@@ -257,8 +257,6 @@ class _StubSession(SaklasSession):
     def __init__(self) -> None:
         self._profiles = {}
         self._steering_stack = []
-        self._steering_override_stack = []
-        self._projection_metric = "mahalanobis"
         self._whitener = None
         self._layer_means = {}
         self.events = EventBus()

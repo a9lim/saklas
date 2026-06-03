@@ -35,6 +35,22 @@ def fit_layer_subspace(*args: Any, **kwargs: Any) -> Any:
     return sub
 
 
+def _iso_monitor(m: "Manifold") -> ManifoldMonitor:
+    """A ``ManifoldMonitor`` wired with an isotropic whitener over ``m``'s
+    fit layers.
+
+    Manifold reads are Mahalanobis-only (4.0 collapse): ``add_probe`` →
+    ``_build_whitened`` requires a covering whitener.  An *isotropic* one
+    (Σ ≈ σ²·I) makes the whitened readout reduce to the Euclidean readout, so
+    the geometric value assertions below (fraction = 1 inside / 0 outside,
+    nearest-node distances) still hold to a loose tolerance.
+    """
+    from tests._whitener import isotropic_whitener
+    dim = next(iter(m.layers.values())).mean.shape[0]
+    whitener = isotropic_whitener(list(m.layers.keys()), dim)
+    return ManifoldMonitor(whitener=whitener)
+
+
 def _node_world(m: Manifold, layer_idx: int) -> torch.Tensor:
     """World-space ``(K, D)`` node activations for a layer.
 
@@ -116,7 +132,7 @@ def _toy_manifold(
 
 def test_add_probe_registers_and_precaches():
     m = _toy_manifold()
-    mon = ManifoldMonitor()
+    mon = _iso_monitor(m)
     mon.add_probe("toy", m)
     assert mon.probe_names == ["toy"]
     probes = mon.attached_probes()
@@ -135,14 +151,14 @@ def test_add_probe_registers_and_precaches():
 
 def test_attached_layers_is_union():
     m = _toy_manifold(n_layers=3)
-    mon = ManifoldMonitor()
+    mon = _iso_monitor(m)
     mon.add_probe("toy", m)
     assert mon.attached_layers() == {0, 1, 2}
 
 
 def test_remove_probe():
     m = _toy_manifold()
-    mon = ManifoldMonitor()
+    mon = _iso_monitor(m)
     mon.add_probe("toy", m)
     mon.remove_probe("toy")
     assert mon.probe_names == []
@@ -151,14 +167,14 @@ def test_remove_probe():
 
 def test_add_probe_top_n_default():
     m = _toy_manifold()
-    mon = ManifoldMonitor()
+    mon = _iso_monitor(m)
     mon.add_probe("toy", m)
     assert mon.attached_probes()["toy"].top_n == DEFAULT_NEAREST_TOP_N
 
 
 def test_add_probe_top_n_override():
     m = _toy_manifold()
-    mon = ManifoldMonitor()
+    mon = _iso_monitor(m)
     mon.add_probe("toy", m, top_n=2)
     assert mon.attached_probes()["toy"].top_n == 2
 
@@ -181,7 +197,7 @@ def test_fraction_inside_subspace_is_one():
     should report ``fraction`` near 1 on every layer the manifold
     covers."""
     m = _toy_manifold()
-    mon = ManifoldMonitor()
+    mon = _iso_monitor(m)
     mon.add_probe("toy", m)
 
     hidden = {}
@@ -198,7 +214,7 @@ def test_fraction_outside_subspace_is_zero():
     """An activation whose centered component is orthogonal to the
     PCA subspace should report ``fraction`` ≈ 0."""
     m = _toy_manifold(dim=8)
-    mon = ManifoldMonitor()
+    mon = _iso_monitor(m)
     mon.add_probe("toy", m)
 
     hidden = {}
@@ -213,14 +229,17 @@ def test_fraction_outside_subspace_is_zero():
         hidden[layer_idx] = sub.mean + v
 
     readings = mon.score_single_token(hidden)
-    assert readings["toy"].fraction == pytest.approx(0.0, abs=1e-5)
+    # Whitened M-orthogonal fraction under an *isotropic* whitener ≈ the old
+    # Euclidean fraction; finite-N Σ has small off-diagonal leakage, so the
+    # near-zero value is loose rather than exact.
+    assert readings["toy"].fraction == pytest.approx(0.0, abs=2e-2)
 
 
 def test_fraction_partial_inside_half():
     """A 45-degree blend of in-subspace + out-of-subspace components
     should report ``fraction`` ≈ ``cos(45°)`` = 1/sqrt(2)."""
     m = _toy_manifold(dim=8)
-    mon = ManifoldMonitor()
+    mon = _iso_monitor(m)
     mon.add_probe("toy", m)
 
     hidden = {}
@@ -235,8 +254,10 @@ def test_fraction_partial_inside_half():
         hidden[layer_idx] = h
 
     readings = mon.score_single_token(hidden)
+    # Isotropic-whitener readout ≈ Euclidean fraction (1/√2); loose tolerance
+    # for the finite-N Σ approximation (see test_fraction_outside_subspace).
     assert readings["toy"].fraction == pytest.approx(
-        1.0 / math.sqrt(2), abs=1e-4,
+        1.0 / math.sqrt(2), abs=2e-2,
     )
 
 
@@ -246,7 +267,7 @@ def test_nearest_finds_correct_node_at_centroid():
     """An activation placed exactly at node k's centroid should rank
     node k first."""
     m = _toy_manifold()
-    mon = ManifoldMonitor()
+    mon = _iso_monitor(m)
     mon.add_probe("toy", m)
 
     for k in range(len(m.node_labels)):
@@ -266,7 +287,7 @@ def test_nearest_finds_correct_node_at_centroid():
 
 def test_nearest_top_n_length():
     m = _toy_manifold()
-    mon = ManifoldMonitor()
+    mon = _iso_monitor(m)
     mon.add_probe("toy", m, top_n=2)
     hidden = {layer_idx: sub.mean for layer_idx, sub in m.layers.items()}
     readings = mon.score_single_token(hidden)
@@ -275,7 +296,7 @@ def test_nearest_top_n_length():
 
 def test_nearest_sorted_ascending():
     m = _toy_manifold()
-    mon = ManifoldMonitor()
+    mon = _iso_monitor(m)
     mon.add_probe("toy", m)
     hidden = {layer_idx: sub.mean for layer_idx, sub in m.layers.items()}
     readings = mon.score_single_token(hidden)
@@ -315,7 +336,7 @@ def test_score_aggregate_at_node_recovers_authoring_coord():
     """Aggregating over a captured stack where every row is node k's
     centroid should recover the authoring coord ``node_coords[k]``."""
     m = _toy_manifold(dim=8)
-    mon = ManifoldMonitor()
+    mon = _iso_monitor(m)
     mon.add_probe("toy", m)
 
     # Pick node 0 (coord = -1.0).  Captured stack has T=3 rows, all the
@@ -352,7 +373,7 @@ def test_score_aggregate_pools_last_non_special_row_not_mean():
     ``stack.mean(dim=0)`` pooling.
     """
     m = _toy_manifold(dim=8)
-    mon = ManifoldMonitor()
+    mon = _iso_monitor(m)
     mon.add_probe("toy", m)
 
     # T=2: row 0 = node 2 (coord +1, "c"), row 1 = node 0 (coord -1, "a").
@@ -384,7 +405,7 @@ def test_score_aggregate_fraction_matches_per_token():
     value itself).
     """
     m = _toy_manifold(dim=8)
-    mon = ManifoldMonitor()
+    mon = _iso_monitor(m)
     mon.add_probe("toy", m)
 
     # All-in-subspace hidden state.
@@ -408,7 +429,7 @@ def test_score_aggregate_to_dict_round_trip():
     import json
 
     m = _toy_manifold(dim=8)
-    mon = ManifoldMonitor()
+    mon = _iso_monitor(m)
     mon.add_probe("toy", m)
     captured: dict[int, torch.Tensor] = {}
     for layer_idx, _sub in m.layers.items():
@@ -428,7 +449,7 @@ def test_score_aggregate_to_dict_round_trip():
 
 def test_empty_inputs_return_empty():
     m = _toy_manifold()
-    mon = ManifoldMonitor()
+    mon = _iso_monitor(m)
     mon.add_probe("toy", m)
     assert mon.score_single_token({}) == {}
     assert mon.score_aggregate({}) == {}
@@ -436,7 +457,7 @@ def test_empty_inputs_return_empty():
 
 def test_pending_per_token_flag():
     m = _toy_manifold()
-    mon = ManifoldMonitor()
+    mon = _iso_monitor(m)
     mon.add_probe("toy", m)
     assert not mon.has_pending_per_token()
     hidden = {layer_idx: sub.mean for layer_idx, sub in m.layers.items()}

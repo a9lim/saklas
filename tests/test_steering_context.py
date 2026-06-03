@@ -38,7 +38,6 @@ class _Stub(SaklasSession):
         import threading
         self._profiles = dict(profiles)
         self._steering_stack = []
-        self._steering_override_stack = []
         # Reentrant gen lock — _push_steering / _pop_steering acquire it
         # so out-of-band steering scope mutations don't race a mid-step
         # rebuild during generation (v2.2 fix).  Stub mode never runs
@@ -53,14 +52,10 @@ class _Stub(SaklasSession):
         # Internal-cleanup bypass for the phase guard; stubs never run
         # gen so it stays False.
         self._internal_steering_pop = False
-        # Session-level default consulted by _resolve_projection_metric when
-        # the LIFO has no overrides.  Mirror the SaklasSession default so the
-        # stub flows through the same code paths the real session uses.
-        self._projection_metric = "mahalanobis"
-        # No whitener in stub mode — _materialize_projections silently
-        # falls back to Euclidean per-layer when whitener is None.  Stub
-        # the lazy ``whitener`` property to skip the model-dependent
-        # neutral-activation build path.
+        # No whitener in stub mode.  These stubs don't materialize ``~``/``|``
+        # projections (which would now require a covering whitener); the
+        # attribute exists so the lazy ``whitener`` property's cache check
+        # doesn't trigger a model-dependent build.
         self._whitener = None
         self._layer_means = {}
         # Active assistant role (role-extraction Phase 7) — populated by

@@ -116,7 +116,13 @@ def _build_monitor(
         li: torch.randn(dim, generator=g, dtype=torch.float32) * 0.1
         for li in layers
     }
-    return TraitMonitor(profiles, layer_means=layer_means)
+    # Mahalanobis is mandatory now: build a covering whitener sharing the
+    # monitor's neutral means.  The incremental-vs-batched equivalence the
+    # suite checks holds under any consistent metric (both paths use this
+    # same monitor), so an anisotropic synthetic whitener is fine.
+    from tests._whitener import synthetic_whitener
+    whitener = synthetic_whitener(layers, dim, means=layer_means, seed=seed)
+    return TraitMonitor(profiles, layer_means=layer_means, whitener=whitener)
 
 
 def _synthetic_capture(

@@ -19,6 +19,7 @@ from saklas.core.events import EventBus, ManifoldExtracted
 from saklas.core.extraction import ManifoldExtractionPipeline
 from saklas.core.sae import MockSaeBackend
 from saklas.io.manifolds import MANIFOLD_FORMAT_VERSION, ManifoldFolder
+from tests._whitener import synthetic_means, synthetic_whitener
 
 _LABELS = ["calm", "uneasy", "afraid", "frantic", "numb"]
 _DIM = 8
@@ -62,6 +63,12 @@ class _Handle:
         self.device = torch.device("cpu")
         self.dtype = torch.float32
         self.layers: Any = [object()] * _N_LAYERS
+        # Activation-space fits require a covering whitener (no Euclidean
+        # fallback post-4.0); synthesize one + matching neutral means on CPU.
+        self.layer_means = synthetic_means(range(_N_LAYERS), _DIM)
+        self.whitener = synthetic_whitener(
+            range(_N_LAYERS), _DIM, means=self.layer_means,
+        )
 
     def _run_generator(
         self, system_msg: str, prompt: str, max_new_tokens: int,
@@ -416,9 +423,9 @@ def test_discover_pca_produces_affine_subspaces(tmp_path: Path) -> None:
     """PCA discover fits a **flat affine** subspace per layer (no RBF surface)
     — the 4.0 reclassification (ARCHITECTURE §1/§5): a personas-shaped artifact
     is a rank-k flat subspace, not a curved manifold.  Each layer carries the
-    real per-layer node coords ``(K, R)``; the basis is Euclidean here because
-    the CPU stub handle has no whitener (the whitened/Fisher basis is the
-    default whenever a covering whitener is present — Step 8)."""
+    real per-layer node coords ``(K, R)``; the basis is whitened/Fisher (the
+    stub handle carries a covering synthetic whitener — activation-space fits
+    require one post-4.0, there is no Euclidean fit path)."""
     folder = _discover_folder(
         tmp_path, fit_mode="pca",
         hyperparams={"max_dim": 4, "var_threshold": 0.70},
@@ -432,10 +439,10 @@ def test_discover_pca_produces_affine_subspaces(tmp_path: Path) -> None:
         assert sub.node_coords is not None            # real per-layer coords
         assert sub.node_coords.shape[0] == 5          # one row per node
         assert sub.node_coords.shape[1] == sub.rank   # (K, R)
-    # subspace_metric records Euclidean here because the CPU stub handle has
-    # no whitener; with a covering whitener it would record "mahalanobis".
+    # subspace_metric is always "mahalanobis": the stub carries a covering
+    # whitener and there is no Euclidean fit path.
     sidecar = json.loads((folder / "stub-model.json").read_text())
-    assert sidecar["subspace_metric"] == "euclidean"
+    assert sidecar["subspace_metric"] == "mahalanobis"
 
 
 def test_discover_records_fit_mode_and_diagnostics(tmp_path: Path) -> None:

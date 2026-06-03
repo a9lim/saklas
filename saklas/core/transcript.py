@@ -209,12 +209,9 @@ class Transcript:
         }
 
     def to_yaml(self) -> str:
-        """Render to YAML.  Uses pyyaml when available, falls back to a
-        small in-tree emitter for the flat schema."""
-        try:
-            import yaml  # pyyaml is a saklas dep; this import is safe
-        except ImportError:  # pragma: no cover — pyyaml is in pyproject
-            return _emit_yaml_minimal(self.to_dict())
+        """Render to YAML (pyyaml is a hard saklas dependency)."""
+        import yaml
+
         return yaml.safe_dump(
             self.to_dict(), sort_keys=False, default_flow_style=False,
         )
@@ -499,71 +496,6 @@ class Transcript:
             tree.annotate(target, "\n".join(guard_notes))
 
         return leaf_id
-
-
-# ---------------------------------------------------------------------------
-# Minimal YAML emitter (fallback when pyyaml is missing)
-# ---------------------------------------------------------------------------
-
-
-def _emit_yaml_minimal(data: Any, indent: int = 0) -> str:
-    """Tiny pyyaml-free emitter for the flat transcript schema.
-
-    Handles only the shapes we produce: nested mappings, lists of
-    mappings, scalars (str/int/float/bool/None).  No anchors, no flow
-    style, no folded scalars — the schema is purposely small so this
-    works.  Kept around as a fallback for embedded usage where pyyaml
-    isn't available; the regular code path uses pyyaml.
-    """
-    lines: list[str] = []
-    _emit_node(data, indent, lines)
-    return "\n".join(lines) + "\n"
-
-
-def _scalar(v: Any) -> str:
-    if v is None:
-        return "null"
-    if isinstance(v, bool):
-        return "true" if v else "false"
-    if isinstance(v, (int, float)):
-        return repr(v)
-    s = str(v)
-    # Quote anything with newlines / special chars / leading whitespace.
-    if any(c in s for c in "\n\t:#&*?{}[]|>%@`'\""):
-        return '"' + s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n") + '"'
-    if s.strip() != s or not s:
-        return '"' + s + '"'
-    return s
-
-
-def _emit_node(data: Any, indent: int, lines: list[str]) -> None:
-    pad = "  " * indent
-    if isinstance(data, dict):
-        for k, v in data.items():
-            if isinstance(v, (dict, list)):
-                lines.append(f"{pad}{k}:")
-                _emit_node(v, indent + 1, lines)
-            else:
-                lines.append(f"{pad}{k}: {_scalar(v)}")
-    elif isinstance(data, list):
-        for item in data:
-            if isinstance(item, dict):
-                # First key starts with ``-``, subsequent indented.
-                first = True
-                for k, v in item.items():
-                    prefix = f"{pad}- " if first else f"{pad}  "
-                    if isinstance(v, (dict, list)):
-                        lines.append(f"{prefix}{k}:")
-                        _emit_node(v, indent + 2, lines)
-                    else:
-                        lines.append(f"{prefix}{k}: {_scalar(v)}")
-                    first = False
-                if first:
-                    lines.append(f"{pad}- {{}}")
-            else:
-                lines.append(f"{pad}- {_scalar(item)}")
-    else:
-        lines.append(f"{pad}{_scalar(data)}")
 
 
 __all__ = [

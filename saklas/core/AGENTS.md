@@ -66,8 +66,9 @@ apply path consumes the per-axis keep set by slicing the basis
 `fold_directions_to_subspace(name, directions, neutral_means)` folds an arbitrary
 per-layer direction (a `merge` linear-combination, a `~`/`|` projection, or a
 folded bundled concept) into a neutral-anchored affine `R=1` `Manifold` — a
-one-pole ray; `_fold_centroids_to_affine_manifold` is the bipolar (pos/neg
-centroids) sibling. `folded_vector_directions(manifold)` is the **reverse view**:
+one-pole ray (the live 2-node-vector read goes through extraction's whitened
+`fit_affine_subspace`; the legacy bipolar-centroid fold was retired in the
+Mahalanobis-only collapse). `folded_vector_directions(manifold)` is the **reverse view**:
 `{L: δ̂_L · share_L}`, the baked-direction view of a 2-node affine manifold, used
 to back the `Profile`-returning surface (`extract()`, `subspace compare`/`why`,
 GGUF export) without a second stored representation. It raises on a curved or
@@ -79,8 +80,9 @@ merged affine subspace.
 `.safetensors` + a slim `.json` sidecar (stamped with `PACK_FORMAT_VERSION` from
 `io/packs.py`); they back the per-model `layer_means`/`neutral_activations`/
 alignment caches and the folded-profile interchange. `project_profile(base, onto,
-operator, *, whitener=None)` is the per-layer `~`/`|` projection (LEACE under a
-whitener, Gram-Schmidt otherwise; metric all-or-nothing via `covers_all`).
+operator, *, whitener=...)` is the per-layer `~`/`|` projection — closed-form
+LEACE, Mahalanobis-only: the whitener is **required** and must cover every
+projected layer (`covers_all`), else `WhitenerError` (no Euclidean path).
 
 ## extraction.py
 
@@ -99,8 +101,9 @@ role=node_role, model_type=)`), threading the folder's `node_kinds` /
 
 - **`pca`** (flat / discover; the 2-node-vector case): derive per-model coords
   (`discover_coords` at a reference layer) when discover, then per layer
-  `fit_affine_subspace` (μ-centered PCA basis — whitened/Fisher when the whitener
-  covers all fit layers, Euclidean otherwise — neutral-anchored frame, real
+  `fit_affine_subspace` (μ-centered PCA basis — whitened/Fisher; the whitener must
+  cover every fit layer or the fit raises `WhitenerError`, there is no Euclidean
+  activation-space fit — neutral-anchored frame, real
   per-layer `node_coords`), per-axis DLS straddle across all fit layers
   (`compute_dls_axes` → `select_axes`), then the μ-centered `subspace_share` bake.
   `anchor_origin` (pca only) shifts coords so a named node lands at 0.
@@ -249,9 +252,9 @@ full retention.
 ## monitor.py
 
 `TraitMonitor` scores vector probes against per-layer hidden states in the
-**whitened (Mahalanobis) cosine** when the whitener covers every probed layer,
-else Euclidean cosine for all (all-or-nothing via `covers_all`; never a per-layer
-mix). The probe weight stays `‖baked‖₂` (the bake already folded the Mahalanobis
+**whitened (Mahalanobis) cosine** — mandatory: the whitener must cover every
+probed layer (`covers_all`), else `_ensure_cache` raises `WhitenerError` (no
+Euclidean path). The probe weight stays `‖baked‖₂` (the bake already folded the Mahalanobis
 score in). `_ensure_cache` precomputes whitened probe directions + Mahalanobis
 norms + device-resident Woodbury factors; the hot path is one matmul + a cheap
 per-token `Σ⁻¹h_c` apply, zero `.item()`. `_layer_sims` is the shared per-layer
@@ -261,12 +264,13 @@ kernel. Entry points: `score_per_token` (primary), `measure_from_hidden`,
 every read source is now live hooks scoring pre-captured hidden states during
 generation, no second forward pass.
 
-`ManifoldMonitor` is the manifold read peer (accepts a whitener too).
-`add_probe(name, manifold, *, top_n)` caches per-layer reduced `(K,R)` node coords.
-Per token, EV-weighted across layers: **fraction** (`‖h_par_c‖/‖h−mean‖`, the
-subspace share ∈ [0,1]) + **nearest** node. Whitened readout
-(`AttachedManifoldProbe.whitened`, per probe, all-or-nothing) switches both to
-Mahalanobis forms (M-orthogonal share, `M_R`-metric cdist). `score_single_token`
+`ManifoldMonitor` is the manifold read peer (requires a whitener too).
+`add_probe(name, manifold, *, top_n)` caches per-layer reduced `(K,R)` node coords
+and builds the per-probe whitened factors (`_build_whitened` raises `WhitenerError`
+unless the whitener covers every fit layer — Mahalanobis-only, no Euclidean
+readout). Per token, EV-weighted across layers: the whitened **fraction**
+(M-orthogonal share ∈ [0,1]) + **nearest** node (`M_R`-metric cdist) via
+`AttachedManifoldProbe.whitened`. `score_single_token`
 returns `ManifoldTokenReading`s; `flat_scalars` flattens to `{"<name>:fraction",
 "<name>@<label>": −distance}` for the probe-gate machinery. `score_aggregate`
 (end-of-gen) pools the last non-special token, runs the channels, and recovers
@@ -309,7 +313,7 @@ Per-message role substitution (`role_templates.apply_with_per_turn_roles`) backs
 the roleplay scaffold; `_active_role` is the steering-driven role.
 `supports_thinking` / `_detect_think_delimiters` round-trips Qwen/Gemma
 `enable_thinking`, falling back to channel (gpt-oss) / bracket (Mistral-3)
-detectors; `ThinkingState` / `GenerationState` drive the streaming state machine.
+detectors; the internal `_ThinkState` machine + `GenerationState` drive streaming.
 
 ## session.py
 
@@ -317,7 +321,7 @@ detectors; `ThinkingState` / `GenerationState` drive the streaming state machine
 loaded-manifold registry (`_manifolds`), both monitors, `SteeringManager`,
 `HiddenCapture`, generation defaults (`session.config`), the loom tree, and a
 synchronous `events: EventBus`. `from_pretrained(model_id, *, device, dtype,
-quantize, probes, projection_metric=..., dls=..., compile=..., cuda_graphs=...)`
+quantize, probes, dls=..., compile=..., cuda_graphs=...)`
 does the HF load + layer-mean compute + probe bootstrap — there is no
 `injection_mode`/`theta_max` param. `__init__` takes a pre-loaded model. Both call
 `materialize_bundled_manifolds()` + `selectors.invalidate()` early.
@@ -352,10 +356,10 @@ training-free `clone_from_corpus` / `io.cloning` path is removed in 4.0.)
 Steering | None` (dicts rejected), `sampling`, `thinking=None`, plus loom args;
 both return `RunSet` (`.first` is the `GenerationResult`). `session.steering(value)`
 coerces via `Steering.from_value`, materializes `ProjectedTerm`s into derived
-profiles (`_materialize_projections` → `project_profile` with `session.whitener`),
-and pushes a per-scope entries dict onto a LIFO stack so nested scopes compose. The
-per-call `projection_metric` rides a parallel override stack walked top-down by
-`_resolve_projection_metric` (inner wins; default Mahalanobis).
+profiles (`_materialize_projections` → `project_profile` with `session.whitener`,
+which is Mahalanobis-only — a `~`/`|` term on a session with no covering whitener
+raises `WhitenerError`), and pushes a per-scope entries dict onto a LIFO stack so
+nested scopes compose. There is no per-call projection-metric override.
 `_resolve_pole_aliases` canonicalizes + sign-flips bare poles through the manifold
 tier and routes variants.
 
@@ -472,8 +476,8 @@ into evenly-sized groups. Used by the TUI WHY footer + CLI `subspace why`.
 
 `SamplingConfig` — per-call frozen config with `merged_with`. `Steering` — frozen;
 `from_value` accepts `str | Steering | None` (strings route through the shared
-parser, dicts rejected); the only per-call override field is `projection_metric`
-(`None` = inherit). `events.py` — synchronous `EventBus` + event dataclasses.
+parser, dicts rejected); it carries no per-call metric override (`~`/`|` projection
+is Mahalanobis-only). `events.py` — synchronous `EventBus` + event dataclasses.
 `errors.py` — `SaklasError` base; every saklas exception multi-inherits through it
 while keeping its stdlib MRO, so `except SaklasError` catches the family and
 `except ValueError`/`RuntimeError` at existing sites still works. `user_message()`

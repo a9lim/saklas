@@ -385,11 +385,9 @@ class _SteeringContext:
     ablation.  Bare-alpha inputs to the public ``steering()`` API are
     normalized before we get here.
 
-    ``_projection_metric`` carries the per-call ``~``/``|`` metric override
-    forward through the stack so nested scopes can flip it for the duration
-    of the inner block.  ``None`` means "inherit": the stack walks the LIFO
-    from top, picking the first non-``None`` value, falling through to the
-    session default if every scope is ``None``.
+    ``~``/``|`` projection terms always materialize in the Mahalanobis
+    metric (closed-form LEACE against the session whitener) — there is no
+    per-call metric override.
     """
 
     __slots__ = (
@@ -397,7 +395,6 @@ class _SteeringContext:
         "_entered",
         "_entries",
         "_prev_active_role",
-        "_projection_metric",
         "_session",
         "_synthetic_snapshots",
     )
@@ -407,20 +404,18 @@ class _SteeringContext:
         session: "SaklasSession",
         entries: dict[str, SteeringStackEntry],
         *,
-        projection_metric: str | None = None,
         synthetic_snapshots: dict[str, "object"] | None = None,
         active_role: str | None = None,
     ) -> None:
         self._session = session
         self._entries = entries
         self._entered = False
-        self._projection_metric = projection_metric
         # Pre-materialize snapshots of any synthetic-projection keys
         # this scope wrote to ``session._profiles`` — value is the prior
         # binding (or :data:`_PROFILE_ABSENT` when the key was unset).
         # Restored on ``__exit__`` so nested scopes that re-materialize
-        # the same ``a|b`` synthetic key with a different metric don't
-        # leak the inner tensor back into the outer scope's hooks.
+        # the same ``a|b`` synthetic key don't leak the inner tensor back
+        # into the outer scope's hooks.
         self._synthetic_snapshots: dict[str, object] = (
             dict(synthetic_snapshots) if synthetic_snapshots else {}
         )
@@ -435,10 +430,7 @@ class _SteeringContext:
         # raises (e.g. VectorNotRegisteredError).  __enter__ only flips
         # `_entered=True` AFTER a clean push so a mid-__enter__ failure leaves
         # no stale state for __exit__ to pop.
-        self._session._push_steering(
-            self._entries,
-            projection_metric=self._projection_metric,
-        )
+        self._session._push_steering(self._entries)
         # Save / overwrite the session-level active_role.  Inner scopes
         # override outer; the outer is restored on ``__exit__``.  An
         # inner scope with ``active_role=None`` inherits — leave the
@@ -506,7 +498,6 @@ class SaklasSession:
         probes: list[str] | None = None,
         system_prompt: str | None = None,
         max_tokens: int = 1024,
-        projection_metric: str = "mahalanobis",
         dls: bool = True,
         compile: bool = False,
         compile_mode: str | None = None,
@@ -519,12 +510,10 @@ class SaklasSession:
         HF-loading heavy lifting. To wrap an already-loaded model use the
         plain ``__init__(model, tokenizer, ...)`` form.
 
-        ``projection_metric`` selects the metric used when materializing
-        ``~`` / ``|`` projection terms in steering expressions:
-        ``"mahalanobis"`` (default since v2.1) uses the closed-form
-        LEACE projector against the per-model whitener — provably erases
-        linearly-decodable information along ``onto`` from ``base``;
-        ``"euclidean"`` is plain Gram-Schmidt (the v2.0/v2.1 behavior).
+        ``~`` / ``|`` projection terms always materialize through the
+        closed-form LEACE projector against the per-model whitener (it
+        provably erases linearly-decodable information along ``onto`` from
+        ``base``); there is no Euclidean path and no metric knob.
 
         ``dls`` toggles the discriminative-layer-selection mask at
         extraction time (v2.1+).  When ``True`` (default), centered DLS
@@ -633,7 +622,6 @@ class SaklasSession:
             probes=probes,
             system_prompt=system_prompt,
             max_tokens=max_tokens,
-            projection_metric=projection_metric,
             dls=dls,
             cuda_graphs=cuda_graphs,
             return_top_k=return_top_k,
@@ -647,7 +635,6 @@ class SaklasSession:
         probes: list[str] | None = None,
         system_prompt: str | None = None,
         max_tokens: int = 1024,
-        projection_metric: str = "mahalanobis",
         dls: bool = True,
         cuda_graphs: bool = False,
         return_top_k: int = 0,
@@ -672,21 +659,6 @@ class SaklasSession:
         # populated lazily by ``_ensure_manifold_loaded`` on scope entry.
         self._manifolds: dict[str, Manifold] = {}
 
-        if projection_metric not in ("mahalanobis", "euclidean"):
-            raise ValueError(
-                f"projection_metric must be 'mahalanobis' or 'euclidean', "
-                f"got {projection_metric!r}"
-            )
-        # Default for runtime ``~`` / ``|`` projection.  Mahalanobis is
-        # default since v2.1: per-layer ``project_profile`` calls receive
-        # ``self.whitener`` so projection erases linearly-decodable
-        # concept information along ``onto`` (closed-form LEACE per
-        # Belrose et al. 2023).  ``"euclidean"`` keeps the v2.0/v2.1
-        # plain Gram-Schmidt semantics — what ``--legacy`` selects.
-        # When the whitener is unavailable (e.g. ``probes=[]`` session
-        # with no neutral-activation cache yet), the materialize site
-        # falls back to Euclidean per layer transparently.
-        self._projection_metric: str = projection_metric
         # Phase 1 logit pass: session-level default for SamplingConfig
         # .return_top_k.  Per-call value > 0 wins; per-call K=0 (the
         # SamplingConfig default) inherits this stored value via the
@@ -728,12 +700,6 @@ class SaklasSession:
         # (later entries overwrite earlier ones) is what the steering
         # manager installs when a generation begins.
         self._steering_stack: list[dict[str, SteeringStackEntry]] = []
-        # Parallel LIFO of per-scope ``projection_metric`` overrides.  Each
-        # element matches its sibling in ``_steering_stack``; ``None`` means
-        # "inherit".  Walked top-down by ``_resolve_projection_metric`` to find
-        # the active value, with the session default as the floor.  (Steering
-        # math / rotation cap retired in 4.0 — there is one injection backend.)
-        self._steering_override_stack: list[str | None] = []
 
         # Active assistant-role label for the current ``session.steering()``
         # scope — populated when every role-tagged term in the resolved
@@ -851,8 +817,9 @@ class SaklasSession:
         self._trait_lock = threading.Lock()
 
         # Ensure bundled concepts are materialized in the user cache and
-        # the selector cache reflects them.  ``bootstrap_probes`` does this
-        # transitively via ``load_defaults``, but is skipped entirely when
+        # the selector cache reflects them.  ``_bootstrap_manifold_probes``
+        # does this transitively via ``load_default_manifolds``, but is
+        # skipped entirely when
         # ``probes=[]`` — leaving freshly-added bundled concepts (e.g. via
         # ``regenerate_bundled_statements.py``) invisible to the selector
         # layer for the rest of the session.  Calling explicitly here keeps
@@ -872,11 +839,11 @@ class SaklasSession:
         probe_categories = PROBE_CATEGORIES if probes is None else probes
 
         # Order matters: layer_means + neutral_activations + whitener must
-        # exist BEFORE ``bootstrap_probes`` runs, because v2.1+ DiM
-        # extraction uses the whitener for Mahalanobis-flavored share
-        # allocation.  Pre-v2.1 ordering computed layer_means *after* probe
-        # extraction (just for monitor centering) — the flip is the
-        # extract-time dependency on the activation covariance.  When
+        # exist BEFORE ``_bootstrap_manifold_probes`` runs, because the
+        # extraction pipeline uses the whitener for Mahalanobis-flavored
+        # share allocation — the probe fold has an extract-time dependency
+        # on the activation covariance, so the centering means and whitener
+        # are built first.  When
         # ``probe_categories`` is empty there's nothing to extract, so we
         # skip the whitener build to keep ``probes=[]`` sessions cheap;
         # ad-hoc later extraction lazily builds via ``self.whitener``.
@@ -954,7 +921,7 @@ class SaklasSession:
 
         Returns whatever ``get_layers`` produced — typically an
         ``nn.ModuleList``, list-like enough for the downstream
-        consumers (``extract_difference_of_means``, hooks).
+        consumers (the extraction pipeline and hooks).
         """
         return self._layers
 
@@ -1112,10 +1079,11 @@ class SaklasSession:
         Uses ``load_or_compute_neutral_activations`` (alignment.py) for
         disk caching; combines with the in-memory ``_layer_means`` to
         instantiate the :class:`LayerWhitener`.  Soft-fails to ``None``
-        on any error — extraction falls back to Euclidean scoring, and
-        ``vector compare --metric mahalanobis`` already errors with a
-        useful hint when ``LayerWhitener.from_cache`` can't find the
-        cache.
+        on any error — but the engine is Mahalanobis-only now, so a
+        ``None`` whitener makes the activation-space consumers (fit,
+        ``~``/``|`` projection, probe scoring, ``subspace compare``) raise
+        ``WhitenerError`` with a regenerate-neutrals hint rather than
+        degrade to Euclidean.
 
         Lazy: only callers who actually need Mahalanobis math (DiM
         extraction at session init, on-demand ``session.whitener``
@@ -1797,20 +1765,8 @@ class SaklasSession:
                 RoleBaselineMismatchWarning,
                 stacklevel=2,
             )
-        # Per-call projection-metric override rides along with the entries.
-        # ``None`` means "inherit"; the resolver folds the session default at
-        # materialize time.
-        metric_override = getattr(steering_obj, "projection_metric", None)
-        if metric_override is not None and metric_override not in (
-            "mahalanobis", "euclidean",
-        ):
-            raise ValueError(
-                f"Steering.projection_metric must be 'mahalanobis' or "
-                f"'euclidean', got {metric_override!r}"
-            )
         return _SteeringContext(
             self, resolved,
-            projection_metric=metric_override,
             synthetic_snapshots=snapshots,
             active_role=active_role,
         )
@@ -1829,44 +1785,28 @@ class SaklasSession:
         resolution + hook install find the profile via the
         ``name in self._profiles`` fast path.
 
-        Metric selection (v2.1): the active projection metric is
-        resolved via :meth:`_resolve_projection_metric`, which composes
-        the per-call ``Steering.projection_metric`` override (if set)
-        with any outer-scope override on
-        ``_steering_override_stack`` and the session-level default.
-        Under ``"mahalanobis"`` (default since v2.1) the call site
-        passes ``self.whitener`` to ``project_profile``, which switches
-        ``~`` / ``|`` to the closed-form LEACE projector — provably
-        erases linearly-decodable concept information along ``onto``.
-        Under ``"euclidean"`` we pass ``whitener=None`` and get plain
-        Gram-Schmidt (the v2.0/v2.1 behavior).  When the whitener is
-        unavailable for this session (no neutral-activation cache, e.g.
-        a ``probes=[]`` session that hasn't extracted yet) the call
-        gracefully falls back to Euclidean.  ``project_profile`` decides
-        the metric **all-or-nothing** via ``covers_all`` over the
-        projected layers — LEACE on every one or Gram-Schmidt on all,
-        never a per-layer mix.
+        Projection is Mahalanobis-only: the call site passes
+        ``self.whitener`` to ``project_profile``, which uses the
+        closed-form LEACE projector — provably erases linearly-decodable
+        concept information along ``onto``.  ``project_profile`` requires
+        the whitener to cover every projected layer (``covers_all``) and
+        raises :class:`~saklas.core.mahalanobis.WhitenerError` otherwise;
+        there is no Euclidean path.  A ``probes=[]`` session that hasn't
+        built a neutral-activation cache yet therefore can't materialize a
+        ``~``/``|`` term — regenerate the neutral cache first.
 
         Returns a snapshot dict ``{syn_key: prev_value_or_PROFILE_ABSENT}``
         of the synthetic-projection bindings this call clobbered, so
         the caller can restore them on scope exit.  Without this
         nested scopes that materialize the same ``a|b`` synthetic
-        key under a different ``projection_metric`` would leak the
-        inner tensor back into the outer scope's hooks after pop —
-        the global ``self._profiles`` registry is shared across all
-        active scopes.
+        key would leak the inner tensor back into the outer scope's
+        hooks after pop — the global ``self._profiles`` registry is
+        shared across all active scopes.
         """
         from saklas.core.steering_expr import ProjectedTerm
         from saklas.core.vectors import project_profile
 
-        # Compute once per ``steering()`` call.  The resolver consults
-        # the per-call override first, then any outer scope on the
-        # override stack (this scope hasn't been pushed yet — it will
-        # be on ``__enter__``), then the session default.
-        metric = self._resolve_projection_metric(
-            getattr(steering, "projection_metric", None),
-        )
-        whitener = self.whitener if metric == "mahalanobis" else None
+        whitener = self.whitener
 
         snapshots: dict[str, object] = {}
         for syn_key, val in steering.alphas.items():
@@ -2175,8 +2115,9 @@ class SaklasSession:
     ) -> dict[str, dict[int, torch.Tensor]]:
         """Source bundled-concept probe directions from their 2-node manifolds.
 
-        The 4.0 counterpart of :func:`~saklas.io.probes_bootstrap.bootstrap_probes`
-        for concepts that now live as 2-node ``pca`` manifolds.  For each
+        Builds the probe roster from the bundled concepts that now live as
+        2-node ``pca`` manifolds (the category roster comes from
+        :func:`~saklas.io.probes_bootstrap.load_default_manifolds`).  For each
         manifold tagged in a requested category it fits-or-loads the per-model
         subspace (eager, same cost band as the legacy DiM extraction — both run
         forward passes, both disk-cache) and folds it to a per-layer direction
@@ -2214,17 +2155,8 @@ class SaklasSession:
     def _push_steering(
         self,
         entries: dict[str, SteeringStackEntry],
-        *,
-        projection_metric: str | None = None,
     ) -> None:
         """Push an entries dict onto the steering stack and rebuild hooks.
-
-        ``projection_metric`` is a per-scope override; ``None`` falls through
-        to the next outer scope (LIFO walk) and ultimately to the session-level
-        default.  It doesn't drive hook rebuild on its own (projection
-        materialization happens in ``steering()`` before ``__enter__``); it's
-        recorded here so :meth:`_resolve_projection_metric` can answer "what
-        metric does the active scope want?" uniformly.
 
         If ``_rebuild_steering_hooks`` raises (e.g. an unknown vector
         name hits ``VectorNotRegisteredError``) the just-pushed entry is
@@ -2267,12 +2199,10 @@ class SaklasSession:
             )
         with self._gen_lock:
             self._steering_stack.append(dict(entries))
-            self._steering_override_stack.append(projection_metric)
             try:
                 self._rebuild_steering_hooks()
             except BaseException:
                 self._steering_stack.pop()
-                self._steering_override_stack.pop()
                 raise
             # Steering hooks just changed; the prefix cache (built
             # under the previous regime) no longer represents the
@@ -2306,8 +2236,6 @@ class SaklasSession:
             )
         with self._gen_lock:
             self._steering_stack.pop()
-            if self._steering_override_stack:
-                self._steering_override_stack.pop()
             self._rebuild_steering_hooks()
             self._invalidate_prefix_cache()
         if not self._steering_stack:
@@ -2363,6 +2291,37 @@ class SaklasSession:
                 return True
         return False
 
+    def _exit_internal_steering(self, steering_cm: Any, *, swallow: bool) -> None:
+        """Pop ``_generate_core``'s internally-entered steering scope.
+
+        Bypasses the ``_pop_steering`` phase guard (we're past the
+        model-forward loop and the rebuild is legitimate teardown, not a
+        callback mutating the stack mid-step) by raising the
+        ``_internal_steering_pop`` flag around the ``__exit__``.
+
+        Exception-safety-critical (Codex review v2): ``old_internal`` is
+        read *before* the ``try`` so the worst case under a signal between
+        the read and the assignment is "we never set True", not "we leave
+        True set" — the flag never leaks across the gen-lock boundary.
+
+        ``swallow`` mirrors the two call sites: the inner ``finally`` lets
+        a teardown ``Exception`` propagate (``swallow=False``); the outer
+        ``except BaseException`` path is already re-raising the original
+        failure and must not let a teardown ``Exception`` mask it
+        (``swallow=True``).  A ``BaseException`` (KeyboardInterrupt /
+        SystemExit) from ``__exit__`` always propagates in both — only the
+        ``finally`` restore runs.
+        """
+        old_internal = self._internal_steering_pop
+        try:
+            self._internal_steering_pop = True
+            steering_cm.__exit__(None, None, None)
+        except Exception:
+            if not swallow:
+                raise
+        finally:
+            self._internal_steering_pop = old_internal
+
     def _build_gating_score_callback(self):
         """Return a closure that scores latest captures into a
         ``dict[str, float]`` for ``generate_steered``'s ``score_callback``.
@@ -2399,32 +2358,6 @@ class SaklasSession:
             return out
 
         return _score
-
-    def _resolve_projection_metric(
-        self, override: str | None = None,
-    ) -> str:
-        """Effective projection metric for the about-to-materialize scope.
-
-        Walks the override LIFO top-down for the first non-None
-        ``projection_metric`` entry; ``override`` (the about-to-push
-        scope's value, not yet on the stack) takes priority over the
-        stack so a per-call ``Steering.projection_metric`` wins over
-        any outer scope.  Falls back to the session-level default
-        (``self._projection_metric``) when nothing is set.
-
-        Used by :meth:`_materialize_projections` — by the time
-        ``__enter__`` pushes the new scope onto
-        ``_steering_override_stack``, projection materialization has
-        already run and committed derived profiles to ``self._profiles``.
-        Threading the override here keeps the v2.1 default end-to-end
-        correct without re-running materialization on every scope flip.
-        """
-        if override is not None:
-            return override
-        for pm in reversed(self._steering_override_stack):
-            if pm is not None:
-                return pm
-        return self._projection_metric
 
     def _compose_steering_entries(
         self,
@@ -2865,6 +2798,11 @@ class SaklasSession:
         self._ensure_manifold_loaded(selector)
         manifold = self._manifolds[selector]
         name = as_name if as_name is not None else selector
+        # Force the lazy whitener build (and its ``set_whitener`` push into
+        # the manifold monitor) before attaching: manifold reads are
+        # Mahalanobis-only now, so ``add_probe`` → ``_build_whitened`` needs
+        # a covering whitener present or it raises.
+        _ = self.whitener
         self._manifold_monitor.add_probe(name, manifold, top_n=top_n)
         # Manifold probes widen the capture-layer set in the same way
         # vector probes do; drop the prefix cache so the next gen
@@ -2952,6 +2890,39 @@ class SaklasSession:
 
     # -- Recipe-override regen (v2.3 phase 5) --
 
+    def _resolve_anchor_recipe(
+        self,
+        parent_node_id: str | None,
+        *,
+        base_recipe: "Recipe | None" = None,
+    ) -> "Recipe":
+        """Resolve the recipe a regen-modifier override composes onto.
+
+        Precedence: an explicit ``base_recipe`` wins; else the parent's
+        recipe when the parent is an assistant carrying one; else the
+        nearest assistant *ancestor* with a recipe (so a user-anchored
+        regen still finds one to overlay); else an empty :class:`Recipe`.
+        ``parent_node_id`` may be ``None`` (no parent context) — only the
+        empty-Recipe fallback applies then.
+        """
+        from saklas.core.loom import Recipe
+
+        if base_recipe is not None:
+            return base_recipe
+        anchor: "Recipe | None" = None
+        if parent_node_id is not None:
+            parent = self.tree.nodes.get(parent_node_id)
+            if parent is not None:
+                if parent.role == "assistant" and parent.recipe is not None:
+                    anchor = parent.recipe
+                else:
+                    for nid in self.tree.ancestors_of(parent_node_id):
+                        anc = self.tree.nodes.get(nid)
+                        if anc is not None and anc.role == "assistant" and anc.recipe is not None:
+                            anchor = anc.recipe
+                            break
+        return anchor if anchor is not None else Recipe()
+
     def regen_with_modifier(
         self,
         parent_node_id: str,
@@ -2975,26 +2946,14 @@ class SaklasSession:
         ``/regen N <mode>`` flow both call this.  Returns a
         :class:`RunSet` even when ``n == 1``.
         """
-        from saklas.core.loom import Recipe
-
         parent = self.tree.get(parent_node_id)
-        # Walk up to find the assistant whose recipe we're overlaying —
-        # if the caller passed a user node, use its existing assistant
-        # child's recipe (regen replaces that assistant).
-        anchor: "Recipe | None" = None
-        if base_recipe is not None:
-            anchor = base_recipe
-        elif parent.role == "assistant" and parent.recipe is not None:
-            anchor = parent.recipe
-        else:
-            # Pick the most recent assistant ancestor's recipe.
-            for nid in self.tree.ancestors_of(parent_node_id):
-                anc = self.tree.nodes.get(nid)
-                if anc is not None and anc.role == "assistant" and anc.recipe is not None:
-                    anchor = anc.recipe
-                    break
-        if anchor is None:
-            anchor = Recipe()
+        # Resolve the assistant recipe we're overlaying — if the caller
+        # passed a user node, walk to the nearest assistant ancestor's
+        # recipe (regen replaces that assistant); see
+        # ``_resolve_anchor_recipe``.
+        anchor = self._resolve_anchor_recipe(
+            parent_node_id, base_recipe=base_recipe,
+        )
 
         # compose_modifier handles both str ("unsteered"/"inverted"/...)
         # and Recipe (custom) — the dispatch lives on the dataclass.
@@ -3888,23 +3847,10 @@ class SaklasSession:
         if recipe_override is None:
             return steering, sampling, thinking
 
-        # Resolve the anchor recipe — the parent assistant's recipe
-        # when present, else an empty Recipe.  Walk ancestors so a
-        # user-anchored regen still finds a recipe to overlay onto.
-        anchor: Recipe | None = None
-        if parent_node_id is not None:
-            parent = self.tree.nodes.get(parent_node_id)
-            if parent is not None:
-                if parent.role == "assistant" and parent.recipe is not None:
-                    anchor = parent.recipe
-                else:
-                    for nid in self.tree.ancestors_of(parent_node_id):
-                        anc = self.tree.nodes.get(nid)
-                        if anc is not None and anc.role == "assistant" and anc.recipe is not None:
-                            anchor = anc.recipe
-                            break
-        if anchor is None:
-            anchor = Recipe()
+        # Resolve the anchor recipe — the parent assistant's recipe when
+        # present, else the nearest assistant ancestor's, else an empty
+        # Recipe (see ``_resolve_anchor_recipe``).
+        anchor = self._resolve_anchor_recipe(parent_node_id)
 
         # compose_modifier handles both str modes and Recipe (custom)
         # — Recipe instances pass through unchanged on that path.
@@ -4402,24 +4348,9 @@ class SaklasSession:
                 self._gen_state.stop_requested.set()
                 self._end_capture()
                 if steering_cm is not None:
-                    # Internal scope cleanup — bypass the
-                    # ``_pop_steering`` phase guard since we're past
-                    # the model-forward loop and the rebuild is part
-                    # of the legitimate teardown sequence, not a
-                    # callback mutating the stack mid-step.  Save/
-                    # restore rather than unconditional clear: a
-                    # KeyboardInterrupt between the assignment and
-                    # the ``try:`` could leak the flag as ``True``
-                    # otherwise.  Reading ``old`` first puts the read
-                    # outside the try-protected window so the worst
-                    # case is "we never set True", not "we leave True
-                    # set" (Codex review v2 catch).
-                    old_internal = self._internal_steering_pop
-                    try:
-                        self._internal_steering_pop = True
-                        steering_cm.__exit__(None, None, None)
-                    finally:
-                        self._internal_steering_pop = old_internal
+                    # Internal scope cleanup (see ``_exit_internal_steering``);
+                    # ``swallow=False`` so a teardown failure surfaces here.
+                    self._exit_internal_steering(steering_cm, swallow=False)
                     steering_cm = None
                 self._gen_phase = GenState.FINALIZING
 
@@ -4457,17 +4388,10 @@ class SaklasSession:
             # or FINALIZING depending on where we threw, and the pop is
             # always legitimate teardown here.
             if steering_cm is not None:
-                # Same save/restore pattern as the inner finally —
-                # robust against signal-delivery between the
-                # assignment and the ``try``.
-                old_internal = self._internal_steering_pop
-                try:
-                    self._internal_steering_pop = True
-                    steering_cm.__exit__(None, None, None)
-                except Exception:
-                    pass
-                finally:
-                    self._internal_steering_pop = old_internal
+                # ``swallow=True``: we're already re-raising the original
+                # failure below, so a teardown ``Exception`` must not mask
+                # it (see ``_exit_internal_steering``).
+                self._exit_internal_steering(steering_cm, swallow=True)
             raise
         finally:
             # Defense-in-depth: even if the inner finally never ran (e.g. a

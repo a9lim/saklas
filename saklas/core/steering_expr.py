@@ -87,25 +87,15 @@ import re
 from dataclasses import dataclass
 from typing import Literal, Optional, TYPE_CHECKING, cast
 
-from saklas.core.errors import (
-    ManifoldArityError,  # noqa: F401  — re-exported for back-compat
-    OverlappingManifoldError,  # noqa: F401  — re-exported for back-compat
-    SaklasError,  # noqa: F401  — re-exported for back-compat
-    SteeringExprError,
-)
+from saklas.core.errors import SteeringExprError
 from saklas.core.triggers import Trigger
 
 if TYPE_CHECKING:
     from saklas.core.steering import AlphaEntry, Steering
 
 
-# Default coefficient when a term omits the explicit number.  Matches the
-# ``recommended_alpha`` field on bundled packs — the observed coherent-α
-# sweet spot post-share-baking.  Future hook: when a per-vector default
-# alpha becomes available on the profile/pack metadata side, ``_fold``
-# should consult it and fall back to this constant.  ``_Term.explicit_coeff``
-# preserves the "user typed a number" signal so that late resolution can
-# tell a defaulted ``honest`` from an explicit ``0.5 honest``.
+# Default coefficient when a term omits the explicit number — the observed
+# coherent-α sweet spot post-share-baking.
 DEFAULT_COEFF = 0.5
 
 # Shared message for the two structurally-parallel "manifold doesn't
@@ -243,9 +233,8 @@ class ManifoldTerm:
         return self.along
 
 
-# ``SteeringExprError`` now lives in :mod:`saklas.core.errors` (alongside its
-# new manifold-specific subclasses ``ManifoldArityError`` /
-# ``OverlappingManifoldError``); it is imported above and re-exported here so
+# ``SteeringExprError`` lives in :mod:`saklas.core.errors`; it is imported
+# above and re-exported here so
 # ``from saklas.core.steering_expr import SteeringExprError`` keeps working.
 
 
@@ -379,10 +368,6 @@ class _Term:
     # produce a ``Trigger(prompt=False, gate=ProbeGate(...))`` directly
     # at parse time.  Rendered back to canonical form by ``_fmt_*``.
     trigger: Optional[Trigger]
-    # True iff the user typed a numeric coefficient; False when the parser
-    # substituted ``DEFAULT_COEFF``.  Internal — lets a future resolver step
-    # swap in per-vector defaults without re-parsing the expression.
-    explicit_coeff: bool
     ablation: bool = False  # True iff term was prefixed with `!`
     # The full comma-run of coefficients the user typed.  A plain term
     # carries a 1-tuple; a manifold ``%`` term may carry up to 2 mapping
@@ -514,7 +499,7 @@ class _Parser:
                 )
         return _Term(
             coeff=coeff, selector=selector, trigger=trigger,
-            explicit_coeff=explicit, ablation=ablation, coeffs=coeffs,
+            ablation=ablation, coeffs=coeffs,
         )
 
     def _parse_when_gate(self, when_col: int) -> Trigger:
@@ -1201,8 +1186,7 @@ def referenced_selectors(
     Walks the AST before pole resolution so namespace prefixes survive —
     useful at install time, when the CLI needs to know which pack to fetch
     for each atom.  Projection terms contribute two entries (base + onto).
-    Manifold terms are skipped — a manifold name is not a concept and
-    resolves through :func:`referenced_manifolds` instead.
+    Manifold terms are skipped — a manifold name is not a concept.
     """
     if not text or not text.strip():
         return []
@@ -1219,30 +1203,6 @@ def referenced_selectors(
     return out
 
 
-def referenced_manifolds(
-    text: str,
-) -> list[tuple[Optional[str], str, str]]:
-    """Return every ``(namespace, name, variant)`` manifold referenced.
-
-    The manifold-term analogue of :func:`referenced_selectors` — kept a
-    separate function so ``referenced_selectors`` keeps its exact 3-tuple
-    shape and no concept-install caller has to learn about manifolds.
-    Walks the AST before resolution so namespace prefixes survive.
-    """
-    if not text or not text.strip():
-        return []
-    toks = _lex(text)
-    terms = _Parser(toks).parse()
-    out: list[tuple[Optional[str], str, str]] = []
-    for term in terms:
-        sel = term.selector
-        if sel.manifold_position is not None:
-            out.append(
-                (sel.base.namespace, sel.base.concept, sel.base.variant)
-            )
-    return out
-
-
 __all__ = [
     "DEFAULT_COEFF",
     "DEFAULT_ABLATION_COEFF",
@@ -1253,5 +1213,4 @@ __all__ = [
     "parse_expr",
     "format_expr",
     "referenced_selectors",
-    "referenced_manifolds",
 ]

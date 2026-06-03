@@ -16,7 +16,6 @@ from saklas.core.steering_expr import (
     SteeringExprError,
     format_expr,
     parse_expr,
-    referenced_manifolds,
     referenced_selectors,
 )
 from saklas.core.triggers import Trigger
@@ -320,13 +319,6 @@ def test_rejects_comma_coeffs_on_non_manifold(expr: str) -> None:
 
 
 # ------------------------------------------------------------- reference ---
-
-def test_referenced_manifolds():
-    refs = referenced_manifolds("emotions%0.5 + local/mood%0.2 + 0.3 angry")
-    assert (None, "emotions", "raw") in refs
-    assert ("local", "mood", "raw") in refs
-    assert len(refs) == 2
-
 
 def test_referenced_selectors_skips_manifolds():
     refs = referenced_selectors("emotions%0.5 + 0.3 angry")

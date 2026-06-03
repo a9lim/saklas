@@ -77,8 +77,14 @@ def _stub_session() -> SaklasSession:
     ``_manifolds``, ``_ensure_manifold_loaded``, ``_invalidate_prefix_cache``,
     ``_layers``.  Everything else stays as ``MagicMock`` defaults.
     """
+    # Manifold reads are Mahalanobis-only now: the monitor needs a covering
+    # whitener before ``add_probe`` builds the per-probe whitened factors.  An
+    # isotropic one over the toy layers (dim 8, up to 3 layers) suffices.
+    from tests._whitener import isotropic_whitener
+    _whit = isotropic_whitener([0, 1, 2, 3], 8)
+
     session = MagicMock(spec=SaklasSession)
-    session._manifold_monitor = ManifoldMonitor()
+    session._manifold_monitor = ManifoldMonitor(whitener=_whit)
     session._monitor = TraitMonitor({}, {})
     session._manifolds = {}
     # Capture has a single ``_per_layer`` dict we read for streaming.
@@ -214,10 +220,14 @@ def test_gating_callback_merges_vector_and_manifold_scalars():
     )
     session.add_manifold_probe("toy")
 
-    # Plant a vector probe — single layer, single direction so the
-    # TraitMonitor cache builds cleanly.
+    # Plant a vector probe — single layer, single direction.  Mahalanobis is
+    # mandatory, so the TraitMonitor gets an isotropic covering whitener.
+    from tests._whitener import isotropic_whitener
     profile = {0: torch.tensor([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])}
-    session._monitor = TraitMonitor({"vec_probe": profile}, {})
+    session._monitor = TraitMonitor(
+        {"vec_probe": profile}, {0: torch.zeros(8)},
+        whitener=isotropic_whitener([0], 8),
+    )
 
     # Latest-per-layer captures: place activation inside the manifold's
     # subspace at layer 0 + 1, plus the same vector for the vector probe.
@@ -262,8 +272,9 @@ def test_gating_callback_empty_capture_returns_empty():
 def test_score_aggregate_called_with_correct_captures():
     """Verify ``score_aggregate`` is called on the manifold monitor when
     probes are attached and gen produced tokens."""
+    from tests._whitener import isotropic_whitener
     m = _toy_manifold()
-    mon = ManifoldMonitor()
+    mon = ManifoldMonitor(whitener=isotropic_whitener(list(m.layers), 8))
     mon.add_probe("toy", m)
 
     # Build a captured stack at node 1's centroid (so coords come back

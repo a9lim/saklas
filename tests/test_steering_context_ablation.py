@@ -49,7 +49,6 @@ def _skeleton_session() -> SaklasSession:
     session._layer_means = {}
     session._steering = SteeringManager()
     session._steering_stack = []
-    session._steering_override_stack = []
     # v2.2: _push_steering / _pop_steering acquire _gen_lock; skeleton
     # mode never runs gen so the lock is uncontended, but the ``with
     # self._gen_lock:`` block needs the attribute to exist.
@@ -59,11 +58,10 @@ def _skeleton_session() -> SaklasSession:
     from saklas.core.session import GenState
     session._gen_phase = GenState.IDLE
     session._internal_steering_pop = False
-    session._projection_metric = "mahalanobis"
     session._whitener = None
-    # Skeleton session has no real model — stub the lazy whitener
-    # property to ``None`` so ``_materialize_projections`` falls back
-    # to Euclidean per-layer transparently.
+    # Skeleton session has no real model.  These ablation tests don't
+    # materialize ``~``/``|`` projections (which would now require a covering
+    # whitener), so the stub ``whitener`` property returns ``None``.
     type(session).whitener = property(lambda _self: None)  # pyright: ignore[reportAttributeAccessIssue]  # monkey-patching read-only property on type for skeleton stub
     session.events = EventBus()
     session._history = []  # pyright: ignore[reportAttributeAccessIssue]  # skeleton: _history is dynamically set

@@ -181,6 +181,7 @@ class ManifoldExtractionPipeline:
             ManifoldFolder, ManifoldSidecar, min_nodes,
         )
         from saklas.core.errors import SaeCoverageError
+        from saklas.core.mahalanobis import WhitenerError
 
         def _progress(msg: str) -> None:
             if on_progress:
@@ -331,9 +332,14 @@ class ManifoldExtractionPipeline:
                     f"can build"
                 )
             _wh = getattr(self._handle, "whitener", None)
-            maha = (
-                _wh if _wh is not None and _wh.covers_all(fit_layers) else None
-            )
+            if _wh is None or not _wh.covers_all(fit_layers):
+                raise WhitenerError(
+                    f"monopolar manifold {mf.name!r}: the Mahalanobis "
+                    f"whitener must cover every fit layer to bake the share "
+                    f"(regenerate the neutral activation cache for "
+                    f"{self._handle.model_id!r})"
+                )
+            maha = _wh
             concept_label = node_groups[0][0]
             directions: dict[int, torch.Tensor] = {}
             for idx in fit_layers:
@@ -371,11 +377,11 @@ class ManifoldExtractionPipeline:
                 "nodes_sha256": nodes_sha,
                 "monopolar": True,
                 # The fold keeps the raw δ̂ basis (``concept − ν`` cancels
-                # common-mode like DiM), so the subspace is Euclidean; only the
-                # share is whitened when the whitener covers the layers.
-                "share_metric": manifold.metadata.get(
-                    "share_metric", "euclidean",
-                ),
+                # common-mode like DiM by differencing), so the subspace is
+                # metric-free: ``subspace_metric`` is "euclidean" as a basis
+                # *label* (no whitened-PCA selection ran), not a fallback.
+                # The share is always whitened (the gate above guarantees it).
+                "share_metric": "mahalanobis",
                 "subspace_metric": "euclidean",
             }
             if sae_backend is not None:
@@ -567,24 +573,25 @@ class ManifoldExtractionPipeline:
         # 4. Per-layer fit.  Stack centroids -> (K, D); for the SAE
         #    variant reconstruct through the SAE before fitting.
         #
-        # Mahalanobis share weighting (parity with the vector bake metric):
-        # the whitener is resolved here, *after* the cache-hit return and
-        # the fail-fast SAE/role checks, since ``handle.whitener`` can
-        # trigger a lazy neutral-activation build — the same deferral the
-        # vector pipeline applies to its bake whitener.  We only bake the
-        # whitened share when the whitener covers *every* fit layer, so the
-        # apply-time cross-layer normalization compares like with like;
-        # partial coverage (or a handle without ``.whitener`` — CPU test
-        # stubs) leaves the dict empty and the apply path falls back to the
-        # Euclidean centroid-spread.  The basis is model-space for both raw
-        # and SAE fits (centroids are decoded back before the fit), so the
-        # residual-stream whitener applies to the SAE variant unchanged.
+        # Mahalanobis whitening is mandatory for an activation-space fit —
+        # without it the basis, mean, and steering direction get dominated by
+        # rogue (massive-activation) channels.  The whitener is resolved here,
+        # *after* the cache-hit return and the fail-fast SAE/role checks, since
+        # ``handle.whitener`` can trigger a lazy neutral-activation build.  It
+        # must cover *every* fit layer (so the cross-layer-normalized share
+        # compares like with like); partial coverage or a handle without a
+        # whitener is a hard error, not a Euclidean fallback.  The basis is
+        # model-space for both raw and SAE fits (centroids are decoded back
+        # before the fit), so the residual-stream whitener applies to the SAE
+        # variant unchanged.
         _whitener = getattr(self._handle, "whitener", None)
-        maha_whitener = (
-            _whitener
-            if _whitener is not None and _whitener.covers_all(fit_layers)
-            else None
-        )
+        if _whitener is None or not _whitener.covers_all(fit_layers):
+            raise WhitenerError(
+                f"manifold {mf.name!r}: the Mahalanobis whitener must cover "
+                f"every fit layer (regenerate the neutral activation cache "
+                f"for {self._handle.model_id!r})"
+            )
+        maha_whitener = _whitener
         _progress(
             f"Fitting RBF interpolant across {len(fit_layers)} layers..."
         )
@@ -621,10 +628,8 @@ class ManifoldExtractionPipeline:
         ) -> None:
             # Per-layer budget = the **μ-centered** (anchor-independent)
             # whitened spread (§5 / ``subspace_share``): the share measures
-            # signal spread, not where neutral sits.  Gated on the covers-all
-            # whitener; absent ⇒ Euclidean spread fallback at apply.
-            if maha_whitener is None:
-                return
+            # signal spread, not where neutral sits.  The whitener is
+            # guaranteed to cover every fit layer (checked above).
             mahalanobis_share[idx] = subspace_share(
                 mu_coords, sub.basis, whitener=maha_whitener, layer=idx,
             )
@@ -634,11 +639,10 @@ class ManifoldExtractionPipeline:
             # subspace, not an RBF surface (ARCHITECTURE §1/§5).  Per layer:
             # ``fit_affine_subspace`` (μ-centered PCA basis at the derived
             # intrinsic dim ``k``, neutral-anchored frame, real per-layer node
-            # coords).  **Whitened/Fisher basis** when the whitener covers every
-            # fit layer (Step 8 made this unconditional — the de-rogued basis is
-            # what makes the no-lever gain coherent; same ``covers_all`` gate as
-            # the curved path + the Mahalanobis share), Euclidean on the
-            # no-coverage fallback.  The shared ``node_coords`` stays the derived
+            # coords).  **Whitened/Fisher basis**, always — the de-rogued basis
+            # is what makes the no-lever gain coherent, and the whitener is
+            # mandatory (checked above), so there is no Euclidean fit path here.
+            # The shared ``node_coords`` stays the derived
             # PCA layout (display/labels); the real per-layer steer coords live
             # on each ``LayerSubspace.node_coords``.
             affine_kwargs = dict(fit_kwargs)
@@ -679,9 +683,7 @@ class ManifoldExtractionPipeline:
             for idx in fit_layers:
                 stacked = _stacked_centroids(idx)
                 # ``neutral_mean`` neutral-anchors the frame; ``maha_whitener``
-                # still selects the (whitened/Fisher) basis on the curved path
-                # — see the Step-3 basis-metric note (curved keeps its existing
-                # whitened selection pending the Step 8 gate decision).
+                # (mandatory, checked above) selects the whitened/Fisher basis.
                 sub, ev_ratio = fit_layer_subspace(
                     stacked, node_params,
                     whitener=maha_whitener, layer=idx,
@@ -737,22 +739,12 @@ class ManifoldExtractionPipeline:
         metadata: dict[str, Any] = {
             "method": method,
             "nodes_sha256": nodes_sha,
-            # Which metric the per-layer share weighting used — the
-            # manifold analogue of the vector sidecar's ``bake`` field.
-            # "mahalanobis" iff the whitened share was baked (whitener
-            # covered every fit layer); "euclidean" on fallback.
-            "share_metric": (
-                "mahalanobis" if maha_whitener is not None else "euclidean"
-            ),
-            # Which metric the per-layer PCA *subspace selection* used —
-            # "mahalanobis" => whitened/Fisher (de-rogued directions) when the
-            # whitener covers every fit layer, else "euclidean".  Both the flat
-            # (``pca``) and curved paths whiten under the same ``covers_all``
-            # gate as the share (Step 8 made the flat path unconditional), so
-            # subspace_metric and share_metric agree.
-            "subspace_metric": (
-                "mahalanobis" if maha_whitener is not None else "euclidean"
-            ),
+            # Provenance only (nothing branches on these at load).  The
+            # whitener is mandatory for an activation-space fit, so both the
+            # per-layer share weighting and the PCA *subspace selection* are
+            # always whitened/Fisher — no Euclidean fit path survives.
+            "share_metric": "mahalanobis",
+            "subspace_metric": "mahalanobis",
         }
         if sae_backend is not None:
             metadata["sae_release"] = sae_backend.release

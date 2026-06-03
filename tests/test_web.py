@@ -252,11 +252,17 @@ class TestScoreSingleTokenPerLayer:
         # layer 0, score against a hidden state.  No torch model needed.
         from saklas.core.monitor import TraitMonitor
 
+        from tests._whitener import isotropic_whitener
         probes = {
             "honest": {0: torch.tensor([1.0, 0.0, 0.0, 0.0])},
             "warm":   {0: torch.tensor([0.0, 1.0, 0.0, 0.0])},
         }
-        monitor = TraitMonitor(probes, layer_means={0: torch.zeros(4)})
+        # Mahalanobis-only: an isotropic whitener reproduces the Euclidean
+        # cosine for these axis-aligned probes (diagonal Σ⁻¹ ⇒ axis 0 ⊥ axis 1).
+        monitor = TraitMonitor(
+            probes, layer_means={0: torch.zeros(4)},
+            whitener=isotropic_whitener([0], 4),
+        )
 
         hidden = {0: torch.tensor([1.0, 0.0, 0.0, 0.0])}
         result = monitor.score_single_token_per_layer(hidden)
@@ -264,9 +270,9 @@ class TestScoreSingleTokenPerLayer:
         assert 0 in result
         assert set(result[0].keys()) == {"honest", "warm"}
         # Hidden state aligns perfectly with the honest direction; warm
-        # is orthogonal.
-        assert result[0]["honest"] == pytest.approx(1.0, abs=1e-4)
-        assert result[0]["warm"] == pytest.approx(0.0, abs=1e-4)
+        # is orthogonal (whitened cosine ≈ Euclidean under isotropic Σ).
+        assert result[0]["honest"] == pytest.approx(1.0, abs=2e-2)
+        assert result[0]["warm"] == pytest.approx(0.0, abs=2e-2)
 
     def test_empty_input_returns_empty(self) -> None:
         from saklas.core.monitor import TraitMonitor
@@ -279,10 +285,12 @@ class TestScoreSingleTokenPerLayer:
 
     def test_layers_outside_probe_cache_omitted(self) -> None:
         from saklas.core.monitor import TraitMonitor
+        from tests._whitener import isotropic_whitener
 
         monitor = TraitMonitor(
             {"honest": {0: torch.tensor([1.0, 0.0, 0.0, 0.0])}},
             layer_means={0: torch.zeros(4)},
+            whitener=isotropic_whitener([0], 4),
         )
         # Hidden state at layer 1, but honest only covers layer 0.
         hidden = {1: torch.tensor([1.0, 0.0, 0.0, 0.0])}

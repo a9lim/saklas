@@ -16,18 +16,16 @@ resulting :class:`Selector` instances down.
 """
 from __future__ import annotations
 
-import re as _re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 from saklas.core.errors import SaklasError
 from saklas.io.packs import NAME_REGEX
-from saklas.io.paths import manifold_dir, manifolds_dir
+from saklas.io.paths import VARIANT_SUFFIX_RE, manifold_dir, manifolds_dir
 
-_VARIANT_REGEX = _re.compile(
-    r"^(raw|sae(?:-[a-z0-9._-]+)?|role(?:-[a-z0-9._-]+)?|from(?:-[a-z0-9._-]+)?)$"
-)
+# Single source of truth lives in ``io.paths`` (owns the variant scheme).
+_VARIANT_REGEX = VARIANT_SUFFIX_RE
 
 
 class SelectorError(ValueError, SaklasError):

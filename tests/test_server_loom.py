@@ -658,10 +658,9 @@ class TestTranscript:
         body = resp.json()
         assert body["node_id"] == a1
         text = body["yaml"]
-        # Phase 5 switched to pyyaml's safe_dump; safe-scalar strings like
+        # to_yaml uses pyyaml's safe_dump; safe-scalar strings like
         # ``test/model`` and ``hello`` come back unquoted (valid YAML).  We
-        # check substrings rather than exact quoting form so both the
-        # pyyaml path and the in-tree _emit_yaml_minimal fallback round-trip.
+        # check substrings rather than exact quoting form.
         assert "saklas_transcript: 1" in text
         assert "model_id:" in text and "test/model" in text
         # Probes block exists (empty in this stub)

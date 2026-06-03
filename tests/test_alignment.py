@@ -117,9 +117,21 @@ class TestFitAlignment:
 
 
 class TestTransferProfile:
+    # Transfer is Mahalanobis-only (4.0 collapse): the target-metric share
+    # re-bake is mandatory, so every transfer needs a target whitener covering
+    # the transferred layers (there is no Euclidean transfer).
+    @staticmethod
+    def _whitener(dim: int, layers):
+        from saklas.core.mahalanobis import LayerWhitener
+        g = torch.Generator().manual_seed(7)
+        acts = {L: torch.randn(120, dim, generator=g) for L in layers}
+        means = {L: torch.zeros(dim) for L in layers}
+        return LayerWhitener.from_neutral_activations(acts, means)
+
     def test_applies_per_layer_map_and_records_provenance(self) -> None:
         torch.manual_seed(0)
-        # Identity alignment — transferred values should equal source.
+        # Identity alignment — direction preserved (magnitude re-baked to the
+        # target Mahalanobis norm).
         D = 4
         eye = torch.eye(D)
         M = {0: eye, 2: eye, 5: eye}
@@ -135,16 +147,22 @@ class TestTransferProfile:
             src_profile, M,
             source_model_id="google/gemma-3-4b-it",
             transfer_quality_estimate=0.85,
+            whitener=self._whitener(D, [0, 2, 5]),
         )
 
         assert transferred.layers == [0, 2, 5]
+        # Identity alignment ⇒ direction preserved (only magnitude re-baked).
         for layer in transferred.layers:
-            assert torch.allclose(transferred[layer], src_profile[layer], atol=1e-5)
+            sv = src_profile[layer].float()
+            tv = transferred[layer].float()
+            cos = torch.dot(sv / sv.norm(), tv / tv.norm())
+            assert abs(float(cos)) == pytest.approx(1.0, abs=1e-5)
 
-        # Provenance survives the wrap.
+        # Provenance survives the wrap; the re-bake is Mahalanobis.
         assert transferred.metadata["method"] == "procrustes_transfer"
         assert transferred.metadata["source_model_id"] == "google/gemma-3-4b-it"
         assert transferred.metadata["transfer_quality_estimate"] == pytest.approx(0.85)
+        assert transferred.metadata["bake"] == "mahalanobis"
 
     def test_drops_uncovered_layers(self) -> None:
         D = 4
@@ -153,8 +171,11 @@ class TestTransferProfile:
             {0: torch.ones(D), 2: torch.ones(D), 5: torch.ones(D)},
             metadata={"method": "contrastive_pca"},
         )
+        # The whitener covers the transferred (alignment-covered) layers {0, 5};
+        # layer 2 is dropped by the alignment before the whitener gate.
         transferred = transfer_profile(
             src_profile, M, source_model_id="src/model",
+            whitener=self._whitener(D, [0, 5]),
         )
         assert transferred.layers == [0, 5]
 

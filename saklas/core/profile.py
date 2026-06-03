@@ -6,9 +6,10 @@ sidecar (safetensors path) or a llama.cpp control-vector GGUF (gguf path).
 This class is purely the Python-level surface the rest of saklas uses so
 that callers stop passing bare ``dict[int, Tensor]`` around.
 
-The underlying tensors are "baked": share and reference norm are folded
-into the magnitude at extraction time (see
-``vectors.extract_difference_of_means``).  A ``Profile`` is just a thin
+The underlying tensors are "baked": the per-layer Mahalanobis share is
+folded into the magnitude at extraction time (see
+``extraction.ManifoldExtractionPipeline`` /
+``vectors.fold_directions_to_subspace``).  A ``Profile`` is just a thin
 wrapper; the dict stays the canonical shape at rest and the unified
 subspace kernel reads the baked magnitudes as per-layer weights.
 """
@@ -308,32 +309,28 @@ class Profile:
         per_layer: bool = False,
         whitener: "Any | None" = None,
     ) -> "float | dict[int, float]":
-        """Cosine similarity against *other*.
+        """Cosine similarity against *other* (Mahalanobis only).
 
-        **Aggregate** (default): magnitude-weighted cosine over the layer
-        intersection.  Weighting by ``||baked||`` matches the monitor regime.
+        **Aggregate** (default): Mahalanobis-norm-weighted cosine over the
+        layer intersection.  Weighting matches the monitor regime.
 
-        **Per-layer** (``per_layer=True``): raw cosine per shared layer.
+        **Per-layer** (``per_layer=True``): Mahalanobis cosine per shared
+        layer.
 
-        **Whitened metric** (``whitener=<LayerWhitener>``): switches to
-        Mahalanobis cosine ``<u, v>_M = u^T Σ^{-1} v``.  Reduces to plain
-        cosine when ``Σ = I``; predicts cross-domain probe generalization
-        better than plain cosine on activation distributions with strongly
-        anisotropic covariance.  The aggregate still weights by Mahalanobis
-        norms (analogous to the Euclidean-magnitude weighting), so the
-        scalar result is on the same ``[-1, 1]`` scale.
+        The metric is Mahalanobis cosine ``<u, v>_M = u^T Σ^{-1} v`` —
+        predicts cross-domain probe generalization better than plain
+        cosine on activation distributions with strongly anisotropic
+        covariance.
 
-        The metric is decided **all-or-nothing** via
-        :meth:`LayerWhitener.covers_all` over the shared layer set:
-        Mahalanobis only when the whitener covers *every* shared layer,
-        else plain Euclidean cosine for *all* shared layers — never a
-        per-layer mix.  Mixing would fold cosines measured under two
-        different metrics into one aggregate, comparing incommensurable
-        magnitudes (``‖·‖_M`` carries a ``1/√λ_L`` factor that ``‖·‖_2``
-        doesn't, and it doesn't cancel across the cross-layer aggregate).
+        The ``whitener`` (a :class:`LayerWhitener`) is **required** and
+        must cover *every* shared layer, via
+        :meth:`LayerWhitener.covers_all`.  There is no Euclidean path: a
+        missing or non-covering whitener raises :class:`WhitenerError`.
 
         Raises :class:`ProfileError` when no layers are shared.
         """
+        from saklas.core.mahalanobis import WhitenerError
+
         shared = sorted(set(self._tensors) & set(other._tensors))
         if not shared:
             raise ProfileError(
@@ -352,45 +349,34 @@ class Profile:
                 af, bf = af.cpu(), bf.cpu()
             return af, bf
 
-        # All-or-nothing metric gate over the shared set: whiten every
-        # shared layer or none (see ``covers_all`` — incommensurable
-        # per-layer scales forbid a mix).  Bind the narrowed whitener once
-        # so the metric decision (and the type narrowing) is made a single
-        # time, mirroring ``extraction.py``'s ``maha_whitener`` idiom.
-        maha = whitener if (whitener is not None and whitener.covers_all(shared)) else None
+        # Mahalanobis-only: the whitener must cover every shared layer.
+        # No Euclidean fallback — a missing or partial whitener is an error.
+        if whitener is None or not whitener.covers_all(shared):
+            raise WhitenerError(
+                "cosine_similarity requires a Mahalanobis whitener covering "
+                f"every shared layer {shared}; regenerate the neutral "
+                "activation cache for this model (the Euclidean path is gone)"
+            )
 
         if per_layer:
             out: dict[int, float] = {}
             for L in shared:
                 a, b = _aligned(self._tensors[L], other._tensors[L])
-                if maha is not None:
-                    out[L] = maha.mahalanobis_cosine(L, a, b)
-                else:
-                    out[L] = (
-                        torch.dot(a, b) / (a.norm() * b.norm())
-                    ).item()
+                out[L] = whitener.mahalanobis_cosine(L, a, b)
             return out
 
-        # Magnitude-weighted aggregate.  Under Mahalanobis, the per-layer
-        # weight uses Mahalanobis norms (same role as ``||baked||`` in the
-        # Euclidean case — directions whose typical activations don't
-        # cover them dominate the average less, mirroring the monitor
-        # regime).
+        # Mahalanobis-norm-weighted aggregate: directions whose typical
+        # activations don't cover them dominate the average less, mirroring
+        # the monitor regime.
         num = 0.0
         den = 0.0
         for L in shared:
             a, b = _aligned(self._tensors[L], other._tensors[L])
-            if maha is not None:
-                na = maha.mahalanobis_norm(L, a)
-                nb = maha.mahalanobis_norm(L, b)
-                if na < 1e-12 or nb < 1e-12:
-                    continue
-                cos = maha.mahalanobis_dot(L, a, b) / (na * nb)
-            else:
-                na, nb = a.norm().item(), b.norm().item()
-                if na < 1e-12 or nb < 1e-12:
-                    continue
-                cos = (torch.dot(a, b) / (na * nb)).item()
+            na = whitener.mahalanobis_norm(L, a)
+            nb = whitener.mahalanobis_norm(L, b)
+            if na < 1e-12 or nb < 1e-12:
+                continue
+            cos = whitener.mahalanobis_dot(L, a, b) / (na * nb)
             w = na * nb
             num += w * cos
             den += w

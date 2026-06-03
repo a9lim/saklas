@@ -697,15 +697,14 @@ class LayerSubspace:
         ``None`` for a bare span with no associated nodes.
         """
         r = int(basis.shape[0])
-        ref = mean
         return cls(
             mean=mean,
             basis=basis,
             node_params=None,
             rbf_weights=None,
             poly_coeffs=None,
-            coord_offset=torch.zeros(r, device=ref.device, dtype=ref.dtype),
-            coord_scale=torch.ones(r, device=ref.device, dtype=ref.dtype),
+            coord_offset=torch.zeros(r, device=mean.device, dtype=mean.dtype),
+            coord_scale=torch.ones(r, device=mean.device, dtype=mean.dtype),
             node_coords=node_coords,
         )
 
@@ -1592,6 +1591,19 @@ def synthesize_subspace(
 _TANGENT_GRAM_RIDGE = 1e-6
 
 
+def _soft_norm_cap(
+    h_new: torch.Tensor, h_f32: torch.Tensor, norm_cap: float,
+) -> torch.Tensor:
+    """Soft cap ``‖h_new‖ ≤ norm_cap·‖h‖`` — the off-domain RBF-extrapolation
+    blowup guard shared by the affine shortcut and the curved injection path."""
+    norm_pre = torch.linalg.vector_norm(h_f32, dim=-1, keepdim=True)
+    norm_post = torch.linalg.vector_norm(h_new, dim=-1, keepdim=True)
+    cap = norm_cap * norm_pre
+    return torch.where(
+        norm_post > cap, h_new * (cap / norm_post.clamp(min=1e-6)), h_new,
+    )
+
+
 def subspace_inject(
     h: torch.Tensor,
     subspace: LayerSubspace,
@@ -1669,12 +1681,7 @@ def subspace_inject(
         new_par = p_new @ basis                        # (.., D)
         new_perp = h_perp                              # (.., D) kept verbatim
         h_new = mean + new_par + new_perp
-        norm_pre = torch.linalg.vector_norm(h_f32, dim=-1, keepdim=True)
-        norm_post = torch.linalg.vector_norm(h_new, dim=-1, keepdim=True)
-        cap = norm_cap * norm_pre
-        h_new = torch.where(
-            norm_post > cap, h_new * (cap / norm_post.clamp(min=1e-6)), h_new,
-        )
+        h_new = _soft_norm_cap(h_new, h_f32, norm_cap)
         return h_new.to(h.dtype), q
 
     np_, rw, pc = subspace.rbf_params()
@@ -1739,12 +1746,7 @@ def subspace_inject(
     # Soft safety cap: only fires on pathological off-domain RBF extrapolation
     # (clamp_position keeps p_new in-box for open axes, so this is belt-and-
     # suspenders, not the norm semantic — onto is allowed to shrink ‖h‖).
-    norm_pre = torch.linalg.vector_norm(h_f32, dim=-1, keepdim=True)
-    norm_post = torch.linalg.vector_norm(h_new, dim=-1, keepdim=True)
-    cap = norm_cap * norm_pre
-    h_new = torch.where(
-        norm_post > cap, h_new * (cap / norm_post.clamp(min=1e-6)), h_new,
-    )
+    h_new = _soft_norm_cap(h_new, h_f32, norm_cap)
     return h_new.to(h.dtype), p
 
 

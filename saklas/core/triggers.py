@@ -83,7 +83,7 @@ class Trigger:
     prompt:    apply during prompt prefill (single forward over input_ids).
     generated: apply during decode (one forward per generated token).
     thinking:  apply when the current decode step is emitting thinking
-               content (``ThinkingState.THINKING``). Ignored during prefill.
+               content. Ignored during prefill.
     response:  apply when the current decode step is in the non-thinking
                response region (all post-thinking states). Ignored during
                prefill. A preamble/channel-delimiter step is treated as
@@ -215,8 +215,8 @@ class TriggerContext:
     * ``is_prefill`` — True during the first forward pass (the one that
       processes the full prompt); False thereafter.
     * ``thinking`` — True while the decode step is inside a thinking
-      section (``ThinkingState.THINKING``); False in prompt, preamble,
-      response, and post-termination states.
+      section; False in prompt, preamble, response, and post-termination
+      states.
     * ``gen_step`` — monotonically increasing index of the generated
       token position the current forward is about to produce. 0 during
       prefill and during the first decode; incremented after the sample.

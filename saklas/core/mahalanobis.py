@@ -199,10 +199,9 @@ class LayerWhitener:
             # non-finite (a corrupt or legacy-fp16-overflowed neutral-
             # activation cache — gemma-3's late-layer channels exceed the
             # fp16 max and stored as ±inf).  Skipping leaves the layer
-            # *uncovered*, so the all-or-nothing ``covers_all`` gate routes
-            # every consumer (monitor read, DiM bake, manifold share) to
-            # Euclidean for the whole set rather than mixing a nan-bearing
-            # layer in.  With the bf16 neutral-activation store this never
+            # *uncovered*, so ``covers_all`` is False and consumers raise
+            # (there is no Euclidean path; regenerate the fp32 neutral
+            # cache).  With the fp32 neutral-activation store this never
             # triggers in practice; it is the single robustness guarantee
             # that lets callers trust ``covers_all`` without their own
             # finite-check.
@@ -301,9 +300,10 @@ class LayerWhitener:
         # in-memory dtype, since the small N×N inverse doesn't tolerate a
         # reduced-precision condition number.  ``from_neutral_activations``
         # skips any layer whose values come back non-finite (a legacy fp16
-        # cache that overflowed on an extreme-activation channel), so a
-        # corrupt cache degrades to Euclidean rather than poisoning the
-        # inverse.
+        # cache that overflowed on an extreme-activation channel) rather than
+        # poisoning the inverse, leaving that layer uncovered — so a corrupt
+        # cache makes ``covers_all`` False and consumers raise (no Euclidean
+        # path), it doesn't silently degrade.
         means = _decode_layer_tensor_map(means_raw, label=f"{model_id} layer_means")
         acts = _decode_layer_tensor_map(
             acts_raw, label=f"{model_id} neutral_activations",
@@ -365,9 +365,9 @@ class LayerWhitener:
         scores live on different scales (``‖·‖_M`` carries a ``1/√λ_L``
         factor that ``‖·‖_2`` doesn't), so mixing metrics across the layers
         of one cross-layer-normalized share weight would compare
-        incommensurable magnitudes.  Callers fall back to all-Euclidean
-        when this returns ``False`` rather than whitening only the covered
-        subset.  Empty ``layers`` → ``True`` (vacuous).
+        incommensurable magnitudes.  Callers RAISE when this returns
+        ``False`` (there is no Euclidean path); the gate is now
+        coverage-or-error.  Empty ``layers`` → ``True`` (vacuous).
         """
         return all(layer in self._X for layer in layers)
 

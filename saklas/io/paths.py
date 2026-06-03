@@ -30,11 +30,14 @@ _VARIANT_SEPARATORS: tuple[tuple[str, str], ...] = (
     (_VARIANT_SEP_FROM, "from"),
     (_VARIANT_SEP_ROLE, "role"),
 )
-# Back-compat: the old single-separator alias many callers already
-# imported.  Kept identical to the SAE form because that's what every
-# external caller meant when they reached for it pre-1.6.
-_VARIANT_SEP = _VARIANT_SEP_SAE
 _UNSAFE_VARIANT_CHARS = re.compile(r"[^a-z0-9._-]+")
+
+# The trailing ``:<variant>`` scheme understood across selectors / runners.
+# One source of truth for the variant suffix grammar (this module owns the
+# tensor-filename variant scheme); ``io.selectors`` and ``cli.runners`` import it.
+VARIANT_SUFFIX_RE = re.compile(
+    r"^(raw|sae(?:-[a-z0-9._-]+)?|role(?:-[a-z0-9._-]+)?|from(?:-[a-z0-9._-]+)?)$"
+)
 
 def saklas_home() -> Path:
     """Return the root ~/.saklas/ directory. Honors $SAKLAS_HOME override."""
@@ -117,22 +120,12 @@ def model_dir(model_id: str) -> Path:
     return ensure_within(models_dir(), safe_model_id(model_id))
 
 
-def safe_variant_suffix(release: str | None) -> str:
-    """Render the SAE filename suffix.  ``None``/``""`` = raw (no suffix).
-
-    Kept for back-compat with callers that pre-date the v1.6 transfer
-    variant.  New code should prefer :func:`safe_sae_suffix` for SAE or
-    :func:`safe_from_suffix` for transferred profiles.
-    """
+def safe_sae_suffix(release: str | None) -> str:
+    """Filename suffix for an SAE variant.  ``None``/``""`` = raw (no suffix)."""
     if not release:
         return ""
     slug = _UNSAFE_VARIANT_CHARS.sub("_", release.lower())
     return f"{_VARIANT_SEP_SAE}{slug}"
-
-
-def safe_sae_suffix(release: str | None) -> str:
-    """Filename suffix for an SAE variant.  ``None``/``""`` = raw."""
-    return safe_variant_suffix(release)
 
 
 def safe_from_suffix(source_safe_id: str | None) -> str:

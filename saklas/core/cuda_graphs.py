@@ -1,4 +1,4 @@
-"""CUDA-graphs / StaticCache support (Phase B of v2.2's perf push).
+"""CUDA-graphs / StaticCache support.
 
 When enabled (``cuda_graphs=True`` + device==cuda + supported architecture
 + fast-path-eligible steering), generation routes through

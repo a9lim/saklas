@@ -4,6 +4,12 @@ Pure tensor math is tested in ``TestProjectProfile``; the session-level
 integration rides on the same ``_Stub`` pattern used by
 ``test_steering_context.py`` — a ``SaklasSession`` that bypasses the
 model-loading machinery and pre-registers profiles directly.
+
+Mahalanobis-only (4.0 collapse): ``project_profile`` is the closed-form LEACE
+projector and *requires* a whitener covering every projected layer — there is
+no Euclidean path, and no per-call ``projection_metric`` override.  Every call
+here passes a synthetic covering whitener; the operator semantics are asserted
+structurally (``|`` ⇒ M-orthogonal to ``onto``; ``~`` ⇒ parallel to ``onto``).
 """
 from __future__ import annotations
 
@@ -13,140 +19,199 @@ import pytest
 import torch
 
 from saklas.core.events import EventBus
+from saklas.core.mahalanobis import WhitenerError
 from saklas.core.session import (
     SaklasSession, VectorNotRegisteredError,
 )
 from saklas.core.steering_expr import parse_expr
 from saklas.core.triggers import Trigger
 from saklas.core.vectors import project_profile
+from tests._whitener import synthetic_means, synthetic_whitener
+
+
+def _whit(layers: Any, dim: int):
+    """A covering whitener with zero neutral means (no recentering)."""
+    layers = list(layers)
+    means = {L: torch.zeros(dim) for L in layers}
+    return synthetic_whitener(layers, dim, means=means)
+
+
+def _m_dot(w: Any, layer: int, u: torch.Tensor, v: torch.Tensor) -> float:
+    return w.mahalanobis_dot(layer, u.float(), v.float())
 
 
 # ------------------------------------------------------- project_profile ---
 
 class TestProjectProfile:
     def test_orthogonal_to_parallel_is_zero(self):
+        w = _whit([0], 2)
         base = {0: torch.tensor([1.0, 0.0])}
         onto = {0: torch.tensor([1.0, 0.0])}
-        out = project_profile(base, onto, "|")
-        assert torch.allclose(out[0], torch.zeros(2), atol=1e-6)
+        out = project_profile(base, onto, "|", whitener=w)
+        # base ∥ onto ⇒ removing the onto-component leaves ~0.
+        assert torch.allclose(out[0], torch.zeros(2), atol=1e-5)
 
     def test_onto_of_parallel_is_base(self):
+        w = _whit([0], 2)
         base = {0: torch.tensor([2.0, 0.0])}
         onto = {0: torch.tensor([1.0, 0.0])}
-        out = project_profile(base, onto, "~")
-        assert torch.allclose(out[0], torch.tensor([2.0, 0.0]), atol=1e-6)
+        out = project_profile(base, onto, "~", whitener=w)
+        # base ∥ onto ⇒ the onto-component is base itself.
+        assert torch.allclose(out[0], torch.tensor([2.0, 0.0]), atol=1e-5)
 
-    def test_orthogonal_drops_shared_axis(self):
-        # base = [1, 1]; onto = [1, 0].  Projection onto = [1, 0]; orthogonal = [0, 1].
-        base = {0: torch.tensor([1.0, 1.0])}
-        onto = {0: torch.tensor([1.0, 0.0])}
-        out_ortho = project_profile(base, onto, "|")
-        assert torch.allclose(out_ortho[0], torch.tensor([0.0, 1.0]), atol=1e-6)
+    def test_orthogonal_result_is_m_orthogonal_to_onto(self):
+        w = _whit([0], 4)
+        base = {0: torch.tensor([1.0, 1.0, 0.5, 0.0])}
+        onto = {0: torch.tensor([1.0, 0.0, 0.0, 0.0])}
+        out = project_profile(base, onto, "|", whitener=w)
+        # LEACE ``|`` erases the onto-direction under the M-metric.
+        assert _m_dot(w, 0, out[0], onto[0]) == pytest.approx(0.0, abs=1e-4)
 
-    def test_onto_keeps_shared_axis(self):
-        base = {0: torch.tensor([1.0, 1.0])}
-        onto = {0: torch.tensor([1.0, 0.0])}
-        out_onto = project_profile(base, onto, "~")
-        assert torch.allclose(out_onto[0], torch.tensor([1.0, 0.0]), atol=1e-6)
+    def test_onto_result_is_parallel_to_onto(self):
+        w = _whit([0], 4)
+        base = {0: torch.tensor([1.0, 1.0, 0.5, 0.0])}
+        onto = {0: torch.tensor([1.0, 0.0, 0.0, 0.0])}
+        out = project_profile(base, onto, "~", whitener=w)
+        # ``~`` keeps the onto-component: result is a scalar multiple of onto.
+        ratio = out[0] / onto[0].clamp(min=1e-9)
+        # All non-zero entries of onto share one ratio; onto here is e0.
+        assert out[0][1:].abs().max() < 1e-5
 
-    def test_multi_layer(self):
+    def test_decomposition_recombines_to_base(self):
+        """``~`` + ``|`` partition base: their sum is base (LEACE identity)."""
+        w = _whit([0], 4)
+        base = {0: torch.tensor([1.0, 1.0, 0.5, -0.3])}
+        onto = {0: torch.tensor([0.7, 0.2, 0.0, 0.0])}
+        par = project_profile(base, onto, "~", whitener=w)[0]
+        perp = project_profile(base, onto, "|", whitener=w)[0]
+        assert torch.allclose(par + perp, base[0], atol=1e-4)
+
+    def test_multi_layer_m_orthogonal(self):
+        w = _whit([0, 1], 4)
         base = {
-            0: torch.tensor([1.0, 1.0]),
-            1: torch.tensor([2.0, 2.0]),
+            0: torch.tensor([1.0, 1.0, 0.0, 0.0]),
+            1: torch.tensor([2.0, 2.0, 0.0, 0.0]),
         }
         onto = {
-            0: torch.tensor([1.0, 0.0]),
-            1: torch.tensor([0.0, 1.0]),
+            0: torch.tensor([1.0, 0.0, 0.0, 0.0]),
+            1: torch.tensor([0.0, 1.0, 0.0, 0.0]),
         }
-        out = project_profile(base, onto, "|")
-        assert torch.allclose(out[0], torch.tensor([0.0, 1.0]), atol=1e-6)
-        assert torch.allclose(out[1], torch.tensor([2.0, 0.0]), atol=1e-6)
+        out = project_profile(base, onto, "|", whitener=w)
+        assert _m_dot(w, 0, out[0], onto[0]) == pytest.approx(0.0, abs=1e-4)
+        assert _m_dot(w, 1, out[1], onto[1]) == pytest.approx(0.0, abs=1e-4)
 
     def test_missing_onto_layer_passes_through_for_ortho(self):
+        w = _whit([0, 1], 2)
         base = {0: torch.tensor([1.0, 0.0]), 1: torch.tensor([0.5, 0.5])}
         onto = {0: torch.tensor([1.0, 0.0])}
-        out = project_profile(base, onto, "|")
+        out = project_profile(base, onto, "|", whitener=w)
         assert 1 in out
+        # Layer 1 has no onto ⇒ passes through verbatim.
         assert torch.allclose(out[1], torch.tensor([0.5, 0.5]), atol=1e-6)
-        assert torch.allclose(out[0], torch.zeros(2), atol=1e-6)
+        assert torch.allclose(out[0], torch.zeros(2), atol=1e-5)
 
     def test_missing_onto_layer_drops_for_onto(self):
+        w = _whit([0, 1], 2)
         base = {0: torch.tensor([1.0, 0.0]), 1: torch.tensor([0.5, 0.5])}
         onto = {0: torch.tensor([1.0, 0.0])}
-        out = project_profile(base, onto, "~")
+        out = project_profile(base, onto, "~", whitener=w)
         assert 1 not in out
         assert 0 in out
 
     def test_near_zero_onto_passes_base_for_ortho(self):
+        w = _whit([0], 2)
         base = {0: torch.tensor([1.0, 0.0])}
         onto = {0: torch.tensor([1e-20, 0.0])}
-        out = project_profile(base, onto, "|")
+        out = project_profile(base, onto, "|", whitener=w)
         assert torch.allclose(out[0], torch.tensor([1.0, 0.0]), atol=1e-6)
 
     def test_near_zero_onto_drops_for_onto_operator(self):
+        w = _whit([0], 2)
         base = {0: torch.tensor([1.0, 0.0])}
         onto = {0: torch.tensor([1e-20, 0.0])}
         with pytest.raises(ValueError):
-            project_profile(base, onto, "~")
+            project_profile(base, onto, "~", whitener=w)
 
     def test_unknown_operator_raises(self):
+        w = _whit([0], 1)
         base = {0: torch.tensor([1.0])}
         onto = {0: torch.tensor([1.0])}
         with pytest.raises(ValueError):
-            project_profile(base, onto, "@")
+            project_profile(base, onto, "@", whitener=w)
 
-    def test_empty_intersection_raises_for_ortho(self):
+    def test_passthrough_intersection_for_ortho(self):
+        w = _whit([0], 1)
         base = {0: torch.tensor([1.0])}
         onto = {7: torch.tensor([1.0])}
         # "|" passes through layer 0 (not in onto), so the result has
         # layer 0 — non-empty.
-        out = project_profile(base, onto, "|")
+        out = project_profile(base, onto, "|", whitener=w)
         assert set(out.keys()) == {0}
 
     def test_empty_intersection_raises_for_onto_operator(self):
+        w = _whit([0], 1)
         base = {0: torch.tensor([1.0])}
         onto = {7: torch.tensor([1.0])}
         with pytest.raises(ValueError):
-            project_profile(base, onto, "~")
+            project_profile(base, onto, "~", whitener=w)
 
     def test_result_dtype_matches_base(self):
+        w = _whit([0], 2)
         base = {0: torch.tensor([1.0, 1.0], dtype=torch.float16)}
         onto = {0: torch.tensor([1.0, 0.0], dtype=torch.float16)}
-        out = project_profile(base, onto, "|")
+        out = project_profile(base, onto, "|", whitener=w)
         assert out[0].dtype == torch.float16
+
+    def test_missing_whitener_raises(self):
+        base = {0: torch.tensor([1.0, 0.0])}
+        onto = {0: torch.tensor([1.0, 0.0])}
+        with pytest.raises(WhitenerError, match="whitener"):
+            project_profile(base, onto, "|")
+
+    def test_partial_coverage_raises(self):
+        w = _whit([0], 2)  # covers layer 0 only
+        base = {0: torch.tensor([1.0, 0.0]), 1: torch.tensor([0.0, 1.0])}
+        onto = {0: torch.tensor([1.0, 0.0]), 1: torch.tensor([0.0, 1.0])}
+        with pytest.raises(WhitenerError, match="whitener"):
+            project_profile(base, onto, "|", whitener=w)
 
 
 # ---------------------------------------------- session-level integration ---
 
 class _Stub(SaklasSession):
-    """SaklasSession without real model/tokenizer, mirrors test_steering_context."""
+    """SaklasSession without real model/tokenizer, mirrors test_steering_context.
+
+    Projection materialization is Mahalanobis-only, so the stub exposes a real
+    covering whitener over the registered profiles' layer/dim (no model load).
+    """
     def __init__(self, profiles: dict[str, Any]) -> None:
         import threading
         self._profiles = dict(profiles)
         self._steering_stack = []
-        self._steering_override_stack = []
         # v2.2: _push_steering / _pop_steering acquire _gen_lock and
         # consult _gen_phase + _internal_steering_pop.
         self._gen_lock = threading.RLock()
         from saklas.core.session import GenState
         self._gen_phase = GenState.IDLE
         self._internal_steering_pop = False
-        # Session-level default consulted by ``_resolve_projection_metric``
-        # when the override LIFO has no entries.
-        self._projection_metric = "mahalanobis"
-        self._whitener = None
         self._layer_means = {}
         self.events = EventBus()
         self._rebuild_calls: list[dict[str, Any]] = []
         self._rebuild_entries: list[dict[str, Any]] = []
+        # Build a covering whitener over the union of profile layers/dim so
+        # ``_materialize_projections`` → ``project_profile`` has its mandatory
+        # whitener.  ``None`` when there are no profiles (degenerate stub).
+        layers: set[int] = set()
+        dim = 0
+        for prof in profiles.values():
+            for L, t in prof.items():
+                layers.add(L)
+                dim = t.shape[-1]
+        self._stub_whitener = _whit(sorted(layers), dim) if layers else None
 
     @property
-    def whitener(self) -> None:
-        # No model in stub mode — return None so
-        # ``_materialize_projections`` falls back to Euclidean
-        # per-layer (the path real sessions hit when neutrals aren't
-        # cached yet).
-        return None
+    def whitener(self) -> Any:
+        return self._stub_whitener
 
     def _rebuild_steering_hooks(self) -> None:
         flat = self._flatten_steering_stack()
@@ -179,9 +244,10 @@ class TestSessionProjection:
         steering = parse_expr("0.5 a|b")
         with s.steering(steering):
             assert "a|b" in s._profiles
-            # Registered projection is orthogonal: [0, 1] (the y-component).
-            assert torch.allclose(
-                s._profiles["a|b"][0], torch.tensor([0.0, 1.0]), atol=1e-6,
+            # LEACE ``|`` erases b under the session's M-metric.
+            proj = s._profiles["a|b"][0]
+            assert _m_dot(s.whitener, 0, proj, _profile_b()[0]) == pytest.approx(
+                0.0, abs=1e-4,
             )
             assert s._rebuild_calls[-1] == {"a|b": 0.5}
 
@@ -190,9 +256,9 @@ class TestSessionProjection:
         steering = parse_expr("0.5 a~b")
         with s.steering(steering):
             assert "a~b" in s._profiles
-            assert torch.allclose(
-                s._profiles["a~b"][0], torch.tensor([1.0, 0.0]), atol=1e-6,
-            )
+            # ``~`` keeps the b-component: result ∥ b (b = e0, so only x ≠ 0).
+            proj = s._profiles["a~b"][0]
+            assert proj[1].abs() < 1e-5
 
     def test_mixed_plain_and_projection(self):
         s = _Stub({"a": _profile_a(), "b": _profile_b()})
@@ -229,11 +295,12 @@ class TestSessionProjection:
         s = _Stub({"a": _profile_a(), "b": _profile_b()})
         with s.steering(parse_expr("1.0 a|b")):
             projected = s._profiles["a|b"][0].clone()
-        # Baseline is a = [1, 1]; orthogonal-to-b strips x-component -> [0, 1].
-        assert not torch.allclose(
-            projected, _profile_a()[0], atol=1e-3,
+        # The orthogonalized direction differs from the raw "a".
+        assert not torch.allclose(projected, _profile_a()[0], atol=1e-3)
+        # And it is M-orthogonal to b.
+        assert _m_dot(s.whitener, 0, projected, _profile_b()[0]) == pytest.approx(
+            0.0, abs=1e-4,
         )
-        assert torch.allclose(projected, torch.tensor([0.0, 1.0]), atol=1e-6)
 
     def test_nested_projection_scopes(self):
         # Keys "a" and "a|b" don't collide, so nesting leaves both active
@@ -246,129 +313,13 @@ class TestSessionProjection:
             assert s._rebuild_calls[-1] == {"a": 0.3}
         assert s._rebuild_calls[-1] == {}
 
-
-# ---------------------------------------- v2.1 metric-default integration ---
-
-class _MetricStub(_Stub):
-    """Variant of ``_Stub`` that lets tests select a metric and stand-in
-    whitener.  ``project_profile`` is patched per-test to record kwarg
-    shape rather than do real math.
-    """
-
-    def __init__(
-        self,
-        profiles: dict[str, Any],
-        *,
-        projection_metric: str = "mahalanobis",
-        whitener_value: object = "WHITENER",
-    ) -> None:
-        super().__init__(profiles)
-        self._projection_metric = projection_metric
-        # Sentinel — patched ``project_profile`` only checks ``is None``.
-        self._whitener_sentinel = whitener_value
-
-    @property
-    def whitener(self) -> object:  # pyright: ignore[reportIncompatibleMethodOverride]  # intentionally widens _Stub.whitener: None → object for test sentinel
-        return self._whitener_sentinel
-
-
-class TestProjectionMetricDefault:
-    """The v2.1 default flips runtime ``~`` / ``|`` to Mahalanobis.
-
-    Verifies that ``_materialize_projections`` passes ``self.whitener``
-    to ``project_profile`` under the default metric, and ``None``
-    under ``"euclidean"`` (the ``--legacy`` path).
-    """
-
-    def _patch_project(self, monkeypatch: pytest.MonkeyPatch, calls: list[Any]) -> None:
-        # ``_materialize_projections`` imports ``project_profile``
-        # lazily inside the method (``from saklas.core.vectors import
-        # project_profile``), so we patch it on the source module.
-        from saklas.core import vectors as vectors_mod
-
-        def _spy(base: Any, onto: Any, operator: Any, *, whitener: Any = None) -> Any:
-            calls.append((operator, whitener is None))
-            return {0: torch.tensor([0.0, 1.0])}
-
-        monkeypatch.setattr(vectors_mod, "project_profile", _spy)
-
-    def test_default_passes_whitener(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        calls: list[Any] = []
-        s = _MetricStub({"a": _profile_a(), "b": _profile_b()})
-        self._patch_project(monkeypatch, calls)
-        with s.steering(parse_expr("0.5 a|b")):
-            pass
-        assert calls == [("|", False)], (
-            "default session should hand session.whitener to project_profile"
-        )
-
-    def test_legacy_metric_passes_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        calls: list[Any] = []
-        s = _MetricStub(
-            {"a": _profile_a(), "b": _profile_b()},
-            projection_metric="euclidean",
-        )
-        self._patch_project(monkeypatch, calls)
-        with s.steering(parse_expr("0.5 a|b")):
-            pass
-        assert calls == [("|", True)], (
-            "euclidean session should pass whitener=None"
-        )
-
-    def test_per_call_override_flips_metric(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from saklas.core.steering import Steering
-
-        calls: list[Any] = []
-        s = _MetricStub({"a": _profile_a(), "b": _profile_b()})
-        self._patch_project(monkeypatch, calls)
-        # First scope inherits the session default ("mahalanobis").
-        with s.steering(parse_expr("0.5 a|b")):
-            pass
-        # Second scope overrides to euclidean via Steering.projection_metric.
-        # parse_expr doesn't surface this field — programmatic-only.
-        base = parse_expr("0.5 a|b")
-        override = Steering(
-            alphas=base.alphas,
-            thinking=base.thinking,
-            trigger=base.trigger,
-            projection_metric="euclidean",
-        )
-        with s.steering(override):
-            pass
-        assert calls == [("|", False), ("|", True)]
-
-    def test_per_call_override_inherits_to_inner_scope(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from saklas.core.steering import Steering
-
-        calls: list[Any] = []
-        s = _MetricStub({"a": _profile_a(), "b": _profile_b()})
-        self._patch_project(monkeypatch, calls)
-        # Outer scope sets "euclidean"; inner scope ``None`` inherits it.
-        outer = Steering(
-            alphas=parse_expr("0.5 a|b").alphas,
-            projection_metric="euclidean",
-        )
-        with s.steering(outer):
-            with s.steering(parse_expr("0.5 a~b")):
-                pass
-        # Both calls should run with whitener=None.
-        assert calls == [("|", True), ("~", True)], (
-            "inner scope without override should inherit outer's "
-            "euclidean choice via _resolve_projection_metric"
-        )
-
-    def test_invalid_metric_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from saklas.core.steering import Steering
-
-        calls: list[Any] = []
-        s = _MetricStub({"a": _profile_a(), "b": _profile_b()})
-        self._patch_project(monkeypatch, calls)
-        bad = Steering(
-            alphas=parse_expr("0.5 a|b").alphas,
-            projection_metric="bogus",
-        )
-        with pytest.raises(ValueError, match="projection_metric"):
-            with s.steering(bad):
+    def test_materialize_without_whitener_raises(self):
+        """A stub with no covering whitener can't materialize a ``~``/``|``
+        term — Mahalanobis is mandatory (no Euclidean fallback)."""
+        s = _Stub({"a": _profile_a(), "b": _profile_b()})
+        s._stub_whitener = None  # drop the whitener
+        with pytest.raises(WhitenerError, match="whitener"):
+            with s.steering(parse_expr("0.5 a|b")):
                 pass
 
 
@@ -407,15 +358,7 @@ class TestLayerMeansLazy:
         """Empty ``self._layer_means`` triggers ``bootstrap_layer_means``
         on first access; result is cached on subsequent calls."""
         s = _Stub({"a": _profile_a()})
-        # Stub has _layer_means = {} from _Stub.__init__, plus the
-        # whitener-property override returns None.  Override the
-        # session.py-level whitener property override on the stub so
-        # we can test layer_means in isolation: replace the class
-        # method with the *real* SaklasSession.layer_means property.
         from saklas.core.session import SaklasSession
-        # The stub doesn't override ``layer_means`` — it inherits the
-        # real property, which is what we want to exercise.
-        # Replace bootstrap_layer_means with a tracker.
         built = {3: torch.tensor([5.0, 6.0]), 4: torch.tensor([7.0, 8.0])}
         calls: list[Any] = []
 
@@ -423,11 +366,6 @@ class TestLayerMeansLazy:
             calls.append(args)
             return built
 
-        # Stub doesn't have _model/_tokenizer/_layers, so the property's
-        # try-except will fire and bootstrap_layer_means won't even be
-        # reached — instead the except block warns and returns {}.
-        # Patch *the same module the property imports from* so that
-        # call lookup resolves to our spy without needing the model.
         from saklas.core import session as session_mod
 
         # Give the stub the minimal handle attributes the bootstrap call
@@ -439,7 +377,7 @@ class TestLayerMeansLazy:
         monkeypatch.setattr(session_mod, "bootstrap_layer_means", _spy)
 
         # First access — triggers build.
-        out = SaklasSession.layer_means.fget(s)  # pyright: ignore[reportOptionalCall]  # fget is None per stub's whitener→None return; correct at runtime
+        out = SaklasSession.layer_means.fget(s)  # pyright: ignore[reportOptionalCall]  # fget present on real property
         assert out is built
         assert len(calls) == 1
         # Second access — caches; no second call.
@@ -451,12 +389,6 @@ class TestLayerMeansLazy:
 class TestComputeDlsMaskEmptyGuard:
     """``compute_dls_mask`` treats ``layer_means={}`` identically to
     ``layer_means=None`` — both fall back to keep-all silently.
-
-    Closes the v2.1 path where an empty dict propagated through
-    ``probes=[]`` sessions and walked the per-layer loop without
-    a baseline, hitting "conservative keep" on every layer.  The
-    behavior was technically the same (keep all), but the early-out
-    makes intent explicit.
     """
 
     def test_none_keeps_all(self):

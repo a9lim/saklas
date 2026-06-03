@@ -24,6 +24,7 @@ from saklas.core.extraction import ManifoldExtractionPipeline
 from saklas.core.vectors import folded_vector_directions
 from saklas.io.manifolds import ManifoldFolder, create_discover_manifold_folder
 from saklas.io.paths import manifold_dir
+from tests._whitener import synthetic_whitener
 
 _DIM = 8
 _N_LAYERS = 4
@@ -58,6 +59,11 @@ class _Handle:
         self.layer_means: dict[int, torch.Tensor] = {
             L: _NU[L].clone() for L in range(_N_LAYERS)
         }
+        # The monopolar share is whitened (mandatory post-4.0); synthesize a
+        # covering whitener over the same neutral means.
+        self.whitener = synthetic_whitener(
+            range(_N_LAYERS), _DIM, means=self.layer_means,
+        )
 
     def _run_generator(
         self, system_msg: str, prompt: str, max_new_tokens: int,

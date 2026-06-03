@@ -49,9 +49,8 @@ class PackFormatError(ValueError, SaklasError):
 def hash_file(path: Path) -> str:
     """Return hex sha256 of a file's contents.
 
-    Twin: :func:`saklas.io.manifolds._hash_file` is byte-identical and
-    kept separate by design (the manifold format is decoupled from packs);
-    mirror any change to one in the other.
+    Shared by the pack and manifold integrity manifests
+    (:func:`saklas.io.manifolds.hash_manifold_files` imports this).
     """
     h = hashlib.sha256()
     with open(path, "rb") as f:

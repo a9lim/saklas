@@ -521,6 +521,12 @@ def test_run_manifold_transfer_calls_backend(monkeypatch: pytest.MonkeyPatch, tm
         return folder_arg / "Qwen__Qwen3-4B_from-google__gemma-3-4b-it.safetensors"
 
     monkeypatch.setattr("saklas.io.manifolds.transfer_manifold", fake_transfer)
+    # Transfer is Mahalanobis-only: the runner builds a target whitener before
+    # the (mocked) backend.  No model/cache here, so stub the helper.
+    monkeypatch.setattr(
+        "saklas.cli.runners._target_whitener_from_neutral_cache",
+        lambda model_id: object(),
+    )
     cli.main([
         "manifold", "transfer", "local/circumplex",
         "--from", src_model, "--to", "Qwen/Qwen3-4B",
@@ -554,6 +560,10 @@ def test_run_manifold_transfer_json(monkeypatch: pytest.MonkeyPatch, tmp_path: P
     monkeypatch.setattr(
         "saklas.io.manifolds.transfer_manifold",
         lambda f, **k: f / "out.safetensors",
+    )
+    monkeypatch.setattr(
+        "saklas.cli.runners._target_whitener_from_neutral_cache",
+        lambda model_id: object(),
     )
     cli.main([
         "manifold", "transfer", "local/circumplex",

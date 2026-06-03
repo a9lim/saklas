@@ -1149,6 +1149,21 @@ def test_refresh_manifold_missing_raises(tmp_path: Path, monkeypatch: pytest.Mon
 # manifold's subspace, writing a _from-<safe_src> variant tensor.
 
 
+def _target_whitener(*, dim: int = 6, layers: tuple[int, ...] = (4, 5, 6)):
+    """A target-model whitener over the transferred layers.
+
+    Transfer is Mahalanobis-only now (the share re-bake is mandatory; there is
+    no Euclidean rebake), so every ``transfer_manifold`` call needs a target
+    whitener covering the transferred layers.
+    """
+    import torch
+    from saklas.core.mahalanobis import LayerWhitener
+    g = torch.Generator().manual_seed(99)
+    acts = {L: torch.randn(120, dim, generator=g) for L in layers}
+    means = {L: torch.zeros(dim) for L in layers}
+    return LayerWhitener.from_neutral_activations(acts, means)
+
+
 def _fit_real_manifold(folder: Path, model_id: str, *, dim: int = 6, seed: int = 0):
     """Fit a tiny real authored manifold on synthetic centroids and save it.
 
@@ -1213,6 +1228,7 @@ def test_transfer_manifold_identity_alignment_preserves_geometry(
     out = transfer_manifold(
         folder, from_model=src_model, to_model=tgt_model,
         alignment=align, transfer_quality_estimate=0.9,
+        whitener=_target_whitener(),
     )
     # Filename uses the transfer variant suffix.
     from saklas.io.paths import tensor_filename
@@ -1224,10 +1240,12 @@ def test_transfer_manifold_identity_alignment_preserves_geometry(
     for L in src_man.layers:
         assert torch.allclose(tgt_man.layers[L].mean, src_man.layers[L].mean, atol=1e-5)
         assert torch.allclose(tgt_man.layers[L].basis, src_man.layers[L].basis, atol=1e-5)
-    # The source's per-model Mahalanobis share is dropped on transfer (Σ is
-    # per-model); EV — a fit-quality ratio — carries.
+    # The source's per-model Mahalanobis share is invalid in target space, so
+    # it is RE-BAKED in the target metric (mandatory now — never dropped).
+    # EV — a fit-quality ratio — carries unchanged.
     assert src_man.mahalanobis_share  # source had one
-    assert tgt_man.mahalanobis_share == {}
+    assert set(tgt_man.mahalanobis_share.keys()) == set(src_man.layers)
+    assert tgt_man.mahalanobis_share != src_man.mahalanobis_share
     assert tgt_man.explained_variance == src_man.explained_variance
     # Provenance lands in the sidecar.
     with open(out.with_suffix(".json")) as f:
@@ -1312,6 +1330,7 @@ def test_transfer_manifold_rotation_maps_subspace(
 
     out = transfer_manifold(
         folder, from_model=src_model, to_model=tgt_model, alignment=align,
+        whitener=_target_whitener(),
     )
     tgt_man = load_manifold(out)
     # World-space activation at node 0 should be Q @ (source activation).
@@ -1340,6 +1359,7 @@ def test_transfer_manifold_drops_uncovered_layers(
     align = {5: torch.eye(6)}
     out = transfer_manifold(
         folder, from_model=src_model, to_model=tgt_model, alignment=align,
+        whitener=_target_whitener(layers=(5,)),
     )
     tgt_man = load_manifold(out)
     assert sorted(tgt_man.layers) == [5]
@@ -1411,12 +1431,18 @@ def test_transfer_manifold_refuses_overwrite_without_force(
     )
     src_tensor = _fit_real_manifold(folder, "src/m", dim=6)
     align = {L: torch.eye(6) for L in load_manifold(src_tensor).layers}
-    transfer_manifold(folder, from_model="src/m", to_model="tgt/m", alignment=align)
+    w = _target_whitener()
+    transfer_manifold(
+        folder, from_model="src/m", to_model="tgt/m", alignment=align, whitener=w,
+    )
     with pytest.raises(FileExistsError):
-        transfer_manifold(folder, from_model="src/m", to_model="tgt/m", alignment=align)
+        transfer_manifold(
+            folder, from_model="src/m", to_model="tgt/m", alignment=align, whitener=w,
+        )
     # force=True overwrites cleanly.
     transfer_manifold(
-        folder, from_model="src/m", to_model="tgt/m", alignment=align, force=True,
+        folder, from_model="src/m", to_model="tgt/m", alignment=align,
+        whitener=w, force=True,
     )
 
 
@@ -1489,7 +1515,10 @@ def test_manifold_summary_reports_transfer_variant(
     )
     src_tensor = _fit_real_manifold(folder, "src/m", dim=6)
     align = {L: torch.eye(6) for L in load_manifold(src_tensor).layers}
-    transfer_manifold(folder, from_model="src/m", to_model="tgt/m", alignment=align)
+    transfer_manifold(
+        folder, from_model="src/m", to_model="tgt/m", alignment=align,
+        whitener=_target_whitener(),
+    )
     summ = manifold_summary(folder)
     assert "src__m" in summ["tensor_variants"]
     assert summ["tensor_variants"]["src__m"] == ["raw"]

@@ -80,8 +80,8 @@ node role and any non-`None` node kind.
 `manifold_pca`/`manifold_sae` authored, `manifold_discover_{pca,spectral,sae}`
 discover, `merge` baked, `manifold_procrustes_transfer` transfer + the
 share/subspace metrics, fit_mode, hyperparams, diagnostics); the tensor save/load
-itself lives in `core/manifold.py`. `hash_manifold_files` / `_hash_file` are the
-integrity twins of `packs.py`'s.
+itself lives in `core/manifold.py`. `hash_manifold_files` reuses
+`packs.hash_file` for the per-file sha256 integrity manifest.
 
 A node corpus is now a list of conversational *responses* (`list[str]`) aligned to
 the shared A2 baseline user prompts — `response[i]` answers `baseline_prompt[i % k]`
@@ -115,10 +115,11 @@ bundled), `clear_manifold_tensors(... model_scope=None, variant="all")` (filter
 raw/sae/from/all; keeps `manifold.json` + corpus), `refresh_manifold` (unscoped:
 `local` → skip, `bundled` → re-materialize, `hf://` → re-pull; scoped → drop one
 model's fit), `transfer_manifold(folder, *, from_model, to_model, alignment,
-whitener=None, ...)` (pure-io: applies a caller-supplied per-layer Procrustes
+whitener, ...)` (pure-io: applies a caller-supplied per-layer Procrustes
 `alignment` to the fitted subspaces — `mean → M_L mean`, `basis → basis @ M_Lᵀ` —
 leaves RBF + `node_coords` untouched, re-bakes the Mahalanobis **share** in target
-space when a target whitener covers the layers, clears `origin`, writes the
+space — the target whitener is **required** and must cover the transferred layers
+(`WhitenerError` otherwise; no Euclidean rebake) — clears `origin`, writes the
 `_from-<safe_src>` variant). `manifold_summary(folder)` is the session-independent
 serializer shared by `manifold show -j` + the HTTP summary route.
 `iter_manifold_folders`, `bundled_manifold_names`, `materialize_bundled_manifolds`
@@ -229,10 +230,11 @@ bf16/fp16/non-finite caches). These are what the Mahalanobis whitener builds its
 covariance from. `fit_alignment(src, tgt, *, min_shared_layers=10) → {layer: M_L}`
 (orthogonal Procrustes for matched dim, rectangular least-squares otherwise; both
 center first); `alignment_quality` is per-layer R². `transfer_profile(profile,
-alignment_map, *, source_model_id, ..., whitener=None)` applies `M_L @ v_src` per
+alignment_map, *, source_model_id, ..., whitener)` applies `M_L @ v_src` per
 layer (uncovered layers dropped, `method="procrustes_transfer"`), re-scaling each
-magnitude to its *target* Mahalanobis norm when a target whitener covers the
-layers. The fitted map round-trips under the *target* model dir
+magnitude to its *target* Mahalanobis norm. The target whitener is **required** and
+must cover the transferred layers (`WhitenerError` otherwise; Mahalanobis-only — no
+Euclidean transfer). The fitted map round-trips under the *target* model dir
 (`models/<safe_tgt>/alignments/<safe_src>.…`). `transfer_manifold`
 (`manifolds.py`) is the manifold counterpart.
 

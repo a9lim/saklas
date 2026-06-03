@@ -843,11 +843,13 @@ class TestScoreSingleToken:
         import torch
         from saklas.core.monitor import TraitMonitor
 
+        from tests._whitener import isotropic_whitener
         dim = 16
         probe_vec = torch.randn(dim)
         profiles = {"test_probe": {0: probe_vec}}
         means = {0: torch.zeros(dim)}
-        monitor = TraitMonitor(profiles, means)
+        # Mahalanobis is mandatory: covering whitener required to score.
+        monitor = TraitMonitor(profiles, means, whitener=isotropic_whitener([0], dim))
 
         hidden = {0: torch.randn(dim)}
         scores = monitor.score_single_token(hidden)
@@ -862,11 +864,14 @@ class TestScoreSingleToken:
         import torch
         from saklas.core.monitor import TraitMonitor
 
+        from tests._whitener import isotropic_whitener
         dim = 16
         probe_vec = torch.randn(dim)
         profiles = {"p1": {0: probe_vec, 1: torch.randn(dim)}}
         means = {0: torch.zeros(dim), 1: torch.zeros(dim)}
-        monitor = TraitMonitor(profiles, means)
+        monitor = TraitMonitor(
+            profiles, means, whitener=isotropic_whitener([0, 1], dim),
+        )
 
         hidden = {0: torch.randn(dim), 1: torch.randn(dim)}
         single = monitor.score_single_token(hidden)
@@ -1027,7 +1032,7 @@ class TestRoleSampling:
 
 
 class TestPairwiseMetric:
-    """``GET /vectors/pairwise`` Euclidean default + Mahalanobis toggle."""
+    """``GET /vectors/pairwise`` is Mahalanobis-only (no Euclidean path)."""
 
     def _setup(self, session_and_client: Any) -> tuple[Any, TestClient]:
         import torch
@@ -1041,19 +1046,7 @@ class TestPairwiseMetric:
         }
         return session, cast(TestClient, client)
 
-    def test_default_euclidean(self, session_and_client: Any) -> None:
-        import torch
-        session, client = self._setup(session_and_client)
-        r = client.get("/saklas/v1/sessions/default/vectors/pairwise?a=x&b=y")
-        assert r.status_code == 200
-        body = r.json()
-        assert body["metric"] == "euclidean"
-        # Cell [0][0] is the plain cosine between x@0 and y@0.
-        vx, vy = session.vectors["x"][0], session.vectors["y"][0]
-        cos = float(torch.dot(vx, vy) / (vx.norm() * vy.norm()))
-        assert body["matrix"][0][0] == pytest.approx(cos, abs=1e-5)
-
-    def test_mahalanobis_toggle(self, session_and_client: Any) -> None:
+    def test_mahalanobis_default(self, session_and_client: Any) -> None:
         import torch
         from saklas.core.mahalanobis import LayerWhitener
         session, client = self._setup(session_and_client)
@@ -1062,9 +1055,7 @@ class TestPairwiseMetric:
         means = {L: torch.zeros(4) for L in (0, 1)}
         w = LayerWhitener.from_neutral_activations(acts, means)
         session.whitener = w
-        r = client.get(
-            "/saklas/v1/sessions/default/vectors/pairwise?a=x&b=y&metric=mahalanobis"
-        )
+        r = client.get("/saklas/v1/sessions/default/vectors/pairwise?a=x&b=y")
         assert r.status_code == 200
         body = r.json()
         assert body["metric"] == "mahalanobis"
@@ -1073,9 +1064,10 @@ class TestPairwiseMetric:
         ref = w.mahalanobis_cosine(0, vx, vy)
         assert body["matrix"][0][0] == pytest.approx(ref, abs=1e-5)
 
-    def test_invalid_metric_400(self, session_and_client: Any) -> None:
-        _session, client = self._setup(session_and_client)
-        r = client.get(
-            "/saklas/v1/sessions/default/vectors/pairwise?a=x&b=y&metric=bogus"
-        )
-        assert r.status_code == 400
+    def test_missing_whitener_409(self, session_and_client: Any) -> None:
+        """No covering whitener → 409 (the neutral cache must be regenerated);
+        there is no Euclidean fallback."""
+        session, client = self._setup(session_and_client)
+        session.whitener = None
+        r = client.get("/saklas/v1/sessions/default/vectors/pairwise?a=x&b=y")
+        assert r.status_code == 409

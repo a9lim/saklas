@@ -55,22 +55,26 @@ def _extract_profile(model: Any, tokenizer: Any, concept: str, layers: Any) -> A
     """A per-layer direction profile for a single concept vs the empty pole.
 
     The 4.0 equivalent of a difference-of-means vector: capture the two pole
-    centroids and fold them into a 2-node affine subspace, then take its
-    baked-direction view (``folded_vector_directions``).  Same centroid-
-    difference direction the old DiM extractor produced, no pipeline needed.
+    centroids, take their per-layer difference ``δ = pos − neg``, and fold that
+    direction into a one-pole affine ray via the production
+    ``fold_directions_to_subspace``, then read its baked-direction view
+    (``folded_vector_directions``).  Same centroid-difference direction the old
+    DiM extractor produced, through the surviving fold primitive.
     """
     from saklas.core.vectors import (
         _encode_and_capture_all,
-        _fold_centroids_to_affine_manifold,
+        fold_directions_to_subspace,
         folded_vector_directions,
     )
 
     device = next(model.parameters()).device
     pos = _encode_and_capture_all(model, tokenizer, concept, layers, device)
     neg = _encode_and_capture_all(model, tokenizer, "", layers, device)
-    mfld = _fold_centroids_to_affine_manifold(
-        concept, pos, neg, pos_label="p", neg_label="n", dls=False,
-    )
+    directions = {
+        L: (pos[L].to(torch.float32) - neg[L].to(torch.float32))
+        for L in pos if L in neg
+    }
+    mfld = fold_directions_to_subspace(concept, directions, None, label="p")
     return folded_vector_directions(mfld)
 
 
@@ -413,10 +417,11 @@ class TestDiscoverManifoldEndToEnd:
     """
 
     _CONCEPTS = ["pirate", "scholar", "robot", "caveman", "assistant"]
-    _N_SCENARIOS = 2
-    _STATEMENTS_PER_CONCEPT = 3
-    # Generation = 1 scenario call + N×K statement calls = 11 LLM turns.
-    # Per-turn budget mirrors `_EXTRACTION_BUDGET_S` × generator-call count.
+    _SAMPLES_PER_PROMPT = 1
+    # A2 conversational extraction: each concept answers every shared baseline
+    # prompt in character, so one corpus = samples_per_prompt × len(baseline
+    # prompts) responses (64 prompts bundled).  Generation is the dominant
+    # cost; the budget scales with the concept × prompt turn count.
     _GENERATE_BUDGET_S = _EXTRACTION_BUDGET_S * 6
     _FIT_BUDGET_S = _EXTRACTION_BUDGET_S * 2
 
@@ -435,27 +440,30 @@ class TestDiscoverManifoldEndToEnd:
         # skipping bootstrap shaves seconds off the discover gate.
         session = SaklasSession(model, tokenizer, probes=[])
         try:
-            # ---- 1. generate per-concept corpora ----
+            # ---- 1. generate per-concept corpora (A2 conversational) ----
+            from saklas.core.vectors import _load_baseline_prompts
+            n_prompts = len(_load_baseline_prompts())
             t0 = time.perf_counter()
-            corpora = session.generate_statements(
+            corpora = session.generate_responses(
                 self._CONCEPTS,
-                n_scenarios=self._N_SCENARIOS,
-                statements_per_cell=self._STATEMENTS_PER_CONCEPT,
+                [None] * len(self._CONCEPTS),
+                samples_per_prompt=self._SAMPLES_PER_PROMPT,
             )
             dt_gen = time.perf_counter() - t0
             assert dt_gen < self._GENERATE_BUDGET_S, (
-                f"generate_statements took {dt_gen:.1f}s, "
+                f"generate_responses took {dt_gen:.1f}s, "
                 f"budget {self._GENERATE_BUDGET_S:.1f}s"
             )
             assert set(corpora.keys()) == set(self._CONCEPTS)
-            expected_per_concept = (
-                self._N_SCENARIOS * self._STATEMENTS_PER_CONCEPT
-            )
+            expected_per_concept = self._SAMPLES_PER_PROMPT * n_prompts
             for c, lines in corpora.items():
                 assert len(lines) == expected_per_concept, (
-                    f"corpus for {c!r}: {len(lines)} statements, "
+                    f"corpus for {c!r}: {len(lines)} responses, "
                     f"expected {expected_per_concept}"
                 )
+                # Length must be a multiple of the baseline-prompt count
+                # (response[i] ↔ baseline_prompt[i % k]).
+                assert len(lines) % n_prompts == 0
 
             # ---- 2. author the discover folder ----
             folder = create_discover_manifold_folder(

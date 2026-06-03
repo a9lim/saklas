@@ -1,6 +1,5 @@
 """Token-by-token generation loop with KV cache, steering hooks, and monitor integration."""
 
-import enum
 import math
 import queue
 import logging
@@ -22,23 +21,6 @@ class _ThinkState(IntEnum):
     THINKING = 2
     RESPONSE_PREAMBLE = 3
 
-
-class ThinkingState(enum.Enum):
-    """Explicit lifecycle signal for the thinking state machine.
-
-    Parallel to the internal ``_ThinkState`` IntEnum — this one is the
-    public, stable signal exposed on ``GenerationState.thinking_state``
-    so consumers (session, TUI, tests) can ask "are we currently
-    generating thinking content?" without inferring it from
-    ``thinking_end_idx``.
-    """
-
-    IDLE = "idle"
-    PREAMBLE = "preamble"
-    THINKING = "thinking"
-    RESPONSE_PREAMBLE = "response_preamble"
-    RESPONSE = "response"
-    DONE = "done"
 
 log = logging.getLogger(__name__)
 
@@ -430,6 +412,56 @@ def _sampler_logprob_vector(
     return out
 
 
+def _effective_topk(config: GenerationConfig, vocab: int) -> int:
+    """Candidate-pool cap applied before top-p (llama.cpp/Ollama order).
+
+    ``top_k`` caps the candidate pool before top-p.  When unset, use 1024
+    as a performance ceiling (nucleus sampling is insensitive beyond that);
+    when set, honour the user's value as a hard cap.  Capped at ``vocab``.
+    """
+    user_top_k = config.top_k if (config.top_k and config.top_k > 0) else 1024
+    return min(int(user_top_k), int(vocab))
+
+
+def _advance_no_cache_input(
+    next_token: torch.Tensor,
+    *,
+    current_input: torch.Tensor,
+    no_cache_buf: torch.Tensor | None,
+    no_cache_len: int,
+    no_cache_mode: bool,
+    max_extra: int,
+) -> tuple[torch.Tensor, torch.Tensor | None, int]:
+    """Advance the decode input for one new token, KV-cached or not.
+
+    Returns the updated ``(current_input, no_cache_buf, no_cache_len)``.
+    With a KV cache the next forward only needs the single new token.  In
+    the O(N²) no-KV-cache fallback path the full running sequence must be
+    re-fed each step, so it lives in a pre-allocated ring buffer
+    (``prompt_len + max(max_extra, 1)``, where ``max_extra`` is the decode
+    budget — ``max_new_tokens`` for live generation, the forced-id count
+    for a logprob replay) that grows in place to avoid per-token
+    reallocation; the ``torch.cat`` branch is an unreachable cap guard.
+    """
+    if not no_cache_mode:
+        return next_token, no_cache_buf, no_cache_len
+    if no_cache_buf is None:
+        cap = int(current_input.shape[1]) + max(max_extra, 1)
+        no_cache_buf = torch.empty(
+            (1, cap), dtype=current_input.dtype, device=current_input.device,
+        )
+        no_cache_buf[:, :current_input.shape[1]].copy_(current_input)
+        no_cache_len = int(current_input.shape[1])
+    if no_cache_len < no_cache_buf.shape[1]:
+        no_cache_buf[:, no_cache_len:no_cache_len + 1].copy_(next_token)
+        no_cache_len += 1
+        current_input = no_cache_buf[:, :no_cache_len]
+    else:  # pragma: no cover - cap is prompt + decode budget by construction
+        current_input = torch.cat([current_input, next_token], dim=1)
+        no_cache_len = int(current_input.shape[1])
+    return current_input, no_cache_buf, no_cache_len
+
+
 class GenerationState:
     """Shared mutable state for controlling generation from the TUI."""
 
@@ -438,7 +470,6 @@ class GenerationState:
         self.token_queue: queue.SimpleQueue[Any] = queue.SimpleQueue()
         self.thinking_end_idx: int = 0
         self.finish_reason: str = "stop"
-        self.thinking_state: ThinkingState = ThinkingState.IDLE
         # For each on_token emission, the index in generated_ids of the
         # token that triggered it (last buffered ID for multi-byte emits),
         # plus whether the emit was thinking.  Used by the TUI to map
@@ -458,7 +489,6 @@ class GenerationState:
         self.token_queue = queue.SimpleQueue()
         self.thinking_end_idx = 0
         self.finish_reason = "stop"
-        self.thinking_state = ThinkingState.IDLE
         self.emit_map = []
         self.response_text = None
 
@@ -675,14 +705,14 @@ def generate_steered(
     Sets ``state.finish_reason`` on exit: "stop" (EOS/external), "length"
     (max tokens), "stop_sequence" (stop string matched).
 
-    ``score_callback`` enables probe-gated triggers (v2.1): when set,
+    ``score_callback`` enables probe-gated triggers: when set,
     it's invoked after every forward pass and the returned
     ``dict[str, float]`` is written to ``trigger_ctx.probe_scores``
     so the next iteration's gates see fresh monitor readings.  Pay
     nothing on the no-gate path — session-level wiring sets this to
     ``None`` unless the active steering contains a gated trigger.
 
-    ``use_static_cache`` (v2.2 Phase B) routes generation through
+    ``use_static_cache`` routes generation through
     :class:`transformers.StaticCache` instead of the default
     ``DynamicCache`` — fixed-shape K/V buffers across decode steps,
     so the kernel shapes the compiled artifact saw on warmup don't
@@ -731,18 +761,13 @@ def generate_steered(
     generated_ids: list[int] = []
     _cfg = getattr(model.config, "text_config", model.config)
     _vocab = _cfg.vocab_size
-    # top_k caps the candidate pool before top-p.  When unset, use 1024 as a
-    # performance ceiling (nucleus sampling is insensitive beyond that).  When
-    # set, honour the user's value as a hard cap — matches llama.cpp/Ollama
-    # semantics where top_k is applied before top_p.
-    _user_top_k = config.top_k if (config.top_k and config.top_k > 0) else 1024
-    topk_k = min(_user_top_k, _vocab)
+    topk_k = _effective_topk(config, _vocab)
     token_table = _get_token_table(tokenizer, _vocab) if on_token else None
     seq_len = input_ids.shape[1] + cache_position_offset
     attn_mask_buf = torch.ones(1, seq_len, device=device, dtype=torch.long)
     prefill = True
 
-    # ---- StaticCache (Phase B, v2.2) -----------------------------------
+    # ---- StaticCache ---------------------------------------------------
     # Caller flips ``use_static_cache`` after probing
     # :func:`saklas.core.cuda_graphs.is_cuda_graphs_supported` at session
     # construction time.  We allocate the static buffer here, sized to
@@ -849,20 +874,6 @@ def generate_steered(
         if (starts_in_thinking and think_end_id is not None)
         else _ThinkState.IDLE
     )
-    # Mirror the internal tstate onto the public ThinkingState enum.
-    # No delimiters detected → straight to RESPONSE; otherwise track the
-    # machine.  Note: even with ``thinking=False`` the machine engages
-    # for channel-based formats (gpt-oss) so the analysis is correctly
-    # classified rather than leaking into the response.
-    if think_end_id is not None:
-        state.thinking_state = (
-            ThinkingState.THINKING
-            if starts_in_thinking
-            else ThinkingState.IDLE
-        )
-    else:
-        state.thinking_state = ThinkingState.RESPONSE
-
     # Buffer for multi-token characters (emoji, rare Unicode).
     # Tokens whose table entry is None represent partial UTF-8 byte sequences;
     # they accumulate here until a complete-token follows, at which point the
@@ -880,23 +891,14 @@ def generate_steered(
 
     def _advance_current_input(next_token: torch.Tensor) -> None:
         nonlocal current_input, no_cache_buf, no_cache_len
-        if not no_cache_mode:
-            current_input = next_token
-            return
-        if no_cache_buf is None:
-            cap = int(current_input.shape[1]) + max(config.max_new_tokens, 1)
-            no_cache_buf = torch.empty(
-                (1, cap), dtype=current_input.dtype, device=current_input.device,
-            )
-            no_cache_buf[:, :current_input.shape[1]].copy_(current_input)
-            no_cache_len = int(current_input.shape[1])
-        if no_cache_len < no_cache_buf.shape[1]:
-            no_cache_buf[:, no_cache_len:no_cache_len + 1].copy_(next_token)
-            no_cache_len += 1
-            current_input = no_cache_buf[:, :no_cache_len]
-        else:  # pragma: no cover - cap is prompt + max_new_tokens by construction
-            current_input = torch.cat([current_input, next_token], dim=1)
-            no_cache_len = int(current_input.shape[1])
+        current_input, no_cache_buf, no_cache_len = _advance_no_cache_input(
+            next_token,
+            current_input=current_input,
+            no_cache_buf=no_cache_buf,
+            no_cache_len=no_cache_len,
+            no_cache_mode=no_cache_mode,
+            max_extra=config.max_new_tokens,
+        )
 
     def _emit_token(text: str, is_thinking: bool, token_id: int,
                     logprob: float | None, top_alts: list[TokenAlt] | None,
@@ -956,8 +958,7 @@ def generate_steered(
                 # Static-cache path passes ``cache_position`` explicitly so
                 # the model knows where to write into the pre-allocated
                 # K/V buffers.  Eager (DynamicCache) path leaves it
-                # implicit so HF derives positions from cache seq_length
-                # — bit-identical to the v1.x call shape.
+                # implicit so HF derives positions from cache seq_length.
                 if cache_position is not None:
                     outputs = model(
                         input_ids=current_input,
@@ -975,7 +976,7 @@ def generate_steered(
                     )
                 prefill = False
 
-                # Probe-gate scoring (v2.1): after the forward (so
+                # Probe-gate scoring: after the forward (so
                 # ``HiddenCapture`` is freshly populated), refresh
                 # ``trigger_ctx.probe_scores`` so the *next* iteration's
                 # gates see last-step readings.  ``score_callback`` is
@@ -989,9 +990,8 @@ def generate_steered(
                 # StaticCache mutates in place — the model returns the
                 # same object and re-assigning here would clobber our
                 # reference if a buggy modeling file returned ``None``.
-                # Plain DynamicCache path keeps the v1.x semantics: pull
-                # the cache out of the output, fall back to no-cache
-                # mode if missing.
+                # Plain DynamicCache path: pull the cache out of the
+                # output, fall back to no-cache mode if missing.
                 if cache_position is None:
                     past_key_values = outputs.past_key_values
                     if not no_cache_mode and past_key_values is None and current_input.shape[1] > 1:
@@ -1125,7 +1125,6 @@ def generate_steered(
                                         current_perplexity)
                             pending_ids.clear()
                         tstate = _ThinkState.RESPONSE_PREAMBLE
-                        state.thinking_state = ThinkingState.RESPONSE_PREAMBLE
                     elif tstate == _ThinkState.PREAMBLE:
                         if on_token and pending_ids:
                             _emit_token(cast(str, tokenizer.decode(pending_ids)),
@@ -1134,7 +1133,6 @@ def generate_steered(
                             pending_ids.clear()
                         tstate = _ThinkState.IDLE
                         state.thinking_end_idx = len(generated_ids)
-                        state.thinking_state = ThinkingState.RESPONSE
                     continue
 
                 # Advance KV cache state (common to all non-EOS paths)
@@ -1147,21 +1145,18 @@ def generate_steered(
                         and token_id == think_start_id
                         and tstate == _ThinkState.IDLE):
                     tstate = _ThinkState.PREAMBLE
-                    state.thinking_state = ThinkingState.PREAMBLE
                     continue  # suppress start delimiter
 
                 if tstate == _ThinkState.PREAMBLE:
                     if token_id == think_end_id:
                         tstate = _ThinkState.IDLE
                         state.thinking_end_idx = len(generated_ids)
-                        state.thinking_state = ThinkingState.RESPONSE
                         continue  # suppress end delimiter
                     if response_start_id is not None:
                         # Channel-style (gpt-oss): suppress channel-name
                         # tokens between ``<|channel|>`` and ``<|message|>``.
                         if token_id == response_start_id:
                             tstate = _ThinkState.THINKING
-                            state.thinking_state = ThinkingState.THINKING
                         continue  # suppress preamble
                     # Non-channel preamble (Qwen-style ``<think>\n``, or
                     # bracket-pair ``[THINK]…`` with no leading whitespace).
@@ -1173,7 +1168,6 @@ def generate_steered(
                     # pair case where the model goes directly from
                     # ``[THINK]`` into content).
                     tstate = _ThinkState.THINKING
-                    state.thinking_state = ThinkingState.THINKING
                     tok_text = cast(str, tokenizer.decode([token_id]))  # transformers stub widens decode return
                     if tok_text == "" or tok_text.isspace():
                         continue  # swallow leading whitespace
@@ -1188,18 +1182,15 @@ def generate_steered(
                         pending_ids.clear()
                     if response_start_id is not None:
                         tstate = _ThinkState.RESPONSE_PREAMBLE
-                        state.thinking_state = ThinkingState.RESPONSE_PREAMBLE
                     else:
                         tstate = _ThinkState.IDLE
                         state.thinking_end_idx = len(generated_ids)
-                        state.thinking_state = ThinkingState.RESPONSE
                     continue
 
                 if tstate == _ThinkState.RESPONSE_PREAMBLE:
                     if token_id == response_start_id:
                         tstate = _ThinkState.IDLE
                         state.thinking_end_idx = len(generated_ids)
-                        state.thinking_state = ThinkingState.RESPONSE
                     continue
 
                 # Penalty bookkeeping: count all emitted completion tokens
@@ -1266,7 +1257,6 @@ def generate_steered(
             )
 
     finally:
-        state.thinking_state = ThinkingState.DONE
         # Flush MPS command buffers before signalling completion — without
         # this, a rapid regenerate can submit new work while Metal is still
         # processing the previous generation's command buffers, triggering

@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import functools
 from operator import itemgetter
-import re
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, TypeVar
@@ -15,6 +14,7 @@ from saklas.cli.parsers import (
 )
 from saklas.core.errors import SaklasError
 from saklas.core.stats import median_or_zero
+from saklas.io.paths import VARIANT_SUFFIX_RE
 
 if TYPE_CHECKING:
     from saklas.core.session import SaklasSession
@@ -56,16 +56,28 @@ def _resolve_probes(raw: list[str] | None) -> list[str]:
     return raw
 
 
-def _target_whitener_from_neutral_cache(model_id: str) -> Any | None:
-    """Build a target-model whitener from neutral activations without loading a model."""
-    try:
-        from saklas.core.mahalanobis import LayerWhitener
+def _target_whitener_from_neutral_cache(model_id: str) -> Any:
+    """Build a target-model whitener from neutral activations without loading a model.
 
+    Transfer re-bakes the share in the target Mahalanobis metric, which is
+    now mandatory — there is no Euclidean rebake.  A missing, stale, or
+    degenerate target neutral cache raises :class:`WhitenerError` (wrapped
+    from whatever the loader raised) so the caller fails loudly with an
+    actionable hint instead of silently degrading.
+    """
+    from saklas.core.mahalanobis import LayerWhitener, WhitenerError
+
+    try:
         return LayerWhitener.from_neutral_cache(model_id)
-    except Exception:
-        # Best-effort: a missing, stale, or degenerate target neutral cache
-        # leaves transfers on the Euclidean fallback path.
-        return None
+    except WhitenerError:
+        raise
+    except Exception as e:
+        raise WhitenerError(
+            f"transfer requires a Mahalanobis whitener for the target model "
+            f"'{model_id}', but its neutral activation cache is missing or "
+            f"unusable ({e}); generate neutral activations for the TARGET "
+            f"model first"
+        ) from e
 
 
 def _load_or_fit_transfer_alignment(
@@ -134,12 +146,9 @@ def _load_or_fit_transfer_alignment(
 def _make_session(args: argparse.Namespace):
     from saklas.core.session import SaklasSession
     probe_categories = _resolve_probes(args.probes)
-    # ``--projection-metric`` selects the runtime ``~`` / ``|`` metric
-    # (``mahalanobis`` default — closed-form LEACE; ``euclidean`` is plain
-    # Gram-Schmidt); ``--no-dls`` opts out of the discriminative-layer mask.
-    # Both the CLI flag and YAML are already merged onto ``args`` by
-    # ``_load_effective_config``.
-    projection_metric = getattr(args, "projection_metric", None) or "mahalanobis"
+    # ``~`` / ``|`` projection is Mahalanobis-only (closed-form LEACE);
+    # ``--no-dls`` opts out of the discriminative-layer mask.  The flag and
+    # YAML are already merged onto ``args`` by ``_load_effective_config``.
     dls = not bool(getattr(args, "no_dls", False))
     # ``--compile`` and ``--cuda-graphs`` opt *in* to the CUDA-side
     # perf path.  Defaults are off — compile's per-token speedup is
@@ -161,7 +170,6 @@ def _make_session(args: argparse.Namespace):
         probes=probe_categories,
         system_prompt=getattr(args, "system_prompt", None),
         max_tokens=getattr(args, "max_tokens", 1024),
-        projection_metric=projection_metric,
         dls=dls,
         compile=compile_enabled,
         cuda_graphs=cuda_graphs_enabled,
@@ -205,12 +213,6 @@ def _load_effective_config(args: argparse.Namespace):
     args.system_prompt = composed.system_prompt
     args.max_tokens = composed.max_tokens if composed.max_tokens is not None else 1024
     args.config_vectors = composed.vectors
-    # Projection metric on tui/serve: YAML wins when the CLI flag is unset.
-    if (
-        composed.projection_metric is not None
-        and getattr(args, "projection_metric", None) is None
-    ):
-        args.projection_metric = composed.projection_metric
     # YAML ``compile: true`` folds onto ``args.compile`` (the CLI
     # opt-in).  YAML ``compile: false`` is the default, so it's a
     # no-op — but accepting it makes round-tripping symmetric with
@@ -330,8 +332,9 @@ def _attach_default_manifold_probes(session: SaklasSession) -> None:
     The two bundled manifolds (``personas``, ``pad``) ship as the
     default read-side counterparts to the bundled vector probes, so the
     dashboard's probe rack opens with them already watching — the
-    manifold analogue of how ``bootstrap_probes`` pre-loads the default
-    vector probes at session construction.
+    manifold analogue of how ``load_default_manifolds`` /
+    ``_bootstrap_manifold_probes`` pre-load the default vector probes at
+    session construction.
 
     Only manifolds already *fitted* for the loaded model are attached:
     fitting runs a forward pass per node and would block ``serve``
@@ -635,10 +638,8 @@ def _run_config_validate(args: argparse.Namespace) -> None:
     print(f"{p}: ok")
 
 
-_VARIANT_SUFFIX_RE = re.compile(
-    r"^(raw|sae(?:-[a-z0-9._-]+)?|"
-    r"role(?:-[a-z0-9._-]+)?|from(?:-[a-z0-9._-]+)?)$"
-)
+# Single source of truth lives in ``io.paths`` (owns the variant scheme).
+_VARIANT_SUFFIX_RE = VARIANT_SUFFIX_RE
 
 
 def _split_variant_suffix(raw: str) -> tuple[str, str | None]:
@@ -761,26 +762,21 @@ def _run_compare(args: argparse.Namespace) -> None:
     from saklas.io.selectors import parse as sel_parse, resolve
     from saklas.core.profile import Profile
 
-    # Default metric is ``"mahalanobis"`` (since v2.1); ``--metric euclidean``
-    # selects plain weighted cosine.
-    metric = getattr(args, "metric", None) or "mahalanobis"
+    # Compare is Mahalanobis-only: load the per-model whitener once up
+    # front and share it across every ``cosine_similarity`` call below.
+    # Failure is fatal — there is no Euclidean path, so a missing neutral
+    # cache surfaces directly instead of degrading silently.
+    from saklas.core.mahalanobis import LayerWhitener, WhitenerError
 
-    # Mahalanobis path: load the per-model whitener once up front, share
-    # across every ``cosine_similarity`` call below.  Failure is fatal —
-    # if the user explicitly asked for the whitened metric, falling
-    # silently back to Euclidean would hide the missing cache.
-    whitener: "Any | None" = None
-    if metric == "mahalanobis":
-        from saklas.core.mahalanobis import LayerWhitener, WhitenerError
-
-        try:
-            whitener = LayerWhitener.from_cache(
-                args.model,
-                ridge_scale=getattr(args, "ridge_scale", 1.0),
-            )
-        except WhitenerError as e:
-            print(f"compare: {e}", file=sys.stderr)
-            sys.exit(1)
+    whitener: "Any | None"
+    try:
+        whitener = LayerWhitener.from_cache(
+            args.model,
+            ridge_scale=getattr(args, "ridge_scale", 1.0),
+        )
+    except WhitenerError as e:
+        print(f"compare: {e}", file=sys.stderr)
+        sys.exit(1)
 
     # Expand selectors into (name, variant) pairs. Variant travels with the
     # name through the load loop so ``foo:sae`` picks the SAE tensor.
@@ -1616,7 +1612,9 @@ def _run_manifold_generate(args: argparse.Namespace) -> None:
     )
     try:
         for concept in plan.pending:
-            gen_roles = {concept: concept} if node_roles else None
+            gen_roles: dict[str, str | None] | None = (
+                {concept: concept} if node_roles else None
+            )
             corpora = session.generate_responses(
                 [concept], [args.kind],
                 roles=gen_roles,
@@ -1877,12 +1875,19 @@ def _run_manifold_transfer(args: argparse.Namespace) -> None:
 
     median_quality = median_or_zero(list(quality_per_layer.values())) if quality_per_layer else None
 
-    # Target whitener for the Mahalanobis-share re-bake (mirrors
-    # ``_run_transfer``).  Read the target neutral cache directly and center by
-    # its own per-layer mean — the neutral mean *is* the probe-centering
-    # baseline, so no separate layer_means cache is needed.  Soft ``None`` →
-    # ``transfer_manifold`` clears the share (Euclidean fallback at apply).
-    target_whitener = _target_whitener_from_neutral_cache(args.tgt_model)
+    # Target whitener for the Mahalanobis-share re-bake.  Read the target
+    # neutral cache directly and center by its own per-layer mean — the
+    # neutral mean *is* the probe-centering baseline, so no separate
+    # layer_means cache is needed.  Mahalanobis is mandatory: a missing /
+    # unusable target cache raises ``WhitenerError`` here (no Euclidean
+    # rebake), surfaced to the user as a fatal transfer error.
+    from saklas.core.mahalanobis import WhitenerError
+
+    try:
+        target_whitener = _target_whitener_from_neutral_cache(args.tgt_model)
+    except WhitenerError as e:
+        print(f"manifold transfer failed: {e}", file=sys.stderr)
+        sys.exit(1)
 
     try:
         out_path = transfer_manifold(

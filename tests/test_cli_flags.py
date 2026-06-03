@@ -397,10 +397,22 @@ def _patch_fold_helpers(
 
 
 def _setup_compare_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
-    """Set SAKLAS_HOME and return the manifolds_dir path."""
+    """Set SAKLAS_HOME and return the manifolds_dir path.
+
+    ``subspace compare`` is Mahalanobis-only now: ``_run_compare`` loads the
+    per-model whitener via ``LayerWhitener.from_cache`` up front and fails if
+    it's missing.  These tests mock ``Profile.cosine_similarity`` (which
+    ignores the whitener), so we patch ``from_cache`` to return a sentinel
+    rather than seed a real neutral cache.
+    """
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     from saklas.io import selectors
     selectors.invalidate()
+    from saklas.core import mahalanobis as _maha
+    monkeypatch.setattr(
+        _maha.LayerWhitener, "from_cache",
+        classmethod(lambda cls, model_id, **kw: object()),
+    )
     return tmp_path / "manifolds"
 
 
@@ -447,11 +459,9 @@ def test_run_compare_one_arg_verbose_text(monkeypatch: pytest.MonkeyPatch, tmp_p
         "warm.clinical": warm_profile,
     })
 
-    # ``--metric euclidean`` keeps the mock-driven test runner-focused —
-    # the v2.1 default flipped to ``mahalanobis``, which would try to
-    # load a real whitener from disk and fail under the mocked Profile.
-    cli.main(["subspace","compare", "angry.calm", "-m", model_id, "-v",
-              "--metric", "euclidean"])
+    # Compare is Mahalanobis-only; the whitener load is patched in
+    # ``_setup_compare_env`` and ``Profile.cosine_similarity`` is mocked.
+    cli.main(["subspace","compare", "angry.calm", "-m", model_id, "-v"])
     out = capsys.readouterr().out
     assert "angry.calm vs all installed" in out
     assert "happy.sad" in out
@@ -476,8 +486,7 @@ def test_run_compare_one_arg_verbose_json(monkeypatch: pytest.MonkeyPatch, tmp_p
         "happy.sad": happy_profile,
     })
 
-    cli.main(["subspace","compare", "angry.calm", "-m", model_id, "-v", "-j",
-              "--metric", "euclidean"])
+    cli.main(["subspace","compare", "angry.calm", "-m", model_id, "-v", "-j"])
     out = capsys.readouterr().out
     data = _json.loads(out)
     assert data["target"] == "angry.calm"
@@ -501,8 +510,7 @@ def test_run_compare_matrix_verbose_json(monkeypatch: pytest.MonkeyPatch, tmp_pa
         for c in concepts
     })
 
-    cli.main(["subspace","compare"] + concepts + ["-m", model_id, "-v", "-j",
-                                                  "--metric", "euclidean"])
+    cli.main(["subspace","compare"] + concepts + ["-m", model_id, "-v", "-j"])
     out = capsys.readouterr().out
     data = _json.loads(out)
     assert "per_layer" in data
@@ -526,8 +534,7 @@ def test_run_compare_matrix_verbose_text_unchanged(monkeypatch: pytest.MonkeyPat
         for c in concepts
     })
 
-    cli.main(["subspace","compare"] + concepts + ["-m", model_id, "-v",
-                                                  "--metric", "euclidean"])
+    cli.main(["subspace","compare"] + concepts + ["-m", model_id, "-v"])
     out = capsys.readouterr().out
     assert "per-layer" not in out
     assert "per_layer" not in out
@@ -751,7 +758,6 @@ def test_run_compare_accepts_sae_suffix(monkeypatch: pytest.MonkeyPatch, tmp_pat
         "subspace","compare",
         "angry.calm:sae-my-release", "happy.sad",
         "-m", model_id,
-        "--metric", "euclidean",
     ])
     out = capsys.readouterr().out
     # Variant suffix carries into display keys.

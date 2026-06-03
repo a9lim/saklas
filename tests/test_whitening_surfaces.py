@@ -23,6 +23,7 @@ from saklas.core.manifold import (
     fit_layer_subspace,
 )
 from saklas.core.monitor import ManifoldMonitor
+from tests._whitener import isotropic_whitener
 
 
 # --------------------------------------------------------------------------- #
@@ -88,6 +89,8 @@ def _toy_manifold(*, dim: int = 8, n_layers: int = 1, seed: int = 0) -> Manifold
 
 class TestManifoldMonitorWhitened:
     def test_whitened_cache_built_all_or_nothing(self) -> None:
+        from saklas.core.mahalanobis import WhitenerError
+
         m = _toy_manifold(dim=8, n_layers=2)
         w = _make_whitener(layers=(0, 1), d=8)
         mon = ManifoldMonitor(whitener=w)
@@ -95,11 +98,12 @@ class TestManifoldMonitorWhitened:
         probe = mon.attached_probes()["toy"]
         assert set(probe.whitened.keys()) == {0, 1}
 
-        # Whitener missing a layer → no whitened cache (Euclidean fallback).
+        # Whitener missing a layer → hard error (Mahalanobis is mandatory;
+        # no Euclidean fallback).
         w_partial = _make_whitener(layers=(0,), d=8)
         mon2 = ManifoldMonitor(whitener=w_partial)
-        mon2.add_probe("toy", m)
-        assert mon2.attached_probes()["toy"].whitened == {}
+        with pytest.raises(WhitenerError, match="whitener"):
+            mon2.add_probe("toy", m)
 
     def test_fraction_matches_reference_and_in_range(self) -> None:
         m = _toy_manifold(dim=8, n_layers=1)
@@ -144,33 +148,51 @@ class TestManifoldMonitorWhitened:
                 assert float(dists[k]) == pytest.approx(ref_d, abs=1e-4)
 
     def test_isotropic_reduces_to_euclidean(self) -> None:
+        """Under an isotropic whitener (Σ ≈ I) the M-orthogonal fraction
+        equals the plain Euclidean projection share.
+
+        The Euclidean ``ManifoldMonitor`` path was removed in the 4.0
+        Mahalanobis-only collapse, so the reference is computed by hand:
+        the L2-orthogonal projection share ``‖x_par‖₂ / ‖x‖₂`` of the
+        centered hidden onto the subspace basis.  With Σ ≈ I the whitened
+        readout must reproduce it (the synthetic isotropic Σ isn't exactly
+        I, hence the loose tolerance)."""
         m = _toy_manifold(dim=8, n_layers=1)
-        iso = _make_whitener(layers=(0,), d=8, n=4000)  # Σ ≈ I
-        mon_w = ManifoldMonitor(whitener=iso)
-        mon_w.add_probe("toy", m)
-        mon_e = ManifoldMonitor()  # Euclidean
-        mon_e.add_probe("toy", m)
-        pw = mon_w.attached_probes()["toy"]
-        pe = mon_e.attached_probes()["toy"]
+        iso = isotropic_whitener((0,), 8, n=4000)  # Σ ≈ I
+        mon = ManifoldMonitor(whitener=iso)
+        mon.add_probe("toy", m)
+        p = mon.attached_probes()["toy"]
+        sub = m.layers[0]
 
         torch.manual_seed(11)
         for _ in range(5):
             h = torch.randn(8)
-            fw = float(mon_w._layer_geometry(pw, 0, h)[0].item())
-            fe = float(mon_e._layer_geometry(pe, 0, h)[0].item())
-            # Σ ≈ I ⇒ M-orthogonal projection ≈ Euclidean projection.
-            assert fw == pytest.approx(fe, abs=0.05)
+            f = float(mon._layer_geometry(p, 0, h)[0].item())
+            assert 0.0 <= f <= 1.0 + 1e-6
 
-    def test_set_whitener_flips_readout(self) -> None:
+            # Euclidean reference: L2-orthogonal projection energy share onto
+            # the subspace basis (Σ⁻¹ → I in the whitened formula).
+            x = h - sub.mean
+            g_e = sub.basis @ x
+            m_r_e = sub.basis @ sub.basis.T
+            c_e = torch.linalg.solve(m_r_e, g_e)
+            par_e = float(torch.sqrt((g_e * c_e).sum().clamp_min(0.0)))
+            frac_e = par_e / max(float(x.norm()), 1e-12)
+            # Σ ≈ I ⇒ M-orthogonal projection ≈ Euclidean projection.
+            assert f == pytest.approx(frac_e, abs=2e-2)
+
+    def test_set_whitener_rebuilds_per_probe_cache(self) -> None:
+        """``set_whitener`` rebuilds the per-probe whitened factors over the
+        new covariance (Mahalanobis-only — there is no Euclidean readout)."""
         m = _toy_manifold(dim=8, n_layers=1)
-        mon = ManifoldMonitor()  # start Euclidean
+        w1 = _make_whitener(layers=(0,), d=8, seed=1)
+        mon = ManifoldMonitor(whitener=w1)
         mon.add_probe("toy", m)
-        assert mon.attached_probes()["toy"].whitened == {}
-        w = _make_whitener(layers=(0,), d=8)
-        mon.set_whitener(w)
         assert set(mon.attached_probes()["toy"].whitened.keys()) == {0}
-        mon.set_whitener(None)
-        assert mon.attached_probes()["toy"].whitened == {}
+        # Swap in a different covering whitener → cache rebuilt for layer 0.
+        w2 = _make_whitener(layers=(0,), d=8, seed=2)
+        mon.set_whitener(w2)
+        assert set(mon.attached_probes()["toy"].whitened.keys()) == {0}
 
 
 def _cos(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -212,25 +234,25 @@ class TestTransferProfileRebake:
                 1.0, abs=1e-5,
             )
 
-    def test_no_whitener_is_plain_euclidean_transfer(self) -> None:
+    def test_no_whitener_raises(self) -> None:
+        """Transfer is Mahalanobis-only: no target whitener is a hard error
+        (the Euclidean transfer path is gone)."""
+        from saklas.core.mahalanobis import WhitenerError
         from saklas.io.alignment import transfer_profile
         d, layers = 6, (0, 1, 2)
         src = self._src_profile(d, layers)
         align = {L: torch.eye(d) for L in layers}
-        out = transfer_profile(src, align, source_model_id="src/m")
-        assert out.metadata["bake"] == "euclidean"
-        for L in layers:
-            assert torch.allclose(out[L].float(), src[L].float(), atol=1e-5)
+        with pytest.raises(WhitenerError, match="TARGET"):
+            transfer_profile(src, align, source_model_id="src/m")
 
-    def test_partial_coverage_gate_skips_rebake(self) -> None:
+    def test_partial_coverage_raises(self) -> None:
+        from saklas.core.mahalanobis import WhitenerError
         from saklas.io.alignment import transfer_profile
         d, layers = 6, (0, 1, 2)
         src = self._src_profile(d, layers)
         align = {L: torch.eye(d) for L in layers}
         w_partial = _make_whitener(layers=(0, 1), d=d)  # missing layer 2
-        out = transfer_profile(
-            src, align, source_model_id="src/m", whitener=w_partial,
-        )
-        assert out.metadata["bake"] == "euclidean"
-        for L in layers:
-            assert torch.allclose(out[L].float(), src[L].float(), atol=1e-5)
+        with pytest.raises(WhitenerError, match="TARGET"):
+            transfer_profile(
+                src, align, source_model_id="src/m", whitener=w_partial,
+            )

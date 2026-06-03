@@ -5,6 +5,12 @@ compare`` / ``subspace why`` (the verbs that read baked tensors off disk
 without a model) fall back to folding a **fitted** manifold tensor when no
 ``vectors/`` tensor resolves.  These tests synthesize a fitted 2-node manifold
 on disk (no model) and exercise the CLI runners end-to-end.
+
+The legacy bipolar-centroid fold (``_fold_centroids_to_affine_manifold``) was
+retired in the Mahalanobis-only collapse; the fitted manifold here is built via
+the production ``fit_affine_subspace`` primitive.  ``subspace compare`` is now
+Mahalanobis-only, so the fixture seeds a per-model neutral cache on disk for the
+runner's ``LayerWhitener.from_cache`` build.
 """
 from __future__ import annotations
 
@@ -16,11 +22,14 @@ import torch
 
 from saklas import cli
 from saklas.cli.runners import _run_compare, _run_why
-from saklas.core.manifold import save_manifold
-from saklas.core.vectors import _fold_centroids_to_affine_manifold
-from saklas.io.paths import manifold_dir, tensor_filename
+from saklas.core.manifold import (
+    CustomDomain, Manifold, fit_affine_subspace, save_manifold, subspace_share,
+)
+from saklas.io.paths import manifold_dir, model_dir, tensor_filename
 
 _MODEL = "test/model"
+_LAYERS = (2, 5)
+_DIM = 8
 
 
 @pytest.fixture(autouse=True)
@@ -30,6 +39,7 @@ def _isolated_home(
     from saklas.io import selectors as _sel
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     _sel.invalidate()
+    _seed_neutral_cache(_MODEL)
     yield
     _sel.invalidate()
 
@@ -38,10 +48,41 @@ def _unit(v: torch.Tensor) -> torch.Tensor:
     return v / v.norm()
 
 
+def _seed_neutral_cache(model_id: str, *, n: int = 64, seed: int = 5) -> None:
+    """Write a per-model neutral-activation + layer-means disk cache.
+
+    ``subspace compare`` builds its (mandatory) whitener via
+    ``LayerWhitener.from_cache(model_id)`` — there is no Euclidean path — so the
+    disk cache (``neutral_activations.safetensors`` + ``layer_means.safetensors``,
+    keyed ``layer_<idx>``, fp32) must exist for the layers the folded manifolds
+    occupy.
+    """
+    from safetensors.torch import save_file
+
+    md = model_dir(model_id)
+    md.mkdir(parents=True, exist_ok=True)
+    means: dict[str, torch.Tensor] = {}
+    acts: dict[str, torch.Tensor] = {}
+    for L in _LAYERS:
+        g = torch.Generator().manual_seed(seed * 13 + L)
+        scale = 0.5 + torch.rand(_DIM, generator=g, dtype=torch.float32)
+        mu = torch.randn(_DIM, generator=g, dtype=torch.float32) * 0.1
+        X = torch.randn(n, _DIM, generator=g, dtype=torch.float32) * scale + mu
+        means[f"layer_{L}"] = mu
+        acts[f"layer_{L}"] = X
+    save_file(means, str(md / "layer_means.safetensors"))
+    save_file(acts, str(md / "neutral_activations.safetensors"))
+
+
 def _write_fitted_manifold(
-    ns: str, name: str, *, seed: int = 0, d: int = 8,
+    ns: str, name: str, *, seed: int = 0, d: int = _DIM,
 ) -> Path:
-    """Synthesize a fitted 2-node affine manifold tensor on disk (no model)."""
+    """Synthesize a fitted 2-node affine manifold tensor on disk (no model).
+
+    Built via the production ``fit_affine_subspace`` per layer — node 0 = pos,
+    node 1 = neg — exactly as ``ManifoldExtractionPipeline`` does for a 2-node
+    ``pca`` fit, so the on-disk shape matches a real fit.
+    """
     g = torch.Generator().manual_seed(seed)
     d0, d1 = _unit(torch.randn(d, generator=g)), _unit(torch.randn(d, generator=g))
     pos = {2: 5.0 + 1.1 * d0, 5: 3.0 + 0.6 * d1}
@@ -50,15 +91,28 @@ def _write_fitted_manifold(
     pos_label, neg_label = (
         name.split(".", 1) if "." in name else (name, f"{name}_neg")
     )
-    mfld = _fold_centroids_to_affine_manifold(
-        name, pos, neg, pos_label=pos_label, neg_label=neg_label,
-        layer_means=neutral,
+    layers = {}
+    share = {}
+    for L in _LAYERS:
+        cent = torch.stack([pos[L].float(), neg[L].float()])  # (2, D), node 0 = pos
+        sub, mu_coords, _ev = fit_affine_subspace(
+            cent, neutral_mean=neutral[L].float(), orient_to=0,
+        )
+        layers[L] = sub
+        share[L] = subspace_share(mu_coords, sub.basis)  # Euclidean spread (no whitener)
+    mfld = Manifold(
+        name=name,
+        domain=CustomDomain(1),
+        node_labels=[pos_label, neg_label],
+        node_coords=torch.tensor([[1.0], [-1.0]]),
+        layers=layers,
+        mahalanobis_share=share,
     )
     folder = manifold_dir(ns, name)
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / tensor_filename(_MODEL, release=None)
     save_manifold(mfld, path, {"method": "folded_vector",
-                               "share_metric": mfld.metadata["share_metric"]})
+                               "share_metric": "euclidean"})
     return path
 
 
@@ -170,7 +224,8 @@ class TestWhyFold:
 
 
 # ---------------------------------------------------------------------------
-# subspace compare — folds fitted manifolds (named + 1-arg rank-all)
+# subspace compare — folds fitted manifolds (named + 1-arg rank-all).
+# Mahalanobis-only: the fixture seeds the per-model neutral cache.
 # ---------------------------------------------------------------------------
 
 class TestCompareFold:
@@ -180,8 +235,7 @@ class TestCompareFold:
         _write_fitted_manifold("default", "happy.sad", seed=1)
         _write_fitted_manifold("default", "warm.clinical", seed=2)
         args = cli.parse_args([
-            "subspace", "compare", "happy.sad", "warm.clinical",
-            "-m", _MODEL, "--metric", "euclidean",
+            "subspace", "compare", "happy.sad", "warm.clinical", "-m", _MODEL,
         ])
         _run_compare(args)
         out = capsys.readouterr().out
@@ -195,8 +249,7 @@ class TestCompareFold:
         _write_fitted_manifold("default", "warm.clinical", seed=2)
         _write_fitted_manifold("default", "angry.calm", seed=3)
         args = cli.parse_args([
-            "subspace", "compare", "happy.sad",
-            "-m", _MODEL, "--metric", "euclidean",
+            "subspace", "compare", "happy.sad", "-m", _MODEL,
         ])
         _run_compare(args)
         out = capsys.readouterr().out
@@ -211,7 +264,7 @@ class TestCompareFold:
         _write_fitted_manifold("alice", "happy.sad", seed=2)
         args = cli.parse_args([
             "subspace", "compare", "default/happy.sad", "alice/happy.sad",
-            "-m", _MODEL, "--metric", "euclidean",
+            "-m", _MODEL,
         ])
         _run_compare(args)
         out = capsys.readouterr().out
@@ -225,8 +278,7 @@ class TestCompareFold:
         _write_fitted_manifold("alice", "warm.clinical", seed=2)
         _write_fitted_manifold("default", "warm.clinical", seed=3)
         args = cli.parse_args([
-            "subspace", "compare", "happy.sad",
-            "-m", _MODEL, "--metric", "euclidean",
+            "subspace", "compare", "happy.sad", "-m", _MODEL,
         ])
         _run_compare(args)
         out = capsys.readouterr().out

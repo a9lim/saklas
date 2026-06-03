@@ -3,6 +3,12 @@
 Covers TraitMonitor.score_stack (Task 3) and SaklasSession.score_hidden
 (Task 4) using a synthetic monitor and a mock SaklasSession built without
 a real model.
+
+Mahalanobis-only (4.0 collapse): probe scoring *requires* a whitener covering
+every probed layer — there is no Euclidean path — so every monitor here is
+built with a synthetic covering whitener (``tests/_whitener.py``).  The metric
+is whitened cosine, so the structural-semantics tests assert ordering /
+finiteness / shape rather than exact Euclidean cosine values.
 """
 from __future__ import annotations
 
@@ -10,48 +16,82 @@ import pytest
 import torch
 
 from saklas.core.monitor import TraitMonitor
+from tests._whitener import synthetic_means, synthetic_whitener
+
+# A probe along axis 0, layer 0, dim 4 — easy to reason about.  The monitor
+# centers each hidden by ``layer_means`` (here the whitener's own neutral mean)
+# before the whitened cosine, so probe/token vectors below are stated relative
+# to that mean (added back where a concrete read value matters).
+_DIM = 4
+_MEANS0 = synthetic_means([0], _DIM)
+_WHIT0 = synthetic_whitener([0], _DIM, means=_MEANS0)
+
+
+_PROBE0 = torch.tensor([1.0, 0.0, 0.0, 0.0])
+
+
+def _m_orthogonal_to_probe() -> torch.Tensor:
+    """A centered vector deliberately *Mahalanobis*-orthogonal to the probe.
+
+    The whitened inner product is ``d^T Σ⁻¹ v`` — so a vector M-orthogonal to
+    the probe ``d`` is any ``v`` Euclidean-orthogonal to ``Σ⁻¹ d``
+    (``= whitener.apply_inv(layer, d)``).  An arbitrary axis vector
+    (``[0,1,0,0]``) is *Euclidean*-orthogonal to the probe but NOT
+    M-orthogonal under an anisotropic Σ, so its whitened cosine is nonzero —
+    hence the explicit construction here.
+    """
+    sinv_d = _WHIT0.apply_inv(0, _PROBE0).float()
+    # Solve sinv_d[0]*a + sinv_d[1]*b = 0 in the first two coords (b = 1).
+    a = -float(sinv_d[1]) / float(sinv_d[0])
+    return torch.tensor([a, 1.0, 0.0, 0.0])
 
 
 def _monitor_with_probe() -> TraitMonitor:
-    """Build a monitor with a single probe on layer 0, dim=4.
-
-    Probe direction is [1, 0, 0, 0] with unit norm and unit weight so
-    scoring math is easy to reason about.
-    """
-    profile = {0: torch.tensor([1.0, 0.0, 0.0, 0.0])}
-    return TraitMonitor({"x": profile}, layer_means=None)
+    """A monitor with a single axis-0 probe on layer 0, covered by a whitener."""
+    profile = {0: _PROBE0.clone()}
+    return TraitMonitor(
+        {"x": profile}, layer_means=dict(_MEANS0), whitener=_WHIT0,
+    )
 
 
-def test_score_stack_single_layer_per_token_values():
+def test_score_stack_aligned_beats_anti_aligned():
+    """Whitened cosine of an aligned token is exactly +1, an anti-aligned one
+    exactly -1 (an SPD-metric invariant), and a deliberately M-orthogonal
+    token reads ~0 — between them."""
     m = _monitor_with_probe()
-    # Three "tokens": first aligned with probe, second anti-aligned, third neutral.
-    stack = torch.tensor([
-        [1.0, 0.0, 0.0, 0.0],
-        [-1.0, 0.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0, 0.0],
+    mu = _MEANS0[0]
+    v_ortho = _m_orthogonal_to_probe()
+    stack = torch.stack([
+        torch.tensor([1.0, 0.0, 0.0, 0.0]) + mu,    # aligned   → +1
+        torch.tensor([-1.0, 0.0, 0.0, 0.0]) + mu,   # anti      → -1
+        v_ortho + mu,                                # M-orthogonal → 0
     ])
-    captured = {0: stack}
-    agg, per_token = m.score_stack(captured, accumulate=False)
+    agg, per_token = m.score_stack({0: stack}, accumulate=False)
     assert set(per_token.keys()) == {"x"}
     vals = per_token["x"]
     assert len(vals) == 3
-    assert vals[0] == pytest.approx(1.0, abs=1e-5)
-    assert vals[1] == pytest.approx(-1.0, abs=1e-5)
-    assert abs(vals[2]) < 1e-5
-    # Default agg_index=None uses the last row — token 2 is near-zero.
-    assert abs(agg["x"]) < 1e-5
+    # Exact ±1 under the whitened (SPD) metric — not merely ordered.
+    assert vals[0] == pytest.approx(1.0, abs=1e-5)    # aligned
+    assert vals[1] == pytest.approx(-1.0, abs=1e-5)   # anti-aligned
+    assert vals[2] == pytest.approx(0.0, abs=1e-5)    # M-orthogonal
+    assert vals[0] > vals[2] > vals[1]                # aligned > ortho > anti
+    # ``agg`` (default agg_index=None) pools the last row.
+    assert agg["x"] == pytest.approx(vals[2], abs=1e-5)
 
 
 def test_score_stack_agg_index_selects_row():
     m = _monitor_with_probe()
-    stack = torch.tensor([
-        [1.0, 0.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0, 0.0],
+    mu = _MEANS0[0]
+    stack = torch.stack([
+        torch.tensor([1.0, 0.0, 0.0, 0.0]) + mu,
+        torch.tensor([0.0, 1.0, 0.0, 0.0]) + mu,
     ])
-    agg, _ = m.score_stack({0: stack}, agg_index=0, accumulate=False)
-    assert agg["x"] == pytest.approx(1.0, abs=1e-5)
-    agg2, _ = m.score_stack({0: stack}, agg_index=1, accumulate=False)
-    assert abs(agg2["x"]) < 1e-5
+    _agg, per_token = m.score_stack({0: stack}, accumulate=False)
+    agg0, _ = m.score_stack({0: stack}, agg_index=0, accumulate=False)
+    agg1, _ = m.score_stack({0: stack}, agg_index=1, accumulate=False)
+    # The selected aggregate row matches that row's per-token value.
+    assert agg0["x"] == pytest.approx(per_token["x"][0], abs=1e-5)
+    assert agg1["x"] == pytest.approx(per_token["x"][1], abs=1e-5)
 
 
 def test_score_stack_accumulate_false_leaves_history_untouched():
@@ -67,9 +107,11 @@ def test_score_stack_accumulate_false_leaves_history_untouched():
 def test_score_stack_accumulate_true_records_aggregate():
     m = _monitor_with_probe()
     m.score_stack(
-        {0: torch.tensor([[1.0, 0.0, 0.0, 0.0]])}, accumulate=True,
+        {0: (torch.tensor([[1.0, 0.0, 0.0, 0.0]]) + _MEANS0[0])},
+        accumulate=True,
     )
     assert m._stats["x"]["count"] == 1
+    # Aligned token ⇒ whitened cosine of exactly +1 recorded.
     assert list(m.history["x"])[-1] == pytest.approx(1.0, abs=1e-5)
 
 
@@ -102,6 +144,18 @@ def test_score_stack_accumulate_false_leaves_pending_flag_clear():
     assert m.has_pending_per_token() is False
 
 
+def test_score_probes_without_whitener_raises():
+    """A monitor with a probe but no whitener can't score — Mahalanobis is
+    mandatory, so ``_ensure_cache`` raises rather than reading Euclidean."""
+    from saklas.core.mahalanobis import WhitenerError
+
+    mon = TraitMonitor({"x": {0: torch.tensor([1.0, 0.0, 0.0, 0.0])}})
+    with pytest.raises(WhitenerError, match="whitener"):
+        mon.score_stack(
+            {0: torch.tensor([[1.0, 0.0, 0.0, 0.0]])}, accumulate=False,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Task 4 — SaklasSession.score_hidden
 # ---------------------------------------------------------------------------
@@ -125,34 +179,38 @@ def _mock_session() -> SaklasSession:
 
 def test_score_hidden_single_state_returns_probe_dict():
     s = _mock_session()
-    h = {0: torch.tensor([1.0, 0.0, 0.0, 0.0])}
+    h = {0: torch.tensor([1.0, 0.0, 0.0, 0.0]) + _MEANS0[0]}
     scores = s.score_hidden(h)
     assert set(scores.keys()) == {"x"}
+    # Aligned with the probe ⇒ whitened cosine of exactly +1.
     assert scores["x"] == pytest.approx(1.0, abs=1e-5)
 
 
 def test_score_hidden_stack_aggregate_only():
     s = _mock_session()
-    stack = torch.tensor([
-        [1.0, 0.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0, 0.0],
+    stack = torch.stack([
+        torch.tensor([1.0, 0.0, 0.0, 0.0]) + _MEANS0[0],
+        torch.tensor([0.0, 1.0, 0.0, 0.0]) + _MEANS0[0],
     ])
     scores = s.score_hidden({0: stack})
-    # Aggregate pools from last row (neutral wrt probe).
     assert isinstance(scores, dict)
-    assert abs(scores["x"]) < 1e-5
+    assert set(scores.keys()) == {"x"}
+    assert scores["x"] == scores["x"]  # finite
 
 
 def test_score_hidden_stack_per_token_returns_tuple():
     s = _mock_session()
-    stack = torch.tensor([
-        [1.0, 0.0, 0.0, 0.0],
-        [-1.0, 0.0, 0.0, 0.0],
+    stack = torch.stack([
+        torch.tensor([1.0, 0.0, 0.0, 0.0]) + _MEANS0[0],
+        torch.tensor([-1.0, 0.0, 0.0, 0.0]) + _MEANS0[0],
     ])
     agg, per_token = s.score_hidden({0: stack}, per_token=True)
     assert set(agg.keys()) == {"x"}
+    # Exact ±1 under the whitened metric: aligned token reads +1, the
+    # anti-aligned one -1.
     assert per_token["x"][0] == pytest.approx(1.0, abs=1e-5)
     assert per_token["x"][1] == pytest.approx(-1.0, abs=1e-5)
+    assert per_token["x"][0] > per_token["x"][1]
 
 
 def test_score_hidden_empty_dict_raises():
@@ -205,7 +263,7 @@ def test_score_hidden_dim_mismatch_raises():
 def test_score_hidden_accumulate_false_does_not_mutate_history():
     s = _mock_session()
     before = list(s._monitor.history["x"])
-    s.score_hidden({0: torch.tensor([1.0, 0.0, 0.0, 0.0])})
+    s.score_hidden({0: torch.tensor([1.0, 0.0, 0.0, 0.0]) + _MEANS0[0]})
     assert list(s._monitor.history["x"]) == before
     assert s._monitor._stats["x"]["count"] == 0
 
@@ -213,7 +271,7 @@ def test_score_hidden_accumulate_false_does_not_mutate_history():
 def test_score_hidden_accumulate_true_records():
     s = _mock_session()
     s.score_hidden(
-        {0: torch.tensor([1.0, 0.0, 0.0, 0.0])}, accumulate=True,
+        {0: torch.tensor([1.0, 0.0, 0.0, 0.0]) + _MEANS0[0]}, accumulate=True,
     )
     assert s._monitor._stats["x"]["count"] == 1
 
@@ -232,80 +290,58 @@ def _whitener_from_neutrals(
     )
 
 
-def test_identity_covariance_matches_euclidean():
-    """When the neutral covariance is ~isotropic (whitening ≈ identity up
-    to ridge scale), the whitened cosine matches the Euclidean cosine —
-    the natural sanity check that the new metric reduces to the old one
-    on isotropic activations.
-    """
-    torch.manual_seed(0)
-    profile = {0: torch.tensor([1.0, 0.0, 0.0, 0.0])}
-    # Isotropic neutrals centered at 0: covariance ≈ σ²·I, so Σ⁻¹ ∝ I and
-    # the whitened cosine equals the Euclidean cosine (scale cancels in
-    # the cosine ratio).
-    X = torch.randn(200, 4)
-    mean = X.mean(dim=0)
-    whitener = _whitener_from_neutrals(X, mean)
-
-    euclid = TraitMonitor({"x": dict(profile)}, layer_means={0: mean})
-    maha = TraitMonitor(
-        {"x": dict(profile)}, layer_means={0: mean}, whitener=whitener,
-    )
-    h = {0: torch.tensor([0.7, 0.7, 0.1, 0.0]) + mean}
-    e = euclid.measure_from_hidden(h, accumulate=False)["x"]
-    m = maha.measure_from_hidden(h, accumulate=False)["x"]
-    # Ridge regularization + finite-sample covariance keep Σ from being
-    # exactly I, so the whitened read tracks the Euclidean one closely
-    # without matching bit-for-bit — a loose tolerance is the right
-    # assertion for "reduces to Euclidean on isotropic neutrals."
-    assert m == pytest.approx(e, abs=6e-2)
-
-
-def test_anisotropic_covariance_differs_from_euclidean():
-    """On strongly anisotropic neutrals the whitened cosine departs from
-    the Euclidean cosine — the metric down-weights alignment along the
-    high-variance neutral direction.
-    """
+def test_anisotropic_whitened_read_downweights_high_variance_axis():
+    """On strongly anisotropic neutrals the whitened cosine down-weights
+    alignment along the high-variance neutral direction relative to a
+    probe-aligned read along a low-variance axis."""
     torch.manual_seed(1)
-    profile = {0: torch.tensor([1.0, 1.0, 0.0, 0.0]) / (2 ** 0.5)}
-    # Neutrals with a huge variance along axis 0, tiny elsewhere.
+    # Probe along the LOW-variance axis 1.
+    profile = {0: torch.tensor([0.0, 1.0, 0.0, 0.0])}
     base = torch.randn(300, 4)
-    base[:, 0] *= 20.0
-    base[:, 1] *= 0.5
+    base[:, 0] *= 20.0   # huge variance axis 0
+    base[:, 1] *= 0.5    # tiny variance axis 1
     mean = base.mean(dim=0)
     whitener = _whitener_from_neutrals(base, mean)
 
-    euclid = TraitMonitor({"x": dict(profile)}, layer_means={0: mean})
     maha = TraitMonitor(
         {"x": dict(profile)}, layer_means={0: mean}, whitener=whitener,
     )
-    # A hidden aligned mostly with the high-variance axis.
-    h = {0: torch.tensor([10.0, 0.5, 0.0, 0.0]) + mean}
-    e = euclid.measure_from_hidden(h, accumulate=False)["x"]
-    m = maha.measure_from_hidden(h, accumulate=False)["x"]
-    # The metrics must disagree (the whole point); the whitened read
-    # discounts the high-variance-axis overlap.
-    assert abs(m - e) > 1e-2
+    # A hidden along the probe (low-var axis) reads strongly; one along the
+    # high-var axis reads weakly under the whitened metric.
+    on_probe = maha.measure_from_hidden(
+        {0: torch.tensor([0.0, 1.0, 0.0, 0.0]) + mean}, accumulate=False,
+    )["x"]
+    off_probe = maha.measure_from_hidden(
+        {0: torch.tensor([10.0, 0.0, 0.0, 0.0]) + mean}, accumulate=False,
+    )["x"]
+    assert on_probe > off_probe
 
 
 def test_set_whitener_invalidates_cache_and_switches_metric():
-    """``set_whitener`` flips the read metric and flushes the cache so the
-    next scoring call rebuilds against the new covariance.
-    """
+    """``set_whitener`` swaps the whitener and flushes the cache so the next
+    scoring call rebuilds against the new covariance."""
     torch.manual_seed(2)
     profile = {0: torch.tensor([1.0, 1.0, 0.0, 0.0]) / (2 ** 0.5)}
-    base = torch.randn(300, 4)
-    base[:, 0] *= 20.0
-    mean = base.mean(dim=0)
-    whitener = _whitener_from_neutrals(base, mean)
+    base_a = torch.randn(300, 4)
+    base_a[:, 0] *= 20.0
+    mean = base_a.mean(dim=0)
+    whit_a = _whitener_from_neutrals(base_a, mean)
 
-    mon = TraitMonitor({"x": dict(profile)}, layer_means={0: mean})
+    # A second, differently-anisotropic whitener over the SAME mean (so the
+    # centering is unchanged and only the metric differs).
+    torch.manual_seed(20)
+    base_b = torch.randn(300, 4)
+    base_b[:, 1] *= 20.0
+    base_b = base_b - base_b.mean(dim=0) + mean
+    whit_b = _whitener_from_neutrals(base_b, mean)
+
+    mon = TraitMonitor({"x": dict(profile)}, layer_means={0: mean}, whitener=whit_a)
     h = {0: torch.tensor([10.0, 0.5, 0.0, 0.0]) + mean}
     before = mon.measure_from_hidden(h, accumulate=False)["x"]
-    assert mon.whitener is None
+    assert mon.whitener is whit_a
 
-    mon.set_whitener(whitener)
-    assert mon.whitener is whitener
+    mon.set_whitener(whit_b)
+    assert mon.whitener is whit_b
     after = mon.measure_from_hidden(h, accumulate=False)["x"]
     # Same instance, same probe, different metric ⇒ different reading.
     assert abs(after - before) > 1e-2
@@ -316,12 +352,12 @@ def test_set_whitener_invalidates_cache_and_switches_metric():
     assert again == pytest.approx(after, abs=1e-6)
 
 
-def test_partial_coverage_falls_back_to_all_euclidean():
+def test_partial_coverage_raises():
     """All-or-nothing read metric: a whitener covering only some probed
-    layers drops the *whole* monitor to Euclidean — never a per-layer
-    Mahalanobis/Euclidean mix (aggregating cosines from two metrics into
-    one probe score is what ``LayerWhitener.covers_all`` exists to forbid).
-    """
+    layers is a hard error (Mahalanobis is mandatory; there is no
+    per-layer mix and no Euclidean fallback)."""
+    from saklas.core.mahalanobis import WhitenerError
+
     torch.manual_seed(3)
     profile = {
         0: torch.tensor([1.0, 0.0, 0.0, 0.0]),
@@ -340,9 +376,5 @@ def test_partial_coverage_falls_back_to_all_euclidean():
         0: torch.tensor([1.0, 0.0, 0.0, 0.0]) + mean0,
         1: torch.tensor([0.0, 1.0, 0.0, 0.0]),
     }
-    out = mon.measure_from_hidden(h, accumulate=False)["x"]
-    assert out == out  # finite, not NaN
-    # covers_all([0, 1]) is False → no Mahalanobis cache at all; every
-    # probed layer scores under the Euclidean cosine.
-    mon._ensure_cache(torch.device("cpu"))
-    assert mon._layer_white == {}
+    with pytest.raises(WhitenerError, match="whitener"):
+        mon.measure_from_hidden(h, accumulate=False)

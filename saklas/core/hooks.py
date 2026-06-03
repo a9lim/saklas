@@ -410,6 +410,21 @@ def _orthogonalize_affine_against(
 _MANIFOLD_COLD_GN_STEPS = 4
 
 
+def _normalize_shares_mean1(raw: dict[int, float]) -> dict[int, float]:
+    """Normalize per-layer share scores to **mean 1** (``Σ_L share_L = n_layers``).
+
+    So ``eff_along_L = share_L · base`` is a clean per-layer slide fraction
+    ≈ ``base`` on a typical layer and n_layers-invariant (see
+    ``_MANIFOLD_GAIN``).  Degenerate guard: an all-zero / near-zero total
+    falls back to a uniform ``1.0`` per layer.
+    """
+    n_layers = max(1, len(raw))
+    total = sum(raw.values())
+    if total <= 1e-12:
+        return dict.fromkeys(raw, 1.0)
+    return {L: s / total * n_layers for L, s in raw.items()}
+
+
 def _manifold_layer_shares(manifold: Any) -> dict[int, float]:
     # Prefer the whitened (Mahalanobis) per-layer share baked at fit time —
     # the subspace-restricted analogue of vector steering's ``‖d‖_M`` bake
@@ -438,11 +453,7 @@ def _manifold_layer_shares(manifold: Any) -> dict[int, float]:
             layer_scores[layer_idx] = float(
                 torch.linalg.vector_norm(node_coords).item()
             )
-    n_layers = max(1, len(manifold.layers))
-    total_score = sum(layer_scores.values())
-    if total_score <= 1e-12:
-        return dict.fromkeys(manifold.layers, 1.0)
-    return {L: s / total_score * n_layers for L, s in layer_scores.items()}
+    return _normalize_shares_mean1(layer_scores)
 
 
 class SteeringManager:
@@ -706,13 +717,8 @@ class SteeringManager:
             # is a clean per-layer slide fraction and n_layers-invariant (one
             # covered layer and a 30-layer fit both put ≈ ``base`` of slide on
             # each contributing layer; A⊂B steers its shared axis identically).
-            n_lay = len(layer_set)
             raw_share = {L: float(synth.share.get(L, 0.0)) for L in layer_set}
-            total_share = sum(raw_share.values())
-            if total_share <= 1e-12:
-                shares = dict.fromkeys(layer_set, 1.0)
-            else:
-                shares = {L: raw_share[L] / total_share * n_lay for L in layer_set}
+            shares = _normalize_shares_mean1(raw_share)
 
             for L in layer_set:
                 sub_L = synth.layers[L]

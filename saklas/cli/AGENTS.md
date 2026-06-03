@@ -45,17 +45,17 @@ files via `ConfigFile.effective(extras, include_default=True)`, runs
 `apply_flag_overrides` for CLI-supplied values, then stamps in place: `args.model`
 (if YAML supplied it), `args.temperature`, `args.top_p`, `args.thinking`,
 `args.system_prompt`, `args.max_tokens`, `args.config_vectors`, plus the YAML-only
-knobs `args.projection_metric` / `args.compile` / `args.cuda_graphs` /
-`args.top_k_alts` (from YAML `return_top_k`) — each only when the matching CLI flag
-is unset (CLI wins). Finally calls `ensure_vectors_installed`. There is **no**
-`method`/`injection_mode`/`theta_max` threading — those config keys were removed
-with the unified injection kernel.
+knobs `args.compile` / `args.cuda_graphs` / `args.top_k_alts` (from YAML
+`return_top_k`) — each only when the matching CLI flag is unset (CLI wins). Finally
+calls `ensure_vectors_installed`. There is **no** `method`/`injection_mode`/
+`theta_max`/`projection_metric` threading — those config keys were removed with the
+unified injection kernel and the Mahalanobis-only collapse.
 
 `ConfigFile.load` parses the YAML, warns on unknown keys, and validates the
 `vectors:` value (a single steering expression) through `parse_expr` at load time.
 `compose` overrides field-by-field (later wins; `vectors` wholesale). Known keys
 (`_KNOWN_KEYS`): `model`, `vectors`, `thinking`, `temperature`, `top_p`,
-`max_tokens`, `system_prompt`, `projection_metric`, `compile`, `cuda_graphs`,
+`max_tokens`, `system_prompt`, `compile`, `cuda_graphs`,
 `return_top_k`. `ensure_vectors_installed` walks the raw expression via
 `referenced_selectors`, auto-installing HF concepts and materializing `default/`
 ones; `strict=True` raises on any unresolvable reference.
@@ -63,9 +63,10 @@ ones; `strict=True` raises on any unresolvable reference.
 ## Session construction + warmup
 
 `_make_session(args)` builds the `SaklasSession` via `from_pretrained`, threading
-`device`, `quantize`, `probes`, `system_prompt`, `max_tokens`, `projection_metric`
-(default `"mahalanobis"`), `dls`, `compile`, `cuda_graphs`, `return_top_k`. There
-is no injection-mode resolution and no `--legacy` conflict check. `_warmup_session`
+`device`, `quantize`, `probes`, `system_prompt`, `max_tokens`, `dls`, `compile`,
+`cuda_graphs`, `return_top_k`. There is no projection-metric knob (`~`/`|` is
+Mahalanobis-only), no injection-mode resolution, and no `--legacy` conflict check.
+`_warmup_session`
 runs a 32-token stateless `session.generate(...)` so dynamo's shape promotion fires
 on a realistic prefill before the user's first request; called from `tui` and
 `serve` after `_setup_steering_vectors`. `_attach_default_manifold_probes(session)`
@@ -82,11 +83,11 @@ concept axes); an unfitted one is skipped with a one-line hint.
 `-s/--strict`).
 
 - **Injection block** (`_add_injection_args`, on `tui`/`serve`/`experiment fan`/
-  `transcript run`/`naturalness`): `--projection-metric {mahalanobis,euclidean}`,
-  `--no-dls`, `--compile`, `--cuda-graphs`. All argparse-default to `None`/`False`;
-  YAML fills unset values, session defaults (mahalanobis / DLS on / compile +
-  cuda-graphs **off**) win otherwise. There is **no** `--steer-mode`/`--theta-max`/
-  `--legacy`.
+  `transcript run`/`naturalness`): `--no-dls`, `--compile`, `--cuda-graphs`. All
+  argparse-default to `None`/`False`; YAML fills unset values, session defaults
+  (DLS on / compile + cuda-graphs **off**) win otherwise. `~`/`|` projection is
+  Mahalanobis-only — there is **no** `--projection-metric`/`--steer-mode`/
+  `--theta-max`/`--legacy`.
 - **Logit block** (`_add_logit_args`): `--top-k-alts N` (0–256, → session
   `SamplingConfig.return_top_k`).
 - `tui`: `model` optional (a `-c` config with `model:` can supply it); `--max-tokens`
@@ -104,22 +105,22 @@ concept axes); an unfitted one is skipped with a one-line hint.
 - `subspace merge`: `name` + `expression`, `-f`, `-s/--strict`, `-m/--model`. Lands
   a corpus-less baked manifold via `merge_into_manifold`.
 - `subspace compare`: `concepts` (1+), `-m/--model` (required), `-v`, `-j`,
-  `--metric {euclidean,mahalanobis}` (default `None` → resolves to `mahalanobis`),
-  `--ridge-scale` (1.0, mahalanobis only). No `--legacy`. 1-arg ranks all installed
-  against the target, 2-arg pairwise, 3+ an N×N matrix; the mahalanobis path loads
-  `LayerWhitener.from_cache` up front (a miss is fatal — no silent Euclidean
-  fallback). Concepts fold from their 2-node manifolds.
+  `--ridge-scale` (1.0). No `--metric`/`--legacy` — compare is **Mahalanobis-only**.
+  1-arg ranks all installed against the target, 2-arg pairwise, 3+ an N×N matrix; it
+  loads `LayerWhitener.from_cache` up front (a miss is fatal — there is no Euclidean
+  path). Concepts fold from their 2-node manifolds.
 - `subspace why`: `concept`, `-m/--model` (required), `-j`. Per-layer `‖baked‖`
   histogram (16 buckets) + sidecar diagnostics.
 - `subspace transfer`: `concept`, `--from SRC` / `--to TGT` (required), `-f`, `-j`.
   A vector is a 2-node `pca` manifold, so `_run_transfer` delegates to
   `_run_manifold_transfer` (the `concept` positional is bridged onto `name`) — one
   transfer path. It fits/loads a Procrustes alignment and writes the target's
-  `from-<safe_src>` **manifold** tensor via `transfer_manifold`. The runner
-  best-effort calls `LayerWhitener.from_neutral_cache` on the target model's cached
-  `neutral_activations.safetensors` (no model load on a cache hit) so transferred
-  shares can be re-baked in the target Mahalanobis metric; cache miss leaves the
-  Euclidean fallback path.
+  `from-<safe_src>` **manifold** tensor via `transfer_manifold`. The runner calls
+  `_target_whitener_from_neutral_cache` (→ `LayerWhitener.from_neutral_cache`) on the
+  target model's cached `neutral_activations.safetensors` (no model load on a cache
+  hit) so transferred shares are re-baked in the target Mahalanobis metric;
+  **mandatory** — a missing/unusable target cache raises `WhitenerError` (the runner
+  exits 1 with a regenerate-neutrals hint), there is no Euclidean rebake.
 - `manifold`: top-level `fit`/`discover`/`generate`/`merge`/`install`/`search`/
   `push`/`rm`/`clear`/`refresh`/`transfer`/`ls`/`show`/`export`. `fit <folder>` runs
   `ManifoldExtractionPipeline` on an authored folder; `discover <name>

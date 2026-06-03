@@ -37,6 +37,8 @@ import torch
 from saklas.core.generation import (
     GenerationConfig,
     _PenaltyState,
+    _advance_no_cache_input,
+    _effective_topk,
     _sampler_logprob_vector,
     build_chat_input,
     supports_thinking,
@@ -535,25 +537,14 @@ def _replay_branch_logprobs(
 
             def _advance_current_input(next_token: torch.Tensor) -> None:
                 nonlocal current_input, no_cache_buf, no_cache_len
-                if not no_cache_mode:
-                    current_input = next_token
-                    return
-                if no_cache_buf is None:
-                    cap = int(current_input.shape[1]) + max(len(forced_ids), 1)
-                    no_cache_buf = torch.empty(
-                        (1, cap),
-                        dtype=current_input.dtype,
-                        device=current_input.device,
-                    )
-                    no_cache_buf[:, :current_input.shape[1]].copy_(current_input)
-                    no_cache_len = int(current_input.shape[1])
-                if no_cache_len < no_cache_buf.shape[1]:
-                    no_cache_buf[:, no_cache_len:no_cache_len + 1].copy_(next_token)
-                    no_cache_len += 1
-                    current_input = no_cache_buf[:, :no_cache_len]
-                else:  # pragma: no cover - cap covers prompt + forced ids
-                    current_input = torch.cat([current_input, next_token], dim=1)
-                    no_cache_len = int(current_input.shape[1])
+                current_input, no_cache_buf, no_cache_len = _advance_no_cache_input(
+                    next_token,
+                    current_input=current_input,
+                    no_cache_buf=no_cache_buf,
+                    no_cache_len=no_cache_len,
+                    no_cache_mode=no_cache_mode,
+                    max_extra=len(forced_ids),
+                )
 
             with torch.inference_mode():
                 for forced_idx, token_id in enumerate(forced_ids):
@@ -598,10 +589,7 @@ def _replay_branch_logprobs(
                         logits[0, bias_idx] += bias_val.to(logits.dtype)
 
                     vocab_size = int(logits.shape[-1])
-                    user_top_k = (
-                        config.top_k if (config.top_k and config.top_k > 0) else 1024
-                    )
-                    topk_k = min(int(user_top_k), vocab_size)
+                    topk_k = _effective_topk(config, vocab_size)
                     logp = _sampler_logprob_vector(logits, config, topk_k)
 
                     if forced_idx >= len(branch.thinking_ids):

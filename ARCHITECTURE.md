@@ -212,8 +212,11 @@ per-layer basis through one routine, `_pca_basis(X, *, n_components, whitener,
 layer)`. The input is the `(K, D)` **μ-centered** centroid scatter `X = centroids
 − mean(centroids)` (`DEFAULT_N_COMPONENTS = 64`):
 
-- *Euclidean* (default, or partial whitener coverage): ordinary SVD of `X`;
-  `basis = Vh[:R]`, `ev_ratio` = retained fraction of raw inter-node variance.
+- *Euclidean* (no whitener — the behavior-space naturalness fit, which lives in
+  output-distribution space where there are no rogue activation dims): ordinary
+  SVD of `X`; `basis = Vh[:R]`, `ev_ratio` = retained fraction of raw inter-node
+  variance. Activation-space callers always pass a covering whitener (§3.4) and
+  raise without one, so they never take this branch.
 - *Whitened / Fisher* (whitener covers `layer`): maximize the LDA objective
   `vᵀS_b v / vᵀΣv` — the generalized eigenproblem `(S_b, Σ)` with `S_b = XᵀX`
   (between-node scatter) and `Σ` the residual-stream covariance. Solved via the
@@ -259,9 +262,11 @@ whitener bit-reproducible across the cache boundary.
 `from_neutral_activations` *excludes* any layer whose centered activations or
 regularized inverse come back non-finite, leaving it uncovered. So
 `covers_all(layers)` — the all-or-nothing coverage gate shared by extraction,
-manifold fit, projection, the monitor, and `subspace compare` — is trustworthy as
-"finite factors everywhere": either the whole probed/scored set is whitened or
-none of it is.
+manifold fit, projection, the monitor, transfer, and `subspace compare` — is
+trustworthy as "finite factors everywhere": either the whole probed/scored set is
+whitened, or the activation-space caller raises `WhitenerError`. There is no
+Euclidean fallback — Mahalanobis-only, because on real LMs the Euclidean metric is
+rogue-dominated (a wrong answer, not a degraded one).
 
 Primitives: `apply_inv`, `mahalanobis_norm`, `mahalanobis_cosine`, `leace_project`
 (closed-form LEACE single-direction projector), `subspace_gram(layer, B) = B Σ⁻¹
@@ -332,10 +337,11 @@ The per-tensor bakes:
   around their *own* mean, restricted to the subspace — **anchor-independent**
   (μ-centered), so it measures signal *spread*, not where neutral sits. At
   K=2/R=1 this is `‖δ_L‖_M / √2`, so the normalized per-layer profile is the DiM
-  bake profile exactly. Baked when the whitener covers all fit layers, gated
-  alongside the whitened basis; `share_metric`/`subspace_metric` record which.
-  This is the per-layer budget weight at apply time. (Coords supply target
-  *positions*; share supplies the *budget*.)
+  bake profile exactly. The activation-space fit always whitens (it raises without
+  a covering whitener), so `share_metric`/`subspace_metric` read `mahalanobis` — the
+  one exception is a monopolar fit's `subspace_metric`, which labels its raw-δ̂ basis
+  `euclidean` (a basis label, not a fallback). This is the per-layer budget weight at
+  apply time. (Coords supply target *positions*; share supplies the *budget*.)
 - **`origin`** (curved only) — `invert_parameterization` of the neutral mean onto
   the surface, per layer, in authoring coords. The cold-start foot seed for the
   per-token follower and the slide target of `!`. Flat subspaces store none (foot
@@ -449,8 +455,9 @@ synthesizer's `Δ = coeff · (coord @ basis) = coeff · d_L` reproduces the bake
 direction exactly. An affine `%` term reads the fitted manifold's per-layer
 `node_coords` directly (label-form only — coord-form on an affine manifold has no
 interpolant). Projection terms are materialized to derived `Profile`s first
-(`_materialize_projections` → `project_profile`: LEACE under a whitener,
-Gram-Schmidt otherwise) and then folded like vectors.
+(`_materialize_projections` → `project_profile`: closed-form LEACE, Mahalanobis-only
+— the session whitener must cover every projected layer, else `WhitenerError`) and
+then folded like vectors.
 
 **Grouping + synthesis.** Push + ablation fragments are grouped **by trigger**.
 Each trigger group is composed by `synthesize_subspace(push, ablate,
@@ -649,10 +656,11 @@ manifold probe layers.
 
 Scores per-layer probe directions against the running hidden state. The per-layer
 similarity is the **whitened (Mahalanobis) cosine** `⟨V, h_c⟩_M / (‖V‖_M
-‖h_c‖_M)` — matching the metric the default fit + `~`/`|` projection use. The
-metric is all-or-nothing via `covers_all`: Mahalanobis when the wired whitener
-covers every probed layer, else plain Euclidean cosine for all (never a per-layer
-mix — that would fold cosines from two metrics into one aggregate). The per-layer
+‖h_c‖_M)` — matching the metric the fit + `~`/`|` projection use. The metric is
+Mahalanobis-only and gated all-or-nothing via `covers_all`: the wired whitener must
+cover every probed layer, else `_ensure_cache` raises `WhitenerError` (there is no
+Euclidean path — a partial mix would fold cosines from two metrics into one
+aggregate). The per-layer
 probe *weight* stays `‖baked‖₂` (the bake already folded the Mahalanobis score
 into the magnitude, so re-whitening would double-count). `_ensure_cache`
 precomputes the whitened probe directions + their Mahalanobis norms +
@@ -673,11 +681,12 @@ across layers:
   living in the manifold's subspace, in `[0,1]`.
 - **nearest** — the nearest node by reduced-coord `cdist`.
 
-**Whitened readout** (built per probe at attach when the whitener covers every
-layer of that manifold): both channels switch to their Mahalanobis forms —
-fraction is the M-orthogonal subspace share `sqrt(gᵀ M_R⁻¹ g)/‖x‖_M` (`g = B Σ⁻¹
-x`), nearest runs in the `M_R` metric — the read-side analogue of the whitened/
-Fisher subspace the manifold was *fitted* in. `score_aggregate` is the
+**Whitened readout** (Mahalanobis-only — built per probe at attach; the whitener
+must cover every layer of that manifold, else `_build_whitened` raises
+`WhitenerError`): both channels are their Mahalanobis forms — fraction is the
+M-orthogonal subspace share `sqrt(gᵀ M_R⁻¹ g)/‖x‖_M` (`g = B Σ⁻¹ x`), nearest runs
+in the `M_R` metric — the read-side analogue of the whitened/Fisher subspace the
+manifold was *fitted* in. There is no Euclidean readout. `score_aggregate` is the
 end-of-gen slow path: pools the last non-special token per layer (same discipline
 as extraction), runs the channels, and additionally calls
 `invert_parameterization` to recover authoring coords + normalized residual.
@@ -740,14 +749,17 @@ Mistral-3/talkie lack a substitutable label and raise
 
 `io/alignment.py` — per-layer orthogonal Procrustes (`fit_alignment`, SVD for
 matched dim, rectangular least-squares otherwise; both center first) maps
-`M_L : ℝ^D_src → ℝ^D_tgt`. `transfer_profile` applies `M_L @ v_src` per layer and,
-with a target whitener covering the transferred layers, re-bakes each magnitude
-to its *target* Mahalanobis norm so the share is in the target metric.
-`transfer_manifold` (`io/manifolds.py`) maps a fitted manifold's per-layer
+`M_L : ℝ^D_src → ℝ^D_tgt`. `transfer_profile` applies `M_L @ v_src` per layer and
+re-bakes each magnitude to its *target* Mahalanobis norm so the share is in the
+target metric. The target whitener is **required** and must cover the transferred
+layers (Mahalanobis-only — a missing/partial whitener raises `WhitenerError`;
+generate neutral activations for the target model first, there is no Euclidean
+rebake). `transfer_manifold` (`io/manifolds.py`) maps a fitted manifold's per-layer
 `mean → M_L mean` and `basis → basis @ M_Lᵀ`, leaves the RBF + `node_coords`
 untouched (subspace/authoring-coordinate space, invariant under the model-space
-map), re-bakes the Mahalanobis **share** in target space (no lever — it's gone),
-clears `origin` (per-layer foot of the *source* neutral), and writes the
+map), re-bakes the Mahalanobis **share** in target space (same whitener
+requirement; no lever — it's gone), clears `origin` (per-layer foot of the
+*source* neutral), and writes the
 `_from-<safe_src>` variant. Since a vector is a 2-node `pca` manifold, `subspace
 transfer` routes to this one transfer path. Alignments cache under the *target*
 model dir.

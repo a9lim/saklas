@@ -3562,10 +3562,14 @@ class SaklasApp(App[None]):
             if not others:
                 chat.add_system_message("No other profiles loaded to compare against.")
                 return
+            # Mahalanobis-only: ``cosine_similarity`` requires the session
+            # whitener (the Euclidean path is gone).  Pairs whose shared
+            # layers the whitener doesn't cover raise and are skipped.
+            whitener = getattr(self._session, "whitener", None)
             scores = {}
             for name, prof in others.items():
                 try:
-                    scores[name] = target.cosine_similarity(prof)
+                    scores[name] = target.cosine_similarity(prof, whitener=whitener)
                 except Exception:
                     continue
             if not scores:
@@ -3586,8 +3590,12 @@ class SaklasApp(App[None]):
             b_name = _resolve(parts[1])
             if b_name is None:
                 return
+            # Mahalanobis-only (see the 1-arg branch above).
+            whitener = getattr(self._session, "whitener", None)
             try:
-                sim = all_profiles[a_name].cosine_similarity(all_profiles[b_name])
+                sim = all_profiles[a_name].cosine_similarity(
+                    all_profiles[b_name], whitener=whitener,
+                )
             except Exception as e:
                 chat.add_system_message(f"Compare failed: {e}")
                 return

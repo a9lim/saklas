@@ -370,15 +370,6 @@ class TestLeaceProject:
 # ---------------------------------------- Profile.cosine_similarity wiring ---
 
 class TestProfileCosineWithWhitener:
-    def test_whitener_none_matches_existing_behavior(self):
-        a = Profile({0: torch.tensor([1.0, 0.0, 0.0]),
-                     1: torch.tensor([0.0, 1.0, 0.0])})
-        b = Profile({0: torch.tensor([1.0, 0.0, 0.0]),
-                     1: torch.tensor([1.0, 0.0, 0.0])})
-        out: Any = a.cosine_similarity(b, per_layer=True, whitener=None)
-        assert out[0] == pytest.approx(1.0)
-        assert out[1] == pytest.approx(0.0)
-
     def test_whitener_per_layer_uses_mahalanobis(self):
         d = 8
         w = _build_whitener(layers=(0, 1), n=100, d=d, seed=51)
@@ -402,27 +393,20 @@ class TestProfileCosineWithWhitener:
         agg: Any = a.cosine_similarity(b, whitener=w)
         assert -1.0 <= agg <= 1.0
 
-    def test_whitener_falls_back_for_uncovered_layers(self):
-        """Layer absent from whitener falls back to Euclidean for that layer."""
+    def test_uncovered_layer_raises(self):
+        """A whitener missing a shared layer is a hard error — Mahalanobis is
+        mandatory (no per-layer Euclidean fallback)."""
         d = 8
         w = _build_whitener(layers=(0,), n=80, d=d, seed=71)
         a = Profile({0: torch.randn(d), 5: torch.tensor([1.0] * d)})
         b = Profile({0: torch.randn(d), 5: torch.tensor([1.0] * d)})
-        per_layer: Any = a.cosine_similarity(b, per_layer=True, whitener=w)
-        # Layer 5 is uncovered; identical vectors should still cosine-1.
-        assert per_layer[5] == pytest.approx(1.0)
+        with pytest.raises(WhitenerError, match="whitener"):
+            a.cosine_similarity(b, per_layer=True, whitener=w)
 
 
 # --------------------------------------------------- project_profile wiring ---
 
 class TestProjectProfileLeace:
-    def test_no_whitener_keeps_euclidean_semantics(self):
-        base = {0: torch.tensor([1.0, 1.0])}
-        onto = {0: torch.tensor([1.0, 0.0])}
-        out_eu = project_profile(base, onto, "|")
-        # Plain Gram-Schmidt: drops axis 0.
-        assert torch.allclose(out_eu[0], torch.tensor([0.0, 1.0]), atol=1e-6)
-
     def test_whitener_swaps_to_leace(self):
         d = 12
         scale = torch.ones(d)
@@ -438,14 +422,14 @@ class TestProjectProfileLeace:
         m_dot = w.mahalanobis_dot(0, out[0], onto)
         assert abs(m_dot) < 1e-4
 
-    def test_uncovered_layer_falls_back_to_euclidean(self):
+    def test_uncovered_layer_raises(self):
         d = 4
         w = _build_whitener(layers=(0,), n=80, d=d, seed=91)
         base = {0: torch.randn(d), 5: torch.tensor([1.0, 1.0, 0.0, 0.0])}
         onto = {0: torch.randn(d), 5: torch.tensor([1.0, 0.0, 0.0, 0.0])}
-        out = project_profile(base, onto, "|", whitener=w)
-        # Layer 5 not covered → Euclidean Gram-Schmidt result.
-        assert torch.allclose(out[5], torch.tensor([0.0, 1.0, 0.0, 0.0]), atol=1e-6)
+        # Layer 5 not covered → Mahalanobis-only hard error (no fallback).
+        with pytest.raises(WhitenerError, match="whitener"):
+            project_profile(base, onto, "|", whitener=w)
 
 
 # ------------------------------------------------------- repr / dunder ---

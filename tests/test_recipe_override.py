@@ -179,6 +179,9 @@ def test_compose_modifier_routes_through_overlay_in_regen_with_modifier():
             self.aid = aid
 
     stub = _StubSession()
+    stub._resolve_anchor_recipe = SaklasSession._resolve_anchor_recipe.__get__(
+        stub, _StubSession
+    )
     resolve = SaklasSession._resolve_recipe_override.__get__(stub, _StubSession)
     custom = Recipe(sampling=SamplingConfig(temperature=0.4))
     new_steering, new_sampling, new_thinking = resolve(
@@ -213,6 +216,9 @@ def test_resolve_override_with_string_mode():
             self.aid = aid
 
     stub = _StubSession()
+    stub._resolve_anchor_recipe = SaklasSession._resolve_anchor_recipe.__get__(
+        stub, _StubSession
+    )
     resolve = SaklasSession._resolve_recipe_override.__get__(stub, _StubSession)
     new_steering, new_sampling, new_thinking = resolve(
         "unsteered",
@@ -251,6 +257,9 @@ def test_resolve_override_with_custom_recipe():
             self.tree = LoomTree()
 
     stub = _StubSession()
+    stub._resolve_anchor_recipe = SaklasSession._resolve_anchor_recipe.__get__(
+        stub, _StubSession
+    )
     resolve = SaklasSession._resolve_recipe_override.__get__(stub, _StubSession)
     partial = Recipe(sampling=SamplingConfig(temperature=0.9), seed=7)
     new_steering, new_sampling, new_thinking = resolve(

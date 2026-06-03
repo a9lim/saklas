@@ -271,7 +271,6 @@ class Recipe:
             alphas=flipped,
             thinking=parsed.thinking,
             trigger=parsed.trigger,
-            projection_metric=parsed.projection_metric,
         )
         return Recipe(steering=format_expr(new))
 

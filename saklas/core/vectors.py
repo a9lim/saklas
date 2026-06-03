@@ -10,75 +10,12 @@ from collections.abc import Sequence
 from contextlib import suppress
 from importlib import resources as _resources
 from pathlib import Path
-from typing import Any, TYPE_CHECKING
+from typing import Any
 
 import torch
 from safetensors.torch import load_file, save_file
 
-from saklas.core.stats import median_or_zero
-
-if TYPE_CHECKING:
-    from saklas.core.sae import SaeBackend
-
 log = logging.getLogger(__name__)
-
-# Per-layer probe-quality diagnostics: thresholds for the soft warning the
-# extractor emits at end-of-extraction.  Fired against the median across
-# retained layers — a single dim layer with rough metrics is normal; a
-# concept whose median is degenerate is the failure mode users care about.
-_DIAG_DEGENERATE_EVR = 0.95         # ~all variance in one direction
-_DIAG_DEGENERATE_INTRA_VAR = 0.01   # almost-identical pos/neg pairs
-_DIM_DIAGNOSTIC_SAMPLE_MAX = 32
-
-# Skip the chat template for extraction when it adds more than this many
-# tokens of overhead (e.g. Ministral injects a ~500-token system prompt).
-# The overhead cancels in contrastive diffs but wastes memory per pass.
-_MAX_TEMPLATE_OVERHEAD = 100
-
-# Keyed by id(tokenizer).  Object IDs can be reused after GC, so this
-# cache is only safe when a single tokenizer lives for the session lifetime
-# (which is the case in both the TUI and the API server).
-_template_overhead_cache: dict[int, int] = {}
-
-
-def _chat_template_overhead(tokenizer: Any, template_kwargs: dict[str, Any]) -> int:
-    """Return the number of extra tokens the chat template adds beyond content."""
-    cache_key = id(tokenizer)
-    cached = _template_overhead_cache.get(cache_key)
-    if cached is not None:
-        return cached
-
-    probe = "X"
-    raw_len = len(tokenizer.encode(probe, add_special_tokens=False))
-    messages = [{"role": "user", "content": "."}, {"role": "assistant", "content": probe}]
-    try:
-        wrapped = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=False, **template_kwargs,
-        )
-        wrapped_len = len(tokenizer.encode(wrapped, add_special_tokens=False))
-    except Exception:
-        wrapped_len = raw_len  # can't measure, assume no overhead
-    overhead = wrapped_len - raw_len
-    _template_overhead_cache[cache_key] = overhead
-    if overhead > _MAX_TEMPLATE_OVERHEAD:
-        log.info("chat template adds %d tokens of overhead, skipping for extraction", overhead)
-    return overhead
-
-
-def _normalize(v: torch.Tensor, ref_norm: float | None = None) -> torch.Tensor:
-    """Normalize a direction vector.
-
-    If *ref_norm* is given the vector is scaled so that its norm equals
-    *ref_norm* (i.e. it lives at the same magnitude as the hidden states
-    it was derived from).  Otherwise the vector is L2-normalized to unit
-    norm — which is fine for models without per-layer output scaling, but
-    catastrophic for architectures like Gemma 4 whose cumulative
-    ``layer_scalar`` shrinks the residual stream by orders of magnitude.
-    """
-    unit = v / v.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-    if ref_norm is not None:
-        return unit * ref_norm
-    return unit
 
 
 def _capture_all_hidden_states(model: torch.nn.Module, layers: torch.nn.ModuleList, input_ids: torch.Tensor):
@@ -580,137 +517,6 @@ def compute_dls_mask(
     return {L for L, axes in per_axis.items() if axes}
 
 
-def _fold_centroids_to_affine_manifold(
-    name: str,
-    mean_pos_per_layer: dict[int, torch.Tensor],
-    mean_neg_per_layer: dict[int, torch.Tensor],
-    *,
-    pos_label: str,
-    neg_label: str,
-    whitener: "Any | None" = None,
-    layer_means: dict[int, torch.Tensor] | None = None,
-    dls: bool = True,
-    feature_space: str = "raw",
-) -> "Any":  # -> saklas.core.manifold.Manifold
-    """Fold per-layer pos/neg centroids into an affine ``R = 1`` manifold.
-
-    The folded-vector representation (saklas 4.0 §5): a steering vector *is*
-    the ``K = 2`` case of a flat affine subspace — a line through the two pole
-    centroids that fills its 1-D span (``H_n ≡ 0``).  Per retained layer
-    ``L``, :func:`~saklas.core.manifold.fit_affine_subspace` (pos = node 0,
-    so the basis orients ``+δ̂``) gives:
-
-    * ``basis`` = unit ``δ̂_L`` where ``δ_L = mean_pos_L − mean_neg_L`` — the
-      **raw** difference-of-means direction (PCA@2 ≡ DiM exactly).  This is the
-      legacy fold path (test-only, retiring in 6b); the live 2-node-vector read
-      whitens the basis via extraction's ``fit_affine_subspace``.  Only the
-      share is whitened here (the ``covers_all`` gate below).
-    * ``mean`` = ``P_basis(ν_L)`` — the neutral mean projected into the span
-      (neutral-anchored frame, §5); falls back to the pole midpoint ``μ`` when
-      no neutral baseline is supplied.
-    * ``LayerSubspace.node_coords`` = the **real**, neutral-anchored pole
-      coords ``(c_± − ν_L)·δ̂_L`` ``(2, 1)``.  The per-layer magnitude lives
-      *here* now (``coord_+ − coord_− = ‖δ_L‖``), not in the share — neutral →
-      coord 0, so a pole sits at distance ∝ ‖δ_L‖ from the origin.
-
-    **Share — the per-layer budget (§5).**  ``mahalanobis_share[L]`` is the
-    μ-centered whitened spread :func:`~saklas.core.manifold.subspace_share`
-    (``‖δ_L‖_M / √2`` at K=2, whitened) when the whitener covers every
-    retained layer, else the Euclidean ``‖δ_L‖₂ / √2``.  The ``√2`` is a
-    constant that **cancels under the apply-time ``Σ_L share_L = 1``
-    normalization**, so ``hooks._manifold_layer_shares`` reproduces today's
-    DiM hook profile exactly (the normalized share is the DiM one — coords
-    carry the position, share carries the budget).
-
-    **Origin** is implicitly ``0`` (neutral → coord 0 by the neutral anchor),
-    so no origin is stored — the flat ``!`` ablation target is coord 0 (§2).
-
-    **DLS** is per-axis at ``R = 1`` (keep-or-drop the layer): the basis row
-    is kept iff the pole projections straddle the neutral baseline —
-    bit-identical to the historical scalar test, dropped layers absent from
-    the returned manifold.
-
-    Returns a :class:`~saklas.core.manifold.Manifold`; the caller persists it.
-    ``share_metric`` is recorded on ``manifold.metadata`` for that save.
-    """
-    from saklas.core.manifold import (
-        CustomDomain, LayerSubspace, Manifold, fit_affine_subspace,
-        subspace_share,
-    )
-
-    shared = sorted(set(mean_pos_per_layer) & set(mean_neg_per_layer))
-
-    # All-or-nothing whitener gate (parity with the DiM bake): Mahalanobis
-    # share only when the whitener covers every candidate layer, else
-    # Euclidean for all.
-    maha_w = (
-        whitener
-        if whitener is not None and whitener.covers_all(shared)
-        else None
-    )
-
-    # Per-layer affine fit over [pos, neg] (pos = node 0 ⇒ +δ̂ orientation).
-    # Degenerate pairs (zero diff — no direction to steer) drop out first so
-    # the K=2 fit never sees a zero scatter.  This is the legacy fold path
-    # (test-only, retiring in 6b) and keeps the **raw** δ̂ basis (PCA@2 ≡ DiM)
-    # — the live 2-node-vector read goes through extraction's whitened
-    # ``fit_affine_subspace``; only the share is whitened here.
-    fits: dict[int, tuple["LayerSubspace", torch.Tensor, torch.Tensor]] = {}
-    for idx in shared:
-        mp = mean_pos_per_layer[idx].to(torch.float32).reshape(-1)
-        mn = mean_neg_per_layer[idx].to(torch.float32).reshape(-1)
-        if float((mp - mn).norm()) <= 1e-12:
-            continue
-        cent = torch.stack([mp, mn])               # (2, D); node 0 = pos
-        nu = (
-            layer_means[idx].to(torch.float32).reshape(-1)
-            if layer_means is not None and idx in layer_means
-            else None
-        )
-        sub, mu_coords, _ev = fit_affine_subspace(
-            cent, neutral_mean=nu, orient_to=0,
-        )
-        fits[idx] = (sub, mu_coords, cent)
-
-    # Per-axis DLS at R=1 (collapses to the scalar keep-or-drop).
-    if dls:
-        node_centroids = {idx: fits[idx][2] for idx in fits}
-        bases = {idx: fits[idx][0].basis for idx in fits}
-        per_axis = compute_dls_axes(node_centroids, bases, layer_means)
-        kept = [idx for idx in fits if per_axis.get(idx)]
-    else:
-        kept = list(fits)
-
-    layers: dict[int, "LayerSubspace"] = {}
-    mahalanobis_share: dict[int, float] = {}
-    for idx in kept:
-        sub, mu_coords, _cent = fits[idx]
-        layers[idx] = sub
-        # Per-layer budget = μ-centered whitened/Euclidean spread.  No origin
-        # store — affine origin is coord 0 (§2).
-        mahalanobis_share[idx] = subspace_share(
-            mu_coords, sub.basis, whitener=maha_w, layer=idx,
-        )
-
-    # Shared display layout: pos at +1, neg at −1 on a 1-D CustomDomain (the
-    # label/display frame; the real per-layer steer coords live on each
-    # ``LayerSubspace.node_coords``).
-    node_coords = torch.tensor([[1.0], [-1.0]], dtype=torch.float32)
-    manifold = Manifold(
-        name=name,
-        domain=CustomDomain(1),
-        node_labels=[pos_label, neg_label],
-        node_coords=node_coords,
-        layers=layers,
-        feature_space=feature_space,
-        mahalanobis_share=mahalanobis_share,
-    )
-    manifold.metadata["share_metric"] = (
-        "mahalanobis" if maha_w is not None else "euclidean"
-    )
-    return manifold
-
-
 def fold_directions_to_subspace(
     name: str,
     directions: dict[int, torch.Tensor],
@@ -723,10 +529,10 @@ def fold_directions_to_subspace(
     """Fold an arbitrary per-layer *direction* into a neutral-anchored affine
     ``R = 1`` manifold (a one-pole ray).
 
-    The monopolar sibling of :func:`_fold_centroids_to_affine_manifold`: where
-    a bipolar concept folds a line through two pole centroids, a derived
-    direction (a ``merge`` linear-combination, a `~`/`|` projection of one
-    concept onto another) has no pole pair — just a direction to push along.
+    Where a bipolar concept's fit (`extraction.py`) folds a line through two
+    pole centroids, a derived direction (a ``merge`` linear-combination, a
+    `~`/`|` projection of one concept onto another) has no pole pair — just a
+    direction to push along.
     So the subspace is neutral-anchored at ``mean = P_basis(ν_L) = (ν_L·d̂)d̂``
     (the neutral mean projected into the 1-D span, §5) with a single ``+`` pole
     node; steering ``along`` toward the pole pushes the running activation's
@@ -800,8 +606,9 @@ def folded_vector_directions(manifold: "Any") -> dict[int, torch.Tensor]:
     """Baked-direction view of a folded (affine ``R = 1``) vector manifold.
 
     Returns ``{L: δ̂_L · share_L}`` — the steering-vector-equivalent baked
-    directions, proportional *per layer* to what
-    :func:`extract_difference_of_means` bakes (``‖baked_L‖ ∝ ‖δ_L‖_M``).  The
+    directions: the per-layer unit direction scaled by its Mahalanobis
+    share, i.e. the per-layer share-weighted direction (``‖baked_L‖ ∝
+    ‖δ_L‖_M``), matching the (now-removed) DiM bake per layer.  The
     global per-concept scale differs (the folded share is the un-normalized
     ``‖δ_L‖_M``, not the ``ref_norm``-weighted normalized share today's bake
     folds in), so this view is *exact* for scale-invariant ops — per-layer and
@@ -970,14 +777,9 @@ def project_profile(
     *,
     whitener: "Any | None" = None,
 ) -> dict[int, torch.Tensor]:
-    """Per-layer projection of ``base`` against ``onto``.
+    """Per-layer projection of ``base`` against ``onto`` (LEACE only).
 
-    Default (Euclidean), per shared layer (fp32)::
-
-        proj = (dot(base, onto) / dot(onto, onto)) * onto
-
-    With ``whitener`` (a :class:`saklas.core.mahalanobis.LayerWhitener`),
-    switches to LEACE-style projection in the Mahalanobis metric::
+    LEACE-style projection in the Mahalanobis metric, per shared layer::
 
         coef = <base, onto>_M / <onto, onto>_M
         proj = coef * onto                # direction is ``onto``; metric is M
@@ -987,10 +789,9 @@ def project_profile(
     operator ``"|"``, this is the closed-form LEACE projector for a
     single direction (Belrose et al. 2023, arXiv 2306.03819) — provably
     erases linearly-decodable information along ``onto`` from ``base``
-    with minimum collateral damage.  Reduces to plain Gram-Schmidt when
-    ``Σ = I``.
+    with minimum collateral damage.
 
-    Operator semantics (both metrics):
+    Operator semantics:
 
     - ``operator == "~"``   returns ``proj``       (component of base aligned with onto).
     - ``operator == "|"`` returns ``base - proj`` (component of base orthogonal to onto).
@@ -1002,28 +803,26 @@ def project_profile(
     Near-zero ``||onto|| < 1e-12`` layers are treated the same way: ``"|"``
     passes base through unchanged, ``"~"`` drops the layer.
 
-    The metric is decided **all-or-nothing** via
-    :meth:`LayerWhitener.covers_all` over the projected layer set
-    (``base ∩ onto``): LEACE only when the whitener covers *every*
-    projected layer, else plain Gram-Schmidt for *all* layers — never a
-    per-layer mix of LEACE and Euclidean.  Mixing would compare
-    incommensurable magnitudes (``‖·‖_M`` carries a ``1/√λ_L`` factor that
-    ``‖·‖_2`` doesn't, and it doesn't cancel across layers).
+    The whitener (a :class:`saklas.core.mahalanobis.LayerWhitener`) is
+    **required** and must cover *every* projected layer (``base ∩ onto``),
+    via :meth:`LayerWhitener.covers_all`.  There is no Euclidean path: a
+    missing or non-covering whitener raises :class:`WhitenerError`.
     Result tensors are cast back to the source dtype of ``base``.
-
-    The returned dict shape matches :func:`extract_difference_of_means` so
-    it plugs into ``SteeringManager.add_vector`` without adaptation.
     """
+    from saklas.core.mahalanobis import WhitenerError
+
     if operator not in ("~", "|"):
         raise ValueError(f"unknown projection operator: {operator!r}")
-    # All-or-nothing metric gate over the layers that actually get
-    # projected (``base ∩ onto``): LEACE on every covered layer or
-    # Gram-Schmidt on all of them (see ``covers_all`` — incommensurable
-    # per-layer scales forbid a mix).
+    # Mahalanobis-only: the whitener must cover every layer that actually
+    # gets projected (``base ∩ onto``).  No Euclidean fallback — a missing
+    # or partial whitener is an error.
     projected_layers = sorted(set(base) & set(onto))
-    # Bind the narrowed whitener once (mirrors ``extraction.py``'s
-    # ``maha_whitener`` idiom) so the metric decision is made a single time.
-    maha = whitener if (whitener is not None and whitener.covers_all(projected_layers)) else None
+    if whitener is None or not whitener.covers_all(projected_layers):
+        raise WhitenerError(
+            "project_profile requires a Mahalanobis whitener covering every "
+            f"projected layer {projected_layers}; regenerate the neutral "
+            "activation cache for this model (the Euclidean path is gone)"
+        )
     out: dict[int, torch.Tensor] = {}
     for layer, base_t in base.items():
         onto_t = onto.get(layer)
@@ -1031,29 +830,13 @@ def project_profile(
             if operator == "|":
                 out[layer] = base_t
             continue
-        # LEACE branch: whitener covers the full projected set.
-        if maha is not None:
-            projected = maha.leace_project(layer, base_t, onto_t, operator)
-            # Drop the layer for ``~`` when ``onto`` is degenerate under
-            # the Mahalanobis metric — leace_project returns a zero
-            # tensor in that case, mirroring the Euclidean drop rule.
-            if operator == "~" and torch.all(projected == 0):
-                continue
-            out[layer] = projected
+        projected = whitener.leace_project(layer, base_t, onto_t, operator)
+        # Drop the layer for ``~`` when ``onto`` is degenerate under
+        # the Mahalanobis metric — leace_project returns a zero tensor
+        # in that case.
+        if operator == "~" and torch.all(projected == 0):
             continue
-        # Euclidean Gram-Schmidt (no whitener, or partial coverage).
-        a_f = base_t.to(dtype=torch.float32)
-        b_f = onto_t.to(dtype=torch.float32)
-        b_dot = torch.dot(b_f, b_f).item()
-        if b_dot < 1e-12:
-            if operator == "|":
-                out[layer] = base_t
-            continue
-        proj = (torch.dot(a_f, b_f) / b_dot) * b_f
-        if operator == "~":
-            out[layer] = proj.to(dtype=base_t.dtype)
-        else:
-            out[layer] = (a_f - proj).to(dtype=base_t.dtype)
+        out[layer] = projected
     if not out:
         raise ValueError(
             f"project_profile: no layers produced for operator {operator!r} "

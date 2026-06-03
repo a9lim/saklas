@@ -145,37 +145,59 @@ def test_repr_contains_layer_info():
 # cosine_similarity
 # ---------------------------------------------------------------------------
 
+# Mahalanobis-only (4.0 collapse): ``cosine_similarity`` requires a covering
+# whitener — there is no Euclidean path.  The whitener is built with zero
+# neutral means so it doesn't recenter the test vectors; the parallel /
+# anti-parallel ±1 invariants hold under any positive-definite metric, while
+# the orthogonal case is rewritten against *Mahalanobis* orthogonality.
+
+def _cov_whitener(layers: Any, dim: int):
+    from tests._whitener import synthetic_whitener, synthetic_means
+    return synthetic_whitener(
+        layers, dim, means=synthetic_means(layers, dim, seed=0),
+    )
+
+
 def test_cosine_similarity_identical_profiles():
-    """Identical profiles should have cosine similarity 1.0."""
+    """Identical profiles should have whitened cosine 1.0 (metric-invariant)."""
     tensors = _mk(layers=(0, 1, 2), dim=16)
     a = Profile(tensors)
     b = Profile({k: v.clone() for k, v in tensors.items()})
-    assert a.cosine_similarity(b) == pytest.approx(1.0, abs=1e-5)
+    w = _cov_whitener((0, 1, 2), 16)
+    assert a.cosine_similarity(b, whitener=w) == pytest.approx(1.0, abs=1e-5)
 
 
 def test_cosine_similarity_opposite_profiles():
-    """Negated profiles should have cosine similarity -1.0."""
+    """Negated profiles should have whitened cosine -1.0 (metric-invariant)."""
     tensors = _mk(layers=(0, 1, 2), dim=16)
     a = Profile(tensors)
     b = Profile({k: -v for k, v in tensors.items()})
-    assert a.cosine_similarity(b) == pytest.approx(-1.0, abs=1e-5)
+    w = _cov_whitener((0, 1, 2), 16)
+    assert a.cosine_similarity(b, whitener=w) == pytest.approx(-1.0, abs=1e-5)
 
 
-def test_cosine_similarity_orthogonal_profiles():
-    """Orthogonal profiles should have cosine similarity 0.0."""
-    # Construct two orthogonal vectors per layer via Gram-Schmidt.
+def test_cosine_similarity_mahalanobis_orthogonal_profiles():
+    """Profiles M-orthogonal per layer have whitened cosine 0.0.
+
+    Build ``b_L`` Euclidean-orthogonal to ``Σ⁻¹ a_L`` so the Mahalanobis dot
+    ``a_L^T Σ⁻¹ b_L`` vanishes — the whitened analogue of the old
+    Euclidean-orthogonal construction.
+    """
     layers = (0, 1, 2)
+    w = _cov_whitener(layers, 16)
     a_tensors, b_tensors = {}, {}
     for L in layers:
         v = torch.randn(16)
+        sv = w.apply_inv(L, v)          # Σ⁻¹ a_L
         u = torch.randn(16)
-        # Remove component of v from u -> orthogonal.
-        u = u - (u @ v) / (v @ v) * v
+        # Remove the component of u along Σ⁻¹a so <u, Σ⁻¹a> = 0, i.e.
+        # <a, u>_M = a^T Σ⁻¹ u = 0 (Σ⁻¹ symmetric).
+        u = u - (u @ sv) / (sv @ sv) * sv
         a_tensors[L] = v
         b_tensors[L] = u
     a = Profile(a_tensors)
     b = Profile(b_tensors)
-    assert a.cosine_similarity(b) == pytest.approx(0.0, abs=1e-4)
+    assert a.cosine_similarity(b, whitener=w) == pytest.approx(0.0, abs=1e-4)
 
 
 def test_cosine_similarity_partial_layer_overlap():
@@ -183,24 +205,42 @@ def test_cosine_similarity_partial_layer_overlap():
     shared = torch.randn(8)
     a = Profile({0: shared.clone(), 1: torch.randn(8)})
     b = Profile({0: shared.clone(), 2: torch.randn(8)})
-    # Only layer 0 overlaps, and it's identical -> 1.0.
-    assert a.cosine_similarity(b) == pytest.approx(1.0, abs=1e-5)
+    w = _cov_whitener((0,), 8)
+    # Only layer 0 overlaps, and it's identical -> 1.0 (metric-invariant).
+    assert a.cosine_similarity(b, whitener=w) == pytest.approx(1.0, abs=1e-5)
 
 
 def test_cosine_similarity_empty_intersection_raises():
     """No shared layers should raise ProfileError."""
     a = Profile({0: torch.randn(8)})
     b = Profile({1: torch.randn(8)})
+    w = _cov_whitener((0, 1), 8)
     with pytest.raises(ProfileError, match="no shared layers"):
+        a.cosine_similarity(b, whitener=w)
+
+
+def test_cosine_similarity_missing_whitener_raises():
+    """Mahalanobis-only: a missing / non-covering whitener is a hard error."""
+    from saklas.core.mahalanobis import WhitenerError
+
+    tensors = _mk(layers=(0, 1), dim=8)
+    a = Profile(tensors)
+    b = Profile({k: v.clone() for k, v in tensors.items()})
+    with pytest.raises(WhitenerError, match="whitener"):
         a.cosine_similarity(b)
+    # A whitener covering only some shared layers is also rejected.
+    partial = _cov_whitener((0,), 8)
+    with pytest.raises(WhitenerError, match="whitener"):
+        a.cosine_similarity(b, whitener=partial)
 
 
 def test_cosine_similarity_per_layer():
-    """per_layer=True returns a dict of per-layer cosines."""
+    """per_layer=True returns a dict of per-layer whitened cosines."""
     tensors = _mk(layers=(0, 5, 10), dim=16)
     a = Profile(tensors)
     b = Profile({k: v.clone() for k, v in tensors.items()})
-    result = a.cosine_similarity(b, per_layer=True)
+    w = _cov_whitener((0, 5, 10), 16)
+    result = a.cosine_similarity(b, per_layer=True, whitener=w)
     assert isinstance(result, dict)
     assert set(result.keys()) == {0, 5, 10}
     for v in result.values():
@@ -211,7 +251,8 @@ def test_cosine_similarity_per_layer_partial_overlap():
     """per_layer=True only includes shared layers."""
     a = Profile({0: torch.randn(8), 1: torch.randn(8)})
     b = Profile({1: torch.randn(8), 2: torch.randn(8)})
-    result: dict[int, float] = a.cosine_similarity(b, per_layer=True)
+    w = _cov_whitener((1,), 8)
+    result: dict[int, float] = a.cosine_similarity(b, per_layer=True, whitener=w)
     assert set(result.keys()) == {1}
 
 

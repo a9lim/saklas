@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from saklas.core.mahalanobis import WhitenerError
 from saklas.core.manifold import decompose, invert_parameterization
 from saklas.core.results import ManifoldAggregate, ManifoldTokenReading
 
@@ -27,9 +28,28 @@ DEFAULT_NEAREST_TOP_N: int = 3
 # ``min_ev`` floor on additive-mode manifold steering's quality_factor.
 _MIN_EV_WEIGHT: float = 1e-6
 
-# Guard against division by zero in the subspace_fraction numerator —
-# matches the hot-path ``_ANGULAR_PERP_EPSILON`` in hooks.py.
+# Guard against division by zero in the subspace_fraction / cosine
+# denominator (a zero or near-zero activation norm).
 _FRACTION_EPSILON: float = 1e-8
+
+
+def _woodbury_apply(
+    v: torch.Tensor, X: torch.Tensor, K: torch.Tensor, lam: float,
+) -> torch.Tensor:
+    """On-device ``Σ_reg⁻¹ v = (1/λ)(v − Xᵀ K (X v))`` (Woodbury).
+
+    Shared by :class:`TraitMonitor` and :class:`ManifoldMonitor`.  Kept a
+    plain module-level function (not a method) so the per-token hot path is
+    a global lookup with no class attribute resolution — the hot-path
+    companion to :meth:`LayerWhitener.apply_inv` (which force-promotes
+    fp32/CPU and is wrong here).  ``v`` is ``[D]`` or ``[n, D]``; ``X`` is
+    ``[N, D]``, ``K`` is ``[N, N]``, all on the same device/dtype.  Pure
+    matmuls, no host sync.  For a ``[n, D]`` batch this is
+    ``(1/λ)(V − (V Xᵀ) K X)``; for ``[D]`` it broadcasts the same way.
+    """
+    Xv = v @ X.transpose(0, 1)        # [..., N]
+    KXv = Xv @ K.transpose(0, 1)      # [..., N]  (K symmetric; t() = K)
+    return (v - KXv @ X) / lam        # [..., D]
 
 
 class TraitMonitor:
@@ -144,7 +164,7 @@ class TraitMonitor:
 
     @property
     def whitener(self) -> Any:
-        """The wired :class:`LayerWhitener` (or ``None`` for Euclidean reads)."""
+        """The wired :class:`LayerWhitener` (required for reads)."""
         return self._whitener
 
     def set_whitener(self, whitener: Any) -> None:
@@ -224,27 +244,29 @@ class TraitMonitor:
                 W[pi] = vn
             new_layer_cache[layer_idx] = (V, W)
 
-        # Mahalanobis read is decided ALL-OR-NOTHING over the scored-layer
-        # set, matching the ``LayerWhitener.covers_all`` gate vector
-        # extraction / manifold fitting / ``vector compare`` already use:
-        # either every probed layer is whitened or none are.  A per-layer
-        # Mahalanobis/Euclidean mix would fold cosines measured under two
-        # different metrics into one aggregated probe score — exactly what
-        # the all-or-nothing discipline exists to forbid.  ``covers_all`` is
-        # trustworthy as "finite, usable factors on every covered layer":
-        # ``LayerWhitener.from_neutral_activations`` skips any layer whose
-        # centered activations or regularized inverse come back non-finite
-        # (the degenerate-whitener case — e.g. gemma-3's late-layer fp16
-        # overflow — leaves the layer uncovered), so a covered set is a
-        # clean set and no local finite-check is needed here.  The per-probe
-        # whitening (``apply_inv``, P × O(ND)) is an off-hot-path cache-build
-        # cost; the hot path whitens the per-token hidden once per layer.
+        # Mahalanobis read is MANDATORY over the scored-layer set, via the
+        # ``LayerWhitener.covers_all`` gate vector extraction / manifold
+        # fitting / ``subspace compare`` already use: every probed layer
+        # must be whitened or the read raises.  There is no Euclidean path.
+        # ``covers_all`` is trustworthy as "finite, usable factors on every
+        # covered layer": ``LayerWhitener.from_neutral_activations`` skips
+        # any layer whose centered activations or regularized inverse come
+        # back non-finite (the degenerate-whitener case — e.g. gemma-3's
+        # late-layer fp16 overflow — leaves the layer uncovered), so a
+        # covered set is a clean set and no local finite-check is needed
+        # here.  The per-probe whitening (``apply_inv``, P × O(ND)) is an
+        # off-hot-path cache-build cost; the hot path whitens the per-token
+        # hidden once per layer.
         scored_layers = list(layer_members.keys())
-        if (
-            whitener is not None
-            and scored_layers
-            and whitener.covers_all(scored_layers)
+        if scored_layers and (
+            whitener is None or not whitener.covers_all(scored_layers)
         ):
+            raise WhitenerError(
+                "probe scoring requires a Mahalanobis whitener covering every "
+                f"probed layer {sorted(scored_layers)}; regenerate the neutral "
+                "activation cache for this model (the Euclidean path is gone)"
+            )
+        if scored_layers:
             for layer_idx in scored_layers:
                 X, K, lam = whitener.woodbury_factors(
                     layer_idx, device=device, dtype=torch.float32,
@@ -267,7 +289,7 @@ class TraitMonitor:
                 )
                 for pi, _v in layer_members[layer_idx]:
                     # V[pi] is the unit Euclidean direction; whiten it once.
-                    vw = self._woodbury_apply(V[pi], X, K, lam)
+                    vw = _woodbury_apply(V[pi], X, K, lam)
                     Vinv[pi] = vw
                     # ||V||_M = sqrt(Vᵀ Σ⁻¹ V) = sqrt(V · vw).
                     V_Mnorm[pi] = torch.sqrt(
@@ -283,51 +305,25 @@ class TraitMonitor:
             for idx, m in self._layer_means.items()
         }
 
-    @staticmethod
-    def _woodbury_apply(
-        v: torch.Tensor,
-        X: torch.Tensor,
-        K: torch.Tensor,
-        lam: float,
-    ) -> torch.Tensor:
-        """On-device ``Σ_reg⁻¹ v = (1/λ)(v − Xᵀ K (X v))`` (Woodbury).
-
-        ``v`` is ``[D]`` or ``[n, D]``; ``X`` is ``[N, D]``, ``K`` is
-        ``[N, N]``, all on the same device/dtype.  Pure matmuls, no host
-        sync — the hot-path companion to
-        :meth:`LayerWhitener.apply_inv`.  For a ``[n, D]`` batch this is
-        ``(1/λ)(V − (V Xᵀ) K X)``; for ``[D]`` it broadcasts the same way.
-        """
-        Xv = v @ X.transpose(0, 1)        # [..., N]
-        KXv = Xv @ K.transpose(0, 1)      # [..., N]  (K symmetric; t() = K)
-        return (v - KXv @ X) / lam        # [..., D]
-
     def _layer_sims(self, layer_idx: int, h: torch.Tensor) -> torch.Tensor:
         """Per-layer probe similarity row(s) for a hidden state.
 
         ``h`` is ``[D]`` (single token) or ``[n, D]`` (token stack); the
         returned tensor is ``[P]`` or ``[n, P]`` respectively.  Centers
-        ``h`` by the layer mean, then computes the Mahalanobis cosine when
-        the whitener covers this layer (``⟨V, h_c⟩_M / (||V||_M ||h_c||_M)``)
-        or the plain Euclidean cosine otherwise.  The caller multiplies by
-        the per-layer weight ``W`` and accumulates.
+        ``h`` by the layer mean, then computes the Mahalanobis cosine
+        ``⟨V, h_c⟩_M / (||V||_M ||h_c||_M)`` (the whitener covers every
+        scored layer — ``_ensure_cache`` raises otherwise).  The caller
+        multiplies by the per-layer weight ``W`` and accumulates.
         """
-        V, _W = self._layer_cache[layer_idx]
         mean = self._mean_cache.get(layer_idx)
         h_c = h - mean if mean is not None else h
-        white = self._layer_white.get(layer_idx)
-        if white is None:
-            # Euclidean cosine: ⟨V̂, ĥ_c⟩.
-            hn = h_c.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-            h_unit = h_c / hn
-            return h_unit @ V.transpose(0, 1) if h_unit.ndim > 1 else V @ h_unit
-        Vinv, V_Mnorm, X, K, lam = white
+        Vinv, V_Mnorm, X, K, lam = self._layer_white[layer_idx]
         # ⟨V, h_c⟩_M = (Σ⁻¹ V) · h_c = Vinv · h_c.
         num = (
             h_c @ Vinv.transpose(0, 1) if h_c.ndim > 1 else Vinv @ h_c
         )                                              # [n,P] or [P]
         # ||h_c||_M = sqrt(h_cᵀ Σ⁻¹ h_c); one Woodbury apply per token.
-        h_inv = self._woodbury_apply(h_c, X, K, lam)
+        h_inv = _woodbury_apply(h_c, X, K, lam)
         h_Mnorm = torch.sqrt(
             (h_c * h_inv).sum(dim=-1, keepdim=True).clamp(min=0.0)
         ).clamp(min=1e-8)                              # [n,1] or [1]
@@ -795,12 +791,13 @@ class AttachedManifoldProbe:
     embedded_node_coords: torch.Tensor | None = None
     # Per-layer EV weight, normalized to sum to 1 across attached layers.
     ev_weights: dict[int, float] = field(default_factory=dict)
-    # Per-layer Mahalanobis bundle, populated at attach **only** when the
-    # wired whitener covers every layer of this manifold (all-or-nothing
-    # per probe).  Each entry is ``_LayerWhiten`` — the precomputed factors
-    # that turn the per-token fraction + nearest-node distance into their
-    # whitened forms (M-orthogonal subspace projection + Mahalanobis
-    # distance).  Empty dict → the Euclidean readout (the legacy path).
+    # Per-layer Mahalanobis bundle, populated at attach.  The wired whitener
+    # must cover every layer of this manifold (all-or-nothing per probe), else
+    # ``_build_whitened`` raises ``WhitenerError`` — there is no Euclidean
+    # readout.  Each entry is ``_LayerWhiten`` — the precomputed factors that
+    # turn the per-token fraction + nearest-node distance into their whitened
+    # forms (M-orthogonal subspace projection + Mahalanobis distance).  Empty
+    # only for an empty manifold (no layers to read).
     whitened: dict[int, "_LayerWhiten"] = field(default_factory=dict)
 
 
@@ -860,19 +857,19 @@ class ManifoldMonitor:
         *,
         whitener: Any = None,
     ) -> None:
-        # Stashed for symmetry with TraitMonitor; the manifold-side math
-        # never reads global layer means — fraction centers on each
-        # manifold's own per-fit mean.
-        self._layer_means: dict[int, torch.Tensor] = (
-            dict(layer_means) if layer_means else {}
-        )
+        # ``layer_means`` is accepted for parity with TraitMonitor's init
+        # signature (the session wires both monitors the same way) but is
+        # intentionally ignored — the manifold-side math never reads global
+        # layer means; fraction centers on each fit's per-layer mean
+        # (``LayerSubspace.mean``).
+        del layer_means
         self._probes: dict[str, AttachedManifoldProbe] = {}
-        # Optional Mahalanobis whitener.  When wired and covering a
-        # manifold's fit layers, the per-token fraction + nearest-node
-        # distance switch to their whitened forms — the read-side analogue
-        # of the whitened/Fisher subspace the manifold was *fitted* in, and
-        # the peer of ``TraitMonitor``'s whitened cosine.  ``None`` keeps
-        # the Euclidean readout.
+        # Mandatory Mahalanobis whitener (set lazily by the session).  The
+        # per-token fraction + nearest-node distance are the whitened forms
+        # — the read-side analogue of the whitened/Fisher subspace the
+        # manifold was *fitted* in, and the peer of ``TraitMonitor``'s
+        # whitened cosine.  ``_build_whitened`` raises if it doesn't cover
+        # an attached manifold's fit layers (there is no Euclidean readout).
         self._whitener: Any = whitener
         # Mirror TraitMonitor's pending-flag pattern so the TUI / webui
         # streaming surfaces can poll for "is a new per-token reading
@@ -886,18 +883,18 @@ class ManifoldMonitor:
 
     @property
     def whitener(self) -> Any:
-        """The wired :class:`LayerWhitener` (or ``None`` for Euclidean reads)."""
+        """The wired :class:`LayerWhitener` (required for reads)."""
         return self._whitener
 
     def set_whitener(self, whitener: Any) -> None:
         """Wire (or clear) the Mahalanobis whitener and rebuild probe caches.
 
         Idempotent on the same instance.  Any change re-derives the
-        per-probe :class:`_LayerWhiten` factors (a manifold whose layers
-        the new whitener covers gains a whitened readout; one it doesn't
-        falls back to Euclidean), so the next scoring call reflects the
-        new metric.  Mirrors :meth:`TraitMonitor.set_whitener` — the
-        session pushes the lazily-built whitener through here.
+        per-probe :class:`_LayerWhiten` factors; manifold reads are
+        Mahalanobis-only, so a new whitener that doesn't cover an attached
+        manifold's layers raises :class:`WhitenerError` here.  Mirrors
+        :meth:`TraitMonitor.set_whitener` — the session pushes the
+        lazily-built whitener through here.
         """
         if whitener is self._whitener:
             return
@@ -905,42 +902,37 @@ class ManifoldMonitor:
         for probe in self._probes.values():
             probe.whitened = self._build_whitened(probe.manifold, probe)
 
-    @staticmethod
-    def _woodbury_apply(
-        v: torch.Tensor, X: torch.Tensor, K: torch.Tensor, lam: float,
-    ) -> torch.Tensor:
-        """On-device ``Σ_reg⁻¹ v = (1/λ)(v − Xᵀ K (X v))`` (Woodbury).
-
-        Identical formula to :meth:`TraitMonitor._woodbury_apply` — kept
-        local so the manifold hot path doesn't reach across classes (and
-        the trait hot path stays a self-contained staticmethod for the
-        throughput invariant).  ``v`` is ``[D]``; X ``[N, D]``, K ``[N, N]``.
-        """
-        Xv = v @ X.transpose(0, 1)        # [N]
-        KXv = Xv @ K.transpose(0, 1)      # [N]  (K symmetric)
-        return (v - KXv @ X) / lam        # [D]
-
     def _build_whitened(
         self, manifold: "Manifold", probe: AttachedManifoldProbe,
     ) -> dict[int, _LayerWhiten]:
         """Build the per-layer :class:`_LayerWhiten` map for a probe.
 
-        Returns an empty dict unless the wired whitener covers **every**
-        fit layer of ``manifold`` (all-or-nothing per probe, mirroring the
-        fraction/distance metric gate the fit + DiM bake use).  Off the hot
-        path — runs once at attach / on ``set_whitener``.
+        The wired whitener is **required** and must cover **every** fit
+        layer of ``manifold`` (all-or-nothing per probe, mirroring the
+        fraction/distance metric gate the fit + DiM bake use).  There is no
+        Euclidean readout: a missing or non-covering whitener raises
+        :class:`WhitenerError`.  An empty ``manifold.layers`` yields an
+        empty map (nothing to read).  Off the hot path — runs once at
+        attach / on ``set_whitener``.
         """
         whitener = self._whitener
-        if whitener is None or not manifold.layers:
+        if not manifold.layers:
             return {}
         layers = list(manifold.layers.keys())
-        if not whitener.covers_all(layers):
-            return {}
+        if whitener is None or not whitener.covers_all(layers):
+            raise WhitenerError(
+                "manifold probe reads require a Mahalanobis whitener covering "
+                f"every fit layer {sorted(layers)}; regenerate the neutral "
+                "activation cache for this model (the Euclidean path is gone)"
+            )
         out: dict[int, _LayerWhiten] = {}
         for layer_idx, sub in manifold.layers.items():
             v_reduced = probe.node_values_reduced.get(layer_idx)
             if v_reduced is None:
-                return {}  # cache not built for this layer — bail to Euclidean
+                raise WhitenerError(
+                    f"manifold probe cache missing reduced node coords for "
+                    f"layer {layer_idx}; rebuild the probe before scoring"
+                )
             dev = v_reduced.device
             basis = sub.basis.to(device=torch.device("cpu"), dtype=torch.float32)
             # M_R = B Σ⁻¹ Bᵀ (R, R), PD for an orthonormal B and ridge-PD Σ.
@@ -948,7 +940,7 @@ class ManifoldMonitor:
             R = m_r.shape[0]
             try:
                 chol = torch.linalg.cholesky(m_r)
-            except Exception:
+            except torch.linalg.LinAlgError:
                 # Defensive jitter for a near-singular subspace gram.
                 eye = torch.eye(R, dtype=m_r.dtype)
                 jitter = 1e-8 * float(m_r.diagonal().mean().clamp_min(1e-12))
@@ -996,20 +988,16 @@ class ManifoldMonitor:
         basis = sub.basis.to(device=h.device, dtype=torch.float32)
         wh = probe.whitened.get(layer_idx)
         if wh is None:
-            h_par_c, _h_perp = decompose(h, mean, basis)
-            num = torch.linalg.vector_norm(h_par_c)
-            denom = torch.linalg.vector_norm(h - mean).clamp(
-                min=_FRACTION_EPSILON,
+            # Mahalanobis-only: ``_build_whitened`` populates every fit
+            # layer or raises, so a missing entry means the probe cache is
+            # out of sync — never an intentional Euclidean read.
+            raise WhitenerError(
+                f"manifold probe read missing whitened factors for layer "
+                f"{layer_idx}; rebuild the probe (the Euclidean path is gone)"
             )
-            frac = (num / denom).clamp(min=0.0, max=1.0)
-            h_reduced = h_par_c @ basis.transpose(0, 1)  # (R,)
-            nodes = probe.node_values_reduced[layer_idx].to(
-                device=h.device, dtype=torch.float32,
-            )
-            return frac, h_reduced.reshape(1, -1), h_reduced, nodes
         # Whitened: M-orthogonal subspace projection + Mahalanobis distance.
         x = h - mean
-        sx = self._woodbury_apply(x, wh.X, wh.K_inv, wh.lam)  # Σ⁻¹ x  (D,)
+        sx = _woodbury_apply(x, wh.X, wh.K_inv, wh.lam)  # Σ⁻¹ x  (D,)
         x_mnorm = torch.sqrt(
             (x * sx).sum().clamp(min=0.0)
         ).clamp(min=_FRACTION_EPSILON)
@@ -1019,19 +1007,6 @@ class ManifoldMonitor:
         frac = (par_mnorm / x_mnorm).clamp(min=0.0, max=1.0)
         cdist_query = (c.reshape(1, -1) @ wh.chol)  # (1, R) — Lᵀc as row
         return frac, cdist_query, c, wh.node_white
-
-    @property
-    def layer_means(self) -> dict[int, torch.Tensor]:
-        return self._layer_means
-
-    @layer_means.setter
-    def layer_means(self, value: dict[int, torch.Tensor] | None) -> None:
-        value_in: Any = value
-        if value_in is not None and not isinstance(value_in, dict):
-            raise TypeError(
-                f"layer_means must be a dict, got {type(value).__name__}"
-            )
-        self._layer_means = dict(value) if value else {}
 
     def attached_probes(self) -> dict[str, AttachedManifoldProbe]:
         """Return the live attached-probe map (read-only view)."""
@@ -1117,9 +1092,9 @@ class ManifoldMonitor:
             embedded_node_coords=embedded,
             ev_weights=ev_weights,
         )
-        # Build the Mahalanobis bundle when the wired whitener covers this
-        # manifold's layers (all-or-nothing per probe); empty otherwise →
-        # Euclidean readout.
+        # Build the Mahalanobis bundle (mandatory): the wired whitener must
+        # cover this manifold's layers (all-or-nothing per probe), else
+        # ``_build_whitened`` raises — there is no Euclidean readout.
         probe.whitened = self._build_whitened(manifold, probe)
         self._probes[name] = probe
 
@@ -1193,9 +1168,9 @@ class ManifoldMonitor:
                     # defensively flatten to the last dim.
                     h = h.reshape(-1, h.shape[-1])[-1]
                 w = w_shared[layer_idx]
-                # Whichever metric (Euclidean or whitened M-orthogonal),
-                # ``_layer_geometry`` returns the fraction + the cdist
-                # query/nodes in matching coords.
+                # ``_layer_geometry`` returns the whitened M-orthogonal
+                # fraction + the cdist query/nodes in matching (Mahalanobis)
+                # coords.
                 frac, cdist_query, _invert, cdist_nodes = self._layer_geometry(
                     probe, layer_idx, h,
                 )

@@ -40,18 +40,18 @@ def test_safe_model_id():
     assert paths.safe_model_id("local-model") == "local-model"
 
 
-def test_safe_variant_suffix_raw():
-    assert paths.safe_variant_suffix(None) == ""
-    assert paths.safe_variant_suffix("") == ""
+def test_safe_sae_suffix_raw():
+    assert paths.safe_sae_suffix(None) == ""
+    assert paths.safe_sae_suffix("") == ""
 
 
-def test_safe_variant_suffix_release():
-    assert paths.safe_variant_suffix("gemma-scope-2b-pt-res-canonical") == "_sae-gemma-scope-2b-pt-res-canonical"
+def test_safe_sae_suffix_release():
+    assert paths.safe_sae_suffix("gemma-scope-2b-pt-res-canonical") == "_sae-gemma-scope-2b-pt-res-canonical"
 
 
-def test_safe_variant_suffix_slugs_unsafe_chars():
+def test_safe_sae_suffix_slugs_unsafe_chars():
     # Slashes and upper-case get slugged to underscores / lowered.
-    assert paths.safe_variant_suffix("Org/Repo") == "_sae-org_repo"
+    assert paths.safe_sae_suffix("Org/Repo") == "_sae-org_repo"
 
 
 def test_tensor_filename_roundtrip_raw():

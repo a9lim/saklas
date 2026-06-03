@@ -13,10 +13,7 @@ Three primitives used by the cross-branch comparison surfaces:
   from "appeared at 0.1 (no prior reading)".
 - :func:`per_token_diff` — byte-offset-based alignment between two token
   sequences.  Stops at the shortest common prefix where bytes diverge;
-  per-token reading deltas land at aligned positions only.  The
-  ``reference_tokenize`` hook is a placeholder for re-tokenization
-  against a shared reference in a later phase — phase 5 leaves it
-  unused.
+  per-token reading deltas land at aligned positions only.
 
 Plus :func:`steering_delta` — render a compact label like
 ``"+0.2 calm"`` for the parent → child edge by walking both
@@ -27,7 +24,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from difflib import SequenceMatcher
-from typing import Any, Callable, Literal, Mapping, Sequence
+from typing import Any, Literal, Mapping, Sequence
 
 
 # ---------------------------------------------------------------------------
@@ -195,7 +192,6 @@ def per_token_diff(
     *,
     a_scores: Mapping[str, Sequence[float]] | None = None,
     b_scores: Mapping[str, Sequence[float]] | None = None,
-    reference_tokenize: Callable[[str], list[str]] | None = None,
 ) -> list[TokenDeltaSpan]:
     """Byte-offset alignment between two token sequences.
 
@@ -205,13 +201,8 @@ def per_token_diff(
     per-probe deltas pulled from the optional ``a_scores`` / ``b_scores``
     maps.  Position drift (one side adds bytes the other doesn't)
     surfaces as ``aligned=False`` spans and reading deltas drop.
-
-    The ``reference_tokenize`` hook is a placeholder for the
-    documented "re-tokenize against a common reference" mode — phase 5
-    leaves it unused; identical-tokenizer cases (same model on both
-    siblings) work without it.
+    Identical-tokenizer cases (same model on both siblings) align directly.
     """
-    del reference_tokenize  # placeholder for later phases — silence lint
     a_off = _token_byte_offsets(a_tokens)
     b_off = _token_byte_offsets(b_tokens)
 

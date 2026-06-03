@@ -19,12 +19,9 @@ log = logging.getLogger(__name__)
 _KNOWN_KEYS = {
     "model", "vectors", "thinking",
     "temperature", "top_p", "max_tokens", "system_prompt",
-    "projection_metric",
     "compile", "cuda_graphs",
     "return_top_k",
 }
-
-_VALID_PROJECTION_METRICS = ("mahalanobis", "euclidean")
 
 
 class ConfigFileError(ValueError, SaklasError):
@@ -41,7 +38,6 @@ class ConfigFile:
     top_p: Optional[float] = None
     max_tokens: Optional[int] = None
     system_prompt: Optional[str] = None
-    projection_metric: Optional[str] = None  # "mahalanobis" | "euclidean"; None = default
     compile: Optional[bool] = None           # CUDA torch.compile auto-enable; None = default (on)
     cuda_graphs: Optional[bool] = None       # CUDA StaticCache + graph capture; None = default (on)
     # Session-level default for SamplingConfig.return_top_k — the number
@@ -136,17 +132,6 @@ class ConfigFile:
                     ) from e
                 vectors = text
 
-        projection_metric = data.get("projection_metric")
-        if projection_metric is not None and (
-            not isinstance(projection_metric, str)
-            or projection_metric not in _VALID_PROJECTION_METRICS
-        ):
-            raise ConfigFileError(
-                f"{path}: projection_metric must be one of "
-                f"{list(_VALID_PROJECTION_METRICS)} "
-                f"(got {projection_metric!r})"
-            )
-
         compile_v = data.get("compile")
         if compile_v is not None and not isinstance(compile_v, bool):
             # ``compile: false`` is the documented opt-out; reject ints,
@@ -190,7 +175,6 @@ class ConfigFile:
             top_p=data.get("top_p"),
             max_tokens=data.get("max_tokens"),
             system_prompt=data.get("system_prompt"),
-            projection_metric=projection_metric,
             compile=compile_v,
             cuda_graphs=cuda_graphs_v,
             return_top_k=return_top_k_v,
@@ -209,7 +193,7 @@ def compose(configs: list[ConfigFile]) -> ConfigFile:
         for f in (
             "model", "thinking", "temperature",
             "top_p", "max_tokens", "system_prompt", "vectors",
-            "projection_metric", "compile", "cuda_graphs",
+            "compile", "cuda_graphs",
             "return_top_k",
         ):
             v = getattr(c, f)

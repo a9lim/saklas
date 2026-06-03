@@ -205,11 +205,11 @@ live hooks, not a re-render pass.
   (also drops the name from `default_steering`).
 - `GET /{name}/diagnostics` — 16-bucket `‖baked‖` histogram + per-layer magnitudes +
   the `diagnostics_by_layer` blocks when present.
-- `GET /vectors/pairwise?a=&b=&metric=` — cross-layer cosine matrix between two named
-  vectors / probes. `metric` (`euclidean` default / `mahalanobis`) toggles whitening
-  (whitened cosine is single-layer, so each cell is whitened in `a`'s row-layer
-  frame; the response echoes the *effective* metric). Registered *before* `GET
-  /vectors/{name}` so the literal path wins.
+- `GET /vectors/pairwise?a=&b=` — cross-layer **whitened** cosine matrix between two
+  named vectors / probes. Mahalanobis-only (no `metric` param, no Euclidean path):
+  whitened cosine is single-layer, so each cell is whitened in `a`'s row-layer frame.
+  `session.whitener` must cover every row-layer of `a`, else 409 (regenerate the
+  neutral cache). Registered *before* `GET /vectors/{name}` so the literal path wins.
 - `POST /extract` — in `asyncio.to_thread`; SSE / JSON. `_coerce_corpora`
   normalizes `source`: a concept name routes to `session.extract` (bipolar-only
   in 4.0 — a monopolar concept raises `NotImplementedError`), while two pole
@@ -223,9 +223,11 @@ live hooks, not a re-render pass.
   tensor back to a steering Profile, registers it. `_refuse_if_busy` first (409).
   `MergeError` → 400. (Cloning was removed in 4.0 — no `/vectors/clone` route.)
 
-`GET /sessions/{id}/correlation?names=…` — N×N magnitude-weighted cosine matrix
-across loaded steering vectors and active probes (a steering vector wins a name
-collision over a same-named probe). Default covers everything; `names` restricts.
+`GET /sessions/{id}/correlation?names=…` — N×N Mahalanobis-cosine matrix across
+loaded steering vectors and active probes (a steering vector wins a name collision
+over a same-named probe). Mahalanobis-only: passes `session.whitener` to
+`cosine_similarity`; a missing whitener is 409, and a pair the whitener doesn't
+fully cover lands as `null`. Default covers everything; `names` restricts.
 
 ### Loom tree (in `saklas_api.py`)
 

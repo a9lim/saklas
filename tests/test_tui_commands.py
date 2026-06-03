@@ -491,6 +491,7 @@ def test_probe_seeds_highlight():
 def test_compare_pairwise():
     import torch
     from saklas.core.profile import Profile
+    from tests._whitener import isotropic_whitener
 
     app = _make_app()
     t = {0: torch.randn(8), 1: torch.randn(8)}
@@ -499,6 +500,8 @@ def test_compare_pairwise():
         "happy.sad": Profile({k: v.clone() for k, v in t.items()}),
     }
     app._session._monitor.profiles = {}
+    # /compare is Mahalanobis-only now: the session exposes a covering whitener.
+    app._session.whitener = isotropic_whitener([0, 1], 8)
     app._handle_command("/compare angry.calm happy.sad")
     msg = _msgs(app)
     assert "angry.calm" in msg and "happy.sad" in msg
@@ -507,6 +510,7 @@ def test_compare_pairwise():
 def test_compare_ranked():
     import torch
     from saklas.core.profile import Profile
+    from tests._whitener import isotropic_whitener
 
     app = _make_app()
     base = {0: torch.randn(8), 1: torch.randn(8)}
@@ -520,6 +524,7 @@ def test_compare_ranked():
         "happy.sad": Profile({k: torch.randn(8) for k in base}),
         "formal.casual": Profile({k: torch.randn(8) for k in base}),
     }
+    app._session.whitener = isotropic_whitener([0, 1], 8)
     app._handle_command("/compare angry.calm")
     msg = _msgs(app)
     assert "angry.calm" in msg

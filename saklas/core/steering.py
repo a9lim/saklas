@@ -69,21 +69,16 @@ class Steering:
         ``Trigger.BOTH`` — steer every token.  Entries given as
         ``(alpha, Trigger)`` tuples ignore this default; projection
         entries carry their own trigger inside the ``ProjectedTerm``.
-    projection_metric: per-call override for the metric used when
-        materializing ``~`` / ``|`` projection terms.  ``"mahalanobis"``
-        uses the closed-form LEACE projector against the session's
-        :class:`~saklas.core.mahalanobis.LayerWhitener` (default since
-        v2.1 — provably erases linearly-decodable information along
-        ``onto`` from ``base``).  ``"euclidean"`` is plain Gram-Schmidt
-        (the v2.0/v2.1 behavior).  ``None`` (default) inherits the
-        session-level setting.  Programmatic only — the canonical
-        expression grammar does not (yet) round-trip this field.
+
+    ``~`` / ``|`` projection terms always materialize through the
+    closed-form LEACE projector against the session's
+    :class:`~saklas.core.mahalanobis.LayerWhitener` — there is no
+    Euclidean path and no per-call metric override.
     """
 
     alphas: Mapping[str, AlphaEntry]
     thinking: bool | None = None
     trigger: Trigger = Trigger.BOTH
-    projection_metric: str | None = None
 
     @classmethod
     def from_value(

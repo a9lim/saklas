@@ -45,7 +45,7 @@ from saklas.core.errors import SaklasError
 from saklas.core.manifold import BoxDomain, domain_from_spec
 from saklas.core.role_templates import _ROLE_SLUG_RE
 from saklas.io.atomic import write_bytes_atomic, write_json_atomic
-from saklas.io.packs import NAME_REGEX, verify_integrity
+from saklas.io.packs import NAME_REGEX, hash_file, verify_integrity
 from saklas.io.paths import manifold_dir, manifolds_dir, saklas_home
 
 _log = logging.getLogger("saklas.io.manifolds")
@@ -258,19 +258,8 @@ def hash_manifold_files(folder: Path) -> dict[str, str]:
     out: dict[str, str] = {}
     for entry in sorted(folder.iterdir()):
         if entry.is_file() and entry.name != "manifold.json":
-            out[entry.name] = _hash_file(entry)
+            out[entry.name] = hash_file(entry)
     return out
-
-
-def _hash_file(path: Path) -> str:
-    # Twin: :func:`saklas.io.packs.hash_file` is byte-identical and kept
-    # separate by design (the manifold format is decoupled from packs);
-    # mirror any change to one in the other.
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(65536), b""):
-            h.update(chunk)
-    return h.hexdigest()
 
 
 def _canonical_json(obj: Any) -> bytes:
@@ -421,9 +410,10 @@ class ManifoldFolder:
     # to a folder authored before the distinction existed.
     node_kinds: list[str | None] = field(default_factory=list)
     # Category tags, mirroring :attr:`saklas.io.packs.PackMetadata.tags`.
-    # Carried so category-grouped probe bootstrap (``load_defaults`` ->
-    # ``bootstrap_probes(categories=...)``) keeps working once a steering
-    # vector lives as a 2-node ``pca`` manifold.  Optional/additive — the
+    # Carried so category-grouped probe bootstrap
+    # (``load_default_manifolds`` -> ``_bootstrap_manifold_probes``) keeps
+    # working once a steering vector lives as a 2-node ``pca`` manifold.
+    # Optional/additive — the
     # loader defaults ``[]``; a tagless manifold stays byte-identical.
     tags: list[str] = field(default_factory=list)
     # tensor stem (``<safe_model>`` or ``<safe_model>_sae-<rel>``) -> sidecar.
@@ -2340,19 +2330,20 @@ def transfer_manifold(
     pure-io.  ``transfer_quality_estimate`` (median per-layer R², if the
     caller computed it) rides into the sidecar provenance.
 
-    **Target-metric re-bake (``whitener`` given).**  The fitted manifold's
+    **Target-metric re-bake (mandatory).**  The fitted manifold's
     per-layer Mahalanobis share is a per-model quantity (``Σ`` belongs to
-    ``from_model``), so a bare transfer can't carry it.  When a ``whitener``
-    for the **target** model is supplied and covers every transferred layer
-    (all-or-nothing, mirroring the fit gate), the share is recomputed in
-    target space via ``sqrt(Σ_k coordsᵀ (B_tgt Σ_tgt⁻¹ B_tgtᵀ) coords)`` (the
-    RBF reduced node values × the target subspace-restricted inverse
-    covariance — the same formula the fit pipeline bakes).  The sidecar then
-    records ``share_metric: "mahalanobis"``.  Without coverage (or no
-    whitener) the share is left empty — the apply path falls back to the
-    Euclidean centroid-spread share (``share_metric: "euclidean"``).
-    ``subspace_metric`` always carries the source value: the basis was
-    *selected* on the source model and only rotated here.
+    ``from_model``), so a bare transfer can't carry it.  The ``whitener``
+    for the **target** model is **required** and must cover every
+    transferred layer (all-or-nothing, mirroring the fit gate); the share
+    is recomputed in target space via
+    ``sqrt(Σ_k coordsᵀ (B_tgt Σ_tgt⁻¹ B_tgtᵀ) coords)`` (the RBF reduced
+    node values × the target subspace-restricted inverse covariance — the
+    same formula the fit pipeline bakes).  The sidecar then records
+    ``share_metric: "mahalanobis"``.  A missing or non-covering whitener
+    raises :class:`~saklas.core.mahalanobis.WhitenerError` — there is no
+    Euclidean rebake.  ``subspace_metric`` always carries the source
+    value: the basis was *selected* on the source model and only rotated
+    here.
 
     Returns the path to the written transferred tensor.  Raises
     :class:`FileNotFoundError` when the source fit is missing,
@@ -2413,31 +2404,44 @@ def transfer_manifold(
 
     # The source model's Mahalanobis share is per-model (Σ and the neutral
     # activations are both ``from_model`` quantities), so it's invalid in
-    # ``to_model`` space.  When a **target** whitener is supplied and covers
-    # every transferred layer (all-or-nothing, mirroring the fit gate),
-    # recompute it in target space; otherwise clear it — the apply path then
-    # falls back to the Euclidean centroid-spread share, which is metric-valid
-    # for the target.  (EV is a fit-quality ratio, not a per-model metric, so
-    # it carries either way.)
-    rebake = whitener is not None and whitener.covers_all(new_layers.keys())
+    # ``to_model`` space.  The **target** whitener is mandatory and must
+    # cover every transferred layer (all-or-nothing, mirroring the fit
+    # gate); recompute the share in target space.  No Euclidean rebake — a
+    # missing / partial whitener is an error.  (EV is a fit-quality ratio,
+    # not a per-model metric, so it carries either way.)
+    from saklas.core.mahalanobis import WhitenerError
+
+    if whitener is None or not whitener.covers_all(new_layers.keys()):
+        raise WhitenerError(
+            "transfer_manifold requires a Mahalanobis whitener covering every "
+            f"transferred layer {sorted(new_layers.keys())}; generate neutral "
+            "activations for the TARGET model first (the Euclidean path is gone)"
+        )
+    from saklas.core.manifold import subspace_share
+
     new_share: dict[int, float] = {}
-    if rebake:
-        assert whitener is not None  # narrowed by ``rebake``
-        for layer, sub_tgt in new_layers.items():
-            sub_f = sub_tgt.to(device=torch.device("cpu"), dtype=torch.float32)
-            # ``coords`` are the reduced node values the RBF interpolates
-            # (subspace-coordinate space — invariant under the model-space
-            # alignment, so identical to the source fit).  ``M_R`` restricts
-            # the *target* Σ⁻¹ to the transferred basis; the whitened share
-            # is ``sqrt(Σ_k coords_kᵀ M_R coords_k)`` — the same formula the
-            # fit pipeline bakes, now in target space.
+    for layer, sub_tgt in new_layers.items():
+        sub_f = sub_tgt.to(device=torch.device("cpu"), dtype=torch.float32)
+        # ``coords`` are the reduced node values in subspace-coordinate
+        # space — invariant under the model-space alignment, so identical
+        # to the source fit.  ``subspace_share`` computes the μ-centered
+        # whitened spread ``sqrt(Σ_k c_kᵀ M_R c_k)`` (``M_R = B_tgt Σ_tgt⁻¹
+        # B_tgtᵀ`` via ``subspace_gram``, the *target* Σ⁻¹ restricted to the
+        # transferred basis) — the same formula the fit pipeline bakes, now
+        # in target space.  It μ-centers internally only if fed μ-centered
+        # coords, so do the centering here: flat fits carry neutral-anchored
+        # real coords in ``node_coords``; curved fits read μ-centered node
+        # values off the RBF.
+        if sub_f.is_affine:
+            coords = sub_f.node_coords  # (K, R) neutral-anchored
+            assert coords is not None  # affine ⇒ node_coords set
+        else:
             _np, _rw, _pc = sub_f.rbf_params()
             coords = eval_rbf(_np, _rw, _pc, _np)  # (K, R)
-            gram = whitener.subspace_gram(layer, sub_f.basis)  # (R, R)
-            quad = float(
-                (coords @ gram * coords).sum().clamp_min(0.0).item()
-            )
-            new_share[layer] = quad ** 0.5
+        mu_coords = coords - coords.mean(dim=0, keepdim=True)  # μ-center
+        new_share[layer] = subspace_share(
+            mu_coords, sub_f.basis, whitener=whitener, layer=layer,
+        )
 
     transferred = _dc_replace(
         src, layers=new_layers, explained_variance=new_ev,
@@ -2471,7 +2475,7 @@ def transfer_manifold(
     # ``subspace_metric`` is left as the source carried it — the basis was
     # selected on the source model and only rotated here, so its selection
     # metric is unchanged by the transfer.
-    metadata["share_metric"] = "mahalanobis" if rebake else "euclidean"
+    metadata["share_metric"] = "mahalanobis"
     metadata["nodes_sha256"] = ManifoldFolder.load(folder).nodes_sha256()
     if transfer_quality_estimate is not None:
         metadata["transfer_quality_estimate"] = float(transfer_quality_estimate)
@@ -2609,11 +2613,6 @@ def _canonical_json_sha256(data: bytes) -> str:
     newline) compare equal.  Falls back to a raw sha256 if the bytes don't
     parse as JSON, so unparseable on-disk content is treated as "user
     edited" rather than silently overwritten.
-
-    Twin: :func:`saklas.io.packs._canonical_json_sha256` is the
-    byte-equivalent helper for the decoupled pack format — kept separate
-    (rather than importing the private cross-module name) so the two
-    formats can churn independently; mirror any change to one in the other.
     """
     try:
         parsed = json.loads(data)

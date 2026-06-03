@@ -301,36 +301,51 @@ def test_generation_result_hidden_states_can_be_set_and_is_omitted_from_to_dict(
 
 
 class TestTraitMonitorScoring:
-    """Tests for TraitMonitor probe scoring — runs anywhere (no GPU)."""
+    """Tests for TraitMonitor probe scoring — runs anywhere (no GPU).
 
-    @staticmethod
-    def _make_monitor():
+    Mahalanobis-only (4.0 collapse): probe scoring requires a covering
+    whitener, so the monitor is built with a synthetic one and the read is
+    the whitened cosine — value assertions are structural (sign / ordering /
+    finiteness), not exact Euclidean cosines.
+    """
+
+    _DIM = 16
+    # Zero neutral mean so the probe/hidden vectors below are already centered.
+    _MEANS = {0: torch.zeros(16)}
+
+    @classmethod
+    def _make_monitor(cls):
         from saklas.core.monitor import TraitMonitor
-        dim = 16
-        # Create a probe vector pointing in a known direction
-        probe_vec = torch.zeros(dim)
+        from tests._whitener import synthetic_whitener
+        probe_vec = torch.zeros(cls._DIM)
         probe_vec[0] = 1.0  # unit vector along dim 0
-        probe_profile = {0: probe_vec}
-        layer_means = {0: torch.zeros(dim)}
-        return TraitMonitor({"test_probe": probe_profile}, layer_means)
+        whitener = synthetic_whitener([0], cls._DIM, means=cls._MEANS)
+        return TraitMonitor(
+            {"test_probe": {0: probe_vec}},
+            layer_means=dict(cls._MEANS), whitener=whitener,
+        )
 
-    def test_measure_from_hidden_matches_manual(self):
+    def test_measure_aligned_scores_positive(self):
         monitor = self._make_monitor()
-        # Hidden state pointing in the same direction as probe
+        # Hidden state pointing in the same direction as probe.
         h = torch.zeros(16)
         h[0] = 5.0
         monitor.measure_from_hidden({0: h})
         assert len(monitor.history["test_probe"]) == 1
-        # Cosine similarity of aligned vectors = 1.0
-        assert abs(monitor.history["test_probe"][0] - 1.0) < 1e-5
+        # Aligned with the probe ⇒ positive whitened cosine, finite.
+        v = monitor.history["test_probe"][0]
+        assert v == v and v > 0.0
 
-    def test_measure_from_hidden_orthogonal(self):
+    def test_measure_aligned_beats_anti_aligned(self):
         monitor = self._make_monitor()
-        # Hidden state orthogonal to probe — cosine = 0
-        h = torch.zeros(16)
-        h[1] = 5.0
-        monitor.measure_from_hidden({0: h})
-        assert abs(monitor.history["test_probe"][0]) < 1e-5
+        aligned = torch.zeros(16)
+        aligned[0] = 5.0
+        anti = torch.zeros(16)
+        anti[0] = -5.0
+        monitor.measure_from_hidden({0: aligned})
+        monitor.measure_from_hidden({0: anti})
+        # Aligned reads above anti-aligned under any PD metric.
+        assert monitor.history["test_probe"][0] > monitor.history["test_probe"][1]
 
     def test_history_accumulates_across_calls(self):
         monitor = self._make_monitor()

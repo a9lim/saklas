@@ -51,11 +51,11 @@ pip install -e ".[gguf]"                        # llama.cpp GGUF I/O
 pip install -e ".[cuda]"                        # bitsandbytes + kernels (Linux/CUDA)
 pip install -e ".[cuda-experimental]"            # + flash-attn (Linux/CUDA)
 pip install -e ".[sae]"                         # SAELens-backed SAE extraction
-saklas tui <model_id> [--projection-metric {mahalanobis,euclidean}] [--no-dls]
+saklas tui <model_id> [--no-dls]
 saklas serve <model_id> [--no-web] [--steer/-S EXPR]
 saklas subspace extract <concept>|<pos> <neg> [-m MODEL] [--sae RELEASE] [--role SLUG] [--namespace NS] [-f]
 saklas subspace merge <name> <expression> [-m]    # shared grammar: "0.3 ns/a + 0.5 ns/b|ns/c"
-saklas subspace compare <concepts...> -m MODEL [--metric mahalanobis|euclidean]
+saklas subspace compare <concepts...> -m MODEL [--ridge-scale R]
 saklas subspace why <concept> -m MODEL [-j]       # per-layer ||baked|| as a 16-bucket histogram
 saklas subspace transfer <concept> --from SRC --to TGT [-f]   # cross-model Procrustes transfer
 saklas manifold fit <folder> [-m MODEL] [--sae REL]  # fit an authored manifold
@@ -93,10 +93,10 @@ Every subcommand that takes `-c/--config` auto-loads `~/.saklas/config.yaml`
 first, then composes explicit `-c` files on top (later overrides earlier). The
 `vectors:` YAML key is a single steering expression parsed by
 `saklas.core.steering_expr.parse_expr`. `cli/AGENTS.md` has the full per-verb flag
-set. There is no `--steer-mode`/`--theta-max`/`--method`/`--legacy` surface — the
-injection kernel is unified, difference-of-means is the only vector extraction
-method, and the only steering knobs at the CLI are `--projection-metric` and
-`--no-dls`.
+set. There is no `--steer-mode`/`--theta-max`/`--method`/`--legacy`/
+`--projection-metric` surface — the injection kernel is unified, difference-of-means
+is the only vector extraction method, `~`/`|` projection is Mahalanobis-only, and
+the only steering knob at the CLI is `--no-dls`.
 
 ## Selector grammar
 
@@ -240,14 +240,18 @@ flat fit; at K=2 it is exactly the pos/neg opposite-sign test. Curved manifolds
 have no pos/neg polarity, so they skip DLS — per-layer signal is the apply-time
 share alone.
 
-Bake/share metric: `‖·‖_M` (Mahalanobis) when a `LayerWhitener` covers every
-scored layer, `‖·‖₂` (Euclidean) otherwise. The choice is all-or-nothing
-(`covers_all`) — the two scales differ by a per-layer `1/√λ_L` factor that doesn't
-cancel from the cross-layer-normalized share. The sidecar `share_metric` /
-`subspace_metric` fields record which. The `LayerWhitener` (`core/mahalanobis.py`)
-is built lazily from cached neutral activations and also drives Mahalanobis
-`~`/`|` projection (closed-form LEACE), the whitened/Fisher subspace fit, the
-whitened monitor reads, and `subspace compare --metric mahalanobis`.
+Bake/share metric: always `‖·‖_M` (Mahalanobis). Activation-space fit, `~`/`|`
+projection, monitor reads, cross-model transfer, and `subspace compare` require a
+`LayerWhitener` covering every scored layer (`covers_all`) and raise `WhitenerError`
+otherwise — there is no Euclidean fallback (on real LMs the Euclidean metric is
+rogue-dominated, so it would be a wrong answer, not a degraded one). The sidecar
+`share_metric` / `subspace_metric` fields are provenance and read `mahalanobis`,
+the one exception being a monopolar fit's `subspace_metric`, which labels its
+raw-δ̂ basis `euclidean` (a basis-selection label — `concept − ν` cancels
+common-mode by differencing, like DiM — not a metric fallback). The `LayerWhitener`
+(`core/mahalanobis.py`) is built lazily from cached neutral activations and drives
+the closed-form LEACE `~`/`|` projection, the whitened/Fisher subspace fit, the
+whitened monitor reads, and `subspace compare`.
 
 ## Injection
 
@@ -336,8 +340,12 @@ background variance, so rogue dims cancel (the same cancellation DiM gets by
 differencing); the de-rogued subspace barely overlaps the rogue-dominated `mean`,
 so the running-`‖h‖` artifact collapses for free. Solved as the generalized
 eigenproblem via the whitener's Woodbury Σ⁻¹, re-expressed Euclidean-orthonormal so
-the hot path is unchanged. Gated all-or-nothing on `covers_all`; absent coverage →
-Euclidean PCA.
+the hot path is unchanged. Gated all-or-nothing on `covers_all`: an activation-space
+fit requires the whitener to cover every fit layer and raises `WhitenerError`
+otherwise — no Euclidean fit path. (The low-level `_pca_basis` keeps a Euclidean SVD
+branch for the behavior-space naturalness fit, which lives in output-distribution
+space where there are no rogue activation dims; the activation-space callers never
+reach it.)
 
 ### Discover mode (auto-fit from a heap of corpora)
 
@@ -442,8 +450,8 @@ Key contracts:
   `extract_manifold(folder)` fits a multi-node manifold and returns a `Manifold`.
   `Profile` wraps `dict[int, Tensor]` (mapping interface plus `layers`, `metadata`,
   `save`/`load`, `merged`, `projected_away`, `cosine_similarity`).
-- `Steering` is frozen; its only per-call override field is `projection_metric`
-  (`None` = inherit the session default). There is no `injection_mode`/`theta_max`.
+- `Steering` is frozen; it carries no per-call metric override (`~`/`|` projection
+  is Mahalanobis-only). There is no `injection_mode`/`theta_max`/`projection_metric`.
 - `SaklasSession.__init__` takes a pre-loaded `PreTrainedModel`; use `from_pretrained`
   for HF loads. There is no `cache_dir=` — set `$SAKLAS_HOME` to relocate paths.
 - Every saklas exception subclasses `SaklasError` while preserving its stdlib MRO,
@@ -517,10 +525,10 @@ tok/s):
   hard candidate-pool cap applied before top-p (llama.cpp/Ollama order).
 - **Monitor capture is hook-driven**, inline with generation — one matmul per layer
   scores all probes, no second forward pass. `TraitMonitor` scores in the whitened
-  (Mahalanobis) cosine when the whitener covers every probed layer, else Euclidean
-  for all (all-or-nothing via `covers_all`; never a per-layer mix). The Σ⁻¹-applied
-  probe directions + device-resident Woodbury factors are precomputed at cache
-  build, so the hot path stays one matmul plus a cheap per-token Woodbury apply.
+  (Mahalanobis) cosine — mandatory: the whitener must cover every probed layer
+  (`covers_all`), else scoring raises `WhitenerError` (no Euclidean path). The
+  Σ⁻¹-applied probe directions + device-resident Woodbury factors are precomputed at
+  cache build, so the hot path stays one matmul plus a cheap per-token Woodbury apply.
   `covers_all` is trustworthy as "finite factors everywhere": any non-finite layer
   is excluded, and neutral activations are cached fp32 (so gemma-3's late layers
   don't overflow the fp16 65504 ceiling to ±inf). The probe weight stays `‖baked‖₂`

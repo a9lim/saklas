@@ -179,14 +179,18 @@ def plot_alpha_sweep(
 def plot_probe_correlation(
     profiles: "dict[str, Profile]",
     *,
-    title: str = "Probe correlation (magnitude-weighted cosine)",
+    whitener: "Any | None" = None,
+    title: str = "Probe correlation (Mahalanobis cosine)",
     color_scale: str = "RdBu",
 ) -> "go.Figure":
-    """N×N magnitude-weighted cosine heatmap across profiles.
+    """N×N Mahalanobis-cosine heatmap across profiles.
 
-    Diagonal is 1.0; off-diagonals are ``Profile.cosine_similarity(...)``
-    aggregated across shared layers.  Profiles with no shared layers
-    render as ``NaN`` cells (plotly handles missing values cleanly).
+    Diagonal is 1.0; off-diagonals are ``Profile.cosine_similarity(...,
+    whitener=whitener)`` aggregated across shared layers.  The metric is
+    Mahalanobis-only (the Euclidean path is gone), so ``whitener`` (a
+    :class:`~saklas.core.mahalanobis.LayerWhitener` covering the profiles'
+    layers) is **required** — a missing or non-covering whitener renders the
+    affected cells as ``NaN`` (plotly handles missing values cleanly).
 
     Names are rendered in dict-iteration order along both axes so callers
     can pre-sort by category (e.g. affect/epistemic/...).
@@ -208,7 +212,9 @@ def plot_probe_correlation(
                 matrix[i][j] = 1.0
                 continue
             try:
-                agg = profiles[a_name].cosine_similarity(profiles[b_name])
+                agg = profiles[a_name].cosine_similarity(
+                    profiles[b_name], whitener=whitener,
+                )
                 cos = float(agg)
             except Exception:
                 cos = float("nan")

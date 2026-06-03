@@ -283,16 +283,16 @@ def transfer_profile(
     dropped — partial transfer is the only sensible behavior, since a
     direction with no map can't be lifted into target space.
 
-    **Target-metric re-bake (``whitener`` given).**  The source tensor is
+    **Target-metric re-bake (mandatory).**  The source tensor is
     share-baked in the *source* model's metric — its per-layer Euclidean
     magnitude is the source Mahalanobis norm of the raw mean-diff (the
     unified subspace hook reads ``‖baked_L‖₂ / Σ‖baked‖₂`` back out as
     the layer share).  The orthogonal Procrustes map preserves Euclidean norm, so a
-    bare transfer carries the *source* cross-layer share into target space
-    — where it no longer matches the target's anisotropy.  When a
-    ``whitener`` for the **target** model is supplied and covers every
-    transferred layer (all-or-nothing, mirroring the DiM-bake /
-    monitor / manifold-fit gate), each layer is rescaled so its magnitude
+    bare transfer would carry the *source* cross-layer share into target
+    space — where it no longer matches the target's anisotropy.  The
+    ``whitener`` for the **target** model is **required** and must cover
+    every transferred layer (all-or-nothing, mirroring the DiM-bake /
+    monitor / manifold-fit gate); each layer is rescaled so its magnitude
     becomes its *target* Mahalanobis norm::
 
         v_tgt'_L = v_tgt_L · (‖v_tgt_L‖_M(target) / ‖v_tgt_L‖₂)
@@ -303,9 +303,8 @@ def transfer_profile(
     available without target contrastive pairs) and ``‖v̂_tgt_L‖_M(target)``
     applies the target anisotropy correction, so the composite is the
     target-metric analogue of a native DiM bake.  ``bake: "mahalanobis"``
-    is stamped on the result; partial coverage (or ``whitener=None``)
-    leaves the Euclidean (source-share) transfer untouched and stamps
-    ``bake: "euclidean"``.
+    is stamped on the result.  A missing or non-covering whitener raises
+    :class:`WhitenerError` — there is no Euclidean transfer.
 
     Carries provenance through ``Profile.metadata``:
 
@@ -313,8 +312,7 @@ def transfer_profile(
     * ``source_model_id`` — HF coord of the source model.
     * ``transfer_quality_estimate`` — median R² across shared layers, if
       known.
-    * ``bake`` — ``"mahalanobis"`` when the target re-bake ran, else
-      ``"euclidean"``.
+    * ``bake`` — always ``"mahalanobis"``.
 
     Existing diagnostics fields on the source profile pass through
     unchanged; users can still reason about source-side separation when
@@ -326,8 +324,8 @@ def transfer_profile(
         raise ProfileError("transfer_profile: alignment_map is empty")
 
     # Stage the transferred directions in fp32 (keyed by layer) plus the
-    # original per-layer dtype, so the optional target re-bake operates at
-    # full precision before the dtype restore.
+    # original per-layer dtype, so the target re-bake operates at full
+    # precision before the dtype restore.
     staged: dict[int, torch.Tensor] = {}
     orig_dtype: dict[int, torch.dtype] = {}
     for layer, src_vec in profile.items():
@@ -345,20 +343,26 @@ def transfer_profile(
             "transfer_profile: alignment covered no layers in the source profile"
         )
 
-    # All-or-nothing target re-bake gate: the per-layer ‖·‖_M and ‖·‖₂
-    # scales differ by a 1/√λ_L factor that doesn't cancel from the
-    # cross-layer share, so re-bake every transferred layer or none.
-    rebake = whitener is not None and whitener.covers_all(staged.keys())
-    if rebake:
-        assert whitener is not None  # narrowed by ``rebake``
-        for layer, v_tgt in staged.items():
-            eucl = float(v_tgt.norm().item())
-            if eucl < 1e-8:
-                # Degenerate direction — leave it; rescaling a zero vector
-                # is undefined and it carries no share anyway.
-                continue
-            m_norm = whitener.mahalanobis_norm(layer, v_tgt)
-            staged[layer] = v_tgt * (m_norm / eucl)
+    # Mahalanobis-only target re-bake: the per-layer ‖·‖_M and ‖·‖₂ scales
+    # differ by a 1/√λ_L factor that doesn't cancel from the cross-layer
+    # share, so the target whitener must cover every transferred layer.
+    # No Euclidean transfer — a missing / partial whitener is an error.
+    from saklas.core.mahalanobis import WhitenerError
+
+    if whitener is None or not whitener.covers_all(staged.keys()):
+        raise WhitenerError(
+            "transfer_profile requires a Mahalanobis whitener covering every "
+            f"transferred layer {sorted(staged.keys())}; generate neutral "
+            "activations for the TARGET model first (the Euclidean path is gone)"
+        )
+    for layer, v_tgt in staged.items():
+        eucl = float(v_tgt.norm().item())
+        if eucl < 1e-8:
+            # Degenerate direction — leave it; rescaling a zero vector
+            # is undefined and it carries no share anyway.
+            continue
+        m_norm = whitener.mahalanobis_norm(layer, v_tgt)
+        staged[layer] = v_tgt * (m_norm / eucl)
 
     out_tensors = {
         layer: v.to(dtype=orig_dtype[layer]) for layer, v in staged.items()
@@ -367,7 +371,7 @@ def transfer_profile(
     metadata = dict(profile.metadata)
     metadata["method"] = "procrustes_transfer"
     metadata["source_model_id"] = source_model_id
-    metadata["bake"] = "mahalanobis" if rebake else "euclidean"
+    metadata["bake"] = "mahalanobis"
     if transfer_quality_estimate is not None:
         metadata["transfer_quality_estimate"] = float(transfer_quality_estimate)
     return Profile(out_tensors, metadata=metadata)

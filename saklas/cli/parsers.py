@@ -112,17 +112,6 @@ def _add_injection_args(p: argparse.ArgumentParser) -> None:
     to the session defaults: Mahalanobis projection + DLS on).
     """
     p.add_argument(
-        "--projection-metric", dest="projection_metric",
-        choices=["mahalanobis", "euclidean"], default=None,
-        help="Metric for runtime ``~`` / ``|`` projection in steering "
-             "expressions.  'mahalanobis' (default since v2.1) uses the "
-             "closed-form LEACE projector against the per-model whitener "
-             "(Belrose et al. 2023) — provably erases linearly-decodable "
-             "concept information along ``onto`` from ``base``.  "
-             "'euclidean' is plain Gram-Schmidt.  "
-             "Unset = inherit YAML / session default.",
-    )
-    p.add_argument(
         "--no-dls", dest="no_dls", action="store_true",
         help="Disable the discriminative-layer-selection mask at "
              "extraction time.  v2.1 introduced centered DLS (Dang & "
@@ -259,24 +248,14 @@ def _build_vector_compare(p: argparse.ArgumentParser) -> None:
     p.add_argument("-j", "--json", dest="json_output", action="store_true",
                    help="Emit machine-readable JSON")
     p.add_argument(
-        "--metric", choices=("euclidean", "mahalanobis"), default=None,
-        help=(
-            "Cosine metric. 'mahalanobis' (default since v2.1) = whitened "
-            "cosine ⟨u,v⟩_M = u^T Σ^{-1} v (Belrose et al. 2023), reads "
-            "cached neutral activations + layer means under "
-            "~/.saklas/models/<id>/ to build the per-layer whitener; "
-            "decided all-or-nothing — whitens every shared layer or, when "
-            "the whitener doesn't cover them all, falls back to Euclidean "
-            "for all.  'euclidean' = standard weighted cosine."
-        ),
-    )
-    p.add_argument(
         "--ridge-scale", type=float, default=1.0, metavar="FLOAT",
         help=(
             "Ridge multiplier on the regularized covariance "
-            "(λ_L = (||X_L||_F²/(N·D)) × ridge_scale). Only consulted "
-            "with --metric mahalanobis; default 1.0 (mean diagonal of "
-            "the un-regularized sample covariance)."
+            "(λ_L = (||X_L||_F²/(N·D)) × ridge_scale); default 1.0 (mean "
+            "diagonal of the un-regularized sample covariance).  Compare is "
+            "Mahalanobis-only — it reads cached neutral activations + layer "
+            "means under ~/.saklas/models/<id>/ to build the per-layer "
+            "whitener and fails if the cache is missing."
         ),
     )
 
@@ -914,7 +893,7 @@ def _build_root_parser() -> argparse.ArgumentParser:
 
     subspace = sub.add_parser(
         "subspace",
-        help="Flat-subspace ops (extract/merge/clone/compare/why/transfer)",
+        help="Flat-subspace ops (extract/merge/compare/why/transfer)",
         description="Flat-subspace (steering vector) operations",
     )
     _build_subspace_parser(subspace)
