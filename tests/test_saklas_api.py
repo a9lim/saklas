@@ -506,6 +506,55 @@ class TestWebSocket:
             assert len(ptp) == 3
             assert ptp[0]["probes"]["happy"] == pytest.approx(0.1)
 
+    def test_stale_n_way_token_callback_stays_on_original_queue(
+        self, session_and_client: Any,
+    ) -> None:
+        """A late sibling-0 callback must not leak into sibling 1's stream."""
+        session, client = session_and_client
+        callbacks: list[Any] = []
+
+        def _gen(input: Any, *, steering: Any = None, sampling: Any = None,
+                 stateless: Any = False, raw: Any = False, thinking: Any = None,
+                 on_token: Any = None, parent_node_id: Any = None, n: Any = 1) -> Any:
+            callbacks.append(on_token)
+            idx = len(callbacks) - 1
+            if idx == 1:
+                callbacks[0]("late-first", False, 1999, None, None)
+                on_token("second", False, 2000, None, None)
+                text = "second"
+                tokens = [2000]
+            else:
+                text = "first"
+                tokens = []
+            result = GenerationResult(
+                text=text, tokens=tokens, token_count=len(tokens),
+                tok_per_sec=50.0, elapsed=0.01, finish_reason="stop",
+            )
+            session._last_result = result
+            session.last_result = result
+            session._last_per_token_scores = {}
+            session.last_per_token_scores = {}
+            return result
+
+        session.generate.side_effect = _gen
+
+        with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
+            ws.send_json({"type": "generate", "input": "hi", "n": 2})
+            tokens: list[str] = []
+            done_count = 0
+            started_count = 0
+            while done_count < 2:
+                msg = ws.receive_json()
+                if msg["type"] == "started":
+                    started_count += 1
+                elif msg["type"] == "token":
+                    tokens.append(msg["text"])
+                elif msg["type"] == "done":
+                    done_count += 1
+
+        assert started_count == 2
+        assert tokens == ["second"]
+
     def test_unknown_message_type(self, session_and_client: Any) -> None:
         _, client = session_and_client
         with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:

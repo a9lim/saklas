@@ -2037,6 +2037,7 @@ async def _ws_handle_generate(
                 top_alts: list[Any] | None,
                 perplexity: float | None = None,
                 _node_holder: list[str | None] = current_node_holder,
+                _token_queue: asyncio.Queue[Any] = token_queue,
             ) -> None:
                 event = build_token_event(
                     session,
@@ -2047,9 +2048,10 @@ async def _ws_handle_generate(
                     lp=lp,
                     top_alts=top_alts,
                 )
-                loop.call_soon_threadsafe(token_queue.put_nowait, event)
-            setattr(_on_token, "_saklas_wants_live_scores", True)
-            setattr(_on_token, "_saklas_wants_per_layer_scores", True)
+                loop.call_soon_threadsafe(_token_queue.put_nowait, event)
+            _on_token_flags: Any = _on_token
+            _on_token_flags._saklas_wants_live_scores = True
+            _on_token_flags._saklas_wants_per_layer_scores = True
 
             result_holder: list[GenerationResult | RunSet] = []
             error_holder: list[BaseException] = []
