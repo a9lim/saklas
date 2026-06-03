@@ -312,9 +312,9 @@ class ResultCollector:
     def to_dataframe(self) -> Any:
         try:
             import pandas as pd
-        except ImportError:
+        except ImportError as e:
             raise ImportError(
                 "pandas is required for to_dataframe(). "
                 "Install with: pip install saklas[research]"
-            )
+            ) from e
         return pd.DataFrame(self._rows)

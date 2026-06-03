@@ -397,7 +397,9 @@ def _find_manifold(
     try:
         return namespace, ManifoldFolder.load(folder)
     except ManifoldFormatError as e:
-        raise HTTPException(400, f"manifold {namespace}/{name} is malformed: {e}")
+        raise HTTPException(
+            400, f"manifold {namespace}/{name} is malformed: {e}",
+        ) from e
 
 
 def _refuse_if_busy(session: SaklasSession) -> None:
@@ -470,9 +472,9 @@ def register_manifold_routes(app: FastAPI) -> None:
                 req.namespace, req.name, req.description, domain_spec, nodes,
             )
         except FileExistsError as e:
-            raise HTTPException(409, str(e))
+            raise HTTPException(409, str(e)) from e
         except ManifoldFormatError as e:
-            raise HTTPException(400, str(e))
+            raise HTTPException(400, str(e)) from e
         mf = ManifoldFolder.load(folder)
         body = _manifold_json(req.namespace, mf, session, full=True)
         body["advisories"] = advisories
@@ -501,9 +503,9 @@ def register_manifold_routes(app: FastAPI) -> None:
                 node_roles=node_roles_map,
             )
         except FileExistsError as e:
-            raise HTTPException(409, str(e))
+            raise HTTPException(409, str(e)) from e
         except ManifoldFormatError as e:
-            raise HTTPException(400, str(e))
+            raise HTTPException(400, str(e)) from e
         mf = ManifoldFolder.load(folder)
         return _manifold_json(req.namespace, mf, session, full=True)
 
@@ -519,9 +521,9 @@ def register_manifold_routes(app: FastAPI) -> None:
         try:
             rows = search_manifolds(q or None)
         except ImportError as e:
-            raise HTTPException(503, f"huggingface_hub not installed: {e}")
+            raise HTTPException(503, f"huggingface_hub not installed: {e}") from e
         except ManifoldHFError as e:
-            raise HTTPException(502, str(e))
+            raise HTTPException(502, str(e)) from e
         # ``limit`` defaults to the search cap; callers can request
         # fewer rows for narrow pickers but the server still respects
         # the cap when ``limit`` is omitted or oversized.
@@ -569,13 +571,13 @@ def register_manifold_routes(app: FastAPI) -> None:
                     force=req.force,
                 )
             except FileExistsError as e:
-                raise HTTPException(409, str(e))
+                raise HTTPException(409, str(e)) from e
             except FileNotFoundError as e:
-                raise HTTPException(404, str(e))
+                raise HTTPException(404, str(e)) from e
             except ManifoldFormatError as e:
-                raise HTTPException(400, str(e))
+                raise HTTPException(400, str(e)) from e
             except ValueError as e:
-                raise HTTPException(400, str(e))
+                raise HTTPException(400, str(e)) from e
             # Evict any cached in-memory ``Manifold`` for the merged
             # target — paranoia in case the user is merging-over an
             # existing folder with the same name (force=True path).
@@ -606,15 +608,15 @@ def register_manifold_routes(app: FastAPI) -> None:
                     force=req.force,
                 )
             except ManifoldInstallConflict as e:
-                raise HTTPException(409, str(e))
+                raise HTTPException(409, str(e)) from e
             except FileNotFoundError as e:
-                raise HTTPException(404, str(e))
+                raise HTTPException(404, str(e)) from e
             except ValueError as e:
-                raise HTTPException(400, str(e))
+                raise HTTPException(400, str(e)) from e
             except ImportError as e:
-                raise HTTPException(503, f"huggingface_hub not installed: {e}")
+                raise HTTPException(503, f"huggingface_hub not installed: {e}") from e
             except ManifoldHFError as e:
-                raise HTTPException(502, str(e))
+                raise HTTPException(502, str(e)) from e
 
         # The just-installed folder lives at ``manifolds/<ns>/<name>/`` —
         # derive namespace/name from the resolved path so the response
@@ -666,7 +668,7 @@ def register_manifold_routes(app: FastAPI) -> None:
                     node_kinds=node_kinds_map,
                 )
             except ManifoldFormatError as e:
-                raise HTTPException(400, str(e))
+                raise HTTPException(400, str(e)) from e
             for concept in plan.pending:
                 gen_roles: dict[str, str | None] | None = (
                     {concept: concept} if node_roles_map else None
@@ -711,7 +713,7 @@ def register_manifold_routes(app: FastAPI) -> None:
             try:
                 return await asyncio.to_thread(_gen, lambda _msg: None)
             except ValueError as e:
-                raise HTTPException(400, str(e))
+                raise HTTPException(400, str(e)) from e
 
     @app.patch("/saklas/v1/manifolds/{namespace}/{name}")
     async def update_manifold(
@@ -745,7 +747,7 @@ def register_manifold_routes(app: FastAPI) -> None:
                     nodes=nodes,
                 )
             except ManifoldFormatError as e:
-                raise HTTPException(400, str(e))
+                raise HTTPException(400, str(e)) from e
             _evict_manifold(session, namespace, name)
         ns, mf = _find_manifold(namespace, name)
         return _manifold_json(ns, mf, session, full=True)
@@ -783,7 +785,7 @@ def register_manifold_routes(app: FastAPI) -> None:
             except FileNotFoundError as e:
                 # Lost a race with another delete between the pre-lock
                 # existence check and acquiring the lock.
-                raise HTTPException(404, str(e))
+                raise HTTPException(404, str(e)) from e
 
     @app.post("/saklas/v1/manifolds/{namespace}/{name}/fit")
     async def fit_manifold(
@@ -810,7 +812,7 @@ def register_manifold_routes(app: FastAPI) -> None:
             try:
                 pre_mf = ManifoldFolder.load(folder)
             except ManifoldFormatError as e:
-                raise HTTPException(400, str(e))
+                raise HTTPException(400, str(e)) from e
             if not pre_mf.is_discover and (
                 req.fit_mode is not None or req.hyperparams is not None
             ):
@@ -881,6 +883,6 @@ def register_manifold_routes(app: FastAPI) -> None:
             try:
                 return await asyncio.to_thread(_fit, lambda _msg: None)
             except ConcurrentExtractionError as e:
-                raise HTTPException(409, str(e))
+                raise HTTPException(409, str(e)) from e
             except (ValueError, ManifoldFormatError) as e:
-                raise HTTPException(400, str(e))
+                raise HTTPException(400, str(e)) from e

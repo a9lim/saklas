@@ -68,9 +68,9 @@ def register_manifold_probe_routes(app: FastAPI) -> None:
                 req.selector, as_name=req.name, top_n=top_n,
             )
         except FileNotFoundError as e:
-            raise HTTPException(404, str(e))
+            raise HTTPException(404, str(e)) from e
         except ValueError as e:
-            raise HTTPException(400, str(e))
+            raise HTTPException(400, str(e)) from e
         attached = session.manifold_monitor.attached_probes()
         probe = attached.get(registered_name)
         if probe is None:

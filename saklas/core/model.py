@@ -611,7 +611,8 @@ def load_model(
     if quantize and device != "cuda":
         warnings.warn(
             f"bitsandbytes quantization ({quantize}) requires CUDA. "
-            f"Ignoring --quantize on {device}, loading in {resolved_dtype}."
+            f"Ignoring --quantize on {device}, loading in {resolved_dtype}.",
+            stacklevel=2,
         )
         quantize = None
 

@@ -123,7 +123,7 @@ def _export_gguf_manifold(
             raise RuntimeError(
                 f"{ns}/{name}: manifold does not fold to a single steering "
                 f"direction (not a 2-node affine subspace): {e}"
-            )
+            ) from e
         hint = model_hint or _resolve_model_hint(sid)
         if out_path is None:
             dest = mdir / f"{sid}.gguf"

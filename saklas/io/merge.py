@@ -147,7 +147,7 @@ def _resolve_component(
         raise MergeError(
             f"component {coord} is a manifold that does not fold to a single "
             f"steering direction (not a 2-node affine subspace): {e}"
-        )
+        ) from e
     return folded, mpath
 
 

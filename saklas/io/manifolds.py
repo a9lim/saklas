@@ -668,7 +668,7 @@ class ManifoldFolder:
         # Every node file must be present — except for a baked manifold,
         # which has no ``nodes/`` corpus at all (its geometry is the tensor).
         if fit_mode != "baked":
-            for idx, label in enumerate(node_labels):
+            for idx, _label in enumerate(node_labels):
                 p = inst.node_path(idx)
                 if not p.exists():
                     raise ManifoldFormatError(

@@ -855,7 +855,7 @@ def register_saklas_routes(app: FastAPI) -> None:
         try:
             transcript = Transcript.from_yaml(req.yaml)
         except TranscriptFormatError as e:
-            raise HTTPException(400, f"invalid transcript: {e}")
+            raise HTTPException(400, f"invalid transcript: {e}") from e
         import warnings
 
         captured: list[str] = []
@@ -881,7 +881,7 @@ def register_saklas_routes(app: FastAPI) -> None:
                         strict=req.strict,
                     )
                 except TranscriptError as e:
-                    raise HTTPException(400, str(e))
+                    raise HTTPException(400, str(e)) from e
         return {
             "leaf_id": leaf_id,
             "rev": session.tree.rev,
@@ -929,7 +929,7 @@ def register_saklas_routes(app: FastAPI) -> None:
         try:
             matches = session.tree.filter_by_expr(text)
         except FilterParseError as e:
-            raise HTTPException(400, str(e))
+            raise HTTPException(400, str(e)) from e
         return {"expr": text, "matching_node_ids": sorted(matches)}
 
     @app.post("/saklas/v1/sessions/{session_id}/tree/diff")
@@ -1247,8 +1247,8 @@ def register_saklas_routes(app: FastAPI) -> None:
         _resolve_session_id(session, session_id)
         try:
             profile = session.load_profile(req.source_path)
-        except FileNotFoundError:
-            raise HTTPException(400, f"file not found: {req.source_path}")
+        except FileNotFoundError as e:
+            raise HTTPException(400, f"file not found: {req.source_path}") from e
         session.steer(req.name, profile)
         return _profile_to_json(req.name, profile)
 

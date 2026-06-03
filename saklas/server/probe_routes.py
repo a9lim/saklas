@@ -37,7 +37,7 @@ def register_probe_routes(app: FastAPI) -> None:
         try:
             session.probe(name)
         except (KeyError, ValueError, FileNotFoundError) as e:
-            raise HTTPException(400, f"probe '{name}' not available: {e}")
+            raise HTTPException(400, f"probe '{name}' not available: {e}") from e
         return Response(status_code=204)
 
     @app.delete("/saklas/v1/sessions/{session_id}/probes/{name}", status_code=204)

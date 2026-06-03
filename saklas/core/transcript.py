@@ -220,11 +220,11 @@ class Transcript:
     def from_yaml(cls, text: str) -> "Transcript":
         try:
             import yaml
-        except ImportError:  # pragma: no cover
+        except ImportError as e:  # pragma: no cover
             raise TranscriptFormatError(
                 "pyyaml required to load transcripts (install with "
                 "`pip install pyyaml`)"
-            )
+            ) from e
         try:
             data = yaml.safe_load(text)
         except Exception as e:

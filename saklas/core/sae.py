@@ -119,11 +119,11 @@ def load_sae_backend(
 
     try:
         import sae_lens
-    except ImportError:
+    except ImportError as e:
         raise SaeBackendImportError(
             f"requested SAE release '{release}' but `sae_lens` is not "
             f"installed. Install with `pip install -e \".[sae]\"`."
-        )
+        ) from e
     if sae_lens is None:
         # Tests (and some environments) may None-shadow the module.
         raise SaeBackendImportError(

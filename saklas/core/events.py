@@ -105,4 +105,5 @@ class EventBus:
                 warnings.warn(
                     f"event subscriber {type(cb).__name__} raised during emit",
                     RuntimeWarning,
+                    stacklevel=2,
                 )

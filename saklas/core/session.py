@@ -572,11 +572,11 @@ class SaklasSession:
         )
 
         cg_supported = False
-        cg_reason: str | None = None
+        _cg_reason: str | None = None
         device_obj = next(model.parameters()).device
         if cuda_graphs:
             from saklas.core.cuda_graphs import is_cuda_graphs_supported
-            cg_supported, cg_reason = is_cuda_graphs_supported(
+            cg_supported, _cg_reason = is_cuda_graphs_supported(
                 model, device_obj,
             )
 
@@ -2051,7 +2051,7 @@ class SaklasSession:
             raise VectorNotRegisteredError(
                 f"'{name}' is a manifold that does not fold to a single "
                 f"steering direction (not a 2-node affine subspace): {e}"
-            )
+            ) from e
 
     def _port_stale_legacy_vector(
         self, canonical: str,

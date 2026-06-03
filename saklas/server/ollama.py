@@ -599,8 +599,10 @@ def register_ollama_routes(app: FastAPI) -> None:
         try:
             async with session.lock:
                 result = session.generate(input_payload, raw=raw, **gen_kwargs)
-        except ConcurrentGenerationError:
-            raise HTTPException(status_code=409, detail="Generation already in progress")
+        except ConcurrentGenerationError as e:
+            raise HTTPException(
+                status_code=409, detail="Generation already in progress",
+            ) from e
         elapsed_ns = time.monotonic_ns() - start_ns
 
         model_name = str(body.get("model") or session.model_id)
