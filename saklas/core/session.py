@@ -519,7 +519,8 @@ class SaklasSession:
         per Dang & Ngo (2026) Eq. 9 drops layers where pos- and
         neg-class means project to the same side of the neutral
         baseline along ``d̂``.  Replaces the v2.0–v2.1 ``edge_drop``
-        heuristic (gone in v2.1); ``--legacy`` flips this to ``False``.
+        heuristic (gone in v2.1); pass ``dls=False`` (CLI ``--no-dls``)
+        to opt out.
 
         ``compile`` (default ``False``) opts in to ``torch.compile`` on
         CUDA — kernel fusion via inductor, typically 1.2–3× decode
