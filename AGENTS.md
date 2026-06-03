@@ -210,9 +210,18 @@ assistant: response]` pairs in **standard-assistant space**. The corpus is a
 (`saklas/data/baseline_prompts.json`, 64 prompts; length must be a multiple of
 `k`). `kind` is recorded per node (generation-time provenance; the fit never
 consumes it). `--role`/`role=` opts into a persona-baselined fit (the explicit
-role overrides the kind-derived label at both generation and capture). **Bipolar
-only:** a monopolar concept (`baseline=None`, a 1-node-vs-neutral fit) is deferred
-and raises `NotImplementedError`.
+role overrides the kind-derived label at both generation and capture). A
+**monopolar** concept (`baseline=None`) authors a genuinely **1-node** `pca`
+folder. The pipeline recognizes the single-node shape (a flat `pca` fit otherwise
+needs `k+1 ≥ 2` poised nodes) and folds `concept − ν` — ν = the model's neutral
+activation mean (`layer_means`) — into a 1-node neutral-anchored ray via
+`fold_directions_to_subspace` (the same primitive `subspace merge` uses): no
+discover-coords, no DLS, no synthetic second node. Neutral is the **implicit**
+negative pole, sourced per-model at fit (never a stored corpus); `concept − ν`
+already cancels common-mode like DiM, so the raw δ̂ basis is appropriate.
+`0.5 <concept>` steers neutral → concept, resolving through the bare-label tier
+exactly like a bipolar pole. The fit needs ν available (`layer_means`); when the
+neutral corpus is stale it raises the same prerequisite the whitener does.
 
 The per-layer fit derives the basis by **μ-centered PCA**; at K=2 the sole axis is
 exactly the unit difference-of-means `δ̂` (PCA@2 ≡ DiM). The fitted manifold stores
@@ -540,11 +549,14 @@ Unsupported (mapped to `None`, `apply_with_role` raises
 
 ## Bundled concepts
 
-26 curated concepts, each shipped as a 2-node `pca` manifold under
-`saklas/data/manifolds/<concept>/` — 24 bipolar + 2 monopolar (`agentic`,
-`manipulative`). Under 4.0 / A2 each pole's corpus is conversational responses to
-the shared baseline prompts; the 2 monopolar concepts await the deferred
-1-node-vs-neutral fit (monopolar `extract` currently raises). The pre-4.0
+26 curated concepts under `saklas/data/manifolds/<concept>/` — 24 bipolar
+(2-node `pca`) + 2 monopolar (`agentic`, `manipulative`). Under 4.0 / A2 each
+pole's corpus is conversational responses to the shared baseline prompts.
+Monopolar `extract` is now implemented as a genuine **1-node** fold against the
+neutral mean ν (see "Extraction"), so a fresh `extract("agentic")` authors a
+1-node ray. The *bundled* `agentic`/`manipulative` still ship with their pre-4.0
+explicit 2-node `_neg` corpora; re-authoring them as 1-node + A2 is part of the
+bundled-regeneration TODO. The pre-4.0
 `scripts/regenerate_bundled_statements.py` (which held the authoritative manifest)
 is removed; the manifest is recoverable from git history and a 4.0 bipolar-concept
 regeneration script is a TODO (the persona + cultural/register discover scripts are

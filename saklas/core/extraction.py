@@ -307,6 +307,92 @@ class ManifoldExtractionPipeline:
                 role=role, model_type=model_type,
             ))
 
+        # 1b. Monopolar (concept-vs-neutral).  A 1-node ``pca`` folder has no
+        #     second pole to span an affine subspace, so it can only mean one
+        #     thing: the concept against the **neutral baseline**.  Its steering
+        #     direction is the displacement of the single concept centroid from
+        #     the model's neutral activation mean ν (``layer_means``) — sourced
+        #     fresh per model, never a stored corpus — folded into a 1-node
+        #     neutral-anchored ray via :func:`fold_directions_to_subspace` (the
+        #     same primitive ``merge`` uses).  No discover-coords, no DLS, no
+        #     synthetic second node; ``concept − ν`` already cancels common-mode
+        #     like DiM, so the raw δ̂ basis is appropriate.  The engine
+        #     recognizes the shape structurally (a flat ``pca`` fit otherwise
+        #     needs ``k + 1 ≥ 2`` poised nodes).
+        if mf.fit_mode == "pca" and K == 1:
+            from saklas.core.vectors import fold_directions_to_subspace
+            means = getattr(self._handle, "layer_means", None) or {}
+            if not means:
+                raise ValueError(
+                    f"monopolar manifold {mf.name!r} (a 1-node concept-vs-"
+                    f"neutral fit) needs the model's neutral activation mean "
+                    f"(layer_means) as its negative pole, but none is "
+                    f"available; regenerate the neutral corpus so layer_means "
+                    f"can build"
+                )
+            _wh = getattr(self._handle, "whitener", None)
+            maha = (
+                _wh if _wh is not None and _wh.covers_all(fit_layers) else None
+            )
+            concept_label = node_groups[0][0]
+            directions: dict[int, torch.Tensor] = {}
+            for idx in fit_layers:
+                nu = means.get(idx)
+                if nu is None:
+                    continue  # no neutral anchor at this layer → can't fold it
+                c = per_node[0][idx].to(torch.float32).reshape(-1)
+                if sae_backend is not None:
+                    with torch.no_grad():
+                        feat = sae_backend.encode_layer(
+                            idx, c.reshape(1, -1).to(device),
+                        )
+                        c = sae_backend.decode_layer(idx, feat).detach().to(
+                            "cpu", torch.float32,
+                        ).reshape(-1)
+                directions[idx] = c - nu.to(torch.float32).reshape(-1)
+            _progress(
+                f"Folding monopolar '{concept_label}' − neutral across "
+                f"{len(directions)} layers..."
+            )
+            manifold = fold_directions_to_subspace(
+                mf.name, directions, means, whitener=maha,
+                label=concept_label, feature_space=feature_space,
+            )
+            # Carry the per-node role/kind onto the fitted ray so steer-time
+            # role substitution (``nearest_node_role``) and provenance work; the
+            # fold primitive itself is role-agnostic.
+            manifold.node_roles = list(node_roles)
+            manifold.node_kinds = list(node_kinds)
+            metadata: dict[str, Any] = {
+                "method": (
+                    "manifold_monopolar_sae" if sae_backend is not None
+                    else "manifold_monopolar"
+                ),
+                "nodes_sha256": nodes_sha,
+                "monopolar": True,
+                # The fold keeps the raw δ̂ basis (``concept − ν`` cancels
+                # common-mode like DiM), so the subspace is Euclidean; only the
+                # share is whitened when the whitener covers the layers.
+                "share_metric": manifold.metadata.get(
+                    "share_metric", "euclidean",
+                ),
+                "subspace_metric": "euclidean",
+            }
+            if sae_backend is not None:
+                metadata["sae_release"] = sae_backend.release
+                metadata["sae_revision"] = sae_backend.revision
+            if any_role:
+                metadata["node_roles"] = list(node_roles)
+            if any_kind:
+                metadata["node_kinds"] = list(node_kinds)
+            save_manifold(manifold, tensor_path, metadata)
+            manifold.metadata.update(metadata)
+            mf.write_metadata()
+            self._events.emit(ManifoldExtracted(
+                name=mf.name, manifold=manifold, metadata=metadata,
+            ))
+            return manifold
+
         # 2. Layer set is already resolved above (fail-fast SAE coverage).
         # No DLS analogue here on purpose: manifolds have no pos/neg
         # polarity, so Dang & Ngo's opposite-sign discriminative test is

@@ -175,15 +175,24 @@ one fp32 mean per layer.
 `session.extract(concept, baseline, *, kind="abstract")`:
 
 1. Splits the composite (`angry.calm` → pos `angry`, neg `calm`). A **monopolar**
-   concept (`baseline=None`, a 1-node-vs-neutral fit) is deferred in 4.0 and raises
-   `NotImplementedError` — bipolar only.
-2. Generates the two pole corpora via `generate_responses` (§3.10) — in-character
+   concept (`baseline=None`) authors a genuinely **1-node** folder; the engine
+   recognizes the single-node `pca` shape and fits it against the model's neutral
+   mean ν (`layer_means`) as the implicit negative pole — folding `concept − ν`
+   into a 1-node neutral-anchored ray (step 3a below). Neutral is sourced per-model
+   at fit, never a stored corpus.
+2. Generates the pole corpora via `generate_responses` (§3.10) — in-character
    responses to the shared baseline prompts, one corpus per pole — unless a cached
-   folder exists.
+   folder exists. Monopolar generates only the concept pole.
 3. Authors a discover-`pca` folder via `create_discover_manifold_folder` with
-   `node_corpora = {pos_label: [...], neg_label: [...]}`, `node_kinds`, and
-   `hyperparams = {"max_dim": 1, "var_threshold": 0.7}` — so the derived intrinsic
-   dim is 1 and the fit is a rank-1 flat subspace.
+   `node_corpora = {pos_label: [...], neg_label: [...]}` (one entry for monopolar),
+   `node_kinds`, and `hyperparams = {"max_dim": 1, "var_threshold": 0.7}` — so a
+   bipolar fit is a rank-1 flat subspace.
+   - **3a (monopolar).** When the folder is a single `pca` node, the pipeline takes
+     an early branch: pool the one concept centroid, compute `concept − ν` per
+     layer, and `fold_directions_to_subspace` it into a 1-node ray (raw δ̂ basis,
+     whitened share when the whitener covers the layers) — no discover-coords, no
+     per-layer PCA, no DLS. The bare-label tier resolves `0.5 <concept>` to this
+     node, so it steers exactly like a bipolar pole.
 4. Fits via `ManifoldExtractionPipeline` and returns `(canonical_name,
    folded_vector_directions(manifold))`.
 

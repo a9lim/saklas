@@ -104,6 +104,12 @@ role=node_role, model_type=)`), threading the folder's `node_kinds` /
   per-layer `node_coords`), per-axis DLS straddle across all fit layers
   (`compute_dls_axes` → `select_axes`), then the μ-centered `subspace_share` bake.
   `anchor_origin` (pca only) shifts coords so a named node lands at 0.
+- **monopolar** (a `pca` folder with `K == 1`): a structural early branch — a
+  1-node flat fit is meaningless (needs `k+1 ≥ 2` poised nodes), so the engine
+  reads it as concept-vs-neutral. Folds `concept − ν` (ν = `handle.layer_means`)
+  into a 1-node neutral-anchored ray via `fold_directions_to_subspace` (raw δ̂
+  basis, whitened share when `covers_all`), bypassing discover-coords / per-layer
+  pca / DLS entirely; `method = "manifold_monopolar"`. Raises if ν is unavailable.
 - **`authored`/`spectral`** (curved): per layer `fit_layer_subspace` (PCA frame +
   RBF surface), μ-centered share bake, and a per-layer `origin`
   (`invert_parameterization` of the neutral mean — curved only; flat's foot is
@@ -322,19 +328,20 @@ Conversational-elicitation helpers `_KIND_TEMPLATES` / `_article` / `_system_for
 (the per-kind system prompt) / `_role_for` (the swapped assistant-role label:
 abstract → `someone_{slug}`, concrete → `{slug}`) author each node's corpus.
 
-`extract(concept, baseline, *, kind="abstract", ...)` is **bipolar-only** (2
-nodes): it authors a 2-node discover-`pca` manifold
-(`create_discover_manifold_folder`, `hyperparams={"max_dim": 1}`) and fits it via
-`ManifoldExtractionPipeline`, returning `(canonical_name,
-folded_vector_directions(manifold))`. The corpus is generated conversationally —
-`generate_responses(concepts, kinds, *, roles=None, samples_per_prompt=1, …)` has
-each pole answer the shared baseline prompts *in character*, the concept riding
-both the system prompt (`_system_for`) and the swapped assistant-role label
-(`_role_for`); responses are emitted samples-outer / prompts-inner so
-`response[i] ↔ prompt[i % k]`. **Monopolar** (`baseline=None`) is deferred in this
-4.0 build — raises `NotImplementedError` (pass an explicit negative pole).
-`generate_neutral_responses` is the neutral-corpus sibling (no system, standard
-label). `extract_vector_from_corpora(..., kind=...)` is the corpus-in sibling
+`extract(concept, baseline, *, kind="abstract", ...)` authors a 2-node
+discover-`pca` manifold (`create_discover_manifold_folder`,
+`hyperparams={"max_dim": 1}`) and fits it via `ManifoldExtractionPipeline`,
+returning `(canonical_name, folded_vector_directions(manifold))`. The corpus is
+generated conversationally — `generate_responses(concepts, kinds, *, roles=None,
+samples_per_prompt=1, …)` has each pole answer the shared baseline prompts *in
+character*, the concept riding both the system prompt (`_system_for`) and the
+swapped assistant-role label (`_role_for`); responses are emitted samples-outer /
+prompts-inner so `response[i] ↔ prompt[i % k]`. **Bipolar** (`baseline` set)
+authors a 2-node folder and generates both poles. **Monopolar** (`baseline=None`)
+authors a genuinely **1-node** folder (only the concept pole is generated); the
+pipeline folds `concept − ν` into a 1-node neutral-anchored ray (see
+`extraction.py`), neutral implicit via `layer_means`. `generate_neutral_responses`
+is the neutral-corpus sibling (no system, standard label). `extract_vector_from_corpora(..., kind=...)` is the corpus-in sibling
 (hand-authored pairs skip generation; corpora pooled conversationally, each length
 a multiple of the baseline prompt set); `extract_manifold(folder)` is the
 multi-node delegate that returns a `Manifold`. All gate against `GenState.IDLE`
