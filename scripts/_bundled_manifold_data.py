@@ -4,7 +4,10 @@ from __future__ import annotations
 import json
 from importlib import resources
 from importlib.resources.abc import Traversable
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from saklas import Profile, SaklasSession
 
 
 def _read_json(path: Traversable) -> Any:
@@ -78,3 +81,17 @@ def load_bipolar_manifold_pairs(concept: str) -> tuple[list[str], list[dict[str,
         for pos, neg in zip(positive, negative, strict=True)
     ]
     return scenarios, pairs
+
+
+def load_folded_bundled_profile(
+    session: "SaklasSession",
+    selector: str = "default/happy.sad",
+) -> "Profile":
+    """Resolve a fitted bundled 2-node manifold to the session's Profile view."""
+    # These scripts are diagnostics, and already use private capture helpers.
+    # This private call is the current manifold-first resolution path.
+    session._ensure_profile_registered(selector)
+    try:
+        return session.vectors[selector]
+    except KeyError as e:  # pragma: no cover - defensive if internals drift
+        raise RuntimeError(f"folded profile {selector!r} was not registered") from e

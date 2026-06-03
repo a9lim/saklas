@@ -45,7 +45,10 @@ import torch
 
 from saklas import SamplingConfig, SaklasSession
 from saklas.core.vectors import compute_dls_mask
-from _bundled_manifold_data import load_bundled_manifold_scenarios
+from _bundled_manifold_data import (
+    load_bundled_manifold_scenarios,
+    load_folded_bundled_profile,
+)
 
 
 MODEL_ID = "google/gemma-4-31b-it"
@@ -286,8 +289,8 @@ def main() -> None:
     session = SaklasSession.from_pretrained(MODEL_ID, device="auto")
 
     # --- prefill side ------------------------------------------------------
-    print("\n=== prefill extraction (DiM on bundled happy.sad pairs) ===")
-    _, prefill_profile = session.extract("default/happy.sad")
+    print("\n=== prefill profile (folded bundled happy.sad) ===")
+    prefill_profile = load_folded_bundled_profile(session, "default/happy.sad")
     prefill_dirs: dict[int, torch.Tensor] = {
         L: t.float().cpu() for L, t in prefill_profile.items()
     }

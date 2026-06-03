@@ -52,7 +52,10 @@ import torch
 
 from saklas import Profile, SamplingConfig, SaklasSession
 from saklas.core.vectors import compute_dls_mask
-from _bundled_manifold_data import load_bundled_manifold_scenarios
+from _bundled_manifold_data import (
+    load_bundled_manifold_scenarios,
+    load_folded_bundled_profile,
+)
 
 
 MODEL_ID = "google/gemma-4-31b-it"
@@ -364,9 +367,9 @@ def main() -> None:
     print(f"loading model {MODEL_ID}")
     session = SaklasSession.from_pretrained(MODEL_ID, device="auto")
 
-    # --- prefill profile (cache hit) ------------------------------------
-    print("\n=== prefill extraction (bundled happy.sad) ===")
-    _, prefill_prof = session.extract("default/happy.sad")
+    # --- prefill profile (folded bundled manifold) ----------------------
+    print("\n=== prefill profile (folded bundled happy.sad) ===")
+    prefill_prof = load_folded_bundled_profile(session, "default/happy.sad")
     print(f"  prefill profile: {len(prefill_prof)} layers")
 
     # --- generation profile (fresh capture pass) ------------------------
