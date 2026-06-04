@@ -767,6 +767,28 @@ def load_model(
     model.requires_grad_(False)
     model.train(False)
 
+    # --- reconcile the chat stop-token set -------------------------------
+    # A multimodal checkpoint's *text* sub-config can under-specify the
+    # end-of-turn tokens its chat template actually emits.  Gemma-4 is the
+    # live case: the composite config lists ``eos_token_id = [<eos>, <turn|>]``
+    # but the extracted ``gemma4_unified_text`` sub-config (what
+    # ``_load_text_from_multimodal`` builds from via ``from_config``) carries
+    # only ``<eos>``, so the loaded model's ``generation_config`` claims the
+    # sole stop token is ``<eos>`` while the model ends every turn with
+    # ``<turn|>``.  HF ``model.generate`` (the native-generate corpus path,
+    # ``session._run_generator``) reads ``generation_config.eos_token_id``, so
+    # without this it runs past every ``<turn|>`` to ``max_new_tokens`` — the
+    # model loops and leaks reasoning-channel name tokens (``thought``) that
+    # ``skip_special_tokens`` can't strip.  ``_get_eos_ids`` is the
+    # chat-correct set (config eos ∪ tokenizer eos ∪ the template's added
+    # end-of-turn tokens) and is exactly what the steered loop already stops
+    # on, so adopting it as the generation default unifies both paths.
+    from saklas.core.generation import _get_eos_ids
+    chat_eos = sorted(_get_eos_ids(model, tokenizer))
+    gen_cfg = getattr(model, "generation_config", None)
+    if chat_eos and gen_cfg is not None:
+        gen_cfg.eos_token_id = chat_eos if len(chat_eos) > 1 else chat_eos[0]
+
     # --- memory report ---
     mem_gb = _get_memory_gb(device)
     if mem_gb > 0:
