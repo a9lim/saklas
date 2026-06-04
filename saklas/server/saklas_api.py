@@ -444,11 +444,31 @@ def _extract_registry_name(canonical: str, namespace: str | None) -> str:
     return f"{namespace}/{canonical}"
 
 
+def _probe_profile_tensors(
+    session: SaklasSession, name: str,
+) -> dict[int, Any] | None:
+    """Folded per-layer direction view of a vector probe, or ``None``.
+
+    The monitor now holds each vector probe as a flat 2-node
+    :class:`~saklas.core.manifold.Manifold` (``session._monitor.manifolds``);
+    the legacy ``monitor.profiles`` baked-``dict[int, Tensor]`` accessor is
+    gone.  This folds the named probe's manifold back to the same
+    ``{L: δ̂_L · share_L}`` baked-direction view callers used to read off
+    ``profiles`` (whitened-cosine matrices, the diagnostics histogram), so
+    the wire shape those routes emit is unchanged.
+    """
+    manifold = session._monitor.manifolds.get(name)
+    if manifold is None:
+        return None
+    from saklas.core.vectors import folded_vector_directions
+
+    return folded_vector_directions(manifold)
+
+
 def _probe_info(session: SaklasSession, name: str) -> dict[str, Any]:
     layers: list[int] = []
     try:
-        profiles = session._monitor.profiles
-        prof = profiles.get(name)
+        prof = _probe_profile_tensors(session, name)
         if prof is not None:
             layers = sorted(prof.keys())
     except Exception:
@@ -1153,11 +1173,10 @@ def register_saklas_routes(app: FastAPI) -> None:
 
         pool: dict[str, "Profile"] = dict(session.vectors)
         try:
-            probe_profiles = session._monitor.profiles
             for probe_name in session._monitor.probe_names:
                 if probe_name in pool:
                     continue
-                tensors = probe_profiles.get(probe_name)
+                tensors = _probe_profile_tensors(session, probe_name)
                 if tensors is None:
                     continue
                 pool[probe_name] = Profile(tensors)
@@ -1282,11 +1301,10 @@ def register_saklas_routes(app: FastAPI) -> None:
         # call works for either source.
         pool: dict[str, "Profile"] = dict(session.vectors)
         try:
-            probe_profiles = session._monitor.profiles
             for probe_name in session._monitor.probe_names:
                 if probe_name in pool:
                     continue
-                tensors = probe_profiles.get(probe_name)
+                tensors = _probe_profile_tensors(session, probe_name)
                 if tensors is None:
                     continue
                 pool[probe_name] = Profile(tensors)
@@ -1480,15 +1498,18 @@ def register_saklas_routes(app: FastAPI) -> None:
         from saklas.core.histogram import HIST_BUCKETS, bucketize
 
         _resolve_session_id(session, session_id)
-        # Probes and steering vectors share the Profile shape but live in
-        # different registries — session.vectors holds steering profiles,
-        # session._monitor.profiles holds probe profiles.  The diagnostics
-        # endpoint serves either; the layer-norms drawer overlay in the
-        # web UI hits this for every selected name (vector or probe).
+        # Probes and steering vectors share the per-layer ``dict[int,
+        # Tensor]`` direction shape but live in different registries —
+        # session.vectors holds steering profiles; a vector probe lives as a
+        # flat manifold in ``session._monitor`` and folds back to the same
+        # baked-direction view via ``_probe_profile_tensors``.  The
+        # diagnostics endpoint serves either; the layer-norms drawer overlay
+        # in the web UI hits this for every selected name (vector or probe).
         profile = session.vectors.get(name)
         if profile is None:
             try:
-                profile = session._monitor.profiles.get(name)
+                folded = _probe_profile_tensors(session, name)
+                profile = Profile(folded) if folded is not None else None
             except Exception:
                 profile = None
         if profile is None:
@@ -1506,8 +1527,8 @@ def register_saklas_routes(app: FastAPI) -> None:
             for lo, hi, mag in buckets
         ]
 
-        # ``diagnostics`` is a Profile attribute; probe profiles are raw
-        # ``dict[int, Tensor]`` and don't carry it.  ``getattr`` covers both.
+        # ``diagnostics`` is a Profile attribute; a probe folded from its
+        # manifold carries no ``diagnostics`` block.  ``getattr`` covers both.
         diagnostics = getattr(profile, "diagnostics", None)
         # ``total_layers`` is the *model's* layer count, not the profile's
         # — the layer-norms drawer in the web UI fills layers absent from

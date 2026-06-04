@@ -647,9 +647,10 @@ def _split_variant_suffix(raw: str) -> tuple[str, str | None]:
     if ":" not in raw:
         return raw, None
     head, _, tail = raw.rpartition(":")
-    if _VARIANT_SUFFIX_RE.match(tail) and head and "/" not in tail:
-        # Guard against ``model:<org>/<name>`` where the ``/`` lives in
-        # the right half of the final ``:``.
+    if _VARIANT_SUFFIX_RE.match(tail) and head:
+        # ``_VARIANT_SUFFIX_RE`` is anchored over ``[a-z0-9._-]`` only, so a
+        # matching ``tail`` can't contain ``/`` — ``model:<org>/<name>`` falls
+        # through to ``return raw, None`` because its tail fails the regex.
         return head, tail
     return raw, None
 
@@ -1248,6 +1249,8 @@ def _run_manifold_show(args: argparse.Namespace) -> None:
             entry["hyperparams"] = sc.hyperparams
         if sc.diagnostics:
             entry["diagnostics"] = sc.diagnostics
+        if sc.node_spread_per_layer:
+            entry["node_spread"] = sc.node_spread_per_layer
         fitted.append(entry)
 
     # In discover mode the folder itself has no per-node coords (they are
@@ -1351,6 +1354,18 @@ def _run_manifold_show(args: argparse.Namespace) -> None:
                     f"{k}={v}" for k, v in sorted(f["hyperparams"].items())
                 )
                 print(f"      hyperparams: {hp}")
+            # Concept layer profile: the whitened between-node spread per layer
+            # (background-σ² units).  Report the peak layers — where this
+            # concept's signal concentrates across the stack.
+            spread = f.get("node_spread") or {}
+            if spread:
+                ranked = sorted(
+                    ((int(layer), float(v)) for layer, v in spread.items()),
+                    key=lambda kv: kv[1],
+                    reverse=True,
+                )
+                peak = ", ".join(f"L{layer}={v:.2f}" for layer, v in ranked[:5])
+                print(f"      signal by layer (peak): {peak}")
     else:
         hint = (
             "discover" if mf.is_discover else "fit"
@@ -1470,7 +1485,9 @@ def _run_manifold_discover(args: argparse.Namespace) -> None:
         new_hyperparams["k_nn"] = int(args.k_nn)
     if args.bandwidth is not None:
         new_hyperparams["bandwidth"] = float(args.bandwidth)
-    # Shared knob (applies to both PCA and spectral fits).
+    # Spectral-only knob — dropped by ``_sanitize_hyperparams`` below for a
+    # pca fit (a flat fit's per-layer subspace dim is its layout dim, capped
+    # by ``--max-dim``, not a separate knob).
     if getattr(args, "max_subspace_dim", None) is not None:
         new_hyperparams["max_subspace_dim"] = int(args.max_subspace_dim)
     # Cross-method knobs that don't apply get dropped — silently

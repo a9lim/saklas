@@ -1808,45 +1808,64 @@ class SpectralDiagnostics:
 
 
 def derive_pca_coords(
-    centroids: torch.Tensor,
+    gram: torch.Tensor,
     *,
     max_dim: int = 8,
     var_threshold: float = 0.70,
 ) -> tuple[torch.Tensor, PcaDiagnostics]:
-    """Derive node coordinates from centroid PCA.
+    """Derive node coordinates from the eigendecomposition of a centroid Gram.
 
-    ``centroids`` is ``(K, D)`` — one per-node mean activation in the
-    chosen reference layer.  Returns ``(coords, diagnostics)`` where
-    ``coords`` is ``(K, k)`` and ``k`` is the smallest prefix whose
-    cumulative variance crosses ``var_threshold``, capped at
-    ``max_dim`` and floored at 1.
+    ``gram`` is the ``(K, K)`` symmetric-PSD Gram of the K node centroids.
+    For a single layer it is ``X̃ X̃ᵀ`` (``X̃`` = node-mean-centered
+    centroids), whose eigendecomposition is exactly the PCA of those
+    centroids — eigenvalues are the component variances, eigenvectors
+    scaled by ``√λ`` are the PCA scores ``U S``.  For the layer-agnostic
+    fit it is the **signal-weighted consensus** Gram
+    ``mean_L X̃_L Σ_L⁻¹ X̃_Lᵀ`` (whitened, averaged over every fit layer):
+    the ``(K, K)`` Gram is the layer-invariant object, so averaging it is
+    what lets the coordinate layout draw on all layers at once instead of
+    one arbitrary reference layer.  A layer where the nodes aren't
+    separated contributes a near-zero whitened Gram, so it drops out of
+    the average on its own — no need to pick a layer band.
 
-    Reproduces the flat-subspace layout a user would author themselves
-    once they knew the answer.  Pure tensor, fp32, dependency-free.
+    Returns ``(coords, diagnostics)`` where ``coords`` is ``(K, k)`` and
+    ``k`` is the smallest prefix whose cumulative variance crosses
+    ``var_threshold``, capped at ``max_dim`` and floored at 1.
+
+    Pure tensor, fp32, dependency-free.
     """
-    centroids = centroids.to(torch.float32)
-    K = centroids.shape[0]
+    gram = gram.to(torch.float32)
+    K = gram.shape[0]
+    if gram.dim() != 2 or gram.shape[1] != K:
+        raise ValueError(
+            f"PCA coord derivation needs a square (K, K) Gram, got shape "
+            f"{tuple(gram.shape)}"
+        )
     if K < 2:
         raise ValueError(
             f"PCA coord derivation needs >= 2 centroids, got {K}"
         )
-    centered = centroids - centroids.mean(dim=0, keepdim=True)
-    # full_matrices=False gives U: (K, min(K,D)), S: (min(K,D),),
-    # Vh: (min(K,D), D).  We only need U @ diag(S) as the scores.
-    U, S, _ = torch.linalg.svd(centered, full_matrices=False)
-    # Variance fractions are (S^2)_i / sum_i (S^2)_i — metric-invariant
-    # and unaffected by sample-size scaling, so no (K-1) divisor.
-    var = S.pow(2)
-    total = var.sum().clamp(min=1e-12)
-    var_frac = var / total                       # (min(K,D),)
-    cum_var = torch.cumsum(var_frac, dim=0)      # (min(K,D),)
+    # Symmetrize away finite-precision drift, then eigendecompose.  eigh is
+    # the Gram analogue of the old SVD-of-centered-centroids: eigenvalues =
+    # S², eigenvectors = U (up to per-axis sign, immaterial for a layout).
+    gram = 0.5 * (gram + gram.transpose(0, 1))
+    evals, evecs = torch.linalg.eigh(gram)  # ascending
+    # Descending order (PCA convention); clamp tiny-negative eigenvalues
+    # that fp drift can leak past a genuinely PSD Gram.
+    evals = evals.flip(0).clamp(min=0.0)
+    evecs = evecs.flip(1)
+    # Variance fractions are λ_i / Σ_i λ_i — metric-invariant and unaffected
+    # by the (sum-vs-mean) scaling of the consensus average.
+    total = evals.sum().clamp(min=1e-12)
+    var_frac = evals / total                     # (K,)
+    cum_var = torch.cumsum(var_frac, dim=0)      # (K,)
     cap = min(max_dim, var_frac.shape[0])
     # Smallest k such that cum_var[k-1] >= threshold; default to cap.
     over = (cum_var[:cap] >= var_threshold).nonzero(as_tuple=False)
     picked_k = int(over[0].item()) + 1 if over.numel() > 0 else cap
     picked_k = max(1, min(picked_k, cap))
 
-    coords = U[:, :picked_k] * S[:picked_k]      # (K, picked_k)
+    coords = evecs[:, :picked_k] * evals[:picked_k].sqrt()  # (K, picked_k) = U S
     diagnostics = PcaDiagnostics(
         per_component_variance=var_frac[:cap].detach().clone(),
         cumulative_variance=cum_var[:cap].detach().clone(),
@@ -1917,7 +1936,7 @@ def _connected_components(mask: torch.Tensor) -> int:
 
 
 def derive_spectral_coords(
-    centroids: torch.Tensor,
+    gram: torch.Tensor,
     *,
     max_dim: int = 8,
     k_nn: int | None = None,
@@ -1925,7 +1944,19 @@ def derive_spectral_coords(
 ) -> tuple[torch.Tensor, SpectralDiagnostics]:
     """Derive node coordinates from a Laplacian-eigenmaps spectral embedding.
 
-    Build a symmetric k-NN graph over the ``(K, D)`` centroids,
+    ``gram`` is the ``(K, K)`` symmetric-PSD centroid Gram (see
+    :func:`derive_pca_coords`); the pairwise distances the graph is built
+    from are read straight off it, ``d²_ij = G_ii + G_jj − 2 G_ij``.  For a
+    single layer this is the plain Euclidean distance ``‖c_i − c_j‖``; for
+    the layer-agnostic fit, where ``gram`` is the layer-averaged whitened
+    consensus, it is the mean per-layer **Mahalanobis** distance — which is
+    exactly the squared distance in the concatenated-whitened space, the
+    same geometry :func:`derive_pca_coords` embeds linearly.  (``mean_L`` of
+    ``diag(G_L) ⊕ diag(G_L) − 2 G_L`` equals ``diag(Ḡ) ⊕ diag(Ḡ) − 2 Ḡ``
+    because the diagonal and the Gram are both linear in the layer average,
+    so the consensus distance is recoverable from the consensus Gram alone.)
+
+    Build a symmetric k-NN graph over those distances,
     heat-kernel weights ``W_ij = exp(-d_ij^2 / (2 sigma^2))``, the
     normalized Laplacian ``L = I - D^{-1/2} W D^{-1/2}``, eigendecompose
     via :func:`torch.linalg.eigh`, drop the smallest (trivial) eigenvalue,
@@ -1954,8 +1985,13 @@ def derive_spectral_coords(
     collapses into the eigenvalue noise floor); PCA is the right
     default at bundled-heap sizes.
     """
-    centroids = centroids.to(torch.float32)
-    K, _ = centroids.shape
+    gram = gram.to(torch.float32)
+    K = gram.shape[0]
+    if gram.dim() != 2 or gram.shape[1] != K:
+        raise ValueError(
+            f"spectral coord derivation needs a square (K, K) Gram, got "
+            f"shape {tuple(gram.shape)}"
+        )
     if K < 4:
         # Need at least 4 nodes to form any kind of k-NN graph and have
         # a candidate gap range.  Below that the heuristics are pure
@@ -1967,7 +2003,13 @@ def derive_spectral_coords(
         k_nn = max(5, math.ceil(math.log(K)))
     k_nn = max(1, min(k_nn, K - 1))
 
-    distances = torch.cdist(centroids, centroids)
+    # Pairwise distances from the Gram: d²_ij = G_ii + G_jj − 2 G_ij.  Clamp
+    # the (PSD-up-to-fp-drift) squared distances off negative before sqrt.
+    gram = 0.5 * (gram + gram.transpose(0, 1))
+    diag = gram.diagonal()
+    sq = diag.unsqueeze(0) + diag.unsqueeze(1) - 2.0 * gram
+    distances = sq.clamp(min=0.0).sqrt()
+    distances.fill_diagonal_(0.0)
     mask, neighbor_dists = _knn_adjacency(distances, k_nn)
 
     components = _connected_components(mask)
@@ -2062,21 +2104,24 @@ def derive_spectral_coords(
 
 
 def discover_coords(
-    centroids: torch.Tensor,
+    gram: torch.Tensor,
     method: str,
     **kwargs: Any,
 ) -> tuple[torch.Tensor, PcaDiagnostics | SpectralDiagnostics]:
     """Dispatch to :func:`derive_pca_coords` or :func:`derive_spectral_coords`.
 
     Exists so the pipeline doesn't branch on method strings; downstream
-    code calls ``discover_coords(centroids, method, **fit_kwargs)``
-    once and the diagnostics ride into the sidecar through the same
-    seam regardless of method.
+    code builds the consensus ``(K, K)`` Gram once and calls
+    ``discover_coords(gram, method, **fit_kwargs)``, and the diagnostics
+    ride into the sidecar through the same seam regardless of method.  Both
+    methods embed the *same* layer-averaged whitened Gram — PCA linearly
+    (eigendecomposition), spectral locally (k-NN Laplacian eigenmaps over
+    the distances read off it).
     """
     if method == "pca":
-        return derive_pca_coords(centroids, **kwargs)
+        return derive_pca_coords(gram, **kwargs)
     if method == "spectral":
-        return derive_spectral_coords(centroids, **kwargs)
+        return derive_spectral_coords(gram, **kwargs)
     raise ValueError(
         f"unknown discover method {method!r} (expected 'pca' | 'spectral')"
     )
@@ -2100,9 +2145,12 @@ def compute_node_centroid(
     Conversational (4.0 / A2) pooling: a node corpus is a list of in-character
     *responses* to the shared baseline *prompts*, aligned positionally as
     ``responses[i] -> prompts[i % len(prompts)]``.  Each is captured as a
-    ``[user: prompt, assistant: response]`` pair (no system, standard label)
-    via :func:`saklas.core.vectors._encode_and_capture_all` -- the same
-    last-content-token, fp32 pooling discipline that backs
+    ``[system: length directive, user: prompt, assistant: response]`` turn
+    (the shared brevity directive only -- *not* the generation-time persona --
+    standard label) via :func:`saklas.core.vectors._encode_and_capture_all`,
+    matching the framing the corpus was generated under so it isn't
+    out-of-distribution and cancels as common-mode against the neutral baseline.
+    Same last-content-token, fp32 pooling discipline that backs
     :func:`saklas.core.vectors.compute_layer_means`, with the same MPS
     ``empty_cache`` discipline between forward passes.
 
@@ -2257,6 +2305,12 @@ def save_manifold(
         # path needs nothing from this field; surfaced by `manifold show`
         # and the inspector.
         "subspace_metric",
+        # Per-layer whitened between-node spread ``{str(L): tr(G_L)}`` — the
+        # concept's signal-concentration profile across the stack (the
+        # consensus Gram's per-layer summand traces).  Diagnostic only; absent
+        # on fits that predate it (loads as an empty dict).  Surfaced by
+        # `manifold show`.
+        "node_spread_per_layer",
         # Discover-mode fields.  ``fit_mode`` discriminates authored vs
         # discover at read time; ``hyperparams`` records the knobs the
         # fitter was called with (max_dim / var_threshold / k_nn /

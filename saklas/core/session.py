@@ -40,6 +40,8 @@ from saklas.io.probes_bootstrap import bootstrap_layer_means
 from saklas.core.profile import Profile
 from saklas.core.results import (
     GenerationResult,
+    ManifoldAggregate,
+    ManifoldTokenReading,
     ProbeReadings,
     RunSet,
     TokenEvent,
@@ -682,9 +684,9 @@ class SaklasSession:
         # which dedupes on ``id(model)``, so when ``from_pretrained``
         # already probed for its compile_mode decision and we re-probe
         # here, the user only sees one message.
-        self._cuda_graphs_requested: bool = bool(cuda_graphs)
+        cuda_graphs_requested = bool(cuda_graphs)
         self._cuda_graphs_active: bool = False
-        if self._cuda_graphs_requested:
+        if cuda_graphs_requested:
             from saklas.core.cuda_graphs import (
                 is_cuda_graphs_supported, warn_once,
             )
@@ -861,16 +863,16 @@ class SaklasSession:
         # calls (via ``ExtractionPipeline``) inherit it without re-passing.
         self._dls: bool = bool(dls)
 
-        probe_profiles: dict[str, dict[int, torch.Tensor]] = {}
+        probe_manifolds: dict[str, "Manifold"] = {}
         if probe_categories:
             # Every concept lives as a 2-node ``pca`` manifold (4.0): fit-or-
-            # load each tagged manifold and fold it to a per-layer direction
-            # for the TraitMonitor probe set.  There is no separate baked-DiM
-            # ``vectors/`` probe path anymore.
-            probe_profiles = self._bootstrap_manifold_probes(probe_categories)
+            # load each tagged manifold and hand the flat ``Manifold`` to the
+            # TraitMonitor, which reads it as a coordinate (the rank-1 case of
+            # the subspace readout).  No folded-direction probe path anymore.
+            probe_manifolds = self._bootstrap_manifold_probes(probe_categories)
 
         self._monitor = TraitMonitor(
-            probe_profiles, self._layer_means, whitener=self._whitener,
+            probe_manifolds, self._layer_means, whitener=self._whitener,
         )
         # Read-side counterpart to manifold steering.  Peer to
         # ``self._monitor``: vector probes and manifold probes attach
@@ -947,9 +949,8 @@ class SaklasSession:
 
     @property
     def probes(self) -> dict[str, dict[str, Any]]:
-        profiles = self._monitor.profiles
-        return {name: {"profile": profiles[name]}
-                for name in self._monitor.probe_names}
+        return {name: {"manifold": m}
+                for name, m in self._monitor.manifolds.items()}
 
     @property
     def last_result(self) -> GenerationResult | None:
@@ -986,10 +987,6 @@ class SaklasSession:
 
     # -- Live trait SSE subscribers --
 
-    @property
-    def _trait_subscribers(self) -> int:
-        return len(self._trait_queues)
-
     def register_trait_queue(self, loop: Any, q: Any) -> None:
         """Register an ``(event_loop, asyncio.Queue)`` pair for live trait events."""
         with self._trait_lock:
@@ -1023,7 +1020,7 @@ class SaklasSession:
         directly, which left ``probes=[]`` sessions with an empty dict
         and silently disabled DLS (every layer fell through the
         "missing baseline" conservative-keep branch in
-        :func:`compute_dls_mask`).  The property closes that footgun.
+        :func:`compute_dls_axes`).  The property closes that footgun.
         """
         if not self._layer_means:
             try:
@@ -1201,8 +1198,11 @@ class SaklasSession:
 
         For every ``(concept, kind)`` the model answers the shared baseline
         prompts *in character* -- the concept rides the system prompt
-        (:func:`_system_for`) and the swapped assistant-role label
-        (:func:`_role_for`, overridable per concept via ``roles``).  Responses
+        (:func:`_system_for`, led by the shared :data:`~saklas.core.vectors._LENGTH_DIRECTIVE`
+        so responses stay one short paragraph) and the swapped assistant-role
+        label (:func:`_role_for`, overridable per concept via ``roles``).  The
+        length directive is common-mode with the neutral corpus and with capture
+        (it leads every system prompt), so it cancels at extraction.  Responses
         are emitted samples-outer / prompts-inner so ``response[i]`` aligns to
         ``prompt[i % k]`` -- the alignment :func:`compute_node_centroid` and the
         node corpus files assume.
@@ -1212,7 +1212,7 @@ class SaklasSession:
         concept.  Always role-swaps (no system-only fallback); a family without
         role support raises ``RoleSubstitutionUnsupportedError`` at generation.
         """
-        from saklas.core.vectors import _load_baseline_prompts
+        from saklas.core.vectors import _LENGTH_DIRECTIVE, _load_baseline_prompts
 
         prompts = _load_baseline_prompts()
         roles = roles or {}
@@ -1221,7 +1221,10 @@ class SaklasSession:
         out: dict[str, list[str]] = {}
         for concept, kind in zip(concepts, kinds, strict=True):
             concept_h = _humanize_concept(concept)
-            system = _system_for(concept_h, kind)
+            # The length directive leads the persona system prompt (and is the
+            # whole system for the neutral baseline + capture), so it is shared
+            # common-mode that cancels at extraction.
+            system = f"{_LENGTH_DIRECTIVE} {_system_for(concept_h, kind)}"
             gen_role = roles.get(concept) or _role_for(_slug(concept), kind)
             responses: list[str] = []
             for _ in range(reps):
@@ -1248,14 +1251,18 @@ class SaklasSession:
         """Generate the neutral baseline corpus -- organic, unconditioned responses.
 
         The neutral counterpart to :meth:`generate_responses`: the model answers
-        the shared baseline prompts with no system prompt and the standard
-        assistant label, so the corpus is the model\'s own voice.  Same
-        prompts-cycled order (``response[i] -> prompt[i % k]``).  This is what
-        ``neutral_statements.json`` holds under 4.0 -- regenerate it with this
-        and the per-model ``layer_means`` / neutral-activation caches recompute
-        conversationally.
+        the shared baseline prompts under the shared
+        :data:`~saklas.core.vectors._LENGTH_DIRECTIVE` as its *only* system prompt
+        (no persona) with the standard assistant label, so the corpus is the
+        model\'s own voice -- just brief.  The directive is the only framing it
+        shares with the node corpora (same on every node system + every capture),
+        so it cancels at extraction while leaving neutral the default-voice
+        reference the contrast subtracts against.  Same prompts-cycled order
+        (``response[i] -> prompt[i % k]``).  This is what ``neutral_statements.json``
+        holds under 4.0 -- regenerate it with this and the per-model
+        ``layer_means`` / neutral-activation caches recompute conversationally.
         """
-        from saklas.core.vectors import _load_baseline_prompts
+        from saklas.core.vectors import _LENGTH_DIRECTIVE, _load_baseline_prompts
 
         prompts = _load_baseline_prompts()
         reps = max(1, samples_per_prompt)
@@ -1269,7 +1276,7 @@ class SaklasSession:
                         f"{len(responses) + 1}/{total}..."
                     )
                 text = self._run_generator(
-                    "", prompt, max_new_tokens, role=None,
+                    _LENGTH_DIRECTIVE, prompt, max_new_tokens, role=None,
                 ).strip()
                 responses.append(text)
         return responses
@@ -2114,27 +2121,25 @@ class SaklasSession:
 
     def _bootstrap_manifold_probes(
         self, categories: list[str],
-    ) -> dict[str, dict[int, torch.Tensor]]:
-        """Source bundled-concept probe directions from their 2-node manifolds.
+    ) -> dict[str, "Manifold"]:
+        """Source bundled-concept probes as their fitted 2-node manifolds.
 
-        Builds the probe roster from the bundled concepts that now live as
+        Builds the probe roster from the bundled concepts that live as
         2-node ``pca`` manifolds (the category roster comes from
         :func:`~saklas.io.probes_bootstrap.load_default_manifolds`).  For each
         manifold tagged in a requested category it fits-or-loads the per-model
         subspace (eager, same cost band as the legacy DiM extraction — both run
-        forward passes, both disk-cache) and folds it to a per-layer direction
-        via :func:`~saklas.core.vectors.folded_vector_directions`, so the
-        ``TraitMonitor`` keeps its whitened-cosine read and ``@when:`` gates
-        unchanged.  A fit/fold failure for one concept is logged and skipped,
-        never fatal to session construction.
+        forward passes, both disk-cache) and hands the flat :class:`Manifold`
+        to the :class:`TraitMonitor`, which reads it as a coordinate (the
+        rank-1 case of the subspace readout).  A fit/load failure for one
+        concept is logged and skipped, never fatal to session construction.
         """
         from saklas.io.probes_bootstrap import load_default_manifolds
-        from saklas.core.vectors import folded_vector_directions
         from saklas.io.manifolds import ManifoldFolder
         from saklas.io.paths import manifold_dir
 
         defaults = load_default_manifolds()
-        probes: dict[str, dict[int, torch.Tensor]] = {}
+        probes: dict[str, "Manifold"] = {}
         seen: set[str] = set()
         for cat in categories:
             for name in defaults.get(cat, []):
@@ -2149,9 +2154,9 @@ class SaklasSession:
                         folder = ManifoldFolder.load(manifold_dir("default", name))
                         self.extract_manifold(folder)
                         self._ensure_manifold_loaded(key)
-                    probes[name] = folded_vector_directions(self._manifolds[key])
+                    probes[name] = self._manifolds[key]
                 except Exception as e:
-                    _log.warning("manifold probe '%s' failed to fit/fold: %s", name, e)
+                    _log.warning("manifold probe '%s' failed to fit/load: %s", name, e)
         return probes
 
     def _push_steering(
@@ -2353,7 +2358,9 @@ class SaklasSession:
             latest = capture.latest_per_layer()
             if not latest:
                 return {}
-            out = monitor.score_single_token(latest)
+            # Flatten the coordinate readings into gate-callback scalars
+            # (``name`` aliases axis 0, ``name[i]`` per axis, ``name:fraction``).
+            out = monitor.flat_scalars(monitor.score_single_token(latest))
             if manifold_monitor.probe_names:
                 manifold_readings = manifold_monitor.score_single_token(latest)
                 out.update(manifold_monitor.flat_scalars(manifold_readings))
@@ -2488,10 +2495,6 @@ class SaklasSession:
         self._compose_steering_entries(flat)
         self._install_composed_steering()
 
-    def _clear_steering(self) -> None:
-        """Remove all steering hooks from the model."""
-        self._steering.clear_all()
-
     def _begin_capture(self, *, widen: bool = False) -> bool:
         """Attach hidden-state capture. Returns True if attached.
 
@@ -2508,9 +2511,7 @@ class SaklasSession:
         if widen:
             layer_idxs = list(range(len(self._layers)))
         else:
-            vector_layers: set[int] = {
-                idx for prof in self._monitor.profiles.values() for idx in prof
-            }
+            vector_layers: set[int] = self._monitor.probe_layers()
             manifold_layers = self._manifold_monitor.attached_layers()
             union = vector_layers | manifold_layers
             if not union:
@@ -2520,26 +2521,16 @@ class SaklasSession:
             layer_idxs = sorted(union)
         self._capture.clear()
         self._capture.attach(self._layers, layer_idxs)
-        # Incremental scoring applies in the common monitored case: vector
-        # probes attached, no manifold probes (those need the pooled mean
-        # stack for the end-of-gen aggregate → keep full retention), and
-        # not widen (return_hidden lands the full per-layer stack on the
-        # result → keep full retention). When eligible, each token is
-        # scored on-device as it is produced; only the latest hidden per
-        # layer survives, plus the tiny per-token score rows.
-        incremental = (
-            (not widen)
-            and bool(self._monitor.probe_names)
-            and not self._manifold_monitor.probe_names
-        )
-        self._capture_incremental = incremental
+        # Incremental scoring (no-sync per-token coord rows + only-latest
+        # hidden retained) is disabled under the coordinate readout: the
+        # ``[P1]`` row carries axis-0 coords but not ``fraction``, so it
+        # can't reconstruct the full per-probe aggregate reading.  Full
+        # retention + ``score_per_token`` is correct; the scoring fast path
+        # (the stacked rank-1 matmul) is unaffected.
+        # TODO(coords): re-enable with a ``[P1, 2]`` (coord, fraction) row so
+        # the aggregate reading round-trips, restoring the memory win.
+        self._capture_incremental = False
         self._incremental_rows = []
-        if incremental:
-            def _step_sink(latest: dict[int, torch.Tensor]) -> None:
-                self._incremental_rows.append(
-                    self._monitor.score_single_token_tensor(latest),
-                )
-            self._capture.set_incremental(_step_sink)
         return True
 
     def _end_capture(self) -> None:
@@ -2549,12 +2540,14 @@ class SaklasSession:
 
     def score_captured(
         self, generated_ids: list[int], *, accumulate: bool = True,
-    ) -> tuple[dict[str, float], dict[str, list[float]]]:
+    ) -> tuple[dict[str, "ManifoldTokenReading"], dict[str, list[float]]]:
         """Score probes from the last hidden-state capture.
 
-        Returns ``(aggregate_vals, per_token_scores)``. Both dicts are empty
-        when the capture was never attached or the generation produced no
-        tokens.
+        Returns ``(aggregate_readings, per_token_scores)`` — the aggregate is a
+        per-probe :class:`ManifoldTokenReading` (coordinate reading), and
+        ``per_token_scores`` is the per-probe axis-0 coordinate stream. Both
+        dicts are empty when the capture was never attached or the generation
+        produced no tokens.
         """
         captured = self._capture.stacked()
         if not captured or not generated_ids:
@@ -2565,72 +2558,15 @@ class SaklasSession:
 
     def _score_incremental(
         self, generated_ids: list[int], *, accumulate: bool = True,
-    ) -> tuple[dict[str, float], dict[str, list[float]]]:
-        """Build ``(agg_vals, per_token)`` from the incremental score rows.
+    ) -> tuple[dict[str, "ManifoldTokenReading"], dict[str, list[float]]]:
+        """Aggregate readings + per-token coord stream for the generated tokens.
 
-        Bit-identical to :meth:`TraitMonitor.score_per_token` for the
-        same captures: each ``self._incremental_rows[k]`` is the on-device
-        ``[P]`` aggregate row :meth:`TraitMonitor.score_single_token_tensor`
-        produced for generated token ``k`` (probe order =
-        ``monitor._cache_probe_keys``), already exactly the ``num/den``
-        math ``score_per_token`` runs per token. We only need to stack,
-        trim the EOS off-by-one, sync once, reshape into the per-token
-        dict, pool the aggregate row, and mirror the accumulate semantics.
-
-        Falls back to :meth:`score_captured` defensively if the row count
-        underran ``generated_ids`` (shouldn't happen — one sink fire per
-        forward, one forward per generated token).
+        TODO(coords): the no-sync incremental coord-row path is disabled (a
+        ``[P1]`` row can't carry ``fraction`` for the aggregate reading), so
+        this delegates to the full-retention :meth:`score_captured`.  Restore
+        the on-device row stacking once the row is widened to ``[P1, 2]``.
         """
-        monitor = self._monitor
-        n = len(generated_ids)
-        rows = self._incremental_rows
-        if not rows or n == 0:
-            return self.score_captured(generated_ids, accumulate=accumulate)
-        # Under-capture: misaligned. Fall back to the full-stack path
-        # (which itself guards the ragged-by-one case per layer).
-        if len(rows) < n:
-            return self.score_captured(generated_ids, accumulate=accumulate)
-
-        probe_keys = monitor._cache_probe_keys
-        n_probes = len(probe_keys)
-        stacked = torch.stack(rows)  # [F, P] on device
-        # EOS off-by-one: capture can overshoot generated_ids by one when
-        # generation terminates on EOS (the forward fires, the loop breaks
-        # without appending the EOS id). Trim trailing extras so row[i] ↔
-        # generated_ids[i] — the same trim score_per_token applies.
-        if stacked.shape[0] > n:
-            stacked = stacked[:n]
-        result = stacked.cpu().tolist()  # single sync: list[F'] of list[P]
-
-        per_token: dict[str, list[float]] = {
-            name: [] for name in monitor._raw_profiles
-        }
-        for i, name in enumerate(probe_keys):
-            per_token[name] = [row[i] for row in result]
-        for name in monitor._raw_profiles:
-            if not per_token[name]:
-                per_token[name] = [0.0] * n
-
-        # Aggregate pool: last non-special generated token — the one
-        # canonical walkback (all_special_ids + added_tokens_encoder),
-        # shared with score_per_token and extraction.
-        agg_idx = last_content_index(generated_ids, self._tokenizer)
-        if n_probes and 0 <= agg_idx < len(result):
-            agg_row = result[agg_idx]
-            agg_vals = {name: agg_row[i] for i, name in enumerate(probe_keys)}
-        else:
-            agg_vals = {}
-        for name in monitor._raw_profiles:
-            agg_vals.setdefault(name, 0.0)
-
-        # Mirror score_per_token's accumulate semantics: the aggregate
-        # feeds history/stats + flips _pending_aggregate (via
-        # _apply_accumulate), and _pending_per_token flips, only when
-        # accumulating. Stateless callers must not leak into either.
-        if accumulate:
-            monitor._apply_accumulate(agg_vals)
-            monitor._pending_per_token = True
-        return agg_vals, per_token
+        return self.score_captured(generated_ids, accumulate=accumulate)
 
     @overload
     def score_hidden(
@@ -2639,7 +2575,7 @@ class SaklasSession:
         *,
         per_token: Literal[False] = False,
         accumulate: bool = False,
-    ) -> dict[str, float]: ...
+    ) -> dict[str, "ManifoldTokenReading"]: ...
     @overload
     def score_hidden(
         self,
@@ -2647,7 +2583,7 @@ class SaklasSession:
         *,
         per_token: Literal[True],
         accumulate: bool = False,
-    ) -> tuple[dict[str, float], dict[str, list[float]]]: ...
+    ) -> tuple[dict[str, "ManifoldTokenReading"], dict[str, list[float]]]: ...
     def score_hidden(
         self,
         hidden: dict[int, torch.Tensor],
@@ -2655,8 +2591,8 @@ class SaklasSession:
         per_token: bool = False,
         accumulate: bool = False,
     ) -> (
-        dict[str, float]
-        | tuple[dict[str, float], dict[str, list[float]]]
+        dict[str, "ManifoldTokenReading"]
+        | tuple[dict[str, "ManifoldTokenReading"], dict[str, list[float]]]
     ):
         """Score registered probes against a pre-captured hidden-state dict.
 
@@ -2667,11 +2603,12 @@ class SaklasSession:
 
         Shape rules:
         - Each value ``[D]``          → single-state aggregate.
-          Returns ``dict[probe, float]``.
+          Returns ``dict[probe, ManifoldTokenReading]``.
         - Each value ``[T, D]``       → per-token stack.
           ``per_token=False`` (default) returns the aggregate pooled from
           row ``T-1``; ``per_token=True`` returns
-          ``(aggregate, per_token_scores)``.
+          ``(aggregate, per_token_scores)`` where ``per_token_scores`` is
+          the per-probe axis-0 coordinate stream.
 
         Mixed shapes (``[D]`` alongside ``[T, D]``) or uneven ``T`` across
         layers raise :class:`SaklasError`. Empty dict raises.
@@ -2708,11 +2645,11 @@ class SaklasSession:
         # violating the "all public errors are SaklasError" invariant.
         for layer_idx, t in hidden.items():
             actual_dim = t.shape[-1]
-            for probe_name, profile in self._monitor.profiles.items():
-                probe_vec = profile.get(layer_idx)
-                if probe_vec is None:
+            for probe_name, manifold in self._monitor.manifolds.items():
+                sub = manifold.layers.get(layer_idx)
+                if sub is None:
                     continue
-                expected_dim = probe_vec.shape[-1]
+                expected_dim = sub.mean.shape[-1]
                 if expected_dim != actual_dim:
                     raise SaklasError(
                         f"score_hidden: dim mismatch at layer {layer_idx} — "
@@ -2756,7 +2693,16 @@ class SaklasSession:
                 self._model, self._tokenizer, self._layers, self._model_info,
             )
             self._monitor.layer_means = self._layer_means
-        self._monitor.add_probe(name, profile)
+        # The monitor reads probes as flat manifolds now (the rank-1
+        # coordinate case of the subspace readout).  A ``Profile`` is a
+        # per-layer baked direction; fold it into a 1-node neutral-anchored
+        # affine ray so ``add_probe`` (which handles the K=1 case) can cache
+        # the per-layer node coords + whitened factors.
+        from saklas.core.vectors import fold_directions_to_subspace
+        manifold = fold_directions_to_subspace(
+            name, dict(profile), self._layer_means, whitener=self.whitener,
+        )
+        self._monitor.add_probe(name, manifold)
         # New probe → _begin_capture would attach to a different
         # layer set than was live when the prefix was prefilled.
         # Drop the cache so the next gen reprefills with the fresh
@@ -2832,9 +2778,15 @@ class SaklasSession:
         """
         if name in self._probe_hash_cache:
             return self._probe_hash_cache[name]
-        profile = self._monitor.profiles.get(name)
-        if profile is None:
+        manifold = self._monitor.manifolds.get(name)
+        if manifold is None:
             return None
+        # Hash the probe's baked direction view (the folded ``{L: δ̂_L ·
+        # share_L}``) for continuity with the pre-coords scalar monitor:
+        # the per-layer baked tensor is what the transcript-drift check
+        # compared, and it's stable across the manifold round-trip.
+        from saklas.core.vectors import folded_vector_directions
+        profile = folded_vector_directions(manifold)
         import hashlib
         h = hashlib.sha256()
         for layer_idx in sorted(profile.keys()):
@@ -3582,6 +3534,7 @@ class SaklasSession:
         ).to(self._device)
 
     def build_readings(self) -> dict[str, ProbeReadings]:
+        """Per-probe cross-generation :class:`ProbeReadings`, per coordinate axis."""
         readings: dict[str, ProbeReadings] = {}
         if not self._monitor.probe_names:
             return readings
@@ -3590,20 +3543,34 @@ class SaklasSession:
             count = stats["count"]
             if count == 0:
                 continue
-            mean = stats["sum"] / count
-            variance = max(0.0, stats["sum_sq"] / count - mean ** 2)
-            std = variance ** 0.5
-            hist = list(self._monitor.history.get(name, []))
+            # Per-axis accumulators (axis 0 falls back to the scalar stats
+            # for a degenerate probe with no axis record).
+            axes = self._monitor.axis_stats(name) or [stats]
+            R = len(axes)
+            hist = [tuple(float(c) for c in coords)
+                    for coords in self._monitor.history.get(name, [])]
+            means = tuple(a["sum"] / count for a in axes)
+            stds = tuple(
+                max(0.0, a["sum_sq"] / count - (a["sum"] / count) ** 2) ** 0.5
+                for a in axes
+            )
+            mins = tuple(
+                a["min"] if a["min"] != float("inf") else 0.0 for a in axes
+            )
+            maxs = tuple(
+                a["max"] if a["max"] != float("-inf") else 0.0 for a in axes
+            )
             if len(hist) >= 2:
-                deltas = [abs(hist[i] - hist[i-1]) for i in range(1, len(hist))]
-                delta_per_gen = sum(deltas) / len(deltas)
+                delta = tuple(
+                    sum(abs(hist[i][k] - hist[i - 1][k])
+                        for i in range(1, len(hist))) / (len(hist) - 1)
+                    for k in range(R)
+                )
             else:
-                delta_per_gen = 0.0
+                delta = tuple(0.0 for _ in range(R))
             readings[name] = ProbeReadings(
-                per_generation=hist, mean=mean, std=std,
-                min=stats["min"] if stats["min"] != float("inf") else 0.0,
-                max=stats["max"] if stats["max"] != float("-inf") else 0.0,
-                delta_per_gen=delta_per_gen,
+                per_generation=hist, mean=means, std=stds,
+                min=mins, max=maxs, delta_per_gen=delta,
             )
         return readings
 
@@ -3643,13 +3610,20 @@ class SaklasSession:
                 )
             self._last_per_token_scores = per_token or None
             if stateless:
-                readings = {
-                    name: ProbeReadings(
-                        per_generation=[v], mean=v, std=0.0,
-                        min=v, max=v, delta_per_gen=0.0,
+                # Stateless gens never touch the monitor's running history,
+                # so synthesize a single-generation ``ProbeReadings`` per
+                # probe straight from this gen's aggregate coordinate tuple
+                # (zero spread — one observation).  ``r.coords`` is the
+                # ``R``-tuple of authoring coords; a degenerate empty reading
+                # falls back to a single 0.0 axis.
+                readings = {}
+                for name, r in agg_vals.items():
+                    c = r.coords or (0.0,)
+                    zeros = tuple(0.0 for _ in c)
+                    readings[name] = ProbeReadings(
+                        per_generation=[c], mean=c, std=zeros,
+                        min=c, max=c, delta_per_gen=zeros,
                     )
-                    for name, v in agg_vals.items()
-                }
             else:
                 readings = self.build_readings()
         else:
@@ -3717,9 +3691,14 @@ class SaklasSession:
         self._last_result = result
 
         if readings:
-            self.events.emit(
-                ProbeScored(readings={name: r.mean for name, r in readings.items()}),
-            )
+            # ``ProbeScored`` / the loom layer take a scalar per probe; the
+            # cross-gen ``mean`` is now a per-axis tuple, so collapse to
+            # coordinate axis 0 (the bare ``@when:<probe>`` channel).
+            scalar_readings = {
+                name: (r.mean[0] if r.mean else 0.0)
+                for name, r in readings.items()
+            }
+            self.events.emit(ProbeScored(readings=scalar_readings))
 
         # Finalize the in-flight assistant node in the tree (loom v2.3).
         # The user node was added by the gen preamble; the assistant node
@@ -3735,7 +3714,13 @@ class SaklasSession:
             self.tree.finalize_assistant(
                 assistant_node_id,
                 text=text,
-                aggregate_readings={n: r.mean for n, r in readings.items()},
+                # Loom nodes store one scalar per probe (``readings_diff``
+                # wants ``dict[str, float]``); collapse the per-axis ``mean``
+                # tuple to coordinate axis 0.
+                aggregate_readings={
+                    n: (r.mean[0] if r.mean else 0.0)
+                    for n, r in readings.items()
+                },
                 applied_steering=applied_steering,
                 finish_reason=self._gen_state.finish_reason,
                 mean_logprob=mean_logprob,
@@ -4150,6 +4135,7 @@ class SaklasSession:
                 mean_logprob_count += 1
             latest_hidden_for_token: dict[int, torch.Tensor] | None = None
             scores: dict[str, float] | None = None
+            vector_readings: dict[str, "ManifoldTokenReading"] | None = None
             per_layer_payload: dict[str, dict[str, float]] | None = None
             manifold_readings = None
             needs_vector_scores = bool(
@@ -4173,7 +4159,16 @@ class SaklasSession:
             if needs_vector_scores and latest_hidden_for_token:
                 agg = self._monitor.score_single_token(latest_hidden_for_token)
                 if agg:
-                    scores = {p: float(v) for p, v in agg.items()}
+                    # ``score_single_token`` now yields per-probe readings.
+                    # Keep the full readings dict for the live-mean fold +
+                    # ``TokenEvent``; collapse to coordinate axis 0 for the
+                    # scalar trait stream + per-token ``probes`` row (the bare
+                    # ``@when:<probe>`` channel).
+                    vector_readings = agg
+                    scores = {
+                        p: (r.coords[0] if r.coords else 0.0)
+                        for p, r in agg.items()
+                    }
                 if assistant_node_id is not None and _persists_layer_scores:
                     per_layer = self._monitor.score_single_token_per_layer(
                         latest_hidden_for_token,
@@ -4191,6 +4186,7 @@ class SaklasSession:
                 )
             self._last_token_probe_payload = {
                 "scores": scores,
+                "readings": vector_readings,
                 "per_layer_scores": per_layer_payload,
                 "manifold_readings": manifold_readings,
             }
@@ -4579,24 +4575,26 @@ class SaklasSession:
         idx_counter = [0]
 
         def _push(text: str, is_thinking: bool, tid: int | None, lp: float | None, top_alts: Any, perplexity: float | None) -> None:
-            scores: dict[str, float] | None = None
+            readings: dict[str, "ManifoldTokenReading"] | None = None
             manifold_readings = None
             if live_scores and (
                 self._monitor.probe_names
                 or self._manifold_monitor.probe_names
             ):
                 payload = self._last_token_probe_payload or {}
-                raw_scores = payload.get("scores")
-                if isinstance(raw_scores, dict) and raw_scores:
-                    scores = {
-                        str(k): float(v) for k, v in raw_scores.items()
-                    }
-                    self._monitor.update_live(scores)
+                raw_readings = payload.get("readings")
+                if isinstance(raw_readings, dict) and raw_readings:
+                    readings = raw_readings
+                    # ``update_live`` folds coordinate axis 0 of each reading
+                    # into the running mean; ``TokenEvent.scores`` carries the
+                    # readings dict verbatim (the live-stream consumer reads
+                    # ``fraction`` / ``nearest`` / ``coords`` off each).
+                    self._monitor.update_live(readings)
                 manifold_readings = payload.get("manifold_readings")
             event = TokenEvent(
                 text=text, token_id=tid if tid is not None else -1, index=idx_counter[0],
                 thinking=is_thinking, logprob=lp, top_alts=top_alts,
-                scores=scores, perplexity=perplexity,
+                scores=readings, perplexity=perplexity,
                 manifold_readings=manifold_readings,
             )
             idx_counter[0] += 1

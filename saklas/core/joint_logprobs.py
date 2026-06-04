@@ -287,7 +287,6 @@ def _shared_prefix_len(ids_a: list[int], ids_b: list[int]) -> int:
 
 @dataclass(frozen=True)
 class _ReplayBranch:
-    node_id: str
     prompt_ids: list[int]
     response_ids: list[int]
     token_ids: list[int]
@@ -295,7 +294,6 @@ class _ReplayBranch:
     thinking_ids: list[int]
     sampling: SamplingConfig
     steering: Steering | None
-    thinking: bool
 
 
 def _decode_each(tokenizer: Any, ids: list[int]) -> list[str]:
@@ -427,7 +425,6 @@ def _branch_inputs(session: "SaklasSession", node_id: str) -> _ReplayBranch:
 
     prompt_strs = _decode_each(tokenizer, prompt_ids)
     return _ReplayBranch(
-        node_id=node_id,
         prompt_ids=prompt_ids,
         response_ids=response_ids,
         token_ids=prompt_ids + response_ids,
@@ -435,7 +432,6 @@ def _branch_inputs(session: "SaklasSession", node_id: str) -> _ReplayBranch:
         thinking_ids=thinking_ids,
         sampling=sampling,
         steering=steering,
-        thinking=thinking,
     )
 
 

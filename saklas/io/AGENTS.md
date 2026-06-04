@@ -79,8 +79,10 @@ node role and any non-`None` node kind.
 `ManifoldSidecar` is the lean per-tensor JSON (`method` round-trips
 `manifold_pca`/`manifold_sae` authored, `manifold_discover_{pca,spectral,sae}`
 discover, `merge` baked, `manifold_procrustes_transfer` transfer + the
-share/subspace metrics, fit_mode, hyperparams, diagnostics); the tensor save/load
-itself lives in `core/manifold.py`. `hash_manifold_files` reuses
+share/subspace metrics, fit_mode, hyperparams, diagnostics, and
+`node_spread_per_layer` — the whitened between-node spread `{str(L): tr(G_L)}`,
+a diagnostic concept-signal-by-layer profile, empty on pre-4.0 fits); the tensor
+save/load itself lives in `core/manifold.py`. `hash_manifold_files` reuses
 `packs.hash_file` for the per-file sha256 integrity manifest.
 
 A node corpus is now a list of conversational *responses* (`list[str]`) aligned to
@@ -143,7 +145,7 @@ Bare-pole resolution moved entirely to the manifold tier (a bipolar concept is a
 suffix + canonicalizes (always `match=None`, `sign=+1`).
 `resolve_manifold_label(label, *, namespace=)` finds a node by label across
 installed manifolds; `resolve_manifold_name(name, *, namespace=)` resolves a 2-node
-`pca` manifold's *name* (e.g. `happy.sad`) to node 0 (the `orient_to=0` + pole) —
+`pca` manifold's *name* (e.g. `formal.casual`) to node 0 (the `orient_to=0` + pole) —
 the vector-composite read path. `resolve_bare_name(raw, *, namespace=) →
 (pole_hit, manifold_hit)` is the unified tier (pole/name first, then manifold
 label, cross-tier collision raises). Three memoized walks

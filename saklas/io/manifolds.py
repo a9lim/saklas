@@ -89,27 +89,24 @@ _FIT_MODES_ALL: frozenset[str] = (
 # POSTing ``{fit_mode: "pca", hyperparams: {"k_nn": 5}}`` doesn't land
 # a foreign key that would then crash ``derive_pca_coords`` at fit
 # time with ``TypeError: unexpected keyword argument``.  ``max_dim``
-# is shared.  ``reference_layer`` is honored by both methods (consumed
-# in ``ManifoldExtractionPipeline.fit`` before the dispatch).
+# is shared.  Coordinate derivation is layer-agnostic — the consensus
+# Gram averages every fit layer (``ManifoldExtractionPipeline.fit``), so
+# there is no reference-layer knob.
+# ``max_dim`` caps the derived intrinsic (layout) dim for both modes.  A
+# flat (``pca``) fit's per-layer steerable subspace *is* its k-dim layout
+# span, so ``max_dim`` is its only dim knob — there is no separate
+# ``max_subspace_dim`` for pca (the subspace dim equals the layout dim).
+# ``max_subspace_dim`` survives only for the curved (``spectral``) fit,
+# where the per-layer RBF subspace can carry off-surface dims beyond the
+# intrinsic coordinate count.  The steer-time origin is always the
+# projection of the per-model neutral mean onto the subspace (the affine
+# fit neutral-anchors the frame), so there is no ``anchor_origin`` knob.
 _HYPERPARAMS_BY_MODE: dict[str, frozenset[str]] = {
     "pca": frozenset({
-        "max_dim", "var_threshold", "reference_layer", "max_subspace_dim",
-        # ``anchor_origin`` is the discover-pca origin-anchoring toggle.
-        # When set to a node label (or the literal ``true`` — sugar for
-        # the canonical ``"default"`` label), the fit pipeline locates
-        # that label among the K nodes, takes its derived authoring coord
-        # as the anchor, and translates *all* node coords so the anchor
-        # sits at ``(0, ..., 0)``.  The RBF interpolant is exact at fit
-        # nodes, so steering ``<manifold>%0,0,...`` reproduces the
-        # anchor's per-layer behavior — giving the manifold's origin a
-        # principled meaning ("no behavioral shift from the anchor")
-        # instead of "centroid of the K corpora in PCA space".  Spectral
-        # mode is not yet supported — Laplacian eigenmaps need Nyström-
-        # style out-of-sample extension to project a held-out anchor.
-        "anchor_origin",
+        "max_dim", "var_threshold",
     }),
     "spectral": frozenset({
-        "max_dim", "k_nn", "bandwidth", "reference_layer", "max_subspace_dim",
+        "max_dim", "k_nn", "bandwidth", "max_subspace_dim",
     }),
 }
 
@@ -300,6 +297,13 @@ class ManifoldSidecar:
     fit_mode: str = "authored"
     hyperparams: dict[str, Any] = field(default_factory=dict)
     diagnostics: dict[str, Any] = field(default_factory=dict)
+    # Per-layer whitened between-node spread ``{str(L): tr(G_L)}`` — the
+    # concept's signal-concentration profile across the stack, in
+    # background-σ² units (comparable across layers).  A diagnostic readout
+    # of "where does this concept live", distinct from the apply-time
+    # ``mahalanobis_share`` (which restricts the same whitened spread to the
+    # steerable subspace).  Empty on fits that predate it.
+    node_spread_per_layer: dict[str, Any] = field(default_factory=dict)
     # Merge provenance on a ``fit_mode="baked"`` manifold — the
     # ``{coord: {alpha, project_away, tensor_sha256}}`` map written by
     # :func:`saklas.io.merge.merge_into_manifold`.  ``None`` on every fit that
@@ -342,6 +346,7 @@ class ManifoldSidecar:
             fit_mode=data.get("fit_mode", "authored"),
             hyperparams=dict(data.get("hyperparams", {})),
             diagnostics=dict(data.get("diagnostics", {})),
+            node_spread_per_layer=dict(data.get("node_spread_per_layer", {})),
             node_roles=list(data.get("node_roles", [])),
             node_kinds=list(data.get("node_kinds", [])),
             components=data.get("components"),
@@ -1699,10 +1704,11 @@ def _discover_manifest_payload(
     roles: dict[str, str | None],
     hyperparams: Optional[dict[str, Any]],
     kinds: Optional[dict[str, str | None]] = None,
+    tags: Optional[list[str]] = None,
 ) -> dict[str, Any]:
     """Build the label-only discover ``manifold.json`` dict."""
     kinds = kinds or {}
-    return {
+    payload: dict[str, Any] = {
         "format_version": MANIFOLD_FORMAT_VERSION,
         "name": name,
         "description": description,
@@ -1714,6 +1720,11 @@ def _discover_manifest_payload(
         ],
         "files": {},
     }
+    # Category tags ride manifold.json; written only when non-empty so a
+    # tagless manifold stays byte-identical to the pre-tags shape.
+    if tags:
+        payload["tags"] = [str(t) for t in tags]
+    return payload
 
 
 @dataclass(frozen=True)
@@ -1748,6 +1759,7 @@ def plan_discover_generation(
     hyperparams: Optional[dict[str, Any]] = None,
     node_roles: Optional[dict[str, str | None]] = None,
     node_kinds: Optional[dict[str, str | None]] = None,
+    tags: Optional[list[str]] = None,
 ) -> DiscoverGenerationPlan:
     """Ensure a streamable discover skeleton at ``folder`` covering every
     label in ``labels``, and report which node corpora still need writing.
@@ -1771,10 +1783,10 @@ def plan_discover_generation(
     The read is deliberately lenient — it does **not** route through
     :meth:`ManifoldFolder.load`, which rejects a partially-written folder
     by design (the missing-node-corpus guard) — so the planner can
-    inspect the very partial it is resuming.  Description is refreshed to
-    the caller's value; fit hyperparams on an existing folder are kept
-    (a resume fills corpus, it does not silently re-spec the fit — use
-    ``--force`` / a fresh folder to change those).
+    inspect the very partial it is resuming.  Description (and ``tags``,
+    when supplied) is refreshed to the caller's value; fit hyperparams on
+    an existing folder are kept (a resume fills corpus, it does not silently
+    re-spec the fit — use ``--force`` / a fresh folder to change those).
 
     Raises :class:`ManifoldFormatError` on a non-discover ``fit_mode``, a
     bad/duplicate label, a ``node_roles`` key outside the roster, or an
@@ -1821,7 +1833,7 @@ def plan_discover_generation(
             meta_path,
             _discover_manifest_payload(
                 name, description, fit_mode, labels, roles_resolved, hyperparams,
-                kinds_resolved,
+                kinds_resolved, tags,
             ),
         )
         return DiscoverGenerationPlan(
@@ -1855,10 +1867,15 @@ def plan_discover_generation(
     }
     new_labels = [label for label in labels if label not in existing_labels]
     full_labels = existing_labels + new_labels
+    # Category tags refresh to the caller's value when supplied (None leaves
+    # whatever the folder already carries); written only when non-empty so a
+    # tagless manifold stays byte-identical to the pre-tags shape.
+    desired_tags = [str(t) for t in tags] if tags else None
     if new_labels:
         # Add-nodes: append the new labels (validating their roles/kinds) and
         # rewrite manifold.json atomically.  Existing roles/kinds/hyperparams
-        # are preserved; description refreshes to the caller's value.
+        # are preserved; description (and tags, when supplied) refresh to the
+        # caller's value.
         merged_roles: dict[str, str | None] = dict(existing_roles)
         merged_kinds: dict[str, str | None] = dict(existing_kinds)
         for label in new_labels:
@@ -1869,6 +1886,8 @@ def plan_discover_generation(
                 name, label, kinds_in.get(label),
             )
         data["description"] = description
+        if desired_tags is not None:
+            data["tags"] = desired_tags
         data["nodes"] = [
             _node_payload_discover(
                 label, merged_roles.get(label), merged_kinds.get(label),
@@ -1876,9 +1895,16 @@ def plan_discover_generation(
             for label in full_labels
         ]
         write_json_atomic(meta_path, data)
-    elif data.get("description") != description:
-        data["description"] = description
-        write_json_atomic(meta_path, data)
+    else:
+        changed = False
+        if data.get("description") != description:
+            data["description"] = description
+            changed = True
+        if desired_tags is not None and data.get("tags") != desired_tags:
+            data["tags"] = desired_tags
+            changed = True
+        if changed:
+            write_json_atomic(meta_path, data)
 
     nodes_dir.mkdir(exist_ok=True)
     index_of = {label: i for i, label in enumerate(full_labels)}

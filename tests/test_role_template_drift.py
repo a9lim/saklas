@@ -43,6 +43,8 @@ _REPRESENTATIVE_TOKENIZERS: dict[str, str] = {
     "gemma3_text": "google/gemma-3-1b-it",
     "gemma4": "google/gemma-4-31b-it",
     "gemma4_text": "google/gemma-4-31b-it",
+    "gemma4_unified": "google/gemma-4-12b-it",
+    "gemma4_unified_text": "google/gemma-4-12b-it",
     "llama": "meta-llama/Llama-3.2-1B-Instruct",
     "glm": "THUDM/glm-4-9b-chat",
     "gpt_oss": "openai/gpt-oss-20b",

@@ -331,8 +331,6 @@ def _format_term(name: str, alpha: float, *, sign_prefix: bool = True) -> str:
     edge labels read like ``+0.2 calm`` / ``-0.3 honest``; turn off for
     the leading position in compound labels.
     """
-    if alpha == 0.0:
-        return f"−{name}"
     if sign_prefix and alpha >= 0:
         return f"+{alpha:g} {name}"
     if alpha < 0:

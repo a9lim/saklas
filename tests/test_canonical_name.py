@@ -125,6 +125,9 @@ class TestHumanize:
         assert "someone artificial intelligence" in captured["system"]
         assert "artificial_intelligence" not in captured["system"]
         assert captured["role"] == "someone_artificial_intelligence"
-        # 2 samples x 1 baseline prompt = 2 responses, each paired with the prompt
+        # 2 samples x 1 baseline prompt = 2 responses, each paired with the bare
+        # prompt (the shared brevity directive rides the system prompt instead).
+        from saklas.core.vectors import _LENGTH_DIRECTIVE
         assert len(out["artificial_intelligence"]) == 2
         assert captured["prompts"] == ["How are you today?", "How are you today?"]
+        assert captured["system"].startswith(_LENGTH_DIRECTIVE)

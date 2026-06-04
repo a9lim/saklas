@@ -60,7 +60,6 @@ def _mock_session():
     # Trait queue infrastructure (used by SSE traits/stream endpoint).
     session._trait_queues = []
     session._trait_lock = threading.Lock()
-    session._trait_subscribers = property(lambda self: len(self._trait_queues))
 
     def _register_trait_queue(loop: Any, q: Any) -> None:
         with session._trait_lock:

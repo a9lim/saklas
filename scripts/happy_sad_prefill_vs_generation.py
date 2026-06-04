@@ -44,7 +44,7 @@ from pathlib import Path
 import torch
 
 from saklas import SamplingConfig, SaklasSession
-from saklas.core.vectors import compute_dls_mask
+from saklas.core.vectors import compute_dls_axes
 from _bundled_manifold_data import (
     load_bundled_manifold_scenarios,
     load_folded_bundled_profile,
@@ -344,9 +344,15 @@ def main() -> None:
     gen_unit_all = {
         L: v / max(float(v.norm()), 1e-12) for L, v in gen_dirs_all.items()
     }
-    gen_keep_all = compute_dls_mask(
-        happy_all, sad_all, gen_unit_all, layer_means,
-    )
+    gen_keep_all = {
+        L for L, ax in compute_dls_axes(
+            {L: torch.stack([happy_all[L].reshape(-1), sad_all[L].reshape(-1)])
+             for L in happy_all},
+            {L: d.reshape(1, -1) for L, d in gen_unit_all.items()},
+            layer_means,
+        ).items()
+        if ax
+    }
     prefill_keep = set(prefill_dirs)
     print(
         f"  DLS keep-set: prefill={len(prefill_keep)}  "

@@ -25,13 +25,23 @@ class TokenAlt:
 
 @dataclass
 class ProbeReadings:
-    """Probe monitor readings across a generation run."""
-    per_generation: list[float]
-    mean: float
-    std: float
-    min: float
-    max: float
-    delta_per_gen: float
+    """Probe monitor readings across a generation run, per coordinate axis.
+
+    Vectorized for the coordinate readout: a probe is a rank-``R`` flat
+    subspace (``R = 1`` for a 2-node concept axis), so each per-generation
+    sample is the aggregate coordinate ``tuple[float, ...]`` of length
+    ``R`` and the summary statistics are reported per axis.  ``mean`` /
+    ``std`` / ``min`` / ``max`` / ``delta_per_gen`` are each an
+    ``R``-tuple aligned with the coordinate axes; ``per_generation`` is
+    the list of per-run coordinate tuples.  A scalar consumer reads axis
+    0 (``mean[0]``).
+    """
+    per_generation: list[tuple[float, ...]]
+    mean: tuple[float, ...]
+    std: tuple[float, ...]
+    min: tuple[float, ...]
+    max: tuple[float, ...]
+    delta_per_gen: tuple[float, ...]
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -39,23 +49,33 @@ class ProbeReadings:
 
 @dataclass
 class ManifoldTokenReading:
-    """Per-token manifold-probe reading for one attached manifold.
+    """Per-token subspace-probe reading for one attached fit (flat or curved).
 
-    Hot-path-cheap channels only: ``fraction`` is
-    ``||h_par_c|| / ||h - mean||`` aggregated EV-weighted across the
-    manifold's layers (the share of the centered activation that lives in
-    the manifold's PCA subspace), and ``nearest`` is the top-N node
-    labels by distance to the running activation in activation space
-    (not domain space), sorted ascending by distance.  Mirrors what
-    ``ManifoldMonitor.score_single_token`` returns per probe.
+    The unified per-token readout for both monitors.  ``coords`` is the
+    EV-weighted whitened in-subspace coordinate of the running activation
+    (``M_R⁻¹ B Σ⁻¹ (h − mean)`` aggregated across the fit's layers) — the
+    raw, neutral-anchored position in the same units the steering target
+    uses, an ``R``-tuple for a rank-``R`` fit (a 1-tuple for a 2-node
+    concept axis).  It is **exact and hot-path-cheap for a flat (affine)
+    fit** — :class:`~saklas.core.monitor.TraitMonitor` fills it via the
+    batched stacked-basis matmul — and left **empty (``()``) for a curved
+    fit**, where an exact per-token coordinate would need the RBF
+    foot-solve and is therefore deferred to the end-of-generation
+    :class:`ManifoldAggregate`.  ``fraction`` is
+    ``||P_M(h−mean)||_M / ||h−mean||_M`` EV-weighted across layers (the
+    share of the centered activation that lives in the subspace), and
+    ``nearest`` is the top-N node labels by whitened distance to the
+    running activation, ascending.
     """
     fraction: float
     nearest: list[tuple[str, float]]
+    coords: tuple[float, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "fraction": self.fraction,
             "nearest": [[label, dist] for label, dist in self.nearest],
+            "coords": list(self.coords),
         }
 
 
@@ -253,10 +273,13 @@ class TokenEvent:
     # carry decoded text so consumers don't re-tokenize.
     top_alts: list[TokenAlt] | None = None
     finish_reason: str | None = None
-    # Per-probe cosine similarities computed inline against the latest
-    # captured hidden state. Populated by ``generate_stream`` only when
-    # the session has active probes; otherwise None.
-    scores: dict[str, float] | None = None
+    # Per-probe subspace readings computed inline against the latest
+    # captured hidden state — the coordinate readout (coords + fraction +
+    # nearest) for each flat-subspace probe (a 2-node concept axis is the
+    # ``R = 1`` case; ``coords`` is a 1-tuple).  Populated by
+    # ``generate_stream`` only when the session has active vector probes;
+    # otherwise None.  Curved-manifold probes ride ``manifold_readings``.
+    scores: dict[str, "ManifoldTokenReading"] | None = None
     # Perplexity of the configured sampler distribution after temperature,
     # top-k, and top-p renormalization — ``exp`` of Shannon entropy in nats.
     # Bounded above by sampler support size; a confident prediction
@@ -286,11 +309,23 @@ class ResultCollector:
             "elapsed": result.elapsed,
         }
         for probe_name, readings in result.readings.items():
-            row[f"probe_{probe_name}_mean"] = readings.mean
-            row[f"probe_{probe_name}_std"] = readings.std
-            row[f"probe_{probe_name}_min"] = readings.min
-            row[f"probe_{probe_name}_max"] = readings.max
-            row[f"probe_{probe_name}_delta"] = readings.delta_per_gen
+            # Per-coordinate columns.  A rank-1 probe (every 2-node
+            # concept axis) keeps the bare ``probe_<name>_<stat>`` column
+            # so existing concept-roster exports are unchanged; a
+            # higher-rank probe suffixes the axis index.
+            stats = {
+                "mean": readings.mean,
+                "std": readings.std,
+                "min": readings.min,
+                "max": readings.max,
+                "delta": readings.delta_per_gen,
+            }
+            for stat_name, vec in stats.items():
+                if len(vec) == 1:
+                    row[f"probe_{probe_name}_{stat_name}"] = vec[0]
+                else:
+                    for k, val in enumerate(vec):
+                        row[f"probe_{probe_name}_{stat_name}_{k}"] = val
         for vec_name, alpha in result.vectors.items():
             row[f"vector_{vec_name}_alpha"] = alpha
         row.update(tags)

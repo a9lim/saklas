@@ -127,8 +127,10 @@ concept axes); an unfitted one is skipped with a one-line hint.
   [--method pca|spectral] [--max-dim N] [--var-threshold T] [--k-nn K]
   [--bandwidth SIGMA] [--max-subspace-dim R] [--sae REL]` fits a discover-mode
   folder (writes any CLI hyperparam override into `manifold.json` atomically
-  *before* the fit; `--max-subspace-dim` caps the per-layer PCA dim,
-  argparse-default `None` → engine 64). `generate <name> --concepts C...
+  *before* the fit; `--max-subspace-dim` caps the per-layer RBF subspace dim for
+  the curved spectral fit, argparse-default `None` → engine 64, and is dropped by
+  `_sanitize_hyperparams` for `--method pca` — a flat fit's subspace dim is its
+  `--max-dim` layout dim). `generate <name> --concepts C...
   [--kind {abstract,concrete}] [--samples-per-prompt K] [--seed INT]
   [--role-per-node] [-m] [-f]` LLM-authors a discover folder via
   `session.generate_responses` — each node's corpus is in-character responses to

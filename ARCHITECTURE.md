@@ -29,8 +29,8 @@ The unifying facts:
 - **A steering vector is a 2-node flat manifold.** Center two pole centroids →
   `±δ/2`; the sole principal axis of the μ-centered scatter is `δ̂`. So
   difference-of-means *is* "PCA on two centroids", and the vector pipeline is "fit
-  a 2-node flat subspace". `session.extract("angry.calm")` authors a 2-node
-  discover-`pca` manifold (node 0 = `angry`, node 1 = `calm`) and fits it; the
+  a 2-node flat subspace". `session.extract("formal.casual")` authors a 2-node
+  discover-`pca` manifold (node 0 = `formal`, node 1 = `casual`) and fits it; the
   in-memory `Profile` callers get back is a *folded view* of that fit
   (`folded_vector_directions`). There is no separate baked-DiM artifact, no
   `statements.json`, no `vectors/` storage — the concept's only on-disk form is
@@ -41,13 +41,11 @@ The unifying facts:
 
 The bundled defaults map cleanly onto the taxonomy:
 
-| artifact            | nodes | rank | structure | fit_mode  |
-|---------------------|-------|------|-----------|-----------|
-| a concept vector    | 2     | 1    | flat      | `pca`     |
-| `cultural`          | 9     | ~4   | flat      | `pca`     |
-| `register`          | 15    | ~6   | flat      | `pca`     |
-| `personas`          | 101   | ~8   | flat      | `pca`     |
-| `pad`               | 15    | 3    | curved    | `authored`|
+| artifact            | nodes | rank | structure | fit_mode   |
+|---------------------|-------|------|-----------|------------|
+| a concept vector    | 2     | 1    | flat      | `pca`      |
+| `personas`          | 107   | ~8   | flat      | `pca`      |
+| `pad`               | 20    | 3    | curved    | `spectral` |
 
 Every steering term — vectors, bare poles, `~`/`|` projections, `!` ablations,
 and `%` manifold positions — lowers at generation time to a single per-layer
@@ -174,7 +172,7 @@ one fp32 mean per layer.
 
 `session.extract(concept, baseline, *, kind="abstract")`:
 
-1. Splits the composite (`angry.calm` → pos `angry`, neg `calm`). A **monopolar**
+1. Splits the composite (`formal.casual` → pos `formal`, neg `casual`). A **monopolar**
    concept (`baseline=None`) authors a genuinely **1-node** folder; the engine
    recognizes the single-node `pca` shape and fits it against the model's neutral
    mean ν (`layer_means`) as the implicit negative pole — folding `concept − ν`
@@ -308,9 +306,10 @@ mu_coords, ev_ratio)`, where `mu_coords = (centroids − μ)·basisᵀ` is the
   Dang & Ngo 2026 Eq. 9) generalizes from layers to axes. `compute_dls_axes`
   keeps axis `d̂ᵣ` at layer L iff the node projections `{(cᵢ − ν)·d̂ᵣ}` *straddle
   zero* (both signs present) — the axis discriminates node *position* across the
-  baseline rather than encoding a common offset/intensity. At K=2 this is exactly
-  the pos/neg opposite-sign test (`compute_dls_mask`/`compute_dls_mask_per_axis`,
-  bit-identical at R=1); for K>2 (personas, register) it prunes per-axis. The
+  baseline rather than encoding a common offset/intensity. At K=2 (stacked
+  `[μ_pos, μ_neg]`) this is exactly the pos/neg opposite-sign test, bit-identical
+  to a difference-of-means vector's keep set; for K>2 (e.g. `personas`) it
+  prunes per-axis. The
   flat fit runs the straddle over all fit layers at once and slices the basis via
   `LayerSubspace.select_axes`; an all-fail layer is dropped (matching the
   folded-vector path). `--no-dls` keeps every axis.
@@ -361,27 +360,59 @@ uniform control-vector scalar reproduces the relative per-layer weighting
 ### 3.8 Discover-mode coordinate derivation
 
 When the user supplies labeled corpora but no coordinate system, `fit_mode` is
-`pca` or `spectral` and coordinates are derived per-model at fit time from the
-pooled centroids at a reference layer (`core/manifold.py`):
+`pca` or `spectral` and coordinates are derived per-model at fit time. The
+derivation is **layer-agnostic**: there is no reference layer. Each fit layer
+contributes its whitened, node-mean-centered `(K, K)` Gram `X̃_L Σ_L⁻¹ X̃_Lᵀ`
+(via `LayerWhitener.subspace_gram`), and the **consensus Gram** is their mean
+`Ḡ = mean_L X̃_L Σ_L⁻¹ X̃_Lᵀ`. Whitening puts every layer in common
+(background-σ) units, so the raw average is **signal-weighted**: a layer where
+the nodes aren't separated contributes a near-zero Gram and falls out of the
+mean, while a layer where the concept is strongly represented dominates — the
+layout draws on whichever layers the concept actually lives in, without picking a
+band by hand. The `(K, K)` Gram is the layer-invariant object, which is what
+makes averaging across heterogeneous-norm layers well-posed. Both methods embed
+that one consensus Gram (`core/manifold.py`):
 
-- **`derive_pca_coords`** — SVD of the centered centroids; pick the smallest
-  prefix whose cumulative variance crosses `var_threshold` (default 0.70), capped
-  at `max_dim` (default 8); project onto those `k` directions.
-- **`derive_spectral_coords`** — symmetric (union) k-NN graph, heat-kernel edge
-  weights, eigendecompose the symmetric normalized Laplacian, drop the smallest
-  eigenvalue, pick `k` by the eigenvalue-*ratio* cliff `argmax(λ_{k+1}/λ_k)` (the
-  absolute gap over-picks on S¹). A disconnected graph raises, naming the
-  component count and pointing at `--k-nn`/`--method pca`.
+- **`derive_pca_coords`** — eigendecompose `Ḡ` (`torch.linalg.eigh`, the Gram
+  analogue of SVD-of-centered-centroids: eigenvalues are the component variances,
+  eigenvectors scaled by `√λ` are the scores `U S`); pick the smallest prefix
+  whose cumulative variance crosses `var_threshold` (default 0.70), capped at
+  `max_dim` (default 8).
+- **`derive_spectral_coords`** — read pairwise distances off the Gram
+  (`d²_ij = Ḡ_ii + Ḡ_jj − 2 Ḡ_ij`, the mean per-layer Mahalanobis distance =
+  the distance in concatenated-whitened space), then symmetric (union) k-NN graph,
+  heat-kernel edge weights, eigendecompose the symmetric normalized Laplacian,
+  drop the smallest eigenvalue, pick `k` by the eigenvalue-*ratio* cliff
+  `argmax(λ_{k+1}/λ_k)` (the absolute gap over-picks on S¹). A disconnected graph
+  raises, naming the component count and pointing at `--k-nn`/`--method pca`.
 
-`anchor_origin` (pca only) post-translates the derived coords so a named node
-lands at `(0, …, 0)` — RBF/affine interpolation is exact at fit nodes, so
-`<manifold>%0,…,0` reproduces that anchor node's behavior. Both wrap the derived
-coords in `CustomDomain(k)` with identity embedding and proceed through
-`fit_affine_subspace` (pca) or `fit_layer_subspace` (spectral) unchanged.
-Per-model coordinates are the architectural consequence: a Gemma fit and a Qwen
-fit produce different node layouts for the same corpus heap, stored as
-`node_coords` in the per-model safetensors; the diagnostics
-(`PcaDiagnostics`/`SpectralDiagnostics`) ride into the sidecar.
+PCA embeds `Ḡ` linearly and spectral embeds it locally, but it is the **same**
+consensus geometry — `derive_pca_coords`'s eigendecomposition and
+`derive_spectral_coords`'s distances both come from one `Ḡ`, which is the
+Gram of the concatenated-whitened centroid stack.
+
+The per-layer summands of the consensus are a free diagnostic: each layer's
+`tr(G_L) = Σ_k ‖x̃_k‖²_M` is the total whitened between-node spread at layer `L`,
+in background-σ² units (comparable across layers). The fit stamps these into the
+sidecar as `node_spread_per_layer` — the concept's whitened signal-by-layer
+profile, surfaced by `manifold show`. It is diagnostic only (nothing runtime
+branches on it) and is computed for every K≥2 fit, authored included. It is the
+*full-space* sibling of the apply-time `mahalanobis_share` (§3.7), which is the
+same whitened spread restricted to the fitted steerable subspace; a layer where
+`tr(G_L)` is large but the share is small is one whose subspace is dropping concept
+signal (low explained variance).
+
+The derived coords come out PCA-mean-centered and wrap in `CustomDomain(k)` with
+identity embedding, then proceed through `fit_affine_subspace` (pca) or
+`fit_layer_subspace` (spectral) unchanged. There is no `anchor_origin` knob: the
+steer-time origin is always the projection of the per-model neutral mean onto the
+subspace (the affine fit neutral-anchors the frame — coord 0 in each layer's real
+reduced frame is neutral, §3.7), so the manifold's origin already carries the
+principled "no behavioral shift from neutral" meaning for free. Per-model
+coordinates are the architectural consequence: a Gemma fit and a Qwen fit produce
+different node layouts for the same corpus heap, stored as `node_coords` in the
+per-model safetensors; the diagnostics (`PcaDiagnostics`/`SpectralDiagnostics`)
+ride into the sidecar.
 
 The 2-node-vector case (§3.2) is exactly discover-`pca` with `max_dim=1`: `k`
 collapses to 1, the floor is `k+1 = 2` (a flat affine subspace needs only `k+1`
@@ -403,10 +434,12 @@ space before the fit).
 `session.generate_responses(concepts, kinds, *, roles=None, samples_per_prompt=1,
 max_new_tokens=256, on_progress=None)` is the unified corpus generator. For each
 `(concept, kind)` the model answers the **shared baseline prompts**
-(`saklas/data/baseline_prompts.json`, 64) *in character*: the concept rides a
+(`saklas/data/baseline_prompts.json`, 48) *in character*: the concept rides a
 system prompt (`_system_for`, by kind — abstract → "someone {c}", concrete →
-"{art} {c}") and a swapped assistant-role elicitation label (`_role_for`). It
-always role-swaps (no system-only fallback). Responses are emitted samples-outer /
+"{art} {c}") led by a shared one-paragraph length directive (`_LENGTH_DIRECTIVE`)
+to keep responses from rambling past the token cap, and a swapped assistant-role
+elicitation label (`_role_for`). It always role-swaps (no system-only fallback).
+Responses are emitted samples-outer /
 prompts-inner, so `response[i] ↔ baseline_prompt[i % k]` — the alignment
 `compute_node_centroid` and the node corpus files assume (length a multiple of
 `k`). The shared prompts hold topic common-mode across nodes, replacing the old
@@ -414,11 +447,17 @@ per-manifold scenario set (so no `scenarios.json` is written). Returns
 `{concept: [response, ...]}`. The vector path calls it with `[pos, neg]`;
 discover authoring (`manifold generate`, the HTTP route) loops it per node, writing
 each via the resumable discover writers (`io/manifolds.py`).
-`session.generate_neutral_responses` is the neutral sibling (empty system, standard
-label) that fills `neutral_statements.json` with organic responses to the same
-prompts. Extraction pools the swapped-back `[user, assistant]` pairs in
-standard-assistant space (the node `role`, when set, overrides the label for a
-persona-baselined fit).
+`session.generate_neutral_responses` is the neutral sibling (the length directive
+as its *only* system — no persona — standard label) that fills
+`neutral_statements.json` with organic responses to the same prompts. The
+directive is the only framing neutral shares with the node corpora (it leads every
+node system too), so it cancels at extraction while leaving neutral the
+default-voice reference the contrast subtracts against. Extraction pools the
+swapped-back `[system: directive, user, assistant]` turns in standard-assistant
+space — **the persona is generation-only, not reconstructed at capture**, so a
+node centroid sees only the brevity directive (matching the framing the response
+was generated under; the node `role`, when set, overrides the assistant label for
+a persona-baselined fit).
 
 ---
 
@@ -606,9 +645,9 @@ per target.
 
 ### 5.4 Worked dispatch trace (a folded vector)
 
-`0.3 angry.calm`:
+`0.3 formal.casual`:
 
-1. `_ensure_profile_registered("angry.calm")` loads the 2-node `pca` manifold,
+1. `_ensure_profile_registered("formal.casual")` loads the 2-node `pca` manifold,
    folds it (`folded_vector_directions` → `{L: δ̂_L·share_L}`), memoizes.
 2. `fold_directions_to_subspace` rebuilds a neutral-anchored `R=1` ray:
    `basis = δ̂_L`, `node_coords = [[‖d_L‖]]`, `share = ‖d_L‖_M`.
@@ -647,30 +686,52 @@ retuning. The lever is torn out everywhere; EV survives as a diagnostic only.
 ## 6. Probing / reads
 
 `core/monitor.py` — two read-side monitors, both hook-driven (inline with
-generation, one matmul per layer, no second forward pass), both fp32, both with
-no `.item()` per token. Both ride the same `HiddenCapture` plumbing as
-generation; `session._begin_capture` widens capture to the union of vector +
-manifold probe layers.
+generation, no second forward pass), both fp32, both with no `.item()` per token.
+Both ride the same `HiddenCapture` plumbing as generation; `session._begin_capture`
+widens capture to the union of vector + manifold probe layers. They are the
+read-side peers of the steering split (`SteeringManager.{subspaces, manifolds}`,
+one `subspace_inject` kernel): both read a fitted subspace and emit the **same
+coordinate-reading shape** (`ManifoldTokenReading` — `coords` + `fraction` +
+`nearest`), sharing the whitened-factor build (`_build_whitened_factors`), the
+attach-time node cache (`_attach_manifold_probe`), and the per-layer geometry
+(`_layer_geometry`); they diverge only in how they aggregate.
 
-### 6.1 TraitMonitor (vector probes)
+### 6.1 TraitMonitor (flat-subspace coordinate readout)
 
-Scores per-layer probe directions against the running hidden state. The per-layer
-similarity is the **whitened (Mahalanobis) cosine** `⟨V, h_c⟩_M / (‖V‖_M
-‖h_c‖_M)` — matching the metric the fit + `~`/`|` projection use. The metric is
-Mahalanobis-only and gated all-or-nothing via `covers_all`: the wired whitener must
-cover every probed layer, else `_ensure_cache` raises `WhitenerError` (there is no
-Euclidean path — a partial mix would fold cosines from two metrics into one
-aggregate). The per-layer
-probe *weight* stays `‖baked‖₂` (the bake already folded the Mahalanobis score
-into the magnitude, so re-whitening would double-count). `_ensure_cache`
-precomputes the whitened probe directions + their Mahalanobis norms +
-device-resident Woodbury factors, so the hot path is one matmul plus a cheap
-per-token `Σ⁻¹h_c` apply. The bundled probe roster comes from folding the fitted
-2-node manifolds tagged in each requested category
-(`session._bootstrap_manifold_probes`), so the probe directions are the same
-de-rogued directions steering uses. Entry points: `score_per_token` (primary,
-returns `(aggregate, per_token)`), `score_single_token{,_per_layer,_tensor}`
-(inline, SSE / probe-gate callback), `score_stack`, `measure` (one-shot text).
+Reads flat (affine) probes as whitened **coordinates** — a 2-node concept axis is
+the rank-1 case, the entire bundled roster. Per token it reports `coords` (the
+in-subspace position in the fit's *domain* frame, EV-weighted across layers),
+`fraction` (the in-subspace energy share ∈ [0,1]), and `nearest`. The coordinate
+is **domain-frame**, matching `ManifoldMonitor.score_aggregate`: each layer's raw
+reduced coord `c_L = M_R⁻¹ B Σ⁻¹ x` lives in that layer's own `‖δ_L‖` units and
+doesn't average across layers, so it is mapped through the affine inverse to the
+shared domain *before* EV-averaging. At rank-1 this is the pole-normalized
+coordinate — `1.0` at the positive node, signed, unbounded past it — and the
+affine inverse is exact and cheap enough to fill **per token** (a capability
+ManifoldMonitor defers to its aggregate). The reference for that inverse is each
+node's *whitened* read-coord, not the Euclidean `node_coords` (the two frames
+coincide only under isotropic Σ).
+
+The **rank-1 fast path** scores the whole roster in one stacked matmul per layer:
+`_ensure_cache` stacks every rank-1 probe's `Σ⁻¹d̂` rows (plus the precomputed
+`Σ⁻¹mean`, `‖d̂‖²_M`, and affine slope/intercept), so per token the reduced coords
+are `A @ h − cmean` (one matmul) + one shared `Σ⁻¹h` Woodbury apply for the
+fraction — no per-probe Python loop. A 1-node fold (a monopolar `extract`, or an
+ad-hoc `probe()` direction) is the neutral-anchored ray case (K=1); a rank-R flat fit
+falls to a per-probe slow path with `fraction` + `nearest` (the affine multi-dim
+coordinate invert is a follow-up). Metric is Mahalanobis-only, gated all-or-nothing
+via `covers_all` (else `_ensure_cache` raises `WhitenerError` — no Euclidean path).
+The bundled roster comes from the fitted 2-node manifolds tagged in each requested
+category (`session._bootstrap_manifold_probes` hands the `Manifold`s directly — no
+fold), so the read frame is the same de-rogued subspace steering uses. Entry
+points: `score_per_token` (primary — returns `(aggregate readings, per-token
+axis-0 coord stream)`), `score_single_token{,_per_layer,_tensor}` (inline, SSE /
+probe-gate callback), `score_stack`, `measure_from_hidden`. `flat_scalars`
+flattens readings to the gate channels `"<name>"` (= coord axis 0), `"<name>[i]"`
+(per axis), `"<name>:fraction"`. (Incremental no-sync capture is disabled under the
+coordinate readout — a `[P1]` row can't carry `fraction` for the aggregate —
+pending a `[P1,2]` row; full-retention scoring is used and the scoring fast path is
+unaffected.)
 
 ### 6.2 ManifoldMonitor (manifold probes)
 
@@ -699,10 +760,13 @@ as extraction), runs the channels, and additionally calls
 `core/triggers.py` — `Trigger` (frozen) carries phase flags + an optional
 `ProbeGate`. `Trigger.active(ctx)` consults the phase flags and, when gated,
 `ctx.probe_scores[gate.probe]` against `score <op> threshold`. The gate key is
-the canonical scalar key from whichever monitor supplied it (`"angry.calm"` from
-TraitMonitor, `"pad:fraction"` / `"pad@elated"` from ManifoldMonitor) — the
-runtime lookup is identical; only the parser knows the difference. Gated triggers
-report inactive during prefill (no reading yet) and for missing probes (no raise).
+the canonical scalar key from whichever monitor supplied it: from TraitMonitor,
+`"confident.uncertain"` (= coordinate axis 0) or `"personas[3]"` (coordinate axis 3 via the
+`@when:<probe>[<i>]` grammar) or `"confident.uncertain:fraction"`; from ManifoldMonitor,
+`"pad:fraction"` / `"pad@happy"`. The runtime lookup is identical — `flat_scalars`
+on each monitor writes the matching key — and only the parser knows the difference.
+Gated triggers report inactive during prefill (no reading yet) and for missing
+probes (no raise).
 
 ---
 
@@ -718,6 +782,8 @@ selector := atom (("~" | "|") atom | "%" position)?
 position := signed_num ("," signed_num)* | label
 atom     := [ns "/"] NAME ["." NAME] [":" variant]
 trigger  := preset | "when" ":" probe op NUM
+probe    := NAME ["." NAME] ["[" INT "]"]   # vector probe, optional coord axis
+          | NAME ":" "fraction" | NAME "@" NAME   # manifold channels
 ```
 
 `+`/`−` add terms, `*` attaches a coefficient, `~` projects onto a direction

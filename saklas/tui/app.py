@@ -2800,22 +2800,6 @@ class SaklasApp(App[None]):
             hl_label = self._highlight_probe or "off"
         self._left_panel.update_highlight(hl_label)
 
-    def _set_widget_token_data(
-        self, widget: _AssistantMessage,
-        response_token_strs: list[str],
-        response_probe_scores: dict[str, list[float]],
-        thinking_token_strs: list[str],
-        thinking_probe_scores: dict[str, list[float]],
-    ) -> None:
-        if not widget.is_mounted:
-            return
-        widget.set_token_data(
-            response_token_strs, response_probe_scores,
-            thinking_token_strs, thinking_probe_scores,
-        )
-        if self._highlighting:
-            widget.apply_highlight(True, self._highlight_probe)
-
     def _finalize_widget_highlight(self, widget: _AssistantMessage) -> None:
         """Pull per-token scores the session stashed during finalize and
         push to the widget for highlight-mode overlays.

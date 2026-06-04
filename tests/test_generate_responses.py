@@ -13,6 +13,7 @@ import pytest
 
 from saklas.core import vectors as V
 from saklas.core.session import SaklasSession, _role_for, _system_for
+from saklas.core.vectors import _LENGTH_DIRECTIVE
 
 
 class _FakeSession(SaklasSession):
@@ -64,6 +65,7 @@ def test_round_robin_alignment_and_count() -> None:
     s = _FakeSession()
     out = s.generate_responses(["happy"], ["abstract"], samples_per_prompt=2)
     # 2 samples x 3 prompts = 6 responses, samples-outer / prompts-inner.
+    # The length directive rides the system prompt, so user turns stay bare.
     assert out["happy"] == [
         "resp::P0", "resp::P1", "resp::P2",
         "resp::P0", "resp::P1", "resp::P2",
@@ -71,13 +73,17 @@ def test_round_robin_alignment_and_count() -> None:
     # response[i] was generated from baseline prompt[i % 3]
     prompts = [c["prompt"] for c in s.calls]
     assert prompts == ["P0", "P1", "P2", "P0", "P1", "P2"]
+    # every node system leads with the shared brevity directive
+    assert all(c["system"].startswith(_LENGTH_DIRECTIVE) for c in s.calls)
 
 
 def test_kind_drives_system_and_role() -> None:
     s = _FakeSession()
     s.generate_responses(["pirate"], ["concrete"])
     call = s.calls[0]
-    assert call["system"] == "You are a pirate. Respond exactly as a pirate would."
+    assert call["system"] == (
+        f"{_LENGTH_DIRECTIVE} You are a pirate. Respond exactly as a pirate would."
+    )
     assert call["role"] == "pirate"
 
     s2 = _FakeSession()
@@ -101,9 +107,12 @@ def test_multiple_concepts_keyed_separately() -> None:
 # --- generate_neutral_responses -------------------------------------------
 
 
-def test_neutral_responses_no_system_no_role() -> None:
+def test_neutral_responses_brevity_system_no_persona_no_role() -> None:
     s = _FakeSession()
     out = s.generate_neutral_responses(samples_per_prompt=2)
     assert len(out) == 6  # 2 x 3 prompts
-    assert all(c["system"] == "" for c in s.calls)
+    # neutral's only system is the shared brevity directive (no persona); the
+    # user turn stays bare and there is no role swap.
+    assert all(c["system"] == _LENGTH_DIRECTIVE for c in s.calls)
+    assert all(c["prompt"] in {"P0", "P1", "P2"} for c in s.calls)
     assert all(c["role"] is None for c in s.calls)

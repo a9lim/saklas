@@ -36,8 +36,11 @@ machinery that pipeline and dispatch both consume.
 One forward pass per response; `_capture_all_hidden_states` hooks every layer at
 once. Capture is **conversational** (4.0 / A2): a corpus item is an assistant
 *response* to a fixed baseline *prompt*, so `_encode_and_capture_all(model,
-tokenizer, prompt, response, layers, device, *, role=, model_type=)` renders
-`[user: prompt, assistant: response]` (no system turn, standard assistant label)
+tokenizer, prompt, response, layers, device, *, role=, model_type=, system_msg=)`
+renders `[system: directive, user: prompt, assistant: response]` (`system_msg`
+defaults to the shared `_LENGTH_DIRECTIVE` — the brevity directive only, *not* the
+generation persona — standard assistant label; matches the generation framing so
+the response isn't OOD and the directive cancels as common-mode against neutral)
 and pools from the response's **last content token** — `last_content_index` walks
 back past both `tokenizer.all_special_ids` and `tokenizer.added_tokens_encoder`
 values to skip trailing chat-template markers (where outlier channels dominate).
@@ -49,16 +52,16 @@ render+tokenize+walkback front half; `role` substitutes the assistant label only
 when an explicit per-node role override is set (the persona-baselined fit), the
 swap-back default being the standard assistant. `_load_baseline_prompts` loads the
 shared A2 user prompts (user override → bundled `saklas/data/baseline_prompts.json`,
-64 prompts); `_neutral_pairs` pairs the neutral corpus to those prompts
+48 prompts); `_neutral_pairs` pairs the neutral corpus to those prompts
 (`response[i] ↔ prompt[i % k]`). `compute_layer_means` /
 `compute_neutral_activations` build the probe-centering baseline + the whitener's
 neutral cache, pooling conversational `(prompt, response)` pairs via `_neutral_pairs`.
 
 DLS (Selective Steering, Dang & Ngo 2026 Eq. 9): `compute_dls_axes(node_centroids,
 bases, layer_means)` is the **N-node straddle** core — keep axis `d̂ᵣ` at layer L
-iff `{(cᵢ − ν)·d̂ᵣ}` straddles zero. `compute_dls_mask_per_axis` (bipolar sugar,
-the per-axis pos/neg form) and `compute_dls_mask` (scalar, the legacy
-opposite-sign product test) are thin wrappers, bit-identical at R=1. The subspace
+iff `{(cᵢ − ν)·d̂ᵣ}` straddles zero. At K=2 (stacked `[μ_pos, μ_neg]`) it
+reproduces a difference-of-means steering vector's keep set bit for bit (the
+legacy opposite-sign product test). The subspace
 apply path consumes the per-axis keep set by slicing the basis
 (`LayerSubspace.select_axes`); an all-fail layer drops.
 
@@ -100,13 +103,18 @@ role=node_role, model_type=)`), threading the folder's `node_kinds` /
 `fit_mode`:
 
 - **`pca`** (flat / discover; the 2-node-vector case): derive per-model coords
-  (`discover_coords` at a reference layer) when discover, then per layer
+  (`discover_coords` over the layer-agnostic consensus Gram — `mean_L` of each
+  layer's whitened, node-mean-centered `(K,K)` Gram, signal-weighted so the
+  layout draws on whichever layers carry the concept, no reference layer) when
+  discover, then per layer
   `fit_affine_subspace` (μ-centered PCA basis — whitened/Fisher; the whitener must
   cover every fit layer or the fit raises `WhitenerError`, there is no Euclidean
   activation-space fit — neutral-anchored frame, real
   per-layer `node_coords`), per-axis DLS straddle across all fit layers
   (`compute_dls_axes` → `select_axes`), then the μ-centered `subspace_share` bake.
-  `anchor_origin` (pca only) shifts coords so a named node lands at 0.
+  The per-layer subspace dim is the `max_dim`-capped layout dim (the affine span
+  *is* the layout — no `max_subspace_dim` for pca); the origin is the neutral
+  projection (neutral-anchored frame — no `anchor_origin` knob).
 - **monopolar** (a `pca` folder with `K == 1`): a structural early branch — a
   1-node flat fit is meaningless (needs `k+1 ≥ 2` poised nodes), so the engine
   reads it as concept-vs-neutral. Folds `concept − ν` (ν = `handle.layer_means`)
@@ -121,7 +129,15 @@ role=node_role, model_type=)`), threading the folder's `node_kinds` /
 `--sae` reconstructs each centroid through the SAE before the fit (fail-fast
 `SaeCoverageError`); the fitted subspace is model-space regardless. Bakes
 `explained_variance`, `mahalanobis_share` (+ `share_metric`/`subspace_metric`),
-`origin`. **No lever.** Whitener resolution is deferred past the cache-hit return
+`origin`. **No lever.** Discover coords come from the **consensus Gram** —
+`mean_L` of each layer's whitened, node-mean-centered `(K,K)` Gram
+`X̃_L Σ_L⁻¹ X̃_Lᵀ` (signal-weighted, layer-agnostic; no reference layer) — and the
+same per-layer Grams' traces are stamped into the sidecar as
+`node_spread_per_layer` (`{str(L): tr(G_L)}`), the concept's whitened
+signal-by-layer profile. Diagnostic only (nothing runtime branches on it; absent →
+empty dict), surfaced by `manifold show`; computed for every K≥2 fit (authored too),
+distinct from `mahalanobis_share` (the same whitened spread restricted to the
+steerable subspace). Whitener resolution is deferred past the cache-hit return
 and gated all-or-nothing on `covers_all`. `min_nodes(k) = 2k+1` for curved; a flat
 `pca` fit needs only `k+1` (so K=2/k=1 is a steering vector). Emits
 `ManifoldExtracted`. (Note: `extract.py`'s old concept `ExtractionPipeline` and
@@ -243,40 +259,55 @@ meant to overshoot; `norm_cap` bounds it). `onto` stays clamped `[0,1]`.
 
 `HiddenCapture` — `attach`/`detach`/`stacked`/`latest_per_layer`. Incremental
 mode (`set_incremental`) overwrites a length-1 bucket per layer so device memory
-stays O(layers·D); fires the step sink after the highest hooked layer. The session
-opts in for the common monitored case, wiring `score_single_token_tensor →
-_incremental_rows`; `_finalize_generation` builds `(agg, per_token)` from those
-rows bit-identically to `score_per_token`. Manifold probes + `return_hidden` force
-full retention.
+stays O(layers·D); fires the step sink after the highest hooked layer. It is
+currently **off** under the coordinate readout — the session keeps full retention
+and `_finalize_generation` scores via `score_per_token` — because the no-sync
+`[P1]` row carries only axis-0 coords, not the `fraction` the aggregate reading
+needs (TODO: re-enable with a `[P1,2]` coord+fraction row). Manifold probes +
+`return_hidden` already force full retention.
 
 ## monitor.py
 
-`TraitMonitor` scores vector probes against per-layer hidden states in the
-**whitened (Mahalanobis) cosine** — mandatory: the whitener must cover every
-probed layer (`covers_all`), else `_ensure_cache` raises `WhitenerError` (no
-Euclidean path). The probe weight stays `‖baked‖₂` (the bake already folded the Mahalanobis
-score in). `_ensure_cache` precomputes whitened probe directions + Mahalanobis
-norms + device-resident Woodbury factors; the hot path is one matmul + a cheap
-per-token `Σ⁻¹h_c` apply, zero `.item()`. `_layer_sims` is the shared per-layer
-kernel. Entry points: `score_per_token` (primary), `measure_from_hidden`,
-`score_single_token{,_per_layer,_tensor}`, `score_stack`, live-mean
-`begin/update/end_live`. The one-shot re-render text scorer (`measure`) is gone —
-every read source is now live hooks scoring pre-captured hidden states during
-generation, no second forward pass.
+`TraitMonitor` reads **flat (affine) probes as whitened coordinates** — a 2-node
+concept axis is the rank-1 case (the whole bundled roster). Per token it emits the
+same `ManifoldTokenReading` shape ManifoldMonitor does: `coords` (domain-frame,
+EV-weighted across layers), `fraction` (M-orthogonal share ∈ [0,1]), `nearest`.
+Coords are **domain-frame** (matching `score_aggregate`): each layer's raw reduced
+coord `c_L = M_R⁻¹ B Σ⁻¹ x` is in that layer's `‖δ_L‖` units, so it is mapped
+through the affine inverse to the shared domain *before* EV-averaging — the
+reference is each node's *whitened* read-coord, not the Euclidean `node_coords`. At
+rank-1 this is the pole-normalized coordinate (`1.0` at the positive node). The
+**rank-1 fast path** stacks every probe's `Σ⁻¹d̂` + precomputed `Σ⁻¹mean`/`‖d̂‖²_M`/
+affine slope-intercept so `_ensure_cache`'s hot path is one matmul (`A@h − cmean`)
++ one shared `Σ⁻¹h` Woodbury apply (the fraction denominator), no per-probe loop, zero
+`.item()`. A 1-node fold (a monopolar `extract`, ad-hoc `probe()`) is the K=1 ray case; a
+rank-R flat fit falls to a per-probe path with `fraction` + `nearest` (affine
+multi-dim coord invert is a follow-up). Mahalanobis-only (`covers_all` or
+`WhitenerError`). `flat_scalars` writes gate channels `"<name>"` (axis 0),
+`"<name>[i]"` (per axis), `"<name>:fraction"`. Entry points: `score_per_token`
+(primary — returns `(aggregate readings, per-token axis-0 coord stream)`),
+`measure_from_hidden`, `score_single_token{,_per_layer,_tensor}`, `score_stack`,
+live-mean `begin/update/end_live` (axis 0). History/stats are per-coordinate-axis
+(`axis_stats`); the TUI-facing scalar helpers report axis 0. The bundled roster is
+the fitted 2-node `Manifold`s themselves (`_bootstrap_manifold_probes` — no fold).
+(Incremental no-sync capture is disabled — a `[P1]` row can't carry `fraction` —
+pending a `[P1,2]` row; the scoring fast path is unaffected.)
 
-`ManifoldMonitor` is the manifold read peer (requires a whitener too).
+The two monitors share `_build_whitened_factors` (per-layer `_LayerWhiten` build),
+`_attach_manifold_probe` (node cache + EV weights + whitened), and `_layer_geometry`
+(per-layer `frac`/`cdist`/reduced-coord pieces) — the read-side peers of the
+steering `{subspaces, manifolds}` split. `ManifoldMonitor` is the curved peer.
 `add_probe(name, manifold, *, top_n)` caches per-layer reduced `(K,R)` node coords
-and builds the per-probe whitened factors (`_build_whitened` raises `WhitenerError`
-unless the whitener covers every fit layer — Mahalanobis-only, no Euclidean
-readout). Per token, EV-weighted across layers: the whitened **fraction**
-(M-orthogonal share ∈ [0,1]) + **nearest** node (`M_R`-metric cdist) via
-`AttachedManifoldProbe.whitened`. `score_single_token`
-returns `ManifoldTokenReading`s; `flat_scalars` flattens to `{"<name>:fraction",
-"<name>@<label>": −distance}` for the probe-gate machinery. `score_aggregate`
-(end-of-gen) pools the last non-special token, runs the channels, and recovers
-authoring coords + residual via `invert_parameterization`. The one-shot re-render
-text scorer (`measure`) is gone — like `TraitMonitor`, the read source is live
-hooks scoring captured hidden states.
+and builds the per-probe whitened factors (Mahalanobis-only). Per token,
+EV-weighted across layers: the whitened **fraction** + **nearest** node
+(`M_R`-metric cdist); `score_single_token` returns `ManifoldTokenReading`s (coords
+empty per-token — the curved invert is deferred), `flat_scalars` flattens to
+`{"<name>:fraction", "<name>@<label>": −distance}`. `score_aggregate` (end-of-gen)
+pools the last non-special token, runs the channels, and recovers authoring coords
++ residual via `invert_parameterization` (which raises on a flat fit — flat probes
+read coords through TraitMonitor's affine path instead). The one-shot re-render
+text scorer (`measure`) is gone — every read source is live hooks scoring captured
+hidden states, no second forward pass.
 
 ## triggers.py
 
@@ -372,9 +403,9 @@ memoized into `_profiles`; (3) a stale (`< PACK_FORMAT_VERSION`) legacy
 `vectors/<ns>/<name>/` folder — `_port_stale_legacy_vector` ports it to a 2-node
 manifold file-only (no tensor yet) and raises with the exact `manifold fit` command
 to run. `_bootstrap_manifold_probes(categories)` is the probe-roster bootstrap:
-for each `default/` manifold tagged in a requested category, fit-or-load + fold to
-a per-layer direction so `TraitMonitor` keeps its whitened-cosine read (replaces
-the old `io.probes_bootstrap.bootstrap_probes`).
+for each `default/` manifold tagged in a requested category, fit-or-load the
+2-node `Manifold` and hand it to `TraitMonitor` (which reads it as a rank-1
+coordinate — no fold; replaces the old `io.probes_bootstrap.bootstrap_probes`).
 
 `_compose_steering_entries` is the dispatch (`ARCHITECTURE.md` §4): classify each
 entry — `AblationTerm` → ablation fragment; `ManifoldTerm` → affine `%` joins the
@@ -394,9 +425,10 @@ re-scorable via `session.score_hidden`. Manifold probes ride the same plumbing:
 `add_manifold_probe(selector, *, as_name=None, top_n=3)` resolves via
 `_ensure_manifold_loaded` and registers on `_manifold_monitor`;
 `_begin_capture` widens to the union of vector + manifold probe layers; the gate
-callback merges `TraitMonitor.score_single_token` and
-`ManifoldMonitor.score_single_token`/`flat_scalars` into
-`TriggerContext.probe_scores`; `_finalize_generation` calls
+callback merges both monitors' `score_single_token` readings via their
+`flat_scalars` into `TriggerContext.probe_scores` (TraitMonitor →
+`"<name>"`/`"<name>[i]"`/`"<name>:fraction"`, ManifoldMonitor →
+`"<name>:fraction"`/`"<name>@<label>"`); `_finalize_generation` calls
 `ManifoldMonitor.score_aggregate` into `GenerationResult.manifold_readings`.
 `session.lock` is the server-owned `asyncio.Lock` (distinct from `_gen_lock`).
 `generate_batch`/`generate_sweep` return `RunSet` (sweep builds the Cartesian
@@ -459,13 +491,18 @@ logprobs + the cross-branch evaluation (`_compute_rows`, alignment via
 `ManifoldTokenReading`, `ManifoldAggregate`, `ResultCollector`. `RunSet` is the
 list-like multi-run shape (`node_ids`/`grid`/`.first`/`.to_collector()`/
 `.to_dataframe()`). `TokenEvent` carries `thinking`, `logprob`, `top_alts`,
-`finish_reason`, `scores` (per-probe sims, live-stream-gated), `perplexity`,
-`manifold_readings`. `GenerationResult` carries `prompt_tokens`, `finish_reason`,
-optional `logprobs`, `manifold_readings`, and `applied_steering` (the canonical
-expression, round-trips through `parse_expr`). `ManifoldTokenReading` (`fraction`,
-`nearest`) is per-token; `ManifoldAggregate` (`fraction_mean`/`fraction_per_layer`/
-`nearest`/`coords`/`coords_per_layer`/`residual_mean`/`residual_per_layer`) is
-end-of-gen. `to_dict()` omits `hidden_states`.
+`finish_reason`, `scores` (per-probe `ManifoldTokenReading`s — the coordinate
+readings, live-stream-gated), `perplexity`, `manifold_readings`. `GenerationResult`
+carries `prompt_tokens`, `finish_reason`, optional `logprobs`, `readings`
+(per-probe `ProbeReadings`), `manifold_readings`, and `applied_steering` (the
+canonical expression, round-trips through `parse_expr`). `ManifoldTokenReading`
+(`coords`, `fraction`, `nearest`) is the unified per-token reading — `coords` is
+the domain-frame coordinate (filled for a flat fit, empty for a curved fit per
+token); `ManifoldAggregate` (`fraction_mean`/`fraction_per_layer`/`nearest`/
+`coords`/`coords_per_layer`/`residual_mean`/`residual_per_layer`) is end-of-gen.
+`ProbeReadings` is vectorized per coordinate axis (`mean`/`std`/`min`/`max`/
+`delta_per_gen` are `tuple[float,...]`, `per_generation` a list of coord tuples).
+`to_dict()` omits `hidden_states`.
 
 ## histogram.py
 
@@ -497,6 +534,6 @@ default coeff 1.0, doesn't compose with `~`/`|` — lowered through
 `synthesize_subspace`'s ablation path at dispatch), `ManifoldTerm` (`along`,
 `onto`, position; `_expand_along_onto_coeffs` yields a 1- or 2-tuple). Probe gates
 (`@when:<probe><op><threshold>`) accept three identifier shapes — vector
-(`angry.calm`), manifold fraction (`pad:fraction`), manifold label
-(`pad@elated`) — all stored verbatim in `ProbeGate.probe` so the runtime gate is
+(`confident.uncertain`), manifold fraction (`pad:fraction`), manifold label
+(`pad@happy`) — all stored verbatim in `ProbeGate.probe` so the runtime gate is
 identical; the parser is the only place the discrimination lives.

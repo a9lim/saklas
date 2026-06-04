@@ -23,8 +23,7 @@ to sub-module registrars and registers a few route groups in place:
 - in place: the loom `tree/*` routes, the `/sessions/{id}/vectors/*` routes, and
   the `WS /sessions/{id}/stream`
 
-`server/openai.py` is a re-export facade over `app.py`. `server/sse.py` and
-`server/ws_events.py` are the shared SSE / WS plumbing.
+`server/sse.py` and `server/ws_events.py` are the shared SSE / WS plumbing.
 
 ## app.py (OpenAI)
 

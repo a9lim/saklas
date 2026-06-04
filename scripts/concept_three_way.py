@@ -59,7 +59,7 @@ import torch
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 from saklas import Profile, SamplingConfig, SaklasSession
-from saklas.core.vectors import _capture_all_hidden_states, compute_dls_mask
+from saklas.core.vectors import _capture_all_hidden_states, compute_dls_axes
 from _bundled_manifold_data import (
     load_bipolar_manifold_pairs,
     load_folded_bundled_profile,
@@ -433,9 +433,15 @@ def _share_bake(
     }
     ref_norms = {L: norm_sums[L] / max(norm_counts[L], 1) for L in layers}
 
-    keep = compute_dls_mask(
-        mu_pos, mu_neg, unit_dir, session.layer_means,
-    )
+    keep = {
+        L for L, ax in compute_dls_axes(
+            {L: torch.stack([mu_pos[L].reshape(-1), mu_neg[L].reshape(-1)])
+             for L in mu_pos},
+            {L: d.reshape(1, -1) for L, d in unit_dir.items()},
+            session.layer_means,
+        ).items()
+        if ax
+    }
     print(f"    DLS retained: {len(keep)}/{len(layers)} layers")
 
     whitener = session.whitener

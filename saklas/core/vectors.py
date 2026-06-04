@@ -95,6 +95,21 @@ def last_content_index(token_ids: Sequence[int], tokenizer: Any) -> int:
     return idx
 
 
+# Shared one-paragraph length directive — a system prompt applied to BOTH
+# generation (``session.generate_responses`` / ``generate_neutral_responses``)
+# AND capture (every ``_encode_and_capture_all`` site), for node and neutral
+# corpora alike.  Identical and symmetric across all four sites, so it is
+# common-mode: it cancels in ``node − neutral`` (and ``concept − ν``) instead of
+# leaking a "be brief" offset into the extracted directions, and it matches the
+# capture framing to the generation framing so the pooled responses are not
+# out-of-distribution.  Without it the model rambles past the token cap and
+# truncates mid-thought.  (For a node, generation also prepends the persona to
+# this system prompt; capture keeps only the directive — the persona stays
+# generation-only, its signal carried in the response text, pooled in
+# standard-assistant space.)
+_LENGTH_DIRECTIVE = "Answer in one short paragraph."
+
+
 def _encode_and_capture_all(
     model: torch.nn.Module,
     tokenizer: Any,
@@ -105,15 +120,19 @@ def _encode_and_capture_all(
     *,
     role: str | None = None,
     model_type: str | None = None,
+    system_msg: str = _LENGTH_DIRECTIVE,
 ):
     """Capture the last-content-token hidden state per layer for a turn pair, fp32.
 
     Conversational (4.0 / A2) capture: the corpus item is an assistant
     *response* to a fixed baseline *prompt*, so extraction pools the model in
-    its real generation regime — ``[user: prompt, assistant: response]`` with
-    no system turn, standard assistant label.  ``role`` overrides the assistant
-    label only when an explicit per-node role is set (the persona-baselined
-    fit); ``role=None`` is the swap-back default.
+    its real generation regime — ``[system: directive, user: prompt, assistant:
+    response]`` with the standard assistant label.  ``system_msg`` defaults to
+    the shared :data:`_LENGTH_DIRECTIVE` so capture matches the framing the
+    corpus was generated under (and cancels as common-mode against the neutral
+    baseline); pass ``""`` to drop the system turn.  ``role`` overrides the
+    assistant label only when an explicit per-node role is set (the
+    persona-baselined fit); ``role=None`` is the swap-back default.
 
     Pools from the response's last non-special token — chat templates append
     trailing markers (Llama's <|eot_id|>, Gemma's <end_of_turn>, Qwen's
@@ -125,7 +144,8 @@ def _encode_and_capture_all(
         dict mapping layer_idx -> pooled vector (dim,) in fp32.
     """
     ids, content_end = _render_and_tokenize_for_capture(
-        tokenizer, prompt, response, device, role=role, model_type=model_type,
+        tokenizer, prompt, response, device,
+        role=role, model_type=model_type, system_msg=system_msg,
     )
     hidden_per_layer = _capture_all_hidden_states(model, layers, ids)
     return {
@@ -142,17 +162,19 @@ def _render_and_tokenize_for_capture(
     *,
     role: str | None = None,
     model_type: str | None = None,
+    system_msg: str = _LENGTH_DIRECTIVE,
 ) -> tuple[torch.Tensor, int]:
-    """Render a ``[user, assistant]`` pair + tokenize, locating the last content token.
+    """Render a ``[system, user, assistant]`` turn + tokenize, locating the last content token.
 
     The shared front half of :func:`_encode_and_capture_all`.  Conversational
     (4.0 / A2) capture: ``response`` is an assistant turn answering ``prompt``,
-    rendered with no system turn and the standard assistant label.  ``role``
-    (when set) substitutes a custom assistant-role label via
-    :func:`saklas.core.role_templates.apply_with_role` for the persona-baselined
-    fit; ``role=None`` is the swap-back default.  Returns ``(ids [1, T] on
-    device, content_end)`` where ``content_end`` is the response's last
-    non-special token — the canonical pooling position.
+    rendered under ``system_msg`` (the shared :data:`_LENGTH_DIRECTIVE` by
+    default, matching generation; ``""`` drops the system turn) with the standard
+    assistant label.  ``role`` (when set) substitutes a custom assistant-role
+    label via :func:`saklas.core.role_templates.apply_with_role` for the
+    persona-baselined fit; ``role=None`` is the swap-back default.  Returns
+    ``(ids [1, T] on device, content_end)`` where ``content_end`` is the
+    response's last non-special token — the canonical pooling position.
     """
     if getattr(tokenizer, "chat_template", None) is not None:
         # Disable thinking/reasoning mode for models that support it
@@ -161,10 +183,13 @@ def _render_and_tokenize_for_capture(
         if "enable_thinking" in (getattr(tokenizer, "chat_template", "") or ""):
             kwargs["enable_thinking"] = False
 
-        messages = [
+        messages = []
+        if system_msg:
+            messages.append({"role": "system", "content": system_msg})
+        messages.extend([
             {"role": "user", "content": prompt},
             {"role": "assistant", "content": response},
-        ]
+        ])
         if role is None:
             text = tokenizer.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=False, **kwargs,
@@ -183,9 +208,10 @@ def _render_and_tokenize_for_capture(
             )
     else:
         # Base model (no chat template) — there are no turn roles to render and
-        # A2 role-swap cannot apply; capture the bare prompt+response
-        # continuation as raw text.
-        text = f"{prompt}\n{response}"
+        # A2 role-swap cannot apply; capture the prompt+response continuation as
+        # raw text, with the length directive prepended (when set) so the framing
+        # still matches generation.
+        text = f"{system_msg}\n{prompt}\n{response}" if system_msg else f"{prompt}\n{response}"
     enc = tokenizer(text, return_tensors="pt", add_special_tokens=False)
     ids = enc["input_ids"]
     if ids.numel() == 0:
@@ -221,7 +247,7 @@ def _load_baseline_prompts() -> list[str]:
     """Load the shared A2 baseline user prompts.
 
     Prefers a user override at ``~/.saklas/baseline_prompts.json``, else the
-    bundled ``saklas/data/baseline_prompts.json`` (64 affect-neutral prompts).
+    bundled ``saklas/data/baseline_prompts.json`` (48 affect-neutral prompts).
     Conversational capture pairs each node response with its prompt by
     ``response[i] -> prompt[i % len(prompts)]``.
     """
@@ -238,10 +264,11 @@ def _neutral_pairs() -> list[tuple[str, str]]:
     """The neutral baseline as ``(prompt, response)`` pairs for conversational capture.
 
     The neutral corpus (``neutral_statements.json``) is the model's organic,
-    no-system / no-role responses to the shared baseline prompts; pairing is
-    positional, ``response[i] -> baseline[i % k]`` — the same alignment a node
-    corpus uses.  Raises if the corpus length is not a multiple of the prompt
-    set (regenerate neutrals against the shared baseline).
+    no-persona / no-role responses to the shared baseline prompts (generated and
+    captured under the shared length directive only — see :data:`_LENGTH_DIRECTIVE`);
+    pairing is positional, ``response[i] -> baseline[i % k]`` — the same alignment
+    a node corpus uses.  Raises if the corpus length is not a multiple of the
+    prompt set (regenerate neutrals against the shared baseline).
     """
     responses = _load_neutral_prompts()
     baseline = _load_baseline_prompts()
@@ -360,10 +387,9 @@ def compute_dls_axes(
     **N=2 parity (the spine invariant).**  With
     ``node_centroids[L] = stack([μ_pos, μ_neg])`` the straddle
     ``min < 0 < max`` is exactly the bipolar opposite-sign product test, bit
-    for bit — :func:`compute_dls_mask_per_axis` is the 2-node sugar over this
-    core, and the scalar :func:`compute_dls_mask` the ``R = 1`` face of that.
-    So a 2-node subspace reproduces today's vector DLS keep set exactly, and
-    an N-node subspace (e.g. ``personas``) prunes per-axis the same way.
+    for bit, so a 2-node subspace reproduces a difference-of-means steering
+    vector's DLS keep set exactly (the ``R = 1`` layer set), and an N-node
+    subspace (e.g. ``personas``) prunes per-axis the same way.
 
     Returns ``{layer: {kept axis indices}}``; a layer absent / mapped to an
     empty set is fully dropped.  ``layer_means`` ``None``/empty disables DLS
@@ -445,76 +471,6 @@ def compute_dls_axes(
         )
         return checkable
     return keep
-
-
-def compute_dls_mask_per_axis(
-    mu_pos: dict[int, torch.Tensor],
-    mu_neg: dict[int, torch.Tensor],
-    bases: dict[int, torch.Tensor],
-    layer_means: dict[int, torch.Tensor] | None,
-) -> dict[int, set[int]]:
-    """Bipolar (2-node) per-axis DLS — sugar over :func:`compute_dls_axes`.
-
-    Stacks each layer's ``[μ_pos, μ_neg]`` into the ``[2, D]`` node-centroid
-    form and delegates to the N-node straddle core.  At ``K = 2`` the straddle
-    ``min < 0 < max`` *is* the centered opposite-sign product test
-    ``(μ_pos − ν)·d̂_r · (μ_neg − ν)·d̂_r < 0``, so this reproduces the
-    historical bipolar keep set bit for bit; the scalar :func:`compute_dls_mask`
-    is the ``R = 1`` face (a single basis row).  The consumer slices the
-    effective basis to the kept rows at apply time, so DLS survives the
-    vector→subspace fold without a separate scalar path.
-
-    ``mu_neg`` must cover every layer of ``mu_pos`` (the caller builds them
-    aligned).  ``layer_means`` ``None``/empty disables DLS; see
-    :func:`compute_dls_axes` for the centering rationale, the missing-baseline
-    conservative-keep, and the all-fail fallback.
-    """
-    node_centroids = {
-        L: torch.stack([mu_pos[L].reshape(-1), mu_neg[L].reshape(-1)])
-        for L in mu_pos
-    }
-    return compute_dls_axes(node_centroids, bases, layer_means)
-
-
-def compute_dls_mask(
-    mu_pos: dict[int, torch.Tensor],
-    mu_neg: dict[int, torch.Tensor],
-    directions: dict[int, torch.Tensor],
-    layer_means: dict[int, torch.Tensor] | None,
-) -> set[int]:
-    """Discriminative-Layer-Selection keep set (scalar / single-direction).
-
-    The R=1 face of :func:`compute_dls_mask_per_axis`: each layer's single
-    ``directions[L]`` is a one-row basis, and a layer is kept iff that row
-    passes the centered opposite-sign check (or is conservatively kept on a
-    missing baseline).  Bit-identical to the historical implementation — it
-    is now a thin wrapper so the vector and subspace paths share one DLS
-    kernel.
-
-    Layers where both pos- and neg-class means project to the same side of
-    the neutral baseline along ``d̂`` are non-discriminative (they encode
-    concept *intensity*, not *polarity*); dropping them concentrates share
-    on layers that genuinely carry the contrast.  See
-    :func:`compute_dls_mask_per_axis` for the centering rationale and the
-    all-fail fallback.
-
-    Args:
-        mu_pos: per-layer positive-class mean, fp32 ``[D]`` per layer.
-        mu_neg: same for the negative class (same layer set as ``mu_pos``).
-        directions: per-layer unsigned direction (``unit(μ_pos − μ_neg)``
-            for DiM, principal component for PCA).  Magnitude is irrelevant
-            (only projection sign matters); unit input recommended.
-        layer_means: per-layer neutral baseline; ``None`` disables DLS
-            (returns every layer).
-
-    Returns:
-        ``set[int]`` of layers passing the discriminative check; the
-        keep-all-checkable fallback fires (with a warning) if every layer
-        fails.
-    """
-    bases = {L: d.reshape(1, -1) for L, d in directions.items()}
-    per_axis = compute_dls_mask_per_axis(mu_pos, mu_neg, bases, layer_means)
-    return {L for L, axes in per_axis.items() if axes}
 
 
 def fold_directions_to_subspace(

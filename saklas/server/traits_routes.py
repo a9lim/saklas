@@ -67,6 +67,14 @@ def register_traits_routes(app: FastAPI) -> None:
                         )
                     elif tag == "token":
                         _, idx, text, thinking, scores = item
+                        # ``scores`` is already the per-probe coordinate axis-0
+                        # float (the session collapses each reading's
+                        # ``coords[0]`` before enqueueing), so the wire-stable
+                        # ``probes`` map keeps its ``{name: float}`` shape.
+                        # The per-token queue item carries no richer coordinate
+                        # payload, so the additive ``probe_readings`` channel is
+                        # only emitted on the ``done`` frame, where the full
+                        # result is reachable.
                         payload = {
                             "type": "token",
                             "idx": idx,
@@ -81,6 +89,12 @@ def register_traits_routes(app: FastAPI) -> None:
                     elif tag == "done":
                         result = item[1]
                         aggregate: dict[str, float] = {}
+                        # Additive rich channel: the full per-probe coordinate
+                        # reading (every axis + per-generation samples) so a
+                        # native client can read coordinates without the
+                        # wire-stable ``aggregate`` (axis-0) shape changing.
+                        probe_readings: dict[str, Any] = {}
+                        manifold_readings: dict[str, Any] = {}
                         if result is not None:
                             readings = getattr(result, "readings", None)
                             if readings:
@@ -88,12 +102,29 @@ def register_traits_routes(app: FastAPI) -> None:
                                     per_generation = getattr(
                                         reading, "per_generation", None,
                                     )
-                                    value = (
+                                    # ``per_generation`` samples and ``mean``
+                                    # are per-axis coordinate tuples now; the
+                                    # scalar ``aggregate`` reads axis 0.
+                                    sample = (
                                         per_generation[-1]
                                         if per_generation
-                                        else getattr(reading, "mean", 0.0)
+                                        else getattr(reading, "mean", None)
                                     )
-                                    aggregate[name] = round(value, 6)
+                                    value = (
+                                        sample[0]
+                                        if sample
+                                        else 0.0
+                                    )
+                                    aggregate[name] = round(float(value), 6)
+                                    with suppress(Exception):
+                                        probe_readings[name] = reading.to_dict()
+                            mf_readings = getattr(
+                                result, "manifold_readings", None,
+                            )
+                            if mf_readings:
+                                for name, agg in mf_readings.items():
+                                    with suppress(Exception):
+                                        manifold_readings[name] = agg.to_dict()
                         payload = {
                             "type": "done",
                             "generation_id": generation_id,
@@ -104,6 +135,10 @@ def register_traits_routes(app: FastAPI) -> None:
                             ),
                             "aggregate": aggregate,
                         }
+                        if probe_readings:
+                            payload["probe_readings"] = probe_readings
+                        if manifold_readings:
+                            payload["manifold_readings"] = manifold_readings
                         yield f"data: {json.dumps(payload)}\n\n"
                         generation_id = None
             finally:

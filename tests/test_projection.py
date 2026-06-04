@@ -329,7 +329,7 @@ class TestLayerMeansLazy:
     ``probes=[]`` left ``self._layer_means`` empty.
 
     Closes the v2.1 footgun where ``probes=[]`` sessions hit
-    ``compute_dls_mask`` with an empty dict, every layer fell into
+    ``compute_dls_axes`` with an empty dict, every layer fell into
     the conservative-keep branch, and DLS silently disabled itself.
     """
 
@@ -385,35 +385,48 @@ class TestLayerMeansLazy:
         assert len(calls) == 1
 
 
-class TestComputeDlsMaskEmptyGuard:
-    """``compute_dls_mask`` treats ``layer_means={}`` identically to
-    ``layer_means=None`` — both fall back to keep-all silently.
+class TestComputeDlsAxesBipolarGuard:
+    """The folded-vector (bipolar, 2-node) face of ``compute_dls_axes``:
+    ``layer_means={}`` behaves identically to ``layer_means=None`` (both
+    keep-all), and the all-fail fallback excludes degenerate (skipped)
+    layers.  Inputs are stacked ``[μ_pos, μ_neg]`` with a single-row basis —
+    the shape a difference-of-means steering vector lowers to.
     """
 
+    @staticmethod
+    def _keep(
+        mu_pos: dict[int, torch.Tensor],
+        mu_neg: dict[int, torch.Tensor],
+        directions: dict[int, torch.Tensor],
+        layer_means: dict[int, torch.Tensor] | None,
+    ) -> set[int]:
+        from saklas.core.vectors import compute_dls_axes
+        node_centroids = {
+            L: torch.stack([mu_pos[L].reshape(-1), mu_neg[L].reshape(-1)])
+            for L in mu_pos
+        }
+        bases = {L: directions[L].reshape(1, -1) for L in directions}
+        per_axis = compute_dls_axes(node_centroids, bases, layer_means)
+        return {L for L, axes in per_axis.items() if axes}
+
     def test_none_keeps_all(self):
-        from saklas.core.vectors import compute_dls_mask
         mu_pos = {0: torch.tensor([1.0, 0.0]), 1: torch.tensor([2.0, 0.0])}
         mu_neg = {0: torch.tensor([-1.0, 0.0]), 1: torch.tensor([-2.0, 0.0])}
         directions = {L: mu_pos[L] - mu_neg[L] for L in mu_pos}
-        out = compute_dls_mask(mu_pos, mu_neg, directions, None)
-        assert out == {0, 1}
+        assert self._keep(mu_pos, mu_neg, directions, None) == {0, 1}
 
     def test_empty_dict_keeps_all(self):
-        from saklas.core.vectors import compute_dls_mask
         mu_pos = {0: torch.tensor([1.0, 0.0]), 1: torch.tensor([2.0, 0.0])}
         mu_neg = {0: torch.tensor([-1.0, 0.0]), 1: torch.tensor([-2.0, 0.0])}
         directions = {L: mu_pos[L] - mu_neg[L] for L in mu_pos}
-        out = compute_dls_mask(mu_pos, mu_neg, directions, {})
-        assert out == {0, 1}
+        assert self._keep(mu_pos, mu_neg, directions, {}) == {0, 1}
 
     def test_all_failed_fallback_excludes_skipped_layers(self):
-        # All layers fail the discriminative test, but layers 0+1 also
-        # had degenerate directions that the loop explicitly skipped.
-        # Fallback should return only the *checkable* set (layer 2),
-        # not every layer in mu_pos — re-including skipped layers via
-        # the fallback would silently undo the skip.
+        # All layers fail the discriminative test, but layers 0+1 also had
+        # degenerate directions the loop explicitly skipped.  Fallback returns
+        # only the *checkable* set (layer 2), not every layer — re-including
+        # skipped layers via the fallback would silently undo the skip.
         import warnings as _warnings
-        from saklas.core.vectors import compute_dls_mask
         mu_pos = {
             0: torch.tensor([0.5, 0.0]),
             1: torch.tensor([0.7, 0.0]),
@@ -431,11 +444,9 @@ class TestComputeDlsMaskEmptyGuard:
             2: mu_pos[2] - mu_neg[2],  # non-degenerate, but won't pass DLS
         }
         layer_means = {0: torch.zeros(2), 1: torch.zeros(2), 2: torch.zeros(2)}
-
         with _warnings.catch_warnings(record=True) as caught:
             _warnings.simplefilter("always")
-            out = compute_dls_mask(mu_pos, mu_neg, directions, layer_means)
-
+            out = self._keep(mu_pos, mu_neg, directions, layer_means)
         # Layer 2 is checkable but failed; fallback returns just it.
         # Layers 0+1 stay dropped despite the fallback.
         assert out == {2}
@@ -443,12 +454,11 @@ class TestComputeDlsMaskEmptyGuard:
         assert any("DLS" in m for m in msgs)
 
     def test_partial_layer_means_runs_check(self):
-        """Layers with a baseline get checked; layers without fall
-        through the per-layer ``mu_n is None`` conservative-keep."""
-        from saklas.core.vectors import compute_dls_mask
+        """Layers with a baseline get checked; layers without fall through
+        the per-layer ``mu_n is None`` conservative-keep."""
         mu_pos = {
             0: torch.tensor([1.0, 0.0]),  # opposite-signed → kept
-            1: torch.tensor([0.5, 0.0]),  # same-signed (both positive after centering) → drop
+            1: torch.tensor([0.5, 0.0]),  # same-signed → drop
             2: torch.tensor([3.0, 0.0]),  # no baseline → conservative keep
         }
         mu_neg = {
@@ -459,104 +469,14 @@ class TestComputeDlsMaskEmptyGuard:
         directions = {L: mu_pos[L] - mu_neg[L] for L in mu_pos}
         # Baseline = 0 for layers 0+1 but absent for layer 2.
         layer_means = {0: torch.zeros(2), 1: torch.zeros(2)}
-        out = compute_dls_mask(mu_pos, mu_neg, directions, layer_means)
-        assert out == {0, 2}  # 1 dropped (both leans positive); 2 kept (no baseline)
-
-
-class TestComputeDlsMaskPerAxis:
-    """Per-axis DLS — the R-dim generalization that lets a folded vector
-    reuse the manifold apply path's basis-row slicing without losing
-    discriminative layer selection.  The load-bearing invariant is exact
-    R=1 parity with the scalar :func:`compute_dls_mask`."""
-
-    def test_per_axis_keep_drop(self):
-        # neutral = 0; axis 0 = x is opposite-signed (keep), axis 1 = y is
-        # same-signed (drop).  One layer, a 2-row basis.
-        from saklas.core.vectors import compute_dls_mask_per_axis
-        mu_pos = {5: torch.tensor([1.0, 0.5])}
-        mu_neg = {5: torch.tensor([-1.0, 0.3])}
-        bases = {5: torch.tensor([[1.0, 0.0], [0.0, 1.0]])}
-        layer_means = {5: torch.zeros(2)}
-        out = compute_dls_mask_per_axis(mu_pos, mu_neg, bases, layer_means)
-        assert out == {5: {0}}
-
-    def test_per_axis_degenerate_row_skipped(self):
-        # A zero-norm basis row is degenerate: dropped, and excluded from
-        # the all-fail fallback's checkable set.
-        from saklas.core.vectors import compute_dls_mask_per_axis
-        mu_pos = {0: torch.tensor([1.0, 0.0])}
-        mu_neg = {0: torch.tensor([-1.0, 0.0])}
-        bases = {0: torch.tensor([[1.0, 0.0], [0.0, 0.0]])}  # row 1 zero-norm
-        layer_means = {0: torch.zeros(2)}
-        out = compute_dls_mask_per_axis(mu_pos, mu_neg, bases, layer_means)
-        assert out == {0: {0}}  # row 0 kept, row 1 silently dropped
-
-    def test_per_axis_disabled_keeps_every_axis(self):
-        from saklas.core.vectors import compute_dls_mask_per_axis
-        mu_pos = {0: torch.tensor([1.0, 0.5]), 1: torch.tensor([2.0, 0.0])}
-        mu_neg = {0: torch.tensor([-1.0, 0.3]), 1: torch.tensor([-2.0, 0.0])}
-        bases = {0: torch.eye(2), 1: torch.eye(2)}
-        out = compute_dls_mask_per_axis(mu_pos, mu_neg, bases, None)
-        assert out == {0: {0, 1}, 1: {0, 1}}
-
-    def test_per_axis_all_fail_fallback(self):
-        # Every checkable axis fails the discriminative test → fall back to
-        # the full checkable set with a one-time warning.
-        import warnings as _warnings
-        from saklas.core.vectors import compute_dls_mask_per_axis
-        mu_pos = {0: torch.tensor([0.5, 0.7])}
-        mu_neg = {0: torch.tensor([0.3, 0.4])}  # both axes same-signed vs 0
-        bases = {0: torch.eye(2)}
-        layer_means = {0: torch.zeros(2)}
-        with _warnings.catch_warnings(record=True) as caught:
-            _warnings.simplefilter("always")
-            out = compute_dls_mask_per_axis(mu_pos, mu_neg, bases, layer_means)
-        assert out == {0: {0, 1}}
-        msgs = [str(w.message) for w in caught if issubclass(w.category, UserWarning)]
-        assert any("DLS" in m for m in msgs)
-
-    def test_r1_parity_with_scalar(self):
-        """The spine invariant: a single-row basis collapses bit-for-bit to
-        the scalar keep set, across randomized inputs and all the edge
-        branches (pass / drop / missing-baseline / degenerate / all-fail)."""
-        from saklas.core.vectors import (
-            compute_dls_mask,
-            compute_dls_mask_per_axis,
-        )
-        for seed in range(40):
-            torch.manual_seed(seed)
-            n_layers = int(torch.randint(1, 6, ()).item())
-            dim = int(torch.randint(2, 9, ()).item())
-            mu_pos, mu_neg, directions, layer_means = {}, {}, {}, {}
-            for L in range(n_layers):
-                mu_pos[L] = torch.randn(dim)
-                mu_neg[L] = torch.randn(dim)
-                # Mix of real / degenerate directions and present / absent
-                # baselines so every branch is exercised across seeds.
-                directions[L] = (
-                    torch.zeros(dim)
-                    if (seed + L) % 7 == 0
-                    else torch.randn(dim)
-                )
-                if (seed + L) % 5 != 0:
-                    layer_means[L] = torch.randn(dim)
-            # Occasionally disable DLS entirely.
-            lm = None if seed % 11 == 0 else layer_means
-            scalar = compute_dls_mask(mu_pos, mu_neg, directions, lm)
-            bases = {L: directions[L].reshape(1, -1) for L in directions}
-            per_axis = compute_dls_mask_per_axis(mu_pos, mu_neg, bases, lm)
-            collapsed = {L for L, axes in per_axis.items() if axes}
-            assert collapsed == scalar, f"seed={seed}"
-            # Kept layers carry exactly the single axis {0}.
-            for L in collapsed:
-                assert per_axis[L] == {0}, f"seed={seed} L={L}"
+        assert self._keep(mu_pos, mu_neg, directions, layer_means) == {0, 2}
 
 
 class TestComputeDlsAxes:
     """N-node per-axis DLS straddle — the form a flat subspace of any node
-    count (a vector at K=2, ``personas`` at K=101) prunes axes with.  The
-    load-bearing invariant is bit-for-bit parity with the bipolar
-    :func:`compute_dls_mask_per_axis` at N=2."""
+    count (a vector at K=2, ``personas`` at K=101) prunes axes with.  At
+    K=2 (stacked ``[μ_pos, μ_neg]``) it reproduces the difference-of-means
+    keep set the folded-vector path uses."""
 
     def test_n_node_straddle_keep_drop(self):
         # Three nodes, neutral at 0.  Axis 0 (x): projections {+2, 0.5, -1}
@@ -611,39 +531,6 @@ class TestComputeDlsAxes:
         assert out == {0: {0, 1}}
         msgs = [str(w.message) for w in caught if issubclass(w.category, UserWarning)]
         assert any("DLS" in m for m in msgs)
-
-    def test_two_node_parity_with_bipolar(self):
-        """The spine invariant: stacking ``[μ_pos, μ_neg]`` into the N-node
-        core reproduces the bipolar keep set bit for bit, across randomized
-        inputs and every edge branch."""
-        from saklas.core.vectors import (
-            compute_dls_axes,
-            compute_dls_mask_per_axis,
-        )
-        for seed in range(40):
-            torch.manual_seed(seed)
-            n_layers = int(torch.randint(1, 6, ()).item())
-            dim = int(torch.randint(2, 9, ()).item())
-            rank = int(torch.randint(1, 4, ()).item())
-            mu_pos, mu_neg, bases, layer_means = {}, {}, {}, {}
-            for L in range(n_layers):
-                mu_pos[L] = torch.randn(dim)
-                mu_neg[L] = torch.randn(dim)
-                # Mix real / degenerate rows and present / absent baselines.
-                rows = torch.randn(rank, dim)
-                if (seed + L) % 7 == 0:
-                    rows[0] = torch.zeros(dim)
-                bases[L] = rows
-                if (seed + L) % 5 != 0:
-                    layer_means[L] = torch.randn(dim)
-            lm = None if seed % 11 == 0 else layer_means
-            bipolar = compute_dls_mask_per_axis(mu_pos, mu_neg, bases, lm)
-            stacked = {
-                L: torch.stack([mu_pos[L], mu_neg[L]]) for L in mu_pos
-            }
-            n_node = compute_dls_axes(stacked, bases, lm)
-            assert n_node == bipolar, f"seed={seed}"
-
 
 # ------------------------------- v2.1 nested projection scope restore ---
 

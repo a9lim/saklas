@@ -340,6 +340,27 @@ def test_manifold_sidecar_load(tmp_path: Path):
     assert sc.feature_space == "sae-gemma"
     assert sc.nodes_sha256 == "deadbeef"
     assert sc.sae_release == "gemma"
+    # Absent diagnostic layer profile loads as an empty dict (back-compat).
+    assert sc.node_spread_per_layer == {}
+
+
+def test_manifold_sidecar_node_spread_round_trips(tmp_path: Path):
+    """The per-layer signal profile (``node_spread_per_layer``) round-trips."""
+    path = tmp_path / "m.json"
+    path.write_text(json.dumps({
+        "method": "manifold_discover_pca",
+        "saklas_version": "4.0.0",
+        "domain": {"type": "custom", "dim": 1},
+        "node_count": 2,
+        "node_labels": ["happy", "sad"],
+        "fit_mode": "pca",
+        "node_spread_per_layer": {"5": 0.5, "12": 8.25, "20": 3.0},
+    }))
+    sc = ManifoldSidecar.load(path)
+    assert sc.node_spread_per_layer == {"5": 0.5, "12": 8.25, "20": 3.0}
+    # The peak layer is the one with the largest whitened between-node spread.
+    peak = max(sc.node_spread_per_layer.items(), key=lambda kv: kv[1])
+    assert peak[0] == "12"
 
 
 # --------------------------------------------------- authoring (create/update) ---
@@ -1536,7 +1557,7 @@ def test_init_and_append_discover_streaming(
     labels = ["alpha", "beta", "gamma", "default"]
     folder = init_discover_manifold_folder(
         "local", "stream", "streamed discover", fit_mode="pca",
-        labels=labels, hyperparams={"max_subspace_dim": 4},
+        labels=labels, hyperparams={"max_dim": 4},
     )
     # Skeleton present, no node corpus yet.
     assert (folder / "manifold.json").exists()
@@ -1616,7 +1637,7 @@ def test_plan_fresh_creates_skeleton_all_pending(tmp_path: Path):
     folder = tmp_path / "m"
     plan = plan_discover_generation(
         folder, "m", "desc", fit_mode="pca",
-        labels=["a", "b", "c"], hyperparams={"max_subspace_dim": 4},
+        labels=["a", "b", "c"], hyperparams={"max_dim": 4},
     )
     assert isinstance(plan, DiscoverGenerationPlan)
     assert not plan.resumed

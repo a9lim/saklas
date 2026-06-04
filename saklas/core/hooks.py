@@ -289,8 +289,6 @@ class SteeringHook:
         curved manifold are both groups here, dispatched by the kernel's
         ``is_affine`` branch (analytic slide vs foot-following GN).
         """
-        if not self.manifold_groups:
-            return
         for i, (
             trig, sub, domain, target, origin, along, onto,
         ) in enumerate(self.manifold_groups):

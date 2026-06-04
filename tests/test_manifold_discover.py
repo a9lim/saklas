@@ -1,10 +1,21 @@
 """Discover-mode coord derivation: derive_pca_coords / derive_spectral_coords.
 
-Pure CPU, no model, no IO. The fit math is tensor over centroids; the
+Pure CPU, no model, no IO. The fit math is tensor over a centroid Gram; the
 centroids are synthesized so every test exercises a known ground truth.
 The Procrustes-agreement test in particular is the discriminating check
 for "did we wire the methods up correctly": PCA and spectral must
 agree on genuinely flat data and disagree on genuinely curved data.
+
+The derive functions take a ``(K, K)`` consensus Gram, not raw centroids:
+``derive_pca_coords`` eigendecomposes it and ``derive_spectral_coords`` reads
+pairwise distances off it. For a single layer with ``Σ = I`` the Gram is the
+centered Euclidean ``X̃ X̃ᵀ`` (``_centered_gram`` below), whose eigendecomposition
+is exactly the PCA of the centroids and whose ``diag ⊕ diag − 2G`` distances are
+``‖c_i − c_j‖`` — so these tests pin the single-layer behavior. The layer-agnostic
+consensus (the mean of per-layer whitened Grams the pipeline actually feeds) is
+covered by the signal-weighting tests at the bottom: a clean signal-layer Gram
+averaged with an isotropic noise-layer Gram recovers the signal layout, because
+whitened common-scale averaging is signal-weighted.
 """
 from __future__ import annotations
 
@@ -23,6 +34,19 @@ from saklas.core.manifold import (
 
 
 # ---------------------------------------------------------------- helpers ---
+
+def _centered_gram(centroids: torch.Tensor) -> torch.Tensor:
+    """The centered Euclidean Gram ``X̃ X̃ᵀ`` of ``(K, D)`` centroids.
+
+    The single-layer (``Σ = I``) case of the consensus Gram the pipeline
+    feeds the derive functions: its eigendecomposition is the PCA of the
+    centroids, and the pairwise distances read off it
+    (``diag ⊕ diag − 2 G``) equal ``‖c_i − c_j‖``, so it drives both methods.
+    """
+    xc = centroids.to(torch.float32)
+    xc = xc - xc.mean(dim=0, keepdim=True)
+    return xc @ xc.transpose(0, 1)
+
 
 def _random_orthonormal_plane(d: int, k: int, *, seed: int) -> torch.Tensor:
     """A ``(d, k)`` matrix with orthonormal columns — a random k-plane in R^d."""
@@ -55,6 +79,26 @@ def _procrustes_distance(a: torch.Tensor, b: torch.Tensor) -> float:
     """Normalized Procrustes distance: ``||a' - b'||_F / ||b'||_F``."""
     a_aligned, b_c = _procrustes_align(a, b)
     num = torch.linalg.norm(a_aligned - b_c)
+    den = torch.linalg.norm(b_c).clamp(min=1e-12)
+    return float((num / den).item())
+
+
+def _procrustes_distance_scaled(a: torch.Tensor, b: torch.Tensor) -> float:
+    """Procrustes distance allowing uniform scale **and** rotation (similarity).
+
+    A discover-coord layout is only defined up to a similarity transform —
+    the absolute coord magnitude is meaningless (the per-layer fit recomputes
+    real node coords, and RBF/affine interpolation re-normalizes to the unit
+    box).  The rotation-only :func:`_procrustes_distance` is the right check
+    when both layouts share a scale (orthonormal-plane embeddings); the
+    consensus comparison must additionally absorb the global scale that the
+    layer averaging introduces, which only this scaled form can.
+    """
+    a_aligned, b_c = _procrustes_align(a, b)
+    s = float(
+        (a_aligned * b_c).sum() / (a_aligned * a_aligned).sum().clamp(min=1e-12)
+    )
+    num = torch.linalg.norm(s * a_aligned - b_c)
     den = torch.linalg.norm(b_c).clamp(min=1e-12)
     return float((num / den).item())
 
@@ -115,7 +159,7 @@ def test_pca_recovers_flat_subspace_rank():
         n=60, ambient=32, rank=3, noise=0.02, seed=11,
     )
     coords, diag = derive_pca_coords(
-        centroids, max_dim=8, var_threshold=0.95,
+        _centered_gram(centroids), max_dim=8, var_threshold=0.95,
     )
     assert isinstance(diag, PcaDiagnostics)
     assert diag.picked_k == 3
@@ -139,9 +183,10 @@ def test_pca_threshold_semantics():
     centroids, _ = _flat_centroids(
         n=60, ambient=32, rank=3, noise=0.02, seed=11,
     )
+    gram = _centered_gram(centroids)
     for threshold in (0.50, 0.70, 0.90, 0.99):
         _, diag = derive_pca_coords(
-            centroids, max_dim=8, var_threshold=threshold,
+            gram, max_dim=8, var_threshold=threshold,
         )
         k = diag.picked_k
         assert diag.cumulative_variance[k - 1] >= threshold, (
@@ -163,7 +208,9 @@ def test_pca_picks_k1_when_one_direction_dominates():
     ramp = torch.linspace(-5.0, 5.0, n).unsqueeze(1)  # (N, 1)
     plane = _random_orthonormal_plane(d, 1, seed=7)
     centroids = ramp @ plane.T + 0.01 * torch.randn(n, d, generator=g)
-    coords, diag = derive_pca_coords(centroids, max_dim=8, var_threshold=0.70)
+    coords, diag = derive_pca_coords(
+        _centered_gram(centroids), max_dim=8, var_threshold=0.70,
+    )
     assert diag.picked_k == 1
     assert diag.cumulative_variance[0] >= 0.70
     assert coords.shape == (40, 1)
@@ -173,7 +220,9 @@ def test_pca_caps_at_max_dim_when_threshold_unreachable():
     """Pure isotropic noise — no prefix crosses 70%, so we cap at max_dim."""
     g = torch.Generator().manual_seed(3)
     centroids = torch.randn(50, 32, generator=g)
-    coords, diag = derive_pca_coords(centroids, max_dim=4, var_threshold=0.99)
+    coords, diag = derive_pca_coords(
+        _centered_gram(centroids), max_dim=4, var_threshold=0.99,
+    )
     # Variance is spread across all 32 axes; threshold 0.99 unreachable
     # inside the cap.  Picked_k pins to max_dim.
     assert diag.picked_k == 4
@@ -183,7 +232,13 @@ def test_pca_caps_at_max_dim_when_threshold_unreachable():
 def test_pca_rejects_too_few_centroids():
     """K=1 has no variance; the function refuses rather than divide by zero."""
     with pytest.raises(ValueError, match=">= 2 centroids"):
-        derive_pca_coords(torch.zeros(1, 32))
+        derive_pca_coords(_centered_gram(torch.zeros(1, 32)))
+
+
+def test_pca_rejects_non_square_gram():
+    """A non-square input is a wiring error — the derive functions take Grams."""
+    with pytest.raises(ValueError, match=r"square \(K, K\) Gram"):
+        derive_pca_coords(torch.randn(10, 32))
 
 
 # -------------------------------------------------- spectral: circle recovery ---
@@ -193,7 +248,7 @@ def test_spectral_recovers_circle_topology():
     centroids, theta = _circle_centroids(
         n=80, ambient=32, noise=0.02, seed=21,
     )
-    coords, diag = derive_spectral_coords(centroids, max_dim=6)
+    coords, diag = derive_spectral_coords(_centered_gram(centroids), max_dim=6)
     assert isinstance(diag, SpectralDiagnostics)
     assert diag.component_count == 1
     # S^1 has two non-trivial Laplacian eigenvalues (the cos/sin pair)
@@ -236,7 +291,7 @@ def test_spectral_flat_subspace_picks_small_k():
     centroids, _ = _flat_centroids(
         n=60, ambient=32, rank=3, noise=0.02, seed=33,
     )
-    coords, diag = derive_spectral_coords(centroids, max_dim=6)
+    coords, diag = derive_spectral_coords(_centered_gram(centroids), max_dim=6)
     assert diag.component_count == 1
     # The fit succeeded and produced some k between 1 and max_dim.
     assert 1 <= diag.picked_k <= 6
@@ -261,10 +316,11 @@ def test_pca_and_spectral_pick_same_k_on_flat_data():
     centroids, _ = _flat_centroids(
         n=60, ambient=32, rank=2, noise=0.02, seed=44,
     )
+    gram = _centered_gram(centroids)
     _, pca_diag = derive_pca_coords(
-        centroids, max_dim=8, var_threshold=0.95,
+        gram, max_dim=8, var_threshold=0.95,
     )
-    _, spec_diag = derive_spectral_coords(centroids, max_dim=8)
+    _, spec_diag = derive_spectral_coords(gram, max_dim=8)
     assert pca_diag.picked_k == 2, (
         f"PCA picked k={pca_diag.picked_k} on rank-2 data"
     )
@@ -292,10 +348,11 @@ def test_pca_and_spectral_diverge_on_curved_data():
     centroids, _ = _circle_centroids(
         n=80, ambient=32, noise=0.02, seed=55,
     )
+    gram = _centered_gram(centroids)
     pca_coords, _ = derive_pca_coords(
-        centroids, max_dim=2, var_threshold=0.95,
+        gram, max_dim=2, var_threshold=0.95,
     )
-    spec_coords, _ = derive_spectral_coords(centroids, max_dim=2)
+    spec_coords, _ = derive_spectral_coords(gram, max_dim=2)
     if spec_coords.shape[1] != 2 or pca_coords.shape[1] != 2:
         pytest.skip(
             f"need k=2 from both for Procrustes match "
@@ -317,13 +374,13 @@ def test_spectral_rejects_disconnected_graph():
     cluster_b = torch.randn(20, 32, generator=g) * 0.3 - 10.0
     centroids = torch.cat([cluster_a, cluster_b], dim=0)
     with pytest.raises(ValueError, match=r"2 connected components"):
-        derive_spectral_coords(centroids, max_dim=4, k_nn=3)
+        derive_spectral_coords(_centered_gram(centroids), max_dim=4, k_nn=3)
 
 
 def test_spectral_rejects_too_few_centroids():
     """Below the floor K=4 the heuristics are pure noise; refuse early."""
     with pytest.raises(ValueError, match=">= 4 centroids"):
-        derive_spectral_coords(torch.zeros(3, 32))
+        derive_spectral_coords(_centered_gram(torch.zeros(3, 32)))
 
 
 def test_spectral_diagnostics_record_data_driven_defaults():
@@ -331,10 +388,124 @@ def test_spectral_diagnostics_record_data_driven_defaults():
     centroids, _ = _circle_centroids(
         n=50, ambient=16, noise=0.01, seed=66,
     )
-    _, diag = derive_spectral_coords(centroids, max_dim=4)
+    _, diag = derive_spectral_coords(_centered_gram(centroids), max_dim=4)
     assert diag.k_nn == max(5, math.ceil(math.log(50)))
     assert diag.bandwidth > 0.0
     assert diag.eigenvalues.shape[0] >= diag.picked_k
+
+
+# ------------------------------------------- layer-agnostic consensus Gram ---
+
+def test_pca_consensus_drops_noise_layer():
+    """Averaging a signal-layer Gram with an isotropic noise-layer Gram keeps
+    the signal layout — the signal-weighting that makes the derivation
+    layer-agnostic.
+
+    The pipeline derives coords from ``mean_L`` of each layer's whitened
+    ``(K, K)`` Gram.  Whitening puts every layer in common (background-σ)
+    units, so a layer where the nodes aren't separated contributes a
+    near-zero Gram and falls out of the mean.  Here the "noise layer" is
+    isotropic at 1% the signal scale: the consensus must recover the
+    signal layer's rank-2 layout rather than a blurred average.
+    """
+    signal, true_coords = _flat_centroids(
+        n=60, ambient=32, rank=2, noise=0.02, seed=101,
+    )
+    g = torch.Generator().manual_seed(202)
+    noise = 0.01 * torch.randn(60, 32, generator=g)  # ~isotropic, tiny
+    signal_only, _ = derive_pca_coords(
+        _centered_gram(signal), max_dim=8, var_threshold=0.95,
+    )
+    consensus = 0.5 * (_centered_gram(signal) + _centered_gram(noise))
+    coords, diag = derive_pca_coords(
+        consensus, max_dim=8, var_threshold=0.95,
+    )
+    assert diag.picked_k == 2, (
+        f"consensus picked k={diag.picked_k}; the noise layer should not "
+        f"add structure"
+    )
+    # The consensus layout is the *same* layout the signal layer recovers
+    # alone (up to similarity) — the noise layer fell out of the average.
+    # Compared scale-invariantly because the layer averaging rescales coords.
+    dist = _procrustes_distance_scaled(coords, signal_only)
+    assert dist < 0.05, (
+        f"consensus layout diverged from signal-only by {dist:.4f}; the "
+        f"noise layer perturbed it"
+    )
+    # And the signal layer's own recovery is faithful to ground truth (so the
+    # comparison above isn't two-wrongs-agreeing).
+    assert _procrustes_distance(signal_only, true_coords) < 0.10
+
+
+def test_spectral_consensus_recovers_signal_topology():
+    """A circle in the signal layer survives averaging with a noise layer.
+
+    Spectral reads distances off the consensus Gram; the noise layer's
+    near-uniform tiny distances don't change the k-NN structure, so the
+    circle topology is recovered from the average just as from the signal
+    layer alone.
+    """
+    circle, theta = _circle_centroids(
+        n=80, ambient=32, noise=0.02, seed=303,
+    )
+    g = torch.Generator().manual_seed(404)
+    noise = 0.01 * torch.randn(80, 32, generator=g)
+    consensus = 0.5 * (_centered_gram(circle) + _centered_gram(noise))
+    coords, diag = derive_spectral_coords(consensus, max_dim=6)
+    assert diag.component_count == 1
+    assert diag.picked_k == 2, (
+        f"consensus picked k={diag.picked_k}; the circle topology should "
+        f"survive the noise layer"
+    )
+    assert coords.shape == (80, 2)
+    rec_order = torch.argsort(torch.atan2(coords[:, 1], coords[:, 0])).tolist()
+    orig_order = torch.argsort(theta).tolist()
+
+    def cyclic_match(a: list[int], b: list[int]) -> bool:
+        n = len(a)
+        return any(
+            all(a[(start + i) % n] == b[i] for i in range(n))
+            for start in range(n)
+        )
+
+    assert cyclic_match(orig_order, rec_order) or cyclic_match(
+        orig_order[::-1], rec_order,
+    ), "consensus spectral embedding did not preserve circular order"
+
+
+def test_pca_consensus_signal_weights_across_layers():
+    """When two layers carry *different* clean structure at different scales,
+    the stronger one dominates the consensus layout.
+
+    Two rank-1 signals on orthogonal axes: layer A at unit scale, layer B
+    at 1/10 scale.  The consensus is rank-2 (both axes present), but the
+    leading component must align with layer A — a direct read on
+    "signal-weighted, not equal-weighted".
+    """
+    g = torch.Generator().manual_seed(505)
+    n, d = 50, 24
+    plane = _random_orthonormal_plane(d, 2, seed=505)  # two orthonormal axes
+    axis_a, axis_b = plane[:, 0], plane[:, 1]
+    ramp = torch.linspace(-3.0, 3.0, n)
+    perm = torch.randperm(n, generator=g)
+    # Layer A: strong rank-1 ramp on axis A.  Layer B: weak rank-1 ramp on
+    # axis B (a different node ordering, so the axes are genuinely distinct).
+    cents_a = ramp.unsqueeze(1) * axis_a.unsqueeze(0)
+    cents_b = 0.1 * ramp[perm].unsqueeze(1) * axis_b.unsqueeze(0)
+    consensus = 0.5 * (_centered_gram(cents_a) + _centered_gram(cents_b))
+    coords, diag = derive_pca_coords(
+        consensus, max_dim=8, var_threshold=0.999,
+    )
+    # Leading component carries far more variance than the second.
+    assert diag.per_component_variance[0] > 0.9, (
+        f"leading variance {diag.per_component_variance[0]:.3f} — the strong "
+        f"layer should dominate"
+    )
+    # The leading coordinate axis tracks layer A's ramp (up to sign), not
+    # layer B's permuted weak ramp.
+    lead = coords[:, 0]
+    corr_a = abs(float(torch.corrcoef(torch.stack([lead, ramp]))[0, 1]))
+    assert corr_a > 0.98, f"leading axis corr with layer-A ramp {corr_a:.3f}"
 
 
 # --------------------------------------------------------------- dispatcher ---
@@ -344,7 +515,7 @@ def test_discover_coords_routes_to_pca():
         n=40, ambient=16, rank=2, noise=0.02, seed=77,
     )
     coords, diag = discover_coords(
-        centroids, method="pca", max_dim=4, var_threshold=0.70,
+        _centered_gram(centroids), method="pca", max_dim=4, var_threshold=0.70,
     )
     assert isinstance(diag, PcaDiagnostics)
     assert coords.shape[0] == 40
@@ -355,7 +526,7 @@ def test_discover_coords_routes_to_spectral():
         n=40, ambient=16, noise=0.02, seed=88,
     )
     coords, diag = discover_coords(
-        centroids, method="spectral", max_dim=4,
+        _centered_gram(centroids), method="spectral", max_dim=4,
     )
     assert isinstance(diag, SpectralDiagnostics)
     assert coords.shape[0] == 40
@@ -363,4 +534,4 @@ def test_discover_coords_routes_to_spectral():
 
 def test_discover_coords_rejects_unknown_method():
     with pytest.raises(ValueError, match=r"unknown discover method"):
-        discover_coords(torch.randn(10, 32), method="banana")
+        discover_coords(torch.randn(4, 4), method="banana")

@@ -224,8 +224,8 @@ def _bare_concept_resolves(concept: str) -> bool:
     )
 
     try:
-        pole_hit, manifold_hit = resolve_bare_name(concept)
-        if pole_hit is not None or manifold_hit is not None:
+        manifold_hit = resolve_bare_name(concept)
+        if manifold_hit is not None:
             return True
         return resolve_manifold_name(concept) is not None
     except AmbiguousSelectorError:

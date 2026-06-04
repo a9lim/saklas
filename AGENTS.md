@@ -8,8 +8,8 @@ OpenAI `/v1/*` and Ollama `/api/*` on one port, plus a native `/saklas/v1/*` API
 and a Svelte dashboard at `/`. Steering signal comes from representation
 engineering, unified under a single artifact family — the **manifold**: labeled
 nodes placed on a domain, fit to a per-layer subspace. A difference-of-means
-steering vector is the 2-node flat case; `personas` is a 101-node flat fan; `pad`
-is a curved 3-D box. Every steering term — vectors, poles, `~`/`|` projections,
+steering vector is the 2-node flat case; `personas` is a 107-node flat fan; `pad`
+is a curved 20-node affect surface. Every steering term — vectors, poles, `~`/`|` projections,
 `!` ablations, and `%` manifold positions — lowers at generation time to one
 unified per-layer injection (the along/onto subspace kernel,
 `core/manifold.py::subspace_inject`). Per-call coefficients, no model mutation.
@@ -118,7 +118,7 @@ role; plain `:raw` terms compose with role terms but emit a one-time
 
 Canonical naming: `canonical_concept_name` (module-level in `core/session.py`)
 slugs poles via `[^a-z0-9]+ → _` and joins bipolar poles with `BIPOLAR_SEP = "."`,
-so `/steer happy . sad` and `/steer happy.sad` resolve to the same manifold.
+so `/steer formal . casual` and `/steer formal.casual` resolve to the same manifold.
 `NAME_REGEX = ^[a-z][a-z0-9._-]{0,63}$`; `@` is forbidden (HF revision separator),
 and `.` is used over `~` because HF repo names reject `~`.
 
@@ -138,7 +138,8 @@ atom        := [ns "/"] NAME ["." NAME] [":" variant]
 trigger     := preset | gate
 preset      := before | after | both | thinking | response | prompt | generated
 gate        := "when" ":" probe_atom op NUM        # op ∈ > >= < <=
-probe_atom  := NAME ["." NAME]                     # vector probe (e.g. angry.calm)
+probe_atom  := NAME ["." NAME] ["[" INT "]"]       # vector probe (e.g. confident.uncertain),
+                                                   # optional coord axis (personas[3])
              | NAME ":" "fraction"                 # manifold subspace fraction
              | NAME "@" NAME                       # manifold label similarity
 ```
@@ -151,16 +152,20 @@ that fires only on decode steps where the monitor reading satisfies the comparis
 (implicit `prompt=False`). `!` cannot compose with `~`/`|`. Compound triggers
 (`@after&when:…`) are programmatic-only.
 
-Probe gates accept three identifier shapes against the merged scalars the session
-writes into `TriggerContext.probe_scores`. Vector probes are bare concept names
-(`@when:angry.calm > 0.4`), matching `TraitMonitor.score_single_token` keys.
+Probe gates accept these identifier shapes against the merged scalars the session
+writes into `TriggerContext.probe_scores`. Vector probes are concept names whose
+bare form reads coordinate axis 0 (`@when:confident.uncertain > 0.4`) and whose `[i]` form
+reads a specific coordinate axis of a multi-axis fit (`@when:personas[3] > 0.4`);
+both match the keys `TraitMonitor.flat_scalars` emits. The coordinate is
+domain-frame (pole-normalized at rank-1: `1.0` at the positive node), so a 2-node
+concept gate reads the same single coordinate it always did.
 Manifold subspace-fraction gates write the `:fraction` channel suffix
 (`@when:pad:fraction > 0.5`) — the share of the centered activation living
 in that manifold's subspace, in `[0, 1]`. Manifold label-similarity gates write
-the `@<label>` suffix (`@when:pad@elated > -0.1`) — the negated distance to
-a named node (larger = closer), so the natural threshold range is negative. All
-three flow through one `ProbeGate` (full namespaced string stored verbatim,
-matching the keys `ManifoldMonitor.flat_scalars` emits) and round-trip
+the `@<label>` suffix (`@when:pad@happy > -0.1`) — the negated distance to
+a named node (larger = closer), so the natural threshold range is negative. Every
+shape flows through one `ProbeGate` (full namespaced string stored verbatim,
+matching the keys each monitor's `flat_scalars` emits) and round-trips
 byte-for-byte.
 
 `%` is the manifold operator: `<manifold> % <position>` places a generation at a
@@ -207,8 +212,15 @@ abstract → "someone {c}", concrete → "{art} {c}") and a swapped assistant-ro
 elicitation label — and extraction pools the swapped-back `[user: prompt,
 assistant: response]` pairs in **standard-assistant space**. The corpus is a
 `list[str]` of responses aligned `response[i] ↔ baseline_prompt[i % k]`
-(`saklas/data/baseline_prompts.json`, 64 prompts; length must be a multiple of
-`k`). `kind` is recorded per node (generation-time provenance; the fit never
+(`saklas/data/baseline_prompts.json`, 48 prompts; length must be a multiple of
+`k`). A shared one-paragraph length directive (`_LENGTH_DIRECTIVE`) leads every
+system prompt — the persona at node generation, the sole system for the neutral
+baseline, and the sole system at *capture* (`_encode_and_capture_all`; the
+persona is generation-only, so node capture sees only the directive). Identical
+and symmetric across all four sites, it is common-mode that cancels at extraction
+while keeping responses from rambling past the token cap, and it matches capture
+framing to generation framing (not OOD). `kind` is recorded per node
+(generation-time provenance; the fit never
 consumes it). `--role`/`role=` opts into a persona-baselined fit (the explicit
 role overrides the kind-derived label at both generation and capture). A
 **monopolar** concept (`baseline=None`) authors a genuinely **1-node** `pca`
@@ -351,15 +363,26 @@ reach it.)
 
 `manifold.json::fit_mode` is the discriminator: `"authored"` (user supplies
 domain + per-node coords) vs *discover* — `"pca"`/`"spectral"`, where the user
-supplies labeled corpora only and coordinates are derived per-model at fit time
-from the pooled centroids. PCA picks the smallest prefix whose cumulative variance
-crosses `var_threshold` (default 0.70), capped at `max_dim` (default 8); spectral
-runs Laplacian eigenmaps on a symmetric k-NN graph and picks `k` by the
-eigenvalue-ratio cliff. `fit_mode=pca` produces a flat affine subspace (no RBF);
-`spectral` (and `authored`) produces a curved RBF surface. `anchor_origin` (pca
-only) shifts every coord so a named node lands at the origin. Per-model coordinates
-are the architectural shift: a Gemma fit and a Qwen fit produce different node
-layouts for the same heap (stored as `node_coords` in the per-model safetensors).
+supplies labeled corpora only and coordinates are derived per-model at fit time.
+The derivation is **layer-agnostic** — there is no reference layer. Each fit layer
+contributes its whitened, node-mean-centered `(K, K)` Gram and the coords come from
+their mean (the *consensus Gram*); whitening puts every layer in common units so
+the average is signal-weighted — a layer where the nodes aren't separated drops out
+on its own, so the layout draws on whichever layers carry the concept. PCA
+eigendecomposes the consensus Gram and picks the smallest prefix whose cumulative
+variance crosses `var_threshold` (default 0.70), capped at `max_dim` (default 8);
+spectral reads pairwise distances off it, runs Laplacian eigenmaps on a symmetric
+k-NN graph, and picks `k` by the eigenvalue-ratio cliff (both embed the same
+consensus geometry). `fit_mode=pca` produces a flat affine subspace (no RBF);
+`spectral` (and `authored`) produces a curved RBF surface. For a flat fit the
+per-layer steerable subspace *is* its `max_dim`-capped layout span, so `max_dim`
+is the only dim knob — `max_subspace_dim` survives only for the curved spectral
+fit (where the RBF subspace can carry off-surface dims). The steer-time origin is
+always the projection of the per-model neutral mean onto the subspace (the affine
+fit neutral-anchors the frame), so there is no `anchor_origin` knob. Per-model
+coordinates are the architectural shift: a Gemma fit and a Qwen fit produce
+different node layouts for the same heap (stored as `node_coords` in the per-model
+safetensors).
 
 `manifold generate <name> --concepts ... [--kind abstract|concrete]` LLM-authors a
 discover folder via `session.generate_responses` — each concept answers the shared
@@ -379,20 +402,21 @@ The bundled artifacts ship under `saklas/data/manifolds/`, materializing into
 `~/.saklas/manifolds/default/` on session start via `materialize_bundled_manifolds()`
 (process-scope no-op after the first call):
 
-- **26 concept manifolds** — 2-node `fit_mode=pca` axes (24 bipolar + 2 monopolar
-  `agentic`/`manipulative`), tagged by category (`affect`, `epistemic`,
-  `alignment`, `register`, `social_stance`, `cultural`, `identity`). These are the
-  steering vectors: `0.5 angry.calm` steers toward `angry` (node 0).
+- **17 concept manifolds** — bipolar 2-node `fit_mode=pca` axes, tagged by
+  category (`epistemic`, `alignment`, `register`, `cultural`). These are the
+  steering vectors: `0.5 formal.casual` steers toward `formal` (node 0). The
+  `register` (7) and `cultural` (4) families are independent bipolar axes, *not*
+  fused into a discover manifold — each has a designed opposite and the primary
+  use is independent signed control. Affect lives in `pad`, not as bipolar axes.
 - **`personas`** — discover `fit_mode=pca` (a flat ~rank-8 affine subspace),
-  101 persona nodes (100 archetypes `assistant`…`vandal` + a `default` anchor) in
-  assistant-baselined activation space; from Anthropic's Assistant Axis paper
-  (arXiv 2601.10387). `anchor_origin` lands `default` at the origin.
-- **`cultural`** (9-node) / **`register`** (15-node) — discover `fit_mode=pca`
-  multi-axis subspaces grouping the cultural / register concept families into one
-  flat subspace each (`anchor_origin`, `max_subspace_dim` 4 / 6).
-- **`pad`** — *authored*, curved 3-D box on the PAD (pleasure × arousal ×
-  dominance) space, each axis `[−1, 1]`. 15 first-person mood corpora. Steer by
-  coord (`pad%0.6,0.4,0.0`) or label (`pad%elated`).
+  107 persona archetype nodes (`assistant`…`vandal`) in assistant-baselined
+  activation space; from Anthropic's Assistant Axis paper (arXiv 2601.10387).
+  `max_dim` 8.
+- **`pad`** — discover `fit_mode=spectral`, a curved affect surface over the PAD
+  (pleasure × arousal × dominance) space. 20 first-person mood corpora, per-model
+  coords derived by Laplacian eigenmaps (`max_dim` 3). Curved rather than flat
+  because affect is a circumplex — opposites are emergent, not designed. Steer by
+  label (`pad%happy`) or coord (`pad%0.6,0.4,0.0`).
 
 Recommended α is vector-comparable: aim for `α ≈ 0.5`, tune up toward `α ≈ 1.0`
 for stronger expression (α clamps to `[0,1]`, so `_MANIFOLD_GAIN = 1.0` is the
@@ -427,13 +451,13 @@ deterministic so compare qualitatively):
 from saklas import SaklasSession, SamplingConfig, Steering, Profile
 
 with SaklasSession.from_pretrained("google/gemma-3-4b-it", device="auto") as session:
-    name, profile = session.extract("angry.calm")     # returns (canonical_name, Profile)
+    name, profile = session.extract("confident.uncertain")   # returns (canonical_name, Profile)
     result = session.generate(
         "What makes a good day?",
         steering=f"0.3 {name}",
         sampling=SamplingConfig(temperature=0.7, max_tokens=256, seed=42),
     )
-    with session.steering("0.5 wolf"):                 # bare pole → deer.wolf node 1
+    with session.steering("0.5 wolf"):                 # bare label → personas%wolf node
         result = session.generate("Describe a forest.")
     for tok in session.generate_stream("Tell me a story."):
         print(tok.text, end="", flush=True)
@@ -523,16 +547,18 @@ tok/s):
   3·‖h‖` is the only bound.
 - **Top-p via `torch.topk`**, not full-vocab sort; `top_k` (default 1024 cap) is a
   hard candidate-pool cap applied before top-p (llama.cpp/Ollama order).
-- **Monitor capture is hook-driven**, inline with generation — one matmul per layer
-  scores all probes, no second forward pass. `TraitMonitor` scores in the whitened
-  (Mahalanobis) cosine — mandatory: the whitener must cover every probed layer
-  (`covers_all`), else scoring raises `WhitenerError` (no Euclidean path). The
-  Σ⁻¹-applied probe directions + device-resident Woodbury factors are precomputed at
-  cache build, so the hot path stays one matmul plus a cheap per-token Woodbury apply.
-  `covers_all` is trustworthy as "finite factors everywhere": any non-finite layer
-  is excluded, and neutral activations are cached fp32 (so gemma-3's late layers
-  don't overflow the fp16 65504 ceiling to ±inf). The probe weight stays `‖baked‖₂`
-  (the bake already folded the Mahalanobis score in).
+- **Monitor capture is hook-driven**, inline with generation — no second forward
+  pass. `TraitMonitor` reads each flat probe as a whitened **coordinate** (the
+  rank-1 case of the subspace readout): per token it emits `coords` (domain-frame,
+  pole-normalized at rank-1) + `fraction` + `nearest`, and the whole rank-1 roster
+  scores in one stacked matmul per layer (the precomputed `Σ⁻¹d̂` rows) plus one
+  shared per-token `Σ⁻¹h` Woodbury apply — no per-probe loop. Mahalanobis-only:
+  the whitener must cover every probed layer (`covers_all`), else scoring raises
+  `WhitenerError` (no Euclidean path). `covers_all` is trustworthy as "finite
+  factors everywhere": any non-finite layer is excluded, and neutral activations
+  are cached fp32 (so gemma-3's late layers don't overflow the fp16 65504 ceiling
+  to ±inf). The incremental no-sync capture path is disabled under the coordinate
+  readout (full-retention scoring; the scoring fast path is unaffected).
 - **Steering hooks are transient** — composed before generation, removed after.
 - **MPS discipline** — diffs on CPU, `torch.mps.empty_cache()` between extraction
   passes, end-of-loop sync to dodge Metal command-buffer reuse crashes.
@@ -557,43 +583,45 @@ Unsupported (mapped to `None`, `apply_with_role` raises
 
 ## Bundled concepts
 
-26 curated concepts under `saklas/data/manifolds/<concept>/` — 24 bipolar
-(2-node `pca`) + 2 monopolar (`agentic`, `manipulative`). Under 4.0 / A2 each
-pole's corpus is conversational responses to the shared baseline prompts.
-Monopolar `extract` is now implemented as a genuine **1-node** fold against the
-neutral mean ν (see "Extraction"), so a fresh `extract("agentic")` authors a
-1-node ray. The *bundled* `agentic`/`manipulative` still ship with their pre-4.0
-explicit 2-node `_neg` corpora; re-authoring them as 1-node + A2 is part of the
-bundled-regeneration TODO. The pre-4.0 bundled statement-regeneration script is
-removed; its manifest is recoverable from git history and a 4.0 bipolar-concept
-regeneration script is a TODO (the persona + cultural/register discover scripts
-are already on A2).
+17 curated concepts under `saklas/data/manifolds/<concept>/` — all bipolar
+(2-node `pca`). Under 4.0 / A2 each pole's corpus is conversational responses to
+the shared baseline prompts. Monopolar `extract` (`baseline=None`) is still a
+genuine **1-node** fold against the neutral mean ν (see "Extraction") — a user
+`extract("agentic")` authors a 1-node ray — but no monopolar concept ships
+bundled anymore (the former `agentic` / `manipulative` were dropped or folded
+into bipolar `sincere.manipulative`). Bundled regeneration is unified under
+`scripts/regenerate_bundled.py` — one A2 pipeline writing the bipolar axes,
+`personas`, and `pad`; the fit is the separate `manifold discover` step.
 
-Categories: `affect` (angry.calm, happy.sad, fearful.unflinching), `epistemic`
-(confident.uncertain, honest.deceptive, hallucinating.grounded,
-curious.disinterested), `alignment` (refusal.compliant, sycophantic.blunt,
-agentic, manipulative), `register` (formal.casual, direct.indirect,
+The 4.0 / A2 regen also dropped the `affect`, `social_stance`, and `identity`
+categories as bipolar axes: affect (the former angry.calm / happy.sad /
+fearful.unflinching) folds into the `pad` manifold, and social_stance
+(authoritative.submissive, high_context.low_context, self.other), identity
+(ai.human), and hallucinating.grounded were cut.
+
+Categories: `epistemic` (confident.uncertain, honest.deceptive,
+curious.disinterested), `alignment` (refusing.compliant, sycophantic.blunt,
+sincere.manipulative), `register` (formal.casual, direct.indirect,
 verbose.concise, creative.conventional, humorous.serious, warm.clinical,
-technical.accessible), `social_stance` (authoritative.submissive,
-high_context.low_context, self.other), `cultural` (masculine.feminine,
-religious.secular, traditional.progressive, individualist.collectivist),
-`identity` (ai.human). The `cultural` / `register` families also ship as
-multi-node discover manifolds of the same name.
+technical.accessible), `cultural` (masculine.feminine,
+individualist.collectivist, traditional.progressive, religious.secular).
 
 Known model-level axis entanglements (cross-model robust, weighted cosine via
 `subspace compare`) — document for users, not probe-design failures:
 - `masculine.feminine ↔ traditional.progressive` (+0.5–0.6) — Hofstede MAS read as
   traditionalism
-- `hallucinating.grounded ↔ humorous.serious` (+0.5–0.7) — humor reads as
-  off-grounded weirdness
-- `angry.calm ↔ authoritative.submissive` (+0.5–0.8) — anger encodes as dominance
 
 `saklas/data/neutral_statements.json` holds the neutral baseline as organic,
-no-system/no-role responses to the same shared baseline prompts (a multiple of the
-64-prompt set), regenerated via `session.generate_neutral_responses`; it backs the
-probe-centering means + Mahalanobis whitener. `saklas/data/baseline_prompts.json`
-(64 affect-neutral, topically-diverse prompts) is the shared elicitation set every
-node and the neutral corpus answer.
+no-persona/no-role responses to the same shared baseline prompts (a multiple of
+the 48-prompt set; the shared one-paragraph length directive is its *only* system
+prompt — the same directive that leads the node systems — so the framing it
+shares with them cancels at extraction), regenerated via
+`session.generate_neutral_responses`; it backs the probe-centering means +
+Mahalanobis whitener. `saklas/data/baseline_prompts.json` (48 affect-neutral,
+topically-diverse prompts) is the shared elicitation set every node and the
+neutral corpus answer. `scripts/regenerate_bundled.py` regenerates it as the
+`neutral` pseudo-target (`--neutral-samples`, default 2, sets its density
+independently of the per-node `--samples-per-prompt`).
 
 ## Package layout
 

@@ -16,7 +16,9 @@ Grammar::
     preset      := "before" | "after" | "both" | "thinking" | "response"
                  | "prompt" | "generated"
     gate        := "when" ":" probe_atom op NUM
-    probe_atom  := NAME ["." NAME]                     # vector probe (e.g. "angry.calm")
+    probe_atom  := NAME ["." NAME] ["[" INT "]"]       # vector probe (e.g. "angry.calm"),
+                                                       # optional coord-axis index
+                                                       # (e.g. "personas[3]")
                  | NAME ":" "fraction"                 # manifold subspace fraction
                  | NAME "@" NAME                       # manifold label similarity
     op          := ">" | ">=" | "<" | "<="
@@ -54,6 +56,15 @@ negative thresholds).  The gate's probe string is stored verbatim
 (``"pad:fraction"``, ``"pad@elated"``) so it matches the
 key ``ManifoldMonitor.flat_scalars`` already merges into
 ``TriggerContext.probe_scores``; no runtime gate machinery changes.
+
+Coordinate-axis gates: a vector probe now reads out a coordinate per
+intrinsic axis, so ``@when:<probe>[<i>] <op> N`` gates on one axis of the
+probe's coordinate vector (``@when:personas[3] > 0.4``).  The index is
+appended to the verbatim probe string (``"personas[3]"``) and the session
+writes a matching per-axis scalar channel into ``probe_scores`` for every
+axis, aliasing the bare ``<probe>`` to axis 0 — so an un-indexed gate on a
+2-node concept (``@when:angry.calm > 0.4``) reads its single coordinate
+exactly as before.
 
 Concept names are ASCII identifiers: letter followed by any of
 ``[a-z0-9_-]``.  Multi-word concepts use underscores
@@ -248,6 +259,7 @@ _SINGLE_CHAR_TOKENS = {
     ".": "DOT", "/": "SLASH", ":": "COLON", "*": "STAR",
     "+": "PLUS", "-": "MINUS", "@": "AT", "~": "TILDE",
     "|": "ORTHO", "!": "BANG", "%": "PERCENT", ",": "COMMA",
+    "[": "LBRACK", "]": "RBRACK",
 }
 
 # Comparison-op tokens.  Two-char ops (``>=``, ``<=``) take precedence
@@ -512,11 +524,14 @@ class _Parser:
         Three probe identifier shapes are accepted:
 
         - Vector probe: ``IDENT`` optionally followed by ``.IDENT`` for
-          a bipolar concept (e.g. ``angry.calm``).  No namespace prefix
-          in v2.1 (the monitor is keyed by canonical concept name
-          regardless of which pack the probe came from), and no SAE
-          variant suffix — gates fire on the live monitor reading,
-          which is already a single number per probe.
+          a bipolar concept (e.g. ``angry.calm``), and an optional
+          ``[<i>]`` coordinate-axis index (e.g. ``personas[3]``,
+          ``angry.calm[0]``).  No namespace prefix in v2.1 (the monitor
+          is keyed by canonical concept name regardless of which pack the
+          probe came from), and no SAE variant suffix.  The index selects
+          one axis of the probe's coordinate readout; an un-indexed gate
+          reads axis 0 (the only axis of a 2-node concept), so existing
+          ``@when:angry.calm>0.4`` gates are unchanged.
         - Manifold subspace-fraction probe:
           ``<manifold>:fraction`` — fires on the fraction of the
           centered activation that lives in the manifold's PCA
@@ -571,10 +586,33 @@ class _Parser:
             self._consume()
             label_tok = self._expect("IDENT")
             probe = f"{probe}@{label_tok.value}"
-        elif nxt == "DOT":
-            self._consume()
-            rhs = self._expect("IDENT")
-            probe = f"{probe}.{rhs.value}"
+        else:
+            if nxt == "DOT":
+                self._consume()
+                rhs = self._expect("IDENT")
+                probe = f"{probe}.{rhs.value}"
+            # Optional coordinate-axis index for a multi-axis probe:
+            # ``personas[3]`` / ``angry.calm[0]``.  Selects one axis of the
+            # probe's coordinate readout.  The session writes a matching
+            # ``<probe>[<i>]`` scalar channel into ``probe_scores`` for
+            # every coord axis, and aliases the bare ``<probe>`` to axis 0,
+            # so an un-indexed gate on a 2-node concept reads its single
+            # coordinate exactly as before.  Indexing is not accepted after
+            # the ``:fraction`` / ``@label`` manifold channels — those are
+            # already scalar.
+            if self._peek().kind == "LBRACK":
+                self._consume()
+                idx_tok = self._expect("NUM")
+                idx_val = float(idx_tok.value)
+                idx = int(idx_val)
+                if idx_val != idx or idx < 0:
+                    raise SteeringExprError(
+                        f"coordinate index must be a non-negative integer, "
+                        f"got '{idx_tok.value}'",
+                        col=idx_tok.col,
+                    )
+                self._expect("RBRACK")
+                probe = f"{probe}[{idx}]"
         op_tok = self._consume()
         op_kind = op_tok.kind
         if op_kind not in ("GT", "GTE", "LT", "LTE"):
@@ -940,7 +978,7 @@ def _fold(terms: list[_Term], *, namespace: Optional[str]) -> "Steering":
                 resolve_bare_name,
             )
             try:
-                pole_hit, manifold_hit = resolve_bare_name(
+                manifold_hit = resolve_bare_name(
                     sel.base.concept, namespace=namespace,
                 )
             except AmbiguousSelectorError:
@@ -949,8 +987,8 @@ def _fold(terms: list[_Term], *, namespace: Optional[str]) -> "Steering":
                 # Errors fall through to the historical resolve_pole
                 # path below; if the same error is genuine, it raises
                 # there with the canonical surface message.
-                pole_hit, manifold_hit = None, None
-            if manifold_hit is not None and pole_hit is None:
+                manifold_hit = None
+            if manifold_hit is not None:
                 mfld_trig = (
                     term.trigger if term.trigger is not None else Trigger.BOTH
                 )

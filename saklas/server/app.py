@@ -544,7 +544,7 @@ def _render_logprobs_completions(result: GenerationResult, session: SaklasSessio
 
 
 async def _stream_generation(
-    app: FastAPI, session: SaklasSession,
+    session: SaklasSession,
     stream_iter: Iterator[Any], rid: str, model_id: str, object_type: str,
     format_delta: Callable[[Any], dict[str, Any]], empty_delta: dict[str, Any],
     include_usage: bool = False, role_delta: bool = False,
@@ -809,7 +809,7 @@ def _register_routes(app: FastAPI) -> None:
             stream_iter = session.generate_stream(messages, **gen_kwargs)
             include_usage = bool(req.stream_options and req.stream_options.include_usage)
             return StreamingResponse(
-                _stream_generation(app, session,
+                _stream_generation(session,
                                    stream_iter, rid, model_id,
                                    "chat.completion.chunk", _chat_delta, {"delta": {}},
                                    include_usage=include_usage, role_delta=True),
@@ -854,7 +854,7 @@ def _register_routes(app: FastAPI) -> None:
             stream_iter = session.generate_stream(req.prompt, raw=True, **gen_kwargs)
             include_usage = bool(req.stream_options and req.stream_options.include_usage)
             return StreamingResponse(
-                _stream_generation(app, session,
+                _stream_generation(session,
                                    stream_iter, rid, model_id,
                                    "text_completion", lambda e: {"text": e.text}, {"text": ""},
                                    include_usage=include_usage, role_delta=False),

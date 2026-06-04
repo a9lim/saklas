@@ -382,12 +382,12 @@ def _build_vector_manifold(parser: argparse.ArgumentParser) -> None:
     discover.add_argument(
         "--max-subspace-dim", dest="max_subspace_dim", type=int, default=None,
         metavar="R",
-        help="Per-layer PCA subspace dim cap (default 64). Smaller values "
-             "give finer-grained steering control at large K — each axis the "
-             "RBF can move along is an axis subspace_inject can displace, "
-             "so fewer axes = smaller per-α effect = wider coherence regime. "
-             "Recommended: set near the manifold's intrinsic dim (=picked_k) "
-             "for steering use; keep at 64 for representational analysis.",
+        help="Spectral (curved) only: per-layer RBF subspace dim cap "
+             "(default 64). Smaller values give finer-grained steering "
+             "control at large K — each axis the RBF can move along is an "
+             "axis subspace_inject can displace, so fewer axes = smaller "
+             "per-α effect = wider coherence regime. Ignored for --method pca "
+             "(a flat fit's subspace dim is its layout dim — use --max-dim).",
     )
     discover.add_argument(
         "--sae", default=None, metavar="RELEASE",

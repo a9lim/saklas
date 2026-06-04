@@ -399,27 +399,82 @@ class ManifoldExtractionPipeline:
             ))
             return manifold
 
-        # 2. Layer set is already resolved above (fail-fast SAE coverage).
-        # No DLS analogue here on purpose: manifolds have no pos/neg
-        # polarity, so Dang & Ngo's opposite-sign discriminative test is
-        # undefined.  Per-layer signal is instead captured continuously by
-        # the apply-time ``share_L = ||eval_rbf(node_params)||_F`` weighting
-        # (low-spread layers are down-weighted, not hard-dropped).
+        # 2. Resolve the Mahalanobis whitener once.  It is mandatory for an
+        #    activation-space fit — without it the basis, mean, and steering
+        #    direction get dominated by rogue (massive-activation) channels —
+        #    and it now also drives the layer-agnostic coordinate derivation
+        #    below, so the discover-coord consensus and the per-layer fit share
+        #    one resolution.  Resolved *after* the cache-hit return and the
+        #    fail-fast SAE/role checks since ``handle.whitener`` can trigger a
+        #    lazy neutral-activation build.  It must cover *every* fit layer (so
+        #    the cross-layer-normalized share — and the consensus Gram — compare
+        #    like with like); partial coverage or a handle without a whitener is
+        #    a hard error, not a Euclidean fallback.  The basis is model-space
+        #    for both raw and SAE fits (centroids are decoded back before the
+        #    fit), so the residual-stream whitener applies to the SAE variant
+        #    unchanged.
+        _whitener = getattr(self._handle, "whitener", None)
+        if _whitener is None or not _whitener.covers_all(fit_layers):
+            raise WhitenerError(
+                f"manifold {mf.name!r}: the Mahalanobis whitener must cover "
+                f"every fit layer (regenerate the neutral activation cache "
+                f"for {self._handle.model_id!r})"
+            )
+        maha_whitener = _whitener
+
+        # 2b. Stack per-node centroids per layer once (SAE-reconstructed when a
+        #     backend is set), shared by the consensus-Gram coord derivation and
+        #     the per-layer subspace fit so the SAE round-trip runs a single
+        #     time.  (K, D) fp32 on CPU per layer.
+        def _stacked_centroids(idx: int) -> torch.Tensor:
+            s = torch.stack([per_node[k][idx] for k in range(K)])  # (K, D) fp32 CPU
+            if sae_backend is not None:
+                with torch.no_grad():
+                    feat = sae_backend.encode_layer(idx, s.to(device))
+                    recon = sae_backend.decode_layer(idx, feat)
+                s = recon.detach().to("cpu", torch.float32)
+            return s
+
+        stacks: dict[int, torch.Tensor] = {
+            idx: _stacked_centroids(idx) for idx in fit_layers
+        }
+
+        # 2c. Per-layer whitened between-node spread — the concept's signal
+        #     concentration across the stack.  ``G_L = X̃_L Σ_L⁻¹ X̃_Lᵀ`` is the
+        #     whitened (K, K) Gram of the node-mean-centered centroids;
+        #     ``tr(G_L) = Σ_k ‖x̃_k‖²_M`` is the total whitened node spread at
+        #     layer L, in background-σ² units (whitening makes it comparable
+        #     across layers).  This is a *diagnostic* layer profile — where does
+        #     this concept live? — distinct from the apply-time
+        #     ``mahalanobis_share``, which restricts the same idea to the
+        #     steerable subspace; a layer where ``tr(G_L)`` is large but the
+        #     share is small is one whose fitted subspace is dropping concept
+        #     signal (low explained variance).  The per-layer Grams are also the
+        #     summands of the discover consensus Gram, so the discover branch
+        #     reuses ``layer_grams`` instead of recomputing them.
+        layer_grams: dict[int, torch.Tensor] = {}
+        for idx in fit_layers:
+            xc = stacks[idx].to(torch.float32)
+            xc = xc - xc.mean(dim=0, keepdim=True)
+            layer_grams[idx] = maha_whitener.subspace_gram(idx, xc)  # (K, K)
+        node_spread_per_layer: dict[int, float] = {
+            idx: float(layer_grams[idx].diagonal().sum()) for idx in fit_layers
+        }
 
         # 3. Resolve domain + node_params — the only step that differs
         #    between authored and discover paths.
         discover_metadata: dict[str, Any] = {}
-        # ``max_subspace_dim`` caps the per-layer PCA subspace in
-        # ``fit_layer_subspace`` (default :data:`DEFAULT_N_COMPONENTS` = 64).
-        # Smaller values constrain the dim count that ``subspace_inject``
-        # displaces at steer time — finer-grained steering control at the
-        # cost of representing less per-layer activation variance.  At K
-        # large (e.g. 100), the default 64 makes the per-layer subspace
-        # cover most of the centroid span; reducing to the manifold's
-        # intrinsic dim (=picked_k for discover) gives an order-of-
-        # magnitude smaller per-α displacement, widening the coherence
-        # regime.  Authored manifolds don't currently route hyperparams
-        # so they inherit the default.
+        # ``max_subspace_dim`` caps the per-layer PCA subspace in the
+        # **curved** fit (``fit_layer_subspace``; default
+        # :data:`DEFAULT_N_COMPONENTS` = 64).  Smaller values constrain the
+        # dim count that ``subspace_inject`` displaces at steer time — finer-
+        # grained steering control at the cost of representing less per-layer
+        # activation variance.  It is a *curved-only* knob: a flat (``pca``)
+        # fit's per-layer subspace is exactly its k-dim layout span (the
+        # affine span *is* the layout), so ``max_subspace_dim`` is not a
+        # ``pca`` hyperparam — the affine branch hard-sets ``n_components`` to
+        # the derived intrinsic dim and ignores any override.  Authored
+        # manifolds don't currently route hyperparams so they inherit 64.
         max_subspace_dim_override: int | None = None
 
         if mf.fit_mode == "authored":
@@ -428,67 +483,47 @@ class ManifoldExtractionPipeline:
             node_params = domain.embed(node_coords)
             method = "manifold_sae" if sae_backend is not None else "manifold_pca"
         else:
-            # Discover: derive coords from per-node centroids at a
-            # reference layer (middle of the fit-layer set by default,
-            # or ``reference_layer`` override).  The same coords feed
-            # the per-layer RBF as the manifold's intrinsic coordinates
-            # — wrapped in a ``CustomDomain(k)`` with identity embed so
-            # the existing fit machinery handles them unchanged.
-            hyperparams = dict(mf.hyperparams)
-            ref_layer = hyperparams.pop(
-                "reference_layer", fit_layers[len(fit_layers) // 2],
-            )
-            # ``max_subspace_dim`` is consumed by the per-layer fit, not
-            # by ``discover_coords`` — pop it before the discover call so
-            # the dispatcher doesn't get an unexpected kwarg.
+            # Discover: derive coords from the per-node centroids, layer-
+            # agnostically — there is no reference layer.  The same coords feed
+            # the per-layer RBF as the manifold's intrinsic coordinates —
+            # wrapped in a ``CustomDomain(k)`` with identity embed so the
+            # existing fit machinery handles them unchanged.
+            # Sanitize against the per-mode whitelist (single source of truth
+            # in ``io.manifolds``) so a stale on-disk ``manifold.json`` carrying
+            # a since-removed key (e.g. the old ``anchor_origin``) can't reach
+            # ``discover_coords`` as an unexpected kwarg.  Author/CLI paths
+            # already sanitize; this guards legacy + hand-edited folders.
+            from saklas.io.manifolds import _sanitize_hyperparams
+            hyperparams = _sanitize_hyperparams(mf.fit_mode, dict(mf.hyperparams))
+            # ``max_subspace_dim`` is consumed by the curved per-layer fit,
+            # not by ``discover_coords`` — pop it before the discover call so
+            # the dispatcher doesn't get an unexpected kwarg.  (Sanitized out
+            # of ``pca`` folders above; the affine branch ignores it regardless
+            # — see the affine fit below.)
             if "max_subspace_dim" in hyperparams:
                 max_subspace_dim_override = int(hyperparams.pop("max_subspace_dim"))
-            # ``anchor_origin`` is the post-discover origin-anchoring
-            # toggle (see ``_HYPERPARAMS_BY_MODE`` in ``io/manifolds.py``
-            # for the semantics).  We pop it here so the discover
-            # dispatcher doesn't see it, and apply the translation after
-            # ``discover_coords`` returns.  Spectral mode rejects it at
-            # the sanitization gate; assert here for defense in depth.
-            anchor_origin_raw = hyperparams.pop("anchor_origin", None)
-            if anchor_origin_raw is not None and mf.fit_mode != "pca":
-                raise ValueError(
-                    f"discover manifold {mf.name!r}: anchor_origin is "
-                    f"only supported for fit_mode='pca' (got {mf.fit_mode!r})"
-                )
-            anchor_label: str | None
-            if anchor_origin_raw in (None, False):
-                anchor_label = None
-            elif anchor_origin_raw is True:
-                anchor_label = "default"
-            elif isinstance(anchor_origin_raw, str) and anchor_origin_raw:
-                anchor_label = anchor_origin_raw
-            else:
-                raise ValueError(
-                    f"discover manifold {mf.name!r}: anchor_origin must "
-                    f"be a bool or non-empty string label, got "
-                    f"{anchor_origin_raw!r}"
-                )
-            if ref_layer not in fit_layers:
-                raise ValueError(
-                    f"discover manifold {mf.name!r}: reference_layer "
-                    f"{ref_layer} not in fit_layers {fit_layers}"
-                )
-            ref_stack = torch.stack(
-                [per_node[k][ref_layer] for k in range(K)]
-            )  # (K, D) fp32 CPU
-            if sae_backend is not None:
-                with torch.no_grad():
-                    feat = sae_backend.encode_layer(
-                        ref_layer, ref_stack.to(device),
-                    )
-                    recon = sae_backend.decode_layer(ref_layer, feat)
-                ref_stack = recon.detach().to("cpu", torch.float32)
+            # Consensus Gram: the mean over every fit layer of that layer's
+            # whitened, node-mean-centered (K, K) Gram ``X̃_L Σ_L⁻¹ X̃_Lᵀ``
+            # (the ``layer_grams`` already computed for the spread profile).
+            # Whitening puts each layer in common (background-σ) units, so the
+            # raw average is **signal-weighted** — a layer where the nodes
+            # aren't separated contributes a near-zero Gram and drops out, while
+            # a layer where the concept is strongly represented dominates.  PCA
+            # eigendecomposes this Gram; spectral reads its pairwise distances.
+            # The (K, K) Gram is the layer-invariant object, so this is exactly
+            # the single-reference-layer derivation generalized to the whole
+            # stack — ``%`` positions and node labels live in one coordinate
+            # system distilled from all layers, wherever the concept's signal
+            # happens to concentrate.
             _progress(
-                f"Deriving {mf.fit_mode} coords from layer "
-                f"{ref_layer} ({K} centroids)..."
+                f"Deriving {mf.fit_mode} coords across {len(fit_layers)} "
+                f"layers ({K} centroids)..."
             )
+            consensus_gram = torch.stack(
+                [layer_grams[idx] for idx in fit_layers]
+            ).mean(dim=0)
             derived_coords, diagnostics = discover_coords(
-                ref_stack, method=mf.fit_mode, **hyperparams,
+                consensus_gram, method=mf.fit_mode, **hyperparams,
             )
             k = derived_coords.shape[1]
             # Node-count floor.  The curved (spectral) path fits an RBF
@@ -509,30 +544,11 @@ class ManifoldExtractionPipeline:
                     f"discover manifold {mf.name!r}: picked k={k} needs "
                     f">= {floor} nodes {floor_reason}, got K={K}"
                 )
-            # Origin anchoring (pca-discover only).  Find the anchor
-            # node by label, take its row from ``derived_coords`` as the
-            # pre-translate authoring coord, and shift every coord by
-            # ``-anchor_coord`` — the anchor lands at ``(0, ..., 0)`` in
-            # the user-facing coord system.  RBF interpolation is exact
-            # at fit nodes, so steering ``<manifold>%0,...,0`` reproduces
-            # the anchor's per-layer behavior (its corpus pools to the
-            # value the interpolant emits at origin).
-            anchor_authoring_coord: list[float] | None = None
-            if anchor_label is not None:
-                node_labels_for_anchor = [
-                    label for label, _ in node_groups
-                ]
-                if anchor_label not in node_labels_for_anchor:
-                    raise ValueError(
-                        f"discover manifold {mf.name!r}: anchor_origin "
-                        f"requires a node labeled {anchor_label!r}, but "
-                        f"the corpus has nodes "
-                        f"{node_labels_for_anchor!r}"
-                    )
-                anchor_idx = node_labels_for_anchor.index(anchor_label)
-                anchor_coord = derived_coords[anchor_idx].clone()
-                anchor_authoring_coord = anchor_coord.tolist()
-                derived_coords = derived_coords - anchor_coord
+            # The derived coords come out PCA-mean-centered; the steer-time
+            # origin is the projection of the per-model neutral mean onto the
+            # subspace (the affine fit neutral-anchors the frame below — coord
+            # 0 in each layer's *real* reduced frame is neutral), so there is
+            # no display-coord translation to apply.
             domain = CustomDomain(k)
             node_coords = derived_coords
             node_params = derived_coords  # identity embedding
@@ -545,7 +561,6 @@ class ManifoldExtractionPipeline:
             # ``k_nn``/``bandwidth``) + the diagnostics for the sidecar
             # and the inspector surfaces.
             resolved_hyperparams = dict(hyperparams)
-            resolved_hyperparams["reference_layer"] = int(ref_layer)
             if max_subspace_dim_override is not None:
                 resolved_hyperparams["max_subspace_dim"] = max_subspace_dim_override
             if hasattr(diagnostics, "k_nn"):  # SpectralDiagnostics
@@ -553,45 +568,16 @@ class ManifoldExtractionPipeline:
                 resolved_hyperparams["bandwidth"] = float(
                     diagnostics.bandwidth,  # pyright: ignore[reportAttributeAccessIssue]  # SpectralDiagnostics only; guarded by hasattr
                 )
-            if anchor_label is not None:
-                resolved_hyperparams["anchor_origin"] = anchor_label
             discover_metadata = {
                 "fit_mode": mf.fit_mode,
                 "hyperparams": resolved_hyperparams,
                 "diagnostics": _diagnostics_to_dict(diagnostics),
             }
-            if anchor_label is not None and anchor_authoring_coord is not None:
-                # Stamp the pre-translate authoring coord into metadata
-                # so post-hoc inspection can verify the translation and
-                # measure how far the anchor sat from the K-centroid mean
-                # in the original PCA space.  Not consumed by any runtime
-                # path — purely diagnostic.
-                discover_metadata["anchor_pre_translate_coord"] = (
-                    anchor_authoring_coord
-                )
 
-        # 4. Per-layer fit.  Stack centroids -> (K, D); for the SAE
-        #    variant reconstruct through the SAE before fitting.
-        #
-        # Mahalanobis whitening is mandatory for an activation-space fit —
-        # without it the basis, mean, and steering direction get dominated by
-        # rogue (massive-activation) channels.  The whitener is resolved here,
-        # *after* the cache-hit return and the fail-fast SAE/role checks, since
-        # ``handle.whitener`` can trigger a lazy neutral-activation build.  It
-        # must cover *every* fit layer (so the cross-layer-normalized share
-        # compares like with like); partial coverage or a handle without a
-        # whitener is a hard error, not a Euclidean fallback.  The basis is
-        # model-space for both raw and SAE fits (centroids are decoded back
-        # before the fit), so the residual-stream whitener applies to the SAE
-        # variant unchanged.
-        _whitener = getattr(self._handle, "whitener", None)
-        if _whitener is None or not _whitener.covers_all(fit_layers):
-            raise WhitenerError(
-                f"manifold {mf.name!r}: the Mahalanobis whitener must cover "
-                f"every fit layer (regenerate the neutral activation cache "
-                f"for {self._handle.model_id!r})"
-            )
-        maha_whitener = _whitener
+        # 4. Per-layer fit over the centroid stacks built in step 2b (SAE
+        #    reconstruction, when set, already folded in there).  The whitener
+        #    (mandatory; resolved in step 2) selects the whitened/Fisher basis
+        #    and bakes the per-layer share.
         _progress(
             f"Fitting RBF interpolant across {len(fit_layers)} layers..."
         )
@@ -606,15 +592,6 @@ class ManifoldExtractionPipeline:
         fit_kwargs: dict[str, Any] = {}
         if max_subspace_dim_override is not None:
             fit_kwargs["n_components"] = max_subspace_dim_override
-
-        def _stacked_centroids(idx: int) -> torch.Tensor:
-            s = torch.stack([per_node[k][idx] for k in range(K)])  # (K, D) fp32 CPU
-            if sae_backend is not None:
-                with torch.no_grad():
-                    feat = sae_backend.encode_layer(idx, s.to(device))
-                    recon = sae_backend.decode_layer(idx, feat)
-                s = recon.detach().to("cpu", torch.float32)
-            return s
 
         def _neutral_for(idx: int) -> "torch.Tensor | None":
             return (
@@ -645,16 +622,16 @@ class ManifoldExtractionPipeline:
             # The shared ``node_coords`` stays the derived
             # PCA layout (display/labels); the real per-layer steer coords live
             # on each ``LayerSubspace.node_coords``.
-            affine_kwargs = dict(fit_kwargs)
-            # rank = the derived intrinsic dim (the shared layout's width — set
-            # for every fit_mode, so always bound here unlike the discover-only
-            # ``k``); ``max_subspace_dim`` override in ``fit_kwargs`` wins.
-            affine_kwargs.setdefault("n_components", int(node_coords.shape[1]))
+            # The per-layer steerable subspace is exactly the k-dim layout
+            # span — ``n_components`` is the derived intrinsic dim (the shared
+            # layout's width, set for every fit_mode, so always bound here
+            # unlike the discover-only ``k``).  There is no separate
+            # ``max_subspace_dim`` knob for a flat fit: the affine span *is*
+            # the layout, so any stray curved-fit override is ignored here.
+            affine_kwargs = {"n_components": int(node_coords.shape[1])}
             raw_fits: dict[int, tuple[Any, torch.Tensor]] = {}
-            stacks: dict[int, torch.Tensor] = {}
             for idx in fit_layers:
-                stacked = _stacked_centroids(idx)
-                stacks[idx] = stacked
+                stacked = stacks[idx]
                 sub, mu_coords, ev_ratio = fit_affine_subspace(
                     stacked, neutral_mean=_neutral_for(idx),
                     whitener=maha_whitener, layer=idx,
@@ -681,7 +658,7 @@ class ManifoldExtractionPipeline:
         else:
             # CURVED (authored / spectral): RBF surface fit, neutral-anchored.
             for idx in fit_layers:
-                stacked = _stacked_centroids(idx)
+                stacked = stacks[idx]
                 # ``neutral_mean`` neutral-anchors the frame; ``maha_whitener``
                 # (mandatory, checked above) selects the whitened/Fisher basis.
                 sub, ev_ratio = fit_layer_subspace(
@@ -745,6 +722,13 @@ class ManifoldExtractionPipeline:
             # always whitened/Fisher — no Euclidean fit path survives.
             "share_metric": "mahalanobis",
             "subspace_metric": "mahalanobis",
+            # Diagnostic layer profile (see step 2c): the whitened between-node
+            # spread per layer, ``{str(L): tr(G_L)}``.  Not consumed by any
+            # runtime path — surfaced by `manifold show` as the concept's
+            # signal-by-layer curve.
+            "node_spread_per_layer": {
+                str(idx): node_spread_per_layer[idx] for idx in fit_layers
+            },
         }
         if sae_backend is not None:
             metadata["sae_release"] = sae_backend.release

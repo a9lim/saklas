@@ -52,12 +52,31 @@ def build_token_event(
         ) if node is not None else None
         last = rows[-1] if rows else None
         if last is not None:
+            # ``probes`` is the per-probe coordinate axis-0 float the session
+            # already collapsed from each reading; ``per_layer_scores`` is the
+            # per-layer coordinate map.  Both keep their existing wire shapes
+            # ({name: float} / {layer: {name: float}}) for the un-updated webui.
             probes_blob = last.get("probes")
             if probes_blob:
                 event["scores"] = probes_blob
             per_layer_blob = last.get("per_layer_scores")
             if per_layer_blob:
                 event["per_layer_scores"] = per_layer_blob
+
+    # Additive rich channel: the full per-probe vector coordinate reading
+    # (coords + fraction + nearest) for the latest token, lifted from the
+    # session's per-token probe payload.  New key — the old webui ignores it,
+    # while a coordinate-aware native client can read coords without the
+    # ``scores`` axis-0 shape changing.
+    with suppress(Exception):
+        payload = getattr(session, "_last_token_probe_payload", None)
+        vector_readings = (
+            payload.get("readings") if isinstance(payload, dict) else None
+        )
+        if vector_readings:
+            event["probe_readings"] = {
+                name: r.to_dict() for name, r in vector_readings.items()
+            }
 
     with suppress(Exception):
         payload = getattr(session, "_last_token_probe_payload", None)
