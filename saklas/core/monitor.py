@@ -111,6 +111,10 @@ class Monitor:
         self._probes: dict[str, AttachedManifoldProbe] = {}
         self._layer_means: dict[int, torch.Tensor] = dict(layer_means) if layer_means else {}
         self._whitener: Any = whitener
+        self._whitener_factor_cache: dict[
+            tuple[int, str, torch.dtype],
+            tuple[torch.Tensor, torch.Tensor, float],
+        ] = {}
 
         # Per-coordinate history + summary stats.  ``history`` holds the
         # per-generation aggregate coordinate tuple; ``_stats`` is axis-0
@@ -179,16 +183,19 @@ class Monitor:
         """Wire (or clear) the Mahalanobis whitener and invalidate the cache.
 
         Idempotent on the same instance — re-wiring the identical whitener
-        is a no-op.  Any change flushes the batched fast cache and rebuilds
-        each attached probe's per-layer whitened factors against the new
+        is a no-op.  Any change flushes the shared Woodbury-factor cache and
+        rebuilds each attached probe's per-layer whitened factors against the new
         covariance (manifold reads are Mahalanobis-only, so a whitener that
         doesn't cover an attached probe's fit layers raises here).
         """
         if whitener is self._whitener:
             return
         self._whitener = whitener
+        self._whitener_factor_cache.clear()
         for probe in self._probes.values():
-            probe.whitened = _build_whitened_factors(whitener, probe)
+            probe.whitened = _build_whitened_factors(
+                whitener, probe, factor_cache=self._whitener_factor_cache,
+            )
 
     def _score_probe_full(
         self,
@@ -209,7 +216,7 @@ class Monitor:
         """
         manifold = probe.manifold
         ev = probe.ev_weights
-        is_affine = _probe_is_affine(probe)
+        is_affine = probe.is_affine
         shared = [idx for idx in manifold.layers if idx in hidden_per_layer]
         if not shared:
             return ProbeReading(fraction=0.0, nearest=[], coords=())
@@ -288,13 +295,28 @@ class Monitor:
                     if i < len(coords_mean):
                         coords_mean[i] += w * c
 
-        dist_acc = (
-            dist_acc_t.cpu().tolist() if dist_acc_t is not None else [0.0] * K
-        )
-        order = sorted(range(K), key=lambda k: dist_acc[k])
-        nearest = [
-            (manifold.node_labels[k], dist_acc[k]) for k in order[: probe.top_n]
-        ]
+        nearest: list[tuple[str, float]] = []
+        requested_top_n = int(probe.top_n)
+        top_n = requested_top_n if requested_top_n >= 0 else K + requested_top_n
+        top_n = min(max(top_n, 0), K)
+        if top_n:
+            if dist_acc_t is None:
+                nearest = [
+                    (manifold.node_labels[k], 0.0) for k in range(top_n)
+                ]
+            else:
+                nearest_dist_t, nearest_idx_t = torch.topk(
+                    dist_acc_t,
+                    k=top_n,
+                    largest=False,
+                    sorted=True,
+                )
+                nearest_dist = nearest_dist_t.detach().cpu().tolist()
+                nearest_idx = nearest_idx_t.detach().cpu().tolist()
+                nearest = [
+                    (manifold.node_labels[int(k)], float(d))
+                    for k, d in zip(nearest_idx, nearest_dist, strict=True)
+                ]
         return ProbeReading(
             fraction=frac_mean,
             nearest=nearest,
@@ -669,12 +691,12 @@ class Monitor:
         Pre-caches the per-layer node values + EV weights + whitened factors
         (and, for a flat fit, the affine reduced→domain coord map) via
         :func:`_attach_manifold_probe`; the wired whitener must cover the
-        fit's layers.  Flat vs curved is decided per probe at read time
-        (:func:`_probe_is_affine`), not cached.
+        fit's layers.  Flat vs curved is cached once on the attached probe.
         """
         is_new = name not in self._probes
         self._probes[name] = _attach_manifold_probe(
             name, manifold, top_n=top_n, whitener=self._whitener,
+            factor_cache=self._whitener_factor_cache,
         )
         if is_new:
             self.history[name] = deque(maxlen=_MAX_HISTORY)
@@ -682,6 +704,7 @@ class Monitor:
 
     def remove_probe(self, name: str):
         self._probes.pop(name, None)
+        self._whitener_factor_cache.clear()
         if name in self.history:
             del self.history[name]
         if name in self._stats:
@@ -768,6 +791,7 @@ class AttachedManifoldProbe:
     name: str
     manifold: "Manifold"
     top_n: int = DEFAULT_NEAREST_TOP_N
+    is_affine: bool = True
     # Per-layer cache, indexed by layer index — same set of layers as
     # ``manifold.layers``.
     node_values_reduced: dict[int, torch.Tensor] = field(default_factory=dict)
@@ -818,25 +842,29 @@ class _LayerWhiten:
 
 # ----------------------------------------------------------------------------
 # Shared subspace-read machinery — used by both read paths of the unified
-# :class:`Monitor`.  The flat (affine) path stacks every flat probe — any rank
-# — into one matmul + one shared Woodbury ``Σ⁻¹h`` per layer and inverts
-# affinely; the curved path loops per probe and foot-solves in the aggregate.
-# Both share the whitened-factor build, the per-layer geometry, and the
-# attach-time node cache — the read-side peer of the steering split (one
-# ``subspace_inject`` kernel, ``SteeringManager.{subspaces, manifolds}``).
+# :class:`Monitor`.  Flat (affine) probes get an analytic coordinate readout;
+# curved probes foot-solve against the aggregate.  Both share the
+# whitened-factor build, the per-layer geometry, and the attach-time node cache
+# — the read-side peer of the steering split (one ``subspace_inject`` kernel,
+# ``SteeringManager.{subspaces, manifolds}``).
 # ----------------------------------------------------------------------------
 
 
-def _probe_is_affine(probe: "AttachedManifoldProbe") -> bool:
-    """True iff the probe's fit is flat (affine) — batched coordinate readout.
+def _probe_is_affine_for_manifold(manifold: "Manifold") -> bool:
+    """True iff a manifold's fit is flat (affine) — batched coordinate readout.
 
     A manifold's layers are uniformly affine (``pca`` / 2-node concept) or
     curved (``spectral`` / ``authored``), so the first fitted layer decides.
     An empty manifold is treated as affine (it scores to nothing anyway).
     """
-    for sub in probe.manifold.layers.values():
+    for sub in manifold.layers.values():
         return bool(sub.is_affine)
     return True
+
+
+def _probe_is_affine(probe: "AttachedManifoldProbe") -> bool:
+    """Back-compat wrapper for tests / callers that ask about an attached probe."""
+    return probe.is_affine
 
 
 def _affine_coord_map(
@@ -890,6 +918,11 @@ def _affine_coord_map(
 
 def _build_whitened_factors(
     whitener: Any, probe: "AttachedManifoldProbe",
+    *,
+    factor_cache: dict[
+        tuple[int, str, torch.dtype],
+        tuple[torch.Tensor, torch.Tensor, float],
+    ] | None = None,
 ) -> dict[int, "_LayerWhiten"]:
     """Per-layer :class:`_LayerWhiten` map for a probe (Mahalanobis-only).
 
@@ -929,9 +962,15 @@ def _build_whitened_factors(
             jitter = 1e-8 * float(m_r.diagonal().mean().clamp_min(1e-12))
             chol = torch.linalg.cholesky(m_r + jitter * eye)
         m_r_inv = torch.cholesky_inverse(chol)
-        X, K_inv, lam = whitener.woodbury_factors(
-            layer_idx, device=dev, dtype=torch.float32,
-        )
+        cache_key = (layer_idx, str(dev), torch.float32)
+        if factor_cache is not None and cache_key in factor_cache:
+            X, K_inv, lam = factor_cache[cache_key]
+        else:
+            X, K_inv, lam = whitener.woodbury_factors(
+                layer_idx, device=dev, dtype=torch.float32,
+            )
+            if factor_cache is not None:
+                factor_cache[cache_key] = (X, K_inv, lam)
         chol_dev = chol.to(device=dev, dtype=torch.float32)
         m_r_inv_dev = m_r_inv.to(device=dev, dtype=torch.float32)
         # Flat probes carry the affine reduced→domain coord map (the rank-R
@@ -960,6 +999,10 @@ def _attach_manifold_probe(
     *,
     top_n: int = DEFAULT_NEAREST_TOP_N,
     whitener: Any = None,
+    factor_cache: dict[
+        tuple[int, str, torch.dtype],
+        tuple[torch.Tensor, torch.Tensor, float],
+    ] | None = None,
 ) -> "AttachedManifoldProbe":
     """Build an :class:`AttachedManifoldProbe`: node values + EV weights + whitened.
 
@@ -1004,10 +1047,13 @@ def _attach_manifold_probe(
         name=name,
         manifold=manifold,
         top_n=int(top_n),
+        is_affine=_probe_is_affine_for_manifold(manifold),
         node_values_reduced=node_values_reduced,
         ev_weights=ev_weights,
     )
-    probe.whitened = _build_whitened_factors(whitener, probe)
+    probe.whitened = _build_whitened_factors(
+        whitener, probe, factor_cache=factor_cache,
+    )
     return probe
 
 

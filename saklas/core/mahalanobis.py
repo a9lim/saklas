@@ -223,12 +223,19 @@ class LayerWhitener:
             )
             # K = (NλI + X X^T)^{-1}, fp32, on CPU.  The ``(NλI + X X^T)``
             # matrix is symmetric PD by construction (Gram matrix plus a
-            # positive multiple of identity) — Cholesky is the right
-            # solver, but ``torch.linalg.inv`` is fine at N=90 and avoids
-            # threading a separate Cholesky through every call site.
+            # positive multiple of identity), so use Cholesky rather than a
+            # general inverse.  This is setup-side work, but it runs once per
+            # layer for every whitener build; the SPD path is both cheaper and
+            # better conditioned.
             G = X_c @ X_c.transpose(0, 1)  # (N, N) Gram
             G.diagonal().add_(n * lam)
-            K = torch.linalg.inv(G)
+            try:
+                chol = torch.linalg.cholesky(G)
+            except torch.linalg.LinAlgError:
+                eye = torch.eye(n, dtype=G.dtype)
+                jitter = 1e-8 * float(G.diagonal().mean().clamp_min(1e-12))
+                chol = torch.linalg.cholesky(G + jitter * eye)
+            K = torch.cholesky_inverse(chol)
             # Never carry non-finite factors into the hot path: if the
             # regularized inverse came back inf/nan (e.g. ``frob_sq`` itself
             # overflowed fp32, so ``λ``/``G`` did too), skip the layer —

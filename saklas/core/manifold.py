@@ -1693,7 +1693,11 @@ def subspace_inject(
         # tangent Gram-solve — the cost the common steering case can't pay.
         # ALONG slides ``q`` toward ``target`` geodesically (CustomDomain ⇒
         # linear); the off-subspace residual ``H_o`` is kept verbatim.
-        p_new = domain.geodesic(q, target, along)      # (.., n==R)
+        p_new = (
+            q + along * (target - q)
+            if isinstance(domain, CustomDomain)
+            else domain.geodesic(q, target, along)
+        )                                               # (.., n==R)
         h_new = h_f32 + ((p_new - q) @ basis)           # keep H_o verbatim
         h_new = _soft_norm_cap(h_new, h_f32, norm_cap)
         return h_new.to(h.dtype), q

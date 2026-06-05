@@ -86,7 +86,10 @@ class HiddenCapture:
                         # Overwrite — keep the bucket length-1 so device
                         # memory stays O(layers·D). ``[-1]`` reads (tap,
                         # latest_per_layer) still return the latest slice.
-                        bucket_ref[:] = (slice_,)
+                        if bucket_ref:
+                            bucket_ref[0] = slice_
+                        else:
+                            bucket_ref.append(slice_)
                         # The highest hooked layer fires last in the
                         # forward (forward hooks run in layer-execution
                         # order), so by the time it stores its slice every
