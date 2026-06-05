@@ -118,7 +118,10 @@ def _steer_subspace(mgr: Any, *pairs: Any) -> None:
             if n < 1e-12:
                 continue
             basis_dirs[L] = (v / n).reshape(1, -1)
-            coord_dirs[L] = torch.tensor([n])
+            # Follow the profile's device (the loaded steering vectors live on
+            # the model device); a CPU-default coord would mismatch the
+            # on-device basis inside synthesize_subspace (``c_i @ B_i``).
+            coord_dirs[L] = torch.tensor([n], device=v.device)
             neutral_means.setdefault(L, torch.zeros_like(v))
         push.append((basis_dirs, coord_dirs, alpha))
     synth = synthesize_subspace(push, [], neutral_means=neutral_means)

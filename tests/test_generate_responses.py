@@ -22,14 +22,22 @@ class _FakeSession(SaklasSession):
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
 
-    def _run_generator(
-        self, system_msg: str, prompt: str, max_new_tokens: int, **kw: Any,
-    ) -> str:
-        self.calls.append(
-            {"system": system_msg, "prompt": prompt, "role": kw.get("role")},
-        )
-        # Echo so the caller can see which prompt produced which response.
-        return f"resp::{prompt}"
+    def _run_generator_batch(
+        self, system_msg: str, prompts: list[str], max_new_tokens: int,
+        **kw: Any,
+    ) -> list[str]:
+        # The batched seam generate_responses / generate_neutral_responses call.
+        # Record one entry per prompt (preserving order) so the alignment +
+        # count assertions are identical to the old per-prompt seam.
+        role = kw.get("role")
+        out: list[str] = []
+        for prompt in prompts:
+            self.calls.append(
+                {"system": system_msg, "prompt": prompt, "role": role},
+            )
+            # Echo so the caller can see which prompt produced which response.
+            out.append(f"resp::{prompt}")
+        return out
 
 
 @pytest.fixture(autouse=True)

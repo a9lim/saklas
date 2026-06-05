@@ -286,13 +286,17 @@ class SteeringHook:
         self._all_groups_always_active = False
         # Fast-path payload for the dominant steering case — exactly one affine
         # group, always-active (``Trigger.BOTH``).  When set,
-        # ``(sub, domain, target, origin, along, onto)`` is the unpacked single
-        # group, so ``hook_fn`` runs one ``subspace_inject`` + ``copy_`` with no
-        # per-fire group loop, no trigger re-check, and no foot-seed branch.
-        # ``None`` ⇒ general path (multi-group, gated, or any curved group).
+        # ``(sub, domain, target, origin, along, onto, mean_proj)`` is the
+        # unpacked single group, so ``hook_fn`` runs one ``subspace_inject`` +
+        # ``copy_`` with no per-fire group loop, no trigger re-check, and no
+        # foot-seed branch.  ``mean_proj = mean·basisᵀ`` (the ``(R,)`` reduced
+        # projection of the layer mean) is precomputed here so the affine
+        # shortcut skips both the full-width ``centered = h − mean`` temporary
+        # and the per-fire matvec.  ``None`` ⇒ general path (multi-group,
+        # gated, or any curved group).
         self._single_affine_fast: tuple[
             LayerSubspace, ManifoldDomain,
-            torch.Tensor, torch.Tensor, float, float,
+            torch.Tensor, torch.Tensor, float, float, torch.Tensor,
         ] | None = None
         # Shared mutable context threaded in by SteeringManager.  Read-only
         # from the hook's perspective; the generation loop mutates fields.
@@ -367,7 +371,13 @@ class SteeringHook:
             and manifold_groups[0][1].is_affine
         ):
             _trig, _sub, _dom, _tgt, _org, _alo, _ont = manifold_groups[0]
-            self._single_affine_fast = (_sub, _dom, _tgt, _org, _alo, _ont)
+            # Precompute mean·basisᵀ ((R,) fp32 on device — ``_sub`` was cast in
+            # the group append above) so the affine shortcut never materializes
+            # the full-width ``centered`` temp per fire.
+            _mp = _sub.mean @ _sub.basis.T
+            self._single_affine_fast = (
+                _sub, _dom, _tgt, _org, _alo, _ont, _mp,
+            )
         # New group set ⇒ cold-start every foot-follower (seed at origin).
         self._manifold_feet = [None] * len(manifold_groups)
 
@@ -380,9 +390,10 @@ class SteeringHook:
         fast = self._single_affine_fast
         if fast is not None:
             hidden = output if isinstance(output, torch.Tensor) else output[0]
-            sub, domain, target, origin, along, onto = fast
+            sub, domain, target, origin, along, onto, mean_proj = fast
             h_new, _foot = subspace_inject(
-                hidden, sub, domain, target, origin, along, onto, gn_steps=1,
+                hidden, sub, domain, target, origin, along, onto,
+                gn_steps=1, mean_proj=mean_proj,
             )
             hidden.copy_(h_new)
             return output

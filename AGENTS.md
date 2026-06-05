@@ -577,7 +577,8 @@ tok/s):
   + `score_per_token`.
 - **Steering hooks are transient** — composed before generation, removed after.
 - **MPS discipline** — diffs on CPU, `torch.mps.empty_cache()` between extraction
-  passes, end-of-loop sync to dodge Metal command-buffer reuse crashes.
+  *batches* (capture is chunked at `_CAPTURE_BATCH`; corpus generation at
+  `_CORPUS_GEN_BATCH`), end-of-loop sync to dodge Metal command-buffer reuse crashes.
 
 ## Tested architectures
 

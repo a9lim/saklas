@@ -113,11 +113,11 @@ class TestHumanize:
             def __init__(self) -> None:
                 pass
 
-            def _run_generator(self, system_msg: str, prompt: str, max_new_tokens: int, **kw: Any) -> str:
+            def _run_generator_batch(self, system_msg: str, prompts: list[str], max_new_tokens: int, **kw: Any) -> list[str]:
                 captured["system"] = system_msg
                 captured["role"] = kw.get("role")
-                captured.setdefault("prompts", []).append(prompt)
-                return "a generated in-character response"
+                captured.setdefault("prompts", []).extend(prompts)
+                return ["a generated in-character response" for _ in prompts]
 
         out = _FakeSession().generate_responses(
             ["artificial_intelligence"], ["abstract"], samples_per_prompt=2,

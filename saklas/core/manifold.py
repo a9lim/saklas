@@ -1625,17 +1625,22 @@ def _soft_norm_cap(
     Operates **in place** on ``h_new`` (returning it for call-site clarity):
     both call sites pass a freshly-allocated sum (``h_f32 + Δ`` / ``mean +
     new_par + new_perp``), never an alias of the function input ``h``, so the
-    in-place ``mul_`` by a ``(.., 1)`` per-row scale is safe and skips the
-    full-width ``torch.where`` temporary the guard used to allocate every
-    fire."""
+    in-place ``mul_`` by a ``(.., 1)`` per-row scale is safe.
+
+    The scale is ``min(1, norm_cap·‖h‖ / ‖h_new‖)`` expressed as a single
+    ``clamp(max=1.0)`` on the ratio — when ``‖h_new‖ ≤ cap`` the ratio is ``≥1``
+    and clamps to a no-op ``1``; when it overshoots, the ratio is the shrink
+    factor ``cap/‖h_new‖``.  This is identical to the old
+    ``where(post > cap, cap/post, 1)`` form on every non-degenerate ``h`` but
+    skips both the full-width ``torch.ones_like`` temporary *and* the
+    ``torch.where`` select the guard used to allocate every fire (only the
+    all-zero-``h`` corner differs — scale 0 vs 1 — and there ``h_new ≈ 0`` so
+    the product is ``0`` either way)."""
     norm_pre = torch.linalg.vector_norm(h_f32, dim=-1, keepdim=True)
     norm_post = torch.linalg.vector_norm(h_new, dim=-1, keepdim=True)
-    cap = norm_cap * norm_pre
-    scale = torch.where(
-        norm_post > cap,
-        cap / norm_post.clamp(min=1e-6),
-        torch.ones_like(norm_post),
-    )                                              # (.., 1) — not full-width
+    scale = (
+        norm_cap * norm_pre / norm_post.clamp(min=1e-6)
+    ).clamp_(max=1.0)                              # (.., 1) — not full-width
     return h_new.mul_(scale)
 
 
@@ -1651,6 +1656,7 @@ def subspace_inject(
     gn_steps: int = 1,
     norm_cap: float = 3.0,
     damping: float = DEFAULT_INVERSION_DAMPING,
+    mean_proj: "torch.Tensor | None" = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """The unified two-operation manifold injection (replaces angular/additive).
 
@@ -1699,17 +1705,24 @@ def subspace_inject(
     basis = subspace.basis.to(torch.float32)          # (R, D)
     target = target_coord.to(device=h_f32.device, dtype=torch.float32)
 
-    centered = h_f32 - mean                            # (.., D)
-    q = centered @ basis.T                             # (.., R) reduced coords of h_par
-
     if subspace.is_affine:
         # --- flat (folded-vector) shortcut --------------------------------
         # The surface fills the subspace, so reduced coords *are* authoring
         # coords (identity map): the foot is ``q`` exactly, ``H_n ≡ 0`` and
         # ``onto`` is vacuous (ignored).  No GN solve, no RBF eval, no
         # tangent Gram-solve — the cost the common steering case can't pay.
-        # ALONG slides ``q`` toward ``target`` geodesically (CustomDomain ⇒
-        # linear); the off-subspace residual ``H_o`` is kept verbatim.
+        #
+        # ``q = (h − mean)·basisᵀ = h·basisᵀ − mean·basisᵀ`` is computed
+        # **without** the full-width ``centered = h − mean`` temporary: the
+        # ``(R,)`` ``mean_proj = mean·basisᵀ`` is a tiny reduced-space constant
+        # (one dot product at R=1).  Hot callers (the single-affine fast hook)
+        # precompute it once at ``recompose`` and thread it in; everyone else
+        # gets the inline ``mean @ basis.T``.  ALONG slides ``q`` toward
+        # ``target`` geodesically (CustomDomain ⇒ linear); the off-subspace
+        # residual ``H_o`` is kept verbatim (``h_new = h + Δ·basis`` is a fresh
+        # tensor, never an in-place mutation of ``h``).
+        mp = mean_proj if mean_proj is not None else (mean @ basis.T)  # (R,)
+        q = h_f32 @ basis.T - mp                        # (.., R)
         p_new = (
             q + along * (target - q)
             if isinstance(domain, CustomDomain)
@@ -1722,6 +1735,8 @@ def subspace_inject(
         # only allocate a redundant full-width model-dtype temporary per fire.
         return h_new, q
 
+    centered = h_f32 - mean                            # (.., D)
+    q = centered @ basis.T                             # (.., R) reduced coords of h_par
     h_par = q @ basis                                  # (.., D) in-subspace reconstruction
     h_perp = centered - h_par                          # (.., D) = H_o
 
@@ -2205,7 +2220,7 @@ def compute_node_centroid(
 
     Returns ``{layer_idx: centroid (D,)}`` in fp32 on CPU.
     """
-    from saklas.core.vectors import _encode_and_capture_all
+    from saklas.core.vectors import _CAPTURE_BATCH, _encode_and_capture_all_batch
 
     if not responses:
         raise ValueError("manifold node has no responses")
@@ -2222,23 +2237,30 @@ def compute_node_centroid(
     n_layers = len(layers)
     sums: dict[int, torch.Tensor] = {}
     is_mps = getattr(device, "type", None) == "mps"
+    n = len(responses)
+    # Each response pairs with ``prompts[i % k]`` (the A2 round-robin alignment);
+    # capture is batched in chunks of ``_CAPTURE_BATCH`` (one forward per chunk,
+    # MPS flush amortized) and reduced to a running per-layer sum, so peak memory
+    # is one chunk's pooled ``(B, D)`` per layer rather than the whole corpus.
+    aligned_prompts = [prompts[i % k] for i in range(n)]
 
-    for i, response in enumerate(responses):
-        per_layer = _encode_and_capture_all(
-            model, tokenizer, prompts[i % k], response, layers, device,
-            role=role, model_type=model_type,
+    for start in range(0, n, _CAPTURE_BATCH):
+        end = min(start + _CAPTURE_BATCH, n)
+        per_layer = _encode_and_capture_all_batch(
+            model, tokenizer,
+            aligned_prompts[start:end], responses[start:end],
+            layers, device, role=role, model_type=model_type,
         )
-        if not sums:
-            for idx in range(n_layers):
-                sums[idx] = per_layer[idx].detach().to("cpu", torch.float32)
-        else:
-            for idx in range(n_layers):
-                sums[idx] += per_layer[idx].detach().to("cpu", torch.float32)
+        for idx in range(n_layers):
+            chunk_sum = per_layer[idx].detach().sum(dim=0).to("cpu", torch.float32)
+            if idx in sums:
+                sums[idx] += chunk_sum
+            else:
+                sums[idx] = chunk_sum
         del per_layer
         if is_mps:
             torch.mps.empty_cache()
 
-    n = len(responses)
     return {idx: sums[idx] / n for idx in range(n_layers)}
 
 

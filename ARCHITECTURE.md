@@ -155,8 +155,15 @@ vector; an N-node fit is a manifold. The session wraps it: `extract` /
 
 ### 3.1 Forward capture and pooling
 
-`core/vectors.py` owns the low-level capture. One forward pass per statement;
-`_capture_all_hidden_states` hooks every layer at once. Pooling is from the
+`core/vectors.py` owns the low-level capture. Statements are captured in
+**right-padded batches** (`_encode_and_capture_all_batch`, `_CAPTURE_BATCH`
+pairs per forward; `_encode_and_capture_all` is the single-pair sibling);
+`_capture_all_hidden_states` hooks every layer at once and pools each row at its
+last-content index *inside the hook* (per-row gather), so only `(B, D)` per layer
+is retained, never `(B, T, D)`, and the MPS allocator flush is amortized per
+chunk. Right-padding is exact for capture — causal attention at a row's pool
+position sees only real tokens to its left, so the pooled state matches the
+unpadded forward. Pooling is from the
 **last content token** — `last_content_index` walks back from the final position
 past both `tokenizer.all_special_ids` and `tokenizer.added_tokens_encoder`
 values, so trailing chat-template markers (which carry outlier "rogue" channel

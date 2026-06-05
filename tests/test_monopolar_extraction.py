@@ -46,6 +46,21 @@ def _concept_encoder(
     return out
 
 
+def _concept_encoder_batch(
+    model: Any, tokenizer: Any, prompts: Any, responses: Any, layers: Any,
+    device: Any, **kwargs: Any,
+) -> dict[int, torch.Tensor]:
+    """Batched seam matching ``vectors._encode_and_capture_all_batch`` — stacks
+    the deterministic per-row concept centroid over the chunk, ``{L: (B, D)}``."""
+    rows = [
+        _concept_encoder(model, tokenizer, p, r, layers, device, **kwargs)
+        for p, r in zip(prompts, responses)
+    ]
+    return {
+        L: torch.stack([row[L] for row in rows]) for L in range(len(layers))
+    }
+
+
 class _Handle:
     """Minimal ModelHandle stub carrying ``layer_means`` (= ν, the neutral pole)."""
 
@@ -78,7 +93,7 @@ class _Handle:
 def _stub(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     torch.manual_seed(0)
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    monkeypatch.setattr(V, "_encode_and_capture_all", _concept_encoder)
+    monkeypatch.setattr(V, "_encode_and_capture_all_batch", _concept_encoder_batch)
     # Single baseline prompt → any corpus length is a multiple of k=1.
     monkeypatch.setattr(V, "_load_baseline_prompts", lambda: ["baseline prompt"])
 

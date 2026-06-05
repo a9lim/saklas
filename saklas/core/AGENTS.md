@@ -33,9 +33,18 @@ Low-level capture, pooling, DLS, the vector⇄subspace fold, and profile I/O. **
 (`extraction.py`); what survives here is the capture + fold + projection
 machinery that pipeline and dispatch both consume.
 
-One forward pass per response; `_capture_all_hidden_states` hooks every layer at
-once. Capture is **conversational** (4.0 / A2): a corpus item is an assistant
-*response* to a fixed baseline *prompt*, so `_encode_and_capture_all(model,
+Capture runs in **right-padded batches** — `_encode_and_capture_all_batch(model,
+tokenizer, prompts, responses, layers, device, *, role=, model_type=,
+system_msg=)` renders + tokenizes the chunk, right-pads to a common length
+(attention-masked; pool indices unchanged since real tokens stay left-aligned),
+and runs one `_capture_all_hidden_states` forward that pools each row at its
+last-content index *inside the hook* (per-row gather → `(B, D)` per layer, never
+`(B, T, D)`). `compute_node_centroid` / `compute_neutral_activations` chunk by
+`_CAPTURE_BATCH` and amortize the MPS `empty_cache` per chunk.
+`_encode_and_capture_all` is the single-pair sibling. `_capture_all_hidden_states`
+hooks every layer at once and accepts an `int` (single) or `(B,)` tensor (per-row)
+`pool_index`. Capture is **conversational** (4.0 / A2): a corpus item is an
+assistant *response* to a fixed baseline *prompt*, so `_encode_and_capture_all(model,
 tokenizer, prompt, response, layers, device, *, role=, model_type=, system_msg=)`
 renders `[system: directive, user: prompt, assistant: response]` (`system_msg`
 defaults to the shared `_LENGTH_DIRECTIVE` — the brevity directive only, *not* the
@@ -416,7 +425,10 @@ generated conversationally — `generate_responses(concepts, kinds, *, roles=Non
 samples_per_prompt=1, …)` has each pole answer the shared baseline prompts *in
 character*, the concept riding both the system prompt (`_system_for`) and the
 swapped assistant-role label (`_role_for`); responses are emitted samples-outer /
-prompts-inner so `response[i] ↔ prompt[i % k]`. **Bipolar** (`baseline` set)
+prompts-inner so `response[i] ↔ prompt[i % k]`. Generation is **batched** —
+`_run_generator_batch` left-pads a `_CORPUS_GEN_BATCH` chunk of prompts into one
+`model.generate` (per-row independent sampling), replacing the per-prompt loop;
+`_run_generator` stays as the single-shot `ModelHandle` seam. **Bipolar** (`baseline` set)
 authors a 2-node folder and generates both poles. **Monopolar** (`baseline=None`)
 authors a genuinely **1-node** folder (only the concept pole is generated); the
 pipeline folds `concept − ν` into a 1-node neutral-anchored ray (see

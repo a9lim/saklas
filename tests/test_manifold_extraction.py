@@ -46,6 +46,25 @@ def _stub_encoder(
     return out
 
 
+def _stub_encoder_batch(
+    model: Any, tokenizer: Any, prompts: Any, responses: Any, layers: Any,
+    device: Any, **kwargs: Any,
+) -> dict[int, torch.Tensor]:
+    """Batched seam matching ``vectors._encode_and_capture_all_batch``.
+
+    Stacks the per-row :func:`_stub_encoder` over the chunk (same call order, so
+    the deterministic-per-label activations and RNG consumption are identical to
+    the old per-row capture).  Returns ``{layer: (B, D)}``."""
+    rows = [
+        _stub_encoder(model, tokenizer, p, r, layers, device, **kwargs)
+        for p, r in zip(prompts, responses)
+    ]
+    return {
+        idx: torch.stack([row[idx] for row in rows])
+        for idx in range(len(layers))
+    }
+
+
 class _Handle:
     """Minimal ModelHandle stub.
 
@@ -137,7 +156,7 @@ def _author_manifold(
 @pytest.fixture(autouse=True)
 def _stub(monkeypatch: pytest.MonkeyPatch) -> None:
     torch.manual_seed(0)
-    monkeypatch.setattr(V, "_encode_and_capture_all", _stub_encoder)
+    monkeypatch.setattr(V, "_encode_and_capture_all_batch", _stub_encoder_batch)
     # Single baseline prompt so any node corpus length is a multiple of k=1
     # (the conversational alignment invariant); the stub ignores the prompt.
     monkeypatch.setattr(V, "_load_baseline_prompts", lambda: ["baseline prompt"])
@@ -204,13 +223,13 @@ def test_fit_cache_hit_skips_forward_passes(tmp_path: Path, monkeypatch: pytest.
     pipe.fit(folder)
 
     calls = {"n": 0}
-    real = _stub_encoder
+    real = _stub_encoder_batch
 
     def _counting(*args: Any, **kwargs: Any) -> dict[int, torch.Tensor]:
         calls["n"] += 1
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(V, "_encode_and_capture_all", _counting)
+    monkeypatch.setattr(V, "_encode_and_capture_all_batch", _counting)
     manifold = pipe.fit(folder)  # second call — corpus unchanged
     assert calls["n"] == 0       # cache hit, no pooling
     assert manifold.name == "mood"
@@ -226,13 +245,13 @@ def test_fit_cache_miss_on_corpus_change(tmp_path: Path, monkeypatch: pytest.Mon
     )
 
     calls = {"n": 0}
-    real = _stub_encoder
+    real = _stub_encoder_batch
 
     def _counting(*args: Any, **kwargs: Any) -> dict[int, torch.Tensor]:
         calls["n"] += 1
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(V, "_encode_and_capture_all", _counting)
+    monkeypatch.setattr(V, "_encode_and_capture_all_batch", _counting)
     pipe.fit(folder)
     assert calls["n"] > 0  # corpus changed -> forward passes re-run
 
@@ -249,13 +268,13 @@ def test_fit_cache_miss_on_domain_change(tmp_path: Path, monkeypatch: pytest.Mon
     (folder / "manifold.json").write_text(json.dumps(meta))
 
     calls = {"n": 0}
-    real = _stub_encoder
+    real = _stub_encoder_batch
 
     def _counting(*args: Any, **kwargs: Any) -> dict[int, torch.Tensor]:
         calls["n"] += 1
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(V, "_encode_and_capture_all", _counting)
+    monkeypatch.setattr(V, "_encode_and_capture_all_batch", _counting)
     pipe.fit(folder)
     assert calls["n"] > 0  # geometry changed -> re-fit
 

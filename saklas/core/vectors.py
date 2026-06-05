@@ -18,26 +18,67 @@ from safetensors.torch import load_file, save_file
 log = logging.getLogger(__name__)
 
 
+# Default chunk size for the batched capture path (:func:`_encode_and_capture_all_batch`
+# and its callers ``compute_node_centroid`` / ``compute_neutral_activations``).  One
+# forward over up to this many (prompt, response) pairs replaces that many sequential
+# batch-1 forwards — the dominant extraction-capture cost.  Sized conservatively so a
+# chunk's attention working set (``B · heads · T²``) stays comfortable on a single
+# 24 GB GPU at the A2 response cap; raise it on a roomier device for fewer forwards.
+_CAPTURE_BATCH = 16
+
+
 def _capture_all_hidden_states(
     model: torch.nn.Module,
     layers: torch.nn.ModuleList,
     input_ids: torch.Tensor,
     *,
-    pool_index: int | None = None,
+    attention_mask: torch.Tensor | None = None,
+    pool_index: "int | torch.Tensor | None" = None,
 ):
-    """Run a single-sequence forward pass capturing hidden states at ALL layers.
+    """Run one forward pass capturing hidden states at ALL layers.
 
     Uses ``use_cache=False`` to avoid polluting any persistent KV cache.
+    ``attention_mask`` (when supplied) is forwarded so right-padded batches
+    don't attend to pad tokens.
 
-    Returns:
-        dict mapping layer index to (1, seq, dim) tensors, or to pooled
-        (dim,) fp32 tensors when ``pool_index`` is supplied.
+    ``pool_index`` selects what is retained per layer:
+
+    - ``None`` — the full ``(B, seq, dim)`` hidden state (the default).
+    - ``int`` — the single-sequence (``B == 1``) last-content pool: a ``(dim,)``
+      fp32 vector at that position.
+    - ``Tensor`` ``(B,)`` — the **per-row** batched pool: a ``(B, dim)`` fp32
+      stack gathered at each row's position *inside the hook*, so only ``(B, D)``
+      is retained per layer rather than the full ``(B, T, D)``.
+
+    Returns a dict mapping layer index to the retained tensor.
     """
     captured_hidden: dict[int, torch.Tensor] = {}
+    per_row = isinstance(pool_index, torch.Tensor)
+    # Precompute the gather index tensors once (not per layer/hook fire); both
+    # are set iff ``per_row`` (the assert in the hook narrows them back).
+    _rows = (
+        torch.arange(input_ids.shape[0], device=input_ids.device)
+        if per_row else None
+    )
+    _pos = pool_index.to(input_ids.device) if isinstance(pool_index, torch.Tensor) else None
 
     def _make_hook(idx: int):
         def _hook(module: torch.nn.Module, input: Any, output: Any):
             h = output if isinstance(output, torch.Tensor) else output[0]
+            if per_row:
+                assert _pos is not None and _rows is not None  # set iff per_row
+                pos = _pos.clamp(max=h.shape[1] - 1)
+                # Advanced indexing returns a fresh tensor (a copy), so the
+                # gathered (B, D) doesn't alias h — h is free to be released as
+                # the forward proceeds, keeping peak memory at one layer's
+                # (B, T, D) rather than every layer's.
+                pooled = h[_rows, pos, :].detach()
+                captured_hidden[idx] = (
+                    pooled.to(torch.float32)
+                    if pooled.dtype != torch.float32
+                    else pooled
+                )
+                return
             if pool_index is not None:
                 pos = min(max(int(pool_index), 0), h.shape[1] - 1)
                 pooled = h[0, pos, :].detach()
@@ -58,7 +99,14 @@ def _capture_all_hidden_states(
     handles = [layers[idx].register_forward_hook(_make_hook(idx)) for idx in range(len(layers))]
     try:
         with torch.inference_mode():
-            model(input_ids=input_ids, use_cache=False)
+            if attention_mask is not None:
+                model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    use_cache=False,
+                )
+            else:
+                model(input_ids=input_ids, use_cache=False)
         # Single sync after the full forward pass — lazy backends (MPS)
         # may not have materialised tensor data yet.
         if input_ids.device.type == "mps":
@@ -170,6 +218,81 @@ def _encode_and_capture_all(
         idx: h if h.ndim == 1 else h[0, min(content_end, h.shape[1] - 1)].float()
         for idx, h in hidden_per_layer.items()
     }
+
+
+def _encode_and_capture_all_batch(
+    model: torch.nn.Module,
+    tokenizer: Any,
+    prompts: Sequence[str],
+    responses: Sequence[str],
+    layers: torch.nn.ModuleList,
+    device: torch.device,
+    *,
+    role: str | None = None,
+    model_type: str | None = None,
+    system_msg: str = _LENGTH_DIRECTIVE,
+) -> dict[int, torch.Tensor]:
+    """Batched conversational capture — one forward over a chunk of pairs.
+
+    The batched sibling of :func:`_encode_and_capture_all`: each
+    ``[system, user: prompt, assistant: response]`` turn is rendered + tokenized
+    through the same :func:`_render_and_tokenize_for_capture` front half, then
+    the rows are **right-padded** to a common length and run through ONE forward
+    pass.  Right-padding is the correct choice for capture (not generation):
+    causal attention at a row's last-content position only sees positions to its
+    *left*, all real tokens, so the pooled hidden state is identical to the
+    unpadded single-sequence forward — the per-row ``content_end`` indices need
+    no adjustment, and an ``attention_mask`` keeps the trailing pads out of every
+    real token's context.  Pooling happens **inside the capture hook** (per-row
+    gather at ``content_end``), so only ``(B, D)`` is retained per layer, never
+    the full ``(B, T, D)``.
+
+    The attention mask is built only when the chunk actually has ragged lengths;
+    a uniform-length (or ``B == 1``) chunk runs full attention, bit-identical to
+    the single-pair path.
+
+    Returns ``{layer_idx: (B, D)}`` in fp32 (on the model device).
+    """
+    if len(prompts) != len(responses):
+        raise ValueError(
+            "batched capture needs len(prompts) == len(responses) "
+            f"({len(prompts)} != {len(responses)})"
+        )
+    rendered = [
+        _render_and_tokenize_for_capture(
+            tokenizer, prompt, response, device,
+            role=role, model_type=model_type, system_msg=system_msg,
+        )
+        for prompt, response in zip(prompts, responses, strict=True)
+    ]
+    seqs = [ids[0] for ids, _ in rendered]              # each (L_i,) on device
+    ends = [content_end for _, content_end in rendered]
+    lengths = [int(s.shape[0]) for s in seqs]
+    batch = len(seqs)
+    max_len = max(lengths)
+
+    pad_id = getattr(tokenizer, "pad_token_id", None)
+    if pad_id is None:
+        pad_id = getattr(tokenizer, "eos_token_id", None) or 0
+    input_ids = torch.full(
+        (batch, max_len), int(pad_id), dtype=seqs[0].dtype, device=device,
+    )
+    for i, seq in enumerate(seqs):
+        input_ids[i, : lengths[i]] = seq                # right-pad
+    # An attention mask is only needed when padding is actually present; a
+    # ragged chunk masks the pads, a uniform/B=1 chunk runs full attention
+    # (matching the single-pair path exactly).
+    if min(lengths) != max_len:
+        attn = torch.zeros((batch, max_len), dtype=torch.long, device=device)
+        for i, length in enumerate(lengths):
+            attn[i, :length] = 1
+    else:
+        attn = None
+    pool_index = torch.tensor(ends, dtype=torch.long, device=device)
+    return _capture_all_hidden_states(
+        model, layers, input_ids,
+        attention_mask=attn, pool_index=pool_index,
+    )
 
 
 def _render_and_tokenize_for_capture(
@@ -309,16 +432,17 @@ def compute_neutral_activations(
 ) -> dict[int, torch.Tensor]:
     """Per-layer ``[N, D]`` stack across the neutral corpus.
 
-    Last non-special-token pooling, fp32, MPS-friendly (one batch-1 forward
-    per ``(prompt, response)`` pair).  Returns one stacked tensor per layer
-    (rows = pairs).  This is the single per-model neutral artifact: the
-    Mahalanobis whitener's covariance is built from the stack and the
-    probe-centering means are its per-layer ``X.mean(0)``
-    (:func:`saklas.io.probes_bootstrap.bootstrap_layer_means`).  Used by
-    cross-model alignment
-    (:func:`saklas.io.alignment.fit_alignment`) which needs paired
-    observations to fit Procrustes; the means alone (N=1) are degenerate
-    for that fit.
+    Last non-special-token pooling, fp32.  The ``(prompt, response)`` pairs are
+    captured in **batched chunks** (:func:`_encode_and_capture_all_batch`, one
+    forward per ``_CAPTURE_BATCH`` pairs) rather than one forward per pair, and
+    the MPS allocator flush is amortized to once per chunk.  Returns one stacked
+    tensor per layer (rows = pairs, original order preserved).  This is the
+    single per-model neutral artifact: the Mahalanobis whitener's covariance is
+    built from the stack and the probe-centering means are its per-layer
+    ``X.mean(0)`` (:func:`saklas.io.probes_bootstrap.bootstrap_layer_means`).
+    Used by cross-model alignment (:func:`saklas.io.alignment.fit_alignment`)
+    which needs paired observations to fit Procrustes; the means alone (N=1)
+    are degenerate for that fit.
 
     Storage cost: ~90 · n_layers · hidden_dim · 4B in fp32 (≈ 56MB on
     a 4096-dim, 80-layer model).  Callers persist this through
@@ -329,26 +453,34 @@ def compute_neutral_activations(
     assert device is not None  # device is always set by this point
 
     n_layers = len(layers)
-    rows_by_layer: dict[int, list[torch.Tensor]] = {
+    chunks_by_layer: dict[int, list[torch.Tensor]] = {
         idx: [] for idx in range(n_layers)
     }
     _mps = device.type == "mps"
 
-    for prompt, response in _neutral_pairs():
-        per_layer = _encode_and_capture_all(
-            model, tokenizer, prompt, response, layers, device,
+    pairs = _neutral_pairs()
+    prompts = [prompt for prompt, _ in pairs]
+    responses = [response for _, response in pairs]
+    n = len(pairs)
+
+    for start in range(0, n, _CAPTURE_BATCH):
+        end = min(start + _CAPTURE_BATCH, n)
+        per_layer = _encode_and_capture_all_batch(
+            model, tokenizer,
+            prompts[start:end], responses[start:end],
+            layers, device,
         )
-        # Move each layer's vector to CPU before discarding the rest of
-        # the captured dict — same MPS discipline as ``compute_layer_means``.
+        # Move each chunk's (B, D) to CPU before discarding the GPU-side dict —
+        # same MPS discipline as before, now per chunk instead of per pair.
         for idx in range(n_layers):
-            rows_by_layer[idx].append(per_layer[idx].detach().to("cpu"))
+            chunks_by_layer[idx].append(per_layer[idx].detach().to("cpu"))
         del per_layer
         if _mps:
             torch.mps.empty_cache()
 
     return {
-        idx: torch.stack(rows)  # (N, D), fp32 on cpu
-        for idx, rows in rows_by_layer.items()
+        idx: torch.cat(chunks, dim=0)  # (N, D), fp32 on cpu
+        for idx, chunks in chunks_by_layer.items()
     }
 
 
@@ -502,6 +634,14 @@ def fold_directions_to_subspace(
         else None
     )
 
+    # Every fresh tensor follows the directions' device so the folded manifold
+    # is internally device-consistent.  The dispatch-time fold runs over a
+    # *loaded* manifold's directions, which may live on the model device (MPS /
+    # CUDA); a CPU-default ``node_coords`` would then mismatch the on-device
+    # ``basis`` inside ``synthesize_subspace`` (``c_i @ B_i``).  ``ν`` is moved to
+    # the same device too so the neutral-anchor projection stays co-located.
+    dev = directions[present[0]].device if present else torch.device("cpu")
+
     layers: dict[int, "LayerSubspace"] = {}
     mahalanobis_share: dict[int, float] = {}
     for idx in present:
@@ -511,14 +651,14 @@ def fold_directions_to_subspace(
             continue
         basis = (d / norm).reshape(1, -1)          # (1, D) unit d̂
         nu = (
-            neutral_means[idx].to(torch.float32).reshape(-1)
+            neutral_means[idx].to(device=d.device, dtype=torch.float32).reshape(-1)
             if neutral_means is not None and idx in neutral_means
             else None
         )
         # Neutral-anchored: mean = P_basis(ν) (off-span part of ν dropped);
         # the pole sits at the real coord ‖d‖ along d̂ from the origin.
         mean = (nu @ basis.T) @ basis if nu is not None else torch.zeros_like(d)
-        node_coords_L = torch.tensor([[norm]], dtype=torch.float32)
+        node_coords_L = torch.tensor([[norm]], dtype=torch.float32, device=d.device)
         layers[idx] = LayerSubspace.affine(mean, basis, node_coords=node_coords_L)
         mahalanobis_share[idx] = (
             float(maha_w.mahalanobis_norm(idx, d))
@@ -527,7 +667,7 @@ def fold_directions_to_subspace(
 
     # Shared display layout: a single ``+`` pole at coord 1 (the real per-layer
     # pole distance ‖d_L‖ lives on each ``LayerSubspace.node_coords``).
-    node_coords = torch.tensor([[1.0]], dtype=torch.float32)
+    node_coords = torch.tensor([[1.0]], dtype=torch.float32, device=dev)
     manifold = Manifold(
         name=name,
         domain=CustomDomain(1),

@@ -9,7 +9,7 @@ import time
 from contextlib import suppress
 from enum import IntEnum
 from types import TracebackType
-from typing import Any, Callable, Iterator, Literal, overload
+from typing import Any, Callable, Iterator, Literal, cast, overload
 
 import torch
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
@@ -152,6 +152,12 @@ def _snapshot_la_layers(cache: Any) -> None:
 
 
 _RESPONSE_MAX_TOKENS = 256  # per in-character response (4.0 / A2 elicitation)
+# Chunk size for batched corpus generation (``_run_generator_batch``, the
+# generation half of ``generate_responses`` / ``generate_neutral_responses``).
+# One left-padded ``model.generate`` over this many baseline prompts replaces
+# that many sequential batch-1 decodes — the dominant cost of extraction's
+# corpus-generation phase (each decode is up to ``_RESPONSE_MAX_TOKENS`` long).
+_CORPUS_GEN_BATCH = 16
 # Tail-ring depth for aggregate-only capture (probes attached, no per-token
 # consumer): how many trailing hidden slices to retain so finalize can pool the
 # last *content* token after walking back past trailing special tokens (EOS,
@@ -1195,6 +1201,94 @@ class SaklasSession:
         decoded = self._tokenizer.decode(new_ids, skip_special_tokens=True)
         return decoded if isinstance(decoded, str) else decoded[0]
 
+    def _run_generator_batch(
+        self,
+        system_msg: str,
+        prompts: list[str],
+        max_new_tokens: int,
+        *,
+        role: str | None = None,
+    ) -> list[str]:
+        """Batched sibling of :meth:`_run_generator`.
+
+        Renders each prompt as a ``[system?, user]`` chat, **left-pads** the
+        batch to a common length (decoder-only generation aligns continuations
+        on the right, so every row's prompt must end at the same column), and
+        runs ONE ``model.generate`` over the whole batch.  Returns the decoded
+        continuations in prompt order.  Sampling is per-row independent
+        (``do_sample``), with the same ``temperature=1.0`` / ``top_p=0.9`` the
+        single-prompt generator uses, so a batched corpus is distributionally
+        the same as the sequential one — just far fewer ``generate`` calls.
+
+        The seam ``generate_responses`` / ``generate_neutral_responses`` call;
+        ``_run_generator`` is kept for the single-shot ``ModelHandle`` protocol
+        and any caller that wants one response.
+        """
+        if not prompts:
+            return []
+        # ``cast`` (not ``int()``): the tokenizer stub types pad/eos as a loose
+        # union (``int | list[int] | str | …``) though the id is an int; casting
+        # avoids a spurious ``int(list)`` type error without a runtime no-op.
+        pad_id = cast(
+            int,
+            self._tokenizer.pad_token_id
+            or self._tokenizer.eos_token_id
+            or 0,
+        )
+        model_type_for_role: str | None = None
+        if role is not None:
+            model_cfg = getattr(self._model, "config", None)
+            text_cfg = getattr(model_cfg, "text_config", None) if model_cfg is not None else None
+            model_type_for_role = (
+                getattr(text_cfg, "model_type", None)
+                if text_cfg is not None
+                else None
+            )
+            if model_type_for_role is None and model_cfg is not None:
+                model_type_for_role = getattr(model_cfg, "model_type", None)
+
+        # Render each prompt to ids (build_chat_input returns CPU tensors).
+        seqs: list[torch.Tensor] = []
+        for prompt in prompts:
+            messages: list[dict[str, str]] = []
+            if system_msg:
+                messages.append({"role": "system", "content": system_msg})
+            messages.append({"role": "user", "content": prompt})
+            ids = build_chat_input(
+                self._tokenizer, messages, system_prompt=None,
+                thinking=False,
+                gen_role=role, model_type=model_type_for_role,
+            )
+            seqs.append(ids[0])
+
+        lengths = [int(s.shape[0]) for s in seqs]
+        max_len = max(lengths)
+        batch = len(seqs)
+        # Left-pad: each row's prompt occupies the rightmost ``lengths[i]``
+        # columns, so the continuation begins at ``max_len`` for every row and
+        # ``out[:, max_len:]`` is the batch's generated tail.
+        input_ids = torch.full(
+            (batch, max_len), pad_id, dtype=seqs[0].dtype,
+        )
+        attn = torch.zeros((batch, max_len), dtype=torch.long)
+        for i, seq in enumerate(seqs):
+            input_ids[i, max_len - lengths[i]:] = seq
+            attn[i, max_len - lengths[i]:] = 1
+        input_ids = input_ids.to(self._device)
+        attn = attn.to(self._device)
+
+        with torch.inference_mode():
+            out = self._model.generate(  # pyright: ignore[reportCallIssue]  # transformers stubs don't expose generate on PreTrainedModel directly
+                input_ids,
+                attention_mask=attn,
+                max_new_tokens=max_new_tokens,
+                do_sample=True, temperature=1.0, top_p=0.9,
+                pad_token_id=pad_id,
+            )
+        new_ids = out[:, max_len:]
+        decoded = self._tokenizer.batch_decode(new_ids, skip_special_tokens=True)
+        return list(decoded)
+
     def generate_responses(
         self,
         concepts: list[str],
@@ -1239,16 +1333,21 @@ class SaklasSession:
             gen_role = roles.get(concept) or _role_for(_slug(concept), kind)
             responses: list[str] = []
             for _ in range(reps):
-                for prompt in prompts:
+                # Prompts-inner, batched in chunks: one model.generate per chunk
+                # rather than per prompt.  Order is preserved within the rep, so
+                # ``response[i] -> prompt[i % k]`` still holds.
+                for start in range(0, len(prompts), _CORPUS_GEN_BATCH):
+                    chunk = prompts[start:start + _CORPUS_GEN_BATCH]
                     if on_progress:
                         on_progress(
-                            f"Generating {concept!r} response "
-                            f"{len(responses) + 1}/{total}..."
+                            f"Generating {concept!r} responses "
+                            f"{len(responses) + 1}-{len(responses) + len(chunk)}"
+                            f"/{total}..."
                         )
-                    text = self._run_generator(
-                        system, prompt, max_new_tokens, role=gen_role,
-                    ).strip()
-                    responses.append(text)
+                    texts = self._run_generator_batch(
+                        system, chunk, max_new_tokens, role=gen_role,
+                    )
+                    responses.extend(text.strip() for text in texts)
             out[concept] = responses
         return out
 
@@ -1280,16 +1379,18 @@ class SaklasSession:
         total = reps * len(prompts)
         responses: list[str] = []
         for _ in range(reps):
-            for prompt in prompts:
+            for start in range(0, len(prompts), _CORPUS_GEN_BATCH):
+                chunk = prompts[start:start + _CORPUS_GEN_BATCH]
                 if on_progress:
                     on_progress(
-                        f"Generating neutral response "
-                        f"{len(responses) + 1}/{total}..."
+                        f"Generating neutral responses "
+                        f"{len(responses) + 1}-{len(responses) + len(chunk)}"
+                        f"/{total}..."
                     )
-                text = self._run_generator(
-                    _LENGTH_DIRECTIVE, prompt, max_new_tokens, role=None,
-                ).strip()
-                responses.append(text)
+                texts = self._run_generator_batch(
+                    _LENGTH_DIRECTIVE, chunk, max_new_tokens, role=None,
+                )
+                responses.extend(text.strip() for text in texts)
         return responses
 
     def extract(
