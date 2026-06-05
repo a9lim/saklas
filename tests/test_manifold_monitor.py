@@ -1,4 +1,4 @@
-"""ManifoldMonitor — read-side counterpart to manifold steering.
+"""Monitor — read-side counterpart to manifold steering.
 
 Pure CPU tests: build a toy manifold with hand-controllable per-layer
 geometry, verify the three channels (subspace_fraction, nearest_nodes,
@@ -17,6 +17,7 @@ import torch
 from saklas.core.manifold import (
     BoxAxis,
     BoxDomain,
+    CustomDomain,
     LayerSubspace,
     Manifold,
     fit_layer_subspace as _fit_layer_subspace_with_ev,
@@ -24,7 +25,7 @@ from saklas.core.manifold import (
 from saklas.core.monitor import (
     DEFAULT_NEAREST_TOP_N,
     AttachedManifoldProbe,
-    ManifoldMonitor,
+    Monitor,
 )
 from saklas.core.results import ManifoldAggregate, ManifoldTokenReading
 
@@ -35,8 +36,8 @@ def fit_layer_subspace(*args: Any, **kwargs: Any) -> Any:
     return sub
 
 
-def _iso_monitor(m: "Manifold") -> ManifoldMonitor:
-    """A ``ManifoldMonitor`` wired with an isotropic whitener over ``m``'s
+def _iso_monitor(m: "Manifold") -> Monitor:
+    """A ``Monitor`` wired with an isotropic whitener over ``m``'s
     fit layers.
 
     Manifold reads are Mahalanobis-only (4.0 collapse): ``add_probe`` →
@@ -48,7 +49,7 @@ def _iso_monitor(m: "Manifold") -> ManifoldMonitor:
     from tests._whitener import isotropic_whitener
     dim = next(iter(m.layers.values())).mean.shape[0]
     whitener = isotropic_whitener(list(m.layers.keys()), dim)
-    return ManifoldMonitor(whitener=whitener)
+    return Monitor(whitener=whitener)
 
 
 def _node_world(m: Manifold, layer_idx: int) -> torch.Tensor:
@@ -185,7 +186,7 @@ def test_add_probe_rejects_empty_manifold():
         name="empty", domain=domain, node_labels=[],
         node_coords=torch.zeros(0, 1), layers={},
     )
-    mon = ManifoldMonitor()
+    mon = Monitor()
     with pytest.raises(ValueError):
         mon.add_probe("empty", empty)
 
@@ -310,7 +311,7 @@ def test_flat_scalars_keys_and_signs():
     """flat_scalars must emit ``<name>:fraction`` (positive ∈ [0, 1])
     and ``<name>@<label>`` (negative — encodes -distance so larger =
     closer)."""
-    mon = ManifoldMonitor()
+    mon = Monitor()
     reading = ManifoldTokenReading(
         fraction=0.7, nearest=[("a", 0.5), ("b", 1.2)],
     )
@@ -323,7 +324,7 @@ def test_flat_scalars_keys_and_signs():
 
 
 def test_flat_scalars_namespaces_per_probe():
-    mon = ManifoldMonitor()
+    mon = Monitor()
     r1 = ManifoldTokenReading(fraction=0.5, nearest=[("x", 0.1)])
     r2 = ManifoldTokenReading(fraction=0.8, nearest=[("y", 0.2)])
     flat = mon.flat_scalars({"p1": r1, "p2": r2})
@@ -465,3 +466,161 @@ def test_pending_per_token_flag():
     assert mon.has_pending_per_token()
     mon.consume_pending_per_token()
     assert not mon.has_pending_per_token()
+
+
+# ============================================== affine (flat) batched path ===
+#
+# The curved tests above exercise the per-probe foot-solve path.  These build
+# *flat* (affine) probes so they ride the batched coordinate readout
+# (one stacked matmul + one shared Woodbury per layer; rank is the block size,
+# rank-1 has no separate path).  An affine subspace's immersion is pure-affine
+# (``eval_at(c) = c @ basis + mean``), so a hand-built ``LayerSubspace.affine``
+# over a ``CustomDomain`` is self-consistent: node k's activation is
+# ``rc[k] @ basis + mean``, and the readout must recover the authoring coord
+# ``rc[k]``.
+
+
+def _flat_manifold(
+    *,
+    reduced_coords: torch.Tensor,   # (K, R) real reduced node coords == domain coords
+    n_layers: int = 2,
+    dim: int = 16,
+    seed: int = 0,
+    name: str = "flat",
+    labels: list[str] | None = None,
+) -> Manifold:
+    """Hand-build a flat ``fit_mode=pca``-shaped manifold of arbitrary rank.
+
+    Each layer gets a fresh random orthonormal ``(R, D)`` basis + mean; the
+    node activations are ``rc @ basis + mean`` so the affine readout is exact.
+    The domain is the identity ``CustomDomain(R)`` and ``node_coords`` are the
+    real reduced coords (shared across layers — fine for the test, the affine
+    map is fit per layer regardless).
+    """
+    torch.manual_seed(seed)
+    rc = reduced_coords.to(torch.float32)
+    K, R = rc.shape
+    layers: dict[int, LayerSubspace] = {}
+    ev: dict[int, float] = {}
+    for layer_idx in range(n_layers):
+        a = torch.randn(dim, R)
+        q, _ = torch.linalg.qr(a)          # (D, R) orthonormal columns
+        basis = q[:, :R].T.contiguous()    # (R, D) orthonormal rows
+        mean = torch.randn(dim) * 0.1 + float(layer_idx + 1)
+        layers[layer_idx] = LayerSubspace.affine(mean, basis, node_coords=rc)
+        ev[layer_idx] = 1.0 + 0.3 * layer_idx
+    return Manifold(
+        name=name,
+        domain=CustomDomain(R),
+        node_labels=labels or [f"n{k}" for k in range(K)],
+        node_coords=rc,
+        layers=layers,
+        explained_variance=ev,
+    )
+
+
+def _flat_node_hidden(m: Manifold, k: int) -> dict[int, torch.Tensor]:
+    """Per-layer activation sitting exactly on node ``k`` (``rc[k] @ basis + mean``)."""
+    rc = m.node_coords.to(torch.float32)
+    return {
+        L: sub.eval_at(rc[k]) for L, sub in m.layers.items()
+    }
+
+
+def test_affine_rank1_recovers_pole_coord():
+    """A 2-node (rank-1) flat probe rides the batched path; placing the
+    activation on a pole recovers that pole's authoring coord."""
+    rc = torch.tensor([[1.0], [-1.0]])
+    m = _flat_manifold(reduced_coords=rc, labels=["pos", "neg"])
+    mon = _iso_monitor(m)
+    mon.add_probe("ax", m)
+    for k, want in ((0, 1.0), (1, -1.0)):
+        r = mon.score_single_token(_flat_node_hidden(m, k))["ax"]
+        assert len(r.coords) == 1
+        assert r.coords[0] == pytest.approx(want, abs=1e-3)
+        # In-subspace → fraction ≈ 1; per-token nearest deferred for affine.
+        assert r.fraction == pytest.approx(1.0, abs=2e-2)
+        assert r.nearest == []
+
+
+def test_affine_rankR_recovers_multidim_coords():
+    """A 3-node 2-D flat probe (rank-2) recovers full 2-D authoring coords
+    at each node — the generalized affine coord map, not just axis 0."""
+    rc = torch.tensor([[1.0, 0.0], [0.0, 1.0], [-1.0, -1.0]])
+    m = _flat_manifold(reduced_coords=rc, labels=["x", "y", "z"])
+    mon = _iso_monitor(m)
+    mon.add_probe("tri", m)
+    for k in range(3):
+        r = mon.score_single_token(_flat_node_hidden(m, k))["tri"]
+        assert len(r.coords) == 2
+        assert r.coords[0] == pytest.approx(float(rc[k][0]), abs=1e-3)
+        assert r.coords[1] == pytest.approx(float(rc[k][1]), abs=1e-3)
+
+
+def test_affine_mixed_rank_batched_together():
+    """A rank-1 and a rank-2 affine probe attached to ONE monitor are scored
+    in the same batched pass — validates the block-diagonal reduced solve +
+    the global per-probe coord layout across mixed ranks."""
+    rc1 = torch.tensor([[2.0], [-2.0]])
+    rc2 = torch.tensor([[1.0, 0.0], [0.0, 1.0], [-1.0, -1.0]])
+    m1 = _flat_manifold(reduced_coords=rc1, dim=16, seed=1, name="ax", labels=["p", "n"])
+    m2 = _flat_manifold(reduced_coords=rc2, dim=16, seed=2, name="tri", labels=["x", "y", "z"])
+    # Share one whitener covering both probes' layers (same layer set).
+    from tests._whitener import isotropic_whitener
+    whitener = isotropic_whitener(list(m1.layers.keys()), 16)
+    mon = Monitor(whitener=whitener)
+    mon.add_probe("ax", m1)
+    mon.add_probe("tri", m2)
+
+    # Build a combined hidden: node 0 of ax, node 2 of tri — but they live on
+    # different bases, so score them one probe at a time against its own node
+    # activation and confirm the batched dict carries both correctly.
+    r_ax = mon.score_single_token(_flat_node_hidden(m1, 0))
+    assert r_ax["ax"].coords[0] == pytest.approx(2.0, abs=1e-3)
+    assert len(r_ax["ax"].coords) == 1
+    # ``tri`` is also scored in the same call (different basis → arbitrary
+    # coord), but its slice must be length-2 (global coord layout intact).
+    assert len(r_ax["tri"].coords) == 2
+
+    r_tri = mon.score_single_token(_flat_node_hidden(m2, 2))
+    assert r_tri["tri"].coords[0] == pytest.approx(-1.0, abs=1e-3)
+    assert r_tri["tri"].coords[1] == pytest.approx(-1.0, abs=1e-3)
+    assert len(r_tri["ax"].coords) == 1
+
+
+def test_affine_aggregate_fills_nearest_and_coords():
+    """End-of-gen aggregate for a flat probe recovers coords via the affine
+    map AND fills nearest (deferred from the per-token path), residual ≈ 0
+    (the surface fills its subspace)."""
+    rc = torch.tensor([[1.0, 0.0], [0.0, 1.0], [-1.0, -1.0]])
+    m = _flat_manifold(reduced_coords=rc, labels=["x", "y", "z"])
+    mon = _iso_monitor(m)
+    mon.add_probe("tri", m)
+    target = 1  # node "y"
+    captured = {
+        L: h.unsqueeze(0).repeat(3, 1)
+        for L, h in _flat_node_hidden(m, target).items()
+    }
+    agg = mon.score_aggregate(captured)["tri"]
+    assert agg.coords[0] == pytest.approx(0.0, abs=1e-3)
+    assert agg.coords[1] == pytest.approx(1.0, abs=1e-3)
+    assert agg.nearest[0][0] == "y"
+    assert agg.nearest[0][1] == pytest.approx(0.0, abs=1e-3)
+    assert agg.residual_mean == pytest.approx(0.0, abs=1e-5)
+
+
+def test_affine_fraction_outside_subspace_is_zero():
+    """A rank-2 flat probe reports fraction ≈ 0 for an off-subspace activation."""
+    rc = torch.tensor([[1.0, 0.0], [0.0, 1.0], [-1.0, -1.0]])
+    m = _flat_manifold(reduced_coords=rc)
+    mon = _iso_monitor(m)
+    mon.add_probe("tri", m)
+    hidden = {}
+    for L, sub in m.layers.items():
+        v = torch.zeros(sub.mean.shape[0])
+        v[-1] = 1.0
+        v = v - (v @ sub.basis.T) @ sub.basis
+        v = v / torch.linalg.vector_norm(v).clamp(min=1e-8)
+        hidden[L] = sub.mean + v
+    r = mon.score_single_token(hidden)["tri"]
+    assert r.fraction == pytest.approx(0.0, abs=2e-2)

@@ -35,12 +35,11 @@ from saklas.core.loom import (
     derive_seed_schedule,
 )
 from saklas.core.model import load_model, get_layers, get_model_info
-from saklas.core.monitor import ManifoldMonitor, TraitMonitor
+from saklas.core.monitor import Monitor
 from saklas.io.probes_bootstrap import bootstrap_layer_means
 from saklas.core.profile import Profile
 from saklas.core.results import (
     GenerationResult,
-    ManifoldAggregate,
     ManifoldTokenReading,
     ProbeReadings,
     RunSet,
@@ -867,22 +866,18 @@ class SaklasSession:
         if probe_categories:
             # Every concept lives as a 2-node ``pca`` manifold (4.0): fit-or-
             # load each tagged manifold and hand the flat ``Manifold`` to the
-            # TraitMonitor, which reads it as a coordinate (the rank-1 case of
-            # the subspace readout).  No folded-direction probe path anymore.
+            # Monitor, which reads it as a coordinate (the rank-1 case of the
+            # subspace readout).  No folded-direction probe path anymore.
             probe_manifolds = self._bootstrap_manifold_probes(probe_categories)
 
-        self._monitor = TraitMonitor(
+        # One unified Monitor for every probe shape — flat concept axes
+        # (rank-1), flat discover fits (rank-R, e.g. ``personas``), and curved
+        # manifolds (``pad``).  Flat probes batch into one matmul per layer
+        # (any rank); curved probes foot-solve per-probe.  Per-token score
+        # callbacks emit one flat-scalar dict into ``TriggerContext.probe_scores``
+        # so ``@when:`` gates fire on any probe without grammar changes.
+        self._monitor = Monitor(
             probe_manifolds, self._layer_means, whitener=self._whitener,
-        )
-        # Read-side counterpart to manifold steering.  Peer to
-        # ``self._monitor``: vector probes and manifold probes attach
-        # independently; per-token score callbacks merge their flat
-        # scalars into a single ``TriggerContext.probe_scores`` dict so
-        # ``@when:`` gates can fire on either tier without grammar
-        # changes.  ``layer_means`` is passed for symmetry but the
-        # manifold-side math uses each fit's per-layer mean.
-        self._manifold_monitor = ManifoldMonitor(
-            layer_means=self._layer_means, whitener=self._whitener,
         )
 
         # Prefix KV cache (opt-in, off by default).  Populated by
@@ -1062,13 +1057,6 @@ class SaklasSession:
             monitor = getattr(self, "_monitor", None)
             if monitor is not None and self._whitener is not None:
                 monitor.set_whitener(self._whitener)
-            # Same for the manifold monitor: a lazily-built whitener flips
-            # its fraction + nearest-node readout to the whitened form for
-            # any attached manifold whose layers it covers, rebuilding the
-            # per-probe ``_LayerWhiten`` caches.
-            mmon = getattr(self, "_manifold_monitor", None)
-            if mmon is not None and self._whitener is not None:
-                mmon.set_whitener(self._whitener)
         return self._whitener
 
     def _build_whitener_from_cache_or_compute(self) -> "Any":
@@ -2130,7 +2118,7 @@ class SaklasSession:
         manifold tagged in a requested category it fits-or-loads the per-model
         subspace (eager, same cost band as the legacy DiM extraction — both run
         forward passes, both disk-cache) and hands the flat :class:`Manifold`
-        to the :class:`TraitMonitor`, which reads it as a coordinate (the
+        to the :class:`Monitor`, which reads it as a coordinate (the
         rank-1 case of the subspace readout).  A fit/load failure for one
         concept is logged and skipped, never fatal to session construction.
         """
@@ -2334,17 +2322,12 @@ class SaklasSession:
         ``dict[str, float]`` for ``generate_steered``'s ``score_callback``.
 
         The closure pulls ``self._capture.latest_per_layer()`` (the
-        most-recent ``[D]`` slice per layer the steering hooks
-        captured) and runs it through :meth:`TraitMonitor.score_single_token`.
-        When at least one manifold probe is attached, the same captures
-        also pass through
-        :meth:`ManifoldMonitor.score_single_token` and the flat-scalar
-        adapter; the two dicts merge with manifold scalars second so a
-        naming collision (vector probe and manifold probe sharing a
-        bare name) lets the manifold side win for the gate.  Returns
-        an empty dict when the capture is empty (e.g. before the first
-        forward) so probe gates report inactive instead of seeing
-        stale values from a previous gen.
+        most-recent ``[D]`` slice per layer the steering hooks captured) and
+        runs it through :meth:`Monitor.score_single_token` — one unified pass
+        over every probe shape — flattening to gate scalars via
+        :meth:`Monitor.flat_scalars`.  Returns an empty dict when the capture
+        is empty (e.g. before the first forward) so probe gates report
+        inactive instead of seeing stale values from a previous gen.
 
         Caller-side guard: only invoked when
         :meth:`_steering_needs_probe_gating` is True, so the no-gate
@@ -2352,19 +2335,15 @@ class SaklasSession:
         """
         capture = self._capture
         monitor = self._monitor
-        manifold_monitor = self._manifold_monitor
 
         def _score() -> dict[str, float]:
             latest = capture.latest_per_layer()
             if not latest:
                 return {}
             # Flatten the coordinate readings into gate-callback scalars
-            # (``name`` aliases axis 0, ``name[i]`` per axis, ``name:fraction``).
-            out = monitor.flat_scalars(monitor.score_single_token(latest))
-            if manifold_monitor.probe_names:
-                manifold_readings = manifold_monitor.score_single_token(latest)
-                out.update(manifold_monitor.flat_scalars(manifold_readings))
-            return out
+            # (``name`` aliases axis 0, ``name[i]`` per axis, ``name:fraction``,
+            # ``name@label`` for curved nearest).
+            return monitor.flat_scalars(monitor.score_single_token(latest))
 
         return _score
 
@@ -2504,16 +2483,14 @@ class SaklasSession:
         attached.
 
         ``widen=True``: cover every model layer.  Used when the caller
-        asked for ``SamplingConfig.return_hidden=True`` — both monitors
-        still read their respective subsets, but the full dict is
-        available on ``GenerationResult.hidden_states`` after the run.
+        asked for ``SamplingConfig.return_hidden=True`` — the monitor still
+        reads its probe subset, but the full dict is available on
+        ``GenerationResult.hidden_states`` after the run.
         """
         if widen:
             layer_idxs = list(range(len(self._layers)))
         else:
-            vector_layers: set[int] = self._monitor.probe_layers()
-            manifold_layers = self._manifold_monitor.attached_layers()
-            union = vector_layers | manifold_layers
+            union: set[int] = self._monitor.probe_layers()
             if not union:
                 self._capture_incremental = False
                 self._incremental_rows = []
@@ -2685,83 +2662,82 @@ class SaklasSession:
 
     # -- Monitoring --
 
-    def probe(self, name: str, profile: Any = None) -> None:
-        if profile is None:
-            _, profile = self.extract(name)
-        if not self._layer_means:
-            self._layer_means = bootstrap_layer_means(
-                self._model, self._tokenizer, self._layers, self._model_info,
-            )
-            self._monitor.layer_means = self._layer_means
-        # The monitor reads probes as flat manifolds now (the rank-1
-        # coordinate case of the subspace readout).  A ``Profile`` is a
-        # per-layer baked direction; fold it into a 1-node neutral-anchored
-        # affine ray so ``add_probe`` (which handles the K=1 case) can cache
-        # the per-layer node coords + whitened factors.
-        from saklas.core.vectors import fold_directions_to_subspace
-        manifold = fold_directions_to_subspace(
-            name, dict(profile), self._layer_means, whitener=self.whitener,
-        )
-        self._monitor.add_probe(name, manifold)
-        # New probe → _begin_capture would attach to a different
-        # layer set than was live when the prefix was prefilled.
-        # Drop the cache so the next gen reprefills with the fresh
-        # capture-attach layout in place. (Probes don't mutate hidden
-        # states, but the safer default keeps the contract simple.)
-        self._invalidate_prefix_cache()
-        # Transcript probe-hash cache (v2.3 phase 5) is keyed by name;
-        # any change to the registered profiles invalidates the relevant
-        # entry (cheaper to drop the whole map than diff per-probe).
-        self._probe_hash_cache.pop(name, None)
-
-    def unprobe(self, name: str) -> None:
-        self._monitor.remove_probe(name)
-        self._invalidate_prefix_cache()
-        self._probe_hash_cache.pop(name, None)
-
-    # -- Manifold probes (read-side counterpart to manifold steering) --
-
-    @property
-    def manifold_monitor(self) -> ManifoldMonitor:
-        """Live :class:`ManifoldMonitor` — read-only handle for the TUI/server."""
-        return self._manifold_monitor
-
-    def add_manifold_probe(
+    def add_probe(
         self,
         selector: str,
         *,
         as_name: str | None = None,
         top_n: int = 3,
     ) -> str:
-        """Attach a manifold probe by selector and return the registered name.
+        """Attach a read-side probe — any shape — and return its name.
 
-        ``selector`` rides the same ``[ns/]name[:variant]`` shape the
-        steering grammar uses for ``%`` operands; the artifact is
-        loaded through :meth:`_ensure_manifold_loaded`, so a probe
-        attached here participates in the same cache as a manifold
-        steered with ``<selector>%<position>``.  ``as_name`` overrides
-        the registered name (defaults to ``selector``).  ``top_n``
-        controls the per-token nearest-node list length.
+        One attach for vector and manifold probes alike: a vector probe is the
+        rank-1 case of the unified subspace readout.  ``selector`` rides the
+        same ``[ns/]name[:variant]`` shape the steering grammar uses for ``%``
+        operands, so a probe shares the lazy-load cache with a manifold steered
+        through ``<selector>%<position>``.  ``as_name`` overrides the registered
+        name (default ``selector``); ``top_n`` sets the nearest-node list
+        length.  Resolution order is in :meth:`_resolve_probe_manifold`.
         """
-        self._ensure_manifold_loaded(selector)
-        manifold = self._manifolds[selector]
-        name = as_name if as_name is not None else selector
-        # Force the lazy whitener build (and its ``set_whitener`` push into
-        # the manifold monitor) before attaching: manifold reads are
-        # Mahalanobis-only now, so ``add_probe`` → ``_build_whitened`` needs
-        # a covering whitener present or it raises.
+        # Manifold reads are Mahalanobis-only: force the lazy whitener build
+        # (and its push into the monitor) before attaching, or ``add_probe`` →
+        # ``_build_whitened_factors`` raises on a missing covering whitener.
         _ = self.whitener
-        self._manifold_monitor.add_probe(name, manifold, top_n=top_n)
-        # Manifold probes widen the capture-layer set in the same way
-        # vector probes do; drop the prefix cache so the next gen
-        # re-prefills with the broadened capture in place.
+        name = as_name if as_name is not None else selector
+        manifold = self._resolve_probe_manifold(selector)
+        self._monitor.add_probe(name, manifold, top_n=top_n)
+        # New probe → _begin_capture attaches a different layer set than was
+        # live when the prefix was prefilled; drop the cache so the next gen
+        # re-prefills with the fresh capture-attach layout in place.
         self._invalidate_prefix_cache()
+        # Transcript probe-hash cache is keyed by name; any change to the
+        # registered probes invalidates the relevant entry.
+        self._probe_hash_cache.pop(name, None)
         return name
 
-    def remove_manifold_probe(self, name: str) -> None:
-        """Detach a previously-attached manifold probe."""
-        self._manifold_monitor.remove_probe(name)
+    def remove_probe(self, name: str) -> None:
+        """Detach a previously-attached probe (any shape)."""
+        self._monitor.remove_probe(name)
         self._invalidate_prefix_cache()
+        self._probe_hash_cache.pop(name, None)
+
+    def _resolve_probe_manifold(self, selector: str) -> "Manifold":
+        """Resolve a probe selector to a loaded :class:`Manifold`.
+
+        Mirrors the steering resolver, in order: (1) an in-memory baked
+        ``Profile`` already in ``_profiles`` (ad-hoc ``extract`` / ``merge`` /
+        projection results) → folded into a 1-node neutral-anchored ray;
+        (2) a fitted manifold on disk (``[ns/]name[:variant]``) → loaded
+        directly, so a 2-node ``pca`` reads rank-1 and a discover / curved fit
+        reads rank-R; (3) a bare concept with neither → extracted, then folded.
+        """
+        profile = self._profiles.get(selector)
+        if profile is not None:
+            return self._fold_profile_probe(selector, profile)
+        try:
+            self._ensure_manifold_loaded(selector)
+            return self._manifolds[selector]
+        except ManifoldNotRegisteredError:
+            pass
+        _, profile = self.extract(selector)
+        return self._fold_profile_probe(selector, profile)
+
+    def _fold_profile_probe(self, name: str, profile: Any) -> "Manifold":
+        """Fold a baked per-layer ``Profile`` into a 1-node neutral-anchored ray.
+
+        A ``Profile`` is a per-layer baked direction; the monitor reads probes
+        as flat manifolds (the rank-1 coordinate case), so fold it via the
+        same primitive ``extract`` uses for a monopolar concept.
+        """
+        if not self._layer_means:
+            self._layer_means = bootstrap_layer_means(
+                self._model, self._tokenizer, self._layers, self._model_info,
+            )
+            self._monitor.layer_means = self._layer_means
+        from saklas.core.vectors import fold_directions_to_subspace
+        return fold_directions_to_subspace(
+            name, dict(profile), self._layer_means, whitener=self.whitener,
+        )
 
     def _probe_hash(self, name: str) -> str | None:
         """Return sha256 hex of the baked tensor bytes for ``name``.
@@ -3649,13 +3625,13 @@ class SaklasSession:
                 trimmed[layer_idx] = h.detach().to("cpu")
             hidden_states = trimmed
 
-        # Manifold-probe aggregate over the pooled captures.  Skipped
-        # when no manifold probe is attached or generation produced no
-        # tokens.  Reuses the captured stack the vector path consumed —
-        # no second forward pass.
+        # Geometric aggregate over the pooled captures — every attached probe
+        # (flat coords via the affine map, curved via the foot solve).  Skipped
+        # when no probe is attached or generation produced no tokens.  Reuses
+        # the captured stack the per-axis path consumed — no second forward pass.
         manifold_aggregates: dict[str, Any] = {}
         if (
-            self._manifold_monitor.probe_names
+            self._monitor.probe_names
             and generated_ids
         ):
             stacked_caps = self._capture.stacked()
@@ -3670,10 +3646,10 @@ class SaklasSession:
                     trimmed_caps[layer_idx] = h
                 if trimmed_caps:
                     # Pool the aggregate from the last non-special token,
-                    # matching the vector-probe aggregate and extraction —
+                    # matching the per-axis aggregate and extraction —
                     # not a mean across the generated trajectory.
                     agg_idx = last_content_index(generated_ids, self._tokenizer)
-                    manifold_aggregates = self._manifold_monitor.score_aggregate(
+                    manifold_aggregates = self._monitor.score_aggregate(
                         trimmed_caps, agg_index=agg_idx,
                     )
 
@@ -4138,7 +4114,7 @@ class SaklasSession:
             vector_readings: dict[str, "ManifoldTokenReading"] | None = None
             per_layer_payload: dict[str, dict[str, float]] | None = None
             manifold_readings = None
-            needs_vector_scores = bool(
+            needs_scores = bool(
                 self._monitor.probe_names
                 and (
                     assistant_node_id is not None
@@ -4146,20 +4122,17 @@ class SaklasSession:
                     or _wants_live_token_scores
                 )
             )
-            needs_manifold_scores = bool(
-                self._manifold_monitor.probe_names
-                and _wants_live_token_scores
-            )
-            if needs_vector_scores or needs_manifold_scores:
+            if needs_scores:
                 latest_hidden_for_token = {
                     layer_idx: bucket[-1]
                     for layer_idx, bucket in self._capture._per_layer.items()
                     if bucket
                 }
-            if needs_vector_scores and latest_hidden_for_token:
+            if needs_scores and latest_hidden_for_token:
+                # One unified pass over every probe shape — flat coords + curved
+                # fraction/nearest in one dict.
                 agg = self._monitor.score_single_token(latest_hidden_for_token)
                 if agg:
-                    # ``score_single_token`` now yields per-probe readings.
                     # Keep the full readings dict for the live-mean fold +
                     # ``TokenEvent``; collapse to coordinate axis 0 for the
                     # scalar trait stream + per-token ``probes`` row (the bare
@@ -4169,6 +4142,10 @@ class SaklasSession:
                         p: (r.coords[0] if r.coords else 0.0)
                         for p, r in agg.items()
                     }
+                    # The per-token geometric wire field (fraction + nearest)
+                    # only when a client wants the live per-token stream.
+                    if _wants_live_token_scores:
+                        manifold_readings = agg
                 if assistant_node_id is not None and _persists_layer_scores:
                     per_layer = self._monitor.score_single_token_per_layer(
                         latest_hidden_for_token,
@@ -4180,10 +4157,6 @@ class SaklasSession:
                             }
                             for layer, metrics in per_layer.items()
                         }
-            if needs_manifold_scores and latest_hidden_for_token:
-                manifold_readings = self._manifold_monitor.score_single_token(
-                    latest_hidden_for_token,
-                )
             self._last_token_probe_payload = {
                 "scores": scores,
                 "readings": vector_readings,
@@ -4577,10 +4550,7 @@ class SaklasSession:
         def _push(text: str, is_thinking: bool, tid: int | None, lp: float | None, top_alts: Any, perplexity: float | None) -> None:
             readings: dict[str, "ManifoldTokenReading"] | None = None
             manifold_readings = None
-            if live_scores and (
-                self._monitor.probe_names
-                or self._manifold_monitor.probe_names
-            ):
+            if live_scores and self._monitor.probe_names:
                 payload = self._last_token_probe_payload or {}
                 raw_readings = payload.get("readings")
                 if isinstance(raw_readings, dict) and raw_readings:

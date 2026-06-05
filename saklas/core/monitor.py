@@ -19,7 +19,7 @@ _EMPTY_STATS = {"count": 0, "sum": 0.0, "sum_sq": 0.0,
                 "min": float("inf"), "max": float("-inf")}
 
 # Default top-N nearest-node count for manifold probes.  Per-probe
-# override available on ``ManifoldMonitor.add_probe``.
+# override available on ``Monitor.add_probe``.
 DEFAULT_NEAREST_TOP_N: int = 3
 
 # Floor for the EV weight on a manifold layer with degenerate fit
@@ -38,7 +38,7 @@ def _woodbury_apply(
 ) -> torch.Tensor:
     """On-device ``Σ_reg⁻¹ v = (1/λ)(v − Xᵀ K (X v))`` (Woodbury).
 
-    Shared by :class:`TraitMonitor` and :class:`ManifoldMonitor`.  Kept a
+    Shared by :class:`Monitor` and :class:`Monitor`.  Kept a
     plain module-level function (not a method) so the per-token hot path is
     a global lookup with no class attribute resolution — the hot-path
     companion to :meth:`LayerWhitener.apply_inv` (which force-promotes
@@ -52,28 +52,29 @@ def _woodbury_apply(
     return (v - KXv @ X) / lam        # [..., D]
 
 
-class TraitMonitor:
-    """Reads flat-subspace probes as whitened coordinates (the unified readout).
+class Monitor:
+    """Reads probes as whitened subspace coordinates — flat and curved alike.
 
-    Each probe is a flat (affine) :class:`~saklas.core.manifold.Manifold` — a
-    2-node concept axis is the rank-1 case, a multi-node discover fit
-    (``personas`` / ``cultural`` / ``register``) the rank-R case.  Per token
-    the monitor reports the same shape :class:`ManifoldMonitor` does —
+    Each probe is a :class:`~saklas.core.manifold.Manifold`.  A flat (affine)
+    probe — a 2-node concept axis (rank-1), a multi-node discover fit such as
+    ``personas`` (rank-R) — takes the **batched affine path**: the per-layer
+    subspace inverse is linear, so coords come from one stacked matmul + one
+    shared Woodbury ``Σ⁻¹h`` per layer (the expensive D-dim apply is shared
+    across every affine probe; rank is just the block size, there is no
+    separate rank-1 path).  A curved probe (``pad``, authored / spectral)
+    takes the **per-probe path**: the iterative
+    :func:`invert_parameterization` nearest-point foot solve, which the
+    affine readout doesn't need.
+
+    Per token both paths report one :class:`ManifoldTokenReading` per probe —
     ``coords`` (the whitened in-subspace position in the fit's *domain*
     frame, EV-weighted across layers), ``fraction`` (the in-subspace energy
-    share ∈ [0, 1]), and ``nearest`` (top-N node labels) — but takes the
-    **flat fast path**: the per-layer subspace inverse is affine, so coords
-    are exact and cheap enough to fill per token, and every rank-1 probe is
-    scored in one stacked matmul per layer (no per-probe Python loop on the
-    hot path).
-
-    Coordinates are **domain-frame**, matching
-    :meth:`ManifoldMonitor.score_aggregate` — which inverts each layer's
-    reduced activation coordinate into the shared domain *before*
-    EV-averaging, because raw per-layer coords live in per-layer ``‖δ_L‖``
-    units and don't average coherently.  At rank-1 this is the
-    pole-normalized coordinate: ``1.0`` sits at the positive node, signed,
-    unbounded past it.
+    share ∈ [0, 1]), and ``nearest`` (top-N node labels).  Coordinates are
+    **domain-frame**: each layer's reduced activation coordinate is inverted
+    into the shared domain *before* EV-averaging, because raw per-layer coords
+    live in per-layer ``‖δ_L‖`` units and don't average coherently.  At rank-1
+    this is the pole-normalized coordinate: ``1.0`` sits at the positive node,
+    signed, unbounded past it.
 
     The Mahalanobis whitener is mandatory: every probed layer must be
     covered (``covers_all``) or :meth:`_ensure_cache` raises
@@ -100,7 +101,7 @@ class TraitMonitor:
             are wrapped into a 1-pole affine manifold by the session before
             registration (``fold_directions_to_subspace``).
         layer_means: maps layer_idx -> neutral mean activation (kept for
-            init-signature parity with :class:`ManifoldMonitor`; the
+            init-signature parity with :class:`Monitor`; the
             coordinate readout centers on each fit's own ``LayerSubspace.mean``,
             not the global layer mean, so this is not consulted on the hot
             path — only exposed via the ``layer_means`` property).
@@ -111,24 +112,34 @@ class TraitMonitor:
         self._layer_means: dict[int, torch.Tensor] = dict(layer_means) if layer_means else {}
         self._whitener: Any = whitener
 
-        # Per-layer batched cache for the rank-1 fast path, keyed by layer.
-        # Each entry stacks every rank-1 probe covering that layer so one
-        # matmul yields all their reduced coords:
-        #   A[P1, D]      : Σ⁻¹ d̂_p              (so g = A @ h − cmean)
-        #   cmean[P1]     : d̂_p · Σ⁻¹ mean_p     (= d̂_p Σ⁻¹ mean_p)
-        #   mR[P1]        : d̂_p · Σ⁻¹ d̂_p        (= ‖d̂_p‖²_M)
-        #   simean[P1, D] : Σ⁻¹ mean_p           (fraction cross term h·Σ⁻¹mean)
-        #   mm[P1]        : mean_p · Σ⁻¹ mean_p   (fraction const)
-        #   slope[P1], intercept[P1] : affine reduced→domain map (rank-1)
-        #   ev[P1]        : per-layer EV weight, normalized mean-1 per probe
-        #   X, K, lam     : shared Woodbury factors for Σ⁻¹ h (fraction denom)
-        #   probe_idx[P1] : column → index into self._fast_keys
+        # Per-layer batched cache for the affine path, keyed by layer.  Each
+        # entry stacks EVERY affine probe covering that layer (rank is just
+        # the block size — rank-1 is one row, rank-R is R rows) so one matmul
+        # + one shared Woodbury apply yields the whole roster's reduced coords:
+        #   A[ΣR, D]       : Σ⁻¹ B_p rows, stacked across probes (g = A @ h − cmean)
+        #   cmean[ΣR]      : B_p · Σ⁻¹ mean_p, per stacked row
+        #   row_probe[ΣR]  : stacked row → affine-probe column index
+        #   mr_inv[ΣR, ΣR] : block-diag (B_p Σ⁻¹ B_pᵀ)⁻¹  (c = mr_inv @ g)
+        #   smap[Σn, ΣR]   : block-diag affine reduced→domain map  (dom = smap @ c + bmap)
+        #   bmap[Σn]       : affine map intercept
+        #   coord_probe[Σn]: domain-coord row → affine-probe column index
+        #   simean[P, D]   : Σ⁻¹ mean_p, per probe (fraction cross term h·Σ⁻¹mean)
+        #   mm[P]          : mean_p · Σ⁻¹ mean_p, per probe (fraction const)
+        #   ev[P]          : per-probe EV weight at this layer
+        #   X, K, lam      : shared Woodbury factors for Σ⁻¹ h (fraction denom)
         # Built lazily; invalidated on probe add/remove or whitener change.
-        self._fast_cache: dict[int, dict[str, Any]] = {}
-        # Insertion-ordered rank-1 probe names (the fast-path column order).
-        self._fast_keys: tuple[str, ...] = ()
-        # Rank-R (>1) probe names — scored on the per-probe slow path.
-        self._slow_keys: tuple[str, ...] = ()
+        self._affine_cache: dict[int, dict[str, Any]] = {}
+        # Insertion-ordered affine probe names (the batched-path column order,
+        # any rank).
+        self._affine_keys: tuple[str, ...] = ()
+        # Curved probe names — scored on the per-probe foot-solve path.
+        self._curved_keys: tuple[str, ...] = ()
+        # Global flat layout of affine-probe domain coords (per-probe slice
+        # offsets / dims into the cross-layer coord accumulator), rebuilt with
+        # the affine cache.
+        self._affine_coord_offsets: list[int] = []
+        self._affine_coord_dims: list[int] = []
+        self._affine_total_coords: int = 0
         self._cache_device: torch.device | None = None
         self._cache_probe_keys: tuple[str, ...] = ()
         self._cache_whitener_id: int | None = id(whitener)
@@ -173,7 +184,7 @@ class TraitMonitor:
         """Union of fit-layer indices across every attached probe.
 
         The capture-widening signal the session uses to retain every layer
-        a probe reads (peer of :meth:`ManifoldMonitor.attached_layers`).
+        a probe reads (peer of :meth:`Monitor.attached_layers`).
         """
         out: set[int] = set()
         for probe in self._probes.values():
@@ -214,29 +225,36 @@ class TraitMonitor:
             probe.whitened = _build_whitened_factors(whitener, probe)
 
     def _invalidate_cache(self) -> None:
-        self._fast_cache = {}
-        self._fast_keys = ()
-        self._slow_keys = ()
+        self._affine_cache = {}
+        self._affine_keys = ()
+        self._curved_keys = ()
         self._cache_device = None
         self._cache_probe_keys = ()
 
     def _ensure_cache(self, device: torch.device) -> None:
-        """Build/refresh the batched rank-1 fast cache on ``device``.
+        """Build/refresh the batched affine cache on ``device``.
 
-        Every rank-1 (2-node concept) probe covering a layer is stacked so
-        the whole roster's reduced coordinates come from one matmul per
-        layer; rank-R (>1) probes go to ``_slow_keys`` and score per-probe.
-        Per (layer, stacked probe) the cache precomputes, off the hot path:
+        Every affine (flat) probe covering a layer is stacked — rank is just
+        the block size, rank-1 is one row — so the whole roster's reduced
+        coords come from one matmul (``A @ h − cmean``) + one shared Woodbury
+        ``Σ⁻¹h`` per layer; curved probes go to ``_curved_keys`` and
+        foot-solve per-probe.  Per layer the cache precomputes, off the hot
+        path, with ``ΣR`` the stacked basis rows, ``P`` the probes, ``Σn`` the
+        stacked domain-coord rows:
 
-          A[P1ₗ, D]      = Σ⁻¹ d̂          (so g = A @ h − cmean)
-          SImean[P1ₗ, D] = Σ⁻¹ mean        (fraction cross term h·Σ⁻¹mean)
-          cmean[P1ₗ]     = d̂ · Σ⁻¹ mean
-          mR[P1ₗ]        = d̂ · Σ⁻¹ d̂      (= ‖d̂‖²_M; reduced coord = g/mR)
-          mm[P1ₗ]        = mean · Σ⁻¹ mean (fraction const)
-          slope/intercept[P1ₗ] : affine reduced→domain map (the two nodes)
-          ev[P1ₗ]        : per-layer EV weight
-          cols[P1ₗ]      : column → global ``_fast_keys`` index
-          X, K, lam      : shared Woodbury factors (Σ⁻¹ h for the fraction)
+          A[ΣR, D]        = Σ⁻¹ B rows, stacked across probes (g = A @ h − cmean)
+          cmean[ΣR]       = B · Σ⁻¹ mean, per stacked row
+          mr_inv[ΣR, ΣR]  = block-diag (B Σ⁻¹ Bᵀ)⁻¹  (c = mr_inv @ g)
+          smap[Σn, ΣR]    = block-diag affine reduced→domain map
+          bmap[Σn]        = affine map intercept  (dom = smap @ c + bmap)
+          row_local[ΣR]   = stacked basis row → layer-local probe index
+          coord_gidx[Σn]  = domain-coord row → GLOBAL affine coord-layout index
+          coord_ev[Σn]    = per-probe EV weight, broadcast to its coord rows
+          probe_cols[P]   = layer-local probe → GLOBAL ``_affine_keys`` index
+          SImean[P, D]    = Σ⁻¹ mean, per probe (fraction cross term)
+          mm[P]           = mean · Σ⁻¹ mean, per probe (fraction const)
+          ev[P]           = per-probe EV weight
+          X, K, lam       = shared Woodbury factors (Σ⁻¹ h for the fraction)
 
         The Mahalanobis whitener must cover every probed layer or this
         raises :class:`WhitenerError` (no Euclidean readout).
@@ -246,7 +264,7 @@ class TraitMonitor:
             self._cache_device == device
             and self._cache_probe_keys == probe_keys
             and self._cache_whitener_id == id(self._whitener)
-            and (self._fast_cache or not self._fast_keys)
+            and (self._affine_cache or not self._affine_keys)
         ):
             return
 
@@ -267,20 +285,35 @@ class TraitMonitor:
                 "cache for this model (the Euclidean path is gone)"
             )
 
-        fast_names = [
+        affine_names = [
             n for n, p in self._probes.items()
-            if p.manifold.layers and _probe_rank(p) == 1
+            if p.manifold.layers and _probe_is_affine(p)
         ]
-        slow_names = [
+        curved_names = [
             n for n, p in self._probes.items()
-            if p.manifold.layers and _probe_rank(p) > 1
+            if p.manifold.layers and not _probe_is_affine(p)
         ]
-        self._fast_keys = tuple(fast_names)
-        self._slow_keys = tuple(slow_names)
+        self._affine_keys = tuple(affine_names)
+        self._curved_keys = tuple(curved_names)
 
-        # layer -> list of (global fast-col idx) covering it.
+        # Global flat layout of affine probe domain coords — one contiguous
+        # slice per probe — so the per-layer EV-weighted coord means
+        # accumulate into one tensor across layers.
+        coord_offsets: list[int] = []
+        coord_dims: list[int] = []
+        off = 0
+        for name in affine_names:
+            n = int(self._probes[name].manifold.domain.intrinsic_dim)
+            coord_offsets.append(off)
+            coord_dims.append(n)
+            off += n
+        self._affine_coord_offsets = coord_offsets
+        self._affine_coord_dims = coord_dims
+        self._affine_total_coords = off
+
+        # layer -> ordered list of (global affine-col idx) covering it.
         layer_members: dict[int, list[int]] = {}
-        for ci, name in enumerate(fast_names):
+        for ci, name in enumerate(affine_names):
             for L in self._probes[name].manifold.layers:
                 layer_members.setdefault(L, []).append(ci)
 
@@ -289,129 +322,168 @@ class TraitMonitor:
             X, K, lam = whitener.woodbury_factors(
                 L, device=device, dtype=torch.float32,
             )
-            P1 = len(cols)
-            first_sub = self._probes[fast_names[cols[0]]].manifold.layers[L]
-            D = first_sub.basis.shape[-1]
-            A = torch.zeros((P1, D), device=device, dtype=torch.float32)
-            SImean = torch.zeros((P1, D), device=device, dtype=torch.float32)
-            cmean = torch.zeros((P1,), device=device, dtype=torch.float32)
-            mR = torch.ones((P1,), device=device, dtype=torch.float32)
-            mm = torch.zeros((P1,), device=device, dtype=torch.float32)
-            slope = torch.zeros((P1,), device=device, dtype=torch.float32)
-            intercept = torch.zeros((P1,), device=device, dtype=torch.float32)
-            ev = torch.zeros((P1,), device=device, dtype=torch.float32)
-            for row, ci in enumerate(cols):
-                probe = self._probes[fast_names[ci]]
-                manifold = probe.manifold
-                sub = manifold.layers[L]
-                d = sub.basis.reshape(-1).to(device=device, dtype=torch.float32)
-                mean = sub.mean.reshape(-1).to(device=device, dtype=torch.float32)
-                sd = _woodbury_apply(d, X, K, lam)      # Σ⁻¹ d̂
-                sm = _woodbury_apply(mean, X, K, lam)    # Σ⁻¹ mean
-                A[row] = sd
-                SImean[row] = sm
-                cmean[row] = torch.dot(d, sm)
-                mR_row = torch.dot(d, sd).clamp(min=1e-12)
-                mR[row] = mR_row
-                mm[row] = torch.dot(mean, sm)
-                # Affine reduced→domain map.  The read coordinate ``c =
-                # M_R⁻¹ B Σ⁻¹ x`` is the *whitened* (GLS) reduced coord, so
-                # the reference ``rc`` must be each node's whitened read
-                # coord — NOT the Euclidean ``sub.node_coords`` (the two
-                # frames coincide only under isotropic Σ; on a real LM they
-                # differ).  ``dom = slope·c + intercept`` then sends node k
-                # to its domain coord ``dc[k]`` exactly.
-                emb = manifold.domain.embed(
-                    manifold.domain.clamp_position(
-                        manifold.node_coords.to(torch.float32)
+            a_rows: list[torch.Tensor] = []      # each (R, D)
+            cmean_rows: list[torch.Tensor] = []  # each (R,)
+            mrinv_blocks: list[torch.Tensor] = []   # each (R, R)
+            smap_blocks: list[torch.Tensor] = []    # each (n, R)
+            bmap_parts: list[torch.Tensor] = []     # each (n,)
+            simean_rows: list[torch.Tensor] = []    # each (D,)
+            mm_parts: list[float] = []
+            ev_parts: list[float] = []
+            row_local: list[int] = []
+            coord_gidx: list[int] = []
+            coord_ev: list[float] = []
+            for j, ci in enumerate(cols):
+                probe = self._probes[affine_names[ci]]
+                sub = probe.manifold.layers[L].to(
+                    device=device, dtype=torch.float32,
+                )
+                wh = probe.whitened.get(L)
+                if wh is None or wh.coord_S is None or wh.coord_b is None:
+                    raise WhitenerError(
+                        f"affine probe {affine_names[ci]!r} missing whitened / "
+                        f"coord-map factors for layer {L}; rebuild the probe"
                     )
-                ).to(device=device, dtype=torch.float32)
-                x_nodes = sub.eval_at(emb).to(torch.float32) - mean  # (K, D)
-                rc = (x_nodes @ sd) / mR_row                          # (K,) whitened
-                ncd = manifold.node_coords
-                dc = ncd.reshape(ncd.shape[0], -1)[:, 0].to(torch.float32)
-                if rc.shape[0] >= 2:
-                    # Bipolar (2-node) concept: line through the two nodes.
-                    drc = float(rc[0] - rc[1])
-                    if abs(drc) < 1e-12:
-                        slope[row] = 1.0
-                        intercept[row] = 0.0
-                    else:
-                        s = (dc[0] - dc[1]) / (rc[0] - rc[1])
-                        slope[row] = s
-                        intercept[row] = dc[0] - s * rc[0]
-                else:
-                    # Monopolar ray (1-node fold, e.g. ``agentic`` or an ad-hoc
-                    # ``probe()`` direction): neutral is the reduced-coord-0
-                    # origin → domain 0, the single pole node → ``dc[0]``.
-                    r0 = float(rc[0])
-                    if abs(r0) < 1e-12:
-                        slope[row] = 1.0
-                    else:
-                        slope[row] = dc[0] / rc[0]
-                    intercept[row] = 0.0
-                ev[row] = float(probe.ev_weights.get(L, 1.0))
+                basis = sub.basis                       # (R, D)
+                mean = sub.mean.reshape(-1)             # (D,)
+                R = int(basis.shape[0])
+                sd = _woodbury_apply(basis, X, K, lam)  # (R, D) = Σ⁻¹ B rows
+                sm = _woodbury_apply(mean, X, K, lam)   # (D,)  = Σ⁻¹ mean
+                a_rows.append(sd)
+                cmean_rows.append(basis @ sm)           # (R,) = B Σ⁻¹ mean
+                mrinv_blocks.append(
+                    wh.m_r_inv.to(device=device, dtype=torch.float32),
+                )
+                cs = wh.coord_S.to(device=device, dtype=torch.float32)
+                smap_blocks.append(cs)                  # (n, R)
+                bmap_parts.append(wh.coord_b.to(device=device, dtype=torch.float32))
+                simean_rows.append(sm)
+                mm_parts.append(float(torch.dot(mean, sm)))
+                ev = float(probe.ev_weights.get(L, 1.0))
+                ev_parts.append(ev)
+                row_local.extend([j] * R)
+                n = int(cs.shape[0])
+                base = coord_offsets[ci]
+                coord_gidx.extend(base + d for d in range(n))
+                coord_ev.extend([ev] * n)
             new_cache[L] = {
-                "A": A, "SImean": SImean, "cmean": cmean, "mR": mR, "mm": mm,
-                "slope": slope, "intercept": intercept, "ev": ev,
-                "cols": torch.tensor(cols, device=device, dtype=torch.long),
+                "A": torch.cat(a_rows, dim=0),                  # (ΣR, D)
+                "cmean": torch.cat(cmean_rows, dim=0),          # (ΣR,)
+                "mr_inv": torch.block_diag(*mrinv_blocks),      # (ΣR, ΣR)
+                "smap": torch.block_diag(*smap_blocks),         # (Σn, ΣR)
+                "bmap": torch.cat(bmap_parts, dim=0),           # (Σn,)
+                "SImean": torch.stack(simean_rows, dim=0),      # (P, D)
+                "mm": torch.tensor(mm_parts, device=device, dtype=torch.float32),
+                "ev": torch.tensor(ev_parts, device=device, dtype=torch.float32),
+                "row_local": torch.tensor(row_local, device=device, dtype=torch.long),
+                "probe_cols": torch.tensor(cols, device=device, dtype=torch.long),
+                "coord_gidx": torch.tensor(coord_gidx, device=device, dtype=torch.long),
+                "coord_ev": torch.tensor(coord_ev, device=device, dtype=torch.float32),
                 "X": X, "K": K, "lam": lam,
             }
-        self._fast_cache = new_cache
+        self._affine_cache = new_cache
 
-    def _score_fast(
+    def _score_affine(
         self, hidden_per_layer: dict[int, torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Rank-1 fast path: ``(domain_coords[P1], fraction[P1])`` on-device.
+    ) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]":
+        """Batched affine path → on-device EV-weighted coord + fraction sums.
 
-        One matmul + one Woodbury apply per layer; EV-weighted across layers
-        (re-normalized by the realized weight so a missing layer doesn't
-        skew the result).  Zero ``.item()`` / ``.cpu()`` — the hot-path
-        no-sync primitive.  ``coords`` is the domain-frame coordinate
-        (pole-normalized at rank-1), ``fraction`` the in-subspace energy
-        share in ``[0, 1]``.
+        Any-rank flat probes share one stacked matmul (``A @ h − cmean``) and
+        one Woodbury ``Σ⁻¹h`` per layer; rank is just the block size.  Returns
+        ``(coords_sum[total_coords], coords_evsum[total_coords],
+        frac_sum[P], frac_evsum[P])`` — all on-device, zero ``.item()`` /
+        ``.cpu()`` (the no-sync hot-path primitive; callers normalize + sync
+        once).  ``coords_sum`` is laid out by the global per-probe coord slices
+        (``_affine_coord_offsets``); ``frac`` is per affine probe.
         """
         device = self._cache_device or torch.device("cpu")
-        P1 = len(self._fast_keys)
-        coords = torch.zeros((P1,), device=device, dtype=torch.float32)
-        frac = torch.zeros((P1,), device=device, dtype=torch.float32)
-        evsum = torch.zeros((P1,), device=device, dtype=torch.float32)
-        if P1 == 0:
-            return coords, frac
+        P = len(self._affine_keys)
+        total = self._affine_total_coords
+        coords_sum = torch.zeros((total,), device=device, dtype=torch.float32)
+        coords_evsum = torch.zeros((total,), device=device, dtype=torch.float32)
+        frac_sum = torch.zeros((P,), device=device, dtype=torch.float32)
+        frac_evsum = torch.zeros((P,), device=device, dtype=torch.float32)
+        if P == 0:
+            return coords_sum, coords_evsum, frac_sum, frac_evsum
         for L, h in hidden_per_layer.items():
-            entry = self._fast_cache.get(L)
+            entry = self._affine_cache.get(L)
             if entry is None:
                 continue
             hf = h.reshape(-1).to(torch.float32) if h.ndim > 1 else h.to(torch.float32)
-            cols = entry["cols"]
-            ev = entry["ev"]
-            g = entry["A"] @ hf - entry["cmean"]            # reduced·mR
-            mRL = entry["mR"]
-            c = g / mRL                                     # reduced coord
-            dom = entry["slope"] * c + entry["intercept"]   # domain coord
-            coords.index_add_(0, cols, ev * dom)
-            evsum.index_add_(0, cols, ev)
-            # Fraction: ‖P_M x‖_M / ‖x‖_M.
+            g = entry["A"] @ hf - entry["cmean"]             # (ΣR,) = B Σ⁻¹ x
+            c = entry["mr_inv"] @ g                           # (ΣR,) = M_R⁻¹ g
+            dom = entry["smap"] @ c + entry["bmap"]           # (Σn,) domain coords
+            cev = entry["coord_ev"]
+            cgi = entry["coord_gidx"]
+            coords_sum.index_add_(0, cgi, cev * dom)
+            coords_evsum.index_add_(0, cgi, cev)
+            # Fraction per probe: ‖P_M x‖_M / ‖x‖_M (M_R-orthogonal share).
             sih = _woodbury_apply(hf, entry["X"], entry["K"], entry["lam"])
-            hSih = torch.dot(hf, sih).clamp(min=0.0)        # hᵀΣ⁻¹h
-            hsm = entry["SImean"] @ hf                      # h·Σ⁻¹mean
-            xM2 = (hSih - 2.0 * hsm + entry["mm"]).clamp(min=1e-12)
-            par = g.abs() / mRL.sqrt()                      # ‖P_M x‖_M = |g|/√mR
-            fL = (par / xM2.sqrt()).clamp(0.0, 1.0)
-            frac.index_add_(0, cols, ev * fL)
-        evsum = evsum.clamp(min=1e-8)
-        return coords / evsum, frac / evsum
+            hSih = torch.dot(hf, sih).clamp(min=0.0)          # hᵀΣ⁻¹h (shared)
+            par2 = torch.zeros_like(entry["mm"])
+            par2.index_add_(0, entry["row_local"], g * c)     # Σ_{r∈p} g_r c_r = gᵀM_R⁻¹g
+            hsm = entry["SImean"] @ hf                        # (P_L,) h·Σ⁻¹mean
+            xM2 = (hSih - 2.0 * hsm + entry["mm"]).clamp(min=1e-12)   # (P_L,) ‖x‖²_M
+            fL = (par2.clamp(min=0.0).sqrt() / xM2.sqrt()).clamp(0.0, 1.0)
+            ev = entry["ev"]
+            frac_sum.index_add_(0, entry["probe_cols"], ev * fL)
+            frac_evsum.index_add_(0, entry["probe_cols"], ev)
+        return coords_sum, coords_evsum, frac_sum, frac_evsum
 
-    def _score_slow(
+    def _affine_axis0(
+        self, coords_sum: torch.Tensor, coords_evsum: torch.Tensor,
+    ) -> torch.Tensor:
+        """On-device ``[P_affine]`` axis-0 domain coord (no host sync).
+
+        Picks each affine probe's first coord (the global-layout slice start)
+        and EV-normalizes — the coordinate analogue the incremental no-sync
+        per-token row would carry.
+        """
+        device = coords_sum.device
+        if not self._affine_coord_offsets:
+            return torch.zeros((0,), device=device, dtype=torch.float32)
+        idx = torch.tensor(
+            self._affine_coord_offsets, device=device, dtype=torch.long,
+        )
+        return coords_sum[idx] / coords_evsum[idx].clamp(min=1e-8)
+
+    def _affine_readings(
+        self, hidden_per_layer: dict[int, torch.Tensor],
+    ) -> dict[str, "ManifoldTokenReading"]:
+        """Per-probe affine readings (coords + fraction; nearest deferred).
+
+        One stacked-matmul pass + one host sync for the whole affine roster.
+        Nearest stays empty per token — flat probes gate on coords; the
+        end-of-gen :meth:`score_aggregate` fills nearest.
+        """
+        out: dict[str, ManifoldTokenReading] = {}
+        if not self._affine_keys:
+            return out
+        coords_sum, coords_evsum, frac_sum, frac_evsum = self._score_affine(
+            hidden_per_layer,
+        )
+        coords = (coords_sum / coords_evsum.clamp(min=1e-8)).cpu().tolist()
+        fracs = (frac_sum / frac_evsum.clamp(min=1e-8)).cpu().tolist()
+        for ci, name in enumerate(self._affine_keys):
+            off = self._affine_coord_offsets[ci]
+            n = self._affine_coord_dims[ci]
+            out[name] = ManifoldTokenReading(
+                fraction=fracs[ci],
+                nearest=[],
+                coords=tuple(coords[off:off + n]),
+            )
+        return out
+
+    def _score_curved(
         self, name: str, hidden_per_layer: dict[int, torch.Tensor],
     ) -> ManifoldTokenReading:
-        """Rank-R per-probe path: domain coords + fraction + nearest.
+        """Per-probe curved path: fraction + nearest (coords deferred per token).
 
-        Mirrors :meth:`ManifoldMonitor.score_aggregate`'s per-layer
-        invert-then-EV-mean, run on the single pooled hidden state.  Used
-        for the (rare) multi-node flat probes attached to this monitor;
-        those force full-retention capture so they never ride the no-sync
-        incremental row.
+        The curved foot-solve (``invert_parameterization``) is run once per
+        generation in :meth:`score_aggregate`, not per token — so the
+        per-token reading carries the EV-weighted whitened fraction + the
+        nearest-node vote and leaves ``coords`` empty.  Curved probes are
+        few (e.g. ``pad``), so the per-probe single-sync loop is fine.
         """
         probe = self._probes[name]
         manifold = probe.manifold
@@ -425,49 +497,28 @@ class TraitMonitor:
             w_shared = {L: probe.ev_weights.get(L, 0.0) / total_w for L in shared}
 
         K = probe.node_values_reduced[shared[0]].shape[0]
-        n_dim = manifold.domain.intrinsic_dim
-        dist_acc = [0.0] * K
-        frac_mean = 0.0
-        coords_mean: list[float] | None = None
+        dist_acc: torch.Tensor | None = None
+        frac_acc: torch.Tensor | None = None
         for L in shared:
-            sub = manifold.layers[L]
-            h = hidden_per_layer[L]
-            h = h.reshape(-1, h.shape[-1])[-1] if h.ndim > 1 else h
-            frac_t, cdist_query, invert_query, cdist_nodes = _layer_geometry(
+            h = hidden_per_layer[L].to(torch.float32)
+            if h.ndim > 1:
+                h = h.reshape(-1, h.shape[-1])[-1]
+            frac_t, cdist_query, _invert, cdist_nodes = _layer_geometry(
                 probe, L, h,
             )
             w = w_shared[L]
-            frac_mean += w * float(frac_t.item())
-            dists = torch.cdist(cdist_query, cdist_nodes).reshape(-1).cpu().tolist()
-            for k in range(K):
-                dist_acc[k] += w * dists[k]
-            # ``invert_parameterization`` recovers domain coords from the
-            # reduced query, but raises on a flat (affine) subspace — its
-            # RBF path has no affine branch.  A flat rank-R probe therefore
-            # reports fraction + nearest with empty coords (the affine
-            # multi-dim coordinate invert is a follow-up); a curved probe
-            # gets full coords.
-            try:
-                pos, _res = invert_parameterization(
-                    sub, manifold.domain, invert_query.reshape(1, -1),
-                    manifold.node_coords,
-                )
-            except ValueError:
-                continue
-            coord_tup = [float(c) for c in pos.reshape(-1).tolist()[:n_dim]]
-            if coords_mean is None:
-                coords_mean = [w * c for c in coord_tup]
-            else:
-                for i, c in enumerate(coord_tup):
-                    if i < len(coords_mean):
-                        coords_mean[i] += w * c
-        order = sorted(range(K), key=lambda k: dist_acc[k])
-        nearest = [(manifold.node_labels[k], dist_acc[k]) for k in order[: probe.top_n]]
-        return ManifoldTokenReading(
-            fraction=frac_mean,
-            nearest=nearest,
-            coords=tuple(coords_mean or ()),
-        )
+            fc = w * frac_t
+            frac_acc = fc if frac_acc is None else frac_acc + fc
+            contrib = w * torch.cdist(cdist_query, cdist_nodes).reshape(-1)
+            dist_acc = contrib if dist_acc is None else dist_acc + contrib
+        assert dist_acc is not None and frac_acc is not None  # shared != []
+        dist_list = dist_acc.cpu().tolist()
+        frac_sum = float(frac_acc.item())
+        order = sorted(range(K), key=lambda k: dist_list[k])
+        nearest = [
+            (manifold.node_labels[k], dist_list[k]) for k in order[: probe.top_n]
+        ]
+        return ManifoldTokenReading(fraction=frac_sum, nearest=nearest, coords=())
 
     def _score_tokens(
         self,
@@ -476,31 +527,20 @@ class TraitMonitor:
     ) -> dict[str, ManifoldTokenReading]:
         """Score every probe → ``{name: ManifoldTokenReading}``.
 
-        Fast (rank-1) probes are batched; slow (rank-R) probes scored
+        Affine (flat) probes are batched (any rank); curved probes scored
         per-probe.  ``accumulate`` folds the aggregate coords into
         history/stats (the in-flight per-token path passes False).
         """
         out: dict[str, ManifoldTokenReading] = {}
         if not hidden_per_layer or not self._probes:
-            for name in self._probes:
-                out[name] = ManifoldTokenReading(fraction=0.0, nearest=[], coords=())
-            if accumulate:
-                self._apply_accumulate(out)
             return out
 
         device = next(iter(hidden_per_layer.values())).device
         self._ensure_cache(device)
 
-        if self._fast_keys:
-            coords_t, frac_t = self._score_fast(hidden_per_layer)
-            coords_l = coords_t.cpu().tolist()
-            frac_l = frac_t.cpu().tolist()
-            for i, name in enumerate(self._fast_keys):
-                out[name] = ManifoldTokenReading(
-                    fraction=frac_l[i], nearest=[], coords=(coords_l[i],),
-                )
-        for name in self._slow_keys:
-            out[name] = self._score_slow(name, hidden_per_layer)
+        out.update(self._affine_readings(hidden_per_layer))
+        for name in self._curved_keys:
+            out[name] = self._score_curved(name, hidden_per_layer)
 
         if accumulate:
             self._apply_accumulate(out)
@@ -553,67 +593,77 @@ class TraitMonitor:
         The live per-token read source: returns ``{name: ManifoldTokenReading}``
         with ``coords`` (domain frame), ``fraction``, ``nearest`` per probe.
         Does NOT touch history/stats — the in-flight gate/stream path must
-        not corrupt the session-level accumulators.
+        not corrupt the session-level accumulators — but flips the
+        per-token pending flag so the TUI/webui can poll for a fresh reading.
         """
-        return self._score_tokens(hidden_per_layer, accumulate=False)
+        out = self._score_tokens(hidden_per_layer, accumulate=False)
+        if out:
+            self._pending_per_token = True
+        return out
 
     def score_single_token_tensor(
         self, hidden_per_layer: dict[int, torch.Tensor],
     ) -> torch.Tensor:
-        """On-device ``[P1]`` axis-0 coordinate row for one token — no host sync.
+        """On-device ``[P_affine]`` axis-0 coordinate row for one token — no sync.
 
-        The rank-1 fast-path coordinate for each rank-1 probe (in
-        :attr:`_fast_keys` order), returned on-device with zero ``.item()``
+        The axis-0 domain coordinate for each affine probe (in
+        :attr:`_affine_keys` order), returned on-device with zero ``.item()``
         / ``.cpu()``.  Powers the session's incremental per-token capture:
         ``_finalize_generation`` stacks one row per generated token and
         syncs once, reproducing :meth:`score_per_token` bit-for-bit while
-        keeping only the latest hidden per layer in device memory.  Rank-R
+        keeping only the latest hidden per layer in device memory.  Curved
         probes force full-retention capture, so they never ride this row.
 
-        Empty-hidden / no-fast-probe case returns a zeros ``[P1]`` tensor on
-        the cache device (else CPU).
+        Empty-hidden / no-affine-probe case returns a zeros ``[P_affine]``
+        tensor on the cache device (else CPU).
         """
-        n_fast = len(self._fast_keys)
+        n_aff = len(self._affine_keys)
         if not hidden_per_layer or (
-            n_fast == 0 and not self._probes
+            n_aff == 0 and not self._probes
         ):
             device = self._cache_device or torch.device("cpu")
-            return torch.zeros((n_fast,), device=device, dtype=torch.float32)
+            return torch.zeros((n_aff,), device=device, dtype=torch.float32)
         device = next(iter(hidden_per_layer.values())).device
         self._ensure_cache(device)
-        coords_t, _frac_t = self._score_fast(hidden_per_layer)
-        return coords_t
+        coords_sum, coords_evsum, _f, _fe = self._score_affine(hidden_per_layer)
+        return self._affine_axis0(coords_sum, coords_evsum)
 
     def score_single_token_per_layer(
         self,
         hidden_per_layer: dict[int, torch.Tensor],
     ) -> dict[int, dict[str, float]]:
-        """Per-layer × per-probe domain coordinate for a single token.
+        """Per-layer × per-probe domain coordinate (axis 0) for a single token.
 
-        Returns the per-layer (un-aggregated) rank-1 domain coordinate for
-        each rank-1 probe covering that layer — the coordinate analogue of
+        Returns the per-layer (un-aggregated) axis-0 domain coordinate for
+        each affine probe covering that layer — the coordinate analogue of
         the old per-layer cosine heatmap.  ``{layer_idx: {probe_name:
-        coord}}``; layers no probe covers are omitted.  Rank-R probes are
-        not expanded here (their per-layer coords need the per-probe
-        invert); the heatmap is a rank-1 roster view.
+        coord}}``; layers no affine probe covers are omitted.  Curved probes
+        are not expanded here (their per-layer coords need the per-probe foot
+        solve); the heatmap is the affine roster view.
         """
-        if not hidden_per_layer or not self._fast_keys:
+        if not hidden_per_layer or not self._affine_keys:
             return {}
         device = next(iter(hidden_per_layer.values())).device
         self._ensure_cache(device)
         out: dict[int, dict[str, float]] = {}
         for layer_idx, h in hidden_per_layer.items():
-            entry = self._fast_cache.get(layer_idx)
+            entry = self._affine_cache.get(layer_idx)
             if entry is None:
                 continue
             hf = h.reshape(-1).to(torch.float32) if h.ndim > 1 else h.to(torch.float32)
             g = entry["A"] @ hf - entry["cmean"]
-            c = g / entry["mR"]
-            dom = (entry["slope"] * c + entry["intercept"]).cpu().tolist()
-            cols = entry["cols"].cpu().tolist()
-            out[layer_idx] = {
-                self._fast_keys[ci]: dom[row] for row, ci in enumerate(cols)
-            }
+            c = entry["mr_inv"] @ g
+            dom = (entry["smap"] @ c + entry["bmap"]).cpu().tolist()
+            gidx = entry["coord_gidx"].cpu().tolist()
+            # axis-0 of probe ci sits at global coord index == coord_offsets[ci];
+            # map it back to this layer's coord-row position.
+            pos_of = {gi: r for r, gi in enumerate(gidx)}
+            layer_out: dict[str, float] = {}
+            for ci in entry["probe_cols"].cpu().tolist():
+                r = pos_of.get(self._affine_coord_offsets[ci])
+                if r is not None:
+                    layer_out[self._affine_keys[ci]] = dom[r]
+            out[layer_idx] = layer_out
         return out
 
     def measure_from_hidden(
@@ -632,21 +682,30 @@ class TraitMonitor:
     ) -> dict[str, float]:
         """Flatten per-probe readings into namespaced gate-callback scalars.
 
-        For each probe emits the bare ``"<probe>"`` aliased to coordinate
-        axis 0 (so ``@when:angry.calm > 0.4`` reads the single coord of a
-        2-node concept unchanged), one ``"<probe>[<i>]"`` per coordinate
-        axis (so ``@when:personas[3] > 0.4`` indexes an axis), and
-        ``"<probe>:fraction"``.  Merges directly into
-        ``TriggerContext.probe_scores`` alongside the manifold-probe
-        scalars from :meth:`ManifoldMonitor.flat_scalars`.
+        The single gate emitter for every probe shape.  For each probe emits
+        the bare ``"<probe>"`` aliased to coordinate axis 0 (so
+        ``@when:angry.calm > 0.4`` reads the single coord of a 2-node concept
+        unchanged), one ``"<probe>[<i>]"`` per coordinate axis (so
+        ``@when:personas[3] > 0.4`` indexes an axis), ``"<probe>:fraction"``,
+        and one ``"<probe>@<label>"`` per nearest node as ``-distance`` (so
+        larger means closer and ``@when:pad@happy > -0.1`` reads like a
+        similarity gate).  Flat probes carry coords (no per-token nearest);
+        curved probes carry fraction + nearest.  All shapes merge directly
+        into ``TriggerContext.probe_scores``.
         """
         out: dict[str, float] = {}
         for name, reading in readings.items():
             coords = reading.coords
-            out[name] = coords[0] if coords else 0.0
-            for i, c in enumerate(coords):
-                out[f"{name}[{i}]"] = c
+            # Bare ``<name>`` / ``<name>[i]`` only when coords are present
+            # (flat probes); a curved probe has no per-token coords, so it
+            # emits only ``:fraction`` + ``@label`` (the old curved behavior).
+            if coords:
+                out[name] = coords[0]
+                for i, c in enumerate(coords):
+                    out[f"{name}[{i}]"] = c
             out[f"{name}:fraction"] = reading.fraction
+            for label, dist in reading.nearest:
+                out[f"{name}@{label}"] = -dist
         return out
 
     def _per_token_coord_stream(
@@ -654,26 +713,22 @@ class TraitMonitor:
     ) -> dict[str, list[float]]:
         """Axis-0 domain-coordinate stream per probe over ``n`` tokens.
 
-        Fast (rank-1) probes are accumulated on-device and synced once;
-        rank-R probes fall back to axis 0 of their per-token reading.  Row
-        ``i`` reads ``captured[L][i]`` (guarded), so an EOS overshoot is
-        ignored and a short capture leaves trailing zeros.
+        Affine (flat) probes are accumulated on-device and synced once; curved
+        probes have no per-token coords (their foot solve is end-of-gen only),
+        so they stream zeros.  Row ``i`` reads ``captured[L][i]`` (guarded),
+        so an EOS overshoot is ignored and a short capture leaves trailing
+        zeros.
         """
         per_token: dict[str, list[float]] = {name: [0.0] * n for name in self._probes}
-        if self._fast_keys:
+        if self._affine_keys:
             rows: list[torch.Tensor] = []
             for i in range(n):
                 tok = {L: h[i] for L, h in captured.items() if h.shape[0] > i}
-                coords_t, _ = self._score_fast(tok)
-                rows.append(coords_t)
+                coords_sum, coords_evsum, _f, _fe = self._score_affine(tok)
+                rows.append(self._affine_axis0(coords_sum, coords_evsum))
             stacked = torch.stack(rows, 0).cpu().tolist() if rows else []
-            for j, name in enumerate(self._fast_keys):
+            for j, name in enumerate(self._affine_keys):
                 per_token[name] = [stacked[i][j] for i in range(n)]
-        for name in self._slow_keys:
-            for i in range(n):
-                tok = {L: h[i] for L, h in captured.items() if h.shape[0] > i}
-                r = self._score_slow(name, tok)
-                per_token[name][i] = r.coords[0] if r.coords else 0.0
         return per_token
 
     def score_per_token(
@@ -860,12 +915,13 @@ class TraitMonitor:
         return "".join(blocks[min(8, max(0, int((v - lo) / span * 8)))] for v in values)
 
     def add_probe(self, name: str, manifold: "Manifold", *, top_n: int = DEFAULT_NEAREST_TOP_N):
-        """Register a flat :class:`Manifold` probe (rank-1 or rank-R).
+        """Register a :class:`Manifold` probe — flat (any rank) or curved.
 
-        Pre-caches the per-layer node values + EV weights + whitened
-        factors (shared with :class:`ManifoldMonitor` via
-        :func:`_attach_manifold_probe`); the wired whitener must cover the
-        fit's layers.
+        Pre-caches the per-layer node values + EV weights + whitened factors
+        (and, for a flat fit, the affine reduced→domain coord map) via
+        :func:`_attach_manifold_probe`; the wired whitener must cover the
+        fit's layers.  Classification (affine batched vs curved per-probe)
+        happens lazily in :meth:`_ensure_cache`.
         """
         is_new = name not in self._probes
         self._probes[name] = _attach_manifold_probe(
@@ -884,6 +940,27 @@ class TraitMonitor:
             del self._stats[name]
         self._invalidate_cache()
 
+    def attached_probes(self) -> dict[str, "AttachedManifoldProbe"]:
+        """Live attached-probe map (read-only view) — name → probe."""
+        return dict(self._probes)
+
+    def attached_layers(self) -> set[int]:
+        """Union of fit-layer indices across every attached probe.
+
+        Alias of :meth:`probe_layers` (capture-widening signal); kept for the
+        server/TUI surfaces that consumed the former ``ManifoldMonitor``.
+        """
+        return self.probe_layers()
+
+    def reset(self) -> None:
+        """Drop every attached probe (TUI ``/unsteer``-style reset)."""
+        self._probes.clear()
+        self.history.clear()
+        self._stats.clear()
+        self._invalidate_cache()
+        self._pending_aggregate = False
+        self._pending_per_token = False
+
     def reset_history(self):
         for name in self._probes:
             self.history[name].clear()
@@ -891,10 +968,141 @@ class TraitMonitor:
         self._pending_aggregate = False
         self._pending_per_token = False
 
+    def score_aggregate(
+        self,
+        captured_per_layer: dict[int, torch.Tensor],
+        *,
+        agg_index: int | None = None,
+    ) -> dict[str, ManifoldAggregate]:
+        """End-of-generation aggregates over pooled captures — all probes.
+
+        ``captured_per_layer[L]`` is the per-layer ``[T, D]`` capture stack.
+        The pooled activation is the **last non-special token** (``agg_index``,
+        default the final row) — the same single-state discipline extraction
+        uses, not a trajectory mean.  Per probe it computes per-layer +
+        EV-weighted (1) subspace fraction, (2) nearest-node vote, (3) domain
+        coords + normalized residual.  A flat probe recovers coords through
+        the affine map (residual 0 — the surface fills its subspace); a curved
+        probe runs the :func:`invert_parameterization` foot solve.  Coords are
+        EV-weighted-meaned across layers (shared domain); residual is
+        ``dist_L / ‖c_L‖`` per layer, EV-weighted-meaned.
+        """
+        out: dict[str, ManifoldAggregate] = {}
+        if not captured_per_layer or not self._probes:
+            return out
+
+        pooled: dict[int, torch.Tensor] = {}
+        for layer_idx, stack in captured_per_layer.items():
+            if stack is None or stack.numel() == 0:
+                continue
+            if stack.ndim == 1:
+                pooled[layer_idx] = stack.to(torch.float32)
+            else:
+                t = stack.shape[0]
+                row = t - 1 if agg_index is None else max(0, min(agg_index, t - 1))
+                pooled[layer_idx] = stack.to(torch.float32)[row]
+
+        for name, probe in self._probes.items():
+            manifold = probe.manifold
+            ev = probe.ev_weights
+            is_affine = _probe_is_affine(probe)
+            shared = [idx for idx in manifold.layers if idx in pooled]
+            if not shared:
+                out[name] = ManifoldAggregate(
+                    fraction_mean=0.0, fraction_per_layer={}, nearest=[],
+                    coords=(), coords_per_layer={},
+                    residual_mean=0.0, residual_per_layer={},
+                )
+                continue
+            total_w = sum(ev.get(idx, 0.0) for idx in shared)
+            if total_w <= _MIN_EV_WEIGHT:
+                w_shared = {idx: 1.0 / len(shared) for idx in shared}
+            else:
+                w_shared = {idx: ev.get(idx, 0.0) / total_w for idx in shared}
+
+            K = probe.node_values_reduced[shared[0]].shape[0]
+            n_dim = manifold.domain.intrinsic_dim
+            dist_acc = [0.0] * K
+            frac_per_layer: dict[int, float] = {}
+            coords_per_layer: dict[int, tuple[float, ...]] = {}
+            residual_per_layer: dict[int, float] = {}
+            frac_mean = 0.0
+            residual_mean = 0.0
+            coords_mean: list[float] | None = None
+
+            for layer_idx in shared:
+                sub = manifold.layers[layer_idx]
+                h = pooled[layer_idx].to(torch.float32)
+                if h.ndim > 1:
+                    h = h.reshape(-1, h.shape[-1])[-1]
+                frac_t, cdist_query, invert_query, cdist_nodes = _layer_geometry(
+                    probe, layer_idx, h,
+                )
+                frac = float(frac_t.item())
+                frac_per_layer[layer_idx] = frac
+                w = w_shared[layer_idx]
+                frac_mean += w * frac
+
+                dists = torch.cdist(cdist_query, cdist_nodes).reshape(-1)
+                dist_list = dists.cpu().tolist()
+                for k in range(K):
+                    dist_acc[k] += w * dist_list[k]
+
+                if is_affine:
+                    # Affine map: coords are exact, no off-subspace residual.
+                    wh = probe.whitened[layer_idx]
+                    pos_t = (
+                        wh.coord_S @ invert_query + wh.coord_b
+                        if wh.coord_S is not None and wh.coord_b is not None
+                        else invert_query
+                    )
+                    norm_residual = 0.0
+                else:
+                    pos, res = invert_parameterization(
+                        sub, manifold.domain, invert_query.reshape(1, -1),
+                        manifold.node_coords,
+                    )
+                    pos_t = pos.reshape(-1)
+                    res_val = float(res.reshape(-1)[0].item())
+                    par_norm_val = float(
+                        torch.linalg.vector_norm(invert_query).item()
+                    )
+                    norm_residual = (
+                        0.0 if par_norm_val < _FRACTION_EPSILON
+                        else res_val / par_norm_val
+                    )
+                residual_per_layer[layer_idx] = norm_residual
+                residual_mean += w * norm_residual
+                coord_tup = tuple(
+                    float(c) for c in pos_t.reshape(-1).tolist()[:n_dim]
+                )
+                coords_per_layer[layer_idx] = coord_tup
+                if coords_mean is None:
+                    coords_mean = [w * c for c in coord_tup]
+                else:
+                    for i, c in enumerate(coord_tup):
+                        if i < len(coords_mean):
+                            coords_mean[i] += w * c
+
+            order = sorted(range(K), key=lambda k: dist_acc[k])
+            nearest = [
+                (manifold.node_labels[k], dist_acc[k]) for k in order[: probe.top_n]
+            ]
+            out[name] = ManifoldAggregate(
+                fraction_mean=frac_mean,
+                fraction_per_layer=frac_per_layer,
+                nearest=nearest,
+                coords=tuple(coords_mean) if coords_mean is not None else (),
+                coords_per_layer=coords_per_layer,
+                residual_mean=residual_mean,
+                residual_per_layer=residual_per_layer,
+            )
+        return out
+
 
 @dataclass
 class AttachedManifoldProbe:
-    """One manifold registered on a :class:`ManifoldMonitor`.
+    """One manifold registered on a :class:`Monitor`.
 
     Pairs the loaded :class:`Manifold` artifact with the per-layer cache
     the monitor uses on the hot path: ``node_values_reduced`` is the
@@ -946,25 +1154,86 @@ class _LayerWhiten:
     X: torch.Tensor            # (N, D) centered neutral observations
     K_inv: torch.Tensor        # (N, N) Woodbury inverse
     lam: float                 # ridge λ
+    # Affine reduced→domain coordinate map (flat probes only; ``None`` for a
+    # curved fit, which recovers coords through ``invert_parameterization``).
+    # ``dom = c @ coord_S.T + coord_b`` sends the whitened M-orthogonal
+    # reduced coords ``c = M_R⁻¹ B Σ⁻¹ x`` to the fit's domain frame, fit by
+    # least squares so each node's reduced coord maps to its
+    # ``node_coords`` (the rank-1 case reproduces the old slope/intercept).
+    coord_S: torch.Tensor | None = None   # (n_dim, R)
+    coord_b: torch.Tensor | None = None   # (n_dim,)
 
 
 # ----------------------------------------------------------------------------
-# Shared subspace-read machinery — used by BOTH monitors.  TraitMonitor (flat,
-# batched, coordinate readout) and ManifoldMonitor (per-probe, curved-capable)
-# are the read-side peers of the steering split (one ``subspace_inject`` kernel,
-# ``SteeringManager.{subspaces, manifolds}``): they share the whitened-factor
-# build, the per-layer geometry, and the attach-time node cache, and diverge
-# only in how they aggregate (TraitMonitor stacks rank-1 probes into one matmul
-# and inverts affinely; ManifoldMonitor loops per probe and foot-solves curved
-# fits in the aggregate).
+# Shared subspace-read machinery — used by both read paths of the unified
+# :class:`Monitor`.  The flat (affine) path stacks every flat probe — any rank
+# — into one matmul + one shared Woodbury ``Σ⁻¹h`` per layer and inverts
+# affinely; the curved path loops per probe and foot-solves in the aggregate.
+# Both share the whitened-factor build, the per-layer geometry, and the
+# attach-time node cache — the read-side peer of the steering split (one
+# ``subspace_inject`` kernel, ``SteeringManager.{subspaces, manifolds}``).
 # ----------------------------------------------------------------------------
 
 
-def _probe_rank(probe: "AttachedManifoldProbe") -> int:
-    """Subspace dimension ``R`` of a flat probe (its per-layer basis rows)."""
+def _probe_is_affine(probe: "AttachedManifoldProbe") -> bool:
+    """True iff the probe's fit is flat (affine) — batched coordinate readout.
+
+    A manifold's layers are uniformly affine (``pca`` / 2-node concept) or
+    curved (``spectral`` / ``authored``), so the first fitted layer decides.
+    An empty manifold is treated as affine (it scores to nothing anyway).
+    """
     for sub in probe.manifold.layers.values():
-        return int(sub.basis.shape[0])
-    return 0
+        return bool(sub.is_affine)
+    return True
+
+
+def _affine_coord_map(
+    sub: Any, manifold: "Manifold", m_r_inv: torch.Tensor,
+    X: torch.Tensor, K_inv: torch.Tensor, lam: float,
+) -> "tuple[torch.Tensor, torch.Tensor]":
+    """Least-squares affine map: whitened M-proj reduced coords → domain.
+
+    Returns ``(coord_S (n_dim, R), coord_b (n_dim,))`` such that
+    ``dom = c @ coord_Sᵀ + coord_b`` sends each node's whitened M-orthogonal
+    reduced coords ``c_k = M_R⁻¹ B Σ⁻¹ (v_k − mean)`` to its domain
+    ``node_coords`` — the rank-R generalization of the old rank-1 2-node
+    slope/intercept (which it reproduces exactly at R=1, K=2).  The small
+    solve runs on CPU (MPS has ``linalg.lstsq`` gaps); the per-node
+    ``Σ⁻¹`` apply rides the device Woodbury.
+    """
+    dev = X.device
+    sub_f = sub.to(device=dev, dtype=torch.float32)
+    basis = sub_f.basis                                   # (R, D)
+    mean = sub_f.mean                                     # (D,)
+    R = int(basis.shape[0])
+    node_coords = manifold.node_coords.to(device=dev, dtype=torch.float32)
+    K = int(node_coords.shape[0])
+    n_dim = int(manifold.domain.intrinsic_dim)
+    embedded = manifold.domain.embed(
+        manifold.domain.clamp_position(node_coords)
+    ).to(device=dev, dtype=torch.float32)
+    v_centered = sub_f.eval_at(embedded) - mean          # (K, D)
+    si_vc = _woodbury_apply(v_centered, X, K_inv, lam)    # (K, D) = Σ⁻¹ v_centered
+    g_nodes = si_vc @ basis.T                             # (K, R) = B Σ⁻¹ v_centered
+    c_nodes = (g_nodes @ m_r_inv.T).cpu()                # (K, R) whitened M-proj coords
+    dc = node_coords.reshape(K, -1)[:, :n_dim].cpu()     # (K, n_dim) domain target
+    if K == 1:
+        # Monopolar ray (R == 1): anchor through the origin (neutral → 0),
+        # the single node → its domain coord; minimal-norm S, b = 0.
+        c0 = c_nodes[0]
+        denom = (c0 @ c0).clamp(min=_FRACTION_EPSILON)
+        coord_S = torch.outer(dc[0], c0) / denom         # (n_dim, R)
+        coord_b = torch.zeros(n_dim, dtype=torch.float32)
+    else:
+        ones = torch.ones((K, 1), dtype=torch.float32)
+        c1 = torch.cat([c_nodes, ones], dim=1)           # (K, R+1)
+        sol = torch.linalg.lstsq(c1, dc).solution        # (R+1, n_dim)
+        coord_S = sol[:R].T.contiguous()                 # (n_dim, R)
+        coord_b = sol[R].contiguous()                    # (n_dim,)
+    return (
+        coord_S.to(device=dev, dtype=torch.float32),
+        coord_b.to(device=dev, dtype=torch.float32),
+    )
 
 
 def _build_whitened_factors(
@@ -1012,11 +1281,21 @@ def _build_whitened_factors(
             layer_idx, device=dev, dtype=torch.float32,
         )
         chol_dev = chol.to(device=dev, dtype=torch.float32)
+        m_r_inv_dev = m_r_inv.to(device=dev, dtype=torch.float32)
+        # Flat probes carry the affine reduced→domain coord map (the rank-R
+        # generalization of the rank-1 slope/intercept); a curved fit leaves
+        # it ``None`` and recovers coords via ``invert_parameterization``.
+        coord_S = coord_b = None
+        if sub.is_affine:
+            coord_S, coord_b = _affine_coord_map(
+                sub, manifold, m_r_inv_dev, X, K_inv, lam,
+            )
         out[layer_idx] = _LayerWhiten(
-            m_r_inv=m_r_inv.to(device=dev, dtype=torch.float32),
+            m_r_inv=m_r_inv_dev,
             chol=chol_dev,
             node_white=(v_reduced.to(torch.float32) @ chol_dev),
             X=X, K_inv=K_inv, lam=lam,
+            coord_S=coord_S, coord_b=coord_b,
         )
     return out
 
@@ -1116,397 +1395,3 @@ def _layer_geometry(
     frac = (par_mnorm / x_mnorm).clamp(min=0.0, max=1.0)
     cdist_query = (c.reshape(1, -1) @ wh.chol)  # (1, R) — Lᵀc as row
     return frac, cdist_query, c, wh.node_white
-
-
-class ManifoldMonitor:
-    """Read-side counterpart to manifold steering.
-
-    For each attached manifold the monitor exposes three channels: the
-    fraction of the centered activation that lives in the manifold's PCA
-    subspace (hot path, scored per token), the top-N node labels nearest
-    the running activation in activation space (hot path, EV-weighted
-    across layers), and the inverse-projection of the pooled
-    end-of-generation activation onto the manifold (slow path, run once
-    in ``_finalize_generation``).
-
-    Peer to :class:`TraitMonitor` — vector probes and manifold probes
-    compose independently; ``flat_scalars`` flattens the rich per-token
-    readings into namespaced scalars (``<probe>:fraction`` and
-    ``<probe>@<label>``, the latter as ``-distance`` so larger means
-    closer) that merge cleanly into ``TriggerContext.probe_scores`` for
-    ``@when:`` gates.
-
-    Hot-path discipline: no ``.item()`` per token, fp32 norms (fp16
-    sum-of-squares overflows at hidden_dim >= 2048), pre-cached node
-    values in subspace coords so per-token distance computations are one
-    batched cdist in R-dim per layer.  ``layer_means`` is accepted for
-    parity with :class:`TraitMonitor`'s init signature but not consulted
-    — manifold fraction uses the per-fit ``LayerSubspace.mean`` (the
-    centroid of the node centroids), not the global layer mean.
-    """
-
-    def __init__(
-        self,
-        layer_means: dict[int, torch.Tensor] | None = None,
-        *,
-        whitener: Any = None,
-    ) -> None:
-        # ``layer_means`` is accepted for parity with TraitMonitor's init
-        # signature (the session wires both monitors the same way) but is
-        # intentionally ignored — the manifold-side math never reads global
-        # layer means; fraction centers on each fit's per-layer mean
-        # (``LayerSubspace.mean``).
-        del layer_means
-        self._probes: dict[str, AttachedManifoldProbe] = {}
-        # Mandatory Mahalanobis whitener (set lazily by the session).  The
-        # per-token fraction + nearest-node distance are the whitened forms
-        # — the read-side analogue of the whitened/Fisher subspace the
-        # manifold was *fitted* in, and the peer of ``TraitMonitor``'s
-        # whitened cosine.  ``_build_whitened`` raises if it doesn't cover
-        # an attached manifold's fit layers (there is no Euclidean readout).
-        self._whitener: Any = whitener
-        # Mirror TraitMonitor's pending-flag pattern so the TUI / webui
-        # streaming surfaces can poll for "is a new per-token reading
-        # available."
-        self._pending_per_token: bool = False
-
-    @property
-    def probe_names(self) -> list[str]:
-        """Attached manifold-probe names in insertion order."""
-        return list(self._probes.keys())
-
-    @property
-    def whitener(self) -> Any:
-        """The wired :class:`LayerWhitener` (required for reads)."""
-        return self._whitener
-
-    def set_whitener(self, whitener: Any) -> None:
-        """Wire (or clear) the Mahalanobis whitener and rebuild probe caches.
-
-        Idempotent on the same instance.  Any change re-derives the
-        per-probe :class:`_LayerWhiten` factors; manifold reads are
-        Mahalanobis-only, so a new whitener that doesn't cover an attached
-        manifold's layers raises :class:`WhitenerError` here.  Mirrors
-        :meth:`TraitMonitor.set_whitener` — the session pushes the
-        lazily-built whitener through here.
-        """
-        if whitener is self._whitener:
-            return
-        self._whitener = whitener
-        for probe in self._probes.values():
-            probe.whitened = _build_whitened_factors(self._whitener, probe)
-
-    def attached_probes(self) -> dict[str, AttachedManifoldProbe]:
-        """Return the live attached-probe map (read-only view)."""
-        return dict(self._probes)
-
-    def attached_layers(self) -> set[int]:
-        """Union of layer indices across every attached manifold.
-
-        Used by ``session._begin_capture`` to widen the per-token
-        hidden-state capture so manifold scoring sees every layer the
-        manifold covers, not just the vector-probe layer union.
-        """
-        out: set[int] = set()
-        for probe in self._probes.values():
-            out.update(probe.manifold.layers.keys())
-        return out
-
-    def add_probe(
-        self,
-        name: str,
-        manifold: "Manifold",
-        *,
-        top_n: int = DEFAULT_NEAREST_TOP_N,
-    ) -> None:
-        """Register a manifold under ``name`` and pre-cache per-layer node values.
-
-        ``top_n`` controls the ``nearest`` list length; default
-        :data:`DEFAULT_NEAREST_TOP_N` (3).  Delegates the attach-time cache
-        build (reduced node activations, EV weights, whitened factors) to
-        the shared :func:`_attach_manifold_probe`; the wired whitener must
-        cover the fit's layers.
-        """
-        self._probes[name] = _attach_manifold_probe(
-            name, manifold, top_n=top_n, whitener=self._whitener,
-        )
-
-    def remove_probe(self, name: str) -> None:
-        self._probes.pop(name, None)
-
-    def reset(self) -> None:
-        """Clear every attached manifold probe (TUI ``/unsteer``-style reset)."""
-        self._probes.clear()
-        self._pending_per_token = False
-
-    def has_pending_per_token(self) -> bool:
-        return self._pending_per_token
-
-    def consume_pending_per_token(self) -> None:
-        self._pending_per_token = False
-
-    # ----------------------------------------------- hot-path scoring ---
-
-    def score_single_token(
-        self,
-        hidden_per_layer: dict[int, torch.Tensor],
-    ) -> dict[str, ManifoldTokenReading]:
-        """Per-token manifold readings — hot path.
-
-        For each attached probe, walks the shared layer set between
-        ``hidden_per_layer`` and the probe's manifold layers, computes
-        the per-layer subspace fraction and per-node distance, then
-        EV-weighted-aggregates across layers.  Returns one
-        :class:`ManifoldTokenReading` per probe; the empty
-        ``hidden_per_layer`` case returns an empty dict.
-
-        Each ``ManifoldTokenReading.fraction`` is in ``[0, 1]``; the
-        nearest list is top-N ``(label, distance)`` ascending by
-        distance.
-        """
-        out: dict[str, ManifoldTokenReading] = {}
-        if not hidden_per_layer or not self._probes:
-            return out
-
-        for name, probe in self._probes.items():
-            manifold = probe.manifold
-            ev = probe.ev_weights
-            shared = [
-                idx for idx in manifold.layers
-                if idx in hidden_per_layer
-            ]
-            if not shared:
-                out[name] = ManifoldTokenReading(fraction=0.0, nearest=[])
-                continue
-            # EV weights restricted to the shared set, re-normalized.
-            total_w = sum(ev.get(idx, 0.0) for idx in shared)
-            if total_w <= _MIN_EV_WEIGHT:
-                w_shared = {idx: 1.0 / len(shared) for idx in shared}
-            else:
-                w_shared = {idx: ev.get(idx, 0.0) / total_w for idx in shared}
-
-            # Per-node EV-weighted distance accumulated ON-DEVICE as a
-            # ``[K]`` tensor (K on the order of tens) and the EV-weighted
-            # fraction as an on-device scalar.  Mirrors ``TraitMonitor``'s
-            # single-sync discipline: zero ``.item()``/``.tolist()`` inside
-            # the per-layer loop, one ``.cpu().tolist()`` + one ``.item()``
-            # per probe after the loop.
-            K = probe.node_values_reduced[shared[0]].shape[0]
-            dist_acc: torch.Tensor | None = None
-            frac_acc: torch.Tensor | None = None
-            for layer_idx in shared:
-                h = hidden_per_layer[layer_idx].to(torch.float32)
-                if h.ndim > 1:
-                    # Hot-path captures are 1-D ``[D]`` slices, but
-                    # defensively flatten to the last dim.
-                    h = h.reshape(-1, h.shape[-1])[-1]
-                w = w_shared[layer_idx]
-                # ``_layer_geometry`` returns the whitened M-orthogonal
-                # fraction + the cdist query/nodes in matching (Mahalanobis)
-                # coords.
-                frac, cdist_query, _invert, cdist_nodes = _layer_geometry(
-                    probe, layer_idx, h,
-                )
-                frac_contrib = w * frac
-                frac_acc = (
-                    frac_contrib if frac_acc is None
-                    else frac_acc + frac_contrib
-                )
-                dists = torch.cdist(cdist_query, cdist_nodes).reshape(-1)  # (K,)
-                contrib = w * dists
-                dist_acc = (
-                    contrib if dist_acc is None else dist_acc + contrib
-                )
-            # Single sync per probe: pull the accumulated distances + the
-            # fraction off-device together, then sort host-side.
-            assert dist_acc is not None and frac_acc is not None  # shared ≠ []
-            dist_list = dist_acc.cpu().tolist()
-            frac_sum = float(frac_acc.item())
-            # Top-N by ascending EV-weighted distance.
-            order = sorted(range(K), key=lambda k: dist_list[k])
-            top = order[: probe.top_n]
-            nearest = [
-                (manifold.node_labels[k], dist_list[k]) for k in top
-            ]
-            out[name] = ManifoldTokenReading(
-                fraction=frac_sum,
-                nearest=nearest,
-            )
-        self._pending_per_token = True
-        return out
-
-    def flat_scalars(
-        self,
-        readings: dict[str, ManifoldTokenReading],
-    ) -> dict[str, float]:
-        """Flatten per-probe readings into namespaced gate-callback scalars.
-
-        Emits ``"<probe>:fraction"`` for the subspace-fraction channel
-        and ``"<probe>@<label>"`` for each node-distance channel; the
-        latter uses ``-distance`` so the convention "larger = closer"
-        holds across both channel types and ``@when:<probe>@<label> > x``
-        reads like a similarity gate.  The output dict merges directly
-        into ``TriggerContext.probe_scores`` alongside vector-probe
-        scalars from :class:`TraitMonitor`.
-        """
-        out: dict[str, float] = {}
-        for name, reading in readings.items():
-            out[f"{name}:fraction"] = reading.fraction
-            for label, dist in reading.nearest:
-                out[f"{name}@{label}"] = -dist
-        return out
-
-    # ----------------------------------------------- slow-path aggregate ---
-
-    def score_aggregate(
-        self,
-        captured_per_layer: dict[int, torch.Tensor],
-        *,
-        agg_index: int | None = None,
-    ) -> dict[str, ManifoldAggregate]:
-        """End-of-generation manifold aggregates over pooled captures.
-
-        ``captured_per_layer[L]`` is the per-layer ``[T, D]`` stack of
-        per-token captures the session collected during generation.  The
-        per-layer pooled activation is the hidden state at the **last
-        non-special token** (``agg_index``, default the final row) — the
-        same single-state discipline extraction and the vector-probe
-        aggregate use, *not* a mean across the trajectory (that lives in
-        :meth:`score_single_token`).  The session passes the
-        ``last_content_index`` walkback so trailing special / structural
-        tokens never pull the reported aggregate.  From that pooled state
-        the aggregator computes (1) per-layer + EV-weighted subspace
-        fraction, (2) the EV-weighted nearest-node vote (same shape as
-        the per-token channel, top-N), and (3) per-layer
-        ``invert_parameterization`` to recover authoring coords +
-        normalized residual.  Coords are EV-weighted-meaned across
-        layers (they share the manifold's domain so the mean is
-        meaningful); residual is reported as
-        ``dist_L / ||h_par_c_L||`` per layer and EV-weighted-meaned.
-        """
-        out: dict[str, ManifoldAggregate] = {}
-        if not captured_per_layer or not self._probes:
-            return out
-
-        # Pool per-layer once — every probe reads the same captures.
-        # Select the last-non-special row (``agg_index``, default the
-        # final token) rather than averaging the trajectory, so the
-        # reported aggregate matches extraction and the vector aggregate.
-        pooled: dict[int, torch.Tensor] = {}
-        for layer_idx, stack in captured_per_layer.items():
-            if stack is None or stack.numel() == 0:
-                continue
-            if stack.ndim == 1:
-                pooled[layer_idx] = stack.to(torch.float32)
-            else:
-                T = stack.shape[0]
-                row = T - 1 if agg_index is None else max(0, min(agg_index, T - 1))
-                pooled[layer_idx] = stack.to(torch.float32)[row]
-
-        for name, probe in self._probes.items():
-            manifold = probe.manifold
-            ev = probe.ev_weights
-            shared = [
-                idx for idx in manifold.layers
-                if idx in pooled
-            ]
-            if not shared:
-                out[name] = ManifoldAggregate(
-                    fraction_mean=0.0,
-                    fraction_per_layer={},
-                    nearest=[],
-                    coords=(),
-                    coords_per_layer={},
-                    residual_mean=0.0,
-                    residual_per_layer={},
-                )
-                continue
-            total_w = sum(ev.get(idx, 0.0) for idx in shared)
-            if total_w <= _MIN_EV_WEIGHT:
-                w_shared = {idx: 1.0 / len(shared) for idx in shared}
-            else:
-                w_shared = {idx: ev.get(idx, 0.0) / total_w for idx in shared}
-
-            K = probe.node_values_reduced[shared[0]].shape[0]
-            dist_acc = [0.0] * K
-            frac_per_layer: dict[int, float] = {}
-            coords_per_layer: dict[int, tuple[float, ...]] = {}
-            residual_per_layer: dict[int, float] = {}
-            frac_mean = 0.0
-            residual_mean = 0.0
-            coords_mean: list[float] | None = None
-            n_dim = manifold.domain.intrinsic_dim
-
-            for layer_idx in shared:
-                sub = manifold.layers[layer_idx]
-                h = pooled[layer_idx].to(torch.float32)
-                if h.ndim > 1:
-                    h = h.reshape(-1, h.shape[-1])[-1]
-                # Shared metric branch: ``frac`` is the (whitened
-                # M-orthogonal or Euclidean) in-subspace share; ``cdist_*``
-                # are matched-space nearest-node coords; ``invert_query`` is
-                # the reduced-coord query for ``invert_parameterization``
-                # (the M-orthogonal projection coords when whitened).
-                frac_t, cdist_query, invert_query, cdist_nodes = (
-                    _layer_geometry(probe, layer_idx, h)
-                )
-                frac = float(frac_t.item())
-                frac_per_layer[layer_idx] = frac
-                w = w_shared[layer_idx]
-                frac_mean += w * frac
-
-                dists = torch.cdist(cdist_query, cdist_nodes).reshape(-1)
-                dist_list = dists.cpu().tolist()
-                for k in range(K):
-                    dist_acc[k] += w * dist_list[k]
-
-                # Inverse projection — coords + residual per layer.
-                pos, res = invert_parameterization(
-                    sub, manifold.domain, invert_query.reshape(1, -1),
-                    manifold.node_coords,
-                )
-                pos_t = pos.reshape(-1)
-                res_val = float(res.reshape(-1)[0].item())
-                # Normalize residual by the in-subspace reduced-coord
-                # magnitude (‖h_par_c‖ in the Euclidean case, ‖M-proj
-                # coords‖ when whitened) so the number is comparable across
-                # layers / generations.
-                par_norm_val = float(
-                    torch.linalg.vector_norm(invert_query).item()
-                )
-                norm_residual = (
-                    0.0
-                    if par_norm_val < _FRACTION_EPSILON
-                    else res_val / par_norm_val
-                )
-                residual_per_layer[layer_idx] = norm_residual
-                residual_mean += w * norm_residual
-                coord_tup = tuple(
-                    float(c) for c in pos_t.tolist()[:n_dim]
-                )
-                coords_per_layer[layer_idx] = coord_tup
-                if coords_mean is None:
-                    coords_mean = [w * c for c in coord_tup]
-                else:
-                    for i, c in enumerate(coord_tup):
-                        if i < len(coords_mean):
-                            coords_mean[i] += w * c
-
-            order = sorted(range(K), key=lambda k: dist_acc[k])
-            top = order[: probe.top_n]
-            nearest = [
-                (manifold.node_labels[k], dist_acc[k]) for k in top
-            ]
-            coords_tuple = (
-                tuple(coords_mean) if coords_mean is not None else ()
-            )
-            out[name] = ManifoldAggregate(
-                fraction_mean=frac_mean,
-                fraction_per_layer=frac_per_layer,
-                nearest=nearest,
-                coords=coords_tuple,
-                coords_per_layer=coords_per_layer,
-                residual_mean=residual_mean,
-                residual_per_layer=residual_per_layer,
-            )
-        return out
