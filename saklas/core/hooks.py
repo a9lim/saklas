@@ -273,6 +273,7 @@ class SteeringHook:
             tuple[
                 Trigger, LayerSubspace, ManifoldDomain,
                 torch.Tensor, torch.Tensor, float, float,
+                "float | torch.Tensor",
             ]
         ] = []
         # Per-token nearest-point foot state, parallel to ``manifold_groups``
@@ -286,7 +287,7 @@ class SteeringHook:
         self._all_groups_always_active = False
         # Fast-path payload for the dominant steering case — exactly one affine
         # group, always-active (``Trigger.BOTH``).  When set,
-        # ``(sub, domain, target, origin, along, onto, mean_proj)`` is the
+        # ``(sub, domain, target, origin, along, onto, mean_proj, kappa)`` is the
         # unpacked single group, so ``hook_fn`` runs one ``subspace_inject`` +
         # ``copy_`` with no per-fire group loop, no trigger re-check, and no
         # foot-seed branch.  ``mean_proj = mean·basisᵀ`` (the ``(R,)`` reduced
@@ -297,6 +298,7 @@ class SteeringHook:
         self._single_affine_fast: tuple[
             LayerSubspace, ManifoldDomain,
             torch.Tensor, torch.Tensor, float, float, torch.Tensor,
+            "float | torch.Tensor",
         ] | None = None
         # Shared mutable context threaded in by SteeringManager.  Read-only
         # from the hook's perspective; the generation loop mutates fields.
@@ -305,7 +307,7 @@ class SteeringHook:
 
     def recompose(
         self,
-        manifold_entries: "list[tuple[LayerSubspace, ManifoldDomain, torch.Tensor, torch.Tensor, float, float, Trigger]] | None",
+        manifold_entries: "list[tuple[LayerSubspace, ManifoldDomain, torch.Tensor, torch.Tensor, float, float, float | torch.Tensor, Trigger]] | None",
         ctx: TriggerContext,
         *,
         device: torch.device,
@@ -313,8 +315,8 @@ class SteeringHook:
         """Pre-compose this layer's subspace / manifold groups.
 
         Each entry is ``(subspace, domain, target_coord, origin_coord, along,
-        onto, trigger)`` — the merged affine subspace (one entry, possibly per
-        active trigger group) and each curved manifold are both groups here.
+        onto, kappa, trigger)`` — the merged affine subspace (one entry, possibly
+        per active trigger group) and each curved manifold are both groups here.
         ``ctx`` is the shared per-generation :class:`TriggerContext` the
         generation loop mutates and the hook reads at fire time.
 
@@ -340,9 +342,10 @@ class SteeringHook:
             tuple[
                 Trigger, LayerSubspace, ManifoldDomain,
                 torch.Tensor, torch.Tensor, float, float,
+                "float | torch.Tensor",
             ]
         ] = []
-        for sub, domain, target, origin, along, onto, trig in (
+        for sub, domain, target, origin, along, onto, kappa, trig in (
             manifold_entries or []
         ):
             if along == 0.0 and onto == 0.0:
@@ -355,6 +358,8 @@ class SteeringHook:
                 origin.to(device=device, dtype=torch.float32),
                 float(along),
                 float(onto),
+                kappa.to(device=device, dtype=torch.float32)
+                if isinstance(kappa, torch.Tensor) else float(kappa),
             ))
         self.manifold_groups = manifold_groups
         self._all_groups_always_active = all(
@@ -370,13 +375,13 @@ class SteeringHook:
             and self._all_groups_always_active
             and manifold_groups[0][1].is_affine
         ):
-            _trig, _sub, _dom, _tgt, _org, _alo, _ont = manifold_groups[0]
+            _trig, _sub, _dom, _tgt, _org, _alo, _ont, _kap = manifold_groups[0]
             # Precompute mean·basisᵀ ((R,) fp32 on device — ``_sub`` was cast in
             # the group append above) so the affine shortcut never materializes
             # the full-width ``centered`` temp per fire.
             _mp = _sub.mean @ _sub.basis.T
             self._single_affine_fast = (
-                _sub, _dom, _tgt, _org, _alo, _ont, _mp,
+                _sub, _dom, _tgt, _org, _alo, _ont, _mp, _kap,
             )
         # New group set ⇒ cold-start every foot-follower (seed at origin).
         self._manifold_feet = [None] * len(manifold_groups)
@@ -390,10 +395,10 @@ class SteeringHook:
         fast = self._single_affine_fast
         if fast is not None:
             hidden = output if isinstance(output, torch.Tensor) else output[0]
-            sub, domain, target, origin, along, onto, mean_proj = fast
+            sub, domain, target, origin, along, onto, mean_proj, kappa = fast
             h_new, _foot = subspace_inject(
                 hidden, sub, domain, target, origin, along, onto,
-                gn_steps=1, mean_proj=mean_proj,
+                gn_steps=1, mean_proj=mean_proj, kappa=kappa,
             )
             hidden.copy_(h_new)
             return output
@@ -443,14 +448,14 @@ class SteeringHook:
         lead = hidden.shape[:-1]
         all_groups_always_active = self._all_groups_always_active
         for i, (
-            trig, sub, domain, target, origin, along, onto,
+            trig, sub, domain, target, origin, along, onto, kappa,
         ) in enumerate(self.manifold_groups):
             if not all_groups_always_active and not _trigger_active(trig, ctx):
                 continue
             if sub.is_affine:
                 h_new, _foot = subspace_inject(
                     hidden, sub, domain, target, origin,
-                    along, onto, gn_steps=1,
+                    along, onto, gn_steps=1, kappa=kappa,
                 )
                 hidden.copy_(h_new)
                 continue
@@ -471,7 +476,7 @@ class SteeringHook:
                 gn_steps = _MANIFOLD_COLD_GN_STEPS
             h_new, foot = subspace_inject(
                 hidden, sub, domain, target, foot_seed,
-                along, onto, gn_steps=gn_steps,
+                along, onto, gn_steps=gn_steps, origin=origin,
             )
             hidden.copy_(h_new)
             # Carry the last position's foot forward (decode keeps its single
@@ -521,6 +526,26 @@ class SteeringHook:
 # strength variance persists — tune α down per target.
 _MANIFOLD_GAIN = 1.0
 
+# --- translate gain (prototype) ----------------------------------------------
+# The injection *translates* the in-subspace foot by a fixed offset toward the
+# target rather than collapsing every token's foot onto it (see
+# ``subspace_inject`` / ``ManifoldDomain.translate_foot``): the fixed offset
+# preserves the per-token in-subspace spread, which the kernel ablation showed
+# keeps strong steer coherent (collapse → looping degeneration).
+#
+# Translate is unbounded where collapse saturated (a fixed offset compounds
+# across layers rather than landing *on* the target), so the slide gain runs ~an
+# order of magnitude below the old collapse gain.  A typical layer gets
+# ``eff_along ≈ _MANIFOLD_ALONG_GAIN``.  Calibrated on the gemma-4-12b caveman
+# gain sweep: the coherent window is ~0.06–0.10 (probe ``frac`` ≈ 0.20–0.26),
+# with the loop degeneration setting in past ~0.14.  ``0.125`` puts the
+# recommended ``≈0.5 <concept>`` at the coherent sweet spot and lets
+# ``1.0 <concept>`` push into a *somewhat over-steered* strong expression
+# (headroom to dial down per target — a harder persona peaks earlier).
+# ``_MANIFOLD_GAIN`` stays the gain for ``onto`` only (the off-surface collapse
+# share-weight).
+_MANIFOLD_ALONG_GAIN = 0.125
+
 # Max |cosine| between two *curved* manifold subspaces sharing a layer before
 # they are deemed overlapping (``OverlappingManifoldError``).  Curved manifolds
 # that share a layer must be (near-)orthogonal — each overwrites its own
@@ -533,8 +558,9 @@ _CURVED_ORTHO_TOL = 1e-3
 def _orthogonalize_affine_against(
     sub: LayerSubspace,
     target: torch.Tensor,
+    kappa: torch.Tensor,
     curved_basis: torch.Tensor,
-) -> "tuple[LayerSubspace, torch.Tensor] | None":
+) -> "tuple[LayerSubspace, torch.Tensor, torch.Tensor] | None":
     """Project a merged affine subspace out of the curved manifolds' span.
 
     Strips the curved-span component from the affine basis rows *and* the push
@@ -544,9 +570,11 @@ def _orthogonalize_affine_against(
     handles the complement.  ``sub`` is the synthesized affine ``LayerSubspace``
     (orthonormal ``basis``), ``target`` its ``(R,)`` push coord, ``curved_basis``
     the stacked ``(Rc, D)`` orthonormal rows of every curved manifold at this
-    layer.  Returns the re-orthonormalized ``(subspace', target')`` or ``None``
-    when the affine span lies entirely inside the curved span (nothing left to
-    steer there).
+    layer.  Carries the per-axis collapse mask ``kappa`` through the
+    re-orthonormalization (each new axis inherits its squared projection onto the
+    old ablate span).  Returns the re-orthonormalized ``(subspace', target',
+    kappa')`` or ``None`` when the affine span lies entirely inside the curved
+    span (nothing left to steer there).
     """
     basis = sub.basis.to(torch.float32)              # (R, D)
     cb = curved_basis.to(torch.float32)              # (Rc, D)
@@ -557,7 +585,12 @@ def _orthogonalize_affine_against(
         return None
     delta_perp = delta - (delta @ cb.T) @ cb         # drop the curved-span part
     new_target = new_basis @ delta_perp              # (R',)
-    return LayerSubspace.affine(sub.mean, new_basis), new_target
+    # Carry the per-axis collapse mask κ through the re-orthonormalization: each
+    # new axis inherits ``Σ_i κ_i (new_axis · old_basis_i)²`` — its squared
+    # projection onto the old ablate span.  ``M = new_basis @ basisᵀ`` (R', R).
+    M = new_basis @ basis.T                          # (R', R)
+    new_kappa = (M * M) @ kappa.to(torch.float32)    # (R',)
+    return LayerSubspace.affine(sub.mean, new_basis), new_target, new_kappa
 
 # Gauss-Newton steps taken on a *cold* foot (seed at origin ``O``).  The
 # warm path takes one step per token; the cold fire — the prefill window,
@@ -804,7 +837,8 @@ class SteeringManager:
             int,
             list[tuple[
                 LayerSubspace, ManifoldDomain,
-                torch.Tensor, torch.Tensor, float, float, Trigger,
+                torch.Tensor, torch.Tensor, float, float,
+                "float | torch.Tensor", Trigger,
             ]],
         ] = {}
         curved_owner: dict[int, str] = {}
@@ -822,7 +856,8 @@ class SteeringManager:
             # un-clamped — a high-share layer is meant to overshoot past the
             # target (``norm_cap`` bounds it); ``onto`` clamps per layer.
             eff_along = {
-                L: along * shares[L] * _MANIFOLD_GAIN for L in manifold.layers
+                L: along * shares[L] * _MANIFOLD_ALONG_GAIN
+                for L in manifold.layers
             }
             eff_onto = {
                 L: max(0.0, min(1.0, onto * shares[L] * _MANIFOLD_GAIN))
@@ -870,8 +905,8 @@ class SteeringManager:
                     )
                 manifold_by_layer.setdefault(layer_idx, []).append((
                     sub, domain, target_coord, origin_coord,
-                    eff_along[layer_idx], eff_onto[layer_idx], trigger,
-                ))
+                    eff_along[layer_idx], eff_onto[layer_idx], 0.0, trigger,
+                ))  # κ = 0: curved manifolds are push-only (pure translate)
 
         # Dispatch-synthesized merged affine subspaces (4.0 unified backend).
         # Each ``synth`` is already neutral-anchored with its ``along`` target
@@ -902,29 +937,38 @@ class SteeringManager:
             for L in layer_set:
                 sub_L = synth.layers[L]
                 sub_target = synth.target_coord[L].to(torch.float32)
+                # Per-axis collapse mask κ (0 push / translate, 1 ablate /
+                # collapse) — default all-translate when a synth predates it.
+                sub_kappa = synth.kappa.get(L)
+                sub_kappa = (
+                    sub_kappa.to(torch.float32) if sub_kappa is not None
+                    else torch.zeros(sub_L.rank, dtype=torch.float32)
+                )
                 # Orthogonalize the affine subspace against any curved manifold
-                # sharing this layer (curved wins the shared directions); drop
-                # the layer if the affine span lies entirely inside the curved
-                # span (nothing left for the merged subspace to steer there).
+                # sharing this layer (curved wins the shared directions); κ rides
+                # through the re-orthonormalization.  Drop the layer if the affine
+                # span lies entirely inside the curved span (nothing left here).
                 curved = curved_basis_by_layer.get(L)
                 if curved is not None:
-                    res = _orthogonalize_affine_against(sub_L, sub_target, curved)
+                    res = _orthogonalize_affine_against(
+                        sub_L, sub_target, sub_kappa, curved,
+                    )
                     if res is None:
                         continue
-                    sub_L, sub_target = res
+                    sub_L, sub_target, sub_kappa = res
                 r_l = sub_L.rank
                 sub_domain = CustomDomain(r_l)
                 # Affine origin is span-coord 0 (neutral → coord 0, §5); the
                 # foot seed / cold-start is unused on the affine shortcut.
                 sub_origin = torch.zeros(r_l, dtype=torch.float32)
                 # No lever / ``N`` and no ``[0, 1]`` clamp (Step 8): the
-                # de-rogued real-coord target carries the magnitude; a
-                # high-share layer overshoots past the pole (``norm_cap`` bounds
+                # de-rogued real-coord target carries the magnitude; the per-axis
+                # share-weighted ``eff_along`` is unclamped (``norm_cap`` bounds
                 # it in ``subspace_inject``).
-                eff_along_L = shares[L] * _MANIFOLD_GAIN
+                eff_along_L = shares[L] * _MANIFOLD_ALONG_GAIN
                 manifold_by_layer.setdefault(L, []).append((
                     sub_L, sub_domain, sub_target, sub_origin,
-                    eff_along_L, 0.0, sub_trigger,
+                    eff_along_L, 0.0, sub_kappa, sub_trigger,
                 ))
 
         active_layers = set(manifold_by_layer)

@@ -177,6 +177,43 @@ class ManifoldDomain(ABC):
         """
         return self.clamp_position(a + frac * (b - a))
 
+    def _tangent(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        """Tangent at ``a`` pointing toward ``b`` in authoring coords.
+
+        Default is the linear ``b - a`` (correct for any flat, non-wrapping
+        domain — :class:`CustomDomain` and the open-axis part of a
+        :class:`BoxDomain`).  :class:`BoxDomain` overrides it for periodic axes
+        (wrap-aware minimal arc).  Consumed by :meth:`translate_foot`.
+        """
+        return b - a
+
+    def translate_foot(
+        self,
+        p: torch.Tensor,
+        origin: torch.Tensor,
+        target: torch.Tensor,
+        frac: float | torch.Tensor,
+    ) -> torch.Tensor:
+        """Translate the foot ``p`` ``(.., n)`` by the fixed offset toward target.
+
+        The ``along`` step.  Shift *every* token's foot by the same displacement
+        — the neutral→target tangent ``target − origin``, parallel-transported to
+        ``p``, scaled by ``frac`` — rather than sliding each foot onto the
+        absolute ``target``.  The fixed offset **preserves the per-token
+        in-subspace spread**, which the kernel ablation showed is what keeps
+        strong steer coherent (collapsing onto one target erases that spread and
+        degenerates into looping).
+
+        ``p_new = clamp(p + frac · transport_{origin→p}(target − origin))``.
+
+        Flat default — transport is the identity, so the offset is the plain
+        ``_tangent(origin, target)``.  :class:`SphereDomain` overrides for
+        curvature; :class:`BoxDomain` inherits this but supplies a wrap-aware
+        ``_tangent``.  For the affine frame (``origin = 0``) this is
+        ``p + frac · target``.
+        """
+        return self.clamp_position(p + frac * self._tangent(origin, target))
+
 
 @dataclass(frozen=True)
 class BoxAxis:
@@ -281,6 +318,23 @@ class BoxDomain(ManifoldDomain):
                     torch.remainder(delta[..., i] + half, ax.period) - half
                 )
         return self.clamp_position(a + frac * delta)
+
+    def _tangent(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        """Linear delta, but periodic axes take the wrap-aware minimal arc.
+
+        The translate connection on a torus/cylinder is flat (a fixed
+        authoring-coord offset is parallel along every axis), so
+        :meth:`ManifoldDomain.translate_foot` is inherited unchanged — it only
+        needs this wrap-aware tangent for the periodic axes.
+        """
+        delta = b - a
+        for i, ax in enumerate(self._axes):
+            if ax.periodic:
+                half = ax.period / 2.0
+                delta[..., i] = (
+                    torch.remainder(delta[..., i] + half, ax.period) - half
+                )
+        return delta
 
     def to_spec(self) -> dict[str, Any]:
         return {
@@ -427,6 +481,52 @@ class SphereDomain(ManifoldDomain):
         e = torch.where(small, e_lin, e)
         e = e / torch.linalg.vector_norm(e, dim=-1, keepdim=True).clamp_min(1e-9)
         return self.clamp_position(self._unembed(e))
+
+    @staticmethod
+    def _sphere_log(ea: torch.Tensor, eb: torch.Tensor) -> torch.Tensor:
+        """Log map at unit vector ``ea`` toward ``eb`` — tangent in ``R^(n+1)``."""
+        dot = (ea * eb).sum(dim=-1, keepdim=True).clamp(-1.0, 1.0)
+        omega = torch.arccos(dot)
+        u = eb - dot * ea
+        un = torch.linalg.vector_norm(u, dim=-1, keepdim=True)
+        return torch.where(
+            un < 1e-9, torch.zeros_like(u), omega * u / un.clamp_min(1e-9),
+        )
+
+    @staticmethod
+    def _sphere_exp(ea: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """Exp map at ``ea`` of tangent ``v`` — a unit vector in ``R^(n+1)``."""
+        theta = torch.linalg.vector_norm(v, dim=-1, keepdim=True)
+        e = torch.cos(theta) * ea + torch.sin(theta) * v / theta.clamp_min(1e-9)
+        return torch.where(theta < 1e-9, ea.expand_as(e), e)
+
+    @staticmethod
+    def _sphere_transport(
+        v: torch.Tensor, ea: torch.Tensor, eb: torch.Tensor,
+    ) -> torch.Tensor:
+        """Parallel-transport tangent ``v`` (at ``ea``) along the geodesic to ``eb``."""
+        c = (ea * eb).sum(dim=-1, keepdim=True)
+        coeff = (v * eb).sum(dim=-1, keepdim=True) / (1.0 + c).clamp_min(1e-9)
+        return v - coeff * (ea + eb)
+
+    def translate_foot(
+        self,
+        p: torch.Tensor,
+        origin: torch.Tensor,
+        target: torch.Tensor,
+        frac: float | torch.Tensor,
+    ) -> torch.Tensor:
+        """Curvature-correct translate in the unit-vector embedding.
+
+        Parallel-transports the neutral→target tangent ``log_origin(target)`` to
+        ``p`` (the flat ``target − origin`` is *not* parallel on a curved sphere)
+        and exponentiates the ``frac``-scaled offset.  See
+        :meth:`ManifoldDomain.translate_foot`.
+        """
+        ep, eo, et = self.embed(p), self.embed(origin), self.embed(target)
+        offset = self._sphere_transport(self._sphere_log(eo, et), eo, ep)
+        e_new = self._sphere_exp(ep, frac * offset)
+        return self.clamp_position(self._unembed(e_new))
 
     def to_spec(self) -> dict[str, Any]:
         return {"type": "sphere", "dim": self._dim}
@@ -1465,10 +1565,13 @@ class SynthesizedSubspace:
     collide at shared layers, ``OverlappingManifoldError``).
 
     Per layer the subspace spans the union of every active term's directions
-    (push + ablation); the ``target_coord`` slides the foot toward each *push*
-    term's (signed, coeff-scaled) target on its own axes and toward the origin
-    (``0``) on each *ablation* axis, so one geodesic ``along`` slide both pushes
-    the concept subspaces and removes the ablated ones.  ``share`` is the
+    (push + ablation).  The ``along`` step **translates** the foot by the
+    ``target_coord`` offset on each *push* axis (preserving the per-token
+    spread → coherent strong steer) and **collapses** the foot to ``0`` on each
+    *ablation* axis (removing the ablated component).  ``kappa`` is the per-axis
+    blend that selects which is which (``0`` push / translate, ``1`` ablate /
+    collapse): the kernel applies ``target − κ⊙q``, so push axes ignore ``q``
+    (fixed offset) while ablation axes drive ``q`` toward ``0``.  ``share`` is the
     un-normalized per-layer budget weight — the world push-displacement
     magnitude ``‖Δ_L‖`` (a pure-ablation layer weights by the summed ablation
     magnitude instead); the apply path normalizes it across layers.
@@ -1480,6 +1583,9 @@ class SynthesizedSubspace:
     layers: dict[int, "LayerSubspace"]        # affine: mean = neutral_L, basis = ortho span
     target_coord: dict[int, torch.Tensor]     # (R_L,) the along target (poles / 0)
     share: dict[int, float]                   # ‖Δ_L‖, un-normalized budget weight
+    kappa: dict[int, torch.Tensor] = field(   # (R_L,) per-axis: 0 push (translate), 1 ablate (collapse)
+        default_factory=dict
+    )
 
 
 def synthesize_subspace(
@@ -1544,6 +1650,7 @@ def synthesize_subspace(
     layers: dict[int, "LayerSubspace"] = {}
     target_coord: dict[int, torch.Tensor] = {}
     share: dict[int, float] = {}
+    kappa: dict[int, torch.Tensor] = {}
 
     for L in sorted(all_layers):
         if L not in neutral_means:
@@ -1605,11 +1712,24 @@ def synthesize_subspace(
             share_L = float(torch.linalg.vector_norm(ablate_sum))
 
         target_coord[L] = basis @ delta          # (R,) ablation axes ≈ 0
+        # Per-axis collapse weight κ: 0 on the push span (translate — preserve
+        # the per-token in-subspace spread), 1 on the ablate-only complement
+        # (collapse the component to 0).  Derived by projecting each merged-basis
+        # axis onto the push span (``κ = 1 − ‖proj‖²``), so it is robust to the
+        # orthonormalization order.  Pure push → all 0; pure ablation → all 1.
+        if push_rows and ablate_rows:
+            B_push, _ = _ortho_basis(push_rows)             # (k_push, D)
+            proj = basis @ B_push.T                          # (R, k_push)
+            kappa[L] = (1.0 - (proj * proj).sum(-1)).clamp(0.0, 1.0)  # (R,)
+        elif ablate_rows:
+            kappa[L] = basis.new_ones(basis.shape[0])
+        else:
+            kappa[L] = basis.new_zeros(basis.shape[0])
         layers[L] = LayerSubspace.affine(mean=mean, basis=basis)
         share[L] = share_L
 
     return SynthesizedSubspace(
-        layers=layers, target_coord=target_coord, share=share,
+        layers=layers, target_coord=target_coord, share=share, kappa=kappa,
     )
 
 
@@ -1657,6 +1777,8 @@ def subspace_inject(
     norm_cap: float = 3.0,
     damping: float = DEFAULT_INVERSION_DAMPING,
     mean_proj: "torch.Tensor | None" = None,
+    origin: "torch.Tensor | None" = None,
+    kappa: "float | torch.Tensor" = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """The unified two-operation manifold injection (replaces angular/additive).
 
@@ -1664,13 +1786,23 @@ def subspace_inject(
     subspace and its RBF surface ``M``, then applies two near-orthogonal
     operations, each a coefficient in ``[0, 1]``:
 
-    - **along** (``a``): slide the projected foot from its current position
-      ``p*`` toward ``target_coord`` *geodesically in authoring-coord space*
-      (``domain.geodesic``), and transport the off-manifold residual ``H_n`` to
-      stay normal at the new foot (project onto the new tangent's normal space,
-      renorm to the preserved ``‖H_n‖``).  Tangential / directional; leaves
-      ``H_o`` untouched.  Replaces the old additive chord — by sliding *on the
+    - **along** (``a``): **translate** the projected foot ``p*`` by the fixed
+      neutral→target offset (scaled by ``a``) via
+      :meth:`ManifoldDomain.translate_foot` — every token's foot shifts by the
+      same displacement, which preserves the per-token in-subspace spread and
+      keeps strong steer coherent (collapsing each foot onto the absolute target
+      instead erases that spread and degenerates into looping).  Then transport
+      the off-manifold residual ``H_n`` to stay normal at the new foot (project
+      onto the new tangent's normal space, renorm to the preserved ``‖H_n‖``).
+      Tangential / directional; leaves ``H_o`` untouched.  By moving *on the
       surface* it never cuts through the off-manifold low-density region.
+
+    ``origin`` is the neutral foot — the translate reference; it is coord 0 for
+    an affine fit, so the affine path ignores it.  ``kappa`` is the per-axis
+    collapse blend on the affine path: scalar ``0.0`` ⇒ pure translate, or a
+    ``(R,)`` mask (from :func:`synthesize_subspace`) whose ``κ=1`` ablation axes
+    collapse toward 0 while ``κ=0`` push axes translate.  (Curved manifolds are
+    push-only, so they take the scalar-0 / pure-translate :meth:`translate_foot`.)
     - **onto** (``o``): scale ``H_n`` by ``(1 − o)`` — collapse onto the surface
       within the subspace.  Vacuous when the surface fills its subspace
       (``H_n ≈ 0``).
@@ -1717,17 +1849,22 @@ def subspace_inject(
         # ``(R,)`` ``mean_proj = mean·basisᵀ`` is a tiny reduced-space constant
         # (one dot product at R=1).  Hot callers (the single-affine fast hook)
         # precompute it once at ``recompose`` and thread it in; everyone else
-        # gets the inline ``mean @ basis.T``.  ALONG slides ``q`` toward
-        # ``target`` geodesically (CustomDomain ⇒ linear); the off-subspace
-        # residual ``H_o`` is kept verbatim (``h_new = h + Δ·basis`` is a fresh
-        # tensor, never an in-place mutation of ``h``).
+        # gets the inline ``mean @ basis.T``.  ALONG translates ``q`` by the
+        # fixed offset ``along·target``; the off-subspace residual ``H_o`` is
+        # kept verbatim (``h_new = h + Δ·basis`` is a fresh tensor, never an
+        # in-place mutation of ``h``).
         mp = mean_proj if mean_proj is not None else (mean @ basis.T)  # (R,)
         q = h_f32 @ basis.T - mp                        # (.., R)
-        p_new = (
-            q + along * (target - q)
-            if isinstance(domain, CustomDomain)
-            else domain.geodesic(q, target, along)
-        )                                               # (.., n==R)
+        # Per-axis κ-blend of the foot toward ``target`` (``origin`` is span-coord
+        # 0 in the ν-anchored affine frame; an affine fit is always on the flat
+        # ``CustomDomain`` — identity clamp — so this analytic is exact):
+        #   push axis   (κ=0): ``q + along·target``        — translate by the
+        #     fixed offset, preserving the per-token in-subspace spread (coherent);
+        #   ablate axis (κ=1): ``q + along·(0 − q)``       — collapse the
+        #     component toward 0 (remove the ablated direction).
+        # ``kappa`` is a scalar (``0.0`` ⇒ pure translate) or a per-axis ``(R,)``
+        # mask from ``synthesize_subspace`` (0 push / 1 ablate).
+        p_new = q + along * (target - kappa * q)        # (.., n==R)
         h_new = h_f32 + ((p_new - q) @ basis)           # keep H_o verbatim
         h_new = _soft_norm_cap(h_new, h_f32, norm_cap)
         # Return fp32; the caller's ``hidden.copy_(h_new)`` downcasts to the
@@ -1756,8 +1893,13 @@ def subspace_inject(
     Hn_red = q - foot_red                              # (.., R) off-manifold-in-subspace (reduced)
     Hn_norm = torch.linalg.vector_norm(Hn_red, dim=-1, keepdim=True)      # (.., 1)
 
-    # --- ALONG: geodesic slide of the foot, with H_n transport ---
-    p_new = domain.geodesic(p, target, along)          # (.., n)
+    # --- ALONG: translate the foot, with H_n transport ---
+    # Translate p* by the parallel-transported neutral→target offset (scaled by
+    # ``along``), preserving the per-token foot spread rather than collapsing
+    # every foot onto the absolute target.  ``origin`` is this layer's neutral
+    # foot; falls back to coord 0.
+    org = origin if origin is not None else torch.zeros_like(target)
+    p_new = domain.translate_foot(p, org, target, along)  # (.., n)
     emb_new = (domain.embed(p_new) - offset) / scale   # (.., m)
     foot_new_red = eval_rbf(np_, rw, pc, emb_new)      # (.., R)
 

@@ -33,12 +33,13 @@ _AffineEntry = tuple[
     torch.Tensor,
     float,
     float,
+    torch.Tensor,
     Trigger,
 ]
 
 
 def _affine_group(layer: int, trigger: Trigger) -> _AffineEntry:
-    """One ``(sub, domain, target, origin, along, onto, trigger)`` entry.
+    """One ``(sub, domain, target, origin, along, onto, kappa, trigger)`` entry.
 
     A rank-1 affine subspace from a single push term — the merged-subspace shape
     ``apply_to_model`` hands ``recompose``.
@@ -52,7 +53,7 @@ def _affine_group(layer: int, trigger: Trigger) -> _AffineEntry:
     sub = synth.layers[layer]
     return (
         sub, CustomDomain(sub.rank), synth.target_coord[layer],
-        torch.zeros(sub.rank), 1.0, 0.0, trigger,
+        torch.zeros(sub.rank), 1.0, 0.0, synth.kappa[layer], trigger,
     )
 
 
@@ -74,11 +75,11 @@ def test_recompose_stamps_group_and_cold_feet():
 def test_zero_coeff_group_dropped():
     hook = SteeringHook()
     ctx = TriggerContext()
-    sub, domain, target, origin, _along, _onto, trig = _affine_group(
+    sub, domain, target, origin, _along, _onto, _kappa, trig = _affine_group(
         0, Trigger.BOTH,
     )
     hook.recompose(
-        [(sub, domain, target, origin, 0.0, 0.0, trig)],
+        [(sub, domain, target, origin, 0.0, 0.0, 0.0, trig)],
         ctx, device=torch.device("cpu"),
     )
     assert hook.manifold_groups == []

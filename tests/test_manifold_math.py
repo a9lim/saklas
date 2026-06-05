@@ -794,22 +794,26 @@ def test_affine_inject_identity_at_zero():
     assert torch.allclose(foot, (h - sub.mean) @ sub.basis.T, atol=1e-5)
 
 
-def test_affine_inject_along_lands_coord_at_target():
+def test_affine_inject_along_translates_coord_by_target():
+    # Translate semantics (not collapse): ``along`` shifts the foot BY the fixed
+    # offset ``along·target`` (origin = 0 in the ν-anchored affine frame), so the
+    # per-token foot spread is preserved — it does NOT slide every foot onto the
+    # absolute target (that collapse erased the spread and degenerated to looping).
     sub, domain = _folded_vector()
     h = sub.eval_at(torch.tensor([-0.4])) + 0.3 * torch.randn(16)
     target = torch.tensor([1.5])
+    q_in = (h - sub.mean) @ sub.basis.T             # input reduced coord
     out, _ = subspace_inject(
         h, sub, domain, target, torch.tensor([-0.4]), 1.0, 0.0,
     )
     q_out = (out - sub.mean) @ sub.basis.T          # reduced coord of the output
-    assert torch.allclose(q_out, target, atol=1e-4)
-    # half-slide lands at the linear midpoint between q and target
-    q_in = (h - sub.mean) @ sub.basis.T
+    assert torch.allclose(q_out, q_in + target, atol=1e-4)
+    # half-slide translates by half the offset
     out_h, _ = subspace_inject(
         h, sub, domain, target, torch.tensor([-0.4]), 0.5, 0.0,
     )
     q_half = (out_h - sub.mean) @ sub.basis.T
-    assert torch.allclose(q_half, 0.5 * (q_in + target), atol=1e-4)
+    assert torch.allclose(q_half, q_in + 0.5 * target, atol=1e-4)
 
 
 def test_affine_inject_onto_is_vacuous():

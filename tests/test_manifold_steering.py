@@ -17,6 +17,7 @@ import torch
 from torch import nn
 
 from saklas.core.hooks import (
+    _MANIFOLD_ALONG_GAIN,
     _MANIFOLD_GAIN,
     _manifold_layer_shares,
     SteeringHook,
@@ -143,7 +144,7 @@ def _recompose_manifold(
     hook.recompose(
         [(
             sub, domain, target_coord, origin_coord,
-            along, onto, Trigger.BOTH,
+            along, onto, 0.0, Trigger.BOTH,
         )],
         ctx,
         device=torch.device("cpu"),
@@ -152,7 +153,7 @@ def _recompose_manifold(
 
 def _coeffs(hook: SteeringHook, gi: int = 0) -> tuple[float, float]:
     """The per-layer (along, onto) on group ``gi``."""
-    _trig, _sub, _domain, _target, _origin, along, onto = (
+    _trig, _sub, _domain, _target, _origin, along, onto, _kappa = (
         hook.manifold_groups[gi]
     )
     return along, onto
@@ -270,7 +271,7 @@ def test_hook_trigger_gating_skips_inactive():
     # GENERATED_ONLY trigger, but the context is in prefill (prompt) -> inactive.
     hook.recompose(
         [(
-            sub, domain, target, origin, 0.6, 0.0, Trigger.GENERATED_ONLY,
+            sub, domain, target, origin, 0.6, 0.0, 0.0, Trigger.GENERATED_ONLY,
         )],
         ctx,
         device=torch.device("cpu"),
@@ -329,8 +330,8 @@ def test_manager_user_coeffs_clamped_to_unit():
     layers = _model_layers(1)
     mgr.apply_to_model(layers, torch.device("cpu"), torch.float32)
     along, onto = _coeffs(mgr.hooks[0])
-    assert along == pytest.approx(_MANIFOLD_GAIN, abs=1e-6)
-    assert onto == pytest.approx(min(1.0, _MANIFOLD_GAIN), abs=1e-6)
+    assert along == pytest.approx(_MANIFOLD_ALONG_GAIN, abs=1e-6)  # along: translate gain
+    assert onto == pytest.approx(min(1.0, _MANIFOLD_GAIN), abs=1e-6)  # onto: collapse gain
 
 
 def test_manager_along_share_weighting_mean_one():
@@ -350,7 +351,7 @@ def test_manager_along_share_weighting_mean_one():
             _model_layers(n_layers), torch.device("cpu"), torch.float32,
         )
         total = sum(_coeffs(hook)[0] for hook in mgr.hooks.values())
-        expected = user_along * _MANIFOLD_GAIN * n_layers
+        expected = user_along * _MANIFOLD_ALONG_GAIN * n_layers
         assert total == pytest.approx(expected, abs=1e-4), (
             f"mean-1 share-weighted along at n={n_layers}: {total} ≠ {expected}"
         )
@@ -369,8 +370,8 @@ def test_manager_along_unclamped_overshoots():
     budgets = [_coeffs(hook)[0] for hook in mgr.hooks.values()]
     assert budgets, "expected manifold groups to be attached"
     # mean-1 ⇒ Σ = along·base·n_layers; the spread pushes the top layer past base.
-    assert sum(budgets) == pytest.approx(1.0 * _MANIFOLD_GAIN * n_layers, abs=1e-4)
-    assert max(budgets) > _MANIFOLD_GAIN
+    assert sum(budgets) == pytest.approx(1.0 * _MANIFOLD_ALONG_GAIN * n_layers, abs=1e-4)
+    assert max(budgets) > _MANIFOLD_ALONG_GAIN
 
 
 def test_manager_onto_clamped_per_layer():
@@ -430,7 +431,7 @@ def test_manager_share_weighting_weights_by_centroid_spread():
     assert along_1 > along_0
     assert along_1 / along_0 == pytest.approx(2.0, rel=0.05)
     assert (along_0 + along_1) == pytest.approx(
-        user_along * _MANIFOLD_GAIN * 2, abs=1e-4
+        user_along * _MANIFOLD_ALONG_GAIN * 2, abs=1e-4
     )
 
 

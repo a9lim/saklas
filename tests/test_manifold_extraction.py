@@ -565,23 +565,21 @@ def test_discover_round_trip_through_load_manifold(tmp_path: Path) -> None:
         assert m2.layers[L].basis.shape == m1.layers[L].basis.shape
 
 
-def test_discover_subspace_inject_moves_toward_target(tmp_path: Path) -> None:
-    """End-to-end behavior check: ``subspace_inject`` with along=onto=1 snaps
-    the in-subspace component onto the manifold target.
+def test_discover_subspace_inject_translates_by_target(tmp_path: Path) -> None:
+    """End-to-end behavior check: ``subspace_inject`` *translates* the in-subspace
+    component by the fixed offset ``along·target``.
 
-    This is the two-op analogue of the old ``subspace_replace`` α=1 snap:
-    ``along=1`` slides the projected foot all the way onto the target coord,
-    ``onto=1`` collapses the off-manifold in-subspace residual ``H_n``, so the
-    output's reduced coords land on ``target_coords``.  We assert
-    direction-reducing (the in-subspace distance to target at least halves),
-    robust to the soft norm cap firing on a synthetic fit.
+    A direct push call leaves ``kappa`` at its scalar-0 default (pure translate),
+    so ``along=1`` shifts the projected foot by the full ``target`` offset
+    (preserving the per-token spread) rather than snapping it onto ``target``.
+    The fit is flat (``fit_mode=pca``) so ``H_n ≡ 0`` and ``onto`` is vacuous; the
+    reduced coords land at exactly ``h_in + target`` (the soft norm cap does not
+    fire — the offset is small against the far-out hidden).
     """
     from saklas.core.manifold import subspace_inject
     # Seed the global RNG before the fit: the stub encoder perturbs each
     # layer's centroid with a generator-less ``torch.randn``, so without
-    # this the fitted subspace jitters with test order and the borderline
-    # direction-reducing assertion below goes flaky (matches the seeding
-    # the other discover-fit tests in this file already do).
+    # this the fitted subspace jitters with test order.
     torch.manual_seed(0)
     folder = _discover_folder(
         tmp_path, fit_mode="pca", hyperparams={"max_dim": 4},
@@ -592,12 +590,10 @@ def test_discover_subspace_inject_moves_toward_target(tmp_path: Path) -> None:
     sub = manifold.layers[layer]
     domain = manifold.domain
     n = domain.intrinsic_dim
-    position = manifold.node_coords[0].to(torch.float32)  # a coord on M
-    target = manifold.manifold_point(layer, position)
-    target_coords = (target - sub.mean) @ sub.basis.T
+    position = manifold.node_coords[0].to(torch.float32)  # a coord on M (the target)
 
-    # Hidden states far from any natural manifold point so the snap has real
-    # distance to close.
+    # Hidden states far from any natural manifold point so the translate is
+    # well-resolved against the soft norm cap.
     g = torch.Generator().manual_seed(0)
     hidden = 3.0 * torch.randn(1, 3, _DIM, generator=g)
     seed = position.reshape((1,) * 2 + (n,)).expand(1, 3, n)
@@ -609,13 +605,11 @@ def test_discover_subspace_inject_moves_toward_target(tmp_path: Path) -> None:
     for pos in range(hidden.shape[1]):
         h_in = (hidden[0, pos] - sub.mean) @ sub.basis.T
         h_out = (out[0, pos] - sub.mean) @ sub.basis.T
-        dist_before = torch.linalg.norm(h_in - target_coords).item()
-        dist_after = torch.linalg.norm(h_out - target_coords).item()
-        # along=onto=1 should close most of the gap toward target — at least
-        # halve the in-subspace coordinate distance.
-        assert dist_after < 0.5 * dist_before, (
-            f"position {pos}: subspace_inject barely moved h_in "
-            f"({dist_before:.3f}) toward target (now {dist_after:.3f})"
+        # along=1, κ=0 ⇒ the in-subspace coord is translated by the full target
+        # offset: h_out == h_in + target (the per-token spread h_in is kept).
+        assert torch.allclose(h_out, h_in + position, atol=1e-3), (
+            f"position {pos}: expected translate h_in + target, "
+            f"got Δ={h_out - h_in} vs target={position}"
         )
 
 

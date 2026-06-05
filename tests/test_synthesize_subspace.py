@@ -229,8 +229,8 @@ def test_drops_degenerate_direction_layer():
 # ----------------------------------------------- integration with subspace_inject ---
 
 def test_synthesized_subspace_drives_subspace_inject():
-    """along=1 lands the in-subspace coords on the target: push axis set to its
-    coeff, ablation axis removed; the off-subspace residual is preserved."""
+    """along=1 *translates* the push axis by its target and *collapses* the
+    ablation axis to 0 (per-axis κ); the off-subspace residual is preserved."""
     torch.manual_seed(6)
     D = 16
     uh = _unit(torch.randn(D))
@@ -244,6 +244,7 @@ def test_synthesized_subspace_drives_subspace_inject():
     sub = synth.layers[0]
     domain = CustomDomain(sub.rank)
     target = synth.target_coord[0]
+    kappa = synth.kappa[0]                        # 0 on the push axis, 1 on ablate
 
     # an activation already leaning on both axes + an off-subspace residual
     perp = torch.randn(D)
@@ -252,19 +253,24 @@ def test_synthesized_subspace_drives_subspace_inject():
     seed = (h - sub.mean) @ sub.basis.T
 
     out, _foot = subspace_inject(
-        h, sub, domain, target, seed, along=1.0, onto=0.0,
+        h, sub, domain, target, seed, along=1.0, onto=0.0, kappa=kappa,
     )
-    # in-subspace coords land exactly on the target (push→0.5, ablate→0)
     coords_out = (out - sub.mean) @ sub.basis.T
-    assert torch.allclose(coords_out, target, atol=1e-4)
+    q = (h - sub.mean) @ sub.basis.T
+    # per-axis κ-blend: push axis translates by target, ablate axis collapses to 0
+    assert torch.allclose(coords_out, q + (target - kappa * q), atol=1e-4)
+    # the ablated direction is driven out of the activation (component → 0)
+    assert abs(float((out - sub.mean) @ ua)) < 1e-3
+    # the pushed direction is translated (grew by coeff·coord = 0.5), not collapsed
+    assert float((out - sub.mean) @ uh) == pytest.approx(0.7 + 0.5, abs=1e-3)
     # off-subspace residual preserved (kept verbatim)
     _, perp_out = decompose(out, sub.mean, sub.basis)
     assert torch.allclose(perp_out, perp, atol=1e-4)
 
 
 def test_rank8_synthesized_drives_subspace_inject():
-    """A rank-8 fragment routed through subspace_inject lands its reduced
-    coords on the target under a full along slide."""
+    """A rank-8 push fragment routed through subspace_inject *translates* its
+    reduced coords by the target under a full along slide (κ=0, pure push)."""
     torch.manual_seed(9)
     D = 24
     B8, _kept = _ortho_basis(list(torch.randn(8, D)))
@@ -277,13 +283,17 @@ def test_rank8_synthesized_drives_subspace_inject():
     sub = synth.layers[0]
     domain = CustomDomain(sub.rank)
     target = synth.target_coord[0]
+    kappa = synth.kappa[0]
+    assert torch.allclose(kappa, torch.zeros_like(kappa), atol=1e-6)  # pure push
     h = neutral + torch.randn(D)
     seed = (h - sub.mean) @ sub.basis.T
     out, _foot = subspace_inject(
-        h, sub, domain, target, seed, along=1.0, onto=0.0,
+        h, sub, domain, target, seed, along=1.0, onto=0.0, kappa=kappa,
     )
     coords_out = (out - sub.mean) @ sub.basis.T
-    assert torch.allclose(coords_out, target, atol=1e-4)
+    q = (h - sub.mean) @ sub.basis.T
+    # translate, not collapse: each push axis shifts by its target coord
+    assert torch.allclose(coords_out, q + target, atol=1e-4)
 
 
 def test_synthesized_inject_identity_at_along_zero():
