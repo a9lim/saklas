@@ -144,7 +144,7 @@ with a one-line hint.
   Fits/loads a Procrustes alignment and writes the target's `from-<safe_src>`
   **manifold** tensor via `transfer_manifold` — one transfer path (the old
   vector-side transfer bridge is gone). The runner calls
-  `_target_whitener_from_neutral_cache` (→ `LayerWhitener.from_neutral_cache`) on the
+  `_target_whitener_from_neutral_cache` (→ `LayerWhitener.from_cache`) on the
   target model's cached `neutral_activations.safetensors` (no model load on a cache
   hit) so transferred shares are re-baked in the target Mahalanobis metric;
   **mandatory** — a missing/unusable target cache raises `WhitenerError` (the runner

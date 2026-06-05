@@ -68,7 +68,7 @@ def _target_whitener_from_neutral_cache(model_id: str) -> Any:
     from saklas.core.mahalanobis import LayerWhitener, WhitenerError
 
     try:
-        return LayerWhitener.from_neutral_cache(model_id)
+        return LayerWhitener.from_cache(model_id)
     except WhitenerError:
         raise
     except Exception as e:

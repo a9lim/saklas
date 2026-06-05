@@ -81,9 +81,13 @@ def _extract_profile(model: Any, tokenizer: Any, concept: str, layers: Any) -> A
 
 @pytest.fixture(scope="module")
 def layer_means(model_and_tokenizer: Any, layers: Any) -> Any:
-    from saklas.core.vectors import compute_layer_means
+    # The probe-centering mean is the per-layer mean of the neutral activation
+    # stack (X.mean(0)) — same corpus, same pooling — so there is no separate
+    # compute_layer_means pass.
+    from saklas.core.vectors import compute_neutral_activations
     model, tokenizer = model_and_tokenizer
-    return compute_layer_means(model, tokenizer, layers)
+    acts = compute_neutral_activations(model, tokenizer, layers)
+    return {idx: X.mean(dim=0) for idx, X in acts.items()}
 
 
 @pytest.fixture(scope="module")

@@ -206,9 +206,11 @@ weighting with no per-layer metadata.
 
 `load_default_manifolds()` walks `manifolds/default/` into `{tag: [manifold_name]}`
 (the category-grouped probe roster; triggers `materialize_bundled_manifolds`).
-`bootstrap_layer_means(...)` loads/computes the per-layer probe-centering means
-(cached at `models/<safe>/layer_means.safetensors`, stale on
-`neutral_statements.json` drift). The old `bootstrap_probes` is gone — the session
+`bootstrap_layer_means(...)` returns the per-layer probe-centering means as
+`X.mean(0)` of the per-model neutral-activation cache
+(`load_or_compute_neutral_activations`) — same corpus the whitener covariance is
+built from, so there is no separate `layer_means.safetensors` cache (a cold model
+pays one neutral-corpus forward loop, not two). The old `bootstrap_probes` is gone — the session
 sources bundled probe directions by folding fitted 2-node manifolds
 (`session._bootstrap_manifold_probes`).
 

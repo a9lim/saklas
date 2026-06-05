@@ -509,8 +509,10 @@ All state under `~/.saklas/` (override via `$SAKLAS_HOME`):
     <safe_model_id>_from-<src>.safetensors   # cross-model transfer
     <safe_model_id>_role-<slug>.safetensors  # role-augmented
   models/<safe_model_id>/
-    layer_means.{safetensors,json}     # probe-centering baseline
-    neutral_activations.{safetensors,json}   # neutral corpus (mult. of 48) × layers, fp32
+    neutral_activations.{safetensors,json}   # neutral corpus (mult. of 48) × layers, fp32;
+                                       # the single per-model neutral artifact — the
+                                       # probe-centering mean is its per-layer X.mean(0),
+                                       # the whitener covariance is built from the stack
     alignments/<safe_src>.{safetensors,json} # optional cross-model Procrustes map
   vectors/<ns>/<concept>/              # LEGACY (pre-4.0) packs only — ported to
                                        # manifolds/ on first touch; no longer written

@@ -124,6 +124,66 @@ class TestGenerateBatch:
 
 
 # ---------------------------------------------------------------------------
+# Prefix-cache eligibility — the predicates that decide whether a batch can
+# share one prefill.  CPU-only: they only read steering triggers, no model.
+# ---------------------------------------------------------------------------
+
+
+class TestPrefixCacheEligibility:
+    def _session(self):
+        from saklas.core.session import SaklasSession
+
+        return SaklasSession.__new__(SaklasSession)
+
+    @pytest.mark.parametrize(
+        "expr, expected_inactive",
+        [
+            (None, True),                          # no steering → reusable
+            ("0.5 honest", False),                 # default BOTH steers prefill
+            ("0.5 honest@response", True),         # response-phase: prompt untouched
+            ("0.5 honest@generated", True),        # decode-only
+            ("0.5 honest@after", True),            # after-N: prompt=False
+            ("0.5 honest@prompt", False),          # prompt-phase steers prefill
+            ("0.5 honest@both", False),            # explicit both
+            ("0.5 honest@when:honest.deceptive>0.4", True),  # probe-gated: inactive in prefill
+        ],
+    )
+    def test_steering_value_prefill_inactive(
+        self, expr: "str | None", expected_inactive: bool,
+    ) -> None:
+        s = self._session()
+        assert s._steering_value_prefill_inactive(expr) is expected_inactive
+
+    def test_mixed_terms_active_if_any_steers_prefill(self) -> None:
+        # One response-phase term + one default-BOTH term → prefill IS steered.
+        s = self._session()
+        assert s._steering_value_prefill_inactive("0.5 honest@response + 0.3 warm") is False
+
+    def test_malformed_expression_treated_as_active(self) -> None:
+        # A parse failure is conservatively prefill-active so the caller skips
+        # caching and lets the normal path surface the error.
+        s = self._session()
+        assert s._steering_value_prefill_inactive("0.5 !nope~bad") is False
+
+    def test_active_in_prefill_reads_the_live_stack(self) -> None:
+        from saklas.core.triggers import Trigger
+
+        s = self._session()
+        s._steering_stack = []
+        assert s._steering_active_in_prefill() is False
+        # Response-phase entry (prompt=False) → prefill untouched.
+        s._steering_stack = [{"honest": (0.5, Trigger.GENERATED_ONLY)}]
+        assert s._steering_active_in_prefill() is False
+        # Default BOTH entry → prefill steered.
+        s._steering_stack = [{"honest": (0.5, Trigger.BOTH)}]
+        assert s._steering_active_in_prefill() is True
+        # A probe-gated trigger reports inactive during prefill.
+        gated = Trigger.when("honest.deceptive", ">", 0.4)
+        s._steering_stack = [{"honest": (0.5, gated)}]
+        assert s._steering_active_in_prefill() is False
+
+
+# ---------------------------------------------------------------------------
 # session.generate_sweep — Cartesian product, applied_steering receipts.
 # ---------------------------------------------------------------------------
 

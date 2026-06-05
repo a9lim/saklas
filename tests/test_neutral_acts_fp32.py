@@ -156,37 +156,37 @@ def test_sidecar_written(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Non
 def test_from_cache_rejects_legacy_bf16(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """``LayerWhitener.from_cache`` refuses a legacy bf16 neutral cache.
 
-    ``from_cache`` (the ``subspace compare`` path) can't
-    recompute — no model is loaded — so it must fail loud rather than build a
-    bf16-sourced whitener, which would reopen the precision seam the fp32 store
-    closes.  Pairs the bf16 neutral cache with an fp32 ``layer_means`` so the
-    rejection is decided by the neutral-activation dtype, not a missing file.
+    ``from_cache`` (the offline ``manifold compare`` + transfer-rebake path)
+    can't recompute — no model is loaded — so it must fail loud rather than
+    build a bf16-sourced whitener, which would reopen the precision seam the
+    fp32 store closes.  The rejection is decided by the neutral-activation
+    dtype; there is no separate ``layer_means`` cache to pair it with anymore
+    (the centering mean is derived from the neutral activations).
     """
     _install_home(tmp_path, monkeypatch)
     acts = _deterministic_acts()
     md = model_dir(MODEL_ID)
     md.mkdir(parents=True, exist_ok=True)
 
-    # Legacy bf16 neutral activations + fp32 layer means (both files must
-    # exist or from_cache raises the missing-cache error first).
     save_file(
         {f"layer_{i}": t.contiguous().to(torch.bfloat16).cpu() for i, t in acts.items()},
         str(md / "neutral_activations.safetensors"),
-    )
-    save_file(
-        {f"layer_{i}": t.mean(dim=0).contiguous() for i, t in acts.items()},
-        str(md / "layer_means.safetensors"),
     )
 
     with pytest.raises(WhitenerError, match="non-fp32"):
         LayerWhitener.from_cache(MODEL_ID)
 
 
-def test_from_neutral_cache_builds_without_layer_means(
+def test_from_cache_builds_without_layer_means(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Transfer rebakes can derive centering means from the neutral cache."""
+    """``from_cache`` derives centering means from the neutral cache alone.
+
+    The neutral mean *is* the probe-centering baseline (same corpus, same
+    pooling), so the offline whitener loader reads only
+    ``neutral_activations.safetensors`` — there is no ``layer_means`` cache.
+    """
     _install_home(tmp_path, monkeypatch)
     acts = _deterministic_acts()
     md = model_dir(MODEL_ID)
@@ -196,7 +196,7 @@ def test_from_neutral_cache_builds_without_layer_means(
         str(md / "neutral_activations.safetensors"),
     )
 
-    got = LayerWhitener.from_neutral_cache(MODEL_ID)
+    got = LayerWhitener.from_cache(MODEL_ID)
     expected = LayerWhitener.from_neutral_activations(
         acts,
         {i: t.mean(dim=0) for i, t in acts.items()},
@@ -206,23 +206,3 @@ def test_from_neutral_cache_builds_without_layer_means(
     v = torch.randn(8, generator=torch.Generator().manual_seed(55))
     for layer in acts:
         assert torch.allclose(got.apply_inv(layer, v), expected.apply_inv(layer, v))
-
-
-def test_from_neutral_cache_rejects_legacy_bf16(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _install_home(tmp_path, monkeypatch)
-    acts = _deterministic_acts()
-    md = model_dir(MODEL_ID)
-    md.mkdir(parents=True, exist_ok=True)
-    save_file(
-        {
-            f"layer_{i}": t.contiguous().to(torch.bfloat16).cpu()
-            for i, t in acts.items()
-        },
-        str(md / "neutral_activations.safetensors"),
-    )
-
-    with pytest.raises(WhitenerError, match="non-fp32"):
-        LayerWhitener.from_neutral_cache(MODEL_ID)

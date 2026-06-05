@@ -49,28 +49,26 @@ def _unit(v: torch.Tensor) -> torch.Tensor:
 
 
 def _seed_neutral_cache(model_id: str, *, n: int = 64, seed: int = 5) -> None:
-    """Write a per-model neutral-activation + layer-means disk cache.
+    """Write a per-model neutral-activation disk cache.
 
     ``manifold compare`` builds its (mandatory) whitener via
     ``LayerWhitener.from_cache(model_id)`` — there is no Euclidean path — so the
-    disk cache (``neutral_activations.safetensors`` + ``layer_means.safetensors``,
-    keyed ``layer_<idx>``, fp32) must exist for the layers the folded manifolds
-    occupy.
+    disk cache (``neutral_activations.safetensors``, keyed ``layer_<idx>``,
+    fp32) must exist for the layers the folded manifolds occupy.  The
+    probe-centering mean is derived from these activations (``X.mean(0)``), so
+    there is no separate ``layer_means`` cache to seed.
     """
     from safetensors.torch import save_file
 
     md = model_dir(model_id)
     md.mkdir(parents=True, exist_ok=True)
-    means: dict[str, torch.Tensor] = {}
     acts: dict[str, torch.Tensor] = {}
     for L in _LAYERS:
         g = torch.Generator().manual_seed(seed * 13 + L)
         scale = 0.5 + torch.rand(_DIM, generator=g, dtype=torch.float32)
         mu = torch.randn(_DIM, generator=g, dtype=torch.float32) * 0.1
         X = torch.randn(n, _DIM, generator=g, dtype=torch.float32) * scale + mu
-        means[f"layer_{L}"] = mu
         acts[f"layer_{L}"] = X
-    save_file(means, str(md / "layer_means.safetensors"))
     save_file(acts, str(md / "neutral_activations.safetensors"))
 
 

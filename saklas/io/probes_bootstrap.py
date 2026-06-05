@@ -3,30 +3,16 @@
 A steering vector lives as a 2-node ``pca`` manifold (4.0), so the bundled
 probe set is sourced by folding fitted manifolds (see
 ``SaklasSession._bootstrap_manifold_probes``); this module owns the two pieces
-that feed it: the per-model layer-mean cache (:func:`bootstrap_layer_means`) and
-the tag→manifold roster (:func:`load_default_manifolds`).
+that feed it: the per-model probe-centering means (:func:`bootstrap_layer_means`,
+derived from the neutral-activation cache) and the tag→manifold roster
+(:func:`load_default_manifolds`).
 """
 
 from __future__ import annotations
 
-import logging
 from typing import Any
 
 import torch
-
-from saklas.io.packs import hash_file
-from saklas.io.paths import (
-    model_dir,
-    neutral_statements_path,
-)
-from saklas.core.vectors import (
-    compute_layer_means,
-    load_profile, save_profile,
-)
-
-log = logging.getLogger(__name__)
-
-_LAYER_MEANS_NAME = "layer_means"
 
 
 def load_default_manifolds() -> dict[str, list[str]]:
@@ -51,36 +37,23 @@ def load_default_manifolds() -> dict[str, list[str]]:
 def bootstrap_layer_means(
     model: Any, tokenizer: Any, layers: torch.nn.ModuleList, model_info: dict[str, Any],
 ) -> dict[int, torch.Tensor]:
-    """Load or compute per-layer mean activations for probe centering.
+    """Per-layer neutral mean activation for probe centering.
 
-    Stored at ~/.saklas/models/<safe_id>/layer_means.safetensors with a slim
-    sidecar. Stale if neutral_statements.json has changed since extraction.
+    Derived as ``X.mean(0)`` from the per-model neutral-activation cache
+    (:func:`saklas.io.alignment.load_or_compute_neutral_activations`).  The
+    neutral mean *is* the probe-centering baseline — same corpus, same
+    last-content-token fp32 pooling the whitener's covariance is built from —
+    so there is no separate ``layer_means`` forward pass or disk cache.  The
+    neutral-activation cache is the single per-model artifact both the
+    centering mean and the Mahalanobis whitener read; the means fall out of it
+    for free, so a cold model pays one neutral-corpus forward loop instead of
+    two.  Stale on ``neutral_statements.json`` drift via the neutral cache's
+    own sha256 key.
     """
+    from saklas.io.alignment import load_or_compute_neutral_activations
+
     model_id = model_info.get("model_id", "unknown")
-    md = model_dir(model_id)
-    md.mkdir(parents=True, exist_ok=True)
-    ts_path = md / f"{_LAYER_MEANS_NAME}.safetensors"
-    sc_path = md / f"{_LAYER_MEANS_NAME}.json"
-
-    current_ns_hash: str | None = None
-    if neutral_statements_path().exists():
-        current_ns_hash = hash_file(neutral_statements_path())
-
-    if ts_path.exists() and sc_path.exists():
-        try:
-            profile, meta = load_profile(str(ts_path))
-            recorded_sha = meta.get("statements_sha256")
-            if current_ns_hash is None or recorded_sha == current_ns_hash:
-                log.debug("Loaded cached layer means")
-                return profile
-            log.info("Layer means stale (neutral_statements changed); recomputing")
-        except Exception as e:
-            log.warning("Corrupt layer means cache, recomputing: %s", e)
-
-    log.info("Computing layer means (one-time per model)...")
-    means = compute_layer_means(model, tokenizer, layers)
-    save_profile(means, str(ts_path), {
-        "method": "layer_means",
-        "statements_sha256": current_ns_hash or "",
-    })
-    return means
+    acts = load_or_compute_neutral_activations(
+        model, tokenizer, layers, model_id=model_id,
+    )
+    return {idx: X.mean(dim=0) for idx, X in acts.items()}

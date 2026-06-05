@@ -152,6 +152,14 @@ def _snapshot_la_layers(cache: Any) -> None:
 
 
 _RESPONSE_MAX_TOKENS = 256  # per in-character response (4.0 / A2 elicitation)
+
+# Floor on the shared token prefix ``generate_batch`` will KV-cache.  Below
+# this the saved prefill is in the noise and the double-render + cache-management
+# overhead isn't worth it; the prefix must also leave a non-empty suffix per row
+# (``_try_prefix_cache_hit`` requires it), so the cached length is capped at
+# ``min_row_len - 1``.
+_PREFIX_CACHE_MIN_TOKENS = 16
+
 PROBE_CATEGORIES = [
     "affect",
     "epistemic",
@@ -872,10 +880,13 @@ class SaklasSession:
 
         # One unified Monitor for every probe shape — flat concept axes
         # (rank-1), flat discover fits (rank-R, e.g. ``personas``), and curved
-        # manifolds (``pad``).  Flat probes batch into one matmul per layer
-        # (any rank); curved probes foot-solve per-probe.  Per-token score
-        # callbacks emit one flat-scalar dict into ``TriggerContext.probe_scores``
-        # so ``@when:`` gates fire on any probe without grammar changes.
+        # manifolds (``pad``).  There is no batched-affine fast path: every
+        # probe — flat or curved — is read per token through one whitened
+        # per-layer geometry pass (the research-tool priority is full per-token
+        # info — nearest, coords, residual, per-layer — over throughput).
+        # Per-token score callbacks emit one flat-scalar dict into
+        # ``TriggerContext.probe_scores`` so ``@when:`` gates fire on any probe
+        # without grammar changes.
         self._monitor = Monitor(
             probe_manifolds, self._layer_means, whitener=self._whitener,
         )
@@ -2234,10 +2245,17 @@ class SaklasSession:
             except BaseException:
                 self._steering_stack.pop()
                 raise
-            # Steering hooks just changed; the prefix cache (built
-            # under the previous regime) no longer represents the
-            # current pre-attention residual stream.  Drop it.
-            self._invalidate_prefix_cache()
+            # Steering hooks just changed.  A cached prefix is *unsteered*
+            # (``cache_prefix`` refuses to run inside a steering scope), so it
+            # only stops representing the current pre-attention residual stream
+            # when the new stack actually steers the prefill.  A prefill-
+            # inactive scope (``@response`` / ``@generated`` / probe-gated)
+            # leaves the prompt region untouched, so the unsteered prefix stays
+            # valid and we keep it — this is what lets ``generate_batch`` reuse
+            # one prefill across a steered batch.  Drop it only when prefill is
+            # genuinely steered.
+            if self._steering_active_in_prefill():
+                self._invalidate_prefix_cache()
         self._emit_steering_applied()
 
     def _pop_steering(self) -> None:
@@ -2267,7 +2285,12 @@ class SaklasSession:
         with self._gen_lock:
             self._steering_stack.pop()
             self._rebuild_steering_hooks()
-            self._invalidate_prefix_cache()
+            # Symmetric with ``_push_steering``: the cached prefix is unsteered,
+            # so only invalidate when what remains on the stack still steers the
+            # prefill.  Popping back to a prefill-inactive (or empty) stack keeps
+            # the unsteered prefix valid for the next reuse.
+            if self._steering_active_in_prefill():
+                self._invalidate_prefix_cache()
         if not self._steering_stack:
             self.events.emit(SteeringCleared())
         else:
@@ -2320,6 +2343,63 @@ class SaklasSession:
             if trig.gate is not None:
                 return True
         return False
+
+    def _steering_active_in_prefill(self) -> bool:
+        """Return True iff any active steering term fires during prompt prefill.
+
+        A term touches the prefill residual stream iff its trigger has
+        ``prompt=True`` and carries no probe gate (probe gates report
+        inactive during prefill — there's no post-forward score yet; see
+        :meth:`~saklas.core.triggers.Trigger.active`).  When this is False the
+        prefill is numerically identical to the *unsteered* prefill, so a
+        cached unsteered prefix KV (the only kind :meth:`cache_prefix` builds)
+        stays valid for reuse.  This is the gate the prefix-cache consume path
+        keys on, and the condition under which steering push/pop preserves the
+        cache.  Mirrors :meth:`_steering_needs_probe_gating`'s stack walk.
+        """
+        flat = self._flatten_steering_stack()
+        for entry in flat.values():
+            if isinstance(entry, (AblationTerm, ManifoldTerm)):
+                trig = entry.trigger
+            else:  # (alpha, Trigger)
+                _alpha, trig = entry
+            if trig.prompt and trig.gate is None:
+                return True
+        return False
+
+    def _steering_value_prefill_inactive(
+        self, value: "str | Steering | None",
+    ) -> bool:
+        """Return True iff steering ``value`` would not touch the prompt prefill.
+
+        Pre-flight form of :meth:`_steering_active_in_prefill` over an
+        *incoming* steering value (before any scope push) — used by
+        :meth:`generate_batch` to decide whether a shared-prefix KV cache is
+        reusable across the batch.  ``None`` (no steering) is trivially
+        prefill-inactive; otherwise a term is prefill-active iff its trigger
+        has ``prompt=True`` and no probe gate.  A malformed expression (raises
+        on parse) is conservatively reported active so the caller skips
+        caching and lets the normal path surface the error.
+        """
+        from saklas.core.steering_expr import ProjectedTerm
+
+        try:
+            s = Steering.from_value(value)
+        except Exception:
+            return False
+        if s is None:
+            return True
+        default = s.trigger
+        for val in s.alphas.values():
+            if isinstance(val, (AblationTerm, ManifoldTerm, ProjectedTerm)):
+                trig = val.trigger
+            elif isinstance(val, tuple):
+                trig = val[1]
+            else:  # bare float — inherits the Steering default trigger
+                trig = default
+            if trig.prompt and trig.gate is None:
+                return False
+        return True
 
     def _exit_internal_steering(self, steering_cm: Any, *, swallow: bool) -> None:
         """Pop ``_generate_core``'s internally-entered steering scope.
@@ -4042,10 +4122,16 @@ class SaklasSession:
         cached_pkv = None
         cache_position_offset = 0
         effective_input_ids = input_ids
+        # The cached prefix KV is unsteered.  It's safe to reuse whenever the
+        # active steering doesn't touch the prefill region — ``@response`` /
+        # ``@generated`` / probe-gated steering leaves the prompt KV identical
+        # to unsteered, so a steered (response-phase) batch can still share one
+        # prefill.  ``want_hidden`` (needs every prefix hidden state) and
+        # thinking (different decode path) still force a full re-prefill.
         if (
             not want_hidden
             and not use_thinking
-            and not self._steering_stack
+            and not self._steering_active_in_prefill()
             and self._prefix_cache is not None
         ):
             hit = self._try_prefix_cache_hit(input_ids)
@@ -4718,6 +4804,17 @@ class SaklasSession:
         pass ``stateless=False`` if you genuinely want each prompt to
         accumulate against the running history.
 
+        **Prefix KV caching.**  When the rows share a token prefix (a common
+        system prompt, few-shot preamble, or shared instruction) and the
+        steering doesn't touch the prefill region (``None`` or ``@response`` /
+        ``@generated`` / probe-gated), that shared prefix is prefilled once and
+        its KV reused across every row — the per-call saving scales with
+        ``shared_prefix_len / total_input_len``.  Skipped for ``stateless=False``
+        (per-row history breaks the shared prefix), ``return_hidden`` (needs
+        every prefix hidden state), thinking, or prefill-active steering (the
+        prompt KV would differ per row).  Correctness is unaffected either way —
+        a cache hit produces the identical token stream.
+
         ``on_result(idx, result)`` fires after each completion for local
         progress hooks.
 
@@ -4729,27 +4826,111 @@ class SaklasSession:
         if not isinstance(prompts_in, list) or not prompts_in:
             raise ValueError("generate_batch: prompts must be a non-empty list")
 
-        results: list[GenerationResult] = []
-        node_ids: list[str | None] = []
-        for idx, prompt in enumerate(prompts):
-            r = self._generate_core(
-                prompt,
-                steering=steering,
-                sampling=sampling,
-                stateless=stateless,
-                raw=raw,
-                thinking=thinking,
-            )
-            results.append(r)
-            node_ids.append(self.tree.active_node_id if not stateless else None)
-            if on_result is not None:
-                on_result(idx, r)
+        prefix_cached = self._maybe_cache_batch_prefix(
+            prompts, steering=steering, sampling=sampling,
+            thinking=thinking, stateless=stateless, raw=raw,
+        )
+        try:
+            results: list[GenerationResult] = []
+            node_ids: list[str | None] = []
+            for idx, prompt in enumerate(prompts):
+                r = self._generate_core(
+                    prompt,
+                    steering=steering,
+                    sampling=sampling,
+                    stateless=stateless,
+                    raw=raw,
+                    thinking=thinking,
+                )
+                results.append(r)
+                node_ids.append(self.tree.active_node_id if not stateless else None)
+                if on_result is not None:
+                    on_result(idx, r)
+        finally:
+            if prefix_cached:
+                self.cache_prefix(None)
         return RunSet(
             results,
             node_ids=node_ids,
             grid=[{"prompt_index": i} for i in range(len(results))],
             kind="batch",
         )
+
+    def _maybe_cache_batch_prefix(
+        self,
+        prompts: list[Any],
+        *,
+        steering: "str | Steering | None",
+        sampling: SamplingConfig | None,
+        thinking: bool | None,
+        stateless: bool,
+        raw: bool,
+    ) -> bool:
+        """Prefill + cache the batch's shared token prefix when reuse is valid.
+
+        Returns ``True`` iff a prefix was cached (the caller clears it after the
+        batch).  Eligibility (all must hold): ``stateless`` (per-row history
+        would break the shared prefix), the steering is prefill-inactive
+        (``_steering_value_prefill_inactive`` — else the prompt KV differs per
+        row and the consume gate would refuse the hit anyway), no
+        ``return_hidden`` and no thinking (both force a full re-prefill), at
+        least two rows, and a shared prefix of at least
+        :data:`_PREFIX_CACHE_MIN_TOKENS`.  Best-effort: any failure to render or
+        cache falls back to the uncached path without disturbing the batch.
+        """
+        if len(prompts) < 2 or not stateless:
+            return False
+        if thinking:
+            return False
+        if sampling is not None and getattr(sampling, "return_hidden", False):
+            return False
+        if not self._steering_value_prefill_inactive(steering):
+            return False
+        try:
+            common = self._batch_common_prefix_ids(prompts, raw=raw)
+            if common is None:
+                return False
+            return self.cache_prefix(common) >= _PREFIX_CACHE_MIN_TOKENS
+        except Exception as exc:
+            # Prefix caching is a pure optimization: a cache_prefix guard
+            # (active scope / in-flight gen), a render failure, or an
+            # under-initialized session must fall back to the normal per-row
+            # prefill, never break the batch.  ``cache_prefix`` clears its own
+            # state before setting it, so no half-built cache can leak.
+            _log.debug("generate_batch: skipping prefix cache (%s)", exc)
+            return False
+
+    def _batch_common_prefix_ids(
+        self, prompts: list[Any], *, raw: bool,
+    ) -> "torch.Tensor | None":
+        """Longest shared leading token run across the batch's rendered inputs.
+
+        Renders each prompt to ``input_ids`` in stateless mode (the same render
+        ``_generate_core`` will reproduce, so the cached tokens are a true
+        byte-prefix of every row) and returns the shared head as a 1-D tensor,
+        or ``None`` when the shared run is shorter than
+        :data:`_PREFIX_CACHE_MIN_TOKENS`.  The run is capped at ``min_row_len -
+        1`` so every row keeps a non-empty suffix to sample from.
+        """
+        rendered: list[torch.Tensor] = []
+        for prompt in prompts:
+            ids = self._prepare_input(prompt, raw=raw, stateless=True)
+            rendered.append(ids[0])
+        min_len = min(int(t.shape[0]) for t in rendered)
+        if min_len <= _PREFIX_CACHE_MIN_TOKENS:
+            return None
+        ref = rendered[0]
+        common = 0
+        for i in range(min_len):
+            tok = int(ref[i])
+            if all(int(t[i]) == tok for t in rendered):
+                common += 1
+            else:
+                break
+        common = min(common, min_len - 1)  # leave a >=1-token suffix per row
+        if common < _PREFIX_CACHE_MIN_TOKENS:
+            return None
+        return ref[:common].clone()
 
     def generate_sweep(
         self,

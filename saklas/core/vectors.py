@@ -301,57 +301,21 @@ def _neutral_pairs() -> list[tuple[str, str]]:
     return [(baseline[i % k], r) for i, r in enumerate(responses)]
 
 
-def compute_layer_means(
-    model: torch.nn.Module,
-    tokenizer: Any,
-    layers: torch.nn.ModuleList,
-    device: torch.device | None = None,
-) -> dict[int, torch.Tensor]:
-    """Compute mean hidden state per layer over neutral prompts.
-
-    Returns dict mapping layer_idx -> mean vector (dim,) in fp32.
-    Used to center activations before probe cosine similarity,
-    removing the baseline projection bias.
-    """
-    if device is None:
-        device = next(model.parameters()).device
-    assert device is not None  # device is always set by this point
-
-    n_layers = len(layers)
-    sums: dict[int, torch.Tensor] = {}
-
-    _mps = device.type == "mps"
-
-    pairs = _neutral_pairs()
-    for prompt, response in pairs:
-        per_layer = _encode_and_capture_all(
-            model, tokenizer, prompt, response, layers, device,
-        )
-        if not sums:
-            for idx in range(n_layers):
-                sums[idx] = per_layer[idx].clone()
-        else:
-            for idx in range(n_layers):
-                sums[idx] += per_layer[idx]
-        del per_layer
-        if _mps:
-            torch.mps.empty_cache()
-
-    n = len(pairs)
-    return {idx: sums[idx] / n for idx in range(n_layers)}
-
-
 def compute_neutral_activations(
     model: torch.nn.Module,
     tokenizer: Any,
     layers: torch.nn.ModuleList,
     device: torch.device | None = None,
 ) -> dict[int, torch.Tensor]:
-    """Per-layer ``[N, D]`` stack across the 90 neutral prompts.
+    """Per-layer ``[N, D]`` stack across the neutral corpus.
 
-    Same forward-pass discipline as :func:`compute_layer_means` — last
-    non-special-token pooling, fp32, MPS-friendly.  Returns one stacked
-    tensor per layer (rows = prompts).  Used by cross-model alignment
+    Last non-special-token pooling, fp32, MPS-friendly (one batch-1 forward
+    per ``(prompt, response)`` pair).  Returns one stacked tensor per layer
+    (rows = pairs).  This is the single per-model neutral artifact: the
+    Mahalanobis whitener's covariance is built from the stack and the
+    probe-centering means are its per-layer ``X.mean(0)``
+    (:func:`saklas.io.probes_bootstrap.bootstrap_layer_means`).  Used by
+    cross-model alignment
     (:func:`saklas.io.alignment.fit_alignment`) which needs paired
     observations to fit Procrustes; the means alone (N=1) are degenerate
     for that fit.

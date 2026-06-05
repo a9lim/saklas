@@ -53,9 +53,10 @@ when an explicit per-node role override is set (the persona-baselined fit), the
 swap-back default being the standard assistant. `_load_baseline_prompts` loads the
 shared A2 user prompts (user override → bundled `saklas/data/baseline_prompts.json`,
 48 prompts); `_neutral_pairs` pairs the neutral corpus to those prompts
-(`response[i] ↔ prompt[i % k]`). `compute_layer_means` /
-`compute_neutral_activations` build the probe-centering baseline + the whitener's
-neutral cache, pooling conversational `(prompt, response)` pairs via `_neutral_pairs`.
+(`response[i] ↔ prompt[i % k]`). `compute_neutral_activations` builds the whitener's
+neutral cache (one per-model artifact), pooling conversational `(prompt, response)`
+pairs via `_neutral_pairs`; the probe-centering baseline is its per-layer `X.mean(0)`
+(`bootstrap_layer_means`), so there is no separate layer-mean forward pass or cache.
 
 DLS (Selective Steering, Dang & Ngo 2026 Eq. 9): `compute_dls_axes(node_centroids,
 bases, layer_means)` is the **N-node straddle** core — keep axis `d̂ᵣ` at layer L
@@ -159,9 +160,11 @@ resolves per-layer sae_ids (`_canonical_layer_map` narrowest-width), gates
 `LayerWhitener` holds per-layer centered neutrals `X_L ∈ ℝ^(N,D)` + the Woodbury
 inverse `K_L = (NλI + XXᵀ)⁻¹`; `apply_inv(layer, v) = (1/λ)(v − Xᵀ K X v)` in
 O(ND), no D×D. Ridge `λ_L = (‖X_L‖²_F / (N·D)) · ridge_scale`. Built lazily via
-`from_neutral_activations`, `from_cache(model_id)` (requires cached layer means),
-or `from_neutral_cache(model_id)` (derives per-layer means from cached neutrals for
-no-model-load transfer rebakes); neutrals cached **fp32** (the project-wide
+`from_neutral_activations` (in-memory) or `from_cache(model_id)` (the single
+offline loader — reads `neutral_activations.safetensors` alone, no model load, and
+derives the per-layer centering mean from the cached neutrals as `X.mean(0)`;
+backs `manifold compare` + the cross-model transfer rebake); neutrals cached
+**fp32** (the project-wide
 invariant — fp16's 65504 ceiling overflows gemma-3's late layers to
 ±inf, poisoning Σ). Any layer whose centered acts or `K` come back non-finite is
 *excluded*, so `covers_all` is trustworthy as "finite factors everywhere" — the
@@ -447,7 +450,17 @@ the gate callback runs one `_monitor.score_single_token` through `flat_scalars` 
 `GenerationResult.probe_readings`.
 `session.lock` is the server-owned `asyncio.Lock` (distinct from `_gen_lock`).
 `generate_batch`/`generate_sweep` return `RunSet` (sweep builds the Cartesian
-product as loom siblings). Hot-path events: `GenerationStarted`/`SteeringApplied`/
+product as loom siblings). `generate_batch` auto-shares one prefill across rows
+when they have a common token prefix and the steering is prefill-inactive
+(`_maybe_cache_batch_prefix` → `cache_prefix` → consumed in `_generate_core`): the
+`_prefix_cache` KV is unsteered, so reuse is valid exactly when no steering term
+touches the prompt region — `_steering_active_in_prefill` (a term steers prefill
+iff `trigger.prompt and gate is None`) gates both the consume path and steering
+push/pop invalidation (a prefill-inactive scope preserves the cache, so a
+`@response`-steered batch still shares the prefill; a default-`BOTH` batch re-prefills
+per row). The alpha *sweep* steers the prompt at varying strength by construction
+(`BOTH` terms), so it can't share a prefill — that's expected, not a gap. Hot-path
+events: `GenerationStarted`/`SteeringApplied`/
 `SteeringCleared`/`ProbeScored`/`GenerationFinished` + `VectorExtracted`/
 `ManifoldExtracted`; threaded subscribers hop via `loop.call_soon_threadsafe`.
 

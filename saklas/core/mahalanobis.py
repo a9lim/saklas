@@ -258,94 +258,53 @@ class LayerWhitener:
         *,
         ridge_scale: float = DEFAULT_RIDGE_SCALE,
     ) -> "LayerWhitener":
-        """Load a whitener from disk caches alone (no model load).
+        """Load a whitener from ``neutral_activations.safetensors`` alone (no model load).
 
-        Reads ``layer_means.safetensors`` and ``neutral_activations.safetensors``
-        from ``~/.saklas/models/<safe_id>/``.  Raises :class:`WhitenerError`
-        with a populating-command hint when either cache is missing —
-        ``manifold compare`` and similar offline tools shouldn't silently
-        load a model.
+        The single offline whitener loader — used by ``manifold compare`` and
+        the cross-model transfer rebake.  Reads only
+        ``neutral_activations.safetensors`` from ``~/.saklas/models/<safe_id>/``
+        and derives the per-layer centering mean from the activations
+        themselves (``X.mean(0)``): the neutral mean *is* the probe-centering
+        baseline (same corpus, same pooling), so there is no separate
+        ``layer_means`` cache.  Raises :class:`WhitenerError` with a
+        populating-command hint when the neutral cache is missing — offline
+        tools shouldn't silently load a model.
 
-        Use :meth:`from_neutral_activations` instead when both tensors
-        are already in memory (e.g. inside a live ``SaklasSession``).
+        Use :meth:`from_neutral_activations` instead when the activations are
+        already in memory (e.g. inside a live ``SaklasSession``).
         """
         from safetensors.torch import load_file
         from saklas.io.paths import model_dir
 
         md = model_dir(model_id)
-        means_path = md / "layer_means.safetensors"
         acts_path = md / "neutral_activations.safetensors"
-        missing: list[str] = []
-        if not means_path.is_file():
-            missing.append(means_path.name)
         if not acts_path.is_file():
-            missing.append(acts_path.name)
-        if missing:
             raise WhitenerError(
                 f"whitener cache missing for {model_id} "
-                f"(expected {', '.join(missing)} under {md}); "
-                f"populate via any flow that loads the model + neutral "
-                f"activations (e.g. run any session-level extract on this "
-                f"model, or prepare a transfer that targets {model_id})"
+                f"(expected {acts_path.name} under {md}); populate via any flow "
+                f"that loads the model + neutral activations (e.g. run any "
+                f"session-level extract on this model, or prepare a transfer "
+                f"that targets {model_id})"
             )
-        means_raw = load_file(str(means_path))
         acts_raw = load_file(str(acts_path))
         # Refuse a legacy non-fp32 neutral-activation store (the pre-fp32
         # bf16/fp16 cache).  Unlike ``load_or_compute_neutral_activations``,
         # which invalidates + recomputes such a cache, ``from_cache`` has no
         # model to recompute with — and a bf16-sourced whitener would diverge
         # from a fresh session whitener, reopening the precision seam the fp32
-        # store closes.  Fail loud with a repopulate hint (mirroring the
-        # missing-cache path above) rather than silently building a reduced-
-        # precision metric.  Checks the RAW on-disk dtype, before the
-        # ``.float()`` promotion below would mask it.
+        # store closes.  Fail loud with a repopulate hint rather than silently
+        # building a reduced-precision metric.  Checks the RAW on-disk dtype,
+        # before the ``.float()`` promotion below would mask it.
         _require_fp32_neutral_cache(model_id, acts_raw)
-        # Both files key tensors by ``layer_<idx>`` (alignment.py and
-        # vectors.save_profile shape).  ``layer_means`` and
-        # ``neutral_activations`` are both stored fp32; the ``.to(fp32)``
-        # casts below stay as a defensive no-op promotion of any legacy
-        # in-memory dtype, since the small N×N inverse doesn't tolerate a
-        # reduced-precision condition number.  ``from_neutral_activations``
-        # skips any layer whose values come back non-finite (a legacy fp16
-        # cache that overflowed on an extreme-activation channel) rather than
-        # poisoning the inverse, leaving that layer uncovered — so a corrupt
-        # cache makes ``covers_all`` False and consumers raise (no Euclidean
-        # path), it doesn't silently degrade.
-        means = _decode_layer_tensor_map(means_raw, label=f"{model_id} layer_means")
-        acts = _decode_layer_tensor_map(
-            acts_raw, label=f"{model_id} neutral_activations",
-        )
-        return cls.from_neutral_activations(
-            acts, means, ridge_scale=ridge_scale,
-        )
-
-    @classmethod
-    def from_neutral_cache(
-        cls,
-        model_id: str,
-        *,
-        ridge_scale: float = DEFAULT_RIDGE_SCALE,
-    ) -> "LayerWhitener":
-        """Load a whitener from ``neutral_activations.safetensors`` alone.
-
-        This is for no-model-load transfer paths that only need the target
-        model's covariance.  The per-layer centering mean is derived from the
-        neutral activations themselves, so no ``layer_means.safetensors`` cache
-        is required.
-        """
-        from safetensors.torch import load_file
-        from saklas.io.paths import model_dir
-
-        md = model_dir(model_id)
-        acts_path = md / "neutral_activations.safetensors"
-        if not acts_path.is_file():
-            raise WhitenerError(
-                f"neutral activations cache missing for {model_id} "
-                f"(expected {acts_path}); populate via any flow that loads "
-                f"the model + neutral activations"
-            )
-        acts_raw = load_file(str(acts_path))
-        _require_fp32_neutral_cache(model_id, acts_raw)
+        # Tensors key by ``layer_<idx>`` (alignment.py shape), stored fp32; the
+        # ``.float()`` in ``_decode_layer_tensor_map`` is a defensive no-op
+        # promotion of any legacy in-memory dtype, since the small N×N inverse
+        # doesn't tolerate a reduced-precision condition number.
+        # ``from_neutral_activations`` skips any layer whose values come back
+        # non-finite (a legacy fp16 cache that overflowed on an extreme-
+        # activation channel) rather than poisoning the inverse, leaving that
+        # layer uncovered — so a corrupt cache makes ``covers_all`` False and
+        # consumers raise (no Euclidean path), it doesn't silently degrade.
         acts = _decode_layer_tensor_map(
             acts_raw, label=f"{model_id} neutral_activations",
         )
