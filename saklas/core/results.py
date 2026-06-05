@@ -47,6 +47,15 @@ class ProbeReadings:
         return asdict(self)
 
 
+def _stat_tuple(value: Any) -> tuple[Any, ...]:
+    """Normalize current tuple stats and legacy scalar stats to one shape."""
+    if isinstance(value, tuple):
+        return value
+    if isinstance(value, list):
+        return tuple(value)
+    return (value,)
+
+
 @dataclass
 class ProbeReading:
     """Subspace-probe reading for one attached fit (flat or curved).
@@ -308,6 +317,7 @@ class ResultCollector:
                 "delta": readings.delta_per_gen,
             }
             for stat_name, vec in stats.items():
+                vec = _stat_tuple(vec)
                 if len(vec) == 1:
                     row[f"probe_{probe_name}_{stat_name}"] = vec[0]
                 else:

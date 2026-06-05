@@ -358,7 +358,7 @@ def _patch_fold_helpers(
 ) -> None:
     """Stub the two manifold-fold helpers ``_run_compare`` / ``_run_why`` call.
 
-    4.0: ``subspace compare`` / ``why`` fold a fitted 2-node ``pca`` manifold
+    4.0: ``manifold compare`` / ``why`` fold a fitted 2-node ``pca`` manifold
     to a ``Profile`` via ``runners._fold_manifold_to_profile_with_identity``
     (1-arg lookup) and ``runners._fold_all_fitted_manifolds`` (rank-all pool).
     Rather than author + fit a real manifold per concept, we stub both helpers
@@ -403,7 +403,7 @@ def _patch_fold_helpers(
 def _setup_compare_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     """Set SAKLAS_HOME and return the manifolds_dir path.
 
-    ``subspace compare`` is Mahalanobis-only now: ``_run_compare`` loads the
+    ``manifold compare`` is Mahalanobis-only now: ``_run_compare`` loads the
     per-model whitener via ``LayerWhitener.from_cache`` up front and fails if
     it's missing.  These tests mock ``Profile.cosine_similarity`` (which
     ignores the whitener), so we patch ``from_cache`` to return a sentinel
@@ -686,7 +686,7 @@ def test_run_why_concept_not_found(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
 
 
 # ---------------------------------------------------------------------------
-# SAE variant resolution in subspace compare / subspace why
+# SAE variant resolution in manifold compare / manifold why
 # ---------------------------------------------------------------------------
 
 
@@ -723,7 +723,7 @@ def test_split_variant_suffix_parses_sae_variants():
 
 
 def test_run_why_accepts_sae_suffix(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
-    """``subspace why foo:sae-<rel>`` folds the SAE-variant manifold tensor."""
+    """``manifold why foo:sae-<rel>`` folds the SAE-variant manifold tensor."""
     _setup_why_env(monkeypatch, tmp_path)
     model_id = "fake/model"
 
@@ -745,7 +745,7 @@ def test_run_why_accepts_sae_suffix(monkeypatch: pytest.MonkeyPatch, tmp_path: P
 
 
 def test_run_compare_accepts_sae_suffix(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
-    """Each concept in ``subspace compare`` parses its own :variant suffix."""
+    """Each concept in ``manifold compare`` parses its own :variant suffix."""
     _setup_compare_env(monkeypatch, tmp_path)
     model_id = "fake/model"
 

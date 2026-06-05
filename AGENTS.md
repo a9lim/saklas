@@ -396,33 +396,35 @@ natural; `--compare-linear` scores a straight-chord baseline alongside).
 
 ### Bundled manifolds + coefficient regime
 
-The bundled artifacts ship under `saklas/data/manifolds/`, materializing into
+Complete bundled artifacts ship under `saklas/data/manifolds/`, materializing into
 `~/.saklas/manifolds/default/` on session start via `materialize_bundled_manifolds()`
-(process-scope no-op after the first call):
+(process-scope no-op after the first call). The materializer only advertises
+folders whose `manifold.json` and declared `nodes/*.json` corpus files are all
+present, so an interrupted `scripts/regenerate_bundled.py` run can leave a
+partial folder in the package tree without exposing it as a default manifold:
 
 - **17 concept manifolds** — bipolar 2-node `fit_mode=pca` axes, tagged by
   category (`epistemic`, `alignment`, `register`, `cultural`). These are the
   steering vectors: `0.5 formal.casual` steers toward `formal` (node 0). The
   `register` (7) and `cultural` (4) families are independent bipolar axes, *not*
   fused into a discover manifold — each has a designed opposite and the primary
-  use is independent signed control. Affect lives in `pad`, not as bipolar axes.
+  use is independent signed control. Affect is reserved for `pad`, not shipped as
+  bipolar axes.
 - **`personas`** — discover `fit_mode=pca` (a flat ~rank-8 affine subspace),
   107 persona archetype nodes (`assistant`…`vandal`) in assistant-baselined
   activation space; from Anthropic's Assistant Axis paper (arXiv 2601.10387).
   `max_dim` 8.
-- **`pad`** — discover `fit_mode=spectral`, a curved affect surface over the PAD
-  (pleasure × arousal × dominance) space. 20 first-person mood corpora, per-model
-  coords derived by Laplacian eigenmaps (`max_dim` 3). Curved rather than flat
-  because affect is a circumplex — opposites are emergent, not designed. Steer by
-  label (`pad%happy`) or coord (`pad%0.6,0.4,0.0`).
+- **`pad`** — the intended discover `fit_mode=spectral` affect surface over PAD
+  (pleasure × arousal × dominance). It materializes only after all 20 mood corpora
+  exist; incomplete package-data output is skipped.
 
 Recommended α is vector-comparable: aim for `α ≈ 0.5`, tune up toward `α ≈ 1.0`
 for stronger expression (α clamps to `[0,1]`, so `_MANIFOLD_GAIN = 1.0` is the
 strength ceiling). Because the share is normalized to mean 1 and the lever is
-gone, a low-dim and a high-dim fit — a 2-node vector and `personas` and `pad` —
-land in the same α-band without per-fit retuning. Architecture-level behavioral
-notes (hold across model families; α values are qualitative, MPS is not bitwise
-deterministic so compare qualitatively):
+gone, a low-dim and a high-dim fit — a 2-node vector, `personas`, and `pad` once
+its corpus is complete — land in the same α-band without per-fit retuning.
+Architecture-level behavioral notes (hold across model families; α values are
+qualitative, MPS is not bitwise deterministic so compare qualitatively):
 
 - The whitened fit stays coherent at strong push where a Euclidean fit
   loop-collapses; caveman reaches terse primitive grammar, hacker a guarded
@@ -594,7 +596,9 @@ genuine **1-node** fold against the neutral mean ν (see "Extraction") — a use
 bundled anymore (the former `agentic` / `manipulative` were dropped or folded
 into bipolar `sincere.manipulative`). Bundled regeneration is unified under
 `scripts/regenerate_bundled.py` — one A2 pipeline writing the bipolar axes,
-`personas`, and `pad`; the fit is the separate `manifold fit` step.
+`personas`, and `pad`; the fit is the separate `manifold fit` step. Partial
+generation output is ignored by bundled materialization until every manifest node
+has a corpus file.
 
 The 4.0 / A2 regen also dropped the `affect`, `social_stance`, and `identity`
 categories as bipolar axes: affect (the former angry.calm / happy.sad /

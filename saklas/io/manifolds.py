@@ -2619,15 +2619,55 @@ def manifold_summary(folder: Path) -> dict[str, Any]:
 # the user's machine via ``saklas manifold discover``.
 
 
+def _bundled_manifest_node_filenames(pkg_root: Any) -> set[str] | None:
+    """Expected node corpus filenames for a bundled manifest, or ``None`` if invalid."""
+    try:
+        with pkg_root.joinpath("manifold.json").open(encoding="utf-8") as f:
+            payload = json.load(f)
+    except (
+        AttributeError,
+        FileNotFoundError,
+        json.JSONDecodeError,
+        OSError,
+        UnicodeDecodeError,
+    ):
+        return None
+    nodes = payload.get("nodes")
+    if not isinstance(nodes, list):
+        return None
+    names: set[str] = set()
+    for idx, node in enumerate(nodes):
+        if not isinstance(node, dict):
+            return None
+        label = node.get("label")
+        if not isinstance(label, str):
+            return None
+        names.add(_node_filename(idx, label))
+    return names
+
+
+def _bundled_manifest_complete(pkg_root: Any) -> bool:
+    """True when a package-data manifold has every node corpus it declares."""
+    node_files = _bundled_manifest_node_filenames(pkg_root)
+    if node_files is None:
+        return False
+    if not node_files:
+        return True
+    nodes_root = pkg_root.joinpath("nodes")
+    return nodes_root.is_dir() and all(
+        nodes_root.joinpath(name).is_file() for name in node_files
+    )
+
+
 def bundled_manifold_names() -> list[str]:
-    """List every manifold shipped under ``saklas/data/manifolds/``."""
+    """List complete manifolds shipped under ``saklas/data/manifolds/``."""
     try:
         root = _resources.files("saklas.data.manifolds")
     except (ModuleNotFoundError, FileNotFoundError):
         return []
     return sorted(
         p.name for p in root.iterdir()
-        if p.is_dir() and (p / "manifold.json").is_file()
+        if p.is_dir() and _bundled_manifest_complete(p)
     )
 
 
@@ -2647,17 +2687,22 @@ def _canonical_json_sha256(data: bytes) -> str:
     return hashlib.sha256(_canonical_json(parsed)).hexdigest()
 
 
+def _is_bundled_json_file(entry: Any) -> bool:
+    """True for package-data payloads materialized from a bundled manifold."""
+    return entry.is_file() and entry.name.endswith(".json")
+
+
 def _copy_bundled_manifold_fresh(pkg_root: Any, target: Path) -> None:
-    """Fresh install of a bundled manifold — copy every shipped file."""
+    """Fresh install of a bundled manifold — copy JSON payloads only."""
     target.mkdir(parents=True, exist_ok=True)
     for entry in pkg_root.iterdir():
-        if entry.is_file():
+        if _is_bundled_json_file(entry):
             write_bytes_atomic(target / entry.name, entry.read_bytes())
         elif entry.is_dir() and entry.name == "nodes":
             nodes_dir = target / "nodes"
             nodes_dir.mkdir(parents=True, exist_ok=True)
             for node_file in entry.iterdir():
-                if node_file.is_file():
+                if _is_bundled_json_file(node_file):
                     write_bytes_atomic(
                         nodes_dir / node_file.name, node_file.read_bytes(),
                     )
@@ -2682,7 +2727,7 @@ def _refresh_all_bundled_nodes(pkg_root: Any, target: Path) -> None:
     target_nodes.mkdir(parents=True, exist_ok=True)
     bundled_names: set[str] = set()
     for node_file in pkg_nodes.iterdir():
-        if not node_file.is_file():
+        if not _is_bundled_json_file(node_file):
             continue
         bundled_names.add(node_file.name)
         write_bytes_atomic(target_nodes / node_file.name, node_file.read_bytes())
@@ -2697,12 +2742,12 @@ def _refresh_all_bundled_nodes(pkg_root: Any, target: Path) -> None:
 def materialize_bundled_manifolds() -> None:
     """Copy bundled manifolds into ``~/.saklas/manifolds/default/``.
 
-    For each ``saklas/data/manifolds/<name>/`` in the wheel, ensure
+    For each complete ``saklas/data/manifolds/<name>/`` in the wheel, ensure
     ``~/.saklas/manifolds/default/<name>/`` is current.  Mirrors
     :func:`saklas.io.packs.materialize_bundled` for the manifold artifact
     kind; only touches ``manifold.json`` and ``nodes/*.json`` since
     bundled manifolds ship JSON-only (no per-model ``.safetensors`` —
-    those are user-side fits).
+    those are user-side fits). Non-JSON filesystem metadata is ignored.
 
     Three paths:
 
@@ -2794,12 +2839,10 @@ def materialize_bundled_manifolds() -> None:
 
         _refresh_all_bundled_nodes(pkg_root, target)
 
-        # Re-copy other top-level shipped files (e.g. scenarios.json
+        # Re-copy other top-level shipped JSON files (e.g. scenarios.json
         # provenance) that aren't manifold.json or under nodes/.
         for entry in pkg_root.iterdir():
-            if not entry.is_file():
-                continue
-            if entry.name == "manifold.json":
+            if not _is_bundled_json_file(entry) or entry.name == "manifold.json":
                 continue
             write_bytes_atomic(target / entry.name, entry.read_bytes())
 

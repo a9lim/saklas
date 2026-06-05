@@ -39,13 +39,16 @@ The unifying facts:
   The de-rogued "aggressive vector" direction is just *which PCA metric the fit
   uses* — gated by the same whitener-coverage check every other surface uses.
 
-The bundled defaults map cleanly onto the taxonomy:
+The complete bundled defaults map cleanly onto the taxonomy. Package-data folders
+with missing declared node corpora are skipped by materialization, so in-progress
+generation output such as a partial `pad` run is not exposed as a default
+manifold:
 
 | artifact            | nodes | rank | structure | fit_mode   |
 |---------------------|-------|------|-----------|------------|
 | a concept vector    | 2     | 1    | flat      | `pca`      |
 | `personas`          | 107   | ~8   | flat      | `pca`      |
-| `pad`               | 20    | 3    | curved    | `spectral` |
+| `pad`               | 20    | 3    | curved    | `spectral` once corpus-complete |
 
 Every steering term — vectors, bare poles, `~`/`|` projections, `!` ablations,
 and `%` manifold positions — lowers at generation time to a single per-layer

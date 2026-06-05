@@ -25,7 +25,10 @@ class _ThinkState(IntEnum):
 log = logging.getLogger(__name__)
 
 def _tok_key(tokenizer: PreTrainedTokenizerBase) -> tuple[str, int]:
-    return (getattr(tokenizer, 'name_or_path', ''), tokenizer.vocab_size)
+    return (
+        getattr(tokenizer, "name_or_path", ""),
+        int(getattr(tokenizer, "vocab_size", 0) or 0),
+    )
 
 
 _eos_cache: dict[tuple[str, int], set[int]] = {}
@@ -44,8 +47,9 @@ def _get_eos_ids(model: PreTrainedModel, tokenizer: PreTrainedTokenizerBase) -> 
             eos_ids.add(eid)
         else:
             eos_ids.update(eid)
-    if tokenizer.eos_token_id is not None:
-        eos_ids.add(int(tokenizer.eos_token_id))  # pyright: ignore[reportArgumentType]  # transformers stub over-widens eos_token_id
+    tokenizer_eos = getattr(tokenizer, "eos_token_id", None)
+    if tokenizer_eos is not None:
+        eos_ids.add(int(tokenizer_eos))  # pyright: ignore[reportArgumentType]  # transformers stub over-widens eos_token_id
     # Pick up end-of-turn tokens that some models (Gemma 4, etc.) add as
     # special tokens but don't list in generation_config.eos_token_id.
     _EOT_NAMES = {"<end_of_turn>", "<|endoftext|>", "<|end|>", "<|eot_id|>",

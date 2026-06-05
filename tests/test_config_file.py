@@ -98,13 +98,13 @@ def test_apply_flag_overrides() -> None:
 
 def test_ensure_vectors_installed_all_present(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    # ``default/happy.sad`` is a bundled manifold — ensure_vectors_installed
+    # ``default/confident.uncertain`` is a bundled manifold — ensure_vectors_installed
     # materializes the bundled set, so the ``default/`` reference resolves
     # against the just-dropped folder with nothing to install.  Reset the
     # process-scope materialize guard so it actually fires under this test's
     # SAKLAS_HOME (in a real CLI run, config load is the first materialize).
     monkeypatch.setattr("saklas.io.manifolds._materialized_this_process", False)
-    c = cfg.ConfigFile(vectors="0.5 default/happy.sad")
+    c = cfg.ConfigFile(vectors="0.5 default/confident.uncertain")
     missing = cfg.ensure_vectors_installed(c, strict=False)
     assert missing == []
 

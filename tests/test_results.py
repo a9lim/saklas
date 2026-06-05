@@ -3,11 +3,13 @@ import json
 import csv
 import tempfile
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 import torch
 from saklas.core.results import (
     ProbeReadings,
+    ProbeReading,
     GenerationResult,
     RunSet,
     TokenEvent,
@@ -31,21 +33,22 @@ class TestPublicAPI:
 class TestProbeReadings:
     def test_from_per_generation_data(self):
         readings = ProbeReadings(
-            per_generation=[0.1, 0.3, 0.5, 0.4],
-            mean=0.325, std=0.1479, min=0.1, max=0.5, delta_per_gen=0.1,
+            per_generation=[(0.1,), (0.3,), (0.5,), (0.4,)],
+            mean=(0.325,), std=(0.1479,), min=(0.1,), max=(0.5,), delta_per_gen=(0.1,),
         )
-        assert readings.mean == 0.325
-        assert readings.min == 0.1
+        assert readings.mean == (0.325,)
+        assert readings.min == (0.1,)
         assert len(readings.per_generation) == 4
 
     def test_to_dict_returns_plain_types(self):
         readings = ProbeReadings(
-            per_generation=[0.1, 0.2], mean=0.15, std=0.05, min=0.1, max=0.2, delta_per_gen=0.1,
+            per_generation=[(0.1,), (0.2,)],
+            mean=(0.15,), std=(0.05,), min=(0.1,), max=(0.2,), delta_per_gen=(0.1,),
         )
         d = readings.to_dict()
         assert isinstance(d, dict)
         assert isinstance(d["per_generation"], list)
-        assert isinstance(d["mean"], float)
+        assert isinstance(d["mean"], tuple)
 
 
 class TestGenerationResult:
@@ -62,7 +65,8 @@ class TestGenerationResult:
 
     def test_to_dict_with_probes(self):
         readings = ProbeReadings(
-            per_generation=[0.5], mean=0.5, std=0.0, min=0.5, max=0.5, delta_per_gen=0.0,
+            per_generation=[(0.5,)],
+            mean=(0.5,), std=(0.0,), min=(0.5,), max=(0.5,), delta_per_gen=(0.0,),
         )
         result = GenerationResult(
             text="Hi", tokens=[1], token_count=1, tok_per_sec=5.0, elapsed=0.2,
@@ -133,11 +137,13 @@ class TestTokenEvent:
         assert event.top_alts == alts
 
     def test_scores_and_perplexity(self):
+        happy = ProbeReading(fraction=0.4, nearest=[], coords=(0.4,))
+        sad = ProbeReading(fraction=-0.1, nearest=[], coords=(-0.1,))
         event = TokenEvent(
             text="x", token_id=0, index=0,
-            scores={"happy": 0.4, "sad": -0.1}, perplexity=12.7,
+            scores={"happy": happy, "sad": sad}, perplexity=12.7,
         )
-        assert event.scores == {"happy": 0.4, "sad": -0.1}
+        assert event.scores == {"happy": happy, "sad": sad}
         assert event.perplexity == 12.7
 
     def test_finish_reason_set(self):
@@ -163,7 +169,8 @@ class TestResultCollector:
 
     def test_probe_readings_flattened(self):
         readings = ProbeReadings(
-            per_generation=[0.5], mean=0.5, std=0.0, min=0.5, max=0.5, delta_per_gen=0.0,
+            per_generation=[(0.5,)],
+            mean=(0.5,), std=(0.0,), min=(0.5,), max=(0.5,), delta_per_gen=(0.0,),
         )
         result = GenerationResult(
             text="Hi", tokens=[1], token_count=1, tok_per_sec=5.0, elapsed=0.2,
@@ -176,6 +183,23 @@ class TestResultCollector:
         assert d["probe_honest_std"] == 0.0
         assert d["probe_honest_min"] == 0.5
         assert d["probe_honest_max"] == 0.5
+
+    def test_probe_readings_flattened_accepts_legacy_scalar_stats(self):
+        readings = ProbeReadings(
+            per_generation=cast(Any, [0.5]),
+            mean=cast(Any, 0.5),
+            std=cast(Any, 0.0),
+            min=cast(Any, 0.5),
+            max=cast(Any, 0.5),
+            delta_per_gen=cast(Any, 0.0),
+        )
+        result = GenerationResult(
+            text="Hi", tokens=[1], token_count=1, tok_per_sec=5.0, elapsed=0.2,
+            readings={"honest": readings}, vectors={},
+        )
+        collector = ResultCollector()
+        collector.add(result)
+        assert collector.results[0]["probe_honest_mean"] == 0.5
 
     def test_to_jsonl(self):
         collector = ResultCollector()

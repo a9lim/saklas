@@ -73,7 +73,7 @@ one-pole ray (the live 2-node-vector read goes through extraction's whitened
 `fit_affine_subspace`; the legacy bipolar-centroid fold was retired in the
 Mahalanobis-only collapse). `folded_vector_directions(manifold)` is the **reverse view**:
 `{L: δ̂_L · share_L}`, the baked-direction view of a 2-node affine manifold, used
-to back the `Profile`-returning surface (`extract()`, `subspace compare`/`why`,
+to back the `Profile`-returning surface (`extract()`, `manifold compare`/`why`,
 GGUF export) without a second stored representation. It raises on a curved or
 multi-dim manifold. Dispatch lowers every plain vector term through
 `fold_directions_to_subspace` → `_affine_manifold_push` (`session.py`) onto the
@@ -166,7 +166,7 @@ invariant — fp16's 65504 ceiling overflows gemma-3's late layers to
 ±inf, poisoning Σ). Any layer whose centered acts or `K` come back non-finite is
 *excluded*, so `covers_all` is trustworthy as "finite factors everywhere" — the
 all-or-nothing gate shared by extraction, manifold fit, projection, monitor, and
-`subspace compare`. Primitives: `mahalanobis_cosine`, `mahalanobis_norm`,
+`manifold compare`. Primitives: `mahalanobis_cosine`, `mahalanobis_norm`,
 `leace_project`, `apply_inv`, `subspace_gram(layer, B) = B Σ⁻¹ Bᵀ` (the (R,R)
 reduced inverse covariance behind whitened share + whitened manifold reads),
 `woodbury_factors` (device-resident factors for the monitor's inline per-token
@@ -520,7 +520,7 @@ coordinate axis (`mean`/`std`/`min`/`max`/`delta_per_gen` are `tuple[float,...]`
 ## histogram.py
 
 `HIST_BUCKETS = 16`; `bucketize(norms, buckets)` collapses sorted per-layer norms
-into evenly-sized groups. Used by the TUI WHY footer + CLI `subspace why`.
+into evenly-sized groups. Used by the TUI WHY footer + CLI `manifold why`.
 
 ## sampling.py / steering.py / steering_expr.py / events.py / errors.py / profile.py
 

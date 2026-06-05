@@ -125,8 +125,9 @@ space — the target whitener is **required** and must cover the transferred lay
 `_from-<safe_src>` variant). `manifold_summary(folder)` is the session-independent
 serializer shared by `pack show -j` + the HTTP summary route.
 `iter_manifold_folders`, `bundled_manifold_names`, `materialize_bundled_manifolds`
-(copy-on-miss into `default/`, plus a re-copy when the bundled manifest hash drifts
-or the on-disk `format_version` predates `MANIFOLD_FORMAT_VERSION`). Per-node `role`
+(copy-on-miss into `default/` for complete package-data folders only, plus a
+re-copy when the bundled manifest hash drifts or the on-disk `format_version`
+predates `MANIFOLD_FORMAT_VERSION`). Per-node `role`
 (slug `[a-z0-9._-]+`) rides the fit to `compute_node_centroid` for role-baselined
 centroids; family-unsupported raises `RoleSubstitutionUnsupportedError` at fit time.
 

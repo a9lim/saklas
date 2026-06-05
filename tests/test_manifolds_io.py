@@ -1722,6 +1722,77 @@ def test_read_manifold_scenarios_roundtrip(tmp_path: Path):
     assert read_manifold_scenarios(folder) == ["alpha", "beta"]
 
 
+def test_bundled_materialization_helpers_ignore_non_json_payloads(tmp_path: Path) -> None:
+    """Package-data materialization should not mirror local metadata files."""
+    from saklas.io import manifolds as M
+
+    pkg = tmp_path / "pkg"
+    (pkg / "nodes").mkdir(parents=True)
+    (pkg / "manifold.json").write_text('{"name": "m"}')
+    (pkg / "scenarios.json").write_text('{"scenarios": []}')
+    (pkg / ".DS_Store").write_text("finder")
+    (pkg / "README.txt").write_text("not package data")
+    (pkg / "nodes" / "00_alpha.json").write_text('["a"]')
+    (pkg / "nodes" / ".DS_Store").write_text("finder")
+    (pkg / "nodes" / "notes.txt").write_text("not package data")
+
+    target = tmp_path / "target"
+    M._copy_bundled_manifold_fresh(pkg, target)
+
+    assert (target / "manifold.json").is_file()
+    assert (target / "scenarios.json").is_file()
+    assert (target / "nodes" / "00_alpha.json").is_file()
+    assert not (target / ".DS_Store").exists()
+    assert not (target / "README.txt").exists()
+    assert not (target / "nodes" / ".DS_Store").exists()
+    assert not (target / "nodes" / "notes.txt").exists()
+
+    (pkg / "nodes" / "01_beta.json").write_text('["b"]')
+    (target / "nodes" / "stale.json").write_text('["old"]')
+    (target / "nodes" / ".DS_Store").write_text("old finder")
+
+    M._refresh_all_bundled_nodes(pkg, target)
+
+    assert (target / "nodes" / "00_alpha.json").read_text() == '["a"]'
+    assert (target / "nodes" / "01_beta.json").read_text() == '["b"]'
+    assert not (target / "nodes" / "stale.json").exists()
+    assert not (target / "nodes" / ".DS_Store").exists()
+
+
+def test_bundled_manifold_names_skips_incomplete_package_data(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A partial generation directory must not materialize as a bundled manifold."""
+    from saklas.io import manifolds as M
+
+    root = tmp_path / "bundled"
+    complete = root / "complete"
+    (complete / "nodes").mkdir(parents=True)
+    (complete / "manifold.json").write_text(json.dumps({
+        "nodes": [{"label": "alpha"}, {"label": "beta"}],
+    }))
+    (complete / "nodes" / "00_alpha.json").write_text('["a"]')
+    (complete / "nodes" / "01_beta.json").write_text('["b"]')
+
+    partial = root / "partial"
+    (partial / "nodes").mkdir(parents=True)
+    (partial / "manifold.json").write_text(json.dumps({
+        "nodes": [{"label": "alpha"}, {"label": "beta"}],
+    }))
+    (partial / "nodes" / "00_alpha.json").write_text('["a"]')
+
+    junk = root / "junk"
+    junk.mkdir()
+    (junk / "manifold.json").write_text("{not json")
+
+    monkeypatch.setattr(
+        M._resources, "files",
+        lambda package: root if package == "saklas.data.manifolds" else None,
+    )
+
+    assert M.bundled_manifold_names() == ["complete"]
+
+
 # =================================================== baked (corpus-less) ===
 #
 # A baked manifold is a pre-fitted, corpus-less artifact (merge output /

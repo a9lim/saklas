@@ -1,14 +1,14 @@
 """4.0 step 6c-2 — the manifold-fold fallback for the disk-side inspection verbs.
 
-Bundled & user concepts ship as 2-node ``pca`` manifolds, so ``subspace
-compare`` / ``subspace why`` (the verbs that read baked tensors off disk
+Bundled & user concepts ship as 2-node ``pca`` manifolds, so ``manifold
+compare`` / ``manifold why`` (the verbs that read baked tensors off disk
 without a model) fall back to folding a **fitted** manifold tensor when no
 ``vectors/`` tensor resolves.  These tests synthesize a fitted 2-node manifold
 on disk (no model) and exercise the CLI runners end-to-end.
 
 The legacy bipolar-centroid fold (``_fold_centroids_to_affine_manifold``) was
 retired in the Mahalanobis-only collapse; the fitted manifold here is built via
-the production ``fit_affine_subspace`` primitive.  ``subspace compare`` is now
+the production ``fit_affine_subspace`` primitive.  ``manifold compare`` is now
 Mahalanobis-only, so the fixture seeds a per-model neutral cache on disk for the
 runner's ``LayerWhitener.from_cache`` build.
 """
@@ -51,7 +51,7 @@ def _unit(v: torch.Tensor) -> torch.Tensor:
 def _seed_neutral_cache(model_id: str, *, n: int = 64, seed: int = 5) -> None:
     """Write a per-model neutral-activation + layer-means disk cache.
 
-    ``subspace compare`` builds its (mandatory) whitener via
+    ``manifold compare`` builds its (mandatory) whitener via
     ``LayerWhitener.from_cache(model_id)`` — there is no Euclidean path — so the
     disk cache (``neutral_activations.safetensors`` + ``layer_means.safetensors``,
     keyed ``layer_<idx>``, fp32) must exist for the layers the folded manifolds
@@ -175,7 +175,7 @@ class TestFoldHelper:
 
 
 # ---------------------------------------------------------------------------
-# subspace why — folds a fitted manifold
+# manifold why — folds a fitted manifold
 # ---------------------------------------------------------------------------
 
 class TestWhyFold:
@@ -224,7 +224,7 @@ class TestWhyFold:
 
 
 # ---------------------------------------------------------------------------
-# subspace compare — folds fitted manifolds (named + 1-arg rank-all).
+# manifold compare — folds fitted manifolds (named + 1-arg rank-all).
 # Mahalanobis-only: the fixture seeds the per-model neutral cache.
 # ---------------------------------------------------------------------------
 
@@ -306,7 +306,7 @@ def _make_full_manifold(ns: str, name: str, *, seed: int = 0) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# subspace merge — folds fitted manifold components
+# manifold bake — folds fitted manifold components
 # ---------------------------------------------------------------------------
 
 class TestMergeFold:
