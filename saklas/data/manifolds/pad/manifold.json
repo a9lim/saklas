@@ -1,0 +1,92 @@
+{
+  "format_version": 5,
+  "name": "pad",
+  "description": "Discover-mode SPECTRAL manifold over the Mehrabian-Russell PAD affect space (pleasure x arousal x dominance; Mehrabian & Russell, 'An Approach to Environmental Psychology', 1974). Twenty first-person mood nodes chosen to span the PAD octants \u2014 high/low pleasure (happy, grateful, relieved, hopeful, playful / sad, weary, distressed, humiliated, disgusted), high/low arousal (excited, alert, surprised / calm, bored), and the dominance contrast (dominant, triumphant, angry / submissive, fearful) \u2014 each answering the shared baseline prompts in character. Fit CURVED (spectral) rather than flat pca because affect is a circumplex: 'opposite' moods are emergent points on a low-dim curved surface, not endpoints of independent axes, so a straight-line subspace would cut through off-manifold regions. Laplacian eigenmaps over the per-model whitened-consensus distances derive the layout (max_dim 3, the PAD dimensionality); k is picked by the eigenvalue-ratio cliff. Converted from the prior authored 3-D box: the per-model spectral embedding recovers the model's own affect geometry rather than declaring idealized coordinates, trading cross-model coordinate-comparability for a data-driven surface.",
+  "fit_mode": "spectral",
+  "hyperparams": {
+    "max_dim": 3
+  },
+  "nodes": [
+    {
+      "label": "excited",
+      "kind": "abstract"
+    },
+    {
+      "label": "happy",
+      "kind": "abstract"
+    },
+    {
+      "label": "calm",
+      "kind": "abstract"
+    },
+    {
+      "label": "weary",
+      "kind": "abstract"
+    },
+    {
+      "label": "sad",
+      "kind": "abstract"
+    },
+    {
+      "label": "distressed",
+      "kind": "abstract"
+    },
+    {
+      "label": "alert",
+      "kind": "abstract"
+    },
+    {
+      "label": "dominant",
+      "kind": "abstract"
+    },
+    {
+      "label": "submissive",
+      "kind": "abstract"
+    },
+    {
+      "label": "angry",
+      "kind": "abstract"
+    },
+    {
+      "label": "fearful",
+      "kind": "abstract"
+    },
+    {
+      "label": "surprised",
+      "kind": "abstract"
+    },
+    {
+      "label": "triumphant",
+      "kind": "abstract"
+    },
+    {
+      "label": "humiliated",
+      "kind": "abstract"
+    },
+    {
+      "label": "disgusted",
+      "kind": "abstract"
+    },
+    {
+      "label": "bored",
+      "kind": "abstract"
+    },
+    {
+      "label": "grateful",
+      "kind": "abstract"
+    },
+    {
+      "label": "relieved",
+      "kind": "abstract"
+    },
+    {
+      "label": "playful",
+      "kind": "abstract"
+    },
+    {
+      "label": "hopeful",
+      "kind": "abstract"
+    }
+  ],
+  "files": {}
+}
