@@ -105,7 +105,7 @@
         {/each}
       </datalist>
       <button type="button" onclick={add}>add term</button>
-      <button type="button" onclick={() => openDrawer("vectors")}>browse…</button>
+      <button type="button" onclick={() => openDrawer("subspace")}>browse…</button>
     </section>
 
     <section class="terms">

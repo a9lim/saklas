@@ -34,7 +34,7 @@
   // Content-driven drawer sizing — forms and pickers get a narrow panel,
   // analysis views keep the wide one (docs/plans/webui-overhaul.md §8).
   const NARROW_DRAWERS: ReadonlySet<DrawerName> = new Set<DrawerName>([
-    "vectors",
+    "subspace",
     "extract",
     "manifolds",
     "manifold_builder",
@@ -205,12 +205,22 @@
           class:narrow={NARROW_DRAWERS.has(drawerState.open)}
           aria-label="{drawerState.open} drawer"
         >
-          {#if drawerState.open === "vectors"}
-            <Drawers.Vectors params={drawerState.params} />
+          {#if drawerState.open === "subspace"}
+            <Drawers.RackDrawer
+              params={{
+                ...(drawerState.params as Record<string, unknown>),
+                family: "subspace",
+              }}
+            />
           {:else if drawerState.open === "extract"}
             <Drawers.Extract params={drawerState.params} />
           {:else if drawerState.open === "manifolds"}
-            <Drawers.Manifolds params={drawerState.params} />
+            <Drawers.RackDrawer
+              params={{
+                ...(drawerState.params as Record<string, unknown>),
+                family: "manifold",
+              }}
+            />
           {:else if drawerState.open === "manifold_builder"}
             <Drawers.ManifoldBuilder params={drawerState.params} />
           {:else if drawerState.open === "manifold_merge"}

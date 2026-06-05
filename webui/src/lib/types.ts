@@ -215,7 +215,7 @@ export interface ManifoldInfo {
    *  for ``authored``.  Server-supplied; absent on older servers. */
   is_discover?: boolean;
   /** Category-valued tags off ``manifold.json`` (e.g. ``register`` /
-   *  ``cultural``).  Drives the concept-axis grouping in VectorsDrawer.
+   *  ``cultural``).  Drives the category grouping in the shared RackDrawer.
    *  NOTE: the ``GET /manifolds`` list serializer currently omits this
    *  (``manifold_summary`` doesn't emit ``tags``), so it's usually
    *  absent on the wire today — grouping degrades to "Other" until the
@@ -1268,19 +1268,23 @@ export interface PendingAction {
 // ----------------------------------------------------- drawers --
 
 export type DrawerName =
-  /** Unified vector management drawer (replaces the legacy
-   *  ``vector_picker`` + ``probe_picker`` pair).  Two sections split
-   *  on the server-supplied ``has_tensor`` flag: extracted rows get
-   *  steer/probe/delete toggles, statements-only rows get
-   *  extract/delete.  Opened from both rack "+ add" buttons. */
-  | "vectors"
-  /** Custom-vector extraction form — reached from the
-   *  "+ custom vector" button at the top of ``vectors``.  Submitting
-   *  closes back to the vectors drawer so the new row appears
+  /** Shared rack browser, subspace (flat) family — every flat affine
+   *  fit (``fit_mode`` pca / baked): 2-node concept axes plus higher-rank
+   *  flats like ``personas``.  White ``--accent``.  Split Fitted /
+   *  Unfitted, per-row steer / probe / re-fit / delete, with a
+   *  "+ extract subspace" launcher.  ``RackDrawer`` with
+   *  ``family: "subspace"``.  Opened from both rack "+ add" buttons. */
+  | "subspace"
+  /** Custom-concept extraction form — reached from the
+   *  "+ extract subspace" button at the top of ``subspace``.  Submitting
+   *  closes back to the subspace drawer so the new row appears
    *  reactively. */
   | "extract"
-  /** Manifold browser — split Fitted / Unfitted, per-row steer / fit /
-   *  delete, with a "+ build manifold" launcher. */
+  /** Shared rack browser, manifold (curved) family — curved fits only
+   *  (``fit_mode`` spectral / authored), e.g. ``pad``.  Purple
+   *  ``--accent-purple``.  Same layout as the subspace half, with a
+   *  "+ build manifold" launcher.  ``RackDrawer`` with
+   *  ``family: "manifold"``. */
   | "manifolds"
   /** Manifold authoring form — domain step + node editor.  Reached
    *  from the "+ build manifold" button inside ``manifolds``. */

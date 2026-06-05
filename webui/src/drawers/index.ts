@@ -14,15 +14,16 @@
 //   "system_prompt"      → SystemPrompt
 //   "help"               → Help
 //
-// ``Vectors`` is the unified vector management drawer — replaces the
-// legacy steer/probe picker pair.  Two sections split on the server's
-// ``has_tensor`` flag (extracted vs statements-only).  Both rack "+
-// add" buttons open this; the ``ExtractDrawer`` is reached from a
-// "+ custom vector" launcher inside it.
+// ``RackDrawer`` is the shared rack browser — one component reskinned by
+// geometry family.  ``family: "subspace"`` (flat pca / baked fits, white
+// accent) and ``family: "manifold"`` (curved spectral / authored fits,
+// purple accent) are mirror images, differing only by accent, label, and
+// catalog filter.  Both rack "+ add" buttons open it; the per-family
+// authoring launcher (``ExtractDrawer`` / ``ManifoldBuilderDrawer``) is
+// reached from the "+ …" button inside it.
 
-export { default as Vectors } from "./VectorsDrawer.svelte";
+export { default as RackDrawer } from "./RackDrawer.svelte";
 export { default as Extract } from "./ExtractDrawer.svelte";
-export { default as Manifolds } from "./ManifoldDrawer.svelte";
 export { default as ManifoldBuilder } from "./ManifoldBuilderDrawer.svelte";
 export { default as ManifoldMerge } from "./ManifoldMergeDrawer.svelte";
 export { default as ManifoldPack } from "./ManifoldPacksDrawer.svelte";

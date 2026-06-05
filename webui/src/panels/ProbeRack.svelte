@@ -9,8 +9,8 @@
   // Every row wears the same RackCard chrome; the family is signalled only
   // by accent colour + marker glyph.  The sort dropdown (name / value /
   // change) orders within each group.  Light group sub-headers; an empty
-  // group hides.  Footer keeps the + add probe / + add manifold probe
-  // entry points and their drawer targets.
+  // group hides.  Footer keeps the + subspace probe / + manifold probe
+  // entry points (white / purple), opening the shared drawer in probe mode.
   //
   // Transcript highlight / compare-two controls live in Chat.svelte —
   // highlighting is about reading the transcript, so that is their one
@@ -56,14 +56,13 @@
     setProbeSortMode(v);
   }
 
-  function onAddProbe(): void {
-    openDrawer("vectors");
+  function onAddSubspaceProbe(): void {
+    // The shared rack drawer hosts the probe attach UI alongside the
+    // steer UI — every row carries both +steer and +probe.
+    openDrawer("subspace", { mode: "probe" });
   }
 
   function onAddManifoldProbe(): void {
-    // The manifolds drawer hosts the manifold-probe attach UI alongside
-    // the existing manifold-steering UI — symmetric with how VectorsDrawer
-    // hosts both steer/probe surfaces on every row.
     openDrawer("manifolds", { mode: "probe" });
   }
 </script>
@@ -96,27 +95,7 @@
           This server doesn't expose the read-side probe routes.
         </p>
       </div>
-    {:else if count === 0}
-      <div class="empty">
-        <p class="empty-copy">
-          Probes watch concepts activate as the model generates.
-          Add a vector to read concept presence, or a manifold to read
-          subspace fraction, nearest node, and inferred coordinates.
-        </p>
-        <div class="empty-actions">
-          <button type="button" class="add" onclick={onAddProbe}>
-            + add probe
-          </button>
-          <button
-            type="button"
-            class="add add-manifold"
-            onclick={onAddManifoldProbe}
-          >
-            + add manifold probe
-          </button>
-        </div>
-      </div>
-    {:else}
+    {:else if count > 0}
       {#if subspaceCount > 0}
         <h3 class="group-header subspace">subspace</h3>
         {#each subspaceProbes as name (name)}
@@ -142,23 +121,26 @@
     {/if}
   </div>
 
-  {#if count > 0}
+  <!-- Launchers stay reachable in both empty + populated states (hidden
+       only when the server lacks the probe routes).  Two family entry
+       points — white subspace vs purple manifold. -->
+  {#if !probeRack.unavailable}
     <div class="actions">
       <button
         type="button"
-        class="add"
-        onclick={onAddProbe}
-        title="Pick a concept to monitor (TUI /probe)"
+        class="add add-subspace"
+        onclick={onAddSubspaceProbe}
+        title="Attach a flat subspace as a read-side probe"
       >
-        + add probe
+        + subspace probe
       </button>
       <button
         type="button"
         class="add add-manifold"
         onclick={onAddManifoldProbe}
-        title="Attach a fitted manifold as a read-side probe"
+        title="Attach a curved manifold as a read-side probe"
       >
-        + add manifold probe
+        + manifold probe
       </button>
     </div>
   {/if}
@@ -261,8 +243,8 @@
     padding-left: var(--space-2);
   }
 
-  /* First-run teaching state — names the steer-vs-observe distinction the
-   * two racks otherwise blur. */
+  /* "Probe routes unavailable" notice — the one remaining empty state
+   * (the first-run teaching copy is gone; the launchers below stand in). */
   .empty {
     display: flex;
     flex-direction: column;
@@ -278,18 +260,10 @@
     line-height: 1.5;
     max-width: 32ch;
   }
-  /* Empty-state stacks the two entry points vertically so the manifold
-   * launcher reads as the second way in, not buried in an actions row.
-   * Mirrors SteeringRack's empty-actions shape. */
-  .empty-actions {
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-2);
-    width: 14em;
-  }
 
   /* Anchored at the bottom — same border-top + padding as SteeringRack
-   * so the two racks read as visual siblings. */
+   * so the two racks read as visual siblings.  Shown in both empty and
+   * populated states. */
   .actions {
     flex: 0 0 auto;
     display: flex;
@@ -299,8 +273,6 @@
   }
   .add {
     flex: 1 1 0;
-    background: var(--accent-subtle);
-    color: var(--accent);
     border: 1px solid var(--border);
     padding: var(--space-3) var(--space-5);
     border-radius: var(--radius);
@@ -309,20 +281,21 @@
     cursor: pointer;
     transition: background var(--dur) var(--ease-out);
   }
-  .empty-actions .add {
-    flex: 0 0 auto;
-    width: 100%;
+  /* Subspace launcher — white accent (the base family colour). */
+  .add-subspace {
+    background: var(--accent-subtle);
+    color: var(--accent);
   }
-  .add:hover {
+  .add-subspace:hover {
     background: var(--accent-glow);
   }
   /* Manifold launcher — purple-tinted to echo the manifold card's accent
    * so the probe-family colour stays consistent across the surfaces. */
   .add-manifold {
-    background: rgba(167, 139, 250, 0.10);
+    background: color-mix(in srgb, var(--accent-purple) 10%, transparent);
     color: var(--accent-purple);
   }
   .add-manifold:hover {
-    background: rgba(167, 139, 250, 0.18);
+    background: color-mix(in srgb, var(--accent-purple) 18%, transparent);
   }
 </style>

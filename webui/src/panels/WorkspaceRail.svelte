@@ -27,23 +27,23 @@
 
   const CATEGORIES: Category[] = [
     {
-      key: "vectors",
-      label: "Steering & vectors",
+      key: "subspace",
+      label: "Steering & subspaces",
       icon: "M5 19L19 5M19 5h-7M19 5v7",
       // Shared op vocabulary with the manifolds category — build / merge
       // sit in the same slots and the same label format so the two
       // steering surfaces read as one family.  Pack lifecycle is unified
       // under the manifolds category's "packs…" (concepts are manifolds
-      // now), so the vectors fan-out is build + merge only.
+      // now), so the subspace fan-out is build + merge only.
       tools: [
         { label: "build vector…", drawer: "extract" },
         { label: "merge vector…", drawer: "merge" },
       ],
     },
     {
-      // Manifold peer of "vectors" — same fan-out shape so the two
-      // steering surfaces feel parallel.  Catalog (ManifoldDrawer) is
-      // reached from rack "+" buttons, same as vectors → VectorsDrawer.
+      // Manifold peer of "subspace" — same fan-out shape so the two
+      // steering surfaces feel parallel.  Both catalogs are the shared
+      // RackDrawer (family-split), reached from the rack "+" buttons.
       key: "manifolds",
       label: "Steering manifolds",
       // Undulating spline curve — reads as "manifold" and is visually

@@ -1,6 +1,6 @@
 <script lang="ts">
-  // Custom-vector extraction — the "+ custom vector" launcher from the
-  // unified VectorsDrawer.  Two input modes:
+  // Custom-concept extraction — the "+ extract subspace" launcher from
+  // the shared rack drawer's subspace family.  Two input modes:
   //
   //   * poles   — type concept A (required) and B (optional); the bare
   //               slug ``source`` is submitted to ``/extract`` and saklas
@@ -8,7 +8,7 @@
   //   * custom  — supply the contrastive pairs directly.  The table
   //               starts with one empty row.
   //
-  // Submission closes immediately and reopens the vectors drawer so
+  // Submission closes immediately and reopens the subspace drawer so
   // the user lands back in the list while the sticky progress toast
   // tracks extraction in the background.
 
@@ -240,20 +240,20 @@
       req.source = { pairs: cleanPairs() };
     }
 
-    // Close this drawer and reopen the vectors drawer so the user
+    // Close this drawer and reopen the subspace drawer so the user
     // lands back in the list while extraction runs in the background.
     // ``driveExtract`` runs on the module scope, so the component
     // unmount here doesn't cancel it.
     closeDrawer();
-    openDrawer("vectors");
+    openDrawer("subspace");
     void driveExtract(req);
   }
 
   function cancel(): void {
-    // Esc / ✕ — back to the vectors drawer rather than no drawer, so
+    // Esc / ✕ — back to the subspace drawer rather than no drawer, so
     // the user doesn't get stranded after backing out of the form.
     closeDrawer();
-    openDrawer("vectors");
+    openDrawer("subspace");
   }
 </script>
 

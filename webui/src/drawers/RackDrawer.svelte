@@ -1,23 +1,35 @@
 <script lang="ts">
-  // Manifold browser — the "+ add manifold" surface from the steering
-  // rack.  Two sections split on whether a tensor exists for the loaded
-  // model:
+  // Shared rack drawer — one component, two reskins split by geometry
+  // family.  Subsumes the former VectorsDrawer + ManifoldDrawer: same
+  // layout, same actions, same chrome, differing only by accent colour,
+  // header label, and which manifolds the catalog filter admits.
   //
-  //   * Fitted    — manifolds with a baked tensor for the current
-  //                 model.  Per row: [+steer] [fit] [delete].
-  //   * Unfitted  — manifolds without a tensor for this model.  Per
-  //                 row: [fit] [delete] — they must be fitted before
-  //                 they can steer.
+  //   * subspace (white ``--accent``) — every flat affine fit
+  //     (``fit_mode`` ``pca`` or ``baked``): 2-node concept axes AND
+  //     higher-rank flats like ``personas``.
+  //   * manifold (purple ``--accent-purple``) — curved fits only
+  //     (``fit_mode`` ``spectral`` or ``authored``), e.g. ``pad``.
   //
-  // The "+ build manifold" button at the top opens ManifoldBuilderDrawer
-  // for authoring a fresh manifold.  Fit drives an SSE progress toast;
-  // delete uses a 2-step confirm.
+  // Within the family filter the existing fitted / unfitted split
+  // (``fitted_for_session``) applies, plus optional category grouping and
+  // a free-text search over manifolds *and* their node labels.  Two
+  // sections:
+  //
+  //   * Fitted    — has a baked tensor for the loaded model.  Per row:
+  //                 [ⓘ] [+steer] [+probe] [re-fit] [delete].
+  //   * Unfitted  — node corpus on disk but no tensor for this model.
+  //                 Per row: [fit] [delete].
+  //
+  // The top "+ …" launcher is the one legitimately family-specific flow:
+  // subspace opens the concept-extract drawer, manifold opens the
+  // curved-manifold builder.
 
   import { onMount } from "svelte";
   import { SvelteMap, SvelteSet } from "svelte/reactivity";
   import { ApiError, apiManifolds, apiManifoldFitStream } from "../lib/api";
   import {
     addManifoldToRack,
+    addVectorToRack,
     attachProbe,
     closeDrawer,
     probeRack,
@@ -33,16 +45,31 @@
     updateToast,
   } from "../lib/stores/toasts.svelte";
   import type { ManifoldInfo } from "../lib/types";
+  import {
+    CATEGORY_LABELS,
+    CATEGORY_ORDER,
+    DEFAULT_EXPANDED,
+    categoryOf,
+    recommendedAlpha,
+    type Category,
+  } from "../lib/concepts";
   import DiagnosticsPanel from "../lib/manifolds/DiagnosticsPanel.svelte";
 
-  // ``mode`` selects the visual emphasis: ``"steer"`` (default —
-  // matches the original drawer behaviour) or ``"probe"`` (opened from
-  // ProbeRack's "+ add manifold probe"; lands the user on the probe
-  // attach action and the inline custom-probe form).  ``params`` is
-  // typed as ``unknown`` so it round-trips through ``drawerState.params``
-  // (also typed loosely so each drawer owns its own shape); the mode
-  // derivation pulls the field defensively.
+  // ``params`` carries ``{ family, mode?, seed_a? }``; typed ``unknown``
+  // so it round-trips through ``drawerState.params`` (loosely typed so
+  // each drawer owns its own shape).  ``family`` and ``mode`` are derived
+  // defensively — the same pattern ManifoldDrawer used for ``mode``.
   let { params }: { params?: unknown } = $props();
+
+  const family = $derived.by<"subspace" | "manifold">(() => {
+    if (
+      params && typeof params === "object"
+      && (params as { family?: unknown }).family === "manifold"
+    ) {
+      return "manifold";
+    }
+    return "subspace";
+  });
   const mode = $derived.by<"steer" | "probe">(() => {
     if (
       params && typeof params === "object"
@@ -53,6 +80,23 @@
     return "steer";
   });
 
+  // Family-derived chrome.  ``familyAccent`` is wired to a CSS custom
+  // property on the shell so every accented rule (header title, row
+  // accents, stripes, hovers) reads one variable — white for subspace,
+  // purple for manifold.
+  const familyAccent = $derived(
+    family === "manifold" ? "var(--accent-purple)" : "var(--accent)",
+  );
+  const title = $derived(family === "manifold" ? "manifold" : "subspace");
+  const launcherLabel = $derived(
+    family === "manifold" ? "build manifold" : "extract subspace",
+  );
+  const launcherHint = $derived(
+    family === "manifold"
+      ? "author a domain and node corpus"
+      : "extract a concept the catalog doesn't carry",
+  );
+
   let errorMsg: string | null = $state(null);
 
   const busyKeys = new SvelteSet<string>();
@@ -60,25 +104,28 @@
   const confirmTimers = new Map<string, number>();
 
   // Per-row inspector state.  The list endpoint omits per-tensor
-  // diagnostics (the JSON would balloon on big heaps), so the
-  // inspector lazily GETs the detail shape the first time the user
-  // expands a row.  ``inspectKeys`` drives the open/closed flag;
-  // ``detailCache`` keeps the fetched payload alive for subsequent
-  // re-opens within the same drawer mount.
+  // diagnostics (the JSON would balloon on big heaps), so the inspector
+  // lazily GETs the detail shape the first time the user expands a row.
   const inspectKeys = new SvelteSet<string>();
   const detailCache = new SvelteMap<string, ManifoldInfo>();
   const detailLoading = new SvelteSet<string>();
   const detailErrors = new SvelteMap<string, string>();
 
-  // Free-text filter over manifolds *and* their node labels (mirrors
-  // VectorsDrawer's search).  ``searching`` auto-expands every node
-  // list so matches are visible without a manual unfold.
+  // Free-text filter over manifolds *and* their node labels.
+  // ``searching`` auto-expands every node list + category so matches are
+  // visible without a manual unfold.
   let query: string = $state("");
   let searchInputRef: HTMLInputElement | null = $state(null);
 
   // Per-row node-list collapse.  Node lists default OPEN, so a key
   // present here means the user explicitly folded that row's nodes.
   const collapsedNodes = new SvelteSet<string>();
+
+  // Section-prefixed category expansion ("ft:register" / "un:register")
+  // so the Fitted / Unfitted sections track open state independently.
+  const expanded = new SvelteSet<string>(
+    [...DEFAULT_EXPANDED].flatMap((c) => [`ft:${c}`, `un:${c}`]),
+  );
 
   onMount(() => {
     void refreshManifoldList();
@@ -114,9 +161,9 @@
     return label.toLowerCase().includes(q);
   }
 
-  /** A manifold matches the query on its key/name/namespace/description
-   *  OR on any of its node labels — so searching a node name surfaces
-   *  the card that owns it. */
+  /** A manifold matches the query on its key/name/namespace/description/
+   *  tags OR on any of its node labels — so searching a node name
+   *  surfaces the card that owns it. */
   function rowMatches(m: ManifoldInfo, q: string): boolean {
     if (!q) return true;
     const n = q.toLowerCase();
@@ -124,6 +171,11 @@
     if (m.name.toLowerCase().includes(n)) return true;
     if (m.namespace.toLowerCase().includes(n)) return true;
     if (m.description && m.description.toLowerCase().includes(n)) return true;
+    if (Array.isArray(m.tags)) {
+      for (const t of m.tags) {
+        if (typeof t === "string" && t.toLowerCase().includes(n)) return true;
+      }
+    }
     return (m.node_labels ?? []).some((l) => nodeMatches(l, n));
   }
 
@@ -156,28 +208,72 @@
     else collapsedNodes.add(key);
   }
 
-  /** Rack the manifold (if not already) and pin it to ``label`` as a
-   *  label-form term, then close — the one-click "steer to this node"
-   *  affordance.  A second node click on an already-racked manifold
-   *  just re-targets the existing term via ``setManifoldLabel``. */
-  function onSteerNode(m: ManifoldInfo, label: string): void {
-    if (!m.fitted_for_session) return;
-    const key = rowKey(m);
-    addManifoldToRack(key);
-    setManifoldLabel(key, label);
-    closeDrawer();
+  // ----- family filter + section split --------------------------------
+
+  /** The family discriminator — subspace admits every flat affine fit
+   *  (pca / baked), manifold admits curved fits only (spectral /
+   *  authored).  ``fit_mode`` defaults to ``authored`` (curved) when a
+   *  legacy server omits it. */
+  function inFamily(m: ManifoldInfo): boolean {
+    const fm = m.fit_mode ?? "authored";
+    if (family === "subspace") return fm === "pca" || fm === "baked";
+    return fm === "spectral" || fm === "authored";
   }
 
   const fitted = $derived(
     manifoldRack.catalog.filter(
-      (m) => m.fitted_for_session && rowMatches(m, query.trim()),
+      (m) => inFamily(m) && m.fitted_for_session && rowMatches(m, query.trim()),
     ),
   );
   const unfitted = $derived(
     manifoldRack.catalog.filter(
-      (m) => !m.fitted_for_session && rowMatches(m, query.trim()),
+      (m) => inFamily(m) && !m.fitted_for_session && rowMatches(m, query.trim()),
     ),
   );
+
+  // Whether *any* row in the family exists at all (drives the empty
+  // states vs the "no match" state).
+  const familyTotal = $derived(
+    manifoldRack.catalog.filter((m) => inFamily(m)).length,
+  );
+
+  // ----- category grouping --------------------------------------------
+
+  function groupedByCategory(rows: ManifoldInfo[]): Map<Category, ManifoldInfo[]> {
+    const m = new Map<Category, ManifoldInfo[]>();
+    for (const r of rows) {
+      // Tags ride the wire now (when the list serializer emits them);
+      // missing → "other".
+      const c = categoryOf(r.tags);
+      const list = m.get(c);
+      if (list) list.push(r);
+      else m.set(c, [r]);
+    }
+    for (const list of m.values()) {
+      list.sort((a, b) => a.name.localeCompare(b.name));
+    }
+    return m;
+  }
+
+  function sectionsOf(g: Map<Category, ManifoldInfo[]>) {
+    const order: Category[] = [...CATEGORY_ORDER, "other"];
+    return order
+      .filter((c) => (g.get(c)?.length ?? 0) > 0)
+      .map((c) => ({ cat: c, items: g.get(c) as ManifoldInfo[] }));
+  }
+
+  const ftSections = $derived(sectionsOf(groupedByCategory(fitted)));
+  const unSections = $derived(sectionsOf(groupedByCategory(unfitted)));
+
+  function toggleCat(key: string): void {
+    if (expanded.has(key)) expanded.delete(key);
+    else expanded.add(key);
+  }
+  function catOpen(key: string): boolean {
+    return searching || expanded.has(key);
+  }
+
+  // ----- per-row membership -------------------------------------------
 
   function isRacked(m: ManifoldInfo): boolean {
     return manifoldRack.entries.has(rowKey(m)) ||
@@ -189,9 +285,36 @@
       probeRack.entries.has(m.name);
   }
 
+  // ----- steer / node-steer / probe -----------------------------------
+
+  /** Rack the manifold (if not already) and pin it to ``label`` as a
+   *  label-form term, then close — the one-click "steer to this node"
+   *  affordance.  A second node click on an already-racked manifold just
+   *  re-targets the existing term via ``setManifoldLabel``. */
+  function onSteerNode(m: ManifoldInfo, label: string): void {
+    if (!m.fitted_for_session) return;
+    const key = rowKey(m);
+    addManifoldToRack(key);
+    setManifoldLabel(key, label);
+    closeDrawer();
+  }
+
+  /** +steer dispatch — the one behavioural fork between the families.
+   *  Subspace: a 2-node ``pca`` axis is a bipolar steering vector, so it
+   *  goes through the vector rack at its recommended α; any other flat
+   *  (a higher-rank fan like ``personas``) joins as a manifold term.
+   *  Manifold: always a manifold term. */
   function onSteer(m: ManifoldInfo): void {
     if (isRacked(m)) return;
-    addManifoldToRack(rowKey(m));
+    if (
+      family === "subspace"
+      && m.node_count === 2
+      && (m.fit_mode ?? "authored") === "pca"
+    ) {
+      addVectorToRack(m.name, recommendedAlpha(m));
+    } else {
+      addManifoldToRack(rowKey(m));
+    }
     closeDrawer();
   }
 
@@ -201,7 +324,7 @@
     busyKeys.add(key);
     try {
       const info = await attachProbe(key);
-      pushToast(`attached manifold probe ${info.name}`, { kind: "info" });
+      pushToast(`attached probe ${info.name}`, { kind: "info" });
       closeDrawer();
     } catch (e) {
       pushToast(`attach failed — ${describeError(e)}`, {
@@ -213,9 +336,8 @@
     }
   }
 
-  // Custom-attach form state — for selectors not in the catalog
-  // (typed slugs, ns/name overrides, etc.).  Only rendered in probe
-  // mode so it doesn't clutter the steer flow.
+  // ----- custom-attach form (probe mode) ------------------------------
+
   let customSelector: string = $state("");
   let customAlias: string = $state("");
   let customTopN: number = $state(3);
@@ -234,7 +356,7 @@
       if (customAlias.trim()) opts.name = customAlias.trim();
       if (customTopN && customTopN > 0) opts.top_n = customTopN;
       const info = await attachProbe(sel, opts);
-      pushToast(`attached manifold probe ${info.name}`, { kind: "info" });
+      pushToast(`attached probe ${info.name}`, { kind: "info" });
       customSelector = "";
       customAlias = "";
     } catch (e) {
@@ -247,11 +369,13 @@
     }
   }
 
+  // ----- fit / delete -------------------------------------------------
+
   function onFit(m: ManifoldInfo): void {
     const key = rowKey(m);
     busyKeys.add(key);
     errorMsg = null;
-    const toastId = pushToast(`fitting manifold '${key}'…`, {
+    const toastId = pushToast(`fitting '${key}'…`, {
       kind: "info",
       ttlMs: null,
     });
@@ -308,7 +432,12 @@
     try {
       await apiManifolds.delete(m.namespace, m.name);
       await refreshManifoldList();
-      pushToast(`deleted manifold ${key}`, { kind: "info" });
+      // Bundled artifacts (the ``default/`` namespace) respawn on the
+      // next session init, so flag that in the toast.
+      const msg = m.namespace === "default"
+        ? `deleted ${key} — bundled, respawns on restart`
+        : `deleted ${key}`;
+      pushToast(msg, { kind: "info" });
     } catch (e) {
       errorMsg = describeError(e);
     } finally {
@@ -316,8 +445,14 @@
     }
   }
 
-  function gotoBuilder(): void {
-    openDrawer("manifold_builder");
+  // ----- launchers + badges -------------------------------------------
+
+  function gotoLauncher(): void {
+    if (family === "manifold") {
+      openDrawer("manifold_builder");
+    } else {
+      openDrawer("extract", { seed_a: query.trim() || undefined });
+    }
   }
 
   function fitModeBadge(m: ManifoldInfo): string | null {
@@ -325,8 +460,8 @@
     return null;
   }
 
-  /** True iff at least one node carries a non-null role — this is a
-   *  persona / role-paired manifold. */
+  /** True iff at least one node carries a non-null role — a persona /
+   *  role-paired manifold. */
   function isRoleAugmented(m: ManifoldInfo): boolean {
     return (m.node_roles ?? []).some((r) => r);
   }
@@ -356,9 +491,14 @@
   }
 </script>
 
-<section class="drawer-shell" aria-label="Manifolds">
+<section
+  class="drawer-shell"
+  class:fam-manifold={family === "manifold"}
+  style:--family-accent={familyAccent}
+  aria-label={family === "manifold" ? "Manifolds" : "Subspaces"}
+>
   <header class="header">
-    <span class="title">{mode === "probe" ? "manifolds · probe" : "manifolds"}</span>
+    <span class="title">{mode === "probe" ? `${title} · probe` : title}</span>
     <button type="button" class="close" aria-label="Close" onclick={closeDrawer}
       >✕</button>
   </header>
@@ -407,13 +547,134 @@
       {/if}
     {/snippet}
 
+    {#snippet fittedRow(m: ManifoldInfo)}
+      {@const key = rowKey(m)}
+      {@const busy = busyKeys.has(key)}
+      {@const confirming = confirmKeys.has(key)}
+      {@const inspecting = inspectKeys.has(key)}
+      {@const badge = fitModeBadge(m)}
+      <li class="row" title={m.description || key}>
+        <div class="row-line">
+          <div class="meta">
+            <span class="row-name">{key}</span>
+            <span class="row-sub">
+              {m.domain_label} · {m.node_count} nodes
+              {#if badge}<span class="fit-badge fit-{badge}">{badge}</span>{/if}
+              {#if isRoleAugmented(m)}<span class="fit-badge fit-persona" title="persona / role-paired manifold">persona</span>{/if}
+              {#if m.stale}<span class="stale">stale</span>{/if}
+            </span>
+          </div>
+          <div class="actions">
+            <button
+              type="button"
+              class="act inspect"
+              aria-expanded={inspecting}
+              onclick={() => void toggleInspect(m)}
+              title={inspecting ? "hide diagnostics" : "inspect fit"}
+            >{inspecting ? "▾" : "ⓘ"}</button>
+            <button
+              type="button"
+              class="act steer"
+              disabled={busy || isRacked(m)}
+              onclick={() => onSteer(m)}
+              title={isRacked(m)
+                ? `${key} is already racked`
+                : `rack ${key} for steering`}
+            >+steer</button>
+            {#if !probeRack.unavailable}
+              <button
+                type="button"
+                class="act probe"
+                disabled={busy || isProbed(m)}
+                onclick={() => void onProbe(m)}
+                title={isProbed(m)
+                  ? `${key} is already attached as a probe`
+                  : `attach ${key} as a read-side probe`}
+              >+probe</button>
+            {/if}
+            <button
+              type="button"
+              class="act fit"
+              disabled={busy}
+              onclick={() => onFit(m)}
+              title={`re-fit ${key} for the current model`}
+            >{busy ? "…" : "re-fit"}</button>
+            <button
+              type="button"
+              class="act del"
+              class:confirm={confirming}
+              disabled={busy}
+              onclick={() => onDeleteClick(m)}
+              title={confirming ? "click again to confirm" : `delete ${key}`}
+            >{confirming ? "confirm?" : "delete"}</button>
+          </div>
+        </div>
+        {#if inspecting}
+          <div class="inspect-body">
+            {#if detailLoading.has(key)}
+              <p class="muted">loading…</p>
+            {:else if detailErrors.has(key)}
+              <p class="error">{detailErrors.get(key)}</p>
+            {:else if detailCache.has(key)}
+              {@const detail = detailCache.get(key)!}
+              {#if isDiscoverMode(detail)}
+                <DiagnosticsPanel manifold={detail} />
+              {:else}
+                <p class="muted">
+                  authored manifold — no discover-mode diagnostics
+                  ({detail.domain_label}, dim={detail.intrinsic_dim})
+                </p>
+              {/if}
+            {/if}
+          </div>
+        {/if}
+        {@render nodeSection(m, true)}
+      </li>
+    {/snippet}
+
+    {#snippet unfittedRow(m: ManifoldInfo)}
+      {@const key = rowKey(m)}
+      {@const busy = busyKeys.has(key)}
+      {@const confirming = confirmKeys.has(key)}
+      {@const badge = fitModeBadge(m)}
+      <li class="row" title={m.description || key}>
+        <div class="row-line">
+          <div class="meta">
+            <span class="row-name">{key}</span>
+            <span class="row-sub">
+              {m.domain_label} · {m.node_count} nodes
+              {#if badge}<span class="fit-badge fit-{badge}">{badge}</span>{/if}
+            </span>
+          </div>
+          <div class="actions">
+            <button
+              type="button"
+              class="act fit"
+              disabled={busy}
+              onclick={() => onFit(m)}
+              title={`fit ${key} for the current model`}
+            >{busy ? "…" : "fit"}</button>
+            <button
+              type="button"
+              class="act del"
+              class:confirm={confirming}
+              disabled={busy}
+              onclick={() => onDeleteClick(m)}
+              title={confirming ? "click again to confirm" : `delete ${key}`}
+            >{confirming ? "confirm?" : "delete"}</button>
+          </div>
+        </div>
+        {@render nodeSection(m, false)}
+      </li>
+    {/snippet}
+
     {#if errorMsg}
       <p class="error" role="alert">{errorMsg}</p>
     {/if}
 
     {#if mode === "probe"}
       <p class="mode-hint">
-        Attach a fitted manifold as a read-side probe.
+        Attach a fitted {title} as a read-side probe.
         Use <strong>+probe</strong> on a fitted row, or attach by
         selector below.
       </p>
@@ -426,7 +687,7 @@
               type="text"
               class="text-input"
               placeholder="ns/name"
-              aria-label="Manifold selector"
+              aria-label="Selector"
               bind:value={customSelector}
               disabled={customAttaching}
             />
@@ -464,20 +725,22 @@
       </details>
     {/if}
 
-    <button type="button" class="build-btn" onclick={gotoBuilder}>
+    <button type="button" class="build-btn" onclick={gotoLauncher}>
       <span class="plus" aria-hidden="true">+</span>
-      <span class="build-label">build manifold</span>
-      <span class="build-hint">author a domain and node corpus</span>
+      <span class="build-label">{launcherLabel}</span>
+      <span class="build-hint">{launcherHint}</span>
     </button>
 
-    {#if !manifoldRack.unavailable && manifoldRack.catalog.length > 0}
+    {#if !manifoldRack.unavailable && familyTotal > 0}
       <div class="search-row">
         <input
           type="search"
           class="search"
           bind:this={searchInputRef}
           bind:value={query}
-          placeholder="search manifolds & nodes…"
+          placeholder={family === "manifold"
+            ? "search manifolds & nodes…"
+            : "search subspaces & nodes…"}
           autocomplete="off"
           spellcheck="false"
         />
@@ -486,160 +749,96 @@
           class="refresh"
           onclick={() => void refreshManifoldList()}
           disabled={manifoldRack.loading}
-          title="re-fetch manifolds"
+          title="re-fetch"
           aria-label="Refresh"
         >{manifoldRack.loading ? "…" : "↻"}</button>
       </div>
     {/if}
 
+    {#if manifoldRack.error}
+      <p class="error" role="alert">{manifoldRack.error}</p>
+    {/if}
+
     {#if manifoldRack.unavailable}
       <p class="muted">
         this server doesn't expose the manifold API — update saklas to
-        author and fit steering manifolds.
+        author and fit steering {title === "manifold" ? "manifolds" : "subspaces"}.
       </p>
-    {:else if manifoldRack.loading && manifoldRack.catalog.length === 0}
-      <p class="muted">loading manifolds…</p>
-    {:else if manifoldRack.catalog.length === 0}
+    {:else if manifoldRack.loading && familyTotal === 0}
+      <p class="muted">loading…</p>
+    {:else if familyTotal === 0}
       <p class="muted">
-        no manifolds yet — use + build manifold above to author one.
+        no {title === "manifold" ? "manifolds" : "subspaces"} yet — use
+        + {launcherLabel} above to author one.
       </p>
     {:else}
-      {#if fitted.length > 0}
+      {#if ftSections.length > 0}
         <h2 class="section-title">Fitted</h2>
-        <ul class="rows" role="list">
-          {#each fitted as m (rowKey(m))}
-            {@const key = rowKey(m)}
-            {@const busy = busyKeys.has(key)}
-            {@const confirming = confirmKeys.has(key)}
-            {@const inspecting = inspectKeys.has(key)}
-            {@const badge = fitModeBadge(m)}
-            <li class="row" title={m.description || key}>
-              <div class="row-line">
-                <div class="meta">
-                  <span class="row-name">{key}</span>
-                  <span class="row-sub">
-                    {m.domain_label} · {m.node_count} nodes
-                    {#if badge}<span class="fit-badge fit-{badge}">{badge}</span>{/if}
-                    {#if isRoleAugmented(m)}<span class="fit-badge fit-persona" title="persona / role-paired manifold">persona</span>{/if}
-                    {#if m.stale}<span class="stale">stale</span>{/if}
-                  </span>
-                </div>
-                <div class="actions">
-                  <button
-                    type="button"
-                    class="act inspect"
-                    aria-expanded={inspecting}
-                    onclick={() => void toggleInspect(m)}
-                    title={inspecting ? "hide diagnostics" : "inspect fit"}
-                  >{inspecting ? "▾" : "ⓘ"}</button>
-                  <button
-                    type="button"
-                    class="act steer"
-                    disabled={busy || isRacked(m)}
-                    onclick={() => onSteer(m)}
-                    title={isRacked(m)
-                      ? `${key} is already racked`
-                      : `rack ${key} for steering`}
-                  >+steer</button>
-                  {#if !probeRack.unavailable}
-                    <button
-                      type="button"
-                      class="act probe"
-                      disabled={busy || isProbed(m)}
-                      onclick={() => void onProbe(m)}
-                      title={isProbed(m)
-                        ? `${key} is already attached as a probe`
-                        : `attach ${key} as a read-side manifold probe`}
-                    >+probe</button>
-                  {/if}
-                  <button
-                    type="button"
-                    class="act fit"
-                    disabled={busy}
-                    onclick={() => onFit(m)}
-                    title={`re-fit ${key} for the current model`}
-                  >{busy ? "…" : "re-fit"}</button>
-                  <button
-                    type="button"
-                    class="act del"
-                    class:confirm={confirming}
-                    disabled={busy}
-                    onclick={() => onDeleteClick(m)}
-                    title={confirming ? "click again to confirm" : `delete ${key}`}
-                  >{confirming ? "confirm?" : "delete"}</button>
-                </div>
-              </div>
-              {#if inspecting}
-                <div class="inspect-body">
-                  {#if detailLoading.has(key)}
-                    <p class="muted">loading…</p>
-                  {:else if detailErrors.has(key)}
-                    <p class="error">{detailErrors.get(key)}</p>
-                  {:else if detailCache.has(key)}
-                    {@const detail = detailCache.get(key)!}
-                    {#if isDiscoverMode(detail)}
-                      <DiagnosticsPanel manifold={detail} />
-                    {:else}
-                      <p class="muted">
-                        authored manifold — no discover-mode diagnostics
-                        ({detail.domain_label}, dim={detail.intrinsic_dim})
-                      </p>
-                    {/if}
-                  {/if}
-                </div>
+        <div class="catalog">
+          {#each ftSections as { cat, items } (cat)}
+            {@const ckey = `ft:${cat}`}
+            {@const open = catOpen(ckey)}
+            <section class="category">
+              <button
+                type="button"
+                class="cat-header"
+                class:open
+                aria-expanded={open}
+                onclick={() => toggleCat(ckey)}
+                disabled={searching}
+              >
+                <span class="caret" aria-hidden="true">{open ? "▾" : "▸"}</span>
+                <span class="cat-name">{CATEGORY_LABELS[cat]}</span>
+                <span class="cat-count">{items.length}</span>
+              </button>
+              {#if open}
+                <ul class="rows" role="list" aria-label={CATEGORY_LABELS[cat]}>
+                  {#each items as m (rowKey(m))}
+                    {@render fittedRow(m)}
+                  {/each}
+                </ul>
               {/if}
-              {@render nodeSection(m, true)}
-            </li>
+            </section>
           {/each}
-        </ul>
+        </div>
       {/if}
 
-      {#if unfitted.length > 0}
+      {#if unSections.length > 0}
         <h2 class="section-title">
           Unfitted
           <span class="section-hint">no tensor for this model yet</span>
         </h2>
-        <ul class="rows" role="list">
-          {#each unfitted as m (rowKey(m))}
-            {@const key = rowKey(m)}
-            {@const busy = busyKeys.has(key)}
-            {@const confirming = confirmKeys.has(key)}
-            {@const badge = fitModeBadge(m)}
-            <li class="row" title={m.description || key}>
-              <div class="row-line">
-                <div class="meta">
-                  <span class="row-name">{key}</span>
-                  <span class="row-sub">
-                    {m.domain_label} · {m.node_count} nodes
-                    {#if badge}<span class="fit-badge fit-{badge}">{badge}</span>{/if}
-                  </span>
-                </div>
-                <div class="actions">
-                  <button
-                    type="button"
-                    class="act fit"
-                    disabled={busy}
-                    onclick={() => onFit(m)}
-                    title={`fit ${key} for the current model`}
-                  >{busy ? "…" : "fit"}</button>
-                  <button
-                    type="button"
-                    class="act del"
-                    class:confirm={confirming}
-                    disabled={busy}
-                    onclick={() => onDeleteClick(m)}
-                    title={confirming ? "click again to confirm" : `delete ${key}`}
-                  >{confirming ? "confirm?" : "delete"}</button>
-                </div>
-              </div>
-              {@render nodeSection(m, false)}
-            </li>
+        <div class="catalog">
+          {#each unSections as { cat, items } (cat)}
+            {@const ckey = `un:${cat}`}
+            {@const open = catOpen(ckey)}
+            <section class="category">
+              <button
+                type="button"
+                class="cat-header"
+                class:open
+                aria-expanded={open}
+                onclick={() => toggleCat(ckey)}
+                disabled={searching}
+              >
+                <span class="caret" aria-hidden="true">{open ? "▾" : "▸"}</span>
+                <span class="cat-name">{CATEGORY_LABELS[cat]}</span>
+                <span class="cat-count">{items.length}</span>
+              </button>
+              {#if open}
+                <ul class="rows" role="list" aria-label={CATEGORY_LABELS[cat]}>
+                  {#each items as m (rowKey(m))}
+                    {@render unfittedRow(m)}
+                  {/each}
+                </ul>
+              {/if}
+            </section>
           {/each}
-        </ul>
+        </div>
       {/if}
 
       {#if fitted.length === 0 && unfitted.length === 0}
-        <p class="muted">no manifold or node matches "{query.trim()}".</p>
+        <p class="muted">no {title} or node matches "{query.trim()}".</p>
       {/if}
     {/if}
   </div>
@@ -662,8 +861,10 @@
     padding: var(--space-4) var(--space-5);
     border-bottom: 1px solid var(--border);
   }
+  /* Family accent drives the header title colour (and every accented rule
+   * below via ``--family-accent``) — white subspace vs purple manifold. */
   .title {
-    color: var(--accent);
+    color: var(--family-accent);
     letter-spacing: 0;
   }
   .close {
@@ -700,6 +901,8 @@
     margin: 0;
     line-height: 1.4;
   }
+
+  /* ---- authoring launcher ---- */
   .build-btn {
     display: flex;
     align-items: baseline;
@@ -721,11 +924,11 @@
   }
   .build-btn:hover {
     background: var(--bg-elev);
-    border-color: var(--accent-purple);
-    color: var(--accent-purple);
+    border-color: var(--family-accent);
+    color: var(--family-accent);
   }
   .plus {
-    color: var(--accent-purple);
+    color: var(--family-accent);
     font-weight: var(--weight-medium);
   }
   .build-label {
@@ -740,12 +943,14 @@
     font-size: var(--text-xs);
     text-align: right;
   }
+
+  /* ---- section headings ---- */
   .section-title {
     display: flex;
     align-items: baseline;
     gap: var(--space-3);
     margin: var(--space-3) 0 0;
-    color: var(--accent);
+    color: var(--family-accent);
     font-size: var(--text-sm);
     font-weight: var(--weight-medium);
     text-transform: uppercase;
@@ -758,10 +963,58 @@
     text-transform: none;
     letter-spacing: 0;
   }
+
+  /* ---- category grouping ---- */
+  .catalog {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+  }
+  .category {
+    display: flex;
+    flex-direction: column;
+  }
+  .cat-header {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    width: 100%;
+    text-align: left;
+    background: transparent;
+    border: 0;
+    border-bottom: 1px solid var(--border);
+    padding: var(--space-3) var(--space-1) var(--space-2);
+    color: var(--fg-muted);
+    cursor: pointer;
+    transition: color var(--dur) var(--ease-out);
+  }
+  .cat-header:hover:not(:disabled) {
+    color: var(--fg-strong);
+  }
+  .cat-header:disabled {
+    cursor: default;
+  }
+  .cat-name {
+    flex: 1 1 auto;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    font-size: var(--text-sm);
+    font-weight: var(--weight-medium);
+  }
+  .cat-header.open .cat-name {
+    color: var(--family-accent);
+  }
+  .cat-count {
+    color: var(--fg-muted);
+    font-size: var(--text-xs);
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* ---- rows ---- */
   .rows {
     list-style: none;
     margin: 0;
-    padding: 0;
+    padding: var(--space-2) 0;
     display: flex;
     flex-direction: column;
     gap: var(--space-2);
@@ -777,7 +1030,7 @@
     transition: border-color var(--dur) var(--ease-out);
   }
   .row:hover {
-    border-color: var(--accent-purple);
+    border-color: var(--family-accent);
   }
   .row-line {
     display: grid;
@@ -794,18 +1047,14 @@
     font-size: var(--text-2xs);
     letter-spacing: 0.04em;
     border: 1px solid var(--border);
-    color: var(--accent-purple);
-    background: color-mix(in srgb, var(--accent-purple) 12%, transparent);
-  }
-  .fit-spectral {
-    color: var(--accent);
-    background: var(--accent-subtle);
+    color: var(--family-accent);
+    background: color-mix(in srgb, var(--family-accent) 12%, transparent);
   }
   .inspect-body {
     padding-top: var(--space-2);
     border-top: 1px solid var(--border);
   }
-  .error {
+  .inspect-body .error {
     color: var(--accent-error);
     font-size: var(--text-xs);
     margin: 0;
@@ -815,8 +1064,8 @@
     min-width: 2.2em;
   }
   .act.inspect:hover:not(:disabled) {
-    color: var(--accent-purple);
-    border-color: var(--accent-purple);
+    color: var(--family-accent);
+    border-color: var(--family-accent);
   }
   .meta {
     display: flex;
@@ -867,47 +1116,57 @@
     opacity: 0.45;
     cursor: not-allowed;
   }
-  .act.steer {
-    color: var(--accent-purple);
-  }
-  .act.steer:hover:not(:disabled) {
-    background: rgba(167, 139, 250, 0.12);
-    border-color: var(--accent-purple);
-  }
-  /* Probe action mirrors steer's purple family so manifold surfaces
-   * (steering vs probing) keep one accent.  Like +steer, it disables
-   * once the manifold is already attached — detach happens from the
-   * probe strip's ✕, not here. */
+  /* Steer + probe both ride the family accent so the white/purple split
+   * reads through every action.  Removal happens from the rack / probe
+   * strip's own ✕, not here — these are pure-add and disable once the
+   * artifact is already racked / attached. */
+  .act.steer,
   .act.probe {
-    color: var(--accent-purple);
+    color: var(--family-accent);
   }
+  .act.steer:hover:not(:disabled),
   .act.probe:hover:not(:disabled) {
-    background: rgba(167, 139, 250, 0.12);
-    border-color: var(--accent-purple);
+    background: color-mix(in srgb, var(--family-accent) 12%, transparent);
+    border-color: var(--family-accent);
+  }
+  .act.fit {
+    color: var(--family-accent);
+  }
+  .act.fit:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--family-accent) 12%, transparent);
+    border-color: var(--family-accent);
+  }
+  .act.del:hover:not(:disabled) {
+    color: var(--accent-red);
+    border-color: var(--accent-red);
+  }
+  .act.del.confirm {
+    color: var(--accent-red);
+    border-color: var(--accent-red);
+    background: color-mix(in srgb, var(--accent-red) 12%, transparent);
   }
 
-  /* Probe-mode hint banner — sits at the top of the drawer when the
-   * user landed here from the probe rack, naming the difference
-   * between +steer and +probe. */
+  /* Probe-mode hint banner — sits at the top of the drawer when the user
+   * landed here from the probe rack, naming the difference between +steer
+   * and +probe. */
   .mode-hint {
     margin: 0;
     padding: var(--space-3) var(--space-4);
     color: var(--fg-dim);
     font-size: var(--text-sm);
     line-height: 1.4;
-    background: rgba(167, 139, 250, 0.06);
+    background: color-mix(in srgb, var(--family-accent) 6%, transparent);
     border: 1px solid var(--border);
-    border-left: 2px solid var(--accent-purple);
+    border-left: 2px solid var(--family-accent);
     border-radius: var(--radius);
   }
   .mode-hint strong {
-    color: var(--accent-purple);
+    color: var(--family-accent);
     font-weight: var(--weight-medium);
   }
 
-  /* Custom-attach disclosure — collapsed by default so it doesn't
-   * compete with the catalog rows.  Opens to the same three-field
-   * form the old standalone ManifoldProbeRack carried. */
+  /* Custom-attach disclosure — collapsed by default so it doesn't compete
+   * with the catalog rows. */
   .custom-attach {
     border: 1px solid var(--border);
     border-radius: var(--radius);
@@ -963,7 +1222,7 @@
     flex: 0 0 5em;
   }
   .text-input:focus-visible {
-    outline: 1px solid var(--accent-purple);
+    outline: 1px solid var(--family-accent);
     outline-offset: -1px;
   }
   .text-input:disabled {
@@ -973,24 +1232,8 @@
     align-self: flex-end;
     margin-top: var(--space-2);
   }
-  .act.fit {
-    color: var(--accent);
-  }
-  .act.fit:hover:not(:disabled) {
-    background: var(--accent-subtle);
-    border-color: var(--accent);
-  }
-  .act.del:hover:not(:disabled) {
-    color: var(--accent-red);
-    border-color: var(--accent-red);
-  }
-  .act.del.confirm {
-    color: var(--accent-red);
-    border-color: var(--accent-red);
-    background: color-mix(in srgb, var(--accent-red) 12%, transparent);
-  }
 
-  /* ---- search row (mirrors VectorsDrawer) ---- */
+  /* ---- search row ---- */
   .search-row {
     display: flex;
     gap: var(--space-3);
@@ -1010,7 +1253,7 @@
   }
   .search:focus {
     outline: none;
-    border-color: var(--accent-purple);
+    border-color: var(--family-accent);
   }
   .refresh {
     flex: 0 0 auto;
@@ -1055,9 +1298,10 @@
     transition: color var(--dur) var(--ease-out);
   }
   .nodes-toggle:hover {
-    color: var(--accent-purple);
+    color: var(--family-accent);
   }
   .caret {
+    font-size: var(--text-xs);
     color: var(--fg-muted);
   }
   .nodes-label {
@@ -1094,9 +1338,9 @@
       color var(--dur) var(--ease-out);
   }
   .node-chip:hover:not(:disabled) {
-    color: var(--accent-purple);
-    border-color: var(--accent-purple);
-    background: rgba(167, 139, 250, 0.12);
+    color: var(--family-accent);
+    border-color: var(--family-accent);
+    background: color-mix(in srgb, var(--family-accent) 12%, transparent);
   }
   .node-chip:disabled {
     opacity: 0.5;
@@ -1114,7 +1358,7 @@
     font-size: var(--text-2xs);
     text-transform: uppercase;
     letter-spacing: 0.04em;
-    color: var(--accent-purple);
-    background: color-mix(in srgb, var(--accent-purple) 12%, transparent);
+    color: var(--family-accent);
+    background: color-mix(in srgb, var(--family-accent) 12%, transparent);
   }
 </style>

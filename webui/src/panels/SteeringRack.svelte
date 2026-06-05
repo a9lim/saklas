@@ -68,32 +68,7 @@
   </header>
 
   <div class="strips" class:is-empty={count === 0}>
-    {#if count === 0}
-      <div class="empty">
-        <p class="empty-copy">
-          Steering shapes how the model responds.
-          Add a vector or a manifold to begin.
-        </p>
-        <div class="empty-actions">
-          <button
-            type="button"
-            class="add-steering"
-            onclick={() => openDrawer("vectors")}
-            title="Browse the concept catalog or extract a custom vector"
-          >
-            + add steering
-          </button>
-          <button
-            type="button"
-            class="add-manifold"
-            onclick={() => openDrawer("manifolds")}
-            title="Rack a fitted steering manifold or build a new one"
-          >
-            + add manifold
-          </button>
-        </div>
-      </div>
-    {:else}
+    {#if count > 0}
       {#if subspaceCount > 0}
         <h3 class="group-header subspace">subspace</h3>
         {#each sortedVectors as [name, entry] (name)}
@@ -112,26 +87,26 @@
     {/if}
   </div>
 
-  {#if count > 0}
-    <div class="actions">
-      <button
-        type="button"
-        class="add-steering"
-        onclick={() => openDrawer("vectors")}
-        title="Browse the concept catalog or extract a custom vector"
-      >
-        + add steering
-      </button>
-      <button
-        type="button"
-        class="add-manifold"
-        onclick={() => openDrawer("manifolds")}
-        title="Rack a fitted steering manifold or build a new one"
-      >
-        + add manifold
-      </button>
-    </div>
-  {/if}
+  <!-- Launchers stay reachable in both empty + populated states — the two
+       family entry points, white subspace vs purple manifold. -->
+  <div class="actions">
+    <button
+      type="button"
+      class="add-subspace"
+      onclick={() => openDrawer("subspace")}
+      title="Browse flat subspaces — concept axes and personas"
+    >
+      + subspace steer
+    </button>
+    <button
+      type="button"
+      class="add-manifold"
+      onclick={() => openDrawer("manifolds")}
+      title="Browse curved steering manifolds"
+    >
+      + manifold steer
+    </button>
+  </div>
 </section>
 
 <style>
@@ -217,34 +192,10 @@
     padding-left: var(--space-2);
   }
 
-  /* First-run teaching state — one line of plain copy above the primary
-   * action. */
-  .empty {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: var(--space-4);
-    padding: var(--space-5) var(--space-4);
-    text-align: center;
-  }
-  .empty-copy {
-    margin: 0;
-    color: var(--fg-dim);
-    font-size: var(--text-sm);
-    line-height: 1.5;
-    max-width: 28ch;
-  }
-  /* Empty-state stacks the two entry points vertically so the manifold
-   * launcher reads as the second way in, not buried in an actions row. */
-  .empty-actions {
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-2);
-    width: 14em;
-  }
-
   /* Anchored at the bottom of the rack.  Border-top mirrors the probe
-   * rack's actions row for visual symmetry. */
+   * rack's actions row for visual symmetry.  Shown in both empty and
+   * populated states — the two family launchers are the only first-run
+   * affordance (no teaching copy). */
   .actions {
     flex: 0 0 auto;
     border-top: 1px solid var(--border);
@@ -252,11 +203,11 @@
     display: flex;
     gap: var(--space-2);
   }
-  /* Primary entry point — the one obvious way to add a steering vector. */
-  .add-steering {
-    width: 100%;
-    background: var(--accent-subtle);
-    color: var(--accent);
+  /* The two family launchers — white subspace vs purple manifold so they
+   * read as the two card families. */
+  .add-subspace,
+  .add-manifold {
+    flex: 1 1 0;
     border: 1px solid var(--border);
     min-height: 2.1rem;
     padding: var(--space-4) var(--space-5);
@@ -267,33 +218,20 @@
     cursor: pointer;
     transition: background var(--dur) var(--ease-out);
   }
-  .actions .add-steering {
-    flex: 1 1 0;
+  .add-subspace {
+    background: var(--accent-subtle);
+    color: var(--accent);
   }
-  .empty-actions .add-steering,
-  .empty-actions .add-manifold {
-    width: 100%;
-  }
-  .add-steering:hover {
+  .add-subspace:hover {
     background: var(--accent-glow);
   }
   /* Manifold launcher — purple-tinted to echo the manifold card's accent
    * so the two surfaces read as one feature. */
   .add-manifold {
-    flex: 1 1 0;
-    background: rgba(167, 139, 250, 0.10);
+    background: color-mix(in srgb, var(--accent-purple) 10%, transparent);
     color: var(--accent-purple);
-    border: 1px solid var(--border);
-    min-height: 2.1rem;
-    padding: var(--space-4) var(--space-5);
-    border-radius: var(--radius);
-    font: inherit;
-    font-family: var(--font-mono);
-    font-size: var(--text-sm);
-    cursor: pointer;
-    transition: background var(--dur) var(--ease-out);
   }
   .add-manifold:hover {
-    background: rgba(167, 139, 250, 0.18);
+    background: color-mix(in srgb, var(--accent-purple) 18%, transparent);
   }
 </style>
