@@ -14,7 +14,7 @@ from saklas.core.histogram import HIST_BUCKETS, bucketize
 from saklas.tui.utils import BAR_WIDTH, build_bar
 
 if TYPE_CHECKING:
-    from saklas.core.results import ManifoldAggregate, ManifoldTokenReading
+    from saklas.core.results import ProbeReading
 
 
 # Mini-map dimensions for 2-D BoxDomain manifolds (the canonical case
@@ -39,17 +39,21 @@ class TraitPanel(Widget):
         self._nav_items: list[str] = []
         self._nav_idx: int = 0
         self._cached_render_text: str = ""
-        # Manifold-probe state.  ``_manifold_probes`` maps probe-name →
-        # the attached ``Manifold`` artifact (needed for domain/axis
-        # introspection at render time — bounds, intrinsic_dim).
-        # ``_manifold_readings`` carries the latest per-token reading
-        # streamed off the engine; ``_manifold_aggregates`` carries the
-        # end-of-gen aggregate populated from
-        # ``GenerationResult.manifold_readings`` at finalize.  Either
+        # Curved-probe state.  After the monitor unification this section
+        # renders the *curved* (non-affine) probes of the one unified
+        # monitor — the flat (affine) probes drive the scalar MONITOR
+        # PROBES section above, mirroring the webui's subspace/manifold
+        # rack split.  ``_manifold_probes`` maps probe-name → the attached
+        # ``Manifold`` artifact (needed for domain/axis introspection at
+        # render time — bounds, intrinsic_dim).  ``_manifold_readings``
+        # carries the latest per-token ``ProbeReading`` streamed off the
+        # engine; ``_manifold_aggregates`` carries the end-of-gen aggregate
+        # from ``GenerationResult.probe_readings`` at finalize (the same
+        # ``ProbeReading`` shape, pooled at the last-content token).  Either
         # may be empty; rendering degrades cleanly.
         self._manifold_probes: dict[str, Any] = {}
-        self._manifold_readings: dict[str, "ManifoldTokenReading"] = {}
-        self._manifold_aggregates: dict[str, "ManifoldAggregate"] = {}
+        self._manifold_readings: dict[str, "ProbeReading"] = {}
+        self._manifold_aggregates: dict[str, "ProbeReading"] = {}
         self._cached_manifold_text: str = ""
 
     def compose(self) -> ComposeResult:
@@ -256,20 +260,21 @@ class TraitPanel(Widget):
 
     def update_manifold_readings(
         self,
-        per_token: dict[str, "ManifoldTokenReading"] | None = None,
-        aggregates: dict[str, "ManifoldAggregate"] | None = None,
+        per_token: dict[str, "ProbeReading"] | None = None,
+        aggregates: dict[str, "ProbeReading"] | None = None,
     ) -> None:
-        """Push fresh manifold-probe data to the panel.
+        """Push fresh curved-probe data to the panel.
 
-        ``per_token`` is the latest per-token reading streamed off the
-        engine; mid-gen renders the live fraction bar + top-N nearest
+        ``per_token`` is the latest per-token :class:`ProbeReading` streamed
+        off the engine; mid-gen renders the live fraction bar + top-N nearest
         labels + (for 2-D BoxDomain manifolds) the coords mini-map with
         the running coord marker.  ``aggregates`` is the end-of-gen
-        :class:`ManifoldAggregate` map populated from
-        ``GenerationResult.manifold_readings`` at finalize; aggregates
-        override per-token entries for the bar / nearest list and supply
-        the inferred ``coords`` for the mini-map dot.  Either may be
-        ``None`` — pass only what changed.
+        :class:`ProbeReading` map from ``GenerationResult.probe_readings`` at
+        finalize; aggregates override per-token entries for the bar / nearest
+        list and supply the inferred ``coords`` for the mini-map dot.  Both
+        dicts may carry flat probes too (the unified monitor reads them all);
+        only those in ``_manifold_probes`` (the curved set) render here.
+        Either may be ``None`` — pass only what changed.
         """
         if per_token is not None:
             self._manifold_readings = dict(per_token)
@@ -298,11 +303,11 @@ class TraitPanel(Widget):
             manifold = self._manifold_probes[name]
             agg = self._manifold_aggregates.get(name)
             live = self._manifold_readings.get(name)
-            # Aggregate beats live for the bar / nearest — it's the
-            # EV-weighted mean over the generated tokens, more stable
-            # than the last-token reading.
+            # Aggregate beats live for the bar / nearest — it's the reading
+            # pooled at the last-content token, the canonical end-of-gen
+            # value (bit-identical to the live read at that token).
             fraction = (
-                agg.fraction_mean if agg is not None
+                agg.fraction if agg is not None
                 else (live.fraction if live is not None else 0.0)
             )
             nearest = (
@@ -341,8 +346,8 @@ class TraitPanel(Widget):
     def _render_minimap(
         self,
         manifold: Any,
-        agg: "ManifoldAggregate | None",
-        live: "ManifoldTokenReading | None",
+        agg: "ProbeReading | None",
+        live: "ProbeReading | None",
     ) -> str:
         """ASCII mini-map of a 2-D BoxDomain manifold's coord plane.
 

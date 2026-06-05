@@ -468,13 +468,12 @@ class SaklasApp(App[None]):
         # yet, so this is purely the panel-line refresh.
         self._apply_highlight_to_all()
 
-        if self._session._monitor:
-            self._trait_panel.set_active_probes(set(self._session._monitor.probe_names))
-            self._refresh_trait_why()
-        # Manifold-probe rack — empty by default, but call through the
-        # set helper so any pre-attached probes (e.g. test stubs) show
-        # up in the panel immediately.
-        self._refresh_manifold_probes()
+        # One unified monitor now; the trait panel splits its probe set by
+        # geometry (flat → scalar section, curved → manifold section), so a
+        # single refresh seeds both — including any pre-attached probes
+        # (e.g. test stubs / bootstrapped roster).
+        self._refresh_probe_panels()
+        self._refresh_trait_why()
 
         self._poll_timer = self.set_interval(1 / _POLL_FPS, self._poll_generation)
         self._update_panel_focus()
@@ -1288,8 +1287,12 @@ class SaklasApp(App[None]):
             self._handle_probe_namespace(ns)
             return
 
-        def _on_success(name: str, profile: Any, _alpha: Any) -> None:
-            self._session.probe(name, profile)
+        def _on_success(name: str, _profile: Any, _alpha: Any) -> None:
+            # ``_handle_extract`` already registered the folded direction in
+            # ``session._profiles[name]``; ``add_probe`` resolves it from
+            # there (folding the 2-node concept to a rank-1 probe) and
+            # attaches it to the unified monitor.
+            self._session.add_probe(name)
             self.call_from_thread(self._on_probe_added, name)
         self._handle_extract(text, include_alpha=False, on_success=_on_success)
 
@@ -1341,7 +1344,7 @@ class SaklasApp(App[None]):
         self._start_manifold_fit(folder_arg)
 
     def _start_manifold_fit(self, folder_arg: str) -> None:
-        """Run ``session.extract_manifold`` on a worker thread.
+        """Run ``session.fit`` on a worker thread.
 
         Mirrors ``_handle_extract``'s worker structure: progress lines
         stream to the chat pane, errors surface as system messages, and
@@ -1366,7 +1369,7 @@ class SaklasApp(App[None]):
             # ``fit_rbf_interpolant`` raises a bare ``ValueError`` on
             # poisedness failure — not a ``SaklasError``; the shared
             # worker wrapper surfaces it as a plain string.
-            manifold = self._session.extract_manifold(
+            manifold = self._session.fit(
                 folder, on_progress=_progress,
             )
             self.call_from_thread(
@@ -1380,13 +1383,15 @@ class SaklasApp(App[None]):
         self._run_worker_with_queue(_work)
 
     def _handle_manifold_probe(self, text: str) -> None:
-        """``/manifold-probe <selector>`` — attach a manifold probe.
+        """``/manifold-probe <selector>`` — attach a curved manifold probe.
 
-        Routes through ``session.add_manifold_probe`` (Phase 1 engine
-        wiring) — the selector can be a bundled name (``pad``,
-        ``personas``), an ``ns/name`` form, or an already-loaded
-        manifold's registered name; the session's lazy-load path
-        (``_ensure_manifold_loaded``) handles resolution.  Refused
+        Routes through the unified ``session.add_probe`` — the selector can
+        be a bundled name (``pad``, ``personas``), an ``ns/name`` form, or an
+        already-loaded manifold's registered name; the session's lazy-load
+        path (``_ensure_manifold_loaded``) handles resolution.  This is the
+        curved-probe front-end (the TUI mirror of the webui's "+ manifold
+        probe" launcher); ``/probe`` is the flat/concept front-end.  Both
+        land in the one monitor.  Refused
         during A/B shadow gen for the same reason ``/probe`` is —
         modifying the monitor set mid-shadow would interleave readings
         across the steered/unsteered split.  Deferred behind an
@@ -1414,7 +1419,7 @@ class SaklasApp(App[None]):
         self._start_manifold_probe_attach(selector)
 
     def _start_manifold_probe_attach(self, selector: str) -> None:
-        """Run ``session.add_manifold_probe`` on a worker thread.
+        """Run ``session.add_probe`` on a worker thread.
 
         Mirrors ``_start_manifold_fit``'s worker structure — errors
         surface as system messages and a ``done`` sentinel re-enters
@@ -1426,7 +1431,7 @@ class SaklasApp(App[None]):
 
         def _worker() -> None:
             try:
-                name = self._session.add_manifold_probe(selector)
+                name = self._session.add_probe(selector)
             except SaklasError as e:
                 self.call_from_thread(self._steer_status, e.user_message()[1])
                 return
@@ -1443,45 +1448,68 @@ class SaklasApp(App[None]):
 
     def _on_manifold_probe_added(self, name: str) -> None:
         """Mirror probe wiring — refresh the trait panel + announce."""
-        self._refresh_manifold_probes()
+        self._refresh_probe_panels()
+        self._refresh_trait_why()
         self._chat_panel.add_system_message(
             f"Manifold probe '{name}' active."
         )
 
     def _handle_manifold_probe_remove(self, text: str) -> None:
-        """``/manifold-probe-remove <name>`` — detach an attached probe."""
+        """``/manifold-probe-remove <name>`` — detach an attached probe.
+
+        After the monitor unification there is one probe set, so this and
+        ``/unprobe`` are interchangeable; the command is kept for muscle
+        memory and detaches any probe shape via ``session.remove_probe``.
+        """
         chat = self._chat_panel
         name = (text or "").strip()
         name = _unquote(name)
         if not name:
             chat.add_system_message("Usage: /manifold-probe-remove <name>")
             return
-        monitor = self._session.manifold_monitor
-        if name not in monitor.probe_names:
+        monitor = self._session._monitor
+        if monitor is None or name not in monitor.probe_names:
             chat.add_system_message(f"Manifold probe '{name}' not active.")
             return
         try:
-            self._session.remove_manifold_probe(name)
+            self._session.remove_probe(name)
         except SaklasError as e:
             chat.add_system_message(e.user_message()[1])
             return
         except Exception as e:
             chat.add_system_message(f"{type(e).__name__}: {e}")
             return
-        self._refresh_manifold_probes()
+        self._refresh_probe_panels()
+        self._refresh_trait_why()
         chat.add_system_message(f"Manifold probe '{name}' removed.")
 
-    def _refresh_manifold_probes(self) -> None:
-        """Push the attached-probe map down to the trait panel.
+    def _refresh_probe_panels(self) -> None:
+        """Split the unified monitor's probe set across the trait panel.
 
-        The trait panel needs each attached probe's :class:`Manifold`
-        artifact (not just the name) so it can introspect the domain
-        for the 2-D mini-map at render time.  Pulled from the
-        ``AttachedManifoldProbe`` records on the live monitor.
+        After the monitor unification there is one probe set; the panel
+        renders it in two sections by geometry — flat (affine) probes drive
+        the scalar MONITOR PROBES section (axis-0 bar + sparkline + WHY),
+        curved probes the MANIFOLD PROBES section (fraction bar + nearest
+        labels + mini-map).  This mirrors the webui's subspace/manifold rack
+        split.  Curved probes carry their :class:`Manifold` artifact so the
+        panel can introspect the domain for the 2-D mini-map at render time.
         """
-        attached = self._session.manifold_monitor.attached_probes()
-        probes = {name: p.manifold for name, p in attached.items()}
-        self._trait_panel.set_active_manifold_probes(probes)
+        monitor = self._session._monitor
+        if monitor is None:
+            self._trait_panel.set_active_probes(set())
+            self._trait_panel.set_active_manifold_probes({})
+            return
+        from saklas.core.session import _manifold_is_affine
+        flat: set[str] = set()
+        curved: dict[str, Any] = {}
+        for name in monitor.probe_names:
+            manifold = monitor.manifolds.get(name)
+            if manifold is not None and not _manifold_is_affine(manifold):
+                curved[name] = manifold
+            else:
+                flat.add(name)
+        self._trait_panel.set_active_probes(flat)
+        self._trait_panel.set_active_manifold_probes(curved)
 
     def _handle_pairs(self, text: str) -> None:
         """`/pairs <name>` — open the custom-statement extraction modal.
@@ -1947,14 +1975,14 @@ class SaklasApp(App[None]):
                         # ``logprobs=0``; ``None`` only on the prefill /
                         # partial-UTF-8 flush steps the engine never
                         # assigns a chosen-token logprob to.
-                        # Manifold readings (``event.manifold_readings``)
-                        # ride alongside scalar scores — ``None`` when no
-                        # manifold probe is attached or ``live_scores`` is
-                        # off; otherwise a per-probe ``ManifoldTokenReading``
-                        # the trait panel renders mid-gen.
+                        # Probe readings (``event.probe_readings``) ride
+                        # alongside the scores — ``None`` when no probe is
+                        # attached or ``live_scores`` is off; otherwise the
+                        # full per-probe ``ProbeReading`` dict the trait
+                        # panel's curved section renders mid-gen.
                         ("tok", event.text, event.thinking, event.scores,
                          event.perplexity, event.logprob, widget, False,
-                         event.manifold_readings),
+                         event.probe_readings),
                     )
                     self._gen_token_count += 1
                 # Normal completion — pull per-token scores out of the
@@ -2437,11 +2465,11 @@ class SaklasApp(App[None]):
                 # Logit-pass: 7-element tuple now (logprob between
                 # perplexity and widget).  Drives the surprise highlight
                 # mode + the per-token logprob storage on the widget.
-                # Manifold-probe pass: optional 9th slot carries
-                # ``event.manifold_readings`` — ``None`` when no manifold
-                # probe is attached or ``live_scores`` is off; otherwise
-                # a per-probe ``ManifoldTokenReading`` the trait panel
-                # renders mid-gen.  Falls back to ``None`` for legacy
+                # Probe pass: optional 9th slot carries
+                # ``event.probe_readings`` — ``None`` when no probe is
+                # attached or ``live_scores`` is off; otherwise the full
+                # per-probe ``ProbeReading`` dict the trait panel's curved
+                # section renders mid-gen.  Falls back to ``None`` for legacy
                 # producers (e.g. test stubs) that emit the 8-element form.
                 manifold_readings = None
                 if len(item) >= 9:
@@ -2455,10 +2483,11 @@ class SaklasApp(App[None]):
                         widget, is_shadow,
                     ) = item
                 if manifold_readings is not None and not is_shadow:
-                    # Push live readings to the trait panel.  Shadow
-                    # streams skip this — their readings describe the
-                    # unsteered baseline and would clobber the steered
-                    # rack mid-gen.
+                    # Push live readings to the trait panel.  The dict carries
+                    # every probe's ``ProbeReading``; only curved probes
+                    # render in the manifold section.  Shadow streams skip
+                    # this — their readings describe the unsteered baseline
+                    # and would clobber the steered rack mid-gen.
                     self._trait_panel.update_manifold_readings(
                         per_token=manifold_readings,
                     )
@@ -2469,7 +2498,15 @@ class SaklasApp(App[None]):
                         widget.ensure_thinking_collapsed()
                         widget.append_token(token)
                     if scores is not None:
-                        widget.append_token_score(scores, is_thinking)
+                        # ``event.scores`` is the full per-probe ``ProbeReading``
+                        # dict now; the highlight markup wants a scalar per
+                        # probe, so collapse to coordinate axis 0 (the same
+                        # scalar the trait stream + ``@when`` gate channel use).
+                        scalar_scores = {
+                            p: (r.coords[0] if r.coords else 0.0)
+                            for p, r in scores.items()
+                        }
+                        widget.append_token_score(scalar_scores, is_thinking)
                     # ``logprob`` may legitimately be ``None`` during prefill
                     # or replay; always append so the per-token list stays
                     # index-aligned with the token list.
@@ -2624,15 +2661,6 @@ class SaklasApp(App[None]):
                 current, previous, sparklines,
             )
 
-        # Manifold-monitor pending-flag pass — mirrors the vector path
-        # so a per-token reading flushed by the engine clears the
-        # pending bit on the next poll tick.  Aggregates land via
-        # ``_pull_manifold_aggregates`` at finalize; this drain is the
-        # mid-gen "tick" so the bit doesn't stall forever.
-        mm = getattr(self._session, "manifold_monitor", None)
-        if mm is not None and mm.has_pending_per_token():
-            mm.consume_pending_per_token()
-
     # -- Actions --
 
     def action_remove_vector(self) -> None:
@@ -2663,8 +2691,8 @@ class SaklasApp(App[None]):
         probe_name = tp.get_selected_probe()
         if not probe_name or not self._session._monitor:
             return
-        self._session.unprobe(probe_name)
-        tp.set_active_probes(set(self._session._monitor.probe_names))
+        self._session.remove_probe(probe_name)
+        self._refresh_probe_panels()
         self._refresh_trait_why()
 
     def action_toggle_vector(self) -> None:
@@ -2852,18 +2880,21 @@ class SaklasApp(App[None]):
         self._pull_manifold_aggregates()
 
     def _pull_manifold_aggregates(self) -> None:
-        """Push end-of-gen manifold aggregates to the trait panel.
+        """Push end-of-gen probe aggregates to the trait panel.
 
-        Reads ``session.last_result.manifold_readings`` — populated by
-        ``ManifoldMonitor.score_aggregate`` in ``_finalize_generation``
-        when at least one probe is attached.  No-op when no result is
-        cached or no probes are attached.
+        Reads ``session.last_result.probe_readings`` — the per-probe
+        ``ProbeReading`` map populated by ``Monitor.score_aggregate`` in
+        ``_finalize_generation`` when at least one probe is attached (the
+        reading pooled at the last-content token).  The dict carries every
+        probe shape; only curved probes render in the manifold section.
+        No-op when no result is cached or no probes are attached.
         """
         last = getattr(self._session, "last_result", None)
         if last is None:
             return
-        aggregates = getattr(last, "manifold_readings", None) or {}
-        if not aggregates and not self._session.manifold_monitor.probe_names:
+        aggregates = getattr(last, "probe_readings", None) or {}
+        monitor = self._session._monitor
+        if not aggregates and (monitor is None or not monitor.probe_names):
             return
         self._trait_panel.update_manifold_readings(aggregates=aggregates)
 
@@ -2971,8 +3002,8 @@ class SaklasApp(App[None]):
             chat.add_system_message(f"'{raw}' is ambiguous: {', '.join(matches)}")
             return
         name = matches[0]
-        self._session.unprobe(name)
-        self._trait_panel.set_active_probes(set(monitor.probe_names))
+        self._session.remove_probe(name)
+        self._refresh_probe_panels()
         if self._highlight_probe == name:
             self._highlight_probe = None
             self._highlighting = False
@@ -3098,14 +3129,14 @@ class SaklasApp(App[None]):
 
             def _finish() -> None:
                 for key in loaded:
-                    profile = self._session._profiles.get(key)
-                    if profile is None:
+                    if self._session._profiles.get(key) is None:
                         continue
-                    self._session.probe(key, profile)
+                    # The folded direction is already in ``_profiles[key]``;
+                    # ``add_probe`` resolves it from there and attaches to the
+                    # unified monitor.
+                    self._session.add_probe(key)
                 if loaded and self._session._monitor is not None:
-                    self._trait_panel.set_active_probes(
-                        set(self._session._monitor.probe_names)
-                    )
+                    self._refresh_probe_panels()
                     # Seed highlight to the last loaded probe — same UX as
                     # single ``/probe``: the user immediately sees one of
                     # them lit up and can navigate the trait panel to flip.
@@ -3168,8 +3199,8 @@ class SaklasApp(App[None]):
             chat.add_system_message(f"No active probes under '{ns}/'.")
             return
         for name in matches:
-            self._session.unprobe(name)
-        self._trait_panel.set_active_probes(set(monitor.probe_names))
+            self._session.remove_probe(name)
+        self._refresh_probe_panels()
         if self._highlight_probe is not None and self._highlight_probe.startswith(prefix):
             self._highlight_probe = None
             self._highlighting = False
@@ -3481,22 +3512,37 @@ class SaklasApp(App[None]):
         chat.add_system_message("\n".join(lines))
 
     def _refresh_trait_why(self) -> None:
-        """Push per-layer ||baked|| norms for the trait-panel-selected probe
+        """Push per-layer importance for the trait-panel-selected probe
         down to the panel's WHY section as a histogram in layer order.
+
+        For a foldable flat probe (a 2-node concept axis) the bars are the
+        per-layer ``||baked||`` norm — the same signal ``manifold why``
+        shows.  A multi-axis flat fit (e.g. personas) has no single baked
+        direction, so the bars fall back to the per-layer Mahalanobis share
+        (the read/steer budget), which is defined for every fit shape.
 
         Per-token highlighting in the chat already surfaces which tokens
         a probe lights up on — no token list duplicated here.
         """
         probe = self._trait_panel.get_selected_probe()
         monitor = self._session._monitor
-        if probe is None or monitor is None or probe not in monitor.profiles:
+        if probe is None or monitor is None or probe not in monitor.manifolds:
             self._trait_panel.update_why(None, [])
             return
-        profile = monitor.profiles[probe]
-        layer_norms = sorted(
-            ((int(lidx), float(t.norm().item())) for lidx, t in profile.items()),
-            key=lambda kv: kv[0],
-        )
+        manifold = monitor.manifolds[probe]
+        layer_norms: list[tuple[int, float]]
+        try:
+            from saklas.core.vectors import folded_vector_directions
+            profile = folded_vector_directions(manifold)
+            layer_norms = sorted(
+                (int(lidx), float(t.norm().item()))
+                for lidx, t in profile.items()
+            )
+        except Exception:
+            share = getattr(manifold, "mahalanobis_share", None) or {}
+            layer_norms = sorted(
+                (int(lidx), float(v)) for lidx, v in share.items()
+            )
         self._trait_panel.update_why(probe, layer_norms)
 
     def _handle_compare(self, arg: str) -> None:
@@ -3508,8 +3554,10 @@ class SaklasApp(App[None]):
         parts = arg.split()
 
         # Gather all available profiles: session profiles + monitor probes.
-        # Monitor stores raw ``dict[int, Tensor]`` — wrap it in a Profile so
-        # both sources expose the same cosine_similarity API.
+        # The monitor stores each probe as a ``Manifold`` now; fold it to the
+        # per-layer baked direction view (``{L: δ̂_L · share_L}``) so both
+        # sources expose the same cosine_similarity API.  A multi-axis /
+        # curved probe has no single direction to compare and is skipped.
         from saklas.core.profile import Profile
         all_profiles: dict[str, Profile] = {}
         for name, prof in self._session._profiles.items():
@@ -3517,14 +3565,21 @@ class SaklasApp(App[None]):
                 all_profiles[name] = prof
             elif isinstance(prof, dict) and prof:
                 all_profiles[name] = Profile(prof)
-        if self._session._monitor:
-            for name, prof in self._session._monitor.profiles.items():
+        monitor = self._session._monitor
+        if monitor:
+            from saklas.core.vectors import folded_vector_directions
+            for name in monitor.probe_names:
                 if name in all_profiles:
                     continue
-                if isinstance(prof, Profile):
-                    all_profiles[name] = prof
-                elif isinstance(prof, dict) and prof:
-                    all_profiles[name] = Profile(prof)
+                manifold = monitor.manifolds.get(name)
+                if manifold is None:
+                    continue
+                try:
+                    folded = folded_vector_directions(manifold)
+                except Exception:
+                    continue
+                if folded:
+                    all_profiles[name] = Profile(folded)
 
         def _resolve(raw: str) -> str | None:
             matches = _resolve_active_name(raw, all_profiles)
@@ -4003,7 +4058,7 @@ class SaklasApp(App[None]):
                     self._ui_token_queue.put(
                         ("tok", event.text, event.thinking, event.scores,
                          event.perplexity, event.logprob, widget, True,
-                         event.manifold_readings),
+                         event.probe_readings),
                     )
                 self._ui_token_queue.put(("finalize", widget, True))
             except BaseException as e:
@@ -4757,7 +4812,7 @@ class SaklasApp(App[None]):
                     self._ui_token_queue.put(
                         ("tok", event.text, event.thinking, event.scores,
                          event.perplexity, event.logprob, widget, True,
-                         event.manifold_readings),
+                         event.probe_readings),
                     )
                 self._ui_token_queue.put(("finalize", widget, True))
             except BaseException as e:

@@ -502,10 +502,10 @@ class TestDiscoverManifoldEndToEnd:
 
             # ---- 3. fit through the session pipeline ----
             t0 = time.perf_counter()
-            manifold = session.extract_manifold(folder)
+            manifold = session.fit(folder)
             dt_fit = time.perf_counter() - t0
             assert dt_fit < self._FIT_BUDGET_S, (
-                f"extract_manifold took {dt_fit:.1f}s, "
+                f"session.fit took {dt_fit:.1f}s, "
                 f"budget {self._FIT_BUDGET_S:.1f}s"
             )
 

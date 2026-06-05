@@ -37,18 +37,15 @@ def _make_app():
     session._model_info = {"model_id": "mock/mock", "model_type": "mock"}
     session._device = SimpleNamespace(type="cpu")
     session._layers = [0, 1, 2]
+    # One unified monitor now.  ``manifolds`` maps probe-name → the attached
+    # ``Manifold``; the TUI's ``_refresh_probe_panels`` splits the probe set
+    # by geometry (flat → scalar section, curved → manifold section).  Tests
+    # that exercise curved-probe routing seed ``manifolds`` with a stub whose
+    # layers report ``is_affine = False``; the default empty dict makes every
+    # probe read as flat.
     session._monitor = MagicMock()
     session._monitor.probe_names = []
-    session._monitor.profiles = {}
-    # Manifold monitor — peer to ``_monitor`` per Phase 1.  Tests that
-    # exercise manifold-probe slash commands populate ``probe_names`` /
-    # ``attached_probes`` directly on the mock; the default empty state
-    # makes the trait-panel manifold section a no-op renderer.
-    session._manifold_monitor = MagicMock()
-    session._manifold_monitor.probe_names = []
-    session._manifold_monitor.attached_probes = MagicMock(return_value={})
-    session._manifold_monitor.has_pending_per_token = MagicMock(return_value=False)
-    session.manifold_monitor = session._manifold_monitor
+    session._monitor.manifolds = {}
     session._last_result = None
     session._last_per_token_scores = None
     session._tokenizer = MagicMock()
@@ -266,14 +263,14 @@ def test_unprobe_removes():
     app._trait_panel.set_active_probes = MagicMock()
     app._apply_highlight_to_all = MagicMock()
 
-    def _unprobe(name: Any) -> None:
+    def _remove_probe(name: Any) -> None:
         app._session._monitor.probe_names = []
-    app._session.unprobe.side_effect = _unprobe
+    app._session.remove_probe.side_effect = _remove_probe
 
     app._highlight_probe = "happy.sad"
     app._highlighting = True
     app._handle_command("/unprobe happy.sad")
-    app._session.unprobe.assert_called_with("happy.sad")
+    app._session.remove_probe.assert_called_with("happy.sad")
     # Highlight seed cleared when its probe was removed.
     assert app._highlight_probe is None
     assert app._highlighting is False
@@ -1007,7 +1004,7 @@ def test_handle_probe_namespace_bulk_loads_and_seeds_highlight(monkeypatch: pyte
     app._handle_command("/probe alice/")
     _drain_workers(app)
 
-    assert app._session.probe.call_count == 2
+    assert app._session.add_probe.call_count == 2
     assert app._highlighting is True
     # Seeded to the lexicographically last loaded probe — deterministic
     # so tests don't flake on dict iteration order.
@@ -1063,11 +1060,11 @@ def test_handle_unprobe_namespace_clears_highlight_when_seed_is_in_namespace():
         app._session._monitor.probe_names = [
             p for p in app._session._monitor.probe_names if p != name
         ]
-    app._session.unprobe.side_effect = _unprobe
+    app._session.remove_probe.side_effect = _unprobe
 
     app._handle_command("/unprobe alice/")
 
-    assert app._session.unprobe.call_count == 2
+    assert app._session.remove_probe.call_count == 2
     assert app._session._monitor.probe_names == ["default/keep"]
     # Highlight seed sat inside the namespace — gets dropped.
     assert app._highlight_probe is None
@@ -1087,7 +1084,7 @@ def test_handle_unprobe_namespace_keeps_highlight_when_seed_outside_namespace():
         app._session._monitor.probe_names = [
             p for p in app._session._monitor.probe_names if p != name
         ]
-    app._session.unprobe.side_effect = _unprobe
+    app._session.remove_probe.side_effect = _unprobe
 
     app._handle_command("/unprobe alice/")
 
@@ -1841,9 +1838,9 @@ def test_manifold_fit_missing_folder_reports(tmp_path: Path) -> None:
     app.run_worker.assert_not_called()
 
 
-def test_manifold_fit_runs_session_extract_manifold(tmp_path: Path) -> None:
+def test_manifold_fit_runs_session_fit(tmp_path: Path) -> None:
     """`/manifold fit <folder>` with a manifold.json present routes
-    through ``session.extract_manifold`` on a worker."""
+    through ``session.fit`` on a worker."""
     (tmp_path / "manifold.json").write_text("{}")
     app = _make_app()
 
@@ -1852,10 +1849,10 @@ def test_manifold_fit_runs_session_extract_manifold(tmp_path: Path) -> None:
     )
     captured: dict[str, Any] = {}
 
-    def _fake_extract_manifold(folder: Any, **kwargs: Any) -> Any:
+    def _fake_fit(folder: Any, **kwargs: Any) -> Any:
         captured["folder"] = folder
         return fitted
-    app._session.extract_manifold = _fake_extract_manifold
+    app._session.fit = _fake_fit
     app.run_worker = lambda fn, thread=True: fn()
     app.call_from_thread = lambda fn, *a, **kw: fn(*a, **kw)
 
@@ -2103,27 +2100,32 @@ def test_manifold_probe_remove_requires_name():
 
 
 def test_manifold_probe_attach_routes_through_session(monkeypatch: pytest.MonkeyPatch):
-    """``/manifold-probe <selector>`` calls ``session.add_manifold_probe``
-    on a worker; on success the trait panel is refreshed with the
-    attached probe's manifold artifact."""
+    """``/manifold-probe <selector>`` calls the unified ``session.add_probe``
+    on a worker; on success ``_refresh_probe_panels`` splits the probe set by
+    geometry and pushes the curved probe's manifold artifact to the trait
+    panel's manifold section."""
     app = _make_app()
     captured = {}
+
+    # A curved manifold stub — every layer reports ``is_affine = False`` so
+    # ``_manifold_is_affine`` routes it to the manifold (curved) section.
+    manifold = SimpleNamespace(
+        domain=SimpleNamespace(intrinsic_dim=1),
+        node_labels=["a"], node_coords=None,
+        layers={0: SimpleNamespace(is_affine=False)},
+    )
 
     def _fake_add(selector: Any, **kwargs: Any) -> Any:
         captured["selector"] = selector
         # Pretend the session registered the probe under the selector
-        # name and populated the monitor.
-        manifold = SimpleNamespace(
-            domain=SimpleNamespace(intrinsic_dim=1),
-            node_labels=["a"], node_coords=None,
-        )
-        app._session._manifold_monitor.probe_names = [selector]
-        app._session._manifold_monitor.attached_probes = MagicMock(
-            return_value={selector: SimpleNamespace(manifold=manifold)},
-        )
+        # name and populated the unified monitor.
+        app._session._monitor.probe_names = [selector]
+        app._session._monitor.manifolds = {selector: manifold}
         return selector
-    app._session.add_manifold_probe = _fake_add
+    app._session.add_probe = _fake_add
+    app._trait_panel.set_active_probes = MagicMock()
     app._trait_panel.set_active_manifold_probes = MagicMock()
+    app._refresh_trait_why = MagicMock()
     app.run_worker = lambda fn, thread=True: fn()
     app.call_from_thread = lambda fn, *a, **kw: fn(*a, **kw)
 
@@ -2138,24 +2140,29 @@ def test_manifold_probe_attach_routes_through_session(monkeypatch: pytest.Monkey
 
 def test_manifold_probe_remove_routes_through_session():
     app = _make_app()
-    app._session._manifold_monitor.probe_names = ["circumplex"]
-    app._session._manifold_monitor.attached_probes = MagicMock(return_value={})
+    app._session._monitor.probe_names = ["circumplex"]
+    app._session._monitor.manifolds = {
+        "circumplex": SimpleNamespace(layers={0: SimpleNamespace(is_affine=False)}),
+    }
 
     def _fake_remove(name: Any) -> None:
-        app._session._manifold_monitor.probe_names = []
-    app._session.remove_manifold_probe = _fake_remove
+        app._session._monitor.probe_names = []
+        app._session._monitor.manifolds = {}
+    app._session.remove_probe.side_effect = _fake_remove
+    app._trait_panel.set_active_probes = MagicMock()
     app._trait_panel.set_active_manifold_probes = MagicMock()
+    app._refresh_trait_why = MagicMock()
 
     app._handle_command("/manifold-probe-remove circumplex")
 
-    assert app._session._manifold_monitor.probe_names == []
+    assert app._session._monitor.probe_names == []
     app._trait_panel.set_active_manifold_probes.assert_called_with({})
     assert "removed" in _msgs(app).lower()
 
 
 def test_manifold_probe_remove_missing_reports():
     app = _make_app()
-    app._session._manifold_monitor.probe_names = []
+    app._session._monitor.probe_names = []
     app._handle_command("/manifold-probe-remove ghost")
     assert "not active" in _msgs(app)
 
@@ -2181,36 +2188,29 @@ def test_manifold_probe_during_ab_shadow_is_refused():
     assert app._pending_queue == []
 
 
-@pytest.mark.xfail(
-    reason="TUI probe surface deferred to its own 4.0 rewire pass: references "
-    "the removed ManifoldAggregate/ManifoldTokenReading + the "
-    "manifold_readings->probe_readings rename; the TUI app/trait_panel still "
-    "call the removed session.manifold_monitor/add_manifold_probe.",
-    strict=False,
-)
 def test_pull_manifold_aggregates_pushes_from_last_result():
     """``_finalize_widget_highlight`` calls ``_pull_manifold_aggregates``,
-    which reads ``session.last_result.manifold_readings`` and pushes the
+    which reads ``session.last_result.probe_readings`` and pushes the
     aggregate map to the trait panel."""
-    from saklas.core.results import GenerationResult, ManifoldAggregate
+    from saklas.core.results import GenerationResult, ProbeReading
 
     app = _make_app()
-    agg = ManifoldAggregate(
-        fraction_mean=0.4,
-        fraction_per_layer={0: 0.4},
+    agg = ProbeReading(
+        fraction=0.4,
         nearest=[("happy", 0.1), ("calm", 0.2)],
         coords=(0.3, 0.5),
+        residual=0.05,
+        fraction_per_layer={0: 0.4},
         coords_per_layer={0: (0.3, 0.5)},
-        residual_mean=0.05,
         residual_per_layer={0: 0.05},
     )
     result = GenerationResult(
         text="x", tokens=[], token_count=0, tok_per_sec=0.0, elapsed=0.0,
-        manifold_readings={"circumplex": agg},
+        probe_readings={"circumplex": agg},
     )
     app._session.last_result = result
     # Pretend a probe is attached so the early-out guard lets us through.
-    app._session._manifold_monitor.probe_names = ["circumplex"]
+    app._session._monitor.probe_names = ["circumplex"]
     app._trait_panel.update_manifold_readings = MagicMock()
 
     app._pull_manifold_aggregates()
@@ -2263,16 +2263,11 @@ def test_trait_panel_renders_manifold_section_empty_state():
     assert "0.00" in content_writes[-1]
 
 
-@pytest.mark.xfail(
-    reason="TUI probe surface deferred to its own 4.0 rewire pass "
-    "(ManifoldTokenReading removed; manifold_readings->probe_readings).",
-    strict=False,
-)
 def test_trait_panel_renders_manifold_minimap_for_2d_box():
     """A 2-D BoxDomain manifold draws an ASCII mini-map.  The coord dot
     from the aggregate lands on a row that contains the ``●`` marker."""
     import torch
-    from saklas.core.results import ManifoldAggregate
+    from saklas.core.results import ProbeReading
     from saklas.tui.trait_panel import TraitPanel
 
     panel: Any = object.__new__(TraitPanel)
@@ -2306,13 +2301,13 @@ def test_trait_panel_renders_manifold_minimap_for_2d_box():
         node_coords=coords,
     )
     panel._manifold_probes = {"circ": manifold}
-    panel._manifold_aggregates = {"circ": ManifoldAggregate(
-        fraction_mean=0.5,
-        fraction_per_layer={0: 0.5},
+    panel._manifold_aggregates = {"circ": ProbeReading(
+        fraction=0.5,
         nearest=[("e", 0.1)],
         coords=(0.0, 0.0),  # origin — center of map
+        residual=0.0,
+        fraction_per_layer={0: 0.5},
         coords_per_layer={0: (0.0, 0.0)},
-        residual_mean=0.0,
         residual_per_layer={0: 0.0},
     )}
 
@@ -2325,15 +2320,10 @@ def test_trait_panel_renders_manifold_minimap_for_2d_box():
     assert "0.50" in rendered
 
 
-@pytest.mark.xfail(
-    reason="TUI probe surface deferred to its own 4.0 rewire pass "
-    "(ManifoldTokenReading removed; manifold_readings->probe_readings).",
-    strict=False,
-)
 def test_trait_panel_skips_minimap_for_higher_dim():
     """An 8-D CustomDomain (like ``personas``) renders the bar + labels
     but no mini-map."""
-    from saklas.core.results import ManifoldTokenReading
+    from saklas.core.results import ProbeReading
     from saklas.tui.trait_panel import TraitPanel
 
     panel: Any = object.__new__(TraitPanel)
@@ -2359,7 +2349,7 @@ def test_trait_panel_skips_minimap_for_higher_dim():
         domain=domain, node_labels=["hacker", "pirate"], node_coords=None,
     )
     panel._manifold_probes = {"personas": manifold}
-    panel._manifold_readings = {"personas": ManifoldTokenReading(
+    panel._manifold_readings = {"personas": ProbeReading(
         fraction=0.3, nearest=[("hacker", 0.1)],
     )}
     panel._render_manifold_probes()

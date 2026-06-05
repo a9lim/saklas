@@ -52,7 +52,7 @@ def _make_app():
     session._layers = [0, 1, 2]
     session._monitor = MagicMock()
     session._monitor.probe_names = []
-    session._monitor.profiles = {}
+    session._monitor.manifolds = {}
     session._last_result = None
     session._last_per_token_scores = None
     session._tokenizer = MagicMock()
@@ -683,12 +683,6 @@ def test_load_missing_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
     assert "no saved tree" in _msgs(app)
 
 
-@pytest.mark.xfail(
-    reason="TUI shadow-column token shape deferred to its own 4.0 rewire pass "
-    "(the manifold_readings->probe_readings field rename in the unified "
-    "Monitor read surface).",
-    strict=False,
-)
 def test_fire_auto_regen_streams_into_shadow_column():
     """Phase-5 fix: non-unsteered auto-regen modes stream the modifier
     output into the right (shadow) column via ``_ui_token_queue``
@@ -752,10 +746,10 @@ def test_fire_auto_regen_streams_into_shadow_column():
         items.append(app._ui_token_queue.get_nowait())
     tok_items = [it for it in items if it[0] == "tok"]
     assert len(tok_items) == 2, items
-    # Position 7 is the ``is_shadow`` tag.  Tuple shape post-Phase 3b:
+    # Position 7 is the ``is_shadow`` tag.  Tuple shape:
     # (kind, text, thinking, scores, perplexity, logprob, widget,
-    # is_shadow, manifold_readings) — nine elements after the
-    # manifold-probe per-token readings slot landed at the tail.
+    # is_shadow, probe_readings) — nine elements, the unified per-token
+    # ``ProbeReading`` dict in the tail slot.
     assert all(it[7] is True for it in tok_items)
     # And the right column had its shadow widget mounted.
     app._chat_panel.start_shadow_message.assert_called_once_with(row)
