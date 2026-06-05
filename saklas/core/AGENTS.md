@@ -441,7 +441,7 @@ the gate callback runs one `_monitor.score_single_token` through `flat_scalars` 
 `TriggerContext.probe_scores` (one key space —
 `"<name>"`/`"<name>[i]"`/`"<name>:fraction"`/`"<name>@<label>"`);
 `_finalize_generation` calls `_monitor.score_aggregate` into
-`GenerationResult.manifold_readings`.
+`GenerationResult.probe_readings`.
 `session.lock` is the server-owned `asyncio.Lock` (distinct from `_gen_lock`).
 `generate_batch`/`generate_sweep` return `RunSet` (sweep builds the Cartesian
 product as loom siblings). Hot-path events: `GenerationStarted`/`SteeringApplied`/
@@ -500,14 +500,14 @@ logprobs + the cross-branch evaluation (`_compute_rows`, alignment via
 ## results.py
 
 `GenerationResult`, `RunSet`, `TokenAlt`, `TokenEvent`, `ProbeReadings`,
-`ManifoldReading`, `ResultCollector`. `RunSet` is the
+`ProbeReading`, `ResultCollector`. `RunSet` is the
 list-like multi-run shape (`node_ids`/`grid`/`.first`/`.to_collector()`/
 `.to_dataframe()`). `TokenEvent` carries `thinking`, `logprob`, `top_alts`,
-`finish_reason`, `scores` (per-probe `ManifoldReading`s — the full readings,
-live-stream-gated), `perplexity`, `manifold_readings`. `GenerationResult`
+`finish_reason`, `scores` (per-probe `ProbeReading`s — the full readings,
+live-stream-gated), `perplexity`, `probe_readings`. `GenerationResult`
 carries `prompt_tokens`, `finish_reason`, optional `logprobs`, `readings`
-(per-probe `ProbeReadings`), `manifold_readings`, and `applied_steering` (the
-canonical expression, round-trips through `parse_expr`). `ManifoldReading`
+(per-probe `ProbeReadings`), `probe_readings`, and `applied_steering` (the
+canonical expression, round-trips through `parse_expr`). `ProbeReading`
 (`coords`/`fraction`/`nearest`/`residual` + `fraction_per_layer`/`coords_per_layer`/
 `residual_per_layer`) is the **single** reading shape for both the live per-token
 stream and the end-of-gen aggregate (the aggregate is the reading pooled at the

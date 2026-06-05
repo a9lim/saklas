@@ -1,12 +1,22 @@
-"""Tests for Phase 3a manifold-probe server surface (no GPU required).
+"""Tests for the unified probe server surface (no GPU required).
 
-Covers the native ``/saklas/v1/manifold-probes`` route family plus the
-``x-saklas-manifold-readings`` extension surfaced on OpenAI chat /
+Covers the native ``/saklas/v1/sessions/{id}/probes`` route family (the
+post-unification collapse of the old vector-probe ``/probes`` +
+manifold-probe ``/manifold-probes`` split) plus the
+``x-saklas-probe-readings`` extension surfaced on OpenAI chat /
 completions and Ollama chat / generate responses (streaming and
-non-streaming), plus per-token ``manifold_readings`` on the native WS
-``/saklas/v1/sessions/{id}/stream`` ``token`` frame.  All exercises
-mock the session — the goal is to pin the wire shape, not re-run
-engine integration.
+non-streaming), plus per-token ``probe_readings`` on the native WS
+``/saklas/v1/sessions/{id}/stream`` ``token`` frame.  All exercises mock
+the session — the goal is to pin the wire shape, not re-run engine
+integration.
+
+The monitor was unified (``a498895``): one ``session._monitor`` (methods
+``attached_probes()`` / ``probe_names``), one ``session.add_probe`` /
+``remove_probe``, and one ``ProbeReading`` collapsing the former
+``ManifoldAggregate`` + ``ManifoldTokenReading`` (so the per-token reading
+and the end-of-gen aggregate are the same shape — ``fraction`` /
+``coords`` / ``nearest`` / ``residual``, no ``fraction_mean`` /
+``residual_mean``).
 """
 
 from __future__ import annotations
@@ -23,10 +33,13 @@ from fastapi.testclient import TestClient
 
 from saklas.core.results import (
     GenerationResult,
-    ManifoldAggregate,
-    ManifoldTokenReading,
+    ProbeReading,
     TokenEvent,
 )
+
+# The single session id the native tree resolves to.
+_SID = "default"
+_PROBES = f"/saklas/v1/sessions/{_SID}/probes"
 
 
 # ---------------------------------------------------------------------------
@@ -103,16 +116,13 @@ def _mock_session():
     session.history = []
     session._manifolds = {}
 
+    # The unified monitor: one object, both ``probe_names`` (the wire/gate
+    # surface) and ``attached_probes()`` (the serializer source).
     monitor = MagicMock()
     monitor.probe_names = []
     monitor.profiles = {}
+    monitor.attached_probes.return_value = {}
     session._monitor = monitor
-
-    manifold_monitor = MagicMock()
-    manifold_monitor.probe_names = []
-    manifold_monitor.attached_probes.return_value = {}
-    session._manifold_monitor = manifold_monitor
-    session.manifold_monitor = manifold_monitor
 
     session._tokenizer = MagicMock()
     session._tokenizer.decode.side_effect = lambda ids: f"<{ids[0]}>" if ids else ""
@@ -121,6 +131,10 @@ def _mock_session():
     session._last_result = None
     session.last_per_token_scores = None
     session.last_result = None
+    # The WS token-frame builder consults this first; a real None lets the
+    # inline ``_monitor`` / ``_capture`` scoring branch run (a bare
+    # MagicMock would shadow it with a truthy child mock).
+    session._last_token_probe_payload = None
 
     gen_state = MagicMock()
     gen_state.finish_reason = "stop"
@@ -143,14 +157,14 @@ def session_and_client():
 
 
 # ---------------------------------------------------------------------------
-# /saklas/v1/manifold-probes route family
+# /saklas/v1/sessions/{id}/probes route family
 # ---------------------------------------------------------------------------
 
 
-class TestManifoldProbeRoutes:
+class TestProbeRoutes:
     def test_list_empty(self, session_and_client: Any) -> None:
         _, client = session_and_client
-        resp = client.get("/saklas/v1/manifold-probes")
+        resp = client.get(_PROBES)
         assert resp.status_code == 200
         assert resp.json() == {"probes": []}
 
@@ -161,16 +175,16 @@ class TestManifoldProbeRoutes:
 
         def _add(selector: str, *, as_name: str | None = None, top_n: int = 3) -> str:
             registered = as_name or selector
-            session._manifold_monitor.probe_names = [registered]
-            session._manifold_monitor.attached_probes.return_value = {
+            session._monitor.probe_names = [registered]
+            session._monitor.attached_probes.return_value = {
                 registered: probe,
             }
             return registered
 
-        session.add_manifold_probe.side_effect = _add
+        session.add_probe.side_effect = _add
 
         resp = client.post(
-            "/saklas/v1/manifold-probes",
+            _PROBES,
             json={"selector": "default/circumplex"},
         )
         assert resp.status_code == 201
@@ -186,7 +200,7 @@ class TestManifoldProbeRoutes:
         assert body["feature_space"] == "raw"
 
         # List route surfaces the attached probe.
-        resp = client.get("/saklas/v1/manifold-probes")
+        resp = client.get(_PROBES)
         assert resp.status_code == 200
         rows = resp.json()["probes"]
         assert len(rows) == 1
@@ -199,16 +213,16 @@ class TestManifoldProbeRoutes:
 
         def _add(selector: str, *, as_name: str | None = None, top_n: int = 3) -> str:
             registered = as_name or selector
-            session._manifold_monitor.probe_names = [registered]
-            session._manifold_monitor.attached_probes.return_value = {
+            session._monitor.probe_names = [registered]
+            session._monitor.attached_probes.return_value = {
                 registered: probe,
             }
             return registered
 
-        session.add_manifold_probe.side_effect = _add
+        session.add_probe.side_effect = _add
 
         resp = client.post(
-            "/saklas/v1/manifold-probes",
+            _PROBES,
             json={
                 "selector": "default/personas",
                 "name": "my-probe",
@@ -219,41 +233,73 @@ class TestManifoldProbeRoutes:
         assert resp.json()["name"] == "my-probe"
         assert resp.json()["top_n"] == 5
         # Underlying session was called with the requested overrides.
-        session.add_manifold_probe.assert_called_once_with(
+        session.add_probe.assert_called_once_with(
             "default/personas", as_name="my-probe", top_n=5,
         )
 
     def test_post_rejects_empty_selector(self, session_and_client: Any) -> None:
         _, client = session_and_client
-        resp = client.post("/saklas/v1/manifold-probes", json={"selector": ""})
+        resp = client.post(_PROBES, json={"selector": ""})
         assert resp.status_code == 400
 
     def test_post_404_on_unknown_selector(self, session_and_client: Any) -> None:
         session, client = session_and_client
-        session.add_manifold_probe.side_effect = FileNotFoundError(
+        session.add_probe.side_effect = FileNotFoundError(
             "manifold 'default/missing' not installed",
         )
         resp = client.post(
-            "/saklas/v1/manifold-probes",
+            _PROBES,
             json={"selector": "default/missing"},
         )
         assert resp.status_code == 404
 
     def test_delete_round_trip(self, session_and_client: Any) -> None:
         session, client = session_and_client
-        session._manifold_monitor.probe_names = ["circumplex"]
+        session._monitor.probe_names = ["circumplex"]
 
-        resp = client.delete("/saklas/v1/manifold-probes/circumplex")
+        resp = client.delete(f"{_PROBES}/circumplex")
         assert resp.status_code == 204
-        session.remove_manifold_probe.assert_called_once_with("circumplex")
+        session.remove_probe.assert_called_once_with("circumplex")
 
     def test_delete_404_on_unknown_name(self, session_and_client: Any) -> None:
         session, client = session_and_client
-        session._manifold_monitor.probe_names = []
-        resp = client.delete("/saklas/v1/manifold-probes/missing")
+        session._monitor.probe_names = []
+        resp = client.delete(f"{_PROBES}/missing")
         assert resp.status_code == 404
-        session.remove_manifold_probe.assert_not_called()
+        session.remove_probe.assert_not_called()
 
+    def test_delete_qualified_namespaced_name(self, session_and_client: Any) -> None:
+        """Probes attached by qualified selector (``default/personas``)
+        carry a registered name containing ``/`` — the DELETE route
+        must accept that via ``{name:path}`` or the webui ✕ button 404s.
+        """
+        session, client = session_and_client
+        session._monitor.probe_names = ["default/personas"]
+
+        # Both raw-slash and percent-encoded forms must reach the
+        # handler with the slash intact.  encodeURIComponent in the
+        # webui sends the percent-encoded form.
+        resp = client.delete(f"{_PROBES}/default/personas")
+        assert resp.status_code == 204
+        session.remove_probe.assert_called_once_with("default/personas")
+
+        session.remove_probe.reset_mock()
+        session._monitor.probe_names = ["default/personas"]
+        resp = client.delete(f"{_PROBES}/default%2Fpersonas")
+        assert resp.status_code == 204
+        session.remove_probe.assert_called_once_with("default/personas")
+
+
+# ---------------------------------------------------------------------------
+# /saklas/v1/manifolds/* route family (search / merge / install)
+# ---------------------------------------------------------------------------
+#
+# These ride the still-present ``manifold_routes`` module — unaffected by
+# the monitor unification — and pin the CRUD wire shapes the webui's HF
+# picker / builder consume.
+
+
+class TestManifoldCrudRoutes:
     def test_search_route_returns_results(self, session_and_client: Any, monkeypatch: pytest.MonkeyPatch) -> None:
         """``GET /saklas/v1/manifolds/search`` proxies to
         ``hf_manifolds.search_manifolds`` and returns the row shape the
@@ -432,60 +478,39 @@ class TestManifoldProbeRoutes:
             "fitted": [],
         }
 
-    def test_delete_qualified_namespaced_name(self, session_and_client: Any) -> None:
-        """Probes attached by qualified selector (``default/personas``)
-        carry a registered name containing ``/`` — the DELETE route
-        must accept that via ``{name:path}`` or the webui ✕ button 404s.
-        """
-        session, client = session_and_client
-        session._manifold_monitor.probe_names = ["default/personas"]
-
-        # Both raw-slash and percent-encoded forms must reach the
-        # handler with the slash intact.  encodeURIComponent in the
-        # webui sends the percent-encoded form.
-        resp = client.delete("/saklas/v1/manifold-probes/default/personas")
-        assert resp.status_code == 204
-        session.remove_manifold_probe.assert_called_once_with("default/personas")
-
-        session.remove_manifold_probe.reset_mock()
-        session._manifold_monitor.probe_names = ["default/personas"]
-        resp = client.delete("/saklas/v1/manifold-probes/default%2Fpersonas")
-        assert resp.status_code == 204
-        session.remove_manifold_probe.assert_called_once_with("default/personas")
-
 
 # ---------------------------------------------------------------------------
-# OpenAI extension: x-saklas-manifold-readings
+# OpenAI extension: x-saklas-probe-readings
 # ---------------------------------------------------------------------------
 
 
 def _attach_aggregate(session: Any, *, name: str = "circumplex") -> None:
     manifold = _mock_manifold(name)
     probe = _mock_probe(name, manifold)
-    session._manifold_monitor.probe_names = [name]
-    session._manifold_monitor.attached_probes.return_value = {name: probe}
+    session._monitor.probe_names = [name]
+    session._monitor.attached_probes.return_value = {name: probe}
 
 
 def _populate_last_result(session: Any, *, name: str = "circumplex") -> GenerationResult:
-    aggregate = ManifoldAggregate(
-        fraction_mean=0.42,
+    aggregate = ProbeReading(
+        fraction=0.42,
         fraction_per_layer={4: 0.4, 8: 0.5},
         nearest=[("happy", 0.13), ("calm", 0.22)],
         coords=(0.61, 0.42),
         coords_per_layer={4: (0.6, 0.4), 8: (0.62, 0.45)},
-        residual_mean=0.07,
+        residual=0.07,
         residual_per_layer={4: 0.05, 8: 0.09},
     )
     result = GenerationResult(
         text="hi", tokens=[1], token_count=1, prompt_tokens=1,
         tok_per_sec=5.0, elapsed=0.1,
-        manifold_readings={name: aggregate},
+        probe_readings={name: aggregate},
     )
     session._last_result = result
     return result
 
 
-class TestOpenAIManifoldExtension:
+class TestOpenAIProbeExtension:
     def test_chat_completion_carries_extension_on_choice(self, session_and_client: Any) -> None:
         session, client = session_and_client
         _attach_aggregate(session)
@@ -497,10 +522,10 @@ class TestOpenAIManifoldExtension:
         })
         assert resp.status_code == 200
         choice = resp.json()["choices"][0]
-        ext = choice.get("x-saklas-manifold-readings")
+        ext = choice.get("x-saklas-probe-readings")
         assert ext is not None
         assert "circumplex" in ext
-        assert ext["circumplex"]["fraction_mean"] == pytest.approx(0.42)
+        assert ext["circumplex"]["fraction"] == pytest.approx(0.42)
         assert ext["circumplex"]["coords"] == [pytest.approx(0.61), pytest.approx(0.42)]
         assert ext["circumplex"]["nearest"] == [["happy", 0.13], ["calm", 0.22]]
 
@@ -515,7 +540,7 @@ class TestOpenAIManifoldExtension:
         })
         assert resp.status_code == 200
         choice = resp.json()["choices"][0]
-        assert "x-saklas-manifold-readings" not in choice
+        assert "x-saklas-probe-readings" not in choice
 
     def test_text_completion_carries_extension_on_choice(self, session_and_client: Any) -> None:
         session, client = session_and_client
@@ -525,9 +550,9 @@ class TestOpenAIManifoldExtension:
 
         resp = client.post("/v1/completions", json={"prompt": "x"})
         assert resp.status_code == 200
-        ext = resp.json()["choices"][0].get("x-saklas-manifold-readings")
+        ext = resp.json()["choices"][0].get("x-saklas-probe-readings")
         assert ext is not None
-        assert ext["circumplex"]["fraction_mean"] == pytest.approx(0.42)
+        assert ext["circumplex"]["fraction"] == pytest.approx(0.42)
 
     def test_chat_stream_surface_per_token_and_aggregate(self, session_and_client: Any) -> None:
         session, client = session_and_client
@@ -535,7 +560,7 @@ class TestOpenAIManifoldExtension:
         result = _populate_last_result(session)
         session._last_result = result
 
-        token_reading = ManifoldTokenReading(
+        token_reading = ProbeReading(
             fraction=0.51,
             nearest=[("happy", 0.18), ("calm", 0.31)],
         )
@@ -543,11 +568,11 @@ class TestOpenAIManifoldExtension:
         def _mock_stream(*args: Any, **kwargs: Any) -> Any:
             yield TokenEvent(
                 text="Hi", token_id=1, index=0,
-                manifold_readings={"circumplex": token_reading},
+                probe_readings={"circumplex": token_reading},
             )
             yield TokenEvent(
                 text=" there", token_id=2, index=1,
-                manifold_readings={"circumplex": token_reading},
+                probe_readings={"circumplex": token_reading},
             )
 
         session.generate_stream.return_value = _mock_stream()
@@ -565,7 +590,7 @@ class TestOpenAIManifoldExtension:
         token_chunks = [c for c in chunks if c["choices"][0].get("delta", {}).get("content")]
         assert token_chunks
         for c in token_chunks:
-            ext = c["choices"][0].get("x-saklas-manifold-readings")
+            ext = c["choices"][0].get("x-saklas-probe-readings")
             assert ext is not None
             assert ext["circumplex"]["fraction"] == pytest.approx(0.51)
             assert ext["circumplex"]["nearest"] == [["happy", 0.18], ["calm", 0.31]]
@@ -575,17 +600,17 @@ class TestOpenAIManifoldExtension:
             c for c in chunks
             if c["choices"][0].get("finish_reason") == "stop"
         )
-        agg = final["choices"][0].get("x-saklas-manifold-readings")
+        agg = final["choices"][0].get("x-saklas-probe-readings")
         assert agg is not None
-        assert agg["circumplex"]["fraction_mean"] == pytest.approx(0.42)
+        assert agg["circumplex"]["fraction"] == pytest.approx(0.42)
 
 
 # ---------------------------------------------------------------------------
-# Ollama extension: x-saklas-manifold-readings (top-level)
+# Ollama extension: x-saklas-probe-readings (top-level)
 # ---------------------------------------------------------------------------
 
 
-class TestOllamaManifoldExtension:
+class TestOllamaProbeExtension:
     def test_chat_non_streaming_carries_extension(self, session_and_client: Any) -> None:
         session, client = session_and_client
         _attach_aggregate(session)
@@ -599,9 +624,9 @@ class TestOllamaManifoldExtension:
         })
         assert resp.status_code == 200
         body = resp.json()
-        ext = body.get("x-saklas-manifold-readings")
+        ext = body.get("x-saklas-probe-readings")
         assert ext is not None
-        assert ext["circumplex"]["fraction_mean"] == pytest.approx(0.42)
+        assert ext["circumplex"]["fraction"] == pytest.approx(0.42)
 
     def test_chat_non_streaming_absent_when_no_probes(self, session_and_client: Any) -> None:
         session, client = session_and_client
@@ -614,7 +639,7 @@ class TestOllamaManifoldExtension:
             "stream": False,
         })
         assert resp.status_code == 200
-        assert "x-saklas-manifold-readings" not in resp.json()
+        assert "x-saklas-probe-readings" not in resp.json()
 
     def test_generate_non_streaming_carries_extension(self, session_and_client: Any) -> None:
         session, client = session_and_client
@@ -627,9 +652,9 @@ class TestOllamaManifoldExtension:
             "stream": False,
         })
         assert resp.status_code == 200
-        ext = resp.json().get("x-saklas-manifold-readings")
+        ext = resp.json().get("x-saklas-probe-readings")
         assert ext is not None
-        assert ext["circumplex"]["fraction_mean"] == pytest.approx(0.42)
+        assert ext["circumplex"]["fraction"] == pytest.approx(0.42)
 
     def test_chat_streaming_surface_per_token_and_aggregate(self, session_and_client: Any) -> None:
         session, client = session_and_client
@@ -637,7 +662,7 @@ class TestOllamaManifoldExtension:
         result = _populate_last_result(session)
         session._last_result = result
 
-        token_reading = ManifoldTokenReading(
+        token_reading = ProbeReading(
             fraction=0.33,
             nearest=[("happy", 0.2)],
         )
@@ -645,7 +670,7 @@ class TestOllamaManifoldExtension:
         def _mock_stream(*args: Any, **kwargs: Any) -> Any:
             yield TokenEvent(
                 text="Hi", token_id=1, index=0,
-                manifold_readings={"circumplex": token_reading},
+                probe_readings={"circumplex": token_reading},
             )
 
         session.generate_stream.side_effect = _mock_stream
@@ -659,46 +684,45 @@ class TestOllamaManifoldExtension:
         # First chunk: per-token reading rides under the extension key.
         first = chunks[0]
         assert first["done"] is False
-        ext = first.get("x-saklas-manifold-readings")
+        ext = first.get("x-saklas-probe-readings")
         assert ext is not None
         assert ext["circumplex"]["fraction"] == pytest.approx(0.33)
         # Final chunk: aggregate.
         final = chunks[-1]
         assert final["done"] is True
-        agg = final.get("x-saklas-manifold-readings")
+        agg = final.get("x-saklas-probe-readings")
         assert agg is not None
-        assert agg["circumplex"]["fraction_mean"] == pytest.approx(0.42)
+        assert agg["circumplex"]["fraction"] == pytest.approx(0.42)
 
 
 # ---------------------------------------------------------------------------
-# Native WebSocket: per-token manifold_readings on token frames
+# Native WebSocket: per-token probe_readings on token frames
 # ---------------------------------------------------------------------------
 
 
-class TestWebSocketManifoldReadings:
+class TestWebSocketProbeReadings:
     """The native ``/saklas/v1/sessions/{id}/stream`` WS must carry
-    ``manifold_readings`` on every ``token`` frame when manifold probes
-    are attached, and the final ``done`` event still carries the
-    aggregate.  Vector probes go through the persisted-loom-row path
-    (see ``test_saklas_api.TestWebSocket``); manifold readings have no
-    such persistence yet, so the server scores directly off
-    ``session._capture._per_layer`` inside the WS ``_on_token``
-    callback.
+    ``probe_readings`` on every ``token`` frame when probes are attached,
+    and the final ``done`` event still carries the aggregate.  Manifold
+    readings have no persisted-loom-row path, so the server scores
+    directly off ``session._capture._per_layer`` via
+    ``session._monitor.score_single_token`` inside the WS token-frame
+    builder.
 
     Regression for the Phase 3c bug where the webui mini-map cursor
     stayed stuck at ``awaiting first token...`` because the WS ``token``
     frame omitted the field entirely until ``done``.
     """
 
-    def _attach_manifold(self, session: Any, *, name: str = "circumplex") -> Any:
+    def _attach_probe(self, session: Any, *, name: str = "circumplex") -> Any:
         manifold = _mock_manifold(name)
         probe = _mock_probe(name, manifold)
-        session._manifold_monitor.probe_names = [name]
-        session._manifold_monitor.attached_probes.return_value = {name: probe}
+        session._monitor.probe_names = [name]
+        session._monitor.attached_probes.return_value = {name: probe}
 
         # Per-token reading the monitor returns each time the WS
-        # callback hits the inline-score branch.
-        reading = ManifoldTokenReading(
+        # builder hits the inline-score branch.
+        reading = ProbeReading(
             fraction=0.51,
             nearest=[("happy", 0.18), ("calm", 0.31)],
         )
@@ -706,11 +730,11 @@ class TestWebSocketManifoldReadings:
         def _score(hidden: Any) -> dict[str, Any]:
             return {name: reading}
 
-        session._manifold_monitor.score_single_token.side_effect = _score
+        session._monitor.score_single_token.side_effect = _score
         return reading
 
     def _wire_capture(self, session: Any) -> None:
-        """Wire ``session._capture._per_layer`` so the inline manifold
+        """Wire ``session._capture._per_layer`` so the inline probe
         scoring branch sees non-empty per-layer captures and therefore
         actually runs.  The values themselves don't matter — the mocked
         ``score_single_token`` ignores its input."""
@@ -723,8 +747,8 @@ class TestWebSocketManifoldReadings:
 
         Mirrors the pattern in ``test_saklas_api.TestWebSocket``.  When
         ``aggregate`` is provided it is stashed on the returned result's
-        ``manifold_readings`` so the ``done`` event surfaces the
-        aggregate alongside the per-token frames.
+        ``probe_readings`` so the ``done`` event surfaces the aggregate
+        alongside the per-token frames.
         """
         def _gen(
             input: Any, *, steering: Any = None, sampling: Any = None, stateless: bool = False,
@@ -740,7 +764,7 @@ class TestWebSocketManifoldReadings:
                 tokens=list(range(1000, 1000 + len(tokens))),
                 token_count=len(tokens), tok_per_sec=50.0, elapsed=0.05,
                 finish_reason="stop",
-                manifold_readings=(
+                probe_readings=(
                     {"circumplex": aggregate} if aggregate else {}
                 ),
             )
@@ -752,14 +776,14 @@ class TestWebSocketManifoldReadings:
 
         session.generate.side_effect = _gen
 
-    def test_token_frame_carries_manifold_readings(self, session_and_client: Any) -> None:
+    def test_token_frame_carries_probe_readings(self, session_and_client: Any) -> None:
         session, client = session_and_client
-        self._attach_manifold(session)
+        self._attach_probe(session)
         self._wire_capture(session)
         self._attach_generate(session, ["Hello", " ", "world"])
 
         with client.websocket_connect(
-            "/saklas/v1/sessions/default/stream",
+            f"/saklas/v1/sessions/{_SID}/stream",
         ) as ws:
             ws.send_json({"type": "generate", "input": "hi"})
             started = ws.receive_json()
@@ -776,9 +800,9 @@ class TestWebSocketManifoldReadings:
 
         assert len(token_frames) == 3
         for frame in token_frames:
-            mf = frame.get("manifold_readings")
+            mf = frame.get("probe_readings")
             assert mf is not None, (
-                "per-token manifold_readings missing on WS token frame — "
+                "per-token probe_readings missing on WS token frame — "
                 "regression of the Phase 3c stall bug"
             )
             assert "circumplex" in mf
@@ -790,26 +814,25 @@ class TestWebSocketManifoldReadings:
         # The done event carries the aggregate only when the result
         # actually has one — this happy-path test omits the aggregate
         # to isolate the per-token wire.  The full round-trip is
-        # covered by ``test_done_frame_carries_manifold_aggregate``
-        # below.
+        # covered by ``test_done_frame_carries_probe_aggregate`` below.
 
-    def test_done_frame_carries_manifold_aggregate(self, session_and_client: Any) -> None:
+    def test_done_frame_carries_probe_aggregate(self, session_and_client: Any) -> None:
         session, client = session_and_client
-        self._attach_manifold(session)
+        self._attach_probe(session)
         self._wire_capture(session)
-        aggregate = ManifoldAggregate(
-            fraction_mean=0.42,
+        aggregate = ProbeReading(
+            fraction=0.42,
             fraction_per_layer={4: 0.4, 8: 0.5},
             nearest=[("happy", 0.13), ("calm", 0.22)],
             coords=(0.61, 0.42),
             coords_per_layer={4: (0.6, 0.4), 8: (0.62, 0.45)},
-            residual_mean=0.07,
+            residual=0.07,
             residual_per_layer={4: 0.05, 8: 0.09},
         )
         self._attach_generate(session, ["Hello"], aggregate=aggregate)
 
         with client.websocket_connect(
-            "/saklas/v1/sessions/default/stream",
+            f"/saklas/v1/sessions/{_SID}/stream",
         ) as ws:
             ws.send_json({"type": "generate", "input": "hi"})
             assert ws.receive_json()["type"] == "started"
@@ -819,27 +842,27 @@ class TestWebSocketManifoldReadings:
                     done = msg
                     break
 
-        agg_blob = done["result"].get("manifold_readings")
+        agg_blob = done["result"].get("probe_readings")
         assert agg_blob is not None
-        assert agg_blob["circumplex"]["fraction_mean"] == pytest.approx(0.42)
+        assert agg_blob["circumplex"]["fraction"] == pytest.approx(0.42)
         assert agg_blob["circumplex"]["coords"] == [
             pytest.approx(0.61), pytest.approx(0.42),
         ]
 
-    def test_token_frame_omits_field_when_no_manifold_probes(
+    def test_token_frame_omits_field_when_no_probes(
         self, session_and_client: Any,
     ) -> None:
-        """No manifold probes attached → ``manifold_readings`` omitted
-        from every token frame.  Legacy clients see the unchanged shape.
+        """No probes attached → ``probe_readings`` omitted from every
+        token frame.  Legacy clients see the unchanged shape.
         """
         session, client = session_and_client
         # Probe list stays empty; capture wiring left default so the
         # inline branch never triggers.
-        session._manifold_monitor.probe_names = []
+        session._monitor.probe_names = []
         self._attach_generate(session, ["Hi"])
 
         with client.websocket_connect(
-            "/saklas/v1/sessions/default/stream",
+            f"/saklas/v1/sessions/{_SID}/stream",
         ) as ws:
             ws.send_json({"type": "generate", "input": "hi"})
             assert ws.receive_json()["type"] == "started"
@@ -848,7 +871,7 @@ class TestWebSocketManifoldReadings:
                 msg = ws.receive_json()
                 if msg["type"] == "token":
                     saw_token = True
-                    assert "manifold_readings" not in msg
+                    assert "probe_readings" not in msg
                 elif msg["type"] == "done":
                     break
         assert saw_token

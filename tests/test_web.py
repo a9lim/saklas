@@ -250,48 +250,64 @@ class TestScoreSingleTokenPerLayer:
     def test_returns_per_layer_per_probe_dict(self) -> None:
         # Build a real TraitMonitor, register two probes that share
         # layer 0, score against a hidden state.  No torch model needed.
-        from saklas.core.monitor import TraitMonitor
+        from saklas.core.monitor import Monitor
+        from saklas.core.vectors import fold_directions_to_subspace
 
         from tests._whitener import isotropic_whitener
-        probes = {
-            "honest": {0: torch.tensor([1.0, 0.0, 0.0, 0.0])},
-            "warm":   {0: torch.tensor([0.0, 1.0, 0.0, 0.0])},
-        }
+        means = {0: torch.zeros(4)}
+        whit = isotropic_whitener([0], 4)
         # Mahalanobis-only: an isotropic whitener reproduces the Euclidean
-        # cosine for these axis-aligned probes (diagonal Σ⁻¹ ⇒ axis 0 ⊥ axis 1).
-        monitor = TraitMonitor(
-            probes, layer_means={0: torch.zeros(4)},
-            whitener=isotropic_whitener([0], 4),
-        )
+        # coordinate for these axis-aligned probes (diagonal Σ⁻¹ ⇒ axis 0 ⊥
+        # axis 1).  Each direction folds to a 1-node ray (coord 1.0 at the
+        # pole) — the session's vector-probe path.
+        probes = {
+            "honest": fold_directions_to_subspace(
+                "honest", {0: torch.tensor([1.0, 0.0, 0.0, 0.0])},
+                means, whitener=whit,
+            ),
+            "warm": fold_directions_to_subspace(
+                "warm", {0: torch.tensor([0.0, 1.0, 0.0, 0.0])},
+                means, whitener=whit,
+            ),
+        }
+        monitor = Monitor(probes, layer_means=means, whitener=whit)
 
         hidden = {0: torch.tensor([1.0, 0.0, 0.0, 0.0])}
         result = monitor.score_single_token_per_layer(hidden)
 
         assert 0 in result
         assert set(result[0].keys()) == {"honest", "warm"}
-        # Hidden state aligns perfectly with the honest direction; warm
-        # is orthogonal (whitened cosine ≈ Euclidean under isotropic Σ).
-        assert result[0]["honest"] == pytest.approx(1.0, abs=2e-2)
-        assert result[0]["warm"] == pytest.approx(0.0, abs=2e-2)
+        # Hidden aligns with the honest direction (coord ≈ 1 at the pole);
+        # warm is orthogonal (coord ≈ 0 under isotropic Σ).
+        assert result[0]["honest"] == pytest.approx(1.0, abs=0.1)
+        assert result[0]["warm"] == pytest.approx(0.0, abs=0.1)
 
     def test_empty_input_returns_empty(self) -> None:
-        from saklas.core.monitor import TraitMonitor
+        from saklas.core.monitor import Monitor
+        from saklas.core.vectors import fold_directions_to_subspace
+        from tests._whitener import isotropic_whitener
 
-        monitor = TraitMonitor(
-            {"honest": {0: torch.tensor([1.0, 0.0, 0.0, 0.0])}},
-            layer_means={0: torch.zeros(4)},
+        means = {0: torch.zeros(4)}
+        whit = isotropic_whitener([0], 4)
+        m = fold_directions_to_subspace(
+            "honest", {0: torch.tensor([1.0, 0.0, 0.0, 0.0])}, means,
+            whitener=whit,
         )
+        monitor = Monitor({"honest": m}, layer_means=means, whitener=whit)
         assert monitor.score_single_token_per_layer({}) == {}
 
     def test_layers_outside_probe_cache_omitted(self) -> None:
-        from saklas.core.monitor import TraitMonitor
+        from saklas.core.monitor import Monitor
+        from saklas.core.vectors import fold_directions_to_subspace
         from tests._whitener import isotropic_whitener
 
-        monitor = TraitMonitor(
-            {"honest": {0: torch.tensor([1.0, 0.0, 0.0, 0.0])}},
-            layer_means={0: torch.zeros(4)},
-            whitener=isotropic_whitener([0], 4),
+        means = {0: torch.zeros(4)}
+        whit = isotropic_whitener([0], 4)
+        m = fold_directions_to_subspace(
+            "honest", {0: torch.tensor([1.0, 0.0, 0.0, 0.0])}, means,
+            whitener=whit,
         )
+        monitor = Monitor({"honest": m}, layer_means=means, whitener=whit)
         # Hidden state at layer 1, but honest only covers layer 0.
         hidden = {1: torch.tensor([1.0, 0.0, 0.0, 0.0])}
         result = monitor.score_single_token_per_layer(hidden)

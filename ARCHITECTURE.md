@@ -688,7 +688,7 @@ retuning. The lever is torn out everywhere; EV survives as a diagnostic only.
 `core/monitor.py` — **one** read-side monitor, `Monitor` (the unification of the
 former `TraitMonitor` + `ManifoldMonitor`), hook-driven (inline with generation,
 no second forward pass), fp32. It reads a fitted subspace and emits one
-reading shape (`ManifoldReading` — `coords` + `fraction` + `nearest` + `residual`,
+reading shape (`ProbeReading` — `coords` + `fraction` + `nearest` + `residual`,
 plus the `*_per_layer` traces) for flat and curved probes alike — the read-side
 peer of the unified `subspace_inject` kernel. A 2-node concept axis, the 107-node
 `personas` fan, and the curved `pad` surface are all just probes on the one

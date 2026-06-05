@@ -40,7 +40,7 @@ from saklas.io.probes_bootstrap import bootstrap_layer_means
 from saklas.core.profile import Profile
 from saklas.core.results import (
     GenerationResult,
-    ManifoldReading,
+    ProbeReading,
     ProbeReadings,
     RunSet,
     TokenEvent,
@@ -2515,11 +2515,11 @@ class SaklasSession:
 
     def score_captured(
         self, generated_ids: list[int], *, accumulate: bool = True,
-    ) -> tuple[dict[str, "ManifoldReading"], dict[str, list[float]]]:
+    ) -> tuple[dict[str, "ProbeReading"], dict[str, list[float]]]:
         """Score probes from the last hidden-state capture.
 
         Returns ``(aggregate_readings, per_token_scores)`` — the aggregate is a
-        per-probe :class:`ManifoldReading` (coordinate reading), and
+        per-probe :class:`ProbeReading` (coordinate reading), and
         ``per_token_scores`` is the per-probe axis-0 coordinate stream. Both
         dicts are empty when the capture was never attached or the generation
         produced no tokens.
@@ -2533,7 +2533,7 @@ class SaklasSession:
 
     def _score_incremental(
         self, generated_ids: list[int], *, accumulate: bool = True,
-    ) -> tuple[dict[str, "ManifoldReading"], dict[str, list[float]]]:
+    ) -> tuple[dict[str, "ProbeReading"], dict[str, list[float]]]:
         """Aggregate readings + per-token coord stream for the generated tokens.
 
         TODO(coords): the no-sync incremental coord-row path is disabled (a
@@ -2550,7 +2550,7 @@ class SaklasSession:
         *,
         per_token: Literal[False] = False,
         accumulate: bool = False,
-    ) -> dict[str, "ManifoldReading"]: ...
+    ) -> dict[str, "ProbeReading"]: ...
     @overload
     def score_hidden(
         self,
@@ -2558,7 +2558,7 @@ class SaklasSession:
         *,
         per_token: Literal[True],
         accumulate: bool = False,
-    ) -> tuple[dict[str, "ManifoldReading"], dict[str, list[float]]]: ...
+    ) -> tuple[dict[str, "ProbeReading"], dict[str, list[float]]]: ...
     def score_hidden(
         self,
         hidden: dict[int, torch.Tensor],
@@ -2566,8 +2566,8 @@ class SaklasSession:
         per_token: bool = False,
         accumulate: bool = False,
     ) -> (
-        dict[str, "ManifoldReading"]
-        | tuple[dict[str, "ManifoldReading"], dict[str, list[float]]]
+        dict[str, "ProbeReading"]
+        | tuple[dict[str, "ProbeReading"], dict[str, list[float]]]
     ):
         """Score registered probes against a pre-captured hidden-state dict.
 
@@ -2578,7 +2578,7 @@ class SaklasSession:
 
         Shape rules:
         - Each value ``[D]``          → single-state aggregate.
-          Returns ``dict[probe, ManifoldReading]``.
+          Returns ``dict[probe, ProbeReading]``.
         - Each value ``[T, D]``       → per-token stack.
           ``per_token=False`` (default) returns the aggregate pooled from
           row ``T-1``; ``per_token=True`` returns
@@ -3660,7 +3660,7 @@ class SaklasSession:
             logprobs=logprobs_list,
             applied_steering=applied_steering,
             hidden_states=hidden_states,
-            manifold_readings=manifold_aggregates,
+            probe_readings=manifold_aggregates,
         )
         self._last_result = result
 
@@ -4109,9 +4109,9 @@ class SaklasSession:
                 mean_logprob_count += 1
             latest_hidden_for_token: dict[int, torch.Tensor] | None = None
             scores: dict[str, float] | None = None
-            vector_readings: dict[str, "ManifoldReading"] | None = None
+            vector_readings: dict[str, "ProbeReading"] | None = None
             per_layer_payload: dict[str, dict[str, float]] | None = None
-            manifold_readings = None
+            probe_readings = None
             needs_scores = bool(
                 self._monitor.probe_names
                 and (
@@ -4143,7 +4143,7 @@ class SaklasSession:
                     # The per-token geometric wire field (full reading) only
                     # when a client wants the live per-token stream.
                     if _wants_live_token_scores:
-                        manifold_readings = agg
+                        probe_readings = agg
                     # Per-layer axis-0 heatmap row — read straight off the
                     # full reading's ``coords_per_layer`` (no second pass).
                     if assistant_node_id is not None and _persists_layer_scores:
@@ -4158,7 +4158,7 @@ class SaklasSession:
                 "scores": scores,
                 "readings": vector_readings,
                 "per_layer_scores": per_layer_payload,
-                "manifold_readings": manifold_readings,
+                "probe_readings": probe_readings,
             }
             if assistant_node_id is not None and tid is not None:
                 token_row: dict[str, Any] = {
@@ -4545,8 +4545,8 @@ class SaklasSession:
         idx_counter = [0]
 
         def _push(text: str, is_thinking: bool, tid: int | None, lp: float | None, top_alts: Any, perplexity: float | None) -> None:
-            readings: dict[str, "ManifoldReading"] | None = None
-            manifold_readings = None
+            readings: dict[str, "ProbeReading"] | None = None
+            probe_readings = None
             if live_scores and self._monitor.probe_names:
                 payload = self._last_token_probe_payload or {}
                 raw_readings = payload.get("readings")
@@ -4557,12 +4557,12 @@ class SaklasSession:
                     # readings dict verbatim (the live-stream consumer reads
                     # ``fraction`` / ``nearest`` / ``coords`` off each).
                     self._monitor.update_live(readings)
-                manifold_readings = payload.get("manifold_readings")
+                probe_readings = payload.get("probe_readings")
             event = TokenEvent(
                 text=text, token_id=tid if tid is not None else -1, index=idx_counter[0],
                 thinking=is_thinking, logprob=lp, top_alts=top_alts,
                 scores=readings, perplexity=perplexity,
-                manifold_readings=manifold_readings,
+                probe_readings=probe_readings,
             )
             idx_counter[0] += 1
             q.put(event)

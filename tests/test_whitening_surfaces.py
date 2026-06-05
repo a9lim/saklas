@@ -3,7 +3,7 @@
 Pure-CPU verification of the four new Mahalanobis integration points, all
 checked against the *definitional* formula (not just "runs"):
 
-* ``ManifoldMonitor`` whitened readout — the M-orthogonal subspace
+* ``Monitor`` whitened readout — the M-orthogonal subspace
   projection fraction + Mahalanobis nearest-node distance, vs a reference
   implementation built from ``LayerWhitener.apply_inv`` / ``subspace_gram``.
 * ``transfer_profile`` target-metric re-bake — per-layer magnitude becomes
@@ -22,7 +22,7 @@ from saklas.core.manifold import (
     Manifold,
     fit_layer_subspace,
 )
-from saklas.core.monitor import ManifoldMonitor
+from saklas.core.monitor import Monitor, _layer_geometry
 from tests._whitener import isotropic_whitener
 
 
@@ -83,17 +83,17 @@ def _toy_manifold(*, dim: int = 8, n_layers: int = 1, seed: int = 0) -> Manifold
 
 
 # --------------------------------------------------------------------------- #
-# ManifoldMonitor whitened readout                                            #
+# Monitor whitened readout                                            #
 # --------------------------------------------------------------------------- #
 
 
-class TestManifoldMonitorWhitened:
+class TestMonitorWhitened:
     def test_whitened_cache_built_all_or_nothing(self) -> None:
         from saklas.core.mahalanobis import WhitenerError
 
         m = _toy_manifold(dim=8, n_layers=2)
         w = _make_whitener(layers=(0, 1), d=8)
-        mon = ManifoldMonitor(whitener=w)
+        mon = Monitor(whitener=w)
         mon.add_probe("toy", m)
         probe = mon.attached_probes()["toy"]
         assert set(probe.whitened.keys()) == {0, 1}
@@ -101,7 +101,7 @@ class TestManifoldMonitorWhitened:
         # Whitener missing a layer → hard error (Mahalanobis is mandatory;
         # no Euclidean fallback).
         w_partial = _make_whitener(layers=(0,), d=8)
-        mon2 = ManifoldMonitor(whitener=w_partial)
+        mon2 = Monitor(whitener=w_partial)
         with pytest.raises(WhitenerError, match="whitener"):
             mon2.add_probe("toy", m)
 
@@ -110,7 +110,7 @@ class TestManifoldMonitorWhitened:
         # Anisotropic Σ so the whitened metric genuinely differs from L2.
         cov = torch.tensor([1.0, 1.0, 4.0, 4.0, 0.5, 0.5, 2.0, 2.0])
         w = _make_whitener(layers=(0,), d=8, cov_scale=cov)
-        mon = ManifoldMonitor(whitener=w)
+        mon = Monitor(whitener=w)
         mon.add_probe("toy", m)
         probe = mon.attached_probes()["toy"]
         sub = m.layers[0]
@@ -118,7 +118,7 @@ class TestManifoldMonitorWhitened:
         torch.manual_seed(3)
         for _ in range(5):
             h = torch.randn(8)
-            frac_t, cdist_q, invert_q, cdist_nodes = mon._layer_geometry(
+            frac_t, cdist_q, invert_q, cdist_nodes = _layer_geometry(
                 probe, 0, h,
             )
             frac = float(frac_t.item())
@@ -151,7 +151,7 @@ class TestManifoldMonitorWhitened:
         """Under an isotropic whitener (Σ ≈ I) the M-orthogonal fraction
         equals the plain Euclidean projection share.
 
-        The Euclidean ``ManifoldMonitor`` path was removed in the 4.0
+        The Euclidean ``Monitor`` path was removed in the 4.0
         Mahalanobis-only collapse, so the reference is computed by hand:
         the L2-orthogonal projection share ``‖x_par‖₂ / ‖x‖₂`` of the
         centered hidden onto the subspace basis.  With Σ ≈ I the whitened
@@ -159,7 +159,7 @@ class TestManifoldMonitorWhitened:
         I, hence the loose tolerance)."""
         m = _toy_manifold(dim=8, n_layers=1)
         iso = isotropic_whitener((0,), 8, n=4000)  # Σ ≈ I
-        mon = ManifoldMonitor(whitener=iso)
+        mon = Monitor(whitener=iso)
         mon.add_probe("toy", m)
         p = mon.attached_probes()["toy"]
         sub = m.layers[0]
@@ -167,7 +167,7 @@ class TestManifoldMonitorWhitened:
         torch.manual_seed(11)
         for _ in range(5):
             h = torch.randn(8)
-            f = float(mon._layer_geometry(p, 0, h)[0].item())
+            f = float(_layer_geometry(p, 0, h)[0].item())
             assert 0.0 <= f <= 1.0 + 1e-6
 
             # Euclidean reference: L2-orthogonal projection energy share onto
@@ -186,7 +186,7 @@ class TestManifoldMonitorWhitened:
         new covariance (Mahalanobis-only — there is no Euclidean readout)."""
         m = _toy_manifold(dim=8, n_layers=1)
         w1 = _make_whitener(layers=(0,), d=8, seed=1)
-        mon = ManifoldMonitor(whitener=w1)
+        mon = Monitor(whitener=w1)
         mon.add_probe("toy", m)
         assert set(mon.attached_probes()["toy"].whitened.keys()) == {0}
         # Swap in a different covering whitener → cache rebuilt for layer 0.

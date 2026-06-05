@@ -285,22 +285,22 @@ def _probe_reading_dict(session: SaklasSession) -> dict[str, Any]:
     return out
 
 
-def _manifold_reading_aggregate(session: SaklasSession) -> dict[str, Any]:
-    """Per-attached-probe ``ManifoldAggregate.to_dict()`` from ``_last_result``.
+def _probe_reading_aggregate(session: SaklasSession) -> dict[str, Any]:
+    """Per-attached-probe ``ProbeReading.to_dict()`` from ``_last_result``.
 
     Returns ``{}`` when no result is recorded or no manifold probes are
-    attached.  Surfaced under the ``x-saklas-manifold-readings`` extension
+    attached.  Surfaced under the ``x-saklas-probe-readings`` extension
     on OpenAI and Ollama responses so vector-probe clients keep working
     unchanged and manifold-aware clients pick up the geometric channel.
     """
     result = getattr(session, "_last_result", None)
     if result is None:
         return {}
-    readings = getattr(result, "manifold_readings", None) or {}
+    readings = getattr(result, "probe_readings", None) or {}
     if not readings:
         return {}
     try:
-        attached = set(session._manifold_monitor.probe_names)
+        attached = set(session._monitor.probe_names)
     except Exception:
         attached = set(readings.keys())
     out: dict[str, Any] = {}
@@ -312,8 +312,8 @@ def _manifold_reading_aggregate(session: SaklasSession) -> dict[str, Any]:
     return out
 
 
-def _manifold_token_readings(event: Any) -> dict[str, Any] | None:
-    """Serialize a :class:`TokenEvent`'s ``manifold_readings`` for the wire.
+def _probe_token_readings(event: Any) -> dict[str, Any] | None:
+    """Serialize a :class:`TokenEvent`'s ``probe_readings`` for the wire.
 
     Returns ``None`` when the event carries no manifold readings (no
     probes attached, or ``live_scores=False`` was passed to
@@ -321,7 +321,7 @@ def _manifold_token_readings(event: Any) -> dict[str, Any] | None:
     paths so the per-token geometric channel rides on each chunk
     without breaking clients that ignore the field.
     """
-    readings = getattr(event, "manifold_readings", None)
+    readings = getattr(event, "probe_readings", None)
     if not readings:
         return None
     out: dict[str, Any] = {}
@@ -580,9 +580,9 @@ async def _stream_generation(
                 # that don't read the field stay unaffected.  Populated
                 # only when at least one manifold probe is attached
                 # and ``live_scores`` is True on the stream.
-                mf_token = _manifold_token_readings(event)
+                mf_token = _probe_token_readings(event)
                 if mf_token is not None:
-                    choice["x-saklas-manifold-readings"] = mf_token
+                    choice["x-saklas-probe-readings"] = mf_token
                 chunk = {
                     "id": rid,
                     "object": object_type,
@@ -616,9 +616,9 @@ async def _stream_generation(
         final_choice: dict[str, Any] = {
             "index": 0, **empty_delta, "finish_reason": finish_reason,
         }
-        mf_agg = _manifold_reading_aggregate(session)
+        mf_agg = _probe_reading_aggregate(session)
         if mf_agg:
-            final_choice["x-saklas-manifold-readings"] = mf_agg
+            final_choice["x-saklas-probe-readings"] = mf_agg
         final = {
             "id": rid,
             "object": object_type,
@@ -826,9 +826,9 @@ def _register_routes(app: FastAPI) -> None:
             "logprobs": _render_logprobs_chat(result, session),
             "finish_reason": result.finish_reason,
         }
-        mf_chat = _manifold_reading_aggregate(session)
+        mf_chat = _probe_reading_aggregate(session)
         if mf_chat:
-            chat_choice["x-saklas-manifold-readings"] = mf_chat
+            chat_choice["x-saklas-probe-readings"] = mf_chat
         return {
             "id": rid,
             "object": "chat.completion",
@@ -871,9 +871,9 @@ def _register_routes(app: FastAPI) -> None:
             "logprobs": _render_logprobs_completions(result, session),
             "finish_reason": result.finish_reason,
         }
-        mf_completion = _manifold_reading_aggregate(session)
+        mf_completion = _probe_reading_aggregate(session)
         if mf_completion:
-            completion_choice["x-saklas-manifold-readings"] = mf_completion
+            completion_choice["x-saklas-probe-readings"] = mf_completion
         return {
             "id": rid,
             "object": "text_completion",

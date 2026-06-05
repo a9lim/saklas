@@ -94,7 +94,7 @@ def register_traits_routes(app: FastAPI) -> None:
                         # native client can read coordinates without the
                         # wire-stable ``aggregate`` (axis-0) shape changing.
                         probe_readings: dict[str, Any] = {}
-                        manifold_readings: dict[str, Any] = {}
+                        probe_readings: dict[str, Any] = {}
                         if result is not None:
                             readings = getattr(result, "readings", None)
                             if readings:
@@ -119,12 +119,12 @@ def register_traits_routes(app: FastAPI) -> None:
                                     with suppress(Exception):
                                         probe_readings[name] = reading.to_dict()
                             mf_readings = getattr(
-                                result, "manifold_readings", None,
+                                result, "probe_readings", None,
                             )
                             if mf_readings:
                                 for name, agg in mf_readings.items():
                                     with suppress(Exception):
-                                        manifold_readings[name] = agg.to_dict()
+                                        probe_readings[name] = agg.to_dict()
                         payload = {
                             "type": "done",
                             "generation_id": generation_id,
@@ -137,8 +137,8 @@ def register_traits_routes(app: FastAPI) -> None:
                         }
                         if probe_readings:
                             payload["probe_readings"] = probe_readings
-                        if manifold_readings:
-                            payload["manifold_readings"] = manifold_readings
+                        if probe_readings:
+                            payload["probe_readings"] = probe_readings
                         yield f"data: {json.dumps(payload)}\n\n"
                         generation_id = None
             finally:

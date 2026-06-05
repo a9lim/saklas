@@ -48,7 +48,7 @@ class ProbeReadings:
 
 
 @dataclass
-class ManifoldReading:
+class ProbeReading:
     """Subspace-probe reading for one attached fit (flat or curved).
 
     The **single** unified readout: a live per-token reading (gate / stream)
@@ -138,11 +138,11 @@ class GenerationResult:
     hidden_states: dict[int, torch.Tensor] | None = None
     # End-of-generation manifold-probe aggregates, populated by
     # ``Monitor.score_aggregate`` when at least one probe is attached
-    # (the same :class:`ManifoldReading` shape the live per-token stream
+    # (the same :class:`ProbeReading` shape the live per-token stream
     # carries, pooled at the last-content token).  Empty dict otherwise.
     # Keyed by registered probe name; round-trips through ``to_dict`` as a
     # nested mapping.
-    manifold_readings: dict[str, "ManifoldReading"] = field(default_factory=dict)
+    probe_readings: dict[str, "ProbeReading"] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -156,8 +156,8 @@ class GenerationResult:
             "prompt_tokens": self.prompt_tokens,
             "finish_reason": self.finish_reason,
             "applied_steering": self.applied_steering,
-            "manifold_readings": {
-                k: v.to_dict() for k, v in self.manifold_readings.items()
+            "probe_readings": {
+                k: v.to_dict() for k, v in self.probe_readings.items()
             },
         }
 
@@ -259,12 +259,12 @@ class TokenEvent:
     finish_reason: str | None = None
     # Per-probe subspace readings computed inline against the latest
     # captured hidden state — the full coordinate readout
-    # (:class:`ManifoldReading`: coords + fraction + nearest + residual,
+    # (:class:`ProbeReading`: coords + fraction + nearest + residual,
     # plus per-layer traces) for every attached probe, flat or curved (a
     # 2-node concept axis is the ``R = 1`` case; ``coords`` is a 1-tuple).
     # Populated by ``generate_stream`` only when the session has active
     # probes; otherwise None.
-    scores: dict[str, "ManifoldReading"] | None = None
+    scores: dict[str, "ProbeReading"] | None = None
     # Perplexity of the configured sampler distribution after temperature,
     # top-k, and top-p renormalization — ``exp`` of Shannon entropy in nats.
     # Bounded above by sampler support size; a confident prediction
@@ -272,10 +272,10 @@ class TokenEvent:
     perplexity: float | None = None
     # Per-token manifold-probe readings, populated by ``generate_stream``
     # only when at least one probe is attached and ``live_scores`` is True;
-    # otherwise ``None``.  Same :class:`ManifoldReading` shape as ``scores``
+    # otherwise ``None``.  Same :class:`ProbeReading` shape as ``scores``
     # (the geometric wire field; kept distinct for the deferred frontend
     # rewire).  Keyed by registered probe name.
-    manifold_readings: dict[str, "ManifoldReading"] | None = None
+    probe_readings: dict[str, "ProbeReading"] | None = None
 
 
 class ResultCollector:

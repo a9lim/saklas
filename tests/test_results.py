@@ -301,12 +301,14 @@ def test_generation_result_hidden_states_can_be_set_and_is_omitted_from_to_dict(
 
 
 class TestTraitMonitorScoring:
-    """Tests for TraitMonitor probe scoring — runs anywhere (no GPU).
+    """Tests for unified ``Monitor`` probe scoring — runs anywhere (no GPU).
 
     Mahalanobis-only (4.0 collapse): probe scoring requires a covering
-    whitener, so the monitor is built with a synthetic one and the read is
-    the whitened cosine — value assertions are structural (sign / ordering /
-    finiteness), not exact Euclidean cosines.
+    whitener.  A single steering direction is attached as a 1-node ray via
+    ``fold_directions_to_subspace`` (the session's vector-probe path); the read
+    is the in-subspace **domain coordinate** (``history`` stores the coordinate
+    tuple, axis 0 the scalar), so value assertions are structural (sign /
+    ordering / finiteness), not exact cosines.
     """
 
     _DIM = 16
@@ -315,14 +317,17 @@ class TestTraitMonitorScoring:
 
     @classmethod
     def _make_monitor(cls):
-        from saklas.core.monitor import TraitMonitor
+        from saklas.core.monitor import Monitor
+        from saklas.core.vectors import fold_directions_to_subspace
         from tests._whitener import synthetic_whitener
         probe_vec = torch.zeros(cls._DIM)
         probe_vec[0] = 1.0  # unit vector along dim 0
         whitener = synthetic_whitener([0], cls._DIM, means=cls._MEANS)
-        return TraitMonitor(
-            {"test_probe": {0: probe_vec}},
-            layer_means=dict(cls._MEANS), whitener=whitener,
+        m = fold_directions_to_subspace(
+            "test_probe", {0: probe_vec}, dict(cls._MEANS), whitener=whitener,
+        )
+        return Monitor(
+            {"test_probe": m}, layer_means=dict(cls._MEANS), whitener=whitener,
         )
 
     def test_measure_aligned_scores_positive(self):
@@ -332,8 +337,8 @@ class TestTraitMonitorScoring:
         h[0] = 5.0
         monitor.measure_from_hidden({0: h})
         assert len(monitor.history["test_probe"]) == 1
-        # Aligned with the probe ⇒ positive whitened cosine, finite.
-        v = monitor.history["test_probe"][0]
+        # Aligned with the probe ⇒ positive coordinate, finite.
+        v = monitor.history["test_probe"][0][0]
         assert v == v and v > 0.0
 
     def test_measure_aligned_beats_anti_aligned(self):
@@ -344,8 +349,11 @@ class TestTraitMonitorScoring:
         anti[0] = -5.0
         monitor.measure_from_hidden({0: aligned})
         monitor.measure_from_hidden({0: anti})
-        # Aligned reads above anti-aligned under any PD metric.
-        assert monitor.history["test_probe"][0] > monitor.history["test_probe"][1]
+        # Aligned reads above anti-aligned (coordinate monotone in alignment).
+        assert (
+            monitor.history["test_probe"][0][0]
+            > monitor.history["test_probe"][1][0]
+        )
 
     def test_history_accumulates_across_calls(self):
         monitor = self._make_monitor()
@@ -356,7 +364,10 @@ class TestTraitMonitorScoring:
         monitor.measure_from_hidden({0: h1})
         monitor.measure_from_hidden({0: h2})
         assert len(monitor.history["test_probe"]) == 2
-        assert monitor.history["test_probe"][0] > monitor.history["test_probe"][1]
+        assert (
+            monitor.history["test_probe"][0][0]
+            > monitor.history["test_probe"][1][0]
+        )
 
     def test_stats_accumulate(self):
         monitor = self._make_monitor()

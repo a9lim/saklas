@@ -8,7 +8,7 @@ import torch
 
 from saklas.core.mahalanobis import WhitenerError
 from saklas.core.manifold import invert_parameterization
-from saklas.core.results import ManifoldReading
+from saklas.core.results import ProbeReading
 
 if TYPE_CHECKING:
     from saklas.core.manifold import Manifold
@@ -59,7 +59,7 @@ class Monitor:
     :class:`~saklas.core.manifold.Manifold`, and every read — live per token
     (gate / stream) and the end-of-generation aggregate — runs the same
     per-probe per-layer geometry (:func:`_layer_geometry`) and produces one
-    full :class:`ManifoldReading`.  There is no batched-affine fast path and
+    full :class:`ProbeReading`.  There is no batched-affine fast path and
     no flat/curved field asymmetry: a flat (affine) probe recovers ``coords``
     through the affine reduced→domain map (off-surface ``residual`` is
     identically 0), a curved probe through the iterative
@@ -85,7 +85,7 @@ class Monitor:
     TUI-facing scalar helpers (``get_stats`` / ``get_sparkline`` /
     ``get_current_and_previous``) report coordinate **axis 0** so the
     untouched trait panel keeps working; the full per-axis + per-layer data
-    flows through the :class:`ManifoldReading` surface.
+    flows through the :class:`ProbeReading` surface.
     """
 
     @staticmethod
@@ -194,7 +194,7 @@ class Monitor:
         self,
         probe: "AttachedManifoldProbe",
         hidden_per_layer: dict[int, torch.Tensor],
-    ) -> ManifoldReading:
+    ) -> ProbeReading:
         """Full per-probe reading for one state — flat or curved, all fields.
 
         Loops the probe's shared fit layers through :func:`_layer_geometry`
@@ -212,7 +212,7 @@ class Monitor:
         is_affine = _probe_is_affine(probe)
         shared = [idx for idx in manifold.layers if idx in hidden_per_layer]
         if not shared:
-            return ManifoldReading(fraction=0.0, nearest=[], coords=())
+            return ProbeReading(fraction=0.0, nearest=[], coords=())
         total_w = sum(ev.get(idx, 0.0) for idx in shared)
         if total_w <= _MIN_EV_WEIGHT:
             w_shared = {idx: 1.0 / len(shared) for idx in shared}
@@ -287,7 +287,7 @@ class Monitor:
         nearest = [
             (manifold.node_labels[k], dist_acc[k]) for k in order[: probe.top_n]
         ]
-        return ManifoldReading(
+        return ProbeReading(
             fraction=frac_mean,
             nearest=nearest,
             coords=tuple(coords_mean) if coords_mean is not None else (),
@@ -299,14 +299,14 @@ class Monitor:
 
     def _score_full(
         self, hidden_per_layer: dict[int, torch.Tensor],
-    ) -> dict[str, ManifoldReading]:
+    ) -> dict[str, ProbeReading]:
         """Full readings for every attached probe at one state.
 
         One per-probe :func:`_layer_geometry` pass — flat and curved alike,
         every field populated.  No batched fast path: the research-tool
         priority is full per-token information, not throughput.
         """
-        out: dict[str, ManifoldReading] = {}
+        out: dict[str, ProbeReading] = {}
         if not hidden_per_layer or not self._probes:
             return out
         for name, probe in self._probes.items():
@@ -317,8 +317,8 @@ class Monitor:
         self,
         hidden_per_layer: dict[int, torch.Tensor],
         accumulate: bool = True,
-    ) -> dict[str, ManifoldReading]:
-        """Score every probe → ``{name: ManifoldReading}`` (full reading).
+    ) -> dict[str, ProbeReading]:
+        """Score every probe → ``{name: ProbeReading}`` (full reading).
 
         ``accumulate`` folds the cross-layer coords into history/stats (the
         in-flight per-token path passes False).
@@ -329,7 +329,7 @@ class Monitor:
         return out
 
     def _apply_accumulate(
-        self, readings: dict[str, ManifoldReading],
+        self, readings: dict[str, ProbeReading],
     ) -> None:
         """Fold per-probe aggregate coords into history + per-axis stats.
 
@@ -369,10 +369,10 @@ class Monitor:
 
     def score_single_token(
         self, hidden_per_layer: dict[int, torch.Tensor],
-    ) -> dict[str, "ManifoldReading"]:
+    ) -> dict[str, "ProbeReading"]:
         """Per-probe full reading for a single token (no accumulate).
 
-        The live per-token read source: returns ``{name: ManifoldReading}``
+        The live per-token read source: returns ``{name: ProbeReading}``
         with ``coords`` (domain frame) + ``fraction`` + ``nearest`` +
         ``residual`` and their per-layer traces, every probe (flat or curved).
         Does NOT touch history/stats — the in-flight gate/stream path must
@@ -404,7 +404,7 @@ class Monitor:
 
     def measure_from_hidden(
         self, hidden_per_layer: dict[int, torch.Tensor], accumulate: bool = True,
-    ) -> dict[str, "ManifoldReading"]:
+    ) -> dict[str, "ProbeReading"]:
         """Score probes from pre-captured hidden states (no forward pass).
 
         Use when hidden states have already been captured during generation
@@ -414,7 +414,7 @@ class Monitor:
 
     @staticmethod
     def flat_scalars(
-        readings: dict[str, "ManifoldReading"],
+        readings: dict[str, "ProbeReading"],
     ) -> dict[str, float]:
         """Flatten per-probe readings into namespaced gate-callback scalars.
 
@@ -472,19 +472,19 @@ class Monitor:
         tokenizer: Any,
         *,
         accumulate: bool = True,
-    ) -> tuple[dict[str, "ManifoldReading"], dict[str, list[float]]]:
+    ) -> tuple[dict[str, "ProbeReading"], dict[str, list[float]]]:
         """Score probes per generated token using pre-captured hidden states.
 
         ``captured[layer_idx]`` is a ``(n, dim)`` stack where row ``k`` is
         the hidden state that produced generated token ``k``.  Returns
         ``(aggregate_readings, per_token_coord_stream)``: the aggregate is
-        the full :class:`ManifoldReading` per probe pooled at the last
+        the full :class:`ProbeReading` per probe pooled at the last
         non-special token (updates history when ``accumulate``); the stream
         is the per-token axis-0 domain coordinate.
         """
         n = len(generated_ids)
         empty_agg = {
-            name: ManifoldReading(fraction=0.0, nearest=[], coords=())
+            name: ProbeReading(fraction=0.0, nearest=[], coords=())
             for name in self._probes
         }
         if n == 0 or not captured:
@@ -508,7 +508,7 @@ class Monitor:
         *,
         agg_index: int | None = None,
         accumulate: bool = False,
-    ) -> tuple[dict[str, "ManifoldReading"], dict[str, list[float]]]:
+    ) -> tuple[dict[str, "ProbeReading"], dict[str, list[float]]]:
         """Score probes over a pre-captured ``[T, D]`` stack per layer.
 
         Like :meth:`score_per_token` but without ``generated_ids`` /
@@ -518,7 +518,7 @@ class Monitor:
         not the in-flight loop).
         """
         empty_agg = {
-            name: ManifoldReading(fraction=0.0, nearest=[], coords=())
+            name: ProbeReading(fraction=0.0, nearest=[], coords=())
             for name in self._probes
         }
         if not captured:
@@ -580,7 +580,7 @@ class Monitor:
         self._live_count = 0
         self._live_pending = False
 
-    def update_live(self, readings: dict[str, "ManifoldReading"]) -> None:
+    def update_live(self, readings: dict[str, "ProbeReading"]) -> None:
         """Fold one token's per-probe coordinate axis 0 into the running mean.
 
         Accepts the per-token readings the score callback already produces;
@@ -699,7 +699,7 @@ class Monitor:
         captured_per_layer: dict[int, torch.Tensor],
         *,
         agg_index: int | None = None,
-    ) -> dict[str, ManifoldReading]:
+    ) -> dict[str, ProbeReading]:
         """End-of-generation aggregate over pooled captures — all probes.
 
         ``captured_per_layer[L]`` is the per-layer ``[T, D]`` capture stack.
@@ -707,10 +707,10 @@ class Monitor:
         default the final row) — the same single-state discipline extraction
         uses, not a trajectory mean.  The aggregate is literally the unified
         per-token :meth:`_score_probe_full` read evaluated at the pooled token,
-        so it is the same :class:`ManifoldReading` shape the live stream
+        so it is the same :class:`ProbeReading` shape the live stream
         carries (and bit-identical to the live read at that token index).
         """
-        out: dict[str, ManifoldReading] = {}
+        out: dict[str, ProbeReading] = {}
         if not captured_per_layer or not self._probes:
             return out
 

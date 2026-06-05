@@ -41,7 +41,7 @@ def _mock_session():
 
     monitor = MagicMock()
     monitor.probe_names = []
-    monitor.profiles = {}
+    monitor.attached_probes.return_value = {}
     session._monitor = monitor
     session._tokenizer = MagicMock()
     session._layers = []
@@ -246,11 +246,33 @@ class TestProbes:
         assert resp.status_code == 200
         assert "emotion" in resp.json()["defaults"]
 
-    def test_activate(self, session_and_client: Any) -> None:
+    def test_attach(self, session_and_client: Any) -> None:
+        from types import SimpleNamespace
+
         session, client = session_and_client
-        resp = client.post("/saklas/v1/sessions/default/probes/happy")
-        assert resp.status_code == 204
-        session.probe.assert_called_once_with("happy")
+        # Unified attach: body-carried selector → session.add_probe, 201 + info.
+        mani = SimpleNamespace(
+            name="happy", layers={0: None}, node_labels=["+"],
+            feature_space="model",
+            domain=SimpleNamespace(to_spec=lambda: {}, intrinsic_dim=1),
+        )
+        session.add_probe.return_value = "happy"
+        session._monitor.attached_probes.return_value = {
+            "happy": SimpleNamespace(top_n=3, manifold=mani),
+        }
+        resp = client.post(
+            "/saklas/v1/sessions/default/probes", json={"selector": "happy"},
+        )
+        assert resp.status_code == 201
+        session.add_probe.assert_called_once_with("happy", as_name=None, top_n=3)
+        assert resp.json()["name"] == "happy"
+
+    def test_attach_empty_selector(self, session_and_client: Any) -> None:
+        _, client = session_and_client
+        resp = client.post(
+            "/saklas/v1/sessions/default/probes", json={"selector": "  "},
+        )
+        assert resp.status_code == 400
 
     def test_deactivate_not_found(self, session_and_client: Any) -> None:
         _, client = session_and_client
@@ -888,43 +910,52 @@ class TestTraitsStream:
 class TestScoreSingleToken:
     def test_returns_scores_without_accumulation(self):
         import torch
-        from saklas.core.monitor import TraitMonitor
+        from saklas.core.monitor import Monitor
+        from saklas.core.results import ProbeReading
+        from saklas.core.vectors import fold_directions_to_subspace
 
         from tests._whitener import isotropic_whitener
         dim = 16
         probe_vec = torch.randn(dim)
-        profiles = {"test_probe": {0: probe_vec}}
         means = {0: torch.zeros(dim)}
-        # Mahalanobis is mandatory: covering whitener required to score.
-        monitor = TraitMonitor(profiles, means, whitener=isotropic_whitener([0], dim))
+        whit = isotropic_whitener([0], dim)
+        # Mahalanobis is mandatory: covering whitener required to attach + score.
+        m = fold_directions_to_subspace(
+            "test_probe", {0: probe_vec}, means, whitener=whit,
+        )
+        monitor = Monitor({"test_probe": m}, means, whitener=whit)
 
         hidden = {0: torch.randn(dim)}
         scores = monitor.score_single_token(hidden)
 
         assert "test_probe" in scores
-        assert isinstance(scores["test_probe"], float)
+        # Read is the full per-probe ProbeReading (coords axis-0 the scalar).
+        assert isinstance(scores["test_probe"], ProbeReading)
+        assert isinstance(scores["test_probe"].coords[0], float)
         # History should NOT have been updated.
         assert len(monitor.history["test_probe"]) == 0
         assert monitor._stats["test_probe"]["count"] == 0
 
     def test_consistent_with_measure_from_hidden(self):
         import torch
-        from saklas.core.monitor import TraitMonitor
+        from saklas.core.monitor import Monitor
+        from saklas.core.vectors import fold_directions_to_subspace
 
         from tests._whitener import isotropic_whitener
         dim = 16
-        probe_vec = torch.randn(dim)
-        profiles = {"p1": {0: probe_vec, 1: torch.randn(dim)}}
         means = {0: torch.zeros(dim), 1: torch.zeros(dim)}
-        monitor = TraitMonitor(
-            profiles, means, whitener=isotropic_whitener([0, 1], dim),
+        whit = isotropic_whitener([0, 1], dim)
+        m = fold_directions_to_subspace(
+            "p1", {0: torch.randn(dim), 1: torch.randn(dim)}, means,
+            whitener=whit,
         )
+        monitor = Monitor({"p1": m}, means, whitener=whit)
 
         hidden = {0: torch.randn(dim), 1: torch.randn(dim)}
         single = monitor.score_single_token(hidden)
         no_acc = monitor.measure_from_hidden(hidden, accumulate=False)
 
-        assert single["p1"] == pytest.approx(no_acc["p1"])
+        assert single["p1"].coords[0] == pytest.approx(no_acc["p1"].coords[0])
 
 
 # NOTE: the ``test_autoload_*`` tests and the three ``test_steering_*``

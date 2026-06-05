@@ -465,22 +465,6 @@ def _probe_profile_tensors(
     return folded_vector_directions(manifold)
 
 
-def _probe_info(session: SaklasSession, name: str) -> dict[str, Any]:
-    layers: list[int] = []
-    try:
-        prof = _probe_profile_tensors(session, name)
-        if prof is not None:
-            layers = sorted(prof.keys())
-    except Exception:
-        pass
-    active = False
-    try:
-        active = name in session._monitor.probe_names
-    except Exception:
-        active = name in (session.probes or {})
-    return {"name": name, "active": active, "layers": layers}
-
-
 def _build_sampling(body: WSSamplingParams | None) -> SamplingConfig | None:
     if body is None:
         return None
@@ -695,11 +679,6 @@ def register_saklas_routes(app: FastAPI) -> None:
 
     from saklas.server.manifold_routes import register_manifold_routes
     register_manifold_routes(app)
-
-    # ----- manifold probes (read-side counterpart to manifold steering) --
-
-    from saklas.server.manifold_probe_routes import register_manifold_probe_routes
-    register_manifold_probe_routes(app)
 
     # ----- sessions collection -------------------------------------------
 
@@ -2237,9 +2216,9 @@ async def _ws_handle_generate(
                 # geometric channel alongside the existing vector-probe
                 # ``per_token_probes`` block.  Empty dict when no
                 # manifold probe is attached.
-                mf_readings = getattr(result, "manifold_readings", None) or {}
+                mf_readings = getattr(result, "probe_readings", None) or {}
                 if mf_readings:
-                    result_json["manifold_readings"] = {
+                    result_json["probe_readings"] = {
                         k: v.to_dict() for k, v in mf_readings.items()
                     }
             else:

@@ -233,8 +233,10 @@ class TestSaveLoad:
 class TestTraitMonitor:
     def test_monitor_records_history(self, model_and_tokenizer: Any, layers: Any, happy_profile: Any, layer_means: Any) -> None:
         from saklas.core.hooks import SteeringManager
-        from saklas.core.monitor import TraitMonitor
+        from saklas.core.monitor import Monitor
+        from saklas.core.vectors import fold_directions_to_subspace
         from saklas.core.generation import GenerationConfig, GenerationState, generate_steered
+        from tests._whitener import isotropic_whitener
 
         model, tokenizer = model_and_tokenizer
         device = next(model.parameters()).device
@@ -242,8 +244,22 @@ class TestTraitMonitor:
 
         sad_profile = _extract_profile(model, tokenizer, "sad", layers)
 
-        probe_profiles = {"happy": happy_profile, "sad": sad_profile}
-        monitor = TraitMonitor(probe_profiles, layer_means)
+        # Unified Monitor reads probes as folded 1-node rays (the vector-probe
+        # path).  Mahalanobis-only: attach needs a covering whitener — an
+        # isotropic one over the union of both probes' layers suffices for a
+        # records-history smoke check.
+        probe_layers = sorted(set(dict(happy_profile)) | set(dict(sad_profile)))
+        dim = next(iter(dict(happy_profile).values())).shape[0]
+        whit = isotropic_whitener(probe_layers, dim)
+        probe_profiles = {
+            "happy": fold_directions_to_subspace(
+                "happy", dict(happy_profile), dict(layer_means), whitener=whit,
+            ),
+            "sad": fold_directions_to_subspace(
+                "sad", dict(sad_profile), dict(layer_means), whitener=whit,
+            ),
+        }
+        monitor = Monitor(probe_profiles, layer_means, whitener=whit)
 
         # Steer toward happy
         mgr = SteeringManager()
@@ -275,15 +291,16 @@ class TestTraitMonitor:
         assert len(happy_hist) == 1, "Monitor should record one entry per generation"
         assert len(sad_hist) == 1
 
-        # Structural: readings are finite floats in the expected cosine range.
-        # The semantic claim "happy steering → higher happy than sad reading
-        # when remeasured via a fresh forward pass" is noise-dominated at this
-        # model scale (3B-param, 20-token gen) — test_throughput_regression
-        # covers whether steering actually runs.
+        # Structural: the coordinate readings are finite (history stores the
+        # per-probe coordinate tuple; axis 0 is the scalar).  The semantic
+        # claim "happy steering → higher happy than sad reading when remeasured
+        # via a fresh forward pass" is noise-dominated at this model scale
+        # (3B-param, 20-token gen) — test_throughput_regression covers whether
+        # steering actually runs.
+        import math
         for hist in (happy_hist, sad_hist):
-            v = hist[0]
-            assert v == v  # not NaN
-            assert -1.5 <= v <= 1.5
+            v = hist[0][0]
+            assert math.isfinite(v)
 
         # Sparkline should be non-empty
         sparkline = monitor.get_sparkline("happy")

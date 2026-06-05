@@ -27,7 +27,7 @@ from saklas.core.monitor import (
     AttachedManifoldProbe,
     Monitor,
 )
-from saklas.core.results import ManifoldReading
+from saklas.core.results import ProbeReading
 
 
 def fit_layer_subspace(*args: Any, **kwargs: Any) -> Any:
@@ -312,7 +312,7 @@ def test_flat_scalars_keys_and_signs():
     and ``<name>@<label>`` (negative — encodes -distance so larger =
     closer)."""
     mon = Monitor()
-    reading = ManifoldReading(
+    reading = ProbeReading(
         fraction=0.7, nearest=[("a", 0.5), ("b", 1.2)],
     )
     flat = mon.flat_scalars({"toy": reading})
@@ -325,8 +325,8 @@ def test_flat_scalars_keys_and_signs():
 
 def test_flat_scalars_namespaces_per_probe():
     mon = Monitor()
-    r1 = ManifoldReading(fraction=0.5, nearest=[("x", 0.1)])
-    r2 = ManifoldReading(fraction=0.8, nearest=[("y", 0.2)])
+    r1 = ProbeReading(fraction=0.5, nearest=[("x", 0.1)])
+    r2 = ProbeReading(fraction=0.8, nearest=[("y", 0.2)])
     flat = mon.flat_scalars({"p1": r1, "p2": r2})
     assert set(flat) == {"p1:fraction", "p1@x", "p2:fraction", "p2@y"}
 
@@ -350,7 +350,7 @@ def test_score_aggregate_at_node_recovers_authoring_coord():
 
     agg = mon.score_aggregate(captured)
     assert "toy" in agg
-    r: ManifoldReading = agg["toy"]
+    r: ProbeReading = agg["toy"]
     # Coords near the authoring coord (-1.0) under the grid's resolution.
     assert len(r.coords) == 1
     assert r.coords[0] == pytest.approx(-1.0, abs=0.1)
@@ -425,7 +425,7 @@ def test_score_aggregate_fraction_matches_per_token():
 
 
 def test_score_aggregate_to_dict_round_trip():
-    """``ManifoldReading.to_dict`` produces a JSON-serializable dict
+    """``ProbeReading.to_dict`` produces a JSON-serializable dict
     with the expected structure."""
     import json
 

@@ -81,12 +81,12 @@ def build_token_event(
     with suppress(Exception):
         payload = getattr(session, "_last_token_probe_payload", None)
         readings = (
-            payload.get("manifold_readings")
+            payload.get("probe_readings")
             if isinstance(payload, dict)
             else None
         )
         if readings is None:
-            mf_monitor = getattr(session, "_manifold_monitor", None)
+            mf_monitor = getattr(session, "_monitor", None)
             capture = getattr(session, "_capture", None)
             per_layer = (
                 getattr(capture, "_per_layer", None)
@@ -106,7 +106,7 @@ def build_token_event(
                 if latest_hidden:
                     readings = mf_monitor.score_single_token(latest_hidden)
         if readings:
-            event["manifold_readings"] = {
+            event["probe_readings"] = {
                 name: r.to_dict() for name, r in readings.items()
             }
 

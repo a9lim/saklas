@@ -551,7 +551,7 @@ tok/s):
 - **Monitor capture is hook-driven**, inline with generation — no second forward
   pass. The unified `Monitor` reads every probe — flat or curved — as a whitened
   **coordinate** through one per-probe per-layer geometry pass: per token it emits a
-  full `ManifoldReading` (`coords` domain-frame + `fraction` + `nearest` +
+  full `ProbeReading` (`coords` domain-frame + `fraction` + `nearest` +
   `residual`, plus per-layer traces). There is **no batched-affine fast path** — the
   research-tool priority is full per-token info (nearest, curved coords, residual,
   per-layer) over throughput, so the per-token cost (incl. the curved

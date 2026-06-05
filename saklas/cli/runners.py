@@ -363,7 +363,7 @@ def _attach_default_manifold_probes(session: SaklasSession) -> None:
             )
             continue
         try:
-            session.add_manifold_probe(selector)
+            session.add_probe(selector)
             print(f"  manifold probe {selector}: attached")
         except SaklasError as exc:
             print(f"  manifold probe {selector}: skipped — {exc}")

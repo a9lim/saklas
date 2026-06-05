@@ -31,7 +31,7 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "TokenEvent": ("saklas.core.results", "TokenEvent"),
     "ProbeReadings": ("saklas.core.results", "ProbeReadings"),
     "Manifold": ("saklas.core.manifold", "Manifold"),
-    "ManifoldReading": ("saklas.core.results", "ManifoldReading"),
+    "ProbeReading": ("saklas.core.results", "ProbeReading"),
     "ResultCollector": ("saklas.core.results", "ResultCollector"),
     "LoomTree": ("saklas.core.loom", "LoomTree"),
     "LoomNode": ("saklas.core.loom", "LoomNode"),
@@ -86,7 +86,7 @@ __all__ = [
     "TokenEvent",
     "ProbeReadings",
     "Manifold",
-    "ManifoldReading",
+    "ProbeReading",
     "ResultCollector",
     "LoomTree",
     "LoomNode",
@@ -169,7 +169,7 @@ if TYPE_CHECKING:
     from saklas.core.profile import Profile as Profile, ProfileError as ProfileError
     from saklas.core.results import (
         GenerationResult as GenerationResult,
-        ManifoldReading as ManifoldReading,
+        ProbeReading as ProbeReading,
         ProbeReadings as ProbeReadings,
         ResultCollector as ResultCollector,
         RunSet as RunSet,

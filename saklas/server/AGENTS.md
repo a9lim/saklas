@@ -6,18 +6,6 @@ serializes on a single `asyncio.Lock`. There is **no `/saklas/v1/packs*` surface
 — concepts are manifolds, so distribution rides the manifold routes (install) and
 the vectors-under-session routes (extract/merge); HF upload stays CLI-only.
 
-> **⚠️ Monitor unification (`a498895`) — the read-side probe surface here is red
-> against the engine, pending rewire (TBD).** The probe routes below still call the
-> *removed* `session.add_manifold_probe` / `remove_manifold_probe` /
-> `manifold_monitor` (manifold probes, `manifold_probe_routes.py`) and
-> `session.probe` / `session.unprobe` (vector probes, `probe_routes.py`); the
-> serve-time `_attach_default_manifold_probes` (`cli/runners.py`) calls
-> `add_manifold_probe` too. The unification collapsed both families into one
-> `session.add_probe(selector, *, as_name=None, top_n=3)` / `remove_probe(name)`
-> over the unified `session._monitor`. The probe-route prose below documents the
-> current (pre-rewire) code — read it as the rewire spec, not working behavior. The
-> generation, steering, manifold-CRUD, loom, and traits-SSE paths are unaffected.
-
 ## Module map
 
 `app.py` registers the OpenAI routes inline, then calls
@@ -27,9 +15,8 @@ the API). `register_saklas_routes` is the native-tree orchestrator — it delega
 to sub-module registrars and registers a few route groups in place:
 
 - `manifold_routes.register_manifold_routes` — `/saklas/v1/manifolds/*`
-- `manifold_probe_routes.register_manifold_probe_routes` — `/saklas/v1/manifold-probes/*`
 - `session_routes.register_session_routes` — `/saklas/v1/sessions` CRUD + clear/rewind
-- `probe_routes.register_probe_routes` — `/sessions/{id}/probes/*` (list / defaults / activate / deactivate)
+- `probe_routes.register_probe_routes` — `/sessions/{id}/probes/*` (unified: list / defaults / attach / detach — every probe shape)
 - `experiment_routes.register_experiment_routes` — `/sessions/{id}/experiments/fan`
 - `traits_routes.register_traits_routes` — `/sessions/{id}/traits/stream` (SSE)
 - in place: the loom `tree/*` routes, the `/sessions/{id}/vectors/*` routes, and
@@ -73,16 +60,16 @@ chunk before `[DONE]`. Thinking tokens stream as `reasoning_content`.
 `_render_logprobs_chat` / `_render_logprobs_completions` build the two OpenAI
 logprobs shapes from `result.logprobs` (alt text off `TokenAlt`, not a re-tokenize).
 
-Manifold-probe readings ride each choice under the vendor-prefixed
-`x-saklas-manifold-readings` extension, keyed by attached probe name. Both the
-aggregate and each streamed per-token chunk carry the same `ManifoldReading.to_dict()`
+Probe readings ride each choice under the vendor-prefixed
+`x-saklas-probe-readings` extension, keyed by attached probe name. Both the
+aggregate and each streamed per-token chunk carry the same `ProbeReading.to_dict()`
 shape (the unification: aggregate is the reading pooled at the last-content token).
 Non-streaming carries the aggregate; each streamed chunk carries the per-token
 reading when at least one probe is attached and `live_scores` is on; the final
-chunk carries the aggregate. The field is omitted entirely when no manifold probe is
+chunk carries the aggregate. The field is omitted entirely when no probe is
 attached, so OpenAI clients that don't read the extension see no shape change.
-`_manifold_reading_aggregate(session)`
-and `_manifold_token_readings(event)` are the shared helpers (also imported by
+`_probe_reading_aggregate(session)`
+and `_probe_token_readings(event)` are the shared helpers (also imported by
 `ollama.py`).
 
 Auth: bearer token from `SAKLAS_API_KEY` / `--api-key`, applied as an app-level
@@ -194,24 +181,31 @@ per-model sidecar/tensor via `_resolve_intrinsic_dim` + a `load_manifold` read.
   `code: "PoisednessError"`; `ConcurrentExtractionError` → 409. Steering a fitted
   manifold needs no route — a `%` term loads it lazily on scope entry.
 
-### manifold_probe_routes.py
-
-Read-side counterpart to manifold steering. `GET /manifold-probes` lists every
-attached probe (`{name, manifold, top_n, layers, node_labels, node_count, domain,
-intrinsic_dim, feature_space}`). `POST /manifold-probes` body `{selector, name?,
-top_n?}` wraps `session.add_manifold_probe` (selector rides the same
-`[ns/]name[:variant]` shape `%` steering consumes — probe and steering share the
-lazy-load cache). `DELETE /manifold-probes/{name}` detaches.
-
 ### probe_routes.py
 
-Vector probes under `/sessions/{id}/probes`: list / defaults / activate / deactivate.
+The read-side counterpart to manifold steering — one unified probe collection
+under `/sessions/{id}/probes`, covering every probe shape (a 2-node concept axis is
+the rank-1 case, a discover / curved fit the rank-R case). The pre-4.0 split (vector
+probes by name; manifold probes by selector on a separate route) collapsed with the
+monitor unification onto the session's single `Monitor`.
+
+- `GET /probes` lists every attached probe via `session._monitor.attached_probes()`
+  (`{name, manifold, top_n, layers, node_labels, node_count, domain, intrinsic_dim,
+  feature_space}`).
+- `GET /probes/defaults` returns the default roster.
+- `POST /probes` body `{selector, name?, top_n?}` → `session.add_probe(selector,
+  as_name=name, top_n=top_n)`, 201 + the probe info. The selector rides the same
+  `[ns/]name[:variant]` shape `%` steering consumes — probe and steering share the
+  lazy-load cache. 400 on an empty selector, 404 on `FileNotFoundError`, 400 on
+  `KeyError`/`ValueError`.
+- `DELETE /probes/{name}` → `session.remove_probe`, 204; 404 if not attached.
+
 The one-shot text-scoring endpoints (`POST .../probe`, `POST .../manifold-probe`)
 were removed in 4.0 — they re-rendered arbitrary text out of conversation context
 via the now-deleted `monitor.measure` / `session.measure_manifold`. Live per-token
 scoring during generation is unchanged: it rides the traits SSE stream and the
-manifold-probe reading extensions on the OpenAI / Ollama / WS paths, which use
-live hooks, not a re-render pass.
+probe reading extensions on the OpenAI / Ollama / WS paths, which use live hooks,
+not a re-render pass.
 
 ### Vectors under `/sessions/{id}/vectors` (in `saklas_api.py`)
 
@@ -298,11 +292,11 @@ Fork / prefill / commit are mutually exclusive (400 on mix). `n>1` fans out N si
 assistant nodes on one shared user parent, generated serially with deterministic
 derived seeds. Server → client: `started` (node_id filled lazily by the first
 token), `node_created`, `tree_mutated`, `token` (per token — `logprob`/`top_alts`
-when captured, `scores`/`per_layer_scores` when probes are loaded, `manifold_readings`
-`Record<name, {fraction, nearest}>` when any manifold probe is attached, computed
+when captured, `scores`/`per_layer_scores` when probes are loaded, `probe_readings`
+`Record<name, {fraction, nearest}>` when any probe is attached, computed
 inline off `session._capture._per_layer`), `done` (`result` with `text`, `tokens`,
 `finish_reason`, `usage`, `per_token_probes`, `mean_logprob`, `mean_surprise`,
-`manifold_readings` aggregate), `error` (validation errors keep the connection open;
+`probe_readings` aggregate), `error` (validation errors keep the connection open;
 other failures close 1011).
 
 Concurrency: one perpetual reader task owns `receive_json()` and feeds a shared
@@ -339,7 +333,7 @@ steering expression composed over `default_steering` at the key level; non-strin
 thinking, streamed as `message.thinking` (chat) / top-level `thinking` (generate).
 `_duration_stats` splits wall time between `prompt_eval_duration` and
 `eval_duration`; `_finish_to_done_reason` maps `stop_sequence` → `stop`.
-`SAKLAS_STRICT_MODEL` 404s a `model` mismatch. Manifold-probe readings ride under
-the top-level `x-saklas-manifold-readings` key (non-streaming = aggregate, each
+`SAKLAS_STRICT_MODEL` 404s a `model` mismatch. Probe readings ride under
+the top-level `x-saklas-probe-readings` key (non-streaming = aggregate, each
 NDJSON chunk = per-token reading, final chunk = aggregate); absent when no probe is
 attached.

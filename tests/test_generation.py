@@ -145,7 +145,6 @@ def test_stop_sequence_trimmed_text_is_final_result_text():
     session._gen_state = state
     session._tokenizer = tokenizer
     session._monitor = SimpleNamespace(probe_names=[])
-    session._manifold_monitor = SimpleNamespace(probe_names=[])
     session._capture = SimpleNamespace(stacked=lambda: {})
     session._last_per_token_scores = None
     session._last_result = None
