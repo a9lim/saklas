@@ -123,10 +123,10 @@ body + any typed safe-message formatter.
 `_manifold_json` is the wire serializer behind every detail-returning route. It
 builds the *session-independent* fields via `io.manifolds.manifold_summary(folder)`
 — the same serializer CLI `pack show -j` emits — so the shared keys
-(`namespace`/`name`/`description`/`source`/`fit_mode`/`is_discover`/`node_count`/
+(`namespace`/`name`/`description`/`source`/`tags`/`fit_mode`/`is_discover`/`node_count`/
 `node_labels`/`node_roles`/`node_kinds`/`hyperparams`/`fitted_models`/`tensor_variants` + authored
 `domain`/`domain_label`/`intrinsic_dim`/`min_nodes`/`node_coords`) match across CLI
-and server. The route then layers *session-aware* extras: `fitted_for_session` /
+and server. The summary carries `tags` (the manifold's category) on the wire. The route then layers *session-aware* extras: `fitted_for_session` /
 `stale`, and — for a discover folder fitted on the loaded model — the materialized
 per-model geometry (`domain`/`intrinsic_dim`/`node_coords`) lifted from the
 per-model sidecar/tensor via `_resolve_intrinsic_dim` + a `load_manifold` read.
@@ -191,7 +191,11 @@ monitor unification onto the session's single `Monitor`.
 
 - `GET /probes` lists every attached probe via `session._monitor.attached_probes()`
   (`{name, manifold, top_n, layers, node_labels, node_count, domain, intrinsic_dim,
-  feature_space}`).
+  feature_space}`). `_probe_info` also emits `is_affine` (the flat/curved
+  discriminator the client classifies subspace-vs-manifold on, via
+  `core.session._manifold_is_affine`, defensively guarded → `False` on any read
+  failure) and `node_coords` (the per-node layout backing the client mini-map,
+  `null` when the manifold has none materialized).
 - `GET /probes/defaults` returns the default roster.
 - `POST /probes` body `{selector, name?, top_n?}` → `session.add_probe(selector,
   as_name=name, top_n=top_n)`, 201 + the probe info. The selector rides the same
