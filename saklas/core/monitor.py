@@ -1264,8 +1264,10 @@ class AttachedManifoldProbe:
 
     Pairs the loaded :class:`Manifold` artifact with the per-layer cache
     the monitor uses on the hot path: ``node_values_reduced`` is the
-    per-layer ``(K, R)`` tensor of node activations in subspace coords
-    (``(sub.eval_at(domain.embed(node_coords)) - sub.mean) @ sub.basis.T``),
+    per-layer ``(K, R)`` tensor of node activations in subspace coords —
+    ``sub.node_coords`` for a flat fit (the M-projected node coords directly,
+    pruned-basis-consistent), else ``(sub.eval_at(domain.embed(node_coords)) -
+    sub.mean) @ sub.basis.T`` for a curved fit (RBF surface eval) —
     pre-computed once at attach so per-token distance computations are one
     batched cdist in R-dim per layer.  ``ev_weights`` is the per-layer EV
     ratio used to weight cross-layer aggregation; floored at
@@ -1377,7 +1379,13 @@ def _affine_coord_map(
     embedded = manifold.domain.embed(
         manifold.domain.clamp_position(node_coords)
     ).to(device=dev, dtype=torch.float32)
-    v_centered = sub_f.eval_at(embedded) - mean          # (K, D)
+    if sub_f.node_coords is not None:
+        # True per-layer node activation in-subspace: ``node_coords @ basis``
+        # (== ``eval_at`` − mean for a flat fit, but pruned-basis-consistent —
+        # the shared domain layout would mis-dimension a DLS-pruned layer).
+        v_centered = sub_f.node_coords.to(device=dev, dtype=torch.float32) @ basis
+    else:
+        v_centered = sub_f.eval_at(embedded) - mean      # (K, D) fallback
     si_vc = _woodbury_apply(v_centered, X, K_inv, lam)    # (K, D) = Σ⁻¹ v_centered
     g_nodes = si_vc @ basis.T                             # (K, R) = B Σ⁻¹ v_centered
     c_nodes = (g_nodes @ m_r_inv.T).cpu()                # (K, R) whitened M-proj coords
@@ -1509,12 +1517,23 @@ def _attach_manifold_probe(
     embedded = manifold.domain.embed(clamped)  # (K, m)
     for layer_idx, sub in manifold.layers.items():
         sub_f32 = sub.to(device=sub.mean.device, dtype=torch.float32)
-        embedded_dev = embedded.to(
-            device=sub_f32.mean.device, dtype=torch.float32,
-        )
-        v_world = sub_f32.eval_at(embedded_dev)  # (K, D)
-        v_centered = v_world - sub_f32.mean
-        v_reduced = v_centered @ sub_f32.basis.T  # (K, R)
+        if sub_f32.is_affine and sub_f32.node_coords is not None:
+            # Flat fit: the per-layer reduced node coords ARE the cdist working
+            # space — analytically ``c_k = node_coords`` in the same M-projected
+            # frame the running-activation query uses.  They're already pruned
+            # in lockstep with a DLS-pruned basis, whereas feeding the shared
+            # (intrinsic_dim) domain layout through ``eval_at`` mis-dimensions a
+            # pruned layer (basis rank R < intrinsic_dim ⇒ ``embedded @ basis``
+            # shape mismatch) *and* conflates the abstract layout frame with the
+            # per-layer activation frame.
+            v_reduced = sub_f32.node_coords.to(torch.float32)  # (K, R)
+        else:
+            embedded_dev = embedded.to(
+                device=sub_f32.mean.device, dtype=torch.float32,
+            )
+            v_world = sub_f32.eval_at(embedded_dev)  # (K, D)
+            v_centered = v_world - sub_f32.mean
+            v_reduced = v_centered @ sub_f32.basis.T  # (K, R)
         node_values_reduced[layer_idx] = v_reduced.contiguous()
         ev_weights_raw[layer_idx] = float(
             manifold.explained_variance.get(layer_idx, 1.0)
