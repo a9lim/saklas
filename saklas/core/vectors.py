@@ -95,9 +95,9 @@ def last_content_index(token_ids: Sequence[int], tokenizer: Any) -> int:
     flooring at 0 so a sequence that is entirely special tokens still
     yields a valid index.  This is the single definition of "last content
     token" shared by extraction (:func:`_encode_and_capture_all`), the
-    aggregate vector probe (:meth:`TraitMonitor.score_per_token`), the
+    aggregate vector probe (:meth:`Monitor.score_per_token`), the
     incremental scoring path (``session._score_incremental``), and the
-    manifold aggregate (:meth:`ManifoldMonitor.score_aggregate`) — every
+    manifold aggregate (:meth:`Monitor.score_aggregate`) — every
     reported single-state value pools from here so the discipline can't
     drift per-site.
     """

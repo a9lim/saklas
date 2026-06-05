@@ -561,9 +561,11 @@ tok/s):
   scoring raises `WhitenerError` (no Euclidean path). `covers_all` is trustworthy as
   "finite factors everywhere": any non-finite layer is excluded, and neutral
   activations are cached fp32 (so gemma-3's late layers don't overflow the fp16
-  65504 ceiling to ±inf). Capture is full-retention only (no no-sync incremental
-  coord-row path); the aggregate is the per-token reading pooled at the last-content
-  token.
+  65504 ceiling to ±inf). For the common monitored case (probes attached, no
+  `return_hidden`) capture runs **incremental** — each token scored live, only the
+  latest per-layer hidden slice + per-token `ProbeReading` rows retained
+  (O(layers·D), not O(T·layers·D)); the aggregate is the row at the last-content
+  token. `return_hidden` falls back to full retention + `score_per_token`.
 - **Steering hooks are transient** — composed before generation, removed after.
 - **MPS discipline** — diffs on CPU, `torch.mps.empty_cache()` between extraction
   passes, end-of-loop sync to dodge Metal command-buffer reuse crashes.

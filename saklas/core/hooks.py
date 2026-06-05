@@ -143,7 +143,7 @@ class HiddenCapture:
         """Return the most-recent capture per layer as ``[D]`` tensors.
 
         Used by the per-step probe-gate scorer in ``generate_steered``:
-        feeds ``TraitMonitor.score_single_token`` with the latest
+        feeds ``Monitor.score_single_token`` with the latest
         hidden-state slice per layer so probe gates can consult last-
         step monitor readings.  Layers with no captures are omitted —
         the monitor handles missing layers as zero-weight contributors.

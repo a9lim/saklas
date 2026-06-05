@@ -47,14 +47,14 @@ Compose with other windows via the programmatic surface — the v1
 grammar accepts a single ``@`` clause per term.
 
 Manifold-probe gates extend the same shape over the two scalar channels
-:class:`ManifoldMonitor` exposes: ``@when:<manifold>:fraction <op> N``
+:class:`Monitor` exposes: ``@when:<manifold>:fraction <op> N``
 fires on the subspace-fraction reading (the share of the centered
 activation living in the manifold's PCA subspace), and
 ``@when:<manifold>@<label> <op> N`` fires on the negated distance to a
 named node (larger = closer; label-similarity gates routinely use
 negative thresholds).  The gate's probe string is stored verbatim
 (``"pad:fraction"``, ``"pad@elated"``) so it matches the
-key ``ManifoldMonitor.flat_scalars`` already merges into
+key ``Monitor.flat_scalars`` already merges into
 ``TriggerContext.probe_scores``; no runtime gate machinery changes.
 
 Coordinate-axis gates: a vector probe now reads out a coordinate per
@@ -537,7 +537,7 @@ class _Parser:
           centered activation that lives in the manifold's PCA
           subspace.  Stored verbatim as the gate's probe string
           (e.g. ``"pad:fraction"``); the session's
-          :class:`ManifoldMonitor.flat_scalars` already emits a
+          :class:`Monitor.flat_scalars` already emits a
           matching namespaced key, so ``Trigger.active`` looks it up
           unchanged.
         - Manifold label-similarity probe:
@@ -561,7 +561,7 @@ class _Parser:
             # Manifold subspace-fraction gate: ``<manifold>:fraction``.
             # The suffix after the colon must be the literal slug
             # ``fraction`` — the only fraction-channel scalar
-            # ``ManifoldMonitor.flat_scalars`` emits.  Any other slug
+            # ``Monitor.flat_scalars`` emits.  Any other slug
             # would silently never match a probe score, so we surface
             # the typo here rather than letting the gate report
             # inactive forever.

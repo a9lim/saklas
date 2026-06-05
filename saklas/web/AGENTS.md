@@ -74,14 +74,17 @@ re-migrated and rebuilt:
   server-rejected. Drop it from the webui.
 - **The ExtractDrawer DiM/PCA `method` radio is inert** — `ExtractRequest` carries
   no `method` field; difference-of-means (a 2-node `pca` fit) is the only method.
-- **Read-side probe routes are red (Monitor unification, `a498895` — separate from
-  the 4.0 collapse).** Server `manifold_probe_routes` / `probe_routes` and the
-  serve-time default-probe attach still call the *removed* `session.add_manifold_probe`
-  / `manifold_monitor` / `probe` (TBD rewire to the unified `session.add_probe` /
-  `remove_probe` over `session._monitor`). The dashboard's `ProbeRack` /
-  `ManifoldProbeStrip` and the auto-loaded default manifold probes depend on those
-  routes, so the read side is non-functional until the *server* is rewired —
-  independent of the webui's own migration state.
+- **Read-side probe routes unified server-side; the webui client lags (Monitor
+  unification, `a498895` — separate from the 4.0 collapse).** The server collapsed the
+  old split (`/probes` for vector probes, `/manifold-probes` for manifold probes) into
+  one `/saklas/v1/sessions/{id}/probes` collection over `session.add_probe` /
+  `remove_probe` / `session._monitor`, and now emits readings under the `probe_readings`
+  wire field (`x-saklas-probe-readings` for OpenAI/Ollama). The webui hasn't caught up:
+  `api.ts`'s `MANIFOLD_PROBES_BASE` still points at the dead `/manifold-probes` route
+  (the manifold-probe list/create/delete client), and `stores.svelte.ts` still reads
+  the old `manifold_readings` field instead of `probe_readings`. So `ProbeRack` /
+  `ManifoldProbeStrip` and the auto-loaded default probes are non-functional until the
+  *webui* migrates — re-point the client at `/probes` and re-key the reading field.
 
 These are described in the relevant sections below as historical context; treat
 them as cleanup TODOs, not live behavior.

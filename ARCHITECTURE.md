@@ -756,9 +756,12 @@ channels: `"<name>"` (= coords axis 0) and `"<name>[i]"` per coord axis,
 "larger = closer"). Under the unified full reading every probe — flat and curved —
 carries coords *and* nearest, so flat probes now expose `@label` similarity gates
 too (`@when:personas@hacker`) and the gate grammar is uniform. The session merges
-these into `TriggerContext.probe_scores`. (Capture is full-retention only — there
-is no no-sync incremental coord-row fast path; the only-latest-hidden memory win is
-gone by design.)
+these into `TriggerContext.probe_scores`. (For the common monitored case — probes
+attached, no `return_hidden` — capture runs incremental: each token is scored live
+and only the latest per-layer hidden slice + per-token `ProbeReading` rows are
+retained, O(layers·D) not O(T·layers·D). `return_hidden` falls back to full
+retention + `score_per_token`; the reads are full `ProbeReading`s either way — the
+win is memory, not throughput.)
 
 ### 6.3 Probe gates / triggers
 

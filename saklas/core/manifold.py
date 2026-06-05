@@ -79,7 +79,7 @@ DEFAULT_N_COMPONENTS = 64
 
 # Levenberg-Marquardt settings for the inverse parameterization
 # (nearest-point projection of an activation onto the fitted manifold).
-# Used only by the naturalness eval and the read-side ``ManifoldMonitor``
+# Used only by the naturalness eval and the read-side ``Monitor``
 # aggregate -- never the steering hot path, which steers to a fixed
 # position.  The solve is warm-started from the nearest fit node(s) and
 # Marquardt-damped, so a fixed dozen iterations converges in
@@ -1392,7 +1392,7 @@ def decompose(
     ``h - mean`` exactly.
 
     The shared decomposition step that backs :func:`subspace_inject` and
-    the read-side ``ManifoldMonitor``.  All
+    the read-side ``Monitor``.  All
     three intermediates are kept in the input's dtype — callers that need
     fp32 (the injection functions, the monitor) cast their inputs first.
     """
@@ -2527,7 +2527,7 @@ def invert_parameterization(
     rather than quantized to a grid.  ``n_restarts`` warm starts from the
     top nearest nodes guard against a fold/periodic local minimum; the best
     final residual per query wins.  Used only by the naturalness eval and
-    ``ManifoldMonitor.score_aggregate`` -- never the steering hot path.
+    ``Monitor.score_aggregate`` -- never the steering hot path.
     """
     n = domain.intrinsic_dim
     R = query.shape[-1]

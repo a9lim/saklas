@@ -260,12 +260,15 @@ meant to overshoot; `norm_cap` bounds it). `onto` stays clamped `[0,1]`.
 
 `HiddenCapture` — `attach`/`detach`/`stacked`/`latest_per_layer`. Incremental
 mode (`set_incremental`) overwrites a length-1 bucket per layer so device memory
-stays O(layers·D); fires the step sink after the highest hooked layer. It is
-currently **off** — the session keeps full retention and `_finalize_generation`
-scores via `score_per_token`. Under the unified full reading there is no no-sync
-incremental coord-row fast path to short-circuit (every read is a full per-probe
-reading from the captured stack), so the only-latest-hidden memory win is gone by
-design; manifold probes + `return_hidden` already force full retention regardless.
+stays O(layers·D); fires the step sink after the highest hooked layer. The session
+enables it for the common monitored case (probes attached, no `return_hidden`):
+`_begin_capture` installs a step sink that scores each token live via
+`Monitor.score_single_token` and keeps only the per-token `ProbeReading` rows, and
+`_finalize_generation`/`_score_incremental` build (aggregate, per-token) from those
+rows. `return_hidden` (widen) or no probe falls back to full retention +
+`score_per_token`. Either way each read is a full per-probe `ProbeReading` —
+incremental wins memory (no O(T·layers·D) stack), not a coord-row throughput
+shortcut.
 
 ## monitor.py
 
