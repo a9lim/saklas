@@ -32,12 +32,27 @@ def _corpus(response: str) -> list[str]:
 
 
 @pytest.fixture(scope="module")
-def session():
+def session(tmp_path_factory: pytest.TempPathFactory):
+    import os
     from saklas.core.session import SaklasSession
+    # Isolate $SAKLAS_HOME so this module's extract/merge writes (e.g.
+    # local/formal.casual, happy.sad, honest) land in a throwaway cache instead
+    # of the user's real ~/.saklas — where they would shadow bundled manifolds of
+    # the same name and break bare-name resolution (AmbiguousSelectorError)
+    # across the whole suite on the next run.
+    home = tmp_path_factory.mktemp("saklas_home")
+    prev = os.environ.get("SAKLAS_HOME")
+    os.environ["SAKLAS_HOME"] = str(home)
     # device="auto" picks cuda > mps > cpu; skipif above guarantees a GPU.
-    s = SaklasSession.from_pretrained(MODEL_ID, device="auto", probes=["affect"])
-    yield s
-    s.close()
+    try:
+        s = SaklasSession.from_pretrained(MODEL_ID, device="auto", probes=["affect"])
+        yield s
+        s.close()
+    finally:
+        if prev is None:
+            os.environ.pop("SAKLAS_HOME", None)
+        else:
+            os.environ["SAKLAS_HOME"] = prev
 
 class TestConstruction:
     def test_model_info(self, session: SaklasSession) -> None:
