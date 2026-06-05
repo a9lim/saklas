@@ -7,14 +7,12 @@
     probeRack,
     refreshCorrelation,
     refreshLoomTree,
-    refreshPacks,
     refreshProbeList,
     refreshSession,
     refreshVectorList,
     sessionState,
     vectorRack,
     vectorsState,
-    packsState,
   } from "../lib/stores.svelte";
 
   let _drawerProps: { params?: unknown } = $props();
@@ -34,7 +32,6 @@
     if (loomTree.unavailable) out.push("loom API unavailable; branch workflows are disabled");
     if (vectorsState.names.length === 0) out.push("no vectors registered in the session");
     if (probeRack.active.length === 0) out.push("no active probes; internal-state views will be sparse");
-    if (packsState.error) out.push(`pack list: ${packsState.error}`);
     return out;
   });
 
@@ -46,7 +43,6 @@
         refreshSession(),
         refreshVectorList(),
         refreshProbeList(),
-        refreshPacks(),
         refreshLoomTree(),
         refreshCorrelation(),
       ]);
@@ -63,7 +59,7 @@
   <header class="header">
     <div>
       <span class="title">model health</span>
-      <p>runtime readiness, cache surfaces, tree state, vectors, probes, and UI coverage</p>
+      <p>runtime readiness, tree state, vectors, probes, and UI coverage</p>
     </div>
     <button type="button" class="close" aria-label="Close" onclick={closeDrawer}>×</button>
   </header>
@@ -109,11 +105,6 @@
         <strong>{probeRack.active.length}</strong>
         <p>{probeRack.entries.size} live rows · {vectorRack.correlation ? "correlation cached" : "no matrix"}</p>
       </div>
-      <div class="tile">
-        <span>packs</span>
-        <strong>{packsState.installed.length}</strong>
-        <p>{packsState.loading ? "loading" : packsState.error ?? "ready"}</p>
-      </div>
     </section>
 
     <section class="panel">
@@ -124,7 +115,6 @@
         <div class:ok={vectorsState.names.length > 0}>vector registry</div>
         <div class:ok={probeRack.active.length > 0}>probe monitor</div>
         <div class:ok={vectorRack.correlation !== null}>correlation cache</div>
-        <div class:ok={!packsState.error}>pack index</div>
       </div>
     </section>
 

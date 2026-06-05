@@ -1,9 +1,12 @@
 <script lang="ts">
   // Unified vector management drawer — replaces VectorPickerDrawer +
-  // ProbePickerDrawer.  One surface, two sections split on the
-  // server-supplied ``has_tensor`` flag:
+  // ProbePickerDrawer.  Concept axes are now 2-node ``pca`` manifolds,
+  // so the catalog is sourced from the manifold list filtered to the
+  // bipolar concept-axis shape (``node_count === 2 && fit_mode ===
+  // "pca"``).  One surface, two sections split on whether a tensor is
+  // fitted for the loaded model (``fitted_for_session``):
   //
-  //   * Extracted      — packs with a baked tensor for the loaded
+  //   * Extracted      — concept axes with a baked tensor for the loaded
   //                      model.  Per row: [+steer] [+probe] [delete].
   //                      Steer/probe are pure-add buttons (no
   //                      toggling); when the concept is already in
@@ -11,11 +14,11 @@
   //                      disables.  Removal happens through the
   //                      rack strip's own ✕ (mirrors the TUI's
   //                      asymmetry — picker adds, rack manages).
-  //   * Statements only — packs with statements + scenarios on disk
-  //                      but no tensor for this model.  Per row:
+  //   * Statements only — concept axes with a node corpus on disk but
+  //                      no tensor for this model.  Per row:
   //                      [extract] [delete].  Extract reuses the
-  //                      cached statements — one-click action, no
-  //                      form needed.
+  //                      cached corpus — one-click action, no form
+  //                      needed.
   //
   // The "+ custom vector" button at the top opens ExtractDrawer for
   // concepts the catalog doesn't carry at all.  Delete uses a 2-step
@@ -24,16 +27,16 @@
 
   import { onMount } from "svelte";
   import { SvelteSet } from "svelte/reactivity";
-  import { ApiError, apiExtractStream, apiPacks } from "../lib/api";
-  import type { ExtractRequest } from "../lib/types";
+  import { ApiError, apiExtractStream, apiManifolds } from "../lib/api";
+  import type { ExtractRequest, ManifoldInfo } from "../lib/types";
   import {
-    activateProbe,
     addVectorToRack,
+    attachProbe,
     closeDrawer,
     openDrawer,
-    packsState,
+    manifoldRack,
     probeRack,
-    refreshPacks,
+    refreshManifoldList,
     refreshVectorList,
     vectorRack,
   } from "../lib/stores.svelte";
@@ -51,7 +54,6 @@
     recommendedAlpha,
     type Category,
   } from "../lib/concepts";
-  import type { LocalPackInfo } from "../lib/types";
 
   let { params: _params }: { params?: unknown } = $props();
   $effect(() => { void _params; });
@@ -72,7 +74,7 @@
   const inspectKeys = new SvelteSet<string>();
 
   onMount(() => {
-    void refreshPacks();
+    void refreshManifoldList();
     queueMicrotask(() => searchInputRef?.focus({ preventScroll: true }));
     return () => {
       // Cancel any pending confirm timers — drawer unmounting means
@@ -84,11 +86,11 @@
 
   // ----- helpers ------------------------------------------------------
 
-  function rowKey(r: LocalPackInfo): string {
+  function rowKey(r: ManifoldInfo): string {
     return `${r.namespace}/${r.name}`;
   }
 
-  function rowMatches(r: LocalPackInfo, q: string): boolean {
+  function rowMatches(r: ManifoldInfo, q: string): boolean {
     if (!q) return true;
     const n = q.toLowerCase();
     if (r.name.toLowerCase().includes(n)) return true;
@@ -118,12 +120,21 @@
 
   const searching = $derived(query.trim().length > 0);
 
+  // Concept axes are 2-node ``pca`` manifolds (bipolar steering vectors).
+  // Curved / discover / authored manifolds are managed in ManifoldDrawer;
+  // this drawer only surfaces the flat 2-node vector shape.
+  function isConceptAxis(m: ManifoldInfo): boolean {
+    return m.node_count === 2 && m.fit_mode === "pca";
+  }
+
   const filtered = $derived(
-    packsState.infos.filter((r) => rowMatches(r, query.trim())),
+    manifoldRack.catalog.filter(
+      (m) => isConceptAxis(m) && rowMatches(m, query.trim()),
+    ),
   );
-  const extracted = $derived(filtered.filter((r) => r.has_tensor === true));
+  const extracted = $derived(filtered.filter((m) => m.fitted_for_session));
   const statementsOnly = $derived(
-    filtered.filter((r) => r.has_tensor !== true),
+    filtered.filter((m) => !m.fitted_for_session),
   );
 
   // Section-prefixed category expansion ("ex:affect" / "st:affect") so
@@ -132,9 +143,15 @@
     [...DEFAULT_EXPANDED].flatMap((c) => [`ex:${c}`, `st:${c}`]),
   );
 
-  function groupedByCategory(rows: LocalPackInfo[]): Map<Category, LocalPackInfo[]> {
-    const m = new Map<Category, LocalPackInfo[]>();
+  function groupedByCategory(rows: ManifoldInfo[]): Map<Category, ManifoldInfo[]> {
+    const m = new Map<Category, ManifoldInfo[]>();
     for (const r of rows) {
+      // TODO(phase2): the GET /manifolds list serializer
+      // (io.manifolds.manifold_summary) currently omits ``tags``, so
+      // ``m.tags`` is usually undefined here and every axis lands in
+      // "Other".  The bundled concept manifolds DO carry category tags in
+      // manifold.json — once the list route emits them, grouping comes
+      // back for free with no client change.
       const c = categoryOf(r.tags);
       const list = m.get(c);
       if (list) list.push(r);
@@ -146,11 +163,11 @@
     return m;
   }
 
-  function sectionsOf(g: Map<Category, LocalPackInfo[]>) {
+  function sectionsOf(g: Map<Category, ManifoldInfo[]>) {
     const order: Category[] = [...CATEGORY_ORDER, "other"];
     return order
       .filter((c) => (g.get(c)?.length ?? 0) > 0)
-      .map((c) => ({ cat: c, items: g.get(c) as LocalPackInfo[] }));
+      .map((c) => ({ cat: c, items: g.get(c) as ManifoldInfo[] }));
   }
 
   const exSections = $derived(sectionsOf(groupedByCategory(extracted)));
@@ -180,7 +197,7 @@
 
   // ----- actions ------------------------------------------------------
 
-  async function onSteer(row: LocalPackInfo): Promise<void> {
+  async function onSteer(row: ManifoldInfo): Promise<void> {
     const name = row.name;
     // Pure-add: clicking an already-racked concept is a no-op.  The
     // button is disabled in that state, but the no-op here keeps the
@@ -191,8 +208,8 @@
     setBusy(key, true);
     errorMsg = null;
     try {
-      // Ensure the profile is registered server-side.  Tensor-on-disk
-      // doesn't mean it's loaded in the session; the extract endpoint
+      // Ensure the profile is registered server-side.  A fitted tensor on
+      // disk doesn't mean it's loaded in the session; the extract endpoint
       // short-circuits on cache hit (cheap profile load).
       await apiExtractStream({ name, register: true }, () => {});
       await refreshVectorList();
@@ -204,15 +221,17 @@
     }
   }
 
-  async function onProbe(row: LocalPackInfo): Promise<void> {
+  async function onProbe(row: ManifoldInfo): Promise<void> {
     const name = row.name;
     if (isActiveProbe(name)) return;
     const key = rowKey(row);
     setBusy(key, true);
     errorMsg = null;
     try {
-      await apiExtractStream({ name, register: true }, () => {});
-      await activateProbe(name);
+      // Attach by ``ns/name`` selector — the unified probe surface
+      // resolves the 2-node axis the same way the steering ``%`` term
+      // does (probe + steering share the lazy-load cache).
+      await attachProbe(`${row.namespace}/${row.name}`);
     } catch (e) {
       errorMsg = describeError(e);
     } finally {
@@ -220,16 +239,16 @@
     }
   }
 
-  /** Statements-only extract.  The concept has a name + cached
-   *  pairs/scenarios; this kicks off the same toast-driven flow as
-   *  the custom-vector form, no user input required.
+  /** Statements-only extract.  The concept axis has a node corpus on
+   *  disk; this kicks off the same toast-driven flow as the custom-vector
+   *  form, no user input required.
    *
    *  ``force=true`` is the re-fit path: the row already has a tensor
    *  for this model, but the user wants to bypass the tensor cache
    *  and re-run the contrastive forward passes (parity with the
    *  manifold drawer's "re-fit" action).  The toast wording branches
    *  so the user sees "re-extracting" vs "extracting". */
-  function onExtract(row: LocalPackInfo, opts: { force?: boolean } = {}): void {
+  function onExtract(row: ManifoldInfo, opts: { force?: boolean } = {}): void {
     const name = row.name;
     const key = rowKey(row);
     setBusy(key, true);
@@ -255,9 +274,9 @@
           },
         );
         // Refresh both so the row jumps from "Statements only" up to
-        // "Extracted" without remount, and the rack autocomplete sees
-        // the newly-registered profile.
-        await Promise.all([refreshVectorList(), refreshPacks()]);
+        // "Extracted" (``fitted_for_session`` flips) without remount, and
+        // the rack autocomplete sees the newly-registered profile.
+        await Promise.all([refreshVectorList(), refreshManifoldList()]);
         dismissToast(toastId);
         const past = opts.force ? "re-extracted" : "extracted";
         pushToast(`${past} ${result.canonical}`, { kind: "info" });
@@ -277,7 +296,7 @@
   /** Two-step delete confirm: first click flips the button to
    *  "confirm?", second click within 3 s commits.  Auto-resets via
    *  timer so a stray click doesn't leave the button armed forever. */
-  function onDeleteClick(row: LocalPackInfo): void {
+  function onDeleteClick(row: ManifoldInfo): void {
     const key = rowKey(row);
     if (confirmKeys.has(key)) {
       const t = confirmTimers.get(key);
@@ -297,17 +316,18 @@
     confirmTimers.set(key, t);
   }
 
-  async function doDelete(row: LocalPackInfo): Promise<void> {
+  async function doDelete(row: ManifoldInfo): Promise<void> {
     const key = rowKey(row);
     setBusy(key, true);
     errorMsg = null;
     try {
-      const r = await apiPacks.delete(row.namespace, row.name);
-      // Server already detached the concept from the session for us.
-      await Promise.all([refreshPacks(), refreshVectorList()]);
-      const msg = r.rematerializes_on_restart
-        ? `deleted ${row.namespace}/${row.name} — bundled, respawns on restart`
-        : `deleted ${row.namespace}/${row.name}`;
+      await apiManifolds.delete(row.namespace, row.name);
+      await Promise.all([refreshManifoldList(), refreshVectorList()]);
+      // Bundled concept axes (the ``default/`` namespace) respawn on the
+      // next session init, so flag that in the toast.
+      const msg = row.namespace === "default"
+        ? `deleted ${key} — bundled, respawns on restart`
+        : `deleted ${key}`;
       pushToast(msg, { kind: "info" });
     } catch (e) {
       errorMsg = describeError(e);
@@ -324,7 +344,7 @@
    *  diagnostics + layer-norms view lives one click further in via the
    *  LayerNormsDrawer, matching ManifoldDrawer's "ⓘ + drill-down"
    *  split. */
-  function toggleInspect(row: LocalPackInfo): void {
+  function toggleInspect(row: ManifoldInfo): void {
     const key = rowKey(row);
     if (inspectKeys.has(key)) inspectKeys.delete(key);
     else inspectKeys.add(key);
@@ -334,18 +354,15 @@
    *  by the inspect body's "show layer norms →" link as the bridge
    *  from the cheap inline panel to the heavier per-layer diagnostics
    *  view. */
-  function gotoLayerNorms(row: LocalPackInfo): void {
+  function gotoLayerNorms(row: ManifoldInfo): void {
     openDrawer("layer_norms", { name: row.name });
   }
 
-  /** Tensor-models field is a loose pass-through on LocalPackInfo —
-   *  returns the list of safe-model-id stems this concept is extracted
-   *  for.  We surface it in the inspect body so the user sees which
-   *  other models the tensor is available on. */
-  function tensorModels(row: LocalPackInfo): string[] {
-    const raw = (row as { tensor_models?: unknown }).tensor_models;
-    if (!Array.isArray(raw)) return [];
-    return raw.filter((m): m is string => typeof m === "string");
+  /** The safe-model-id stems this concept axis has a fitted tensor for.
+   *  Surfaced in the inspect body so the user sees which other models
+   *  the tensor is available on. */
+  function tensorModels(row: ManifoldInfo): string[] {
+    return row.fitted_models ?? [];
   }
 </script>
 
@@ -380,26 +397,30 @@
       <button
         type="button"
         class="refresh"
-        onclick={() => void refreshPacks()}
-        disabled={packsState.loading}
-        title="re-fetch installed packs"
+        onclick={() => void refreshManifoldList()}
+        disabled={manifoldRack.loading}
+        title="re-fetch concept axes"
         aria-label="Refresh"
-      >{packsState.loading ? "…" : "↻"}</button>
+      >{manifoldRack.loading ? "…" : "↻"}</button>
     </div>
 
-    {#if packsState.error}
-      <p class="error" role="alert">{packsState.error}</p>
+    {#if manifoldRack.error}
+      <p class="error" role="alert">{manifoldRack.error}</p>
     {/if}
 
-    {#if packsState.loading && packsState.infos.length === 0}
-      <p class="muted">loading concepts…</p>
-    {:else if packsState.infos.length === 0}
+    {#if manifoldRack.unavailable}
       <p class="muted">
-        no packs installed locally — use + custom vector above, or
-        install one via the rail › vectors › packs.
+        this server doesn't expose the manifold API — update saklas to
+        manage concept axes.
       </p>
-    {:else if filtered.length === 0}
+    {:else if manifoldRack.loading && manifoldRack.catalog.length === 0}
+      <p class="muted">loading concepts…</p>
+    {:else if filtered.length === 0 && searching}
       <p class="muted">no concept matches "{query.trim()}".</p>
+    {:else if filtered.length === 0}
+      <p class="muted">
+        no concept axes yet — use + build vector above to extract one.
+      </p>
     {:else}
       {#if exSections.length > 0}
         <h2 class="section-title">Extracted</h2>
@@ -491,8 +512,8 @@
                           <dl class="meta-list">
                             <dt>description</dt>
                             <dd>{row.description || "—"}</dd>
-                            <dt>source</dt>
-                            <dd>{row.source}</dd>
+                            <dt>domain</dt>
+                            <dd>{row.domain_label}</dd>
                             <dt>recommended α</dt>
                             <dd>{recommendedAlpha(row).toFixed(2)}</dd>
                             {#if row.tags && row.tags.length > 0}

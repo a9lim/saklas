@@ -22,6 +22,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel
 
+from saklas.core.session import _manifold_is_affine
 from saklas.server import saklas_api as _api
 from saklas.server.saklas_api import _resolve_session_id
 
@@ -45,6 +46,15 @@ def _probe_info(name: str, probe: Any) -> dict[str, Any]:
         intrinsic_dim = int(manifold.domain.intrinsic_dim)
     except Exception:
         intrinsic_dim = 0
+    try:
+        nc = manifold.node_coords
+        node_coords = nc.tolist() if nc is not None else None
+    except Exception:
+        node_coords = None
+    try:
+        is_affine = _manifold_is_affine(manifold)
+    except Exception:
+        is_affine = False
     return {
         "name": name,
         "manifold": manifold.name,
@@ -55,6 +65,14 @@ def _probe_info(name: str, probe: Any) -> dict[str, Any]:
         "domain": domain_spec,
         "intrinsic_dim": intrinsic_dim,
         "feature_space": manifold.feature_space,
+        # Flat (affine) probes are the subspace family — a 2-node concept axis
+        # through the rank-8 personas fan; curved fits are the manifold family.
+        # The client classifies subspace-vs-manifold off this single flag.
+        "is_affine": is_affine,
+        # Per-node authoring/display layout (K, n), aligned with node_labels;
+        # backs the client mini-map node dots + per-token trajectory lookup.
+        # None on an unfitted discover manifold (no per-model layout yet).
+        "node_coords": node_coords,
     }
 
 

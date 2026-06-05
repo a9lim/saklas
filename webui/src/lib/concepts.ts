@@ -6,11 +6,9 @@
 // ``BIPOLAR_SEP`` — a dot).  See docs/plans/webui-overhaul.md §"Category
 // data" and saklas/core/session.py ``canonical_concept_name``.
 
-import type { LocalPackInfo } from "./types";
-
 /** The seven fixed bundled categories, in display order.  Matches the
- * category-valued tags in saklas/data/vectors/<concept>/pack.json and the
- * grouping in AGENTS.md §"Bundled concepts". */
+ * category-valued tags in saklas/data/manifolds/<concept>/manifold.json
+ * and the grouping in AGENTS.md §"Bundled concepts". */
 export const CATEGORY_ORDER = [
   "affect",
   "epistemic",
@@ -70,10 +68,10 @@ export function polesOf(name: string): Poles {
   return { positive: name.slice(0, dot), negative: name.slice(dot + 1) };
 }
 
-/** Resting α for a concept — the pack's ``recommended_alpha`` (loose
- * passthrough on ``LocalPackInfo``), defaulting to 0.5 when absent. */
-export function recommendedAlpha(row: LocalPackInfo): number {
-  const raw = row["recommended_alpha"];
+/** Resting α for a concept — a loose ``recommended_alpha`` passthrough on
+ * any catalog row that carries one, defaulting to 0.5 when absent. */
+export function recommendedAlpha(row: { recommended_alpha?: unknown }): number {
+  const raw = row.recommended_alpha;
   const n = typeof raw === "number" ? raw : Number(raw);
   return Number.isFinite(n) && n !== 0 ? n : 0.5;
 }

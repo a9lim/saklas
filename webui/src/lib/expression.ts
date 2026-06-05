@@ -8,7 +8,7 @@
 //   coord_list := signed_num ("," signed_num)*
 //   atom     := [ns "/"] NAME ["." NAME] [":" variant]
 //   trigger  := before|after|both|thinking|response|prompt|generated
-//   variant  := raw | pca | sae | sae-<release> | role | role-<name>
+//   variant  := raw | sae | sae-<release> | role | role-<name>
 //             | from | from-<safe-source-model>
 //
 // A ``%`` selector is the manifold operator — ``<manifold> % a,b,...``
@@ -493,7 +493,6 @@ class Parser {
       const vs = String(v.value);
       if (
         vs === "raw" ||
-        vs === "pca" ||
         vs === "sae" ||
         vs === "role" ||
         vs === "from"
@@ -507,7 +506,7 @@ class Parser {
         variant = vs as Variant;
       } else {
         throw new ExpressionParseError(
-          `unknown variant ':${vs}'; expected raw, pca, sae, sae-<release>, role, role-<name>, from, or from-<safe-source-model>`,
+          `unknown variant ':${vs}'; expected raw, sae, sae-<release>, role, role-<name>, from, or from-<safe-source-model>`,
           this.src,
           v.col,
         );

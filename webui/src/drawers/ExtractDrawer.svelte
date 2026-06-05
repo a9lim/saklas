@@ -2,25 +2,21 @@
   // Custom-vector extraction — the "+ custom vector" launcher from the
   // unified VectorsDrawer.  Two input modes:
   //
-  //   * poles   — type concept A (required) and B (optional); saklas
-  //               auto-generates contrastive statements.  A "generate
-  //               previews" button surfaces those statements in an
-  //               editable pos/neg table before they commit; the user
-  //               can edit and commit, or skip preview and submit the
-  //               bare slug.
+  //   * poles   — type concept A (required) and B (optional); the bare
+  //               slug ``source`` is submitted to ``/extract`` and saklas
+  //               auto-generates the contrastive corpus server-side.
   //   * custom  — supply the contrastive pairs directly.  The table
-  //               starts with one empty row; no preview call.
+  //               starts with one empty row.
   //
   // Submission closes immediately and reopens the vectors drawer so
   // the user lands back in the list while the sticky progress toast
   // tracks extraction in the background.
 
   import { untrack } from "svelte";
-  import { apiExtractStream, apiVectors, ApiError } from "../lib/api";
+  import { apiExtractStream, ApiError } from "../lib/api";
   import {
     closeDrawer,
     openDrawer,
-    refreshPacks,
     refreshVectorList,
   } from "../lib/stores.svelte";
   import {
@@ -29,7 +25,6 @@
     updateToast,
   } from "../lib/stores/toasts.svelte";
   import type { ExtractRequest, StatementPair } from "../lib/types";
-  import Radio from "../lib/Radio.svelte";
   import Checkbox from "../lib/Checkbox.svelte";
   import ModeTabs from "../lib/builder/ModeTabs.svelte";
   import AdvancedSection from "../lib/builder/AdvancedSection.svelte";
@@ -56,7 +51,6 @@
   let conceptA = $state(untrack(() => narrow(params).seed_a ?? ""));
   let conceptB = $state("");
   let advancedOpen = $state(false);
-  let method: "dim" | "pca" = $state("dim");
   let dls = $state(true);
   let sae = $state("");
   // Role-augmented extraction (`:role-<slug>` variant).  Empty = raw
@@ -78,18 +72,14 @@
     roleTrim === "" || ROLE_SLUG_RE.test(roleTrim),
   );
 
-  // Editable contrastive-pair table.  In poles mode it fills after a
-  // "generate previews" call; in custom mode it starts with one empty
-  // row.  ``previewed`` tracks whether the poles-mode user has ever
-  // generated previews — drives whether submit sends pairs or the bare
-  // slug string.
+  // Editable contrastive-pair table — custom mode only.  Starts with one
+  // empty row; the auto-generated (poles) tab submits the bare slug and
+  // lets saklas build the corpus server-side, so it never touches this.
   let pairs: StatementPair[] = $state([]);
-  let previewed = $state(false);
-  let previewing = $state(false);
 
   // Custom mode opens with one empty row to fill in.
   $effect(() => {
-    if (inputMode === "custom" && pairs.length === 0 && !previewed) {
+    if (inputMode === "custom" && pairs.length === 0) {
       pairs = [{ positive: "", negative: "" }];
     }
   });
@@ -116,24 +106,6 @@
         negative: p.negative.trim(),
       }))
       .filter((p) => p.positive || p.negative);
-  }
-
-  async function generatePreviews(): Promise<void> {
-    if (!valid.ok || previewing) return;
-    previewing = true;
-    errorMsg = null;
-    try {
-      const r = await apiVectors.previewPairs({ concept: canonicalName });
-      pairs = r.pairs.map((p) => ({
-        positive: p.positive,
-        negative: p.negative,
-      }));
-      previewed = true;
-    } catch (e) {
-      errorMsg = describeError(e);
-    } finally {
-      previewing = false;
-    }
   }
 
   /** Slugify a free-text concept into the ``NAME_REGEX`` shape the
@@ -213,8 +185,8 @@
    *  toast tracks extraction.  Lifecycle: sticky progress toast
    *  spawn → live-update on SSE ``progress`` events → dismiss +
    *  replace with a 6 s success toast (or sticky error toast) when
-   *  ``done`` / ``error`` lands.  Also refreshes packs so the newly
-   *  extracted row pops into the vectors drawer reactively. */
+   *  ``done`` / ``error`` lands.  Also refreshes the vector list so the
+   *  newly extracted row pops into the vectors drawer reactively. */
   async function driveExtract(req: ExtractRequest): Promise<void> {
     const toastId = pushToast(`extracting '${req.name}'…`, {
       kind: "info",
@@ -230,7 +202,7 @@
           if (m) updateToast(toastId, { detail: m });
         }
       });
-      await Promise.all([refreshVectorList(), refreshPacks()]);
+      await refreshVectorList();
       dismissToast(toastId);
       pushToast(`extracted ${result.canonical}`, { kind: "info" });
     } catch (e) {
@@ -248,7 +220,6 @@
     const req: ExtractRequest = {
       name: canonicalName,
       register: true,
-      method,
       dls,
     };
     const saeTrim = sae.trim();
@@ -261,14 +232,12 @@
     if (force) req.force = true;
 
     // Source resolution:
-    //   * custom mode, or poles mode where the user generated and
-    //     possibly edited previews → send the explicit pair list, which
-    //     runs the server's generation-skipping fast path.
-    //   * poles mode with no preview ever generated → leave ``source``
-    //     unset so the server slug-resolves and auto-generates pairs.
-    const cleaned = cleanPairs();
-    if (inputMode === "custom" || previewed) {
-      req.source = { pairs: cleaned };
+    //   * custom mode → send the explicit pair list, which runs the
+    //     server's generation-skipping fast path.
+    //   * poles mode → leave ``source`` unset so the server slug-resolves
+    //     the canonical name and auto-generates the contrastive corpus.
+    if (inputMode === "custom") {
+      req.source = { pairs: cleanPairs() };
     }
 
     // Close this drawer and reopen the vectors drawer so the user
@@ -307,9 +276,8 @@
 
     <p class="hint">
       {#if inputMode === "poles"}
-        enter one or two concepts.  saklas auto-generates contrastive
-        statements — generate previews to review and edit them before
-        extraction, or submit straight away to use them as-is.
+        enter one or two concepts.  saklas auto-generates the contrastive
+        corpus server-side and extracts the steering vector.
       {:else}
         supply the contrastive pairs directly.  each row's positive and
         negative statement is differenced to build the steering vector.
@@ -362,18 +330,7 @@
         </p>
       {/if}
 
-      {#if inputMode === "poles"}
-        <button
-          type="button"
-          class="preview-btn"
-          disabled={!valid.ok || previewing}
-          onclick={generatePreviews}
-        >
-          {previewing ? "generating previews…" : "generate previews"}
-        </button>
-      {/if}
-
-      {#if inputMode === "custom" || pairs.length > 0}
+      {#if inputMode === "custom"}
         <section class="pairs">
           <div class="pairs-head">
             <span class="label">contrastive pairs</span>
@@ -428,24 +385,6 @@
       {/if}
 
       <AdvancedSection bind:expanded={advancedOpen}>
-        <fieldset class="field method">
-          <legend class="label">method</legend>
-          <span class="radio">
-            <Radio
-              bind:group={method}
-              value="dim"
-              label="difference-of-means"
-            />
-          </span>
-          <span class="radio">
-            <Radio
-              bind:group={method}
-              value="pca"
-              label="contrastive PCA"
-            />
-          </span>
-        </fieldset>
-
         <label class="field">
           <span class="label"
             >SAE release <span class="opt">optional</span></span>
@@ -636,19 +575,6 @@
     border-radius: var(--radius);
   }
 
-  .method {
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    padding: var(--space-3) var(--space-4);
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-2);
-    margin: 0;
-  }
-  .method legend {
-    padding: 0 var(--space-2);
-  }
-  .radio,
   .check {
     display: flex;
     align-items: center;
@@ -668,28 +594,6 @@
     padding: var(--space-1) var(--space-2);
     border-radius: var(--radius);
     font-family: var(--font-mono);
-  }
-
-  /* ---- preview button ---- */
-  .preview-btn {
-    background: var(--accent-subtle);
-    color: var(--accent);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    padding: var(--space-2) var(--space-4);
-    font: inherit;
-    font-family: var(--font-mono);
-    font-size: var(--text-sm);
-    cursor: pointer;
-    transition: background var(--dur) var(--ease-out);
-    align-self: flex-start;
-  }
-  .preview-btn:hover:not(:disabled) {
-    background: var(--accent-glow);
-  }
-  .preview-btn:disabled {
-    color: var(--fg-muted);
-    cursor: not-allowed;
   }
 
   /* ---- pairs table ---- */

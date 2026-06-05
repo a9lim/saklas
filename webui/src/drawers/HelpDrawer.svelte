@@ -135,7 +135,7 @@ position  := signed_num ("," signed_num)* | label
 atom      := [ns "/"] NAME ["." NAME] [":" variant]
 trigger   := before | after | both | thinking | response
              | prompt | generated | when:<probe><op><num>
-variant   := raw | pca | sae | sae-<release>
+variant   := raw | sae | sae-<release>
              | role | role-<name> | from | from-<source>
 `}</pre>
 
@@ -144,7 +144,6 @@ variant   := raw | pca | sae | sae-<release>
 0.4 warm@after               # active only after </think>
 -0.5 wolf                    # bare pole resolves to deer.wolf @ -0.5
 0.6 honest:sae               # pull from the SAE-feature-space tensor
-0.6 honest:pca               # pull from the legacy PCA tensor
 0.6 honest:role-pirate       # role-augmented tensor
 0.6 honest:from-gemma_4_31b  # transferred tensor
 0.5 honest|sycophantic       # remove shared component with sycophantic

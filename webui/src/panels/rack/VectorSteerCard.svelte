@@ -1,19 +1,20 @@
 <script lang="ts">
-  // One row per loaded steering vector.  The bipolar axis *is* the
-  // layout: the negative pole flanks the slider on the left, the positive
-  // on the right, so ``calm ◄──●──► angry`` reads as a control rather
-  // than a bare name next to an unlabelled slider (docs/plans/
-  // webui-overhaul.md §"The rack strip").  The canonical concept name
-  // lives in the tooltip / aria-label; monopolar concepts show one pole.
+  // Subspace steer card — the harmonised replacement for VectorStrip.  A
+  // steering vector is always the flat (subspace) family: 2-node bipolar
+  // (or a 1-node monopolar fold).  Composes the shared RackCard chrome:
   //
-  // Every mutation goes through the store actions in stores.svelte.ts so
-  // the canonical expression and pending-action queue stay coherent.
+  //   statline : ●/○ enable · name · !ablate · variant chip · trigger pill
+  //              · projection tag · ⋮ menu · ✕ remove   (all one row)
+  //   body     : the bipolar axis as ONE control row —
+  //              neg pole · Slider (α) · pos pole · signed α value
   //
-  // The α slider has a 0 detent: dragging through ±0.025 snaps to 0 so
-  // the user can park at "off" without fighting the slider.
+  // Control logic (the 0-detent slider, the variant dropdown, the ⋮ menu,
+  // the inline projection modal, ablate / duplicate / copy-expression /
+  // remove) is carried over verbatim from VectorStrip — this is a
+  // restack into statline/body, not a rewrite.
 
   import { onMount } from "svelte";
-  import type { ProjectionSpec, Trigger, VectorRackEntry } from "../lib/types";
+  import type { ProjectionSpec, Trigger, VectorRackEntry } from "../../lib/types";
   import {
     setVectorAlpha,
     setVectorEnabled,
@@ -24,12 +25,13 @@
     addVectorToRack,
     removeVectorFromRack,
     vectorRack,
-  } from "../lib/stores.svelte";
-  import { pushToast } from "../lib/stores/toasts.svelte";
-  import { serializeExpression } from "../lib/expression";
-  import { apiVectors } from "../lib/api";
-  import { polesOf } from "../lib/concepts";
-  import Slider from "../lib/Slider.svelte";
+  } from "../../lib/stores.svelte";
+  import { pushToast } from "../../lib/stores/toasts.svelte";
+  import { serializeExpression } from "../../lib/expression";
+  import { apiVectors } from "../../lib/api";
+  import { polesOf } from "../../lib/concepts";
+  import Slider from "../../lib/Slider.svelte";
+  import RackCard from "./RackCard.svelte";
 
   interface Props {
     name: string;
@@ -113,9 +115,10 @@
 
   // ---------- variant dropdown ----------
   //
-  // Replaces the v1 ``window.prompt``.  A small in-app menu offering
-  // common tensor variants plus the current open-ended suffix when one is
-  // set, so flipping variants never leaves the saklas visual language.
+  // A small in-app menu offering common tensor variants plus the current
+  // open-ended suffix when one is set, so flipping variants never leaves
+  // the saklas visual language.  NOTE: ``pca`` is gone — difference-of-
+  // means is the only vector extraction method now.
 
   let variantOpen = $state(false);
   let variantRef: HTMLDivElement | null = $state(null);
@@ -123,7 +126,6 @@
   const variantOptions = $derived.by(() => {
     const opts: VectorRackEntry["variant"][] = [
       "raw",
-      "pca",
       "sae",
       "role",
       "from",
@@ -180,10 +182,9 @@
 
   // ---------- inline projection modal ----------
   //
-  // Replaces the v1 ``window.prompt`` for picking a projection target.
-  // Modal is local to the strip — backdrop covers the viewport, the
-  // dialog itself is centered, Esc / click-outside cancel, Enter
-  // confirms, the input autofocuses on open.
+  // In-app dialog for picking a projection target — backdrop covers the
+  // viewport, the dialog itself is centered, Esc / click-outside cancel,
+  // Enter confirms, the input autofocuses on open.
 
   let projectionPromptOp = $state<ProjectionSpec["op"] | null>(null);
   let projectionTargetDraft = $state("");
@@ -288,161 +289,166 @@
   });
 </script>
 
-<div
-  class="strip"
-  class:disabled={!entry.enabled}
-  class:ablate={entry.ablate}
-  role="row"
->
-  <button
-    type="button"
-    class="enable"
-    onclick={toggleEnabled}
-    title={entry.enabled ? "Enabled (click to disable)" : "Disabled (click to enable)"}
-    aria-pressed={entry.enabled}
-    aria-label="Toggle steering for {name}"
-  >
-    {entry.enabled ? "●" : "○"}
-  </button>
-
-  {#if entry.ablate}
-    <span class="ablate-mark" title="ablation: concept removed from the residual stream">!</span>
-  {/if}
-
-  <!-- Bipolar axis frame.  The negative pole sits left of the slider, the
-       positive right — dragging left/right now means something.
-       Monopolar concepts render an empty left-pole slot rather than
-       collapsing the grid, so a mixed mono/bipolar rack keeps slider
-       starts + positive poles vertically aligned across rows. -->
-  <div class="axis">
-    <span class="pole neg" aria-hidden={monopolar}>
-      {#if !monopolar}{poles.negative}{/if}
-    </span>
-    <Slider
-      value={entry.alpha}
-      min={monopolar ? 0 : -1}
-      max={1}
-      step={0.05}
-      oninput={onSliderInput}
-      ariaLabel="strength (α) for {name}"
-      title="strength (α) for {name}: drag, ±0.025 snaps to 0"
-    />
-    <span class="pole pos" title="positive pole (drag right)">
-      {poles.positive}
-    </span>
-  </div>
-
-  <span
-    class="alpha-display"
-    style:color={alphaColor}
-    title="strength (α): signed steering coefficient"
-  >
-    {formatAlpha(entry.alpha)}
-  </span>
-
-  <button
-    type="button"
-    class="trigger-pill"
-    onclick={cycleTrigger}
-    title="trigger: {TRIGGER_LABEL[entry.trigger]} (click to cycle)"
-    aria-label="trigger for {name}: {entry.trigger}"
-  >
-    {TRIGGER_WORD[entry.trigger]}
-  </button>
-
-  <div class="variant-wrap" bind:this={variantRef}>
+<RackCard accent="--accent" disabled={!entry.enabled}>
+  {#snippet statline()}
     <button
       type="button"
-      class="variant-chip"
-      onclick={toggleVariant}
-      aria-haspopup="menu"
-      aria-expanded={variantOpen}
-      title="tensor variant: {entry.variant} (click to change)"
-      aria-label="variant for {name}: {entry.variant}"
+      class="enable"
+      class:off={!entry.enabled}
+      onclick={toggleEnabled}
+      title={entry.enabled ? "Enabled (click to disable)" : "Disabled (click to enable)"}
+      aria-pressed={entry.enabled}
+      aria-label="Toggle steering for {name}"
     >
-      {entry.variant}
+      {entry.enabled ? "●" : "○"}
     </button>
-    {#if variantOpen}
-      <div class="variant-menu" role="menu">
-        {#each variantOptions as v (v)}
+
+    <span class="name" class:struck={!entry.enabled} title="concept {name}">
+      {name}
+    </span>
+
+    {#if entry.ablate}
+      <span class="ablate-mark" title="ablation: concept removed from the residual stream">!</span>
+    {/if}
+
+    <span class="spacer"></span>
+
+    <div class="variant-wrap" bind:this={variantRef}>
+      <button
+        type="button"
+        class="variant-chip"
+        onclick={toggleVariant}
+        aria-haspopup="menu"
+        aria-expanded={variantOpen}
+        title="tensor variant: {entry.variant} (click to change)"
+        aria-label="variant for {name}: {entry.variant}"
+      >
+        {entry.variant}
+      </button>
+      {#if variantOpen}
+        <div class="variant-menu" role="menu">
+          {#each variantOptions as v (v)}
+            <button
+              type="button"
+              role="menuitemradio"
+              aria-checked={entry.variant === v}
+              class:active={entry.variant === v}
+              onclick={() => pickVariant(v)}
+            >
+              {v}
+            </button>
+          {/each}
+        </div>
+      {/if}
+    </div>
+
+    <button
+      type="button"
+      class="trigger-pill"
+      onclick={cycleTrigger}
+      title="trigger: {TRIGGER_LABEL[entry.trigger]} (click to cycle)"
+      aria-label="trigger for {name}: {entry.trigger}"
+    >
+      {TRIGGER_WORD[entry.trigger]}
+    </button>
+
+    {#if projectionGlyph}
+      <span class="projection-tag" title="projection: {projectionGlyph}">
+        {projectionGlyph}
+      </span>
+    {/if}
+
+    <div class="menu-wrap" bind:this={menuRef}>
+      <button
+        type="button"
+        class="icon menu-btn"
+        onclick={toggleMenu}
+        aria-haspopup="menu"
+        aria-expanded={menuOpen}
+        aria-label="more actions for {name}"
+        title="more actions"
+      >
+        ⋮
+      </button>
+      {#if menuOpen}
+        <div class="menu" role="menu">
           <button
             type="button"
-            role="menuitemradio"
-            aria-checked={entry.variant === v}
-            class:active={entry.variant === v}
-            onclick={() => pickVariant(v)}
+            role="menuitem"
+            onclick={() => pickProjection("~")}
+            disabled={entry.ablate}
           >
-            {v}
+            {entry.projection?.op === "~"
+              ? `clear projection (~ ${entry.projection.target})`
+              : "project onto (~)…"}
           </button>
-        {/each}
-      </div>
-    {/if}
-  </div>
+          <button
+            type="button"
+            role="menuitem"
+            onclick={() => pickProjection("|")}
+            disabled={entry.ablate}
+          >
+            {entry.projection?.op === "|"
+              ? `clear projection (| ${entry.projection.target})`
+              : "project orthogonal (|)…"}
+          </button>
+          <button type="button" role="menuitem" onclick={toggleAblate}>
+            {entry.ablate ? "remove ablation (!)" : "ablate (!)"}
+          </button>
+          <hr />
+          <button type="button" role="menuitem" onclick={duplicate}>
+            duplicate
+          </button>
+          <button type="button" role="menuitem" onclick={copyTermExpression}>
+            copy expression
+          </button>
+        </div>
+      {/if}
+    </div>
 
-  {#if projectionGlyph}
-    <span class="projection-tag" title="projection: {projectionGlyph}">
-      {projectionGlyph}
-    </span>
-  {/if}
-
-  <div class="menu-wrap" bind:this={menuRef}>
     <button
       type="button"
-      class="icon menu-btn"
-      onclick={toggleMenu}
-      aria-haspopup="menu"
-      aria-expanded={menuOpen}
-      aria-label="more actions for {name}"
-      title="more actions"
+      class="icon remove"
+      onclick={removeVector}
+      aria-label="remove {name}"
+      title="remove {name}"
     >
-      ⋮
+      ✕
     </button>
-    {#if menuOpen}
-      <div class="menu" role="menu">
-        <button
-          type="button"
-          role="menuitem"
-          onclick={() => pickProjection("~")}
-          disabled={entry.ablate}
-        >
-          {entry.projection?.op === "~"
-            ? `clear projection (~ ${entry.projection.target})`
-            : "project onto (~)…"}
-        </button>
-        <button
-          type="button"
-          role="menuitem"
-          onclick={() => pickProjection("|")}
-          disabled={entry.ablate}
-        >
-          {entry.projection?.op === "|"
-            ? `clear projection (| ${entry.projection.target})`
-            : "project orthogonal (|)…"}
-        </button>
-        <button type="button" role="menuitem" onclick={toggleAblate}>
-          {entry.ablate ? "remove ablation (!)" : "ablate (!)"}
-        </button>
-        <hr />
-        <button type="button" role="menuitem" onclick={duplicate}>
-          duplicate
-        </button>
-        <button type="button" role="menuitem" onclick={copyTermExpression}>
-          copy expression
-        </button>
-      </div>
-    {/if}
-  </div>
+  {/snippet}
 
-  <button
-    type="button"
-    class="icon remove"
-    onclick={removeVector}
-    aria-label="remove {name}"
-    title="remove {name}"
-  >
-    ✕
-  </button>
-</div>
+  {#snippet body()}
+    <!-- Bipolar axis frame.  The negative pole sits left of the slider,
+         the positive right — dragging left/right now means something.
+         Monopolar concepts render an empty left-pole slot rather than
+         collapsing the grid, so a mixed mono/bipolar rack keeps slider
+         starts + positive poles vertically aligned across rows. -->
+    <div class="axis" class:disabled={!entry.enabled}>
+      <span class="pole neg" aria-hidden={monopolar}>
+        {#if !monopolar}{poles.negative}{/if}
+      </span>
+      <Slider
+        value={entry.alpha}
+        min={monopolar ? 0 : -1}
+        max={1}
+        step={0.05}
+        oninput={onSliderInput}
+        ariaLabel="strength (α) for {name}"
+        title="strength (α) for {name}: drag, ±0.025 snaps to 0"
+      />
+      <span class="pole pos" title="positive pole (drag right)">
+        {poles.positive}
+      </span>
+      <span
+        class="alpha-display"
+        style:color={alphaColor}
+        title="strength (α): signed steering coefficient"
+      >
+        {formatAlpha(entry.alpha)}
+      </span>
+    </div>
+  {/snippet}
+</RackCard>
 
 {#if projectionPromptOp !== null}
   <!-- Inline projection-target dialog. -->
@@ -495,37 +501,34 @@
 {/if}
 
 <style>
-  .strip {
-    display: flex;
-    align-items: center;
-    gap: var(--space-3);
-    min-height: 32px;
-    padding: var(--space-2) var(--space-3);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    background: var(--bg-alt);
-    font-size: var(--text-sm);
-    transition: border-color var(--dur) var(--ease-out),
-      opacity var(--dur) var(--ease-out);
-  }
-  .strip.disabled {
-    opacity: 0.5;
-  }
-  .strip.ablate {
-    border-color: var(--accent-purple);
-  }
+  /* ----- statline pieces ----- */
 
-  /* Enable / disable toggle — same ●/○ glyph the probe row uses. */
+  /* Enable / disable toggle — ●/○ glyph in the subspace accent. */
   .enable {
     background: transparent;
     border: 0;
     padding: 0 var(--space-1);
-    color: var(--accent);
+    color: var(--card-accent);
     font-size: var(--text);
     line-height: 1;
     flex: 0 0 auto;
+    cursor: pointer;
   }
-  .strip.disabled .enable {
+  .enable.off {
+    color: var(--fg-muted);
+  }
+
+  .name {
+    color: var(--fg-strong);
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+  }
+  .name.struck {
+    text-decoration: line-through;
     color: var(--fg-muted);
   }
 
@@ -535,41 +538,10 @@
     flex: 0 0 auto;
   }
 
-  /* The axis owns the strip's flexible width — poles + slider together.
-   * Monopolar rows render an empty left-pole slot instead of collapsing
-   * the grid, so a mono row sits on the same column proportions as the
-   * bipolar rows around it and the slider starts at the same x. */
-  .axis {
-    display: grid;
-    grid-template-columns: minmax(2.5em, 1fr) minmax(60px, 2.6fr) minmax(2.5em, 1fr);
-    align-items: center;
-    gap: var(--space-2);
+  /* Pushes the action cluster to the right of the statline. */
+  .spacer {
     flex: 1 1 auto;
     min-width: 0;
-  }
-  .pole {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    font-size: var(--text-sm);
-  }
-  .strip.disabled .pole {
-    text-decoration: line-through;
-  }
-  .pole.neg {
-    color: var(--fg-muted);
-    text-align: right;
-  }
-  .pole.pos {
-    color: var(--fg-strong);
-    text-align: left;
-  }
-
-  .alpha-display {
-    flex: 0 0 auto;
-    min-width: 3.5em;
-    text-align: right;
-    font-variant-numeric: tabular-nums;
   }
 
   .trigger-pill,
@@ -592,7 +564,7 @@
     border-color: var(--fg-muted);
   }
   .variant-chip {
-    color: var(--accent);
+    color: var(--card-accent);
   }
 
   .variant-wrap {
@@ -652,6 +624,7 @@
     padding: var(--space-1) var(--space-2);
     border-radius: var(--radius);
     flex: 0 0 auto;
+    cursor: pointer;
     transition: color var(--dur) var(--ease-out),
       background var(--dur) var(--ease-out);
   }
@@ -702,6 +675,38 @@
     border: 0;
     border-top: 1px solid var(--border);
     margin: var(--space-1) 0;
+  }
+
+  /* ----- body: the bipolar axis row ----- */
+  .axis {
+    display: grid;
+    grid-template-columns: minmax(2.5em, 1fr) minmax(60px, 2.6fr) minmax(2.5em, 1fr) 3.5em;
+    align-items: center;
+    gap: var(--space-2);
+    min-width: 0;
+  }
+  .pole {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: var(--text-sm);
+  }
+  .axis.disabled .pole {
+    text-decoration: line-through;
+  }
+  .pole.neg {
+    color: var(--fg-muted);
+    text-align: right;
+  }
+  .pole.pos {
+    color: var(--fg-strong);
+    text-align: left;
+  }
+  .alpha-display {
+    flex: 0 0 auto;
+    min-width: 3.5em;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
   }
 
   /* ----- projection modal ----- */

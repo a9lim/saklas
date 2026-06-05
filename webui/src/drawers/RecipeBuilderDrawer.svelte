@@ -66,7 +66,6 @@
   function isVariant(raw: string): raw is Variant {
     return (
       raw === "raw" ||
-      raw === "pca" ||
       raw === "sae" ||
       raw === "role" ||
       raw === "from" ||
@@ -157,7 +156,7 @@
                 <span>variant</span>
                 <input
                   value={entry.variant}
-                  placeholder="raw | pca | sae-* | role-* | from-*"
+                  placeholder="raw | sae-* | role-* | from-*"
                   oninput={(ev) => {
                     const raw = (ev.currentTarget as HTMLInputElement).value.trim();
                     if (isVariant(raw)) {

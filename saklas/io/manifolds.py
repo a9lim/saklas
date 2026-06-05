@@ -2549,7 +2549,7 @@ def manifold_summary(folder: Path) -> dict[str, Any]:
     summary).
 
     Returns a dict with keys: ``namespace`` / ``name`` / ``description`` /
-    ``source`` / ``fit_mode`` / ``is_discover`` / ``domain`` /
+    ``source`` / ``tags`` / ``fit_mode`` / ``is_discover`` / ``domain`` /
     ``domain_label`` / ``intrinsic_dim`` / ``min_nodes`` / ``node_count`` /
     ``node_labels`` / ``node_coords`` / ``node_roles`` / ``hyperparams`` /
     ``fitted_models`` / ``tensor_variants``.
@@ -2591,6 +2591,7 @@ def manifold_summary(folder: Path) -> dict[str, Any]:
         "name": mf.name,
         "description": mf.description,
         "source": mf.source,
+        "tags": list(mf.tags),
         "fit_mode": mf.fit_mode,
         "is_discover": mf.is_discover,
         "domain": domain,

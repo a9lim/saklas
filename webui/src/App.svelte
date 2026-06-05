@@ -13,9 +13,7 @@
   import Toaster from "./lib/Toaster.svelte";
 
   import * as Drawers from "./drawers";
-  import PackDrawer from "./drawers/PackDrawer.svelte";
   import MergeDrawer from "./drawers/MergeDrawer.svelte";
-  import CloneDrawer from "./drawers/CloneDrawer.svelte";
   import TokenDrilldownDrawer from "./drawers/TokenDrilldownDrawer.svelte";
 
   import {
@@ -41,7 +39,6 @@
     "manifolds",
     "manifold_builder",
     "merge",
-    "clone",
     "system_prompt",
     "save_conversation",
     "load_conversation",
@@ -232,12 +229,8 @@
             <Drawers.Help params={drawerState.params} />
           {:else if drawerState.open === "export"}
             <Drawers.Export params={drawerState.params} />
-          {:else if drawerState.open === "pack"}
-            <PackDrawer params={drawerState.params} />
           {:else if drawerState.open === "merge"}
             <MergeDrawer params={drawerState.params} />
-          {:else if drawerState.open === "clone"}
-            <CloneDrawer params={drawerState.params} />
           {:else if drawerState.open === "token_drilldown"}
             <TokenDrilldownDrawer params={drawerState.params} />
           {:else if drawerState.open === "correlation"}

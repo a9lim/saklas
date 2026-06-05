@@ -30,16 +30,14 @@
       key: "vectors",
       label: "Steering & vectors",
       icon: "M5 19L19 5M19 5h-7M19 5v7",
-      // Shared op vocabulary with the manifolds category — build /
-      // merge / packs sit in the same slots and the same label format
-      // so the two steering surfaces read as one family.  ``clone`` is a
-      // vector-only extra (no manifold counterpart by design); it tucks
-      // in after merge.
+      // Shared op vocabulary with the manifolds category — build / merge
+      // sit in the same slots and the same label format so the two
+      // steering surfaces read as one family.  Pack lifecycle is unified
+      // under the manifolds category's "packs…" (concepts are manifolds
+      // now), so the vectors fan-out is build + merge only.
       tools: [
         { label: "build vector…", drawer: "extract" },
         { label: "merge vector…", drawer: "merge" },
-        { label: "clone vector…", drawer: "clone" },
-        { label: "packs…", drawer: "pack" },
       ],
     },
     {

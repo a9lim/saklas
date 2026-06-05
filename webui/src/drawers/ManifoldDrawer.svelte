@@ -18,13 +18,13 @@
   import { ApiError, apiManifolds, apiManifoldFitStream } from "../lib/api";
   import {
     addManifoldToRack,
-    attachManifoldProbe,
+    attachProbe,
     closeDrawer,
-    manifoldProbeRack,
+    probeRack,
     manifoldRack,
     openDrawer,
     refreshManifoldList,
-    refreshManifoldProbeList,
+    refreshProbeList,
     setManifoldLabel,
   } from "../lib/stores.svelte";
   import {
@@ -85,7 +85,7 @@
     // Pull the attached-probe list too — the +probe button disables
     // itself when a fitted manifold is already attached, so the drawer
     // needs this fresh on mount.
-    void refreshManifoldProbeList();
+    void refreshProbeList();
     queueMicrotask(() => searchInputRef?.focus({ preventScroll: true }));
     return () => {
       for (const t of confirmTimers.values()) window.clearTimeout(t);
@@ -185,8 +185,8 @@
   }
 
   function isProbed(m: ManifoldInfo): boolean {
-    return manifoldProbeRack.entries.has(rowKey(m)) ||
-      manifoldProbeRack.entries.has(m.name);
+    return probeRack.entries.has(rowKey(m)) ||
+      probeRack.entries.has(m.name);
   }
 
   function onSteer(m: ManifoldInfo): void {
@@ -200,7 +200,7 @@
     const key = rowKey(m);
     busyKeys.add(key);
     try {
-      const info = await attachManifoldProbe(key);
+      const info = await attachProbe(key);
       pushToast(`attached manifold probe ${info.name}`, { kind: "info" });
       closeDrawer();
     } catch (e) {
@@ -233,7 +233,7 @@
       const opts: { name?: string; top_n?: number } = {};
       if (customAlias.trim()) opts.name = customAlias.trim();
       if (customTopN && customTopN > 0) opts.top_n = customTopN;
-      const info = await attachManifoldProbe(sel, opts);
+      const info = await attachProbe(sel, opts);
       pushToast(`attached manifold probe ${info.name}`, { kind: "info" });
       customSelector = "";
       customAlias = "";
@@ -541,7 +541,7 @@
                       ? `${key} is already racked`
                       : `rack ${key} for steering`}
                   >+steer</button>
-                  {#if !manifoldProbeRack.unavailable}
+                  {#if !probeRack.unavailable}
                     <button
                       type="button"
                       class="act probe"

@@ -1,64 +1,50 @@
 <script lang="ts">
-  // Probe rack — fused manifold + vector probes in one section.  Section
-  // header with a combined count, manifold strips sorted alphabetically
-  // first (the bundled ``personas`` / ``circumplex`` probes auto-load
-  // here, so they head the rack), then vector strips, then a footer with
-  // two entry-point buttons (+ add probe / + add manifold probe).
+  // Probe rack — two harmonised groups split on geometry, not artifact
+  // type:
   //
-  // Sort cycle order matches the TUI (Ctrl+S): name → value → change →
-  // name.  Sort only orders vector probes — manifold probes always sort
-  // alphabetically at the top (they aren't comparable to vector probes
-  // on ``value`` or ``change`` — different units, different domains).
+  //   subspace (flat) — probeRack entries where info.is_affine (a 2-node
+  //     concept axis or a higher-rank flat fan like personas).
+  //   manifold (curved) — the rest (e.g. a curved pad probe).
   //
-  // Manifold strips keep their purple accent so the probe family stays
-  // visually distinct even inside the shared rack.  The catalog
-  // dropdown + selector input + top_n controls from the old standalone
-  // ManifoldProbeRack live inside ManifoldDrawer's "as probe" row —
-  // unified with the steering attach path the way VectorsDrawer
-  // unifies steer/probe for vectors.
+  // Every row wears the same RackCard chrome; the family is signalled only
+  // by accent colour + marker glyph.  The sort dropdown (name / value /
+  // change) orders within each group.  Light group sub-headers; an empty
+  // group hides.  Footer keeps the + add probe / + add manifold probe
+  // entry points and their drawer targets.
   //
   // Transcript highlight / compare-two controls live in Chat.svelte —
   // highlighting is about reading the transcript, so that is their one
-  // home (docs/plans/webui-overhaul.md §"Panel & drawer notes").
+  // home.
 
-  import ProbeStrip from "./ProbeStrip.svelte";
-  import ManifoldProbeStrip from "./ManifoldProbeStrip.svelte";
+  import SubspaceProbeCard from "./rack/SubspaceProbeCard.svelte";
+  import ManifoldProbeCard from "./rack/ManifoldProbeCard.svelte";
   import Select from "../lib/Select.svelte";
   import {
     activeProbeNames,
-    manifoldProbeRack,
     openDrawer,
     probeRack,
     setProbeSortMode,
   } from "../lib/stores.svelte";
   import type { ProbeSortMode } from "../lib/types";
 
-  // Computed derivations — Svelte 5 runes track both the underlying state
-  // and the function call's read of it via $derived's argument.
   const sortMode = $derived(probeRack.sortMode);
 
   // activeProbeNames() reads probeRack.active + entries + sortMode, all
-  // $state-tracked, so this $derived re-runs on any of those changes.
-  const sortedProbes = $derived(activeProbeNames());
+  // $state-tracked, so this $derived re-runs on any of those changes.  We
+  // then split it into the two families, preserving the sort order within
+  // each.
+  const sorted = $derived(activeProbeNames());
 
-  // Manifold probes are always sorted alphabetically — the vector
-  // sortMode ordering (value/change) doesn't apply across the two
-  // families.  They render at the top of the rack (above vector probes)
-  // since the bundled defaults auto-load here.
-  const sortedManifoldProbes = $derived.by(() => {
-    return [...manifoldProbeRack.entries.keys()].sort((a, b) =>
-      a.localeCompare(b),
-    );
-  });
+  const subspaceProbes = $derived.by(() =>
+    sorted.filter((n) => probeRack.entries.get(n)?.info.is_affine === true),
+  );
+  const manifoldProbes = $derived.by(() =>
+    sorted.filter((n) => probeRack.entries.get(n)?.info.is_affine === false),
+  );
 
-  // Show the manifold probe entry-point only when the server exposes
-  // the read-side routes (older saklas: ``unavailable`` is true and the
-  // button would 404 on click).
-  const manifoldAvailable = $derived(!manifoldProbeRack.unavailable);
-
-  const vectorCount = $derived(sortedProbes.length);
-  const manifoldCount = $derived(sortedManifoldProbes.length);
-  const count = $derived(vectorCount + manifoldCount);
+  const subspaceCount = $derived(subspaceProbes.length);
+  const manifoldCount = $derived(manifoldProbes.length);
+  const count = $derived(subspaceCount + manifoldCount);
 
   const SORT_OPTIONS: { value: ProbeSortMode; label: string }[] = [
     { value: "name", label: "name" },
@@ -76,8 +62,8 @@
 
   function onAddManifoldProbe(): void {
     // The manifolds drawer hosts the manifold-probe attach UI alongside
-    // the existing manifold-steering UI — symmetric with how
-    // VectorsDrawer hosts both steer/probe surfaces on every row.
+    // the existing manifold-steering UI — symmetric with how VectorsDrawer
+    // hosts both steer/probe surfaces on every row.
     openDrawer("manifolds", { mode: "probe" });
   }
 </script>
@@ -104,7 +90,13 @@
   </header>
 
   <div class="strips" class:is-empty={count === 0} role="list">
-    {#if count === 0}
+    {#if probeRack.unavailable}
+      <div class="empty">
+        <p class="empty-copy">
+          This server doesn't expose the read-side probe routes.
+        </p>
+      </div>
+    {:else if count === 0}
       <div class="empty">
         <p class="empty-copy">
           Probes watch concepts activate as the model generates.
@@ -115,28 +107,38 @@
           <button type="button" class="add" onclick={onAddProbe}>
             + add probe
           </button>
-          {#if manifoldAvailable}
-            <button
-              type="button"
-              class="add add-manifold"
-              onclick={onAddManifoldProbe}
-            >
-              + add manifold probe
-            </button>
-          {/if}
+          <button
+            type="button"
+            class="add add-manifold"
+            onclick={onAddManifoldProbe}
+          >
+            + add manifold probe
+          </button>
         </div>
       </div>
     {:else}
-      {#each sortedManifoldProbes as probe (probe)}
-        <div role="listitem">
-          <ManifoldProbeStrip name={probe} />
-        </div>
-      {/each}
-      {#each sortedProbes as probe (probe)}
-        <div role="listitem">
-          <ProbeStrip name={probe} />
-        </div>
-      {/each}
+      {#if subspaceCount > 0}
+        <h3 class="group-header subspace">subspace</h3>
+        {#each subspaceProbes as name (name)}
+          {@const entry = probeRack.entries.get(name)}
+          {#if entry}
+            <div role="listitem">
+              <SubspaceProbeCard {name} {entry} />
+            </div>
+          {/if}
+        {/each}
+      {/if}
+      {#if manifoldCount > 0}
+        <h3 class="group-header manifold">manifold</h3>
+        {#each manifoldProbes as name (name)}
+          {@const entry = probeRack.entries.get(name)}
+          {#if entry}
+            <div role="listitem">
+              <ManifoldProbeCard {name} {entry} />
+            </div>
+          {/if}
+        {/each}
+      {/if}
     {/if}
   </div>
 
@@ -150,16 +152,14 @@
       >
         + add probe
       </button>
-      {#if manifoldAvailable}
-        <button
-          type="button"
-          class="add add-manifold"
-          onclick={onAddManifoldProbe}
-          title="Attach a fitted manifold as a read-side probe"
-        >
-          + add manifold probe
-        </button>
-      {/if}
+      <button
+        type="button"
+        class="add add-manifold"
+        onclick={onAddManifoldProbe}
+        title="Attach a fitted manifold as a read-side probe"
+      >
+        + add manifold probe
+      </button>
     </div>
   {/if}
 </section>
@@ -168,8 +168,7 @@
   /* A flat section of the inspector panel — no border box, no own
    * background; it reads as the lower half of one flat panel, divided
    * from the steering section above by that section's border-bottom.
-   * Fixed chrome + one scrollable middle, matching SteeringRack.  The
-   * inspector constrains this rack, then only .strips may scroll. */
+   * Fixed chrome + one scrollable middle, matching SteeringRack. */
   .rack {
     display: flex;
     flex-direction: column;
@@ -195,8 +194,8 @@
     gap: var(--space-3);
     min-width: 0;
   }
-  /* Match SteeringRack's title — bold accent so the two racks look
-   * like siblings, not strangers. */
+  /* Match SteeringRack's title — bold accent so the two racks look like
+   * siblings, not strangers. */
   .title {
     font-weight: var(--weight-bold);
     color: var(--accent);
@@ -224,7 +223,7 @@
     min-width: 8em;
   }
 
-  /* Strips own the scroll inside the rack — with 26 auto-loaded probes
+  /* Strips own the scroll inside the rack — with many auto-loaded probes
    * the list overflows the rack viewport, but the actions row stays
    * anchored at the bottom. */
   .strips {
@@ -241,6 +240,27 @@
     align-items: center;
     justify-content: center;
   }
+
+  /* Light group sub-headers — mirror SteeringRack so the steer / probe
+   * racks read as one family. */
+  .group-header {
+    margin: 0;
+    padding: var(--space-1) 0 0;
+    font-size: var(--text-2xs);
+    font-weight: var(--weight-normal);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--fg-muted);
+  }
+  .group-header.subspace {
+    border-left: 2px solid var(--accent);
+    padding-left: var(--space-2);
+  }
+  .group-header.manifold {
+    border-left: 2px solid var(--accent-purple);
+    padding-left: var(--space-2);
+  }
+
   /* First-run teaching state — names the steer-vs-observe distinction the
    * two racks otherwise blur. */
   .empty {
@@ -296,9 +316,8 @@
   .add:hover {
     background: var(--accent-glow);
   }
-  /* Manifold launcher — purple-tinted to echo the manifold strip's
-   * accent so the probe-family colour stays consistent across the
-   * surfaces (strip, drawer row, rack action). */
+  /* Manifold launcher — purple-tinted to echo the manifold card's accent
+   * so the probe-family colour stays consistent across the surfaces. */
   .add-manifold {
     background: rgba(167, 139, 250, 0.10);
     color: var(--accent-purple);

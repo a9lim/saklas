@@ -19,9 +19,7 @@ import {
   apiSessions,
   apiVectors,
   apiProbes,
-  apiPacks,
   apiManifolds,
-  apiManifoldProbes,
   apiTree,
   ApiError,
   connectWs,
@@ -31,7 +29,6 @@ import type {
   LoomNodeJSON,
   LoomTreeJSON,
   ManifoldInfo,
-  ManifoldProbeInfo,
   SessionInfo,
   VectorInfo,
   WSClientMessage,
@@ -40,11 +37,10 @@ import type {
 import type {
   ChatTurn,
   GenStatus,
-  LocalPackInfo,
-  ManifoldAggregateJSON,
   ManifoldRackEntry,
-  ManifoldTokenReadingJSON,
   PendingAction,
+  ProbeInfo,
+  ProbeReadingJSON,
   ProbeRackEntry,
   ProbeSortMode,
   ProjectionSpec,
@@ -553,78 +549,75 @@ export function setManifoldEnabled(name: string, enabled: boolean): void {
   });
 }
 
-// =================================================== manifold probes ====
+// =========================================================== probes =====
 //
-// Read-side counterpart to manifold steering — peer to the vector probe
-// rack.  Each entry tracks one attached probe (metadata pulled from the
-// server's ``ManifoldProbeInfo``) plus per-token streaming state: the
-// EV-weighted ``fraction`` sparkline, the most-recent nearest-node tuple
-// for hover-readouts, and the aggregate-of-record from the final ``done``
-// event (``coords``, ``fraction_mean``, ``residual_mean``).
-//
-// For ≤2D ``BoxDomain`` manifolds we also accumulate a per-token
-// ``trajectory`` — each token's ``nearest[0]`` label looked up in the
-// probe row's ``node_coords`` and stored as a coord tuple, so the
-// inspector mini-map can render the inferred path through generation
-// alongside the final aggregate dot.  Higher-dimensional manifolds keep
-// the trajectory empty (we don't render a >2D path).
+// One unified read-side rack — every probe shape (a 2-node concept axis is
+// the rank-1 case, a discover / curved fit the rank-R case).  Each entry
+// carries the server ``ProbeInfo`` (with the ``is_affine`` flat-vs-curved
+// flag the cards classify on), a sparkline of the primary scalar, the
+// latest per-token ``reading`` + end-of-gen ``aggregate`` (one
+// ``ProbeReadingJSON`` shape), the most-recent ``nearest`` list, and — for
+// 2-D box probes — an inferred per-token ``trajectory`` for the mini-map.
 
-/** Per-probe live state.  Mirrors ``ProbeRackEntry`` in shape:
- *  ``sparkline`` for the fraction history, ``current`` / ``previous`` for
- *  the sort-by-change idiom, plus the richer manifold-specific fields. */
-export interface ManifoldProbeRackEntry {
-  /** Server-side row (metadata, domain, node labels + coords).  Used to
-   *  read intrinsic dim + domain shape for the inspector strip + minimap. */
-  info: ManifoldProbeInfo;
-  /** EV-weighted subspace fraction sparkline.  Capped at ``MAX_SPARKLINE``
-   *  like the vector probe rack. */
-  sparkline: number[];
-  current: number;
-  previous: number;
-  /** Most-recent per-token nearest list (descending similarity =
-   *  ascending distance).  Drives the inline "nearest <label>" readout
-   *  and the mini-map hover tooltip; empty until the first token. */
-  nearest: [string, number][];
-  /** End-of-gen aggregate the ``done`` event lands.  Null between gens
-   *  and during a stream's lifetime — set on ``done`` and cleared on the
-   *  next ``started`` so the inspector reverts to "live only". */
-  aggregate: ManifoldAggregateJSON | null;
-  /** Inferred per-token coord trajectory for 2D mini-map rendering.
-   *  Each entry is the looked-up authoring-space position of
-   *  ``nearest[0]`` for that token (the true per-token inverse is too
-   *  expensive for the hot path; ``nearest[0].coords`` is a faithful
-   *  approximation when the probe sits over a labeled manifold).  Empty
-   *  for non-2D manifolds and for probes whose ``node_coords`` are
-   *  absent (unfitted discover). */
-  trajectory: number[][];
-}
+const MAX_SPARKLINE = 60;
+const MAX_PROBE_TRAJECTORY = 240;
 
-export interface ManifoldProbeRack {
-  /** Attached probes keyed by registered name.  SvelteMap so set/delete
-   *  trip Svelte 5 reactivity in the inspector strip list. */
-  entries: Map<string, ManifoldProbeRackEntry>;
-  /** True when the server's manifold-probe list route 404s — older
-   *  server pre-dates the read side.  Hides the rack section. */
+export interface ProbeRackState {
+  /** Per-probe live state, keyed by registered probe name. */
+  entries: Map<string, ProbeRackEntry>;
+  sortMode: ProbeSortMode;
+  /** Attached probe names (every listed probe is attached/active). */
+  active: string[];
+  /** True when the server's probe route 404s (pre-read-side server). */
   unavailable: boolean;
   loading: boolean;
   error: string | null;
 }
 
-export const manifoldProbeRack: ManifoldProbeRack = $state({
+export const probeRack: ProbeRackState = $state({
   entries: new SvelteMap(),
+  // Alphabetical by default — matches the TUI's initial state.  Sort by
+  // value / change is a dropdown opt-in.
+  sortMode: "name",
+  active: [],
   unavailable: false,
   loading: false,
   error: null,
 });
 
-/** Look up ``node_coords`` for a label inside a probe row.  Returns
- *  ``null`` when the label is absent or the row carries no coords (an
- *  unfitted discover manifold).  Returns a shallow copy so callers can
- *  push into trajectories without aliasing the metadata. */
-function _lookupNodeCoords(
-  info: ManifoldProbeInfo,
-  label: string,
-): number[] | null {
+/** Primary scalar a probe's sparkline / sort tracks: the signed axis-0
+ *  coordinate for a flat (subspace) probe, the [0,1] subspace fraction for
+ *  a curved (manifold) probe. */
+function _primaryScalar(info: ProbeInfo, reading: ProbeReadingJSON): number {
+  if (info.is_affine) return reading.coords.length > 0 ? reading.coords[0] : 0;
+  return reading.fraction;
+}
+
+/** Per-layer column for the expanded layer strip: axis-0 ``coords_per_layer``
+ *  for a flat probe, ``fraction_per_layer`` for a curved one. */
+function _primaryPerLayer(
+  info: ProbeInfo,
+  reading: ProbeReadingJSON,
+): Record<string, number> {
+  if (!info.is_affine) return reading.fraction_per_layer ?? {};
+  const out: Record<string, number> = {};
+  for (const [layer, c] of Object.entries(reading.coords_per_layer ?? {})) {
+    out[layer] = Array.isArray(c) && c.length > 0 ? c[0] : 0;
+  }
+  return out;
+}
+
+/** A probe targets a 2-D-authored ``BoxDomain`` — the regime the mini-map
+ *  renders.  Higher-dim and sphere/custom probes attach but skip it. */
+function _probeIsMiniMapCandidate(info: ProbeInfo): boolean {
+  if (info.intrinsic_dim !== 2) return false;
+  const d = info.domain as { type?: string };
+  return d?.type === "box" && !!info.node_coords && info.node_coords.length > 0;
+}
+
+/** Look up ``node_coords`` for a label.  Null when absent or the row carries
+ *  no coords (unfitted discover).  Returns a copy so callers can push. */
+function _lookupNodeCoords(info: ProbeInfo, label: string): number[] | null {
   const coords = info.node_coords;
   if (!coords) return null;
   const idx = info.node_labels.indexOf(label);
@@ -634,196 +627,27 @@ function _lookupNodeCoords(
   return [...row];
 }
 
-/** A probe targets a 2D-authored ``BoxDomain`` manifold — the regime the
- *  inspector mini-map renders.  Higher-dim and sphere/custom domains
- *  still attach, they just don't get the mini-map. */
-function _isMiniMapCandidate(info: ManifoldProbeInfo): boolean {
-  if (info.intrinsic_dim !== 2) return false;
-  const d = info.domain as { type?: string };
-  return d?.type === "box" && !!info.node_coords && info.node_coords.length > 0;
-}
-
-const MAX_MANIFOLD_TRAJECTORY = 240;
-
-function _emptyManifoldProbeEntry(
-  info: ManifoldProbeInfo,
-): ManifoldProbeRackEntry {
+function _emptyProbeEntry(info: ProbeInfo): ProbeRackEntry {
   return {
     info,
     sparkline: [],
     current: 0,
     previous: 0,
-    nearest: [],
+    perLayer: {},
+    reading: null,
     aggregate: null,
+    nearest: [],
     trajectory: [],
   };
 }
 
-/** Fetch the attached-probe catalog.  Tolerates a 404 from an older
- *  server — flips ``unavailable`` and leaves the rack empty so the
- *  inspector section can hide cleanly. */
-export async function refreshManifoldProbeList(): Promise<void> {
-  manifoldProbeRack.loading = true;
-  try {
-    const r = await apiManifoldProbes.list();
-    const seen = new Set<string>();
-    for (const info of r.probes) {
-      seen.add(info.name);
-      const prev = manifoldProbeRack.entries.get(info.name);
-      if (prev) {
-        // Refresh metadata in place; preserve live sparkline / aggregate.
-        manifoldProbeRack.entries.set(info.name, { ...prev, info });
-      } else {
-        manifoldProbeRack.entries.set(info.name, _emptyManifoldProbeEntry(info));
-      }
-    }
-    // Drop entries the server no longer reports — they were detached
-    // out-of-band (e.g. via the TUI or another client).
-    for (const name of [...manifoldProbeRack.entries.keys()]) {
-      if (!seen.has(name)) manifoldProbeRack.entries.delete(name);
-    }
-    manifoldProbeRack.unavailable = false;
-    manifoldProbeRack.error = null;
-  } catch (e) {
-    if (e instanceof ApiError && e.status === 404) {
-      manifoldProbeRack.unavailable = true;
-      manifoldProbeRack.entries.clear();
-    } else {
-      manifoldProbeRack.error = e instanceof Error ? e.message : String(e);
-    }
-  } finally {
-    manifoldProbeRack.loading = false;
-  }
-}
-
-/** Attach a manifold probe.  ``selector`` rides the same ``[ns/]name``
- *  shape the steering ``%`` term consumes; ``name`` defaults to the
- *  selector server-side.  ``top_n`` caps the per-token nearest list. */
-export async function attachManifoldProbe(
-  selector: string,
-  opts: { name?: string; top_n?: number } = {},
-): Promise<ManifoldProbeInfo> {
-  const info = await apiManifoldProbes.attach({
-    selector,
-    name: opts.name,
-    top_n: opts.top_n,
-  });
-  const prev = manifoldProbeRack.entries.get(info.name);
-  if (prev) {
-    manifoldProbeRack.entries.set(info.name, { ...prev, info });
-  } else {
-    manifoldProbeRack.entries.set(info.name, _emptyManifoldProbeEntry(info));
-  }
-  return info;
-}
-
-/** Detach a probe by registered name.  Refreshes the catalog after — the
- *  server may have synthesized aliases the client doesn't know about. */
-export async function detachManifoldProbe(name: string): Promise<void> {
-  await apiManifoldProbes.detach(name);
-  manifoldProbeRack.entries.delete(name);
-}
-
-/** Reset all attached probes' streaming state at the start of a fresh
- *  generation.  Trajectory + aggregate + nearest live with one gen each;
- *  the sparkline carries across so the inspector shows the rolling
- *  history.  Called from the WS ``started`` handler. */
-export function resetManifoldProbeStreams(): void {
-  for (const [name, e] of manifoldProbeRack.entries) {
-    manifoldProbeRack.entries.set(name, {
-      ...e,
-      nearest: [],
-      aggregate: null,
-      trajectory: [],
-    });
-  }
-}
-
-/** Append one per-token reading per attached probe.  Drives the
- *  sparkline + nearest hover + (for 2D box manifolds) the trajectory.
- *  Tolerates the wire-shape's optional ``manifold_readings`` field being
- *  absent entirely. */
-export function updateManifoldProbesFromToken(
-  readings: Record<string, ManifoldTokenReadingJSON> | undefined,
-): void {
-  if (!readings) return;
-  for (const [name, reading] of Object.entries(readings)) {
-    const prev = manifoldProbeRack.entries.get(name);
-    if (!prev) continue;
-    const sparkline = prev.sparkline.slice();
-    sparkline.push(reading.fraction);
-    if (sparkline.length > MAX_SPARKLINE) {
-      sparkline.splice(0, sparkline.length - MAX_SPARKLINE);
-    }
-    const trajectory =
-      _isMiniMapCandidate(prev.info) && reading.nearest.length > 0
-        ? prev.trajectory.slice()
-        : prev.trajectory;
-    if (trajectory !== prev.trajectory) {
-      const label = reading.nearest[0][0];
-      const xy = _lookupNodeCoords(prev.info, label);
-      if (xy) {
-        trajectory.push(xy);
-        if (trajectory.length > MAX_MANIFOLD_TRAJECTORY) {
-          trajectory.splice(0, trajectory.length - MAX_MANIFOLD_TRAJECTORY);
-        }
-      }
-    }
-    manifoldProbeRack.entries.set(name, {
-      ...prev,
-      sparkline,
-      current: reading.fraction,
-      previous: prev.current,
-      nearest: reading.nearest,
-      trajectory,
-    });
-  }
-}
-
-/** Land the end-of-gen aggregate.  Drives the inspector's "fraction_mean"
- *  + "settled coords" readout and the bold final dot on the mini-map. */
-export function setManifoldProbeAggregates(
-  aggregates: Record<string, ManifoldAggregateJSON> | undefined,
-): void {
-  if (!aggregates) return;
-  for (const [name, agg] of Object.entries(aggregates)) {
-    const prev = manifoldProbeRack.entries.get(name);
-    if (!prev) continue;
-    manifoldProbeRack.entries.set(name, { ...prev, aggregate: agg });
-  }
-}
-
-// =========================================================== probes =====
-
-export interface ProbeRackState {
-  /** Per-probe sparkline + last-tick state.  Keys are probe names. */
-  entries: Map<string, ProbeRackEntry>;
-  sortMode: ProbeSortMode;
-  /** Mirrors sessionState.info?.probes — exposed separately so probe
-   * adds/removes refresh independently of full session info. */
-  active: string[];
-}
-
-export const probeRack: ProbeRackState = $state({
-  entries: new SvelteMap(),
-  // Alphabetical by default — matches the TUI's ``TraitPanel._sort_mode
-  // = "name"`` initial state.  Sort by live value / change is a
-  // dropdown opt-in (value is interesting when probes are firing but
-  // unstable as a default — order shifts every token).
-  sortMode: "name",
-  active: [],
-});
-
-/** Computed: probes sorted per the user's chosen sort mode.  Returns
- * a fresh array on each access; consumers use it as a $derived
- * read-only view. */
+/** Computed: probe names sorted per the chosen sort mode.  Fresh array each
+ *  access; consumers use it as a ``$derived`` read-only view. */
 export function activeProbeNames(): string[] {
   const arr = [...probeRack.active];
   if (probeRack.sortMode === "name") {
     arr.sort();
   } else if (probeRack.sortMode === "value") {
-    // Signed value desc — matches the TUI's trait_panel.py sort_key
-    // (line 191).  Magnitude sort is what "change" is for.
     arr.sort((a, b) => {
       const av = probeRack.entries.get(a)?.current ?? 0;
       const bv = probeRack.entries.get(b)?.current ?? 0;
@@ -841,124 +665,170 @@ export function activeProbeNames(): string[] {
   return arr;
 }
 
+/** Fetch the attached-probe catalog.  Tolerates a 404 from an older server
+ *  — flips ``unavailable`` and leaves the rack empty. */
 export async function refreshProbeList(): Promise<void> {
-  const r = await apiProbes.list();
-  probeRack.active = r.probes.filter((p) => p.active).map((p) => p.name);
-  // Drop any rack entries the server no longer reports active.
-  for (const name of [...probeRack.entries.keys()]) {
-    if (!probeRack.active.includes(name)) {
-      probeRack.entries.delete(name);
+  probeRack.loading = true;
+  try {
+    const r = await apiProbes.list();
+    const seen = new Set<string>();
+    for (const info of r.probes) {
+      seen.add(info.name);
+      const prev = probeRack.entries.get(info.name);
+      if (prev) {
+        // Refresh metadata in place; preserve live sparkline / aggregate.
+        probeRack.entries.set(info.name, { ...prev, info });
+      } else {
+        probeRack.entries.set(info.name, _emptyProbeEntry(info));
+      }
     }
-  }
-  // Seed entries for newly active probes.
-  for (const name of probeRack.active) {
-    if (!probeRack.entries.has(name)) {
-      probeRack.entries.set(name, {
-        sparkline: [],
-        current: 0,
-        previous: 0,
-        perLayer: {},
-      });
+    // Drop entries the server no longer reports (detached out-of-band).
+    for (const name of [...probeRack.entries.keys()]) {
+      if (!seen.has(name)) probeRack.entries.delete(name);
     }
+    probeRack.active = r.probes.map((p) => p.name);
+    probeRack.unavailable = false;
+    probeRack.error = null;
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 404) {
+      probeRack.unavailable = true;
+      probeRack.entries.clear();
+      probeRack.active = [];
+    } else {
+      probeRack.error = e instanceof Error ? e.message : String(e);
+    }
+  } finally {
+    probeRack.loading = false;
   }
 }
 
-export async function activateProbe(name: string): Promise<void> {
-  await apiProbes.activate(name);
-  await refreshProbeList();
-  // Auto-seed the highlight target when a probe is activated through
-  // the rack — matches the TUI's /probe behavior, which flips highlight
-  // on and points it at the new probe.
+/** Attach any probe shape by selector — the same ``[ns/]name[:variant]`` the
+ *  steering ``%`` term consumes; ``name`` defaults to the selector. */
+export async function attachProbe(
+  selector: string,
+  opts: { name?: string; top_n?: number } = {},
+): Promise<ProbeInfo> {
+  const info = await apiProbes.attach({
+    selector,
+    name: opts.name,
+    top_n: opts.top_n,
+  });
+  const prev = probeRack.entries.get(info.name);
+  if (prev) {
+    probeRack.entries.set(info.name, { ...prev, info });
+  } else {
+    probeRack.entries.set(info.name, _emptyProbeEntry(info));
+  }
+  if (!probeRack.active.includes(info.name)) {
+    probeRack.active = [...probeRack.active, info.name];
+  }
+  // Seed the highlight target when a probe is attached through the rack —
+  // matches the TUI pointing highlight at a fresh probe.
   if (highlightState.target === null) {
-    highlightState.target = name;
+    highlightState.target = info.name;
   }
+  return info;
 }
 
-export async function deactivateProbe(name: string): Promise<void> {
-  await apiProbes.deactivate(name);
-  await refreshProbeList();
-  if (highlightState.target === name) {
-    highlightState.target = null;
-  }
-  if (highlightState.compareTarget === name) {
-    highlightState.compareTarget = null;
-  }
+/** Detach a probe by registered name. */
+export async function detachProbe(name: string): Promise<void> {
+  await apiProbes.detach(name);
+  probeRack.entries.delete(name);
+  probeRack.active = probeRack.active.filter((n) => n !== name);
+  if (highlightState.target === name) highlightState.target = null;
+  if (highlightState.compareTarget === name) highlightState.compareTarget = null;
 }
 
 export function setProbeSortMode(mode: ProbeSortMode): void {
   probeRack.sortMode = mode;
 }
 
-/** Update probe rows from a streaming token's aggregate scores plus full
- * per-layer × per-probe map.  Each entry records:
- *   - ``current`` / ``sparkline`` — the magnitude-weighted aggregate
- *     (``||baked_L||``-weighted mean of per-layer cosines, the same value
- *     the TUI trait panel and the post-generation projected pass display).
- *     Reading from a single deepest-layer slice would freeze the meter at
- *     zero for any probe whose profile doesn't cover that layer — DLS
- *     routinely drops late layers for affect / social-stance probes — so
- *     the aggregate is the only honest read.
- *   - ``perLayer`` — the full per-layer column for that probe at this
- *     token, used by the expanded layer strip.
- *
- * Drops stale sparkline entries past ``MAX_SPARKLINE`` so memory stays
- * bounded across long sessions. */
-const MAX_SPARKLINE = 60;
-export function updateProbeFromScores(
-  perLayerScores: Record<string, Record<string, number>>,
-  aggregateScores: Record<string, number>,
-): void {
-  const layers = Object.keys(perLayerScores);
-  if (layers.length === 0) return;
-
-  // Pivot: gather per-probe column across all layers in one pass so the
-  // hot WS handler doesn't iterate L × P twice per token.
-  const probeNames = new Set<string>(Object.keys(aggregateScores));
-  const perProbeLayer: Record<string, Record<string, number>> = {};
-  for (const layer of layers) {
-    const row = perLayerScores[layer] ?? {};
-    for (const [name, val] of Object.entries(row)) {
-      probeNames.add(name);
-      (perProbeLayer[name] ??= {})[layer] = val;
-    }
-  }
-
-  // Reassign the entry on every score so the SvelteMap fires reactivity
-  // for whichever component reads ``current`` / ``sparkline`` / ``perLayer``
-  // — bare ``entry.current = val`` would update the in-memory object but
-  // the map's ``set``-tracked subscribers never see it, leaving probe
-  // strips frozen at zero throughout a generation.
-  for (const name of probeNames) {
-    const prev = probeRack.entries.get(name);
-    const val = aggregateScores[name] ?? 0;
-    const previous = prev?.current ?? 0;
-    const sparkline = prev ? prev.sparkline.slice() : [];
-    sparkline.push(val);
-    if (sparkline.length > MAX_SPARKLINE) {
-      sparkline.splice(0, sparkline.length - MAX_SPARKLINE);
-    }
+/** Reset per-gen streaming state at the start of a fresh generation.
+ *  Trajectory + aggregate + nearest live one gen each; the sparkline
+ *  carries across.  Called from the WS ``started`` handler. */
+export function resetProbeStreams(): void {
+  for (const [name, e] of probeRack.entries) {
     probeRack.entries.set(name, {
-      sparkline,
-      current: val,
-      previous,
-      perLayer: perProbeLayer[name] ?? {},
+      ...e,
+      nearest: [],
+      aggregate: null,
+      trajectory: [],
     });
   }
 }
 
-/** Snapshot the current per-probe means as the new "previous" baseline
- * — call after a generation lands so the next gen's deltas are computed
- * against the post-gen state, not mid-gen. */
+/** Append one per-token reading per attached probe (the unified
+ *  ``probe_readings`` WS channel).  Drives the sparkline + per-layer strip +
+ *  nearest readout + 2-D trajectory.  No-ops on undefined.
+ *
+ *  Reassigns each entry (rather than mutating in place) so the SvelteMap
+ *  fires reactivity — a bare ``entry.current = v`` would freeze probe strips
+ *  at zero through a whole generation. */
+export function updateProbesFromReadings(
+  readings: Record<string, ProbeReadingJSON> | undefined,
+): void {
+  if (!readings) return;
+  for (const [name, reading] of Object.entries(readings)) {
+    const prev = probeRack.entries.get(name);
+    if (!prev) continue;
+    const scalar = _primaryScalar(prev.info, reading);
+    const sparkline = prev.sparkline.slice();
+    sparkline.push(scalar);
+    if (sparkline.length > MAX_SPARKLINE) {
+      sparkline.splice(0, sparkline.length - MAX_SPARKLINE);
+    }
+    let trajectory = prev.trajectory;
+    if (_probeIsMiniMapCandidate(prev.info) && reading.nearest.length > 0) {
+      const xy = _lookupNodeCoords(prev.info, reading.nearest[0][0]);
+      if (xy) {
+        trajectory = prev.trajectory.slice();
+        trajectory.push(xy);
+        if (trajectory.length > MAX_PROBE_TRAJECTORY) {
+          trajectory.splice(0, trajectory.length - MAX_PROBE_TRAJECTORY);
+        }
+      }
+    }
+    probeRack.entries.set(name, {
+      ...prev,
+      sparkline,
+      current: scalar,
+      previous: prev.current,
+      perLayer: _primaryPerLayer(prev.info, reading),
+      reading,
+      nearest: reading.nearest,
+      trajectory,
+    });
+  }
+}
+
+/** Land the end-of-gen aggregate readings (the ``done`` event) — the settled
+ *  ``ProbeReading`` per probe. */
+export function setProbeAggregates(
+  aggregates: Record<string, ProbeReadingJSON> | undefined,
+): void {
+  if (!aggregates) return;
+  for (const [name, agg] of Object.entries(aggregates)) {
+    const prev = probeRack.entries.get(name);
+    if (!prev) continue;
+    probeRack.entries.set(name, {
+      ...prev,
+      aggregate: agg,
+      current: _primaryScalar(prev.info, agg),
+      perLayer: _primaryPerLayer(prev.info, agg),
+      nearest: agg.nearest,
+    });
+  }
+}
+
+/** Snapshot current per-probe scalars as the new "previous" baseline — call
+ *  after a gen lands so the next gen's deltas compute against post-gen state. */
 export function snapshotProbeBaseline(): void {
   for (const [name, e] of probeRack.entries) {
     probeRack.entries.set(name, { ...e, previous: e.current });
   }
 }
 
-/** Sentinel value the ProbeStrip layer strip falls back to when a probe
- * has been activated but no token has streamed yet.  Returned as a
- * computed default so consumers can switch on emptiness without a
- * separate ``hasReadings`` flag. */
+/** Sentinel for the layer strip when a probe has no token yet. */
 export const EMPTY_PER_LAYER: Readonly<Record<string, number>> = Object.freeze({});
 
 // ============================================================ chat ======
@@ -1772,36 +1642,6 @@ function buildSamplingPayload(): WSSampling | null {
   return Object.keys(payload).length > 0 ? payload : null;
 }
 
-// ============================================================ packs ======
-
-export const packsState: {
-  /** ``ns/name`` strings — kept for the consumers that just want a
-   *  set membership check.  Mirrors ``infos`` and is recomputed by
-   *  ``refreshPacks``. */
-  installed: string[];
-  /** Full ``LocalPackInfo`` rows — the unified VectorsDrawer reads
-   *  this reactively so a successful extract / delete reshuffles
-   *  rows between the "Extracted" and "Statements only" sections
-   *  without remount. */
-  infos: LocalPackInfo[];
-  loading: boolean;
-  error: string | null;
-} = $state({ installed: [], infos: [], loading: false, error: null });
-
-export async function refreshPacks(): Promise<void> {
-  packsState.loading = true;
-  try {
-    const r = await apiPacks.list();
-    packsState.infos = r.packs;
-    packsState.installed = r.packs.map((p) => `${p.namespace}/${p.name}`);
-    packsState.error = null;
-  } catch (e) {
-    packsState.error = e instanceof Error ? e.message : String(e);
-  } finally {
-    packsState.loading = false;
-  }
-}
-
 // ===================================================== pending actions ===
 
 export interface PendingActionsState {
@@ -2147,7 +1987,7 @@ function handleWsMessage(msg: WSServerMessage): void {
       liveTokenStream.thinkingTokens = [];
       // Manifold probes: drop the previous gen's trajectory + aggregate so
       // the inspector mini-map starts blank.  Sparkline carries across.
-      if (!abState.processingAb) resetManifoldProbeStreams();
+      if (!abState.processingAb) resetProbeStreams();
       // Loom: record the target node so tree-driven sync attaches the
       // streaming turn to the right active-path entry, and so the chat
       // panel's "streaming" highlight fires on the right turn.
@@ -2257,22 +2097,14 @@ function handleWsMessage(msg: WSServerMessage): void {
           }
         }
       }
-      // Update probe rack from the aggregate + per-layer × per-probe map.
-      // ``current`` / sparkline ride the magnitude-weighted aggregate (the
-      // TUI-equivalent scalar); the per-layer column feeds the expanded
-      // layer-strip view.  Skip during shadow runs so the rack stays
-      // anchored to the steered branch's signal.  The server emits
-      // ``per_layer_scores`` and ``scores`` together whenever probes are
-      // loaded, so both are present or both are absent.
-      if (msg.per_layer_scores && msg.scores && !abState.processingAb) {
-        updateProbeFromScores(msg.per_layer_scores, msg.scores);
-      }
-      // Manifold probes — per-token streaming reading.  Field is omitted
-      // entirely when no manifold probe is attached, so the helper
-      // no-ops on undefined.  Skip during shadow runs so the inspector
-      // stays anchored on the steered branch.
+      // Probe rack — unified per-token readings.  Every probe shape rides
+      // the one ``probe_readings`` channel (a 2-node concept axis is the
+      // rank-1 case); the field is omitted when no probe is attached, so the
+      // helper no-ops on undefined.  Skip shadow runs so the rack stays
+      // anchored to the steered branch.  ``msg.scores`` / ``per_layer_scores``
+      // above still feed highlight tinting + the token-drilldown heatmap.
       if (!abState.processingAb) {
-        updateManifoldProbesFromToken(msg.manifold_readings);
+        updateProbesFromReadings(msg.probe_readings);
       }
       return;
     }
@@ -2280,10 +2112,11 @@ function handleWsMessage(msg: WSServerMessage): void {
       adoptStreamingNode(msg.node_id);
       genStatus.active = false;
       genStatus.finishReason = msg.result?.finish_reason ?? "stop";
-      // Manifold probes — end-of-gen aggregate (coords + fraction_mean +
-      // residual + per-layer traces).  Same omitted-when-absent rule.
+      // Probe rack — end-of-gen aggregate (the settled ``ProbeReading`` per
+      // probe: coords / fraction / nearest / residual + per-layer traces).
+      // Same omitted-when-absent rule.
       if (!abState.processingAb) {
-        setManifoldProbeAggregates(msg.result?.manifold_readings);
+        setProbeAggregates(msg.result?.probe_readings);
       }
       const perToken = msg.result?.per_token_probes ?? [];
       const turn = _currentWriteTurn();
@@ -3557,16 +3390,13 @@ export async function bootstrap(): Promise<void> {
   attachPersistence();
   await Promise.allSettled([
     refreshVectorList(),
+    // Unified probe roster — every probe shape (flat subspace + curved
+    // manifold).  404 tolerated (pre-read-side server) → ``unavailable``.
     refreshProbeList(),
     refreshCorrelation(),
-    refreshPacks(),
     // Manifold catalog — 404 tolerated (server pre-dates the manifold
     // HTTP surface); ``refreshManifoldList`` flips ``unavailable``.
     refreshManifoldList(),
-    // Manifold probes — read-side counterpart; same 404-tolerated
-    // pattern, flips ``manifoldProbeRack.unavailable`` on an old
-    // server so the inspector section hides cleanly.
-    refreshManifoldProbeList(),
     // Server tree wins — fetch and reconcile.  404 is a quiet no-op
     // (server pre-loom); other failures surface via loomTree.error.
     refreshLoomTree(),

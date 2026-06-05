@@ -398,10 +398,15 @@
   // ============================================================ discover ===
 
   type DiscoverFitMode = "pca" | "spectral";
+  type DiscoverKind = "abstract" | "concrete";
   let discoverFitMode: DiscoverFitMode = $state("pca");
   let discoverConceptsText = $state("");
-  let discoverNScenarios = $state(9);
-  let discoverStatementsPerConcept = $state(5);
+  // A2 conversational corpus knobs: ``kind`` frames each concept's
+  // system prompt (abstract → "someone {c}", concrete → "{article} {c}");
+  // ``samplesPerPrompt`` is the in-character responses generated per
+  // shared baseline prompt.
+  let discoverKind: DiscoverKind = $state("abstract");
+  let discoverSamplesPerPrompt = $state(1);
   let discoverMaxDim = $state(8);
   let discoverVarThreshold = $state(0.70);
   let discoverKNN: number | null = $state(null);
@@ -437,7 +442,7 @@
     if (discoverConcepts.length < 2) {
       messages.push(
         `need >= 2 concepts (have ${discoverConcepts.length}) — ` +
-        "shared-scenario structure is meaningless with one",
+        "a manifold layout needs at least two nodes",
       );
     }
     const seen = new Set<string>();
@@ -451,9 +456,8 @@
         seen.add(s);
       }
     }
-    if (discoverNScenarios <= 0) messages.push("n_scenarios must be > 0");
-    if (discoverStatementsPerConcept <= 0) {
-      messages.push("statements_per_concept must be > 0");
+    if (discoverSamplesPerPrompt <= 0) {
+      messages.push("samples_per_prompt must be > 0");
     }
     if (discoverMaxDim < 1) messages.push("max_dim must be >= 1");
     if (
@@ -494,8 +498,8 @@
       name: nameSlug,
       description: description.trim(),
       concepts: discoverConcepts.map((c) => slug(c)),
-      n_scenarios: discoverNScenarios,
-      statements_per_concept: discoverStatementsPerConcept,
+      kind: discoverKind,
+      samples_per_prompt: discoverSamplesPerPrompt,
       fit_mode: discoverFitMode,
       hyperparams: buildDiscoverHyperparams(),
       force: discoverForce,
@@ -979,35 +983,29 @@
           </span>
         </label>
         <div class="grid2">
+          <div class="field">
+            <span class="label">kind</span>
+            <div class="radio-row">
+              <Radio bind:group={discoverKind} value="abstract" label="abstract" />
+              <Radio bind:group={discoverKind} value="concrete" label="concrete" />
+            </div>
+          </div>
           <label class="field">
-            <span class="label">n_scenarios</span>
+            <span class="label">samples per prompt</span>
             <NumberInput
-              value={discoverNScenarios}
+              value={discoverSamplesPerPrompt}
               min={1}
               step={1}
               oninput={(v) => {
-                if (v !== null) discoverNScenarios = v;
-              }}
-            />
-          </label>
-          <label class="field">
-            <span class="label">statements per concept × scenario</span>
-            <NumberInput
-              value={discoverStatementsPerConcept}
-              min={1}
-              step={1}
-              oninput={(v) => {
-                if (v !== null) discoverStatementsPerConcept = v;
+                if (v !== null) discoverSamplesPerPrompt = v;
               }}
             />
           </label>
         </div>
         <p class="dim-note">
-          total per-concept statements:
-          <strong>
-            {discoverNScenarios * discoverStatementsPerConcept}
-          </strong>
-          (across {discoverNScenarios} shared scenarios)
+          each concept answers the shared baseline prompts in character —
+          <strong>{discoverKind}</strong> framing,
+          <strong>{discoverSamplesPerPrompt}</strong> response(s) per prompt.
         </p>
       </section>
 

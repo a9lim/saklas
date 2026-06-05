@@ -24,7 +24,6 @@ export type Trigger =
 /** Tensor variant suffix from the shared steering grammar. */
 export type Variant =
   | "raw"
-  | "pca"
   | "sae"
   | `sae-${string}`
   | "role"
@@ -169,9 +168,10 @@ export interface ManifoldFitInfo {
   node_count: number;
   nodes_sha256?: string;
   /** Discriminator: ``authored`` for hand-placed coords, ``pca`` /
-   *  ``spectral`` for coords derived from per-node activations.  Older
-   *  servers may omit this; treat ``undefined`` as ``"authored"``. */
-  fit_mode?: "authored" | "pca" | "spectral";
+   *  ``spectral`` for coords derived from per-node activations, ``baked``
+   *  for a corpus-less precomputed direction.  Older servers may omit
+   *  this; treat ``undefined`` as ``"authored"``. */
+  fit_mode?: "authored" | "pca" | "spectral" | "baked";
   /** Discover-mode only.  ``max_dim``/``var_threshold`` for PCA;
    *  ``max_dim``/``k_nn``/``bandwidth``/``reference_layer`` for spectral. */
   hyperparams?: Record<string, number | string>;
@@ -207,9 +207,24 @@ export interface ManifoldInfo {
    *  current node geometry — the fit is stale and should be re-run. */
   stale: boolean;
   /** Discriminator: ``authored`` for hand-placed coords, ``pca`` /
-   *  ``spectral`` for coords derived per-model from activations.  Older
-   *  servers may omit this; treat ``undefined`` as ``"authored"``. */
-  fit_mode?: "authored" | "pca" | "spectral";
+   *  ``spectral`` for coords derived per-model from activations, ``baked``
+   *  for a corpus-less precomputed direction.  Older servers may omit
+   *  this; treat ``undefined`` as ``"authored"``. */
+  fit_mode?: "authored" | "pca" | "spectral" | "baked";
+  /** True for ``pca`` / ``spectral`` (coords derived per-model), false
+   *  for ``authored``.  Server-supplied; absent on older servers. */
+  is_discover?: boolean;
+  /** Category-valued tags off ``manifold.json`` (e.g. ``register`` /
+   *  ``cultural``).  Drives the concept-axis grouping in VectorsDrawer.
+   *  NOTE: the ``GET /manifolds`` list serializer currently omits this
+   *  (``manifold_summary`` doesn't emit ``tags``), so it's usually
+   *  absent on the wire today — grouping degrades to "Other" until the
+   *  server adds the field. */
+  tags?: string[];
+  /** Resting steering coefficient hint for a concept axis.  Read by
+   *  ``recommendedAlpha`` (defaults to 0.5 when absent).  Not currently
+   *  emitted by the list serializer — provenance for a future field. */
+  recommended_alpha?: number;
   /** Discover-mode only: the knobs the fit (will) use.  Empty / absent
    *  on authored folders.  PCA accepts ``max_dim`` / ``var_threshold``;
    *  spectral accepts ``max_dim`` / ``k_nn`` / ``bandwidth``. */
@@ -332,16 +347,20 @@ export interface CreateDiscoverManifoldRequest {
 /** Body for POST /saklas/v1/manifolds/generate.
  *
  *  LLM-author a discover-mode manifold from a flat concept list: the
- *  server runs ``SaklasSession.generate_concept_statements`` (shared
- *  scenarios + per-concept statements) and writes a fresh discover
- *  folder ready for ``POST .../fit``. */
+ *  server runs ``SaklasSession.generate_responses`` (A2 conversational
+ *  extraction — each concept answers the shared baseline prompts in
+ *  character, one corpus per node) and writes a fresh discover folder
+ *  ready for ``POST .../fit``. */
 export interface GenerateManifoldRequest {
   namespace?: string;
   name: string;
   description?: string;
   concepts: string[];
-  n_scenarios?: number;
-  statements_per_concept?: number;
+  /** Per-concept system-prompt framing: ``abstract`` → "someone {c}",
+   *  ``concrete`` → "{article} {c}".  Default abstract. */
+  kind?: "abstract" | "concrete";
+  /** In-character responses generated per shared baseline prompt. */
+  samples_per_prompt?: number;
   fit_mode?: "pca" | "spectral";
   hyperparams?: Record<string, number | string>;
   force?: boolean;
@@ -391,7 +410,6 @@ export interface ExtractRequest {
    * or a {pairs: [{positive, negative}, ...]} bundle. */
   source?: unknown;
   baseline?: string | null;
-  method?: "dim" | "pca" | null;
   dls?: boolean | null;
   sae?: string | null;
   sae_revision?: string | null;
@@ -433,21 +451,6 @@ export interface MergeVectorRequest {
 
 export type MergeVectorResponse = VectorInfo;
 
-/** Body for POST /sessions/{id}/vectors/clone — wraps the clone CLI. */
-export interface CloneVectorRequest {
-  name: string;
-  corpus_path: string;
-  n_pairs?: number;
-  seed?: number;
-  baseline?: string | null;
-}
-
-export interface CloneVectorResponse {
-  canonical: string;
-  profile: VectorInfo;
-  progress: string[];
-}
-
 /** Output of GET /sessions/{id}/vectors/{name}/diagnostics — per-layer
  * ``||baked||`` magnitudes + bucket histogram + (optional) probe-quality
  * diagnostics from ``saklas vector why``.  Resolves either steering
@@ -479,25 +482,14 @@ export interface VectorDiagnosticsResponse {
 
 // ----------------------------------------------------- probes --
 
+/** One attached probe — any rank.  The unified read-side row the server's
+ *  ``probe_routes._probe_info`` emits (the pre-4.0 split of vector probes vs
+ *  manifold probes collapsed onto one ``/probes`` collection).  ``is_affine``
+ *  is the flat-vs-curved discriminator the client classifies on: flat probes
+ *  (a 2-node concept axis through the rank-8 personas fan) are the *subspace*
+ *  family, curved fits the *manifold* family. */
 export interface ProbeInfo {
-  name: string;
-  active: boolean;
-  layers: number[];
-}
-
-export interface ProbeListResponse {
-  probes: ProbeInfo[];
-}
-
-// ------------------------------------------------- manifold probes --
-
-/** Row returned by the manifold-probes list / create routes.  Carries
- *  enough manifold geometry for the client to render the node layout
- *  (labels + intrinsic dim + domain spec) without re-fetching the source
- *  artifact.  Mirrors ``saklas.core.monitor.ManifoldProbeInfo``. */
-export interface ManifoldProbeInfo {
-  /** Registered probe name (defaults to the selector when ``name`` was
-   *  omitted at attach time). */
+  /** Registered probe name (defaults to the selector at attach time). */
   name: string;
   /** Underlying manifold display name (``ns/name`` or bare). */
   manifold: string;
@@ -505,70 +497,58 @@ export interface ManifoldProbeInfo {
   top_n: number;
   /** Sorted ascending list of layer indices the probe reads from. */
   layers: number[];
-  /** Authoring node labels.  Aligned with the manifold's ``node_coords``
-   *  when the geometry is authored / fitted. */
+  /** Authoring node labels.  Aligned with ``node_coords`` when fitted. */
   node_labels: string[];
   node_count: number;
-  /** Manifold domain spec — same shape as ``ManifoldInfo.domain``.  May
-   *  be ``{}`` for an unfitted discover manifold (the server reports
-   *  ``intrinsic_dim = 0`` then). */
+  /** Manifold domain spec — same shape as ``ManifoldInfo.domain``.  ``{}``
+   *  for an unfitted discover manifold (``intrinsic_dim = 0`` then). */
   domain: ManifoldDomain | Record<string, never>;
   intrinsic_dim: number;
-  /** ``"raw"`` for plain activation space, ``"sae-<release>"`` for an
-   *  SAE-reconstructed manifold. */
+  /** ``"raw"`` for plain activation space, ``"sae-<release>"`` for SAE. */
   feature_space: string;
-  /** Per-node authoring coordinates the server attached to the probe row.
-   *  Aligned with ``node_labels``; populated when the manifold carries a
-   *  per-model layout (authored or fitted-discover).  Empty / absent on
-   *  unfitted discover probes. */
-  node_coords?: number[][];
+  /** Flat (affine) ⇒ subspace family; curved ⇒ manifold family. */
+  is_affine: boolean;
+  /** Per-node authoring/display layout (K, n), aligned with ``node_labels``.
+   *  Backs the mini-map node dots + per-token trajectory lookup.  ``null``
+   *  on an unfitted discover manifold (no per-model layout yet). */
+  node_coords?: number[][] | null;
 }
 
-export interface ManifoldProbeListResponse {
-  probes: ManifoldProbeInfo[];
+export interface ProbeListResponse {
+  probes: ProbeInfo[];
 }
 
-export interface AttachManifoldProbeRequest {
+/** Body for ``POST /saklas/v1/sessions/{id}/probes`` — attach any probe
+ *  shape by selector (the same ``[ns/]name[:variant]`` the ``%`` steering
+ *  term consumes). */
+export interface ProbeRequest {
   selector: string;
   name?: string;
   top_n?: number;
 }
 
-/** Per-token streaming reading for one manifold probe.  Mirrors
- *  ``ManifoldTokenReading.to_dict()``.  ``fraction`` is the
- *  EV-weighted subspace-fraction across layers; ``nearest`` is the
- *  top-N nearest-node list as ``(label, distance)`` pairs sorted
- *  ascending. */
-export interface ManifoldTokenReadingJSON {
+// ------------------------------------------------- probe readings --
+
+/** One probe's reading — the single wire shape for *both* the per-token
+ *  stream and the end-of-gen aggregate (the aggregate is the reading pooled
+ *  at the last-content token).  Mirrors
+ *  ``saklas.core.results.ProbeReading.to_dict()``.  ``coords`` is the
+ *  domain-frame position (signed pole-normalized axis-0 at rank-1);
+ *  ``residual`` is ``0`` for a flat (subspace) fit and the normalized
+ *  off-surface distance for a curved (manifold) fit.  Per-layer maps are
+ *  string-keyed by layer index. */
+export interface ProbeReadingJSON {
   fraction: number;
   nearest: [string, number][];
-}
-
-/** End-of-generation aggregate reading for one manifold probe.  Mirrors
- *  ``ManifoldAggregate.to_dict()``.  ``coords`` is the EV-weighted mean
- *  authoring-space position recovered by ``invert_parameterization``;
- *  ``coords_per_layer`` exposes the same per-layer trace. */
-export interface ManifoldAggregateJSON {
-  fraction_mean: number;
-  fraction_per_layer: Record<string, number>;
-  nearest: [string, number][];
   coords: number[];
+  residual: number;
+  fraction_per_layer: Record<string, number>;
   coords_per_layer: Record<string, number[]>;
-  residual_mean: number;
   residual_per_layer: Record<string, number>;
 }
 
 export interface ProbeDefaultsResponse {
   defaults: string[];
-}
-
-export interface ScoreProbeRequest {
-  text: string;
-  probes?: string[] | null;
-}
-
-export interface ScoreProbeResponse {
-  readings: Record<string, number>;
 }
 
 // ----------------------------------------------------- correlation --
@@ -593,70 +573,6 @@ export interface PairwiseCompareResponse {
   layers_b: number[];
   matrix: (number | null)[][];
   model: string | null;
-}
-
-// ----------------------------------------------------- packs --
-
-export interface LocalPackInfo {
-  name: string;
-  namespace: string;
-  source: "bundled" | "local" | string;
-  description?: string;
-  tags?: string[];
-  layers?: number[];
-  has_tensor?: boolean;
-  has_sae?: boolean;
-  variants?: string[];
-  /** Loose passthrough for fields the server adds later. */
-  [key: string]: unknown;
-}
-
-export interface PackListResponse {
-  packs: LocalPackInfo[];
-}
-
-export interface RemotePackInfo {
-  repo_id: string;
-  description?: string;
-  downloads?: number;
-  likes?: number;
-  tags?: string[];
-  last_modified?: string;
-  /** Loose passthrough — HF rows have many optional fields. */
-  [key: string]: unknown;
-}
-
-export interface PackSearchResponse {
-  query: string;
-  results: RemotePackInfo[];
-}
-
-export interface InstallPackRequest {
-  /** HF coord (``owner/repo``) or local folder path. */
-  target: string;
-  /** Override the install namespace (``-a NS/N`` in the CLI).  Wire field
-   * is ``as`` (Python keyword in code, plain key in JSON). */
-  as?: string;
-  force?: boolean;
-  /** Statements-only install (skip per-model tensor pull). */
-  statements_only?: boolean;
-}
-
-export interface InstallPackResponse {
-  target: string;
-  installed_at: string;
-  statements_only: boolean;
-}
-
-export interface DeletePackResponse {
-  namespace: string;
-  name: string;
-  /** ``"bundled"`` / ``"local"`` / ``"hf://..."``.  Drives the
-   *  toast wording — bundled concepts re-materialize on restart. */
-  source: string;
-  removed: number;
-  /** Bundled concepts respawn on next session init. */
-  rematerializes_on_restart: boolean;
 }
 
 // ----------------------------------------------------- traits SSE --
@@ -807,11 +723,12 @@ export interface WSTokenEvent {
   /** Loom: node id this token belongs to.  Routes the token to the right
    * sibling render during n-way regen.  Optional. */
   node_id?: string | null;
-  /** Per-attached-probe manifold reading for this token.  Keys are probe
-   *  names; values carry ``fraction`` (EV-weighted subspace fraction) and
-   *  ``nearest`` (top-N node-label distances).  Field is omitted entirely
-   *  when no manifold probe is attached, so legacy clients see no change. */
-  manifold_readings?: Record<string, ManifoldTokenReadingJSON>;
+  /** Per-attached-probe reading for this token — every probe shape (a
+   *  2-node concept axis is the rank-1 case).  Keys are probe names; values
+   *  are the full ``ProbeReadingJSON``.  Omitted entirely when no probe is
+   *  attached, so clients read it defensively.  Distinct from ``scores``
+   *  (the magnitude-weighted axis-0 scalar the highlight tint still uses). */
+  probe_readings?: Record<string, ProbeReadingJSON>;
 }
 
 export interface WSDoneResultPerToken {
@@ -833,11 +750,11 @@ export interface WSDoneResult {
    *  response span (thinking tokens excluded by construction).  Null when
    *  logprob capture wasn't live (replay / no on_token consumer). */
   mean_logprob?: number | null;
-  /** End-of-generation per-attached-probe aggregate.  Keys are probe
-   *  names; values carry ``fraction_mean``, ``coords``, ``nearest`` and
-   *  the per-layer traces.  Field is omitted entirely when no manifold
-   *  probe is attached — read defensively. */
-  manifold_readings?: Record<string, ManifoldAggregateJSON>;
+  /** End-of-generation per-attached-probe aggregate — the same
+   *  ``ProbeReadingJSON`` shape as the per-token stream (the aggregate is the
+   *  reading pooled at the last-content token).  Keys are probe names.
+   *  Omitted entirely when no probe is attached — read defensively. */
+  probe_readings?: Record<string, ProbeReadingJSON>;
 }
 
 export interface WSDoneEvent {
@@ -1248,14 +1165,32 @@ export interface StatementPair {
 export type ProbeSortMode = "name" | "value" | "change";
 
 export interface ProbeRackEntry {
-  /** Last N values for the sparkline — ring-buffer-ish, capped client-side. */
+  /** Server-side row — metadata, domain, node layout, and the ``is_affine``
+   *  flat-vs-curved flag that selects the subspace vs manifold card. */
+  info: ProbeInfo;
+  /** Last N values of the primary scalar for the sparkline — ring-buffer-ish,
+   *  capped client-side.  Primary scalar is the signed axis-0 ``coords[0]``
+   *  for a subspace (flat) probe, the ``fraction`` for a manifold (curved). */
   sparkline: number[];
   current: number;
   previous: number;
   /** Most recent token's per-layer readings for *this* probe.  Layer-key
-   * strings keep the wire shape; ProbeStrip sorts numerically.  Empty
-   * until the first ``token`` event with ``per_layer_scores`` lands. */
+   * strings keep the wire shape; the card sorts numerically.  For a subspace
+   * probe this is axis-0 ``coords_per_layer``; for a manifold, ``fraction_per_layer``. */
   perLayer: Record<string, number>;
+  /** Latest full per-token reading (coords / fraction / nearest / residual +
+   *  per-layer traces).  Null until the first ``token`` event lands. */
+  reading: ProbeReadingJSON | null;
+  /** End-of-gen aggregate the ``done`` event lands — the settled reading.
+   *  Null between gens; set on ``done``, cleared on the next ``started``. */
+  aggregate: ProbeReadingJSON | null;
+  /** Most-recent per-token nearest list (ascending distance).  Drives the
+   *  inline nearest readout + mini-map hover; empty until the first token. */
+  nearest: [string, number][];
+  /** Inferred per-token coord trajectory for 2-D box mini-map rendering —
+   *  each token's ``nearest[0]`` looked up in ``info.node_coords``.  Empty
+   *  for non-2-D / sphere / custom probes and unfitted-discover (no coords). */
+  trajectory: number[][];
 }
 
 // ----------------------------------------------------- gen status --
@@ -1357,9 +1292,7 @@ export type DrawerName =
   | "save_conversation"
   | "load_conversation"
   | "compare"
-  | "pack"
   | "merge"
-  | "clone"
   | "system_prompt"
   | "token_drilldown"
   | "correlation"

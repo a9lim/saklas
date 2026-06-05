@@ -110,7 +110,6 @@
   function isVariant(raw: string): raw is Variant {
     return (
       raw === "raw" ||
-      raw === "pca" ||
       raw === "sae" ||
       raw === "role" ||
       raw === "from" ||
@@ -221,7 +220,7 @@
       <input
         type="text"
         class="variant-input"
-        placeholder="raw | pca | sae-* | role-* | from-*"
+        placeholder="raw | sae-* | role-* | from-*"
         bind:value={variantInput}
       />
       {#if variantInput.trim() && !isVariant(variantInput.trim())}

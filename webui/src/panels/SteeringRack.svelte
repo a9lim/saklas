@@ -1,31 +1,60 @@
 <script lang="ts">
-  // The steering rack — section header, one VectorStrip per loaded
-  // vector, one ManifoldStrip per racked manifold (both alphabetized
-  // for stable ordering), and the + add steering / + add manifold
-  // action buttons.
+  // The steering rack — two harmonised groups split on geometry, not
+  // artifact type:
+  //
+  //   subspace (flat) — every vectorRack entry (2-node bipolar) plus every
+  //     manifoldRack entry whose catalog fit_mode is pca / baked (a flat
+  //     affine subspace, e.g. personas).
+  //   manifold (curved) — the remaining manifoldRack entries (e.g. pad).
+  //
+  // Every row wears the same RackCard chrome; the family is signalled only
+  // by accent colour + marker glyph.  Light group sub-headers; an empty
+  // group hides.  Footer keeps the + add steering / + add manifold entry
+  // points and their drawer targets.
 
-  import VectorStrip from "./VectorStrip.svelte";
-  import ManifoldStrip from "./ManifoldStrip.svelte";
-  import { vectorRack, manifoldRack, openDrawer } from "../lib/stores.svelte";
+  import VectorSteerCard from "./rack/VectorSteerCard.svelte";
+  import ManifoldSteerCard from "./rack/ManifoldSteerCard.svelte";
+  import {
+    vectorRack,
+    manifoldRack,
+    manifoldByName,
+    openDrawer,
+  } from "../lib/stores.svelte";
 
-  // Reactive entries — sorted alphabetically by name for stable order.
-  // The Map iteration order tracks insertion which makes the rack
-  // visually jump around as vectors land out of order; sorting fixes it.
-  const sortedEntries = $derived.by(() => {
+  // Vectors are always subspace.  Alphabetized for stable order — Map
+  // iteration tracks insertion which makes the rack jump around.
+  const sortedVectors = $derived.by(() => {
     const arr = [...vectorRack.entries.entries()];
     arr.sort((a, b) => a[0].localeCompare(b[0]));
     return arr;
   });
 
-  const sortedManifolds = $derived.by(() => {
-    const arr = [...manifoldRack.entries.entries()];
+  /** A manifold rack entry is subspace iff its catalog fit_mode is flat
+   *  (pca / baked); otherwise it's the curved manifold family. */
+  function isFlatManifold(name: string): boolean {
+    const fm = manifoldByName(name)?.fit_mode;
+    return fm === "pca" || fm === "baked";
+  }
+
+  const flatManifolds = $derived.by(() => {
+    const arr = [...manifoldRack.entries.entries()].filter(([n]) =>
+      isFlatManifold(n),
+    );
     arr.sort((a, b) => a[0].localeCompare(b[0]));
     return arr;
   });
 
-  const vectorCount = $derived(sortedEntries.length);
-  const manifoldCount = $derived(sortedManifolds.length);
-  const count = $derived(vectorCount + manifoldCount);
+  const curvedManifolds = $derived.by(() => {
+    const arr = [...manifoldRack.entries.entries()].filter(
+      ([n]) => !isFlatManifold(n),
+    );
+    arr.sort((a, b) => a[0].localeCompare(b[0]));
+    return arr;
+  });
+
+  const subspaceCount = $derived(sortedVectors.length + flatManifolds.length);
+  const manifoldCount = $derived(curvedManifolds.length);
+  const count = $derived(subspaceCount + manifoldCount);
 </script>
 
 <section class="rack" aria-label="Steering rack">
@@ -65,12 +94,21 @@
         </div>
       </div>
     {:else}
-      {#each sortedEntries as [name, entry] (name)}
-        <VectorStrip {name} {entry} />
-      {/each}
-      {#each sortedManifolds as [name, entry] (name)}
-        <ManifoldStrip {name} {entry} />
-      {/each}
+      {#if subspaceCount > 0}
+        <h3 class="group-header subspace">subspace</h3>
+        {#each sortedVectors as [name, entry] (name)}
+          <VectorSteerCard {name} {entry} />
+        {/each}
+        {#each flatManifolds as [name, entry] (name)}
+          <ManifoldSteerCard {name} {entry} />
+        {/each}
+      {/if}
+      {#if manifoldCount > 0}
+        <h3 class="group-header manifold">manifold</h3>
+        {#each curvedManifolds as [name, entry] (name)}
+          <ManifoldSteerCard {name} {entry} />
+        {/each}
+      {/if}
     {/if}
   </div>
 
@@ -100,9 +138,7 @@
   /* A flat section of the inspector panel — no border box, no own
    * background; the only chrome is the border-bottom hairline dividing
    * it from the probe section below.  Fixed chrome + one scrollable
-   * middle.  This deliberately uses flex instead of grid: the generated
-   * ``.strips`` element was able to grow past the rack in some viewport
-   * sizes, hiding the apply-vector controls. */
+   * middle. */
   .rack {
     display: flex;
     flex-direction: column;
@@ -144,7 +180,7 @@
   }
 
   /* Strips own the scroll — overflow at the rack level would push the
-   * actions row off-screen when vectors pile up. */
+   * actions row off-screen when terms pile up. */
   .strips {
     display: flex;
     flex-direction: column;
@@ -159,8 +195,30 @@
     align-items: center;
     justify-content: center;
   }
+
+  /* Light group sub-headers — name the geometry family without competing
+   * with the section title.  Accent-coded to match the cards' left
+   * stripe so the eye links header → rows. */
+  .group-header {
+    margin: 0;
+    padding: var(--space-1) 0 0;
+    font-size: var(--text-2xs);
+    font-weight: var(--weight-normal);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--fg-muted);
+  }
+  .group-header.subspace {
+    border-left: 2px solid var(--accent);
+    padding-left: var(--space-2);
+  }
+  .group-header.manifold {
+    border-left: 2px solid var(--accent-purple);
+    padding-left: var(--space-2);
+  }
+
   /* First-run teaching state — one line of plain copy above the primary
-   * action.  Replaces the bare "no active steering vectors". */
+   * action. */
   .empty {
     display: flex;
     flex-direction: column;
@@ -219,8 +277,8 @@
   .add-steering:hover {
     background: var(--accent-glow);
   }
-  /* Manifold launcher — purple-tinted to echo the manifold strip's
-   * accent so the two surfaces read as one feature. */
+  /* Manifold launcher — purple-tinted to echo the manifold card's accent
+   * so the two surfaces read as one feature. */
   .add-manifold {
     flex: 1 1 0;
     background: rgba(167, 139, 250, 0.10);

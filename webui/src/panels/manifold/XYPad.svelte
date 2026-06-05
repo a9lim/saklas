@@ -20,7 +20,7 @@
     coords: number[];
     onchange: (coords: number[]) => void;
     /** When true, the pad / sliders display the coords but reject
-     *  input — used by ``ManifoldStrip`` for label-form terms, where
+     *  input — used by ``ManifoldSteerCard`` for label-form terms, where
      *  the engine takes the position from the named node and the
      *  surfaced coords would be ignored.  Keeping the controls
      *  visible (instead of hiding them) gives the user a read-out of
