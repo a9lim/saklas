@@ -476,6 +476,7 @@ export function addManifoldToRack(name: string): void {
   const coords = info ? manifoldCentroid(info) : [];
   manifoldRack.entries.set(name, {
     blend: 0.5,
+    onto: 0,
     coords,
     label: null,
     trigger: "BOTH",
@@ -491,6 +492,15 @@ export function setManifoldBlend(name: string, blend: number): void {
   enqueueOrApply(`manifold blend ${name} ${blend.toFixed(3)}`, () => {
     const e = manifoldRack.entries.get(name);
     if (e) manifoldRack.entries.set(name, { ...e, blend });
+  });
+}
+
+/** Set the curved-manifold ``onto`` collapse fraction (the second
+ *  coefficient).  Curved-only; vacuous for flat/affine terms. */
+export function setManifoldOnto(name: string, onto: number): void {
+  enqueueOrApply(`manifold onto ${name} ${onto.toFixed(3)}`, () => {
+    const e = manifoldRack.entries.get(name);
+    if (e) manifoldRack.entries.set(name, { ...e, onto });
   });
 }
 

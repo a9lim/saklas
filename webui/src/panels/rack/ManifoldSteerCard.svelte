@@ -18,6 +18,7 @@
   import {
     manifoldByName,
     setManifoldBlend,
+    setManifoldOnto,
     setManifoldCoords,
     setManifoldLabel,
     setManifoldTrigger,
@@ -83,6 +84,11 @@
   function onBlendInput(v: number): void {
     if (!Number.isFinite(v)) return;
     setManifoldBlend(name, v);
+  }
+
+  function onOntoInput(v: number): void {
+    if (!Number.isFinite(v)) return;
+    setManifoldOnto(name, v);
   }
 
   function onCoordsChange(coords: number[]): void {
@@ -234,7 +240,24 @@
         />
         <span class="along-val" title="along fraction">{entry.blend.toFixed(2)}</span>
       </div>
-      <!-- TODO(onto): curved-only second coefficient, pending the along,onto grammar slice -->
+      {#if !flat}
+        <!-- onto — curved-only second coefficient: collapse the off-surface
+             in-subspace residual onto the manifold.  Vacuous for flat/affine
+             terms, so the row is hidden there. -->
+        <div class="along-row">
+          <span class="along-label">onto</span>
+          <Slider
+            value={entry.onto}
+            min={0}
+            max={1}
+            step={0.05}
+            oninput={onOntoInput}
+            ariaLabel="onto fraction for {name}"
+            title="onto — collapse the off-surface residual onto the manifold (curved only)"
+          />
+          <span class="along-val" title="onto fraction">{entry.onto.toFixed(2)}</span>
+        </div>
+      {/if}
     {:else}
       <p class="missing">
         manifold metadata unavailable — coordinates are still applied.

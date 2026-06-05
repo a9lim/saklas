@@ -158,7 +158,13 @@ function formatManifoldTerm(name: string, entry: ManifoldRackEntry): string {
     ? entry.label
     : entry.coords.map((c) => formatCoeff(c)).join(",");
   const selector = `${name}%${position}`;
-  return `${formatCoeff(entry.blend)} ${selector}${formatTriggerSuffix(entry.trigger)}`;
+  // Coefficient slot: ``along`` alone, or ``along,onto`` when onto is set
+  // (> 0) — the curved-manifold residual-collapse fraction.
+  const coeff =
+    (entry.onto ?? 0) > 0
+      ? `${formatCoeff(entry.blend)},${formatCoeff(entry.onto)}`
+      : formatCoeff(entry.blend);
+  return `${coeff} ${selector}${formatTriggerSuffix(entry.trigger)}`;
 }
 
 // ----------------------------------------------- lexer -------------------
@@ -298,7 +304,11 @@ interface ManifoldTerm {
   kind: "manifold";
   /** Display name of the manifold (``ns/name`` or bare ``name``). */
   name: string;
+  /** ``along`` — the first (and representative) coefficient. */
   coeff: number;
+  /** ``onto`` — the second coefficient when the slot was a comma-run
+   *  (``along,onto``); null for a single-coeff term. */
+  onto: number | null;
   coords: number[] | null;
   label: string | null;
   trigger: string | null;
@@ -352,9 +362,28 @@ class Parser {
   private term(sign: number): Term {
     let explicit = false;
     let coeff = sign * DEFAULT_COEFF;
+    // The coefficient slot is a comma-run of <= 2 (along[,onto]); the second
+    // value is the curved-manifold ``onto``.  Lexically unambiguous from the
+    // post-``%`` position commas — this run precedes the selector.  Each
+    // value carries the term's leading sign (mirrors the engine grammar).
+    const coeffs: number[] = [coeff];
     if (this.peek().kind === "NUM") {
       coeff = sign * (this.consume().value as number);
       explicit = true;
+      coeffs[0] = coeff;
+      while (this.peek().kind === "COMMA") {
+        this.consume();
+        coeffs.push(sign * this.signedNum());
+        if (coeffs.length > 2) {
+          const bad = this.peek(-1);
+          throw new ExpressionParseError(
+            "a manifold coefficient slot takes at most 2 comma-separated " +
+              "values (along, onto)",
+            this.src,
+            bad.col,
+          );
+        }
+      }
       if (this.peek().kind === "STAR") this.consume();
     }
     let ablation = false;
@@ -393,12 +422,20 @@ class Parser {
         kind: "manifold",
         name: atomKey(base),
         coeff,
+        onto: coeffs.length > 1 ? coeffs[1] : null,
         coords,
         label,
         trigger,
       };
     }
 
+    if (coeffs.length > 1) {
+      throw new ExpressionParseError(
+        "a comma coefficient (along,onto) is only valid on a manifold '%' term",
+        this.src,
+        base.col,
+      );
+    }
     const selector = this.selector(base);
     const trigger = this.optTrigger();
     return {
@@ -566,6 +603,7 @@ export function parseExpression(expr: string): ParsedExpression {
       // tuple, ``label`` is null.
       manifolds.set(term.name, {
         blend: term.coeff,
+        onto: term.onto ?? 0,
         coords: term.coords ?? [],
         label: term.label,
         trigger,

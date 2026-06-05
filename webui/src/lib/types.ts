@@ -1135,8 +1135,15 @@ export interface VectorRackEntry {
  *  intrinsic dimension; ``blend`` is the soft subspace-replace fraction
  *  in ``[0, 1]``. */
 export interface ManifoldRackEntry {
-  /** Blend fraction in [0, 1] — the term coefficient. */
+  /** ``along`` blend fraction in [0, 1] — how far to slide the in-subspace
+   *  foot toward the position.  Serializes as the first value of the ``%``
+   *  coefficient slot. */
   blend: number;
+  /** ``onto`` collapse fraction in [0, 1] — curved-only; pulls the
+   *  off-surface in-subspace residual onto the manifold.  ``0`` = off
+   *  (vacuous for flat/affine terms).  Serializes as the second value of
+   *  the coefficient slot (``along,onto``) only when > 0. */
+  onto: number;
   /** Authoring coordinates, one per intrinsic dimension. */
   coords: number[];
   /** Optional node-label form of the position: when set, the term
