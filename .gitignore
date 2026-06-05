@@ -40,3 +40,7 @@ Thumbs.db
 .remember/
 .superpowers/
 docs/superpowers/
+
+# Scratch / throwaway dev artifacts (eyeball-once output, stress scripts)
+/scratch_*/
+**/scratch_*.py
