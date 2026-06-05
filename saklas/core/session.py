@@ -3077,22 +3077,37 @@ class SaklasSession:
         # the per-layer baked tensor is what the transcript-drift check
         # compared, and it's stable across the manifold round-trip.
         from saklas.core.vectors import folded_vector_directions
-        profile = folded_vector_directions(manifold)
         import hashlib
         h = hashlib.sha256()
-        for layer_idx in sorted(profile.keys()):
-            tensor = profile[layer_idx]
-            # ``tensor.detach().cpu().contiguous()`` keeps the hash stable
-            # across device placements; fp32 cast normalizes dtype so
-            # mixed-precision storage doesn't change the hex digest.
-            try:
-                arr = tensor.detach().to("cpu").to(torch.float32).contiguous()
-                h.update(arr.numpy().tobytes())
-            except Exception:
-                # Synthetic probes from unit tests may not be torch
-                # tensors — fall through to a stable text representation
-                # so the cache still produces something deterministic.
-                h.update(repr((layer_idx, tensor)).encode("utf-8"))
+        try:
+            # 2-node R=1 concept probe: hash the folded baked-direction view,
+            # for continuity with the pre-coords scalar monitor's drift check.
+            profile = folded_vector_directions(manifold)
+            per_layer = {L: [profile[L]] for L in profile}
+        except ValueError:
+            # Multi-node / curved probe (e.g. ``personas``): no R=1 fold exists.
+            # Hash the per-layer subspace geometry directly — mean + basis (+ the
+            # real node_coords when stamped) — a deterministic digest for any
+            # manifold shape, so attaching a multi-node probe is reproducible too.
+            per_layer = {}
+            for layer_idx, sub in manifold.layers.items():
+                tensors = [sub.mean, sub.basis]
+                if sub.node_coords is not None:
+                    tensors.append(sub.node_coords)
+                per_layer[layer_idx] = tensors
+        for layer_idx in sorted(per_layer.keys()):
+            for tensor in per_layer[layer_idx]:
+                # ``tensor.detach().cpu().contiguous()`` keeps the hash stable
+                # across device placements; fp32 cast normalizes dtype so
+                # mixed-precision storage doesn't change the hex digest.
+                try:
+                    arr = tensor.detach().to("cpu").to(torch.float32).contiguous()
+                    h.update(arr.numpy().tobytes())
+                except Exception:
+                    # Synthetic probes from unit tests may not be torch
+                    # tensors — fall through to a stable text representation
+                    # so the cache still produces something deterministic.
+                    h.update(repr((layer_idx, tensor)).encode("utf-8"))
         digest = h.hexdigest()
         self._probe_hash_cache[name] = digest
         return digest
