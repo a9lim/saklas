@@ -2169,7 +2169,6 @@ class SaklasSession:
         concept is logged and skipped, never fatal to session construction.
         """
         from saklas.io.probes_bootstrap import load_default_manifolds
-        from saklas.io.manifolds import ManifoldFolder
         from saklas.io.paths import manifold_dir
 
         defaults = load_default_manifolds()
@@ -2185,8 +2184,7 @@ class SaklasSession:
                     try:
                         self._ensure_manifold_loaded(key)
                     except ManifoldNotRegisteredError:
-                        folder = ManifoldFolder.load(manifold_dir("default", name))
-                        self.fit(folder)
+                        self.fit(manifold_dir("default", name))
                         self._ensure_manifold_loaded(key)
                     probes[name] = self._manifolds[key]
                 except Exception as e:

@@ -94,7 +94,6 @@ def register_traits_routes(app: FastAPI) -> None:
                         # native client can read coordinates without the
                         # wire-stable ``aggregate`` (axis-0) shape changing.
                         probe_readings: dict[str, Any] = {}
-                        probe_readings: dict[str, Any] = {}
                         if result is not None:
                             readings = getattr(result, "readings", None)
                             if readings:
@@ -135,8 +134,6 @@ def register_traits_routes(app: FastAPI) -> None:
                             ),
                             "aggregate": aggregate,
                         }
-                        if probe_readings:
-                            payload["probe_readings"] = probe_readings
                         if probe_readings:
                             payload["probe_readings"] = probe_readings
                         yield f"data: {json.dumps(payload)}\n\n"
