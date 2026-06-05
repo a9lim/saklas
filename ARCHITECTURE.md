@@ -602,11 +602,17 @@ projection — never the per-token hot path.
 `(trigger, subspace, domain, target_coord, origin_coord, along, onto)` and runs
 each active one through `subspace_inject` in `_apply_manifold_groups`. A
 cheap pre-check skips the work when no group is active this step (e.g. an
-`AFTER_THINKING` group during prefill). There is no composed-tensor fast path:
-every steered layer runs the (ctx-consulting) slow hook, so per-step triggers and
-probe gates work uniformly. `all_fast_path()` is true only for the unsteered path
-— which is the sole `torch.compile` / StaticCache graph-capture eligibility
-signal (`core/cuda_graphs.py`).
+`AFTER_THINKING` group during prefill). The dominant case — one always-active
+(`Trigger.BOTH`) affine group — is precomputed at `recompose` into
+`_single_affine_fast`, and `hook_fn` short-circuits to it: one analytic slide + an
+in-place write, consulting no `TriggerContext` and threading no foot state.
+Curved / gated / phased steering runs the general (ctx-consulting) path. Two
+eligibility signals feed `core/cuda_graphs.py`: `all_fast_path()` (unsteered — no
+hooks) and `static_steerable()` (every hook is the static-affine fast path). Both
+make `torch.compile` / StaticCache graph capture eligible — StaticCache never
+bypasses the forward hooks, so the static-affine injection still applies, and its
+fixed tensor-op sequence is capturable. (StaticCache-with-steering is CUDA-only;
+the through-the-hook graph capture wants a CUDA validation pass.)
 
 **`SteeringManager`** owns the hooks + the per-generation `TriggerContext`. It
 holds `subspaces` (the dispatch-synthesized merged affine subspaces, one per
@@ -700,14 +706,20 @@ monitor. It rides the same `HiddenCapture` plumbing as generation;
 (`Monitor.probe_layers`; `attached_layers` survives as an alias for the server/TUI
 surfaces that consumed the former `ManifoldMonitor`).
 
-### 6.1 One read path (per-probe geometry, every field, every token)
+### 6.1 One read shape (every field, every token), two execution paths
 
-`_score_full` loops every attached probe through `_score_probe_full`, which loops
-the probe's shared fit layers through `_layer_geometry` and EV-weights across them.
-There is **no batched-affine fast path** and **no flat/curved field asymmetry** —
-the project is a research tool, and full per-token information (nearest, curved
-coords, residual, per-layer) is worth more than the throughput a batched matmul
-bought. Per layer `_layer_geometry` returns the M-orthogonal **fraction**
+`_score_full` produces one full `ProbeReading` per probe — **no flat/curved field
+asymmetry**, the full per-token information (nearest, curved coords, residual,
+per-layer) is the research-tool priority. Execution is no-redundancy: the whole
+**flat** roster is scored together in `_score_flat_batched` (one `Σ⁻¹h` Woodbury
+apply + stacked / block-diagonal matmuls + a single host transfer per layer,
+scattered into global per-probe slots), while **curved** probes run the per-probe
+`_score_probe_full` foot solve — warm-started across decode tokens from the previous
+foot (`enable_curved_warm`) on the sequential live path. Per-token scoring is itself
+**conditional**: when nothing consumes a per-token reading (no probe gate, no live
+stream) the session skips it and pools the aggregate once at the last content token
+(`score_aggregate`); a gate / stream consumer gets per-token incremental scoring.
+Per layer `_layer_geometry` returns the M-orthogonal **fraction**
 `sqrt(gᵀ M_R⁻¹ g)/‖x‖_M` (`g = B Σ⁻¹ x`), the whitened query for the **nearest**
 `M_R`-metric node, and the M-projection reduced coord `c = M_R⁻¹ g`. From there:
 

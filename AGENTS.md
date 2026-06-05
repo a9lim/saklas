@@ -539,12 +539,17 @@ tok/s):
 - **Norms use fp32** — fp16 sum-of-squares overflows at hidden_dim ≥ 2048. Applies
   to fit-time direction norms and the per-position norms inside `subspace_inject`.
   Centroid differences are taken in fp32 too.
-- **One injection kernel.** Every steered layer runs `subspace_inject` (the slow,
-  ctx-consulting hook path), so per-step triggers and probe gates work uniformly;
-  there is no composed-tensor fast path. `torch.compile`/StaticCache graph capture
-  is eligible only for unsteered generation. The affine analytic shortcut keeps the
-  common case (folded vectors / flat subspaces) cheap; curved manifolds pay a
-  warm-started O(R) per-token foot solve.
+- **One injection kernel.** Every steered layer runs `subspace_inject`. The
+  dominant case — one always-active (`Trigger.BOTH`) affine group — takes a
+  precomputed fast path (`SteeringHook._single_affine_fast`): one analytic slide +
+  in-place write, no ctx read, no foot state. `torch.compile`/StaticCache graph
+  capture is eligible for unsteered generation (`all_fast_path`) **and** for that
+  static-affine steered case (`static_steerable` — the hook is a fixed tensor-op
+  sequence and StaticCache never bypasses forward hooks). Curved / gated / phased
+  steering keeps the ctx-consulting general path (DynamicCache, eager); curved
+  manifolds pay a warm-started O(R) per-token foot solve. (StaticCache-with-steering
+  is CUDA-only, so MPS/CPU are unaffected; the through-the-hook graph capture wants a
+  CUDA validation pass.)
 - **Share baked at fit**, normalized to mean 1 at apply; the subspace foot slides
   by `share_L · _MANIFOLD_GAIN` toward a target that already carries the
   coefficient. No norm preservation (onto is meant to shrink `‖h‖`); `norm_cap =
@@ -553,21 +558,23 @@ tok/s):
   hard candidate-pool cap applied before top-p (llama.cpp/Ollama order).
 - **Monitor capture is hook-driven**, inline with generation — no second forward
   pass. The unified `Monitor` reads every probe — flat or curved — as a whitened
-  **coordinate** through one per-probe per-layer geometry pass: per token it emits a
-  full `ProbeReading` (`coords` domain-frame + `fraction` + `nearest` +
-  `residual`, plus per-layer traces). There is **no batched-affine fast path** — the
-  research-tool priority is full per-token info (nearest, curved coords, residual,
-  per-layer) over throughput, so the per-token cost (incl. the curved
-  `invert_parameterization` foot solve) is paid in the decode loop by design.
-  Mahalanobis-only: the whitener must cover every probed layer (`covers_all`), else
-  scoring raises `WhitenerError` (no Euclidean path). `covers_all` is trustworthy as
-  "finite factors everywhere": any non-finite layer is excluded, and neutral
-  activations are cached fp32 (so gemma-3's late layers don't overflow the fp16
-  65504 ceiling to ±inf). For the common monitored case (probes attached, no
-  `return_hidden`) capture runs **incremental** — each token scored live, only the
-  latest per-layer hidden slice + per-token `ProbeReading` rows retained
-  (O(layers·D), not O(T·layers·D)); the aggregate is the row at the last-content
-  token. `return_hidden` falls back to full retention + `score_per_token`.
+  **coordinate**, emitting a full `ProbeReading` (`coords` domain-frame + `fraction`
+  + `nearest` + `residual`, plus per-layer traces). The full-reading *shape* is the
+  research-tool priority; execution is no-redundancy: the whole **flat** roster is
+  scored together (`_score_flat_batched` — one `Σ⁻¹h` Woodbury apply + block-diagonal
+  matmuls + a single host transfer per layer), **curved** probes run the per-probe
+  `invert_parameterization` foot solve (warm-started across decode tokens from the
+  previous foot on the sequential live path). Mahalanobis-only: the whitener must
+  cover every probed layer (`covers_all`), else scoring raises `WhitenerError` (no
+  Euclidean path). `covers_all` is trustworthy as "finite factors everywhere": any
+  non-finite layer is excluded, and neutral activations are cached fp32 (so gemma-3's
+  late layers don't overflow the fp16 65504 ceiling to ±inf). Per-token scoring is
+  **conditional on need**: a gate / live-stream consumer ⇒ **incremental** (each token
+  scored live, only the latest per-layer slice + `ProbeReading` rows retained,
+  O(layers·D)); probes attached but only the aggregate wanted (no gate / stream — e.g.
+  a stateless server gen) ⇒ **aggregate-only** (a bounded tail ring, NO per-token
+  scoring, pooled once at finalize, T scorings → 1); `return_hidden` ⇒ full retention
+  + `score_per_token`.
 - **Steering hooks are transient** — composed before generation, removed after.
 - **MPS discipline** — diffs on CPU, `torch.mps.empty_cache()` between extraction
   passes, end-of-loop sync to dodge Metal command-buffer reuse crashes.

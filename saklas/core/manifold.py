@@ -89,6 +89,13 @@ DEFAULT_N_COMPONENTS = 64
 # degraded to a 4-point-per-axis landing on the bundled 8-D ``personas``.
 DEFAULT_INVERSION_MAX_ITER = 12
 DEFAULT_INVERSION_RESTARTS = 3
+# Warm-started inversion (curved-probe per-token foot-follow): when the caller
+# hands a previous foot as ``warm_start``, the activation has drifted only one
+# decode step, so the carried foot is already near this token's nearest point —
+# a handful of LM steps from it (plus one nearest-node restart as a basin-jump
+# safety net) converges where the cold 12-iter / 3-restart search would.  This
+# is the read-side analogue of the steering foot-follower's one-warm-step path.
+DEFAULT_INVERSION_WARM_ITER = 4
 DEFAULT_INVERSION_DAMPING = 1e-3
 # Absolute floor added to the LM normal-equation diagonal so a locally
 # rank-deficient Jacobian (a fold/pinch, or a flat authoring direction)
@@ -1613,13 +1620,23 @@ def _soft_norm_cap(
     h_new: torch.Tensor, h_f32: torch.Tensor, norm_cap: float,
 ) -> torch.Tensor:
     """Soft cap ``‖h_new‖ ≤ norm_cap·‖h‖`` — the off-domain RBF-extrapolation
-    blowup guard shared by the affine shortcut and the curved injection path."""
+    blowup guard shared by the affine shortcut and the curved injection path.
+
+    Operates **in place** on ``h_new`` (returning it for call-site clarity):
+    both call sites pass a freshly-allocated sum (``h_f32 + Δ`` / ``mean +
+    new_par + new_perp``), never an alias of the function input ``h``, so the
+    in-place ``mul_`` by a ``(.., 1)`` per-row scale is safe and skips the
+    full-width ``torch.where`` temporary the guard used to allocate every
+    fire."""
     norm_pre = torch.linalg.vector_norm(h_f32, dim=-1, keepdim=True)
     norm_post = torch.linalg.vector_norm(h_new, dim=-1, keepdim=True)
     cap = norm_cap * norm_pre
-    return torch.where(
-        norm_post > cap, h_new * (cap / norm_post.clamp(min=1e-6)), h_new,
-    )
+    scale = torch.where(
+        norm_post > cap,
+        cap / norm_post.clamp(min=1e-6),
+        torch.ones_like(norm_post),
+    )                                              # (.., 1) — not full-width
+    return h_new.mul_(scale)
 
 
 def subspace_inject(
@@ -1700,7 +1717,10 @@ def subspace_inject(
         )                                               # (.., n==R)
         h_new = h_f32 + ((p_new - q) @ basis)           # keep H_o verbatim
         h_new = _soft_norm_cap(h_new, h_f32, norm_cap)
-        return h_new.to(h.dtype), q
+        # Return fp32; the caller's ``hidden.copy_(h_new)`` downcasts to the
+        # model dtype on the copy, so an explicit ``.to(h.dtype)`` here would
+        # only allocate a redundant full-width model-dtype temporary per fire.
+        return h_new, q
 
     h_par = q @ basis                                  # (.., D) in-subspace reconstruction
     h_perp = centered - h_par                          # (.., D) = H_o
@@ -1768,7 +1788,9 @@ def subspace_inject(
     # (clamp_position keeps p_new in-box for open axes, so this is belt-and-
     # suspenders, not the norm semantic — onto is allowed to shrink ‖h‖).
     h_new = _soft_norm_cap(h_new, h_f32, norm_cap)
-    return h_new.to(h.dtype), p
+    # Return fp32 (see the affine branch): the caller's ``hidden.copy_`` does
+    # the model-dtype downcast, so no per-fire ``.to(h.dtype)`` temporary.
+    return h_new, p
 
 
 # ======================================================= coord discovery ===
@@ -2510,6 +2532,8 @@ def invert_parameterization(
     *,
     max_iter: int = DEFAULT_INVERSION_MAX_ITER,
     n_restarts: int = DEFAULT_INVERSION_RESTARTS,
+    warm_start: torch.Tensor | None = None,
+    warm_iter: int = DEFAULT_INVERSION_WARM_ITER,
     damping: float = DEFAULT_INVERSION_DAMPING,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Nearest-point projection of ``query`` onto the fitted manifold.
@@ -2530,8 +2554,19 @@ def invert_parameterization(
     the former ``resolution**n`` grid scan, and the landing is continuous
     rather than quantized to a grid.  ``n_restarts`` warm starts from the
     top nearest nodes guard against a fold/periodic local minimum; the best
-    final residual per query wins.  Used only by the naturalness eval and
-    ``Monitor.score_aggregate`` -- never the steering hot path.
+    final residual per query wins.  Used by the naturalness eval,
+    ``Monitor.score_aggregate``, and the curved-probe per-token read --
+    never the steering hot path.
+
+    ``warm_start`` ``(.., n)`` (the curved-probe foot-follower) seeds from a
+    carried previous-token foot instead of the nearest-node scan: the read
+    runs ``warm_iter`` LM steps over just two restarts -- the carried foot and
+    the single nearest fit node (a cheap basin-jump safety net) -- because a
+    one-decode-step activation drift leaves the foot already near this token's
+    nearest point.  The best-residual restart still wins, so a genuine basin
+    jump falls back to the nearest-node chain.  ``None`` is the cold path
+    (``n_restarts`` nearest-node seeds, ``max_iter`` steps), bit-for-bit
+    unchanged.
     """
     n = domain.intrinsic_dim
     R = query.shape[-1]
@@ -2553,7 +2588,6 @@ def invert_parameterization(
 
     node_coords = node_coords.to(device=device, dtype=dtype)  # (K, n)
     K = node_coords.shape[0]
-    restarts = max(1, min(int(n_restarts), K))
 
     def _eval(p: torch.Tensor) -> torch.Tensor:
         # Inline normalize (avoids ``subspace._normalize`` reaching for the
@@ -2564,17 +2598,31 @@ def invert_parameterization(
     # so this recovers the per-node centroids in reduced coords without a
     # stored field.  Used to pick each query's nearest node(s) as seeds.
     node_vals = eval_rbf(np_, rw, pc, np_)  # (K, R)
-    seed_idx = torch.cdist(flat, node_vals).topk(
-        restarts, dim=-1, largest=False,
-    ).indices  # (N, S)
-    p = domain.clamp_position(node_coords[seed_idx])  # (N, S, n)
+    if warm_start is not None:
+        # Warm path: seed from the carried foot + the single nearest fit node
+        # (basin-jump safety net), and take only ``warm_iter`` LM steps.
+        ws = warm_start.to(device=device, dtype=dtype).reshape(N, n)  # (N, n)
+        near1 = torch.cdist(flat, node_vals).topk(
+            1, dim=-1, largest=False,
+        ).indices.squeeze(-1)  # (N,)
+        p = domain.clamp_position(
+            torch.stack([ws, node_coords[near1]], dim=1)  # (N, 2, n)
+        )
+        iters = int(warm_iter)
+    else:
+        restarts = max(1, min(int(n_restarts), K))
+        seed_idx = torch.cdist(flat, node_vals).topk(
+            restarts, dim=-1, largest=False,
+        ).indices  # (N, S)
+        p = domain.clamp_position(node_coords[seed_idx])  # (N, S, n)
+        iters = int(max_iter)
     q = flat.unsqueeze(1)  # (N, 1, R) -- broadcasts over the S restarts
 
     # Each step shares the LM body with the steering foot-follower via
     # ``_gn_step``; ``q`` is ``(N, 1, R)`` and broadcasts over the ``S``
     # restarts.  The internal ``reshape(-1, n, n)`` there also dodges
     # ``torch.linalg.solve``'s size-1-leading-batch out-resize warning on MPS.
-    for _ in range(int(max_iter)):
+    for _ in range(iters):
         p, _ = _gn_step(p, q, np_, rw, pc, offset, scale, domain, damping)
 
     # Best restart per query by final reduced-space residual norm.

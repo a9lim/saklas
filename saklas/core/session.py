@@ -152,6 +152,11 @@ def _snapshot_la_layers(cache: Any) -> None:
 
 
 _RESPONSE_MAX_TOKENS = 256  # per in-character response (4.0 / A2 elicitation)
+# Tail-ring depth for aggregate-only capture (probes attached, no per-token
+# consumer): how many trailing hidden slices to retain so finalize can pool the
+# last *content* token after walking back past trailing special tokens (EOS,
+# end-of-turn). 8 comfortably covers any chat template's trailing-marker run.
+_AGG_TAIL_DEPTH = 8
 
 # Floor on the shared token prefix ``generate_batch`` will KV-cache.  Below
 # this the saved prefill is in the noise and the double-render + cache-management
@@ -743,6 +748,13 @@ class SaklasSession:
         # teardown.
         self._incremental_readings: list[dict[str, ProbeReading]] = []
         self._capture_incremental: bool = False
+        # Aggregate-only capture: probes attached but nothing consumes a
+        # per-token reading (no probe gate, no loom row, no trait stream, no
+        # live scores) — so the decode loop pays NO per-token scoring and the
+        # capture keeps only a bounded tail ring; ``_finalize_generation``
+        # scores the aggregate once via ``_score_aggregate_only``. Mutually
+        # exclusive with ``_capture_incremental``. Set in ``_begin_capture``.
+        self._capture_aggregate_only: bool = False
 
         # Reentrant — ``_generate_core`` acquires it for the whole gen,
         # then enters an internal ``self.steering(...)`` scope which
@@ -2590,7 +2602,9 @@ class SaklasSession:
         self._compose_steering_entries(flat)
         self._install_composed_steering()
 
-    def _begin_capture(self, *, widen: bool = False) -> bool:
+    def _begin_capture(
+        self, *, widen: bool = False, need_per_token: bool = True,
+    ) -> bool:
         """Attach hidden-state capture. Returns True if attached.
 
         ``widen=False`` (default): cover the union of vector-probe
@@ -2602,6 +2616,14 @@ class SaklasSession:
         asked for ``SamplingConfig.return_hidden=True`` — the monitor still
         reads its probe subset, but the full dict is available on
         ``GenerationResult.hidden_states`` after the run.
+
+        ``need_per_token`` (default True): whether anything consumes a
+        per-token reading this gen — a probe gate, a loom token row, a trait
+        stream, or a live-scores client.  When False (probes attached but only
+        the end-of-gen aggregate is wanted, e.g. stateless server scoring) the
+        capture runs in **aggregate-only** mode: a bounded tail ring, NO
+        per-token scoring (T scorings + T host syncs → 1 at finalize via
+        :meth:`_score_aggregate_only`).
         """
         if widen:
             layer_idxs = list(range(len(self._layers)))
@@ -2609,13 +2631,15 @@ class SaklasSession:
             union: set[int] = self._monitor.probe_layers()
             if not union:
                 self._capture_incremental = False
+                self._capture_aggregate_only = False
                 self._incremental_readings = []
                 return False
             layer_idxs = sorted(union)
         self._capture.clear()
         self._capture.attach(self._layers, layer_idxs)
         self._incremental_readings = []
-        if not widen and self._monitor.probe_names:
+        self._capture_aggregate_only = False
+        if not widen and self._monitor.probe_names and need_per_token:
             def _score_step(latest: dict[int, torch.Tensor]) -> None:
                 # Score once while the just-produced hidden slice is still the
                 # only retained device payload.  Append even an empty dict so
@@ -2627,8 +2651,26 @@ class SaklasSession:
 
             self._capture.set_incremental(_score_step)
             self._capture_incremental = True
+            # The step sink scores one token per decode step in order, so curved
+            # probes can warm-start their nearest-point foot from the previous
+            # token. Cold-start the feet for this generation first.
+            self._monitor.reset_curved_feet()
+            self._monitor.enable_curved_warm(True)
+        elif not widen and self._monitor.probe_names:
+            # Aggregate-only: probes attached but no per-token consumer. Keep a
+            # bounded tail ring, score nothing per token; finalize pools the
+            # last content token once. Curved warm-start is a sequential-live
+            # optimization, so leave it off for the one-shot aggregate read.
+            self._capture.set_aggregate_tail(_AGG_TAIL_DEPTH)
+            self._capture_incremental = False
+            self._capture_aggregate_only = True
+            self._monitor.enable_curved_warm(False)
         else:
             self._capture_incremental = False
+            # Non-incremental reads (return_hidden full stack, or no probes) are
+            # scored out of order / one-shot, so keep curved probes on the cold
+            # foot solve for reproducibility.
+            self._monitor.enable_curved_warm(False)
         return True
 
     def _end_capture(self) -> None:
@@ -2685,6 +2727,37 @@ class SaklasSession:
         if accumulate and agg_vals:
             self._monitor.accumulate_readings(agg_vals)
         return agg_vals, per_token
+
+    def _score_aggregate_only(
+        self, generated_ids: list[int], *, accumulate: bool = True,
+    ) -> dict[str, "ProbeReading"]:
+        """Score *only* the end-of-gen aggregate from the bounded tail ring.
+
+        The aggregate-only capture path (``_capture_aggregate_only``) scored
+        nothing per token; here we pool the last content token's slice from the
+        tail ring and run one :meth:`Monitor.score_aggregate`.  ``generated_ids``
+        token ``k`` was produced by decode forward ``k``, so the last content
+        token's forward index is ``last_content_index(generated_ids)`` — which
+        :meth:`HiddenCapture.tail_slice_at` maps into the ring.
+        """
+        names = list(self._monitor.probe_names)
+        empty = {
+            name: ProbeReading(fraction=0.0, nearest=[], coords=())
+            for name in names
+        }
+        if not generated_ids:
+            return empty
+        from saklas.core.vectors import last_content_index
+        agg_fwd = last_content_index(generated_ids, self._tokenizer)
+        pooled = self._capture.tail_slice_at(agg_fwd)
+        if not pooled:
+            return empty
+        agg_vals = self._monitor.score_aggregate(pooled)
+        # Fill any probe the pool missed (e.g. a layer absent from the ring).
+        agg_vals = {name: agg_vals.get(name, empty[name]) for name in names}
+        if accumulate and agg_vals:
+            self._monitor.accumulate_readings(agg_vals)
+        return agg_vals
 
     @overload
     def score_hidden(
@@ -3721,9 +3794,17 @@ class SaklasSession:
             generated_ids
             and (
                 return_hidden
-                or (self._monitor.probe_names and not self._capture_incremental)
+                or (
+                    self._monitor.probe_names
+                    and not self._capture_incremental
+                    and not self._capture_aggregate_only
+                )
             )
         ):
+            # Full stack only for return_hidden or the non-incremental
+            # full-retention path; the aggregate-only ring is pooled via
+            # ``_score_aggregate_only`` (``stacked()`` would stack the tail
+            # ring, not the full [T, D]).
             captured_stack = self._capture.stacked()
 
         agg_vals: dict[str, ProbeReading] = {}
@@ -3732,6 +3813,12 @@ class SaklasSession:
                 agg_vals, per_token = self._score_incremental(
                     generated_ids, accumulate=not stateless,
                 )
+            elif self._capture_aggregate_only:
+                # No per-token stream was produced — score the aggregate once.
+                agg_vals = self._score_aggregate_only(
+                    generated_ids, accumulate=not stateless,
+                )
+                per_token = {}
             else:
                 if captured_stack:
                     agg_vals, per_token = self._monitor.score_per_token(
@@ -4115,6 +4202,7 @@ class SaklasSession:
         frequency_penalty: float,
         lp_count: int | None,
         forced_prefix: list[int] | None = None,
+        want_perplexity: bool = True,
     ) -> tuple[list[int], float]:
         """Run the decode loop once capture and steering are installed."""
         cached_pkv = None
@@ -4143,10 +4231,21 @@ class SaklasSession:
             if self._steering_needs_probe_gating()
             else None
         )
+        # StaticCache / CUDA-graph capture is eligible when generation is
+        # unsteered (``all_fast_path``) OR every steered layer is the static
+        # single-affine fast path (``static_steerable`` — Trigger.BOTH affine
+        # slide, no ctx, no foot, no gate).  StaticCache never bypasses the
+        # forward hooks, so the steering still applies; only the KV buffers are
+        # preallocated.  ``_cuda_graphs_active`` is CUDA-only, so this is inert
+        # on MPS/CPU.  Curved / gated / phased steering keeps the eager
+        # DynamicCache path.
         use_static_cache = (
             self._cuda_graphs_active
             and cached_pkv is None
-            and self._steering.all_fast_path()
+            and (
+                self._steering.all_fast_path()
+                or self._steering.static_steerable()
+            )
         )
         generated_ids = generate_steered(
             self._model, self._tokenizer, effective_input_ids,
@@ -4163,6 +4262,7 @@ class SaklasSession:
             use_static_cache=use_static_cache,
             forced_prefix=forced_prefix,
             steering_active=bool(self._steering.hooks),
+            want_perplexity=want_perplexity,
         )
         elapsed = time.monotonic() - start
 
@@ -4451,13 +4551,29 @@ class SaklasSession:
             vector_snapshot = self._snapshot_steering_alphas()
 
             want_hidden = bool(sampling and sampling.return_hidden)
+            # Per-token scoring is only needed when something consumes a
+            # per-token reading: a probe gate, a loom token row, an SSE trait
+            # stream, a live-scores client, or a per-layer-heatmap persist.
+            # Otherwise (probes attached but only the aggregate wanted, e.g. a
+            # stateless server gen) the capture skips per-token scoring entirely
+            # and pools the aggregate once at finalize.
+            need_per_token = bool(
+                self._steering_needs_probe_gating()
+                or assistant_node_id is not None
+                or _has_trait_consumer
+                or _wants_live_token_scores
+                or _persists_layer_scores
+                or _persists_probe_row
+            )
             self.events.emit(GenerationStarted(input=input, stateless=stateless))
             try:
                 # Capture attach + monitor live + ctx.reset live INSIDE the
                 # inner try so a BaseException (KeyboardInterrupt, etc.)
                 # between any pair of these still hits the cleanup finally.
                 # ``_end_capture`` and ``end_live`` are idempotent.
-                self._begin_capture(widen=want_hidden)
+                self._begin_capture(
+                    widen=want_hidden, need_per_token=need_per_token,
+                )
                 self._monitor.begin_live()
                 # Reset the steering manager's TriggerContext for this gen;
                 # ``generate_steered`` mutates it at lifecycle boundaries.
@@ -4480,6 +4596,24 @@ class SaklasSession:
                     frequency_penalty=frequency_penalty,
                     lp_count=lp_count,
                     forced_prefix=forced_prefix,
+                    # Per-token perplexity costs one host sync/token.  Compute
+                    # it only when something surfaces it: a loom-attached gen
+                    # persists it on the token row, an interactive (non-
+                    # stateless) gen may show it, or a caller opts its on_token
+                    # in.  Stateless server streaming (OpenAI/Ollama deltas, the
+                    # native WS tap) never reads per-token ppl, so it skips the
+                    # sync.  Callers can force it via ``on_token
+                    # ._saklas_wants_perplexity = True``.
+                    want_perplexity=(
+                        not stateless
+                        or assistant_node_id is not None
+                        or (
+                            on_token is not None
+                            and getattr(
+                                on_token, "_saklas_wants_perplexity", False,
+                            )
+                        )
+                    ),
                 )
             finally:
                 self._gen_state.stop_requested.set()

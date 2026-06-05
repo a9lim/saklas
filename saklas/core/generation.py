@@ -687,6 +687,7 @@ def generate_steered(
     use_static_cache: bool = False,
     forced_prefix: list[int] | None = None,
     steering_active: bool = True,
+    want_perplexity: bool = True,
 ) -> list[int]:
     """
     Runs in a worker thread (not the async event loop).
@@ -842,7 +843,14 @@ def generate_steered(
         bias_idx = torch.tensor(list(logit_bias.keys()), dtype=torch.long, device=device)
         bias_val = torch.tensor(list(logit_bias.values()), dtype=torch.float32, device=device)
     stop_list = list(stop) if stop else None
-    completion_text = ""  # accumulated non-thinking emitted text, for stop matching
+    # ``completion_text`` is a *bounded tail* of the emitted non-thinking text,
+    # not the full completion: only the last ``_stop_keep`` chars are retained —
+    # enough for a stop string to straddle the previous/current emit boundary
+    # (a k-char stop can overlap the boundary by at most k−1 chars).  Keeps the
+    # per-token stop match O(tail+emit) instead of the old O(n) concat that grew
+    # the whole completion (O(n²) over the generation).
+    _stop_keep = (max(len(s) for s in stop_list) - 1) if stop_list else 0
+    completion_text = ""  # bounded tail of emitted non-thinking text, for stop matching
     state.finish_reason = "length"  # default: loop exhausted
 
     # Thinking state tracking.  Always detect delimiters even when the
@@ -1084,14 +1092,24 @@ def generate_steered(
                             [[forced_id]], device=device, dtype=cand_ids.dtype,
                         )
 
-                if capture_sampler_stats:
+                # ``cand_logp`` backs both the logprobs capture and the
+                # perplexity entropy.  Compute it only when one of them needs
+                # it, and pay the entropy ``.item()`` host sync (one sync per
+                # token) only when a consumer actually wants perplexity —
+                # ``want_perplexity=False`` (e.g. stateless server streaming,
+                # which never surfaces per-token ppl) skips it entirely.
+                want_ppl = want_perplexity and capture_sampler_stats
+                if logprobs is not None or want_ppl:
                     cand_logp = cand_probs.clamp_min(
                         torch.finfo(torch.float32).tiny,
                     ).log()
+                else:
+                    cand_logp = None
+                if want_ppl:
+                    assert cand_logp is not None  # set above when want_ppl
                     entropy_nats = float((-(cand_probs * cand_logp)).sum().item())
                     current_perplexity = math.exp(entropy_nats)
                 else:
-                    cand_logp = None
                     current_perplexity = float("nan")
 
                 token_id = int(next_token.item())
@@ -1225,18 +1243,24 @@ def generate_steered(
                         emit_text = tok_str
 
                     if emit_text is not None:
-                        # Stop-sequence check (response text only).
+                        # Stop-sequence check (response text only).  Match
+                        # against the bounded tail + this emit: the tail never
+                        # holds a complete stop (we'd have broken already), so
+                        # any match necessarily completes within ``emit_text``,
+                        # and searching the short ``combined`` from 0 finds the
+                        # same boundary-relative hit the old full-text scan did.
                         if stop_list and not emit_thinking:
-                            prev_len = len(completion_text)
-                            new_text = completion_text + emit_text
+                            tail_len = len(completion_text)
+                            combined = completion_text + emit_text
                             hit_idx = -1
                             for s in stop_list:
-                                i = new_text.find(s, max(0, prev_len - len(s) + 1))
+                                i = combined.find(s)
                                 if i >= 0 and (hit_idx < 0 or i < hit_idx):
                                     hit_idx = i
                             if hit_idx >= 0:
-                                # Trim emit to the pre-stop portion only.
-                                trimmed = new_text[:hit_idx][prev_len:]
+                                # Emit only this token's pre-stop portion (empty
+                                # when the stop began back in the retained tail).
+                                trimmed = combined[tail_len:hit_idx]
                                 if trimmed:
                                     state.emit_map.append((len(generated_ids) - 1, emit_thinking))
                                     _emit_token(trimmed, emit_thinking, emit_id,
@@ -1244,7 +1268,9 @@ def generate_steered(
                                                 current_perplexity)
                                 state.finish_reason = "stop_sequence"
                                 break
-                            completion_text = new_text
+                            completion_text = (
+                                combined[-_stop_keep:] if _stop_keep > 0 else ""
+                            )
                         state.emit_map.append((len(generated_ids) - 1, emit_thinking))
                         _emit_token(emit_text, emit_thinking, emit_id,
                                     chosen_logprob, top_alts,

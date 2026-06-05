@@ -626,3 +626,154 @@ def test_affine_fraction_outside_subspace_is_zero():
         hidden[L] = sub.mean + v
     r = mon.score_single_token(hidden)["tri"]
     assert r.fraction == pytest.approx(0.0, abs=2e-2)
+
+
+# ================================================ curved-probe warm-start ===
+
+def test_curved_warm_start_matches_cold_path():
+    """Warm-started curved-probe foot reads track the cold solve.
+
+    A curved probe's per-token nearest-point foot is warm-started from the
+    previous token's foot when the session enables it for the (sequential)
+    incremental live-scoring pass.  For a smoothly drifting activation the
+    warm path (``warm_iter`` steps from the carried foot + one nearest-node
+    safety restart) must land at the same nearest point the cold solve
+    (``max_iter`` steps from the nearest nodes) finds.
+    """
+    m = _toy_manifold(dim=8)
+    mon = _iso_monitor(m)
+    mon.add_probe("toy", m)
+
+    # A smoothly drifting sequence: slide the foot from node a → c along the
+    # domain, plus a small off-surface nudge so the residual channel is
+    # exercised too.
+    dim = next(iter(m.layers.values())).mean.shape[0]
+    off = torch.zeros(dim)
+    off[-1] = 1.0
+    seq = []
+    for t in range(8):
+        frac = t / 7.0  # 0 → 1
+        coord = torch.tensor([2.0 * frac - 1.0])  # slide -1 → 1, on-domain
+        embedded = m.domain.embed(m.domain.clamp_position(coord))
+        hidden = {
+            # World activation at the drifting foot + a small off-surface nudge.
+            L: sub.eval_at(embedded) + 0.05 * off
+            for L, sub in m.layers.items()
+        }
+        seq.append(hidden)
+
+    # Cold pass (warm disabled, the default).
+    mon.enable_curved_warm(False)
+    cold = [mon.score_single_token(h)["toy"] for h in seq]
+
+    # Warm pass: cold-start the feet, enable warm, score the same sequence
+    # in order.
+    mon.reset_curved_feet()
+    mon.enable_curved_warm(True)
+    warm = [mon.score_single_token(h)["toy"] for h in seq]
+
+    # The warm path must have populated foot state (it actually ran).
+    assert mon._curved_feet, "warm path did not stash any foot"
+
+    for t, (c, w) in enumerate(zip(cold, warm, strict=True)):
+        assert w.coords[0] == pytest.approx(c.coords[0], abs=2e-2), (
+            f"token {t}: warm coord {w.coords[0]} vs cold {c.coords[0]}"
+        )
+        assert w.fraction == pytest.approx(c.fraction, abs=2e-2)
+        assert w.nearest[0][0] == c.nearest[0][0]
+
+
+# ========================================== aggregate-only tail capture ===
+
+def test_aggregate_tail_pools_last_content_token():
+    """Aggregate-only capture pools the last *content* token, not the EOS slice.
+
+    The bounded tail ring keeps the last ``depth`` forward slices and scores
+    nothing per token.  ``tail_slice_at(forward_index)`` must map the
+    last-content-token forward index to the correct ring slot — including the
+    EOS off-by-one (the terminal EOS forward captures but its token is not in
+    ``generated_ids``), so the aggregate matches the full-stack path pooled at
+    the same index.
+    """
+    import torch.nn as nn
+
+    from saklas.core.hooks import HiddenCapture
+
+    m = _toy_manifold(dim=8)  # curved, layers {0, 1}
+    mon = _iso_monitor(m)
+    mon.add_probe("toy", m)
+    D = next(iter(m.layers.values())).mean.shape[0]
+
+    class _Pass(nn.Module):
+        def forward(self, x: torch.Tensor) -> torch.Tensor:  # noqa: D401
+            return x
+
+    layers = nn.ModuleList([_Pass(), _Pass()])
+
+    # Five forwards; each layer's hidden is a distinct slide along basis[0].
+    # generated_ids has 4 tokens (forward 4 = terminal EOS, not appended), so
+    # the last content token is forward index 3.
+    def _forward_state(t: int) -> dict[int, torch.Tensor]:
+        return {
+            L: (m.layers[L].mean + float(t + 1) * m.layers[L].basis[0]).reshape(1, 1, D)
+            for L in m.layers
+        }
+
+    forwards = [_forward_state(t) for t in range(5)]
+    last_content_forward = 3
+
+    # Full-retention capture → score_aggregate at the last-content index.
+    cap_full = HiddenCapture()
+    cap_full.attach(layers, [0, 1])
+    for fw in forwards:
+        for L in (0, 1):
+            layers[L](fw[L])
+    full_stack = cap_full.stacked()
+    cap_full.detach()
+    assert all(s.shape[0] == 5 for s in full_stack.values())
+    agg_full = mon.score_aggregate(full_stack, agg_index=last_content_forward)["toy"]
+
+    # Aggregate-tail capture (depth 3) → tail_slice_at(last_content_forward).
+    cap_tail = HiddenCapture()
+    cap_tail.attach(layers, [0, 1])
+    cap_tail.set_aggregate_tail(3)
+    for fw in forwards:
+        for L in (0, 1):
+            layers[L](fw[L])
+    assert cap_tail._forward_count == 5
+    assert all(len(b) == 3 for b in cap_tail._per_layer.values())  # ring capped
+    pooled = cap_tail.tail_slice_at(last_content_forward)
+    cap_tail.detach()
+    agg_tail = mon.score_aggregate(pooled)["toy"]
+
+    # Same pooled token ⇒ identical aggregate (not the EOS/forward-4 slice).
+    assert agg_tail.coords[0] == pytest.approx(agg_full.coords[0], abs=1e-5)
+    assert agg_tail.fraction == pytest.approx(agg_full.fraction, abs=1e-5)
+    assert agg_tail.nearest[0][0] == agg_full.nearest[0][0]
+
+
+def test_aggregate_tail_clamps_when_walkback_exceeds_depth():
+    """A walk-back deeper than the ring clamps to the oldest retained slice."""
+    import torch.nn as nn
+
+    from saklas.core.hooks import HiddenCapture
+
+    m = _toy_manifold(dim=8)
+    D = next(iter(m.layers.values())).mean.shape[0]
+
+    class _Pass(nn.Module):
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return x
+
+    layers = nn.ModuleList([_Pass(), _Pass()])
+    cap = HiddenCapture()
+    cap.attach(layers, [0, 1])
+    cap.set_aggregate_tail(2)  # tiny ring
+    for t in range(5):
+        for L in (0, 1):
+            layers[L]((m.layers[L].mean + float(t) * m.layers[L].basis[0]).reshape(1, 1, D))
+    cap.detach()
+    # Ask for forward 0 (older than the depth-2 ring holding forwards {3, 4}):
+    # clamps to the oldest retained slice rather than indexing out of range.
+    pooled = cap.tail_slice_at(0)
+    assert set(pooled) == {0, 1}

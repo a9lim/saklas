@@ -127,6 +127,38 @@ def test_subspace_forces_slow_path():
     assert mgr.all_fast_path() is False
 
 
+def test_static_steerable_for_affine_both_subspace():
+    # An always-active (Trigger.BOTH) affine subspace lowers to the single-
+    # affine fast-path hook on every covered layer, so the whole gen is
+    # StaticCache / graph-capture eligible even though it IS steered.
+    synth = _equal_share_synth((0, 1, 2))
+    mgr = SteeringManager()
+    mgr.add_subspace("__affine__", synth)
+    mgr.apply_to_model(_model_layers(3), torch.device("cpu"), torch.float32)
+    assert mgr.all_fast_path() is False        # it IS steered
+    assert mgr.static_steerable() is True       # but statically so
+    assert all(
+        h._single_affine_fast is not None for h in mgr.hooks.values()
+    )
+
+
+def test_static_steerable_false_when_unsteered():
+    # Unsteered is the cheaper ``all_fast_path`` case, not ``static_steerable``.
+    mgr = SteeringManager()
+    assert mgr.static_steerable() is False
+    assert mgr.all_fast_path() is True
+
+
+def test_static_steerable_false_for_gated_subspace():
+    # A phase-gated (non-BOTH) trigger keeps the hook on the ctx-consulting
+    # general path, so it is NOT statically capturable.
+    synth = _single_layer_synth(0)
+    mgr = SteeringManager()
+    mgr.add_subspace("__affine__", synth, trigger=Trigger.AFTER_THINKING)
+    mgr.apply_to_model(_model_layers(1), torch.device("cpu"), torch.float32)
+    assert mgr.static_steerable() is False
+
+
 def test_custom_trigger_rides_through():
     synth = _single_layer_synth(0)
     mgr = SteeringManager()

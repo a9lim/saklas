@@ -40,17 +40,27 @@ class HiddenCapture:
     (device-local, no sync) and append to a per-layer Python list. Stacking and
     fp32 casting happen after detach, not in the hot path.
 
-    Incremental mode (``set_incremental``): for the common monitored case
-    the full ``[T, D]`` stack is never needed — the session scores each
-    token as it is produced and keeps only the per-token score rows. In
-    this mode each per-layer hook OVERWRITES its bucket (length-1) instead
-    of appending, so device memory stays O(layers·D) for the whole
+    Incremental mode (``set_incremental``): for the gated / live-stream
+    monitored case the full ``[T, D]`` stack is never needed — the session
+    scores each token as it is produced and keeps only the per-token score
+    rows. In this mode each per-layer hook OVERWRITES its bucket (length-1)
+    instead of appending, so device memory stays O(layers·D) for the whole
     generation, and a ``step_sink`` callback fires once per forward (after
     the highest hooked layer stores its slice) with the latest per-layer
     slice. ``latest_per_layer()`` and the ``bucket[-1]`` reads the
     streaming tap relies on keep working — a length-1 bucket's ``[-1]`` is
-    still the latest. Non-incremental mode is byte-identical to the append
-    path: ``stacked()`` returns the full ``[T, D]``.
+    still the latest.
+
+    Aggregate-only mode (``set_aggregate_tail``): when the caller needs only
+    the end-of-gen aggregate (no probe gate, no per-token stream — e.g.
+    stateless server scoring), the hook keeps a bounded *ring* of the last
+    ``depth`` slices per layer and runs NO step sink, so the decode loop pays
+    zero per-token monitor scoring (T scorings → 1 at finalize). The session
+    pools the last content token via :meth:`tail_slice_at`; the ring is deep
+    enough to walk back past trailing special tokens (EOS / end-of-turn).
+
+    Non-incremental mode is byte-identical to the append path: ``stacked()``
+    returns the full ``[T, D]`` (used for ``return_hidden``).
     """
 
     def __init__(self) -> None:
@@ -59,10 +69,22 @@ class HiddenCapture:
         # Incremental-mode state. ``_incremental`` flips the per-layer
         # hook from append to overwrite; ``_step_sink`` is invoked once
         # per forward after the highest hooked layer (``_max_layer``)
-        # stores this step's slice. All three reset on attach/clear.
+        # stores this step's slice. All reset on attach/clear.
         self._incremental: bool = False
         self._step_sink: Callable[[dict[int, torch.Tensor]], None] | None = None
         self._max_layer: int | None = None
+        # Bounded-tail (aggregate-only) state: when ``_tail_depth > 1`` the
+        # incremental hook keeps the last ``_tail_depth`` slices per layer (a
+        # ring) instead of length-1, and runs *no* step sink — used when the
+        # caller needs only the end-of-gen aggregate, not the per-token stream,
+        # so the expensive per-token scoring is skipped entirely and the
+        # aggregate is scored once at finalize from the retained tail (deep
+        # enough to walk back past trailing special tokens to the last content
+        # token). ``_forward_count`` counts decode forwards (incremented once
+        # per forward at the max layer) so ``tail_slice_at`` can map a
+        # generated-token index to its ring slot.
+        self._tail_depth: int = 1
+        self._forward_count: int = 0
 
     def attach(
         self, layers: "torch.nn.ModuleList", layer_indices: list[int]
@@ -70,34 +92,59 @@ class HiddenCapture:
         self._per_layer = {idx: [] for idx in layer_indices}
         self._handles = []
         # Attach resets incremental state — a fresh capture starts in the
-        # append (full-retention) mode. ``set_incremental`` must be called
-        # after attach to opt into incremental scoring for this gen.
+        # append (full-retention) mode. ``set_incremental`` /
+        # ``set_aggregate_tail`` must be called after attach to opt into
+        # incremental scoring / bounded-tail capture for this gen.
         self._incremental = False
         self._step_sink = None
         self._max_layer = None
+        self._tail_depth = 1
+        self._forward_count = 0
         for idx in layer_indices:
             bucket = self._per_layer[idx]
 
             def _make(bucket_ref: list[torch.Tensor], layer_idx: int) -> Any:
                 def _hook(module: Any, input: Any, output: Any) -> None:
                     h = output if isinstance(output, torch.Tensor) else output[0]
-                    slice_ = h[0, -1, :].detach().clone()
+                    src = h[0, -1, :].detach()
                     if self._incremental:
-                        # Overwrite — keep the bucket length-1 so device
-                        # memory stays O(layers·D). ``[-1]`` reads (tap,
-                        # latest_per_layer) still return the latest slice.
-                        if bucket_ref:
-                            bucket_ref[0] = slice_
+                        if self._tail_depth <= 1:
+                            # Overwrite into a single preallocated (D,) buffer per
+                            # layer — ``copy_`` the latest slice in instead of
+                            # allocating a fresh clone every step, so the per-token
+                            # decode loop does zero capture allocation (only the
+                            # first fire allocates).  Device memory stays
+                            # O(layers·D) and the bucket stays length-1, so
+                            # ``[-1]`` reads (tap, latest_per_layer) still return
+                            # the latest slice.  Safe because every consumer (step
+                            # sink, gate callback, token tap) reads the slice
+                            # synchronously after this forward and before the next
+                            # overwrites it.
+                            if bucket_ref:
+                                bucket_ref[0].copy_(src)
+                            else:
+                                bucket_ref.append(src.clone())
                         else:
-                            bucket_ref.append(slice_)
-                        # The highest hooked layer fires last in the
-                        # forward (forward hooks run in layer-execution
-                        # order), so by the time it stores its slice every
-                        # hooked layer holds this step's value. Score now.
-                        if layer_idx == self._max_layer and self._step_sink is not None:
-                            self._step_sink(self.latest_per_layer())
+                            # Bounded-tail (aggregate-only) ring: keep the last
+                            # ``_tail_depth`` slices so finalize can pool the last
+                            # *content* token (walking back past trailing
+                            # specials).  O(tail_depth·layers·D), no per-token
+                            # scoring.
+                            bucket_ref.append(src.clone())
+                            if len(bucket_ref) > self._tail_depth:
+                                bucket_ref.pop(0)
+                        # The highest hooked layer fires last in the forward
+                        # (forward hooks run in layer-execution order), so by the
+                        # time it stores its slice every hooked layer holds this
+                        # step's value: count the forward, then score if wired.
+                        if layer_idx == self._max_layer:
+                            self._forward_count += 1
+                            if self._step_sink is not None:
+                                self._step_sink(self.latest_per_layer())
                     else:
-                        bucket_ref.append(slice_)
+                        # Full-retention mode: each step is a distinct clone so
+                        # ``stacked()`` can build the [T, D] history.
+                        bucket_ref.append(src.clone())
                 return _hook
 
             self._handles.append(
@@ -116,7 +163,23 @@ class HiddenCapture:
         layer has stored this step's slice.
         """
         self._incremental = True
+        self._tail_depth = 1
         self._step_sink = step_sink
+        self._max_layer = max(self._per_layer) if self._per_layer else None
+
+    def set_aggregate_tail(self, depth: int) -> None:
+        """Enable bounded-tail capture (aggregate-only, no per-token scoring).
+
+        Must be called after :meth:`attach`. Keeps the last ``depth`` slices
+        per layer (a ring) and installs *no* step sink, so the decode loop pays
+        no per-token monitor scoring; the session pools the last content token
+        at finalize via :meth:`tail_slice_at`. ``depth`` must exceed the most
+        trailing special tokens a generation can append after its last content
+        token (EOS, end-of-turn) so the walk-back lands inside the ring.
+        """
+        self._incremental = True
+        self._step_sink = None
+        self._tail_depth = max(1, int(depth))
         self._max_layer = max(self._per_layer) if self._per_layer else None
 
     def detach(self) -> None:
@@ -130,6 +193,30 @@ class HiddenCapture:
         self._incremental = False
         self._step_sink = None
         self._max_layer = None
+        self._tail_depth = 1
+        self._forward_count = 0
+
+    def tail_slice_at(self, forward_index: int) -> dict[int, torch.Tensor]:
+        """Per-layer ``[D]`` slice for decode ``forward_index`` from the tail ring.
+
+        Used by the aggregate-only finalize: ``forward_index`` is the
+        generated-token index of the last content token (generated token ``k``
+        was produced by forward ``k``), and the ring holds the last
+        ``len(bucket)`` forwards ending at ``_forward_count - 1``.  The position
+        is clamped into the ring, so a walk-back longer than the tail depth
+        (more trailing specials than ``depth``) degrades to the oldest retained
+        slice rather than indexing out of range.
+        """
+        out: dict[int, torch.Tensor] = {}
+        F = self._forward_count
+        for idx, bucket in self._per_layer.items():
+            if not bucket:
+                continue
+            start = F - len(bucket)            # forward index of bucket[0]
+            pos = forward_index - start
+            pos = max(0, min(pos, len(bucket) - 1))
+            out[idx] = bucket[pos]
+        return out
 
     def stacked(self) -> dict[int, torch.Tensor]:
         """Return per-layer ``(n_captures, dim)`` tensors in the capture dtype.
@@ -197,6 +284,16 @@ class SteeringHook:
         # :meth:`SteeringManager.reset_manifold_feet` at each generation start.
         self._manifold_feet: list[torch.Tensor | None] = []
         self._all_groups_always_active = False
+        # Fast-path payload for the dominant steering case — exactly one affine
+        # group, always-active (``Trigger.BOTH``).  When set,
+        # ``(sub, domain, target, origin, along, onto)`` is the unpacked single
+        # group, so ``hook_fn`` runs one ``subspace_inject`` + ``copy_`` with no
+        # per-fire group loop, no trigger re-check, and no foot-seed branch.
+        # ``None`` ⇒ general path (multi-group, gated, or any curved group).
+        self._single_affine_fast: tuple[
+            LayerSubspace, ManifoldDomain,
+            torch.Tensor, torch.Tensor, float, float,
+        ] | None = None
         # Shared mutable context threaded in by SteeringManager.  Read-only
         # from the hook's perspective; the generation loop mutates fields.
         self._ctx: TriggerContext | None = None
@@ -218,10 +315,12 @@ class SteeringHook:
         generation loop mutates and the hook reads at fire time.
 
         Subspace tensors are cast to **fp32** (the RBF / Gauss-Newton math is
-        fp32 regardless of the model dtype; ``subspace_inject`` casts the
-        result back to ``hidden.dtype`` per fire).  An entry with both
-        coefficients zero is a no-op and drops here.  A new group set
-        cold-starts every foot-follower.
+        fp32 regardless of the model dtype; ``subspace_inject`` returns its
+        fp32 result and :meth:`_apply_manifold_groups`'s ``hidden.copy_``
+        downcasts to the model dtype on the write, so there is no per-fire
+        model-dtype temporary).  An entry with both coefficients zero is a
+        no-op and drops here.  A new group set cold-starts every
+        foot-follower.
         """
         self._ctx = ctx
 
@@ -257,10 +356,36 @@ class SteeringHook:
         self._all_groups_always_active = all(
             group[0] is Trigger.BOTH for group in manifold_groups
         )
+        # Arm the single-affine-group fast path for the dominant case (one
+        # always-active affine group — the merged folded-vector/pole/affine-``%``
+        # subspace of a plain ``BOTH`` steering scope).  Curved groups, gated
+        # triggers, or multiple groups fall back to the general loop.
+        self._single_affine_fast = None
+        if (
+            len(manifold_groups) == 1
+            and self._all_groups_always_active
+            and manifold_groups[0][1].is_affine
+        ):
+            _trig, _sub, _dom, _tgt, _org, _alo, _ont = manifold_groups[0]
+            self._single_affine_fast = (_sub, _dom, _tgt, _org, _alo, _ont)
         # New group set ⇒ cold-start every foot-follower (seed at origin).
         self._manifold_feet = [None] * len(manifold_groups)
 
     def hook_fn(self, module: Any, input: Any, output: Any) -> Any:
+        # Fast path: one always-active affine group (the common steering case).
+        # Skips the group loop, the trigger re-check, and the foot-seed branch;
+        # the analytic affine slide consults no per-step ctx, so it is correct
+        # whether or not ``ctx`` is set.  Behaviorally identical to the general
+        # path for this group shape (one ``subspace_inject`` + ``copy_``).
+        fast = self._single_affine_fast
+        if fast is not None:
+            hidden = output if isinstance(output, torch.Tensor) else output[0]
+            sub, domain, target, origin, along, onto = fast
+            h_new, _foot = subspace_inject(
+                hidden, sub, domain, target, origin, along, onto, gn_steps=1,
+            )
+            hidden.copy_(h_new)
+            return output
         groups = self.manifold_groups
         if not groups:
             return output
@@ -501,15 +626,37 @@ class SteeringManager:
     def all_fast_path(self) -> bool:
         """True iff no steering hook is attached (the unsteered path).
 
-        The 4.0 backend lowers every steering term to a slow (ctx-consulting)
-        :func:`subspace_inject` group, so there is no longer a composed-tensor
-        fast path.  An attached hook therefore always forces the slow path,
-        which is the StaticCache / ``torch.compile`` graph-capture
-        ineligibility signal :mod:`saklas.core.cuda_graphs` reads — graph
-        capture stays available only for unsteered generation (no hooks),
-        the cheapest case.
+        The cheapest case: nothing mutates the residual stream, so StaticCache
+        / ``torch.compile`` graph capture is unconditionally eligible.  A
+        ctx-consulting / curved / gated hook still forces the eager
+        DynamicCache path; the *static-affine* steered case is captured by the
+        separate :meth:`static_steerable` signal below.
         """
         return not self.hooks
+
+    def static_steerable(self) -> bool:
+        """True iff every attached hook is the static single-affine fast path.
+
+        The precondition for routing *steered* generation through StaticCache /
+        CUDA-graph capture: each steered layer carries exactly one always-active
+        (``Trigger.BOTH``) affine group — the analytic subspace slide
+        (:attr:`SteeringHook._single_affine_fast`) consults no per-step
+        ``TriggerContext`` and threads no foot state, so its injection is a
+        fixed sequence of tensor ops, identical every decode step.  StaticCache
+        never bypasses forward hooks (the hook fires on every forward, writing
+        into the preallocated K/V buffers), so the steering applies unchanged;
+        the analytic affine ops are also traceable, so ``torch.compile``
+        graph capture can fold them into the captured region (and
+        ``_compile_with_probe``'s warmup falls back to eager if a given arch
+        breaks capture).  Any curved manifold, probe gate, or phase-gated
+        trigger leaves a hook on the general (ctx-consulting) path and
+        disqualifies the whole generation.  False when unsteered — that is
+        :meth:`all_fast_path`'s (cheaper) case.
+        """
+        hooks = self.hooks
+        return bool(hooks) and all(
+            h._single_affine_fast is not None for h in hooks.values()
+        )
 
     def add_manifold(
         self,

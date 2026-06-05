@@ -521,3 +521,17 @@ def test_any_steering_forces_slow_path():
                      along=0.5, onto=0.0)
     mgr.apply_to_model(_model_layers(3), torch.device("cpu"), torch.float32)
     assert mgr.all_fast_path() is False
+
+
+def test_curved_manifold_not_static_steerable():
+    # A curved manifold runs the per-token foot-following hook (ctx + GN
+    # state), so it can't ride the static-affine StaticCache / graph-capture
+    # path — ``static_steerable`` must be False even though it's steered.
+    mgr = SteeringManager()
+    mgr.add_manifold("mood", _manifold(layers=(0, 1)), position=(0.5,),
+                     along=0.5, onto=0.0)
+    mgr.apply_to_model(_model_layers(3), torch.device("cpu"), torch.float32)
+    assert mgr.static_steerable() is False
+    assert all(
+        h._single_affine_fast is None for h in mgr.hooks.values()
+    )

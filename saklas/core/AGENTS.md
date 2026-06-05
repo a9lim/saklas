@@ -243,10 +243,16 @@ Naturalness eval: `to_hellinger`, `bhattacharyya_distance`, `fit_behavior_manifo
 origin_coord, along, onto)` and runs each active one through `subspace_inject`
 (`_apply_manifold_groups`). A cheap pre-check skips inactive steps. Per-token foot
 state `_manifold_feet` (cold → seed at `origin`, `_MANIFOLD_COLD_GN_STEPS = 4` GN
-steps; warm → one step). No composed-tensor fast path: a steered layer always
-runs the slow (ctx-consulting) hook, so per-step triggers / probe gates work
-uniformly; `all_fast_path()` is true only unsteered (the StaticCache / graph-
-capture eligibility signal).
+steps; warm → one step). The dominant case — exactly one always-active
+(`Trigger.BOTH`) affine group — is precomputed at `recompose` into
+`_single_affine_fast` and `hook_fn` short-circuits to it: one `subspace_inject` +
+`copy_`, no group loop, no trigger re-check, no foot-seed. `all_fast_path()` is
+true only unsteered (no hooks); `static_steerable()` is true when *every* hook is
+that static-affine fast path — those are the two StaticCache / graph-capture
+eligibility signals (`session.use_static_cache` ORs them). A curved / gated /
+phased hook consults ctx + foot state per step and disqualifies both. `subspace_inject`
+returns its fp32 result and the hook's `copy_` does the model-dtype downcast (no
+per-fire downcast temp).
 
 `SteeringManager` owns `subspaces` (dispatch-synthesized merged affine, one per
 trigger group, via `add_subspace`) + `manifolds` (curved, via `add_manifold`).
@@ -261,29 +267,45 @@ directions), and enforces `_CURVED_ORTHO_TOL = 1e-3` between two curved manifold
 meant to overshoot; `norm_cap` bounds it). `onto` stays clamped `[0,1]`.
 `reset_manifold_feet` cold-starts followers per generation.
 
-`HiddenCapture` — `attach`/`detach`/`stacked`/`latest_per_layer`. Incremental
-mode (`set_incremental`) overwrites a length-1 bucket per layer so device memory
-stays O(layers·D); fires the step sink after the highest hooked layer. The session
-enables it for the common monitored case (probes attached, no `return_hidden`):
-`_begin_capture` installs a step sink that scores each token live via
-`Monitor.score_single_token` and keeps only the per-token `ProbeReading` rows, and
-`_finalize_generation`/`_score_incremental` build (aggregate, per-token) from those
-rows. `return_hidden` (widen) or no probe falls back to full retention +
-`score_per_token`. Either way each read is a full per-probe `ProbeReading` —
-incremental wins memory (no O(T·layers·D) stack), not a coord-row throughput
-shortcut.
+`HiddenCapture` — `attach`/`detach`/`stacked`/`latest_per_layer`. Three modes,
+chosen by `_begin_capture` from `need_per_token`:
+
+- **incremental** (`set_incremental`) — a gate / live-stream consumer wants
+  per-token readings: overwrites a single preallocated length-1 buffer per layer
+  via `copy_` (zero per-step capture allocation, O(layers·D) memory) and fires the
+  step sink after the highest hooked layer to score each token live; the per-token
+  `ProbeReading` rows back `_score_incremental`'s (aggregate, per-token).
+- **aggregate-only** (`set_aggregate_tail`) — probes attached but *nothing*
+  consumes a per-token reading (no gate, no loom row, no trait stream, no live
+  scores — e.g. a stateless server gen): keeps a bounded tail ring
+  (`_AGG_TAIL_DEPTH = 8`) and runs NO step sink, so the decode loop pays zero
+  per-token scoring; `_finalize_generation`/`_score_aggregate_only` pool the last
+  *content* token once via `tail_slice_at` (the ring is deep enough to walk back
+  past trailing specials) and one `Monitor.score_aggregate`.
+- **full retention** (append) — `return_hidden` (widen) or any non-incremental
+  read: distinct clones per step so `stacked()` builds the full `[T, D]`;
+  `score_per_token`.
+
+Every read is a full per-probe `ProbeReading` either way; the modes trade only
+*when/how often* scoring runs (per token vs once) and memory (length-1 vs tail
+ring vs full stack).
 
 ## monitor.py
 
 `Monitor` — **one** read-side class (the unification of the former `TraitMonitor` +
 `ManifoldMonitor`) that reads every probe shape as whitened subspace coordinates,
 flat and curved alike. Hook-driven, fp32, Mahalanobis-only (`covers_all` or
-`WhitenerError`). **One** read path: `_score_full` loops every probe through
-`_score_probe_full`, which loops the probe's shared fit layers through
-`_layer_geometry` and EV-weights across them — there is no batched-affine fast path
-and no flat/curved field asymmetry. The research-tool priority is full per-token
-information (nearest, curved coords, residual, per-layer), not the throughput a
-batched matmul bought. Each layer's `_layer_geometry` yields the M-orthogonal
+`WhitenerError`). **One** read shape, two execution paths: `_score_full` scores the
+whole *flat* roster together in `_score_flat_batched` (one `Σ⁻¹h` Woodbury apply +
+stacked / block-diagonal matmuls + a single host transfer per layer, scattered into
+global per-probe slots) and runs each *curved* probe through `_score_probe_full`
+(the per-probe `invert_parameterization` foot solve, warm-started across decode
+tokens from the previous foot when `enable_curved_warm` is set — the sequential
+live path). No flat/curved field asymmetry — both yield the full `ProbeReading`
+(the research-tool priority is full per-token information: nearest, curved coords,
+residual, per-layer). `score_aggregate` pools one token (the last content token)
+and runs the per-probe `_score_probe_full`, so the aggregate is bit-identical to
+the live read at that index. Each layer's `_layer_geometry` yields the M-orthogonal
 **fraction** `sqrt(gᵀ M_R⁻¹ g)/‖x‖_M` (`g = B Σ⁻¹ x`), the whitened query for the
 **nearest** `M_R`-metric node, and the M-projection reduced coord `c = M_R⁻¹ g`.
 From there:
@@ -351,9 +373,15 @@ ignore `past_key_values` (e.g. talkie) flip `no_cache_mode` (O(N²), one warning
 composes into a local copy. Top-p via `torch.topk` (not full-vocab sort); `top_k`
 (default 1024 cap) applied before top-p. `generate_steered` accepts `seed`, `stop`,
 `logit_bias`, presence/frequency penalties, `logprobs`, `score_callback` (probe
-gates), `forced_prefix`, `steering_active`. `forced_prefix` forces the first N
-decode tokens while the multinomial draw still runs (re-seeding stays bit-
-identical through the fork). `fork_from_token` / `prefill_assistant` /
+gates), `forced_prefix`, `steering_active`, `want_perplexity`. `forced_prefix`
+forces the first N decode tokens while the multinomial draw still runs (re-seeding
+stays bit-identical through the fork). `want_perplexity=False` skips the per-token
+entropy `.item()` host sync (one sync/token) when no consumer surfaces perplexity —
+the session passes False for stateless gens that aren't loom-attached / opted-in
+(server streaming never reads per-token ppl); `cand_logp` is still computed when
+`logprobs` needs it. Stop-sequence matching keeps only a bounded tail of the
+emitted text (`_stop_keep = max(len(s))−1` chars) instead of growing the full
+completion, so the per-token match is O(tail+emit) not the old O(n²) concat. `fork_from_token` / `prefill_assistant` /
 `append_user_turn` / `append_assistant_turn` are the fork / commit entry points.
 `detect_base_model` (no chat template) routes flat (`raw=True`) generation.
 Per-message role substitution (`role_templates.apply_with_per_turn_roles`) backs
@@ -442,12 +470,16 @@ re-scorable via `session.score_hidden`. Probes ride the same plumbing:
 `add_probe(selector, *, as_name=None, top_n=3)` resolves via `_resolve_probe_manifold`
 (a 2-node `pca` concept folds to a rank-1 probe via `_fold_profile_probe`; a
 multi-node manifold attaches whole) and registers on the unified `_monitor`;
-`remove_probe(name)` detaches. `_begin_capture` widens to `_monitor.probe_layers()`;
-the gate callback runs one `_monitor.score_single_token` through `flat_scalars` into
+`remove_probe(name)` detaches. `_begin_capture` widens to `_monitor.probe_layers()`
+and picks the capture mode from `need_per_token` (gate ∨ loom row ∨ trait stream ∨
+live scores ∨ per-layer persist — see hooks.py `HiddenCapture`): per-token
+incremental scoring when something consumes a per-token reading, else aggregate-only
+(no per-token scoring, pool once at finalize). The gate callback runs one
+`_monitor.score_single_token` through `flat_scalars` into
 `TriggerContext.probe_scores` (one key space —
 `"<name>"`/`"<name>[i]"`/`"<name>:fraction"`/`"<name>@<label>"`);
-`_finalize_generation` calls `_monitor.score_aggregate` into
-`GenerationResult.probe_readings`.
+`_finalize_generation` calls `_score_incremental` / `_score_aggregate_only` /
+`score_per_token` (per mode) into `GenerationResult.probe_readings`.
 `session.lock` is the server-owned `asyncio.Lock` (distinct from `_gen_lock`).
 `generate_batch`/`generate_sweep` return `RunSet` (sweep builds the Cartesian
 product as loom siblings). `generate_batch` auto-shares one prefill across rows

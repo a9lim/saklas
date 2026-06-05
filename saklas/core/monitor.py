@@ -55,20 +55,28 @@ def _woodbury_apply(
 class Monitor:
     """Reads probes as whitened subspace coordinates — flat and curved alike.
 
-    **One** read path.  Each probe is a
+    **One** read shape, two execution paths.  Each probe is a
     :class:`~saklas.core.manifold.Manifold`, and every read — live per token
-    (gate / stream) and the end-of-generation aggregate — runs the same
-    per-probe per-layer geometry (:func:`_layer_geometry`) and produces one
-    full :class:`ProbeReading`.  There is no batched-affine fast path and
-    no flat/curved field asymmetry: a flat (affine) probe recovers ``coords``
-    through the affine reduced→domain map (off-surface ``residual`` is
-    identically 0), a curved probe through the iterative
-    :func:`invert_parameterization` foot solve (the off-surface ``residual``
-    is real).  Both report ``coords`` + ``fraction`` + ``nearest`` +
-    ``residual`` plus their ``*_per_layer`` traces, every token.  This trades
-    the old hot-path batching for full per-token information — the project is
-    a research tool, and the per-token nearest / curved coords / residual /
-    per-layer data is worth the throughput.
+    (gate / stream) and the end-of-generation aggregate — produces one full
+    :class:`ProbeReading` (``coords`` + ``fraction`` + ``nearest`` +
+    ``residual`` plus their ``*_per_layer`` traces), with no flat/curved field
+    asymmetry: a flat (affine) probe recovers ``coords`` through the affine
+    reduced→domain map (off-surface ``residual`` identically 0), a curved probe
+    through the iterative :func:`invert_parameterization` foot solve (real
+    off-surface ``residual``).  The full per-token information (nearest, curved
+    coords, residual, per-layer) is the research-tool priority.
+
+    Execution is still no-redundancy on the hot path.  The whole *flat* roster
+    is scored together per layer in :meth:`_score_flat_batched` — one ``Σ⁻¹h``
+    Woodbury apply + stacked / block-diagonal matmuls + a **single** host
+    transfer for the roster — instead of re-running the apply and the R-dim
+    solve per probe per layer.  *Curved* probes keep the per-probe foot solve
+    (:meth:`_score_probe_full`), warm-started across decode tokens from the
+    previous token's foot (:meth:`enable_curved_warm`) on the sequential live
+    path.  And when nothing consumes a per-token reading (no gate, no stream),
+    the session skips per-token scoring entirely and pools the aggregate once
+    at finalize — see ``SaklasSession._begin_capture`` /
+    :meth:`score_aggregate`.
 
     Coordinates are **domain-frame**: each layer's reduced activation
     coordinate is inverted into the shared domain *before* EV-averaging,
@@ -158,6 +166,18 @@ class Monitor:
         self._live_count: int = 0
         self._live_pending: bool = False
 
+        # Curved-probe per-token foot-follow (read-side analogue of the steering
+        # foot-follower).  When ``_curved_warm`` is set — only the sequential
+        # incremental live-scoring path enables it, via ``enable_curved_warm`` —
+        # ``_score_probe_full`` seeds each curved probe's ``invert_parameterization``
+        # from the previous token's foot (keyed ``(probe_name, layer_idx)``) and
+        # stashes the refined foot for the next token, cutting the cold
+        # 12-iter/3-restart solve to ``warm_iter`` steps over two restarts.  Off
+        # by default and for one-off reads (``score_aggregate`` / ``score_hidden``
+        # / the non-incremental stream), so those stay bit-for-bit the cold path.
+        self._curved_feet: dict[tuple[str, int], torch.Tensor] = {}
+        self._curved_warm: bool = False
+
         if probe_manifolds:
             for _name, _m in probe_manifolds.items():
                 self.add_probe(_name, _m)
@@ -217,6 +237,26 @@ class Monitor:
             probe.whitened = _build_whitened_factors(
                 whitener, probe, factor_cache=self._whitener_factor_cache,
             )
+
+    def enable_curved_warm(self, flag: bool) -> None:
+        """Enable/disable curved-probe per-token foot warm-starting.
+
+        The session flips this on only for the sequential incremental
+        live-scoring path (one ``score_single_token`` per decode step) and off
+        otherwise, so one-off / out-of-order reads (``score_aggregate``,
+        ``score_hidden``, the non-incremental per-token stream) stay on the cold
+        ``invert_parameterization`` path and remain bit-for-bit reproducible.
+        """
+        self._curved_warm = bool(flag)
+
+    def reset_curved_feet(self) -> None:
+        """Cold-start every curved probe's per-token foot (call per generation).
+
+        Peer of ``SteeringManager.reset_manifold_feet`` — the carried foot is
+        per-generation state, so a new run must re-seed from the nearest node
+        rather than inherit the previous run's final foot.
+        """
+        self._curved_feet.clear()
 
     def _invalidate_flat_cache(self) -> None:
         """Drop the cross-probe batched flat-read cache.
@@ -311,10 +351,17 @@ class Monitor:
                 )
                 resid_t = frac_t.new_zeros(1)
             else:
+                # Curved probe: warm-start the nearest-point foot from the
+                # previous token's foot when the session enabled it for this
+                # (sequential) live-scoring pass; otherwise solve cold.
+                foot_key = (probe.name, layer_idx)
+                warm = self._curved_feet.get(foot_key) if self._curved_warm else None
                 pos, res = invert_parameterization(
                     sub, manifold.domain, invert_query.reshape(1, -1),
-                    manifold.node_coords,
+                    manifold.node_coords, warm_start=warm,
                 )
+                if self._curved_warm:
+                    self._curved_feet[foot_key] = pos.detach()
                 pos_t = pos.reshape(-1)
                 par_norm = torch.linalg.vector_norm(invert_query)
                 res_flat = res.reshape(-1)[:1]
