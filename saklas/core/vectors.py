@@ -18,19 +18,35 @@ from safetensors.torch import load_file, save_file
 log = logging.getLogger(__name__)
 
 
-def _capture_all_hidden_states(model: torch.nn.Module, layers: torch.nn.ModuleList, input_ids: torch.Tensor):
+def _capture_all_hidden_states(
+    model: torch.nn.Module,
+    layers: torch.nn.ModuleList,
+    input_ids: torch.Tensor,
+    *,
+    pool_index: int | None = None,
+):
     """Run a single-sequence forward pass capturing hidden states at ALL layers.
 
     Uses ``use_cache=False`` to avoid polluting any persistent KV cache.
 
     Returns:
-        dict mapping layer index to (1, seq, dim) tensors.
+        dict mapping layer index to (1, seq, dim) tensors, or to pooled
+        (dim,) fp32 tensors when ``pool_index`` is supplied.
     """
     captured_hidden: dict[int, torch.Tensor] = {}
 
     def _make_hook(idx: int):
         def _hook(module: torch.nn.Module, input: Any, output: Any):
             h = output if isinstance(output, torch.Tensor) else output[0]
+            if pool_index is not None:
+                pos = min(max(int(pool_index), 0), h.shape[1] - 1)
+                pooled = h[0, pos, :].detach()
+                captured_hidden[idx] = (
+                    pooled.to(torch.float32)
+                    if pooled.dtype != torch.float32
+                    else pooled.clone()
+                )
+                return
             # No .clone() — with use_cache=False and inference_mode() the
             # residual-stream tensors are fresh allocations at each layer
             # boundary (residual add produces a new tensor).  Detach severs
@@ -147,9 +163,11 @@ def _encode_and_capture_all(
         tokenizer, prompt, response, device,
         role=role, model_type=model_type, system_msg=system_msg,
     )
-    hidden_per_layer = _capture_all_hidden_states(model, layers, ids)
+    hidden_per_layer = _capture_all_hidden_states(
+        model, layers, ids, pool_index=content_end,
+    )
     return {
-        idx: h[0, min(content_end, h.shape[1] - 1)].float()
+        idx: h if h.ndim == 1 else h[0, min(content_end, h.shape[1] - 1)].float()
         for idx, h in hidden_per_layer.items()
     }
 
@@ -347,7 +365,9 @@ def compute_neutral_activations(
     assert device is not None  # device is always set by this point
 
     n_layers = len(layers)
-    rows: list[dict[int, torch.Tensor]] = []
+    rows_by_layer: dict[int, list[torch.Tensor]] = {
+        idx: [] for idx in range(n_layers)
+    }
     _mps = device.type == "mps"
 
     for prompt, response in _neutral_pairs():
@@ -356,14 +376,15 @@ def compute_neutral_activations(
         )
         # Move each layer's vector to CPU before discarding the rest of
         # the captured dict — same MPS discipline as ``compute_layer_means``.
-        rows.append({idx: per_layer[idx].detach().to("cpu") for idx in range(n_layers)})
+        for idx in range(n_layers):
+            rows_by_layer[idx].append(per_layer[idx].detach().to("cpu"))
         del per_layer
         if _mps:
             torch.mps.empty_cache()
 
     return {
-        idx: torch.stack([row[idx] for row in rows])  # (N, D), fp32 on cpu
-        for idx in range(n_layers)
+        idx: torch.stack(rows)  # (N, D), fp32 on cpu
+        for idx, rows in rows_by_layer.items()
     }
 
 

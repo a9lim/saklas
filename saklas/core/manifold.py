@@ -809,6 +809,7 @@ def _pca_basis(
     n_components: int = DEFAULT_N_COMPONENTS,
     whitener: "LayerWhitener | None" = None,
     layer: int | None = None,
+    whitened_gram: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, float]:
     """μ-centered PCA basis — Euclidean (default) or whitened/Fisher.
 
@@ -829,21 +830,34 @@ def _pca_basis(
     raw inter-node variance ratio.  Shared by :func:`fit_layer_subspace`
     (curved RBF) and :func:`fit_affine_subspace` (flat) so both pick the
     basis identically — only what's built on top differs.
+
+    ``whitened_gram`` may provide a precomputed ``X Σ⁻¹ Xᵀ`` for fit
+    callers that already built the same Gram for diagnostics or discover
+    coordinate derivation, avoiding a second Woodbury pass over the layer.
     """
     K = int(X.shape[0])
     if whitener is not None and layer is not None:
         # Whitened (Fisher) PCA — generalized eigenproblem (S_b, Σ) via the
         # whitener's low-rank Woodbury Σ⁻¹.  ``G = X Σ⁻¹ Xᵀ`` is K×K; its
         # eigvecs ``a`` give the discriminant directions ``v_r = Σ⁻¹ Xᵀ a_r``.
-        G = whitener.subspace_gram(layer, X)            # (K, K) = X Σ⁻¹ Xᵀ
+        G = (
+            whitened_gram.to(dtype=torch.float32, device="cpu")
+            if whitened_gram is not None
+            else whitener.subspace_gram(layer, X)
+        )                                               # (K, K) = X Σ⁻¹ Xᵀ
+        if G.shape != (K, K):
+            raise ValueError(
+                f"whitened_gram shape {tuple(G.shape)} does not match "
+                f"centered scatter shape ({K}, {K})"
+            )
         mu, A = torch.linalg.eigh(G)                    # ascending
         mu_pos = mu.clamp_min(0.0)
         rank = int((mu_pos > 1e-6 * mu_pos[-1].clamp(min=1e-12)).sum().item())
         R = max(1, min(n_components, K - 1, rank))
         top = torch.argsort(mu, descending=True)[:R]
         XtA = X.transpose(0, 1) @ A[:, top]             # (D, R) = Xᵀ a_r
-        directions = torch.stack(
-            [whitener.apply_inv(layer, XtA[:, j]) for j in range(R)]
+        directions = whitener.apply_inv(
+            layer, XtA.transpose(0, 1).contiguous(),
         )                                               # (R, D) = Σ⁻¹ Xᵀ a_r
         # QR → orthonormal column span identical to the discriminant span;
         # transpose back to (R, D) rows the LayerSubspace expects.
@@ -875,6 +889,7 @@ def fit_affine_subspace(
     n_components: int = DEFAULT_N_COMPONENTS,
     whitener: "LayerWhitener | None" = None,
     layer: int | None = None,
+    whitened_gram: torch.Tensor | None = None,
     orient_to: int | None = 0,
 ) -> tuple[LayerSubspace, torch.Tensor, float]:
     """Fit a flat (affine, no-RBF) subspace from per-node centroids (§5).
@@ -921,6 +936,7 @@ def fit_affine_subspace(
     X = centroids - mu  # (K, D) μ-centered
     basis, ev_ratio = _pca_basis(
         X, n_components=n_components, whitener=whitener, layer=layer,
+        whitened_gram=whitened_gram,
     )
     if orient_to is not None:
         proj = basis @ (centroids[orient_to] - mu)      # (R,)
@@ -978,6 +994,7 @@ def fit_layer_subspace(
     whitener: "LayerWhitener | None" = None,
     layer: int | None = None,
     neutral_mean: torch.Tensor | None = None,
+    whitened_gram: torch.Tensor | None = None,
 ) -> tuple[LayerSubspace, float]:
     """Fit a PCA subspace + RBF interpolant for one layer (curved).
 
@@ -1050,6 +1067,7 @@ def fit_layer_subspace(
     # differs.
     basis, ev_ratio = _pca_basis(
         X, n_components=n_components, whitener=whitener, layer=layer,
+        whitened_gram=whitened_gram,
     )
     # Neutral-anchor the frame (§5): ``mean = P_basis(anchor)`` and the RBF
     # interpolates **anchor-relative** reduced coords, so neutral lands at

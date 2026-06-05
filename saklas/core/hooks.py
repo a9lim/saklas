@@ -289,12 +289,19 @@ class SteeringHook:
         curved manifold are both groups here, dispatched by the kernel's
         ``is_affine`` branch (analytic slide vs foot-following GN).
         """
+        lead = hidden.shape[:-1]
         for i, (
             trig, sub, domain, target, origin, along, onto,
         ) in enumerate(self.manifold_groups):
             if not trig.active(ctx):
                 continue
-            lead = hidden.shape[:-1]
+            if sub.is_affine:
+                h_new, _foot = subspace_inject(
+                    hidden, sub, domain, target, origin,
+                    along, onto, gn_steps=1,
+                )
+                hidden.copy_(h_new)
+                continue
             seed = self._manifold_feet[i]
             # Warm only when the carried foot's leading shape broadcasts onto
             # this fire (B unchanged, one decode position).  A prefill→decode

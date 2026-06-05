@@ -402,25 +402,32 @@ class LayerWhitener:
 
         ``v`` is promoted to fp32 on CPU regardless of input dtype/device
         — ``LayerWhitener`` is an analysis-time tool, not a hot path.
-        Output matches ``v``'s original dtype.
+        The last dimension is the hidden dimension; leading dimensions
+        are batched through the same Woodbury factors so fit-time callers
+        can whiten several directions with one ``X``/``K`` pass. Output
+        matches ``v``'s original dtype and shape.
         """
         if layer not in self._X:
             raise WhitenerError(f"whitener does not cover layer {layer}")
         v_in_dtype = v.dtype
-        v32 = v.to(dtype=torch.float32, device="cpu").reshape(-1)
-        if v32.shape[0] != self._dim[layer]:
+        v32 = v.to(dtype=torch.float32, device="cpu")
+        if v32.shape[-1] != self._dim[layer]:
             raise WhitenerError(
-                f"layer {layer}: input dim {v32.shape[0]} does not match "
+                f"layer {layer}: input dim {v32.shape[-1]} does not match "
                 f"whitener dim {self._dim[layer]}"
             )
         X = self._X[layer]
         K = self._K[layer]
         lam = self._lambda[layer]
-        # X v  ∈ ℝ^N ; K (X v)  ∈ ℝ^N ; X^T (K X v)  ∈ ℝ^D
-        Xv = X @ v32  # (N,)
-        KXv = K @ Xv  # (N,)
-        out = (v32 - X.transpose(0, 1) @ KXv) / lam
-        return out.to(dtype=v_in_dtype)
+        original_shape = v32.shape
+        rows = v32.reshape(-1, self._dim[layer])
+        # X v  ∈ ℝ^N ; K (X v)  ∈ ℝ^N ; X^T (K X v)  ∈ ℝ^D.
+        # Batched as rows @ X.T so a rank-R fit whitens R directions with
+        # one BLAS call per Woodbury leg instead of R Python calls.
+        Xv = rows @ X.transpose(0, 1)        # (B, N)
+        KXv = Xv @ K.transpose(0, 1)         # (B, N)
+        out = (rows - KXv @ X) / lam         # (B, D)
+        return out.reshape(original_shape).to(dtype=v_in_dtype)
 
     def woodbury_factors(
         self, layer: int, *, device: torch.device, dtype: torch.dtype,

@@ -306,6 +306,54 @@ def test_fit_layer_subspace_neutral_anchored():
     assert torch.allclose(q, torch.zeros(sub_n.rank), atol=1e-4)
 
 
+def test_fit_affine_subspace_reuses_precomputed_whitened_gram():
+    """Extraction precomputes ``X Σ⁻¹ Xᵀ`` for diagnostics / discover coords;
+    the affine fit should consume that Gram instead of recomputing it."""
+    from saklas.core.manifold import fit_affine_subspace
+    from tests._whitener import synthetic_means, synthetic_whitener
+
+    torch.manual_seed(19)
+    centroids = torch.randn(6, 14)
+    means = synthetic_means([0], 14)
+    base = synthetic_whitener([0], 14, means=means)
+    X = centroids - centroids.mean(dim=0)
+    gram = base.subspace_gram(0, X)
+
+    class CountingWhitener:
+        def __init__(self, inner: Any) -> None:
+            self.inner = inner
+            self.subspace_gram_calls = 0
+
+        def subspace_gram(self, *args: Any, **kwargs: Any) -> torch.Tensor:
+            self.subspace_gram_calls += 1
+            return self.inner.subspace_gram(*args, **kwargs)
+
+        def apply_inv(self, *args: Any, **kwargs: Any) -> torch.Tensor:
+            return self.inner.apply_inv(*args, **kwargs)
+
+    counting = CountingWhitener(base)
+    sub, mu_coords, ev = fit_affine_subspace(
+        centroids,
+        neutral_mean=means[0],
+        n_components=3,
+        whitener=counting,  # type: ignore[arg-type]
+        layer=0,
+        whitened_gram=gram,
+    )
+    ref_sub, ref_mu_coords, ref_ev = fit_affine_subspace(
+        centroids,
+        neutral_mean=means[0],
+        n_components=3,
+        whitener=base,
+        layer=0,
+    )
+
+    assert counting.subspace_gram_calls == 0
+    assert torch.allclose(sub.basis, ref_sub.basis, atol=1e-5)
+    assert torch.allclose(mu_coords, ref_mu_coords, atol=1e-5)
+    assert ev == pytest.approx(ref_ev, abs=1e-6)
+
+
 def test_fit_layer_subspace_rejects_too_few_nodes():
     with pytest.raises(ValueError):
         fit_layer_subspace(torch.randn(2, 8), torch.rand(2, 1))

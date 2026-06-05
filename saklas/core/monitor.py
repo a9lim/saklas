@@ -221,7 +221,7 @@ class Monitor:
 
         K = probe.node_values_reduced[shared[0]].shape[0]
         n_dim = manifold.domain.intrinsic_dim
-        dist_acc = [0.0] * K
+        dist_acc_t: torch.Tensor | None = None
         frac_per_layer: dict[int, float] = {}
         coords_per_layer: dict[int, tuple[float, ...]] = {}
         residual_per_layer: dict[int, float] = {}
@@ -242,10 +242,15 @@ class Monitor:
             w = w_shared[layer_idx]
             frac_mean += w * frac
 
-            dists = torch.cdist(cdist_query, cdist_nodes).reshape(-1)
-            dist_list = dists.cpu().tolist()
-            for k in range(K):
-                dist_acc[k] += w * dist_list[k]
+            dists = torch.linalg.vector_norm(
+                cdist_nodes - cdist_query.reshape(1, -1), dim=-1,
+            )
+            weighted_dists = dists * w
+            dist_acc_t = (
+                weighted_dists
+                if dist_acc_t is None
+                else dist_acc_t + weighted_dists.to(dist_acc_t.device)
+            )
 
             if is_affine:
                 # Affine map: coords are exact, no off-subspace residual.
@@ -283,6 +288,9 @@ class Monitor:
                     if i < len(coords_mean):
                         coords_mean[i] += w * c
 
+        dist_acc = (
+            dist_acc_t.cpu().tolist() if dist_acc_t is not None else [0.0] * K
+        )
         order = sorted(range(K), key=lambda k: dist_acc[k])
         nearest = [
             (manifold.node_labels[k], dist_acc[k]) for k in order[: probe.top_n]
@@ -781,6 +789,8 @@ class _LayerWhiten:
     m_r_inv: torch.Tensor      # (R, R) = (B Σ⁻¹ Bᵀ)⁻¹
     chol: torch.Tensor         # (R, R) lower-tri, M_R = chol @ cholᵀ
     node_white: torch.Tensor   # (K, R) = node_values_reduced @ chol
+    mean: torch.Tensor         # (D,) fit mean on the scoring device
+    basis: torch.Tensor        # (R, D) basis on the scoring device
     X: torch.Tensor            # (N, D) centered neutral observations
     K_inv: torch.Tensor        # (N, N) Woodbury inverse
     lam: float                 # ridge λ
@@ -924,6 +934,8 @@ def _build_whitened_factors(
             m_r_inv=m_r_inv_dev,
             chol=chol_dev,
             node_white=(v_reduced.to(torch.float32) @ chol_dev),
+            mean=sub.mean.to(device=dev, dtype=torch.float32),
+            basis=sub.basis.to(device=dev, dtype=torch.float32),
             X=X, K_inv=K_inv, lam=lam,
             coord_S=coord_S, coord_b=coord_b,
         )
@@ -1005,15 +1017,14 @@ def _layer_geometry(
       ``c = M_R⁻¹ g`` for :func:`invert_parameterization`.
     * ``cdist_nodes`` — ``(K, R)`` whitened node coords.
     """
-    sub = probe.manifold.layers[layer_idx]
-    mean = sub.mean.to(device=h.device, dtype=torch.float32)
-    basis = sub.basis.to(device=h.device, dtype=torch.float32)
     wh = probe.whitened.get(layer_idx)
     if wh is None:
         raise WhitenerError(
             f"subspace probe read missing whitened factors for layer "
             f"{layer_idx}; rebuild the probe (the Euclidean path is gone)"
         )
+    mean = wh.mean
+    basis = wh.basis
     x = h - mean
     sx = _woodbury_apply(x, wh.X, wh.K_inv, wh.lam)  # Σ⁻¹ x  (D,)
     x_mnorm = torch.sqrt(

@@ -141,6 +141,20 @@ class TestApplyInv:
         direct = Sigma_inv_direct @ v
         assert torch.allclose(woodbury, direct, atol=1e-4, rtol=1e-4)
 
+    def test_apply_inv_batches_leading_dims(self):
+        """Batched input matches stacking independent Woodbury applies."""
+        w = _build_whitener(layers=(0,), d=16)
+        V = torch.randn(3, 2, 16, generator=torch.Generator().manual_seed(123))
+
+        batched = w.apply_inv(0, V)
+        expected = torch.stack([
+            torch.stack([w.apply_inv(0, row) for row in block])
+            for block in V
+        ])
+
+        assert batched.shape == V.shape
+        assert torch.allclose(batched, expected, atol=1e-5, rtol=1e-5)
+
     def test_apply_inv_preserves_dtype(self):
         w = _build_whitener()
         v_fp16 = torch.randn(16, dtype=torch.float16)
@@ -443,4 +457,3 @@ class TestRepr:
 
 
 # --------------------------------------- Mahalanobis bake at extract time ---
-

@@ -50,7 +50,6 @@ from saklas.core.steering import Steering
 from saklas.core.steering_expr import AblationTerm, ManifoldTerm
 from saklas.core.manifold import Manifold
 from saklas.core.triggers import Trigger
-from saklas.core.vectors import last_content_index
 from saklas.core.vectors import load_profile as _load_profile
 
 _log = logging.getLogger(__name__)
@@ -3608,15 +3607,24 @@ class SaklasSession:
             _decoded = self._tokenizer.decode(response_ids, skip_special_tokens=True)
             text = _decoded if isinstance(_decoded, str) else _decoded[0]
 
+        captured_stack: dict[int, torch.Tensor] = {}
+        if generated_ids and (self._monitor.probe_names or return_hidden):
+            captured_stack = self._capture.stacked()
+
+        agg_vals: dict[str, ProbeReading] = {}
         if self._monitor.probe_names and generated_ids:
             if self._capture_incremental:
                 agg_vals, per_token = self._score_incremental(
                     generated_ids, accumulate=not stateless,
                 )
             else:
-                agg_vals, per_token = self.score_captured(
-                    generated_ids, accumulate=not stateless,
-                )
+                if captured_stack:
+                    agg_vals, per_token = self._monitor.score_per_token(
+                        captured_stack, generated_ids, self._tokenizer,
+                        accumulate=not stateless,
+                    )
+                else:
+                    agg_vals, per_token = {}, {}
             self._last_per_token_scores = per_token or None
             if stateless:
                 # Stateless gens never touch the monitor's running history,
@@ -3640,8 +3648,8 @@ class SaklasSession:
             readings = self.build_readings()
 
         hidden_states: dict[int, torch.Tensor] | None = None
-        if return_hidden and generated_ids:
-            raw = self._capture.stacked()  # {layer_idx: [n_captured, D] on device}
+        if return_hidden and generated_ids and captured_stack:
+            raw = captured_stack  # {layer_idx: [n_captured, D] on device}
             n = len(generated_ids)
             trimmed: dict[int, torch.Tensor] = {}
             for layer_idx, h in raw.items():
@@ -3667,24 +3675,13 @@ class SaklasSession:
             self._monitor.probe_names
             and generated_ids
         ):
-            stacked_caps = self._capture.stacked()
+            stacked_caps = captured_stack
             if stacked_caps:
-                n = len(generated_ids)
-                trimmed_caps: dict[int, torch.Tensor] = {}
-                for layer_idx, h in stacked_caps.items():
-                    if h.shape[0] > n:
-                        h = h[:n]
-                    elif h.shape[0] < n:
-                        continue
-                    trimmed_caps[layer_idx] = h
-                if trimmed_caps:
-                    # Pool the aggregate from the last non-special token,
-                    # matching the per-axis aggregate and extraction —
-                    # not a mean across the generated trajectory.
-                    agg_idx = last_content_index(generated_ids, self._tokenizer)
-                    manifold_aggregates = self._monitor.score_aggregate(
-                        trimmed_caps, agg_index=agg_idx,
-                    )
+                # ``score_per_token`` above already pools this same
+                # last-content-token aggregate and returns the full
+                # ProbeReading shape; reusing it avoids a second geometry
+                # pass and a second capture-stack traversal.
+                manifold_aggregates = dict(agg_vals)
 
         result = GenerationResult(
             text=text, tokens=list(generated_ids), token_count=token_count,

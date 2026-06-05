@@ -635,6 +635,7 @@ class ManifoldExtractionPipeline:
                 sub, mu_coords, ev_ratio = fit_affine_subspace(
                     stacked, neutral_mean=_neutral_for(idx),
                     whitener=maha_whitener, layer=idx,
+                    whitened_gram=layer_grams[idx],
                     orient_to=0, **affine_kwargs,
                 )
                 raw_fits[idx] = (sub, mu_coords)
@@ -664,7 +665,9 @@ class ManifoldExtractionPipeline:
                 sub, ev_ratio = fit_layer_subspace(
                     stacked, node_params,
                     whitener=maha_whitener, layer=idx,
-                    neutral_mean=_neutral_for(idx), **fit_kwargs,
+                    neutral_mean=_neutral_for(idx),
+                    whitened_gram=layer_grams[idx],
+                    **fit_kwargs,
                 )
                 layer_subs[idx] = sub
                 explained_variance[idx] = ev_ratio

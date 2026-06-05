@@ -14,6 +14,7 @@ from saklas.core.generation import (
     _PenaltyState,
     generate_steered,
 )
+from saklas.core.results import ProbeReading
 from saklas.core.session import SaklasSession
 
 
@@ -159,6 +160,75 @@ def test_stop_sequence_trimmed_text_is_final_result_text():
         stateless=True,
     )
     assert result.text == "Hello"
+
+
+def test_finalize_reuses_scored_probe_aggregate() -> None:
+    """Finalization should not rescore the same probe aggregate after
+    ``score_per_token`` already returned the full ``ProbeReading``."""
+
+    reading = ProbeReading(
+        fraction=0.5,
+        nearest=[("node", 0.25)],
+        coords=(0.25,),
+        fraction_per_layer={0: 0.5},
+        coords_per_layer={0: (0.25,)},
+    )
+
+    class Capture:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def stacked(self) -> dict[int, torch.Tensor]:
+            self.calls += 1
+            return {0: torch.randn(2, 4)}
+
+    class Monitor:
+        probe_names = ["toy"]
+
+        def score_per_token(
+            self,
+            captured: dict[int, torch.Tensor],
+            generated_ids: list[int],
+            tokenizer: Any,
+            *,
+            accumulate: bool = True,
+        ) -> tuple[dict[str, ProbeReading], dict[str, list[float]]]:
+            assert list(captured) == [0]
+            assert generated_ids == [0, 1]
+            assert accumulate is False
+            return {"toy": reading}, {"toy": [0.1, 0.25]}
+
+        def score_aggregate(self, *_args: Any, **_kwargs: Any) -> None:
+            raise AssertionError("aggregate was already scored")
+
+    capture = Capture()
+    state = GenerationState()
+    state.finish_reason = "length"
+
+    session: Any = SaklasSession.__new__(SaklasSession)
+    session._gen_state = state
+    session._tokenizer = _StopTokenizer()
+    session._monitor = Monitor()
+    session._capture = capture
+    session._capture_incremental = False
+    session._last_per_token_scores = None
+    session._last_result = None
+    session.events = SimpleNamespace(emit=lambda _event: None)
+    session.build_readings = lambda: {}
+
+    result = SaklasSession._finalize_generation(
+        session,
+        "prompt",
+        [0, 1],
+        elapsed=1.0,
+        vector_snapshot={},
+        stateless=True,
+    )
+
+    assert capture.calls == 1
+    assert result.probe_readings == {"toy": reading}
+    assert result.readings["toy"].mean == (0.25,)
+    assert session._last_per_token_scores == {"toy": [0.1, 0.25]}
 
 
 def test_penalty_state_applies_sparse_counts_on_device():
