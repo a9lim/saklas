@@ -375,6 +375,18 @@ class Monitor:
                     a["max"] = v
         self._pending_aggregate = True
 
+    def accumulate_readings(
+        self, readings: dict[str, ProbeReading],
+    ) -> None:
+        """Fold an already-scored aggregate into history/stats.
+
+        The normal stack-scoring path scores and accumulates in one call.  The
+        incremental capture path scores each token live, so finalization already
+        has the aggregate ``ProbeReading`` and should not rescore just to update
+        cross-generation stats.
+        """
+        self._apply_accumulate(readings)
+
     def score_single_token(
         self, hidden_per_layer: dict[int, torch.Tensor],
     ) -> dict[str, "ProbeReading"]:

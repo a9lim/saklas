@@ -725,14 +725,15 @@ class SaklasSession:
         # without a second forward pass.
         self._capture = HiddenCapture()
         # Incremental-capture state. In the common monitored case
-        # (vector probes, no manifold probes, no return_hidden) the
-        # capture scores each token on-device as it is produced and keeps
-        # only the per-token score rows here — O(layers·D) device memory
-        # instead of the full O(T·layers·D) stack. ``_capture_incremental``
-        # tells ``_finalize_generation`` to build (agg, per_token) from
-        # these rows instead of ``score_captured``. Reset at each
-        # ``_begin_capture`` and on teardown.
-        self._incremental_rows: list[torch.Tensor] = []
+        # (probes attached, no return_hidden) the capture scores each token
+        # as it is produced and keeps only the latest hidden slice per layer
+        # plus the already-computed ProbeReading rows here — O(layers·D)
+        # device memory instead of the full O(T·layers·D) hidden stack.
+        # ``_capture_incremental`` tells ``_finalize_generation`` to build
+        # (aggregate, per_token) from these readings instead of rescoring
+        # captured hidden states. Reset at each ``_begin_capture`` and on
+        # teardown.
+        self._incremental_readings: list[dict[str, ProbeReading]] = []
         self._capture_incremental: bool = False
 
         # Reentrant — ``_generate_core`` acquires it for the whole gen,
@@ -2371,6 +2372,9 @@ class SaklasSession:
         monitor = self._monitor
 
         def _score() -> dict[str, float]:
+            incremental_readings = getattr(self, "_incremental_readings", [])
+            if getattr(self, "_capture_incremental", False) and incremental_readings:
+                return monitor.flat_scalars(incremental_readings[-1])
             latest = capture.latest_per_layer()
             if not latest:
                 return {}
@@ -2527,19 +2531,26 @@ class SaklasSession:
             union: set[int] = self._monitor.probe_layers()
             if not union:
                 self._capture_incremental = False
-                self._incremental_rows = []
+                self._incremental_readings = []
                 return False
             layer_idxs = sorted(union)
         self._capture.clear()
         self._capture.attach(self._layers, layer_idxs)
-        # Full retention only.  Every read is a full per-probe reading
-        # (coords + fraction + nearest + residual + per-layer) computed from
-        # the captured stack — there is no no-sync incremental coord-row fast
-        # path to short-circuit, so the only-latest-hidden memory win is gone
-        # by design (the research-tool priority is full per-token info, not
-        # throughput).  ``score_per_token`` rescoring is the canonical path.
-        self._capture_incremental = False
-        self._incremental_rows = []
+        self._incremental_readings = []
+        if not widen and self._monitor.probe_names:
+            def _score_step(latest: dict[int, torch.Tensor]) -> None:
+                # Score once while the just-produced hidden slice is still the
+                # only retained device payload.  Append even an empty dict so
+                # row indices remain aligned with decode forwards; finalization
+                # trims any terminal EOS-only overcapture to generated_ids.
+                self._incremental_readings.append(
+                    self._monitor.score_single_token(latest) if latest else {}
+                )
+
+            self._capture.set_incremental(_score_step)
+            self._capture_incremental = True
+        else:
+            self._capture_incremental = False
         return True
 
     def _end_capture(self) -> None:
@@ -2568,14 +2579,34 @@ class SaklasSession:
     def _score_incremental(
         self, generated_ids: list[int], *, accumulate: bool = True,
     ) -> tuple[dict[str, "ProbeReading"], dict[str, list[float]]]:
-        """Aggregate readings + per-token coord stream for the generated tokens.
+        """Aggregate readings + per-token coord stream from live-scored rows."""
+        names = list(self._monitor.probe_names)
+        empty_agg = {
+            name: ProbeReading(fraction=0.0, nearest=[], coords=())
+            for name in names
+        }
+        n = len(generated_ids)
+        if n == 0 or not self._incremental_readings:
+            return empty_agg, {name: [] for name in names}
 
-        TODO(coords): the no-sync incremental coord-row path is disabled (a
-        ``[P1]`` row can't carry ``fraction`` for the aggregate reading), so
-        this delegates to the full-retention :meth:`score_captured`.  Restore
-        the on-device row stacking once the row is widened to ``[P1, 2]``.
-        """
-        return self.score_captured(generated_ids, accumulate=accumulate)
+        from saklas.core.vectors import last_content_index
+        rows = self._incremental_readings[:n]
+        per_token: dict[str, list[float]] = {name: [0.0] * n for name in names}
+        for i, readings in enumerate(rows):
+            for name, reading in readings.items():
+                if name in per_token:
+                    per_token[name][i] = (
+                        reading.coords[0] if reading.coords else 0.0
+                    )
+
+        agg_idx = last_content_index(generated_ids, self._tokenizer)
+        agg_row = rows[agg_idx] if agg_idx < len(rows) else {}
+        agg_vals = {
+            name: agg_row.get(name, empty_agg[name]) for name in names
+        }
+        if accumulate and agg_vals:
+            self._monitor.accumulate_readings(agg_vals)
+        return agg_vals, per_token
 
     @overload
     def score_hidden(
@@ -3608,7 +3639,13 @@ class SaklasSession:
             text = _decoded if isinstance(_decoded, str) else _decoded[0]
 
         captured_stack: dict[int, torch.Tensor] = {}
-        if generated_ids and (self._monitor.probe_names or return_hidden):
+        if (
+            generated_ids
+            and (
+                return_hidden
+                or (self._monitor.probe_names and not self._capture_incremental)
+            )
+        ):
             captured_stack = self._capture.stacked()
 
         agg_vals: dict[str, ProbeReading] = {}
@@ -3671,17 +3708,12 @@ class SaklasSession:
         # when no probe is attached or generation produced no tokens.  Reuses
         # the captured stack the per-axis path consumed — no second forward pass.
         manifold_aggregates: dict[str, Any] = {}
-        if (
-            self._monitor.probe_names
-            and generated_ids
-        ):
-            stacked_caps = captured_stack
-            if stacked_caps:
-                # ``score_per_token`` above already pools this same
-                # last-content-token aggregate and returns the full
-                # ProbeReading shape; reusing it avoids a second geometry
-                # pass and a second capture-stack traversal.
-                manifold_aggregates = dict(agg_vals)
+        if self._monitor.probe_names and generated_ids:
+            # ``score_per_token`` / ``_score_incremental`` above already pools
+            # this same last-content-token aggregate and returns the full
+            # ProbeReading shape; reusing it avoids a second geometry pass and,
+            # on the incremental path, avoids retaining the full capture stack.
+            manifold_aggregates = dict(agg_vals)
 
         result = GenerationResult(
             text=text, tokens=list(generated_ids), token_count=token_count,
@@ -4152,13 +4184,37 @@ class SaklasSession:
                     or _wants_live_token_scores
                 )
             )
-            if needs_scores:
+            has_incremental_reading = bool(
+                self._capture_incremental and self._incremental_readings
+            )
+            if needs_scores and not has_incremental_reading:
                 latest_hidden_for_token = {
                     layer_idx: bucket[-1]
                     for layer_idx, bucket in self._capture._per_layer.items()
                     if bucket
                 }
-            if needs_scores and latest_hidden_for_token:
+            if (
+                needs_scores
+                and has_incremental_reading
+            ):
+                agg = self._incremental_readings[-1]
+                if agg:
+                    vector_readings = agg
+                    scores = {
+                        p: (r.coords[0] if r.coords else 0.0)
+                        for p, r in agg.items()
+                    }
+                    if _wants_live_token_scores:
+                        probe_readings = agg
+                    if assistant_node_id is not None and _persists_layer_scores:
+                        by_layer: dict[str, dict[str, float]] = {}
+                        for p, r in agg.items():
+                            for layer, coord in r.coords_per_layer.items():
+                                by_layer.setdefault(str(layer), {})[p] = round(
+                                    float(coord[0] if coord else 0.0), 6,
+                                )
+                        per_layer_payload = by_layer or None
+            elif needs_scores and latest_hidden_for_token:
                 # One unified pass over every probe shape — flat coords + curved
                 # fraction/nearest in one dict.
                 agg = self._monitor.score_single_token(latest_hidden_for_token)
@@ -4406,7 +4462,7 @@ class SaklasSession:
             # (finalize has already consumed the rows by now). Belt-and-
             # suspenders: ``_begin_capture`` resets these at gen start too.
             self._capture_incremental = False
-            self._incremental_rows = []
+            self._incremental_readings = []
             self._gen_phase = GenState.IDLE
             self._gen_lock.release()
 

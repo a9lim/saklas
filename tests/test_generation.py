@@ -231,6 +231,61 @@ def test_finalize_reuses_scored_probe_aggregate() -> None:
     assert session._last_per_token_scores == {"toy": [0.1, 0.25]}
 
 
+def test_finalize_incremental_probe_path_does_not_stack_capture() -> None:
+    reading0 = ProbeReading(
+        fraction=0.2,
+        nearest=[("node", 0.4)],
+        coords=(0.1,),
+        fraction_per_layer={0: 0.2},
+        coords_per_layer={0: (0.1,)},
+    )
+    reading1 = ProbeReading(
+        fraction=0.5,
+        nearest=[("node", 0.25)],
+        coords=(0.25,),
+        fraction_per_layer={0: 0.5},
+        coords_per_layer={0: (0.25,)},
+    )
+
+    class Capture:
+        def stacked(self) -> dict[int, torch.Tensor]:
+            raise AssertionError("incremental probe finalization should not stack")
+
+    class Monitor:
+        probe_names = ["toy"]
+
+    state = GenerationState()
+    state.finish_reason = "length"
+
+    session: Any = SaklasSession.__new__(SaklasSession)
+    session._gen_state = state
+    session._tokenizer = _StopTokenizer()
+    session._monitor = Monitor()
+    session._capture = Capture()
+    session._capture_incremental = True
+    session._incremental_readings = [
+        {"toy": reading0},
+        {"toy": reading1},
+    ]
+    session._last_per_token_scores = None
+    session._last_result = None
+    session.events = SimpleNamespace(emit=lambda _event: None)
+    session.build_readings = lambda: {}
+
+    result = SaklasSession._finalize_generation(
+        session,
+        "prompt",
+        [0, 1],
+        elapsed=1.0,
+        vector_snapshot={},
+        stateless=True,
+    )
+
+    assert result.probe_readings == {"toy": reading1}
+    assert result.readings["toy"].mean == (0.25,)
+    assert session._last_per_token_scores == {"toy": [0.1, 0.25]}
+
+
 def test_penalty_state_applies_sparse_counts_on_device():
     logits = torch.zeros(1, 8)
     state = _PenaltyState(max_tokens=4, device=logits.device, dtype=torch.float32)

@@ -96,7 +96,12 @@ def _stub_session() -> SaklasSession:
     session._profiles = {}
     session._probe_hash_cache = {}
     # Capture has a single ``_per_layer`` dict we read for streaming.
-    session._capture = types.SimpleNamespace(_per_layer={})
+    session._capture = types.SimpleNamespace(
+        _per_layer={},
+        set_incremental=lambda _sink: None,
+    )
+    session._capture_incremental = False
+    session._incremental_readings = []
     session._layers = []
     # Minimal prefix-cache invalidator + tree spy.
     session._prefix_cache = None
@@ -185,20 +190,27 @@ def test_begin_capture_widens_to_manifold_layers():
 
     # Track what layers _capture.attach was called with.
     attached_layers: list[int] = []
+    incremental_sinks: list[Any] = []
 
     def _attach(layers: Any, layer_indices: list[int]) -> None:
         attached_layers.extend(layer_indices)
     session._capture.attach = _attach
     session._capture.clear = lambda: None
+    session._capture.set_incremental = (
+        lambda step_sink: incremental_sinks.append(step_sink)
+    )
     # Real layer list of length 4 (just need len() — the stub doesn't
     # forward through to anything that touches the layers).
     session._layers = [None] * 4  # pyright: ignore[reportAttributeAccessIssue]  # test stub: list[None] satisfies len() contract
+    session._incremental_readings = []
 
     # Bind the real _begin_capture and run it.
     ok = SaklasSession._begin_capture(session, widen=False)
     assert ok
     # Manifold covers layers 0, 1, 2 — capture must attach to all of them.
     assert set(attached_layers) == {0, 1, 2}
+    assert session._capture_incremental is True
+    assert len(incremental_sinks) == 1
 
 
 def test_begin_capture_no_probes_returns_false():
@@ -208,6 +220,7 @@ def test_begin_capture_no_probes_returns_false():
     session._layers = [None] * 4  # pyright: ignore[reportAttributeAccessIssue]  # test stub: list[None] satisfies len() contract
     session._capture.attach = lambda *args, **kw: None
     session._capture.clear = lambda: None
+    session._incremental_readings = []
     ok = SaklasSession._begin_capture(session, widen=False)
     assert ok is False
 

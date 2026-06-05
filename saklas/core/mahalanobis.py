@@ -525,11 +525,23 @@ class LayerWhitener:
         Returns ``0.0`` when either argument has near-zero Mahalanobis
         norm — same convention as plain cosine on near-zero vectors.
         """
-        nu = self.mahalanobis_norm(layer, u)
-        nv = self.mahalanobis_norm(layer, v)
-        if nu < _NEAR_ZERO_DENOM or nv < _NEAR_ZERO_DENOM:
+        if layer not in self._X:
+            raise WhitenerError(f"whitener does not cover layer {layer}")
+        u32 = u.to(dtype=torch.float32, device="cpu").reshape(-1)
+        v32 = v.to(dtype=torch.float32, device="cpu").reshape(-1)
+        if u32.shape[0] != self._dim[layer] or v32.shape[0] != self._dim[layer]:
+            raise WhitenerError(
+                f"layer {layer}: input dims {u32.shape[0]}, {v32.shape[0]} "
+                f"do not match whitener dim {self._dim[layer]}"
+            )
+        si_u = self.apply_inv(layer, u32).float()
+        si_v = self.apply_inv(layer, v32).float()
+        uu = float(torch.dot(u32, si_u).item())
+        vv = float(torch.dot(v32, si_v).item())
+        if uu < _NEAR_ZERO_DENOM or vv < _NEAR_ZERO_DENOM:
             return 0.0
-        return self.mahalanobis_dot(layer, u, v) / (nu * nv)
+        uv = float(torch.dot(u32, si_v).item())
+        return uv / math.sqrt(uu * vv)
 
     def leace_project(
         self,
@@ -562,7 +574,13 @@ class LayerWhitener:
         base_dtype = base.dtype
         base32 = base.to(dtype=torch.float32, device="cpu").reshape(-1)
         onto32 = onto.to(dtype=torch.float32, device="cpu").reshape(-1)
-        m_oo = self.mahalanobis_dot(layer, onto32, onto32)
+        if base32.shape[0] != self._dim[layer] or onto32.shape[0] != self._dim[layer]:
+            raise WhitenerError(
+                f"layer {layer}: input dims {base32.shape[0]}, {onto32.shape[0]} "
+                f"do not match whitener dim {self._dim[layer]}"
+            )
+        onto_inv = self.apply_inv(layer, onto32).float()
+        m_oo = float(torch.dot(onto32, onto_inv).item())
         if m_oo < _NEAR_ZERO_DENOM:
             # ``onto`` has effectively zero Mahalanobis norm — no
             # projection is well-defined.  Mirror ``project_profile``'s
@@ -571,7 +589,7 @@ class LayerWhitener:
             if operator == "|":
                 return base32.to(dtype=base_dtype)
             return torch.zeros_like(base32).to(dtype=base_dtype)
-        m_bo = self.mahalanobis_dot(layer, base32, onto32)
+        m_bo = float(torch.dot(base32, onto_inv).item())
         coef = m_bo / m_oo
         proj = coef * onto32
         if operator == "~":

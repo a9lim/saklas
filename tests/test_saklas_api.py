@@ -816,10 +816,16 @@ class TestTraitsStream:
         # Test the serialization logic directly rather than fighting TestClient
         # SSE streaming semantics. Build the events as they'd arrive on the
         # trait queue and verify the JSON output format.
-        readings = {"probe_a": ProbeReadings(
-            per_generation=[0.42], mean=0.30, std=0.1, min=0.2, max=0.42,
-            delta_per_gen=0.12,
-        )}
+        readings = {
+            "probe_a": ProbeReadings(
+                per_generation=[(0.42,)],
+                mean=(0.30,),
+                std=(0.1,),
+                min=(0.2,),
+                max=(0.42,),
+                delta_per_gen=(0.12,),
+            )
+        }
         fake_result = MagicMock()
         fake_result.readings = readings
         fake_result.finish_reason = "stop"
@@ -855,6 +861,8 @@ class TestTraitsStream:
                     for name, r in rd.items():
                         pg = getattr(r, "per_generation", None)
                         val = pg[-1] if pg else getattr(r, "mean", 0.0)
+                        if isinstance(val, tuple):
+                            val = val[0] if val else 0.0
                         agg[name] = round(val, 6)
                 output_lines.append(json.dumps({
                     "type": "done", "generation_id": generation_id,
@@ -1137,10 +1145,12 @@ class TestPairwiseMetric:
         assert r.status_code == 200
         body = r.json()
         assert body["metric"] == "mahalanobis"
-        # Cell [0][0] is the Mahalanobis cosine in layer 0's frame.
-        vx, vy = session.vectors["x"][0], session.vectors["y"][0]
-        ref = w.mahalanobis_cosine(0, vx, vy)
-        assert body["matrix"][0][0] == pytest.approx(ref, abs=1e-5)
+        for i, la in enumerate(body["layers_a"]):
+            for j, lb in enumerate(body["layers_b"]):
+                # Each cell is whitened in the row layer's frame.
+                vx, vy = session.vectors["x"][la], session.vectors["y"][lb]
+                ref = w.mahalanobis_cosine(la, vx, vy)
+                assert body["matrix"][i][j] == pytest.approx(ref, abs=1e-5)
 
     def test_missing_whitener_409(self, session_and_client: Any) -> None:
         """No covering whitener → 409 (the neutral cache must be regenerated);

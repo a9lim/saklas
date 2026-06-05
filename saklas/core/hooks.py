@@ -19,6 +19,11 @@ from saklas.core.manifold import (
 from saklas.core.triggers import Trigger, TriggerContext
 
 
+def _trigger_active(trigger: Trigger, ctx: TriggerContext) -> bool:
+    """Hot-path trigger predicate with the default preset as a true no-op."""
+    return trigger is Trigger.BOTH or trigger.active(ctx)
+
+
 class HiddenCapture:
     """Accumulates the last-position hidden state at each hooked layer on every
     forward pass. Paired with a KV-cached generation loop, one capture per step
@@ -188,6 +193,7 @@ class SteeringHook:
         # start.  Reset at recompose and by
         # :meth:`SteeringManager.reset_manifold_feet` at each generation start.
         self._manifold_feet: list[torch.Tensor | None] = []
+        self._all_groups_always_active = False
         # Shared mutable context threaded in by SteeringManager.  Read-only
         # from the hook's perspective; the generation loop mutates fields.
         self._ctx: TriggerContext | None = None
@@ -245,6 +251,9 @@ class SteeringHook:
                 float(onto),
             ))
         self.manifold_groups = manifold_groups
+        self._all_groups_always_active = all(
+            group[0] is Trigger.BOTH for group in manifold_groups
+        )
         # New group set ⇒ cold-start every foot-follower (seed at origin).
         self._manifold_feet = [None] * len(manifold_groups)
 
@@ -257,7 +266,10 @@ class SteeringHook:
             return output
         # Cheap pre-check: any group active this step?  Skip the work entirely
         # if not (e.g. an ``AFTER_THINKING`` group during prefill).
-        if not any(grp[0].active(ctx) for grp in groups):
+        if (
+            not self._all_groups_always_active
+            and not any(_trigger_active(grp[0], ctx) for grp in groups)
+        ):
             return output
         hidden = output if isinstance(output, torch.Tensor) else output[0]
         self._apply_manifold_groups(hidden, ctx)
@@ -290,10 +302,11 @@ class SteeringHook:
         ``is_affine`` branch (analytic slide vs foot-following GN).
         """
         lead = hidden.shape[:-1]
+        all_groups_always_active = self._all_groups_always_active
         for i, (
             trig, sub, domain, target, origin, along, onto,
         ) in enumerate(self.manifold_groups):
-            if not trig.active(ctx):
+            if not all_groups_always_active and not _trigger_active(trig, ctx):
                 continue
             if sub.is_affine:
                 h_new, _foot = subspace_inject(

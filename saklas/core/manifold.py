@@ -1684,8 +1684,6 @@ def subspace_inject(
 
     centered = h_f32 - mean                            # (.., D)
     q = centered @ basis.T                             # (.., R) reduced coords of h_par
-    h_par = q @ basis                                  # (.., D) in-subspace reconstruction
-    h_perp = centered - h_par                          # (.., D) = H_o
 
     if subspace.is_affine:
         # --- flat (folded-vector) shortcut --------------------------------
@@ -1696,11 +1694,12 @@ def subspace_inject(
         # ALONG slides ``q`` toward ``target`` geodesically (CustomDomain ⇒
         # linear); the off-subspace residual ``H_o`` is kept verbatim.
         p_new = domain.geodesic(q, target, along)      # (.., n==R)
-        new_par = p_new @ basis                        # (.., D)
-        new_perp = h_perp                              # (.., D) kept verbatim
-        h_new = mean + new_par + new_perp
+        h_new = h_f32 + ((p_new - q) @ basis)           # keep H_o verbatim
         h_new = _soft_norm_cap(h_new, h_f32, norm_cap)
         return h_new.to(h.dtype), q
+
+    h_par = q @ basis                                  # (.., D) in-subspace reconstruction
+    h_perp = centered - h_par                          # (.., D) = H_o
 
     np_, rw, pc = subspace.rbf_params()
     np_ = np_.to(torch.float32)

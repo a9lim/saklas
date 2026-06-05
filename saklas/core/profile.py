@@ -16,6 +16,7 @@ subspace kernel reads the baked magnitudes as per-layer weights.
 
 from __future__ import annotations
 
+import math
 import pathlib
 from typing import Any, Iterable, Iterator, Literal, Mapping, overload
 
@@ -339,15 +340,10 @@ class Profile:
 
         # Cross-device pairs (e.g. an actively-steered profile hooked on
         # the model device against a disk-loaded peer on CPU) would crash
-        # the dot below; resolve to a common device once and reuse for
-        # both code paths.  CPU is the safe choice — these tensors are
-        # tiny relative to the model and the whitener path moves them
-        # back to its own device internally anyway.
+        # the dot below; resolve to CPU once and reuse for both code paths.
+        # CPU is also where LayerWhitener applies its Woodbury factors.
         def _aligned(a_t: torch.Tensor, b_t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-            af, bf = a_t.float(), b_t.float()
-            if af.device != bf.device:
-                af, bf = af.cpu(), bf.cpu()
-            return af, bf
+            return a_t.float().cpu(), b_t.float().cpu()
 
         # Mahalanobis-only: the whitener must cover every shared layer.
         # No Euclidean fallback — a missing or partial whitener is an error.
@@ -372,14 +368,14 @@ class Profile:
         den = 0.0
         for L in shared:
             a, b = _aligned(self._tensors[L], other._tensors[L])
-            na = whitener.mahalanobis_norm(L, a)
-            nb = whitener.mahalanobis_norm(L, b)
-            if na < 1e-12 or nb < 1e-12:
+            si_a = whitener.apply_inv(L, a).float()
+            si_b = whitener.apply_inv(L, b).float()
+            aa = max(float(torch.dot(a.reshape(-1), si_a.reshape(-1)).item()), 0.0)
+            bb = max(float(torch.dot(b.reshape(-1), si_b.reshape(-1)).item()), 0.0)
+            if aa < 1e-12 or bb < 1e-12:
                 continue
-            cos = whitener.mahalanobis_dot(L, a, b) / (na * nb)
-            w = na * nb
-            num += w * cos
-            den += w
+            num += float(torch.dot(a.reshape(-1), si_b.reshape(-1)).item())
+            den += math.sqrt(aa * bb)
         if den < 1e-12:
             raise ProfileError(
                 "cosine_similarity: every shared layer has near-zero "

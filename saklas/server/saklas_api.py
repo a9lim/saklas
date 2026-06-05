@@ -1170,26 +1170,21 @@ def register_saklas_routes(app: FastAPI) -> None:
         layers_a = sorted(prof_a.keys())
         layers_b = sorted(prof_b.keys())
 
-        # Precompute fp32 vectors + norms so the inner loop is a single
-        # dot per cell.  ``None`` for near-zero norms — propagates to the
-        # cell so the client can render an empty / dimmed square instead
-        # of NaN or a meaningless cosine.  Both sides are forced to CPU
-        # so a cross-device pair (e.g. an actively-steered vector hooked
-        # on MPS vs. a disk-loaded peer on CPU) computes cleanly rather
-        # than raising on the dot — hidden_dim × layer-count is small
-        # enough that the device round-trip is free relative to the
-        # request budget.
+        # Precompute fp32 vectors.  Both sides are forced to CPU so a
+        # cross-device pair (e.g. an actively-steered vector hooked on MPS
+        # vs. a disk-loaded peer on CPU) computes cleanly rather than
+        # raising on the dot — hidden_dim × layer-count is small enough
+        # that the device round-trip is free relative to the request
+        # budget.
         import torch as _torch
-        vecs_a: list[tuple["_torch.Tensor", float]] = []
+        vecs_a: list["_torch.Tensor"] = []
         for L in layers_a:
             v = prof_a[L].float().cpu()
-            n = float(v.norm().item())
-            vecs_a.append((v, n))
-        vecs_b: list[tuple["_torch.Tensor", float]] = []
+            vecs_a.append(v)
+        vecs_b: list["_torch.Tensor"] = []
         for L in layers_b:
             v = prof_b[L].float().cpu()
-            n = float(v.norm().item())
-            vecs_b.append((v, n))
+            vecs_b.append(v)
 
         # Resolve the whitener (Mahalanobis-only).  ``session.whitener`` is
         # a lazy property (builds from the neutral-activation cache on first
@@ -1206,20 +1201,51 @@ def register_saklas_routes(app: FastAPI) -> None:
             )
 
         matrix: list[list[float | None]] = []
-        for la, (va, na) in zip(layers_a, vecs_a, strict=True):
-            row: list[float | None] = []
-            for vb, nb in vecs_b:
-                if na < 1e-12 or nb < 1e-12:
-                    row.append(None)
-                    continue
-                # Different hidden dims would be a model-mismatch bug —
-                # surface as None rather than raising so a misconfigured
-                # pool still renders the cells that *do* line up.
-                if va.shape != vb.shape:
-                    row.append(None)
-                    continue
-                cos = whitener.mahalanobis_cosine(la, va, vb)
-                row.append(round(cos, 6))
+        for la, va in zip(layers_a, vecs_a, strict=True):
+            row: list[float | None] = [None] * len(vecs_b)
+            try:
+                si_va = whitener.apply_inv(la, va).float()
+            except Exception:
+                matrix.append(row)
+                continue
+            aa = max(
+                float(_torch.dot(va.reshape(-1), si_va.reshape(-1)).item()),
+                0.0,
+            )
+            if aa < 1e-12:
+                matrix.append(row)
+                continue
+
+            # Batch every compatible B-vector in this row through one
+            # Woodbury application.  Different hidden dims are a
+            # model-mismatch bug; keep those cells empty so a partially
+            # misconfigured pool still renders the cells that line up.
+            b_indices: list[int] = []
+            b_rows: list["_torch.Tensor"] = []
+            for j, vb in enumerate(vecs_b):
+                if va.shape == vb.shape:
+                    b_indices.append(j)
+                    b_rows.append(vb)
+            if not b_rows:
+                matrix.append(row)
+                continue
+
+            block = _torch.stack(b_rows)
+            try:
+                si_block = whitener.apply_inv(la, block).float()
+            except Exception:
+                matrix.append(row)
+                continue
+            bb = (block.reshape(len(b_rows), -1) * si_block.reshape(
+                len(b_rows), -1,
+            )).sum(dim=1).clamp_min(0.0)
+            uv = (block.reshape(len(b_rows), -1) * si_va.reshape(1, -1)).sum(dim=1)
+            denom = (bb * aa).sqrt()
+            valid = denom >= 1e-12
+            cosines = uv / denom.clamp_min(1e-12)
+            for j, ok, cos in zip(b_indices, valid.tolist(), cosines.tolist(), strict=True):
+                if ok:
+                    row[j] = round(float(cos), 6)
             matrix.append(row)
 
         return {
