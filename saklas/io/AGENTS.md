@@ -125,7 +125,8 @@ space — the target whitener is **required** and must cover the transferred lay
 `_from-<safe_src>` variant). `manifold_summary(folder)` is the session-independent
 serializer shared by `manifold show -j` + the HTTP summary route.
 `iter_manifold_folders`, `bundled_manifold_names`, `materialize_bundled_manifolds`
-(copy-on-miss into `default/`, auto-refreshes stale bundled nodes). Per-node `role`
+(copy-on-miss into `default/`, plus a re-copy when the bundled manifest hash drifts
+or the on-disk `format_version` predates `MANIFOLD_FORMAT_VERSION`). Per-node `role`
 (slug `[a-z0-9._-]+`) rides the fit to `compute_node_centroid` for role-baselined
 centroids; family-unsupported raises `RoleSubstitutionUnsupportedError` at fit time.
 
@@ -147,8 +148,10 @@ suffix + canonicalizes (always `match=None`, `sign=+1`).
 installed manifolds; `resolve_manifold_name(name, *, namespace=)` resolves a 2-node
 `pca` manifold's *name* (e.g. `formal.casual`) to node 0 (the `orient_to=0` + pole) —
 the vector-composite read path. `resolve_bare_name(raw, *, namespace=) →
-(pole_hit, manifold_hit)` is the unified tier (pole/name first, then manifold
-label, cross-tier collision raises). Three memoized walks
+ResolvedManifoldLabel | None` is *just* the manifold-label tier (it delegates to
+`resolve_manifold_label`, raising on cross-manifold collision); the pole/name-first,
+label-second ordering lives in the caller (`core/steering_expr`, which tries
+`resolve_pole`/`resolve_manifold_name` before `resolve_bare_name`). Three memoized walks
 (`_concepts_cache`/`_manifold_labels_cache`/`_manifold_names_cache`) keyed on
 `manifolds_dir()`; `invalidate()` clears all three — mutating code must call it.
 `parse_args(tokens)` splits a token list into one concept selector + one optional
@@ -227,7 +230,7 @@ per-component `components` provenance.
 
 Cross-model probe alignment via per-layer Procrustes.
 `load_or_compute_neutral_activations(...)` is the disk-cached per-model neutrals
-(90 prompts × layers, **fp32** — the project-wide invariant; self-heals legacy
+(the neutral corpus × layers, **fp32** — the project-wide invariant; self-heals legacy
 bf16/fp16/non-finite caches). These are what the Mahalanobis whitener builds its
 covariance from. `fit_alignment(src, tgt, *, min_shared_layers=10) → {layer: M_L}`
 (orthogonal Procrustes for matched dim, rectangular least-squares otherwise; both

@@ -29,10 +29,11 @@ with no subverb) prints help and exits 0, not argparse's exit 2.
   a model; the lifecycle verbs and `ls`/`show` are pure-IO over
   `~/.saklas/manifolds/`, addressed by `(namespace, name)` pairs. Bare-name
   resolution splits by intent: verbs addressing an *existing* manifold
-  (`clear`/`refresh`/`rm`/`transfer`, `discover`/`show`) resolve cross-namespace via
-  `_resolve_manifold_ns_name` (reaching bundled `default/`, raising on
-  collision/miss); verbs authoring a *fresh* folder (`generate`, `merge` target,
-  `push`) default a bare name to `local/` via `_split_manifold_ns_name`.
+  (`clear`/`refresh`/`rm`/`transfer`/`export`, `discover`/`show`) resolve
+  cross-namespace via `_resolve_manifold_ns_name` (reaching bundled `default/`,
+  raising on collision/miss); verbs authoring a *fresh* folder (`merge` target,
+  `push`) default a bare name to `local/` via `_split_manifold_ns_name` —
+  `generate` does the same bare → `local/` split inline.
 - `experiment` = repeatable research runs (`fan`, `transcript run`, `naturalness`)
   via `_EXPERIMENT_VERBS`; `_run_experiment` hand-dispatches.
 - `config` = show / validate.
@@ -88,8 +89,9 @@ concept axes); an unfitted one is skipped with a one-line hint.
   (DLS on / compile + cuda-graphs **off**) win otherwise. `~`/`|` projection is
   Mahalanobis-only — there is **no** `--projection-metric`/`--steer-mode`/
   `--theta-max`/`--legacy`.
-- **Logit block** (`_add_logit_args`): `--top-k-alts N` (0–256, → session
-  `SamplingConfig.return_top_k`).
+- **Logit block** (`_add_logit_args`): `--top-k-alts N` (→ session
+  `SamplingConfig.return_top_k`). The `[0,256]` bound is validated only on the YAML
+  `return_top_k` key, not on this flag (a plain `type=int`).
 - `tui`: `model` optional (a `-c` config with `model:` can supply it); `--max-tokens`
   default 1024.
 - `serve`: `-H/--host` (default `0.0.0.0`), `-P/--port` (8000), `-S/--steer EXPR`,
@@ -98,7 +100,8 @@ concept axes); an unfitted one is skipped with a one-line hint.
 - `subspace extract`: positional `concept` (one concept or two poles, `nargs="+"`),
   `-m/--model`, `-f/--force` (re-authors the pole corpora + bypasses the tensor
   cache), `--sae RELEASE`, `--sae-revision REV`, `--role SLUG` (mutually exclusive
-  with `--sae`; writes a `_role-<slug>` tensor + returns a `:role-<slug>` tail; slug
+  with `--sae`; the role bakes into the node corpora and writes the **canonical**
+  tensor — no `_role-` suffix — while returning a `:role-<slug>` name tail; slug
   `[a-z0-9._-]+`), `--namespace NS` (destination; unset → `local/`). There is **no
   `--method`/`--legacy`** — difference-of-means (a 2-node `pca` fit) is the only
   method.
@@ -141,7 +144,12 @@ concept axes); an unfitted one is skipped with a one-line hint.
   [-f]` pulls an HF
   manifold or copies a local folder (and salvages a legacy saklas-pack repo).
   `export gguf <name> [-m MODEL] [-o PATH] [--model-hint HINT]` folds a fitted
-  2-node `pca` manifold to a vector and writes a control-vector GGUF. The only
+  2-node `pca` manifold to a vector and writes a control-vector GGUF. Lifecycle +
+  inspection: `push <selector> [-a OWNER/N] [-m] [-p/--private] [-d/--dry-run]
+  [--variant raw|sae|all]` (HF upload, CLI-only), `clear <selector> [-m]
+  [--variant raw|sae|all]` (drop per-model fitted tensors; default `all`),
+  `refresh <selector> [-m]`, `rm <selector> [-y]`, `ls [--namespace NS] [-v|-j]`,
+  `show <name> [-j]`, `search [query] [-v|-j]`. The only
   surviving `--method` flag is the manifold `pca`/`spectral` one (on
   `discover`/`merge`).
 - `experiment fan`: `model` + `prompt`, `-g/--grid CONCEPT=ALPHAS` (required,

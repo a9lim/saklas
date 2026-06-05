@@ -27,7 +27,7 @@ from saklas.core.monitor import (
     AttachedManifoldProbe,
     Monitor,
 )
-from saklas.core.results import ManifoldAggregate, ManifoldTokenReading
+from saklas.core.results import ManifoldReading
 
 
 def fit_layer_subspace(*args: Any, **kwargs: Any) -> Any:
@@ -312,7 +312,7 @@ def test_flat_scalars_keys_and_signs():
     and ``<name>@<label>`` (negative — encodes -distance so larger =
     closer)."""
     mon = Monitor()
-    reading = ManifoldTokenReading(
+    reading = ManifoldReading(
         fraction=0.7, nearest=[("a", 0.5), ("b", 1.2)],
     )
     flat = mon.flat_scalars({"toy": reading})
@@ -325,8 +325,8 @@ def test_flat_scalars_keys_and_signs():
 
 def test_flat_scalars_namespaces_per_probe():
     mon = Monitor()
-    r1 = ManifoldTokenReading(fraction=0.5, nearest=[("x", 0.1)])
-    r2 = ManifoldTokenReading(fraction=0.8, nearest=[("y", 0.2)])
+    r1 = ManifoldReading(fraction=0.5, nearest=[("x", 0.1)])
+    r2 = ManifoldReading(fraction=0.8, nearest=[("y", 0.2)])
     flat = mon.flat_scalars({"p1": r1, "p2": r2})
     assert set(flat) == {"p1:fraction", "p1@x", "p2:fraction", "p2@y"}
 
@@ -350,7 +350,7 @@ def test_score_aggregate_at_node_recovers_authoring_coord():
 
     agg = mon.score_aggregate(captured)
     assert "toy" in agg
-    r: ManifoldAggregate = agg["toy"]
+    r: ManifoldReading = agg["toy"]
     # Coords near the authoring coord (-1.0) under the grid's resolution.
     assert len(r.coords) == 1
     assert r.coords[0] == pytest.approx(-1.0, abs=0.1)
@@ -360,7 +360,7 @@ def test_score_aggregate_at_node_recovers_authoring_coord():
         assert len(coord) == 1
         assert coord[0] == pytest.approx(-1.0, abs=0.1)
     # Residual is small at a node.
-    assert r.residual_mean < 0.1
+    assert r.residual < 0.1
 
 
 def test_score_aggregate_pools_last_non_special_row_not_mean():
@@ -420,12 +420,12 @@ def test_score_aggregate_fraction_matches_per_token():
     per_token = mon.score_single_token(hidden)
     agg = mon.score_aggregate(captured)
     assert per_token["toy"].fraction == pytest.approx(
-        agg["toy"].fraction_mean, abs=1e-5,
+        agg["toy"].fraction, abs=1e-5,
     )
 
 
 def test_score_aggregate_to_dict_round_trip():
-    """``ManifoldAggregate.to_dict`` produces a JSON-serializable dict
+    """``ManifoldReading.to_dict`` produces a JSON-serializable dict
     with the expected structure."""
     import json
 
@@ -440,12 +440,12 @@ def test_score_aggregate_to_dict_round_trip():
     agg = mon.score_aggregate(captured)
     d = agg["toy"].to_dict()
     js = json.dumps(d)  # raises if any value is non-serializable
-    assert "fraction_mean" in d
+    assert "fraction" in d
     assert "coords" in d
     assert "nearest" in d
     # Re-decodable, and the round-trip shape is stable.
     decoded = json.loads(js)
-    assert decoded["fraction_mean"] == d["fraction_mean"]
+    assert decoded["fraction"] == d["fraction"]
 
 
 def test_empty_inputs_return_empty():
@@ -528,19 +528,21 @@ def _flat_node_hidden(m: Manifold, k: int) -> dict[int, torch.Tensor]:
 
 
 def test_affine_rank1_recovers_pole_coord():
-    """A 2-node (rank-1) flat probe rides the batched path; placing the
-    activation on a pole recovers that pole's authoring coord."""
+    """A 2-node (rank-1) flat probe places the activation on a pole and
+    recovers that pole's authoring coord."""
     rc = torch.tensor([[1.0], [-1.0]])
     m = _flat_manifold(reduced_coords=rc, labels=["pos", "neg"])
     mon = _iso_monitor(m)
     mon.add_probe("ax", m)
-    for k, want in ((0, 1.0), (1, -1.0)):
+    for k, want, label in ((0, 1.0, "pos"), (1, -1.0, "neg")):
         r = mon.score_single_token(_flat_node_hidden(m, k))["ax"]
         assert len(r.coords) == 1
         assert r.coords[0] == pytest.approx(want, abs=1e-3)
-        # In-subspace → fraction ≈ 1; per-token nearest deferred for affine.
+        # In-subspace → fraction ≈ 1.  Under the unified full reading flat
+        # probes now fill nearest per token too (was deferred); residual ≈ 0.
         assert r.fraction == pytest.approx(1.0, abs=2e-2)
-        assert r.nearest == []
+        assert r.nearest[0][0] == label
+        assert r.residual == pytest.approx(0.0, abs=1e-5)
 
 
 def test_affine_rankR_recovers_multidim_coords():
@@ -606,7 +608,7 @@ def test_affine_aggregate_fills_nearest_and_coords():
     assert agg.coords[1] == pytest.approx(1.0, abs=1e-3)
     assert agg.nearest[0][0] == "y"
     assert agg.nearest[0][1] == pytest.approx(0.0, abs=1e-3)
-    assert agg.residual_mean == pytest.approx(0.0, abs=1e-5)
+    assert agg.residual == pytest.approx(0.0, abs=1e-5)
 
 
 def test_affine_fraction_outside_subspace_is_zero():

@@ -1,7 +1,7 @@
 # core/
 
-Engine layer: model loading, the unified manifold/subspace fit + injection,
-trait/manifold monitoring, session orchestration, the generation loop, and the
+Engine layer: model loading, the unified manifold/subspace fit + injection, the
+unified `Monitor`, session orchestration, the generation loop, and the
 loom conversation tree. The cross-cutting design lives in the repo-root
 `ARCHITECTURE.md`; this file is the per-module map.
 
@@ -171,7 +171,7 @@ all-or-nothing gate shared by extraction, manifold fit, projection, monitor, and
 reduced inverse covariance behind whitened share + whitened manifold reads),
 `woodbury_factors` (device-resident factors for the monitor's inline per-token
 apply). `SaklasSession.whitener` is a lazy property; session construction wires it
-into both monitors via `set_whitener`.
+into the unified `Monitor` via `set_whitener`.
 
 ## manifold.py
 
@@ -209,8 +209,9 @@ round-trips through the save/load sidecar. `manifold_point`, `tangent` (analytic
 RBF Jacobian), `resolve_position` (coord payload or label),
 `nearest_node_{index,label,role}`.
 
-`decompose(h, mean, basis) → (h_par_c, h_perp)` — the shared centered
-decomposition behind injection + the read monitor. `synthesize_subspace(push,
+`decompose(h, mean, basis) → (h_par_c, h_perp)` — a standalone centered-decomposition
+helper (exported but off the hot path; `subspace_inject` and the monitor each
+decompose inline). `synthesize_subspace(push,
 ablate, neutral_means)` composes the active steering term set into one
 `SynthesizedSubspace` per layer (orthonormal merged basis via `_ortho_basis`,
 push-before-ablation ordering; `target_coord = B @ Σ coeffᵢ·poleᵢ`; `share =
@@ -260,54 +261,63 @@ meant to overshoot; `norm_cap` bounds it). `onto` stays clamped `[0,1]`.
 `HiddenCapture` — `attach`/`detach`/`stacked`/`latest_per_layer`. Incremental
 mode (`set_incremental`) overwrites a length-1 bucket per layer so device memory
 stays O(layers·D); fires the step sink after the highest hooked layer. It is
-currently **off** under the coordinate readout — the session keeps full retention
-and `_finalize_generation` scores via `score_per_token` — because the no-sync
-`[P1]` row carries only axis-0 coords, not the `fraction` the aggregate reading
-needs (TODO: re-enable with a `[P1,2]` coord+fraction row). Manifold probes +
-`return_hidden` already force full retention.
+currently **off** — the session keeps full retention and `_finalize_generation`
+scores via `score_per_token`. Under the unified full reading there is no no-sync
+incremental coord-row fast path to short-circuit (every read is a full per-probe
+reading from the captured stack), so the only-latest-hidden memory win is gone by
+design; manifold probes + `return_hidden` already force full retention regardless.
 
 ## monitor.py
 
-`TraitMonitor` reads **flat (affine) probes as whitened coordinates** — a 2-node
-concept axis is the rank-1 case (the whole bundled roster). Per token it emits the
-same `ManifoldTokenReading` shape ManifoldMonitor does: `coords` (domain-frame,
-EV-weighted across layers), `fraction` (M-orthogonal share ∈ [0,1]), `nearest`.
-Coords are **domain-frame** (matching `score_aggregate`): each layer's raw reduced
-coord `c_L = M_R⁻¹ B Σ⁻¹ x` is in that layer's `‖δ_L‖` units, so it is mapped
-through the affine inverse to the shared domain *before* EV-averaging — the
-reference is each node's *whitened* read-coord, not the Euclidean `node_coords`. At
-rank-1 this is the pole-normalized coordinate (`1.0` at the positive node). The
-**rank-1 fast path** stacks every probe's `Σ⁻¹d̂` + precomputed `Σ⁻¹mean`/`‖d̂‖²_M`/
-affine slope-intercept so `_ensure_cache`'s hot path is one matmul (`A@h − cmean`)
-+ one shared `Σ⁻¹h` Woodbury apply (the fraction denominator), no per-probe loop, zero
-`.item()`. A 1-node fold (a monopolar `extract`, ad-hoc `probe()`) is the K=1 ray case; a
-rank-R flat fit falls to a per-probe path with `fraction` + `nearest` (affine
-multi-dim coord invert is a follow-up). Mahalanobis-only (`covers_all` or
-`WhitenerError`). `flat_scalars` writes gate channels `"<name>"` (axis 0),
-`"<name>[i]"` (per axis), `"<name>:fraction"`. Entry points: `score_per_token`
-(primary — returns `(aggregate readings, per-token axis-0 coord stream)`),
-`measure_from_hidden`, `score_single_token{,_per_layer,_tensor}`, `score_stack`,
-live-mean `begin/update/end_live` (axis 0). History/stats are per-coordinate-axis
-(`axis_stats`); the TUI-facing scalar helpers report axis 0. The bundled roster is
-the fitted 2-node `Manifold`s themselves (`_bootstrap_manifold_probes` — no fold).
-(Incremental no-sync capture is disabled — a `[P1]` row can't carry `fraction` —
-pending a `[P1,2]` row; the scoring fast path is unaffected.)
+`Monitor` — **one** read-side class (the unification of the former `TraitMonitor` +
+`ManifoldMonitor`) that reads every probe shape as whitened subspace coordinates,
+flat and curved alike. Hook-driven, fp32, Mahalanobis-only (`covers_all` or
+`WhitenerError`). **One** read path: `_score_full` loops every probe through
+`_score_probe_full`, which loops the probe's shared fit layers through
+`_layer_geometry` and EV-weights across them — there is no batched-affine fast path
+and no flat/curved field asymmetry. The research-tool priority is full per-token
+information (nearest, curved coords, residual, per-layer), not the throughput a
+batched matmul bought. Each layer's `_layer_geometry` yields the M-orthogonal
+**fraction** `sqrt(gᵀ M_R⁻¹ g)/‖x‖_M` (`g = B Σ⁻¹ x`), the whitened query for the
+**nearest** `M_R`-metric node, and the M-projection reduced coord `c = M_R⁻¹ g`.
+From there:
 
-The two monitors share `_build_whitened_factors` (per-layer `_LayerWhiten` build),
-`_attach_manifold_probe` (node cache + EV weights + whitened), and `_layer_geometry`
-(per-layer `frac`/`cdist`/reduced-coord pieces) — the read-side peers of the
-steering `{subspaces, manifolds}` split. `ManifoldMonitor` is the curved peer.
-`add_probe(name, manifold, *, top_n)` caches per-layer reduced `(K,R)` node coords
-and builds the per-probe whitened factors (Mahalanobis-only). Per token,
-EV-weighted across layers: the whitened **fraction** + **nearest** node
-(`M_R`-metric cdist); `score_single_token` returns `ManifoldTokenReading`s (coords
-empty per-token — the curved invert is deferred), `flat_scalars` flattens to
-`{"<name>:fraction", "<name>@<label>": −distance}`. `score_aggregate` (end-of-gen)
-pools the last non-special token, runs the channels, and recovers authoring coords
-+ residual via `invert_parameterization` (which raises on a flat fit — flat probes
-read coords through TraitMonitor's affine path instead). The one-shot re-render
-text scorer (`measure`) is gone — every read source is live hooks scoring captured
-hidden states, no second forward pass.
+- a **flat** (affine) probe recovers `coords` through the affine reduced→domain
+  map (`coord_S @ c + coord_b`); off-surface `residual` is identically `0`.
+  **domain-frame**: each layer's reduced coord is in that layer's `‖δ_L‖` units,
+  mapped to the shared domain *before* EV-averaging (reference = each node's
+  whitened read-coord). At rank-1 this is the pole-normalized coordinate (`1.0` at
+  the positive node); a 1-node fold (monopolar `extract`, ad-hoc `probe()`) is the
+  K=1 ray (`coord_b = 0`). A 2-node concept axis *and* the rank-8 `personas` fan.
+- a **curved** probe recovers `coords` via the `invert_parameterization`
+  nearest-point foot solve (run **per token** now — the accepted live cost) plus a
+  real normalized off-surface `residual`.
+
+`score_aggregate` (end-of-gen) pools the last non-special token per layer and calls
+the *same* `_score_probe_full`, so the aggregate at a token index is bit-identical
+to the live read at that token. `add_probe(name, manifold, *, top_n)` /
+`remove_probe(name)` attach/detach any shape. The read shares
+`_build_whitened_factors` (per-layer `_LayerWhiten` build), `_attach_manifold_probe`
+(node cache + EV weights), and `_layer_geometry`. `__init__`'s `layer_means` is
+vestigial on the hot path — the readout centers on each fit's own
+`LayerSubspace.mean`. `probe_layers` is the capture-widening union
+(`attached_layers` is a back-compat alias for the surfaces that consumed the former
+`ManifoldMonitor`).
+
+`flat_scalars` (one staticmethod) writes the gate channels from a readings dict:
+`"<name>"` (= coords axis 0) + `"<name>[i]"` per axis, `"<name>:fraction"`,
+`"<name>@<label>": −distance` per nearest node. Every probe — flat and curved — now
+carries coords *and* nearest, so flat probes expose `@label` similarity gates too
+(`@when:personas@hacker`) and the gate grammar is uniform. Entry points:
+`score_per_token` (primary — returns `(aggregate readings, per-token axis-0 coord
+stream)`), `score_single_token{,_per_layer}` (`_per_layer` is a view over the
+reading's `coords_per_layer` backing the loom heatmap), `measure_from_hidden`,
+`score_stack`, live-mean `begin/update/end_live`. History/stats are
+per-coordinate-axis (`axis_stats`); the TUI-facing scalar helpers report axis 0.
+The bundled roster is the fitted 2-node `Manifold`s themselves
+(`_bootstrap_manifold_probes` — no fold). The one-shot re-render text scorer
+(`measure`) is gone — every read source is live hooks scoring captured hidden
+states, no second forward pass.
 
 ## triggers.py
 
@@ -349,10 +359,11 @@ detectors; the internal `_ThinkState` machine + `GenerationState` drive streamin
 ## session.py
 
 `SaklasSession` owns the model, the in-memory profile registry (`_profiles`), the
-loaded-manifold registry (`_manifolds`), both monitors, `SteeringManager`,
-`HiddenCapture`, generation defaults (`session.config`), the loom tree, and a
-synchronous `events: EventBus`. `from_pretrained(model_id, *, device, dtype,
-quantize, probes, dls=..., compile=..., cuda_graphs=...)`
+loaded-manifold registry (`_manifolds`), the unified `Monitor` (`_monitor`),
+`SteeringManager`, `HiddenCapture`, generation defaults (`session.config`), the loom
+tree, and a synchronous `events: EventBus`. `from_pretrained(model_id, *, device,
+dtype, quantize, probes, system_prompt, max_tokens=1024, dls=True, compile=False,
+compile_mode=None, cuda_graphs=False, return_top_k=0)`
 does the HF load + layer-mean compute + probe bootstrap — there is no
 `injection_mode`/`theta_max` param. `__init__` takes a pre-loaded model. Both call
 `materialize_bundled_manifolds()` + `selectors.invalidate()` early.
@@ -404,7 +415,7 @@ memoized into `_profiles`; (3) a stale (`< PACK_FORMAT_VERSION`) legacy
 manifold file-only (no tensor yet) and raises with the exact `manifold fit` command
 to run. `_bootstrap_manifold_probes(categories)` is the probe-roster bootstrap:
 for each `default/` manifold tagged in a requested category, fit-or-load the
-2-node `Manifold` and hand it to `TraitMonitor` (which reads it as a rank-1
+2-node `Manifold` and hand it to the `Monitor` (which reads it as a rank-1
 coordinate — no fold; replaces the old `io.probes_bootstrap.bootstrap_probes`).
 
 `_compose_steering_entries` is the dispatch (`ARCHITECTURE.md` §4): classify each
@@ -421,15 +432,16 @@ aggregate under soft-warn + highest-`|coeff|`-wins (`RoleBaselineMismatchWarning
 context, `_begin_capture`/`_end_capture`, `_finalize_generation`, and teardown.
 Monitor scoring is in-flight (no second forward pass); `SamplingConfig(return_hidden=
 True)` widens capture to every layer and lands `GenerationResult.hidden_states`,
-re-scorable via `session.score_hidden`. Manifold probes ride the same plumbing:
-`add_manifold_probe(selector, *, as_name=None, top_n=3)` resolves via
-`_ensure_manifold_loaded` and registers on `_manifold_monitor`;
-`_begin_capture` widens to the union of vector + manifold probe layers; the gate
-callback merges both monitors' `score_single_token` readings via their
-`flat_scalars` into `TriggerContext.probe_scores` (TraitMonitor →
-`"<name>"`/`"<name>[i]"`/`"<name>:fraction"`, ManifoldMonitor →
-`"<name>:fraction"`/`"<name>@<label>"`); `_finalize_generation` calls
-`ManifoldMonitor.score_aggregate` into `GenerationResult.manifold_readings`.
+re-scorable via `session.score_hidden`. Probes ride the same plumbing:
+`add_probe(selector, *, as_name=None, top_n=3)` resolves via `_resolve_probe_manifold`
+(a 2-node `pca` concept folds to a rank-1 probe via `_fold_profile_probe`; a
+multi-node manifold attaches whole) and registers on the unified `_monitor`;
+`remove_probe(name)` detaches. `_begin_capture` widens to `_monitor.probe_layers()`;
+the gate callback runs one `_monitor.score_single_token` through `flat_scalars` into
+`TriggerContext.probe_scores` (one key space —
+`"<name>"`/`"<name>[i]"`/`"<name>:fraction"`/`"<name>@<label>"`);
+`_finalize_generation` calls `_monitor.score_aggregate` into
+`GenerationResult.manifold_readings`.
 `session.lock` is the server-owned `asyncio.Lock` (distinct from `_gen_lock`).
 `generate_batch`/`generate_sweep` return `RunSet` (sweep builds the Cartesian
 product as loom siblings). Hot-path events: `GenerationStarted`/`SteeringApplied`/
@@ -488,21 +500,22 @@ logprobs + the cross-branch evaluation (`_compute_rows`, alignment via
 ## results.py
 
 `GenerationResult`, `RunSet`, `TokenAlt`, `TokenEvent`, `ProbeReadings`,
-`ManifoldTokenReading`, `ManifoldAggregate`, `ResultCollector`. `RunSet` is the
+`ManifoldReading`, `ResultCollector`. `RunSet` is the
 list-like multi-run shape (`node_ids`/`grid`/`.first`/`.to_collector()`/
 `.to_dataframe()`). `TokenEvent` carries `thinking`, `logprob`, `top_alts`,
-`finish_reason`, `scores` (per-probe `ManifoldTokenReading`s — the coordinate
-readings, live-stream-gated), `perplexity`, `manifold_readings`. `GenerationResult`
+`finish_reason`, `scores` (per-probe `ManifoldReading`s — the full readings,
+live-stream-gated), `perplexity`, `manifold_readings`. `GenerationResult`
 carries `prompt_tokens`, `finish_reason`, optional `logprobs`, `readings`
 (per-probe `ProbeReadings`), `manifold_readings`, and `applied_steering` (the
-canonical expression, round-trips through `parse_expr`). `ManifoldTokenReading`
-(`coords`, `fraction`, `nearest`) is the unified per-token reading — `coords` is
-the domain-frame coordinate (filled for a flat fit, empty for a curved fit per
-token); `ManifoldAggregate` (`fraction_mean`/`fraction_per_layer`/`nearest`/
-`coords`/`coords_per_layer`/`residual_mean`/`residual_per_layer`) is end-of-gen.
-`ProbeReadings` is vectorized per coordinate axis (`mean`/`std`/`min`/`max`/
-`delta_per_gen` are `tuple[float,...]`, `per_generation` a list of coord tuples).
-`to_dict()` omits `hidden_states`.
+canonical expression, round-trips through `parse_expr`). `ManifoldReading`
+(`coords`/`fraction`/`nearest`/`residual` + `fraction_per_layer`/`coords_per_layer`/
+`residual_per_layer`) is the **single** reading shape for both the live per-token
+stream and the end-of-gen aggregate (the aggregate is the reading pooled at the
+last-content token). Every field is populated for flat and curved fits alike;
+`residual` is `0` for a flat fit (the surface fills its subspace) and the
+normalized off-surface distance for a curved fit. `ProbeReadings` is vectorized per
+coordinate axis (`mean`/`std`/`min`/`max`/`delta_per_gen` are `tuple[float,...]`,
+`per_generation` a list of coord tuples). `to_dict()` omits `hidden_states`.
 
 ## histogram.py
 

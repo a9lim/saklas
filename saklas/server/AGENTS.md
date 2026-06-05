@@ -6,6 +6,18 @@ serializes on a single `asyncio.Lock`. There is **no `/saklas/v1/packs*` surface
 — concepts are manifolds, so distribution rides the manifold routes (install) and
 the vectors-under-session routes (extract/merge); HF upload stays CLI-only.
 
+> **⚠️ Monitor unification (`a498895`) — the read-side probe surface here is red
+> against the engine, pending rewire (TBD).** The probe routes below still call the
+> *removed* `session.add_manifold_probe` / `remove_manifold_probe` /
+> `manifold_monitor` (manifold probes, `manifold_probe_routes.py`) and
+> `session.probe` / `session.unprobe` (vector probes, `probe_routes.py`); the
+> serve-time `_attach_default_manifold_probes` (`cli/runners.py`) calls
+> `add_manifold_probe` too. The unification collapsed both families into one
+> `session.add_probe(selector, *, as_name=None, top_n=3)` / `remove_probe(name)`
+> over the unified `session._monitor`. The probe-route prose below documents the
+> current (pre-rewire) code — read it as the rewire spec, not working behavior. The
+> generation, steering, manifold-CRUD, loom, and traits-SSE paths are unaffected.
+
 ## Module map
 
 `app.py` registers the OpenAI routes inline, then calls
@@ -62,12 +74,14 @@ chunk before `[DONE]`. Thinking tokens stream as `reasoning_content`.
 logprobs shapes from `result.logprobs` (alt text off `TokenAlt`, not a re-tokenize).
 
 Manifold-probe readings ride each choice under the vendor-prefixed
-`x-saklas-manifold-readings` extension, keyed by attached probe name. Non-streaming
-carries the aggregate (`ManifoldAggregate.to_dict()`); each streamed chunk carries
-the per-token reading (`ManifoldTokenReading.to_dict()`) when at least one probe is
-attached and `live_scores` is on; the final chunk carries the aggregate. The field
-is omitted entirely when no manifold probe is attached, so OpenAI clients that
-don't read the extension see no shape change. `_manifold_reading_aggregate(session)`
+`x-saklas-manifold-readings` extension, keyed by attached probe name. Both the
+aggregate and each streamed per-token chunk carry the same `ManifoldReading.to_dict()`
+shape (the unification: aggregate is the reading pooled at the last-content token).
+Non-streaming carries the aggregate; each streamed chunk carries the per-token
+reading when at least one probe is attached and `live_scores` is on; the final
+chunk carries the aggregate. The field is omitted entirely when no manifold probe is
+attached, so OpenAI clients that don't read the extension see no shape change.
+`_manifold_reading_aggregate(session)`
 and `_manifold_token_readings(event)` are the shared helpers (also imported by
 `ollama.py`).
 
@@ -112,7 +126,8 @@ body + any typed safe-message formatter.
 - `GET/POST /saklas/v1/sessions` — list / idempotent create (a model mismatch warns
   and returns the existing session). `_session_info` carries `is_base_model` plus
   `role_substitution_supported` / `user_role_supported` (against `ROLE_HEADERS` /
-  `USER_ROLE_HEADERS` for the resolved `model_type`) so the webui can gate roles.
+  `USER_ROLE_HEADERS` for the resolved `model_type`) and the resolved
+  `default_assistant_role` / `default_user_role`, so the webui can gate roles.
 - `GET/PATCH/DELETE /saklas/v1/sessions/{id}` — info / update defaults / no-op 204.
 - `POST /saklas/v1/sessions/{id}/{clear,rewind}`.
 
@@ -122,7 +137,7 @@ body + any typed safe-message formatter.
 builds the *session-independent* fields via `io.manifolds.manifold_summary(folder)`
 — the same serializer CLI `manifold show -j` emits — so the shared keys
 (`namespace`/`name`/`description`/`source`/`fit_mode`/`is_discover`/`node_count`/
-`node_labels`/`node_roles`/`hyperparams`/`fitted_models`/`tensor_variants` + authored
+`node_labels`/`node_roles`/`node_kinds`/`hyperparams`/`fitted_models`/`tensor_variants` + authored
 `domain`/`domain_label`/`intrinsic_dim`/`min_nodes`/`node_coords`) match across CLI
 and server. The route then layers *session-aware* extras: `fitted_for_session` /
 `stale`, and — for a discover folder fitted on the loaded model — the materialized
@@ -215,8 +230,9 @@ live hooks, not a re-render pass.
   neutral-anchored ray), while two pole corpora (`{positive, negative}` /
   `{pairs: [...]}` / a bare single `{positive, negative}`) route to
   `session.extract_vector_from_corpora` and land a 2-node `pca` manifold.
-  `namespace` controls the destination; `force`
-  bypasses the tensor cache. There is no `/extract/preview` (the A0
+  `namespace` controls the destination; `force` bypasses the tensor cache;
+  `auto_register` (wire field `register`, default true) steers the result in as a
+  vector on success. There is no `/extract/preview` (the A0
   scenario/preview machinery was removed — A2 has no scenarios).
 - `POST /vectors/merge` body `{name, expression}` — wraps `merge_into_manifold`
   (model-scoped, `force=True`): lands a corpus-less baked manifold, folds the fitted
@@ -247,7 +263,7 @@ node_ids, rows}`.
 ### traits_routes.py — live traits SSE
 
 `GET /sessions/{id}/traits/stream` — per-token probe scores in real time during any
-active generation, via inline `TraitMonitor.score_single_token` gated behind
+active generation, via inline `Monitor.score_single_token` gated behind
 registered trait queues (zero overhead when no client is connected). Stays open
 across generations; multiple clients supported. Events: `start`
 (`{generation_id}`), `token` (`{idx, text, thinking, probes}`), `done`
@@ -259,8 +275,10 @@ Bidirectional WebSocket; only `session_id == "default"` is reachable (HF ids con
 `/`). Client → server: `{type: "stop"}`, or `{type: "generate", input, steering,
 sampling, thinking, stateless, raw, parent_node_id?, n?, recipe_override?}`. The
 `sampling` block (`WSSamplingParams` → `_build_sampling` → `SamplingConfig`) carries
-`user_role`/`assistant_role` — the per-message role-substitution labels, stamped
-onto the produced loom nodes and rendered faithfully per-turn. Special generate
+`user_role`/`assistant_role` (the per-message role-substitution labels, stamped
+onto the produced loom nodes and rendered faithfully per-turn), plus `return_top_k`
+(per-request top-K-alts override) and `persist_per_layer_scores` (the per-layer
+heatmap opt-in that gates the `per_layer_scores` token channel). Special generate
 modes:
 - **Logit fork** (`fork_node_id`/`fork_raw_index`/`fork_alt_token_id`) →
   `session.fork_from_token`: replays the source node's raw decode prefix, forces the

@@ -48,71 +48,54 @@ class ProbeReadings:
 
 
 @dataclass
-class ManifoldTokenReading:
-    """Per-token subspace-probe reading for one attached fit (flat or curved).
+class ManifoldReading:
+    """Subspace-probe reading for one attached fit (flat or curved).
 
-    The unified per-token readout for both monitors.  ``coords`` is the
-    EV-weighted whitened in-subspace coordinate of the running activation
-    (``M_R⁻¹ B Σ⁻¹ (h − mean)`` aggregated across the fit's layers) — the
-    raw, neutral-anchored position in the same units the steering target
-    uses, an ``R``-tuple for a rank-``R`` fit (a 1-tuple for a 2-node
-    concept axis).  It is **exact and hot-path-cheap for a flat (affine)
-    fit** — :class:`~saklas.core.monitor.TraitMonitor` fills it via the
-    batched stacked-basis matmul — and left **empty (``()``) for a curved
-    fit**, where an exact per-token coordinate would need the RBF
-    foot-solve and is therefore deferred to the end-of-generation
-    :class:`ManifoldAggregate`.  ``fraction`` is
-    ``||P_M(h−mean)||_M / ||h−mean||_M`` EV-weighted across layers (the
-    share of the centered activation that lives in the subspace), and
-    ``nearest`` is the top-N node labels by whitened distance to the
-    running activation, ascending.
+    The **single** unified readout: a live per-token reading (gate / stream)
+    and the end-of-generation aggregate are the same shape — the aggregate
+    is just this reading evaluated at the pooled last-content token.  Every
+    field is populated for both flat and curved fits (the old flat/curved
+    asymmetry — flat-no-nearest, curved-no-coords — is gone; both run the
+    full per-layer geometry each token):
+
+    * ``coords`` — EV-weighted whitened in-subspace coordinate in the fit's
+      domain frame (``M_R⁻¹ B Σ⁻¹ (h − mean)`` mapped through the affine
+      inverse for a flat fit, the ``invert_parameterization`` foot solve for
+      a curved fit), an ``R``-tuple for a rank-``R`` fit (a 1-tuple for a
+      2-node concept axis).  Neutral-anchored, pole-normalized at rank-1
+      (``1.0`` at the positive node).
+    * ``fraction`` — ``||P_M(h−mean)||_M / ||h−mean||_M`` EV-weighted across
+      layers, the share of the centered activation living in the subspace,
+      ∈ [0, 1].
+    * ``nearest`` — top-N node labels by EV-weighted whitened distance,
+      ascending.
+    * ``residual`` — EV-weighted normalized off-manifold residual
+      ``dist_L / ||c_L||``; identically ``0.0`` for a flat fit (the surface
+      fills its subspace), the off-surface distance for a curved fit.
+
+    The ``*_per_layer`` maps carry the un-EV-collapsed per-layer trace of
+    the same three geometric quantities (coords / fraction / residual).
     """
     fraction: float
     nearest: list[tuple[str, float]]
     coords: tuple[float, ...] = ()
+    residual: float = 0.0
+    fraction_per_layer: dict[int, float] = field(default_factory=dict)
+    coords_per_layer: dict[int, tuple[float, ...]] = field(default_factory=dict)
+    residual_per_layer: dict[int, float] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "fraction": self.fraction,
             "nearest": [[label, dist] for label, dist in self.nearest],
             "coords": list(self.coords),
-        }
-
-
-@dataclass
-class ManifoldAggregate:
-    """End-of-generation manifold-probe aggregate for one attached manifold.
-
-    ``fraction_mean`` is the EV-weighted per-layer subspace fraction over
-    the mean-across-generated-tokens activation; ``fraction_per_layer``
-    is the same quantity reported per layer.  ``nearest`` is the top-N
-    node labels by EV-weighted distance vote across layers.  ``coords``
-    is the EV-weighted mean of the per-layer inverse-projection
-    coordinates (coords share the domain, so the mean is meaningful);
-    ``residual_mean`` and ``residual_per_layer`` are the EV-weighted
-    mean of the normalized off-manifold residual
-    ``dist_L / ||h_par_c_L||`` and its per-layer trace.
-    """
-    fraction_mean: float
-    fraction_per_layer: dict[int, float]
-    nearest: list[tuple[str, float]]
-    coords: tuple[float, ...]
-    coords_per_layer: dict[int, tuple[float, ...]]
-    residual_mean: float
-    residual_per_layer: dict[int, float]
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "fraction_mean": self.fraction_mean,
+            "residual": self.residual,
             "fraction_per_layer": {
                 str(k): float(v) for k, v in self.fraction_per_layer.items()
             },
-            "nearest": [[label, dist] for label, dist in self.nearest],
-            "coords": list(self.coords),
             "coords_per_layer": {
                 str(k): list(v) for k, v in self.coords_per_layer.items()
             },
-            "residual_mean": self.residual_mean,
             "residual_per_layer": {
                 str(k): float(v) for k, v in self.residual_per_layer.items()
             },
@@ -154,11 +137,12 @@ class GenerationResult:
     # the JSON path; persist explicitly with ``torch.save`` if needed.
     hidden_states: dict[int, torch.Tensor] | None = None
     # End-of-generation manifold-probe aggregates, populated by
-    # ``ManifoldMonitor.score_aggregate`` when at least one manifold
-    # probe is attached.  Empty dict otherwise (no aggregates were
-    # computed).  Keyed by registered probe name; round-trips through
-    # ``to_dict`` as a nested mapping.
-    manifold_readings: dict[str, "ManifoldAggregate"] = field(default_factory=dict)
+    # ``Monitor.score_aggregate`` when at least one probe is attached
+    # (the same :class:`ManifoldReading` shape the live per-token stream
+    # carries, pooled at the last-content token).  Empty dict otherwise.
+    # Keyed by registered probe name; round-trips through ``to_dict`` as a
+    # nested mapping.
+    manifold_readings: dict[str, "ManifoldReading"] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -274,21 +258,24 @@ class TokenEvent:
     top_alts: list[TokenAlt] | None = None
     finish_reason: str | None = None
     # Per-probe subspace readings computed inline against the latest
-    # captured hidden state — the coordinate readout (coords + fraction +
-    # nearest) for each flat-subspace probe (a 2-node concept axis is the
-    # ``R = 1`` case; ``coords`` is a 1-tuple).  Populated by
-    # ``generate_stream`` only when the session has active vector probes;
-    # otherwise None.  Curved-manifold probes ride ``manifold_readings``.
-    scores: dict[str, "ManifoldTokenReading"] | None = None
+    # captured hidden state — the full coordinate readout
+    # (:class:`ManifoldReading`: coords + fraction + nearest + residual,
+    # plus per-layer traces) for every attached probe, flat or curved (a
+    # 2-node concept axis is the ``R = 1`` case; ``coords`` is a 1-tuple).
+    # Populated by ``generate_stream`` only when the session has active
+    # probes; otherwise None.
+    scores: dict[str, "ManifoldReading"] | None = None
     # Perplexity of the configured sampler distribution after temperature,
     # top-k, and top-p renormalization — ``exp`` of Shannon entropy in nats.
     # Bounded above by sampler support size; a confident prediction
     # approaches 1. Consumers take ``log`` to recover entropy-nats.
     perplexity: float | None = None
     # Per-token manifold-probe readings, populated by ``generate_stream``
-    # only when at least one manifold probe is attached and ``live_scores``
-    # is True; otherwise ``None``.  Keyed by registered probe name.
-    manifold_readings: dict[str, "ManifoldTokenReading"] | None = None
+    # only when at least one probe is attached and ``live_scores`` is True;
+    # otherwise ``None``.  Same :class:`ManifoldReading` shape as ``scores``
+    # (the geometric wire field; kept distinct for the deferred frontend
+    # rewire).  Keyed by registered probe name.
+    manifold_readings: dict[str, "ManifoldReading"] | None = None
 
 
 class ResultCollector:

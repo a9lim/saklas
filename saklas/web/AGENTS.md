@@ -18,7 +18,7 @@ The Svelte source lives at the repo's `webui/` directory (peer of `saklas/`). `c
 
 ## Mount
 
-`register_web_routes(app)` mounts `/assets/*` on `StaticFiles` (content-hashed, safe to cache hard), registers `GET /` → `index.html`, and a catch-all `GET /{full_path:path}` that serves allowlisted top-level dist files (favicon, etc.) and otherwise falls back to `index.html` for SPA routing. The catch-all is registered last by `create_app` so it never shadows `/v1/*`, `/api/*`, `/saklas/v1/*`. `full_path` is only ever used as a dict key, never a path component — `..` traversal is structurally impossible.
+`register_web_routes(app)` mounts `/assets/*` on `StaticFiles` with hard cache headers, registers `GET /` → `index.html`, and a catch-all `GET /{full_path:path}` that serves the allowlisted top-level dist files (every top-level file except `index.html` — currently just `favicon.ico`) and otherwise falls back to `index.html` for SPA routing. (Caveat: the bundle filenames are *fixed* — `assets/saklas.js` / `assets/index.css`, not content-hashed — so a rebuilt bundle can stale-cache under the hard headers; a shipping concern, not a mount bug.) The catch-all is registered last by `create_app` so it never shadows `/v1/*`, `/api/*`, `/saklas/v1/*`. `full_path` is only ever used as a dict key, never a path component — `..` traversal is structurally impossible.
 
 `dist_path()` resolves through `importlib.resources` (editable + wheel). `WebUINotBuilt` is raised on mount when the dist directory is empty — only fires in source installs that haven't run `npm run build`.
 
@@ -32,7 +32,7 @@ The dashboard speaks the native `/saklas/v1/*` API (`saklas/server/saklas_api.py
 - **GET `/sessions/{id}/vectors/{name}/diagnostics`** — 16-bucket layer-magnitude histogram + per-layer magnitudes; falls back to monitor profiles when `name` is a probe.
 - **GET `/sessions/{id}/vectors`** — registered steering vectors. Vector lifecycle now rides the session routes (`POST /extract`, `/vectors/merge`) + the manifold install/browse routes; there is **no `/saklas/v1/packs*` surface** and **no `/vectors/clone`** (both removed in the 4.0 collapse — see "Known server drift" below).
 - **`/manifolds`** — `GET` list (with `fit_mode` / `hyperparams` / `fitted_for_session` / `stale` per manifold), `GET /{ns}/{name}` detail (nodes + statements; discover-mode fits carry derived coords + `diagnostics`), `POST` create (authored), `POST /discover` create (discover-mode, label-only nodes), `POST /generate` (SSE; LLM-authors a discover folder via `session.generate_responses` — A2 conversational extraction, body `kind: "abstract"|"concrete"` + `samples_per_prompt`, no scenario counts), `PATCH /{ns}/{name}`, `DELETE /{ns}/{name}`, `POST /{ns}/{name}/fit` (SSE; accepts discover-mode `fit_mode` / `hyperparams` overrides on discover folders). Steering a fitted manifold is just a `%` term in the WS `steering` string — no separate route.
-- **`/manifold-probes`** — read-side counterpart. `GET` lists every attached probe with its `ManifoldProbeInfo` (name, manifold id, top_n, layers, node_labels, node_coords, intrinsic_dim, domain, feature_space); `POST` body `{selector, name?, top_n?}` attaches; `DELETE /{name}` detaches. Generation responses (OpenAI / Ollama / native WS `done`) gain a `manifold_readings` block keyed by probe name carrying the `ManifoldAggregate` (`fraction_mean / fraction_per_layer / nearest / coords / coords_per_layer / residual_mean / residual_per_layer`); per-token chunks carry the `ManifoldTokenReading` (`fraction / nearest`). The field is omitted entirely when no probe is attached, so clients render it defensively.
+- **`/manifold-probes`** — read-side counterpart. `GET` lists every attached probe with its `ManifoldProbeInfo` (name, manifold id, top_n, layers, node_labels, node_coords, intrinsic_dim, domain, feature_space); `POST` body `{selector, name?, top_n?}` attaches; `DELETE /{name}` detaches. Generation responses (OpenAI / Ollama / native WS `done`) gain a `manifold_readings` block keyed by probe name carrying a `ManifoldReading` (`fraction / nearest / coords / residual / fraction_per_layer / coords_per_layer / residual_per_layer`); per-token chunks carry the **same** `ManifoldReading` shape (the unification — aggregate is the reading pooled at the last-content token, so per-token and aggregate are one shape). The field is omitted entirely when no probe is attached, so clients render it defensively.
 - **POST `/sessions/{id}/vectors/merge`** (JSON), **POST `/sessions/{id}/extract`** (SSE progress on `Accept: text/event-stream`, JSON otherwise). The historical `/vectors/clone` and `/extract/preview` routes were removed in the 4.0 collapse — the client still references both (see "Known server drift"); they now 404.
 - **POST `/sessions/{id}/experiments/fan`** — alpha grid as loom siblings, JSON `RunSet` summary.
 - **Loom tree** under `/sessions/{id}/tree` — `tree`/`tree/active` GETs; `navigate`/`edit`/`branch`/`delete`/`star`/`note`/`reset` mutations; `edge_label`, `filter`, `diff`, `joint_logprobs`; `transcript` export/import.
@@ -74,6 +74,14 @@ re-migrated and rebuilt:
   server-rejected. Drop it from the webui.
 - **The ExtractDrawer DiM/PCA `method` radio is inert** — `ExtractRequest` carries
   no `method` field; difference-of-means (a 2-node `pca` fit) is the only method.
+- **Read-side probe routes are red (Monitor unification, `a498895` — separate from
+  the 4.0 collapse).** Server `manifold_probe_routes` / `probe_routes` and the
+  serve-time default-probe attach still call the *removed* `session.add_manifold_probe`
+  / `manifold_monitor` / `probe` (TBD rewire to the unified `session.add_probe` /
+  `remove_probe` over `session._monitor`). The dashboard's `ProbeRack` /
+  `ManifoldProbeStrip` and the auto-loaded default manifold probes depend on those
+  routes, so the read side is non-functional until the *server* is rewired —
+  independent of the webui's own migration state.
 
 These are described in the relevant sections below as historical context; treat
 them as cleanup TODOs, not live behavior.
@@ -135,6 +143,8 @@ webui/src/
      AdvancedSampling,Health,SessionAdmin,Correlation,LayerNorms,
      NodeCompare,Transcript}Drawer.svelte
     index.ts                  # barrel re-exports for App.svelte's switch
+                              #   (legacy Pack/Merge/Clone are NOT re-exported here —
+                              #    App.svelte imports those three directly)
 ```
 
 `VectorsDrawer` is the unified vector management surface — both rack `+ add` buttons (steering and probe) and `RecipeBuilderDrawer`'s "browse…" route here.  It reads `packsState.infos` reactively (populated by `refreshPacks`) and splits into two sections on the server's `LocalPackInfo.has_tensor` flag:
@@ -170,7 +180,7 @@ The read-side surface lives inside the unified `ProbeRack` (one of two equal sec
 
 `ManifoldDrawer` in `probe` mode grows a `+probe` action on every fitted row (sitting between `+steer` and `re-fit`, sharing the purple accent), plus a collapsed `attach by selector` disclosure form (free-text `selector` + optional alias `name` + `top_n` numeric) for attaching a manifold not in the catalog or registering under a non-default name. A top-of-drawer hint banner names the steer-vs-probe distinction so the mode landing reads cleanly. The drawer's existing inspect / re-fit / delete actions are unchanged; `+probe` flips to `-probe` (red-on-hover) when the manifold is already attached so the row carries the detach affordance too. All three surfaces (`+probe` button, custom-attach form, store mutators) wrap `attachManifoldProbe` / `detachManifoldProbe`, which call the existing `apiManifoldProbes.attach` / `detach` routes.
 
-Wire-shape: the WS `token` event grows an optional `manifold_readings: Record<string, {fraction, nearest}>` field; the `done` event's `result` grows `manifold_readings: Record<string, ManifoldAggregateJSON>`. Both are omitted entirely when no probe is attached, so legacy WS clients see no shape change. `updateManifoldProbesFromToken` / `setManifoldProbeAggregates` / `resetManifoldProbeStreams` are the store-side mutators called from `handleWsMessage`; `attachManifoldProbe` / `detachManifoldProbe` / `refreshManifoldProbeList` cover the REST surface. The OpenAI / Ollama extensions (`x-saklas-manifold-readings`) ride the same shapes for non-WS clients.
+Wire-shape: the WS `token` event grows an optional `manifold_readings: Record<string, ManifoldReadingJSON>` field; the `done` event's `result` grows `manifold_readings: Record<string, ManifoldReadingJSON>` — the **same** shape (per-token and aggregate are unified). Both are omitted entirely when no probe is attached, so legacy WS clients see no shape change. `updateManifoldProbesFromToken` / `setManifoldProbeAggregates` / `resetManifoldProbeStreams` are the store-side mutators called from `handleWsMessage`; `attachManifoldProbe` / `detachManifoldProbe` / `refreshManifoldProbeList` cover the REST surface. The OpenAI / Ollama extensions (`x-saklas-manifold-readings`) ride the same shapes for non-WS clients.
 
 `RawBuffer` is the base-model surface.  `SessionInfo.is_base_model` (a non-chat model has no chat template) drives `genUiMode.effectiveRawMode()`; the `genUiMode.override` (`auto`/`chat`/`raw`, persisted per `model_id`, set from the AdvancedSamplingDrawer control or the cycling badge in the Chat header) wins when not `auto`.  In raw mode `Chat.svelte` renders `<RawBuffer />` instead of role bubbles — one continuous editable `pre-wrap` surface with the loom active path joined as plain text, no roles.
 

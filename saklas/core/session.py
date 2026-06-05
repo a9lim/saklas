@@ -40,7 +40,7 @@ from saklas.io.probes_bootstrap import bootstrap_layer_means
 from saklas.core.profile import Profile
 from saklas.core.results import (
     GenerationResult,
-    ManifoldTokenReading,
+    ManifoldReading,
     ProbeReadings,
     RunSet,
     TokenEvent,
@@ -2498,14 +2498,12 @@ class SaklasSession:
             layer_idxs = sorted(union)
         self._capture.clear()
         self._capture.attach(self._layers, layer_idxs)
-        # Incremental scoring (no-sync per-token coord rows + only-latest
-        # hidden retained) is disabled under the coordinate readout: the
-        # ``[P1]`` row carries axis-0 coords but not ``fraction``, so it
-        # can't reconstruct the full per-probe aggregate reading.  Full
-        # retention + ``score_per_token`` is correct; the scoring fast path
-        # (the stacked rank-1 matmul) is unaffected.
-        # TODO(coords): re-enable with a ``[P1, 2]`` (coord, fraction) row so
-        # the aggregate reading round-trips, restoring the memory win.
+        # Full retention only.  Every read is a full per-probe reading
+        # (coords + fraction + nearest + residual + per-layer) computed from
+        # the captured stack — there is no no-sync incremental coord-row fast
+        # path to short-circuit, so the only-latest-hidden memory win is gone
+        # by design (the research-tool priority is full per-token info, not
+        # throughput).  ``score_per_token`` rescoring is the canonical path.
         self._capture_incremental = False
         self._incremental_rows = []
         return True
@@ -2517,11 +2515,11 @@ class SaklasSession:
 
     def score_captured(
         self, generated_ids: list[int], *, accumulate: bool = True,
-    ) -> tuple[dict[str, "ManifoldTokenReading"], dict[str, list[float]]]:
+    ) -> tuple[dict[str, "ManifoldReading"], dict[str, list[float]]]:
         """Score probes from the last hidden-state capture.
 
         Returns ``(aggregate_readings, per_token_scores)`` — the aggregate is a
-        per-probe :class:`ManifoldTokenReading` (coordinate reading), and
+        per-probe :class:`ManifoldReading` (coordinate reading), and
         ``per_token_scores`` is the per-probe axis-0 coordinate stream. Both
         dicts are empty when the capture was never attached or the generation
         produced no tokens.
@@ -2535,7 +2533,7 @@ class SaklasSession:
 
     def _score_incremental(
         self, generated_ids: list[int], *, accumulate: bool = True,
-    ) -> tuple[dict[str, "ManifoldTokenReading"], dict[str, list[float]]]:
+    ) -> tuple[dict[str, "ManifoldReading"], dict[str, list[float]]]:
         """Aggregate readings + per-token coord stream for the generated tokens.
 
         TODO(coords): the no-sync incremental coord-row path is disabled (a
@@ -2552,7 +2550,7 @@ class SaklasSession:
         *,
         per_token: Literal[False] = False,
         accumulate: bool = False,
-    ) -> dict[str, "ManifoldTokenReading"]: ...
+    ) -> dict[str, "ManifoldReading"]: ...
     @overload
     def score_hidden(
         self,
@@ -2560,7 +2558,7 @@ class SaklasSession:
         *,
         per_token: Literal[True],
         accumulate: bool = False,
-    ) -> tuple[dict[str, "ManifoldTokenReading"], dict[str, list[float]]]: ...
+    ) -> tuple[dict[str, "ManifoldReading"], dict[str, list[float]]]: ...
     def score_hidden(
         self,
         hidden: dict[int, torch.Tensor],
@@ -2568,8 +2566,8 @@ class SaklasSession:
         per_token: bool = False,
         accumulate: bool = False,
     ) -> (
-        dict[str, "ManifoldTokenReading"]
-        | tuple[dict[str, "ManifoldTokenReading"], dict[str, list[float]]]
+        dict[str, "ManifoldReading"]
+        | tuple[dict[str, "ManifoldReading"], dict[str, list[float]]]
     ):
         """Score registered probes against a pre-captured hidden-state dict.
 
@@ -2580,7 +2578,7 @@ class SaklasSession:
 
         Shape rules:
         - Each value ``[D]``          → single-state aggregate.
-          Returns ``dict[probe, ManifoldTokenReading]``.
+          Returns ``dict[probe, ManifoldReading]``.
         - Each value ``[T, D]``       → per-token stack.
           ``per_token=False`` (default) returns the aggregate pooled from
           row ``T-1``; ``per_token=True`` returns
@@ -4111,7 +4109,7 @@ class SaklasSession:
                 mean_logprob_count += 1
             latest_hidden_for_token: dict[int, torch.Tensor] | None = None
             scores: dict[str, float] | None = None
-            vector_readings: dict[str, "ManifoldTokenReading"] | None = None
+            vector_readings: dict[str, "ManifoldReading"] | None = None
             per_layer_payload: dict[str, dict[str, float]] | None = None
             manifold_readings = None
             needs_scores = bool(
@@ -4142,21 +4140,20 @@ class SaklasSession:
                         p: (r.coords[0] if r.coords else 0.0)
                         for p, r in agg.items()
                     }
-                    # The per-token geometric wire field (fraction + nearest)
-                    # only when a client wants the live per-token stream.
+                    # The per-token geometric wire field (full reading) only
+                    # when a client wants the live per-token stream.
                     if _wants_live_token_scores:
                         manifold_readings = agg
-                if assistant_node_id is not None and _persists_layer_scores:
-                    per_layer = self._monitor.score_single_token_per_layer(
-                        latest_hidden_for_token,
-                    )
-                    if per_layer:
-                        per_layer_payload = {
-                            str(layer): {
-                                p: round(float(v), 6) for p, v in metrics.items()
-                            }
-                            for layer, metrics in per_layer.items()
-                        }
+                    # Per-layer axis-0 heatmap row — read straight off the
+                    # full reading's ``coords_per_layer`` (no second pass).
+                    if assistant_node_id is not None and _persists_layer_scores:
+                        by_layer: dict[str, dict[str, float]] = {}
+                        for p, r in agg.items():
+                            for layer, coord in r.coords_per_layer.items():
+                                by_layer.setdefault(str(layer), {})[p] = round(
+                                    float(coord[0] if coord else 0.0), 6,
+                                )
+                        per_layer_payload = by_layer or None
             self._last_token_probe_payload = {
                 "scores": scores,
                 "readings": vector_readings,
@@ -4548,7 +4545,7 @@ class SaklasSession:
         idx_counter = [0]
 
         def _push(text: str, is_thinking: bool, tid: int | None, lp: float | None, top_alts: Any, perplexity: float | None) -> None:
-            readings: dict[str, "ManifoldTokenReading"] | None = None
+            readings: dict[str, "ManifoldReading"] | None = None
             manifold_readings = None
             if live_scores and self._monitor.probe_names:
                 payload = self._last_token_probe_payload or {}

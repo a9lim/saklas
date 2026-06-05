@@ -36,7 +36,7 @@ when you work in that directory. Consult them only when editing that layer.
 
 - `saklas/core/AGENTS.md` — model loading, the manifold/subspace fit + injection,
   monitor, session, generation loop, loom tree
-- `saklas/io/AGENTS.md` — manifold format, HF distribution, GGUF, merge, cloning,
+- `saklas/io/AGENTS.md` — manifold format, HF distribution, GGUF, merge,
   alignment, paths/selectors
 - `saklas/cli/AGENTS.md` — six-verb dispatch, config loading, flags
 - `saklas/server/AGENTS.md` — OpenAI / Ollama / native routes
@@ -108,11 +108,11 @@ generated under a chat template whose assistant-role label was substituted, and
 the same substitution is auto-applied at steering time so extract baseline equals
 steer baseline). There is no `pca` variant. Bare names resolve cross-namespace and
 raise `AmbiguousSelectorError` on collision. Concepts *are* manifolds now
-(`io.selectors` walks `manifolds_dir()`): a bare pole resolves through the
-manifold tier — `resolve_bare_name` tries the bipolar-pole node first
-(`resolve_manifold_label`/`resolve_manifold_name` over the installed 2-node `pca`
-manifolds), then a multi-node manifold node label, raising on cross-tier
-collision. A steering expression composing role-augmented terms must agree on
+(`io.selectors` walks `manifolds_dir()`): a bare slug resolves through the steering
+grammar's bare-atom tier (`core/steering_expr`) — the bipolar-pole/name resolvers
+(`resolve_pole`/`resolve_manifold_name` over the installed 2-node `pca` manifolds)
+first, then `io.selectors.resolve_bare_name` for a multi-node manifold node label,
+raising on cross-tier collision. A steering expression composing role-augmented terms must agree on
 role; plain `:raw` terms compose with role terms but emit a one-time
 `RoleBaselineMismatchWarning`.
 
@@ -156,7 +156,7 @@ Probe gates accept these identifier shapes against the merged scalars the sessio
 writes into `TriggerContext.probe_scores`. Vector probes are concept names whose
 bare form reads coordinate axis 0 (`@when:confident.uncertain > 0.4`) and whose `[i]` form
 reads a specific coordinate axis of a multi-axis fit (`@when:personas[3] > 0.4`);
-both match the keys `TraitMonitor.flat_scalars` emits. The coordinate is
+both match the keys `Monitor.flat_scalars` emits. The coordinate is
 domain-frame (pole-normalized at rank-1: `1.0` at the positive node), so a 2-node
 concept gate reads the same single coordinate it always did.
 Manifold subspace-fraction gates write the `:fraction` channel suffix
@@ -165,7 +165,7 @@ in that manifold's subspace, in `[0, 1]`. Manifold label-similarity gates write
 the `@<label>` suffix (`@when:pad@happy > -0.1`) — the negated distance to
 a named node (larger = closer), so the natural threshold range is negative. Every
 shape flows through one `ProbeGate` (full namespaced string stored verbatim,
-matching the keys each monitor's `flat_scalars` emits) and round-trips
+matching the keys `Monitor.flat_scalars` emits) and round-trips
 byte-for-byte.
 
 `%` is the manifold operator: `<manifold> % <position>` places a generation at a
@@ -183,9 +183,10 @@ layer must be (near-)orthogonal or `OverlappingManifoldError` raises; the merged
 affine subspace is always orthogonalized against the curved spans. See "Manifold
 steering" below.
 
-A bare slug (`pirate`) resolves through `io.selectors.resolve_bare_name`: first as
-a bipolar-pole node of a 2-node `pca` manifold, then as a multi-node manifold node
-label (synthesizing a label-form `ManifoldTerm`, e.g. `local/personas%pirate`).
+A bare slug (`pirate`) resolves in `core/steering_expr`: first as a bipolar
+pole/name of a 2-node `pca` manifold (`resolve_pole`/`resolve_manifold_name`), then
+via `io.selectors.resolve_bare_name` as a multi-node manifold node label
+(synthesizing a label-form `ManifoldTerm`, e.g. `local/personas%pirate`).
 Cross-tier ambiguity raises `AmbiguousSelectorError`. Namespace-qualified or
 variant-suffixed forms (`alice/pirate`, `pirate:role-x`, `civilian.pirate`) skip
 the manifold-label tier.
@@ -508,7 +509,7 @@ All state under `~/.saklas/` (override via `$SAKLAS_HOME`):
     <safe_model_id>_role-<slug>.safetensors  # role-augmented
   models/<safe_model_id>/
     layer_means.{safetensors,json}     # probe-centering baseline
-    neutral_activations.{safetensors,json}   # 90 neutral prompts × layers, fp32
+    neutral_activations.{safetensors,json}   # neutral corpus (mult. of 48) × layers, fp32
     alignments/<safe_src>.{safetensors,json} # optional cross-model Procrustes map
   vectors/<ns>/<concept>/              # LEGACY (pre-4.0) packs only — ported to
                                        # manifolds/ on first touch; no longer written
@@ -548,17 +549,20 @@ tok/s):
 - **Top-p via `torch.topk`**, not full-vocab sort; `top_k` (default 1024 cap) is a
   hard candidate-pool cap applied before top-p (llama.cpp/Ollama order).
 - **Monitor capture is hook-driven**, inline with generation — no second forward
-  pass. `TraitMonitor` reads each flat probe as a whitened **coordinate** (the
-  rank-1 case of the subspace readout): per token it emits `coords` (domain-frame,
-  pole-normalized at rank-1) + `fraction` + `nearest`, and the whole rank-1 roster
-  scores in one stacked matmul per layer (the precomputed `Σ⁻¹d̂` rows) plus one
-  shared per-token `Σ⁻¹h` Woodbury apply — no per-probe loop. Mahalanobis-only:
-  the whitener must cover every probed layer (`covers_all`), else scoring raises
-  `WhitenerError` (no Euclidean path). `covers_all` is trustworthy as "finite
-  factors everywhere": any non-finite layer is excluded, and neutral activations
-  are cached fp32 (so gemma-3's late layers don't overflow the fp16 65504 ceiling
-  to ±inf). The incremental no-sync capture path is disabled under the coordinate
-  readout (full-retention scoring; the scoring fast path is unaffected).
+  pass. The unified `Monitor` reads every probe — flat or curved — as a whitened
+  **coordinate** through one per-probe per-layer geometry pass: per token it emits a
+  full `ManifoldReading` (`coords` domain-frame + `fraction` + `nearest` +
+  `residual`, plus per-layer traces). There is **no batched-affine fast path** — the
+  research-tool priority is full per-token info (nearest, curved coords, residual,
+  per-layer) over throughput, so the per-token cost (incl. the curved
+  `invert_parameterization` foot solve) is paid in the decode loop by design.
+  Mahalanobis-only: the whitener must cover every probed layer (`covers_all`), else
+  scoring raises `WhitenerError` (no Euclidean path). `covers_all` is trustworthy as
+  "finite factors everywhere": any non-finite layer is excluded, and neutral
+  activations are cached fp32 (so gemma-3's late layers don't overflow the fp16
+  65504 ceiling to ±inf). Capture is full-retention only (no no-sync incremental
+  coord-row path); the aggregate is the per-token reading pooled at the last-content
+  token.
 - **Steering hooks are transient** — composed before generation, removed after.
 - **MPS discipline** — diffs on CPU, `torch.mps.empty_cache()` between extraction
   passes, end-of-loop sync to dodge Metal command-buffer reuse crashes.
