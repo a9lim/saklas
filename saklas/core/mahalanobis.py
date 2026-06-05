@@ -256,7 +256,7 @@ class LayerWhitener:
         Reads ``layer_means.safetensors`` and ``neutral_activations.safetensors``
         from ``~/.saklas/models/<safe_id>/``.  Raises :class:`WhitenerError`
         with a populating-command hint when either cache is missing —
-        ``subspace compare`` and similar offline tools shouldn't silently
+        ``manifold compare`` and similar offline tools shouldn't silently
         load a model.
 
         Use :meth:`from_neutral_activations` instead when both tensors

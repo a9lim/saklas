@@ -1037,7 +1037,7 @@ class SaklasSession:
         """Per-layer Mahalanobis whitener; built lazily on first access.
 
         Used by v2.1+ DiM extraction for Mahalanobis-flavored share
-        allocation, by ``subspace compare``, and by
+        allocation, by ``manifold compare``, and by
         callers that pass a whitener to ``project_profile`` for
         LEACE-style projection.  Returns a
         :class:`saklas.core.mahalanobis.LayerWhitener` or ``None`` if
@@ -1067,13 +1067,13 @@ class SaklasSession:
         instantiate the :class:`LayerWhitener`.  Soft-fails to ``None``
         on any error — but the engine is Mahalanobis-only now, so a
         ``None`` whitener makes the activation-space consumers (fit,
-        ``~``/``|`` projection, probe scoring, ``subspace compare``) raise
+        ``~``/``|`` projection, probe scoring, ``manifold compare``) raise
         ``WhitenerError`` with a regenerate-neutrals hint rather than
         degrade to Euclidean.
 
         Lazy: only callers who actually need Mahalanobis math (DiM
         extraction at session init, on-demand ``session.whitener``
-        access, or ``subspace compare``) trigger the
+        access, or ``manifold compare``) trigger the
         forward-pass loop over neutral statements.
         """
         from saklas.core.mahalanobis import LayerWhitener

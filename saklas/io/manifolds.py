@@ -2312,9 +2312,8 @@ def refresh_manifold(
 
 # ============================================================ cross-model transfer ===
 #
-# The manifold analogue of ``saklas subspace transfer`` (which writes a
-# ``_from-<safe_src>`` variant tensor for steering vectors via
-# ``saklas.io.alignment.transfer_profile``).  Pure-io: the caller builds
+# Writes a ``_from-<safe_src>`` variant tensor for cross-model manifold transfer.
+# Pure-io: the caller builds
 # the per-layer Procrustes alignment map — that needs both models loaded,
 # which lives in the session/CLI layer — and passes it in; this function
 # only *applies* it to a fitted manifold's per-layer subspace and writes
