@@ -3,7 +3,7 @@
   // the merged result as a new local steerable.
   //
   // Expression is live-validated in the browser using parseExpression
-  // (mirrors the server parser).  On submit, POST /vectors/merge wraps
+  // (mirrors the server parser).  On submit, POST /vectors/bake wraps
   // saklas.io.merge.merge_into_manifold server-side (the merge lands a
   // corpus-less baked manifold, folded back to a steering direction); the
   // response is the same VectorInfo shape GET /vectors/{name} returns.

@@ -279,7 +279,7 @@ export const apiVectors = {
     req: MergeVectorRequest,
     id: string = SESSION,
   ): Promise<MergeVectorResponse> {
-    return request(`${SESSION_BASE(id)}/vectors/merge`, jsonBody(req));
+    return request(`${SESSION_BASE(id)}/vectors/bake`, jsonBody(req));
   },
   diagnostics(
     name: string,
