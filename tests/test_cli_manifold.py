@@ -25,9 +25,9 @@ from saklas import cli
 # ---------------------------------------------------------------------------
 
 def test_parse_manifold_install():
-    args = cli.parse_args(["manifold", "install", "alice/circumplex"])
-    assert args.command == "manifold"
-    assert args.manifold_cmd == "install"
+    args = cli.parse_args(["pack", "install", "alice/circumplex"])
+    assert args.command == "pack"
+    assert args.pack_cmd == "install"
     assert args.target == "alice/circumplex"
     assert args.as_target is None
     assert args.force is False
@@ -35,7 +35,7 @@ def test_parse_manifold_install():
 
 def test_parse_manifold_install_flags():
     args = cli.parse_args([
-        "manifold", "install", "alice/circumplex",
+        "pack", "install", "alice/circumplex",
         "-a", "local/mood", "-f",
     ])
     assert args.as_target == "local/mood"
@@ -43,16 +43,16 @@ def test_parse_manifold_install_flags():
 
 
 def test_parse_manifold_search():
-    args = cli.parse_args(["manifold", "search", "mood", "-j", "-v"])
-    assert args.manifold_cmd == "search"
+    args = cli.parse_args(["pack", "search", "mood", "-j", "-v"])
+    assert args.pack_cmd == "search"
     assert args.query == "mood"
     assert args.json_output is True
     assert args.verbose is True
 
 
 def test_parse_manifold_search_empty_query():
-    args = cli.parse_args(["manifold", "search"])
-    assert args.manifold_cmd == "search"
+    args = cli.parse_args(["pack", "search"])
+    assert args.pack_cmd == "search"
     assert args.query == ""
 
 
@@ -98,11 +98,11 @@ def test_require_model_reports_manifold_leaf_verb(capsys: pytest.CaptureFixture[
 
 def test_parse_manifold_push():
     args = cli.parse_args([
-        "manifold", "push", "local/circumplex",
+        "pack", "push", "local/circumplex",
         "-a", "alice/circumplex", "-m", "google/gemma-3-4b-it",
         "--variant", "sae", "-p", "-d",
     ])
-    assert args.manifold_cmd == "push"
+    assert args.pack_cmd == "push"
     assert args.selector == "local/circumplex"
     assert args.as_target == "alice/circumplex"
     assert args.model == "google/gemma-3-4b-it"
@@ -112,7 +112,7 @@ def test_parse_manifold_push():
 
 
 def test_parse_manifold_push_variant_default_raw():
-    args = cli.parse_args(["manifold", "push", "circumplex"])
+    args = cli.parse_args(["pack", "push", "circumplex"])
     # Aligned with `pack push` — SAE variants are opt-in.
     assert args.variant == "raw"
     assert args.private is False
@@ -122,36 +122,36 @@ def test_parse_manifold_push_variant_default_raw():
 def test_parse_manifold_push_variant_rejects_unknown():
     with pytest.raises(SystemExit):
         cli.parse_args([
-            "manifold", "push", "circumplex", "--variant", "weird",
+            "pack", "push", "circumplex", "--variant", "weird",
         ])
 
 
 def test_parse_manifold_rm():
-    args = cli.parse_args(["manifold", "rm", "local/mood", "-y"])
-    assert args.manifold_cmd == "rm"
+    args = cli.parse_args(["pack", "rm", "local/mood", "-y"])
+    assert args.pack_cmd == "rm"
     assert args.selector == "local/mood"
     assert args.yes is True
 
 
 def test_parse_manifold_clear():
     args = cli.parse_args([
-        "manifold", "clear", "circumplex",
+        "pack", "clear", "circumplex",
         "-m", "foo/bar", "--variant", "raw",
     ])
-    assert args.manifold_cmd == "clear"
+    assert args.pack_cmd == "clear"
     assert args.selector == "circumplex"
     assert args.model == "foo/bar"
     assert args.variant == "raw"
 
 
 def test_parse_manifold_clear_variant_default_all():
-    args = cli.parse_args(["manifold", "clear", "circumplex"])
+    args = cli.parse_args(["pack", "clear", "circumplex"])
     assert args.variant == "all"
 
 
 def test_parse_manifold_refresh():
-    args = cli.parse_args(["manifold", "refresh", "alice/circumplex"])
-    assert args.manifold_cmd == "refresh"
+    args = cli.parse_args(["pack", "refresh", "alice/circumplex"])
+    assert args.pack_cmd == "refresh"
     assert args.selector == "alice/circumplex"
     assert args.model is None
 
@@ -178,18 +178,28 @@ def test_parse_manifold_transfer_missing_from_errors():
 
 
 def test_parse_manifold_ls_verbose():
-    args = cli.parse_args(["manifold", "ls", "-v"])
-    assert args.manifold_cmd == "ls"
+    args = cli.parse_args(["pack", "ls", "-v"])
+    assert args.pack_cmd == "ls"
     assert args.verbose is True
 
 
-def test_parse_manifold_no_verb_lists_new_subverbs(capsys: pytest.CaptureFixture[str]):
+def test_parse_pack_no_verb_lists_lifecycle_subverbs(capsys: pytest.CaptureFixture[str]):
+    with pytest.raises(SystemExit) as ex:
+        cli.main(["pack"])
+    assert ex.value.code == 0
+    out = capsys.readouterr().out
+    for verb in ("install", "search", "push", "rm", "clear",
+                 "refresh", "ls", "show", "export"):
+        assert verb in out
+
+
+def test_parse_manifold_no_verb_lists_compute_subverbs(capsys: pytest.CaptureFixture[str]):
     with pytest.raises(SystemExit) as ex:
         cli.main(["manifold"])
     assert ex.value.code == 0
     out = capsys.readouterr().out
-    for verb in ("install", "search", "merge", "push", "rm", "clear",
-                 "refresh", "transfer"):
+    for verb in ("extract", "generate", "fit", "bake", "merge",
+                 "transfer", "compare", "why"):
         assert verb in out
 
 
@@ -205,7 +215,7 @@ def test_run_manifold_install_calls_backend(monkeypatch: pytest.MonkeyPatch, cap
         return Path("/home/.saklas/manifolds/local/circumplex")
 
     monkeypatch.setattr("saklas.io.hf_manifolds.install_manifold", fake_install)
-    cli.main(["manifold", "install", "alice/circumplex", "-a", "local/mood", "-f"])
+    cli.main(["pack", "install", "alice/circumplex", "-a", "local/mood", "-f"])
     assert calls == [("alice/circumplex", "local/mood", True)]
     out = capsys.readouterr().out
     assert "Installed alice/circumplex" in out
@@ -223,7 +233,7 @@ def test_run_manifold_search_calls_backend(monkeypatch: pytest.MonkeyPatch, caps
         }]
 
     monkeypatch.setattr("saklas.io.hf_manifolds.search_manifolds", fake_search)
-    cli.main(["manifold", "search", "mood"])
+    cli.main(["pack", "search", "mood"])
     assert seen == ["mood"]
     out = capsys.readouterr().out
     assert "circumplex" in out
@@ -238,7 +248,7 @@ def test_run_manifold_search_empty_query_passes_none(monkeypatch: pytest.MonkeyP
         return []
 
     monkeypatch.setattr("saklas.io.hf_manifolds.search_manifolds", fake_search)
-    cli.main(["manifold", "search"])
+    cli.main(["pack", "search"])
     # Empty CLI default coerces to None for the backend (list by recency).
     assert seen == [None]
     out = capsys.readouterr().out
@@ -252,7 +262,7 @@ def test_run_manifold_search_json(monkeypatch: pytest.MonkeyPatch, capsys: pytes
         "fit_mode": "authored", "tensor_models": [],
     }]
     monkeypatch.setattr("saklas.io.hf_manifolds.search_manifolds", lambda q: rows)
-    cli.main(["manifold", "search", "mood", "-j"])
+    cli.main(["pack", "search", "mood", "-j"])
     out = capsys.readouterr().out
     data = _json.loads(out)
     assert data[0]["name"] == "circumplex"
@@ -283,7 +293,7 @@ def test_run_manifold_merge_calls_backend(monkeypatch: pytest.MonkeyPatch, capsy
     assert c["force"] is True
     out = capsys.readouterr().out
     assert "Merged manifold written to" in out
-    assert "discover local/combined" in out
+    assert "fit local/combined" in out
 
 
 def test_run_manifold_merge_one_source_errors(monkeypatch: pytest.MonkeyPatch):
@@ -318,7 +328,7 @@ def test_run_manifold_push_calls_backend(monkeypatch: pytest.MonkeyPatch, tmp_pa
     monkeypatch.setattr("saklas.io.hf_manifolds.push_manifold", fake_push)
     # -a override means resolve_target_coord doesn't need whoami().
     cli.main([
-        "manifold", "push", "local/circumplex",
+        "pack", "push", "local/circumplex",
         "-a", "alice/circumplex", "-m", "google/gemma-3-4b-it",
         "--variant", "sae", "-p",
     ])
@@ -346,7 +356,7 @@ def test_run_manifold_push_dry_run(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
         lambda f, coord, **k: (f"https://huggingface.co/{coord}", None),
     )
     cli.main([
-        "manifold", "push", "local/circumplex",
+        "pack", "push", "local/circumplex",
         "-a", "alice/circumplex", "-d",
     ])
     out = capsys.readouterr().out
@@ -360,7 +370,7 @@ def test_run_manifold_push_missing_folder_errors(monkeypatch: pytest.MonkeyPatch
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not call backend")),
     )
     with pytest.raises(SystemExit) as ex:
-        cli.main(["manifold", "push", "local/nope", "-a", "x/y"])
+        cli.main(["pack", "push", "local/nope", "-a", "x/y"])
     assert ex.value.code == 1
 
 
@@ -373,7 +383,7 @@ def test_run_manifold_rm_calls_backend(monkeypatch: pytest.MonkeyPatch, capsys: 
                 "removed": True, "rematerializes_on_restart": False}
 
     monkeypatch.setattr("saklas.io.manifolds.remove_manifold_folder", fake_rm)
-    cli.main(["manifold", "rm", "local/mood"])
+    cli.main(["pack", "rm", "local/mood"])
     assert calls == [("local", "mood")]
     out = capsys.readouterr().out
     assert "Removed local/mood" in out
@@ -385,7 +395,7 @@ def test_run_manifold_rm_bundled_refuses_without_yes(monkeypatch: pytest.MonkeyP
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not call backend")),
     )
     with pytest.raises(SystemExit) as ex:
-        cli.main(["manifold", "rm", "default/personas"])
+        cli.main(["pack", "rm", "default/personas"])
     assert ex.value.code == 2
 
 
@@ -395,7 +405,7 @@ def test_run_manifold_rm_bundled_with_yes(monkeypatch: pytest.MonkeyPatch, capsy
                 "removed": True, "rematerializes_on_restart": True}
 
     monkeypatch.setattr("saklas.io.manifolds.remove_manifold_folder", fake_rm)
-    cli.main(["manifold", "rm", "default/personas", "-y"])
+    cli.main(["pack", "rm", "default/personas", "-y"])
     out = capsys.readouterr().out
     assert "Removed default/personas" in out
     assert "re-materializes" in out
@@ -407,7 +417,7 @@ def test_run_manifold_rm_missing_errors(monkeypatch: pytest.MonkeyPatch):
 
     monkeypatch.setattr("saklas.io.manifolds.remove_manifold_folder", fake_rm)
     with pytest.raises(SystemExit) as ex:
-        cli.main(["manifold", "rm", "local/nope"])
+        cli.main(["pack", "rm", "local/nope"])
     assert ex.value.code == 1
 
 
@@ -422,7 +432,7 @@ def test_run_manifold_clear_calls_backend(monkeypatch: pytest.MonkeyPatch, capsy
     # Bare ``pad`` resolves cross-namespace to the bundled ``default/pad``
     # (the only installed match) — the lifecycle verbs no longer hard-default
     # a bare name to ``local/``.
-    cli.main(["manifold", "clear", "pad", "--variant", "raw"])
+    cli.main(["pack", "clear", "pad", "--variant", "raw"])
     assert calls == [
         {"ns": "default", "name": "pad", "model_scope": None, "variant": "raw"},
     ]
@@ -440,7 +450,7 @@ def test_run_manifold_clear_passes_model_scope(monkeypatch: pytest.MonkeyPatch, 
 
     monkeypatch.setattr("saklas.io.manifolds.clear_manifold_tensors", fake_clear)
     # Bare name resolves cross-namespace to bundled ``default/pad``.
-    cli.main(["manifold", "clear", "pad", "-m", "foo/bar"])
+    cli.main(["pack", "clear", "pad", "-m", "foo/bar"])
     assert calls == [
         {"ns": "default", "name": "pad", "model_scope": "foo/bar", "variant": "all"},
     ]
@@ -457,7 +467,7 @@ def test_run_manifold_refresh_tiers(monkeypatch: pytest.MonkeyPatch, capsys: pyt
             "saklas.io.manifolds.refresh_manifold",
             lambda ns, name, *, model_scope=None, t=tier: t,
         )
-        cli.main(["manifold", "refresh", "alice/circumplex"])
+        cli.main(["pack", "refresh", "alice/circumplex"])
         out = capsys.readouterr().out
         assert fragment in out
 
@@ -472,7 +482,7 @@ def test_run_manifold_refresh_passes_model_scope(monkeypatch: pytest.MonkeyPatch
 
     monkeypatch.setattr("saklas.io.manifolds.refresh_manifold", fake_refresh)
     # Bare name resolves cross-namespace to bundled ``default/pad``.
-    cli.main(["manifold", "refresh", "pad", "-m", "foo/bar"])
+    cli.main(["pack", "refresh", "pad", "-m", "foo/bar"])
     assert calls == [{"ns": "default", "name": "pad", "model_scope": "foo/bar"}]
     captured = capsys.readouterr()
     assert "foo/bar" in captured.out and "re-fits on next use" in captured.out
@@ -485,7 +495,7 @@ def test_run_manifold_refresh_missing_errors(monkeypatch: pytest.MonkeyPatch):
 
     monkeypatch.setattr("saklas.io.manifolds.refresh_manifold", fake_refresh)
     with pytest.raises(SystemExit) as ex:
-        cli.main(["manifold", "refresh", "local/nope"])
+        cli.main(["pack", "refresh", "local/nope"])
     assert ex.value.code == 1
 
 
@@ -604,7 +614,7 @@ def test_lifecycle_bare_name_not_found_exits(monkeypatch: pytest.MonkeyPatch, tm
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not call backend")),
     )
     with pytest.raises(SystemExit) as ex:
-        cli.main(["manifold", "clear", "nope_not_installed"])
+        cli.main(["pack", "clear", "nope_not_installed"])
     assert ex.value.code == 1
 
 
@@ -620,7 +630,7 @@ def test_lifecycle_bare_name_resolves_local(monkeypatch: pytest.MonkeyPatch, tmp
         return 0
 
     monkeypatch.setattr("saklas.io.manifolds.clear_manifold_tensors", fake_clear)
-    cli.main(["manifold", "clear", "moodlite"])
+    cli.main(["pack", "clear", "moodlite"])
     assert calls == [("local", "moodlite")]
 
 
@@ -642,7 +652,7 @@ def test_lifecycle_bare_name_ambiguous_exits(monkeypatch: pytest.MonkeyPatch, tm
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not call backend")),
     )
     with pytest.raises(SystemExit) as ex:
-        cli.main(["manifold", "clear", "dup"])
+        cli.main(["pack", "clear", "dup"])
     assert ex.value.code == 2
 
 
@@ -656,7 +666,7 @@ def test_lifecycle_explicit_ns_pins_without_walk(monkeypatch: pytest.MonkeyPatch
         return 0
 
     monkeypatch.setattr("saklas.io.manifolds.clear_manifold_tensors", fake_clear)
-    cli.main(["manifold", "clear", "alice/ghost"])
+    cli.main(["pack", "clear", "alice/ghost"])
     assert calls == [("alice", "ghost")]
 
 
@@ -689,7 +699,7 @@ def test_run_manifold_ls_verbose_shows_description(monkeypatch: pytest.MonkeyPat
     _author_circumplex_lite(tmp_path)
     from saklas.io import selectors
     selectors.invalidate()
-    cli.main(["manifold", "ls", "--namespace", "local", "-v"])
+    cli.main(["pack", "ls", "--namespace", "local", "-v"])
     out = capsys.readouterr().out
     assert "local/moodlite" in out
     assert "a tiny test mood manifold" in out
@@ -700,7 +710,7 @@ def test_run_manifold_ls_non_verbose_hides_description(monkeypatch: pytest.Monke
     _author_circumplex_lite(tmp_path)
     from saklas.io import selectors
     selectors.invalidate()
-    cli.main(["manifold", "ls", "--namespace", "local"])
+    cli.main(["pack", "ls", "--namespace", "local"])
     out = capsys.readouterr().out
     assert "local/moodlite" in out
     assert "a tiny test mood manifold" not in out
@@ -711,7 +721,7 @@ def test_run_manifold_show_json_uses_summary_keys(monkeypatch: pytest.MonkeyPatc
     _author_circumplex_lite(tmp_path)
     from saklas.io import selectors
     selectors.invalidate()
-    cli.main(["manifold", "show", "local/moodlite", "-j"])
+    cli.main(["pack", "show", "local/moodlite", "-j"])
     out = capsys.readouterr().out
     data = _json.loads(out)
     # manifold_summary's contract keys (shared with the server route).
@@ -734,6 +744,6 @@ def test_run_manifold_show_json_matches_summary_helper(monkeypatch: pytest.Monke
     selectors.invalidate()
     from saklas.io.manifolds import manifold_summary
     expected = manifold_summary(folder)
-    cli.main(["manifold", "show", "local/moodlite", "-j"])
+    cli.main(["pack", "show", "local/moodlite", "-j"])
     out = capsys.readouterr().out
     assert _json.loads(out) == expected

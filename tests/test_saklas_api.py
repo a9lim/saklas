@@ -1073,7 +1073,7 @@ class TestManifoldRoutes:
         client.post("/saklas/v1/manifolds", json=_box1d_payload())
 
         from unittest.mock import MagicMock as _MM
-        session.extract_manifold.return_value = _MM(
+        session.fit.return_value = _MM(
             layers={0: 1, 1: 1, 2: 1}, feature_space="raw",
         )
         resp = client.post("/saklas/v1/manifolds/local/mood/fit", json={})

@@ -18,7 +18,7 @@ def test_parse_zero_args_prints_help_and_exits_zero(capsys: pytest.CaptureFixtur
         cli.parse_args([])
     assert ex.value.code == 0
     out = capsys.readouterr().out
-    assert "tui" in out and "serve" in out and "subspace" in out and "manifold" in out and "config" in out
+    assert "tui" in out and "serve" in out and "pack" in out and "manifold" in out and "config" in out
 
 
 def test_parse_bare_unknown_model_id_errors():
@@ -42,44 +42,44 @@ def test_parse_tui_with_config_only():
 
 
 # ---------------------------------------------------------------------------
-# subspace subtree (the flat-artifact / vector verbs)
+# manifold compute subtree (the flat-artifact / vector verbs folded in)
 # ---------------------------------------------------------------------------
 
 def test_parse_vector_merge():
     args = cli.parse_args([
-        "subspace","merge", "bard",
+        "manifold","bake", "bard",
         "0.3 default/happy + 0.4 a9lim/archaic",
     ])
-    assert args.command == "subspace"
-    assert args.subspace_cmd == "merge"
+    assert args.command == "manifold"
+    assert args.manifold_cmd == "bake"
     assert args.name == "bard"
     assert args.expression == "0.3 default/happy + 0.4 a9lim/archaic"
 
 
 def test_parse_vector_extract_one_positional():
-    args = cli.parse_args(["subspace","extract", "happy.sad"])
-    assert args.subspace_cmd == "extract"
+    args = cli.parse_args(["manifold","extract", "happy.sad"])
+    assert args.manifold_cmd == "extract"
     assert args.concept == ["happy.sad"]
     assert args.model is None
     assert args.force is False
 
 
 def test_parse_vector_extract_two_positionals():
-    args = cli.parse_args(["subspace","extract", "happy", "sad"])
+    args = cli.parse_args(["manifold","extract", "happy", "sad"])
     assert args.concept == ["happy", "sad"]
 
 
 def test_parse_vector_extract_all_flags():
-    args = cli.parse_args(["subspace","extract", "happy.sad", "-m", "foo/bar", "-f"])
+    args = cli.parse_args(["manifold","extract", "happy.sad", "-m", "foo/bar", "-f"])
     assert args.concept == ["happy.sad"]
     assert args.model == "foo/bar"
     assert args.force is True
 
 
-def test_parse_manifold_export_gguf():
-    args = cli.parse_args(["manifold", "export", "gguf", "happy.sad", "-m", "foo/bar"])
-    assert args.command == "manifold"
-    assert args.manifold_cmd == "export"
+def test_parse_pack_export_gguf():
+    args = cli.parse_args(["pack", "export", "gguf", "happy.sad", "-m", "foo/bar"])
+    assert args.command == "pack"
+    assert args.pack_cmd == "export"
     assert args.format == "gguf"
     assert args.name == "happy.sad"
     assert args.model == "foo/bar"
@@ -242,7 +242,7 @@ def test_run_extract_cache_hit_prints_already_extracted(monkeypatch: pytest.Monk
     monkeypatch.setattr(cli_runners, "_print_startup", lambda args: None)
 
     with pytest.raises(SystemExit) as excinfo:
-        cli.main(["subspace", "extract", "happy.sad", "-m", model_id])
+        cli.main(["manifold", "extract", "happy.sad", "-m", model_id])
     assert excinfo.value.code == 0
     out = capsys.readouterr().out
     assert "already extracted at" in out
@@ -302,48 +302,48 @@ def test_run_tui_registers_config_vectors(monkeypatch: pytest.MonkeyPatch, tmp_p
 
 
 def test_parse_vector_compare_two_args():
-    args = cli.parse_args(["subspace","compare", "angry.calm", "happy.sad", "-m", "foo/bar"])
-    assert args.command == "subspace"
-    assert args.subspace_cmd == "compare"
+    args = cli.parse_args(["manifold","compare", "angry.calm", "happy.sad", "-m", "foo/bar"])
+    assert args.command == "manifold"
+    assert args.manifold_cmd == "compare"
     assert args.concepts == ["angry.calm", "happy.sad"]
     assert args.model == "foo/bar"
 
 
 def test_parse_vector_compare_one_arg():
-    args = cli.parse_args(["subspace","compare", "angry.calm", "-m", "foo/bar"])
+    args = cli.parse_args(["manifold","compare", "angry.calm", "-m", "foo/bar"])
     assert args.concepts == ["angry.calm"]
 
 
 def test_parse_vector_compare_three_plus_args():
-    args = cli.parse_args(["subspace","compare", "angry.calm", "happy.sad", "formal.casual", "-m", "foo/bar"])
+    args = cli.parse_args(["manifold","compare", "angry.calm", "happy.sad", "formal.casual", "-m", "foo/bar"])
     assert args.concepts == ["angry.calm", "happy.sad", "formal.casual"]
 
 
 def test_parse_vector_compare_selector_arg():
-    args = cli.parse_args(["subspace","compare", "tag:affect", "-m", "foo/bar"])
+    args = cli.parse_args(["manifold","compare", "tag:affect", "-m", "foo/bar"])
     assert args.concepts == ["tag:affect"]
 
 
 def test_parse_vector_compare_verbose_and_json():
-    args = cli.parse_args(["subspace","compare", "a", "b", "-m", "x", "-v", "-j"])
+    args = cli.parse_args(["manifold","compare", "a", "b", "-m", "x", "-v", "-j"])
     assert args.verbose is True
     assert args.json_output is True
 
 
 def test_parse_vector_compare_missing_model_errors():
     with pytest.raises(SystemExit):
-        cli.parse_args(["subspace","compare", "angry.calm"])
+        cli.parse_args(["manifold","compare", "angry.calm"])
 
 
-def test_subspace_manifold_appear_in_help_pack_vector_gone(capsys: pytest.CaptureFixture[str]):
+def test_manifold_pack_appear_in_help_subspace_vector_gone(capsys: pytest.CaptureFixture[str]):
     with pytest.raises(SystemExit):
         cli.parse_args([])
     out = capsys.readouterr().out
-    assert "subspace" in out
     assert "manifold" in out
-    # The 4.0 collapse retired the `pack` verb and the `vector` alias —
-    # neither should parse as a top-level command anymore.
-    for gone in (["pack", "ls"], ["vector", "extract", "x"]):
+    assert "pack" in out
+    # The verb harmonization retired the `subspace` verb and the `vector`
+    # alias — neither parses as a top-level command anymore.
+    for gone in (["subspace", "extract", "x"], ["vector", "extract", "x"]):
         with pytest.raises(SystemExit):
             cli.parse_args(gone)
 
@@ -465,7 +465,7 @@ def test_run_compare_one_arg_verbose_text(monkeypatch: pytest.MonkeyPatch, tmp_p
 
     # Compare is Mahalanobis-only; the whitener load is patched in
     # ``_setup_compare_env`` and ``Profile.cosine_similarity`` is mocked.
-    cli.main(["subspace","compare", "angry.calm", "-m", model_id, "-v"])
+    cli.main(["manifold","compare", "angry.calm", "-m", model_id, "-v"])
     out = capsys.readouterr().out
     assert "angry.calm vs all installed" in out
     assert "happy.sad" in out
@@ -490,7 +490,7 @@ def test_run_compare_one_arg_verbose_json(monkeypatch: pytest.MonkeyPatch, tmp_p
         "happy.sad": happy_profile,
     })
 
-    cli.main(["subspace","compare", "angry.calm", "-m", model_id, "-v", "-j"])
+    cli.main(["manifold","compare", "angry.calm", "-m", model_id, "-v", "-j"])
     out = capsys.readouterr().out
     data = _json.loads(out)
     assert data["target"] == "angry.calm"
@@ -514,7 +514,7 @@ def test_run_compare_matrix_verbose_json(monkeypatch: pytest.MonkeyPatch, tmp_pa
         for c in concepts
     })
 
-    cli.main(["subspace","compare"] + concepts + ["-m", model_id, "-v", "-j"])
+    cli.main(["manifold","compare"] + concepts + ["-m", model_id, "-v", "-j"])
     out = capsys.readouterr().out
     data = _json.loads(out)
     assert "per_layer" in data
@@ -538,7 +538,7 @@ def test_run_compare_matrix_verbose_text_unchanged(monkeypatch: pytest.MonkeyPat
         for c in concepts
     })
 
-    cli.main(["subspace","compare"] + concepts + ["-m", model_id, "-v"])
+    cli.main(["manifold","compare"] + concepts + ["-m", model_id, "-v"])
     out = capsys.readouterr().out
     assert "per-layer" not in out
     assert "per_layer" not in out
@@ -586,24 +586,24 @@ def _mock_why_profile(layer_mags: dict[int, float], diagnostics: dict[str, Any] 
 
 
 def test_parse_vector_why_basic():
-    args = cli.parse_args(["subspace","why", "angry.calm", "-m", "foo/bar"])
-    assert args.command == "subspace"
-    assert args.subspace_cmd == "why"
+    args = cli.parse_args(["manifold","why", "angry.calm", "-m", "foo/bar"])
+    assert args.command == "manifold"
+    assert args.manifold_cmd == "why"
     assert args.concept == "angry.calm"
     assert args.model == "foo/bar"
     assert args.json_output is False
 
 
 def test_parse_vector_why_json():
-    args = cli.parse_args(["subspace","why", "angry.calm", "-m", "foo/bar", "-j"])
+    args = cli.parse_args(["manifold","why", "angry.calm", "-m", "foo/bar", "-j"])
     assert args.json_output is True
 
 
 def test_parse_vector_why_removed_flags_rejected():
     # ``--all`` and ``-n`` were removed with the histogram overhaul.
     for argv in (
-        ["subspace","why", "angry.calm", "-m", "foo/bar", "--all"],
-        ["subspace","why", "angry.calm", "-m", "foo/bar", "-n", "10"],
+        ["manifold","why", "angry.calm", "-m", "foo/bar", "--all"],
+        ["manifold","why", "angry.calm", "-m", "foo/bar", "-n", "10"],
     ):
         with pytest.raises(SystemExit):
             cli.parse_args(argv)
@@ -611,7 +611,7 @@ def test_parse_vector_why_removed_flags_rejected():
 
 def test_parse_vector_why_missing_model_errors():
     with pytest.raises(SystemExit):
-        cli.parse_args(["subspace","why", "angry.calm"])
+        cli.parse_args(["manifold","why", "angry.calm"])
 
 
 def test_run_why_text_output(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
@@ -623,7 +623,7 @@ def test_run_why_text_output(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, ca
     profile = _mock_why_profile(layer_mags)
     _patch_fold_helpers(monkeypatch, {"angry.calm": profile})
 
-    cli.main(["subspace","why", "angry.calm", "-m", model_id])
+    cli.main(["manifold","why", "angry.calm", "-m", model_id])
     out = capsys.readouterr().out
     assert "angry.calm" in out
     assert "6 layers" in out
@@ -645,7 +645,7 @@ def test_run_why_text_buckets_large_profile(monkeypatch: pytest.MonkeyPatch, tmp
     profile = _mock_why_profile(layer_mags)
     _patch_fold_helpers(monkeypatch, {"angry.calm": profile})
 
-    cli.main(["subspace","why", "angry.calm", "-m", model_id])
+    cli.main(["manifold","why", "angry.calm", "-m", model_id])
     out = capsys.readouterr().out
     assert "62 layers" in out
     # Range label form used when buckets span more than one layer.
@@ -666,7 +666,7 @@ def test_run_why_json_output(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, ca
     profile = _mock_why_profile(layer_mags)
     _patch_fold_helpers(monkeypatch, {"angry.calm": profile})
 
-    cli.main(["subspace","why", "angry.calm", "-m", model_id, "-j"])
+    cli.main(["manifold","why", "angry.calm", "-m", model_id, "-j"])
     out = capsys.readouterr().out
     data = _json.loads(out)
     assert data["concept"] == "angry.calm"
@@ -681,7 +681,7 @@ def test_run_why_concept_not_found(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
     _setup_why_env(monkeypatch, tmp_path)
     _patch_fold_helpers(monkeypatch, {})  # nothing folds → miss
     with pytest.raises(SystemExit) as exc:
-        cli.main(["subspace","why", "nonexistent_concept_xyz", "-m", "foo/bar"])
+        cli.main(["manifold","why", "nonexistent_concept_xyz", "-m", "foo/bar"])
     assert exc.value.code == 1
 
 
@@ -734,7 +734,7 @@ def test_run_why_accepts_sae_suffix(monkeypatch: pytest.MonkeyPatch, tmp_path: P
         "angry.calm:sae-my-release": sae_profile,
     })
 
-    cli.main(["subspace","why", "angry.calm:sae-my-release", "-m", model_id])
+    cli.main(["manifold","why", "angry.calm:sae-my-release", "-m", model_id])
     out = capsys.readouterr().out
     # Suffix propagates into the display name.
     assert "angry.calm:sae-my-release" in out
@@ -759,7 +759,7 @@ def test_run_compare_accepts_sae_suffix(monkeypatch: pytest.MonkeyPatch, tmp_pat
     })
 
     cli.main([
-        "subspace","compare",
+        "manifold","compare",
         "angry.calm:sae-my-release", "happy.sad",
         "-m", model_id,
     ])
@@ -804,7 +804,7 @@ def test_config_bare_pole_resolves_canonical(monkeypatch: pytest.MonkeyPatch, tm
 def test_vector_extract_parses_sae_flag():
     """--sae RELEASE is captured on the Namespace as `sae`."""
     args = cli.parse_args([
-        "subspace","extract", "honest.deceptive",
+        "manifold","extract", "honest.deceptive",
         "-m", "google/gemma-2-2b-it",
         "--sae", "gemma-scope-2b-pt-res-canonical",
     ])
@@ -814,7 +814,7 @@ def test_vector_extract_parses_sae_flag():
 
 def test_vector_extract_sae_revision():
     args = cli.parse_args([
-        "subspace","extract", "honest.deceptive",
+        "manifold","extract", "honest.deceptive",
         "-m", "google/gemma-2-2b-it",
         "--sae", "release-x",
         "--sae-revision", "v1.0",
@@ -825,7 +825,7 @@ def test_vector_extract_sae_revision():
 
 def test_vector_extract_no_sae_defaults_to_none():
     args = cli.parse_args([
-        "subspace","extract", "honest.deceptive", "-m", "model",
+        "manifold","extract", "honest.deceptive", "-m", "model",
     ])
     assert args.sae is None
     assert args.sae_revision is None
@@ -835,5 +835,5 @@ def test_vector_extract_sae_requires_value():
     """--sae must be followed by a release name; it's not a boolean switch."""
     with pytest.raises(SystemExit):
         cli.parse_args([
-            "subspace","extract", "honest.deceptive", "-m", "m", "--sae",
+            "manifold","extract", "honest.deceptive", "-m", "m", "--sae",
         ])

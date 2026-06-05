@@ -192,7 +192,7 @@ class TestCliRoundTrip:
         try:
             proc = subprocess.run(
                 [
-                    sys.executable, "-m", "saklas", "subspace", "extract",
+                    sys.executable, "-m", "saklas", "manifold", "extract",
                     "happy.sad", "-m", MODEL_ID, "--namespace", "local",
                 ],
                 capture_output=True, text=True, timeout=600,

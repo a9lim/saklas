@@ -156,7 +156,7 @@ def _fit_ported(ported: list[tuple[str, str]], model_id: str) -> None:
         for ns, name in ported:
             folder = manifold_dir(ns, name)
             try:
-                session.extract_manifold(folder)
+                session.fit(folder)
                 print(f"fitted    {ns}/{name}")
             except Exception as e:
                 print(f"skip fit  {ns}/{name}: {e}", file=sys.stderr)

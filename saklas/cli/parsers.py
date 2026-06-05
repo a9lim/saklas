@@ -67,34 +67,36 @@ def _add_logit_args(p: argparse.ArgumentParser) -> None:
 # Top-level parsers
 # ---------------------------------------------------------------------------
 
-# ``subspace`` (4.0): the flat-artifact verbs — a steering vector *is* the
-# K=2 case of a flat affine subspace.  (Pre-4.0 these were the ``vector``
-# direct subcommands; the deprecated ``vector`` alias is gone in 4.0.)
-_SUBSPACE_VERBS: list[tuple[str, str]] = [
+# Verb table for ``saklas manifold <verb>`` — the *compute* surface.  A
+# steering vector is the K=2 case of a flat affine subspace, so the former
+# ``subspace`` verbs (extract / bake / compare / why) fold into the one
+# ``manifold`` verb alongside the full steering-manifold authoring tree.
+# This table is the source of truth for both parser registration order and
+# the bare-verb help block.
+_MANIFOLD_VERBS: list[tuple[str, str]] = [
     ("extract",   "Extract a steering vector (a 2-node flat subspace)"),
-    ("merge",     "Merge existing vectors into a new manifold"),
+    ("generate",  "Author a discover-mode manifold from a concept list"),
+    ("fit",       "Fit an authored or discover-mode manifold"),
+    ("bake",      "Bake existing vectors into a new manifold"),
+    ("merge",     "Union discover-mode manifolds' nodes into a new manifold"),
+    ("transfer",  "Transfer a manifold to another model via Procrustes"),
     ("compare",   "Cosine similarity between steering vectors"),
     ("why",       "Show which layers contribute most to a steering vector"),
-    ("transfer",  "Transfer a probe from one model to another via Procrustes"),
 ]
 
-# Verb table for ``saklas manifold <verb>`` — the source of truth for both
-# parser registration order and the bare-verb help block, mirroring how
-# ``_SUBSPACE_VERBS`` drives theirs.
-_MANIFOLD_VERBS: list[tuple[str, str]] = [
-    ("fit",       "Fit an authored manifold (user-supplied coords)"),
-    ("discover",  "Fit a discover-mode manifold (coords derived from activations)"),
-    ("generate",  "Author a discover-mode manifold from a concept list"),
+# Verb table for ``saklas pack <verb>`` — the *lifecycle* surface (install /
+# share / inspect / remove).  These were the lifecycle leaves of the former
+# ``manifold`` verb; they address an on-disk manifold by ``(namespace, name)``
+# and never load a model.
+_PACK_VERBS: list[tuple[str, str]] = [
     ("ls",        "List installed manifolds"),
     ("show",      "Show a manifold's nodes and fitted models"),
     ("install",   "Install a manifold from HF or a local folder"),
     ("search",    "Search the HuggingFace hub for manifolds"),
-    ("merge",     "Union discover-mode manifolds' nodes into a new manifold"),
     ("push",      "Push a manifold to HF as a model repo"),
     ("rm",        "Fully remove a manifold folder"),
     ("clear",     "Delete per-model fitted tensors for a manifold"),
     ("refresh",   "Re-pull / re-materialize a manifold from its source"),
-    ("transfer",  "Transfer a manifold to another model via Procrustes"),
     ("export",    "Export a fitted manifold to an interchange format (gguf)"),
 ]
 
@@ -225,7 +227,7 @@ def _build_vector_extract(p: argparse.ArgumentParser) -> None:
 
 
 def _build_vector_merge(p: argparse.ArgumentParser) -> None:
-    p.add_argument("name", help="New pack name (written under local/)")
+    p.add_argument("name", help="New manifold name (written under local/)")
     p.add_argument(
         "expression",
         help=(
@@ -268,66 +270,21 @@ def _build_vector_why(p: argparse.ArgumentParser) -> None:
                    help="Emit machine-readable JSON (full per-layer detail)")
 
 
-def _build_vector_transfer(p: argparse.ArgumentParser) -> None:
-    """``saklas subspace transfer`` — cross-model probe alignment.
+def _build_manifold_fit(fit: argparse.ArgumentParser) -> None:
+    """``saklas manifold fit`` — fit an authored *or* discover-mode manifold.
 
-    Required:
-        ``concept`` — selector resolving to a single concept folder.
-        ``--from`` — HF coord of the source model (must already have a
-        fitted tensor for the concept manifold under ~/.saklas/manifolds/...).
-        ``--to`` — HF coord of the target model (the alignment is fit
-        between these two using cached neutral activations).
-
-    Behavior: writes a transferred tensor at the target model's
-    ``_from-<safe_src>`` variant path, with a sidecar carrying transfer
-    provenance (``method=procrustes_transfer``, ``source_model_id``,
-    ``alignment_map_hash``, ``transfer_quality_estimate``).  Reuses the
-    same tensor-filename machinery as SAE variants, so subsequent
-    ``saklas manifold show`` / ``saklas subspace why`` see the transferred
-    profile alongside any native or SAE variants.
-
-    Cached alignment maps live at
-    ``~/.saklas/models/<safe_tgt>/alignments/<safe_src>.{safetensors,json}``;
-    ``--force`` recomputes even when the cache hits.
+    The 4.0 fold of the former ``fit`` (authored folder positional) and
+    ``discover`` (name → folder + hyperparam overrides) verbs into one.
+    The positional is a name-or-folder (``_run_manifold_fit`` resolves it),
+    and the discover hyperparam knobs are accepted but apply only when the
+    resolved folder is discover-mode (``pca`` / ``spectral``); supplying any
+    of them against an authored folder is an error.
     """
-    p.add_argument("concept", help="Concept selector (name or ns/name)")
-    p.add_argument("--from", dest="src_model", required=True, metavar="SRC_MODEL",
-                   help="Source model id (where the probe was extracted)")
-    p.add_argument("--to", dest="tgt_model", required=True, metavar="TGT_MODEL",
-                   help="Target model id (where the transferred probe will live)")
-    p.add_argument("-f", "--force", action="store_true",
-                   help="Recompute alignment + transfer even when cached")
-    p.add_argument("-j", "--json", dest="json_output", action="store_true",
-                   help="Emit machine-readable JSON (path + quality summary)")
-
-
-def _build_vector_manifold(parser: argparse.ArgumentParser) -> None:
-    """Shared builder for the ``saklas manifold`` subtree.
-
-    Nested subparser:
-      ``fit`` — fit an authored manifold (user-supplied coords).
-      ``discover`` — fit a discover-mode manifold (coords derived from
-        per-node activations via PCA or spectral embedding).
-      ``generate`` — author a discover-mode manifold folder by asking
-        the loaded model for per-concept statement corpora.
-      ``ls`` / ``show`` — pure-IO discovery + inspection.
-
-    ``fit`` / ``discover`` / ``generate`` load a model; ``ls`` / ``show``
-    are pure-IO over ``~/.saklas/manifolds/``.
-    """
-    sub = parser.add_subparsers(dest="manifold_cmd", required=False, metavar="VERB")
-
-    fit = sub.add_parser(
-        "fit",
-        help="Fit a manifold for a model from an authored corpus folder",
-        description=(
-            "Pool per-node centroids, fit a per-layer PCA subspace + RBF "
-            "interpolant, and write the per-model manifold tensor into the "
-            "folder."
-        ),
+    fit.add_argument(
+        "target", help="manifold name or folder path",
     )
-    fit.add_argument("folder", help="Path to an authored manifold folder")
     fit.add_argument("-m", "--model", default=None, metavar="MODEL_ID")
+    fit.add_argument("-f", "--force", action="store_true")
     fit.add_argument(
         "--sae", default=None, metavar="RELEASE",
         help="Fit in an SAELens SAE feature space (requires `.[sae]`); "
@@ -337,82 +294,48 @@ def _build_vector_manifold(parser: argparse.ArgumentParser) -> None:
         "--sae-revision", dest="sae_revision", default=None, metavar="REV",
         help="Pin a specific HF revision for the SAE release",
     )
-    fit.set_defaults(quantize=None, device="auto", probes=None)
-
-    discover = sub.add_parser(
-        "discover",
-        help="Fit a discover-mode manifold (coords derived from activations)",
-        description=(
-            "Pool per-node centroids, derive node coordinates via PCA or "
-            "spectral embedding, fit a per-layer RBF, and write the per-model "
-            "manifold tensor.  Operates on an existing discover-mode manifold "
-            "folder (usually authored by `saklas manifold generate`).  "
-            "PCA is the safe default for current bundled-heap sizes (~20–48 "
-            "nodes); spectral is the right choice once heaps cross ~50 nodes "
-            "and start to hint at curved structure — below that the spectral "
-            "gap collapses into the eigenvalue noise floor and the layout "
-            "looks meaningful but isn't."
-        ),
-    )
-    discover.add_argument("name", help="Manifold name (or ns/name)")
-    discover.add_argument("-m", "--model", default=None, metavar="MODEL_ID")
-    discover.add_argument(
+    # Discover-mode hyperparam overrides.  Written into ``manifold.json``
+    # before the fit; rejected against an authored folder.
+    fit.add_argument(
         "--method", choices=("pca", "spectral"), default=None,
-        help="Override the folder's fit_mode (default: keep folder's setting)",
+        help="Discover-mode: override the folder's fit_mode "
+             "(default: keep folder's setting)",
     )
-    discover.add_argument(
+    fit.add_argument(
         "--max-dim", dest="max_dim", type=int, default=None, metavar="N",
-        help="Cap intrinsic dimension (default: 8 for PCA, 8 for spectral)",
+        help="Discover-mode: cap intrinsic dimension "
+             "(default: 8 for PCA, 8 for spectral)",
     )
-    discover.add_argument(
+    fit.add_argument(
         "--var-threshold", dest="var_threshold", type=float, default=None,
         metavar="T",
-        help="PCA: smallest cumulative-variance prefix that crosses T "
-             "is picked (default: 0.70)",
+        help="Discover PCA: smallest cumulative-variance prefix that "
+             "crosses T is picked (default: 0.70)",
     )
-    discover.add_argument(
+    fit.add_argument(
         "--k-nn", dest="k_nn", type=int, default=None, metavar="K",
-        help="Spectral: number of nearest neighbors in the k-NN graph "
-             "(default: max(5, ceil(log K)))",
+        help="Discover spectral: number of nearest neighbors in the k-NN "
+             "graph (default: max(5, ceil(log K)))",
     )
-    discover.add_argument(
+    fit.add_argument(
         "--bandwidth", type=float, default=None, metavar="SIGMA",
-        help="Spectral: heat-kernel bandwidth (default: median k-NN distance)",
+        help="Discover spectral: heat-kernel bandwidth "
+             "(default: median k-NN distance)",
     )
-    discover.add_argument(
+    fit.add_argument(
         "--max-subspace-dim", dest="max_subspace_dim", type=int, default=None,
         metavar="R",
-        help="Spectral (curved) only: per-layer RBF subspace dim cap "
-             "(default 64). Smaller values give finer-grained steering "
+        help="Discover spectral (curved) only: per-layer RBF subspace dim "
+             "cap (default 64). Smaller values give finer-grained steering "
              "control at large K — each axis the RBF can move along is an "
              "axis subspace_inject can displace, so fewer axes = smaller "
              "per-α effect = wider coherence regime. Ignored for --method pca "
              "(a flat fit's subspace dim is its layout dim — use --max-dim).",
     )
-    discover.add_argument(
-        "--sae", default=None, metavar="RELEASE",
-        help="Reconstruct centroids through an SAELens SAE before the fit "
-             "(requires `.[sae]`)",
-    )
-    discover.add_argument(
-        "--sae-revision", dest="sae_revision", default=None, metavar="REV",
-    )
-    discover.set_defaults(quantize=None, device="auto", probes=None)
+    fit.set_defaults(quantize=None, device="auto", probes=None)
 
-    generate = sub.add_parser(
-        "generate",
-        help="Generate per-concept corpora and write a discover-mode manifold",
-        description=(
-            "For every concept, have the loaded model answer the shared "
-            "baseline prompts *in character* (the concept rides the system "
-            "prompt + a kind-derived elicitation role), writing one corpus per "
-            "node.  Writes a fresh discover-mode manifold folder under "
-            "~/.saklas/manifolds/<ns>/<name>/ ready for `saklas manifold "
-            "discover` to fit.  The shared baseline prompts hold the topic "
-            "common-mode across nodes, so the per-concept centroids stay "
-            "comparable (response[i] aligns to baseline prompt[i % k])."
-        ),
-    )
+
+def _build_manifold_generate(generate: argparse.ArgumentParser) -> None:
     generate.add_argument("name", help="Manifold name (use ns/name for non-local)")
     generate.add_argument(
         "--concepts", nargs="+", required=True, metavar="CONCEPT",
@@ -460,82 +383,8 @@ def _build_vector_manifold(parser: argparse.ArgumentParser) -> None:
     generate.add_argument("-m", "--model", default=None, metavar="MODEL_ID")
     generate.set_defaults(quantize=None, device="auto", probes=None)
 
-    ls = sub.add_parser(
-        "ls", help="List installed manifolds",
-        description="List local manifolds under ~/.saklas/manifolds/.",
-    )
-    ls.add_argument("--namespace", default=None, metavar="NS",
-                    help="Restrict to a single namespace")
-    ls.add_argument("-j", "--json", dest="json_output", action="store_true")
-    ls.add_argument("-v", "--verbose", action="store_true",
-                    help="Include descriptions in the table output")
 
-    show = sub.add_parser(
-        "show", help="Show a manifold's nodes and fitted models",
-        description="Print one manifold's domain, node coordinates, and "
-                    "per-model fitted tensors.",
-    )
-    show.add_argument("name", help="Manifold name (or ns/name)")
-    show.add_argument("-j", "--json", dest="json_output", action="store_true")
-
-    install = sub.add_parser(
-        "install",
-        help="Install a manifold from HF or a local folder",
-        description=(
-            "Pull a manifold from a HuggingFace saklas-manifold repo "
-            "(`<ns>/<name>[@revision]`) or copy-install a local folder "
-            "path."
-        ),
-    )
-    install.add_argument(
-        "target",
-        help="<ns>/<name>[@revision] or path to a manifold folder",
-    )
-    install.add_argument(
-        "-a", "--as", dest="as_target", default=None, metavar="NS/NAME",
-        help="Relocate the installed manifold under a different "
-             "namespace/name (must be fully qualified)",
-    )
-    install.add_argument(
-        "-f", "--force", action="store_true",
-        help="Overwrite an existing installation",
-    )
-
-    search = sub.add_parser(
-        "search",
-        help="Search the HuggingFace hub for manifolds",
-        description=(
-            "Search HF for `saklas-manifold`-tagged model repos."
-        ),
-    )
-    search.add_argument(
-        "query", nargs="?", default="",
-        help="Search text (matched against HF model ids)",
-    )
-    search.add_argument(
-        "-j", "--json", dest="json_output", action="store_true",
-        help="Emit machine-readable JSON instead of a table",
-    )
-    search.add_argument(
-        "-v", "--verbose", action="store_true",
-        help="Include descriptions in the table output",
-    )
-
-    merge = sub.add_parser(
-        "merge",
-        help="Union discover-mode manifolds' nodes into a new manifold",
-        description=(
-            "Union the *nodes* of two or more discover-mode source "
-            "manifolds into a fresh, unfitted discover folder, then run "
-            "`saklas manifold discover <merged>` to fit it.  The "
-            "manifold analogue of `saklas subspace merge` — but on node "
-            "corpora rather than steering directions.  Restricted to "
-            "discover-mode sources (authored manifolds carry user-declared "
-            "geometry that isn't mergeable without a shared coordinate "
-            "system).  Label collisions across sources raise; rename one "
-            "side before merging."
-        ),
-    )
+def _build_manifold_merge(merge: argparse.ArgumentParser) -> None:
     merge.add_argument("name", help="New manifold name (or ns/name)")
     merge.add_argument(
         "sources", nargs="+", metavar="SOURCE",
@@ -555,97 +404,8 @@ def _build_vector_manifold(parser: argparse.ArgumentParser) -> None:
         help="Overwrite an existing manifold folder",
     )
 
-    push = sub.add_parser(
-        "push",
-        help="Push a manifold to HF as a model repo",
-        description=(
-            "Push a manifold folder (corpus + fitted tensors) to HF as a "
-            "`saklas-manifold`-tagged model repo.  The corpus is always "
-            "uploaded (a manifold can't re-fit without it); per-model tensors are "
-            "filtered by `-m`/`--variant`."
-        ),
-    )
-    push.add_argument("selector", help="Single manifold (name or ns/name)")
-    push.add_argument(
-        "-a", "--as", dest="as_target", default=None, metavar="OWNER/NAME",
-        help="Target HF coord (default: <whoami>/<name>)",
-    )
-    push.add_argument(
-        "-m", "--model", default=None, metavar="MODEL_ID",
-        help="Restrict the pushed tensors to one base model",
-    )
-    push.add_argument("-p", "--private", action="store_true")
-    push.add_argument("-d", "--dry-run", action="store_true")
-    push.add_argument(
-        "--variant", choices=["raw", "sae", "all"], default="raw",
-        help="Which tensor variant(s) to push. Default: raw. (SAE variants "
-             "carry stronger provenance, so sharing them is opt-in.)",
-    )
 
-    rm = sub.add_parser(
-        "rm",
-        help="Fully remove a manifold folder",
-        description=(
-            "Remove a whole manifold folder.  Bundled manifolds "
-            "(`default/` namespace) re-materialize on next session init."
-        ),
-    )
-    rm.add_argument("selector", help="Manifold name (or ns/name)")
-    rm.add_argument(
-        "-y", "--yes", action="store_true",
-        help="Skip the confirmation prompt for a bundled (default/) manifold",
-    )
-
-    clear = sub.add_parser(
-        "clear",
-        help="Delete per-model fitted tensors for a manifold",
-        description=(
-            "Delete a manifold's per-model fitted tensors (they re-fit on "
-            "next use) while keeping `manifold.json` + the node corpus."
-        ),
-    )
-    clear.add_argument("selector", help="Manifold name (or ns/name)")
-    clear.add_argument(
-        "-m", "--model", default=None, metavar="MODEL_ID",
-        help="Scope to one model's tensors only (default: all models)",
-    )
-    clear.add_argument(
-        "--variant", choices=["raw", "sae", "all"], default="all",
-        help="Which tensor variant(s) to delete. Default: all.",
-    )
-
-    refresh = sub.add_parser(
-        "refresh",
-        help="Re-pull / re-materialize a manifold from its source",
-        description=(
-            "Re-pull a manifold from its source: `local` is skipped, "
-            "`bundled`/`default/` re-materializes from package data, "
-            "`hf://` re-pulls.  With `-m/--model`, instead does a scoped "
-            "refresh — drops just that model's fitted tensor pair so it "
-            "re-fits on next use, without re-pulling from the source.  The "
-            "refreshes a manifold folder or drops a scoped fitted tensor."
-        ),
-    )
-    refresh.add_argument("selector", help="Manifold name (or ns/name)")
-    refresh.add_argument(
-        "-m", "--model", default=None, metavar="MODEL_ID",
-        help="Scope to one model: clear its fitted tensor pair so it re-fits "
-             "on next use (does not re-pull from source). Default: all-source "
-             "re-pull.",
-    )
-
-    transfer = sub.add_parser(
-        "transfer",
-        help="Transfer a manifold from one model to another via Procrustes",
-        description=(
-            "Transfer a fitted manifold from a source model to a target "
-            "model by fitting a per-layer Procrustes alignment between "
-            "their cached neutral activations and mapping the fitted "
-            "subspace into target space.  The manifold analogue of "
-            "`saklas subspace transfer`.  Writes the transferred tensor at "
-            "the target's `_from-<safe_src>` variant path."
-        ),
-    )
+def _build_manifold_transfer(transfer: argparse.ArgumentParser) -> None:
     transfer.add_argument("name", help="Manifold name (or ns/name)")
     transfer.add_argument(
         "--from", dest="src_model", required=True, metavar="SRC_MODEL",
@@ -664,17 +424,103 @@ def _build_vector_manifold(parser: argparse.ArgumentParser) -> None:
         help="Emit machine-readable JSON (path + quality summary)",
     )
 
-    export = sub.add_parser(
-        "export",
-        help="Export a fitted manifold to an interchange format (gguf)",
-        description=(
-            "Fold a fitted 2-node ``pca`` manifold down to a single steering "
-            "direction and write it out in an interchange format.  Only "
-            "``gguf`` (llama.cpp control-vector) is supported today; the fold "
-            "requires an affine 2-node (R=1) subspace, so multi-node / curved "
-            "manifolds are rejected."
-        ),
+
+# --- pack lifecycle leaf builders ----------------------------------------
+
+def _build_pack_ls(ls: argparse.ArgumentParser) -> None:
+    ls.add_argument("--namespace", default=None, metavar="NS",
+                    help="Restrict to a single namespace")
+    ls.add_argument("-j", "--json", dest="json_output", action="store_true")
+    ls.add_argument("-v", "--verbose", action="store_true",
+                    help="Include descriptions in the table output")
+
+
+def _build_pack_show(show: argparse.ArgumentParser) -> None:
+    show.add_argument("name", help="Manifold name (or ns/name)")
+    show.add_argument("-j", "--json", dest="json_output", action="store_true")
+
+
+def _build_pack_install(install: argparse.ArgumentParser) -> None:
+    install.add_argument(
+        "target",
+        help="<ns>/<name>[@revision] or path to a manifold folder",
     )
+    install.add_argument(
+        "-a", "--as", dest="as_target", default=None, metavar="NS/NAME",
+        help="Relocate the installed manifold under a different "
+             "namespace/name (must be fully qualified)",
+    )
+    install.add_argument(
+        "-f", "--force", action="store_true",
+        help="Overwrite an existing installation",
+    )
+
+
+def _build_pack_search(search: argparse.ArgumentParser) -> None:
+    search.add_argument(
+        "query", nargs="?", default="",
+        help="Search text (matched against HF model ids)",
+    )
+    search.add_argument(
+        "-j", "--json", dest="json_output", action="store_true",
+        help="Emit machine-readable JSON instead of a table",
+    )
+    search.add_argument(
+        "-v", "--verbose", action="store_true",
+        help="Include descriptions in the table output",
+    )
+
+
+def _build_pack_push(push: argparse.ArgumentParser) -> None:
+    push.add_argument("selector", help="Single manifold (name or ns/name)")
+    push.add_argument(
+        "-a", "--as", dest="as_target", default=None, metavar="OWNER/NAME",
+        help="Target HF coord (default: <whoami>/<name>)",
+    )
+    push.add_argument(
+        "-m", "--model", default=None, metavar="MODEL_ID",
+        help="Restrict the pushed tensors to one base model",
+    )
+    push.add_argument("-p", "--private", action="store_true")
+    push.add_argument("-d", "--dry-run", action="store_true")
+    push.add_argument(
+        "--variant", choices=["raw", "sae", "all"], default="raw",
+        help="Which tensor variant(s) to push. Default: raw. (SAE variants "
+             "carry stronger provenance, so sharing them is opt-in.)",
+    )
+
+
+def _build_pack_rm(rm: argparse.ArgumentParser) -> None:
+    rm.add_argument("selector", help="Manifold name (or ns/name)")
+    rm.add_argument(
+        "-y", "--yes", action="store_true",
+        help="Skip the confirmation prompt for a bundled (default/) manifold",
+    )
+
+
+def _build_pack_clear(clear: argparse.ArgumentParser) -> None:
+    clear.add_argument("selector", help="Manifold name (or ns/name)")
+    clear.add_argument(
+        "-m", "--model", default=None, metavar="MODEL_ID",
+        help="Scope to one model's tensors only (default: all models)",
+    )
+    clear.add_argument(
+        "--variant", choices=["raw", "sae", "all"], default="all",
+        help="Which tensor variant(s) to delete. Default: all.",
+    )
+
+
+def _build_pack_refresh(refresh: argparse.ArgumentParser) -> None:
+    refresh.add_argument("selector", help="Manifold name (or ns/name)")
+    refresh.add_argument(
+        "-m", "--model", default=None, metavar="MODEL_ID",
+        help="Scope to one model: clear its fitted tensor pair so it re-fits "
+             "on next use (does not re-pull from source). Default: all-source "
+             "re-pull.",
+    )
+
+
+def _build_pack_export(export: argparse.ArgumentParser) -> None:
     export_fmt = export.add_subparsers(dest="format", required=True)
     gguf = export_fmt.add_parser(
         "gguf", help="Export a folded manifold to llama.cpp GGUF",
@@ -685,25 +531,146 @@ def _build_vector_manifold(parser: argparse.ArgumentParser) -> None:
     gguf.add_argument("--model-hint", default=None, metavar="HINT")
 
 
-_SUBSPACE_BUILDERS = {
-    "extract":  _build_vector_extract,
-    "merge":    _build_vector_merge,
-    "compare":  _build_vector_compare,
-    "why":      _build_vector_why,
-    "transfer": _build_vector_transfer,
+# --- manifold (compute) + pack (lifecycle) parser wiring -----------------
+
+# Long-form ``description=`` blocks per manifold compute verb (the verb's
+# ``-h`` carries these; the short ``help=`` lives in ``_MANIFOLD_VERBS``).
+_MANIFOLD_DESCRIPTIONS: dict[str, str] = {
+    "extract": "Extract a steering vector (a 2-node flat `pca` manifold).",
+    "generate": (
+        "For every concept, have the loaded model answer the shared "
+        "baseline prompts *in character* (the concept rides the system "
+        "prompt + a kind-derived elicitation role), writing one corpus per "
+        "node.  Writes a fresh discover-mode manifold folder under "
+        "~/.saklas/manifolds/<ns>/<name>/ ready for `saklas manifold fit` "
+        "to fit.  The shared baseline prompts hold the topic common-mode "
+        "across nodes, so the per-concept centroids stay comparable "
+        "(response[i] aligns to baseline prompt[i % k])."
+    ),
+    "fit": (
+        "Pool per-node centroids, fit a per-layer PCA subspace (+ RBF "
+        "interpolant for curved manifolds), and write the per-model manifold "
+        "tensor into the folder.  The positional is a manifold name OR a "
+        "folder path.  Authored folders supply their own coords; discover-mode "
+        "folders (fit_mode pca/spectral, usually authored by `saklas manifold "
+        "generate`) derive coords per-model and accept the --method / "
+        "--max-dim / --var-threshold / --k-nn / --bandwidth / "
+        "--max-subspace-dim hyperparam overrides (written into manifold.json "
+        "before the fit; rejected against an authored folder)."
+    ),
+    "bake": (
+        "Bake a steering expression into a corpus-less manifold under local/ "
+        "(the merge op): a linear combination / projection of existing fitted "
+        "vectors, written as a fit_mode=baked manifold."
+    ),
+    "merge": (
+        "Union the *nodes* of two or more discover-mode source manifolds into "
+        "a fresh, unfitted discover folder, then run `saklas manifold fit "
+        "<merged>` to fit it.  The corpus analogue of `manifold bake` — but on "
+        "node corpora rather than steering directions.  Restricted to "
+        "discover-mode sources (authored manifolds carry user-declared "
+        "geometry that isn't mergeable without a shared coordinate system).  "
+        "Label collisions across sources raise; rename one side before merging."
+    ),
+    "transfer": (
+        "Transfer a fitted manifold from a source model to a target model by "
+        "fitting a per-layer Procrustes alignment between their cached neutral "
+        "activations and mapping the fitted subspace into target space.  "
+        "Writes the transferred tensor at the target's `_from-<safe_src>` "
+        "variant path."
+    ),
+    "compare": "Cosine similarity between steering vectors (Mahalanobis).",
+    "why": (
+        "Per-layer ‖baked‖ histogram (16 buckets) showing which layers "
+        "contribute most to a steering vector."
+    ),
 }
 
-def _build_subspace_parser(parser: argparse.ArgumentParser) -> None:
-    """``saklas subspace`` — the flat-artifact (vector) verbs."""
-    sub = parser.add_subparsers(dest="subspace_cmd", required=False, metavar="VERB")
-    for verb, desc in _SUBSPACE_VERBS:
-        child = sub.add_parser(verb, help=desc, description=desc)
-        _SUBSPACE_BUILDERS[verb](child)
+_MANIFOLD_BUILDERS = {
+    "extract":  _build_vector_extract,
+    "generate": _build_manifold_generate,
+    "fit":      _build_manifold_fit,
+    "bake":     _build_vector_merge,
+    "merge":    _build_manifold_merge,
+    "transfer": _build_manifold_transfer,
+    "compare":  _build_vector_compare,
+    "why":      _build_vector_why,
+}
+
+_PACK_DESCRIPTIONS: dict[str, str] = {
+    "ls": "List local manifolds under ~/.saklas/manifolds/.",
+    "show": (
+        "Print one manifold's domain, node coordinates, and per-model fitted "
+        "tensors."
+    ),
+    "install": (
+        "Pull a manifold from a HuggingFace saklas-manifold repo "
+        "(`<ns>/<name>[@revision]`) or copy-install a local folder path."
+    ),
+    "search": "Search HF for `saklas-manifold`-tagged model repos.",
+    "push": (
+        "Push a manifold folder (corpus + fitted tensors) to HF as a "
+        "`saklas-manifold`-tagged model repo.  The corpus is always uploaded "
+        "(a manifold can't re-fit without it); per-model tensors are filtered "
+        "by `-m`/`--variant`."
+    ),
+    "rm": (
+        "Remove a whole manifold folder.  Bundled manifolds (`default/` "
+        "namespace) re-materialize on next session init."
+    ),
+    "clear": (
+        "Delete a manifold's per-model fitted tensors (they re-fit on next "
+        "use) while keeping `manifold.json` + the node corpus."
+    ),
+    "refresh": (
+        "Re-pull a manifold from its source: `local` is skipped, "
+        "`bundled`/`default/` re-materializes from package data, `hf://` "
+        "re-pulls.  With `-m/--model`, instead does a scoped refresh — drops "
+        "just that model's fitted tensor pair so it re-fits on next use, "
+        "without re-pulling from the source."
+    ),
+    "export": (
+        "Fold a fitted 2-node ``pca`` manifold down to a single steering "
+        "direction and write it out in an interchange format.  Only ``gguf`` "
+        "(llama.cpp control-vector) is supported today; the fold requires an "
+        "affine 2-node (R=1) subspace, so multi-node / curved manifolds are "
+        "rejected."
+    ),
+}
+
+_PACK_BUILDERS = {
+    "ls":       _build_pack_ls,
+    "show":     _build_pack_show,
+    "install":  _build_pack_install,
+    "search":   _build_pack_search,
+    "push":     _build_pack_push,
+    "rm":       _build_pack_rm,
+    "clear":    _build_pack_clear,
+    "refresh":  _build_pack_refresh,
+    "export":   _build_pack_export,
+}
 
 
 def _build_manifold_parser(parser: argparse.ArgumentParser) -> None:
-    """``saklas manifold`` — curved/flat manifold authoring + lifecycle."""
-    _build_vector_manifold(parser)
+    """``saklas manifold`` — the steering-vector / manifold compute verbs."""
+    sub = parser.add_subparsers(dest="manifold_cmd", required=False, metavar="VERB")
+    for verb, desc in _MANIFOLD_VERBS:
+        child = sub.add_parser(
+            verb, help=desc,
+            description=_MANIFOLD_DESCRIPTIONS.get(verb, desc),
+        )
+        _MANIFOLD_BUILDERS[verb](child)
+
+
+def _build_pack_parser(parser: argparse.ArgumentParser) -> None:
+    """``saklas pack`` — the manifold lifecycle (install/share/inspect) verbs."""
+    sub = parser.add_subparsers(dest="pack_cmd", required=False, metavar="VERB")
+    for verb, desc in _PACK_VERBS:
+        child = sub.add_parser(
+            verb, help=desc,
+            description=_PACK_DESCRIPTIONS.get(verb, desc),
+        )
+        _PACK_BUILDERS[verb](child)
 
 
 # --- config subtree ------------------------------------------------------
@@ -887,19 +854,19 @@ def _build_root_parser() -> argparse.ArgumentParser:
     )
     _build_serve_parser(serve)
 
-    subspace = sub.add_parser(
-        "subspace",
-        help="Flat-subspace ops (extract/merge/compare/why/transfer)",
-        description="Flat-subspace (steering vector) operations",
-    )
-    _build_subspace_parser(subspace)
-
     manifold = sub.add_parser(
         "manifold",
-        help="Manifold ops (fit/discover/generate/ls/show/install/export/...)",
-        description="Steering-manifold authoring, fitting, and lifecycle",
+        help="Manifold compute (extract/generate/fit/bake/merge/transfer/compare/why)",
+        description="Steering-vector / manifold authoring, fitting, and analysis",
     )
     _build_manifold_parser(manifold)
+
+    pack = sub.add_parser(
+        "pack",
+        help="Manifold lifecycle (ls/show/install/search/push/rm/clear/refresh/export)",
+        description="Manifold install / share / inspect / removal lifecycle",
+    )
+    _build_pack_parser(pack)
 
     cfg = sub.add_parser(
         "config",

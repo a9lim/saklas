@@ -122,7 +122,7 @@ body + any typed safe-message formatter.
 
 `_manifold_json` is the wire serializer behind every detail-returning route. It
 builds the *session-independent* fields via `io.manifolds.manifold_summary(folder)`
-— the same serializer CLI `manifold show -j` emits — so the shared keys
+— the same serializer CLI `pack show -j` emits — so the shared keys
 (`namespace`/`name`/`description`/`source`/`fit_mode`/`is_discover`/`node_count`/
 `node_labels`/`node_roles`/`node_kinds`/`hyperparams`/`fitted_models`/`tensor_variants` + authored
 `domain`/`domain_label`/`intrinsic_dim`/`min_nodes`/`node_coords`) match across CLI
@@ -171,10 +171,10 @@ per-model sidecar/tensor via `_resolve_intrinsic_dim` + a `load_manifold` read.
 - `PATCH /manifolds/{ns}/{name}` — `update_manifold_folder` (serializes against an
   in-flight fit). Existing tensors go stale, not deleted.
 - `DELETE /manifolds/{ns}/{name}` — `remove_manifold_folder` (single source of truth
-  shared with CLI `manifold rm`) under `session.lock`; 409 when a fit holds the
+  shared with CLI `pack rm`) under `session.lock`; 409 when a fit holds the
   gen-lock, 404 pre-lock. Response `{namespace, name, source, removed,
   rematerializes_on_restart}`.
-- `POST /manifolds/{ns}/{name}/fit` — `session.extract_manifold` under the lock; SSE
+- `POST /manifolds/{ns}/{name}/fit` — `session.fit` under the lock; SSE
   / JSON. Discover folders accept `fit_mode` / `hyperparams` overrides, written
   atomically into `manifold.json` (after `_sanitize_hyperparams`) *before* the fit;
   authored folders reject them with 400. Poisedness `ValueError` →
@@ -228,9 +228,10 @@ not a re-render pass.
   `auto_register` (wire field `register`, default true) steers the result in as a
   vector on success. There is no `/extract/preview` (the A0
   scenario/preview machinery was removed — A2 has no scenarios).
-- `POST /vectors/merge` body `{name, expression}` — wraps `merge_into_manifold`
-  (model-scoped, `force=True`): lands a corpus-less baked manifold, folds the fitted
-  tensor back to a steering Profile, registers it. `_refuse_if_busy` first (409).
+- `POST /vectors/bake` (`BakeVectorRequest`) body `{name, expression}` — wraps
+  `merge_into_manifold` (model-scoped, `force=True`): lands a corpus-less baked
+  manifold, folds the fitted tensor back to a steering Profile, registers it. The
+  server mirror of CLI `manifold bake`. `_refuse_if_busy` first (409).
   `MergeError` → 400. (Cloning was removed in 4.0 — no `/vectors/clone` route.)
 
 `GET /sessions/{id}/correlation?names=…` — N×N Mahalanobis-cosine matrix across

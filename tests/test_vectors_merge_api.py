@@ -1,4 +1,4 @@
-"""Tests for POST /saklas/v1/sessions/{id}/vectors/merge."""
+"""Tests for POST /saklas/v1/sessions/{id}/vectors/bake."""
 
 # pyright: reportUnusedVariable=false
 
@@ -105,7 +105,7 @@ class TestMergeVector:
             return_value=merged_folder,
         ) as m:
             resp = client.post(
-                "/saklas/v1/sessions/default/vectors/merge",
+                "/saklas/v1/sessions/default/vectors/bake",
                 json={
                     "name": "noble",
                     "expression": "0.3 default/honest + 0.4 default/warm",
@@ -139,7 +139,7 @@ class TestMergeVector:
             side_effect=MergeError("merge requires at least one component"),
         ):
             resp = client.post(
-                "/saklas/v1/sessions/default/vectors/merge",
+                "/saklas/v1/sessions/default/vectors/bake",
                 json={"name": "x", "expression": ""},
             )
         # MergeError is a SaklasError → 400 via the global handler.
@@ -153,7 +153,7 @@ class TestMergeVector:
             side_effect=MergeError("component default/missing not installed"),
         ):
             resp = client.post(
-                "/saklas/v1/sessions/default/vectors/merge",
+                "/saklas/v1/sessions/default/vectors/bake",
                 json={
                     "name": "x",
                     "expression": "0.3 default/missing",
@@ -164,7 +164,7 @@ class TestMergeVector:
     def test_session_not_found_404(self, session_and_client: tuple[SaklasSession, TestClient]):
         _, client = session_and_client
         resp = client.post(
-            "/saklas/v1/sessions/other/vectors/merge",
+            "/saklas/v1/sessions/other/vectors/bake",
             json={"name": "x", "expression": "0.3 default/a"},
         )
         assert resp.status_code == 404
@@ -184,7 +184,7 @@ class TestMergeVector:
             return_value=empty_folder,
         ):
             resp = client.post(
-                "/saklas/v1/sessions/default/vectors/merge",
+                "/saklas/v1/sessions/default/vectors/bake",
                 json={"name": "x", "expression": "0.3 default/a"},
             )
         assert resp.status_code == 500

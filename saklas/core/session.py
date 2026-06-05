@@ -1475,7 +1475,7 @@ class SaklasSession:
 
         Shared tail of :meth:`extract` / :meth:`extract_vector_from_corpora`:
         runs :class:`ManifoldExtractionPipeline` directly (the public
-        :meth:`extract_manifold` re-acquires ``_gen_lock``, which the callers
+        :meth:`fit` re-acquires ``_gen_lock``, which the callers
         already hold), folds the fitted manifold to a per-layer direction
         :class:`Profile`, and emits ``VectorExtracted``.
 
@@ -1509,7 +1509,7 @@ class SaklasSession:
         ))
         return ret_name, profile
 
-    def extract_manifold(
+    def fit(
         self,
         folder: Any,
         *,
@@ -1517,24 +1517,23 @@ class SaklasSession:
         sae_revision: str | None = None,
         on_progress: Callable[[str], None] | None = None,
     ) -> Manifold:
-        """Fit a steering manifold from an authored manifold-pack folder.
+        """Fit a steering manifold from a manifold folder (authored or discover).
 
         Thin delegate to :class:`ManifoldExtractionPipeline` — that
         pipeline owns corpus loading, per-node centroid pooling, the
-        per-layer PCA + spline fit, and the cache short-circuit.  Gated
-        against generation like :meth:`extract`: manifold fitting runs
+        per-layer PCA + spline fit (dispatching on the folder's ``fit_mode``),
+        and the cache short-circuit.  The Python mirror of CLI ``manifold fit``.
+        Gated against generation like :meth:`extract`: manifold fitting runs
         forward passes through the model.
         """
         if not self._gen_lock.acquire(blocking=False):
             raise ConcurrentExtractionError(
-                "session.extract_manifold called while another model use "
-                "is in flight"
+                "session.fit called while another model use is in flight"
             )
         try:
             if self._gen_phase is not GenState.IDLE:
                 raise ConcurrentExtractionError(
-                    "session.extract_manifold called while a generation "
-                    "is in flight"
+                    "session.fit called while a generation is in flight"
                 )
             from saklas.core.extraction import ManifoldExtractionPipeline
             pipe = ManifoldExtractionPipeline(self, self.events)
@@ -1544,6 +1543,42 @@ class SaklasSession:
             )
         finally:
             self._gen_lock.release()
+
+    def bake(
+        self,
+        name: str,
+        expression: str,
+        *,
+        force: bool = True,
+        strict: bool = False,
+    ) -> tuple[str, Profile]:
+        """Bake a steering expression into a corpus-less manifold (the merge op).
+
+        The Python mirror of CLI ``manifold bake``.  Wraps
+        :func:`saklas.io.merge.merge_into_manifold`, model-scoped to this
+        session's loaded model — the merge lands a corpus-less
+        ``fit_mode="baked"`` manifold under ``local/<name>/`` — then folds the
+        fitted tensor back to a steering :class:`Profile` and registers it
+        (:meth:`steer`) so it is immediately steerable.  Returns
+        ``(name, Profile)``, the same shape :meth:`extract` returns.
+        """
+        from saklas.io.merge import MergeError, merge_into_manifold
+        from saklas.io.paths import tensor_filename
+        from saklas.core.manifold import load_manifold
+        from saklas.core.vectors import folded_vector_directions
+
+        dst_folder = merge_into_manifold(
+            name, expression, self.model_id, force=force, strict=strict,
+        )
+        tensor_path = dst_folder / tensor_filename(self.model_id)
+        if not tensor_path.is_file():
+            raise MergeError(
+                f"bake produced no tensor for {self.model_id} at {tensor_path}"
+            )
+        manifold = load_manifold(str(tensor_path))
+        profile = Profile(folded_vector_directions(manifold))
+        self.steer(name, profile)
+        return name, profile
 
     def load_profile(self, path: str) -> Profile:
         profile, meta = _load_profile(path)
@@ -2140,7 +2175,7 @@ class SaklasSession:
                         self._ensure_manifold_loaded(key)
                     except ManifoldNotRegisteredError:
                         folder = ManifoldFolder.load(manifold_dir("default", name))
-                        self.extract_manifold(folder)
+                        self.fit(folder)
                         self._ensure_manifold_loaded(key)
                     probes[name] = self._manifolds[key]
                 except Exception as e:

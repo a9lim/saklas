@@ -7,7 +7,7 @@ Supersedes the two former scripts (``regenerate_bundled_manifold.py`` for
 2-node ``pca`` subspaces) never had an A2 regeneration path.
 
 Generation writes node corpora only; FIT is a separate step
-(``saklas manifold discover <ns>/<name>``), deliberately decoupled so a flaky
+(``saklas manifold fit <ns>/<name>``), deliberately decoupled so a flaky
 generation leaves inspectable corpora.  The manifold folders are written
 directly into the package data tree, so a killed run resumes; ``--force`` wipes
 and regenerates.  Because rosters changed (personas recut to 107) and PAD is
@@ -415,7 +415,7 @@ def main() -> None:
     if written:
         print(f"\n[done] wrote {len(written)} manifold(s) -> fit with:")
         for name in written:
-            print(f"  saklas manifold discover default/{name} -m <model>")
+            print(f"  saklas manifold fit default/{name} -m <model>")
     if neutral_pending:
         print(f"\n[done] wrote neutral baseline -> {NEUTRAL_PATH.relative_to(REPO)}")
         print("  per-model layer_means + Mahalanobis whitener recompute on next "

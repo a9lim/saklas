@@ -54,7 +54,7 @@ def run_sweep(
     if not _Path(fit_path).exists():
         print(f"refitting bundled personas manifold for {MODEL_ID} ...")
         t1 = time.time()
-        session.extract_manifold(personas_dir)
+        session.fit(personas_dir)
         print(f"  refit done in {time.time() - t1:.1f}s")
 
     runs: list[dict[str, object]] = []

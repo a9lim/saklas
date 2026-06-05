@@ -261,8 +261,8 @@ class JointLogprobsRequest(BaseModel):
     b_id: str
 
 
-class MergeVectorRequest(BaseModel):
-    """Body for ``POST /saklas/v1/sessions/{id}/vectors/merge``.
+class BakeVectorRequest(BaseModel):
+    """Body for ``POST /saklas/v1/sessions/{id}/vectors/bake``.
 
     ``expression`` is a merge expression in the shared steering grammar
     (``"0.3 default/honest + 0.4 default/warm"``); ``name`` becomes the
@@ -1415,8 +1415,8 @@ def register_saklas_routes(app: FastAPI) -> None:
             "progress": progress_msgs,
         }
 
-    @app.post("/saklas/v1/sessions/{session_id}/vectors/merge")
-    async def merge_vector(session_id: str, req: MergeVectorRequest):
+    @app.post("/saklas/v1/sessions/{session_id}/vectors/bake")
+    async def bake_vector(session_id: str, req: BakeVectorRequest):
         """Merge an expression of installed directions into a baked manifold.
 
         Wraps :func:`saklas.io.merge.merge_into_manifold` (model-scoped to

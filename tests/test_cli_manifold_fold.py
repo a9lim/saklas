@@ -21,7 +21,7 @@ import pytest
 import torch
 
 from saklas import cli
-from saklas.cli.runners import _run_compare, _run_why
+from saklas.cli.runners import _run_manifold_compare, _run_manifold_why
 from saklas.core.manifold import (
     CustomDomain, Manifold, fit_affine_subspace, save_manifold, subspace_share,
 )
@@ -183,8 +183,8 @@ class TestWhyFold:
         self, capsys: pytest.CaptureFixture[str],
     ) -> None:
         _write_fitted_manifold("default", "happy.sad")
-        args = cli.parse_args(["subspace", "why", "happy.sad", "-m", _MODEL])
-        _run_why(args)
+        args = cli.parse_args(["manifold", "why", "happy.sad", "-m", _MODEL])
+        _run_manifold_why(args)
         out = capsys.readouterr().out
         assert "happy.sad" in out
 
@@ -193,9 +193,9 @@ class TestWhyFold:
     ) -> None:
         # Manifold folder exists but no fitted tensor for the model.
         manifold_dir("default", "happy.sad").mkdir(parents=True, exist_ok=True)
-        args = cli.parse_args(["subspace", "why", "happy.sad", "-m", _MODEL])
+        args = cli.parse_args(["manifold", "why", "happy.sad", "-m", _MODEL])
         with pytest.raises(SystemExit):
-            _run_why(args)
+            _run_manifold_why(args)
         err = capsys.readouterr().err
         assert "fit" in err
 
@@ -204,8 +204,8 @@ class TestWhyFold:
     ) -> None:
         import json
         _write_fitted_manifold("default", "happy.sad")
-        args = cli.parse_args(["subspace", "why", "happy.sad", "-m", _MODEL, "-j"])
-        _run_why(args)
+        args = cli.parse_args(["manifold", "why", "happy.sad", "-m", _MODEL, "-j"])
+        _run_manifold_why(args)
         payload = json.loads(capsys.readouterr().out)
         assert payload["concept"] == "happy.sad"
         assert {row["layer"] for row in payload["layers"]} == {2, 5}
@@ -216,9 +216,9 @@ class TestWhyFold:
         import json
         _write_fitted_manifold("alice", "happy.sad")
         args = cli.parse_args([
-            "subspace", "why", "alice/happy.sad", "-m", _MODEL, "-j",
+            "manifold", "why", "alice/happy.sad", "-m", _MODEL, "-j",
         ])
-        _run_why(args)
+        _run_manifold_why(args)
         payload = json.loads(capsys.readouterr().out)
         assert payload["concept"] == "alice/happy.sad"
 
@@ -235,9 +235,9 @@ class TestCompareFold:
         _write_fitted_manifold("default", "happy.sad", seed=1)
         _write_fitted_manifold("default", "warm.clinical", seed=2)
         args = cli.parse_args([
-            "subspace", "compare", "happy.sad", "warm.clinical", "-m", _MODEL,
+            "manifold", "compare", "happy.sad", "warm.clinical", "-m", _MODEL,
         ])
-        _run_compare(args)
+        _run_manifold_compare(args)
         out = capsys.readouterr().out
         assert "happy.sad" in out
         assert "warm.clinical" in out
@@ -249,9 +249,9 @@ class TestCompareFold:
         _write_fitted_manifold("default", "warm.clinical", seed=2)
         _write_fitted_manifold("default", "angry.calm", seed=3)
         args = cli.parse_args([
-            "subspace", "compare", "happy.sad", "-m", _MODEL,
+            "manifold", "compare", "happy.sad", "-m", _MODEL,
         ])
-        _run_compare(args)
+        _run_manifold_compare(args)
         out = capsys.readouterr().out
         # 1-arg mode ranks the others (folded manifolds) against the target.
         assert "warm.clinical" in out
@@ -263,10 +263,10 @@ class TestCompareFold:
         _write_fitted_manifold("default", "happy.sad", seed=1)
         _write_fitted_manifold("alice", "happy.sad", seed=2)
         args = cli.parse_args([
-            "subspace", "compare", "default/happy.sad", "alice/happy.sad",
+            "manifold", "compare", "default/happy.sad", "alice/happy.sad",
             "-m", _MODEL,
         ])
-        _run_compare(args)
+        _run_manifold_compare(args)
         out = capsys.readouterr().out
         assert "default/happy.sad" in out
         assert "alice/happy.sad" in out
@@ -278,9 +278,9 @@ class TestCompareFold:
         _write_fitted_manifold("alice", "warm.clinical", seed=2)
         _write_fitted_manifold("default", "warm.clinical", seed=3)
         args = cli.parse_args([
-            "subspace", "compare", "happy.sad", "-m", _MODEL,
+            "manifold", "compare", "happy.sad", "-m", _MODEL,
         ])
-        _run_compare(args)
+        _run_manifold_compare(args)
         out = capsys.readouterr().out
         assert "alice/warm.clinical" in out
         assert "default/warm.clinical" in out

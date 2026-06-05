@@ -3,7 +3,7 @@
 A manifold is a top-level artifact (labeled nodes on a domain), not
 session-scoped, so these routes live beside the pack routes rather than
 under ``/sessions/{id}``.  The exception is ``fit``, which needs the
-loaded model — it runs ``session.extract_manifold`` under the session
+loaded model — it runs ``session.fit`` under the session
 lock and streams progress like ``/extract`` does.
 
 Authoring (create / update) writes ``manifold.json`` + ``nodes/*.json``
@@ -536,7 +536,7 @@ def register_manifold_routes(app: FastAPI) -> None:
     async def merge_manifold(req: MergeManifoldRequest):
         """Union N discover-mode manifolds' nodes into a fresh discover folder.
 
-        The manifold-side counterpart to ``POST /saklas/v1/vectors/merge``,
+        The manifold-side counterpart to ``POST /saklas/v1/vectors/bake``,
         but operating on *node corpora* rather than steering directions:
         pools the sources' nodes into one heap and writes an unfitted
         discover folder.  The next ``POST .../fit`` derives coords from
@@ -793,7 +793,7 @@ def register_manifold_routes(app: FastAPI) -> None:
     ):
         """Fit the manifold for the loaded model.
 
-        Runs :meth:`SaklasSession.extract_manifold` under the session
+        Runs :meth:`SaklasSession.fit` under the session
         lock.  SSE progress when ``Accept: text/event-stream``, JSON
         otherwise.  Poisedness failures (a bare ``ValueError`` from the
         RBF solve, not a ``SaklasError``) are caught explicitly and
@@ -839,7 +839,7 @@ def register_manifold_routes(app: FastAPI) -> None:
             write_json_atomic(folder / "manifold.json", data)
 
         def _fit(on_progress: Callable[[str], None]) -> dict[str, Any]:
-            manifold = session.extract_manifold(
+            manifold = session.fit(
                 folder, sae=req.sae, sae_revision=req.sae_revision,
                 on_progress=on_progress,
             )

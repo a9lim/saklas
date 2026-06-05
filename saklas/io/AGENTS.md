@@ -58,7 +58,7 @@ by `manifold.json::fit_mode`:
 - **`pca`** / **`spectral`** (discover) — nodes carry `{label}` only; coords are
   derived per-model at fit time and stored in the safetensors; `hyperparams` feeds
   the picker. `pca` is flat (also the 2-node vector case), `spectral` curved.
-- **`baked`** — corpus-less: a precomputed direction written by `subspace merge`.
+- **`baked`** — corpus-less: a precomputed direction written by `manifold bake`.
   No node corpus, no re-fit; `BakedManifoldError` guards corpus-requiring calls.
 
 `ManifoldFolder.load` validates the format version, `NAME_REGEX`, and per-node
@@ -123,7 +123,7 @@ leaves RBF + `node_coords` untouched, re-bakes the Mahalanobis **share** in targ
 space — the target whitener is **required** and must cover the transferred layers
 (`WhitenerError` otherwise; no Euclidean rebake) — clears `origin`, writes the
 `_from-<safe_src>` variant). `manifold_summary(folder)` is the session-independent
-serializer shared by `manifold show -j` + the HTTP summary route.
+serializer shared by `pack show -j` + the HTTP summary route.
 `iter_manifold_folders`, `bundled_manifold_names`, `materialize_bundled_manifolds`
 (copy-on-miss into `default/`, plus a re-copy when the bundled manifest hash drifts
 or the on-disk `format_version` predates `MANIFOLD_FORMAT_VERSION`). Per-node `role`

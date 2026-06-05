@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, TypeVar
 
 from saklas.cli.parsers import (
-    _EXPERIMENT_VERBS, _MANIFOLD_VERBS, _SUBSPACE_VERBS,
+    _EXPERIMENT_VERBS, _MANIFOLD_VERBS, _PACK_VERBS,
 )
 from saklas.core.errors import SaklasError
 from saklas.core.stats import median_or_zero
@@ -457,10 +457,9 @@ def _run_serve(args: argparse.Namespace) -> None:
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
 
-# --- subspace runners ----------------------------------------------------
+# --- manifold compute runners --------------------------------------------
 
-@_saklas_error_exit
-def _run_merge(args: argparse.Namespace) -> None:
+def _run_manifold_bake(args: argparse.Namespace) -> None:
     from saklas.io import merge as merge_mod
     dst = merge_mod.merge_into_manifold(
         args.name, args.expression, model=args.model,
@@ -471,16 +470,16 @@ def _run_merge(args: argparse.Namespace) -> None:
 
 def _require_model(args: argparse.Namespace) -> None:
     if not args.model:
-        # The manifold leaves (fit / discover / generate / transfer) carry the
-        # leaf on ``manifold_cmd`` — surface it so the error reads "manifold
-        # fit". Otherwise the leaf is the subspace verb (``subspace_cmd``).
+        # The compute leaves (extract / fit / generate / bake / transfer) carry
+        # the leaf on ``manifold_cmd`` — surface it so the error reads
+        # "manifold fit".
         manifold_cmd = getattr(args, "manifold_cmd", None)
-        cmd = f"manifold {manifold_cmd}" if manifold_cmd else getattr(args, "subspace_cmd", None) or "?"
+        cmd = f"manifold {manifold_cmd}" if manifold_cmd else "?"
         print(f"{cmd}: -m/--model is required", file=sys.stderr)
         sys.exit(2)
 
 
-def _run_extract(args: argparse.Namespace) -> None:
+def _run_manifold_extract(args: argparse.Namespace) -> None:
     _require_model(args)
     import pathlib
     from saklas.core.session import canonical_concept_name
@@ -751,7 +750,7 @@ def _fold_all_fitted_manifolds(
     return out
 
 
-def _run_compare(args: argparse.Namespace) -> None:
+def _run_manifold_compare(args: argparse.Namespace) -> None:
     import json as _json
     from saklas.io.selectors import parse as sel_parse, resolve
 
@@ -952,7 +951,7 @@ def _run_compare(args: argparse.Namespace) -> None:
             print(f"{a_name:<{width}}  {row}")
 
 
-def _run_why(args: argparse.Namespace) -> None:
+def _run_manifold_why(args: argparse.Namespace) -> None:
     import json as _json
     from saklas.io.selectors import AmbiguousSelectorError
 
@@ -1103,53 +1102,133 @@ def _print_why_histogram(
         print(f"    {_label(lo, hi):<{label_col}}  {bar}  {norm:>{value_w}.3f}")
 
 
-def _run_transfer(args: argparse.Namespace) -> None:
-    """Cross-model transfer via Procrustes — routes to the manifold path.
-
-    A steering vector is the K=2 case of a flat ``pca`` manifold, so
-    ``subspace transfer <concept>`` transfers the 2-node manifold named
-    ``<concept>``: it delegates to :func:`_run_manifold_transfer`, which
-    resolves the manifold folder, fits/loads the per-layer Procrustes
-    alignment, and writes the target's ``_from-<safe_src>`` fitted tensor via
-    :func:`saklas.io.manifolds.transfer_manifold`.  The pre-4.0
-    ``Profile``-Procrustes path that wrote a ``vectors/`` tensor is gone.
-    """
-    # The subspace parser names the positional ``concept``; the manifold
-    # transfer runner reads ``name``.  Bridge the one differing attr and
-    # delegate — every other arg (src_model / tgt_model / force / json_output)
-    # is identical across the two parsers.
-    args.name = args.concept
-    _run_manifold_transfer(args)
-
-
 def _run_manifold_fit(args: argparse.Namespace) -> None:
-    from saklas.io.manifolds import domain_label
+    """``saklas manifold fit`` — fit an authored OR discover-mode manifold.
+
+    The positional ``target`` is a manifold name OR a folder path.  When it
+    resolves to an authored folder the fit runs as-is (no hyperparam knobs
+    allowed).  When it resolves to a discover-mode folder (``pca`` /
+    ``spectral``) any supplied hyperparam override (``--method`` / ``--max-dim``
+    / ``--var-threshold`` / ``--k-nn`` / ``--bandwidth`` / ``--max-subspace-dim``)
+    is written into ``manifold.json`` atomically *before* the fit so the cache
+    key reflects the actual fit inputs.  Supplying overrides against an authored
+    folder is an error (mirrors the server's 400).
+    """
+    import json as _json
+    from saklas.io.atomic import write_json_atomic
+    from saklas.io.manifolds import (
+        ManifoldFolder, ManifoldFormatError, _sanitize_hyperparams,
+        domain_label,
+    )
 
     _require_model(args)
-    folder = Path(args.folder)
+
+    # Resolve ``target`` to a folder.  A path that exists on disk (or that
+    # carries a ``manifold.json``) is taken as an authored-folder path —
+    # ``manifold fit /path/to/folder``; otherwise it is a manifold *name*
+    # resolved cross-namespace the same way the lifecycle verbs resolve.
+    target = args.target
+    target_path = Path(target)
+    if target_path.is_dir() or (target_path / "manifold.json").exists():
+        folder = target_path
+    else:
+        folder = _resolve_manifold_folder(target)
+
     if not (folder / "manifold.json").exists():
         print(
             f"manifold fit: no manifold.json in {folder}", file=sys.stderr,
         )
         sys.exit(2)
+
+    # Load the folder to learn its fit_mode before paying for a model load.
+    try:
+        mf = ManifoldFolder.load(folder)
+    except ManifoldFormatError as e:
+        print(f"manifold fit: {e}", file=sys.stderr)
+        sys.exit(2)
+
+    # Did the user supply any discover-mode hyperparam override?
+    override_supplied = any(
+        getattr(args, attr, None) is not None
+        for attr in (
+            "method", "max_dim", "var_threshold", "k_nn", "bandwidth",
+            "max_subspace_dim",
+        )
+    )
+
+    new_fit_mode = mf.fit_mode
+    if override_supplied:
+        if not mf.is_discover:
+            # Mirror the server's 400: hyperparam overrides are discover-only.
+            print(
+                f"manifold fit: fit_mode/hyperparams overrides are "
+                f"discover-mode only; {folder} is authored",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        new_fit_mode = args.method or mf.fit_mode
+        if new_fit_mode not in {"pca", "spectral"}:
+            print(
+                f"manifold fit: invalid method {new_fit_mode!r}",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        new_hyperparams = dict(mf.hyperparams)
+        # PCA knobs.
+        if args.max_dim is not None:
+            new_hyperparams["max_dim"] = int(args.max_dim)
+        if args.var_threshold is not None:
+            new_hyperparams["var_threshold"] = float(args.var_threshold)
+        # Spectral knobs.
+        if args.k_nn is not None:
+            new_hyperparams["k_nn"] = int(args.k_nn)
+        if args.bandwidth is not None:
+            new_hyperparams["bandwidth"] = float(args.bandwidth)
+        # Spectral-only knob — dropped by ``_sanitize_hyperparams`` for a pca
+        # fit (a flat fit's per-layer subspace dim is its layout dim, capped
+        # by ``--max-dim``, not a separate knob).
+        if getattr(args, "max_subspace_dim", None) is not None:
+            new_hyperparams["max_subspace_dim"] = int(args.max_subspace_dim)
+        new_hyperparams = _sanitize_hyperparams(new_fit_mode, new_hyperparams)
+
+        # Write back if anything changed.  Staged write — a crash mid-rewrite
+        # would leave the folder unreadable and ``ManifoldFolder.load`` would
+        # 400 on the next list call.
+        if new_fit_mode != mf.fit_mode or new_hyperparams != mf.hyperparams:
+            data = _json.loads((folder / "manifold.json").read_text())
+            data["fit_mode"] = new_fit_mode
+            data["hyperparams"] = new_hyperparams
+            # Re-author the nodes list in case fit_mode changed and it
+            # accidentally carries authored shape.  Discover nodes are
+            # label-only.
+            data["nodes"] = [{"label": label} for label in mf.node_labels]
+            data.pop("domain", None)
+            write_json_atomic(folder / "manifold.json", data)
+
     _print_startup(args)
     session = _make_session(args)
     _print_model_info(session)
     try:
-        manifold = session.extract_manifold(
+        manifold = session.fit(
             folder,
             sae=getattr(args, "sae", None),
             sae_revision=getattr(args, "sae_revision", None),
             on_progress=lambda m: print(f"  {m}"),
         )
+    except (ValueError, ManifoldFormatError) as e:
+        print(f"manifold fit failed: {e}", file=sys.stderr)
+        sys.exit(1)
     except Exception as e:
         print(f"manifold fit failed: {e}", file=sys.stderr)
         sys.exit(1)
+    tail = (
+        f", fit_mode={new_fit_mode}" if mf.is_discover else ""
+    )
     print(
         f"fitted manifold '{manifold.name}' "
         f"({len(manifold.layers)} layers, {len(manifold.node_labels)} nodes, "
         f"{domain_label(manifold.domain.to_spec())}, "
-        f"{manifold.feature_space})"
+        f"{manifold.feature_space}{tail})"
     )
 
 
@@ -1161,10 +1240,10 @@ def _iter_manifold_folders(namespace: str | None):
     importing ``cli``.
 
     Materializes bundled manifolds (e.g. ``default/personas``) before
-    the walk.  CLI verbs like ``manifold discover`` / ``show`` / ``ls``
+    the walk.  CLI verbs like ``manifold fit`` / ``pack show`` / ``pack ls``
     resolve folders *before* any session is constructed, so the session-
     startup ``materialize_bundled_manifolds`` call hasn't fired yet —
-    without this hop, a user's first ``saklas manifold discover
+    without this hop, a user's first ``saklas manifold fit
     default/personas`` would miss the bundled folder and exit with "not
     found".  The format-version short-circuit inside the materialize
     function makes repeated calls cheap (no-op when up-to-date).  The
@@ -1179,7 +1258,7 @@ def _iter_manifold_folders(namespace: str | None):
     yield from iter_manifold_folders(namespace)
 
 
-def _run_manifold_ls(args: argparse.Namespace) -> None:
+def _run_pack_ls(args: argparse.Namespace) -> None:
     import json as _json
     from saklas.io.manifolds import domain_label
 
@@ -1210,7 +1289,7 @@ def _run_manifold_ls(args: argparse.Namespace) -> None:
             print(f"    {mf.description}")
 
 
-def _run_manifold_show(args: argparse.Namespace) -> None:
+def _run_pack_show(args: argparse.Namespace) -> None:
     import json as _json
     from saklas.io.manifolds import domain_label
 
@@ -1367,26 +1446,24 @@ def _run_manifold_show(args: argparse.Namespace) -> None:
                 peak = ", ".join(f"L{layer}={v:.2f}" for layer, v in ranked[:5])
                 print(f"      signal by layer (peak): {peak}")
     else:
-        hint = (
-            "discover" if mf.is_discover else "fit"
-        )
-        print(f"  fitted models: (none — run `saklas manifold {hint}`)")
+        print("  fitted models: (none — run `saklas manifold fit`)")
 
 
 def _resolve_manifold_ns_name(name: str) -> tuple[str, str]:
     """Resolve a CLI-supplied ``NAME`` (or ``ns/name``) to ``(namespace, name)``.
 
-    Mirrors :func:`_run_manifold_show`'s ambiguity handling — bare names
+    Mirrors :func:`_run_pack_show`'s ambiguity handling — bare names
     resolve cross-namespace (reaching e.g. bundled ``default/`` when that's
     the only match) and raise on collision; an ``ns/name`` form pins to a
     single namespace.  Exits with a clear error on miss / ambiguity.
 
     This is the lifecycle analogue of the concept-selector cross-namespace
-    resolution: ``clear`` / ``refresh`` / ``rm`` / ``transfer`` (and the
-    folder-returning ``discover`` / ``show``) all route a bare name through
-    here so it can reach any namespace, not just ``local/``.  (``generate``
-    deliberately does *not* — it authors a fresh folder and defaults bare →
-    ``local/`` via :func:`_split_manifold_ns_name`.)
+    resolution: ``pack clear`` / ``pack refresh`` / ``pack rm`` / ``manifold
+    transfer`` / ``pack export`` (and the folder-returning ``manifold fit`` by
+    name / ``pack show``) all route a bare name through here so it can reach
+    any namespace, not just ``local/``.  (``generate`` deliberately does *not*
+    — it authors a fresh folder and defaults bare → ``local/`` via
+    :func:`_split_manifold_ns_name`.)
 
     An explicit ``ns/name`` pins directly — it's returned verbatim without a
     filesystem walk, leaving the existence check to the io backend (which
@@ -1419,7 +1496,7 @@ def _resolve_manifold_folder(name: str) -> Path:
     """Resolve a CLI-supplied ``NAME`` (or ``ns/name``) to a folder path.
 
     Thin wrapper over :func:`_resolve_manifold_ns_name` for the verbs that
-    want the folder directly (``discover`` / ``show``); the lifecycle verbs
+    want the folder directly (``fit`` by-name, ``show``); the lifecycle verbs
     that hand a ``(namespace, name)`` pair to their io backend call the
     pair-returning form instead.
     """
@@ -1427,111 +1504,6 @@ def _resolve_manifold_folder(name: str) -> Path:
 
     ns, resolved = _resolve_manifold_ns_name(name)
     return manifold_dir(ns, resolved)
-
-
-def _run_manifold_discover(args: argparse.Namespace) -> None:
-    from saklas.io.manifolds import domain_label
-
-    """``saklas manifold discover`` — fit a discover-mode manifold.
-
-    The folder must already exist (usually created by ``generate``) and
-    be in discover shape.  Any CLI overrides (``--method``, ``--max-dim``,
-    ``--var-threshold``, ``--k-nn``, ``--bandwidth``) are written back
-    to ``manifold.json`` *before* the fit so the cache key reflects the
-    actual fit inputs.  This means a subsequent fit with different
-    overrides reliably misses cache; the folder's manifest is the
-    single source of truth for "what hyperparams produced the cached
-    tensor."
-    """
-    import json as _json
-    from saklas.io.atomic import write_json_atomic
-    from saklas.io.manifolds import (
-        ManifoldFolder, ManifoldFormatError, _sanitize_hyperparams,
-    )
-
-    _require_model(args)
-    folder = _resolve_manifold_folder(args.name)
-
-    # Validate folder is discover-shape before paying for model load.
-    try:
-        mf = ManifoldFolder.load(folder)
-    except ManifoldFormatError as e:
-        print(f"manifold discover: {e}", file=sys.stderr)
-        sys.exit(2)
-    if not mf.is_discover:
-        print(
-            f"manifold discover: '{args.name}' is authored, not discover; "
-            f"use `saklas manifold fit` for authored manifolds",
-            file=sys.stderr,
-        )
-        sys.exit(2)
-
-    # Compose the effective fit_mode + hyperparams from CLI overrides.
-    new_fit_mode = args.method or mf.fit_mode
-    if new_fit_mode not in {"pca", "spectral"}:
-        print(
-            f"manifold discover: invalid method {new_fit_mode!r}",
-            file=sys.stderr,
-        )
-        sys.exit(2)
-    new_hyperparams = dict(mf.hyperparams)
-    # PCA knobs.
-    if args.max_dim is not None:
-        new_hyperparams["max_dim"] = int(args.max_dim)
-    if args.var_threshold is not None:
-        new_hyperparams["var_threshold"] = float(args.var_threshold)
-    # Spectral knobs.
-    if args.k_nn is not None:
-        new_hyperparams["k_nn"] = int(args.k_nn)
-    if args.bandwidth is not None:
-        new_hyperparams["bandwidth"] = float(args.bandwidth)
-    # Spectral-only knob — dropped by ``_sanitize_hyperparams`` below for a
-    # pca fit (a flat fit's per-layer subspace dim is its layout dim, capped
-    # by ``--max-dim``, not a separate knob).
-    if getattr(args, "max_subspace_dim", None) is not None:
-        new_hyperparams["max_subspace_dim"] = int(args.max_subspace_dim)
-    # Cross-method knobs that don't apply get dropped — silently
-    # carrying e.g. ``var_threshold`` into a spectral fit pollutes the
-    # cache key without affecting the fit, and an out-of-whitelist key
-    # would crash the dispatcher at fit time.  Single source of truth
-    # lives in ``io.manifolds._sanitize_hyperparams``.
-    new_hyperparams = _sanitize_hyperparams(new_fit_mode, new_hyperparams)
-
-    # Write back if anything changed.  Staged write — a crash mid-rewrite
-    # would leave the folder unreadable and ``ManifoldFolder.load`` would
-    # 400 on the next list call.
-    if new_fit_mode != mf.fit_mode or new_hyperparams != mf.hyperparams:
-        data = _json.loads((folder / "manifold.json").read_text())
-        data["fit_mode"] = new_fit_mode
-        data["hyperparams"] = new_hyperparams
-        # Re-author the nodes list in case fit_mode changed and it
-        # accidentally carries authored shape.  Discover nodes are
-        # label-only.
-        data["nodes"] = [{"label": label} for label in mf.node_labels]
-        data.pop("domain", None)
-        write_json_atomic(folder / "manifold.json", data)
-
-    _print_startup(args)
-    session = _make_session(args)
-    _print_model_info(session)
-    try:
-        manifold = session.extract_manifold(
-            folder,
-            sae=getattr(args, "sae", None),
-            sae_revision=getattr(args, "sae_revision", None),
-            on_progress=lambda m: print(f"  {m}"),
-        )
-    except (ValueError, ManifoldFormatError) as e:
-        print(f"manifold discover failed: {e}", file=sys.stderr)
-        sys.exit(1)
-    print(
-        f"discovered manifold '{manifold.name}' "
-        f"({len(manifold.layers)} layers, "
-        f"{len(manifold.node_labels)} nodes, "
-        f"{domain_label(manifold.domain.to_spec())}, "
-        f"{manifold.feature_space}, "
-        f"fit_mode={new_fit_mode})"
-    )
 
 
 def _run_manifold_generate(args: argparse.Namespace) -> None:
@@ -1637,7 +1609,7 @@ def _run_manifold_generate(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     print(f"wrote {namespace}/{name} ({n_total} nodes)")
-    print(f"  -> run `saklas manifold discover {namespace}/{name}` to fit")
+    print(f"  -> run `saklas manifold fit {namespace}/{name}` to fit")
 
 
 def _split_manifold_ns_name(raw: str) -> tuple[str, str]:
@@ -1655,14 +1627,14 @@ def _split_manifold_ns_name(raw: str) -> tuple[str, str]:
     return "local", raw
 
 
-def _run_manifold_install(args: argparse.Namespace) -> None:
+def _run_pack_install(args: argparse.Namespace) -> None:
     from saklas.io.hf_manifolds import install_manifold
 
     dst = install_manifold(args.target, args.as_target, force=args.force)
     print(f"Installed {args.target} -> {dst}")
 
 
-def _run_manifold_search(args: argparse.Namespace) -> None:
+def _run_pack_search(args: argparse.Namespace) -> None:
     import json as _json
     from saklas.io.hf_manifolds import search_manifolds
 
@@ -1720,11 +1692,11 @@ def _run_manifold_merge(args: argparse.Namespace) -> None:
         sys.exit(1)
     print(f"Merged manifold written to {dst}")
     print(
-        f"  -> run `saklas manifold discover {target_ns}/{target_name}` to fit"
+        f"  -> run `saklas manifold fit {target_ns}/{target_name}` to fit"
     )
 
 
-def _run_manifold_push(args: argparse.Namespace) -> None:
+def _run_pack_push(args: argparse.Namespace) -> None:
     from saklas.io.hf import resolve_target_coord
     from saklas.io.hf_manifolds import push_manifold
     from saklas.io.paths import manifold_dir
@@ -1767,7 +1739,7 @@ def _run_manifold_push(args: argparse.Namespace) -> None:
         print(f"Pushed {coord} -> {repo_url}")
 
 
-def _run_manifold_rm(args: argparse.Namespace) -> None:
+def _run_pack_rm(args: argparse.Namespace) -> None:
     from saklas.io.manifolds import remove_manifold_folder
 
     ns, name = _resolve_manifold_ns_name(args.selector)
@@ -1793,7 +1765,7 @@ def _run_manifold_rm(args: argparse.Namespace) -> None:
     print(msg)
 
 
-def _run_manifold_clear(args: argparse.Namespace) -> None:
+def _run_pack_clear(args: argparse.Namespace) -> None:
     from saklas.io.manifolds import clear_manifold_tensors
 
     ns, name = _resolve_manifold_ns_name(args.selector)
@@ -1809,7 +1781,7 @@ def _run_manifold_clear(args: argparse.Namespace) -> None:
     print(f"Deleted {n} files")
 
 
-def _run_manifold_refresh(args: argparse.Namespace) -> None:
+def _run_pack_refresh(args: argparse.Namespace) -> None:
     from saklas.io.manifolds import refresh_manifold
 
     ns, name = _resolve_manifold_ns_name(args.selector)
@@ -1834,12 +1806,12 @@ def _run_manifold_refresh(args: argparse.Namespace) -> None:
 def _run_manifold_transfer(args: argparse.Namespace) -> None:
     """Cross-model manifold transfer via Procrustes.
 
-    Mirrors :func:`_run_transfer` (the vector path): resolve the manifold
-    folder, fit (or load) the per-layer Procrustes alignment between the
-    source and target models' cached neutral activations — the part that
-    needs both models loaded — then hand the prebuilt alignment dict to
-    :func:`saklas.io.manifolds.transfer_manifold`, which is pure-io and
-    only *applies* the map.
+    Resolve the manifold folder, fit (or load) the per-layer Procrustes
+    alignment between the source and target models' cached neutral activations
+    — the part that needs both models loaded — then hand the prebuilt alignment
+    dict to :func:`saklas.io.manifolds.transfer_manifold`, which is pure-io and
+    only *applies* the map.  Steering vectors transfer the same way (a vector is
+    the K=2 case of a flat ``pca`` manifold).
     """
     import json as _json
 
@@ -1937,13 +1909,12 @@ def _run_manifold_transfer(args: argparse.Namespace) -> None:
     )
 
 
-def _run_manifold_export(args: argparse.Namespace) -> None:
+def _run_pack_export(args: argparse.Namespace) -> None:
     """Export a fitted 2-node ``pca`` manifold to an interchange format (gguf).
 
     Folds the manifold down to a single steering direction
     (:func:`~saklas.core.vectors.folded_vector_directions`) and writes a
-    llama.cpp control-vector GGUF — the manifold-native successor to the old
-    ``pack export gguf``.
+    llama.cpp control-vector GGUF.
     """
     fmt = getattr(args, "format", None)
     if fmt != "gguf":
@@ -1966,9 +1937,25 @@ def _run_manifold_export(args: argparse.Namespace) -> None:
         print(f"Wrote {p}")
 
 
+# The eight steering-vector / manifold *compute* verbs (model-loading +
+# analysis).  ``manifold transfer`` keeps its own runner (it was already a
+# manifold verb); the rest are the renamed former ``subspace`` verbs plus the
+# discover→fit fold.
+_MANIFOLD_RUNNERS = {
+    "extract":  _run_manifold_extract,
+    "generate": _run_manifold_generate,
+    "fit":      _run_manifold_fit,
+    "bake":     _run_manifold_bake,
+    "merge":    _run_manifold_merge,
+    "transfer": _run_manifold_transfer,
+    "compare":  _run_manifold_compare,
+    "why":      _run_manifold_why,
+}
+
+
 @_saklas_error_exit
 def _run_manifold(args: argparse.Namespace) -> None:
-    """Dispatch ``saklas manifold <verb>``."""
+    """Dispatch ``saklas manifold <verb>`` (the compute verbs)."""
     cmd = getattr(args, "manifold_cmd", None)
     if cmd is None:
         print("usage: saklas manifold <verb> [...]")
@@ -1976,76 +1963,49 @@ def _run_manifold(args: argparse.Namespace) -> None:
         width = max(len(v) for v, _ in _MANIFOLD_VERBS)
         for v, desc in _MANIFOLD_VERBS:
             print(f"  {v:<{width}}  {desc}")
+        print()
+        print("Run `saklas manifold <verb> -h` for verb-specific options.")
         sys.exit(0)
-    if cmd == "fit":
-        _run_manifold_fit(args)
-        return
-    if cmd == "discover":
-        _run_manifold_discover(args)
-        return
-    if cmd == "generate":
-        _run_manifold_generate(args)
-        return
-    if cmd == "merge":
-        _run_manifold_merge(args)
-        return
-    if cmd == "install":
-        _run_manifold_install(args)
-        return
-    if cmd == "search":
-        _run_manifold_search(args)
-        return
-    if cmd == "push":
-        _run_manifold_push(args)
-        return
-    if cmd == "rm":
-        _run_manifold_rm(args)
-        return
-    if cmd == "clear":
-        _run_manifold_clear(args)
-        return
-    if cmd == "refresh":
-        _run_manifold_refresh(args)
-        return
-    if cmd == "transfer":
-        _run_manifold_transfer(args)
-        return
-    if cmd == "ls":
-        _run_manifold_ls(args)
-        return
-    if cmd == "show":
-        _run_manifold_show(args)
-        return
-    if cmd == "export":
-        _run_manifold_export(args)
-        return
-    print(f"unknown manifold verb {cmd!r}", file=sys.stderr)
-    sys.exit(2)
+    runner = _MANIFOLD_RUNNERS.get(cmd)
+    if runner is None:
+        print(f"unknown manifold verb {cmd!r}", file=sys.stderr)
+        sys.exit(2)
+    runner(args)
 
 
-_SUBSPACE_RUNNERS = {
-    "extract":  _run_extract,
-    "merge":    _run_merge,
-    "compare":  _run_compare,
-    "why":      _run_why,
-    "transfer": _run_transfer,
+# The nine manifold *lifecycle* verbs (pure-IO over ~/.saklas/manifolds/,
+# addressed by (namespace, name); install / share / inspect / remove).
+_PACK_RUNNERS = {
+    "ls":       _run_pack_ls,
+    "show":     _run_pack_show,
+    "install":  _run_pack_install,
+    "search":   _run_pack_search,
+    "push":     _run_pack_push,
+    "rm":       _run_pack_rm,
+    "clear":    _run_pack_clear,
+    "refresh":  _run_pack_refresh,
+    "export":   _run_pack_export,
 }
 
 
 @_saklas_error_exit
-def _run_subspace(args: argparse.Namespace) -> None:
-    """Dispatch ``saklas subspace <verb>`` (the flat-artifact / vector verbs)."""
-    cmd = getattr(args, "subspace_cmd", None)
+def _run_pack(args: argparse.Namespace) -> None:
+    """Dispatch ``saklas pack <verb>`` (the manifold lifecycle verbs)."""
+    cmd = getattr(args, "pack_cmd", None)
     if cmd is None:
-        print("usage: saklas subspace <verb> [...]")
+        print("usage: saklas pack <verb> [...]")
         print()
-        width = max(len(v) for v, _ in _SUBSPACE_VERBS)
-        for v, desc in _SUBSPACE_VERBS:
+        width = max(len(v) for v, _ in _PACK_VERBS)
+        for v, desc in _PACK_VERBS:
             print(f"  {v:<{width}}  {desc}")
         print()
-        print("Run `saklas subspace <verb> -h` for verb-specific options.")
+        print("Run `saklas pack <verb> -h` for verb-specific options.")
         sys.exit(0)
-    _SUBSPACE_RUNNERS[cmd](args)
+    runner = _PACK_RUNNERS.get(cmd)
+    if runner is None:
+        print(f"unknown pack verb {cmd!r}", file=sys.stderr)
+        sys.exit(2)
+    runner(args)
 
 
 @_saklas_error_exit
@@ -2362,8 +2322,8 @@ def _run_transcript_run(args: argparse.Namespace) -> None:
 _COMMAND_RUNNERS = {
     "tui":        _run_tui,
     "serve":      _run_serve,
-    "subspace":   _run_subspace,
     "manifold":   _run_manifold,
+    "pack":       _run_pack,
     "config":     _run_config,
     "experiment": _run_experiment,
 }

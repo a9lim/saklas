@@ -1,10 +1,11 @@
-"""4.0 — the six-verb root CLI.
+"""The six-verb root CLI.
 
-``subspace`` (flat / vector ops) and ``manifold`` (curved + flat manifold
-authoring) are the artifact verbs; the ``pack`` verb and the deprecated
-``vector`` alias are gone in 4.0 (the pack distribution surface collapsed into
-manifolds).  These tests exercise the parser shape + dispatch wiring, not the
-backends.
+``manifold`` is the steering-vector / manifold *compute* surface
+(extract/generate/fit/bake/merge/transfer/compare/why); ``pack`` is the
+manifold *lifecycle* surface (ls/show/install/search/push/rm/clear/refresh/
+export).  The former ``subspace`` verb and the deprecated ``vector`` alias are
+gone — the flat-artifact verbs folded into ``manifold``.  These tests exercise
+the parser shape + dispatch wiring, not the backends.
 """
 from __future__ import annotations
 
@@ -34,81 +35,87 @@ def _isolated_home(
 
 def test_six_top_level_verbs() -> None:
     assert set(_COMMAND_RUNNERS) == {
-        "tui", "serve", "subspace", "manifold", "config", "experiment",
+        "tui", "serve", "manifold", "pack", "config", "experiment",
     }
 
 
-def test_root_help_lists_subspace_and_manifold(
+def test_root_help_lists_manifold_and_pack(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     with pytest.raises(SystemExit):
         cli.parse_args(["--help"])
     out = capsys.readouterr().out
-    assert "subspace" in out
     assert "manifold" in out
+    assert "pack" in out
 
 
 # ---------------------------------------------------------------------------
-# subspace — the flat-artifact verbs parse on the top-level verb
+# manifold — the compute verbs (extract/bake/compare/why folded in)
 # ---------------------------------------------------------------------------
 
-def test_subspace_extract_parses() -> None:
-    args = cli.parse_args(["subspace", "extract", "happy", "sad"])
-    assert args.command == "subspace"
-    assert args.subspace_cmd == "extract"
+def test_manifold_extract_parses() -> None:
+    args = cli.parse_args(["manifold", "extract", "happy", "sad"])
+    assert args.command == "manifold"
+    assert args.manifold_cmd == "extract"
     assert args.concept == ["happy", "sad"]
 
 
-def test_subspace_compare_parses() -> None:
-    args = cli.parse_args(["subspace", "compare", "happy.sad", "-m", "m/x"])
-    assert args.command == "subspace"
-    assert args.subspace_cmd == "compare"
+def test_manifold_bake_parses() -> None:
+    args = cli.parse_args(["manifold", "bake", "bard", "0.3 a + 0.4 b"])
+    assert args.command == "manifold"
+    assert args.manifold_cmd == "bake"
+    assert args.name == "bard"
+    assert args.expression == "0.3 a + 0.4 b"
+
+
+def test_manifold_compare_parses() -> None:
+    args = cli.parse_args(["manifold", "compare", "happy.sad", "-m", "m/x"])
+    assert args.command == "manifold"
+    assert args.manifold_cmd == "compare"
     assert args.model == "m/x"
 
 
-def test_subspace_why_parses() -> None:
-    args = cli.parse_args(["subspace", "why", "happy.sad", "-m", "m/x"])
-    assert args.subspace_cmd == "why"
-
-
-def test_subspace_has_no_manifold_subverb() -> None:
-    # ``manifold`` is its own top-level verb now — not nested under subspace.
-    with pytest.raises(SystemExit):
-        cli.parse_args(["subspace", "manifold", "ls"])
-
-
-def test_bare_subspace_prints_help_exit_0(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    with pytest.raises(SystemExit) as exc:
-        cli.main(["subspace"])
-    assert exc.value.code == 0
-    out = capsys.readouterr().out
-    assert "saklas subspace <verb>" in out
-
-
-# ---------------------------------------------------------------------------
-# manifold — promoted to top-level, identical subparser shape
-# ---------------------------------------------------------------------------
-
-def test_manifold_ls_parses() -> None:
-    args = cli.parse_args(["manifold", "ls"])
-    assert args.command == "manifold"
-    assert args.manifold_cmd == "ls"
+def test_manifold_why_parses() -> None:
+    args = cli.parse_args(["manifold", "why", "happy.sad", "-m", "m/x"])
+    assert args.manifold_cmd == "why"
 
 
 def test_manifold_fit_parses() -> None:
     args = cli.parse_args(["manifold", "fit", "/tmp/folder", "-m", "m/x"])
     assert args.command == "manifold"
     assert args.manifold_cmd == "fit"
+    assert args.target == "/tmp/folder"
 
 
-def test_manifold_discover_flags_parse() -> None:
+def test_manifold_fit_discover_hyperparams_parse() -> None:
+    # discover folded into fit — the hyperparam flags ride the one verb.
     args = cli.parse_args([
-        "manifold", "discover", "mood", "--method", "spectral", "-m", "m/x",
+        "manifold", "fit", "mood", "--method", "spectral", "-m", "m/x",
     ])
-    assert args.manifold_cmd == "discover"
+    assert args.manifold_cmd == "fit"
     assert args.method == "spectral"
+    assert args.target == "mood"
+
+
+def test_manifold_transfer_parses() -> None:
+    args = cli.parse_args([
+        "manifold", "transfer", "circumplex",
+        "--from", "a/b", "--to", "c/d",
+    ])
+    assert args.manifold_cmd == "transfer"
+    assert args.name == "circumplex"
+
+
+def test_manifold_has_no_lifecycle_subverb() -> None:
+    # ``ls`` is a pack verb now — not nested under manifold.
+    with pytest.raises(SystemExit):
+        cli.parse_args(["manifold", "ls"])
+
+
+def test_manifold_has_no_discover_verb() -> None:
+    # discover folded into fit.
+    with pytest.raises(SystemExit):
+        cli.parse_args(["manifold", "discover", "mood"])
 
 
 def test_bare_manifold_prints_help_exit_0(
@@ -122,12 +129,46 @@ def test_bare_manifold_prints_help_exit_0(
 
 
 # ---------------------------------------------------------------------------
-# pack / vector — removed in 4.0
+# pack — the lifecycle verbs (moved off manifold)
 # ---------------------------------------------------------------------------
 
-def test_pack_verb_removed() -> None:
+def test_pack_ls_parses() -> None:
+    args = cli.parse_args(["pack", "ls"])
+    assert args.command == "pack"
+    assert args.pack_cmd == "ls"
+
+
+def test_pack_export_gguf_parses() -> None:
+    args = cli.parse_args(["pack", "export", "gguf", "happy.sad", "-m", "m/x"])
+    assert args.command == "pack"
+    assert args.pack_cmd == "export"
+    assert args.format == "gguf"
+    assert args.name == "happy.sad"
+
+
+def test_pack_has_no_compute_subverb() -> None:
+    # ``extract`` is a manifold verb now — not nested under pack.
     with pytest.raises(SystemExit):
-        cli.parse_args(["pack", "ls"])
+        cli.parse_args(["pack", "extract", "happy", "sad"])
+
+
+def test_bare_pack_prints_help_exit_0(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["pack"])
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    assert "saklas pack <verb>" in out
+
+
+# ---------------------------------------------------------------------------
+# subspace / vector — removed (subspace folded into manifold)
+# ---------------------------------------------------------------------------
+
+def test_subspace_verb_removed() -> None:
+    with pytest.raises(SystemExit):
+        cli.parse_args(["subspace", "extract", "happy", "sad"])
 
 
 def test_vector_alias_removed() -> None:

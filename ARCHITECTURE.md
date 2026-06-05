@@ -57,7 +57,7 @@ nearest-point foot-follower.
 There are four `fit_mode`s: `authored` (user gives domain + coords; curved),
 `pca` / `spectral` (discover — labeled corpora only, coords derived per-model;
 `pca` flat, `spectral` curved), and `baked` (corpus-less, a precomputed direction
-from `subspace merge`). The first three flow through the fit pipeline; `baked`
+from `manifold bake`). The first three flow through the fit pipeline; `baked`
 ships an already-fit tensor.
 
 ---
@@ -136,7 +136,7 @@ load (`io/manifolds.py` + the `packs.py` integrity helpers).
 The `manifold.json::fit_mode` discriminates the folder shape and the fit path:
 `authored` (curved, user coords) · `pca` (flat, derived coords) · `spectral`
 (curved, derived coords) · `baked` (corpus-less, a frozen direction from
-`subspace merge`).
+`manifold bake`).
 
 ---
 
@@ -148,7 +148,7 @@ same operation: pool per-node centroids, fit a per-layer subspace, bake the
 per-layer share, write the per-model tensor. A 2-node `pca` fit is a steering
 vector; an N-node fit is a manifold. The session wraps it: `extract` /
 `extract_vector_from_corpora` author a 2-node `pca` folder then fit;
-`extract_manifold` fits an authored/discover folder directly.
+`fit` fits an authored/discover folder directly.
 
 ### 3.1 Forward capture and pooling
 
@@ -200,7 +200,7 @@ is the folded view, not a separately stored tensor.
 
 `folded_vector_directions(manifold)` reverses the fold: `{L: δ̂_L · share_L}`, the
 baked-direction equivalent, used to back the `Profile`-returning surface
-(`extract()`, `subspace compare`/`why`, GGUF export) without a second stored
+(`extract()`, `manifold compare`/`why`, GGUF export) without a second stored
 representation. It raises on a curved or multi-dim manifold.
 
 ### 3.3 Basis selection (`_pca_basis`)
@@ -260,7 +260,7 @@ whitener bit-reproducible across the cache boundary.
 `from_neutral_activations` *excludes* any layer whose centered activations or
 regularized inverse come back non-finite, leaving it uncovered. So
 `covers_all(layers)` — the all-or-nothing coverage gate shared by extraction,
-manifold fit, projection, the monitor, transfer, and `subspace compare` — is
+manifold fit, projection, the monitor, transfer, and `manifold compare` — is
 trustworthy as "finite factors everywhere": either the whole probed/scored set is
 whitened, or the activation-space caller raises `WhitenerError`. There is no
 Euclidean fallback — Mahalanobis-only, because on real LMs the Euclidean metric is
@@ -395,7 +395,7 @@ The per-layer summands of the consensus are a free diagnostic: each layer's
 `tr(G_L) = Σ_k ‖x̃_k‖²_M` is the total whitened between-node spread at layer `L`,
 in background-σ² units (comparable across layers). The fit stamps these into the
 sidecar as `node_spread_per_layer` — the concept's whitened signal-by-layer
-profile, surfaced by `manifold show`. It is diagnostic only (nothing runtime
+profile, surfaced by `pack show`. It is diagnostic only (nothing runtime
 branches on it) and is computed for every K≥2 fit, authored included. It is the
 *full-space* sibling of the apply-time `mahalanobis_share` (§3.7), which is the
 same whitened spread restricted to the fitted steerable subspace; a layer where
@@ -774,7 +774,7 @@ reading yet) and for missing probes (no raise).
 ## 7. Grammar (`core/steering_expr.py`)
 
 `parse_expr(text) → Steering`; `format_expr` round-trips. Every input surface
-(Python, YAML, HTTP, TUI, `subspace merge`) speaks it.
+(Python, YAML, HTTP, TUI, `manifold bake`) speaks it.
 
 ```
 expr     := term (("+" | "-") term)*
@@ -828,7 +828,7 @@ untouched (subspace/authoring-coordinate space, invariant under the model-space
 map), re-bakes the Mahalanobis **share** in target space (same whitener
 requirement; no lever — it's gone), clears `origin` (per-layer foot of the
 *source* neutral), and writes the
-`_from-<safe_src>` variant. Since a vector is a 2-node `pca` manifold, `subspace
+`_from-<safe_src>` variant. Since a vector is a 2-node `pca` manifold, `manifold
 transfer` routes to this one transfer path. Alignments cache under the *target*
 model dir.
 
