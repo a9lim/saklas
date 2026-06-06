@@ -27,6 +27,7 @@ from saklas.core.manifold import (
     fit_rbf_smoothed,
     fit_sigma_field,
     _off_surface_var,
+    _off_surface_vars,
     _rbf_smoother_matrix,
     rbf_cardinal_weights,
     subspace_inject,
@@ -1001,6 +1002,26 @@ def test_off_surface_var_isolates_normal_directions():
     cov_norm = torch.diag(torch.tensor([0.0, 0.0, 2.0, 4.0]))
     # off-surface mean variance = (2 + 4) / (R − n) = 3.0
     assert abs(_off_surface_var(cov_norm, tangent, R, n) - 3.0) < 1e-5
+
+
+def test_off_surface_vars_matches_scalar_helper():
+    R, n = 4, 2
+    tangents = torch.zeros(3, R, n)
+    tangents[:, 0, 0] = 1.0
+    tangents[:, 1, 1] = 1.0
+    covs = torch.stack([
+        torch.diag(torch.tensor([1.0, 0.0, 2.0, 4.0])),
+        torch.diag(torch.tensor([0.0, 3.0, 0.5, 1.5])),
+        torch.diag(torch.tensor([2.0, 2.0, 0.0, 8.0])),
+    ])
+
+    batched = _off_surface_vars(covs, tangents, R, n)
+    scalar = torch.tensor([
+        _off_surface_var(covs[i], tangents[i], R, n)
+        for i in range(covs.shape[0])
+    ])
+
+    assert torch.allclose(batched, scalar, atol=1e-6)
 
 
 def test_fit_sigma_field_interpolates_node_thickness():

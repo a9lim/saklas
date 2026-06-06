@@ -3529,6 +3529,23 @@ def _reduced_tangent(
     return j_red @ domain.embed_jacobian(coord)  # (R, n)
 
 
+def _reduced_tangents(
+    sub: "LayerSubspace", domain: "ManifoldDomain", coords: torch.Tensor,
+) -> torch.Tensor:
+    """Batched reduced-space surface tangents ``(K, R, n)``.
+
+    Fit-time companion to :func:`_reduced_tangent`: every structured domain's
+    ``embed`` / ``embed_jacobian`` is batch-generic, and ``eval_rbf_jacobian`` is
+    vectorized, so the σ-field pass can compute all node tangent frames for a
+    layer in one tensor sweep instead of K small Python/RBF calls.
+    """
+    np_, rw, pc = sub.rbf_params()
+    coords_f = coords.to(torch.float32)
+    emb = sub._normalize(domain.embed(coords_f))                  # (K, m)
+    j_red = eval_rbf_jacobian(np_, rw, pc, emb) / sub.coord_scale  # (K, R, m)
+    return j_red @ domain.embed_jacobian(coords_f)                # (K, R, n)
+
+
 def _off_surface_var(
     cov: torch.Tensor, tangent: torch.Tensor, R: int, n: int,
 ) -> float:
@@ -3550,6 +3567,24 @@ def _off_surface_var(
     normal = torch.eye(R, dtype=cov.dtype) - proj               # onto normal complement
     var = torch.trace(normal @ cov) / float(R - n)
     return float(var.clamp(min=0.0))
+
+
+def _off_surface_vars(
+    covs: torch.Tensor, tangents: torch.Tensor, R: int, n: int,
+) -> torch.Tensor:
+    """Batched counterpart to :func:`_off_surface_var`.
+
+    ``covs`` is ``(K, R, R)`` and ``tangents`` is ``(K, R, n)``.  Returns one
+    non-negative off-surface variance per node, keeping the small pseudoinverse
+    solve batched on CPU during σ-field fitting.
+    """
+    if R <= n:
+        return torch.diagonal(covs, dim1=-2, dim2=-1).sum(dim=-1) / max(R, 1)
+    tt = tangents.transpose(-1, -2) @ tangents                  # (K, n, n)
+    proj = tangents @ torch.linalg.pinv(tt) @ tangents.transpose(-1, -2)
+    normal = torch.eye(R, dtype=covs.dtype, device=covs.device) - proj
+    var = torch.einsum("kij,kji->k", normal, covs) / float(R - n)
+    return var.clamp(min=0.0)
 
 
 def fit_sigma_field(
@@ -3579,16 +3614,16 @@ def fit_sigma_field(
     """
     K = int(node_coords.shape[0])
     n = int(domain.intrinsic_dim)
+    coords_f = node_coords.to(torch.float32)
     info: dict[int, dict[str, float]] = {}
     for idx, sub in layer_subs.items():
         R = sub.rank
-        raw = torch.empty(K, dtype=torch.float32)
-        for kidx in range(K):
-            cov = node_covs[kidx][idx].to(torch.float32)        # (R, R)
-            tangent = _reduced_tangent(
-                sub, domain, node_coords[kidx].to(torch.float32),
-            )                                                    # (R, n)
-            raw[kidx] = _off_surface_var(cov, tangent, R, n)
+        covs = torch.stack(
+            [node_covs[kidx][idx].to(torch.float32) for kidx in range(K)],
+            dim=0,
+        )                                                        # (K, R, R)
+        tangents = _reduced_tangents(sub, domain, coords_f)      # (K, R, n)
+        raw = _off_surface_vars(covs, tangents, R, n).to(torch.float32)
         floor = floor_frac * float(raw.median().clamp(min=1e-12))
         sigma = raw.clamp(min=floor).sqrt()                      # (K,) σ (std)
         log_sigma = torch.log(sigma).reshape(K, 1)               # (K, 1)
