@@ -22,6 +22,17 @@ _EMPTY_STATS = {"count": 0, "sum": 0.0, "sum_sq": 0.0,
 # override available on ``Monitor.add_probe``.
 DEFAULT_NEAREST_TOP_N: int = 3
 
+# Synthetic label for the neutral anchor in the nearest-node readout.  Every
+# fit is neutral-anchored (the per-model neutral mean is the frame origin), so
+# neutral is a *point* in the same whitened metric the nodes live in — not a
+# stored corpus node.  It competes in the ``nearest`` ranking as a virtual
+# candidate (computed, never written to ``node_labels`` / ``node_coords``): when
+# the running activation sits closer to the origin than to any node, ``nearest``
+# reports ``("neutral", dist)`` and ``flat_scalars`` exposes the uniform
+# ``<probe>@neutral`` gate channel.  Suppressed when a manifold already carries a
+# real node with this label (the corpus node owns the name).
+NEUTRAL_LABEL: str = "neutral"
+
 # Floor for the EV weight on a manifold layer with degenerate fit
 # quality — keeps the EV-weighted aggregation from collapsing to NaN
 # on a manifold whose every layer reports EV ≈ 0.  Matches the
@@ -302,6 +313,8 @@ class Monitor:
             w_shared = {idx: ev.get(idx, 0.0) / total_w for idx in shared}
 
         K = probe.node_values_reduced[shared[0]].shape[0]
+        inject_neutral = probe.inject_neutral
+        Kc = K + (1 if inject_neutral else 0)   # candidate count incl. neutral
         n_dim = manifold.domain.intrinsic_dim
         dist_acc_t: torch.Tensor | None = None
         # Per-layer terms + running EV-weighted means are accumulated as
@@ -326,11 +339,20 @@ class Monitor:
             h = hidden_per_layer[layer_idx].to(torch.float32)
             if h.ndim > 1:
                 h = h.reshape(-1, h.shape[-1])[-1]
+            wh = probe.whitened[layer_idx]
             frac_t, cdist_query, invert_query, cdist_nodes = _layer_geometry(
                 probe, layer_idx, h,
             )
             w = w_shared[layer_idx]
 
+            # Neutral competes as a virtual candidate appended after the K real
+            # nodes (index ``K``): its whitened coord is ``wh.neutral_white``
+            # (0 for an affine fit, the baked origin for a curved one), so the
+            # same cdist yields its distance with no special-casing downstream.
+            if inject_neutral:
+                cdist_nodes = torch.cat(
+                    [cdist_nodes, wh.neutral_white.reshape(1, -1)], dim=0,
+                )
             dists = torch.linalg.vector_norm(
                 cdist_nodes - cdist_query.reshape(1, -1), dim=-1,
             )
@@ -343,7 +365,6 @@ class Monitor:
 
             if is_affine:
                 # Affine map: coords are exact, no off-subspace residual.
-                wh = probe.whitened[layer_idx]
                 pos_t = (
                     wh.coord_S @ invert_query + wh.coord_b
                     if wh.coord_S is not None and wh.coord_b is not None
@@ -396,8 +417,8 @@ class Monitor:
             )
 
         requested_top_n = int(probe.top_n)
-        top_n = requested_top_n if requested_top_n >= 0 else K + requested_top_n
-        top_n = min(max(top_n, 0), K)
+        top_n = requested_top_n if requested_top_n >= 0 else Kc + requested_top_n
+        top_n = min(max(top_n, 0), Kc)
         nearest_dist_t: torch.Tensor | None = None
         nearest_idx_t: torch.Tensor | None = None
         if top_n and dist_acc_t is not None:
@@ -441,16 +462,25 @@ class Monitor:
             layer_order[i]: tuple(coord_layer_vals[i * n_dim:(i + 1) * n_dim])
             for i in range(L)
         }
+        def _label(idx: int) -> str:
+            # Index ``K`` is the synthetic neutral candidate (when injected);
+            # everything below indexes a real corpus node.
+            return (
+                NEUTRAL_LABEL
+                if inject_neutral and idx == K
+                else manifold.node_labels[idx]
+            )
+
         if nearest_dist_t is not None:
             tn = int(nearest_dist_t.numel())
             nd_vals = flat[o:o + tn]; o += tn
             ni_vals = flat[o:o + tn]; o += tn
             nearest = [
-                (manifold.node_labels[int(round(ni_vals[j]))], nd_vals[j])
+                (_label(int(round(ni_vals[j]))), nd_vals[j])
                 for j in range(tn)
             ]
         elif top_n:
-            nearest = [(manifold.node_labels[k], 0.0) for k in range(top_n)]
+            nearest = [(_label(k), 0.0) for k in range(top_n)]
         else:
             nearest = []
 
@@ -561,30 +591,44 @@ class Monitor:
         K_list = [
             int(self._probes[n].manifold.node_coords.shape[0]) for n in flat_names
         ]
+        # Neutral competes as a virtual candidate at column ``K`` per injecting
+        # probe.  A flat fit is neutral-anchored (origin = reduced 0), and
+        # ``node_pad`` is zero-initialized, so the reserved column already holds
+        # ``neutral_white`` — its distance falls out of the existing padded norm
+        # as ``‖cq‖`` with no hot-loop change.  ``Kc_list`` is the candidate
+        # count (nodes + neutral) per probe.
+        inj_list = [bool(self._probes[n].inject_neutral) for n in flat_names]
+        Kc_list = [K + (1 if inj else 0) for K, inj in zip(K_list, inj_list, strict=True)]
         top_n_list: list[int] = []
-        for n, K in zip(flat_names, K_list, strict=True):
+        for n, Kc in zip(flat_names, Kc_list, strict=True):
             req = int(self._probes[n].top_n)
-            tn = req if req >= 0 else K + req
-            top_n_list.append(min(max(tn, 0), K))
+            tn = req if req >= 0 else Kc + req
+            top_n_list.append(min(max(tn, 0), Kc))
         nd_off: list[tuple[int, int]] = []
         off = 0
         for nd in nd_list:
             nd_off.append((off, nd)); off += nd
         nd_total = off
-        Kmax = max(K_list)
+        Kmax = max(Kc_list)
         Rmax = max(
             int(sub.basis.shape[0])
             for n in flat_names
             for sub in self._probes[n].whitened.values()
         )
         valid_mask = torch.zeros((P, Kmax), dtype=torch.bool, device=device)
-        for ci, K in enumerate(K_list):
-            valid_mask[ci, :K] = True
+        for ci, Kc in enumerate(Kc_list):
+            valid_mask[ci, :Kc] = True
+        labels: list[list[str]] = []
+        for n, inj in zip(flat_names, inj_list, strict=True):
+            row = list(self._probes[n].manifold.node_labels)
+            if inj:
+                row.append(NEUTRAL_LABEL)   # index K → neutral
+            labels.append(row)
         nd_counts = torch.tensor(nd_list, device=device, dtype=torch.long)
         self._flat_global = {
             "P": P, "nd_list": nd_list, "nd_off": nd_off, "nd_total": nd_total,
             "K_list": K_list, "top_n_list": top_n_list,
-            "labels": [list(self._probes[n].manifold.node_labels) for n in flat_names],
+            "labels": labels,
             "Kmax": Kmax, "Rmax": Rmax,
             "valid_mask": valid_mask, "nd_counts": nd_counts,
         }
@@ -1279,6 +1323,11 @@ class AttachedManifoldProbe:
     manifold: "Manifold"
     top_n: int = DEFAULT_NEAREST_TOP_N
     is_affine: bool = True
+    # Whether the neutral anchor competes as a virtual candidate in this
+    # probe's ``nearest`` ranking (see :data:`NEUTRAL_LABEL`).  Set at attach to
+    # ``NEUTRAL_LABEL not in manifold.node_labels`` so a real node named
+    # ``neutral`` keeps sole ownership of the label.
+    inject_neutral: bool = True
     # Per-layer cache, indexed by layer index — same set of layers as
     # ``manifold.layers``.
     node_values_reduced: dict[int, torch.Tensor] = field(default_factory=dict)
@@ -1312,6 +1361,13 @@ class _LayerWhiten:
     m_r_inv: torch.Tensor      # (R, R) = (B Σ⁻¹ Bᵀ)⁻¹
     chol: torch.Tensor         # (R, R) lower-tri, M_R = chol @ cholᵀ
     node_white: torch.Tensor   # (K, R) = node_values_reduced @ chol
+    # Neutral anchor in the same whitened metric as ``node_white`` (R,).  For a
+    # neutral-anchored affine fit the frame origin *is* neutral, so this is the
+    # zero vector; a curved fit centers on the PCA-frame mean, so it is the baked
+    # per-layer ``origin`` (the authoring-coord foot of the neutral mean) mapped
+    # through ``eval_at`` → basis → ``chol``.  The neutral candidate's distance
+    # is then ``‖cdist_query − neutral_white‖``, identical machinery to a node.
+    neutral_white: torch.Tensor  # (R,)
     mean: torch.Tensor         # (D,) fit mean on the scoring device
     basis: torch.Tensor        # (R, D) basis on the scoring device
     X: torch.Tensor            # (N, D) centered neutral observations
@@ -1474,10 +1530,34 @@ def _build_whitened_factors(
             coord_S, coord_b = _affine_coord_map(
                 sub, manifold, m_r_inv_dev, X, K_inv, lam,
             )
+        # Neutral anchor in the whitened metric.  Affine: the frame is
+        # neutral-anchored, so neutral is reduced coord 0.  Curved: map the
+        # baked per-layer ``origin`` (authoring-coord foot of the neutral mean)
+        # through the same eval_at → basis → chol pipeline as a node.  A curved
+        # fit without a stored origin falls back to the subspace mean (0).
+        if sub.is_affine:
+            neutral_white = torch.zeros(R, device=dev, dtype=torch.float32)
+        else:
+            o = manifold.origin.get(layer_idx)
+            if o is None:
+                neutral_white = torch.zeros(R, device=dev, dtype=torch.float32)
+            else:
+                o_dom = o.to(device=dev, dtype=torch.float32).reshape(1, -1)
+                emb = manifold.domain.embed(
+                    manifold.domain.clamp_position(o_dom)
+                ).to(device=dev, dtype=torch.float32)
+                v_centered = sub.eval_at(emb) - sub.mean.to(
+                    device=dev, dtype=torch.float32,
+                )
+                v_red = v_centered @ sub.basis.to(
+                    device=dev, dtype=torch.float32,
+                ).T                                  # (1, R)
+                neutral_white = (v_red @ chol_dev).reshape(-1)
         out[layer_idx] = _LayerWhiten(
             m_r_inv=m_r_inv_dev,
             chol=chol_dev,
             node_white=(v_reduced.to(torch.float32) @ chol_dev),
+            neutral_white=neutral_white,
             mean=sub.mean.to(device=dev, dtype=torch.float32),
             basis=sub.basis.to(device=dev, dtype=torch.float32),
             X=X, K_inv=K_inv, lam=lam,
@@ -1552,6 +1632,7 @@ def _attach_manifold_probe(
         manifold=manifold,
         top_n=int(top_n),
         is_affine=_probe_is_affine_for_manifold(manifold),
+        inject_neutral=NEUTRAL_LABEL not in manifold.node_labels,
         node_values_reduced=node_values_reduced,
         ev_weights=ev_weights,
     )

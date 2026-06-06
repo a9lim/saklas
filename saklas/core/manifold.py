@@ -1622,9 +1622,13 @@ def synthesize_subspace(
       — each fragment's own ``(R_i,) @ (R_i, D) = (D,)`` world vector, scaled by
       its coeff.  ``target = B @ Δ`` is its coordinate in the merged basis.
       Because ``Δ`` lives in the push span and the ablation-only axes are its
-      orthogonal complement, those axes get ``target ≈ 0`` for free — sliding
-      the foot toward ``target`` pushes the concepts *and* collapses the ablated
-      directions in one op.
+      orthogonal complement, those axes get ``target ≈ 0``.
+    - Per-axis collapse mask ``kappa`` ``(R,)`` — ``0`` on the push span, ``1`` on
+      the ablation-only complement (``κ = 1 − ‖proj onto push span‖²``).  The
+      kernel *translates* push axes by the fixed offset but *collapses* ``κ=1``
+      axes toward 0 (``p_new = q + a·(target − κ·q)``): post translate-not-
+      collapse a ``target ≈ 0`` alone no longer removes an ablated direction (a
+      pure translate by 0 is a no-op), so ``κ`` is what carries the ablation.
     - ``share = ‖Δ‖`` (the world displacement magnitude); a pure-ablation layer
       weights by the summed ablation-row magnitude instead.
 

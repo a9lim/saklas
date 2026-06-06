@@ -228,10 +228,12 @@ ablate, neutral_means)` composes the active steering term set into one
 `SynthesizedSubspace` per layer (orthonormal merged basis via `_ortho_basis`,
 push-before-ablation ordering; `target_coord = B @ Σ coeffᵢ·poleᵢ`; `share =
 ‖Δ‖`). `subspace_inject(h, subspace, domain, target_coord, foot_seed, along,
-onto)` is **the** injection: affine analytic shortcut (foot = q, geodesic slide,
-`H_o` kept) vs curved per-token GN foot-follow (along transports `H_n` normal at
-the new foot, onto scales it `(1−o)`, `H_o` kept). `norm_cap = 3·‖h‖` is the only
-norm guard. `invert_parameterization` is the cold/eval-only damped-LM nearest-
+onto)` is **the** injection: affine analytic shortcut (foot = q, translate by the
+fixed `a·target` offset with per-axis κ collapsing ablation axes — `p_new = q +
+a·(target − κ·q)` — `H_o` kept) vs curved per-token GN foot-follow (along
+translates the foot and transports `H_n` normal at the new foot, onto scales it
+`(1−o)`, `H_o` kept). `synthesize_subspace` emits the κ mask (0 push / 1 ablate).
+`norm_cap = 3·‖h‖` is the only norm guard. `invert_parameterization` is the cold/eval-only damped-LM nearest-
 point projection.
 
 `save_manifold`/`load_manifold` round-trip the per-model tensor (`layer_<L>.{mean,
@@ -270,10 +272,15 @@ normalized — `_manifold_layer_shares` prefers the baked `mahalanobis_share`, e
 the Euclidean `‖eval_rbf(node_params)‖_F`), orthogonalizes the affine subspace
 against curved spans (`_orthogonalize_affine_against` — curved wins shared
 directions), and enforces `_CURVED_ORTHO_TOL = 1e-3` between two curved manifolds
-(`OverlappingManifoldError`). Gain: `_MANIFOLD_GAIN = 1.0`, `eff_along_L = share_L
-· base` (affine: α already in `target_coord`; curved: × clamped user `along`).
-**No lever / N, no `[0,1]` clamp / water-fill on `along`** (a high-share layer is
-meant to overshoot; `norm_cap` bounds it). `onto` stays clamped `[0,1]`.
+(`OverlappingManifoldError`). Gain: two constants — `_MANIFOLD_ALONG_GAIN = 0.125`
+scales `along` (the translate slide, both modes), `_MANIFOLD_GAIN = 1.0` scales
+`onto` only. `eff_along_L = share_L · _MANIFOLD_ALONG_GAIN` (affine: α already in
+`target_coord`; curved: × clamped user `along`); `eff_onto_L = clamp(onto ·
+share_L · _MANIFOLD_GAIN, 0, 1)`. **No lever / N, no `[0,1]` clamp / water-fill on
+`along`** (a high-share layer is meant to overshoot; `norm_cap` bounds it). `onto`
+stays clamped `[0,1]`. (`_MANIFOLD_ALONG_GAIN` runs ~10× below the old
+lerp-onto-target gain — the translate offset compounds across layers; tagged a
+prototype.)
 `reset_manifold_feet` cold-starts followers per generation.
 
 `HiddenCapture` — `attach`/`detach`/`stacked`/`latest_per_layer`. Three modes,
@@ -330,6 +337,18 @@ From there:
   nearest-point foot solve (run **per token** now — the accepted live cost) plus a
   real normalized off-surface `residual`.
 
+The **neutral anchor competes in `nearest`** as a virtual candidate (`NEUTRAL_LABEL`)
+— every fit is neutral-anchored, so neutral is a point in the same whitened metric
+as the nodes (`_LayerWhiten.neutral_white`: the zero vector for an affine fit, the
+baked per-layer `origin` mapped through `eval_at → basis → chol` for a curved one),
+never a stored node. The per-probe path appends it as the `K`-th row of the cdist;
+the batched flat path gets it for free (the zero `node_pad` column already holds the
+affine neutral, so its distance falls out as `‖cq‖` — one reserved valid column, no
+hot-loop change). When the activation sits closer to the origin than to any node,
+`nearest` reports `("neutral", dist)`. `_attach_manifold_probe` sets
+`inject_neutral = NEUTRAL_LABEL not in node_labels`, so a real node named `neutral`
+keeps sole ownership of the label.
+
 `score_aggregate` (end-of-gen) pools the last non-special token per layer and calls
 the *same* `_score_probe_full`, so the aggregate at a token index is bit-identical
 to the live read at that token. `add_probe(name, manifold, *, top_n)` /
@@ -343,9 +362,11 @@ vestigial on the hot path — the readout centers on each fit's own
 
 `flat_scalars` (one staticmethod) writes the gate channels from a readings dict:
 `"<name>"` (= coords axis 0) + `"<name>[i]"` per axis, `"<name>:fraction"`,
-`"<name>@<label>": −distance` per nearest node. Every probe — flat and curved — now
-carries coords *and* nearest, so flat probes expose `@label` similarity gates too
-(`@when:personas@hacker`) and the gate grammar is uniform. Entry points:
+`"<name>@<label>": −distance` per nearest node (including the reserved
+`"<name>@neutral"` when the neutral anchor wins a top-N slot). Every probe — flat
+and curved — now carries coords *and* nearest, so flat probes expose `@label`
+similarity gates too (`@when:personas@hacker`, `@when:personas@neutral`) and the
+gate grammar is uniform. Entry points:
 `score_per_token` (primary — returns `(aggregate readings, per-token axis-0 coord
 stream)`), `score_single_token{,_per_layer}` (`_per_layer` is a view over the
 reading's `coords_per_layer` backing the loom heatmap), `measure_from_hidden`,

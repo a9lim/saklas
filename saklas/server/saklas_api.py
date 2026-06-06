@@ -460,8 +460,15 @@ def _probe_profile_tensors(
     manifold = session._monitor.manifolds.get(name)
     if manifold is None:
         return None
-    from saklas.core.vectors import folded_vector_directions
+    from saklas.core.vectors import (
+        folded_vector_directions,
+        is_foldable_vector_manifold,
+    )
 
+    # A multi-node / curved probe has no single baked direction to fold —
+    # the diagnostics histogram only means anything for an R=1 vector.
+    if not is_foldable_vector_manifold(manifold):
+        return None
     return folded_vector_directions(manifold)
 
 

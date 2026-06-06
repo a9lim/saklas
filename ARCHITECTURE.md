@@ -515,12 +515,18 @@ any term touches):
 
 1. Flatten every present push fragment's basis rows, then every ablation
    fragment's rows, into one ordered list (push first); orthonormalize the union
-   (`_ortho_basis`) → the merged `(R, D)` basis `B`. Ordering is load-bearing:
-   push-before-ablation keeps the push displacement inside the earlier rows, so
-   the ablation-only axes (the orthogonal complement) get a target ≈ 0 for free.
+   (`_ortho_basis`) → the merged `(R, D)` basis `B`.
 2. World push displacement `Δ = Σ_push coeffᵢ·(coord_targetᵢ @ basis_rowsᵢ)`;
-   `target_coord = B @ Δ` is its coordinate in the merged basis.
-3. `share = ‖Δ‖` (a pure-ablation layer weights by the summed ablation-row
+   `target_coord = B @ Δ` is its coordinate in the merged basis. `Δ` lives in the
+   push span, so the ablation-only axes (its orthogonal complement) carry
+   `target ≈ 0`.
+3. Per-axis collapse mask `κ` (R,): `0` on the push span, `1` on the
+   ablation-only complement, derived as `κ = 1 − ‖proj onto push span‖²` (robust
+   to orthonormalization order). The kernel *translates* push axes by the fixed
+   offset but *collapses* `κ=1` axes toward 0 — a `target ≈ 0` alone no longer
+   removes an ablated direction (translate-by-offset would leave it untouched), so
+   κ is what does the ablation post translate-not-collapse.
+4. `share = ‖Δ‖` (a pure-ablation layer weights by the summed ablation-row
    magnitude instead).
 
 Because `B` is orthonormal, `‖target_coord‖ = ‖Δ‖`, so the per-layer budget
@@ -561,12 +567,18 @@ operates only inside its own span.
 where `h_par` is the in-subspace component and `h_perp = H_o` the off-subspace
 residual, then applies two operations:
 
-- **along (`a ∈ ℝ`)** — slide the projected foot from its current position toward
-  `target_coord`, geodesically in authoring-coord space (`domain.geodesic`), and
-  transport the off-*manifold*-in-subspace residual `H_n` to stay normal at the
-  new foot (project onto the new tangent's normal space, renorm to the preserved
-  `‖H_n‖`). Tangential/directional. This replaces an additive chord — by sliding
-  *on the surface* it never cuts through off-manifold low-density space.
+- **along (`a ∈ ℝ`)** — **translate** the projected foot by the fixed
+  neutral→target offset scaled by `a` (`domain.translate_foot`), *not* a lerp onto
+  the absolute target. Every token's foot shifts by the same displacement, which
+  preserves the per-token in-subspace spread and keeps strong steer coherent —
+  collapsing each foot onto the absolute target instead erases that spread and
+  degenerates into looping (the kernel ablation that motivated the
+  translate-not-collapse change). It then transports the
+  off-*manifold*-in-subspace residual `H_n` to stay normal at the new foot
+  (project onto the new tangent's normal space, renorm to the preserved `‖H_n‖`).
+  Tangential/directional; by moving *on the surface* it never cuts through
+  off-manifold low-density space. A per-axis collapse mask `κ` (§4) overrides this
+  for ablation axes (`κ=1`): those collapse toward 0 instead of translating.
 - **onto (`o ∈ [0,1]`)** — scale `H_n` by `(1 − o)`: collapse the off-surface
   in-subspace residual onto the surface. Vacuous when the surface fills its
   subspace.
@@ -587,9 +599,12 @@ scaling the transported residual). A soft cap `‖h_new‖ ≤ norm_cap·‖h‖
 **Flat (affine) shortcut.** When `subspace.is_affine` the surface fills the
 subspace: reduced coords *are* authoring coords (identity), the foot is `q`
 exactly, `H_n ≡ 0`, and `onto` is vacuous. So the kernel skips the Gauss-Newton
-foot solve, the RBF eval, and the tangent Gram-solve — it slides `q` toward
-`target` (linear, since the synthesized domain is `CustomDomain`) and keeps `H_o`
-verbatim. This is load-bearing for throughput: a folded vector is the common
+foot solve, the RBF eval, and the tangent Gram-solve — it computes
+`p_new = q + a·(target − κ·q)` and keeps `H_o` verbatim. The per-axis κ from
+`synthesize_subspace` selects per axis: `κ=0` push axes translate by the fixed
+`a·target` offset (preserving per-token spread), `κ=1` ablation axes do
+`q + a·(0 − q)` (collapse the component toward 0), so push and ablation share one
+analytic op. This is load-bearing for throughput: a folded vector is the common
 case and the curved per-token solve would blow the throughput invariant.
 
 **Curved foot-following.** The nearest-point foot on the surface is a function of
@@ -635,29 +650,35 @@ sum 1 (`_manifold_layer_shares` prefers the baked `mahalanobis_share`, else the
 Euclidean `‖eval_rbf(node_params)‖_F`), then:
 
 - **Merged affine subspace** (`add_subspace`): `eff_along_L = share_L ·
-  _MANIFOLD_GAIN`, `onto = 0`. The coefficient α is already folded into
+  _MANIFOLD_ALONG_GAIN`, `onto = 0`. The coefficient α is already folded into
   `target_coord` by `synthesize_subspace` (`Δ = Σ coeffᵢ·poleᵢ`, required for
-  multi-term composition), so α scales *where* the slide lands and `share_L·base`
-  scales *how far* the slide goes. α is unclamped (it sets a target position).
-- **Curved manifold** (`add_manifold`): `eff_along_L = along · share_L · base`,
-  `eff_onto_L = clamp(onto · share_L · base, 0, 1)`; the target is the full node
-  position, so `along` is the slide fraction (the historic `%` knob), clamped to
-  `[0,1]` at apply time. `onto` stays a `[0,1]` collapse fraction.
+  multi-term composition), so α scales the *size* of the translate offset and
+  `share_L·base` scales the per-layer slide fraction. α is unclamped (it sets the
+  offset magnitude).
+- **Curved manifold** (`add_manifold`): `eff_along_L = along · share_L ·
+  _MANIFOLD_ALONG_GAIN`, `eff_onto_L = clamp(onto · share_L · _MANIFOLD_GAIN, 0,
+  1)`; the target is the full node position, so `along` is the slide fraction (the
+  historic `%` knob), clamped to `[0,1]` at apply time. `onto` stays a `[0,1]`
+  collapse fraction.
 
-`_MANIFOLD_GAIN = 1.0` — one gain constant for both modes. There is **no `[0,1]`
-clamp and no water-fill on `along`**: with mean-1 share a typical layer already
-sits at `eff_along ≈ base`, so a clamp would saturate nearly every layer and
-erase the share distribution. High-signal layers are allowed to overshoot the
-target; the de-rogued whitened coords keep the overshoot controlled, and the
-kernel's `norm_cap = 3·‖h‖` is the only backstop. `onto` keeps its clamp (a
-collapse fraction past 1 inverts the residual).
+**Two gain constants.** `_MANIFOLD_ALONG_GAIN = 0.125` scales **along** (the
+translate slide) in both modes; `_MANIFOLD_GAIN = 1.0` now scales **onto** only
+(the off-surface collapse share-weight, curved-only). The split is the
+translate-not-collapse consequence: a fixed-offset translate is *unbounded* where
+the old lerp-onto-target saturated (the offset compounds across layers rather than
+landing on the target), so the slide gain runs ~an order of magnitude below the
+old collapse gain. `_MANIFOLD_ALONG_GAIN` is calibrated on the gemma-4-12b caveman
+sweep — coherent window ~0.06–0.10 (probe `frac` ≈ 0.20–0.26), loop degeneration
+past ~0.14; `0.125` puts the recommended `≈0.5 <concept>` at the sweet spot and
+lets `1.0 <concept>` push into somewhat-over-steered strong expression. It is
+committed but tagged a prototype in the source.
 
-Geometrically `eff_along` is the geodesic-lerp fraction of the in-subspace
-component toward the target, so `base ≈ 1.0` means a *typical layer fully
-replaces* its in-subspace component with the target. α clamps to `[0,1]` so `base`
-is the strength ceiling. Per-persona strength variance persists — a hard persona
-peaks near its coherence edge at α ≈ 1 where a robust one still has room; tune α
-per target.
+There is **no `[0,1]` clamp and no water-fill on `along`**: a high-signal layer is
+*meant* to overshoot, the de-rogued whitened coords keep the overshoot controlled,
+and the kernel's `norm_cap = 3·‖h‖` is the only backstop. `onto` keeps its clamp
+(a collapse fraction past 1 inverts the residual). Per-persona strength variance
+persists — a hard persona peaks near its coherence edge where a robust one still
+has room; tune α per target.
 
 ### 5.4 Worked dispatch trace (a folded vector)
 
@@ -669,11 +690,12 @@ per target.
    `basis = δ̂_L`, `node_coords = [[‖d_L‖]]`, `share = ‖d_L‖_M`.
 3. `_affine_manifold_push` → push fragment `(δ̂_L rows, [‖d_L‖] coord, coeff 0.3)`.
 4. `synthesize_subspace`: `B = δ̂_L`, `Δ_L = 0.3·‖d_L‖·δ̂_L`,
-   `target_coord = [0.3·‖d_L‖]`, `share = 0.3·‖d_L‖`.
+   `target_coord = [0.3·‖d_L‖]`, `share = 0.3·‖d_L‖`, `κ = [0]` (pure push).
 5. `add_subspace` → `apply_to_model`: `share_L` normalized to mean 1,
-   `eff_along_L = share_L · 1.0`.
+   `eff_along_L = share_L · 0.125`.
 6. Per token, `subspace_inject` (affine shortcut): foot `q = (h − mean)·δ̂`,
-   slide `q ← q + eff_along·(target − q)`, write `h ← mean + (slid q)·δ̂ + H_o`.
+   translate `q ← q + eff_along·(target − κ·q) = q + eff_along·target` (κ=0),
+   write `h ← mean + (translated q)·δ̂ + H_o`.
 
 ### 5.5 Why mean-1 share and no lever
 
@@ -884,11 +906,15 @@ straight-chord additive baseline alongside.
   fix is about how steering *accesses* the subdominant identity directions (sphere
   the between-persona covariance at fit time; strip the shared axis from the
   target), not the metric.
-- **`base_gain` magnitude.** `_MANIFOLD_GAIN = 1.0` is committed but provisional
-  and coupled to the personas frontier: the coherence cliff is `eff_along → 1.0`
-  (full in-subspace replacement), so a strong-but-safe constant for rank-8 fits
-  sits *below* 1.0. The rank-1 vector path likely tolerates more. One constant,
-  no per-fit knob.
+- **`base_gain` magnitude.** Steering now uses **two** constants:
+  `_MANIFOLD_ALONG_GAIN = 0.125` (the translate slide, both modes) and
+  `_MANIFOLD_GAIN = 1.0` (onto / off-surface collapse only). Both are committed but
+  provisional — `_MANIFOLD_ALONG_GAIN` is tagged a prototype, calibrated on the
+  gemma-4-12b caveman sweep (coherent window ~0.06–0.10, loop degeneration past
+  ~0.14). The translate offset compounds across layers rather than landing on the
+  target, so the coherent gain sits ~10× below the old lerp-onto-target collapse
+  gain. Still one global per-op constant, no per-fit knob; per-persona strength
+  variance is handled by α, not a per-target gain.
 - **Discover-coord transfer.** Cross-model Procrustes for discover *coordinates*
   is deferred (a Gemma layout and a Qwen layout aren't comparable without it);
   `transfer_manifold` maps the per-layer subspaces but leaves the per-model

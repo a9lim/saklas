@@ -1159,3 +1159,95 @@ class TestPairwiseMetric:
         session.whitener = None
         r = client.get("/saklas/v1/sessions/default/vectors/pairwise?a=x&b=y")
         assert r.status_code == 409
+
+
+class TestAnalyticsMultiNodeProbe:
+    """A multi-node / curved probe (the ``personas`` rank-R fan) has no single
+    steering direction, so the direction-cosine analytics must *exclude* it —
+    not 500 on ``folded_vector_directions`` (regression: a rank-8 probe attached
+    while the web UI polled ``/correlation`` aborted the request)."""
+
+    def _wire(self, session_and_client: Any) -> tuple[Any, TestClient]:
+        import threading
+
+        import torch
+
+        from saklas.core.mahalanobis import LayerWhitener
+        from saklas.core.manifold import (
+            CustomDomain, LayerSubspace, Manifold,
+        )
+        from saklas.core.session import SaklasSession
+        from saklas.core.vectors import fold_directions_to_subspace
+
+        session, client = session_and_client
+        torch.manual_seed(3)
+
+        # One registered steering vector + one foldable (R=1) vector probe +
+        # one rank-3 multi-node probe (the shape that used to crash), all over
+        # layers {0, 1} in dim 4.
+        vx = {0: torch.randn(4), 1: torch.randn(4)}
+        vp = fold_directions_to_subspace(
+            "vp", {0: torch.randn(4), 1: torch.randn(4)}, None,
+        )
+        K, R, D = 4, 3, 4
+        basis, _ = torch.linalg.qr(torch.randn(D, R))
+        basis = basis.T.contiguous()
+        fan = Manifold(
+            name="fan",
+            domain=CustomDomain(R),
+            node_labels=[f"n{i}" for i in range(K)],
+            node_coords=torch.randn(K, R),
+            layers={
+                L: LayerSubspace.affine(
+                    torch.zeros(D), basis, node_coords=torch.randn(K, R),
+                )
+                for L in (0, 1)
+            },
+        )
+
+        session._profiles = {"vx": vx}
+        session._monitor.probe_names = ["vp", "fan"]
+        session._monitor.manifolds = {"vp": vp, "fan": fan}
+        session._gen_lock = threading.Lock()
+        session._analytics_cpu_cache = {}
+        # Bind the real analytics methods onto the mock so the endpoint
+        # exercises the production fold path, not a vacuous MagicMock.
+        session.analytics_names = lambda: SaklasSession.analytics_names(session)
+        session._live_direction_tensors = (
+            lambda n: SaklasSession._live_direction_tensors(session, n)
+        )
+        session.analytics_profile = (
+            lambda n: SaklasSession.analytics_profile(session, n)
+        )
+
+        g = torch.Generator().manual_seed(11)
+        acts = {L: torch.randn(80, 4, generator=g) for L in (0, 1)}
+        means = {L: torch.zeros(4) for L in (0, 1)}
+        session.whitener = LayerWhitener.from_neutral_activations(acts, means)
+        return session, cast(TestClient, client)
+
+    def test_analytics_names_excludes_multinode(self, session_and_client: Any) -> None:
+        session, _ = self._wire(session_and_client)
+        # The fan is dropped; the vector and the R=1 probe survive.
+        assert session.analytics_names() == ["vp", "vx"]
+        assert session._live_direction_tensors("fan") is None
+
+    def test_correlation_skips_multinode_no_500(self, session_and_client: Any) -> None:
+        _, client = self._wire(session_and_client)
+        r = client.get("/saklas/v1/sessions/default/correlation")
+        assert r.status_code == 200
+        body = r.json()
+        assert "fan" not in body["names"]
+        assert body["names"] == ["vp", "vx"]
+        # The surviving pair has a real (non-null) cosine cell.
+        assert body["matrix"]["vp"]["vx"] is not None
+
+    def test_correlation_explicit_multinode_404(self, session_and_client: Any) -> None:
+        _, client = self._wire(session_and_client)
+        r = client.get("/saklas/v1/sessions/default/correlation?names=fan,vx")
+        assert r.status_code == 404
+
+    def test_pairwise_multinode_404(self, session_and_client: Any) -> None:
+        _, client = self._wire(session_and_client)
+        r = client.get("/saklas/v1/sessions/default/vectors/pairwise?a=fan&b=vx")
+        assert r.status_code == 404

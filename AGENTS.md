@@ -160,10 +160,15 @@ Manifold subspace-fraction gates write the `:fraction` channel suffix
 (`@when:pad:fraction > 0.5`) — the share of the centered activation living
 in that manifold's subspace, in `[0, 1]`. Manifold label-similarity gates write
 the `@<label>` suffix (`@when:pad@happy > -0.1`) — the negated distance to
-a named node (larger = closer), so the natural threshold range is negative. Every
-shape flows through one `ProbeGate` (full namespaced string stored verbatim,
-matching the keys `Monitor.flat_scalars` emits) and round-trips
-byte-for-byte.
+a named node (larger = closer), so the natural threshold range is negative. The
+reserved label `neutral` (`@when:personas@neutral > -0.1`) reads the negated
+distance to the frame *anchor* (the per-model neutral mean) — every fit is
+neutral-anchored, so neutral is a point in the same whitened metric as the nodes,
+not a stored node. It competes in the nearest-node ranking, so the channel is
+present whenever neutral lands in a probe's top-N; suppressed only when a manifold
+already carries a real node named `neutral`. Every shape flows through one
+`ProbeGate` (full namespaced string stored verbatim, matching the keys
+`Monitor.flat_scalars` emits) and round-trips byte-for-byte.
 
 `%` is the manifold operator: `<manifold> % <position>` places a generation at a
 point of a fitted manifold. `<position>` is `<coord_list>` (a comma-separated list
@@ -274,10 +279,13 @@ affine `%` are composed into **one merged affine subspace per trigger group** vi
 attaches per-layer `subspace_inject` groups.
 
 The kernel decomposes `h = mean + h_par + h_perp` against the layer's affine
-subspace and applies two ops: **along** slides the in-subspace foot toward the
-target (geodesically; on a curved surface it transports the off-surface residual
-`H_n` to stay normal at the new foot), **onto** scales `H_n` by `(1 − o)` (vacuous
-when the surface fills its subspace, i.e. for every flat/affine term). The
+subspace and applies two ops: **along** *translates* the in-subspace foot by the
+fixed `α·(target−neutral)` offset (preserving per-token spread — not a lerp onto
+the absolute target, which loop-collapses at strong push; on a curved surface it
+transports the off-surface residual `H_n` to stay normal at the new foot), with a
+per-axis κ mask collapsing ablation axes toward 0 instead; **onto** scales `H_n`
+by `(1 − o)` (vacuous when the surface fills its subspace, i.e. for every
+flat/affine term). The
 off-subspace residual `h_perp` is always kept verbatim, which is what lets a
 vector and N orthogonal manifolds compose with zero cross-talk. A flat (affine)
 subspace takes an analytic shortcut (foot = the projected coord, no Gauss-Newton /
@@ -286,14 +294,16 @@ nearest-point foot-follower. fp32 throughout; the only norm guard is the soft ca
 `‖h_new‖ ≤ 3·‖h‖`.
 
 Gain (`core/hooks.py`): the per-layer share is normalized to **mean 1** (`Σ_L
-share_L = n_layers`) and `eff_along_L = share_L · _MANIFOLD_GAIN` (one constant,
-`= 1.0`). For an affine term the coefficient α is folded into the slide *target*
-by `synthesize_subspace`, so α scales *where* the slide lands and `share·base`
-scales *how far*; for a curved term α is the (clamped `[0,1]`) `along` fraction.
-There is **no lever / N correction** and **no `[0,1]` clamp / water-fill on
-`along`** (a high-signal layer is meant to overshoot the target; the de-rogued
-whitened coords keep it controlled and `norm_cap` bounds it). `onto` stays clamped
-`[0,1]`. A steered layer always runs the slow (ctx-consulting) hook, so per-step
+share_L = n_layers`) and `eff_along_L = share_L · _MANIFOLD_ALONG_GAIN`
+(`= 0.125`, the translate-slide gain for both modes). `_MANIFOLD_GAIN = 1.0` now
+scales **onto** only (the curved off-surface collapse). For an affine term the
+coefficient α is folded into the translate *target* by `synthesize_subspace`, so α
+scales the offset magnitude (unclamped); for a curved term α is the (clamped
+`[0,1]`) `along` fraction. There is **no lever / N correction** and **no `[0,1]`
+clamp / water-fill on `along`** (a high-signal layer is meant to overshoot the
+target; the de-rogued whitened coords keep it controlled and `norm_cap` bounds
+it). `onto` stays clamped `[0,1]`. (`_MANIFOLD_ALONG_GAIN` is tagged a prototype —
+calibrated so `≈0.5 <concept>` lands at the coherent sweet spot.) A steered layer always runs the slow (ctx-consulting) hook, so per-step
 triggers and probe gates work uniformly; `torch.compile`/StaticCache graph capture
 stays available only for unsteered generation.
 
@@ -419,10 +429,13 @@ partial folder in the package tree without exposing it as a default manifold:
   exist; incomplete package-data output is skipped.
 
 Recommended α is vector-comparable: aim for `α ≈ 0.5`, tune up toward `α ≈ 1.0`
-for stronger expression (α clamps to `[0,1]`, so `_MANIFOLD_GAIN = 1.0` is the
-strength ceiling). Because the share is normalized to mean 1 and the lever is
-gone, a low-dim and a high-dim fit — a 2-node vector, `personas`, and `pad` once
-its corpus is complete — land in the same α-band without per-fit retuning.
+for stronger expression. (For an affine push term α is unclamped — it sets the
+translate-offset magnitude; for a curved `%` term `along` clamps to `[0,1]`.) The
+global translate-slide gain `_MANIFOLD_ALONG_GAIN = 0.125` is calibrated so
+`≈0.5 <concept>` lands at the coherent sweet spot. Because the share is normalized
+to mean 1 and the lever is gone, a low-dim and a high-dim fit — a 2-node vector,
+`personas`, and `pad` once its corpus is complete — land in the same α-band
+without per-fit retuning.
 Architecture-level behavioral notes (hold across model families; α values are
 qualitative, MPS is not bitwise deterministic so compare qualitatively):
 
@@ -442,8 +455,8 @@ qualitative, MPS is not bitwise deterministic so compare qualitatively):
 > **Open frontiers** (see `ARCHITECTURE.md` §10): the fitted `personas` subspace is
 > a near-1-D "persona-ness" fan, so distinct personas can express the same generic
 > intense register (a steering-access problem, not the rogue problem — whitening
-> verifiably worked), and `_MANIFOLD_GAIN`'s exact value is provisional and coupled
-> to that.
+> verifiably worked), and the translate-slide gain (`_MANIFOLD_ALONG_GAIN`) is
+> provisional and coupled to that.
 
 ## Python API
 
@@ -550,10 +563,11 @@ tok/s):
   manifolds pay a warm-started O(R) per-token foot solve. (StaticCache-with-steering
   is CUDA-only, so MPS/CPU are unaffected; the through-the-hook graph capture wants a
   CUDA validation pass.)
-- **Share baked at fit**, normalized to mean 1 at apply; the subspace foot slides
-  by `share_L · _MANIFOLD_GAIN` toward a target that already carries the
-  coefficient. No norm preservation (onto is meant to shrink `‖h‖`); `norm_cap =
-  3·‖h‖` is the only bound.
+- **Share baked at fit**, normalized to mean 1 at apply; the subspace foot
+  translates by `share_L · _MANIFOLD_ALONG_GAIN · target` (the target already
+  carries the coefficient; `_MANIFOLD_GAIN = 1.0` is now the `onto`-only gain). No
+  norm preservation (onto is meant to shrink `‖h‖`); `norm_cap = 3·‖h‖` is the
+  only bound.
 - **Top-p via `torch.topk`**, not full-vocab sort; `top_k` (default 1024 cap) is a
   hard candidate-pool cap applied before top-p (llama.cpp/Ollama order).
 - **Monitor capture is hook-driven**, inline with generation — no second forward

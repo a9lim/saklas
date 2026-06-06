@@ -267,7 +267,12 @@ def test_gating_callback_emits_probe_scalars():
     flat = cb()
     # Manifold keys are present: fraction + per-node distance + coord axis 0.
     assert "toy:fraction" in flat
-    assert "toy@a" in flat
+    # Per-node distance channels emit; the activation sits near the frame
+    # origin, so the virtual neutral candidate competes in the nearest ranking
+    # (it can displace a farther node from the default top-3) and exposes the
+    # uniform ``toy@neutral`` gate channel.
+    assert "toy@neutral" in flat
+    assert any(f"toy@{label}" in flat for label in m.node_labels)
     assert "toy" in flat  # bare name aliases coordinate axis 0
 
 

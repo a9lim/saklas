@@ -987,10 +987,24 @@ class SaklasSession:
     def analytics_names(self) -> list[str]:
         """Names available to read-side analytics: registered steering
         vectors plus attached probes (a vector wins a same-named probe,
-        matching the correlation pool's dedup).  Pure metadata — no GPU."""
-        names = set(self._profiles)
+        matching the correlation pool's dedup).  Pure metadata — no GPU.
+
+        A multi-node / curved probe (a rank-``R`` fit like ``personas`` or
+        ``pad``) is **excluded** — the direction-cosine analytics fold every
+        name to a single steering direction, which only a folded affine
+        ``R = 1`` manifold has.  Listing one would only render an all-null
+        row in the correlation matrix (or a misleading miss in ``pairwise``)
+        and, before the guard below, made the fold raise a 500."""
+        from saklas.core.vectors import is_foldable_vector_manifold
+
+        names = set(self._profiles)  # registered vectors are always R=1
         try:
-            names.update(self._monitor.probe_names)
+            for pname in self._monitor.probe_names:
+                if pname in names:
+                    continue  # a registered vector wins the same-named probe
+                manifold = self._monitor.manifolds.get(pname)
+                if manifold is not None and is_foldable_vector_manifold(manifold):
+                    names.add(pname)
         except Exception:
             pass
         return sorted(names)
@@ -999,14 +1013,22 @@ class SaklasSession:
         """Live per-layer direction tensors for *name* (may be device-
         resident — callers must hold ``_gen_lock``).  A registered steering
         vector wins over a same-named probe; otherwise the folded view of an
-        attached probe's manifold."""
+        attached probe's manifold.
+
+        Returns ``None`` for a multi-node / curved probe — it has no single
+        direction to fold, so the direction analytics skip it rather than
+        crashing on ``folded_vector_directions``."""
         prof = self._profiles.get(name)
         if prof is not None:
             return dict(prof)
         manifold = self._monitor.manifolds.get(name)
         if manifold is not None:
-            from saklas.core.vectors import folded_vector_directions
-            return folded_vector_directions(manifold)
+            from saklas.core.vectors import (
+                folded_vector_directions,
+                is_foldable_vector_manifold,
+            )
+            if is_foldable_vector_manifold(manifold):
+                return folded_vector_directions(manifold)
         return None
 
     def analytics_profile(self, name: str) -> "Profile | None":

@@ -18,6 +18,7 @@ import torch
 from saklas.core.vectors import (
     fold_directions_to_subspace,
     folded_vector_directions,
+    is_foldable_vector_manifold,
 )
 
 
@@ -55,6 +56,50 @@ def test_folded_vector_directions_rejects_curved():
     )
     with pytest.raises(ValueError, match="affine"):
         folded_vector_directions(mfld)
+    # ...and the foldability predicate agrees, so analytics skip it.
+    assert not is_foldable_vector_manifold(mfld)
+
+
+def test_is_foldable_vector_manifold_rejects_multinode_affine():
+    """A flat *rank-R>1* fit (the ``personas`` fan shape) is affine but has no
+    single direction — the predicate must reject it so the direction-cosine
+    analytics (correlation / pairwise) skip it instead of folding to a 500."""
+    from saklas.core.manifold import (
+        CustomDomain, LayerSubspace, Manifold,
+    )
+    torch.manual_seed(0)
+    K, R, dim = 4, 3, 8           # 4 nodes, rank-3 affine subspace
+    basis, _ = torch.linalg.qr(torch.randn(dim, R))
+    basis = basis.T.contiguous()  # (R, D), orthonormal rows
+    mean = torch.zeros(dim)
+    node_coords = torch.randn(K, R)
+    sub = LayerSubspace.affine(mean, basis, node_coords=node_coords)
+    assert sub.is_affine and sub.rank == R
+    mfld = Manifold(
+        name="fan",
+        domain=CustomDomain(R),
+        node_labels=[f"n{i}" for i in range(K)],
+        node_coords=node_coords,
+        layers={0: sub},
+    )
+    assert not is_foldable_vector_manifold(mfld)
+    import pytest
+    with pytest.raises(ValueError, match="affine R=1"):
+        folded_vector_directions(mfld)
+
+
+def test_is_foldable_vector_manifold_accepts_r1_and_rejects_empty():
+    """The R=1 fold output is foldable; a layerless manifold is not."""
+    from saklas.core.manifold import CustomDomain, Manifold
+
+    d = 6
+    mfld = fold_directions_to_subspace("v", {0: torch.randn(d), 3: torch.randn(d)}, None)
+    assert is_foldable_vector_manifold(mfld)
+    empty = Manifold(
+        name="empty", domain=CustomDomain(1),
+        node_labels=["x"], node_coords=torch.tensor([[1.0]]), layers={},
+    )
+    assert not is_foldable_vector_manifold(empty)
 
 
 def test_fold_directions_to_subspace_neutral_anchored():

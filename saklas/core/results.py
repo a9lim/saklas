@@ -77,7 +77,11 @@ class ProbeReading:
       layers, the share of the centered activation living in the subspace,
       ∈ [0, 1].
     * ``nearest`` — top-N node labels by EV-weighted whitened distance,
-      ascending.
+      ascending.  The synthetic label ``"neutral"`` competes here as the
+      frame anchor (the per-model neutral mean, distance ``‖cdist_query‖``):
+      it is never a stored node, only a candidate the readout ranks, so it
+      surfaces when the activation sits closer to the origin than to any node.
+      Suppressed when a manifold already carries a real node named ``neutral``.
     * ``residual`` — EV-weighted normalized off-manifold residual
       ``dist_L / ||c_L||``; identically ``0.0`` for a flat fit (the surface
       fills its subspace), the off-surface distance for a curved fit.

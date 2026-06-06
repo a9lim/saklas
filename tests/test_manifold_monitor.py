@@ -24,6 +24,7 @@ from saklas.core.manifold import (
 )
 from saklas.core.monitor import (
     DEFAULT_NEAREST_TOP_N,
+    NEUTRAL_LABEL,
     AttachedManifoldProbe,
     Monitor,
 )
@@ -303,6 +304,64 @@ def test_nearest_sorted_ascending():
     readings = mon.score_single_token(hidden)
     dists = [d for _, d in readings["toy"].nearest]
     assert dists == sorted(dists)
+
+
+def test_neutral_competes_in_nearest_at_origin():
+    """An activation at the neutral-anchored frame origin (reduced coord 0,
+    world ``sub.mean``) ranks the synthetic ``neutral`` candidate first — it is
+    never a stored node, only a competitor in the readout (flat/batched path)."""
+    rc = torch.tensor([[1.0, 1.0], [2.0, -1.0], [-1.0, 2.0]])  # none at origin
+    m = _flat_manifold(reduced_coords=rc, labels=["a", "b", "c"])
+    mon = _iso_monitor(m)
+    mon.add_probe("tri", m)
+    # World activation at the origin = the subspace mean (reduced 0 = neutral).
+    hidden = {L: sub.mean for L, sub in m.layers.items()}
+    nearest = mon.score_single_token(hidden)["tri"].nearest
+    assert nearest[0][0] == NEUTRAL_LABEL
+    assert nearest[0][1] == pytest.approx(0.0, abs=1e-3)
+    # ``neutral`` never leaks into the stored node set.
+    assert NEUTRAL_LABEL not in m.node_labels
+
+
+def test_neutral_competes_in_aggregate_path():
+    """The end-of-gen aggregate (the per-probe ``_score_probe_full`` path, not
+    the batched one) also lets neutral compete — last content token at origin."""
+    rc = torch.tensor([[1.0, 1.0], [2.0, -1.0], [-1.0, 2.0]])
+    m = _flat_manifold(reduced_coords=rc, labels=["a", "b", "c"])
+    mon = _iso_monitor(m)
+    mon.add_probe("tri", m)
+    captured = {
+        L: sub.mean.unsqueeze(0).repeat(3, 1) for L, sub in m.layers.items()
+    }
+    agg = mon.score_aggregate(captured)["tri"]
+    assert agg.nearest[0][0] == NEUTRAL_LABEL
+    assert agg.nearest[0][1] == pytest.approx(0.0, abs=1e-3)
+
+
+def test_neutral_does_not_displace_a_closer_node():
+    """On a node centroid the real node still wins; neutral is farther."""
+    rc = torch.tensor([[1.0, 1.0], [2.0, -1.0], [-1.0, 2.0]])
+    m = _flat_manifold(reduced_coords=rc, labels=["a", "b", "c"])
+    mon = _iso_monitor(m)
+    mon.add_probe("tri", m)
+    nearest = mon.score_single_token(_flat_node_hidden(m, 1))["tri"].nearest
+    assert nearest[0][0] == "b"
+    assert nearest[0][1] == pytest.approx(0.0, abs=1e-3)
+
+
+def test_neutral_suppressed_when_node_named_neutral():
+    """A real corpus node labeled ``neutral`` keeps sole ownership of the
+    label — the synthetic competitor is not injected."""
+    rc = torch.tensor([[1.0, 1.0], [2.0, -1.0], [-1.0, 2.0]])
+    m = _flat_manifold(reduced_coords=rc, labels=["a", "neutral", "c"])
+    mon = _iso_monitor(m)
+    mon.add_probe("tri", m, top_n=-1)  # all candidates
+    assert mon._probes["tri"].inject_neutral is False
+    # The real ``neutral`` node wins at its own centroid; exactly one entry.
+    nearest = mon.score_single_token(_flat_node_hidden(m, 1))["tri"].nearest
+    assert nearest[0][0] == "neutral"
+    assert nearest[0][1] == pytest.approx(0.0, abs=1e-3)
+    assert sum(1 for label, _ in nearest if label == "neutral") == 1
 
 
 # =========================================================== flat_scalars ===
