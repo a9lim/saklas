@@ -1478,10 +1478,10 @@ class Manifold:
         return j_act_authoring.T.contiguous()              # (n, D)
 
 
-# Per-position guard against a degenerate normal-transport renorm in
-# :func:`subspace_inject` (the off-manifold residual collapsing onto the
-# tangent at a new foot near a fold): below this the transported residual
-# is dropped rather than fabricated from a near-zero direction.
+# Per-position guard for the principal-angle residual transport in
+# :func:`_frame_rotation_transport`: a principal plane whose ``sin θ`` is below
+# this is treated as a no-op rotation (its in-plane direction ``nᵢ`` is a 0/0),
+# which is also exactly the ``p_new == p`` identity-at-rest case.
 _ROTATE_EPSILON: float = 1e-6
 
 
@@ -1737,9 +1737,6 @@ def synthesize_subspace(
     )
 
 
-_TANGENT_GRAM_RIDGE = 1e-6
-
-
 def _soft_norm_cap(
     h_new: torch.Tensor, h_f32: torch.Tensor, norm_cap: float,
 ) -> torch.Tensor:
@@ -1766,6 +1763,108 @@ def _soft_norm_cap(
         norm_cap * norm_pre / norm_post.clamp(min=1e-6)
     ).clamp_(max=1.0)                              # (.., 1) — not full-width
     return h_new.mul_(scale)
+
+
+def _orthonormalize_columns(
+    m: torch.Tensor, *, eps: float = _ROTATE_EPSILON,
+) -> torch.Tensor:
+    """Modified Gram-Schmidt orthonormalization of the columns of ``m`` (.., R, n).
+
+    Returns ``(.., R, n)`` with orthonormal columns spanning the same range.
+    Pure matmul / elementwise — **no** ``torch.linalg.qr``, which is
+    unimplemented on the MPS backend (no autograd-fallback either), so this runs
+    natively on every device.  ``n`` is the small intrinsic dim (≤ a handful),
+    so the Python loop is cheap.  A column that collapses to ~0 after
+    orthogonalization (a rank-deficient frame at a fold) is zeroed rather than
+    amplified by the norm division — the downstream principal-angle SVD treats
+    the resulting zero overlap row as a 90° angle, i.e. no transport in it.
+    """
+    cols: list[torch.Tensor] = []
+    for i in range(m.shape[-1]):
+        v = m[..., i]                                       # (.., R)
+        for u in cols:
+            v = v - (u * v).sum(dim=-1, keepdim=True) * u
+        norm = torch.linalg.vector_norm(v, dim=-1, keepdim=True)
+        v = torch.where(norm > eps, v / norm.clamp(min=eps), torch.zeros_like(v))
+        cols.append(v)
+    return torch.stack(cols, dim=-1)                        # (.., R, n)
+
+
+def _svd_mps_safe(
+    a: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``torch.linalg.svd`` with an explicit CPU hop on MPS.
+
+    ``aten::linalg_svd`` is unimplemented on Metal and silently CPU-falls-back
+    with a per-call warning; doing the hop explicitly suppresses the warning and
+    keeps it a tiny ``(.., n, n)`` round-trip (``n`` = intrinsic dim).  Native on
+    CUDA / CPU.
+    """
+    if a.device.type == "mps":
+        u, s, vh = torch.linalg.svd(a.cpu())
+        return u.to(a.device), s.to(a.device), vh.to(a.device)
+    return torch.linalg.svd(a)
+
+
+def _frame_rotation_transport(
+    Hn: torch.Tensor,      # (.., R) off-surface residual to transport
+    j_old: torch.Tensor,   # (.., R, n) tangent at the old foot p
+    j_new: torch.Tensor,   # (.., R, n) tangent at the new foot p_new
+) -> torch.Tensor:
+    """Transport ``Hn`` from the tangent frame at the old foot to the frame at
+    the new foot by the minimal (principal-angle) orthogonal rotation between
+    the two tangent subspaces.
+
+    The rotation maps ``span(j_old) → span(j_new)`` (and hence their normal
+    complements) by rotating each pair of principal vectors ``aᵢ → bᵢ`` in its
+    own plane, identity on the orthogonal complement of both frames.  Two
+    properties this guarantees, which the former project-onto-normal + renorm
+    violated:
+
+    - **Identity at rest.**  When the foot doesn't move (``p_new == p``, i.e.
+      ``along == 0``) the frames coincide, every principal angle is 0, and the
+      rotation is *exactly* the identity — so ``subspace_inject`` returns its
+      input untouched regardless of foot-solve accuracy.  (The old code
+      reprojected ``Hn`` onto the normal space every fire, corrupting any
+      off-neutral activation by the residual's tangential part — which never
+      vanishes at an approximate foot — independent of the slide.)
+    - **No information loss.**  A rotation preserves ``‖Hn‖`` and discards no
+      component; the residual's full content rides the frame as it turns.
+
+    All ``O(R·n)`` per position, no ``(R, R)`` matrix materialized.  fp32.
+    """
+    # Orthonormal bases of the two tangent spaces (basis-choice-arbitrary, but
+    # the principal-angle SVD below is invariant to that choice).  Modified
+    # Gram-Schmidt, not ``torch.linalg.qr`` — the latter is unimplemented on MPS.
+    qa = _orthonormalize_columns(j_old)            # (.., R, n)
+    qb = _orthonormalize_columns(j_new)            # (.., R, n)
+    # Principal angles between the subspaces: SVD of the n×n frame overlap.
+    # Σ = cos θᵢ; the principal directions pair up orthogonally across i
+    # (aᵢᵀbⱼ = cos θᵢ · δᵢⱼ), so the subspace rotation is a product of
+    # *independent* planar rotations aᵢ → bᵢ.
+    u, s_cos, vh = _svd_mps_safe(qa.transpose(-1, -2) @ qb)  # (..,n,n),(..,n),(..,n,n)
+    a = qa @ u                                     # (.., R, n) principal dirs in span(qa)
+    b = qb @ vh.transpose(-1, -2)                  # (.., R, n) principal dirs in span(qb)
+    c = s_cos.clamp(-1.0, 1.0)                     # (.., n) cos θᵢ
+    s = (1.0 - c * c).clamp(min=0.0).sqrt()        # (.., n) sin θᵢ
+    # nᵢ = unit(bᵢ − cᵢ aᵢ): the in-(aᵢ,bᵢ)-plane direction ⊥ aᵢ that aᵢ rotates
+    # toward (‖bᵢ − cᵢ aᵢ‖ = sᵢ).  Guard the sᵢ≈0 (no-rotation) planes — their
+    # nᵢ is a 0/0 and their planar rotation is the identity anyway.
+    perp = b - c.unsqueeze(-2) * a                 # (.., R, n)
+    perp_norm = torch.linalg.vector_norm(perp, dim=-2, keepdim=True)  # (.., 1, n)
+    n_dir = perp / perp_norm.clamp(min=_ROTATE_EPSILON)  # (.., R, n) unit nᵢ
+    # Hn's components in each plane and the planar-rotation change
+    # (aᵢ → cᵢaᵢ + sᵢnᵢ, nᵢ → −sᵢaᵢ + cᵢnᵢ):
+    #   Δ = Σᵢ [(cᵢ−1)αᵢ − sᵢβᵢ] aᵢ + [sᵢαᵢ + (cᵢ−1)βᵢ] nᵢ.
+    alpha = (a * Hn.unsqueeze(-1)).sum(dim=-2)     # (.., n)  aᵢᵀ Hn
+    beta = (n_dir * Hn.unsqueeze(-1)).sum(dim=-2)  # (.., n)  nᵢᵀ Hn
+    active = (s > _ROTATE_EPSILON).to(Hn.dtype)    # (.., n) skip sᵢ≈0 planes
+    d_a = ((c - 1.0) * alpha - s * beta) * active  # (.., n)
+    d_n = (s * alpha + (c - 1.0) * beta) * active  # (.., n)
+    delta = (
+        (a * d_a.unsqueeze(-2)).sum(dim=-1) + (n_dir * d_n.unsqueeze(-2)).sum(dim=-1)
+    )                                              # (.., R)
+    return Hn + delta
 
 
 def subspace_inject(
@@ -1796,8 +1895,14 @@ def subspace_inject(
       same displacement, which preserves the per-token in-subspace spread and
       keeps strong steer coherent (collapsing each foot onto the absolute target
       instead erases that spread and degenerates into looping).  Then transport
-      the off-manifold residual ``H_n`` to stay normal at the new foot (project
-      onto the new tangent's normal space, renorm to the preserved ``‖H_n‖``).
+      the off-manifold residual ``H_n`` from the tangent frame at the old foot to
+      the frame at the new foot by the minimal orthogonal (principal-angle)
+      rotation between the two tangent subspaces
+      (:func:`_frame_rotation_transport`) — *exactly* the identity when the foot
+      didn't move, so the curved path is identity at ``along == 0`` regardless of
+      foot-solve accuracy; norm-preserving and lossless (the former
+      project-onto-normal + renorm discarded the residual's tangential part every
+      fire, corrupting any off-neutral activation independent of the slide).
       Tangential / directional; leaves ``H_o`` untouched.  By moving *on the
       surface* it never cuts through the off-manifold low-density region.
 
@@ -1893,11 +1998,18 @@ def subspace_inject(
     for _ in range(int(gn_steps)):
         p, _ = _gn_step(p, q, np_, rw, pc, offset, scale, domain, damping)
 
-    foot_red = eval_rbf(np_, rw, pc, (domain.embed(p) - offset) / scale)  # (.., R)
+    emb_old = (domain.embed(p) - offset) / scale       # (.., m)
+    foot_red = eval_rbf(np_, rw, pc, emb_old)          # (.., R)
     Hn_red = q - foot_red                              # (.., R) off-manifold-in-subspace (reduced)
-    Hn_norm = torch.linalg.vector_norm(Hn_red, dim=-1, keepdim=True)      # (.., 1)
+    # World-reduced tangent columns of M at the *old* foot p: dRBF/dcoord chained
+    # through the embedding Jacobian (the reduced-space analogue of
+    # Manifold.tangent).  Needed alongside the new-foot frame so the residual can
+    # be rotated between them rather than reprojected.
+    j_old = (
+        eval_rbf_jacobian(np_, rw, pc, emb_old) / scale  # (.., R, m)
+    ) @ domain.embed_jacobian(p)                         # (.., R, n)
 
-    # --- ALONG: translate the foot, with H_n transport ---
+    # --- ALONG: translate the foot along the surface ---
     # Translate p* by the parallel-transported neutral→target offset (scaled by
     # ``along``), preserving the per-token foot spread rather than collapsing
     # every foot onto the absolute target.  ``origin`` is this layer's neutral
@@ -1906,32 +2018,19 @@ def subspace_inject(
     p_new = domain.translate_foot(p, org, target, along)  # (.., n)
     emb_new = (domain.embed(p_new) - offset) / scale   # (.., m)
     foot_new_red = eval_rbf(np_, rw, pc, emb_new)      # (.., R)
-
-    # World-reduced tangent columns of M at p_new: dRBF/dcoord chained through
-    # the embedding Jacobian (the reduced-space analogue of Manifold.tangent).
-    tangent = (
+    j_new = (
         eval_rbf_jacobian(np_, rw, pc, emb_new) / scale  # (.., R, m)
-    ) @ domain.embed_jacobian(p_new)                     # (.., R, n)
-    # Project H_n onto the normal space at p_new (remove its tangent component).
-    gram = tangent.transpose(-1, -2) @ tangent           # (.., n, n)
-    n_dim = gram.shape[-1]
-    eye = torch.eye(n_dim, device=gram.device, dtype=gram.dtype)
-    rhs = tangent.transpose(-1, -2) @ Hn_red.unsqueeze(-1)  # (.., n, 1)
-    bsz = gram.shape[:-2]
-    coeff = torch.linalg.solve(
-        (gram + _TANGENT_GRAM_RIDGE * eye).reshape(-1, n_dim, n_dim).contiguous(),
-        rhs.reshape(-1, n_dim, 1).contiguous(),
-    ).reshape(*bsz, n_dim, 1)
-    Hn_tan = (tangent @ coeff).squeeze(-1)               # (.., R) tangent component
-    Hn_normal = Hn_red - Hn_tan                          # (.., R) normal at p_new
-    Hn_normal_norm = torch.linalg.vector_norm(Hn_normal, dim=-1, keepdim=True)
-    # Renorm to the preserved ‖H_n‖; if the projection collapsed (H_n went
-    # tangent at the new foot — a large slide near a fold), drop it rather than
-    # fabricate a direction (risk-2 mitigation), via a hot-path-safe ``where``.
-    Hn_trans = Hn_normal * (Hn_norm / Hn_normal_norm.clamp(min=_ROTATE_EPSILON))
-    Hn_trans = torch.where(
-        Hn_normal_norm < _ROTATE_EPSILON, torch.zeros_like(Hn_trans), Hn_trans,
-    )
+    ) @ domain.embed_jacobian(p_new)                     # (.., R, n) tangent at p_new
+
+    # Transport the off-surface residual from the frame at p to the frame at
+    # p_new by the minimal orthogonal (principal-angle) rotation between the two
+    # tangent subspaces.  Identity when the foot didn't move (``along == 0`` ⇒
+    # p_new == p ⇒ exact identity at rest), norm-preserving, and discards no
+    # component — the three properties the former project-onto-normal + renorm
+    # lacked (it corrupted every off-neutral activation by the residual's
+    # tangential part, independent of the slide).  See
+    # :func:`_frame_rotation_transport`.
+    Hn_trans = _frame_rotation_transport(Hn_red, j_old, j_new)  # (.., R)
 
     # --- ONTO: scale the transported off-manifold residual ---
     Hn_final = (1.0 - onto) * Hn_trans                   # (.., R)
@@ -2009,6 +2108,16 @@ class SpectralDiagnostics:
     bandwidth: float           # heat-kernel sigma actually used
     k_nn: int                  # number of nearest neighbors actually used
     component_count: int       # always 1 on success (disconnected graphs raise)
+    # Authored-dimensionality floor.  ``heuristic_k`` is what the
+    # eigenvalue-ratio cliff picked on its own; when ``min_dim`` is set and
+    # exceeds it, ``picked_k`` is floored to ``min(min_dim, cap)`` and
+    # ``pinned`` is True.  The cliff *undershoots* for a manifold whose
+    # strongest mode dominates the spectrum (a small Fiedler value forces an
+    # early ratio cliff), so the floor lets a known geometry (PAD's P×A×D)
+    # survive a re-derivation that would otherwise collapse it.
+    heuristic_k: int = 0       # ratio-cliff pick before the floor
+    min_dim: int | None = None # author-declared floor (None = pure heuristic)
+    pinned: bool = False       # True iff the floor raised picked_k
 
 
 def derive_pca_coords(
@@ -2143,6 +2252,7 @@ def derive_spectral_coords(
     gram: torch.Tensor,
     *,
     max_dim: int = 8,
+    min_dim: int | None = None,
     k_nn: int | None = None,
     bandwidth: float | None = None,
 ) -> tuple[torch.Tensor, SpectralDiagnostics]:
@@ -2175,6 +2285,16 @@ def derive_spectral_coords(
     ``λ_{k+1} - λ_k`` would over-pick on S^1 because the eigenvalues
     scale ~ ``k²`` in the continuous limit, so the largest absolute
     gap lands at high ``k`` rather than the structural cliff.
+
+    ``min_dim`` floors the picked dimension: when an author declares the
+    intrinsic dimensionality (e.g. PAD is P×A×D, 3-D by construction), the
+    ratio cliff can *undershoot* if one mode dominates the spectrum — a
+    small first non-trivial (Fiedler) eigenvalue makes ``λ_2 / λ_1`` the
+    largest ratio, picking ``k=1`` regardless of the true geometry. The
+    floor raises ``picked_k`` to ``min(min_dim, cap)`` (it can't exceed the
+    usable eigenvector budget) and the diagnostics record both the
+    heuristic pick and that the floor fired. ``None`` (default) leaves the
+    pick to the heuristic alone.
 
     Defaults: ``k_nn = max(5, ceil(log K))``, ``bandwidth = median
     k-NN distance``.  Both are recorded in the diagnostics.
@@ -2275,11 +2395,6 @@ def derive_spectral_coords(
     cap = max(1, cap)
     if cap == 1:
         picked_k = 1
-        gap_magnitude = float(
-            (nontrivial_vals[1] - nontrivial_vals[0]).item()
-            if nontrivial_vals.shape[0] > 1
-            else 0.0
-        )
     else:
         # Ratio at "use k dims" = nontrivial[k] / nontrivial[k-1].
         # Clamp the denominator off zero — a vanishing eigenvalue at
@@ -2288,9 +2403,22 @@ def derive_spectral_coords(
         denom = nontrivial_vals[:cap].clamp(min=1e-12)
         ratios = nontrivial_vals[1:cap + 1] / denom
         picked_k = int(ratios.argmax().item()) + 1
-        gap_magnitude = float(
-            (nontrivial_vals[picked_k] - nontrivial_vals[picked_k - 1]).item()
-        )
+
+    # Authored-dimensionality floor: honor a declared intrinsic dim over the
+    # ratio cliff (which undershoots when one mode dominates — see docstring).
+    # The floor can't exceed the usable eigenvector budget (``cap``).
+    heuristic_k = picked_k
+    if min_dim is not None:
+        picked_k = max(picked_k, min(int(min_dim), cap))
+    pinned = picked_k != heuristic_k
+
+    # Absolute gap at the *final* picked_k (diagnostic annotation); 0 when
+    # picked_k saturates the available spectrum so there's no λ_{k+1}.
+    gap_magnitude = float(
+        (nontrivial_vals[picked_k] - nontrivial_vals[picked_k - 1]).item()
+        if picked_k < nontrivial_vals.shape[0]
+        else 0.0
+    )
 
     coords = nontrivial_vecs[:, :picked_k].contiguous()  # (K, picked_k)
 
@@ -2303,6 +2431,9 @@ def derive_spectral_coords(
         bandwidth=bandwidth,
         k_nn=k_nn,
         component_count=1,
+        heuristic_k=heuristic_k,
+        min_dim=int(min_dim) if min_dim is not None else None,
+        pinned=pinned,
     )
     return coords, diagnostics
 

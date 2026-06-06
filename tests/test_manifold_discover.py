@@ -394,6 +394,59 @@ def test_spectral_diagnostics_record_data_driven_defaults():
     assert diag.eigenvalues.shape[0] >= diag.picked_k
 
 
+# ----------------------------------------------- min_dim dimensionality floor ---
+
+def test_spectral_min_dim_floors_undershooting_cliff():
+    """``min_dim`` honors a declared intrinsic dim over the ratio cliff.
+
+    The PAD failure mode: when one mode dominates the spectrum the
+    eigenvalue-ratio cliff undershoots (a small first non-trivial / Fiedler
+    eigenvalue makes ``λ_2 / λ_1`` the largest ratio → ``k=1``), collapsing
+    P×A×D to the valence axis.  A clean circle has intrinsic dim 2, so the
+    cliff picks ``k=2`` — below a declared ``min_dim=3``, which the floor
+    must raise the embedding back up to, recording that it fired.
+    """
+    centroids, _ = _circle_centroids(n=60, ambient=32, noise=0.02, seed=5)
+    gram = _centered_gram(centroids)
+    # Unpinned: the cliff picks the circle's intrinsic dim (2).
+    _, free = derive_spectral_coords(gram, max_dim=6)
+    assert free.pinned is False
+    assert free.min_dim is None
+    assert free.heuristic_k == free.picked_k  # records its own pick when free
+    assert free.picked_k < 3, (
+        f"precondition: circle should pick k<3, got {free.picked_k}"
+    )
+    # Pinned to 3: the floor raises picked_k and the coords widen to match.
+    coords, diag = derive_spectral_coords(gram, max_dim=6, min_dim=3)
+    assert diag.picked_k == 3
+    assert diag.gap_index == 3          # the alias tracks the floored pick
+    assert diag.min_dim == 3
+    assert diag.pinned is True
+    assert diag.heuristic_k == free.picked_k  # the heuristic still ran
+    assert coords.shape == (60, 3)
+
+
+def test_spectral_min_dim_at_or_below_pick_is_noop():
+    """A floor at/below the heuristic pick leaves pick and shape untouched."""
+    centroids, _ = _circle_centroids(n=60, ambient=32, noise=0.02, seed=5)
+    gram = _centered_gram(centroids)
+    coords_free, free = derive_spectral_coords(gram, max_dim=6)
+    coords_pin, pinned = derive_spectral_coords(gram, max_dim=6, min_dim=1)
+    assert pinned.picked_k == free.picked_k
+    assert pinned.pinned is False
+    assert pinned.min_dim == 1
+    assert coords_pin.shape == coords_free.shape
+
+
+def test_spectral_min_dim_clamped_to_eigenvector_budget():
+    """``min_dim`` can't widen past the usable budget (``max_dim`` cap)."""
+    centroids, _ = _circle_centroids(n=60, ambient=32, noise=0.02, seed=5)
+    gram = _centered_gram(centroids)
+    coords, diag = derive_spectral_coords(gram, max_dim=2, min_dim=5)
+    assert diag.picked_k == 2          # capped at max_dim despite asking for 5
+    assert coords.shape[1] == 2
+
+
 # ------------------------------------------- layer-agnostic consensus Gram ---
 
 def test_pca_consensus_drops_noise_layer():

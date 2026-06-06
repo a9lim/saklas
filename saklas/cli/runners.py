@@ -1151,8 +1151,8 @@ def _run_manifold_fit(args: argparse.Namespace) -> None:
     override_supplied = any(
         getattr(args, attr, None) is not None
         for attr in (
-            "method", "max_dim", "var_threshold", "k_nn", "bandwidth",
-            "max_subspace_dim",
+            "method", "max_dim", "min_dim", "var_threshold", "k_nn",
+            "bandwidth", "max_subspace_dim",
         )
     )
 
@@ -1180,6 +1180,8 @@ def _run_manifold_fit(args: argparse.Namespace) -> None:
         if args.var_threshold is not None:
             new_hyperparams["var_threshold"] = float(args.var_threshold)
         # Spectral knobs.
+        if getattr(args, "min_dim", None) is not None:
+            new_hyperparams["min_dim"] = int(args.min_dim)
         if args.k_nn is not None:
             new_hyperparams["k_nn"] = int(args.k_nn)
         if args.bandwidth is not None:

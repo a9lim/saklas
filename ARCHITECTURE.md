@@ -574,11 +574,22 @@ residual, then applies two operations:
   collapsing each foot onto the absolute target instead erases that spread and
   degenerates into looping (the kernel ablation that motivated the
   translate-not-collapse change). It then transports the
-  off-*manifold*-in-subspace residual `H_n` to stay normal at the new foot
-  (project onto the new tangent's normal space, renorm to the preserved `‖H_n‖`).
-  Tangential/directional; by moving *on the surface* it never cuts through
-  off-manifold low-density space. A per-axis collapse mask `κ` (§4) overrides this
-  for ablation axes (`κ=1`): those collapse toward 0 instead of translating.
+  off-*manifold*-in-subspace residual `H_n` from the tangent frame at the old foot
+  to the frame at the new foot by the **minimal orthogonal (principal-angle)
+  rotation** between the two tangent subspaces (`_frame_rotation_transport`):
+  orthonormalize each frame (modified Gram-Schmidt — `torch.linalg.qr` is
+  unimplemented on MPS), take the principal angles from the SVD of their `n×n`
+  overlap, and rotate each pair of principal vectors `aᵢ → bᵢ` in its own plane.
+  This is *exactly* the identity when the foot doesn't move (`p_new == p`, i.e.
+  `along=0`), so the curved path is identity at rest **regardless of foot-solve
+  accuracy**, and it is norm-preserving and lossless. (The former
+  project-onto-normal + renorm was neither: it discarded the residual's
+  tangential-at-the-foot component every fire — which never vanishes at an
+  approximate foot — corrupting any off-neutral activation by 20–150% with *zero*
+  steering, compounding across layers into degenerate looping.) Tangential/
+  directional; by moving *on the surface* it never cuts through off-manifold
+  low-density space. A per-axis collapse mask `κ` (§4) overrides this for ablation
+  axes (`κ=1`): those collapse toward 0 instead of translating.
 - **onto (`o ∈ [0,1]`)** — scale `H_n` by `(1 − o)`: collapse the off-surface
   in-subspace residual onto the surface. Vacuous when the surface fills its
   subspace.

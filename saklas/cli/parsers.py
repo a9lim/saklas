@@ -307,6 +307,13 @@ def _build_manifold_fit(fit: argparse.ArgumentParser) -> None:
              "(default: 8 for PCA, 8 for spectral)",
     )
     fit.add_argument(
+        "--min-dim", dest="min_dim", type=int, default=None, metavar="N",
+        help="Discover spectral: floor the intrinsic dimension the "
+             "eigenvalue-ratio cliff picks (the cliff undershoots when one "
+             "mode dominates — set --min-dim == --max-dim to pin the dim "
+             "exactly, e.g. PAD's 3). Ignored for --method pca.",
+    )
+    fit.add_argument(
         "--var-threshold", dest="var_threshold", type=float, default=None,
         metavar="T",
         help="Discover PCA: smallest cumulative-variance prefix that "

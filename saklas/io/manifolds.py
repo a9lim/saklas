@@ -98,15 +98,20 @@ _FIT_MODES_ALL: frozenset[str] = (
 # ``max_subspace_dim`` for pca (the subspace dim equals the layout dim).
 # ``max_subspace_dim`` survives only for the curved (``spectral``) fit,
 # where the per-layer RBF subspace can carry off-surface dims beyond the
-# intrinsic coordinate count.  The steer-time origin is always the
-# projection of the per-model neutral mean onto the subspace (the affine
-# fit neutral-anchors the frame), so there is no ``anchor_origin`` knob.
+# intrinsic coordinate count.  ``min_dim`` (spectral only) floors the
+# layout dim the eigenvalue-ratio cliff derives — for an authored-
+# dimensionality manifold (PAD's P×A×D) the cliff undershoots when one
+# mode dominates the spectrum, so the floor keeps the declared geometry
+# (set ``min_dim == max_dim`` to pin the dim exactly).  The steer-time
+# origin is always the projection of the per-model neutral mean onto the
+# subspace (the affine fit neutral-anchors the frame), so there is no
+# ``anchor_origin`` knob.
 _HYPERPARAMS_BY_MODE: dict[str, frozenset[str]] = {
     "pca": frozenset({
         "max_dim", "var_threshold",
     }),
     "spectral": frozenset({
-        "max_dim", "k_nn", "bandwidth", "max_subspace_dim",
+        "max_dim", "min_dim", "k_nn", "bandwidth", "max_subspace_dim",
     }),
 }
 

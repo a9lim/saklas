@@ -644,6 +644,35 @@ def test_inject_identity_at_zero():
     assert torch.allclose(out, h, atol=1e-3)
 
 
+def test_inject_identity_at_zero_off_surface_approximate_foot():
+    """``along=0, onto=0`` is *exact* identity even for an activation far off
+    the surface whose foot solve hasn't converged (one GN step, a deliberately
+    wrong seed).
+
+    This is the regression guard for the curved-steering gibberish: the former
+    project-onto-normal + renorm transport silently discarded the residual's
+    tangential-at-the-foot component on every fire, so it corrupted any
+    off-surface activation by 20-150% *with zero steering applied* — compounding
+    across layers into degenerate repetition.  ``test_inject_identity_at_zero``
+    missed it because a near-surface input with a perfect seed leaves the
+    residual already-normal.  The minimal orthogonal frame rotation is the
+    identity whenever the foot doesn't move (``p_new == p``), so it cannot
+    corrupt the activation regardless of foot accuracy.
+    """
+    sub, domain = _grid_manifold()
+    torch.manual_seed(1)
+    # A large *in-subspace* off-surface residual (pure H_n) + a far-off seed so
+    # one GN step leaves the foot approximate (residual not normal at it).
+    pert = torch.randn(16)
+    pert = (pert @ sub.basis.T) @ sub.basis            # project into the subspace
+    h = _on_surface(sub, domain, [0.5, 0.5]) + 3.0 * pert
+    out, _ = subspace_inject(
+        h, sub, domain, torch.tensor([0.9, 0.1]), torch.tensor([0.02, 0.97]),
+        0.0, 0.0, gn_steps=1,
+    )
+    assert torch.allclose(out, h, atol=1e-4)
+
+
 def test_inject_along_slides_on_surface():
     sub, domain = _grid_manifold()
     a, b = [0.0, 0.0], [1.0, 1.0]

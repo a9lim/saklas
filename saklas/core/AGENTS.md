@@ -231,8 +231,14 @@ push-before-ablation ordering; `target_coord = B @ Σ coeffᵢ·poleᵢ`; `share
 onto)` is **the** injection: affine analytic shortcut (foot = q, translate by the
 fixed `a·target` offset with per-axis κ collapsing ablation axes — `p_new = q +
 a·(target − κ·q)` — `H_o` kept) vs curved per-token GN foot-follow (along
-translates the foot and transports `H_n` normal at the new foot, onto scales it
-`(1−o)`, `H_o` kept). `synthesize_subspace` emits the κ mask (0 push / 1 ablate).
+translates the foot and transports `H_n` to the new foot by the minimal
+orthogonal principal-angle rotation between the old/new tangent frames
+(`_frame_rotation_transport` — exact identity when the foot doesn't move, so the
+curved path is identity at `along=0` regardless of foot accuracy; replaced the
+project-onto-normal + renorm that corrupted off-neutral activations every fire),
+onto scales `H_n` `(1−o)`, `H_o` kept). MGS orthonormalization + a CPU-hopped
+`n×n` SVD keep it MPS-safe (`linalg.qr`/`svd` are unimplemented/`fallback` on
+Metal). `synthesize_subspace` emits the κ mask (0 push / 1 ablate).
 `norm_cap = 3·‖h‖` is the only norm guard. `invert_parameterization` is the cold/eval-only damped-LM nearest-
 point projection.
 

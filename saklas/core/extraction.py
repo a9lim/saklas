@@ -105,13 +105,18 @@ def _diagnostics_to_dict(diag: Any) -> dict[str, Any]:
             else:
                 out[name] = list(t)
     for name in (
-        "picked_k", "gap_index", "k_nn", "component_count",
+        "picked_k", "gap_index", "k_nn", "component_count", "heuristic_k",
     ):
         if hasattr(diag, name):
             out[name] = int(getattr(diag, name))
     for name in ("threshold", "gap_magnitude", "bandwidth"):
         if hasattr(diag, name):
             out[name] = float(getattr(diag, name))
+    # Spectral dimensionality-floor provenance (optional / bool).
+    if hasattr(diag, "pinned"):
+        out["pinned"] = bool(diag.pinned)
+    if getattr(diag, "min_dim", None) is not None:
+        out["min_dim"] = int(diag.min_dim)
     return out
 
 
