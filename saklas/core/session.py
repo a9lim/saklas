@@ -772,6 +772,19 @@ class SaklasSession:
         # passes (which keeps the internal steering scope from
         # deadlocking against itself).
         self._gen_lock = threading.RLock()
+        # ``_gen_lock`` doubles as the process-wide **exclusive-GPU** lock:
+        # PyTorch's MPS backend serializes every device op through one global,
+        # NOT-thread-safe command buffer, so two threads committing it at once
+        # aborts the process ("commit an already committed command buffer").
+        # Every model op (fit / extract / generate) already holds it for its
+        # duration; read-side GPU work (the analytics CPU snapshot below,
+        # ``add_probe``) acquires it non-blocking and defers rather than race.
+        # Read-side analytics (correlation / pairwise) snapshot each steering
+        # direction to CPU once and serve every poll from this cache, so the
+        # hot polling path never issues an MPS->CPU copy on a threadpool
+        # thread (which would race a concurrent model op and abort).  See
+        # ``analytics_profile``; cleared on any registry/manifold change.
+        self._analytics_cpu_cache: dict[str, "Profile"] = {}
         # Bypass flag for the phase guard in ``_push_steering`` /
         # ``_pop_steering``.  ``_generate_core`` sets this around the
         # ``steering_cm.__exit__()`` it owns at the end of a generation
@@ -970,6 +983,76 @@ class SaklasSession:
     def vectors(self) -> dict[str, Profile]:
         """Registered steering vector profiles: name -> Profile."""
         return {name: Profile(tensors) for name, tensors in self._profiles.items()}
+
+    def analytics_names(self) -> list[str]:
+        """Names available to read-side analytics: registered steering
+        vectors plus attached probes (a vector wins a same-named probe,
+        matching the correlation pool's dedup).  Pure metadata — no GPU."""
+        names = set(self._profiles)
+        try:
+            names.update(self._monitor.probe_names)
+        except Exception:
+            pass
+        return sorted(names)
+
+    def _live_direction_tensors(self, name: str) -> "dict[int, torch.Tensor] | None":
+        """Live per-layer direction tensors for *name* (may be device-
+        resident — callers must hold ``_gen_lock``).  A registered steering
+        vector wins over a same-named probe; otherwise the folded view of an
+        attached probe's manifold."""
+        prof = self._profiles.get(name)
+        if prof is not None:
+            return dict(prof)
+        manifold = self._monitor.manifolds.get(name)
+        if manifold is not None:
+            from saklas.core.vectors import folded_vector_directions
+            return folded_vector_directions(manifold)
+        return None
+
+    def analytics_profile(self, name: str) -> "Profile | None":
+        """CPU-resident snapshot of a steering vector / probe direction for
+        read-side analytics (correlation, pairwise), cached.
+
+        PyTorch's MPS backend serializes every device op through one global,
+        non-thread-safe command buffer.  A read endpoint evacuating an
+        MPS-resident direction to CPU on its own threadpool thread races a
+        concurrent model op's command-buffer commit and aborts the process
+        (``IOGPUMetalCommandBuffer validate: commit an already committed
+        command buffer``).  This snapshots each direction to CPU **once,
+        under ``_gen_lock``** (the exclusive-GPU lock every fit / extract /
+        generation holds), then serves every later poll from the CPU cache —
+        so the hot polling path never touches the GPU.
+
+        Returns ``None`` when *name* isn't registered, or when a model op
+        currently holds the GPU and no snapshot is cached yet; the caller
+        renders that cell as null and a later poll builds it once the GPU is
+        free.
+        """
+        cached = self._analytics_cpu_cache.get(name)
+        if cached is not None:
+            return cached
+        # The source fold + device->host copy is GPU work: run it under the
+        # exclusive-GPU lock so it can't overlap a model op.  Non-blocking —
+        # defer to a later poll rather than stall or race while one runs.
+        if not self._gen_lock.acquire(blocking=False):
+            return None
+        try:
+            live = self._live_direction_tensors(name)
+            if live is None:
+                return None
+            snap = Profile({
+                int(L): t.detach().float().cpu() for L, t in live.items()
+            })
+        finally:
+            self._gen_lock.release()
+        self._analytics_cpu_cache[name] = snap
+        return snap
+
+    def _invalidate_analytics_cache(self) -> None:
+        """Drop the read-side analytics CPU snapshots (rebuilt lazily on the
+        next poll).  Called on any change to the steering-vector / probe
+        registry or the fitted manifolds those directions read from."""
+        self._analytics_cpu_cache.clear()
 
     @property
     def probes(self) -> dict[str, dict[str, Any]]:
@@ -1614,6 +1697,8 @@ class SaklasSession:
         manifold = pipe.fit(
             folder, sae=sae, sae_revision=sae_revision, on_progress=on_progress,
         )
+        # The newly-fit manifold changes folded directions a probe may read.
+        self._invalidate_analytics_cache()
         if sae:
             ret_name = f"{name}:sae-{sae}"
         elif role:
@@ -1666,6 +1751,8 @@ class SaklasSession:
                 on_progress=on_progress,
             )
         finally:
+            # A re-fit changes the folded directions any probe reads from.
+            self._invalidate_analytics_cache()
             self._gen_lock.release()
 
     def bake(
@@ -1731,11 +1818,13 @@ class SaklasSession:
         # the prefix cache so the next gen reprefills under the new
         # registry view.
         self._invalidate_prefix_cache()
+        self._invalidate_analytics_cache()
 
     def unsteer(self, name: str) -> None:
         """Remove a steering vector from the registry."""
         self._profiles.pop(name, None)
         self._invalidate_prefix_cache()
+        self._invalidate_analytics_cache()
 
     def steering(
         self, value: "str | Steering",
@@ -2999,8 +3088,22 @@ class SaklasSession:
         # ``_build_whitened_factors`` raises on a missing covering whitener.
         _ = self.whitener
         name = as_name if as_name is not None else selector
-        manifold = self._resolve_probe_manifold(selector)
-        self._monitor.add_probe(name, manifold, top_n=top_n)
+        # Probe attach loads the manifold onto the model device and builds
+        # device-resident whitened factors — GPU work that must not run
+        # concurrently with a fit / extract / generation on PyTorch's single
+        # global MPS command buffer (which would abort the process).  Hold the
+        # exclusive-GPU ``_gen_lock`` non-blocking: a cross-thread model op in
+        # flight refuses rather than races; same-thread reentry passes (RLock).
+        if not self._gen_lock.acquire(blocking=False):
+            raise ConcurrentExtractionError(
+                "add_probe called while another model operation is in "
+                "flight; retry shortly"
+            )
+        try:
+            manifold = self._resolve_probe_manifold(selector)
+            self._monitor.add_probe(name, manifold, top_n=top_n)
+        finally:
+            self._gen_lock.release()
         # New probe → _begin_capture attaches a different layer set than was
         # live when the prefix was prefilled; drop the cache so the next gen
         # re-prefills with the fresh capture-attach layout in place.
@@ -3008,6 +3111,7 @@ class SaklasSession:
         # Transcript probe-hash cache is keyed by name; any change to the
         # registered probes invalidates the relevant entry.
         self._probe_hash_cache.pop(name, None)
+        self._invalidate_analytics_cache()
         return name
 
     def remove_probe(self, name: str) -> None:
@@ -3015,6 +3119,7 @@ class SaklasSession:
         self._monitor.remove_probe(name)
         self._invalidate_prefix_cache()
         self._probe_hash_cache.pop(name, None)
+        self._invalidate_analytics_cache()
 
     def _resolve_probe_manifold(self, selector: str) -> "Manifold":
         """Resolve a probe selector to a loaded :class:`Manifold`.

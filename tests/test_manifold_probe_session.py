@@ -16,6 +16,7 @@ covers both shapes.
 """
 from __future__ import annotations
 
+import threading
 import types
 from typing import Any
 from unittest.mock import MagicMock
@@ -95,6 +96,13 @@ def _stub_session() -> SaklasSession:
     session._manifolds = {}
     session._profiles = {}
     session._probe_hash_cache = {}
+    # ``add_probe`` holds the exclusive-GPU lock (``_gen_lock``) around its
+    # device-touching factor build and clears the read-side analytics cache.
+    session._gen_lock = threading.RLock()
+    session._analytics_cpu_cache = {}
+    session._invalidate_analytics_cache = types.MethodType(
+        SaklasSession._invalidate_analytics_cache, session,
+    )
     # Capture has a single ``_per_layer`` dict we read for streaming.
     session._capture = types.SimpleNamespace(
         _per_layer={},

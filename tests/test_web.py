@@ -57,6 +57,11 @@ def _mock_session_with_vectors(vectors: dict[str, Profile]):
     session.history = []
     session._monitor = MagicMock()
     session._monitor.probe_names = []
+    # Read-side analytics now flow through a CPU-snapshot cache so the polled
+    # correlation/pairwise endpoints never touch the GPU.  Mirror that shape
+    # against the mock's (already-CPU) vector Profiles.
+    session.analytics_names = lambda: sorted(vectors.keys())
+    session.analytics_profile = lambda name: vectors.get(name)
     session._tokenizer = MagicMock()
     session._layers = []
     session._gen_state = MagicMock()

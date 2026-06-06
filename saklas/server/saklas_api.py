@@ -1146,27 +1146,28 @@ def register_saklas_routes(app: FastAPI) -> None:
         wins the routing match — Starlette matches in registration order
         and ``pairwise`` would otherwise be swallowed by ``{name}``.
         """
-        from saklas import Profile
-
         _resolve_session_id(session, session_id)
 
-        pool: dict[str, "Profile"] = dict(session.vectors)
-        try:
-            for probe_name in session._monitor.probe_names:
-                if probe_name in pool:
-                    continue
-                tensors = _probe_profile_tensors(session, probe_name)
-                if tensors is None:
-                    continue
-                pool[probe_name] = Profile(tensors)
-        except Exception:
-            pass
-
-        missing = [n for n in (a, b) if n not in pool]
-        if missing:
-            raise HTTPException(404, f"names not loaded: {missing}")
-
-        prof_a, prof_b = pool[a], pool[b]
+        # CPU snapshots only (cached, built once under the exclusive-GPU lock)
+        # so this endpoint never issues an MPS->CPU copy on its threadpool
+        # thread that could race a concurrent model op on PyTorch's single
+        # global, non-thread-safe command buffer (which aborts the process).
+        prof_a = session.analytics_profile(a)
+        prof_b = session.analytics_profile(b)
+        unavailable = [n for n, p in ((a, prof_a), (b, prof_b)) if p is None]
+        if unavailable:
+            known = set(session.analytics_names())
+            missing = [n for n in unavailable if n not in known]
+            if missing:
+                raise HTTPException(404, f"names not loaded: {missing}")
+            # Registered, but a model op holds the GPU and no snapshot is
+            # cached yet — retryable rather than a hard miss.
+            raise HTTPException(
+                409,
+                "a model operation is in flight; the comparison snapshot is "
+                "not ready yet — retry shortly",
+            )
+        assert prof_a is not None and prof_b is not None  # guarded above
         layers_a = sorted(prof_a.keys())
         layers_b = sorted(prof_b.keys())
 
@@ -1296,35 +1297,32 @@ def register_saklas_routes(app: FastAPI) -> None:
         server-side so the client doesn't have to ship full per-layer
         tensors over the wire.
         """
-        from saklas import Profile
-
         _resolve_session_id(session, session_id)
 
-        # Build a unified pool of {name: Profile} covering both registries.
-        # Steering vectors come first (so they win on collision); probe
-        # tensors are wrapped into Profile so the same cosine_similarity
-        # call works for either source.
-        pool: dict[str, "Profile"] = dict(session.vectors)
-        try:
-            for probe_name in session._monitor.probe_names:
-                if probe_name in pool:
-                    continue
-                tensors = _probe_profile_tensors(session, probe_name)
-                if tensors is None:
-                    continue
-                pool[probe_name] = Profile(tensors)
-        except Exception:
-            # Monitor not available — fall back to vectors-only pool.
-            pass
-
+        # Read-side pool of **CPU snapshots**, one per direction (a steering
+        # vector wins a same-named probe, matching the historical dedup).
+        # ``session.analytics_profile`` does the device->host copy once, under
+        # the exclusive-GPU lock, and caches it — so this polled endpoint
+        # never issues an MPS->CPU copy on its threadpool thread that could
+        # race a concurrent model op on PyTorch's single global, non-thread-
+        # safe command buffer (which aborts the whole process).
+        available = session.analytics_names()
         if names is not None and names.strip():
             requested = [n.strip() for n in names.split(",") if n.strip()]
-            missing = [n for n in requested if n not in pool]
+            missing = [n for n in requested if n not in available]
             if missing:
                 raise HTTPException(404, f"names not loaded: {missing}")
             ordered = requested
         else:
-            ordered = sorted(pool.keys())
+            ordered = available
+        # A name whose CPU snapshot isn't ready (a model op currently holds
+        # the GPU) is left out of the pool; its cells render null until a
+        # later poll builds it once the GPU is free.
+        pool: dict[str, "Profile"] = {}
+        for name in ordered:
+            snap = session.analytics_profile(name)
+            if snap is not None:
+                pool[name] = snap
 
         # Mahalanobis-only: ``cosine_similarity`` requires a whitener
         # covering each pair's shared layers.  Resolve it once; a missing
@@ -1349,6 +1347,10 @@ def register_saklas_routes(app: FastAPI) -> None:
                     continue
                 if i == j:
                     matrix[a][b] = 1.0
+                    continue
+                if a not in pool or b not in pool:
+                    # Snapshot not ready (GPU busy) — null cell this poll.
+                    matrix[a][b] = None
                     continue
                 try:
                     cos = pool[a].cosine_similarity(pool[b], whitener=whitener)
