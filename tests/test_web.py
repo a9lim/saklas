@@ -37,6 +37,18 @@ def _profile_from_layers(layers: dict[int, list[float]]) -> Profile:
     )
 
 
+class _IdentityWhitener:
+    def __init__(self) -> None:
+        self.apply_calls: list[int] = []
+
+    def covers_all(self, _layers: list[int]) -> bool:
+        return True
+
+    def apply_inv(self, layer: int, vec: torch.Tensor) -> torch.Tensor:
+        self.apply_calls.append(int(layer))
+        return vec.float().cpu()
+
+
 def _mock_session_with_vectors(vectors: dict[str, Profile]):
     session = MagicMock()
     session.model_id = "test/model"
@@ -66,6 +78,7 @@ def _mock_session_with_vectors(vectors: dict[str, Profile]):
     session._layers = []
     session._gen_state = MagicMock()
     session._gen_state.finish_reason = "stop"
+    session.whitener = _IdentityWhitener()
     session.lock = asyncio.Lock()
 
     session._trait_queues = []
@@ -229,6 +242,14 @@ class TestCorrelationEndpoint:
         key = "honest__warm"
         assert key in data["layers_shared"]
         assert data["layers_shared"][key] == 2
+
+    def test_whitens_each_profile_layer_once_per_request(self, web_client: Any) -> None:
+        session, client = web_client
+        r = client.get("/saklas/v1/sessions/default/correlation")
+        assert r.status_code == 200
+        # 2 names × 2 layers.  The endpoint should reuse these factors across
+        # the upper-triangle matrix instead of reapplying the whitener per pair.
+        assert sorted(session.whitener.apply_calls) == [0, 0, 5, 5]
 
 
 class TestVectorPerLayerNorms:

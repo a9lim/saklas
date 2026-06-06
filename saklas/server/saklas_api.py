@@ -1345,6 +1345,26 @@ def register_saklas_routes(app: FastAPI) -> None:
                 "is gone)",
             )
 
+        # Request-scope Mahalanobis cache.  The old upper-triangle loop called
+        # ``Profile.cosine_similarity`` per pair, which reapplied ``Σ⁻¹`` to
+        # the same profile-layer O(N) times as the dashboard roster grew.
+        # Cache ``(v, Σ⁻¹v, vᵀΣ⁻¹v)`` once per available name/layer and assemble
+        # the symmetric matrix from those factors.
+        import math as _math
+        import torch as _torch
+        white_cache: dict[str, dict[int, tuple[Any, Any, float]]] = {}
+        for name, prof in pool.items():
+            entries: dict[int, tuple[Any, Any, float]] = {}
+            for layer, tensor in prof.items():
+                try:
+                    vec = tensor.float().cpu().reshape(-1)
+                    si_vec = whitener.apply_inv(layer, vec).float().reshape(-1)
+                    norm_sq = max(float(_torch.dot(vec, si_vec).item()), 0.0)
+                except Exception:
+                    continue
+                entries[int(layer)] = (vec, si_vec, norm_sq)
+            white_cache[name] = entries
+
         matrix: dict[str, dict[str, float | None]] = {a: {} for a in ordered}
         layers_shared: dict[str, int] = {}
         for i, a in enumerate(ordered):
@@ -1359,17 +1379,32 @@ def register_saklas_routes(app: FastAPI) -> None:
                     # Snapshot not ready (GPU busy) — null cell this poll.
                     matrix[a][b] = None
                     continue
-                try:
-                    cos = pool[a].cosine_similarity(pool[b], whitener=whitener)
-                    matrix[a][b] = round(float(cos), 6)
-                except Exception:
-                    matrix[a][b] = None
                 shared = sorted(
                     set(pool[a].keys()) & set(pool[b].keys())
                 )
                 # Pair key sorted alphabetically so a__b == b__a in the lookup.
                 key = "__".join(sorted([a, b]))
                 layers_shared[key] = len(shared)
+                if not shared or not whitener.covers_all(shared):
+                    matrix[a][b] = None
+                    continue
+                entries_a = white_cache.get(a, {})
+                entries_b = white_cache.get(b, {})
+                if any(L not in entries_a or L not in entries_b for L in shared):
+                    matrix[a][b] = None
+                    continue
+                num = 0.0
+                den = 0.0
+                for layer in shared:
+                    vec_a, _si_a, aa = entries_a[layer]
+                    _vec_b, si_b, bb = entries_b[layer]
+                    if aa < 1e-12 or bb < 1e-12:
+                        continue
+                    num += float(_torch.dot(vec_a, si_b).item())
+                    den += _math.sqrt(aa * bb)
+                matrix[a][b] = (
+                    round(num / den, 6) if den >= 1e-12 else None
+                )
         return {
             "names": ordered,
             "matrix": matrix,
