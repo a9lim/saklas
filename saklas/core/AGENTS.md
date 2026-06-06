@@ -279,8 +279,10 @@ the Euclidean `‖eval_rbf(node_params)‖_F`), orthogonalizes the affine subspa
 against curved spans (`_orthogonalize_affine_against` — curved wins shared
 directions), and enforces `_CURVED_ORTHO_TOL = 1e-3` between two curved manifolds
 (`OverlappingManifoldError`). Gain: two constants — `_MANIFOLD_ALONG_GAIN = 0.125`
-scales `along` (the translate slide, both modes), `_MANIFOLD_GAIN = 1.0` scales
-`onto` only. `eff_along_L = share_L · _MANIFOLD_ALONG_GAIN` (affine: α already in
+scales `along` (the translate slide, both modes), `_MANIFOLD_GAIN = 0.5` scales
+`onto` only (calibrated on the gemma-4-12b `pad%dominant` onto sweep — at `1.0`
+even `onto=0.5` fragmented and `onto=1.0` collapsed; `0.5` makes `onto∈[0,1]` a
+usable dial with `1.0` a coherent ceiling). `eff_along_L = share_L · _MANIFOLD_ALONG_GAIN` (affine: α already in
 `target_coord`; curved: × clamped user `along`); `eff_onto_L = clamp(onto ·
 share_L · _MANIFOLD_GAIN, 0, 1)`. **No lever / N, no `[0,1]` clamp / water-fill on
 `along`** (a high-share layer is meant to overshoot; `norm_cap` bounds it). `onto`

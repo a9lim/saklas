@@ -375,20 +375,25 @@ def test_manager_along_unclamped_overshoots():
 
 
 def test_manager_onto_clamped_per_layer():
-    """onto is a bounded collapse fraction: clamped to [0, 1] per layer (a
-    fraction > 1 would invert the residual).  A high-spread layer (mean-1
-    share > 1) saturates its onto at 1.0."""
+    """onto is a bounded collapse fraction: ``eff_onto_L = clamp(onto · share_L ·
+    _MANIFOLD_GAIN, 0, 1)``, clamped to [0, 1] per layer (a fraction > 1 would
+    invert the residual).  Each layer follows the share-weighted formula and the
+    highest-spread layer (largest mean-1 share) carries the largest onto,
+    saturating at 1.0 only once ``share_L · _MANIFOLD_GAIN ≥ 1`` (gain-dependent,
+    so asserted against the formula, not a hardcoded 1.0)."""
     n_layers = 3
     manifold = _manifold(layers=tuple(range(n_layers)))
     mgr = SteeringManager()
     mgr.add_manifold("mood", manifold, position=(0.5,), along=0.0, onto=1.0)
     mgr.apply_to_model(_model_layers(n_layers), torch.device("cpu"), torch.float32)
-    for hook in mgr.hooks.values():
-        _along, onto = _coeffs(hook)
-        assert 0.0 <= onto <= 1.0 + 1e-6
-    # The top-spread layer's mean-1 share > 1 ⇒ its onto saturates at 1.0.
     ontos = [_coeffs(h)[1] for h in mgr.hooks.values()]
-    assert max(ontos) == pytest.approx(1.0, abs=1e-6)
+    assert all(0.0 <= o <= 1.0 + 1e-6 for o in ontos)            # clamp holds
+    shares = _manifold_layer_shares(manifold)
+    expected = [min(1.0, shares[L] * _MANIFOLD_GAIN) for L in shares]
+    assert sorted(ontos) == pytest.approx(sorted(expected), abs=1e-6)
+    assert max(ontos) == pytest.approx(
+        min(1.0, max(shares.values()) * _MANIFOLD_GAIN), abs=1e-6,
+    )
 
 
 def test_manager_two_coeffs_independent():

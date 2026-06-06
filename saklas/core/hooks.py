@@ -519,12 +519,21 @@ class SteeringHook:
 # the only bound.  ``onto`` stays clamped ``[0, 1]`` (a collapse fraction > 1
 # inverts the residual).
 #
-# Calibrated on the gemma-3-4b whitened MPS smoke (rank-1 ``happysad`` + rank-8
-# ``personas``, lever dropped): ``base = 1.0`` is coherent + directional across
-# both regimes but *gentle* — the gemma-4-31b sweep (#8.5) refines the number
-# upward (α clamps to [0, 1] so ``base`` is the strength ceiling).  Per-persona
-# strength variance persists — tune α down per target.
-_MANIFOLD_GAIN = 1.0
+# This is the **onto** (off-surface collapse) gain only: ``eff_onto_L =
+# clamp(onto · share_L · _MANIFOLD_GAIN, 0, 1)``, and the kernel scales the
+# off-surface residual by ``(1 − eff_onto)``.  That residual carries the
+# per-token content variation, so combined with a directional ``along`` push too
+# much onto drives every token onto the *same* surface point and degenerates into
+# looping — the exact failure the translate-not-collapse ``along`` design avoids,
+# reintroduced by zeroing the residual that held the spread.  Calibrated on the
+# gemma-4-12b ``pad%dominant`` onto sweep (along fixed at 0.3): at the old ``1.0``
+# even ``onto = 0.5`` fragmented and ``onto = 1.0`` collapsed to ``!!!``; ``0.5``
+# puts the recommended ``onto ≈ 0.5`` at a clean sweet spot and keeps ``onto =
+# 1.0`` a strong-but-coherent ceiling, while below ``~0.3`` the [0, 1] knob
+# saturates into no dynamic range (``onto = 0.5 ≈ 1.0``).  A [0, 1] dial whose top
+# emits garbage is a bad dial, so ``onto = 1.0`` is deliberately the coherent
+# maximum, not the over-steer edge.
+_MANIFOLD_GAIN = 0.5
 
 # --- translate gain (prototype) ----------------------------------------------
 # The injection *translates* the in-subspace foot by a fixed offset toward the

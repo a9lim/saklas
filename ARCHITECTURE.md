@@ -673,8 +673,12 @@ Euclidean `‖eval_rbf(node_params)‖_F`), then:
   collapse fraction.
 
 **Two gain constants.** `_MANIFOLD_ALONG_GAIN = 0.125` scales **along** (the
-translate slide) in both modes; `_MANIFOLD_GAIN = 1.0` now scales **onto** only
-(the off-surface collapse share-weight, curved-only). The split is the
+translate slide) in both modes; `_MANIFOLD_GAIN = 0.5` now scales **onto** only
+(the off-surface collapse share-weight, curved-only — calibrated on the
+gemma-4-12b `pad%dominant` onto sweep: at `1.0` even `onto=0.5` fragmented and
+`onto=1.0` collapsed into looping, since collapsing the off-surface residual
+erases the per-token spread; `0.5` makes `onto∈[0,1]` a usable dial with `1.0` a
+coherent ceiling). The split is the
 translate-not-collapse consequence: a fixed-offset translate is *unbounded* where
 the old lerp-onto-target saturated (the offset compounds across layers rather than
 landing on the target), so the slide gain runs ~an order of magnitude below the
@@ -919,12 +923,17 @@ straight-chord additive baseline alongside.
   target), not the metric.
 - **`base_gain` magnitude.** Steering now uses **two** constants:
   `_MANIFOLD_ALONG_GAIN = 0.125` (the translate slide, both modes) and
-  `_MANIFOLD_GAIN = 1.0` (onto / off-surface collapse only). Both are committed but
+  `_MANIFOLD_GAIN = 0.5` (onto / off-surface collapse only). Both are committed but
   provisional — `_MANIFOLD_ALONG_GAIN` is tagged a prototype, calibrated on the
   gemma-4-12b caveman sweep (coherent window ~0.06–0.10, loop degeneration past
   ~0.14). The translate offset compounds across layers rather than landing on the
   target, so the coherent gain sits ~10× below the old lerp-onto-target collapse
-  gain. Still one global per-op constant, no per-fit knob; per-persona strength
+  gain. `_MANIFOLD_GAIN` was likewise calibrated on the gemma-4-12b `pad%dominant`
+  onto sweep: at `1.0` (combined with a directional push) `onto=0.5` already
+  fragmented and `onto=1.0` collapsed into looping — collapsing the off-surface
+  residual erases the per-token spread, the same failure translate-not-collapse
+  avoids — so `0.5` puts `onto∈[0,1]` at a usable range with `1.0` a coherent
+  ceiling. Still one global per-op constant, no per-fit knob; per-persona strength
   variance is handled by α, not a per-target gain.
 - **Discover-coord transfer.** Cross-model Procrustes for discover *coordinates*
   is deferred (a Gemma layout and a Qwen layout aren't comparable without it);
