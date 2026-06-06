@@ -16,8 +16,7 @@
   // highlighting is about reading the transcript, so that is their one
   // home.
 
-  import SubspaceProbeCard from "./rack/SubspaceProbeCard.svelte";
-  import ManifoldProbeCard from "./rack/ManifoldProbeCard.svelte";
+  import ProbeCard from "./rack/ProbeCard.svelte";
   import Select from "../lib/Select.svelte";
   import {
     activeProbeNames,
@@ -102,7 +101,7 @@
           {@const entry = probeRack.entries.get(name)}
           {#if entry}
             <div role="listitem">
-              <SubspaceProbeCard {name} {entry} />
+              <ProbeCard {name} {entry} />
             </div>
           {/if}
         {/each}
@@ -113,7 +112,7 @@
           {@const entry = probeRack.entries.get(name)}
           {#if entry}
             <div role="listitem">
-              <ManifoldProbeCard {name} {entry} />
+              <ProbeCard {name} {entry} />
             </div>
           {/if}
         {/each}

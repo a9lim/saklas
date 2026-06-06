@@ -14,7 +14,7 @@
   // for the printed cosine — same color mapping as the click-token grid
   // so reading a row across both surfaces stays consistent.
 
-  import { closeDrawer, refreshCorrelation, vectorRack } from "../lib/stores.svelte";
+  import { closeDrawer, refreshCorrelation, steerRack } from "../lib/stores.svelte";
   import HeatmapCell from "../lib/charts/HeatmapCell.svelte";
 
   // Drawer host forwards { params } — unused here, but the prop must
@@ -43,11 +43,11 @@
 
   $effect(() => {
     // Trigger initial load only if the snapshot is empty.  Subsequent
-    // reopens read straight off ``vectorRack.correlation``.
-    if (!vectorRack.correlation) void reload();
+    // reopens read straight off ``steerRack.correlation``.
+    if (!steerRack.correlation) void reload();
   });
 
-  const data = $derived(vectorRack.correlation);
+  const data = $derived(steerRack.correlation);
   const names = $derived<string[]>(data?.names ?? []);
 
   function cellTitle(a: string, b: string, v: number | null): string {

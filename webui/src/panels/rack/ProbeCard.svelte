@@ -1,26 +1,35 @@
 <script lang="ts">
-  // Subspace probe card — the harmonised replacement for ProbeStrip.  A
-  // flat (affine) probe is the subspace family: accent ``--accent``, glyph
-  // ●/○.  Composes the shared RackCard chrome:
+  // Unified probe card — one row for every probe shape.  Replaces the
+  // SubspaceProbeCard / ManifoldProbeCard split: the store already
+  // normalises ``current`` / ``sparkline`` / ``perLayer`` per family
+  // (``_primaryScalar`` / ``_primaryPerLayer``), so this row reads those
+  // uniformly and branches only on *presentation*.
   //
-  //   statline : ●/○ highlight-select · name · sparkline · ✕ detach
-  //   body     : the reading row (bipolar bar OR fraction bar + nearest)
-  //              then the per-layer heatmap strip
+  //   statline : ●/○ (flat) or ◆/◇ (curved) highlight-select · name
+  //              · sparkline · ✕ detach
+  //   body     : the reading row —
+  //                bipolar bar + poles   (is_affine && node_count===2), or
+  //                scalar/fraction bar + nearest   (everything else)
+  //              then the curved-only settled coords/residual meta, the
+  //              per-layer heatmap strip, and a 2-D box-domain mini-map.
   //
-  // Selection ●/○ glyph reuses the accent so a glance distinguishes "this
-  // probe is the highlight" (selected, accent) from unselected (muted).
-  // The whole statline identity cluster is the click target for toggling
-  // the highlight selection — preserving ProbeStrip's behavior.
+  // Family is signalled by accent (--accent flat / --accent-purple curved)
+  // and glyph.  The identity cluster toggles the transcript highlight for
+  // *every* family — the per-token score map is keyed by probe name
+  // regardless of geometry, so curved probes are valid highlight targets
+  // (the top-bar dropdown already lists them; this wires the click too).
 
   import type { ProbeRackEntry } from "../../lib/types";
   import Bar from "../../lib/charts/Bar.svelte";
   import Sparkline from "../../lib/charts/Sparkline.svelte";
   import HeatmapCell from "../../lib/charts/HeatmapCell.svelte";
+  import ManifoldMiniMap from "../manifold/ManifoldMiniMap.svelte";
   import {
     detachProbe,
     highlightState,
     setHighlightTarget,
   } from "../../lib/stores.svelte";
+  import { pushToast } from "../../lib/stores/toasts.svelte";
   import { polesOf } from "../../lib/concepts";
   import RackCard from "./RackCard.svelte";
 
@@ -31,42 +40,88 @@
 
   let { name, entry }: Props = $props();
 
+  const info = $derived(entry.info);
+  /** Flat (affine) ⇒ subspace family; curved ⇒ manifold family. */
+  const affine = $derived(info.is_affine);
+  /** A bipolar 2-node concept axis — the one shape with a signed,
+   *  pole-anchored reading.  Every higher-rank flat fan and every curved
+   *  fit renders the scalar/fraction row instead. */
+  const bipolar = $derived(affine && info.node_count === 2);
+
+  const accent = $derived(affine ? "--accent" : "--accent-purple");
+
   const current = $derived(entry.current ?? 0);
   const sparkline = $derived(entry.sparkline ?? []);
   const isHighlight = $derived(highlightState.target === name);
 
-  /** Bipolar (2-node) probes read poles off the underlying manifold (or the
-   *  registered name, when the manifold name carries the ``a.b`` form).  A
-   *  higher-rank flat probe (e.g. personas) renders the fraction + nearest
-   *  readout instead. */
-  const bipolar = $derived(entry.info.node_count === 2);
-  const poles = $derived(polesOf(entry.info.manifold || name));
+  /** Highlight-select glyph — family marker (●/◆) filled when this probe is
+   *  the highlight target, hollow (○/◇) when not. */
+  const selectGlyph = $derived(
+    affine ? (isHighlight ? "●" : "○") : (isHighlight ? "◆" : "◇"),
+  );
+
+  /** Display name — bare manifold name, namespace prefix stripped; full
+   *  name stays in the tooltip. */
+  const displayName = $derived(name.split("/").pop() ?? name);
+
+  // ---------- bipolar poles ----------
+  const poles = $derived(polesOf(info.manifold || name));
   const monopolar = $derived(poles.negative === null);
 
-  /** Top nearest node, for the higher-rank flat readout. */
+  // ---------- nearest (store keeps this settled post-gen) ----------
   const topNearest = $derived(entry.nearest.length > 0 ? entry.nearest[0] : null);
+  const nearestLabel = $derived(topNearest?.[0] ?? "");
+  const nearestDistance = $derived(topNearest?.[1] ?? null);
 
-  // Layer keys sorted ascending (numeric).  The wire shape is zero-padded
-  // ints keyed as strings; Number() coerces cleanly for any base-10 prefix.
+  // ---------- curved settled meta (end-of-gen aggregate) ----------
+  const aggregate = $derived(entry.aggregate ?? null);
+  const coords = $derived(aggregate?.coords ?? []);
+  const residual = $derived(aggregate?.residual ?? null);
+  const trajectory = $derived(entry.trajectory ?? []);
+
+  /** Mini-map gating — only 2-D box-domain probes with attached node coords
+   *  render the visual (intrinsic_dim 1 of a 2-node axis and the custom
+   *  carrier of a flat discover fan both fall out here). */
+  const showMiniMap = $derived.by(() => {
+    if (info.intrinsic_dim !== 2) return false;
+    const d = info.domain as { type?: string };
+    if (d?.type !== "box") return false;
+    return !!info.node_coords && info.node_coords.length > 0;
+  });
+
+  // ---------- per-layer strip (store-normalised primary column) ----------
   const layerKeys = $derived<string[]>(
     entry.perLayer
       ? Object.keys(entry.perLayer).sort((a, b) => Number(a) - Number(b))
       : [],
   );
 
+  // 14px reads cleanly on a 28-layer Gemma without horizontal scroll on a
+  // 1280px viewport, and stays usable on 60+ layer models when the strip
+  // wraps inside its own scroll container.
+  const CELL_SIZE = 14;
+
   function cellTooltip(layer: string): string {
     const v = entry.perLayer?.[layer];
     if (typeof v !== "number" || !Number.isFinite(v)) {
       return `L${layer} · —`;
     }
-    const sign = v >= 0 ? "+" : "";
+    // Flat per-layer is signed (axis-0); curved is a [0,1] fraction.
+    const sign = affine && v >= 0 ? "+" : "";
     return `L${layer} · ${sign}${v.toFixed(3)}`;
   }
 
-  // 14px reads cleanly on a 28-layer Gemma without forcing horizontal
-  // scroll on a 1280px viewport, and stays usable on 60+ layer models when
-  // the strip wraps inside its own scroll container.
-  const CELL_SIZE = 14;
+  function fmtFraction(v: number): string {
+    return Number.isFinite(v) ? v.toFixed(2) : "0.00";
+  }
+  function fmtDistance(v: number | null): string {
+    return v !== null && Number.isFinite(v) ? v.toFixed(2) : "—";
+  }
+  function fmtCoord(v: number): string {
+    return Number.isFinite(v) ? v.toFixed(2) : "0.00";
+  }
+
+  // ---------- highlight select / detach ----------
 
   // Click the identity cluster toggles highlight: select if not selected,
   // deselect (back to "off") if already selected.  Mirrors the TUI's
@@ -82,20 +137,22 @@
     }
   }
 
-  function onDetach(ev: MouseEvent): void {
+  async function onDetach(ev: MouseEvent): Promise<void> {
     ev.stopPropagation();
-    void detachProbe(name);
-  }
-
-  function fmtFraction(v: number): string {
-    return Number.isFinite(v) ? v.toFixed(2) : "0.00";
-  }
-  function fmtDistance(v: number | null): string {
-    return v !== null && Number.isFinite(v) ? v.toFixed(2) : "—";
+    try {
+      await detachProbe(name);
+      pushToast(`detached probe ${name}`, { kind: "info" });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      pushToast(`detach ${name} failed — ${msg}`, {
+        kind: "error",
+        ttlMs: null,
+      });
+    }
   }
 </script>
 
-<RackCard accent="--accent" disabled={false}>
+<RackCard {accent} disabled={false}>
   {#snippet statline()}
     <!-- Identity cluster — clicking it toggles the highlight selection. -->
     <div
@@ -113,14 +170,18 @@
         class="select-glyph"
         class:selected={isHighlight}
         aria-hidden="true"
-        title={isHighlight ? "Selected (click to deselect)" : "Click to select for highlighting"}
-      >{isHighlight ? "●" : "○"}</span>
-      <span class="name" title="probe {name}">{name}</span>
+        title={isHighlight
+          ? "Selected (click to deselect)"
+          : "Click to select for highlighting"}
+      >{selectGlyph}</span>
+      <span class="name" title="probe {name}">{displayName}</span>
     </div>
 
     <span class="spacer"></span>
 
-    <Sparkline points={sparkline} width={56} height={14} />
+    <!-- Curved (fraction) probes are [0,1]-bounded → cap the sparkline at 1;
+         flat (signed) probes auto-scale. -->
+    <Sparkline points={sparkline} width={56} height={14} cap={affine ? undefined : 1} />
 
     <button
       type="button"
@@ -134,7 +195,7 @@
   {#snippet body()}
     {#if bipolar}
       <!-- Bipolar reading row: neg pole · signed bar · pos pole · value. -->
-      <div class="reading">
+      <div class="reading reading-bipolar">
         <span class="pole neg" aria-hidden={monopolar}>
           {#if !monopolar}{poles.negative}{/if}
         </span>
@@ -149,23 +210,43 @@
         </span>
       </div>
     {:else}
-      <!-- Higher-rank flat (e.g. personas): a fraction bar + nearest-node
-           readout.  ``current`` is the signed axis-0 coordinate the store
-           tracks for a flat probe. -->
-      <div class="reading">
-        <span class="rank-label">subspace</span>
+      <!-- Scalar / fraction row: bar · nearest node · value.  A higher-rank
+           flat fan reads the signed axis-0 magnitude; a curved fit reads the
+           [0,1] subspace fraction — both fill from the left. -->
+      <div class="reading reading-scalar">
         <div class="bar-cell" aria-hidden="true">
           <Bar value={Math.abs(current)} max={1} width={160} height={8} />
         </div>
-        <span class="nearest" title="nearest node">
+        <span
+          class="nearest"
+          title={topNearest
+            ? `nearest node: ${nearestLabel} (distance ${fmtDistance(nearestDistance)})`
+            : "awaiting first token"}
+        >
           {#if topNearest}
-            <span class="nearest-label">{topNearest[0]}</span>
-            <span class="nearest-dist">d={fmtDistance(topNearest[1])}</span>
+            <span class="nearest-label">{nearestLabel}</span>
+            <span class="nearest-dist">d={fmtDistance(nearestDistance)}</span>
           {:else}
             <span class="nearest-empty">—</span>
           {/if}
         </span>
         <span class="value">{fmtFraction(current)}</span>
+      </div>
+    {/if}
+
+    {#if !affine && (coords.length > 0 || residual !== null)}
+      <!-- Curved-only settled meta: where the trajectory came to rest. -->
+      <div class="meta">
+        {#if coords.length > 0}
+          <span class="meta-item" title="settled inverse-projection coords">
+            coords ({coords.map(fmtCoord).join(", ")})
+          </span>
+        {/if}
+        {#if residual !== null}
+          <span class="meta-item" title="normalized off-surface residual">
+            residual {fmtCoord(residual)}
+          </span>
+        {/if}
       </div>
     {/if}
 
@@ -189,6 +270,16 @@
         </span>
       {/if}
     </div>
+
+    {#if showMiniMap}
+      <div class="map-wrap">
+        <ManifoldMiniMap
+          info={entry.info}
+          trajectory={trajectory}
+          settled={aggregate?.coords ?? null}
+        />
+      </div>
+    {/if}
   {/snippet}
 </RackCard>
 
@@ -207,7 +298,7 @@
     background: var(--bg-elev);
   }
   .select-cluster:focus-visible {
-    outline: 1px solid var(--accent);
+    outline: 1px solid var(--card-accent);
     outline-offset: -1px;
   }
   .select-glyph {
@@ -257,10 +348,17 @@
   /* ----- body: reading row ----- */
   .reading {
     display: grid;
-    grid-template-columns: minmax(2.5em, 1fr) minmax(60px, 2.6fr) minmax(2.5em, 1fr) 3.5em;
     align-items: center;
     gap: var(--space-2);
     min-width: 0;
+  }
+  /* Bipolar: neg pole · bar · pos pole · value. */
+  .reading-bipolar {
+    grid-template-columns: minmax(2.5em, 1fr) minmax(60px, 2.6fr) minmax(2.5em, 1fr) 3.5em;
+  }
+  /* Scalar / fraction: bar · nearest · value. */
+  .reading-scalar {
+    grid-template-columns: minmax(60px, 2.6fr) minmax(2.5em, 1fr) 3.5em;
   }
   .pole {
     overflow: hidden;
@@ -275,14 +373,6 @@
   .pole.pos {
     color: var(--fg-strong);
     text-align: left;
-  }
-  .rank-label {
-    color: var(--fg-muted);
-    font-size: var(--text-xs);
-    text-align: right;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
   }
   .bar-cell {
     min-width: 0;
@@ -331,6 +421,19 @@
     color: var(--accent-red);
   }
 
+  /* ----- body: curved settled meta ----- */
+  .meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-3);
+    color: var(--card-accent);
+    font-size: var(--text-xs);
+    font-variant-numeric: tabular-nums;
+  }
+  .meta-item {
+    flex: 0 0 auto;
+  }
+
   /* ----- body: per-layer heatmap ----- */
   .layers {
     display: flex;
@@ -354,5 +457,11 @@
     font-size: var(--text-xs);
     font-variant-numeric: tabular-nums;
     flex: 0 0 auto;
+  }
+
+  /* ----- body: mini-map ----- */
+  .map-wrap {
+    display: flex;
+    justify-content: center;
   }
 </style>

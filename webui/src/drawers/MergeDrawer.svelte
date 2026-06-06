@@ -18,14 +18,14 @@
   import {
     addVectorToRack,
     closeDrawer,
-    vectorRack,
+    steerRack,
   } from "../lib/stores.svelte";
   import {
     ExpressionParseError,
     parseExpression,
     serializeExpression,
   } from "../lib/expression";
-  import type { Variant, VectorRackEntry } from "../lib/types";
+  import type { SteerEntry, Variant } from "../lib/types";
   import Disclosure from "../lib/Disclosure.svelte";
 
   // Drawer host forwards { params } — unused.
@@ -45,7 +45,7 @@
   let grammarOpen = $state(false);
 
   // Datalist source: the user's current rack.
-  const rackNames = $derived(Array.from(vectorRack.entries.keys()));
+  const rackNames = $derived(Array.from(steerRack.entries.keys()));
 
   // Live validator — re-runs every keystroke; cheap.
   $effect(() => {
@@ -58,7 +58,7 @@
       return;
     }
     try {
-      const { vectors: rack } = parseExpression(expr);
+      const rack = parseExpression(expr);
       preview = serializeExpression(rack);
       parseError = null;
       parseCol = null;
@@ -90,14 +90,16 @@
   function applyVariantToExpression(): void {
     const expr = expression.trim();
     if (!expr) return;
-    let rack: Map<string, VectorRackEntry>;
+    let rack: Map<string, SteerEntry>;
     try {
-      rack = parseExpression(expr).vectors;
+      rack = parseExpression(expr);
     } catch {
       return;
     }
     for (const entry of rack.values()) {
-      entry.variant = effectiveVariant();
+      // Variant lives on vector (pole/DiM) terms only; a ``%`` position term
+      // carries no variant suffix.
+      if (entry.mode === "vector") entry.variant = effectiveVariant();
     }
     expression = serializeExpression(rack);
   }

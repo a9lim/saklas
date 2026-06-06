@@ -37,17 +37,18 @@ import type {
 import type {
   ChatTurn,
   GenStatus,
-  ManifoldRackEntry,
   PendingAction,
+  PositionSteerEntry,
   ProbeInfo,
   ProbeReadingJSON,
   ProbeRackEntry,
   ProbeSortMode,
   ProjectionSpec,
+  SteerEntry,
   TokenScore,
   Trigger,
   Variant,
-  VectorRackEntry,
+  VectorSteerEntry,
   WSSampling,
 } from "./types";
 import { serializeExpression } from "./expression";
@@ -239,18 +240,39 @@ export async function rewindSession(): Promise<void> {
   }
 }
 
-// =========================================================== vectors ====
+// =========================================================== steering ===
+//
+// One unified steer rack.  A steering vector is the K=2 flat case of a
+// manifold, so vectors (pole/DiM axes) and manifold positions share one
+// ``entries`` map of tagged ``SteerEntry`` (``mode: "vector" | "position"``),
+// one card, and one serializer.  The sidecars that used to hang off the two
+// separate racks live here too: ``profiles`` + ``correlation`` (vector
+// metadata) and ``catalog`` + ``unavailable`` / ``loading`` / ``error`` (the
+// manifold HTTP surface).
+//
+// The ``setVector*`` / ``setManifold*`` / ``add*`` mutators are kept as
+// mode-guarded shims so the drawers + cards that call them are untouched by
+// the collapse — a ``setVector*`` no-ops on a position entry and vice versa.
 
-export interface VectorRack {
-  /** Rack key = atom display form (``honest``, ``ns/foo``, ``happy.sad``).
-   * One entry per concept.  Variant lives on the entry, not the key —
-   * matching the saklas parser's Steering.alphas semantics. */
-  entries: Map<string, VectorRackEntry>;
+export interface SteerRack {
+  /** Rack key = atom display form (``honest``, ``ns/foo``, ``happy.sad``,
+   *  ``personas``).  One entry per name; ``mode`` discriminates vector
+   *  (pole/DiM) vs position (manifold ``%``).  Variant lives on the entry,
+   *  not the key — matching the saklas parser's Steering.alphas semantics. */
+  entries: Map<string, SteerEntry>;
   /** Per-vector profile metadata fetched from GET /vectors/{name}.
    * Populated lazily; absent until the user opens a strip's expander. */
   profiles: Map<string, VectorInfo>;
   /** Cosine matrix from GET /correlation; refreshed after each generation. */
   correlation: CorrelationData | null;
+  /** Server-side catalog of available manifolds — refreshed by
+   *  ``refreshManifoldList``.  Empty (and ``unavailable`` true) on servers
+   *  that pre-date the manifold HTTP surface. */
+  catalog: ManifoldInfo[];
+  /** True when the manifold list route 404s — older server. */
+  unavailable: boolean;
+  loading: boolean;
+  error: string | null;
 }
 
 // SvelteMap from svelte/reactivity — plain Map mutations don't trigger
@@ -258,10 +280,14 @@ export interface VectorRack {
 // update wouldn't re-render the strips list.  SvelteMap.set/.delete is
 // rune-tracked.  Inner-object property writes still aren't tracked, so
 // callers that mutate an entry must reassign via .set(name, {...e, …}).
-export const vectorRack: VectorRack = $state({
+export const steerRack: SteerRack = $state({
   entries: new SvelteMap(),
   profiles: new SvelteMap(),
   correlation: null,
+  catalog: [],
+  unavailable: false,
+  loading: false,
+  error: null,
 });
 
 /** Server-derived list of registered vectors — names only.  Mirrors
@@ -275,13 +301,13 @@ export async function refreshVectorList(): Promise<void> {
   vectorsState.names = r.vectors.map((v) => v.name);
   // Cache profile metadata — cheap, server already serialized.
   for (const v of r.vectors) {
-    vectorRack.profiles.set(v.name, v);
+    steerRack.profiles.set(v.name, v);
   }
 }
 
 export async function refreshVector(name: string): Promise<VectorInfo> {
   const info = await apiVectors.get(name);
-  vectorRack.profiles.set(name, info);
+  steerRack.profiles.set(name, info);
   return info;
 }
 
@@ -290,102 +316,26 @@ export async function refreshCorrelation(
 ): Promise<void> {
   try {
     const data = await apiVectors.correlation(names);
-    vectorRack.correlation = data;
+    steerRack.correlation = data;
   } catch {
-    vectorRack.correlation = null;
+    steerRack.correlation = null;
   }
 }
 
-// SvelteMap tracks .set/.delete; mutations on stored objects are NOT
-// tracked, so each setter reassigns the entry via .set with a fresh
-// spread.  This pattern is uniform across every rack mutator.
-export function setVectorAlpha(name: string, alpha: number): void {
-  enqueueOrApply(`alpha ${name} ${alpha.toFixed(3)}`, () => {
-    const e = vectorRack.entries.get(name);
-    if (e) {
-      vectorRack.entries.set(name, { ...e, alpha });
-    } else {
-      vectorRack.entries.set(name, defaultRackEntry(alpha));
-    }
-  });
-}
+// ---------------------------------------------------- vector-mode mutators
 
-export function setVectorEnabled(name: string, enabled: boolean): void {
-  enqueueOrApply(`${enabled ? "enable" : "disable"} ${name}`, () => {
-    const e = vectorRack.entries.get(name);
-    if (e) vectorRack.entries.set(name, { ...e, enabled });
-  });
-}
-
-export function setVectorTrigger(name: string, trigger: Trigger): void {
-  enqueueOrApply(`trigger ${name} ${trigger}`, () => {
-    const e = vectorRack.entries.get(name);
-    if (e) vectorRack.entries.set(name, { ...e, trigger });
-  });
-}
-
-export function setVectorVariant(name: string, variant: Variant): void {
-  enqueueOrApply(`variant ${name} ${variant}`, () => {
-    const e = vectorRack.entries.get(name);
-    if (e) vectorRack.entries.set(name, { ...e, variant });
-  });
-}
-
-export function setVectorProjection(
-  name: string,
-  projection: ProjectionSpec | null,
-): void {
-  enqueueOrApply(`project ${name}`, () => {
-    const e = vectorRack.entries.get(name);
-    if (e) {
-      // Ablation can't compose with projection — clear if a projection
-      // was just set on top of an ablated entry.
-      vectorRack.entries.set(name, {
-        ...e,
-        projection,
-        ablate: projection ? false : e.ablate,
-      });
-    }
-  });
-}
-
-export function setVectorAblate(name: string, ablate: boolean): void {
-  enqueueOrApply(`ablate ${name} ${ablate}`, () => {
-    const e = vectorRack.entries.get(name);
-    if (e) {
-      vectorRack.entries.set(name, {
-        ...e,
-        ablate,
-        projection: ablate ? null : e.projection,
-      });
-    }
-  });
-}
-
-/** Default α for a freshly-added rack entry — matches DEFAULT_COEFF in
- * saklas.core.steering_expr (TUI's /steer assumes 0.5 when the user
- * types a bare term).  α=0 would serialize to an empty expression and
- * make the new strip invisible in the EXPR block. */
+/** Default α for a freshly-added vector entry — matches DEFAULT_COEFF in
+ * saklas.core.steering_expr (TUI's /steer assumes 0.5 when the user types a
+ * bare term).  α=0 would serialize to an empty expression and make the new
+ * strip invisible in the EXPR block. */
 const DEFAULT_RACK_ALPHA = 0.5;
 
-export function addVectorToRack(
-  name: string,
-  alpha: number = DEFAULT_RACK_ALPHA,
-  trigger: Trigger = "BOTH",
-): void {
-  if (vectorRack.entries.has(name)) return;
-  vectorRack.entries.set(name, defaultRackEntry(alpha, trigger));
-}
-
-export function removeVectorFromRack(name: string): void {
-  vectorRack.entries.delete(name);
-}
-
-function defaultRackEntry(
+function defaultVectorEntry(
   alpha: number = 0,
   trigger: Trigger = "BOTH",
-): VectorRackEntry {
+): VectorSteerEntry {
   return {
+    mode: "vector",
     alpha,
     trigger,
     variant: "raw",
@@ -395,62 +345,119 @@ function defaultRackEntry(
   };
 }
 
-/** The canonical expression string the racks would send to the server.
- * Recomputed on demand; cheap.  Folds in manifold (``%``) terms after
- * the vector terms. */
+/** Reassign a vector-mode entry through ``fn``; no-op if the entry is absent
+ *  or is a position term (a ``setVector*`` shim never touches a manifold). */
+function mutateVector(
+  name: string,
+  fn: (e: VectorSteerEntry) => VectorSteerEntry,
+): void {
+  const e = steerRack.entries.get(name);
+  if (e && e.mode === "vector") steerRack.entries.set(name, fn(e));
+}
+
+// SvelteMap tracks .set/.delete; mutations on stored objects are NOT
+// tracked, so each setter reassigns the entry via .set with a fresh
+// spread.  This pattern is uniform across every rack mutator.
+export function setVectorAlpha(name: string, alpha: number): void {
+  enqueueOrApply(`alpha ${name} ${alpha.toFixed(3)}`, () => {
+    const e = steerRack.entries.get(name);
+    if (e && e.mode === "vector") {
+      steerRack.entries.set(name, { ...e, alpha });
+    } else if (!e) {
+      steerRack.entries.set(name, defaultVectorEntry(alpha));
+    }
+  });
+}
+
+export function setVectorEnabled(name: string, enabled: boolean): void {
+  enqueueOrApply(`${enabled ? "enable" : "disable"} ${name}`, () => {
+    mutateVector(name, (e) => ({ ...e, enabled }));
+  });
+}
+
+export function setVectorTrigger(name: string, trigger: Trigger): void {
+  enqueueOrApply(`trigger ${name} ${trigger}`, () => {
+    mutateVector(name, (e) => ({ ...e, trigger }));
+  });
+}
+
+export function setVectorVariant(name: string, variant: Variant): void {
+  enqueueOrApply(`variant ${name} ${variant}`, () => {
+    mutateVector(name, (e) => ({ ...e, variant }));
+  });
+}
+
+export function setVectorProjection(
+  name: string,
+  projection: ProjectionSpec | null,
+): void {
+  enqueueOrApply(`project ${name}`, () => {
+    // Ablation can't compose with projection — clear it if a projection
+    // was just set on top of an ablated entry.
+    mutateVector(name, (e) => ({
+      ...e,
+      projection,
+      ablate: projection ? false : e.ablate,
+    }));
+  });
+}
+
+export function setVectorAblate(name: string, ablate: boolean): void {
+  enqueueOrApply(`ablate ${name} ${ablate}`, () => {
+    mutateVector(name, (e) => ({
+      ...e,
+      ablate,
+      projection: ablate ? null : e.projection,
+    }));
+  });
+}
+
+export function addVectorToRack(
+  name: string,
+  alpha: number = DEFAULT_RACK_ALPHA,
+  trigger: Trigger = "BOTH",
+): void {
+  if (steerRack.entries.has(name)) return;
+  steerRack.entries.set(name, defaultVectorEntry(alpha, trigger));
+}
+
+export function removeVectorFromRack(name: string): void {
+  steerRack.entries.delete(name);
+}
+
+/** The canonical expression string the rack would send to the server.
+ * Recomputed on demand; cheap.  Vector terms first, then position (``%``)
+ * terms — the serializer picks each production from ``entry.mode``. */
 export function currentSteeringExpression(): string {
-  return serializeExpression(vectorRack.entries, manifoldRack.entries);
+  return serializeExpression(steerRack.entries);
 }
 
-// ========================================================= manifolds ====
-
-export interface ManifoldRack {
-  /** Server-side catalog of available manifolds — refreshed by
-   *  ``refreshManifoldList``.  Empty (and ``unavailable`` true) on
-   *  servers that pre-date the manifold HTTP surface. */
-  catalog: ManifoldInfo[];
-  /** Racked manifolds keyed by display name (``ns/name`` or bare
-   *  ``name``).  Each entry carries blend / coords / trigger / enabled
-   *  — parallel to the vector rack. */
-  entries: Map<string, ManifoldRackEntry>;
-  /** True when the manifold list route 404s — older server. */
-  unavailable: boolean;
-  loading: boolean;
-  error: string | null;
-}
-
-export const manifoldRack: ManifoldRack = $state({
-  catalog: [],
-  entries: new SvelteMap(),
-  unavailable: false,
-  loading: false,
-  error: null,
-});
+// ------------------------------------------------------ manifold catalog
 
 /** Fetch the manifold catalog.  Tolerates a 404 from an older server —
  *  flips ``unavailable`` and leaves the catalog empty. */
 export async function refreshManifoldList(): Promise<void> {
-  manifoldRack.loading = true;
+  steerRack.loading = true;
   try {
     const r = await apiManifolds.list();
-    manifoldRack.catalog = r.manifolds;
-    manifoldRack.unavailable = false;
-    manifoldRack.error = null;
+    steerRack.catalog = r.manifolds;
+    steerRack.unavailable = false;
+    steerRack.error = null;
   } catch (e) {
     if (e instanceof ApiError && e.status === 404) {
-      manifoldRack.unavailable = true;
-      manifoldRack.catalog = [];
+      steerRack.unavailable = true;
+      steerRack.catalog = [];
     } else {
-      manifoldRack.error = e instanceof Error ? e.message : String(e);
+      steerRack.error = e instanceof Error ? e.message : String(e);
     }
   } finally {
-    manifoldRack.loading = false;
+    steerRack.loading = false;
   }
 }
 
 /** Look up a catalog row by display name (``ns/name`` or bare name). */
 export function manifoldByName(name: string): ManifoldInfo | null {
-  for (const m of manifoldRack.catalog) {
+  for (const m of steerRack.catalog) {
     if (`${m.namespace}/${m.name}` === name || m.name === name) return m;
   }
   return null;
@@ -469,12 +476,26 @@ export function manifoldCentroid(m: ManifoldInfo): number[] {
   return new Array(m.intrinsic_dim).fill(0);
 }
 
-/** Add a manifold to the rack at its domain centroid, blend 0.5. */
+// ---------------------------------------------------- position-mode mutators
+
+/** Reassign a position-mode entry through ``fn``; no-op if the entry is
+ *  absent or is a vector term (a ``setManifold*`` shim never touches a
+ *  pole/DiM axis). */
+function mutatePosition(
+  name: string,
+  fn: (e: PositionSteerEntry) => PositionSteerEntry,
+): void {
+  const e = steerRack.entries.get(name);
+  if (e && e.mode === "position") steerRack.entries.set(name, fn(e));
+}
+
+/** Add a manifold to the rack at its domain centroid, along 0.5. */
 export function addManifoldToRack(name: string): void {
-  if (manifoldRack.entries.has(name)) return;
+  if (steerRack.entries.has(name)) return;
   const info = manifoldByName(name);
   const coords = info ? manifoldCentroid(info) : [];
-  manifoldRack.entries.set(name, {
+  steerRack.entries.set(name, {
+    mode: "position",
     blend: 0.5,
     onto: 0,
     coords,
@@ -485,13 +506,12 @@ export function addManifoldToRack(name: string): void {
 }
 
 export function removeManifoldFromRack(name: string): void {
-  manifoldRack.entries.delete(name);
+  steerRack.entries.delete(name);
 }
 
 export function setManifoldBlend(name: string, blend: number): void {
   enqueueOrApply(`manifold blend ${name} ${blend.toFixed(3)}`, () => {
-    const e = manifoldRack.entries.get(name);
-    if (e) manifoldRack.entries.set(name, { ...e, blend });
+    mutatePosition(name, (e) => ({ ...e, blend }));
   });
 }
 
@@ -499,8 +519,7 @@ export function setManifoldBlend(name: string, blend: number): void {
  *  coefficient).  Curved-only; vacuous for flat/affine terms. */
 export function setManifoldOnto(name: string, onto: number): void {
   enqueueOrApply(`manifold onto ${name} ${onto.toFixed(3)}`, () => {
-    const e = manifoldRack.entries.get(name);
-    if (e) manifoldRack.entries.set(name, { ...e, onto });
+    mutatePosition(name, (e) => ({ ...e, onto }));
   });
 }
 
@@ -510,10 +529,7 @@ export function setManifoldCoords(name: string, coords: number[]): void {
   // serializes as a coord list and the snap-to-node dropdown shows
   // "(no node)" until the user picks one.
   enqueueOrApply(`manifold coords ${name}`, () => {
-    const e = manifoldRack.entries.get(name);
-    if (e) manifoldRack.entries.set(name, {
-      ...e, coords: [...coords], label: null,
-    });
+    mutatePosition(name, (e) => ({ ...e, coords: [...coords], label: null }));
   });
 }
 
@@ -524,38 +540,35 @@ export function setManifoldCoords(name: string, coords: number[]): void {
  *  position correctly. */
 export function setManifoldLabel(name: string, label: string | null): void {
   enqueueOrApply(`manifold label ${name} ${label ?? "<null>"}`, () => {
-    const e = manifoldRack.entries.get(name);
-    if (!e) return;
     if (label === null) {
-      manifoldRack.entries.set(name, { ...e, label: null });
+      mutatePosition(name, (e) => ({ ...e, label: null }));
       return;
     }
     const info = manifoldByName(name);
-    if (!info) {
-      // No catalog metadata — accept the label without mirroring
-      // coords; downstream resolution happens server-side.
-      manifoldRack.entries.set(name, { ...e, label });
-      return;
-    }
-    const idx = info.node_labels.indexOf(label);
-    const coords = (idx >= 0 && info.node_coords[idx])
-      ? [...info.node_coords[idx]]
-      : e.coords;
-    manifoldRack.entries.set(name, { ...e, label, coords });
+    mutatePosition(name, (e) => {
+      if (!info) {
+        // No catalog metadata — accept the label without mirroring
+        // coords; downstream resolution happens server-side.
+        return { ...e, label };
+      }
+      const idx = info.node_labels.indexOf(label);
+      const coords = (idx >= 0 && info.node_coords[idx])
+        ? [...info.node_coords[idx]]
+        : e.coords;
+      return { ...e, label, coords };
+    });
   });
 }
 
 export function setManifoldTrigger(name: string, trigger: Trigger): void {
   enqueueOrApply(`manifold trigger ${name} ${trigger}`, () => {
-    const e = manifoldRack.entries.get(name);
-    if (e) manifoldRack.entries.set(name, { ...e, trigger });
+    mutatePosition(name, (e) => ({ ...e, trigger }));
   });
 }
 
 export function setManifoldEnabled(name: string, enabled: boolean): void {
   enqueueOrApply(`manifold ${enabled ? "enable" : "disable"} ${name}`, () => {
-    const e = manifoldRack.entries.get(name);
-    if (e) manifoldRack.entries.set(name, { ...e, enabled });
+    mutatePosition(name, (e) => ({ ...e, enabled }));
   });
 }
 

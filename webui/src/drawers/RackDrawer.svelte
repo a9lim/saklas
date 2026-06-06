@@ -33,7 +33,7 @@
     attachProbe,
     closeDrawer,
     probeRack,
-    manifoldRack,
+    steerRack,
     openDrawer,
     refreshManifoldList,
     refreshProbeList,
@@ -221,12 +221,12 @@
   }
 
   const fitted = $derived(
-    manifoldRack.catalog.filter(
+    steerRack.catalog.filter(
       (m) => inFamily(m) && m.fitted_for_session && rowMatches(m, query.trim()),
     ),
   );
   const unfitted = $derived(
-    manifoldRack.catalog.filter(
+    steerRack.catalog.filter(
       (m) => inFamily(m) && !m.fitted_for_session && rowMatches(m, query.trim()),
     ),
   );
@@ -234,7 +234,7 @@
   // Whether *any* row in the family exists at all (drives the empty
   // states vs the "no match" state).
   const familyTotal = $derived(
-    manifoldRack.catalog.filter((m) => inFamily(m)).length,
+    steerRack.catalog.filter((m) => inFamily(m)).length,
   );
 
   // ----- category grouping --------------------------------------------
@@ -276,8 +276,8 @@
   // ----- per-row membership -------------------------------------------
 
   function isRacked(m: ManifoldInfo): boolean {
-    return manifoldRack.entries.has(rowKey(m)) ||
-      manifoldRack.entries.has(m.name);
+    return steerRack.entries.has(rowKey(m)) ||
+      steerRack.entries.has(m.name);
   }
 
   function isProbed(m: ManifoldInfo): boolean {
@@ -731,7 +731,7 @@
       <span class="build-hint">{launcherHint}</span>
     </button>
 
-    {#if !manifoldRack.unavailable && familyTotal > 0}
+    {#if !steerRack.unavailable && familyTotal > 0}
       <div class="search-row">
         <input
           type="search"
@@ -748,23 +748,23 @@
           type="button"
           class="refresh"
           onclick={() => void refreshManifoldList()}
-          disabled={manifoldRack.loading}
+          disabled={steerRack.loading}
           title="re-fetch"
           aria-label="Refresh"
-        >{manifoldRack.loading ? "…" : "↻"}</button>
+        >{steerRack.loading ? "…" : "↻"}</button>
       </div>
     {/if}
 
-    {#if manifoldRack.error}
-      <p class="error" role="alert">{manifoldRack.error}</p>
+    {#if steerRack.error}
+      <p class="error" role="alert">{steerRack.error}</p>
     {/if}
 
-    {#if manifoldRack.unavailable}
+    {#if steerRack.unavailable}
       <p class="muted">
         this server doesn't expose the manifold API — update saklas to
         author and fit steering {title === "manifold" ? "manifolds" : "subspaces"}.
       </p>
-    {:else if manifoldRack.loading && familyTotal === 0}
+    {:else if steerRack.loading && familyTotal === 0}
       <p class="muted">loading…</p>
     {:else if familyTotal === 0}
       <p class="muted">

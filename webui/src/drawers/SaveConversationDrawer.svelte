@@ -10,7 +10,7 @@
 
   import {
     chatLog,
-    vectorRack,
+    steerRack,
     probeRack,
     highlightState,
     samplingState,
@@ -32,10 +32,12 @@
     model_id: sessionState.info?.model_id ?? null,
     session_id: sessionState.info?.id ?? null,
     chatLog: chatLog.turns,
-    vectorRack: [...vectorRack.entries.entries()].map(([name, entry]) => ({
-      name,
-      ...entry,
-    })),
+    // Only vector-mode terms persist in the legacy ``vectorRack`` array
+    // (position/manifold terms were never saved); filter so the loader's
+    // addVectorToRack path never sees a manifold entry.
+    vectorRack: [...steerRack.entries.entries()]
+      .filter(([, entry]) => entry.mode === "vector")
+      .map(([name, entry]) => ({ name, ...entry })),
     probeRack: {
       sortMode: probeRack.sortMode,
       active: [...probeRack.active],
@@ -126,7 +128,7 @@
       <pre class="preview" aria-label="Preview JSON">{previewDisplay}</pre>
       <span class="meta">
         {chatLog.turns.length} turn{chatLog.turns.length === 1 ? "" : "s"} ·
-        {vectorRack.entries.size} vector{vectorRack.entries.size === 1 ? "" : "s"} ·
+        {snapshot.vectorRack.length} vector{snapshot.vectorRack.length === 1 ? "" : "s"} ·
         {probeRack.active.length} probe{probeRack.active.length === 1 ? "" : "s"}
       </span>
     </div>

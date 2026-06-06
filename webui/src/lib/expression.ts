@@ -15,21 +15,24 @@
 // places generation at a point of a fitted steering manifold.  The
 // coefficient is the blend fraction.
 //
-// The racks are the source of truth — VectorRackEntry stores α, trigger,
-// variant, projection, ablate, enabled; ManifoldRackEntry stores blend,
-// coords, trigger, enabled.  serializeExpression emits the canonical
-// string the server's parser accepts; parseExpression hydrates fresh
-// rack Maps from a pasted expression.
+// One unified steer rack is the source of truth — a ``Map<string,
+// SteerEntry>`` where each entry is ``mode: "vector"`` (α, trigger, variant,
+// projection, ablate, enabled) or ``mode: "position"`` (blend, onto, coords,
+// label, trigger, enabled).  serializeExpression picks the grammar
+// production per entry from ``mode``; parseExpression hydrates a fresh map
+// from a pasted expression, landing ``%`` terms as ``position`` and
+// everything else as ``vector``.
 //
-// Round-trip property: parseExpression(serializeExpression(v, m)) ===
-// {v, m} for any disabled-stripped racks the parser can express.
+// Round-trip property: parseExpression(serializeExpression(m)) === m for any
+// disabled-stripped rack the parser can express.
 
 import type {
-  ManifoldRackEntry,
+  PositionSteerEntry,
   ProjectionSpec,
+  SteerEntry,
   Trigger,
   Variant,
-  VectorRackEntry,
+  VectorSteerEntry,
 } from "./types";
 
 // ----------------------------------------------- triggers ----------------
@@ -81,21 +84,19 @@ export class ExpressionParseError extends Error {
 
 // ----------------------------------------------- formatter ---------------
 
-/** Render the racks as a canonical expression string.  Disabled
- * entries are skipped; manifold terms are emitted after vector terms.
- * Empty/all-disabled racks return "". */
+/** Render the rack as a canonical expression string.  Disabled entries are
+ * skipped; position (``%``) terms are emitted after vector terms (preserving
+ * the canonical ordering the prior two-rack serializer produced, so the EXPR
+ * display stays stable).  Empty/all-disabled racks return "". */
 export function serializeExpression(
-  rack: Map<string, VectorRackEntry>,
-  manifolds?: Map<string, ManifoldRackEntry>,
+  rack: Map<string, SteerEntry>,
 ): string {
   const parts: string[] = [];
   for (const [name, entry] of rack) {
-    if (!entry.enabled) continue;
-    parts.push(formatTerm(name, entry));
+    if (entry.enabled && entry.mode === "vector") parts.push(formatTerm(name, entry));
   }
-  if (manifolds) {
-    for (const [name, entry] of manifolds) {
-      if (!entry.enabled) continue;
+  for (const [name, entry] of rack) {
+    if (entry.enabled && entry.mode === "position") {
       parts.push(formatManifoldTerm(name, entry));
     }
   }
@@ -111,7 +112,7 @@ export function serializeExpression(
   return out;
 }
 
-function formatTerm(name: string, entry: VectorRackEntry): string {
+function formatTerm(name: string, entry: VectorSteerEntry): string {
   const coeff = entry.alpha;
   const triggerSuffix = formatTriggerSuffix(entry.trigger);
   if (entry.ablate) {
@@ -153,7 +154,7 @@ function formatTriggerSuffix(trigger: Trigger): string {
  *  (``-`` rides the joiner like vector terms).  ``<position>`` is the
  *  label form (``persona%pirate``) when ``entry.label`` is set;
  *  otherwise the comma-joined coord list (``persona%0.3,0.8``). */
-function formatManifoldTerm(name: string, entry: ManifoldRackEntry): string {
+function formatManifoldTerm(name: string, entry: PositionSteerEntry): string {
   const position = entry.label
     ? entry.label
     : entry.coords.map((c) => formatCoeff(c)).join(",");
@@ -560,48 +561,43 @@ function atomKey(atom: Atom): string {
   return atom.namespace ? `${atom.namespace}/${atom.concept}` : atom.concept;
 }
 
-/** Result of {@link parseExpression} — the two racks a pasted
- *  expression hydrates: classic vector terms plus manifold (``%``)
- *  terms. */
-export interface ParsedExpression {
-  vectors: Map<string, VectorRackEntry>;
-  manifolds: Map<string, ManifoldRackEntry>;
-}
-
-/** Hydrate the vector + manifold racks from an expression string.
- *  Vector rack keys use the atom's display form (ns/foo, happy.sad) —
- *  variants live on the entry, not in the key, so two terms differing
- *  only by variant collide (matching the saklas parser's
- *  Steering.alphas semantics; users wanting both should ablate-or-merge
- *  explicitly).  Manifold rack keys are the manifold display name. */
-export function parseExpression(expr: string): ParsedExpression {
+/** Hydrate the unified steer rack from an expression string.  Rack keys use
+ *  the atom's display form (ns/foo, happy.sad, personas) — variants live on
+ *  the entry, not in the key, so two terms differing only by variant collide
+ *  (matching the saklas parser's Steering.alphas semantics; users wanting
+ *  both should ablate-or-merge explicitly).  A ``%`` term lands a
+ *  ``position`` entry, everything else a ``vector`` entry; a name appearing
+ *  as both is a conflict. */
+export function parseExpression(expr: string): Map<string, SteerEntry> {
   if (!expr || !expr.trim()) {
     throw new ExpressionParseError("empty steering expression", expr, null);
   }
   const toks = lex(expr);
   const terms = new Parser(toks, expr).parse();
-  const rack = new Map<string, VectorRackEntry>();
-  const manifolds = new Map<string, ManifoldRackEntry>();
+  const rack = new Map<string, SteerEntry>();
 
   for (const term of terms) {
     if (term.kind === "manifold") {
       const trigger: Trigger = term.trigger
         ? KEYWORD_TO_TRIGGER[term.trigger]
         : "BOTH";
-      const existing = manifolds.get(term.name);
+      const existing = rack.get(term.name);
       if (existing) {
         throw new ExpressionParseError(
-          `manifold '${term.name}' appears more than once`,
+          existing.mode === "position"
+            ? `manifold '${term.name}' appears more than once`
+            : `'${term.name}' appears as both a vector and a manifold term`,
           expr,
           null,
         );
       }
       // Label-form term: ``coords`` is null on the parser output and
-      // will be filled in when the strip resolves through the
-      // catalog's ``node_labels`` (else stays empty until the user
-      // pulls on the XYPad).  Coord-form: ``coords`` is the literal
-      // tuple, ``label`` is null.
-      manifolds.set(term.name, {
+      // will be filled in when the card resolves through the catalog's
+      // ``node_labels`` (else stays empty until the user pulls on the
+      // XYPad).  Coord-form: ``coords`` is the literal tuple, ``label``
+      // is null.
+      rack.set(term.name, {
+        mode: "position",
         blend: term.coeff,
         onto: term.onto ?? 0,
         coords: term.coords ?? [],
@@ -649,19 +645,36 @@ export function parseExpression(expr: string): ParsedExpression {
 
     mergePlain(rack, baseKey, term.coeff, trigger, sel.base.variant);
   }
-  return { vectors: rack, manifolds };
+  return rack;
+}
+
+/** Narrow a same-key entry to vector mode, or throw — a name can't appear as
+ *  both a vector (pole/DiM) term and a position (``%``) term. */
+function asVector(
+  existing: SteerEntry | undefined,
+  key: string,
+): VectorSteerEntry | undefined {
+  if (existing && existing.mode !== "vector") {
+    throw new ExpressionParseError(
+      `'${key}' appears as both a vector and a manifold term`,
+      key,
+      null,
+    );
+  }
+  return existing;
 }
 
 function mergePlain(
-  rack: Map<string, VectorRackEntry>,
+  rack: Map<string, SteerEntry>,
   key: string,
   coeff: number,
   trigger: Trigger,
   variant: Variant,
 ): void {
-  const existing = rack.get(key);
+  const existing = asVector(rack.get(key), key);
   if (!existing) {
     rack.set(key, {
+      mode: "vector",
       alpha: coeff,
       trigger,
       variant,
@@ -703,16 +716,17 @@ function mergePlain(
 }
 
 function mergeProjected(
-  rack: Map<string, VectorRackEntry>,
+  rack: Map<string, SteerEntry>,
   baseKey: string,
   coeff: number,
   trigger: Trigger,
   variant: Variant,
   projection: ProjectionSpec,
 ): void {
-  const existing = rack.get(baseKey);
+  const existing = asVector(rack.get(baseKey), baseKey);
   if (!existing) {
     rack.set(baseKey, {
+      mode: "vector",
       alpha: coeff,
       trigger,
       variant,
@@ -745,15 +759,16 @@ function mergeProjected(
 }
 
 function mergeAblation(
-  rack: Map<string, VectorRackEntry>,
+  rack: Map<string, SteerEntry>,
   baseKey: string,
   coeff: number,
   trigger: Trigger,
   variant: Variant,
 ): void {
-  const existing = rack.get(baseKey);
+  const existing = asVector(rack.get(baseKey), baseKey);
   if (!existing) {
     rack.set(baseKey, {
+      mode: "vector",
       alpha: coeff,
       trigger,
       variant,

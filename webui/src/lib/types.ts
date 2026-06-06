@@ -1111,11 +1111,33 @@ export interface ProjectionSpec {
   target: string;
 }
 
-export interface VectorRackEntry {
+// ----------------------------------------------------- steer rack --
+//
+// One unified steering term.  A steering vector is the K=2 flat case of a
+// manifold, so both shapes share one rack and one card; ``mode`` is the
+// discriminator the serializer reads to pick the grammar production:
+//
+//   ``vector``   → a bipolar/monopolar concept axis (or any pole/DiM term),
+//                  serializes as ``[α] [!] name[:variant] [~|target] [@trig]``.
+//                  Owns the signed slider, projection (``~``/``|``),
+//                  ablation (``!``), and the tensor variant.
+//   ``position`` → a placement on a fitted manifold (flat fan or curved
+//                  surface), serializes as ``[along[,onto]] name%pos [@trig]``.
+//                  Owns snap-to-node, the XYPad, and the along/onto sliders.
+//
+// ``mode`` is set at add time (the drawer picks the adder by node count) and
+// at parse time (a ``%`` term lands ``position``; everything else
+// ``vector``), never flipped in the UI — a 2-node axis is always addressed
+// as a pole, a multi-node manifold always as a position.  The grammar forbids
+// ``%`` composing with ``~``/``|``/``!``, which is exactly why the two modes
+// carry disjoint control fields.
+
+/** Vector-mode steering term — a pole/DiM axis with a signed coefficient. */
+export interface VectorSteerEntry {
+  mode: "vector";
   /** Slider value in [-1, +1].  Sign is the user's typed sign — ``serialize``
    * preserves it as the term coefficient. */
   alpha: number;
-  trigger: Trigger;
   variant: Variant;
   /** Optional projection — keep (``~``) or remove (``|``) the shared
    * component with another concept. */
@@ -1123,18 +1145,17 @@ export interface VectorRackEntry {
   /** When true, term is rendered as ``!name``; bare ``!`` defaults to
    * coeff=1.0 (fully replace).  Cannot compose with projection. */
   ablate: boolean;
+  trigger: Trigger;
   /** When false, the term is excluded from serialization (visual but
    * not active). */
   enabled: boolean;
 }
 
-// ----------------------------------------------------- manifold rack --
-
-/** One racked manifold — a steering term placing generation at a point
- *  of a fitted manifold.  ``coords`` is one authoring coordinate per
- *  intrinsic dimension; ``blend`` is the soft subspace-replace fraction
- *  in ``[0, 1]``. */
-export interface ManifoldRackEntry {
+/** Position-mode steering term — a placement on a fitted manifold.
+ *  ``coords`` is one authoring coordinate per intrinsic dimension; ``blend``
+ *  (``along``) is the slide fraction toward the position in ``[0, 1]``. */
+export interface PositionSteerEntry {
+  mode: "position";
   /** ``along`` blend fraction in [0, 1] — how far to slide the in-subspace
    *  foot toward the position.  Serializes as the first value of the ``%``
    *  coefficient slot. */
@@ -1147,16 +1168,18 @@ export interface ManifoldRackEntry {
   /** Authoring coordinates, one per intrinsic dimension. */
   coords: number[];
   /** Optional node-label form of the position: when set, the term
-   *  serializes as ``<name>%<label>`` (Phase B label-form) and the
-   *  coords are this node's authoring coords mirrored for the XYPad
-   *  display.  ``null`` = the position was authored coord-wise (drag
-   *  on the XYPad), serialize as the comma-joined coord list.  Pulling
-   *  on the XYPad clears the label; picking from the snap-to-node
-   *  dropdown sets it. */
-  label?: string | null;
+   *  serializes as ``<name>%<label>`` (label-form) and the coords are this
+   *  node's authoring coords mirrored for the XYPad display.  ``null`` = the
+   *  position was authored coord-wise (drag on the XYPad), serialize as the
+   *  comma-joined coord list.  Pulling on the XYPad clears the label;
+   *  picking from the snap-to-node dropdown sets it. */
+  label: string | null;
   trigger: Trigger;
   enabled: boolean;
 }
+
+/** A racked steering term — vector (pole) or position (manifold). */
+export type SteerEntry = VectorSteerEntry | PositionSteerEntry;
 
 // ----------------------------------------------------- extract pairs --
 

@@ -7,7 +7,7 @@
     loomNavigate,
     refreshLoomTree,
     samplingState,
-    vectorRack,
+    steerRack,
     vectorsState,
   } from "../lib/stores.svelte";
   import { serializeExpression } from "../lib/expression";
@@ -31,8 +31,8 @@
   const conceptOptions = $derived.by(() => {
     const names = new Set<string>([
       ...vectorsState.names,
-      ...vectorRack.entries.keys(),
-      ...vectorRack.profiles.keys(),
+      ...steerRack.entries.keys(),
+      ...steerRack.profiles.keys(),
     ]);
     return [...names].sort();
   });
@@ -57,7 +57,7 @@
   }
 
   function firstConcept(): string {
-    return [...vectorRack.entries.keys()][0] ?? vectorsState.names[0] ?? "";
+    return [...steerRack.entries.keys()][0] ?? vectorsState.names[0] ?? "";
   }
 
   function parseAlphaList(raw: string): number[] {
@@ -93,7 +93,7 @@
   function baseSteeringExcluding(axisNames: string[]): string | null {
     const excluded = new Set(axisNames.map((name) => name.trim()).filter(Boolean));
     const base = new Map(
-      [...vectorRack.entries.entries()].filter(([name]) => !excluded.has(name)),
+      [...steerRack.entries.entries()].filter(([name]) => !excluded.has(name)),
     );
     return serializeExpression(base) || null;
   }

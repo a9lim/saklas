@@ -11,10 +11,10 @@
     setVectorProjection,
     setVectorTrigger,
     setVectorVariant,
-    vectorRack,
+    steerRack,
     vectorsState,
   } from "../lib/stores.svelte";
-  import type { Trigger, Variant } from "../lib/types";
+  import type { Trigger, Variant, VectorSteerEntry } from "../lib/types";
   import Select from "../lib/Select.svelte";
   import Checkbox from "../lib/Checkbox.svelte";
 
@@ -26,10 +26,17 @@
   let newVector = $state("");
   let copied = $state(false);
 
-  const entries = $derived([...vectorRack.entries.entries()]);
+  // The recipe builder edits vector (pole/DiM) terms — α slider, projection,
+  // ablation.  Position (manifold ``%``) terms have no α and are authored on
+  // their own card, so they're filtered out of this list.
+  const entries = $derived(
+    [...steerRack.entries.entries()].filter(
+      (e): e is [string, VectorSteerEntry] => e[1].mode === "vector",
+    ),
+  );
   const expression = $derived(currentSteeringExpression());
   const allNames = $derived.by(() => {
-    const names = new Set<string>([...vectorsState.names, ...vectorRack.profiles.keys()]);
+    const names = new Set<string>([...vectorsState.names, ...steerRack.profiles.keys()]);
     return [...names].sort();
   });
 

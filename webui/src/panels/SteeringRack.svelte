@@ -1,59 +1,55 @@
 <script lang="ts">
-  // The steering rack — two harmonised groups split on geometry, not
-  // artifact type:
+  // The steering rack — one unified steerRack, two harmonised groups split
+  // on geometry, not artifact type:
   //
-  //   subspace (flat) — every vectorRack entry (2-node bipolar) plus every
-  //     manifoldRack entry whose catalog fit_mode is pca / baked (a flat
-  //     affine subspace, e.g. personas).
-  //   manifold (curved) — the remaining manifoldRack entries (e.g. pad).
+  //   subspace (flat) — every vector-mode term (2-node bipolar / monopolar
+  //     pole) plus every position-mode term whose catalog fit_mode is pca /
+  //     baked (a flat affine subspace, e.g. personas).
+  //   manifold (curved) — the remaining position-mode terms (e.g. pad).
   //
-  // Every row wears the same RackCard chrome; the family is signalled only
-  // by accent colour + marker glyph.  Light group sub-headers; an empty
-  // group hides.  Footer keeps the + add steering / + add manifold entry
-  // points and their drawer targets.
+  // Every row is one SteerCard wearing the same RackCard chrome; the family
+  // is signalled only by accent colour + marker glyph, and the card branches
+  // its body on entry.mode.  Light group sub-headers; an empty group hides.
+  // Footer keeps the + add steering / + add manifold entry points and their
+  // drawer targets.
 
-  import VectorSteerCard from "./rack/VectorSteerCard.svelte";
-  import ManifoldSteerCard from "./rack/ManifoldSteerCard.svelte";
+  import SteerCard from "./rack/SteerCard.svelte";
   import {
-    vectorRack,
-    manifoldRack,
+    steerRack,
     manifoldByName,
     openDrawer,
   } from "../lib/stores.svelte";
 
-  // Vectors are always subspace.  Alphabetized for stable order — Map
-  // iteration tracks insertion which makes the rack jump around.
-  const sortedVectors = $derived.by(() => {
-    const arr = [...vectorRack.entries.entries()];
-    arr.sort((a, b) => a[0].localeCompare(b[0]));
-    return arr;
-  });
-
-  /** A manifold rack entry is subspace iff its catalog fit_mode is flat
-   *  (pca / baked); otherwise it's the curved manifold family. */
+  /** A position (manifold) term is subspace iff its catalog fit_mode is flat
+   *  (pca / baked); otherwise it's the curved manifold family.  Vector terms
+   *  are always subspace. */
   function isFlatManifold(name: string): boolean {
     const fm = manifoldByName(name)?.fit_mode;
     return fm === "pca" || fm === "baked";
   }
 
-  const flatManifolds = $derived.by(() => {
-    const arr = [...manifoldRack.entries.entries()].filter(([n]) =>
-      isFlatManifold(n),
+  // Subspace = every vector term + every flat position term.  Alphabetized
+  // for stable order — Map iteration tracks insertion which makes the rack
+  // jump around.
+  const subspaceTerms = $derived.by(() => {
+    const arr = [...steerRack.entries.entries()].filter(
+      ([n, e]) => e.mode === "vector" || isFlatManifold(n),
     );
     arr.sort((a, b) => a[0].localeCompare(b[0]));
     return arr;
   });
 
-  const curvedManifolds = $derived.by(() => {
-    const arr = [...manifoldRack.entries.entries()].filter(
-      ([n]) => !isFlatManifold(n),
+  // Manifold = curved position terms only.
+  const curvedTerms = $derived.by(() => {
+    const arr = [...steerRack.entries.entries()].filter(
+      ([n, e]) => e.mode === "position" && !isFlatManifold(n),
     );
     arr.sort((a, b) => a[0].localeCompare(b[0]));
     return arr;
   });
 
-  const subspaceCount = $derived(sortedVectors.length + flatManifolds.length);
-  const manifoldCount = $derived(curvedManifolds.length);
+  const subspaceCount = $derived(subspaceTerms.length);
+  const manifoldCount = $derived(curvedTerms.length);
   const count = $derived(subspaceCount + manifoldCount);
 </script>
 
@@ -71,17 +67,14 @@
     {#if count > 0}
       {#if subspaceCount > 0}
         <h3 class="group-header subspace">subspace</h3>
-        {#each sortedVectors as [name, entry] (name)}
-          <VectorSteerCard {name} {entry} />
-        {/each}
-        {#each flatManifolds as [name, entry] (name)}
-          <ManifoldSteerCard {name} {entry} />
+        {#each subspaceTerms as [name, entry] (name)}
+          <SteerCard {name} {entry} />
         {/each}
       {/if}
       {#if manifoldCount > 0}
         <h3 class="group-header manifold">manifold</h3>
-        {#each curvedManifolds as [name, entry] (name)}
-          <ManifoldSteerCard {name} {entry} />
+        {#each curvedTerms as [name, entry] (name)}
+          <SteerCard {name} {entry} />
         {/each}
       {/if}
     {/if}

@@ -20,7 +20,7 @@
   import { ApiError, apiManifolds } from "../lib/api";
   import {
     closeDrawer,
-    manifoldRack,
+    steerRack,
     refreshManifoldList,
   } from "../lib/stores.svelte";
   import { pushToast } from "../lib/stores/toasts.svelte";
@@ -167,21 +167,21 @@
 
   <div class="body">
     {#if tab === "installed"}
-      {#if manifoldRack.unavailable}
+      {#if steerRack.unavailable}
         <p class="muted">
           this server doesn't expose the manifold API — update saklas to
           author and fit steering manifolds.
         </p>
-      {:else if manifoldRack.loading && manifoldRack.catalog.length === 0}
+      {:else if steerRack.loading && steerRack.catalog.length === 0}
         <p class="muted">loading manifolds…</p>
-      {:else if manifoldRack.catalog.length === 0}
+      {:else if steerRack.catalog.length === 0}
         <p class="muted">
           no manifolds installed yet — search HF above, or use
           <strong>+ build manifold</strong> from the manifold drawer.
         </p>
       {:else}
         <ul class="rows" role="list">
-          {#each manifoldRack.catalog as m (selectorOf(m))}
+          {#each steerRack.catalog as m (selectorOf(m))}
             {@const key = selectorOf(m)}
             {@const badge = fitBadge(m)}
             <li class="row" title={m.description || key}>

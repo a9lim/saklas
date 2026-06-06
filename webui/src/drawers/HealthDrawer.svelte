@@ -11,7 +11,7 @@
     refreshSession,
     refreshVectorList,
     sessionState,
-    vectorRack,
+    steerRack,
     vectorsState,
   } from "../lib/stores.svelte";
 
@@ -98,12 +98,12 @@
       <div class="tile">
         <span>vectors</span>
         <strong>{vectorsState.names.length}</strong>
-        <p>{vectorRack.entries.size} on rack · {vectorRack.profiles.size} profiles cached</p>
+        <p>{steerRack.entries.size} on rack · {steerRack.profiles.size} profiles cached</p>
       </div>
       <div class="tile">
         <span>probes</span>
         <strong>{probeRack.active.length}</strong>
-        <p>{probeRack.entries.size} live rows · {vectorRack.correlation ? "correlation cached" : "no matrix"}</p>
+        <p>{probeRack.entries.size} live rows · {steerRack.correlation ? "correlation cached" : "no matrix"}</p>
       </div>
     </section>
 
@@ -114,7 +114,7 @@
         <div class:ok={!loomTree.unavailable && loomTree.rev > 0}>loom API</div>
         <div class:ok={vectorsState.names.length > 0}>vector registry</div>
         <div class:ok={probeRack.active.length > 0}>probe monitor</div>
-        <div class:ok={vectorRack.correlation !== null}>correlation cache</div>
+        <div class:ok={steerRack.correlation !== null}>correlation cache</div>
       </div>
     </section>
 

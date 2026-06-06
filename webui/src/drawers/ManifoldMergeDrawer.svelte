@@ -15,7 +15,7 @@
   import { ApiError, apiManifolds } from "../lib/api";
   import {
     closeDrawer,
-    manifoldRack,
+    steerRack,
     refreshManifoldList,
   } from "../lib/stores.svelte";
   import { dismissToast, pushToast } from "../lib/stores/toasts.svelte";
@@ -50,7 +50,7 @@
 
   /** Discover-only catalog — merge sources must be autofitted. */
   const discoverManifolds = $derived(
-    manifoldRack.catalog.filter((m) => isDiscoverMode(m)),
+    steerRack.catalog.filter((m) => isDiscoverMode(m)),
   );
 
   function toggleSource(key: string): void {
@@ -63,7 +63,7 @@
   const sourceModes = $derived.by<string[]>(() => {
     const modes = new Set<string>();
     for (const key of selected) {
-      const m = manifoldRack.catalog.find((x) => rowKey(x) === key);
+      const m = steerRack.catalog.find((x) => rowKey(x) === key);
       if (m && m.fit_mode) modes.add(m.fit_mode);
     }
     return [...modes].sort();
@@ -140,7 +140,7 @@
       aren't mergeable — only their <em>autofitted</em> siblings.
     </p>
 
-    {#if manifoldRack.unavailable}
+    {#if steerRack.unavailable}
       <p class="muted">
         this server doesn't expose the manifold API — update saklas to
         author and fit steering manifolds.

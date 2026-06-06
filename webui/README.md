@@ -61,10 +61,11 @@ src/
     StatusFooter.svelte          # ● gen N/M [bar] · t/s · elapsed · ppl
     Chat.svelte                  # thinking-collapsible + live probe-tinted tokens + ⋮ actions menu + auto-regen/pinned split
     SamplingStrip.svelte         # T / P / K / max / seed / thinking + segmented apply-mode
-    SteeringRack.svelte          # vector strips + "+ add steering" + canonical expression
-    VectorStrip.svelte           # ●/○ enable + pole-framed α slider + α display + trigger / variant menu / ⋮ menu / ✕ + inline projection modal
-    ProbeRack.svelte             # sort + "+ add probe"
-    ProbeStrip.svelte            # ●/○ select (whole-row click) + name + right-aligned sparkline + bar + value + ✕ + per-layer cells
+    SteeringRack.svelte          # subspace + manifold groups of steer cards + "+ subspace/manifold steer"
+    ProbeRack.svelte             # subspace + manifold groups of probe cards + sort + "+ subspace/manifold probe"
+    rack/RackCard.svelte         # shared card chrome (statline on top, controls/meters below)
+    rack/SteerCard.svelte        # unified steer card — vector (pole-framed α slider / projection / ablate / variant) | position (snap + XYPad + along / onto)
+    rack/ProbeCard.svelte        # unified probe card — bipolar bar | scalar/fraction + nearest; curved adds coords / residual / mini-map
     loom/                        # LoomSidebar + LoomNode + LoomEdge
   drawers/
     Load / Compare / SystemPrompt / Help / Export

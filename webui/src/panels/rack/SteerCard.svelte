@@ -1,20 +1,30 @@
 <script lang="ts">
-  // Subspace steer card — the harmonised replacement for VectorStrip.  A
-  // steering vector is always the flat (subspace) family: 2-node bipolar
-  // (or a 1-node monopolar fold).  Composes the shared RackCard chrome:
+  // Unified steer card — one row for every steering term.  A steering vector
+  // is the K=2 flat case of a manifold, so this single card replaces the
+  // VectorSteerCard / ManifoldSteerCard split, branching on ``entry.mode``:
   //
-  //   statline : ●/○ enable · name · !ablate · variant chip · trigger pill
-  //              · projection tag · ⋮ menu · ✕ remove   (all one row)
-  //   body     : the bipolar axis as ONE control row —
-  //              neg pole · Slider (α) · pos pole · signed α value
+  //   vector   → a bipolar (or monopolar) concept axis / pole-DiM term.
+  //              statline: ●/○ · name · !ablate · variant chip · trigger
+  //                        · projection tag · ⋮ menu · ✕
+  //              body:     neg pole · Slider(α) · pos pole · signed α
+  //   position → a placement on a fitted manifold (flat fan or curved
+  //              surface).  Flat (pca/baked) wears the subspace accent (●/○,
+  //              --accent); curved (spectral/authored) the manifold accent
+  //              (◆/◇, --accent-purple).
+  //              statline: glyph · name · unfitted/stale warn · trigger · ✕
+  //              body:     snap-to-node Select · XYPad · along [· onto]
   //
-  // Control logic (the 0-detent slider, the variant dropdown, the ⋮ menu,
-  // the inline projection modal, ablate / duplicate / copy-expression /
-  // remove) is carried over verbatim from VectorStrip — this is a
-  // restack into statline/body, not a rewrite.
+  // The two modes carry disjoint control fields (the grammar forbids ``%``
+  // composing with ``~``/``|``/``!``), so the bodies don't share affordances
+  // — but the chrome, trigger pill, enable/remove, and the RackCard shell are
+  // common.  ``v`` / ``p`` are the narrowed entry views the template renders
+  // behind ``{#if v}`` / ``{#if p}`` so svelte-check enforces mode-correct
+  // field access.
 
   import { onMount } from "svelte";
-  import type { ProjectionSpec, Trigger, VectorRackEntry } from "../../lib/types";
+  import type { ProjectionSpec, Trigger } from "../../lib/types";
+  import type { Variant } from "../../lib/types";
+  import type { SteerEntry, VectorSteerEntry, PositionSteerEntry } from "../../lib/types";
   import {
     setVectorAlpha,
     setVectorEnabled,
@@ -24,58 +34,85 @@
     setVectorAblate,
     addVectorToRack,
     removeVectorFromRack,
-    vectorRack,
+    setManifoldBlend,
+    setManifoldOnto,
+    setManifoldCoords,
+    setManifoldLabel,
+    setManifoldTrigger,
+    setManifoldEnabled,
+    removeManifoldFromRack,
+    manifoldByName,
+    steerRack,
   } from "../../lib/stores.svelte";
   import { pushToast } from "../../lib/stores/toasts.svelte";
   import { serializeExpression } from "../../lib/expression";
   import { apiVectors } from "../../lib/api";
   import { polesOf } from "../../lib/concepts";
   import Slider from "../../lib/Slider.svelte";
+  import Select from "../../lib/Select.svelte";
+  import XYPad from "../manifold/XYPad.svelte";
   import RackCard from "./RackCard.svelte";
 
   interface Props {
     name: string;
-    entry: VectorRackEntry;
+    entry: SteerEntry;
   }
 
   let { name, entry }: Props = $props();
 
-  // ---------- bipolar axis ----------
+  // Narrowed views — exactly one is non-null per entry.
+  const v = $derived<VectorSteerEntry | null>(
+    entry.mode === "vector" ? entry : null,
+  );
+  const p = $derived<PositionSteerEntry | null>(
+    entry.mode === "position" ? entry : null,
+  );
+
+  // ---------- family chrome (accent + enable glyph) ----------
+
+  /** Catalog row for a position term (drives flat/curved + node list). */
+  const info = $derived(entry.mode === "position" ? manifoldByName(name) : null);
+  /** Flat (affine) iff the fit is a discover-pca or baked direction. */
+  const flat = $derived(info?.fit_mode === "pca" || info?.fit_mode === "baked");
+  /** Subspace family = every vector term plus every flat position term. */
+  const subspace = $derived(entry.mode === "vector" || flat);
+
+  const accent = $derived(subspace ? "--accent" : "--accent-purple");
+  const enableGlyph = $derived(
+    subspace ? (entry.enabled ? "●" : "○") : (entry.enabled ? "◆" : "◇"),
+  );
+
+  /** Display name — bare name with the namespace prefix stripped
+   *  (``default/personas`` → ``personas``).  Full name stays in the tooltip. */
+  const displayName = $derived(name.split("/").pop() ?? name);
+
+  // ---------- bipolar axis (vector mode) ----------
 
   const poles = $derived(polesOf(name));
   const monopolar = $derived(poles.negative === null);
+  const alpha = $derived(v?.alpha ?? 0);
 
-  // ---------- α slider with 0 detent ----------
-
-  /** Coerce the slider's raw value to the 0-detent snap.  ±0.025 collapses
-   * to 0 so users can park the term off without fiddling. */
   function snapAlpha(raw: number): number {
     if (Math.abs(raw) <= 0.025) return 0;
     return raw;
   }
-
-  function onSliderInput(v: number): void {
-    if (!Number.isFinite(v)) return;
-    setVectorAlpha(name, snapAlpha(v));
+  function onSliderInput(val: number): void {
+    if (!Number.isFinite(val)) return;
+    setVectorAlpha(name, snapAlpha(val));
   }
-
   function formatAlpha(a: number): string {
     if (a === 0) return "0.00";
     const sign = a > 0 ? "+" : "-";
     return `${sign}${Math.abs(a).toFixed(2)}`;
   }
-
   const alphaColor = $derived.by(() => {
-    if (entry.alpha > 0) return "var(--accent-green)";
-    if (entry.alpha < 0) return "var(--accent-red)";
+    if (alpha > 0) return "var(--accent-green)";
+    if (alpha < 0) return "var(--accent-red)";
     return "var(--fg-muted)";
   });
 
-  // ---------- trigger cycle ----------
+  // ---------- trigger cycle (shared) ----------
 
-  // Match the canonical render order in steering_expr.py — BOTH is
-  // default; aliases collapse on serialize so we surface the canonical
-  // five plus the two aliases.
   const TRIGGER_ORDER: Trigger[] = [
     "BOTH",
     "BEFORE",
@@ -85,8 +122,6 @@
     "PROMPT",
     "GENERATED",
   ];
-
-  // Plain-language word shown at rest — no more decoding ``Bf`` / ``Af``.
   const TRIGGER_WORD: Record<Trigger, string> = {
     BOTH: "both",
     BEFORE: "before",
@@ -96,7 +131,6 @@
     PROMPT: "prompt",
     GENERATED: "generated",
   };
-
   const TRIGGER_LABEL: Record<Trigger, string> = {
     BOTH: "both: steer the whole turn (default)",
     BEFORE: "before: steer thinking and response",
@@ -110,38 +144,32 @@
   function cycleTrigger(): void {
     const idx = TRIGGER_ORDER.indexOf(entry.trigger);
     const next = TRIGGER_ORDER[(idx + 1) % TRIGGER_ORDER.length];
-    setVectorTrigger(name, next);
+    if (entry.mode === "vector") setVectorTrigger(name, next);
+    else setManifoldTrigger(name, next);
   }
 
-  // ---------- variant dropdown ----------
-  //
-  // A small in-app menu offering common tensor variants plus the current
-  // open-ended suffix when one is set, so flipping variants never leaves
-  // the saklas visual language.  NOTE: ``pca`` is gone — difference-of-
-  // means is the only vector extraction method now.
+  function toggleEnabled(): void {
+    if (entry.mode === "vector") setVectorEnabled(name, !entry.enabled);
+    else setManifoldEnabled(name, !entry.enabled);
+  }
+
+  // ---------- variant dropdown (vector mode) ----------
 
   let variantOpen = $state(false);
   let variantRef: HTMLDivElement | null = $state(null);
 
-  const variantOptions = $derived.by(() => {
-    const opts: VectorRackEntry["variant"][] = [
-      "raw",
-      "sae",
-      "role",
-      "from",
-    ];
-    if (!opts.includes(entry.variant)) {
-      opts.push(entry.variant);
-    }
+  const variantOptions = $derived.by<Variant[]>(() => {
+    const opts: Variant[] = ["raw", "sae", "role", "from"];
+    if (v && !opts.includes(v.variant)) opts.push(v.variant);
     return opts;
   });
 
-  function pickVariant(v: VectorRackEntry["variant"]): void {
+  function pickVariant(variant: Variant): void {
     variantOpen = false;
-    setVectorVariant(name, v);
+    setVectorVariant(name, variant);
   }
 
-  // ---------- ⋮ menu ----------
+  // ---------- ⋮ menu (vector mode) ----------
 
   let menuOpen = $state(false);
   let menuRef: HTMLDivElement | null = $state(null);
@@ -149,9 +177,7 @@
   function onDocClick(ev: MouseEvent): void {
     const t = ev.target as Node;
     if (menuOpen && menuRef && !menuRef.contains(t)) menuOpen = false;
-    if (variantOpen && variantRef && !variantRef.contains(t)) {
-      variantOpen = false;
-    }
+    if (variantOpen && variantRef && !variantRef.contains(t)) variantOpen = false;
   }
   function onDocKey(ev: KeyboardEvent): void {
     if (ev.key !== "Escape") return;
@@ -173,18 +199,13 @@
     menuOpen = !menuOpen;
     variantOpen = false;
   }
-
   function toggleVariant(ev: MouseEvent): void {
     ev.stopPropagation();
     variantOpen = !variantOpen;
     menuOpen = false;
   }
 
-  // ---------- inline projection modal ----------
-  //
-  // In-app dialog for picking a projection target — backdrop covers the
-  // viewport, the dialog itself is centered, Esc / click-outside cancel,
-  // Enter confirms, the input autofocuses on open.
+  // ---------- inline projection modal (vector mode) ----------
 
   let projectionPromptOp = $state<ProjectionSpec["op"] | null>(null);
   let projectionTargetDraft = $state("");
@@ -192,21 +213,18 @@
 
   function pickProjection(op: ProjectionSpec["op"]): void {
     menuOpen = false;
-    // Toggle off when the same operator is already wired.
-    if (entry.projection && entry.projection.op === op) {
+    if (v?.projection && v.projection.op === op) {
       setVectorProjection(name, null);
       return;
     }
-    projectionTargetDraft = entry.projection?.target ?? "";
+    projectionTargetDraft = v?.projection?.target ?? "";
     projectionPromptOp = op;
     queueMicrotask(() => projectionInputRef?.focus());
   }
-
   function cancelProjection(): void {
     projectionPromptOp = null;
     projectionTargetDraft = "";
   }
-
   function confirmProjection(): void {
     const op = projectionPromptOp;
     if (op === null) return;
@@ -216,7 +234,6 @@
     if (!target) return;
     setVectorProjection(name, { op, target });
   }
-
   function onProjectionKey(ev: KeyboardEvent): void {
     if (ev.key === "Enter") {
       ev.preventDefault();
@@ -229,67 +246,93 @@
 
   function toggleAblate(): void {
     menuOpen = false;
-    setVectorAblate(name, !entry.ablate);
+    if (v) setVectorAblate(name, !v.ablate);
   }
 
   function duplicate(): void {
     menuOpen = false;
+    if (!v) return;
     let candidate = `${name}-copy`;
     let n = 2;
-    while (vectorRack.entries.has(candidate)) {
-      candidate = `${name}-copy-${n++}`;
-    }
-    addVectorToRack(candidate, entry.alpha, entry.trigger);
-    const fresh = vectorRack.entries.get(candidate);
-    if (fresh) {
-      fresh.variant = entry.variant;
-      fresh.projection = entry.projection
-        ? { op: entry.projection.op, target: entry.projection.target }
+    while (steerRack.entries.has(candidate)) candidate = `${name}-copy-${n++}`;
+    addVectorToRack(candidate, v.alpha, v.trigger);
+    const fresh = steerRack.entries.get(candidate);
+    if (fresh && fresh.mode === "vector") {
+      fresh.variant = v.variant;
+      fresh.projection = v.projection
+        ? { op: v.projection.op, target: v.projection.target }
         : null;
-      fresh.ablate = entry.ablate;
-      fresh.enabled = entry.enabled;
+      fresh.ablate = v.ablate;
+      fresh.enabled = v.enabled;
     }
   }
 
   async function copyTermExpression(): Promise<void> {
     menuOpen = false;
-    const oneRack = new Map<string, VectorRackEntry>();
+    const oneRack = new Map<string, SteerEntry>();
     oneRack.set(name, { ...entry, enabled: true });
     const expr = serializeExpression(oneRack);
     try {
       await navigator.clipboard.writeText(expr);
       pushToast(`copied: ${expr}`, { kind: "info", ttlMs: 3000 });
     } catch {
-      // Clipboard is gated on user gesture in some browsers — surface an
-      // in-app toast rather than a native prompt.
       pushToast("clipboard blocked by the browser", { kind: "warning" });
     }
   }
 
-  // ---------- removal ----------
+  const projectionGlyph = $derived.by(() => {
+    if (!v?.projection) return null;
+    return `${v.projection.op} ${v.projection.target}`;
+  });
 
-  async function removeVector(): Promise<void> {
-    removeVectorFromRack(name);
-    try {
-      await apiVectors.delete(name);
-    } catch {
-      /* ignore — the rack is the user-visible source of truth. */
+  // ---------- removal (shared) ----------
+
+  async function removeTerm(): Promise<void> {
+    if (entry.mode === "vector") {
+      removeVectorFromRack(name);
+      try {
+        await apiVectors.delete(name);
+      } catch {
+        /* ignore — the rack is the user-visible source of truth. */
+      }
+    } else {
+      removeManifoldFromRack(name);
     }
   }
 
-  function toggleEnabled(): void {
-    setVectorEnabled(name, !entry.enabled);
+  // ---------- position controls (position mode) ----------
+
+  function onBlendInput(val: number): void {
+    if (!Number.isFinite(val)) return;
+    setManifoldBlend(name, val);
+  }
+  function onOntoInput(val: number): void {
+    if (!Number.isFinite(val)) return;
+    setManifoldOnto(name, val);
+  }
+  function onCoordsChange(coords: number[]): void {
+    setManifoldCoords(name, coords);
+  }
+  function onSnapToNode(val: string): void {
+    setManifoldLabel(name, val === "" ? null : val);
   }
 
-  // ---------- display fragments ----------
-
-  const projectionGlyph = $derived.by(() => {
-    if (!entry.projection) return null;
-    return `${entry.projection.op} ${entry.projection.target}`;
+  const snapOptions = $derived.by<{ value: string; label: string }[]>(() => {
+    const labels = info?.node_labels ?? [];
+    const roles = info?.node_roles;
+    const opts = labels.map((nl, i) => {
+      const role = roles?.[i];
+      return { value: nl, label: nl + (role ? ` [role=${role}]` : "") };
+    });
+    return [{ value: "", label: "(free position)" }, ...opts];
   });
+
+  // A manifold needs a tensor for the loaded model to actually steer.
+  const fitted = $derived(info?.fitted_for_session === true);
+  const stale = $derived(info?.stale === true);
 </script>
 
-<RackCard accent="--accent" disabled={!entry.enabled}>
+<RackCard {accent} disabled={!entry.enabled}>
   {#snippet statline()}
     <button
       type="button"
@@ -300,47 +343,59 @@
       aria-pressed={entry.enabled}
       aria-label="Toggle steering for {name}"
     >
-      {entry.enabled ? "●" : "○"}
+      {enableGlyph}
     </button>
 
-    <span class="name" class:struck={!entry.enabled} title="concept {name}">
-      {name}
+    <span class="name" class:struck={!entry.enabled} title={entry.mode === "vector" ? `concept ${name}` : `manifold ${name}`}>
+      {entry.mode === "vector" ? name : displayName}
     </span>
 
-    {#if entry.ablate}
+    {#if v?.ablate}
       <span class="ablate-mark" title="ablation: concept removed from the residual stream">!</span>
+    {/if}
+
+    {#if p && !fitted}
+      <span class="warn" title="no fitted tensor for the loaded model — fit it from the manifolds drawer">
+        unfitted
+      </span>
+    {:else if p && stale}
+      <span class="warn" title="the fitted tensor is stale — node geometry changed since the fit">
+        stale
+      </span>
     {/if}
 
     <span class="spacer"></span>
 
-    <div class="variant-wrap" bind:this={variantRef}>
-      <button
-        type="button"
-        class="variant-chip"
-        onclick={toggleVariant}
-        aria-haspopup="menu"
-        aria-expanded={variantOpen}
-        title="tensor variant: {entry.variant} (click to change)"
-        aria-label="variant for {name}: {entry.variant}"
-      >
-        {entry.variant}
-      </button>
-      {#if variantOpen}
-        <div class="variant-menu" role="menu">
-          {#each variantOptions as v (v)}
-            <button
-              type="button"
-              role="menuitemradio"
-              aria-checked={entry.variant === v}
-              class:active={entry.variant === v}
-              onclick={() => pickVariant(v)}
-            >
-              {v}
-            </button>
-          {/each}
-        </div>
-      {/if}
-    </div>
+    {#if v}
+      <div class="variant-wrap" bind:this={variantRef}>
+        <button
+          type="button"
+          class="variant-chip"
+          onclick={toggleVariant}
+          aria-haspopup="menu"
+          aria-expanded={variantOpen}
+          title="tensor variant: {v.variant} (click to change)"
+          aria-label="variant for {name}: {v.variant}"
+        >
+          {v.variant}
+        </button>
+        {#if variantOpen}
+          <div class="variant-menu" role="menu">
+            {#each variantOptions as opt (opt)}
+              <button
+                type="button"
+                role="menuitemradio"
+                aria-checked={v.variant === opt}
+                class:active={v.variant === opt}
+                onclick={() => pickVariant(opt)}
+              >
+                {opt}
+              </button>
+            {/each}
+          </div>
+        {/if}
+      </div>
+    {/if}
 
     <button
       type="button"
@@ -358,58 +413,60 @@
       </span>
     {/if}
 
-    <div class="menu-wrap" bind:this={menuRef}>
-      <button
-        type="button"
-        class="icon menu-btn"
-        onclick={toggleMenu}
-        aria-haspopup="menu"
-        aria-expanded={menuOpen}
-        aria-label="more actions for {name}"
-        title="more actions"
-      >
-        ⋮
-      </button>
-      {#if menuOpen}
-        <div class="menu" role="menu">
-          <button
-            type="button"
-            role="menuitem"
-            onclick={() => pickProjection("~")}
-            disabled={entry.ablate}
-          >
-            {entry.projection?.op === "~"
-              ? `clear projection (~ ${entry.projection.target})`
-              : "project onto (~)…"}
-          </button>
-          <button
-            type="button"
-            role="menuitem"
-            onclick={() => pickProjection("|")}
-            disabled={entry.ablate}
-          >
-            {entry.projection?.op === "|"
-              ? `clear projection (| ${entry.projection.target})`
-              : "project orthogonal (|)…"}
-          </button>
-          <button type="button" role="menuitem" onclick={toggleAblate}>
-            {entry.ablate ? "remove ablation (!)" : "ablate (!)"}
-          </button>
-          <hr />
-          <button type="button" role="menuitem" onclick={duplicate}>
-            duplicate
-          </button>
-          <button type="button" role="menuitem" onclick={copyTermExpression}>
-            copy expression
-          </button>
-        </div>
-      {/if}
-    </div>
+    {#if v}
+      <div class="menu-wrap" bind:this={menuRef}>
+        <button
+          type="button"
+          class="icon menu-btn"
+          onclick={toggleMenu}
+          aria-haspopup="menu"
+          aria-expanded={menuOpen}
+          aria-label="more actions for {name}"
+          title="more actions"
+        >
+          ⋮
+        </button>
+        {#if menuOpen}
+          <div class="menu" role="menu">
+            <button
+              type="button"
+              role="menuitem"
+              onclick={() => pickProjection("~")}
+              disabled={v.ablate}
+            >
+              {v.projection?.op === "~"
+                ? `clear projection (~ ${v.projection.target})`
+                : "project onto (~)…"}
+            </button>
+            <button
+              type="button"
+              role="menuitem"
+              onclick={() => pickProjection("|")}
+              disabled={v.ablate}
+            >
+              {v.projection?.op === "|"
+                ? `clear projection (| ${v.projection.target})`
+                : "project orthogonal (|)…"}
+            </button>
+            <button type="button" role="menuitem" onclick={toggleAblate}>
+              {v.ablate ? "remove ablation (!)" : "ablate (!)"}
+            </button>
+            <hr />
+            <button type="button" role="menuitem" onclick={duplicate}>
+              duplicate
+            </button>
+            <button type="button" role="menuitem" onclick={copyTermExpression}>
+              copy expression
+            </button>
+          </div>
+        {/if}
+      </div>
+    {/if}
 
     <button
       type="button"
       class="icon remove"
-      onclick={removeVector}
+      onclick={removeTerm}
       aria-label="remove {name}"
       title="remove {name}"
     >
@@ -418,35 +475,93 @@
   {/snippet}
 
   {#snippet body()}
-    <!-- Bipolar axis frame.  The negative pole sits left of the slider,
-         the positive right — dragging left/right now means something.
-         Monopolar concepts render an empty left-pole slot rather than
-         collapsing the grid, so a mixed mono/bipolar rack keeps slider
-         starts + positive poles vertically aligned across rows. -->
-    <div class="axis" class:disabled={!entry.enabled}>
-      <span class="pole neg" aria-hidden={monopolar}>
-        {#if !monopolar}{poles.negative}{/if}
-      </span>
-      <Slider
-        value={entry.alpha}
-        min={monopolar ? 0 : -1}
-        max={1}
-        step={0.05}
-        oninput={onSliderInput}
-        ariaLabel="strength (α) for {name}"
-        title="strength (α) for {name}: drag, ±0.025 snaps to 0"
-      />
-      <span class="pole pos" title="positive pole (drag right)">
-        {poles.positive}
-      </span>
-      <span
-        class="alpha-display"
-        style:color={alphaColor}
-        title="strength (α): signed steering coefficient"
-      >
-        {formatAlpha(entry.alpha)}
-      </span>
-    </div>
+    {#if v}
+      <!-- Bipolar axis frame.  Monopolar concepts render an empty left-pole
+           slot rather than collapsing the grid, so a mixed mono/bipolar rack
+           keeps slider starts + positive poles vertically aligned. -->
+      <div class="axis" class:disabled={!entry.enabled}>
+        <span class="pole neg" aria-hidden={monopolar}>
+          {#if !monopolar}{poles.negative}{/if}
+        </span>
+        <Slider
+          value={v.alpha}
+          min={monopolar ? 0 : -1}
+          max={1}
+          step={0.05}
+          oninput={onSliderInput}
+          ariaLabel="strength (α) for {name}"
+          title="strength (α) for {name}: drag, ±0.025 snaps to 0"
+        />
+        <span class="pole pos" title="positive pole (drag right)">
+          {poles.positive}
+        </span>
+        <span
+          class="alpha-display"
+          style:color={alphaColor}
+          title="strength (α): signed steering coefficient"
+        >
+          {formatAlpha(v.alpha)}
+        </span>
+      </div>
+    {:else if p}
+      <!-- Snap-to-node + free XYPad position, shared by flat + curved. -->
+      {#if info}
+        {#if info.node_labels.length > 0}
+          <label class="ctl-row">
+            <span class="ctl-label">snap to node</span>
+            <span class="ctl-select">
+              <Select
+                value={p.label ?? ""}
+                options={snapOptions}
+                onchange={onSnapToNode}
+                ariaLabel="snap to node"
+                title="pick a node to switch to label-form, or '(free position)' to drag the pad"
+              />
+            </span>
+          </label>
+        {/if}
+        <XYPad
+          manifold={info}
+          coords={p.coords}
+          onchange={onCoordsChange}
+          locked={p.label !== null}
+        />
+        <div class="along-row">
+          <span class="along-label">along</span>
+          <Slider
+            value={p.blend}
+            min={0}
+            max={1}
+            step={0.05}
+            oninput={onBlendInput}
+            ariaLabel="along fraction for {name}"
+            title="along — how far to slide toward the manifold position"
+          />
+          <span class="along-val" title="along fraction">{p.blend.toFixed(2)}</span>
+        </div>
+        {#if !flat}
+          <!-- onto — curved-only second coefficient: collapse the off-surface
+               in-subspace residual onto the manifold.  Vacuous for flat. -->
+          <div class="along-row">
+            <span class="along-label">onto</span>
+            <Slider
+              value={p.onto}
+              min={0}
+              max={1}
+              step={0.05}
+              oninput={onOntoInput}
+              ariaLabel="onto fraction for {name}"
+              title="onto — collapse the off-surface residual onto the manifold (curved only)"
+            />
+            <span class="along-val" title="onto fraction">{p.onto.toFixed(2)}</span>
+          </div>
+        {/if}
+      {:else}
+        <p class="missing">
+          manifold metadata unavailable — coordinates are still applied.
+        </p>
+      {/if}
+    {/if}
   {/snippet}
 </RackCard>
 
@@ -502,8 +617,6 @@
 
 <style>
   /* ----- statline pieces ----- */
-
-  /* Enable / disable toggle — ●/○ glyph in the subspace accent. */
   .enable {
     background: transparent;
     border: 0;
@@ -538,7 +651,15 @@
     flex: 0 0 auto;
   }
 
-  /* Pushes the action cluster to the right of the statline. */
+  .warn {
+    flex: 0 0 auto;
+    color: var(--accent-yellow);
+    font-size: var(--text-2xs);
+    border: 1px solid var(--accent-yellow);
+    border-radius: var(--radius);
+    padding: 0 var(--space-2);
+  }
+
   .spacer {
     flex: 1 1 auto;
     min-width: 0;
@@ -677,7 +798,7 @@
     margin: var(--space-1) 0;
   }
 
-  /* ----- body: the bipolar axis row ----- */
+  /* ----- body: bipolar axis row (vector mode) ----- */
   .axis {
     display: grid;
     grid-template-columns: minmax(2.5em, 1fr) minmax(60px, 2.6fr) minmax(2.5em, 1fr) 3.5em;
@@ -707,6 +828,45 @@
     min-width: 3.5em;
     text-align: right;
     font-variant-numeric: tabular-nums;
+  }
+
+  /* ----- body: position controls (position mode) ----- */
+  .ctl-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    color: var(--fg-strong);
+    font-size: var(--text-xs);
+  }
+  .ctl-label {
+    color: var(--fg-muted);
+    flex: 0 0 auto;
+  }
+  .ctl-select {
+    flex: 1 1 auto;
+    display: inline-flex;
+  }
+  .along-row {
+    display: grid;
+    grid-template-columns: minmax(3em, auto) 1fr 3em;
+    align-items: center;
+    gap: var(--space-2);
+  }
+  .along-label {
+    color: var(--fg-muted);
+    font-size: var(--text-xs);
+    text-transform: lowercase;
+  }
+  .along-val {
+    color: var(--fg-muted);
+    font-size: var(--text-xs);
+    font-variant-numeric: tabular-nums;
+    text-align: right;
+  }
+  .missing {
+    margin: 0;
+    color: var(--fg-muted);
+    font-size: var(--text-xs);
   }
 
   /* ----- projection modal ----- */
