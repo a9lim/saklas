@@ -496,13 +496,20 @@ class Monitor:
         flat = torch.cat([p.reshape(-1) for p in parts]).detach().cpu().tolist()
 
         o = 0
-        frac_mean = flat[o]; o += 1
-        residual_mean = flat[o]; o += 1
-        coords_mean = flat[o:o + n_dim]; o += n_dim
-        membership = flat[o]; o += 1
-        frac_layer_vals = flat[o:o + L]; o += L
-        resid_layer_vals = flat[o:o + L]; o += L
-        coord_layer_vals = flat[o:o + L * n_dim]; o += L * n_dim
+        frac_mean = flat[o]
+        o += 1
+        residual_mean = flat[o]
+        o += 1
+        coords_mean = flat[o:o + n_dim]
+        o += n_dim
+        membership = flat[o]
+        o += 1
+        frac_layer_vals = flat[o:o + L]
+        o += L
+        resid_layer_vals = flat[o:o + L]
+        o += L
+        coord_layer_vals = flat[o:o + L * n_dim]
+        o += L * n_dim
         frac_per_layer = {layer_order[i]: frac_layer_vals[i] for i in range(L)}
         residual_per_layer = {
             layer_order[i]: resid_layer_vals[i] for i in range(L)
@@ -522,8 +529,10 @@ class Monitor:
 
         if nearest_dist_t is not None:
             tn = int(nearest_dist_t.numel())
-            nd_vals = flat[o:o + tn]; o += tn
-            ni_vals = flat[o:o + tn]; o += tn
+            nd_vals = flat[o:o + tn]
+            o += tn
+            ni_vals = flat[o:o + tn]
+            o += tn
             nearest = [
                 (_label(int(round(ni_vals[j]))), nd_vals[j])
                 for j in range(tn)
@@ -536,8 +545,10 @@ class Monitor:
         assignment: list[tuple[str, float]] = []
         if assign_prob_t is not None:
             ta = int(assign_prob_t.numel())
-            ap_vals = flat[o:o + ta]; o += ta
-            ai_vals = flat[o:o + ta]; o += ta
+            ap_vals = flat[o:o + ta]
+            o += ta
+            ai_vals = flat[o:o + ta]
+            o += ta
             assignment = [
                 (_label(int(round(ai_vals[j]))), ap_vals[j])
                 for j in range(ta)
@@ -665,10 +676,12 @@ class Monitor:
             req = int(self._probes[n].top_n)
             tn = req if req >= 0 else Kc + req
             top_n_list.append(min(max(tn, 0), Kc))
+        topk_width = max(top_n_list, default=0)
         nd_off: list[tuple[int, int]] = []
         off = 0
         for nd in nd_list:
-            nd_off.append((off, nd)); off += nd
+            nd_off.append((off, nd))
+            off += nd
         nd_total = off
         Kmax = max(Kc_list)
         Rmax = max(
@@ -689,7 +702,7 @@ class Monitor:
         # ``band_present``.
         band_pad = torch.ones((P, Kmax), dtype=torch.float32, device=device)
         logvol_pad = torch.zeros((P, Kmax), dtype=torch.float32, device=device)
-        band_present = torch.zeros(P, dtype=torch.bool, device=device)
+        band_present_list = [False] * P
         for ci, n in enumerate(flat_names):
             bw = self._probes[n].assign_bandwidth
             lvb = self._probes[n].assign_logvol_bias
@@ -699,7 +712,7 @@ class Monitor:
             ):
                 band_pad[ci, :bw.numel()] = bw.to(device, torch.float32)
                 logvol_pad[ci, :lvb.numel()] = lvb.to(device, torch.float32)
-                band_present[ci] = True
+                band_present_list[ci] = True
         labels: list[list[str]] = []
         for n, inj in zip(flat_names, inj_list, strict=True):
             row = list(self._probes[n].manifold.node_labels)
@@ -712,9 +725,11 @@ class Monitor:
             "K_list": K_list, "top_n_list": top_n_list,
             "labels": labels,
             "Kmax": Kmax, "Rmax": Rmax,
+            "topk_width": topk_width,
             "valid_mask": valid_mask, "nd_counts": nd_counts,
             "band_pad": band_pad, "logvol_pad": logvol_pad,
-            "band_present": band_present,
+            "band_present_list": band_present_list,
+            "band_present_any": any(band_present_list),
         }
 
         layer_members: dict[int, list[int]] = {}
@@ -812,7 +827,8 @@ class Monitor:
         domain coords, fraction, and a padded ``(P_L, Kmax)`` nearest-distance
         norm — each scattered straight into global per-probe accumulators
         (``frac_acc`` / ``coords_acc`` / ``dist_acc`` / ``evsum``).  Phase 2
-        (device): EV-normalize, one global ``topk`` for nearest, and **one**
+        (device): EV-normalize, one global ``topk`` sized to the largest requested
+        ``top_n`` for nearest, and **one**
         ``.cpu()`` for the entire roster (means + per-layer traces + nearest).
         Phase 3 (host): slice the flat blob back into per-probe
         :class:`ProbeReading`s.  Values match the per-probe path (the aggregate
@@ -822,7 +838,10 @@ class Monitor:
         cache = self._flat_layer_cache
         if not gl or not cache:
             return {}
-        P = gl["P"]; Kmax = gl["Kmax"]; Rmax = gl["Rmax"]
+        P = gl["P"]
+        Kmax = gl["Kmax"]
+        Rmax = gl["Rmax"]
+        topk_width = gl["topk_width"]
         flat_names = self._flat_keys
         device = gl["valid_mask"].device
 
@@ -875,7 +894,7 @@ class Monitor:
             trace_layers.append(layer_idx)
             seen.update(ent["cols_list"])
 
-        # --- device finalize (EV-normalize + one global topk) ---
+        # --- device finalize (EV-normalize + one bounded global topk) ---
         evsum_safe = evsum.clamp(min=_FRACTION_EPSILON)
         frac_final = frac_acc / evsum_safe
         coords_final = coords_acc / evsum_safe.repeat_interleave(
@@ -884,25 +903,33 @@ class Monitor:
         dist_final = (dist_acc / evsum_safe.unsqueeze(1)).masked_fill(
             ~gl["valid_mask"], float("inf"),
         )
-        nd_sorted, ni_sorted = torch.topk(
-            dist_final, k=Kmax, largest=False, sorted=True,
-        )                                                           # (P, Kmax)
+        if topk_width:
+            nd_sorted, ni_sorted = torch.topk(
+                dist_final, k=topk_width, largest=False, sorted=True,
+            )                                                       # (P, topk_width)
+        else:
+            nd_sorted = dist_final.new_zeros((P, 0))
+            ni_sorted = torch.empty((P, 0), device=device, dtype=torch.long)
         # Soft assignment: softmax(−d²/(2τ²) − R·log(τ)) per probe over valid
         # candidates (invalid columns are +inf distance ⇒ −inf logit ⇒ 0
-        # probability), top-Kmax by probability.  ``band_pad`` is the
+        # probability), top-``topk_width`` by probability.  ``band_pad`` is the
         # precomputed per-candidate bandwidth, ``logvol_pad`` the precomputed
         # ``−R·log(τ)`` Gaussian normalization bias; together they make a proper
         # isotropic R-D mixture posterior (vs. the bare ``−d²/2τ²`` softmax's
         # broadest-node-wins pathology).  Rows without a bandwidth get the
         # neutral defaults (band=1, bias=0) so the blob shape is static
         # (suppressed per-probe on the host via ``band_present``).
-        assign_logits = -(dist_final ** 2) / (
-            2.0 * (gl["band_pad"] ** 2).clamp(min=_FRACTION_EPSILON)
-        ) + gl["logvol_pad"]
-        assign_probs = torch.softmax(assign_logits, dim=1)          # (P, Kmax)
-        ap_sorted, ai_sorted = torch.topk(
-            assign_probs, k=Kmax, largest=True, sorted=True,
-        )                                                           # (P, Kmax)
+        if topk_width and gl["band_present_any"]:
+            assign_logits = -(dist_final ** 2) / (
+                2.0 * (gl["band_pad"] ** 2).clamp(min=_FRACTION_EPSILON)
+            ) + gl["logvol_pad"]
+            assign_probs = torch.softmax(assign_logits, dim=1)      # (P, Kmax)
+            ap_sorted, ai_sorted = torch.topk(
+                assign_probs, k=topk_width, largest=True, sorted=True,
+            )                                                       # (P, topk_width)
+        else:
+            ap_sorted = dist_final.new_zeros((P, topk_width))
+            ai_sorted = torch.zeros((P, topk_width), device=device, dtype=torch.long)
 
         all_frac = (
             torch.cat(trace_frac) if trace_frac
@@ -920,16 +947,23 @@ class Monitor:
         ]).detach().cpu().tolist()
 
         # --- host reconstruction (one slice walk; no per-probe sync) ---
-        nd_off = gl["nd_off"]; top_n_list = gl["top_n_list"]
+        nd_off = gl["nd_off"]
+        top_n_list = gl["top_n_list"]
         labels = gl["labels"]
         o = 0
-        frac_v = blob[o:o + P]; o += P
-        coords_v = blob[o:o + gl["nd_total"]]; o += gl["nd_total"]
-        nd_v = blob[o:o + P * Kmax]; o += P * Kmax
-        ni_v = blob[o:o + P * Kmax]; o += P * Kmax
-        ap_v = blob[o:o + P * Kmax]; o += P * Kmax
-        ai_v = blob[o:o + P * Kmax]; o += P * Kmax
-        band_present = gl["band_present"].tolist()
+        frac_v = blob[o:o + P]
+        o += P
+        coords_v = blob[o:o + gl["nd_total"]]
+        o += gl["nd_total"]
+        nd_v = blob[o:o + P * topk_width]
+        o += P * topk_width
+        ni_v = blob[o:o + P * topk_width]
+        o += P * topk_width
+        ap_v = blob[o:o + P * topk_width]
+        o += P * topk_width
+        ai_v = blob[o:o + P * topk_width]
+        o += P * topk_width
+        band_present = gl["band_present_list"]
         # per-layer trace offsets within all_frac / all_coords
         frac_per_layer_acc: list[dict[int, float]] = [{} for _ in range(P)]
         coords_per_layer_acc: list[dict[int, tuple[float, ...]]] = [{} for _ in range(P)]
@@ -957,7 +991,7 @@ class Monitor:
                 continue
             g_off, nd = nd_off[ci]
             top_n = top_n_list[ci]
-            row = ci * Kmax
+            row = ci * topk_width
             nearest = [
                 (labels[ci][int(round(ni_v[row + j]))], nd_v[row + j])
                 for j in range(top_n)

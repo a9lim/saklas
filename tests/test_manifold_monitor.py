@@ -448,8 +448,10 @@ def _curved_toy(dim: int = 8, seed: int = 0) -> "Manifold":
     domain = BoxDomain([BoxAxis("u", periodic=False, lo=-1.0, hi=1.0)])
     coords = torch.tensor([[-1.0], [-0.5], [0.0], [0.5], [1.0]])
     u = coords.reshape(-1)
-    e1 = torch.zeros(dim); e1[0] = 1.0
-    e2 = torch.zeros(dim); e2[1] = 1.0
+    e1 = torch.zeros(dim)
+    e1[0] = 1.0
+    e2 = torch.zeros(dim)
+    e2[1] = 1.0
     layers: dict[int, LayerSubspace] = {}
     ev: dict[int, float] = {}
     for layer_idx in range(2):
@@ -819,6 +821,39 @@ def test_affine_mixed_rank_batched_together():
     assert r_tri["tri"].coords[0] == pytest.approx(-1.0, abs=1e-3)
     assert r_tri["tri"].coords[1] == pytest.approx(-1.0, abs=1e-3)
     assert len(r_tri["ax"].coords) == 1
+
+
+def test_affine_batched_topk_width_tracks_requested_top_n():
+    """The flat batched scorer should not sort/copy every padded candidate when
+    a probe only asks for a small nearest/assignment head.
+    """
+    rc = torch.randn(32, 2)
+    labels = [f"n{k}" for k in range(rc.shape[0])]
+    m = _flat_manifold(
+        reduced_coords=rc, dim=16, seed=3, name="wide", labels=labels,
+    )
+    mon = _iso_monitor(m)
+    mon.add_probe("wide", m, top_n=3)
+
+    reading = mon.score_single_token(_flat_node_hidden(m, 0))["wide"]
+
+    assert mon._flat_global["topk_width"] == 3
+    assert len(reading.nearest) == 3
+    assert len(reading.assignment) == 3
+    assert reading.nearest[0][0] == "n0"
+
+
+def test_affine_batched_top_n_zero_skips_ranked_heads():
+    rc = torch.tensor([[1.0, 0.0], [0.0, 1.0], [-1.0, -1.0]])
+    m = _flat_manifold(reduced_coords=rc, labels=["x", "y", "z"])
+    mon = _iso_monitor(m)
+    mon.add_probe("tri", m, top_n=0)
+
+    reading = mon.score_single_token(_flat_node_hidden(m, 1))["tri"]
+
+    assert mon._flat_global["topk_width"] == 0
+    assert reading.nearest == []
+    assert reading.assignment == []
 
 
 def test_affine_aggregate_fills_nearest_and_coords():

@@ -244,7 +244,8 @@ orthogonal principal-angle rotation between the old/new tangent frames
 (`_frame_rotation_transport` — exact identity when the foot doesn't move, so the
 curved path is identity at `along=0` regardless of foot accuracy; replaced the
 project-onto-normal + renorm that corrupted off-neutral activations every fire),
-onto scales `H_n` `(1−o)`, `H_o` kept). MGS orthonormalization + a CPU-hopped
+onto shrinks `H_n` toward the zero-thickness wire on legacy/no-σ fits or toward
+the local fuzzy σ-tube when present, `H_o` kept). MGS orthonormalization + a CPU-hopped
 `n×n` SVD keep it MPS-safe (`linalg.qr`/`svd` are unimplemented/`fallback` on
 Metal). `synthesize_subspace` emits the κ mask (0 push / 1 ablate).
 `norm_cap = 3·‖h‖` is the only norm guard. `invert_parameterization` is the cold/eval-only damped-LM nearest-
@@ -320,7 +321,8 @@ that static-affine fast path — those are the two StaticCache / graph-capture
 eligibility signals (`session.use_static_cache` ORs them). A curved / gated /
 phased hook consults ctx + foot state per step and disqualifies both. `subspace_inject`
 returns its fp32 result and the hook's `copy_` does the model-dtype downcast (no
-per-fire downcast temp).
+per-fire downcast temp). For curved fits with a fuzzy σ-field, `onto` lands inside
+the learned tube rather than collapsing every activation onto the mean wire.
 
 `SteeringManager` owns `subspaces` (dispatch-synthesized merged affine, one per
 trigger group, via `add_subspace`) + `manifolds` (curved, via `add_manifold`).
@@ -337,7 +339,8 @@ usable dial with `1.0` a coherent ceiling). `eff_along_L = share_L · _MANIFOLD_
 `target_coord`; curved: × clamped user `along`); `eff_onto_L = clamp(onto ·
 share_L · _MANIFOLD_GAIN, 0, 1)`. **No lever / N, no `[0,1]` clamp / water-fill on
 `along`** (a high-share layer is meant to overshoot; `norm_cap` bounds it). `onto`
-stays clamped `[0,1]`. (`_MANIFOLD_ALONG_GAIN` runs ~10× below the old
+stays clamped `[0,1]` (beyond 1 would overshoot through the wire/tube).
+(`_MANIFOLD_ALONG_GAIN` runs ~10× below the old
 lerp-onto-target gain — the translate offset compounds across layers; tagged a
 prototype.)
 `reset_manifold_feet` cold-starts followers per generation.

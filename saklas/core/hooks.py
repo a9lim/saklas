@@ -516,23 +516,24 @@ class SteeringHook:
 # (``N ≈ 1e-4`` → ``base/N`` saturating every layer).  And **no ``[0, 1]`` clamp
 # / water-fill** on ``along``: a high-signal layer is *meant* to overshoot past
 # the pole; the affine/RBF ``norm_cap = 3·‖h‖`` inside ``subspace_inject`` is
-# the only bound.  ``onto`` stays clamped ``[0, 1]`` (a collapse fraction > 1
-# inverts the residual).
+# the only bound.  ``onto`` stays clamped ``[0, 1]`` (a residual-shrink fraction
+# beyond 1 would overshoot through the zero-thickness wire or σ-tube).
 #
 # This is the **onto** (off-surface collapse) gain only: ``eff_onto_L =
-# clamp(onto · share_L · _MANIFOLD_GAIN, 0, 1)``, and the kernel scales the
-# off-surface residual by ``(1 − eff_onto)``.  That residual carries the
-# per-token content variation, so combined with a directional ``along`` push too
-# much onto drives every token onto the *same* surface point and degenerates into
-# looping — the exact failure the translate-not-collapse ``along`` design avoids,
-# reintroduced by zeroing the residual that held the spread.  Calibrated on the
-# gemma-4-12b ``pad%dominant`` onto sweep (along fixed at 0.3): at the old ``1.0``
-# even ``onto = 0.5`` fragmented and ``onto = 1.0`` collapsed to ``!!!``; ``0.5``
-# puts the recommended ``onto ≈ 0.5`` at a clean sweet spot and keeps ``onto =
-# 1.0`` a strong-but-coherent ceiling, while below ``~0.3`` the [0, 1] knob
-# saturates into no dynamic range (``onto = 0.5 ≈ 1.0``).  A [0, 1] dial whose top
-# emits garbage is a bad dial, so ``onto = 1.0`` is deliberately the coherent
-# maximum, not the over-steer edge.
+# clamp(onto · share_L · _MANIFOLD_GAIN, 0, 1)``.  On a legacy zero-thickness
+# curved fit the kernel scales the off-surface residual by ``(1 − eff_onto)``; on
+# a fuzzy σ-field fit it instead shrinks residual norm toward the local tube
+# thickness.  That residual carries the per-token content variation, so combined
+# with a directional ``along`` push too much onto erases the spread and degenerates
+# into looping — the exact failure the translate-not-collapse ``along`` design
+# avoids, reintroduced by over-shrinking the residual that held the spread.
+# Calibrated on the gemma-4-12b ``pad%dominant`` onto sweep (along fixed at 0.3):
+# at the old ``1.0`` even ``onto = 0.5`` fragmented and ``onto = 1.0`` collapsed to
+# ``!!!``; ``0.5`` puts the recommended ``onto ≈ 0.5`` at a clean sweet spot and
+# keeps ``onto = 1.0`` a strong-but-coherent ceiling, while below ``~0.3`` the
+# [0, 1] knob saturates into no dynamic range (``onto = 0.5 ≈ 1.0``).  A [0, 1]
+# dial whose top emits garbage is a bad dial, so ``onto = 1.0`` is deliberately the
+# coherent maximum, not the over-steer edge.
 _MANIFOLD_GAIN = 0.5
 
 # --- translate gain (prototype) ----------------------------------------------
@@ -841,7 +842,7 @@ class SteeringManager:
         # ``_MANIFOLD_GAIN`` docstring): ``along`` is left un-clamped so a
         # high-share layer overshoots past the target (the ``norm_cap`` inside
         # ``subspace_inject`` is the only bound), while ``onto`` stays clamped
-        # ``[0, 1]`` per layer (a collapse fraction > 1 inverts the residual).
+        # ``[0, 1]`` per layer (beyond 1 would overshoot through the wire/tube).
         manifold_by_layer: dict[
             int,
             list[tuple[
