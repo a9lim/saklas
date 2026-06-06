@@ -753,13 +753,15 @@ class TestNativeSteeringField:
         )
         resp = client.post("/v1/chat/completions", json={
             "messages": [{"role": "user", "content": "hi"}],
-            "steering": "-0.4 wolf",
+            "steering": "-0.4 zzfakevec",
         })
         assert resp.status_code == 200
         kw = session.generate.call_args[1]
-        # Parser resolves ``wolf`` → identity with sign +1 when nothing is
-        # installed; coefficient carries through as -0.4.
-        assert kw["steering"].alphas == {"wolf": -0.4}
+        # A bare name matching no installed manifold/concept resolves to a plain
+        # vector term (identity, sign +1); the coefficient carries through as
+        # -0.4.  (Must NOT collide with a bundled node — ``wolf`` is a real
+        # ``personas`` node now, so it would resolve to ``personas%wolf``.)
+        assert kw["steering"].alphas == {"zzfakevec": -0.4}
 
     def test_steering_merges_with_server_defaults(self):
         from saklas.server import create_app

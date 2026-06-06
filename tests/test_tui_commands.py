@@ -843,9 +843,13 @@ def test_handle_steer_ambiguous_pole_does_not_crash(monkeypatch: pytest.MonkeyPa
         raise AmbiguousSelectorError(
             "ambiguous pole 'wolf': matches alice/wolf, default/deer.wolf"
         )
-    # ``parse_expr`` imports ``resolve_pole`` lazily inside ``_resolve_atom``,
-    # so monkeypatching the module attribute reaches the parser.
-    monkeypatch.setattr(_sel, "resolve_pole", _ambiguous)
+    # A bare slug now resolves through ``resolve_bare_name`` (the multi-node
+    # manifold-label tier) *before* the ``resolve_pole`` bipolar tier — that is
+    # the resolver a bare colliding name reaches first, and ``parse_expr``
+    # imports it lazily, so monkeypatching the module attribute reaches the
+    # parser.  (``wolf`` is itself a real ``personas`` node now, which is why
+    # the bare-label tier is the one that fires.)
+    monkeypatch.setattr(_sel, "resolve_bare_name", _ambiguous)
 
     app._handle_command("/steer 0.5 wolf")
 
