@@ -723,6 +723,47 @@ def eval_rbf_jacobian(
     return j_rbf + j_poly
 
 
+def rbf_cardinal_weights(
+    node_coords: torch.Tensor, query: torch.Tensor,
+) -> torch.Tensor:
+    """Cardinal ``r**3``-RBF interpolation weights ``w(z) ∈ ℝ^K`` over a layout.
+
+    Given ``node_coords`` ``(K, n)`` -- a manifold's authoring node layout --
+    and a ``query`` ``(n,)``, return weights ``(K,)`` such that for *any*
+    per-node values ``Y`` ``(K, R)`` the ``r**3``-polyharmonic RBF interpolant
+    of ``Y`` evaluated at ``query`` equals ``w @ Y``.  The weights are the
+    layer-agnostic cardinal functions of the layout: they depend only on the
+    node coordinates and the query, not on what is interpolated, so one solve
+    serves every layer.  They are **exact at the nodes** (``w = e_i`` at node
+    ``i``, since RBF interpolation reproduces the sampled values) and form a
+    partition of unity (``Σ w = 1``, since the affine polynomial reproduces
+    constants).
+
+    This is the flat-manifold coord-form analogue of a curved fit's RBF
+    surface: applying ``w`` to a flat fit's per-layer real reduced node coords
+    reproduces label-form steering at the nodes and interpolates the per-layer
+    target between them off-node — staying within the flat subspace while
+    following the learned layout rather than a straight chord.
+
+    Computed on CPU / fp32 (the indefinite saddle solve in
+    :func:`fit_rbf_interpolant` is MPS-unsafe and this runs once per steering
+    compose, off the hot path).  Unit-box-normalized for kernel conditioning,
+    matching :func:`fit_layer_subspace`.  Propagates the ``ValueError`` from
+    :func:`fit_rbf_interpolant` when the layout is not affinely poised (no
+    interpolant exists — the caller falls back to label-form guidance).
+    """
+    node_coords = node_coords.detach().to(device="cpu", dtype=torch.float32)
+    query = query.detach().to(device="cpu", dtype=torch.float32).reshape(-1)
+    lo = node_coords.min(dim=0).values
+    hi = node_coords.max(dim=0).values
+    scale = (hi - lo).clamp(min=1e-9)
+    nc_norm = (node_coords - lo) / scale
+    q_norm = (query - lo) / scale                       # (n,)
+    eye = torch.eye(node_coords.shape[0], dtype=torch.float32)
+    rbf_weights, poly_coeffs = fit_rbf_interpolant(nc_norm, eye)
+    return eval_rbf(nc_norm, rbf_weights, poly_coeffs, q_norm)  # (K,)
+
+
 # ============================================================== subspaces ===
 
 @dataclass
@@ -3097,6 +3138,7 @@ __all__ = [
     "fit_rbf_interpolant",
     "eval_rbf",
     "eval_rbf_jacobian",
+    "rbf_cardinal_weights",
     "fit_layer_subspace",
     "decompose",
     "subspace_inject",

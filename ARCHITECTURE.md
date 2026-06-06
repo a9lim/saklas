@@ -501,9 +501,15 @@ neutral-anchored affine `R=1` `Manifold` — a one-pole ray with `basis = d̂_L`
 `node_coords = [[‖d_L‖]]`, and `share = ‖d_L‖_M`. `session._affine_manifold_push`
 then splits it into per-layer `(unit_dir rows, [‖d_L‖] coord)`, so the
 synthesizer's `Δ = coeff · (coord @ basis) = coeff · d_L` reproduces the baked
-direction exactly. An affine `%` term reads the fitted manifold's per-layer
-`node_coords` directly (label-form only — coord-form on an affine manifold has no
-interpolant). Projection terms are materialized to derived `Profile`s first
+direction exactly. An affine `%` term in **label form** reads the fitted manifold's
+per-layer `node_coords[idx]` directly; in **coord form** it maps the free authoring
+coordinate into each layer's reduced frame by cardinal RBF interpolation over the
+node layout (`manifold.rbf_cardinal_weights` on the shared `node_coords`, solved
+once in authoring space), so the per-layer target is the layout blend
+`node_coords_L.T @ w`. The weights are exact at the nodes (`w = e_idx`), so coord
+form placed at a node's coords reproduces label form and interpolates between nodes
+off-node — the flat analogue of a curved `%` following its RBF surface instead of a
+straight chord. Projection terms are materialized to derived `Profile`s first
 (`_materialize_projections` → `project_profile`: closed-form LEACE, Mahalanobis-only
 — the session whitener must cover every projected layer, else `WhitenerError`) and
 then folded like vectors.

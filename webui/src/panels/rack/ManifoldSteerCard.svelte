@@ -4,11 +4,14 @@
   // Whether it reads as the *subspace* (flat) family or the *manifold*
   // (curved) family is decided by the catalog ``fit_mode``:
   //   - ``pca`` / ``baked`` → flat affine subspace (e.g. personas):
-  //     accent ``--accent``, glyph ●/○, label-form only (NO free XYPad —
-  //     a flat ``%`` manifold raises on free coords at the engine).
+  //     accent ``--accent``, glyph ●/○, snap-to-node Select + XYPad + along
+  //     slider.  Free coords place via the engine's cardinal-RBF layout
+  //     blend (``personas%c0,c1,…``), node-equivalent to label form; the
+  //     ``onto`` slider is hidden (off-surface collapse is vacuous on a flat
+  //     fit, which fills its subspace).
   //   - everything else (``spectral`` / ``authored``) → curved surface
   //     (e.g. pad): accent ``--accent-purple``, glyph ◆/◇, snap-to-node
-  //     Select + XYPad + along slider.
+  //     Select + XYPad + along + onto sliders.
   //
   // Composes the shared RackCard chrome: a statline on top (enable glyph ·
   // name · warn chip · trigger pill · ✕) with the position controls
@@ -102,16 +105,18 @@
   // Snap-to-node dropdown: the user can pick a labeled node from the
   // manifold's node list, which switches the term to label-form
   // (``personas%pirate``).  An empty selection clears the label binding —
-  // the position becomes free-form, drag on the XYPad to author (curved
-  // only).  ``setManifoldLabel`` mirrors the catalog's ``node_coords[idx]``
-  // onto ``entry.coords`` so any XYPad readout reflects the picked node.
+  // the position becomes free-form, drag on the XYPad to author.  Flat and
+  // curved both support free coords now (the flat engine path maps a free
+  // coord through the cardinal-RBF layout blend), so both offer the
+  // "(free position)" escape hatch.  ``setManifoldLabel`` mirrors the
+  // catalog's ``node_coords[idx]`` onto ``entry.coords`` so any XYPad
+  // readout reflects the picked node.
   function onSnapToNode(val: string): void {
     setManifoldLabel(name, val === "" ? null : val);
   }
 
-  /** Build the node-list option set.  A flat manifold is label-only at
-   *  the engine, so it offers no "(free position)" escape hatch; a curved
-   *  manifold prepends one. */
+  /** Build the node-list option set, prepending a "(free position)"
+   *  escape hatch that unsnaps the term to free coords (flat + curved). */
   const snapOptions = $derived.by<{ value: string; label: string }[]>(() => {
     const labels = info?.node_labels ?? [];
     const roles = info?.node_roles;
@@ -119,7 +124,6 @@
       const role = roles?.[i];
       return { value: nl, label: nl + (role ? ` [role=${role}]` : "") };
     });
-    if (flat) return opts;
     return [{ value: "", label: "(free position)" }, ...opts];
   });
 
@@ -184,46 +188,31 @@
 
   {#snippet body()}
     {#if info}
-      {#if flat}
-        <!-- Flat (affine) manifold (e.g. personas): label-only.  A free
-             ``%`` position raises at the engine, so there is no XYPad —
-             snap to a node, then slide ``along`` toward it. -->
+      <!-- Snap-to-node + free XYPad position, shared by flat + curved.  A
+           flat free coord places via the engine's cardinal-RBF layout blend
+           (node-equivalent to label form); a curved one rides its RBF
+           surface.  The pad reads out (``locked``) while a node label is
+           bound, and unsnaps to free coords via "(free position)". -->
+      {#if info.node_labels.length > 0}
         <label class="ctl-row">
-          <span class="ctl-label">node</span>
+          <span class="ctl-label">snap to node</span>
           <span class="ctl-select">
             <Select
               value={entry.label ?? ""}
               options={snapOptions}
               onchange={onSnapToNode}
               ariaLabel="snap to node"
-              title="pick a node to place this term at (label-form)"
+              title="pick a node to switch to label-form, or '(free position)' to drag the pad"
             />
           </span>
         </label>
-      {:else}
-        <!-- Curved manifold (e.g. pad): optional snap-to-node + free XYPad
-             position + along slider. -->
-        {#if info.node_labels.length > 0}
-          <label class="ctl-row">
-            <span class="ctl-label">snap to node</span>
-            <span class="ctl-select">
-              <Select
-                value={entry.label ?? ""}
-                options={snapOptions}
-                onchange={onSnapToNode}
-                ariaLabel="snap to node"
-                title="pick a node to switch to label-form, or '(free position)' to drag the pad"
-              />
-            </span>
-          </label>
-        {/if}
-        <XYPad
-          manifold={info}
-          coords={entry.coords}
-          onchange={onCoordsChange}
-          locked={entry.label !== null}
-        />
       {/if}
+      <XYPad
+        manifold={info}
+        coords={entry.coords}
+        onchange={onCoordsChange}
+        locked={entry.label !== null}
+      />
 
       <!-- along slider — how far to slide the in-subspace foot toward the
            target position.  Shared by flat + curved. -->

@@ -364,20 +364,54 @@ def _affine_manifold_push(
 ) -> "tuple[dict[int, torch.Tensor], dict[int, torch.Tensor]]":
     """An affine ``%`` term → a rank-R push fragment per layer.
 
-    **Label-form only.**  The node's per-layer real coords
-    (``LayerSubspace.node_coords[idx]``) are the push target on the manifold's
-    per-layer basis.  Coord-form on an affine manifold has no interpolant to
-    map authoring coords to per-layer reduced coords, so it raises (deferred).
+    Both position forms are supported and **equivalent at the nodes**:
+
+    - **Label form** (``position`` a ``str``): the node's per-layer real coords
+      (``LayerSubspace.node_coords[idx]``) are the push target on that layer's
+      basis — a direct table lookup, no interpolation.
+    - **Coord form** (``position`` a coord tuple): the free authoring
+      coordinate is mapped into each layer's reduced frame by cardinal RBF
+      interpolation over the node layout (:func:`rbf_cardinal_weights` on the
+      shared ``Manifold.node_coords``), so the per-layer target is the layout
+      blend ``node_coords_L.T @ w``.  The weights are solved once in authoring
+      space (layer-agnostic) and are exact at the nodes (``w = e_idx`` at node
+      ``idx``), so placing a coord-form term at a node's coords reproduces the
+      label-form push toward that node, and interpolates the per-layer target
+      between nodes off-node — the flat-subspace analogue of a curved ``%``
+      following its RBF surface instead of a straight chord.
+
+    The affine fit's domain is the identity carrier (authoring == embedded), so
+    the weights are built directly in authoring-coordinate space.  Arity
+    (coord form) is validated against the domain's intrinsic dim, matching the
+    curved :meth:`SteeringManager.add_manifold` path; a non-poised layout (no
+    interpolant) falls back to a label-form instruction.
     """
     from saklas.core.steering_expr import SteeringExprError
+    from saklas.core.manifold import rbf_cardinal_weights
 
-    if not isinstance(position, str):
-        raise SteeringExprError(
-            f"coord-form position {tuple(position)!r} is not supported on the "
-            f"affine manifold {manifold.name!r}; steer by node label "
-            f"(e.g. '{manifold.name}%<label>')"
-        )
-    idx = manifold.nearest_node_index(position)
+    weights: "torch.Tensor | None" = None
+    idx = 0
+    if isinstance(position, str):
+        idx = manifold.nearest_node_index(position)
+    else:
+        n = manifold.domain.intrinsic_dim
+        pos = tuple(float(c) for c in position)
+        if len(pos) != n:
+            from saklas.core.errors import ManifoldArityError
+            raise ManifoldArityError(
+                f"manifold {manifold.name!r} has a {n}-dimensional domain but "
+                f"the steering position has {len(pos)} coordinate(s)"
+            )
+        query = torch.tensor(pos, dtype=torch.float32)
+        try:
+            weights = rbf_cardinal_weights(manifold.node_coords, query)
+        except ValueError as exc:
+            raise SteeringExprError(
+                f"manifold {manifold.name!r}: cannot place free coord-form "
+                f"position {pos!r} — {exc}; steer by node label instead "
+                f"(e.g. '{manifold.name}%<label>')"
+            ) from exc
+
     basis_dirs: dict[int, torch.Tensor] = {}
     coord_dirs: dict[int, torch.Tensor] = {}
     for L, sub in manifold.layers.items():
@@ -387,7 +421,11 @@ def _affine_manifold_push(
                 f"per-layer node_coords; re-fit to steer it by node label"
             )
         basis_dirs[L] = sub.basis
-        coord_dirs[L] = sub.node_coords[idx]
+        if weights is None:
+            coord_dirs[L] = sub.node_coords[idx]
+        else:
+            w = weights.to(device=sub.node_coords.device, dtype=sub.node_coords.dtype)
+            coord_dirs[L] = sub.node_coords.transpose(0, 1) @ w   # (R,)
     return basis_dirs, coord_dirs
 
 
@@ -2747,8 +2785,10 @@ class SaklasSession:
                         f"No manifold registered for '{entry.manifold}'"
                     )
                 if _manifold_is_affine(manifold):
-                    # Affine ``%`` (e.g. ``personas%pirate``) joins the merged
-                    # subspace as a rank-R push toward the node's per-layer coords.
+                    # Affine ``%`` joins the merged subspace as a rank-R push
+                    # toward the position's per-layer coords — a node's real
+                    # coords for label form (``personas%pirate``) or the cardinal
+                    # RBF layout blend for free coord form (``personas%c0,c1,…``).
                     basis_dirs, coord_dirs = _affine_manifold_push(
                         manifold, entry.position,
                     )

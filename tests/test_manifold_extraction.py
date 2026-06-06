@@ -673,6 +673,78 @@ def test_two_node_pca_reads_as_affine_pole_push(tmp_path: Path) -> None:
         assert coord_angry[L][0] * coord_calm[L][0] < 0
 
 
+def test_affine_push_coord_form_equals_label_at_node(tmp_path: Path) -> None:
+    """Coord form and label form are equivalent at the nodes: a free coord-form
+    position placed at a node's authoring coords reproduces the label-form push
+    (the cardinal RBF weights are ``e_idx`` at node ``idx``).  This is the
+    equivalence that makes ``personas%<pirate's coords>`` ≡ ``personas%pirate``.
+    """
+    from saklas.core.session import _affine_manifold_push
+
+    folder = _discover_folder(
+        tmp_path, name="trio", fit_mode="pca", labels=["a", "b", "c"],
+        hyperparams={"max_dim": 2, "var_threshold": 0.999},
+    )
+    manifold = ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder)
+    assert all(sub.is_affine for sub in manifold.layers.values())
+
+    for idx, label in enumerate(manifold.node_labels):
+        _, coord_label = _affine_manifold_push(manifold, label)
+        node_coords = tuple(float(c) for c in manifold.node_coords[idx].tolist())
+        _, coord_free = _affine_manifold_push(manifold, node_coords)
+        for L in manifold.layers:
+            assert torch.allclose(coord_free[L], coord_label[L], atol=1e-4), (
+                f"layer {L} node {label}: coord form != label form"
+            )
+
+
+def test_affine_push_coord_form_interpolates_between_nodes(tmp_path: Path) -> None:
+    """A free coord-form position between two nodes blends their per-layer
+    targets — distinct from either endpoint, and the layout's two nearest nodes
+    carry the dominant cardinal weight.
+    """
+    from saklas.core.manifold import rbf_cardinal_weights
+    from saklas.core.session import _affine_manifold_push
+
+    folder = _discover_folder(
+        tmp_path, name="trio2", fit_mode="pca", labels=["a", "b", "c"],
+        hyperparams={"max_dim": 2, "var_threshold": 0.999},
+    )
+    manifold = ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder)
+
+    mid = (manifold.node_coords[0] + manifold.node_coords[1]) / 2
+    w = rbf_cardinal_weights(manifold.node_coords, mid)
+    # nodes 0 and 1 dominate the blend at their midpoint
+    assert int(torch.argsort(w, descending=True)[0]) in (0, 1)
+    assert int(torch.argsort(w, descending=True)[1]) in (0, 1)
+
+    _, coord_mid = _affine_manifold_push(manifold, tuple(float(c) for c in mid))
+    _, coord_a = _affine_manifold_push(manifold, "a")
+    _, coord_b = _affine_manifold_push(manifold, "b")
+    for L in manifold.layers:
+        assert not torch.allclose(coord_mid[L], coord_a[L], atol=1e-3)
+        assert not torch.allclose(coord_mid[L], coord_b[L], atol=1e-3)
+
+
+def test_affine_push_coord_form_arity_mismatch_raises(tmp_path: Path) -> None:
+    """A coord-form position with the wrong number of coordinates raises
+    ``ManifoldArityError`` (a ``SteeringExprError``), matching the curved path.
+    """
+    from saklas.core.errors import ManifoldArityError
+    from saklas.core.steering_expr import SteeringExprError
+    from saklas.core.session import _affine_manifold_push
+
+    folder = _discover_folder(
+        tmp_path, name="trio3", fit_mode="pca", labels=["a", "b", "c"],
+        hyperparams={"max_dim": 2, "var_threshold": 0.999},
+    )
+    manifold = ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder)
+    n = manifold.domain.intrinsic_dim
+    with pytest.raises(ManifoldArityError) as exc:
+        _affine_manifold_push(manifold, tuple([0.0] * (n + 1)))
+    assert isinstance(exc.value, SteeringExprError)
+
+
 def test_discover_pca_flat_fit_skips_rbf_floor(tmp_path: Path) -> None:
     """The flat (``pca``) path is gated by the affine-span floor ``k+1``, not
     the RBF poisedness floor ``2k+1``: a flat subspace has no interpolant to

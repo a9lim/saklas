@@ -24,6 +24,7 @@ from saklas.core.manifold import (
     eval_rbf_jacobian,
     fit_layer_subspace as _fit_layer_subspace_with_ev,  # returns (LayerSubspace, ev_ratio)
     fit_rbf_interpolant,
+    rbf_cardinal_weights,
     subspace_inject,
     LayerSubspace,
     invert_parameterization,
@@ -183,6 +184,43 @@ def test_rbf_interpolates_nodes():
     w, c = fit_rbf_interpolant(node, val)
     got = eval_rbf(node, w, c, node)
     assert torch.allclose(got, val, atol=1e-3)
+
+
+def test_rbf_cardinal_weights_node_exact_and_partition_of_unity():
+    # The cardinal weights are e_i at node i (RBF reproduces sampled values)
+    # and sum to 1 everywhere (the affine polynomial reproduces constants).
+    torch.manual_seed(7)
+    nodes = torch.rand(8, 3)
+    K = nodes.shape[0]
+    for i in range(K):
+        w = rbf_cardinal_weights(nodes, nodes[i])
+        assert torch.allclose(w, torch.eye(K)[i], atol=1e-4)
+    w_mid = rbf_cardinal_weights(nodes, nodes.mean(dim=0))
+    assert w_mid.shape == (K,)
+    assert abs(float(w_mid.sum()) - 1.0) < 1e-4
+
+
+def test_rbf_cardinal_weights_reproduce_affine_off_node():
+    # r**3 RBF + linear polynomial reproduces affine functions exactly, so
+    # ``w(z) @ Y`` equals ``A z + b`` at any query when Y is affine in coords —
+    # the property that makes the per-layer target a faithful layout blend.
+    torch.manual_seed(11)
+    nodes = torch.rand(12, 2)
+    A = torch.randn(4, 2)
+    b = torch.randn(4)
+    Y = nodes @ A.T + b                       # (12, 4) affine in coords
+    z = torch.tensor([0.37, 0.62])
+    w = rbf_cardinal_weights(nodes, z)
+    assert torch.allclose(w @ Y, A @ z + b, atol=1e-3)
+
+
+def test_rbf_cardinal_weights_poisedness_rejection():
+    # A degenerate (collinear) layout has no interpolant — propagates ValueError.
+    line = torch.stack(
+        [torch.linspace(0, 1, 6), torch.linspace(0, 1, 6)], dim=-1,
+    )
+    with pytest.raises(ValueError, match="poisedness"):
+        rbf_cardinal_weights(line, torch.tensor([0.5, 0.5]))
 
 
 def test_rbf_poisedness_rejection_collinear():
