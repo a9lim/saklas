@@ -134,7 +134,15 @@ role=node_role, model_type=)`), threading the folder's `node_kinds` /
 - **`authored`/`spectral`** (curved): per layer `fit_layer_subspace` (PCA frame +
   RBF surface), μ-centered share bake, and a per-layer `origin`
   (`invert_parameterization` of the neutral mean — curved only; flat's foot is
-  coord 0).
+  coord 0). The `spectral` path passes `smoothing` (default `"auto"` → GCV) into
+  the penalized `fit_rbf_smoothed`; authored stays exact (node = exact target).
+  Per-layer λ/edf ride the sidecar as `rbf_smoothing_per_layer`.
+- **`auto`** (discover): `select_topology` (`core/manifold.py`) picks the
+  geometry per-model — flat `pca` vs curved `spectral` by GCV, plus periodic
+  `BoxDomain` axes via persistent homology. The chosen `effective_fit_mode`
+  drives the same flat/curved per-layer fit below; the resolved mode + the ranked
+  topology candidates land in the sidecar (`resolved_fit_mode`,
+  `topology_winner`, `topology_candidates`). Sphere is authored-only.
 
 `--sae` reconstructs each centroid through the SAE before the fit (fail-fast
 `SaeCoverageError`); the fitted subspace is model-space regardless. Bakes
@@ -249,7 +257,33 @@ basis[,node_params,rbf_weights,poly_coeffs,coord_offset,coord_scale]}` + shared
 `subspace_metric` — no `lever_per_layer`). `transfer_manifold` re-bakes share in
 target space (no lever). Discover: `derive_pca_coords` (cumulative-variance
 prefix) / `derive_spectral_coords` (Laplacian eigenmaps, eigenvalue-ratio cliff)
-/ `discover_coords` dispatcher, with `PcaDiagnostics`/`SpectralDiagnostics`.
+/ `discover_coords` dispatcher, with `PcaDiagnostics`/`SpectralDiagnostics`;
+`_laplacian_eigen` is the shared graph→Laplacian→eigh core.
+
+**Penalized smoothing.** `fit_rbf_smoothed(node_params, values, *, smoothing)`
+is the thin-plate/Duchon generalization of `fit_rbf_interpolant`: the penalized
+saddle `[E+λI Q; Qᵀ 0][w;c]=[y;0]` (penalty `λ·wᵀEw`). `smoothing="auto"`
+GCV-selects λ (`_gcv_select_lambda` → `_rbf_smoother_matrix` hat `S_λ`, GCV
+`K·RSS/(K−edf)²`, edf `tr S_λ`); `0`/`None` delegates to the exact interpolant
+bit-for-bit; a float is a fixed λ. The fitted weight shapes are unchanged so
+`eval_rbf` (hot path) is untouched — only the coefficients shrink. `fit_layer_subspace`
+takes `smoothing=` (curved discover passes it; authored stays exact) and surfaces
+the chosen λ/edf via the `rbf_info` out-dict. CPU/fp32 (the saddle is MPS-unsafe).
+
+**Topology selection (`fit_mode="auto"`).** `select_topology(stacks, layer_grams,
+consensus_gram, *, whitener, …)` picks the discover geometry per-model in two
+decoupled decisions (decoupling dodges the dimension bias that makes a single
+reconstruction score always crown the highest-dim candidate): **(a) flat vs
+curved** — GCV of the flat affine (`pca`) vs curved RBF (`spectral`) fit in a
+shared whitened-reduced target metric, each at its own intrinsic dim
+(`_ols_gcv_score`/`_rbf_gcv_score`); **(b) periodic axes** — Vietoris–Rips H1
+*persistent homology* (`_rips_h1_persistence` boundary-matrix reduction →
+`_count_persistent_loops`, essential loops at `eps_max=2ε_c`) counts the loops
+(ellipse/noise-robust — a circle and a 6:1 ellipse both read as one loop), the
+spectral eigenpairs coordinate them (`_detect_periodic_axes`, `_is_angular_harmonic`
+dedups a circle's `cos kθ` harmonics), routing to a periodic `BoxDomain`. Returns a
+`TopologyChoice` (`fit_mode`/`coords`/`domain` + ranked `TopologyCandidate`s for
+the sidecar). Sphere is **authored-only** — not an auto candidate.
 Naturalness eval: `to_hellinger`, `bhattacharyya_distance`, `fit_behavior_manifold`,
 `trajectory_naturalness`, `compute_node_behavior_centroid`,
 `compute_trajectory_distributions`, `compute_node_centroid`.

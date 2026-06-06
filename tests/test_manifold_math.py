@@ -24,6 +24,8 @@ from saklas.core.manifold import (
     eval_rbf_jacobian,
     fit_layer_subspace as _fit_layer_subspace_with_ev,  # returns (LayerSubspace, ev_ratio)
     fit_rbf_interpolant,
+    fit_rbf_smoothed,
+    _rbf_smoother_matrix,
     rbf_cardinal_weights,
     subspace_inject,
     LayerSubspace,
@@ -236,6 +238,95 @@ def test_rbf_poisedness_rejection_too_few():
     # 2 nodes cannot determine an affine term in 2 dimensions.
     with pytest.raises(ValueError, match="poisedness"):
         fit_rbf_interpolant(torch.rand(2, 2), torch.randn(2, 3))
+
+
+# ------------------------------------------------ penalized RBF (smoothing) ---
+
+def test_fit_rbf_smoothed_lambda_zero_equals_interpolant():
+    # smoothing=0 (and None) must reproduce the exact interpolant bit-for-bit:
+    # the discover path can always recover authored-style exactness, and the
+    # cardinal-weight / interpolation guarantees rest on this identity.
+    torch.manual_seed(3)
+    node = torch.rand(10, 2)
+    val = torch.randn(10, 4)
+    w0, c0 = fit_rbf_interpolant(node, val)
+    for smoothing in (0, 0.0, None):
+        ws, cs, info = fit_rbf_smoothed(node, val, smoothing=smoothing)
+        assert torch.equal(w0, ws)
+        assert torch.equal(c0, cs)
+        assert info["lambda"] == 0.0
+        assert info["edf"] == float(node.shape[0])
+
+
+def test_fit_rbf_smoothed_gcv_picks_interior_lambda():
+    # On noisy values GCV should select a positive λ and an effective dof
+    # strictly below the node count (genuine smoothing, not interpolation).
+    torch.manual_seed(4)
+    K = 14
+    x = torch.linspace(0.0, 1.0, K).unsqueeze(1)
+    clean = torch.stack([torch.sin(6 * x[:, 0]), (x[:, 0] - 0.5) ** 2], dim=1)
+    y = clean + 0.2 * torch.randn(K, 2)
+    _w, _c, info = fit_rbf_smoothed(x, y, smoothing="auto")
+    assert info["lambda"] > 0.0
+    assert info["edf"] < K
+    assert math.isfinite(info["gcv"]) and info["gcv"] > 0.0
+
+
+def test_fit_rbf_smoothed_edf_monotone_to_polynomial():
+    # The rigorous correctness check on the penalty form: as λ grows the
+    # effective dof tr(S_λ) must fall monotonically from K (interpolation) to
+    # m+1 (the affine polynomial null space).  A wrong penalty system would
+    # not converge to the polynomial dimension.
+    torch.manual_seed(5)
+    K, m = 12, 1
+    x = torch.linspace(0.0, 1.0, K).unsqueeze(1)
+    dist = torch.cdist(x, x)
+    E = dist.pow(3)
+    Q = torch.cat([torch.ones(K, 1), x], dim=1)
+    lams = [0.0, 1e-4, 1e-2, 1e0, 1e2, 1e5]
+    edfs = [float(_rbf_smoother_matrix(E, Q, lam).diagonal().sum()) for lam in lams]
+    assert edfs[0] == pytest.approx(float(K), abs=1e-3)
+    for a, b in zip(edfs, edfs[1:]):
+        assert b <= a + 1e-4
+    assert edfs[-1] == pytest.approx(float(m + 1), abs=1e-2)
+
+
+def test_fit_rbf_smoothed_clean_data_keeps_low_lambda():
+    # GCV on cleanly-interpolatable (affine) data should not over-smooth: the
+    # surface stays close to the data and the smallest grid λ wins out.
+    torch.manual_seed(6)
+    K = 12
+    x = torch.rand(K, 2)
+    A = torch.randn(3, 2)
+    b = torch.randn(3)
+    y = x @ A.T + b  # exactly affine → reproduced by the polynomial term
+    w, c, _info = fit_rbf_smoothed(x, y, smoothing="auto")
+    fit = eval_rbf(x, w, c, x)
+    assert torch.allclose(fit, y, atol=1e-2)
+
+
+def test_fit_rbf_smoothed_fixed_lambda_shrinks_node_residual():
+    # A fixed positive λ shrinks the surface toward the trend, so it no longer
+    # passes exactly through the (noisy) nodes — the smoothing trade-off.
+    torch.manual_seed(7)
+    K = 12
+    x = torch.linspace(0.0, 1.0, K).unsqueeze(1)
+    y = torch.sin(5 * x) + 0.25 * torch.randn(K, 1)
+    w0, c0 = fit_rbf_interpolant(x, y)
+    ws, cs, _info = fit_rbf_smoothed(x, y, smoothing=1.0)
+    exact_resid = float((eval_rbf(x, w0, c0, x) - y).abs().max())
+    smooth_resid = float((eval_rbf(x, ws, cs, x) - y).abs().max())
+    assert exact_resid < 1e-3 < smooth_resid
+
+
+def test_fit_rbf_smoothed_poisedness_rejection():
+    # The smoothing path validates poisedness too (the constraint Qᵀw=0 still
+    # needs Q full column rank), raising the same error as the exact fit.
+    line = torch.stack(
+        [torch.linspace(0, 1, 6), torch.linspace(0, 1, 6)], dim=-1,
+    )
+    with pytest.raises(ValueError, match="poisedness"):
+        fit_rbf_smoothed(line, torch.randn(6, 3), smoothing="auto")
 
 
 def test_eval_rbf_jacobian_matches_finite_difference():

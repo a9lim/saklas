@@ -71,7 +71,11 @@ _materialized_this_process: bool = False
 # manifolds whose node coordinates are derived from the model's
 # activations rather than authored by hand.  Authored manifolds carry
 # ``fit_mode == "authored"`` (or omit the field, which means the same).
-_FIT_MODES_DISCOVER: frozenset[str] = frozenset({"pca", "spectral"})
+# ``auto`` is a discover mode whose *resolved* geometry (flat ``pca`` vs curved
+# ``spectral``, plus periodic ``BoxDomain`` axes) is chosen per-model at fit
+# time by ``core.manifold.select_topology`` — the folder declares only the
+# corpus + hyperparams, exactly like ``pca``/``spectral``.
+_FIT_MODES_DISCOVER: frozenset[str] = frozenset({"pca", "spectral", "auto"})
 # A baked manifold is a pre-fitted, corpus-less artifact: its geometry is
 # frozen in the per-model tensor and it can never re-fit (no node corpus to
 # pool from).  Merge outputs and imported control vectors land this way — a
@@ -112,6 +116,16 @@ _HYPERPARAMS_BY_MODE: dict[str, frozenset[str]] = {
     }),
     "spectral": frozenset({
         "max_dim", "min_dim", "k_nn", "bandwidth", "max_subspace_dim",
+        "smoothing",
+    }),
+    # ``auto`` routes to ``select_topology`` (flat/curved by GCV + periodic by
+    # persistent homology); it accepts the union of the knobs its candidate
+    # fits consume — ``max_dim`` (layout dim cap), ``smoothing`` (curved-fit
+    # GCV λ), ``persistence_frac`` (H1 loop-significance threshold), plus the
+    # spectral graph knobs and ``max_subspace_dim`` for a resolved curved fit.
+    "auto": frozenset({
+        "max_dim", "var_threshold", "min_dim", "k_nn", "bandwidth",
+        "max_subspace_dim", "smoothing", "persistence_frac",
     }),
 }
 

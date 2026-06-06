@@ -1167,7 +1167,7 @@ def _run_manifold_fit(args: argparse.Namespace) -> None:
             )
             sys.exit(2)
         new_fit_mode = args.method or mf.fit_mode
-        if new_fit_mode not in {"pca", "spectral"}:
+        if new_fit_mode not in {"pca", "spectral", "auto"}:
             print(
                 f"manifold fit: invalid method {new_fit_mode!r}",
                 file=sys.stderr,
@@ -1191,6 +1191,13 @@ def _run_manifold_fit(args: argparse.Namespace) -> None:
         # by ``--max-dim``, not a separate knob).
         if getattr(args, "max_subspace_dim", None) is not None:
             new_hyperparams["max_subspace_dim"] = int(args.max_subspace_dim)
+        # Curved-fit smoothing (spectral/auto): "auto" → GCV, else a float λ.
+        if getattr(args, "smoothing", None) is not None:
+            s = args.smoothing
+            new_hyperparams["smoothing"] = s if s == "auto" else float(s)
+        # Auto-only: periodic-detection persistence threshold.
+        if getattr(args, "persistence_frac", None) is not None:
+            new_hyperparams["persistence_frac"] = float(args.persistence_frac)
         new_hyperparams = _sanitize_hyperparams(new_fit_mode, new_hyperparams)
 
         # Write back if anything changed.  Staged write — a crash mid-rewrite

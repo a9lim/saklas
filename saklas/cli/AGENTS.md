@@ -126,15 +126,20 @@ with a one-line hint.
 - `manifold fit`: positional `target` (a manifold name *or* a folder path;
   `_run_manifold_fit` resolves it and reads `fit_mode`), `-m/--model`, `-f/--force`,
   `--sae RELEASE`, `--sae-revision REV`, plus the discover hyperparams
-  `--method pca|spectral`, `--max-dim N`, `--var-threshold T`, `--k-nn K`,
-  `--bandwidth SIGMA`, `--max-subspace-dim R`. An authored folder runs
-  `ManifoldExtractionPipeline` directly; a discover folder (`pca`/`spectral`) has
-  any supplied hyperparam written into `manifold.json` atomically *before* the fit.
-  Supplying a discover hyperparam against an authored folder is an error.
-  `--max-subspace-dim` caps the per-layer RBF subspace dim for the curved spectral
-  fit (argparse-default `None` → engine 64) and is dropped by `_sanitize_hyperparams`
-  for `--method pca` — a flat fit's subspace dim is its `--max-dim` layout dim. This
-  verb folds the former separate `discover` verb.
+  `--method pca|spectral|auto`, `--max-dim N`, `--var-threshold T`, `--k-nn K`,
+  `--bandwidth SIGMA`, `--max-subspace-dim R`, `--smoothing auto|0|LAMBDA`,
+  `--persistence-frac F`. An authored folder runs
+  `ManifoldExtractionPipeline` directly; a discover folder (`pca`/`spectral`/`auto`)
+  has any supplied hyperparam written into `manifold.json` atomically *before* the
+  fit. Supplying a discover hyperparam against an authored folder is an error.
+  `--method auto` defers flat-vs-curved + periodic-axis selection to
+  `select_topology` per-model. `--max-subspace-dim` caps the per-layer RBF subspace
+  dim for the curved spectral fit (argparse-default `None` → engine 64) and is
+  dropped by `_sanitize_hyperparams` for `--method pca` — a flat fit's subspace dim
+  is its `--max-dim` layout dim. `--smoothing` (curved only: GCV `auto` / exact `0`
+  / fixed λ) sets the penalized-RBF regularization; `--persistence-frac` (auto
+  only) is the H1 loop-significance threshold. This verb folds the former separate
+  `discover` verb.
 - `manifold bake`: `name` + `expression`, `-f`, `-s/--strict`, `-m/--model`. Lands
   a corpus-less baked manifold via `merge_into_manifold`.
 - `manifold merge`: `name` + `sources` (1+), `-f`. Unions the node corpora of

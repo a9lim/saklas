@@ -571,7 +571,7 @@ def fetch_manifold_info(
         else:
             n = 0
         domain_label = f"{kind}({n}d)"
-    elif fit_mode in {"pca", "spectral"}:
+    elif fit_mode in {"pca", "spectral", "auto"}:
         domain_label = f"discover-{fit_mode}"
     else:
         domain_label = "?"

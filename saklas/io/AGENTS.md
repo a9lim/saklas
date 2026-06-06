@@ -51,13 +51,18 @@ onto the profile-cache sidecars `vectors.save_profile` writes.
 The on-disk format for every concept + steering manifold —
 `~/.saklas/manifolds/<ns>/<name>/`. `MANIFOLD_FORMAT_VERSION = 5` (decoupled from
 `PACK_FORMAT_VERSION`); rejects pre-v3 and newer-than-local. `min_nodes(n) = 2n+1`
-(the curved-fit poisedness floor). Four `fit_mode`s share the class, discriminated
+(the curved-fit poisedness floor). Five `fit_mode`s share the class, discriminated
 by `manifold.json::fit_mode`:
 
 - **`authored`** — user supplies `domain` + per-node `{label, coords}`. Curved RBF.
-- **`pca`** / **`spectral`** (discover) — nodes carry `{label}` only; coords are
-  derived per-model at fit time and stored in the safetensors; `hyperparams` feeds
-  the picker. `pca` is flat (also the 2-node vector case), `spectral` curved.
+- **`pca`** / **`spectral`** / **`auto`** (discover) — nodes carry `{label}` only;
+  coords are derived per-model at fit time and stored in the safetensors;
+  `hyperparams` feeds the picker. `pca` is flat (also the 2-node vector case),
+  `spectral` curved, `auto` lets `core.manifold.select_topology` pick flat-vs-
+  curved (GCV) plus periodic `BoxDomain` axes (H1 persistent homology) per-model.
+  All three are `is_discover`; `_HYPERPARAMS_BY_MODE` whitelists each (auto's
+  union includes `smoothing` + `persistence_frac`), and `nodes_sha256` folds
+  `fit_mode` + hyperparams so re-fit is deterministic.
 - **`baked`** — corpus-less: a precomputed direction written by `manifold bake`.
   No node corpus, no re-fit; `BakedManifoldError` guards corpus-requiring calls.
 

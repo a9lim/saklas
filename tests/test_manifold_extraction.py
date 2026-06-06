@@ -761,3 +761,73 @@ def test_discover_pca_flat_fit_skips_rbf_floor(tmp_path: Path) -> None:
     assert manifold.layers
     for sub in manifold.layers.values():
         assert sub.is_affine
+
+
+# ----------------------------------------------------- fit_mode="auto" -------
+
+def _circle_encoder_batch(
+    model: Any, tokenizer: Any, prompts: Any, responses: Any, layers: Any,
+    device: Any, **kwargs: Any,
+) -> dict[int, torch.Tensor]:
+    """Place node ``node<NN>`` at angle ``2π·NN/12`` on a circle in dims 0–1.
+
+    Exercises the ``auto`` → persistent-homology → periodic ``BoxDomain`` path
+    end to end: the per-node centroids trace a loop, so ``select_topology``
+    must resolve a ``spectral`` curved fit over a 1-periodic box (a circle).
+    """
+    import math as _math
+    rows = []
+    for r in responses:
+        i = int(r.split()[0][4:])           # "node07 statement 2" -> 7
+        ang = 2.0 * _math.pi * i / 12.0
+        base = torch.zeros(_DIM)
+        base[0] = _math.cos(ang)
+        base[1] = _math.sin(ang)
+        out: dict[int, torch.Tensor] = {}
+        for layer in range(len(layers)):
+            v = base.clone()
+            v[2] = 0.3 * layer
+            out[layer] = v + 0.02 * torch.randn(_DIM)
+        rows.append(out)
+    return {
+        idx: torch.stack([row[idx] for row in rows]) for idx in range(len(layers))
+    }
+
+
+def test_auto_records_resolution_metadata(tmp_path: Path) -> None:
+    """An ``auto`` fit resolves a concrete geometry and records the ranking."""
+    folder = _discover_folder(
+        tmp_path, name="autoflat", fit_mode="auto",
+        labels=[f"n{i:02d}" for i in range(8)], hyperparams={"max_dim": 4},
+    )
+    manifold = ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder)
+
+    assert manifold.layers
+    meta = manifold.metadata
+    assert meta["fit_mode"] == "auto"
+    assert meta["resolved_fit_mode"] in {"pca", "spectral"}
+    assert meta["method"] == "manifold_discover_auto"
+    names = {c["name"] for c in meta["topology_candidates"]}
+    assert "flat-pca" in names
+    assert meta["topology_winner"] in names
+
+
+def test_auto_detects_circle_as_periodic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``auto`` on loop-structured centroids resolves a periodic BoxDomain."""
+    from saklas.core.manifold import BoxDomain
+    monkeypatch.setattr(V, "_encode_and_capture_all_batch", _circle_encoder_batch)
+    folder = _discover_folder(
+        tmp_path, name="autocircle", fit_mode="auto",
+        labels=[f"node{i:02d}" for i in range(12)], hyperparams={"max_dim": 4},
+    )
+    manifold = ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder)
+
+    assert isinstance(manifold.domain, BoxDomain)
+    assert manifold.domain.axes[0].periodic
+    assert manifold.metadata["resolved_fit_mode"] == "spectral"
+    assert manifold.metadata["topology_winner"] == "torus-T1"
+    # The curved fit landed an RBF surface per layer (not affine).
+    for sub in manifold.layers.values():
+        assert not sub.is_affine

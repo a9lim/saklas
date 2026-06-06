@@ -17,6 +17,7 @@ pipeline itself does not touch generation state.
 """
 from __future__ import annotations
 
+import math
 import pathlib
 from typing import Any, Callable, Protocol, runtime_checkable
 
@@ -481,12 +482,83 @@ class ManifoldExtractionPipeline:
         # the derived intrinsic dim and ignores any override.  Authored
         # manifolds don't currently route hyperparams so they inherit 64.
         max_subspace_dim_override: int | None = None
+        # ``smoothing`` (curved discover only): penalized-RBF λ selection for
+        # the per-layer surface.  ``None`` ⇒ exact interpolation — the authored
+        # contract (node = exact steering target) and the flat ``pca`` path
+        # (no RBF).  A curved ``spectral`` discover fit defaults to GCV
+        # (``"auto"``), trading exactness for a surface that doesn't chase
+        # noise in the per-node centroids.
+        curved_smoothing: float | str | None = None
 
+        # ``effective_fit_mode`` is the *resolved* geometry the per-layer fit
+        # branches on: it equals ``mf.fit_mode`` for authored / pca / spectral,
+        # and the topology ``select_topology`` picks for ``fit_mode="auto"``.
+        effective_fit_mode = mf.fit_mode
         if mf.fit_mode == "authored":
             domain = domain_from_spec(mf.domain)
             node_coords = torch.tensor(mf.node_coords, dtype=torch.float32)
             node_params = domain.embed(node_coords)
             method = "manifold_sae" if sae_backend is not None else "manifold_pca"
+        elif mf.fit_mode == "auto":
+            # Auto: pick the discover geometry per-model — flat (pca) vs curved
+            # (spectral) by GCV, plus periodic (BoxDomain) axes via persistent
+            # homology.  ``select_topology`` returns the resolved fit_mode +
+            # coords + domain; the per-layer fit below runs unchanged on the
+            # resolved mode.  Sphere is authored-only (not an auto candidate).
+            from saklas.io.manifolds import _sanitize_hyperparams
+            from saklas.core.manifold import select_topology
+            st_hyper = _sanitize_hyperparams("auto", dict(mf.hyperparams))
+            consensus_gram = torch.stack(
+                [layer_grams[idx] for idx in fit_layers]
+            ).mean(dim=0)
+            _progress(
+                f"Selecting topology across {len(fit_layers)} layers "
+                f"({K} centroids)..."
+            )
+            choice = select_topology(
+                {idx: stacks[idx] for idx in fit_layers},
+                {idx: layer_grams[idx] for idx in fit_layers},
+                consensus_gram,
+                whitener=maha_whitener,
+                max_dim=int(st_hyper.get("max_dim", 8)),
+                smoothing=st_hyper.get("smoothing", "auto"),
+                persistence_frac=float(st_hyper.get("persistence_frac", 0.5)),
+            )
+            effective_fit_mode = choice.fit_mode
+            domain = choice.domain
+            node_coords = choice.coords
+            node_params = domain.embed(node_coords)
+            k = int(node_coords.shape[1])
+            floor = (k + 1) if effective_fit_mode == "pca" else min_nodes(k)
+            if floor > K:
+                raise ValueError(
+                    f"auto manifold {mf.name!r}: resolved topology "
+                    f"{choice.winner_name!r} (k={k}) needs >= {floor} nodes, "
+                    f"got K={K}"
+                )
+            if effective_fit_mode == "spectral":
+                curved_smoothing = st_hyper.get("smoothing", "auto")
+            method = (
+                "manifold_discover_sae" if sae_backend is not None
+                else "manifold_discover_auto"
+            )
+            discover_metadata = {
+                "fit_mode": "auto",
+                "resolved_fit_mode": effective_fit_mode,
+                "hyperparams": dict(st_hyper),
+                "topology_winner": choice.winner_name,
+                "topology_candidates": [
+                    {
+                        "name": c.name,
+                        "fit_mode": c.fit_mode,
+                        "intrinsic_dim": c.intrinsic_dim,
+                        "score": (c.score if math.isfinite(c.score) else None),
+                        "viable": c.viable,
+                        "reason": c.reason,
+                    }
+                    for c in choice.candidates
+                ],
+            }
         else:
             # Discover: derive coords from the per-node centroids, layer-
             # agnostically — there is no reference layer.  The same coords feed
@@ -507,6 +579,16 @@ class ManifoldExtractionPipeline:
             # — see the affine fit below.)
             if "max_subspace_dim" in hyperparams:
                 max_subspace_dim_override = int(hyperparams.pop("max_subspace_dim"))
+            # ``smoothing`` is consumed by the penalized curved fit
+            # (``fit_layer_subspace`` → ``fit_rbf_smoothed``), not by
+            # ``discover_coords`` — pop it before the dispatch so it isn't an
+            # unexpected kwarg.  Only the curved (``spectral``) path has an RBF
+            # surface to smooth; the flat (``pca``) path's affine span has no
+            # interpolant, so smoothing never applies there.
+            if mf.fit_mode == "spectral":
+                curved_smoothing = hyperparams.pop("smoothing", "auto")
+            else:
+                hyperparams.pop("smoothing", None)
             # Consensus Gram: the mean over every fit layer of that layer's
             # whitened, node-mean-centered (K, K) Gram ``X̃_L Σ_L⁻¹ X̃_Lᵀ``
             # (the ``layer_grams`` already computed for the spread profile).
@@ -568,6 +650,8 @@ class ManifoldExtractionPipeline:
             resolved_hyperparams = dict(hyperparams)
             if max_subspace_dim_override is not None:
                 resolved_hyperparams["max_subspace_dim"] = max_subspace_dim_override
+            if curved_smoothing is not None:
+                resolved_hyperparams["smoothing"] = curved_smoothing
             if hasattr(diagnostics, "k_nn"):  # SpectralDiagnostics
                 resolved_hyperparams["k_nn"] = int(diagnostics.k_nn)  # pyright: ignore[reportAttributeAccessIssue]  # SpectralDiagnostics only; guarded by hasattr
                 resolved_hyperparams["bandwidth"] = float(
@@ -589,6 +673,10 @@ class ManifoldExtractionPipeline:
         layer_subs = {}
         explained_variance: dict[int, float] = {}
         mahalanobis_share: dict[int, float] = {}
+        # Per-layer penalized-RBF provenance (curved + ``smoothing`` only):
+        # ``{layer: {"lambda", "edf", "gcv"}}`` from the GCV select, for the
+        # sidecar + inspector.  Empty for exact / flat fits.
+        rbf_smoothing_per_layer: dict[int, dict[str, float]] = {}
         # Neutral baseline (probe-centering means), **ungated** by the
         # whitener: the curved fit's neutral-anchor (``mean = P_basis(ν)``,
         # §5) consumes it.  ``None`` on a CPU-stub handle ⇒ the fit falls back
@@ -616,7 +704,7 @@ class ManifoldExtractionPipeline:
                 mu_coords, sub.basis, whitener=maha_whitener, layer=idx,
             )
 
-        if mf.fit_mode == "pca":
+        if effective_fit_mode == "pca":
             # FLAT affine fit — the discover-``pca`` path is a flat rank-``k``
             # subspace, not an RBF surface (ARCHITECTURE §1/§5).  Per layer:
             # ``fit_affine_subspace`` (μ-centered PCA basis at the derived
@@ -663,19 +751,26 @@ class ManifoldExtractionPipeline:
                 _bake_share(idx, sub, mu_coords)
         else:
             # CURVED (authored / spectral): RBF surface fit, neutral-anchored.
+            # ``curved_smoothing`` is ``None`` for authored (exact-interpolation
+            # contract) and the GCV / fixed-λ selector for ``spectral``.
             for idx in fit_layers:
                 stacked = stacks[idx]
                 # ``neutral_mean`` neutral-anchors the frame; ``maha_whitener``
                 # (mandatory, checked above) selects the whitened/Fisher basis.
+                _rbf_info: dict[str, float] = {}
                 sub, ev_ratio = fit_layer_subspace(
                     stacked, node_params,
                     whitener=maha_whitener, layer=idx,
                     neutral_mean=_neutral_for(idx),
                     whitened_gram=layer_grams[idx],
+                    smoothing=curved_smoothing,
+                    rbf_info=_rbf_info,
                     **fit_kwargs,
                 )
                 layer_subs[idx] = sub
                 explained_variance[idx] = ev_ratio
+                if _rbf_info:
+                    rbf_smoothing_per_layer[idx] = _rbf_info
                 # μ-centered share (NOT ``eval_rbf(node_params)`` — the surface
                 # is neutral-anchored, so its node values aren't μ-centered).
                 mu_centered = stacked.to(torch.float32)
@@ -691,7 +786,7 @@ class ManifoldExtractionPipeline:
         # ``rbf_params()`` and raise.  Each layer's cold-start foot seed; layers
         # whose mean isn't resolvable (CPU stub) are simply absent.
         origin: dict[int, torch.Tensor] = {}
-        if mf.fit_mode != "pca" and _handle_means is not None:
+        if effective_fit_mode != "pca" and _handle_means is not None:
             for idx, sub in layer_subs.items():
                 if idx not in _handle_means:
                     continue
@@ -738,6 +833,13 @@ class ManifoldExtractionPipeline:
                 str(idx): node_spread_per_layer[idx] for idx in fit_layers
             },
         }
+        if rbf_smoothing_per_layer:
+            # Penalized-RBF provenance: the GCV-chosen λ + effective dof per
+            # layer (curved discover fits only).  Diagnostic — surfaced by
+            # `manifold show`, nothing branches on it at load.
+            metadata["rbf_smoothing_per_layer"] = {
+                str(idx): info for idx, info in rbf_smoothing_per_layer.items()
+            }
         if sae_backend is not None:
             metadata["sae_release"] = sae_backend.release
             metadata["sae_revision"] = sae_backend.revision

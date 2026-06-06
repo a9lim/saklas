@@ -297,9 +297,10 @@ def _build_manifold_fit(fit: argparse.ArgumentParser) -> None:
     # Discover-mode hyperparam overrides.  Written into ``manifold.json``
     # before the fit; rejected against an authored folder.
     fit.add_argument(
-        "--method", choices=("pca", "spectral"), default=None,
-        help="Discover-mode: override the folder's fit_mode "
-             "(default: keep folder's setting)",
+        "--method", choices=("pca", "spectral", "auto"), default=None,
+        help="Discover-mode: override the folder's fit_mode. 'auto' picks "
+             "flat (pca) vs curved (spectral) by GCV and detects periodic "
+             "axes via persistent homology (default: keep folder's setting)",
     )
     fit.add_argument(
         "--max-dim", dest="max_dim", type=int, default=None, metavar="N",
@@ -338,6 +339,19 @@ def _build_manifold_fit(fit: argparse.ArgumentParser) -> None:
              "axis subspace_inject can displace, so fewer axes = smaller "
              "per-α effect = wider coherence regime. Ignored for --method pca "
              "(a flat fit's subspace dim is its layout dim — use --max-dim).",
+    )
+    fit.add_argument(
+        "--smoothing", dest="smoothing", default=None, metavar="LAMBDA",
+        help="Discover spectral/auto (curved): penalized-RBF smoothing — "
+             "'auto' (GCV-selected, the default), '0' (exact interpolation), "
+             "or a float λ. Ignored for --method pca (no RBF surface).",
+    )
+    fit.add_argument(
+        "--persistence-frac", dest="persistence_frac", type=float,
+        default=None, metavar="F",
+        help="Discover auto: H1 loop-significance threshold as a fraction of "
+             "the connectivity scale (default 0.5); higher = stricter periodic "
+             "detection. Ignored unless --method auto.",
     )
     fit.set_defaults(quantize=None, device="auto", probes=None)
 
@@ -402,7 +416,7 @@ def _build_manifold_merge(merge: argparse.ArgumentParser) -> None:
         help="Human-readable description for the merged manifold folder",
     )
     merge.add_argument(
-        "--method", choices=("pca", "spectral"), default=None,
+        "--method", choices=("pca", "spectral", "auto"), default=None,
         help="Override the merged fit_mode (default: the sources' shared "
              "mode; required when sources disagree)",
     )

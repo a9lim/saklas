@@ -115,7 +115,7 @@ class CreateDiscoverManifoldRequest(BaseModel):
     namespace: str = "local"
     name: str
     description: str = ""
-    fit_mode: Literal["pca", "spectral"] = "pca"
+    fit_mode: Literal["pca", "spectral", "auto"] = "pca"
     nodes: list[DiscoverNodeSpec]
     hyperparams: dict[str, Any] = {}
 
@@ -135,7 +135,7 @@ class GenerateManifoldRequest(BaseModel):
     concepts: list[str]
     kind: Literal["abstract", "concrete"] = "abstract"
     samples_per_prompt: int = 1
-    fit_mode: Literal["pca", "spectral"] = "pca"
+    fit_mode: Literal["pca", "spectral", "auto"] = "pca"
     hyperparams: dict[str, Any] = {}
     force: bool = False
     # ``role_per_node=True`` (the GUI "use slug as per-node role"
@@ -164,7 +164,7 @@ class FitManifoldRequest(BaseModel):
     sae: str | None = None
     sae_revision: str | None = None
     # Discover-mode override fields — ignored when the folder is authored.
-    fit_mode: Literal["pca", "spectral"] | None = None
+    fit_mode: Literal["pca", "spectral", "auto"] | None = None
     hyperparams: dict[str, Any] | None = None
 
 
@@ -207,7 +207,7 @@ class MergeManifoldRequest(BaseModel):
     # Defaults to the sources' shared fit_mode if they agree, else
     # required.  Server-side reconciliation lives in
     # ``merge_discover_manifolds``.
-    fit_mode: Literal["pca", "spectral"] | None = None
+    fit_mode: Literal["pca", "spectral", "auto"] | None = None
     hyperparams: dict[str, Any] | None = None
     force: bool = False
 

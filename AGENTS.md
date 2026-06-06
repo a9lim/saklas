@@ -55,7 +55,7 @@ saklas tui <model_id> [--no-dls]
 saklas serve <model_id> [--no-web] [--steer/-S EXPR]
 saklas manifold extract <concept>|<pos> <neg> [-m MODEL] [--sae RELEASE] [--role SLUG] [--namespace NS] [-f]
 saklas manifold generate <name> --concepts C... [--kind abstract|concrete] [--samples-per-prompt K] [--seed S]
-saklas manifold fit <name>|<folder> [-m MODEL] [--sae REL] [--method pca|spectral] [--max-dim N] [--var-threshold T] [--k-nn K] [--bandwidth SIGMA] [--max-subspace-dim R]  # authored or discover-mode (hyperparams apply only to discover folders)
+saklas manifold fit <name>|<folder> [-m MODEL] [--sae REL] [--method pca|spectral|auto] [--max-dim N] [--var-threshold T] [--k-nn K] [--bandwidth SIGMA] [--max-subspace-dim R] [--smoothing auto|0|LAMBDA] [--persistence-frac F]  # authored or discover-mode (hyperparams apply only to discover folders; --smoothing curved only, --persistence-frac auto only)
 saklas manifold bake <name> <expression> [-m]    # shared grammar: "0.3 ns/a + 0.5 ns/b|ns/c"
 saklas manifold merge <name> <src...> [-f]           # union discover-mode node corpora
 saklas manifold transfer <name> --from SRC --to TGT [-f]   # cross-model Procrustes
@@ -338,10 +338,21 @@ so the hook never touches the SAE. `min_nodes(n) = 2n+1` for a curved fit (a fla
 `pca` fit needs only `k+1`); authored nodes must be *poised* (affinely span the
 embedding).
 
-`fit_mode` is one of four: `authored` (user supplies domain + coords; curved),
-`pca` / `spectral` (discover — labeled corpora only, coords derived per-model;
-`pca` is flat, `spectral` curved), and `baked` (corpus-less, a precomputed
-direction written by `manifold bake` — see io/AGENTS.md).
+`fit_mode` is one of five: `authored` (user supplies domain + coords; curved),
+`pca` / `spectral` / `auto` (discover — labeled corpora only, coords derived
+per-model; `pca` is flat, `spectral` curved, `auto` picks between them), and
+`baked` (corpus-less, a precomputed direction written by `manifold bake` — see
+io/AGENTS.md). `auto` runs `select_topology` at fit time (`core/manifold.py`):
+flat (`pca`) vs curved (`spectral`) chosen by GCV in a shared whitened-reduced
+metric, plus periodic (`BoxDomain`) axes detected by Vietoris–Rips H1 persistent
+homology (loop counter, robust to ellipse distortion) coordinated off the
+spectral eigenpairs. The resolved geometry is per-model and recorded in the
+sidecar (`resolved_fit_mode` + the ranked `topology_candidates`). Sphere is
+authored-only — not an auto candidate. The curved (`spectral`/`auto`) RBF fit is
+**penalized**: a GCV-selected smoothing λ (`fit_rbf_smoothed`) regularizes the
+surface so it doesn't chase noise in the centroids, generalizing the exact
+interpolation `authored` keeps (node = exact steering target). λ=0 reproduces the
+interpolant; the hot-path `eval_rbf` is unchanged (only the coefficients shrink).
 
 Per-node `role` (slug `[a-z0-9._-]+`): the centroid is pooled under a
 chat-template substitution that replaces the assistant-role label, so the fit
@@ -370,8 +381,10 @@ reach it.)
 ### Discover mode (auto-fit from a heap of corpora)
 
 `manifold.json::fit_mode` is the discriminator: `"authored"` (user supplies
-domain + per-node coords) vs *discover* — `"pca"`/`"spectral"`, where the user
-supplies labeled corpora only and coordinates are derived per-model at fit time.
+domain + per-node coords) vs *discover* — `"pca"`/`"spectral"`/`"auto"`, where the
+user supplies labeled corpora only and coordinates are derived per-model at fit
+time. `"auto"` defers the flat-vs-curved-vs-periodic choice to `select_topology`
+(see below); `"pca"`/`"spectral"` pin it.
 The derivation is **layer-agnostic** — there is no reference layer. Each fit layer
 contributes its whitened, node-mean-centered `(K, K)` Gram and the coords come from
 their mean (the *consensus Gram*); whitening puts every layer in common units so
@@ -391,6 +404,23 @@ fit neutral-anchors the frame), so there is no `anchor_origin` knob. Per-model
 coordinates are the architectural shift: a Gemma fit and a Qwen fit produce
 different node layouts for the same heap (stored as `node_coords` in the per-model
 safetensors).
+
+`fit_mode="auto"` chooses the geometry per-model via `select_topology`, in two
+decoupled decisions (decoupling is deliberate: a single reconstruction score has a
+dimension bias — more spectral coordinates always "fit" better, so the highest-dim
+candidate always wins). **(a) flat vs curved** — the flat affine (`pca`) and curved
+RBF (`spectral`) fits, each at its own intrinsic dim, are scored by GCV (effective-
+dof-penalized) in a shared per-layer whitened/Fisher reduced metric; lower wins.
+**(b) periodic axes** — Vietoris–Rips H1 *persistent homology* counts the loops
+(topologically robust: a circle, a 6:1 ellipse, and a noisy circle all read as one
+loop; a 2-torus as two; a blob/arc/line as zero), and the spectral eigenpairs
+supply the angle coordinates, routing a detection to a periodic `BoxDomain`.
+Spheres are **authored-only** (a speculative topology that's the least reliable to
+detect from few centroids). `--persistence-frac` tunes the loop-significance
+threshold. The curved fit (`spectral`, or an `auto` resolving to it) is a
+**penalized** RBF — `--smoothing auto` GCV-selects a smoothing λ (default), `0` is
+exact interpolation, a float is a fixed λ; the penalty regularizes the surface
+against centroid noise without touching the hot-path evaluator.
 
 `manifold generate <name> --concepts ... [--kind abstract|concrete]` LLM-authors a
 discover folder via `session.generate_responses` — each concept answers the shared

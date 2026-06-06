@@ -674,6 +674,190 @@ def fit_rbf_interpolant(
     return sol[:K].contiguous(), sol[K:].contiguous()
 
 
+def _rbf_poised(node_params: torch.Tensor) -> tuple[int, int]:
+    """Validate affine poisedness for an RBF fit; return ``(K, m)``.
+
+    Mirrors the checks at the head of :func:`fit_rbf_interpolant` so the
+    smoothing path raises the *same* ``ValueError`` messages on a
+    rank-deficient layout (the penalty conditions the kernel block but the
+    constraint ``Qᵀw = 0`` still needs ``Q`` full column rank for the
+    polynomial coefficients to be determined).
+    """
+    K, m = node_params.shape
+    if m + 1 > K:
+        raise ValueError(
+            f"RBF poisedness failure: {K} nodes cannot determine an affine "
+            f"term in {m} embedding dimensions (need >= {m + 1})"
+        )
+    centered = node_params - node_params.mean(dim=0, keepdim=True)
+    if int(torch.linalg.matrix_rank(centered)) != m:
+        raise ValueError(
+            f"RBF poisedness failure: the {K} node coordinates do not "
+            f"affinely span the {m}-dim embedding space (they lie in a "
+            f"lower-dimensional flat); spread the nodes across every axis"
+        )
+    return K, m
+
+
+def _rbf_saddle(
+    A: torch.Tensor, Q: torch.Tensor, rhs_top: torch.Tensor,
+) -> torch.Tensor:
+    """Solve ``[[A, Q],[Qᵀ, 0]] [x; c] = [rhs_top; 0]`` and return ``[x; c]``.
+
+    The shared saddle assembler for the smoothing path.  ``A`` is the
+    (possibly penalized) ``(K, K)`` kernel block, ``Q`` the ``(K, m+1)``
+    polynomial block, ``rhs_top`` the ``(K, P)`` top right-hand side (node
+    values for a fit; ``I_K`` for the smoother matrix).  Symmetric-indefinite
+    ⇒ LU (``torch.linalg.solve``), never Cholesky — same as
+    :func:`fit_rbf_interpolant`.
+    """
+    mp1 = Q.shape[1]
+    P = rhs_top.shape[1]
+    top = torch.cat([A, Q], dim=1)                                  # (K, K+m+1)
+    bot = torch.cat([Q.transpose(0, 1), torch.zeros(mp1, mp1, dtype=A.dtype)], dim=1)
+    M = torch.cat([top, bot], dim=0)                                # (K+m+1, square)
+    rhs = torch.cat([rhs_top, torch.zeros(mp1, P, dtype=A.dtype)], dim=0)
+    return torch.linalg.solve(M, rhs)
+
+
+def _rbf_smoother_matrix(
+    E: torch.Tensor, Q: torch.Tensor, lam: float,
+) -> torch.Tensor:
+    """The ``(K, K)`` smoother (hat) matrix ``S_λ`` mapping node values to fits.
+
+    ``ŷ = S_λ y = E w + Q c`` where ``(w, c)`` solve the penalized saddle
+    ``[[E+λI, Q],[Qᵀ, 0]] [w; c] = [y; 0]``.  Built by solving the saddle
+    against ``[I_K; 0]`` — the columns of the inverse that map ``y`` into
+    ``(w, c)`` — then composing ``S = E·M11 + Q·M21``.  ``tr S_λ`` is the
+    effective degrees of freedom (``K`` at ``λ=0`` ⇒ exact interpolation;
+    ``m+1`` as ``λ→∞`` ⇒ the polynomial trend), and ``I − S_λ`` is the
+    residual operator behind GCV / leave-one-out.
+    """
+    K = E.shape[0]
+    A = E + lam * torch.eye(K, dtype=E.dtype)
+    eye = torch.eye(K, dtype=E.dtype)
+    sol = _rbf_saddle(A, Q, eye)            # (K+m+1, K)
+    W = sol[:K]                              # M11  (K, K)
+    C = sol[K:]                              # M21  (m+1, K)
+    return E @ W + Q @ C                     # (K, K)
+
+
+def _gcv_select_lambda(
+    E: torch.Tensor, Q: torch.Tensor, values: torch.Tensor,
+    *, n_grid: int = 40,
+) -> tuple[float, float, float]:
+    """Pick the smoothing ``λ`` minimizing generalized cross-validation.
+
+    ``V(λ) = K · ‖(I − S_λ) Y‖²_F / [tr(I − S_λ)]²`` over a log-spaced grid
+    scaled by the mean kernel magnitude (so ``λ`` is dimensionless against
+    ``E``).  The smoother ``S_λ`` is shared across the ``R`` output columns,
+    so the multi-output GCV is the single shared-``S`` form with a Frobenius
+    RSS — the ``K`` factor and the (common) ``1/K`` normalizations are
+    constants in ``λ`` and don't move the argmin; kept for a comparable
+    scalar.  ``λ = 0`` (exact interpolation) is excluded: there ``S = I`` so
+    ``tr(I − S) = 0`` and GCV is the indeterminate ``0/0`` — the smallest
+    grid ``λ`` is the near-interpolating limit.  Returns
+    ``(λ*, edf = tr S_{λ*}, V(λ*))``.
+    """
+    K = E.shape[0]
+    # Scale the grid by the mean off-diagonal kernel magnitude (diag(E) = 0),
+    # so the search range is invariant to coordinate scale.
+    denom = K * K - K
+    e_scale = float(E.abs().sum() / denom) if denom > 0 else 1.0
+    if not math.isfinite(e_scale) or e_scale <= 0.0:
+        e_scale = 1.0
+    grid = e_scale * torch.logspace(-6.0, 3.0, n_grid, dtype=E.dtype)
+    eye = torch.eye(K, dtype=E.dtype)
+    best_lam = float(grid[0].item())
+    best_gcv = math.inf
+    best_edf = float(K)
+    for lam_t in grid:
+        lam = float(lam_t.item())
+        S = _rbf_smoother_matrix(E, Q, lam)
+        ImS = eye - S
+        tr = float(ImS.diagonal().sum().item())
+        if tr <= 0.0:
+            continue
+        rss = float((ImS @ values).pow(2).sum().item())
+        gcv = K * rss / (tr * tr)
+        if gcv < best_gcv:
+            best_gcv = gcv
+            best_lam = lam
+            best_edf = float(K) - tr
+    return best_lam, best_edf, best_gcv
+
+
+def fit_rbf_smoothed(
+    node_params: torch.Tensor,
+    values: torch.Tensor,
+    *,
+    smoothing: float | str | None = "auto",
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+    """Fit a *penalized* ``r**3`` polyharmonic RBF — the smoothing generalization.
+
+    The thin-plate / Duchon smoothing spline: minimize
+    ``‖y − Ew − Qc‖² + λ wᵀEw`` subject to ``Qᵀw = 0``, whose stationarity is
+    the penalized saddle::
+
+        [ E + λI   Q ] [w]   [y]
+        [ Qᵀ       0 ] [c] = [0]
+
+    ``E_ij = ‖p_i − p_j‖³``, ``Q = [1 | node_params]``.  At ``λ = 0`` this is
+    exactly :func:`fit_rbf_interpolant` (the no-penalty / kernel-ridge limit
+    ``(E)w + Qc = y``), so the surface interpolates the node values; at
+    ``λ > 0`` it *shrinks* toward the affine polynomial trend, trading
+    exactness for a smoother surface that doesn't chase noise in the
+    centroids.  This is the discover-mode counterpart to authored manifolds'
+    exact interpolation (where node = exact steering target is the contract).
+
+    ``smoothing`` is ``"auto"`` (GCV-select ``λ`` over a log grid — the
+    default for a noisy discover fit), ``0`` / ``None`` (exact, delegates to
+    :func:`fit_rbf_interpolant` for a byte-identical result), or a float
+    (a fixed ``λ`` on the mean-kernel-magnitude scale, for advanced control).
+
+    Returns ``(rbf_weights (K, R), poly_coeffs (m+1, R), info)`` where
+    ``info`` carries ``{"lambda", "edf", "gcv"}`` (the chosen ``λ``, the
+    effective dof ``tr S_λ``, and the GCV score — ``gcv`` is ``-1`` for the
+    exact / fixed-``λ`` paths that don't run the search).  The weight shapes
+    are identical to :func:`fit_rbf_interpolant`, so :func:`eval_rbf` and the
+    steering hot path are unchanged — only the coefficient *values* shrink.
+
+    CPU / fp32: the saddle solve is symmetric-indefinite (MPS-unsafe), and
+    this runs once per layer at fit time, off the hot path.
+    """
+    node_params = node_params.to(device="cpu", dtype=torch.float32)
+    values = values.to(device="cpu", dtype=torch.float32)
+    # Exact path: delegate so ``λ = 0`` reproduces ``fit_rbf_interpolant``
+    # bit-for-bit (the cardinal-weight + interpolation tests pin this).
+    if smoothing is None or (isinstance(smoothing, (int, float)) and float(smoothing) == 0.0):
+        w, c = fit_rbf_interpolant(node_params, values)
+        return w, c, {"lambda": 0.0, "edf": float(node_params.shape[0]), "gcv": -1.0}
+
+    K, _ = _rbf_poised(node_params)
+    dist = torch.cdist(node_params, node_params)
+    E = dist.pow(3)
+    Q = torch.cat([torch.ones(K, 1, dtype=torch.float32), node_params], dim=1)
+
+    if smoothing == "auto":
+        lam, edf, gcv = _gcv_select_lambda(E, Q, values)
+    elif isinstance(smoothing, (int, float)):
+        denom = K * K - K
+        e_scale = float(E.abs().sum() / denom) if denom > 0 else 1.0
+        lam = float(smoothing) * (e_scale if e_scale > 0.0 else 1.0)
+        S = _rbf_smoother_matrix(E, Q, lam)
+        edf = float(S.diagonal().sum().item())
+        gcv = -1.0
+    else:
+        raise ValueError(
+            f"smoothing must be 'auto', a float, or 0/None; got {smoothing!r}"
+        )
+
+    A = E + lam * torch.eye(K, dtype=torch.float32)
+    sol = _rbf_saddle(A, Q, values)
+    w, c = sol[:K].contiguous(), sol[K:].contiguous()
+    return w, c, {"lambda": float(lam), "edf": float(edf), "gcv": float(gcv)}
+
+
 def eval_rbf(
     node_params: torch.Tensor,
     rbf_weights: torch.Tensor,
@@ -1143,6 +1327,8 @@ def fit_layer_subspace(
     layer: int | None = None,
     neutral_mean: torch.Tensor | None = None,
     whitened_gram: torch.Tensor | None = None,
+    smoothing: float | str | None = None,
+    rbf_info: dict[str, float] | None = None,
 ) -> tuple[LayerSubspace, float]:
     """Fit a PCA subspace + RBF interpolant for one layer (curved).
 
@@ -1238,7 +1424,20 @@ def fit_layer_subspace(
     coord_scale = (hi - lo).clamp(min=1e-9)
     normalized = (node_params - coord_offset) / coord_scale
 
-    rbf_weights, poly_coeffs = fit_rbf_interpolant(normalized, coords)
+    # Exact interpolation by default (``smoothing=None``) — every existing
+    # caller (authored fits, the behavior-manifold naturalness fit, the test
+    # suite) keeps the byte-identical interpolant.  ``smoothing`` set (the
+    # discover ``spectral`` path) opts into the penalized fit; the chosen
+    # ``λ``/edf flow back through the optional ``rbf_info`` out-dict for the
+    # sidecar, leaving the 2-tuple return arity untouched.
+    if smoothing is None:
+        rbf_weights, poly_coeffs = fit_rbf_interpolant(normalized, coords)
+    else:
+        rbf_weights, poly_coeffs, _info = fit_rbf_smoothed(
+            normalized, coords, smoothing=smoothing,
+        )
+        if rbf_info is not None:
+            rbf_info.update(_info)
     sub = LayerSubspace(
         mean=mean, basis=basis, node_params=normalized,
         rbf_weights=rbf_weights, poly_coeffs=poly_coeffs,
@@ -2289,6 +2488,93 @@ def _connected_components(mask: torch.Tensor) -> int:
     return len({find(i) for i in range(K)})
 
 
+def _laplacian_eigen(
+    gram: torch.Tensor,
+    *,
+    k_nn: int | None = None,
+    bandwidth: float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, int, float]:
+    """Normalized-Laplacian eigenmaps core shared by every spectral topology.
+
+    Builds the symmetric k-NN heat-kernel graph over the distances read off
+    ``gram`` (``d²_ij = G_ii + G_jj − 2 G_ij``), forms the normalized
+    Laplacian ``L = I − D^{-1/2} W D^{-1/2}``, eigendecomposes it, and drops
+    the trivial (constant-mode) eigenpair.  Returns ``(nontrivial_vals
+    (K-1,), nontrivial_vecs (K, K-1), k_nn, bandwidth)`` — the spectral
+    embedding :func:`derive_spectral_coords` reads as flat coordinates and
+    :func:`_detect_periodic_axes` reads as ``(cos, sin)`` angle pairs for the
+    loops persistent homology has counted.
+
+    The first ``n`` nontrivial eigenfunctions of data sampled from a manifold
+    are its lowest Laplace–Beltrami modes — on a circle the ``(cos θ, sin θ)``
+    pair — which is what lets the periodic detection read an angle coordinate
+    straight off this embedding once a loop is confirmed.
+
+    Raises on a < 4-node heap (no graph) or a disconnected k-NN graph (no
+    single embedding) — the geometric preconditions every spectral topology
+    shares.  ``derive_spectral_coords`` validates first with its own
+    messages, so those callers never reach these.
+    """
+    gram = gram.to(torch.float32)
+    K = gram.shape[0]
+    if gram.dim() != 2 or gram.shape[1] != K:
+        raise ValueError(
+            f"spectral embedding needs a square (K, K) Gram, got shape "
+            f"{tuple(gram.shape)}"
+        )
+    if K < 4:
+        raise ValueError(
+            f"spectral embedding needs >= 4 centroids to form a k-NN graph, "
+            f"got {K}"
+        )
+    if k_nn is None:
+        k_nn = max(5, math.ceil(math.log(K)))
+    k_nn = max(1, min(k_nn, K - 1))
+
+    # Pairwise distances from the Gram: d²_ij = G_ii + G_jj − 2 G_ij.  Clamp
+    # the (PSD-up-to-fp-drift) squared distances off negative before sqrt.
+    gram = 0.5 * (gram + gram.transpose(0, 1))
+    diag = gram.diagonal()
+    sq = diag.unsqueeze(0) + diag.unsqueeze(1) - 2.0 * gram
+    distances = sq.clamp(min=0.0).sqrt()
+    distances.fill_diagonal_(0.0)
+    mask, neighbor_dists = _knn_adjacency(distances, k_nn)
+
+    components = _connected_components(mask)
+    if components > 1:
+        raise ValueError(
+            f"spectral embedding: k-NN graph has {components} connected "
+            f"components (need 1). Raise k_nn or switch to PCA."
+        )
+
+    if bandwidth is None:
+        if neighbor_dists.numel() == 0:
+            raise ValueError("spectral embedding: k-NN graph has no edges")
+        bandwidth = float(neighbor_dists.median().item())
+        if bandwidth <= 0.0:
+            # All-zero neighbor distances would NaN out the heat kernel.
+            bandwidth = 1e-6
+    bandwidth = float(bandwidth)
+
+    # Heat-kernel weights on the symmetric k-NN edge set.
+    W = torch.zeros_like(distances)
+    sq = (distances * distances) / (2.0 * bandwidth * bandwidth)
+    W = torch.where(mask, torch.exp(-sq), W)
+    W.fill_diagonal_(0.0)
+
+    deg = W.sum(dim=1)
+    d_inv_sqrt = deg.clamp(min=1e-12).rsqrt()
+    # L_sym = I - D^{-1/2} W D^{-1/2}
+    L = -W * d_inv_sqrt.unsqueeze(0) * d_inv_sqrt.unsqueeze(1)
+    L.fill_diagonal_(0.0)
+    L = L + torch.eye(K, dtype=L.dtype, device=L.device)
+
+    eigvals, eigvecs = torch.linalg.eigh(L)  # ascending
+    # Drop the smallest eigenvalue (~0 for a connected graph); its eigenvector
+    # is D^{1/2}1, carrying no embedding information.
+    return eigvals[1:], eigvecs[:, 1:], int(k_nn), float(bandwidth)
+
+
 def derive_spectral_coords(
     gram: torch.Tensor,
     *,
@@ -2364,64 +2650,13 @@ def derive_spectral_coords(
         raise ValueError(
             f"spectral coord derivation needs >= 4 centroids, got {K}"
         )
-    if k_nn is None:
-        k_nn = max(5, math.ceil(math.log(K)))
-    k_nn = max(1, min(k_nn, K - 1))
-
-    # Pairwise distances from the Gram: d²_ij = G_ii + G_jj − 2 G_ij.  Clamp
-    # the (PSD-up-to-fp-drift) squared distances off negative before sqrt.
-    gram = 0.5 * (gram + gram.transpose(0, 1))
-    diag = gram.diagonal()
-    sq = diag.unsqueeze(0) + diag.unsqueeze(1) - 2.0 * gram
-    distances = sq.clamp(min=0.0).sqrt()
-    distances.fill_diagonal_(0.0)
-    mask, neighbor_dists = _knn_adjacency(distances, k_nn)
-
-    components = _connected_components(mask)
-    if components > 1:
-        raise ValueError(
-            f"spectral coord derivation: k-NN graph has {components} "
-            f"connected components (need 1). Raise --k-nn or switch to "
-            f"--method pca."
-        )
-
-    if bandwidth is None:
-        if neighbor_dists.numel() == 0:
-            raise ValueError(
-                "spectral coord derivation: k-NN graph has no edges"
-            )
-        bandwidth = float(neighbor_dists.median().item())
-        if bandwidth <= 0.0:
-            # All-zero neighbor distances would NaN out the heat kernel.
-            # Falls back to a small positive sentinel; the caller's data
-            # is degenerate but we'd rather return something than crash.
-            bandwidth = 1e-6
-    bandwidth = float(bandwidth)
-
-    # Heat-kernel weights on the symmetric k-NN edge set.
-    W = torch.zeros_like(distances)
-    sq = (distances * distances) / (2.0 * bandwidth * bandwidth)
-    W = torch.where(mask, torch.exp(-sq), W)
-    # Belt-and-braces: kill any residual self-loops.
-    W.fill_diagonal_(0.0)
-
-    deg = W.sum(dim=1)
-    # _connected_components above guarantees no isolated vertex, so
-    # deg > 0 everywhere; the clamp is purely defensive against fp32
-    # underflow on huge bandwidths.
-    d_inv_sqrt = deg.clamp(min=1e-12).rsqrt()
-    # L_sym = I - D^{-1/2} W D^{-1/2}
-    L = -W * d_inv_sqrt.unsqueeze(0) * d_inv_sqrt.unsqueeze(1)
-    L.fill_diagonal_(0.0)
-    L = L + torch.eye(K, dtype=L.dtype, device=L.device)
-
-    eigvals, eigvecs = torch.linalg.eigh(L)  # ascending
-
-    # Drop the smallest eigenvalue (~0 for a connected graph).  The
-    # corresponding eigenvector is D^{1/2}1, not constant — it carries
-    # no embedding information.
-    nontrivial_vals = eigvals[1:]
-    nontrivial_vecs = eigvecs[:, 1:]
+    # Graph build + normalized-Laplacian eigendecomposition, shared with the
+    # sphere/torus spectral derivations.  The square + ``K < 4`` validation
+    # above stays here so the spectral-specific error messages are preserved;
+    # ``_laplacian_eigen`` re-checks defensively for its other callers.
+    nontrivial_vals, nontrivial_vecs, k_nn, bandwidth = _laplacian_eigen(
+        gram, k_nn=k_nn, bandwidth=bandwidth,
+    )
 
     # Pick k by the eigenvalue-ratio heuristic.  For each candidate
     # ``k`` in ``[1, cap]`` the ratio ``nontrivial[k] / nontrivial[k-1]``
@@ -2500,6 +2735,537 @@ def discover_coords(
         return derive_spectral_coords(gram, **kwargs)
     raise ValueError(
         f"unknown discover method {method!r} (expected 'pca' | 'spectral')"
+    )
+
+
+# ===================================================== topology selection ===
+#
+# ``fit_mode="auto"`` picks the discover geometry instead of the user declaring
+# it, in two decoupled decisions (the decoupling is what dodges the dimension
+# bias that sinks naive reconstruction scoring — more spectral coordinates
+# always "fit" better, so a single score always crowns the highest-dim
+# candidate):
+#
+#   (a) flat vs curved — compare the flat affine (``pca``) and curved RBF
+#       (``spectral``) fits, each at its own intrinsic dim, by GCV in a shared
+#       whitened-reduced metric.  GCV's effective-dof penalty makes this a fair
+#       model selection rather than a coordinate-count race.
+#   (b) periodic axes — Vietoris–Rips H1 *persistent homology* counts the loops
+#       (topologically robust: a circle and an ellipse both read as one loop, a
+#       2-torus as two, a blob/arc/sphere as none), and the spectral eigenpairs
+#       coordinate them.  A detected loop routes to a periodic ``BoxDomain``.
+#
+# Spheres are authored-only — ``S^n`` is a speculative topology that's the least
+# reliable to detect from few centroids, so it is not an auto candidate.
+
+
+@dataclass(frozen=True)
+class TopologyCandidate:
+    """One scored candidate in :func:`select_topology`'s ranking."""
+
+    name: str            # display name, e.g. "flat-pca", "spectral", "torus-T1"
+    fit_mode: str        # resolved fit_mode: "pca" (flat) | "spectral" (curved)
+    intrinsic_dim: int
+    score: float         # summed GCV (lower = better); inf if unscorable
+    viable: bool
+    reason: str = ""     # why excluded / how chosen (e.g. periodic detection note)
+
+
+@dataclass(frozen=True)
+class TopologyChoice:
+    """The winning topology + the full ranked candidate field (for the sidecar)."""
+
+    winner_name: str
+    fit_mode: str                  # "pca" | "spectral"
+    coords: torch.Tensor           # (K, n) winner intrinsic coords
+    domain: ManifoldDomain         # CustomDomain | BoxDomain (periodic)
+    candidates: tuple[TopologyCandidate, ...]   # ranked best-first
+
+
+def _gcv_value(rss: float, edf: float, K: int) -> float:
+    """The GCV score ``K · RSS / (K − edf)²`` — RSS penalized by effective dof.
+
+    The ``(K − edf)²`` denominator is what gives model selection its parsimony:
+    a higher-dimensional / more flexible candidate drives ``edf`` up, shrinking
+    the denominator and *raising* its GCV unless the extra flexibility buys a
+    commensurate RSS drop.  This is what stops a naive reconstruction error
+    from always preferring the highest-dimensional topology.  ``edf ≥ K``
+    (a saturated fit) returns ``+inf`` — it explains nothing out of sample.
+    """
+    slack = K - edf
+    if slack <= 0.0:
+        return math.inf
+    return K * rss / (slack * slack)
+
+
+def _ols_gcv_score(coords: torch.Tensor, targets: dict[int, torch.Tensor]) -> float:
+    """Summed GCV of the affine (flat) map ``coords → target``.
+
+    The flat candidate's surface is affine in its coordinates; its hat is the
+    OLS projection ``H = C̃ (C̃ᵀC̃)⁺ C̃ᵀ`` (``C̃ = [1|coords]``) with effective
+    dof ``edf = tr H = rank(C̃) = dim+1``.  Per-layer GCV (:func:`_gcv_value`)
+    summed over layers — comparable to the curved candidates' GCV.
+    """
+    K = coords.shape[0]
+    C = torch.cat([torch.ones(K, 1, dtype=torch.float32), coords.to(torch.float32)], dim=1)
+    H = C @ torch.linalg.pinv(C.transpose(0, 1) @ C) @ C.transpose(0, 1)  # (K, K)
+    edf = float(H.diagonal().sum().item())
+    total = 0.0
+    for y in targets.values():
+        rss = float((y - H @ y).pow(2).sum().item())
+        total += _gcv_value(rss, edf, K)
+    return total
+
+
+def _rbf_gcv_score(
+    node_params: torch.Tensor,
+    targets: dict[int, torch.Tensor],
+    *,
+    smoothing: float | str,
+) -> float:
+    """Summed GCV of the penalized RBF surface over a layout.
+
+    The curved candidates (``spectral`` / ``S^n`` / ``T^d``) fit an ``r**3``
+    RBF to the (unit-box-normalized) embedded coordinates.  Each layer's ``λ``
+    is GCV-selected (:func:`_gcv_select_lambda` returns its GCV directly), and
+    the score sums those per-layer GCVs — so every candidate is judged at its
+    own best smoothing, the standard model-selection comparison.  Raises
+    (propagating poisedness) if the layout can't carry an RBF — the caller
+    marks that candidate non-viable.
+    """
+    _rbf_poised(node_params)
+    lo = node_params.min(dim=0).values
+    hi = node_params.max(dim=0).values
+    norm = (node_params - lo) / (hi - lo).clamp(min=1e-9)
+    K = norm.shape[0]
+    E = torch.cdist(norm, norm).pow(3)
+    Q = torch.cat([torch.ones(K, 1, dtype=torch.float32), norm], dim=1)
+    total = 0.0
+    for y in targets.values():
+        if smoothing == "auto":
+            _lam, _edf, gcv = _gcv_select_lambda(E, Q, y)
+        else:
+            denom_e = K * K - K
+            e_scale = float(E.abs().sum() / denom_e) if denom_e > 0 else 1.0
+            lam = float(smoothing) * (e_scale if e_scale > 0.0 else 1.0)
+            S = _rbf_smoother_matrix(E, Q, lam)
+            edf = float(S.diagonal().sum().item())
+            rss = float((y - S @ y).pow(2).sum().item())
+            gcv = _gcv_value(rss, edf, K)
+        total += gcv
+    return total
+
+
+_HARMONIC_COHERENCE = 0.80        # |⟨z_new, z_acc^m⟩| above this ⇒ a harmonic, not a new axis
+_HARMONIC_MAX_ORDER = 5
+
+
+def _is_angular_harmonic(theta_new: torch.Tensor, accepted: list[torch.Tensor]) -> bool:
+    """True if ``theta_new`` is an integer harmonic of an already-accepted angle.
+
+    A single circle's Laplacian spectrum is ``cos kθ, sin kθ`` for ``k = 1, 2,
+    …`` — every harmonic pair looks like a clean circle, so a naive scan would
+    count one circle as a high-dimensional torus.  Two angles are the *same*
+    circular axis when one is an integer multiple of the other: in the complex
+    phase ``z = e^{iθ}``, ``θ_new = m·θ_acc`` ⇔ ``z_new = z_acc^m`` ⇔ the
+    coherence ``|mean(z_new · conj(z_acc^m))| ≈ 1``.  Checks ``m = 1…5`` and the
+    conjugate (opposite winding); a hit means ``theta_new`` is a harmonic of an
+    existing fundamental and is *not* an independent periodic axis.
+    """
+    z_new = torch.polar(torch.ones_like(theta_new), theta_new)  # e^{iθ_new}
+    for theta_acc in accepted:
+        z_acc = torch.polar(torch.ones_like(theta_acc), theta_acc)
+        for m in range(1, _HARMONIC_MAX_ORDER + 1):
+            zm = z_acc.pow(m)
+            coh = (z_new * zm.conj()).mean().abs()
+            coh_conj = (z_new * zm).mean().abs()  # opposite winding
+            if float(torch.maximum(coh, coh_conj).item()) >= _HARMONIC_COHERENCE:
+                return True
+    return False
+
+
+def _rips_h1_persistence(
+    distances: torch.Tensor,
+    eps_max: float,
+    *,
+    max_triangles: int = 150_000,
+) -> list[tuple[float, float]]:
+    """H1 persistence pairs of the Vietoris–Rips filtration up to ``eps_max``.
+
+    The robust, ellipse- and noise-tolerant **loop counter**: standard boundary-
+    matrix reduction over the chain complex (vertices → edges → triangles,
+    ordered by filtration value, ties broken by dimension).  A column reduces to
+    a unique low; a triangle that lows out on an edge *kills* that edge's 1-cycle
+    (a finite H1 pair ``(birth_edge_len, death_triangle_len)``), and a 1-cycle
+    edge never killed up to ``eps_max`` is *essential* (death ``= ∞``).  Counting
+    H1 classes with large persistence is the topological signal "there is a
+    loop here" — invariant to the metric distortion (a circle vs. an ellipse)
+    that breaks the eigenpair-geometry heuristics.
+
+    Bounded for tractability: only simplices with all edges ``≤ eps_max`` enter
+    the filtration, and the triangle list is capped at ``max_triangles`` (which
+    only lowers the effective ``eps`` ceiling — it can't manufacture a loop).
+    Pure Python over small index sets; ``K`` is tens-to-low-hundreds and this
+    runs once at fit time.  Returns the list of ``(birth, death)`` H1 pairs.
+    """
+    K = int(distances.shape[0])
+    # Edges with length <= eps_max, in a total filtration order.
+    iu = torch.triu_indices(K, K, offset=1)
+    lens_all = distances[iu[0], iu[1]]
+    keep = lens_all <= eps_max
+    ei = iu[0][keep].tolist()
+    ej = iu[1][keep].tolist()
+    el = lens_all[keep].tolist()
+    order = sorted(range(len(el)), key=lambda x: (el[x], ei[x], ej[x]))
+    ei = [ei[o] for o in order]
+    ej = [ej[o] for o in order]
+    el = [el[o] for o in order]
+    E = len(el)
+    edge_id: dict[tuple[int, int], int] = {(ei[x], ej[x]): x for x in range(E)}
+    # Global simplex indices: vertices 0..K-1, edges K..K+E-1 (in filtration
+    # order, so edge global index already respects the filtration).
+    def eg(idx: int) -> int:
+        return K + idx
+    adj: list[set[int]] = [set() for _ in range(K)]
+    for x in range(E):
+        adj[ei[x]].add(ej[x])
+        adj[ej[x]].add(ei[x])
+    # Triangles: i<j<k with all three edges present; filtration = longest edge.
+    dist = distances
+    triangles: list[tuple[float, int, int, int]] = []
+    for x in range(E):
+        i, j = ei[x], ej[x]
+        for k in adj[i] & adj[j]:
+            if k > j:  # canonical i<j<k → each triangle once
+                fl = max(el[x], float(dist[i, k].item()), float(dist[j, k].item()))
+                triangles.append((fl, i, j, k))
+    triangles.sort(key=lambda t: (t[0], t[1], t[2], t[3]))
+    if len(triangles) > max_triangles:
+        triangles = triangles[:max_triangles]
+
+    # Reduction.  Vertices and edges first (H0); their positive (cycle-creating)
+    # edges are found by union-find — equivalent to reducing the edge columns
+    # over vertex rows, and cheaper.
+    parent = list(range(K))
+
+    def find(a: int) -> int:
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    positive_edges: set[int] = set()  # edge filtration indices that create a 1-cycle
+    for x in range(E):
+        ri, rj = find(ei[x]), find(ej[x])
+        if ri != rj:
+            parent[ri] = rj      # tree edge — kills an H0 component
+        else:
+            positive_edges.add(x)  # both endpoints already joined — births a loop
+
+    # H1 deaths: reduce triangle columns over edge rows (global edge indices, so
+    # the pivot respects filtration order).  A reduced low on a positive edge
+    # pairs that loop's birth with this triangle's death.
+    low_inv: dict[int, set[int]] = {}     # pivot edge-global → reduced column
+    killed: dict[int, float] = {}         # edge filtration index → death filtration
+    for fl, i, j, k in triangles:
+        col = {
+            eg(edge_id[(min(i, j), max(i, j))]),
+            eg(edge_id[(min(i, k), max(i, k))]),
+            eg(edge_id[(min(j, k), max(j, k))]),
+        }
+        while col:
+            piv = max(col)
+            if piv in low_inv:
+                col ^= low_inv[piv]
+            else:
+                break
+        if not col:
+            continue  # triangle creates an H2 void — irrelevant to H1
+        piv = max(col)
+        low_inv[piv] = col
+        edge_idx = piv - K
+        if edge_idx in positive_edges and edge_idx not in killed:
+            killed[edge_idx] = fl
+
+    pairs: list[tuple[float, float]] = []
+    for idx in positive_edges:
+        birth = el[idx]
+        death = killed.get(idx, math.inf)
+        pairs.append((birth, death))
+    return pairs
+
+
+def _count_persistent_loops(
+    distances: torch.Tensor,
+    *,
+    persistence_frac: float = 0.5,
+    max_dim: int = 8,
+) -> int:
+    """Number of significant H1 loops in the Rips filtration of ``distances``.
+
+    Sets the filtration ceiling at ``2x`` the minimum-spanning-tree's longest
+    edge — the connectivity scale ``eps_c`` is where the loop *closes*, and the
+    ``2 eps_c`` window is wide enough to birth it yet narrow enough that
+    cross-chords (which would slice an elongated loop into spurious sub-loops)
+    haven't formed.  In that window a genuine ``S^1`` / ``T^d`` loop stays
+    **essential** — a 1-D hole never fills until the whole structure does, at
+    ``eps`` far above ``eps_c`` — while a 2-D surface's holes (a sphere) and
+    noise loops are *finite*, born and filled within a few ``eps_c``.  Counting
+    only essential loops (unfilled at ``eps_max``) whose persistence ``eps_max −
+    birth`` clears ``persistence_frac · eps_c`` therefore separates a true loop
+    from a sphere's transient surface holes and from noise, and is robust to the
+    metric distortion (circle vs. elongated ellipse) that defeats eigenpair
+    geometry.  Circle / ellipse / noisy circle: 1.  ``T^d``: ``d``.  Blob, arc,
+    line: 0.  A 2-D *spherical* surface is out of scope (``S^n`` is authored-
+    only, not auto-selected) and at some sampling densities can leave one
+    surface hole essential inside the window — a known, accepted false positive
+    for an unsupported auto topology, not a target case.
+    """
+    K = int(distances.shape[0])
+    if K < 4:
+        return 0
+    # Connectivity scale ε_c: the largest edge in the MST (Kruskal).
+    iu = torch.triu_indices(K, K, offset=1)
+    lens = distances[iu[0], iu[1]]
+    order = torch.argsort(lens)
+    parent = list(range(K))
+
+    def find(a: int) -> int:
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    eps_c = 0.0
+    joined = 0
+    src, dst = iu[0].tolist(), iu[1].tolist()
+    for o in order.tolist():
+        ra, rb = find(src[o]), find(dst[o])
+        if ra != rb:
+            parent[ra] = rb
+            eps_c = float(lens[o].item())
+            joined += 1
+            if joined == K - 1:
+                break
+    if eps_c <= 0.0:
+        return 0
+    eps_max = 2.0 * eps_c
+    pairs = _rips_h1_persistence(distances, eps_max)
+    threshold = persistence_frac * eps_c
+    count = 0
+    for birth, death in pairs:
+        # Essential only (a finite death means a 2-D surface hole / noise loop
+        # that filled inside the window — not a real 1-D cycle).
+        if math.isfinite(death):
+            continue
+        if (eps_max - birth) >= threshold:
+            count += 1
+    return min(count, max_dim)
+
+
+def _detect_periodic_axes(
+    distances: torch.Tensor,
+    eigvecs: torch.Tensor,
+    *,
+    max_dim: int,
+    persistence_frac: float = 0.5,
+) -> tuple[torch.Tensor, int] | None:
+    """Detect periodic axes — part (b), persistent homology + spectral angles.
+
+    Two stages with a clean division of labour:
+
+    1. **Count** the loops with :func:`_count_persistent_loops` (Vietoris–Rips
+       H1 persistence).  This is the topologically robust part: it sees a circle
+       *and* an ellipse as one loop, a 2-torus as two, and a blob / open arc as
+       none — immune to the metric distortion that defeats eigenpair geometry.
+
+    2. **Coordinate** each detected loop from the spectral eigenmap.  An ellipse's
+       ``atan2`` of its fundamental eigenpair still winds once around the loop
+       (monotonically, if non-uniformly), so it is a valid periodic coordinate —
+       the count from stage 1 caps how many independent eigenpair-angles to take,
+       which is exactly what stops a single circle's ``cos kθ`` harmonics from
+       being miscounted (:func:`_is_angular_harmonic` skips harmonics of an
+       already-taken axis).
+
+    Returns ``(angles (K, d), loop_count)`` for the ``d`` periodic axes, or
+    ``None`` if no loop persists.
+    """
+    d = _count_persistent_loops(
+        distances, persistence_frac=persistence_frac, max_dim=max_dim,
+    )
+    if d < 1:
+        return None
+    avail = int(eigvecs.shape[1])
+    angles: list[torch.Tensor] = []
+    p = 0
+    # Take the d lowest *independent* eigenpair angles (skip harmonics of an
+    # axis already taken); PH count d is the ground truth for how many.
+    while p * 2 + 1 < avail and len(angles) < d:
+        cos_j = eigvecs[:, 2 * p]
+        sin_j = eigvecs[:, 2 * p + 1]
+        theta = torch.atan2(sin_j, cos_j)
+        if not _is_angular_harmonic(theta, angles):
+            angles.append(theta)
+        p += 1
+    if not angles:
+        return None
+    return torch.stack(angles, dim=1).contiguous(), d
+
+
+def select_topology(
+    stacks: dict[int, torch.Tensor],
+    layer_grams: dict[int, torch.Tensor],
+    consensus_gram: torch.Tensor,
+    *,
+    whitener: "LayerWhitener",
+    max_dim: int = 8,
+    smoothing: float | str = "auto",
+    score_dim: int | None = None,
+    k_nn: int | None = None,
+    bandwidth: float | None = None,
+    persistence_frac: float = 0.5,
+) -> TopologyChoice:
+    """Pick the manifold topology for a discover heap — flat vs curved vs periodic.
+
+    Two decisions, deliberately decoupled to avoid the dimension bias that
+    sinks naive reconstruction scoring (where more spectral coordinates always
+    "fit" better, so the highest-dim candidate always wins):
+
+    **(a) flat vs curved** — compare the flat affine fit (``pca`` mode, at its
+    PCA variance-threshold dim) against the curved RBF fit (``spectral`` mode,
+    at its eigenvalue-ratio-cliff dim) by **GCV** in a shared per-layer
+    whitened / Fisher reduced metric (``targets[L] = X̃_L · basis_Lᵀ``).  GCV's
+    ``(K − edf)²`` denominator charges each mode for its own effective dof, and
+    each mode picks its *own* intrinsic dim with its own heuristic, so this is a
+    fair model-selection comparison rather than a coordinate-count race.
+
+    **(b) periodic axes** — independently, :func:`_detect_periodic_axes` runs a
+    direct geometric circularity test on the eigenmap (constant radius + full
+    angular coverage).  Detected circles are *topology*, not surface shape — a
+    circle can be linearly embedded yet still needs a periodic domain to steer
+    around rather than across — so a confident detection routes to a periodic
+    ``BoxDomain`` (the curved path) provided its GCV is within
+    ``1.5×`` the best Euclidean fit (a guard against a spurious circle that also
+    reconstructs badly).  Spheres are **not** auto-selected (a speculative
+    topology that's the least reliable to detect from few centroids); ``S^n`` is
+    available as an *authored* domain only.
+
+    Returns a :class:`TopologyChoice` carrying the winner's ``fit_mode`` /
+    ``coords`` / ``domain`` plus the ranked candidate field for the sidecar.
+    ``whitener`` must cover every fit layer (the caller gates on
+    ``covers_all``).
+    """
+    fit_layers = sorted(layer_grams.keys())
+    K = consensus_gram.shape[0]
+    R = score_dim if score_dim is not None else min(max_dim, K - 1)
+    R = max(1, R)
+
+    # Shared per-layer whitened/Fisher reduced targets — every candidate
+    # predicts the *same* y in the *same* metric, so the comparison isolates
+    # the coordinate geometry + surface, not the basis (common-mode).
+    targets: dict[int, torch.Tensor] = {}
+    for L in fit_layers:
+        X = stacks[L].to(torch.float32)
+        X = X - X.mean(dim=0, keepdim=True)
+        basis, _ev = _pca_basis(
+            X, n_components=R, whitener=whitener, layer=L,
+            whitened_gram=layer_grams[L],
+        )
+        targets[L] = (X @ basis.transpose(0, 1)).contiguous()      # (K, R)
+
+    candidates: list[TopologyCandidate] = []
+
+    # (a) Flat (pca) — always viable for K >= 2.
+    coords_flat, _pca_diag = derive_pca_coords(consensus_gram, max_dim=max_dim)
+    k_flat = int(coords_flat.shape[1])
+    gcv_flat = _ols_gcv_score(coords_flat, targets)
+    candidates.append(TopologyCandidate("flat-pca", "pca", k_flat, gcv_flat, True))
+
+    # (a) Curved Euclidean (spectral) — may fail on a tiny / disconnected heap.
+    gcv_curved = math.inf
+    curved: tuple[torch.Tensor, ManifoldDomain] | None = None
+    try:
+        coords_spec, _spec_diag = derive_spectral_coords(
+            consensus_gram, max_dim=max_dim, k_nn=k_nn, bandwidth=bandwidth,
+        )
+        k_spec = int(coords_spec.shape[1])
+        if (2 * k_spec + 1) > K:
+            raise ValueError(f"poisedness floor 2n+1={2 * k_spec + 1} exceeds K={K}")
+        gcv_curved = _rbf_gcv_score(
+            coords_spec.to(torch.float32), targets, smoothing=smoothing,
+        )
+        curved = (coords_spec, CustomDomain(k_spec))
+        candidates.append(TopologyCandidate("spectral", "spectral", k_spec, gcv_curved, True))
+    except (ValueError, RuntimeError) as e:  # _LinAlgError ⊂ RuntimeError
+        candidates.append(TopologyCandidate("spectral", "spectral", 0, math.inf, False, str(e)))
+
+    # (b) Periodic (circle / torus) detection — persistent homology counts the
+    # loops (ellipse/noise-robust), spectral eigenpairs coordinate them.
+    periodic: tuple[torch.Tensor, ManifoldDomain, float] | None = None
+    try:
+        _vals, eigvecs, _knn, _bw = _laplacian_eigen(
+            consensus_gram, k_nn=k_nn, bandwidth=bandwidth,
+        )
+        # Whitened pairwise distances off the consensus Gram (same metric the
+        # eigenmap embeds): d²_ij = G_ii + G_jj − 2 G_ij.
+        cg = 0.5 * (consensus_gram + consensus_gram.transpose(0, 1))
+        diag = cg.diagonal()
+        d2 = diag.unsqueeze(0) + diag.unsqueeze(1) - 2.0 * cg
+        distances = d2.clamp(min=0.0).sqrt()
+        distances.fill_diagonal_(0.0)
+        detected = _detect_periodic_axes(
+            distances, eigvecs, max_dim=max_dim,
+            persistence_frac=persistence_frac,
+        )
+        if detected is not None:
+            p_coords, n_loops = detected
+            d = int(p_coords.shape[1])
+            if (2 * d + 1) <= K:
+                axes = [
+                    BoxAxis(f"theta{i}", periodic=True, period=2.0 * math.pi)
+                    for i in range(d)
+                ]
+                p_domain = BoxDomain(axes)
+                gcv_p = _rbf_gcv_score(
+                    p_domain.embed(p_coords).to(torch.float32),
+                    targets, smoothing=smoothing,
+                )
+                note = f"H1 persistent loops = {n_loops}"
+                candidates.append(TopologyCandidate(
+                    f"torus-T{d}", "spectral", d, gcv_p, True, note,
+                ))
+                periodic = (p_coords, p_domain, gcv_p)
+    except (ValueError, RuntimeError):
+        pass  # no clean eigenmap ⇒ no periodic candidate
+
+    # Decision.  A confidently-detected periodic topology wins outright: the
+    # circularity test (constant radius + full coverage + harmonic dedup) is a
+    # strong, conservative geometric signal, and periodicity is the correct
+    # steering geometry *even when a flat plane reconstructs the centroids
+    # better* — a linearly-embedded circle lives in a 2-plane, so flat always
+    # wins reconstruction, yet you still want to steer *around* the loop, not
+    # across the chord.  Gating periodicity on GCV-vs-flat would therefore
+    # always reject the correct circle; instead the geometric test is trusted,
+    # guarded only against a degenerate (non-finite) periodic fit.  Absent a
+    # circle, the lower-GCV of flat vs curved wins.
+    if periodic is not None and math.isfinite(periodic[2]):
+        p_coords, p_domain, _gcv_p = periodic
+        win_name = f"torus-T{int(p_coords.shape[1])}"
+        win_mode, win_coords, win_domain = "spectral", p_coords, p_domain
+    elif curved is not None and gcv_curved < gcv_flat:
+        win_name = "spectral"
+        win_mode, win_coords, win_domain = "spectral", curved[0], curved[1]
+    else:
+        win_name = "flat-pca"
+        win_mode, win_coords, win_domain = "pca", coords_flat, CustomDomain(k_flat)
+
+    candidates.sort(key=lambda c: (not c.viable, c.score))
+    return TopologyChoice(
+        winner_name=win_name,
+        fit_mode=win_mode,
+        coords=win_coords,
+        domain=win_domain,
+        candidates=tuple(candidates),
     )
 
 
@@ -3136,6 +3902,7 @@ __all__ = [
     "LayerSubspace",
     "Manifold",
     "fit_rbf_interpolant",
+    "fit_rbf_smoothed",
     "eval_rbf",
     "eval_rbf_jacobian",
     "rbf_cardinal_weights",
@@ -3144,9 +3911,12 @@ __all__ = [
     "subspace_inject",
     "PcaDiagnostics",
     "SpectralDiagnostics",
+    "TopologyCandidate",
+    "TopologyChoice",
     "derive_pca_coords",
     "derive_spectral_coords",
     "discover_coords",
+    "select_topology",
     "compute_node_centroid",
     "save_manifold",
     "load_manifold",
