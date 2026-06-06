@@ -831,3 +831,12 @@ def test_auto_detects_circle_as_periodic(
     # The curved fit landed an RBF surface per layer (not affine).
     for sub in manifold.layers.values():
         assert not sub.is_affine
+    # Fuzzy-manifold σ-field: the curved fit ran the within-node spread second
+    # pass (same monkeypatched encoder), attaching a log-σ RBF to each layer and
+    # stamping the sidecar summary.  End-to-end coverage of
+    # compute_node_reduced_covariance → fit_sigma_field → save/load.
+    for sub in manifold.layers.values():
+        assert sub.has_sigma
+        z = manifold.domain.embed(manifold.node_coords[0])
+        assert float(sub.sigma_at(z)) > 0.0
+    assert "sigma_field_per_layer" in manifold.metadata

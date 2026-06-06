@@ -333,6 +333,7 @@ class Monitor:
         frac_mean_t: torch.Tensor | None = None    # (1,)
         resid_mean_t: torch.Tensor | None = None   # (1,)
         coords_mean_t: torch.Tensor | None = None  # (n_dim,)
+        mem_mean_t: torch.Tensor | None = None     # (1,) tube-fit membership
 
         for layer_idx in shared:
             sub = manifold.layers[layer_idx]
@@ -371,6 +372,7 @@ class Monitor:
                     else invert_query
                 )
                 resid_t = frac_t.new_zeros(1)
+                mem_t = frac_t.new_ones(1)   # surface fills subspace ⇒ full fit
             else:
                 # Curved probe: warm-start the nearest-point foot from the
                 # previous token's foot when the session enabled it for this
@@ -393,9 +395,24 @@ class Monitor:
                     torch.zeros_like(res_flat),
                     res_flat / par_norm.clamp(min=_FRACTION_EPSILON),
                 )
+                # Tube-fit membership ``exp(−res²/2σ²)`` at the foot — both ``res``
+                # and ``σ`` are raw reduced-space (un-whitened) distances, so the
+                # ratio is unit-consistent.  No σ-field ⇒ no tube ⇒ full
+                # membership (1.0), matching the legacy "no fuzziness" read.
+                if sub.has_sigma:
+                    sig_foot = sub.sigma_at(
+                        manifold.domain.embed(pos.reshape(1, -1)),
+                    ).reshape(1)
+                    mem_t = torch.exp(
+                        -(res_flat ** 2)
+                        / (2.0 * (sig_foot ** 2).clamp(min=_FRACTION_EPSILON))
+                    )
+                else:
+                    mem_t = frac_t.new_ones(1)
 
             frac_t = frac_t.reshape(1)
             resid_t = resid_t.reshape(1)
+            mem_t = mem_t.reshape(1)
             coord_t = pos_t.reshape(-1)[:n_dim]
             if coord_t.numel() < n_dim:
                 coord_t = torch.cat(
@@ -415,6 +432,9 @@ class Monitor:
             coords_mean_t = (
                 w * coord_t if coords_mean_t is None else coords_mean_t + w * coord_t
             )
+            mem_mean_t = (
+                w * mem_t if mem_mean_t is None else mem_mean_t + w * mem_t
+            )
 
         requested_top_n = int(probe.top_n)
         top_n = requested_top_n if requested_top_n >= 0 else Kc + requested_top_n
@@ -425,6 +445,30 @@ class Monitor:
             nearest_dist_t, nearest_idx_t = torch.topk(
                 dist_acc_t, k=top_n, largest=False, sorted=True,
             )
+        # Soft assignment: softmax(−d²/(2τ²) − R·log(τ)) — a proper isotropic
+        # R-D Gaussian-mixture posterior with uniform node prior.  The
+        # ``logvol_bias`` term is the missing Gaussian normalization; without it
+        # the bare softmax sends mass to whichever ``τ`` is largest regardless of
+        # distance (broadest-node-wins).
+        assign_prob_t: torch.Tensor | None = None
+        assign_idx_t: torch.Tensor | None = None
+        if (
+            top_n
+            and dist_acc_t is not None
+            and probe.assign_bandwidth is not None
+            and probe.assign_logvol_bias is not None
+        ):
+            tau = probe.assign_bandwidth.to(dist_acc_t.device, torch.float32)
+            lvb = probe.assign_logvol_bias.to(dist_acc_t.device, torch.float32)
+            if tau.numel() == dist_acc_t.numel() == lvb.numel():
+                logits = (
+                    -(dist_acc_t ** 2) / (2.0 * (tau ** 2).clamp(min=_FRACTION_EPSILON))
+                    + lvb
+                )
+                probs = torch.softmax(logits, dim=0)
+                assign_prob_t, assign_idx_t = torch.topk(
+                    probs, k=top_n, largest=True, sorted=True,
+                )
 
         # --- one device→host transfer for the whole probe reading ---
         # Means (1 + 1 + n_dim) ‖ per-layer traces (L + L + L·n_dim) ‖ nearest
@@ -435,22 +479,27 @@ class Monitor:
             frac_mean_t is not None
             and resid_mean_t is not None
             and coords_mean_t is not None
+            and mem_mean_t is not None
         )
         L = len(layer_order)
         parts: list[torch.Tensor] = [
-            frac_mean_t, resid_mean_t, coords_mean_t,
+            frac_mean_t, resid_mean_t, coords_mean_t, mem_mean_t,
             torch.cat(frac_terms), torch.cat(resid_terms),
             torch.stack(coord_terms, 0).reshape(-1),
         ]
         if nearest_dist_t is not None and nearest_idx_t is not None:
             parts.append(nearest_dist_t)
             parts.append(nearest_idx_t.to(torch.float32))
+        if assign_prob_t is not None and assign_idx_t is not None:
+            parts.append(assign_prob_t)
+            parts.append(assign_idx_t.to(torch.float32))
         flat = torch.cat([p.reshape(-1) for p in parts]).detach().cpu().tolist()
 
         o = 0
         frac_mean = flat[o]; o += 1
         residual_mean = flat[o]; o += 1
         coords_mean = flat[o:o + n_dim]; o += n_dim
+        membership = flat[o]; o += 1
         frac_layer_vals = flat[o:o + L]; o += L
         resid_layer_vals = flat[o:o + L]; o += L
         coord_layer_vals = flat[o:o + L * n_dim]; o += L * n_dim
@@ -484,6 +533,16 @@ class Monitor:
         else:
             nearest = []
 
+        assignment: list[tuple[str, float]] = []
+        if assign_prob_t is not None:
+            ta = int(assign_prob_t.numel())
+            ap_vals = flat[o:o + ta]; o += ta
+            ai_vals = flat[o:o + ta]; o += ta
+            assignment = [
+                (_label(int(round(ai_vals[j]))), ap_vals[j])
+                for j in range(ta)
+            ]
+
         return ProbeReading(
             fraction=frac_mean,
             nearest=nearest,
@@ -492,6 +551,8 @@ class Monitor:
             fraction_per_layer=frac_per_layer,
             coords_per_layer=coords_per_layer,
             residual_per_layer=residual_per_layer,
+            assignment=assignment,
+            membership=membership,
         )
 
     def _score_full(
@@ -618,6 +679,27 @@ class Monitor:
         valid_mask = torch.zeros((P, Kmax), dtype=torch.bool, device=device)
         for ci, Kc in enumerate(Kc_list):
             valid_mask[ci, :Kc] = True
+        # Padded per-candidate soft-assignment bandwidth ``τ`` and the precomputed
+        # Gaussian log-volume bias ``−R·log(τ)`` ``(P, Kmax)`` each.  Filled from
+        # each probe's precomputed ``assign_bandwidth`` / ``assign_logvol_bias``
+        # (invalid/pad columns stay at the neutral defaults — band=1.0, bias=0 —
+        # but are masked to −inf logit by ``valid_mask`` in the softmax, so their
+        # value is irrelevant).  A probe without a bandwidth (degenerate) keeps
+        # the defaults and is suppressed from the assignment downstream via
+        # ``band_present``.
+        band_pad = torch.ones((P, Kmax), dtype=torch.float32, device=device)
+        logvol_pad = torch.zeros((P, Kmax), dtype=torch.float32, device=device)
+        band_present = torch.zeros(P, dtype=torch.bool, device=device)
+        for ci, n in enumerate(flat_names):
+            bw = self._probes[n].assign_bandwidth
+            lvb = self._probes[n].assign_logvol_bias
+            if (
+                bw is not None and lvb is not None
+                and bw.numel() == Kc_list[ci] and lvb.numel() == Kc_list[ci]
+            ):
+                band_pad[ci, :bw.numel()] = bw.to(device, torch.float32)
+                logvol_pad[ci, :lvb.numel()] = lvb.to(device, torch.float32)
+                band_present[ci] = True
         labels: list[list[str]] = []
         for n, inj in zip(flat_names, inj_list, strict=True):
             row = list(self._probes[n].manifold.node_labels)
@@ -631,6 +713,8 @@ class Monitor:
             "labels": labels,
             "Kmax": Kmax, "Rmax": Rmax,
             "valid_mask": valid_mask, "nd_counts": nd_counts,
+            "band_pad": band_pad, "logvol_pad": logvol_pad,
+            "band_present": band_present,
         }
 
         layer_members: dict[int, list[int]] = {}
@@ -803,6 +887,22 @@ class Monitor:
         nd_sorted, ni_sorted = torch.topk(
             dist_final, k=Kmax, largest=False, sorted=True,
         )                                                           # (P, Kmax)
+        # Soft assignment: softmax(−d²/(2τ²) − R·log(τ)) per probe over valid
+        # candidates (invalid columns are +inf distance ⇒ −inf logit ⇒ 0
+        # probability), top-Kmax by probability.  ``band_pad`` is the
+        # precomputed per-candidate bandwidth, ``logvol_pad`` the precomputed
+        # ``−R·log(τ)`` Gaussian normalization bias; together they make a proper
+        # isotropic R-D mixture posterior (vs. the bare ``−d²/2τ²`` softmax's
+        # broadest-node-wins pathology).  Rows without a bandwidth get the
+        # neutral defaults (band=1, bias=0) so the blob shape is static
+        # (suppressed per-probe on the host via ``band_present``).
+        assign_logits = -(dist_final ** 2) / (
+            2.0 * (gl["band_pad"] ** 2).clamp(min=_FRACTION_EPSILON)
+        ) + gl["logvol_pad"]
+        assign_probs = torch.softmax(assign_logits, dim=1)          # (P, Kmax)
+        ap_sorted, ai_sorted = torch.topk(
+            assign_probs, k=Kmax, largest=True, sorted=True,
+        )                                                           # (P, Kmax)
 
         all_frac = (
             torch.cat(trace_frac) if trace_frac
@@ -815,6 +915,7 @@ class Monitor:
         blob = torch.cat([
             frac_final, coords_final,
             nd_sorted.reshape(-1), ni_sorted.to(torch.float32).reshape(-1),
+            ap_sorted.reshape(-1), ai_sorted.to(torch.float32).reshape(-1),
             all_frac, all_coords,
         ]).detach().cpu().tolist()
 
@@ -826,6 +927,9 @@ class Monitor:
         coords_v = blob[o:o + gl["nd_total"]]; o += gl["nd_total"]
         nd_v = blob[o:o + P * Kmax]; o += P * Kmax
         ni_v = blob[o:o + P * Kmax]; o += P * Kmax
+        ap_v = blob[o:o + P * Kmax]; o += P * Kmax
+        ai_v = blob[o:o + P * Kmax]; o += P * Kmax
+        band_present = gl["band_present"].tolist()
         # per-layer trace offsets within all_frac / all_coords
         frac_per_layer_acc: list[dict[int, float]] = [{} for _ in range(P)]
         coords_per_layer_acc: list[dict[int, tuple[float, ...]]] = [{} for _ in range(P)]
@@ -858,6 +962,12 @@ class Monitor:
                 (labels[ci][int(round(ni_v[row + j]))], nd_v[row + j])
                 for j in range(top_n)
             ]
+            assignment: list[tuple[str, float]] = []
+            if band_present[ci]:
+                assignment = [
+                    (labels[ci][int(round(ai_v[row + j]))], ap_v[row + j])
+                    for j in range(top_n)
+                ]
             out[name] = ProbeReading(
                 fraction=frac_v[ci],
                 nearest=nearest,
@@ -866,6 +976,8 @@ class Monitor:
                 fraction_per_layer=frac_per_layer_acc[ci],
                 coords_per_layer=coords_per_layer_acc[ci],
                 residual_per_layer=residual_per_layer_acc[ci],
+                assignment=assignment,
+                membership=1.0,
             )
         return out
 
@@ -996,7 +1108,15 @@ class Monitor:
         similarity gate).  Under the unified full reading every probe — flat
         and curved — carries coords *and* nearest, so flat probes now expose
         ``@label`` similarity gates too (e.g. ``@when:personas@hacker``) and
-        the gate grammar is uniform.  All shapes merge directly into
+        the gate grammar is uniform.
+
+        **Fuzzy channels** (additive — the ``@label`` distance gates are
+        untouched): one ``"<probe>~<label>"`` per assigned node as the
+        soft-assignment *probability* (``@when:personas~hacker > 0.5`` — a
+        normalized, in-``[0,1]`` membership gate, unlike the unbounded
+        ``-distance``), and ``"<probe>:membership"`` as the graded tube-fit
+        (``@when:pad:membership > 0.6`` — high when the activation sits inside
+        the manifold's learned thickness).  All shapes merge directly into
         ``TriggerContext.probe_scores``.
         """
         out: dict[str, float] = {}
@@ -1009,6 +1129,9 @@ class Monitor:
             out[f"{name}:fraction"] = reading.fraction
             for label, dist in reading.nearest:
                 out[f"{name}@{label}"] = -dist
+            for label, prob in reading.assignment:
+                out[f"{name}~{label}"] = prob
+            out[f"{name}:membership"] = reading.membership
         return out
 
     def _per_token_coord_stream(
@@ -1333,6 +1456,26 @@ class AttachedManifoldProbe:
     node_values_reduced: dict[int, torch.Tensor] = field(default_factory=dict)
     # Per-layer EV weight, normalized to sum to 1 across attached layers.
     ev_weights: dict[int, float] = field(default_factory=dict)
+    # Per-candidate soft-assignment bandwidth ``τ`` ``(Kc,)`` in the **whitened**
+    # metric (the metric the nearest-node distances live in), EV-weighted across
+    # layers, candidate order = nodes then the neutral anchor (when injected).
+    # A curved fit's within-node σ-field mapped into the whitened metric (×
+    # ``√(tr(M_R)/R)``, the isotropic-σ scale); a flat fit's local layout scale
+    # (each node's nearest-neighbor whitened distance).  Drives the
+    # ``softmax(−d²/2τ² − R·log(τ))`` soft assignment.  ``None`` until the
+    # post-attach bandwidth pass runs (an empty / degenerate manifold leaves it
+    # ``None`` ⇒ assignment empty, argmax ``nearest`` unaffected).
+    assign_bandwidth: torch.Tensor | None = None
+    # Per-candidate Gaussian log-volume bias ``−R·log(τ_k)`` ``(Kc,)`` —
+    # precomputed at attach so the hot-path logit is
+    # ``−d²/(2τ²) + logvol_bias`` (one add, no per-token ``log``).  This is the
+    # missing Gaussian normalization that turns the bare ``softmax(−d²/2τ²)``
+    # into a proper isotropic R-D mixture posterior with a uniform node prior:
+    # the bias penalizes diffuse-``τ`` candidates by their log-volume so a wide
+    # node can't swallow probability from far away (the "broadest-node-wins"
+    # pathology the bare form has).  ``R`` is the manifold's per-layer subspace
+    # rank — the effective dimension of the space ``τ`` measures.
+    assign_logvol_bias: torch.Tensor | None = None
     # Per-layer Mahalanobis bundle, populated at attach.  The wired whitener
     # must cover every layer of this manifold (all-or-nothing per probe), else
     # ``_build_whitened`` raises ``WhitenerError`` — there is no Euclidean
@@ -1639,7 +1782,111 @@ def _attach_manifold_probe(
     probe.whitened = _build_whitened_factors(
         whitener, probe, factor_cache=factor_cache,
     )
+    bw, lvb = _compute_assign_bandwidth(probe, embedded)
+    probe.assign_bandwidth = bw
+    probe.assign_logvol_bias = lvb
     return probe
+
+
+def _compute_assign_bandwidth(
+    probe: "AttachedManifoldProbe", embedded: torch.Tensor,
+) -> "tuple[torch.Tensor | None, torch.Tensor | None]":
+    """Per-candidate ``(τ, −R·log(τ))`` ``(Kc,)`` each, EV-weighted.
+
+    ``τ`` is the soft-assignment bandwidth in the **whitened** metric the
+    nearest-node distances use, candidate order = nodes then the neutral anchor
+    (when ``inject_neutral``).  Two sources for ``τ``, per the chosen within-
+    node-thickness variance:
+
+    * **curved + σ-field**: each node's reduced within-node thickness
+      ``σ(z)`` (:meth:`LayerSubspace.sigma_at`) mapped into the whitened metric by
+      the isotropic scale ``√(tr(M_R)/R)`` (``M_R = chol cholᵀ``), so a
+      reduced-space σ is comparable to the chol-whitened distances; the neutral
+      anchor takes the per-layer median node σ.
+    * **flat / no σ-field**: each node's *local layout scale* — its
+      nearest-neighbor distance among the whitened node coords ``node_white`` —
+      so a dense cluster assigns sharply and an isolated node softly; the neutral
+      anchor takes its own nearest-node distance.
+
+    The second return ``−R·log(τ)`` is the precomputed Gaussian log-volume
+    bias for the soft-assignment logit: the proper isotropic R-D Gaussian
+    posterior is ``softmax(−d²/(2τ²) − R·log(τ))`` (the ``−R·log(τ)`` is the
+    log of the normalization ``(2πτ²)^(-R/2)`` with the constant dropped — it
+    cancels in softmax).  Without this term the bare ``−d²/2τ²`` softmax has a
+    *broadest-node-wins* pathology: a wide-``τ`` candidate's logit sits near 0
+    while crisp-``τ`` candidates have strongly-negative logits, so the diffuse
+    node swallows probability regardless of distance.  Precomputed once at
+    attach so the hot path is a single add.  ``R`` is the manifold's per-layer
+    subspace rank (one number per probe — fits are rank-uniform across layers).
+
+    EV-weighted across layers (same weights as every other cross-layer read),
+    floored positive.  Returns ``(None, None)`` for a degenerate manifold (no
+    layers / single node), which leaves the assignment empty without disturbing
+    ``nearest``.
+    """
+    shared = list(probe.manifold.layers.keys())
+    if not shared:
+        return None, None
+    K = probe.node_values_reduced[shared[0]].shape[0]
+    if K < 1:
+        return None, None
+    ev = probe.ev_weights
+    acc: torch.Tensor | None = None
+    wsum = 0.0
+    for layer_idx in shared:
+        wh = probe.whitened.get(layer_idx)
+        if wh is None:
+            continue
+        sub = probe.manifold.layers[layer_idx]
+        node_white = wh.node_white.to(torch.float32)        # (K, R)
+        R = int(node_white.shape[1])
+        if (not sub.is_affine) and sub.has_sigma:
+            # σ-field (reduced units) → whitened via the isotropic scale.
+            emb = embedded.to(device=node_white.device, dtype=torch.float32)
+            sig_reduced = sub.sigma_at(emb).reshape(-1).to(torch.float32)  # (K,)
+            m_r = wh.chol @ wh.chol.transpose(-1, -2)        # M_R (R, R)
+            scale = float((torch.diagonal(m_r).sum() / max(R, 1)).clamp(min=1e-12).sqrt())
+            band = sig_reduced * scale                       # (K,) whitened
+            neutral_band = band.median()
+        else:
+            # Local layout scale: each node's nearest-neighbor whitened distance.
+            if K >= 2:
+                dmat = torch.cdist(node_white, node_white)   # (K, K)
+                dmat = dmat + torch.eye(
+                    K, device=dmat.device, dtype=dmat.dtype,
+                ) * 1e9                                       # mask self
+                band = dmat.min(dim=1).values                # (K,)
+            else:
+                band = node_white.new_ones(K)
+            if probe.inject_neutral:
+                nd = torch.linalg.vector_norm(
+                    node_white - wh.neutral_white.reshape(1, -1), dim=-1,
+                )                                            # (K,)
+                neutral_band = nd.min()
+            else:
+                neutral_band = band.median() if K else node_white.new_tensor(1.0)
+        cand = (
+            torch.cat([band, neutral_band.reshape(1)])
+            if probe.inject_neutral else band
+        )                                                    # (Kc,)
+        w = float(ev.get(layer_idx, 0.0))
+        acc = cand * w if acc is None else acc + cand * w
+        wsum += w
+    if acc is None:
+        return None, None
+    if wsum > _MIN_EV_WEIGHT:
+        acc = acc / wsum
+    # Floor positive so the softmax denominator never divides by ~0.
+    med = float(acc.median().clamp(min=1e-6))
+    tau = acc.clamp(min=1e-3 * med).to(torch.float32)
+    # Gaussian log-volume bias ``−R·log(τ)`` for the soft-assignment logit.
+    # ``R`` = the manifold's per-layer subspace rank (rank-uniform across a
+    # fit's layers), the effective dimension of the space the bandwidth ``τ``
+    # lives in.  Precomputed here so the hot path adds a single scalar per
+    # candidate with no per-token ``log()``.
+    R = int(next(iter(probe.manifold.layers.values())).rank)
+    logvol_bias = (-float(R) * torch.log(tau)).to(torch.float32)
+    return tau, logvol_bias
 
 
 def _layer_geometry(

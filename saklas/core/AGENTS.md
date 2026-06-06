@@ -270,6 +270,23 @@ bit-for-bit; a float is a fixed λ. The fitted weight shapes are unchanged so
 takes `smoothing=` (curved discover passes it; authored stays exact) and surfaces
 the chosen λ/edf via the `rbf_info` out-dict. CPU/fp32 (the saddle is MPS-unsafe).
 
+**Fuzzy-manifold σ-field (curved only).** Optional per-layer *tube thickness*:
+the surface stops being a zero-thickness wire and carries a within-node off-surface
+spread `σ(z)`. `compute_node_reduced_covariance` (a **second** fit-time capture
+pass — needs the just-fitted basis, so it can't fold into centroid pooling)
+accumulates each node's reduced `(R,R)` within-node covariance; `fit_sigma_field`
+reduces it to one off-surface scalar per node (`_off_surface_var` — the
+normal-complement trace via the surface tangent `_reduced_tangent`) and fits a
+**separate** `log σ` RBF over the same normalized `node_params`, stored on
+`LayerSubspace.{sigma_rbf_weights,sigma_poly_coeffs}` (None ⇒ `has_sigma` False ⇒
+`sigma_at` returns 0 ⇒ exact legacy). `sigma_at(embedded)` is the one extra
+`eval_rbf` on the curved path. Curved+raw fits only (SAE/flat skip; the
+extraction pipeline gates on `effective_fit_mode != "pca" and sae_backend is
+None`); summary rides the sidecar as `sigma_field_per_layer`. Consumed by soft
+`onto` (`subspace_inject` shrinks `H_n` toward `σ(z)` — the tube — instead of to 0)
+and the monitor's membership/assignment reads. v1 is **isotropic** (one scalar/node;
+diagonal/full later).
+
 **Topology selection (`fit_mode="auto"`).** `select_topology(stacks, layer_grams,
 consensus_gram, *, whitener, …)` picks the discover geometry per-model in two
 decoupled decisions (decoupling dodges the dimension bias that makes a single
@@ -408,7 +425,29 @@ vestigial on the hot path — the readout centers on each fit's own
 `"<name>@neutral"` when the neutral anchor wins a top-N slot). Every probe — flat
 and curved — now carries coords *and* nearest, so flat probes expose `@label`
 similarity gates too (`@when:personas@hacker`, `@when:personas@neutral`) and the
-gate grammar is uniform. Entry points:
+gate grammar is uniform.
+
+**Fuzzy reads** (the soft/distributional view of `nearest`/`residual`): every
+`ProbeReading` also carries `assignment` (a `softmax(−d²/(2τ²) − R·log(τ))` node
+posterior — a proper isotropic R-D Gaussian-mixture posterior with uniform node
+prior, the distributional counterpart to argmax `nearest`) and `membership`
+(`exp(−residual²/2σ²)` tube-fit density ∈ `[0,1]`, `1.0` for flat / no-σ fits).
+The per-candidate bandwidth `τ` AND the precomputed Gaussian log-volume bias
+`−R·log(τ)` are computed at attach (`_compute_assign_bandwidth` →
+`AttachedManifoldProbe.{assign_bandwidth, assign_logvol_bias}`): `τ` is a curved
+fit's σ-field mapped into the whitened metric (×`√(tr(M_R)/R)`) or a flat fit's
+local layout scale (each node's nearest-neighbor whitened distance), and the
+log-volume bias is the missing Gaussian normalization (without it the bare
+`−d²/2τ²` softmax has a broadest-node-wins pathology — a diffuse-τ candidate
+sits near logit 0 while crisp-τ candidates have strongly-negative logits, so the
+wide node swallows probability regardless of distance; the bias inverts this to
+the standard "tight when near, broad when far" mixture behavior). `R` is the
+manifold's per-layer subspace rank (rank-uniform across a fit's layers). Soft
+assignment is uniform flat+curved with the hot path gaining only one softmax +
+one add over the distances it already computes (folded into the single host
+transfer in both `_score_probe_full` and the batched `_score_flat_batched`).
+`flat_scalars` emits these as `"<name>~<label>"` (assignment prob) +
+`"<name>:membership"`. Entry points:
 `score_per_token` (primary — returns `(aggregate readings, per-token axis-0 coord
 stream)`), `score_single_token{,_per_layer}` (`_per_layer` is a view over the
 reading's `coords_per_layer` backing the loom heatmap), `measure_from_hidden`,
@@ -631,10 +670,13 @@ live-stream-gated), `perplexity`, `probe_readings`. `GenerationResult`
 carries `prompt_tokens`, `finish_reason`, optional `logprobs`, `readings`
 (per-probe `ProbeReadings`), `probe_readings`, and `applied_steering` (the
 canonical expression, round-trips through `parse_expr`). `ProbeReading`
-(`coords`/`fraction`/`nearest`/`residual` + `fraction_per_layer`/`coords_per_layer`/
-`residual_per_layer`) is the **single** reading shape for both the live per-token
-stream and the end-of-gen aggregate (the aggregate is the reading pooled at the
-last-content token). Every field is populated for flat and curved fits alike;
+(`coords`/`fraction`/`nearest`/`residual` + `assignment`/`membership` +
+`fraction_per_layer`/`coords_per_layer`/`residual_per_layer`) is the **single**
+reading shape for both the live per-token stream and the end-of-gen aggregate (the
+aggregate is the reading pooled at the last-content token). `assignment`
+(`[(label, prob)]` soft node posterior) and `membership` (tube-fit density, default
+`1.0`) are the fuzzy-manifold readout — empty/`1.0` defaults keep serialization
+back-compat. Every field is populated for flat and curved fits alike;
 `residual` is `0` for a flat fit (the surface fills its subspace) and the
 normalized off-surface distance for a curved fit. `ProbeReadings` is vectorized per
 coordinate axis (`mean`/`std`/`min`/`max`/`delta_per_gen` are `tuple[float,...]`,

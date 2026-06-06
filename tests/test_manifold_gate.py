@@ -89,6 +89,46 @@ class TestParseStoresNamespacedProbe:
         assert trig.gate.threshold == -0.1
         assert trig.gate.op == ">"
 
+    def test_membership_gate_probe_string(self):
+        # Fuzzy tube-fit density channel ``<manifold>:membership``.
+        s = parse_expr("0.3 happy.sad @when:circumplex:membership > 0.6")
+        trig = _trigger_of(s, "happy.sad")
+        assert trig.gate == ProbeGate(
+            probe="circumplex:membership", op=">", threshold=0.6,
+        )
+
+    def test_soft_assignment_gate_probe_string(self):
+        # Fuzzy soft-assignment probability channel ``<manifold>~<label>``.
+        s = parse_expr("0.3 happy.sad @when:circumplex~elated > 0.5")
+        trig = _trigger_of(s, "happy.sad")
+        assert trig.gate == ProbeGate(
+            probe="circumplex~elated", op=">", threshold=0.5,
+        )
+
+    def test_unknown_colon_channel_rejected(self):
+        import pytest
+        from saklas.core.steering_expr import SteeringExprError
+        with pytest.raises(SteeringExprError, match="membership"):
+            parse_expr("0.3 happy.sad @when:circumplex:bogus > 0.5")
+
+    def test_new_channels_round_trip(self):
+        from saklas.core.steering_expr import format_expr
+        for text in (
+            "0.3 happy.sad@when:circumplex:membership>0.6",
+            "0.3 happy.sad@when:circumplex~elated>0.5",
+        ):
+            assert format_expr(parse_expr(text)) == text
+
+    def test_membership_and_assignment_gates_fire(self):
+        s = parse_expr("0.3 happy.sad @when:circumplex:membership > 0.6")
+        trig = _trigger_of(s, "happy.sad")
+        assert trig.active(_ctx({"circumplex:membership": 0.7}))
+        assert not trig.active(_ctx({"circumplex:membership": 0.5}))
+        s2 = parse_expr("0.3 happy.sad @when:circumplex~elated > 0.5")
+        trig2 = _trigger_of(s2, "happy.sad")
+        assert trig2.active(_ctx({"circumplex~elated": 0.8}))
+        assert not trig2.active(_ctx({"circumplex~elated": 0.3}))
+
 
 # ----------------------------------------------------- runtime gate firing ---
 

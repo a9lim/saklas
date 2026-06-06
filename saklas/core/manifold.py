@@ -992,6 +992,21 @@ class LayerSubspace:
     # origin here, so the synthesizer reads ``node_coords[index]`` per layer
     # as the ``along`` target.  The shared ``Manifold.node_coords`` stays the
     # label/display layout; *these* are the geometry (§5 neutral-anchor).
+    sigma_rbf_weights: torch.Tensor | None = None
+    sigma_poly_coeffs: torch.Tensor | None = None
+    # The **fuzzy-manifold σ-field** (curved subspaces only; ``None`` =
+    # zero-thickness wire = legacy behavior).  A *separate* ``r**3`` RBF over
+    # the **same** normalized ``node_params`` that interpolates per-node
+    # ``log σ`` — the within-node off-surface activation spread (the corpus a
+    # node produces scatters off the mean surface; ``σ`` is that scatter's
+    # normal-projected std, a tube thickness).  Kept separate from the surface
+    # RBF (rather than appended as an extra value column) so the ``(R,)``-shape
+    # contracts the surface consumers rely on are untouched; ``sigma_at`` is the
+    # one extra ``eval_rbf`` (``O(K)``) paid only on the already-slow curved
+    # path.  ``sigma_rbf_weights`` is ``(K, 1)``, ``sigma_poly_coeffs`` is
+    # ``(m+1, 1)``.  ``None`` (affine, legacy, or a curved fit predating the
+    # σ-field) ⇒ ``sigma_at`` returns ``0`` ⇒ soft-onto degenerates to the hard
+    # collapse and the read bandwidth degenerates to argmax — exact legacy.
 
     @property
     def rank(self) -> int:
@@ -1105,7 +1120,20 @@ class LayerSubspace:
             coord_offset=self.coord_offset.to(device=device, dtype=dtype),
             coord_scale=self.coord_scale.to(device=device, dtype=dtype),
             node_coords=_cast(self.node_coords),
+            sigma_rbf_weights=_cast(self.sigma_rbf_weights),
+            sigma_poly_coeffs=_cast(self.sigma_poly_coeffs),
         )
+
+    @property
+    def has_sigma(self) -> bool:
+        """True iff this subspace carries a fuzzy-manifold σ-field.
+
+        A curved subspace fitted with the within-node spread pass; ``False``
+        for affine fits, legacy curved fits, and any subspace where the σ-RBF
+        wasn't built.  Gates :meth:`sigma_at` (which returns ``0`` when absent)
+        so every σ consumer degrades to the exact zero-thickness behavior.
+        """
+        return self.sigma_rbf_weights is not None and self.sigma_poly_coeffs is not None
 
     def _normalize(self, embedded: torch.Tensor) -> torch.Tensor:
         return (embedded - self.coord_offset) / self.coord_scale
@@ -1118,6 +1146,29 @@ class LayerSubspace:
             return embedded @ self.basis + self.mean
         reduced = eval_rbf(*self.rbf_params(), self._normalize(embedded))
         return reduced @ self.basis + self.mean
+
+    def sigma_at(self, embedded: torch.Tensor) -> torch.Tensor:
+        """Within-node off-surface spread ``σ`` at embedded coords ``(.., m)``.
+
+        Interpolates the per-node ``log σ`` field through the σ-RBF over the
+        same normalized ``node_params``, then exponentiates — so the result is
+        a positive ``(..,)`` thickness in the layer's reduced-coordinate units
+        (the same units ``H_n`` is measured in, since the basis is
+        orthonormal).  Returns an all-zeros ``(..,)`` when the subspace carries
+        no σ-field (:attr:`has_sigma` false): affine fits, legacy curved fits,
+        the degenerate-but-safe path that makes every σ consumer exact-legacy.
+        Hot-path safe (one extra ``eval_rbf``, no ``.item()`` / host sync).
+        """
+        lead = embedded.shape[:-1]
+        sw, sp, np_ = self.sigma_rbf_weights, self.sigma_poly_coeffs, self.node_params
+        if sw is None or sp is None or np_ is None:
+            return torch.zeros(lead, device=embedded.device, dtype=embedded.dtype)
+        dev, dt = embedded.device, embedded.dtype
+        norm = (embedded - self.coord_offset.to(dev, dt)) / self.coord_scale.to(dev, dt)
+        log_sigma = eval_rbf(
+            np_.to(dev, dt), sw.to(dev, dt), sp.to(dev, dt), norm,
+        )  # (.., 1)
+        return torch.exp(log_sigma).squeeze(-1)  # (..,)
 
     def jacobian_at(self, embedded: torch.Tensor) -> torch.Tensor:
         """Activation Jacobian ``d activation / d embedded``: ``(m,) -> (D, m)``."""
@@ -2152,9 +2203,15 @@ def subspace_inject(
     ``(R,)`` mask (from :func:`synthesize_subspace`) whose ``κ=1`` ablation axes
     collapse toward 0 while ``κ=0`` push axes translate.  (Curved manifolds are
     push-only, so they take the scalar-0 / pure-translate :meth:`translate_foot`.)
-    - **onto** (``o``): scale ``H_n`` by ``(1 − o)`` — collapse onto the surface
-      within the subspace.  Vacuous when the surface fills its subspace
-      (``H_n ≈ 0``).
+    - **onto** (``o``): collapse the off-surface residual ``H_n`` toward the
+      surface within the subspace.  With no σ-field (zero-thickness wire) this
+      scales ``H_n`` by ``(1 − o)`` — at ``o = 1`` the activation lands on the
+      mean surface.  With a fuzzy-manifold σ-field (:meth:`LayerSubspace.sigma_at`)
+      it instead shrinks ``‖H_n‖`` toward the local within-node thickness
+      ``σ(z)`` (the *tube*), so ``o = 1`` lands one-σ off the wire — a sample-like
+      point on the surface's typical set — direction preserved and never
+      expanding a residual already inside the tube.  Vacuous when the surface
+      fills its subspace (``H_n ≈ 0``, every affine term).
 
     The off-*subspace* residual ``H_o`` is **always kept verbatim** — the old
     third op (``toward``, which scaled ``H_o``) is removed.  It scaled the
@@ -2256,7 +2313,8 @@ def subspace_inject(
     # foot; falls back to coord 0.
     org = origin if origin is not None else torch.zeros_like(target)
     p_new = domain.translate_foot(p, org, target, along)  # (.., n)
-    emb_new = (domain.embed(p_new) - offset) / scale   # (.., m)
+    emb_new_raw = domain.embed(p_new)                  # (.., m) un-normalized
+    emb_new = (emb_new_raw - offset) / scale           # (.., m)
     foot_new_red = eval_rbf(np_, rw, pc, emb_new)      # (.., R)
     j_new = (
         eval_rbf_jacobian(np_, rw, pc, emb_new) / scale  # (.., R, m)
@@ -2272,8 +2330,23 @@ def subspace_inject(
     # :func:`_frame_rotation_transport`.
     Hn_trans = _frame_rotation_transport(Hn_red, j_old, j_new)  # (.., R)
 
-    # --- ONTO: scale the transported off-manifold residual ---
-    Hn_final = (1.0 - onto) * Hn_trans                   # (.., R)
+    # --- ONTO: collapse the transported off-manifold residual toward the tube ---
+    # Legacy (zero-thickness wire, σ-field absent): scale ``H_n`` by ``(1 − o)``
+    # — at ``o = 1`` the activation lands *on* the mean surface.  Fuzzy
+    # (σ-field present): shrink ``‖H_n‖`` toward the local within-node thickness
+    # ``σ(z)`` instead of toward 0, so ``o = 1`` lands one-σ off the wire (the
+    # surface's *typical set*, a sample-like point) rather than on the idealized
+    # centroid — the within-concept variety the hard collapse erases is exactly
+    # what drives the strong-push mode-collapse the open-frontier note flags.
+    # The residual *direction* is preserved (only its magnitude is rescaled),
+    # and a token already inside the tube (``‖H_n‖ ≤ σ``) is never *expanded*
+    # (the ``(·)_+`` clamp).  ``σ(z) = 0`` ⇒ ``shrink = (1)_+ = 1`` ⇒ the exact
+    # ``(1 − o)`` legacy collapse.
+    sigma = subspace.sigma_at(emb_new_raw)               # (..,) tube thickness σ(z)
+    hn_norm = torch.linalg.vector_norm(Hn_trans, dim=-1)  # (..,)
+    shrink = torch.clamp(1.0 - sigma / hn_norm.clamp(min=1e-6), min=0.0)  # (..,)
+    onto_scale = 1.0 - onto * shrink                     # (..,) in [1−o, 1]
+    Hn_final = onto_scale.unsqueeze(-1) * Hn_trans        # (.., R)
 
     new_par = (foot_new_red + Hn_final) @ basis          # (.., D) back to world
 
@@ -3348,6 +3421,192 @@ def compute_node_centroid(
     return {idx: sums[idx] / n for idx in range(n_layers)}
 
 
+def compute_node_reduced_covariance(
+    model: torch.nn.Module,
+    tokenizer: object,
+    layers: torch.nn.ModuleList,
+    device: torch.device,
+    responses: list[str],
+    prompts: list[str],
+    layer_subs: "dict[int, LayerSubspace]",
+    *,
+    role: str | None = None,
+    model_type: str | None = None,
+) -> dict[int, torch.Tensor]:
+    """Within-node **reduced** covariance ``(R, R)`` per layer for one node.
+
+    The fuzzy-manifold second pass (curved fits only).  Re-captures the node's
+    corpus exactly as :func:`compute_node_centroid` does — same conversational
+    ``[directive, prompt, response]`` framing, same last-content-token fp32
+    pooling — but instead of pooling to the centroid it projects every sample
+    through each fitted layer's affine frame
+    (``Z = (h − mean) · basisᵀ``, ``(B, R)``) and accumulates the reduced
+    first/second moments, returning ``{layer: cov (R, R)}`` (sample covariance,
+    ``count − 1`` denominator; zeros for a single-sample node).
+
+    This needs the per-layer ``mean``/``basis`` (hence ``layer_subs``), which
+    only exist *after* the surface fit — so it is a deliberate **second
+    fit-time forward pass** over the corpus, run only for curved manifolds
+    (``pad``-shaped), where the reduced dim ``R`` keeps the accumulators tiny
+    (``(R, R)`` with ``R ≤ 64``, ``O(1)`` memory vs. the activation width).
+    The "no second forward pass" invariant governs generation / monitoring, not
+    the rare off-hot-path fit.  The off-surface reduction of these covariances
+    into per-node ``σ`` lives in the extraction pipeline (it needs the surface
+    tangent too).  fp32 on CPU, same MPS ``empty_cache`` discipline.
+    """
+    from saklas.core.vectors import _CAPTURE_BATCH, _encode_and_capture_all_batch
+
+    if not responses:
+        raise ValueError("manifold node has no responses")
+    if not prompts:
+        raise ValueError("conversational capture needs at least one baseline prompt")
+    k = len(prompts)
+    if len(responses) % k != 0:
+        raise ValueError(
+            f"node corpus ({len(responses)} responses) must be a multiple of "
+            f"the baseline prompt set ({k})"
+        )
+    is_mps = getattr(device, "type", None) == "mps"
+    n = len(responses)
+    aligned_prompts = [prompts[i % k] for i in range(n)]
+
+    # Per-layer reduced accumulators: count, Σz (R,), Σ z zᵀ (R, R).
+    sum_z: dict[int, torch.Tensor] = {}
+    sum_zz: dict[int, torch.Tensor] = {}
+    means_basis = {
+        idx: (sub.mean.to(torch.float32), sub.basis.to(torch.float32))
+        for idx, sub in layer_subs.items()
+    }
+
+    for start in range(0, n, _CAPTURE_BATCH):
+        end = min(start + _CAPTURE_BATCH, n)
+        per_layer = _encode_and_capture_all_batch(
+            model, tokenizer,
+            aligned_prompts[start:end], responses[start:end],
+            layers, device, role=role, model_type=model_type,
+        )
+        for idx, (mean, basis) in means_basis.items():
+            h = per_layer[idx].detach().to("cpu", torch.float32)  # (B, D)
+            z = (h - mean) @ basis.T                              # (B, R)
+            sz = z.sum(dim=0)                                     # (R,)
+            szz = z.T @ z                                         # (R, R)
+            if idx in sum_z:
+                sum_z[idx] += sz
+                sum_zz[idx] += szz
+            else:
+                sum_z[idx] = sz
+                sum_zz[idx] = szz
+        del per_layer
+        if is_mps:
+            torch.mps.empty_cache()
+
+    covs: dict[int, torch.Tensor] = {}
+    for idx in layer_subs:
+        cnt = float(n)
+        mu = sum_z[idx] / cnt                                     # (R,)
+        # Sample covariance Σzzᵀ/cnt − μμᵀ, unbiased (cnt−1) scaling.
+        cov = sum_zz[idx] / cnt - torch.outer(mu, mu)            # (R, R)
+        if n > 1:
+            cov = cov * (cnt / (cnt - 1.0))
+        covs[idx] = cov
+    return covs
+
+
+def _reduced_tangent(
+    sub: "LayerSubspace", domain: "ManifoldDomain", coord: torch.Tensor,
+) -> torch.Tensor:
+    """Reduced-space surface tangent ``(R, n)`` at authoring coord ``(n,)``.
+
+    The columns span the directions the surface can move *along* at this point,
+    in the layer's reduced frame — the RBF Jacobian chained through the domain's
+    embedding Jacobian, mirroring :func:`subspace_inject`'s ``j_old``.  Its
+    orthogonal complement in ``ℝ^R`` is the *off-surface* (tube-thickness)
+    subspace.
+    """
+    np_, rw, pc = sub.rbf_params()
+    emb = sub._normalize(domain.embed(coord))  # (m,)
+    j_red = eval_rbf_jacobian(np_, rw, pc, emb) / sub.coord_scale  # (R, m)
+    return j_red @ domain.embed_jacobian(coord)  # (R, n)
+
+
+def _off_surface_var(
+    cov: torch.Tensor, tangent: torch.Tensor, R: int, n: int,
+) -> float:
+    """Mean within-node variance in the off-surface (normal) directions.
+
+    ``cov`` is the node's reduced ``(R, R)`` within-node covariance, ``tangent``
+    its ``(R, n)`` surface tangent.  Projects ``cov`` onto the normal complement
+    ``P = I − t(tᵀt)⁺tᵀ`` and returns ``tr(P cov)/(R − n)`` — the part of the
+    node's scatter that lives *off* the mean surface, which is what the tube
+    thickness should be (tangential scatter is the node sliding *along* the
+    surface, expected and not thickness).  Degenerates to the full isotropic
+    ``tr(cov)/R`` when the surface fills its subspace (``R ≤ n``, no normal
+    complement).  Clamped non-negative (sample-covariance round-off).
+    """
+    if R <= n:
+        return float(torch.diagonal(cov).sum() / max(R, 1))
+    tt = tangent.T @ tangent                                   # (n, n)
+    proj = tangent @ torch.linalg.pinv(tt) @ tangent.T          # (R, R) onto tangent
+    normal = torch.eye(R, dtype=cov.dtype) - proj               # onto normal complement
+    var = torch.trace(normal @ cov) / float(R - n)
+    return float(var.clamp(min=0.0))
+
+
+def fit_sigma_field(
+    layer_subs: "dict[int, LayerSubspace]",
+    domain: "ManifoldDomain",
+    node_coords: torch.Tensor,
+    node_covs: "list[dict[int, torch.Tensor]]",
+    *,
+    smoothing: float | str | None = "auto",
+    floor_frac: float = 1e-3,
+) -> dict[int, dict[str, float]]:
+    """Attach a fuzzy-manifold ``log σ`` RBF to each curved layer (mutates them).
+
+    Reduces the per-node within-node covariances (from
+    :func:`compute_node_reduced_covariance`) to one off-surface ``σ`` per node
+    per layer (:func:`_off_surface_var`), then fits a *separate* penalized
+    ``r**3`` RBF over the **same normalized** ``node_params`` interpolating the
+    per-node ``log σ`` and writes it onto ``sub.sigma_rbf_weights`` /
+    ``sub.sigma_poly_coeffs``.  Returns ``{layer: {"sigma_mean", "sigma_min",
+    "sigma_max", "lambda"}}`` for the sidecar.
+
+    ``floor_frac`` floors each layer's per-node ``σ²`` at ``floor_frac × median``
+    so a degenerate (single-sample / collapsed) node can't drive ``log σ → −∞``.
+    Smoothing defaults to GCV ``"auto"`` — the σ-field is noisier than the mean
+    surface (a second-moment estimate from ~48 samples), so a regularized
+    interpolant is the right default; ``0`` makes it exact at the nodes.
+    """
+    K = int(node_coords.shape[0])
+    n = int(domain.intrinsic_dim)
+    info: dict[int, dict[str, float]] = {}
+    for idx, sub in layer_subs.items():
+        R = sub.rank
+        raw = torch.empty(K, dtype=torch.float32)
+        for kidx in range(K):
+            cov = node_covs[kidx][idx].to(torch.float32)        # (R, R)
+            tangent = _reduced_tangent(
+                sub, domain, node_coords[kidx].to(torch.float32),
+            )                                                    # (R, n)
+            raw[kidx] = _off_surface_var(cov, tangent, R, n)
+        floor = floor_frac * float(raw.median().clamp(min=1e-12))
+        sigma = raw.clamp(min=floor).sqrt()                      # (K,) σ (std)
+        log_sigma = torch.log(sigma).reshape(K, 1)               # (K, 1)
+        np_, _rw, _pc = sub.rbf_params()
+        w, c, rinfo = fit_rbf_smoothed(
+            np_.to(torch.float32), log_sigma, smoothing=smoothing,
+        )
+        sub.sigma_rbf_weights = w
+        sub.sigma_poly_coeffs = c
+        info[idx] = {
+            "sigma_mean": float(sigma.mean()),
+            "sigma_min": float(sigma.min()),
+            "sigma_max": float(sigma.max()),
+            "lambda": float(rinfo.get("lambda", 0.0)),
+        }
+    return info
+
+
 # ------------------------------------------------------------- save/load ---
 
 def save_manifold(
@@ -3403,6 +3662,18 @@ def save_manifold(
         tensors[f"layer_{idx}.poly_coeffs"] = pc.contiguous().to(torch.float32).cpu()
         tensors[f"layer_{idx}.coord_offset"] = sub.coord_offset.contiguous().to(torch.float32).cpu()
         tensors[f"layer_{idx}.coord_scale"] = sub.coord_scale.contiguous().to(torch.float32).cpu()
+        # Fuzzy-manifold σ-field (curved fits with the within-node spread pass).
+        # The log-σ RBF over the same normalized ``node_params``; its *absence*
+        # on disk is the read-side "zero-thickness wire" marker (legacy curved
+        # fits and SAE fits skip it), so a fuzzy and a legacy manifold share one
+        # save/load path exactly as affine/curved do.
+        if sub.sigma_rbf_weights is not None and sub.sigma_poly_coeffs is not None:
+            tensors[f"layer_{idx}.sigma_rbf_weights"] = (
+                sub.sigma_rbf_weights.contiguous().to(torch.float32).cpu()
+            )
+            tensors[f"layer_{idx}.sigma_poly_coeffs"] = (
+                sub.sigma_poly_coeffs.contiguous().to(torch.float32).cpu()
+            )
     save_file(tensors, str(path))
 
     from saklas import __version__ as _saklas_version
@@ -3460,6 +3731,14 @@ def save_manifold(
         # on fits that predate it (loads as an empty dict).  Surfaced by
         # `manifold show`.
         "node_spread_per_layer",
+        # Penalized-RBF provenance ``{str(L): {lambda, edf, gcv}}`` (curved
+        # discover fits) and the fuzzy-manifold σ-field summary
+        # ``{str(L): {sigma_mean, sigma_min, sigma_max, lambda}}`` (curved fits
+        # run with the within-node spread pass).  Diagnostic only — the σ-RBF
+        # tensors themselves ride the safetensors; these are the inspector
+        # summaries.  Absent on fits without them (load as empty dicts).
+        "rbf_smoothing_per_layer",
+        "sigma_field_per_layer",
         # Discover-mode fields.  ``fit_mode`` discriminates authored vs
         # discover at read time; ``hyperparams`` records the knobs the
         # fitter was called with (max_dim / var_threshold / k_nn /
@@ -3533,6 +3812,11 @@ def load_manifold(path: str | Path) -> Manifold:
             poly_coeffs=parts["poly_coeffs"],
             coord_offset=parts["coord_offset"],
             coord_scale=parts["coord_scale"],
+            # Fuzzy-manifold σ-field — present only on curved fits run with the
+            # within-node spread pass; absent ⇒ ``None`` ⇒ zero-thickness wire
+            # (the exact legacy curved behavior).
+            sigma_rbf_weights=parts.get("sigma_rbf_weights"),
+            sigma_poly_coeffs=parts.get("sigma_poly_coeffs"),
         )
 
     domain = domain_from_spec(sidecar["domain"])

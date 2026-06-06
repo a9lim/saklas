@@ -25,6 +25,8 @@ from saklas.core.manifold import (
     fit_layer_subspace as _fit_layer_subspace_with_ev,  # returns (LayerSubspace, ev_ratio)
     fit_rbf_interpolant,
     fit_rbf_smoothed,
+    fit_sigma_field,
+    _off_surface_var,
     _rbf_smoother_matrix,
     rbf_cardinal_weights,
     subspace_inject,
@@ -883,6 +885,189 @@ def test_inject_norm_cap_bounds_output():
             assert torch.isfinite(out).all()
             ratio = out.norm() / h.norm()
             assert ratio <= 3.0 + 1e-4
+
+
+# ----------------------------------------------- fuzzy-manifold σ-field ---
+#
+# A curved manifold can carry a per-node within-node off-surface spread
+# interpolated as a separate ``log σ`` RBF (``LayerSubspace.sigma_at``).  It
+# gives the surface a *tube thickness*: soft ``onto`` shrinks the off-surface
+# residual toward ``σ`` (the typical set) instead of to the zero-thickness
+# wire.  Absent ⇒ ``sigma_at`` returns 0 ⇒ exact legacy behavior.
+
+def _attach_constant_sigma(sub: Any, value: float) -> None:
+    """Fit a σ-RBF interpolating a constant ``σ = value`` over the layout.
+
+    A constant value is reproduced exactly by the affine polynomial term (the
+    RBF weights vanish), so ``sigma_at`` returns ``value`` everywhere — the
+    clean, predictable σ-field for testing the soft-``onto`` arithmetic.
+    """
+    np_, _rw, _pc = sub.rbf_params()
+    K = np_.shape[0]
+    log_sigma = torch.full((K, 1), math.log(value), dtype=torch.float32)
+    w, c, _ = fit_rbf_smoothed(np_, log_sigma, smoothing=0.0)
+    sub.sigma_rbf_weights = w
+    sub.sigma_poly_coeffs = c
+
+
+def test_sigma_at_absent_is_zero():
+    # A freshly fitted curved subspace carries no σ-field → zero-thickness wire.
+    sub, domain = _grid_manifold()
+    assert not sub.has_sigma
+    z = domain.embed(torch.tensor([0.3, 0.7]))
+    assert float(sub.sigma_at(z)) == 0.0
+
+
+def test_sigma_at_constant_field():
+    sub, domain = _grid_manifold()
+    _attach_constant_sigma(sub, 0.7)
+    assert sub.has_sigma
+    for coord in ([0.1, 0.2], [0.5, 0.5], [0.9, 0.4]):
+        z = domain.embed(torch.tensor(coord))
+        assert abs(float(sub.sigma_at(z)) - 0.7) < 1e-3
+
+
+def _curved_with_pure_residual(sigma: float | None, resid_norm: float = 3.0):
+    """A curved sub + an on-surface point at [0.5,0.5] plus a pure in-subspace
+    off-surface residual of norm ``resid_norm``; optionally σ-field-equipped."""
+    sub, domain = _grid_manifold()
+    if sigma is not None:
+        _attach_constant_sigma(sub, sigma)
+    torch.manual_seed(7)
+    pert = torch.randn(16)
+    pert = (pert @ sub.basis.T) @ sub.basis          # pure in-subspace (H_n)
+    pert = resid_norm * pert / pert.norm()
+    h = _on_surface(sub, domain, [0.5, 0.5]) + pert
+    return sub, domain, h
+
+
+def test_soft_onto_lands_one_sigma_off_the_wire():
+    # With a σ-field, onto=1 shrinks ‖H_n‖ to σ (not 0): the activation lands on
+    # the tube, one σ off the mean surface — direction preserved.
+    sigma = 0.5
+    sub, domain, h = _curved_with_pure_residual(sigma, resid_norm=3.0)
+    pos = torch.tensor([0.5, 0.5])
+    out, foot = subspace_inject(h, sub, domain, pos, pos, 0.0, 1.0, gn_steps=20)
+    q_out = (out - sub.mean) @ sub.basis.T
+    foot_red = (sub.eval_at(domain.embed(foot)) - sub.mean) @ sub.basis.T
+    hn_out = q_out - foot_red
+    assert abs(float(hn_out.norm()) - sigma) < 5e-3
+    # direction preserved vs the hard-collapse direction (onto=0 keeps full H_n)
+    out0, foot0 = subspace_inject(h, sub, domain, pos, pos, 0.0, 0.0, gn_steps=20)
+    hn0 = (out0 - sub.mean) @ sub.basis.T - (
+        sub.eval_at(domain.embed(foot0)) - sub.mean
+    ) @ sub.basis.T
+    cos = float((hn_out @ hn0) / (hn_out.norm() * hn0.norm()))
+    assert cos > 0.999
+
+
+def test_soft_onto_without_field_collapses_to_wire():
+    # No σ-field → onto=1 is the exact legacy collapse: H_n → 0.
+    sub, domain, h = _curved_with_pure_residual(None, resid_norm=3.0)
+    pos = torch.tensor([0.5, 0.5])
+    out, foot = subspace_inject(h, sub, domain, pos, pos, 0.0, 1.0, gn_steps=20)
+    hn_out = (out - sub.mean) @ sub.basis.T - (
+        sub.eval_at(domain.embed(foot)) - sub.mean
+    ) @ sub.basis.T
+    assert float(hn_out.norm()) < 5e-3
+
+
+def test_soft_onto_never_expands_inside_tube():
+    # A residual already smaller than σ is left untouched (the (·)_+ clamp).
+    sigma = 5.0
+    sub, domain, h = _curved_with_pure_residual(sigma, resid_norm=1.0)
+    pos = torch.tensor([0.5, 0.5])
+    out0, foot0 = subspace_inject(h, sub, domain, pos, pos, 0.0, 0.0, gn_steps=20)
+    out1, foot1 = subspace_inject(h, sub, domain, pos, pos, 0.0, 1.0, gn_steps=20)
+    hn0 = (out0 - sub.mean) @ sub.basis.T - (
+        sub.eval_at(domain.embed(foot0)) - sub.mean
+    ) @ sub.basis.T
+    hn1 = (out1 - sub.mean) @ sub.basis.T - (
+        sub.eval_at(domain.embed(foot1)) - sub.mean
+    ) @ sub.basis.T
+    assert torch.allclose(hn1, hn0, atol=5e-3)
+
+
+def test_off_surface_var_isolates_normal_directions():
+    # A 4-D reduced space, surface tangent spanning dims 0..1; a covariance with
+    # variance only in the tangent directions has zero off-surface variance, and
+    # one with variance only in the normal directions returns that variance.
+    R, n = 4, 2
+    tangent = torch.zeros(R, n)
+    tangent[0, 0] = 1.0
+    tangent[1, 1] = 1.0
+    cov_tan = torch.diag(torch.tensor([3.0, 3.0, 0.0, 0.0]))
+    assert _off_surface_var(cov_tan, tangent, R, n) < 1e-5
+    cov_norm = torch.diag(torch.tensor([0.0, 0.0, 2.0, 4.0]))
+    # off-surface mean variance = (2 + 4) / (R − n) = 3.0
+    assert abs(_off_surface_var(cov_norm, tangent, R, n) - 3.0) < 1e-5
+
+
+def test_fit_sigma_field_interpolates_node_thickness():
+    # fit_sigma_field reduces per-node covariances to off-surface σ and attaches
+    # a log-σ RBF; sigma_at at a node recovers that node's off-surface std.
+    sub, domain = _grid_manifold()
+    coords = torch.tensor(
+        [[u, v] for u in (0.0, 0.5, 1.0) for v in (0.0, 0.5, 1.0)]
+    )
+    R = sub.rank
+    # Per-node isotropic covariance, distinct scale per node so interpolation is
+    # non-trivial. Isotropic ⇒ off-surface σ == the isotropic scale (equal
+    # variance in every direction, normal or tangent). Keyed by layer 0 like the
+    # real pipeline's per-node ``{layer: (R,R)}``.
+    layer_subs = {0: sub}
+    node_covs = [
+        {0: (0.1 + 0.05 * k) ** 2 * torch.eye(R)}
+        for k in range(coords.shape[0])
+    ]
+    info = fit_sigma_field(layer_subs, domain, coords, node_covs, smoothing=0.0)
+    assert 0 in info and info[0]["sigma_mean"] > 0
+    assert sub.has_sigma
+    # at node 0 (coord [0,0]) the off-surface σ ≈ sqrt(iso var on normal dims)
+    # = the isotropic scale 0.1 (isotropic cov has equal var in every direction)
+    z0 = domain.embed(coords[0])
+    assert abs(float(sub.sigma_at(z0)) - 0.1) < 2e-2
+
+
+def test_sigma_field_save_load_round_trip(tmp_path: Path):
+    sub, domain = _grid_manifold()
+    _attach_constant_sigma(sub, 0.42)
+    coords = torch.tensor(
+        [[u, v] for u in (0.0, 0.5, 1.0) for v in (0.0, 0.5, 1.0)]
+    )
+    man = Manifold(
+        name="fuzzy", domain=domain,
+        node_labels=[f"n{i}" for i in range(9)],
+        node_coords=coords, layers={0: sub},
+    )
+    path = tmp_path / "fuzzy.safetensors"
+    save_manifold(man, path, {"method": "manifold_spectral"})
+    loaded = load_manifold(path)
+    lsub = loaded.layers[0]
+    assert lsub.has_sigma
+    for coord in ([0.2, 0.3], [0.8, 0.6]):
+        z = domain.embed(torch.tensor(coord))
+        assert abs(float(lsub.sigma_at(z)) - float(sub.sigma_at(z))) < 1e-4
+
+
+def test_legacy_curved_manifold_loads_without_sigma(tmp_path: Path):
+    # A curved manifold saved with no σ-field loads with σ absent (back-compat):
+    # sigma_at returns 0, soft onto degenerates to the hard collapse.
+    sub, domain = _grid_manifold()
+    coords = torch.tensor(
+        [[u, v] for u in (0.0, 0.5, 1.0) for v in (0.0, 0.5, 1.0)]
+    )
+    man = Manifold(
+        name="legacy", domain=domain,
+        node_labels=[f"n{i}" for i in range(9)],
+        node_coords=coords, layers={0: sub},
+    )
+    path = tmp_path / "legacy.safetensors"
+    save_manifold(man, path, {"method": "manifold_spectral"})
+    loaded = load_manifold(path)
+    assert not loaded.layers[0].has_sigma
+    z = domain.embed(torch.tensor([0.4, 0.4]))
+    assert float(loaded.layers[0].sigma_at(z)) == 0.0
 
 
 # ------------------------------------------------- affine (flat) subspace ---

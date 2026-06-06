@@ -160,7 +160,15 @@ Manifold subspace-fraction gates write the `:fraction` channel suffix
 (`@when:pad:fraction > 0.5`) — the share of the centered activation living
 in that manifold's subspace, in `[0, 1]`. Manifold label-similarity gates write
 the `@<label>` suffix (`@when:pad@happy > -0.1`) — the negated distance to
-a named node (larger = closer), so the natural threshold range is negative. The
+a named node (larger = closer), so the natural threshold range is negative. Two
+**fuzzy-manifold** channels join them (additive — the `@<label>` distance gate is
+untouched): the soft-assignment probability `~<label>` (`@when:personas~hacker >
+0.5`) — a normalized, in-`[0,1]` `softmax(−d²/2τ²)` membership over the nodes,
+the distributional counterpart to argmax `nearest` — and the tube-fit density
+`:membership` (`@when:pad:membership > 0.6`) — `exp(−residual²/2σ²)` under the
+fitted within-node thickness `σ(z)`, high when the activation sits inside the
+manifold's learned tube (distinguishes off-surface from on-surface-but-diffuse,
+which a hard `residual` threshold can't). The
 reserved label `neutral` (`@when:personas@neutral > -0.1`) reads the negated
 distance to the frame *anchor* (the per-model neutral mean) — every fit is
 neutral-anchored, so neutral is a point in the same whitened metric as the nodes,
@@ -283,9 +291,15 @@ subspace and applies two ops: **along** *translates* the in-subspace foot by the
 fixed `α·(target−neutral)` offset (preserving per-token spread — not a lerp onto
 the absolute target, which loop-collapses at strong push; on a curved surface it
 transports the off-surface residual `H_n` to stay normal at the new foot), with a
-per-axis κ mask collapsing ablation axes toward 0 instead; **onto** scales `H_n`
-by `(1 − o)` (vacuous when the surface fills its subspace, i.e. for every
-flat/affine term). The
+per-axis κ mask collapsing ablation axes toward 0 instead; **onto** collapses
+`H_n` toward the surface (vacuous when the surface fills its subspace, i.e. for
+every flat/affine term). With no σ-field it scales `H_n` by `(1 − o)` — `o=1`
+lands on the zero-thickness wire. With a **fuzzy-manifold σ-field**
+(`LayerSubspace.sigma_at`, curved fits only) it instead shrinks `‖H_n‖` toward the
+local within-node thickness `σ(z)` — `o=1` lands one-σ off the wire, a sample-like
+point on the surface's *typical set*, direction preserved and never expanding a
+residual already inside the tube; `σ=0` reproduces the `(1 − o)` collapse exactly.
+The
 off-subspace residual `h_perp` is always kept verbatim, which is what lets a
 vector and N orthogonal manifolds compose with zero cross-talk. A flat (affine)
 subspace takes an analytic shortcut (foot = the projected coord, no Gauss-Newton /

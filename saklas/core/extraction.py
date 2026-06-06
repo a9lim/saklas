@@ -173,10 +173,12 @@ class ManifoldExtractionPipeline:
             CustomDomain,
             Manifold,
             compute_node_centroid,
+            compute_node_reduced_covariance,
             discover_coords,
             domain_from_spec,
             fit_affine_subspace,
             fit_layer_subspace,
+            fit_sigma_field,
             invert_parameterization,
             load_manifold,
             save_manifold,
@@ -778,6 +780,39 @@ class ManifoldExtractionPipeline:
                 mu_coords = mu_centered @ sub.basis.to(torch.float32).T  # (K, R)
                 _bake_share(idx, sub, mu_coords)
 
+        # 4b. Fuzzy-manifold σ-field (curved + raw only).  A **second** fit-time
+        #     capture pass accumulates each node's within-node reduced ``(R, R)``
+        #     covariance (``compute_node_reduced_covariance`` — needs the
+        #     just-fitted per-layer basis, hence a second pass), then
+        #     ``fit_sigma_field`` reduces it to one off-surface ``σ`` per node and
+        #     fits a ``log σ`` RBF onto each ``LayerSubspace`` (mutated in place).
+        #     This gives the surface a *tube thickness* that soft-``onto`` steers
+        #     into and the monitor reads as a soft node-assignment bandwidth.
+        #     Skipped for SAE fits (the σ would mix raw activation spread with an
+        #     SAE-reconstructed mean surface) and flat fits (``H_n ≡ 0``, the tube
+        #     is vacuous) — both leave ``σ`` absent ⇒ exact zero-thickness legacy.
+        sigma_field_per_layer: dict[int, dict[str, float]] = {}
+        if effective_fit_mode != "pca" and sae_backend is None and layer_subs:
+            _progress(
+                f"Fitting within-node σ-field across {len(layer_subs)} layers "
+                f"({K} nodes, second capture pass)..."
+            )
+            node_covs: list[dict[int, torch.Tensor]] = []
+            for (label, responses), role in zip(
+                node_groups, node_roles, strict=True,
+            ):
+                node_covs.append(compute_node_reduced_covariance(
+                    model, tokenizer, layers, device, responses,
+                    baseline_prompts, layer_subs,
+                    role=role, model_type=model_type,
+                ))
+            sigma_field_per_layer = fit_sigma_field(
+                layer_subs, domain, node_coords, node_covs,
+                smoothing=(
+                    curved_smoothing if curved_smoothing is not None else "auto"
+                ),
+            )
+
         # Origin ``O_L`` — the per-layer foot of the neutral mean on ``M``, in
         # authoring coords ``(n,)``.  **Curved only** — a flat affine subspace's
         # surface fills its span, so neutral's foot is reduced-coord 0 (the
@@ -839,6 +874,15 @@ class ManifoldExtractionPipeline:
             # `manifold show`, nothing branches on it at load.
             metadata["rbf_smoothing_per_layer"] = {
                 str(idx): info for idx, info in rbf_smoothing_per_layer.items()
+            }
+        if sigma_field_per_layer:
+            # Fuzzy-manifold σ-field provenance: per-layer within-node off-surface
+            # spread summary (``sigma_mean``/``sigma_min``/``sigma_max`` + the
+            # log-σ RBF's smoothing λ).  Diagnostic — the σ-RBF tensors themselves
+            # ride the per-model safetensors; this is the inspector-facing
+            # summary.  Absent on flat / SAE / legacy fits (no tube).
+            metadata["sigma_field_per_layer"] = {
+                str(idx): info for idx, info in sigma_field_per_layer.items()
             }
         if sae_backend is not None:
             metadata["sae_release"] = sae_backend.release

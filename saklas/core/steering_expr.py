@@ -19,8 +19,10 @@ Grammar::
     probe_atom  := NAME ["." NAME] ["[" INT "]"]       # vector probe (e.g. "angry.calm"),
                                                        # optional coord-axis index
                                                        # (e.g. "personas[3]")
-                 | NAME ":" "fraction"                 # manifold subspace fraction
-                 | NAME "@" NAME                       # manifold label similarity
+                 | NAME ":" ("fraction" | "membership")  # subspace fraction /
+                                                       # fuzzy tube-fit density
+                 | NAME "@" NAME                       # manifold label similarity (−dist)
+                 | NAME "~" NAME                       # fuzzy soft-assignment prob ∈[0,1]
     op          := ">" | ">=" | "<" | "<="
     coeff       := signed_float ("," signed_float)?  # comma-run of ≤2;
                                                        # >1 value is valid
@@ -568,12 +570,15 @@ class _Parser:
             self._consume()
             suffix_tok = self._expect("IDENT")
             suffix = str(suffix_tok.value)
-            if suffix != "fraction":
+            # ``fraction`` (subspace energy share) and ``membership`` (the
+            # fuzzy-manifold tube-fit density ∈ [0,1]) are the two scalar
+            # ``:``-channels ``Monitor.flat_scalars`` emits.
+            if suffix not in ("fraction", "membership"):
                 raise SteeringExprError(
                     f"unknown manifold gate channel "
                     f"'{probe}:{suffix}'; expected "
-                    f"'<manifold>:fraction' or "
-                    f"'<manifold>@<label>'",
+                    f"'<manifold>:fraction', '<manifold>:membership', "
+                    f"'<manifold>@<label>', or '<manifold>~<label>'",
                     col=suffix_tok.col,
                 )
             probe = f"{probe}:{suffix}"
@@ -586,6 +591,15 @@ class _Parser:
             self._consume()
             label_tok = self._expect("IDENT")
             probe = f"{probe}@{label_tok.value}"
+        elif nxt == "TILDE":
+            # Fuzzy-manifold soft-assignment gate: ``<manifold>~<label>`` —
+            # fires on the node's assignment *probability* ∈ [0,1] (the
+            # normalized counterpart to the ``@<label>`` negated distance).
+            # Same verbatim-storage / ``flat_scalars`` correspondence; label
+            # existence unvalidated at parse time (stale → inactive, not raise).
+            self._consume()
+            label_tok = self._expect("IDENT")
+            probe = f"{probe}~{label_tok.value}"
         else:
             if nxt == "DOT":
                 self._consume()

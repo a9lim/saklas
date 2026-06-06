@@ -88,6 +88,23 @@ class ProbeReading:
 
     The ``*_per_layer`` maps carry the un-EV-collapsed per-layer trace of
     the same three geometric quantities (coords / fraction / residual).
+
+    **Fuzzy-manifold readout** (the soft, distributional view of ``nearest`` /
+    ``residual``):
+
+    * ``assignment`` — a soft node-assignment posterior: ``(label, prob)`` over
+      the candidate nodes (+ the neutral anchor), ``softmax(−d²_M / 2τ²)`` with a
+      per-node bandwidth ``τ`` (a curved fit's within-node σ-field mapped into the
+      whitened metric, a flat fit's local layout scale).  The *distributional*
+      counterpart to the argmax ``nearest`` — ships the shape instead of the
+      winner.  Top-N by probability, descending; sums to ≤ 1 (the reported
+      head of the full simplex).  Empty when no bandwidth is available.
+    * ``membership`` — graded tube-fit ∈ [0, 1]: ``exp(−residual² / 2σ²)`` at the
+      foot under the within-node thickness ``σ(z)``, EV-averaged.  Distinguishes
+      *off-surface* (a real residual relative to a thin tube) from
+      *on-surface-but-diffuse* — the density taper a hard ``residual`` threshold
+      can't express.  ``1.0`` for a flat fit (the surface fills its subspace) and
+      for a curved fit with no σ-field (no tube information).
     """
     fraction: float
     nearest: list[tuple[str, float]]
@@ -96,6 +113,8 @@ class ProbeReading:
     fraction_per_layer: dict[int, float] = field(default_factory=dict)
     coords_per_layer: dict[int, tuple[float, ...]] = field(default_factory=dict)
     residual_per_layer: dict[int, float] = field(default_factory=dict)
+    assignment: list[tuple[str, float]] = field(default_factory=list)
+    membership: float = 1.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -112,6 +131,8 @@ class ProbeReading:
             "residual_per_layer": {
                 str(k): float(v) for k, v in self.residual_per_layer.items()
             },
+            "assignment": [[label, prob] for label, prob in self.assignment],
+            "membership": self.membership,
         }
 
 

@@ -387,7 +387,179 @@ def test_flat_scalars_namespaces_per_probe():
     r1 = ProbeReading(fraction=0.5, nearest=[("x", 0.1)])
     r2 = ProbeReading(fraction=0.8, nearest=[("y", 0.2)])
     flat = mon.flat_scalars({"p1": r1, "p2": r2})
-    assert set(flat) == {"p1:fraction", "p1@x", "p2:fraction", "p2@y"}
+    # ``:membership`` is always emitted (defaults to 1.0); ``~<label>`` only when
+    # the reading carries a soft assignment (these have none).
+    assert set(flat) == {
+        "p1:fraction", "p1@x", "p1:membership",
+        "p2:fraction", "p2@y", "p2:membership",
+    }
+
+
+def test_flat_scalars_emits_assignment_and_membership():
+    mon = Monitor()
+    r = ProbeReading(
+        fraction=0.5, nearest=[("x", 0.1)],
+        assignment=[("x", 0.7), ("y", 0.3)], membership=0.42,
+    )
+    flat = mon.flat_scalars({"p": r})
+    assert flat["p~x"] == 0.7
+    assert flat["p~y"] == 0.3
+    assert flat["p:membership"] == 0.42
+    # distance gate untouched (additive)
+    assert flat["p@x"] == -0.1
+
+
+def _attach_const_sigma(m: "Manifold", value: float) -> None:
+    """Attach a constant-σ field to every curved layer of ``m`` (test helper)."""
+    from saklas.core.manifold import fit_rbf_smoothed
+    for sub in m.layers.values():
+        np_, _, _ = sub.rbf_params()
+        K = np_.shape[0]
+        log_sigma = torch.full((K, 1), math.log(value))
+        w, c, _ = fit_rbf_smoothed(np_, log_sigma, smoothing=0.0)
+        sub.sigma_rbf_weights = w
+        sub.sigma_poly_coeffs = c
+
+
+def _attach_per_node_sigma(m: "Manifold", sigmas: list[float]) -> None:
+    """Attach a σ-field interpolating the given per-node thicknesses (test helper)."""
+    from saklas.core.manifold import fit_rbf_smoothed
+    for sub in m.layers.values():
+        np_, _, _ = sub.rbf_params()
+        K = np_.shape[0]
+        assert K == len(sigmas)
+        log_sigma = torch.tensor(
+            [[math.log(s)] for s in sigmas], dtype=torch.float32,
+        )
+        w, c, _ = fit_rbf_smoothed(np_, log_sigma, smoothing=0.0)
+        sub.sigma_rbf_weights = w
+        sub.sigma_poly_coeffs = c
+
+
+def _curved_toy(dim: int = 8, seed: int = 0) -> "Manifold":
+    """A genuinely curved 1-D manifold (a parabola) in a rank-2 subspace.
+
+    5 nodes along ``u ∈ [-1, 1]`` placed at ``s·(u·e1 + u²·e2)`` so the surface
+    bends into the ``e2`` direction — R = 2, n = 1, so a real off-surface
+    (normal) direction exists for membership tests (unlike the near-collinear
+    ``_toy_manifold``, which collapses to rank 1).
+    """
+    torch.manual_seed(seed)
+    domain = BoxDomain([BoxAxis("u", periodic=False, lo=-1.0, hi=1.0)])
+    coords = torch.tensor([[-1.0], [-0.5], [0.0], [0.5], [1.0]])
+    u = coords.reshape(-1)
+    e1 = torch.zeros(dim); e1[0] = 1.0
+    e2 = torch.zeros(dim); e2[1] = 1.0
+    layers: dict[int, LayerSubspace] = {}
+    ev: dict[int, float] = {}
+    for layer_idx in range(2):
+        s = 1.0 + 0.5 * layer_idx
+        centroids = s * (u.unsqueeze(1) * e1 + (u ** 2).unsqueeze(1) * e2)
+        sub, ev_ratio = _fit_layer_subspace_with_ev(centroids, domain.embed(coords))
+        layers[layer_idx] = sub
+        ev[layer_idx] = ev_ratio
+    return Manifold(
+        name="curve", domain=domain,
+        node_labels=["a", "b", "c", "d", "e"],
+        node_coords=coords, layers=layers, explained_variance=ev,
+    )
+
+
+def test_soft_assignment_peaks_at_nearest_node():
+    # An activation at node 0's centroid → assignment is a valid distribution
+    # whose mass concentrates on node "a"; nearest argmax agrees.
+    m = _toy_manifold(dim=8)
+    mon = _iso_monitor(m)
+    mon.add_probe("toy", m, top_n=3)
+    hidden = {L: _node_world(m, L)[0] for L in m.layers}
+    reading = mon.score_single_token(hidden)["toy"]
+    assert reading.assignment
+    probs = [p for _, p in reading.assignment]
+    assert all(0.0 <= p <= 1.0 + 1e-6 for p in probs)
+    assert sum(probs) <= 1.0 + 1e-5            # top-N head of the simplex
+    top_label = max(reading.assignment, key=lambda kv: kv[1])[0]
+    assert top_label == "a"
+    assert reading.nearest[0][0] == "a"
+
+
+def test_soft_assignment_does_not_let_wide_node_win_from_far_away():
+    # Regression: the bare ``softmax(−d²/2τ²)`` form lets a diffuse-τ candidate
+    # swallow all the mass regardless of distance — the gemma-4-12B pad eval
+    # surfaced this with ``triumphant`` winning 99.7% despite not being in the
+    # top-4 nearest.  Fix: add the Gaussian log-volume bias ``−R·log(τ)`` to the
+    # logit (proper isotropic R-D mixture posterior).
+    #
+    # Setup: node "a" is wide (σ=2.0), all other nodes are tight (σ=0.1).  Place
+    # the query AT node "c" (the middle of the curve, far from "a").  Under the
+    # bare softmax, "a" would dominate by virtue of its wide τ; under the fixed
+    # softmax, "c" wins (the query is on it) and "a" is penalized for its
+    # log-volume.
+    m = _curved_toy(dim=8)
+    _attach_per_node_sigma(m, [2.0, 0.1, 0.1, 0.1, 0.1])  # only "a" is diffuse
+    mon = _iso_monitor(m)
+    mon.add_probe("curve", m, top_n=5)
+    at_c = {L: _node_world(m, L)[2] for L in m.layers}
+    reading = mon.score_single_token(at_c)["curve"]
+    assert reading.assignment
+    top = max(reading.assignment, key=lambda kv: kv[1])
+    assert top[0] == "c", (
+        f"broadest-node-wins regression: query at 'c' assigned to {top[0]!r} "
+        f"with mass {top[1]:.3f} — the wide-σ 'a' is dominating despite distance. "
+        f"Full assignment: {reading.assignment}"
+    )
+    a_prob = next((p for L, p in reading.assignment if L == "a"), 0.0)
+    c_prob = top[1]
+    assert c_prob > 10.0 * a_prob, (
+        f"wide-σ 'a' still has comparable mass ({a_prob:.3f}) to the true "
+        f"nearest 'c' ({c_prob:.3f}); log-volume bias not strong enough"
+    )
+
+
+def test_logvol_bias_attached_and_finite():
+    # The precomputed bias rides on the probe alongside ``assign_bandwidth``.
+    m = _curved_toy(dim=8)
+    _attach_const_sigma(m, 0.3)
+    mon = _iso_monitor(m)
+    mon.add_probe("curve", m)
+    probe = mon.attached_probes()["curve"]
+    assert probe.assign_bandwidth is not None
+    assert probe.assign_logvol_bias is not None
+    assert probe.assign_bandwidth.shape == probe.assign_logvol_bias.shape
+    assert torch.isfinite(probe.assign_logvol_bias).all()
+    # For constant τ across nodes the bias is constant too (one number repeated).
+    bias = probe.assign_logvol_bias
+    assert (bias.max() - bias.min()).abs() < 1e-5
+
+
+def test_membership_high_on_surface_low_off_tube():
+    # With a σ-field, membership is ~1 on the surface and collapses far off it.
+    m = _curved_toy(dim=8)
+    _attach_const_sigma(m, 0.3)
+    mon = _iso_monitor(m)
+    mon.add_probe("curve", m)
+    on = {L: _node_world(m, L)[2] for L in m.layers}   # node "c", on-surface
+    mem_on = mon.score_single_token(on)["curve"].membership
+    assert mem_on > 0.9
+    # push along basis row 1 (≈ the surface normal at the apex) → off-tube
+    off = {
+        L: _node_world(m, L)[2] + 5.0 * sub.basis[1]
+        for L, sub in m.layers.items()
+    }
+    mem_off = mon.score_single_token(off)["curve"].membership
+    assert mem_off < 0.5
+    assert mem_off < mem_on
+
+
+def test_membership_one_without_sigma_field():
+    # No σ-field → no tube → membership defaults to 1.0 even far off-surface.
+    m = _curved_toy(dim=8)
+    mon = _iso_monitor(m)
+    mon.add_probe("curve", m)
+    off = {
+        L: _node_world(m, L)[2] + 5.0 * sub.basis[1]
+        for L, sub in m.layers.items()
+    }
+    assert mon.score_single_token(off)["curve"].membership == pytest.approx(1.0)
 
 
 # ============================================== inverse_projection / aggregate ===
