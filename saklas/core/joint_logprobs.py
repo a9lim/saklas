@@ -522,6 +522,16 @@ def _replay_branch_logprobs(
                 dtype=torch.long,
                 device=device,
             )
+            forced_tensor = torch.tensor(
+                [forced_ids],
+                dtype=torch.long,
+                device=device,
+            )
+            attn_mask_buf = torch.ones(
+                (1, current_input.shape[1] + max(len(forced_ids), 1)),
+                dtype=torch.long,
+                device=device,
+            )
             past_key_values = None
             no_cache_mode = False
             no_cache_buf: torch.Tensor | None = None
@@ -553,7 +563,9 @@ def _replay_branch_logprobs(
                     if past_key_values is not None and not no_cache_mode:
                         kwargs["past_key_values"] = past_key_values
                     if prefill or no_cache_mode:
-                        kwargs["attention_mask"] = torch.ones_like(current_input)
+                        kwargs["attention_mask"] = attn_mask_buf[
+                            :, :current_input.shape[1]
+                        ]
 
                     outputs = _call_model(model, **kwargs)
                     prefill = False
@@ -593,7 +605,7 @@ def _replay_branch_logprobs(
                     if penalty_state is not None:
                         penalty_state.add(token_id)
 
-                    next_token = torch.tensor([[int(token_id)]], dtype=torch.long, device=device)
+                    next_token = forced_tensor[:, forced_idx:forced_idx + 1]
                     _advance_current_input(next_token)
         finally:
             if end_capture is not None:
