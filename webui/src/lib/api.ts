@@ -10,6 +10,7 @@ import type {
   CorrelationData,
   CreateDiscoverManifoldRequest,
   CreateManifoldRequest,
+  CreateTemplatedManifoldRequest,
   ExperimentFanRequest,
   ExperimentFanResponse,
   ExtractRequest,
@@ -52,6 +53,7 @@ export type {
   CorrelationData,
   CreateDiscoverManifoldRequest,
   CreateManifoldRequest,
+  CreateTemplatedManifoldRequest,
   FitManifoldRequest,
   GenerateManifoldRequest,
   ExperimentFanRequest,
@@ -361,6 +363,14 @@ export const apiManifolds = {
     req: CreateDiscoverManifoldRequest,
   ): Promise<ManifoldInfo> {
     return request(`${MANIFOLDS_BASE}/discover`, jsonBody(req));
+  },
+  /** Create a templated discover manifold — slot + values + chat-turn
+   *  templates, expanded server-side into per-value node corpora. Pair with
+   *  ``apiManifoldFitStream`` to fit. */
+  createTemplated(
+    req: CreateTemplatedManifoldRequest,
+  ): Promise<ManifoldInfo> {
+    return request(`${MANIFOLDS_BASE}/templated`, jsonBody(req));
   },
   update(
     namespace: string,

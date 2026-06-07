@@ -1030,6 +1030,44 @@ class TestManifoldRoutes:
         assert client.post("/saklas/v1/manifolds",
                            json=_box1d_payload()).status_code == 409
 
+    def test_create_templated(self, session_and_client: Any, tmp_path: Any,
+                              monkeypatch: Any) -> None:
+        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+        _session, client = session_and_client
+        payload = {
+            "name": "weekday",
+            "fit_mode": "auto",
+            "slot": "[DAY]",
+            "values": ["Monday", "Tuesday", "Wednesday"],
+            "pairs": [
+                {"user": "what day is it?", "assistant": "today is [DAY]"},
+                {"user": "which day?", "assistant": "it's [DAY]"},
+            ],
+        }
+        resp = client.post("/saklas/v1/manifolds/templated", json=payload)
+        assert resp.status_code == 201, resp.text
+        body = resp.json()
+        assert body["name"] == "weekday"
+        assert body["fit_mode"] == "auto"
+        assert body["node_labels"] == ["monday", "tuesday", "wednesday"]
+
+        detail = client.get("/saklas/v1/manifolds/local/weekday").json()
+        monday = next(n for n in detail["nodes"] if n["label"] == "monday")
+        assert monday["statements"] == ["today is Monday", "it's Monday"]
+
+    def test_create_templated_slot_in_user_rejected(
+        self, session_and_client: Any, tmp_path: Any, monkeypatch: Any,
+    ) -> None:
+        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+        _session, client = session_and_client
+        resp = client.post("/saklas/v1/manifolds/templated", json={
+            "name": "bad",
+            "slot": "[DAY]",
+            "values": ["Monday", "Tuesday"],
+            "pairs": [{"user": "is it [DAY]?", "assistant": "yes [DAY]"}],
+        })
+        assert resp.status_code == 400
+
     def test_create_too_few_nodes(self, session_and_client: Any, tmp_path: Any,
                                   monkeypatch: Any) -> None:
         monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))

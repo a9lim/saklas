@@ -168,6 +168,81 @@ def test_parse_manifold_refresh():
     assert args.model is None
 
 
+def test_parse_manifold_template():
+    args = cli.parse_args([
+        "manifold", "template", "weekday",
+        "--slot", "[DAY]",
+        "--values", "Monday", "Tuesday", "Sunday",
+        "--pairs-file", "/tmp/pairs.json",
+        "--fit-mode", "auto", "--max-dim", "3", "-f",
+    ])
+    assert args.manifold_cmd == "template"
+    assert args.name == "weekday"
+    assert args.slot == "[DAY]"
+    assert args.values == ["Monday", "Tuesday", "Sunday"]
+    assert args.pairs_file == "/tmp/pairs.json"
+    assert args.fit_mode == "auto"
+    assert args.max_dim == 3
+    assert args.force is True
+
+
+def test_parse_manifold_template_fit_mode_default_auto():
+    args = cli.parse_args([
+        "manifold", "template", "weekday",
+        "--slot", "[DAY]", "--values", "Monday", "Tuesday",
+        "--pairs-file", "/tmp/pairs.json",
+    ])
+    assert args.fit_mode == "auto"
+    assert args.max_dim is None
+
+
+def test_run_manifold_template_writes_folder(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+):
+    """End-to-end: the runner expands the template into a discover folder."""
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    pairs_file = tmp_path / "pairs.json"
+    pairs_file.write_text(_json.dumps([
+        {"user": "what day is it?", "assistant": "today is [DAY]"},
+        {"user": "which day?", "assistant": "it's [DAY]"},
+    ]))
+    cli.main([
+        "manifold", "template", "weekday",
+        "--slot", "[DAY]",
+        "--values", "Monday", "Tuesday", "Wednesday",
+        "--pairs-file", str(pairs_file),
+        "--fit-mode", "auto",
+    ])
+    out = capsys.readouterr().out
+    assert "3 nodes x 2 templates" in out
+
+    from saklas.io.manifolds import ManifoldFolder
+    from saklas.io.paths import manifold_dir
+    mf = ManifoldFolder.load(manifold_dir("local", "weekday"))
+    assert mf.fit_mode == "auto"
+    assert mf.node_labels == ["monday", "tuesday", "wednesday"]
+    assert mf.template is not None
+    assert [p["user"] for p in mf.template["pairs"]] == [
+        "what day is it?", "which day?",
+    ]
+    assert dict(mf.node_groups())["monday"] == ["today is Monday", "it's Monday"]
+
+
+def test_run_manifold_template_bad_pairs_file_exits(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+):
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    bad = tmp_path / "bad.json"
+    bad.write_text(_json.dumps({"not": "a list"}))
+    with pytest.raises(SystemExit):
+        cli.main([
+            "manifold", "template", "weekday",
+            "--slot", "[DAY]", "--values", "Monday", "Tuesday",
+            "--pairs-file", str(bad),
+        ])
+
+
 def test_parse_manifold_transfer():
     args = cli.parse_args([
         "manifold", "transfer", "circumplex",

@@ -440,6 +440,17 @@ class ManifoldFolder:
     # Optional/additive — the
     # loader defaults ``[]``; a tagless manifold stays byte-identical.
     tags: list[str] = field(default_factory=list)
+    # Templated-corpus provenance + the per-manifold elicitation prompt set.
+    # A *templated* discover manifold's node corpora are slot-filled assistant
+    # turns (``today is monday``); this block records the authoring template
+    # ``{slot, values, pairs:[{user, assistant}]}`` so the folder can be
+    # re-expanded, and — load-bearing at fit time — supplies the user turns the
+    # fit pools each filled response against (``pairs[*].user``, the template
+    # analogue of the shared baseline prompts). ``None`` for every non-templated
+    # manifold, which keeps their manifest byte-identical to the pre-template
+    # shape. Folded into ``nodes_sha256`` (a template edit re-fits) and
+    # preserved across re-fits by ``write_metadata``.
+    template: dict[str, Any] | None = None
     # tensor stem (``<safe_model>`` or ``<safe_model>_sae-<rel>``) -> sidecar.
     _sidecars: dict[str, ManifoldSidecar] = field(default_factory=dict)
 
@@ -673,6 +684,22 @@ class ManifoldFolder:
                 f"manifold {name!r} 'tags' must be a list of strings"
             )
 
+        # Optional templated-corpus block — present only on templated discover
+        # manifolds, validated/normalized into the canonical shape so a
+        # corrupt manifest surfaces as ManifoldFormatError (not a later KeyError
+        # in the fit). Only discover folders may carry it (the prompt set is a
+        # fit-time input; authored/baked folders have no centroid pooling).
+        raw_template = data.get("template")
+        template: dict[str, Any] | None = None
+        if raw_template is not None:
+            if fit_mode not in _FIT_MODES_DISCOVER:
+                raise ManifoldFormatError(
+                    f"manifold {name!r} carries a 'template' block but "
+                    f"fit_mode is {fit_mode!r}; templated corpora are a "
+                    f"discover-mode feature ({sorted(_FIT_MODES_DISCOVER)})"
+                )
+            template = _validate_template_block(name, raw_template)
+
         inst = cls(
             folder=folder,
             name=name,
@@ -687,6 +714,7 @@ class ManifoldFolder:
             node_roles=node_roles,
             node_kinds=node_kinds,
             tags=[str(t) for t in raw_tags],
+            template=template,
         )
 
         # Every node file must be present — except for a baked manifold,
@@ -804,6 +832,14 @@ class ManifoldFolder:
         # missing field (same legacy shape).
         if any(k is not None for k in self.node_kinds):
             h.update(_canonical_json(self.node_kinds))
+        # The templated block's ``pairs[*].user`` are the fit's elicitation
+        # prompts and its ``pairs[*].assistant`` regenerate the node corpora,
+        # so any template edit must invalidate a cached fit. (Assistant edits
+        # also change the node files above; folding the whole block additionally
+        # catches user-turn edits, which live only here.) ``None`` (every
+        # non-templated manifold) hashes identically to a missing field.
+        if self.template is not None:
+            h.update(_canonical_json(self.template))
         return h.hexdigest()
 
     # -- fitted tensors ----------------------------------------------------
@@ -848,6 +884,12 @@ class ManifoldFolder:
         # tagless manifold stays byte-identical to the pre-tags shape.
         if self.tags:
             payload["tags"] = list(self.tags)
+        # The templated-corpus block is a fit input (its user turns are the
+        # elicitation prompts), so it must survive the post-fit manifest
+        # rewrite — written only when set, keeping non-templated manifests
+        # byte-identical.
+        if self.template is not None:
+            payload["template"] = self.template
         # Per-node ``role`` is written only when set — keeps the legacy
         # shape (every node carries ``{label, coords}`` or ``{label}``
         # only) byte-identical for non-role manifolds, and a stray
@@ -1216,6 +1258,162 @@ def _validate_discover_labels(name: str, labels: object) -> list[str]:
     return out
 
 
+def _slug_value(value: str) -> str:
+    """Slug a template value to a node label (mirrors ``core.session._slug``).
+
+    ``[^a-z0-9]+ -> _`` over the lowercased value, trimmed of edge
+    underscores — ``"New York" -> "new_york"``, ``"Monday" -> "monday"`` —
+    so the label a user steers (``weekday%monday``) matches the value typed.
+    """
+    return re.sub(r"[^a-z0-9]+", "_", value.strip().lower()).strip("_")
+
+
+def _validate_template_block(name: str, block: object) -> dict[str, Any]:
+    """Validate + normalize a manifold.json ``template`` block.
+
+    Shape: ``{slot: str, values: [str, ...], pairs: [{user, assistant}, ...]}``.
+    The block is a templated manifold's re-expansion provenance *and* its
+    per-manifold elicitation prompt set — ``pairs[*].user`` are the user turns
+    the fit pools each node's slot-filled assistant response against (the
+    template analogue of the shared baseline prompts). v1 invariant: the slot
+    appears in every assistant turn (the value is read off the assistant's last
+    content token) and in no user turn (user turns are common-mode, shared
+    across nodes). Returns the canonical block; raises
+    :class:`ManifoldFormatError` on any shape/invariant violation.
+    """
+    if not isinstance(block, dict):
+        raise ManifoldFormatError(
+            f"templated manifold {name!r} 'template' must be an object"
+        )
+    slot = block.get("slot")
+    if not isinstance(slot, str) or not slot:
+        raise ManifoldFormatError(
+            f"templated manifold {name!r} template 'slot' must be a "
+            f"non-empty string"
+        )
+    values = block.get("values")
+    if (
+        not isinstance(values, list)
+        or len(values) < 2
+        or not all(isinstance(v, str) and v.strip() for v in values)
+    ):
+        raise ManifoldFormatError(
+            f"templated manifold {name!r} template 'values' must be a list of "
+            f">= 2 non-blank strings (one node per value)"
+        )
+    pairs = block.get("pairs")
+    if not isinstance(pairs, list) or not pairs:
+        raise ManifoldFormatError(
+            f"templated manifold {name!r} template 'pairs' must be a "
+            f"non-empty list of {{user, assistant}} objects"
+        )
+    norm_pairs: list[dict[str, str]] = []
+    for i, pair in enumerate(pairs):
+        if not isinstance(pair, dict):
+            raise ManifoldFormatError(
+                f"templated manifold {name!r} template pair {i} must be an "
+                f"object with 'user' and 'assistant'"
+            )
+        user = pair.get("user")
+        assistant = pair.get("assistant")
+        if not isinstance(user, str) or not user.strip():
+            raise ManifoldFormatError(
+                f"templated manifold {name!r} template pair {i} 'user' must "
+                f"be a non-blank string"
+            )
+        if not isinstance(assistant, str) or not assistant.strip():
+            raise ManifoldFormatError(
+                f"templated manifold {name!r} template pair {i} 'assistant' "
+                f"must be a non-blank string"
+            )
+        if slot not in assistant:
+            raise ManifoldFormatError(
+                f"templated manifold {name!r} template pair {i} 'assistant' "
+                f"must contain the slot {slot!r} — the value is read off the "
+                f"assistant turn's last content token"
+            )
+        if slot in user:
+            raise ManifoldFormatError(
+                f"templated manifold {name!r} template pair {i} 'user' must "
+                f"not contain the slot {slot!r}: v1 user turns are shared "
+                f"common-mode across nodes, so put the slot only in the "
+                f"assistant turn"
+            )
+        norm_pairs.append({"user": user, "assistant": assistant})
+    return {"slot": slot, "values": [str(v) for v in values], "pairs": norm_pairs}
+
+
+def expand_template(
+    slot: str,
+    pairs: list[dict[str, str]],
+    values: list[str],
+    *,
+    name: str = "<templated>",
+) -> tuple[dict[str, list[str]], dict[str, Any]]:
+    """Expand a ``(slot, pairs, values)`` template into discover node corpora.
+
+    Returns ``(node_corpora, template_block)``: ``node_corpora`` maps each
+    value's slug label to the list of slot-filled assistant turns (its discover
+    node corpus, one entry per template, so the corpus length equals the number
+    of templates — the per-node sample count); ``template_block`` is the
+    validated, canonical block stored in ``manifold.json``. The raw (as-typed)
+    value is what gets substituted into the text — ``"Monday" -> "today is
+    Monday"`` — while the node label is its slug. Pure + side-effect free, so it
+    is the unit-test seam under :func:`create_templated_manifold_folder`.
+    """
+    block = _validate_template_block(
+        name, {"slot": slot, "values": values, "pairs": pairs},
+    )
+    node_corpora: dict[str, list[str]] = {}
+    for value in block["values"]:
+        label = _slug_value(value)
+        if not _LABEL_REGEX.match(label):
+            raise ManifoldFormatError(
+                f"templated manifold {name!r} value {value!r} slugs to "
+                f"{label!r}, which is not a valid node label "
+                f"(must match {_LABEL_REGEX.pattern})"
+            )
+        if label in node_corpora:
+            raise ManifoldFormatError(
+                f"templated manifold {name!r} value {value!r} (label "
+                f"{label!r}) collides with another value's label"
+            )
+        node_corpora[label] = [
+            pair["assistant"].replace(block["slot"], value)
+            for pair in block["pairs"]
+        ]
+    return node_corpora, block
+
+
+def create_templated_manifold_folder(
+    namespace: str,
+    name: str,
+    description: str,
+    *,
+    fit_mode: str,
+    slot: str,
+    pairs: list[dict[str, str]],
+    values: list[str],
+    hyperparams: Optional[dict[str, Any]] = None,
+) -> Path:
+    """Author a templated discover manifold folder.
+
+    Expands ``(slot, pairs, values)`` into per-value node corpora (the
+    slot-filled assistant turns) and writes a discover folder carrying the
+    ``template`` block — re-expansion provenance plus the per-manifold
+    elicitation prompt set (``pairs[*].user``) the fit pools against. A thin
+    wrapper over :func:`expand_template` + :func:`create_discover_manifold_folder`.
+    """
+    node_corpora, block = expand_template(slot, pairs, values, name=name)
+    return create_discover_manifold_folder(
+        namespace, name, description,
+        fit_mode=fit_mode,
+        node_corpora=node_corpora,
+        hyperparams=hyperparams,
+        template=block,
+    )
+
+
 def create_discover_manifold_folder(
     namespace: str,
     name: str,
@@ -1227,6 +1425,7 @@ def create_discover_manifold_folder(
     node_roles: Optional[dict[str, str | None]] = None,
     node_kinds: Optional[dict[str, str | None]] = None,
     scenarios: Optional[list[str]] = None,
+    template: Optional[dict[str, Any]] = None,
 ) -> Path:
     """Author a fresh discover-mode manifold artifact folder on disk.
 
@@ -1271,6 +1470,10 @@ def create_discover_manifold_folder(
             f"expected one of {sorted(_FIT_MODES_DISCOVER)}"
         )
     _validate_discover_corpora(name, node_corpora)
+    # Normalize the optional templated block before any folder is written, so
+    # a malformed template fails cleanly with no half-built folder.
+    if template is not None:
+        template = _validate_template_block(name, template)
     # Validate the optional ``node_roles`` mapping up front, before any
     # corpus is written — keeps the failure mode consistent (no
     # half-built folder on a bad role slug).  Extra keys outside the
@@ -1324,6 +1527,8 @@ def create_discover_manifold_folder(
         ],
         "files": {},
     }
+    if template is not None:
+        payload["template"] = template
     write_json_atomic(folder / "manifold.json", payload)
     if scenarios is not None:
         write_manifold_scenarios(folder, scenarios)

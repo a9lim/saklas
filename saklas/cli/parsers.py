@@ -76,6 +76,7 @@ def _add_logit_args(p: argparse.ArgumentParser) -> None:
 _MANIFOLD_VERBS: list[tuple[str, str]] = [
     ("extract",   "Extract a steering vector (a 2-node flat subspace)"),
     ("generate",  "Author a discover-mode manifold from a concept list"),
+    ("template",  "Author a templated discover manifold (slot + values)"),
     ("fit",       "Fit an authored or discover-mode manifold"),
     ("bake",      "Bake existing vectors into a new manifold"),
     ("merge",     "Union discover-mode manifolds' nodes into a new manifold"),
@@ -405,6 +406,52 @@ def _build_manifold_generate(generate: argparse.ArgumentParser) -> None:
     generate.set_defaults(quantize=None, device="auto", probes=None)
 
 
+def _build_manifold_template(template: argparse.ArgumentParser) -> None:
+    template.add_argument("name", help="Manifold name (use ns/name for non-local)")
+    template.add_argument(
+        "--slot", required=True, metavar="TOKEN",
+        help="The placeholder substituted per value, e.g. '[DAY]'. Must appear "
+             "in every assistant turn and in no user turn.",
+    )
+    template.add_argument(
+        "--values", nargs="+", required=True, metavar="VALUE",
+        help="Slot values, one node per value (>= 2). The raw value is "
+             "substituted into the text; its slug is the node label "
+             "('New York' -> node 'new_york').",
+    )
+    template.add_argument(
+        "--pairs-file", dest="pairs_file", required=True, metavar="PATH",
+        help="JSON file: a list of {\"user\": ..., \"assistant\": ...} chat-turn "
+             "templates (the slot lives in the assistant turn). More templates "
+             "= more samples per node; aim for ~10-50.",
+    )
+    template.add_argument(
+        "--fit-mode", dest="fit_mode",
+        choices=("pca", "spectral", "auto"), default="auto",
+        help="Discover fit mode written into the folder (default: auto — lets "
+             "the fit pick flat/curved + detect periodic axes, the right "
+             "default for cyclic categories like days/months).",
+    )
+    template.add_argument(
+        "--max-dim", dest="max_dim", type=int, default=None, metavar="N",
+        help="Cap the discovered intrinsic dimension (optional; overridable "
+             "later on `manifold fit`).",
+    )
+    template.add_argument(
+        "--var-threshold", dest="var_threshold", type=float, default=None,
+        metavar="T",
+        help="PCA cumulative-variance threshold for dim selection (optional).",
+    )
+    template.add_argument(
+        "--description", default="", metavar="TEXT",
+        help="Human-readable description for the manifold folder",
+    )
+    template.add_argument(
+        "-f", "--force", action="store_true",
+        help="Overwrite an existing manifold folder",
+    )
+
+
 def _build_manifold_merge(merge: argparse.ArgumentParser) -> None:
     merge.add_argument("name", help="New manifold name (or ns/name)")
     merge.add_argument(
@@ -568,6 +615,19 @@ _MANIFOLD_DESCRIPTIONS: dict[str, str] = {
         "across nodes, so the per-concept centroids stay comparable "
         "(response[i] aligns to baseline prompt[i % k])."
     ),
+    "template": (
+        "Author a *templated* discover manifold: supply a slot token (e.g. "
+        "'[DAY]'), a list of values (one node per value), and a JSON file of "
+        "{user, assistant} chat-turn templates with the slot in the assistant "
+        "turn. Each value fills the slot across every template, so the node "
+        "corpora are the slot-filled assistant turns and the template's user "
+        "turns become the per-manifold elicitation prompts the fit pools "
+        "against. The right tool for categories you reference rather than "
+        "embody — days, months, colours, directions — where 'someone {c}' "
+        "makes no sense. Deterministic (no model load); run `saklas manifold "
+        "fit <name> -m MODEL` next. fit_mode auto suits cyclic categories "
+        "(days/months) — the fit detects the loop."
+    ),
     "fit": (
         "Pool per-node centroids, fit a per-layer PCA subspace (+ RBF "
         "interpolant for curved manifolds), and write the per-model manifold "
@@ -610,6 +670,7 @@ _MANIFOLD_DESCRIPTIONS: dict[str, str] = {
 _MANIFOLD_BUILDERS = {
     "extract":  _build_vector_extract,
     "generate": _build_manifold_generate,
+    "template": _build_manifold_template,
     "fit":      _build_manifold_fit,
     "bake":     _build_vector_merge,
     "merge":    _build_manifold_merge,

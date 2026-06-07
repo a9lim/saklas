@@ -1621,6 +1621,79 @@ def _run_manifold_generate(args: argparse.Namespace) -> None:
     print(f"  -> run `saklas manifold fit {namespace}/{name}` to fit")
 
 
+def _run_manifold_template(args: argparse.Namespace) -> None:
+    """``saklas manifold template`` — author a templated discover folder.
+
+    Pure-IO (no model): reads the ``--pairs-file`` chat-turn templates, expands
+    ``--slot`` across ``--values`` into per-value node corpora (the slot-filled
+    assistant turns), and writes a discover folder carrying the ``template``
+    block (re-expansion provenance + the user-turn prompt set the fit pools
+    against). Mirrors the ``generate``→``fit`` split — fit it next with
+    ``saklas manifold fit <name> -m MODEL``.
+    """
+    import json as _json
+
+    from saklas.io.manifolds import (
+        ManifoldFormatError,
+        create_templated_manifold_folder,
+    )
+    from saklas.io.paths import manifold_dir
+
+    try:
+        with open(args.pairs_file) as f:
+            pairs = _json.load(f)
+    except (OSError, ValueError) as e:
+        print(f"manifold template: cannot read --pairs-file: {e}", file=sys.stderr)
+        sys.exit(1)
+    if not isinstance(pairs, list) or not all(isinstance(p, dict) for p in pairs):
+        print(
+            "manifold template: --pairs-file must be a JSON list of "
+            '{"user": ..., "assistant": ...} objects',
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    namespace, name = _split_manifold_ns_name(args.name)
+    folder = manifold_dir(namespace, name)
+    if args.force and (folder / "manifold.json").exists():
+        import shutil
+        shutil.rmtree(folder)
+
+    hyperparams: dict[str, object] = {}
+    if args.max_dim is not None:
+        hyperparams["max_dim"] = args.max_dim
+    if args.var_threshold is not None:
+        hyperparams["var_threshold"] = args.var_threshold
+
+    try:
+        create_templated_manifold_folder(
+            namespace, name, args.description,
+            fit_mode=args.fit_mode,
+            slot=args.slot,
+            pairs=pairs,
+            values=list(args.values),
+            hyperparams=hyperparams or None,
+        )
+    except FileExistsError:
+        print(
+            f"manifold template: {namespace}/{name} already exists "
+            f"-- pass -f/--force to overwrite",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    except ManifoldFormatError as e:
+        print(f"manifold template failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    n_nodes = len(args.values)
+    n_templates = len(pairs)
+    print(
+        f"wrote {namespace}/{name} ({n_nodes} nodes x {n_templates} "
+        f"templates, fit_mode={args.fit_mode})"
+    )
+    print(f"  -> run `saklas manifold fit {namespace}/{name} -m MODEL` to fit")
+
+
 def _split_manifold_ns_name(raw: str) -> tuple[str, str]:
     """Split a CLI-supplied manifold selector into ``(namespace, name)``.
 
@@ -1953,6 +2026,7 @@ def _run_pack_export(args: argparse.Namespace) -> None:
 _MANIFOLD_RUNNERS = {
     "extract":  _run_manifold_extract,
     "generate": _run_manifold_generate,
+    "template": _run_manifold_template,
     "fit":      _run_manifold_fit,
     "bake":     _run_manifold_bake,
     "merge":    _run_manifold_merge,

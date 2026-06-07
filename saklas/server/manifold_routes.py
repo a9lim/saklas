@@ -38,6 +38,7 @@ from saklas.io.manifolds import (
     append_discover_manifold_node,
     create_discover_manifold_folder,
     create_manifold_folder,
+    create_templated_manifold_folder,
     domain_label,
     iter_manifold_folders,
     manifold_summary,
@@ -117,6 +118,36 @@ class CreateDiscoverManifoldRequest(BaseModel):
     description: str = ""
     fit_mode: Literal["pca", "spectral", "auto"] = "pca"
     nodes: list[DiscoverNodeSpec]
+    hyperparams: dict[str, Any] = {}
+
+
+class TemplatePairSpec(BaseModel):
+    """One ``{user, assistant}`` chat-turn template. The slot lives in the
+    assistant turn (read off its last content token); the user turn is shared
+    common-mode across nodes (no slot)."""
+
+    user: str
+    assistant: str
+
+
+class CreateTemplatedManifoldRequest(BaseModel):
+    """Author a templated discover manifold from a slot + values + pair set.
+
+    The server expands ``slot`` across ``values`` into per-value node corpora
+    (the slot-filled assistant turns) and writes a discover folder carrying the
+    ``template`` block — re-expansion provenance plus the user-turn elicitation
+    prompts the fit pools against. The right tool for categories one references
+    rather than embodies (days, months, colours, directions). Pair with
+    ``POST .../fit`` (``fit_mode`` auto suits cyclic categories).
+    """
+
+    namespace: str = "local"
+    name: str
+    description: str = ""
+    fit_mode: Literal["pca", "spectral", "auto"] = "auto"
+    slot: str
+    values: list[str]
+    pairs: list[TemplatePairSpec]
     hyperparams: dict[str, Any] = {}
 
 
@@ -501,6 +532,32 @@ def register_manifold_routes(app: FastAPI) -> None:
                 node_corpora=node_corpora,
                 hyperparams=req.hyperparams,
                 node_roles=node_roles_map,
+            )
+        except FileExistsError as e:
+            raise HTTPException(409, str(e)) from e
+        except ManifoldFormatError as e:
+            raise HTTPException(400, str(e)) from e
+        mf = ManifoldFolder.load(folder)
+        return _manifold_json(req.namespace, mf, session, full=True)
+
+    @app.post("/saklas/v1/manifolds/templated", status_code=201)
+    def create_templated_manifold(req: CreateTemplatedManifoldRequest):
+        """Author a fresh templated discover manifold from a slot + values.
+
+        Expands ``slot`` across ``values`` into per-value node corpora (the
+        slot-filled assistant turns) and writes a discover folder with the
+        ``template`` block.  Pair with ``POST /saklas/v1/manifolds/{ns}/{name}/
+        fit`` to run discovery + fit.
+        """
+        pairs = [{"user": p.user, "assistant": p.assistant} for p in req.pairs]
+        try:
+            folder = create_templated_manifold_folder(
+                req.namespace, req.name, req.description,
+                fit_mode=req.fit_mode,
+                slot=req.slot,
+                pairs=pairs,
+                values=list(req.values),
+                hyperparams=req.hyperparams or None,
             )
         except FileExistsError as e:
             raise HTTPException(409, str(e)) from e

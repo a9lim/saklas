@@ -303,7 +303,17 @@ class ManifoldExtractionPipeline:
         #    a ``None`` role pools under the standard assistant (swap-back)
         #    baseline.
         from saklas.core.vectors import _load_baseline_prompts
-        baseline_prompts = _load_baseline_prompts()
+        # Templated manifolds carry their own elicitation prompt set — the
+        # template's user turns — pooled 1:1 against each node's slot-filled
+        # assistant responses (corpus length == #templates == #user turns, so
+        # ``response[i] -> user[i]``). This keeps capture rendering the real
+        # ``[user: "what day is it?", assistant: "today is monday"]`` turn
+        # rather than gluing the day statement onto an unrelated global baseline
+        # prompt. A non-templated discover/A2 folder uses the shared globals.
+        if mf.template is not None:
+            baseline_prompts = [p["user"] for p in mf.template["pairs"]]
+        else:
+            baseline_prompts = _load_baseline_prompts()
         per_node: list[dict[int, torch.Tensor]] = []
         for (label, responses), role in zip(node_groups, node_roles, strict=True):
             role_note = f" [role={role}]" if role else ""

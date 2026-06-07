@@ -31,6 +31,7 @@
     AxisSpec,
     CreateDiscoverManifoldRequest,
     CreateManifoldRequest,
+    CreateTemplatedManifoldRequest,
     GenerateManifoldRequest,
     ManifoldDomain,
   } from "../lib/types";
@@ -59,7 +60,14 @@
   // Both build into the same on-disk manifold artifact; the mode shows
   // up as ``manifold.json::fit_mode``.  Inspector + steering paths are
   // unchanged from there on.
-  type AuthoringMode = "authored" | "discover";
+  //   * Templated — user gives a slot token, a list of values (one node
+  //                 each), and a set of {user, assistant} chat-turn
+  //                 templates with the slot in the assistant turn; the
+  //                 slot is filled per value (deterministic, no model) and
+  //                 the templates' user turns become the per-manifold
+  //                 elicitation prompts. The tool for categories one
+  //                 references rather than embodies (days, months, …).
+  type AuthoringMode = "authored" | "discover" | "templated";
   let authoringMode: AuthoringMode = $state("authored");
 
   // ---------- custom-nodes auto-domain switch ----------
@@ -588,6 +596,159 @@
     }
   }
 
+  // ============================================================ templated ===
+  //
+  // Slot + values + chat-turn templates. The slot fills (deterministically,
+  // no model) across every template's assistant turn, so each value's node
+  // corpus is the slot-filled assistant turns; the templates' user turns
+  // become the per-manifold elicitation prompts the fit pools against.
+  type TemplatedFitMode = "pca" | "spectral" | "auto";
+  let templatedFitMode: TemplatedFitMode = $state("auto");
+  let templatedSlot = $state("[DAY]");
+  let templatedValuesText = $state("");
+  let templatedPairs = $state<{ user: string; assistant: string }[]>([
+    { user: "what day is it?", assistant: "today is [DAY]" },
+  ]);
+  let templatedMaxDim: number | null = $state(null);
+  let advancedTemplatedOpen = $state(false);
+
+  const templatedValues = $derived(parseConcepts(templatedValuesText));
+
+  function addTemplatedPair(): void {
+    templatedPairs = [...templatedPairs, { user: "", assistant: "" }];
+  }
+  function removeTemplatedPair(i: number): void {
+    templatedPairs = templatedPairs.filter((_, idx) => idx !== i);
+  }
+  function nonEmptyTemplatedPairs(): { user: string; assistant: string }[] {
+    return templatedPairs.filter((p) => p.user.trim() || p.assistant.trim());
+  }
+
+  const templatedValidation = $derived.by<{
+    ok: boolean;
+    messages: string[];
+  }>(() => {
+    const messages: string[] = [];
+    if (!slug(manifoldName)) messages.push("a manifold name is required");
+    const sl = templatedSlot.trim();
+    if (!sl) messages.push("a slot token is required (e.g. [DAY])");
+    if (templatedValues.length < 2) {
+      messages.push(
+        `need >= 2 values (have ${templatedValues.length}) — one node per value`,
+      );
+    }
+    const seen = new Set<string>();
+    for (const v of templatedValues) {
+      const s = slug(v);
+      if (!s) messages.push(`value "${v}" has no valid label slug`);
+      else if (seen.has(s)) messages.push(`duplicate value label: "${s}"`);
+      else seen.add(s);
+    }
+    const pairs = nonEmptyTemplatedPairs();
+    if (pairs.length === 0) messages.push("need at least one template");
+    pairs.forEach((p, i) => {
+      if (!p.user.trim()) messages.push(`template ${i + 1}: user turn is empty`);
+      if (!p.assistant.trim()) {
+        messages.push(`template ${i + 1}: assistant turn is empty`);
+      } else if (sl && !p.assistant.includes(sl)) {
+        messages.push(
+          `template ${i + 1}: assistant turn must contain the slot ${sl}`,
+        );
+      }
+      if (sl && p.user.includes(sl)) {
+        messages.push(
+          `template ${i + 1}: user turn must not contain the slot ` +
+          "(user turns are shared common-mode across nodes)",
+        );
+      }
+    });
+    if (templatedMaxDim !== null && templatedMaxDim < 1) {
+      messages.push("max_dim must be >= 1");
+    }
+    return { ok: messages.length === 0, messages };
+  });
+
+  async function templatedSave(): Promise<void> {
+    if (!templatedValidation.ok || submitting) return;
+    submitting = true;
+    const namespaceSlug = slug(namespace) || "local";
+    const nameSlug = slug(manifoldName);
+    const hyperparams: Record<string, number> = {};
+    if (templatedMaxDim !== null && templatedMaxDim >= 1) {
+      hyperparams.max_dim = templatedMaxDim;
+    }
+    const req: CreateTemplatedManifoldRequest = {
+      namespace: namespaceSlug,
+      name: nameSlug,
+      description: description.trim(),
+      fit_mode: templatedFitMode,
+      slot: templatedSlot.trim(),
+      values: templatedValues,
+      pairs: nonEmptyTemplatedPairs().map((p) => ({
+        user: p.user,
+        assistant: p.assistant,
+      })),
+      hyperparams,
+    };
+    const toastId = pushToast(
+      `authoring ${namespaceSlug}/${nameSlug}…`,
+      { kind: "info", ttlMs: null },
+    );
+    try {
+      await apiManifolds.createTemplated(req);
+      dismissToast(toastId);
+      if (alsoFit) {
+        const fitToastId = pushToast(
+          `fitting ${namespaceSlug}/${nameSlug}…`,
+          { kind: "info", ttlMs: null },
+        );
+        try {
+          await apiManifoldFitStream(
+            namespaceSlug,
+            nameSlug,
+            { fit_mode: templatedFitMode, hyperparams },
+            (ev) => {
+              if (ev.event === "progress") {
+                const msg =
+                  ev.data && typeof ev.data === "object"
+                    ? (ev.data as { message?: string }).message
+                    : null;
+                if (msg) updateToast(fitToastId, { detail: msg });
+              }
+            },
+          );
+          dismissToast(fitToastId);
+          pushToast(
+            `fit ${namespaceSlug}/${nameSlug} (${templatedFitMode})`,
+            { kind: "info" },
+          );
+        } catch (e) {
+          dismissToast(fitToastId);
+          pushToast(`fit failed — ${describeFitError(e)}`, {
+            kind: "error",
+            ttlMs: null,
+          });
+        }
+      } else {
+        pushToast(
+          `authored ${namespaceSlug}/${nameSlug} — open manifolds drawer to fit`,
+          { kind: "info" },
+        );
+      }
+      await refreshManifoldList();
+      closeDrawer();
+      openDrawer("manifolds");
+    } catch (e) {
+      dismissToast(toastId);
+      pushToast(`author failed — ${describeFitError(e)}`, {
+        kind: "error",
+        ttlMs: null,
+      });
+    } finally {
+      submitting = false;
+    }
+  }
+
   function describeFitError(e: unknown): string {
     if (e instanceof ApiError) {
       return e.body && typeof e.body === "object" && "detail" in (e.body as object)
@@ -612,6 +773,7 @@
       bind:value={authoringMode}
       tabs={[
         { value: "discover", label: "auto-generated" },
+        { value: "templated", label: "templated" },
         { value: "authored", label: "custom nodes" },
       ]}
       ariaLabel="Authoring mode"
@@ -623,13 +785,23 @@
         with a statement corpus each, then fit it from the manifolds
         drawer.
       </p>
-    {:else}
+    {:else if authoringMode === "discover"}
       <p class="hint">
         hand the model a flat list of concepts; the K-tuple generator
         produces shared scenarios + per-concept statements, and the
         fitter derives node coordinates per-model via pca or spectral
         embedding. recommended at 20–48 concepts; spectral comes into
         its own only past ~50 nodes.
+      </p>
+    {:else}
+      <p class="hint">
+        give a slot token, a list of values (one node each), and a set of
+        (user, assistant) templates with the slot in the assistant turn.
+        the slot fills per value — deterministic, no model — and the
+        templates' user turns become the elicitation prompts the fit pools
+        against. the tool for categories you reference rather than embody
+        (days, months, colours, directions); fit_mode auto detects cyclic
+        layouts.
       </p>
     {/if}
 
@@ -962,7 +1134,7 @@
           ? `build manifold (auto-domain ${discoverFitMode}) → return to list`
           : "build manifold → return to list"}
     </button>
-    {:else}
+    {:else if authoringMode === "discover"}
       <!-- auto-generated authoring: LLM-author corpora from a flat
            concept list, fitter derives coords. -->
       <section class="step">
@@ -1127,6 +1299,132 @@
           : alsoFit
             ? "generate corpora + fit"
             : "generate corpora"}
+      </button>
+    {:else}
+      <!-- templated authoring: slot + values + chat-turn templates;
+           deterministic fill (no model), then derive coords. -->
+      <section class="step">
+        <h2 class="step-title">slot + values</h2>
+        <label class="field">
+          <span class="label">slot token <span class="req">required</span></span>
+          <input
+            type="text"
+            class="input"
+            bind:value={templatedSlot}
+            placeholder="[DAY]"
+            autocomplete="off"
+            spellcheck="false"
+          />
+          <span class="dim-note">
+            the placeholder filled per value — lives in the assistant turn only
+          </span>
+        </label>
+        <label class="field">
+          <span class="label">
+            values <span class="req">required (≥2)</span>
+          </span>
+          <textarea
+            class="input"
+            rows="3"
+            placeholder={"Monday Tuesday Wednesday Thursday Friday Saturday Sunday\n(whitespace or comma-separated)"}
+            bind:value={templatedValuesText}
+            spellcheck="false"
+          ></textarea>
+          <span class="dim-note">
+            parsed: <strong>{templatedValues.length}</strong> value(s) → one node each
+          </span>
+        </label>
+      </section>
+
+      <section class="step">
+        <h2 class="step-title">templates</h2>
+        <p class="dim-note">
+          {templatedPairs.length} template(s) — each a (user, assistant) turn;
+          the slot fills in the assistant turn. more templates = more samples
+          per node (aim ~10–50).
+        </p>
+        {#each templatedPairs as pair, i (i)}
+          <div class="pair-row">
+            <div class="pair-fields">
+              <input
+                type="text"
+                class="input"
+                bind:value={pair.user}
+                placeholder="user — e.g. what day is it?"
+                spellcheck="false"
+              />
+              <input
+                type="text"
+                class="input"
+                bind:value={pair.assistant}
+                placeholder={`assistant — e.g. today is ${templatedSlot || "[SLOT]"}`}
+                spellcheck="false"
+              />
+            </div>
+            <button
+              type="button"
+              class="pair-remove"
+              aria-label="Remove template"
+              onclick={() => removeTemplatedPair(i)}
+              disabled={templatedPairs.length <= 1}
+            >✕</button>
+          </div>
+        {/each}
+        <button type="button" class="add-pair-btn" onclick={addTemplatedPair}>
+          + add template
+        </button>
+      </section>
+
+      <section class="step">
+        <h2 class="step-title">fit method</h2>
+        <div class="radio-row">
+          <Radio bind:group={templatedFitMode} value="auto" label="auto" />
+          <Radio bind:group={templatedFitMode} value="pca" label="pca" />
+          <Radio bind:group={templatedFitMode} value="spectral" label="spectral" />
+        </div>
+        <p class="dim-note">
+          {#if templatedFitMode === "auto"}
+            recommended — picks flat/curved per-model and detects periodic
+            axes (the right default for cyclic categories like days / months).
+          {:else if templatedFitMode === "pca"}
+            flat affine subspace.
+          {:else}
+            curved RBF surface (laplacian eigenmaps).
+          {/if}
+        </p>
+      </section>
+
+      <AdvancedSection bind:expanded={advancedTemplatedOpen}>
+        <label class="field">
+          <span class="label">max_dim (blank → auto)</span>
+          <NumberInput
+            value={templatedMaxDim}
+            min={1}
+            step={1}
+            allowEmpty
+            placeholder="auto"
+            oninput={(v) => {
+              templatedMaxDim = v;
+            }}
+          />
+        </label>
+        <div class="check-stack">
+          <Checkbox
+            bind:checked={alsoFit}
+            label="fit immediately after authoring"
+          />
+        </div>
+      </AdvancedSection>
+
+      <ValidationBlock verb="templated" messages={templatedValidation.messages} />
+
+      <button
+        type="button"
+        class="save-btn"
+        disabled={!templatedValidation.ok || submitting}
+        onclick={templatedSave}
+      >
+        {submitting ? "authoring…" : alsoFit ? "author + fit" : "author"}
       </button>
     {/if}
   </div>
@@ -1418,6 +1716,51 @@
     align-self: flex-start;
   }
   .add-node:hover {
+    background: var(--accent-glow);
+  }
+
+  /* Templated-tab (user, assistant) template editor rows. */
+  .pair-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    margin-bottom: var(--space-2);
+  }
+  .pair-fields {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    flex: 1;
+    min-width: 0;
+  }
+  .pair-remove {
+    background: transparent;
+    border: 0;
+    color: var(--fg-muted);
+    cursor: pointer;
+    font-size: var(--text);
+    padding: 0 var(--space-2);
+  }
+  .pair-remove:hover:not(:disabled) {
+    color: var(--accent-red);
+  }
+  .pair-remove:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+  .add-pair-btn {
+    background: var(--accent-subtle);
+    color: var(--accent);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: var(--space-2) var(--space-4);
+    font: inherit;
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    cursor: pointer;
+    align-self: flex-start;
+  }
+  .add-pair-btn:hover {
     background: var(--accent-glow);
   }
 
