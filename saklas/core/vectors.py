@@ -34,8 +34,9 @@ def _capture_all_hidden_states(
     *,
     attention_mask: torch.Tensor | None = None,
     pool_index: "int | torch.Tensor | None" = None,
+    layer_indices: Sequence[int] | None = None,
 ):
-    """Run one forward pass capturing hidden states at ALL layers.
+    """Run one forward pass capturing hidden states at selected layers.
 
     Uses ``use_cache=False`` to avoid polluting any persistent KV cache.
     ``attention_mask`` (when supplied) is forwarded so right-padded batches
@@ -50,9 +51,15 @@ def _capture_all_hidden_states(
       stack gathered at each row's position *inside the hook*, so only ``(B, D)``
       is retained per layer rather than the full ``(B, T, D)``.
 
-    Returns a dict mapping layer index to the retained tensor.
+    ``layer_indices`` narrows hook registration to a subset; ``None`` captures
+    every layer. Returns a dict mapping layer index to the retained tensor.
     """
     captured_hidden: dict[int, torch.Tensor] = {}
+    capture_layers = (
+        list(range(len(layers)))
+        if layer_indices is None
+        else [int(idx) for idx in layer_indices]
+    )
     per_row = isinstance(pool_index, torch.Tensor)
     # Precompute the gather index tensors once (not per layer/hook fire); both
     # are set iff ``per_row`` (the assert in the hook narrows them back).
@@ -96,7 +103,10 @@ def _capture_all_hidden_states(
             captured_hidden[idx] = h.detach()
         return _hook
 
-    handles = [layers[idx].register_forward_hook(_make_hook(idx)) for idx in range(len(layers))]
+    handles = [
+        layers[idx].register_forward_hook(_make_hook(idx))
+        for idx in capture_layers
+    ]
     try:
         with torch.inference_mode():
             if attention_mask is not None:
@@ -185,6 +195,7 @@ def _encode_and_capture_all(
     role: str | None = None,
     model_type: str | None = None,
     system_msg: str = _LENGTH_DIRECTIVE,
+    layer_indices: Sequence[int] | None = None,
 ):
     """Capture the last-content-token hidden state per layer for a turn pair, fp32.
 
@@ -213,6 +224,7 @@ def _encode_and_capture_all(
     )
     hidden_per_layer = _capture_all_hidden_states(
         model, layers, ids, pool_index=content_end,
+        layer_indices=layer_indices,
     )
     return {
         idx: h if h.ndim == 1 else h[0, min(content_end, h.shape[1] - 1)].float()
@@ -231,6 +243,7 @@ def _encode_and_capture_all_batch(
     role: str | None = None,
     model_type: str | None = None,
     system_msg: str = _LENGTH_DIRECTIVE,
+    layer_indices: Sequence[int] | None = None,
 ) -> dict[int, torch.Tensor]:
     """Batched conversational capture — one forward over a chunk of pairs.
 
@@ -292,6 +305,7 @@ def _encode_and_capture_all_batch(
     return _capture_all_hidden_states(
         model, layers, input_ids,
         attention_mask=attn, pool_index=pool_index,
+        layer_indices=layer_indices,
     )
 
 

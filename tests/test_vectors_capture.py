@@ -45,3 +45,15 @@ def test_capture_all_hidden_states_can_pool_inside_hook() -> None:
     assert pooled[0].shape == (3,)
     assert torch.allclose(pooled[0], full[0][0, 2].float())
     assert torch.allclose(pooled[1], full[1][0, 2].float())
+
+
+def test_capture_all_hidden_states_can_filter_layers() -> None:
+    model = _ToyModel()
+    ids = torch.tensor([[10, 11, 12, 13]])
+
+    pooled = _capture_all_hidden_states(
+        model, model.layers, ids, pool_index=2, layer_indices=[1],
+    )
+
+    assert set(pooled) == {1}
+    assert pooled[1].shape == (3,)

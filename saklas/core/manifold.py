@@ -3354,6 +3354,7 @@ def compute_node_centroid(
     *,
     role: str | None = None,
     model_type: str | None = None,
+    layer_indices: Sequence[int] | None = None,
 ) -> dict[int, torch.Tensor]:
     """Mean per-layer pooled activation over a manifold node's responses.
 
@@ -3375,6 +3376,7 @@ def compute_node_centroid(
     the standard assistant (swap-back) baseline.  Requires ``model_type``.
     ``role=None`` is the swap-back default.
 
+    ``layer_indices`` narrows capture to a subset; ``None`` captures every layer.
     Returns ``{layer_idx: centroid (D,)}`` in fp32 on CPU.
     """
     from saklas.core.vectors import _CAPTURE_BATCH, _encode_and_capture_all_batch
@@ -3391,7 +3393,11 @@ def compute_node_centroid(
             f"prompt[i % k]"
         )
 
-    n_layers = len(layers)
+    capture_layers = (
+        list(range(len(layers)))
+        if layer_indices is None
+        else [int(idx) for idx in layer_indices]
+    )
     sums: dict[int, torch.Tensor] = {}
     is_mps = getattr(device, "type", None) == "mps"
     n = len(responses)
@@ -3407,8 +3413,9 @@ def compute_node_centroid(
             model, tokenizer,
             aligned_prompts[start:end], responses[start:end],
             layers, device, role=role, model_type=model_type,
+            layer_indices=capture_layers,
         )
-        for idx in range(n_layers):
+        for idx in capture_layers:
             chunk_sum = per_layer[idx].detach().sum(dim=0).to("cpu", torch.float32)
             if idx in sums:
                 sums[idx] += chunk_sum
@@ -3418,7 +3425,7 @@ def compute_node_centroid(
         if is_mps:
             torch.mps.empty_cache()
 
-    return {idx: sums[idx] / n for idx in range(n_layers)}
+    return {idx: sums[idx] / n for idx in capture_layers}
 
 
 def compute_node_reduced_covariance(
@@ -3484,6 +3491,7 @@ def compute_node_reduced_covariance(
             model, tokenizer,
             aligned_prompts[start:end], responses[start:end],
             layers, device, role=role, model_type=model_type,
+            layer_indices=sorted(layer_subs),
         )
         for idx, (mean, basis) in means_basis.items():
             h = per_layer[idx].detach().to("cpu", torch.float32)  # (B, D)

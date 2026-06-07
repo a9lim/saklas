@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 import torch
@@ -129,7 +129,7 @@ def test_stop_sequence_trimmed_text_is_final_result_text():
 
     generated_ids = generate_steered(
         model,
-        tokenizer,
+        cast(Any, tokenizer),
         torch.tensor([[0]]),
         GenerationConfig(max_new_tokens=5, temperature=0.0),
         state,
@@ -160,6 +160,40 @@ def test_stop_sequence_trimmed_text_is_final_result_text():
         stateless=True,
     )
     assert result.text == "Hello"
+
+
+def test_stop_sequence_only_tap_can_skip_full_token_table():
+    class CountingStopTokenizer(_StopTokenizer):
+        name_or_path = "stop-tokenizer-no-table"
+
+        def __init__(self) -> None:
+            self.batch_decode_calls = 0
+
+        def batch_decode(self, ids: Any) -> list[str]:
+            self.batch_decode_calls += 1
+            return super().batch_decode(ids)
+
+    model: Any = _StopModel()
+    tokenizer = CountingStopTokenizer()
+    state = GenerationState()
+    emitted: list[str] = []
+
+    generated_ids = generate_steered(
+        model,
+        cast(Any, tokenizer),
+        torch.tensor([[0]]),
+        GenerationConfig(max_new_tokens=5, temperature=0.0),
+        state,
+        on_token=lambda text, *_args: emitted.append(text),
+        stop=[" STOP"],
+        cache_token_text=False,
+    )
+
+    assert tokenizer.batch_decode_calls == 0
+    assert generated_ids == [0, 1]
+    assert emitted == ["Hello"]
+    assert state.finish_reason == "stop_sequence"
+    assert state.response_text == "Hello"
 
 
 def test_finalize_reuses_scored_probe_aggregate() -> None:

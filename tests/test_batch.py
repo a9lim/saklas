@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import MagicMock
 
 import pytest
@@ -181,6 +181,33 @@ class TestPrefixCacheEligibility:
         gated = Trigger.when("honest.deceptive", ">", 0.4)
         s._steering_stack = [{"honest": (0.5, gated)}]
         assert s._steering_active_in_prefill() is False
+
+    def test_batch_common_prefix_detection_keeps_scalar_walk_on_cpu(self) -> None:
+        import torch
+
+        s = self._session()
+        common = list(range(32))
+
+        def _prepare_input(
+            input: Any,
+            raw: bool = False,
+            thinking: bool = False,
+            stateless: bool = False,
+            parent_node_id: str | None = None,
+            user_role: str | None = None,
+            assistant_role: str | None = None,
+            to_device: bool = True,
+        ) -> torch.Tensor:
+            suffix = 100 if input == "a" else 101
+            return torch.tensor([common + [suffix]], dtype=torch.long)
+
+        cast(Any, s)._prepare_input = _prepare_input
+
+        prefix = s._batch_common_prefix_ids(["a", "b"], raw=False)
+
+        assert prefix is not None
+        assert prefix.device.type == "cpu"
+        assert prefix.tolist() == common
 
 
 # ---------------------------------------------------------------------------

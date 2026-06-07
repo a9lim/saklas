@@ -3943,6 +3943,7 @@ class SaklasSession:
         parent_node_id: str | None = None,
         user_role: str | None = None,
         assistant_role: str | None = None,
+        to_device: bool = True,
     ) -> torch.Tensor:
         if raw and isinstance(input, str):
             # Flat (base-model / completion) path: no chat template, no
@@ -3954,7 +3955,8 @@ class SaklasSession:
             encoded = self._tokenizer.encode(
                 prefix + input, return_tensors="pt",
             )
-            return encoded.to(self._device)  # pyright: ignore[reportAttributeAccessIssue]  # return_tensors="pt" gives BatchEncoding/Tensor, not list
+            ids = cast(torch.Tensor, encoded)  # return_tensors="pt" gives Tensor, not list[int]
+            return ids.to(self._device) if to_device else ids
         if isinstance(input, str):
             if stateless:
                 prior: list[dict[str, Any]] = []
@@ -3999,12 +4001,13 @@ class SaklasSession:
             )
             if model_type_for_role is None and model_cfg is not None:
                 model_type_for_role = getattr(model_cfg, "model_type", None)
-        return build_chat_input(
+        ids = build_chat_input(
             self._tokenizer, messages, self.config.system_prompt,
             thinking=thinking,
             gen_role=gen_role,
             model_type=model_type_for_role,
-        ).to(self._device)
+        )
+        return ids.to(self._device) if to_device else ids
 
     def build_readings(self) -> dict[str, ProbeReadings]:
         """Per-probe cross-generation :class:`ProbeReadings`, per coordinate axis."""
@@ -4486,6 +4489,7 @@ class SaklasSession:
         lp_count: int | None,
         forced_prefix: list[int] | None = None,
         want_perplexity: bool = True,
+        cache_token_text: bool = True,
     ) -> tuple[list[int], float]:
         """Run the decode loop once capture and steering are installed."""
         cached_pkv = None
@@ -4546,6 +4550,7 @@ class SaklasSession:
             forced_prefix=forced_prefix,
             steering_active=bool(self._steering.hooks),
             want_perplexity=want_perplexity,
+            cache_token_text=cache_token_text,
         )
         elapsed = time.monotonic() - start
 
@@ -4780,6 +4785,12 @@ class SaklasSession:
             or stop_list is not None
         )
         _effective_tap = _token_tap if _need_tap else None
+        _tap_has_text_consumer = bool(
+            on_token is not None
+            or (logprobs_list is not None and (lp_count or 0) > 0)
+            or _has_trait_consumer
+            or _persists_probe_row
+        )
 
         steering_cm = None
         if steering_obj is not None and steering_obj.alphas:
@@ -4897,6 +4908,7 @@ class SaklasSession:
                             )
                         )
                     ),
+                    cache_token_text=_tap_has_text_consumer,
                 )
             finally:
                 self._gen_state.stop_requested.set()
@@ -5329,8 +5341,13 @@ class SaklasSession:
         """
         rendered: list[torch.Tensor] = []
         for prompt in prompts:
-            ids = self._prepare_input(prompt, raw=raw, stateless=True)
-            rendered.append(ids[0])
+            ids = self._prepare_input(
+                prompt, raw=raw, stateless=True, to_device=False,
+            )
+            # Prefix discovery is scalar-heavy Python work. Keep the token
+            # comparison on CPU so MPS/CUDA do not pay one device sync per
+            # ``int(t[i])`` while walking the common prefix.
+            rendered.append(ids[0].detach().to("cpu"))
         min_len = min(int(t.shape[0]) for t in rendered)
         if min_len <= _PREFIX_CACHE_MIN_TOKENS:
             return None

@@ -1434,10 +1434,9 @@ class Monitor:
         ``captured_per_layer[L]`` is the per-layer ``[T, D]`` capture stack.
         The pooled activation is the **last non-special token** (``agg_index``,
         default the final row) — the same single-state discipline extraction
-        uses, not a trajectory mean.  The aggregate is literally the unified
-        per-token :meth:`_score_probe_full` read evaluated at the pooled token,
-        so it is the same :class:`ProbeReading` shape the live stream
-        carries (and bit-identical to the live read at that token index).
+        uses, not a trajectory mean.  It routes through the same full scorer
+        as live single-token reads, so flat probe rosters use the batched
+        Woodbury path while curved probes keep their per-probe foot solve.
         """
         out: dict[str, ProbeReading] = {}
         if not captured_per_layer or not self._probes:
@@ -1454,9 +1453,7 @@ class Monitor:
                 row = t - 1 if agg_index is None else max(0, min(agg_index, t - 1))
                 pooled[layer_idx] = stack.to(torch.float32)[row]
 
-        for name, probe in self._probes.items():
-            out[name] = self._score_probe_full(probe, pooled)
-        return out
+        return self._score_full(pooled)
 
 
 @dataclass

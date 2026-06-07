@@ -688,6 +688,7 @@ def generate_steered(
     forced_prefix: list[int] | None = None,
     steering_active: bool = True,
     want_perplexity: bool = True,
+    cache_token_text: bool = True,
 ) -> list[int]:
     """
     Runs in a worker thread (not the async event loop).
@@ -742,6 +743,10 @@ def generate_steered(
     the thinking-state machine transitions identically.  ``None`` (the
     default) is the normal free-sampling path with zero added cost.
 
+    ``cache_token_text`` controls the eager token-id→text table used by
+    streaming/logprob renderers. Stop-sequence-only callers can turn it
+    off to avoid a full-vocab decode table for a bounded tail match.
+
     Returns list of generated token IDs.
     """
     if seed is not None:
@@ -768,7 +773,11 @@ def generate_steered(
     _cfg = getattr(model.config, "text_config", model.config)
     _vocab = _cfg.vocab_size
     topk_k = _effective_topk(config, _vocab)
-    token_table = _get_token_table(tokenizer, _vocab) if on_token else None
+    token_table = (
+        _get_token_table(tokenizer, _vocab)
+        if on_token is not None and cache_token_text
+        else None
+    )
     seq_len = input_ids.shape[1] + cache_position_offset
     attn_mask_buf = torch.ones(1, seq_len, device=device, dtype=torch.long)
     prefill = True
@@ -932,6 +941,13 @@ def generate_steered(
             if cached is not None:
                 return cached
         return cast(str, tokenizer.decode([tid]))  # transformers stub widens decode return to str|list[str]
+
+    def _decode_piece(tid: int) -> str | None:
+        """Decode one emitted token, preserving partial-UTF-8 buffering."""
+        if token_table is not None and 0 <= tid < _vocab:
+            return token_table[tid]
+        s = cast(str, tokenizer.decode([tid]))  # transformers stub widens decode return to str|list[str]
+        return None if "\ufffd" in s else s
 
     try:
         with torch.inference_mode():
@@ -1223,8 +1239,7 @@ def generate_steered(
                     penalty_state.add(token_id)
 
                 if on_token:
-                    assert token_table is not None  # token_table is non-None when on_token is set
-                    tok_str = token_table[token_id] if token_id < _vocab else ''
+                    tok_str = _decode_piece(token_id) if token_id < _vocab else ''
                     emit_text: str | None = None
                     emit_id = token_id
                     emit_thinking = tstate == _ThinkState.THINKING

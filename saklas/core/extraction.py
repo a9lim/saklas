@@ -314,6 +314,7 @@ class ManifoldExtractionPipeline:
             per_node.append(compute_node_centroid(
                 model, tokenizer, layers, device, responses, baseline_prompts,
                 role=role, model_type=model_type,
+                layer_indices=fit_layers,
             ))
 
         # 1b. Monopolar (concept-vs-neutral).  A 1-node ``pca`` folder has no

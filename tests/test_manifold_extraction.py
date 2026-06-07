@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import hashlib
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 import torch
@@ -291,6 +291,35 @@ def test_fit_sae_variant(tmp_path: Path) -> None:
     assert manifold.feature_space == "sae-mock-rel"
     assert sorted(manifold.layers) == list(range(_N_LAYERS))
     assert (folder / "stub-model_sae-mock-rel.safetensors").exists()
+
+
+def test_fit_sae_variant_captures_only_covered_layers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    folder = _author_manifold(tmp_path)
+    sae = MockSaeBackend(
+        layers=frozenset({1, 3}), d_model=_DIM,
+        release="partial-rel",
+    )
+    seen: list[tuple[int, ...]] = []
+
+    def _filtered_batch(*args: Any, **kwargs: Any) -> dict[int, torch.Tensor]:
+        layer_indices = kwargs.get("layer_indices")
+        seen.append(tuple(layer_indices or range(_N_LAYERS)))
+        out = _stub_encoder_batch(*args, **kwargs)
+        if layer_indices is None:
+            return out
+        return {idx: out[idx] for idx in layer_indices}
+
+    monkeypatch.setattr(V, "_encode_and_capture_all_batch", _filtered_batch)
+
+    manifold = ManifoldExtractionPipeline(_Handle(), EventBus()).fit(
+        folder, sae=sae,
+    )
+
+    assert sorted(manifold.layers) == [1, 3]
+    assert seen
+    assert all(layers == (1, 3) for layers in seen)
 
 
 def test_fit_sae_no_coverage_raises_before_pooling(
@@ -807,7 +836,8 @@ def test_auto_records_resolution_metadata(tmp_path: Path) -> None:
     assert meta["fit_mode"] == "auto"
     assert meta["resolved_fit_mode"] in {"pca", "spectral"}
     assert meta["method"] == "manifold_discover_auto"
-    names = {c["name"] for c in meta["topology_candidates"]}
+    candidates = cast(list[dict[str, Any]], meta["topology_candidates"])
+    names = {c["name"] for c in candidates}
     assert "flat-pca" in names
     assert meta["topology_winner"] in names
 
