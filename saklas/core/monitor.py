@@ -442,9 +442,20 @@ class Monitor:
         nearest_dist_t: torch.Tensor | None = None
         nearest_idx_t: torch.Tensor | None = None
         if top_n and dist_acc_t is not None:
+            # Rank by **raw** whitened distance (so ``nearest`` is literally the
+            # nearest node, distinct from the density-aware ``assignment``), then
+            # report it in units of the probe's typical label spacing
+            # ``label_scale`` (median node nearest-neighbor distance) — a single
+            # per-probe constant, so it rescales the value without reordering.
+            # Raw whitened distance spans ~60× across fits (a node sits 1.15..72
+            # from neutral), so a bare negated-distance ``@label`` gate was not
+            # portable; ``d / label_scale`` ≈ "typical label-spacings away"
+            # transfers across probes.  Assignment keeps raw ``dist_acc_t`` (it
+            # needs raw ``d`` for the Gaussian ``−d²/2τ²``).
             nearest_dist_t, nearest_idx_t = torch.topk(
                 dist_acc_t, k=top_n, largest=False, sorted=True,
             )
+            nearest_dist_t = nearest_dist_t / probe.label_scale
         # Soft assignment: softmax(−d²/(2τ²) − R·log(τ)) — a proper isotropic
         # R-D Gaussian-mixture posterior with uniform node prior.  The
         # ``logvol_bias`` term is the missing Gaussian normalization; without it
@@ -713,6 +724,14 @@ class Monitor:
                 band_pad[ci, :bw.numel()] = bw.to(device, torch.float32)
                 logvol_pad[ci, :lvb.numel()] = lvb.to(device, torch.float32)
                 band_present_list[ci] = True
+        # Per-probe ``@label`` distance scale ``(P,)`` — the robust median node
+        # spacing each probe carries.  The reported nearest distance is divided
+        # by it (a per-probe constant ⇒ preserves the raw ranking) to make the
+        # ``@label`` gate threshold portable across probes.
+        label_scale = torch.tensor(
+            [float(self._probes[n].label_scale) for n in flat_names],
+            device=device, dtype=torch.float32,
+        ).clamp(min=_FRACTION_EPSILON)
         labels: list[list[str]] = []
         for n, inj in zip(flat_names, inj_list, strict=True):
             row = list(self._probes[n].manifold.node_labels)
@@ -730,6 +749,7 @@ class Monitor:
             "band_pad": band_pad, "logvol_pad": logvol_pad,
             "band_present_list": band_present_list,
             "band_present_any": any(band_present_list),
+            "label_scale": label_scale,
         }
 
         layer_members: dict[int, list[int]] = {}
@@ -904,9 +924,15 @@ class Monitor:
             ~gl["valid_mask"], float("inf"),
         )
         if topk_width:
+            # Rank by **raw** distance (``nearest`` stays literally nearest), then
+            # divide the reported top-N distances by each probe's ``label_scale``
+            # (a per-probe constant ⇒ no reordering) for a portable ``@label``
+            # gate — distance in "typical label-spacings"; see ``_score_probe_full``.
+            # Assignment below keeps the raw ``dist_final``.
             nd_sorted, ni_sorted = torch.topk(
                 dist_final, k=topk_width, largest=False, sorted=True,
             )                                                       # (P, topk_width)
+            nd_sorted = nd_sorted / gl["label_scale"].unsqueeze(1)
         else:
             nd_sorted = dist_final.new_zeros((P, 0))
             ni_sorted = torch.empty((P, 0), device=device, dtype=torch.long)
@@ -1507,6 +1533,15 @@ class AttachedManifoldProbe:
     # pathology the bare form has).  ``R`` is the manifold's per-layer subspace
     # rank — the effective dimension of the space ``τ`` measures.
     assign_logvol_bias: torch.Tensor | None = None
+    # Robust per-probe scale for the ``nearest`` / ``@label`` distance: the
+    # **median node nearest-neighbor whitened spacing** (a single scalar, not the
+    # per-candidate ``τ`` above).  The reported nearest distance is divided by it
+    # so ``@label`` reads "how many typical label-spacings away" — portable across
+    # probes (raw whitened distance spans ~60× by fit), while staying a *uniform*
+    # rescale that preserves the raw nearest **ranking** (``nearest`` stays
+    # literally nearest, distinct from the density-aware ``assignment``).  A
+    # single-node fit / degenerate manifold leaves it ``1.0`` (raw distance).
+    label_scale: float = 1.0
     # Per-layer Mahalanobis bundle, populated at attach.  The wired whitener
     # must cover every layer of this manifold (all-or-nothing per probe), else
     # ``_build_whitened`` raises ``WhitenerError`` — there is no Euclidean
@@ -1816,6 +1851,19 @@ def _attach_manifold_probe(
     bw, lvb = _compute_assign_bandwidth(probe, embedded)
     probe.assign_bandwidth = bw
     probe.assign_logvol_bias = lvb
+    # Robust per-probe ``@label`` distance scale: the median of the *node*
+    # bandwidths (``bw`` is candidate-order nodes-then-neutral; the node entries
+    # are each node's nearest-neighbor whitened spacing, EV-weighted across
+    # layers).  Median, not per-candidate, so one crowded pair can't make a label
+    # weirdly ungateable; a single scalar, so it rescales the reported distance
+    # without reordering ``nearest``.  K=1 / no bandwidth ⇒ 1.0 (raw distance).
+    n_nodes = len(manifold.node_labels)
+    if bw is not None and bw.numel() >= 1 and n_nodes >= 1:
+        node_bw = bw[:n_nodes] if bw.numel() >= n_nodes else bw
+        if node_bw.numel():
+            probe.label_scale = float(
+                node_bw.median().clamp(min=_FRACTION_EPSILON)
+            )
     return probe
 
 

@@ -77,9 +77,14 @@ class ProbeReading:
       layers, the share of the centered activation living in the subspace,
       ∈ [0, 1].
     * ``nearest`` — top-N node labels by EV-weighted whitened distance,
-      ascending.  The synthetic label ``"neutral"`` competes here as the
-      frame anchor (the per-model neutral mean, distance ``‖cdist_query‖``):
-      it is never a stored node, only a candidate the readout ranks, so it
+      ascending (ranked by **raw** whitened distance — literally nearest).  The
+      reported distance is rescaled into the probe's **typical label-spacing**
+      units (divided by ``AttachedManifoldProbe.label_scale``, the median node
+      nearest-neighbor whitened distance), so an ``@label`` gate threshold is
+      portable across probes (raw whitened distance spans ~60× by fit); the scale
+      is a per-probe constant, so the ranking is unchanged.  The synthetic label
+      ``"neutral"`` competes here as the frame anchor (the per-model neutral
+      mean): it is never a stored node, only a candidate the readout ranks, so it
       surfaces when the activation sits closer to the origin than to any node.
       Suppressed when a manifold already carries a real node named ``neutral``.
     * ``residual`` — EV-weighted normalized off-manifold residual

@@ -441,10 +441,18 @@ vestigial on the hot path — the readout centers on each fit's own
 `flat_scalars` (one staticmethod) writes the gate channels from a readings dict:
 `"<name>"` (= coords axis 0) + `"<name>[i]"` per axis, `"<name>:fraction"`,
 `"<name>@<label>": −distance` per nearest node (including the reserved
-`"<name>@neutral"` when the neutral anchor wins a top-N slot). Every probe — flat
-and curved — now carries coords *and* nearest, so flat probes expose `@label`
-similarity gates too (`@when:personas@hacker`, `@when:personas@neutral`) and the
-gate grammar is uniform.
+`"<name>@neutral"` when the neutral anchor wins a top-N slot). The nearest
+distance is reported in units of the probe's **typical label spacing** —
+`AttachedManifoldProbe.label_scale`, the median node nearest-neighbor whitened
+distance (a robust single per-probe scalar derived from the same per-node
+bandwidths `_compute_assign_bandwidth` produces). Raw whitened distance spans
+~60× across fits, so a bare `@label` threshold wasn't portable; `d/label_scale`
+("typical label-spacings away") transfers. Because the scale is a per-probe
+constant, `nearest` still ranks by **raw** distance (literally nearest — distinct
+from the density-aware `~<label>` assignment, which keeps per-candidate `τ`).
+Every probe — flat and curved — carries coords *and* nearest, so flat probes
+expose `@label` similarity gates too (`@when:personas@hacker`,
+`@when:personas@neutral`) and the gate grammar is uniform.
 
 **Fuzzy reads** (the soft/distributional view of `nearest`/`residual`): every
 `ProbeReading` also carries `assignment` (a `softmax(−d²/(2τ²) − R·log(τ))` node

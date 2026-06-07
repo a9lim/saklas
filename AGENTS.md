@@ -159,8 +159,15 @@ concept gate reads the same single coordinate it always did.
 Manifold subspace-fraction gates write the `:fraction` channel suffix
 (`@when:pad:fraction > 0.5`) — the share of the centered activation living
 in that manifold's subspace, in `[0, 1]`. Manifold label-similarity gates write
-the `@<label>` suffix (`@when:pad@happy > -0.1`) — the negated distance to
-a named node (larger = closer), so the natural threshold range is negative. Two
+the `@<label>` suffix (`@when:pad@happy > -0.5`) — the negated distance to
+a named node (larger = closer), so the natural threshold range is negative. The
+distance is reported in units of the probe's **typical label spacing** (the
+median node nearest-neighbor whitened distance, a single per-probe scale), so a
+threshold reads as "within N typical label-spacings" and **transfers across
+probes** — the raw whitened distance spans ~60× by fit (a node sits 1.15..72
+from neutral), which made a bare threshold meaningless. The scale is a uniform
+per-probe constant, so `nearest` still ranks by raw distance (literally nearest,
+distinct from the density-aware `~<label>`). Two
 **fuzzy-manifold** channels join them (additive — the `@<label>` distance gate is
 untouched): the soft-assignment probability `~<label>` (`@when:personas~hacker >
 0.5`) — a normalized, in-`[0,1]` `softmax(−d²/2τ²)` membership over the nodes,
@@ -169,8 +176,9 @@ the distributional counterpart to argmax `nearest` — and the tube-fit density
 fitted within-node thickness `σ(z)`, high when the activation sits inside the
 manifold's learned tube (distinguishes off-surface from on-surface-but-diffuse,
 which a hard `residual` threshold can't). The
-reserved label `neutral` (`@when:personas@neutral > -0.1`) reads the negated
-distance to the frame *anchor* (the per-model neutral mean) — every fit is
+reserved label `neutral` (`@when:personas@neutral > -0.5`) reads the negated
+distance to the frame *anchor* (the per-model neutral mean), in the same
+label-spacing units — every fit is
 neutral-anchored, so neutral is a point in the same whitened metric as the nodes,
 not a stored node. It competes in the nearest-node ranking, so the channel is
 present whenever neutral lands in a probe's top-N; suppressed only when a manifold
