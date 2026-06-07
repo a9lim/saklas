@@ -16,24 +16,41 @@
 // coefficient is the blend fraction.
 //
 // One unified steer rack is the source of truth — a ``Map<string,
-// SteerEntry>`` where each entry is ``mode: "vector"`` (α, trigger, variant,
-// projection, ablate, enabled) or ``mode: "position"`` (blend, onto, coords,
-// label, trigger, enabled).  serializeExpression picks the grammar
-// production per entry from ``mode``; parseExpression hydrates a fresh map
-// from a pasted expression, landing ``%`` terms as ``position`` and
-// everything else as ``vector``.
+// SteerEntry>`` where each entry is ``mode: "subspace"`` (flat: coords,
+// label, variant, trigger, enabled — magnitude is the rack-level
+// ``subspaceAlong`` master) or ``mode: "manifold"`` (curved: blend, onto,
+// coords, label, variant, trigger, enabled).  Both serialize as ``%`` terms;
+// the magnitude slot is the shared ``subspaceAlong`` for subspace terms and
+// the per-card ``along[,onto]`` for manifold terms.
 //
-// Round-trip property: parseExpression(serializeExpression(m)) === m for any
-// disabled-stripped rack the parser can express.
+// ``parseExpression`` returns ``{ rack, subspaceAlong, warnings }``: a curved
+// ``%`` (or any ``onto`` coeff) lands ``manifold``, else ``subspace``; a
+// bare-pole term (``0.5 formal.casual``) is converted to a label-form
+// subspace term toward the signed pole, its magnitude collected into
+// ``subspaceAlong``.  The pre-4.1 ``~``/``|`` projection and ``!`` ablation
+// no longer have a rack home: they parse (so pasted expressions don't throw)
+// but the operator is dropped with a warning.  ``:variant`` survives on the
+// atom.
+//
+// Round-trip property: parse(serialize(rack, G)) reproduces ``rack`` (and
+// ``G``) for any disabled-stripped rack the serializer emits.
 
 import type {
-  PositionSteerEntry,
-  ProjectionSpec,
+  ManifoldSteerEntry,
   SteerEntry,
+  SubspaceSteerEntry,
   Trigger,
   Variant,
-  VectorSteerEntry,
 } from "./types";
+
+/** Result of ``parseExpression`` — the hydrated rack plus the recovered
+ *  ``subspaceAlong`` master and any soft warnings (dropped projection /
+ *  ablation operators) the caller should surface. */
+export interface ParsedExpression {
+  rack: Map<string, SteerEntry>;
+  subspaceAlong: number;
+  warnings: string[];
+}
 
 // ----------------------------------------------- triggers ----------------
 
@@ -85,18 +102,22 @@ export class ExpressionParseError extends Error {
 // ----------------------------------------------- formatter ---------------
 
 /** Render the rack as a canonical expression string.  Disabled entries are
- * skipped; position (``%``) terms are emitted after vector terms (preserving
- * the canonical ordering the prior two-rack serializer produced, so the EXPR
- * display stays stable).  Empty/all-disabled racks return "". */
+ * skipped; subspace (flat) terms emit first, then manifold (curved) terms.
+ * Every term is a ``%`` position; the coefficient slot is the shared
+ * ``subspaceAlong`` master for subspace terms and the per-card
+ * ``along[,onto]`` for manifold terms.  Empty/all-disabled racks return "". */
 export function serializeExpression(
   rack: Map<string, SteerEntry>,
+  subspaceAlong = 1,
 ): string {
   const parts: string[] = [];
   for (const [name, entry] of rack) {
-    if (entry.enabled && entry.mode === "vector") parts.push(formatTerm(name, entry));
+    if (entry.enabled && entry.mode === "subspace") {
+      parts.push(formatSubspaceTerm(name, entry, subspaceAlong));
+    }
   }
   for (const [name, entry] of rack) {
-    if (entry.enabled && entry.mode === "position") {
+    if (entry.enabled && entry.mode === "manifold") {
       parts.push(formatManifoldTerm(name, entry));
     }
   }
@@ -112,25 +133,20 @@ export function serializeExpression(
   return out;
 }
 
-function formatTerm(name: string, entry: VectorSteerEntry): string {
-  const coeff = entry.alpha;
-  const triggerSuffix = formatTriggerSuffix(entry.trigger);
-  if (entry.ablate) {
-    // !x (coeff=1) and -!x (coeff=-1) are the bare canonical forms;
-    // anything else carries the explicit number.  Parser canonicalizes
-    // 1.0 !x back to !x on round-trip.
-    let body: string;
-    if (coeff === 1.0) body = `!${nameWithVariant(name, entry.variant)}`;
-    else if (coeff === -1.0) body = `-!${nameWithVariant(name, entry.variant)}`;
-    else body = `${formatCoeff(coeff)} !${nameWithVariant(name, entry.variant)}`;
-    return body + triggerSuffix;
-  }
-  const head = nameWithVariant(name, entry.variant);
-  let selector = head;
-  if (entry.projection) {
-    selector = `${head}${entry.projection.op}${entry.projection.target}`;
-  }
-  return `${formatCoeff(coeff)} ${selector}${triggerSuffix}`;
+/** Render one subspace (flat) term — ``<subspaceAlong> name[:variant]%<pos>``
+ *  plus an optional ``@trigger``.  All subspace terms share the one
+ *  ``subspaceAlong`` magnitude (the merged affine subspace slides once);
+ *  relative weight between them lives in how far each position sits from
+ *  neutral.  ``<pos>`` is the label form (``personas%hacker``) when
+ *  ``entry.label`` is set, else the comma-joined coord list. */
+function formatSubspaceTerm(
+  name: string,
+  entry: SubspaceSteerEntry,
+  subspaceAlong: number,
+): string {
+  const position = entry.label ?? entry.coords.map((c) => formatCoeff(c)).join(",");
+  const selector = `${nameWithVariant(name, entry.variant)}%${position}`;
+  return `${formatCoeff(subspaceAlong)} ${selector}${formatTriggerSuffix(entry.trigger)}`;
 }
 
 function nameWithVariant(name: string, variant: Variant): string {
@@ -149,16 +165,16 @@ function formatTriggerSuffix(trigger: Trigger): string {
   return kw ? `@${kw}` : "";
 }
 
-/** Render one manifold rack entry — ``<coeff> <name>%<position>`` plus
- *  an optional ``@trigger`` suffix.  Coefficient is the blend fraction
- *  (``-`` rides the joiner like vector terms).  ``<position>`` is the
- *  label form (``persona%pirate``) when ``entry.label`` is set;
- *  otherwise the comma-joined coord list (``persona%0.3,0.8``). */
-function formatManifoldTerm(name: string, entry: PositionSteerEntry): string {
+/** Render one manifold (curved) rack entry — ``<along[,onto]>
+ *  <name>[:variant]%<position>`` plus an optional ``@trigger`` suffix.
+ *  Coefficient is the per-card blend fraction (``-`` rides the joiner).
+ *  ``<position>`` is the label form (``pad%happy``) when ``entry.label`` is
+ *  set; otherwise the comma-joined coord list (``pad%0.3,0.8``). */
+function formatManifoldTerm(name: string, entry: ManifoldSteerEntry): string {
   const position = entry.label
     ? entry.label
     : entry.coords.map((c) => formatCoeff(c)).join(",");
-  const selector = `${name}%${position}`;
+  const selector = `${nameWithVariant(name, entry.variant)}%${position}`;
   // Coefficient slot: ``along`` alone, or ``along,onto`` when onto is set
   // (> 0) — the curved-manifold residual-collapse fraction.
   const coeff =
@@ -312,6 +328,8 @@ interface ManifoldTerm {
   onto: number | null;
   coords: number[] | null;
   label: string | null;
+  /** Tensor variant off the atom (``personas:sae%hacker``). */
+  variant: Variant;
   trigger: string | null;
 }
 
@@ -426,6 +444,7 @@ class Parser {
         onto: coeffs.length > 1 ? coeffs[1] : null,
         coords,
         label,
+        variant: base.variant,
         trigger,
       };
     }
@@ -561,236 +580,125 @@ function atomKey(atom: Atom): string {
   return atom.namespace ? `${atom.namespace}/${atom.concept}` : atom.concept;
 }
 
-/** Hydrate the unified steer rack from an expression string.  Rack keys use
- *  the atom's display form (ns/foo, happy.sad, personas) — variants live on
- *  the entry, not in the key, so two terms differing only by variant collide
- *  (matching the saklas parser's Steering.alphas semantics; users wanting
- *  both should ablate-or-merge explicitly).  A ``%`` term lands a
- *  ``position`` entry, everything else a ``vector`` entry; a name appearing
- *  as both is a conflict. */
-export function parseExpression(expr: string): Map<string, SteerEntry> {
+/** Hydrate the unified steer rack from an expression string.  Returns
+ *  ``{ rack, subspaceAlong, warnings }``.  Rack keys use the atom's display
+ *  form (``ns/foo``, ``happy.sad``, ``personas``) — variants live on the
+ *  entry, not the key.  Classification:
+ *
+ *   - A ``%`` term with an ``onto`` coeff, or whose ``isFlat(name)`` is
+ *     ``false`` (a curved fit per the catalog), lands a ``manifold`` entry
+ *     with its per-card ``along``/``onto``; otherwise a ``subspace`` entry
+ *     whose magnitude is collected into the shared ``subspaceAlong``.
+ *   - A bare-pole term (``0.5 formal.casual``) becomes a label-form
+ *     ``subspace`` entry toward the signed pole, magnitude → ``subspaceAlong``.
+ *   - ``~``/``|`` projection and ``!`` ablation no longer have a rack home:
+ *     they parse (so pasted expressions don't throw) but the operator is
+ *     dropped and a warning recorded; the base concept stays as a subspace
+ *     term.
+ *
+ *  ``opts.isFlat`` lets the caller resolve flat-vs-curved off the live
+ *  catalog (``manifoldByName(...).fit_mode``); the default treats unknown
+ *  manifolds as flat (subspace). */
+export function parseExpression(
+  expr: string,
+  opts: { isFlat?: (name: string) => boolean } = {},
+): ParsedExpression {
   if (!expr || !expr.trim()) {
     throw new ExpressionParseError("empty steering expression", expr, null);
   }
+  const isFlat = opts.isFlat ?? (() => true);
   const toks = lex(expr);
   const terms = new Parser(toks, expr).parse();
   const rack = new Map<string, SteerEntry>();
+  const warnings: string[] = [];
+  let subspaceAlong: number | null = null;
+
+  // The merged affine subspace has one slide, so subspace terms share one
+  // ``subspaceAlong``.  The first subspace term sets it; a later one whose
+  // magnitude differs folds onto it with a warning (lossy, but the
+  // serializer only ever emits uniform output, so round-trips are exact).
+  function noteSubspaceAlong(name: string, mag: number): void {
+    if (subspaceAlong === null) {
+      subspaceAlong = mag;
+    } else if (Math.abs(mag - subspaceAlong) > 1e-9) {
+      warnings.push(
+        `'${name}': magnitude ${formatCoeff(mag)} folded onto the shared ` +
+          `subspace-along ${formatCoeff(subspaceAlong)} (subspace terms share one along)`,
+      );
+    }
+  }
+
+  function ensureUnique(name: string): void {
+    if (rack.has(name)) {
+      throw new ExpressionParseError(`'${name}' appears more than once`, expr, null);
+    }
+  }
 
   for (const term of terms) {
     if (term.kind === "manifold") {
-      const trigger: Trigger = term.trigger
-        ? KEYWORD_TO_TRIGGER[term.trigger]
-        : "BOTH";
-      const existing = rack.get(term.name);
-      if (existing) {
-        throw new ExpressionParseError(
-          existing.mode === "position"
-            ? `manifold '${term.name}' appears more than once`
-            : `'${term.name}' appears as both a vector and a manifold term`,
-          expr,
-          null,
-        );
+      const trigger: Trigger = term.trigger ? KEYWORD_TO_TRIGGER[term.trigger] : "BOTH";
+      ensureUnique(term.name);
+      // Curved iff a 2-coeff (along,onto) slot was given, or the catalog
+      // says this fit is non-flat.  Else flat (subspace).
+      const curved = term.onto !== null || isFlat(term.name) === false;
+      if (curved) {
+        rack.set(term.name, {
+          mode: "manifold",
+          blend: term.coeff,
+          onto: term.onto ?? 0,
+          coords: term.coords ?? [],
+          label: term.label,
+          variant: term.variant,
+          trigger,
+          enabled: true,
+        });
+      } else {
+        noteSubspaceAlong(term.name, term.coeff);
+        rack.set(term.name, {
+          mode: "subspace",
+          coords: term.coords ?? [],
+          label: term.label,
+          variant: term.variant,
+          trigger,
+          enabled: true,
+        });
       }
-      // Label-form term: ``coords`` is null on the parser output and
-      // will be filled in when the card resolves through the catalog's
-      // ``node_labels`` (else stays empty until the user pulls on the
-      // XYPad).  Coord-form: ``coords`` is the literal tuple, ``label``
-      // is null.
-      rack.set(term.name, {
-        mode: "position",
-        blend: term.coeff,
-        onto: term.onto ?? 0,
-        coords: term.coords ?? [],
-        label: term.label,
-        trigger,
-        enabled: true,
-      });
       continue;
     }
+
+    // A "vector" AST term — a flat concept addressed as a pole/DiM atom.
+    // It lowers to a label-form subspace term toward the signed pole; the
+    // pre-4.1 projection / ablation operators are dropped with a warning.
     const sel = term.selector;
     const baseKey = atomKey(sel.base);
-    const trigger: Trigger = term.trigger
-      ? KEYWORD_TO_TRIGGER[term.trigger]
-      : "BOTH";
-
+    const trigger: Trigger = term.trigger ? KEYWORD_TO_TRIGGER[term.trigger] : "BOTH";
     if (term.ablation) {
-      if (sel.operator !== null) {
-        throw new ExpressionParseError(
-          "ablation does not compose with projection operators",
-          expr,
-          sel.base.col,
-        );
-      }
-      mergeAblation(rack, baseKey, term.coeff, trigger, sel.base.variant);
-      continue;
-    }
-
-    if (sel.operator !== null) {
-      // Projection term: base + (~|) + onto.
-      const onto = sel.onto!;
-      const projection: ProjectionSpec = {
-        op: sel.operator,
-        target: atomKey(onto),
-      };
-      mergeProjected(
-        rack,
-        baseKey,
-        term.coeff,
-        trigger,
-        sel.base.variant,
-        projection,
+      warnings.push(
+        `'!${baseKey}': ablation is no longer authorable in the rack; steering toward the concept instead`,
       );
-      continue;
     }
-
-    mergePlain(rack, baseKey, term.coeff, trigger, sel.base.variant);
-  }
-  return rack;
-}
-
-/** Narrow a same-key entry to vector mode, or throw — a name can't appear as
- *  both a vector (pole/DiM) term and a position (``%``) term. */
-function asVector(
-  existing: SteerEntry | undefined,
-  key: string,
-): VectorSteerEntry | undefined {
-  if (existing && existing.mode !== "vector") {
-    throw new ExpressionParseError(
-      `'${key}' appears as both a vector and a manifold term`,
-      key,
-      null,
-    );
-  }
-  return existing;
-}
-
-function mergePlain(
-  rack: Map<string, SteerEntry>,
-  key: string,
-  coeff: number,
-  trigger: Trigger,
-  variant: Variant,
-): void {
-  const existing = asVector(rack.get(key), key);
-  if (!existing) {
-    rack.set(key, {
-      mode: "vector",
-      alpha: coeff,
-      trigger,
-      variant,
-      projection: null,
-      ablate: false,
-      enabled: true,
-    });
-    return;
-  }
-  if (existing.ablate) {
-    throw new ExpressionParseError(
-      `concept '${key}' appears as both plain and ablation`,
-      key,
-      null,
-    );
-  }
-  if (existing.projection) {
-    throw new ExpressionParseError(
-      `concept '${key}' appears both as plain and projection target; use distinct names`,
-      key,
-      null,
-    );
-  }
-  if (existing.trigger !== trigger) {
-    throw new ExpressionParseError(
-      `concept '${key}' appears with conflicting triggers`,
-      key,
-      null,
-    );
-  }
-  if (existing.variant !== variant) {
-    throw new ExpressionParseError(
-      `concept '${key}' appears with conflicting variants`,
-      key,
-      null,
-    );
-  }
-  existing.alpha += coeff;
-}
-
-function mergeProjected(
-  rack: Map<string, SteerEntry>,
-  baseKey: string,
-  coeff: number,
-  trigger: Trigger,
-  variant: Variant,
-  projection: ProjectionSpec,
-): void {
-  const existing = asVector(rack.get(baseKey), baseKey);
-  if (!existing) {
+    if (sel.operator !== null) {
+      warnings.push(
+        `'${baseKey}${sel.operator}${atomKey(sel.onto!)}': projection is no longer authorable in the rack; the '${sel.operator}' operator was dropped`,
+      );
+    }
+    ensureUnique(baseKey);
+    // Signed pole → node label; magnitude → the shared master.  Bipolar
+    // concepts (``a.b``) pick ``a`` for coeff ≥ 0 and ``b`` for coeff < 0;
+    // a monopolar concept keeps the (signed) coeff on the master.
+    const poles = sel.base.concept.split(".");
+    const negative = poles.length > 1 ? poles[1] : null;
+    const label = negative !== null ? (term.coeff >= 0 ? poles[0] : negative) : poles[0];
+    const mag = negative !== null ? Math.abs(term.coeff) : term.coeff;
+    noteSubspaceAlong(baseKey, mag);
     rack.set(baseKey, {
-      mode: "vector",
-      alpha: coeff,
+      mode: "subspace",
+      coords: [],
+      label,
+      variant: sel.base.variant,
       trigger,
-      variant,
-      projection,
-      ablate: false,
       enabled: true,
     });
-    return;
   }
-  if (existing.ablate || !existing.projection) {
-    throw new ExpressionParseError(
-      `projection '${baseKey}' conflicts with a plain entry of the same name`,
-      baseKey,
-      null,
-    );
-  }
-  if (
-    existing.projection.op !== projection.op ||
-    existing.projection.target !== projection.target ||
-    existing.trigger !== trigger ||
-    existing.variant !== variant
-  ) {
-    throw new ExpressionParseError(
-      `projection '${baseKey}' appears with conflicting attributes`,
-      baseKey,
-      null,
-    );
-  }
-  existing.alpha += coeff;
-}
-
-function mergeAblation(
-  rack: Map<string, SteerEntry>,
-  baseKey: string,
-  coeff: number,
-  trigger: Trigger,
-  variant: Variant,
-): void {
-  const existing = asVector(rack.get(baseKey), baseKey);
-  if (!existing) {
-    rack.set(baseKey, {
-      mode: "vector",
-      alpha: coeff,
-      trigger,
-      variant,
-      projection: null,
-      ablate: true,
-      enabled: true,
-    });
-    return;
-  }
-  if (!existing.ablate) {
-    throw new ExpressionParseError(
-      `ablation '!${baseKey}' conflicts with a non-ablation entry of the same name`,
-      baseKey,
-      null,
-    );
-  }
-  if (existing.trigger !== trigger || existing.variant !== variant) {
-    throw new ExpressionParseError(
-      `ablation '!${baseKey}' appears with conflicting attributes`,
-      baseKey,
-      null,
-    );
-  }
-  existing.alpha += coeff;
+  return { rack, subspaceAlong: subspaceAlong ?? DEFAULT_COEFF, warnings };
 }

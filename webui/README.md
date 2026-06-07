@@ -61,10 +61,10 @@ src/
     StatusFooter.svelte          # ● gen N/M [bar] · t/s · elapsed · ppl
     Chat.svelte                  # thinking-collapsible + live probe-tinted tokens + ⋮ actions menu + auto-regen/pinned split
     SamplingStrip.svelte         # T / P / K / max / seed / thinking + segmented apply-mode
-    SteeringRack.svelte          # subspace + manifold groups of steer cards + "+ subspace/manifold steer"
+    SteeringRack.svelte          # subspace group (+ shared "subspace along" master) + manifold group of steer cards + "+ subspace/manifold steer"
     ProbeRack.svelte             # subspace + manifold groups of probe cards + sort + "+ subspace/manifold probe"
     rack/RackCard.svelte         # shared card chrome (statline on top, controls/meters below)
-    rack/SteerCard.svelte        # unified steer card — vector (pole-framed α slider / projection / ablate / variant) | position (snap + XYPad + along / onto)
+    rack/SteerCard.svelte        # unified steer card — branches on entry.mode (snap-to-node + XYPad both); subspace = position only (shared along master) | manifold = position + per-card along / onto
     rack/ProbeCard.svelte        # unified probe card — bipolar bar | scalar/fraction + nearest; curved adds coords / residual / mini-map
     loom/                        # LoomSidebar + LoomNode + LoomEdge
   drawers/

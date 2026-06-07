@@ -1,49 +1,35 @@
 <script lang="ts">
   // The steering rack — one unified steerRack, two harmonised groups split
-  // on geometry, not artifact type:
+  // on geometry, the entry's own ``mode``:
   //
-  //   subspace (flat) — every vector-mode term (2-node bipolar / monopolar
-  //     pole) plus every position-mode term whose catalog fit_mode is pca /
-  //     baked (a flat affine subspace, e.g. personas).
-  //   manifold (curved) — the remaining position-mode terms (e.g. pad).
+  //   subspace (flat)   — a 2-node bipolar axis through the rank-8 personas
+  //     fan.  Shares one rack-level "subspace along" master (the merged
+  //     affine subspace slides once), so the cards carry no per-card along.
+  //   manifold (curved) — curved fits (e.g. pad), each its own injection with
+  //     a per-card along + onto.
   //
   // Every row is one SteerCard wearing the same RackCard chrome; the family
-  // is signalled only by accent colour + marker glyph, and the card branches
-  // its body on entry.mode.  Light group sub-headers; an empty group hides.
-  // Footer keeps the + add steering / + add manifold entry points and their
-  // drawer targets.
+  // is signalled only by accent colour + marker glyph.  Light group
+  // sub-headers; an empty group hides.  Footer keeps the + add steering /
+  // + add manifold entry points and their drawer targets.
 
   import SteerCard from "./rack/SteerCard.svelte";
+  import Slider from "../lib/Slider.svelte";
   import {
     steerRack,
-    manifoldByName,
+    setSubspaceAlong,
     openDrawer,
   } from "../lib/stores.svelte";
 
-  /** A position (manifold) term is subspace iff its catalog fit_mode is flat
-   *  (pca / baked); otherwise it's the curved manifold family.  Vector terms
-   *  are always subspace. */
-  function isFlatManifold(name: string): boolean {
-    const fm = manifoldByName(name)?.fit_mode;
-    return fm === "pca" || fm === "baked";
-  }
-
-  // Subspace = every vector term + every flat position term.  Alphabetized
-  // for stable order — Map iteration tracks insertion which makes the rack
-  // jump around.
+  // Alphabetized for stable order — Map iteration tracks insertion which
+  // makes the rack jump around.
   const subspaceTerms = $derived.by(() => {
-    const arr = [...steerRack.entries.entries()].filter(
-      ([n, e]) => e.mode === "vector" || isFlatManifold(n),
-    );
+    const arr = [...steerRack.entries.entries()].filter(([, e]) => e.mode === "subspace");
     arr.sort((a, b) => a[0].localeCompare(b[0]));
     return arr;
   });
-
-  // Manifold = curved position terms only.
   const curvedTerms = $derived.by(() => {
-    const arr = [...steerRack.entries.entries()].filter(
-      ([n, e]) => e.mode === "position" && !isFlatManifold(n),
-    );
+    const arr = [...steerRack.entries.entries()].filter(([, e]) => e.mode === "manifold");
     arr.sort((a, b) => a[0].localeCompare(b[0]));
     return arr;
   });
@@ -51,6 +37,10 @@
   const subspaceCount = $derived(subspaceTerms.length);
   const manifoldCount = $derived(curvedTerms.length);
   const count = $derived(subspaceCount + manifoldCount);
+
+  function onAlongInput(v: number): void {
+    if (Number.isFinite(v)) setSubspaceAlong(v);
+  }
 </script>
 
 <section class="rack" aria-label="Steering rack">
@@ -67,6 +57,24 @@
     {#if count > 0}
       {#if subspaceCount > 0}
         <h3 class="group-header subspace">subspace</h3>
+        <!-- Shared "subspace along" master — the single slide magnitude every
+             flat term serializes with (the merged affine subspace slides
+             once).  Per-term relative weight lives in each card's position. -->
+        <div
+          class="along-master"
+          title="shared subspace-along — one slide magnitude for every flat term"
+        >
+          <span class="along-label">along</span>
+          <Slider
+            value={steerRack.subspaceAlong}
+            min={0}
+            max={2}
+            step={0.05}
+            oninput={onAlongInput}
+            ariaLabel="shared subspace along"
+          />
+          <span class="along-val">{steerRack.subspaceAlong.toFixed(2)}</span>
+        </div>
         {#each subspaceTerms as [name, entry] (name)}
           <SteerCard {name} {entry} />
         {/each}
@@ -183,6 +191,28 @@
   .group-header.manifold {
     border-left: 2px solid var(--accent-purple);
     padding-left: var(--space-2);
+  }
+
+  /* Shared subspace-along master — sits between the subspace header and its
+   * cards, reading as a group-level control rather than a per-card one. */
+  .along-master {
+    display: grid;
+    grid-template-columns: minmax(3em, auto) 1fr 3em;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-1) var(--space-2) var(--space-2);
+    border-left: 2px solid var(--accent);
+  }
+  .along-label {
+    color: var(--fg-muted);
+    font-size: var(--text-xs);
+    text-transform: lowercase;
+  }
+  .along-val {
+    color: var(--fg-muted);
+    font-size: var(--text-xs);
+    font-variant-numeric: tabular-nums;
+    text-align: right;
   }
 
   /* Anchored at the bottom of the rack.  Border-top mirrors the probe

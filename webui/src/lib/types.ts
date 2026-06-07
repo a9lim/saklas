@@ -1113,73 +1113,75 @@ export interface ProjectionSpec {
 
 // ----------------------------------------------------- steer rack --
 //
-// One unified steering term.  A steering vector is the K=2 flat case of a
-// manifold, so both shapes share one rack and one card; ``mode`` is the
-// discriminator the serializer reads to pick the grammar production:
+// One unified steering term, addressed as a position on a fitted geometry —
+// a steering vector is the K=2 flat case of a manifold, so there is no longer
+// a separate "vector" shape.  ``mode`` is the geometry family, the
+// discriminator the card branches on and the serializer reads:
 //
-//   ``vector``   → a bipolar/monopolar concept axis (or any pole/DiM term),
-//                  serializes as ``[α] [!] name[:variant] [~|target] [@trig]``.
-//                  Owns the signed slider, projection (``~``/``|``),
-//                  ablation (``!``), and the tensor variant.
-//   ``position`` → a placement on a fitted manifold (flat fan or curved
-//                  surface), serializes as ``[along[,onto]] name%pos [@trig]``.
-//                  Owns snap-to-node, the XYPad, and the along/onto sliders.
+//   ``subspace`` — a flat affine fit (a 2-node bipolar axis through the
+//                  rank-8 ``personas`` fan).  Every subspace term shares one
+//                  rack-level ``subspaceAlong`` master (the merged affine
+//                  subspace has a single slide), so the card carries NO
+//                  per-card along knob — only a position (snap-to-node /
+//                  XYPad).  Serializes ``<subspaceAlong> name[:variant]%pos``.
+//   ``manifold`` — a curved fit (e.g. ``pad``).  Each curved term is its own
+//                  injection, so it keeps a per-card ``along`` + ``onto``.
+//                  Serializes ``<along[,onto]> name[:variant]%pos``.
 //
-// ``mode`` is set at add time (the drawer picks the adder by node count) and
-// at parse time (a ``%`` term lands ``position``; everything else
-// ``vector``), never flipped in the UI — a 2-node axis is always addressed
-// as a pole, a multi-node manifold always as a position.  The grammar forbids
-// ``%`` composing with ``~``/``|``/``!``, which is exactly why the two modes
-// carry disjoint control fields.
+// ``mode`` is set at add time (``RackDrawer`` picks the adder off the
+// catalog's ``fit_mode``: pca/baked → subspace, spectral/authored →
+// manifold) and at parse time (a curved ``%`` or an ``onto`` coeff → manifold;
+// else subspace).  The pre-4.1 ``~``/``|`` projection and ``!`` ablation are
+// no longer authorable in the rack (a ``%`` term can't carry them); a pasted
+// expression using them parses with a one-time warning and the operator
+// dropped.  ``:variant`` survives — it rides the atom (``name:sae%pos``).
 
-/** Vector-mode steering term — a pole/DiM axis with a signed coefficient. */
-export interface VectorSteerEntry {
-  mode: "vector";
-  /** Slider value in [-1, +1].  Sign is the user's typed sign — ``serialize``
-   * preserves it as the term coefficient. */
-  alpha: number;
+/** Subspace (flat affine) steering term — a position on a flat fit.  The
+ *  magnitude is the rack-level ``subspaceAlong`` master (shared across every
+ *  subspace term — the merged affine subspace slides once), so this entry
+ *  carries no per-card coefficient; relative weight between subspace terms is
+ *  expressed by how far each position sits from neutral. */
+export interface SubspaceSteerEntry {
+  mode: "subspace";
+  /** Authoring coordinates, one per intrinsic dimension.  Rank-1 (a 2-node
+   *  concept) is a single signed coord on the bipolar axis. */
+  coords: number[];
+  /** Node-label form (``name%label``); ``null`` = free coords (drag).  A
+   *  fresh 2-node concept defaults to its positive pole's label. */
+  label: string | null;
+  /** Tensor variant — rides the atom (``name:sae%pos``).  Not authorable via
+   *  the card today (kept for round-trip of pasted/legacy expressions). */
   variant: Variant;
-  /** Optional projection — keep (``~``) or remove (``|``) the shared
-   * component with another concept. */
-  projection: ProjectionSpec | null;
-  /** When true, term is rendered as ``!name``; bare ``!`` defaults to
-   * coeff=1.0 (fully replace).  Cannot compose with projection. */
-  ablate: boolean;
   trigger: Trigger;
   /** When false, the term is excluded from serialization (visual but
    * not active). */
   enabled: boolean;
 }
 
-/** Position-mode steering term — a placement on a fitted manifold.
- *  ``coords`` is one authoring coordinate per intrinsic dimension; ``blend``
- *  (``along``) is the slide fraction toward the position in ``[0, 1]``. */
-export interface PositionSteerEntry {
-  mode: "position";
+/** Manifold (curved) steering term — a placement on a curved fit with its own
+ *  per-card ``along`` + ``onto`` (each curved term is its own injection). */
+export interface ManifoldSteerEntry {
+  mode: "manifold";
   /** ``along`` blend fraction in [0, 1] — how far to slide the in-subspace
    *  foot toward the position.  Serializes as the first value of the ``%``
    *  coefficient slot. */
   blend: number;
-  /** ``onto`` collapse fraction in [0, 1] — curved-only; pulls the
-   *  off-surface in-subspace residual onto the manifold.  ``0`` = off
-   *  (vacuous for flat/affine terms).  Serializes as the second value of
-   *  the coefficient slot (``along,onto``) only when > 0. */
+  /** ``onto`` collapse fraction in [0, 1] — pulls the off-surface in-subspace
+   *  residual onto the surface.  ``0`` = off.  Serializes as the second value
+   *  of the coefficient slot (``along,onto``) only when > 0. */
   onto: number;
   /** Authoring coordinates, one per intrinsic dimension. */
   coords: number[];
-  /** Optional node-label form of the position: when set, the term
-   *  serializes as ``<name>%<label>`` (label-form) and the coords are this
-   *  node's authoring coords mirrored for the XYPad display.  ``null`` = the
-   *  position was authored coord-wise (drag on the XYPad), serialize as the
-   *  comma-joined coord list.  Pulling on the XYPad clears the label;
-   *  picking from the snap-to-node dropdown sets it. */
+  /** Node-label form (``name%label``); ``null`` = free coords (drag). */
   label: string | null;
+  /** Tensor variant — rides the atom (``name:sae%pos``). */
+  variant: Variant;
   trigger: Trigger;
   enabled: boolean;
 }
 
-/** A racked steering term — vector (pole) or position (manifold). */
-export type SteerEntry = VectorSteerEntry | PositionSteerEntry;
+/** A racked steering term — subspace (flat) or manifold (curved). */
+export type SteerEntry = SubspaceSteerEntry | ManifoldSteerEntry;
 
 // ----------------------------------------------------- extract pairs --
 

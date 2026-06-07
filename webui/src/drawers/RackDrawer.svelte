@@ -29,7 +29,7 @@
   import { ApiError, apiManifolds, apiManifoldFitStream } from "../lib/api";
   import {
     addManifoldToRack,
-    addVectorToRack,
+    addSubspaceToRack,
     attachProbe,
     closeDrawer,
     probeRack,
@@ -38,6 +38,7 @@
     refreshManifoldList,
     refreshProbeList,
     setManifoldLabel,
+    setSubspaceLabel,
   } from "../lib/stores.svelte";
   import {
     dismissToast,
@@ -50,7 +51,6 @@
     CATEGORY_ORDER,
     DEFAULT_EXPANDED,
     categoryOf,
-    recommendedAlpha,
     type Category,
   } from "../lib/concepts";
   import DiagnosticsPanel from "../lib/manifolds/DiagnosticsPanel.svelte";
@@ -290,31 +290,29 @@
   /** Rack the manifold (if not already) and pin it to ``label`` as a
    *  label-form term, then close — the one-click "steer to this node"
    *  affordance.  A second node click on an already-racked manifold just
-   *  re-targets the existing term via ``setManifoldLabel``. */
+   *  re-targets the existing term.  Routes by family: subspace (flat) lands
+   *  a subspace term at the shared along; manifold (curved) a curved term. */
   function onSteerNode(m: ManifoldInfo, label: string): void {
     if (!m.fitted_for_session) return;
     const key = rowKey(m);
-    addManifoldToRack(key);
-    setManifoldLabel(key, label);
+    if (family === "subspace") {
+      addSubspaceToRack(key);
+      setSubspaceLabel(key, label);
+    } else {
+      addManifoldToRack(key);
+      setManifoldLabel(key, label);
+    }
     closeDrawer();
   }
 
-  /** +steer dispatch — the one behavioural fork between the families.
-   *  Subspace: a 2-node ``pca`` axis is a bipolar steering vector, so it
-   *  goes through the vector rack at its recommended α; any other flat
-   *  (a higher-rank fan like ``personas``) joins as a manifold term.
-   *  Manifold: always a manifold term. */
+  /** +steer dispatch — flat fits join as a subspace term (magnitude is the
+   *  shared "subspace along" master); curved fits join as a manifold term
+   *  with their own per-card along/onto.  The drawer ``family`` already
+   *  filtered the rows, so it is the discriminator. */
   function onSteer(m: ManifoldInfo): void {
     if (isRacked(m)) return;
-    if (
-      family === "subspace"
-      && m.node_count === 2
-      && (m.fit_mode ?? "authored") === "pca"
-    ) {
-      addVectorToRack(m.name, recommendedAlpha(m));
-    } else {
-      addManifoldToRack(rowKey(m));
-    }
+    if (family === "subspace") addSubspaceToRack(rowKey(m));
+    else addManifoldToRack(rowKey(m));
     closeDrawer();
   }
 

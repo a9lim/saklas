@@ -16,8 +16,9 @@
 
   import { ApiError, apiVectors } from "../lib/api";
   import {
-    addVectorToRack,
+    addSubspaceToRack,
     closeDrawer,
+    manifoldByName,
     steerRack,
   } from "../lib/stores.svelte";
   import {
@@ -25,8 +26,15 @@
     parseExpression,
     serializeExpression,
   } from "../lib/expression";
-  import type { SteerEntry, Variant } from "../lib/types";
+  import type { Variant } from "../lib/types";
   import Disclosure from "../lib/Disclosure.svelte";
+
+  /** Catalog-backed flat-vs-curved predicate for the parser, so a pasted
+   *  ``pad%…`` lands as a manifold term and ``personas%…`` as subspace. */
+  function isFlat(name: string): boolean {
+    const fm = manifoldByName(name)?.fit_mode;
+    return fm ? fm === "pca" || fm === "baked" : true;
+  }
 
   // Drawer host forwards { params } — unused.
   let _drawerProps: { params?: unknown } = $props();
@@ -58,8 +66,8 @@
       return;
     }
     try {
-      const rack = parseExpression(expr);
-      preview = serializeExpression(rack);
+      const parsed = parseExpression(expr, { isFlat });
+      preview = serializeExpression(parsed.rack, parsed.subspaceAlong);
       parseError = null;
       parseCol = null;
       // Soft check: which atoms aren't present in the user's rack?
@@ -67,7 +75,7 @@
       // loaded yet, so this is informational, not a hard block.
       const known = new Set(rackNames);
       const unknown: string[] = [];
-      for (const key of rack.keys()) {
+      for (const key of parsed.rack.keys()) {
         if (!known.has(key)) unknown.push(key);
       }
       unknownTerms = unknown;
@@ -90,18 +98,17 @@
   function applyVariantToExpression(): void {
     const expr = expression.trim();
     if (!expr) return;
-    let rack: Map<string, SteerEntry>;
+    let parsed;
     try {
-      rack = parseExpression(expr);
+      parsed = parseExpression(expr, { isFlat });
     } catch {
       return;
     }
-    for (const entry of rack.values()) {
-      // Variant lives on vector (pole/DiM) terms only; a ``%`` position term
-      // carries no variant suffix.
-      if (entry.mode === "vector") entry.variant = effectiveVariant();
+    // Variant rides the atom on every term shape (``name:sae%pos``).
+    for (const entry of parsed.rack.values()) {
+      entry.variant = effectiveVariant();
     }
-    expression = serializeExpression(rack);
+    expression = serializeExpression(parsed.rack, parsed.subspaceAlong);
   }
 
   function effectiveVariant(): Variant {
@@ -141,7 +148,7 @@
         name: name.trim(),
         expression: expression.trim(),
       });
-      addVectorToRack(r.name ?? name.trim());
+      addSubspaceToRack(r.name ?? name.trim());
       closeDrawer();
     } catch (e) {
       if (e instanceof ApiError) {

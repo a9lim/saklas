@@ -1,21 +1,29 @@
 <script lang="ts">
+  // Recipe builder — a list editor over the unified steer rack.  Since 4.1
+  // every term is a position on a fitted geometry; per-card coefficient,
+  // projection, ablation, and variant editing moved out (subspace terms share
+  // one "subspace along" master, positions are authored on the cards).  What
+  // survives here: the canonical-expression readout, an add-by-name field, the
+  // shared subspace-along master, and a per-term trigger / enable / remove
+  // list across both families.
   import {
-    addVectorToRack,
+    addSubspaceToRack,
     closeDrawer,
     currentSteeringExpression,
     openDrawer,
-    removeVectorFromRack,
-    setVectorAblate,
-    setVectorAlpha,
-    setVectorEnabled,
-    setVectorProjection,
-    setVectorTrigger,
-    setVectorVariant,
+    removeSubspaceFromRack,
+    removeManifoldFromRack,
+    setSubspaceTrigger,
+    setSubspaceEnabled,
+    setManifoldTrigger,
+    setManifoldEnabled,
+    setSubspaceAlong,
     steerRack,
     vectorsState,
   } from "../lib/stores.svelte";
-  import type { Trigger, Variant, VectorSteerEntry } from "../lib/types";
+  import type { SteerEntry, Trigger } from "../lib/types";
   import Select from "../lib/Select.svelte";
+  import Slider from "../lib/Slider.svelte";
   import Checkbox from "../lib/Checkbox.svelte";
 
   let _drawerProps: { params?: unknown } = $props();
@@ -23,17 +31,13 @@
     void _drawerProps.params;
   });
 
-  let newVector = $state("");
+  let newTerm = $state("");
   let copied = $state(false);
 
-  // The recipe builder edits vector (pole/DiM) terms — α slider, projection,
-  // ablation.  Position (manifold ``%``) terms have no α and are authored on
-  // their own card, so they're filtered out of this list.
   const entries = $derived(
-    [...steerRack.entries.entries()].filter(
-      (e): e is [string, VectorSteerEntry] => e[1].mode === "vector",
-    ),
+    [...steerRack.entries.entries()].sort((a, b) => a[0].localeCompare(b[0])),
   );
+  const hasSubspace = $derived(entries.some(([, e]) => e.mode === "subspace"));
   const expression = $derived(currentSteeringExpression());
   const allNames = $derived.by(() => {
     const names = new Set<string>([...vectorsState.names, ...steerRack.profiles.keys()]);
@@ -49,10 +53,26 @@
   ];
 
   function add(): void {
-    const name = newVector.trim();
+    const name = newTerm.trim();
     if (!name) return;
-    addVectorToRack(name);
-    newVector = "";
+    addSubspaceToRack(name);
+    newTerm = "";
+  }
+
+  function setTrig(name: string, entry: SteerEntry, t: Trigger): void {
+    if (entry.mode === "subspace") setSubspaceTrigger(name, t);
+    else setManifoldTrigger(name, t);
+  }
+  function setEn(name: string, entry: SteerEntry, v: boolean): void {
+    if (entry.mode === "subspace") setSubspaceEnabled(name, v);
+    else setManifoldEnabled(name, v);
+  }
+  function remove(name: string, entry: SteerEntry): void {
+    if (entry.mode === "subspace") removeSubspaceFromRack(name);
+    else removeManifoldFromRack(name);
+  }
+  function onAlongInput(v: number): void {
+    if (Number.isFinite(v)) setSubspaceAlong(v);
   }
 
   async function copyExpression(): Promise<void> {
@@ -64,30 +84,13 @@
       copied = false;
     }
   }
-
-  function setProjection(name: string, op: "~" | "|", target: string): void {
-    const t = target.trim();
-    setVectorProjection(name, t ? { op, target: t } : null);
-  }
-
-  function isVariant(raw: string): raw is Variant {
-    return (
-      raw === "raw" ||
-      raw === "sae" ||
-      raw === "role" ||
-      raw === "from" ||
-      raw.startsWith("sae-") ||
-      raw.startsWith("role-") ||
-      raw.startsWith("from-")
-    );
-  }
 </script>
 
 <section class="drawer-shell" aria-label="Recipe builder drawer">
   <header class="header">
     <div>
       <span class="title">recipe builder</span>
-      <p>visual editor for coefficients, variants, projections, ablations, and triggers</p>
+      <p>canonical expression, the shared subspace-along, and per-term triggers</p>
     </div>
     <button type="button" class="close" aria-label="Close" onclick={closeDrawer}>×</button>
   </header>
@@ -105,7 +108,7 @@
     </section>
 
     <section class="add-card">
-      <input list="recipe-concepts" bind:value={newVector} placeholder="add concept or ns/concept" onkeydown={(ev) => { if (ev.key === "Enter") add(); }} />
+      <input list="recipe-concepts" bind:value={newTerm} placeholder="add concept or ns/concept" onkeydown={(ev) => { if (ev.key === "Enter") add(); }} />
       <datalist id="recipe-concepts">
         {#each allNames as name (name)}
           <option value={name}></option>
@@ -115,9 +118,27 @@
       <button type="button" onclick={() => openDrawer("subspace")}>browse…</button>
     </section>
 
+    {#if hasSubspace}
+      <section class="along-card">
+        <span class="label">subspace along (shared)</span>
+        <div class="along-row">
+          <Slider
+            value={steerRack.subspaceAlong}
+            min={0}
+            max={2}
+            step={0.05}
+            oninput={onAlongInput}
+            ariaLabel="shared subspace along"
+          />
+          <strong>{steerRack.subspaceAlong.toFixed(2)}</strong>
+        </div>
+        <p class="muted">one slide magnitude for every flat term — relative weight lives in each term's position (set on its card)</p>
+      </section>
+    {/if}
+
     <section class="terms">
       {#if entries.length === 0}
-        <div class="empty">no active steering terms, add a vector to start building a recipe</div>
+        <div class="empty">no active steering terms, add a concept or manifold to start</div>
       {:else}
         {#each entries as [name, entry] (name)}
           <article class="term" class:disabled={!entry.enabled}>
@@ -125,94 +146,24 @@
               <span class="enable">
                 <Checkbox
                   checked={entry.enabled}
-                  onchange={(v) => setVectorEnabled(name, v)}
+                  onchange={(v) => setEn(name, entry, v)}
                   ariaLabel="enabled"
                 />
                 <span>{name}</span>
+                <span class="mode-badge mode-{entry.mode}">{entry.mode}</span>
               </span>
-              <button type="button" class="remove" aria-label={`Remove ${name}`} onclick={() => removeVectorFromRack(name)}>×</button>
+              <button type="button" class="remove" aria-label={`Remove ${name}`} onclick={() => remove(name, entry)}>×</button>
             </header>
 
-            <div class="alpha">
-              <label>
-                <span>alpha</span>
-                <input
-                  type="range"
-                  min="-1"
-                  max="1"
-                  step="0.01"
-                  value={entry.alpha}
-                  oninput={(ev) => setVectorAlpha(name, Number((ev.currentTarget as HTMLInputElement).value))}
-                />
-                <strong>{entry.alpha.toFixed(2)}</strong>
-              </label>
-            </div>
-
-            <div class="control-grid">
-              <label class="field">
-                <span>trigger</span>
-                <Select
-                  value={entry.trigger}
-                  options={triggers}
-                  onchange={(v) => setVectorTrigger(name, v)}
-                  ariaLabel="trigger"
-                />
-              </label>
-
-              <label class="field">
-                <span>variant</span>
-                <input
-                  value={entry.variant}
-                  placeholder="raw | sae-* | role-* | from-*"
-                  oninput={(ev) => {
-                    const raw = (ev.currentTarget as HTMLInputElement).value.trim();
-                    if (isVariant(raw)) {
-                      setVectorVariant(name, raw);
-                    }
-                  }}
-                />
-              </label>
-
-              <label class="field">
-                <span>projection</span>
-                <Select
-                  value={entry.projection?.op ?? ""}
-                  options={[
-                    { value: "", label: "none" },
-                    { value: "~", label: "keep shared (~)" },
-                    { value: "|", label: "remove shared (|)" },
-                  ]}
-                  onchange={(op) => {
-                    if (!op) setVectorProjection(name, null);
-                    else setProjection(name, op, entry.projection?.target ?? "");
-                  }}
-                  disabled={entry.ablate}
-                  ariaLabel="projection"
-                />
-              </label>
-
-              <label class="field">
-                <span>projection target</span>
-                <input
-                  list="recipe-concepts"
-                  value={entry.projection?.target ?? ""}
-                  disabled={entry.ablate}
-                  oninput={(ev) => {
-                    const target = (ev.currentTarget as HTMLInputElement).value;
-                    setProjection(name, entry.projection?.op ?? "|", target);
-                  }}
-                />
-              </label>
-            </div>
-
-            <span class="ablate">
-              <Checkbox
-                checked={entry.ablate}
-                onchange={(v) => setVectorAblate(name, v)}
-                ariaLabel="mean-ablate"
+            <label class="field">
+              <span>trigger</span>
+              <Select
+                value={entry.trigger}
+                options={triggers}
+                onchange={(v) => setTrig(name, entry, v)}
+                ariaLabel="trigger"
               />
-              <span>mean-ablate this concept instead of steering toward it</span>
-            </span>
+            </label>
           </article>
         {/each}
       {/if}
@@ -227,7 +178,7 @@
   .header p { margin: var(--space-2) 0 0; color: var(--fg-muted); }
   .close, .remove { background: transparent; border: 0; color: var(--fg-muted); font-size: var(--text-md); }
   .body { display: grid; gap: var(--space-5); padding: var(--space-6); overflow: auto; }
-  .expression-card, .add-card, .term { border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); padding: var(--space-6); }
+  .expression-card, .add-card, .along-card, .term { border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); padding: var(--space-6); }
   .expression-card { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: var(--space-5); align-items: center; }
   .label, .field span { display: block; color: var(--fg-muted); font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0; margin-bottom: var(--space-2); }
   code { color: var(--accent-amber); font-family: var(--font-mono); white-space: pre-wrap; word-break: break-word; }
@@ -237,17 +188,18 @@
   .add-card input { flex: 1; }
   input { border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-deep); color: var(--fg); padding: var(--space-4); font-family: var(--font-mono); font-size: var(--text-xs); }
   input:focus { outline: none; border-color: var(--accent); }
+  .along-row { display: grid; grid-template-columns: 1fr 4rem; gap: var(--space-5); align-items: center; }
+  .along-row strong { color: var(--accent); font-family: var(--font-mono); text-align: right; }
+  .muted { color: var(--fg-muted); font-size: var(--text-xs); margin: var(--space-3) 0 0; }
   .terms { display: grid; gap: var(--space-5); }
   .term { display: grid; gap: var(--space-5); }
   .term.disabled { opacity: 0.58; }
   .term header { display: flex; align-items: center; justify-content: space-between; gap: var(--space-5); }
-  .enable, .ablate { display: flex; align-items: center; gap: var(--space-4); color: var(--fg); }
+  .enable { display: flex; align-items: center; gap: var(--space-4); color: var(--fg); }
   .enable span { font-weight: var(--weight-bold); }
-  .alpha label { display: grid; grid-template-columns: auto 1fr 4rem; gap: var(--space-5); align-items: center; color: var(--fg-muted); text-transform: uppercase; letter-spacing: 0; font-size: var(--text-xs); }
-  .alpha strong { color: var(--accent); font-family: var(--font-mono); text-align: right; }
-  input[type="range"] { padding: 0; accent-color: var(--accent); }
-  .control-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-5); }
+  .mode-badge { font-weight: var(--weight-normal); font-size: var(--text-2xs); text-transform: uppercase; border: 1px solid var(--border); border-radius: var(--radius); padding: 0 var(--space-2); color: var(--fg-muted); }
+  .mode-badge.mode-subspace { border-color: var(--accent); color: var(--accent); }
+  .mode-badge.mode-manifold { border-color: var(--accent-purple); color: var(--accent-purple); }
   .field { display: grid; gap: var(--space-1); }
-  .ablate { color: var(--fg-muted); font-size: var(--text-xs); }
   .empty { display: grid; place-items: center; min-height: 10rem; color: var(--fg-muted); border: 1px solid var(--border); border-radius: var(--radius); }
 </style>
