@@ -382,7 +382,8 @@ io/AGENTS.md). `auto` runs `select_topology` at fit time (`core/manifold.py`):
 flat (`pca`) vs curved (`spectral`) chosen by GCV in a shared whitened-reduced
 metric, plus periodic (`BoxDomain`) axes detected by Vietoris–Rips H1 persistent
 homology (loop counter, robust to ellipse distortion) coordinated off the
-spectral eigenpairs. The resolved geometry is per-model and recorded in the
+spectral eigenpairs, with a guarded single-cycle fallback for faint rings PH's
+hole-size threshold misses (days-of-week and the like). The resolved geometry is per-model and recorded in the
 sidecar (`resolved_fit_mode` + the ranked `topology_candidates`). Sphere is
 authored-only — not an auto candidate. The curved (`spectral`/`auto`) RBF fit is
 **penalized**: a GCV-selected smoothing λ (`fit_rbf_smoothed`) regularizes the
@@ -453,7 +454,11 @@ loop; a 2-torus as two; a blob/arc/line as zero), and the spectral eigenpairs
 supply the angle coordinates, routing a detection to a periodic `BoxDomain`.
 Spheres are **authored-only** (a speculative topology that's the least reliable to
 detect from few centroids). `--persistence-frac` tunes the loop-significance
-threshold. The curved fit (`spectral`, or an `auto` resolving to it) is a
+threshold. PH counts loops by *hole size*, so a **faint ring** — a small cyclic
+modulation on a near-equidistant heap (e.g. day-of-week centroids) — slips under
+its threshold; a complementary guarded single-cycle fallback (1-D max-degree +
+closed-tour + local-recall + cyclic-grading tests) catches it when PH counts zero
+and routes one periodic axis, while rejecting arcs/lines/grids/blobs/persona-fans. The curved fit (`spectral`, or an `auto` resolving to it) is a
 **penalized** RBF — `--smoothing auto` GCV-selects a smoothing λ (default), `0` is
 exact interpolation, a float is a fixed λ; the penalty regularizes the surface
 against centroid noise without touching the hot-path evaluator.

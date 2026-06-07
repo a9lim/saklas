@@ -3211,6 +3211,137 @@ def _count_persistent_loops(
     return min(count, max_dim)
 
 
+# Faint single-cycle fallback thresholds (complement H1 persistence, which only
+# counts *fat* loops — a thin ring slips under it).  Validated for sensitivity
+# (synthetic faint rings + real day-of-week centroids) and specificity (~0.4%
+# false-positive on random K=7 Gaussian heaps, ~0 for K>=10; lines, open arcs,
+# grids, branched theta/Y, and high-D persona-style fans all rejected).
+_CYCLE_MIN_NODES = 7        # below this, too few points to detect a ring reliably
+_CYCLE_MAX_NODES = 128      # above this, robust loops are visible to H1; cap the tour
+_CYCLE_MAX_DEGREE = 3       # symmetric 2-NN graph: a 1-D loop; 2-D/fan => deg >= 4
+_CYCLE_CLOSURE_MAX = 2.0    # max/median tour edge: a closed loop is edge-uniform
+_CYCLE_RECALL_MIN = 0.90    # tour-neighbour top-2 recall: the cycle is *local*
+_CYCLE_CONTRAST_MIN = 1.08  # mean d(sep=2)/d(sep=1): genuine cyclic growth
+
+
+def _nn_tour(dist: torch.Tensor) -> list[int]:
+    """Greedy nearest-neighbour tour (best of all starts) + 2-opt — a cheap,
+    deterministic TSP heuristic recovering a candidate cyclic order over the K
+    centroids.  ``O(K^3)``; the caller gates ``K <= _CYCLE_MAX_NODES``."""
+    D = dist.tolist()
+    K = len(D)
+    best_tour: list[int] | None = None
+    best_len = math.inf
+    for start in range(K):
+        unvisited = set(range(K))
+        unvisited.discard(start)
+        tour = [start]
+        while unvisited:
+            row = D[tour[-1]]
+            nxt = min(unvisited, key=row.__getitem__)
+            tour.append(nxt)
+            unvisited.discard(nxt)
+        length = sum(D[tour[i]][tour[(i + 1) % K]] for i in range(K))
+        if length < best_len:
+            best_len, best_tour = length, tour
+    tour = best_tour if best_tour is not None else list(range(K))
+    improved = True
+    while improved:
+        improved = False
+        for i in range(K - 1):
+            for j in range(i + 2, K):
+                if i == 0 and j == K - 1:
+                    continue  # the closing edge — reversing it is a no-op
+                a, b = tour[i], tour[i + 1]
+                c, e = tour[j], tour[(j + 1) % K]
+                if D[a][b] + D[c][e] > D[a][c] + D[b][e] + 1e-9:
+                    tour[i + 1:j + 1] = tour[i + 1:j + 1][::-1]
+                    improved = True
+    return tour
+
+
+def _faint_cycle_coords(distances: torch.Tensor) -> torch.Tensor | None:
+    """Recover a single periodic coordinate for a faint ``S^1`` that H1 misses.
+
+    Vietoris–Rips H1 persistence counts loops by *hole size*; a faint ring — a
+    small cyclic modulation on a near-equidistant heap, e.g. day-of-week
+    centroids at a ~16% modulation — has too thin a hole to clear the
+    persistence threshold, yet is unambiguously cyclic by graph topology.  This
+    complementary test runs only when persistence found nothing, and fires only
+    on a structure that is, in the whitened consensus metric:
+
+    - **1-D**: max degree ``<= _CYCLE_MAX_DEGREE`` in the symmetric 2-NN graph
+      (a 2-D grid or high-D fan has degree ``>= 4`` — rejects persona-style heaps
+      before any tour runs);
+    - **closed**: a greedy + 2-opt tour has near-uniform edges
+      (``max/median < _CYCLE_CLOSURE_MAX``) — a line / open arc needs one long
+      closing edge;
+    - **local**: each node's two tour-neighbours are among its two nearest
+      (``recall >= _CYCLE_RECALL_MIN``) — rejects a tour manufactured across a
+      blob or a branched (theta / Y) structure; and
+    - **graded**: mean distance grows from cyclic-separation 1 to 2
+      (``>= _CYCLE_CONTRAST_MIN``) — a real ring, not a flat simplex.
+
+    Returns the per-node angle ``(K,)`` = ``2*pi*tour_rank/K`` (a uniform
+    ``S^1`` parameterisation in the recovered cyclic order), or ``None``.  All
+    four guards must hold; they trade a small elongated-ellipse false-negative
+    (those don't arise in the sphered whitened metric, and fall back to the
+    curved fit) for a low false-positive rate on real non-cyclic concept heaps.
+    """
+    K = int(distances.shape[0])
+    if K < _CYCLE_MIN_NODES or K > _CYCLE_MAX_NODES:
+        return None
+    dist = distances.detach().to(torch.float32)
+    # (1) 1-D filter: max degree in the symmetric 2-NN graph.
+    nn2 = dist.argsort(dim=1)[:, 1:3].tolist()
+    deg: dict[int, int] = {}
+    edges_uv: set[tuple[int, int]] = set()
+    for i, row in enumerate(nn2):
+        for j in row:
+            edges_uv.add((i, j) if i < j else (j, i))
+    for u, v in edges_uv:
+        deg[u] = deg.get(u, 0) + 1
+        deg[v] = deg.get(v, 0) + 1
+    if max(deg.values()) > _CYCLE_MAX_DEGREE:
+        return None
+    # (2) closed: tour edges near-uniform (no single long closing edge).
+    tour = _nn_tour(dist)
+    D = dist.tolist()
+    tour_edges = sorted(D[tour[i]][tour[(i + 1) % K]] for i in range(K))
+    median = (tour_edges[K // 2] if K % 2
+              else 0.5 * (tour_edges[K // 2 - 1] + tour_edges[K // 2]))
+    if median <= 0.0 or tour_edges[-1] / median >= _CYCLE_CLOSURE_MAX:
+        return None
+    # (3) local: tour-neighbours among the two nearest neighbours.
+    nn2_set = [set(row) for row in nn2]
+    pos = [0] * K
+    for i, n in enumerate(tour):
+        pos[n] = i
+    hits = 0
+    for i, n in enumerate(tour):
+        hits += len({tour[(i - 1) % K], tour[(i + 1) % K]} & nn2_set[n])
+    if hits / (2 * K) < _CYCLE_RECALL_MIN:
+        return None
+    # (4) graded: distance grows from cyclic separation 1 to 2.
+    s1 = s1n = s2 = s2n = 0.0
+    for a in range(K):
+        for b in range(a + 1, K):
+            sep = min((pos[a] - pos[b]) % K, (pos[b] - pos[a]) % K)
+            if sep == 1:
+                s1 += D[a][b]; s1n += 1
+            elif sep == 2:
+                s2 += D[a][b]; s2n += 1
+    if s1n == 0 or s2n == 0:
+        return None
+    if (s2 / s2n) / max(s1 / s1n, 1e-9) < _CYCLE_CONTRAST_MIN:
+        return None
+    # Uniform S^1 coordinate in the recovered cyclic order.
+    angles = torch.zeros(K, dtype=torch.float32)
+    for i, n in enumerate(tour):
+        angles[n] = 2.0 * math.pi * i / K
+    return angles
+
+
 def _detect_periodic_axes(
     distances: torch.Tensor,
     eigvecs: torch.Tensor,
@@ -3235,6 +3366,13 @@ def _detect_periodic_axes(
        being miscounted (:func:`_is_angular_harmonic` skips harmonics of an
        already-taken axis).
 
+    When persistence counts **zero** loops, a complementary single-cycle
+    fallback (:func:`_faint_cycle_coords`) runs: PH measures hole *size*, so a
+    thin ring (a faint cyclic modulation on a near-equidistant heap — e.g.
+    day-of-week centroids) slips under its persistence threshold even though it
+    is unambiguously cyclic by graph topology.  The fallback recovers one
+    periodic axis from a guarded tour test, or confirms there is no cycle.
+
     Returns ``(angles (K, d), loop_count)`` for the ``d`` periodic axes, or
     ``None`` if no loop persists.
     """
@@ -3242,7 +3380,12 @@ def _detect_periodic_axes(
         distances, persistence_frac=persistence_frac, max_dim=max_dim,
     )
     if d < 1:
-        return None
+        # PH found no *fat* loop; try the faint single-cycle fallback before
+        # conceding there is no periodicity.
+        theta = _faint_cycle_coords(distances)
+        if theta is None:
+            return None
+        return theta.unsqueeze(1), 1
     avail = int(eigvecs.shape[1])
     angles: list[torch.Tensor] = []
     p = 0
@@ -3287,16 +3430,16 @@ def select_topology(
     each mode picks its *own* intrinsic dim with its own heuristic, so this is a
     fair model-selection comparison rather than a coordinate-count race.
 
-    **(b) periodic axes** — independently, :func:`_detect_periodic_axes` runs a
-    direct geometric circularity test on the eigenmap (constant radius + full
-    angular coverage).  Detected circles are *topology*, not surface shape — a
-    circle can be linearly embedded yet still needs a periodic domain to steer
-    around rather than across — so a confident detection routes to a periodic
-    ``BoxDomain`` (the curved path) provided its GCV is within
-    ``1.5×`` the best Euclidean fit (a guard against a spurious circle that also
-    reconstructs badly).  Spheres are **not** auto-selected (a speculative
-    topology that's the least reliable to detect from few centroids); ``S^n`` is
-    available as an *authored* domain only.
+    **(b) periodic axes** — independently, :func:`_detect_periodic_axes` counts
+    loops by Vietoris–Rips H1 *persistent homology* (a circle and an ellipse both
+    read as one loop, a 2-torus as two, a blob/arc as none), with a guarded
+    single-cycle fallback (:func:`_faint_cycle_coords`) for faint rings whose
+    hole is too thin to clear the persistence threshold.  Detected circles are
+    *topology*, not surface shape — a circle can be linearly embedded yet still
+    needs a periodic domain to steer around rather than across — so a confident
+    detection routes to a periodic ``BoxDomain`` (the curved path).  Spheres are
+    **not** auto-selected (a speculative topology that's the least reliable to
+    detect from few centroids); ``S^n`` is available as an *authored* domain only.
 
     Returns a :class:`TopologyChoice` carrying the winner's ``fit_mode`` /
     ``coords`` / ``domain`` plus the ranked candidate field for the sidecar.

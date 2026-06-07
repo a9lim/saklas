@@ -23,6 +23,7 @@ from saklas.core.manifold import (
     BoxDomain,
     CustomDomain,
     _count_persistent_loops,
+    _faint_cycle_coords,
     _is_angular_harmonic,
     select_topology,
 )
@@ -182,3 +183,101 @@ def test_select_records_candidate_ranking() -> None:
     # Candidates are ranked viable-first by score (GCV); the winner is present.
     assert any(c.name == choice.winner_name for c in choice.candidates)
     assert choice.candidates[0].viable
+
+
+# ------------------------------------ faint single-cycle fallback (S^1) ------
+#
+# H1 persistence counts loops by *hole size*, so a faint ring (a small cyclic
+# modulation on a near-equidistant heap — e.g. day-of-week centroids) slips
+# under its threshold. ``_faint_cycle_coords`` is the complementary
+# graph-topological detector that fires only when PH found nothing.
+
+def _faint_ring(k: int, mod: float = 0.16, common_dims: int = 30) -> torch.Tensor:
+    """A faint ``S^1``: a small cyclic modulation + many constant dims, so the
+    points are near-equidistant (thin hole that PH would miss)."""
+    th = torch.linspace(0, 2 * math.pi, k + 1)[:-1]
+    ring = mod * torch.stack([torch.cos(th), torch.sin(th)], dim=1)
+    return torch.cat([ring, torch.ones(k, common_dims)], dim=1)
+
+
+def _arc(k: int, deg: float) -> torch.Tensor:
+    th = torch.linspace(0, math.radians(deg), k)
+    return torch.stack([torch.cos(th), torch.sin(th)], dim=1)
+
+
+def _theta_graph() -> torch.Tensor:
+    """Two hubs joined by three parallel routes — maxdeg-3 but not S^1."""
+    mids = torch.linspace(0.5, 3.5, 3)
+    return torch.cat([
+        torch.tensor([[0.0, 0.0], [4.0, 0.0]]),
+        torch.stack([mids, torch.full((3,), 1.0)], dim=1),
+        torch.stack([mids, torch.full((3,), -1.0)], dim=1),
+        torch.stack([mids, torch.zeros(3)], dim=1),
+    ], dim=0)
+
+
+def _grid(side: int) -> torch.Tensor:
+    g = torch.arange(side, dtype=torch.float32)
+    a, b = torch.meshgrid(g, g, indexing="ij")
+    return torch.stack([a.flatten(), b.flatten()], dim=1)
+
+
+def _persona_fan(k: int, rank: int, seed: int) -> torch.Tensor:
+    """A high-D non-cyclic fan — the dangerous false-positive (personas)."""
+    g = torch.Generator().manual_seed(seed)
+    return torch.randn(k, rank, generator=g).abs() @ torch.randn(rank, 40, generator=g)
+
+
+@pytest.mark.parametrize("name,points,want", [
+    ("clean-circle-K9", _circle(9), True),
+    ("faint-ring-K7", _faint_ring(7), True),
+    ("faint-ring-K12", _faint_ring(12), True),
+    ("line-K7", torch.stack([torch.linspace(0, 1, 7), torch.zeros(7)], 1), False),
+    ("arc-210-K7", _arc(7, 210), False),
+    ("arc-300-K12", _arc(12, 300), False),
+    ("theta", _theta_graph(), False),
+    ("grid-4x4", _grid(4), False),
+    ("persona-fan-K30", _persona_fan(30, 8, 1), False),
+    ("persona-fan-K107", _persona_fan(107, 8, 2), False),
+    ("too-few-K5", _circle(5), False),  # below the K>=7 reliability gate
+])
+def test_faint_cycle_detector(name: str, points: torch.Tensor, want: bool) -> None:
+    got = _faint_cycle_coords(torch.cdist(points, points)) is not None
+    assert got is want, name
+
+
+def test_faint_cycle_recovers_uniform_ordered_angles() -> None:
+    """The recovered S^1 coordinate is uniform and in the cyclic order."""
+    coords = _faint_cycle_coords(torch.cdist(_faint_ring(8), _faint_ring(8)))
+    assert coords is not None
+    # Each node lands on a distinct 2*pi*i/8 grid point; sorted gaps are uniform.
+    ordered = torch.sort(coords).values
+    gaps = torch.diff(ordered)
+    assert torch.allclose(gaps, gaps.mean(), atol=1e-4)
+
+
+def test_faint_cycle_false_positive_rate_low() -> None:
+    """Random Gaussian heaps must rarely read as cyclic (the FP guard)."""
+    fp = 0
+    for seed in range(120):
+        g = torch.Generator().manual_seed(seed)
+        pts = torch.randn(9, 6, generator=g)
+        fp += _faint_cycle_coords(torch.cdist(pts, pts)) is not None
+    assert fp <= 2, f"random-heap false positives too high: {fp}/120"
+
+
+def test_select_faint_ring_is_periodic() -> None:
+    """End-to-end: a faint ring PH misses still routes to a periodic BoxDomain."""
+    choice = _choose(_faint_ring(9, mod=0.16, common_dims=0)[:, :2], noise=0.01)
+    # (a plain faint circle through the synthetic whitener/consensus path)
+    assert choice.winner_name == "torus-T1"
+    assert isinstance(choice.domain, BoxDomain)
+    assert choice.domain.axes[0].periodic
+
+
+def test_select_blob_not_spuriously_periodic() -> None:
+    """The fallback must not turn a random blob into a ring."""
+    for seed in range(8):
+        g = torch.Generator().manual_seed(seed)
+        choice = _choose(torch.randn(9, 4, generator=g))
+        assert not isinstance(choice.domain, BoxDomain), f"seed {seed} spurious ring"

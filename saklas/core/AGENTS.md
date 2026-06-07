@@ -312,7 +312,21 @@ shared whitened-reduced target metric, each at its own intrinsic dim
 spectral eigenpairs coordinate them (`_detect_periodic_axes`, `_is_angular_harmonic`
 dedups a circle's `cos kθ` harmonics), routing to a periodic `BoxDomain`. Returns a
 `TopologyChoice` (`fit_mode`/`coords`/`domain` + ranked `TopologyCandidate`s for
-the sidecar). Sphere is **authored-only** — not an auto candidate.
+the sidecar). Sphere is **authored-only** — not an auto candidate. PH counts loops
+by *hole size*, so a **faint ring** (a small cyclic modulation on a near-equidistant
+heap — e.g. day-of-week centroids at ~16% modulation) has too thin a hole to clear
+the persistence threshold; `_faint_cycle_coords` is the complementary single-cycle
+fallback (`_detect_periodic_axes` runs it only when PH counts zero). It fires on a
+structure that is **1-D** (symmetric 2-NN graph max-degree ≤ 3 — rejects 2-D grids
+and high-D persona-style fans), **closed** (a greedy+2-opt tour `_nn_tour` has
+near-uniform edges, `max/median < 2.0` — rejects open arcs/lines), **local** (each
+node's two tour-neighbours among its two nearest, recall ≥ 0.90 — rejects branched
+theta/Y and tours manufactured across a blob), and **graded** (mean distance grows
+from cyclic-separation 1→2 ≥ 1.08), returning a uniform `2π·rank/K` `S¹` coordinate
+in the recovered cyclic order. Gated `7 ≤ K ≤ 128`. Validated for specificity
+(~0.4% false-positive on random K=7 Gaussian heaps, ~0 for K≥10; the thresholds
+trade a small elongated-ellipse false-negative, which doesn't arise in the sphered
+whitened metric, for a low false-positive rate on real concept heaps).
 Naturalness eval: `to_hellinger`, `bhattacharyya_distance`, `fit_behavior_manifold`,
 `trajectory_naturalness`, `compute_node_behavior_centroid`,
 `compute_trajectory_distributions`, `compute_node_centroid`.
