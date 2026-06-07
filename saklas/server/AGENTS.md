@@ -15,6 +15,7 @@ the API). `register_saklas_routes` is the native-tree orchestrator — it delega
 to sub-module registrars and registers a few route groups in place:
 
 - `manifold_routes.register_manifold_routes` — `/saklas/v1/manifolds/*`
+- `template_routes.register_template_routes` — `/saklas/v1/templates/*` (templated-completion artifact + scorer)
 - `session_routes.register_session_routes` — `/saklas/v1/sessions` CRUD + clear/rewind
 - `probe_routes.register_probe_routes` — `/sessions/{id}/probes/*` (unified: list / defaults / attach / detach — every probe shape)
 - `experiment_routes.register_experiment_routes` — `/sessions/{id}/experiments/fan`
@@ -180,6 +181,32 @@ per-model sidecar/tensor via `_resolve_intrinsic_dim` + a `load_manifold` read.
   authored folders reject them with 400. Poisedness `ValueError` →
   `code: "PoisednessError"`; `ConcurrentExtractionError` → 409. Steering a fitted
   manifold needs no route — a `%` term loads it lazily on scope entry.
+
+The `POST /manifolds/templated` route survives as a **bridge** (back-compat for the
+webui's templated-manifold builder): it writes a standalone template
+(single-turn contexts from the `{user, assistant}` pairs) then a manifold that
+`template_ref`-erences it. Multi-turn contexts + the scorer ride the dedicated
+template routes.
+
+### template_routes.py
+
+The standalone templated-completion artifact (`io.templates`). Lifecycle is
+pure-IO; `score` runs the loaded model. `_template_detail` serializes
+`TemplateFolder.summary()` + the full `contexts`.
+
+- `GET /templates` — list (`summary` + `namespace` per row).
+- `GET /templates/{ns}/{name}` — detail incl. `contexts`. 404 on missing.
+- `POST /templates` — `create_template_folder` (`CreateTemplateRequest`: slot,
+  values, multi-turn `contexts:[{turns, assistant}]`, `force`). 409 on existing,
+  400 on a validation failure (slot in a history turn, slot count ≠ 1, last turn
+  not user, …).
+- `DELETE /templates/{ns}/{name}` — `remove_template_folder`; 404 on missing.
+- `POST /templates/{ns}/{name}/score` — `session.score_template` in
+  `asyncio.to_thread` under `acquire_session_lock` (503 if locked). Body
+  `{steering?}`; returns `{template, namespace, steering, contexts:
+  [ChoiceScores.to_dict()]}` — the per-context restricted-choice value
+  distribution, steering-aware. 404 on a missing/ambiguous template, 400 on a
+  scoring/steering-expr failure (scrubbed to `type(e).__name__`).
 
 ### probe_routes.py
 

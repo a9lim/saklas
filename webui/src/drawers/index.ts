@@ -44,3 +44,5 @@ export { default as SessionAdmin } from "./SessionAdminDrawer.svelte";
 // Phase 5 drawers — cross-branch diff and transcript IO.
 export { default as NodeCompare } from "./NodeCompareDrawer.svelte";
 export { default as Transcript } from "./TranscriptDrawer.svelte";
+// Templated-completion lab — author templates + score the value distribution.
+export { default as TemplateLab } from "./TemplateLabDrawer.svelte";

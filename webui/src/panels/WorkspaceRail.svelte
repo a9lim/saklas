@@ -56,6 +56,7 @@
         { label: "build manifold…", drawer: "manifold_builder" },
         { label: "merge manifolds…", drawer: "manifold_merge" },
         { label: "packs…", drawer: "manifold_pack" },
+        { label: "templates…", drawer: "template_lab" },
       ],
     },
     {

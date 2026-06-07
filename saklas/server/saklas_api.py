@@ -687,6 +687,11 @@ def register_saklas_routes(app: FastAPI) -> None:
     from saklas.server.manifold_routes import register_manifold_routes
     register_manifold_routes(app)
 
+    # ----- templates (templated-completion artifact + scorer) ------------
+
+    from saklas.server.template_routes import register_template_routes
+    register_template_routes(app)
+
     # ----- sessions collection -------------------------------------------
 
     from saklas.server.session_routes import register_session_routes

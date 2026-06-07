@@ -65,6 +65,18 @@ def manifolds_dir() -> Path:
     return saklas_home() / "manifolds"
 
 
+def templates_dir() -> Path:
+    """Root of the templated-completion artifact tree.
+
+    A template is a first-class artifact (peer to a manifold): a slot, a set
+    of candidate values, and one or more multi-turn contexts whose final
+    assistant turn carries the slot. Two consumers read it — the manifold fit
+    (pools the slot-filled assistant centroids into nodes) and the completion
+    scorer (the restricted-choice logprob distribution over the values).
+    """
+    return saklas_home() / "templates"
+
+
 def ensure_within(root: Path, *parts: str) -> Path:
     """Join ``parts`` onto ``root`` and verify the result stays inside ``root``.
 

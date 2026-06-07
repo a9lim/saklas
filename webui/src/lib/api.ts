@@ -10,6 +10,7 @@ import type {
   CorrelationData,
   CreateDiscoverManifoldRequest,
   CreateManifoldRequest,
+  CreateTemplateRequest,
   CreateTemplatedManifoldRequest,
   ExperimentFanRequest,
   ExperimentFanResponse,
@@ -35,7 +36,10 @@ import type {
   ProbeListResponse,
   ProbeRequest,
   RemoteManifoldInfo,
+  ScoreTemplateResponse,
   SessionInfo,
+  TemplateDetail,
+  TemplateSummary,
   TraitsEvent,
   TranscriptLoadResponseJSON,
   UpdateManifoldRequest,
@@ -53,6 +57,7 @@ export type {
   CorrelationData,
   CreateDiscoverManifoldRequest,
   CreateManifoldRequest,
+  CreateTemplateRequest,
   CreateTemplatedManifoldRequest,
   FitManifoldRequest,
   GenerateManifoldRequest,
@@ -78,7 +83,10 @@ export type {
   ProbeListResponse,
   ProbeRequest,
   RemoteManifoldInfo,
+  ScoreTemplateResponse,
   SessionInfo,
+  TemplateDetail,
+  TemplateSummary,
   TraitsEvent,
   TranscriptLoadResponseJSON,
   UpdateManifoldRequest,
@@ -418,6 +426,46 @@ export const apiManifolds = {
    *  destination conflict. */
   merge(req: MergeManifoldRequest): Promise<ManifoldInfo> {
     return request(`${MANIFOLDS_BASE}/merge`, jsonBody(req));
+  },
+};
+
+const TEMPLATES_BASE = "/saklas/v1/templates";
+
+/** The standalone templated-completion artifact — a slot + candidate values
+ *  + multi-turn contexts, read by both the completion scorer and a
+ *  ``manifold from-template`` fit. */
+export const apiTemplates = {
+  list(): Promise<{ templates: TemplateSummary[] }> {
+    return request(TEMPLATES_BASE);
+  },
+  get(namespace: string, name: string): Promise<TemplateDetail> {
+    return request(
+      `${TEMPLATES_BASE}/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}`,
+    );
+  },
+  create(req: CreateTemplateRequest): Promise<TemplateDetail> {
+    return request(TEMPLATES_BASE, jsonBody(req));
+  },
+  delete(
+    namespace: string,
+    name: string,
+  ): Promise<{ namespace: string; name: string; removed: boolean }> {
+    return request(
+      `${TEMPLATES_BASE}/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}`,
+      { method: "DELETE" },
+    );
+  },
+  /** Score the value distribution against each context. ``steering`` runs the
+   *  forward under a steering expression (the distributional before/after). */
+  score(
+    namespace: string,
+    name: string,
+    steering: string | null,
+  ): Promise<ScoreTemplateResponse> {
+    return request(
+      `${TEMPLATES_BASE}/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}/score`,
+      jsonBody({ steering }),
+    );
   },
 };
 

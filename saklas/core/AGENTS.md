@@ -700,6 +700,26 @@ logprobs + the cross-branch evaluation (`_compute_rows`, alignment via
 `per_token_diff`). `approx_kl` is top-K-truncated `KL(P_A‖P_B)`. Cached on
 `session._joint_logprob_cache`; held under the session lock.
 
+## scoring.py
+
+Restricted-choice completion scoring — the logit read of a template (the
+counterpart to a manifold fit). `score_choices(session, messages, choices, *,
+assistant_prefix="", labels=None, steering=None)` scores each candidate
+completion's conditional logprob given the conversation context and returns a
+`ChoiceScores` set — per candidate `{n_tokens, sum_logprob, mean_logprob}` plus the
+restricted-choice softmax (`prob_sum` over the joint logprobs, `prob_mean` over the
+length-normalized ones; both reported, neither silently chosen). Scoring is against
+the **raw** model distribution (plain `log_softmax`, temperature 1, no top-k/p), so
+the probabilities are the model's beliefs, not a sampler reshaping. One batched
+teacher-forced forward per `_SCORE_BATCH` (=16) chunk — vocab is ~256k, so an
+unbounded batch would blow memory; `logsumexp` + a gather avoid materializing a
+second vocab-sized tensor. The completion span per choice is recovered with
+`_shared_prefix_len` (reused from `joint_logprobs.py`), which absorbs the
+boundary-token merge. `steering=` wraps the forward in `session.steering(...)` — the
+distributional before/after read. `score_template(session, template, *, steering)`
+runs it over a `TemplateFolder.score_inputs()` and returns one `ChoiceScores` per
+context. Surfaced as `session.score_choices` / `session.score_template`.
+
 ## results.py
 
 `GenerationResult`, `RunSet`, `TokenAlt`, `TokenEvent`, `ProbeReadings`,

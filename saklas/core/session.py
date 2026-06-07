@@ -9,7 +9,7 @@ import time
 from contextlib import suppress
 from enum import IntEnum
 from types import TracebackType
-from typing import Any, Callable, Iterator, Literal, cast, overload
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Literal, cast, overload
 
 import torch
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
@@ -49,6 +49,10 @@ from saklas.core.sampling import SamplingConfig
 from saklas.core.steering import Steering
 from saklas.core.steering_expr import AblationTerm, ManifoldTerm
 from saklas.core.manifold import Manifold
+
+if TYPE_CHECKING:
+    from saklas.core.scoring import ChoiceScores
+    from saklas.io.templates import TemplateFolder
 from saklas.core.triggers import Trigger
 from saklas.core.vectors import load_profile as _load_profile
 
@@ -2940,6 +2944,57 @@ class SaklasSession:
         self._capture.detach()
 
     # -- Score entry points --
+
+    def score_choices(
+        self,
+        messages: list[dict[str, str]],
+        choices: list[str],
+        *,
+        assistant_prefix: str = "",
+        labels: list[str] | None = None,
+        steering: "str | Steering | None" = None,
+        system_prompt: str | None = None,
+    ) -> "ChoiceScores":
+        """Restricted-choice logprob distribution over ``choices``.
+
+        Scores each candidate completion against the raw model distribution
+        given ``messages`` (+ optional ``assistant_prefix`` before the slot) and
+        returns the set with per-candidate ``sum``/``mean`` logprobs and their
+        softmax probabilities. ``steering=`` runs the scoring forward under a
+        steering expression — the distributional before/after read. See
+        :func:`saklas.core.scoring.score_choices`.
+        """
+        from saklas.core.scoring import score_choices as _score_choices
+
+        return _score_choices(
+            self, messages, choices,
+            assistant_prefix=assistant_prefix, labels=labels,
+            steering=steering, system_prompt=system_prompt,
+        )
+
+    def score_template(
+        self,
+        template: "str | TemplateFolder",
+        *,
+        steering: "str | Steering | None" = None,
+        system_prompt: str | None = None,
+    ) -> list["ChoiceScores"]:
+        """Score a template's values against each of its contexts.
+
+        ``template`` is a :class:`~saklas.io.templates.TemplateFolder` or a
+        selector string (``<name>`` / ``<ns>/<name>``). Returns one
+        :class:`~saklas.core.scoring.ChoiceScores` per context.
+        """
+        from saklas.core.scoring import score_template as _score_template
+        from saklas.io.templates import TemplateFolder, resolve_template
+
+        tmpl = (
+            template if isinstance(template, TemplateFolder)
+            else resolve_template(template)
+        )
+        return _score_template(
+            self, tmpl, steering=steering, system_prompt=system_prompt,
+        )
 
     def score_captured(
         self, generated_ids: list[int], *, accumulate: bool = True,

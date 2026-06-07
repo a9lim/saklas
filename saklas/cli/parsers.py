@@ -76,7 +76,7 @@ def _add_logit_args(p: argparse.ArgumentParser) -> None:
 _MANIFOLD_VERBS: list[tuple[str, str]] = [
     ("extract",   "Extract a steering vector (a 2-node flat subspace)"),
     ("generate",  "Author a discover-mode manifold from a concept list"),
-    ("template",  "Author a templated discover manifold (slot + values)"),
+    ("from-template", "Author a discover manifold from a standalone template"),
     ("fit",       "Fit an authored or discover-mode manifold"),
     ("bake",      "Bake existing vectors into a new manifold"),
     ("merge",     "Union discover-mode manifolds' nodes into a new manifold"),
@@ -105,6 +105,18 @@ _EXPERIMENT_VERBS: list[tuple[str, str]] = [
     ("fan",         "Run an alpha grid as one experiment"),
     ("transcript",  "Replay or inspect saved transcript paths"),
     ("naturalness", "Score a steered generation's behavior-manifold naturalness"),
+]
+
+# Verb table for ``saklas template <verb>`` — the standalone templated-completion
+# artifact (a slot + candidate values + multi-turn contexts).  Lifecycle verbs
+# (create/ls/show/rm) are pure-IO; ``score`` loads a model for the restricted-
+# choice logprob read.
+_TEMPLATE_VERBS: list[tuple[str, str]] = [
+    ("create",  "Author a template (slot + values + multi-turn contexts)"),
+    ("ls",      "List installed templates"),
+    ("show",    "Show a template's slot, values, and contexts"),
+    ("score",   "Score the value distribution against each context (loads a model)"),
+    ("rm",      "Remove a template folder"),
 ]
 
 
@@ -406,47 +418,33 @@ def _build_manifold_generate(generate: argparse.ArgumentParser) -> None:
     generate.set_defaults(quantize=None, device="auto", probes=None)
 
 
-def _build_manifold_template(template: argparse.ArgumentParser) -> None:
-    template.add_argument("name", help="Manifold name (use ns/name for non-local)")
-    template.add_argument(
-        "--slot", required=True, metavar="TOKEN",
-        help="The placeholder substituted per value, e.g. '[DAY]'. Must appear "
-             "in every assistant turn and in no user turn.",
+def _build_manifold_from_template(p: argparse.ArgumentParser) -> None:
+    p.add_argument("template", help="Template name (or ns/name) to derive from")
+    p.add_argument(
+        "--name", default=None, metavar="MANIFOLD",
+        help="Manifold name to write (default: the template name; use ns/name "
+             "for a non-local namespace).",
     )
-    template.add_argument(
-        "--values", nargs="+", required=True, metavar="VALUE",
-        help="Slot values, one node per value (>= 2). The raw value is "
-             "substituted into the text; its slug is the node label "
-             "('New York' -> node 'new_york').",
-    )
-    template.add_argument(
-        "--pairs-file", dest="pairs_file", required=True, metavar="PATH",
-        help="JSON file: a list of {\"user\": ..., \"assistant\": ...} chat-turn "
-             "templates (the slot lives in the assistant turn). More templates "
-             "= more samples per node; aim for ~10-50.",
-    )
-    template.add_argument(
+    p.add_argument(
         "--fit-mode", dest="fit_mode",
         choices=("pca", "spectral", "auto"), default="auto",
-        help="Discover fit mode written into the folder (default: auto — lets "
-             "the fit pick flat/curved + detect periodic axes, the right "
-             "default for cyclic categories like days/months).",
+        help="Discover fit mode written into the folder (default: auto — picks "
+             "flat/curved + detects periodic axes, the right default for cyclic "
+             "categories like days/months).",
     )
-    template.add_argument(
+    p.add_argument(
         "--max-dim", dest="max_dim", type=int, default=None, metavar="N",
-        help="Cap the discovered intrinsic dimension (optional; overridable "
-             "later on `manifold fit`).",
+        help="Cap the discovered intrinsic dimension (optional).",
     )
-    template.add_argument(
+    p.add_argument(
         "--var-threshold", dest="var_threshold", type=float, default=None,
-        metavar="T",
-        help="PCA cumulative-variance threshold for dim selection (optional).",
+        metavar="T", help="PCA cumulative-variance threshold for dim selection.",
     )
-    template.add_argument(
+    p.add_argument(
         "--description", default="", metavar="TEXT",
         help="Human-readable description for the manifold folder",
     )
-    template.add_argument(
+    p.add_argument(
         "-f", "--force", action="store_true",
         help="Overwrite an existing manifold folder",
     )
@@ -615,18 +613,15 @@ _MANIFOLD_DESCRIPTIONS: dict[str, str] = {
         "across nodes, so the per-concept centroids stay comparable "
         "(response[i] aligns to baseline prompt[i % k])."
     ),
-    "template": (
-        "Author a *templated* discover manifold: supply a slot token (e.g. "
-        "'[DAY]'), a list of values (one node per value), and a JSON file of "
-        "{user, assistant} chat-turn templates with the slot in the assistant "
-        "turn. Each value fills the slot across every template, so the node "
-        "corpora are the slot-filled assistant turns and the template's user "
-        "turns become the per-manifold elicitation prompts the fit pools "
-        "against. The right tool for categories you reference rather than "
-        "embody — days, months, colours, directions — where 'someone {c}' "
-        "makes no sense. Deterministic (no model load); run `saklas manifold "
-        "fit <name> -m MODEL` next. fit_mode auto suits cyclic categories "
-        "(days/months) — the fit detects the loop."
+    "from-template": (
+        "Author a discover manifold whose node corpora derive from a standalone "
+        "template (`saklas template create`). Resolves the template, expands its "
+        "values x contexts into per-value node corpora (the slot-filled assistant "
+        "turns), and writes a discover folder that stores the corpus and "
+        "`template_ref`-erences the template — so the fit resolves the template's "
+        "multi-turn contexts as elicitation prefixes. Deterministic (no model "
+        "load); run `saklas manifold fit <name> -m MODEL` next. fit_mode auto "
+        "suits cyclic categories (days/months) — the fit detects the loop."
     ),
     "fit": (
         "Pool per-node centroids, fit a per-layer PCA subspace (+ RBF "
@@ -670,7 +665,7 @@ _MANIFOLD_DESCRIPTIONS: dict[str, str] = {
 _MANIFOLD_BUILDERS = {
     "extract":  _build_vector_extract,
     "generate": _build_manifold_generate,
-    "template": _build_manifold_template,
+    "from-template": _build_manifold_from_template,
     "fit":      _build_manifold_fit,
     "bake":     _build_vector_merge,
     "merge":    _build_manifold_merge,
@@ -733,6 +728,108 @@ _PACK_BUILDERS = {
 }
 
 
+def _build_template_create(p: argparse.ArgumentParser) -> None:
+    p.add_argument("name", help="Template name (use ns/name for non-local)")
+    p.add_argument(
+        "--slot", required=True, metavar="TOKEN",
+        help="The placeholder substituted per value, e.g. '[DAY]'. Must appear "
+             "exactly once in each context's final assistant turn and in no "
+             "history turn.",
+    )
+    p.add_argument(
+        "--values", nargs="+", required=True, metavar="VALUE",
+        help="Candidate slot values (>= 2). The raw value is substituted into "
+             "the text; its slug is the node label ('New York' -> 'new_york').",
+    )
+    p.add_argument(
+        "--contexts", dest="contexts_file", required=True, metavar="PATH",
+        help="JSON file: a list of contexts. Each is either "
+             "{\"turns\": [{\"role\", \"content\"}...], \"assistant\": \"...slot...\"} "
+             "for multi-turn, or the single-turn sugar "
+             "{\"user\": ..., \"assistant\": \"...slot...\"}. The slotted "
+             "assistant turn carries the slot.",
+    )
+    p.add_argument(
+        "--description", default="", metavar="TEXT",
+        help="Human-readable description for the template folder",
+    )
+    p.add_argument(
+        "-f", "--force", action="store_true",
+        help="Overwrite an existing template folder",
+    )
+
+
+def _build_template_ls(p: argparse.ArgumentParser) -> None:
+    p.add_argument("-j", "--json", action="store_true", help="JSON output")
+
+
+def _build_template_show(p: argparse.ArgumentParser) -> None:
+    p.add_argument("name", help="Template name (or ns/name)")
+    p.add_argument("-j", "--json", action="store_true", help="JSON output")
+
+
+def _build_template_rm(p: argparse.ArgumentParser) -> None:
+    p.add_argument("name", help="Template name (or ns/name)")
+    p.add_argument("-y", "--yes", action="store_true", help="Skip confirmation")
+
+
+def _build_template_score(p: argparse.ArgumentParser) -> None:
+    p.add_argument("name", help="Template name (or ns/name)")
+    p.add_argument(
+        "-m", "--model", required=True, metavar="MODEL_ID",
+        help="Model to score against",
+    )
+    p.add_argument(
+        "-S", "--steer", default=None, metavar="EXPR",
+        help="Optional steering expression — score the completion distribution "
+             "under steering (the distributional before/after read).",
+    )
+    p.add_argument(
+        "--by", choices=("sum", "mean"), default="sum",
+        help="Rank/highlight statistic: 'sum' (joint logprob, length-biased to "
+             "short completions) or 'mean' (length-normalized). Default sum.",
+    )
+    p.add_argument("-d", "--device", default="auto",
+                   help="Device: auto (detect), cuda, mps, or cpu")
+    p.add_argument("-q", "--quantize", choices=["4bit", "8bit"], default=None,
+                   help="Quantization mode (default: bf16/fp16)")
+    p.add_argument("-j", "--json", action="store_true", help="JSON output")
+
+
+_TEMPLATE_DESCRIPTIONS: dict[str, str] = {
+    "create": (
+        "Author a standalone template artifact under "
+        "~/.saklas/templates/<ns>/<name>/. A template is a slot token, a set of "
+        "candidate values, and one or more multi-turn contexts whose final "
+        "assistant turn carries the slot. Two consumers read it: the completion "
+        "scorer (`template score`) reports the restricted-choice logprob "
+        "distribution over the values, and a manifold can `template_ref` it to "
+        "pool each value's slot-filled centroid into a node. The right tool for "
+        "categories you reference rather than embody — days, months, durations — "
+        "where 'someone {c}' makes no sense. Deterministic (no model load)."
+    ),
+    "ls": "List local templates under ~/.saklas/templates/.",
+    "show": "Print one template's slot, values, and contexts.",
+    "score": (
+        "Score the value distribution against each of the template's contexts: "
+        "for every context, the model's restricted-choice probability over the "
+        "candidate slot-fills (the logit counterpart to a manifold fit). Reports "
+        "both the joint (sum) and length-normalized (mean) views. With "
+        "`-S/--steer`, scores under a steering expression so you can read how "
+        "steering reshapes the distribution — did it shift, not just the argmax?"
+    ),
+    "rm": "Remove a whole template folder.",
+}
+
+_TEMPLATE_BUILDERS = {
+    "create": _build_template_create,
+    "ls":     _build_template_ls,
+    "show":   _build_template_show,
+    "score":  _build_template_score,
+    "rm":     _build_template_rm,
+}
+
+
 def _build_manifold_parser(parser: argparse.ArgumentParser) -> None:
     """``saklas manifold`` — the steering-vector / manifold compute verbs."""
     sub = parser.add_subparsers(dest="manifold_cmd", required=False, metavar="VERB")
@@ -753,6 +850,17 @@ def _build_pack_parser(parser: argparse.ArgumentParser) -> None:
             description=_PACK_DESCRIPTIONS.get(verb, desc),
         )
         _PACK_BUILDERS[verb](child)
+
+
+def _build_template_parser(parser: argparse.ArgumentParser) -> None:
+    """``saklas template`` — the standalone templated-completion artifact."""
+    sub = parser.add_subparsers(dest="template_cmd", required=False, metavar="VERB")
+    for verb, desc in _TEMPLATE_VERBS:
+        child = sub.add_parser(
+            verb, help=desc,
+            description=_TEMPLATE_DESCRIPTIONS.get(verb, desc),
+        )
+        _TEMPLATE_BUILDERS[verb](child)
 
 
 # --- config subtree ------------------------------------------------------
@@ -963,5 +1071,13 @@ def _build_root_parser() -> argparse.ArgumentParser:
         description="Run and replay experiment trees",
     )
     _build_experiment_parser(experiment)
+
+    template = sub.add_parser(
+        "template",
+        help="Templated completions (create/ls/show/score/rm)",
+        description="Standalone templated-completion artifact: author, inspect, "
+                    "and score the restricted-choice value distribution",
+    )
+    _build_template_parser(template)
 
     return root

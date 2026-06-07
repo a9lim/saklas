@@ -55,6 +55,7 @@ saklas tui <model_id> [--no-dls]
 saklas serve <model_id> [--no-web] [--steer/-S EXPR]
 saklas manifold extract <concept>|<pos> <neg> [-m MODEL] [--sae RELEASE] [--role SLUG] [--namespace NS] [-f]
 saklas manifold generate <name> --concepts C... [--kind abstract|concrete] [--samples-per-prompt K] [--seed S]
+saklas manifold from-template <template> [--name MANIFOLD] [--fit-mode auto|pca|spectral] [--max-dim N] [-f]   # derive a discover manifold from a standalone template
 saklas manifold fit <name>|<folder> [-m MODEL] [--sae REL] [--method pca|spectral|auto] [--max-dim N] [--var-threshold T] [--k-nn K] [--bandwidth SIGMA] [--max-subspace-dim R] [--smoothing auto|0|LAMBDA] [--persistence-frac F]  # authored or discover-mode (hyperparams apply only to discover folders; --smoothing curved only, --persistence-frac auto only)
 saklas manifold bake <name> <expression> [-m]    # shared grammar: "0.3 ns/a + 0.5 ns/b|ns/c"
 saklas manifold merge <name> <src...> [-f]           # union discover-mode node corpora
@@ -72,19 +73,26 @@ saklas pack export gguf <name> [-m MODEL] [-o PATH] [--model-hint HINT]   # fold
 saklas experiment fan <model> "<prompt>" -g concept=0,0.5,1 # alpha grid as loom siblings
 saklas experiment transcript run <path.yaml> [model]        # replay a saved transcript
 saklas experiment naturalness <model> "<prompt>" --manifold F -S EXPR  # behavior-manifold eval
+saklas template create <name> --slot TOKEN --values V... --contexts FILE [--description TEXT] [-f]
+saklas template ls [-j] | show <name> [-j] | rm <name> [-y]
+saklas template score <name> -m MODEL [-S EXPR] [--by sum|mean] [-j]   # restricted-choice value distribution
 saklas config show [-c PATH ...] [--no-default] [-m MODEL]
 saklas config validate <file>
 pytest tests/                                   # all; GPU tests gated on CUDA/MPS
 ```
 
-The root parser has exactly six verbs: `tui`, `serve`, `manifold`, `pack`,
-`experiment`, `config`. There is no `vector` alias. `manifold` is the unified
-compute surface (extract/generate/fit/bake/merge/transfer/compare/why); `pack`
-owns lifecycle and distribution (ls/show/install/search/push/rm/clear/refresh/
-export gguf), so install via `pack install` and export via `pack export gguf`. No
-`argv[0]` peeking, no bare-TUI fallback — `saklas google/gemma-2-2b-it` is an
-argparse error. Bare `saklas` / `saklas manifold` / `saklas pack` / `saklas
-experiment` / `saklas config` print help and exit 0.
+The root parser has exactly seven verbs: `tui`, `serve`, `manifold`, `pack`,
+`experiment`, `config`, `template`. There is no `vector` alias. `manifold` is the
+unified compute surface
+(extract/generate/from-template/fit/bake/merge/transfer/compare/why); `pack` owns
+lifecycle and distribution (ls/show/install/search/push/rm/clear/refresh/export
+gguf), so install via `pack install` and export via `pack export gguf`; `template`
+owns the standalone templated-completion artifact (create/ls/show/score/rm — a slot
++ candidate values + multi-turn contexts, read by both the completion **scorer**
+and a `manifold from-template` fit). No `argv[0]` peeking, no bare-TUI fallback —
+`saklas google/gemma-2-2b-it` is an argparse error. Bare `saklas` / `saklas
+manifold` / `saklas pack` / `saklas experiment` / `saklas config` / `saklas
+template` print help and exit 0.
 
 Every subcommand that takes `-c/--config` auto-loads `~/.saklas/config.yaml`
 first, then composes explicit `-c` files on top (later overrides earlier). The
@@ -208,6 +216,46 @@ via `io.selectors.resolve_bare_name` as a multi-node manifold node label
 Cross-tier ambiguity raises `AmbiguousSelectorError`. Namespace-qualified or
 variant-suffixed forms (`alice/pirate`, `pirate:role-x`, `civilian.pirate`) skip
 the manifold-label tier.
+
+## Templated completions + scoring
+
+Some categories you *reference* rather than *embody* — days of the week, months,
+durations, directions. "someone who is Tuesday" is nonsense, so the persona-framed
+extraction doesn't apply. A **template** is the artifact for these: a `slot` token,
+a set of candidate `values`, and one or more multi-turn `contexts` whose final
+assistant turn carries the slot (`io/templates.py::TemplateFolder`, on disk at
+`~/.saklas/templates/<ns>/<name>/template.json`). Invariant: the slot appears
+**exactly once** in each context's final `assistant` string and **never** in a
+history turn (history is shared common-mode across the values; the slot lives only
+where the value is read). A single-turn template is the degenerate
+`turns:[{user}]` case.
+
+The template is a first-class artifact with **two** consumers:
+
+- **The completion scorer** (`core/scoring.py::score_choices`) — for each context,
+  the restricted-choice logprob distribution over the values: the model's belief
+  about which slot-fill comes next. Forced-choice scoring against the **raw** model
+  distribution (temperature 1, no top-k/p truncation), one batched teacher-forced
+  forward per chunk; `_shared_prefix_len` absorbs the boundary-token merge
+  (`"Monday"` vs `"Tuesday"` may retokenize the last prefix token). Multi-token
+  candidates report both `sum_logprob` (the joint `log P(candidate | context)`) and
+  `mean_logprob` (length-normalized), each with its own softmax over the set —
+  neither view is silently chosen. An optional `steering=` runs the scoring forward
+  under a steering expression, so the project's core question answers directly:
+  *did steering shift the distribution, not just the argmax?* `session.score_choices(
+  messages, choices, …)` / `session.score_template(name, steering=…)` return one
+  `ChoiceScores` per context.
+- **A manifold fit** — `manifold from-template <tmpl>`
+  (`io/manifolds.py::create_manifold_from_template`) resolves the template, expands
+  its `values × contexts` into per-value node corpora (the slot-filled assistant
+  turns, `corpus[i]` aligned to `contexts[i]`), and writes a discover folder that
+  stores the corpus **and** a `template_ref`. At fit time the pipeline resolves the
+  ref to use the template's multi-turn contexts as the per-node elicitation
+  prefixes (the multi-turn generalization of the A2 `response[i] → prompt[i]`
+  alignment). The template is the authoring source of truth; the manifold's corpus
+  is its materialization, and the resolved template's content hash folds into
+  `nodes_sha256` so a context/value edit re-fits. There is no embedded `template`
+  block anymore — `manifold from-template` replaces the former `manifold template`.
 
 ## Extraction
 
@@ -567,6 +615,12 @@ Key contracts:
   expression (the mirror of `manifold bake`). `Profile` wraps `dict[int, Tensor]`
   (mapping interface plus `layers`, `metadata`, `save`/`load`, `merged`,
   `projected_away`, `cosine_similarity`).
+- `session.score_choices(messages, choices, *, assistant_prefix="", steering=None)`
+  and `session.score_template(template, *, steering=None)` return the
+  restricted-choice completion distribution (`ChoiceScores`, per-context for a
+  template) — the logit read; `core/scoring.py`. Steering-aware (the distributional
+  before/after). `template` is a `TemplateFolder` or a `<name>`/`<ns>/<name>`
+  selector.
 - `Steering` is frozen; it carries no per-call metric override (`~`/`|` projection
   is Mahalanobis-only). There is no `injection_mode`/`theta_max`/`projection_metric`.
 - `SaklasSession.__init__` takes a pre-loaded `PreTrainedModel`; use `from_pretrained`
@@ -591,8 +645,10 @@ All state under `~/.saklas/` (override via `$SAKLAS_HOME`):
   neutral_statements.json              # user-editable; organic responses to the
                                        # baseline prompts (copy-on-miss from package)
   baseline_prompts.json                # user override for the shared A2 prompts
+  templates/<ns>/<name>/               # standalone templated-completion artifact
+    template.json                      # slot, values, contexts:[{turns:[{role,content}], assistant}]
   manifolds/<ns>/<name>/               # THE concept + steering-manifold root
-    manifold.json                      # name, source, fit_mode, per-node {label,kind,role?}, domain/coords or hyperparams, files{sha256}
+    manifold.json                      # name, source, fit_mode, per-node {label,kind,role?}, domain/coords or hyperparams, files{sha256}, template_ref?
     nodes/NN_<label>.json              # one JSON response list per node (response[i] ↔ baseline_prompt[i % k])
     <safe_model_id>.safetensors        # fitted per-layer subspaces (+ .json sidecar);
                                        # discover/baked also carry node_coords (the layout)

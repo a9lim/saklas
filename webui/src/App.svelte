@@ -263,6 +263,8 @@
             <Drawers.NodeCompare params={drawerState.params} />
           {:else if drawerState.open === "transcript"}
             <Drawers.Transcript params={drawerState.params} />
+          {:else if drawerState.open === "template_lab"}
+            <Drawers.TemplateLab params={drawerState.params} />
           {:else}
             <header class="drawer-header">
               <span class="drawer-title">{drawerState.open}</span>

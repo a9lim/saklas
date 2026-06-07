@@ -1,11 +1,12 @@
 # cli/
 
-Six-verb root parser
-(`tui`/`serve`/`manifold`/`pack`/`experiment`/`config`). `manifold` is the unified
-compute surface (extract/generate/fit/bake/merge/transfer/compare/why); `pack` is
-the lifecycle/distribution verb (ls/show/install/search/push/rm/clear/refresh/
-export gguf). There is no `vector` alias — install via `pack install` and export
-via `pack export gguf`. Split across:
+Seven-verb root parser
+(`tui`/`serve`/`manifold`/`pack`/`experiment`/`config`/`template`). `manifold` is the
+unified compute surface (extract/generate/from-template/fit/bake/merge/transfer/
+compare/why); `pack` is the lifecycle/distribution verb (ls/show/install/search/
+push/rm/clear/refresh/export gguf); `template` owns the standalone
+templated-completion artifact (create/ls/show/score/rm). There is no `vector` alias
+— install via `pack install` and export via `pack export gguf`. Split across:
 - `cli/main.py` — entry point, `parse_args`, `main`, `_COMMAND_RUNNERS` dispatch
 - `cli/parsers.py` — `_build_root_parser` + every `_build_X_parser`, the verb tables
 - `cli/runners.py` — every `_run_X` plus the shared helpers below
@@ -27,8 +28,11 @@ with no subverb) prints help and exits 0, not argparse's exit 2.
   (`pca`/`spectral`), erroring against an authored folder. `bake` (the former
   `merge` compute verb) lands a corpus-less baked manifold from a steering
   expression via `merge_into_manifold`; the present `merge` is the *distinct*
-  corpus-union of discover-mode manifolds — two different verbs now. The
-  extract/generate/fit/transfer verbs load a model.
+  corpus-union of discover-mode manifolds — two different verbs now.
+  `from-template` (`_run_manifold_from_template`) is pure-IO: it resolves a
+  standalone template and writes a discover folder that derives its corpus from
+  the template + stores `template_ref` (replaces the former `manifold template`
+  embedded-block verb). The extract/generate/fit/transfer verbs load a model.
 - `pack` = lifecycle + distribution
   (`ls`/`show`/`install`/`search`/`push`/`rm`/`clear`/`refresh`/`export`),
   hand-dispatched by `_run_pack` (table `_PACK_VERBS`). `export gguf <name>` folds
@@ -46,6 +50,16 @@ with no subverb) prints help and exits 0, not argparse's exit 2.
 - `experiment` = repeatable research runs (`fan`, `transcript run`, `naturalness`)
   via `_EXPERIMENT_VERBS`; `_run_experiment` hand-dispatches.
 - `config` = show / validate.
+- `template` = the standalone templated-completion artifact
+  (`create`/`ls`/`show`/`score`/`rm`) via `_TEMPLATE_VERBS`; `_run_template`
+  hand-dispatches. `create` reads a `--contexts` JSON file (each entry a multi-turn
+  `{turns, assistant}` or the single-turn `{user, assistant}` sugar normalized by
+  `_normalize_context_entry`) and writes `~/.saklas/templates/<ns>/<name>/`;
+  `ls`/`show`/`rm` are pure-IO. `score <name> -m MODEL [-S EXPR] [--by sum|mean]`
+  loads a model and prints the per-context restricted-choice value distribution
+  (`session.score_template`), steering-aware via `-S`. Bare names default to
+  `local/` (`_split_manifold_ns_name`); `score`/`show`/`rm` resolve cross-namespace
+  via `resolve_template`.
 
 ## Config loading
 

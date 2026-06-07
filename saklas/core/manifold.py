@@ -3568,7 +3568,7 @@ def compute_node_centroid(
     layers: torch.nn.ModuleList,
     device: torch.device,
     responses: list[str],
-    prompts: list[str],
+    prompts: "list[str] | list[list[dict[str, str]]]",
     *,
     role: str | None = None,
     model_type: str | None = None,

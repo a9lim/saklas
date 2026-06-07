@@ -11,7 +11,7 @@ format/distribution surface (`PackMetadata`/`ConceptFolder`/`pull_pack`/the
 ## paths.py
 
 Every `~/.saklas/` path resolves through `saklas_home()` (honors `$SAKLAS_HOME`).
-Helpers: `manifolds_dir`, `manifold_dir(ns, name)`, `models_dir`, `model_dir(id)`,
+Helpers: `manifolds_dir`, `manifold_dir(ns, name)`, `templates_dir`, `models_dir`, `model_dir(id)`,
 `neutral_statements_path`, `baseline_prompts_path` (user override for the shared A2
 baseline user prompts; falls back to bundled `saklas/data/baseline_prompts.json`),
 `safe_model_id` (`/` → `__`), `ensure_within(root, *parts)` (path-traversal
@@ -135,6 +135,40 @@ re-copy when the bundled manifest hash drifts or the on-disk `format_version`
 predates `MANIFOLD_FORMAT_VERSION`). Per-node `role`
 (slug `[a-z0-9._-]+`) rides the fit to `compute_node_centroid` for role-baselined
 centroids; family-unsupported raises `RoleSubstitutionUnsupportedError` at fit time.
+
+**Templated manifolds** carry a `template_ref: str | None` (a
+`templates.py::TemplateFolder` selector) instead of node corpora authored by hand:
+`create_manifold_from_template(ns, name, *, template_ref, fit_mode, …)` resolves the
+template, expands its `values × contexts` into per-value node corpora (via
+`TemplateFolder.node_corpora()`), and writes a normal discover folder that stores
+both the derived corpus (`nodes/`) and the `template_ref`. The fit
+(`core/extraction.py`) resolves the ref to use the template's **multi-turn
+contexts** as the per-node elicitation prefixes; `nodes_sha256()` folds the resolved
+template's `sha256()` so a context/value edit re-fits. The template is the authoring
+source of truth; the corpus is its materialization. There is **no embedded
+`template` block** — the pre-migration `{slot, values, pairs}` block, `expand_template`,
+`_validate_template_block`, and `create_templated_manifold_folder` are gone.
+
+## templates.py
+
+The standalone templated-completion artifact — `~/.saklas/templates/<ns>/<name>/
+template.json`, peer to a manifold. `TemplateFolder` = `{name, slot, values,
+contexts:[TemplateContext{turns:[{role,content}], assistant}]}`,
+`TEMPLATE_FORMAT_VERSION = 1`. Invariant (`_validate_body` / `_validate_context`):
+the slot appears **exactly once** in each context's final `assistant` string and in
+no history turn; the last history turn must be `user` (the slotted assistant turn
+follows it). Derived views: `node_labels()` (slugged values), `node_corpora()`
+(`{label: [slot-filled assistant per context]}` — the manifold corpus,
+`corpus[i] ↔ contexts[i]`), `score_inputs()` (per-context `{messages,
+assistant_prefix, suffix, choices, labels}` — the scorer feed, slot split via
+`partition`). `sha256()` hashes `slot × values × contexts` (excludes
+description/tags) — the staleness key folded into a referencing manifold's
+`nodes_sha256`. Lifecycle: `create_template_folder` (validates whole body before
+writing — no half-built folder), `resolve_template(selector)` (bare name searches
+all namespaces, `AmbiguousTemplateError` on collision, `TemplateNotFoundError` on
+miss), `iter_template_folders`, `remove_template_folder`. `_slug_value` mirrors the
+manifold node-label slug; `_LABEL_REGEX` is redefined locally so the
+`manifolds → templates` import direction stays acyclic.
 
 ## selectors.py
 

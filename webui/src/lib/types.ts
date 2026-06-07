@@ -372,6 +372,76 @@ export interface CreateTemplatedManifoldRequest {
   hyperparams?: Record<string, number | string>;
 }
 
+// ---- standalone templated-completion artifact (/saklas/v1/templates) ----
+
+/** One turn in a template context's multi-turn history. */
+export interface TemplateTurn {
+  role: "system" | "user" | "assistant";
+  content: string;
+}
+
+/** A multi-turn context: history turns + the slotted final assistant turn.
+ *  The slot appears exactly once in ``assistant`` and never in a history turn. */
+export interface TemplateContextSpec {
+  turns: TemplateTurn[];
+  assistant: string;
+}
+
+/** Body for POST /saklas/v1/templates — author a standalone template. */
+export interface CreateTemplateRequest {
+  namespace?: string;
+  name: string;
+  slot: string;
+  values: string[];
+  contexts: TemplateContextSpec[];
+  description?: string;
+  tags?: string[];
+  force?: boolean;
+}
+
+/** A template list-row / summary. */
+export interface TemplateSummary {
+  namespace: string;
+  name: string;
+  slot: string;
+  n_values: number;
+  n_contexts: number;
+  values: string[];
+  labels: string[];
+  description: string;
+  tags: string[];
+}
+
+/** A template detail (summary + the full contexts). */
+export interface TemplateDetail extends TemplateSummary {
+  contexts: TemplateContextSpec[];
+}
+
+/** One candidate's score within a context's distribution. */
+export interface ChoiceScore {
+  text: string;
+  label: string;
+  n_tokens: number;
+  sum_logprob: number;
+  mean_logprob: number;
+  prob_sum: number;
+  prob_mean: number;
+}
+
+/** One context's restricted-choice distribution. */
+export interface ChoiceScores {
+  steering: string | null;
+  choices: ChoiceScore[];
+}
+
+/** Response from POST /saklas/v1/templates/{ns}/{name}/score. */
+export interface ScoreTemplateResponse {
+  template: string;
+  namespace: string;
+  steering: string | null;
+  contexts: ChoiceScores[];
+}
+
 /** Body for POST /saklas/v1/manifolds/generate.
  *
  *  LLM-author a discover-mode manifold from a flat concept list: the
@@ -1374,7 +1444,12 @@ export type DrawerName =
    * assistant nodes → compare those). */
   | "node_compare"
   /** Transcript export/import drawer — phase 5. */
-  | "transcript";
+  | "transcript"
+  /** Templated-completion lab — author standalone templates (slot + values
+   *  + multi-turn contexts) and score the restricted-choice value
+   *  distribution (steering-aware before/after). Reached from the workspace
+   *  rail's "manifolds → templates…" entry. */
+  | "template_lab";
 
 export interface DrawerState {
   open: DrawerName | null;

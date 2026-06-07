@@ -235,7 +235,7 @@ def _encode_and_capture_all(
 def _encode_and_capture_all_batch(
     model: torch.nn.Module,
     tokenizer: Any,
-    prompts: Sequence[str],
+    prompts: "Sequence[str | list[dict[str, str]]]",
     responses: Sequence[str],
     layers: torch.nn.ModuleList,
     device: torch.device,
@@ -311,7 +311,7 @@ def _encode_and_capture_all_batch(
 
 def _render_and_tokenize_for_capture(
     tokenizer: Any,
-    prompt: str,
+    prompt: "str | list[dict[str, str]]",
     response: str,
     device: torch.device,
     *,
@@ -319,18 +319,26 @@ def _render_and_tokenize_for_capture(
     model_type: str | None = None,
     system_msg: str = _LENGTH_DIRECTIVE,
 ) -> tuple[torch.Tensor, int]:
-    """Render a ``[system, user, assistant]`` turn + tokenize, locating the last content token.
+    """Render a ``[system, *history, assistant]`` turn + tokenize, locating the last content token.
 
     The shared front half of :func:`_encode_and_capture_all`.  Conversational
     (4.0 / A2) capture: ``response`` is an assistant turn answering ``prompt``,
     rendered under ``system_msg`` (the shared :data:`_LENGTH_DIRECTIVE` by
     default, matching generation; ``""`` drops the system turn) with the standard
-    assistant label.  ``role`` (when set) substitutes a custom assistant-role
-    label via :func:`saklas.core.role_templates.apply_with_role` for the
-    persona-baselined fit; ``role=None`` is the swap-back default.  Returns
-    ``(ids [1, T] on device, content_end)`` where ``content_end`` is the
-    response's last non-special token — the canonical pooling position.
+    assistant label.  ``prompt`` is either a single user-turn ``str`` (the A2
+    default) or a multi-turn history ``list[{role, content}]`` (templated
+    capture — the slotted assistant turn rides a real conversation prefix);
+    either way the assistant ``response`` is appended as the final turn.
+    ``role`` (when set) substitutes a custom assistant-role label via
+    :func:`saklas.core.role_templates.apply_with_role` for the persona-baselined
+    fit; ``role=None`` is the swap-back default.  Returns ``(ids [1, T] on
+    device, content_end)`` where ``content_end`` is the response's last
+    non-special token — the canonical pooling position.
     """
+    history: list[dict[str, str]] = (
+        [{"role": "user", "content": prompt}] if isinstance(prompt, str)
+        else [dict(t) for t in prompt]
+    )
     if getattr(tokenizer, "chat_template", None) is not None:
         # Disable thinking/reasoning mode for models that support it
         # (Qwen 3.5, QwQ, etc.) — thinking tokens would contaminate pooling.
@@ -341,10 +349,8 @@ def _render_and_tokenize_for_capture(
         messages = []
         if system_msg:
             messages.append({"role": "system", "content": system_msg})
-        messages.extend([
-            {"role": "user", "content": prompt},
-            {"role": "assistant", "content": response},
-        ])
+        messages.extend(history)
+        messages.append({"role": "assistant", "content": response})
         if role is None:
             text = tokenizer.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=False, **kwargs,
@@ -363,10 +369,11 @@ def _render_and_tokenize_for_capture(
             )
     else:
         # Base model (no chat template) — there are no turn roles to render and
-        # A2 role-swap cannot apply; capture the prompt+response continuation as
+        # A2 role-swap cannot apply; capture the history+response continuation as
         # raw text, with the length directive prepended (when set) so the framing
         # still matches generation.
-        text = f"{system_msg}\n{prompt}\n{response}" if system_msg else f"{prompt}\n{response}"
+        hist_text = "\n".join(t["content"] for t in history)
+        text = f"{system_msg}\n{hist_text}\n{response}" if system_msg else f"{hist_text}\n{response}"
     enc = tokenizer(text, return_tensors="pt", add_special_tokens=False)
     ids = enc["input_ids"]
     if ids.numel() == 0:

@@ -1130,6 +1130,95 @@ class TestManifoldRoutes:
         assert body["feature_space"] == "raw"
 
 
+# ---- templates (standalone artifact + scorer) ----------------------------
+
+_TMPL_PAYLOAD = {
+    "namespace": "local",
+    "name": "weekday",
+    "slot": "[DAY]",
+    "values": ["Monday", "Tuesday", "Wednesday"],
+    "contexts": [
+        {"turns": [{"role": "user", "content": "what day is it?"}],
+         "assistant": "today is [DAY]"},
+        {"turns": [{"role": "user", "content": "hi"},
+                   {"role": "assistant", "content": "hello!"},
+                   {"role": "user", "content": "remind me the day?"}],
+         "assistant": "it's [DAY]"},
+    ],
+}
+
+
+class TestTemplateRoutes:
+    def test_create_list_get_delete(
+        self, session_and_client: Any, tmp_path: Any, monkeypatch: Any,
+    ) -> None:
+        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+        _session, client = session_and_client
+        resp = client.post("/saklas/v1/templates", json=_TMPL_PAYLOAD)
+        assert resp.status_code == 201, resp.text
+        body = resp.json()
+        assert body["name"] == "weekday"
+        assert body["labels"] == ["monday", "tuesday", "wednesday"]
+        assert body["n_contexts"] == 2
+
+        listing = client.get("/saklas/v1/templates").json()["templates"]
+        assert any(t["name"] == "weekday" for t in listing)
+
+        detail = client.get("/saklas/v1/templates/local/weekday").json()
+        assert detail["slot"] == "[DAY]"
+        assert len(detail["contexts"]) == 2
+        assert detail["contexts"][1]["turns"][-1]["content"] == "remind me the day?"
+
+        assert client.delete("/saklas/v1/templates/local/weekday").status_code == 200
+        assert client.get("/saklas/v1/templates/local/weekday").status_code == 404
+
+    def test_create_slot_in_history_rejected(
+        self, session_and_client: Any, tmp_path: Any, monkeypatch: Any,
+    ) -> None:
+        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+        _session, client = session_and_client
+        bad = {
+            "name": "bad", "slot": "[DAY]", "values": ["Monday", "Tuesday"],
+            "contexts": [{"turns": [{"role": "user", "content": "is it [DAY]?"}],
+                          "assistant": "yes [DAY]"}],
+        }
+        assert client.post("/saklas/v1/templates", json=bad).status_code == 400
+
+    def test_score_route_wires_session(
+        self, session_and_client: Any, tmp_path: Any, monkeypatch: Any,
+    ) -> None:
+        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+        session, client = session_and_client
+        client.post("/saklas/v1/templates", json=_TMPL_PAYLOAD)
+
+        from saklas.core.scoring import ChoiceScore, ChoiceScores
+        fake = [ChoiceScores(choices=(
+            ChoiceScore("Monday", "monday", (1,), 1, -1.0, -1.0, 0.7, 0.7),
+            ChoiceScore("Tuesday", "tuesday", (2,), 1, -2.0, -2.0, 0.3, 0.3),
+        ), steering="0.5 a.b")]
+        session.score_template.return_value = fake
+
+        resp = client.post(
+            "/saklas/v1/templates/local/weekday/score",
+            json={"steering": "0.5 a.b"},
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["template"] == "weekday"
+        assert body["steering"] == "0.5 a.b"
+        assert body["contexts"][0]["choices"][0]["label"] == "monday"
+        assert body["contexts"][0]["choices"][0]["prob_sum"] == 0.7
+
+    def test_score_missing_template_404(
+        self, session_and_client: Any, tmp_path: Any, monkeypatch: Any,
+    ) -> None:
+        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+        _session, client = session_and_client
+        assert client.post(
+            "/saklas/v1/templates/local/ghost/score", json={},
+        ).status_code == 404
+
+
 # ---- per-message roles (sampling carrier) --------------------------------
 
 

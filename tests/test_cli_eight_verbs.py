@@ -33,10 +33,36 @@ def _isolated_home(
 # Root verb set
 # ---------------------------------------------------------------------------
 
-def test_six_top_level_verbs() -> None:
+def test_seven_top_level_verbs() -> None:
     assert set(_COMMAND_RUNNERS) == {
-        "tui", "serve", "manifold", "pack", "config", "experiment",
+        "tui", "serve", "manifold", "pack", "config", "experiment", "template",
     }
+
+
+def test_template_verb_parses() -> None:
+    args = cli.parse_args(["template", "score", "weekday", "-m", "m/x"])
+    assert args.command == "template"
+    assert args.template_cmd == "score"
+    assert args.name == "weekday"
+    assert args.model == "m/x"
+
+
+def test_manifold_from_template_parses() -> None:
+    args = cli.parse_args(["manifold", "from-template", "weekday", "--name", "wd"])
+    assert args.command == "manifold"
+    assert args.manifold_cmd == "from-template"
+    assert args.template == "weekday"
+    assert args.name == "wd"
+
+
+def test_bare_template_prints_help_exit_0(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["template"])
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    assert "saklas template <verb>" in out
 
 
 def test_root_help_lists_manifold_and_pack(
