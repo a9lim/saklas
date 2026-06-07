@@ -1863,9 +1863,13 @@ class SynthesizedSubspace:
     blend that selects which is which (``0`` push / translate, ``1`` ablate /
     collapse): the kernel applies ``target − κ⊙q``, so push axes ignore ``q``
     (fixed offset) while ablation axes drive ``q`` toward ``0``.  ``share`` is the
-    un-normalized per-layer budget weight — the world push-displacement
-    magnitude ``‖Δ_L‖`` (a pure-ablation layer weights by the summed ablation
-    magnitude instead); the apply path normalizes it across layers.
+    un-normalized per-layer budget weight — the push-displacement magnitude
+    ``‖Δ_L‖_M`` (whitened) when a covering ``whitener`` is supplied, else the
+    raw-Euclidean ``‖Δ_L‖₂``; a pure-ablation layer weights by the summed
+    ablation magnitude instead.  The apply path normalizes it across layers
+    (mean-1).  ``target_coord`` is correspondingly a whitened-unit direction on
+    the whitened path (magnitude carried by ``share``) or the raw reduced
+    displacement on the Euclidean fallback.
 
     Fields are keyed by layer index; only layers carrying at least one
     non-degenerate active direction (and present in ``neutral_means``) appear.
@@ -1886,6 +1890,7 @@ def synthesize_subspace(
     ablate: Sequence[dict[int, torch.Tensor]],
     neutral_means: dict[int, torch.Tensor],
     *,
+    whitener: "LayerWhitener | None" = None,
     eps: float = 1e-9,
 ) -> SynthesizedSubspace:
     """Compose an active steering term set into one affine subspace per layer.
@@ -1923,11 +1928,38 @@ def synthesize_subspace(
     - ``share = ‖Δ‖`` (the world displacement magnitude); a pure-ablation layer
       weights by the summed ablation-row magnitude instead.
 
-    Because the basis is orthonormal, ``‖target‖ = ‖Δ‖`` for a push, so the
-    per-layer budget weight and the steered coordinate sit on one consistent
-    scale (unlike the rank-1-only predecessor, which mixed a unit target with a
-    baked-magnitude share).  Real per-layer coords (Step 3) restore the
-    ``∝ ‖δ_L‖`` magnitude that the high-signal layers should carry.
+    **Whitened normalization (``whitener`` given).**  The push magnitude used to
+    be the *raw-Euclidean* node displacement ``‖Δ_L‖₂``, which is not a
+    scale-stable steering unit: it is the un-whitened (rogue-dominated) distance
+    from neutral to the target node, and it spans ~100× across targets purely by
+    where each centroid happens to sit (a tight bipolar pole sits ~0.3 from
+    neutral, a far persona centroid ~17), so a single ``along`` gain over-pushed
+    far nodes into incoherence and left near ones doing nothing.  When the
+    ``whitener`` covers every synthesized layer the push is instead normalized in
+    the Mahalanobis metric ``M_R = B Σ⁻¹ Bᵀ`` (the engine-wide read/fit metric):
+
+    - ``share = ‖Δ‖_M`` (whitened displacement) — the cross-layer profile weights
+      by *whitened* signal, matching the baked ``mahalanobis_share`` rather than
+      the raw activation distance.
+    - ``target = (B @ Δ) / ‖Δ‖_M`` — a **whitened-unit** direction (``‖B@target‖_M
+      = 1``), so the apply path's ``eff_along_L = mean1(share)·gain`` puts the same
+      *whitened* slide on every target.  The push still aims at the node centroid
+      (whitening a direction toward a fixed point is metric-invariant — only the
+      calibration changes), it is just measured in std-units instead of the
+      raw-Euclidean scale.  Every target then receives one uniform whitened
+      budget (``Σ_L eff_along_L = gain·n_layers``), distributed across layers by
+      where its signal lives; ``along`` becomes a scale-stable strength knob.
+
+    This is all-or-nothing (Mahalanobis-only): a partially-covering / absent
+    whitener falls back to the raw-Euclidean ``‖Δ‖₂`` path below (CPU stubs,
+    degenerate fits), never mixing the two metrics across layers within one
+    steer (a mixed cross-layer profile would be meaningless under the mean-1
+    normalization).
+
+    Because the basis is orthonormal, ``‖target‖₂ = ‖Δ‖₂`` on the Euclidean
+    fallback (the per-layer budget weight and the steered coordinate sit on one
+    scale); the whitened path instead decouples them — ``share`` carries the
+    per-layer magnitude, ``target`` carries only the unit direction.
 
     The strengths live in ``target`` (per-axis), not in a single ``along`` — the
     caller picks ``along`` (the overall slide, the existing manifold-``%``
@@ -1942,6 +1974,20 @@ def synthesize_subspace(
     for dirs in ablate:
         all_layers |= dirs.keys()
 
+    # All-or-nothing whitened normalization: only when the whitener covers every
+    # layer that will actually be synthesized (present in ``neutral_means``).  A
+    # mixed whitened/Euclidean cross-layer profile is meaningless under the
+    # apply-time mean-1 share normalization, so gate the whole synth on one
+    # ``covers_all`` rather than per-layer.
+    present_layers = sorted(L for L in all_layers if L in neutral_means)
+    maha = (
+        whitener
+        if whitener is not None
+        and present_layers
+        and whitener.covers_all(present_layers)
+        else None
+    )
+
     layers: dict[int, "LayerSubspace"] = {}
     target_coord: dict[int, torch.Tensor] = {}
     share: dict[int, float] = {}
@@ -1953,9 +1999,13 @@ def synthesize_subspace(
         mean = neutral_means[L].to(torch.float32).reshape(-1)
 
         # Push fragments present at this layer: their basis rows (for the span)
-        # and their world displacement vector ``coeff · (coords @ basis)``.
+        # and per fragment the ``(coeff, world_dir)`` pair — ``world_dir = coords
+        # @ basis`` is the raw (coeff-free) neutral→node displacement; ``coeff``
+        # is kept *separate* so the whitened path can unit-normalize the
+        # direction (strip the node's raw-Euclidean distance) while still scaling
+        # by the user strength.
         push_rows: list[torch.Tensor] = []          # individual (D,) basis rows
-        push_world: list[torch.Tensor] = []         # per-fragment (D,) displacement
+        push_frags: list[tuple[float, torch.Tensor]] = []   # (coeff, world_dir (D,))
         for basis_dirs, coord_dirs, coeff in push:
             B_i = basis_dirs.get(L)
             if B_i is None:
@@ -1972,7 +2022,7 @@ def synthesize_subspace(
                 c_i = B_i.new_zeros(B_i.shape[0])
             c_i = c_i.to(torch.float32).reshape(-1)
             push_rows.extend(B_i)
-            push_world.append(float(coeff) * (c_i @ B_i))   # (D,)
+            push_frags.append((float(coeff), c_i @ B_i))    # (D,) raw world dir
 
         ablate_rows: list[torch.Tensor] = []        # individual (D,) basis rows
         ablate_raw: list[torch.Tensor] = []         # raw rows (magnitude → share)
@@ -1998,15 +2048,40 @@ def synthesize_subspace(
         if basis.shape[0] == 0:
             continue
 
-        if push_world:
-            delta = torch.stack(push_world).sum(0)
-            share_L = float(torch.linalg.vector_norm(delta))
+        if push_frags:
+            # Raw coeff-weighted displacement — its (whitened) magnitude is the
+            # per-layer **profile** weight (``share``); the absolute node-distance
+            # scale cancels under the apply-time mean-1 normalization, leaving
+            # only the relative across-layer shape (steer where the signal is).
+            raw_delta = torch.stack([cf * wd for cf, wd in push_frags]).sum(0)
+            if maha is not None:
+                share_L = float(maha.mahalanobis_norm(L, raw_delta))
+                # Target = Σ_i coeff_i · (B @ world_dir_i)/‖world_dir_i‖_M — each
+                # fragment a **whitened-unit** direction (node-distance stripped,
+                # so scale-stable across targets) scaled by its user coeff (the
+                # strength knob the mean-1 ``share`` would otherwise cancel).
+                tc = basis.new_zeros(basis.shape[0])
+                for cf, wd in push_frags:
+                    wn = float(maha.mahalanobis_norm(L, wd))
+                    if wn > eps:
+                        tc = tc + (cf / wn) * (basis @ wd)
+                if float(torch.linalg.vector_norm(tc)) < eps:
+                    # Every fragment degenerate in the whitened metric here —
+                    # fall back to the raw reduced target so the layer still steers.
+                    tc = basis @ raw_delta
+                    share_L = float(torch.linalg.vector_norm(raw_delta))
+            else:
+                tc = basis @ raw_delta                    # Euclidean fallback
+                share_L = float(torch.linalg.vector_norm(raw_delta))
+            target_coord[L] = tc                          # ablation axes ≈ 0
         else:
-            delta = torch.zeros_like(mean)
             ablate_sum = torch.stack(ablate_raw).sum(0)
-            share_L = float(torch.linalg.vector_norm(ablate_sum))
-
-        target_coord[L] = basis @ delta          # (R,) ablation axes ≈ 0
+            share_L = (
+                float(maha.mahalanobis_norm(L, ablate_sum))
+                if maha is not None
+                else float(torch.linalg.vector_norm(ablate_sum))
+            )
+            target_coord[L] = basis.new_zeros(basis.shape[0])   # (R,) all ≈ 0
         # Per-axis collapse weight κ: 0 on the push span (translate — preserve
         # the per-token in-subspace spread), 1 on the ablate-only complement
         # (collapse the component to 0).  Derived by projecting each merged-basis

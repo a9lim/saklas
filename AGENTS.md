@@ -309,15 +309,29 @@ nearest-point foot-follower. fp32 throughout; the only norm guard is the soft ca
 
 Gain (`core/hooks.py`): the per-layer share is normalized to **mean 1** (`Σ_L
 share_L = n_layers`) and `eff_along_L = share_L · _MANIFOLD_ALONG_GAIN`
-(`= 0.125`, the translate-slide gain for both modes). `_MANIFOLD_GAIN = 1.0` now
-scales **onto** only (the curved off-surface collapse). For an affine term the
+(`= 16.0` — bumped from `0.125` when the affine target went whitened-unit and
+live-recalibrated on gemma-4-12b, see below; the translate-slide gain for both
+modes). `_MANIFOLD_GAIN` scales
+**onto** only (the curved off-surface collapse). For an affine term the
 coefficient α is folded into the translate *target* by `synthesize_subspace`, so α
 scales the offset magnitude (unclamped); for a curved term α is the (clamped
-`[0,1]`) `along` fraction. There is **no lever / N correction** and **no `[0,1]`
+`[0,1]`) `along` fraction. **Whitened along-normalization:** when a covering
+whitener is present `synthesize_subspace` makes the affine push target a
+*whitened-unit* direction (`target = Σᵢ coeffᵢ·(B@dirᵢ)/‖dirᵢ‖_M`) and the share
+the *whitened* displacement `‖Δ‖_M` — so the per-layer slide budget is the same
+whitened amount for every target (`Σ_L eff_along_L = gain·n_layers`), linear in α.
+This replaced steering by the raw-Euclidean node distance, which spanned ~100×
+across targets (a tight pole sits ~0.3 from neutral, a far persona centroid ~17),
+so one `along` gain couldn't calibrate both — `0.5 formal%formal` did nothing
+while `0.5 personas%caveman` slammed the output. `along` is now a scale-stable
+strength knob across ranks/targets; per-target *coherence* variance (~2-3×, §10)
+remains. There is **no lever / N correction** and **no `[0,1]`
 clamp / water-fill on `along`** (a high-signal layer is meant to overshoot the
 target; the de-rogued whitened coords keep it controlled and `norm_cap` bounds
 it). `onto` stays clamped `[0,1]`. (`_MANIFOLD_ALONG_GAIN` is tagged a prototype —
-calibrated so `≈0.5 <concept>` lands at the coherent sweet spot.) A steered layer always runs the slow (ctx-consulting) hook, so per-step
+calibrated so `≈0.5 <concept>` lands at the coherent sweet spot; the whitened
+normalization changes the absolute scale, so this constant is **due for
+recalibration** against live output.) A steered layer always runs the slow (ctx-consulting) hook, so per-step
 triggers and probe gates work uniformly; `torch.compile`/StaticCache graph capture
 stays available only for unsteered generation.
 
@@ -475,8 +489,12 @@ partial folder in the package tree without exposing it as a default manifold:
 Recommended α is vector-comparable: aim for `α ≈ 0.5`, tune up toward `α ≈ 1.0`
 for stronger expression. (For an affine push term α is unclamped — it sets the
 translate-offset magnitude; for a curved `%` term `along` clamps to `[0,1]`.) The
-global translate-slide gain `_MANIFOLD_ALONG_GAIN = 0.125` is calibrated so
-`≈0.5 <concept>` lands at the coherent sweet spot. Because the share is normalized
+global translate-slide gain `_MANIFOLD_ALONG_GAIN = 16.0` (live-calibrated on
+gemma-4-12b — it jumped from `0.125` when the affine target became whitened-unit, a
+unit-scale change of ~100×) targets `≈0.5 <concept>` at the coherent band for both
+tight concepts and personas (`α ≈ 1.0` is the strong / over-steer zone where hard
+personas break — dial down per target, §10). Because
+the target is now whitened-unit and the share is normalized
 to mean 1 and the lever is gone, a low-dim and a high-dim fit — a 2-node vector,
 `personas`, and `pad` once its corpus is complete — land in the same α-band
 without per-fit retuning.
@@ -499,8 +517,11 @@ qualitative, MPS is not bitwise deterministic so compare qualitatively):
 > **Open frontiers** (see `ARCHITECTURE.md` §10): the fitted `personas` subspace is
 > a near-1-D "persona-ness" fan, so distinct personas can express the same generic
 > intense register (a steering-access problem, not the rogue problem — whitening
-> verifiably worked), and the translate-slide gain (`_MANIFOLD_ALONG_GAIN`) is
-> provisional and coupled to that.
+> verifiably worked). The translate-slide gain (`_MANIFOLD_ALONG_GAIN`) is
+> live-calibrated but still coupled to that: with the geometric scale now whitened
+> away, what remains is per-target *coherence* variance (~2× — a hard persona like
+> hacker shatters at roughly half the effective gain a robust concept tolerates),
+> which a single scalar gain can't unify. `16.0` is the coherence-first compromise.
 
 ## Python API
 

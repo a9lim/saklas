@@ -2759,6 +2759,16 @@ class SaklasSession:
         # ablation took without ``layer_means``.
         neutral_means = self._layer_means
 
+        # Whitened push normalization (Mahalanobis-only): hand the synthesizer the
+        # session whitener so the per-layer ``along`` budget is the whitened
+        # displacement ``‖Δ‖_M`` and the target is a whitened-unit direction —
+        # making ``along`` a scale-stable strength knob instead of inheriting each
+        # node's raw-Euclidean distance from neutral (which spans ~100× across
+        # targets).  Gated on a real session (means populated): a model-less stub
+        # keeps the Euclidean fallback, and the property soft-fails to ``None``
+        # (covers_all is then false) so a missing whitener degrades, never raises.
+        whitener = self.whitener if neutral_means else None
+
         # trigger -> {"push": [(basis_dirs, coord_dirs, coeff)], "ablate": [dirs]}
         grouped: dict[Trigger, dict[str, list[Any]]] = {}
 
@@ -2824,6 +2834,7 @@ class SaklasSession:
                 continue
             synth = synthesize_subspace(
                 terms["push"], terms["ablate"], neutral_means=neutral_means,
+                whitener=whitener,
             )
             if not synth.layers:
                 continue

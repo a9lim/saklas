@@ -516,30 +516,49 @@ then folded like vectors.
 
 **Grouping + synthesis.** Push + ablation fragments are grouped **by trigger**.
 Each trigger group is composed by `synthesize_subspace(push, ablate,
-neutral_means)` into one `SynthesizedSubspace`. Per layer (over the union of layers
-any term touches):
+neutral_means, *, whitener)` into one `SynthesizedSubspace`. Per layer (over the
+union of layers any term touches):
 
 1. Flatten every present push fragment's basis rows, then every ablation
    fragment's rows, into one ordered list (push first); orthonormalize the union
    (`_ortho_basis`) → the merged `(R, D)` basis `B`.
-2. World push displacement `Δ = Σ_push coeffᵢ·(coord_targetᵢ @ basis_rowsᵢ)`;
-   `target_coord = B @ Δ` is its coordinate in the merged basis. `Δ` lives in the
-   push span, so the ablation-only axes (its orthogonal complement) carry
-   `target ≈ 0`.
+2. **Whitened-normalized push** (the session always passes `self.whitener`; gated
+   all-or-nothing on `covers_all`). Each push fragment's raw neutral→node
+   direction `dirᵢ = coord_targetᵢ @ basis_rowsᵢ` is unit-normalized **in the
+   Mahalanobis metric** (`dirᵢ/‖dirᵢ‖_M`) and scaled by its user coeff, then
+   summed: `target_coord = Σᵢ coeffᵢ·(B@dirᵢ)/‖dirᵢ‖_M`. This *strips the raw node
+   distance* from the direction (only the unit whitened bearing survives) while
+   keeping α as the strength. The ablation-only axes carry `target ≈ 0`.
 3. Per-axis collapse mask `κ` (R,): `0` on the push span, `1` on the
    ablation-only complement, derived as `κ = 1 − ‖proj onto push span‖²` (robust
    to orthonormalization order). The kernel *translates* push axes by the fixed
    offset but *collapses* `κ=1` axes toward 0 — a `target ≈ 0` alone no longer
    removes an ablated direction (translate-by-offset would leave it untouched), so
    κ is what does the ablation post translate-not-collapse.
-4. `share = ‖Δ‖` (a pure-ablation layer weights by the summed ablation-row
-   magnitude instead).
+4. `share = ‖Δ‖_M` — the **whitened** magnitude of the raw coeff-weighted
+   displacement `Δ = Σ coeffᵢ·dirᵢ`; this is the per-layer *profile* (the absolute
+   node-distance scale cancels under apply-time mean-1 normalization, leaving only
+   the relative across-layer shape). A pure-ablation layer weights by the summed
+   ablation-row whitened magnitude instead.
 
-Because `B` is orthonormal, `‖target_coord‖ = ‖Δ‖`, so the per-layer budget
-weight and the steered coordinate sit on one consistent scale. Each merged
-subspace registers via `SteeringManager.add_subspace`; curved `%` terms register
-via `add_manifold`. So `add_subspace`/`add_manifold` see exactly one merged affine
-subspace per trigger group plus zero or more curved manifolds.
+**Why whitened.** Steering by the raw-Euclidean node distance (the prior `target =
+B@Δ`, `‖target‖ = ‖Δ‖₂`) coupled `along` to an accident of where each centroid
+sits: a tight bipolar pole sits ~0.3 from neutral while a far persona centroid
+sits ~17 — a ~100× spread — so a single `along` gain over-pushed far nodes into
+incoherence and left near ones doing nothing (`0.5 formal%formal` ≈ dead,
+`0.5 personas%caveman` slammed). Raw-Euclidean distance is the un-whitened,
+rogue-dominated metric the rest of the engine avoids; it leaked back in through
+`node_coords` as the `%` target. Whitened-unit normalization removes it: every
+target lands on **one uniform whitened budget** (`Σ_L eff_along_L = gain·n_layers`),
+linear in α, concentrated by the per-layer profile — so `along` finally means the
+same thing across ranks/targets. (Whitening the *direction* toward a fixed node is
+otherwise metric-invariant — only the calibration changes — so the push still aims
+at the node centroid, just measured in std-units.) A whitener-absent path (CPU
+stub / degenerate fit) falls back to the raw-Euclidean `target_coord = B@Δ`,
+`share = ‖Δ‖₂` unchanged. Each merged subspace registers via
+`SteeringManager.add_subspace`; curved `%` terms register via `add_manifold`. So
+`add_subspace`/`add_manifold` see exactly one merged affine subspace per trigger
+group plus zero or more curved manifolds.
 
 ### Orthogonality model
 
@@ -678,8 +697,8 @@ Euclidean `‖eval_rbf(node_params)‖_F`), then:
   historic `%` knob), clamped to `[0,1]` at apply time. `onto` stays a `[0,1]`
   collapse fraction.
 
-**Two gain constants.** `_MANIFOLD_ALONG_GAIN = 0.125` scales **along** (the
-translate slide) in both modes; `_MANIFOLD_GAIN = 0.5` now scales **onto** only
+**Two gain constants.** `_MANIFOLD_ALONG_GAIN = 16.0` (live-calibrated) scales
+**along** (the translate slide) in both modes; `_MANIFOLD_GAIN = 0.5` now scales **onto** only
 (the off-surface collapse share-weight, curved-only — calibrated on the
 gemma-4-12b `pad%dominant` onto sweep: at `1.0` even `onto=0.5` fragmented and
 `onto=1.0` collapsed into looping, since collapsing the off-surface residual
@@ -688,11 +707,18 @@ coherent ceiling). The split is the
 translate-not-collapse consequence: a fixed-offset translate is *unbounded* where
 the old lerp-onto-target saturated (the offset compounds across layers rather than
 landing on the target), so the slide gain runs ~an order of magnitude below the
-old collapse gain. `_MANIFOLD_ALONG_GAIN` is calibrated on the gemma-4-12b caveman
-sweep — coherent window ~0.06–0.10 (probe `frac` ≈ 0.20–0.26), loop degeneration
-past ~0.14; `0.125` puts the recommended `≈0.5 <concept>` at the sweet spot and
-lets `1.0 <concept>` push into somewhat-over-steered strong expression. It is
-committed but tagged a prototype in the source.
+old collapse gain. **Whitened-target recalibration:** since the affine target is
+now a *whitened-unit* direction (§5.3), the avg per-layer whitened push is `GAIN·α`,
+independent of which target — where the prior raw-Euclidean target scaled the push
+by each node's distance from neutral (caveman ~17, formal ~0.3, a ~100× spread
+that left near targets dead). The old `0.125` was tuned against that ~17 scale, so
+on the unit scale it under-pushes ~100×; `16.0` is live-calibrated on a gemma-4-12b
+α-sweep (`formal%formal`, `personas%caveman`, `personas%hacker`) so the recommended
+α≈0.5 lands at effective gain `GAIN·α ≈ 8` — clearly steering every target while
+staying coherent for the most fragile persona. Coherence ceilings vary ~2× per
+target (hacker shatters at effective ~12, caveman ~17, formal past ~22 — the §10
+per-persona variance a scalar gain can't unify), so α≈1.0 is the strong/over-steer
+zone where hard personas break. Committed but tagged a prototype in the source.
 
 There is **no `[0,1]` clamp and no water-fill on `along`**: a high-signal layer is
 *meant* to overshoot, the de-rogued whitened coords keep the overshoot controlled,
@@ -710,10 +736,13 @@ has room; tune α per target.
 2. `fold_directions_to_subspace` rebuilds a neutral-anchored `R=1` ray:
    `basis = δ̂_L`, `node_coords = [[‖d_L‖]]`, `share = ‖d_L‖_M`.
 3. `_affine_manifold_push` → push fragment `(δ̂_L rows, [‖d_L‖] coord, coeff 0.3)`.
-4. `synthesize_subspace`: `B = δ̂_L`, `Δ_L = 0.3·‖d_L‖·δ̂_L`,
-   `target_coord = [0.3·‖d_L‖]`, `share = 0.3·‖d_L‖`, `κ = [0]` (pure push).
+4. `synthesize_subspace` (whitened, session whitener covers all): `B = δ̂_L`, raw
+   dir `‖d_L‖·δ̂_L` whitened-unit-normalized then ×coeff →
+   `target_coord = [0.3 / ‖δ̂_L‖_M]` (so `‖target@B‖_M = 0.3`), profile
+   `share = ‖0.3·d_L‖_M = 0.3·‖d_L‖_M`, `κ = [0]` (pure push).
 5. `add_subspace` → `apply_to_model`: `share_L` normalized to mean 1,
-   `eff_along_L = share_L · 0.125`.
+   `eff_along_L = share_L · 16.0`. Avg per-layer whitened push = `16.0·0.3` —
+   target-independent (a far persona node lands on the same budget).
 6. Per token, `subspace_inject` (affine shortcut): foot `q = (h − mean)·δ̂`,
    translate `q ← q + eff_along·(target − κ·q) = q + eff_along·target` (κ=0),
    write `h ← mean + (translated q)·δ̂ + H_o`.
@@ -928,13 +957,18 @@ straight-chord additive baseline alongside.
   the between-persona covariance at fit time; strip the shared axis from the
   target), not the metric.
 - **`base_gain` magnitude.** Steering now uses **two** constants:
-  `_MANIFOLD_ALONG_GAIN = 0.125` (the translate slide, both modes) and
+  `_MANIFOLD_ALONG_GAIN = 16.0` (the translate slide, both modes) and
   `_MANIFOLD_GAIN = 0.5` (onto / off-surface collapse only). Both are committed but
-  provisional — `_MANIFOLD_ALONG_GAIN` is tagged a prototype, calibrated on the
-  gemma-4-12b caveman sweep (coherent window ~0.06–0.10, loop degeneration past
-  ~0.14). The translate offset compounds across layers rather than landing on the
-  target, so the coherent gain sits ~10× below the old lerp-onto-target collapse
-  gain. `_MANIFOLD_GAIN` was likewise calibrated on the gemma-4-12b `pad%dominant`
+  tagged prototypes. `_MANIFOLD_ALONG_GAIN` was bumped ~130×
+  from the prior `0.125` when the affine target became whitened-unit (§5.3): the
+  avg per-layer whitened push is now `GAIN·α` for *every* target, where the old
+  raw-Euclidean target scaled it by each node's distance from neutral (a ~100×
+  spread that left tight targets like `formal%formal` dead while `personas%caveman`
+  slammed). `16.0` is live-calibrated on a gemma-4-12b α-sweep so α≈0.5 (effective
+  `GAIN·α ≈ 8`) clearly steers concepts and personas alike while staying coherent
+  for fragile personas; the per-target *coherence* ceiling (~2× variance, §10), not
+  the geometric scale, now caps it — α≈1.0 over-steers hard personas. `_MANIFOLD_GAIN`
+  was likewise calibrated on the gemma-4-12b `pad%dominant`
   onto sweep: at `1.0` (combined with a directional push) `onto=0.5` already
   fragmented and `onto=1.0` collapsed into looping — collapsing the off-surface
   residual erases the per-token spread, the same failure translate-not-collapse

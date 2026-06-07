@@ -546,15 +546,37 @@ _MANIFOLD_GAIN = 0.5
 # Translate is unbounded where collapse saturated (a fixed offset compounds
 # across layers rather than landing *on* the target), so the slide gain runs ~an
 # order of magnitude below the old collapse gain.  A typical layer gets
-# ``eff_along ≈ _MANIFOLD_ALONG_GAIN``.  Calibrated on the gemma-4-12b caveman
-# gain sweep: the coherent window is ~0.06–0.10 (probe ``frac`` ≈ 0.20–0.26),
-# with the loop degeneration setting in past ~0.14.  ``0.125`` puts the
-# recommended ``≈0.5 <concept>`` at the coherent sweet spot and lets
-# ``1.0 <concept>`` push into a *somewhat over-steered* strong expression
-# (headroom to dial down per target — a harder persona peaks earlier).
-# ``_MANIFOLD_GAIN`` stays the gain for ``onto`` only (the off-surface collapse
-# share-weight).
-_MANIFOLD_ALONG_GAIN = 0.125
+# ``eff_along ≈ _MANIFOLD_ALONG_GAIN``.
+#
+# **Whitened-normalization recalibration.**  ``synthesize_subspace`` now emits a
+# *whitened-unit* affine target (``‖target@basis‖_M = 1`` per push term, magnitude
+# carried by α), so the avg per-layer whitened push is simply ``GAIN·α`` — the same
+# for every target.  Under the prior raw-Euclidean target the push was
+# ``eff_along · ‖node_coords‖₂``, which baked in each node's distance from neutral
+# (caveman ~17, formal ~0.3, a ~100× spread); the old ``0.125`` was tuned against
+# that ~17 scale, so on the unit scale it under-pushes ~100×.
+#
+# Live-calibrated on a gemma-4-12b α-sweep (thinking off; ``formal.casual%formal``,
+# ``personas%caveman``, ``personas%hacker``).  In **effective gain ``E = GAIN·α``**:
+# the dead→expressive transition is ``E ≈ 7-8`` for every target, but the coherence
+# *ceiling* (token-soup looping past it) varies ~2× by target — hacker shatters at
+# ``E ≈ 12``, caveman at ``E ≈ 17``, formal still coherent past ``E ≈ 22``.  There
+# is **no single E** that makes caveman full AND keeps hacker coherent; this is the
+# §10 per-persona coherence variance, which a scalar gain cannot unify (it is a
+# steering-access property of the fit, not the geometric scale the whitened
+# normalization fixed).
+#
+# So the calibration is **coherence-first**: put the recommended ``α ≈ 0.5`` at
+# ``E ≈ 8`` — the strongest setting where *every* target (including the fragile
+# hacker) is clearly register-shifted yet coherent — giving ``GAIN = 16``.  ``α ≈
+# 1.0`` then lands at ``E ≈ 16`` (the documented "strong / over-steered" zone:
+# robust concepts still coherent, hard personas break — dial α down per target).
+# This is the payoff of the whitened normalization: pre-fix, ``0.5 formal%formal``
+# did nothing while ``0.5 personas%caveman`` slammed; now ``0.5`` of *either* lands
+# in the same coherent band.  (Tune up toward ``E ≈ 12`` — α ≈ 0.75 — for fuller
+# persona expression where the target tolerates it.)  ``_MANIFOLD_GAIN`` stays the
+# gain for ``onto`` only (the off-surface collapse share-weight).
+_MANIFOLD_ALONG_GAIN = 16.0
 
 # Max |cosine| between two *curved* manifold subspaces sharing a layer before
 # they are deemed overlapping (``OverlappingManifoldError``).  Curved manifolds

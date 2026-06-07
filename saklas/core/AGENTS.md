@@ -232,10 +232,21 @@ RBF Jacobian), `resolve_position` (coord payload or label),
 `decompose(h, mean, basis) → (h_par_c, h_perp)` — a standalone centered-decomposition
 helper (exported but off the hot path; `subspace_inject` and the monitor each
 decompose inline). `synthesize_subspace(push,
-ablate, neutral_means)` composes the active steering term set into one
-`SynthesizedSubspace` per layer (orthonormal merged basis via `_ortho_basis`,
-push-before-ablation ordering; `target_coord = B @ Σ coeffᵢ·poleᵢ`; `share =
-‖Δ‖`). `subspace_inject(h, subspace, domain, target_coord, foot_seed, along,
+ablate, neutral_means, *, whitener=None)` composes the active steering term set
+into one `SynthesizedSubspace` per layer (orthonormal merged basis via
+`_ortho_basis`, push-before-ablation ordering). When a covering `whitener` is
+supplied (the session always passes `self.whitener`; gated all-or-nothing on
+`covers_all`) the push is **whitened-normalized** so `along` is a scale-stable
+strength knob: `share = ‖Δ‖_M` (whitened displacement → the mean-1 cross-layer
+*profile*) and `target_coord = Σᵢ coeffᵢ·(B@dirᵢ)/‖dirᵢ‖_M` (each fragment a
+**whitened-unit** direction, node-distance stripped, scaled by its user coeff).
+This removes the ~100× push spread that came from steering by the raw-Euclidean
+node distance (a tight bipolar pole sits ~0.3 from neutral, a far persona
+centroid ~17, so one `along` gain couldn't calibrate both); every target now
+lands on one uniform whitened budget (`Σ_L eff_along_L = gain·n_layers`),
+linear in α, concentrated where the signal lives. Whitener-absent (CPU stub /
+degenerate fit) falls back to the raw-Euclidean `target_coord = B @ Σ coeffᵢ·poleᵢ`,
+`share = ‖Δ‖₂`. `subspace_inject(h, subspace, domain, target_coord, foot_seed, along,
 onto)` is **the** injection: affine analytic shortcut (foot = q, translate by the
 fixed `a·target` offset with per-axis κ collapsing ablation axes — `p_new = q +
 a·(target − κ·q)` — `H_o` kept) vs curved per-token GN foot-follow (along
@@ -331,8 +342,9 @@ normalized — `_manifold_layer_shares` prefers the baked `mahalanobis_share`, e
 the Euclidean `‖eval_rbf(node_params)‖_F`), orthogonalizes the affine subspace
 against curved spans (`_orthogonalize_affine_against` — curved wins shared
 directions), and enforces `_CURVED_ORTHO_TOL = 1e-3` between two curved manifolds
-(`OverlappingManifoldError`). Gain: two constants — `_MANIFOLD_ALONG_GAIN = 0.125`
-scales `along` (the translate slide, both modes), `_MANIFOLD_GAIN = 0.5` scales
+(`OverlappingManifoldError`). Gain: two constants — `_MANIFOLD_ALONG_GAIN = 16.0`
+(live-calibrated — see below) scales `along` (the translate slide, both modes),
+`_MANIFOLD_GAIN = 0.5` scales
 `onto` only (calibrated on the gemma-4-12b `pad%dominant` onto sweep — at `1.0`
 even `onto=0.5` fragmented and `onto=1.0` collapsed; `0.5` makes `onto∈[0,1]` a
 usable dial with `1.0` a coherent ceiling). `eff_along_L = share_L · _MANIFOLD_ALONG_GAIN` (affine: α already in
@@ -340,9 +352,13 @@ usable dial with `1.0` a coherent ceiling). `eff_along_L = share_L · _MANIFOLD_
 share_L · _MANIFOLD_GAIN, 0, 1)`. **No lever / N, no `[0,1]` clamp / water-fill on
 `along`** (a high-share layer is meant to overshoot; `norm_cap` bounds it). `onto`
 stays clamped `[0,1]` (beyond 1 would overshoot through the wire/tube).
-(`_MANIFOLD_ALONG_GAIN` runs ~10× below the old
-lerp-onto-target gain — the translate offset compounds across layers; tagged a
-prototype.)
+(`_MANIFOLD_ALONG_GAIN` jumped ~130× *up* from the prior `0.125` when the affine
+target went whitened-unit — the avg per-layer whitened push is now `GAIN·α`,
+target-independent, where it used to scale with each node's raw-Euclidean distance
+from neutral; `16.0` is live-calibrated on a gemma-4-12b α-sweep so `α ≈ 0.5`
+clearly steers concepts *and* personas while staying coherent for the fragile ones
+(effective `GAIN·α ≈ 8`; coherence ceilings vary ~2× per target — §10 — so a hard
+persona breaks by `α ≈ 1.0`). Tagged a prototype.)
 `reset_manifold_feet` cold-starts followers per generation.
 
 `HiddenCapture` — `attach`/`detach`/`stacked`/`latest_per_layer`. Three modes,
