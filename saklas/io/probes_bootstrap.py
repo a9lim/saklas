@@ -25,7 +25,10 @@ def load_default_manifolds() -> dict[str, list[str]]:
     from saklas.io.manifolds import (
         iter_manifold_folders, materialize_bundled_manifolds,
     )
+    from saklas.io.templates import materialize_bundled_templates
 
+    # Templates first — a bundled manifold may ``template_ref`` a bundled one.
+    materialize_bundled_templates()
     materialize_bundled_manifolds()
     by_tag: dict[str, list[str]] = {}
     for _ns, mf in iter_manifold_folders(namespace="default"):

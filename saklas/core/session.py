@@ -915,7 +915,13 @@ class SaklasSession:
         from saklas.io.manifolds import (
             materialize_bundled_manifolds as _materialize_bundled_manifolds,
         )
+        from saklas.io.templates import (
+            materialize_bundled_templates as _materialize_bundled_templates,
+        )
         from saklas.io import selectors as _selectors
+        # Templates first: a bundled manifold may ``template_ref`` a bundled
+        # ``default/<name>`` template, and its fit resolves that ref.
+        _materialize_bundled_templates()
         _materialize_bundled_manifolds()
         _selectors.invalidate()
 

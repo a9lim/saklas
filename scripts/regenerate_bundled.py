@@ -1,5 +1,5 @@
-"""Regenerate every bundled manifold under ``saklas/data/manifolds/`` — one
-A2 pipeline, one hardcoded spec table.
+"""Regenerate every model-generated bundled manifold under
+``saklas/data/manifolds/`` — one A2 pipeline, one hardcoded spec table.
 
 Supersedes the two former scripts (``regenerate_bundled_manifold.py`` for
 ``personas`` and ``regenerate_bundled_discover_manifold.py`` for

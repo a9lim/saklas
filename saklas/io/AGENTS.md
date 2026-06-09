@@ -170,6 +170,19 @@ miss), `iter_template_folders`, `remove_template_folder`. `_slug_value` mirrors 
 manifold node-label slug; `_LABEL_REGEX` is redefined locally so the
 `manifolds → templates` import direction stays acyclic.
 
+**Bundled templates.** `bundled_template_names` / `materialize_bundled_templates`
+mirror the manifold materializer for the template kind — copy-on-miss of
+`saklas/data/templates/<name>/template.json` into `~/.saklas/templates/default/`,
+re-copy on bundle drift (canonical hash or `format_version`), process-scope no-op.
+**Ordering**: every bootstrap site runs this *before*
+`materialize_bundled_manifolds`, because a templated bundled manifold
+(`default/<name>`) resolves its `template_ref` at fit (a hard
+`TemplateNotFoundError` otherwise; `nodes_sha256` degrades to the ref string). A
+template-derived bundled manifold authors deterministically (model-free) — write
+the template, then `create_manifold_from_template` derives the corpus — so there
+is no model-generation step. No template-derived bundled manifold ships at present
+(colors was the first candidate, pulled).
+
 ## selectors.py
 
 Selector grammar shared by `core.session` and the CLI (lives in `io` so neither

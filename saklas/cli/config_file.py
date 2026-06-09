@@ -245,6 +245,7 @@ def ensure_vectors_installed(config: ConfigFile, *, strict: bool) -> list[str]:
     from saklas.core.steering_expr import referenced_selectors
     from saklas.io.paths import manifold_dir
     from saklas.io.manifolds import materialize_bundled_manifolds
+    from saklas.io.templates import materialize_bundled_templates
     from saklas.io import selectors as _selectors
 
     if config.vectors is None:
@@ -253,7 +254,9 @@ def ensure_vectors_installed(config: ConfigFile, *, strict: bool) -> list[str]:
     # Every concept is a manifold (4.0): bundled ones live under
     # ``manifolds/default/<name>/``.  Materialize them up front so a bare or
     # ``default/`` reference resolves against the just-dropped folders, and
-    # drop any stale resolver cache so the new folders are seen.
+    # drop any stale resolver cache so the new folders are seen.  Templates
+    # first — a bundled manifold may ``template_ref`` a bundled template.
+    materialize_bundled_templates()
     materialize_bundled_manifolds()
     _selectors.invalidate()
 

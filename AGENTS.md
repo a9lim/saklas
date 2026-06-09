@@ -221,14 +221,17 @@ the manifold-label tier.
 
 Some categories you *reference* rather than *embody* — days of the week, months,
 durations, directions. "someone who is Tuesday" is nonsense, so the persona-framed
-extraction doesn't apply. A **template** is the artifact for these: a `slot` token,
-a set of candidate `values`, and one or more multi-turn `contexts` whose final
-assistant turn carries the slot (`io/templates.py::TemplateFolder`, on disk at
-`~/.saklas/templates/<ns>/<name>/template.json`). Invariant: the slot appears
-**exactly once** in each context's final `assistant` string and **never** in a
-history turn (history is shared common-mode across the values; the slot lives only
-where the value is read). A single-turn template is the degenerate
-`turns:[{user}]` case.
+extraction doesn't apply. A **template** is the artifact for these:
+a `slot` token, a set of candidate `values`, and one or more multi-turn `contexts`
+whose final assistant turn carries the slot (`io/templates.py::TemplateFolder`, on
+disk at `~/.saklas/templates/<ns>/<name>/template.json`). Invariant: the slot
+appears **exactly once** in each context's final `assistant` string and **never**
+in a history turn (history is shared common-mode across the values; the slot lives
+only where the value is read). A single-turn template is the degenerate
+`turns:[{user}]` case. Templates can ship **bundled** — `saklas/data/templates/
+<name>/template.json` materializes to `default/<name>` on session start
+(`materialize_bundled_templates`, run before the manifold materializer), so a
+template-derived bundled manifold can `template_ref` it. None ship at present.
 
 The template is a first-class artifact with **two** consumers:
 
@@ -650,6 +653,7 @@ All state under `~/.saklas/` (override via `$SAKLAS_HOME`):
   baseline_prompts.json                # user override for the shared A2 prompts
   templates/<ns>/<name>/               # standalone templated-completion artifact
     template.json                      # slot, values, contexts:[{turns:[{role,content}], assistant}]
+                                       # bundled default/<name> ones copy-on-miss from saklas/data/templates/
   manifolds/<ns>/<name>/               # THE concept + steering-manifold root
     manifold.json                      # name, source, fit_mode, per-node {label,kind,role?}, domain/coords or hyperparams, files{sha256}, template_ref?
     nodes/NN_<label>.json              # one JSON response list per node (response[i] ↔ baseline_prompt[i % k])
@@ -757,11 +761,15 @@ the shared baseline prompts. Monopolar `extract` (`baseline=None`) is still a
 genuine **1-node** fold against the neutral mean ν (see "Extraction") — a user
 `extract("agentic")` authors a 1-node ray — but no monopolar concept ships
 bundled anymore (the former `agentic` / `manipulative` were dropped or folded
-into bipolar `sincere.manipulative`). Bundled regeneration is unified under
-`scripts/regenerate_bundled.py` — one A2 pipeline writing the bipolar axes,
+into bipolar `sincere.manipulative`). Model-driven bundled regeneration is unified
+under `scripts/regenerate_bundled.py` — one A2 pipeline writing the bipolar axes,
 `personas`, and `emotions`; the fit is the separate `manifold fit` step. Partial
 generation output is ignored by bundled materialization until every manifest node
-has a corpus file.
+has a corpus file. A **template-derived** bundled artifact (a bundled template +
+a discover manifold that `template_ref`-erences it) would author deterministically
+and model-free — the node corpus is just the template's slot-filled
+`values × contexts`, no generation step — but none currently ship (colors was the
+first candidate, pulled after it resolved to a flat lexical scatter, not a ring).
 
 The 4.0 / A2 regen also dropped the `affect`, `social_stance`, and `identity`
 categories as bipolar axes: affect (the former angry.calm / happy.sad /

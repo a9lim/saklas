@@ -38,15 +38,21 @@ values, so the slot lives only where the value is read.
 from __future__ import annotations
 
 import hashlib
+import json
+import logging
 import re
+import warnings
 from dataclasses import dataclass
+from importlib import resources as _resources
 from pathlib import Path
 from typing import Any, Iterator
 
 from saklas.core.errors import SaklasError
-from saklas.io.atomic import write_json_atomic
+from saklas.io.atomic import write_bytes_atomic, write_json_atomic
 from saklas.io.packs import NAME_REGEX
 from saklas.io.paths import ensure_within, templates_dir
+
+_LOG = logging.getLogger(__name__)
 
 TEMPLATE_FORMAT_VERSION = 1
 
@@ -501,3 +507,151 @@ def remove_template_folder(namespace: str, name: str) -> bool:
         return False
     shutil.rmtree(path)
     return True
+
+
+# ---------------------------------------------------------------------------
+# Bundled materialization
+# ---------------------------------------------------------------------------
+#
+# Parallel to ``manifolds.materialize_bundled_manifolds`` but for the template
+# artifact kind.  Bundled templates live under ``saklas/data/templates/<name>/``
+# in the wheel and materialize into ``~/.saklas/templates/default/<name>/`` on
+# session startup.  A template is a single self-contained ``template.json`` (the
+# node corpora derive deterministically from ``slot × values × contexts``), so
+# the copy is one file — no ``nodes/`` subtree to mirror.
+#
+# **Ordering invariant.**  A bundled *manifold* may ``template_ref`` a bundled
+# ``default/<name>`` template.  The manifold *fit* resolves that ref to use the
+# template's multi-turn contexts as elicitation prefixes
+# (``core/extraction.py``) — a hard ``TemplateNotFoundError`` if it's absent — and
+# the ``nodes_sha256`` staleness key folds the resolved template's sha256
+# (best-effort: it falls back to the ref string if unresolved).  So this MUST run
+# before ``materialize_bundled_manifolds`` at every bootstrap site, or the first
+# fit of a templated bundled manifold raises.
+
+# Process-scope flag: set True after the first ``materialize_bundled_templates``
+# so a later call in the same process is a no-op.  Mirrors the manifold
+# materializer — process-scope caching sidesteps the "bundle changed under user"
+# vs "user changed it via CLI" ambiguity (see that function's docstring).
+_templates_materialized_this_process: bool = False
+
+
+def _canonical_json_sha256(data: bytes) -> str:
+    """Content-stable sha256 of a JSON byte payload.
+
+    Hashes the canonical-JSON form so cosmetic-only differences (key order,
+    indent, trailing newline) compare equal.  Falls back to a raw sha256 if the
+    bytes don't parse, so unparseable on-disk content reads as "user edited"
+    rather than getting silently overwritten.
+    """
+    try:
+        parsed = json.loads(data)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return hashlib.sha256(data).hexdigest()
+    return hashlib.sha256(_canonical_json(parsed)).hexdigest()
+
+
+def _bundled_template_valid(pkg_root: Any) -> bool:
+    """True when a package-data template parses and passes format validation."""
+    try:
+        with pkg_root.joinpath("template.json").open(encoding="utf-8") as f:
+            payload = json.load(f)
+    except (
+        AttributeError,
+        FileNotFoundError,
+        OSError,
+        json.JSONDecodeError,
+        UnicodeDecodeError,
+    ):
+        return False
+    try:
+        TemplateFolder.from_payload(payload)
+    except (TemplateFormatError, ValueError):
+        return False
+    return True
+
+
+def bundled_template_names() -> list[str]:
+    """List valid templates shipped under ``saklas/data/templates/``."""
+    try:
+        root = _resources.files("saklas.data.templates")
+    except (ModuleNotFoundError, FileNotFoundError):
+        return []
+    return sorted(
+        p.name for p in root.iterdir()
+        if p.is_dir() and _bundled_template_valid(p)
+    )
+
+
+def materialize_bundled_templates() -> None:
+    """Copy bundled templates into ``~/.saklas/templates/default/``.
+
+    Mirrors :func:`saklas.io.manifolds.materialize_bundled_manifolds` for the
+    template artifact kind:
+
+    - **Fresh install** (target missing) — copy ``template.json``.
+    - **Bundle update** (canonical hash differs OR on-disk ``format_version``
+      predates :data:`TEMPLATE_FORMAT_VERSION`) — re-copy, writing a ``.bak``;
+      user edits to a ``default/`` template are stale-against-old-bundle and
+      replaced (fork under another namespace to keep a custom copy).
+    - **No change** — skip.
+
+    Process-scoped no-op after the first call.  Must run BEFORE
+    ``materialize_bundled_manifolds`` — see the module note above.
+    """
+    global _templates_materialized_this_process
+    if _templates_materialized_this_process:
+        return
+    _templates_materialized_this_process = True
+
+    names = bundled_template_names()
+    if not names:
+        return
+
+    root = _resources.files("saklas.data.templates")
+    default_dir = templates_dir() / "default"
+    default_dir.mkdir(parents=True, exist_ok=True)
+    for name in names:
+        bundled_bytes = root.joinpath(name).joinpath("template.json").read_bytes()
+        target = default_dir / name
+        manifest = target / "template.json"
+
+        if not manifest.exists():
+            target.mkdir(parents=True, exist_ok=True)
+            write_bytes_atomic(manifest, bundled_bytes)
+            continue
+
+        try:
+            on_disk_bytes = manifest.read_bytes()
+            on_disk_payload = json.loads(on_disk_bytes)
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            # Corrupt on-disk copy — don't stomp user state.
+            continue
+
+        hash_changed = (
+            _canonical_json_sha256(on_disk_bytes)
+            != _canonical_json_sha256(bundled_bytes)
+        )
+        fmt = on_disk_payload.get("format_version")
+        format_stale = isinstance(fmt, int) and fmt < TEMPLATE_FORMAT_VERSION
+        if not hash_changed and not format_stale:
+            continue
+
+        write_bytes_atomic(manifest.with_suffix(".json.bak"), on_disk_bytes)
+        write_bytes_atomic(manifest, bundled_bytes)
+        reason = (
+            f"v{fmt}->v{TEMPLATE_FORMAT_VERSION} (format_version)"
+            if format_stale
+            else "content changed"
+        )
+        warnings.warn(
+            f"materialize_bundled_templates: refreshed default/{name} — "
+            f"{reason}; any local edits were overwritten (fork under a "
+            f"non-default namespace to keep a custom template)",
+            UserWarning,
+            stacklevel=2,
+        )
+        _LOG.warning(
+            "materialize_bundled_templates: refreshed default/%s — %s",
+            name, reason,
+        )

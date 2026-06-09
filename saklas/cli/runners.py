@@ -1262,7 +1262,10 @@ def _iter_manifold_folders(namespace: str | None):
     from saklas.io.manifolds import (
         iter_manifold_folders, materialize_bundled_manifolds,
     )
+    from saklas.io.templates import materialize_bundled_templates
 
+    # Templates first — a bundled manifold may ``template_ref`` a bundled one.
+    materialize_bundled_templates()
     materialize_bundled_manifolds()
     yield from iter_manifold_folders(namespace)
 
@@ -1479,6 +1482,18 @@ def _resolve_manifold_ns_name(name: str) -> tuple[str, str]:
     raises ``FileNotFoundError``).  Only a *bare* name walks the installed
     manifolds to discover its namespace, raising on collision / miss.
     """
+    # Materialize bundled artifacts up front so a *qualified* reference to a
+    # newly-shipped bundled manifold (``default/<name>``) resolves even on
+    # an existing ``~/.saklas`` that predates it — the ``ns/name`` branch below
+    # returns verbatim and never walks the installed folders, so it would
+    # otherwise miss the materialize that the bare-name walk triggers.  Process-
+    # scoped no-op, so this is free when already done.  Templates before
+    # manifolds (a templated manifold's fit resolves its ``template_ref``).
+    from saklas.io.manifolds import materialize_bundled_manifolds
+    from saklas.io.templates import materialize_bundled_templates
+    materialize_bundled_templates()
+    materialize_bundled_manifolds()
+
     if "/" in name:
         ns, leaf = name.split("/", 1)
         return ns, leaf
