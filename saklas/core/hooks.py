@@ -527,7 +527,8 @@ class SteeringHook:
 # with a directional ``along`` push too much onto erases the spread and degenerates
 # into looping — the exact failure the translate-not-collapse ``along`` design
 # avoids, reintroduced by over-shrinking the residual that held the spread.
-# Calibrated on the gemma-4-12b ``pad%dominant`` onto sweep (along fixed at 0.3):
+# Calibrated on the gemma-4-12b ``emotions%dominant`` onto sweep — the affect
+# manifold under a curved fit, along fixed at 0.3:
 # at the old ``1.0`` even ``onto = 0.5`` fragmented and ``onto = 1.0`` collapsed to
 # ``!!!``; ``0.5`` puts the recommended ``onto ≈ 0.5`` at a clean sweet spot and
 # keeps ``onto = 1.0`` a strong-but-coherent ceiling, while below ``~0.3`` the

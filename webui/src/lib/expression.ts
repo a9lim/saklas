@@ -168,8 +168,8 @@ function formatTriggerSuffix(trigger: Trigger): string {
 /** Render one manifold (curved) rack entry — ``<along[,onto]>
  *  <name>[:variant]%<position>`` plus an optional ``@trigger`` suffix.
  *  Coefficient is the per-card blend fraction (``-`` rides the joiner).
- *  ``<position>`` is the label form (``pad%happy``) when ``entry.label`` is
- *  set; otherwise the comma-joined coord list (``pad%0.3,0.8``). */
+ *  ``<position>`` is the label form (``emotions%happy``) when ``entry.label`` is
+ *  set; otherwise the comma-joined coord list (``emotions%0.3,0.8``). */
 function formatManifoldTerm(name: string, entry: ManifoldSteerEntry): string {
   const position = entry.label
     ? entry.label

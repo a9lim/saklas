@@ -8,7 +8,7 @@
   //     (``fit_mode`` ``pca`` or ``baked``): 2-node concept axes AND
   //     higher-rank flats like ``personas``.
   //   * manifold (purple ``--accent-purple``) — curved fits only
-  //     (``fit_mode`` ``spectral`` or ``authored``), e.g. ``pad``.
+  //     (``fit_mode`` ``spectral`` or ``authored``), e.g. ``emotions``.
   //
   // Within the family filter the existing fitted / unfitted split
   // (``fitted_for_session``) applies, plus optional category grouping and

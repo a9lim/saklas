@@ -8,7 +8,7 @@
   //              body:     snap-to-node Select · XYPad   (NO per-card along —
   //                        the magnitude is the rack-level "subspace along"
   //                        master shared by every subspace term)
-  //   manifold → a curved fit (e.g. pad).  Manifold accent (◆/◇,
+  //   manifold → a curved fit (e.g. emotions).  Manifold accent (◆/◇,
   //              --accent-purple).
   //              statline: glyph · name · unfitted/stale warn · trigger · ✕
   //              body:     snap-to-node Select · XYPad · along · onto

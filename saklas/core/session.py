@@ -953,7 +953,7 @@ class SaklasSession:
 
         # One unified Monitor for every probe shape — flat concept axes
         # (rank-1), flat discover fits (rank-R, e.g. ``personas``), and curved
-        # manifolds (``pad``).  There is no batched-affine fast path: every
+        # manifolds (``emotions``).  There is no batched-affine fast path: every
         # probe — flat or curved — is read per token through one whitened
         # per-layer geometry pass (the research-tool priority is full per-token
         # info — nearest, coords, residual, per-layer — over throughput).
@@ -1032,7 +1032,7 @@ class SaklasSession:
         matching the correlation pool's dedup).  Pure metadata — no GPU.
 
         A multi-node / curved probe (a rank-``R`` fit like ``personas`` or
-        ``pad``) is **excluded** — the direction-cosine analytics fold every
+        ``emotions``) is **excluded** — the direction-cosine analytics fold every
         name to a single steering direction, which only a folded affine
         ``R = 1`` manifold has.  Listing one would only render an all-null
         row in the correlation matrix (or a misleading miss in ``pairwise``)

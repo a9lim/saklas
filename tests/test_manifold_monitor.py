@@ -486,7 +486,7 @@ def test_soft_assignment_peaks_at_nearest_node():
 
 def test_soft_assignment_does_not_let_wide_node_win_from_far_away():
     # Regression: the bare ``softmax(−d²/2τ²)`` form lets a diffuse-τ candidate
-    # swallow all the mass regardless of distance — the gemma-4-12B pad eval
+    # swallow all the mass regardless of distance — the gemma-4-12B emotions eval
     # surfaced this with ``triumphant`` winning 99.7% despite not being in the
     # top-4 nearest.  Fix: add the Gaussian log-volume bias ``−R·log(τ)`` to the
     # logit (proper isotropic R-D mixture posterior).

@@ -709,7 +709,7 @@ def is_foldable_vector_manifold(manifold: "Any") -> bool:
     the only shape :func:`folded_vector_directions` accepts.
 
     A multi-node / curved fit (a rank-``R`` subspace, e.g. the ``personas``
-    fan or the ``pad`` surface) is **not** a single steering direction, so it
+    fan or the ``emotions`` surface) is **not** a single steering direction, so it
     can't participate in the direction-cosine analytics (``correlation`` /
     ``vectors/pairwise``).  Callers use this to skip such probes instead of
     letting the fold raise — an empty / layerless manifold is also False.

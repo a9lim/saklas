@@ -41,14 +41,14 @@ The unifying facts:
 
 The complete bundled defaults map cleanly onto the taxonomy. Package-data folders
 with missing declared node corpora are skipped by materialization, so in-progress
-generation output such as a partial `pad` run is not exposed as a default
+generation output such as a partial `emotions` run is not exposed as a default
 manifold:
 
 | artifact            | nodes | rank | structure | fit_mode   |
 |---------------------|-------|------|-----------|------------|
 | a concept vector    | 2     | 1    | flat      | `pca`      |
-| `personas`          | 107   | ~8   | flat      | `pca`      |
-| `pad`               | 20    | 3    | curved    | `spectral` once corpus-complete |
+| `personas`          | 107   | ~8   | flat (auto-resolved) | `auto`     |
+| `emotions`          | 20    | 3    | per-model (flat on gemma-4-12B) | `auto`     |
 
 Every steering term — vectors, bare poles, `~`/`|` projections, `!` ablations,
 and `%` manifold positions — lowers at generation time to a single per-layer
@@ -700,7 +700,7 @@ Euclidean `‖eval_rbf(node_params)‖_F`), then:
 **Two gain constants.** `_MANIFOLD_ALONG_GAIN = 16.0` (live-calibrated) scales
 **along** (the translate slide) in both modes; `_MANIFOLD_GAIN = 0.5` now scales **onto** only
 (the off-surface collapse share-weight, curved-only — calibrated on the
-gemma-4-12b `pad%dominant` onto sweep: at `1.0` even `onto=0.5` fragmented and
+gemma-4-12b `emotions%dominant` onto sweep: at `1.0` even `onto=0.5` fragmented and
 `onto=1.0` collapsed into looping, since collapsing the off-surface residual
 erases the per-token spread; `0.5` makes `onto∈[0,1]` a usable dial with `1.0` a
 coherent ceiling). The split is the
@@ -779,7 +779,7 @@ no second forward pass), fp32. It reads a fitted subspace and emits one
 reading shape (`ProbeReading` — `coords` + `fraction` + `nearest` + `residual`,
 plus the `*_per_layer` traces) for flat and curved probes alike — the read-side
 peer of the unified `subspace_inject` kernel. A 2-node concept axis, the 107-node
-`personas` fan, and the curved `pad` surface are all just probes on the one
+`personas` fan, and the `emotions` affect surface are all just probes on the one
 monitor. It rides the same `HiddenCapture` plumbing as generation;
 `session._begin_capture` widens capture to the union of every probe's layers
 (`Monitor.probe_layers`; `attached_layers` survives as an alias for the server/TUI
@@ -861,8 +861,8 @@ win is memory, not throughput.)
 `ctx.probe_scores[gate.probe]` against `score <op> threshold`. The gate key is the
 canonical scalar key `Monitor.flat_scalars` emits — a coordinate axis
 (`"confident.uncertain"` = axis 0, or `"personas[3]"` = axis 3 via the
-`@when:<probe>[<i>]` grammar), a subspace fraction (`"pad:fraction"`), or a label
-similarity (`"pad@happy"`). The runtime lookup is identical for every shape; only
+`@when:<probe>[<i>]` grammar), a subspace fraction (`"emotions:fraction"`), or a label
+similarity (`"emotions@happy"`). The runtime lookup is identical for every shape; only
 the parser knows the difference. Gated triggers report inactive during prefill (no
 reading yet) and for missing probes (no raise).
 
@@ -968,7 +968,7 @@ straight-chord additive baseline alongside.
   `GAIN·α ≈ 8`) clearly steers concepts and personas alike while staying coherent
   for fragile personas; the per-target *coherence* ceiling (~2× variance, §10), not
   the geometric scale, now caps it — α≈1.0 over-steers hard personas. `_MANIFOLD_GAIN`
-  was likewise calibrated on the gemma-4-12b `pad%dominant`
+  was likewise calibrated on the gemma-4-12b `emotions%dominant`
   onto sweep: at `1.0` (combined with a directional push) `onto=0.5` already
   fragmented and `onto=1.0` collapsed into looping — collapsing the off-surface
   residual erases the per-token spread, the same failure translate-not-collapse

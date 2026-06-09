@@ -363,6 +363,61 @@ def test_manifold_sidecar_node_spread_round_trips(tmp_path: Path):
     assert peak[0] == "12"
 
 
+def test_manifold_sidecar_topology_provenance_round_trips(tmp_path: Path):
+    """``auto``-fit topology provenance survives the save → load round-trip.
+
+    Regression: ``save_manifold`` filters metadata through a key whitelist, and
+    ``resolved_fit_mode`` / ``topology_winner`` / ``topology_candidates`` (built
+    by the extraction pipeline for an ``auto`` fit) were absent from it — so they
+    were silently dropped from the on-disk sidecar even though the documented
+    contract said the resolved geometry is recorded there.  The in-memory
+    ``manifold.metadata`` carried them (``.update`` after save), which is why the
+    extraction tests stayed green while the round-trip lost them.
+    """
+    import torch
+    from saklas.core.manifold import (
+        BoxAxis, BoxDomain, Manifold, fit_layer_subspace, load_manifold,
+        save_manifold,
+    )
+
+    g = torch.Generator().manual_seed(0)
+    domain = BoxDomain([BoxAxis("t", periodic=False, lo=0.0, hi=1.0)])
+    coords = torch.tensor([[0.0], [0.5], [1.0]])
+    embedded = domain.embed(coords)
+    layers, ev = {}, {}
+    for layer in (4, 5):
+        sub, ev_ratio = fit_layer_subspace(torch.randn(3, 6, generator=g), embedded)
+        layers[layer] = sub
+        ev[layer] = ev_ratio
+    man = Manifold(
+        name="autotopo", domain=domain, node_labels=["a", "b", "c"],
+        node_coords=coords, layers=layers, explained_variance=ev,
+        mahalanobis_share={4: 1.0, 5: 2.0},
+    )
+    candidates = [
+        {"name": "flat-pca", "fit_mode": "pca", "intrinsic_dim": 2,
+         "score": 12.5, "viable": True, "reason": None},
+        {"name": "spectral", "fit_mode": "spectral", "intrinsic_dim": 1,
+         "score": 40.0, "viable": True, "reason": None},
+    ]
+    out = tmp_path / "autotopo.safetensors"
+    save_manifold(man, out, {
+        "method": "manifold_discover_auto", "nodes_sha256": "x",
+        "fit_mode": "auto", "resolved_fit_mode": "pca",
+        "topology_winner": "flat-pca", "topology_candidates": candidates,
+    })
+    # The written sidecar JSON carries the provenance (the whitelist passes it).
+    sidecar = json.loads(out.with_suffix(".json").read_text())
+    assert sidecar["resolved_fit_mode"] == "pca"
+    assert sidecar["topology_winner"] == "flat-pca"
+    assert [c["name"] for c in sidecar["topology_candidates"]] == ["flat-pca", "spectral"]
+    # And it surfaces on the loaded manifold's metadata (load reads the whole
+    # sidecar back into ``metadata``).
+    loaded = load_manifold(out)
+    assert loaded.metadata["resolved_fit_mode"] == "pca"
+    assert loaded.metadata["topology_winner"] == "flat-pca"
+
+
 # --------------------------------------------------- authoring (create/update) ---
 
 def _author_nodes(labels: list[str]) -> list[dict[str, Any]]:

@@ -1386,7 +1386,7 @@ class SaklasApp(App[None]):
         """``/manifold-probe <selector>`` — attach a curved manifold probe.
 
         Routes through the unified ``session.add_probe`` — the selector can
-        be a bundled name (``pad``, ``personas``), an ``ns/name`` form, or an
+        be a bundled name (``emotions``, ``personas``), an ``ns/name`` form, or an
         already-loaded manifold's registered name; the session's lazy-load
         path (``_ensure_manifold_loaded``) handles resolution.  This is the
         curved-probe front-end (the TUI mirror of the webui's "+ manifold

@@ -1222,7 +1222,7 @@ export interface ProjectionSpec {
 //                  subspace has a single slide), so the card carries NO
 //                  per-card along knob — only a position (snap-to-node /
 //                  XYPad).  Serializes ``<subspaceAlong> name[:variant]%pos``.
-//   ``manifold`` — a curved fit (e.g. ``pad``).  Each curved term is its own
+//   ``manifold`` — a curved fit (e.g. ``emotions``).  Each curved term is its own
 //                  injection, so it keeps a per-card ``along`` + ``onto``.
 //                  Serializes ``<along[,onto]> name[:variant]%pos``.
 //
@@ -1404,7 +1404,7 @@ export type DrawerName =
    *  reactively. */
   | "extract"
   /** Shared rack browser, manifold (curved) family — curved fits only
-   *  (``fit_mode`` spectral / authored), e.g. ``pad``.  Purple
+   *  (``fit_mode`` spectral / authored), e.g. ``emotions``.  Purple
    *  ``--accent-purple``.  Same layout as the subspace half, with a
    *  "+ build manifold" launcher.  ``RackDrawer`` with
    *  ``family: "manifold"``. */

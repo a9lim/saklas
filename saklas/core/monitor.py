@@ -1164,7 +1164,7 @@ class Monitor:
         unchanged), one ``"<probe>[<i>]"`` per coordinate axis (so
         ``@when:personas[3] > 0.4`` indexes an axis), ``"<probe>:fraction"``,
         and one ``"<probe>@<label>"`` per nearest node as ``-distance`` (so
-        larger means closer and ``@when:pad@happy > -0.1`` reads like a
+        larger means closer and ``@when:emotions@happy > -0.1`` reads like a
         similarity gate).  Under the unified full reading every probe — flat
         and curved — carries coords *and* nearest, so flat probes now expose
         ``@label`` similarity gates too (e.g. ``@when:personas@hacker``) and
@@ -1175,8 +1175,8 @@ class Monitor:
         soft-assignment *probability* (``@when:personas~hacker > 0.5`` — a
         normalized, in-``[0,1]`` membership gate, unlike the unbounded
         ``-distance``), and ``"<probe>:membership"`` as the graded tube-fit
-        (``@when:pad:membership > 0.6`` — high when the activation sits inside
-        the manifold's learned thickness).  All shapes merge directly into
+        (``@when:emotions:membership > 0.6`` — high when the activation sits
+        inside the manifold's learned thickness).  All shapes merge directly into
         ``TriggerContext.probe_scores``.
         """
         out: dict[str, float] = {}

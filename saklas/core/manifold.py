@@ -3036,7 +3036,7 @@ def _rips_h1_persistence(
     distances: torch.Tensor,
     eps_max: float,
     *,
-    max_triangles: int = 150_000,
+    max_triangles: int = 500_000,
 ) -> list[tuple[float, float]]:
     """H1 persistence pairs of the Vietoris–Rips filtration up to ``eps_max``.
 
@@ -3051,10 +3051,22 @@ def _rips_h1_persistence(
     that breaks the eigenpair-geometry heuristics.
 
     Bounded for tractability: only simplices with all edges ``≤ eps_max`` enter
-    the filtration, and the triangle list is capped at ``max_triangles`` (which
-    only lowers the effective ``eps`` ceiling — it can't manufacture a loop).
-    Pure Python over small index sets; ``K`` is tens-to-low-hundreds and this
-    runs once at fit time.  Returns the list of ``(birth, death)`` H1 pairs.
+    the filtration, and the triangle list is capped at ``max_triangles``.  The
+    cap is a **performance bound, not a free one**: truncating the
+    largest-filtration triangles drops the boundaries that would *fill* the
+    larger cycles, so a cycle can be left born-but-unfillable and miscounted as
+    essential.  This manufactured a spurious 8-torus on the 107-node
+    ``personas`` heap: an outlier-inflated ``eps_max`` made the Rips complex
+    *complete* (every pair within the ceiling), whose true H1 is 0, but
+    ``C(107,3) ≈ 198k`` triangles overran the old ``150k`` cap so ~650 cycles
+    were left unfilled and miscounted.  The cap is therefore set high enough
+    (``500k > C(143,3)``) to keep *every* triangle of a (near-)complete complex
+    across the supported ``7 ≤ K ≤ 128`` periodic-detection regime, so
+    truncation never manufactures a loop there; it only backstops a
+    pathologically large-``K`` heap (where periodic detection isn't meaningful
+    anyway).  Pure Python over small index sets; ``K`` is tens-to-low-hundreds
+    and this runs once at fit time.  Returns the list of ``(birth, death)`` H1
+    pairs.
     """
     K = int(distances.shape[0])
     # Edges with length <= eps_max, in a total filtration order.
@@ -3672,7 +3684,7 @@ def compute_node_reduced_covariance(
     This needs the per-layer ``mean``/``basis`` (hence ``layer_subs``), which
     only exist *after* the surface fit — so it is a deliberate **second
     fit-time forward pass** over the corpus, run only for curved manifolds
-    (``pad``-shaped), where the reduced dim ``R`` keeps the accumulators tiny
+    (``emotions``-shaped), where the reduced dim ``R`` keeps the accumulators tiny
     (``(R, R)`` with ``R ≤ 64``, ``O(1)`` memory vs. the activation width).
     The "no second forward pass" invariant governs generation / monitoring, not
     the rare off-hot-path fit.  The off-surface reduction of these covariances
@@ -4007,6 +4019,15 @@ def save_manifold(
         # per-method PCA variance bars or spectral spectrum for the
         # CLI / webui inspector.  All absent for authored fits.
         "fit_mode", "hyperparams", "diagnostics",
+        # Topology-selection provenance (``fit_mode="auto"`` only): the
+        # geometry ``select_topology`` resolved to (``resolved_fit_mode`` ∈
+        # pca/spectral + the winning ``topology_winner`` name) and the full
+        # ranked candidate field (``topology_candidates`` — each
+        # ``{name, fit_mode, intrinsic_dim, score, viable, reason}``, the
+        # GCV scores behind the flat-vs-curved-vs-periodic decision).  Built
+        # in ``extraction.py``; absent for pinned (non-auto) discover and
+        # authored fits.
+        "resolved_fit_mode", "topology_winner", "topology_candidates",
         # Per-node role-augmented fit metadata.  Aligned with
         # ``node_labels`` index-by-index; ``None`` for a given node means
         # "pooled under the standard assistant baseline" (the legacy

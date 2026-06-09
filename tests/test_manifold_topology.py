@@ -78,6 +78,43 @@ def test_ph_loop_count(name: str, points: torch.Tensor | None, want: int) -> Non
     assert got == want, f"{name}: H1={got}, want {want}"
 
 
+def test_ph_dense_complete_complex_no_spurious_loops() -> None:
+    """A (near-)complete Rips complex has trivial H1 — the triangle cap must be
+    large enough not to *manufacture* loops by truncating the filling triangles.
+
+    Regression for the ``personas`` 8-torus.  109 tightly-clustered points plus
+    one far outlier force ``eps_c`` (the largest MST edge) up to the outlier
+    distance, so ``eps_max = 2·eps_c`` puts *every* pair inside the ceiling — the
+    complex is complete and its true H1 is 0.  But that is ``C(109,3) ≈ 210k``
+    triangles; the old ``max_triangles=150_000`` cap dropped the largest-
+    filtration ones, leaving ~800 cycles born-but-unfillable and miscounted as
+    essential (which routed the 107-node ``personas`` heap to a spurious
+    8-torus).  The raised cap keeps every triangle across the supported regime.
+    """
+    from saklas.core.manifold import _rips_h1_persistence
+
+    g = torch.Generator().manual_seed(7)
+    cluster = torch.randn(109, 6, generator=g) * 0.1
+    outlier = torch.zeros(1, 6)
+    outlier[0, 0] = 50.0
+    D = torch.cdist(torch.cat([cluster, outlier]), torch.cat([cluster, outlier]))
+
+    # The fix: no spurious loops on the dense complex.
+    assert _count_persistent_loops(D) == 0
+
+    # And the cap is genuinely load-bearing: at the same (complete) ceiling the
+    # starved budget *does* manufacture essential cycles while the current
+    # default keeps every triangle and reports none — so the regression is real,
+    # not incidental to this particular heap.
+    K = D.shape[0]
+    iu = torch.triu_indices(K, K, offset=1)
+    eps_max = 2.0 * float(D[iu[0], iu[1]].max())  # ≥ every pair ⇒ complete
+    starved = _rips_h1_persistence(D, eps_max, max_triangles=150_000)
+    ample = _rips_h1_persistence(D, eps_max, max_triangles=500_000)
+    assert sum(1 for _b, death in starved if math.isinf(death)) > 0
+    assert sum(1 for _b, death in ample if math.isinf(death)) == 0
+
+
 def test_ph_noisy_circle_is_one_loop() -> None:
     g = torch.Generator().manual_seed(1)
     pts = _circle(40) + 0.05 * torch.randn(40, 2, generator=g)

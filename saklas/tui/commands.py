@@ -217,7 +217,7 @@ def _build_registry() -> dict[str, SlashCommand]:
             handler=SaklasApp._handle_manifold_probe,
             usage=(
                 "Usage: /manifold-probe <selector>\n"
-                "  e.g. /manifold-probe pad\n"
+                "  e.g. /manifold-probe emotions\n"
                 "       /manifold-probe alice/affect"
             ),
             min_args=1,

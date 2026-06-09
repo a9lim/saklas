@@ -8,8 +8,8 @@ OpenAI `/v1/*` and Ollama `/api/*` on one port, plus a native `/saklas/v1/*` API
 and a Svelte dashboard at `/`. Steering signal comes from representation
 engineering, unified under a single artifact family — the **manifold**: labeled
 nodes placed on a domain, fit to a per-layer subspace. A difference-of-means
-steering vector is the 2-node flat case; `personas` is a 107-node flat fan; `pad`
-is a curved 20-node affect surface. Every steering term — vectors, poles, `~`/`|` projections,
+steering vector is the 2-node flat case; `personas` is a 107-node flat fan; `emotions`
+is a 20-node affect manifold over PAD. Every steering term — vectors, poles, `~`/`|` projections,
 `!` ablations, and `%` manifold positions — lowers at generation time to one
 unified per-layer injection (the along/onto subspace kernel,
 `core/manifold.py::subspace_inject`). Per-call coefficients, no model mutation.
@@ -165,9 +165,9 @@ both match the keys `Monitor.flat_scalars` emits. The coordinate is
 domain-frame (pole-normalized at rank-1: `1.0` at the positive node), so a 2-node
 concept gate reads the same single coordinate it always did.
 Manifold subspace-fraction gates write the `:fraction` channel suffix
-(`@when:pad:fraction > 0.5`) — the share of the centered activation living
+(`@when:emotions:fraction > 0.5`) — the share of the centered activation living
 in that manifold's subspace, in `[0, 1]`. Manifold label-similarity gates write
-the `@<label>` suffix (`@when:pad@happy > -0.5`) — the negated distance to
+the `@<label>` suffix (`@when:emotions@happy > -0.5`) — the negated distance to
 a named node (larger = closer), so the natural threshold range is negative. The
 distance is reported in units of the probe's **typical label spacing** (the
 median node nearest-neighbor whitened distance, a single per-probe scale), so a
@@ -180,7 +180,7 @@ distinct from the density-aware `~<label>`). Two
 untouched): the soft-assignment probability `~<label>` (`@when:personas~hacker >
 0.5`) — a normalized, in-`[0,1]` `softmax(−d²/2τ²)` membership over the nodes,
 the distributional counterpart to argmax `nearest` — and the tube-fit density
-`:membership` (`@when:pad:membership > 0.6`) — `exp(−residual²/2σ²)` under the
+`:membership` (`@when:emotions:membership > 0.6`) — `exp(−residual²/2σ²)` under the
 fitted within-node thickness `σ(z)`, high when the activation sits inside the
 manifold's learned tube (distinguishes off-surface from on-surface-but-diffuse,
 which a hard `residual` threshold can't). The
@@ -197,12 +197,12 @@ already carries a real node named `neutral`. Every shape flows through one
 `%` is the manifold operator: `<manifold> % <position>` places a generation at a
 point of a fitted manifold. `<position>` is `<coord_list>` (a comma-separated list
 of authoring coordinates, one per intrinsic dimension, e.g.
-`0.7 pad%0.3,0.8,0.0@response`) or `<label>` (sugar for "the coords of the node
+`0.7 emotions%0.3,0.8,0.0@response`) or `<label>` (sugar for "the coords of the node
 labeled `pirate`", e.g. `0.5 personas%pirate`). The coefficient slot is
 `along[,onto]` — `along` is the slide fraction toward the position, `onto` (curved
 manifolds only) collapses the off-surface in-subspace residual. An affine `%` term
 (flat manifold, e.g. `personas%pirate`) joins the merged subspace as a push
-fragment; a curved `%` term (e.g. `pad%…`) gets its own injection term. A `%`
+fragment; a curved `%` term (e.g. a curved-resolving manifold `m%…`) gets its own injection term. A `%`
 term doesn't compose with `~`/`|`/`!`. Arity (coord form) and label existence
 (label form) are validated at manifold-load time. Two *curved* manifolds at one
 layer must be (near-)orthogonal or `OverlappingManifoldError` raises; the merged
@@ -537,15 +537,18 @@ partial folder in the package tree without exposing it as a default manifold:
   steering vectors: `0.5 formal.casual` steers toward `formal` (node 0). The
   `register` (7) and `cultural` (4) families are independent bipolar axes, *not*
   fused into a discover manifold — each has a designed opposite and the primary
-  use is independent signed control. Affect is reserved for `pad`, not shipped as
+  use is independent signed control. Affect is reserved for `emotions`, not shipped as
   bipolar axes.
-- **`personas`** — discover `fit_mode=pca` (a flat ~rank-8 affine subspace),
-  107 persona archetype nodes (`assistant`…`vandal`) in assistant-baselined
+- **`personas`** — discover `fit_mode=auto` resolving flat (a low-dim ~rank-8
+  affine subspace — the auto selector independently picks flat for the persona
+  fan), 107 persona archetype nodes (`assistant`…`vandal`) in assistant-baselined
   activation space; from Anthropic's Assistant Axis paper (arXiv 2601.10387).
   `max_dim` 8.
-- **`pad`** — the intended discover `fit_mode=spectral` affect surface over PAD
-  (pleasure × arousal × dominance). It materializes only after all 20 mood corpora
-  exist; incomplete package-data output is skipped.
+- **`emotions`** — a discover `fit_mode=auto` affect manifold over PAD
+  (pleasure × arousal × dominance), 20 mood nodes. `auto` resolves the geometry
+  per-model (flat affine vs curved RBF by GCV, with periodic detection); on
+  gemma-4-12B it resolves to a flat 3-D affect subspace. It materializes only after
+  all 20 mood corpora exist; incomplete package-data output is skipped.
 
 Recommended α is vector-comparable: aim for `α ≈ 0.5`, tune up toward `α ≈ 1.0`
 for stronger expression. (For an affine push term α is unclamped — it sets the
@@ -557,7 +560,7 @@ tight concepts and personas (`α ≈ 1.0` is the strong / over-steer zone where 
 personas break — dial down per target, §10). Because
 the target is now whitened-unit and the share is normalized
 to mean 1 and the lever is gone, a low-dim and a high-dim fit — a 2-node vector,
-`personas`, and `pad` once its corpus is complete — land in the same α-band
+`personas`, and `emotions` once its corpus is complete — land in the same α-band
 without per-fit retuning.
 Architecture-level behavioral notes (hold across model families; α values are
 qualitative, MPS is not bitwise deterministic so compare qualitatively):
@@ -756,13 +759,13 @@ genuine **1-node** fold against the neutral mean ν (see "Extraction") — a use
 bundled anymore (the former `agentic` / `manipulative` were dropped or folded
 into bipolar `sincere.manipulative`). Bundled regeneration is unified under
 `scripts/regenerate_bundled.py` — one A2 pipeline writing the bipolar axes,
-`personas`, and `pad`; the fit is the separate `manifold fit` step. Partial
+`personas`, and `emotions`; the fit is the separate `manifold fit` step. Partial
 generation output is ignored by bundled materialization until every manifest node
 has a corpus file.
 
 The 4.0 / A2 regen also dropped the `affect`, `social_stance`, and `identity`
 categories as bipolar axes: affect (the former angry.calm / happy.sad /
-fearful.unflinching) folds into the `pad` manifold, and social_stance
+fearful.unflinching) folds into the `emotions` manifold, and social_stance
 (authoritative.submissive, high_context.low_context, self.other), identity
 (ai.human), and hallucinating.grounded were cut.
 

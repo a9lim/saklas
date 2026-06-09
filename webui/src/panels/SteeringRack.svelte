@@ -5,7 +5,7 @@
   //   subspace (flat)   — a 2-node bipolar axis through the rank-8 personas
   //     fan.  Shares one rack-level "subspace along" master (the merged
   //     affine subspace slides once), so the cards carry no per-card along.
-  //   manifold (curved) — curved fits (e.g. pad), each its own injection with
+  //   manifold (curved) — curved fits (e.g. emotions), each its own injection with
   //     a per-card along + onto.
   //
   // Every row is one SteerCard wearing the same RackCard chrome; the family

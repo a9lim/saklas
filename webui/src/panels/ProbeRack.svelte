@@ -4,7 +4,7 @@
   //
   //   subspace (flat) — probeRack entries where info.is_affine (a 2-node
   //     concept axis or a higher-rank flat fan like personas).
-  //   manifold (curved) — the rest (e.g. a curved pad probe).
+  //   manifold (curved) — the rest (e.g. a curved emotions probe).
   //
   // Every row wears the same RackCard chrome; the family is signalled only
   // by accent colour + marker glyph.  The sort dropdown (name / value /

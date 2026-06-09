@@ -10,8 +10,9 @@ Generation writes node corpora only; FIT is a separate step
 (``saklas manifold fit <ns>/<name>``), deliberately decoupled so a flaky
 generation leaves inspectable corpora.  The manifold folders are written
 directly into the package data tree, so a killed run resumes; ``--force`` wipes
-and regenerates.  Because rosters changed (personas recut to 107) and PAD is
-being converted from authored to discover, this migration run wants ``--force``.
+and regenerates.  The two discover manifolds (``personas``, ``emotions``) fit
+``fit_mode=auto`` — ``select_topology`` resolves flat-vs-curved-vs-periodic
+per-model — so a re-fit, not a re-generation, is what changes their geometry.
 
 The shared neutral baseline (``neutral_statements.json`` -- the model's organic,
 unconditioned responses to the same baseline prompts, backing the per-model
@@ -21,7 +22,7 @@ like any manifold.
 
 Usage:
     python scripts/regenerate_bundled.py                    # all manifolds + neutral, resume
-    python scripts/regenerate_bundled.py pad neutral        # a subset
+    python scripts/regenerate_bundled.py emotions neutral   # a subset
     python scripts/regenerate_bundled.py neutral            # just the neutral baseline
     python scripts/regenerate_bundled.py --force            # wipe + regenerate
     python scripts/regenerate_bundled.py --dry-run          # plan only, no model
@@ -90,9 +91,10 @@ def _monopolar(name: str, tag: str, desc: str) -> ManifoldSpec:
     )
 
 
-# --- concept axes (17) — bipolar 2-node `pca` subspaces.  Affect lives in
-# `pad` (emotions lack clean opposites and sit on a curved circumplex, so they
-# belong on a manifold), but the cultural (4) and register (7) axes are split
+# --- concept axes (17) — bipolar 2-node `pca` subspaces.  Affect lives in the
+# `emotions` manifold (moods lack clean opposites and sit on a low-dim affect
+# surface, so they belong on a manifold), but the cultural (4) and register (7)
+# axes are split
 # OUT as independent bipolar probes rather than fused into discover manifolds:
 # each has a designed opposite and the primary use is independent signed
 # control, which the bipolar DiM serves directly and a fused PCA basis would
@@ -181,8 +183,9 @@ _PERSONAS: tuple[str, ...] = (
     "thief", "conman", "hacker", "cultist", "tyrant", "vandal",
 )
 
-# PAD affect-space moods (converted from the prior authored 3-D box).
-_PAD_MOODS: tuple[str, ...] = (
+# Emotional-state moods spanning the PAD affect octants (the `emotions`
+# manifold; converted from the prior authored 3-D PAD box).
+_EMOTION_MOODS: tuple[str, ...] = (
     "excited", "happy", "calm", "weary", "sad", "distressed",
     "alert", "dominant", "submissive", "angry", "fearful", "surprised",
     "triumphant", "humiliated", "disgusted", "bored", "grateful", "relieved",
@@ -193,10 +196,10 @@ _PAD_MOODS: tuple[str, ...] = (
 _DISCOVER: list[ManifoldSpec] = [
     ManifoldSpec(
         name="personas", kind="concrete", labels=_PERSONAS,
-        hyperparams={"max_dim": 8},
+        fit_mode="auto", hyperparams={"max_dim": 8},
         description=(
-            "Persona archetypes for discover-mode PCA manifold steering. 107 "
-            "nodes spanning everyday and pre-modern "
+            "Persona archetypes for discover-mode AUTO-fit manifold steering. "
+            "107 nodes spanning everyday and pre-modern "
             "human roles, modern social subcultures, institutional and "
             "political identities, relational and psychological archetypes, "
             "creative and divine figures, fantastical creatures, nonhuman "
@@ -206,34 +209,34 @@ _DISCOVER: list[ManifoldSpec] = [
             "framing; the 2026-05-31 recut data-pruned redundant / "
             "near-baseline nodes (whitened per-node centroid distances, "
             "cross-model consistent) and filled previously-empty semantic "
-            "axes. PCA over per-node centroids recovers a low-dim persona "
-            "structure as the leading components on role-supporting model "
-            "families."
+            "axes. fit_mode=auto resolves the geometry per-model "
+            "(select_topology scores a flat affine subspace against a curved "
+            "RBF surface by GCV, with persistent-homology periodic detection); "
+            "the persona fan resolves flat — a low-dim affine subspace over the "
+            "per-node centroids — on role-supporting model families."
         ),
     ),
     ManifoldSpec(
-        name="pad", kind="abstract", labels=_PAD_MOODS, fit_mode="spectral",
+        name="emotions", kind="abstract", labels=_EMOTION_MOODS, fit_mode="auto",
         hyperparams={"max_dim": 3},
         description=(
-            "Discover-mode SPECTRAL manifold over the Mehrabian-Russell PAD "
-            "affect space (pleasure x arousal x dominance; Mehrabian & Russell, "
-            "'An Approach to Environmental Psychology', 1974). Twenty "
-            "first-person mood nodes chosen to span the PAD octants — high/low "
-            "pleasure (happy, grateful, relieved, hopeful, playful / sad, weary, "
+            "Discover-mode AUTO-fit manifold over emotional state. Twenty "
+            "first-person mood nodes spanning the Mehrabian-Russell PAD affect "
+            "octants (pleasure x arousal x dominance; Mehrabian & Russell, 'An "
+            "Approach to Environmental Psychology', 1974) — high/low pleasure "
+            "(happy, grateful, relieved, hopeful, playful / sad, weary, "
             "distressed, humiliated, disgusted), high/low arousal (excited, "
             "alert, surprised / calm, bored), and the dominance contrast "
             "(dominant, triumphant, angry / submissive, fearful) — each "
-            "answering the shared baseline prompts in character. Fit CURVED "
-            "(spectral) rather than flat pca because affect is a circumplex: "
-            "'opposite' moods are emergent points on a low-dim curved surface, "
-            "not endpoints of independent axes, so a straight-line subspace "
-            "would cut through off-manifold regions. Laplacian eigenmaps over "
-            "the per-model whitened-consensus distances derive the layout "
-            "(max_dim 3, the PAD dimensionality); k is picked by the "
-            "eigenvalue-ratio cliff. Converted from the prior authored 3-D box: "
-            "the per-model spectral embedding recovers the model's own affect "
-            "geometry rather than declaring idealized coordinates, trading "
-            "cross-model coordinate-comparability for a data-driven surface."
+            "answering the shared baseline prompts in character. fit_mode=auto "
+            "resolves the geometry per-model: select_topology scores a flat "
+            "affine subspace against a curved RBF surface by GCV and runs "
+            "persistent-homology periodic detection, so the layout is the "
+            "model's own emotional geometry (flat affect subspace or curved "
+            "circumplex) rather than a declared circumplex. Capped at the 3 PAD "
+            "affect dimensions. Renamed from 'pad': the artifact is the "
+            "emotional-state manifold; the PAD octants are the spanning design, "
+            "not the label."
         ),
     ),
 ]

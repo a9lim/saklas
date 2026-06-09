@@ -359,7 +359,7 @@ directions), and enforces `_CURVED_ORTHO_TOL = 1e-3` between two curved manifold
 (`OverlappingManifoldError`). Gain: two constants — `_MANIFOLD_ALONG_GAIN = 16.0`
 (live-calibrated — see below) scales `along` (the translate slide, both modes),
 `_MANIFOLD_GAIN = 0.5` scales
-`onto` only (calibrated on the gemma-4-12b `pad%dominant` onto sweep — at `1.0`
+`onto` only (calibrated on the gemma-4-12b `emotions%dominant` onto sweep — at `1.0`
 even `onto=0.5` fragmented and `onto=1.0` collapsed; `0.5` makes `onto∈[0,1]` a
 usable dial with `1.0` a coherent ceiling). `eff_along_L = share_L · _MANIFOLD_ALONG_GAIN` (affine: α already in
 `target_coord`; curved: × clamped user `along`); `eff_onto_L = clamp(onto ·
@@ -773,6 +773,6 @@ default coeff 1.0, doesn't compose with `~`/`|` — lowered through
 `synthesize_subspace`'s ablation path at dispatch), `ManifoldTerm` (`along`,
 `onto`, position; `_expand_along_onto_coeffs` yields a 1- or 2-tuple). Probe gates
 (`@when:<probe><op><threshold>`) accept three identifier shapes — vector
-(`confident.uncertain`), manifold fraction (`pad:fraction`), manifold label
-(`pad@happy`) — all stored verbatim in `ProbeGate.probe` so the runtime gate is
+(`confident.uncertain`), manifold fraction (`emotions:fraction`), manifold label
+(`emotions@happy`) — all stored verbatim in `ProbeGate.probe` so the runtime gate is
 identical; the parser is the only place the discrimination lives.

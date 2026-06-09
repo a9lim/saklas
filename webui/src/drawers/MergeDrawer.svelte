@@ -30,7 +30,7 @@
   import Disclosure from "../lib/Disclosure.svelte";
 
   /** Catalog-backed flat-vs-curved predicate for the parser, so a pasted
-   *  ``pad%…`` lands as a manifold term and ``personas%…`` as subspace. */
+   *  ``emotions%…`` lands as a manifold term and ``personas%…`` as subspace. */
   function isFlat(name: string): boolean {
     const fm = manifoldByName(name)?.fit_mode;
     return fm ? fm === "pca" || fm === "baked" : true;

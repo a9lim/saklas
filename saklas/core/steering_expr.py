@@ -55,7 +55,7 @@ activation living in the manifold's PCA subspace), and
 ``@when:<manifold>@<label> <op> N`` fires on the negated distance to a
 named node (larger = closer; label-similarity gates routinely use
 negative thresholds).  The gate's probe string is stored verbatim
-(``"pad:fraction"``, ``"pad@elated"``) so it matches the
+(``"emotions:fraction"``, ``"emotions@happy"``) so it matches the
 key ``Monitor.flat_scalars`` already merges into
 ``TriggerContext.probe_scores``; no runtime gate machinery changes.
 
@@ -84,7 +84,7 @@ entry.
 
 Manifold steering: the ``%`` infix operator places a generation at a
 point of a fitted manifold — ``manifold % coord_list``, e.g.
-``0.7 pad%0.3,0.8,0.0@response``.  The left operand is a manifold name
+``0.7 emotions%0.3,0.8,0.0@response``.  The left operand is a manifold name
 (not a concept; no pole resolution), the right is a comma-separated list
 of authoring coordinates — one per intrinsic dimension of the manifold's
 domain.  The parser only collects the coordinate tuple; arity and range
@@ -538,14 +538,14 @@ class _Parser:
           ``<manifold>:fraction`` — fires on the fraction of the
           centered activation that lives in the manifold's PCA
           subspace.  Stored verbatim as the gate's probe string
-          (e.g. ``"pad:fraction"``); the session's
+          (e.g. ``"emotions:fraction"``); the session's
           :class:`Monitor.flat_scalars` already emits a
           matching namespaced key, so ``Trigger.active`` looks it up
           unchanged.
         - Manifold label-similarity probe:
           ``<manifold>@<label>`` — fires on the negated distance to
           the named node (larger = closer).  Stored verbatim as the
-          gate's probe string (e.g. ``"pad@elated"``); same
+          gate's probe string (e.g. ``"emotions@happy"``); same
           ``flat_scalars`` correspondence.
 
         The discriminator on the trailing IDENT: a ``COLON`` after the
