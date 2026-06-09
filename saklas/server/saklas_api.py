@@ -132,6 +132,10 @@ class WSSamplingParams(BaseModel):
     # Regular API clients can leave this false and still get aggregate
     # per-token probe scores.
     persist_per_layer_scores: bool = False
+    # Native-dashboard opt-in for the per-layer whitened subspace coords on each
+    # token's probe reading — the probe-inspector live point + fading trail.  Set
+    # true only while that inspector is open; forces per-token incremental scoring.
+    persist_subspace_coords: bool = False
     # Per-message role-substitution labels (roleplay scaffold).  Ride each
     # generate like ``seed``; stamped onto the produced loom nodes (user
     # turn ← ``user_role``, generated assistant turn ← ``assistant_role``)
@@ -490,6 +494,7 @@ def _build_sampling(body: WSSamplingParams | None) -> SamplingConfig | None:
         user_role=(body.user_role or None),
         assistant_role=(body.assistant_role or None),
         persist_per_layer_scores=bool(body.persist_per_layer_scores),
+        persist_subspace_coords=bool(body.persist_subspace_coords),
     )
 
 

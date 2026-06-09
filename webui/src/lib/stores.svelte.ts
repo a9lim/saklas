@@ -55,6 +55,10 @@ import { SURPRISE_TARGET } from "./tokens";
 import { pushToast } from "./stores/toasts.svelte";
 
 export * from "./stores/drawers.svelte";
+// Explicit binding too — ``export *`` re-exports it for consumers but does
+// not bring it into this module's local scope, and ``buildSamplingPayload``
+// reads it to gate the probe-inspector subspace-coords flag.
+import { drawerState } from "./stores/drawers.svelte";
 export * from "./stores/inputHistory.svelte";
 import {
   onPendingQueueShift,
@@ -590,6 +594,10 @@ export function setManifoldEnabled(name: string, enabled: boolean): void {
 
 const MAX_SPARKLINE = 60;
 const MAX_PROBE_TRAJECTORY = 240;
+// Probe-inspector live trajectory trail depth (tokens).  Bounded so the
+// fading polyline + the stored per-layer coords stay cheap; the oldest
+// samples fade out as newer tokens push them off the ring.
+const MAX_SUBSPACE_TRAIL = 64;
 
 export interface ProbeRackState {
   /** Per-probe live state, keyed by registered probe name. */
@@ -667,6 +675,7 @@ function _emptyProbeEntry(info: ProbeInfo): ProbeRackEntry {
     aggregate: null,
     nearest: [],
     trajectory: [],
+    subspaceTrail: [],
   };
 }
 
@@ -782,6 +791,7 @@ export function resetProbeStreams(): void {
       nearest: [],
       aggregate: null,
       trajectory: [],
+      subspaceTrail: [],
     });
   }
 }
@@ -817,6 +827,18 @@ export function updateProbesFromReadings(
         }
       }
     }
+    // Probe-inspector trail: append this token's per-layer whitened subspace
+    // coords (present only while the inspector requested them).  Stored across
+    // all probed layers so the inspector reprojects for any scrubbed layer.
+    let subspaceTrail = prev.subspaceTrail;
+    const sc = reading.subspace_coords_per_layer;
+    if (sc && Object.keys(sc).length > 0) {
+      subspaceTrail = prev.subspaceTrail.slice();
+      subspaceTrail.push({ perLayer: sc });
+      if (subspaceTrail.length > MAX_SUBSPACE_TRAIL) {
+        subspaceTrail.splice(0, subspaceTrail.length - MAX_SUBSPACE_TRAIL);
+      }
+    }
     probeRack.entries.set(name, {
       ...prev,
       sparkline,
@@ -826,6 +848,7 @@ export function updateProbesFromReadings(
       reading,
       nearest: reading.nearest,
       trajectory,
+      subspaceTrail,
     });
   }
 }
@@ -1665,6 +1688,12 @@ function buildSamplingPayload(): WSSampling | null {
   // PATCH-able either — both always ride per-call.
   const payload: WSSampling = {
     persist_per_layer_scores: true,
+    // The probe-inspector live point + fading trail need per-layer whitened
+    // subspace coords on each token reading.  Opt in only while that inspector
+    // is open so the default generate stays on the cheaper reading shape.
+    ...(drawerState.open === "probe_inspector"
+      ? { persist_subspace_coords: true }
+      : {}),
     ...nonDefaultSamplingOverrides(),
     ...(samplingState.seed !== null ? { seed: samplingState.seed } : {}),
   };

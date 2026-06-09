@@ -67,6 +67,13 @@ class SamplingConfig:
     # this heavier layer×probe payload is opt-in for surfaces such as the
     # native dashboard token drilldown.
     persist_per_layer_scores: bool = False
+    # Persist per-layer whitened subspace coords on each token's probe reading
+    # (``ProbeReading.subspace_coords_per_layer``) — the live point + fading
+    # trail for the dashboard probe-inspector geometry plot.  Heavier than the
+    # default per-token reading and only consumed by that one surface, so opt-in;
+    # set true by the native dashboard only while the inspector is open.  Forces
+    # per-token incremental scoring (else no per-token reading is produced).
+    persist_subspace_coords: bool = False
 
     def __post_init__(self) -> None:
         # Accept list[str] from callers; store as tuple so the frozen
@@ -104,6 +111,7 @@ class SamplingConfig:
         "user_role": None,
         "assistant_role": None,
         "persist_per_layer_scores": False,
+        "persist_subspace_coords": False,
     }
 
     def merged_with(self, other: "SamplingConfig | None") -> "SamplingConfig":

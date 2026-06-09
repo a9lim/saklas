@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from saklas.core.mahalanobis import WhitenerError
-from saklas.core.manifold import invert_parameterization
+from saklas.core.manifold import BoxDomain, invert_parameterization
 from saklas.core.results import ProbeReading
 
 if TYPE_CHECKING:
@@ -189,6 +189,16 @@ class Monitor:
         self._curved_feet: dict[tuple[str, int], torch.Tensor] = {}
         self._curved_warm: bool = False
 
+        # Probe-inspector live trail: when set, every full read also stamps each
+        # probe's per-layer whitened query coords (``cdist_query``) onto the
+        # ``ProbeReading.subspace_coords_per_layer`` so the dashboard can plot the
+        # current hidden state (+ a fading trajectory trail) in the same whitened
+        # frame as the geometry endpoint's ``node_white``.  Off by default — the
+        # session flips it on only while a client requests it
+        # (``persist_subspace_coords``), so the default hot path never pays the
+        # post-pass.
+        self._emit_subspace_coords: bool = False
+
         if probe_manifolds:
             for _name, _m in probe_manifolds.items():
                 self.add_probe(_name, _m)
@@ -259,6 +269,16 @@ class Monitor:
         ``invert_parameterization`` path and remain bit-for-bit reproducible.
         """
         self._curved_warm = bool(flag)
+
+    def set_subspace_coords(self, flag: bool) -> None:
+        """Enable/disable the probe-inspector live whitened-coords post-pass.
+
+        Flipped on by the session for the duration of a generation when a client
+        sets ``persist_subspace_coords`` (the dashboard inspector being open), and
+        reset off at teardown.  Gates the only added work in :meth:`_score_full`,
+        so with it off the read path is byte-for-byte the legacy path.
+        """
+        self._emit_subspace_coords = bool(flag)
 
     def reset_curved_feet(self) -> None:
         """Cold-start every curved probe's per-token foot (call per generation).
@@ -607,8 +627,58 @@ class Monitor:
         for name, probe in self._probes.items():
             if name not in out:
                 out[name] = self._score_probe_full(probe, hidden_per_layer)
+        # Probe-inspector live trail (gated): stamp each probe's per-layer whitened
+        # query coords onto its reading.  Isolated post-pass — the hot batched
+        # flat cache is untouched; runs only while a client opted in.
+        if self._emit_subspace_coords:
+            for name, probe in self._probes.items():
+                reading = out.get(name)
+                if reading is not None:
+                    reading.subspace_coords_per_layer = (
+                        self._subspace_coords_for(probe, hidden_per_layer)
+                    )
         # Preserve probe insertion order in the returned dict.
         return {name: out[name] for name in self._probes if name in out}
+
+    def _subspace_coords_for(
+        self,
+        probe: "AttachedManifoldProbe",
+        hidden_per_layer: dict[int, torch.Tensor],
+    ) -> dict[int, tuple[float, ...]]:
+        """Per-layer whitened query coords for one probe (inspector trail).
+
+        Reuses :func:`_layer_geometry` — the same primitive the read path runs —
+        so the live point lands in the identical whitened frame as the geometry
+        endpoint's ``node_white`` / ``neutral_white``.  One batched host transfer
+        per probe; only reached when ``_emit_subspace_coords`` is set.  Rank can
+        vary per layer (flat DLS prune), so each layer's slice length is tracked
+        explicitly rather than assumed uniform.
+        """
+        rows: list[torch.Tensor] = []
+        order: list[int] = []
+        lens: list[int] = []
+        for layer_idx in probe.manifold.layers:
+            if layer_idx not in hidden_per_layer:
+                continue
+            if probe.whitened.get(layer_idx) is None:
+                continue
+            h = hidden_per_layer[layer_idx].to(torch.float32)
+            if h.ndim > 1:
+                h = h.reshape(-1, h.shape[-1])[-1]
+            _, cdist_query, _, _ = _layer_geometry(probe, layer_idx, h)
+            cq = cdist_query.reshape(-1)
+            rows.append(cq)
+            order.append(layer_idx)
+            lens.append(int(cq.numel()))
+        if not rows:
+            return {}
+        flat = torch.cat(rows).detach().cpu().tolist()
+        out: dict[int, tuple[float, ...]] = {}
+        pos = 0
+        for i, ln in enumerate(lens):
+            out[order[i]] = tuple(flat[pos:pos + ln])
+            pos += ln
+        return out
 
     def _ensure_flat_cache(self, device: torch.device) -> None:
         """Build/refresh the cross-probe batched flat-read cache on ``device``.
@@ -1480,6 +1550,129 @@ class Monitor:
                 pooled[layer_idx] = stack.to(torch.float32)[row]
 
         return self._score_full(pooled)
+
+    def probe_geometry(
+        self, name: str, *, grid_resolution: int = 24,
+    ) -> dict[str, Any]:
+        """Static geometry payload for one attached probe (inspector plot).
+
+        Everything in the **whitened frame** the reads use: per-layer node
+        centroids (``wh.node_white``), the neutral anchor (``wh.neutral_white``),
+        a top-3 PCA rotation of the node cloud when ``rank >= 3``, and — for a
+        curved fit of intrinsic dim 1/2 embedded in a higher-rank subspace — the
+        manifold curve/surface sampled and whitened into the same frame.  Pairs
+        with the per-token ``ProbeReading.subspace_coords_per_layer`` (the live
+        point + trail), which carries the same ``cdist_query`` whitened coord.
+        CPU/fp32 for the SVD + grid (MPS-fallback discipline); off the hot path.
+        """
+        probe = self._probes.get(name)
+        if probe is None:
+            raise KeyError(name)
+        manifold = probe.manifold
+        domain = manifold.domain
+        n = int(domain.intrinsic_dim)
+        layers_out: dict[str, Any] = {}
+        ranks: set[int] = set()
+        for layer_idx in sorted(manifold.layers):
+            wh = probe.whitened.get(layer_idx)
+            if wh is None:
+                continue
+            sub = manifold.layers[layer_idx]
+            node_white = wh.node_white.detach().to(torch.float32).cpu()   # (K, R)
+            R = int(node_white.shape[1])
+            ranks.add(R)
+            neutral_white = (
+                wh.neutral_white.detach().to(torch.float32).cpu().reshape(-1)
+            )
+            pca_rotation: list[list[float]] | None = None
+            ev_pcs: list[float] | None = None
+            if R >= 3 and node_white.shape[0] >= 2:
+                centered = node_white - node_white.mean(dim=0, keepdim=True)
+                try:
+                    _u, s, vh = torch.linalg.svd(centered, full_matrices=False)
+                    pca_rotation = vh[:3].transpose(0, 1).contiguous().tolist()
+                    var = s ** 2
+                    tot = float(var.sum().clamp(min=1e-12))
+                    ev_pcs = [float(v) / tot for v in var[:3].tolist()]
+                except Exception:
+                    pca_rotation, ev_pcs = None, None
+            overlay: dict[str, Any] | None = None
+            if (
+                (not sub.is_affine)
+                and n in (1, 2)
+                and n < R
+                and isinstance(domain, BoxDomain)
+            ):
+                overlay = self._sample_overlay(sub, domain, wh, n, grid_resolution)
+            layers_out[str(layer_idx)] = {
+                "layer": layer_idx,
+                "rank": R,
+                "intrinsic_dim": n,
+                "is_affine": bool(sub.is_affine),
+                "node_white": node_white.tolist(),
+                "neutral_white": neutral_white.tolist(),
+                "pca_rotation": pca_rotation,
+                "explained_variance_pcs": ev_pcs,
+                "explained_variance": float(
+                    manifold.explained_variance.get(layer_idx, 0.0),
+                ),
+                "mahalanobis_share": float(
+                    manifold.mahalanobis_share.get(layer_idx, 0.0),
+                ),
+                "overlay": overlay,
+            }
+        return {
+            "name": name,
+            "manifold": manifold.name,
+            "intrinsic_dim": n,
+            "is_affine": bool(probe.is_affine),
+            "node_labels": list(manifold.node_labels),
+            "rank_uniform": len(ranks) <= 1,
+            "layers": layers_out,
+        }
+
+    @staticmethod
+    def _sample_overlay(
+        sub: Any, domain: BoxDomain, wh: Any, n: int, res: int,
+    ) -> dict[str, Any] | None:
+        """Sample a curved manifold's curve (n=1) / surface (n=2), whitened.
+
+        Returns the sampled points already in the ``node_white`` frame
+        (``r @ chol``), so the frontend overlays them on the same plot without a
+        second transform.  Off the hot path — CPU/fp32 throughout.
+        """
+        cpu = torch.device("cpu")
+        sub_c = sub.to(device=cpu, dtype=torch.float32)
+        chol = wh.chol.detach().to(torch.float32).cpu()       # (R, R)
+        basis = sub_c.basis                                   # (R, D)
+        mean = sub_c.mean                                     # (D,)
+        axes = domain.axes
+
+        def _axis_grid(ax: Any) -> torch.Tensor:
+            if ax.periodic:
+                return torch.linspace(
+                    0.0, float(ax.period), res + 1, dtype=torch.float32,
+                )[:-1]
+            return torch.linspace(
+                float(ax.lo), float(ax.hi), res, dtype=torch.float32,
+            )
+
+        def _whiten(coords: torch.Tensor) -> torch.Tensor:
+            world = sub_c.eval_at(domain.embed(domain.clamp_position(coords)))
+            reduced = (world - mean) @ basis.transpose(0, 1)  # (.., R)
+            return reduced @ chol                             # (.., R) whitened
+
+        if n == 1:
+            g = _axis_grid(axes[0]).reshape(-1, 1)            # (S, 1)
+            return {"kind": "curve", "points": _whiten(g).tolist()}
+        gu, gv = _axis_grid(axes[0]), _axis_grid(axes[1])
+        uu, vv = torch.meshgrid(gu, gv, indexing="ij")
+        grid = torch.stack([uu.reshape(-1), vv.reshape(-1)], dim=1)  # (nu*nv, 2)
+        return {
+            "kind": "surface",
+            "points": _whiten(grid).tolist(),
+            "grid_shape": [int(gu.numel()), int(gv.numel())],
+        }
 
 
 @dataclass

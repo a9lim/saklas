@@ -35,6 +35,7 @@ export { default as Help } from "./HelpDrawer.svelte";
 export { default as Export } from "./ExportDrawer.svelte";
 export { default as Correlation } from "./CorrelationDrawer.svelte";
 export { default as LayerNorms } from "./LayerNormsDrawer.svelte";
+export { default as ProbeInspector } from "./ProbeInspectorDrawer.svelte";
 export { default as ExperimentLab } from "./ExperimentLabDrawer.svelte";
 export { default as ActivationAtlas } from "./ActivationAtlasDrawer.svelte";
 export { default as RecipeBuilder } from "./RecipeBuilderDrawer.svelte";

@@ -643,6 +643,58 @@ export interface ProbeReadingJSON {
   fraction_per_layer: Record<string, number>;
   coords_per_layer: Record<string, number[]>;
   residual_per_layer: Record<string, number>;
+  /** Per-layer whitened subspace coords (the live point + trail for the
+   *  probe-inspector geometry plot).  Keyed by layer-index string -> that
+   *  layer's ``(R,)`` whitened coords, in the same frame as the geometry
+   *  endpoint's ``node_white``.  Present only when the generate request set
+   *  ``persist_subspace_coords`` (the inspector being open); absent otherwise. */
+  subspace_coords_per_layer?: Record<string, number[]>;
+}
+
+// ----------------------------------------------------- probe geometry --
+
+/** One fitted layer's geometry for the probe-inspector plot.  All coords
+ *  are in the **whitened (Mahalanobis) frame** — distances are Mahalanobis
+ *  distances and the cloud is de-rogued.  ``rank`` (subspace dimension)
+ *  drives the plot branch: 1 -> line, 2 -> 2D scatter, 3+ -> 3D PCA scatter.
+ *  ``intrinsic_dim`` drives the overlay: 1 -> curve, 2 -> surface, else none. */
+export interface ProbeLayerGeometry {
+  layer: number;
+  rank: number;
+  intrinsic_dim: number;
+  is_affine: boolean;
+  /** (K, R) node centroids in whitened coords, aligned with node_labels. */
+  node_white: number[][];
+  /** (R,) neutral anchor in whitened coords (origin for a flat fit). */
+  neutral_white: number[];
+  /** (R, 3) projection onto the top-3 PCs of the node cloud; null for rank<3. */
+  pca_rotation: number[][] | null;
+  /** Variance share of the top-3 PCs; null for rank<3. */
+  explained_variance_pcs: number[] | null;
+  explained_variance: number;
+  mahalanobis_share: number;
+  /** Curved-fit manifold overlay sampled into the whitened frame, or null. */
+  overlay: ProbeOverlay | null;
+}
+
+export interface ProbeOverlay {
+  kind: "curve" | "surface";
+  /** Sampled points (S, R) for a curve; (nu*nv, R) row-major for a surface. */
+  points: number[][];
+  /** [nu, nv] mesh dims; present for ``kind === "surface"`` only. */
+  grid_shape?: [number, number];
+}
+
+export interface ProbeGeometryResponse {
+  name: string;
+  manifold: string;
+  intrinsic_dim: number;
+  is_affine: boolean;
+  node_labels: string[];
+  /** False when a flat-DLS fit kept a different rank per layer. */
+  rank_uniform: boolean;
+  /** Keyed by layer-index string. */
+  layers: Record<string, ProbeLayerGeometry>;
 }
 
 export interface ProbeDefaultsResponse {
@@ -712,6 +764,10 @@ export interface WSSampling {
   /** Native dashboard requests this so streamed token rows can rehydrate
    *  the token-drilldown layer heatmap after a refresh. */
   persist_per_layer_scores?: boolean | null;
+  /** Native dashboard requests per-layer whitened subspace coords on each
+   *  token's probe reading (the probe-inspector live point + fading trail).
+   *  Set true only while that inspector is open; forces per-token scoring. */
+  persist_subspace_coords?: boolean | null;
   /** Per-message role-substitution labels (roleplay scaffold).  Ride each
    *  generate / commit like ``seed``; stamped onto the produced loom nodes
    *  and rendered per-turn.  null/empty = standard role label. */
@@ -1321,6 +1377,18 @@ export interface ProbeRackEntry {
    *  each token's ``nearest[0]`` looked up in ``info.node_coords``.  Empty
    *  for non-2-D / sphere / custom probes and unfitted-discover (no coords). */
   trajectory: number[][];
+  /** Ring buffer (last ~64 tokens) of per-layer whitened subspace coords for
+   *  the probe-inspector geometry plot's live point + fading trail.  Each entry
+   *  is one token's ``subspace_coords_per_layer`` (layer-key -> (R,) coords), so
+   *  the inspector can reproject for any scrubbed layer at render time.  Only
+   *  populated while the inspector is open (the ``persist_subspace_coords``
+   *  generate flag); cleared on each generation ``started``. */
+  subspaceTrail: SubspaceTrailSample[];
+}
+
+/** One token's per-layer whitened subspace coords for the inspector trail. */
+export interface SubspaceTrailSample {
+  perLayer: Record<string, number[]>;
 }
 
 // ----------------------------------------------------- gen status --
@@ -1431,6 +1499,11 @@ export type DrawerName =
   | "token_drilldown"
   | "correlation"
   | "layer_norms"
+  /** Per-probe inspector — subsumes the layer-norms view for probes and
+   *  adds a rank-aware whitened geometry plot (line / 2D scatter / 3D PCA
+   *  scatter) with a layer scrubber and a fading live trajectory trail.
+   *  Opened from a probe card's ⓘ button.  ``params: { name }``. */
+  | "probe_inspector"
   | "experiment_lab"
   | "activation_atlas"
   | "recipe_builder"

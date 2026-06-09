@@ -32,6 +32,7 @@ import type {
   NodeDiffJSON,
   PairwiseCompareResponse,
   ProbeDefaultsResponse,
+  ProbeGeometryResponse,
   ProbeInfo,
   ProbeListResponse,
   ProbeRequest,
@@ -79,6 +80,7 @@ export type {
   NodeDiffJSON,
   PairwiseCompareResponse,
   ProbeDefaultsResponse,
+  ProbeGeometryResponse,
   ProbeInfo,
   ProbeListResponse,
   ProbeRequest,
@@ -338,6 +340,14 @@ export const apiProbes = {
     return request<void>(
       `${SESSION_BASE(id)}/probes/${encodeURIComponent(name)}`,
       { method: "DELETE" },
+    );
+  },
+  /** Static whitened geometry for the probe-inspector plot — per-layer node
+   *  centroids, neutral anchor, top-3 PCA rotation (rank>=3), and the curved
+   *  manifold curve/surface overlay.  404 if the probe isn't attached. */
+  geometry(name: string, id: string = SESSION): Promise<ProbeGeometryResponse> {
+    return request(
+      `${SESSION_BASE(id)}/probes/${encodeURIComponent(name)}/geometry`,
     );
   },
 };

@@ -4706,6 +4706,14 @@ class SaklasSession:
                 and getattr(on_token, "_saklas_wants_per_layer_scores", False)
             )
         )
+        # Probe-inspector live point + fading trail: stamp each token's probe
+        # reading with per-layer whitened subspace coords.  Gates the monitor
+        # post-pass (set here, reset in the teardown ``finally``) and forces
+        # per-token scoring so the per-token reading actually exists to carry it.
+        _persists_subspace_coords = bool(
+            sampling is not None and sampling.persist_subspace_coords
+        )
+        self._monitor.set_subspace_coords(_persists_subspace_coords)
 
         def _token_tap(text: str, is_thinking: bool, tid: int | None, lp: float | None, top_alts: Any, perplexity: float | None) -> None:
             nonlocal mean_logprob_sum, mean_logprob_count
@@ -4726,6 +4734,7 @@ class SaklasSession:
                     assistant_node_id is not None
                     or _has_trait_consumer
                     or _wants_live_token_scores
+                    or _persists_subspace_coords
                 )
             )
             has_incremental_reading = bool(
@@ -4930,6 +4939,7 @@ class SaklasSession:
                 or _wants_live_token_scores
                 or _persists_layer_scores
                 or _persists_probe_row
+                or _persists_subspace_coords
             )
             self.events.emit(GenerationStarted(input=input, stateless=stateless))
             try:
@@ -5037,6 +5047,9 @@ class SaklasSession:
             # any hooks that did get attached must come off.  Idempotent.
             self._end_capture()
             self._monitor.end_live()
+            # Probe-inspector subspace-coords post-pass is per-generation; clear
+            # it so it never leaks into a later gen that didn't opt in.
+            self._monitor.set_subspace_coords(False)
             # Release the loom-tree reservation in the same scope as the
             # gen-lock release.  Even if finalize raised, mutators (edit /
             # delete on this subtree) need to be free again now that the

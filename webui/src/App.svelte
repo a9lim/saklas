@@ -247,6 +247,8 @@
             <Drawers.Correlation params={drawerState.params} />
           {:else if drawerState.open === "layer_norms"}
             <Drawers.LayerNorms params={drawerState.params} />
+          {:else if drawerState.open === "probe_inspector"}
+            <Drawers.ProbeInspector params={drawerState.params} />
           {:else if drawerState.open === "experiment_lab"}
             <Drawers.ExperimentLab params={drawerState.params} />
           {:else if drawerState.open === "activation_atlas"}

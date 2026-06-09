@@ -98,6 +98,22 @@ def register_probe_routes(app: FastAPI) -> None:
         _resolve_session_id(session, session_id)
         return {"defaults": _api.load_defaults()}
 
+    @app.get("/saklas/v1/sessions/{session_id}/probes/{name:path}/geometry")
+    def probe_geometry(session_id: str, name: str):
+        """Static geometry for the dashboard probe-inspector plot.
+
+        Per-layer node centroids + neutral + (rank>=3) a top-3 PCA rotation +
+        the curve/surface overlay for a curved fit — all in the whitened frame
+        the reads use, so the per-token live point (the reading's
+        ``subspace_coords_per_layer``) overlays directly.  ``defaults`` is
+        registered before this greedy ``{name:path}`` route so it still resolves.
+        """
+        _resolve_session_id(session, session_id)
+        try:
+            return session._monitor.probe_geometry(name)
+        except KeyError as e:
+            raise HTTPException(404, f"probe '{name}' not attached") from e
+
     @app.post("/saklas/v1/sessions/{session_id}/probes", status_code=201)
     def add_probe(session_id: str, req: ProbeRequest):
         _resolve_session_id(session, session_id)

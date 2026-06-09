@@ -27,6 +27,7 @@
   import {
     detachProbe,
     highlightState,
+    openDrawer,
     setHighlightTarget,
   } from "../../lib/stores.svelte";
   import { pushToast } from "../../lib/stores/toasts.svelte";
@@ -137,6 +138,14 @@
     }
   }
 
+  // Open the per-probe inspector (whitened geometry plot + layer norms + live
+  // trail).  Distinct gesture from the identity-cluster highlight toggle, so
+  // ``stopPropagation`` keeps the two from colliding.
+  function onInspect(ev: MouseEvent): void {
+    ev.stopPropagation();
+    openDrawer("probe_inspector", { name });
+  }
+
   async function onDetach(ev: MouseEvent): Promise<void> {
     ev.stopPropagation();
     try {
@@ -182,6 +191,14 @@
     <!-- Curved (fraction) probes are [0,1]-bounded → cap the sparkline at 1;
          flat (signed) probes auto-scale. -->
     <Sparkline points={sparkline} width={56} height={14} cap={affine ? undefined : 1} />
+
+    <button
+      type="button"
+      class="icon inspect"
+      aria-label="Inspect probe {name}"
+      title="Open probe inspector"
+      onclick={onInspect}
+    >ⓘ</button>
 
     <button
       type="button"
@@ -343,6 +360,9 @@
   }
   .remove:hover:not(:disabled) {
     color: var(--accent-red);
+  }
+  .inspect:hover:not(:disabled) {
+    color: var(--accent-purple);
   }
 
   /* ----- body: reading row ----- */

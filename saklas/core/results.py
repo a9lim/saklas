@@ -120,6 +120,17 @@ class ProbeReading:
     residual_per_layer: dict[int, float] = field(default_factory=dict)
     assignment: list[tuple[str, float]] = field(default_factory=list)
     membership: float = 1.0
+    # Per-layer reduced subspace coords in the **whitened** frame
+    # (``cdist_query = c @ chol``, the same metric ``node_white`` lives in) — the
+    # current hidden state's position for the probe-inspector geometry plot +
+    # fading trajectory trail.  Empty by default; populated only when the session
+    # sets ``Monitor.set_subspace_coords(True)`` (the ``persist_subspace_coords``
+    # generate flag, on while the dashboard inspector is open), so the default
+    # hot path neither computes nor serializes it.  Keyed by layer index → the
+    # layer's ``(R,)`` whitened coords (R = that layer's subspace rank).
+    subspace_coords_per_layer: dict[int, tuple[float, ...]] = field(
+        default_factory=dict,
+    )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -138,6 +149,10 @@ class ProbeReading:
             },
             "assignment": [[label, prob] for label, prob in self.assignment],
             "membership": self.membership,
+            "subspace_coords_per_layer": {
+                str(k): list(v)
+                for k, v in self.subspace_coords_per_layer.items()
+            },
         }
 
 
