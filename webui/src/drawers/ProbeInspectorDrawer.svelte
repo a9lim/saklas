@@ -37,7 +37,7 @@
   let loading = $state(false);
   let error = $state<string | null>(null);
   let selectedLayer = $state<number | null>(null);
-  const orbit = $state<OrbitState>({ az: 0.6, el: 0.5 });
+  const orbit = $state<OrbitState>({ az: 0.6, el: 0.5, zoom: 1 });
 
   let canvasEl = $state<HTMLCanvasElement | null>(null);
   let rafId = 0;
@@ -119,6 +119,7 @@
     const trail = trailPoints;
     const az = orbit.az;
     const el = orbit.el;
+    const zoom = orbit.zoom;
     const labels = geom?.node_labels ?? [];
     if (!canvas || !g) return;
     if (rafId) cancelAnimationFrame(rafId);
@@ -129,7 +130,7 @@
         nodeLabels: labels,
         live,
         trail,
-        orbit: { az, el },
+        orbit: { az, el, zoom },
       });
     });
   });
@@ -164,6 +165,15 @@
     } catch {
       /* ignore */
     }
+  }
+  // Scroll wheel = intentional zoom (the rotation-driven zoom artifact is
+  // gone; this is the only zoom path now).  Multiplicative so each notch is a
+  // constant ratio; clamped to a sane window.
+  function onWheel(ev: WheelEvent): void {
+    if (!canOrbit) return;
+    ev.preventDefault();
+    const factor = Math.exp(-ev.deltaY * 0.0015);
+    orbit.zoom = Math.max(0.3, Math.min(6, orbit.zoom * factor));
   }
 
   function onClose(): void {
@@ -242,11 +252,14 @@
           onpointerdown={onPointerDown}
           onpointermove={onPointerMove}
           onpointerup={onPointerUp}
+          onwheel={onWheel}
         ></canvas>
         {#if canOrbit}
-          <span class="orbit-hint">drag to orbit</span>
+          <span class="orbit-hint">drag to orbit · scroll to zoom</span>
         {/if}
-        {#if !livePoint}
+        {#if trailPoints.length > 0}
+          <span class="trail-hint">{trailPoints.length} trail pts</span>
+        {:else}
           <span class="live-hint">generate to see the live point + trail</span>
         {/if}
       </div>
@@ -393,7 +406,8 @@
     height: 320px;
   }
   .orbit-hint,
-  .live-hint {
+  .live-hint,
+  .trail-hint {
     position: absolute;
     color: var(--fg-muted);
     font-size: var(--text-2xs);
@@ -409,6 +423,12 @@
     right: 0;
     text-align: center;
     font-style: italic;
+  }
+  .trail-hint {
+    bottom: var(--space-2);
+    left: var(--space-3);
+    color: var(--accent-green);
+    font-variant-numeric: tabular-nums;
   }
 
   .section-label {

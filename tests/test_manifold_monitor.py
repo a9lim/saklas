@@ -1043,3 +1043,37 @@ def test_aggregate_tail_clamps_when_walkback_exceeds_depth():
     # clamps to the oldest retained slice rather than indexing out of range.
     pooled = cap.tail_slice_at(0)
     assert set(pooled) == {0, 1}
+
+
+# ===== probe-inspector live-point subspace coords (gated stamping) =========
+
+def test_subspace_coords_gated_off_by_default():
+    """Live-point coords are NOT stamped unless the session opted in via
+    ``set_subspace_coords(True)`` — the default hot path neither computes
+    nor serializes ``subspace_coords_per_layer``."""
+    m = _toy_manifold()
+    mon = _iso_monitor(m)
+    mon.add_probe("toy", m)
+    hidden = {li: sub.mean + sub.basis[0] for li, sub in m.layers.items()}
+    reading = mon.score_single_token(hidden)["toy"]
+    assert reading.subspace_coords_per_layer == {}
+    assert reading.to_dict()["subspace_coords_per_layer"] == {}
+
+
+def test_subspace_coords_stamped_when_enabled():
+    """With the gate on, every probed layer carries its (R,) whitened query
+    coords — the live point the inspector plots, same frame as the geometry
+    endpoint's ``node_white`` — and they serialize with string layer keys."""
+    m = _toy_manifold()
+    mon = _iso_monitor(m)
+    mon.add_probe("toy", m)
+    mon.set_subspace_coords(True)
+    hidden = {li: sub.mean + sub.basis[0] for li, sub in m.layers.items()}
+    reading = mon.score_single_token(hidden)["toy"]
+    sc = reading.subspace_coords_per_layer
+    assert set(sc.keys()) == set(m.layers.keys())
+    for layer_idx, coords in sc.items():
+        assert len(coords) == m.layers[layer_idx].basis.shape[0]
+        assert all(isinstance(c, float) for c in coords)
+    wire = reading.to_dict()["subspace_coords_per_layer"]
+    assert set(wire.keys()) == {str(li) for li in m.layers}

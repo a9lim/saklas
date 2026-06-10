@@ -9,6 +9,15 @@
 //
 // Every case overlays the fading trajectory trail (oldest faint -> newest
 // bright) and the current hidden-state point.
+//
+// **Camera (rank >= 3).**  The scale is derived ONCE from the static framing
+// set (nodes + neutral + overlay) and is rotation-invariant — the orbit is a
+// rigid rotation about the node centroid, so the cloud's radius never changes
+// as you drag.  This is what fixes the old "zooms while I rotate" bug: the
+// previous code rescaled every frame from the 2D silhouette of the rotated
+// cloud (smaller edge-on, larger broadside), and it also let a moving live
+// point rescale the whole scatter.  Zoom is now an explicit user control
+// (``orbit.zoom``, driven by the scroll wheel), never an artifact of rotation.
 
 import type { ProbeLayerGeometry } from "../types";
 
@@ -17,6 +26,8 @@ export interface OrbitState {
   az: number;
   /** Elevation (radians) — vertical drag, clamped. */
   el: number;
+  /** Zoom multiplier on the fixed base scale (scroll wheel); 1 = fit. */
+  zoom: number;
 }
 
 export interface GeometryRenderInput {
@@ -28,7 +39,7 @@ export interface GeometryRenderInput {
   live: number[] | null;
   /** Trail of past whitened points (R,), oldest -> newest. */
   trail: number[][];
-  /** Orbit angles (used for rank >= 3 only). */
+  /** Orbit angles + zoom (used for rank >= 3 only). */
   orbit: OrbitState;
 }
 
@@ -40,6 +51,14 @@ interface Palette {
   accent: string;
   purple: string;
   bg: string;
+  /** Node centroids — one cool accent (minimal-color scheme). */
+  node: string;
+  /** Neutral anchor — warm hollow ring. */
+  neutral: string;
+  /** Live hidden-state point halo + trail head. */
+  live: string;
+  /** Live point core. */
+  light: string;
 }
 
 function readPalette(el: HTMLElement): Palette {
@@ -56,6 +75,10 @@ function readPalette(el: HTMLElement): Palette {
     accent: v("--accent", "#e6e6e6"),
     purple: v("--accent-purple", "#b58cf0"),
     bg: v("--bg-deep", "#0d0d0d"),
+    node: v("--accent-blue", "#488acb"),
+    neutral: v("--accent-amber", "#ca6800"),
+    live: v("--accent-green", "#009f68"),
+    light: v("--accent-light", "#ffffff"),
   };
 }
 
@@ -140,6 +163,27 @@ function dot(
   ctx.globalAlpha = 1;
 }
 
+/** The live hidden-state point: white core inside a colored halo ring, so it
+ *  reads clearly over both the node accent and the dark background. */
+function liveDot(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  pal: Palette,
+): void {
+  ctx.globalAlpha = 0.95;
+  ctx.beginPath();
+  ctx.arc(x, y, 6.5, 0, Math.PI * 2);
+  ctx.strokeStyle = pal.live;
+  ctx.lineWidth = 2;
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(x, y, 3.2, 0, Math.PI * 2);
+  ctx.fillStyle = pal.light;
+  ctx.fill();
+  ctx.globalAlpha = 1;
+}
+
 function label(
   ctx: CanvasRenderingContext2D,
   x: number,
@@ -207,26 +251,26 @@ function drawRank1(
 
   // neutral tick
   const nx = px(geom.neutral_white[0] ?? 0);
-  ctx.strokeStyle = pal.muted;
+  ctx.strokeStyle = pal.neutral;
   ctx.beginPath();
   ctx.moveTo(nx, y0 - 8);
   ctx.lineTo(nx, y0 + 8);
   ctx.stroke();
-  label(ctx, nx, y0 - 6, "neutral", pal.muted);
+  label(ctx, nx, y0 - 6, "neutral", pal.neutral);
 
   // poles / nodes
   geom.node_white.forEach((nc, i) => {
     const x = px(nc[0] ?? 0);
-    dot(ctx, x, y0, 4, pal.fgDim);
+    dot(ctx, x, y0, 4, pal.node);
     label(ctx, x, y0 + 18, input.nodeLabels[i] ?? "", pal.fgDim);
   });
 
   // trail (ticks along the line) + live dot
   trail.forEach((t, i) => {
     const a = 0.1 + 0.7 * (i / Math.max(1, trail.length - 1));
-    dot(ctx, px(t[0] ?? 0), y0, 2.5, pal.purple, a);
+    dot(ctx, px(t[0] ?? 0), y0, 2.5, pal.live, a);
   });
-  if (live) dot(ctx, px(live[0] ?? 0), y0, 5, pal.accent);
+  if (live) liveDot(ctx, px(live[0] ?? 0), y0, pal);
 }
 
 // ----------------------------------------------------------- rank 2 --
@@ -240,15 +284,15 @@ function drawRank2(
   nodeLabel: (i: number) => string,
 ): void {
   const { geom, live, trail } = input;
-  const pts: Array<[number, number]> = [];
-  for (const nc of geom.node_white) pts.push([nc[0] ?? 0, nc[1] ?? 0]);
-  pts.push([geom.neutral_white[0] ?? 0, geom.neutral_white[1] ?? 0]);
+  // Frame the view from the STATIC geometry (nodes + neutral + overlay) only,
+  // so a moving live point / growing trail can't rescale the scatter.
+  const framing: Array<[number, number]> = [];
+  for (const nc of geom.node_white) framing.push([nc[0] ?? 0, nc[1] ?? 0]);
+  framing.push([geom.neutral_white[0] ?? 0, geom.neutral_white[1] ?? 0]);
   if (geom.overlay?.kind === "curve") {
-    for (const p of geom.overlay.points) pts.push([p[0] ?? 0, p[1] ?? 0]);
+    for (const p of geom.overlay.points) framing.push([p[0] ?? 0, p[1] ?? 0]);
   }
-  if (live) pts.push([live[0] ?? 0, live[1] ?? 0]);
-  for (const t of trail) pts.push([t[0] ?? 0, t[1] ?? 0]);
-  const b = boundsOf(pts);
+  const b = boundsOf(framing);
   const proj = projector(b, w, h);
 
   // overlay curve
@@ -269,8 +313,8 @@ function drawRank2(
   // neutral
   {
     const [sx, sy] = proj(geom.neutral_white[0] ?? 0, geom.neutral_white[1] ?? 0);
-    ctx.strokeStyle = pal.muted;
-    ctx.lineWidth = 1;
+    ctx.strokeStyle = pal.neutral;
+    ctx.lineWidth = 1.5;
     ctx.beginPath();
     ctx.arc(sx, sy, 4, 0, Math.PI * 2);
     ctx.stroke();
@@ -279,24 +323,25 @@ function drawRank2(
   // nodes
   geom.node_white.forEach((nc, i) => {
     const [sx, sy] = proj(nc[0] ?? 0, nc[1] ?? 0);
-    dot(ctx, sx, sy, 3.5, pal.fgDim);
+    dot(ctx, sx, sy, 3.5, pal.node);
     label(ctx, sx, sy, nodeLabel(i), pal.fgDim);
   });
 
   // trail + live
   const trailScreen = trail.map((t) => proj(t[0] ?? 0, t[1] ?? 0));
-  fadingTrail(ctx, trailScreen, pal.purple);
+  fadingTrail(ctx, trailScreen, pal.live);
   if (live) {
     const [sx, sy] = proj(live[0] ?? 0, live[1] ?? 0);
-    dot(ctx, sx, sy, 5, pal.accent);
+    liveDot(ctx, sx, sy, pal);
   }
 }
 
 // ----------------------------------------------------------- rank 3+ --
 
-/** Project an (R,) whitened point onto 3 PCs then orbit-rotate to a 3-vector. */
-function to3(p: number[], rot: number[][], az: number, el: number): [number, number, number] {
-  // PCA: xyz0[k] = sum_i p[i] * rot[i][k]
+type Vec3 = [number, number, number];
+
+/** Project an (R,) whitened point onto the top-3 PCs (static, orbit-free). */
+function projectPca3(p: number[], rot: number[][]): Vec3 {
   let x = 0;
   let y = 0;
   let z = 0;
@@ -308,7 +353,13 @@ function to3(p: number[], rot: number[][], az: number, el: number): [number, num
     y += pi * (r[1] ?? 0);
     z += pi * (r[2] ?? 0);
   }
-  // azimuth about y, then elevation about x
+  return [x, y, z];
+}
+
+/** Rigid orbit rotation about the origin: azimuth about y, then elevation
+ *  about x.  Norm-preserving, so the cloud radius is invariant under drag. */
+function orbitRotate(v: Vec3, az: number, el: number): Vec3 {
+  const [x, y, z] = v;
   const ca = Math.cos(az);
   const sa = Math.sin(az);
   const x1 = ca * x + sa * z;
@@ -318,6 +369,11 @@ function to3(p: number[], rot: number[][], az: number, el: number): [number, num
   const y2 = ce * y - se * z1;
   const z2 = se * y + ce * z1;
   return [x1, y2, z2];
+}
+
+interface Projected {
+  s: [number, number];
+  z: number;
 }
 
 function drawRank3(
@@ -333,29 +389,55 @@ function drawRank3(
   if (!rot) return;
   const az = orbit.az;
   const el = orbit.el;
+  const zoom = orbit.zoom || 1;
 
-  // Collect every 3-projected point for a shared bounds + depth scale.
-  const node3 = geom.node_white.map((p) => to3(p, rot, az, el));
-  const neutral3 = to3(geom.neutral_white, rot, az, el);
-  const overlay3 = (geom.overlay?.points ?? []).map((p) => to3(p, rot, az, el));
-  const trail3 = trail.map((p) => to3(p, rot, az, el));
-  const live3 = live ? to3(live, rot, az, el) : null;
+  // Static PCA-3D coords (independent of the orbit) for the framing set.
+  const nodePca = geom.node_white.map((p) => projectPca3(p, rot));
+  const neutralPca = projectPca3(geom.neutral_white, rot);
+  const overlayPca = (geom.overlay?.points ?? []).map((p) => projectPca3(p, rot));
 
-  const xy: Array<[number, number]> = [];
-  for (const p of node3) xy.push([p[0], p[1]]);
-  xy.push([neutral3[0], neutral3[1]]);
-  for (const p of overlay3) xy.push([p[0], p[1]]);
-  for (const p of trail3) xy.push([p[0], p[1]]);
-  if (live3) xy.push([live3[0], live3[1]]);
-  const b = boundsOf(xy);
-  const proj = projector(b, w, h);
+  // Pivot = node centroid (the frame ``pca_rotation`` was centered on).
+  let cx3 = 0;
+  let cy3 = 0;
+  let cz3 = 0;
+  for (const p of nodePca) {
+    cx3 += p[0];
+    cy3 += p[1];
+    cz3 += p[2];
+  }
+  const nN = Math.max(1, nodePca.length);
+  const C: Vec3 = [cx3 / nN, cy3 / nN, cz3 / nN];
 
-  // depth normalization for size/alpha cueing
+  // Rotation-invariant radius over the static framing set → fixed base scale.
+  let rho = 0;
+  for (const p of [...nodePca, neutralPca, ...overlayPca]) {
+    const d = Math.hypot(p[0] - C[0], p[1] - C[1], p[2] - C[2]);
+    if (d > rho) rho = d;
+  }
+  rho = rho || 1;
+  const iw = w - 2 * PAD;
+  const ih = h - 2 * PAD;
+  const scale = (Math.min(iw, ih) / 2 / rho) * zoom;
+  const ox = w / 2;
+  const oy = h / 2;
+
+  const project = (pca: Vec3): Projected => {
+    const r = orbitRotate([pca[0] - C[0], pca[1] - C[1], pca[2] - C[2]], az, el);
+    return { s: [ox + r[0] * scale, oy - r[1] * scale], z: r[2] };
+  };
+
+  const node3 = nodePca.map(project);
+  const neutral3 = project(neutralPca);
+  const overlay3 = overlayPca.map(project);
+  const trail3 = trail.map((p) => project(projectPca3(p, rot)));
+  const live3 = live ? project(projectPca3(live, rot)) : null;
+
+  // depth normalization for size/alpha cueing (from the node cloud)
   let zmin = Infinity;
   let zmax = -Infinity;
   for (const p of node3) {
-    if (p[2] < zmin) zmin = p[2];
-    if (p[2] > zmax) zmax = p[2];
+    if (p.z < zmin) zmin = p.z;
+    if (p.z > zmax) zmax = p.z;
   }
   const zspan = zmax - zmin || 1;
   const depth01 = (z: number): number => (z - zmin) / zspan;
@@ -368,9 +450,8 @@ function drawRank3(
       ctx.globalAlpha = 0.4;
       ctx.beginPath();
       overlay3.forEach((p, i) => {
-        const [sx, sy] = proj(p[0], p[1]);
-        if (i === 0) ctx.moveTo(sx, sy);
-        else ctx.lineTo(sx, sy);
+        if (i === 0) ctx.moveTo(p.s[0], p.s[1]);
+        else ctx.lineTo(p.s[0], p.s[1]);
       });
       ctx.stroke();
       ctx.globalAlpha = 1;
@@ -383,9 +464,8 @@ function drawRank3(
         for (let vv = 0; vv < nv; vv++) {
           const p = overlay3[u * nv + vv];
           if (!p) continue;
-          const [sx, sy] = proj(p[0], p[1]);
-          if (vv === 0) ctx.moveTo(sx, sy);
-          else ctx.lineTo(sx, sy);
+          if (vv === 0) ctx.moveTo(p.s[0], p.s[1]);
+          else ctx.lineTo(p.s[0], p.s[1]);
         }
         ctx.stroke();
       }
@@ -395,9 +475,8 @@ function drawRank3(
         for (let u = 0; u < nu; u++) {
           const p = overlay3[u * nv + vv];
           if (!p) continue;
-          const [sx, sy] = proj(p[0], p[1]);
-          if (u === 0) ctx.moveTo(sx, sy);
-          else ctx.lineTo(sx, sy);
+          if (u === 0) ctx.moveTo(p.s[0], p.s[1]);
+          else ctx.lineTo(p.s[0], p.s[1]);
         }
         ctx.stroke();
       }
@@ -407,36 +486,31 @@ function drawRank3(
 
   // neutral
   {
-    const [sx, sy] = proj(neutral3[0], neutral3[1]);
-    ctx.strokeStyle = pal.muted;
-    ctx.lineWidth = 1;
+    ctx.strokeStyle = pal.neutral;
+    ctx.lineWidth = 1.5;
     ctx.beginPath();
-    ctx.arc(sx, sy, 4, 0, Math.PI * 2);
+    ctx.arc(neutral3.s[0], neutral3.s[1], 4, 0, Math.PI * 2);
     ctx.stroke();
   }
 
   // nodes — painter's algorithm (far first), depth-cued size + alpha
   const order = node3
-    .map((p, i) => ({ i, z: p[2] }))
+    .map((p, i) => ({ i, z: p.z }))
     .sort((a, c) => a.z - c.z);
   for (const { i } of order) {
     const p = node3[i];
-    const [sx, sy] = proj(p[0], p[1]);
-    const d = depth01(p[2]);
-    dot(ctx, sx, sy, 2.5 + 2.5 * d, pal.fgDim, 0.4 + 0.6 * d);
-    if (d > 0.55) label(ctx, sx, sy, nodeLabel(i), pal.fgDim);
+    const d = depth01(p.z);
+    dot(ctx, p.s[0], p.s[1], 2.5 + 2.5 * d, pal.node, 0.4 + 0.6 * d);
+    if (d > 0.55) label(ctx, p.s[0], p.s[1], nodeLabel(i), pal.fgDim);
   }
 
   // trail + live (always on top)
-  const trailScreen = trail3.map((p) => proj(p[0], p[1]));
-  fadingTrail(ctx, trailScreen, pal.purple);
-  if (live3) {
-    const [sx, sy] = proj(live3[0], live3[1]);
-    dot(ctx, sx, sy, 5, pal.accent);
-  }
+  const trailScreen = trail3.map((p) => p.s);
+  fadingTrail(ctx, trailScreen, pal.live);
+  if (live3) liveDot(ctx, live3.s[0], live3.s[1], pal);
 }
 
-/** Render one frame.  Returns the rank actually drawn (for cursor hints). */
+/** Render one frame. */
 export function renderProbeGeometry(
   canvas: HTMLCanvasElement,
   input: GeometryRenderInput,
