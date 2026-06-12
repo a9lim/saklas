@@ -295,6 +295,27 @@ function drawRank2(
   const b = boundsOf(framing);
   const proj = projector(b, w, h);
 
+  // PC1 (horizontal) / PC2 (vertical) reference axes through the whitened
+  // origin, spanning the inner plot box.
+  {
+    const [ox, oy] = proj(0, 0);
+    ctx.strokeStyle = pal.border;
+    ctx.lineWidth = 1;
+    ctx.globalAlpha = 0.35;
+    ctx.beginPath();
+    ctx.moveTo(PAD, oy);
+    ctx.lineTo(w - PAD, oy);
+    ctx.moveTo(ox, PAD);
+    ctx.lineTo(ox, h - PAD);
+    ctx.stroke();
+    ctx.globalAlpha = 0.7;
+    ctx.fillStyle = pal.muted;
+    ctx.font = "9px ui-monospace, monospace";
+    ctx.fillText("PC1", w - PAD - 22, oy - 4);
+    ctx.fillText("PC2", ox + 4, PAD + 10);
+    ctx.globalAlpha = 1;
+  }
+
   // overlay curve
   if (geom.overlay?.kind === "curve" && geom.overlay.points.length > 1) {
     ctx.strokeStyle = pal.purple;
@@ -441,6 +462,41 @@ function drawRank3(
   }
   const zspan = zmax - zmin || 1;
   const depth01 = (z: number): number => (z - zmin) / zspan;
+
+  // PC1/PC2/PC3 reference triad through the centroid (behind everything),
+  // rotating rigidly with the cloud so orientation is always readable.
+  {
+    const axLen = rho * 1.1;
+    const triad: Array<{ dir: Vec3; name: string }> = [
+      { dir: [1, 0, 0], name: "PC1" },
+      { dir: [0, 1, 0], name: "PC2" },
+      { dir: [0, 0, 1], name: "PC3" },
+    ];
+    ctx.strokeStyle = pal.border;
+    ctx.lineWidth = 1;
+    for (const { dir, name } of triad) {
+      const pos = project([
+        C[0] + dir[0] * axLen,
+        C[1] + dir[1] * axLen,
+        C[2] + dir[2] * axLen,
+      ]);
+      const neg = project([
+        C[0] - dir[0] * axLen,
+        C[1] - dir[1] * axLen,
+        C[2] - dir[2] * axLen,
+      ]);
+      ctx.globalAlpha = 0.35;
+      ctx.beginPath();
+      ctx.moveTo(neg.s[0], neg.s[1]);
+      ctx.lineTo(pos.s[0], pos.s[1]);
+      ctx.stroke();
+      ctx.globalAlpha = 0.7;
+      ctx.fillStyle = pal.muted;
+      ctx.font = "9px ui-monospace, monospace";
+      ctx.fillText(name, pos.s[0] + 3, pos.s[1] - 2);
+    }
+    ctx.globalAlpha = 1;
+  }
 
   // overlay first (behind), depth-agnostic faint wireframe
   if (geom.overlay && overlay3.length > 1) {

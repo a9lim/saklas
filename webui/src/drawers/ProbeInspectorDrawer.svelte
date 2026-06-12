@@ -37,7 +37,7 @@
   let loading = $state(false);
   let error = $state<string | null>(null);
   let selectedLayer = $state<number | null>(null);
-  const orbit = $state<OrbitState>({ az: 0.6, el: 0.5, zoom: 1 });
+  const orbit = $state<OrbitState>({ az: 0.6, el: 0.5, zoom: 1.6 });
 
   let canvasEl = $state<HTMLCanvasElement | null>(null);
   let rafId = 0;
@@ -245,39 +245,43 @@
     </div>
 
     <div class="body">
-      <div class="plot-wrap" class:orbit={canOrbit}>
-        <canvas
-          bind:this={canvasEl}
-          class="plot"
-          onpointerdown={onPointerDown}
-          onpointermove={onPointerMove}
-          onpointerup={onPointerUp}
-          onwheel={onWheel}
-        ></canvas>
-        {#if canOrbit}
-          <span class="orbit-hint">drag to orbit · scroll to zoom</span>
-        {/if}
-        {#if trailPoints.length > 0}
-          <span class="trail-hint">{trailPoints.length} trail pts</span>
-        {:else}
-          <span class="live-hint">generate to see the live point + trail</span>
-        {/if}
+      <div class="bars-col">
+        <div class="section-label">per-layer ‖share‖<span class="dim"> · click to scrub</span></div>
+        <div class="bars">
+          {#each layerList as l (l.layer)}
+            <button
+              type="button"
+              class="row"
+              class:active={l.layer === selectedLayer}
+              onclick={() => (selectedLayer = l.layer)}
+            >
+              <span class="lyr">L{l.layer}</span>
+              <Bar value={l.mahalanobis_share} max={maxShare || 1} width={200} height={8} />
+              <span class="val">{l.mahalanobis_share.toFixed(3)}</span>
+            </button>
+          {/each}
+        </div>
       </div>
 
-      <div class="section-label">per-layer ‖share‖<span class="dim"> · click to scrub</span></div>
-      <div class="bars">
-        {#each layerList as l (l.layer)}
-          <button
-            type="button"
-            class="row"
-            class:active={l.layer === selectedLayer}
-            onclick={() => (selectedLayer = l.layer)}
-          >
-            <span class="lyr">L{l.layer}</span>
-            <Bar value={l.mahalanobis_share} max={maxShare || 1} width={240} height={8} />
-            <span class="val">{l.mahalanobis_share.toFixed(3)}</span>
-          </button>
-        {/each}
+      <div class="plot-col">
+        <div class="plot-wrap" class:orbit={canOrbit}>
+          <canvas
+            bind:this={canvasEl}
+            class="plot"
+            onpointerdown={onPointerDown}
+            onpointermove={onPointerMove}
+            onpointerup={onPointerUp}
+            onwheel={onWheel}
+          ></canvas>
+          {#if canOrbit}
+            <span class="orbit-hint">drag to orbit · scroll to zoom</span>
+          {/if}
+          {#if trailPoints.length > 0}
+            <span class="trail-hint">{trailPoints.length} trail pts</span>
+          {:else}
+            <span class="live-hint">generate to see the live point + trail</span>
+          {/if}
+        </div>
       </div>
     </div>
   {/if}
@@ -371,9 +375,25 @@
 
   .body {
     flex: 1 1 auto;
-    overflow: auto;
+    overflow: hidden;
     min-height: 0;
     padding: var(--space-4);
+    display: flex;
+    flex-direction: row;
+    gap: var(--space-4);
+  }
+  .bars-col {
+    flex: 0 0 auto;
+    min-height: 0;
+    overflow-y: auto;
+    padding-right: var(--space-2);
+  }
+  .plot-col {
+    flex: 1 1 auto;
+    min-width: 0;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
   }
   .empty {
     color: var(--fg-muted);
@@ -387,8 +407,8 @@
 
   .plot-wrap {
     position: relative;
-    width: 100%;
-    margin-bottom: var(--space-4);
+    flex: 1 1 auto;
+    min-height: 0;
     border: 1px solid var(--border);
     border-radius: var(--radius);
     background: var(--bg-deep);
@@ -401,9 +421,11 @@
     cursor: grabbing;
   }
   .plot {
+    position: absolute;
+    inset: 0;
     display: block;
     width: 100%;
-    height: 320px;
+    height: 100%;
   }
   .orbit-hint,
   .live-hint,
