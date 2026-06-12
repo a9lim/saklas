@@ -213,9 +213,20 @@
   /** The family discriminator — subspace admits every flat affine fit
    *  (pca / baked), manifold admits curved fits only (spectral /
    *  authored).  ``fit_mode`` defaults to ``authored`` (curved) when a
-   *  legacy server omits it. */
+   *  legacy server omits it.
+   *
+   *  An ``auto`` discover folder resolves its geometry per-model at fit
+   *  time, so route it by ``resolved_fit_mode`` once fitted; while it's
+   *  unfitted the geometry is unknown (``resolved_fit_mode`` null), so it
+   *  belongs to *both* families until a fit pins it — otherwise an
+   *  unfitted auto manifold (personas / emotions) shows in neither drawer. */
   function inFamily(m: ManifoldInfo): boolean {
-    const fm = m.fit_mode ?? "authored";
+    let fm: string = m.fit_mode ?? "authored";
+    if (fm === "auto") {
+      const resolved = m.resolved_fit_mode;
+      if (resolved == null) return true; // unresolved → show in both drawers
+      fm = resolved;
+    }
     if (family === "subspace") return fm === "pca" || fm === "baked";
     return fm === "spectral" || fm === "authored";
   }

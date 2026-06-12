@@ -1016,6 +1016,9 @@ class TestManifoldRoutes:
 
         listed = client.get("/saklas/v1/manifolds").json()["manifolds"]
         assert [m["name"] for m in listed] == ["mood"]
+        # An authored folder carries a concrete geometry on the wire so the
+        # rack family split can route it without a fit.
+        assert listed[0]["resolved_fit_mode"] == "authored"
 
         detail = client.get("/saklas/v1/manifolds/local/mood").json()
         labels = [n["label"] for n in detail["nodes"]]
@@ -1050,6 +1053,16 @@ class TestManifoldRoutes:
         assert body["name"] == "weekday"
         assert body["fit_mode"] == "auto"
         assert body["node_labels"] == ["monday", "tuesday", "wednesday"]
+        # Unfitted ``auto`` folder: geometry unresolved on the wire (null), so
+        # the rack client shows it in *both* family drawers.  Regression: an
+        # auto manifold used to match neither subspace nor manifold family and
+        # vanished from every drawer.
+        assert body["resolved_fit_mode"] is None
+        weekday_row = next(
+            m for m in client.get("/saklas/v1/manifolds").json()["manifolds"]
+            if m["name"] == "weekday"
+        )
+        assert weekday_row["resolved_fit_mode"] is None
 
         detail = client.get("/saklas/v1/manifolds/local/weekday").json()
         monday = next(n for n in detail["nodes"] if n["label"] == "monday")

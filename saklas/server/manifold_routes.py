@@ -23,7 +23,11 @@ from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from saklas.core.manifold import domain_from_spec
-from saklas.core.session import ConcurrentExtractionError, SaklasSession
+from saklas.core.session import (
+    ConcurrentExtractionError,
+    SaklasSession,
+    _manifold_is_affine,
+)
 from saklas.io.atomic import write_json_atomic
 from saklas.io.hf_manifolds import (
     HFError as ManifoldHFError,
@@ -333,6 +337,7 @@ def _manifold_json(
     # picked node's actual coords (otherwise label-form selections show
     # zeros on every axis).  Cheap (one safetensors header read).
     derived_coords: list[list[float]] = []
+    resolved_affine: bool | None = None
     if fitted_for_session and mf.is_discover:
         from saklas.core.manifold import load_manifold
         try:
@@ -341,6 +346,7 @@ def _manifold_json(
                 [float(x) for x in row]
                 for row in m.node_coords.tolist()
             ]
+            resolved_affine = _manifold_is_affine(m)
         except (FileNotFoundError, KeyError, ValueError):
             derived_coords = []
 
@@ -360,6 +366,23 @@ def _manifold_json(
         out["intrinsic_dim"] = n
         out["min_nodes"] = min_nodes(n) if n > 0 else None
         out["node_coords"] = derived_coords
+
+    # Resolved flat/curved geometry for the rack family split.  An
+    # ``auto`` discover folder's family is per-model and only known
+    # post-fit, so the client can't route it to the subspace (flat) vs
+    # manifold (curved) drawer off ``fit_mode`` alone.  Surface the
+    # resolved mode: ``"pca"`` (flat) / ``"spectral"`` (curved) for a
+    # fitted discover folder, the concrete ``fit_mode`` for an authored /
+    # baked folder, and ``None`` when an ``auto`` folder isn't fitted for
+    # this model yet (the client shows an unresolved auto manifold in
+    # both drawers until a fit pins the geometry).
+    if mf.is_discover:
+        out["resolved_fit_mode"] = (
+            None if resolved_affine is None
+            else ("pca" if resolved_affine else "spectral")
+        )
+    else:
+        out["resolved_fit_mode"] = mf.fit_mode
 
     # Session-only extras layered on top of the shared summary.
     out["fitted_for_session"] = fitted_for_session

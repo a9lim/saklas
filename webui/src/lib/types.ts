@@ -171,7 +171,7 @@ export interface ManifoldFitInfo {
    *  ``spectral`` for coords derived from per-node activations, ``baked``
    *  for a corpus-less precomputed direction.  Older servers may omit
    *  this; treat ``undefined`` as ``"authored"``. */
-  fit_mode?: "authored" | "pca" | "spectral" | "baked";
+  fit_mode?: "authored" | "pca" | "spectral" | "auto" | "baked";
   /** Discover-mode only.  ``max_dim``/``var_threshold`` for PCA;
    *  ``max_dim``/``k_nn``/``bandwidth``/``reference_layer`` for spectral. */
   hyperparams?: Record<string, number | string>;
@@ -207,10 +207,18 @@ export interface ManifoldInfo {
    *  current node geometry — the fit is stale and should be re-run. */
   stale: boolean;
   /** Discriminator: ``authored`` for hand-placed coords, ``pca`` /
-   *  ``spectral`` for coords derived per-model from activations, ``baked``
-   *  for a corpus-less precomputed direction.  Older servers may omit
-   *  this; treat ``undefined`` as ``"authored"``. */
-  fit_mode?: "authored" | "pca" | "spectral" | "baked";
+   *  ``spectral`` for coords derived per-model from activations, ``auto``
+   *  for a discover folder whose flat-vs-curved geometry is resolved
+   *  per-model at fit time, ``baked`` for a corpus-less precomputed
+   *  direction.  Older servers may omit this; treat ``undefined`` as
+   *  ``"authored"``. */
+  fit_mode?: "authored" | "pca" | "spectral" | "auto" | "baked";
+  /** The geometry an ``auto`` folder resolved to for the loaded model —
+   *  ``"pca"`` (flat) / ``"spectral"`` (curved) once fitted, ``null`` when
+   *  not yet fitted (geometry unknown → show in both rack drawers).  For a
+   *  non-``auto`` folder this mirrors ``fit_mode``.  Absent on older
+   *  servers. */
+  resolved_fit_mode?: "pca" | "spectral" | "authored" | "baked" | null;
   /** True for ``pca`` / ``spectral`` (coords derived per-model), false
    *  for ``authored``.  Server-supplied; absent on older servers. */
   is_discover?: boolean;
