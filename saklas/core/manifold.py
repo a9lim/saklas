@@ -2576,6 +2576,41 @@ def derive_pca_coords(
     return coords.contiguous(), diagnostics
 
 
+def neutral_layout_coord(
+    node_coords: torch.Tensor,
+    neutral_cross_gram: torch.Tensor,
+) -> torch.Tensor:
+    """Project the neutral baseline into a consensus-PCA node layout.
+
+    :func:`derive_pca_coords` returns ``node_coords`` ``(K, k)`` centered on the
+    **node mean** (PCA removes it), so the layout origin is the node centroid,
+    not the neutral baseline.  This is the classical-MDS / kernel-PCA
+    out-of-sample extension that locates neutral in the *same* layout:
+
+    - ``node_coords`` are the ``U S`` scores, so ``node_coords @ node_coordsᵀ``
+      reproduces the rank-``k`` consensus Gram ``Ḡ`` the layout was built from.
+    - ``neutral_cross_gram`` ``(K,)`` is neutral's matching cross-Gram column —
+      its node-mean-centered, whitened inner product with each node centroid in
+      the *same* layer-averaged metric ``Ḡ`` uses
+      (``gᵢ = mean_L (ν_L − μ_L)ᵀ Σ_L⁻¹ (c_{L,i} − μ_L)``).
+
+    The landmark coordinate is then ``cₙ = node_coords⁺ g`` (``⁺`` the
+    pseudo-inverse: ``cₙ[r] = (1/√λ_r) Σᵢ Uᵢᵣ gᵢ``).  Subtracting it from
+    ``node_coords`` re-anchors the layout so neutral sits at the origin — a pure
+    translation that leaves the inter-node geometry (and, via the
+    translation-invariant cardinal weights, every steering target) unchanged.
+    Returns ``(k,)`` fp32.
+    """
+    nc = node_coords.to(torch.float32)
+    g = neutral_cross_gram.to(torch.float32).reshape(-1)
+    if g.shape[0] != nc.shape[0]:
+        raise ValueError(
+            f"neutral cross-Gram has {g.shape[0]} entries but the layout has "
+            f"{nc.shape[0]} nodes"
+        )
+    return (torch.linalg.pinv(nc) @ g).contiguous()
+
+
 def _knn_adjacency(
     distances: torch.Tensor, k_nn: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -4482,6 +4517,7 @@ __all__ = [
     "derive_pca_coords",
     "derive_spectral_coords",
     "discover_coords",
+    "neutral_layout_coord",
     "select_topology",
     "compute_node_centroid",
     "save_manifold",

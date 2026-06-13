@@ -488,7 +488,13 @@ per-layer steerable subspace *is* its `max_dim`-capped layout span, so `max_dim`
 is the only dim knob — `max_subspace_dim` survives only for the curved spectral
 fit (where the RBF subspace can carry off-surface dims). The steer-time origin is
 always the projection of the per-model neutral mean onto the subspace (the affine
-fit neutral-anchors the frame), so there is no `anchor_origin` knob. Per-model
+fit neutral-anchors the frame), so there is no `anchor_origin` knob. The shared
+display layout (`node_coords`) is **neutral-centered** to match: PCA returns it
+mean-centered on the node centroid, so the flat fit re-anchors it on neutral's
+landmark-MDS projection into the layout (`neutral_layout_coord`) — a pure
+translation that leaves steering untouched (cardinal weights are
+translation-invariant) and makes `% 0,…,0` read as neutral, so the rack sliders
+and the probe-geometry plot share neutral as their origin. Per-model
 coordinates are the architectural shift: a Gemma fit and a Qwen fit produce
 different node layouts for the same heap (stored as `node_coords` in the per-model
 safetensors).

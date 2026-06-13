@@ -12,8 +12,9 @@
 //
 // **Camera (rank >= 3).**  The scale is derived ONCE from the static framing
 // set (nodes + neutral + overlay) and is rotation-invariant — the orbit is a
-// rigid rotation about the node centroid, so the cloud's radius never changes
-// as you drag.  This is what fixes the old "zooms while I rotate" bug: the
+// rigid rotation about the neutral anchor (the whitened origin), so neutral
+// sits at the plot center and the cloud's radius never changes as you drag.
+// This is what fixes the old "zooms while I rotate" bug: the
 // previous code rescaled every frame from the 2D silhouette of the rotated
 // cloud (smaller edge-on, larger broadside), and it also let a moving live
 // point rescale the whole scatter.  Zoom is now an explicit user control
@@ -417,17 +418,12 @@ function drawRank3(
   const neutralPca = projectPca3(geom.neutral_white, rot);
   const overlayPca = (geom.overlay?.points ?? []).map((p) => projectPca3(p, rot));
 
-  // Pivot = node centroid (the frame ``pca_rotation`` was centered on).
-  let cx3 = 0;
-  let cy3 = 0;
-  let cz3 = 0;
-  for (const p of nodePca) {
-    cx3 += p[0];
-    cy3 += p[1];
-    cz3 += p[2];
-  }
-  const nN = Math.max(1, nodePca.length);
-  const C: Vec3 = [cx3 / nN, cy3 / nN, cz3 / nN];
+  // Pivot = the neutral anchor (the whitened origin), so neutral sits at the
+  // plot center and the cloud shows its real displacement from neutral.  Still
+  // a fixed pivot, so the rotation-invariant base scale below is preserved (the
+  // backend's ``node_coords`` layout is neutral-anchored to match — both
+  // surfaces share neutral as their origin).
+  const C: Vec3 = neutralPca;
 
   // Rotation-invariant radius over the static framing set → fixed base scale.
   let rho = 0;
@@ -463,7 +459,7 @@ function drawRank3(
   const zspan = zmax - zmin || 1;
   const depth01 = (z: number): number => (z - zmin) / zspan;
 
-  // PC1/PC2/PC3 reference triad through the centroid (behind everything),
+  // PC1/PC2/PC3 reference triad through neutral (behind everything),
   // rotating rigidly with the cloud so orientation is always readable.
   {
     const axLen = rho * 1.1;

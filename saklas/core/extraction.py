@@ -181,6 +181,7 @@ class ManifoldExtractionPipeline:
             fit_sigma_field,
             invert_parameterization,
             load_manifold,
+            neutral_layout_coord,
             save_manifold,
             subspace_share,
         )
@@ -647,11 +648,11 @@ class ManifoldExtractionPipeline:
                     f"discover manifold {mf.name!r}: picked k={k} needs "
                     f">= {floor} nodes {floor_reason}, got K={K}"
                 )
-            # The derived coords come out PCA-mean-centered; the steer-time
-            # origin is the projection of the per-model neutral mean onto the
-            # subspace (the affine fit neutral-anchors the frame below — coord
-            # 0 in each layer's *real* reduced frame is neutral), so there is
-            # no display-coord translation to apply.
+            # The derived coords come out PCA-mean-centered (origin = the node
+            # centroid).  The per-layer fit below neutral-anchors each layer's
+            # *real* reduced frame (coord 0 = neutral), and the shared display
+            # layout is re-anchored on neutral in step 4a after the fit, so the
+            # display/`%`-authoring origin matches the steer origin.
             domain = CustomDomain(k)
             node_coords = derived_coords
             node_params = derived_coords  # identity embedding
@@ -793,6 +794,46 @@ class ManifoldExtractionPipeline:
                 mu_centered = mu_centered - mu_centered.mean(dim=0)
                 mu_coords = mu_centered @ sub.basis.to(torch.float32).T  # (K, R)
                 _bake_share(idx, sub, mu_coords)
+
+        # 4a. Neutral-center the flat (pca) display layout.  ``discover_coords``
+        #     returns node coords centered on the **node centroid** (PCA removes
+        #     the node mean), so the shared layout's origin is "the average
+        #     node", not the neutral baseline — a coord-form ``% 0,…,0`` would
+        #     mean the centroid and the rack sliders read displacements from it.
+        #     Re-anchor the layout on neutral so ``% 0,…,0`` reads as neutral and
+        #     the sliders share the geometry plot's origin (whose ``neutral_white``
+        #     is already the whitened origin).  ``neutral_layout_coord`` is the
+        #     landmark-MDS projection of the neutral baseline into the consensus-
+        #     PCA layout from neutral's whitened, node-mean-centered cross-Gram
+        #     column ``gᵢ = mean_L (ν_L − μ_L)ᵀ Σ_L⁻¹ (c_{L,i} − μ_L)`` (the same
+        #     layer-averaged metric the consensus Gram itself uses).  Subtracting
+        #     it is a **pure translation**: steering is unchanged because
+        #     ``_affine_manifold_push`` blends per-layer *neutral-anchored* coords
+        #     with cardinal weights, which are translation-invariant — the new
+        #     origin maps to neutral's in-span projection, so a coord-form ``%`` at
+        #     (0,...,0) pushes by neutral's (small) off-hull residual, not the full
+        #     slide toward the node centroid it used to.  Flat only: a curved
+        #     layout carries authored coords / a
+        #     per-layer ``origin`` foot, not a layout coordinate for neutral.
+        #     Needs the neutral baseline — a CPU-stub handle without
+        #     ``layer_means`` keeps the centroid origin (graceful, fit still valid).
+        if effective_fit_mode == "pca" and _handle_means is not None:
+            g_cols: list[torch.Tensor] = []
+            for idx in fit_layers:
+                nu = _neutral_for(idx)
+                if nu is None:
+                    g_cols = []
+                    break
+                xc = stacks[idx].to(torch.float32)
+                mu_L = xc.mean(dim=0, keepdim=True)               # (1, D) node mean
+                nu_c = nu.to(torch.float32).reshape(1, -1) - mu_L  # (1, D) ν − μ
+                sinv_xc = maha_whitener.apply_inv(idx, xc - mu_L)  # (K, D) Σ⁻¹ x̃
+                g_cols.append(sinv_xc @ nu_c.reshape(-1))          # (K,) x̃ᵀΣ⁻¹ν̃
+            if g_cols:
+                g_nu = torch.stack(g_cols).mean(dim=0)             # (K,) layer-avg
+                neutral_coords = neutral_layout_coord(node_coords, g_nu)
+                node_coords = (node_coords - neutral_coords).contiguous()
+                node_params = domain.embed(node_coords)
 
         # 4b. Fuzzy-manifold σ-field (curved + raw only).  A **second** fit-time
         #     capture pass accumulates each node's within-node reduced ``(R, R)``

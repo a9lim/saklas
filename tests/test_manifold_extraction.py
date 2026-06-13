@@ -493,6 +493,49 @@ def test_discover_pca_produces_affine_subspaces(tmp_path: Path) -> None:
     assert sidecar["subspace_metric"] == "mahalanobis"
 
 
+def test_discover_pca_layout_is_neutral_centered(tmp_path: Path) -> None:
+    """The flat (pca) display layout is re-anchored on neutral instead of the
+    node centroid.  ``derive_pca_coords`` returns coords with a zero node mean
+    (PCA-centered), so pre-re-anchoring the origin *was* the centroid; after
+    re-anchoring the origin is neutral's projection into the layout span (the
+    closest layout point to neutral, like the geometry plot's ``neutral_white``),
+    so the centroid sits off-origin and a coord-form ``%`` at (0,…,0) pushes less
+    than one toward the centroid.  Re-anchoring is a pure translation, so node-
+    exact steering is unchanged: a coord-form push at a node's layout coords
+    still reproduces that node's label-form push, layer for layer."""
+    from saklas.core.session import _affine_manifold_push
+
+    folder = _discover_folder(
+        tmp_path, fit_mode="pca",
+        hyperparams={"max_dim": 4, "var_threshold": 0.99},
+    )
+    m = ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder)
+    k = m.domain.intrinsic_dim
+    centroid = m.node_coords.mean(dim=0)                    # (k,)
+
+    # (a) origin moved off the node centroid (PCA mean was exactly 0; the
+    #     re-anchor shifted it to −neutral_layout_coord).
+    assert float(centroid.norm()) > 1e-2
+
+    # (b) origin == neutral's projection ⇒ steering toward (0,…,0) displaces less
+    #     than steering toward the node centroid, and less than a full node push.
+    push_norm = lambda d: max(float(v.norm()) for v in d.values())  # noqa: E731
+    _, at_origin = _affine_manifold_push(m, tuple([0.0] * k))
+    _, at_centroid = _affine_manifold_push(m, tuple(centroid.tolist()))
+    _, at_node = _affine_manifold_push(m, m.node_labels[0])
+    assert push_norm(at_origin) < push_norm(at_centroid)
+    assert push_norm(at_origin) < push_norm(at_node)
+
+    # (c) node-exactness preserved by the shift: coord-form at a node's layout
+    #     coords reproduces its label-form push, layer for layer.
+    for i in range(len(m.node_labels)):
+        _, by_label = _affine_manifold_push(m, m.node_labels[i])
+        _, by_coord = _affine_manifold_push(m, tuple(m.node_coords[i].tolist()))
+        assert set(by_label) == set(by_coord)
+        for L in by_label:
+            assert torch.allclose(by_label[L], by_coord[L], atol=1e-4)
+
+
 def test_discover_records_fit_mode_and_diagnostics(tmp_path: Path) -> None:
     """The sidecar carries fit_mode + diagnostics so the inspector can render."""
     folder = _discover_folder(

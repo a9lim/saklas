@@ -124,7 +124,16 @@ role=node_role, model_type=)`), threading the folder's `node_kinds` /
   (`compute_dls_axes` → `select_axes`), then the μ-centered `subspace_share` bake.
   The per-layer subspace dim is the `max_dim`-capped layout dim (the affine span
   *is* the layout — no `max_subspace_dim` for pca); the origin is the neutral
-  projection (neutral-anchored frame — no `anchor_origin` knob).
+  projection (neutral-anchored frame — no `anchor_origin` knob). The shared
+  display layout (`Manifold.node_coords`) comes out PCA-mean-centered (origin =
+  node centroid), so step 4a re-anchors it on neutral via `neutral_layout_coord`
+  — the landmark-MDS projection of neutral into the consensus-PCA layout
+  (`cₙ = node_coords⁺ · g_ν`, `g_ν` neutral's whitened node-mean-centered
+  cross-Gram column). Subtracting it is a **pure translation** (cardinal weights
+  are translation-invariant, so `_affine_manifold_push` steering is unchanged),
+  putting the layout origin at neutral's projection so `% 0,…,0` reads as neutral
+  and the rack sliders share the geometry plot's whitened origin. Flat only — a
+  curved layout's neutral is the per-layer `origin` foot, not a layout coord.
 - **monopolar** (a `pca` folder with `K == 1`): a structural early branch — a
   1-node flat fit is meaningless (needs `k+1 ≥ 2` poised nodes), so the engine
   reads it as concept-vs-neutral. Folds `concept − ν` (ν = `handle.layer_means`)

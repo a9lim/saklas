@@ -30,6 +30,7 @@ from saklas.core.manifold import (
     derive_pca_coords,
     derive_spectral_coords,
     discover_coords,
+    neutral_layout_coord,
 )
 
 
@@ -588,3 +589,27 @@ def test_discover_coords_routes_to_spectral():
 def test_discover_coords_rejects_unknown_method():
     with pytest.raises(ValueError, match=r"unknown discover method"):
         discover_coords(torch.randn(4, 4), method="banana")
+
+
+def test_neutral_layout_coord_recovers_landmark():
+    """The MDS out-of-sample projection: neutral's cross-Gram column against the
+    nodes maps to its coordinate in the (U S) layout.  If neutral coincides with
+    node j, its column is the Gram's j-th column and the projection returns node
+    j's coordinate; a half-and-half column lands at the coordinate midpoint
+    (the projection is linear in the cross-Gram)."""
+    g = torch.Generator().manual_seed(0)
+    node_coords = torch.randn(6, 3, generator=g)            # full column rank
+    gram = node_coords @ node_coords.transpose(0, 1)        # (U S)(U S)ᵀ
+    for j in range(node_coords.shape[0]):
+        cj = neutral_layout_coord(node_coords, gram[:, j])
+        assert torch.allclose(cj, node_coords[j], atol=1e-4)
+    mid = 0.5 * (gram[:, 0] + gram[:, 1])
+    c_mid = neutral_layout_coord(node_coords, mid)
+    assert torch.allclose(
+        c_mid, 0.5 * (node_coords[0] + node_coords[1]), atol=1e-4,
+    )
+
+
+def test_neutral_layout_coord_rejects_length_mismatch():
+    with pytest.raises(ValueError, match=r"entries but the layout has"):
+        neutral_layout_coord(torch.randn(5, 2), torch.randn(4))
