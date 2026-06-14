@@ -55,10 +55,11 @@
   } from "../lib/concepts";
   import DiagnosticsPanel from "../lib/manifolds/DiagnosticsPanel.svelte";
 
-  // ``params`` carries ``{ family, mode?, seed_a? }``; typed ``unknown``
-  // so it round-trips through ``drawerState.params`` (loosely typed so
-  // each drawer owns its own shape).  ``family`` and ``mode`` are derived
-  // defensively — the same pattern ManifoldDrawer used for ``mode``.
+  // ``params`` carries ``{ family, seed_a? }``; typed ``unknown`` so it
+  // round-trips through ``drawerState.params`` (loosely typed so each
+  // drawer owns its own shape).  ``family`` is derived defensively.  The
+  // drawer is one steer+probe browser — every fitted row carries both
+  // +steer and +probe, so there is no steer-vs-probe mode split.
   let { params }: { params?: unknown } = $props();
 
   const family = $derived.by<"subspace" | "manifold">(() => {
@@ -69,15 +70,6 @@
       return "manifold";
     }
     return "subspace";
-  });
-  const mode = $derived.by<"steer" | "probe">(() => {
-    if (
-      params && typeof params === "object"
-      && (params as { mode?: unknown }).mode === "probe"
-    ) {
-      return "probe";
-    }
-    return "steer";
   });
 
   // Family-derived chrome.  ``familyAccent`` is wired to a CSS custom
@@ -345,7 +337,7 @@
     }
   }
 
-  // ----- custom-attach form (probe mode) ------------------------------
+  // ----- custom-attach form (attach probe by selector) ----------------
 
   let customSelector: string = $state("");
   let customAlias: string = $state("");
@@ -507,7 +499,7 @@
   aria-label={family === "manifold" ? "Manifolds" : "Subspaces"}
 >
   <header class="header">
-    <span class="title">{mode === "probe" ? `${title} · probe` : title}</span>
+    <span class="title">{title}</span>
     <button type="button" class="close" aria-label="Close" onclick={closeDrawer}
       >✕</button>
   </header>
@@ -681,58 +673,51 @@
       <p class="error" role="alert">{errorMsg}</p>
     {/if}
 
-    {#if mode === "probe"}
-      <p class="mode-hint">
-        Attach a fitted {title} as a read-side probe.
-        Use <strong>+probe</strong> on a fitted row, or attach by
-        selector below.
-      </p>
-      <details class="custom-attach">
-        <summary>attach by selector</summary>
-        <form class="attach-form" onsubmit={onCustomAttachSubmit}>
-          <label class="row-label">
-            <span>selector</span>
-            <input
-              type="text"
-              class="text-input"
-              placeholder="ns/name"
-              aria-label="Selector"
-              bind:value={customSelector}
-              disabled={customAttaching}
-            />
-          </label>
-          <label class="row-label">
-            <span>name <span class="optional">(optional)</span></span>
-            <input
-              type="text"
-              class="text-input"
-              placeholder="registered name"
-              aria-label="Registered probe name (optional)"
-              bind:value={customAlias}
-              disabled={customAttaching}
-            />
-          </label>
-          <label class="row-label">
-            <span>top_n</span>
-            <input
-              type="number"
-              class="text-input small"
-              min="1"
-              max="32"
-              step="1"
-              aria-label="Per-token nearest-node list length"
-              bind:value={customTopN}
-              disabled={customAttaching}
-            />
-          </label>
-          <button
-            type="submit"
-            class="act probe"
-            disabled={customAttaching || !customSelector.trim()}
-          >+ attach</button>
-        </form>
-      </details>
-    {/if}
+    <details class="custom-attach">
+      <summary>attach probe by selector</summary>
+      <form class="attach-form" onsubmit={onCustomAttachSubmit}>
+        <label class="row-label">
+          <span>selector</span>
+          <input
+            type="text"
+            class="text-input"
+            placeholder="ns/name"
+            aria-label="Selector"
+            bind:value={customSelector}
+            disabled={customAttaching}
+          />
+        </label>
+        <label class="row-label">
+          <span>name <span class="optional">(optional)</span></span>
+          <input
+            type="text"
+            class="text-input"
+            placeholder="registered name"
+            aria-label="Registered probe name (optional)"
+            bind:value={customAlias}
+            disabled={customAttaching}
+          />
+        </label>
+        <label class="row-label">
+          <span>top_n</span>
+          <input
+            type="number"
+            class="text-input small"
+            min="1"
+            max="32"
+            step="1"
+            aria-label="Per-token nearest-node list length"
+            bind:value={customTopN}
+            disabled={customAttaching}
+          />
+        </label>
+        <button
+          type="submit"
+          class="act probe"
+          disabled={customAttaching || !customSelector.trim()}
+        >+ attach</button>
+      </form>
+    </details>
 
     <button type="button" class="build-btn" onclick={gotoLauncher}>
       <span class="plus" aria-hidden="true">+</span>
@@ -1153,25 +1138,6 @@
     color: var(--accent-red);
     border-color: var(--accent-red);
     background: color-mix(in srgb, var(--accent-red) 12%, transparent);
-  }
-
-  /* Probe-mode hint banner — sits at the top of the drawer when the user
-   * landed here from the probe rack, naming the difference between +steer
-   * and +probe. */
-  .mode-hint {
-    margin: 0;
-    padding: var(--space-3) var(--space-4);
-    color: var(--fg-dim);
-    font-size: var(--text-sm);
-    line-height: 1.4;
-    background: color-mix(in srgb, var(--family-accent) 6%, transparent);
-    border: 1px solid var(--border);
-    border-left: 2px solid var(--family-accent);
-    border-radius: var(--radius);
-  }
-  .mode-hint strong {
-    color: var(--family-accent);
-    font-weight: var(--weight-medium);
   }
 
   /* Custom-attach disclosure — collapsed by default so it doesn't compete

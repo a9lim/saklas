@@ -57,12 +57,13 @@
 
   function onAddSubspaceProbe(): void {
     // The shared rack drawer hosts the probe attach UI alongside the
-    // steer UI — every row carries both +steer and +probe.
-    openDrawer("subspace", { mode: "probe" });
+    // steer UI — every row carries both +steer and +probe, so the steer
+    // rack and probe rack open the exact same drawer (no mode split).
+    openDrawer("subspace");
   }
 
   function onAddManifoldProbe(): void {
-    openDrawer("manifolds", { mode: "probe" });
+    openDrawer("manifolds");
   }
 </script>
 
