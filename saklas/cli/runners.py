@@ -47,10 +47,17 @@ def _saklas_error_exit(fn: Callable[..., _R]) -> Callable[..., _R]:
 # Shared helpers
 # ---------------------------------------------------------------------------
 
-def _resolve_probes(raw: list[str] | None) -> list[str]:
-    from saklas.core.session import PROBE_CATEGORIES
+def _resolve_probes(raw: list[str] | None) -> list[str] | None:
+    """Resolve the ``--probes`` flag to a value for ``from_pretrained``.
+
+    ``None`` (unset) and ``all`` both return ``None`` — the session's default-
+    roster signal, which attaches the tagged concept axes *plus* every already-
+    fitted bundled multi-node manifold (``personas`` / ``emotions``).  ``none``
+    / ``[]`` disable probes; an explicit category list is honored verbatim (the
+    tagged concepts only, no multi-node sweep).
+    """
     if raw is None or raw == ["all"]:
-        return list(PROBE_CATEGORIES)
+        return None
     if raw in (["none"], []):
         return []
     return raw
@@ -324,64 +331,6 @@ def _warmup_session(session: SaklasSession) -> None:
         print(f"  warm-up skipped: {e}")
 
 
-def _attach_default_manifold_probes(session: SaklasSession) -> None:
-    """Auto-attach the bundled manifold probes on dashboard startup.
-
-    The two bundled manifolds (``personas``, ``emotions``) ship as the
-    default read-side counterparts to the bundled vector probes, so the
-    dashboard's probe rack opens with them already watching — the
-    manifold analogue of how ``load_default_manifolds`` /
-    ``_bootstrap_manifold_probes`` pre-load the default vector probes at
-    session construction.
-
-    Only manifolds already *fitted* for the loaded model are attached:
-    fitting runs a forward pass per node and would block ``serve``
-    startup for minutes on a fresh model, so an unfitted bundled
-    manifold is skipped with a one-line hint (fit it from the dashboard
-    and it auto-loads next launch).  Selector is the fully-qualified
-    ``default/<name>`` so the registered probe name matches a manual
-    attach from the manifolds drawer — no duplicate rows.
-
-    A bundled manifold already on the monitor is skipped: the
-    construction-time ``_bootstrap_manifold_probes`` roster attaches the
-    category-tagged concept axes under their *bare* names (``confident.
-    uncertain``), and the gate grammar / trait panel key off those bare
-    names, so re-attaching the same concept here as ``default/<name>``
-    would leave two rows for one probe in every picker.  personas /
-    emotions aren't in the bootstrap categories, so they fall through and
-    attach here as their read-side counterparts.
-    """
-    from saklas.io.manifolds import (
-        ManifoldFolder,
-        ManifoldFormatError,
-        bundled_manifold_names,
-    )
-    from saklas.io.paths import manifold_dir, safe_model_id
-
-    stem = safe_model_id(session.model_id)
-    attached = set(session.probes)
-    for name in bundled_manifold_names():
-        selector = f"default/{name}"
-        if name in attached or selector in attached:
-            continue
-        try:
-            mf = ManifoldFolder.load(manifold_dir("default", name))
-        except (ManifoldFormatError, FileNotFoundError):
-            continue
-        if stem not in mf.tensor_models():
-            print(
-                f"  manifold probe {selector}: not fitted for this model "
-                "— skipping (fit it from the dashboard to auto-load)"
-            )
-            continue
-        try:
-            session.add_probe(selector)
-            attached.add(selector)
-            print(f"  manifold probe {selector}: attached")
-        except SaklasError as exc:
-            print(f"  manifold probe {selector}: skipped — {exc}")
-
-
 # ---------------------------------------------------------------------------
 # Top-level runners
 # ---------------------------------------------------------------------------
@@ -452,12 +401,10 @@ def _run_serve(args: argparse.Namespace) -> None:
                      api_key=getattr(args, "api_key", None),
                      web=web_enabled)
 
-    # The dashboard's probe rack opens with the bundled manifold probes
-    # already watching (the read-side default, mirroring the bundled
-    # vector probes).  Gated on the dashboard being mounted — with
-    # ``--no-web`` there's no rack to populate.
-    if web_enabled:
-        _attach_default_manifold_probes(session)
+    # The default probe roster — tagged concept axes plus every fitted bundled
+    # multi-node manifold (``personas`` / ``emotions``) — is attached at session
+    # construction (``_bootstrap_manifold_probes``), so the dashboard's probe
+    # rack opens already watching them with no serve-side step.
 
     _warmup_session(session)
 

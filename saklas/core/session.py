@@ -955,7 +955,13 @@ class SaklasSession:
             # load each tagged manifold and hand the flat ``Manifold`` to the
             # Monitor, which reads it as a coordinate (the rank-1 case of the
             # subspace readout).  No folded-direction probe path anymore.
-            probe_manifolds = self._bootstrap_manifold_probes(probe_categories)
+            # ``probes is None`` is the default-roster signal: beyond the
+            # tagged concept axes, also attach every already-fitted bundled
+            # multi-node manifold (``personas`` / ``emotions``).  An explicit
+            # category list (``probes=[...]``) is honored exactly — no sweep.
+            probe_manifolds = self._bootstrap_manifold_probes(
+                probe_categories, include_fitted_defaults=probes is None,
+            )
 
         # One unified Monitor for every probe shape — flat concept axes
         # (rank-1), flat discover fits (rank-R, e.g. ``personas``), and curved
@@ -2426,22 +2432,38 @@ class SaklasSession:
         return None
 
     def _bootstrap_manifold_probes(
-        self, categories: list[str],
+        self, categories: list[str], *, include_fitted_defaults: bool = False,
     ) -> dict[str, "Manifold"]:
-        """Source bundled-concept probes as their fitted 2-node manifolds.
+        """Source the default probe roster as fitted bundled manifolds.
 
-        Builds the probe roster from the bundled concepts that live as
-        2-node ``pca`` manifolds (the category roster comes from
-        :func:`~saklas.io.probes_bootstrap.load_default_manifolds`).  For each
-        manifold tagged in a requested category it fits-or-loads the per-model
-        subspace (eager, same cost band as the legacy DiM extraction — both run
-        forward passes, both disk-cache) and hands the flat :class:`Manifold`
-        to the :class:`Monitor`, which reads it as a coordinate (the
-        rank-1 case of the subspace readout).  A fit/load failure for one
-        concept is logged and skipped, never fatal to session construction.
+        One pass, two tiers:
+
+        - **Tagged concept axes** — for each bundled 2-node ``pca`` manifold
+          tagged in a requested category (roster from
+          :func:`~saklas.io.probes_bootstrap.load_default_manifolds`) fit-or-
+          load the per-model subspace (eager, same cost band as the legacy DiM
+          extraction — both run forward passes, both disk-cache) and hand the
+          flat :class:`Manifold` to the :class:`Monitor`, which reads it as a
+          coordinate (the rank-1 case of the subspace readout).  Registered
+          under the **bare** name (``confident.uncertain``) so the gate grammar
+          and trait panel key off it.
+        - **Fitted multi-node defaults** (``include_fitted_defaults``, the
+          ``probes=None`` default roster) — sweep every bundled ``default/``
+          manifold and additionally attach any that is *already fitted* for the
+          loaded model and not already attached (``personas`` / ``emotions``).
+          Attach-only: fitting a 107-node manifold runs a forward pass per node
+          and would block startup for minutes, so an unfitted one is skipped
+          with a one-line log (fit it and it auto-loads next launch).
+          Registered under the qualified ``default/<name>`` selector so a manual
+          attach from the manifolds drawer matches — no duplicate rows.  This
+          folds the former serve-only ``_attach_default_manifold_probes`` into
+          the construction-time pass so every frontend gets the same roster.
+
+        A fit/load failure for one manifold is logged and skipped, never fatal
+        to session construction.
         """
         from saklas.io.probes_bootstrap import load_default_manifolds
-        from saklas.io.paths import manifold_dir
+        from saklas.io.paths import manifold_dir, safe_model_id
 
         defaults = load_default_manifolds()
         probes: dict[str, "Manifold"] = {}
@@ -2461,6 +2483,40 @@ class SaklasSession:
                     probes[name] = self._manifolds[key]
                 except Exception as e:
                     _log.warning("manifold probe '%s' failed to fit/load: %s", name, e)
+
+        if not include_fitted_defaults:
+            return probes
+
+        # Attach-only sweep: every fitted bundled multi-node manifold that the
+        # tagged tier didn't already pick up (personas / emotions carry no
+        # category tag, so they fall through to here).
+        from saklas.io.manifolds import (
+            ManifoldFolder,
+            ManifoldFormatError,
+            bundled_manifold_names,
+        )
+
+        stem = safe_model_id(self.model_id)
+        for name in bundled_manifold_names():
+            key = f"default/{name}"
+            if name in probes or key in probes:
+                continue
+            try:
+                folder = ManifoldFolder.load(manifold_dir("default", name))
+            except (ManifoldFormatError, FileNotFoundError):
+                continue
+            if stem not in folder.tensor_models():
+                _log.info(
+                    "manifold probe '%s' not fitted for %s — skipping "
+                    "(fit it to auto-attach next launch)",
+                    key, self.model_id,
+                )
+                continue
+            try:
+                self._ensure_manifold_loaded(key)
+                probes[key] = self._manifolds[key]
+            except Exception as e:
+                _log.warning("manifold probe '%s' failed to load: %s", key, e)
         return probes
 
     def _push_steering(

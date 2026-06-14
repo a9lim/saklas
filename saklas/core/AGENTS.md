@@ -611,10 +611,19 @@ resolves a direction from, in order: (1) an in-memory baked direction already in
 memoized into `_profiles`; (3) a stale (`< PACK_FORMAT_VERSION`) legacy
 `vectors/<ns>/<name>/` folder — `_port_stale_legacy_vector` ports it to a 2-node
 manifold file-only (no tensor yet) and raises with the exact `manifold fit` command
-to run. `_bootstrap_manifold_probes(categories)` is the probe-roster bootstrap:
-for each `default/` manifold tagged in a requested category, fit-or-load the
-2-node `Manifold` and hand it to the `Monitor` (which reads it as a rank-1
-coordinate — no fold; replaces the old `io.probes_bootstrap.bootstrap_probes`).
+to run. `_bootstrap_manifold_probes(categories, *, include_fitted_defaults)` is the
+probe-roster bootstrap — one pass, two tiers. **Tagged concept axes**: for each
+`default/` manifold tagged in a requested category, fit-or-load the 2-node
+`Manifold` and hand it to the `Monitor` (rank-1 coordinate, no fold; replaces the
+old `io.probes_bootstrap.bootstrap_probes`), registered under the **bare** name.
+**Fitted multi-node defaults** (`include_fitted_defaults`, set when
+`probes is None`): sweep every bundled `default/` manifold and additionally attach
+any *already fitted* for the model and not already attached (`personas`,
+`emotions`) under the qualified `default/<name>` selector — attach-only (never
+fits; an unfitted one logs a skip), so a 107-node manifold can't block startup.
+This folds the former serve-only `_attach_default_manifold_probes` into the
+construction-time pass, so every frontend (TUI / serve / programmatic) gets the
+same roster; an explicit `probes=[...]` category list skips the multi-node sweep.
 
 `_compose_steering_entries` is the dispatch (`ARCHITECTURE.md` §4): classify each
 entry — `AblationTerm` → ablation fragment; `ManifoldTerm` → affine `%` joins the

@@ -843,8 +843,11 @@ aggregate at a token index is bit-identical to the live read at that token), plu
 the live-mean trio `begin/update/end_live`. The one-shot re-render text scorer
 (`measure`) is gone — every read source is live hooks scoring captured hidden
 states. The bundled probe roster is the fitted 2-node manifolds tagged in each
-requested category, handed in directly by `session._bootstrap_manifold_probes` (no
-fold), so the read frame is the same de-rogued subspace steering uses.
+requested category — plus, in the default (`probes is None`) roster, every
+already-fitted bundled multi-node manifold (`personas`, `emotions`) attached
+under its `default/<name>` selector — handed in directly by
+`session._bootstrap_manifold_probes` (no fold), so the read frame is the same
+de-rogued subspace steering uses.
 
 `flat_scalars` (one staticmethod) flattens a readings dict to the probe-gate
 channels: `"<name>"` (= coords axis 0) and `"<name>[i]"` per coord axis,

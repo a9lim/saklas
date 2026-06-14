@@ -93,12 +93,13 @@ Mahalanobis-only), no injection-mode resolution, and no `--legacy` conflict chec
 `_warmup_session`
 runs a 32-token stateless `session.generate(...)` so dynamo's shape promotion fires
 on a realistic prefill before the user's first request; called from `tui` and
-`serve` after `_setup_steering_vectors`. `_attach_default_manifold_probes(session)`
-runs in `_run_serve` after `create_app`, gated on the dashboard being mounted
-(`web_enabled`) — it attaches each complete bundled `default/<name>` manifold
-already fitted for the loaded model as a read-side probe (`personas`, `emotions` once
-its corpus is complete, plus any fitted concept axes); an unfitted one is skipped
-with a one-line hint.
+`serve` after `_setup_steering_vectors`. There is no serve-side probe-attach step:
+the default probe roster — tagged concept axes plus every fitted bundled multi-node
+manifold (`personas`, `emotions`) — is attached at session construction
+(`_bootstrap_manifold_probes`, `core/session.py`) in every frontend, so the
+dashboard rack opens already watching them. `_resolve_probes` maps unset / `all` →
+`None` (the session's default-roster signal), `none` / `[]` → `[]`, and an explicit
+category list through verbatim (tagged concepts only, no multi-node sweep).
 
 ## Flags
 
