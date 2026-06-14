@@ -22,11 +22,17 @@
 
 import type { ProbeLayerGeometry } from "../types";
 
+/** Unit quaternion ``[w, x, y, z]``. */
+export type Quat = [number, number, number, number];
+
 export interface OrbitState {
-  /** Azimuth (radians) — horizontal drag. */
-  az: number;
-  /** Elevation (radians) — vertical drag, clamped. */
-  el: number;
+  /** Accumulated orientation as a unit quaternion mapping world (PCA) coords
+   *  into view coords.  A drag composes an incremental screen-axis rotation
+   *  onto it (trackball), so there are no Euler angles — hence no pole
+   *  singularity / gimbal lock, and the whole orientation sphere is reachable
+   *  without a clamp.  Every increment is a rigid rotation, so the
+   *  rotation-invariant base scale (below) is preserved. */
+  q: Quat;
   /** Zoom multiplier on the fixed base scale (scroll wheel); 1 = fit. */
   zoom: number;
 }
@@ -378,20 +384,75 @@ function projectPca3(p: number[], rot: number[][]): Vec3 {
   return [x, y, z];
 }
 
-/** Rigid orbit rotation about the origin: azimuth about y, then elevation
- *  about x.  Norm-preserving, so the cloud radius is invariant under drag. */
-function orbitRotate(v: Vec3, az: number, el: number): Vec3 {
-  const [x, y, z] = v;
-  const ca = Math.cos(az);
-  const sa = Math.sin(az);
-  const x1 = ca * x + sa * z;
-  const z1 = -sa * x + ca * z;
-  const ce = Math.cos(el);
-  const se = Math.sin(el);
-  const y2 = ce * y - se * z1;
-  const z2 = se * y + ce * z1;
-  return [x1, y2, z2];
+// --- Orientation quaternion (gimbal-lock-free orbit) ---------------------
+// The orbit accumulates a unit quaternion instead of (az, el) Euler angles, so
+// dragging never approaches a pole singularity and every orientation is
+// reachable without clamping.  Each step is a rigid rotation, so the
+// rotation-invariant base scale stays valid.
+
+/** Unit quaternion from a unit axis + angle (radians). */
+function quatFromAxisAngle(axis: Vec3, angle: number): Quat {
+  const half = angle / 2;
+  const s = Math.sin(half);
+  return [Math.cos(half), axis[0] * s, axis[1] * s, axis[2] * s];
 }
+
+/** Hamilton product ``a ∘ b`` (b applied first, then a). */
+function quatMul(a: Quat, b: Quat): Quat {
+  const [aw, ax, ay, az] = a;
+  const [bw, bx, by, bz] = b;
+  return [
+    aw * bw - ax * bx - ay * by - az * bz,
+    aw * bx + ax * bw + ay * bz - az * by,
+    aw * by - ax * bz + ay * bw + az * bx,
+    aw * bz + ax * by - ay * bx + az * bw,
+  ];
+}
+
+/** Renormalize, killing drift accumulated across repeated composition. */
+function quatNormalize(q: Quat): Quat {
+  const n = Math.hypot(q[0], q[1], q[2], q[3]) || 1;
+  return [q[0] / n, q[1] / n, q[2] / n, q[3] / n];
+}
+
+/** Rotate a vector by a unit quaternion (``v' = q v q⁻¹``, branchless). */
+function quatRotate(q: Quat, v: Vec3): Vec3 {
+  const [w, x, y, z] = q;
+  const [vx, vy, vz] = v;
+  const tx = 2 * (y * vz - z * vy);
+  const ty = 2 * (z * vx - x * vz);
+  const tz = 2 * (x * vy - y * vx);
+  return [
+    vx + w * tx + (y * tz - z * ty),
+    vy + w * ty + (z * tx - x * tz),
+    vz + w * tz + (x * ty - y * tx),
+  ];
+}
+
+/** Compose an incremental drag rotation onto an orientation.  ``dx`` spins
+ *  about the view-up axis, ``dy`` tilts about the view-right axis — both
+ *  screen-relative (trackball), pre-multiplied so they act in view space.
+ *  ``sensitivity`` is radians per pixel. */
+export function orbitDrag(
+  q: Quat,
+  dx: number,
+  dy: number,
+  sensitivity = 0.01,
+): Quat {
+  const yaw = quatFromAxisAngle([0, 1, 0], dx * sensitivity);
+  const pitch = quatFromAxisAngle([1, 0, 0], dy * sensitivity);
+  return quatNormalize(quatMul(quatMul(pitch, yaw), q));
+}
+
+/** Default orbit orientation — the old three-quarter view (``az=0.6, el=0.5``)
+ *  expressed as the equivalent quaternion (elevation-about-x ∘ azimuth-about-y),
+ *  so the initial framing is unchanged. */
+export const DEFAULT_ORBIT_QUAT: Quat = quatNormalize(
+  quatMul(
+    quatFromAxisAngle([1, 0, 0], 0.5),
+    quatFromAxisAngle([0, 1, 0], 0.6),
+  ),
+);
 
 interface Projected {
   s: [number, number];
@@ -409,8 +470,7 @@ function drawRank3(
   const { geom, live, trail, orbit } = input;
   const rot = geom.pca_rotation;
   if (!rot) return;
-  const az = orbit.az;
-  const el = orbit.el;
+  const q = orbit.q;
   const zoom = orbit.zoom || 1;
 
   // Static PCA-3D coords (independent of the orbit) for the framing set.
@@ -439,7 +499,7 @@ function drawRank3(
   const oy = h / 2;
 
   const project = (pca: Vec3): Projected => {
-    const r = orbitRotate([pca[0] - C[0], pca[1] - C[1], pca[2] - C[2]], az, el);
+    const r = quatRotate(q, [pca[0] - C[0], pca[1] - C[1], pca[2] - C[2]]);
     return { s: [ox + r[0] * scale, oy - r[1] * scale], z: r[2] };
   };
 

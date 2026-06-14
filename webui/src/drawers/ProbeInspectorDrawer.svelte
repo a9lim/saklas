@@ -19,6 +19,8 @@
   import Select from "../lib/Select.svelte";
   import {
     renderProbeGeometry,
+    orbitDrag,
+    DEFAULT_ORBIT_QUAT,
     type OrbitState,
   } from "../lib/charts/probeGeometry";
   import type { ProbeGeometryResponse, ProbeLayerGeometry } from "../lib/types";
@@ -37,7 +39,7 @@
   let loading = $state(false);
   let error = $state<string | null>(null);
   let selectedLayer = $state<number | null>(null);
-  const orbit = $state<OrbitState>({ az: 0.6, el: 0.5, zoom: 1.6 });
+  const orbit = $state<OrbitState>({ q: DEFAULT_ORBIT_QUAT, zoom: 1.6 });
 
   let canvasEl = $state<HTMLCanvasElement | null>(null);
   let rafId = 0;
@@ -119,8 +121,7 @@
     // touch the reactive deps so the effect re-subscribes
     const live = livePoint;
     const trail = trailPoints;
-    const az = orbit.az;
-    const el = orbit.el;
+    const q = orbit.q;
     const zoom = orbit.zoom;
     const labels = geom?.node_labels ?? [];
     if (!canvas || !g) return;
@@ -132,7 +133,7 @@
         nodeLabels: labels,
         live,
         trail,
-        orbit: { az, el, zoom },
+        orbit: { q, zoom },
       });
     });
   });
@@ -157,8 +158,9 @@
     const dy = ev.clientY - lastY;
     lastX = ev.clientX;
     lastY = ev.clientY;
-    orbit.az += dx * 0.01;
-    orbit.el = Math.max(-1.45, Math.min(1.45, orbit.el - dy * 0.01));
+    // Trackball: compose a screen-axis rotation onto the accumulated
+    // orientation.  No Euler angles → no gimbal lock, no elevation clamp.
+    orbit.q = orbitDrag(orbit.q, dx, dy);
   }
   function onPointerUp(ev: PointerEvent): void {
     dragging = false;
