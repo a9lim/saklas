@@ -527,6 +527,13 @@
     gap: var(--space-3);
     overflow-x: auto;
     white-space: nowrap;
+    /* Symmetric breathing room around the cells, matched to a bar's ~8px of
+       vertical whitespace (an 8px bar centred in a 24px row).  The values are
+       asymmetric to land symmetric whitespace: the body gap already adds 2px
+       above the strip and the card's 4px bottom padding sits below it, so
+       6px top + 4px bottom → 8px clear above and below the cells. */
+    padding-top: var(--space-3);
+    padding-bottom: var(--space-2);
   }
   .layers-status {
     color: var(--fg-muted);
