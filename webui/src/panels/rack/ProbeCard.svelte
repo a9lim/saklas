@@ -23,6 +23,7 @@
   import Bar from "../../lib/charts/Bar.svelte";
   import Sparkline from "../../lib/charts/Sparkline.svelte";
   import HeatmapCell from "../../lib/charts/HeatmapCell.svelte";
+  import { nodeCoordExtent } from "../../lib/tokens";
   import ManifoldMiniMap from "../manifold/ManifoldMiniMap.svelte";
   import {
     detachProbe,
@@ -50,6 +51,14 @@
   const bipolar = $derived(affine && info.node_count === 2);
 
   const accent = $derived(affine ? "--accent" : "--accent-purple");
+
+  /** Saturation scale for the bar + layer cells.  A flat probe reads a
+   *  signed domain-frame ``coords[0]`` whose units are the fit's own node
+   *  layout (a fan runs to ±tens), so we normalize by the axis-0 node
+   *  extent — "full = as far along as the most extreme node".  A curved
+   *  probe reads a ``[0,1]`` fraction, already unit-normalized, so it
+   *  stays on the fixed unit scale. */
+  const axisScale = $derived(affine ? nodeCoordExtent(info.node_coords, 0) : 1);
 
   const current = $derived(entry.current ?? 0);
   const sparkline = $derived(entry.sparkline ?? []);
@@ -217,7 +226,7 @@
           {#if !monopolar}{poles.negative}{/if}
         </span>
         <div class="bar-cell" aria-hidden="true">
-          <Bar value={current} max={1} width={160} height={8} bipolar />
+          <Bar value={current} max={axisScale} width={160} height={8} bipolar />
         </div>
         <span class="pole pos" title={`positive pole (${poles.positive})`}>
           {poles.positive}
@@ -227,12 +236,16 @@
         </span>
       </div>
     {:else}
-      <!-- Scalar / fraction row: bar · nearest node · value.  A higher-rank
-           flat fan reads the signed axis-0 magnitude; a curved fit reads the
-           [0,1] subspace fraction — both fill from the left. -->
+      <!-- Scalar / fraction row — same 4-column grid as the bipolar row so
+           the bar sits in the identical inset slot and reads center-zero.
+           Column 1 (the neg-pole slot) is an empty spacer; the nearest node
+           takes the pos-pole slot.  A higher-rank flat fan reads the signed
+           axis-0 magnitude (centered, sign-coloured like a bipolar axis); a
+           curved fit reads the [0,1] subspace fraction (fills rightward). -->
       <div class="reading reading-scalar">
+        <span class="pole neg" aria-hidden="true"></span>
         <div class="bar-cell" aria-hidden="true">
-          <Bar value={Math.abs(current)} max={1} width={160} height={8} />
+          <Bar value={current} max={axisScale} width={160} height={8} bipolar />
         </div>
         <span
           class="nearest"
@@ -247,7 +260,13 @@
             <span class="nearest-empty">—</span>
           {/if}
         </span>
-        <span class="value">{fmtFraction(current)}</span>
+        <span
+          class="value"
+          class:pos={affine && current > 0}
+          class:neg={affine && current < 0}
+        >
+          {#if affine}{current >= 0 ? "+" : ""}{current.toFixed(2)}{:else}{fmtFraction(current)}{/if}
+        </span>
       </div>
     {/if}
 
@@ -277,6 +296,7 @@
           {#each layerKeys as layer (layer)}
             <HeatmapCell
               value={entry.perLayer?.[layer]}
+              scale={axisScale}
               size={CELL_SIZE}
               title={cellTooltip(layer)}
             />
@@ -372,13 +392,12 @@
     gap: var(--space-2);
     min-width: 0;
   }
-  /* Bipolar: neg pole · bar · pos pole · value. */
-  .reading-bipolar {
-    grid-template-columns: minmax(2.5em, 1fr) minmax(60px, 2.6fr) minmax(2.5em, 1fr) 3.5em;
-  }
-  /* Scalar / fraction: bar · nearest · value. */
+  /* Both rows share the grid so the bar lands in the same inset slot and
+     the cards line up vertically.  Bipolar: neg pole · bar · pos pole ·
+     value.  Scalar: empty spacer · bar · nearest · value. */
+  .reading-bipolar,
   .reading-scalar {
-    grid-template-columns: minmax(60px, 2.6fr) minmax(2.5em, 1fr) 3.5em;
+    grid-template-columns: minmax(2.5em, 1fr) minmax(60px, 2.6fr) minmax(2.5em, 1fr) 3.5em;
   }
   .pole {
     overflow: hidden;

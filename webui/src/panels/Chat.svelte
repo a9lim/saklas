@@ -55,6 +55,7 @@
     genUiMode,
     setGenUiMode,
     roleDisplayLabel,
+    highlightScale,
   } from "../lib/stores.svelte";
   import type { AutoRegenMode } from "../lib/stores.svelte";
   import type { ChatTurn, TokenScore } from "../lib/types";
@@ -699,13 +700,15 @@
     const a = highlightState.target;
     if (!a) return {};
     const aScore = pickScore(t, a);
+    const scaleA = highlightScale(a);
     if (highlightState.compareTwo && highlightState.compareTarget) {
       const bScore = pickScore(t, highlightState.compareTarget);
+      const scaleB = highlightScale(highlightState.compareTarget);
       return highlightState.smoothBlend
-        ? twoBlendStyle(aScore, bScore)
-        : twoStripeStyle(aScore, bScore);
+        ? twoBlendStyle(aScore, bScore, scaleA, scaleB)
+        : twoStripeStyle(aScore, bScore, scaleA, scaleB);
     }
-    const bg = scoreToRgb(aScore);
+    const bg = scoreToRgb(aScore, scaleA);
     return bg === "transparent" ? {} : { backgroundColor: bg };
   }
 

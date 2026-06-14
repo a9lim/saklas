@@ -7,19 +7,20 @@
   // for the selected token) at the bottom.
   //
   // The heatmap reuses the project's canonical primitive,
-  // ``HeatmapCell`` — same diverging red/green scoreToRgb scale the
-  // correlation matrix and probe-strip per-layer rows use.  The grid is
-  // laid out exactly like ``CorrelationDrawer``'s matrix: sticky-header
-  // table, rotated column labels for long probe names, scroll-area
-  // bounded by the drawer body.  Result: any heatmap in the project now
-  // reads the same way — same colors, same cell-value treatment, same
-  // grid frame.
+  // ``HeatmapCell`` — the same diverging red/green scoreToRgb ramp, here
+  // normalized per-probe by the node-coordinate extent (``probeAxisScale``)
+  // so a column matches that probe's rack strip and chat-token tint rather
+  // than the fixed ±HIGHLIGHT_SAT cutoff the cosine matrices keep.  The grid
+  // is laid out exactly like ``CorrelationDrawer``'s matrix: sticky-header
+  // table, rotated column labels for long probe names, scroll-area bounded
+  // by the drawer body.
 
   import {
     closeDrawer,
     chatLog,
     highlightState,
     probeRack,
+    probeAxisScale,
   } from "../lib/stores.svelte";
   import HeatmapCell from "../lib/charts/HeatmapCell.svelte";
   import type { TokenScore } from "../lib/types";
@@ -236,6 +237,7 @@
                     <td class="cell-td">
                       <HeatmapCell
                         value={v}
+                        scale={probeAxisScale(probe)}
                         size={CELL_SIZE}
                         title={cellTitle(layer, probe, v)}
                       />

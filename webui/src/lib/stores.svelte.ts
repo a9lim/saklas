@@ -51,7 +51,7 @@ import type {
   WSSampling,
 } from "./types";
 import { serializeExpression } from "./expression";
-import { SURPRISE_TARGET } from "./tokens";
+import { SURPRISE_TARGET, HIGHLIGHT_SAT, nodeCoordExtent } from "./tokens";
 import { pushToast } from "./stores/toasts.svelte";
 
 export * from "./stores/drawers.svelte";
@@ -677,6 +677,23 @@ function _emptyProbeEntry(info: ProbeInfo): ProbeRackEntry {
     trajectory: [],
     subspaceTrail: [],
   };
+}
+
+/** Per-probe saturation scale for the bar / layer cells / token tint — the
+ *  axis-0 node-coordinate extent of the attached probe (``nodeCoordExtent``),
+ *  or 1 when the probe isn't attached / carries no coords.  Token highlighting
+ *  reads ``coords[0]`` (domain-frame) for every probe, flat or curved, so the
+ *  node extent is the right normalizer in both cases. */
+export function probeAxisScale(name: string, axis = 0): number {
+  return nodeCoordExtent(probeRack.entries.get(name)?.info?.node_coords, axis);
+}
+
+/** Saturation scale for a highlight target.  The surprise sentinel keeps the
+ *  fixed ``HIGHLIGHT_SAT`` cutoff (``surpriseScore`` is pre-scaled to it); a
+ *  real probe normalizes by its node extent. */
+export function highlightScale(target: string | null, axis = 0): number {
+  if (!target || target === SURPRISE_TARGET) return HIGHLIGHT_SAT;
+  return probeAxisScale(target, axis);
 }
 
 /** Computed: probe names sorted per the chosen sort mode.  Fresh array each

@@ -23,6 +23,7 @@
     sendStop,
     highlightState,
     openDrawer,
+    highlightScale,
   } from "../lib/stores.svelte";
   import type { ChatTurn, TokenScore } from "../lib/types";
   import { scoreToRgb, surpriseScore, SURPRISE_TARGET } from "../lib/tokens";
@@ -259,7 +260,7 @@
   }
 
   function tintStyle(t: TokenScore): string {
-    const bg = scoreToRgb(tokenScore(t));
+    const bg = scoreToRgb(tokenScore(t), highlightScale(highlightState.target));
     return bg === "transparent" ? "" : `background-color: ${bg}`;
   }
 
