@@ -679,7 +679,7 @@ export interface ProbeLayerGeometry {
   pca_rotation: number[][] | null;
   /** Variance share of the top-3 PCs; null for rank<3. */
   explained_variance_pcs: number[] | null;
-  explained_variance: number;
+  /** Per-layer Mahalanobis share — the steering budget; also the read weight. */
   mahalanobis_share: number;
   /** Curved-fit manifold overlay sampled into the whitened frame, or null. */
   overlay: ProbeOverlay | null;

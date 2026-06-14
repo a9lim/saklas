@@ -68,17 +68,17 @@ def _toy_manifold(*, dim: int = 8, n_layers: int = 1, seed: int = 0) -> Manifold
     e1 = torch.zeros(dim)
     e1[1] = 1.0
     layers: dict[int, LayerSubspace] = {}
-    ev: dict[int, float] = {}
+    share: dict[int, float] = {}
     for layer_idx in range(n_layers):
         scale = 1.0 + 0.5 * layer_idx
         centroids = torch.stack([-scale * e0, torch.zeros(dim), scale * e0])
         centroids = centroids + 0.01 * torch.stack([-e1, torch.zeros(dim), e1])
         sub, ev_ratio = fit_layer_subspace(centroids, domain.embed(coords))
         layers[layer_idx] = sub
-        ev[layer_idx] = ev_ratio
+        share[layer_idx] = ev_ratio
     return Manifold(
         name="toy", domain=domain, node_labels=["a", "b", "c"],
-        node_coords=coords, layers=layers, explained_variance=ev,
+        node_coords=coords, layers=layers, mahalanobis_share=share,
     )
 
 

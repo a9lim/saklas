@@ -33,11 +33,12 @@ DEFAULT_NEAREST_TOP_N: int = 3
 # real node with this label (the corpus node owns the name).
 NEUTRAL_LABEL: str = "neutral"
 
-# Floor for the EV weight on a manifold layer with degenerate fit
-# quality — keeps the EV-weighted aggregation from collapsing to NaN
-# on a manifold whose every layer reports EV ≈ 0.  Matches the
-# ``min_ev`` floor on additive-mode manifold steering's quality_factor.
-_MIN_EV_WEIGHT: float = 1e-6
+# Floor for the per-layer share weight on a manifold layer with a
+# degenerate (near-zero) Mahalanobis share — keeps the share-weighted
+# cross-layer aggregation from collapsing to NaN on a manifold whose
+# every layer reports share ≈ 0.  Negligible against a real per-layer
+# share (~O(1) whitened units), so it doesn't de-peak the weighting.
+_MIN_SHARE_WEIGHT: float = 1e-6
 
 # Guard against division by zero in the subspace_fraction / cosine
 # denominator (a zero or near-zero activation norm).
@@ -311,26 +312,28 @@ class Monitor:
         """Full per-probe reading for one state — flat or curved, all fields.
 
         Loops the probe's shared fit layers through :func:`_layer_geometry`
-        and EV-weights across them.  A flat (affine) probe recovers ``coords``
-        through the affine reduced→domain map (off-surface ``residual`` 0); a
-        curved probe through the :func:`invert_parameterization` foot solve
-        (real off-surface ``residual``).  Returns the cross-layer EV-weighted
+        and **share**-weights across them (the layer carrying the most
+        Mahalanobis steering budget is also the most reliable to read from).
+        A flat (affine) probe recovers ``coords`` through the affine
+        reduced→domain map (off-surface ``residual`` 0); a curved probe
+        through the :func:`invert_parameterization` foot solve (real
+        off-surface ``residual``).  Returns the cross-layer share-weighted
         ``coords`` / ``fraction`` / ``nearest`` / ``residual`` plus their
         per-layer traces.  This is the single geometry primitive every read
         entry point (live per token, aggregate) shares, so the aggregate at a
         token index is bit-identical to the live read at that token.
         """
         manifold = probe.manifold
-        ev = probe.ev_weights
+        sw = probe.share_weights
         is_affine = probe.is_affine
         shared = [idx for idx in manifold.layers if idx in hidden_per_layer]
         if not shared:
             return ProbeReading(fraction=0.0, nearest=[], coords=())
-        total_w = sum(ev.get(idx, 0.0) for idx in shared)
-        if total_w <= _MIN_EV_WEIGHT:
+        total_w = sum(sw.get(idx, 0.0) for idx in shared)
+        if total_w <= _MIN_SHARE_WEIGHT:
             w_shared = {idx: 1.0 / len(shared) for idx in shared}
         else:
-            w_shared = {idx: ev.get(idx, 0.0) / total_w for idx in shared}
+            w_shared = {idx: sw.get(idx, 0.0) / total_w for idx in shared}
 
         K = probe.node_values_reduced[shared[0]].shape[0]
         inject_neutral = probe.inject_neutral
@@ -699,7 +702,7 @@ class Monitor:
         * ``Mblk`` / ``chol_blk`` / ``coordS_blk`` (block-diagonal) — per-probe
           ``M_R⁻¹``, whitened-distance Cholesky, and the affine reduced→domain
           map, each one block-diagonal matmul,
-        * ``cols`` ``(P_L,)`` / ``coords_gidx`` ``(Σnd_L,)`` / ``ev_perdim`` /
+        * ``cols`` ``(P_L,)`` / ``coords_gidx`` ``(Σnd_L,)`` / ``wt_perdim`` /
           ``cq_scatter`` ``(ΣR_L,)`` — scatter indices into the global
           ``frac_acc`` / ``coords_acc`` / ``dist_acc`` slots and into the padded
           ``(P_L, Rmax)`` whitened query,
@@ -862,8 +865,8 @@ class Monitor:
                 )
                 for w in whs
             ])
-            ev = torch.tensor(
-                [float(self._probes[n].ev_weights.get(layer_idx, 0.0))
+            wt = torch.tensor(
+                [float(self._probes[n].share_weights.get(layer_idx, 0.0))
                  for n in present],
                 device=device, dtype=torch.float32,
             )
@@ -871,7 +874,7 @@ class Monitor:
             seg_ids_list: list[int] = []
             cq_scatter_list: list[int] = []
             coords_gidx_list: list[int] = []
-            ev_perdim_list: list[float] = []
+            wt_perdim_list: list[float] = []
             present_nd: list[int] = []
             node_pad = torch.zeros((len(present), Kmax, Rmax),
                                    device=device, dtype=torch.float32)
@@ -883,23 +886,23 @@ class Monitor:
                 present_nd.append(ndp)
                 g_off = nd_off[cis[li]][0]
                 coords_gidx_list.extend(range(g_off, g_off + ndp))
-                ev_perdim_list.extend([li] * ndp)  # local index → ev gather
+                wt_perdim_list.extend([li] * ndp)  # local index → weight gather
                 nw = w.node_white.to(device)                       # (K_p, Rp)
                 node_pad[li, :nw.shape[0], :Rp] = nw
-            ev_perdim = ev[torch.tensor(
-                ev_perdim_list, device=device, dtype=torch.long,
-            )] if ev_perdim_list else ev.new_zeros(0)
+            wt_perdim = wt[torch.tensor(
+                wt_perdim_list, device=device, dtype=torch.long,
+            )] if wt_perdim_list else wt.new_zeros(0)
             cache[layer_idx] = {
                 "X": X, "K_inv": K_inv, "lam": lam,
                 "basis_stack": basis_stack, "means_stack": means_stack,
                 "gmean_stack": gmean_stack, "mm_stack": mm_stack,
                 "Mblk": Mblk, "chol_blk": chol_blk,
                 "coordS_blk": coordS_blk, "coordb_stack": coordb_stack,
-                "ev": ev,
+                "wt": wt,
                 "seg_ids": torch.tensor(seg_ids_list, device=device, dtype=torch.long),
                 "cq_scatter": torch.tensor(cq_scatter_list, device=device, dtype=torch.long),
                 "coords_gidx": torch.tensor(coords_gidx_list, device=device, dtype=torch.long),
-                "ev_perdim": ev_perdim,
+                "wt_perdim": wt_perdim,
                 "cols": torch.tensor(cis, device=device, dtype=torch.long),
                 "cols_list": list(cis),
                 "present_nd": present_nd,
@@ -916,8 +919,8 @@ class Monitor:
         Woodbury apply, stacked / block-diagonal matmuls for reduced coords,
         domain coords, fraction, and a padded ``(P_L, Kmax)`` nearest-distance
         norm — each scattered straight into global per-probe accumulators
-        (``frac_acc`` / ``coords_acc`` / ``dist_acc`` / ``evsum``).  Phase 2
-        (device): EV-normalize, one global ``topk`` sized to the largest requested
+        (``frac_acc`` / ``coords_acc`` / ``dist_acc`` / ``wtsum``).  Phase 2
+        (device): share-normalize, one global ``topk`` sized to the largest requested
         ``top_n`` for nearest, and **one**
         ``.cpu()`` for the entire roster (means + per-layer traces + nearest).
         Phase 3 (host): slice the flat blob back into per-probe
@@ -936,7 +939,7 @@ class Monitor:
         device = gl["valid_mask"].device
 
         frac_acc = torch.zeros(P, device=device, dtype=torch.float32)
-        evsum = torch.zeros(P, device=device, dtype=torch.float32)
+        wtsum = torch.zeros(P, device=device, dtype=torch.float32)
         coords_acc = torch.zeros(gl["nd_total"], device=device, dtype=torch.float32)
         dist_acc = torch.zeros((P, Kmax), device=device, dtype=torch.float32)
         # Per-layer trace pieces (raw, unweighted) for the single transfer.
@@ -974,23 +977,23 @@ class Monitor:
                 ent["node_pad"] - cq_pad.unsqueeze(1), dim=-1,
             )                                                       # (P_L, Kmax)
 
-            ev = ent["ev"]
-            frac_acc.index_add_(0, cols, ev * frac)
-            evsum.index_add_(0, cols, ev)
-            coords_acc.index_add_(0, ent["coords_gidx"], ent["ev_perdim"] * coords_all)
-            dist_acc.index_add_(0, cols, dist * ev.unsqueeze(1))
+            wt = ent["wt"]
+            frac_acc.index_add_(0, cols, wt * frac)
+            wtsum.index_add_(0, cols, wt)
+            coords_acc.index_add_(0, ent["coords_gidx"], ent["wt_perdim"] * coords_all)
+            dist_acc.index_add_(0, cols, dist * wt.unsqueeze(1))
             trace_frac.append(frac)
             trace_coords.append(coords_all)
             trace_layers.append(layer_idx)
             seen.update(ent["cols_list"])
 
         # --- device finalize (EV-normalize + one bounded global topk) ---
-        evsum_safe = evsum.clamp(min=_FRACTION_EPSILON)
-        frac_final = frac_acc / evsum_safe
-        coords_final = coords_acc / evsum_safe.repeat_interleave(
+        wtsum_safe = wtsum.clamp(min=_FRACTION_EPSILON)
+        frac_final = frac_acc / wtsum_safe
+        coords_final = coords_acc / wtsum_safe.repeat_interleave(
             gl["nd_counts"],
         ).clamp(min=_FRACTION_EPSILON)
-        dist_final = (dist_acc / evsum_safe.unsqueeze(1)).masked_fill(
+        dist_final = (dist_acc / wtsum_safe.unsqueeze(1)).masked_fill(
             ~gl["valid_mask"], float("inf"),
         )
         if topk_width:
@@ -1613,9 +1616,6 @@ class Monitor:
                 "neutral_white": neutral_white.tolist(),
                 "pca_rotation": pca_rotation,
                 "explained_variance_pcs": ev_pcs,
-                "explained_variance": float(
-                    manifold.explained_variance.get(layer_idx, 0.0),
-                ),
                 "mahalanobis_share": float(
                     manifold.mahalanobis_share.get(layer_idx, 0.0),
                 ),
@@ -1686,10 +1686,11 @@ class AttachedManifoldProbe:
     pruned-basis-consistent), else ``(sub.eval_at(domain.embed(node_coords)) -
     sub.mean) @ sub.basis.T`` for a curved fit (RBF surface eval) —
     pre-computed once at attach so per-token distance computations are one
-    batched cdist in R-dim per layer.  ``ev_weights`` is the per-layer EV
-    ratio used to weight cross-layer aggregation; floored at
-    :data:`_MIN_EV_WEIGHT` so a degenerate layer doesn't crash the
-    aggregator.
+    batched cdist in R-dim per layer.  ``share_weights`` is the per-layer
+    Mahalanobis share (the steering budget) used to weight cross-layer
+    aggregation — the layer that carries the most push is the most reliable
+    to read from; floored at :data:`_MIN_SHARE_WEIGHT` so a degenerate layer
+    doesn't crash the aggregator.
     """
 
     name: str
@@ -1704,10 +1705,11 @@ class AttachedManifoldProbe:
     # Per-layer cache, indexed by layer index — same set of layers as
     # ``manifold.layers``.
     node_values_reduced: dict[int, torch.Tensor] = field(default_factory=dict)
-    # Per-layer EV weight, normalized to sum to 1 across attached layers.
-    ev_weights: dict[int, float] = field(default_factory=dict)
+    # Per-layer Mahalanobis-share weight, normalized to sum to 1 across
+    # attached layers.
+    share_weights: dict[int, float] = field(default_factory=dict)
     # Per-candidate soft-assignment bandwidth ``τ`` ``(Kc,)`` in the **whitened**
-    # metric (the metric the nearest-node distances live in), EV-weighted across
+    # metric (the metric the nearest-node distances live in), share-weighted across
     # layers, candidate order = nodes then the neutral anchor (when injected).
     # A curved fit's within-node σ-field mapped into the whitened metric (×
     # ``√(tr(M_R)/R)``, the isotropic-σ scale); a flat fit's local layout scale
@@ -1979,12 +1981,15 @@ def _attach_manifold_probe(
         tuple[torch.Tensor, torch.Tensor, float],
     ] | None = None,
 ) -> "AttachedManifoldProbe":
-    """Build an :class:`AttachedManifoldProbe`: node values + EV weights + whitened.
+    """Build an :class:`AttachedManifoldProbe`: node values + share weights + whitened.
 
     Pre-caches, once at attach, the per-layer reduced ``(K, R)`` node
     activations (hot-path cdist working space) and the normalized per-layer
-    EV weights, then the Mahalanobis bundle via :func:`_build_whitened_factors`
-    (the whitener must cover the fit's layers).
+    Mahalanobis-share weights, then the Mahalanobis bundle via
+    :func:`_build_whitened_factors` (the whitener must cover the fit's layers).
+    The share is baked at fit under the same whitener the monitor requires, so
+    it is present for every probed layer; an absent share (CPU stub / partial
+    fit) falls back to uniform weighting via the floor.
     """
     if not manifold.layers:
         raise ValueError(f"manifold {manifold.name!r} carries no fitted layers")
@@ -1993,7 +1998,7 @@ def _attach_manifold_probe(
             f"manifold {manifold.name!r} carries no node coords / labels"
         )
     node_values_reduced: dict[int, torch.Tensor] = {}
-    ev_weights_raw: dict[int, float] = {}
+    share_weights_raw: dict[int, float] = {}
     coords = manifold.node_coords.to(torch.float32)
     clamped = manifold.domain.clamp_position(coords)
     embedded = manifold.domain.embed(clamped)  # (K, m)
@@ -2017,17 +2022,17 @@ def _attach_manifold_probe(
             v_centered = v_world - sub_f32.mean
             v_reduced = v_centered @ sub_f32.basis.T  # (K, R)
         node_values_reduced[layer_idx] = v_reduced.contiguous()
-        ev_weights_raw[layer_idx] = float(
-            manifold.explained_variance.get(layer_idx, 1.0)
+        share_weights_raw[layer_idx] = float(
+            manifold.mahalanobis_share.get(layer_idx, 0.0)
         )
-    total = sum(max(_MIN_EV_WEIGHT, w) for w in ev_weights_raw.values())
+    total = sum(max(_MIN_SHARE_WEIGHT, w) for w in share_weights_raw.values())
     if total <= 0.0:
-        n_layers = max(1, len(ev_weights_raw))
-        ev_weights = dict.fromkeys(ev_weights_raw, 1.0 / n_layers)
+        n_layers = max(1, len(share_weights_raw))
+        share_weights = dict.fromkeys(share_weights_raw, 1.0 / n_layers)
     else:
-        ev_weights = {
-            idx: max(_MIN_EV_WEIGHT, w) / total
-            for idx, w in ev_weights_raw.items()
+        share_weights = {
+            idx: max(_MIN_SHARE_WEIGHT, w) / total
+            for idx, w in share_weights_raw.items()
         }
     probe = AttachedManifoldProbe(
         name=name,
@@ -2036,7 +2041,7 @@ def _attach_manifold_probe(
         is_affine=_probe_is_affine_for_manifold(manifold),
         inject_neutral=NEUTRAL_LABEL not in manifold.node_labels,
         node_values_reduced=node_values_reduced,
-        ev_weights=ev_weights,
+        share_weights=share_weights,
     )
     probe.whitened = _build_whitened_factors(
         whitener, probe, factor_cache=factor_cache,
@@ -2091,10 +2096,10 @@ def _compute_assign_bandwidth(
     attach so the hot path is a single add.  ``R`` is the manifold's per-layer
     subspace rank (one number per probe — fits are rank-uniform across layers).
 
-    EV-weighted across layers (same weights as every other cross-layer read),
-    floored positive.  Returns ``(None, None)`` for a degenerate manifold (no
-    layers / single node), which leaves the assignment empty without disturbing
-    ``nearest``.
+    Share-weighted across layers (same weights as every other cross-layer
+    read), floored positive.  Returns ``(None, None)`` for a degenerate
+    manifold (no layers / single node), which leaves the assignment empty
+    without disturbing ``nearest``.
     """
     shared = list(probe.manifold.layers.keys())
     if not shared:
@@ -2102,7 +2107,7 @@ def _compute_assign_bandwidth(
     K = probe.node_values_reduced[shared[0]].shape[0]
     if K < 1:
         return None, None
-    ev = probe.ev_weights
+    sw = probe.share_weights
     acc: torch.Tensor | None = None
     wsum = 0.0
     for layer_idx in shared:
@@ -2141,12 +2146,12 @@ def _compute_assign_bandwidth(
             torch.cat([band, neutral_band.reshape(1)])
             if probe.inject_neutral else band
         )                                                    # (Kc,)
-        w = float(ev.get(layer_idx, 0.0))
+        w = float(sw.get(layer_idx, 0.0))
         acc = cand * w if acc is None else acc + cand * w
         wsum += w
     if acc is None:
         return None, None
-    if wsum > _MIN_EV_WEIGHT:
+    if wsum > _MIN_SHARE_WEIGHT:
         acc = acc / wsum
     # Floor positive so the softmax denominator never divides by ~0.
     med = float(acc.median().clamp(min=1e-6))

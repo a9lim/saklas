@@ -89,7 +89,7 @@ def _toy_manifold(
     coords = torch.tensor([[-1.0], [0.0], [1.0]])
 
     layers: dict[int, LayerSubspace] = {}
-    ev: dict[int, float] = {}
+    share: dict[int, float] = {}
     # Same orthonormal frame across layers so each layer's geometry is
     # easy to reason about (the fraction = 1.0 case lands on a single
     # well-known set of D-dim directions).
@@ -99,7 +99,7 @@ def _toy_manifold(
     e2[1] = 1.0
     for layer_idx in range(n_layers):
         # Centroids: well-separated in (e1, e2), per layer scaled so the
-        # 3 nodes don't degenerate.  Per-layer scaling makes the EV
+        # 3 nodes don't degenerate.  Per-layer scaling makes the share
         # weighting non-trivial.
         scale = 1.0 + 0.5 * layer_idx
         centroids = torch.stack([
@@ -119,14 +119,14 @@ def _toy_manifold(
             centroids, domain.embed(coords),
         )
         layers[layer_idx] = sub
-        ev[layer_idx] = ev_ratio
+        share[layer_idx] = ev_ratio
     return Manifold(
         name="toy",
         domain=domain,
         node_labels=["a", "b", "c"],
         node_coords=coords,
         layers=layers,
-        explained_variance=ev,
+        mahalanobis_share=share,
     )
 
 
@@ -147,8 +147,8 @@ def test_add_probe_registers_and_precaches():
     for layer_idx in m.layers:
         assert layer_idx in p.node_values_reduced
         assert p.node_values_reduced[layer_idx].shape[0] == len(m.node_labels)
-    # EV weights normalized to sum ≈ 1.
-    assert sum(p.ev_weights.values()) == pytest.approx(1.0, abs=1e-5)
+    # Share weights normalized to sum ≈ 1.
+    assert sum(p.share_weights.values()) == pytest.approx(1.0, abs=1e-5)
 
 
 def test_attached_layers_is_union():
@@ -453,17 +453,17 @@ def _curved_toy(dim: int = 8, seed: int = 0) -> "Manifold":
     e2 = torch.zeros(dim)
     e2[1] = 1.0
     layers: dict[int, LayerSubspace] = {}
-    ev: dict[int, float] = {}
+    share: dict[int, float] = {}
     for layer_idx in range(2):
         s = 1.0 + 0.5 * layer_idx
         centroids = s * (u.unsqueeze(1) * e1 + (u ** 2).unsqueeze(1) * e2)
         sub, ev_ratio = _fit_layer_subspace_with_ev(centroids, domain.embed(coords))
         layers[layer_idx] = sub
-        ev[layer_idx] = ev_ratio
+        share[layer_idx] = ev_ratio
     return Manifold(
         name="curve", domain=domain,
         node_labels=["a", "b", "c", "d", "e"],
-        node_coords=coords, layers=layers, explained_variance=ev,
+        node_coords=coords, layers=layers, mahalanobis_share=share,
     )
 
 
@@ -734,21 +734,21 @@ def _flat_manifold(
     rc = reduced_coords.to(torch.float32)
     K, R = rc.shape
     layers: dict[int, LayerSubspace] = {}
-    ev: dict[int, float] = {}
+    share: dict[int, float] = {}
     for layer_idx in range(n_layers):
         a = torch.randn(dim, R)
         q, _ = torch.linalg.qr(a)          # (D, R) orthonormal columns
         basis = q[:, :R].T.contiguous()    # (R, D) orthonormal rows
         mean = torch.randn(dim) * 0.1 + float(layer_idx + 1)
         layers[layer_idx] = LayerSubspace.affine(mean, basis, node_coords=rc)
-        ev[layer_idx] = 1.0 + 0.3 * layer_idx
+        share[layer_idx] = 1.0 + 0.3 * layer_idx
     return Manifold(
         name=name,
         domain=CustomDomain(R),
         node_labels=labels or [f"n{k}" for k in range(K)],
         node_coords=rc,
         layers=layers,
-        explained_variance=ev,
+        mahalanobis_share=share,
     )
 
 

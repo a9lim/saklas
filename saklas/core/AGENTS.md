@@ -155,8 +155,8 @@ role=node_role, model_type=)`), threading the folder's `node_kinds` /
 
 `--sae` reconstructs each centroid through the SAE before the fit (fail-fast
 `SaeCoverageError`); the fitted subspace is model-space regardless. Bakes
-`explained_variance`, `mahalanobis_share` (+ `share_metric`/`subspace_metric`),
-`origin`. **No lever.** Discover coords come from the **consensus Gram** —
+`mahalanobis_share` (+ `share_metric`/`subspace_metric`), `origin`. **No lever.**
+Discover coords come from the **consensus Gram** —
 `mean_L` of each layer's whitened, node-mean-centered `(K,K)` Gram
 `X̃_L Σ_L⁻¹ X̃_Lᵀ` (signal-weighted, layer-agnostic; no reference layer) — and the
 same per-layer Grams' traces are stamped into the sidecar as
@@ -230,8 +230,8 @@ real `node_coords = (centroids − neutral)·basisᵀ`); `orient_to` fixes the s
 independent) per-layer budget weight (`DEFAULT_N_COMPONENTS = 64`).
 
 `Manifold` — domain + per-layer `LayerSubspace`s + `node_labels`/`node_coords`/
-`node_roles`/`node_kinds` + the bakes `explained_variance`/`mahalanobis_share`/
-`origin` + `feature_space`/`metadata`. The `Profile` analogue. `node_kinds`
+`node_roles`/`node_kinds` + the bakes `mahalanobis_share`/`origin` +
+`feature_space`/`metadata`. The `Profile` analogue. `node_kinds`
 (abstract/concrete) is generation-only provenance — it selects the system template
 + elicitation role label at authoring time, but is NOT consumed at fit; it
 round-trips through the save/load sidecar. `manifold_point`, `tangent` (analytic
@@ -273,9 +273,9 @@ point projection.
 
 `save_manifold`/`load_manifold` round-trip the per-model tensor (`layer_<L>.{mean,
 basis[,node_params,rbf_weights,poly_coeffs,coord_offset,coord_scale]}` + shared
-`node_coords` + optional `origin`) + sidecar (`explained_variance_per_layer`,
-`mahalanobis_share_per_layer`, `origin_per_layer`, `share_metric`,
-`subspace_metric` — no `lever_per_layer`). `transfer_manifold` re-bakes share in
+`node_coords` + optional `origin`) + sidecar (`mahalanobis_share_per_layer`,
+`origin_per_layer`, `share_metric`, `subspace_metric` — no
+`explained_variance_per_layer`, no `lever_per_layer`). `transfer_manifold` re-bakes share in
 target space (no lever). Discover: `derive_pca_coords` (cumulative-variance
 prefix) / `derive_spectral_coords` (Laplacian eigenmaps, eigenvalue-ratio cliff)
 / `discover_coords` dispatcher, with `PcaDiagnostics`/`SpectralDiagnostics`;
@@ -430,7 +430,7 @@ From there:
 - a **flat** (affine) probe recovers `coords` through the affine reduced→domain
   map (`coord_S @ c + coord_b`); off-surface `residual` is identically `0`.
   **domain-frame**: each layer's reduced coord is in that layer's `‖δ_L‖` units,
-  mapped to the shared domain *before* EV-averaging (reference = each node's
+  mapped to the shared domain *before* share-averaging (reference = each node's
   whitened read-coord). At rank-1 this is the pole-normalized coordinate (`1.0` at
   the positive node); a 1-node fold (monopolar `extract`, ad-hoc `probe()`) is the
   K=1 ray (`coord_b = 0`). A 2-node concept axis *and* the rank-8 `personas` fan.
@@ -455,7 +455,7 @@ the *same* `_score_probe_full`, so the aggregate at a token index is bit-identic
 to the live read at that token. `add_probe(name, manifold, *, top_n)` /
 `remove_probe(name)` attach/detach any shape. The read shares
 `_build_whitened_factors` (per-layer `_LayerWhiten` build), `_attach_manifold_probe`
-(node cache + EV weights), and `_layer_geometry`. `__init__`'s `layer_means` is
+(node cache + per-layer Mahalanobis-share read weights), and `_layer_geometry`. `__init__`'s `layer_means` is
 vestigial on the hot path — the readout centers on each fit's own
 `LayerSubspace.mean`. `probe_layers` is the capture-widening union
 (`attached_layers` is a back-compat alias for the surfaces that consumed the former

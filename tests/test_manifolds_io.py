@@ -384,14 +384,13 @@ def test_manifold_sidecar_topology_provenance_round_trips(tmp_path: Path):
     domain = BoxDomain([BoxAxis("t", periodic=False, lo=0.0, hi=1.0)])
     coords = torch.tensor([[0.0], [0.5], [1.0]])
     embedded = domain.embed(coords)
-    layers, ev = {}, {}
+    layers = {}
     for layer in (4, 5):
-        sub, ev_ratio = fit_layer_subspace(torch.randn(3, 6, generator=g), embedded)
+        sub, _ev_ratio = fit_layer_subspace(torch.randn(3, 6, generator=g), embedded)
         layers[layer] = sub
-        ev[layer] = ev_ratio
     man = Manifold(
         name="autotopo", domain=domain, node_labels=["a", "b", "c"],
-        node_coords=coords, layers=layers, explained_variance=ev,
+        node_coords=coords, layers=layers,
         mahalanobis_share={4: 1.0, 5: 2.0},
     )
     candidates = [
@@ -1255,22 +1254,19 @@ def _fit_real_manifold(folder: Path, model_id: str, *, dim: int = 6, seed: int =
     coords = torch.tensor([[0.0], [0.5], [1.0]])
     embedded = domain.embed(coords)
     layers = {}
-    ev = {}
     for layer in (4, 5, 6):
         centroids = torch.randn(3, dim, generator=g)
-        sub, ev_ratio = fit_layer_subspace(centroids, embedded)
+        sub, _ev_ratio = fit_layer_subspace(centroids, embedded)
         layers[layer] = sub
-        ev[layer] = ev_ratio
     man = Manifold(
         name=folder.name,
         domain=domain,
         node_labels=["a", "b", "c"],
         node_coords=coords,
         layers=layers,
-        explained_variance=ev,
         # A per-model whitened share, so the transfer test can assert it
-        # is dropped (Σ is per-model; the source metric is invalid in
-        # target space).
+        # is re-baked in target space (Σ is per-model; the source metric is
+        # invalid in target space).
         mahalanobis_share={4: 1.0, 5: 2.0, 6: 3.0},
     )
     from saklas.io.paths import tensor_filename
@@ -1318,11 +1314,9 @@ def test_transfer_manifold_identity_alignment_preserves_geometry(
         assert torch.allclose(tgt_man.layers[L].basis, src_man.layers[L].basis, atol=1e-5)
     # The source's per-model Mahalanobis share is invalid in target space, so
     # it is RE-BAKED in the target metric (mandatory now — never dropped).
-    # EV — a fit-quality ratio — carries unchanged.
     assert src_man.mahalanobis_share  # source had one
     assert set(tgt_man.mahalanobis_share.keys()) == set(src_man.layers)
     assert tgt_man.mahalanobis_share != src_man.mahalanobis_share
-    assert tgt_man.explained_variance == src_man.explained_variance
     # Provenance lands in the sidecar.
     with open(out.with_suffix(".json")) as f:
         sc = json.load(f)

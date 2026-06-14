@@ -49,7 +49,7 @@ def _toy_manifold(*, dim: int = 8, n_layers: int = 2) -> Manifold:
     domain = BoxDomain([BoxAxis("u", periodic=False, lo=-1.0, hi=1.0)])
     coords = torch.tensor([[-1.0], [0.0], [1.0]])
     layers: dict[int, LayerSubspace] = {}
-    ev: dict[int, float] = {}
+    share: dict[int, float] = {}
     e1 = torch.zeros(dim)
     e1[0] = 1.0
     e2 = torch.zeros(dim)
@@ -65,14 +65,14 @@ def _toy_manifold(*, dim: int = 8, n_layers: int = 2) -> Manifold:
             centroids, domain.embed(coords),
         )
         layers[layer_idx] = sub
-        ev[layer_idx] = ev_ratio
+        share[layer_idx] = ev_ratio
     return Manifold(
         name="toy",
         domain=domain,
         node_labels=["a", "b", "c"],
         node_coords=coords,
         layers=layers,
-        explained_variance=ev,
+        mahalanobis_share=share,
     )
 
 

@@ -88,9 +88,9 @@ tensor's per-layer *magnitude* carries the layer's share (§3.7).
   subspace through RBF math).
 - **`Manifold`** — `name`, `domain` (a `ManifoldDomain`), `node_labels`,
   `node_coords` (K, n) shared authoring layout, `layers: dict[int,
-  LayerSubspace]`, plus calibration bakes `explained_variance`,
-  `mahalanobis_share`, `origin` (per-layer authoring-coord foot of the neutral
-  mean, curved only), `node_roles`, `feature_space`, and a free `metadata` dict.
+  LayerSubspace]`, plus the calibration bakes `mahalanobis_share`, `origin`
+  (per-layer authoring-coord foot of the neutral mean, curved only),
+  `node_roles`, `feature_space`, and a free `metadata` dict.
   The analogue of `Profile` for manifold steering. `manifold_point`, `tangent`,
   `resolve_position` (coord payload or node-label string), `nearest_node_{index,
   label,role}`.
@@ -351,13 +351,18 @@ The per-tensor bakes:
   one exception is a monopolar fit's `subspace_metric`, which labels its raw-δ̂ basis
   `euclidean` (a basis label, not a fallback). This is the per-layer budget weight at
   apply time. (Coords supply target *positions*; share supplies the *budget*.)
+  The unified `Monitor` **also** read-weights by it (normalized to sum 1, not
+  mean 1): combining each layer's geometry into one cross-layer reading, the layer
+  carrying the most steering budget is the most reliable to read from — so one
+  baked quantity drives both the steer side and the read side. (This replaced an
+  `explained_variance` read weight, which normalized away the per-layer signal
+  *magnitude* the pooling needs — and was identically 1.0 for every 2-node
+  concept, so it weighted the whole bipolar roster uniformly.)
 - **`origin`** (curved only) — `invert_parameterization` of the neutral mean onto
   the surface, per layer, in authoring coords. The cold-start foot seed for the
   per-token follower and the slide target of `!`. Flat subspaces store none (foot
   = span-coord 0; routing a flat subspace through `invert_parameterization` would
   also hit `rbf_params()` and raise).
-- **`explained_variance`** — recorded as a fit-quality diagnostic only; it does
-  not drive gain.
 
 For a vector, the activation-space magnitude lives in the real `node_coords`
 (`coord_+ − coord_− = ‖δ_L‖`), so a fixed slide fraction displaces proportionally
@@ -410,7 +415,7 @@ branches on it) and is computed for every K≥2 fit, authored included. It is th
 *full-space* sibling of the apply-time `mahalanobis_share` (§3.7), which is the
 same whitened spread restricted to the fitted steerable subspace; a layer where
 `tr(G_L)` is large but the share is small is one whose subspace is dropping concept
-signal (low explained variance).
+signal (the fitted subspace captures little of the between-node spread).
 
 The derived coords come out PCA-mean-centered and wrap in `CustomDomain(k)` with
 identity embedding, then proceed through `fit_affine_subspace` (pca) or

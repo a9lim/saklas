@@ -1535,15 +1535,6 @@ class Manifold:
     # standard-assistant space (swap-back) regardless — so it is carried for
     # provenance / regeneration, not consumed by ``compute_node_centroid``.
     node_kinds: list[str | None] = field(default_factory=list)
-    # Per-layer PCA explained-variance ratio recorded at fit time.
-    # ``explained_variance[L] = Σ σ²[:R] / Σ σ² (all)`` where ``R`` is
-    # the retained subspace rank — a per-layer fit-quality signal used
-    # by additive-mode manifold steering to normalize per-α behavioral
-    # magnitude across manifolds of varying quality.  Empty dict on
-    # pre-v4 manifolds (no EV recorded at fit time) — the additive
-    # normalization falls back to "no quality correction" so legacy
-    # fits keep their pre-v4 behavior.
-    explained_variance: dict[int, float] = field(default_factory=dict)
     # Per-layer Mahalanobis share weight recorded at fit time when a
     # whitener was available — ``share_L = ‖Bᵀ coords_k‖_M`` summed over
     # nodes, the subspace-restricted analogue of vector steering's
@@ -1552,8 +1543,13 @@ class Manifold:
     # uses it in place of the Euclidean centroid-spread; an empty dict
     # (no whitener at fit time, e.g. CPU test stubs, or partial layer
     # coverage) falls back to the Euclidean ``‖coords‖_F`` weighting.
-    # These are raw per-layer scalars — the apply-time normalization to
-    # ``Σ_L share_L = 1`` lives in ``_manifold_layer_shares``.
+    # These are raw per-layer scalars with two normalized consumers: the
+    # apply-time **steer** weight (normalized to mean 1, ``Σ_L share_L =
+    # n_layers``) in ``_manifold_layer_shares``, and the **read** weight
+    # (normalized to sum 1) the unified ``Monitor`` uses to combine each
+    # layer's geometry into one cross-layer reading — the layer carrying
+    # the most steering budget is also the most reliable to read from, so
+    # one quantity drives both sides.
     mahalanobis_share: dict[int, float] = field(default_factory=dict)
     # Origin ``O_L`` — the **per-layer** foot of the neutral mean on ``M``, in
     # authoring coordinates ``(n,)``, keyed by layer.  Always a point *on* the
@@ -1590,7 +1586,6 @@ class Manifold:
             metadata=dict(self.metadata),
             node_roles=list(self.node_roles),
             node_kinds=list(self.node_kinds),
-            explained_variance=dict(self.explained_variance),
             mahalanobis_share=dict(self.mahalanobis_share),
             origin={
                 L: o.to(device=device, dtype=dtype)
@@ -3996,15 +3991,6 @@ def save_manifold(
         "node_count": len(manifold.node_labels),
         "feature_space": manifold.feature_space,
     }
-    # Per-layer explained-variance ratio (v4+).  Stored as
-    # ``{str(idx): float}`` for JSON compatibility; loaded back into
-    # an ``int``-keyed dict.  Older fits without EV simply skip the
-    # field and load with an empty dict downstream.
-    if manifold.explained_variance:
-        sidecar["explained_variance_per_layer"] = {
-            str(idx): float(v)
-            for idx, v in manifold.explained_variance.items()
-        }
     # Per-layer Mahalanobis share weight (whitened bake-score analogue).
     # Stored as ``{str(idx): float}`` like EV; absent when no whitener was
     # available at fit time, in which case the apply-time share weighting
@@ -4140,11 +4126,6 @@ def load_manifold(path: str | Path) -> Manifold:
     if node_coords is None:
         node_coords = torch.zeros(0, domain.intrinsic_dim)
 
-    ev_raw = sidecar.get("explained_variance_per_layer") or {}
-    explained_variance: dict[int, float] = {
-        int(k): float(v) for k, v in ev_raw.items()
-    }
-
     maha_raw = sidecar.get("mahalanobis_share_per_layer") or {}
     mahalanobis_share: dict[int, float] = {
         int(k): float(v) for k, v in maha_raw.items()
@@ -4172,7 +4153,6 @@ def load_manifold(path: str | Path) -> Manifold:
         # ``node_kinds`` is absent on manifolds authored without the
         # abstract/concrete distinction; the loaded list stays empty then.
         node_kinds=list(sidecar.get("node_kinds", [])),
-        explained_variance=explained_variance,
         mahalanobis_share=mahalanobis_share,
         origin=origin,
     )

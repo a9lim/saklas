@@ -168,14 +168,12 @@ def _sanitize_hyperparams(
 # v3 is the arbitrary-dimensional / arbitrary-topology format (domain
 # spec + per-node coordinates); v2 and earlier were the 1-D cyclic-spline
 # format and must be converted with ``scripts/upgrade_manifolds.py``.
-# v4 adds the per-layer ``explained_variance_per_layer`` sidecar field
-# used by additive-mode manifold steering's quality normalization — the
-# field rides on optional sidecar metadata, so a v3 manifold loads at
-# v4 fine *except* that we want users to refit so the EV value is
-# populated and the normalizer can kick in.  Bumping the version forces
-# materialize_bundled_manifolds to refresh the bundled fit on next
-# session start; user-fit v3 manifolds will need ``saklas manifold fit``
-# to pick up the new field.
+# v4 added a per-layer ``explained_variance_per_layer`` sidecar field
+# (a fit-quality ratio).  It is no longer read — cross-layer read
+# weighting now rides the Mahalanobis ``share`` (the same per-layer
+# budget that drives steering), so EV is neither baked nor loaded.  An
+# old sidecar that still carries the key loads fine (it's ignored); a
+# refit simply drops it.
 # v5 adds the per-layer ``origin_per_layer`` sidecar field (the per-layer
 # authoring-coordinate foot of the neutral mean, ``{str(L): [coord, ...]}``,
 # the cold-start foot seed).  Loading stays back-compatible — an absent
@@ -2522,7 +2520,6 @@ def transfer_manifold(
     # ``(D_tgt, D_src)`` so ``mean_tgt = M_L @ mean_src`` and each basis
     # row transforms the same way → ``basis_tgt = basis_src @ M_L^T``.
     new_layers: dict[int, LayerSubspace] = {}
-    new_ev: dict[int, float] = {}
     for layer, sub in src.layers.items():
         M_L = alignment.get(layer)
         if M_L is None:
@@ -2533,8 +2530,6 @@ def transfer_manifold(
         mean_tgt = (M @ mean_f).to(dtype=sub.mean.dtype)
         basis_tgt = (basis_f @ M.transpose(0, 1)).to(dtype=sub.basis.dtype)
         new_layers[layer] = _dc_replace(sub, mean=mean_tgt, basis=basis_tgt)
-        if layer in src.explained_variance:
-            new_ev[layer] = src.explained_variance[layer]
 
     if not new_layers:
         raise ManifoldFormatError(
@@ -2548,8 +2543,7 @@ def transfer_manifold(
     # ``to_model`` space.  The **target** whitener is mandatory and must
     # cover every transferred layer (all-or-nothing, mirroring the fit
     # gate); recompute the share in target space.  No Euclidean rebake — a
-    # missing / partial whitener is an error.  (EV is a fit-quality ratio,
-    # not a per-model metric, so it carries either way.)
+    # missing / partial whitener is an error.
     from saklas.core.mahalanobis import WhitenerError
 
     if whitener is None or not whitener.covers_all(new_layers.keys()):
@@ -2585,7 +2579,7 @@ def transfer_manifold(
         )
 
     transferred = _dc_replace(
-        src, layers=new_layers, explained_variance=new_ev,
+        src, layers=new_layers,
         mahalanobis_share=new_share,
         # ``origin`` is the per-layer foot of the *source* model's neutral
         # mean — a per-model quantity invalid in target space (same reason the

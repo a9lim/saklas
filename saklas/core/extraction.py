@@ -688,7 +688,6 @@ class ManifoldExtractionPipeline:
             f"Fitting RBF interpolant across {len(fit_layers)} layers..."
         )
         layer_subs = {}
-        explained_variance: dict[int, float] = {}
         mahalanobis_share: dict[int, float] = {}
         # Per-layer penalized-RBF provenance (curved + ``smoothing`` only):
         # ``{layer: {"lambda", "edf", "gcv"}}`` from the GCV select, for the
@@ -742,14 +741,13 @@ class ManifoldExtractionPipeline:
             raw_fits: dict[int, tuple[Any, torch.Tensor]] = {}
             for idx in fit_layers:
                 stacked = stacks[idx]
-                sub, mu_coords, ev_ratio = fit_affine_subspace(
+                sub, mu_coords, _ev_ratio = fit_affine_subspace(
                     stacked, neutral_mean=_neutral_for(idx),
                     whitener=maha_whitener, layer=idx,
                     whitened_gram=layer_grams[idx],
                     orient_to=0, **affine_kwargs,
                 )
                 raw_fits[idx] = (sub, mu_coords)
-                explained_variance[idx] = ev_ratio
             # Per-axis DLS straddle over all fit layers at once (flat → DLS;
             # the global all-fail fallback matches the folded-vector path).
             dls_kept = compute_dls_axes(
@@ -775,7 +773,7 @@ class ManifoldExtractionPipeline:
                 # ``neutral_mean`` neutral-anchors the frame; ``maha_whitener``
                 # (mandatory, checked above) selects the whitened/Fisher basis.
                 _rbf_info: dict[str, float] = {}
-                sub, ev_ratio = fit_layer_subspace(
+                sub, _ev_ratio = fit_layer_subspace(
                     stacked, node_params,
                     whitener=maha_whitener, layer=idx,
                     neutral_mean=_neutral_for(idx),
@@ -785,7 +783,6 @@ class ManifoldExtractionPipeline:
                     **fit_kwargs,
                 )
                 layer_subs[idx] = sub
-                explained_variance[idx] = ev_ratio
                 if _rbf_info:
                     rbf_smoothing_per_layer[idx] = _rbf_info
                 # μ-centered share (NOT ``eval_rbf(node_params)`` — the surface
@@ -900,7 +897,6 @@ class ManifoldExtractionPipeline:
             feature_space=feature_space,
             node_roles=list(node_roles),
             node_kinds=list(node_kinds),
-            explained_variance=explained_variance,
             mahalanobis_share=mahalanobis_share,
             origin=origin,
         )

@@ -54,12 +54,14 @@
     try {
       const g = await apiProbes.geometry(name);
       geom = g;
-      // default to the highest explained-variance layer
+      // default to the highest-share layer (the one carrying the most
+      // steering budget — also the most concept-bearing to read from)
       let best: number | null = null;
-      let bestEv = -Infinity;
+      let bestShare = -Infinity;
       for (const l of Object.values(g.layers)) {
-        if (l.explained_variance > bestEv) {
-          bestEv = l.explained_variance;
+        const sh = Math.abs(l.mahalanobis_share);
+        if (sh > bestShare) {
+          bestShare = sh;
           best = l.layer;
         }
       }
@@ -231,7 +233,7 @@
           value={selectedLayer ?? layerList[0].layer}
           options={layerList.map((l) => ({
             value: l.layer,
-            label: `L${l.layer} · ev ${l.explained_variance.toFixed(2)}`,
+            label: `L${l.layer} · sh ${l.mahalanobis_share.toFixed(2)}`,
           }))}
           onchange={(v) => (selectedLayer = v)}
           ariaLabel="Layer"
