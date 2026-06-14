@@ -406,13 +406,17 @@
     const info = probeRack.entries.get(name)?.info;
     const dim = info?.intrinsic_dim ?? 0;
     const flat = info?.is_affine ?? true;
+    // Labels strip the namespace prefix (``default/emotions`` → ``emotions``)
+    // to match the probe cards; the option value keeps the full registered
+    // name so lookups stay unambiguous.
+    const display = name.split("/").pop() ?? name;
     if (flat && dim > 1) {
       return Array.from({ length: dim }, (_, i) => ({
         value: i === 0 ? name : `${name}[${i}]`,
-        label: `${name}[${i}]`,
+        label: `${display}[${i}]`,
       }));
     }
-    return [{ value: name, label: name }];
+    return [{ value: name, label: display }];
   }
 
   /** Highlight-target picker options: "(off)" + surprise sentinel + live
