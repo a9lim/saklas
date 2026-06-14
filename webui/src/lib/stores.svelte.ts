@@ -55,10 +55,6 @@ import { SURPRISE_TARGET, HIGHLIGHT_SAT, nodeCoordExtent } from "./tokens";
 import { pushToast } from "./stores/toasts.svelte";
 
 export * from "./stores/drawers.svelte";
-// Explicit binding too — ``export *`` re-exports it for consumers but does
-// not bring it into this module's local scope, and ``buildSamplingPayload``
-// reads it to gate the probe-inspector subspace-coords flag.
-import { drawerState } from "./stores/drawers.svelte";
 export * from "./stores/inputHistory.svelte";
 import {
   onPendingQueueShift,
@@ -1706,9 +1702,12 @@ function buildSamplingPayload(): WSSampling | null {
   const payload: WSSampling = {
     persist_per_layer_scores: true,
     // The probe-inspector live point + fading trail need per-layer whitened
-    // subspace coords on each token reading.  Opt in only while that inspector
-    // is open so the default generate stays on the cheaper reading shape.
-    ...(drawerState.open === "probe_inspector"
+    // subspace coords on each token reading.  Sent whenever a probe is attached
+    // so the trajectory is always captured — opening the inspector after any
+    // generation shows the run's path with no prior opt-in.  (The Python
+    // SamplingConfig default stays off, so non-webui callers and the throughput
+    // benchmark are unaffected.)
+    ...(probeRack.active.length > 0
       ? { persist_subspace_coords: true }
       : {}),
     ...nonDefaultSamplingOverrides(),
