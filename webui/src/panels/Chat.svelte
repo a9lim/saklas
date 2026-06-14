@@ -66,6 +66,7 @@
     formatScoreTooltip,
     surpriseScore,
     SURPRISE_TARGET,
+    probeScoreForTarget,
   } from "../lib/tokens";
   import Select from "../lib/Select.svelte";
   import Checkbox from "../lib/Checkbox.svelte";
@@ -394,21 +395,42 @@
     toggleCompareTwo();
   }
 
+  /** Highlight options for one probe.  A rank-1 flat probe (a 2-node concept
+   *  axis) and every curved probe stay a single bare-name option — the bare
+   *  channel is the pole coordinate / subspace fraction.  A multi-axis flat
+   *  probe (the ``personas`` fan, a flat ``emotions``) fans out into one
+   *  option per coordinate so a token can be tinted by each PC; axis 0 keeps
+   *  the bare-name value (the channel that survives reload) while axis ``i``
+   *  uses the ``name[i]`` form that lines up with the ``@when:name[i]`` gate. */
+  function axisOptionsFor(name: string): { value: string; label: string }[] {
+    const info = probeRack.entries.get(name)?.info;
+    const dim = info?.intrinsic_dim ?? 0;
+    const flat = info?.is_affine ?? true;
+    if (flat && dim > 1) {
+      return Array.from({ length: dim }, (_, i) => ({
+        value: i === 0 ? name : `${name}[${i}]`,
+        label: `${name}[${i}]`,
+      }));
+    }
+    return [{ value: name, label: name }];
+  }
+
   /** Highlight-target picker options: "(off)" + surprise sentinel + live
-   *  probe names. */
+   *  probe names, fanned out per coordinate axis for multi-axis probes. */
   const highlightOptions = $derived.by<{ value: string; label: string }[]>(
     () => {
       const opts: { value: string; label: string }[] = [
         { value: "", label: "(off)" },
         { value: SURPRISE_TARGET, label: "surprise (logprob)" },
       ];
-      for (const name of probeNames) opts.push({ value: name, label: name });
+      for (const name of probeNames) opts.push(...axisOptionsFor(name));
       return opts;
     },
   );
 
-  /** Compare-target picker — same shape but filtered so the A and B
-   *  targets don't pick the same probe. */
+  /** Compare-target picker — same shape but filtered so the A and B targets
+   *  don't pick the same axis.  Distinct axes of one probe (PC0 vs PC1) are
+   *  allowed — that's a useful two-stripe compare. */
   const compareOptions = $derived.by<{ value: string; label: string }[]>(() => {
     const opts: { value: string; label: string }[] = [
       { value: "", label: "(off)" },
@@ -417,8 +439,8 @@
       opts.push({ value: SURPRISE_TARGET, label: "surprise (logprob)" });
     }
     for (const name of probeNames) {
-      if (name !== highlightState.target) {
-        opts.push({ value: name, label: name });
+      for (const opt of axisOptionsFor(name)) {
+        if (opt.value !== highlightState.target) opts.push(opt);
       }
     }
     return opts;
@@ -683,7 +705,10 @@
   function pickScore(t: TokenScore, target: string | null): number | undefined {
     if (!target) return undefined;
     if (target === SURPRISE_TARGET) return surpriseScore(t.logprob);
-    if (t.probes && target in t.probes) return t.probes[target];
+    // Probe / per-axis lookup: the live per-PC coords first, then the
+    // axis-0 ``probes`` row (the channel ``done`` + reload restore).
+    const direct = probeScoreForTarget(t, target);
+    if (direct !== undefined) return direct;
     const latest = latestLayerScores(t);
     if (latest && target in latest) return latest[target];
     return t.score;
@@ -751,6 +776,17 @@
       : `${lp}, chosen not in top-${alts.length}`;
   }
 
+  /** A dedicated tooltip line for an axis highlight target (``personas[3]``)
+   *  whose value isn't already in the bare-name ``probes`` row.  Returns null
+   *  for axis 0 / a plain probe (already shown) or when no value is known. */
+  function axisTooltipLine(t: TokenScore, target: string | null): string | null {
+    if (!target || target === SURPRISE_TARGET) return null;
+    if (t.probes && target in t.probes) return null;
+    const v = probeScoreForTarget(t, target);
+    if (v === undefined) return null;
+    return `${target} ${v >= 0 ? "+" : ""}${v.toFixed(3)}`;
+  }
+
   function tooltipFor(t: TokenScore): string {
     // Logit-pass: surprise mode owns the tooltip when active so the
     // surprise number is what hovers on the inline tint.
@@ -769,7 +805,19 @@
       const sup = surpriseTooltip(t);
       return probeTip ? `${probeTip}\n${sup}` : sup;
     }
-    if (t.probes) return formatScoreTooltip(t.probes);
+    if (t.probes) {
+      // Lead with the selected axis target(s) so a per-PC tint reports its
+      // own value, then the full axis-0 probe row underneath.
+      const extra: string[] = [];
+      const la = axisTooltipLine(t, highlightState.target);
+      if (la) extra.push(la);
+      if (highlightState.compareTwo) {
+        const lb = axisTooltipLine(t, highlightState.compareTarget);
+        if (lb) extra.push(lb);
+      }
+      const base = formatScoreTooltip(t.probes);
+      return extra.length ? `${extra.join("\n")}\n${base}` : base;
+    }
     const latest = latestLayerScores(t);
     if (latest) return formatScoreTooltip(latest);
     if (t.score !== undefined && highlightState.target) {

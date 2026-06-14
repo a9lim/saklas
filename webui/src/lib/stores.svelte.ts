@@ -51,7 +51,12 @@ import type {
   WSSampling,
 } from "./types";
 import { serializeExpression } from "./expression";
-import { SURPRISE_TARGET, HIGHLIGHT_SAT, nodeCoordExtent } from "./tokens";
+import {
+  SURPRISE_TARGET,
+  HIGHLIGHT_SAT,
+  nodeCoordExtent,
+  parseProbeTarget,
+} from "./tokens";
 import { pushToast } from "./stores/toasts.svelte";
 
 export * from "./stores/drawers.svelte";
@@ -686,10 +691,13 @@ export function probeAxisScale(name: string, axis = 0): number {
 
 /** Saturation scale for a highlight target.  The surprise sentinel keeps the
  *  fixed ``HIGHLIGHT_SAT`` cutoff (``surpriseScore`` is pre-scaled to it); a
- *  real probe normalizes by its node extent. */
-export function highlightScale(target: string | null, axis = 0): number {
+ *  real probe normalizes by its per-axis node extent — an axis target
+ *  (``personas[3]``) scales by that PC's own coordinate extent, so a tight
+ *  axis isn't pinned saturated by a wider sibling axis. */
+export function highlightScale(target: string | null): number {
   if (!target || target === SURPRISE_TARGET) return HIGHLIGHT_SAT;
-  return probeAxisScale(target, axis);
+  const { base, axis } = parseProbeTarget(target);
+  return probeAxisScale(base, axis);
 }
 
 /** Computed: probe names sorted per the chosen sort mode.  Fresh array each
@@ -2152,6 +2160,19 @@ function handleWsMessage(msg: WSServerMessage): void {
       if (msg.scores && highlightState.target) {
         const s = msg.scores[highlightState.target];
         if (typeof s === "number") tokenScore.score = s;
+      }
+      // Per-PC token highlighting: stash the full per-axis domain coords off
+      // the rich ``probe_readings`` channel so axis targets (``personas[3]``)
+      // can tint live.  Only multi-axis probes need it — axis 0 already rides
+      // ``msg.scores`` — and the row keeps it through ``done`` (the per-token
+      // settle pass is axis-0 only and never clobbers this field).
+      if (msg.probe_readings) {
+        const byProbe: Record<string, number[]> = {};
+        for (const [pname, r] of Object.entries(msg.probe_readings)) {
+          const coords = (r as ProbeReadingJSON).coords;
+          if (Array.isArray(coords) && coords.length > 1) byProbe[pname] = coords;
+        }
+        if (Object.keys(byProbe).length > 0) tokenScore.coordsByProbe = byProbe;
       }
       const turn = _currentWriteTurn();
       if (turn) {

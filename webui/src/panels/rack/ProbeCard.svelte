@@ -24,7 +24,7 @@
   import Bar from "../../lib/charts/Bar.svelte";
   import Sparkline from "../../lib/charts/Sparkline.svelte";
   import HeatmapCell from "../../lib/charts/HeatmapCell.svelte";
-  import { nodeCoordExtent } from "../../lib/tokens";
+  import { nodeCoordExtent, parseProbeTarget } from "../../lib/tokens";
   import ManifoldMiniMap from "../manifold/ManifoldMiniMap.svelte";
   import {
     detachProbe,
@@ -82,7 +82,12 @@
   const showPoles = $derived(affine && nDim === 1 && info.node_count <= 2);
 
   const sparkline = $derived(entry.sparkline ?? []);
-  const isHighlight = $derived(highlightState.target === name);
+  // Lit when this probe is the highlight target on any of its axes — a
+  // per-PC target (``personas[3]``) still belongs to the ``personas`` card.
+  const isHighlight = $derived(
+    highlightState.target !== null &&
+      parseProbeTarget(highlightState.target).base === name,
+  );
 
   /** Highlight-select glyph — family marker (●/◆) filled when this probe is
    *  the highlight target, hollow (○/◇) when not. */

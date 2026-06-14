@@ -21,6 +21,39 @@ export const HIGHLIGHT_SAT = 0.5;
  *  ``Chat.svelte`` and any future TUI parity pass. */
 export const SURPRISE_TARGET = "__surprise__";
 
+/** Split a highlight target into its base probe name and coordinate axis.
+ *  ``"personas[3]"`` → ``{base: "personas", axis: 3}``; a bare name → axis 0.
+ *  Mirrors the ``<probe>[<i>]`` gate-channel grammar ``Monitor.flat_scalars``
+ *  emits, so a per-axis highlight target lines up with the steering gate that
+ *  reads the same coordinate. */
+export function parseProbeTarget(target: string): { base: string; axis: number } {
+  const m = /^(.+)\[(\d+)\]$/.exec(target);
+  if (m) return { base: m[1], axis: Number(m[2]) };
+  return { base: target, axis: 0 };
+}
+
+/** Look up a token's score for a (possibly axis-indexed) probe target.
+ *
+ *  Axis ``i`` reads the live per-token domain coordinates captured under
+ *  ``coordsByProbe`` (the full rank-R reading off the ``probe_readings`` wire
+ *  channel); axis 0 falls back to the collapsed ``probes`` row, which is the
+ *  channel the end-of-gen ``per_token_probes`` pass and a tree reload restore.
+ *  Returns ``undefined`` when neither source carries the target, so the caller
+ *  can fall through to its own default (transparent tint). */
+export function probeScoreForTarget(
+  t: {
+    probes?: Record<string, number>;
+    coordsByProbe?: Record<string, number[]>;
+  },
+  target: string,
+): number | undefined {
+  const { base, axis } = parseProbeTarget(target);
+  const coords = t.coordsByProbe?.[base];
+  if (coords && axis < coords.length) return coords[axis];
+  if (t.probes && target in t.probes) return t.probes[target];
+  return undefined;
+}
+
 /** Map a chosen-token logprob to a positive-scale score suitable for
  *  ``scoreToRgb``.
  *

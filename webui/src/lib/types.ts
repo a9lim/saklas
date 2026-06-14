@@ -1210,6 +1210,14 @@ export interface TokenScore {
   score?: number;
   /** Full per-probe scores once available. */
   probes?: Record<string, number>;
+  /** Full per-axis domain-frame coordinates per probe, captured live from the
+   *  ``probe_readings`` wire channel.  Backs per-PC token highlighting (the
+   *  ``personas[3]`` axis targets) — axis 0 already lives in ``probes``, so
+   *  this is populated only for multi-axis (rank-R) probes.  The end-of-gen
+   *  ``per_token_probes`` pass is axis-0 only, so it survives ``done`` and
+   *  in-session navigation (held by reference in ``tokenScoreCache``) but is
+   *  absent after a transcript / localStorage reload. */
+  coordsByProbe?: Record<string, number[]>;
   /** Token-id from the WS event when available — useful for debugging. */
   tokenId?: number | null;
   /** Per-layer × per-probe heatmap data captured during streaming.

@@ -26,7 +26,12 @@
     highlightScale,
   } from "../lib/stores.svelte";
   import type { ChatTurn, TokenScore } from "../lib/types";
-  import { scoreToRgb, surpriseScore, SURPRISE_TARGET } from "../lib/tokens";
+  import {
+    scoreToRgb,
+    surpriseScore,
+    SURPRISE_TARGET,
+    probeScoreForTarget,
+  } from "../lib/tokens";
 
   // ---------- buffer text ----------
 
@@ -255,8 +260,8 @@
     const target = highlightState.target;
     if (!target) return undefined;
     if (target === SURPRISE_TARGET) return surpriseScore(t.logprob);
-    if (t.probes && target in t.probes) return t.probes[target];
-    return t.score;
+    const s = probeScoreForTarget(t, target);
+    return s !== undefined ? s : t.score;
   }
 
   function tintStyle(t: TokenScore): string {
