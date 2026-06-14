@@ -7,11 +7,12 @@
   //
   //   statline : ●/○ (flat) or ◆/◇ (curved) highlight-select · name
   //              · sparkline · ✕ detach
-  //   body     : the reading row —
-  //                bipolar bar + poles   (is_affine && node_count===2), or
-  //                scalar/fraction bar + nearest   (everything else)
-  //              then the curved-only settled coords/residual meta, the
-  //              per-layer heatmap strip, and a 2-D box-domain mini-map.
+  //   body     : the subspaceness row (white 0→1 bar segmented into
+  //                intrinsic-dim notches · nearest node · fraction), then
+  //                one signed bar per coordinate axis (poles on a rank-1
+  //                concept axis, "c0…cR-1" labels otherwise), then the
+  //                curved-only residual meta, the per-layer heatmap strip,
+  //                and a 2-D box-domain mini-map.
   //
   // Family is signalled by accent (--accent flat / --accent-purple curved)
   // and glyph.  The identity cluster toggles the transcript highlight for
@@ -45,22 +46,41 @@
   const info = $derived(entry.info);
   /** Flat (affine) ⇒ subspace family; curved ⇒ manifold family. */
   const affine = $derived(info.is_affine);
-  /** A bipolar 2-node concept axis — the one shape with a signed,
-   *  pole-anchored reading.  Every higher-rank flat fan and every curved
-   *  fit renders the scalar/fraction row instead. */
-  const bipolar = $derived(affine && info.node_count === 2);
 
   const accent = $derived(affine ? "--accent" : "--accent-purple");
 
-  /** Saturation scale for the bar + layer cells.  A flat probe reads a
-   *  signed domain-frame ``coords[0]`` whose units are the fit's own node
-   *  layout (a fan runs to ±tens), so we normalize by the axis-0 node
-   *  extent — "full = as far along as the most extreme node".  A curved
-   *  probe reads a ``[0,1]`` fraction, already unit-normalized, so it
-   *  stays on the fixed unit scale. */
+  /** Saturation scale for the per-layer heatmap strip + token tint — the
+   *  axis-0 node extent for a flat probe ("full = as far along as the most
+   *  extreme node"), the fixed unit scale for a curved probe's [0,1]
+   *  fraction. */
   const axisScale = $derived(affine ? nodeCoordExtent(info.node_coords, 0) : 1);
 
-  const current = $derived(entry.current ?? 0);
+  // ---------- latest reading: live during gen, settled (aggregate) after ----------
+  const latest = $derived(entry.aggregate ?? entry.reading);
+  /** Subspaceness — share of the centered activation living in this probe's
+   *  subspace, [0,1].  Backs the white top-row bar. */
+  const fraction = $derived(latest?.fraction ?? 0);
+  /** Domain-frame coordinates, one per intrinsic dimension — each gets its
+   *  own signed bar below the subspaceness row. */
+  const coordVec = $derived(latest?.coords ?? []);
+  /** Coordinate-bar count — the intrinsic dim, falling back to the live
+   *  coord-vector length for a row reporting 0. */
+  const nDim = $derived(
+    info.intrinsic_dim > 0 ? info.intrinsic_dim : coordVec.length,
+  );
+  /** One {axis index, value, per-axis node extent} per coordinate bar. */
+  const axes = $derived(
+    Array.from({ length: nDim }, (_, i) => ({
+      i,
+      value: coordVec[i] ?? 0,
+      scale: nodeCoordExtent(info.node_coords, i),
+    })),
+  );
+  /** Pole labels (neg ◄─► pos) instead of a "c0" axis label — only a rank-1
+   *  affine concept axis (2-node bipolar / 1-node monopolar) has poles;
+   *  every higher-rank fan and curved fit labels its axes c0…cR-1. */
+  const showPoles = $derived(affine && nDim === 1 && info.node_count <= 2);
+
   const sparkline = $derived(entry.sparkline ?? []);
   const isHighlight = $derived(highlightState.target === name);
 
@@ -85,7 +105,6 @@
 
   // ---------- curved settled meta (end-of-gen aggregate) ----------
   const aggregate = $derived(entry.aggregate ?? null);
-  const coords = $derived(aggregate?.coords ?? []);
   const residual = $derived(aggregate?.residual ?? null);
   const trajectory = $derived(entry.trajectory ?? []);
 
@@ -219,70 +238,68 @@
   {/snippet}
 
   {#snippet body()}
-    {#if bipolar}
-      <!-- Bipolar reading row: neg pole · signed bar · pos pole · value. -->
-      <div class="reading reading-bipolar">
-        <span class="pole neg" aria-hidden={monopolar}>
-          {#if !monopolar}{poles.negative}{/if}
-        </span>
-        <div class="bar-cell" aria-hidden="true">
-          <Bar value={current} max={axisScale} width={160} height={8} bipolar />
-        </div>
-        <span class="pole pos" title={`positive pole (${poles.positive})`}>
-          {poles.positive}
-        </span>
-        <span class="value" class:pos={current > 0} class:neg={current < 0}>
-          {current >= 0 ? "+" : ""}{current.toFixed(2)}
-        </span>
+    <!-- Subspaceness row: white 0→1 bar · nearest node · fraction.  "How
+         much of the centered activation lives in this probe's subspace" —
+         the scale runs higher for higher-rank fits, which is expected. -->
+    <div class="reading reading-subspace">
+      <span
+        class="row-label"
+        title="subspaceness — share of the centered activation living in this probe's subspace (0–1)"
+      >subspace</span>
+      <div class="bar-cell" aria-hidden="true">
+        <Bar value={fraction} max={1} width={160} height={8} color="var(--fg)" />
       </div>
-    {:else}
-      <!-- Scalar / fraction row — same 4-column grid as the bipolar row so
-           the bar sits in the identical inset slot and reads center-zero.
-           Column 1 (the neg-pole slot) is an empty spacer; the nearest node
-           takes the pos-pole slot.  A higher-rank flat fan reads the signed
-           axis-0 magnitude (centered, sign-coloured like a bipolar axis); a
-           curved fit reads the [0,1] subspace fraction (fills rightward). -->
-      <div class="reading reading-scalar">
-        <span class="pole neg" aria-hidden="true"></span>
-        <div class="bar-cell" aria-hidden="true">
-          <Bar value={current} max={axisScale} width={160} height={8} bipolar />
-        </div>
-        <span
-          class="nearest"
-          title={topNearest
-            ? `nearest node: ${nearestLabel} (distance ${fmtDistance(nearestDistance)})`
-            : "awaiting first token"}
-        >
-          {#if topNearest}
-            <span class="nearest-label">{nearestLabel}</span>
-            <span class="nearest-dist">d={fmtDistance(nearestDistance)}</span>
-          {:else}
-            <span class="nearest-empty">—</span>
-          {/if}
-        </span>
-        <span
-          class="value"
-          class:pos={affine && current > 0}
-          class:neg={affine && current < 0}
-        >
-          {#if affine}{current >= 0 ? "+" : ""}{current.toFixed(2)}{:else}{fmtFraction(current)}{/if}
-        </span>
-      </div>
-    {/if}
+      <span
+        class="nearest"
+        title={topNearest
+          ? `nearest node: ${nearestLabel} (distance ${fmtDistance(nearestDistance)})`
+          : "awaiting first token"}
+      >
+        {#if topNearest}
+          <span class="nearest-label">{nearestLabel}</span>
+          <span class="nearest-dist">d={fmtDistance(nearestDistance)}</span>
+        {:else}
+          <span class="nearest-empty">—</span>
+        {/if}
+      </span>
+      <span class="value">{fmtFraction(fraction)}</span>
+    </div>
 
-    {#if !affine && (coords.length > 0 || residual !== null)}
-      <!-- Curved-only settled meta: where the trajectory came to rest. -->
+    <!-- One signed bar per coordinate axis.  A rank-1 concept axis carries
+         pole labels (neg ◄─► pos); higher-rank fans and curved fits label
+         axes c0…cR-1.  Each bar normalizes by its own node extent. -->
+    {#each axes as ax (ax.i)}
+      <div class="reading reading-coord">
+        {#if showPoles}
+          <span class="pole neg" aria-hidden={monopolar}>
+            {#if !monopolar}{poles.negative}{/if}
+          </span>
+        {:else}
+          <span class="row-label axis">c{ax.i}</span>
+        {/if}
+        <div class="bar-cell" aria-hidden="true">
+          <Bar value={ax.value} max={ax.scale} width={160} height={8} bipolar />
+        </div>
+        {#if showPoles}
+          <span class="pole pos" title={`positive pole (${poles.positive})`}>
+            {poles.positive}
+          </span>
+        {:else}
+          <span class="pole pos" aria-hidden="true"></span>
+        {/if}
+        <span class="value" class:pos={ax.value > 0} class:neg={ax.value < 0}>
+          {ax.value >= 0 ? "+" : ""}{ax.value.toFixed(2)}
+        </span>
+      </div>
+    {/each}
+
+    {#if !affine && residual !== null}
+      <!-- Curved-only settled meta: how far off-surface the point came to
+           rest (the in-subspace coords are now the bars above). -->
       <div class="meta">
-        {#if coords.length > 0}
-          <span class="meta-item" title="settled inverse-projection coords">
-            coords ({coords.map(fmtCoord).join(", ")})
-          </span>
-        {/if}
-        {#if residual !== null}
-          <span class="meta-item" title="normalized off-surface residual">
-            residual {fmtCoord(residual)}
-          </span>
-        {/if}
+        <span class="meta-item" title="normalized off-surface residual">
+          residual {fmtCoord(residual)}
+        </span>
       </div>
     {/if}
 
@@ -391,13 +408,36 @@
     align-items: center;
     gap: var(--space-2);
     min-width: 0;
+    /* Every reading row is two text lines tall — the subspaceness row's
+       stacked nearest (label / d=…) sets the height, and the single-line
+       coordinate rows reserve the same so the stack reads as one even
+       column rather than a tall first row over short ones.  13px + 11px =
+       the label + dist line boxes pinned below. */
+    min-height: 24px;
   }
-  /* Both rows share the grid so the bar lands in the same inset slot and
-     the cards line up vertically.  Bipolar: neg pole · bar · pos pole ·
-     value.  Scalar: empty spacer · bar · nearest · value. */
-  .reading-bipolar,
-  .reading-scalar {
+  /* Every reading row shares the grid so the bars stack in one inset
+     column and the labels/values line up.  Subspaceness: "subspace" ·
+     white bar · nearest · fraction.  Coordinate: pole-or-cN · signed bar ·
+     pole-or-empty · value. */
+  .reading-subspace,
+  .reading-coord {
     grid-template-columns: minmax(2.5em, 1fr) minmax(60px, 2.6fr) minmax(2.5em, 1fr) 3.5em;
+  }
+  /* Left-column axis caption — the subspaceness "subspace" tag and the
+     "c0…cR-1" coordinate labels.  Hugs the bar (right-aligned) like the
+     neg pole it shares the slot with. */
+  .row-label {
+    color: var(--fg-muted);
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    text-align: right;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+  }
+  .row-label.axis {
+    color: var(--fg-dim);
   }
   .pole {
     overflow: hidden;
@@ -436,11 +476,13 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     color: var(--fg-strong);
+    line-height: 13px;
   }
   .nearest-dist {
     color: var(--fg-muted);
     font-size: var(--text-2xs);
     font-variant-numeric: tabular-nums;
+    line-height: 11px;
   }
   .nearest-empty {
     color: var(--fg-muted);
