@@ -341,6 +341,15 @@ def _attach_default_manifold_probes(session: SaklasSession) -> None:
     and it auto-loads next launch).  Selector is the fully-qualified
     ``default/<name>`` so the registered probe name matches a manual
     attach from the manifolds drawer — no duplicate rows.
+
+    A bundled manifold already on the monitor is skipped: the
+    construction-time ``_bootstrap_manifold_probes`` roster attaches the
+    category-tagged concept axes under their *bare* names (``confident.
+    uncertain``), and the gate grammar / trait panel key off those bare
+    names, so re-attaching the same concept here as ``default/<name>``
+    would leave two rows for one probe in every picker.  personas /
+    emotions aren't in the bootstrap categories, so they fall through and
+    attach here as their read-side counterparts.
     """
     from saklas.io.manifolds import (
         ManifoldFolder,
@@ -350,8 +359,11 @@ def _attach_default_manifold_probes(session: SaklasSession) -> None:
     from saklas.io.paths import manifold_dir, safe_model_id
 
     stem = safe_model_id(session.model_id)
+    attached = set(session.probes)
     for name in bundled_manifold_names():
         selector = f"default/{name}"
+        if name in attached or selector in attached:
+            continue
         try:
             mf = ManifoldFolder.load(manifold_dir("default", name))
         except (ManifoldFormatError, FileNotFoundError):
@@ -364,6 +376,7 @@ def _attach_default_manifold_probes(session: SaklasSession) -> None:
             continue
         try:
             session.add_probe(selector)
+            attached.add(selector)
             print(f"  manifold probe {selector}: attached")
         except SaklasError as exc:
             print(f"  manifold probe {selector}: skipped — {exc}")
