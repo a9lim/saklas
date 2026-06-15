@@ -2365,7 +2365,18 @@ def subspace_inject(
         # mask from ``synthesize_subspace`` (0 push / 1 ablate).
         p_new = q + along * (target - kappa * q)        # (.., n==R)
         h_new = h_f32 + ((p_new - q) @ basis)           # keep H_o verbatim
-        h_new = _soft_norm_cap(h_new, h_f32, norm_cap)
+        # No ``_soft_norm_cap`` on the affine branch.  The cap only ever guarded
+        # off-domain RBF *extrapolation* blowup; a flat affine fit has no RBF
+        # surface (``clamp_position`` is identity on the flat ``CustomDomain``),
+        # so ``p_new`` is always in-frame and the displacement ``(p_new − q)@basis``
+        # is a bounded steering offset added to a large-norm residual stream — it
+        # cannot plausibly push ``‖h_new‖`` past ``3·‖h‖``.  This is the same
+        # reasoning (and now the same behavior) as the constant-add fast path in
+        # ``SteeringHook._pure_push_constant``, which already drops the cap; the
+        # mixed push+ablate (κ≠0) affine term only *shrinks* the ablated axes, so
+        # it can't grow the norm past the pure-push case either.  Dropping it
+        # removes the two per-fire full-width norm reductions on the affine kernel
+        # path (curved fits keep the cap below).
         # Return fp32; the caller's ``hidden.copy_(h_new)`` downcasts to the
         # model dtype on the copy, so an explicit ``.to(h.dtype)`` here would
         # only allocate a redundant full-width model-dtype temporary per fire.

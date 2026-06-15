@@ -1099,3 +1099,75 @@ def test_subspace_coords_stamped_when_enabled():
         assert all(isinstance(c, float) for c in coords)
     wire = reading.to_dict()["subspace_coords_per_layer"]
     assert set(wire.keys()) == {str(li) for li in m.layers}
+
+
+# ===================================================== coords_only (FIX F2) ===
+#
+# The lean per-token read (``coords_only=True``) must produce the SAME coords +
+# fraction as the full read — the lean live consumers (trait stream, loom probe
+# row) read only the cross-layer axis-0 coord, so the lean path skips nearest /
+# assignment / per-layer traces but must not perturb the coordinate it keeps.
+
+
+def _assert_lean_matches_full(mon: Monitor, hidden: dict[int, torch.Tensor]) -> None:
+    mon.reset_curved_feet()
+    full = mon.score_single_token(hidden)
+    mon.reset_curved_feet()
+    lean = mon.score_single_token(hidden, coords_only=True)
+    assert set(full) == set(lean)
+    for name in full:
+        f, l = full[name], lean[name]
+        assert l.coords == pytest.approx(f.coords, abs=1e-4), name
+        assert l.fraction == pytest.approx(f.fraction, abs=1e-4), name
+        # Lean drops the richer fields the live axis-0 consumers don't read.
+        assert l.nearest == []
+        assert l.assignment == []
+        assert l.membership == 1.0
+        assert l.residual == 0.0
+
+
+def test_coords_only_matches_full_flat_on_node():
+    rc = torch.tensor([[1.0, 0.0], [0.0, 1.0], [-1.0, -1.0]])
+    m = _flat_manifold(reduced_coords=rc, labels=["x", "y", "z"])
+    mon = _iso_monitor(m)
+    mon.add_probe("tri", m)
+    for k in range(3):
+        _assert_lean_matches_full(mon, _flat_node_hidden(m, k))
+
+
+def test_coords_only_matches_full_flat_off_node():
+    rc = torch.tensor([[1.0, 0.0], [0.0, 1.0], [-1.0, -1.0]])
+    m = _flat_manifold(reduced_coords=rc, labels=["x", "y", "z"])
+    mon = _iso_monitor(m)
+    mon.add_probe("tri", m)
+    h0 = _flat_node_hidden(m, 0)
+    h1 = _flat_node_hidden(m, 1)
+    blend = {L: 0.4 * h0[L] + 0.6 * h1[L] for L in h0}
+    _assert_lean_matches_full(mon, blend)
+
+
+def test_coords_only_matches_full_curved():
+    m = _toy_manifold()
+    mon = _iso_monitor(m)
+    mon.add_probe("toy", m)
+    for k in range(3):
+        _assert_lean_matches_full(mon, {L: _node_world(m, L)[k] for L in m.layers})
+
+
+def test_coords_only_mixed_flat_and_curved_roster():
+    flat = _flat_manifold(
+        reduced_coords=torch.tensor([[1.0], [-1.0]]), dim=8,
+        name="ax", labels=["p", "n"],
+    )
+    curved = _toy_manifold(dim=8)
+    from tests._whitener import isotropic_whitener
+    whitener = isotropic_whitener(sorted(set(flat.layers) | set(curved.layers)), 8)
+    mon = Monitor(whitener=whitener)
+    mon.add_probe("ax", flat)
+    mon.add_probe("toy", curved)
+    # Both probes read the same per-layer hidden (different bases) — we only
+    # assert lean == full per probe, not specific values.
+    hidden = dict(_flat_node_hidden(flat, 0))
+    for L in curved.layers:
+        hidden[L] = _node_world(curved, L)[1]
+    _assert_lean_matches_full(mon, hidden)

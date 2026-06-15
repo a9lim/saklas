@@ -709,7 +709,12 @@ tok/s):
   steering keeps the ctx-consulting general path (DynamicCache, eager); curved
   manifolds pay a warm-started O(R) per-token foot solve. (StaticCache-with-steering
   is CUDA-only, so MPS/CPU are unaffected; the through-the-hook graph capture wants a
-  CUDA validation pass.)
+  CUDA validation pass.) Curved `%` steering is materially the slowest path —
+  per token it runs a Gauss-Newton foot solve + frame-rotation transport (two RBF
+  evals + two Jacobians), an `n≥2` fit hops to CPU for the SVD on MPS
+  (`_svd_mps_safe`), and it forfeits StaticCache/`torch.compile`. Affine/flat
+  terms (a folded vector, or `personas`/`emotions` when they resolve flat) take the
+  constant-add fast path instead; prefer them where coherence allows.
 - **Share baked at fit**, normalized to mean 1 at apply; the subspace foot
   translates by `share_L · _MANIFOLD_ALONG_GAIN · target` (the target already
   carries the coefficient; `_MANIFOLD_GAIN = 1.0` is now the `onto`-only gain). No
@@ -729,13 +734,21 @@ tok/s):
   cover every probed layer (`covers_all`), else scoring raises `WhitenerError` (no
   Euclidean path). `covers_all` is trustworthy as "finite factors everywhere": any
   non-finite layer is excluded, and neutral activations are cached fp32 (so gemma-3's
-  late layers don't overflow the fp16 65504 ceiling to ±inf). Per-token scoring is
-  **conditional on need**: a gate / live-stream consumer ⇒ **incremental** (each token
+  late layers don't overflow the fp16 65504 ceiling to ±inf). Per-token scoring runs
+  **post-forward**, not inside the capture hook (FIX F1 — `generate_steered` calls
+  `HiddenCapture.fire_step_sink` after `model()` returns, so the host-side score read
+  doesn't drain the device pipeline mid-forward at the max probe layer). It is also
+  **conditional on need**: a full-reading live consumer ⇒ **incremental** (each token
   scored live, only the latest per-layer slice + `ProbeReading` rows retained,
-  O(layers·D)); probes attached but only the aggregate wanted (no gate / stream — e.g.
-  a stateless server gen) ⇒ **aggregate-only** (a bounded tail ring, NO per-token
-  scoring, pooled once at finalize, T scorings → 1); `return_hidden` ⇒ full retention
-  + `score_per_token`.
+  O(layers·D)); axis-0-only consumers (trait stream / loom probe row, no gate, no
+  full-reading consumer) ⇒ **lean-incremental** (FIX F2 — per-token `coords_only`
+  scoring, no nearest / assignment / per-layer trace, plus a tail ring re-scored to
+  the full aggregate once at finalize); a probe gate as sole consumer ⇒
+  **gating-only-subset** (only the gated probes' scalars per token via
+  `score_gate_scalars`, full aggregate from the tail ring); probes attached but only
+  the aggregate wanted (e.g. a stateless server gen) ⇒ **aggregate-only** (a bounded
+  tail ring, NO per-token scoring, pooled once at finalize, T scorings → 1);
+  `return_hidden` ⇒ full retention + `score_per_token`.
 - **Steering hooks are transient** — composed before generation, removed after.
 - **MPS discipline** — diffs on CPU, `torch.mps.empty_cache()` between extraction
   *batches* (capture is chunked at `_CAPTURE_BATCH`; corpus generation at

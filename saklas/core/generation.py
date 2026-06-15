@@ -743,6 +743,7 @@ def generate_steered(
     past_key_values: Any = None,
     cache_position_offset: int = 0,
     score_callback: Callable[[], dict[str, float]] | None = None,
+    step_callback: Callable[[], None] | None = None,
     use_static_cache: bool = False,
     forced_prefix: list[int] | None = None,
     steering_active: bool = True,
@@ -777,6 +778,14 @@ def generate_steered(
     so the next iteration's gates see fresh monitor readings.  Pay
     nothing on the no-gate path — session-level wiring sets this to
     ``None`` unless the active steering contains a gated trigger.
+
+    ``step_callback`` is the per-token monitor-scoring hook (FIX F1):
+    invoked once per forward, post-``model()``, before ``score_callback``.
+    The session wires it to :meth:`HiddenCapture.fire_step_sink` so the
+    per-token probe scoring (and its device→host sync) runs *after* the
+    forward instead of inside the capture hook at the max probe layer,
+    keeping the sync out of the middle of the forward pass.  ``None`` when
+    no per-token scoring is needed (no probes, or aggregate-only capture).
 
     ``use_static_cache`` routes generation through
     :class:`transformers.StaticCache` instead of the default
@@ -1127,6 +1136,19 @@ def generate_steered(
                             use_cache=True,
                         )
                 prefill = False
+
+                # Per-token monitor scoring (FIX F1): run the capture's step
+                # sink HERE, post-forward, rather than from inside the capture
+                # hook at the max probe layer.  The sink's score read ends in a
+                # device→host sync; firing it mid-forward (in the hook) drained
+                # the device pipeline before the remaining transformer layers +
+                # LM head were even enqueued.  Post-forward the captures are
+                # equally fresh (every probe layer stored this step's slice
+                # during the forward), so the readings are identical — only the
+                # sync no longer stalls the tail of the forward.  Runs before
+                # ``score_callback`` so a probe gate reads the freshly-scored row.
+                if step_callback is not None:
+                    step_callback()
 
                 # Probe-gate scoring: after the forward (so
                 # ``HiddenCapture`` is freshly populated), refresh

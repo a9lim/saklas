@@ -136,11 +136,15 @@ class HiddenCapture:
                         # The highest hooked layer fires last in the forward
                         # (forward hooks run in layer-execution order), so by the
                         # time it stores its slice every hooked layer holds this
-                        # step's value: count the forward, then score if wired.
+                        # step's value.  Count the forward (drives the tail ring's
+                        # ``tail_slice_at`` mapping); the per-token monitor scoring
+                        # that used to fire *here* now runs post-forward via
+                        # :meth:`fire_step_sink` (FIX F1) so the host-side score
+                        # read no longer drains the device pipeline mid-forward at
+                        # the max probe layer — the remaining transformer layers +
+                        # LM head stay queued.
                         if layer_idx == self._max_layer:
                             self._forward_count += 1
-                            if self._step_sink is not None:
-                                self._step_sink(self.latest_per_layer())
                     else:
                         # Full-retention mode: each step is a distinct clone so
                         # ``stacked()`` can build the [T, D] history.
@@ -158,9 +162,11 @@ class HiddenCapture:
 
         Must be called after :meth:`attach`. Flips the per-layer hook from
         append to length-1 overwrite and records the highest hooked layer
-        as the per-forward sink trigger. ``step_sink`` receives
-        :meth:`latest_per_layer` once per forward, after every hooked
-        layer has stored this step's slice.
+        as the per-forward counter trigger. ``step_sink`` receives
+        :meth:`latest_per_layer` once per forward via :meth:`fire_step_sink`,
+        which ``generate_steered`` invokes **post-forward** (FIX F1) — not from
+        inside the capture hook — so the score read doesn't drain the device
+        pipeline mid-forward.
         """
         self._incremental = True
         self._tail_depth = 1
@@ -245,6 +251,22 @@ class HiddenCapture:
             if bucket:
                 out[idx] = bucket[-1]
         return out
+
+    def fire_step_sink(self) -> None:
+        """Run the per-token step sink once, **after** the model forward (FIX F1).
+
+        Invoked by ``generate_steered`` post-``model()`` rather than from inside
+        the capture hook at the max probe layer.  Scoring here keeps the
+        device→host sync the sink's score read incurs out of the *middle* of the
+        forward pass, so the remaining transformer layers + LM head stay queued
+        on the device instead of draining the pipeline at the highest hooked
+        layer.  No-op when no sink is installed (aggregate-only / full-retention /
+        no-probe captures).  Reads the latest per-layer slice the forward just
+        stored — valid until the next forward overwrites the length-1 buffer (or
+        rotates the tail ring).
+        """
+        if self._step_sink is not None:
+            self._step_sink(self.latest_per_layer())
 
 
 class SteeringHook:

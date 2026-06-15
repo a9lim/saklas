@@ -287,6 +287,7 @@ def test_finalize_reuses_scored_probe_aggregate() -> None:
     session._capture = capture
     session._capture_incremental = False
     session._capture_aggregate_only = False
+    session._capture_lean = False
     session._last_per_token_scores = None
     session._last_result = None
     session.events = SimpleNamespace(emit=lambda _event: None)

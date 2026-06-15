@@ -803,6 +803,14 @@ class SaklasSession:
         # scores the aggregate once via ``_score_aggregate_only``. Mutually
         # exclusive with ``_capture_incremental``. Set in ``_begin_capture``.
         self._capture_aggregate_only: bool = False
+        # Lean-incremental capture (FIX F2): a per-token consumer wants only the
+        # axis-0 coord (the trait stream / loom probe row), no nearest /
+        # assignment / per-layer trace and no probe gate.  The step sink scores
+        # each token ``coords_only`` (cheap), stores the lean rows for the
+        # per-token stream, and a bounded tail ring lets ``_finalize_generation``
+        # re-score the FULL aggregate once via ``_score_lean_incremental``.
+        # Mutually exclusive with ``_capture_incremental`` / ``_capture_aggregate_only``.
+        self._capture_lean: bool = False
         # Gating-only subset capture (FIX #4): per-token scoring is needed ONLY
         # to feed probe gates, so the step sink scores just the gated probes
         # (``_capture_gating_subset`` holds their names) while a bounded tail
@@ -3007,6 +3015,7 @@ class SaklasSession:
         self, *, widen: bool = False, need_per_token: bool = True,
         gating_only_probes: set[str] | None = None,
         gating_probe_keys: set[str] | None = None,
+        lean_per_token: bool = False,
     ) -> bool:
         """Attach hidden-state capture. Returns True if attached.
 
@@ -3045,6 +3054,7 @@ class SaklasSession:
             if not union:
                 self._capture_incremental = False
                 self._capture_aggregate_only = False
+                self._capture_lean = False
                 self._capture_gating_subset = None
                 self._incremental_readings = []
                 return False
@@ -3054,6 +3064,7 @@ class SaklasSession:
         self._incremental_readings = []
         self._incremental_gate_scores = []
         self._capture_aggregate_only = False
+        self._capture_lean = False
         self._capture_gating_subset = None
         self._capture_gating_keys = None
         # Gating-only-subset path: per-token scoring is needed solely to feed
@@ -3097,6 +3108,34 @@ class SaklasSession:
             self._capture_gating_keys = gate_keys
             # The subset is scored one token per step in order, so curved gated
             # probes can warm-start their foot; cold-start the feet first.
+            self._monitor.reset_curved_feet()
+            self._monitor.enable_curved_warm(True)
+        elif (
+            not widen and self._monitor.probe_names
+            and need_per_token and lean_per_token
+        ):
+            # Lean-incremental (FIX F2): the only per-token consumers read just
+            # the axis-0 coord (the trait stream / loom probe row) — no nearest /
+            # assignment / per-layer trace, no probe gate.  Score each token
+            # ``coords_only`` (skips the big-K nearest norm + assignment softmax +
+            # per-layer host reconstruction), store the lean rows for the per-token
+            # stream, and keep a bounded tail ring so finalize re-scores the FULL
+            # aggregate once via ``_score_lean_incremental``.
+            def _score_step_lean(latest: dict[int, torch.Tensor]) -> None:
+                self._incremental_readings.append(
+                    self._monitor.score_single_token(latest, coords_only=True)
+                    if latest else {}
+                )
+
+            # Deep tail ring (full-roster aggregate at finalize) PLUS the lean
+            # per-token step sink — same dual-arming as the gating-subset path.
+            self._capture.set_aggregate_tail(_AGG_TAIL_DEPTH)
+            self._capture._step_sink = _score_step_lean
+            self._capture_incremental = False
+            self._capture_aggregate_only = False
+            self._capture_lean = True
+            # Lean rows are scored one token per step in order, so curved probes
+            # can warm-start their foot for the per-token coord stream.
             self._monitor.reset_curved_feet()
             self._monitor.enable_curved_warm(True)
         elif not widen and self._monitor.probe_names and need_per_token:
@@ -3275,6 +3314,34 @@ class SaklasSession:
         if accumulate and agg_vals:
             self._monitor.accumulate_readings(agg_vals)
         return agg_vals
+
+    def _score_lean_incremental(
+        self, generated_ids: list[int], *, accumulate: bool = True,
+    ) -> tuple[dict[str, "ProbeReading"], dict[str, list[float]]]:
+        """Lean per-token coord stream + full aggregate from the tail ring (FIX F2).
+
+        The lean-incremental capture path scored each token ``coords_only`` (just
+        the cross-layer axis-0 coord / fraction, no nearest / assignment /
+        per-layer trace), so the per-token coordinate stream comes straight from
+        those stored rows.  The end-of-gen aggregate, which DOES carry the full
+        reading, is re-scored once from the bounded tail ring via
+        :meth:`_score_aggregate_only` — so no field is lost despite the lean
+        per-token rows.
+        """
+        names = list(self._monitor.probe_names)
+        n = len(generated_ids)
+        per_token: dict[str, list[float]] = {name: [0.0] * n for name in names}
+        rows = self._incremental_readings[:n]
+        for i, readings in enumerate(rows):
+            for name, reading in readings.items():
+                if name in per_token:
+                    per_token[name][i] = (
+                        reading.coords[0] if reading.coords else 0.0
+                    )
+        agg_vals = self._score_aggregate_only(
+            generated_ids, accumulate=accumulate,
+        )
+        return agg_vals, per_token
 
     @overload
     def score_hidden(
@@ -4349,12 +4416,13 @@ class SaklasSession:
                     self._monitor.probe_names
                     and not self._capture_incremental
                     and not self._capture_aggregate_only
+                    and not self._capture_lean
                 )
             )
         ):
             # Full stack only for return_hidden or the non-incremental
-            # full-retention path; the aggregate-only ring is pooled via
-            # ``_score_aggregate_only`` (``stacked()`` would stack the tail
+            # full-retention path; the aggregate-only / lean tail ring is pooled
+            # via ``_score_aggregate_only`` (``stacked()`` would stack the tail
             # ring, not the full [T, D]).
             captured_stack = self._capture.stacked()
 
@@ -4362,6 +4430,11 @@ class SaklasSession:
         if self._monitor.probe_names and generated_ids:
             if self._capture_incremental:
                 agg_vals, per_token = self._score_incremental(
+                    generated_ids, accumulate=not stateless,
+                )
+            elif self._capture_lean:
+                # Lean per-token coord stream + full aggregate from the tail ring.
+                agg_vals, per_token = self._score_lean_incremental(
                     generated_ids, accumulate=not stateless,
                 )
             elif self._capture_aggregate_only:
@@ -4811,6 +4884,10 @@ class SaklasSession:
             past_key_values=cached_pkv,
             cache_position_offset=cache_position_offset,
             score_callback=gating_callback,
+            # Per-token probe scoring fires post-forward (FIX F1), not inside the
+            # capture hook.  ``fire_step_sink`` no-ops when no per-token sink is
+            # installed (aggregate-only / full-retention / no-probe captures).
+            step_callback=self._capture.fire_step_sink,
             use_static_cache=use_static_cache,
             forced_prefix=forced_prefix,
             steering_active=bool(self._steering.hooks),
@@ -4930,8 +5007,14 @@ class SaklasSession:
                     or _persists_subspace_coords
                 )
             )
+            # Lean-incremental rows carry coords+fraction only (FIX F2); the tap's
+            # consumers in lean mode read just axis-0 ``scores`` (the lean
+            # precondition rules out ``_wants_live_token_scores`` /
+            # ``_persists_layer_scores`` / ``_persists_subspace_coords``), so the
+            # stored lean rows are reused exactly like the full-incremental rows.
             has_incremental_reading = bool(
-                self._capture_incremental and self._incremental_readings
+                (self._capture_incremental or self._capture_lean)
+                and self._incremental_readings
             )
             if needs_scores and not has_incremental_reading:
                 latest_hidden_for_token = {
@@ -5150,6 +5233,25 @@ class SaklasSession:
                 if (_needs_gating and not _per_token_full_consumer)
                 else None
             )
+            # Lean-incremental (FIX F2): the live consumers present read ONLY the
+            # axis-0 coord (the SSE trait stream, the loom probe row, the loom
+            # node text/aggregate) — none of the consumers that genuinely need a
+            # richer per-token reading is live, and there is no probe gate.  Then
+            # the per-token scoring drops the nearest / assignment / per-layer
+            # work (the full aggregate is re-scored once from the tail ring at
+            # finalize), which is the common TUI/loom monitoring path.
+            _full_reading_consumer = bool(
+                _wants_live_token_scores       # full ProbeReading in TokenEvent
+                or _persists_layer_scores      # per-layer heatmap row
+                or _persists_subspace_coords   # inspector whitened coords
+            )
+            lean_per_token = bool(
+                need_per_token
+                and not want_hidden
+                and not _needs_gating
+                and not _full_reading_consumer
+                and self._monitor.probe_names
+            )
             self.events.emit(GenerationStarted(input=input, stateless=stateless))
             try:
                 # Capture attach + monitor live + ctx.reset live INSIDE the
@@ -5160,6 +5262,7 @@ class SaklasSession:
                     widen=want_hidden, need_per_token=need_per_token,
                     gating_only_probes=gating_only_probes,
                     gating_probe_keys=gating_probe_keys,
+                    lean_per_token=lean_per_token,
                 )
                 self._monitor.begin_live()
                 # Reset the steering manager's TriggerContext for this gen;
@@ -5271,6 +5374,8 @@ class SaklasSession:
             # (finalize has already consumed the rows by now). Belt-and-
             # suspenders: ``_begin_capture`` resets these at gen start too.
             self._capture_incremental = False
+            self._capture_lean = False
+            self._capture_aggregate_only = False
             self._capture_gating_subset = None
             self._capture_gating_keys = None
             self._incremental_readings = []

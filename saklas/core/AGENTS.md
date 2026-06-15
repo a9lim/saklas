@@ -387,11 +387,22 @@ persona breaks by `α ≈ 1.0`). Tagged a prototype.)
 `HiddenCapture` — `attach`/`detach`/`stacked`/`latest_per_layer`. Three modes,
 chosen by `_begin_capture` from `need_per_token`:
 
-- **incremental** (`set_incremental`) — a gate / live-stream consumer wants
+- **incremental** (`set_incremental`) — a full-reading live consumer wants
   per-token readings: overwrites a single preallocated length-1 buffer per layer
-  via `copy_` (zero per-step capture allocation, O(layers·D) memory) and fires the
-  step sink after the highest hooked layer to score each token live; the per-token
-  `ProbeReading` rows back `_score_incremental`'s (aggregate, per-token).
+  via `copy_` (zero per-step capture allocation, O(layers·D) memory). The step
+  sink scores each token live — but it now fires **post-forward** (`generate_steered`
+  calls `HiddenCapture.fire_step_sink` after `model()` returns, not from inside the
+  hook at the max probe layer; FIX F1), so the host-side score read no longer drains
+  the device pipeline mid-forward. The per-token `ProbeReading` rows back
+  `_score_incremental`'s (aggregate, per-token).
+- **lean-incremental** (session `_capture_lean`, FIX F2) — the live consumers
+  read only the axis-0 coord (the SSE trait stream / loom probe row), no nearest /
+  assignment / per-layer trace and no probe gate: the post-forward step sink scores
+  each token `coords_only=True` (skips the big-K nearest norm + assignment softmax +
+  per-layer host reconstruction) into the per-token coord stream, while a bounded
+  tail ring lets `_score_lean_incremental` re-score the **full** aggregate once at
+  finalize. Built on `set_aggregate_tail` + a session-level sink, like the
+  gating-only-subset path.
 - **aggregate-only** (`set_aggregate_tail`) — probes attached but *nothing*
   consumes a per-token reading (no gate, no loom row, no trait stream, no live
   scores — e.g. a stateless server gen): keeps a bounded tail ring
