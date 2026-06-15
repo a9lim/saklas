@@ -308,6 +308,7 @@ class Monitor:
         self,
         probe: "AttachedManifoldProbe",
         hidden_per_layer: dict[int, torch.Tensor],
+        sih_cache: dict[int, torch.Tensor] | None = None,
     ) -> ProbeReading:
         """Full per-probe reading for one state — flat or curved, all fields.
 
@@ -322,6 +323,11 @@ class Monitor:
         per-layer traces.  This is the single geometry primitive every read
         entry point (live per token, aggregate) shares, so the aggregate at a
         token index is bit-identical to the live read at that token.
+
+        ``sih_cache`` (optional, keyed by layer) shares the probe-independent
+        ``Σ⁻¹h`` apply across every curved probe in one ``_score_full`` pass; it
+        is valid only for the current state, so callers pass a fresh dict per
+        token / pool.
         """
         manifold = probe.manifold
         sw = probe.share_weights
@@ -365,7 +371,7 @@ class Monitor:
                 h = h.reshape(-1, h.shape[-1])[-1]
             wh = probe.whitened[layer_idx]
             frac_t, cdist_query, invert_query, cdist_nodes = _layer_geometry(
-                probe, layer_idx, h,
+                probe, layer_idx, h, sih_cache,
             )
             w = w_shared[layer_idx]
 
@@ -602,6 +608,7 @@ class Monitor:
 
     def _score_full(
         self, hidden_per_layer: dict[int, torch.Tensor],
+        *, only: set[str] | None = None,
     ) -> dict[str, ProbeReading]:
         """Full readings for every attached probe at one state.
 
@@ -615,21 +622,45 @@ class Monitor:
         :class:`ProbeReading` is populated either way, and the batched result is
         bit-identical (to float tolerance) to the per-probe path the aggregate
         uses.
+
+        ``only`` (a set of probe names) scores just that subset, routing every
+        probe in it — flat or curved — through the per-probe :meth:`_score_probe_full`
+        path (correct for both shapes, and cheap for the 1-2 probe subset a
+        gate-only step needs, where building the full batched roster would be
+        pure waste).  ``only=None`` is the full-roster behavior, byte-identical
+        to before.
         """
         out: dict[str, ProbeReading] = {}
         if not hidden_per_layer or not self._probes:
             return out
+        # ``Σ⁻¹h`` is probe-independent (depends only on the layer's hidden state
+        # + the shared whitener), so it is computed at most once per layer and
+        # reused across every curved probe in this pass.  Valid only for this
+        # ``hidden_per_layer`` — a fresh dict per call.
+        sih_cache: dict[int, torch.Tensor] = {}
+        if only is not None:
+            # Gate-only subset: per-probe path for both flat and curved.
+            for name in self._probes:
+                if name in only:
+                    out[name] = self._score_probe_full(
+                        self._probes[name], hidden_per_layer, sih_cache,
+                    )
+            return out
         device = next(iter(hidden_per_layer.values())).device
         self._ensure_flat_cache(device)
         if self._flat_keys:
-            out.update(self._score_flat_batched(hidden_per_layer))
+            out.update(self._score_flat_batched(hidden_per_layer, sih_cache))
         for name in self._curved_keys:
-            out[name] = self._score_probe_full(self._probes[name], hidden_per_layer)
+            out[name] = self._score_probe_full(
+                self._probes[name], hidden_per_layer, sih_cache,
+            )
         # Defensive: any probe the cache didn't classify (it always should) is
         # scored per-probe so nothing silently drops from the readings.
         for name, probe in self._probes.items():
             if name not in out:
-                out[name] = self._score_probe_full(probe, hidden_per_layer)
+                out[name] = self._score_probe_full(
+                    probe, hidden_per_layer, sih_cache,
+                )
         # Probe-inspector live trail (gated): stamp each probe's per-layer whitened
         # query coords onto its reading.  Isolated post-pass — the hot batched
         # flat cache is untouched; runs only while a client opted in.
@@ -912,6 +943,7 @@ class Monitor:
 
     def _score_flat_batched(
         self, hidden_per_layer: dict[int, torch.Tensor],
+        sih_cache: dict[int, torch.Tensor] | None = None,
     ) -> dict[str, ProbeReading]:
         """Score the whole flat roster in one batched sweep + one host transfer.
 
@@ -926,6 +958,11 @@ class Monitor:
         Phase 3 (host): slice the flat blob back into per-probe
         :class:`ProbeReading`s.  Values match the per-probe path (the aggregate
         uses) to float tolerance.
+
+        ``sih_cache`` (optional, keyed by layer) is the per-pass ``Σ⁻¹h`` cache
+        shared with the curved per-probe path: the apply depends only on the
+        layer's hidden state + the shared whitener (identical Woodbury factors),
+        so a mixed flat+curved roster computes ``Σ⁻¹h`` once per layer total.
         """
         gl = self._flat_global
         cache = self._flat_layer_cache
@@ -955,7 +992,13 @@ class Monitor:
             hf = h.to(torch.float32)
             if hf.ndim > 1:
                 hf = hf.reshape(-1, hf.shape[-1])[-1]
-            sih = _woodbury_apply(hf, ent["X"], ent["K_inv"], ent["lam"])
+            # Σ⁻¹h — probe-independent, so share it with the curved per-probe
+            # path via the per-pass cache (same Woodbury factors per layer).
+            sih = None if sih_cache is None else sih_cache.get(layer_idx)
+            if sih is None:
+                sih = _woodbury_apply(hf, ent["X"], ent["K_inv"], ent["lam"])
+                if sih_cache is not None:
+                    sih_cache[layer_idx] = sih
             h_sih = (hf * sih).sum()
             g_all = ent["basis_stack"] @ sih - ent["gmean_stack"]   # (ΣR,)
             c_all = ent["Mblk"] @ g_all                             # (ΣR,)
@@ -1118,14 +1161,18 @@ class Monitor:
         self,
         hidden_per_layer: dict[int, torch.Tensor],
         accumulate: bool = True,
+        *,
+        only: set[str] | None = None,
     ) -> dict[str, ProbeReading]:
         """Score every probe → ``{name: ProbeReading}`` (full reading).
 
         ``accumulate`` folds the cross-layer coords into history/stats (the
-        in-flight per-token path passes False).
+        in-flight per-token path passes False).  ``only`` restricts scoring to
+        a subset (gate-only per-token path); a subset read never accumulates
+        (the cross-gen stats want the full roster, not the gated probes alone).
         """
-        out = self._score_full(hidden_per_layer)
-        if out and accumulate:
+        out = self._score_full(hidden_per_layer, only=only)
+        if out and accumulate and only is None:
             self._apply_accumulate(out)
         return out
 
@@ -1182,6 +1229,7 @@ class Monitor:
 
     def score_single_token(
         self, hidden_per_layer: dict[int, torch.Tensor],
+        *, only: set[str] | None = None,
     ) -> dict[str, "ProbeReading"]:
         """Per-probe full reading for a single token (no accumulate).
 
@@ -1191,8 +1239,14 @@ class Monitor:
         Does NOT touch history/stats — the in-flight gate/stream path must
         not corrupt the session-level accumulators — but flips the
         per-token pending flag so the TUI/webui can poll for a fresh reading.
+
+        ``only`` (a set of probe names) scores just that subset, returning
+        ``{name: ProbeReading}`` for the subset alone — the gate-only per-token
+        path, where the step sink consumes just the gated probes' scalars and
+        the big-K roster's nearest-distance work is pure waste.  ``only=None``
+        keeps the byte-identical full-roster behavior.
         """
-        out = self._score_tokens(hidden_per_layer, accumulate=False)
+        out = self._score_tokens(hidden_per_layer, accumulate=False, only=only)
         if out:
             self._pending_per_token = True
         return out
@@ -1777,6 +1831,13 @@ class _LayerWhiten:
     X: torch.Tensor            # (N, D) centered neutral observations
     K_inv: torch.Tensor        # (N, N) Woodbury inverse
     lam: float                 # ridge λ
+    # Precomputed ``Σ⁻¹ mean`` (D,) — the per-probe-per-layer centering term.
+    # ``_woodbury_apply`` is exactly linear, so the per-token centered apply
+    # ``Σ⁻¹(h − mean)`` is ``Σ⁻¹h − s_mean``: one subtract against a shared
+    # ``Σ⁻¹h`` (the same for every probe at a layer, cached in ``_score_full``)
+    # instead of a full Woodbury apply per probe.  Baked at attach (and rebuilt
+    # on ``set_whitener``), since ``mean`` and the whitener are both constant.
+    s_mean: torch.Tensor       # (D,) = Σ⁻¹ mean
     # Affine reduced→domain coordinate map (flat probes only; ``None`` for a
     # curved fit, which recovers coords through ``invert_parameterization``).
     # ``dom = c @ coord_S.T + coord_b`` sends the whitened M-orthogonal
@@ -1957,14 +2018,20 @@ def _build_whitened_factors(
                     device=dev, dtype=torch.float32,
                 ).T                                  # (1, R)
                 neutral_white = (v_red @ chol_dev).reshape(-1)
+        mean_dev = sub.mean.to(device=dev, dtype=torch.float32)
+        # Precompute ``Σ⁻¹ mean`` once (constant in mean + whitener), so the
+        # per-token ``_layer_geometry`` centers via ``sih − s_mean`` against the
+        # shared ``Σ⁻¹h`` rather than a full per-probe Woodbury apply.
+        s_mean = _woodbury_apply(mean_dev, X, K_inv, lam)
         out[layer_idx] = _LayerWhiten(
             m_r_inv=m_r_inv_dev,
             chol=chol_dev,
             node_white=(v_reduced.to(torch.float32) @ chol_dev),
             neutral_white=neutral_white,
-            mean=sub.mean.to(device=dev, dtype=torch.float32),
+            mean=mean_dev,
             basis=sub.basis.to(device=dev, dtype=torch.float32),
             X=X, K_inv=K_inv, lam=lam,
+            s_mean=s_mean,
             coord_S=coord_S, coord_b=coord_b,
         )
     return out
@@ -2170,6 +2237,7 @@ def _layer_geometry(
     probe: "AttachedManifoldProbe",
     layer_idx: int,
     h: torch.Tensor,
+    sih_cache: dict[int, torch.Tensor] | None = None,
 ) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]":
     """Per-layer readout pieces, shared by the per-token + aggregate paths.
 
@@ -2183,6 +2251,15 @@ def _layer_geometry(
     * ``invert_query`` — ``(R,)`` M-orthogonal projection coords
       ``c = M_R⁻¹ g`` for :func:`invert_parameterization`.
     * ``cdist_nodes`` — ``(K, R)`` whitened node coords.
+
+    ``Σ⁻¹h`` depends only on the layer's hidden state + the shared whitener,
+    not on the probe, so within one :meth:`Monitor._score_full` pass (where ``h``
+    is fixed) it is computed once per layer and reused across every curved probe
+    at that layer.  ``sih_cache`` (keyed by ``layer_idx``, valid only for the
+    current ``h``) carries it; on a miss we compute and store it.  The centering
+    is then ``Σ⁻¹(h − mean) = Σ⁻¹h − Σ⁻¹mean = sih − wh.s_mean`` (one subtract,
+    ``_woodbury_apply`` being exactly linear), instead of a full per-probe apply.
+    ``None`` (one-off reads) computes ``Σ⁻¹h`` locally — bit-identical algebra.
     """
     wh = probe.whitened.get(layer_idx)
     if wh is None:
@@ -2193,7 +2270,16 @@ def _layer_geometry(
     mean = wh.mean
     basis = wh.basis
     x = h - mean
-    sx = _woodbury_apply(x, wh.X, wh.K_inv, wh.lam)  # Σ⁻¹ x  (D,)
+    # Σ⁻¹h is probe-independent — share it across the layer's curved probes via
+    # the per-pass cache, then center by subtracting the precomputed Σ⁻¹mean.
+    if sih_cache is not None:
+        sih = sih_cache.get(layer_idx)
+        if sih is None:
+            sih = _woodbury_apply(h, wh.X, wh.K_inv, wh.lam)  # Σ⁻¹ h  (D,)
+            sih_cache[layer_idx] = sih
+    else:
+        sih = _woodbury_apply(h, wh.X, wh.K_inv, wh.lam)       # Σ⁻¹ h  (D,)
+    sx = sih - wh.s_mean                  # Σ⁻¹ x = Σ⁻¹h − Σ⁻¹mean  (D,)
     x_mnorm = torch.sqrt(
         (x * sx).sum().clamp(min=0.0)
     ).clamp(min=_FRACTION_EPSILON)

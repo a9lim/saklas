@@ -803,6 +803,12 @@ class SaklasSession:
         # scores the aggregate once via ``_score_aggregate_only``. Mutually
         # exclusive with ``_capture_incremental``. Set in ``_begin_capture``.
         self._capture_aggregate_only: bool = False
+        # Gating-only subset capture (FIX #4): per-token scoring is needed ONLY
+        # to feed probe gates, so the step sink scores just the gated probes
+        # (``_capture_gating_subset`` holds their names) while a bounded tail
+        # ring is kept so ``_finalize_generation`` can pool the FULL roster
+        # once. Empty/None ⇒ not in this mode. Set in ``_begin_capture``.
+        self._capture_gating_subset: set[str] | None = None
 
         # Reentrant — ``_generate_core`` acquires it for the whole gen,
         # then enters an internal ``self.steering(...)`` scope which
@@ -2670,6 +2676,37 @@ class SaklasSession:
                 return True
         return False
 
+    def _gated_probe_names(self) -> set[str]:
+        """Registered probe names referenced by active probe gates.
+
+        Walks the flattened steering stack, pulls each trigger's
+        :class:`~saklas.core.triggers.ProbeGate`, and maps the gate's scalar
+        ``probe`` key back to the registered monitor probe NAME — the prefix
+        before the first of ``[`` / ``:`` / ``@`` / ``~`` (e.g.
+        ``"personas[3]"`` → ``"personas"``, ``"emotions:fraction"`` →
+        ``"emotions"``, ``"confident.uncertain"`` → itself).  Only names that
+        are actually attached probes are kept, so a stale / non-probe gate key
+        doesn't shrink an otherwise-empty subset to "score nothing".  Used by
+        :meth:`_begin_capture` to scope the per-token step sink to just the
+        gated probes when gating is the sole per-token consumer (FIX #4).
+        """
+        attached = set(self._monitor.probe_names)
+        out: set[str] = set()
+        for entry in self._flatten_steering_stack().values():
+            if isinstance(entry, (AblationTerm, ManifoldTerm)):
+                trig = entry.trigger
+            else:  # (alpha, Trigger)
+                _alpha, trig = entry
+            gate = trig.gate
+            if gate is None:
+                continue
+            # Split off the channel suffix: the probe name is everything up to
+            # the first axis/fraction/label/assignment marker.
+            name = re.split(r"[\[:@~]", gate.probe, maxsplit=1)[0]
+            if name in attached:
+                out.add(name)
+        return out
+
     def _steering_active_in_prefill(self) -> bool:
         """Return True iff any active steering term fires during prompt prefill.
 
@@ -2779,15 +2816,28 @@ class SaklasSession:
 
         def _score() -> dict[str, float]:
             incremental_readings = getattr(self, "_incremental_readings", [])
-            if getattr(self, "_capture_incremental", False) and incremental_readings:
+            # The step sink already scored this token's readings — reuse them so
+            # the gate doesn't trigger a second pass.  In gating-only-subset mode
+            # (FIX #4) the rows hold just the gated probes, which is exactly the
+            # set the gate consults; in the full incremental mode they hold the
+            # whole roster.  Both reuse the latest appended row.
+            gating_subset = getattr(self, "_capture_gating_subset", None)
+            if (
+                getattr(self, "_capture_incremental", False)
+                or gating_subset
+            ) and incremental_readings:
                 return monitor.flat_scalars(incremental_readings[-1])
             latest = capture.latest_per_layer()
             if not latest:
                 return {}
             # Flatten the coordinate readings into gate-callback scalars
             # (``name`` aliases axis 0, ``name[i]`` per axis, ``name:fraction``,
-            # ``name@label`` for curved nearest).
-            return monitor.flat_scalars(monitor.score_single_token(latest))
+            # ``name@label`` for curved nearest).  Scope to the gated subset
+            # when the per-token path is gating-only (avoids the full roster).
+            agg = monitor.score_single_token(
+                latest, only=gating_subset if gating_subset else None,
+            )
+            return monitor.flat_scalars(agg)
 
         return _score
 
@@ -2933,6 +2983,7 @@ class SaklasSession:
 
     def _begin_capture(
         self, *, widen: bool = False, need_per_token: bool = True,
+        gating_only_probes: set[str] | None = None,
     ) -> bool:
         """Attach hidden-state capture. Returns True if attached.
 
@@ -2953,6 +3004,16 @@ class SaklasSession:
         capture runs in **aggregate-only** mode: a bounded tail ring, NO
         per-token scoring (T scorings + T host syncs → 1 at finalize via
         :meth:`_score_aggregate_only`).
+
+        ``gating_only_probes`` (FIX #4): when per-token scoring is needed *only*
+        to feed probe gates (no UI / trait / loom / persist consumer), this is
+        the set of gated probe names.  The incremental step sink then scores
+        just that subset every token (the gate consumes only those scalars),
+        while the big-K roster's per-token nearest-distance work is skipped.
+        The end-of-gen aggregate still covers the **full** roster: the tail ring
+        is also kept, so :meth:`_finalize_generation` pools the last content
+        token once and scores every probe (the gated subset live-scored, the
+        rest one-shot).  ``None`` (or empty) keeps the full per-token scoring.
         """
         if widen:
             layer_idxs = list(range(len(self._layers)))
@@ -2961,6 +3022,7 @@ class SaklasSession:
             if not union:
                 self._capture_incremental = False
                 self._capture_aggregate_only = False
+                self._capture_gating_subset = None
                 self._incremental_readings = []
                 return False
             layer_idxs = sorted(union)
@@ -2968,7 +3030,49 @@ class SaklasSession:
         self._capture.attach(self._layers, layer_idxs)
         self._incremental_readings = []
         self._capture_aggregate_only = False
-        if not widen and self._monitor.probe_names and need_per_token:
+        self._capture_gating_subset = None
+        # Gating-only-subset path: per-token scoring is needed solely to feed
+        # probe gates, so the step sink scores only the gated probes (the gate
+        # consumes only those scalars), skipping the big-K roster's per-token
+        # nearest-distance work.  A bounded tail ring is kept alongside the sink
+        # so finalize still pools the FULL roster once via the aggregate path —
+        # the gated subset's per-token rows are NOT the source of the final
+        # readings, the one-shot full aggregate is, so no probe drops.
+        gating_subset = (
+            gating_only_probes
+            if (gating_only_probes and need_per_token and not widen
+                and self._monitor.probe_names)
+            else None
+        )
+        if not widen and self._monitor.probe_names and need_per_token and gating_subset:
+            subset = set(gating_subset)
+
+            def _score_step_subset(latest: dict[int, torch.Tensor]) -> None:
+                # Score ONLY the gated probes each token (the gate's sole
+                # consumer); append even an empty dict to keep row indices
+                # aligned with decode forwards.  The full roster is pooled once
+                # at finalize from the tail ring (``_score_aggregate_only``).
+                self._incremental_readings.append(
+                    self._monitor.score_single_token(latest, only=subset)
+                    if latest else {}
+                )
+
+            # Deep tail ring (full-roster finalize via ``tail_slice_at``) PLUS a
+            # per-token step sink (gated subset, for the gate).  ``set_incremental``
+            # would force a length-1 buffer and drop the ring, and
+            # ``set_aggregate_tail`` installs no sink, so we arm the ring first
+            # and wire the sink directly — the hook fires the sink whenever it is
+            # set, independent of the tail depth (see ``HiddenCapture._hook``).
+            self._capture.set_aggregate_tail(_AGG_TAIL_DEPTH)
+            self._capture._step_sink = _score_step_subset
+            self._capture_incremental = False
+            self._capture_aggregate_only = True
+            self._capture_gating_subset = subset
+            # The subset is scored one token per step in order, so curved gated
+            # probes can warm-start their foot; cold-start the feet first.
+            self._monitor.reset_curved_feet()
+            self._monitor.enable_curved_warm(True)
+        elif not widen and self._monitor.probe_names and need_per_token:
             def _score_step(latest: dict[int, torch.Tensor]) -> None:
                 # Score once while the just-produced hidden slice is still the
                 # only retained device payload.  Append even an empty dict so
@@ -3132,6 +3236,12 @@ class SaklasSession:
         pooled = self._capture.tail_slice_at(agg_fwd)
         if not pooled:
             return empty
+        # One-shot pooled read over the full roster — keep curved probes on the
+        # cold foot solve so the aggregate is reproducible (it pools the last
+        # *content* token, which may differ from the live loop's last forward,
+        # so a warm foot seeded during gating-only subset scoring would not be
+        # the right warm start here).
+        self._monitor.enable_curved_warm(False)
         agg_vals = self._monitor.score_aggregate(pooled)
         # Fill any probe the pool missed (e.g. a layer absent from the ring).
         agg_vals = {name: agg_vals.get(name, empty[name]) for name in names}
@@ -4988,14 +5098,25 @@ class SaklasSession:
             # Otherwise (probes attached but only the aggregate wanted, e.g. a
             # stateless server gen) the capture skips per-token scoring entirely
             # and pools the aggregate once at finalize.
-            need_per_token = bool(
-                self._steering_needs_probe_gating()
-                or assistant_node_id is not None
+            _needs_gating = self._steering_needs_probe_gating()
+            # The five UI / trait / loom / persist consumers each need a
+            # per-token reading for the FULL roster.  When NONE of them is live
+            # but a probe gate is, gating is the SOLE per-token consumer (FIX
+            # #4): the step sink can score just the gated probes per token and
+            # leave the big-K roster to the one-shot full aggregate at finalize.
+            _per_token_full_consumer = bool(
+                assistant_node_id is not None
                 or _has_trait_consumer
                 or _wants_live_token_scores
                 or _persists_layer_scores
                 or _persists_probe_row
                 or _persists_subspace_coords
+            )
+            need_per_token = bool(_needs_gating or _per_token_full_consumer)
+            gating_only_probes: set[str] | None = (
+                self._gated_probe_names()
+                if (_needs_gating and not _per_token_full_consumer)
+                else None
             )
             self.events.emit(GenerationStarted(input=input, stateless=stateless))
             try:
@@ -5005,6 +5126,7 @@ class SaklasSession:
                 # ``_end_capture`` and ``end_live`` are idempotent.
                 self._begin_capture(
                     widen=want_hidden, need_per_token=need_per_token,
+                    gating_only_probes=gating_only_probes,
                 )
                 self._monitor.begin_live()
                 # Reset the steering manager's TriggerContext for this gen;
@@ -5116,6 +5238,7 @@ class SaklasSession:
             # (finalize has already consumed the rows by now). Belt-and-
             # suspenders: ``_begin_capture`` resets these at gen start too.
             self._capture_incremental = False
+            self._capture_gating_subset = None
             self._incremental_readings = []
             self._gen_phase = GenState.IDLE
             self._gen_lock.release()
