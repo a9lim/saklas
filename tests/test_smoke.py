@@ -392,7 +392,7 @@ class TestAblationPerformance:
         from saklas.core.session import SaklasSession
 
         model, tokenizer = model_and_tokenizer
-        session = SaklasSession(model, tokenizer, probes=["affect"])
+        session = SaklasSession(model, tokenizer, probes=["register"])
 
         try:
             prompt = "Write a 200-word essay on the history of bicycles."
