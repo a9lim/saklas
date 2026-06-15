@@ -138,15 +138,20 @@ def _add_injection_args(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument(
         "--compile", dest="compile", action="store_true",
-        help="Enable ``torch.compile`` on CUDA.  Off by default — the "
+        help="Enable ``torch.compile`` on CUDA or MPS.  Off by default — the "
              "compile path is intermittently broken on torch 2.12 for "
              "newer architectures (Gemma-4, Qwen3.5 hit inductor "
              "codegen bugs), and on interactive workloads the ~25–50s "
-             "compile cost rarely pays off against the 1.2–3× per-token "
-             "speedup it delivers when it works.  Pass this for "
-             "sustained workloads (long-running serve, batch eval) "
-             "where the upfront cost amortizes.  On MPS/CPU compile is "
-             "already a no-op.  YAML equivalent: ``compile: true``.",
+             "compile cost rarely pays off against the per-token speedup "
+             "it delivers when it works (~1.4–1.7× on MPS, 1.2–3× on "
+             "CUDA).  Pass this for sustained workloads (long-running "
+             "serve, batch eval) where the upfront cost amortizes.  On "
+             "MPS the fused fast path engages for unsteered AND "
+             "static-affine *steered* generation (the steering lowers to "
+             "persistent compile-clean offset hooks); only *probed* gens "
+             "(a live per-token monitor roster) still fall back to eager "
+             "for now — no regression, just no speedup there yet.  CPU is "
+             "still a no-op.  YAML equivalent: ``compile: true``.",
     )
     p.add_argument(
         "--cuda-graphs", dest="cuda_graphs", action="store_true",

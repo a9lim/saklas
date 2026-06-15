@@ -65,33 +65,26 @@ def _support_cache_key(
     return id(base), str(device), dtype
 
 
-def is_cuda_graphs_supported(
+def is_static_cache_supported(
     model: "PreTrainedModel | torch.nn.Module",
     device: torch.device | str,
 ) -> tuple[bool, str | None]:
-    """Probe whether StaticCache + CUDA-graph capture is viable.
+    """Probe whether :class:`transformers.StaticCache` is viable here.
 
-    Returns ``(supported, reason)``.  When ``supported=False``, ``reason``
-    is a short human-readable string explaining the gate that failed —
-    logged once per model so the user sees why the fast path is off
-    without spamming subsequent generations.
+    **Device-agnostic** — unlike :func:`is_cuda_graphs_supported`, this does
+    not require CUDA.  StaticCache (pre-allocated, fixed-shape K/V) is the
+    enabler for ``torch.compile`` on *any* backend: fixed kernel shapes across
+    the decode loop let inductor reuse one trace instead of re-specializing as a
+    ``DynamicCache`` grows.  On MPS the fixed-shape benefit is real (measured
+    ~+16% eager, and it unlocks the ~1.7x ``compile`` win on top), not the
+    "negligible" the old CUDA-only gate assumed.
 
-    Checks (in order):
-
-    1. Device is CUDA.  StaticCache works on CPU/MPS too but graph capture
-       only fires on CUDA, and on MPS the static-shape benefit is
-       negligible against the device-context overhead.
-    2. ``transformers.StaticCache`` is importable (transformers ≥ 4.40).
-    3. StaticCache constructs successfully against the model's config
-       with a 1-token capacity.  Some architectures (notably MLA variants
-       and certain custom modeling files) raise here even when
-       DynamicCache works.
+    Returns ``(supported, reason)``.  Checks: (1) ``StaticCache`` importable
+    (transformers ≥ 4.40); (2) it constructs against the model config with a
+    1-token capacity — some architectures (MLA variants, certain custom
+    modeling files) raise here even when ``DynamicCache`` works.  Cached by
+    ``(module id, device, dtype)``.
     """
-    dev_str = str(device)
-    dev_type = getattr(device, "type", "") if hasattr(device, "type") else dev_str
-    if dev_type != "cuda" and not dev_str.startswith("cuda"):
-        return False, f"device={dev_str!r} (CUDA-only)"
-
     cache_key = _support_cache_key(model, device)
     cached = _support_cache.get(cache_key)
     if cached is not None:
@@ -139,6 +132,26 @@ def is_cuda_graphs_supported(
     result = True, None
     _support_cache[cache_key] = result
     return result
+
+
+def is_cuda_graphs_supported(
+    model: "PreTrainedModel | torch.nn.Module",
+    device: torch.device | str,
+) -> tuple[bool, str | None]:
+    """Probe whether StaticCache + **CUDA-graph** capture is viable.
+
+    The CUDA-specific superset of :func:`is_static_cache_supported`: CUDA-graph
+    capture (via ``torch.compile(mode="reduce-overhead")``) only fires on CUDA,
+    so this gates device first, then defers to the device-agnostic StaticCache
+    probe.  ``__init__`` consults it to decide ``reduce-overhead`` vs the
+    ``default`` (fusion-only) compile mode; the MPS/CPU fast path uses
+    :func:`is_static_cache_supported` directly with ``default`` mode.
+    """
+    dev_str = str(device)
+    dev_type = getattr(device, "type", "") if hasattr(device, "type") else dev_str
+    if dev_type != "cuda" and not dev_str.startswith("cuda"):
+        return False, f"device={dev_str!r} (CUDA-only)"
+    return is_static_cache_supported(model, device)
 
 
 def make_static_cache(

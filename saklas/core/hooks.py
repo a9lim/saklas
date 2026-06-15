@@ -846,6 +846,18 @@ class SteeringManager:
         # manifolds.
         self.subspaces: dict[str, dict[str, Any]] = {}
         self.ctx: TriggerContext = TriggerContext()
+        # Persistent compile-clean steering path (MPS torch.compile).  A single
+        # branchless ``hidden.add_(offset)`` hook per layer, attached ONCE before
+        # compile (so it is traced into the captured graph) and never
+        # re-registered — the per-gen steering is pushed by updating the
+        # ``(D,)`` offset buffers *in place* (``copy_``), which torch.compile
+        # does not retrace on (tensor value, not identity/structure).  Only the
+        # static-affine pure-push case lowers here (``compute_static_offsets``);
+        # curved / gated / ablation steering keeps the transient ``hooks`` path
+        # on the eager model.  ``_compiled_offsets`` maps layer → buffer;
+        # populated by :meth:`adopt_compiled_offsets` at session construction.
+        self._compiled_offsets: dict[int, torch.Tensor] = {}
+        self._compiled_offset_handles: list[Any] = []
 
     def all_fast_path(self) -> bool:
         """True iff no steering hook is attached (the unsteered path).
@@ -1190,3 +1202,130 @@ class SteeringManager:
         self.hooks.clear()
         self.manifolds.clear()
         self.subspaces.clear()
+
+    # -- Persistent compile-clean offset path (MPS torch.compile) --------------
+
+    def adopt_compiled_offsets(
+        self, buffers: dict[int, torch.Tensor], handles: list[Any],
+    ) -> None:
+        """Adopt the persistent per-layer offset buffers + hook handles.
+
+        Built by :func:`install_persistent_offset_hooks` in ``from_pretrained``
+        *before* ``torch.compile`` so the branchless ``add_(offset)`` hooks are
+        traced into the captured graph.  The session hands them here so the
+        manager can push static-affine steering by updating the buffers in place.
+        """
+        self._compiled_offsets = buffers
+        self._compiled_offset_handles = handles
+
+    def has_compiled_offsets(self) -> bool:
+        return bool(self._compiled_offsets)
+
+    def compute_static_offsets(self) -> "dict[int, torch.Tensor] | None":
+        """Per-layer constant steering offsets, or ``None`` if not compile-clean.
+
+        Returns ``{}`` for unsteered (all buffers zero), a ``{layer: (D,)}`` map
+        for the static-affine pure-push case (every subspace is an always-active
+        ``Trigger.BOTH`` push with zero ablation mask κ and no curved manifold),
+        and ``None`` for anything that needs the per-token kernel (curved ``%``,
+        a probe gate / phase trigger, or an ``!`` ablation).  The offset is the
+        same world vector the transient :meth:`SteeringHook._pure_push_constant`
+        fast path adds (``(share_L·gain·target) @ basis``), so the compiled and
+        eager pushes are numerically identical.
+        """
+        if self.manifolds:
+            return None  # a curved manifold isn't a constant add
+        offsets: dict[int, torch.Tensor] = {}
+        for s in self.subspaces.values():
+            synth: SynthesizedSubspace = s["synth"]
+            if s["trigger"] is not Trigger.BOTH:
+                return None  # gated / phased — needs the ctx-consulting hook
+            layer_set = list(synth.layers)
+            if not layer_set:
+                continue
+            raw_share = {L: float(synth.share.get(L, 0.0)) for L in layer_set}
+            shares = _normalize_shares_mean1(raw_share)
+            for L in layer_set:
+                sub_L = synth.layers[L]
+                kappa = synth.kappa.get(L)
+                if kappa is not None and bool((kappa.abs() > 0).any()):
+                    return None  # ablation: injection depends on h, not a const
+                target = synth.target_coord[L].to(torch.float32)
+                basis = sub_L.basis.to(torch.float32)              # (R, D)
+                eff_along = shares[L] * _MANIFOLD_ALONG_GAIN
+                c = (eff_along * target) @ basis                   # (D,)
+                offsets[L] = offsets[L] + c if L in offsets else c
+        return offsets
+
+    def write_compiled_offsets(self, offsets: dict[int, torch.Tensor]) -> None:
+        """Push ``offsets`` into the persistent buffers in place (``copy_``).
+
+        Layers absent from ``offsets`` are zeroed, so a stale push can't leak
+        into a layer the current steering doesn't touch.  In-place is load-
+        bearing: reassigning the buffer tensor would change its identity and
+        force a torch.compile retrace.
+        """
+        for L, buf in self._compiled_offsets.items():
+            c = offsets.get(L)
+            if c is None:
+                buf.zero_()
+            else:
+                buf.copy_(c)   # copy_ casts to the buffer's device/dtype
+
+    def zero_compiled_offsets(self) -> None:
+        """Zero every persistent offset buffer (no steering push)."""
+        for buf in self._compiled_offsets.values():
+            buf.zero_()
+
+    def detach_transient_hooks(self) -> None:
+        """Detach the ctx-consulting steering hooks, keeping synthesis state.
+
+        Used by the compiled offset path: the per-layer push is carried by the
+        persistent offset buffers, so the transient :class:`SteeringHook`s must
+        not also fire (they would double-apply on the eager fallback, and their
+        attach/detach churn recompiles the graph).  ``subspaces`` / ``manifolds``
+        are left intact (already consumed into the offsets; cleared on scope
+        pop).
+        """
+        for hook in self.hooks.values():
+            hook.detach()
+        self.hooks.clear()
+
+    def detach_compiled_offsets(self) -> None:
+        """Remove the persistent offset hooks (compile-failure / teardown)."""
+        for h in self._compiled_offset_handles:
+            h.remove()
+        self._compiled_offset_handles = []
+        self._compiled_offsets = {}
+
+
+def install_persistent_offset_hooks(
+    layers: "torch.nn.ModuleList",
+    hidden_size: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> "tuple[dict[int, torch.Tensor], list[Any]]":
+    """Attach one branchless ``hidden.add_(offset)`` forward hook per layer.
+
+    The persistent compile-clean steering path: each layer gets a preallocated
+    ``(hidden_size,)`` offset buffer (zero-initialized) and a hook that adds it
+    in place.  Call **before** ``torch.compile`` so the add is captured in the
+    traced graph; per-generation steering then updates the buffers in place
+    (:meth:`SteeringManager.write_compiled_offsets`) without retracing.  Returns
+    ``(buffers, handles)`` for :meth:`SteeringManager.adopt_compiled_offsets`.
+    """
+    buffers: dict[int, torch.Tensor] = {}
+    handles: list[Any] = []
+
+    def _make(buf: torch.Tensor) -> Any:
+        def _hook(module: Any, inp: Any, out: Any) -> Any:
+            h = out if isinstance(out, torch.Tensor) else out[0]
+            h.add_(buf)
+            return out
+        return _hook
+
+    for idx in range(len(layers)):
+        buf = torch.zeros(hidden_size, device=device, dtype=dtype)
+        buffers[idx] = buf
+        handles.append(layers[idx].register_forward_hook(_make(buf)))
+    return buffers, handles

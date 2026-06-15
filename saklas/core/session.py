@@ -661,8 +661,34 @@ class SaklasSession:
         # ``_compile_with_probe`` so an architecture-specific inductor /
         # Triton bug surfaces at load time as a caught warning + eager
         # fallback, rather than as a segfault on the user's first token.
-        if compile and device_obj.type == "cuda":
-            from saklas.core.model import _compile_with_probe
+        #
+        # MPS is now eligible (not just CUDA): inductor's MPS backend fuses the
+        # per-layer kernels and amortizes dispatch, which is the dominant decode
+        # cost on Metal — measured ~1.7x on gemma-3-4b paired with StaticCache.
+        # CUDA-graph capture (``reduce-overhead``) stays CUDA-only, so on MPS
+        # ``effective_compile_mode`` is ``"default"`` (``cg_supported`` is False
+        # there) — fusion without graph capture, which composes with the
+        # transient steering hooks and StaticCache the decode loop installs.
+        offset_buffers: dict[int, Any] = {}
+        offset_handles: list[Any] = []
+        if compile and device_obj.type in ("cuda", "mps"):
+            from saklas.core.hooks import install_persistent_offset_hooks
+            from saklas.core.model import _compile_with_probe, get_layers
+            # Attach the persistent branchless ``add_(offset)`` steering hooks
+            # BEFORE compile so they ride inside the captured graph (post-compile
+            # hook changes are not retraced — ``skip_nnmodule_hook_guards``).
+            # Per-gen static-affine steering then updates the offset buffers in
+            # place; the compiled fast path sees a stable hook topology and never
+            # recompiles.  ``hidden_size`` falls back to the text sub-config for
+            # multimodal wrappers (Gemma-3/4).
+            hidden_size = getattr(model.config, "hidden_size", None)
+            if hidden_size is None and hasattr(model.config, "get_text_config"):
+                hidden_size = model.config.get_text_config().hidden_size
+            if hidden_size is not None:
+                model_dtype = next(model.parameters()).dtype
+                offset_buffers, offset_handles = install_persistent_offset_hooks(
+                    get_layers(model), int(hidden_size), device_obj, model_dtype,
+                )
             model = _compile_with_probe(
                 model, tokenizer, device_obj,
                 mode=effective_compile_mode,
@@ -670,7 +696,7 @@ class SaklasSession:
         elif compile:
             _log.info(
                 "compile=True but device=%s — skipping torch.compile "
-                "(supported only on CUDA)",
+                "(supported only on CUDA / MPS)",
                 device_obj.type,
             )
 
@@ -679,7 +705,7 @@ class SaklasSession:
         # wrapper via ``_orig_mod``), so this second call is a dictionary
         # lookup rather than another StaticCache(max_cache_len=1)
         # allocation.
-        return cls(
+        session = cls(
             model,  # pyright: ignore[reportArgumentType]  # may be torch.compile OptimizedModule wrapping PreTrainedModel
             tokenizer,
             probes=probes,
@@ -689,6 +715,17 @@ class SaklasSession:
             cuda_graphs=cuda_graphs,
             return_top_k=return_top_k,
         )
+        # Adopt the persistent offset hooks iff compile actually stuck; if it
+        # fell back to eager, drop them (their add_(0) would be pure overhead).
+        if offset_handles:
+            if session._compiled:
+                session._steering.adopt_compiled_offsets(
+                    offset_buffers, offset_handles,
+                )
+            else:
+                for h in offset_handles:
+                    h.remove()
+        return session
 
     def __init__(
         self,
@@ -756,6 +793,27 @@ class SaklasSession:
                 self._cuda_graphs_active = True
             elif reason is not None:
                 warn_once(self._model, reason)
+        # ``torch.compile`` left an ``_orig_mod`` wrapper iff it stuck (the
+        # probe in ``from_pretrained`` falls back to the eager model on failure).
+        # The compiled fast path wants StaticCache so inductor traces one fixed
+        # decode shape instead of re-specializing as a DynamicCache grows;
+        # ``_static_cache_active`` gates that, device-agnostically (CUDA *or*
+        # MPS), distinct from the CUDA-only ``_cuda_graphs_active`` graph-capture
+        # signal.  Either one (or a future StaticCache-only opt-in) enables the
+        # preallocated K/V path for fast-path-eligible steering.
+        self._compiled: bool = hasattr(self._model, "_orig_mod")
+        self._static_cache_active: bool = False
+        if self._compiled or self._cuda_graphs_active:
+            from saklas.core.cuda_graphs import (
+                is_static_cache_supported, warn_once,
+            )
+            sc_supported, sc_reason = is_static_cache_supported(
+                self._model, self._device,
+            )
+            if sc_supported:
+                self._static_cache_active = True
+            elif sc_reason is not None:
+                warn_once(self._model, sc_reason)
         # LIFO stack of per-scope entries dicts pushed by session.steering().
         # Each entry is ``{name: (alpha, Trigger)}`` — triggers are
         # preserved through stack flattening so nested scopes with
@@ -763,6 +821,12 @@ class SaklasSession:
         # (later entries overwrite earlier ones) is what the steering
         # manager installs when a generation begins.
         self._steering_stack: list[dict[str, SteeringStackEntry]] = []
+
+        # Set by ``_install_composed_steering`` when the current steering lowers
+        # to the persistent compile-clean offset buffers (static-affine push, no
+        # probes, compiled MPS session) instead of transient hooks — routes the
+        # decode loop to the compiled module + StaticCache.
+        self._steering_uses_compiled_offsets: bool = False
 
         # Active assistant-role label for the current ``session.steering()``
         # scope — populated when every role-tagged term in the resolved
@@ -2989,7 +3053,38 @@ class SaklasSession:
             )
 
     def _install_composed_steering(self) -> None:
-        """Attach the currently-composed steering entries to model layers."""
+        """Attach the currently-composed steering entries to model layers.
+
+        Compiled fast path (MPS): a static-affine pure-push steering lowers to
+        the persistent branchless offset buffers (traced into the compiled
+        graph) instead of transient ctx-consulting hooks — the latter would
+        force a per-gen ``torch.compile`` recompile and graph-break at every
+        layer.  Gated on no probes (per-token capture isn't compile-clean yet)
+        and on the offsets being available (compiled session).  Anything that
+        isn't a constant add (curved ``%``, gate, phase, ``!`` ablation) returns
+        ``None`` from :meth:`compute_static_offsets` and falls through to the
+        transient eager path.
+        """
+        self._steering_uses_compiled_offsets = False
+        # ``getattr`` defaults keep skeleton sessions (``__new__`` test stubs that
+        # bypass ``__init__``) on the transient path — they never compile.
+        if (
+            getattr(self, "_compiled", False)
+            and self._device.type == "mps"
+            and self._steering.has_compiled_offsets()
+            and not self._monitor.probe_names
+        ):
+            offsets = self._steering.compute_static_offsets()
+            if offsets is not None:
+                self._steering.detach_transient_hooks()
+                self._steering.write_compiled_offsets(offsets)
+                self._steering_uses_compiled_offsets = True
+                return
+        # Eager / general path: zero the persistent offsets (no stale push leaks
+        # into the eager model, whose layers carry the same persistent hooks)
+        # and attach the transient ctx-consulting hooks.
+        if self._steering.has_compiled_offsets():
+            self._steering.zero_compiled_offsets()
         self._steering.apply_to_model(
             self._layers, self._device, self._dtype,
         )
@@ -4856,24 +4951,49 @@ class SaklasSession:
             if self._steering_needs_probe_gating()
             else None
         )
-        # StaticCache / CUDA-graph capture is eligible when generation is
-        # unsteered (``all_fast_path``) OR every steered layer is the static
-        # single-affine fast path (``static_steerable`` — Trigger.BOTH affine
-        # slide, no ctx, no foot, no gate).  StaticCache never bypasses the
-        # forward hooks, so the steering still applies; only the KV buffers are
-        # preallocated.  ``_cuda_graphs_active`` is CUDA-only, so this is inert
-        # on MPS/CPU.  Curved / gated / phased steering keeps the eager
+        # StaticCache (+ compile fusion on MPS, + CUDA-graph capture on CUDA) is
+        # eligible when generation is unsteered (``all_fast_path``) OR every
+        # steered layer is the static single-affine fast path
+        # (``static_steerable`` — Trigger.BOTH affine slide, no ctx, no foot, no
+        # gate).  StaticCache never bypasses the forward hooks, so the steering
+        # still applies; only the KV buffers are preallocated and the decode
+        # shape stays fixed (what lets the compiled graph stay specialized).
+        # ``_static_cache_active`` is device-agnostic (set when compile stuck or
+        # CUDA graphs are on).  Curved / gated / phased steering keeps the eager
         # DynamicCache path.
         use_static_cache = (
-            self._cuda_graphs_active
+            self._static_cache_active
             and cached_pkv is None
             and (
                 self._steering.all_fast_path()
                 or self._steering.static_steerable()
             )
         )
+        # Compiled-model routing (MPS).  The graph was traced with ONLY the
+        # persistent branchless offset hooks present (attached pre-compile), so
+        # the compiled module is correct exactly when the live hook topology
+        # matches that: no per-token capture hooks AND either unsteered or a
+        # static-affine steering that lowered to the persistent offset buffers
+        # (``_steering_uses_compiled_offsets`` — the push rides the offset, no
+        # transient hook).  Everything else (transient ctx-consulting steering
+        # hooks, the probe roster's capture hooks) graph-breaks / recompiles, so
+        # route it to the eager original (``_orig_mod``) + DynamicCache — where
+        # the same persistent hooks still apply any offsets, so correctness
+        # holds and ``compile=True`` never regresses the hooked path.  CUDA keeps
+        # its existing graph-capture path untouched.
+        gen_model = self._model
+        if self._compiled and self._device.type == "mps":
+            compiled_clean = not self._capture._handles and (
+                self._steering_uses_compiled_offsets
+                or self._steering.all_fast_path()
+            )
+            if compiled_clean:
+                use_static_cache = self._static_cache_active and cached_pkv is None
+            else:
+                gen_model = getattr(self._model, "_orig_mod", self._model)
+                use_static_cache = False
         generated_ids = generate_steered(
-            self._model, self._tokenizer, effective_input_ids,
+            gen_model, self._tokenizer, effective_input_ids,
             gen_config, self._gen_state, thinking=use_thinking,
             on_token=effective_tap,
             seed=seed, stop=stop_list, logit_bias=logit_bias,
@@ -5380,6 +5500,13 @@ class SaklasSession:
             self._capture_gating_keys = None
             self._incremental_readings = []
             self._incremental_gate_scores = []
+            # Zero the persistent compile-clean steering offsets so a static-
+            # affine push can't leak into a later generation that takes the
+            # eager / unsteered path without re-running ``_install_composed_
+            # steering`` (unsteered gens have no steering scope to reset them).
+            self._steering_uses_compiled_offsets = False
+            if self._steering.has_compiled_offsets():
+                self._steering.zero_compiled_offsets()
             self._gen_phase = GenState.IDLE
             self._gen_lock.release()
 

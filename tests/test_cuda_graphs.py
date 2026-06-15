@@ -23,6 +23,22 @@ import torch
 from saklas.core import cuda_graphs as cg
 
 
+@pytest.fixture(autouse=True)
+def _isolate_cg_module_caches():
+    """Clear the module-level support/warn caches around every test.
+
+    ``is_static_cache_supported`` memoizes by ``id(model)``, which Python can
+    reuse across the throwaway ``_FakeModel`` instances different tests build —
+    so without isolation a cached ``(id, device) -> True`` can leak into a later
+    test that expects a construction failure.  Clear before and after.
+    """
+    cg._support_cache.clear()
+    cg._warned_models.clear()
+    yield
+    cg._support_cache.clear()
+    cg._warned_models.clear()
+
+
 # ---------------------------------------------------------------------------
 # Device gating — CUDA graphs are CUDA-only.
 # ---------------------------------------------------------------------------
@@ -53,14 +69,55 @@ def test_cpu_device_returns_unsupported():
 
 
 def test_mps_device_returns_unsupported():
-    """MPS path mirrors CPU.  We could in principle build StaticCache on
-    MPS but graph capture is a CUDA-only torch feature, so the static-
-    shape benefit doesn't pay off — simpler to gate at device.
+    """``is_cuda_graphs_supported`` still gates MPS out — CUDA-graph capture
+    (``reduce-overhead``) is a CUDA-only torch feature.  StaticCache + compile
+    *fusion* on MPS is a separate, device-agnostic probe
+    (:func:`is_static_cache_supported`, covered below).
     """
     m: Any = _FakeModel()
     supported, reason = cg.is_cuda_graphs_supported(m, "mps")
     assert supported is False
     assert reason is not None and "CUDA-only" in reason
+
+
+def test_static_cache_supported_is_device_agnostic():
+    """``is_static_cache_supported`` does NOT gate on CUDA — StaticCache (the
+    enabler for ``torch.compile`` fusion) pays off on MPS/CPU too, so it
+    proceeds to the construction probe on any device instead of short-
+    circuiting with a 'CUDA-only' reason."""
+    import transformers
+
+    class _OKCache:
+        def __init__(self, *a: Any, **k: Any) -> None:
+            self.layers = [object(), object()]
+
+    m: Any = _FakeModel()
+    # Patch the binding ``is_static_cache_supported`` reads (``from transformers
+    # import StaticCache``) — patching ``cache_utils.StaticCache`` is fragile
+    # once the lazy top-level attribute has resolved.
+    with patch.object(transformers, "StaticCache", _OKCache):
+        for dev in ("mps", "cpu", "cuda"):
+            supported, reason = cg.is_static_cache_supported(m, dev)
+            assert supported is True, (dev, reason)
+            assert reason is None
+    # The CUDA-graphs probe still rejects the non-CUDA devices (graph capture),
+    # even though StaticCache itself is supported there.
+    assert cg.is_cuda_graphs_supported(m, "mps")[0] is False
+    assert cg.is_cuda_graphs_supported(m, "cpu")[0] is False
+
+
+def test_static_cache_construction_failure_device_agnostic():
+    """A StaticCache that fails to construct is reported as unsupported on MPS
+    too (a real reason, not the CUDA-only gate)."""
+    import transformers
+    m: Any = _FakeModel()
+    with patch.object(
+        transformers, "StaticCache",
+        side_effect=RuntimeError("synthetic: layer_types missing"),
+    ):
+        supported, reason = cg.is_static_cache_supported(m, "mps")
+    assert supported is False
+    assert reason is not None and "StaticCache construction failed" in reason
 
 
 def test_torch_device_object_accepted():
@@ -86,21 +143,19 @@ def test_static_cache_construction_failure_returns_unsupported():
     propagating the raw exception — callers expect a ``(bool, str|None)``
     contract regardless of the underlying failure mode.
     """
-    # Force the device check to think we're on CUDA so the StaticCache
-    # branch fires; mock the import to raise.
-    with patch.object(cg, "torch", torch):  # keep the real torch
-        # Build a fake "cuda" device string and a model that crashes
-        # StaticCache construction.  The function imports StaticCache
-        # locally; we patch it via the transformers module.
-        from transformers import cache_utils
-        with patch.object(
-            cache_utils, "StaticCache",
-            side_effect=RuntimeError("synthetic: layer_types missing"),
-        ):
-            m: Any = _FakeModel()
-            supported, reason = cg.is_cuda_graphs_supported(
-                m, "cuda",
-            )
+    # Build a model that crashes StaticCache construction.  The function does
+    # ``from transformers import StaticCache`` at call time, so patch that
+    # binding (not ``cache_utils.StaticCache``, which the lazy top-level
+    # attribute may already have resolved past).
+    import transformers
+    with patch.object(
+        transformers, "StaticCache",
+        side_effect=RuntimeError("synthetic: layer_types missing"),
+    ):
+        m: Any = _FakeModel()
+        supported, reason = cg.is_cuda_graphs_supported(
+            m, "cuda",
+        )
     assert supported is False
     assert reason is not None
     assert "StaticCache construction failed" in reason
