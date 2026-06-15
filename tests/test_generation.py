@@ -121,6 +121,25 @@ class _NoCacheModel(_StopModel):
         return out
 
 
+class _SplitStopTokenizer(_StopTokenizer):
+    name_or_path = "split-stop-tokenizer"
+    vocab_size = 5
+    _pieces = {
+        0: "Hello S",
+        1: "TOP",
+        2: " ignored",
+        3: "",
+    }
+
+
+class _SplitStopModel(_StopModel):
+    config = SimpleNamespace(vocab_size=5)
+
+    def __init__(self):
+        self._tokens = [0, 1, 3]
+        self._idx = 0
+
+
 def test_stop_sequence_trimmed_text_is_final_result_text():
     model: Any = _StopModel()
     tokenizer: Any = _StopTokenizer()
@@ -160,6 +179,28 @@ def test_stop_sequence_trimmed_text_is_final_result_text():
         stateless=True,
     )
     assert result.text == "Hello"
+
+
+def test_stop_sequence_split_across_tokens_trims_final_text():
+    model: Any = _SplitStopModel()
+    tokenizer: Any = _SplitStopTokenizer()
+    state = GenerationState()
+    emitted: list[str] = []
+
+    generated_ids = generate_steered(
+        model,
+        cast(Any, tokenizer),
+        torch.tensor([[0]]),
+        GenerationConfig(max_new_tokens=5, temperature=0.0),
+        state,
+        on_token=lambda text, *_args: emitted.append(text),
+        stop=[" STOP"],
+    )
+
+    assert generated_ids == [0, 1]
+    assert emitted == ["Hello S"]
+    assert state.finish_reason == "stop_sequence"
+    assert state.response_text == "Hello"
 
 
 def test_stop_sequence_only_tap_can_skip_full_token_table():

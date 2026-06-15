@@ -533,6 +533,28 @@ def test_logvol_bias_attached_and_finite():
     assert (bias.max() - bias.min()).abs() < 1e-5
 
 
+def test_gate_scalar_fraction_label_assignment_skip_curved_foot(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Gate-only curved fraction/label/assignment channels avoid foot solves."""
+    m = _curved_toy(dim=8)
+    _attach_const_sigma(m, 0.3)
+    mon = _iso_monitor(m)
+    mon.add_probe("curve", m, top_n=5)
+    hidden = {L: _node_world(m, L)[2] for L in m.layers}
+    full = mon.flat_scalars(mon.score_single_token(hidden))
+
+    def _fail_foot(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("gate scalar path should not solve a curved foot")
+
+    monkeypatch.setattr("saklas.core.monitor.invert_parameterization", _fail_foot)
+    keys = {"curve:fraction", "curve@c", "curve~c"}
+    scalars = mon.score_gate_scalars(hidden, keys)
+    assert scalars["curve:fraction"] == pytest.approx(full["curve:fraction"])
+    assert scalars["curve@c"] == pytest.approx(full["curve@c"])
+    assert scalars["curve~c"] == pytest.approx(full["curve~c"])
+
+
 def test_membership_high_on_surface_low_off_tube():
     # With a σ-field, membership is ~1 on the surface and collapses far off it.
     m = _curved_toy(dim=8)

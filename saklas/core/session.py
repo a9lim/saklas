@@ -809,6 +809,8 @@ class SaklasSession:
         # ring is kept so ``_finalize_generation`` can pool the FULL roster
         # once. Empty/None ⇒ not in this mode. Set in ``_begin_capture``.
         self._capture_gating_subset: set[str] | None = None
+        self._capture_gating_keys: set[str] | None = None
+        self._incremental_gate_scores: list[dict[str, float]] = []
 
         # Reentrant — ``_generate_core`` acquires it for the whole gen,
         # then enters an internal ``self.steering(...)`` scope which
@@ -2707,6 +2709,23 @@ class SaklasSession:
                 out.add(name)
         return out
 
+    def _gated_probe_keys(self) -> set[str]:
+        """Exact monitor scalar keys referenced by active probe gates."""
+        attached = set(self._monitor.probe_names)
+        out: set[str] = set()
+        for entry in self._flatten_steering_stack().values():
+            if isinstance(entry, (AblationTerm, ManifoldTerm)):
+                trig = entry.trigger
+            else:  # (alpha, Trigger)
+                _alpha, trig = entry
+            gate = trig.gate
+            if gate is None:
+                continue
+            name = re.split(r"[\[:@~]", gate.probe, maxsplit=1)[0]
+            if name in attached:
+                out.add(gate.probe)
+        return out
+
     def _steering_active_in_prefill(self) -> bool:
         """Return True iff any active steering term fires during prompt prefill.
 
@@ -2816,20 +2835,23 @@ class SaklasSession:
 
         def _score() -> dict[str, float]:
             incremental_readings = getattr(self, "_incremental_readings", [])
+            incremental_gate_scores = getattr(self, "_incremental_gate_scores", [])
             # The step sink already scored this token's readings — reuse them so
             # the gate doesn't trigger a second pass.  In gating-only-subset mode
             # (FIX #4) the rows hold just the gated probes, which is exactly the
             # set the gate consults; in the full incremental mode they hold the
             # whole roster.  Both reuse the latest appended row.
             gating_subset = getattr(self, "_capture_gating_subset", None)
-            if (
-                getattr(self, "_capture_incremental", False)
-                or gating_subset
-            ) and incremental_readings:
+            if gating_subset and incremental_gate_scores:
+                return incremental_gate_scores[-1]
+            if getattr(self, "_capture_incremental", False) and incremental_readings:
                 return monitor.flat_scalars(incremental_readings[-1])
             latest = capture.latest_per_layer()
             if not latest:
                 return {}
+            gate_keys = getattr(self, "_capture_gating_keys", None)
+            if gating_subset and gate_keys:
+                return monitor.score_gate_scalars(latest, gate_keys)
             # Flatten the coordinate readings into gate-callback scalars
             # (``name`` aliases axis 0, ``name[i]`` per axis, ``name:fraction``,
             # ``name@label`` for curved nearest).  Scope to the gated subset
@@ -2984,6 +3006,7 @@ class SaklasSession:
     def _begin_capture(
         self, *, widen: bool = False, need_per_token: bool = True,
         gating_only_probes: set[str] | None = None,
+        gating_probe_keys: set[str] | None = None,
     ) -> bool:
         """Attach hidden-state capture. Returns True if attached.
 
@@ -3029,8 +3052,10 @@ class SaklasSession:
         self._capture.clear()
         self._capture.attach(self._layers, layer_idxs)
         self._incremental_readings = []
+        self._incremental_gate_scores = []
         self._capture_aggregate_only = False
         self._capture_gating_subset = None
+        self._capture_gating_keys = None
         # Gating-only-subset path: per-token scoring is needed solely to feed
         # probe gates, so the step sink scores only the gated probes (the gate
         # consumes only those scalars), skipping the big-K roster's per-token
@@ -3046,15 +3071,16 @@ class SaklasSession:
         )
         if not widen and self._monitor.probe_names and need_per_token and gating_subset:
             subset = set(gating_subset)
+            gate_keys = set(gating_probe_keys or ())
 
             def _score_step_subset(latest: dict[int, torch.Tensor]) -> None:
-                # Score ONLY the gated probes each token (the gate's sole
-                # consumer); append even an empty dict to keep row indices
-                # aligned with decode forwards.  The full roster is pooled once
-                # at finalize from the tail ring (``_score_aggregate_only``).
-                self._incremental_readings.append(
-                    self._monitor.score_single_token(latest, only=subset)
-                    if latest else {}
+                # Score ONLY the exact gate scalar keys each token (the gate's
+                # sole consumer); append even an empty dict to keep row indices
+                # aligned with decode forwards.  The full roster is pooled once at
+                # finalize from the tail ring (``_score_aggregate_only``).
+                self._incremental_gate_scores.append(
+                    self._monitor.score_gate_scalars(latest, gate_keys)
+                    if latest and gate_keys else {}
                 )
 
             # Deep tail ring (full-roster finalize via ``tail_slice_at``) PLUS a
@@ -3068,6 +3094,7 @@ class SaklasSession:
             self._capture_incremental = False
             self._capture_aggregate_only = True
             self._capture_gating_subset = subset
+            self._capture_gating_keys = gate_keys
             # The subset is scored one token per step in order, so curved gated
             # probes can warm-start their foot; cold-start the feet first.
             self._monitor.reset_curved_feet()
@@ -5118,6 +5145,11 @@ class SaklasSession:
                 if (_needs_gating and not _per_token_full_consumer)
                 else None
             )
+            gating_probe_keys: set[str] | None = (
+                self._gated_probe_keys()
+                if (_needs_gating and not _per_token_full_consumer)
+                else None
+            )
             self.events.emit(GenerationStarted(input=input, stateless=stateless))
             try:
                 # Capture attach + monitor live + ctx.reset live INSIDE the
@@ -5127,6 +5159,7 @@ class SaklasSession:
                 self._begin_capture(
                     widen=want_hidden, need_per_token=need_per_token,
                     gating_only_probes=gating_only_probes,
+                    gating_probe_keys=gating_probe_keys,
                 )
                 self._monitor.begin_live()
                 # Reset the steering manager's TriggerContext for this gen;
@@ -5239,7 +5272,9 @@ class SaklasSession:
             # suspenders: ``_begin_capture`` resets these at gen start too.
             self._capture_incremental = False
             self._capture_gating_subset = None
+            self._capture_gating_keys = None
             self._incremental_readings = []
+            self._incremental_gate_scores = []
             self._gen_phase = GenState.IDLE
             self._gen_lock.release()
 

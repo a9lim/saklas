@@ -2388,40 +2388,46 @@ def subspace_inject(
     for _ in range(int(gn_steps)):
         p, _ = _gn_step(p, q, np_, rw, pc, offset, scale, domain, damping)
 
-    emb_old = (domain.embed(p) - offset) / scale       # (.., m)
+    along_zero = not isinstance(along, torch.Tensor) and float(along) == 0.0
+    onto_zero = not isinstance(onto, torch.Tensor) and float(onto) == 0.0
+
+    emb_old_raw = domain.embed(p)                      # (.., m) un-normalized
+    emb_old = (emb_old_raw - offset) / scale           # (.., m)
     foot_red = eval_rbf(np_, rw, pc, emb_old)          # (.., R)
     Hn_red = q - foot_red                              # (.., R) off-manifold-in-subspace (reduced)
-    # World-reduced tangent columns of M at the *old* foot p: dRBF/dcoord chained
-    # through the embedding Jacobian (the reduced-space analogue of
-    # Manifold.tangent).  Needed alongside the new-foot frame so the residual can
-    # be rotated between them rather than reprojected.
-    j_old = (
-        eval_rbf_jacobian(np_, rw, pc, emb_old) / scale  # (.., R, m)
-    ) @ domain.embed_jacobian(p)                         # (.., R, n)
 
     # --- ALONG: translate the foot along the surface ---
     # Translate p* by the parallel-transported neutral→target offset (scaled by
     # ``along``), preserving the per-token foot spread rather than collapsing
     # every foot onto the absolute target.  ``origin`` is this layer's neutral
     # foot; falls back to coord 0.
-    org = origin if origin is not None else torch.zeros_like(target)
-    p_new = domain.translate_foot(p, org, target, along)  # (.., n)
-    emb_new_raw = domain.embed(p_new)                  # (.., m) un-normalized
-    emb_new = (emb_new_raw - offset) / scale           # (.., m)
-    foot_new_red = eval_rbf(np_, rw, pc, emb_new)      # (.., R)
-    j_new = (
-        eval_rbf_jacobian(np_, rw, pc, emb_new) / scale  # (.., R, m)
-    ) @ domain.embed_jacobian(p_new)                     # (.., R, n) tangent at p_new
+    if along_zero:
+        p_new = p
+        emb_new_raw = emb_old_raw
+        foot_new_red = foot_red
+        Hn_trans = Hn_red
+    else:
+        org = origin if origin is not None else torch.zeros_like(target)
+        p_new = domain.translate_foot(p, org, target, along)  # (.., n)
+        emb_new_raw = domain.embed(p_new)                  # (.., m) un-normalized
+        emb_new = (emb_new_raw - offset) / scale           # (.., m)
+        foot_new_red = eval_rbf(np_, rw, pc, emb_new)      # (.., R)
+        # World-reduced tangent columns of M at the old/new feet: dRBF/dcoord
+        # chained through the embedding Jacobian (the reduced-space analogue of
+        # Manifold.tangent).  Needed only when the foot actually moves; when
+        # along==0 the transport is exactly identity, so skipping this avoids the
+        # n>=2 MPS SVD CPU hop and two Jacobian evaluations.
+        j_old = (
+            eval_rbf_jacobian(np_, rw, pc, emb_old) / scale  # (.., R, m)
+        ) @ domain.embed_jacobian(p)                         # (.., R, n)
+        j_new = (
+            eval_rbf_jacobian(np_, rw, pc, emb_new) / scale  # (.., R, m)
+        ) @ domain.embed_jacobian(p_new)                     # (.., R, n)
 
-    # Transport the off-surface residual from the frame at p to the frame at
-    # p_new by the minimal orthogonal (principal-angle) rotation between the two
-    # tangent subspaces.  Identity when the foot didn't move (``along == 0`` ⇒
-    # p_new == p ⇒ exact identity at rest), norm-preserving, and discards no
-    # component — the three properties the former project-onto-normal + renorm
-    # lacked (it corrupted every off-neutral activation by the residual's
-    # tangential part, independent of the slide).  See
-    # :func:`_frame_rotation_transport`.
-    Hn_trans = _frame_rotation_transport(Hn_red, j_old, j_new)  # (.., R)
+        # Transport the off-surface residual from the frame at p to the frame at
+        # p_new by the minimal orthogonal (principal-angle) rotation between the
+        # two tangent subspaces.  See :func:`_frame_rotation_transport`.
+        Hn_trans = _frame_rotation_transport(Hn_red, j_old, j_new)  # (.., R)
 
     # --- ONTO: collapse the transported off-manifold residual toward the tube ---
     # Legacy (zero-thickness wire, σ-field absent): scale ``H_n`` by ``(1 − o)``
@@ -2435,11 +2441,16 @@ def subspace_inject(
     # and a token already inside the tube (``‖H_n‖ ≤ σ``) is never *expanded*
     # (the ``(·)_+`` clamp).  ``σ(z) = 0`` ⇒ ``shrink = (1)_+ = 1`` ⇒ the exact
     # ``(1 − o)`` legacy collapse.
-    sigma = subspace.sigma_at(emb_new_raw)               # (..,) tube thickness σ(z)
-    hn_norm = torch.linalg.vector_norm(Hn_trans, dim=-1)  # (..,)
-    shrink = torch.clamp(1.0 - sigma / hn_norm.clamp(min=1e-6), min=0.0)  # (..,)
-    onto_scale = 1.0 - onto * shrink                     # (..,) in [1−o, 1]
-    Hn_final = onto_scale.unsqueeze(-1) * Hn_trans        # (.., R)
+    if onto_zero:
+        Hn_final = Hn_trans
+    else:
+        sigma = subspace.sigma_at(emb_new_raw)               # (..,) tube thickness σ(z)
+        hn_norm = torch.linalg.vector_norm(Hn_trans, dim=-1)  # (..,)
+        shrink = torch.clamp(
+            1.0 - sigma / hn_norm.clamp(min=1e-6), min=0.0,
+        )                                                     # (..,)
+        onto_scale = 1.0 - onto * shrink                     # (..,) in [1−o, 1]
+        Hn_final = onto_scale.unsqueeze(-1) * Hn_trans        # (.., R)
 
     new_par = (foot_new_red + Hn_final) @ basis          # (.., D) back to world
 
@@ -3393,9 +3404,11 @@ def _faint_cycle_coords(distances: torch.Tensor) -> torch.Tensor | None:
         for b in range(a + 1, K):
             sep = min((pos[a] - pos[b]) % K, (pos[b] - pos[a]) % K)
             if sep == 1:
-                s1 += D[a][b]; s1n += 1
+                s1 += D[a][b]
+                s1n += 1
             elif sep == 2:
-                s2 += D[a][b]; s2n += 1
+                s2 += D[a][b]
+                s2n += 1
     if s1n == 0 or s2n == 0:
         return None
     if (s2 / s2n) / max(s1 / s1n, 1e-9) < _CYCLE_CONTRAST_MIN:

@@ -674,6 +674,274 @@ class Monitor:
         # Preserve probe insertion order in the returned dict.
         return {name: out[name] for name in self._probes if name in out}
 
+    def _score_probe_gate_scalars(
+        self,
+        probe: "AttachedManifoldProbe",
+        hidden_per_layer: dict[int, torch.Tensor],
+        gate_keys: set[str],
+        sih_cache: dict[int, torch.Tensor] | None = None,
+    ) -> dict[str, float]:
+        """Score only the exact scalar channels a probe gate consumes.
+
+        This is intentionally narrower than :meth:`_score_probe_full`: it is used
+        only by the gate-only decode path, where no UI/API consumer needs a full
+        :class:`ProbeReading`. Curved ``:fraction`` and ``@label`` / ``~label``
+        gates can skip the nearest-foot solve entirely; coord and membership
+        gates still run the geometry they semantically require.
+        """
+        name = probe.name
+        suffixes = {
+            key[len(name):]: key for key in gate_keys
+            if key == name
+            or key.startswith(f"{name}[")
+            or key.startswith(f"{name}:")
+            or key.startswith(f"{name}@")
+            or key.startswith(f"{name}~")
+        }
+        if not suffixes:
+            return {}
+
+        coord_axes: dict[int, str] = {}
+        if "" in suffixes:
+            coord_axes[0] = suffixes[""]
+        for suffix, key in suffixes.items():
+            if suffix.startswith("[") and suffix.endswith("]"):
+                try:
+                    axis = int(suffix[1:-1])
+                except ValueError:
+                    continue
+                if axis >= 0:
+                    coord_axes[axis] = key
+        fraction_key = suffixes.get(":fraction")
+        membership_key = suffixes.get(":membership")
+        dist_labels = {
+            suffix[1:]: key for suffix, key in suffixes.items()
+            if suffix.startswith("@") and len(suffix) > 1
+        }
+        assign_labels = {
+            suffix[1:]: key for suffix, key in suffixes.items()
+            if suffix.startswith("~") and len(suffix) > 1
+        }
+
+        need_coords = bool(coord_axes)
+        need_fraction = fraction_key is not None
+        need_membership = membership_key is not None
+        need_nearest = bool(dist_labels)
+        need_assignment = bool(assign_labels)
+        need_dist = bool(need_nearest or need_assignment)
+        if not (need_coords or need_fraction or need_membership or need_dist):
+            return {}
+
+        manifold = probe.manifold
+        sw = probe.share_weights
+        is_affine = probe.is_affine
+        shared = [idx for idx in manifold.layers if idx in hidden_per_layer]
+        if not shared:
+            return {}
+        total_w = sum(sw.get(idx, 0.0) for idx in shared)
+        if total_w <= _MIN_SHARE_WEIGHT:
+            w_shared = {idx: 1.0 / len(shared) for idx in shared}
+        else:
+            w_shared = {idx: sw.get(idx, 0.0) / total_w for idx in shared}
+
+        K = probe.node_values_reduced[shared[0]].shape[0]
+        inject_neutral = probe.inject_neutral
+        Kc = K + (1 if inject_neutral else 0)
+        n_dim = manifold.domain.intrinsic_dim
+        frac_mean_t: torch.Tensor | None = None
+        coords_mean_t: torch.Tensor | None = None
+        mem_mean_t: torch.Tensor | None = None
+        dist_acc_t: torch.Tensor | None = None
+
+        for layer_idx in shared:
+            sub = manifold.layers[layer_idx]
+            h = hidden_per_layer[layer_idx].to(torch.float32)
+            if h.ndim > 1:
+                h = h.reshape(-1, h.shape[-1])[-1]
+            wh = probe.whitened[layer_idx]
+            frac_t, cdist_query, invert_query, cdist_nodes = _layer_geometry(
+                probe, layer_idx, h, sih_cache,
+            )
+            w = w_shared[layer_idx]
+
+            if need_fraction:
+                frac_t = frac_t.reshape(1)
+                frac_mean_t = (
+                    w * frac_t if frac_mean_t is None else frac_mean_t + w * frac_t
+                )
+
+            if need_dist:
+                if inject_neutral:
+                    cdist_nodes = torch.cat(
+                        [cdist_nodes, wh.neutral_white.reshape(1, -1)], dim=0,
+                    )
+                dists = torch.linalg.vector_norm(
+                    cdist_nodes - cdist_query.reshape(1, -1), dim=-1,
+                )
+                weighted_dists = dists * w
+                dist_acc_t = (
+                    weighted_dists
+                    if dist_acc_t is None
+                    else dist_acc_t + weighted_dists.to(dist_acc_t.device)
+                )
+
+            if need_coords or need_membership:
+                if is_affine:
+                    pos_t = (
+                        wh.coord_S @ invert_query + wh.coord_b
+                        if wh.coord_S is not None and wh.coord_b is not None
+                        else invert_query
+                    )
+                    mem_t = frac_t.new_ones(1)
+                else:
+                    foot_key = (probe.name, layer_idx)
+                    warm = self._curved_feet.get(foot_key) if self._curved_warm else None
+                    pos, res = invert_parameterization(
+                        sub, manifold.domain, invert_query.reshape(1, -1),
+                        manifold.node_coords, warm_start=warm,
+                    )
+                    if self._curved_warm:
+                        self._curved_feet[foot_key] = pos.detach()
+                    pos_t = pos.reshape(-1)
+                    if need_membership and sub.has_sigma:
+                        res_flat = res.reshape(-1)[:1]
+                        sig_foot = sub.sigma_at(
+                            manifold.domain.embed(pos.reshape(1, -1)),
+                        ).reshape(1)
+                        mem_t = torch.exp(
+                            -(res_flat ** 2)
+                            / (2.0 * (sig_foot ** 2).clamp(min=_FRACTION_EPSILON))
+                        )
+                    else:
+                        mem_t = frac_t.new_ones(1)
+
+                if need_coords:
+                    coord_t = pos_t.reshape(-1)[:n_dim]
+                    if coord_t.numel() < n_dim:
+                        coord_t = torch.cat(
+                            [coord_t, coord_t.new_zeros(n_dim - coord_t.numel())],
+                        )
+                    coords_mean_t = (
+                        w * coord_t
+                        if coords_mean_t is None
+                        else coords_mean_t + w * coord_t
+                    )
+                if need_membership:
+                    mem_t = mem_t.reshape(1)
+                    mem_mean_t = (
+                        w * mem_t
+                        if mem_mean_t is None
+                        else mem_mean_t + w * mem_t
+                    )
+
+        def _label(idx: int) -> str:
+            return (
+                NEUTRAL_LABEL
+                if inject_neutral and idx == K
+                else manifold.node_labels[idx]
+            )
+
+        out: dict[str, float] = {}
+        parts: list[torch.Tensor] = []
+        slots: list[tuple[str, Any]] = []
+        if need_fraction and frac_mean_t is not None and fraction_key is not None:
+            parts.append(frac_mean_t.reshape(1))
+            slots.append(("scalar", fraction_key))
+        if need_coords and coords_mean_t is not None:
+            for axis, key in sorted(coord_axes.items()):
+                if axis < int(coords_mean_t.numel()):
+                    parts.append(coords_mean_t[axis].reshape(1))
+                    slots.append(("scalar", key))
+        if need_membership and mem_mean_t is not None and membership_key is not None:
+            parts.append(mem_mean_t.reshape(1))
+            slots.append(("scalar", membership_key))
+
+        requested_top_n = int(probe.top_n)
+        top_n = requested_top_n if requested_top_n >= 0 else Kc + requested_top_n
+        top_n = min(max(top_n, 0), Kc)
+        if need_nearest and top_n and dist_acc_t is not None:
+            nearest_dist_t, nearest_idx_t = torch.topk(
+                dist_acc_t, k=top_n, largest=False, sorted=True,
+            )
+            parts.extend([
+                nearest_dist_t / probe.label_scale,
+                nearest_idx_t.to(torch.float32),
+            ])
+            slots.append(("nearest", int(nearest_dist_t.numel())))
+        if (
+            need_assignment
+            and top_n
+            and dist_acc_t is not None
+            and probe.assign_bandwidth is not None
+            and probe.assign_logvol_bias is not None
+        ):
+            tau = probe.assign_bandwidth.to(dist_acc_t.device, torch.float32)
+            lvb = probe.assign_logvol_bias.to(dist_acc_t.device, torch.float32)
+            if tau.numel() == dist_acc_t.numel() == lvb.numel():
+                logits = (
+                    -(dist_acc_t ** 2)
+                    / (2.0 * (tau ** 2).clamp(min=_FRACTION_EPSILON))
+                    + lvb
+                )
+                probs = torch.softmax(logits, dim=0)
+                assign_prob_t, assign_idx_t = torch.topk(
+                    probs, k=top_n, largest=True, sorted=True,
+                )
+                parts.extend([assign_prob_t, assign_idx_t.to(torch.float32)])
+                slots.append(("assignment", int(assign_prob_t.numel())))
+
+        if not parts:
+            return out
+        flat = torch.cat([p.reshape(-1) for p in parts]).detach().cpu().tolist()
+        pos = 0
+        for kind, meta in slots:
+            if kind == "scalar":
+                out[meta] = float(flat[pos])
+                pos += 1
+            elif kind == "nearest":
+                n = int(meta)
+                d_vals = flat[pos:pos + n]
+                pos += n
+                i_vals = flat[pos:pos + n]
+                pos += n
+                for label, dist in (
+                    (_label(int(round(i_vals[i]))), d_vals[i]) for i in range(n)
+                ):
+                    key = dist_labels.get(label)
+                    if key is not None:
+                        out[key] = -float(dist)
+            elif kind == "assignment":
+                n = int(meta)
+                p_vals = flat[pos:pos + n]
+                pos += n
+                i_vals = flat[pos:pos + n]
+                pos += n
+                for label, prob in (
+                    (_label(int(round(i_vals[i]))), p_vals[i]) for i in range(n)
+                ):
+                    key = assign_labels.get(label)
+                    if key is not None:
+                        out[key] = float(prob)
+        return out
+
+    def score_gate_scalars(
+        self,
+        hidden_per_layer: dict[int, torch.Tensor],
+        gate_keys: set[str],
+    ) -> dict[str, float]:
+        """Return exact gate scalar keys without building full readings."""
+        if not hidden_per_layer or not self._probes or not gate_keys:
+            return {}
+        sih_cache: dict[int, torch.Tensor] = {}
+        out: dict[str, float] = {}
+        for probe in self._probes.values():
+            out.update(
+                self._score_probe_gate_scalars(
+                    probe, hidden_per_layer, gate_keys, sih_cache,
+                )
+            )
+        return out
+
     def _subspace_coords_for(
         self,
         probe: "AttachedManifoldProbe",

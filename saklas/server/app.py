@@ -272,11 +272,18 @@ def ws_auth_ok(websocket: WebSocket) -> bool:
     return websocket.query_params.get("token") == expected
 
 
-def _probe_reading_dict(session: SaklasSession) -> dict[str, Any]:
+def _probe_reading_dict(
+    session: SaklasSession,
+    readings: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     # build_readings() already scopes to monitor.probe_names, but cross-check
     # explicitly so a client never sees a probe that isn't active in the monitor.
     monitor_names = set(session._monitor.probe_names)
-    readings = session.build_readings()
+    if readings is None:
+        result = getattr(session, "_last_result", None)
+        readings = getattr(result, "readings", None) if result is not None else None
+    if readings is None:
+        readings = session.build_readings()
     out: dict[str, Any] = {}
     for name, r in readings.items():
         if name not in monitor_names:
@@ -616,16 +623,21 @@ async def _stream_generation(
         final_choice: dict[str, Any] = {
             "index": 0, **empty_delta, "finish_reason": finish_reason,
         }
+        last_result = getattr(session, "_last_result", None)
         mf_agg = _probe_reading_aggregate(session)
         if mf_agg:
             final_choice["x-saklas-probe-readings"] = mf_agg
+        compat_probe_readings = _probe_reading_dict(
+            session,
+            readings=getattr(last_result, "readings", None) if last_result is not None else None,
+        )
         final = {
             "id": rid,
             "object": object_type,
             "created": created_ts,
             "model": model_id,
             "choices": [final_choice],
-            "probe_readings": _probe_reading_dict(session),
+            "probe_readings": compat_probe_readings,
         }
         yield f"data: {json.dumps(final)}\n\n"
 

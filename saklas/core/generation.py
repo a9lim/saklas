@@ -539,9 +539,9 @@ class GenerationState:
         # per-token probe scores (which are in generated_ids space) back
         # to the emitted token stream.
         self.emit_map: list[tuple[int, bool]] = []
-        # Exact non-thinking text accepted by the streaming path. This is
-        # authoritative for final result text because stop sequences can trim
-        # only part of a decoded token while generated_ids still contains it.
+        # Exact non-thinking text accepted by a stop-sequence streaming path.
+        # Populated only when a stop sequence actually matches, because normal
+        # streaming finalization can decode generated ids directly.
         self.response_text: str | None = None
 
     def request_stop(self):
@@ -977,8 +977,9 @@ def generate_steered(
     # Survives loop iterations so post-loop partial-flush can reuse it;
     # None when max_new_tokens=0 (degenerate, no forward ever ran).
     current_perplexity: float | None = None
-    if on_token is not None:
-        state.response_text = ""
+    response_chunks: list[str] | None = [] if (on_token is not None and stop_list) else None
+    response_char_len = 0
+    state.response_text = None
 
     no_cache_buf: torch.Tensor | None = None
     no_cache_len = int(current_input.shape[1])
@@ -997,10 +998,28 @@ def generate_steered(
     def _emit_token(text: str, is_thinking: bool, token_id: int,
                     logprob: float | None, top_alts: list[TokenAlt] | None,
                     perplexity: float | None) -> None:
-        if not is_thinking and state.response_text is not None:
-            state.response_text += text
+        nonlocal response_char_len
+        if not is_thinking and response_chunks is not None:
+            response_chunks.append(text)
+            response_char_len += len(text)
         if on_token is not None:
             on_token(text, is_thinking, token_id, logprob, top_alts, perplexity)
+
+    def _response_prefix(chars: int) -> str:
+        if response_chunks is None or chars <= 0:
+            return ""
+        remaining = chars
+        out: list[str] = []
+        for chunk in response_chunks:
+            if remaining <= 0:
+                break
+            if len(chunk) <= remaining:
+                out.append(chunk)
+                remaining -= len(chunk)
+            else:
+                out.append(chunk[:remaining])
+                break
+        return "".join(out)
 
     def _decode_alt(tid: int) -> str:
         """Decode a single alt token id to text, preferring the cached
@@ -1377,6 +1396,7 @@ def generate_steered(
                                 if i >= 0 and (hit_idx < 0 or i < hit_idx):
                                     hit_idx = i
                             if hit_idx >= 0:
+                                keep_chars = max(0, response_char_len - tail_len + hit_idx)
                                 # Emit only this token's pre-stop portion (empty
                                 # when the stop began back in the retained tail).
                                 trimmed = combined[tail_len:hit_idx]
@@ -1385,6 +1405,7 @@ def generate_steered(
                                     _emit_token(trimmed, emit_thinking, emit_id,
                                                 chosen_logprob, top_alts,
                                                 current_perplexity)
+                                state.response_text = _response_prefix(keep_chars)
                                 state.finish_reason = "stop_sequence"
                                 break
                             completion_text = (
