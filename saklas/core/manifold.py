@@ -2199,14 +2199,37 @@ def _frame_rotation_transport(
     # Gram-Schmidt, not ``torch.linalg.qr`` — the latter is unimplemented on MPS.
     qa = _orthonormalize_columns(j_old)            # (.., R, n)
     qb = _orthonormalize_columns(j_new)            # (.., R, n)
-    # Principal angles between the subspaces: SVD of the n×n frame overlap.
-    # Σ = cos θᵢ; the principal directions pair up orthogonally across i
-    # (aᵢᵀbⱼ = cos θᵢ · δᵢⱼ), so the subspace rotation is a product of
-    # *independent* planar rotations aᵢ → bᵢ.
-    u, s_cos, vh = _svd_mps_safe(qa.transpose(-1, -2) @ qb)  # (..,n,n),(..,n),(..,n,n)
-    a = qa @ u                                     # (.., R, n) principal dirs in span(qa)
-    b = qb @ vh.transpose(-1, -2)                  # (.., R, n) principal dirs in span(qb)
-    c = s_cos.clamp(-1.0, 1.0)                     # (.., n) cos θᵢ
+    n = qa.shape[-1]
+    if n == 1:
+        # --- on-device n=1 closed form (the common curved topology: a 1-D
+        # ring/arc) ----------------------------------------------------------
+        # A 1×1 overlap ``[c0] = qaᵀqb`` has a trivial SVD: the singular value is
+        # ``|c0|`` and the sign rides into U/V.  Rather than route a 1×1 matrix
+        # through ``_svd_mps_safe`` (which hops to CPU on MPS every fire — the
+        # whole point of this branch is to stay on-device), build the principal
+        # directions / cosine directly: pick ``b = ±qb`` so the cosine is
+        # ``c = |c0| ≥ 0`` (exactly what SVD's non-negative singular value gives,
+        # the sign absorbed into V).  ``a = qa``, ``b = sign(c0)·qb`` then
+        # satisfy ``aᵀb = |c0| = c`` — bit-for-bit the (a, b, c) the SVD path
+        # produces at n=1, so the shared planar-rotation tail below is identical.
+        c0 = (qa * qb).sum(dim=-2, keepdim=True)   # (.., 1, 1) = qaᵀqb
+        sign = torch.where(
+            c0 >= 0.0, torch.ones_like(c0), -torch.ones_like(c0),
+        )                                          # (.., 1, 1) sign(c0), +1 at 0
+        a = qa                                     # (.., R, 1) principal dir in span(qa)
+        b = qb * sign                              # (.., R, 1) flipped so aᵀb ≥ 0
+        c = c0.squeeze(-2).abs().clamp(0.0, 1.0)   # (.., 1) cos θ = |c0|
+    else:
+        # Principal angles between the subspaces: SVD of the n×n frame overlap.
+        # Σ = cos θᵢ; the principal directions pair up orthogonally across i
+        # (aᵢᵀbⱼ = cos θᵢ · δᵢⱼ), so the subspace rotation is a product of
+        # *independent* planar rotations aᵢ → bᵢ.  n≥2 keeps the CPU-hopped SVD
+        # (``linalg.svd`` is unimplemented on Metal); only the tiny n=1 case
+        # (the dominant curved topology) earned a hand-written on-device path.
+        u, s_cos, vh = _svd_mps_safe(qa.transpose(-1, -2) @ qb)  # (..,n,n),(..,n),(..,n,n)
+        a = qa @ u                                 # (.., R, n) principal dirs in span(qa)
+        b = qb @ vh.transpose(-1, -2)              # (.., R, n) principal dirs in span(qb)
+        c = s_cos.clamp(-1.0, 1.0)                 # (.., n) cos θᵢ
     s = (1.0 - c * c).clamp(min=0.0).sqrt()        # (.., n) sin θᵢ
     # nᵢ = unit(bᵢ − cᵢ aᵢ): the in-(aᵢ,bᵢ)-plane direction ⊥ aᵢ that aᵢ rotates
     # toward (‖bᵢ − cᵢ aᵢ‖ = sᵢ).  Guard the sᵢ≈0 (no-rotation) planes — their

@@ -300,6 +300,23 @@ class SteeringHook:
             torch.Tensor, torch.Tensor, float, float, torch.Tensor,
             "float | torch.Tensor",
         ] | None = None
+        # Constant-add fast path for a **pure-push** affine group (all-zero
+        # κ — no ``!`` ablation).  When such a group's foot translates by the
+        # fixed offset ``along·target`` (κ=0 ⇒ ``p_new − q = along·target``,
+        # independent of ``h``), the entire ``subspace_inject`` affine branch
+        # reduces to ``h_new = h + c`` with ``c = (along·target)@basis`` a fixed
+        # per-layer world vector — the projection ``q`` is computed only to be
+        # cancelled, and the foot it returns is discarded for affine groups.  So
+        # the offset is precomputed once here and the hot path does a single
+        # in-place ``hidden.add_(c)`` (one kernel, zero alloc, no fp32 cast, no
+        # ``copy_``).  ``_const_single`` is the offset for the single-affine-fast
+        # case (when that group is pure-push), parallel to
+        # ``_single_affine_fast``; ``_const_groups`` is the per-group offset
+        # list parallel to ``self.manifold_groups`` (``None`` where a group is
+        # curved or carries a non-zero κ, i.e. needs the full kernel because the
+        # injection then depends on ``h``).  Both ``None`` ⇒ no group qualified.
+        self._const_single: torch.Tensor | None = None
+        self._const_groups: list[torch.Tensor | None] = []
         # Shared mutable context threaded in by SteeringManager.  Read-only
         # from the hook's perspective; the generation loop mutates fields.
         self._ctx: TriggerContext | None = None
@@ -311,6 +328,7 @@ class SteeringHook:
         ctx: TriggerContext,
         *,
         device: torch.device,
+        dtype: "torch.dtype | None" = None,
     ) -> None:
         """Pre-compose this layer's subspace / manifold groups.
 
@@ -327,6 +345,14 @@ class SteeringHook:
         model-dtype temporary).  An entry with both coefficients zero is a
         no-op and drops here.  A new group set cold-starts every
         foot-follower.
+
+        ``dtype`` is the model's residual-stream dtype (threaded in from
+        :meth:`SteeringManager.apply_to_model`).  It is used only to pre-cast the
+        constant-add fast path's offset (see :meth:`_arm_constant_add`) so the
+        hot path can ``hidden.add_`` an already-model-dtype tensor with no
+        per-fire cast temporary.  ``None`` (the direct-``recompose`` test seam)
+        skips that pre-cast and keeps the offset fp32 — still correct, since the
+        in-place ``add_`` keeps ``hidden``'s dtype regardless.
         """
         self._ctx = ctx
 
@@ -383,15 +409,102 @@ class SteeringHook:
             self._single_affine_fast = (
                 _sub, _dom, _tgt, _org, _alo, _ont, _mp, _kap,
             )
+        # Arm the *constant-add* fast path on top of (or in place of) the above
+        # for **pure-push** affine groups (all-zero κ — no ``!`` ablation).  Such
+        # a group's injection is ``h_new = h + c`` with ``c = (along·target)@basis``
+        # a fixed per-layer world vector (κ=0 ⇒ ``p_new − q = along·target``,
+        # independent of ``h``), so the projection ``q`` inside ``subspace_inject``
+        # is pure waste — computed only to cancel.  Precompute ``c`` once here (in
+        # the model dtype when ``dtype`` is known, so the hot path's in-place
+        # ``add_`` needs no per-fire cast temporary) and let ``hook_fn`` /
+        # ``_apply_manifold_groups`` short-circuit to a single ``hidden.add_(c)``.
+        # ``_const_single`` mirrors the single-affine-fast slot; ``_const_groups``
+        # is the per-group list (``None`` where a group is curved or has non-zero
+        # κ — the kernel is still needed there, since the ablation term
+        # ``p_new − q = −along·κ·q`` depends on ``h``).
+        if self._single_affine_fast is not None:
+            _g = manifold_groups[0]
+            self._const_single = self._pure_push_constant(
+                _g[1], _g[3], _g[5], _g[7], device=device, dtype=dtype,
+            )
+        else:
+            self._const_single = None
+        self._const_groups = [
+            self._pure_push_constant(
+                sub, target, along, kappa, device=device, dtype=dtype,
+            )
+            if sub.is_affine else None
+            for (_t, sub, _d, target, _o, along, _on, kappa) in manifold_groups
+        ]
         # New group set ⇒ cold-start every foot-follower (seed at origin).
         self._manifold_feet = [None] * len(manifold_groups)
 
+    @staticmethod
+    def _pure_push_constant(
+        sub: LayerSubspace,
+        target: torch.Tensor,
+        along: float,
+        kappa: "float | torch.Tensor",
+        *,
+        device: torch.device,
+        dtype: "torch.dtype | None",
+    ) -> "torch.Tensor | None":
+        """Precompute the constant world offset for a pure-push affine group.
+
+        Returns ``c = (along·target) @ basis`` ((D,) per-layer offset) when the
+        per-axis collapse mask ``kappa`` is all zero (a push-only term: vectors,
+        poles, ``~``/``|`` projections, affine ``%``, and merges of them) — the
+        case where the affine injection is exactly ``h_new = h + c`` (see
+        :meth:`recompose`).  ``None`` for a mixed push+ablate group (any
+        ``κ ≠ 0``), whose injection ``p_new − q = along·(target − κ·q)`` depends
+        on ``q`` (hence ``h``) and so must keep the full kernel.
+
+        The offset is cast to the model ``dtype`` when known so the hot-path
+        ``hidden.add_`` is a single fused kernel with no per-fire cast; ``None``
+        ``dtype`` keeps it fp32 (still correct — in-place ``add_`` keeps the
+        destination dtype).  fp32 throughout the math (the ``@`` runs before the
+        optional downcast).
+        """
+        # All-zero κ test: scalar ``0.0`` ⇒ pure push; a ``(R,)`` mask ⇒ pure
+        # push iff every entry is zero.  Any ablation axis (κ≠0) disqualifies —
+        # the injection then depends on ``h``.
+        if isinstance(kappa, torch.Tensor):
+            if bool(kappa.any()):
+                return None
+        elif float(kappa) != 0.0:
+            return None
+        basis = sub.basis.to(device=device, dtype=torch.float32)   # (R, D)
+        tgt = target.to(device=device, dtype=torch.float32)        # (R,)
+        c = (along * tgt) @ basis                                  # (D,) world offset
+        # ``norm_cap`` (``‖h_new‖ ≤ 3·‖h‖``) is deliberately **skipped** here.
+        # For the constant-add path it only ever guarded curved-RBF off-domain
+        # extrapolation (``clamp_position`` keeps affine ``p_new`` in-box, and a
+        # flat affine fit has no RBF to extrapolate — the affine-branch comment
+        # in ``subspace_inject`` calls the cap "belt-and-suspenders, not the norm
+        # semantic" for exactly this reason): a bounded steering offset ``c``
+        # added to a large-norm residual-stream ``h`` cannot plausibly push
+        # ``‖h + c‖`` past ``3·‖h‖``.  Dropping it is the point of the fix —
+        # it removes the two per-fire norm reductions the cap needs.
+        return c.to(dtype) if dtype is not None else c
+
     def hook_fn(self, module: Any, input: Any, output: Any) -> Any:
+        # Constant-add fast path: one always-active **pure-push** affine group
+        # (the dominant steering case — any push term / merge with no ``!``
+        # ablation).  The whole injection is ``h += c`` with ``c`` the
+        # precomputed per-layer offset, so it is a single in-place ``add_``: no
+        # ``subspace_inject`` call, no projection, no fp32 cast, no ``copy_``.
+        const = self._const_single
+        if const is not None:
+            hidden = output if isinstance(output, torch.Tensor) else output[0]
+            hidden.add_(const)
+            return output
         # Fast path: one always-active affine group (the common steering case).
         # Skips the group loop, the trigger re-check, and the foot-seed branch;
         # the analytic affine slide consults no per-step ctx, so it is correct
         # whether or not ``ctx`` is set.  Behaviorally identical to the general
         # path for this group shape (one ``subspace_inject`` + ``copy_``).
+        # Reached only by a mixed push+ablate affine group (κ≠0 — the constant
+        # add above didn't arm), which still needs the kernel.
         fast = self._single_affine_fast
         if fast is not None:
             hidden = output if isinstance(output, torch.Tensor) else output[0]
@@ -447,12 +560,24 @@ class SteeringHook:
         """
         lead = hidden.shape[:-1]
         all_groups_always_active = self._all_groups_always_active
+        const_groups = self._const_groups
         for i, (
             trig, sub, domain, target, origin, along, onto, kappa,
         ) in enumerate(self.manifold_groups):
             if not all_groups_always_active and not _trigger_active(trig, ctx):
                 continue
             if sub.is_affine:
+                # Pure-push affine group (all-zero κ): the injection is a fixed
+                # ``h += c`` — a single in-place ``add_`` of the precomputed
+                # offset, no projection / kernel call / ``copy_``.  A mixed
+                # push+ablate group (``const`` is ``None``) keeps the full kernel
+                # (its ablation term depends on ``h``).  This path is reached by a
+                # *mixed affine+curved* scope, whose affine group can still be
+                # pure-push.
+                const = const_groups[i]
+                if const is not None:
+                    hidden.add_(const)
+                    continue
                 h_new, _foot = subspace_inject(
                     hidden, sub, domain, target, origin,
                     along, onto, gn_steps=1, kappa=kappa,
@@ -1021,6 +1146,7 @@ class SteeringManager:
                 manifold_by_layer.get(idx, []),
                 self.ctx,
                 device=device,
+                dtype=dtype,
             )
 
     def reset_manifold_feet(self) -> None:
