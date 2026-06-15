@@ -2,6 +2,7 @@
 
 import math
 import queue
+import inspect
 import logging
 import threading
 import warnings
@@ -379,6 +380,15 @@ def _sampler_candidates(
     next token. The returned probabilities are exactly the distribution the
     sampler draws from after temperature, top-k, and top-p renormalization.
     Greedy decoding is represented as a one-token distribution with p=1.
+
+    The non-greedy return is the **fixed-width** top-k pool (``topk_k``
+    entries): sub-top-p entries are zeroed in place (``torch.multinomial``
+    never draws a zero-prob index, and the top-1 floor keeps the pool
+    non-degenerate), so the shape is static.  A boolean-mask select would
+    make the output shape data-dependent and force a device→host sync every
+    decode token — on top of the unavoidable ``int(next_token.item())`` one,
+    that's two syncs/token.  Callers consume the fixed width and must treat
+    zero-prob entries as the excluded tail (see ``_sampler_logprob_vector``).
     """
     if config.temperature <= 0:
         token = logits.argmax(dim=-1).reshape(1).to(dtype=torch.long)
@@ -394,9 +404,7 @@ def _sampler_candidates(
     probs[:, :1].clamp_(min=1e-8)
     probs.div_(probs.sum(dim=-1, keepdim=True))
 
-    row_probs = probs[0]
-    valid = row_probs > 0
-    return top_idx[0][valid].to(dtype=torch.long), row_probs[valid].to(dtype=torch.float32)
+    return top_idx[0].to(dtype=torch.long), probs[0].to(dtype=torch.float32)
 
 
 def _sampler_logprob_vector(
@@ -412,7 +420,17 @@ def _sampler_logprob_vector(
         dtype=torch.float32,
         device=logits.device,
     )
-    out[ids] = probs.clamp_min(torch.finfo(torch.float32).tiny).log()
+    # ``_sampler_candidates`` now returns the fixed-width top-k pool, so
+    # ``ids`` includes the sub-top-p tail whose ``probs`` are exactly 0.
+    # Those must stay ``-inf`` (outside the sampler's support), so scatter
+    # ``log p`` only where ``p > 0`` — the in-support entries — and leave the
+    # zeroed tail at the initialized ``-inf``.  (Greedy returns a 1-element
+    # ``probs`` of all ones, so the ``where`` is a no-op there.)
+    out[ids] = torch.where(
+        probs > 0,
+        probs.clamp_min(torch.finfo(torch.float32).tiny).log(),
+        torch.full_like(probs, float("-inf")),
+    )
     return out
 
 
@@ -425,6 +443,47 @@ def _effective_topk(config: GenerationConfig, vocab: int) -> int:
     """
     user_top_k = config.top_k if (config.top_k and config.top_k > 0) else 1024
     return min(int(user_top_k), int(vocab))
+
+
+# Modern HF ``CausalLM.forward`` accepts ``logits_to_keep`` (the current
+# name; ``num_logits_to_keep`` is the older one) — an int cap on how many
+# trailing positions get the LM head.  Passing ``1`` at prefill avoids
+# materializing a ``(1, T_prompt, V)`` logits tensor (hundreds of MB at a
+# 256k vocab) and the ~T× wasted head FLOPs when only the last row is used.
+# Some custom/older modeling files don't expose the kwarg, so we detect the
+# supported name once via signature inspection and cache it.
+_logits_keep_kwarg_cache: dict[int, str | None] = {}
+
+
+def _logits_keep_kwarg(model: PreTrainedModel) -> str | None:
+    """Return the ``logits_to_keep``/``num_logits_to_keep`` kwarg this model's
+    ``forward`` accepts, or ``None`` if neither is in the signature.
+
+    Cached per ``forward`` callable.  A ``**kwargs``-only signature reports
+    ``None`` here (the name isn't explicit); the caller's first-forward
+    try/except still catches a model that silently mishandles the kwarg.
+    A model with no ``forward`` (a non-``nn.Module`` test double calling via
+    ``__call__``) reports ``None`` — inspecting ``__call__`` would only see
+    ``nn.Module``'s ``*args, **kwargs`` wrapper, never the real param.
+    """
+    fwd = getattr(model, "forward", None)
+    if fwd is None:
+        return None
+    key = id(fwd)
+    cached = _logits_keep_kwarg_cache.get(key, "")
+    if cached != "":  # "" is the not-yet-computed sentinel; None is a real result
+        return cached
+    name: str | None = None
+    try:
+        params = inspect.signature(fwd).parameters
+    except (ValueError, TypeError):  # pragma: no cover — C/builtin forwards
+        params = {}
+    for cand in ("logits_to_keep", "num_logits_to_keep"):
+        if cand in params:
+            name = cand
+            break
+    _logits_keep_kwarg_cache[key] = name
+    return name
 
 
 def _advance_no_cache_input(
@@ -782,6 +841,19 @@ def generate_steered(
     attn_mask_buf = torch.ones(1, seq_len, device=device, dtype=torch.long)
     prefill = True
 
+    # ---- logits_to_keep ------------------------------------------------
+    # Detect the trailing-logits cap kwarg once (signature inspection) so
+    # the per-step branch is a cheap dict spread.  ``logits_to_keep=1``
+    # computes the LM head over only the last position — a large win at
+    # prefill (no ``(1, T_prompt, V)`` transient) and correct everywhere
+    # (we only ever read ``outputs.logits[:, -1, :]``, including the
+    # no-KV-cache fallback that re-feeds the full sequence each step).
+    # ``logits_keep_failed`` arms a one-shot retry-without-kwarg if a model
+    # whose signature *looked* supportive rejects the value at runtime.
+    _lk_name = _logits_keep_kwarg(model)
+    logits_keep_kwargs: dict[str, int] = {_lk_name: 1} if _lk_name is not None else {}
+    logits_keep_failed = False
+
     # ---- StaticCache ---------------------------------------------------
     # Caller flips ``use_static_cache`` after probing
     # :func:`saklas.core.cuda_graphs.is_cuda_graphs_supported` at session
@@ -988,21 +1060,53 @@ def generate_steered(
                 # the model knows where to write into the pre-allocated
                 # K/V buffers.  Eager (DynamicCache) path leaves it
                 # implicit so HF derives positions from cache seq_length.
-                if cache_position is not None:
-                    outputs = model(
-                        input_ids=current_input,
-                        attention_mask=attn_mask_buf if prefill else None,
-                        past_key_values=past_key_values,
-                        use_cache=True,
-                        cache_position=cache_position,
+                # ``logits_keep_kwargs`` (``{logits_to_keep: 1}`` or empty)
+                # caps the LM head to the last position; the one-shot
+                # ``TypeError`` retry below covers a model whose signature
+                # advertised the kwarg but rejects the value at runtime.
+                try:
+                    if cache_position is not None:
+                        outputs = model(
+                            input_ids=current_input,
+                            attention_mask=attn_mask_buf if prefill else None,
+                            past_key_values=past_key_values,
+                            use_cache=True,
+                            cache_position=cache_position,
+                            **logits_keep_kwargs,
+                        )
+                    else:
+                        outputs = model(
+                            input_ids=current_input,
+                            attention_mask=attn_mask_buf if prefill else None,
+                            past_key_values=past_key_values,
+                            use_cache=True,
+                            **logits_keep_kwargs,
+                        )
+                except TypeError:
+                    if not logits_keep_kwargs or logits_keep_failed:
+                        raise  # not our kwarg — a genuine signature error
+                    logits_keep_failed = True
+                    logits_keep_kwargs = {}
+                    warnings.warn(
+                        "model.forward rejected logits_to_keep at runtime — "
+                        "falling back to full-sequence logits (slower prefill)",
+                        stacklevel=2,
                     )
-                else:
-                    outputs = model(
-                        input_ids=current_input,
-                        attention_mask=attn_mask_buf if prefill else None,
-                        past_key_values=past_key_values,
-                        use_cache=True,
-                    )
+                    if cache_position is not None:
+                        outputs = model(
+                            input_ids=current_input,
+                            attention_mask=attn_mask_buf if prefill else None,
+                            past_key_values=past_key_values,
+                            use_cache=True,
+                            cache_position=cache_position,
+                        )
+                    else:
+                        outputs = model(
+                            input_ids=current_input,
+                            attention_mask=attn_mask_buf if prefill else None,
+                            past_key_values=past_key_values,
+                            use_cache=True,
+                        )
                 prefill = False
 
                 # Probe-gate scoring: after the forward (so
