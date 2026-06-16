@@ -341,13 +341,13 @@ export interface DiscoverManifoldNodeSpec {
 /** Body for POST /saklas/v1/manifolds/discover.
  *
  *  The user supplies labeled statement corpora; the matching ``fit``
- *  call derives node coordinates per-model via PCA or spectral
- *  embedding. */
+ *  call derives node coordinates per-model via PCA, spectral embedding,
+ *  or ``auto`` (let ``select_topology`` pick the geometry per-model). */
 export interface CreateDiscoverManifoldRequest {
   namespace?: string;
   name: string;
   description?: string;
-  fit_mode: "pca" | "spectral";
+  fit_mode: "pca" | "spectral" | "auto";
   nodes: DiscoverManifoldNodeSpec[];
   hyperparams?: Record<string, number | string>;
 }
@@ -467,7 +467,7 @@ export interface GenerateManifoldRequest {
   kind?: "abstract" | "concrete";
   /** In-character responses generated per shared baseline prompt. */
   samples_per_prompt?: number;
-  fit_mode?: "pca" | "spectral";
+  fit_mode?: "pca" | "spectral" | "auto";
   hyperparams?: Record<string, number | string>;
   force?: boolean;
   /** Persona-manifold opt-in: each ``concepts[i]`` slug doubles as

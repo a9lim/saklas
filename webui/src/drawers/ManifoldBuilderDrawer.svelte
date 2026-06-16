@@ -280,7 +280,7 @@
     if (autoDomain) {
       if (discoverMaxDim < 1) messages.push("max_dim must be >= 1");
       if (
-        discoverFitMode === "pca" &&
+        (discoverFitMode === "pca" || discoverFitMode === "auto") &&
         (discoverVarThreshold <= 0 || discoverVarThreshold > 1)
       ) {
         messages.push("var_threshold must be in (0, 1]");
@@ -325,7 +325,7 @@
         await apiManifolds.createDiscover(req);
         await refreshManifoldList();
         pushToast(
-          `built ${namespaceSlug}/${nameSlug} (auto-domain ${discoverFitMode}) — open the manifolds drawer to fit`,
+          `built ${namespaceSlug}/${nameSlug} (auto-domain, ${discoverFitMode} fit) — open the manifolds drawer to fit`,
           { kind: "info" },
         );
         closeDrawer();
@@ -405,9 +405,12 @@
 
   // ============================================================ discover ===
 
-  type DiscoverFitMode = "pca" | "spectral";
+  type DiscoverFitMode = "pca" | "spectral" | "auto";
   type DiscoverKind = "abstract" | "concrete";
-  let discoverFitMode: DiscoverFitMode = $state("pca");
+  // ``auto`` is the friendly default — ``select_topology`` picks
+  // flat / curved / periodic per-model, so a newcomer needn't know which
+  // geometry their concepts want.  pca / spectral pin it for power users.
+  let discoverFitMode: DiscoverFitMode = $state("auto");
   let discoverConceptsText = $state("");
   // A2 conversational corpus knobs: ``kind`` frames each concept's
   // system prompt (abstract → "someone {c}", concrete → "{article} {c}");
@@ -469,7 +472,7 @@
     }
     if (discoverMaxDim < 1) messages.push("max_dim must be >= 1");
     if (
-      discoverFitMode === "pca" &&
+      (discoverFitMode === "pca" || discoverFitMode === "auto") &&
       (discoverVarThreshold <= 0 || discoverVarThreshold > 1)
     ) {
       messages.push("var_threshold must be in (0, 1]");
@@ -478,19 +481,21 @@
   });
 
   function buildDiscoverHyperparams(): Record<string, number> {
-    if (discoverFitMode === "pca") {
-      return {
-        max_dim: discoverMaxDim,
-        var_threshold: discoverVarThreshold,
-      };
-    }
-    // spectral: only include the optional knobs when the user set
-    // them.  Server fills in data-driven defaults otherwise (median
-    // k-NN distance, ``max(5, ceil(log K))``).
+    // ``max_dim`` (the layout-dim cap) is the one knob every mode honors.
+    // The rest are method-specific; ``auto`` accepts the union (the server
+    // sanitizer drops whichever the resolved geometry doesn't consume), so
+    // we forward every knob the user actually set and let the backend
+    // fill data-driven defaults for the rest (median k-NN distance,
+    // ``max(5, ceil(log K))``).
     const hp: Record<string, number> = { max_dim: discoverMaxDim };
-    if (discoverKNN !== null && discoverKNN > 0) hp.k_nn = discoverKNN;
-    if (discoverBandwidth !== null && discoverBandwidth > 0) {
-      hp.bandwidth = discoverBandwidth;
+    if (discoverFitMode === "pca" || discoverFitMode === "auto") {
+      hp.var_threshold = discoverVarThreshold;
+    }
+    if (discoverFitMode === "spectral" || discoverFitMode === "auto") {
+      if (discoverKNN !== null && discoverKNN > 0) hp.k_nn = discoverKNN;
+      if (discoverBandwidth !== null && discoverBandwidth > 0) {
+        hp.bandwidth = discoverBandwidth;
+      }
     }
     return hp;
   }
@@ -787,11 +792,11 @@
       </p>
     {:else if authoringMode === "discover"}
       <p class="hint">
-        hand the model a flat list of concepts; the K-tuple generator
-        produces shared scenarios + per-concept statements, and the
-        fitter derives node coordinates per-model via pca or spectral
-        embedding. recommended at 20–48 concepts; spectral comes into
-        its own only past ~50 nodes.
+        hand the model a flat list of concepts; each one answers a shared
+        set of baseline prompts in character (one corpus per node), then
+        the fitter derives node coordinates per-model. leave the fit method
+        on auto unless you know you want flat (pca) or curved (spectral).
+        recommended at 20–48 concepts.
       </p>
     {:else}
       <p class="hint">
@@ -857,13 +862,18 @@
       <section class="step">
         <h2 class="step-title">fit method</h2>
         <div class="radio-row">
+          <Radio bind:group={discoverFitMode} value="auto" label="auto" />
           <Radio bind:group={discoverFitMode} value="pca" label="pca" />
           <Radio bind:group={discoverFitMode} value="spectral" label="spectral" />
         </div>
         <p class="dim-note">
-          {#if discoverFitMode === "pca"}
-            safe linear default — picks the smallest prefix whose
-            cumulative variance crosses the threshold, capped at max_dim.
+          {#if discoverFitMode === "auto"}
+            recommended — lets the fitter pick flat / curved per-model and
+            detect periodic axes. the safe choice when you're not sure which
+            geometry your concepts want.
+          {:else if discoverFitMode === "pca"}
+            flat linear layout — picks the smallest prefix whose cumulative
+            variance crosses the threshold, capped at max_dim.
           {:else}
             laplacian eigenmaps — recovers curved-manifold topology that
             pca flattens. noisy below ~50 nodes.
@@ -1077,7 +1087,7 @@
               }}
             />
           </label>
-          {#if discoverFitMode === "pca"}
+          {#if discoverFitMode === "pca" || discoverFitMode === "auto"}
             <label class="field">
               <span class="label">var_threshold</span>
               <NumberInput
@@ -1131,7 +1141,7 @@
       {submitting
         ? "building…"
         : autoDomain
-          ? `build manifold (auto-domain ${discoverFitMode}) → return to list`
+          ? `build manifold (auto-domain, ${discoverFitMode} fit) → return to list`
           : "build manifold → return to list"}
     </button>
     {:else if authoringMode === "discover"}
@@ -1184,14 +1194,19 @@
       <section class="step">
         <h2 class="step-title">fit method</h2>
         <div class="radio-row">
+          <Radio bind:group={discoverFitMode} value="auto" label="auto" />
           <Radio bind:group={discoverFitMode} value="pca" label="pca" />
           <Radio bind:group={discoverFitMode} value="spectral" label="spectral" />
         </div>
         <p class="dim-note">
-          {#if discoverFitMode === "pca"}
-            safe linear default — picks the smallest prefix whose
-            cumulative variance crosses the threshold, capped at
-            max_dim. recommended at bundled-heap sizes.
+          {#if discoverFitMode === "auto"}
+            recommended — lets the fitter pick flat / curved per-model and
+            detect periodic axes. the safe choice when you're not sure which
+            geometry your concepts want.
+          {:else if discoverFitMode === "pca"}
+            flat linear layout — picks the smallest prefix whose cumulative
+            variance crosses the threshold, capped at max_dim. a good fit
+            for most concept heaps.
           {:else}
             laplacian eigenmaps — recovers curved-manifold topology
             that pca flattens. noisy below ~50 nodes.
@@ -1212,7 +1227,7 @@
               }}
             />
           </label>
-          {#if discoverFitMode === "pca"}
+          {#if discoverFitMode === "pca" || discoverFitMode === "auto"}
             <label class="field">
               <span class="label">var_threshold</span>
               <NumberInput
@@ -1286,7 +1301,7 @@
         <p class="progress">{discoverProgress}</p>
       {/if}
 
-      <ValidationBlock verb="discover" messages={discoverValidation.messages} />
+      <ValidationBlock verb="generate" messages={discoverValidation.messages} />
 
       <button
         type="button"
@@ -1384,12 +1399,14 @@
         </div>
         <p class="dim-note">
           {#if templatedFitMode === "auto"}
-            recommended — picks flat/curved per-model and detects periodic
+            recommended — picks flat / curved per-model and detects periodic
             axes (the right default for cyclic categories like days / months).
           {:else if templatedFitMode === "pca"}
-            flat affine subspace.
+            flat linear layout — pins a straight affine arrangement of the
+            values.
           {:else}
-            curved RBF surface (laplacian eigenmaps).
+            laplacian eigenmaps — pins a curved RBF surface (use auto if you
+            want periodic axes detected for cyclic categories).
           {/if}
         </p>
       </section>
@@ -1416,7 +1433,7 @@
         </div>
       </AdvancedSection>
 
-      <ValidationBlock verb="templated" messages={templatedValidation.messages} />
+      <ValidationBlock verb="author" messages={templatedValidation.messages} />
 
       <button
         type="button"
