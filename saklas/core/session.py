@@ -671,23 +671,35 @@ class SaklasSession:
         # transient steering hooks and StaticCache the decode loop installs.
         offset_buffers: dict[int, Any] = {}
         offset_handles: list[Any] = []
+        capture_buffers: dict[int, Any] = {}
+        capture_handles: list[Any] = []
         if compile and device_obj.type in ("cuda", "mps"):
-            from saklas.core.hooks import install_persistent_offset_hooks
+            from saklas.core.hooks import (
+                install_persistent_capture_hooks,
+                install_persistent_offset_hooks,
+            )
             from saklas.core.model import _compile_with_probe, get_layers
-            # Attach the persistent branchless ``add_(offset)`` steering hooks
-            # BEFORE compile so they ride inside the captured graph (post-compile
-            # hook changes are not retraced — ``skip_nnmodule_hook_guards``).
-            # Per-gen static-affine steering then updates the offset buffers in
-            # place; the compiled fast path sees a stable hook topology and never
-            # recompiles.  ``hidden_size`` falls back to the text sub-config for
+            # Attach the persistent branchless steering + capture hooks BEFORE
+            # compile so they ride inside the captured graph (post-compile hook
+            # changes are not retraced — ``skip_nnmodule_hook_guards``).  The
+            # offset hooks (``add_(offset)``) carry static-affine steering; the
+            # capture hooks (``copy_`` the last-token slice) carry probe reads.
+            # Both update their buffers in place per gen, so the compiled fast
+            # path sees a stable hook topology and never recompiles — that is what
+            # lets steered *and probed* generation stay on the compiled graph
+            # (slice 2).  ``hidden_size`` falls back to the text sub-config for
             # multimodal wrappers (Gemma-3/4).
             hidden_size = getattr(model.config, "hidden_size", None)
             if hidden_size is None and hasattr(model.config, "get_text_config"):
                 hidden_size = model.config.get_text_config().hidden_size
             if hidden_size is not None:
                 model_dtype = next(model.parameters()).dtype
+                layers_ml = get_layers(model)
                 offset_buffers, offset_handles = install_persistent_offset_hooks(
-                    get_layers(model), int(hidden_size), device_obj, model_dtype,
+                    layers_ml, int(hidden_size), device_obj, model_dtype,
+                )
+                capture_buffers, capture_handles = install_persistent_capture_hooks(
+                    layers_ml, int(hidden_size), device_obj, model_dtype,
                 )
             model = _compile_with_probe(
                 model, tokenizer, device_obj,
@@ -715,15 +727,20 @@ class SaklasSession:
             cuda_graphs=cuda_graphs,
             return_top_k=return_top_k,
         )
-        # Adopt the persistent offset hooks iff compile actually stuck; if it
-        # fell back to eager, drop them (their add_(0) would be pure overhead).
-        if offset_handles:
+        # Adopt the persistent offset + capture hooks iff compile actually stuck;
+        # if it fell back to eager, drop them (their add_(0) / copy_ would be pure
+        # overhead with no compiled graph to ride).
+        if offset_handles or capture_handles:
             if session._compiled:
                 session._steering.adopt_compiled_offsets(
                     offset_buffers, offset_handles,
                 )
+                session._capture_buffers = capture_buffers
+                session._capture_handles = capture_handles
             else:
                 for h in offset_handles:
+                    h.remove()
+                for h in capture_handles:
                     h.remove()
         return session
 
@@ -823,10 +840,29 @@ class SaklasSession:
         self._steering_stack: list[dict[str, SteeringStackEntry]] = []
 
         # Set by ``_install_composed_steering`` when the current steering lowers
-        # to the persistent compile-clean offset buffers (static-affine push, no
-        # probes, compiled MPS session) instead of transient hooks — routes the
-        # decode loop to the compiled module + StaticCache.
+        # to the persistent compile-clean offset buffers (static-affine push,
+        # compiled MPS session) instead of transient hooks — routes the decode
+        # loop to the compiled module + StaticCache.
         self._steering_uses_compiled_offsets: bool = False
+
+        # Persistent compile-clean *capture* buffers + hook handles, adopted from
+        # ``from_pretrained`` when compile stuck (slice 2).  The always-on hooks
+        # ``copy_`` each layer's last-token slice into ``_capture_buffers[L]``
+        # every forward (fused into the compiled graph); a probed gen on the
+        # compiled path reads them post-forward via ``HiddenCapture.ingest_persistent``
+        # instead of registering transient capture hooks that would graph-break.
+        # Empty unless a compiled MPS session adopted them.
+        self._capture_buffers: dict[int, torch.Tensor] = {}
+        self._capture_handles: list[Any] = []
+        # Per-gen flags: ``_compiled_clean_eligible`` (set early in
+        # ``_generate_core``) means this gen *can* take the compiled clean path —
+        # compiled MPS, static cache, capture buffers present, not return_hidden —
+        # provided steering also lowers to offsets.  ``_capture_persistent`` (set
+        # in ``_begin_capture``) means the active capture rides the persistent
+        # buffers, so the decode loop wires ``ingest_persistent`` as its step
+        # callback and the routing keeps the compiled module.
+        self._compiled_clean_eligible: bool = False
+        self._capture_persistent: bool = False
 
         # Active assistant-role label for the current ``session.steering()``
         # scope — populated when every role-tagged term in the resolved
@@ -3059,11 +3095,13 @@ class SaklasSession:
         the persistent branchless offset buffers (traced into the compiled
         graph) instead of transient ctx-consulting hooks — the latter would
         force a per-gen ``torch.compile`` recompile and graph-break at every
-        layer.  Gated on no probes (per-token capture isn't compile-clean yet)
-        and on the offsets being available (compiled session).  Anything that
-        isn't a constant add (curved ``%``, gate, phase, ``!`` ablation) returns
-        ``None`` from :meth:`compute_static_offsets` and falls through to the
-        transient eager path.
+        layer.  Gated on the offsets being available (compiled session) and on
+        the capture being compile-clean too: either no probes, or this gen is
+        ``_compiled_clean_eligible`` so :meth:`_begin_capture` will ride the
+        persistent capture buffers instead of transient capture hooks (slice 2).
+        Anything that isn't a constant add (curved ``%``, gate, phase, ``!``
+        ablation) returns ``None`` from :meth:`compute_static_offsets` and falls
+        through to the transient eager path.
         """
         self._steering_uses_compiled_offsets = False
         # ``getattr`` defaults keep skeleton sessions (``__new__`` test stubs that
@@ -3072,7 +3110,10 @@ class SaklasSession:
             getattr(self, "_compiled", False)
             and self._device.type == "mps"
             and self._steering.has_compiled_offsets()
-            and not self._monitor.probe_names
+            and (
+                not self._monitor.probe_names
+                or getattr(self, "_compiled_clean_eligible", False)
+            )
         ):
             offsets = self._steering.compute_static_offsets()
             if offsets is not None:
@@ -3151,11 +3192,34 @@ class SaklasSession:
                 self._capture_aggregate_only = False
                 self._capture_lean = False
                 self._capture_gating_subset = None
+                self._capture_persistent = False
                 self._incremental_readings = []
                 return False
             layer_idxs = sorted(union)
+        # Persistent compile-clean capture (slice 2): when this gen is eligible
+        # for the compiled clean path AND steering lowered to offsets (or is
+        # unsteered), capture rides the always-on persistent buffers — the decode
+        # loop ``copy_``s each slice in inside the compiled graph, and
+        # ``ingest_persistent`` (wired as the step callback) does the per-token
+        # accumulation + scoring post-forward.  No transient ``register_forward_hook``
+        # is installed, so the routing keeps the compiled module + StaticCache.
+        # Anything that forced the eager path (curved / gated / phased steering,
+        # ``return_hidden``) falls back to transient capture hooks.
+        use_persistent = bool(
+            not widen
+            and getattr(self, "_compiled_clean_eligible", False)
+            and self._capture_buffers
+            and (
+                self._steering_uses_compiled_offsets
+                or self._steering.all_fast_path()
+            )
+        )
         self._capture.clear()
-        self._capture.attach(self._layers, layer_idxs)
+        if use_persistent:
+            self._capture.attach_persistent(layer_idxs, self._capture_buffers)
+        else:
+            self._capture.attach(self._layers, layer_idxs)
+        self._capture_persistent = use_persistent
         self._incremental_readings = []
         self._incremental_gate_scores = []
         self._capture_aggregate_only = False
@@ -4970,17 +5034,20 @@ class SaklasSession:
             )
         )
         # Compiled-model routing (MPS).  The graph was traced with ONLY the
-        # persistent branchless offset hooks present (attached pre-compile), so
-        # the compiled module is correct exactly when the live hook topology
-        # matches that: no per-token capture hooks AND either unsteered or a
-        # static-affine steering that lowered to the persistent offset buffers
-        # (``_steering_uses_compiled_offsets`` — the push rides the offset, no
-        # transient hook).  Everything else (transient ctx-consulting steering
-        # hooks, the probe roster's capture hooks) graph-breaks / recompiles, so
-        # route it to the eager original (``_orig_mod``) + DynamicCache — where
-        # the same persistent hooks still apply any offsets, so correctness
-        # holds and ``compile=True`` never regresses the hooked path.  CUDA keeps
-        # its existing graph-capture path untouched.
+        # persistent branchless offset + capture hooks present (attached
+        # pre-compile), so the compiled module is correct exactly when the live
+        # hook topology matches that: no *transient* per-token capture hooks
+        # (``self._capture._handles`` empty — true for the persistent-capture and
+        # no-probe paths) AND either unsteered or a static-affine steering that
+        # lowered to the persistent offset buffers (``_steering_uses_compiled_offsets``
+        # — the push rides the offset, no transient hook).  A probed gen on the
+        # persistent-capture path (slice 2) satisfies both, so it now keeps the
+        # compiled graph.  Everything else (transient ctx-consulting steering
+        # hooks, transient capture hooks for curved/gated/return_hidden) graph-breaks
+        # / recompiles, so route it to the eager original (``_orig_mod``) +
+        # DynamicCache — where the same persistent hooks still apply any offsets
+        # and capture, so correctness holds and ``compile=True`` never regresses
+        # the hooked path.  CUDA keeps its existing graph-capture path untouched.
         gen_model = self._model
         if self._compiled and self._device.type == "mps":
             compiled_clean = not self._capture._handles and (
@@ -5005,9 +5072,16 @@ class SaklasSession:
             cache_position_offset=cache_position_offset,
             score_callback=gating_callback,
             # Per-token probe scoring fires post-forward (FIX F1), not inside the
-            # capture hook.  ``fire_step_sink`` no-ops when no per-token sink is
-            # installed (aggregate-only / full-retention / no-probe captures).
-            step_callback=self._capture.fire_step_sink,
+            # capture hook.  On the persistent-capture path the step callback is
+            # ``ingest_persistent`` (accumulate from the persistent buffers +
+            # fire the step sink); otherwise ``fire_step_sink`` (the transient
+            # hooks already accumulated in-forward).  Both no-op when no per-token
+            # sink is installed (aggregate-only / full-retention / no-probe).
+            step_callback=(
+                self._capture.ingest_persistent
+                if self._capture_persistent
+                else self._capture.fire_step_sink
+            ),
             use_static_cache=use_static_cache,
             forced_prefix=forced_prefix,
             steering_active=bool(self._steering.hooks),
@@ -5269,6 +5343,23 @@ class SaklasSession:
             or _persists_probe_row
         )
 
+        # Compiled-clean eligibility for this gen, decided BEFORE the steering
+        # context enters (``steering_cm.__enter__`` runs ``_install_composed_steering``,
+        # which consults this to decide whether a probed gen may still lower
+        # steering to the persistent offset buffers — slice 2).  Eligible when the
+        # compiled MPS graph + static cache are live, the persistent capture
+        # buffers were adopted, and the caller didn't ask for the full per-step
+        # hidden stack (``return_hidden`` keeps the transient full-retention
+        # capture).  Capture then rides the persistent buffers; steering rides the
+        # offsets — both compile-clean.
+        self._compiled_clean_eligible = bool(
+            getattr(self, "_compiled", False)
+            and self._device.type == "mps"
+            and self._static_cache_active
+            and self._capture_buffers
+            and not (sampling and sampling.return_hidden)
+        )
+
         steering_cm = None
         if steering_obj is not None and steering_obj.alphas:
             steering_cm = self.steering(steering_obj)
@@ -5498,6 +5589,8 @@ class SaklasSession:
             self._capture_aggregate_only = False
             self._capture_gating_subset = None
             self._capture_gating_keys = None
+            self._capture_persistent = False
+            self._compiled_clean_eligible = False
             self._incremental_readings = []
             self._incremental_gate_scores = []
             # Zero the persistent compile-clean steering offsets so a static-

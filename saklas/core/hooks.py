@@ -85,6 +85,15 @@ class HiddenCapture:
         # generated-token index to its ring slot.
         self._tail_depth: int = 1
         self._forward_count: int = 0
+        # Persistent compile-clean capture source: when capture rides the
+        # always-on pre-compile capture hooks (``install_persistent_capture_hooks``)
+        # instead of transient per-gen hooks, this maps each captured layer to its
+        # persistent ``(D,)`` buffer (the latest-slice the hook ``copy_``-ed this
+        # forward).  ``attach_persistent`` populates it (no transient hook is
+        # registered); :meth:`ingest_persistent` reads it post-forward to drive the
+        # same accumulation + step-sink the in-hook path does.  Empty ⇒ the normal
+        # transient-hook path.
+        self._persistent_buffers: dict[int, torch.Tensor] = {}
 
     def attach(
         self, layers: "torch.nn.ModuleList", layer_indices: list[int]
@@ -100,6 +109,7 @@ class HiddenCapture:
         self._max_layer = None
         self._tail_depth = 1
         self._forward_count = 0
+        self._persistent_buffers = {}
         for idx in layer_indices:
             bucket = self._per_layer[idx]
 
@@ -188,10 +198,83 @@ class HiddenCapture:
         self._tail_depth = max(1, int(depth))
         self._max_layer = max(self._per_layer) if self._per_layer else None
 
+    def attach_persistent(
+        self, layer_indices: list[int], buffers: dict[int, torch.Tensor],
+    ) -> None:
+        """Compile-clean capture: accumulate from persistent buffers, no hooks.
+
+        The always-on pre-compile capture hooks
+        (:func:`install_persistent_capture_hooks`) ``copy_`` each layer's latest
+        ``(D,)`` slice into ``buffers[L]`` every forward — fused into the compiled
+        graph, so they don't break it (a transient per-gen ``register_forward_hook``
+        would).  This sets up the per-layer buckets for the probe subset and
+        records the buffer source, but registers **no** transient hook.  The
+        generation loop calls :meth:`ingest_persistent` post-forward to run the
+        same accumulation (length-1 / tail ring / full stack) + step sink the
+        in-hook path runs.  Mode setters (:meth:`set_incremental` /
+        :meth:`set_aggregate_tail`) apply identically afterward.
+        """
+        self._per_layer = {idx: [] for idx in layer_indices}
+        self._handles = []
+        self._incremental = False
+        self._step_sink = None
+        self._max_layer = None
+        self._tail_depth = 1
+        self._forward_count = 0
+        self._persistent_buffers = {
+            idx: buffers[idx] for idx in layer_indices if idx in buffers
+        }
+
+    def ingest_persistent(self) -> None:
+        """Post-forward accumulation from the persistent buffers (compiled path).
+
+        The compile-clean mirror of the in-hook accumulation: for each captured
+        layer, append / overwrite / ring its latest persistent slice exactly as
+        :meth:`attach`'s hook would, advance the forward counter, then fire the
+        step sink once (the FIX F1 post-forward scoring point).  Wired as the
+        decode loop's ``step_callback`` when capture is persistent, so the call
+        order (forward → ingest → gate scoring) and the resulting bucket shapes
+        are byte-identical to the transient path — every downstream consumer
+        (``tail_slice_at`` / ``stacked`` / ``latest_per_layer`` / the step sink's
+        stored rows) is unchanged.  No-op unless attached via
+        :meth:`attach_persistent`.
+        """
+        if not self._persistent_buffers:
+            return
+        for idx, bucket in self._per_layer.items():
+            src = self._persistent_buffers.get(idx)
+            if src is None:
+                continue
+            if self._incremental:
+                if self._tail_depth <= 1:
+                    # Length-1 overwrite: clone once, then ``copy_`` the latest
+                    # persistent slice in each step (zero steady-state allocation,
+                    # bucket stays length-1 so ``[-1]`` reads the latest).
+                    if bucket:
+                        bucket[0].copy_(src)
+                    else:
+                        bucket.append(src.clone())
+                else:
+                    # Bounded-tail ring: keep the last ``_tail_depth`` slices so
+                    # finalize can pool the last *content* token.
+                    bucket.append(src.clone())
+                    if len(bucket) > self._tail_depth:
+                        bucket.pop(0)
+            else:
+                # Full-retention: a distinct clone per step so ``stacked()`` can
+                # build the [T, D] history.
+                bucket.append(src.clone())
+        self._forward_count += 1
+        if self._step_sink is not None:
+            self._step_sink(self.latest_per_layer())
+
     def detach(self) -> None:
         for h in self._handles:
             h.remove()
         self._handles = []
+        # Drop the persistent-buffer source so a later transient capture (or a
+        # no-probe gen) can't read stale slices through ``ingest_persistent``.
+        self._persistent_buffers = {}
 
     def clear(self) -> None:
         self._per_layer = {}
@@ -201,6 +284,7 @@ class HiddenCapture:
         self._max_layer = None
         self._tail_depth = 1
         self._forward_count = 0
+        self._persistent_buffers = {}
 
     def tail_slice_at(self, forward_index: int) -> dict[int, torch.Tensor]:
         """Per-layer ``[D]`` slice for decode ``forward_index`` from the tail ring.
@@ -1321,6 +1405,45 @@ def install_persistent_offset_hooks(
         def _hook(module: Any, inp: Any, out: Any) -> Any:
             h = out if isinstance(out, torch.Tensor) else out[0]
             h.add_(buf)
+            return out
+        return _hook
+
+    for idx in range(len(layers)):
+        buf = torch.zeros(hidden_size, device=device, dtype=dtype)
+        buffers[idx] = buf
+        handles.append(layers[idx].register_forward_hook(_make(buf)))
+    return buffers, handles
+
+
+def install_persistent_capture_hooks(
+    layers: "torch.nn.ModuleList",
+    hidden_size: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> "tuple[dict[int, torch.Tensor], list[Any]]":
+    """Attach one branchless ``buf.copy_(hidden[0, -1, :])`` forward hook per layer.
+
+    The persistent compile-clean *capture* path (the read-side analogue of
+    :func:`install_persistent_offset_hooks`): each layer gets a preallocated
+    ``(hidden_size,)`` buffer and a hook that copies its last-position hidden
+    slice in.  Call **before** ``torch.compile`` so the ``copy_`` is fused into
+    the traced graph; a probed generation then reads the latest slice per forward
+    via :meth:`HiddenCapture.ingest_persistent` (post-forward, host side) instead
+    of registering transient capture hooks that would graph-break / recompile.
+
+    Hooks cover **every** layer (the probe roster isn't known until after compile,
+    so capture a fixed superset and let the monitor read its subset).  The
+    ``copy_`` is a pure write with no effect on the model output, so the hooks are
+    always safe to leave installed — unprobed and eager-fallback gens just ignore
+    the buffers.  Returns ``(buffers, handles)`` for the session to adopt.
+    """
+    buffers: dict[int, torch.Tensor] = {}
+    handles: list[Any] = []
+
+    def _make(buf: torch.Tensor) -> Any:
+        def _hook(module: Any, inp: Any, out: Any) -> Any:
+            h = out if isinstance(out, torch.Tensor) else out[0]
+            buf.copy_(h[0, -1, :])
             return out
         return _hook
 
