@@ -13,7 +13,7 @@
   //              statline: glyph · name · unfitted/stale warn · trigger · ✕
   //              body:     snap-to-node Select · XYPad · along · onto
   //
-  // The pre-4.1 ``~``/``|`` projection, ``!`` ablation, and ``:variant`` chip
+  // The pre-4.0 ``~``/``|`` projection, ``!`` ablation, and ``:variant`` chip
   // are gone from the card (a ``%`` term can't carry projection/ablation;
   // variant survives on the entry for round-trip but isn't authored here).
   // ``s`` / ``m`` are the narrowed entry views the template renders behind
@@ -220,7 +220,7 @@
               options={snapOptions}
               onchange={onSnapToNode}
               ariaLabel="snap to node"
-              title="pick a node to switch to label-form, or '(free position)' to drag the pad"
+              title="pick a node to lock to label-form, or '(free position)' to set coords with the sliders"
             />
           </span>
         </label>

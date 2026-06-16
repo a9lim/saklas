@@ -21,8 +21,9 @@ activation covariance:
   to plain Gram-Schmidt projection when ``Σ = I``.
 
 Storage discipline: **no new persistent cache.**  :class:`LayerWhitener`
-is built from the existing ``layer_means.safetensors`` and
-``neutral_activations.safetensors`` caches under ``~/.saklas/models/<id>/``.
+is built from the ``neutral_activations.safetensors`` cache under
+``~/.saklas/models/<id>/`` (the per-layer centering mean is derived from
+those neutrals as ``X.mean(0)`` — there is no separate ``layer_means`` cache).
 The 90 neutral statements give ``X ∈ ℝ^(N=90, D)`` per layer; ``Σ`` is
 rank-deficient (rank ≤ N-1 = 89), so we ridge-regularize with
 ``λ_L = (||X_L||_F² / (N · D)) · ridge_scale`` (mean diagonal of the
@@ -37,15 +38,17 @@ Cost per ``Σ^{-1} v``: ``O(N D)`` (one ``X v`` matvec, one ``X^T (Kx)``
 matvec).  Storage cost: ``X`` already on disk; ``K`` is ``N × N`` (≈32 KB
 per layer at N=90), held in memory only.
 
-Intended consumers:
+Intended consumers (Mahalanobis-only as of 4.0 — there is no Euclidean
+fallback path):
 
-* :meth:`saklas.core.profile.Profile.cosine_similarity` — pass a
-  :class:`LayerWhitener` to switch to the Mahalanobis metric.
-* :func:`saklas.core.vectors.project_profile` — pass a whitener to
-  switch ``|`` / ``~`` to LEACE-flavored projection.
+* :meth:`saklas.core.profile.Profile.cosine_similarity` — the whitened
+  cosine metric.
+* :func:`saklas.core.vectors.project_profile` — LEACE-flavored ``|`` / ``~``
+  projection.
 
-Both call sites accept ``whitener=None`` (default) for back-compat
-Euclidean math.
+Both call sites **require** a :class:`LayerWhitener` covering every shared /
+projected layer and raise :class:`WhitenerError` on a missing or
+non-covering whitener.
 """
 
 from __future__ import annotations

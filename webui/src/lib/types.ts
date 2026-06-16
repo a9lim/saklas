@@ -548,14 +548,6 @@ export interface ExtractResponse {
   progress: string[];
 }
 
-/** Body for POST /sessions/{id}/vectors/merge — registered output is a
- * derived profile keyed by ``name``. */
-export interface MergeVectorRequest {
-  name: string;
-  expression: string;
-}
-
-export type MergeVectorResponse = VectorInfo;
 
 /** Output of GET /sessions/{id}/vectors/{name}/diagnostics — per-layer
  * ``||baked||`` magnitudes + bucket histogram + (optional) probe-quality
@@ -1272,13 +1264,6 @@ export interface ChatTurn {
    *  thinking excluded).  Populated from the WS ``done`` event; absent for
    *  legacy / replayed turns. */
   meanLogprob?: number | null;
-}
-
-// ----------------------------------------------------- vector rack --
-
-export interface ProjectionSpec {
-  op: "~" | "|";
-  target: string;
 }
 
 // ----------------------------------------------------- steer rack --

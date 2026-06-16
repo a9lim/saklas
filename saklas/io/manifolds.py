@@ -6,9 +6,9 @@ statements — placed at authoring coordinates on a :class:`ManifoldDomain`
 cylinder, a torus, a sphere, or an explicit immersion).  Fitting a
 manifold against a model produces a per-model RBF artifact (see
 :mod:`saklas.core.manifold`).  Manifolds live under their own root,
-``~/.saklas/manifolds/<ns>/<name>/``, parallel to ``vectors/`` — a
-manifold is not a single bipolar concept, so it is not a
-:class:`saklas.io.packs.ConceptFolder`.
+``~/.saklas/manifolds/<ns>/<name>/``, parallel to the legacy ``vectors/``
+port root — a manifold carries N labeled nodes on a domain, not a single
+bipolar concept (the retired pack/concept folder shape).
 
 ```
 ~/.saklas/manifolds/<ns>/<name>/
@@ -480,9 +480,9 @@ class ManifoldFolder:
         if not isinstance(fmt, int) or fmt < MANIFOLD_FORMAT_VERSION:
             raise ManifoldFormatError(
                 f"manifold.json in {folder} has format_version={fmt!r}; "
-                f"need >= {MANIFOLD_FORMAT_VERSION}. Pre-v3 manifolds use "
-                f"the old 1-D cyclic-spline format — convert them with "
-                f"scripts/upgrade_manifolds.py."
+                f"need >= {MANIFOLD_FORMAT_VERSION}. Regenerate it with the "
+                f"current saklas — run scripts/upgrade_manifolds.py for a legacy "
+                f"pack, or re-fit a discover manifold."
             )
         if fmt > MANIFOLD_FORMAT_VERSION:
             # Symmetric upper bound, mirroring ``PackMetadata.load`` — a

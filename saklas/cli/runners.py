@@ -2167,7 +2167,7 @@ def _run_pack_export(args: argparse.Namespace) -> None:
         print(f"Wrote {p}")
 
 
-# The eight steering-vector / manifold *compute* verbs (model-loading +
+# The nine steering-vector / manifold *compute* verbs (model-loading +
 # analysis).  ``manifold transfer`` keeps its own runner (it was already a
 # manifold verb); the rest are the renamed former ``subspace`` verbs plus the
 # discover→fit fold.

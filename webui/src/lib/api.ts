@@ -27,8 +27,6 @@ import type {
   ManifoldInfo,
   ManifoldListResponse,
   MergeManifoldRequest,
-  MergeVectorRequest,
-  MergeVectorResponse,
   NodeDiffJSON,
   PairwiseCompareResponse,
   ProbeDefaultsResponse,
@@ -75,8 +73,6 @@ export type {
   ManifoldInfo,
   ManifoldListResponse,
   MergeManifoldRequest,
-  MergeVectorRequest,
-  MergeVectorResponse,
   NodeDiffJSON,
   PairwiseCompareResponse,
   ProbeDefaultsResponse,
@@ -286,12 +282,6 @@ export const apiVectors = {
    * ``apiExtractStream`` instead. */
   extract(req: ExtractRequest, id: string = SESSION): Promise<ExtractResponse> {
     return request(`${SESSION_BASE(id)}/extract`, jsonBody(req));
-  },
-  merge(
-    req: MergeVectorRequest,
-    id: string = SESSION,
-  ): Promise<MergeVectorResponse> {
-    return request(`${SESSION_BASE(id)}/vectors/bake`, jsonBody(req));
   },
   diagnostics(
     name: string,

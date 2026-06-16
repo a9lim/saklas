@@ -176,13 +176,10 @@ _AGG_TAIL_DEPTH = 8
 _PREFIX_CACHE_MIN_TOKENS = 16
 
 PROBE_CATEGORIES = [
-    "affect",
     "epistemic",
     "alignment",
     "register",
-    "social_stance",
     "cultural",
-    "identity",
 ]
 MIN_ELAPSED_FOR_RATE = 0.1
 
@@ -388,7 +385,8 @@ def _affine_manifold_push(
     the weights are built directly in authoring-coordinate space.  Arity
     (coord form) is validated against the domain's intrinsic dim, matching the
     curved :meth:`SteeringManager.add_manifold` path; a non-poised layout (no
-    interpolant) falls back to a label-form instruction.
+    interpolant) raises ``SteeringExprError`` advising the user to steer by
+    node label instead.
     """
     from saklas.core.steering_expr import SteeringExprError
     from saklas.core.manifold import rbf_cardinal_weights
@@ -5125,280 +5123,280 @@ class SaklasSession:
             self._gen_lock.release()
             raise ConcurrentGenerationError("session generation already in flight")
         self._gen_phase = GenState.PREAMBLE
-
-        # v2.3 phase 5: apply recipe override (auto-regen / manual mode)
-        # before constructing the Steering object so the overlay wins
-        # over the per-call kwargs.
-        if recipe_override is not None:
-            steering, sampling, thinking = self._resolve_recipe_override(
-                recipe_override,
-                parent_node_id=parent_node_id,
-                steering=steering,
-                sampling=sampling,
-                thinking=thinking,
-            )
-
-        (
-            steering_obj,
-            use_thinking_req,
-            gen_config,
-            lp_count,
-            seed,
-            stop_list,
-            logit_bias,
-            presence_penalty,
-            frequency_penalty,
-            logprobs_list,
-        ) = self._prepare_generation_call(steering, sampling, thinking)
-        # ``mean_logprob_accum`` averages chosen-token logprobs over the
-        # non-thinking response span — surfaced on ``LoomNode.mean_logprob``
-        # at finalize-assistant time so the loom sidebar can sort siblings
-        # by surprise.  Populates whenever the engine captures chosen
-        # logprob (any ``on_token`` consumer with ``lp_count is not None``
-        # — i.e. the loom path or an explicit logprobs request).
-        mean_logprob_sum: float = 0.0
-        mean_logprob_count: int = 0
-        trait_token_counter = [0]
-        _wants_live_token_scores = bool(
-            on_token is not None
-            and getattr(on_token, "_saklas_wants_live_scores", False)
-        )
-        _persists_layer_scores = bool(
-            (sampling is not None and sampling.persist_per_layer_scores)
-            or (
-                on_token is not None
-                and getattr(on_token, "_saklas_wants_per_layer_scores", False)
-            )
-        )
-        # Probe-inspector live point + fading trail: stamp each token's probe
-        # reading with per-layer whitened subspace coords.  Gates the monitor
-        # post-pass (set here, reset in the teardown ``finally``) and forces
-        # per-token scoring so the per-token reading actually exists to carry it.
-        _persists_subspace_coords = bool(
-            sampling is not None and sampling.persist_subspace_coords
-        )
-        self._monitor.set_subspace_coords(_persists_subspace_coords)
-
-        def _token_tap(text: str, is_thinking: bool, tid: int | None, lp: float | None, top_alts: Any, perplexity: float | None) -> None:
-            nonlocal mean_logprob_sum, mean_logprob_count
-            self._last_token_probe_payload = None
-            if logprobs_list is not None and tid is not None and tid >= 0 and not is_thinking:
-                logprobs_list.append((tid, lp if lp is not None else 0.0, top_alts or []))
-            if lp is not None and tid is not None and tid >= 0 and not is_thinking:
-                mean_logprob_sum += lp
-                mean_logprob_count += 1
-            latest_hidden_for_token: dict[int, torch.Tensor] | None = None
-            scores: dict[str, float] | None = None
-            vector_readings: dict[str, "ProbeReading"] | None = None
-            per_layer_payload: dict[str, dict[str, float]] | None = None
-            probe_readings = None
-            needs_scores = bool(
-                self._monitor.probe_names
-                and (
-                    assistant_node_id is not None
-                    or _has_trait_consumer
-                    or _wants_live_token_scores
-                    or _persists_subspace_coords
-                )
-            )
-            # Lean-incremental rows carry coords+fraction only (FIX F2); the tap's
-            # consumers in lean mode read just axis-0 ``scores`` (the lean
-            # precondition rules out ``_wants_live_token_scores`` /
-            # ``_persists_layer_scores`` / ``_persists_subspace_coords``), so the
-            # stored lean rows are reused exactly like the full-incremental rows.
-            has_incremental_reading = bool(
-                (self._capture_incremental or self._capture_lean)
-                and self._incremental_readings
-            )
-            if needs_scores and not has_incremental_reading:
-                latest_hidden_for_token = {
-                    layer_idx: bucket[-1]
-                    for layer_idx, bucket in self._capture._per_layer.items()
-                    if bucket
-                }
-            if (
-                needs_scores
-                and has_incremental_reading
-            ):
-                agg = self._incremental_readings[-1]
-                if agg:
-                    vector_readings = agg
-                    scores = {
-                        p: (r.coords[0] if r.coords else 0.0)
-                        for p, r in agg.items()
-                    }
-                    if _wants_live_token_scores:
-                        probe_readings = agg
-                    if assistant_node_id is not None and _persists_layer_scores:
-                        by_layer: dict[str, dict[str, float]] = {}
-                        for p, r in agg.items():
-                            for layer, coord in r.coords_per_layer.items():
-                                by_layer.setdefault(str(layer), {})[p] = round(
-                                    float(coord[0] if coord else 0.0), 6,
-                                )
-                        per_layer_payload = by_layer or None
-            elif needs_scores and latest_hidden_for_token:
-                # One unified pass over every probe shape — flat coords + curved
-                # fraction/nearest in one dict.
-                agg = self._monitor.score_single_token(latest_hidden_for_token)
-                if agg:
-                    # Keep the full readings dict for the live-mean fold +
-                    # ``TokenEvent``; collapse to coordinate axis 0 for the
-                    # scalar trait stream + per-token ``probes`` row (the bare
-                    # ``@when:<probe>`` channel).
-                    vector_readings = agg
-                    scores = {
-                        p: (r.coords[0] if r.coords else 0.0)
-                        for p, r in agg.items()
-                    }
-                    # The per-token geometric wire field (full reading) only
-                    # when a client wants the live per-token stream.
-                    if _wants_live_token_scores:
-                        probe_readings = agg
-                    # Per-layer axis-0 heatmap row — read straight off the
-                    # full reading's ``coords_per_layer`` (no second pass).
-                    if assistant_node_id is not None and _persists_layer_scores:
-                        by_layer: dict[str, dict[str, float]] = {}
-                        for p, r in agg.items():
-                            for layer, coord in r.coords_per_layer.items():
-                                by_layer.setdefault(str(layer), {})[p] = round(
-                                    float(coord[0] if coord else 0.0), 6,
-                                )
-                        per_layer_payload = by_layer or None
-            self._last_token_probe_payload = {
-                "scores": scores,
-                "readings": vector_readings,
-                "per_layer_scores": per_layer_payload,
-                "probe_readings": probe_readings,
-            }
-            if assistant_node_id is not None and tid is not None:
-                token_row: dict[str, Any] = {
-                    "token_id": int(tid),
-                    "text": text,
-                    "logprob": float(lp) if lp is not None else None,
-                    "perplexity": (
-                        float(perplexity) if perplexity is not None else None
-                    ),
-                }
-                if top_alts:
-                    token_row["top_alts"] = [
-                        {
-                            "id": int(a.id),
-                            "text": a.text,
-                            "logprob": float(a.logprob),
-                        }
-                        for a in top_alts
-                    ]
-                if scores:
-                    token_row["probes"] = {
-                        p: round(float(v), 6) for p, v in scores.items()
-                    }
-                if per_layer_payload:
-                    token_row["per_layer_scores"] = per_layer_payload
-                self.tree.append_token(
-                    assistant_node_id,
-                    token_row,
-                    thinking=bool(is_thinking),
-                )
-            if on_token is not None:
-                on_token(text, is_thinking, tid, lp, top_alts, perplexity)
-            # Inline per-token scoring for live SSE trait subscribers.
-            if self._trait_queues and self._monitor.probe_names and scores:
-                event = ("token", trait_token_counter[0], text, is_thinking, scores)
-                trait_token_counter[0] += 1
-                with self._trait_lock:
-                    for lp_ref, q in list(self._trait_queues):
-                        with suppress(Exception):
-                            lp_ref.call_soon_threadsafe(q.put_nowait, event)
-
-        # Pass _token_tap into generate_steered only when at least one of its
-        # branches is live: caller-supplied on_token, logprobs collection, or
-        # live trait subscribers.  When all three are inactive, _token_tap
-        # would be a no-op called once per generated token, AND its presence
-        # forces generate_steered to compute the unconditional fp32
-        # log_softmax + entropy sync per step (gate at generation.py:571).
-        # Skipping it here trims that cost from the v3 stateless prefill
-        # workload (800 back-to-back gens of ~16 tokens each, no logprobs,
-        # no streaming, no SSE).  Stop-sequence behavior is preserved by
-        # not wiring _token_tap=None when stop_list is set — the tokenizer-
-        # decode + stop-match in generation.py only runs under on_token.
-        _has_trait_consumer = bool(self._trait_queues and self._monitor.probe_names)
-        # The tap also writes per-token ``probes`` / ``per_layer_scores``
-        # onto the loom row when probes are loaded and the gen is loom-
-        # attached — required so a webui refresh can rehydrate highlight
-        # tints and the token-drilldown heatmap from the server tree.
-        _persists_probe_row = bool(not stateless and self._monitor.probe_names)
-        _need_tap = (
-            on_token is not None
-            or logprobs_list is not None
-            or _has_trait_consumer
-            or _persists_probe_row
-            or stop_list is not None
-        )
-        _effective_tap = _token_tap if _need_tap else None
-        _tap_has_text_consumer = bool(
-            on_token is not None
-            or (logprobs_list is not None and (lp_count or 0) > 0)
-            or _has_trait_consumer
-            or _persists_probe_row
-        )
-
-        # Compiled-clean eligibility for this gen, decided BEFORE the steering
-        # context enters (``steering_cm.__enter__`` runs ``_install_composed_steering``,
-        # which consults this to decide whether a probed gen may still lower
-        # steering to the persistent offset buffers — slice 2).  Eligible when the
-        # compiled MPS graph + static cache are live, the persistent capture
-        # buffers were adopted, and the caller didn't ask for the full per-step
-        # hidden stack (``return_hidden`` keeps the transient full-retention
-        # capture).  Capture then rides the persistent buffers; steering rides the
-        # offsets — both compile-clean.
-        self._compiled_clean_eligible = bool(
-            getattr(self, "_compiled", False)
-            and self._device.type == "mps"
-            and self._static_cache_active
-            and self._capture_buffers
-            and not (sampling and sampling.return_hidden)
-        )
-
         steering_cm = None
-        if steering_obj is not None and steering_obj.alphas:
-            steering_cm = self.steering(steering_obj)
-
-        vector_snapshot: dict[str, float] = (
-            self._snapshot_steering_alphas()
-            if self._steering_stack or steering_cm is not None
-            else {}
-        )
-
-        # Snapshot the chat-history anchor BEFORE _start_loom_assistant
-        # mutates the tree.  Otherwise the new (empty) assistant node it
-        # creates becomes the active leaf, and ``messages_for(None)`` later
-        # walks INCLUDING that empty assistant — producing a trailing
-        # empty-content assistant message AND a duplicated trailing user
-        # turn after ``_prepare_input`` re-appends ``input``.  Strict chat
-        # templates (Mistral 3) reject the empty assistant outright with
-        # ``Assistant message must have a string or a list of chunks ...``;
-        # permissive templates render the duplicate user silently and
-        # degrade prompt quality.
-        chat_history_anchor = parent_node_id
-        if (
-            not stateless
-            and isinstance(input, str)
-            and chat_history_anchor is None
-        ):
-            chat_history_anchor = self.tree.active_node_id
-
-        assistant_node_id = self._start_loom_assistant(
-            input,
-            stateless=stateless,
-            raw=raw,
-            parent_node_id=parent_node_id,
-            sampling=sampling,
-            steering_obj=steering_obj,
-            use_thinking_req=use_thinking_req,
-        )
-
         try:
+
+            # v2.3 phase 5: apply recipe override (auto-regen / manual mode)
+            # before constructing the Steering object so the overlay wins
+            # over the per-call kwargs.
+            if recipe_override is not None:
+                steering, sampling, thinking = self._resolve_recipe_override(
+                    recipe_override,
+                    parent_node_id=parent_node_id,
+                    steering=steering,
+                    sampling=sampling,
+                    thinking=thinking,
+                )
+
+            (
+                steering_obj,
+                use_thinking_req,
+                gen_config,
+                lp_count,
+                seed,
+                stop_list,
+                logit_bias,
+                presence_penalty,
+                frequency_penalty,
+                logprobs_list,
+            ) = self._prepare_generation_call(steering, sampling, thinking)
+            # ``mean_logprob_accum`` averages chosen-token logprobs over the
+            # non-thinking response span — surfaced on ``LoomNode.mean_logprob``
+            # at finalize-assistant time so the loom sidebar can sort siblings
+            # by surprise.  Populates whenever the engine captures chosen
+            # logprob (any ``on_token`` consumer with ``lp_count is not None``
+            # — i.e. the loom path or an explicit logprobs request).
+            mean_logprob_sum: float = 0.0
+            mean_logprob_count: int = 0
+            trait_token_counter = [0]
+            _wants_live_token_scores = bool(
+                on_token is not None
+                and getattr(on_token, "_saklas_wants_live_scores", False)
+            )
+            _persists_layer_scores = bool(
+                (sampling is not None and sampling.persist_per_layer_scores)
+                or (
+                    on_token is not None
+                    and getattr(on_token, "_saklas_wants_per_layer_scores", False)
+                )
+            )
+            # Probe-inspector live point + fading trail: stamp each token's probe
+            # reading with per-layer whitened subspace coords.  Gates the monitor
+            # post-pass (set here, reset in the teardown ``finally``) and forces
+            # per-token scoring so the per-token reading actually exists to carry it.
+            _persists_subspace_coords = bool(
+                sampling is not None and sampling.persist_subspace_coords
+            )
+            self._monitor.set_subspace_coords(_persists_subspace_coords)
+
+            def _token_tap(text: str, is_thinking: bool, tid: int | None, lp: float | None, top_alts: Any, perplexity: float | None) -> None:
+                nonlocal mean_logprob_sum, mean_logprob_count
+                self._last_token_probe_payload = None
+                if logprobs_list is not None and tid is not None and tid >= 0 and not is_thinking:
+                    logprobs_list.append((tid, lp if lp is not None else 0.0, top_alts or []))
+                if lp is not None and tid is not None and tid >= 0 and not is_thinking:
+                    mean_logprob_sum += lp
+                    mean_logprob_count += 1
+                latest_hidden_for_token: dict[int, torch.Tensor] | None = None
+                scores: dict[str, float] | None = None
+                vector_readings: dict[str, "ProbeReading"] | None = None
+                per_layer_payload: dict[str, dict[str, float]] | None = None
+                probe_readings = None
+                needs_scores = bool(
+                    self._monitor.probe_names
+                    and (
+                        assistant_node_id is not None
+                        or _has_trait_consumer
+                        or _wants_live_token_scores
+                        or _persists_subspace_coords
+                    )
+                )
+                # Lean-incremental rows carry coords+fraction only (FIX F2); the tap's
+                # consumers in lean mode read just axis-0 ``scores`` (the lean
+                # precondition rules out ``_wants_live_token_scores`` /
+                # ``_persists_layer_scores`` / ``_persists_subspace_coords``), so the
+                # stored lean rows are reused exactly like the full-incremental rows.
+                has_incremental_reading = bool(
+                    (self._capture_incremental or self._capture_lean)
+                    and self._incremental_readings
+                )
+                if needs_scores and not has_incremental_reading:
+                    latest_hidden_for_token = {
+                        layer_idx: bucket[-1]
+                        for layer_idx, bucket in self._capture._per_layer.items()
+                        if bucket
+                    }
+                if (
+                    needs_scores
+                    and has_incremental_reading
+                ):
+                    agg = self._incremental_readings[-1]
+                    if agg:
+                        vector_readings = agg
+                        scores = {
+                            p: (r.coords[0] if r.coords else 0.0)
+                            for p, r in agg.items()
+                        }
+                        if _wants_live_token_scores:
+                            probe_readings = agg
+                        if assistant_node_id is not None and _persists_layer_scores:
+                            by_layer: dict[str, dict[str, float]] = {}
+                            for p, r in agg.items():
+                                for layer, coord in r.coords_per_layer.items():
+                                    by_layer.setdefault(str(layer), {})[p] = round(
+                                        float(coord[0] if coord else 0.0), 6,
+                                    )
+                            per_layer_payload = by_layer or None
+                elif needs_scores and latest_hidden_for_token:
+                    # One unified pass over every probe shape — flat coords + curved
+                    # fraction/nearest in one dict.
+                    agg = self._monitor.score_single_token(latest_hidden_for_token)
+                    if agg:
+                        # Keep the full readings dict for the live-mean fold +
+                        # ``TokenEvent``; collapse to coordinate axis 0 for the
+                        # scalar trait stream + per-token ``probes`` row (the bare
+                        # ``@when:<probe>`` channel).
+                        vector_readings = agg
+                        scores = {
+                            p: (r.coords[0] if r.coords else 0.0)
+                            for p, r in agg.items()
+                        }
+                        # The per-token geometric wire field (full reading) only
+                        # when a client wants the live per-token stream.
+                        if _wants_live_token_scores:
+                            probe_readings = agg
+                        # Per-layer axis-0 heatmap row — read straight off the
+                        # full reading's ``coords_per_layer`` (no second pass).
+                        if assistant_node_id is not None and _persists_layer_scores:
+                            by_layer: dict[str, dict[str, float]] = {}
+                            for p, r in agg.items():
+                                for layer, coord in r.coords_per_layer.items():
+                                    by_layer.setdefault(str(layer), {})[p] = round(
+                                        float(coord[0] if coord else 0.0), 6,
+                                    )
+                            per_layer_payload = by_layer or None
+                self._last_token_probe_payload = {
+                    "scores": scores,
+                    "readings": vector_readings,
+                    "per_layer_scores": per_layer_payload,
+                    "probe_readings": probe_readings,
+                }
+                if assistant_node_id is not None and tid is not None:
+                    token_row: dict[str, Any] = {
+                        "token_id": int(tid),
+                        "text": text,
+                        "logprob": float(lp) if lp is not None else None,
+                        "perplexity": (
+                            float(perplexity) if perplexity is not None else None
+                        ),
+                    }
+                    if top_alts:
+                        token_row["top_alts"] = [
+                            {
+                                "id": int(a.id),
+                                "text": a.text,
+                                "logprob": float(a.logprob),
+                            }
+                            for a in top_alts
+                        ]
+                    if scores:
+                        token_row["probes"] = {
+                            p: round(float(v), 6) for p, v in scores.items()
+                        }
+                    if per_layer_payload:
+                        token_row["per_layer_scores"] = per_layer_payload
+                    self.tree.append_token(
+                        assistant_node_id,
+                        token_row,
+                        thinking=bool(is_thinking),
+                    )
+                if on_token is not None:
+                    on_token(text, is_thinking, tid, lp, top_alts, perplexity)
+                # Inline per-token scoring for live SSE trait subscribers.
+                if self._trait_queues and self._monitor.probe_names and scores:
+                    event = ("token", trait_token_counter[0], text, is_thinking, scores)
+                    trait_token_counter[0] += 1
+                    with self._trait_lock:
+                        for lp_ref, q in list(self._trait_queues):
+                            with suppress(Exception):
+                                lp_ref.call_soon_threadsafe(q.put_nowait, event)
+
+            # Pass _token_tap into generate_steered only when at least one of its
+            # branches is live: caller-supplied on_token, logprobs collection, or
+            # live trait subscribers.  When all three are inactive, _token_tap
+            # would be a no-op called once per generated token, AND its presence
+            # forces generate_steered to compute the unconditional fp32
+            # log_softmax + entropy sync per step (gate at generation.py:571).
+            # Skipping it here trims that cost from the v3 stateless prefill
+            # workload (800 back-to-back gens of ~16 tokens each, no logprobs,
+            # no streaming, no SSE).  Stop-sequence behavior is preserved by
+            # not wiring _token_tap=None when stop_list is set — the tokenizer-
+            # decode + stop-match in generation.py only runs under on_token.
+            _has_trait_consumer = bool(self._trait_queues and self._monitor.probe_names)
+            # The tap also writes per-token ``probes`` / ``per_layer_scores``
+            # onto the loom row when probes are loaded and the gen is loom-
+            # attached — required so a webui refresh can rehydrate highlight
+            # tints and the token-drilldown heatmap from the server tree.
+            _persists_probe_row = bool(not stateless and self._monitor.probe_names)
+            _need_tap = (
+                on_token is not None
+                or logprobs_list is not None
+                or _has_trait_consumer
+                or _persists_probe_row
+                or stop_list is not None
+            )
+            _effective_tap = _token_tap if _need_tap else None
+            _tap_has_text_consumer = bool(
+                on_token is not None
+                or (logprobs_list is not None and (lp_count or 0) > 0)
+                or _has_trait_consumer
+                or _persists_probe_row
+            )
+
+            # Compiled-clean eligibility for this gen, decided BEFORE the steering
+            # context enters (``steering_cm.__enter__`` runs ``_install_composed_steering``,
+            # which consults this to decide whether a probed gen may still lower
+            # steering to the persistent offset buffers — slice 2).  Eligible when the
+            # compiled MPS graph + static cache are live, the persistent capture
+            # buffers were adopted, and the caller didn't ask for the full per-step
+            # hidden stack (``return_hidden`` keeps the transient full-retention
+            # capture).  Capture then rides the persistent buffers; steering rides the
+            # offsets — both compile-clean.
+            self._compiled_clean_eligible = bool(
+                getattr(self, "_compiled", False)
+                and self._device.type == "mps"
+                and self._static_cache_active
+                and self._capture_buffers
+                and not (sampling and sampling.return_hidden)
+            )
+
+            if steering_obj is not None and steering_obj.alphas:
+                steering_cm = self.steering(steering_obj)
+
+            vector_snapshot: dict[str, float] = (
+                self._snapshot_steering_alphas()
+                if self._steering_stack or steering_cm is not None
+                else {}
+            )
+
+            # Snapshot the chat-history anchor BEFORE _start_loom_assistant
+            # mutates the tree.  Otherwise the new (empty) assistant node it
+            # creates becomes the active leaf, and ``messages_for(None)`` later
+            # walks INCLUDING that empty assistant — producing a trailing
+            # empty-content assistant message AND a duplicated trailing user
+            # turn after ``_prepare_input`` re-appends ``input``.  Strict chat
+            # templates (Mistral 3) reject the empty assistant outright with
+            # ``Assistant message must have a string or a list of chunks ...``;
+            # permissive templates render the duplicate user silently and
+            # degrade prompt quality.
+            chat_history_anchor = parent_node_id
+            if (
+                not stateless
+                and isinstance(input, str)
+                and chat_history_anchor is None
+            ):
+                chat_history_anchor = self.tree.active_node_id
+
+            assistant_node_id = self._start_loom_assistant(
+                input,
+                stateless=stateless,
+                raw=raw,
+                parent_node_id=parent_node_id,
+                sampling=sampling,
+                steering_obj=steering_obj,
+                use_thinking_req=use_thinking_req,
+            )
+
             if steering_cm is not None:
                 steering_cm.__enter__()
             input_ids, use_thinking, prompt_tokens = self._generation_preamble(

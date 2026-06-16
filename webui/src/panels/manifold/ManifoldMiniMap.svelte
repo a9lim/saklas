@@ -174,8 +174,8 @@
       />
     {/if}
 
-    <!-- Settled aggregate dot — bold, lands at the EV-weighted mean
-         coords once the final ``done`` aggregate arrives. -->
+    <!-- Settled aggregate dot — bold, lands at the coords from the final
+         ``done`` aggregate. -->
     {#if settledPx}
       <circle
         class="settled"

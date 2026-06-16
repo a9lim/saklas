@@ -22,9 +22,9 @@ Grammar::
 
 Examples::
 
-    agg:angry.calm > 0.4
-    any:hallucinating.grounded > 0.7, agg:honest > 0
-    last:refusal.compliant < 0
+    agg:confident.uncertain > 0.4
+    any:formal.casual > 0.7, agg:honest.deceptive > 0
+    last:refusing.compliant < 0
 
 Aggregate semantics:
 
@@ -158,8 +158,15 @@ _AGG_OPS: tuple[AggOp, ...] = ("agg", "any", "last")
 
 # Allow the same probe-name shape the steering grammar accepts: ASCII
 # identifier, optional dotted second pole, optional embedded ``_``/``-``
-# inside an identifier segment.  Multi-word probe names use ``_``.
-_PROBE_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*(?:\.[A-Za-z][A-Za-z0-9_-]*)?$")
+# inside an identifier segment.  Multi-word probe names use ``_``.  An
+# optional ``<ns>/`` prefix matches the qualified keys the fitted multi-node
+# defaults register under (``default/personas`` / ``default/emotions``), and
+# an optional ``[i]`` axis suffix matches a multi-axis probe's coordinate key
+# — both land verbatim in ``LoomNode.aggregate_readings``.
+_PROBE_NAME_RE = re.compile(
+    r"^(?:[A-Za-z][A-Za-z0-9_-]*/)?"
+    r"[A-Za-z][A-Za-z0-9_-]*(?:\.[A-Za-z][A-Za-z0-9_-]*)?(?:\[[0-9]+\])?$"
+)
 
 # Compare op precedence: try two-char before single-char.
 _COMPARE_OP_RE = re.compile(r"(>=|<=|>|<)")

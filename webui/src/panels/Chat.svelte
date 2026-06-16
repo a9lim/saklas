@@ -1088,7 +1088,7 @@
     class:shadow={isShadow}
   >
     <span class="role">
-      {roleDisplayLabel(turn.role, turn.roleLabel)}{#if isShadow} (unsteered){/if}
+      {roleDisplayLabel(turn.role, turn.roleLabel)}{#if isShadow && !pinnedActive} (unsteered){/if}
     </span>
 
     {#if turn.role === "assistant"}

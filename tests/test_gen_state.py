@@ -29,7 +29,7 @@ MODEL_ID = "google/gemma-3-4b-it"
 @pytest.fixture(scope="module")
 def session():
     from saklas.core.session import SaklasSession
-    s = SaklasSession.from_pretrained(MODEL_ID, device="auto", probes=["affect"])
+    s = SaklasSession.from_pretrained(MODEL_ID, device="auto", probes=["register"])
     yield s
     s.close()
 

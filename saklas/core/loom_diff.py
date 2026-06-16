@@ -68,9 +68,9 @@ def text_diff(a: str, b: str) -> list[DiffSpan]:
 
     Uses :class:`difflib.SequenceMatcher` on whitespace-split tokens.
     Returns a flat list of :class:`DiffSpan` in order, suitable for
-    rendering unified-diff style or side-by-side.  Empty inputs produce
-    a single-span result (``equal`` for both empty, otherwise the
-    appropriate ``insert`` / ``delete`` of the non-empty side).
+    rendering unified-diff style or side-by-side.  Both-empty inputs
+    produce an empty list; an empty-vs-non-empty input produces a single
+    ``insert`` / ``delete`` span of the non-empty side.
     """
     a_toks = _tokenize_for_diff(a)
     b_toks = _tokenize_for_diff(b)
@@ -333,8 +333,7 @@ def _format_term(name: str, alpha: float, *, sign_prefix: bool = True) -> str:
     """
     if sign_prefix and alpha >= 0:
         return f"+{alpha:g} {name}"
-    if alpha < 0:
-        return f"{alpha:g} {name}"
+    # A negative alpha already carries its ``-`` via ``%g``.
     return f"{alpha:g} {name}"
 
 
@@ -349,12 +348,13 @@ def steering_delta(parent_expr: str | None, child_expr: str | None) -> str:
     edge cases where one side fails to parse — UIs render whichever
     sentinel they receive.
 
-    Output format examples::
+    Output format examples (``X``/``Y`` stand for the canonical
+    ``Steering.alphas`` keys the grammar produces; the leading term carries
+    no sign prefix, later terms get ``+`` / ``-``)::
 
-        steering_delta(None, "0.3 calm")            == "+0.3 calm"
-        steering_delta("0.3 calm", "0.5 calm")      == "+0.2 calm"
-        steering_delta("0.3 calm", "")              == "-0.3 calm"
-        steering_delta("0.3 calm", "0.3 calm + 0.2 warm") == "+0.2 warm"
+        steering_delta(None, "0.3 X")              == "0.3 X"
+        steering_delta("0.3 X", "")                == "-0.3 X"
+        steering_delta("0.3 X", "0.5 X + 0.2 Y")   == "0.2 X +0.2 Y"
     """
     p = _parse_or_empty(parent_expr)
     c = _parse_or_empty(child_expr)

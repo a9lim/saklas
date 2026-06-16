@@ -173,12 +173,12 @@ class ProjectedTerm:
 class AblationTerm:
     """Mean-replacement ablation entry in ``Steering.alphas``.
 
-    The session resolves ``target`` through the auto-load fast path at
-    ``_SteeringContext`` entry, then hands ``(target_profile, coeff,
-    trigger, layer_means)`` to ``SteeringManager.add_ablation``.  Stored
-    as a value inside ``Steering.alphas``; the key is ``"!<target>"`` so
-    ablation entries never collide with plain-term entries on the same
-    concept.
+    The session lowers an ``AblationTerm`` to an ablate fragment in
+    ``_compose_steering_entries``, which ``synthesize_subspace`` folds into
+    the merged affine subspace (per-axis ``κ = 1`` on the ablation axes),
+    attached via ``SteeringManager.add_subspace``.  Stored as a value inside
+    ``Steering.alphas``; the key is ``"!<target>"`` so ablation entries never
+    collide with plain-term entries on the same concept.
     """
     coeff: float
     trigger: Trigger
@@ -971,15 +971,18 @@ def _fold(terms: list[_Term], *, namespace: Optional[str]) -> "Steering":
                 sel.manifold_position, mfld_trig,
             )
             continue
-        # Bare-name manifold-label fallback (Phase C.2): a plain term
-        # whose base is a bare slug (no namespace, no variant suffix,
-        # no bipolar ``.``, no projection / ablation) is a candidate
-        # for the unified bare-name resolver.  If the slug isn't an
-        # installed bipolar pole *and* matches a manifold's node
-        # label, synthesize a label-form ManifoldTerm at that node
-        # instead of treating the slug as a fresh concept.  Cross-tier
-        # collisions (slug matches both a pole and a manifold node)
-        # raise ``AmbiguousSelectorError`` inside ``resolve_bare_name``.
+        # Bare-name manifold-label tier (Phase C.2), tried FIRST for a
+        # plain term whose base is a bare slug (no namespace, no variant
+        # suffix, no bipolar ``.``, no projection / ablation): if the slug
+        # matches a manifold's node label, synthesize a label-form
+        # ManifoldTerm at that node instead of treating the slug as a fresh
+        # vector concept.  ``resolve_bare_name`` arbitrates only cross-
+        # *manifold* label collisions (raising ``AmbiguousSelectorError``);
+        # it knows nothing of poles.  A miss falls through to the
+        # composite-name tier (``resolve_manifold_name``) and then the
+        # ``resolve_pole`` canonicalization below — every bipolar pole is
+        # itself a node label, so a bare pole resolves here as an affine
+        # ``%`` push.
         if (
             sel.operator is None
             and not term.ablation

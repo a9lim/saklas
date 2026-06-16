@@ -7,13 +7,10 @@ is single-session.  The one session has id ``"default"``; both that
 literal and the loaded model id resolve to it, everything else 404s.
 
 Killer feature: ``WS /saklas/v1/sessions/{id}/stream`` bidirectional
-token + probe co-stream.  Per-token probe readings can't currently be
-pushed inline from the session hot path (they're computed once the run
-finalizes, via ``score_captured``).  So the WS protocol ships plain
-token events during the run and a single ``per_token_probes`` array in
-the ``done`` event, assembled from ``session._last_per_token_scores``.
-Future clusters can upgrade to inline streaming without changing the
-wire format meaningfully.
+token + probe co-stream.  Per-token probe readings are pushed inline on
+each token event (``ws_events.build_token_event``); the ``done`` event
+also carries the full ``per_token_probes`` array, assembled from
+``session.last_per_token_scores``.
 
 Old ``/v1/saklas/*`` routes were removed in the same commit that
 introduced this file — no aliases.

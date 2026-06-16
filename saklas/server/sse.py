@@ -25,7 +25,14 @@ def progress_sse_response(
     error_formatter: ErrorFormatter | None = None,
     logger: logging.Logger | None = None,
 ) -> StreamingResponse:
-    """Run a progress-reporting async job and stream progress/done/error frames."""
+    """Run a progress-reporting async job and stream progress/done/error frames.
+
+    Acquires ``lock`` *without* a timeout — unlike the bounded
+    ``acquire_session_lock`` used by request handlers — because the jobs this
+    drives (manifold ``fit`` / ``generate``, ``extract``) are inherently
+    unbounded.  Use it only for those long-running operations; a bounded
+    variant would need a timeout parameter.
+    """
     log = logger or logging.getLogger("saklas.api")
 
     async def _sse():

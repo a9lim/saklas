@@ -1,11 +1,12 @@
-"""The six-verb root CLI.
+"""The seven-verb root CLI.
 
 ``manifold`` is the steering-vector / manifold *compute* surface
-(extract/generate/fit/bake/merge/transfer/compare/why); ``pack`` is the
-manifold *lifecycle* surface (ls/show/install/search/push/rm/clear/refresh/
-export).  The former ``subspace`` verb and the deprecated ``vector`` alias are
-gone — the flat-artifact verbs folded into ``manifold``.  These tests exercise
-the parser shape + dispatch wiring, not the backends.
+(extract/generate/from-template/fit/bake/merge/transfer/compare/why); ``pack`` is
+the manifold *lifecycle* surface (ls/show/install/search/push/rm/clear/refresh/
+export); ``template`` owns the standalone templated-completion artifact.  The
+former ``subspace`` verb and the deprecated ``vector`` alias are gone — the
+flat-artifact verbs folded into ``manifold``.  These tests exercise the parser
+shape + dispatch wiring, not the backends.
 """
 from __future__ import annotations
 

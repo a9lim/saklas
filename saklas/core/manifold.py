@@ -934,7 +934,8 @@ def rbf_cardinal_weights(
     compose, off the hot path).  Unit-box-normalized for kernel conditioning,
     matching :func:`fit_layer_subspace`.  Propagates the ``ValueError`` from
     :func:`fit_rbf_interpolant` when the layout is not affinely poised (no
-    interpolant exists — the caller falls back to label-form guidance).
+    interpolant exists — the caller re-raises it as ``SteeringExprError``
+    advising the user to steer by node label instead).
     """
     node_coords = node_coords.detach().to(device="cpu", dtype=torch.float32)
     query = query.detach().to(device="cpu", dtype=torch.float32).reshape(-1)
@@ -3003,6 +3004,12 @@ class TopologyChoice:
     coords: torch.Tensor           # (K, n) winner intrinsic coords
     domain: ManifoldDomain         # CustomDomain | BoxDomain (periodic)
     candidates: tuple[TopologyCandidate, ...]   # ranked best-first
+    # The winner's coordinate diagnostics — ``PcaDiagnostics`` for a flat
+    # winner, ``SpectralDiagnostics`` for a curved / periodic one (the
+    # Laplacian eigenpairs the spectral/periodic embedding rode), or ``None``
+    # when unavailable.  Lets an ``auto`` fit emit a diagnostics block so the
+    # inspector renders the same bars a pinned ``pca``/``spectral`` fit does.
+    diagnostics: "object | None" = None
 
 
 def _gcv_value(rss: float, edf: float, K: int) -> float:
@@ -3556,7 +3563,7 @@ def select_topology(
     candidates: list[TopologyCandidate] = []
 
     # (a) Flat (pca) — always viable for K >= 2.
-    coords_flat, _pca_diag = derive_pca_coords(consensus_gram, max_dim=max_dim)
+    coords_flat, pca_diag = derive_pca_coords(consensus_gram, max_dim=max_dim)
     k_flat = int(coords_flat.shape[1])
     gcv_flat = _ols_gcv_score(coords_flat, targets)
     candidates.append(TopologyCandidate("flat-pca", "pca", k_flat, gcv_flat, True))
@@ -3564,8 +3571,9 @@ def select_topology(
     # (a) Curved Euclidean (spectral) — may fail on a tiny / disconnected heap.
     gcv_curved = math.inf
     curved: tuple[torch.Tensor, ManifoldDomain] | None = None
+    spec_diag: object | None = None
     try:
-        coords_spec, _spec_diag = derive_spectral_coords(
+        coords_spec, spec_diag = derive_spectral_coords(
             consensus_gram, max_dim=max_dim, k_nn=k_nn, bandwidth=bandwidth,
         )
         k_spec = int(coords_spec.shape[1])
@@ -3632,12 +3640,15 @@ def select_topology(
         p_coords, p_domain, _gcv_p = periodic
         win_name = f"torus-T{int(p_coords.shape[1])}"
         win_mode, win_coords, win_domain = "spectral", p_coords, p_domain
+        win_diag = spec_diag  # periodic rides the spectral eigenpairs
     elif curved is not None and gcv_curved < gcv_flat:
         win_name = "spectral"
         win_mode, win_coords, win_domain = "spectral", curved[0], curved[1]
+        win_diag = spec_diag
     else:
         win_name = "flat-pca"
         win_mode, win_coords, win_domain = "pca", coords_flat, CustomDomain(k_flat)
+        win_diag = pca_diag
 
     candidates.sort(key=lambda c: (not c.viable, c.score))
     return TopologyChoice(
@@ -3646,6 +3657,7 @@ def select_topology(
         coords=win_coords,
         domain=win_domain,
         candidates=tuple(candidates),
+        diagnostics=win_diag,
     )
 
 
@@ -3674,7 +3686,7 @@ def compute_node_centroid(
     matching the framing the corpus was generated under so it isn't
     out-of-distribution and cancels as common-mode against the neutral baseline.
     Same last-content-token, fp32 pooling discipline that backs
-    :func:`saklas.core.vectors.compute_layer_means`, with the same MPS
+    :func:`saklas.core.vectors.compute_neutral_activations`, with the same MPS
     ``empty_cache`` discipline between forward passes.
 
     ``role`` (optional): substitute a custom assistant-role label into the

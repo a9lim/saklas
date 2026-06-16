@@ -766,10 +766,11 @@ def save_profile(
     """Save a baked vector profile as .safetensors with a slim .json sidecar.
 
     ``metadata`` must contain at minimum:
-        method            - str, e.g. "difference_of_means" / "merge" / "layer_means"
+        method            - str, e.g. "merge" / "procrustes_transfer" /
+                            "neutral_activations" / "gguf_import"
 
     Optional keys honored:
-        statements_sha256 - str, hash of source statements at extraction time
+        statements_sha256 - str, hash of the source neutral corpus at write time
         components        - dict, merge provenance (method="merge" only)
         diagnostics       - dict[int, dict[str, float]], per-layer probe-quality
                             metrics (see ``_compute_layer_diagnostics``).
@@ -796,7 +797,7 @@ def save_profile(
     from saklas.io.packs import PACK_FORMAT_VERSION
     sidecar: dict[str, Any] = {
         "format_version": PACK_FORMAT_VERSION,
-        "method": metadata.get("method", "difference_of_means"),
+        "method": metadata.get("method", "unknown"),
         "saklas_version": _saklas_version,
     }
     if "statements_sha256" in metadata:

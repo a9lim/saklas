@@ -804,9 +804,11 @@ def load_model(
     # Hooks added later via ``register_forward_hook`` on layer modules
     # (which live under ``model._orig_mod``) compose cleanly: compile
     # treats hooks as external state and recompiles only when the
-    # hook's *Python-scalar* inputs change.  Pinning the angle scalars
-    # to 0-dim tensors in :class:`SteeringHook._refresh_angular_cache`
-    # keeps a single compiled artifact across α changes between
+    # hook's *Python-scalar* inputs change.  The unified steering hook
+    # reads its per-gen coefficients from pre-traced per-layer ``(D,)``
+    # offset buffers updated in place (:meth:`SteeringManager.write_compiled_offsets`,
+    # installed by :func:`install_persistent_offset_hooks`), so compile sees
+    # no structural change and never retraces across α changes between
     # generations.
     if compile and device == "cuda":
         model = _compile_with_probe(model, tokenizer, device, mode=compile_mode)

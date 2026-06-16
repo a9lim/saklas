@@ -38,7 +38,7 @@ when you work in that directory. Consult them only when editing that layer.
   monitor, session, generation loop, loom tree
 - `saklas/io/AGENTS.md` — manifold format, HF distribution, GGUF, merge,
   alignment, paths/selectors
-- `saklas/cli/AGENTS.md` — six-verb dispatch, config loading, flags
+- `saklas/cli/AGENTS.md` — seven-verb dispatch, config loading, flags
 - `saklas/server/AGENTS.md` — OpenAI / Ollama / native routes
 - `saklas/tui/AGENTS.md` — slash commands, panels, loom screen
 - `saklas/web/AGENTS.md` — dashboard mount, wire protocol, Svelte source layout
@@ -836,6 +836,6 @@ owns the throughput regression.
 
 **CPU-only**: the bulk of the suite — core dataclasses, steering-context
 semantics, manifold format integrity + staleness, selector grammar, mocked HF
-wrappers, GGUF round-trip, config loading, monitor scoring, six-verb CLI dispatch,
+wrappers, GGUF round-trip, config loading, monitor scoring, seven-verb CLI dispatch,
 OpenAI/Ollama/native servers, TUI slash-command dispatch, loom tree/diff/filter/
 transcript.

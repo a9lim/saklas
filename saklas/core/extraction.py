@@ -124,12 +124,12 @@ def _diagnostics_to_dict(diag: Any) -> dict[str, Any]:
 class ManifoldExtractionPipeline:
     """Fit an RBF-based steering manifold from an authored corpus.
 
-    Distinct from :class:`ExtractionPipeline` — manifold extraction has a
-    fundamentally different input (N labeled node groups, no contrastive
-    pairs, no scenario generation), so it is its own pipeline rather than
-    a method on the concept extractor.  It reuses the :class:`ModelHandle`
-    protocol (it needs ``model`` / ``tokenizer`` / ``layers`` / ``device``
-    / ``model_id``) and emits :class:`ManifoldExtracted`.
+    THE 4.0 extraction pipeline: concept extraction and manifold fitting are
+    the same operation — a steering vector is just the 2-node ``pca`` case (N
+    labeled node groups, no contrastive pairs, no scenario generation).  It
+    reuses the :class:`ModelHandle` protocol (it needs ``model`` /
+    ``tokenizer`` / ``layers`` / ``device`` / ``model_id``) and emits
+    :class:`ManifoldExtracted`.
 
     Feature space: ``sae=None`` fits per-layer PCA + RBF directly on
     residual-stream centroids.  ``sae="<release>"`` reconstructs each
@@ -275,12 +275,10 @@ class ManifoldExtractionPipeline:
                 f"registry entry"
             )
 
-        # SAE coverage — fail-fast (mirrors the vector path in
-        # ``vectors._capture_diffs_for_pairs``, which raises
-        # ``SaeCoverageError`` *before* its forward loop).  Validate the
-        # fit-layer set here, before the expensive per-node centroid
-        # pooling, so an SAE release that covers none of the model's
-        # layers errors immediately instead of after K node passes.
+        # SAE coverage — fail-fast.  Validate the fit-layer set here, before
+        # the expensive per-node centroid pooling, so an SAE release that
+        # covers none of the model's layers errors immediately instead of
+        # after K node passes.
         if sae_backend is not None:
             fit_layers = sorted(
                 set(sae_backend.layers) & set(range(n_layers))
@@ -576,6 +574,14 @@ class ManifoldExtractionPipeline:
                     for c in choice.candidates
                 ],
             }
+            # Emit the winner's coordinate diagnostics (pca per-component
+            # variance / spectral eigenvalues) so the inspector renders the
+            # same bars a pinned pca/spectral fit does — the auto resolution
+            # otherwise leaves the panel blank.
+            if choice.diagnostics is not None:
+                discover_metadata["diagnostics"] = _diagnostics_to_dict(
+                    choice.diagnostics
+                )
         else:
             # Discover: derive coords from the per-node centroids, layer-
             # agnostically — there is no reference layer.  The same coords feed

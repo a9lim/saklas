@@ -83,7 +83,6 @@
   class="edge"
   class:active
   class:dead
-  class:weighted={intensity !== null}
   aria-hidden="true"
 >
   <span class="line" style={lineStyle}></span>

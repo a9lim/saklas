@@ -50,7 +50,7 @@ onto the profile-cache sidecars `vectors.save_profile` writes.
 
 The on-disk format for every concept + steering manifold —
 `~/.saklas/manifolds/<ns>/<name>/`. `MANIFOLD_FORMAT_VERSION = 5` (decoupled from
-`PACK_FORMAT_VERSION`); rejects pre-v3 and newer-than-local. `min_nodes(n) = 2n+1`
+`PACK_FORMAT_VERSION`); rejects any `format_version` below 5. `min_nodes(n) = 2n+1`
 (the curved-fit poisedness floor). Five `fit_mode`s share the class, discriminated
 by `manifold.json::fit_mode`:
 
@@ -202,9 +202,12 @@ installed manifolds; `resolve_manifold_name(name, *, namespace=)` resolves a 2-n
 `pca` manifold's *name* (e.g. `formal.casual`) to node 0 (the `orient_to=0` + pole) —
 the vector-composite read path. `resolve_bare_name(raw, *, namespace=) →
 ResolvedManifoldLabel | None` is *just* the manifold-label tier (it delegates to
-`resolve_manifold_label`, raising on cross-manifold collision); the pole/name-first,
-label-second ordering lives in the caller (`core/steering_expr`, which tries
-`resolve_pole`/`resolve_manifold_name` before `resolve_bare_name`). Three memoized walks
+`resolve_manifold_label`, raising on cross-manifold collision); it knows nothing of
+poles. The tier ordering lives in the caller (`core/steering_expr`): a bare dot-free
+slug hits `resolve_bare_name` (the label tier) first, then the composite-name tier
+(`resolve_manifold_name`, for a dotted `formal.casual`), then `resolve_pole`
+canonicalization — every bipolar pole is itself a node label, so a bare pole
+resolves through the label tier as an affine `%` push. Three memoized walks
 (`_concepts_cache`/`_manifold_labels_cache`/`_manifold_names_cache`) keyed on
 `manifolds_dir()`; `invalidate()` clears all three — mutating code must call it.
 `parse_args(tokens)` splits a token list into one concept selector + one optional

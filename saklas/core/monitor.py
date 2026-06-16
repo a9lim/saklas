@@ -359,7 +359,7 @@ class Monitor:
         Kc = K + (1 if inject_neutral else 0)   # candidate count incl. neutral
         n_dim = manifold.domain.intrinsic_dim
         dist_acc_t: torch.Tensor | None = None
-        # Per-layer terms + running EV-weighted means are accumulated as
+        # Per-layer terms + running share-weighted means are accumulated as
         # on-device tensors and pulled to the host in a *single* transfer per
         # probe at the end.  The earlier code called ``float(... .item())`` /
         # ``.tolist()`` per layer, which on MPS is one command-buffer stall per
@@ -1356,7 +1356,7 @@ class Monitor:
             trace_coords.append(coords_all)
             trace_layers.append(layer_idx)
 
-        # --- device finalize (EV-normalize + one bounded global topk) ---
+        # --- device finalize (share-normalize + one bounded global topk) ---
         wtsum_safe = wtsum.clamp(min=_FRACTION_EPSILON)
         frac_final = frac_acc / wtsum_safe
         coords_final = coords_acc / wtsum_safe.repeat_interleave(
@@ -1682,9 +1682,10 @@ class Monitor:
     ) -> dict[str, list[float]]:
         """Axis-0 domain-coordinate stream per probe over ``n`` tokens.
 
-        Each token's full reading is computed (flat affine map + curved foot
-        solve alike) and its cross-layer axis-0 coordinate extracted, so
-        curved probes now carry a real per-token coord stream (not zeros).
+        Each token is scored ``coords_only`` (the flat affine map + curved foot
+        solve that axis 0 needs, skipping the big-K nearest norm, soft
+        assignment, and per-layer host reconstruction this stream discards), so
+        curved probes still carry a real per-token coord stream (not zeros).
         Row ``i`` reads ``captured[L][i]`` (guarded), so an EOS overshoot is
         ignored and a short capture leaves trailing zeros.
         """
@@ -1695,7 +1696,7 @@ class Monitor:
             tok = {L: h[i] for L, h in captured.items() if h.shape[0] > i}
             if not tok:
                 continue
-            for name, reading in self._score_full(tok).items():
+            for name, reading in self._score_full(tok, coords_only=True).items():
                 per_token[name][i] = reading.coords[0] if reading.coords else 0.0
         return per_token
 
@@ -2502,7 +2503,7 @@ def _attach_manifold_probe(
     )
     # Robust per-probe ``@label`` distance scale: the median of the *node*
     # bandwidths (``bw`` is candidate-order nodes-then-neutral; the node entries
-    # are each node's nearest-neighbor whitened spacing, EV-weighted across
+    # are each node's nearest-neighbor whitened spacing, share-weighted across
     # layers).  Median, not per-candidate, so one crowded pair can't make a label
     # weirdly ungateable; a single scalar, so it rescales the reported distance
     # without reordering ``nearest``.  K=1 / no bandwidth ⇒ 1.0 (raw distance).
@@ -2519,7 +2520,7 @@ def _attach_manifold_probe(
 def _compute_assign_bandwidth(
     probe: "AttachedManifoldProbe", embedded: torch.Tensor,
 ) -> "tuple[torch.Tensor | None, torch.Tensor | None]":
-    """Per-candidate ``(τ, −R·log(τ))`` ``(Kc,)`` each, EV-weighted.
+    """Per-candidate ``(τ, −R·log(τ))`` ``(Kc,)`` each, share-weighted.
 
     ``τ`` is the soft-assignment bandwidth in the **whitened** metric the
     nearest-node distances use, candidate order = nodes then the neutral anchor

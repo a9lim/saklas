@@ -1284,7 +1284,19 @@ def generate_steered(
                             logits.float(), dim=-1,
                         )[0, token_id].item())
                     if logprobs > 0:
-                        tlv, tpos = cand_logp.topk(min(logprobs, cand_logp.numel()))
+                        # Only surface in-support alternatives.  Sub-top-p tail
+                        # entries were zeroed in ``cand_probs`` and clamped to
+                        # ``log(tiny)`` in ``cand_logp``; without this mask a
+                        # request for more alts than the nucleus holds pads the
+                        # list with tokens the sampler had zero probability of
+                        # drawing (reported at ~-87 nats).  Mask them to -inf,
+                        # take the top-k, then drop any -inf the topk had to
+                        # pad with — so a peaked step returns fewer than
+                        # ``logprobs`` alts rather than out-of-support ones.
+                        masked = cand_logp.masked_fill(cand_probs <= 0, float("-inf"))
+                        tlv, tpos = masked.topk(min(logprobs, cand_logp.numel()))
+                        keep = torch.isfinite(tlv)
+                        tlv, tpos = tlv[keep], tpos[keep]
                         tli = cand_ids.index_select(0, tpos)
                         top_alts = [
                             TokenAlt(id=int(i), text=_decode_alt(int(i)), logprob=float(v))

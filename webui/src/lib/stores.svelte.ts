@@ -1278,6 +1278,16 @@ function applyTreeDelta(ev: {
   if (ev.active_node_id !== undefined && ev.active_node_id !== null) {
     loomTree.active_node_id = ev.active_node_id;
   }
+  // A ``reset`` is the only mutation that drops the root: its ``removed`` list
+  // now includes the old root and ``added`` carries a fresh parentless one.
+  // ``applyTreeDelta`` never otherwise touches ``root_id``, so re-seed it here
+  // when the old root is gone — else the sidebar (which walks from ``root_id``)
+  // points at a deleted node and renders empty after a cross-client reset.
+  if (loomTree.root_id !== null && !loomTree.nodes.has(loomTree.root_id)) {
+    const newRoot = (ev.added ?? []).find((n) => n.parent_id == null)
+      ?? [...loomTree.nodes.values()].find((n) => n.parent_id == null);
+    if (newRoot) loomTree.root_id = newRoot.id;
+  }
   loomTree.rev = ev.rev;
   // Phase 5: applied_steering strings can shift after edit/regen, so
   // bust the edge-label cache wholesale on any mutation.  Cheap — the
@@ -2438,6 +2448,12 @@ export async function sendGenerate(
         apply: item.apply,
         awaitsGen: item.awaitsGen,
         rebuild: item.rebuild,
+        // A send lands an assistant turn, so the post-drain active node is an
+        // assistant.  Forward the factory's value (mirrors sendPrefill /
+        // sendCommit); omitting it left the queued send as ``undefined``, so
+        // ``predictedQueueEndOnUserNode`` skipped it and the input mode
+        // mispredicted while a gen was in flight.
+        endsOnUserNode: item.endsOnUserNode,
       },
       { replaceSlot: replaceSlot ?? null },
     );

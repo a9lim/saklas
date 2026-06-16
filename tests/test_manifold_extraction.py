@@ -326,8 +326,8 @@ def test_fit_sae_no_coverage_raises_before_pooling(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """An SAE covering none of the model's layers raises ``SaeCoverageError``
-    *before* the per-node centroid pooling loop — fail-fast parity with the
-    vector path (``vectors._capture_diffs_for_pairs``)."""
+    *before* the per-node centroid pooling loop — fail-fast on the
+    ``ManifoldExtractionPipeline`` ordering contract."""
     from saklas.core.errors import SaeCoverageError
 
     folder = _author_manifold(tmp_path)

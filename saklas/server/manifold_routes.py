@@ -787,7 +787,16 @@ def register_manifold_routes(app: FastAPI) -> None:
 
             def _format_error(e: Exception) -> dict[str, Any] | None:
                 if isinstance(e, HTTPException):
-                    return {"message": e.detail, "code": "HTTPException"}
+                    # The generate job only raises HTTPException to wrap a
+                    # ManifoldFormatError, whose detail embeds the on-disk
+                    # manifold path.  Log the detail server-side and surface a
+                    # path-free frame (SSE info-disclosure discipline — see
+                    # server/AGENTS.md).
+                    log.warning("manifold generate: format error: %s", e.detail)
+                    return {
+                        "message": "manifold has an unsupported on-disk format",
+                        "code": "ManifoldFormatError",
+                    }
                 if isinstance(e, ValueError):
                     return {"message": str(e), "code": "ValueError"}
                 return None

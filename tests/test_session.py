@@ -45,7 +45,7 @@ def session(tmp_path_factory: pytest.TempPathFactory):
     os.environ["SAKLAS_HOME"] = str(home)
     # device="auto" picks cuda > mps > cpu; skipif above guarantees a GPU.
     try:
-        s = SaklasSession.from_pretrained(MODEL_ID, device="auto", probes=["affect"])
+        s = SaklasSession.from_pretrained(MODEL_ID, device="auto", probes=["register"])
         yield s
         s.close()
     finally:

@@ -127,10 +127,11 @@ def load_or_compute_neutral_activations(
                         "Cached neutral activations for %s are non-finite "
                         "(legacy fp16 overflow); recomputing as fp32.", model_id,
                     )
-            log.info(
-                "Neutral activations stale (neutral_statements changed); recomputing for %s",
-                model_id,
-            )
+            else:
+                log.info(
+                    "Neutral activations stale (neutral_statements changed); recomputing for %s",
+                    model_id,
+                )
         except Exception as e:
             log.warning("Corrupt neutral activations cache for %s, recomputing: %s", model_id, e)
 

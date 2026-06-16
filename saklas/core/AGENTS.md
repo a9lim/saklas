@@ -275,9 +275,10 @@ point projection.
 basis[,node_params,rbf_weights,poly_coeffs,coord_offset,coord_scale]}` + shared
 `node_coords` + optional `origin`) + sidecar (`mahalanobis_share_per_layer`,
 `origin_per_layer`, `share_metric`, `subspace_metric` — no
-`explained_variance_per_layer`, no `lever_per_layer`). `transfer_manifold` re-bakes share in
-target space (no lever). Discover: `derive_pca_coords` (cumulative-variance
-prefix) / `derive_spectral_coords` (Laplacian eigenmaps, eigenvalue-ratio cliff)
+`explained_variance_per_layer`, no `lever_per_layer`). (Cross-model
+`transfer_manifold` lives in `io/manifolds.py`.) Discover: `derive_pca_coords`
+(cumulative-variance prefix) / `derive_spectral_coords` (Laplacian eigenmaps,
+eigenvalue-ratio cliff)
 / `discover_coords` dispatcher, with `PcaDiagnostics`/`SpectralDiagnostics`;
 `_laplacian_eigen` is the shared graph→Laplacian→eigh core.
 
@@ -531,8 +532,11 @@ scalar key from whichever monitor supplied it.
 
 ## cuda_graphs.py
 
-CUDA-graphs / `StaticCache`. Eligible only for **unsteered** generation (any
-steering hook forces the slow path). `is_cuda_graphs_supported(model, device)`
+CUDA-graphs / `StaticCache`. Eligible for **unsteered** generation
+(`all_fast_path`) **and** for the static single-affine steered case
+(`static_steerable` — a `Trigger.BOTH` affine slide, no ctx/foot/gate);
+curved / gated / phased / ablation steering forces the eager DynamicCache
+path. `is_cuda_graphs_supported(model, device)`
 probes viability + caches keyed by underlying module id / device / dtype;
 `make_static_cache` sizes to `prompt_len + max_new_tokens + offset`; `warn_once`
 logs the fallback reason.

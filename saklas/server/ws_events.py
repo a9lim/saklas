@@ -63,28 +63,17 @@ def build_token_event(
             if per_layer_blob:
                 event["per_layer_scores"] = per_layer_blob
 
-    # Additive rich channel: the full per-probe vector coordinate reading
-    # (coords + fraction + nearest) for the latest token, lifted from the
-    # session's per-token probe payload.  New key — the old webui ignores it,
-    # while a coordinate-aware native client can read coords without the
-    # ``scores`` axis-0 shape changing.
+    # Rich channel: the full per-probe reading (coords + fraction + nearest)
+    # for the latest token.  ``readings`` and ``probe_readings`` in the payload
+    # are the *same* unified per-probe dict — the 4.0 monitor reads every probe
+    # shape (flat + curved) into one ``agg`` — so prefer whichever the token tap
+    # populated; if neither is present (probes attached but the tap didn't
+    # score), fall back to scoring the latest captured hidden states directly.
     with suppress(Exception):
         payload = getattr(session, "_last_token_probe_payload", None)
-        vector_readings = (
-            payload.get("readings") if isinstance(payload, dict) else None
-        )
-        if vector_readings:
-            event["probe_readings"] = {
-                name: r.to_dict() for name, r in vector_readings.items()
-            }
-
-    with suppress(Exception):
-        payload = getattr(session, "_last_token_probe_payload", None)
-        readings = (
-            payload.get("probe_readings")
-            if isinstance(payload, dict)
-            else None
-        )
+        readings = None
+        if isinstance(payload, dict):
+            readings = payload.get("readings") or payload.get("probe_readings")
         if readings is None:
             mf_monitor = getattr(session, "_monitor", None)
             capture = getattr(session, "_capture", None)

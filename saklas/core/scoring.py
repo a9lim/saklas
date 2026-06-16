@@ -193,8 +193,25 @@ def score_choices(
             del out, logits, norm
 
     mean_lps = [sl / nt if nt else sl for sl, nt in zip(sum_lps, n_toks)]
-    prob_sum = torch.softmax(torch.tensor(sum_lps), dim=0).tolist()
-    prob_mean = torch.softmax(torch.tensor(mean_lps), dim=0).tolist()
+    # Degenerate candidates (no distinct completion token — an empty-string
+    # choice, or one fully absorbed by the prefix) carry ``sum_logprob`` 0.0,
+    # which is the *largest* value in the restricted-choice softmax (every real
+    # candidate's joint logprob is strictly negative) and would wrongly dominate
+    # it.  Exclude them: -inf in the softmax input gives them ~0 probability,
+    # with an all-degenerate guard (softmax over all -inf is NaN).
+    degenerate = [nt == 0 for nt in n_toks]
+
+    def _restricted_softmax(values: list[float]) -> list[float]:
+        masked = [
+            float("-inf") if deg else v
+            for v, deg in zip(values, degenerate)
+        ]
+        if all(m == float("-inf") for m in masked):
+            return [0.0] * len(masked)
+        return [float(p) for p in torch.softmax(torch.tensor(masked), dim=0).tolist()]
+
+    prob_sum = _restricted_softmax(sum_lps)
+    prob_mean = _restricted_softmax(mean_lps)
 
     scored = tuple(
         ChoiceScore(

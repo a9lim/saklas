@@ -1,10 +1,9 @@
 <script lang="ts">
-  // A single-node chip in the loom sidebar.  Phase 3 scope: role glyph,
-  // first ~40 chars of text, active-path bolded, dead branches dimmed.
-  // Phase-5 additions (steering-delta edge labels, probe-aggregate ring
-  // decoration, star/note glyphs, pin affordances) live behind props /
-  // slots that aren't wired yet — but the hooks are here so the sidebar
-  // doesn't need a structural rewrite when phase 5 lands.
+  // A single-node chip in the loom sidebar.  Role glyph, first ~40 chars of
+  // text, active-path bolded, dead branches dimmed, plus steering-delta edge
+  // labels, probe-aggregate ring decoration, star/note glyphs, and pin
+  // affordances — the sidebar feeds all of these live (LoomSidebar's
+  // ringFor / weightBadgeFor / steerLabelFor).
 
   import type { LoomNodeJSON } from "../../lib/types";
   import { roleGlyphLetter } from "../../lib/stores.svelte";
@@ -23,7 +22,7 @@
     onclick?: (ev: MouseEvent) => void;
     /** Right-click handler — open the context menu. */
     oncontextmenu?: (ev: MouseEvent) => void;
-    /** Optional probe ring fill in [-1, 1] (phase 5; null for now). */
+    /** Optional probe ring fill in [-1, 1] (null when no probe aggregate). */
     ring?: number | null;
     /** Logit-pass: per-turn ``mean_logprob`` to render as a numeric
      *  badge.  Null (capture wasn't live) suppresses the badge. */
@@ -62,9 +61,8 @@
     return t.length > PREVIEW_CHARS ? t.slice(0, PREVIEW_CHARS) + "…" : t;
   });
 
-  // Phase-5 hook: ring color stub.  Caller passes ``ring`` in [-1,1] —
-  // negative red, positive green.  Until phase 5 the prop is null and
-  // nothing renders.
+  // Ring color: caller passes ``ring`` in [-1,1] — negative red, positive
+  // green; null when there's no probe aggregate to show.
   const ringColor = $derived(
     ring === null ? null : ring >= 0 ? "var(--accent-green)" : "var(--accent-red)",
   );

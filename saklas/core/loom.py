@@ -1085,7 +1085,12 @@ class LoomTree:
         """Drop the entire tree.  Refused under in-flight generation."""
         with self._lock:
             self._conflict_check(self.root_id, "reset")
-            removed = tuple(nid for nid in self.nodes if nid != self.root_id)
+            # Every current id is removed — including the *old* root, which the
+            # fresh ``_ulid()`` root below replaces.  Reporting the old root in
+            # ``removed`` keeps the delta self-consistent for id-tracking
+            # surfaces (the WS dashboard's ``applyTreeDelta``), which otherwise
+            # retain a stale orphan root.
+            removed = tuple(self.nodes)
             # Wipe everything; rebuild a fresh root.
             self.nodes.clear()
             self.children_of.clear()

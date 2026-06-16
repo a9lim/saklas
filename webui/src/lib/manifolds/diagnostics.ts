@@ -109,15 +109,21 @@ export function diagnosticsSummary(diag: DiscoverDiagnostics): string {
 /** Pick the fitted-record entry for the loaded session's model.  In
  *  practice the server's ``_manifold_json`` reports at most one
  *  per-model tensor stem at a time; this helper just picks the first
- *  whose ``fit_mode`` is one of the discover modes.  Returns ``null``
- *  when no fitted record is in discover mode (authored fits, or no
- *  fits at all). */
+ *  whose ``fit_mode`` is one of the discover modes.  ``auto`` folders
+ *  store ``fit_mode === "auto"`` in the sidecar (the resolved geometry
+ *  rides ``resolved_fit_mode``) and now carry a real diagnostics block
+ *  for the winning mode, so they qualify too — without this the headline
+ *  ``personas`` / ``emotions`` manifolds render no diagnostics.  Returns
+ *  ``null`` when no fitted record is in discover mode (authored fits, or
+ *  no fits at all). */
 export function pickDiscoverFit(
   fitted: ManifoldFitInfo[] | undefined,
 ): ManifoldFitInfo | null {
   if (!fitted) return null;
   for (const f of fitted) {
-    if (f.fit_mode === "pca" || f.fit_mode === "spectral") return f;
+    if (f.fit_mode === "pca" || f.fit_mode === "spectral" || f.fit_mode === "auto") {
+      return f;
+    }
   }
   return null;
 }

@@ -1,5 +1,13 @@
 # Audit follow-ups
 
+> **SUPERSEDED (pre-4.0).** This plan was written against the v1.5.0
+> pack/concept/`statements.json`/`vectors/` architecture, which the 4.0
+> manifold unification replaced wholesale. Its phases either shipped (version
+> single-sourcing, `selectors` moved to `io/`, the `GenState` enum, the
+> `ExtractionPipeline` extraction, the TUI command registry, atomic IO) or no
+> longer apply (every concrete file/line reference predates the collapse). Kept
+> for history only — do not action. Safe to delete.
+
 Plan for the items selected from the codebase audit. Phases are ordered by ship order, not by audit tier — atomic IO and version single-sourcing land first because they're mechanical wins with low blast radius; the session.py extraction refactor lands last because it touches the most surface area.
 
 Each phase is meant to be one or two PRs. Phases are independent unless noted. 1.5.0 is in flight; everything below is post-1.5.0 work.
