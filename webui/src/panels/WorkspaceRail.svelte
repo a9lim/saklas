@@ -27,31 +27,20 @@
 
   const CATEGORIES: Category[] = [
     {
-      key: "subspace",
-      label: "Steering & subspaces",
-      icon: "M5 19L19 5M19 5h-7M19 5v7",
-      // Shared op vocabulary with the manifolds category — build / merge
-      // sit in the same slots and the same label format so the two
-      // steering surfaces read as one family.  Pack lifecycle is unified
-      // under the manifolds category's "packs…" (concepts are manifolds
-      // now), so the subspace fan-out is build + merge only.
-      tools: [
-        { label: "build vector…", drawer: "extract" },
-        { label: "merge vector…", drawer: "merge" },
-      ],
-    },
-    {
-      // Manifold peer of "subspace" — same fan-out shape so the two
-      // steering surfaces feel parallel.  Both catalogs are the shared
-      // RackDrawer (family-split), reached from the rack "+" buttons.
+      // The single steering-authoring surface.  Concepts are manifolds
+      // now — a flat (2-node / personas) fit is just a pca manifold — so
+      // there's no separate "subspaces" category and no standalone vector
+      // build/merge form; flat authoring folds into the manifold builder's
+      // pca path.  The catalog is the shared RackDrawer (family-split),
+      // reached from the rack "+" buttons.
       key: "manifolds",
       label: "Steering manifolds",
       // Undulating spline curve — reads as "manifold" and is visually
-      // distinct from vectors' arrow and analysis' line graph.
+      // distinct from analysis' line graph.
       icon: "M3 17c4-8 6-8 9-4s2 8 9 0",
-      // build / merge / packs mirror the vectors category's shared
-      // slots one-for-one.  No clone counterpart — corpus generation is
-      // folded into the manifold builder's discover tab.
+      // build authors a fit (pca → flat, spectral/authored → curved);
+      // merge unions discover node corpora; packs + templates are shared
+      // lifecycle surfaces.
       tools: [
         { label: "build manifold…", drawer: "manifold_builder" },
         { label: "merge manifolds…", drawer: "manifold_merge" },

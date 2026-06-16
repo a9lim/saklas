@@ -3,7 +3,7 @@
 // suite as one module:
 //
 //   import * as Drawers from "./drawers";
-//   <Drawers.Extract params={drawerState.params} />
+//   <Drawers.RackDrawer params={drawerState.params} />
 //
 // Names match the DrawerName union in lib/types.ts (modulo the trivial
 // snake_case → PascalCase mapping):
@@ -18,12 +18,11 @@
 // geometry family.  ``family: "subspace"`` (flat pca / baked fits, white
 // accent) and ``family: "manifold"`` (curved spectral / authored fits,
 // purple accent) are mirror images, differing only by accent, label, and
-// catalog filter.  Both rack "+ add" buttons open it; the per-family
-// authoring launcher (``ExtractDrawer`` / ``ManifoldBuilderDrawer``) is
-// reached from the "+ …" button inside it.
+// catalog filter.  Both rack "+ add" buttons open it; the "+ build
+// manifold" launcher inside it routes to ``ManifoldBuilderDrawer`` for
+// both families (a flat fit is just a pca manifold).
 
 export { default as RackDrawer } from "./RackDrawer.svelte";
-export { default as Extract } from "./ExtractDrawer.svelte";
 export { default as ManifoldBuilder } from "./ManifoldBuilderDrawer.svelte";
 export { default as ManifoldMerge } from "./ManifoldMergeDrawer.svelte";
 export { default as ManifoldPack } from "./ManifoldPacksDrawer.svelte";

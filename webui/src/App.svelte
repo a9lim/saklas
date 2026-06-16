@@ -13,7 +13,6 @@
   import Toaster from "./lib/Toaster.svelte";
 
   import * as Drawers from "./drawers";
-  import MergeDrawer from "./drawers/MergeDrawer.svelte";
   import TokenDrilldownDrawer from "./drawers/TokenDrilldownDrawer.svelte";
 
   import {
@@ -35,10 +34,8 @@
   // analysis views keep the wide one (docs/plans/webui-overhaul.md §8).
   const NARROW_DRAWERS: ReadonlySet<DrawerName> = new Set<DrawerName>([
     "subspace",
-    "extract",
     "manifolds",
     "manifold_builder",
-    "merge",
     "system_prompt",
     "save_conversation",
     "load_conversation",
@@ -212,8 +209,6 @@
                 family: "subspace",
               }}
             />
-          {:else if drawerState.open === "extract"}
-            <Drawers.Extract params={drawerState.params} />
           {:else if drawerState.open === "manifolds"}
             <Drawers.RackDrawer
               params={{
@@ -239,8 +234,6 @@
             <Drawers.Help params={drawerState.params} />
           {:else if drawerState.open === "export"}
             <Drawers.Export params={drawerState.params} />
-          {:else if drawerState.open === "merge"}
-            <MergeDrawer params={drawerState.params} />
           {:else if drawerState.open === "token_drilldown"}
             <TokenDrilldownDrawer params={drawerState.params} />
           {:else if drawerState.open === "correlation"}

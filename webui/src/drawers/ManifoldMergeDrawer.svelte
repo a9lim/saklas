@@ -1,14 +1,13 @@
 <script lang="ts">
-  // ManifoldMergeDrawer — manifold-side counterpart to MergeDrawer.
+  // ManifoldMergeDrawer — discover-mode node-union merge.
   //
-  // Vector merge composes a new vector from a steering expression; the
-  // manifold analogue unions *node corpora* and lets the next autofit
-  // derive coords from the combined heap.  Restricted to discover-mode
-  // sources by design — authored manifolds carry user-declared
-  // geometry that isn't mergeable without a shared coordinate system.
+  // Unions the *node corpora* of two or more discover-mode manifolds and
+  // lets the next autofit derive coords from the combined heap.  Restricted
+  // to discover-mode sources by design — authored manifolds carry
+  // user-declared geometry that isn't mergeable without a shared coordinate
+  // system.
   //
-  // Reached from the workspace rail's "manifolds → merge…" entry,
-  // parallel to "vectors → merge vector…".
+  // Reached from the workspace rail's "manifolds → merge manifolds…" entry.
 
   import { onMount } from "svelte";
   import { SvelteSet } from "svelte/reactivity";
@@ -351,8 +350,7 @@
     color: var(--fg-muted);
     font-size: var(--text-xs);
   }
-  /* Stacked form fields — label above control, matching MergeDrawer so
-   * the two merge surfaces share one field idiom. */
+  /* Stacked form fields — label above control. */
   .field {
     display: flex;
     flex-direction: column;
@@ -388,8 +386,8 @@
     font-size: var(--text-xs);
   }
 
-  /* Footer mirrors MergeDrawer: cancel (secondary) + primary submit
-   * pinned to the bottom.  Only the primary accent goes purple. */
+  /* Footer: cancel (secondary) + primary submit pinned to the bottom.
+   * Only the primary accent goes purple. */
   .foot {
     border-top: 1px solid var(--border);
     padding-top: var(--space-4);

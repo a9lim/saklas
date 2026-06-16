@@ -103,7 +103,6 @@
       </div>
       <div class="actions">
         <button type="button" onclick={copyExpression}>{copied ? "copied" : "copy"}</button>
-        <button type="button" onclick={() => openDrawer("merge")}>merge…</button>
       </div>
     </section>
 

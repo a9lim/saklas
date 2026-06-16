@@ -80,14 +80,11 @@
     family === "manifold" ? "var(--accent-purple)" : "var(--accent)",
   );
   const title = $derived(family === "manifold" ? "manifold" : "subspace");
-  const launcherLabel = $derived(
-    family === "manifold" ? "build manifold" : "extract subspace",
-  );
-  const launcherHint = $derived(
-    family === "manifold"
-      ? "author a domain and node corpus"
-      : "extract a concept the catalog doesn't carry",
-  );
+  // Authoring always routes to the manifold builder now — a flat (2-node /
+  // personas) fit is just a pca manifold, so there's no separate vector
+  // extraction form.  Both families' launcher opens the same builder.
+  const launcherLabel = "build manifold";
+  const launcherHint = "author a domain and node corpus";
 
   let errorMsg: string | null = $state(null);
 
@@ -449,11 +446,7 @@
   // ----- launchers + badges -------------------------------------------
 
   function gotoLauncher(): void {
-    if (family === "manifold") {
-      openDrawer("manifold_builder");
-    } else {
-      openDrawer("extract", { seed_a: query.trim() || undefined });
-    }
+    openDrawer("manifold_builder");
   }
 
   function fitModeBadge(m: ManifoldInfo): string | null {

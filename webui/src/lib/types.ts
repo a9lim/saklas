@@ -1479,14 +1479,10 @@ export type DrawerName =
    *  fit (``fit_mode`` pca / baked): 2-node concept axes plus higher-rank
    *  flats like ``personas``.  White ``--accent``.  Split Fitted /
    *  Unfitted, per-row steer / probe / re-fit / delete, with a
-   *  "+ extract subspace" launcher.  ``RackDrawer`` with
-   *  ``family: "subspace"``.  Opened from both rack "+ add" buttons. */
+   *  "+ build manifold" launcher (flat authoring folds into the manifold
+   *  builder's pca path).  ``RackDrawer`` with ``family: "subspace"``.
+   *  Opened from both rack "+ add" buttons. */
   | "subspace"
-  /** Custom-concept extraction form — reached from the
-   *  "+ extract subspace" button at the top of ``subspace``.  Submitting
-   *  closes back to the subspace drawer so the new row appears
-   *  reactively. */
-  | "extract"
   /** Shared rack browser, manifold (curved) family — curved fits only
    *  (``fit_mode`` spectral / authored), e.g. ``emotions``.  Purple
    *  ``--accent-purple``.  Same layout as the subspace half, with a
@@ -1496,11 +1492,10 @@ export type DrawerName =
   /** Manifold authoring form — domain step + node editor.  Reached
    *  from the "+ build manifold" button inside ``manifolds``. */
   | "manifold_builder"
-  /** Manifold-side counterpart to ``MergeDrawer``.  Unions the node
-   *  corpora of two or more discover-mode manifolds into a fresh
-   *  discover folder; restricted to discover sources by design.
-   *  Reached from the workspace rail's "manifolds → merge…" entry,
-   *  parallel to "vectors → merge vector…". */
+  /** Discover-mode node-union merge.  Unions the node corpora of two or
+   *  more discover-mode manifolds into a fresh discover folder; restricted
+   *  to discover sources by design.  Reached from the workspace rail's
+   *  "manifolds → merge manifolds…" entry. */
   | "manifold_merge"
   /** Manifold-side counterpart to ``PackDrawer``.  Two tabs: local
    *  catalog, plus HF search/install for ``saklas-manifold``-tagged
@@ -1510,7 +1505,6 @@ export type DrawerName =
   | "save_conversation"
   | "load_conversation"
   | "compare"
-  | "merge"
   | "system_prompt"
   | "token_drilldown"
   | "correlation"

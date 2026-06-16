@@ -1,8 +1,7 @@
 <script lang="ts">
   // Themed collapsible — the existing ``▸/▾ caret + button row`` pattern
-  // packaged as one component.  Replaces the lone ``<details>`` in
-  // MergeDrawer and the ad-hoc ``advancedOpen`` toggles used in
-  // ExtractDrawer / ManifoldBuilderDrawer.
+  // packaged as one component.  Backs the ad-hoc ``advancedOpen`` toggles
+  // (e.g. ManifoldBuilderDrawer) and inline grammar-reference disclosures.
   //
   // Default slot is the body; the trigger row shows the caret + summary.
 
