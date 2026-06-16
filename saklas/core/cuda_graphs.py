@@ -154,6 +154,46 @@ def is_cuda_graphs_supported(
     return is_static_cache_supported(model, device)
 
 
+_static_sliding_mask_patched = False
+
+
+def _patch_static_sliding_mask() -> None:
+    """Make a non-sliding StaticSlidingWindowLayer's ``get_mask_sizes`` constant.
+
+    The hybrid-cache recompile storm: ``StaticSlidingWindowLayer.get_mask_sizes``
+    branches on ``cumulative_length_int`` — a Python int that increments every
+    decode step — so inside a ``torch.compile`` graph dynamo specializes on its
+    value and recompiles every token until it hits ``recompile_limit`` and falls
+    back to eager.  But when the cache never slides (the whole generation fits the
+    static buffer — ``total_context <= max_cache_len``), ``get_mask_sizes`` is a
+    *constant* ``(max_cache_len, 0)`` for every decode step: ``is_full`` stays
+    False and ``kv_offset`` stays 0, so the original's ``else`` branch already
+    returns exactly this.  Returning it directly — gated on the per-cache
+    ``_saklas_static_mask`` flag :func:`make_static_cache` sets only when no slide
+    can occur — is byte-identical to the original in that regime, but drops the
+    per-step int guard so the mask stays in the compiled graph with no recompile.
+    A sliding cache (long context) keeps the original dynamic path.  Idempotent."""
+    global _static_sliding_mask_patched
+    if _static_sliding_mask_patched:
+        return
+    try:
+        from transformers.cache_utils import StaticSlidingWindowLayer
+    except Exception:
+        _static_sliding_mask_patched = True  # nothing to patch; don't retry
+        return
+
+    _orig = StaticSlidingWindowLayer.get_mask_sizes
+
+    def get_mask_sizes(self, query_length: int) -> tuple[int, int]:
+        if getattr(self, "_saklas_static_mask", False):
+            return self.max_cache_len, 0
+        return _orig(self, query_length)
+
+    get_mask_sizes._saklas_orig = _orig  # type: ignore[attr-defined]
+    StaticSlidingWindowLayer.get_mask_sizes = get_mask_sizes  # type: ignore[method-assign]
+    _static_sliding_mask_patched = True
+
+
 def make_static_cache(
     model: "PreTrainedModel | torch.nn.Module",
     max_cache_len: int,
@@ -172,12 +212,25 @@ def make_static_cache(
     first and check the boolean.
     """
     from transformers import StaticCache
-    return StaticCache(
+    _patch_static_sliding_mask()
+    cache = StaticCache(
         model.config,  # pyright: ignore[reportArgumentType]  # transformers stub types model.config as PreTrainedConfig|Tensor|Module
         max_cache_len=max_cache_len,
         device=device,
         dtype=dtype,
     )
+    # Flag each sliding layer that can't slide for this generation (the whole
+    # ``max_cache_len`` context fits its static buffer) so the patched
+    # ``get_mask_sizes`` returns the guard-free constant and the hybrid-cache
+    # recompile storm doesn't fire.  A sliding layer caps its buffer to
+    # ``min(sliding_window, max_cache_len)``, so it never slides exactly when the
+    # requested total is within that buffer.
+    for layer in getattr(cache, "layers", []):
+        if getattr(layer, "is_sliding", False):
+            buf = getattr(layer, "max_cache_len", None)
+            if buf is not None:
+                layer._saklas_static_mask = max_cache_len <= buf
+    return cache
 
 
 def warn_once(model: "PreTrainedModel | torch.nn.Module", reason: str) -> None:
