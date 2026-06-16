@@ -447,8 +447,8 @@ chat-template substitution that replaces the assistant-role label, so the fit
 lives in role-baselined (persona) activation space. At steer time
 `nearest_node_role` pipes the closest node's role through `session._active_role` so
 the generation prefill applies the same substitution. Distinct implied roles
-compose under soft-warn + highest-coefficient-wins; family-unsupported (Mistral-3,
-talkie) raises `RoleSubstitutionUnsupportedError` at fit time.
+compose under soft-warn + highest-coefficient-wins; family-unsupported (Mistral-3)
+raises `RoleSubstitutionUnsupportedError` at fit time.
 
 **Whitened/Fisher subspace selection.** When the whitener covers every fit layer
 the basis is selected by whitened PCA — maximize `vᵀS_b v / vᵀΣv` (the LDA
@@ -767,10 +767,10 @@ port) auto-fall back to O(N²) no-KV-cache generation with a one-time warning.
 Role-augmented extraction (`:role-<name>` variant) and persona manifolds need a
 chat template with a substitutable assistant-role label (`core/role_templates.py::
 ROLE_HEADERS`). Supported: `qwen2`/`qwen3`/`qwen3_5` (ChatML), `gemma2`/`gemma3`/
-`gemma4` (`<start_of_turn>`, label is `model`), `llama`, `glm`, `gpt_oss`.
-Unsupported (mapped to `None`, `apply_with_role` raises
-`RoleSubstitutionUnsupportedError`): `mistral3` / `ministral3` (positional
-`[INST]`, no role label in the rendered string), `talkie` (opted out).
+`gemma4` (`<start_of_turn>`, label is `model`), `llama`, `glm`, `gpt_oss`, `talkie`
+(`<|role|>` markers, GLM-shaped). Unsupported (mapped to `None`, `apply_with_role`
+raises `RoleSubstitutionUnsupportedError`): `mistral3` / `ministral3` (positional
+`[INST]`, no role label in the rendered string).
 
 ## Bundled concepts
 

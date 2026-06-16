@@ -37,7 +37,9 @@ _REPRESENTATIVE_TOKENIZERS: dict[str, str] = {
     "qwen3": "Qwen/Qwen3-0.6B",
     "qwen3_text": "Qwen/Qwen3-0.6B",
     "qwen3_moe": "Qwen/Qwen3-30B-A3B-Instruct-2507",
-    "qwen3_5": "Qwen/Qwen3.5-7B-Instruct",
+    "qwen3_5": "Qwen/Qwen3.5-0.8B",
+    "qwen3_5_text": "Qwen/Qwen3.5-0.8B",
+    "qwen3_5_moe": "Qwen/Qwen3.5-35B-A3B",
     "gemma2": "google/gemma-2-2b-it",
     "gemma3": "google/gemma-3-1b-it",
     "gemma3_text": "google/gemma-3-1b-it",
@@ -48,6 +50,10 @@ _REPRESENTATIVE_TOKENIZERS: dict[str, str] = {
     "llama": "meta-llama/Llama-3.2-1B-Instruct",
     "glm": "THUDM/glm-4-9b-chat",
     "gpt_oss": "openai/gpt-oss-20b",
+    # The HF-compatible fork ships a fast tokenizer.json + chat_template.jinja
+    # that load without trust_remote_code; the upstream talkie-lm repo can't
+    # instantiate its backend tokenizer.
+    "talkie": "a9lim/talkie-1930-13b-it-hf-cached",
 }
 
 

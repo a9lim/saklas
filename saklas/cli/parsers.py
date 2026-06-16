@@ -228,8 +228,8 @@ def _build_vector_extract(p: argparse.ArgumentParser) -> None:
              "Writes the tensor under a ``_role-<slug>`` filename suffix; "
              "steer it with the matching ``:role-<slug>`` variant in any "
              "expression. Slug must match ``[a-z0-9._-]+``. Mutually "
-             "exclusive with ``--sae``. Mistral-3 / talkie families don't "
-             "carry a substitutable role label and raise at runtime.",
+             "exclusive with ``--sae``. Mistral-3 families don't carry a "
+             "substitutable role label and raise at runtime.",
     )
     p.add_argument(
         "--namespace", default=None, metavar="NS",
@@ -411,8 +411,8 @@ def _build_manifold_generate(generate: argparse.ArgumentParser) -> None:
             "and steering through it implies the nearest node's role at "
             "decode time (role-paired manifold steering).  Slugs must "
             "match [a-z0-9._-]+; family must carry a substitutable role "
-            "header (Qwen / Gemma / Llama / GLM / gpt-oss — Mistral-3 / "
-            "talkie raise at fit time)."
+            "header (Qwen / Gemma / Llama / GLM / gpt-oss / talkie — "
+            "Mistral-3 raises at fit time)."
         ),
     )
     generate.add_argument(

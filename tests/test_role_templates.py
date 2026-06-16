@@ -89,6 +89,17 @@ GLM_TEMPLATE = (
 )
 
 
+# Talkie-1930: ``<|role|>content<|end|>`` — same <|role|> shape as GLM but no
+# post-marker newline.  Faithful to the real chat template captured from
+# a9lim/talkie-1930-13b-it-hf-cached (model_type "talkie").
+TALKIE_TEMPLATE = (
+    "{% for m in messages %}"
+    "<|{{ m['role'] }}|>{{ m['content'] }}<|end|>"
+    "{% endfor %}"
+    "{% if add_generation_prompt %}<|assistant|>{% endif %}"
+)
+
+
 # GPT-OSS: ``<|start|>{role}<|channel|>{content}<|end|>``.
 GPT_OSS_TEMPLATE = (
     "{% for m in messages %}"
@@ -193,6 +204,10 @@ def _llama_tok() -> FakeTokenizer:
 
 def _glm_tok() -> FakeTokenizer:
     return FakeTokenizer(GLM_TEMPLATE)
+
+
+def _talkie_tok() -> FakeTokenizer:
+    return FakeTokenizer(TALKIE_TEMPLATE)
 
 
 def _gpt_oss_tok() -> FakeTokenizer:
@@ -446,17 +461,22 @@ def test_apply_with_role_ministral_raises():
         )
 
 
-def test_apply_with_role_talkie_raises():
-    """talkie explicitly opts out (untested family)."""
-    tok = _qwen_tok()  # template doesn't matter — registry blocks first
-    with pytest.raises(RoleSubstitutionUnsupportedError):
-        apply_with_role(
-            tok,
-            _sample_messages(),
-            role="pirate",
-            model_type="talkie",
-            tokenize=False,
-        )
+def test_apply_with_role_talkie():
+    """Talkie: <|role|> markers (GLM-shaped) splice — <|pirate|> appears,
+    <|assistant|> does not, and the <|end|>/<|user|> markers are untouched."""
+    tok = _talkie_tok()
+    out = apply_with_role(
+        tok,
+        _sample_messages(),
+        role="pirate",
+        model_type="talkie",
+        tokenize=False,
+    )
+    assert "<|pirate|>" in out
+    assert "<|assistant|>" not in out
+    # Non-assistant markers survive — the splice is keyed to <|assistant|> only.
+    assert "<|user|>" in out
+    assert "<|end|>" in out
 
 
 def test_apply_with_role_unknown_model_type_raises():
@@ -646,27 +666,23 @@ def test_unsupported_error_caught_as_value_error():
 
 
 def test_registry_covers_tested_archs():
-    """Every model_type in core.model._TESTED_ARCHS has a registry entry
-    (either a RoleHeader or an explicit None).  The registry must be
-    exhaustive over the tested-arch set so saklas's first-class
-    architectures all have a decision recorded.
+    """Every model_type in core.model._TESTED_ARCHS has an *exact* registry
+    entry (either a RoleHeader or an explicit None).
+
+    Exact-match, not suffix-stripping: the runtime ``_lookup_header`` does a
+    plain ``model_type not in registry`` lookup with no ``_text``/``_moe``
+    fallback, so a sub-variant only works if it's listed explicitly.  A
+    lenient parent-fallback check here is exactly what once let
+    ``qwen3_5_text``/``qwen3_5_moe`` read as covered while the code raised on
+    them — so the test must mirror the lookup, not paper over it.
     """
     from saklas.core.model import _TESTED_ARCHS
 
-    for arch in _TESTED_ARCHS:
-        # Sub-variants we explicitly route through their parent.  Build
-        # the set of acceptable mappings: an exact registry hit, or a
-        # parent-family hit reachable by stripping a known suffix.
-        if arch in ROLE_HEADERS:
-            continue
-        # Allow text/moe suffix-stripping to the parent family.
-        for suffix in ("_text", "_moe"):
-            if arch.endswith(suffix) and arch[: -len(suffix)] in ROLE_HEADERS:
-                break
-        else:
-            raise AssertionError(
-                f"_TESTED_ARCHS member {arch!r} has no role_templates registry entry"
-            )
+    missing = [arch for arch in _TESTED_ARCHS if arch not in ROLE_HEADERS]
+    assert not missing, (
+        f"_TESTED_ARCHS members have no role_templates registry entry "
+        f"(runtime lookup is exact — list each variant explicitly): {missing}"
+    )
 
 
 def test_role_header_is_frozen():
@@ -900,25 +916,21 @@ def test_apply_with_user_role_invalid_slug_raises():
 
 
 def test_user_role_registry_covers_tested_archs():
-    """Every ``_TESTED_ARCHS`` member has a USER_ROLE_HEADERS entry
-    (RoleHeader or explicit None), mirroring the assistant registry."""
+    """Every ``_TESTED_ARCHS`` member has an *exact* USER_ROLE_HEADERS entry
+    (RoleHeader or explicit None), mirroring the assistant registry — and the
+    runtime lookup, which is exact (no suffix fallback)."""
     from saklas.core.model import _TESTED_ARCHS
 
-    for arch in _TESTED_ARCHS:
-        if arch in USER_ROLE_HEADERS:
-            continue
-        for suffix in ("_text", "_moe"):
-            if arch.endswith(suffix) and arch[: -len(suffix)] in USER_ROLE_HEADERS:
-                break
-        else:
-            raise AssertionError(
-                f"_TESTED_ARCHS member {arch!r} has no USER_ROLE_HEADERS entry"
-            )
+    missing = [arch for arch in _TESTED_ARCHS if arch not in USER_ROLE_HEADERS]
+    assert not missing, (
+        f"_TESTED_ARCHS members have no USER_ROLE_HEADERS entry "
+        f"(runtime lookup is exact — list each variant explicitly): {missing}"
+    )
 
 
 def test_user_role_registry_opt_outs_match_assistant():
     """The label-free families opt out of *both* sides."""
-    for mt in ("mistral3", "ministral3", "talkie"):
+    for mt in ("mistral3", "ministral3"):
         assert ROLE_HEADERS[mt] is None
         assert USER_ROLE_HEADERS[mt] is None
 

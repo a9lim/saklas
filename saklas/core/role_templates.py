@@ -78,6 +78,12 @@ def _build_role_headers() -> dict[str, RoleHeader | None]:
     gpt_oss = RoleHeader(
         before="<|start|>", after="<|channel|>", label="assistant"
     )
+    # Talkie-1930 renders turns as ``<|role|>content<|end|>`` — the same
+    # ``<|...|>`` role-label shape as GLM (no post-marker newline).  Verified
+    # against the ``a9lim/talkie-1930-13b-it-hf-cached`` chat template
+    # (model_type "talkie", 2026-06).  The opt-out was "untested", not
+    # "label-free" — the label is present, so render-then-splice applies.
+    talkie = RoleHeader(before="<|", after="|>", label="assistant")
 
     table: dict[str, RoleHeader | None] = {
         # Qwen family
@@ -86,6 +92,8 @@ def _build_role_headers() -> dict[str, RoleHeader | None]:
         "qwen3_text": qwen,
         "qwen3_moe": qwen,
         "qwen3_5": qwen,
+        "qwen3_5_text": qwen,
+        "qwen3_5_moe": qwen,
         # Gemma family — note label="model", not "assistant".  Gemma-4
         # uses a different delimiter than 2/3 (see ``gemma4`` above).
         "gemma2": gemma,
@@ -101,12 +109,12 @@ def _build_role_headers() -> dict[str, RoleHeader | None]:
         "glm": glm,
         # GPT-OSS
         "gpt_oss": gpt_oss,
+        # Talkie — <|role|> markers, GLM-shaped.
+        "talkie": talkie,
         # Mistral: positional [INST]/[/INST] in the rendered string — there is
-        # no role label to swap, so the strategy doesn't apply.  Likewise
-        # talkie (vintage, untested for this feature; opt out explicitly).
+        # no role label to swap, so the strategy doesn't apply.
         "mistral3": None,
         "ministral3": None,
-        "talkie": None,
     }
     return table
 
@@ -132,6 +140,8 @@ def _build_user_role_headers() -> dict[str, RoleHeader | None]:
     glm = RoleHeader(before="<|", after="|>", label="user")
     # gpt-oss user turns use ``<|message|>``, not the assistant ``<|channel|>``.
     gpt_oss = RoleHeader(before="<|start|>", after="<|message|>", label="user")
+    # Talkie user turns render as ``<|user|>`` — GLM-shaped, like its assistant side.
+    talkie = RoleHeader(before="<|", after="|>", label="user")
 
     table: dict[str, RoleHeader | None] = {
         "qwen2": qwen,
@@ -139,6 +149,8 @@ def _build_user_role_headers() -> dict[str, RoleHeader | None]:
         "qwen3_text": qwen,
         "qwen3_moe": qwen,
         "qwen3_5": qwen,
+        "qwen3_5_text": qwen,
+        "qwen3_5_moe": qwen,
         "gemma2": gemma,
         "gemma3": gemma,
         "gemma3_text": gemma,
@@ -149,11 +161,11 @@ def _build_user_role_headers() -> dict[str, RoleHeader | None]:
         "llama": llama,
         "glm": glm,
         "gpt_oss": gpt_oss,
+        "talkie": talkie,
         # Same opt-outs as the assistant side: positional / label-free
-        # templates and the untested talkie port.
+        # templates (Mistral's [INST]/[/INST] markers).
         "mistral3": None,
         "ministral3": None,
-        "talkie": None,
     }
     return table
 
@@ -181,9 +193,9 @@ class RoleSubstitutionUnsupportedError(SaklasError, ValueError):
     support it.
 
     Two sub-cases share this error: the family is in :data:`ROLE_HEADERS`
-    with value ``None`` (positional templates like Mistral-3, opt-outs like
-    talkie), or the family is absent from the registry entirely (unknown
-    or unsupported architecture).
+    with value ``None`` (positional, label-free templates like Mistral-3),
+    or the family is absent from the registry entirely (unknown or
+    unsupported architecture).
     """
 
     def user_message(self) -> tuple[int, str]:

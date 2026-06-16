@@ -190,7 +190,7 @@ def _validate_node_role(name: str, label: str, role: Any) -> str | None:
     ``None`` / missing means "use the standard assistant baseline" (the
     legacy shape, same as today).  A non-empty string must match
     :data:`saklas.core.role_templates._ROLE_SLUG_RE`
-    (``[a-z0-9._-]+``).  Family-unsupported (Mistral-3, talkie) is *not*
+    (``[a-z0-9._-]+``).  Family-unsupported (Mistral-3) is *not*
     checked here — the folder is model-agnostic; the check fires when
     :func:`saklas.core.role_templates.apply_with_role` runs at fit time.
     """

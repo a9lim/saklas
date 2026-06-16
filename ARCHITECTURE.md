@@ -913,7 +913,7 @@ manifold). At steer time `nearest_node_role` picks the role and pipes it through
 `session._active_role` so the generation prefill applies the same substitution —
 steer baseline equals extract baseline. Multiple terms implying distinct roles
 compose under soft-warn + highest-`|coeff|`-wins (`RoleBaselineMismatchWarning`).
-Mistral-3/talkie lack a substitutable label and raise
+Mistral-3 lacks a substitutable label and raises
 `RoleSubstitutionUnsupportedError` at fit time.
 
 ---
