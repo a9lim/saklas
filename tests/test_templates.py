@@ -8,6 +8,7 @@ turn is user, slot appears exactly once).
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -40,7 +41,7 @@ def _home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
 
 
-def _make(name: str = "weekday", **kw) -> TemplateFolder:
+def _make(name: str = "weekday", **kw: Any) -> TemplateFolder:
     return create_template_folder(
         "local", name, slot=SLOT, values=VALUES, contexts=CONTEXTS, **kw,
     )

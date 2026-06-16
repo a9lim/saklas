@@ -19,6 +19,7 @@ import json
 import re
 import sys
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 from safetensors import safe_open
@@ -50,24 +51,25 @@ def slug(v: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", v.strip().lower()).strip("_")
 
 
-def pearson(a, b) -> float:
-    a = a - a.mean(); b = b - b.mean()
+def pearson(a: Any, b: Any) -> float:
+    a = a - a.mean()
+    b = b - b.mean()
     return float((a @ b) / (np.linalg.norm(a) * np.linalg.norm(b)))
 
 
-def eucl_pdist(X):
+def eucl_pdist(X: Any) -> Any:
     d = X[:, None, :] - X[None, :, :]
     return np.sqrt((d ** 2).sum(-1))
 
 
-def haversine(lat, lon):
+def haversine(lat: Any, lon: Any) -> Any:
     la, lo = np.radians(lat)[:, None], np.radians(lon)[:, None]
     a = (np.sin((la - la.T) / 2) ** 2
          + np.cos(la) * np.cos(la.T) * np.sin((lo - lo.T) / 2) ** 2)
     return 2 * 6371.0 * np.arcsin(np.sqrt(np.clip(a, 0, 1)))
 
 
-def loo_decode(coords, target):
+def loo_decode(coords: Any, target: Any):
     from sklearn.linear_model import RidgeCV
     from sklearn.model_selection import LeaveOneOut
     from sklearn.preprocessing import StandardScaler
@@ -83,7 +85,7 @@ def loo_decode(coords, target):
 # --------------------------------------------------------------------------- #
 # geographic (countries)
 # --------------------------------------------------------------------------- #
-def analyze_geographic(probe, coords, labels, fig):
+def analyze_geographic(probe: Any, coords: Any, labels: Any, fig: Any) -> None:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -107,7 +109,8 @@ def analyze_geographic(probe, coords, labels, fig):
     eur = [i for i, n in enumerate(names) if "Europe" in geo[n][2]]
     if len(eur) > 4:
         ce = coords[eur]
-        Dm = eucl_pdist(ce); Dg = haversine(lat[eur], lon[eur])
+        Dm = eucl_pdist(ce)
+        Dg = haversine(lat[eur], lon[eur])
         je = np.triu_indices(len(eur), 1)
         print(f"  Europe-only Mantel ({len(eur)})    = {pearson(Dm[je], Dg[je]):+.3f}")
 
@@ -129,21 +132,27 @@ def analyze_geographic(probe, coords, labels, fig):
     ax.set_title(f"countries — top-2 PCA (of {coords.shape[1]}-D)  ·  var "
                  f"{var[0]:.0%}/{var[1]:.0%}\nMantel {mantel:+.2f}  ·  "
                  f"lat/lon LOO R² {r2lat:.2f}/{r2lon:.2f}  (geography barely shows)")
-    ax.set_xlabel("PC1"); ax.set_ylabel("PC2"); ax.legend(fontsize=7, ncol=2)
-    f.tight_layout(); f.savefig(fig / "pca_layout.png", dpi=130); plt.close(f)
+    ax.set_xlabel("PC1")
+    ax.set_ylabel("PC2")
+    ax.legend(fontsize=7, ncol=2)
+    f.tight_layout()
+    f.savefig(fig / "pca_layout.png", dpi=130)
+    plt.close(f)
     print(f"  wrote {fig/'pca_layout.png'}")
 
 
 # --------------------------------------------------------------------------- #
 # ordinal (years*)
 # --------------------------------------------------------------------------- #
-def analyze_ordinal(probe, coords, labels, sidecar, fig):
+def analyze_ordinal(probe: Any, coords: Any, labels: Any, sidecar: Any, fig: Any) -> None:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from scipy.stats import spearmanr
 
-    years = np.array([int(re.search(r"(\d{4})", l).group(1)) for l in labels])
+    m = re.search(r"(\d{4})", labels[0])
+    assert m is not None
+    years = np.array([int(re.search(r"(\d{4})", l).group(1)) for l in labels])  # type: ignore[union-attr]
     o = np.argsort(years)
     coords, years = coords[o], years[o]
     K, D = coords.shape
@@ -156,10 +165,11 @@ def analyze_ordinal(probe, coords, labels, sidecar, fig):
     mantel = pearson(Dman[iu], Dyr[iu])
     U, S, Vt = np.linalg.svd(coords - coords.mean(0), full_matrices=False)
     pc = U * S
-    if spearmanr(pc[:, 0], years).statistic < 0:
+    res: Any = spearmanr(pc[:, 0], years)
+    if res.statistic < 0:
         pc[:, 0] *= -1
     var = S ** 2 / (S ** 2).sum()
-    rho1 = abs(spearmanr(pc[:, 0], years).statistic)
+    rho1 = abs(spearmanr(pc[:, 0], years).statistic)  # type: ignore[union-attr]
     print(f"  resolved geometry = {sidecar.get('resolved_fit_mode')} "
           f"{sidecar.get('domain')}")
     print(f"  decode year LOO R² = {r2:+.3f}  (median |err| {med:.1f} yr)")
@@ -172,21 +182,28 @@ def analyze_ordinal(probe, coords, labels, sidecar, fig):
     # decoded-vs-true (money shot)
     f, ax = plt.subplots(figsize=(8, 8))
     ax.scatter(years, pred, c=years, cmap="viridis", s=45, edgecolor="k", linewidth=0.3)
-    lim = [years.min() - 5, years.max() + 5]
+    years_min: Any = years.min()
+    years_max: Any = years.max()
+    lim = (years_min - 5, years_max + 5)
     ax.plot(lim, lim, "k--", alpha=0.5)
-    ax.set_xlim(lim); ax.set_ylim(lim); ax.set_aspect("equal")
-    ax.set_xlabel("true year"); ax.set_ylabel("LOO-decoded year")
+    ax.set_xlim(lim)
+    ax.set_ylim(lim)
+    ax.set_aspect("equal")
+    ax.set_xlabel("true year")
+    ax.set_ylabel("LOO-decoded year")
     ax.set_title(f"{probe.name} ({probe.framing}) — reading the year off the activation\n"
                  f"R²={r2:.3f}  ·  median {med:.1f} yr  ·  {D}-D  ·  PC1 {var[0]:.0%}")
     ax.grid(alpha=0.25)
-    f.tight_layout(); f.savefig(fig / "decoded_vs_true.png", dpi=130); plt.close(f)
+    f.tight_layout()
+    f.savefig(fig / "decoded_vs_true.png", dpi=130)
+    plt.close(f)
     print(f"  wrote {fig/'decoded_vs_true.png'}")
 
     if probe.future:
         analyze_cliff(probe, coords, years, pred, r2, adj, pc, var, fig)
 
 
-def analyze_cliff(probe, coords, years, pred, r2, adj, pc, var, fig):
+def analyze_cliff(probe: Any, coords: Any, years: Any, pred: Any, r2: Any, adj: Any, pc: Any, var: Any, fig: Any) -> None:
     import matplotlib.pyplot as plt
     K = len(years)
     med_adj = np.median(adj)
@@ -198,15 +215,16 @@ def analyze_cliff(probe, coords, years, pred, r2, adj, pc, var, fig):
     fut = np.where(years >= 2026)[0]
     past = np.where((years >= 2026 - 2 * len(fut)) & (years < 2026))[0]
 
-    def spread(idx):
-        c = coords[idx]; dm = eucl_pdist(c)
+    def spread(idx: Any) -> float:
+        c = coords[idx]
+        dm = eucl_pdist(c)
         return dm[np.triu_indices(len(idx), 1)].mean()
 
     pre = (years >= 2015) & (years < 2024)
     post = years >= 2024
     resid_pre = float((pred[pre] - years[pre]).mean())
     resid_post = float((pred[post] - years[post]).mean())
-    print(f"  --- future cliff ---")
+    print("  --- future cliff ---")
     print(f"  largest 2010+ adjacent jump: {cliff_year}→{cliff_year+1} "
           f"= {cliff_mag:.1f}× median  (the geometric 'now')")
     print(f"  decode residual flips sign at the present: "
@@ -220,20 +238,28 @@ def analyze_cliff(probe, coords, years, pred, r2, adj, pc, var, fig):
     ax[0].axvline(cliff_year + 0.5, color="red", ls="--", label=f"'now' cliff ~{cliff_year}")
     if (ymid == 1999).any():
         ax[0].axvline(1999.5, color="teal", ls="--", alpha=0.7, label="century seam 2000")
-    ax[0].set_xlabel("year"); ax[0].set_ylabel("adjacent step (×median)")
+    ax[0].set_xlabel("year")
+    ax[0].set_ylabel("adjacent step (×median)")
     ax[0].set_title("adjacent-distance profile — spikes mark regime breaks")
-    ax[0].legend(); ax[0].grid(alpha=0.2)
+    ax[0].legend()
+    ax[0].grid(alpha=0.2)
 
     ax[1].scatter(years[~future], pred[~future], c=years[~future], cmap="viridis",
                   s=35, edgecolor="k", linewidth=0.3, label="past")
     ax[1].scatter(years[future], pred[future], facecolor="none", edgecolor="red",
                   s=70, linewidth=1.5, label="2024+ (future)")
-    lim = [years.min() - 5, years.max() + 5]
+    ymin: Any = years.min()
+    ymax: Any = years.max()
+    lim = (ymin - 5, ymax + 5)
     ax[1].plot(lim, lim, "k--", alpha=0.5)
-    ax[1].set_xlim(lim); ax[1].set_ylim(lim); ax[1].set_aspect("equal")
-    ax[1].set_xlabel("true year"); ax[1].set_ylabel("LOO-decoded year")
+    ax[1].set_xlim(lim)
+    ax[1].set_ylim(lim)
+    ax[1].set_aspect("equal")
+    ax[1].set_xlabel("true year")
+    ax[1].set_ylabel("LOO-decoded year")
     ax[1].set_title(f"decode (R²={r2:.2f}) — future folds below the diagonal: can't place past 'now'")
-    ax[1].legend(); ax[1].grid(alpha=0.25)
+    ax[1].legend()
+    ax[1].grid(alpha=0.25)
 
     sc = ax[2].scatter(pc[:, 0], pc[:, 1], c=years, cmap="viridis", s=40,
                        edgecolor="k", linewidth=0.3)
@@ -245,8 +271,11 @@ def analyze_cliff(probe, coords, years, pred, r2, adj, pc, var, fig):
                        xytext=(3, 3), textcoords="offset points")
     plt.colorbar(sc, ax=ax[2], label="year")
     ax[2].set_title(f"top-2 PCA (var {var[0]:.0%}/{var[1]:.0%}) — red ring = 2024+")
-    ax[2].set_xlabel("PC1 (year-oriented)"); ax[2].set_ylabel("PC2")
-    f.tight_layout(); f.savefig(fig / "cliff.png", dpi=130); plt.close(f)
+    ax[2].set_xlabel("PC1 (year-oriented)")
+    ax[2].set_ylabel("PC2")
+    f.tight_layout()
+    f.savefig(fig / "cliff.png", dpi=130)
+    plt.close(f)
     print(f"  wrote {fig/'cliff.png'}")
 
 

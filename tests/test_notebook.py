@@ -53,12 +53,12 @@ def _make_result(
         elapsed=0.06,
         readings={
             "honest": ProbeReadings(
-                per_generation=[probe_mean - 0.05, probe_mean, probe_mean + 0.05],
-                mean=probe_mean,
-                std=0.05,
-                min=probe_mean - 0.05,
-                max=probe_mean + 0.05,
-                delta_per_gen=0.0,
+                per_generation=[(probe_mean - 0.05,), (probe_mean,), (probe_mean + 0.05,)],
+                mean=(probe_mean,),
+                std=(0.05,),
+                min=(probe_mean - 0.05,),
+                max=(probe_mean + 0.05,),
+                delta_per_gen=(0.0,),
             ),
         },
         vectors={"honest.deceptive": alpha},
@@ -278,12 +278,12 @@ class TestPlotTraitHistory:
     def test_one_trace_per_probe(self) -> None:
         readings = {
             "honest": ProbeReadings(
-                per_generation=[0.1, 0.2, 0.3],
-                mean=0.2, std=0.1, min=0.1, max=0.3, delta_per_gen=0.1,
+                per_generation=[(0.1,), (0.2,), (0.3,)],
+                mean=(0.2,), std=(0.1,), min=(0.1,), max=(0.3,), delta_per_gen=(0.1,),
             ),
             "warm": ProbeReadings(
-                per_generation=[0.5, 0.4, 0.3],
-                mean=0.4, std=0.1, min=0.3, max=0.5, delta_per_gen=-0.1,
+                per_generation=[(0.5,), (0.4,), (0.3,)],
+                mean=(0.4,), std=(0.1,), min=(0.3,), max=(0.5,), delta_per_gen=(-0.1,),
             ),
         }
         fig = plot_trait_history(readings)
@@ -297,8 +297,8 @@ class TestPlotTraitHistory:
     def test_show_mean_off_yields_one_trace_per_probe(self) -> None:
         readings = {
             "honest": ProbeReadings(
-                per_generation=[0.1, 0.2, 0.3],
-                mean=0.2, std=0.1, min=0.1, max=0.3, delta_per_gen=0.1,
+                per_generation=[(0.1,), (0.2,), (0.3,)],
+                mean=(0.2,), std=(0.1,), min=(0.1,), max=(0.3,), delta_per_gen=(0.1,),
             ),
         }
         fig = plot_trait_history(readings, show_mean=False)

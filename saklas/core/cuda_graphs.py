@@ -32,7 +32,7 @@ eligibility check lives at the steering layer, not here.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -184,7 +184,7 @@ def _patch_static_sliding_mask() -> None:
 
     _orig = StaticSlidingWindowLayer.get_mask_sizes
 
-    def get_mask_sizes(self, query_length: int) -> tuple[int, int]:
+    def get_mask_sizes(self: Any, query_length: int) -> tuple[int, int]:
         if getattr(self, "_saklas_static_mask", False):
             return self.max_cache_len, 0
         return _orig(self, query_length)

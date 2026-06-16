@@ -342,8 +342,10 @@ class TestLeaceProject:
 
     def test_leace_reduces_to_euclidean_when_sigma_is_identity(self):
         """λ=very-small + isotropic acts → LEACE ≈ Euclidean projection."""
-        d, n = 16, 500
-        # Big n, isotropic acts, small ridge.  Σ → I tightly.
+        d, n = 16, 5000
+        # Big n, isotropic acts, small ridge.  Σ → I tightly — n must be large
+        # enough that the finite-sample Σ deviation stays under the 0.05 tol on
+        # every platform's BLAS (n=500 was borderline and flaked on CI x64).
         w = _build_whitener(
             layers=(0,), n=n, d=d, seed=5, ridge_scale=0.001,
         )

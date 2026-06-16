@@ -308,7 +308,9 @@ def plot_trait_history(
 
     fig = go.Figure()
     for probe_name, r in readings.items():
-        series = list(r.per_generation)
+        # ``ProbeReadings`` is per-axis now; this timeline is a scalar
+        # consumer, so it reads coordinate axis 0 (``mean[0]`` likewise).
+        series = [coord[0] for coord in r.per_generation]
         x = list(range(len(series)))
         fig.add_trace(go.Scatter(
             x=x,
@@ -320,7 +322,7 @@ def plot_trait_history(
         if show_mean and series:
             fig.add_trace(go.Scatter(
                 x=[0, len(series) - 1] if len(series) > 1 else [0, 0],
-                y=[r.mean, r.mean],
+                y=[r.mean[0], r.mean[0]],
                 mode="lines",
                 name=f"{probe_name} mean",
                 line={"dash": "dash"},

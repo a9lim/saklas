@@ -14,6 +14,7 @@ import json
 import re
 import sys
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 from safetensors import safe_open
@@ -58,14 +59,17 @@ def main() -> None:
     ax = figh.add_subplot(111, projection="3d")
 
     if probe.kind == "ordinal":
-        years = np.array([int(re.search(r"(\d{4})", l).group(1)) for l in labels])
+        m0 = re.search(r"(\d{4})", labels[0])
+        assert m0 is not None
+        years: Any = np.array([int(re.search(r"(\d{4})", l).group(1)) for l in labels])  # type: ignore[union-attr]
         o = np.argsort(years)
         pc, years = pc[o], years[o]
         from scipy.stats import spearmanr
-        if spearmanr(pc[:, 0], years).statistic < 0:
+        res: Any = spearmanr(pc[:, 0], years)
+        if res.statistic < 0:
             pc[:, 0] *= -1
         ax.plot(pc[:, 0], pc[:, 1], pc[:, 2], "-", color="gray", alpha=0.4, lw=0.9)
-        p = ax.scatter(pc[:, 0], pc[:, 1], pc[:, 2], c=years, cmap="viridis",
+        p = ax.scatter(pc[:, 0], pc[:, 1], zs=pc[:, 2], c=years, cmap="viridis",  # type: ignore[arg-type]
                        s=45, edgecolor="k", linewidth=0.3)
         for i in range(0, K, 10):
             ax.text(pc[i, 0], pc[i, 1], pc[i, 2], str(years[i]), fontsize=7)
@@ -84,7 +88,7 @@ def main() -> None:
             for mw, mark, sz in ((False, "o", 55), (True, "X", 90)):
                 m = [i for i in range(K) if region[i] == r and multiword[i] == mw]
                 if m:
-                    ax.scatter(pc[m, 0], pc[m, 1], pc[m, 2], c=[rcol[r]], marker=mark,
+                    ax.scatter(pc[m, 0], pc[m, 1], zs=pc[m, 2], c=[rcol[r]], marker=mark,  # type: ignore[arg-type]
                                s=sz, edgecolor="k", linewidth=0.4,
                                label=r if not mw else None)
         for i in range(K):

@@ -190,7 +190,10 @@ def test_share_weight_mean_one_across_layers():
     mgr.apply_to_model(_model_layers(3), torch.device("cpu"), torch.float32)
     expected = _MANIFOLD_ALONG_GAIN
     for L in (0, 1, 2):
-        assert _group(mgr, L)[5] == pytest.approx(expected, abs=1e-6)
+        # mean-1 normalization divides then re-scales in fp32, so the share
+        # picks up ~gain·eps rounding (≈1.3e-6 at gain 16); rel tol, not the
+        # old abs=1e-6 that was tight only while the gain was 0.125.
+        assert _group(mgr, L)[5] == pytest.approx(expected, rel=1e-5)
 
 
 def test_n_layers_invariance():
@@ -241,7 +244,9 @@ def test_hot_path_translates_in_subspace_component_by_target():
     mgr.apply_to_model(layers, torch.device("cpu"), torch.float32)
     eff = _group(mgr, 0)[5]
     assert eff == pytest.approx(_MANIFOLD_ALONG_GAIN, abs=1e-6)  # share == 1
-    assert torch.allclose(_group(mgr, 0)[7], torch.zeros(1), atol=1e-6)  # κ=0 (pure push)
+    kappa = _group(mgr, 0)[7]
+    assert isinstance(kappa, torch.Tensor)
+    assert torch.allclose(kappa, torch.zeros(1), atol=1e-6)  # κ=0 (pure push)
 
     sub = synth.layers[0]
     target = synth.target_coord[0]

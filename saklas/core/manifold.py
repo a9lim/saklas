@@ -3741,7 +3741,7 @@ def compute_node_reduced_covariance(
     layers: torch.nn.ModuleList,
     device: torch.device,
     responses: list[str],
-    prompts: list[str],
+    prompts: "list[str] | list[list[dict[str, str]]]",
     layer_subs: "dict[int, LayerSubspace]",
     *,
     role: str | None = None,

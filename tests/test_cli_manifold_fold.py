@@ -339,6 +339,7 @@ class TestMergeFold:
 
 class TestGgufFold:
     def test_export_gguf_folds_manifold(self, tmp_path: Path) -> None:
+        pytest.importorskip("gguf")  # writing the GGUF needs the optional extra
         from saklas.io.cache_ops import _export_gguf_manifold
 
         _make_full_manifold("default", "happy.sad")

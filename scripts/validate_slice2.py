@@ -12,7 +12,9 @@ eager by a tiny fused-numerics delta with cos≈1).
 Run: python3 scripts/validate_slice2.py
 """
 
+from __future__ import annotations
 import sys
+from typing import Any
 
 from saklas import SamplingConfig, SaklasSession
 
@@ -25,7 +27,7 @@ STEER = "0.5 formal.casual"
 SAMP = SamplingConfig(temperature=0.0, max_tokens=48, seed=11)
 
 
-def agg_coord(result, name):
+def agg_coord(result: Any, name: str) -> Any:
     r = result.probe_readings.get(name) if result.probe_readings else None
     if r is None:
         return None

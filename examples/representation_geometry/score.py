@@ -28,7 +28,9 @@ FIGROOT = Path(__file__).parent / "figures"
 
 
 def yr(label: str) -> int:
-    return int(re.search(r"(\d{4})", label).group(1))
+    m = re.search(r"(\d{4})", label)
+    assert m is not None
+    return int(m.group(1))
 
 
 def score(probe: str, model_id: str) -> dict[str, object]:
@@ -67,10 +69,14 @@ def report_and_plot(belief: dict[str, object], fig: Path) -> None:
     f, ax = plt.subplots(figsize=(13, 5))
     ax.bar(years, p, width=0.9, color="steelblue")
     ax.axvline(peak, color="red", ls="--", label=f"peak {peak}")
-    ax.set_xlabel("year"); ax.set_ylabel("P(current year)")
+    ax.set_xlabel("year")
+    ax.set_ylabel("P(current year)")
     ax.set_title('model\'s explicit belief about "now" — P("the current year is ___")')
-    ax.legend(); ax.grid(alpha=0.2)
-    f.tight_layout(); f.savefig(fig / "belief_curve.png", dpi=130); plt.close(f)
+    ax.legend()
+    ax.grid(alpha=0.2)
+    f.tight_layout()
+    f.savefig(fig / "belief_curve.png", dpi=130)
+    plt.close(f)
     print(f"  wrote {fig/'belief_curve.png'}")
 
 

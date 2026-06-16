@@ -17,9 +17,11 @@ loop — full roster, then with the big multi-node probes detached, then a singl
 
 Run: SAKLAS_MEASURE_MODEL=google/gemma-4-12B-it python3 scripts/profile_pertoken.py
 """
+from __future__ import annotations
 import os
 import sys
 import time
+from typing import Any
 
 import torch
 
@@ -37,7 +39,7 @@ def _sync(device: torch.device) -> None:
         torch.cuda.synchronize()
 
 
-def _time_scoring(session, latest, *, coords_only, reps, device) -> float:
+def _time_scoring(session: Any, latest: Any, *, coords_only: bool, reps: int, device: Any) -> float:
     """Median per-call wall time (ms) of score_single_token over `reps`."""
     mon = session._monitor
     for _ in range(WARMUP):
@@ -123,7 +125,7 @@ def main() -> int:
     return 0
 
 
-def _capture_one(session):
+def _capture_one(session: Any) -> Any:
     """Run one forward, hook every probe layer, return the last per-layer slice."""
     layers = session._monitor.probe_layers()
     if not layers:
@@ -132,8 +134,8 @@ def _capture_one(session):
     model_layers = session._layers
     hid = {}
 
-    def _mk(idx):
-        def _h(_m, _i, out):
+    def _mk(idx: int) -> Any:
+        def _h(_m: Any, _i: Any, out: Any) -> None:
             o = out[0] if isinstance(out, tuple) else out
             hid[idx] = o[0, -1, :].detach().to(torch.float32).clone()
         return _h

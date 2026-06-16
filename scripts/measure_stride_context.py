@@ -8,9 +8,11 @@ TUI regime or only at short context.
 
 Run: SAKLAS_MEASURE_MODEL=google/gemma-4-12B-it python3 scripts/measure_stride_context.py --compile
 """
+from __future__ import annotations
 import os
 import statistics
 import sys
+from typing import Any
 
 from saklas import SamplingConfig, SaklasSession
 
@@ -30,7 +32,7 @@ S = SamplingConfig(temperature=0.7, max_tokens=MAXTOK, seed=7)
 
 
 class _FakeLoop:
-    def call_soon_threadsafe(self, fn, *a):
+    def call_soon_threadsafe(self, fn: Any, *a: Any) -> None:
         try:
             fn(*a)
         except Exception:
@@ -38,7 +40,7 @@ class _FakeLoop:
 
 
 class _FakeQ:
-    def put_nowait(self, ev):
+    def put_nowait(self, ev: Any) -> None:
         pass
 
 
@@ -56,8 +58,9 @@ def main() -> int:
         orig = mon.score_single_token
         state = {"n": 1, "i": 0, "last": None}
 
-        def strided(hidden, **kw):
-            i = state["i"]; state["i"] = i + 1
+        def strided(hidden: Any, **kw: Any) -> Any:
+            i = state["i"]
+            state["i"] = i + 1
             if state["n"] > 1 and (i % state["n"]) != 0 and state["last"] is not None:
                 return state["last"]
             r = orig(hidden, **kw)
@@ -66,14 +69,18 @@ def main() -> int:
 
         mon.score_single_token = strided  # type: ignore[method-assign]
 
-        def g(prompt):
+        def g(prompt: str) -> Any:
             return s.generate(prompt, steering="0.5 formal.casual", sampling=S,
                               stateless=True).first.tok_per_sec
 
-        def run(prompt, n):
-            state["n"] = n; state["i"] = 0; state["last"] = None
-            g(prompt); g(prompt)
-            state["i"] = 0; state["last"] = None
+        def run(prompt: str, n: int) -> Any:
+            state["n"] = n
+            state["i"] = 0
+            state["last"] = None
+            g(prompt)
+            g(prompt)
+            state["i"] = 0
+            state["last"] = None
             xs = [g(prompt) for _ in range(REPS)]
             return statistics.median(xs)
 
