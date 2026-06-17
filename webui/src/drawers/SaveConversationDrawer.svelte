@@ -4,13 +4,14 @@
   // it as a browser download.  Mirrors the TUI's ``/save`` but client-
   // side only — no server round-trip.
   //
-  // Shape: {version, savedAt, model_id?, chatLog, vectorRack, probeRack,
-  //         highlightState, samplingState}.  Vector / probe rack Maps are
-  //         serialized as plain arrays (Map → tuples) for JSON safety.
+  // Shape: {version, savedAt, model_id?, chatLog, steerRack, subspaceAlong,
+  //         probeRack, highlightState, samplingState}.  Steer / probe rack
+  //         Maps are serialized as plain arrays (Map → tuples) for JSON
+  //         safety.  (v1 saves used a vector-only ``vectorRack`` array.)
 
   import {
     chatLog,
-    vectorRack,
+    steerRack,
     probeRack,
     highlightState,
     samplingState,
@@ -27,15 +28,19 @@
   // would otherwise capture a partial turn.  User can re-open the drawer
   // to refresh.
   const snapshot = $derived.by(() => ({
-    version: 1 as const,
+    version: 2 as const,
     savedAt: new Date().toISOString(),
     model_id: sessionState.info?.model_id ?? null,
     session_id: sessionState.info?.id ?? null,
     chatLog: chatLog.turns,
-    vectorRack: [...vectorRack.entries.entries()].map(([name, entry]) => ({
+    // Full steer rack — every term (subspace + manifold) plus the shared
+    // subspace-along master.  (v1 saves carried a vector-only ``vectorRack``
+    // array; the loader still accepts that shape for back-compat.)
+    steerRack: [...steerRack.entries.entries()].map(([name, entry]) => ({
       name,
       ...entry,
     })),
+    subspaceAlong: steerRack.subspaceAlong,
     probeRack: {
       sortMode: probeRack.sortMode,
       active: [...probeRack.active],
@@ -126,7 +131,7 @@
       <pre class="preview" aria-label="Preview JSON">{previewDisplay}</pre>
       <span class="meta">
         {chatLog.turns.length} turn{chatLog.turns.length === 1 ? "" : "s"} ·
-        {vectorRack.entries.size} vector{vectorRack.entries.size === 1 ? "" : "s"} ·
+        {snapshot.steerRack.length} term{snapshot.steerRack.length === 1 ? "" : "s"} ·
         {probeRack.active.length} probe{probeRack.active.length === 1 ? "" : "s"}
       </span>
     </div>

@@ -34,7 +34,7 @@ def test_from_value_passthrough():
 def test_from_value_rejects_dict_input():
     import pytest
     with pytest.raises(TypeError) as ei:
-        Steering.from_value({"foo": 0.5})
+        Steering.from_value({"foo": 0.5})  # pyright: ignore[reportArgumentType]  # intentional wrong-type test
     assert "str | Steering | None" in str(ei.value)
 
 
@@ -70,6 +70,7 @@ def test_expression_preserves_trigger_entries():
     # onto the same ``(alpha, Trigger)`` tuple form that direct-construction
     # accepts.
     s = Steering.from_value("0.5 foo + 0.3 bar@response")
+    assert s is not None  # non-None string input always yields a Steering
     entries = s.normalized_entries()
     assert entries["foo"] == (0.5, Trigger.BOTH)
     assert entries["bar"] == (0.3, Trigger.GENERATED_ONLY)

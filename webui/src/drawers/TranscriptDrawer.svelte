@@ -16,6 +16,8 @@
     loomTree,
     refreshLoomTree,
   } from "../lib/stores.svelte";
+  import Radio from "../lib/Radio.svelte";
+  import Checkbox from "../lib/Checkbox.svelte";
 
   let _drawerProps: { params?: unknown } = $props();
   $effect(() => {
@@ -248,45 +250,24 @@
 
       <div class="field">
         <span class="label">mode</span>
-        <label class="mode-opt">
-          <input
-            type="radio"
-            name="import-mode"
-            value="default"
-            checked={importMode === "default"}
-            onchange={() => (importMode = "default")}
-          />
+        <span class="mode-opt">
+          <Radio bind:group={importMode} value="default" ariaLabel="default" />
           <span><strong>default</strong>: attach at root (fresh branch)</span>
-        </label>
-        <label class="mode-opt">
-          <input
-            type="radio"
-            name="import-mode"
-            value="here"
-            checked={importMode === "here"}
-            onchange={() => (importMode = "here")}
-          />
+        </span>
+        <span class="mode-opt">
+          <Radio bind:group={importMode} value="here" ariaLabel="here" />
           <span><strong>here</strong>: attach at the active node</span>
-        </label>
-        <label class="mode-opt">
-          <input
-            type="radio"
-            name="import-mode"
-            value="merge"
-            checked={importMode === "merge"}
-            onchange={() => (importMode = "merge")}
-          />
+        </span>
+        <span class="mode-opt">
+          <Radio bind:group={importMode} value="merge" ariaLabel="merge" />
           <span><strong>merge</strong>: deepest user-turn prefix match</span>
-        </label>
+        </span>
       </div>
 
-      <label class="mode-opt">
-        <input
-          type="checkbox"
-          bind:checked={importStrict}
-        />
+      <span class="mode-opt">
+        <Checkbox bind:checked={importStrict} ariaLabel="strict mode" />
         <span>strict (refuse on probe-hash drift)</span>
-      </label>
+      </span>
 
       <div class="field">
         <span class="label">file (optional)</span>

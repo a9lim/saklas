@@ -1,21 +1,46 @@
 <script lang="ts">
-  // The steering rack — section header, one VectorStrip per loaded
-  // vector (alphabetized for stable ordering across re-renders), and
-  // the + add steering action button.
+  // The steering rack — one unified steerRack, two harmonised groups split
+  // on geometry, the entry's own ``mode``:
+  //
+  //   subspace (flat)   — a 2-node bipolar axis through the rank-8 personas
+  //     fan.  Shares one rack-level "subspace along" master (the merged
+  //     affine subspace slides once), so the cards carry no per-card along.
+  //   manifold (curved) — curved fits (e.g. emotions), each its own injection with
+  //     a per-card along + onto.
+  //
+  // Every row is one SteerCard wearing the same RackCard chrome; the family
+  // is signalled only by accent colour + marker glyph.  Light group
+  // sub-headers; an empty group hides.  Footer keeps the + add steering /
+  // + add manifold entry points and their drawer targets.
 
-  import VectorStrip from "./VectorStrip.svelte";
-  import { vectorRack, openDrawer } from "../lib/stores.svelte";
+  import SteerCard from "./rack/SteerCard.svelte";
+  import Slider from "../lib/Slider.svelte";
+  import {
+    steerRack,
+    setSubspaceAlong,
+    openDrawer,
+  } from "../lib/stores.svelte";
 
-  // Reactive entries — sorted alphabetically by name for stable order.
-  // The Map iteration order tracks insertion which makes the rack
-  // visually jump around as vectors land out of order; sorting fixes it.
-  const sortedEntries = $derived.by(() => {
-    const arr = [...vectorRack.entries.entries()];
+  // Alphabetized for stable order — Map iteration tracks insertion which
+  // makes the rack jump around.
+  const subspaceTerms = $derived.by(() => {
+    const arr = [...steerRack.entries.entries()].filter(([, e]) => e.mode === "subspace");
+    arr.sort((a, b) => a[0].localeCompare(b[0]));
+    return arr;
+  });
+  const curvedTerms = $derived.by(() => {
+    const arr = [...steerRack.entries.entries()].filter(([, e]) => e.mode === "manifold");
     arr.sort((a, b) => a[0].localeCompare(b[0]));
     return arr;
   });
 
-  const count = $derived(sortedEntries.length);
+  const subspaceCount = $derived(subspaceTerms.length);
+  const manifoldCount = $derived(curvedTerms.length);
+  const count = $derived(subspaceCount + manifoldCount);
+
+  function onAlongInput(v: number): void {
+    if (Number.isFinite(v)) setSubspaceAlong(v);
+  }
 </script>
 
 <section class="rack" aria-label="Steering rack">
@@ -24,53 +49,72 @@
       <span class="title">STEERING</span>
     </div>
     <span class="count" aria-live="polite">
-      {count} vector{count === 1 ? "" : "s"}
+      {count} term{count === 1 ? "" : "s"}
     </span>
   </header>
 
   <div class="strips" class:is-empty={count === 0}>
-    {#if count === 0}
-      <div class="empty">
-        <p class="empty-copy">
-          Steering shapes how the model responds.
-          Add a concept to begin.
-        </p>
-        <button
-          type="button"
-          class="add-steering"
-          onclick={() => openDrawer("vectors")}
+    {#if count > 0}
+      {#if subspaceCount > 0}
+        <h3 class="group-header subspace">subspace</h3>
+        <!-- Shared "subspace along" master — the single slide magnitude every
+             flat term serializes with (the merged affine subspace slides
+             once).  Per-term relative weight lives in each card's position. -->
+        <div
+          class="along-master"
+          title="shared subspace-along — one slide magnitude for every flat term"
         >
-          + add steering
-        </button>
-      </div>
-    {:else}
-      {#each sortedEntries as [name, entry] (name)}
-        <VectorStrip {name} {entry} />
-      {/each}
+          <span class="along-label">along</span>
+          <Slider
+            value={steerRack.subspaceAlong}
+            min={0}
+            max={2}
+            step={0.05}
+            oninput={onAlongInput}
+            ariaLabel="shared subspace along"
+          />
+          <span class="along-val">{steerRack.subspaceAlong.toFixed(2)}</span>
+        </div>
+        {#each subspaceTerms as [name, entry] (name)}
+          <SteerCard {name} {entry} />
+        {/each}
+      {/if}
+      {#if manifoldCount > 0}
+        <h3 class="group-header manifold">manifold</h3>
+        {#each curvedTerms as [name, entry] (name)}
+          <SteerCard {name} {entry} />
+        {/each}
+      {/if}
     {/if}
   </div>
 
-  {#if count > 0}
-    <div class="actions">
-      <button
-        type="button"
-        class="add-steering"
-        onclick={() => openDrawer("vectors")}
-        title="Browse the concept catalog or extract a custom vector"
-      >
-        + add steering
-      </button>
-    </div>
-  {/if}
+  <!-- Launchers stay reachable in both empty + populated states — the two
+       family entry points, white subspace vs purple manifold. -->
+  <div class="actions">
+    <button
+      type="button"
+      class="add-subspace"
+      onclick={() => openDrawer("subspace")}
+      title="Browse flat subspaces — concept axes and personas"
+    >
+      + subspace steer
+    </button>
+    <button
+      type="button"
+      class="add-manifold"
+      onclick={() => openDrawer("manifolds")}
+      title="Browse curved steering manifolds"
+    >
+      + manifold steer
+    </button>
+  </div>
 </section>
 
 <style>
   /* A flat section of the inspector panel — no border box, no own
    * background; the only chrome is the border-bottom hairline dividing
    * it from the probe section below.  Fixed chrome + one scrollable
-   * middle.  This deliberately uses flex instead of grid: the generated
-   * ``.strips`` element was able to grow past the rack in some viewport
-   * sizes, hiding the apply-vector controls. */
+   * middle. */
   .rack {
     display: flex;
     flex-direction: column;
@@ -112,7 +156,7 @@
   }
 
   /* Strips own the scroll — overflow at the rack level would push the
-   * actions row off-screen when vectors pile up. */
+   * actions row off-screen when terms pile up. */
   .strips {
     display: flex;
     flex-direction: column;
@@ -127,36 +171,66 @@
     align-items: center;
     justify-content: center;
   }
-  /* First-run teaching state — one line of plain copy above the primary
-   * action.  Replaces the bare "no active steering vectors". */
-  .empty {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: var(--space-4);
-    padding: var(--space-5) var(--space-4);
-    text-align: center;
-  }
-  .empty-copy {
+
+  /* Light group sub-headers — name the geometry family without competing
+   * with the section title.  Accent-coded to match the cards' left
+   * stripe so the eye links header → rows. */
+  .group-header {
     margin: 0;
-    color: var(--fg-dim);
-    font-size: var(--text-sm);
-    line-height: 1.5;
-    max-width: 28ch;
+    padding: var(--space-1) 0 0;
+    font-size: var(--text-2xs);
+    font-weight: var(--weight-normal);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--fg-muted);
+  }
+  .group-header.subspace {
+    border-left: 2px solid var(--accent);
+    padding-left: var(--space-2);
+  }
+  .group-header.manifold {
+    border-left: 2px solid var(--accent-purple);
+    padding-left: var(--space-2);
+  }
+
+  /* Shared subspace-along master — sits between the subspace header and its
+   * cards, reading as a group-level control rather than a per-card one. */
+  .along-master {
+    display: grid;
+    grid-template-columns: minmax(3em, auto) 1fr 3em;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-1) var(--space-2) var(--space-2);
+    border-left: 2px solid var(--accent);
+  }
+  .along-label {
+    color: var(--fg-muted);
+    font-size: var(--text-xs);
+    text-transform: lowercase;
+  }
+  .along-val {
+    color: var(--fg-muted);
+    font-size: var(--text-xs);
+    font-variant-numeric: tabular-nums;
+    text-align: right;
   }
 
   /* Anchored at the bottom of the rack.  Border-top mirrors the probe
-   * rack's actions row for visual symmetry. */
+   * rack's actions row for visual symmetry.  Shown in both empty and
+   * populated states — the two family launchers are the only first-run
+   * affordance (no teaching copy). */
   .actions {
     flex: 0 0 auto;
     border-top: 1px solid var(--border);
     padding-top: var(--space-4);
+    display: flex;
+    gap: var(--space-2);
   }
-  /* Primary entry point — the one obvious way to add a steering vector. */
-  .add-steering {
-    width: 100%;
-    background: var(--accent-subtle);
-    color: var(--accent);
+  /* The two family launchers — white subspace vs purple manifold so they
+   * read as the two card families. */
+  .add-subspace,
+  .add-manifold {
+    flex: 1 1 0;
     border: 1px solid var(--border);
     min-height: 2.1rem;
     padding: var(--space-4) var(--space-5);
@@ -167,11 +241,20 @@
     cursor: pointer;
     transition: background var(--dur) var(--ease-out);
   }
-  .empty .add-steering {
-    width: auto;
-    min-width: 14em;
+  .add-subspace {
+    background: var(--accent-subtle);
+    color: var(--accent);
   }
-  .add-steering:hover {
+  .add-subspace:hover {
     background: var(--accent-glow);
+  }
+  /* Manifold launcher — purple-tinted to echo the manifold card's accent
+   * so the two surfaces read as one feature. */
+  .add-manifold {
+    background: color-mix(in srgb, var(--accent-purple) 10%, transparent);
+    color: var(--accent-purple);
+  }
+  .add-manifold:hover {
+    background: color-mix(in srgb, var(--accent-purple) 18%, transparent);
   }
 </style>

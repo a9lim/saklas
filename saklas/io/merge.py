@@ -1,26 +1,26 @@
-"""Offline vector merging: precompute a linear combination of existing
-steering vectors into a distributable single-vector pack.
+"""Offline direction merging: precompute a linear combination of existing
+steering directions into a corpus-less ``fit_mode="baked"`` manifold.
 
 Merge expressions use the shared steering grammar from
 :mod:`saklas.core.steering_expr` — the same ``+`` / ``-`` / ``~`` /
 ``|`` / coefficient / projection syntax every other saklas surface
-speaks.
+speaks.  Each component resolves to a per-layer ``dict[int, Tensor]``
+direction by folding a fitted 2-node ``pca`` manifold down to a single
+direction, the directions are linearly combined, and the result is
+folded to a one-pole ray and frozen into a baked manifold under
+``~/.saklas/manifolds/local/<name>/``.
 """
 from __future__ import annotations
 
 import logging
-import shutil
 from pathlib import Path
 from typing import Any, Optional
 
 import torch
 
 from saklas.core.errors import SaklasError
-from saklas.io.packs import (
-    ConceptFolder, PackMetadata, hash_file,
-)
-from saklas.io.paths import concept_dir, safe_model_id
-from saklas.core.vectors import load_profile, save_profile
+from saklas.io.packs import hash_file
+from saklas.io.paths import safe_model_id
 
 log = logging.getLogger(__name__)
 
@@ -101,40 +101,54 @@ def linear_sum(
     return out
 
 
-def _resolve_coord(ns: Optional[str], name: str) -> ConceptFolder:
-    if ns is None:
-        raise MergeError(
-            f"merge component '{name}' must be namespace-qualified "
-            f"(e.g. 'default/{name}')"
-        )
-    folder = concept_dir(ns, name)
-    if not folder.exists():
-        raise MergeError(f"component {ns}/{name} not installed")
-    return ConceptFolder.load(folder)
+def _manifold_tensor_path(ns: str, name: str, sid: str, variant: Optional[str]) -> "Path | None":
+    """Fitted-manifold tensor path for ``(ns, name, sid, variant)``, or ``None``.
 
-
-def _variant_tensor_path(
-    cf: ConceptFolder, sid: str, variant: Optional[str], coord: str,
-) -> Path:
-    """Resolve a per-model tensor path honoring ``:variant`` suffix.
-
-    Pre-v2.1 merge always loaded ``cf.tensor_path(sid)`` regardless of
-    parsed variant, so ``default/foo:pca`` silently picked the raw DiM
-    tensor instead of the PCA one.  ``enumerate_variants`` is the
-    canonical lookup — ``"raw"`` / ``"pca"`` / ``"sae-<release>"`` etc.
+    The 4.0 fold fallback: bundled & user concepts ship as 2-node ``pca``
+    manifolds.  Only the ``raw`` / ``sae-<release>`` variants fold (role /
+    transfer variants are vector-only).
     """
-    from saklas.io.packs import enumerate_variants
+    from saklas.io.paths import manifold_dir, tensor_filename
+    if variant in (None, "raw"):
+        release: Optional[str] = None
+    elif variant.startswith("sae-"):
+        release = variant[len("sae-"):]
+    else:
+        return None
+    path = manifold_dir(ns, name) / tensor_filename(sid, release=release)
+    return path if path.exists() else None
 
-    variants = enumerate_variants(cf.folder, sid)
-    key = "raw" if variant in (None, "raw") else variant
-    path = variants.get(key)
-    if path is None:
-        available = sorted(variants) or ["(none)"]
+
+def _component_has_tensor_for(ns: str, name: str, sid: str, variant: Optional[str]) -> bool:
+    """True when ``(ns, name)`` has a usable fitted manifold tensor for ``sid``."""
+    return _manifold_tensor_path(ns, name, sid, variant) is not None
+
+
+def _resolve_component(
+    ns: str, name: str, sid: str, variant: Optional[str], coord: str,
+) -> "tuple[Profile, Path]":
+    """Load a merge component as ``(profile, source_tensor_path)``.
+
+    Folds a fitted 2-node ``pca`` manifold down to a single direction
+    (:func:`~saklas.core.vectors.folded_vector_directions`).  The returned path
+    is the manifold's fitted tensor file, so provenance hashing is uniform.
+    """
+    mpath = _manifold_tensor_path(ns, name, sid, variant)
+    if mpath is None:
         raise MergeError(
-            f"component {coord} has no '{key}' tensor for {sid} "
-            f"(available variants: {available})"
+            f"component {coord} not installed (no fitted manifold for {sid})"
         )
-    return path
+    from saklas.core.manifold import load_manifold
+    from saklas.core.vectors import folded_vector_directions
+    manifold = load_manifold(mpath)
+    try:
+        folded = folded_vector_directions(manifold)
+    except Exception as e:
+        raise MergeError(
+            f"component {coord} is a manifold that does not fold to a single "
+            f"steering direction (not a 2-node affine subspace): {e}"
+        ) from e
+    return folded, mpath
 
 
 def _parse_merge_expr(expression: str) -> "list[_MergeTerm]":
@@ -219,8 +233,14 @@ def _parse_merge_expr(expression: str) -> "list[_MergeTerm]":
 
 class _MergeTerm:
     __slots__ = (
-        "ns", "name", "variant", "coeff",
-        "operator", "onto_ns", "onto_name", "onto_variant",
+        "coeff",
+        "name",
+        "ns",
+        "onto_name",
+        "onto_ns",
+        "onto_variant",
+        "operator",
+        "variant",
     )
     def __init__(
         self,
@@ -253,17 +273,36 @@ class _MergeTerm:
         return f"{self.onto_ns}/{self.onto_name}"
 
 
+def _component_tensor_models(ns: Optional[str], name: str) -> set[str]:
+    """Models with a fitted ``raw`` manifold tensor for a component (the fold source)."""
+    if ns is None:
+        raise MergeError(
+            f"merge component '{name}' must be namespace-qualified "
+            f"(e.g. 'default/{name}')"
+        )
+    from saklas.io.paths import manifold_dir, parse_tensor_filename
+    mdir = manifold_dir(ns, name)
+    models: set[str] = set()
+    if mdir.is_dir():
+        for tensor in mdir.glob("*.safetensors"):
+            parsed = parse_tensor_filename(tensor.name)
+            if parsed is None:
+                continue
+            safe_model, variant = parsed
+            if variant is None:  # raw fitted tensor → foldable
+                models.add(safe_model)
+    return models
+
+
 def shared_models(expression: str) -> list[str]:
     """Return models for which every merge term has a tensor, sorted."""
     terms = _parse_merge_expr(expression)
     per: list[set[str]] = []
     for term in terms:
-        cf = _resolve_coord(term.ns, term.name)
-        per.append(set(cf.tensor_models()))
+        per.append(_component_tensor_models(term.ns, term.name))
         if term.operator is not None:
             assert term.onto_ns is not None and term.onto_name is not None
-            cf_b = _resolve_coord(term.onto_ns, term.onto_name)
-            per.append(set(cf_b.tensor_models()))
+            per.append(_component_tensor_models(term.onto_ns, term.onto_name))
     if not per:
         raise MergeError("no components provided")
     shared = set.intersection(*per)
@@ -274,7 +313,14 @@ def shared_models(expression: str) -> list[str]:
     return sorted(shared)
 
 
-def merge_into_pack(
+def _term_desc(term: _MergeTerm) -> str:
+    base = term.name
+    if term.operator is not None:
+        return f"{base}|{term.onto_name} ({term.coeff})"
+    return f"{base} ({term.coeff})"
+
+
+def merge_into_manifold(
     name: str,
     expression: str,
     model: Optional[str],
@@ -282,47 +328,63 @@ def merge_into_pack(
     force: bool = False,
     strict: bool = False,
 ) -> Path:
-    """Create a merged tensors-only pack at ~/.saklas/vectors/local/<name>/.
+    """Merge an expression of installed directions into a baked manifold.
 
-    ``expression`` is a merge expression using the shared grammar:
-    ``0.5 default/happy - 0.3 default/sad~default/calm``.
+    Writes a corpus-less ``fit_mode="baked"`` manifold to
+    ``~/.saklas/manifolds/local/<name>/`` — one fitted per-model tensor for
+    every model the expression resolves on, all sharing one ``manifold.json``.
+    ``expression`` uses the shared steering grammar:
+    ``0.5 default/happy - 0.3 default/sad|default/calm`` (``|`` projects away).
+
+    Each component resolves to a per-layer ``dict[int, Tensor]`` direction (a
+    fitted 2-node ``pca`` manifold folded down, or a legacy vector pack), the
+    directions are linearly combined, and the result is folded to a one-pole
+    ray (:func:`~saklas.core.vectors.fold_directions_to_subspace`) and frozen
+    into the baked tensor.  Returns the manifold folder path.
     """
+    from saklas.core.vectors import fold_directions_to_subspace
+    from saklas.io.manifolds import (
+        ManifoldFolder,
+        create_baked_manifold_folder,
+        save_baked_manifold_tensor,
+    )
+    from saklas.io.paths import manifold_dir
+
     terms = _parse_merge_expr(expression)
 
-    dst = concept_dir("local", name)
-    if dst.exists() and not force:
+    dst = manifold_dir("local", name)
+    if (dst / "manifold.json").exists() and not force:
         raise MergeError(f"{dst} exists; pass force=True to overwrite")
-    if dst.exists():
-        shutil.rmtree(dst)
-    dst.mkdir(parents=True, exist_ok=True)
 
     if model is not None:
-        target_models = [safe_model_id(model)]
+        sid_check = safe_model_id(model)
+        target_models = [sid_check]
         for term in terms:
-            cf = _resolve_coord(term.ns, term.name)
-            if safe_model_id(model) not in cf.tensor_models():
+            if not _component_has_tensor_for(
+                term.ns, term.name, sid_check, term.variant,
+            ):
                 raise MergeError(
                     f"component {term.coord} has no tensor for {model}"
                 )
     else:
         target_models = shared_models(expression)
 
-    component_info: dict[str, dict[str, Any]] = {}
-    files_map: dict[str, str] = {}
+    description = f"Merged manifold: {' + '.join(_term_desc(t) for t in terms)}"
 
+    folder: Optional[Path] = None
     for sid in target_models:
         profiles_and_alphas: list[tuple[Profile, float]] = []
+        component_info: dict[str, dict[str, Any]] = {}
         for term in terms:
-            cf = _resolve_coord(term.ns, term.name)
-            base_path = _variant_tensor_path(cf, sid, term.variant, term.coord)
-            profile, _meta = load_profile(str(base_path))
+            profile, base_path = _resolve_component(
+                term.ns, term.name, sid, term.variant, term.coord,
+            )
             if term.operator is not None:
                 assert term.onto_ns is not None and term.onto_name is not None
-                cf_b2 = _resolve_coord(term.onto_ns, term.onto_name)
-                onto_path = _variant_tensor_path(
-                    cf_b2, sid, term.onto_variant, term.onto_coord or "",
+                b_profile, _onto_path = _resolve_component(
+                    term.onto_ns, term.onto_name, sid,
+                    term.onto_variant, term.onto_coord or "",
                 )
-                b_profile, _ = load_profile(str(onto_path))
                 profile = project_away(profile, b_profile)
             profiles_and_alphas.append((profile, term.coeff))
             component_info.setdefault(term.coord, {
@@ -332,30 +394,24 @@ def merge_into_pack(
             })
 
         merged = linear_sum(profiles_and_alphas, strict=strict)
-        ts_path = dst / f"{sid}.safetensors"
-        save_profile(merged, str(ts_path), {
-            "method": "merge",
-            "components": component_info,
-        })
-        files_map[f"{sid}.safetensors"] = hash_file(ts_path)
-        files_map[f"{sid}.json"] = hash_file(ts_path.with_suffix(".json"))
+        # Fold the derived direction into a corpus-less one-pole ray
+        # (neutral_means=None — an offline merge has no model/whitener loaded,
+        # so the subspace anchors at coord 0 and the share is the Euclidean
+        # ‖merged_L‖, the same magnitude the components already carry baked in).
+        manifold = fold_directions_to_subspace(name, merged, None, label="merged")
+        if folder is None:
+            folder, _mf = create_baked_manifold_folder(
+                "local", name, description, manifold, sid,
+                method="merge", tags=["merge"], force=force,
+                components=component_info,
+            )
+        else:
+            save_baked_manifold_tensor(
+                folder, manifold, sid, method="merge", components=component_info,
+            )
 
-    def _term_desc(term: _MergeTerm) -> str:
-        base = term.name
-        if term.operator is not None:
-            return f"{base}~{term.onto_name} ({term.coeff})"
-        return f"{base} ({term.coeff})"
-
-    desc = " + ".join(_term_desc(t) for t in terms)
-    meta = PackMetadata(
-        name=name,
-        description=f"Merged pack: {desc}",
-        version="1.0.0",
-        license="AGPL-3.0-or-later",
-        tags=["merge"],
-        recommended_alpha=1.0,
-        source="local",
-        files=files_map,
-    )
-    meta.write(dst)
-    return dst
+    # ``target_models`` is non-empty (shared_models raises on an empty
+    # intersection; the explicit-model branch is always a singleton).
+    assert folder is not None
+    ManifoldFolder.load(folder).write_metadata()
+    return folder

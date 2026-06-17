@@ -76,7 +76,9 @@
    * kept here as named handles for future skin overrides. */
   --highlight-pos: #00ff00;
   --highlight-neg: #ff0000;
-  /* score / HIGHLIGHT_SAT clamps to [-1, 1] before mapping to RGB. */
+  /* Default saturation cutoff: score / scale clamps to [-1, 1] before
+   * mapping to RGB.  ``scale`` defaults to this for the [-1, 1] cosine
+   * grids; probe surfaces pass a per-probe node-coordinate extent. */
   --highlight-sat: 0.5;
 
   /* ---- One overlay shadow — drawers, modals, popovers, toasts ------ */

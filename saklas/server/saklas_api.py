@@ -7,13 +7,10 @@ is single-session.  The one session has id ``"default"``; both that
 literal and the loaded model id resolve to it, everything else 404s.
 
 Killer feature: ``WS /saklas/v1/sessions/{id}/stream`` bidirectional
-token + probe co-stream.  Per-token probe readings can't currently be
-pushed inline from the session hot path (they're computed once the run
-finalizes, via ``score_captured``).  So the WS protocol ships plain
-token events during the run and a single ``per_token_probes`` array in
-the ``done`` event, assembled from ``session._last_per_token_scores``.
-Future clusters can upgrade to inline streaming without changing the
-wire format meaningfully.
+token + probe co-stream.  Per-token probe readings are pushed inline on
+each token event (``ws_events.build_token_event``); the ``done`` event
+also carries the full ``per_token_probes`` array, assembled from
+``session.last_per_token_scores``.
 
 Old ``/v1/saklas/*`` routes were removed in the same commit that
 introduced this file — no aliases.
@@ -26,25 +23,28 @@ from __future__ import annotations
 from saklas.server.app import acquire_session_lock, ws_auth_ok
 
 import asyncio
-import json
 import time
 import uuid
-from dataclasses import replace as _replace
+from collections import deque
+from contextlib import suppress
+from operator import itemgetter
 from typing import Any, Awaitable, Callable, Literal
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 from saklas.core.errors import SaklasError
 from saklas.core.generation import supports_thinking, thinking_is_optional
-from saklas.io.probes_bootstrap import load_defaults
+from saklas.io.probes_bootstrap import load_default_manifolds as load_defaults  # noqa: F401
 from saklas.core.loom import LoomMutated
 from saklas.core.profile import Profile
 from saklas.core.results import GenerationResult, RunSet
 from saklas.core.sampling import SamplingConfig
 from saklas.core.session import SaklasSession
 from saklas.core.steering import Steering
+from saklas.server.sse import ProgressCallback, progress_sse_response
+from saklas.server.ws_events import build_token_event
 
 
 _SINGLE_SESSION_ID = "default"
@@ -74,10 +74,29 @@ class ExtractRequest(BaseModel):
     name: str
     source: Any = None
     baseline: str | None = None
-    method: str | None = None
-    dls: bool | None = None
     sae: str | None = None
     sae_revision: str | None = None
+    # Role-augmented extraction (engine: ``core/role_templates``).  When
+    # set, the chat template's assistant-role label is replaced by this
+    # slug at extract time, and the same substitution is auto-applied at
+    # steer time so the extract baseline matches the steer baseline.
+    # Tensor lands under a ``_role-<slug>`` filename suffix and the
+    # returned ``canonical`` carries a ``:role-<slug>`` variant tail.
+    # Slug must match ``[a-z0-9._-]+``; family must carry a
+    # substitutable role header (Qwen / Gemma / Llama / GLM / gpt-oss).
+    # Mutually exclusive with ``sae`` at the engine layer.
+    role: str | None = None
+    # Destination namespace for the extracted concept manifold. ``None``
+    # (default) lands under ``~/.saklas/manifolds/local/<canonical>/``.
+    # Any other namespace value relocates the folder to
+    # ``~/.saklas/manifolds/<namespace>/<canonical>/``; parity with the
+    # manifold builder's namespace control.
+    namespace: str | None = None
+    # Force a fresh extraction even if a cached tensor / node corpus exists at
+    # the destination. Default ``False`` keeps the cache-hit short-circuit
+    # (instant, no work). Parity with the manifold builder's ``force``
+    # overwrite control.
+    force: bool = False
     auto_register: bool = Field(True, alias="register")
 
     model_config = {"populate_by_name": True}
@@ -86,11 +105,6 @@ class ExtractRequest(BaseModel):
 class LoadVectorRequest(BaseModel):
     name: str
     source_path: str
-
-
-class ScoreProbeRequest(BaseModel):
-    text: str
-    probes: list[str] | None = None
 
 
 class WSSamplingParams(BaseModel):
@@ -111,6 +125,20 @@ class WSSamplingParams(BaseModel):
     # SamplingConfig layer to ``[0, 256]``; pydantic accepts the int
     # and forwards as-is.
     return_top_k: int = 0
+    # Native-dashboard opt-in for the heavier layer×probe heatmap payload.
+    # Regular API clients can leave this false and still get aggregate
+    # per-token probe scores.
+    persist_per_layer_scores: bool = False
+    # Native-dashboard opt-in for the per-layer whitened subspace coords on each
+    # token's probe reading — the probe-inspector live point + fading trail.  Set
+    # true only while that inspector is open; forces per-token incremental scoring.
+    persist_subspace_coords: bool = False
+    # Per-message role-substitution labels (roleplay scaffold).  Ride each
+    # generate like ``seed``; stamped onto the produced loom nodes (user
+    # turn ← ``user_role``, generated assistant turn ← ``assistant_role``)
+    # and rendered per-turn.  ``None`` / empty leaves the standard label.
+    user_role: str | None = None
+    assistant_role: str | None = None
 
 
 class WSGenerateMessage(BaseModel):
@@ -234,49 +262,16 @@ class JointLogprobsRequest(BaseModel):
     b_id: str
 
 
-class InstallPackRequest(BaseModel):
-    """Body for ``POST /saklas/v1/packs``.
-
-    ``target`` is an HF coordinate (``ns/name[@rev]``) or a local folder
-    path — the same surface ``saklas pack install`` consumes.  ``as_``
-    relocates the install to ``<dst_ns>/<dst_name>``; ``force``
-    overwrites an existing folder; ``statements_only`` strips tensors
-    after install.  Field name ``as_`` (Pydantic alias ``as``) avoids
-    shadowing the Python keyword on the wire.
-    """
-    target: str
-    as_: str | None = Field(default=None, alias="as")
-    force: bool = False
-    statements_only: bool = False
-
-    model_config = {"populate_by_name": True}
-
-
-class MergeVectorRequest(BaseModel):
-    """Body for ``POST /saklas/v1/sessions/{id}/vectors/merge``.
+class BakeVectorRequest(BaseModel):
+    """Body for ``POST /saklas/v1/sessions/{id}/vectors/bake``.
 
     ``expression`` is a merge expression in the shared steering grammar
     (``"0.3 default/honest + 0.4 default/warm"``); ``name`` becomes the
-    new merged pack's local name.  Reuses :func:`saklas.io.merge.merge_into_pack`.
+    new merged manifold's local name.  Reuses
+    :func:`saklas.io.merge.merge_into_manifold`.
     """
     name: str
     expression: str
-
-
-class CloneVectorRequest(BaseModel):
-    """Body for ``POST /saklas/v1/sessions/{id}/vectors/clone``.
-
-    Mirrors ``saklas vector clone`` flags: ``corpus_path`` points at a
-    one-utterance-per-line text file; ``n_pairs`` and ``seed`` carry
-    through to :func:`saklas.io.cloning.clone_from_corpus`. ``baseline``
-    is currently unused by the underlying clone path but reserved for
-    symmetry with extract.
-    """
-    name: str
-    corpus_path: str
-    n_pairs: int = 90
-    seed: int | None = None
-    baseline: str | None = None
 
 
 class ExperimentFanRequest(BaseModel):
@@ -324,6 +319,50 @@ def _session_config_dict(session: SaklasSession) -> dict[str, Any]:
     }
 
 
+def _session_model_type(session: SaklasSession) -> str | None:
+    """Resolve the loaded model's ``model_type`` (unwrapping multimodal
+    ``text_config``) — the key both role-header registries are indexed by."""
+    model_cfg = getattr(getattr(session, "_model", None), "config", None)
+    if model_cfg is None:
+        return None
+    text_cfg = getattr(model_cfg, "text_config", None)
+    mt = getattr(text_cfg, "model_type", None) if text_cfg is not None else None
+    return mt or getattr(model_cfg, "model_type", None)
+
+
+def _role_support(session: SaklasSession) -> tuple[bool, bool]:
+    """``(assistant_supported, user_supported)`` for the loaded family —
+    a non-``None`` entry in the respective role-header registry."""
+    from saklas.core.role_templates import ROLE_HEADERS, USER_ROLE_HEADERS
+
+    mt = _session_model_type(session)
+    if mt is None:
+        return (False, False)
+    return (
+        ROLE_HEADERS.get(mt) is not None,
+        USER_ROLE_HEADERS.get(mt) is not None,
+    )
+
+
+def _default_role_labels(session: SaklasSession) -> tuple[str | None, str | None]:
+    """``(assistant_label, user_label)`` — the family's *standard* role
+    strings (e.g. Gemma ``model`` / ``user``, ChatML ``assistant`` / ``user``),
+    or ``None`` when the family can't substitute that side.  The webui seeds
+    the role boxes with these so they show the live defaults rather than an
+    empty placeholder."""
+    from saklas.core.role_templates import ROLE_HEADERS, USER_ROLE_HEADERS
+
+    mt = _session_model_type(session)
+    if mt is None:
+        return (None, None)
+    asst = ROLE_HEADERS.get(mt)
+    usr = USER_ROLE_HEADERS.get(mt)
+    return (
+        asst.label if asst is not None else None,
+        usr.label if usr is not None else None,
+    )
+
+
 def _device_dtype(session: SaklasSession) -> tuple[str, str]:
     info = session.model_info or {}
     device = str(info.get("device", getattr(session, "_device", "")))
@@ -341,8 +380,18 @@ def _session_info(
     except Exception:
         thinks = False
         thinks_optional = False
+    try:
+        is_base = bool(session.is_base_model)
+    except Exception:
+        is_base = False
     created = getattr(session, "_created_ts", None) or int(time.time())
     default_expr = str(default_steering) if default_steering is not None else None
+    try:
+        assistant_role_ok, user_role_ok = _role_support(session)
+        default_assistant_role, default_user_role = _default_role_labels(session)
+    except Exception:
+        assistant_role_ok = user_role_ok = False
+        default_assistant_role = default_user_role = None
     return {
         "id": _SINGLE_SESSION_ID,
         "model_id": session.model_id,
@@ -355,13 +404,18 @@ def _session_info(
         "history_length": len(session.history) if hasattr(session, "history") else 0,
         "supports_thinking": thinks,
         "thinking_is_optional": thinks_optional,
+        "is_base_model": is_base,
         "default_steering": default_expr,
+        "role_substitution_supported": assistant_role_ok,
+        "user_role_supported": user_role_ok,
+        "default_assistant_role": default_assistant_role,
+        "default_user_role": default_user_role,
     }
 
 
 def _profile_to_json(name: str, profile: Profile) -> dict[str, Any]:
     layer_norms = [(idx, float(vec.norm().item())) for idx, vec in profile.items()]
-    top = sorted(layer_norms, key=lambda x: x[1], reverse=True)[:5]
+    top = sorted(layer_norms, key=itemgetter(1), reverse=True)[:5]
     # Full per-layer ||baked|| keyed by layer index — stringified for
     # JSON-key compatibility, mirroring how diagnostics_by_layer round-trips.
     # The web UI's LayerNorms panel consumes this directly.
@@ -375,21 +429,48 @@ def _profile_to_json(name: str, profile: Profile) -> dict[str, Any]:
     }
 
 
-def _probe_info(session: SaklasSession, name: str) -> dict[str, Any]:
-    layers: list[int] = []
-    try:
-        profiles = session._monitor.profiles
-        prof = profiles.get(name)
-        if prof is not None:
-            layers = sorted(prof.keys())
-    except Exception:
-        pass
-    active = False
-    try:
-        active = name in session._monitor.probe_names
-    except Exception:
-        active = name in (session.probes or {})
-    return {"name": name, "active": active, "layers": layers}
+def _extract_registry_name(canonical: str, namespace: str | None) -> str:
+    """Return the steerable key for a freshly extracted vector.
+
+    ``session.extract`` returns the concept-local canonical name with any
+    tensor variant suffix, while a non-default destination namespace lives
+    outside that name.  Reattach the namespace at the registry/API boundary so
+    immediate steering uses the same key that disk lookup will resolve later.
+    """
+    if namespace is None:
+        return canonical
+    if ":" in canonical:
+        bare, suffix = canonical.rsplit(":", 1)
+        return f"{namespace}/{bare}:{suffix}"
+    return f"{namespace}/{canonical}"
+
+
+def _probe_profile_tensors(
+    session: SaklasSession, name: str,
+) -> dict[int, Any] | None:
+    """Folded per-layer direction view of a vector probe, or ``None``.
+
+    The monitor now holds each vector probe as a flat 2-node
+    :class:`~saklas.core.manifold.Manifold` (``session._monitor.manifolds``);
+    the legacy ``monitor.profiles`` baked-``dict[int, Tensor]`` accessor is
+    gone.  This folds the named probe's manifold back to the same
+    ``{L: δ̂_L · share_L}`` baked-direction view callers used to read off
+    ``profiles`` (whitened-cosine matrices, the diagnostics histogram), so
+    the wire shape those routes emit is unchanged.
+    """
+    manifold = session._monitor.manifolds.get(name)
+    if manifold is None:
+        return None
+    from saklas.core.vectors import (
+        folded_vector_directions,
+        is_foldable_vector_manifold,
+    )
+
+    # A multi-node / curved probe has no single baked direction to fold —
+    # the diagnostics histogram only means anything for an R=1 vector.
+    if not is_foldable_vector_manifold(manifold):
+        return None
+    return folded_vector_directions(manifold)
 
 
 def _build_sampling(body: WSSamplingParams | None) -> SamplingConfig | None:
@@ -407,6 +488,10 @@ def _build_sampling(body: WSSamplingParams | None) -> SamplingConfig | None:
         presence_penalty=body.presence_penalty or 0.0,
         frequency_penalty=body.frequency_penalty or 0.0,
         return_top_k=body.return_top_k,
+        user_role=(body.user_role or None),
+        assistant_role=(body.assistant_role or None),
+        persist_per_layer_scores=bool(body.persist_per_layer_scores),
+        persist_subspace_coords=bool(body.persist_subspace_coords),
     )
 
 
@@ -434,35 +519,67 @@ def _build_steering(
     if default_steering is not None and not explicit_clear:
         merged.update(default_steering.alphas)
     if req is not None:
-        for k, v in req.alphas.items():
-            merged[k] = v
+        merged.update(req.alphas)
 
     if not merged and thinking is None:
         return None
     return Steering(alphas=merged, thinking=thinking)
 
 
-def _coerce_pair_source(source: Any) -> Any:
-    """Normalize JSON pair payloads into DataSource-compatible tuples."""
-    if not (isinstance(source, dict) and "pairs" in source):
+def _coerce_corpora(source: Any) -> Any:
+    """Normalize a JSON extract source into a concept name or two pole corpora.
+
+    A concept-name string passes through unchanged.  A
+    ``{positive: [...], negative: [...]}`` object (two pole corpora), a
+    ``{pairs: [{positive, negative}, ...]}`` object, or a bare single
+    ``{positive, negative}`` object are all turned into a
+    ``(positive_corpus, negative_corpus)`` tuple — the two node corpora of the
+    2-node ``pca`` manifold the steering vector is fit as.  No
+    ``{positive, negative}`` pairs are retained: hand-authored contrastive
+    examples become two independent corpora at the boundary.
+    """
+    if not isinstance(source, dict):
         return source
-    pairs = []
-    for idx, pair in enumerate(source["pairs"]):
+
+    # Two-corpora form: ``{positive: [...], negative: [...]}``.
+    if (
+        isinstance(source.get("positive"), list)
+        and isinstance(source.get("negative"), list)
+    ):
+        return (
+            [str(s) for s in source["positive"]],
+            [str(s) for s in source["negative"]],
+        )
+
+    # Pairs / single-pair forms — unzip into the two corpora.
+    raw_pairs: list[Any]
+    if "pairs" in source:
+        raw_pairs = list(source["pairs"])
+    elif "positive" in source and "negative" in source:
+        raw_pairs = [source]
+    else:
+        return source
+
+    positive: list[str] = []
+    negative: list[str] = []
+    for idx, pair in enumerate(raw_pairs):
         if isinstance(pair, dict):
             if "positive" not in pair or "negative" not in pair:
                 raise HTTPException(
                     400,
                     f"pairs[{idx}] must contain 'positive' and 'negative'",
                 )
-            pairs.append((str(pair["positive"]), str(pair["negative"])))
+            positive.append(str(pair["positive"]))
+            negative.append(str(pair["negative"]))
         elif isinstance(pair, (list, tuple)) and len(pair) == 2:
-            pairs.append((str(pair[0]), str(pair[1])))
+            positive.append(str(pair[0]))
+            negative.append(str(pair[1]))
         else:
             raise HTTPException(
                 400,
                 f"pairs[{idx}] must be a [positive, negative] pair",
             )
-    return pairs
+    return positive, negative
 
 
 def _result_to_json(result: GenerationResult | RunSet | None) -> dict[str, Any]:
@@ -538,126 +655,18 @@ def _node_json(session: SaklasSession, node_id: str) -> dict[str, Any]:
     return out
 
 
-def _transcript_yaml(session: SaklasSession, leaf_id: str | None) -> str:
-    """Render the path ending at ``leaf_id`` (or active) as transcript YAML.
-
-    Schema follows the example in ``docs/plans/loom.md`` phase 5 (probe
-    sha256 stubbed empty for phase 2):
-
-        saklas_transcript: 1
-        model_id: <id>
-        system_prompt: <text>
-        probes:
-          - name: <probe>
-            sha256: ""
-        turns:
-          - role: user
-            text: ...
-          - role: assistant
-            text: ...
-            recipe: {...}
-            readings: {...}
-    """
-    tree = session.tree
-    target = leaf_id if leaf_id is not None else tree.active_node_id
-    path = tree.path_to(target)
-
-    system_prompt = ""
-    cfg_sys = getattr(session.config, "system_prompt", None)
-    if cfg_sys:
-        system_prompt = str(cfg_sys)
-
-    monitor = getattr(session, "_monitor", None)
-    probe_names: list[str] = []
-    if monitor is not None:
-        try:
-            probe_names = sorted(monitor.probe_names)
-        except Exception:
-            probe_names = []
-
-    lines: list[str] = []
-    lines.append("saklas_transcript: 1")
-    lines.append(f"model_id: {_yaml_scalar(session.model_id)}")
-    lines.append(f"system_prompt: {_yaml_scalar(system_prompt)}")
-    lines.append("probes:")
-    if not probe_names:
-        lines.append("  []")
-    else:
-        for name in probe_names:
-            lines.append(f"  - name: {_yaml_scalar(name)}")
-            # Phase 2 stub — phase 5 fills with hash of baked tensor bytes.
-            lines.append("    sha256: \"\"")
-    lines.append("turns:")
-    any_turn = False
-    for node in path:
-        if node.id == tree.root_id:
-            continue
-        any_turn = True
-        lines.append(f"  - role: {node.role}")
-        lines.append(f"    text: {_yaml_scalar(node.text)}")
-        if node.recipe is not None:
-            recipe_dict = node.recipe.to_dict()
-            lines.append("    recipe:")
-            for k, v in recipe_dict.items():
-                lines.append(f"      {k}: {_yaml_inline(v)}")
-        if node.aggregate_readings:
-            lines.append("    readings:")
-            for k, v in sorted(node.aggregate_readings.items()):
-                lines.append(f"      {k}: {float(v):.6f}")
-    if not any_turn:
-        lines.append("  []")
-    return "\n".join(lines) + "\n"
-
-
-def _yaml_scalar(value: Any) -> str:
-    """Render a single scalar for the transcript-YAML emitter.
-
-    Strings are double-quoted with escapes so multi-line / unicode / null
-    bodies round-trip cleanly through any YAML 1.2 loader. Non-strings
-    fall through to :func:`_yaml_inline`.
-    """
-    if isinstance(value, str):
-        escaped = (
-            value.replace("\\", "\\\\")
-                 .replace("\"", "\\\"")
-                 .replace("\n", "\\n")
-                 .replace("\r", "\\r")
-                 .replace("\t", "\\t")
-        )
-        return f"\"{escaped}\""
-    return _yaml_inline(value)
-
-
-def _yaml_inline(value: Any) -> str:
-    """JSON-flavored inline rendering for nested recipe scalars.
-
-    JSON is a strict subset of YAML 1.2, so emitting nested dicts /
-    lists / numbers / null via :func:`json.dumps` is valid YAML and
-    sidesteps writing a full YAML emitter.
-    """
-    if value is None:
-        return "null"
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, (int, float)):
-        return json.dumps(value)
-    if isinstance(value, str):
-        return _yaml_scalar(value)
-    return json.dumps(value)
-
-
 def _per_token_probes(session: SaklasSession, n_tokens: int) -> list[dict[str, Any]]:
     scores = session.last_per_token_scores
     if not scores:
         return []
-    out: list[dict[str, Any]] = []
     n = min(n_tokens, *(len(v) for v in scores.values())) if scores else 0
-    for i in range(n):
-        out.append({
+    return [
+        {
             "token_idx": i,
             "probes": {name: float(vals[i]) for name, vals in scores.items() if i < len(vals)},
-        })
-    return out
+        }
+        for i in range(n)
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -675,250 +684,20 @@ def register_saklas_routes(app: FastAPI) -> None:
 
     session: SaklasSession = app.state.session
 
-    # ----- packs (top-level, not under a session) ------------------------
+    # ----- manifolds (top-level, own resource tree) ----------------------
 
-    @app.get("/saklas/v1/packs")
-    def list_packs():
-        """Return locally installed packs as JSON.
+    from saklas.server.manifold_routes import register_manifold_routes
+    register_manifold_routes(app)
 
-        Mirrors ``saklas pack ls`` (local-only branch). HF hub query is
-        the separate ``GET /saklas/v1/packs/search`` route — keeps the
-        common case (UI rack refresh) off the network.
+    # ----- templates (templated-completion artifact + scorer) ------------
 
-        Each row carries a session-relative ``has_tensor`` flag: ``True``
-        when the pack folder contains a baked tensor for the loaded
-        model (``<safe_model_id>.safetensors``).  The unified webui
-        vectors drawer splits the list on that flag — extracted rows
-        get steer/probe/delete actions, statements-only rows get
-        extract/delete — so the client doesn't have to re-derive the
-        safe-model-id slug.
-        """
-        from saklas.io.cache_ops import list_concepts as _list_concepts
-        from saklas.io.paths import safe_model_id as _safe_id
-        result = _list_concepts(None, hf=False)
-        sid = _safe_id(session.model_id)
-        return {
-            "packs": [
-                {
-                    "name": r.name,
-                    "namespace": r.namespace,
-                    "status": r.status,
-                    "recommended_alpha": r.recommended_alpha,
-                    "tags": list(r.tags),
-                    "description": r.description,
-                    "source": r.source,
-                    "tensor_models": list(r.tensor_models),
-                    "has_tensor": sid in r.tensor_models,
-                    **({"error": r.error} if r.error else {}),
-                }
-                for r in result.installed
-            ],
-        }
-
-    @app.get("/saklas/v1/packs/search")
-    def search_packs(q: str = "", limit: int = 50):
-        """HF-hub search proxy returning JSON.
-
-        Wraps :func:`saklas.io.cache_ops.search_remote_packs` so the UI
-        gets structured rows (not the CLI's text rendering). ``q`` is a
-        free-form query against repo ids; ``limit`` clamps the response
-        size client-side. HF transport errors land as 502; missing
-        ``huggingface_hub`` lands as 503.
-        """
-        from saklas.io.cache_ops import search_remote_packs as _search
-        try:
-            rows = _search(q)
-        except ImportError as e:
-            raise HTTPException(503, f"hf search unavailable: {e}")
-        except Exception as e:
-            raise HTTPException(502, f"hf search failed: {type(e).__name__}: {e}")
-        if limit and limit > 0:
-            rows = rows[:limit]
-        return {
-            "query": q,
-            "results": [
-                {
-                    "name": r.name,
-                    "namespace": r.namespace,
-                    "recommended_alpha": r.recommended_alpha,
-                    "tags": list(r.tags),
-                    "description": r.description,
-                    "tensor_models": list(r.tensor_models),
-                }
-                for r in rows
-            ],
-        }
-
-    @app.post("/saklas/v1/packs")
-    async def install_pack(req: InstallPackRequest):
-        """Install a pack from HF or a local folder.
-
-        Wraps :func:`saklas.io.cache_ops.install`; runs in a worker
-        thread because the HF download path is blocking. ``InstallConflict``
-        (409) and ``ValueError`` (400) propagate via the existing
-        ``SaklasError`` handler / generic mapping.
-        """
-        from saklas.io.cache_ops import install as _install, InstallConflict
-        try:
-            dst = await asyncio.to_thread(
-                _install,
-                req.target,
-                req.as_,
-                force=req.force,
-                statements_only=req.statements_only,
-            )
-        except FileNotFoundError as e:
-            raise HTTPException(404, f"pack not found: {e}")
-        except InstallConflict as e:
-            raise HTTPException(409, str(e))
-        except ValueError as e:
-            raise HTTPException(400, str(e))
-        return {
-            "target": req.target,
-            "installed_at": str(dst),
-            "statements_only": req.statements_only,
-        }
-
-    @app.delete("/saklas/v1/packs/{namespace}/{name}")
-    async def delete_pack(namespace: str, name: str):
-        """Remove a locally installed pack folder.
-
-        Wraps :func:`saklas.io.cache_ops.uninstall` on the parsed
-        ``<namespace>/<name>`` selector.  Always passes ``yes=True`` —
-        the selector is fully qualified so there's no broad-selector
-        risk, and the webui surfaces its own two-step confirm before
-        calling this.
-
-        If the concept is currently registered on the session
-        (steering rack or active probe), unsteers / deactivates it
-        first so the engine doesn't keep a stale pointer.  Bundled
-        concepts re-materialize on next session init — the response
-        carries ``rematerializes_on_restart: True`` for the source so
-        the client can surface a friendlier toast.
-
-        Returns ``{namespace, name, source, removed, rematerializes_on_restart}``.
-        404 if nothing matched the selector.
-        """
-        from saklas.io.cache_ops import uninstall as _uninstall
-        from saklas.io.selectors import parse as _parse_selector
-        try:
-            selector = _parse_selector(f"{namespace}/{name}")
-        except ValueError as e:
-            raise HTTPException(400, str(e))
-
-        # Capture source before deletion so the response can carry the
-        # rematerializes-on-restart hint.  ``ConceptRow.source`` is the
-        # canonical "bundled" / "local" / "hf://..." string.
-        from saklas.io.cache_ops import list_concepts as _list_concepts
-        rows = _list_concepts(None, hf=False).installed
-        match = next(
-            (r for r in rows if r.namespace == namespace and r.name == name),
-            None,
-        )
-        if match is None:
-            raise HTTPException(404, f"pack '{namespace}/{name}' not installed")
-        source = match.source
-
-        # Detach from the session under the lock — refuses mid-extraction
-        # via the engine's gen-lock guard (mutations during generation
-        # raise; the lock here serializes against streaming requests).
-        async with session.lock:
-            await asyncio.to_thread(
-                lambda: (
-                    session.unsteer(name) if name in session.vectors else None,
-                ),
-            )
-            # ``session.vectors`` is keyed by canonical name; the namespace
-            # form is also worth trying for ns-qualified registrations.
-            qualified = f"{namespace}/{name}"
-            if qualified in session.vectors:
-                await asyncio.to_thread(session.unsteer, qualified)
-            try:
-                count = await asyncio.to_thread(
-                    _uninstall, selector, yes=True,
-                )
-            except RuntimeError as e:
-                raise HTTPException(400, str(e))
-
-        if count == 0:
-            raise HTTPException(404, f"pack '{namespace}/{name}' not installed")
-        return {
-            "namespace": namespace,
-            "name": name,
-            "source": source,
-            "removed": count,
-            "rematerializes_on_restart": source == "bundled",
-        }
+    from saklas.server.template_routes import register_template_routes
+    register_template_routes(app)
 
     # ----- sessions collection -------------------------------------------
 
-    @app.get("/saklas/v1/sessions")
-    def list_sessions():
-        return {"sessions": [_session_info(session, app.state.default_steering)]}
-
-    @app.post("/saklas/v1/sessions")
-    def create_session(req: CreateSessionRequest):
-        if req.model and req.model != session.model_id:
-            # Idempotent: log and return existing, per plan.
-            import logging
-            logging.getLogger("saklas.api").warning(
-                "POST /saklas/v1/sessions requested model=%r but session is %r; "
-                "single-session mode, returning existing",
-                req.model, session.model_id,
-            )
-        return _session_info(session, app.state.default_steering)
-
-    @app.get("/saklas/v1/sessions/{session_id}")
-    def get_session(session_id: str):
-        _resolve_session_id(session, session_id)
-        return _session_info(session, app.state.default_steering)
-
-    @app.delete("/saklas/v1/sessions/{session_id}", status_code=204)
-    def delete_session(session_id: str):
-        _resolve_session_id(session, session_id)
-        import logging
-        logging.getLogger("saklas.api").warning(
-            "DELETE /saklas/v1/sessions/%s: single-session mode, no-op",
-            session_id,
-        )
-        return JSONResponse(status_code=204, content=None)
-
-    @app.patch("/saklas/v1/sessions/{session_id}")
-    def patch_session(session_id: str, req: PatchSessionRequest):
-        _resolve_session_id(session, session_id)
-        overrides: dict[str, Any] = {}
-        if req.temperature is not None:
-            overrides["temperature"] = req.temperature
-        if req.top_p is not None:
-            overrides["top_p"] = req.top_p
-        if req.top_k is not None:
-            overrides["top_k"] = req.top_k
-        if req.max_tokens is not None:
-            overrides["max_new_tokens"] = req.max_tokens
-        if req.system_prompt is not None:
-            overrides["system_prompt"] = req.system_prompt
-        if overrides:
-            from dataclasses import is_dataclass
-            if is_dataclass(session.config):
-                session.config = _replace(session.config, **overrides)
-            else:
-                for k, v in overrides.items():
-                    setattr(session.config, k, v)
-        return _session_info(session, app.state.default_steering)
-
-    @app.post("/saklas/v1/sessions/{session_id}/clear", status_code=204)
-    def clear_session(session_id: str):
-        _resolve_session_id(session, session_id)
-        session.clear_history()
-        return JSONResponse(status_code=204, content=None)
-
-    @app.post("/saklas/v1/sessions/{session_id}/rewind", status_code=204)
-    def rewind_session(session_id: str):
-        _resolve_session_id(session, session_id)
-        if not session.history:
-            raise HTTPException(400, "History is empty")
-        session.rewind()
-        return JSONResponse(status_code=204, content=None)
+    from saklas.server.session_routes import register_session_routes
+    register_session_routes(app)
 
     # ----- loom tree (v2.3 phase 2) --------------------------------------
 
@@ -980,9 +759,9 @@ def register_saklas_routes(app: FastAPI) -> None:
         """
         _resolve_session_id(session, session_id)
         # Cast role through the Literal-narrowing layer the tree owns.
-        role_arg = req.role  # type: ignore[assignment]
+        role_arg = req.role
         new_id = session.tree.branch(
-            req.node_id, req.text, role=role_arg,
+            req.node_id, req.text, role=role_arg,  # pyright: ignore[reportArgumentType]  # req.role is str|None; branch() expects Role|None (Literal narrowing)
         )
         return {
             "node_id": new_id,
@@ -1037,7 +816,7 @@ def register_saklas_routes(app: FastAPI) -> None:
         _resolve_session_id(session, session_id)
         async with session.lock:
             session.clear_history()
-        return JSONResponse(status_code=204, content=None)
+        return Response(status_code=204)
 
     @app.post("/saklas/v1/sessions/{session_id}/tree/transcript")
     def tree_transcript(session_id: str, req: TreeTranscriptRequest):
@@ -1089,24 +868,24 @@ def register_saklas_routes(app: FastAPI) -> None:
         try:
             transcript = Transcript.from_yaml(req.yaml)
         except TranscriptFormatError as e:
-            raise HTTPException(400, f"invalid transcript: {e}")
+            raise HTTPException(400, f"invalid transcript: {e}") from e
         import warnings
 
         captured: list[str] = []
 
         def _on_warning(
-            message,
-            category,
-            filename,
-            lineno,
-            file=None,
-            line=None,
-        ):
+            message: Warning | str,
+            category: type[Warning],
+            filename: str,
+            lineno: int,
+            file: Any = None,
+            line: str | None = None,
+        ) -> None:
             captured.append(str(message))
 
         async with session.lock:
             with warnings.catch_warnings():
-                warnings.showwarning = _on_warning  # type: ignore[assignment]
+                warnings.showwarning = _on_warning
                 try:
                     leaf_id = await asyncio.to_thread(
                         transcript.import_into,
@@ -1115,7 +894,7 @@ def register_saklas_routes(app: FastAPI) -> None:
                         strict=req.strict,
                     )
                 except TranscriptError as e:
-                    raise HTTPException(400, str(e))
+                    raise HTTPException(400, str(e)) from e
         return {
             "leaf_id": leaf_id,
             "rev": session.tree.rev,
@@ -1163,7 +942,7 @@ def register_saklas_routes(app: FastAPI) -> None:
         try:
             matches = session.tree.filter_by_expr(text)
         except FilterParseError as e:
-            raise HTTPException(400, str(e))
+            raise HTTPException(400, str(e)) from e
         return {"expr": text, "matching_node_ids": sorted(matches)}
 
     @app.post("/saklas/v1/sessions/{session_id}/tree/diff")
@@ -1212,8 +991,8 @@ def register_saklas_routes(app: FastAPI) -> None:
         per_token_spans: list[dict[str, Any]] = []
         if a_tok_strs and b_tok_strs:
             spans = per_token_diff(a_tok_strs, b_tok_strs)
-            for sp in spans:
-                per_token_spans.append({
+            per_token_spans.extend(
+                {
                     "a_index": sp.a_index,
                     "b_index": sp.b_index,
                     "a_text": sp.a_text,
@@ -1228,7 +1007,9 @@ def register_saklas_routes(app: FastAPI) -> None:
                         }
                         for rd in sp.reading_deltas
                     ],
-                })
+                }
+                for sp in spans
+            )
 
         return {
             "a_id": diff.a_id,
@@ -1308,7 +1089,7 @@ def register_saklas_routes(app: FastAPI) -> None:
         cache_obj: Any = getattr(session, "_joint_logprob_cache", None)
         if cache_obj is None:
             cache_obj = {}
-            session._joint_logprob_cache = cache_obj  # type: ignore[attr-defined]
+            session._joint_logprob_cache = cache_obj
         cache: dict[tuple[str, str], Any] = cache_obj
 
         key = _cache_key(req.a_id, req.b_id)
@@ -1339,15 +1120,16 @@ def register_saklas_routes(app: FastAPI) -> None:
 
     @app.get("/saklas/v1/sessions/{session_id}/vectors/pairwise")
     def pairwise_compare(session_id: str, a: str, b: str):
-        """Cross-layer cosine matrix between two named vectors / probes.
+        """Cross-layer whitened cosine matrix between two named vectors / probes.
 
         Query: ``?a=<name>&b=<name>``.  Each cell ``matrix[i][j]`` is the
-        raw cosine similarity between vector ``a``'s layer ``layers_a[i]``
-        and vector ``b``'s layer ``layers_b[j]``.  Output:
+        Mahalanobis cosine between vector ``a``'s layer ``layers_a[i]`` and
+        vector ``b``'s layer ``layers_b[j]``.  Output:
 
             {
               "a": "honest",
               "b": "warm",
+              "metric": "mahalanobis",
               "layers_a": [0, 5, ...],
               "layers_b": [0, 5, ...],
               "matrix": [[1.0, 0.41, ...], [0.13, 0.92, ...], ...],
@@ -1356,83 +1138,135 @@ def register_saklas_routes(app: FastAPI) -> None:
 
         Pool unions ``session.vectors`` and ``monitor.probe_names`` (same
         as :func:`correlation_matrix`) so probes that were never
-        registered as steering vectors still resolve.  Cosines are
-        layer-pairwise (no magnitude weighting, no Mahalanobis whitening)
-        — the matrix is the structural signal the webui pairwise-compare
-        heatmap reads, distinct from the aggregate scalar that
-        :meth:`Profile.cosine_similarity` returns.  Near-zero layer norms
-        land as ``None`` so the client can render them as empty cells.
+        registered as steering vectors still resolve.  Near-zero layer
+        norms land as ``None`` so the client can render them as empty
+        cells.  The matrix is the structural signal the webui
+        pairwise-compare heatmap reads, distinct from the aggregate
+        scalar :meth:`Profile.cosine_similarity` returns.
+
+        **Metric.**  Mahalanobis-only: each cell is whitened in the
+        per-model :class:`LayerWhitener` metric, downweighting alignment
+        that is merely shared high-variance base-rate structure.
+        Mahalanobis cosine is a *single-layer* (single-``Σ``) operation,
+        but this matrix is **cross-layer** (``layers_a × layers_b``), so
+        each cell is whitened in vector ``a``'s row-layer frame
+        (``⟨v_a, v_b⟩_M / (‖v_a‖_M ‖v_b‖_M)`` under ``Σ_{La}^{-1}``):
+        exact on the layer-aligned diagonal (``La == Lb``), an A-frame
+        read off it.  There is no Euclidean path: a missing whitener, or
+        one that doesn't cover every row-layer of ``a``, is a 409 (the
+        neutral activation cache must be regenerated).
 
         Registered *before* ``GET /vectors/{name}`` so the literal path
         wins the routing match — Starlette matches in registration order
         and ``pairwise`` would otherwise be swallowed by ``{name}``.
         """
-        from saklas import Profile
-
         _resolve_session_id(session, session_id)
 
-        pool: dict[str, "Profile"] = dict(session.vectors)
-        try:
-            probe_profiles = session._monitor.profiles
-            for probe_name in session._monitor.probe_names:
-                if probe_name in pool:
-                    continue
-                tensors = probe_profiles.get(probe_name)
-                if tensors is None:
-                    continue
-                pool[probe_name] = Profile(tensors)
-        except Exception:
-            pass
-
-        missing = [n for n in (a, b) if n not in pool]
-        if missing:
-            raise HTTPException(404, f"names not loaded: {missing}")
-
-        prof_a, prof_b = pool[a], pool[b]
+        # CPU snapshots only (cached, built once under the exclusive-GPU lock)
+        # so this endpoint never issues an MPS->CPU copy on its threadpool
+        # thread that could race a concurrent model op on PyTorch's single
+        # global, non-thread-safe command buffer (which aborts the process).
+        prof_a = session.analytics_profile(a)
+        prof_b = session.analytics_profile(b)
+        unavailable = [n for n, p in ((a, prof_a), (b, prof_b)) if p is None]
+        if unavailable:
+            known = set(session.analytics_names())
+            missing = [n for n in unavailable if n not in known]
+            if missing:
+                raise HTTPException(404, f"names not loaded: {missing}")
+            # Registered, but a model op holds the GPU and no snapshot is
+            # cached yet — retryable rather than a hard miss.
+            raise HTTPException(
+                409,
+                "a model operation is in flight; the comparison snapshot is "
+                "not ready yet — retry shortly",
+            )
+        assert prof_a is not None and prof_b is not None  # guarded above
         layers_a = sorted(prof_a.keys())
         layers_b = sorted(prof_b.keys())
 
-        # Precompute fp32 vectors + norms so the inner loop is a single
-        # dot per cell.  ``None`` for near-zero norms — propagates to the
-        # cell so the client can render an empty / dimmed square instead
-        # of NaN or a meaningless cosine.  Both sides are forced to CPU
-        # so a cross-device pair (e.g. an actively-steered vector hooked
-        # on MPS vs. a disk-loaded peer on CPU) computes cleanly rather
-        # than raising on the dot — hidden_dim × layer-count is small
-        # enough that the device round-trip is free relative to the
-        # request budget.
+        # Precompute fp32 vectors.  Both sides are forced to CPU so a
+        # cross-device pair (e.g. an actively-steered vector hooked on MPS
+        # vs. a disk-loaded peer on CPU) computes cleanly rather than
+        # raising on the dot — hidden_dim × layer-count is small enough
+        # that the device round-trip is free relative to the request
+        # budget.
         import torch as _torch
-        vecs_a: list[tuple["_torch.Tensor", float]] = []
+        vecs_a: list["_torch.Tensor"] = []
         for L in layers_a:
             v = prof_a[L].float().cpu()
-            n = float(v.norm().item())
-            vecs_a.append((v, n))
-        vecs_b: list[tuple["_torch.Tensor", float]] = []
+            vecs_a.append(v)
+        vecs_b: list["_torch.Tensor"] = []
         for L in layers_b:
             v = prof_b[L].float().cpu()
-            n = float(v.norm().item())
-            vecs_b.append((v, n))
+            vecs_b.append(v)
+
+        # Resolve the whitener (Mahalanobis-only).  ``session.whitener`` is
+        # a lazy property (builds from the neutral-activation cache on first
+        # access).  It must cover every row-layer of ``a`` (each row is
+        # framed in its row-layer's covariance) — there is no Euclidean
+        # fallback, so a missing / non-covering whitener is a 409.
+        whitener = getattr(session, "whitener", None)
+        if whitener is None or not whitener.covers_all(layers_a):
+            raise HTTPException(
+                409,
+                "pairwise compare requires a Mahalanobis whitener covering "
+                f"every row-layer {layers_a} of '{a}'; regenerate the neutral "
+                "activation cache for this model (the Euclidean path is gone)",
+            )
 
         matrix: list[list[float | None]] = []
-        for va, na in vecs_a:
-            row: list[float | None] = []
-            for vb, nb in vecs_b:
-                if na < 1e-12 or nb < 1e-12:
-                    row.append(None)
-                    continue
-                # Different hidden dims would be a model-mismatch bug —
-                # surface as None rather than raising so a misconfigured
-                # pool still renders the cells that *do* line up.
-                if va.shape != vb.shape:
-                    row.append(None)
-                    continue
-                cos = float(_torch.dot(va, vb).item()) / (na * nb)
-                row.append(round(cos, 6))
+        for la, va in zip(layers_a, vecs_a, strict=True):
+            row: list[float | None] = [None] * len(vecs_b)
+            try:
+                si_va = whitener.apply_inv(la, va).float()
+            except Exception:
+                matrix.append(row)
+                continue
+            aa = max(
+                float(_torch.dot(va.reshape(-1), si_va.reshape(-1)).item()),
+                0.0,
+            )
+            if aa < 1e-12:
+                matrix.append(row)
+                continue
+
+            # Batch every compatible B-vector in this row through one
+            # Woodbury application.  Different hidden dims are a
+            # model-mismatch bug; keep those cells empty so a partially
+            # misconfigured pool still renders the cells that line up.
+            b_indices: list[int] = []
+            b_rows: list["_torch.Tensor"] = []
+            for j, vb in enumerate(vecs_b):
+                if va.shape == vb.shape:
+                    b_indices.append(j)
+                    b_rows.append(vb)
+            if not b_rows:
+                matrix.append(row)
+                continue
+
+            block = _torch.stack(b_rows)
+            try:
+                si_block = whitener.apply_inv(la, block).float()
+            except Exception:
+                matrix.append(row)
+                continue
+            bb = (block.reshape(len(b_rows), -1) * si_block.reshape(
+                len(b_rows), -1,
+            )).sum(dim=1).clamp_min(0.0)
+            uv = (block.reshape(len(b_rows), -1) * si_va.reshape(1, -1)).sum(dim=1)
+            denom = (bb * aa).sqrt()
+            valid = denom >= 1e-12
+            cosines = uv / denom.clamp_min(1e-12)
+            for j, ok, cos in zip(b_indices, valid.tolist(), cosines.tolist(), strict=True):
+                if ok:
+                    row[j] = round(float(cos), 6)
             matrix.append(row)
 
         return {
             "a": a,
             "b": b,
+            "metric": "mahalanobis",
             "layers_a": layers_a,
             "layers_b": layers_b,
             "matrix": matrix,
@@ -1452,8 +1286,8 @@ def register_saklas_routes(app: FastAPI) -> None:
         _resolve_session_id(session, session_id)
         try:
             profile = session.load_profile(req.source_path)
-        except FileNotFoundError:
-            raise HTTPException(400, f"file not found: {req.source_path}")
+        except FileNotFoundError as e:
+            raise HTTPException(400, f"file not found: {req.source_path}") from e
         session.steer(req.name, profile)
         return _profile_to_json(req.name, profile)
 
@@ -1477,36 +1311,66 @@ def register_saklas_routes(app: FastAPI) -> None:
         server-side so the client doesn't have to ship full per-layer
         tensors over the wire.
         """
-        from saklas import Profile
-
         _resolve_session_id(session, session_id)
 
-        # Build a unified pool of {name: Profile} covering both registries.
-        # Steering vectors come first (so they win on collision); probe
-        # tensors are wrapped into Profile so the same cosine_similarity
-        # call works for either source.
-        pool: dict[str, "Profile"] = dict(session.vectors)
-        try:
-            probe_profiles = session._monitor.profiles
-            for probe_name in session._monitor.probe_names:
-                if probe_name in pool:
-                    continue
-                tensors = probe_profiles.get(probe_name)
-                if tensors is None:
-                    continue
-                pool[probe_name] = Profile(tensors)
-        except Exception:
-            # Monitor not available — fall back to vectors-only pool.
-            pass
-
+        # Read-side pool of **CPU snapshots**, one per direction (a steering
+        # vector wins a same-named probe, matching the historical dedup).
+        # ``session.analytics_profile`` does the device->host copy once, under
+        # the exclusive-GPU lock, and caches it — so this polled endpoint
+        # never issues an MPS->CPU copy on its threadpool thread that could
+        # race a concurrent model op on PyTorch's single global, non-thread-
+        # safe command buffer (which aborts the whole process).
+        available = session.analytics_names()
         if names is not None and names.strip():
             requested = [n.strip() for n in names.split(",") if n.strip()]
-            missing = [n for n in requested if n not in pool]
+            missing = [n for n in requested if n not in available]
             if missing:
                 raise HTTPException(404, f"names not loaded: {missing}")
             ordered = requested
         else:
-            ordered = sorted(pool.keys())
+            ordered = available
+        # A name whose CPU snapshot isn't ready (a model op currently holds
+        # the GPU) is left out of the pool; its cells render null until a
+        # later poll builds it once the GPU is free.
+        pool: dict[str, "Profile"] = {}
+        for name in ordered:
+            snap = session.analytics_profile(name)
+            if snap is not None:
+                pool[name] = snap
+
+        # Mahalanobis-only: ``cosine_similarity`` requires a whitener
+        # covering each pair's shared layers.  Resolve it once; a missing
+        # whitener is a 409 (regenerate the neutral cache).  A pair the
+        # whitener doesn't fully cover still raises inside the loop and
+        # lands as ``None`` for that cell.
+        whitener = getattr(session, "whitener", None)
+        if whitener is None:
+            raise HTTPException(
+                409,
+                "correlation requires a Mahalanobis whitener; regenerate the "
+                "neutral activation cache for this model (the Euclidean path "
+                "is gone)",
+            )
+
+        # Request-scope Mahalanobis cache.  The old upper-triangle loop called
+        # ``Profile.cosine_similarity`` per pair, which reapplied ``Σ⁻¹`` to
+        # the same profile-layer O(N) times as the dashboard roster grew.
+        # Cache ``(v, Σ⁻¹v, vᵀΣ⁻¹v)`` once per available name/layer and assemble
+        # the symmetric matrix from those factors.
+        import math as _math
+        import torch as _torch
+        white_cache: dict[str, dict[int, tuple[Any, Any, float]]] = {}
+        for name, prof in pool.items():
+            entries: dict[int, tuple[Any, Any, float]] = {}
+            for layer, tensor in prof.items():
+                try:
+                    vec = tensor.float().cpu().reshape(-1)
+                    si_vec = whitener.apply_inv(layer, vec).float().reshape(-1)
+                    norm_sq = max(float(_torch.dot(vec, si_vec).item()), 0.0)
+                except Exception:
+                    continue
+                entries[int(layer)] = (vec, si_vec, norm_sq)
+            white_cache[name] = entries
 
         matrix: dict[str, dict[str, float | None]] = {a: {} for a in ordered}
         layers_shared: dict[str, int] = {}
@@ -1518,23 +1382,36 @@ def register_saklas_routes(app: FastAPI) -> None:
                 if i == j:
                     matrix[a][b] = 1.0
                     continue
-                try:
-                    # ``cosine_similarity`` without ``per_layer=`` returns
-                    # the magnitude-weighted aggregate ``float`` — narrow
-                    # explicitly because the method's union return type
-                    # is ``float | dict[int, float]``.
-                    cos = pool[a].cosine_similarity(pool[b])
-                    matrix[a][b] = (
-                        round(float(cos), 6) if isinstance(cos, (int, float)) else None
-                    )
-                except Exception:
+                if a not in pool or b not in pool:
+                    # Snapshot not ready (GPU busy) — null cell this poll.
                     matrix[a][b] = None
+                    continue
                 shared = sorted(
                     set(pool[a].keys()) & set(pool[b].keys())
                 )
                 # Pair key sorted alphabetically so a__b == b__a in the lookup.
                 key = "__".join(sorted([a, b]))
                 layers_shared[key] = len(shared)
+                if not shared or not whitener.covers_all(shared):
+                    matrix[a][b] = None
+                    continue
+                entries_a = white_cache.get(a, {})
+                entries_b = white_cache.get(b, {})
+                if any(L not in entries_a or L not in entries_b for L in shared):
+                    matrix[a][b] = None
+                    continue
+                num = 0.0
+                den = 0.0
+                for layer in shared:
+                    vec_a, _si_a, aa = entries_a[layer]
+                    _vec_b, si_b, bb = entries_b[layer]
+                    if aa < 1e-12 or bb < 1e-12:
+                        continue
+                    num += float(_torch.dot(vec_a, si_b).item())
+                    den += _math.sqrt(aa * bb)
+                matrix[a][b] = (
+                    round(num / den, 6) if den >= 1e-12 else None
+                )
         return {
             "names": ordered,
             "matrix": matrix,
@@ -1556,164 +1433,90 @@ def register_saklas_routes(app: FastAPI) -> None:
             app.state.default_steering = (
                 _replace(ds, alphas=new_alphas) if new_alphas else None
             )
-        return JSONResponse(status_code=204, content=None)
+        return Response(status_code=204)
 
     @app.post("/saklas/v1/sessions/{session_id}/extract")
     async def extract_vector(session_id: str, req: ExtractRequest, request: Request):
         _resolve_session_id(session, session_id)
-        source: Any = req.source if req.source is not None else req.name
-        source = _coerce_pair_source(source)
+        coerced: Any = _coerce_corpora(
+            req.source if req.source is not None else req.name
+        )
+
+        def _run(on_progress: ProgressCallback) -> tuple[str, Any]:
+            # Two pole corpora -> author + fit directly; a concept name ->
+            # generate the corpora first.  Both land a 2-node ``pca`` manifold.
+            if isinstance(coerced, tuple):
+                positive, negative = coerced
+                return session.extract_vector_from_corpora(
+                    req.name, positive, negative,
+                    on_progress=on_progress,
+                    sae=req.sae, sae_revision=req.sae_revision,
+                    role=req.role, namespace=req.namespace, force=req.force,
+                )
+            return session.extract(
+                coerced, req.baseline,
+                on_progress=on_progress,
+                sae=req.sae, sae_revision=req.sae_revision,
+                role=req.role, namespace=req.namespace, force=req.force,
+            )
 
         accept = request.headers.get("accept", "application/json")
         if "text/event-stream" in accept:
-            async def _sse():
-                # Live streaming: the `on_progress` callback fires from
-                # the worker thread (``session.extract`` runs under
-                # ``asyncio.to_thread``), so we hop each message back to
-                # the loop via ``call_soon_threadsafe`` and drain a
-                # queue here.  The previous shape collected messages
-                # into a list and yielded them only after extraction
-                # finished, which made the SSE stream silent for the
-                # whole multi-minute cold path and burst all events in
-                # one tick right before ``done`` — the client never had
-                # time to render them as live progress.
-                loop = asyncio.get_running_loop()
-                queue: asyncio.Queue[tuple[Any, ...]] = asyncio.Queue()
+            async def _job(on_progress: ProgressCallback) -> dict[str, Any]:
+                canonical, profile = await asyncio.to_thread(_run, on_progress)
+                registry_name = _extract_registry_name(canonical, req.namespace)
+                if req.auto_register:
+                    session.steer(registry_name, profile)
+                return {
+                    "done": True,
+                    "profile": _profile_to_json(registry_name, profile),
+                    "canonical": registry_name,
+                }
 
-                def _on_progress(msg: str) -> None:
-                    loop.call_soon_threadsafe(
-                        queue.put_nowait, ("progress", msg),
-                    )
-
-                async with session.lock:
-                    async def _run() -> None:
-                        try:
-                            canonical, profile = await asyncio.to_thread(
-                                session.extract, source, req.baseline,
-                                on_progress=_on_progress,
-                                sae=req.sae,
-                                sae_revision=req.sae_revision,
-                                method=req.method,
-                                dls=req.dls,
-                            )
-                            if req.auto_register:
-                                session.steer(req.name, profile)
-                            # Yield once so any pending
-                            # ``call_soon_threadsafe`` progress
-                            # callbacks scheduled by the worker drain
-                            # into the queue *before* the terminal
-                            # ``done`` lands.  Without this nudge the
-                            # late-burst progress messages can be
-                            # short-circuited by the SSE generator's
-                            # ``done`` break.
-                            await asyncio.sleep(0)
-                            queue.put_nowait(("done", canonical, profile))
-                        except SaklasError as e:
-                            import logging
-                            logging.getLogger("saklas.api").exception(
-                                "extract failed for session=%s", session_id,
-                            )
-                            queue.put_nowait((
-                                "error",
-                                {
-                                    "message": "extract failed",
-                                    "code": type(e).__name__,
-                                },
-                            ))
-                        except Exception as e:  # noqa: BLE001
-                            # Catch-all so a crash in the worker doesn't
-                            # leave the SSE generator blocked forever on
-                            # ``queue.get()``.  Log + send a generic
-                            # error frame; preserve traceback in logs.
-                            import logging
-                            logging.getLogger("saklas.api").exception(
-                                "extract crashed for session=%s", session_id,
-                            )
-                            queue.put_nowait((
-                                "error",
-                                {
-                                    "message": str(e) or "internal error",
-                                    "code": type(e).__name__,
-                                },
-                            ))
-
-                    task = asyncio.create_task(_run())
-                    try:
-                        while True:
-                            item = await queue.get()
-                            kind = item[0]
-                            if kind == "progress":
-                                yield (
-                                    f"event: progress\n"
-                                    f"data: {json.dumps({'message': item[1]})}\n\n"
-                                )
-                            elif kind == "done":
-                                _, canonical, profile = item
-                                body = {
-                                    "done": True,
-                                    "profile": _profile_to_json(canonical, profile),
-                                    "canonical": canonical,
-                                }
-                                yield (
-                                    f"event: done\n"
-                                    f"data: {json.dumps(body)}\n\n"
-                                )
-                                break
-                            elif kind == "error":
-                                yield (
-                                    f"event: error\n"
-                                    f"data: {json.dumps(item[1])}\n\n"
-                                )
-                                break
-                    finally:
-                        # If the client disconnects mid-stream the
-                        # generator gets cancelled here — make sure the
-                        # worker task is not orphaned.  The underlying
-                        # thread can't be stopped, but the future is.
-                        if not task.done():
-                            task.cancel()
-                            try:
-                                await task
-                            except BaseException:  # noqa: BLE001
-                                pass
-
-            return StreamingResponse(_sse(), media_type="text/event-stream")
+            return progress_sse_response(
+                session.lock,
+                _job,
+                error_message="extract failed",
+                log_message=f"extract failed for session={session_id}",
+            )
 
         progress_msgs: list[str] = []
         async with session.lock:
-            canonical, profile = await asyncio.to_thread(
-                session.extract, source, req.baseline,
-                on_progress=progress_msgs.append,
-                sae=req.sae,
-                sae_revision=req.sae_revision,
-                method=req.method,
-                dls=req.dls,
-            )
+            canonical, profile = await asyncio.to_thread(_run, progress_msgs.append)
+            registry_name = _extract_registry_name(canonical, req.namespace)
             if req.auto_register:
-                session.steer(req.name, profile)
+                session.steer(registry_name, profile)
         return {
-            "canonical": canonical,
-            "profile": _profile_to_json(canonical, profile),
+            "canonical": registry_name,
+            "profile": _profile_to_json(registry_name, profile),
             "progress": progress_msgs,
         }
 
-    @app.post("/saklas/v1/sessions/{session_id}/vectors/merge")
-    async def merge_vector(session_id: str, req: MergeVectorRequest):
-        """Merge an expression of installed vectors into a new local pack.
+    @app.post("/saklas/v1/sessions/{session_id}/vectors/bake")
+    async def bake_vector(session_id: str, req: BakeVectorRequest):
+        """Merge an expression of installed directions into a baked manifold.
 
-        Wraps :func:`saklas.io.merge.merge_into_pack` (model-scoped to
-        the session's loaded model), then loads the merged tensor into
-        ``session._profiles`` so it's immediately steerable. Returns the
-        same profile-JSON shape ``GET /vectors/{name}`` produces.
+        Wraps :func:`saklas.io.merge.merge_into_manifold` (model-scoped to
+        the session's loaded model) — the merge lands a corpus-less
+        ``fit_mode="baked"`` manifold — then folds the fitted tensor back to a
+        steering Profile and registers it so it's immediately steerable.
+        Returns the same profile-JSON shape ``GET /vectors/{name}`` produces.
         """
-        from saklas.io.merge import merge_into_pack, MergeError
+        from saklas.io.merge import merge_into_manifold, MergeError
         from saklas.io.paths import tensor_filename
+        from saklas.core.manifold import load_manifold
+        from saklas.core.vectors import folded_vector_directions
+        from saklas.server.manifold_routes import _refuse_if_busy
         _resolve_session_id(session, session_id)
 
         async with session.lock:
+            # Refuse (409) while an in-flight extract holds the engine
+            # gen-lock — parity with the manifold mutating routes, so a
+            # merge can't race a concurrent extraction.
+            _refuse_if_busy(session)
             try:
                 dst_folder = await asyncio.to_thread(
-                    merge_into_pack,
+                    merge_into_manifold,
                     req.name,
                     req.expression,
                     session.model_id,
@@ -1729,98 +1532,20 @@ def register_saklas_routes(app: FastAPI) -> None:
                     500,
                     f"merge produced no tensor for {session.model_id} at {tensor_path}",
                 )
-            profile = await asyncio.to_thread(session.load_profile, str(tensor_path))
+
+            def _load_folded() -> Profile:
+                manifold = load_manifold(str(tensor_path))
+                return Profile(folded_vector_directions(manifold))
+
+            profile = await asyncio.to_thread(_load_folded)
             session.steer(req.name, profile)
         return _profile_to_json(req.name, profile)
-
-    @app.post("/saklas/v1/sessions/{session_id}/vectors/clone")
-    async def clone_vector(session_id: str, req: CloneVectorRequest, request: Request):
-        """Corpus-based persona clone, optionally streamed via SSE.
-
-        Mirrors :meth:`SaklasSession.clone_from_corpus`. JSON when the
-        client sends ``Accept: application/json`` (default); SSE
-        progress when ``Accept: text/event-stream`` — same shape as
-        the ``/extract`` endpoint, except clone has no native progress
-        stream so the only events emitted are ``done`` / ``error``.
-        """
-        _resolve_session_id(session, session_id)
-
-        accept = request.headers.get("accept", "application/json")
-        wants_sse = "text/event-stream" in accept
-
-        def _do_clone() -> tuple[str, "Profile"]:
-            return session.clone_from_corpus(
-                req.corpus_path,
-                req.name,
-                n_pairs=req.n_pairs,
-                seed=req.seed,
-            )
-
-        if wants_sse:
-            async def _sse():
-                async with session.lock:
-                    try:
-                        canonical, profile = await asyncio.to_thread(_do_clone)
-                    except FileNotFoundError:
-                        # Don't surface ``str(e)`` — Python's "No such file
-                        # or directory: '<path>'" leaks server-side
-                        # filesystem layout.  Echo the request's own
-                        # ``corpus_path`` instead so the client gets a
-                        # useful 404 without any traceback content.
-                        err = {
-                            "message": f"corpus not found: {req.corpus_path}",
-                            "code": "FileNotFoundError",
-                        }
-                        yield f"event: error\ndata: {json.dumps(err)}\n\n"
-                        return
-                    except SaklasError as e:
-                        import logging
-                        logging.getLogger("saklas.api").exception(
-                            "clone failed for session=%s", session_id,
-                        )
-                        err = {"message": "clone failed", "code": type(e).__name__}
-                        yield f"event: error\ndata: {json.dumps(err)}\n\n"
-                        return
-                    except Exception as e:
-                        # Don't surface ``str(e)`` — Python exception messages
-                        # routinely echo paths, traceback fragments, or vendor
-                        # error text that we don't want flowing to a remote
-                        # caller.  Log the full traceback server-side and
-                        # return a generic shape that mirrors the SaklasError
-                        # branch above.
-                        import logging
-                        logging.getLogger("saklas.api").exception(
-                            "clone failed for session=%s", session_id,
-                        )
-                        err = {"message": "clone failed", "code": type(e).__name__}
-                        yield f"event: error\ndata: {json.dumps(err)}\n\n"
-                        return
-                    session.steer(req.name, profile)
-                    body = {
-                        "done": True,
-                        "canonical": canonical,
-                        "profile": _profile_to_json(req.name, profile),
-                    }
-                    yield f"event: done\ndata: {json.dumps(body)}\n\n"
-
-            return StreamingResponse(_sse(), media_type="text/event-stream")
-
-        async with session.lock:
-            try:
-                canonical, profile = await asyncio.to_thread(_do_clone)
-            except FileNotFoundError as e:
-                raise HTTPException(404, str(e))
-            session.steer(req.name, profile)
-        return {
-            "canonical": canonical,
-            "profile": _profile_to_json(req.name, profile),
-        }
 
     @app.get("/saklas/v1/sessions/{session_id}/vectors/{name}/diagnostics")
     def vector_diagnostics(session_id: str, name: str):
         """Per-layer ``||baked||`` histogram + diagnostics for a registered vector.
 
-        Mirrors what ``saklas vector why <concept> -m MODEL --json`` produces:
+        Mirrors what ``saklas manifold why <concept> -m MODEL --json`` produces:
         a 16-bucket layer-magnitude histogram plus the ``diagnostics_by_layer``
         / ``diagnostics_summary`` block when the profile carries them.
         Drives the WHY-histogram strip in the web UI's probe rack.
@@ -1829,15 +1554,18 @@ def register_saklas_routes(app: FastAPI) -> None:
         from saklas.core.histogram import HIST_BUCKETS, bucketize
 
         _resolve_session_id(session, session_id)
-        # Probes and steering vectors share the Profile shape but live in
-        # different registries — session.vectors holds steering profiles,
-        # session._monitor.profiles holds probe profiles.  The diagnostics
-        # endpoint serves either; the layer-norms drawer overlay in the
-        # web UI hits this for every selected name (vector or probe).
+        # Probes and steering vectors share the per-layer ``dict[int,
+        # Tensor]`` direction shape but live in different registries —
+        # session.vectors holds steering profiles; a vector probe lives as a
+        # flat manifold in ``session._monitor`` and folds back to the same
+        # baked-direction view via ``_probe_profile_tensors``.  The
+        # diagnostics endpoint serves either; the layer-norms drawer overlay
+        # in the web UI hits this for every selected name (vector or probe).
         profile = session.vectors.get(name)
         if profile is None:
             try:
-                profile = session._monitor.profiles.get(name)
+                folded = _probe_profile_tensors(session, name)
+                profile = Profile(folded) if folded is not None else None
             except Exception:
                 profile = None
         if profile is None:
@@ -1845,18 +1573,18 @@ def register_saklas_routes(app: FastAPI) -> None:
 
         layer_mags: list[tuple[int, float]] = sorted(
             ((layer, float(vec.norm().item())) for layer, vec in profile.items()),
-            key=lambda kv: kv[0],
+            key=itemgetter(0),
         )
         buckets = bucketize(layer_mags, HIST_BUCKETS)
         # Buckets: ``(lo_layer, hi_layer, mean_norm)`` triples — same shape the
-        # CLI ``vector why`` text path renders, JSON-friendly here.
+        # CLI ``manifold why`` text path renders, JSON-friendly here.
         bucket_payload = [
             {"lo": lo, "hi": hi, "mean_norm": round(mag, 6)}
             for lo, hi, mag in buckets
         ]
 
-        # ``diagnostics`` is a Profile attribute; probe profiles are raw
-        # ``dict[int, Tensor]`` and don't carry it.  ``getattr`` covers both.
+        # ``diagnostics`` is a Profile attribute; a probe folded from its
+        # manifold carries no ``diagnostics`` block.  ``getattr`` covers both.
         diagnostics = getattr(profile, "diagnostics", None)
         # ``total_layers`` is the *model's* layer count, not the profile's
         # — the layer-norms drawer in the web UI fills layers absent from
@@ -1886,205 +1614,16 @@ def register_saklas_routes(app: FastAPI) -> None:
             payload["diagnostics_summary"] = _summarize_diagnostics(diagnostics)
         return payload
 
-    # ----- probes --------------------------------------------------------
+    # ----- probes / experiments / live traits ----------------------------
 
-    @app.get("/saklas/v1/sessions/{session_id}/probes")
-    def list_probes(session_id: str):
-        _resolve_session_id(session, session_id)
-        names = sorted(session.probes.keys())
-        return {"probes": [_probe_info(session, n) for n in names]}
+    from saklas.server.probe_routes import register_probe_routes
+    register_probe_routes(app)
 
-    @app.get("/saklas/v1/sessions/{session_id}/probes/defaults")
-    def list_default_probes(session_id: str):
-        _resolve_session_id(session, session_id)
-        return {"defaults": load_defaults()}
+    from saklas.server.experiment_routes import register_experiment_routes
+    register_experiment_routes(app)
 
-    @app.post("/saklas/v1/sessions/{session_id}/probes/{name}", status_code=204)
-    def activate_probe(session_id: str, name: str):
-        _resolve_session_id(session, session_id)
-        try:
-            session.probe(name)
-        except (KeyError, ValueError, FileNotFoundError) as e:
-            raise HTTPException(400, f"probe '{name}' not available: {e}")
-        return JSONResponse(status_code=204, content=None)
-
-    @app.delete("/saklas/v1/sessions/{session_id}/probes/{name}", status_code=204)
-    def deactivate_probe(session_id: str, name: str):
-        _resolve_session_id(session, session_id)
-        if name not in session.probes:
-            raise HTTPException(404, f"probe '{name}' not active")
-        session.unprobe(name)
-        return JSONResponse(status_code=204, content=None)
-
-    @app.post("/saklas/v1/sessions/{session_id}/probe")
-    async def score_probe_oneshot(session_id: str, req: ScoreProbeRequest):
-        _resolve_session_id(session, session_id)
-        requested = req.probes
-        monitor = session._monitor
-        if requested:
-            missing = [n for n in requested if n not in monitor.probe_names]
-            if missing:
-                raise HTTPException(400, f"probes not active: {missing}")
-
-        async with session.lock:
-            readings = await asyncio.to_thread(
-                monitor.measure, session._model, session._tokenizer,
-                session._layers, req.text,
-            )
-        if requested:
-            readings = {k: v for k, v in readings.items() if k in requested}
-        return {"readings": {k: float(v) for k, v in readings.items()}}
-
-    # ----- Experiments ------------------------------------------------------
-
-    @app.post("/saklas/v1/sessions/{session_id}/experiments/fan")
-    async def run_experiment_fan(session_id: str, req: ExperimentFanRequest):
-        """Run an alpha grid as loom siblings and return a RunSet summary."""
-        _resolve_session_id(session, session_id)
-
-        if not req.grid:
-            raise HTTPException(400, "grid must be non-empty")
-        for name, alphas in req.grid.items():
-            if not alphas:
-                raise HTTPException(400, f"grid['{name}'] must be non-empty")
-        sampling_cfg = _build_sampling(req.sampling)
-
-        async with acquire_session_lock(session) as acquired:
-            if not acquired:
-                raise HTTPException(503, "session locked")
-            runset = await asyncio.to_thread(
-                session.generate_sweep,
-                req.prompt,
-                req.grid,
-                base_steering=req.base_steering,
-                sampling=sampling_cfg,
-                thinking=req.thinking,
-                stateless=False,
-                raw=req.raw,
-            )
-        rows = []
-        for idx, result in enumerate(runset):
-            readings_summary: dict[str, float] = {}
-            for probe_name, r in (getattr(result, "readings", {}) or {}).items():
-                pg = getattr(r, "per_generation", None)
-                val = pg[-1] if pg else getattr(r, "mean", 0.0)
-                readings_summary[probe_name] = round(float(val), 6)
-            rows.append({
-                "idx": idx,
-                "alpha_values": runset.grid[idx] if idx < len(runset.grid) else {},
-                "node_id": runset.node_ids[idx] if idx < len(runset.node_ids) else None,
-                "result": {
-                    "text": result.text,
-                    "token_count": result.token_count,
-                    "tok_per_sec": result.tok_per_sec,
-                    "elapsed": result.elapsed,
-                    "finish_reason": result.finish_reason,
-                    "applied_steering": result.applied_steering,
-                    "readings": readings_summary,
-                },
-            })
-        return {
-            "kind": runset.kind,
-            "total": len(runset),
-            "node_ids": runset.node_ids,
-            "rows": rows,
-        }
-
-    # ----- Live traits SSE stream ------------------------------------------
-
-    @app.get("/saklas/v1/sessions/{session_id}/traits/stream")
-    async def traits_stream(session_id: str, request: Request):
-        """SSE endpoint streaming per-token probe scores during generation.
-
-        Events:
-          - ``data: {"type": "start", ...}`` when generation begins
-          - ``data: {"type": "token", "idx": N, "text": "...", "thinking": bool, "probes": {...}}``
-          - ``data: {"type": "done", "finish_reason": "...", "aggregate": {...}}``
-          - ``: heartbeat`` every 15 s when idle
-
-        The stream stays open across generations; a client can subscribe
-        once and observe every generation the session runs.
-        """
-        _resolve_session_id(session, session_id)
-
-        from saklas.core.events import GenerationStarted, GenerationFinished
-
-        loop = asyncio.get_running_loop()
-        trait_queue: asyncio.Queue[Any] = asyncio.Queue()
-
-        # EventBus callback: push start/done into the same queue as tokens.
-        def _on_event(event: object) -> None:
-            if isinstance(event, GenerationStarted):
-                try:
-                    loop.call_soon_threadsafe(
-                        trait_queue.put_nowait,
-                        ("start", getattr(event, "input", None), getattr(event, "stateless", False)),
-                    )
-                except Exception:
-                    pass
-            elif isinstance(event, GenerationFinished):
-                try:
-                    loop.call_soon_threadsafe(
-                        trait_queue.put_nowait,
-                        ("done", getattr(event, "result", None)),
-                    )
-                except Exception:
-                    pass
-
-        unsub = session.events.subscribe(_on_event)
-        session.register_trait_queue(loop, trait_queue)
-
-        async def event_generator():
-            try:
-                generation_id: str | None = None
-                while True:
-                    if await request.is_disconnected():
-                        break
-                    try:
-                        item = await asyncio.wait_for(trait_queue.get(), timeout=15.0)
-                    except asyncio.TimeoutError:
-                        yield ": heartbeat\n\n"
-                        continue
-
-                    tag = item[0]
-                    if tag == "start":
-                        generation_id = uuid.uuid4().hex[:8]
-                        yield (
-                            f"data: {json.dumps({'type': 'start', 'generation_id': generation_id})}"
-                            "\n\n"
-                        )
-                    elif tag == "token":
-                        _, idx, text, thinking, scores = item
-                        yield (
-                            f"data: {json.dumps({'type': 'token', 'idx': idx, 'text': text, 'thinking': thinking, 'probes': {k: round(v, 6) for k, v in scores.items()}})}"
-                            "\n\n"
-                        )
-                    elif tag == "done":
-                        result = item[1]
-                        agg: dict[str, float] = {}
-                        if result is not None:
-                            readings = getattr(result, "readings", None)
-                            if readings:
-                                for name, r in readings.items():
-                                    # Use this generation's aggregate, not the
-                                    # rolling history mean.
-                                    pg = getattr(r, "per_generation", None)
-                                    val = pg[-1] if pg else getattr(r, "mean", 0.0)
-                                    agg[name] = round(val, 6)
-                        yield (
-                            f"data: {json.dumps({'type': 'done', 'generation_id': generation_id, 'finish_reason': getattr(result, 'finish_reason', 'stop') if result else 'stop', 'aggregate': agg})}"
-                            "\n\n"
-                        )
-                        generation_id = None
-            finally:
-                session.unregister_trait_queue(loop, trait_queue)
-                unsub()
-
-        return StreamingResponse(
-            event_generator(),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
-        )
+    from saklas.server.traits_routes import register_traits_routes
+    register_traits_routes(app)
 
     # ----- WebSocket token+probe co-stream -------------------------------
 
@@ -2150,6 +1689,10 @@ def register_saklas_routes(app: FastAPI) -> None:
             async with ws_send_lock:
                 await websocket.send_json(payload)
 
+        def _queue_tree_event(payload: dict[str, Any]) -> None:
+            with suppress(Exception):
+                loop.call_soon_threadsafe(tree_event_queue.put_nowait, payload)
+
         def _on_loom_event(event: object) -> None:
             if not isinstance(event, LoomMutated):
                 return
@@ -2175,12 +1718,7 @@ def register_saklas_routes(app: FastAPI) -> None:
                 ],
                 "active_node_id": event.active_node_id,
             }
-            try:
-                loop.call_soon_threadsafe(
-                    tree_event_queue.put_nowait, mutated_payload,
-                )
-            except Exception:
-                pass
+            _queue_tree_event(mutated_payload)
             # ``begin_assistant`` and ``branch`` both materialize a new
             # node — surface a separate ``node_created`` event with the
             # parent + role so the client can allocate a render slot
@@ -2198,12 +1736,7 @@ def register_saklas_routes(app: FastAPI) -> None:
                         "role": node.role,
                         "rev": event.rev,
                     }
-                    try:
-                        loop.call_soon_threadsafe(
-                            tree_event_queue.put_nowait, node_payload,
-                        )
-                    except Exception:
-                        pass
+                    _queue_tree_event(node_payload)
 
         loom_unsub = session.events.subscribe(_on_loom_event)
 
@@ -2227,9 +1760,24 @@ def register_saklas_routes(app: FastAPI) -> None:
 
         forwarder_task = asyncio.create_task(_tree_forwarder())
 
+        deferred_incoming: deque[Any] = deque()
+
+        async def _cancel_and_wait(task: asyncio.Task[Any]) -> None:
+            task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await task
+
+        def _stop_session_safely() -> None:
+            with suppress(Exception):
+                session.stop()
+
         try:
             while True:
-                msg = await incoming.get()
+                msg = (
+                    deferred_incoming.popleft()
+                    if deferred_incoming
+                    else await incoming.get()
+                )
                 if msg is _DISCONNECT:
                     raise WebSocketDisconnect(code=1000)
                 if isinstance(msg, dict) and "_reader_error" in msg:
@@ -2247,8 +1795,8 @@ def register_saklas_routes(app: FastAPI) -> None:
                         })
                         continue
                     await _ws_handle_generate(
-                        websocket, session, parsed,
-                        app.state.default_steering, incoming, _send_json,
+                        session, parsed, app.state.default_steering, incoming,
+                        deferred_incoming, _send_json,
                     )
                 elif mtype == "stop":
                     # Idle-state stop: nothing in flight.
@@ -2261,10 +1809,7 @@ def register_saklas_routes(app: FastAPI) -> None:
                     })
         except WebSocketDisconnect:
             # Ensure any stray generation is signaled.
-            try:
-                session.stop()
-            except Exception:
-                pass
+            _stop_session_safely()
             return
         except Exception as e:
             try:
@@ -2274,39 +1819,27 @@ def register_saklas_routes(app: FastAPI) -> None:
                     "code": type(e).__name__,
                 })
             finally:
-                try:
+                with suppress(Exception):
                     await websocket.close(code=1011)
-                except Exception:
-                    pass
         finally:
             # Drop the loom subscription before tearing down the reader
             # so the EventBus stops dispatching into a queue nobody
             # reads.
-            try:
+            with suppress(Exception):
                 loom_unsub()
-            except Exception:
-                pass
-            forwarder_task.cancel()
-            try:
-                await forwarder_task
-            except (asyncio.CancelledError, Exception):
-                pass
+            await _cancel_and_wait(forwarder_task)
             # Reader holds the only ``receive_json()`` call on the WS.
             # Cancel + await so the cancellation propagates fully before
             # the connection tears down.
-            reader_task.cancel()
-            try:
-                await reader_task
-            except (asyncio.CancelledError, Exception):
-                pass
+            await _cancel_and_wait(reader_task)
 
 
 async def _ws_handle_generate(
-    websocket: WebSocket,
     session: SaklasSession,
     msg: WSGenerateMessage,
     default_steering: "Steering | None",
     incoming: asyncio.Queue[Any],
+    deferred_incoming: "deque[Any]",
     send_json: Callable[[Any], Awaitable[None]],
 ) -> None:
     """Run one generate turn and stream token/done/error events.
@@ -2471,13 +2004,27 @@ async def _ws_handle_generate(
             "sibling_index": 0,
             "sibling_count": 1,
         })
+        # Per-message role labels ride the commit's sampling block too
+        # (roleplay scaffold).  Raw / flat commits carry no chat-template
+        # role, so labels are suppressed there.
+        commit_user_role = (
+            msg.sampling.user_role if msg.sampling is not None else None
+        ) or None
+        commit_asst_role = (
+            msg.sampling.assistant_role if msg.sampling is not None else None
+        ) or None
         async with session.lock:
             try:
                 if msg.commit_role == "user":
+                    # ``raw`` flags a flat (base-model) commit — the
+                    # authored span may hang under a node of any role,
+                    # so the user-under-user guard is lifted.
                     new_id = await asyncio.to_thread(
                         session.append_user_turn,
                         parent_node_id,
                         commit_text,
+                        allow_any_parent=msg.raw,
+                        role_label=None if msg.raw else commit_user_role,
                     )
                 else:
                     # ``parent_node_id`` is non-None here (validated above
@@ -2487,6 +2034,7 @@ async def _ws_handle_generate(
                         session.append_assistant_turn,
                         parent_node_id,
                         commit_text,
+                        role_label=None if msg.raw else commit_asst_role,
                     )
             except SaklasError as e:
                 status, message = e.user_message()
@@ -2523,10 +2071,11 @@ async def _ws_handle_generate(
     from saklas.core.loom import derive_seed_schedule
     base_seed = sampling.seed if sampling is not None else None
     seeds: list[int | None]
-    if n == 1:
-        seeds = [base_seed]
-    else:
-        seeds = list(derive_seed_schedule(base_seed, n))  # type: ignore[arg-type]
+    seeds = [base_seed] if n == 1 else list(derive_seed_schedule(base_seed, n))
+
+    def _stop_session_safely() -> None:
+        with suppress(Exception):
+            session.stop()
 
     # Acquire the session lock for the full N-way batch lifetime so
     # concurrent WS clients serialize FIFO instead of overlapping.
@@ -2562,90 +2111,21 @@ async def _ws_handle_generate(
                 top_alts: list[Any] | None,
                 perplexity: float | None = None,
                 _node_holder: list[str | None] = current_node_holder,
+                _token_queue: asyncio.Queue[Any] = token_queue,
             ) -> None:
-                # Resolve the streaming assistant node id once per token;
-                # cheap (one attribute read) and avoids racing the tree
-                # mutation that adds the assistant node before the first
-                # token fires.
-                node_id = _node_holder[0]
-                if node_id is None:
-                    try:
-                        candidate = session.tree.active_node_id
-                        # Defensive coerce: tests may pass a Mock-shaped
-                        # ``session`` whose ``tree.active_node_id`` is
-                        # not a string.  Treat anything non-string as
-                        # "no node" so the JSON encoder doesn't choke.
-                        if isinstance(candidate, str):
-                            node_id = candidate
-                            _node_holder[0] = candidate
-                    except Exception:
-                        node_id = None
-                event: dict[str, Any] = {
-                    "type": "token",
-                    "text": text,
-                    "thinking": bool(is_thinking),
-                    "token_id": int(tid) if tid is not None else None,
-                    "node_id": node_id,
-                }
-                # Phase 1 logit pass: surface chosen-token logprob + top-K
-                # alternatives on the wire so webui drilldown / inline
-                # surprise / NodeCompare can render distributional info
-                # without a second fetch. Both fields are None when the
-                # engine didn't capture them (no on_token consumer + no
-                # logprobs / return_top_k request); subscribers ``?? null``-
-                # guard so legacy / unconfigured streams pass through
-                # cleanly. ``top_alts`` items are TokenAlt dataclasses;
-                # serialize each to ``{id, text, logprob}`` for JSON.
-                if lp is not None:
-                    event["logprob"] = float(lp)
-                if top_alts:
-                    event["top_alts"] = [
-                        {"id": int(a.id), "text": a.text, "logprob": float(a.logprob)}
-                        for a in top_alts
-                    ]
-                # Raw decode-step index of this emitted token — the join
-                # key a logit fork slices ``raw_token_ids`` on.  Read off
-                # ``emit_map`` (appended immediately before this callback
-                # fires).  Best-effort: a mocked session has no gen state.
-                try:
-                    emap = session._gen_state.emit_map
-                    if emap:
-                        event["raw_index"] = int(emap[-1][0])
-                except Exception:
-                    pass
-                # Inline probe scores for the live inspector + chat
-                # highlight.  ``scores`` is the magnitude-weighted aggregate
-                # per probe — the webui tints tokens with this so live
-                # highlighting matches the post-generation pass.
-                # ``per_layer_scores`` is the per-layer heatmap the token
-                # drilldown drawer needs.
-                #
-                # Both are computed and persisted onto the loom row by
-                # ``session._token_tap`` (engine-side) before this WS
-                # callback fires; we read them back off the row rather
-                # than recomputing.  Single source of truth: the persisted
-                # row is what a webui refresh rehydrates from, so the live
-                # stream and the rehydrated tree match by construction.
-                try:
-                    node = (
-                        session.tree.nodes.get(node_id) if node_id else None
-                    )
-                    rows = (
-                        node.thinking_tokens if is_thinking else node.tokens
-                    ) if node is not None else None
-                    last = rows[-1] if rows else None
-                    if last is not None:
-                        probes_blob = last.get("probes")
-                        if probes_blob:
-                            event["scores"] = probes_blob
-                        per_layer_blob = last.get("per_layer_scores")
-                        if per_layer_blob:
-                            event["per_layer_scores"] = per_layer_blob
-                except Exception:
-                    # Inspector data is best-effort — never let a failure
-                    # here break the streaming token path.
-                    pass
-                loop.call_soon_threadsafe(token_queue.put_nowait, event)
+                event = build_token_event(
+                    session,
+                    _node_holder,
+                    text=text,
+                    is_thinking=is_thinking,
+                    tid=tid,
+                    lp=lp,
+                    top_alts=top_alts,
+                )
+                loop.call_soon_threadsafe(_token_queue.put_nowait, event)
+            _on_token_flags: Any = _on_token
+            _on_token_flags._saklas_wants_live_scores = True
+            _on_token_flags._saklas_wants_per_layer_scores = True
 
             result_holder: list[GenerationResult | RunSet] = []
             error_holder: list[BaseException] = []
@@ -2659,14 +2139,14 @@ async def _ws_handle_generate(
             recipe_override = msg.recipe_override
 
             def _worker(
-                _sampling=per_sibling_sampling,
-                _on_token=_on_token,
-                _result_holder=result_holder,
-                _error_holder=error_holder,
-                _token_queue=token_queue,
-                _sentinel=_SENTINEL,
-                _recipe_override=recipe_override,
-            ):
+                _sampling: SamplingConfig | None = per_sibling_sampling,
+                _on_token: Callable[..., Any] = _on_token,
+                _result_holder: list[GenerationResult | RunSet] = result_holder,
+                _error_holder: list[BaseException] = error_holder,
+                _token_queue: asyncio.Queue[Any] = token_queue,
+                _sentinel: object = _SENTINEL,
+                _recipe_override: Any = recipe_override,
+            ) -> None:
                 try:
                     if msg.fork_node_id is not None:
                         # Fork: recipe / sampling / parent all come from
@@ -2674,8 +2154,8 @@ async def _ws_handle_generate(
                         # WS-level steering/sampling/n fields are ignored.
                         result = session.fork_from_token(
                             msg.fork_node_id,
-                            int(msg.fork_raw_index),  # type: ignore[arg-type]
-                            int(msg.fork_alt_token_id),  # type: ignore[arg-type]
+                            int(msg.fork_raw_index),  # pyright: ignore[reportArgumentType]  # guarded non-None by is_fork check above; int() accepts int|None only at runtime with None already excluded
+                            int(msg.fork_alt_token_id),  # pyright: ignore[reportArgumentType]  # guarded non-None by is_fork check above; int() accepts int|None only at runtime with None already excluded
                             on_token=_on_token,
                         )
                     elif msg.prefill_node_id is not None:
@@ -2692,15 +2172,15 @@ async def _ws_handle_generate(
                             on_token=_on_token,
                         )
                     else:
-                        gen_kwargs: dict[str, Any] = dict(
-                            steering=steering,
-                            sampling=_sampling,
-                            stateless=msg.stateless,
-                            raw=msg.raw,
-                            thinking=msg.thinking,
-                            on_token=_on_token,
-                            parent_node_id=parent_node_id,
-                        )
+                        gen_kwargs: dict[str, Any] = {
+                            "steering": steering,
+                            "sampling": _sampling,
+                            "stateless": msg.stateless,
+                            "raw": msg.raw,
+                            "thinking": msg.thinking,
+                            "on_token": _on_token,
+                            "parent_node_id": parent_node_id,
+                        }
                         if _recipe_override is not None:
                             gen_kwargs["recipe_override"] = _recipe_override
                         result = session.generate(msg.input, **gen_kwargs)
@@ -2736,7 +2216,7 @@ async def _ws_handle_generate(
                 while not done:
                     token_get = asyncio.create_task(token_queue.get())
                     client_get = asyncio.create_task(incoming.get())
-                    finished, _pending = await asyncio.wait(
+                    finished, pending = await asyncio.wait(
                         {token_get, client_get}, return_when=asyncio.FIRST_COMPLETED,
                     )
                     if client_get in finished:
@@ -2747,45 +2227,42 @@ async def _ws_handle_generate(
                         # iteration.
                         if isinstance(incoming_msg, dict):
                             if incoming_msg.get("type") == "stop":
-                                try:
-                                    session.stop()
-                                except Exception:
-                                    pass
+                                _stop_session_safely()
                                 stop_signaled = True
                             elif "_reader_error" in incoming_msg:
-                                try:
-                                    session.stop()
-                                except Exception:
-                                    pass
+                                _stop_session_safely()
                                 stop_signaled = True
-                                # Re-enqueue so the outer dispatch loop
+                                # Defer so the outer dispatch loop
                                 # surfaces the error after we wind down.
-                                await incoming.put(incoming_msg)
+                                deferred_incoming.append(incoming_msg)
                             else:
                                 # Out-of-band frame during a generation —
-                                # re-enqueue so the outer loop sees it
+                                # defer so the outer loop sees it
                                 # after this turn finishes.  Most likely
                                 # an early ``{type: "generate"}`` from a
                                 # client that didn't wait for ``done``.
-                                await incoming.put(incoming_msg)
+                                #
+                                # Do not put it back on ``incoming`` here:
+                                # the next loop iteration would consume it
+                                # immediately, cancel token_queue.get(), and
+                                # spin until the worker happened to have a
+                                # token already queued.
+                                deferred_incoming.append(incoming_msg)
                         else:
                             # Disconnect sentinel from the reader.
-                            try:
-                                session.stop()
-                            except Exception:
-                                pass
+                            _stop_session_safely()
                             stop_signaled = True
-                            await incoming.put(incoming_msg)
-                    else:
-                        client_get.cancel()
+                            deferred_incoming.append(incoming_msg)
                     if token_get in finished:
                         item = token_get.result()
                         if item is _SENTINEL:
                             done = True
                         else:
                             await send_json(item)
-                    else:
-                        token_get.cancel()
+                    for task in pending:
+                        task.cancel()
+                    if pending:
+                        await asyncio.gather(*pending, return_exceptions=True)
             finally:
                 # Drain any residual events the worker pushed between
                 # sentinel and join — should be none because the
@@ -2811,6 +2288,16 @@ async def _ws_handle_generate(
                 result_json["per_token_probes"] = _per_token_probes(
                     session, getattr(result, "token_count", 0) or 0,
                 )
+                # Per-attached-manifold-probe aggregate readings ride on
+                # the ``done`` event so a WS client picks up the
+                # geometric channel alongside the existing vector-probe
+                # ``per_token_probes`` block.  Empty dict when no
+                # manifold probe is attached.
+                mf_readings = getattr(result, "probe_readings", None) or {}
+                if mf_readings:
+                    result_json["probe_readings"] = {
+                        k: v.to_dict() for k, v in mf_readings.items()
+                    }
             else:
                 result_json["per_token_probes"] = []
             # Phase 1 logit pass: stamp the per-turn logprob rollup on the

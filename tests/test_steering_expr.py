@@ -6,10 +6,13 @@ isolated SAKLAS_HOME with no packs installed.
 """
 from __future__ import annotations
 
+from collections.abc import Generator
+from pathlib import Path
+
 import pytest
 
 from saklas.io import selectors as sel
-from saklas.io import packs
+from saklas.io.manifolds import create_discover_manifold_folder
 from saklas.core.steering import Steering
 from saklas.core.steering_expr import (
     ProjectedTerm,
@@ -22,24 +25,38 @@ from saklas.core.triggers import Trigger
 
 
 @pytest.fixture(autouse=True)
-def _isolated_home(monkeypatch, tmp_path):
+def _isolated_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Generator[None, None, None]:
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     sel.invalidate()
     yield
     sel.invalidate()
 
 
-def _mk(tmp_path, ns, name, tags=None):
-    d = tmp_path / "vectors" / ns / name
-    d.mkdir(parents=True)
-    (d / "statements.json").write_text("[]")
-    meta = packs.PackMetadata(
-        name=name, description="x", version="1.0.0", license="MIT",
-        tags=tags or [], recommended_alpha=0.5, source="local",
-        files={"statements.json": packs.hash_file(d / "statements.json")},
+def _mk(tmp_path: Path, ns: str, name: str, tags: list[str] | None = None) -> Path:
+    """Author an installed concept as a 2-node ``pca`` manifold (4.0).
+
+    A bipolar composite name (``deer.wolf``) becomes a manifold whose two
+    node labels are the poles (``deer``/``wolf``), so a bare pole resolves
+    through the manifold tier (``resolve_manifold_label`` /
+    ``resolve_manifold_name``); a plain name gets generic ``pos``/``neg``
+    nodes.  ``tags`` are patched into ``manifold.json``.
+    """
+    if "." in name:
+        pos, neg = name.split(".", 1)
+        node_corpora = {pos: ["a statement."], neg: ["b statement."]}
+    else:
+        node_corpora = {"pos": ["a statement."], "neg": ["b statement."]}
+    folder = create_discover_manifold_folder(
+        ns, name, "x", fit_mode="pca",
+        node_corpora=node_corpora, hyperparams={"max_dim": 1},
     )
-    meta.write(d)
-    return d
+    if tags:
+        import json
+        mpath = folder / "manifold.json"
+        data = json.loads(mpath.read_text())
+        data["tags"] = list(tags)
+        mpath.write_text(json.dumps(data))
+    return folder
 
 
 # -------------------------------------------------------------- basic ---
@@ -135,18 +152,24 @@ def test_namespace_with_bipolar():
     assert s.alphas == {"bob/deer.wolf": 0.3}
 
 
-def test_namespace_disambiguates_collision(tmp_path):
-    # Two packs sharing a concept name across namespaces — the parser
-    # must keep the user's explicit ``alice/`` / ``bob/`` prefix in the
-    # alphas key so each pack ends up at a distinct registry slot.
-    # Pre-fix this case raised ``AmbiguousSelectorError`` from the
-    # session's pole-resolution second pass because the namespace was
-    # dropped at parse time.
+def test_namespace_disambiguates_collision(tmp_path: Path) -> None:
+    # Two concepts sharing a name across namespaces — the parser must keep
+    # the user's explicit ``alice/`` / ``bob/`` prefix so each lands at a
+    # distinct registry slot.  4.0: a 2-node ``pca`` manifold name resolves
+    # through the composite-name tier to its node-0 (+) pole, so each term
+    # becomes a ``ManifoldTerm`` keyed ``<ns>/shared%pos`` — still distinct
+    # per namespace, which is the behavior under test.
+    from saklas.core.steering_expr import ManifoldTerm
     _mk(tmp_path, "alice", "shared", tags=[])
     _mk(tmp_path, "bob", "shared", tags=[])
     sel.invalidate()
     s = parse_expr("0.3 alice/shared + 0.4 bob/shared")
-    assert s.alphas == {"alice/shared": 0.3, "bob/shared": 0.4}
+    assert set(s.alphas) == {"alice/shared%pos", "bob/shared%pos"}
+    a = s.alphas["alice/shared%pos"]
+    b = s.alphas["bob/shared%pos"]
+    assert isinstance(a, ManifoldTerm) and isinstance(b, ManifoldTerm)
+    assert a.manifold == "alice/shared" and a.along == 0.3
+    assert b.manifold == "bob/shared" and b.along == 0.4
 
 
 def test_namespace_round_trips_through_format():
@@ -258,6 +281,7 @@ def test_projection_onto():
     key = "honest~sycophantic"
     assert key in s.alphas
     v = s.alphas[key]
+    assert isinstance(v, ProjectedTerm)
     assert v.operator == "~"
 
 
@@ -392,27 +416,49 @@ def test_dot_without_second_pole():
 
 # ------------------------------------------------------ pole aliasing ---
 
-def test_pole_alias_flips_sign(tmp_path):
-    # Install ``default/deer.wolf``; bare ``wolf`` should resolve to
-    # ``deer.wolf`` with sign -1, so ``0.5 wolf`` -> ``deer.wolf: -0.5``.
+def test_pole_alias_resolves_through_manifold(tmp_path: Path) -> None:
+    # 4.0: a bipolar concept is a 2-node ``pca`` manifold (``deer.wolf`` with
+    # nodes ``deer``/``wolf``).  A bare pole resolves through the manifold
+    # *label* tier — ``0.5 wolf`` synthesizes a label-form ``ManifoldTerm`` at
+    # the ``wolf`` node (``default/deer.wolf%wolf``) rather than the old
+    # signed-vector ``deer.wolf @ -0.5``.
+    from saklas.core.steering_expr import ManifoldTerm
     _mk(tmp_path, "default", "deer.wolf")
     sel.invalidate()
     s = parse_expr("0.5 wolf")
-    assert s.alphas == {"deer.wolf": -0.5}
+    assert set(s.alphas) == {"default/deer.wolf%wolf"}
+    term = s.alphas["default/deer.wolf%wolf"]
+    assert isinstance(term, ManifoldTerm)
+    assert term.manifold == "default/deer.wolf"
+    assert term.position == "wolf"
+    assert term.along == 0.5
 
 
-def test_pole_positive_pole_keeps_sign(tmp_path):
+def test_pole_positive_pole_resolves_through_manifold(tmp_path: Path) -> None:
+    from saklas.core.steering_expr import ManifoldTerm
     _mk(tmp_path, "default", "deer.wolf")
     sel.invalidate()
     s = parse_expr("0.5 deer")
-    assert s.alphas == {"deer.wolf": 0.5}
+    assert set(s.alphas) == {"default/deer.wolf%deer"}
+    term = s.alphas["default/deer.wolf%deer"]
+    assert isinstance(term, ManifoldTerm)
+    assert term.position == "deer"
+    assert term.along == 0.5
 
 
-def test_pole_composite_literal_bypasses_resolution(tmp_path):
+def test_pole_composite_name_resolves_to_node0(tmp_path: Path) -> None:
+    # The composite-name tier: a 2-node ``pca`` manifold *name* (``deer.wolf``,
+    # whose ``.`` skips the bare-label tier) steers toward node 0 — the
+    # ``orient_to=0`` (+) pole, ``deer``.
+    from saklas.core.steering_expr import ManifoldTerm
     _mk(tmp_path, "default", "deer.wolf")
     sel.invalidate()
     s = parse_expr("0.5 deer.wolf")
-    assert s.alphas == {"deer.wolf": 0.5}
+    assert set(s.alphas) == {"default/deer.wolf%deer"}
+    term = s.alphas["default/deer.wolf%deer"]
+    assert isinstance(term, ManifoldTerm)
+    assert term.position == "deer"
+    assert term.along == 0.5
 
 
 # -------------------------------------------------------- format/round-trip ---
@@ -522,7 +568,7 @@ class TestRoundTripGolden:
         (".25 honest", "0.25 honest"),
         ("2 honest", "2 honest"),
     ])
-    def test_canonical_form(self, text, canonical):
+    def test_canonical_form(self, text: str, canonical: str) -> None:
         s = parse_expr(text)
         assert format_expr(s) == canonical
 
@@ -539,7 +585,7 @@ class TestRoundTripGolden:
         "0.5 honest:sae-gemma-scope",
         "0.5 honest:sae|sycophantic",
     ])
-    def test_format_parse_format_is_stable(self, text):
+    def test_format_parse_format_is_stable(self, text: str) -> None:
         """Render -> re-parse -> render produces the same string."""
         s1 = parse_expr(text)
         r1 = format_expr(s1)
@@ -589,13 +635,13 @@ def test_from_value_steering_passthrough():
 
 def test_from_value_rejects_dict():
     with pytest.raises(TypeError) as ei:
-        Steering.from_value({"honest": 0.5})
+        Steering.from_value({"honest": 0.5})  # pyright: ignore[reportArgumentType]  # intentional bad-type test
     assert "str | Steering | None" in str(ei.value)
 
 
 def test_from_value_rejects_list():
     with pytest.raises(TypeError):
-        Steering.from_value([("honest", 0.5)])
+        Steering.from_value([("honest", 0.5)])  # pyright: ignore[reportArgumentType]  # intentional bad-type test
 
 
 # -------------------------------------------------------------- referenced_selectors ---
@@ -659,7 +705,7 @@ def test_ablation_term_is_frozen():
     from saklas.core.steering_expr import AblationTerm
     t = AblationTerm(coeff=1.0, trigger=Trigger.BOTH, target="x")
     with pytest.raises(FrozenInstanceError):
-        t.coeff = 0.5  # type: ignore[misc]
+        t.coeff = 0.5  # pyright: ignore[reportAttributeAccessIssue]  # frozen dataclass — assignment expected to raise FrozenInstanceError
 
 
 def test_ablation_explicit_coefficient():
@@ -694,7 +740,7 @@ def test_ablation_signed_explicit():
     assert term.coeff == -0.3
 
 
-def test_ablation_with_namespace(tmp_path):
+def test_ablation_with_namespace(tmp_path: Path) -> None:
     from saklas.core.steering_expr import AblationTerm
     _mk(tmp_path, "bob", "custom", tags=[])
     s = parse_expr("!bob/custom")
@@ -805,7 +851,7 @@ def test_format_ablation_variant_preserved():
     "0.3 honest - !sycophantic",
     "!refusal + !sycophantic",
 ])
-def test_ablation_format_parse_format_is_stable(text):
+def test_ablation_format_parse_format_is_stable(text: str) -> None:
     """Ablation expressions round-trip through parse -> format stably."""
     s1 = parse_expr(text)
     r1 = format_expr(s1)
@@ -909,3 +955,132 @@ def test_direct_ablation_construction_round_trips():
     assert isinstance(term, AblationTerm)
     assert term.target == "sycophantic"
     assert term.coeff == 1.0
+
+
+# ------------------------------------------------- manifold-probe gates ---
+#
+# Phase 2 of the manifold-probes feature adds two new ``@when:`` shapes:
+# ``<manifold>:fraction`` for the subspace-fraction channel and
+# ``<manifold>@<label>`` for the label-similarity channel.  The parser
+# stores the full namespaced string verbatim as ``ProbeGate.probe`` so
+# the gate looks up ``TriggerContext.probe_scores`` against the matching
+# key that ``ManifoldMonitor.flat_scalars`` already emits — no runtime
+# gate changes, only parsing and format round-trip.
+
+
+def _gate_of(steering: Steering, key: str):
+    """Extract the (probe, op, threshold) gate triple for ``key``."""
+    val = steering.alphas[key]
+    if isinstance(val, tuple):
+        _, trig = val
+    else:
+        trig = steering.trigger
+    assert trig.gate is not None
+    return trig.gate
+
+
+def test_manifold_fraction_gate_parses():
+    s = parse_expr("0.3 happy.sad @when:circumplex:fraction > 0.5")
+    gate = _gate_of(s, "happy.sad")
+    assert gate.probe == "circumplex:fraction"
+    assert gate.op == ">"
+    assert gate.threshold == 0.5
+
+
+def test_manifold_label_gate_parses():
+    s = parse_expr("0.3 happy.sad @when:circumplex@elated > 0.7")
+    gate = _gate_of(s, "happy.sad")
+    assert gate.probe == "circumplex@elated"
+    assert gate.op == ">"
+    assert gate.threshold == 0.7
+
+
+@pytest.mark.parametrize("op", [">", ">=", "<", "<="])
+def test_manifold_fraction_gate_all_ops(op: str) -> None:
+    s = parse_expr(f"0.3 happy.sad @when:circumplex:fraction {op} 0.3")
+    gate = _gate_of(s, "happy.sad")
+    assert gate.probe == "circumplex:fraction"
+    assert gate.op == op
+    assert gate.threshold == 0.3
+
+
+@pytest.mark.parametrize("op", [">", ">=", "<", "<="])
+def test_manifold_label_gate_all_ops(op: str) -> None:
+    s = parse_expr(f"0.3 happy.sad @when:circumplex@elated {op} -0.1")
+    gate = _gate_of(s, "happy.sad")
+    assert gate.probe == "circumplex@elated"
+    assert gate.op == op
+    assert gate.threshold == -0.1
+
+
+def test_manifold_label_gate_negative_threshold():
+    # Label-similarity gates use ``-distance`` as the score, so the
+    # natural threshold range is negative — the grammar must accept a
+    # leading ``-`` on the NUM the same way it does for vector gates.
+    s = parse_expr("0.3 happy.sad @when:circumplex@elated < -0.5")
+    gate = _gate_of(s, "happy.sad")
+    assert gate.probe == "circumplex@elated"
+    assert gate.op == "<"
+    assert gate.threshold == -0.5
+
+
+def test_manifold_fraction_gate_round_trips():
+    # Canonical format (no spaces around the op) is what ``format_expr``
+    # emits, and the parser tolerates the spaced form on the way in.
+    canonical = "0.3 happy.sad@when:circumplex:fraction>0.5"
+    s = parse_expr(canonical)
+    assert format_expr(s) == canonical
+    # Round-trip a second time through parse to lock in idempotence.
+    assert format_expr(parse_expr(format_expr(s))) == canonical
+
+
+def test_manifold_label_gate_round_trips():
+    canonical = "0.3 happy.sad@when:circumplex@elated>-0.1"
+    s = parse_expr(canonical)
+    assert format_expr(s) == canonical
+    assert format_expr(parse_expr(format_expr(s))) == canonical
+
+
+@pytest.mark.parametrize("op", [">", ">=", "<", "<="])
+def test_manifold_fraction_gate_round_trips_all_ops(op: str) -> None:
+    canonical = f"0.3 happy.sad@when:circumplex:fraction{op}0.25"
+    s = parse_expr(canonical)
+    assert format_expr(s) == canonical
+
+
+def test_vector_probe_gate_still_parses_unchanged():
+    # Regression: a vector probe gate (no ``:`` or ``@`` after the
+    # probe name) must still parse to the bare canonical concept,
+    # not get accidentally claimed by the manifold-form branch.
+    s = parse_expr("0.3 happy.sad @when:angry.calm > 0.4")
+    gate = _gate_of(s, "happy.sad")
+    assert gate.probe == "angry.calm"
+    assert gate.op == ">"
+    assert gate.threshold == 0.4
+    # And the canonical form still round-trips.
+    canonical = "0.3 happy.sad@when:angry.calm>0.4"
+    assert format_expr(parse_expr(canonical)) == canonical
+
+
+def test_manifold_fraction_gate_unknown_channel_rejected():
+    # ``:fraction`` is the only fraction-channel slug today; a typo
+    # like ``:frac`` would silently never match a probe score, so the
+    # parser surfaces it as a SteeringExprError instead.
+    with pytest.raises(SteeringExprError) as ei:
+        parse_expr("0.3 happy.sad @when:circumplex:frac > 0.5")
+    msg = str(ei.value).lower()
+    assert "channel" in msg or "fraction" in msg
+
+
+def test_manifold_gate_does_not_break_other_trigger_parses():
+    # Multi-term expression with one vector gate, one manifold-fraction
+    # gate, and one manifold-label gate composes without interaction.
+    text = (
+        "0.3 happy.sad@when:angry.calm>0.4 "
+        "+ 0.2 calm@when:circumplex:fraction>=0.5 "
+        "+ 0.1 honest@when:circumplex@elated<-0.2"
+    )
+    s = parse_expr(text)
+    assert _gate_of(s, "happy.sad").probe == "angry.calm"
+    assert _gate_of(s, "calm").probe == "circumplex:fraction"
+    assert _gate_of(s, "honest").probe == "circumplex@elated"

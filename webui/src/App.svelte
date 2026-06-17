@@ -13,10 +13,6 @@
   import Toaster from "./lib/Toaster.svelte";
 
   import * as Drawers from "./drawers";
-  import PackDrawer from "./drawers/PackDrawer.svelte";
-  import MergeDrawer from "./drawers/MergeDrawer.svelte";
-  import CloneDrawer from "./drawers/CloneDrawer.svelte";
-  import TokenDrilldownDrawer from "./drawers/TokenDrilldownDrawer.svelte";
 
   import {
     bootstrap,
@@ -36,11 +32,9 @@
   // Content-driven drawer sizing — forms and pickers get a narrow panel,
   // analysis views keep the wide one (docs/plans/webui-overhaul.md §8).
   const NARROW_DRAWERS: ReadonlySet<DrawerName> = new Set<DrawerName>([
-    "vectors",
-    "extract",
-    "load",
-    "merge",
-    "clone",
+    "subspace",
+    "manifolds",
+    "manifold_builder",
     "system_prompt",
     "save_conversation",
     "load_conversation",
@@ -207,12 +201,26 @@
           class:narrow={NARROW_DRAWERS.has(drawerState.open)}
           aria-label="{drawerState.open} drawer"
         >
-          {#if drawerState.open === "load"}
-            <Drawers.Load params={drawerState.params} />
-          {:else if drawerState.open === "vectors"}
-            <Drawers.Vectors params={drawerState.params} />
-          {:else if drawerState.open === "extract"}
-            <Drawers.Extract params={drawerState.params} />
+          {#if drawerState.open === "subspace"}
+            <Drawers.RackDrawer
+              params={{
+                ...(drawerState.params as Record<string, unknown>),
+                family: "subspace",
+              }}
+            />
+          {:else if drawerState.open === "manifolds"}
+            <Drawers.RackDrawer
+              params={{
+                ...(drawerState.params as Record<string, unknown>),
+                family: "manifold",
+              }}
+            />
+          {:else if drawerState.open === "manifold_builder"}
+            <Drawers.ManifoldBuilder params={drawerState.params} />
+          {:else if drawerState.open === "manifold_merge"}
+            <Drawers.ManifoldMerge params={drawerState.params} />
+          {:else if drawerState.open === "manifold_pack"}
+            <Drawers.ManifoldPack params={drawerState.params} />
           {:else if drawerState.open === "save_conversation"}
             <Drawers.SaveConversation params={drawerState.params} />
           {:else if drawerState.open === "load_conversation"}
@@ -225,18 +233,14 @@
             <Drawers.Help params={drawerState.params} />
           {:else if drawerState.open === "export"}
             <Drawers.Export params={drawerState.params} />
-          {:else if drawerState.open === "pack"}
-            <PackDrawer params={drawerState.params} />
-          {:else if drawerState.open === "merge"}
-            <MergeDrawer params={drawerState.params} />
-          {:else if drawerState.open === "clone"}
-            <CloneDrawer params={drawerState.params} />
           {:else if drawerState.open === "token_drilldown"}
-            <TokenDrilldownDrawer params={drawerState.params} />
+            <Drawers.TokenDrilldown params={drawerState.params} />
           {:else if drawerState.open === "correlation"}
             <Drawers.Correlation params={drawerState.params} />
           {:else if drawerState.open === "layer_norms"}
             <Drawers.LayerNorms params={drawerState.params} />
+          {:else if drawerState.open === "probe_inspector"}
+            <Drawers.ProbeInspector params={drawerState.params} />
           {:else if drawerState.open === "experiment_lab"}
             <Drawers.ExperimentLab params={drawerState.params} />
           {:else if drawerState.open === "activation_atlas"}
@@ -253,6 +257,8 @@
             <Drawers.NodeCompare params={drawerState.params} />
           {:else if drawerState.open === "transcript"}
             <Drawers.Transcript params={drawerState.params} />
+          {:else if drawerState.open === "template_lab"}
+            <Drawers.TemplateLab params={drawerState.params} />
           {:else}
             <header class="drawer-header">
               <span class="drawer-title">{drawerState.open}</span>
@@ -293,11 +299,14 @@
     opacity: 0.85;
   }
   /* Four permanent columns: rail · threads · chat · rack.  The threads
-   * (loom) column is 340px, the rack column 440px; min-width 1280px
-   * keeps the chat column usable (1280 − 64 − 340 − 440 ≈ 436px floor). */
+   * (loom) column is 376px, the rack column 432px; min-width 1280px
+   * keeps the chat column usable (1280 − 56 − 376 − 432 ≈ 416px floor).
+   * Rail is 56px (not 48px) so the longest category label ("ANALYSIS")
+   * fits without clipping at the rail's right edge; threads gave back
+   * the same 8px so the chat floor is unchanged. */
   .layout {
     display: grid;
-    grid-template-columns: 64px 340px minmax(0, 1fr) 440px;
+    grid-template-columns: 56px 376px minmax(0, 1fr) 432px;
     grid-template-rows: 1fr;
     min-height: 0; /* let children scroll inside */
     position: relative; /* drawer sits over rack-zone via absolute pos */

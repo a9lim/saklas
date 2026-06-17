@@ -2,20 +2,19 @@
 from __future__ import annotations
 import asyncio
 import logging
-import os
-import pathlib
 import queue
 import re
 import threading
 import time
+from contextlib import suppress
 from enum import IntEnum
 from types import TracebackType
-from typing import Any, Callable, Iterator, Literal, overload
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Literal, cast, overload
 
 import torch
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
-from saklas.core.errors import SaklasError, StaleSidecarError
+from saklas.core.errors import SaklasError
 from saklas.core.events import (
     EventBus,
     GenerationFinished,
@@ -23,8 +22,9 @@ from saklas.core.events import (
     ProbeScored,
     SteeringApplied,
     SteeringCleared,
+    VectorExtracted,
 )
-from saklas.core.generation import GenerationConfig, GenerationState, build_chat_input, generate_steered, supports_thinking
+from saklas.core.generation import GenerationConfig, GenerationState, build_chat_input, detect_base_model, generate_steered, supports_thinking
 from saklas.core.hooks import HiddenCapture, SteeringManager
 from saklas.core.loom import (
     InvalidNodeOperationError,
@@ -35,15 +35,24 @@ from saklas.core.loom import (
     derive_seed_schedule,
 )
 from saklas.core.model import load_model, get_layers, get_model_info
-from saklas.core.monitor import TraitMonitor
-from saklas.io.packs import PackFormatError, PackMetadata, hash_folder_files
-from saklas.io.paths import concept_dir
-from saklas.io.probes_bootstrap import bootstrap_probes, bootstrap_layer_means
+from saklas.core.monitor import Monitor
+from saklas.io.probes_bootstrap import bootstrap_layer_means
 from saklas.core.profile import Profile
-from saklas.core.results import GenerationResult, RunSet, TokenEvent, ProbeReadings
+from saklas.core.results import (
+    GenerationResult,
+    ProbeReading,
+    ProbeReadings,
+    RunSet,
+    TokenEvent,
+)
 from saklas.core.sampling import SamplingConfig
 from saklas.core.steering import Steering
-from saklas.core.steering_expr import AblationTerm
+from saklas.core.steering_expr import AblationTerm, ManifoldTerm
+from saklas.core.manifold import Manifold
+
+if TYPE_CHECKING:
+    from saklas.core.scoring import ChoiceScores
+    from saklas.io.templates import TemplateFolder
 from saklas.core.triggers import Trigger
 from saklas.core.vectors import load_profile as _load_profile
 
@@ -88,7 +97,7 @@ def _install_la_cache_patch() -> bool:
             snap["conv"] = layer.conv_states.detach().clone()
         if getattr(layer, "is_recurrent_states_initialized", False):
             snap["recurrent"] = layer.recurrent_states.detach().clone()
-        layer._saklas_la_snapshot = snap if snap else None
+        layer._saklas_la_snapshot = snap or None
 
     def _la_crop_with_restore(self: Any, max_length: int) -> None:
         _orig_la_crop(self, max_length)
@@ -112,10 +121,12 @@ def _install_la_cache_patch() -> bool:
         DynamicLayer.crop(self, max_length)
         _la_crop_with_restore(self, max_length)
 
-    setattr(LinearAttentionLayer, "crop", _la_crop_with_restore)
-    setattr(LinearAttentionAndFullAttentionLayer, "crop", _hybrid_crop)
-    setattr(LinearAttentionLayer, "_saklas_save_snapshot", _save_la_snapshot)
-    setattr(LinearAttentionLayer, "_saklas_crop_patched", True)
+    linear_attention_layer: Any = LinearAttentionLayer
+    hybrid_attention_layer: Any = LinearAttentionAndFullAttentionLayer
+    linear_attention_layer.crop = _la_crop_with_restore
+    hybrid_attention_layer.crop = _hybrid_crop
+    linear_attention_layer._saklas_save_snapshot = _save_la_snapshot
+    linear_attention_layer._saklas_crop_patched = True
     return True
 
 
@@ -144,32 +155,34 @@ def _snapshot_la_layers(cache: Any) -> None:
             save()
 
 
-_N_PAIRS = 45
-_N_SCENARIOS = 9           # default broad domains per concept
-_N_PAIRS_PER_SCENARIO = 5  # default pairs sampled within each domain
-_MAX_GEN_ATTEMPTS = 4      # retry whole generator call on short parse
+_RESPONSE_MAX_TOKENS = 256  # per in-character response (4.0 / A2 elicitation)
+# Chunk size for batched corpus generation (``_run_generator_batch``, the
+# generation half of ``generate_responses`` / ``generate_neutral_responses``).
+# One left-padded ``model.generate`` over this many baseline prompts replaces
+# that many sequential batch-1 decodes — the dominant cost of extraction's
+# corpus-generation phase (each decode is up to ``_RESPONSE_MAX_TOKENS`` long).
+_CORPUS_GEN_BATCH = 16
+# Tail-ring depth for aggregate-only capture (probes attached, no per-token
+# consumer): how many trailing hidden slices to retain so finalize can pool the
+# last *content* token after walking back past trailing special tokens (EOS,
+# end-of-turn). 8 comfortably covers any chat template's trailing-marker run.
+_AGG_TAIL_DEPTH = 8
+
+# Floor on the shared token prefix ``generate_batch`` will KV-cache.  Below
+# this the saved prefill is in the noise and the double-render + cache-management
+# overhead isn't worth it; the prefix must also leave a non-empty suffix per row
+# (``_try_prefix_cache_hit`` requires it), so the cached length is capped at
+# ``min_row_len - 1``.
+_PREFIX_CACHE_MIN_TOKENS = 16
+
 PROBE_CATEGORIES = [
-    "affect",
     "epistemic",
     "alignment",
     "register",
-    "social_stance",
     "cultural",
-    "identity",
 ]
 MIN_ELAPSED_FOR_RATE = 0.1
 
-_PAIR_RE = re.compile(r"(?:\d+|N)\s*([ab])[.)]\s*(.*)", re.IGNORECASE)
-_SCENARIO_LINE_RE = re.compile(r"^\s*(\d+)\s*[.\)]\s*(.+?)\s*$")
-
-# System prompt shared by scenario and pair generators. Tightened from
-# the v1 generic framing to emphasize format discipline — weaker models
-# (gemma-4-e4b-it) parse first-try with this.
-_GEN_SYSTEM_MSG = (
-    "You generate structured output for neural network interpretability "
-    "research. Your output is parsed programmatically. Emit exactly the "
-    "number of items requested in exactly the format requested, nothing else."
-)
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 BIPOLAR_SEP = "."
 
@@ -194,6 +207,37 @@ def _humanize_concept(name: str) -> str:
     return name.replace("_", " ")
 
 
+# Conversational (4.0 / A2) elicitation templates keyed by node ``kind``.  The
+# concept goes in the system prompt; {c} is the humanized concept, {art} its
+# a/an article.  ``abstract`` traits read as "someone {c}", ``concrete``
+# entities as "{art} {c}".
+_KIND_TEMPLATES = {
+    "abstract": "You are someone {c}. Respond exactly as someone {c} would.",
+    "concrete": "You are {art} {c}. Respond exactly as {art} {c} would.",
+}
+
+
+def _article(word: str) -> str:
+    """Naive a/an for the concrete-entity template (an alien, a deer)."""
+    return "an" if word[:1].lower() in "aeiou" else "a"
+
+
+def _system_for(concept_h: str, kind: str | None) -> str:
+    """A2 system prompt for a humanized concept under its kind (default abstract)."""
+    template = _KIND_TEMPLATES.get(kind or "abstract", _KIND_TEMPLATES["abstract"])
+    return template.format(c=concept_h, art=_article(concept_h))
+
+
+def _role_for(slug: str, kind: str | None) -> str:
+    """A2 elicitation role label (the swapped assistant header) for a node.
+
+    Abstract traits get a ``someone_{slug}`` speaker ("someone happy"); concrete
+    entities are the bare slug ("pirate").  The underscore de-slugs to a space
+    at render (:func:`saklas.core.role_templates._render_label`).
+    """
+    return f"someone_{slug}" if (kind or "abstract") == "abstract" else slug
+
+
 def _split_composite_source(
     concept: str, baseline: str | None,
 ) -> tuple[str, str | None]:
@@ -201,12 +245,10 @@ def _split_composite_source(
 
     ``canonical_concept_name`` already performs this split for the
     storage name.  ``extract()`` needs the same split at the generator
-    interface so :meth:`SaklasSession.generate_scenarios` and
-    :meth:`SaklasSession.generate_pairs` route ``concept`` and
-    ``baseline`` as two distinct poles — otherwise the LLM sees one
-    composite blob vs "its semantic opposite" and the A/B assignment in
-    the returned statements no longer matches the user's declared pole
-    order.
+    interface so :meth:`SaklasSession.generate_responses` elicits
+    ``concept`` and ``baseline`` as two distinct poles — otherwise the LLM
+    sees one composite blob and the pole assignment no longer matches the
+    user's declared order.
     """
     if baseline is None and BIPOLAR_SEP in concept:
         pos, neg = concept.split(BIPOLAR_SEP, 1)
@@ -276,6 +318,14 @@ class VectorNotRegisteredError(KeyError, SaklasError):
         return (404, str(msg))
 
 
+class ManifoldNotRegisteredError(KeyError, SaklasError):
+    """Raised when manifold steering references an unknown / unfitted manifold."""
+
+    def user_message(self) -> tuple[int, str]:
+        msg = self.args[0] if self.args else self.__class__.__name__
+        return (404, str(msg))
+
+
 class ConcurrentExtractionError(RuntimeError, SaklasError):
     """Raised when ``session.extract`` is called while a generation is in flight.
 
@@ -295,7 +345,90 @@ class ConcurrentExtractionError(RuntimeError, SaklasError):
 # values carrying their own coeff + trigger + target.  The union flows
 # through the stack, ``_flatten``, ``_push``/``_pop``, and is dispatched
 # by type in ``_compose_steering_entries``.
-SteeringStackEntry = tuple[float, Trigger] | AblationTerm
+SteeringStackEntry = tuple[float, Trigger] | AblationTerm | ManifoldTerm
+
+
+def _manifold_is_affine(manifold: "Manifold") -> bool:
+    """True iff every layer subspace is flat — an affine ``%`` joins the merge.
+
+    A fit is all-affine (``fit_mode=pca``) or all-curved (authored / spectral);
+    a curved ``%`` gets its own two-op instead.
+    """
+    layers = getattr(manifold, "layers", None)
+    if not layers:
+        return False
+    return all(sub.is_affine for sub in layers.values())
+
+
+def _affine_manifold_push(
+    manifold: "Manifold", position: "tuple[float, ...] | str",
+) -> "tuple[dict[int, torch.Tensor], dict[int, torch.Tensor]]":
+    """An affine ``%`` term → a rank-R push fragment per layer.
+
+    Both position forms are supported and **equivalent at the nodes**:
+
+    - **Label form** (``position`` a ``str``): the node's per-layer real coords
+      (``LayerSubspace.node_coords[idx]``) are the push target on that layer's
+      basis — a direct table lookup, no interpolation.
+    - **Coord form** (``position`` a coord tuple): the free authoring
+      coordinate is mapped into each layer's reduced frame by cardinal RBF
+      interpolation over the node layout (:func:`rbf_cardinal_weights` on the
+      shared ``Manifold.node_coords``), so the per-layer target is the layout
+      blend ``node_coords_L.T @ w``.  The weights are solved once in authoring
+      space (layer-agnostic) and are exact at the nodes (``w = e_idx`` at node
+      ``idx``), so placing a coord-form term at a node's coords reproduces the
+      label-form push toward that node, and interpolates the per-layer target
+      between nodes off-node — the flat-subspace analogue of a curved ``%``
+      following its RBF surface instead of a straight chord.
+
+    The affine fit's domain is the identity carrier (authoring == embedded), so
+    the weights are built directly in authoring-coordinate space.  Arity
+    (coord form) is validated against the domain's intrinsic dim, matching the
+    curved :meth:`SteeringManager.add_manifold` path; a non-poised layout (no
+    interpolant) raises ``SteeringExprError`` advising the user to steer by
+    node label instead.
+    """
+    from saklas.core.steering_expr import SteeringExprError
+    from saklas.core.manifold import rbf_cardinal_weights
+
+    weights: "torch.Tensor | None" = None
+    idx = 0
+    if isinstance(position, str):
+        idx = manifold.nearest_node_index(position)
+    else:
+        n = manifold.domain.intrinsic_dim
+        pos = tuple(float(c) for c in position)
+        if len(pos) != n:
+            from saklas.core.errors import ManifoldArityError
+            raise ManifoldArityError(
+                f"manifold {manifold.name!r} has a {n}-dimensional domain but "
+                f"the steering position has {len(pos)} coordinate(s)"
+            )
+        query = torch.tensor(pos, dtype=torch.float32)
+        try:
+            weights = rbf_cardinal_weights(manifold.node_coords, query)
+        except ValueError as exc:
+            raise SteeringExprError(
+                f"manifold {manifold.name!r}: cannot place free coord-form "
+                f"position {pos!r} — {exc}; steer by node label instead "
+                f"(e.g. '{manifold.name}%<label>')"
+            ) from exc
+
+    basis_dirs: dict[int, torch.Tensor] = {}
+    coord_dirs: dict[int, torch.Tensor] = {}
+    for L, sub in manifold.layers.items():
+        if sub.node_coords is None:
+            raise SteeringExprError(
+                f"affine manifold {manifold.name!r} layer {L} carries no "
+                f"per-layer node_coords; re-fit to steer it by node label"
+            )
+        basis_dirs[L] = sub.basis
+        if weights is None:
+            coord_dirs[L] = sub.node_coords[idx]
+        else:
+            w = weights.to(device=sub.node_coords.device, dtype=sub.node_coords.dtype)
+            coord_dirs[L] = sub.node_coords.transpose(0, 1) @ w   # (R,)
+    return basis_dirs, coord_dirs
 
 
 class _SteeringContext:
@@ -312,17 +445,17 @@ class _SteeringContext:
     ablation.  Bare-alpha inputs to the public ``steering()`` API are
     normalized before we get here.
 
-    ``_injection_mode`` and ``_theta_max`` carry the per-call overrides
-    forward through the stack so nested scopes can flip the steering
-    math (or the angular cap) for the duration of the inner block.
-    ``None`` means "inherit": stack walks the LIFO from top, picking the
-    first non-``None`` value, falling through to the session default if
-    every scope is ``None``.
+    ``~``/``|`` projection terms always materialize in the Mahalanobis
+    metric (closed-form LEACE against the session whitener) — there is no
+    per-call metric override.
     """
 
     __slots__ = (
-        "_session", "_entries", "_entered",
-        "_injection_mode", "_theta_max", "_projection_metric",
+        "_active_role",
+        "_entered",
+        "_entries",
+        "_prev_active_role",
+        "_session",
         "_synthetic_snapshots",
     )
 
@@ -331,38 +464,40 @@ class _SteeringContext:
         session: "SaklasSession",
         entries: dict[str, SteeringStackEntry],
         *,
-        injection_mode: str | None = None,
-        theta_max: float | None = None,
-        projection_metric: str | None = None,
         synthetic_snapshots: dict[str, "object"] | None = None,
+        active_role: str | None = None,
     ) -> None:
         self._session = session
         self._entries = entries
         self._entered = False
-        self._injection_mode = injection_mode
-        self._theta_max = theta_max
-        self._projection_metric = projection_metric
         # Pre-materialize snapshots of any synthetic-projection keys
         # this scope wrote to ``session._profiles`` — value is the prior
         # binding (or :data:`_PROFILE_ABSENT` when the key was unset).
         # Restored on ``__exit__`` so nested scopes that re-materialize
-        # the same ``a|b`` synthetic key with a different metric don't
-        # leak the inner tensor back into the outer scope's hooks.
+        # the same ``a|b`` synthetic key don't leak the inner tensor back
+        # into the outer scope's hooks.
         self._synthetic_snapshots: dict[str, object] = (
             dict(synthetic_snapshots) if synthetic_snapshots else {}
         )
+        # Active role (role-extraction Phase 7): the role label every
+        # role-augmented term in this scope shares.  Restored on exit so
+        # nested scopes save/restore inner-wins.
+        self._active_role = active_role
+        self._prev_active_role: str | None = None
 
     def __enter__(self) -> "_SteeringContext":
         # _push_steering rolls its own stack entry back if _rebuild_steering_hooks
         # raises (e.g. VectorNotRegisteredError).  __enter__ only flips
         # `_entered=True` AFTER a clean push so a mid-__enter__ failure leaves
         # no stale state for __exit__ to pop.
-        self._session._push_steering(
-            self._entries,
-            injection_mode=self._injection_mode,
-            theta_max=self._theta_max,
-            projection_metric=self._projection_metric,
-        )
+        self._session._push_steering(self._entries)
+        # Save / overwrite the session-level active_role.  Inner scopes
+        # override outer; the outer is restored on ``__exit__``.  An
+        # inner scope with ``active_role=None`` inherits — leave the
+        # outer's value in place.
+        self._prev_active_role = getattr(self._session, "_active_role", None)
+        if self._active_role is not None:
+            self._session._active_role = self._active_role
         self._entered = True
         return self
 
@@ -375,6 +510,11 @@ class _SteeringContext:
         if self._entered:
             self._session._pop_steering()
             self._entered = False
+        # Restore the prior active_role.  Done unconditionally — even
+        # if pop_steering raised — so the session never leaks a stale
+        # role binding into the next request.
+        if self._active_role is not None:
+            self._session._active_role = self._prev_active_role
         # Restore any pre-existing values for synthetic-projection
         # keys this scope clobbered.  Runs even if ``_pop_steering``
         # raised — best-effort cleanup keeps the registry consistent
@@ -388,7 +528,7 @@ class _SteeringContext:
                 if prev is _PROFILE_ABSENT:
                     profiles.pop(key, None)
                 else:
-                    profiles[key] = prev  # type: ignore[assignment]
+                    profiles[key] = prev  # pyright: ignore[reportArgumentType]  # sentinel restore: prev is dict[int, Tensor] at runtime
             self._synthetic_snapshots = {}
 
 
@@ -418,10 +558,6 @@ class SaklasSession:
         probes: list[str] | None = None,
         system_prompt: str | None = None,
         max_tokens: int = 1024,
-        injection_mode: str = "angular",
-        theta_max: float | None = None,
-        extraction_method: str = "dim",
-        projection_metric: str = "mahalanobis",
         dls: bool = True,
         compile: bool = False,
         compile_mode: str | None = None,
@@ -434,24 +570,18 @@ class SaklasSession:
         HF-loading heavy lifting. To wrap an already-loaded model use the
         plain ``__init__(model, tokenizer, ...)`` form.
 
-        ``injection_mode`` selects the steering math: ``"angular"``
-        (default, v2.1+) maps user α to a rotation angle; ``"additive"``
-        is the legacy v1.x additive + norm-preserving path.  ``theta_max``
-        sets the maximum rotation angle under angular mode (default π/2,
-        i.e. α=1 fully aligns the residual with the concept direction).
-        ``projection_metric`` selects the metric used when materializing
-        ``~`` / ``|`` projection terms in steering expressions:
-        ``"mahalanobis"`` (default since v2.1) uses the closed-form
-        LEACE projector against the per-model whitener — provably erases
-        linearly-decodable information along ``onto`` from ``base``;
-        ``"euclidean"`` is plain Gram-Schmidt (the v2.0/v2.1 behavior).
+        ``~`` / ``|`` projection terms always materialize through the
+        closed-form LEACE projector against the per-model whitener (it
+        provably erases linearly-decodable information along ``onto`` from
+        ``base``); there is no Euclidean path and no metric knob.
 
         ``dls`` toggles the discriminative-layer-selection mask at
         extraction time (v2.1+).  When ``True`` (default), centered DLS
         per Dang & Ngo (2026) Eq. 9 drops layers where pos- and
         neg-class means project to the same side of the neutral
         baseline along ``d̂``.  Replaces the v2.0–v2.1 ``edge_drop``
-        heuristic (gone in v2.1); ``--legacy`` flips this to ``False``.
+        heuristic (gone in v2.1); pass ``dls=False`` (CLI ``--no-dls``)
+        to opt out.
 
         ``compile`` (default ``False``) opts in to ``torch.compile`` on
         CUDA — kernel fusion via inductor, typically 1.2–3× decode
@@ -503,11 +633,11 @@ class SaklasSession:
         )
 
         cg_supported = False
-        cg_reason: str | None = None
+        _cg_reason: str | None = None
         device_obj = next(model.parameters()).device
         if cuda_graphs:
             from saklas.core.cuda_graphs import is_cuda_graphs_supported
-            cg_supported, cg_reason = is_cuda_graphs_supported(
+            cg_supported, _cg_reason = is_cuda_graphs_supported(
                 model, device_obj,
             )
 
@@ -529,8 +659,46 @@ class SaklasSession:
         # ``_compile_with_probe`` so an architecture-specific inductor /
         # Triton bug surfaces at load time as a caught warning + eager
         # fallback, rather than as a segfault on the user's first token.
-        if compile and device_obj.type == "cuda":
-            from saklas.core.model import _compile_with_probe
+        #
+        # MPS is now eligible (not just CUDA): inductor's MPS backend fuses the
+        # per-layer kernels and amortizes dispatch, which is the dominant decode
+        # cost on Metal — measured ~1.7x on gemma-3-4b paired with StaticCache.
+        # CUDA-graph capture (``reduce-overhead``) stays CUDA-only, so on MPS
+        # ``effective_compile_mode`` is ``"default"`` (``cg_supported`` is False
+        # there) — fusion without graph capture, which composes with the
+        # transient steering hooks and StaticCache the decode loop installs.
+        offset_buffers: dict[int, Any] = {}
+        offset_handles: list[Any] = []
+        capture_buffers: dict[int, Any] = {}
+        capture_handles: list[Any] = []
+        if compile and device_obj.type in ("cuda", "mps"):
+            from saklas.core.hooks import (
+                install_persistent_capture_hooks,
+                install_persistent_offset_hooks,
+            )
+            from saklas.core.model import _compile_with_probe, get_layers
+            # Attach the persistent branchless steering + capture hooks BEFORE
+            # compile so they ride inside the captured graph (post-compile hook
+            # changes are not retraced — ``skip_nnmodule_hook_guards``).  The
+            # offset hooks (``add_(offset)``) carry static-affine steering; the
+            # capture hooks (``copy_`` the last-token slice) carry probe reads.
+            # Both update their buffers in place per gen, so the compiled fast
+            # path sees a stable hook topology and never recompiles — that is what
+            # lets steered *and probed* generation stay on the compiled graph
+            # (slice 2).  ``hidden_size`` falls back to the text sub-config for
+            # multimodal wrappers (Gemma-3/4).
+            hidden_size = getattr(model.config, "hidden_size", None)
+            if hidden_size is None and hasattr(model.config, "get_text_config"):
+                hidden_size = model.config.get_text_config().hidden_size
+            if hidden_size is not None:
+                model_dtype = next(model.parameters()).dtype
+                layers_ml = get_layers(model)
+                offset_buffers, offset_handles = install_persistent_offset_hooks(
+                    layers_ml, int(hidden_size), device_obj, model_dtype,
+                )
+                capture_buffers, capture_handles = install_persistent_capture_hooks(
+                    layers_ml, int(hidden_size), device_obj, model_dtype,
+                )
             model = _compile_with_probe(
                 model, tokenizer, device_obj,
                 mode=effective_compile_mode,
@@ -538,7 +706,7 @@ class SaklasSession:
         elif compile:
             _log.info(
                 "compile=True but device=%s — skipping torch.compile "
-                "(supported only on CUDA)",
+                "(supported only on CUDA / MPS)",
                 device_obj.type,
             )
 
@@ -547,19 +715,32 @@ class SaklasSession:
         # wrapper via ``_orig_mod``), so this second call is a dictionary
         # lookup rather than another StaticCache(max_cache_len=1)
         # allocation.
-        return cls(
-            model, tokenizer,
+        session = cls(
+            model,  # pyright: ignore[reportArgumentType]  # may be torch.compile OptimizedModule wrapping PreTrainedModel
+            tokenizer,
             probes=probes,
             system_prompt=system_prompt,
             max_tokens=max_tokens,
-            injection_mode=injection_mode,
-            theta_max=theta_max,
-            extraction_method=extraction_method,
-            projection_metric=projection_metric,
             dls=dls,
             cuda_graphs=cuda_graphs,
             return_top_k=return_top_k,
         )
+        # Adopt the persistent offset + capture hooks iff compile actually stuck;
+        # if it fell back to eager, drop them (their add_(0) / copy_ would be pure
+        # overhead with no compiled graph to ride).
+        if offset_handles or capture_handles:
+            if session._compiled:
+                session._steering.adopt_compiled_offsets(
+                    offset_buffers, offset_handles,
+                )
+                session._capture_buffers = capture_buffers
+                session._capture_handles = capture_handles
+            else:
+                for h in offset_handles:
+                    h.remove()
+                for h in capture_handles:
+                    h.remove()
+        return session
 
     def __init__(
         self,
@@ -569,10 +750,6 @@ class SaklasSession:
         probes: list[str] | None = None,
         system_prompt: str | None = None,
         max_tokens: int = 1024,
-        injection_mode: str = "angular",
-        theta_max: float | None = None,
-        extraction_method: str = "dim",
-        projection_metric: str = "mahalanobis",
         dls: bool = True,
         cuda_graphs: bool = False,
         return_top_k: int = 0,
@@ -593,36 +770,10 @@ class SaklasSession:
 
         # Vector registry: name -> profile. No alphas, no hooks.
         self._profiles: dict[str, dict[int, torch.Tensor]] = {}
+        # Manifold registry: registry key -> loaded Manifold artifact,
+        # populated lazily by ``_ensure_manifold_loaded`` on scope entry.
+        self._manifolds: dict[str, Manifold] = {}
 
-        # Transient steering manager — used only during generation.  The
-        # session-level injection_mode + θ_max are stamped onto every hook
-        # at apply time; per-call ``Steering.injection_mode`` overrides
-        # this default in ``_rebuild_steering_hooks``.
-        from saklas.core.hooks import DEFAULT_THETA_MAX
-        if injection_mode not in ("angular", "additive"):
-            raise ValueError(
-                f"injection_mode must be 'angular' or 'additive', "
-                f"got {injection_mode!r}"
-            )
-        self._injection_mode: str = injection_mode
-        self._theta_max: float = (
-            DEFAULT_THETA_MAX if theta_max is None else float(theta_max)
-        )
-        if projection_metric not in ("mahalanobis", "euclidean"):
-            raise ValueError(
-                f"projection_metric must be 'mahalanobis' or 'euclidean', "
-                f"got {projection_metric!r}"
-            )
-        # Default for runtime ``~`` / ``|`` projection.  Mahalanobis is
-        # default since v2.1: per-layer ``project_profile`` calls receive
-        # ``self.whitener`` so projection erases linearly-decodable
-        # concept information along ``onto`` (closed-form LEACE per
-        # Belrose et al. 2023).  ``"euclidean"`` keeps the v2.0/v2.1
-        # plain Gram-Schmidt semantics — what ``--legacy`` selects.
-        # When the whitener is unavailable (e.g. ``probes=[]`` session
-        # with no neutral-activation cache yet), the materialize site
-        # falls back to Euclidean per layer transparently.
-        self._projection_metric: str = projection_metric
         # Phase 1 logit pass: session-level default for SamplingConfig
         # .return_top_k.  Per-call value > 0 wins; per-call K=0 (the
         # SamplingConfig default) inherits this stored value via the
@@ -634,10 +785,7 @@ class SaklasSession:
         elif return_top_k > 256:
             return_top_k = 256
         self._default_return_top_k: int = int(return_top_k)
-        self._steering = SteeringManager(
-            injection_mode=self._injection_mode,  # type: ignore[arg-type]
-            theta_max=self._theta_max,
-        )
+        self._steering = SteeringManager()
         # CUDA-graphs / StaticCache routing (Phase B, v2.2).  Probe
         # support once at construction so the per-generation hot path
         # only consults a boolean.  Off when (a) user opted out, (b)
@@ -647,9 +795,9 @@ class SaklasSession:
         # which dedupes on ``id(model)``, so when ``from_pretrained``
         # already probed for its compile_mode decision and we re-probe
         # here, the user only sees one message.
-        self._cuda_graphs_requested: bool = bool(cuda_graphs)
+        cuda_graphs_requested = bool(cuda_graphs)
         self._cuda_graphs_active: bool = False
-        if self._cuda_graphs_requested:
+        if cuda_graphs_requested:
             from saklas.core.cuda_graphs import (
                 is_cuda_graphs_supported, warn_once,
             )
@@ -660,6 +808,27 @@ class SaklasSession:
                 self._cuda_graphs_active = True
             elif reason is not None:
                 warn_once(self._model, reason)
+        # ``torch.compile`` left an ``_orig_mod`` wrapper iff it stuck (the
+        # probe in ``from_pretrained`` falls back to the eager model on failure).
+        # The compiled fast path wants StaticCache so inductor traces one fixed
+        # decode shape instead of re-specializing as a DynamicCache grows;
+        # ``_static_cache_active`` gates that, device-agnostically (CUDA *or*
+        # MPS), distinct from the CUDA-only ``_cuda_graphs_active`` graph-capture
+        # signal.  Either one (or a future StaticCache-only opt-in) enables the
+        # preallocated K/V path for fast-path-eligible steering.
+        self._compiled: bool = hasattr(self._model, "_orig_mod")
+        self._static_cache_active: bool = False
+        if self._compiled or self._cuda_graphs_active:
+            from saklas.core.cuda_graphs import (
+                is_static_cache_supported, warn_once,
+            )
+            sc_supported, sc_reason = is_static_cache_supported(
+                self._model, self._device,
+            )
+            if sc_supported:
+                self._static_cache_active = True
+            elif sc_reason is not None:
+                warn_once(self._model, sc_reason)
         # LIFO stack of per-scope entries dicts pushed by session.steering().
         # Each entry is ``{name: (alpha, Trigger)}`` — triggers are
         # preserved through stack flattening so nested scopes with
@@ -667,16 +836,42 @@ class SaklasSession:
         # (later entries overwrite earlier ones) is what the steering
         # manager installs when a generation begins.
         self._steering_stack: list[dict[str, SteeringStackEntry]] = []
-        # Parallel LIFO of per-scope (injection_mode, theta_max,
-        # projection_metric) overrides.  Each element matches its sibling
-        # in ``_steering_stack``; ``None`` means "inherit".  Walked
-        # top-down by ``_resolve_steering_override`` to find the active
-        # value, with the session default as the floor.  Triplet shape so
-        # all three knobs (steering math, rotation cap, projection
-        # metric) compose under nesting.
-        self._steering_override_stack: list[
-            tuple[str | None, float | None, str | None]
-        ] = []
+
+        # Set by ``_install_composed_steering`` when the current steering lowers
+        # to the persistent compile-clean offset buffers (static-affine push,
+        # compiled MPS session) instead of transient hooks — routes the decode
+        # loop to the compiled module + StaticCache.
+        self._steering_uses_compiled_offsets: bool = False
+
+        # Persistent compile-clean *capture* buffers + hook handles, adopted from
+        # ``from_pretrained`` when compile stuck (slice 2).  The always-on hooks
+        # ``copy_`` each layer's last-token slice into ``_capture_buffers[L]``
+        # every forward (fused into the compiled graph); a probed gen on the
+        # compiled path reads them post-forward via ``HiddenCapture.ingest_persistent``
+        # instead of registering transient capture hooks that would graph-break.
+        # Empty unless a compiled MPS session adopted them.
+        self._capture_buffers: dict[int, torch.Tensor] = {}
+        self._capture_handles: list[Any] = []
+        # Per-gen flags: ``_compiled_clean_eligible`` (set early in
+        # ``_generate_core``) means this gen *can* take the compiled clean path —
+        # compiled MPS, static cache, capture buffers present, not return_hidden —
+        # provided steering also lowers to offsets.  ``_capture_persistent`` (set
+        # in ``_begin_capture``) means the active capture rides the persistent
+        # buffers, so the decode loop wires ``ingest_persistent`` as its step
+        # callback and the routing keeps the compiled module.
+        self._compiled_clean_eligible: bool = False
+        self._capture_persistent: bool = False
+
+        # Active assistant-role label for the current ``session.steering()``
+        # scope — populated when every role-tagged term in the resolved
+        # expression agrees on a role.  ``None`` means "use the family's
+        # standard assistant label", the legacy zero-overhead path.
+        # Push/save/restore is handled by ``_SteeringContext`` so nested
+        # scopes inner-wins for the duration of the inner block.  The
+        # generation surface reads this when assembling the chat-template
+        # input so the assistant turn opens with ``<role>`` instead of
+        # ``assistant``.
+        self._active_role: str | None = None
 
         # Synchronous event bus.  Emits on extraction, steering enter/exit,
         # probe scoring, generation start/finish.  Subscribers run on the
@@ -688,6 +883,40 @@ class SaklasSession:
         # generate_steered when probes are active so scoring happens
         # without a second forward pass.
         self._capture = HiddenCapture()
+        # Incremental-capture state. In the common monitored case
+        # (probes attached, no return_hidden) the capture scores each token
+        # as it is produced and keeps only the latest hidden slice per layer
+        # plus the already-computed ProbeReading rows here — O(layers·D)
+        # device memory instead of the full O(T·layers·D) hidden stack.
+        # ``_capture_incremental`` tells ``_finalize_generation`` to build
+        # (aggregate, per_token) from these readings instead of rescoring
+        # captured hidden states. Reset at each ``_begin_capture`` and on
+        # teardown.
+        self._incremental_readings: list[dict[str, ProbeReading]] = []
+        self._capture_incremental: bool = False
+        # Aggregate-only capture: probes attached but nothing consumes a
+        # per-token reading (no probe gate, no loom row, no trait stream, no
+        # live scores) — so the decode loop pays NO per-token scoring and the
+        # capture keeps only a bounded tail ring; ``_finalize_generation``
+        # scores the aggregate once via ``_score_aggregate_only``. Mutually
+        # exclusive with ``_capture_incremental``. Set in ``_begin_capture``.
+        self._capture_aggregate_only: bool = False
+        # Lean-incremental capture (FIX F2): a per-token consumer wants only the
+        # axis-0 coord (the trait stream / loom probe row), no nearest /
+        # assignment / per-layer trace and no probe gate.  The step sink scores
+        # each token ``coords_only`` (cheap), stores the lean rows for the
+        # per-token stream, and a bounded tail ring lets ``_finalize_generation``
+        # re-score the FULL aggregate once via ``_score_lean_incremental``.
+        # Mutually exclusive with ``_capture_incremental`` / ``_capture_aggregate_only``.
+        self._capture_lean: bool = False
+        # Gating-only subset capture (FIX #4): per-token scoring is needed ONLY
+        # to feed probe gates, so the step sink scores just the gated probes
+        # (``_capture_gating_subset`` holds their names) while a bounded tail
+        # ring is kept so ``_finalize_generation`` can pool the FULL roster
+        # once. Empty/None ⇒ not in this mode. Set in ``_begin_capture``.
+        self._capture_gating_subset: set[str] | None = None
+        self._capture_gating_keys: set[str] | None = None
+        self._incremental_gate_scores: list[dict[str, float]] = []
 
         # Reentrant — ``_generate_core`` acquires it for the whole gen,
         # then enters an internal ``self.steering(...)`` scope which
@@ -699,6 +928,19 @@ class SaklasSession:
         # passes (which keeps the internal steering scope from
         # deadlocking against itself).
         self._gen_lock = threading.RLock()
+        # ``_gen_lock`` doubles as the process-wide **exclusive-GPU** lock:
+        # PyTorch's MPS backend serializes every device op through one global,
+        # NOT-thread-safe command buffer, so two threads committing it at once
+        # aborts the process ("commit an already committed command buffer").
+        # Every model op (fit / extract / generate) already holds it for its
+        # duration; read-side GPU work (the analytics CPU snapshot below,
+        # ``add_probe``) acquires it non-blocking and defers rather than race.
+        # Read-side analytics (correlation / pairwise) snapshot each steering
+        # direction to CPU once and serve every poll from this cache, so the
+        # hot polling path never issues an MPS->CPU copy on a threadpool
+        # thread (which would race a concurrent model op and abort).  See
+        # ``analytics_profile``; cleared on any registry/manifold change.
+        self._analytics_cpu_cache: dict[str, "Profile"] = {}
         # Bypass flag for the phase guard in ``_push_steering`` /
         # ``_pop_steering``.  ``_generate_core`` sets this around the
         # ``steering_cm.__exit__()`` it owns at the end of a generation
@@ -757,6 +999,7 @@ class SaklasSession:
         self._active_gen_reservation: str | None = None
         self._last_result: GenerationResult | None = None
         self._last_per_token_scores: dict[str, list[float]] | None = None
+        self._last_token_probe_payload: dict[str, Any] | None = None
 
         # Probe content-hash cache for transcript export / replay (v2.3
         # phase 5).  Keyed by probe name → sha256 hex of the baked tensor
@@ -768,31 +1011,43 @@ class SaklasSession:
         # Live trait SSE subscribers.  Each entry is (event_loop, asyncio.Queue).
         # The generation thread pushes tagged tuples via loop.call_soon_threadsafe;
         # SSE handlers drain the queue asynchronously.
-        self._trait_queues: list[tuple] = []
+        self._trait_queues: list[tuple[Any, ...]] = []
         self._trait_lock = threading.Lock()
 
         # Ensure bundled concepts are materialized in the user cache and
-        # the selector cache reflects them.  ``bootstrap_probes`` does this
-        # transitively via ``load_defaults``, but is skipped entirely when
+        # the selector cache reflects them.  ``_bootstrap_manifold_probes``
+        # does this transitively via ``load_default_manifolds``, but is
+        # skipped entirely when
         # ``probes=[]`` — leaving freshly-added bundled concepts (e.g. via
-        # ``regenerate_bundled_statements.py``) invisible to the selector
+        # updating package-data bundled manifolds) invisible to the selector
         # layer for the rest of the session.  Calling explicitly here keeps
         # the invariant intact regardless of probe-loading config; the call
-        # is cheap when up-to-date (pack.json format-version short-circuit).
-        from saklas.io.packs import materialize_bundled as _materialize_bundled
+        # is cheap when up-to-date (format-version short-circuit).  Bundled
+        # concepts and manifolds (e.g. ``happy.sad``, ``personas``) all
+        # materialize in the same pre-invalidate window so the bare-name
+        # resolver picks up every bundled node label.
+        from saklas.io.manifolds import (
+            materialize_bundled_manifolds as _materialize_bundled_manifolds,
+        )
+        from saklas.io.templates import (
+            materialize_bundled_templates as _materialize_bundled_templates,
+        )
         from saklas.io import selectors as _selectors
-        _materialize_bundled()
+        # Templates first: a bundled manifold may ``template_ref`` a bundled
+        # ``default/<name>`` template, and its fit resolves that ref.
+        _materialize_bundled_templates()
+        _materialize_bundled_manifolds()
         _selectors.invalidate()
 
         # Bootstrap probes
         probe_categories = PROBE_CATEGORIES if probes is None else probes
 
         # Order matters: layer_means + neutral_activations + whitener must
-        # exist BEFORE ``bootstrap_probes`` runs, because v2.1+ DiM
-        # extraction uses the whitener for Mahalanobis-flavored share
-        # allocation.  Pre-v2.1 ordering computed layer_means *after* probe
-        # extraction (just for monitor centering) — the flip is the
-        # extract-time dependency on the activation covariance.  When
+        # exist BEFORE ``_bootstrap_manifold_probes`` runs, because the
+        # extraction pipeline uses the whitener for Mahalanobis-flavored
+        # share allocation — the probe fold has an extract-time dependency
+        # on the activation covariance, so the centering means and whitener
+        # are built first.  When
         # ``probe_categories`` is empty there's nothing to extract, so we
         # skip the whitener build to keep ``probes=[]`` sessions cheap;
         # ad-hoc later extraction lazily builds via ``self.whitener``.
@@ -804,31 +1059,36 @@ class SaklasSession:
             )
             self._whitener = self._build_whitener_from_cache_or_compute()
 
-        # Stash for later session.extract calls — same default applies
-        # to ad-hoc extraction unless the caller overrides per-call.
-        if extraction_method not in ("dim", "pca"):
-            raise ValueError(
-                f"extraction_method must be 'dim' or 'pca', "
-                f"got {extraction_method!r}"
-            )
-        self._extraction_method: str = extraction_method
-        # v2.1+: DLS toggle stored on the session so ad-hoc
-        # ``session.extract`` calls (via ``ExtractionPipeline``) inherit
-        # it without re-passing.  ``--legacy`` sets this to False.
+        # DLS toggle stored on the session so ad-hoc ``session.extract``
+        # calls (via ``ExtractionPipeline``) inherit it without re-passing.
         self._dls: bool = bool(dls)
 
-        probe_profiles: dict[str, dict] = {}
+        probe_manifolds: dict[str, "Manifold"] = {}
         if probe_categories:
-            probe_profiles = bootstrap_probes(
-                self._model, self._tokenizer, self._layers, self._model_info,
-                probe_categories,
-                method=extraction_method,
-                whitener=self._whitener if extraction_method == "dim" else None,
-                layer_means=self._layer_means,
-                dls=self._dls,
+            # Every concept lives as a 2-node ``pca`` manifold (4.0): fit-or-
+            # load each tagged manifold and hand the flat ``Manifold`` to the
+            # Monitor, which reads it as a coordinate (the rank-1 case of the
+            # subspace readout).  No folded-direction probe path anymore.
+            # ``probes is None`` is the default-roster signal: beyond the
+            # tagged concept axes, also attach every already-fitted bundled
+            # multi-node manifold (``personas`` / ``emotions``).  An explicit
+            # category list (``probes=[...]``) is honored exactly — no sweep.
+            probe_manifolds = self._bootstrap_manifold_probes(
+                probe_categories, include_fitted_defaults=probes is None,
             )
 
-        self._monitor = TraitMonitor(probe_profiles, self._layer_means)
+        # One unified Monitor for every probe shape — flat concept axes
+        # (rank-1), flat discover fits (rank-R, e.g. ``personas``), and curved
+        # manifolds (``emotions``).  There is no batched-affine fast path: every
+        # probe — flat or curved — is read per token through one whitened
+        # per-layer geometry pass (the research-tool priority is full per-token
+        # info — nearest, coords, residual, per-layer — over throughput).
+        # Per-token score callbacks emit one flat-scalar dict into
+        # ``TriggerContext.probe_scores`` so ``@when:`` gates fire on any probe
+        # without grammar changes.
+        self._monitor = Monitor(
+            probe_manifolds, self._layer_means, whitener=self._whitener,
+        )
 
         # Prefix KV cache (opt-in, off by default).  Populated by
         # :meth:`cache_prefix`; consumed by :meth:`_generate_core` when the
@@ -842,15 +1102,7 @@ class SaklasSession:
         # push/pop/steer/unsteer, probe install/remove, profile mutation.
         self._prefix_cache: tuple[torch.Tensor, object, int] | None = None
 
-        # Concept-extraction pipeline.  Constructed once so the session
-        # holds a single live instance; the pipeline takes the structural
-        # dependencies it needs (model handle / pack writer / event bus)
-        # instead of a back-reference.  ``self`` satisfies those protocols
-        # implicitly — see :mod:`saklas.core.extraction`.
-        from saklas.core.extraction import ExtractionPipeline as _Pipeline
-        self._extraction = _Pipeline(self, self, self.events)
-
-    # -- ModelHandle protocol surface (consumed by ExtractionPipeline) --
+    # -- ModelHandle protocol surface (consumed by ManifoldExtractionPipeline) --
 
     @property
     def model(self) -> torch.nn.Module:
@@ -878,14 +1130,14 @@ class SaklasSession:
 
         Returns whatever ``get_layers`` produced — typically an
         ``nn.ModuleList``, list-like enough for the downstream
-        consumers (``extract_contrastive``, hooks).
+        consumers (the extraction pipeline and hooks).
         """
         return self._layers
 
     # -- State queries --
 
     @property
-    def model_info(self) -> dict:
+    def model_info(self) -> dict[str, Any]:
         return dict(self._model_info)
 
     @property
@@ -900,11 +1152,102 @@ class SaklasSession:
         """Registered steering vector profiles: name -> Profile."""
         return {name: Profile(tensors) for name, tensors in self._profiles.items()}
 
+    def analytics_names(self) -> list[str]:
+        """Names available to read-side analytics: registered steering
+        vectors plus attached probes (a vector wins a same-named probe,
+        matching the correlation pool's dedup).  Pure metadata — no GPU.
+
+        A multi-node / curved probe (a rank-``R`` fit like ``personas`` or
+        ``emotions``) is **excluded** — the direction-cosine analytics fold every
+        name to a single steering direction, which only a folded affine
+        ``R = 1`` manifold has.  Listing one would only render an all-null
+        row in the correlation matrix (or a misleading miss in ``pairwise``)
+        and, before the guard below, made the fold raise a 500."""
+        from saklas.core.vectors import is_foldable_vector_manifold
+
+        names = set(self._profiles)  # registered vectors are always R=1
+        try:
+            for pname in self._monitor.probe_names:
+                if pname in names:
+                    continue  # a registered vector wins the same-named probe
+                manifold = self._monitor.manifolds.get(pname)
+                if manifold is not None and is_foldable_vector_manifold(manifold):
+                    names.add(pname)
+        except Exception:
+            pass
+        return sorted(names)
+
+    def _live_direction_tensors(self, name: str) -> "dict[int, torch.Tensor] | None":
+        """Live per-layer direction tensors for *name* (may be device-
+        resident — callers must hold ``_gen_lock``).  A registered steering
+        vector wins over a same-named probe; otherwise the folded view of an
+        attached probe's manifold.
+
+        Returns ``None`` for a multi-node / curved probe — it has no single
+        direction to fold, so the direction analytics skip it rather than
+        crashing on ``folded_vector_directions``."""
+        prof = self._profiles.get(name)
+        if prof is not None:
+            return dict(prof)
+        manifold = self._monitor.manifolds.get(name)
+        if manifold is not None:
+            from saklas.core.vectors import (
+                folded_vector_directions,
+                is_foldable_vector_manifold,
+            )
+            if is_foldable_vector_manifold(manifold):
+                return folded_vector_directions(manifold)
+        return None
+
+    def analytics_profile(self, name: str) -> "Profile | None":
+        """CPU-resident snapshot of a steering vector / probe direction for
+        read-side analytics (correlation, pairwise), cached.
+
+        PyTorch's MPS backend serializes every device op through one global,
+        non-thread-safe command buffer.  A read endpoint evacuating an
+        MPS-resident direction to CPU on its own threadpool thread races a
+        concurrent model op's command-buffer commit and aborts the process
+        (``IOGPUMetalCommandBuffer validate: commit an already committed
+        command buffer``).  This snapshots each direction to CPU **once,
+        under ``_gen_lock``** (the exclusive-GPU lock every fit / extract /
+        generation holds), then serves every later poll from the CPU cache —
+        so the hot polling path never touches the GPU.
+
+        Returns ``None`` when *name* isn't registered, or when a model op
+        currently holds the GPU and no snapshot is cached yet; the caller
+        renders that cell as null and a later poll builds it once the GPU is
+        free.
+        """
+        cached = self._analytics_cpu_cache.get(name)
+        if cached is not None:
+            return cached
+        # The source fold + device->host copy is GPU work: run it under the
+        # exclusive-GPU lock so it can't overlap a model op.  Non-blocking —
+        # defer to a later poll rather than stall or race while one runs.
+        if not self._gen_lock.acquire(blocking=False):
+            return None
+        try:
+            live = self._live_direction_tensors(name)
+            if live is None:
+                return None
+            snap = Profile({
+                int(L): t.detach().float().cpu() for L, t in live.items()
+            })
+        finally:
+            self._gen_lock.release()
+        self._analytics_cpu_cache[name] = snap
+        return snap
+
+    def _invalidate_analytics_cache(self) -> None:
+        """Drop the read-side analytics CPU snapshots (rebuilt lazily on the
+        next poll).  Called on any change to the steering-vector / probe
+        registry or the fitted manifolds those directions read from."""
+        self._analytics_cpu_cache.clear()
+
     @property
-    def probes(self) -> dict[str, dict]:
-        profiles = self._monitor.profiles
-        return {name: {"profile": profiles[name]}
-                for name in self._monitor.probe_names}
+    def probes(self) -> dict[str, dict[str, Any]]:
+        return {name: {"manifold": m}
+                for name, m in self._monitor.manifolds.items()}
 
     @property
     def last_result(self) -> GenerationResult | None:
@@ -930,24 +1273,26 @@ class SaklasSession:
         """``True`` whenever :attr:`gen_state` is not ``GenState.IDLE``."""
         return self._gen_phase is not GenState.IDLE
 
+    @property
+    def is_base_model(self) -> bool:
+        """``True`` when the loaded model has no chat template (a base model).
+
+        Frontends branch on this to switch to a raw-completion UI — no
+        roles, no chat bubbles, the whole buffer is a prefill.
+        """
+        return detect_base_model(self._tokenizer)
+
     # -- Live trait SSE subscribers --
 
-    @property
-    def _trait_subscribers(self) -> int:
-        return len(self._trait_queues)
-
-    def register_trait_queue(self, loop, q) -> None:
+    def register_trait_queue(self, loop: Any, q: Any) -> None:
         """Register an ``(event_loop, asyncio.Queue)`` pair for live trait events."""
         with self._trait_lock:
             self._trait_queues.append((loop, q))
 
-    def unregister_trait_queue(self, loop, q) -> None:
+    def unregister_trait_queue(self, loop: Any, q: Any) -> None:
         """Remove a previously registered trait queue."""
-        with self._trait_lock:
-            try:
-                self._trait_queues.remove((loop, q))
-            except ValueError:
-                pass
+        with self._trait_lock, suppress(ValueError):
+            self._trait_queues.remove((loop, q))
 
     # -- Neutral baseline (v2.1) --
 
@@ -972,7 +1317,7 @@ class SaklasSession:
         directly, which left ``probes=[]`` sessions with an empty dict
         and silently disabled DLS (every layer fell through the
         "missing baseline" conservative-keep branch in
-        :func:`compute_dls_mask`).  The property closes that footgun.
+        :func:`compute_dls_axes`).  The property closes that footgun.
         """
         if not self._layer_means:
             try:
@@ -994,7 +1339,7 @@ class SaklasSession:
         """Per-layer Mahalanobis whitener; built lazily on first access.
 
         Used by v2.1+ DiM extraction for Mahalanobis-flavored share
-        allocation, by ``vector compare --metric mahalanobis``, and by
+        allocation, by ``manifold compare``, and by
         callers that pass a whitener to ``project_profile`` for
         LEACE-style projection.  Returns a
         :class:`saklas.core.mahalanobis.LayerWhitener` or ``None`` if
@@ -1004,6 +1349,16 @@ class SaklasSession:
         """
         if self._whitener is None:
             self._whitener = self._build_whitener_from_cache_or_compute()
+            # Keep the trait monitor's read metric in lock-step with the
+            # session whitener: when it's built lazily (e.g. a ``probes=[]``
+            # session that later extracts), push it into the monitor so
+            # probe reads switch to the Mahalanobis cosine.  ``set_whitener``
+            # is a no-op when the identity is unchanged.  Guarded with
+            # ``getattr`` because the property can be touched mid-init
+            # before ``_monitor`` is assigned.
+            monitor = getattr(self, "_monitor", None)
+            if monitor is not None and self._whitener is not None:
+                monitor.set_whitener(self._whitener)
         return self._whitener
 
     def _build_whitener_from_cache_or_compute(self) -> "Any":
@@ -1012,14 +1367,15 @@ class SaklasSession:
         Uses ``load_or_compute_neutral_activations`` (alignment.py) for
         disk caching; combines with the in-memory ``_layer_means`` to
         instantiate the :class:`LayerWhitener`.  Soft-fails to ``None``
-        on any error — extraction falls back to Euclidean scoring, and
-        ``vector compare --metric mahalanobis`` already errors with a
-        useful hint when ``LayerWhitener.from_cache`` can't find the
-        cache.
+        on any error — but the engine is Mahalanobis-only now, so a
+        ``None`` whitener makes the activation-space consumers (fit,
+        ``~``/``|`` projection, probe scoring, ``manifold compare``) raise
+        ``WhitenerError`` with a regenerate-neutrals hint rather than
+        degrade to Euclidean.
 
         Lazy: only callers who actually need Mahalanobis math (DiM
         extraction at session init, on-demand ``session.whitener``
-        access, or ``vector compare --metric mahalanobis``) trigger the
+        access, or ``manifold compare``) trigger the
         forward-pass loop over neutral statements.
         """
         from saklas.core.mahalanobis import LayerWhitener
@@ -1055,64 +1411,59 @@ class SaklasSession:
 
     # -- Extraction --
 
-    def _local_concept_folder(self, canonical: str) -> pathlib.Path:
-        """Return the local/<canonical>/ folder, creating pack.json if needed.
-
-        User-extracted vectors and generated statements live under
-        ~/.saklas/vectors/local/<canonical>/. A minimal pack.json with
-        source=local is written on first access.
-        """
-        folder = concept_dir("local", canonical)
-        folder.mkdir(parents=True, exist_ok=True)
-        if not (folder / "pack.json").exists():
-            PackMetadata(
-                name=canonical,
-                description=f"User-extracted: {canonical}",
-                version="1.0.0",
-                license="AGPL-3.0-or-later",
-                tags=[],
-                recommended_alpha=0.5,
-                source="local",
-                files={},
-            ).write(folder)
-        return folder
-
-    def _statements_cache_path(self, canonical: str) -> str:
-        folder = self._local_concept_folder(canonical)
-        return str(folder / "statements.json")
-
-    def _update_local_pack_files(self, folder: pathlib.Path) -> None:
-        """Recompute pack.json `files` map after writing new tensors/statements."""
-        try:
-            meta = PackMetadata.load(folder)
-        except PackFormatError:
-            return
-        meta.files = hash_folder_files(folder)
-        meta.write(folder)
-
     def _run_generator(
         self,
         system_msg: str,
         prompt: str,
         max_new_tokens: int,
+        *,
+        role: str | None = None,
     ) -> str:
         """Single-turn LLM call shared by scenario and pair generators.
 
         Builds a chat input from (system_msg, prompt), runs the model
         under inference_mode, decodes and returns the generated text.
         No parsing, no retry — callers drive the retry loop.
+
+        An empty ``system_msg`` (``""``) drops the system role entirely
+        — the chat template sees only the user turn.  Useful for
+        measuring whether the system framing is biasing statement
+        register: with the persona-priming gone, the model writes from
+        its default assistant identity rather than the "interpretability
+        research output generator" framing the constant has historically
+        carried.
+
+        ``role`` (optional): substitute a custom assistant-role label so
+        the generation prompt opens with ``<role>`` instead of
+        ``assistant``.  Routed through :func:`build_chat_input`.  Mirrors
+        the role-augmented extraction path so the scenario / pair
+        generators inhabit the same persona the corpus will be pooled
+        from.  ``role=None`` is the zero-overhead default.
         """
         pad_id = self._tokenizer.pad_token_id or self._tokenizer.eos_token_id
-        messages = [
-            {"role": "system", "content": system_msg},
-            {"role": "user", "content": prompt},
-        ]
+        messages: list[dict[str, str]] = []
+        if system_msg:
+            messages.append({"role": "system", "content": system_msg})
+        messages.append({"role": "user", "content": prompt})
+        model_type_for_role: str | None = None
+        if role is not None:
+            model_cfg = getattr(self._model, "config", None)
+            text_cfg = getattr(model_cfg, "text_config", None) if model_cfg is not None else None
+            model_type_for_role = (
+                getattr(text_cfg, "model_type", None)
+                if text_cfg is not None
+                else None
+            )
+            if model_type_for_role is None and model_cfg is not None:
+                model_type_for_role = getattr(model_cfg, "model_type", None)
         input_ids = build_chat_input(
             self._tokenizer, messages, system_prompt=None,
+            thinking=False,
+            gen_role=role, model_type=model_type_for_role,
         ).to(self._device)
         attention_mask = torch.ones_like(input_ids)
         with torch.inference_mode():
-            out = self._model.generate(
+            out = self._model.generate(  # pyright: ignore[reportCallIssue]  # transformers stubs don't expose generate on PreTrainedModel directly
                 input_ids,
                 attention_mask=attention_mask,
                 max_new_tokens=max_new_tokens,
@@ -1120,339 +1471,253 @@ class SaklasSession:
                 pad_token_id=pad_id,
             )
         new_ids = out[0][input_ids.shape[-1]:]
-        return self._tokenizer.decode(new_ids, skip_special_tokens=True)
+        decoded = self._tokenizer.decode(new_ids, skip_special_tokens=True)
+        return decoded if isinstance(decoded, str) else decoded[0]
 
-    def generate_scenarios(
+    def _run_generator_batch(
         self,
-        concept: str,
-        baseline: str | None = None,
-        n: int = _N_SCENARIOS,
+        system_msg: str,
+        prompts: list[str],
+        max_new_tokens: int,
         *,
-        on_progress: Callable[[str], None] | None = None,
+        role: str | None = None,
     ) -> list[str]:
-        """Ask the generator for ``n`` broad situational domains shared across the axis.
+        """Batched sibling of :meth:`_run_generator`.
 
-        Each domain is 2–6 words, broad enough to contain many specific
-        moments, shared across both poles so within-pair variance stays
-        pure-pole while cross-pair variance is domain-diverse.
+        Renders each prompt as a ``[system?, user]`` chat, **left-pads** the
+        batch to a common length (decoder-only generation aligns continuations
+        on the right, so every row's prompt must end at the same column), and
+        runs ONE ``model.generate`` over the whole batch.  Returns the decoded
+        continuations in prompt order.  Sampling is per-row independent
+        (``do_sample``), with the same ``temperature=1.0`` / ``top_p=0.9`` the
+        single-prompt generator uses, so a batched corpus is distributionally
+        the same as the sequential one — just far fewer ``generate`` calls.
 
-        The anti-allegory clause ("do not force human-social framing
-        onto concepts that aren't about humans") is load-bearing for
-        non-human concepts (deer/wolf, brick/feather) — without it
-        the model defaults its pool to workplace/relationship
-        situations and extracted vectors read everything as
-        allegorical human-person statements.
-
-        Pure function, no disk side effects. Callers that want
-        persistence (``extract()``) write the result to scenarios.json
-        themselves.
+        The seam ``generate_responses`` / ``generate_neutral_responses`` call;
+        ``_run_generator`` is kept for the single-shot ``ModelHandle`` protocol
+        and any caller that wants one response.
         """
-        if n <= 0:
+        if not prompts:
             return []
-        # Slugs on the pack/alphas side use underscores; LLM prompts read
-        # them as spaces ("artificial_intelligence" → "artificial
-        # intelligence") so the generator treats the axis as the
-        # underlying phrase rather than a literal token.
-        concept_h = _humanize_concept(concept)
-        baseline_h = _humanize_concept(baseline) if baseline is not None else None
-        if baseline_h is not None:
-            axis_phrase = f'"{concept_h}" vs "{baseline_h}"'
-            poles_line = (
-                f'Both "{concept_h}" and "{baseline_h}" should have natural, '
-                f'distinct responses within every domain you list.'
-            )
-        else:
-            axis_phrase = f'"{concept_h}" vs its semantic opposite'
-            poles_line = (
-                f'Both "{concept_h}" and its semantic opposite should have '
-                f'natural, distinct responses within every domain you list.'
-            )
-        prompt = (
-            f"For the axis {axis_phrase}, list exactly {n} broad "
-            f"situational domains where the axis naturally expresses "
-            f"itself.\n\n"
-            f"A domain is a *category of experience*, not a specific "
-            f"scenario. It should be 2 to 6 words, concrete enough to "
-            f"be evocative, broad enough to contain many specific "
-            f"situations. Cover the full range of contexts where the "
-            f"axis lives — internal states, social or relational "
-            f"contact, physical environment, routine moments, high-"
-            f"stakes moments — whatever is natural to the axis itself. "
-            f"Do not force human-social framing onto concepts that "
-            f"aren't about humans.\n\n"
-            f"{poles_line}\n\n"
-            f"The {n} domains together should span the axis without "
-            f"overlap. No meta-commentary, no explanations, no sub-"
-            f"bullets.\n\n"
-            f"Format: number, period, then the domain name. Nothing "
-            f"else.\n\n"
-            f"1. [domain]\n"
-            f"2. [domain]\n"
-            f"...\n"
-            f"{n}. [domain]"
+        # ``cast`` (not ``int()``): the tokenizer stub types pad/eos as a loose
+        # union (``int | list[int] | str | …``) though the id is an int; casting
+        # avoids a spurious ``int(list)`` type error without a runtime no-op.
+        pad_id = cast(
+            int,
+            self._tokenizer.pad_token_id
+            or self._tokenizer.eos_token_id
+            or 0,
         )
-        max_new_tokens = max(300, n * 40)
-        best: list[str] = []
-        for attempt in range(1, _MAX_GEN_ATTEMPTS + 1):
-            if on_progress:
-                on_progress(
-                    f"Generating {n} scenarios for '{concept}' "
-                    f"(attempt {attempt}/{_MAX_GEN_ATTEMPTS})..."
-                )
-            text = self._run_generator(_GEN_SYSTEM_MSG, prompt, max_new_tokens)
-            parsed = self._parse_scenarios(text)
-            if len(parsed) >= n:
-                return parsed[:n]
-            if len(parsed) > len(best):
-                best = parsed
-        return best
+        model_type_for_role: str | None = None
+        if role is not None:
+            model_cfg = getattr(self._model, "config", None)
+            text_cfg = getattr(model_cfg, "text_config", None) if model_cfg is not None else None
+            model_type_for_role = (
+                getattr(text_cfg, "model_type", None)
+                if text_cfg is not None
+                else None
+            )
+            if model_type_for_role is None and model_cfg is not None:
+                model_type_for_role = getattr(model_cfg, "model_type", None)
 
-    @staticmethod
-    def _parse_scenarios(text: str) -> list[str]:
-        """Parse a numbered list of domain names from generated text.
+        # Render each prompt to ids (build_chat_input returns CPU tensors).
+        seqs: list[torch.Tensor] = []
+        for prompt in prompts:
+            messages: list[dict[str, str]] = []
+            if system_msg:
+                messages.append({"role": "system", "content": system_msg})
+            messages.append({"role": "user", "content": prompt})
+            ids = build_chat_input(
+                self._tokenizer, messages, system_prompt=None,
+                thinking=False,
+                gen_role=role, model_type=model_type_for_role,
+            )
+            seqs.append(ids[0])
 
-        Accepts ``1. name``, ``1) name``, tolerates bracket markers and
-        trailing punctuation, deduplicates case-insensitively.
+        lengths = [int(s.shape[0]) for s in seqs]
+        max_len = max(lengths)
+        batch = len(seqs)
+        # Left-pad: each row's prompt occupies the rightmost ``lengths[i]``
+        # columns, so the continuation begins at ``max_len`` for every row and
+        # ``out[:, max_len:]`` is the batch's generated tail.
+        input_ids = torch.full(
+            (batch, max_len), pad_id, dtype=seqs[0].dtype,
+        )
+        attn = torch.zeros((batch, max_len), dtype=torch.long)
+        for i, seq in enumerate(seqs):
+            input_ids[i, max_len - lengths[i]:] = seq
+            attn[i, max_len - lengths[i]:] = 1
+        input_ids = input_ids.to(self._device)
+        attn = attn.to(self._device)
+
+        with torch.inference_mode():
+            out = self._model.generate(  # pyright: ignore[reportCallIssue]  # transformers stubs don't expose generate on PreTrainedModel directly
+                input_ids,
+                attention_mask=attn,
+                max_new_tokens=max_new_tokens,
+                do_sample=True, temperature=1.0, top_p=0.9,
+                pad_token_id=pad_id,
+            )
+        new_ids = out[:, max_len:]
+        decoded = self._tokenizer.batch_decode(new_ids, skip_special_tokens=True)
+        return list(decoded)
+
+    def generate_responses(
+        self,
+        concepts: list[str],
+        kinds: list[str | None],
+        *,
+        roles: dict[str, str | None] | None = None,
+        samples_per_prompt: int = 1,
+        max_new_tokens: int = _RESPONSE_MAX_TOKENS,
+        on_progress: Callable[[str], None] | None = None,
+    ) -> dict[str, list[str]]:
+        """Generate each concept\'s conversational corpus (4.0 / A2 elicitation).
+
+        For every ``(concept, kind)`` the model answers the shared baseline
+        prompts *in character* -- the concept rides the system prompt
+        (:func:`_system_for`, led by the shared :data:`~saklas.core.vectors._LENGTH_DIRECTIVE`
+        so responses stay one short paragraph) and the swapped assistant-role
+        label (:func:`_role_for`, overridable per concept via ``roles``).  The
+        length directive is common-mode with the neutral corpus and with capture
+        (it leads every system prompt), so it cancels at extraction.  Responses
+        are emitted samples-outer / prompts-inner so ``response[i]`` aligns to
+        ``prompt[i % k]`` -- the alignment :func:`compute_node_centroid` and the
+        node corpus files assume.
+
+        Returns ``{concept: [response, ...]}`` with
+        ``len == max(1, samples_per_prompt) * len(baseline_prompts)`` per
+        concept.  Always role-swaps (no system-only fallback); a family without
+        role support raises ``RoleSubstitutionUnsupportedError`` at generation.
         """
-        out: list[str] = []
-        seen: set[str] = set()
-        for line in text.split("\n"):
-            m = _SCENARIO_LINE_RE.match(line)
-            if not m:
-                continue
-            name = m.group(2).strip().strip("[]").strip().rstrip(".,;:")
-            if not name:
-                continue
-            key = name.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append(name)
+        from saklas.core.vectors import _LENGTH_DIRECTIVE, _load_baseline_prompts
+
+        prompts = _load_baseline_prompts()
+        roles = roles or {}
+        reps = max(1, samples_per_prompt)
+        total = reps * len(prompts)
+        out: dict[str, list[str]] = {}
+        for concept, kind in zip(concepts, kinds, strict=True):
+            concept_h = _humanize_concept(concept)
+            # The length directive leads the persona system prompt (and is the
+            # whole system for the neutral baseline + capture), so it is shared
+            # common-mode that cancels at extraction.
+            system = f"{_LENGTH_DIRECTIVE} {_system_for(concept_h, kind)}"
+            gen_role = roles.get(concept) or _role_for(_slug(concept), kind)
+            responses: list[str] = []
+            for _ in range(reps):
+                # Prompts-inner, batched in chunks: one model.generate per chunk
+                # rather than per prompt.  Order is preserved within the rep, so
+                # ``response[i] -> prompt[i % k]`` still holds.
+                for start in range(0, len(prompts), _CORPUS_GEN_BATCH):
+                    chunk = prompts[start:start + _CORPUS_GEN_BATCH]
+                    if on_progress:
+                        on_progress(
+                            f"Generating {concept!r} responses "
+                            f"{len(responses) + 1}-{len(responses) + len(chunk)}"
+                            f"/{total}..."
+                        )
+                    texts = self._run_generator_batch(
+                        system, chunk, max_new_tokens, role=gen_role,
+                    )
+                    responses.extend(text.strip() for text in texts)
+            out[concept] = responses
         return out
 
-    def generate_pairs(
+    def generate_neutral_responses(
         self,
-        concept: str,
-        baseline: str | None = None,
-        n: int = _N_PAIRS,
         *,
-        scenarios: list[str] | None = None,
+        samples_per_prompt: int = 1,
+        max_new_tokens: int = _RESPONSE_MAX_TOKENS,
         on_progress: Callable[[str], None] | None = None,
-    ) -> list[tuple[str, str]]:
-        """Generate contrastive statement pairs via the open-ended pipeline.
+    ) -> list[str]:
+        """Generate the neutral baseline corpus -- organic, unconditioned responses.
 
-        For each of ``len(scenarios)`` broad domains (passed via
-        ``scenarios`` or generated fresh via :meth:`generate_scenarios`),
-        ask the model for ``ceil(n / len(scenarios))`` first-person
-        contrastive pairs drawn from concrete moments within that
-        domain. Uses POV/behavior framing that generalizes across human
-        and non-human concepts — a ``deer.wolf`` axis yields literal
-        animal-life pairs rather than human-allegory pairs. Returns up
-        to ``n`` pairs total.
-
-        Bipolar (baseline given): Speaker A embodies ``concept``,
-        Speaker B embodies ``baseline``. Monopolar (baseline None):
-        Speaker B embodies the semantic opposite of ``concept``.
+        The neutral counterpart to :meth:`generate_responses`: the model answers
+        the shared baseline prompts under the shared
+        :data:`~saklas.core.vectors._LENGTH_DIRECTIVE` as its *only* system prompt
+        (no persona) with the standard assistant label, so the corpus is the
+        model\'s own voice -- just brief.  The directive is the only framing it
+        shares with the node corpora (same on every node system + every capture),
+        so it cancels at extraction while leaving neutral the default-voice
+        reference the contrast subtracts against.  Same prompts-cycled order
+        (``response[i] -> prompt[i % k]``).  This is what ``neutral_statements.json``
+        holds under 4.0 -- regenerate it with this and the per-model
+        ``layer_means`` / neutral-activation caches recompute conversationally.
         """
-        if scenarios is None:
-            scenarios = self.generate_scenarios(
-                concept, baseline, _N_SCENARIOS, on_progress=on_progress,
-            )
-        if not scenarios:
-            return []
+        from saklas.core.vectors import _LENGTH_DIRECTIVE, _load_baseline_prompts
 
-        pairs_per_scenario = max(1, -(-n // len(scenarios)))  # ceil div
-
-        # See ``generate_scenarios`` — slug underscores become spaces for
-        # the LLM-facing prompt only; progress messages and cache keys
-        # keep the slug form.
-        concept_h = _humanize_concept(concept)
-        baseline_h = _humanize_concept(baseline) if baseline is not None else None
-        if baseline_h is not None:
-            axis_phrase = f'"{concept_h}" vs "{baseline_h}"'
-            a_line = (
-                f'   - Statement A: write like you ARE "{concept_h}", '
-                f'facing that moment.'
-            )
-            b_line = (
-                f'   - Statement B: write like you ARE "{baseline_h}", '
-                f'facing the same moment.'
-            )
-            labels_ban = (
-                f'Do not name the poles. Never write "I am a {concept_h}" '
-                f'or "as a {baseline_h}" or any similar self-label — just '
-                f'inhabit the pole directly.'
-            )
-        else:
-            axis_phrase = f'"{concept_h}" vs its semantic opposite'
-            a_line = (
-                f'   - Statement A: write like you ARE "{concept_h}", '
-                f'facing that moment.'
-            )
-            b_line = (
-                f'   - Statement B: write like you ARE the semantic '
-                f'opposite of "{concept_h}" — whatever that opposite '
-                f'naturally is — facing the same moment.'
-            )
-            labels_ban = (
-                f'Do not name the pole. Never write "I am a {concept_h}" '
-                f'or any similar self-label — just inhabit the pole '
-                f'directly.'
-            )
-
-        all_pairs: list[tuple[str, str]] = []
-        for idx, scenario in enumerate(scenarios, 1):
-            if len(all_pairs) >= n:
-                break
-            if on_progress:
-                on_progress(
-                    f"Generating {pairs_per_scenario} pairs for domain "
-                    f"{idx}/{len(scenarios)}: {scenario}"
+        prompts = _load_baseline_prompts()
+        reps = max(1, samples_per_prompt)
+        total = reps * len(prompts)
+        responses: list[str] = []
+        for _ in range(reps):
+            for start in range(0, len(prompts), _CORPUS_GEN_BATCH):
+                chunk = prompts[start:start + _CORPUS_GEN_BATCH]
+                if on_progress:
+                    on_progress(
+                        f"Generating neutral responses "
+                        f"{len(responses) + 1}-{len(responses) + len(chunk)}"
+                        f"/{total}..."
+                    )
+                texts = self._run_generator_batch(
+                    _LENGTH_DIRECTIVE, chunk, max_new_tokens, role=None,
                 )
-            prompt = (
-                f"Axis: {axis_phrase}.\n"
-                f"Domain: {scenario}.\n\n"
-                f"Write exactly {pairs_per_scenario} contrastive "
-                f"statement pairs drawn from this domain.\n\n"
-                f"For each pair:\n"
-                f"1. Pick a specific concrete moment that naturally "
-                f"lives inside the domain — a thing happening right "
-                f"now, not a generality.\n"
-                f"2. Write two first-person statements about that "
-                f"same moment:\n"
-                f"{a_line}\n"
-                f"{b_line}\n\n"
-                f"Write AS the pole, not ABOUT it. {labels_ban}\n\n"
-                f"Both statements in a pair should have the same "
-                f"overall shape — both an inner thought, or both a "
-                f"description of what you do, or both something said "
-                f"aloud — so the only axis of variation is "
-                f"{axis_phrase}.\n\n"
-                f"Each statement should be at least 12 words; longer "
-                f"is fine. Natural, unhurried language. Lean into the "
-                f"pole and let it speak in its natural register.\n\n"
-                f"Format: number then a/b, period, then the statement. "
-                f"Nothing else.\n\n"
-                f"1a. [Statement A for moment 1]\n"
-                f"1b. [Statement B for moment 1]\n"
-                f"2a. [Statement A for moment 2]\n"
-                f"2b. [Statement B for moment 2]\n"
-                f"..."
-            )
-            max_new_tokens = max(400, pairs_per_scenario * 200)
-            batch_best: list[tuple[str, str]] = []
-            for _attempt in range(_MAX_GEN_ATTEMPTS):
-                text = self._run_generator(
-                    _GEN_SYSTEM_MSG, prompt, max_new_tokens,
-                )
-                parsed = self._parse_pairs(text)
-                if len(parsed) >= pairs_per_scenario:
-                    batch_best = parsed[:pairs_per_scenario]
-                    break
-                if len(parsed) > len(batch_best):
-                    batch_best = parsed
-            all_pairs.extend(batch_best)
-
-        return all_pairs[:n]
-
-    @staticmethod
-    def _parse_pairs(text: str) -> list[tuple[str, str]]:
-        """Parse contrastive pairs from generated text.
-
-        Accepts varied formats: "1a.", "Na.", "a.", "1a)", "a)" etc.
-        Pairs positionally: each 'a' entry pairs with the nearest 'b'
-        (either direction), tolerating reversed, misnumbered, skipped,
-        or duplicated indices.
-        """
-        entries: list[tuple[str, str]] = []  # ("a"|"b", content)
-        for line in text.split("\n"):
-            line = line.strip()
-            m = _PAIR_RE.match(line)
-            if not m:
-                continue
-            ab, content = m.group(1).lower(), m.group(2).strip()
-            if len(content) > 10:
-                entries.append((ab, content))
-        # Pair adjacent a/b entries regardless of order
-        pairs = []
-        i = 0
-        while i < len(entries) - 1:
-            cur, nxt = entries[i], entries[i + 1]
-            if cur[0] == "a" and nxt[0] == "b":
-                pairs.append((cur[1], nxt[1]))
-                i += 2
-            elif cur[0] == "b" and nxt[0] == "a":
-                pairs.append((nxt[1], cur[1]))
-                i += 2
-            else:
-                # Two of the same in a row — skip the first, try the second
-                i += 1
-        return pairs
+                responses.extend(text.strip() for text in texts)
+        return responses
 
     def extract(
         self,
-        source,
+        concept: str,
         baseline: str | None = None,
         *,
-        scenarios: list[str] | None = None,
-        reuse_scenarios: bool = False,
-        force_statements: bool = False,
+        kind: str = "abstract",
+        force: bool = False,
         on_progress: Callable[[str], None] | None = None,
         sae: str | None = None,
         sae_revision: str | None = None,
         namespace: str | None = None,
-        method: str | None = None,
-        dls: bool | None = None,
+        role: str | None = None,
     ) -> tuple[str, Profile]:
-        """Extract a steering vector profile and emit ``VectorExtracted``.
+        """Author + fit a steering vector via conversational (4.0 / A2) extraction.
 
-        Thin delegate to :class:`saklas.core.extraction.ExtractionPipeline` —
-        the pipeline owns folder probing, statement caching, scenario /
-        pair generation, contrastive PCA invocation, and pack updates.
-        Re-entry is gated against generation: extraction runs forward
-        passes through the model and would race an active gen.
+        A steering vector is a flat ``pca`` manifold.  A **bipolar** axis
+        (``concept`` + ``baseline``) authors a 2-node manifold — node 0 the
+        positive pole, node 1 the negative.  A **monopolar** concept
+        (``baseline=None``) authors a genuinely **1-node** manifold; the fit
+        recognizes the single-node ``pca`` shape and folds ``concept − ν``
+        (ν = the model's neutral activation mean, ``layer_means``) into a
+        1-node neutral-anchored ray — neutral is the implicit negative pole,
+        sourced per-model at fit (never a stored corpus).  Both resolve as
+        steerable vectors: ``0.5 <concept>`` steers toward the concept pole.
 
-        **Default behavior**: tensor cache hits short-circuit.  On
-        tensor miss, if ``statements.json`` exists (curated bundled
-        pack or local cache), extract directly from it — statements
-        are the expensive part and reuse is the sane default.  On
-        statements miss, run the full pipeline: generate scenarios →
-        generate pairs → save both → extract tensor.
+        Each node's corpus is generated by :meth:`generate_responses`: the model
+        answers the shared baseline prompts *in character* (concept in the system
+        prompt + a kind-derived elicitation role), and extraction pools the
+        swapped-back ``[user, assistant]`` pairs in standard-assistant space.
+
+        Returns ``(canonical_name, Profile)`` — the folded per-layer direction
+        view of the fitted manifold (the in-memory steering-vector shape), with
+        the manifold the single on-disk artifact.  Emits ``VectorExtracted``.
 
         Flags:
 
-        - ``scenarios=[...]``: explicit scenarios input; bypasses
-          scenario generation and ``scenarios.json`` cache.  Written
-          to disk after use.  **Also bypasses the tensor cache** —
-          supplying fresh scenarios means the caller wants fresh
-          pairs, so any cached tensor is stale by definition.
-        - ``reuse_scenarios=True``: when regenerating pairs, load
-          ``scenarios.json`` from disk if present instead of
-          regenerating.  Default False — scenarios are cheap, so the
-          full pipeline regenerates them fresh each pair-gen pass.
-        - ``force_statements=True``: regenerate ``statements.json``
-          from scratch.  **Also bypasses the tensor cache** — same
-          reasoning as ``scenarios=[...]``.
-        - ``method=None`` (default) inherits ``self._extraction_method``
-          (set at session construction; ``"dim"`` unless ``--legacy``
-          flipped it to ``"pca"``).  Explicit ``"dim"`` / ``"pca"``
-          overrides per-call.
-        - ``dls=None`` (default) inherits ``self._dls`` (set at session
-          construction; ``True`` unless ``--legacy`` flipped it).
-          Explicit ``True`` / ``False`` overrides per-call.
+        - ``kind=`` (``"abstract"`` | ``"concrete"``): selects each node's system
+          template + elicitation role label (``someone {c}`` vs ``{c}``).
+          Applies to both poles of a bipolar axis.
+        - ``force=True``: regenerate the corpora + re-author the folder
+          (otherwise an existing manifold's corpus is reused and the fit
+          cache-hits when a tensor for this model is already present).
+        - ``role=<slug>``: persona-baselined extraction — the explicit role
+          overrides the kind-derived label at *both* generation and capture
+          (the centroid lives in role-baselined space; stored as the node
+          ``role``).  Omit for the standard swap-back baseline.
+        - ``sae=<release>``: fit in SAE feature space (a ``_sae-<release>``
+          tensor variant beside the raw one).
 
-        Pre-v2.1 these defaults were hardcoded to ``method="dim"`` and
-        ``dls=True`` regardless of session config — so ``--legacy``
-        sessions calling bare ``session.extract(...)`` got the modern
-        stack instead of the v2.0 one.  The ``None``-inherits-session
-        shape closes that hole.
+        Gated against generation: fitting runs forward passes through the
+        model and would race an active gen.
         """
-        # Must hold ``_gen_lock`` to read ``_gen_phase`` race-free against
-        # ``_generate_core``, which acquires the lock first then flips
-        # ``_gen_phase = PREAMBLE``.  Without the lock, a concurrent
-        # ``generate()`` could pass ``extract()``'s gate and then race
-        # extraction over model forward passes.  The lock generalizes from
-        # "serialize generations" to "serialize all model uses".
         if not self._gen_lock.acquire(blocking=False):
             raise ConcurrentExtractionError(
                 "session.extract called while another model use is in flight"
@@ -1462,46 +1727,259 @@ class SaklasSession:
                 raise ConcurrentExtractionError(
                     "session.extract called while a generation is in flight"
                 )
-            effective_method = (
-                method if method is not None else self._extraction_method
-            )
-            effective_dls = dls if dls is not None else self._dls
-            return self._extraction.extract(
-                source, baseline,
-                scenarios=scenarios,
-                reuse_scenarios=reuse_scenarios,
-                force_statements=force_statements,
-                on_progress=on_progress,
-                sae=sae,
-                sae_revision=sae_revision,
-                namespace=namespace,
-                method=effective_method,  # type: ignore[arg-type]
-                dls=effective_dls,
+            from saklas.io.manifolds import create_discover_manifold_folder
+            from saklas.io.paths import manifold_dir
+
+            ns = namespace or "local"
+            pos_raw, neg_raw = _split_composite_source(concept, baseline)
+            name = canonical_concept_name(concept, baseline)
+            pos_label = _slug(pos_raw)
+            if neg_raw is None:
+                # Monopolar = a single concept node.  The folder is genuinely
+                # one node; the engine recognizes a 1-node ``pca`` fit and folds
+                # ``concept − ν`` (ν = the model's neutral activation mean,
+                # ``layer_means``) into a 1-node neutral-anchored ray
+                # (`ManifoldExtractionPipeline`).  ν is the implicit negative
+                # pole, sourced per-model at fit — never a stored corpus — so
+                # ``0.5 <concept>`` steers neutral → concept.
+                gen_concepts = [pos_raw]
+                labels = [pos_label]
+                desc = f"Monopolar axis: {pos_raw} (+) vs neutral baseline (-)."
+            else:
+                gen_concepts = [pos_raw, neg_raw]
+                labels = [pos_label, _slug(neg_raw)]
+                desc = f"Bipolar axis: {pos_raw} (+) vs {neg_raw} (-)."
+
+            folder = manifold_dir(ns, name)
+            manifest = folder / "manifold.json"
+            if force or not manifest.exists():
+                gen_roles: dict[str, str | None] | None = (
+                    {c: role for c in gen_concepts} if role else None
+                )
+                corpora = self.generate_responses(
+                    gen_concepts, [kind] * len(gen_concepts),
+                    roles=gen_roles, on_progress=on_progress,
+                )
+                node_corpora = {
+                    label: corpora[c]
+                    for label, c in zip(labels, gen_concepts, strict=True)
+                }
+                node_kinds: dict[str, str | None] = {
+                    label: kind for label in labels
+                }
+                node_roles: dict[str, str | None] | None = (
+                    {label: role for label in labels} if role else None
+                )
+                if manifest.exists():
+                    import shutil
+                    shutil.rmtree(folder)
+                create_discover_manifold_folder(
+                    ns, name, desc, fit_mode="pca",
+                    node_corpora=node_corpora,
+                    hyperparams={"max_dim": 1, "var_threshold": 0.7},
+                    node_roles=node_roles, node_kinds=node_kinds,
+                )
+            return self._fit_vector_manifold(
+                name, folder, sae=sae, sae_revision=sae_revision,
+                role=role, on_progress=on_progress,
             )
         finally:
             self._gen_lock.release()
 
-    def clone_from_corpus(
+    def extract_vector_from_corpora(
         self,
-        path,
         name: str,
+        positive: list[str],
+        negative: list[str],
         *,
-        n_pairs: int = 90,
-        seed: int | None = None,
-        batch_size: int = 5,
+        kind: str = "abstract",
+        namespace: str | None = None,
+        role: str | None = None,
+        sae: str | None = None,
+        sae_revision: str | None = None,
+        on_progress: Callable[[str], None] | None = None,
         force: bool = False,
+        description: str = "",
     ) -> tuple[str, Profile]:
-        """Extract a persona-cloning steering vector from a corpus file.
+        """Author + fit a steering vector from two ready-made pole corpora.
 
-        Thin wrapper around saklas.cloning.clone_from_corpus; see that
-        module for the full pipeline. Returns `(canonical_name, profile)`
-        matching extract()'s return shape.
+        The corpus-in sibling of :meth:`extract` — used by persona cloning and
+        the hand-authored TUI/HTTP paths, which already hold the positive and
+        negative corpora and so skip generation.  Authors a 2-node ``pca``
+        manifold (``positive`` → pole node, ``negative`` → its opposite) and
+        fits it; returns ``(canonical_name, Profile)`` like :meth:`extract`.
+
+        Under 4.0 the corpora are pooled conversationally — each entry is treated
+        as a response to the shared baseline prompts (``response[i] -> prompt[i
+        % k]``), so each corpus length must be a multiple of the baseline prompt
+        set.  ``kind`` is recorded per node (provenance); ``role`` opts into a
+        persona-baselined fit as in :meth:`extract`.
         """
-        from saklas.io.cloning import clone_from_corpus as _clone
-        return _clone(
-            self, path, name,
-            n_pairs=n_pairs, seed=seed, batch_size=batch_size, force=force,
+        if not self._gen_lock.acquire(blocking=False):
+            raise ConcurrentExtractionError(
+                "session.extract_vector_from_corpora called while another "
+                "model use is in flight"
+            )
+        try:
+            if self._gen_phase is not GenState.IDLE:
+                raise ConcurrentExtractionError(
+                    "session.extract_vector_from_corpora called while a "
+                    "generation is in flight"
+                )
+            from saklas.io.manifolds import create_discover_manifold_folder
+            from saklas.io.paths import manifold_dir
+
+            ns = namespace or "local"
+            pos_raw, neg_raw = _split_composite_source(name, None)
+            canonical = canonical_concept_name(name)
+            pos_label = _slug(pos_raw)
+            neg_label = _slug(neg_raw) if neg_raw is not None else f"{pos_label}_neg"
+
+            folder = manifold_dir(ns, canonical)
+            manifest = folder / "manifold.json"
+            if force or not manifest.exists():
+                node_roles: dict[str, str | None] | None = (
+                    {pos_label: role, neg_label: role} if role else None
+                )
+                if manifest.exists():
+                    import shutil
+                    shutil.rmtree(folder)
+                create_discover_manifold_folder(
+                    ns, canonical, description, fit_mode="pca",
+                    node_corpora={pos_label: positive, neg_label: negative},
+                    hyperparams={"max_dim": 1, "var_threshold": 0.7},
+                    node_roles=node_roles,
+                    node_kinds={pos_label: kind, neg_label: kind},
+                )
+            return self._fit_vector_manifold(
+                canonical, folder, sae=sae, sae_revision=sae_revision,
+                role=role, on_progress=on_progress,
+            )
+        finally:
+            self._gen_lock.release()
+
+    def _fit_vector_manifold(
+        self,
+        name: str,
+        folder: Any,
+        *,
+        sae: str | None,
+        sae_revision: str | None,
+        role: str | None,
+        on_progress: Callable[[str], None] | None,
+    ) -> tuple[str, Profile]:
+        """Fit a 2-node pca manifold (lock held) and return its folded Profile.
+
+        Shared tail of :meth:`extract` / :meth:`extract_vector_from_corpora`:
+        runs :class:`ManifoldExtractionPipeline` directly (the public
+        :meth:`fit` re-acquires ``_gen_lock``, which the callers
+        already hold), folds the fitted manifold to a per-layer direction
+        :class:`Profile`, and emits ``VectorExtracted``.
+
+        The returned name carries the variant tail (``:sae-<release>`` /
+        ``:role-<slug>``) so the caller steers the right per-model tensor; the
+        on-disk manifold folder stays the bare canonical name.
+        """
+        from saklas.core.extraction import ManifoldExtractionPipeline
+        from saklas.core.vectors import folded_vector_directions
+
+        pipe = ManifoldExtractionPipeline(self, self.events)
+        manifold = pipe.fit(
+            folder, sae=sae, sae_revision=sae_revision, on_progress=on_progress,
         )
+        # The newly-fit manifold changes folded directions a probe may read.
+        self._invalidate_analytics_cache()
+        if sae:
+            ret_name = f"{name}:sae-{sae}"
+        elif role:
+            ret_name = f"{name}:role-{role}"
+        else:
+            ret_name = name
+        profile = Profile(
+            folded_vector_directions(manifold),
+            metadata={
+                "method": "manifold_pca",
+                "name": ret_name,
+                "share_metric": manifold.metadata.get("share_metric"),
+            },
+        )
+        self.events.emit(VectorExtracted(
+            name=ret_name, profile=profile, metadata=dict(profile.metadata),
+        ))
+        return ret_name, profile
+
+    def fit(
+        self,
+        folder: Any,
+        *,
+        sae: str | None = None,
+        sae_revision: str | None = None,
+        on_progress: Callable[[str], None] | None = None,
+    ) -> Manifold:
+        """Fit a steering manifold from a manifold folder (authored or discover).
+
+        Thin delegate to :class:`ManifoldExtractionPipeline` — that
+        pipeline owns corpus loading, per-node centroid pooling, the
+        per-layer PCA + spline fit (dispatching on the folder's ``fit_mode``),
+        and the cache short-circuit.  The Python mirror of CLI ``manifold fit``.
+        Gated against generation like :meth:`extract`: manifold fitting runs
+        forward passes through the model.
+        """
+        if not self._gen_lock.acquire(blocking=False):
+            raise ConcurrentExtractionError(
+                "session.fit called while another model use is in flight"
+            )
+        try:
+            if self._gen_phase is not GenState.IDLE:
+                raise ConcurrentExtractionError(
+                    "session.fit called while a generation is in flight"
+                )
+            from saklas.core.extraction import ManifoldExtractionPipeline
+            pipe = ManifoldExtractionPipeline(self, self.events)
+            return pipe.fit(
+                folder, sae=sae, sae_revision=sae_revision,
+                on_progress=on_progress,
+            )
+        finally:
+            # A re-fit changes the folded directions any probe reads from.
+            self._invalidate_analytics_cache()
+            self._gen_lock.release()
+
+    def bake(
+        self,
+        name: str,
+        expression: str,
+        *,
+        force: bool = True,
+        strict: bool = False,
+    ) -> tuple[str, Profile]:
+        """Bake a steering expression into a corpus-less manifold (the merge op).
+
+        The Python mirror of CLI ``manifold bake``.  Wraps
+        :func:`saklas.io.merge.merge_into_manifold`, model-scoped to this
+        session's loaded model — the merge lands a corpus-less
+        ``fit_mode="baked"`` manifold under ``local/<name>/`` — then folds the
+        fitted tensor back to a steering :class:`Profile` and registers it
+        (:meth:`steer`) so it is immediately steerable.  Returns
+        ``(name, Profile)``, the same shape :meth:`extract` returns.
+        """
+        from saklas.io.merge import MergeError, merge_into_manifold
+        from saklas.io.paths import tensor_filename
+        from saklas.core.manifold import load_manifold
+        from saklas.core.vectors import folded_vector_directions
+
+        dst_folder = merge_into_manifold(
+            name, expression, self.model_id, force=force, strict=strict,
+        )
+        tensor_path = dst_folder / tensor_filename(self.model_id)
+        if not tensor_path.is_file():
+            raise MergeError(
+                f"bake produced no tensor for {self.model_id} at {tensor_path}"
+            )
+        manifold = load_manifold(str(tensor_path))
+        profile = Profile(folded_vector_directions(manifold))
+        self.steer(name, profile)
+        return name, profile
 
     def load_profile(self, path: str) -> Profile:
         profile, meta = _load_profile(path)
@@ -1512,7 +1990,7 @@ class SaklasSession:
         self,
         profile: Profile,
         path: str,
-        metadata: dict | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
         profile.save(path, metadata=metadata)
 
@@ -1530,11 +2008,13 @@ class SaklasSession:
         # the prefix cache so the next gen reprefills under the new
         # registry view.
         self._invalidate_prefix_cache()
+        self._invalidate_analytics_cache()
 
     def unsteer(self, name: str) -> None:
         """Remove a steering vector from the registry."""
         self._profiles.pop(name, None)
         self._invalidate_prefix_cache()
+        self._invalidate_analytics_cache()
 
     def steering(
         self, value: "str | Steering",
@@ -1574,6 +2054,47 @@ class SaklasSession:
             self._resolve_pole_aliases(raw_entries)
         )
 
+        # Role-augmented extraction (role-extraction Phase 7):
+        # collect the set of ``role-<id>`` variants across every resolved
+        # term so the generation surface can substitute the assistant-
+        # role label.  Unanimity is the only coherent regime — mixing
+        # multiple roles in one scope has no defined semantics.  A plain
+        # term mixed with a role-tagged term is allowed but warns: the
+        # plain term's baseline was ``assistant``, not ``<role>``.
+        role_variants: set[str] = set()
+        any_plain_term = False
+        for key in resolved:
+            if ":" not in key:
+                any_plain_term = True
+                continue
+            variant = key.rsplit(":", 1)[1]
+            if variant.startswith("role-"):
+                role_variants.add(variant[len("role-"):])
+            else:
+                # Non-role variant (sae, sae-<rel>) — treat as plain for
+                # baseline-mismatch tracking.  Its baseline is also the
+                # standard assistant role, distinct from the role
+                # substitution path.
+                any_plain_term = True
+        if len(role_variants) > 1:
+            from saklas.core.steering_expr import SteeringExprError
+            raise SteeringExprError(
+                f"conflicting roles in expression: {sorted(role_variants)}; "
+                f"all role-augmented terms must agree on role"
+            )
+        active_role: str | None = next(iter(role_variants), None)
+        if active_role is not None and any_plain_term:
+            import warnings as _warnings
+            from saklas.core.errors import RoleBaselineMismatchWarning
+            _warnings.warn(
+                f"steering scope mixes plain terms with role-augmented "
+                f"terms (role={active_role!r}); the plain term's "
+                f"extraction baseline was the standard assistant role, "
+                f"not {active_role!r}",
+                RoleBaselineMismatchWarning,
+                stacklevel=2,
+            )
+
         # Fold in ablation entries alongside additive/projection ones.
         # ``normalized_entries`` strips ``AblationTerm`` values, so walk
         # ``steering_obj.alphas`` directly.  Keys already carry the
@@ -1588,41 +2109,101 @@ class SaklasSession:
                 continue
             target = val.target
             if target not in self._profiles:
-                if ":" in target:
-                    canonical, variant = target.rsplit(":", 1)
-                else:
-                    canonical, variant = target, "raw"
-                try:
-                    self._try_autoload_vector(canonical, variant=variant)
-                except Exception:
-                    # Non-raw variant miss raises AmbiguousVariantError or
-                    # UnknownVariantError; let it surface at hook-install
-                    # with the shared VectorNotRegisteredError shape.
-                    pass
+                # Resolve via the unified path (fold a fitted manifold, or
+                # port a legacy vectors/ folder on first touch).  A miss /
+                # non-raw variant error surfaces at hook-install with the
+                # shared VectorNotRegisteredError shape.
+                with suppress(Exception):
+                    self._ensure_profile_registered(target, role="ablation")
             resolved[key] = val
-        # Per-call overrides ride along with the entries.  ``None`` means
-        # "inherit"; the resolver folds session defaults at hook-install.
-        mode_override = getattr(steering_obj, "injection_mode", None)
-        theta_override = getattr(steering_obj, "theta_max", None)
-        metric_override = getattr(steering_obj, "projection_metric", None)
-        if mode_override is not None and mode_override not in ("angular", "additive"):
-            raise ValueError(
-                f"Steering.injection_mode must be 'angular' or 'additive', "
-                f"got {mode_override!r}"
+        # Fold in manifold terms.  Like ablation, ``normalized_entries``
+        # strips ``ManifoldTerm`` values, so walk ``alphas`` directly.
+        # Keys carry the ``<manifold>%<pos>`` form — disjoint from
+        # plain/projection/ablation keys.  The manifold artifact is
+        # loaded into ``self._manifolds`` here so a miss surfaces
+        # eagerly (``ManifoldNotRegisteredError``) rather than at hook
+        # install.
+        manifold_terms: list[ManifoldTerm] = []
+        for key, val in steering_obj.alphas.items():
+            if not isinstance(val, ManifoldTerm):
+                continue
+            self._ensure_manifold_loaded(val.manifold)
+            resolved[key] = val
+            manifold_terms.append(val)
+
+        # Role-paired manifold steering (Phase A.4): each manifold term
+        # implies a role via its nearest-node lookup.  Aggregate across
+        # all manifold terms by highest absolute coefficient (Phase A.4
+        # disagreement policy: soft-warn + highest-coeff wins).  An
+        # explicit ``:role-<X>`` term wins over any manifold-implied
+        # role — explicit user intent dominates implicit lookup — with
+        # a soft warn if they disagreed.  ``None``-roles (nodes opting
+        # out of substitution) abstain from the aggregate; they don't
+        # vote for the standard baseline against an explicit role.
+        manifold_role: str | None = None
+        manifold_role_coeff = -1.0
+        manifold_role_disagreement = False
+        for term in manifold_terms:
+            manifold = self._manifolds.get(term.manifold)
+            if manifold is None:
+                # Should not happen — ``_ensure_manifold_loaded`` either
+                # populates ``self._manifolds`` or raises.  Defensive.
+                continue
+            try:
+                implied = manifold.nearest_node_role(term.position)
+            except ValueError:
+                implied = None
+            if implied is None:
+                continue
+            abs_c = abs(term.coeff)
+            if manifold_role is None:
+                manifold_role = implied
+                manifold_role_coeff = abs_c
+            elif implied == manifold_role:
+                # Same role — pick the larger coefficient as tiebreaker
+                # so the warning copy below carries the dominant term.
+                manifold_role_coeff = max(manifold_role_coeff, abs_c)
+            else:
+                manifold_role_disagreement = True
+                if abs_c > manifold_role_coeff:
+                    manifold_role = implied
+                    manifold_role_coeff = abs_c
+        if manifold_role_disagreement:
+            import warnings as _warnings
+            from saklas.core.errors import RoleBaselineMismatchWarning
+            _warnings.warn(
+                f"steering scope has manifold terms implying distinct "
+                f"per-node roles; highest-coefficient term wins "
+                f"(role={manifold_role!r}, |coeff|={manifold_role_coeff:.3f}). "
+                f"Compose with a single manifold term or align the active "
+                f"nodes if you want a different role.",
+                RoleBaselineMismatchWarning,
+                stacklevel=2,
             )
-        if metric_override is not None and metric_override not in (
-            "mahalanobis", "euclidean",
-        ):
-            raise ValueError(
-                f"Steering.projection_metric must be 'mahalanobis' or "
-                f"'euclidean', got {metric_override!r}"
+
+        # Resolve the final active role across both tiers:
+        # explicit ``:role-<X>`` (already aggregated as ``active_role``
+        # above) wins over any manifold-implied role.  Soft-warn when
+        # the two tiers disagreed — the user typed an explicit role and
+        # also has a manifold term pulling toward a different persona.
+        if active_role is None:
+            active_role = manifold_role
+        elif manifold_role is not None and manifold_role != active_role:
+            import warnings as _warnings
+            from saklas.core.errors import RoleBaselineMismatchWarning
+            _warnings.warn(
+                f"steering scope has an explicit role={active_role!r} "
+                f"and a manifold term implying role={manifold_role!r}; "
+                f"explicit role wins, manifold-implied role ignored. "
+                f"Use the same role on both, or drop the explicit "
+                f":role-{active_role} variant to let the manifold drive.",
+                RoleBaselineMismatchWarning,
+                stacklevel=2,
             )
         return _SteeringContext(
             self, resolved,
-            injection_mode=mode_override,
-            theta_max=theta_override,
-            projection_metric=metric_override,
             synthetic_snapshots=snapshots,
+            active_role=active_role,
         )
 
     def _materialize_projections(self, steering: Steering) -> dict[str, object]:
@@ -1639,51 +2220,39 @@ class SaklasSession:
         resolution + hook install find the profile via the
         ``name in self._profiles`` fast path.
 
-        Metric selection (v2.1): the active projection metric is
-        resolved via :meth:`_resolve_projection_metric`, which composes
-        the per-call ``Steering.projection_metric`` override (if set)
-        with any outer-scope override on
-        ``_steering_override_stack`` and the session-level default.
-        Under ``"mahalanobis"`` (default since v2.1) the call site
-        passes ``self.whitener`` to ``project_profile``, which switches
-        ``~`` / ``|`` to the closed-form LEACE projector — provably
-        erases linearly-decodable concept information along ``onto``.
-        Under ``"euclidean"`` we pass ``whitener=None`` and get plain
-        Gram-Schmidt (the v2.0/v2.1 behavior).  When the whitener is
-        unavailable for this session (no neutral-activation cache, e.g.
-        a ``probes=[]`` session that hasn't extracted yet) the call
-        gracefully falls back to Euclidean per-layer transparently —
-        ``project_profile``'s coverage check handles per-layer misses.
+        Projection is Mahalanobis-only: the call site passes
+        ``self.whitener`` to ``project_profile``, which uses the
+        closed-form LEACE projector — provably erases linearly-decodable
+        concept information along ``onto``.  ``project_profile`` requires
+        the whitener to cover every projected layer (``covers_all``) and
+        raises :class:`~saklas.core.mahalanobis.WhitenerError` otherwise;
+        there is no Euclidean path.  A ``probes=[]`` session that hasn't
+        built a neutral-activation cache yet therefore can't materialize a
+        ``~``/``|`` term — regenerate the neutral cache first.
 
         Returns a snapshot dict ``{syn_key: prev_value_or_PROFILE_ABSENT}``
         of the synthetic-projection bindings this call clobbered, so
         the caller can restore them on scope exit.  Without this
         nested scopes that materialize the same ``a|b`` synthetic
-        key under a different ``projection_metric`` would leak the
-        inner tensor back into the outer scope's hooks after pop —
-        the global ``self._profiles`` registry is shared across all
-        active scopes.
+        key would leak the inner tensor back into the outer scope's
+        hooks after pop — the global ``self._profiles`` registry is
+        shared across all active scopes.
         """
         from saklas.core.steering_expr import ProjectedTerm
         from saklas.core.vectors import project_profile
 
-        # Compute once per ``steering()`` call.  The resolver consults
-        # the per-call override first, then any outer scope on the
-        # override stack (this scope hasn't been pushed yet — it will
-        # be on ``__enter__``), then the session default.
-        metric = self._resolve_projection_metric(
-            getattr(steering, "projection_metric", None),
-        )
-        whitener = self.whitener if metric == "mahalanobis" else None
+        whitener = self.whitener
 
         snapshots: dict[str, object] = {}
         for syn_key, val in steering.alphas.items():
             if not isinstance(val, ProjectedTerm):
                 continue
-            self._ensure_profile_loaded(val.base)
-            self._ensure_profile_loaded(val.onto)
-            base_tensors = self._profiles[val.base]
-            onto_tensors = self._profiles[val.onto]
+            base_tensors = self._ensure_profile_registered(
+                val.base, role="projection base",
+            )
+            onto_tensors = self._ensure_profile_registered(
+                val.onto, role="projection onto",
+            )
             projected = project_profile(
                 base_tensors, onto_tensors, val.operator,
                 whitener=whitener,
@@ -1701,27 +2270,68 @@ class SaklasSession:
             self._profiles[syn_key] = projected
         return snapshots
 
-    def _ensure_profile_loaded(self, key: str) -> None:
-        """Ensure ``key`` is registered in ``self._profiles``.
+    def _ensure_manifold_loaded(self, key: str) -> None:
+        """Load the manifold artifact for registry key ``key`` if absent.
 
-        ``key`` is a canonical registry key (bare for raw variants,
-        ``f"{canonical}:{variant}"`` otherwise) as produced by
-        :func:`saklas.core.steering_expr._resolve_atom`.  Routes to the
-        existing autoload path for packs that are installed but not yet
-        loaded.
+        ``key`` is the manifold registry key produced by the grammar:
+        ``[ns/]name[:variant]``.  ``raw`` (default) selects the
+        residual-stream tensor; ``sae-<release>`` selects the SAE-variant
+        tensor.  A bare name (no namespace) searches every namespace
+        under ``manifolds/``.  The loaded :class:`Manifold` is promoted
+        onto the session device (kept fp32 — the spline math wants it).
+        Raises :class:`ManifoldNotRegisteredError` on a miss.
         """
-        if key in self._profiles:
+        if key in self._manifolds:
             return
-        if ":" in key:
-            canonical, variant = key.rsplit(":", 1)
+        from saklas.core.manifold import load_manifold
+        from saklas.io.paths import manifold_dir, manifolds_dir, tensor_filename
+
+        name_part, variant = (
+            key.rsplit(":", 1) if ":" in key else (key, "raw")
+        )
+        if "/" in name_part:
+            ns, name = name_part.split("/", 1)
+            search_ns = [ns]
         else:
-            canonical, variant = key, "raw"
-        self._try_autoload_vector(canonical, variant=variant)
-        if key not in self._profiles:
-            raise VectorNotRegisteredError(
-                f"projection references '{key}' which is not registered "
-                f"and no pack could be autoloaded for this model"
+            name = name_part
+            root = manifolds_dir()
+            search_ns = (
+                sorted(d.name for d in root.iterdir() if d.is_dir())
+                if root.exists() else []
             )
+        if variant == "raw":
+            release: str | None = None
+        elif variant.startswith("sae-"):
+            release = variant[len("sae-"):]
+        else:
+            raise ManifoldNotRegisteredError(
+                f"manifold '{key}': unsupported variant '{variant}'"
+            )
+        fname = tensor_filename(self.model_id, release=release)
+
+        matches = [
+            (ns, manifold_dir(ns, name) / fname)
+            for ns in search_ns
+            if (manifold_dir(ns, name) / fname).exists()
+        ]
+        if not matches:
+            raise ManifoldNotRegisteredError(
+                f"manifold '{key}' has no fitted tensor for {self.model_id}; "
+                f"run `saklas manifold fit` first"
+            )
+        if len(matches) > 1:
+            # A bare name collided across namespaces — refuse rather than
+            # silently pick one, mirroring concept selector resolution.
+            from saklas.io.selectors import AmbiguousSelectorError
+            qualified = ", ".join(f"{ns}/{name}" for ns, _ in matches)
+            raise AmbiguousSelectorError(
+                f"ambiguous manifold '{name}': matches {qualified}. "
+                f"Qualify it with a namespace."
+            )
+        manifold = load_manifold(matches[0][1])
+        self._manifolds[key] = manifold.to(
+            device=self._device, dtype=torch.float32,
+        )
 
     def _resolve_pole_aliases(
         self, entries: dict[str, tuple[float, Trigger]],
@@ -1775,13 +2385,13 @@ class SaklasSession:
             )
             if registry_key not in self._profiles:
                 try:
-                    self._try_autoload_vector(
-                        canonical_qualified, variant=variant,
-                    )
+                    # Unified resolution: fold a fitted manifold, or port a
+                    # legacy vectors/ folder on first touch.  May raise
+                    # Ambiguous/UnknownVariantError — keep the user's original
+                    # name in ``out`` so the error surfaces at hook-install
+                    # with a clear message.
+                    self._ensure_profile_registered(registry_key)
                 except Exception:
-                    # Autoload may raise AmbiguousVariantError / UnknownVariantError.
-                    # Keep the user's original name in `out` so the error surfaces
-                    # at hook-install time with a clear message.
                     out[name] = (float(alpha), trig)
                     continue
             effective = float(alpha) * (1 if sign >= 0 else -1)
@@ -1792,123 +2402,242 @@ class SaklasSession:
                 out[name] = (float(alpha), trig)
         return out
 
-    def _try_autoload_vector(self, canonical: str, *, variant: str = "raw") -> None:
-        """Cache-hit fast path: load an installed concept's tensor into _profiles.
+    def _ensure_profile_registered(
+        self, name: str, *, role: str = "vector",
+    ) -> dict[int, torch.Tensor]:
+        """Direction profile for ``name`` — registered tensor or folded manifold.
 
-        Walks installed concept packs, finds the first matching ``canonical``,
-        and loads its per-model tensor. ``variant`` is the resolver's output:
+        4.0 unifies the sources a steering direction can come from, **manifold
+        first** (the 6e "prefer-manifold" stance):
 
-        - ``"raw"`` — loads the unsuffixed tensor. Silent on miss (caller
-          falls through to the normal raise path). Matches pre-Task-7 behavior.
-        - ``"sae"`` — loads the unique SAE variant. Raises
-          :class:`AmbiguousVariantError` when more than one is on disk,
-          :class:`UnknownVariantError` when zero exist.
-        - ``"sae-<release>"`` — loads that specific release.
-          :class:`UnknownVariantError` when absent.
+        1. an in-memory baked direction already in ``_profiles`` (ad-hoc
+           ``extract``/``clone``/``merge`` results, ``~``/``|`` projection
+           derivations) — returned verbatim;
+        2. a fitted 2-node ``pca`` manifold on disk (native, or one a prior
+           steer already ported) — loaded via :meth:`_ensure_manifold_loaded`
+           and folded by :func:`~saklas.core.vectors.folded_vector_directions`,
+           then memoized in ``_profiles``;
+        3. a **stale** (`< PACK_FORMAT_VERSION`) statements-bearing legacy
+           ``vectors/<ns>/<name>/`` folder — ported to a 2-node manifold on
+           first touch (:meth:`_port_stale_legacy_vector`).  The port is
+           file-only; fitting runs forward passes through the model and can't
+           re-enter the generation lock from dispatch, so a freshly-ported
+           manifold has no tensor yet and the call raises with the exact
+           ``manifold fit`` command to run (or the bulk migration with ``-m``).
 
-        ``canonical`` may be namespace-qualified (``alice/foo``), in which
-        case discovery is scoped to that namespace.  Registered key in
-        ``_profiles`` matches the input form: ``canonical`` for raw, and
-        ``f"{canonical}:{variant}"`` otherwise — so namespace-qualified
-        callers get a namespace-qualified registry key back.
+        Raises :class:`VectorNotRegisteredError` when nothing resolves.
         """
-        from saklas.io.selectors import _all_concepts
-        from saklas.io.packs import enumerate_variants
-        from saklas.core.errors import AmbiguousVariantError, UnknownVariantError
-        from saklas.core.vectors import load_profile
+        existing = self._profiles.get(name)
+        if existing is not None:
+            return existing
+        if ":" in name:
+            canonical, variant = name.rsplit(":", 1)
+        else:
+            canonical, variant = name, "raw"
 
-        # Split namespace prefix so concept discovery scopes to the
-        # namespace the caller specified.  Bare canonicals leave
-        # ``namespace=None`` and pick up the first matching concept
-        # across every namespace (the historical behavior).
-        ns: str | None = None
-        bare_canonical = canonical
+        # (2) Manifold first — native or previously ported.
+        folded = self._try_fold_manifold(name)
+        if folded is not None:
+            self._profiles[name] = folded
+            return folded
+
+        # (3) Stale legacy vectors/ folder → port (file-only) and nudge to fit.
+        if variant == "raw":
+            ported = self._port_stale_legacy_vector(canonical)
+            if ported is not None:
+                folded = self._try_fold_manifold(name)
+                if folded is not None:
+                    self._profiles[name] = folded
+                    return folded
+                ns, bare = ported
+                raise VectorNotRegisteredError(
+                    f"ported legacy vector '{canonical}' to manifold "
+                    f"'{ns}/{bare}' (a 2-node pca subspace), but it has no "
+                    f"fitted tensor for {self.model_id} yet — porting is "
+                    f"file-only. Fit it: "
+                    f"`saklas manifold fit {ns}/{bare} -m {self.model_id}` "
+                    f"(or `python scripts/upgrade_packs.py --all -m {self.model_id}` "
+                    f"to migrate + fit every legacy vector at once)."
+                )
+
+        raise VectorNotRegisteredError(
+            f"No vector registered for {role} '{name}'"
+        )
+
+    def _try_fold_manifold(
+        self, name: str,
+    ) -> dict[int, torch.Tensor] | None:
+        """Load a 2-node ``pca`` manifold for ``name`` and fold it to a vector.
+
+        Returns the per-layer direction dict, or ``None`` when no fitted
+        manifold resolves (so the caller falls through to porting / autoload).
+        Re-raises only when a manifold *does* load but isn't a foldable 2-node
+        affine subspace — that's a usage error, not a miss.
+        """
+        try:
+            self._ensure_manifold_loaded(name)
+        except Exception:
+            return None
+        from saklas.core.vectors import folded_vector_directions
+        try:
+            return folded_vector_directions(self._manifolds[name])
+        except Exception as e:
+            raise VectorNotRegisteredError(
+                f"'{name}' is a manifold that does not fold to a single "
+                f"steering direction (not a 2-node affine subspace): {e}"
+            ) from e
+
+    def _port_stale_legacy_vector(
+        self, canonical: str,
+    ) -> tuple[str, str] | None:
+        """Port a stale legacy ``vectors/`` folder to a 2-node ``pca`` manifold.
+
+        4.0 6e port-on-detect.  ``canonical`` is a concept name, optionally
+        ``ns/``-qualified.  Scans ``vectors/`` *directly* (not through the
+        resolver, which after the v3 bump skips stale v2 folders) for a
+        statements-bearing folder whose ``pack.json`` is below
+        :data:`~saklas.io.packs.PACK_FORMAT_VERSION`, and ports it via
+        :func:`~saklas.io.manifolds.port_legacy_vector_folder` (file-only — no
+        tensors carried; they re-fit lazily).  Current-version packs are left
+        for the autoload path; tensor-only packs (no ``statements.json``) can't
+        re-fit and are skipped.
+
+        Returns ``(namespace, name)`` when a folder was ported or a matching
+        manifold already exists (so the caller nudges to fit), else ``None``.
+        """
+        import json as _json
+        from saklas.io.packs import PACK_FORMAT_VERSION
+        from saklas.io.paths import vectors_dir, concept_dir, manifold_dir
+        from saklas.io.manifolds import port_legacy_vector_folder
+        from saklas.io.selectors import invalidate as _invalidate_selectors
+
         if "/" in canonical:
-            ns, bare_canonical = canonical.split("/", 1)
+            ns, bare = canonical.split("/", 1)
+            candidates = [(ns, concept_dir(ns, bare))]
+        else:
+            bare = canonical
+            root = vectors_dir()
+            candidates = (
+                [(nsd.name, nsd / bare) for nsd in sorted(root.iterdir())
+                 if nsd.is_dir() and (nsd / bare).is_dir()]
+                if root.exists() else []
+            )
 
-        registry_key = canonical if variant == "raw" else f"{canonical}:{variant}"
-        available: list[str] = []
-        for concept in _all_concepts():
-            if ns is not None and concept.namespace != ns:
+        for namespace, vfolder in candidates:
+            pack_path = vfolder / "pack.json"
+            if not pack_path.exists():
                 continue
-            if concept.name != bare_canonical:
-                continue
-            variants = enumerate_variants(concept.folder, self.model_id)
-            available.extend(variants.keys())
-
-            if variant == "raw":
-                path = variants.get("raw")
-            elif variant == "sae":
-                sae_paths = {k: v for k, v in variants.items() if k.startswith("sae-")}
-                if len(sae_paths) == 0:
-                    continue
-                if len(sae_paths) > 1:
-                    raise AmbiguousVariantError(
-                        f"concept '{canonical}' has multiple SAE variants for "
-                        f"model '{self.model_id}': {sorted(sae_paths.keys())}. "
-                        f"Specify explicitly with :sae-<release>."
-                    )
-                path = next(iter(sae_paths.values()))
-            else:
-                # "sae-<release>"
-                path = variants.get(variant)
-
-            if path is None:
-                continue
-
+            if not (vfolder / "statements.json").exists():
+                continue  # tensor-only — can't re-fit, leave to autoload
             try:
-                profile_dict, _meta = load_profile(str(path))
+                fmt = _json.loads(pack_path.read_text()).get("format_version", 1)
+            except (OSError, ValueError):
+                fmt = 1
+            if isinstance(fmt, int) and fmt >= PACK_FORMAT_VERSION:
+                continue  # current — keep its tensor via autoload-fold
+            if (manifold_dir(namespace, bare) / "manifold.json").exists():
+                return (namespace, bare)  # already ported; nudge to fit
+            try:
+                port_legacy_vector_folder(vfolder, namespace=namespace, force=False)
             except Exception:
                 continue
-            # Phase 2 contract: tensor must not be stale relative to the
-            # concept's on-disk statements.json.  bootstrap_probes raises
-            # StaleSidecarError on the same condition; autoload would
-            # otherwise be a silent escape hatch for the same mismatch.
-            recorded_sha = _meta.get("statements_sha256") if _meta else None
-            stmts_path = concept.folder / "statements.json"
-            if recorded_sha and stmts_path.exists():
-                from saklas.io.packs import hash_file as _hash_file
-                if (
-                    _hash_file(stmts_path) != recorded_sha
-                    and os.environ.get("SAKLAS_ALLOW_STALE") != "1"
-                ):
-                    raise StaleSidecarError(
-                        f"{concept.namespace}/{bare_canonical}: statements.json has "
-                        f"changed since this tensor was extracted "
-                        f"(model={self.model_id}). The baked PCA no longer "
-                        f"matches the on-disk pairs. Re-extract: "
-                        f"`saklas pack refresh {concept.namespace}/{bare_canonical} "
-                        f"-m {self.model_id}` — or set SAKLAS_ALLOW_STALE=1 "
-                        f"to load the stale tensor anyway."
-                    )
-            self._profiles[registry_key] = self._promote_profile(profile_dict)
-            return
+            _invalidate_selectors()
+            return (namespace, bare)
+        return None
 
-        # Explicit non-raw variant request that didn't resolve → surface the miss.
-        if variant != "raw":
-            raise UnknownVariantError(
-                f"variant '{variant}' not found for '{canonical}' on model "
-                f"'{self.model_id}' (available: {sorted(set(available)) or 'none'})"
-            )
+    def _bootstrap_manifold_probes(
+        self, categories: list[str], *, include_fitted_defaults: bool = False,
+    ) -> dict[str, "Manifold"]:
+        """Source the default probe roster as fitted bundled manifolds.
+
+        One pass, two tiers:
+
+        - **Tagged concept axes** — for each bundled 2-node ``pca`` manifold
+          tagged in a requested category (roster from
+          :func:`~saklas.io.probes_bootstrap.load_default_manifolds`) fit-or-
+          load the per-model subspace (eager, same cost band as the legacy DiM
+          extraction — both run forward passes, both disk-cache) and hand the
+          flat :class:`Manifold` to the :class:`Monitor`, which reads it as a
+          coordinate (the rank-1 case of the subspace readout).  Registered
+          under the **bare** name (``confident.uncertain``) so the gate grammar
+          and trait panel key off it.
+        - **Fitted multi-node defaults** (``include_fitted_defaults``, the
+          ``probes=None`` default roster) — sweep every bundled ``default/``
+          manifold and additionally attach any that is *already fitted* for the
+          loaded model and not already attached (``personas`` / ``emotions``).
+          Attach-only: fitting a 107-node manifold runs a forward pass per node
+          and would block startup for minutes, so an unfitted one is skipped
+          with a one-line log (fit it and it auto-loads next launch).
+          Registered under the qualified ``default/<name>`` selector so a manual
+          attach from the manifolds drawer matches — no duplicate rows.  This
+          folds the former serve-only ``_attach_default_manifold_probes`` into
+          the construction-time pass so every frontend gets the same roster.
+
+        A fit/load failure for one manifold is logged and skipped, never fatal
+        to session construction.
+        """
+        from saklas.io.probes_bootstrap import load_default_manifolds
+        from saklas.io.paths import manifold_dir, safe_model_id
+
+        defaults = load_default_manifolds()
+        probes: dict[str, "Manifold"] = {}
+        seen: set[str] = set()
+        for cat in categories:
+            for name in defaults.get(cat, []):
+                if name in seen:
+                    continue
+                seen.add(name)
+                key = f"default/{name}"
+                try:
+                    try:
+                        self._ensure_manifold_loaded(key)
+                    except ManifoldNotRegisteredError:
+                        self.fit(manifold_dir("default", name))
+                        self._ensure_manifold_loaded(key)
+                    probes[name] = self._manifolds[key]
+                except Exception as e:
+                    _log.warning("manifold probe '%s' failed to fit/load: %s", name, e)
+
+        if not include_fitted_defaults:
+            return probes
+
+        # Attach-only sweep: every fitted bundled multi-node manifold that the
+        # tagged tier didn't already pick up (personas / emotions carry no
+        # category tag, so they fall through to here).
+        from saklas.io.manifolds import (
+            ManifoldFolder,
+            ManifoldFormatError,
+            bundled_manifold_names,
+        )
+
+        stem = safe_model_id(self.model_id)
+        for name in bundled_manifold_names():
+            key = f"default/{name}"
+            if name in probes or key in probes:
+                continue
+            try:
+                folder = ManifoldFolder.load(manifold_dir("default", name))
+            except (ManifoldFormatError, FileNotFoundError):
+                continue
+            if stem not in folder.tensor_models():
+                _log.info(
+                    "manifold probe '%s' not fitted for %s — skipping "
+                    "(fit it to auto-attach next launch)",
+                    key, self.model_id,
+                )
+                continue
+            try:
+                self._ensure_manifold_loaded(key)
+                probes[key] = self._manifolds[key]
+            except Exception as e:
+                _log.warning("manifold probe '%s' failed to load: %s", key, e)
+        return probes
 
     def _push_steering(
         self,
         entries: dict[str, SteeringStackEntry],
-        *,
-        injection_mode: str | None = None,
-        theta_max: float | None = None,
-        projection_metric: str | None = None,
     ) -> None:
         """Push an entries dict onto the steering stack and rebuild hooks.
-
-        ``injection_mode`` / ``theta_max`` / ``projection_metric`` are
-        per-scope overrides; any ``None`` field falls through to the
-        next outer scope (LIFO walk) and ultimately to the session-level
-        default.  ``projection_metric`` doesn't drive hook rebuild on its
-        own (projection materialization happens in ``steering()`` before
-        ``__enter__``); it's recorded here for symmetry with the other
-        two so :meth:`_resolve_steering_override` can answer "what
-        metric does the active scope want?" uniformly.
 
         If ``_rebuild_steering_hooks`` raises (e.g. an unknown vector
         name hits ``VectorNotRegisteredError``) the just-pushed entry is
@@ -1951,19 +2680,22 @@ class SaklasSession:
             )
         with self._gen_lock:
             self._steering_stack.append(dict(entries))
-            self._steering_override_stack.append(
-                (injection_mode, theta_max, projection_metric),
-            )
             try:
                 self._rebuild_steering_hooks()
             except BaseException:
                 self._steering_stack.pop()
-                self._steering_override_stack.pop()
                 raise
-            # Steering hooks just changed; the prefix cache (built
-            # under the previous regime) no longer represents the
-            # current pre-attention residual stream.  Drop it.
-            self._invalidate_prefix_cache()
+            # Steering hooks just changed.  A cached prefix is *unsteered*
+            # (``cache_prefix`` refuses to run inside a steering scope), so it
+            # only stops representing the current pre-attention residual stream
+            # when the new stack actually steers the prefill.  A prefill-
+            # inactive scope (``@response`` / ``@generated`` / probe-gated)
+            # leaves the prompt region untouched, so the unsteered prefix stays
+            # valid and we keep it — this is what lets ``generate_batch`` reuse
+            # one prefill across a steered batch.  Drop it only when prefill is
+            # genuinely steered.
+            if self._steering_active_in_prefill():
+                self._invalidate_prefix_cache()
         self._emit_steering_applied()
 
     def _pop_steering(self) -> None:
@@ -1992,10 +2724,13 @@ class SaklasSession:
             )
         with self._gen_lock:
             self._steering_stack.pop()
-            if self._steering_override_stack:
-                self._steering_override_stack.pop()
             self._rebuild_steering_hooks()
-            self._invalidate_prefix_cache()
+            # Symmetric with ``_push_steering``: the cached prefix is unsteered,
+            # so only invalidate when what remains on the stack still steers the
+            # prefill.  Popping back to a prefill-inactive (or empty) stack keeps
+            # the unsteered prefix valid for the next reuse.
+            if self._steering_active_in_prefill():
+                self._invalidate_prefix_cache()
         if not self._steering_stack:
             self.events.emit(SteeringCleared())
         else:
@@ -2013,7 +2748,7 @@ class SaklasSession:
         alphas_only: dict[str, float] = {}
         entries_out: dict[str, tuple[float, Trigger]] = {}
         for name, entry in flat.items():
-            if isinstance(entry, AblationTerm):
+            if isinstance(entry, (AblationTerm, ManifoldTerm)):
                 alphas_only[name] = entry.coeff
                 entries_out[name] = (entry.coeff, entry.trigger)
                 continue
@@ -2028,30 +2763,6 @@ class SaklasSession:
             flat.update(entry)
         return flat
 
-    def _resolve_steering_override(
-        self,
-    ) -> tuple[str, float]:
-        """Effective ``(injection_mode, theta_max)`` for the active scope.
-
-        Walks the override LIFO from the top, picking the first non-None
-        value for each field; falls back to the session-level default
-        when no scope set it.  Symmetric across the two fields so a
-        scope can override mode without setting θ_max and vice versa.
-        """
-        eff_mode: str | None = None
-        eff_theta: float | None = None
-        for mode, theta, _pm in reversed(self._steering_override_stack):
-            if eff_mode is None and mode is not None:
-                eff_mode = mode
-            if eff_theta is None and theta is not None:
-                eff_theta = theta
-            if eff_mode is not None and eff_theta is not None:
-                break
-        return (
-            eff_mode if eff_mode is not None else self._injection_mode,
-            eff_theta if eff_theta is not None else self._theta_max,
-        )
-
     def _steering_needs_probe_gating(self) -> bool:
         """Return True iff any active steering trigger carries a
         :class:`~saklas.core.triggers.ProbeGate`.
@@ -2063,7 +2774,7 @@ class SaklasSession:
         """
         flat = self._flatten_steering_stack()
         for entry in flat.values():
-            if isinstance(entry, AblationTerm):
+            if isinstance(entry, (AblationTerm, ManifoldTerm)):
                 if entry.trigger.gate is not None:
                     return True
                 continue
@@ -2073,16 +2784,153 @@ class SaklasSession:
                 return True
         return False
 
+    def _gated_probe_names(self) -> set[str]:
+        """Registered probe names referenced by active probe gates.
+
+        Walks the flattened steering stack, pulls each trigger's
+        :class:`~saklas.core.triggers.ProbeGate`, and maps the gate's scalar
+        ``probe`` key back to the registered monitor probe NAME — the prefix
+        before the first of ``[`` / ``:`` / ``@`` / ``~`` (e.g.
+        ``"personas[3]"`` → ``"personas"``, ``"emotions:fraction"`` →
+        ``"emotions"``, ``"confident.uncertain"`` → itself).  Only names that
+        are actually attached probes are kept, so a stale / non-probe gate key
+        doesn't shrink an otherwise-empty subset to "score nothing".  Used by
+        :meth:`_begin_capture` to scope the per-token step sink to just the
+        gated probes when gating is the sole per-token consumer (FIX #4).
+        """
+        attached = set(self._monitor.probe_names)
+        out: set[str] = set()
+        for entry in self._flatten_steering_stack().values():
+            if isinstance(entry, (AblationTerm, ManifoldTerm)):
+                trig = entry.trigger
+            else:  # (alpha, Trigger)
+                _alpha, trig = entry
+            gate = trig.gate
+            if gate is None:
+                continue
+            # Split off the channel suffix: the probe name is everything up to
+            # the first axis/fraction/label/assignment marker.
+            name = re.split(r"[\[:@~]", gate.probe, maxsplit=1)[0]
+            if name in attached:
+                out.add(name)
+        return out
+
+    def _gated_probe_keys(self) -> set[str]:
+        """Exact monitor scalar keys referenced by active probe gates."""
+        attached = set(self._monitor.probe_names)
+        out: set[str] = set()
+        for entry in self._flatten_steering_stack().values():
+            if isinstance(entry, (AblationTerm, ManifoldTerm)):
+                trig = entry.trigger
+            else:  # (alpha, Trigger)
+                _alpha, trig = entry
+            gate = trig.gate
+            if gate is None:
+                continue
+            name = re.split(r"[\[:@~]", gate.probe, maxsplit=1)[0]
+            if name in attached:
+                out.add(gate.probe)
+        return out
+
+    def _steering_active_in_prefill(self) -> bool:
+        """Return True iff any active steering term fires during prompt prefill.
+
+        A term touches the prefill residual stream iff its trigger has
+        ``prompt=True`` and carries no probe gate (probe gates report
+        inactive during prefill — there's no post-forward score yet; see
+        :meth:`~saklas.core.triggers.Trigger.active`).  When this is False the
+        prefill is numerically identical to the *unsteered* prefill, so a
+        cached unsteered prefix KV (the only kind :meth:`cache_prefix` builds)
+        stays valid for reuse.  This is the gate the prefix-cache consume path
+        keys on, and the condition under which steering push/pop preserves the
+        cache.  Mirrors :meth:`_steering_needs_probe_gating`'s stack walk.
+        """
+        flat = self._flatten_steering_stack()
+        for entry in flat.values():
+            if isinstance(entry, (AblationTerm, ManifoldTerm)):
+                trig = entry.trigger
+            else:  # (alpha, Trigger)
+                _alpha, trig = entry
+            if trig.prompt and trig.gate is None:
+                return True
+        return False
+
+    def _steering_value_prefill_inactive(
+        self, value: "str | Steering | None",
+    ) -> bool:
+        """Return True iff steering ``value`` would not touch the prompt prefill.
+
+        Pre-flight form of :meth:`_steering_active_in_prefill` over an
+        *incoming* steering value (before any scope push) — used by
+        :meth:`generate_batch` to decide whether a shared-prefix KV cache is
+        reusable across the batch.  ``None`` (no steering) is trivially
+        prefill-inactive; otherwise a term is prefill-active iff its trigger
+        has ``prompt=True`` and no probe gate.  A malformed expression (raises
+        on parse) is conservatively reported active so the caller skips
+        caching and lets the normal path surface the error.
+        """
+        from saklas.core.steering_expr import ProjectedTerm
+
+        try:
+            s = Steering.from_value(value)
+        except Exception:
+            return False
+        if s is None:
+            return True
+        default = s.trigger
+        for val in s.alphas.values():
+            if isinstance(val, (AblationTerm, ManifoldTerm, ProjectedTerm)):
+                trig = val.trigger
+            elif isinstance(val, tuple):
+                trig = val[1]
+            else:  # bare float — inherits the Steering default trigger
+                trig = default
+            if trig.prompt and trig.gate is None:
+                return False
+        return True
+
+    def _exit_internal_steering(self, steering_cm: Any, *, swallow: bool) -> None:
+        """Pop ``_generate_core``'s internally-entered steering scope.
+
+        Bypasses the ``_pop_steering`` phase guard (we're past the
+        model-forward loop and the rebuild is legitimate teardown, not a
+        callback mutating the stack mid-step) by raising the
+        ``_internal_steering_pop`` flag around the ``__exit__``.
+
+        Exception-safety-critical (Codex review v2): ``old_internal`` is
+        read *before* the ``try`` so the worst case under a signal between
+        the read and the assignment is "we never set True", not "we leave
+        True set" — the flag never leaks across the gen-lock boundary.
+
+        ``swallow`` mirrors the two call sites: the inner ``finally`` lets
+        a teardown ``Exception`` propagate (``swallow=False``); the outer
+        ``except BaseException`` path is already re-raising the original
+        failure and must not let a teardown ``Exception`` mask it
+        (``swallow=True``).  A ``BaseException`` (KeyboardInterrupt /
+        SystemExit) from ``__exit__`` always propagates in both — only the
+        ``finally`` restore runs.
+        """
+        old_internal = self._internal_steering_pop
+        try:
+            self._internal_steering_pop = True
+            steering_cm.__exit__(None, None, None)
+        except Exception:
+            if not swallow:
+                raise
+        finally:
+            self._internal_steering_pop = old_internal
+
     def _build_gating_score_callback(self):
         """Return a closure that scores latest captures into a
         ``dict[str, float]`` for ``generate_steered``'s ``score_callback``.
 
         The closure pulls ``self._capture.latest_per_layer()`` (the
-        most-recent ``[D]`` slice per layer the steering hooks
-        captured) and runs it through :meth:`TraitMonitor.score_single_token`.
-        Returns an empty dict when the capture is empty (e.g. before
-        the first forward) so probe gates report inactive instead of
-        seeing stale values from a previous gen.
+        most-recent ``[D]`` slice per layer the steering hooks captured) and
+        runs it through :meth:`Monitor.score_single_token` — one unified pass
+        over every probe shape — flattening to gate scalars via
+        :meth:`Monitor.flat_scalars`.  Returns an empty dict when the capture
+        is empty (e.g. before the first forward) so probe gates report
+        inactive instead of seeing stale values from a previous gen.
 
         Caller-side guard: only invoked when
         :meth:`_steering_needs_probe_gating` is True, so the no-gate
@@ -2092,85 +2940,203 @@ class SaklasSession:
         monitor = self._monitor
 
         def _score() -> dict[str, float]:
+            incremental_readings = getattr(self, "_incremental_readings", [])
+            incremental_gate_scores = getattr(self, "_incremental_gate_scores", [])
+            # The step sink already scored this token's readings — reuse them so
+            # the gate doesn't trigger a second pass.  In gating-only-subset mode
+            # (FIX #4) the rows hold just the gated probes, which is exactly the
+            # set the gate consults; in the full incremental mode they hold the
+            # whole roster.  Both reuse the latest appended row.
+            gating_subset = getattr(self, "_capture_gating_subset", None)
+            if gating_subset and incremental_gate_scores:
+                return incremental_gate_scores[-1]
+            if getattr(self, "_capture_incremental", False) and incremental_readings:
+                return monitor.flat_scalars(incremental_readings[-1])
             latest = capture.latest_per_layer()
             if not latest:
                 return {}
-            return monitor.score_single_token(latest)
+            gate_keys = getattr(self, "_capture_gating_keys", None)
+            if gating_subset and gate_keys:
+                return monitor.score_gate_scalars(latest, gate_keys)
+            # Flatten the coordinate readings into gate-callback scalars
+            # (``name`` aliases axis 0, ``name[i]`` per axis, ``name:fraction``,
+            # ``name@label`` for curved nearest).  Scope to the gated subset
+            # when the per-token path is gating-only (avoids the full roster).
+            agg = monitor.score_single_token(
+                latest, only=gating_subset if gating_subset else None,
+            )
+            return monitor.flat_scalars(agg)
 
         return _score
-
-    def _resolve_projection_metric(
-        self, override: str | None = None,
-    ) -> str:
-        """Effective projection metric for the about-to-materialize scope.
-
-        Walks the override LIFO top-down for the first non-None
-        ``projection_metric`` entry; ``override`` (the about-to-push
-        scope's value, not yet on the stack) takes priority over the
-        stack so a per-call ``Steering.projection_metric`` wins over
-        any outer scope.  Falls back to the session-level default
-        (``self._projection_metric``) when nothing is set.
-
-        Used by :meth:`_materialize_projections` — by the time
-        ``__enter__`` pushes the new scope onto
-        ``_steering_override_stack``, projection materialization has
-        already run and committed derived profiles to ``self._profiles``.
-        Threading the override here keeps the v2.1 default end-to-end
-        correct without re-running materialization on every scope flip.
-        """
-        if override is not None:
-            return override
-        for _mode, _theta, pm in reversed(self._steering_override_stack):
-            if pm is not None:
-                return pm
-        return self._projection_metric
 
     def _compose_steering_entries(
         self,
         entries: dict[str, SteeringStackEntry],
     ) -> None:
-        """Load entries into ``SteeringManager`` without installing hooks."""
+        """Lower the active steering entries into the ``SteeringManager`` (4.0).
+
+        Classifies every entry and composes the one unified backend:
+
+        - **push** terms (vectors, poles, ``~``/``|`` projections, affine-``%``
+          manifolds) and **ablation** terms (``!``) are grouped by trigger;
+          each group is synthesized into one merged affine subspace via
+          :func:`~saklas.core.manifold.synthesize_subspace` and registered with
+          :meth:`SteeringManager.add_subspace`;
+        - **curved-``%``** manifold terms each get their own two-op via
+          :meth:`SteeringManager.add_manifold`.
+
+        A push fragment is ``(unit-dir rows, ‖d_L‖ coord, coeff)`` so the
+        synthesizer's ``Δ = Σ coeff·(coord @ basis)`` recovers the baked
+        direction; the coeff is the term's ``along`` (the strength composes into
+        the merged target).  Ablation directions slide their axis to the
+        neutral-anchored origin (coord 0 = mean-replacement).  The neutral
+        anchor is :attr:`layer_means`; a layer with no anchor is skipped.
+        """
+        from saklas.core.manifold import synthesize_subspace
+
         self._steering.clear_all()
+        # Raw attr (not the lazily-building ``layer_means`` property): real
+        # sessions populate it at construction / first extraction, and a
+        # model-less context (test stub) keeps an empty dict rather than
+        # triggering a model-dependent build.  An empty anchor ⇒ the synthesizer
+        # skips every layer (no steering), the same degenerate path the old
+        # ablation took without ``layer_means``.
+        neutral_means = self._layer_means
+
+        # Whitened push normalization (Mahalanobis-only): hand the synthesizer the
+        # session whitener so the per-layer ``along`` budget is the whitened
+        # displacement ``‖Δ‖_M`` and the target is a whitened-unit direction —
+        # making ``along`` a scale-stable strength knob instead of inheriting each
+        # node's raw-Euclidean distance from neutral (which spans ~100× across
+        # targets).  Gated on a real session (means populated): a model-less stub
+        # keeps the Euclidean fallback, and the property soft-fails to ``None``
+        # (covers_all is then false) so a missing whitener degrades, never raises.
+        whitener = self.whitener if neutral_means else None
+
+        # trigger -> {"push": [(basis_dirs, coord_dirs, coeff)], "ablate": [dirs]}
+        grouped: dict[Trigger, dict[str, list[Any]]] = {}
+
+        def _bucket(trigger: Trigger) -> dict[str, list[Any]]:
+            return grouped.setdefault(trigger, {"push": [], "ablate": []})
+
+        from saklas.core.vectors import fold_directions_to_subspace
+
         for name, entry in entries.items():
             if isinstance(entry, AblationTerm):
-                target = entry.target
-                if target not in self._profiles:
-                    raise VectorNotRegisteredError(
-                        f"No vector registered for ablation target '{target}'"
-                    )
-                self._steering.add_ablation(
-                    target, self._profiles[target],
-                    alpha=entry.coeff, trigger=entry.trigger,
-                    layer_means=self._layer_means,
+                ablate_prof = self._ensure_profile_registered(
+                    entry.target, role="ablation target",
                 )
+                ablate_dirs = {
+                    L: v.to(torch.float32).reshape(-1)
+                    for L, v in ablate_prof.items()
+                }
+                _bucket(entry.trigger)["ablate"].append(ablate_dirs)
+                continue
+            if isinstance(entry, ManifoldTerm):
+                manifold = self._manifolds.get(entry.manifold)
+                if manifold is None:
+                    raise ManifoldNotRegisteredError(
+                        f"No manifold registered for '{entry.manifold}'"
+                    )
+                if _manifold_is_affine(manifold):
+                    # Affine ``%`` joins the merged subspace as a rank-R push
+                    # toward the position's per-layer coords — a node's real
+                    # coords for label form (``personas%pirate``) or the cardinal
+                    # RBF layout blend for free coord form (``personas%c0,c1,…``).
+                    basis_dirs, coord_dirs = _affine_manifold_push(
+                        manifold, entry.position,
+                    )
+                    _bucket(entry.trigger)["push"].append(
+                        (basis_dirs, coord_dirs, entry.along),
+                    )
+                else:
+                    self._steering.add_manifold(
+                        entry.manifold, manifold,
+                        position=entry.position,
+                        along=entry.along, onto=entry.onto,
+                        trigger=entry.trigger,
+                    )
                 continue
             alpha, trigger = entry
-            if name not in self._profiles:
-                raise VectorNotRegisteredError(f"No vector registered for '{name}'")
-            self._steering.add_vector(
-                name, self._profiles[name], alpha, trigger,
+            # 4.0 step 6b: every in-memory direction (ad-hoc extracts, clones,
+            # merges, ``~``/``|`` projections, or a folded bundled concept)
+            # lowers through the one push path — fold it to a neutral-anchored
+            # one-pole-ray subspace and push label-form, exactly as an affine
+            # ``%`` term does.  There is no separate baked-vector fragment.
+            prof = self._ensure_profile_registered(name)
+            folded = fold_directions_to_subspace(name, prof, neutral_means)
+            if not folded.layers:
+                continue
+            basis_dirs, coord_dirs = _affine_manifold_push(
+                folded, folded.node_labels[0],
+            )
+            _bucket(trigger)["push"].append((basis_dirs, coord_dirs, alpha))
+
+        # One merged affine subspace per active trigger group.
+        for i, (trigger, terms) in enumerate(grouped.items()):
+            if not terms["push"] and not terms["ablate"]:
+                continue
+            synth = synthesize_subspace(
+                terms["push"], terms["ablate"], neutral_means=neutral_means,
+                whitener=whitener,
+            )
+            if not synth.layers:
+                continue
+            self._steering.add_subspace(
+                f"__affine__{i}", synth, trigger=trigger,
             )
 
     def _install_composed_steering(self) -> None:
-        """Attach the currently-composed steering entries to model layers."""
-        eff_mode, eff_theta = self._resolve_steering_override()
+        """Attach the currently-composed steering entries to model layers.
+
+        Compiled fast path (MPS): a static-affine pure-push steering lowers to
+        the persistent branchless offset buffers (traced into the compiled
+        graph) instead of transient ctx-consulting hooks — the latter would
+        force a per-gen ``torch.compile`` recompile and graph-break at every
+        layer.  Gated on the offsets being available (compiled session) and on
+        the capture being compile-clean too: either no probes, or this gen is
+        ``_compiled_clean_eligible`` so :meth:`_begin_capture` will ride the
+        persistent capture buffers instead of transient capture hooks (slice 2).
+        Anything that isn't a constant add (curved ``%``, gate, phase, ``!``
+        ablation) returns ``None`` from :meth:`compute_static_offsets` and falls
+        through to the transient eager path.
+        """
+        self._steering_uses_compiled_offsets = False
+        # ``getattr`` defaults keep skeleton sessions (``__new__`` test stubs that
+        # bypass ``__init__``) on the transient path — they never compile.
+        if (
+            getattr(self, "_compiled", False)
+            and self._device.type == "mps"
+            and self._steering.has_compiled_offsets()
+            and (
+                not self._monitor.probe_names
+                or getattr(self, "_compiled_clean_eligible", False)
+            )
+        ):
+            offsets = self._steering.compute_static_offsets()
+            if offsets is not None:
+                self._steering.detach_transient_hooks()
+                self._steering.write_compiled_offsets(offsets)
+                self._steering_uses_compiled_offsets = True
+                return
+        # Eager / general path: zero the persistent offsets (no stale push leaks
+        # into the eager model, whose layers carry the same persistent hooks)
+        # and attach the transient ctx-consulting hooks.
+        if self._steering.has_compiled_offsets():
+            self._steering.zero_compiled_offsets()
         self._steering.apply_to_model(
             self._layers, self._device, self._dtype,
-            injection_mode=eff_mode,  # type: ignore[arg-type]
-            theta_max=eff_theta,
         )
 
     def _rebuild_steering_hooks(self) -> None:
         """Tear down existing hooks and install from the flattened stack head.
 
         Called on every push/pop.  When the stack is empty this is a clean
-        ``clear_all``.  One hook installation per active layer regardless
-        of nesting depth — ``SteeringManager.apply_to_model`` composes
-        per-layer vectors internally and groups entries by trigger within
-        each layer.  Dispatches by entry type: plain tuples route to
-        :meth:`SteeringManager.add_vector`, :class:`AblationTerm` values
-        route to :meth:`SteeringManager.add_ablation` using the term's
-        ``target`` as the registry key.
+        ``clear_all``.  One hook installation per active layer regardless of
+        nesting depth — ``_compose_steering_entries`` synthesizes the merged
+        affine subspace(s) + registers curved manifolds, and
+        ``SteeringManager.apply_to_model`` lowers them to per-layer
+        ``subspace_inject`` groups.
         """
         flat = self._flatten_steering_stack()
         if not flat:
@@ -2179,33 +3145,188 @@ class SaklasSession:
         self._compose_steering_entries(flat)
         self._install_composed_steering()
 
-    def _clear_steering(self) -> None:
-        """Remove all steering hooks from the model."""
-        self._steering.clear_all()
-
-    def _begin_capture(self, *, widen: bool = False) -> bool:
+    def _begin_capture(
+        self, *, widen: bool = False, need_per_token: bool = True,
+        gating_only_probes: set[str] | None = None,
+        gating_probe_keys: set[str] | None = None,
+        lean_per_token: bool = False,
+    ) -> bool:
         """Attach hidden-state capture. Returns True if attached.
 
-        ``widen=False`` (default): cover only probe-layer union — what
-        the monitor needs.  Fast path; matches v1 behavior.
+        ``widen=False`` (default): cover the union of vector-probe
+        layers and manifold-probe layers — what both monitors need.
+        Fast path; matches v1 behavior when only vector probes are
+        attached.
 
         ``widen=True``: cover every model layer.  Used when the caller
-        asked for ``SamplingConfig.return_hidden=True`` — the monitor
-        still reads its subset, but the full dict is available on
+        asked for ``SamplingConfig.return_hidden=True`` — the monitor still
+        reads its probe subset, but the full dict is available on
         ``GenerationResult.hidden_states`` after the run.
+
+        ``need_per_token`` (default True): whether anything consumes a
+        per-token reading this gen — a probe gate, a loom token row, a trait
+        stream, or a live-scores client.  When False (probes attached but only
+        the end-of-gen aggregate is wanted, e.g. stateless server scoring) the
+        capture runs in **aggregate-only** mode: a bounded tail ring, NO
+        per-token scoring (T scorings + T host syncs → 1 at finalize via
+        :meth:`_score_aggregate_only`).
+
+        ``gating_only_probes`` (FIX #4): when per-token scoring is needed *only*
+        to feed probe gates (no UI / trait / loom / persist consumer), this is
+        the set of gated probe names.  The incremental step sink then scores
+        just that subset every token (the gate consumes only those scalars),
+        while the big-K roster's per-token nearest-distance work is skipped.
+        The end-of-gen aggregate still covers the **full** roster: the tail ring
+        is also kept, so :meth:`_finalize_generation` pools the last content
+        token once and scores every probe (the gated subset live-scored, the
+        rest one-shot).  ``None`` (or empty) keeps the full per-token scoring.
         """
         if widen:
             layer_idxs = list(range(len(self._layers)))
         else:
-            if not self._monitor.probe_names:
+            union: set[int] = self._monitor.probe_layers()
+            if not union:
+                self._capture_incremental = False
+                self._capture_aggregate_only = False
+                self._capture_lean = False
+                self._capture_gating_subset = None
+                self._capture_persistent = False
+                self._incremental_readings = []
                 return False
-            layer_idxs = sorted({
-                idx for prof in self._monitor.profiles.values() for idx in prof
-            })
-            if not layer_idxs:
-                return False
+            layer_idxs = sorted(union)
+        # Persistent compile-clean capture (slice 2): when this gen is eligible
+        # for the compiled clean path AND steering lowered to offsets (or is
+        # unsteered), capture rides the always-on persistent buffers — the decode
+        # loop ``copy_``s each slice in inside the compiled graph, and
+        # ``ingest_persistent`` (wired as the step callback) does the per-token
+        # accumulation + scoring post-forward.  No transient ``register_forward_hook``
+        # is installed, so the routing keeps the compiled module + StaticCache.
+        # Anything that forced the eager path (curved / gated / phased steering,
+        # ``return_hidden``) falls back to transient capture hooks.
+        use_persistent = bool(
+            not widen
+            and getattr(self, "_compiled_clean_eligible", False)
+            and self._capture_buffers
+            and (
+                self._steering_uses_compiled_offsets
+                or self._steering.all_fast_path()
+            )
+        )
         self._capture.clear()
-        self._capture.attach(self._layers, layer_idxs)
+        if use_persistent:
+            self._capture.attach_persistent(layer_idxs, self._capture_buffers)
+        else:
+            self._capture.attach(self._layers, layer_idxs)
+        self._capture_persistent = use_persistent
+        self._incremental_readings = []
+        self._incremental_gate_scores = []
+        self._capture_aggregate_only = False
+        self._capture_lean = False
+        self._capture_gating_subset = None
+        self._capture_gating_keys = None
+        # Gating-only-subset path: per-token scoring is needed solely to feed
+        # probe gates, so the step sink scores only the gated probes (the gate
+        # consumes only those scalars), skipping the big-K roster's per-token
+        # nearest-distance work.  A bounded tail ring is kept alongside the sink
+        # so finalize still pools the FULL roster once via the aggregate path —
+        # the gated subset's per-token rows are NOT the source of the final
+        # readings, the one-shot full aggregate is, so no probe drops.
+        gating_subset = (
+            gating_only_probes
+            if (gating_only_probes and need_per_token and not widen
+                and self._monitor.probe_names)
+            else None
+        )
+        if not widen and self._monitor.probe_names and need_per_token and gating_subset:
+            subset = set(gating_subset)
+            gate_keys = set(gating_probe_keys or ())
+
+            def _score_step_subset(latest: dict[int, torch.Tensor]) -> None:
+                # Score ONLY the exact gate scalar keys each token (the gate's
+                # sole consumer); append even an empty dict to keep row indices
+                # aligned with decode forwards.  The full roster is pooled once at
+                # finalize from the tail ring (``_score_aggregate_only``).
+                self._incremental_gate_scores.append(
+                    self._monitor.score_gate_scalars(latest, gate_keys)
+                    if latest and gate_keys else {}
+                )
+
+            # Deep tail ring (full-roster finalize via ``tail_slice_at``) PLUS a
+            # per-token step sink (gated subset, for the gate).  ``set_incremental``
+            # would force a length-1 buffer and drop the ring, and
+            # ``set_aggregate_tail`` installs no sink, so we arm the ring first
+            # and wire the sink directly — the hook fires the sink whenever it is
+            # set, independent of the tail depth (see ``HiddenCapture._hook``).
+            self._capture.set_aggregate_tail(_AGG_TAIL_DEPTH)
+            self._capture._step_sink = _score_step_subset
+            self._capture_incremental = False
+            self._capture_aggregate_only = True
+            self._capture_gating_subset = subset
+            self._capture_gating_keys = gate_keys
+            # The subset is scored one token per step in order, so curved gated
+            # probes can warm-start their foot; cold-start the feet first.
+            self._monitor.reset_curved_feet()
+            self._monitor.enable_curved_warm(True)
+        elif (
+            not widen and self._monitor.probe_names
+            and need_per_token and lean_per_token
+        ):
+            # Lean-incremental (FIX F2): the only per-token consumers read just
+            # the axis-0 coord (the trait stream / loom probe row) — no nearest /
+            # assignment / per-layer trace, no probe gate.  Score each token
+            # ``coords_only`` (skips the big-K nearest norm + assignment softmax +
+            # per-layer host reconstruction), store the lean rows for the per-token
+            # stream, and keep a bounded tail ring so finalize re-scores the FULL
+            # aggregate once via ``_score_lean_incremental``.
+            def _score_step_lean(latest: dict[int, torch.Tensor]) -> None:
+                self._incremental_readings.append(
+                    self._monitor.score_single_token(latest, coords_only=True)
+                    if latest else {}
+                )
+
+            # Deep tail ring (full-roster aggregate at finalize) PLUS the lean
+            # per-token step sink — same dual-arming as the gating-subset path.
+            self._capture.set_aggregate_tail(_AGG_TAIL_DEPTH)
+            self._capture._step_sink = _score_step_lean
+            self._capture_incremental = False
+            self._capture_aggregate_only = False
+            self._capture_lean = True
+            # Lean rows are scored one token per step in order, so curved probes
+            # can warm-start their foot for the per-token coord stream.
+            self._monitor.reset_curved_feet()
+            self._monitor.enable_curved_warm(True)
+        elif not widen and self._monitor.probe_names and need_per_token:
+            def _score_step(latest: dict[int, torch.Tensor]) -> None:
+                # Score once while the just-produced hidden slice is still the
+                # only retained device payload.  Append even an empty dict so
+                # row indices remain aligned with decode forwards; finalization
+                # trims any terminal EOS-only overcapture to generated_ids.
+                self._incremental_readings.append(
+                    self._monitor.score_single_token(latest) if latest else {}
+                )
+
+            self._capture.set_incremental(_score_step)
+            self._capture_incremental = True
+            # The step sink scores one token per decode step in order, so curved
+            # probes can warm-start their nearest-point foot from the previous
+            # token. Cold-start the feet for this generation first.
+            self._monitor.reset_curved_feet()
+            self._monitor.enable_curved_warm(True)
+        elif not widen and self._monitor.probe_names:
+            # Aggregate-only: probes attached but no per-token consumer. Keep a
+            # bounded tail ring, score nothing per token; finalize pools the
+            # last content token once. Curved warm-start is a sequential-live
+            # optimization, so leave it off for the one-shot aggregate read.
+            self._capture.set_aggregate_tail(_AGG_TAIL_DEPTH)
+            self._capture_incremental = False
+            self._capture_aggregate_only = True
+            self._monitor.enable_curved_warm(False)
+        else:
+            self._capture_incremental = False
+            # Non-incremental reads (return_hidden full stack, or no probes) are
+            # scored out of order / one-shot, so keep curved probes on the cold
+            # foot solve for reproducibility.
+            self._monitor.enable_curved_warm(False)
         return True
 
     def _end_capture(self) -> None:
@@ -2213,14 +3334,67 @@ class SaklasSession:
 
     # -- Score entry points --
 
+    def score_choices(
+        self,
+        messages: list[dict[str, str]],
+        choices: list[str],
+        *,
+        assistant_prefix: str = "",
+        labels: list[str] | None = None,
+        steering: "str | Steering | None" = None,
+        system_prompt: str | None = None,
+    ) -> "ChoiceScores":
+        """Restricted-choice logprob distribution over ``choices``.
+
+        Scores each candidate completion against the raw model distribution
+        given ``messages`` (+ optional ``assistant_prefix`` before the slot) and
+        returns the set with per-candidate ``sum``/``mean`` logprobs and their
+        softmax probabilities. ``steering=`` runs the scoring forward under a
+        steering expression — the distributional before/after read. See
+        :func:`saklas.core.scoring.score_choices`.
+        """
+        from saklas.core.scoring import score_choices as _score_choices
+
+        return _score_choices(
+            self, messages, choices,
+            assistant_prefix=assistant_prefix, labels=labels,
+            steering=steering, system_prompt=system_prompt,
+        )
+
+    def score_template(
+        self,
+        template: "str | TemplateFolder",
+        *,
+        steering: "str | Steering | None" = None,
+        system_prompt: str | None = None,
+    ) -> list["ChoiceScores"]:
+        """Score a template's values against each of its contexts.
+
+        ``template`` is a :class:`~saklas.io.templates.TemplateFolder` or a
+        selector string (``<name>`` / ``<ns>/<name>``). Returns one
+        :class:`~saklas.core.scoring.ChoiceScores` per context.
+        """
+        from saklas.core.scoring import score_template as _score_template
+        from saklas.io.templates import TemplateFolder, resolve_template
+
+        tmpl = (
+            template if isinstance(template, TemplateFolder)
+            else resolve_template(template)
+        )
+        return _score_template(
+            self, tmpl, steering=steering, system_prompt=system_prompt,
+        )
+
     def score_captured(
         self, generated_ids: list[int], *, accumulate: bool = True,
-    ) -> tuple[dict[str, float], dict[str, list[float]]]:
+    ) -> tuple[dict[str, "ProbeReading"], dict[str, list[float]]]:
         """Score probes from the last hidden-state capture.
 
-        Returns ``(aggregate_vals, per_token_scores)``. Both dicts are empty
-        when the capture was never attached or the generation produced no
-        tokens.
+        Returns ``(aggregate_readings, per_token_scores)`` — the aggregate is a
+        per-probe :class:`ProbeReading` (coordinate reading), and
+        ``per_token_scores`` is the per-probe axis-0 coordinate stream. Both
+        dicts are empty when the capture was never attached or the generation
+        produced no tokens.
         """
         captured = self._capture.stacked()
         if not captured or not generated_ids:
@@ -2229,6 +3403,103 @@ class SaklasSession:
             captured, generated_ids, self._tokenizer, accumulate=accumulate,
         )
 
+    def _score_incremental(
+        self, generated_ids: list[int], *, accumulate: bool = True,
+    ) -> tuple[dict[str, "ProbeReading"], dict[str, list[float]]]:
+        """Aggregate readings + per-token coord stream from live-scored rows."""
+        names = list(self._monitor.probe_names)
+        empty_agg = {
+            name: ProbeReading(fraction=0.0, nearest=[], coords=())
+            for name in names
+        }
+        n = len(generated_ids)
+        if n == 0 or not self._incremental_readings:
+            return empty_agg, {name: [] for name in names}
+
+        from saklas.core.vectors import last_content_index
+        rows = self._incremental_readings[:n]
+        per_token: dict[str, list[float]] = {name: [0.0] * n for name in names}
+        for i, readings in enumerate(rows):
+            for name, reading in readings.items():
+                if name in per_token:
+                    per_token[name][i] = (
+                        reading.coords[0] if reading.coords else 0.0
+                    )
+
+        agg_idx = last_content_index(generated_ids, self._tokenizer)
+        agg_row = rows[agg_idx] if agg_idx < len(rows) else {}
+        agg_vals = {
+            name: agg_row.get(name, empty_agg[name]) for name in names
+        }
+        if accumulate and agg_vals:
+            self._monitor.accumulate_readings(agg_vals)
+        return agg_vals, per_token
+
+    def _score_aggregate_only(
+        self, generated_ids: list[int], *, accumulate: bool = True,
+    ) -> dict[str, "ProbeReading"]:
+        """Score *only* the end-of-gen aggregate from the bounded tail ring.
+
+        The aggregate-only capture path (``_capture_aggregate_only``) scored
+        nothing per token; here we pool the last content token's slice from the
+        tail ring and run one :meth:`Monitor.score_aggregate`.  ``generated_ids``
+        token ``k`` was produced by decode forward ``k``, so the last content
+        token's forward index is ``last_content_index(generated_ids)`` — which
+        :meth:`HiddenCapture.tail_slice_at` maps into the ring.
+        """
+        names = list(self._monitor.probe_names)
+        empty = {
+            name: ProbeReading(fraction=0.0, nearest=[], coords=())
+            for name in names
+        }
+        if not generated_ids:
+            return empty
+        from saklas.core.vectors import last_content_index
+        agg_fwd = last_content_index(generated_ids, self._tokenizer)
+        pooled = self._capture.tail_slice_at(agg_fwd)
+        if not pooled:
+            return empty
+        # One-shot pooled read over the full roster — keep curved probes on the
+        # cold foot solve so the aggregate is reproducible (it pools the last
+        # *content* token, which may differ from the live loop's last forward,
+        # so a warm foot seeded during gating-only subset scoring would not be
+        # the right warm start here).
+        self._monitor.enable_curved_warm(False)
+        agg_vals = self._monitor.score_aggregate(pooled)
+        # Fill any probe the pool missed (e.g. a layer absent from the ring).
+        agg_vals = {name: agg_vals.get(name, empty[name]) for name in names}
+        if accumulate and agg_vals:
+            self._monitor.accumulate_readings(agg_vals)
+        return agg_vals
+
+    def _score_lean_incremental(
+        self, generated_ids: list[int], *, accumulate: bool = True,
+    ) -> tuple[dict[str, "ProbeReading"], dict[str, list[float]]]:
+        """Lean per-token coord stream + full aggregate from the tail ring (FIX F2).
+
+        The lean-incremental capture path scored each token ``coords_only`` (just
+        the cross-layer axis-0 coord / fraction, no nearest / assignment /
+        per-layer trace), so the per-token coordinate stream comes straight from
+        those stored rows.  The end-of-gen aggregate, which DOES carry the full
+        reading, is re-scored once from the bounded tail ring via
+        :meth:`_score_aggregate_only` — so no field is lost despite the lean
+        per-token rows.
+        """
+        names = list(self._monitor.probe_names)
+        n = len(generated_ids)
+        per_token: dict[str, list[float]] = {name: [0.0] * n for name in names}
+        rows = self._incremental_readings[:n]
+        for i, readings in enumerate(rows):
+            for name, reading in readings.items():
+                if name in per_token:
+                    per_token[name][i] = (
+                        reading.coords[0] if reading.coords else 0.0
+                    )
+        agg_vals = self._score_aggregate_only(
+            generated_ids, accumulate=accumulate,
+        )
+        return agg_vals, per_token
+
     @overload
     def score_hidden(
         self,
@@ -2236,7 +3507,7 @@ class SaklasSession:
         *,
         per_token: Literal[False] = False,
         accumulate: bool = False,
-    ) -> dict[str, float]: ...
+    ) -> dict[str, "ProbeReading"]: ...
     @overload
     def score_hidden(
         self,
@@ -2244,7 +3515,7 @@ class SaklasSession:
         *,
         per_token: Literal[True],
         accumulate: bool = False,
-    ) -> tuple[dict[str, float], dict[str, list[float]]]: ...
+    ) -> tuple[dict[str, "ProbeReading"], dict[str, list[float]]]: ...
     def score_hidden(
         self,
         hidden: dict[int, torch.Tensor],
@@ -2252,8 +3523,8 @@ class SaklasSession:
         per_token: bool = False,
         accumulate: bool = False,
     ) -> (
-        dict[str, float]
-        | tuple[dict[str, float], dict[str, list[float]]]
+        dict[str, "ProbeReading"]
+        | tuple[dict[str, "ProbeReading"], dict[str, list[float]]]
     ):
         """Score registered probes against a pre-captured hidden-state dict.
 
@@ -2264,11 +3535,12 @@ class SaklasSession:
 
         Shape rules:
         - Each value ``[D]``          → single-state aggregate.
-          Returns ``dict[probe, float]``.
+          Returns ``dict[probe, ProbeReading]``.
         - Each value ``[T, D]``       → per-token stack.
           ``per_token=False`` (default) returns the aggregate pooled from
           row ``T-1``; ``per_token=True`` returns
-          ``(aggregate, per_token_scores)``.
+          ``(aggregate, per_token_scores)`` where ``per_token_scores`` is
+          the per-probe axis-0 coordinate stream.
 
         Mixed shapes (``[D]`` alongside ``[T, D]``) or uneven ``T`` across
         layers raise :class:`SaklasError`. Empty dict raises.
@@ -2305,11 +3577,11 @@ class SaklasSession:
         # violating the "all public errors are SaklasError" invariant.
         for layer_idx, t in hidden.items():
             actual_dim = t.shape[-1]
-            for probe_name, profile in self._monitor.profiles.items():
-                probe_vec = profile.get(layer_idx)
-                if probe_vec is None:
+            for probe_name, manifold in self._monitor.manifolds.items():
+                sub = manifold.layers.get(layer_idx)
+                if sub is None:
                     continue
-                expected_dim = probe_vec.shape[-1]
+                expected_dim = sub.mean.shape[-1]
                 if expected_dim != actual_dim:
                     raise SaklasError(
                         f"score_hidden: dim mismatch at layer {layer_idx} — "
@@ -2345,30 +3617,98 @@ class SaklasSession:
 
     # -- Monitoring --
 
-    def probe(self, name: str, profile: dict | None = None) -> None:
-        if profile is None:
-            _, profile = self.extract(name)
+    def add_probe(
+        self,
+        selector: str,
+        *,
+        as_name: str | None = None,
+        top_n: int = 3,
+    ) -> str:
+        """Attach a read-side probe — any shape — and return its name.
+
+        One attach for vector and manifold probes alike: a vector probe is the
+        rank-1 case of the unified subspace readout.  ``selector`` rides the
+        same ``[ns/]name[:variant]`` shape the steering grammar uses for ``%``
+        operands, so a probe shares the lazy-load cache with a manifold steered
+        through ``<selector>%<position>``.  ``as_name`` overrides the registered
+        name (default ``selector``); ``top_n`` sets the nearest-node list
+        length.  Resolution order is in :meth:`_resolve_probe_manifold`.
+        """
+        # Manifold reads are Mahalanobis-only: force the lazy whitener build
+        # (and its push into the monitor) before attaching, or ``add_probe`` →
+        # ``_build_whitened_factors`` raises on a missing covering whitener.
+        _ = self.whitener
+        name = as_name if as_name is not None else selector
+        # Probe attach loads the manifold onto the model device and builds
+        # device-resident whitened factors — GPU work that must not run
+        # concurrently with a fit / extract / generation on PyTorch's single
+        # global MPS command buffer (which would abort the process).  Hold the
+        # exclusive-GPU ``_gen_lock`` non-blocking: a cross-thread model op in
+        # flight refuses rather than races; same-thread reentry passes (RLock).
+        if not self._gen_lock.acquire(blocking=False):
+            raise ConcurrentExtractionError(
+                "add_probe called while another model operation is in "
+                "flight; retry shortly"
+            )
+        try:
+            manifold = self._resolve_probe_manifold(selector)
+            self._monitor.add_probe(name, manifold, top_n=top_n)
+        finally:
+            self._gen_lock.release()
+        # New probe → _begin_capture attaches a different layer set than was
+        # live when the prefix was prefilled; drop the cache so the next gen
+        # re-prefills with the fresh capture-attach layout in place.
+        self._invalidate_prefix_cache()
+        # Transcript probe-hash cache is keyed by name; any change to the
+        # registered probes invalidates the relevant entry.
+        self._probe_hash_cache.pop(name, None)
+        self._invalidate_analytics_cache()
+        return name
+
+    def remove_probe(self, name: str) -> None:
+        """Detach a previously-attached probe (any shape)."""
+        self._monitor.remove_probe(name)
+        self._invalidate_prefix_cache()
+        self._probe_hash_cache.pop(name, None)
+        self._invalidate_analytics_cache()
+
+    def _resolve_probe_manifold(self, selector: str) -> "Manifold":
+        """Resolve a probe selector to a loaded :class:`Manifold`.
+
+        Mirrors the steering resolver, in order: (1) an in-memory baked
+        ``Profile`` already in ``_profiles`` (ad-hoc ``extract`` / ``merge`` /
+        projection results) → folded into a 1-node neutral-anchored ray;
+        (2) a fitted manifold on disk (``[ns/]name[:variant]``) → loaded
+        directly, so a 2-node ``pca`` reads rank-1 and a discover / curved fit
+        reads rank-R; (3) a bare concept with neither → extracted, then folded.
+        """
+        profile = self._profiles.get(selector)
+        if profile is not None:
+            return self._fold_profile_probe(selector, profile)
+        try:
+            self._ensure_manifold_loaded(selector)
+            return self._manifolds[selector]
+        except ManifoldNotRegisteredError:
+            pass
+        _, profile = self.extract(selector)
+        return self._fold_profile_probe(selector, profile)
+
+    def _fold_profile_probe(self, name: str, profile: Any) -> "Manifold":
+        """Fold a baked per-layer ``Profile`` into a 1-node neutral-anchored ray.
+
+        A ``Profile`` is a per-layer baked direction; the monitor reads probes
+        as flat manifolds (the rank-1 coordinate case), so fold it via the
+        same primitive ``extract`` uses for a monopolar concept.
+        """
         if not self._layer_means:
             self._layer_means = bootstrap_layer_means(
                 self._model, self._tokenizer, self._layers, self._model_info,
             )
             self._monitor.layer_means = self._layer_means
-        self._monitor.add_probe(name, profile)
-        # New probe → _begin_capture would attach to a different
-        # layer set than was live when the prefix was prefilled.
-        # Drop the cache so the next gen reprefills with the fresh
-        # capture-attach layout in place. (Probes don't mutate hidden
-        # states, but the safer default keeps the contract simple.)
-        self._invalidate_prefix_cache()
-        # Transcript probe-hash cache (v2.3 phase 5) is keyed by name;
-        # any change to the registered profiles invalidates the relevant
-        # entry (cheaper to drop the whole map than diff per-probe).
-        self._probe_hash_cache.pop(name, None)
-
-    def unprobe(self, name: str) -> None:
-        self._monitor.remove_probe(name)
-        self._invalidate_prefix_cache()
-        self._probe_hash_cache.pop(name, None)
+        from saklas.core.vectors import fold_directions_to_subspace
+        return fold_directions_to_subspace(
+            name, dict(profile), self._layer_means, whitener=self.whitener,
+        )
 
     def _probe_hash(self, name: str) -> str | None:
         """Return sha256 hex of the baked tensor bytes for ``name``.
@@ -2385,24 +3725,45 @@ class SaklasSession:
         """
         if name in self._probe_hash_cache:
             return self._probe_hash_cache[name]
-        profile = self._monitor.profiles.get(name)
-        if profile is None:
+        manifold = self._monitor.manifolds.get(name)
+        if manifold is None:
             return None
+        # Hash the probe's baked direction view (the folded ``{L: δ̂_L ·
+        # share_L}``) for continuity with the pre-coords scalar monitor:
+        # the per-layer baked tensor is what the transcript-drift check
+        # compared, and it's stable across the manifold round-trip.
+        from saklas.core.vectors import folded_vector_directions
         import hashlib
         h = hashlib.sha256()
-        for layer_idx in sorted(profile.keys()):
-            tensor = profile[layer_idx]
-            # ``tensor.detach().cpu().contiguous()`` keeps the hash stable
-            # across device placements; fp32 cast normalizes dtype so
-            # mixed-precision storage doesn't change the hex digest.
-            try:
-                arr = tensor.detach().to("cpu").to(torch.float32).contiguous()
-                h.update(arr.numpy().tobytes())
-            except Exception:
-                # Synthetic probes from unit tests may not be torch
-                # tensors — fall through to a stable text representation
-                # so the cache still produces something deterministic.
-                h.update(repr((layer_idx, tensor)).encode("utf-8"))
+        try:
+            # 2-node R=1 concept probe: hash the folded baked-direction view,
+            # for continuity with the pre-coords scalar monitor's drift check.
+            profile = folded_vector_directions(manifold)
+            per_layer = {L: [profile[L]] for L in profile}
+        except ValueError:
+            # Multi-node / curved probe (e.g. ``personas``): no R=1 fold exists.
+            # Hash the per-layer subspace geometry directly — mean + basis (+ the
+            # real node_coords when stamped) — a deterministic digest for any
+            # manifold shape, so attaching a multi-node probe is reproducible too.
+            per_layer = {}
+            for layer_idx, sub in manifold.layers.items():
+                tensors = [sub.mean, sub.basis]
+                if sub.node_coords is not None:
+                    tensors.append(sub.node_coords)
+                per_layer[layer_idx] = tensors
+        for layer_idx in sorted(per_layer.keys()):
+            for tensor in per_layer[layer_idx]:
+                # ``tensor.detach().cpu().contiguous()`` keeps the hash stable
+                # across device placements; fp32 cast normalizes dtype so
+                # mixed-precision storage doesn't change the hex digest.
+                try:
+                    arr = tensor.detach().to("cpu").to(torch.float32).contiguous()
+                    h.update(arr.numpy().tobytes())
+                except Exception:
+                    # Synthetic probes from unit tests may not be torch
+                    # tensors — fall through to a stable text representation
+                    # so the cache still produces something deterministic.
+                    h.update(repr((layer_idx, tensor)).encode("utf-8"))
         digest = h.hexdigest()
         self._probe_hash_cache[name] = digest
         return digest
@@ -2445,6 +3806,39 @@ class SaklasSession:
 
     # -- Recipe-override regen (v2.3 phase 5) --
 
+    def _resolve_anchor_recipe(
+        self,
+        parent_node_id: str | None,
+        *,
+        base_recipe: "Recipe | None" = None,
+    ) -> "Recipe":
+        """Resolve the recipe a regen-modifier override composes onto.
+
+        Precedence: an explicit ``base_recipe`` wins; else the parent's
+        recipe when the parent is an assistant carrying one; else the
+        nearest assistant *ancestor* with a recipe (so a user-anchored
+        regen still finds one to overlay); else an empty :class:`Recipe`.
+        ``parent_node_id`` may be ``None`` (no parent context) — only the
+        empty-Recipe fallback applies then.
+        """
+        from saklas.core.loom import Recipe
+
+        if base_recipe is not None:
+            return base_recipe
+        anchor: "Recipe | None" = None
+        if parent_node_id is not None:
+            parent = self.tree.nodes.get(parent_node_id)
+            if parent is not None:
+                if parent.role == "assistant" and parent.recipe is not None:
+                    anchor = parent.recipe
+                else:
+                    for nid in self.tree.ancestors_of(parent_node_id):
+                        anc = self.tree.nodes.get(nid)
+                        if anc is not None and anc.role == "assistant" and anc.recipe is not None:
+                            anchor = anc.recipe
+                            break
+        return anchor if anchor is not None else Recipe()
+
     def regen_with_modifier(
         self,
         parent_node_id: str,
@@ -2468,26 +3862,14 @@ class SaklasSession:
         ``/regen N <mode>`` flow both call this.  Returns a
         :class:`RunSet` even when ``n == 1``.
         """
-        from saklas.core.loom import Recipe
-
         parent = self.tree.get(parent_node_id)
-        # Walk up to find the assistant whose recipe we're overlaying —
-        # if the caller passed a user node, use its existing assistant
-        # child's recipe (regen replaces that assistant).
-        anchor: "Recipe | None" = None
-        if base_recipe is not None:
-            anchor = base_recipe
-        elif parent.role == "assistant" and parent.recipe is not None:
-            anchor = parent.recipe
-        else:
-            # Pick the most recent assistant ancestor's recipe.
-            for nid in self.tree.ancestors_of(parent_node_id):
-                anc = self.tree.nodes.get(nid)
-                if anc is not None and anc.role == "assistant" and anc.recipe is not None:
-                    anchor = anc.recipe
-                    break
-        if anchor is None:
-            anchor = Recipe()
+        # Resolve the assistant recipe we're overlaying — if the caller
+        # passed a user node, walk to the nearest assistant ancestor's
+        # recipe (regen replaces that assistant); see
+        # ``_resolve_anchor_recipe``.
+        anchor = self._resolve_anchor_recipe(
+            parent_node_id, base_recipe=base_recipe,
+        )
 
         # compose_modifier handles both str ("unsteered"/"inverted"/...)
         # and Recipe (custom) — the dispatch lives on the dataclass.
@@ -2498,10 +3880,7 @@ class SaklasSession:
         # Resolve which node to anchor the regen under.  If the caller
         # passed an assistant node, regen siblings under its user-parent;
         # if a user node, siblings under it directly.
-        if parent.role == "assistant":
-            anchor_user_id = parent.parent_id
-        else:
-            anchor_user_id = parent_node_id
+        anchor_user_id = parent.parent_id if parent.role == "assistant" else parent_node_id
 
         # Reuse the existing user-turn text for sibling spawning.  When
         # the anchor is a user turn we feed the user-turn text to
@@ -2679,6 +4058,9 @@ class SaklasSession:
         self,
         parent_node_id: str | None,
         text: str,
+        *,
+        allow_any_parent: bool = False,
+        role_label: str | None = None,
     ) -> str:
         """Land a user turn under ``parent_node_id`` without generating.
 
@@ -2696,6 +4078,11 @@ class SaklasSession:
         returned without growing the tree, matching the regen workflow.
         Returns the new (or deduped) user node id.
 
+        ``allow_any_parent`` skips the user-under-user guard: in flat
+        (base-model) mode the role tag is authorship provenance, not a
+        turn-taking constraint, so an authored span may hang under a
+        node of any role.
+
         ``text`` must be non-empty (whitespace-only is honored, but a
         completely empty string raises) — empty commits should be
         no-op'd at the surface, not sent over the wire.
@@ -2704,13 +4091,17 @@ class SaklasSession:
             raise InvalidNodeOperationError(
                 "append_user_turn: text must be non-empty"
             )
-        self._check_user_send_target(parent_node_id)
-        return self.tree.add_user_turn(text, parent_id=parent_node_id)
+        if not allow_any_parent:
+            self._check_user_send_target(parent_node_id)
+        return self.tree.add_user_turn(
+            text, parent_id=parent_node_id, role_label=role_label)
 
     def append_assistant_turn(
         self,
         user_node_id: str,
         text: str,
+        *,
+        role_label: str | None = None,
     ) -> str:
         """Land a user-authored assistant turn under ``user_node_id``.
 
@@ -2749,7 +4140,8 @@ class SaklasSession:
                 f"empty sequence — nothing to commit"
             )
 
-        new_id = self.tree.begin_assistant(user_node_id, recipe=None)
+        new_id = self.tree.begin_assistant(
+            user_node_id, recipe=None, role_label=role_label)
         # Drop the empty token blobs ``begin_assistant`` seeded — an
         # authored turn has no per-token scores; ``None`` matches the
         # transcript-loaded shape so renderers/saves treat it the same.
@@ -3035,33 +4427,79 @@ class SaklasSession:
     # -- Generation helpers --
 
     def _prepare_input(
-        self, input, raw: bool = False, thinking: bool = False,
+        self, input: Any, raw: bool = False, thinking: bool = False,
         stateless: bool = False,
         parent_node_id: str | None = None,
+        user_role: str | None = None,
+        assistant_role: str | None = None,
+        to_device: bool = True,
     ) -> torch.Tensor:
+        if raw and isinstance(input, str):
+            # Flat (base-model / completion) path: no chat template, no
+            # role markers.  The model sees the active-path text verbatim
+            # — every node along the loom path concatenated — plus this
+            # call's own ``input``.  ``stateless`` skips the tree walk so
+            # the buffer is purely ``input``.
+            prefix = "" if stateless else self.tree.flat_text(parent_node_id)
+            encoded = self._tokenizer.encode(
+                prefix + input, return_tensors="pt",
+            )
+            ids = cast(torch.Tensor, encoded)  # return_tensors="pt" gives Tensor, not list[int]
+            return ids.to(self._device) if to_device else ids
         if isinstance(input, str):
             if stateless:
-                prior: list[dict[str, str]] = []
+                prior: list[dict[str, Any]] = []
             else:
                 # Walk the path to ``parent_node_id`` (or the active node).
                 # Loom: the model sees the conversation along whatever path
                 # the user is currently focused on, not a single flat log.
-                prior = self.tree.messages_for(parent_node_id)
-            messages = prior + [{"role": "user", "content": input}]
+                # ``with_labels`` carries each prior turn's stamped
+                # ``role_label`` so the render is faithful per-turn — earlier
+                # turns render with the roles they were *sent* with.
+                prior = self.tree.messages_for(parent_node_id, with_labels=True)
+            # The new user turn carries this send's user-role label.
+            messages = prior + [
+                {"role": "user", "content": input, "label": user_role}
+            ]
         elif isinstance(input, list):
             messages = list(input)
         else:
             raise TypeError(f"Unsupported input type: {type(input)}")
-        if raw and isinstance(input, str):
-            return self._tokenizer.encode(
-                input, return_tensors="pt",
-            ).to(self._device)
-        return build_chat_input(
+        # Generation-prompt assistant label: a role-augmented steering scope
+        # (``_active_role``, transient, set by ``_SteeringContext`` for
+        # ``:role-<slug>`` vectors / persona manifolds) wins so steer
+        # baseline matches extract baseline; otherwise this send's
+        # ``assistant_role`` box drives the to-be-generated turn.  Prior
+        # turns' labels ride on the messages themselves (above).
+        steer_role = getattr(self, "_active_role", None)
+        gen_role = steer_role if steer_role is not None else assistant_role
+        model_type_for_role: str | None = None
+        any_label = gen_role is not None or any(
+            isinstance(m, dict) and m.get("label") for m in messages
+        )
+        if any_label:
+            model_cfg = getattr(self._model, "config", None)
+            text_cfg = (
+                getattr(model_cfg, "text_config", None)
+                if model_cfg is not None else None
+            )
+            model_type_for_role = (
+                getattr(text_cfg, "model_type", None)
+                if text_cfg is not None
+                else None
+            )
+            if model_type_for_role is None and model_cfg is not None:
+                model_type_for_role = getattr(model_cfg, "model_type", None)
+        ids = build_chat_input(
             self._tokenizer, messages, self.config.system_prompt,
             thinking=thinking,
-        ).to(self._device)
+            gen_role=gen_role,
+            model_type=model_type_for_role,
+        )
+        return ids.to(self._device) if to_device else ids
 
     def build_readings(self) -> dict[str, ProbeReadings]:
+        """Per-probe cross-generation :class:`ProbeReadings`, per coordinate axis."""
         readings: dict[str, ProbeReadings] = {}
         if not self._monitor.probe_names:
             return readings
@@ -3070,25 +4508,48 @@ class SaklasSession:
             count = stats["count"]
             if count == 0:
                 continue
-            mean = stats["sum"] / count
-            variance = max(0.0, stats["sum_sq"] / count - mean ** 2)
-            std = variance ** 0.5
-            hist = list(self._monitor.history.get(name, []))
+            # Per-axis accumulators (axis 0 falls back to the scalar stats
+            # for a degenerate probe with no axis record).
+            axes = self._monitor.axis_stats(name) or [stats]
+            R = len(axes)
+            hist = [tuple(float(c) for c in coords)
+                    for coords in self._monitor.history.get(name, [])]
+            # An empty reading is accumulated as the rank-1 ``(0.0,)`` fallback
+            # (monitor ``_apply_accumulate``), while ``axes`` grows to the max
+            # rank a probe ever saw — so a probe that yields both an empty and a
+            # full reading leaves ``hist`` ragged.  Pad short rows to ``R`` (zeros
+            # match the axis-0 empty fallback) so the per-axis delta never
+            # over-indexes and ``per_generation`` stays uniform-width.
+            if any(len(row) < R for row in hist):
+                hist = [row + (0.0,) * (R - len(row)) if len(row) < R else row
+                        for row in hist]
+            means = tuple(a["sum"] / count for a in axes)
+            stds = tuple(
+                max(0.0, a["sum_sq"] / count - (a["sum"] / count) ** 2) ** 0.5
+                for a in axes
+            )
+            mins = tuple(
+                a["min"] if a["min"] != float("inf") else 0.0 for a in axes
+            )
+            maxs = tuple(
+                a["max"] if a["max"] != float("-inf") else 0.0 for a in axes
+            )
             if len(hist) >= 2:
-                deltas = [abs(hist[i] - hist[i-1]) for i in range(1, len(hist))]
-                delta_per_gen = sum(deltas) / len(deltas)
+                delta = tuple(
+                    sum(abs(hist[i][k] - hist[i - 1][k])
+                        for i in range(1, len(hist))) / (len(hist) - 1)
+                    for k in range(R)
+                )
             else:
-                delta_per_gen = 0.0
+                delta = tuple(0.0 for _ in range(R))
             readings[name] = ProbeReadings(
-                per_generation=hist, mean=mean, std=std,
-                min=stats["min"] if stats["min"] != float("inf") else 0.0,
-                max=stats["max"] if stats["max"] != float("-inf") else 0.0,
-                delta_per_gen=delta_per_gen,
+                per_generation=hist, mean=means, std=stds,
+                min=mins, max=maxs, delta_per_gen=delta,
             )
         return readings
 
     def _finalize_generation(
-        self, input, generated_ids: list[int], elapsed: float,
+        self, input: Any, generated_ids: list[int], elapsed: float,
         vector_snapshot: dict[str, float], prompt_tokens: int = 0,
         stateless: bool = False,
         logprobs_list: list[tuple[int, float, list[Any]]] | None = None,
@@ -3107,23 +4568,71 @@ class SaklasSession:
             self._gen_state.finish_reason == "stop_sequence"
             and self._gen_state.response_text is not None
         ):
-            text = self._gen_state.response_text
+            text: str = self._gen_state.response_text
         else:
-            text = self._tokenizer.decode(response_ids, skip_special_tokens=True)
+            _decoded = self._tokenizer.decode(response_ids, skip_special_tokens=True)
+            text = _decoded if isinstance(_decoded, str) else _decoded[0]
 
-        if self._monitor.probe_names and generated_ids:
-            agg_vals, per_token = self.score_captured(
-                generated_ids, accumulate=not stateless,
+        captured_stack: dict[int, torch.Tensor] = {}
+        if (
+            generated_ids
+            and (
+                return_hidden
+                or (
+                    self._monitor.probe_names
+                    and not self._capture_incremental
+                    and not self._capture_aggregate_only
+                    and not self._capture_lean
+                )
             )
+        ):
+            # Full stack only for return_hidden or the non-incremental
+            # full-retention path; the aggregate-only / lean tail ring is pooled
+            # via ``_score_aggregate_only`` (``stacked()`` would stack the tail
+            # ring, not the full [T, D]).
+            captured_stack = self._capture.stacked()
+
+        agg_vals: dict[str, ProbeReading] = {}
+        if self._monitor.probe_names and generated_ids:
+            if self._capture_incremental:
+                agg_vals, per_token = self._score_incremental(
+                    generated_ids, accumulate=not stateless,
+                )
+            elif self._capture_lean:
+                # Lean per-token coord stream + full aggregate from the tail ring.
+                agg_vals, per_token = self._score_lean_incremental(
+                    generated_ids, accumulate=not stateless,
+                )
+            elif self._capture_aggregate_only:
+                # No per-token stream was produced — score the aggregate once.
+                agg_vals = self._score_aggregate_only(
+                    generated_ids, accumulate=not stateless,
+                )
+                per_token = {}
+            else:
+                if captured_stack:
+                    agg_vals, per_token = self._monitor.score_per_token(
+                        captured_stack, generated_ids, self._tokenizer,
+                        accumulate=not stateless,
+                    )
+                else:
+                    agg_vals, per_token = {}, {}
             self._last_per_token_scores = per_token or None
             if stateless:
-                readings = {
-                    name: ProbeReadings(
-                        per_generation=[v], mean=v, std=0.0,
-                        min=v, max=v, delta_per_gen=0.0,
+                # Stateless gens never touch the monitor's running history,
+                # so synthesize a single-generation ``ProbeReadings`` per
+                # probe straight from this gen's aggregate coordinate tuple
+                # (zero spread — one observation).  ``r.coords`` is the
+                # ``R``-tuple of authoring coords; a degenerate empty reading
+                # falls back to a single 0.0 axis.
+                readings = {}
+                for name, r in agg_vals.items():
+                    c = r.coords or (0.0,)
+                    zeros = tuple(0.0 for _ in c)
+                    readings[name] = ProbeReadings(
+                        per_generation=[c], mean=c, std=zeros,
+                        min=c, max=c, delta_per_gen=zeros,
                     )
-                    for name, v in agg_vals.items()
-                }
             else:
                 readings = self.build_readings()
         else:
@@ -3131,8 +4640,8 @@ class SaklasSession:
             readings = self.build_readings()
 
         hidden_states: dict[int, torch.Tensor] | None = None
-        if return_hidden and generated_ids:
-            raw = self._capture.stacked()  # {layer_idx: [n_captured, D] on device}
+        if return_hidden and generated_ids and captured_stack:
+            raw = captured_stack  # {layer_idx: [n_captured, D] on device}
             n = len(generated_ids)
             trimmed: dict[int, torch.Tensor] = {}
             for layer_idx, h in raw.items():
@@ -3149,6 +4658,18 @@ class SaklasSession:
                 trimmed[layer_idx] = h.detach().to("cpu")
             hidden_states = trimmed
 
+        # Geometric aggregate over the pooled captures — every attached probe
+        # (flat coords via the affine map, curved via the foot solve).  Skipped
+        # when no probe is attached or generation produced no tokens.  Reuses
+        # the captured stack the per-axis path consumed — no second forward pass.
+        manifold_aggregates: dict[str, Any] = {}
+        if self._monitor.probe_names and generated_ids:
+            # ``score_per_token`` / ``_score_incremental`` above already pools
+            # this same last-content-token aggregate and returns the full
+            # ProbeReading shape; reusing it avoids a second geometry pass and,
+            # on the incremental path, avoids retaining the full capture stack.
+            manifold_aggregates = dict(agg_vals)
+
         result = GenerationResult(
             text=text, tokens=list(generated_ids), token_count=token_count,
             tok_per_sec=tok_per_sec, elapsed=elapsed,
@@ -3158,13 +4679,19 @@ class SaklasSession:
             logprobs=logprobs_list,
             applied_steering=applied_steering,
             hidden_states=hidden_states,
+            probe_readings=manifold_aggregates,
         )
         self._last_result = result
 
         if readings:
-            self.events.emit(
-                ProbeScored(readings={name: r.mean for name, r in readings.items()}),
-            )
+            # ``ProbeScored`` / the loom layer take a scalar per probe; the
+            # cross-gen ``mean`` is now a per-axis tuple, so collapse to
+            # coordinate axis 0 (the bare ``@when:<probe>`` channel).
+            scalar_readings = {
+                name: (r.mean[0] if r.mean else 0.0)
+                for name, r in readings.items()
+            }
+            self.events.emit(ProbeScored(readings=scalar_readings))
 
         # Finalize the in-flight assistant node in the tree (loom v2.3).
         # The user node was added by the gen preamble; the assistant node
@@ -3180,7 +4707,13 @@ class SaklasSession:
             self.tree.finalize_assistant(
                 assistant_node_id,
                 text=text,
-                aggregate_readings={n: r.mean for n, r in readings.items()},
+                # Loom nodes store one scalar per probe (``readings_diff``
+                # wants ``dict[str, float]``); collapse the per-axis ``mean``
+                # tuple to coordinate axis 0.
+                aggregate_readings={
+                    n: (r.mean[0] if r.mean else 0.0)
+                    for n, r in readings.items()
+                },
                 applied_steering=applied_steering,
                 finish_reason=self._gen_state.finish_reason,
                 mean_logprob=mean_logprob,
@@ -3216,19 +4749,26 @@ class SaklasSession:
                 resp_rows[r_i]["raw_index"] = raw_index
                 r_i += 1
 
-    def _generation_preamble(self, input, raw, thinking, stateless=False,
-                             parent_node_id: str | None = None):
+    def _generation_preamble(self, input: Any, raw: bool, thinking: bool, stateless: bool = False,
+                             parent_node_id: str | None = None,
+                             user_role: str | None = None,
+                             assistant_role: str | None = None):
         """Shared input prep + gen-state reset.
 
         Steering is NOT installed here — the caller is expected to hold a
         ``session.steering()`` scope open across the generation.
         ``parent_node_id`` selects which loom-tree path the input is
-        anchored against (default: the active path).
+        anchored against (default: the active path).  ``user_role`` /
+        ``assistant_role`` are this send's per-message role labels (the
+        roleplay scaffold): the new user turn renders under ``user_role``
+        and the generation prompt under ``assistant_role`` (a role-bearing
+        steering scope overrides the latter inside ``_prepare_input``).
         """
         use_thinking = thinking and supports_thinking(self._tokenizer)
         input_ids = self._prepare_input(
             input, raw=raw, thinking=use_thinking, stateless=stateless,
             parent_node_id=parent_node_id,
+            user_role=user_role, assistant_role=assistant_role,
         )
         self._gen_state.reset()
         return input_ids, use_thinking, int(input_ids.shape[1])
@@ -3246,7 +4786,7 @@ class SaklasSession:
 
         if sampling is None:
             return self.config
-        overrides: dict = {}
+        overrides: dict[str, Any] = {}
         if sampling.temperature is not None:
             overrides["temperature"] = sampling.temperature
         if sampling.top_p is not None:
@@ -3284,23 +4824,10 @@ class SaklasSession:
         if recipe_override is None:
             return steering, sampling, thinking
 
-        # Resolve the anchor recipe — the parent assistant's recipe
-        # when present, else an empty Recipe.  Walk ancestors so a
-        # user-anchored regen still finds a recipe to overlay onto.
-        anchor: Recipe | None = None
-        if parent_node_id is not None:
-            parent = self.tree.nodes.get(parent_node_id)
-            if parent is not None:
-                if parent.role == "assistant" and parent.recipe is not None:
-                    anchor = parent.recipe
-                else:
-                    for nid in self.tree.ancestors_of(parent_node_id):
-                        anc = self.tree.nodes.get(nid)
-                        if anc is not None and anc.role == "assistant" and anc.recipe is not None:
-                            anchor = anc.recipe
-                            break
-        if anchor is None:
-            anchor = Recipe()
+        # Resolve the anchor recipe — the parent assistant's recipe when
+        # present, else the nearest assistant ancestor's, else an empty
+        # Recipe (see ``_resolve_anchor_recipe``).
+        anchor = self._resolve_anchor_recipe(parent_node_id)
 
         # compose_modifier handles both str modes and Recipe (custom)
         # — Recipe instances pass through unchanged on that path.
@@ -3337,7 +4864,7 @@ class SaklasSession:
         dict[int, float] | None,
         float,
         float,
-        list | None,
+        list[Any] | None,
     ]:
         """Normalize per-call generation controls before model work."""
         steering_obj = Steering.from_value(steering)
@@ -3369,7 +4896,7 @@ class SaklasSession:
         frequency_penalty = (
             sampling.frequency_penalty if sampling is not None else 0.0
         )
-        logprobs_list: list | None = [] if raw_lp is not None else None
+        logprobs_list: list[Any] | None = [] if raw_lp is not None else None
         return (
             steering_obj,
             use_thinking_req,
@@ -3387,7 +4914,7 @@ class SaklasSession:
         """Flatten the active steering stack for ``GenerationResult.vectors``."""
         snap: dict[str, float] = {}
         for name, entry in self._flatten_steering_stack().items():
-            if isinstance(entry, AblationTerm):
+            if isinstance(entry, (AblationTerm, ManifoldTerm)):
                 snap[name] = entry.coeff
                 continue
             snap[name] = entry[0]
@@ -3395,9 +4922,10 @@ class SaklasSession:
 
     def _start_loom_assistant(
         self,
-        input,
+        input: Any,
         *,
         stateless: bool,
+        raw: bool,
         parent_node_id: str | None,
         sampling: SamplingConfig | None,
         steering_obj: Steering | None,
@@ -3407,9 +4935,32 @@ class SaklasSession:
         if stateless:
             return None
 
-        if isinstance(input, str):
+        # Per-message role labels (roleplay scaffold) ride this send's
+        # SamplingConfig and are stamped onto the nodes at creation — the
+        # turn keeps its role regardless of later box changes.  Raw / flat
+        # mode has no chat template, so role labels don't apply there.
+        user_role = sampling.user_role if sampling is not None and not raw else None
+        assistant_role = (
+            sampling.assistant_role if sampling is not None and not raw else None
+        )
+
+        if isinstance(input, str) and raw:
+            # Flat (base-model) path: no user/assistant turn pairing.  A
+            # non-empty ``input`` is a typed span recorded as its own
+            # node; an empty ``input`` is a bare continuation that just
+            # extends the active leaf.  ``_check_user_send_target`` is
+            # skipped — in flat mode the role tag is authorship
+            # provenance, not a turn-taking constraint, so a span may
+            # hang under a node of any role.
+            if input != "":
+                user_node_id = self.tree.add_user_turn(
+                    input, parent_id=parent_node_id)
+            else:
+                user_node_id = parent_node_id or self.tree.active_node_id
+        elif isinstance(input, str):
             self._check_user_send_target(parent_node_id)
-            user_node_id = self.tree.add_user_turn(input, parent_id=parent_node_id)
+            user_node_id = self.tree.add_user_turn(
+                input, parent_id=parent_node_id, role_label=user_role)
         else:
             user_node_id = parent_node_id or self.tree.active_node_id
 
@@ -3423,7 +4974,8 @@ class SaklasSession:
             probes=list(self._monitor.probe_names),
         )
         recipe = recipe._fill_probe_hashes(self)
-        return self.tree.begin_assistant(user_node_id, recipe=recipe)
+        return self.tree.begin_assistant(
+            user_node_id, recipe=recipe, role_label=assistant_role)
 
     def _run_generation_loop(
         self,
@@ -3440,15 +4992,23 @@ class SaklasSession:
         frequency_penalty: float,
         lp_count: int | None,
         forced_prefix: list[int] | None = None,
+        want_perplexity: bool = True,
+        cache_token_text: bool = True,
     ) -> tuple[list[int], float]:
         """Run the decode loop once capture and steering are installed."""
         cached_pkv = None
         cache_position_offset = 0
         effective_input_ids = input_ids
+        # The cached prefix KV is unsteered.  It's safe to reuse whenever the
+        # active steering doesn't touch the prefill region — ``@response`` /
+        # ``@generated`` / probe-gated steering leaves the prompt KV identical
+        # to unsteered, so a steered (response-phase) batch can still share one
+        # prefill.  ``want_hidden`` (needs every prefix hidden state) and
+        # thinking (different decode path) still force a full re-prefill.
         if (
             not want_hidden
             and not use_thinking
-            and not self._steering_stack
+            and not self._steering_active_in_prefill()
             and self._prefix_cache is not None
         ):
             hit = self._try_prefix_cache_hit(input_ids)
@@ -3462,13 +5022,52 @@ class SaklasSession:
             if self._steering_needs_probe_gating()
             else None
         )
+        # StaticCache (+ compile fusion on MPS, + CUDA-graph capture on CUDA) is
+        # eligible when generation is unsteered (``all_fast_path``) OR every
+        # steered layer is the static single-affine fast path
+        # (``static_steerable`` — Trigger.BOTH affine slide, no ctx, no foot, no
+        # gate).  StaticCache never bypasses the forward hooks, so the steering
+        # still applies; only the KV buffers are preallocated and the decode
+        # shape stays fixed (what lets the compiled graph stay specialized).
+        # ``_static_cache_active`` is device-agnostic (set when compile stuck or
+        # CUDA graphs are on).  Curved / gated / phased steering keeps the eager
+        # DynamicCache path.
         use_static_cache = (
-            self._cuda_graphs_active
+            self._static_cache_active
             and cached_pkv is None
-            and self._steering.all_fast_path()
+            and (
+                self._steering.all_fast_path()
+                or self._steering.static_steerable()
+            )
         )
+        # Compiled-model routing (MPS).  The graph was traced with ONLY the
+        # persistent branchless offset + capture hooks present (attached
+        # pre-compile), so the compiled module is correct exactly when the live
+        # hook topology matches that: no *transient* per-token capture hooks
+        # (``self._capture._handles`` empty — true for the persistent-capture and
+        # no-probe paths) AND either unsteered or a static-affine steering that
+        # lowered to the persistent offset buffers (``_steering_uses_compiled_offsets``
+        # — the push rides the offset, no transient hook).  A probed gen on the
+        # persistent-capture path (slice 2) satisfies both, so it now keeps the
+        # compiled graph.  Everything else (transient ctx-consulting steering
+        # hooks, transient capture hooks for curved/gated/return_hidden) graph-breaks
+        # / recompiles, so route it to the eager original (``_orig_mod``) +
+        # DynamicCache — where the same persistent hooks still apply any offsets
+        # and capture, so correctness holds and ``compile=True`` never regresses
+        # the hooked path.  CUDA keeps its existing graph-capture path untouched.
+        gen_model = self._model
+        if self._compiled and self._device.type == "mps":
+            compiled_clean = not self._capture._handles and (
+                self._steering_uses_compiled_offsets
+                or self._steering.all_fast_path()
+            )
+            if compiled_clean:
+                use_static_cache = self._static_cache_active and cached_pkv is None
+            else:
+                gen_model = getattr(self._model, "_orig_mod", self._model)
+                use_static_cache = False
         generated_ids = generate_steered(
-            self._model, self._tokenizer, effective_input_ids,
+            gen_model, self._tokenizer, effective_input_ids,
             gen_config, self._gen_state, thinking=use_thinking,
             on_token=effective_tap,
             seed=seed, stop=stop_list, logit_bias=logit_bias,
@@ -3479,21 +5078,35 @@ class SaklasSession:
             past_key_values=cached_pkv,
             cache_position_offset=cache_position_offset,
             score_callback=gating_callback,
+            # Per-token probe scoring fires post-forward (FIX F1), not inside the
+            # capture hook.  On the persistent-capture path the step callback is
+            # ``ingest_persistent`` (accumulate from the persistent buffers +
+            # fire the step sink); otherwise ``fire_step_sink`` (the transient
+            # hooks already accumulated in-forward).  Both no-op when no per-token
+            # sink is installed (aggregate-only / full-retention / no-probe).
+            step_callback=(
+                self._capture.ingest_persistent
+                if self._capture_persistent
+                else self._capture.fire_step_sink
+            ),
             use_static_cache=use_static_cache,
             forced_prefix=forced_prefix,
+            steering_active=bool(self._steering.hooks),
+            want_perplexity=want_perplexity,
+            cache_token_text=cache_token_text,
         )
         elapsed = time.monotonic() - start
 
         if cached_pkv is not None and self._prefix_cache is not None:
             try:
-                cached_pkv.crop(cache_position_offset)
+                cached_pkv.crop(cache_position_offset)  # pyright: ignore[reportAttributeAccessIssue]  # HF cache object; crop() is present at runtime
             except (AttributeError, TypeError):
                 self._invalidate_prefix_cache()
         return generated_ids, elapsed
 
     def _generate_core(
         self,
-        input,
+        input: Any,
         *,
         steering: "str | Steering | None" = None,
         sampling: SamplingConfig | None = None,
@@ -3519,207 +5132,363 @@ class SaklasSession:
             self._gen_lock.release()
             raise ConcurrentGenerationError("session generation already in flight")
         self._gen_phase = GenState.PREAMBLE
+        steering_cm = None
+        try:
 
-        # v2.3 phase 5: apply recipe override (auto-regen / manual mode)
-        # before constructing the Steering object so the overlay wins
-        # over the per-call kwargs.
-        if recipe_override is not None:
-            steering, sampling, thinking = self._resolve_recipe_override(
-                recipe_override,
-                parent_node_id=parent_node_id,
-                steering=steering,
-                sampling=sampling,
-                thinking=thinking,
+            # v2.3 phase 5: apply recipe override (auto-regen / manual mode)
+            # before constructing the Steering object so the overlay wins
+            # over the per-call kwargs.
+            if recipe_override is not None:
+                steering, sampling, thinking = self._resolve_recipe_override(
+                    recipe_override,
+                    parent_node_id=parent_node_id,
+                    steering=steering,
+                    sampling=sampling,
+                    thinking=thinking,
+                )
+
+            (
+                steering_obj,
+                use_thinking_req,
+                gen_config,
+                lp_count,
+                seed,
+                stop_list,
+                logit_bias,
+                presence_penalty,
+                frequency_penalty,
+                logprobs_list,
+            ) = self._prepare_generation_call(steering, sampling, thinking)
+            # ``mean_logprob_accum`` averages chosen-token logprobs over the
+            # non-thinking response span — surfaced on ``LoomNode.mean_logprob``
+            # at finalize-assistant time so the loom sidebar can sort siblings
+            # by surprise.  Populates whenever the engine captures chosen
+            # logprob (any ``on_token`` consumer with ``lp_count is not None``
+            # — i.e. the loom path or an explicit logprobs request).
+            mean_logprob_sum: float = 0.0
+            mean_logprob_count: int = 0
+            trait_token_counter = [0]
+            _wants_live_token_scores = bool(
+                on_token is not None
+                and getattr(on_token, "_saklas_wants_live_scores", False)
             )
+            _persists_layer_scores = bool(
+                (sampling is not None and sampling.persist_per_layer_scores)
+                or (
+                    on_token is not None
+                    and getattr(on_token, "_saklas_wants_per_layer_scores", False)
+                )
+            )
+            # Probe-inspector live point + fading trail: stamp each token's probe
+            # reading with per-layer whitened subspace coords.  Gates the monitor
+            # post-pass (set here, reset in the teardown ``finally``) and forces
+            # per-token scoring so the per-token reading actually exists to carry it.
+            _persists_subspace_coords = bool(
+                sampling is not None and sampling.persist_subspace_coords
+            )
+            self._monitor.set_subspace_coords(_persists_subspace_coords)
 
-        (
-            steering_obj,
-            use_thinking_req,
-            gen_config,
-            lp_count,
-            seed,
-            stop_list,
-            logit_bias,
-            presence_penalty,
-            frequency_penalty,
-            logprobs_list,
-        ) = self._prepare_generation_call(steering, sampling, thinking)
-        # ``mean_logprob_accum`` averages chosen-token logprobs over the
-        # non-thinking response span — surfaced on ``LoomNode.mean_logprob``
-        # at finalize-assistant time so the loom sidebar can sort siblings
-        # by surprise.  Populates whenever the engine captures chosen
-        # logprob (any ``on_token`` consumer with ``lp_count is not None``
-        # — i.e. the loom path or an explicit logprobs request).
-        mean_logprob_sum: float = 0.0
-        mean_logprob_count: int = 0
-        trait_token_counter = [0]
-
-        def _token_tap(text, is_thinking, tid, lp, top_alts, perplexity):
-            nonlocal mean_logprob_sum, mean_logprob_count
-            if logprobs_list is not None and tid >= 0 and not is_thinking:
-                logprobs_list.append((tid, lp if lp is not None else 0.0, top_alts or []))
-            if lp is not None and tid >= 0 and not is_thinking:
-                mean_logprob_sum += lp
-                mean_logprob_count += 1
-            if assistant_node_id is not None and tid is not None:
-                token_row: dict[str, Any] = {
-                    "token_id": int(tid),
-                    "text": text,
-                    "logprob": float(lp) if lp is not None else None,
-                    "perplexity": (
-                        float(perplexity) if perplexity is not None else None
-                    ),
-                }
-                if top_alts:
-                    token_row["top_alts"] = [
-                        {
-                            "id": int(a.id),
-                            "text": a.text,
-                            "logprob": float(a.logprob),
-                        }
-                        for a in top_alts
-                    ]
-                # Per-token probe scoring lives here so the persisted node
-                # row carries the same ``probes`` + ``per_layer_scores`` the
-                # live WS ``token`` event ships.  Without this, the webui
-                # rehydrates a tree across a page refresh with tokens but
-                # no scores — highlight tint and the token-drilldown heatmap
-                # silently go blank for historical turns.  The WS handler
-                # reads these back off the row rather than recomputing.
-                if self._monitor.probe_names:
-                    latest_hidden_for_persist = {
+            def _token_tap(text: str, is_thinking: bool, tid: int | None, lp: float | None, top_alts: Any, perplexity: float | None) -> None:
+                nonlocal mean_logprob_sum, mean_logprob_count
+                self._last_token_probe_payload = None
+                if logprobs_list is not None and tid is not None and tid >= 0 and not is_thinking:
+                    logprobs_list.append((tid, lp if lp is not None else 0.0, top_alts or []))
+                if lp is not None and tid is not None and tid >= 0 and not is_thinking:
+                    mean_logprob_sum += lp
+                    mean_logprob_count += 1
+                latest_hidden_for_token: dict[int, torch.Tensor] | None = None
+                scores: dict[str, float] | None = None
+                vector_readings: dict[str, "ProbeReading"] | None = None
+                per_layer_payload: dict[str, dict[str, float]] | None = None
+                probe_readings = None
+                needs_scores = bool(
+                    self._monitor.probe_names
+                    and (
+                        assistant_node_id is not None
+                        or _has_trait_consumer
+                        or _wants_live_token_scores
+                        or _persists_subspace_coords
+                    )
+                )
+                # Lean-incremental rows carry coords+fraction only (FIX F2); the tap's
+                # consumers in lean mode read just axis-0 ``scores`` (the lean
+                # precondition rules out ``_wants_live_token_scores`` /
+                # ``_persists_layer_scores`` / ``_persists_subspace_coords``), so the
+                # stored lean rows are reused exactly like the full-incremental rows.
+                has_incremental_reading = bool(
+                    (self._capture_incremental or self._capture_lean)
+                    and self._incremental_readings
+                )
+                if needs_scores and not has_incremental_reading:
+                    latest_hidden_for_token = {
                         layer_idx: bucket[-1]
                         for layer_idx, bucket in self._capture._per_layer.items()
                         if bucket
                     }
-                    if latest_hidden_for_persist:
-                        agg = self._monitor.score_single_token(
-                            latest_hidden_for_persist,
-                        )
-                        if agg:
-                            token_row["probes"] = {
-                                p: round(float(v), 6) for p, v in agg.items()
-                            }
-                        per_layer = self._monitor.score_single_token_per_layer(
-                            latest_hidden_for_persist,
-                        )
-                        if per_layer:
-                            token_row["per_layer_scores"] = {
-                                str(layer): {
-                                    p: round(float(v), 6) for p, v in metrics.items()
-                                }
-                                for layer, metrics in per_layer.items()
-                            }
-                self.tree.append_token(
-                    assistant_node_id,
-                    token_row,
-                    thinking=bool(is_thinking),
-                )
-            if on_token is not None:
-                on_token(text, is_thinking, tid, lp, top_alts, perplexity)
-            # Inline per-token scoring for live SSE trait subscribers.
-            if self._trait_queues and self._monitor.probe_names:
-                latest_hidden = {
-                    layer_idx: bucket[-1]
-                    for layer_idx, bucket in self._capture._per_layer.items()
-                    if bucket
+                if (
+                    needs_scores
+                    and has_incremental_reading
+                ):
+                    agg = self._incremental_readings[-1]
+                    if agg:
+                        vector_readings = agg
+                        scores = {
+                            p: (r.coords[0] if r.coords else 0.0)
+                            for p, r in agg.items()
+                        }
+                        if _wants_live_token_scores:
+                            probe_readings = agg
+                        if assistant_node_id is not None and _persists_layer_scores:
+                            by_layer: dict[str, dict[str, float]] = {}
+                            for p, r in agg.items():
+                                for layer, coord in r.coords_per_layer.items():
+                                    by_layer.setdefault(str(layer), {})[p] = round(
+                                        float(coord[0] if coord else 0.0), 6,
+                                    )
+                            per_layer_payload = by_layer or None
+                elif needs_scores and latest_hidden_for_token:
+                    # One unified pass over every probe shape — flat coords + curved
+                    # fraction/nearest in one dict.
+                    agg = self._monitor.score_single_token(latest_hidden_for_token)
+                    if agg:
+                        # Keep the full readings dict for the live-mean fold +
+                        # ``TokenEvent``; collapse to coordinate axis 0 for the
+                        # scalar trait stream + per-token ``probes`` row (the bare
+                        # ``@when:<probe>`` channel).
+                        vector_readings = agg
+                        scores = {
+                            p: (r.coords[0] if r.coords else 0.0)
+                            for p, r in agg.items()
+                        }
+                        # The per-token geometric wire field (full reading) only
+                        # when a client wants the live per-token stream.
+                        if _wants_live_token_scores:
+                            probe_readings = agg
+                        # Per-layer axis-0 heatmap row — read straight off the
+                        # full reading's ``coords_per_layer`` (no second pass).
+                        if assistant_node_id is not None and _persists_layer_scores:
+                            by_layer: dict[str, dict[str, float]] = {}
+                            for p, r in agg.items():
+                                for layer, coord in r.coords_per_layer.items():
+                                    by_layer.setdefault(str(layer), {})[p] = round(
+                                        float(coord[0] if coord else 0.0), 6,
+                                    )
+                            per_layer_payload = by_layer or None
+                self._last_token_probe_payload = {
+                    "scores": scores,
+                    "readings": vector_readings,
+                    "per_layer_scores": per_layer_payload,
+                    "probe_readings": probe_readings,
                 }
-                if latest_hidden:
-                    scores = self._monitor.score_single_token(latest_hidden)
+                if assistant_node_id is not None and tid is not None:
+                    token_row: dict[str, Any] = {
+                        "token_id": int(tid),
+                        "text": text,
+                        "logprob": float(lp) if lp is not None else None,
+                        "perplexity": (
+                            float(perplexity) if perplexity is not None else None
+                        ),
+                    }
+                    if top_alts:
+                        token_row["top_alts"] = [
+                            {
+                                "id": int(a.id),
+                                "text": a.text,
+                                "logprob": float(a.logprob),
+                            }
+                            for a in top_alts
+                        ]
+                    if scores:
+                        token_row["probes"] = {
+                            p: round(float(v), 6) for p, v in scores.items()
+                        }
+                    if per_layer_payload:
+                        token_row["per_layer_scores"] = per_layer_payload
+                    self.tree.append_token(
+                        assistant_node_id,
+                        token_row,
+                        thinking=bool(is_thinking),
+                    )
+                if on_token is not None:
+                    on_token(text, is_thinking, tid, lp, top_alts, perplexity)
+                # Inline per-token scoring for live SSE trait subscribers.
+                if self._trait_queues and self._monitor.probe_names and scores:
                     event = ("token", trait_token_counter[0], text, is_thinking, scores)
                     trait_token_counter[0] += 1
                     with self._trait_lock:
                         for lp_ref, q in list(self._trait_queues):
-                            try:
+                            with suppress(Exception):
                                 lp_ref.call_soon_threadsafe(q.put_nowait, event)
-                            except Exception:
-                                pass
 
-        # Pass _token_tap into generate_steered only when at least one of its
-        # branches is live: caller-supplied on_token, logprobs collection, or
-        # live trait subscribers.  When all three are inactive, _token_tap
-        # would be a no-op called once per generated token, AND its presence
-        # forces generate_steered to compute the unconditional fp32
-        # log_softmax + entropy sync per step (gate at generation.py:571).
-        # Skipping it here trims that cost from the v3 stateless prefill
-        # workload (800 back-to-back gens of ~16 tokens each, no logprobs,
-        # no streaming, no SSE).  Stop-sequence behavior is preserved by
-        # not wiring _token_tap=None when stop_list is set — the tokenizer-
-        # decode + stop-match in generation.py only runs under on_token.
-        _has_trait_consumer = bool(self._trait_queues and self._monitor.probe_names)
-        # The tap also writes per-token ``probes`` / ``per_layer_scores``
-        # onto the loom row when probes are loaded and the gen is loom-
-        # attached — required so a webui refresh can rehydrate highlight
-        # tints and the token-drilldown heatmap from the server tree.
-        _persists_probe_row = bool(not stateless and self._monitor.probe_names)
-        _need_tap = (
-            on_token is not None
-            or logprobs_list is not None
-            or _has_trait_consumer
-            or _persists_probe_row
-            or stop_list is not None
-        )
-        _effective_tap = _token_tap if _need_tap else None
+            # Pass _token_tap into generate_steered only when at least one of its
+            # branches is live: caller-supplied on_token, logprobs collection, or
+            # live trait subscribers.  When all three are inactive, _token_tap
+            # would be a no-op called once per generated token, AND its presence
+            # forces generate_steered to compute the unconditional fp32
+            # log_softmax + entropy sync per step (gate at generation.py:571).
+            # Skipping it here trims that cost from the v3 stateless prefill
+            # workload (800 back-to-back gens of ~16 tokens each, no logprobs,
+            # no streaming, no SSE).  Stop-sequence behavior is preserved by
+            # not wiring _token_tap=None when stop_list is set — the tokenizer-
+            # decode + stop-match in generation.py only runs under on_token.
+            _has_trait_consumer = bool(self._trait_queues and self._monitor.probe_names)
+            # The tap also writes per-token ``probes`` / ``per_layer_scores``
+            # onto the loom row when probes are loaded and the gen is loom-
+            # attached — required so a webui refresh can rehydrate highlight
+            # tints and the token-drilldown heatmap from the server tree.
+            _persists_probe_row = bool(not stateless and self._monitor.probe_names)
+            _need_tap = (
+                on_token is not None
+                or logprobs_list is not None
+                or _has_trait_consumer
+                or _persists_probe_row
+                or stop_list is not None
+            )
+            _effective_tap = _token_tap if _need_tap else None
+            _tap_has_text_consumer = bool(
+                on_token is not None
+                or (logprobs_list is not None and (lp_count or 0) > 0)
+                or _has_trait_consumer
+                or _persists_probe_row
+            )
 
-        steering_cm = None
-        if steering_obj is not None and steering_obj.alphas:
-            steering_cm = self.steering(steering_obj)
+            # Compiled-clean eligibility for this gen, decided BEFORE the steering
+            # context enters (``steering_cm.__enter__`` runs ``_install_composed_steering``,
+            # which consults this to decide whether a probed gen may still lower
+            # steering to the persistent offset buffers — slice 2).  Eligible when the
+            # compiled MPS graph + static cache are live, the persistent capture
+            # buffers were adopted, and the caller didn't ask for the full per-step
+            # hidden stack (``return_hidden`` keeps the transient full-retention
+            # capture).  Capture then rides the persistent buffers; steering rides the
+            # offsets — both compile-clean.
+            self._compiled_clean_eligible = bool(
+                getattr(self, "_compiled", False)
+                and self._device.type == "mps"
+                and self._static_cache_active
+                and self._capture_buffers
+                and not (sampling and sampling.return_hidden)
+            )
 
-        vector_snapshot: dict[str, float] = (
-            self._snapshot_steering_alphas()
-            if self._steering_stack or steering_cm is not None
-            else {}
-        )
+            if steering_obj is not None and steering_obj.alphas:
+                steering_cm = self.steering(steering_obj)
 
-        # Snapshot the chat-history anchor BEFORE _start_loom_assistant
-        # mutates the tree.  Otherwise the new (empty) assistant node it
-        # creates becomes the active leaf, and ``messages_for(None)`` later
-        # walks INCLUDING that empty assistant — producing a trailing
-        # empty-content assistant message AND a duplicated trailing user
-        # turn after ``_prepare_input`` re-appends ``input``.  Strict chat
-        # templates (Mistral 3) reject the empty assistant outright with
-        # ``Assistant message must have a string or a list of chunks ...``;
-        # permissive templates render the duplicate user silently and
-        # degrade prompt quality.
-        chat_history_anchor = parent_node_id
-        if (
-            not stateless
-            and isinstance(input, str)
-            and chat_history_anchor is None
-        ):
-            chat_history_anchor = self.tree.active_node_id
+            vector_snapshot: dict[str, float] = (
+                self._snapshot_steering_alphas()
+                if self._steering_stack or steering_cm is not None
+                else {}
+            )
 
-        assistant_node_id = self._start_loom_assistant(
-            input,
-            stateless=stateless,
-            parent_node_id=parent_node_id,
-            sampling=sampling,
-            steering_obj=steering_obj,
-            use_thinking_req=use_thinking_req,
-        )
+            # Snapshot the chat-history anchor BEFORE _start_loom_assistant
+            # mutates the tree.  Otherwise the new (empty) assistant node it
+            # creates becomes the active leaf, and ``messages_for(None)`` later
+            # walks INCLUDING that empty assistant — producing a trailing
+            # empty-content assistant message AND a duplicated trailing user
+            # turn after ``_prepare_input`` re-appends ``input``.  Strict chat
+            # templates (Mistral 3) reject the empty assistant outright with
+            # ``Assistant message must have a string or a list of chunks ...``;
+            # permissive templates render the duplicate user silently and
+            # degrade prompt quality.
+            chat_history_anchor = parent_node_id
+            if (
+                not stateless
+                and isinstance(input, str)
+                and chat_history_anchor is None
+            ):
+                chat_history_anchor = self.tree.active_node_id
 
-        try:
+            assistant_node_id = self._start_loom_assistant(
+                input,
+                stateless=stateless,
+                raw=raw,
+                parent_node_id=parent_node_id,
+                sampling=sampling,
+                steering_obj=steering_obj,
+                use_thinking_req=use_thinking_req,
+            )
+
             if steering_cm is not None:
                 steering_cm.__enter__()
             input_ids, use_thinking, prompt_tokens = self._generation_preamble(
                 input, raw, use_thinking_req, stateless=stateless,
                 parent_node_id=chat_history_anchor,
+                user_role=sampling.user_role if sampling is not None else None,
+                assistant_role=(
+                    sampling.assistant_role if sampling is not None else None
+                ),
             )
             # Refresh snapshot now that steering is pushed (first-scope case).
             vector_snapshot = self._snapshot_steering_alphas()
 
             want_hidden = bool(sampling and sampling.return_hidden)
+            # Per-token scoring is only needed when something consumes a
+            # per-token reading: a probe gate, a loom token row, an SSE trait
+            # stream, a live-scores client, or a per-layer-heatmap persist.
+            # Otherwise (probes attached but only the aggregate wanted, e.g. a
+            # stateless server gen) the capture skips per-token scoring entirely
+            # and pools the aggregate once at finalize.
+            _needs_gating = self._steering_needs_probe_gating()
+            # The five UI / trait / loom / persist consumers each need a
+            # per-token reading for the FULL roster.  When NONE of them is live
+            # but a probe gate is, gating is the SOLE per-token consumer (FIX
+            # #4): the step sink can score just the gated probes per token and
+            # leave the big-K roster to the one-shot full aggregate at finalize.
+            _per_token_full_consumer = bool(
+                assistant_node_id is not None
+                or _has_trait_consumer
+                or _wants_live_token_scores
+                or _persists_layer_scores
+                or _persists_probe_row
+                or _persists_subspace_coords
+            )
+            need_per_token = bool(_needs_gating or _per_token_full_consumer)
+            gating_only_probes: set[str] | None = (
+                self._gated_probe_names()
+                if (_needs_gating and not _per_token_full_consumer)
+                else None
+            )
+            gating_probe_keys: set[str] | None = (
+                self._gated_probe_keys()
+                if (_needs_gating and not _per_token_full_consumer)
+                else None
+            )
+            # Lean-incremental (FIX F2): the live consumers present read ONLY the
+            # axis-0 coord (the SSE trait stream, the loom probe row, the loom
+            # node text/aggregate) — none of the consumers that genuinely need a
+            # richer per-token reading is live, and there is no probe gate.  Then
+            # the per-token scoring drops the nearest / assignment / per-layer
+            # work (the full aggregate is re-scored once from the tail ring at
+            # finalize), which is the common TUI/loom monitoring path.
+            _full_reading_consumer = bool(
+                _wants_live_token_scores       # full ProbeReading in TokenEvent
+                or _persists_layer_scores      # per-layer heatmap row
+                or _persists_subspace_coords   # inspector whitened coords
+            )
+            lean_per_token = bool(
+                need_per_token
+                and not want_hidden
+                and not _needs_gating
+                and not _full_reading_consumer
+                and self._monitor.probe_names
+            )
             self.events.emit(GenerationStarted(input=input, stateless=stateless))
             try:
                 # Capture attach + monitor live + ctx.reset live INSIDE the
                 # inner try so a BaseException (KeyboardInterrupt, etc.)
                 # between any pair of these still hits the cleanup finally.
                 # ``_end_capture`` and ``end_live`` are idempotent.
-                self._begin_capture(widen=want_hidden)
+                self._begin_capture(
+                    widen=want_hidden, need_per_token=need_per_token,
+                    gating_only_probes=gating_only_probes,
+                    gating_probe_keys=gating_probe_keys,
+                    lean_per_token=lean_per_token,
+                )
                 self._monitor.begin_live()
                 # Reset the steering manager's TriggerContext for this gen;
                 # ``generate_steered`` mutates it at lifecycle boundaries.
                 self._steering.ctx.reset()
+                # Cold-start every manifold foot-follower so this gen re-seeds
+                # at the origin instead of inheriting the prior run's foot.
+                self._steering.reset_manifold_feet()
                 self._gen_phase = GenState.RUNNING
 
                 generated_ids, elapsed = self._run_generation_loop(
@@ -3735,29 +5504,33 @@ class SaklasSession:
                     frequency_penalty=frequency_penalty,
                     lp_count=lp_count,
                     forced_prefix=forced_prefix,
+                    # Per-token perplexity costs one host sync/token.  Compute
+                    # it only when something surfaces it: a loom-attached gen
+                    # persists it on the token row, an interactive (non-
+                    # stateless) gen may show it, or a caller opts its on_token
+                    # in.  Stateless server streaming (OpenAI/Ollama deltas, the
+                    # native WS tap) never reads per-token ppl, so it skips the
+                    # sync.  Callers can force it via ``on_token
+                    # ._saklas_wants_perplexity = True``.
+                    want_perplexity=(
+                        not stateless
+                        or assistant_node_id is not None
+                        or (
+                            on_token is not None
+                            and getattr(
+                                on_token, "_saklas_wants_perplexity", False,
+                            )
+                        )
+                    ),
+                    cache_token_text=_tap_has_text_consumer,
                 )
             finally:
                 self._gen_state.stop_requested.set()
                 self._end_capture()
                 if steering_cm is not None:
-                    # Internal scope cleanup — bypass the
-                    # ``_pop_steering`` phase guard since we're past
-                    # the model-forward loop and the rebuild is part
-                    # of the legitimate teardown sequence, not a
-                    # callback mutating the stack mid-step.  Save/
-                    # restore rather than unconditional clear: a
-                    # KeyboardInterrupt between the assignment and
-                    # the ``try:`` could leak the flag as ``True``
-                    # otherwise.  Reading ``old`` first puts the read
-                    # outside the try-protected window so the worst
-                    # case is "we never set True", not "we leave True
-                    # set" (Codex review v2 catch).
-                    old_internal = self._internal_steering_pop
-                    try:
-                        self._internal_steering_pop = True
-                        steering_cm.__exit__(None, None, None)
-                    finally:
-                        self._internal_steering_pop = old_internal
+                    # Internal scope cleanup (see ``_exit_internal_steering``);
+                    # ``swallow=False`` so a teardown failure surfaces here.
+                    self._exit_internal_steering(steering_cm, swallow=False)
                     steering_cm = None
                 self._gen_phase = GenState.FINALIZING
 
@@ -3795,17 +5568,10 @@ class SaklasSession:
             # or FINALIZING depending on where we threw, and the pop is
             # always legitimate teardown here.
             if steering_cm is not None:
-                # Same save/restore pattern as the inner finally —
-                # robust against signal-delivery between the
-                # assignment and the ``try``.
-                old_internal = self._internal_steering_pop
-                try:
-                    self._internal_steering_pop = True
-                    steering_cm.__exit__(None, None, None)
-                except Exception:
-                    pass
-                finally:
-                    self._internal_steering_pop = old_internal
+                # ``swallow=True``: we're already re-raising the original
+                # failure below, so a teardown ``Exception`` must not mask
+                # it (see ``_exit_internal_steering``).
+                self._exit_internal_steering(steering_cm, swallow=True)
             raise
         finally:
             # Defense-in-depth: even if the inner finally never ran (e.g. a
@@ -3813,17 +5579,40 @@ class SaklasSession:
             # any hooks that did get attached must come off.  Idempotent.
             self._end_capture()
             self._monitor.end_live()
+            # Probe-inspector subspace-coords post-pass is per-generation; clear
+            # it so it never leaks into a later gen that didn't opt in.
+            self._monitor.set_subspace_coords(False)
             # Release the loom-tree reservation in the same scope as the
             # gen-lock release.  Even if finalize raised, mutators (edit /
             # delete on this subtree) need to be free again now that the
             # streaming target is no longer live.
             self._active_gen_reservation = None
+            self._last_token_probe_payload = None
+            # Reset incremental-capture state so the next gen starts clean
+            # (finalize has already consumed the rows by now). Belt-and-
+            # suspenders: ``_begin_capture`` resets these at gen start too.
+            self._capture_incremental = False
+            self._capture_lean = False
+            self._capture_aggregate_only = False
+            self._capture_gating_subset = None
+            self._capture_gating_keys = None
+            self._capture_persistent = False
+            self._compiled_clean_eligible = False
+            self._incremental_readings = []
+            self._incremental_gate_scores = []
+            # Zero the persistent compile-clean steering offsets so a static-
+            # affine push can't leak into a later generation that takes the
+            # eager / unsteered path without re-running ``_install_composed_
+            # steering`` (unsteered gens have no steering scope to reset them).
+            self._steering_uses_compiled_offsets = False
+            if self._steering.has_compiled_offsets():
+                self._steering.zero_compiled_offsets()
             self._gen_phase = GenState.IDLE
             self._gen_lock.release()
 
     def _generate_runset(
         self,
-        input,
+        input: Any,
         *,
         steering: "str | Steering | None" = None,
         sampling: SamplingConfig | None = None,
@@ -3888,7 +5677,7 @@ class SaklasSession:
 
     def generate(
         self,
-        input,
+        input: Any,
         *,
         steering: "str | Steering | None" = None,
         sampling: SamplingConfig | None = None,
@@ -3952,7 +5741,7 @@ class SaklasSession:
 
     def generate_stream(
         self,
-        input,
+        input: Any,
         *,
         steering: "str | Steering | None" = None,
         sampling: SamplingConfig | None = None,
@@ -3981,30 +5770,36 @@ class SaklasSession:
         stream. Final aggregate/per-token readings are still computed during
         generation finalization from the captured hidden states.
         """
-        q: queue.SimpleQueue = queue.SimpleQueue()
+        q: queue.SimpleQueue[Any] = queue.SimpleQueue()
         done = object()
         result_holder: list[GenerationResult] = []
         exc_holder: list[BaseException] = []
         idx_counter = [0]
 
-        def _push(text, is_thinking, tid, lp, top_alts, perplexity):
-            scores: dict[str, float] | None = None
+        def _push(text: str, is_thinking: bool, tid: int | None, lp: float | None, top_alts: Any, perplexity: float | None) -> None:
+            readings: dict[str, "ProbeReading"] | None = None
+            probe_readings = None
             if live_scores and self._monitor.probe_names:
-                latest_hidden = {
-                    layer_idx: bucket[-1]
-                    for layer_idx, bucket in self._capture._per_layer.items()
-                    if bucket
-                }
-                if latest_hidden:
-                    scores = self._monitor.score_single_token(latest_hidden)
-                    self._monitor.update_live(scores)
+                payload = self._last_token_probe_payload or {}
+                raw_readings = payload.get("readings")
+                if isinstance(raw_readings, dict) and raw_readings:
+                    readings = raw_readings
+                    # ``update_live`` folds coordinate axis 0 of each reading
+                    # into the running mean; ``TokenEvent.scores`` carries the
+                    # readings dict verbatim (the live-stream consumer reads
+                    # ``fraction`` / ``nearest`` / ``coords`` off each).
+                    self._monitor.update_live(readings)
+                probe_readings = payload.get("probe_readings")
             event = TokenEvent(
-                text=text, token_id=tid, index=idx_counter[0],
+                text=text, token_id=tid if tid is not None else -1, index=idx_counter[0],
                 thinking=is_thinking, logprob=lp, top_alts=top_alts,
-                scores=scores, perplexity=perplexity,
+                scores=readings, perplexity=perplexity,
+                probe_readings=probe_readings,
             )
             idx_counter[0] += 1
             q.put(event)
+        _push_flags: Any = _push
+        _push_flags._saklas_wants_live_scores = bool(live_scores)
 
         def _worker():
             try:
@@ -4044,7 +5839,7 @@ class SaklasSession:
 
     def generate_batch(
         self,
-        prompts: list,
+        prompts: list[Any],
         *,
         steering: "str | Steering | None" = None,
         sampling: SamplingConfig | None = None,
@@ -4067,6 +5862,17 @@ class SaklasSession:
         pass ``stateless=False`` if you genuinely want each prompt to
         accumulate against the running history.
 
+        **Prefix KV caching.**  When the rows share a token prefix (a common
+        system prompt, few-shot preamble, or shared instruction) and the
+        steering doesn't touch the prefill region (``None`` or ``@response`` /
+        ``@generated`` / probe-gated), that shared prefix is prefilled once and
+        its KV reused across every row — the per-call saving scales with
+        ``shared_prefix_len / total_input_len``.  Skipped for ``stateless=False``
+        (per-row history breaks the shared prefix), ``return_hidden`` (needs
+        every prefix hidden state), thinking, or prefill-active steering (the
+        prompt KV would differ per row).  Correctness is unaffected either way —
+        a cache hit produces the identical token stream.
+
         ``on_result(idx, result)`` fires after each completion for local
         progress hooks.
 
@@ -4074,24 +5880,33 @@ class SaklasSession:
             ``RunSet`` aligned with ``prompts``.  ``runset.grid`` records
             ``{"prompt_index": i}`` for each row.
         """
-        if not isinstance(prompts, list) or not prompts:
+        prompts_in: Any = prompts
+        if not isinstance(prompts_in, list) or not prompts_in:
             raise ValueError("generate_batch: prompts must be a non-empty list")
 
-        results: list[GenerationResult] = []
-        node_ids: list[str | None] = []
-        for idx, prompt in enumerate(prompts):
-            r = self._generate_core(
-                prompt,
-                steering=steering,
-                sampling=sampling,
-                stateless=stateless,
-                raw=raw,
-                thinking=thinking,
-            )
-            results.append(r)
-            node_ids.append(self.tree.active_node_id if not stateless else None)
-            if on_result is not None:
-                on_result(idx, r)
+        prefix_cached = self._maybe_cache_batch_prefix(
+            prompts, steering=steering, sampling=sampling,
+            thinking=thinking, stateless=stateless, raw=raw,
+        )
+        try:
+            results: list[GenerationResult] = []
+            node_ids: list[str | None] = []
+            for idx, prompt in enumerate(prompts):
+                r = self._generate_core(
+                    prompt,
+                    steering=steering,
+                    sampling=sampling,
+                    stateless=stateless,
+                    raw=raw,
+                    thinking=thinking,
+                )
+                results.append(r)
+                node_ids.append(self.tree.active_node_id if not stateless else None)
+                if on_result is not None:
+                    on_result(idx, r)
+        finally:
+            if prefix_cached:
+                self.cache_prefix(None)
         return RunSet(
             results,
             node_ids=node_ids,
@@ -4099,9 +5914,90 @@ class SaklasSession:
             kind="batch",
         )
 
+    def _maybe_cache_batch_prefix(
+        self,
+        prompts: list[Any],
+        *,
+        steering: "str | Steering | None",
+        sampling: SamplingConfig | None,
+        thinking: bool | None,
+        stateless: bool,
+        raw: bool,
+    ) -> bool:
+        """Prefill + cache the batch's shared token prefix when reuse is valid.
+
+        Returns ``True`` iff a prefix was cached (the caller clears it after the
+        batch).  Eligibility (all must hold): ``stateless`` (per-row history
+        would break the shared prefix), the steering is prefill-inactive
+        (``_steering_value_prefill_inactive`` — else the prompt KV differs per
+        row and the consume gate would refuse the hit anyway), no
+        ``return_hidden`` and no thinking (both force a full re-prefill), at
+        least two rows, and a shared prefix of at least
+        :data:`_PREFIX_CACHE_MIN_TOKENS`.  Best-effort: any failure to render or
+        cache falls back to the uncached path without disturbing the batch.
+        """
+        if len(prompts) < 2 or not stateless:
+            return False
+        if thinking:
+            return False
+        if sampling is not None and getattr(sampling, "return_hidden", False):
+            return False
+        if not self._steering_value_prefill_inactive(steering):
+            return False
+        try:
+            common = self._batch_common_prefix_ids(prompts, raw=raw)
+            if common is None:
+                return False
+            return self.cache_prefix(common) >= _PREFIX_CACHE_MIN_TOKENS
+        except Exception as exc:
+            # Prefix caching is a pure optimization: a cache_prefix guard
+            # (active scope / in-flight gen), a render failure, or an
+            # under-initialized session must fall back to the normal per-row
+            # prefill, never break the batch.  ``cache_prefix`` clears its own
+            # state before setting it, so no half-built cache can leak.
+            _log.debug("generate_batch: skipping prefix cache (%s)", exc)
+            return False
+
+    def _batch_common_prefix_ids(
+        self, prompts: list[Any], *, raw: bool,
+    ) -> "torch.Tensor | None":
+        """Longest shared leading token run across the batch's rendered inputs.
+
+        Renders each prompt to ``input_ids`` in stateless mode (the same render
+        ``_generate_core`` will reproduce, so the cached tokens are a true
+        byte-prefix of every row) and returns the shared head as a 1-D tensor,
+        or ``None`` when the shared run is shorter than
+        :data:`_PREFIX_CACHE_MIN_TOKENS`.  The run is capped at ``min_row_len -
+        1`` so every row keeps a non-empty suffix to sample from.
+        """
+        rendered: list[torch.Tensor] = []
+        for prompt in prompts:
+            ids = self._prepare_input(
+                prompt, raw=raw, stateless=True, to_device=False,
+            )
+            # Prefix discovery is scalar-heavy Python work. Keep the token
+            # comparison on CPU so MPS/CUDA do not pay one device sync per
+            # ``int(t[i])`` while walking the common prefix.
+            rendered.append(ids[0].detach().to("cpu"))
+        min_len = min(int(t.shape[0]) for t in rendered)
+        if min_len <= _PREFIX_CACHE_MIN_TOKENS:
+            return None
+        ref = rendered[0]
+        common = 0
+        for i in range(min_len):
+            tok = int(ref[i])
+            if all(int(t[i]) == tok for t in rendered):
+                common += 1
+            else:
+                break
+        common = min(common, min_len - 1)  # leave a >=1-token suffix per row
+        if common < _PREFIX_CACHE_MIN_TOKENS:
+            return None
+        return ref[:common].clone()
+
     def generate_sweep(
         self,
-        prompt,
+        prompt: Any,
         sweep: dict[str, list[float]],
         *,
         base_steering: "str | Steering | None" = None,
@@ -4137,10 +6033,12 @@ class SaklasSession:
             alpha dict for row ``i``; ``runset.node_ids[i]`` is the
             assistant node id when ``stateless=False``.
         """
-        if not isinstance(sweep, dict) or not sweep:
+        sweep_in: Any = sweep
+        if not isinstance(sweep_in, dict) or not sweep_in:
             raise ValueError("generate_sweep: sweep dict must be non-empty")
         for name, alphas in sweep.items():
-            if not isinstance(alphas, (list, tuple)) or not alphas:
+            alphas_in: Any = alphas
+            if not isinstance(alphas_in, (list, tuple)) or not alphas_in:
                 raise ValueError(
                     f"generate_sweep: sweep['{name}'] must be a non-empty "
                     f"list of alpha values"
@@ -4192,7 +6090,7 @@ class SaklasSession:
         sibling_node_ids: list[str | None] = []
         grid_rows: list[dict[str, float]] = []
         for idx, combo in enumerate(itertools.product(*alpha_lists)):
-            alpha_values = dict(zip(concept_names, combo))
+            alpha_values = dict(zip(concept_names, combo, strict=True))
             alpha_values = {k: float(v) for k, v in alpha_values.items()}
             terms = [f"{alpha} {name}" for name, alpha in alpha_values.items()]
             expr = " + ".join(terms)
@@ -4239,9 +6137,10 @@ class SaklasSession:
     def close(self) -> None:
         self._steering.clear_all()
         self._profiles.clear()
+        self._manifolds.clear()
 
-    def __enter__(self):
+    def __enter__(self) -> "SaklasSession":
         return self
 
-    def __exit__(self, *args):
+    def __exit__(self, *args: Any) -> None:
         self.close()

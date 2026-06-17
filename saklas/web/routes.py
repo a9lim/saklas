@@ -1,9 +1,11 @@
 """Mount the pre-built Svelte+Vite bundle from ``saklas/web/dist/``.
 
 The bundle is a single-page app — every unknown route falls back to
-``index.html`` so client-side routing works.  Asset hashing is handled
-by Vite; aggressive caching of ``/assets/*`` is safe because filenames
-are content-hashed.
+``index.html`` so client-side routing works.  Vite emits the bundle
+under fixed filenames (``assets/saklas.js`` / ``assets/index.css``),
+not content-hashed ones, so ``/assets/*`` is served by ``StaticFiles``
+with its default ETag / Last-Modified revalidation — do not layer an
+immutable long-lived cache on top, a rebuild reuses the same names.
 """
 from __future__ import annotations
 
@@ -80,7 +82,7 @@ def register_web_routes(app: FastAPI) -> None:
     # the request is then only ever used as a dict key — never as a
     # path component — so ``..`` traversal and absolute-path injection
     # are structurally impossible.  Nested paths fall through to the
-    # SPA shell; hashed bundle assets are already served by the
+    # SPA shell; the bundle assets are already served by the
     # StaticFiles mount on ``/assets``.
     top_level_files: dict[str, Path] = {
         p.name: p

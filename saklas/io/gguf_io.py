@@ -50,7 +50,7 @@ class GGUFNotInstalled(ImportError, SaklasError):
 
 def _import_gguf():
     try:
-        import gguf  # type: ignore
+        import gguf
     except ImportError as e:
         raise GGUFNotInstalled(
             "GGUF support requires the 'gguf' package. "

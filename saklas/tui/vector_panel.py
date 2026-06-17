@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from textual.app import ComposeResult
 from textual.containers import VerticalScroll
 from textual.widgets import Static
@@ -15,10 +17,10 @@ MAX_ALPHA = 1.0
 class LeftPanel(Widget):
     """Entire left column: model, vectors, gen config, keys."""
 
-    def __init__(self, model_info: dict, **kwargs) -> None:
+    def __init__(self, model_info: dict[str, Any], **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._model_info = model_info
-        self._vectors: list[dict] = []
+        self._vectors: list[dict[str, Any]] = []
         self._selected_idx: int = 0
         self._thinking: bool | None = None  # None = model doesn't support it
         # True when the model thinks unconditionally (gpt-oss / Mistral-3
@@ -82,7 +84,7 @@ class LeftPanel(Widget):
             id="key-ref",
         )
 
-    def update_vectors(self, vectors: list[dict]) -> None:
+    def update_vectors(self, vectors: list[dict[str, Any]]) -> None:
         self._vectors = vectors
         if self._vectors:
             self._selected_idx = min(self._selected_idx, len(self._vectors) - 1)
@@ -121,7 +123,7 @@ class LeftPanel(Widget):
             self._selected_idx = (self._selected_idx - 1) % len(self._vectors)
             self._render_vectors()
 
-    def get_selected(self) -> dict | None:
+    def get_selected(self) -> dict[str, Any] | None:
         if self._vectors and 0 <= self._selected_idx < len(self._vectors):
             return self._vectors[self._selected_idx]
         return None
@@ -139,6 +141,11 @@ class LeftPanel(Widget):
             is_selected = i == self._selected_idx
             enabled = v.get("enabled", True)
             name = v["name"]
+
+            if v.get("kind") == "manifold":
+                lines.append(self._render_manifold_row(v, is_selected, enabled))
+                continue
+
             alpha = v["alpha"]
             peak = v["peak"]
             n_active = v["n_active"]
@@ -175,6 +182,44 @@ class LeftPanel(Widget):
 
         content = self._vector_content
         content.update("\n".join(lines))
+
+    def _render_manifold_row(
+        self, v: dict[str, Any], is_selected: bool, enabled: bool,
+    ) -> str:
+        """Render one manifold row.
+
+        A manifold term has a fixed position on a fitted surface, not a
+        scalar alpha — so there's no alpha bar.  The second line shows
+        the authoring position (``manifold % 0.3,0.8``) and the blend
+        coefficient instead.
+        """
+        manifold = v.get("manifold", v["name"])
+        coords = v.get("coords", "")
+        blend = v.get("blend", 0.0)
+
+        marker = ">" if is_selected else " "
+        dot = "[ansi_green]●[/]" if enabled else "[dim]○[/]"
+
+        if is_selected and enabled:
+            name_str = f"[bold]{manifold}[/]"
+        elif is_selected and not enabled:
+            name_str = f"[dim bold]{manifold}[/]"
+        elif not enabled:
+            name_str = f"[dim]{manifold}[/]"
+        else:
+            name_str = manifold
+
+        dim_prefix = "dim " if not enabled else ""
+        # Phase C.3: manifold rows render in purple
+        # (``ansi_magenta``) — visually distinct from vector rows
+        # (red/green per the alpha sign) so a bare-name resolution
+        # that lands on a manifold-label is immediately legible in
+        # the rack.  The GUI ``ManifoldStrip`` uses the same accent.
+        return (
+            f"{marker} {dot} {name_str} [dim]manifold[/]\n"
+            f"  [{dim_prefix}ansi_magenta]% {coords}[/] "
+            f"[dim]blend[/] [{dim_prefix}ansi_magenta]{blend:.2f}[/]"
+        )
 
     def _render_gen_config(self) -> None:
         gen = self._gen_config_widget

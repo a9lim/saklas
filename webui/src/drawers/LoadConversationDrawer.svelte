@@ -6,13 +6,20 @@
 
   import {
     chatLog,
-    addVectorToRack,
-    setVectorAlpha,
-    setVectorTrigger,
-    setVectorVariant,
-    setVectorProjection,
-    setVectorAblate,
-    setVectorEnabled,
+    addSubspaceToRack,
+    setSubspaceLabel,
+    setSubspaceCoords,
+    setSubspaceVariant,
+    setSubspaceTrigger,
+    setSubspaceEnabled,
+    setSubspaceAlong,
+    addManifoldToRack,
+    setManifoldLabel,
+    setManifoldCoords,
+    setManifoldBlend,
+    setManifoldOnto,
+    setManifoldTrigger,
+    setManifoldEnabled,
     samplingState,
     setSampling,
     setHighlightTarget,
@@ -22,12 +29,8 @@
     refreshVectorList,
     vectorsState,
   } from "../lib/stores.svelte";
-  import type {
-    ChatTurn,
-    ProjectionSpec,
-    Trigger,
-    Variant,
-  } from "../lib/types";
+  import { polesOf } from "../lib/concepts";
+  import type { ChatTurn, Trigger, Variant } from "../lib/types";
   import type { SamplingState } from "../lib/stores.svelte";
 
   let _drawerProps: { params?: unknown } = $props();
@@ -42,6 +45,25 @@
   let warnings: string[] = $state([]);
   let appliedSummary: string | null = $state(null);
 
+  /** One persisted steer row — the v2 ``steerRack`` shape (mode + position),
+   *  with the legacy v1 ``vectorRack`` vector fields (``alpha`` / ``projection``
+   *  / ``ablate``) kept optional so old saves still load. */
+  interface SteerRowShape {
+    name: string;
+    mode?: "subspace" | "manifold";
+    coords?: number[];
+    label?: string | null;
+    variant?: Variant;
+    blend?: number;
+    onto?: number;
+    trigger?: Trigger;
+    enabled?: boolean;
+    // legacy v1 (vector) fields:
+    alpha?: number;
+    projection?: unknown;
+    ablate?: boolean;
+  }
+
   /** Loose snapshot shape — matches the writer's output but every field
    * is optional so partial / older saves still load opportunistically. */
   interface SnapshotShape {
@@ -49,15 +71,12 @@
     savedAt?: string;
     model_id?: string | null;
     chatLog?: ChatTurn[];
-    vectorRack?: Array<{
-      name: string;
-      alpha?: number;
-      trigger?: Trigger;
-      variant?: Variant;
-      projection?: ProjectionSpec | null;
-      ablate?: boolean;
-      enabled?: boolean;
-    }>;
+    /** v2: the full steer rack (subspace + manifold entries). */
+    steerRack?: SteerRowShape[];
+    /** v2: the shared subspace-along master. */
+    subspaceAlong?: number;
+    /** v1 legacy: vector-only rack array. */
+    vectorRack?: SteerRowShape[];
     probeRack?: {
       sortMode?: string;
       active?: string[];
@@ -84,6 +103,7 @@
     // sections is present — older saves might be sampling-only.
     return (
       "chatLog" in obj ||
+      "steerRack" in obj ||
       "vectorRack" in obj ||
       "probeRack" in obj ||
       "samplingState" in obj ||
@@ -126,8 +146,8 @@
     warnings = [];
     appliedSummary = null;
     let appliedTurns = 0;
-    let appliedVectors = 0;
-    let skippedVectors = 0;
+    let appliedTerms = 0;
+    let skippedTerms = 0;
     let appliedSampling = 0;
 
     // Refresh server-known vectors so we can warn about missing ones
@@ -146,39 +166,75 @@
       warnings.push("chatLog missing or invalid, skipped");
     }
 
-    if (Array.isArray(parsed.vectorRack)) {
-      for (const row of parsed.vectorRack) {
+    // v2 ``steerRack`` (subspace + manifold) wins; fall back to the legacy
+    // v1 ``vectorRack`` (vector-only) and convert each pole to a subspace
+    // term toward its signed pole, the magnitude → the shared master.
+    const steerRows = Array.isArray(parsed.steerRack)
+      ? parsed.steerRack
+      : Array.isArray(parsed.vectorRack)
+        ? parsed.vectorRack
+        : null;
+    if (steerRows) {
+      if (typeof parsed.subspaceAlong === "number") {
+        setSubspaceAlong(parsed.subspaceAlong);
+      }
+      let firstLegacyAlong = true;
+      for (const row of steerRows) {
         if (!row || typeof row !== "object" || typeof row.name !== "string") {
-          warnings.push("vectorRack: skipped malformed entry");
+          warnings.push("steerRack: skipped malformed entry");
           continue;
         }
         const name = row.name;
-        const alpha = typeof row.alpha === "number" ? row.alpha : 0;
-        const trigger: Trigger = (row.trigger ?? "BOTH") as Trigger;
-        addVectorToRack(name, alpha, trigger);
-        // Apply additional attributes if present.
-        if (typeof row.alpha === "number") setVectorAlpha(name, row.alpha);
-        if (typeof row.trigger === "string") setVectorTrigger(name, row.trigger as Trigger);
-        if (typeof row.variant === "string")
-          setVectorVariant(name, row.variant as Variant);
-        if (row.projection !== undefined)
-          setVectorProjection(name, (row.projection as ProjectionSpec | null) ?? null);
-        if (typeof row.ablate === "boolean") setVectorAblate(name, row.ablate);
-        if (typeof row.enabled === "boolean")
-          setVectorEnabled(name, row.enabled);
-        appliedVectors++;
+        if (row.mode === "manifold") {
+          addManifoldToRack(name);
+          if (typeof row.label === "string") setManifoldLabel(name, row.label);
+          else if (Array.isArray(row.coords)) setManifoldCoords(name, row.coords);
+          if (typeof row.blend === "number") setManifoldBlend(name, row.blend);
+          if (typeof row.onto === "number") setManifoldOnto(name, row.onto);
+          if (typeof row.trigger === "string") setManifoldTrigger(name, row.trigger as Trigger);
+          if (row.enabled === false) setManifoldEnabled(name, false);
+          appliedTerms++;
+          continue;
+        }
+        // subspace (v2) OR legacy v1 vector row.
+        addSubspaceToRack(name);
+        if (row.mode === "subspace") {
+          if (typeof row.label === "string") setSubspaceLabel(name, row.label);
+          else if (Array.isArray(row.coords)) setSubspaceCoords(name, row.coords);
+        } else {
+          // legacy vector → subspace toward the signed pole; |alpha| → master.
+          if (typeof row.alpha === "number") {
+            if (firstLegacyAlong) {
+              setSubspaceAlong(Math.abs(row.alpha));
+              firstLegacyAlong = false;
+            }
+            if (row.alpha < 0) {
+              const neg = polesOf(name).negative;
+              if (neg) setSubspaceLabel(name, neg);
+            }
+          }
+          if (row.projection || row.ablate) {
+            warnings.push(
+              `'${name}': projection/ablation dropped (no longer authorable in the rack)`,
+            );
+          }
+        }
+        if (typeof row.variant === "string") setSubspaceVariant(name, row.variant as Variant);
+        if (typeof row.trigger === "string") setSubspaceTrigger(name, row.trigger as Trigger);
+        if (row.enabled === false) setSubspaceEnabled(name, false);
+        appliedTerms++;
       }
       // Sanity-check against the server's known set; surface a warning
-      // for vectors that aren't currently registered.  This is purely
-      // informational — the rack carries them as-is.
+      // for terms that aren't currently registered.  Informational only —
+      // the rack carries them as-is.
       try {
         const known = vectorsState.names;
-        for (const row of parsed.vectorRack) {
+        for (const row of steerRows) {
           if (typeof row?.name !== "string") continue;
           if (known.length > 0 && !known.includes(row.name)) {
-            skippedVectors++;
+            skippedTerms++;
             warnings.push(
-              `vector '${row.name}' not registered server-side; present in rack but won't apply at gen time`,
+              `'${row.name}' not registered server-side; present in rack but won't apply at gen time`,
             );
           }
         }
@@ -186,7 +242,7 @@
         /* ignore */
       }
     } else {
-      warnings.push("vectorRack missing or invalid, skipped");
+      warnings.push("steerRack / vectorRack missing or invalid, skipped");
     }
 
     if (parsed.samplingState && typeof parsed.samplingState === "object") {
@@ -209,7 +265,7 @@
         highlightState.smoothBlend = hs.smoothBlend;
     }
 
-    appliedSummary = `restored ${appliedTurns} turn${appliedTurns === 1 ? "" : "s"}, ${appliedVectors} vector${appliedVectors === 1 ? "" : "s"}${skippedVectors ? ` (${skippedVectors} not server-known)` : ""}, ${appliedSampling} sampling field${appliedSampling === 1 ? "" : "s"}`;
+    appliedSummary = `restored ${appliedTurns} turn${appliedTurns === 1 ? "" : "s"}, ${appliedTerms} term${appliedTerms === 1 ? "" : "s"}${skippedTerms ? ` (${skippedTerms} not server-known)` : ""}, ${appliedSampling} sampling field${appliedSampling === 1 ? "" : "s"}`;
   }
 </script>
 
@@ -251,7 +307,7 @@
         </span>
         <ul class="counts">
           <li>turns: {parsed.chatLog?.length ?? 0}</li>
-          <li>vectors: {parsed.vectorRack?.length ?? 0}</li>
+          <li>terms: {parsed.steerRack?.length ?? parsed.vectorRack?.length ?? 0}</li>
           <li>probes: {parsed.probeRack?.active?.length ?? 0}</li>
           <li>sampling fields: {parsed.samplingState ? Object.keys(parsed.samplingState).length : 0}</li>
         </ul>

@@ -1,8 +1,15 @@
 <script lang="ts">
-  // Inspector — the right-hand control rack: the steering and probe
-  // racks split the full column height.  The sampling strip moved to
-  // the bottom of the threads column (below the workbench card), giving
-  // the racks this column's whole budget.
+  // Inspector — the right-hand control rack: two equal sections, the
+  // steering rack on top, the (fused vector + manifold) probe rack on
+  // the bottom.  The sampling strip moved to the bottom of the threads
+  // column (below the workbench card), giving these racks this column's
+  // whole budget.
+  //
+  // Manifold probes used to live in their own third rack; they fused
+  // into ProbeRack so the two surfaces (vector + manifold) read as one
+  // family — same shape SteeringRack already uses for vector + manifold
+  // steering.
+
   import SteeringRack from "./SteeringRack.svelte";
   import ProbeRack from "./ProbeRack.svelte";
 </script>

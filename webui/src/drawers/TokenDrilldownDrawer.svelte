@@ -23,10 +23,10 @@
     loomTree,
     sendFork,
     samplingState,
+    probeAxisScale,
   } from "../lib/stores.svelte";
   import type { ChatTurn, TokenAltJSON, TokenScore } from "../lib/types";
   import HeatmapCell from "../lib/charts/HeatmapCell.svelte";
-  import { HIGHLIGHT_SAT } from "../lib/tokens";
 
   interface DrawerParams {
     turnIdx: number;
@@ -394,6 +394,7 @@
                     <td class="cell-td">
                       <HeatmapCell
                         value={v}
+                        scale={probeAxisScale(probe)}
                         size={CELL_SIZE}
                         title={cellTooltip(layer, probe)}
                       />
@@ -514,8 +515,9 @@
   <footer class="drawer-footer">
     <span class="hint">
       {#if tab === "probes"}
-        Tints map score / {HIGHLIGHT_SAT} clamped to ±1. Green = +pole,
-        red = −pole, transparent ≈ 0.
+        Tints map each probe's coordinate to its node extent (full color at
+        the most extreme node), clamped to ±1. Green = +pole, red = −pole,
+        transparent ≈ 0.
       {:else}
         Logprob is the chosen-token natural-log probability under the
         post-temperature / post-top-p / post-top-k distribution the sampler

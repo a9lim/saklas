@@ -6,17 +6,19 @@ sidecar (safetensors path) or a llama.cpp control-vector GGUF (gguf path).
 This class is purely the Python-level surface the rest of saklas uses so
 that callers stop passing bare ``dict[int, Tensor]`` around.
 
-The underlying tensors are "baked": share and reference norm are folded
-into the magnitude at extraction time (see ``vectors.extract_contrastive``),
-so the steering hook collapses to ``alpha * _STEER_GAIN * sum(baked)``.
-A ``Profile`` is just a thin wrapper; the dict stays the canonical shape
-at rest.
+The underlying tensors are "baked": the per-layer Mahalanobis share is
+folded into the magnitude at extraction time (see
+``extraction.ManifoldExtractionPipeline`` /
+``vectors.fold_directions_to_subspace``).  A ``Profile`` is just a thin
+wrapper; the dict stays the canonical shape at rest and the unified
+subspace kernel reads the baked magnitudes as per-layer weights.
 """
 
 from __future__ import annotations
 
+import math
 import pathlib
-from typing import Any, Iterable, Iterator, Mapping
+from typing import Any, Iterable, Iterator, Literal, Mapping, overload
 
 import torch
 
@@ -40,7 +42,7 @@ class Profile:
     ``merged``, ``projected_away``, ``cosine_similarity``).
     """
 
-    __slots__ = ("_tensors", "_metadata")
+    __slots__ = ("_metadata", "_tensors")
 
     def __init__(
         self,
@@ -48,7 +50,8 @@ class Profile:
         *,
         metadata: dict[str, Any] | None = None,
     ) -> None:
-        if not isinstance(tensors, Mapping):
+        tensors_in: Any = tensors
+        if not isinstance(tensors_in, Mapping):
             raise ProfileError(
                 f"Profile(tensors) must be a mapping, got {type(tensors).__name__}"
             )
@@ -57,11 +60,13 @@ class Profile:
         out: dict[int, torch.Tensor] = {}
         ref_dtype: torch.dtype | None = None
         for layer, t in tensors.items():
-            if not isinstance(layer, int):
+            layer_in: Any = layer
+            tensor_in: Any = t
+            if not isinstance(layer_in, int):
                 raise ProfileError(
                     f"Profile layer key must be int, got {type(layer).__name__}"
                 )
-            if not isinstance(t, torch.Tensor):
+            if not isinstance(tensor_in, torch.Tensor):
                 raise ProfileError(
                     f"Profile value at layer {layer} must be torch.Tensor, "
                     f"got {type(t).__name__}"
@@ -287,6 +292,17 @@ class Profile:
                 out[layer] = (a_f - proj).to(dtype=a_t.dtype)
         return type(self)(out, metadata=self._metadata)
 
+    @overload
+    def cosine_similarity(
+        self, other: "Profile", *, per_layer: Literal[False] = ...,
+        whitener: "Any | None" = ...,
+    ) -> float: ...
+    @overload
+    def cosine_similarity(
+        self, other: "Profile", *, per_layer: Literal[True],
+        whitener: "Any | None" = ...,
+    ) -> dict[int, float]: ...
+
     def cosine_similarity(
         self,
         other: "Profile",
@@ -294,25 +310,28 @@ class Profile:
         per_layer: bool = False,
         whitener: "Any | None" = None,
     ) -> "float | dict[int, float]":
-        """Cosine similarity against *other*.
+        """Cosine similarity against *other* (Mahalanobis only).
 
-        **Aggregate** (default): magnitude-weighted cosine over the layer
-        intersection.  Weighting by ``||baked||`` matches the monitor regime.
+        **Aggregate** (default): Mahalanobis-norm-weighted cosine over the
+        layer intersection.  Weighting matches the monitor regime.
 
-        **Per-layer** (``per_layer=True``): raw cosine per shared layer.
+        **Per-layer** (``per_layer=True``): Mahalanobis cosine per shared
+        layer.
 
-        **Whitened metric** (``whitener=<LayerWhitener>``): switches to
-        Mahalanobis cosine ``<u, v>_M = u^T Σ^{-1} v``.  Reduces to plain
-        cosine when ``Σ = I``; predicts cross-domain probe generalization
-        better than plain cosine on activation distributions with strongly
-        anisotropic covariance.  The aggregate still weights by Mahalanobis
-        norms (analogous to the Euclidean-magnitude weighting), so the
-        scalar result is on the same ``[-1, 1]`` scale.  Layers absent
-        from the whitener silently fall back to plain cosine — the
-        whitener may legitimately cover a subset (e.g. SAE-only releases).
+        The metric is Mahalanobis cosine ``<u, v>_M = u^T Σ^{-1} v`` —
+        predicts cross-domain probe generalization better than plain
+        cosine on activation distributions with strongly anisotropic
+        covariance.
+
+        The ``whitener`` (a :class:`LayerWhitener`) is **required** and
+        must cover *every* shared layer, via
+        :meth:`LayerWhitener.covers_all`.  There is no Euclidean path: a
+        missing or non-covering whitener raises :class:`WhitenerError`.
 
         Raises :class:`ProfileError` when no layers are shared.
         """
+        from saklas.core.mahalanobis import WhitenerError
+
         shared = sorted(set(self._tensors) & set(other._tensors))
         if not shared:
             raise ProfileError(
@@ -321,51 +340,42 @@ class Profile:
 
         # Cross-device pairs (e.g. an actively-steered profile hooked on
         # the model device against a disk-loaded peer on CPU) would crash
-        # the dot below; resolve to a common device once and reuse for
-        # both code paths.  CPU is the safe choice — these tensors are
-        # tiny relative to the model and the whitener path moves them
-        # back to its own device internally anyway.
+        # the dot below; resolve to CPU once and reuse for both code paths.
+        # CPU is also where LayerWhitener applies its Woodbury factors.
         def _aligned(a_t: torch.Tensor, b_t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-            af, bf = a_t.float(), b_t.float()
-            if af.device != bf.device:
-                af, bf = af.cpu(), bf.cpu()
-            return af, bf
+            return a_t.float().cpu(), b_t.float().cpu()
+
+        # Mahalanobis-only: the whitener must cover every shared layer.
+        # No Euclidean fallback — a missing or partial whitener is an error.
+        if whitener is None or not whitener.covers_all(shared):
+            raise WhitenerError(
+                "cosine_similarity requires a Mahalanobis whitener covering "
+                f"every shared layer {shared}; regenerate the neutral "
+                "activation cache for this model (the Euclidean path is gone)"
+            )
 
         if per_layer:
             out: dict[int, float] = {}
             for L in shared:
                 a, b = _aligned(self._tensors[L], other._tensors[L])
-                if whitener is not None and whitener.covers(L):
-                    out[L] = whitener.mahalanobis_cosine(L, a, b)
-                else:
-                    out[L] = (
-                        torch.dot(a, b) / (a.norm() * b.norm())
-                    ).item()
+                out[L] = whitener.mahalanobis_cosine(L, a, b)
             return out
 
-        # Magnitude-weighted aggregate.  Under Mahalanobis, the per-layer
-        # weight uses Mahalanobis norms (same role as ``||baked||`` in the
-        # Euclidean case — directions whose typical activations don't
-        # cover them dominate the average less, mirroring the monitor
-        # regime).
+        # Mahalanobis-norm-weighted aggregate: directions whose typical
+        # activations don't cover them dominate the average less, mirroring
+        # the monitor regime.
         num = 0.0
         den = 0.0
         for L in shared:
             a, b = _aligned(self._tensors[L], other._tensors[L])
-            if whitener is not None and whitener.covers(L):
-                na = whitener.mahalanobis_norm(L, a)
-                nb = whitener.mahalanobis_norm(L, b)
-                if na < 1e-12 or nb < 1e-12:
-                    continue
-                cos = whitener.mahalanobis_dot(L, a, b) / (na * nb)
-            else:
-                na, nb = a.norm().item(), b.norm().item()
-                if na < 1e-12 or nb < 1e-12:
-                    continue
-                cos = (torch.dot(a, b) / (na * nb)).item()
-            w = na * nb
-            num += w * cos
-            den += w
+            si_a = whitener.apply_inv(L, a).float()
+            si_b = whitener.apply_inv(L, b).float()
+            aa = max(float(torch.dot(a.reshape(-1), si_a.reshape(-1)).item()), 0.0)
+            bb = max(float(torch.dot(b.reshape(-1), si_b.reshape(-1)).item()), 0.0)
+            if aa < 1e-12 or bb < 1e-12:
+                continue
+            num += float(torch.dot(a.reshape(-1), si_b.reshape(-1)).item())
+            den += math.sqrt(aa * bb)
         if den < 1e-12:
             raise ProfileError(
                 "cosine_similarity: every shared layer has near-zero "
@@ -375,10 +385,7 @@ class Profile:
 
     def __repr__(self) -> str:
         layers = self.layers
-        if len(layers) <= 4:
-            layer_desc = str(layers)
-        else:
-            layer_desc = f"[{layers[0]}..{layers[-1]}] ({len(layers)} layers)"
+        layer_desc = str(layers) if len(layers) <= 4 else f"[{layers[0]}..{layers[-1]}] ({len(layers)} layers)"
         first = next(iter(self._tensors.values()))
         return (
             f"Profile({layer_desc}, dtype={first.dtype}, "

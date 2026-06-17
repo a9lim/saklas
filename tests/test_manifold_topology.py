@@ -1,0 +1,320 @@
+"""Topology auto-selection — ``fit_mode="auto"`` machinery (CPU only).
+
+Covers the two decoupled decisions in :func:`select_topology`:
+
+  (a) flat (``pca``) vs curved (``spectral``), by GCV in a shared whitened-
+      reduced metric — validated on linearly-embedded (flat) vs nonlinearly-
+      embedded (curved) synthetic manifolds;
+  (b) periodic axes, by Vietoris–Rips H1 *persistent homology* counting the
+      loops (ellipse/noise-robust) and the spectral eigenpairs coordinating
+      them.
+
+The PH loop counter is tested directly on distance matrices of known topology;
+the full selector through a synthetic whitener + per-layer consensus Gram.
+"""
+from __future__ import annotations
+
+import math
+
+import pytest
+import torch
+
+from saklas.core.manifold import (
+    BoxDomain,
+    CustomDomain,
+    _count_persistent_loops,
+    _faint_cycle_coords,
+    _is_angular_harmonic,
+    select_topology,
+)
+from tests._whitener import isotropic_whitener
+
+_LAYERS = list(range(6))
+_D = 48
+
+
+def _circle(k: int) -> torch.Tensor:
+    th = torch.linspace(0, 2 * math.pi, k + 1)[:-1]
+    return torch.stack([torch.cos(th), torch.sin(th)], dim=1)
+
+
+def _ellipse(k: int, a: float, b: float) -> torch.Tensor:
+    th = torch.linspace(0, 2 * math.pi, k + 1)[:-1]
+    rot = torch.tensor([[0.8, -0.6], [0.6, 0.8]])
+    return torch.stack([a * torch.cos(th), b * torch.sin(th)], dim=1) @ rot
+
+
+def _torus_t2(side: int) -> torch.Tensor:
+    g = torch.linspace(0, 2 * math.pi, side + 1)[:-1]
+    a, b = torch.meshgrid(g, g, indexing="ij")
+    return torch.stack(
+        [torch.cos(a).flatten(), torch.sin(a).flatten(),
+         torch.cos(b).flatten(), torch.sin(b).flatten()], dim=1,
+    )
+
+
+def _sphere(k: int, seed: int) -> torch.Tensor:
+    g = torch.Generator().manual_seed(seed)
+    v = torch.randn(k, 3, generator=g)
+    return v / v.norm(dim=1, keepdim=True)
+
+
+# ----------------------------------------------------- PH H1 loop counter ---
+
+@pytest.mark.parametrize("name,points,want", [
+    ("circle", _circle(40), 1),
+    ("ellipse-4:1", _ellipse(40, 3.0, 0.7), 1),
+    ("ellipse-6:1", _ellipse(40, 6.0, 1.0), 1),
+    ("torus-T2", _torus_t2(8), 2),
+    ("blob", None, 0),          # filled in below (needs a seed)
+    ("arc", torch.stack([torch.linspace(0, 1, 40), torch.linspace(0, 1, 40) ** 2], 1), 0),
+    ("line", torch.stack([torch.linspace(0, 1, 30), 2 * torch.linspace(0, 1, 30)], 1), 0),
+    ("sphere-S2", _sphere(80, 3), 0),
+])
+def test_ph_loop_count(name: str, points: torch.Tensor | None, want: int) -> None:
+    if points is None:  # blob
+        points = torch.randn(60, 2, generator=torch.Generator().manual_seed(2))
+    got = _count_persistent_loops(torch.cdist(points, points))
+    assert got == want, f"{name}: H1={got}, want {want}"
+
+
+def test_ph_dense_complete_complex_no_spurious_loops() -> None:
+    """A (near-)complete Rips complex has trivial H1 — the triangle cap must be
+    large enough not to *manufacture* loops by truncating the filling triangles.
+
+    Regression for the ``personas`` 8-torus.  109 tightly-clustered points plus
+    one far outlier force ``eps_c`` (the largest MST edge) up to the outlier
+    distance, so ``eps_max = 2·eps_c`` puts *every* pair inside the ceiling — the
+    complex is complete and its true H1 is 0.  But that is ``C(109,3) ≈ 210k``
+    triangles; the old ``max_triangles=150_000`` cap dropped the largest-
+    filtration ones, leaving ~800 cycles born-but-unfillable and miscounted as
+    essential (which routed the 107-node ``personas`` heap to a spurious
+    8-torus).  The raised cap keeps every triangle across the supported regime.
+    """
+    from saklas.core.manifold import _rips_h1_persistence
+
+    g = torch.Generator().manual_seed(7)
+    cluster = torch.randn(109, 6, generator=g) * 0.1
+    outlier = torch.zeros(1, 6)
+    outlier[0, 0] = 50.0
+    D = torch.cdist(torch.cat([cluster, outlier]), torch.cat([cluster, outlier]))
+
+    # The fix: no spurious loops on the dense complex.
+    assert _count_persistent_loops(D) == 0
+
+    # And the cap is genuinely load-bearing: at the same (complete) ceiling the
+    # starved budget *does* manufacture essential cycles while the current
+    # default keeps every triangle and reports none — so the regression is real,
+    # not incidental to this particular heap.
+    K = D.shape[0]
+    iu = torch.triu_indices(K, K, offset=1)
+    eps_max = 2.0 * float(D[iu[0], iu[1]].max())  # ≥ every pair ⇒ complete
+    starved = _rips_h1_persistence(D, eps_max, max_triangles=150_000)
+    ample = _rips_h1_persistence(D, eps_max, max_triangles=500_000)
+    assert sum(1 for _b, death in starved if math.isinf(death)) > 0
+    assert sum(1 for _b, death in ample if math.isinf(death)) == 0
+
+
+def test_ph_noisy_circle_is_one_loop() -> None:
+    g = torch.Generator().manual_seed(1)
+    pts = _circle(40) + 0.05 * torch.randn(40, 2, generator=g)
+    assert _count_persistent_loops(torch.cdist(pts, pts)) == 1
+
+
+# ------------------------------------------------------ harmonic dedup -------
+
+def test_angular_harmonic_detects_multiples() -> None:
+    side = 6
+    g = torch.linspace(0, 2 * math.pi, side + 1)[:-1]
+    a, b = torch.meshgrid(g, g, indexing="ij")
+    theta_a = a.flatten()
+    theta_b = b.flatten()              # an independent torus factor
+    second = (2.0 * theta_a) % (2.0 * math.pi)   # 2nd harmonic of theta_a
+    assert _is_angular_harmonic(second, [theta_a]) is True
+    # The other torus factor is genuinely independent — not a harmonic.
+    assert _is_angular_harmonic(theta_b, [theta_a]) is False
+
+
+# ----------------------------------------------------- full select_topology -
+
+def _stacks_from_coords(
+    low: torch.Tensor, *, noise: float = 0.02,
+) -> dict[int, torch.Tensor]:
+    """Per-layer activation centroids: a random linear lift of ``low`` per layer."""
+    k, p = low.shape
+    out: dict[int, torch.Tensor] = {}
+    for layer in _LAYERS:
+        g = torch.Generator().manual_seed(100 + layer)
+        proj = torch.randn(p, _D, generator=g)
+        out[layer] = (low @ proj + noise * torch.randn(k, _D, generator=g)).float()
+    return out
+
+
+def _nonlinear_curve(k: int) -> torch.Tensor:
+    """A genuinely curved (nonlinearly-embedded) 1-D manifold — not in any plane."""
+    t = torch.linspace(0, 1, k)
+    return torch.stack([torch.sin(5 * t), torch.cos(7 * t), torch.sin(11 * t)], dim=1)
+
+
+def _choose(low: torch.Tensor, *, noise: float = 0.02):
+    wh = isotropic_whitener(_LAYERS, _D)
+    stacks = _stacks_from_coords(low, noise=noise)
+    grams = {
+        layer: wh.subspace_gram(layer, stacks[layer] - stacks[layer].mean(0, keepdim=True))
+        for layer in _LAYERS
+    }
+    consensus = torch.stack([grams[layer] for layer in _LAYERS]).mean(0)
+    return select_topology(stacks, grams, consensus, whitener=wh, max_dim=6)
+
+
+def test_select_flat_blob_is_pca() -> None:
+    g = torch.Generator().manual_seed(0)
+    choice = _choose(torch.randn(50, 3, generator=g))
+    assert choice.fit_mode == "pca"
+    assert isinstance(choice.domain, CustomDomain)
+
+
+def test_select_line_is_pca() -> None:
+    t = torch.linspace(0, 1, 30)
+    choice = _choose(torch.stack([t, 2 * t, -t], dim=1))
+    assert choice.fit_mode == "pca"
+
+
+def test_select_nonlinear_curve_is_spectral() -> None:
+    choice = _choose(_nonlinear_curve(40), noise=0.005)
+    assert choice.winner_name == "spectral"
+    assert choice.fit_mode == "spectral"
+    assert isinstance(choice.domain, CustomDomain)
+
+
+def test_select_circle_is_periodic() -> None:
+    choice = _choose(_circle(40))
+    assert choice.winner_name == "torus-T1"
+    assert choice.fit_mode == "spectral"
+    assert isinstance(choice.domain, BoxDomain)
+    assert choice.domain.axes[0].periodic
+    assert choice.coords.shape[1] == 1
+
+
+def test_select_ellipse_is_periodic() -> None:
+    # The case that defeated the geometric heuristic: a linearly-mapped circle
+    # is an ellipse, but PH still reads one loop.
+    choice = _choose(_ellipse(40, 3.0, 1.0))
+    assert choice.winner_name == "torus-T1"
+    assert isinstance(choice.domain, BoxDomain)
+
+
+def test_select_torus_t2_is_periodic_2d() -> None:
+    choice = _choose(_torus_t2(8))
+    assert choice.winner_name == "torus-T2"
+    assert isinstance(choice.domain, BoxDomain)
+    assert choice.coords.shape[1] == 2
+    assert all(ax.periodic for ax in choice.domain.axes)
+
+
+def test_select_records_candidate_ranking() -> None:
+    g = torch.Generator().manual_seed(0)
+    choice = _choose(torch.randn(50, 3, generator=g))
+    names = {c.name for c in choice.candidates}
+    assert "flat-pca" in names
+    # Candidates are ranked viable-first by score (GCV); the winner is present.
+    assert any(c.name == choice.winner_name for c in choice.candidates)
+    assert choice.candidates[0].viable
+
+
+# ------------------------------------ faint single-cycle fallback (S^1) ------
+#
+# H1 persistence counts loops by *hole size*, so a faint ring (a small cyclic
+# modulation on a near-equidistant heap — e.g. day-of-week centroids) slips
+# under its threshold. ``_faint_cycle_coords`` is the complementary
+# graph-topological detector that fires only when PH found nothing.
+
+def _faint_ring(k: int, mod: float = 0.16, common_dims: int = 30) -> torch.Tensor:
+    """A faint ``S^1``: a small cyclic modulation + many constant dims, so the
+    points are near-equidistant (thin hole that PH would miss)."""
+    th = torch.linspace(0, 2 * math.pi, k + 1)[:-1]
+    ring = mod * torch.stack([torch.cos(th), torch.sin(th)], dim=1)
+    return torch.cat([ring, torch.ones(k, common_dims)], dim=1)
+
+
+def _arc(k: int, deg: float) -> torch.Tensor:
+    th = torch.linspace(0, math.radians(deg), k)
+    return torch.stack([torch.cos(th), torch.sin(th)], dim=1)
+
+
+def _theta_graph() -> torch.Tensor:
+    """Two hubs joined by three parallel routes — maxdeg-3 but not S^1."""
+    mids = torch.linspace(0.5, 3.5, 3)
+    return torch.cat([
+        torch.tensor([[0.0, 0.0], [4.0, 0.0]]),
+        torch.stack([mids, torch.full((3,), 1.0)], dim=1),
+        torch.stack([mids, torch.full((3,), -1.0)], dim=1),
+        torch.stack([mids, torch.zeros(3)], dim=1),
+    ], dim=0)
+
+
+def _grid(side: int) -> torch.Tensor:
+    g = torch.arange(side, dtype=torch.float32)
+    a, b = torch.meshgrid(g, g, indexing="ij")
+    return torch.stack([a.flatten(), b.flatten()], dim=1)
+
+
+def _persona_fan(k: int, rank: int, seed: int) -> torch.Tensor:
+    """A high-D non-cyclic fan — the dangerous false-positive (personas)."""
+    g = torch.Generator().manual_seed(seed)
+    return torch.randn(k, rank, generator=g).abs() @ torch.randn(rank, 40, generator=g)
+
+
+@pytest.mark.parametrize("name,points,want", [
+    ("clean-circle-K9", _circle(9), True),
+    ("faint-ring-K7", _faint_ring(7), True),
+    ("faint-ring-K12", _faint_ring(12), True),
+    ("line-K7", torch.stack([torch.linspace(0, 1, 7), torch.zeros(7)], 1), False),
+    ("arc-210-K7", _arc(7, 210), False),
+    ("arc-300-K12", _arc(12, 300), False),
+    ("theta", _theta_graph(), False),
+    ("grid-4x4", _grid(4), False),
+    ("persona-fan-K30", _persona_fan(30, 8, 1), False),
+    ("persona-fan-K107", _persona_fan(107, 8, 2), False),
+    ("too-few-K5", _circle(5), False),  # below the K>=7 reliability gate
+])
+def test_faint_cycle_detector(name: str, points: torch.Tensor, want: bool) -> None:
+    got = _faint_cycle_coords(torch.cdist(points, points)) is not None
+    assert got is want, name
+
+
+def test_faint_cycle_recovers_uniform_ordered_angles() -> None:
+    """The recovered S^1 coordinate is uniform and in the cyclic order."""
+    coords = _faint_cycle_coords(torch.cdist(_faint_ring(8), _faint_ring(8)))
+    assert coords is not None
+    # Each node lands on a distinct 2*pi*i/8 grid point; sorted gaps are uniform.
+    ordered = torch.sort(coords).values
+    gaps = torch.diff(ordered)
+    assert torch.allclose(gaps, gaps.mean(), atol=1e-4)
+
+
+def test_faint_cycle_false_positive_rate_low() -> None:
+    """Random Gaussian heaps must rarely read as cyclic (the FP guard)."""
+    fp = 0
+    for seed in range(120):
+        g = torch.Generator().manual_seed(seed)
+        pts = torch.randn(9, 6, generator=g)
+        fp += _faint_cycle_coords(torch.cdist(pts, pts)) is not None
+    assert fp <= 2, f"random-heap false positives too high: {fp}/120"
+
+
+def test_select_faint_ring_is_periodic() -> None:
+    """End-to-end: a faint ring PH misses still routes to a periodic BoxDomain."""
+    choice = _choose(_faint_ring(9, mod=0.16, common_dims=0)[:, :2], noise=0.01)
+    # (a plain faint circle through the synthetic whitener/consensus path)
+    assert choice.winner_name == "torus-T1"
+    assert isinstance(choice.domain, BoxDomain)
+    assert choice.domain.axes[0].periodic
+
+
+def test_select_blob_not_spuriously_periodic() -> None:
+    """The fallback must not turn a random blob into a ring."""
+    for seed in range(8):
+        g = torch.Generator().manual_seed(seed)
+        choice = _choose(torch.randn(9, 4, generator=g))
+        assert not isinstance(choice.domain, BoxDomain), f"seed {seed} spurious ring"

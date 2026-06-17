@@ -20,7 +20,7 @@ pytest tests/test_paths.py -v       # fast non-GPU tests
 pytest tests/test_smoke.py -v       # GPU smoke tests (downloads gemma-3-4b-it, ~8GB)
 ```
 
-Smoke tests need CUDA or Apple Silicon MPS. The non-GPU tests (`test_paths`, `test_packs`, `test_selectors`, `test_cache_ops`, `test_hf`, `test_merge`, `test_config_file`, `test_cli_flags`, `test_probes_bootstrap`, `test_results`, `test_datasource`, `test_server`) run anywhere, and are what CI exercises.
+Smoke tests need CUDA or Apple Silicon MPS (they're marked `@pytest.mark.gpu`). The rest of the suite runs anywhere — that's what CI exercises via `pytest -m "not gpu"`.
 
 ## Lint
 
@@ -53,7 +53,7 @@ If the model is quirky (multimodal text extraction, FP8 dequantization, nonstand
 
 ## PRs
 
-- If you're adding an architecture, please include a note in the PR about which model you tested against and provide the vectors for `angry.calm`.
+- If you're adding an architecture, please include a note in the PR about which model you tested against and provide the vectors for `confident.uncertain`.
 - Please don't bump the version in your PR unless you want a new release; the PyPI publish workflow is triggered by a version update.
 
 ## Questions

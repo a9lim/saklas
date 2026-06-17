@@ -4,16 +4,22 @@ from __future__ import annotations
 
 import argparse
 import functools
-import re
+from operator import itemgetter
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, TypeVar
 
-from saklas.cli.parsers import _EXPERIMENT_VERBS, _PACK_VERBS, _VECTOR_VERBS
+from saklas.cli.parsers import (
+    _EXPERIMENT_VERBS, _MANIFOLD_VERBS, _PACK_VERBS, _TEMPLATE_VERBS,
+)
 from saklas.core.errors import SaklasError
+from saklas.core.stats import median_or_zero
+from saklas.io.paths import VARIANT_SUFFIX_RE
 
 if TYPE_CHECKING:
+    from saklas.core.session import SaklasSession
     from saklas.core.steering import Steering
+    from saklas.core.profile import Profile
 
 
 _R = TypeVar("_R")
@@ -41,71 +47,116 @@ def _saklas_error_exit(fn: Callable[..., _R]) -> Callable[..., _R]:
 # Shared helpers
 # ---------------------------------------------------------------------------
 
-def _resolve_probes(raw: list[str] | None) -> list[str]:
-    from saklas.core.session import PROBE_CATEGORIES
+def _resolve_probes(raw: list[str] | None) -> list[str] | None:
+    """Resolve the ``--probes`` flag to a value for ``from_pretrained``.
+
+    ``None`` (unset) and ``all`` both return ``None`` — the session's default-
+    roster signal, which attaches the tagged concept axes *plus* every already-
+    fitted bundled multi-node manifold (``personas`` / ``emotions``).  ``none``
+    / ``[]`` disable probes; an explicit category list is honored verbatim (the
+    tagged concepts only, no multi-node sweep).
+    """
     if raw is None or raw == ["all"]:
-        return list(PROBE_CATEGORIES)
-    if raw == ["none"] or raw == []:
+        return None
+    if raw in (["none"], []):
         return []
     return raw
+
+
+def _target_whitener_from_neutral_cache(model_id: str) -> Any:
+    """Build a target-model whitener from neutral activations without loading a model.
+
+    Transfer re-bakes the share in the target Mahalanobis metric, which is
+    now mandatory — there is no Euclidean rebake.  A missing, stale, or
+    degenerate target neutral cache raises :class:`WhitenerError` (wrapped
+    from whatever the loader raised) so the caller fails loudly with an
+    actionable hint instead of silently degrading.
+    """
+    from saklas.core.mahalanobis import LayerWhitener, WhitenerError
+
+    try:
+        return LayerWhitener.from_cache(model_id)
+    except WhitenerError:
+        raise
+    except Exception as e:
+        raise WhitenerError(
+            f"transfer requires a Mahalanobis whitener for the target model "
+            f"'{model_id}', but its neutral activation cache is missing or "
+            f"unusable ({e}); generate neutral activations for the TARGET "
+            f"model first"
+        ) from e
+
+
+def _load_or_fit_transfer_alignment(
+    src_model: str,
+    tgt_model: str,
+    *,
+    force: bool,
+    label: str,
+) -> tuple[dict[int, Any], dict[int, float], Path]:
+    """Load or fit a Procrustes alignment for vector/manifold transfer."""
+    from saklas.io.alignment import (
+        AlignmentError,
+        alignment_cache_path,
+        alignment_quality,
+        fit_alignment,
+        load_alignment_map,
+        load_or_compute_neutral_activations,
+        save_alignment_map,
+    )
+
+    cached = None if force else load_alignment_map(src_model, tgt_model)
+    if cached is not None:
+        M, sidecar = cached
+        raw_q = sidecar.get("quality_per_layer") or {}
+        quality_per_layer = {int(k): float(v) for k, v in raw_q.items()}
+        map_path, _ = alignment_cache_path(src_model, tgt_model)
+        return M, quality_per_layer, map_path
+
+    # Need both models loaded to compute neutrals.  Loading two large models
+    # simultaneously is non-trivial, so serialize: source, then target.
+    print(
+        f"{label}: fitting Procrustes alignment {src_model} -> {tgt_model} "
+        f"(this may load each model briefly)...",
+        file=sys.stderr,
+    )
+    from saklas.core.session import SaklasSession
+
+    with SaklasSession.from_pretrained(
+        src_model, device="auto", probes=[],
+    ) as src_sess:
+        src_acts = load_or_compute_neutral_activations(
+            src_sess._model, src_sess._tokenizer, src_sess._layers,
+            model_id=src_model, force=force,
+        )
+    with SaklasSession.from_pretrained(
+        tgt_model, device="auto", probes=[],
+    ) as tgt_sess:
+        tgt_acts = load_or_compute_neutral_activations(
+            tgt_sess._model, tgt_sess._tokenizer, tgt_sess._layers,
+            model_id=tgt_model, force=force,
+        )
+    try:
+        M = fit_alignment(src_acts, tgt_acts)
+    except AlignmentError as e:
+        print(f"{label}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    quality_per_layer = alignment_quality(M, src_acts, tgt_acts)
+    map_path = save_alignment_map(
+        M, src_model, tgt_model,
+        quality_per_layer=quality_per_layer,
+    )
+    return M, quality_per_layer, map_path
 
 
 def _make_session(args: argparse.Namespace):
     from saklas.core.session import SaklasSession
     probe_categories = _resolve_probes(args.probes)
-    # ``--legacy`` is a v2.0-backcompat shorthand: additive injection +
-    # PCA extraction.  Mutually exclusive with ``--steer-mode`` (the
-    # canonical injection-mode flag).  Probe-bootstrap method is forced
-    # to ``"pca"`` so first-run extractions match the v2.0 stack;
-    # ``--method`` on ``vector extract`` is independent (per-call).
-    legacy = bool(getattr(args, "legacy", False))
-    injection_explicit = getattr(args, "injection_mode", None)
-    metric_explicit = getattr(args, "projection_metric", None)
-    if legacy and injection_explicit is not None:
-        print(
-            f"--legacy and --steer-mode are mutually exclusive "
-            f"(--legacy implies --steer-mode additive); got "
-            f"--steer-mode {injection_explicit}",
-            file=sys.stderr,
-        )
-        sys.exit(2)
-    if legacy and metric_explicit is not None:
-        print(
-            f"--legacy and --projection-metric are mutually exclusive "
-            f"(--legacy implies --projection-metric euclidean); got "
-            f"--projection-metric {metric_explicit}",
-            file=sys.stderr,
-        )
-        sys.exit(2)
-    if legacy and bool(getattr(args, "no_dls", False)):
-        print(
-            "--legacy and --no-dls are mutually exclusive "
-            "(--legacy already implies DLS off)",
-            file=sys.stderr,
-        )
-        sys.exit(2)
-    # ``--legacy`` also flips the runtime ``~`` / ``|`` projection
-    # metric to Euclidean (the v2.0/v2.1 plain Gram-Schmidt behavior),
-    # and disables DLS (v2.1 introduced data-driven layer selection;
-    # the v2.0 stack used the old ``drop_edges=(2,2)`` heuristic which
-    # is gone in v2.1 — under ``--legacy`` we keep every layer rather
-    # than re-implement the removed edge-drop just for backcompat).
-    if legacy:
-        injection_mode = "additive"
-        extraction_method = "pca"
-        projection_metric = "euclidean"
-        dls = False
-    else:
-        # Steering-injection options: ``None`` flows through to the v2.1
-        # session defaults (angular + π/2).  CLI flag and YAML are both
-        # already merged onto ``args`` by ``_load_effective_config``.
-        injection_mode = injection_explicit or "angular"
-        extraction_method = "dim"
-        projection_metric = getattr(args, "projection_metric", None) or "mahalanobis"
-        # ``--no-dls`` opts out of the discriminative-layer mask without
-        # toggling the rest of the v2.1 stack.
-        dls = not bool(getattr(args, "no_dls", False))
-    theta_max = getattr(args, "theta_max", None)
+    # ``~`` / ``|`` projection is Mahalanobis-only (closed-form LEACE);
+    # ``--no-dls`` opts out of the discriminative-layer mask.  The flag and
+    # YAML are already merged onto ``args`` by ``_load_effective_config``.
+    dls = not bool(getattr(args, "no_dls", False))
     # ``--compile`` and ``--cuda-graphs`` opt *in* to the CUDA-side
     # perf path.  Defaults are off — compile's per-token speedup is
     # variable (~1.2–3× when it works, ~equal otherwise), the
@@ -126,10 +177,6 @@ def _make_session(args: argparse.Namespace):
         probes=probe_categories,
         system_prompt=getattr(args, "system_prompt", None),
         max_tokens=getattr(args, "max_tokens", 1024),
-        injection_mode=injection_mode,
-        theta_max=theta_max,
-        extraction_method=extraction_method,
-        projection_metric=projection_metric,
         dls=dls,
         compile=compile_enabled,
         cuda_graphs=cuda_graphs_enabled,
@@ -137,7 +184,7 @@ def _make_session(args: argparse.Namespace):
     )
 
 
-def _print_model_info(session) -> None:
+def _print_model_info(session: SaklasSession) -> None:
     info = session.model_info
     print(f"Architecture: {info['model_type']}")
     print(f"Layers: {info['num_layers']}, Hidden dim: {info['hidden_dim']}")
@@ -173,29 +220,6 @@ def _load_effective_config(args: argparse.Namespace):
     args.system_prompt = composed.system_prompt
     args.max_tokens = composed.max_tokens if composed.max_tokens is not None else 1024
     args.config_vectors = composed.vectors
-    # Honor YAML ``extraction_method:`` only when the user hasn't already
-    # set --method on the CLI (argparse defaults the attr to "dim").
-    if (
-        composed.extraction_method is not None
-        and getattr(args, "method", None) is None
-    ):
-        args.method = composed.extraction_method
-    # Steering-injection options on tui/serve: YAML wins when CLI is unset.
-    if (
-        composed.injection_mode is not None
-        and getattr(args, "injection_mode", None) is None
-    ):
-        args.injection_mode = composed.injection_mode
-    if (
-        composed.theta_max is not None
-        and getattr(args, "theta_max", None) is None
-    ):
-        args.theta_max = composed.theta_max
-    if (
-        composed.projection_metric is not None
-        and getattr(args, "projection_metric", None) is None
-    ):
-        args.projection_metric = composed.projection_metric
     # YAML ``compile: true`` folds onto ``args.compile`` (the CLI
     # opt-in).  YAML ``compile: false`` is the default, so it's a
     # no-op — but accepting it makes round-tripping symmetric with
@@ -226,7 +250,7 @@ def _print_startup(args: argparse.Namespace) -> None:
 
 
 def _setup_steering_vectors(
-    session,
+    session: SaklasSession,
     expression: "str | None",
     *,
     verbose: bool = False,
@@ -276,14 +300,12 @@ def _setup_steering_vectors(
             continue
         registry_key = canonical
         session.steer(registry_key, profile)
-        print(f"  Registered '{registry_key}'"
-              if not verbose else
-              f"  Registered '{registry_key}'")
+        print(f"  Registered '{registry_key}'")
 
     return parse_expr(expression)
 
 
-def _warmup_session(session) -> None:
+def _warmup_session(session: SaklasSession) -> None:
     """Run a stateless generation so the first real request is fast.
 
     The model loader's compile probe (``_compile_with_probe``) already
@@ -379,6 +401,11 @@ def _run_serve(args: argparse.Namespace) -> None:
                      api_key=getattr(args, "api_key", None),
                      web=web_enabled)
 
+    # The default probe roster — tagged concept axes plus every fitted bundled
+    # multi-node manifold (``personas`` / ``emotions``) — is attached at session
+    # construction (``_bootstrap_manifold_probes``), so the dashboard's probe
+    # rack opens already watching them with no serve-side step.
+
     _warmup_session(session)
 
     print(f"\nServing on http://{args.host}:{args.port}")
@@ -390,227 +417,33 @@ def _run_serve(args: argparse.Namespace) -> None:
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
 
-# --- pack runners --------------------------------------------------------
+# --- manifold compute runners --------------------------------------------
 
-@_saklas_error_exit
-def _run_pack(args: argparse.Namespace) -> None:
-    pack_cmd = getattr(args, "pack_cmd", None)
-    if pack_cmd is None:
-        print("usage: saklas pack <verb> [...]")
-        print()
-        width = max(len(v) for v, _ in _PACK_VERBS)
-        for v, desc in _PACK_VERBS:
-            print(f"  {v:<{width}}  {desc}")
-        print()
-        print("Run `saklas pack <verb> -h` for verb-specific options.")
-        sys.exit(0)
-    runner = _PACK_RUNNERS[pack_cmd]
-    runner(args)
-
-
-def _run_install(args: argparse.Namespace) -> None:
-    from saklas.io import cache_ops
-    cache_ops.install(
-        args.target,
-        as_=args.as_target,
-        force=args.force,
-        statements_only=args.statements_only,
-    )
-    suffix = " (statements only)" if args.statements_only else ""
-    print(f"Installed {args.target}{suffix}")
-
-
-def _run_refresh(args: argparse.Namespace) -> None:
-    from saklas.io import cache_ops
-    from saklas.io.selectors import parse as sel_parse
-
-    if args.selector == "neutrals":
-        if args.model is not None:
-            print("warning: --model has no effect with `refresh neutrals`", file=sys.stderr)
-        dst = cache_ops.refresh_neutrals()
-        print(f"Refreshed {dst}")
-        return
-
-    selector = sel_parse(args.selector)
-    n = cache_ops.refresh(selector, model_scope=args.model)
-    print(f"Refreshed {n} concept(s)")
-
-
-def _run_clear(args: argparse.Namespace) -> None:
-    from saklas.io import cache_ops
-    from saklas.io.selectors import parse as sel_parse
-
-    selector = sel_parse(args.selector)
-    if selector.kind in {"all", "namespace"} and not args.yes:
-        print(
-            f"refusing to clear a broad selector ({selector.kind}); pass --yes to confirm",
-            file=sys.stderr,
-        )
-        sys.exit(2)
-    n = cache_ops.delete_tensors(selector, args.model, variant=args.variant)
-    print(f"Deleted {n} files")
-
-
-def _run_rm(args: argparse.Namespace) -> None:
-    from saklas.io import cache_ops
-    from saklas.io.selectors import parse as sel_parse
-
-    selector = sel_parse(args.selector)
-    try:
-        n = cache_ops.uninstall(selector, yes=args.yes)
-    except RuntimeError as e:
-        print(str(e), file=sys.stderr)
-        sys.exit(2)
-    print(f"Uninstalled {n} concept(s)")
-
-
-def _run_ls(args: argparse.Namespace) -> None:
-    from saklas.cli.output import render_local_pack_list
-    from saklas.io.selectors import parse as sel_parse
-
-    selector = sel_parse(args.selector) if args.selector else None
-    render_local_pack_list(
-        selector,
-        json_output=args.json_output,
-        verbose=args.verbose,
-    )
-
-
-def _run_search(args: argparse.Namespace) -> None:
-    from saklas.cli.output import render_remote_search
-    render_remote_search(
-        args.query,
-        json_output=args.json_output,
-        verbose=args.verbose,
-    )
-
-
-def _run_export(args: argparse.Namespace) -> None:
-    if args.format != "gguf":
-        print(f"Unknown export format: {args.format}", file=sys.stderr)
-        sys.exit(2)
-    from saklas.io import cache_ops
-    from saklas.io.selectors import parse as sel_parse
-    selector = sel_parse(args.selector)
-    written = cache_ops.export_gguf(
-        selector,
-        model_scope=args.model,
-        output=args.output,
-        model_hint=args.model_hint,
-    )
-    for p in written:
-        print(f"Wrote {p}")
-
-
-def _run_merge(args: argparse.Namespace) -> None:
+def _run_manifold_bake(args: argparse.Namespace) -> None:
     from saklas.io import merge as merge_mod
-    dst = merge_mod.merge_into_pack(
+    dst = merge_mod.merge_into_manifold(
         args.name, args.expression, model=args.model,
         force=args.force, strict=args.strict,
     )
-    print(f"Merged pack written to {dst}")
-
-
-def _run_push(args: argparse.Namespace) -> None:
-    from saklas.io import cache_ops
-    from saklas.io.selectors import parse as sel_parse
-
-    selector = sel_parse(args.selector)
-    try:
-        coord, url, sha = cache_ops.push(
-            selector,
-            as_=args.as_target,
-            private=args.private,
-            model_scope=args.model,
-            statements_only=args.statements_only,
-            no_statements=args.no_statements,
-            tag_version=args.tag_version,
-            dry_run=args.dry_run,
-            force=args.force,
-            variant=args.variant,
-        )
-    except RuntimeError as e:
-        print(str(e), file=sys.stderr)
-        sys.exit(2)
-
-    if sha:
-        print(f"Pushed {coord} -> {url} @ {sha[:12]}")
-    elif args.dry_run:
-        print(f"Dry-run: would push {coord} -> {url}")
-    else:
-        print(f"Pushed {coord} -> {url}")
+    print(f"Merged manifold written to {dst}")
 
 
 def _require_model(args: argparse.Namespace) -> None:
     if not args.model:
-        cmd = getattr(args, "vector_cmd", None) or getattr(args, "pack_cmd", None) or "?"
+        # The compute leaves (extract / fit / generate / bake / transfer) carry
+        # the leaf on ``manifold_cmd`` — surface it so the error reads
+        # "manifold fit".
+        manifold_cmd = getattr(args, "manifold_cmd", None)
+        cmd = f"manifold {manifold_cmd}" if manifold_cmd else "?"
         print(f"{cmd}: -m/--model is required", file=sys.stderr)
         sys.exit(2)
 
 
-def _run_clone(args: argparse.Namespace) -> None:
+def _run_manifold_extract(args: argparse.Namespace) -> None:
     _require_model(args)
-    from saklas.io.cloning import (
-        CorpusTooShortError, CorpusTooLongError, InsufficientPairsError,
-    )
-    from saklas.io.selectors import _all_concepts
-
-    for c in _all_concepts():
-        if c.name == args.name and c.namespace != "local":
-            print(
-                f"warning: '{args.name}' exists in namespace '{c.namespace}'; "
-                f"reference this as 'local/{args.name}' to disambiguate",
-                file=sys.stderr,
-            )
-            break
-
-    _print_startup(args)
-    session = _make_session(args)
-    _print_model_info(session)
-
-    try:
-        canonical, _profile = session.clone_from_corpus(
-            args.corpus_path,
-            name=args.name,
-            n_pairs=args.n_pairs,
-            seed=args.seed,
-            force=args.force,
-        )
-    except (CorpusTooShortError, CorpusTooLongError, InsufficientPairsError) as e:
-        print(f"clone failed: {e}", file=sys.stderr)
-        sys.exit(1)
-    print(f"Cloned persona -> local/{canonical}")
-
-
-def _resolve_legacy_method(args: argparse.Namespace) -> str:
-    """Resolve ``vector extract --legacy`` / ``--method`` into a method string.
-
-    ``--legacy`` is a v2.0-backcompat shorthand for ``--method pca``.
-    Mutually exclusive with ``--method``: passing both is a hard error
-    (we'd otherwise silently pick one and the user wouldn't know which).
-    """
-    legacy = bool(getattr(args, "legacy", False))
-    method = getattr(args, "method", None)
-    if legacy and method is not None:
-        print(
-            "extract: --legacy and --method are mutually exclusive "
-            "(--legacy implies --method pca)",
-            file=sys.stderr,
-        )
-        sys.exit(2)
-    if legacy:
-        return "pca"
-    return method or "dim"
-
-
-def _run_extract(args: argparse.Namespace) -> None:
-    _require_model(args)
+    import pathlib
     from saklas.core.session import canonical_concept_name
-
-    # Validate flag combinations before kicking off the model load —
-    # otherwise the user pays a multi-GB download just to learn their
-    # CLI invocation had conflicting options.
-    method = _resolve_legacy_method(args)
+    from saklas.io.paths import manifold_dir, tensor_filename
 
     if len(args.concept) == 1:
         raw = args.concept[0]
@@ -626,85 +459,57 @@ def _run_extract(args: argparse.Namespace) -> None:
         )
         sys.exit(2)
 
+    requested_release = getattr(args, "sae", None)
+    requested_role = getattr(args, "role", None)
+    if requested_release and requested_role:
+        print(
+            "extract: --sae and --role are mutually exclusive "
+            "(role substitution bakes into the manifold's node corpora; SAE "
+            "reconstructs the centroids — the two don't compose)",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
     _print_startup(args)
     session = _make_session(args)
     _print_model_info(session)
 
+    # A steering vector is a 2-node ``pca`` manifold (4.0); it lives under
+    # ``manifolds/<ns>/<canonical>/``.  The per-model fitted tensor (raw or
+    # ``_sae-<release>``) inside it is the existence/destination marker; a
+    # role-augmented fit bakes into the node corpora and writes the canonical
+    # tensor name (no ``_role-`` suffix).
+    ns = getattr(args, "namespace", None) or "local"
     canonical = canonical_concept_name(raw, baseline)
-
-    import pathlib
-    from saklas.io.paths import tensor_filename
-    from saklas.io.selectors import _all_concepts
-    # ``method`` was resolved at the top of the function (pre-flight
-    # validation; see ``_resolve_legacy_method``).
-    candidate_folders = [c.folder for c in _all_concepts() if c.name == canonical]
-    candidate_folders.append(session._local_concept_folder(canonical))
-    requested_release = getattr(args, "sae", None)
-    candidate_tensor_name = tensor_filename(
-        session.model_id, release=requested_release, method=method,
-    )
-    candidate_paths = [
-        pathlib.Path(folder) / candidate_tensor_name for folder in candidate_folders
-    ]
-    existing = next((p for p in candidate_paths if p.exists()), None)
-
-    if existing is not None and not args.force:
-        print(f"already extracted at {existing}")
+    tensor_name = tensor_filename(session.model_id, release=requested_release)
+    tensor_path = pathlib.Path(manifold_dir(ns, canonical)) / tensor_name
+    if tensor_path.exists() and not args.force:
+        print(f"already extracted at {tensor_path}")
         sys.exit(0)
 
-    if args.force:
-        for p in candidate_paths:
-            if p.exists():
-                p.unlink()
-
-    extract_kwargs: dict = {"method": method}
-    if getattr(args, "sae", None):
+    extract_kwargs: dict[str, Any] = {}
+    if requested_release:
         extract_kwargs["sae"] = args.sae
     if getattr(args, "sae_revision", None):
         extract_kwargs["sae_revision"] = args.sae_revision
+    if requested_role:
+        extract_kwargs["role"] = requested_role
+    if getattr(args, "namespace", None) is not None:
+        extract_kwargs["namespace"] = args.namespace
+    if args.force:
+        extract_kwargs["force"] = True
 
     try:
         if baseline is not None:
-            canonical, _profile = session.extract(raw, baseline=baseline, **extract_kwargs)
+            name, _profile = session.extract(raw, baseline=baseline, **extract_kwargs)
         else:
-            canonical, _profile = session.extract(raw, **extract_kwargs)
+            name, _profile = session.extract(raw, **extract_kwargs)
     except Exception as e:
         print(f"extract failed: {e}", file=sys.stderr)
         sys.exit(1)
 
-    # `canonical` may be "name:sae-<release>" — peel it for filename construction.
-    if ":sae-" in canonical:
-        core_name, _, rel = canonical.partition(":sae-")
-        tensor_name = tensor_filename(
-            session.model_id, release=rel, method=method,
-        )
-    else:
-        core_name = canonical
-        tensor_name = tensor_filename(
-            session.model_id, release=None, method=method,
-        )
-    final_paths = [pathlib.Path(f) / tensor_name for f in candidate_folders]
-    final_path = next((p for p in final_paths if p.exists()), None)
-    if final_path is None:
-        final_path = (
-            pathlib.Path(session._local_concept_folder(core_name)) / tensor_name
-        )
-    print(f"extracted {canonical} ({method}) -> {final_path}")
-
-
-_PACK_RUNNERS = {
-    "install": _run_install,
-    "refresh": _run_refresh,
-    "clear":   _run_clear,
-    "rm":      _run_rm,
-    "ls":      _run_ls,
-    "search":  _run_search,
-    "push":    _run_push,
-    "export":  _run_export,
-}
-
-
-# --- vector runners ------------------------------------------------------
+    final_path = pathlib.Path(manifold_dir(ns, name)) / tensor_name
+    print(f"extracted {name} -> {final_path}")
 
 
 # --- config runners ------------------------------------------------------
@@ -785,124 +590,145 @@ def _run_config_validate(args: argparse.Namespace) -> None:
     print(f"{p}: ok")
 
 
-_VARIANT_SUFFIX_RE = re.compile(r"^(raw|sae(?:-[a-z0-9._-]+)?)$")
+# Single source of truth lives in ``io.paths`` (owns the variant scheme).
+_VARIANT_SUFFIX_RE = VARIANT_SUFFIX_RE
 
 
 def _split_variant_suffix(raw: str) -> tuple[str, str | None]:
     """Peel a trailing ``:<variant>`` off a selector string.
 
-    Returns ``(name_part, variant_or_None)``. ``variant`` is ``"raw"``,
-    ``"sae"``, or ``"sae-<release>"``. Non-variant colon usage
-    (``tag:``, ``namespace:``, ``model:``) passes through unchanged with
-    ``variant=None`` — those prefixes are caught by ``sel.parse`` later.
+    Returns ``(name_part, variant_or_None)``. ``variant`` is one of the
+    tensor suffixes understood by :func:`saklas.io.packs.enumerate_variants`.
+    Non-variant colon usage (``tag:``, ``namespace:``, ``model:``) passes
+    through unchanged with ``variant=None`` — those prefixes are caught by
+    ``sel.parse`` later.
     """
     if ":" not in raw:
         return raw, None
     head, _, tail = raw.rpartition(":")
-    if _VARIANT_SUFFIX_RE.match(tail) and head and "/" not in tail:
-        # Guard against ``model:<org>/<name>`` where the ``/`` lives in
-        # the right half of the final ``:``.
+    if _VARIANT_SUFFIX_RE.match(tail) and head:
+        # ``_VARIANT_SUFFIX_RE`` is anchored over ``[a-z0-9._-]`` only, so a
+        # matching ``tail`` can't contain ``/`` — ``model:<org>/<name>`` falls
+        # through to ``return raw, None`` because its tail fails the regex.
         return head, tail
     return raw, None
 
 
-def _resolve_variant_tensor(
-    folder,
-    model_id: str,
-    variant: str | None,
-) -> "Path | None":
-    """Locate the on-disk tensor for ``(folder, model, variant)``.
+def _fold_manifold_to_profile_with_identity(
+    name: str, model_id: str, variant: str | None,
+) -> "tuple[Profile, str, str] | None":
+    """Fold a fitted 2-node ``pca`` manifold and return its namespace identity.
 
-    ``variant`` semantics:
-      - ``None`` (no suffix passed): prefer raw safetensors, fall back
-        to GGUF.
-      - ``"raw"``: require the raw safetensors tensor.
-      - ``"sae"``: require the unique SAE variant; raise
-        :class:`AmbiguousVariantError` when >1, :class:`UnknownVariantError`
-        when 0.
-      - ``"sae-<release>"``: require that specific release.
+    The identity is needed by ``compare``'s rank-all mode: bundled and user
+    concepts can share a bare name across namespaces, so callers must key
+    scanned profiles by ``namespace/name`` rather than letting later matches
+    overwrite earlier ones.
     """
-    from saklas.core.errors import AmbiguousVariantError, UnknownVariantError
-    from saklas.io.packs import enumerate_variants
+    from saklas.core.profile import Profile
+    from saklas.core.manifold import load_manifold
+    from saklas.core.vectors import folded_vector_directions
+    from saklas.io.paths import manifold_dir, manifolds_dir, tensor_filename
+    from saklas.io.selectors import AmbiguousSelectorError
 
-    variants = enumerate_variants(folder, model_id)
+    if variant in (None, "raw"):
+        release: str | None = None
+    elif variant.startswith("sae-"):
+        release = variant[len("sae-"):]
+    else:
+        return None
 
-    if variant is None:
-        # Raw preferred, GGUF fallback.
-        if "raw" in variants:
-            return variants["raw"]
-        from saklas.io.paths import safe_model_id as _safe
-        gguf = folder / f"{_safe(model_id)}.gguf"
-        return gguf if gguf.is_file() else None
-
-    if variant == "raw":
-        return variants.get("raw")
-
-    if variant == "sae":
-        sae_paths = {k: v for k, v in variants.items() if k.startswith("sae-")}
-        if len(sae_paths) == 0:
-            raise UnknownVariantError(
-                f"no SAE variants found in {folder.name} for model {model_id} "
-                f"(available: {sorted(variants) or 'none'})"
-            )
-        if len(sae_paths) > 1:
-            raise AmbiguousVariantError(
-                f"{folder.name}: multiple SAE variants for model {model_id}: "
-                f"{sorted(sae_paths)}. Specify with :sae-<release>."
-            )
-        return next(iter(sae_paths.values()))
-
-    # ``sae-<release>``
-    path = variants.get(variant)
-    if path is None:
-        raise UnknownVariantError(
-            f"variant '{variant}' not found in {folder.name} for model "
-            f"{model_id} (available: {sorted(variants) or 'none'})"
+    if "/" in name:
+        ns, bare = name.split("/", 1)
+        search_ns = [ns]
+    else:
+        bare = name
+        root = manifolds_dir()
+        search_ns = (
+            sorted(d.name for d in root.iterdir() if d.is_dir())
+            if root.exists() else []
         )
-    return path
+    fname = tensor_filename(model_id, release=release)
+    hits = [
+        manifold_dir(ns, bare) / fname
+        for ns in search_ns
+        if (manifold_dir(ns, bare) / fname).exists()
+    ]
+    if not hits:
+        return None
+    if len(hits) > 1:
+        qualified = ", ".join(f"{p.parent.parent.name}/{bare}" for p in hits)
+        raise AmbiguousSelectorError(
+            f"ambiguous manifold '{bare}': matches {qualified}. "
+            f"Qualify it with a namespace."
+        )
+    try:
+        manifold = load_manifold(hits[0])
+        dirs = folded_vector_directions(manifold)
+    except Exception:
+        return None
+    ns = hits[0].parent.parent.name
+    return Profile(dirs), ns, bare
 
 
-def _run_compare(args: argparse.Namespace) -> None:
+def _fold_all_fitted_manifolds(
+    model_id: str, *, exclude_identity: tuple[str, str] | None = None,
+) -> "dict[str, Profile]":
+    """Fold every fitted 2-node ``pca`` manifold into ``{ns/name: Profile}``.
+
+    Backs ``compare``'s 1-arg "rank against all installed" mode now that
+    bundled concepts are manifolds.  Only manifolds with a fitted raw tensor
+    for ``model_id`` that fold to a 2-node affine are included;
+    ``exclude_identity`` drops the target by exact ``(namespace, name)``.
+    """
+    from saklas.core.profile import Profile
+    from saklas.core.manifold import load_manifold
+    from saklas.core.vectors import folded_vector_directions
+    from saklas.io.paths import manifolds_dir, tensor_filename
+
+    out: dict[str, Profile] = {}
+    root = manifolds_dir()
+    if not root.is_dir():
+        return out
+    fname = tensor_filename(model_id, release=None)
+    for ns_dir in sorted(root.iterdir()):
+        if not ns_dir.is_dir():
+            continue
+        for mdir in sorted(ns_dir.iterdir()):
+            if not mdir.is_dir():
+                continue
+            identity = (ns_dir.name, mdir.name)
+            if identity == exclude_identity:
+                continue
+            tensor = mdir / fname
+            if not tensor.is_file():
+                continue
+            try:
+                dirs = folded_vector_directions(load_manifold(tensor))
+            except Exception:
+                continue  # not a foldable 2-node affine (curved / rank > 1)
+            out[f"{ns_dir.name}/{mdir.name}"] = Profile(dirs)
+    return out
+
+
+def _run_manifold_compare(args: argparse.Namespace) -> None:
     import json as _json
     from saklas.io.selectors import parse as sel_parse, resolve
-    from saklas.core.errors import AmbiguousVariantError, UnknownVariantError
-    from saklas.io.paths import vectors_dir
-    from saklas.core.profile import Profile, ProfileError
 
-    # ``--legacy`` is a v2.0-backcompat shorthand for ``--metric euclidean``.
-    # Mutually exclusive with an explicit ``--metric``.  Default since
-    # v2.1 is ``"mahalanobis"`` — ``args.metric is None`` means "use the
-    # default" (and ``--legacy`` overrides to euclidean).
-    legacy = bool(getattr(args, "legacy", False))
-    explicit_metric = vars(args).get("metric") is not None
-    if legacy and explicit_metric:
-        print(
-            "compare: --legacy and --metric are mutually exclusive "
-            "(--legacy implies --metric euclidean)",
-            file=sys.stderr,
+    # Compare is Mahalanobis-only: load the per-model whitener once up
+    # front and share it across every ``cosine_similarity`` call below.
+    # Failure is fatal — there is no Euclidean path, so a missing neutral
+    # cache surfaces directly instead of degrading silently.
+    from saklas.core.mahalanobis import LayerWhitener, WhitenerError
+
+    whitener: "Any | None"
+    try:
+        whitener = LayerWhitener.from_cache(
+            args.model,
+            ridge_scale=getattr(args, "ridge_scale", 1.0),
         )
-        sys.exit(2)
-    if legacy:
-        metric = "euclidean"
-    else:
-        metric = getattr(args, "metric", None) or "mahalanobis"
-
-    # Mahalanobis path: load the per-model whitener once up front, share
-    # across every ``cosine_similarity`` call below.  Failure is fatal —
-    # if the user explicitly asked for the whitened metric, falling
-    # silently back to Euclidean would hide the missing cache.
-    whitener: "Any | None" = None
-    if metric == "mahalanobis":
-        from saklas.core.mahalanobis import LayerWhitener, WhitenerError
-
-        try:
-            whitener = LayerWhitener.from_cache(
-                args.model,
-                ridge_scale=getattr(args, "ridge_scale", 1.0),
-            )
-        except WhitenerError as e:
-            print(f"compare: {e}", file=sys.stderr)
-            sys.exit(1)
+    except WhitenerError as e:
+        print(f"compare: {e}", file=sys.stderr)
+        sys.exit(1)
 
     # Expand selectors into (name, variant) pairs. Variant travels with the
     # name through the load loop so ``foo:sae`` picks the SAE tensor.
@@ -921,34 +747,31 @@ def _run_compare(args: argparse.Namespace) -> None:
             # names; inherit the variant suffix so `tag:emotion:sae`
             # resolves SAE tensors across the tag.
             resolved = resolve(sel)
-            for c in resolved:
-                names.append((f"{c.namespace}/{c.name}", variant))
+            names.extend((f"{c.namespace}/{c.name}", variant) for c in resolved)
 
-    # Load profiles from disk.
+    # Load profiles by folding each concept's fitted 2-node ``pca`` manifold.
     profiles: dict[str, Profile] = {}
+    profile_identities: dict[str, tuple[str, str]] = {}
     for name, variant in names:
-        sel = sel_parse(name)
-        matches = resolve(sel)
-        if not matches:
-            print(f"warning: '{name}' not found, skipping", file=sys.stderr)
-            continue
-        folder = matches[0].folder
         try:
-            tensor_path = _resolve_variant_tensor(folder, args.model, variant)
-        except (AmbiguousVariantError, UnknownVariantError) as e:
+            folded = _fold_manifold_to_profile_with_identity(
+                name, args.model, variant,
+            )
+        except Exception as e:
             print(f"warning: {e}, skipping", file=sys.stderr)
             continue
-        if tensor_path is None or not tensor_path.is_file():
-            print(f"warning: no tensor for '{name}' with model {args.model}, skipping",
-                  file=sys.stderr)
+        if folded is None:
+            print(
+                f"warning: no fitted manifold for '{name}' with model "
+                f"{args.model}, skipping",
+                file=sys.stderr,
+            )
             continue
-        # Display keys carry the variant when present so compare output
-        # distinguishes raw vs SAE rows.
-        display = matches[0].name if variant is None else f"{matches[0].name}:{variant}"
-        try:
-            profiles[display] = Profile.load(tensor_path)
-        except (ProfileError, Exception) as e:
-            print(f"warning: failed to load '{name}': {e}", file=sys.stderr)
+        loaded, ns, bare = folded
+        display_base = f"{ns}/{bare}" if "/" in name else bare
+        display = display_base if variant is None else f"{display_base}:{variant}"
+        profiles[display] = loaded
+        profile_identities[display] = (ns, bare)
 
     if len(profiles) < 1:
         print("compare: no loadable profiles found", file=sys.stderr)
@@ -960,42 +783,48 @@ def _run_compare(args: argparse.Namespace) -> None:
     if len(args.concepts) == 1 and len(ordered) == 1:
         target_name = ordered[0]
         target = profiles[target_name]
+        target_identity = profile_identities.get(target_name)
 
-        # Load all other installed profiles for this model.
+        # Every concept ships as a fitted 2-node ``pca`` manifold — fold
+        # every fitted one for this model into the ranking pool.  Keep the
+        # exact namespace identity internally, then choose display names after
+        # the full pool is known: bare for unique names, qualified for
+        # collisions.
+        other_entries: dict[tuple[str, str], Profile] = {}
+        for mname, mprof in _fold_all_fitted_manifolds(
+            args.model, exclude_identity=target_identity,
+        ).items():
+            ns, bare = mname.split("/", 1)
+            other_entries[(ns, bare)] = mprof
+
+        from collections import Counter
+
+        target_bare = (
+            target_identity[1] if target_identity is not None
+            else target_name.rsplit("/", 1)[-1]
+        )
+        bare_counts = Counter(name for _ns, name in other_entries)
         others: dict[str, Profile] = {}
-        vdir = vectors_dir()
-        if vdir.is_dir():
-            for ns_dir in sorted(vdir.iterdir()):
-                if not ns_dir.is_dir():
-                    continue
-                for cdir in sorted(ns_dir.iterdir()):
-                    if not cdir.is_dir():
-                        continue
-                    if cdir.name == target_name:
-                        continue
-                    # Auto-scan: raw preferred, GGUF fallback. SAE-vs-all
-                    # ranking requires the caller to pass the SAE selector
-                    # explicitly.
-                    try:
-                        tp = _resolve_variant_tensor(cdir, args.model, None)
-                    except (AmbiguousVariantError, UnknownVariantError):
-                        continue
-                    if tp is None or not tp.is_file():
-                        continue
-                    try:
-                        others[cdir.name] = Profile.load(tp)
-                    except Exception:
-                        continue
+        for (ns, bare), profile in sorted(other_entries.items()):
+            display = (
+                f"{ns}/{bare}"
+                if bare_counts[bare] > 1 or bare == target_bare
+                else bare
+            )
+            others[display] = profile
 
         if not others:
             print(f"compare: no other profiles found for model {args.model}", file=sys.stderr)
             sys.exit(1)
 
-        scores = {name: target.cosine_similarity(p, whitener=whitener) for name, p in others.items()}
-        ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        scores: dict[str, float] = {
+            name: target.cosine_similarity(p, whitener=whitener)
+            for name, p in others.items()
+        }
+        ranked = sorted(scores.items(), key=itemgetter(1), reverse=True)
 
         if args.json_output:
-            result: dict = {"target": target_name, "model": args.model,
+            result: dict[str, Any] = {"target": target_name, "model": args.model,
                             "similarities": [{"name": n, "similarity": round(s, 6)}
                                               for n, s in ranked]}
             if args.verbose:
@@ -1015,10 +844,10 @@ def _run_compare(args: argparse.Namespace) -> None:
                 print()
                 print("  per-layer (top 3):")
                 for name, _ in ranked[:3]:
-                    per_layer = target.cosine_similarity(others[name], per_layer=True, whitener=whitener)
+                    per_layer_top3: dict[int, float] = target.cosine_similarity(others[name], per_layer=True, whitener=whitener)
                     print(f"    {name}:")
-                    for layer in sorted(per_layer):
-                        print(f"      layer {layer:>3}: {per_layer[layer]:+.4f}")
+                    for layer in sorted(per_layer_top3):
+                        print(f"      layer {layer:>3}: {per_layer_top3[layer]:+.4f}")
         return
 
     if len(ordered) < 2:
@@ -1029,7 +858,7 @@ def _run_compare(args: argparse.Namespace) -> None:
     if len(ordered) == 2:
         a_name, b_name = ordered
         a, b = profiles[a_name], profiles[b_name]
-        sim = a.cosine_similarity(b, whitener=whitener)
+        sim: float = a.cosine_similarity(b, whitener=whitener)
 
         if args.json_output:
             result = {"a": a_name, "b": b_name, "model": args.model,
@@ -1041,9 +870,9 @@ def _run_compare(args: argparse.Namespace) -> None:
         else:
             print(f"{a_name} ~ {b_name}: {sim:+.4f}")
             if args.verbose:
-                per_layer = a.cosine_similarity(b, per_layer=True, whitener=whitener)
-                for layer in sorted(per_layer):
-                    print(f"  layer {layer:>3}: {per_layer[layer]:+.4f}")
+                per_layer_2: dict[int, float] = a.cosine_similarity(b, per_layer=True, whitener=whitener)
+                for layer in sorted(per_layer_2):
+                    print(f"  layer {layer:>3}: {per_layer_2[layer]:+.4f}")
         return
 
     # 3+ mode: N×N matrix.
@@ -1082,44 +911,39 @@ def _run_compare(args: argparse.Namespace) -> None:
             print(f"{a_name:<{width}}  {row}")
 
 
-def _run_why(args: argparse.Namespace) -> None:
+def _run_manifold_why(args: argparse.Namespace) -> None:
     import json as _json
-    from saklas.io.selectors import parse as sel_parse, resolve
-    from saklas.core.errors import AmbiguousVariantError, UnknownVariantError
-    from saklas.core.profile import Profile, ProfileError
+    from saklas.io.selectors import AmbiguousSelectorError
 
-    # Peel off a ``:<variant>`` suffix before parsing as a selector.
+    # Peel off a ``:<variant>`` suffix before resolving the manifold.
     name_part, variant = _split_variant_suffix(args.concept)
-    sel = sel_parse(name_part)
-    matches = resolve(sel)
-    if not matches:
-        print(f"why: '{args.concept}' not found", file=sys.stderr)
-        sys.exit(1)
 
-    folder = matches[0].folder
-    concept_name = matches[0].name if variant is None else f"{matches[0].name}:{variant}"
-
+    # Every concept is a fitted 2-node ``pca`` manifold — fold it to a vector.
+    profile: "Profile | None" = None
+    concept_name = name_part if variant is None else f"{name_part}:{variant}"
     try:
-        tensor_path = _resolve_variant_tensor(folder, args.model, variant)
-    except (AmbiguousVariantError, UnknownVariantError) as e:
+        folded = _fold_manifold_to_profile_with_identity(
+            name_part, args.model, variant,
+        )
+    except AmbiguousSelectorError as e:
         print(f"why: {e}", file=sys.stderr)
         sys.exit(1)
-    if tensor_path is None or not tensor_path.is_file():
+    if folded is not None:
+        profile, ns, bare = folded
+        concept_base = f"{ns}/{bare}" if "/" in name_part else bare
+        concept_name = concept_base if variant is None else f"{concept_base}:{variant}"
+    if profile is None:
         print(
-            f"why: no tensor for '{args.concept}' with model {args.model}",
+            f"why: no fitted manifold for '{args.concept}' with model "
+            f"{args.model}. If it's authored but unfit, fit it first: "
+            f"`saklas manifold fit {name_part} -m {args.model}`.",
             file=sys.stderr,
         )
         sys.exit(1)
 
-    try:
-        profile = Profile.load(tensor_path)
-    except (ProfileError, Exception) as e:
-        print(f"why: failed to load '{args.concept}': {e}", file=sys.stderr)
-        sys.exit(1)
-
     layer_mags: list[tuple[int, float]] = sorted(
         ((layer, float(tensor.norm().item())) for layer, tensor in profile.items()),
-        key=lambda kv: kv[0],
+        key=itemgetter(0),
     )
     total_layers = len(profile)
     diagnostics = profile.diagnostics  # None when extracted before saklas 1.6
@@ -1154,16 +978,6 @@ def _summarize_diagnostics(
     extraction-time warning uses.  Mirrored in the JSON output so callers
     don't have to recompute it client-side.
     """
-    def _median(values: list[float]) -> float:
-        s = sorted(values)
-        n = len(s)
-        if n == 0:
-            return 0.0
-        mid = n // 2
-        if n % 2 == 1:
-            return s[mid]
-        return 0.5 * (s[mid - 1] + s[mid])
-
     evrs = [m["evr"] for m in diagnostics.values() if "evr" in m]
     intras = [
         m["intra_pair_variance_mean"]
@@ -1181,14 +995,12 @@ def _summarize_diagnostics(
         if "diff_principal_projection" in m
     ]
 
-    med_evr = _median(evrs) if evrs else 0.0
-    med_intra = _median(intras) if intras else 0.0
-    med_align = _median(aligns) if aligns else 0.0
-    med_proj = _median(projs) if projs else 0.0
+    med_evr = median_or_zero(evrs)
+    med_intra = median_or_zero(intras)
+    med_align = median_or_zero(aligns)
+    med_proj = median_or_zero(projs)
 
-    if med_evr > 0.95 and med_intra < 0.01:
-        quality = "poor"
-    elif med_align < 0.2:
+    if (med_evr > 0.95 and med_intra < 0.01) or med_align < 0.2:
         quality = "poor"
     elif med_align < 0.4 or med_evr < 0.2:
         quality = "shaky"
@@ -1250,52 +1062,1008 @@ def _print_why_histogram(
         print(f"    {_label(lo, hi):<{label_col}}  {bar}  {norm:>{value_w}.3f}")
 
 
-def _run_transfer(args: argparse.Namespace) -> None:
-    """Cross-model probe transfer via Procrustes (v1.6).
+def _run_manifold_fit(args: argparse.Namespace) -> None:
+    """``saklas manifold fit`` — fit an authored OR discover-mode manifold.
 
-    Resolves the concept folder, loads the source-model tensor, fits
-    (or loads) the per-layer alignment between source and target's
-    cached neutral activations, applies the transfer, and writes the
-    result at the target's ``_from-<safe_src>`` variant path with a
-    sidecar carrying transfer provenance.
+    The positional ``target`` is a manifold name OR a folder path.  When it
+    resolves to an authored folder the fit runs as-is (no hyperparam knobs
+    allowed).  When it resolves to a discover-mode folder (``pca`` /
+    ``spectral``) any supplied hyperparam override (``--method`` / ``--max-dim``
+    / ``--var-threshold`` / ``--k-nn`` / ``--bandwidth`` / ``--max-subspace-dim``)
+    is written into ``manifold.json`` atomically *before* the fit so the cache
+    key reflects the actual fit inputs.  Supplying overrides against an authored
+    folder is an error (mirrors the server's 400).
+    """
+    import json as _json
+    from saklas.io.atomic import write_json_atomic
+    from saklas.io.manifolds import (
+        ManifoldFolder, ManifoldFormatError, _sanitize_hyperparams,
+        domain_label,
+    )
+
+    _require_model(args)
+
+    # Resolve ``target`` to a folder.  A path that exists on disk (or that
+    # carries a ``manifold.json``) is taken as an authored-folder path —
+    # ``manifold fit /path/to/folder``; otherwise it is a manifold *name*
+    # resolved cross-namespace the same way the lifecycle verbs resolve.
+    target = args.target
+    target_path = Path(target)
+    if target_path.is_dir() or (target_path / "manifold.json").exists():
+        folder = target_path
+    else:
+        folder = _resolve_manifold_folder(target)
+
+    if not (folder / "manifold.json").exists():
+        print(
+            f"manifold fit: no manifold.json in {folder}", file=sys.stderr,
+        )
+        sys.exit(2)
+
+    # Load the folder to learn its fit_mode before paying for a model load.
+    try:
+        mf = ManifoldFolder.load(folder)
+    except ManifoldFormatError as e:
+        print(f"manifold fit: {e}", file=sys.stderr)
+        sys.exit(2)
+
+    # Did the user supply any discover-mode hyperparam override?
+    override_supplied = any(
+        getattr(args, attr, None) is not None
+        for attr in (
+            "method", "max_dim", "min_dim", "var_threshold", "k_nn",
+            "bandwidth", "max_subspace_dim",
+        )
+    )
+
+    new_fit_mode = mf.fit_mode
+    if override_supplied:
+        if not mf.is_discover:
+            # Mirror the server's 400: hyperparam overrides are discover-only.
+            print(
+                f"manifold fit: fit_mode/hyperparams overrides are "
+                f"discover-mode only; {folder} is authored",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        new_fit_mode = args.method or mf.fit_mode
+        if new_fit_mode not in {"pca", "spectral", "auto"}:
+            print(
+                f"manifold fit: invalid method {new_fit_mode!r}",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        new_hyperparams = dict(mf.hyperparams)
+        # PCA knobs.
+        if args.max_dim is not None:
+            new_hyperparams["max_dim"] = int(args.max_dim)
+        if args.var_threshold is not None:
+            new_hyperparams["var_threshold"] = float(args.var_threshold)
+        # Spectral knobs.
+        if getattr(args, "min_dim", None) is not None:
+            new_hyperparams["min_dim"] = int(args.min_dim)
+        if args.k_nn is not None:
+            new_hyperparams["k_nn"] = int(args.k_nn)
+        if args.bandwidth is not None:
+            new_hyperparams["bandwidth"] = float(args.bandwidth)
+        # Spectral-only knob — dropped by ``_sanitize_hyperparams`` for a pca
+        # fit (a flat fit's per-layer subspace dim is its layout dim, capped
+        # by ``--max-dim``, not a separate knob).
+        if getattr(args, "max_subspace_dim", None) is not None:
+            new_hyperparams["max_subspace_dim"] = int(args.max_subspace_dim)
+        # Curved-fit smoothing (spectral/auto): "auto" → GCV, else a float λ.
+        if getattr(args, "smoothing", None) is not None:
+            s = args.smoothing
+            new_hyperparams["smoothing"] = s if s == "auto" else float(s)
+        # Auto-only: periodic-detection persistence threshold.
+        if getattr(args, "persistence_frac", None) is not None:
+            new_hyperparams["persistence_frac"] = float(args.persistence_frac)
+        new_hyperparams = _sanitize_hyperparams(new_fit_mode, new_hyperparams)
+
+        # Write back if anything changed.  Staged write — a crash mid-rewrite
+        # would leave the folder unreadable and ``ManifoldFolder.load`` would
+        # 400 on the next list call.
+        if new_fit_mode != mf.fit_mode or new_hyperparams != mf.hyperparams:
+            data = _json.loads((folder / "manifold.json").read_text())
+            data["fit_mode"] = new_fit_mode
+            data["hyperparams"] = new_hyperparams
+            # Re-author the nodes list in case fit_mode changed and it
+            # accidentally carries authored shape.  Discover nodes are
+            # label-only.
+            data["nodes"] = [{"label": label} for label in mf.node_labels]
+            data.pop("domain", None)
+            write_json_atomic(folder / "manifold.json", data)
+
+    _print_startup(args)
+    session = _make_session(args)
+    _print_model_info(session)
+    try:
+        manifold = session.fit(
+            folder,
+            sae=getattr(args, "sae", None),
+            sae_revision=getattr(args, "sae_revision", None),
+            on_progress=lambda m: print(f"  {m}"),
+        )
+    except (ValueError, ManifoldFormatError) as e:
+        print(f"manifold fit failed: {e}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"manifold fit failed: {e}", file=sys.stderr)
+        sys.exit(1)
+    tail = (
+        f", fit_mode={new_fit_mode}" if mf.is_discover else ""
+    )
+    print(
+        f"fitted manifold '{manifold.name}' "
+        f"({len(manifold.layers)} layers, {len(manifold.node_labels)} nodes, "
+        f"{domain_label(manifold.domain.to_spec())}, "
+        f"{manifold.feature_space}{tail})"
+    )
+
+
+def _iter_manifold_folders(namespace: str | None):
+    """Yield ``(namespace, ManifoldFolder)`` for every installed manifold.
+
+    Thin wrapper over :func:`saklas.io.manifolds.iter_manifold_folders` —
+    the discovery walk lives in ``io`` so the server shares it without
+    importing ``cli``.
+
+    Materializes bundled manifolds (e.g. ``default/personas``) before
+    the walk.  CLI verbs like ``manifold fit`` / ``pack show`` / ``pack ls``
+    resolve folders *before* any session is constructed, so the session-
+    startup ``materialize_bundled_manifolds`` call hasn't fired yet —
+    without this hop, a user's first ``saklas manifold fit
+    default/personas`` would miss the bundled folder and exit with "not
+    found".  The format-version short-circuit inside the materialize
+    function makes repeated calls cheap (no-op when up-to-date).  The
+    server has its own session-driven materialization at startup, so
+    going through ``iter_manifold_folders`` directly stays correct.
+    """
+    from saklas.io.manifolds import (
+        iter_manifold_folders, materialize_bundled_manifolds,
+    )
+    from saklas.io.templates import materialize_bundled_templates
+
+    # Templates first — a bundled manifold may ``template_ref`` a bundled one.
+    materialize_bundled_templates()
+    materialize_bundled_manifolds()
+    yield from iter_manifold_folders(namespace)
+
+
+def _run_pack_ls(args: argparse.Namespace) -> None:
+    import json as _json
+    from saklas.io.manifolds import domain_label
+
+    rows = list(_iter_manifold_folders(getattr(args, "namespace", None)))
+    if getattr(args, "json_output", False):
+        print(_json.dumps([
+            {
+                "namespace": ns,
+                "name": mf.name,
+                "domain": mf.domain,
+                "nodes": mf.node_labels,
+                "fitted_models": mf.tensor_models(),
+            }
+            for ns, mf in rows
+        ], indent=2))
+        return
+    if not rows:
+        print("no manifolds installed under ~/.saklas/manifolds/")
+        return
+    verbose = getattr(args, "verbose", False)
+    for ns, mf in rows:
+        kind = domain_label(mf.domain)
+        models = ", ".join(mf.tensor_models()) or "(unfitted)"
+        print(
+            f"  {ns}/{mf.name}  [{kind}, {len(mf.node_labels)} nodes]  {models}"
+        )
+        if verbose and mf.description:
+            print(f"    {mf.description}")
+
+
+def _run_pack_show(args: argparse.Namespace) -> None:
+    import json as _json
+    from saklas.io.manifolds import domain_label
+
+    name = args.name
+    target_ns = None
+    if "/" in name:
+        target_ns, name = name.split("/", 1)
+    matches = [
+        (ns, mf)
+        for ns, mf in _iter_manifold_folders(target_ns)
+        if mf.name == name
+    ]
+    if not matches:
+        print(f"manifold '{args.name}' not found", file=sys.stderr)
+        sys.exit(1)
+    if len(matches) > 1:
+        qualified = ", ".join(f"{ns}/{mf.name}" for ns, mf in matches)
+        print(
+            f"ambiguous manifold '{name}': matches {qualified}; "
+            f"qualify with a namespace",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    ns, mf = matches[0]
+    fitted = []
+    for stem in mf.tensor_models():
+        sc = mf.sidecar(stem)
+        entry: dict[str, Any] = {
+            "stem": stem,
+            "method": sc.method,
+            "feature_space": sc.feature_space,
+            "node_count": sc.node_count,
+            "fit_mode": sc.fit_mode,
+        }
+        if sc.hyperparams:
+            entry["hyperparams"] = sc.hyperparams
+        if sc.diagnostics:
+            entry["diagnostics"] = sc.diagnostics
+        if sc.node_spread_per_layer:
+            entry["node_spread"] = sc.node_spread_per_layer
+        fitted.append(entry)
+
+    # In discover mode the folder itself has no per-node coords (they are
+    # derived per-model at fit time) — try to surface the derived coords
+    # from the per-model tensor when a fit exists.  Cheap: one safetensors
+    # header read.  Soft-fails to an empty list if the tensor isn't there.
+    derived_node_coords: list[list[float]] = []
+    if mf.is_discover and fitted:
+        from saklas.core.manifold import load_manifold
+        stem_for_session = fitted[0]["stem"]
+        try:
+            m = load_manifold(mf.tensor_path(stem_for_session))
+            derived_node_coords = [
+                [float(x) for x in row]
+                for row in m.node_coords.tolist()
+            ]
+        except (FileNotFoundError, KeyError, ValueError):
+            derived_node_coords = []
+
+    # Per-node roles ride alongside coords in the JSON shape; ``None``
+    # for a given node means "pooled under the standard assistant
+    # baseline" (the legacy / non-role default).  Padded to the label
+    # count so consumers can index by node.
+    node_roles_padded = list(mf.node_roles) + [None] * (
+        len(mf.node_labels) - len(mf.node_roles)
+    )
+    if getattr(args, "json_output", False):
+        # Share the session-independent summary serializer with the
+        # server's ``GET /saklas/v1/manifolds/{ns}/{name}`` route so both
+        # surfaces emit the same keys.  For a discover folder
+        # ``manifold_summary`` reports the on-disk (empty) geometry —
+        # ``node_coords == []`` — since the derived per-model layout lives
+        # in the fitted safetensors; the text path below still surfaces
+        # the derived coords for interactive use.
+        from saklas.io.manifolds import manifold_summary
+        print(_json.dumps(manifold_summary(mf.folder), indent=2))
+        return
+
+    print(f"{ns}/{mf.name}")
+    if mf.description:
+        print(f"  {mf.description}")
+    if mf.is_discover:
+        print(f"  fit_mode: {mf.fit_mode} (discover — coords derived per-model)")
+        if mf.hyperparams:
+            hp = ", ".join(f"{k}={v}" for k, v in sorted(mf.hyperparams.items()))
+            print(f"  hyperparams: {hp}")
+        print("  nodes:")
+        for i, label in enumerate(mf.node_labels):
+            role_tail = (
+                f"  [role={node_roles_padded[i]}]"
+                if node_roles_padded[i] else ""
+            )
+            if i < len(derived_node_coords):
+                coord_str = ", ".join(f"{c:.3g}" for c in derived_node_coords[i])
+                print(f"    {label}  ({coord_str}){role_tail}")
+            else:
+                print(f"    {label}  (coords pending fit){role_tail}")
+    else:
+        print(f"  domain: {domain_label(mf.domain)}")
+        print("  nodes:")
+        for label, coords, role in zip(
+            mf.node_labels, mf.node_coords, node_roles_padded, strict=True,
+        ):
+            coord_str = ", ".join(f"{c:g}" for c in coords)
+            role_tail = f"  [role={role}]" if role else ""
+            print(f"    {label}  ({coord_str}){role_tail}")
+    if fitted:
+        print("  fitted models:")
+        for f in fitted:
+            tag = f"{f['method']}, {f['feature_space']}"
+            if f.get("fit_mode") and f["fit_mode"] != "authored":
+                tag += f", fit_mode={f['fit_mode']}"
+            print(f"    {f['stem']}  ({tag})")
+            diag = f.get("diagnostics") or {}
+            # Per-method one-line summary.  PCA: picked_k + cumvar at k.
+            # Spectral: picked_k + gap_magnitude + bandwidth + k_nn.
+            if diag and f.get("fit_mode") == "pca":
+                cumvar = diag.get("cumulative_variance") or []
+                k = diag.get("picked_k")
+                if k and 1 <= k <= len(cumvar):
+                    print(
+                        f"      pca: picked_k={k}, "
+                        f"cumvar@k={cumvar[k - 1]:.3f} "
+                        f"(threshold={diag.get('threshold', '?')})"
+                    )
+            elif diag and f.get("fit_mode") == "spectral":
+                k = diag.get("picked_k")
+                gap = diag.get("gap_magnitude")
+                bw = diag.get("bandwidth")
+                knn = diag.get("k_nn")
+                bits = [f"picked_k={k}"]
+                if gap is not None:
+                    bits.append(f"gap={gap:.3g}")
+                if bw is not None:
+                    bits.append(f"bandwidth={bw:.3g}")
+                if knn is not None:
+                    bits.append(f"k_nn={knn}")
+                print(f"      spectral: {', '.join(bits)}")
+            if f.get("hyperparams"):
+                hp = ", ".join(
+                    f"{k}={v}" for k, v in sorted(f["hyperparams"].items())
+                )
+                print(f"      hyperparams: {hp}")
+            # Concept layer profile: the whitened between-node spread per layer
+            # (background-σ² units).  Report the peak layers — where this
+            # concept's signal concentrates across the stack.
+            spread = f.get("node_spread") or {}
+            if spread:
+                ranked = sorted(
+                    ((int(layer), float(v)) for layer, v in spread.items()),
+                    key=lambda kv: kv[1],
+                    reverse=True,
+                )
+                peak = ", ".join(f"L{layer}={v:.2f}" for layer, v in ranked[:5])
+                print(f"      signal by layer (peak): {peak}")
+    else:
+        print("  fitted models: (none — run `saklas manifold fit`)")
+
+
+def _resolve_manifold_ns_name(name: str) -> tuple[str, str]:
+    """Resolve a CLI-supplied ``NAME`` (or ``ns/name``) to ``(namespace, name)``.
+
+    Mirrors :func:`_run_pack_show`'s ambiguity handling — bare names
+    resolve cross-namespace (reaching e.g. bundled ``default/`` when that's
+    the only match) and raise on collision; an ``ns/name`` form pins to a
+    single namespace.  Exits with a clear error on miss / ambiguity.
+
+    This is the lifecycle analogue of the concept-selector cross-namespace
+    resolution: ``pack clear`` / ``pack refresh`` / ``pack rm`` / ``manifold
+    transfer`` / ``pack export`` (and the folder-returning ``manifold fit`` by
+    name / ``pack show``) all route a bare name through here so it can reach
+    any namespace, not just ``local/``.  (``generate`` deliberately does *not*
+    — it authors a fresh folder and defaults bare → ``local/`` via
+    :func:`_split_manifold_ns_name`.)
+
+    An explicit ``ns/name`` pins directly — it's returned verbatim without a
+    filesystem walk, leaving the existence check to the io backend (which
+    raises ``FileNotFoundError``).  Only a *bare* name walks the installed
+    manifolds to discover its namespace, raising on collision / miss.
+    """
+    # Materialize bundled artifacts up front so a *qualified* reference to a
+    # newly-shipped bundled manifold (``default/<name>``) resolves even on
+    # an existing ``~/.saklas`` that predates it — the ``ns/name`` branch below
+    # returns verbatim and never walks the installed folders, so it would
+    # otherwise miss the materialize that the bare-name walk triggers.  Process-
+    # scoped no-op, so this is free when already done.  Templates before
+    # manifolds (a templated manifold's fit resolves its ``template_ref``).
+    from saklas.io.manifolds import materialize_bundled_manifolds
+    from saklas.io.templates import materialize_bundled_templates
+    materialize_bundled_templates()
+    materialize_bundled_manifolds()
+
+    if "/" in name:
+        ns, leaf = name.split("/", 1)
+        return ns, leaf
+    matches = [
+        (ns, mf)
+        for ns, mf in _iter_manifold_folders(None)
+        if mf.name == name
+    ]
+    if not matches:
+        print(f"manifold '{name}' not found", file=sys.stderr)
+        sys.exit(1)
+    if len(matches) > 1:
+        qualified = ", ".join(f"{ns}/{mf.name}" for ns, mf in matches)
+        print(
+            f"ambiguous manifold '{name}': matches {qualified}; "
+            f"qualify with a namespace",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    return matches[0][0], matches[0][1].name
+
+
+def _resolve_manifold_folder(name: str) -> Path:
+    """Resolve a CLI-supplied ``NAME`` (or ``ns/name``) to a folder path.
+
+    Thin wrapper over :func:`_resolve_manifold_ns_name` for the verbs that
+    want the folder directly (``fit`` by-name, ``show``); the lifecycle verbs
+    that hand a ``(namespace, name)`` pair to their io backend call the
+    pair-returning form instead.
+    """
+    from saklas.io.paths import manifold_dir
+
+    ns, resolved = _resolve_manifold_ns_name(name)
+    return manifold_dir(ns, resolved)
+
+
+def _run_manifold_generate(args: argparse.Namespace) -> None:
+    """``saklas manifold generate`` -- author + LLM-fill a discover folder (A2).
+
+    Two-step end-to-end: load the model, run :meth:`SaklasSession.generate_responses`
+    to fill each node's conversational corpus (in-character responses to the
+    shared baseline prompts), then leave the folder ready for ``manifold
+    discover`` to fit.  The two-step split keeps failure modes legible (a flaky
+    generation leaves inspectable corpora) and lets the user review before
+    paying for the fit.
+    """
+    from saklas.io.manifolds import (
+        ManifoldFormatError,
+        append_discover_manifold_node,
+        plan_discover_generation,
+    )
+    from saklas.io.paths import manifold_dir
+
+    _require_model(args)
+    if len(args.concepts) < 2:
+        print(
+            "manifold generate: need >= 2 concepts (a discover manifold is "
+            "meaningless with one node)",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    namespace = "local"
+    name = args.name
+    if "/" in name:
+        namespace, name = name.split("/", 1)
+
+    folder = manifold_dir(namespace, name)
+    # ``-f/--force`` is a clean slate; the default *resumes* -- fills any
+    # missing node corpora and appends concepts new to the roster, so a run
+    # killed half-way picks up where it left off and adding a node is a re-run.
+    if args.force and (folder / "manifold.json").exists():
+        import shutil
+        shutil.rmtree(folder)
+
+    # ``--role-per-node``: the concept slug doubles as that node's assistant-role
+    # substitution -- a persona manifold pooled in role-baselined space (the
+    # explicit role overrides the kind-derived elicitation label at both
+    # generation and capture).  Otherwise the node\'s ``kind`` drives a
+    # generation-only elicitation role and capture stays standard (swap-back).
+    node_roles: dict[str, str | None] | None = None
+    if getattr(args, "role_per_node", False):
+        node_roles = {concept: concept for concept in args.concepts}
+    node_kinds: dict[str, str | None] = {c: args.kind for c in args.concepts}
+
+    # Plan first -- no model load needed to learn there is nothing to do.
+    try:
+        plan = plan_discover_generation(
+            folder, name, args.description,
+            fit_mode="pca", labels=list(args.concepts),
+            node_roles=node_roles, node_kinds=node_kinds,
+        )
+    except ManifoldFormatError as e:
+        print(f"manifold generate failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    n_total = len(plan.index_of)
+    if not plan.pending:
+        print(
+            f"manifold {namespace}/{name} already complete ({n_total} nodes)"
+            f" -- pass -f/--force to regenerate"
+        )
+        return
+    if plan.resumed and len(plan.pending) < n_total:
+        print(
+            f"resuming {namespace}/{name}: "
+            f"{n_total - len(plan.pending)}/{n_total} nodes present, "
+            f"generating {len(plan.pending)}"
+        )
+    if plan.added:
+        print(f"adding {len(plan.added)} new node(s): {', '.join(plan.added)}")
+
+    _print_startup(args)
+    session = _make_session(args)
+    _print_model_info(session)
+
+    print(
+        f"generating {args.samples_per_prompt} response(s) per baseline prompt "
+        f"for {len(plan.pending)} concept(s)..."
+    )
+    try:
+        for concept in plan.pending:
+            gen_roles: dict[str, str | None] | None = (
+                {concept: concept} if node_roles else None
+            )
+            corpora = session.generate_responses(
+                [concept], [args.kind],
+                roles=gen_roles,
+                samples_per_prompt=args.samples_per_prompt,
+                on_progress=lambda m: print(f"  {m}"),
+            )
+            append_discover_manifold_node(
+                folder, plan.index_of[concept], concept, corpora[concept],
+            )
+    except (ValueError, RuntimeError) as e:
+        print(f"manifold generate failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"wrote {namespace}/{name} ({n_total} nodes)")
+    print(f"  -> run `saklas manifold fit {namespace}/{name}` to fit")
+
+
+def _run_manifold_from_template(args: argparse.Namespace) -> None:
+    """``saklas manifold from-template`` — author a discover manifold from a template.
+
+    Pure-IO (no model): resolves the standalone template, expands its values x
+    contexts into per-value node corpora, and writes a discover folder that
+    stores the corpus + ``template_ref``. Fit it next with
+    ``saklas manifold fit <name> -m MODEL``.
+    """
+    from saklas.io.manifolds import ManifoldFormatError, create_manifold_from_template
+    from saklas.io.templates import (
+        AmbiguousTemplateError, TemplateNotFoundError, resolve_template,
+    )
+
+    try:
+        tmpl = resolve_template(args.template)
+    except (TemplateNotFoundError, AmbiguousTemplateError) as e:
+        print(f"manifold from-template: {e}", file=sys.stderr)
+        sys.exit(1)
+    ref = f"{tmpl.path.parent.name}/{tmpl.name}" if tmpl.path else tmpl.name
+    namespace, name = _split_manifold_ns_name(args.name or tmpl.name)
+
+    hyperparams: dict[str, object] = {}
+    if args.max_dim is not None:
+        hyperparams["max_dim"] = args.max_dim
+    if args.var_threshold is not None:
+        hyperparams["var_threshold"] = args.var_threshold
+
+    try:
+        create_manifold_from_template(
+            namespace, name, args.description,
+            template_ref=ref,
+            fit_mode=args.fit_mode,
+            hyperparams=hyperparams or None,
+            force=args.force,
+        )
+    except FileExistsError:
+        print(
+            f"manifold from-template: {namespace}/{name} already exists "
+            f"-- pass -f/--force to overwrite",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    except ManifoldFormatError as e:
+        print(f"manifold from-template failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    print(
+        f"wrote {namespace}/{name} ({len(tmpl.values)} nodes x "
+        f"{len(tmpl.contexts)} contexts, template_ref={ref}, "
+        f"fit_mode={args.fit_mode})"
+    )
+    print(f"  -> run `saklas manifold fit {namespace}/{name} -m MODEL` to fit")
+
+
+def _normalize_context_entry(entry: object) -> dict[str, object]:
+    """Accept either a multi-turn ``{turns, assistant}`` context or the
+    single-turn sugar ``{user, assistant}`` and return the canonical shape."""
+    if not isinstance(entry, dict):
+        raise ValueError("each context must be an object")
+    if "turns" in entry:
+        return {"turns": entry["turns"], "assistant": entry.get("assistant")}
+    if "user" in entry:                      # single-turn sugar
+        return {
+            "turns": [{"role": "user", "content": entry["user"]}],
+            "assistant": entry.get("assistant"),
+        }
+    raise ValueError(
+        "each context needs either 'turns' (multi-turn) or 'user' "
+        "(single-turn sugar), plus 'assistant'"
+    )
+
+
+def _run_template_create(args: argparse.Namespace) -> None:
+    """``saklas template create`` — author a standalone template artifact.
+
+    Pure-IO (no model): reads the ``--contexts`` JSON file (multi-turn contexts
+    or the single-turn ``{user, assistant}`` sugar), validates the slot/value
+    invariants, and writes ``~/.saklas/templates/<ns>/<name>/template.json``.
     """
     import json as _json
 
-    from saklas.core.profile import Profile, ProfileError
-    from saklas.io.alignment import (
-        AlignmentError,
-        alignment_cache_path,
-        alignment_quality,
-        fit_alignment,
-        load_alignment_map,
-        load_or_compute_neutral_activations,
-        save_alignment_map,
-        transfer_profile,
-    )
-    from saklas.io.packs import hash_file
-    from saklas.io.paths import safe_model_id, sidecar_filename, tensor_filename
-    from saklas.io.selectors import parse as sel_parse, resolve
+    from saklas.io.templates import TemplateFormatError, create_template_folder
 
-    sel = sel_parse(args.concept)
-    matches = resolve(sel)
-    if not matches:
-        print(f"transfer: '{args.concept}' not found", file=sys.stderr)
+    try:
+        with open(args.contexts_file) as f:
+            raw = _json.load(f)
+    except (OSError, ValueError) as e:
+        print(f"template create: cannot read --contexts: {e}", file=sys.stderr)
         sys.exit(1)
-    if len(matches) > 1:
-        qualified = ", ".join(f"{c.namespace}/{c.name}" for c in matches)
+    if not isinstance(raw, list) or not raw:
         print(
-            f"transfer: '{args.concept}' is ambiguous (matches {qualified}); "
-            f"specify ns/name",
+            "template create: --contexts must be a non-empty JSON list of "
+            'contexts ({"turns": [...], "assistant": ...} or {"user": ..., '
+            '"assistant": ...})',
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    try:
+        contexts = [_normalize_context_entry(e) for e in raw]
+    except ValueError as e:
+        print(f"template create: {e}", file=sys.stderr)
+        sys.exit(2)
+
+    namespace, name = _split_manifold_ns_name(args.name)
+    try:
+        create_template_folder(
+            namespace, name,
+            slot=args.slot,
+            values=list(args.values),
+            contexts=contexts,
+            description=args.description,
+            force=args.force,
+        )
+    except FileExistsError:
+        print(
+            f"template create: {namespace}/{name} already exists "
+            f"-- pass -f/--force to overwrite",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    except TemplateFormatError as e:
+        print(f"template create failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    print(
+        f"wrote template {namespace}/{name} ({len(args.values)} values x "
+        f"{len(contexts)} contexts)"
+    )
+    print(f"  -> `saklas template score {namespace}/{name} -m MODEL` to read the "
+          f"value distribution")
+
+
+def _run_template_ls(args: argparse.Namespace) -> None:
+    import json as _json
+
+    from saklas.io.templates import iter_template_folders
+
+    rows = list(iter_template_folders())
+    if getattr(args, "json", False):
+        print(_json.dumps([t.summary() for t in rows], indent=2))
+        return
+    if not rows:
+        print("no templates installed under ~/.saklas/templates/")
+        return
+    for t in rows:
+        ns = t.path.parent.name if t.path else "?"
+        print(
+            f"  {ns}/{t.name}  [slot {t.slot!r}, {len(t.values)} values x "
+            f"{len(t.contexts)} contexts]"
+        )
+        if t.description:
+            print(f"    {t.description}")
+
+
+def _run_template_show(args: argparse.Namespace) -> None:
+    import json as _json
+
+    from saklas.io.templates import (
+        AmbiguousTemplateError, TemplateNotFoundError, resolve_template,
+    )
+
+    try:
+        t = resolve_template(args.name)
+    except (TemplateNotFoundError, AmbiguousTemplateError) as e:
+        print(f"template show: {e}", file=sys.stderr)
+        sys.exit(1)
+    if getattr(args, "json", False):
+        payload = t.summary()
+        payload["contexts"] = [
+            {"turns": list(c.turns), "assistant": c.assistant} for c in t.contexts
+        ]
+        print(_json.dumps(payload, indent=2))
+        return
+    print(f"{t.name}  (slot {t.slot!r})")
+    if t.description:
+        print(f"  {t.description}")
+    print(f"  values ({len(t.values)}): {', '.join(t.values)}")
+    print(f"  contexts ({len(t.contexts)}):")
+    for i, c in enumerate(t.contexts):
+        turns = " / ".join(f"{turn['role']}: {turn['content']}" for turn in c.turns)
+        print(f"    [{i}] {turns}")
+        print(f"        assistant: {c.assistant}")
+
+
+def _run_template_rm(args: argparse.Namespace) -> None:
+    from saklas.io.templates import remove_template_folder
+
+    namespace, name = _split_manifold_ns_name(args.name)
+    if not args.yes:
+        print(
+            f"remove template {namespace}/{name}? pass -y/--yes to confirm",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if remove_template_folder(namespace, name):
+        print(f"Removed template {namespace}/{name}")
+    else:
+        print(f"template rm: no template {namespace}/{name}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _run_template_score(args: argparse.Namespace) -> None:
+    """``saklas template score`` — the restricted-choice value distribution."""
+    import json as _json
+
+    from saklas.core.scoring import score_template
+    from saklas.core.session import SaklasSession
+    from saklas.io.templates import (
+        AmbiguousTemplateError, TemplateNotFoundError, resolve_template,
+    )
+
+    try:
+        tmpl = resolve_template(args.name)
+    except (TemplateNotFoundError, AmbiguousTemplateError) as e:
+        print(f"template score: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    with SaklasSession.from_pretrained(
+        args.model, device=args.device, quantize=args.quantize,
+    ) as session:
+        per_ctx = score_template(session, tmpl, steering=args.steer)
+
+    if getattr(args, "json", False):
+        print(_json.dumps({
+            "template": tmpl.name,
+            "model": args.model,
+            "steering": args.steer,
+            "contexts": [sc.to_dict() for sc in per_ctx],
+        }, indent=2))
+        return
+
+    by = getattr(args, "by", "sum")
+    steer_note = f"  (steering: {args.steer})" if args.steer else ""
+    print(f"{tmpl.name} on {args.model}{steer_note}")
+    for i, sc in enumerate(per_ctx):
+        print(f"\n  context [{i}]:")
+        for c in sc.ranked(by=by):
+            prob = c.prob_sum if by == "sum" else c.prob_mean
+            bar = "#" * int(round(prob * 30))
+            print(
+                f"    {c.label:14s} P={prob:6.3f}  "
+                f"sum={c.sum_logprob:8.3f}  mean={c.mean_logprob:8.3f}  "
+                f"n={c.n_tokens}  {bar}"
+            )
+
+
+def _split_manifold_ns_name(raw: str) -> tuple[str, str]:
+    """Split a CLI-supplied manifold selector into ``(namespace, name)``.
+
+    Manifolds are addressed by ``(namespace, name)`` directly — not the
+    concept ``Selector``/``resolve`` machinery — so a bare name defaults
+    to the ``local`` namespace (the manifold lifecycle backends accept
+    the pair verbatim).  Mirrors the ``ns/name`` split in
+    ``_run_manifold_generate``.
+    """
+    if "/" in raw:
+        ns, name = raw.split("/", 1)
+        return ns, name
+    return "local", raw
+
+
+def _run_pack_install(args: argparse.Namespace) -> None:
+    from saklas.io.hf_manifolds import install_manifold
+
+    dst = install_manifold(args.target, args.as_target, force=args.force)
+    print(f"Installed {args.target} -> {dst}")
+
+
+def _run_pack_search(args: argparse.Namespace) -> None:
+    import json as _json
+    from saklas.io.hf_manifolds import search_manifolds
+
+    try:
+        rows = search_manifolds(args.query or None)
+    except ImportError as e:
+        print(f"saklas manifold search unavailable: {e}", file=sys.stderr)
+        return
+    except Exception as e:
+        print(f"hf search failed: {type(e).__name__}: {e}", file=sys.stderr)
+        return
+    if getattr(args, "json_output", False):
+        print(_json.dumps(rows, indent=2))
+        return
+    if not rows:
+        print("(no matches)")
+        return
+    for r in rows:
+        line = (
+            f"{r['name']:<24} {r['namespace']:<12} [hf]          "
+            f"{r['domain_label']:<14} {r['node_count']:>3} nodes  "
+            f"{', '.join(r['tensor_models']) or '(unfitted)'}"
+        )
+        if getattr(args, "verbose", False):
+            line = (
+                f"{r['name']:<24} {r['namespace']:<12} [hf]          "
+                f"{r['domain_label']:<14} {r['node_count']:>3} nodes  "
+                f"{r.get('description', '')}"
+            )
+        print(line)
+
+
+def _run_manifold_merge(args: argparse.Namespace) -> None:
+    from saklas.io.manifolds import (
+        ManifoldFormatError, merge_discover_manifolds,
+    )
+
+    target_ns, target_name = _split_manifold_ns_name(args.name)
+    sources = [_split_manifold_ns_name(s) for s in args.sources]
+    if len(sources) < 2:
+        print(
+            "manifold merge: need >= 2 sources (union of one manifold is a no-op)",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    try:
+        dst = merge_discover_manifolds(
+            target_ns, target_name, args.description,
+            sources=sources,
+            fit_mode=args.method,  # parser dest unified to ``method`` (matches discover)
+            force=args.force,
+        )
+    except (FileNotFoundError, FileExistsError, ManifoldFormatError, ValueError) as e:
+        print(f"manifold merge failed: {e}", file=sys.stderr)
+        sys.exit(1)
+    print(f"Merged manifold written to {dst}")
+    print(
+        f"  -> run `saklas manifold fit {target_ns}/{target_name}` to fit"
+    )
+
+
+def _run_pack_push(args: argparse.Namespace) -> None:
+    from saklas.io.hf import resolve_target_coord
+    from saklas.io.hf_manifolds import push_manifold
+    from saklas.io.paths import manifold_dir
+
+    ns, name = _split_manifold_ns_name(args.selector)
+    folder = manifold_dir(ns, name)
+    if not (folder / "manifold.json").exists():
+        print(
+            f"manifold push: {ns}/{name} not found at {folder}", file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # The coord follows pack push's resolution: ``--as owner/name`` wins,
+    # else ``<whoami>/<name>``.  ``push_manifold`` takes the resolved
+    # coord directly (no internal selector machinery), so the runner owns
+    # the resolution the way ``cache_ops.push`` does for packs.
+    try:
+        coord = resolve_target_coord(name, args.as_target)
+    except Exception as e:
+        print(f"manifold push: {e}", file=sys.stderr)
+        sys.exit(2)
+
+    try:
+        repo_url, sha = push_manifold(
+            folder, coord,
+            private=args.private,
+            model_scope=args.model,
+            variant=args.variant,
+            dry_run=args.dry_run,
+        )
+    except RuntimeError as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(2)
+
+    if sha:
+        print(f"Pushed {coord} -> {repo_url} @ {sha[:12]}")
+    elif args.dry_run:
+        print(f"Dry-run: would push {coord} -> {repo_url}")
+    else:
+        print(f"Pushed {coord} -> {repo_url}")
+
+
+def _run_pack_rm(args: argparse.Namespace) -> None:
+    from saklas.io.manifolds import remove_manifold_folder
+
+    ns, name = _resolve_manifold_ns_name(args.selector)
+    # Bundled (``default/``) manifolds re-materialize on next session
+    # init — mirror ``pack rm``'s confirmation guard for the broad/
+    # destructive case (here: a bundled folder the user likely didn't
+    # mean to nuke).  ``-y`` skips it.
+    if ns == "default" and not args.yes:
+        print(
+            f"refusing to remove bundled manifold {ns}/{name} "
+            f"(re-materializes on restart); pass --yes to confirm",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    try:
+        result = remove_manifold_folder(ns, name)
+    except FileNotFoundError as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(1)
+    msg = f"Removed {result['namespace']}/{result['name']}"
+    if result.get("rematerializes_on_restart"):
+        msg += " (re-materializes on next session start)"
+    print(msg)
+
+
+def _run_pack_clear(args: argparse.Namespace) -> None:
+    from saklas.io.manifolds import clear_manifold_tensors
+
+    ns, name = _resolve_manifold_ns_name(args.selector)
+    # ``args.model`` is the raw model id; ``clear_manifold_tensors`` does
+    # the safe-id conversion at the io boundary, exactly as the pack
+    # ``cache_ops.delete_tensors`` path does (it passes ``args.model``
+    # straight through to ``enumerate_variants``).
+    try:
+        n = clear_manifold_tensors(ns, name, args.model, variant=args.variant)
+    except FileNotFoundError as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(1)
+    print(f"Deleted {n} files")
+
+
+def _run_pack_refresh(args: argparse.Namespace) -> None:
+    from saklas.io.manifolds import refresh_manifold
+
+    ns, name = _resolve_manifold_ns_name(args.selector)
+    # ``args.model`` is the raw model id; ``refresh_manifold`` converts to
+    # a safe id at the io boundary (via ``clear_manifold_tensors``), the
+    # same convention ``cache_ops.refresh``'s scoped path uses.
+    try:
+        tier = refresh_manifold(ns, name, model_scope=args.model)
+    except FileNotFoundError as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(1)
+    if tier == "scoped":
+        print(f"Refreshed {ns}/{name} ({args.model} tensors cleared — re-fits on next use)")
+    elif tier == "skipped":
+        print(f"{ns}/{name}: local source, nothing to refresh")
+    elif tier == "bundled":
+        print(f"Refreshed {ns}/{name} (bundled — re-materialized from package data)")
+    else:  # "hf"
+        print(f"Refreshed {ns}/{name} (re-pulled from HF)")
+
+
+def _run_manifold_transfer(args: argparse.Namespace) -> None:
+    """Cross-model manifold transfer via Procrustes.
+
+    Resolve the manifold folder, fit (or load) the per-layer Procrustes
+    alignment between the source and target models' cached neutral activations
+    — the part that needs both models loaded — then hand the prebuilt alignment
+    dict to :func:`saklas.io.manifolds.transfer_manifold`, which is pure-io and
+    only *applies* the map.  Steering vectors transfer the same way (a vector is
+    the K=2 case of a flat ``pca`` manifold).
+    """
+    import json as _json
+
+    from saklas.io.manifolds import (
+        ManifoldFormatError, transfer_manifold,
+    )
+    from saklas.io.paths import manifold_dir, safe_model_id, tensor_filename
+
+    ns, name = _resolve_manifold_ns_name(args.name)
+    folder = manifold_dir(ns, name)
+    if not (folder / "manifold.json").exists():
+        print(
+            f"manifold transfer: {ns}/{name} not found at {folder}",
             file=sys.stderr,
         )
         sys.exit(1)
 
-    folder = matches[0].folder
     src_tensor = folder / tensor_filename(args.src_model)
-    if not src_tensor.is_file():
+    if not src_tensor.exists():
         print(
-            f"transfer: source tensor not found at {src_tensor} — extract "
-            f"the concept on {args.src_model} first",
+            f"manifold transfer: source fit not found at {src_tensor} — fit "
+            f"the manifold on {args.src_model} first",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -1303,114 +2071,54 @@ def _run_transfer(args: argparse.Namespace) -> None:
     tgt_tensor = folder / tensor_filename(
         args.tgt_model, transferred_from=args.src_model,
     )
-    tgt_sidecar = folder / sidecar_filename(
-        args.tgt_model, transferred_from=args.src_model,
-    )
     if tgt_tensor.exists() and not args.force:
         print(
-            f"transfer: target already exists at {tgt_tensor}; pass -f to recompute",
+            f"manifold transfer: target already exists at {tgt_tensor}; "
+            f"pass -f to recompute",
             file=sys.stderr,
         )
         sys.exit(1)
 
-    # Load + fit / load alignment.  Heavy work — both forward passes
-    # and the SVD — so we lazy-load saklas.core.session to avoid paying
-    # the model-load cost when the user just runs --help.
-    from saklas.core.session import SaklasSession
-
-    try:
-        src_profile = Profile.load(src_tensor)
-    except ProfileError as e:
-        print(f"transfer: failed to load source profile: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    cached = None if args.force else load_alignment_map(args.src_model, args.tgt_model)
-
-    if cached is None:
-        # Need both models loaded to compute neutrals.  Loading two
-        # large models simultaneously is non-trivial; we serialize:
-        # load src, compute its neutrals, drop, load tgt, compute, drop.
-        print(
-            f"transfer: fitting Procrustes alignment {args.src_model} -> {args.tgt_model} "
-            f"(this may load each model briefly)...",
-            file=sys.stderr,
-        )
-
-        with SaklasSession.from_pretrained(args.src_model, device="auto", probes=[]) as src_sess:
-            src_acts = load_or_compute_neutral_activations(
-                src_sess._model, src_sess._tokenizer, src_sess._layers,
-                model_id=args.src_model, force=args.force,
-            )
-
-        with SaklasSession.from_pretrained(args.tgt_model, device="auto", probes=[]) as tgt_sess:
-            tgt_acts = load_or_compute_neutral_activations(
-                tgt_sess._model, tgt_sess._tokenizer, tgt_sess._layers,
-                model_id=args.tgt_model, force=args.force,
-            )
-
-        try:
-            M = fit_alignment(src_acts, tgt_acts)
-        except AlignmentError as e:
-            print(f"transfer: {e}", file=sys.stderr)
-            sys.exit(1)
-
-        quality_per_layer = alignment_quality(M, src_acts, tgt_acts)
-        map_path = save_alignment_map(
-            M, args.src_model, args.tgt_model,
-            quality_per_layer=quality_per_layer,
-        )
-    else:
-        M, sidecar = cached
-        # Replay the per-layer quality from the sidecar when present;
-        # otherwise leave it None — transfer still runs.
-        raw_q = sidecar.get("quality_per_layer") or {}
-        quality_per_layer = {int(k): float(v) for k, v in raw_q.items()}
-        map_path, _ = alignment_cache_path(args.src_model, args.tgt_model)
-
-    median_quality: float | None = None
-    if quality_per_layer:
-        ordered = sorted(quality_per_layer.values())
-        mid = len(ordered) // 2
-        if len(ordered) % 2:
-            median_quality = ordered[mid]
-        else:
-            median_quality = 0.5 * (ordered[mid - 1] + ordered[mid])
-
-    transferred = transfer_profile(
-        src_profile, M,
-        source_model_id=args.src_model,
-        transfer_quality_estimate=median_quality,
+    M, quality_per_layer, _ = _load_or_fit_transfer_alignment(
+        args.src_model, args.tgt_model, force=args.force, label="manifold transfer",
     )
 
-    # Persist the alignment-map hash on the transferred sidecar so
-    # callers can detect when an old transfer is stale against a newer
-    # alignment cache.
-    map_hash = hash_file(map_path) if map_path.exists() else None
-    save_meta: dict[str, Any] = dict(transferred.metadata)
-    if map_hash is not None:
-        save_meta["alignment_map_hash"] = map_hash
+    median_quality = median_or_zero(list(quality_per_layer.values())) if quality_per_layer else None
 
-    transferred.save(tgt_tensor, metadata=save_meta)
+    # Target whitener for the Mahalanobis-share re-bake.  Read the target
+    # neutral cache directly and center by its own per-layer mean — the
+    # neutral mean *is* the probe-centering baseline, so no separate
+    # layer_means cache is needed.  Mahalanobis is mandatory: a missing /
+    # unusable target cache raises ``WhitenerError`` here (no Euclidean
+    # rebake), surfaced to the user as a fatal transfer error.
+    from saklas.core.mahalanobis import WhitenerError
 
-    # Refresh the pack.json files map so the new variant lands in the
-    # integrity check on next load.
-    from saklas.io.packs import PackMetadata, hash_folder_files
     try:
-        meta = PackMetadata.load(folder)
-        meta.files = hash_folder_files(folder)
-        meta.write(folder)
-    except Exception:
-        # Pack metadata refresh is best-effort — the tensor itself is
-        # written, and the next ``pack ls`` will notice the discrepancy.
-        pass
+        target_whitener = _target_whitener_from_neutral_cache(args.tgt_model)
+    except WhitenerError as e:
+        print(f"manifold transfer failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        out_path = transfer_manifold(
+            folder,
+            from_model=args.src_model,
+            to_model=args.tgt_model,
+            alignment=M,
+            transfer_quality_estimate=median_quality,
+            whitener=target_whitener,
+            force=args.force,
+        )
+    except (FileNotFoundError, FileExistsError, ManifoldFormatError) as e:
+        print(f"manifold transfer failed: {e}", file=sys.stderr)
+        sys.exit(1)
 
     payload = {
-        "concept": matches[0].name,
-        "namespace": matches[0].namespace,
+        "namespace": ns,
+        "name": name,
         "source_model": args.src_model,
         "target_model": args.tgt_model,
-        "tensor": str(tgt_tensor),
-        "sidecar": str(tgt_sidecar),
+        "tensor": str(out_path),
         "transferred_layers": sorted(M.keys()),
         "median_transfer_quality": (
             round(median_quality, 4) if median_quality is not None else None
@@ -1420,42 +2128,143 @@ def _run_transfer(args: argparse.Namespace) -> None:
         print(_json.dumps(payload, indent=2))
         return
 
-    quality_str = (
-        f"{median_quality:.3f}" if median_quality is not None else "n/a"
-    )
+    quality_str = f"{median_quality:.3f}" if median_quality is not None else "n/a"
     print(
-        f"Transferred {matches[0].namespace}/{matches[0].name} "
+        f"Transferred manifold {ns}/{name} "
         f"from {args.src_model} -> {args.tgt_model}\n"
         f"  layers:           {len(M)} shared\n"
         f"  median quality:   {quality_str} (R^2 across shared layers)\n"
-        f"  tensor:           {tgt_tensor}\n"
+        f"  tensor:           {out_path}\n"
         f"  variant suffix:   :from-{safe_model_id(args.src_model)}"
     )
 
 
-_VECTOR_RUNNERS = {
-    "extract":  _run_extract,
-    "merge":    _run_merge,
-    "clone":    _run_clone,
-    "compare":  _run_compare,
-    "why":      _run_why,
-    "transfer": _run_transfer,
+def _run_pack_export(args: argparse.Namespace) -> None:
+    """Export a fitted 2-node ``pca`` manifold to an interchange format (gguf).
+
+    Folds the manifold down to a single steering direction
+    (:func:`~saklas.core.vectors.folded_vector_directions`) and writes a
+    llama.cpp control-vector GGUF.
+    """
+    fmt = getattr(args, "format", None)
+    if fmt != "gguf":
+        print(f"Unknown export format: {fmt}", file=sys.stderr)
+        sys.exit(2)
+    from saklas.io.cache_ops import _export_gguf_manifold
+
+    ns, name = _resolve_manifold_ns_name(args.name)
+    try:
+        written = _export_gguf_manifold(
+            ns, name,
+            model_scope=args.model,
+            output=args.output,
+            model_hint=args.model_hint,
+        )
+    except (FileNotFoundError, RuntimeError) as e:
+        print(f"manifold export failed: {e}", file=sys.stderr)
+        sys.exit(1)
+    for p in written:
+        print(f"Wrote {p}")
+
+
+# The nine steering-vector / manifold *compute* verbs (model-loading +
+# analysis).  ``manifold transfer`` keeps its own runner (it was already a
+# manifold verb); the rest are the renamed former ``subspace`` verbs plus the
+# discover→fit fold.
+_MANIFOLD_RUNNERS = {
+    "extract":  _run_manifold_extract,
+    "generate": _run_manifold_generate,
+    "from-template": _run_manifold_from_template,
+    "fit":      _run_manifold_fit,
+    "bake":     _run_manifold_bake,
+    "merge":    _run_manifold_merge,
+    "transfer": _run_manifold_transfer,
+    "compare":  _run_manifold_compare,
+    "why":      _run_manifold_why,
 }
 
 
 @_saklas_error_exit
-def _run_vector(args: argparse.Namespace) -> None:
-    vector_cmd = getattr(args, "vector_cmd", None)
-    if vector_cmd is None:
-        print("usage: saklas vector <verb> [...]")
+def _run_manifold(args: argparse.Namespace) -> None:
+    """Dispatch ``saklas manifold <verb>`` (the compute verbs)."""
+    cmd = getattr(args, "manifold_cmd", None)
+    if cmd is None:
+        print("usage: saklas manifold <verb> [...]")
         print()
-        width = max(len(v) for v, _ in _VECTOR_VERBS)
-        for v, desc in _VECTOR_VERBS:
+        width = max(len(v) for v, _ in _MANIFOLD_VERBS)
+        for v, desc in _MANIFOLD_VERBS:
             print(f"  {v:<{width}}  {desc}")
         print()
-        print("Run `saklas vector <verb> -h` for verb-specific options.")
+        print("Run `saklas manifold <verb> -h` for verb-specific options.")
         sys.exit(0)
-    runner = _VECTOR_RUNNERS[vector_cmd]
+    runner = _MANIFOLD_RUNNERS.get(cmd)
+    if runner is None:
+        print(f"unknown manifold verb {cmd!r}", file=sys.stderr)
+        sys.exit(2)
+    runner(args)
+
+
+# The nine manifold *lifecycle* verbs (pure-IO over ~/.saklas/manifolds/,
+# addressed by (namespace, name); install / share / inspect / remove).
+_PACK_RUNNERS = {
+    "ls":       _run_pack_ls,
+    "show":     _run_pack_show,
+    "install":  _run_pack_install,
+    "search":   _run_pack_search,
+    "push":     _run_pack_push,
+    "rm":       _run_pack_rm,
+    "clear":    _run_pack_clear,
+    "refresh":  _run_pack_refresh,
+    "export":   _run_pack_export,
+}
+
+
+@_saklas_error_exit
+def _run_pack(args: argparse.Namespace) -> None:
+    """Dispatch ``saklas pack <verb>`` (the manifold lifecycle verbs)."""
+    cmd = getattr(args, "pack_cmd", None)
+    if cmd is None:
+        print("usage: saklas pack <verb> [...]")
+        print()
+        width = max(len(v) for v, _ in _PACK_VERBS)
+        for v, desc in _PACK_VERBS:
+            print(f"  {v:<{width}}  {desc}")
+        print()
+        print("Run `saklas pack <verb> -h` for verb-specific options.")
+        sys.exit(0)
+    runner = _PACK_RUNNERS.get(cmd)
+    if runner is None:
+        print(f"unknown pack verb {cmd!r}", file=sys.stderr)
+        sys.exit(2)
+    runner(args)
+
+
+_TEMPLATE_RUNNERS = {
+    "create": _run_template_create,
+    "ls":     _run_template_ls,
+    "show":   _run_template_show,
+    "score":  _run_template_score,
+    "rm":     _run_template_rm,
+}
+
+
+@_saklas_error_exit
+def _run_template(args: argparse.Namespace) -> None:
+    """Dispatch ``saklas template <verb>`` (the templated-completion artifact)."""
+    cmd = getattr(args, "template_cmd", None)
+    if cmd is None:
+        print("usage: saklas template <verb> [...]")
+        print()
+        width = max(len(v) for v, _ in _TEMPLATE_VERBS)
+        for v, desc in _TEMPLATE_VERBS:
+            print(f"  {v:<{width}}  {desc}")
+        print()
+        print("Run `saklas template <verb> -h` for verb-specific options.")
+        sys.exit(0)
+    runner = _TEMPLATE_RUNNERS.get(cmd)
+    if runner is None:
+        print(f"unknown template verb {cmd!r}", file=sys.stderr)
+        sys.exit(2)
     runner(args)
 
 
@@ -1476,8 +2285,144 @@ def _run_experiment(args: argparse.Namespace) -> None:
     if cmd == "transcript":
         _run_experiment_transcript(args)
         return
+    if cmd == "naturalness":
+        _run_experiment_naturalness(args)
+        return
     print(f"unknown experiment verb {cmd!r}", file=sys.stderr)
     sys.exit(2)
+
+
+def _run_experiment_naturalness(args: argparse.Namespace) -> None:
+    """Score a steered generation's behavior-manifold naturalness."""
+    import json as _json
+
+    import torch
+
+    from saklas.core.manifold import (
+        compute_node_behavior_centroid,
+        compute_trajectory_distributions,
+        domain_from_spec,
+        fit_behavior_manifold,
+        trajectory_naturalness,
+    )
+    from saklas.core.profile import Profile
+    from saklas.core.sampling import SamplingConfig
+    from saklas.core.steering_expr import ManifoldTerm, parse_expr
+    from saklas.io.manifolds import ManifoldFolder
+
+    _load_effective_config(args)
+    mfolder = Path(args.manifold)
+    if not (mfolder / "manifold.json").exists():
+        print(
+            f"experiment naturalness: no manifold.json in {mfolder}",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    mf = ManifoldFolder.load(mfolder)
+    node_groups = mf.node_groups()
+    domain = domain_from_spec(mf.domain)
+    node_coords = torch.tensor(mf.node_coords, dtype=torch.float32)
+    node_params = domain.embed(node_coords)
+
+    _print_startup(args)
+    session = _make_session(args)
+    _print_model_info(session)
+
+    # 1. Fit the behavior manifold from the node corpus — each node's
+    #    mean next-token distribution, in Hellinger space.
+    print(f"fitting behavior manifold ({len(node_groups)} nodes)...")
+    centroids = [
+        compute_node_behavior_centroid(
+            session.model, session.tokenizer, session.device, statements,
+        )
+        for _label, statements in node_groups
+    ]
+    behavior = fit_behavior_manifold(torch.stack(centroids), node_params)
+
+    sampling = SamplingConfig(max_tokens=args.max_tokens, seed=0)
+
+    def _score(steer: str | None) -> tuple[str, float, float]:
+        result = session.generate(
+            args.prompt, steering=steer, sampling=sampling,
+        )
+        text = result.text
+        traj = compute_trajectory_distributions(
+            session.model, session.tokenizer, session.device, text,
+        )
+        per_step = trajectory_naturalness(traj, behavior, domain, node_coords)
+        return text, float(per_step.mean()), float(per_step.max())
+
+    rows: list[dict[str, Any]] = []
+    _text, mean_d, max_d = _score(args.steer)
+    rows.append({
+        "label": "manifold", "steering": args.steer,
+        "mean_bhattacharyya": mean_d, "max_bhattacharyya": max_d,
+    })
+
+    if args.compare_linear:
+        steering = parse_expr(args.steer)
+        mterms = [
+            v for v in steering.alphas.values()
+            if isinstance(v, ManifoldTerm)
+        ]
+        if len(mterms) != 1 or len(steering.alphas) != 1:
+            print(
+                "experiment naturalness: --compare-linear requires the "
+                "steer expression to be a single manifold term",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        mt = mterms[0]
+        session._ensure_manifold_loaded(mt.manifold)
+        act_manifold = session._manifolds[mt.manifold]
+        # Resolve label-form positions to coords up front — every
+        # downstream call here wants a coord tuple, and the chord
+        # baseline is per-coord arithmetic that can't operate on a
+        # string label.
+        mt_position = act_manifold.resolve_position(mt.position)
+        # Linear baseline: the straight chord through activation space
+        # from the manifold point at node 0 to the term's position, per
+        # layer — what plain additive steering would do instead of
+        # following the manifold's curvature.
+        origin = act_manifold.node_coords[0]
+        chord = {
+            L: (
+                act_manifold.manifold_point(L, mt_position)
+                - act_manifold.manifold_point(L, origin)
+            )
+            for L in act_manifold.layer_indices
+        }
+        session.steer("__manifold_linear_baseline__", Profile(chord))
+        _ltext, lmean, lmax = _score(
+            f"{mt.coeff:g} __manifold_linear_baseline__"
+        )
+        pos_label = (
+            mt.position if isinstance(mt.position, str)
+            else ",".join(f"{c:g}" for c in mt_position)
+        )
+        rows.append({
+            "label": "linear-chord", "steering": f"chord@{pos_label}",
+            "mean_bhattacharyya": lmean, "max_bhattacharyya": lmax,
+        })
+
+    if args.json_output:
+        print(_json.dumps({"prompt": args.prompt, "results": rows}, indent=2))
+        return
+    print()
+    print("behavior-manifold naturalness  (lower = more natural)")
+    for r in rows:
+        print(
+            f"  {r['label']:<14} mean D_B={r['mean_bhattacharyya']:.4f}  "
+            f"max D_B={r['max_bhattacharyya']:.4f}"
+        )
+    if len(rows) == 2:
+        delta = rows[1]["mean_bhattacharyya"] - rows[0]["mean_bhattacharyya"]
+        verdict = (
+            "manifold steering stays closer to the behavior manifold"
+            if delta > 0 else
+            "linear steering stays closer to the behavior manifold"
+        )
+        print(f"  -> {verdict} (Δmean={delta:+.4f})")
 
 
 def _run_experiment_transcript(args: argparse.Namespace) -> None:
@@ -1637,8 +2582,9 @@ def _run_transcript_run(args: argparse.Namespace) -> None:
 _COMMAND_RUNNERS = {
     "tui":        _run_tui,
     "serve":      _run_serve,
+    "manifold":   _run_manifold,
     "pack":       _run_pack,
-    "vector":     _run_vector,
     "config":     _run_config,
     "experiment": _run_experiment,
+    "template":   _run_template,
 }

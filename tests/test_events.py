@@ -1,8 +1,10 @@
 """EventBus unit tests — subscribe, unsubscribe, exception isolation."""
 
 import warnings
+from typing import Callable
 
 from saklas.core.events import (
+    Event,
     EventBus,
     GenerationFinished,
     GenerationStarted,
@@ -54,7 +56,7 @@ def test_subscriber_exception_does_not_break_emit():
     bus = EventBus()
     seen = []
 
-    def _boom(event):
+    def _boom(event: Event) -> None:
         raise RuntimeError("boom")
 
     bus.subscribe(_boom)
@@ -71,9 +73,9 @@ def test_subscriber_exception_does_not_break_emit():
 def test_subscriber_that_unsubscribes_mid_emit():
     bus = EventBus()
     seen = []
-    unsubs: list = []
+    unsubs: list[Callable[[], None]] = []
 
-    def _self_unsub(event):
+    def _self_unsub(event: Event) -> None:
         seen.append(event)
         unsubs[0]()
 
@@ -128,4 +130,4 @@ def test_events_are_frozen_dataclasses():
     import pytest as _p
     ev = SteeringCleared()
     with _p.raises(Exception):
-        ev.foo = "x"  # type: ignore[attr-defined]
+        ev.foo = "x"  # pyright: ignore[reportAttributeAccessIssue]  # frozen dataclass: assignment must raise

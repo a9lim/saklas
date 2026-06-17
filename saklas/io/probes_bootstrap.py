@@ -1,242 +1,62 @@
-"""Bootstrap default probe vectors from the ~/.saklas/ concept-folder layout."""
+"""Bootstrap the per-model probe-centering baseline and the bundled probe roster.
+
+A steering vector lives as a 2-node ``pca`` manifold (4.0), so the bundled
+probe set is sourced by folding fitted manifolds (see
+``SaklasSession._bootstrap_manifold_probes``); this module owns the two pieces
+that feed it: the per-model probe-centering means (:func:`bootstrap_layer_means`,
+derived from the neutral-activation cache) and the tag→manifold roster
+(:func:`load_default_manifolds`).
+"""
 
 from __future__ import annotations
 
-import logging
-import os
-from pathlib import Path
 from typing import Any
 
 import torch
 
-from saklas.core.errors import StaleSidecarError
-from saklas.io.packs import (
-    ConceptFolder, PackFormatError, Sidecar,
-    hash_file, materialize_bundled,
-)
-from saklas.io.paths import (
-    concept_dir,
-    model_dir,
-    neutral_statements_path,
-    sidecar_filename,
-    tensor_filename,
-    vectors_dir,
-)
-from saklas.core.vectors import (
-    compute_layer_means,
-    extract_contrastive,
-    extract_difference_of_means,
-    load_contrastive_pairs,
-    load_profile, save_profile,
-)
 
-log = logging.getLogger(__name__)
+def load_default_manifolds() -> dict[str, list[str]]:
+    """Return {tag: [manifold_name, ...]} for bundled default/ manifolds.
 
-_LAYER_MEANS_NAME = "layer_means"
-
-
-def load_defaults() -> dict[str, list[str]]:
-    """Return {tag: [concept_name, ...]} for the default/ namespace.
-
-    Triggers first-run materialization of bundled data into ~/.saklas/.
+    A steering vector lives as a 2-node ``pca`` manifold, tagged
+    (``manifold.json::tags``) for category-grouped probe bootstrap.  Triggers
+    first-run materialization of bundled manifolds.
     """
-    materialize_bundled()
-    root = vectors_dir() / "default"
-    if not root.is_dir():
-        return {}
+    from saklas.io.manifolds import (
+        iter_manifold_folders, materialize_bundled_manifolds,
+    )
+    from saklas.io.templates import materialize_bundled_templates
+
+    # Templates first — a bundled manifold may ``template_ref`` a bundled one.
+    materialize_bundled_templates()
+    materialize_bundled_manifolds()
     by_tag: dict[str, list[str]] = {}
-    for cdir in sorted(root.iterdir()):
-        if not cdir.is_dir() or not (cdir / "pack.json").is_file():
-            continue
-        try:
-            cf = ConceptFolder.load(cdir)
-        except PackFormatError as e:
-            log.warning("skipping %s: %s", cdir.name, e)
-            continue
-        for tag in cf.metadata.tags or ["uncategorized"]:
-            by_tag.setdefault(tag, []).append(cf.metadata.name)
+    for _ns, mf in iter_manifold_folders(namespace="default"):
+        for tag in mf.tags or []:
+            by_tag.setdefault(tag, []).append(mf.name)
     return by_tag
 
 
 def bootstrap_layer_means(
-    model: Any, tokenizer: Any, layers: list[Any], model_info: dict[str, Any],
+    model: Any, tokenizer: Any, layers: torch.nn.ModuleList, model_info: dict[str, Any],
 ) -> dict[int, torch.Tensor]:
-    """Load or compute per-layer mean activations for probe centering.
+    """Per-layer neutral mean activation for probe centering.
 
-    Stored at ~/.saklas/models/<safe_id>/layer_means.safetensors with a slim
-    sidecar. Stale if neutral_statements.json has changed since extraction.
+    Derived as ``X.mean(0)`` from the per-model neutral-activation cache
+    (:func:`saklas.io.alignment.load_or_compute_neutral_activations`).  The
+    neutral mean *is* the probe-centering baseline — same corpus, same
+    last-content-token fp32 pooling the whitener's covariance is built from —
+    so there is no separate ``layer_means`` forward pass or disk cache.  The
+    neutral-activation cache is the single per-model artifact both the
+    centering mean and the Mahalanobis whitener read; the means fall out of it
+    for free, so a cold model pays one neutral-corpus forward loop instead of
+    two.  Stale on ``neutral_statements.json`` drift via the neutral cache's
+    own sha256 key.
     """
+    from saklas.io.alignment import load_or_compute_neutral_activations
+
     model_id = model_info.get("model_id", "unknown")
-    md = model_dir(model_id)
-    md.mkdir(parents=True, exist_ok=True)
-    ts_path = md / f"{_LAYER_MEANS_NAME}.safetensors"
-    sc_path = md / f"{_LAYER_MEANS_NAME}.json"
-
-    current_ns_hash: str | None = None
-    if neutral_statements_path().exists():
-        current_ns_hash = hash_file(neutral_statements_path())
-
-    if ts_path.exists() and sc_path.exists():
-        try:
-            sc = Sidecar.load(sc_path)
-            if current_ns_hash is None or sc.statements_sha256 == current_ns_hash:
-                profile, _ = load_profile(str(ts_path))
-                log.debug("Loaded cached layer means")
-                return profile
-            log.info("Layer means stale (neutral_statements changed); recomputing")
-        except Exception as e:
-            log.warning("Corrupt layer means cache, recomputing: %s", e)
-
-    log.info("Computing layer means (one-time per model)...")
-    means = compute_layer_means(model, tokenizer, layers)
-    save_profile(means, str(ts_path), {
-        "method": "layer_means",
-        "statements_sha256": current_ns_hash or "",
-    })
-    return means
-
-
-def bootstrap_probes(
-    model: Any,
-    tokenizer: Any,
-    layers: list[Any],
-    model_info: dict[str, Any],
-    categories: list[str],
-    *,
-    method: str = "dim",
-    whitener: Any = None,
-    layer_means: dict[int, torch.Tensor] | None = None,
-    dls: bool = True,
-) -> dict[str, dict[int, torch.Tensor]]:
-    """Load or extract probe vector profiles for the given categories.
-
-    ``method`` selects the extraction algorithm for any probes that need
-    re-extraction.  Defaults to ``"dim"`` (difference-of-means, v2.1+);
-    pass ``"pca"`` to recover the legacy contrastive-PCA path.  Cached
-    tensors are loaded as-is regardless of method — the sidecar carries
-    the method that produced them.
-
-    ``whitener`` is a :class:`saklas.core.mahalanobis.LayerWhitener` (or
-    ``None``).  When provided, DiM extraction uses Mahalanobis-flavored
-    scores for share allocation (see :func:`saklas.core.vectors.extract_difference_of_means`);
-    written sidecars carry ``bake: "mahalanobis"``.  ``None`` falls back
-    to Euclidean scoring (sidecar ``bake: "euclidean"``).  Whitener has
-    no effect on PCA extraction (legacy method, kept on EVR scoring).
-
-    ``layer_means`` is the per-model neutral-baseline mean cache (built
-    by :func:`bootstrap_layer_means` before this call).  Threaded into
-    the extractors for the centered-DLS check.  ``None`` disables DLS
-    centering — the helper falls back to "keep all layers."
-
-    ``dls`` (default ``True``, v2.1+) enables the discriminative-layer
-    selection mask.  Pass ``False`` to extract every layer (the path
-    used by ``--legacy`` and by tests on small mock models).
-    """
-    from saklas import __version__ as _saklas_version
-
-    defaults = load_defaults()
-    model_id = model_info.get("model_id", "unknown")
-    if method not in ("dim", "pca"):
-        raise ValueError(
-            f"unknown extraction method {method!r} (expected 'dim' | 'pca')"
-        )
-
-    probes: dict[str, dict[int, torch.Tensor]] = {}
-    to_extract: list[tuple[str, Path, Path]] = []
-
-    allow_stale = os.environ.get("SAKLAS_ALLOW_STALE") == "1"
-    ts_name = tensor_filename(model_id, method=method)
-    sc_name = sidecar_filename(model_id, method=method)
-
-    for cat in categories:
-        for probe_name in defaults.get(cat, []):
-            cdir = concept_dir("default", probe_name)
-            ts = cdir / ts_name
-            sc_path = cdir / sc_name
-            if ts.exists() and sc_path.exists():
-                try:
-                    profile, meta = load_profile(str(ts))
-                    stmts = cdir / "statements.json"
-                    recorded_sha = meta.get("statements_sha256")
-                    if stmts.exists() and recorded_sha:
-                        current = hash_file(stmts)
-                        if current != recorded_sha and not allow_stale:
-                            raise StaleSidecarError(
-                                f"default/{probe_name}: statements.json has changed "
-                                f"since this tensor was extracted (model={model_id}). "
-                                f"The baked PCA no longer matches the on-disk pairs. "
-                                f"Re-extract: `saklas pack refresh default/{probe_name} -m {model_id}` "
-                                f"— or set SAKLAS_ALLOW_STALE=1 to load the stale tensor anyway."
-                            )
-                    probes[probe_name] = profile
-                    sidecar_version = meta.get("saklas_version", "")
-                    try:
-                        sv = tuple(int(p) for p in sidecar_version.split(".")[:2])
-                        cv = tuple(int(p) for p in _saklas_version.split(".")[:2])
-                        if sv != cv:
-                            log.warning("%s: extracted with older saklas version", probe_name)
-                    except (ValueError, IndexError):
-                        log.warning("%s: extracted with older saklas version", probe_name)
-                    continue
-                except StaleSidecarError:
-                    raise
-                except Exception as e:
-                    log.warning("Corrupt cache for %s, re-extracting: %s", probe_name, e)
-            to_extract.append((probe_name, cdir, ts))
-
-    if not to_extract:
-        return probes
-
-    log.info("Extracting %d probes...", len(to_extract))
-    try:
-        from tqdm import tqdm as _tqdm
-        progress: Any = _tqdm
-    except ImportError:
-        def _no_tqdm(x: Any, **kw: Any) -> Any:
-            return x
-        progress = _no_tqdm
-
-    datasets_to_extract = []
-    for name, cdir, ts in to_extract:
-        stmts_path = cdir / "statements.json"
-        if not stmts_path.exists():
-            log.warning("statements.json missing for %s; skipping", name)
-            continue
-        pairs_data = load_contrastive_pairs(str(stmts_path))
-        datasets_to_extract.append((name, cdir, ts, pairs_data, stmts_path))
-
-    model_device = next(model.parameters()).device
-    extractor = (
-        extract_difference_of_means if method == "dim" else extract_contrastive
+    acts = load_or_compute_neutral_activations(
+        model, tokenizer, layers, model_id=model_id,
     )
-    method_label = (
-        "difference_of_means" if method == "dim" else "contrastive_pca"
-    )
-    # Whitener only affects DiM; PCA stays on EVR scoring (legacy path).
-    # DLS + layer_means flow into both extractors uniformly.
-    extract_kwargs: dict[str, Any] = {"dls": dls, "layer_means": layer_means}
-    bake_label = "euclidean"
-    if method == "dim" and whitener is not None:
-        extract_kwargs["whitener"] = whitener
-        bake_label = "mahalanobis"
-    for name, cdir, ts, ds, stmts_path in progress(datasets_to_extract, desc="Extracting probes", unit="probe"):
-        try:
-            profile, diagnostics = extractor(
-                model, tokenizer, ds["pairs"], layers=layers,
-                concept_label=f"default/{name}",
-                **extract_kwargs,
-            )
-            probes[name] = profile
-            save_meta: dict[str, Any] = {
-                "method": method_label,
-                "bake": bake_label,
-                "statements_sha256": hash_file(stmts_path),
-            }
-            if diagnostics:
-                save_meta["diagnostics"] = diagnostics
-            save_profile(profile, str(ts), save_meta)
-        except Exception as e:
-            log.warning("Contrastive extraction failed for %s: %s", name, e)
-        if model_device.type == "mps":
-            torch.mps.empty_cache()
-    return probes
+    return {idx: X.mean(dim=0) for idx, X in acts.items()}

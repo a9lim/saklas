@@ -37,6 +37,8 @@ import torch
 from saklas.core.generation import (
     GenerationConfig,
     _PenaltyState,
+    _advance_no_cache_input,
+    _effective_topk,
     _sampler_logprob_vector,
     build_chat_input,
     supports_thinking,
@@ -148,16 +150,31 @@ def _approx_kl_topk(
 
 def _finite_float(value: torch.Tensor | float) -> float | None:
     """Convert finite tensor/float values to JSON-safe floats."""
-    if isinstance(value, torch.Tensor):
-        out = float(value.item())
-    else:
-        out = float(value)
+    out = float(value.item()) if isinstance(value, torch.Tensor) else float(value)
     return out if math.isfinite(out) else None
 
 
+_LogprobRows = torch.Tensor | dict[int, torch.Tensor]
+
+
+def _logprob_row(rows: _LogprobRows, row_idx: int) -> torch.Tensor | None:
+    if isinstance(rows, dict):
+        return rows.get(row_idx)
+    if 0 <= row_idx < rows.shape[0]:
+        return rows[row_idx]
+    return None
+
+
+def _logprob_value(rows: _LogprobRows, row_idx: int, token_id: int) -> float | None:
+    row = _logprob_row(rows, row_idx)
+    if row is None or token_id < 0 or token_id >= row.shape[-1]:
+        return None
+    return _finite_float(row[token_id])
+
+
 def _compute_rows(
-    logp_a: torch.Tensor,        # [T_a, V] sampler-renormalized logprobs
-    logp_b: torch.Tensor,        # [T_b, V]
+    logp_a: _LogprobRows,        # sampler-renormalized logprobs by predictor row
+    logp_b: _LogprobRows,
     token_ids_a: list[int],      # full sequence (prefix + assistant) for A
     token_ids_b: list[int],
     token_strs_a: list[str],     # decoded text per id (display) for A's full seq
@@ -201,9 +218,9 @@ def _compute_rows(
         lp_a_in_a: float | None = None
         lp_b_in_b: float | None = None
         if 0 <= a_idx < len(assistant_ids_a):
-            lp_a_in_a = _finite_float(logp_a[pa_pos, assistant_ids_a[a_idx]])
+            lp_a_in_a = _logprob_value(logp_a, pa_pos, assistant_ids_a[a_idx])
         if 0 <= b_idx < len(assistant_ids_b):
-            lp_b_in_b = _finite_float(logp_b[pb_pos, assistant_ids_b[b_idx]])
+            lp_b_in_b = _logprob_value(logp_b, pb_pos, assistant_ids_b[b_idx])
 
         # Cross-evaluation: only meaningful when the positions actually
         # align (byte-equal context up to here).  On divergent rows the
@@ -214,16 +231,23 @@ def _compute_rows(
         rank_changed = False
         approx_kl: float | None = None
         if sp.aligned and 0 <= a_idx < len(assistant_ids_a) and 0 <= b_idx < len(assistant_ids_b):
-            lp_a_in_b = _finite_float(logp_b[pb_pos, assistant_ids_a[a_idx]])
-            lp_b_in_a = _finite_float(logp_a[pa_pos, assistant_ids_b[b_idx]])
-            # Rank-1 change: does the argmax differ at this aligned
-            # position?  Cheap signal — one ``argmax`` per side.
-            argmax_a = int(logp_a[pa_pos].argmax().item())
-            argmax_b = int(logp_b[pb_pos].argmax().item())
-            rank_changed = argmax_a != argmax_b
-            approx_kl = _finite_float(_approx_kl_topk(
-                logp_a[pa_pos], logp_b[pb_pos], kl_top_k,
-            ))
+            row_a = _logprob_row(logp_a, pa_pos)
+            row_b = _logprob_row(logp_b, pb_pos)
+            if row_a is not None and row_b is not None:
+                lp_a_in_b = _logprob_value(
+                    logp_b, pb_pos, assistant_ids_a[a_idx],
+                )
+                lp_b_in_a = _logprob_value(
+                    logp_a, pa_pos, assistant_ids_b[b_idx],
+                )
+                # Rank-1 change: does the argmax differ at this aligned
+                # position?  Cheap signal — one ``argmax`` per side.
+                argmax_a = int(row_a.argmax().item())
+                argmax_b = int(row_b.argmax().item())
+                rank_changed = argmax_a != argmax_b
+                approx_kl = _finite_float(_approx_kl_topk(
+                    row_a, row_b, kl_top_k,
+                ))
 
         rows.append(JointLogprobRow(
             a_index=a_idx,
@@ -263,7 +287,6 @@ def _shared_prefix_len(ids_a: list[int], ids_b: list[int]) -> int:
 
 @dataclass(frozen=True)
 class _ReplayBranch:
-    node_id: str
     prompt_ids: list[int]
     response_ids: list[int]
     token_ids: list[int]
@@ -271,7 +294,6 @@ class _ReplayBranch:
     thinking_ids: list[int]
     sampling: SamplingConfig
     steering: Steering | None
-    thinking: bool
 
 
 def _decode_each(tokenizer: Any, ids: list[int]) -> list[str]:
@@ -286,7 +308,7 @@ def _row_token_ids(rows: list[dict[str, Any]] | None) -> tuple[list[int], list[s
     texts: list[str] = []
     for row in rows or []:
         try:
-            tid = int(row.get("token_id"))
+            tid = int(row.get("token_id"))  # pyright: ignore[reportArgumentType]  # None raises TypeError, caught below
         except (TypeError, ValueError):
             continue
         if tid < 0:
@@ -403,7 +425,6 @@ def _branch_inputs(session: "SaklasSession", node_id: str) -> _ReplayBranch:
 
     prompt_strs = _decode_each(tokenizer, prompt_ids)
     return _ReplayBranch(
-        node_id=node_id,
         prompt_ids=prompt_ids,
         response_ids=response_ids,
         token_ids=prompt_ids + response_ids,
@@ -411,7 +432,6 @@ def _branch_inputs(session: "SaklasSession", node_id: str) -> _ReplayBranch:
         thinking_ids=thinking_ids,
         sampling=sampling,
         steering=steering,
-        thinking=thinking,
     )
 
 
@@ -432,18 +452,23 @@ def _call_model(model: Any, **kwargs: Any) -> Any:
 def _replay_branch_logprobs(
     session: "SaklasSession",
     branch: _ReplayBranch,
-) -> torch.Tensor:
-    """Force-replay one branch and return visible response-row logprobs."""
+) -> dict[int, torch.Tensor]:
+    """Force-replay one branch and return visible response-row logprobs.
+
+    The result is keyed by predictor row in the full branch sequence.  Only
+    response-token rows are retained; prompt rows and thinking-only rows are
+    intentionally absent so long branches do not allocate dense
+    ``[n_rows, vocab]`` tensors filled mostly with ``-inf``.
+    """
     model = session._model
     try:
         device = next(model.parameters()).device
     except StopIteration:  # pragma: no cover - defensive for odd test doubles
         device = torch.device("cpu")
 
-    n_rows = len(branch.token_ids)
     forced_ids = branch.thinking_ids + branch.response_ids
     if not forced_ids:
-        return torch.empty((n_rows, 0), dtype=torch.float32)
+        return {}
     if not branch.prompt_ids:
         raise ValueError("joint-logprob replay requires a non-empty prompt")
 
@@ -497,6 +522,16 @@ def _replay_branch_logprobs(
                 dtype=torch.long,
                 device=device,
             )
+            forced_tensor = torch.tensor(
+                [forced_ids],
+                dtype=torch.long,
+                device=device,
+            )
+            attn_mask_buf = torch.ones(
+                (1, current_input.shape[1] + max(len(forced_ids), 1)),
+                dtype=torch.long,
+                device=device,
+            )
             past_key_values = None
             no_cache_mode = False
             no_cache_buf: torch.Tensor | None = None
@@ -505,25 +540,14 @@ def _replay_branch_logprobs(
 
             def _advance_current_input(next_token: torch.Tensor) -> None:
                 nonlocal current_input, no_cache_buf, no_cache_len
-                if not no_cache_mode:
-                    current_input = next_token
-                    return
-                if no_cache_buf is None:
-                    cap = int(current_input.shape[1]) + max(len(forced_ids), 1)
-                    no_cache_buf = torch.empty(
-                        (1, cap),
-                        dtype=current_input.dtype,
-                        device=current_input.device,
-                    )
-                    no_cache_buf[:, :current_input.shape[1]].copy_(current_input)
-                    no_cache_len = int(current_input.shape[1])
-                if no_cache_len < no_cache_buf.shape[1]:
-                    no_cache_buf[:, no_cache_len:no_cache_len + 1].copy_(next_token)
-                    no_cache_len += 1
-                    current_input = no_cache_buf[:, :no_cache_len]
-                else:  # pragma: no cover - cap covers prompt + forced ids
-                    current_input = torch.cat([current_input, next_token], dim=1)
-                    no_cache_len = int(current_input.shape[1])
+                current_input, no_cache_buf, no_cache_len = _advance_no_cache_input(
+                    next_token,
+                    current_input=current_input,
+                    no_cache_buf=no_cache_buf,
+                    no_cache_len=no_cache_len,
+                    no_cache_mode=no_cache_mode,
+                    max_extra=len(forced_ids),
+                )
 
             with torch.inference_mode():
                 for forced_idx, token_id in enumerate(forced_ids):
@@ -539,7 +563,9 @@ def _replay_branch_logprobs(
                     if past_key_values is not None and not no_cache_mode:
                         kwargs["past_key_values"] = past_key_values
                     if prefill or no_cache_mode:
-                        kwargs["attention_mask"] = torch.ones_like(current_input)
+                        kwargs["attention_mask"] = attn_mask_buf[
+                            :, :current_input.shape[1]
+                        ]
 
                     outputs = _call_model(model, **kwargs)
                     prefill = False
@@ -563,13 +589,12 @@ def _replay_branch_logprobs(
                             frequency_penalty=frequency_penalty,
                         )
                     if bias_idx is not None:
+                        # bias_val is always set when bias_idx is set (both come from logit_bias)
+                        assert bias_val is not None
                         logits[0, bias_idx] += bias_val.to(logits.dtype)
 
                     vocab_size = int(logits.shape[-1])
-                    user_top_k = (
-                        config.top_k if (config.top_k and config.top_k > 0) else 1024
-                    )
-                    topk_k = min(int(user_top_k), vocab_size)
+                    topk_k = _effective_topk(config, vocab_size)
                     logp = _sampler_logprob_vector(logits, config, topk_k)
 
                     if forced_idx >= len(branch.thinking_ids):
@@ -580,7 +605,7 @@ def _replay_branch_logprobs(
                     if penalty_state is not None:
                         penalty_state.add(token_id)
 
-                    next_token = torch.tensor([[int(token_id)]], dtype=torch.long, device=device)
+                    next_token = forced_tensor[:, forced_idx:forced_idx + 1]
                     _advance_current_input(next_token)
         finally:
             if end_capture is not None:
@@ -588,17 +613,7 @@ def _replay_branch_logprobs(
             if monitor is not None and hasattr(monitor, "end_live"):
                 monitor.end_live()
 
-    if vocab_size is None:
-        return torch.empty((n_rows, 0), dtype=torch.float32)
-    out = torch.full(
-        (n_rows, vocab_size),
-        float("-inf"),
-        dtype=torch.float32,
-    )
-    for row_idx, logp in row_logps.items():
-        if 0 <= row_idx < n_rows:
-            out[row_idx] = logp
-    return out
+    return row_logps if vocab_size is not None else {}
 
 
 def compute_joint_logprobs(

@@ -1,0 +1,24 @@
+{
+  "format_version": 5,
+  "name": "traditional.progressive",
+  "description": "Bipolar axis: traditional (+) vs progressive (-). Steer with negative alpha for the opposite pole.",
+  "fit_mode": "pca",
+  "hyperparams": {
+    "max_dim": 1,
+    "var_threshold": 0.7
+  },
+  "nodes": [
+    {
+      "label": "traditional",
+      "kind": "abstract"
+    },
+    {
+      "label": "progressive",
+      "kind": "abstract"
+    }
+  ],
+  "files": {},
+  "tags": [
+    "cultural"
+  ]
+}

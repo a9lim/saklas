@@ -11,12 +11,16 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
 
 from saklas.core.results import GenerationResult, RunSet
+
+if TYPE_CHECKING:
+    from saklas.core.session import SaklasSession
 
 
 # ---------------------------------------------------------------------------
@@ -40,7 +44,7 @@ def _make_result(text: str, applied: str | None = None) -> GenerationResult:
     )
 
 
-def _stub_generate_core(session, *, capture: list):
+def _stub_generate_core(session: SaklasSession, *, capture: list[Any]) -> None:
     """Replace ``session._generate_core`` with a stub that records calls.
 
     Returns one ``GenerationResult`` per call carrying the call's index
@@ -50,7 +54,7 @@ def _stub_generate_core(session, *, capture: list):
     """
     counter = {"n": 0}
 
-    def _fake(input, *, steering=None, sampling=None, stateless=False, raw=False, thinking=None, on_token=None, **kwargs):
+    def _fake(input: Any, *, steering: Any = None, sampling: Any = None, stateless: bool = False, raw: bool = False, thinking: Any = None, on_token: Any = None, **kwargs: Any) -> GenerationResult:
         # ``kwargs`` swallows additions to ``_generate_core``'s signature
         # (v2.3 added ``parent_node_id`` and ``recipe_override``) so this
         # stub doesn't churn every time the core gains a new optional
@@ -81,7 +85,7 @@ class TestGenerateBatch:
 
     def test_returns_results_in_prompt_order(self) -> None:
         s = self._session()
-        capture: list = []
+        capture: list[Any] = []
         _stub_generate_core(s, capture=capture)
 
         prompts = ["alpha", "beta", "gamma"]
@@ -93,7 +97,7 @@ class TestGenerateBatch:
 
     def test_steering_passes_through_unchanged(self) -> None:
         s = self._session()
-        capture: list = []
+        capture: list[Any] = []
         _stub_generate_core(s, capture=capture)
 
         s.generate_batch(["p1", "p2"], steering="0.3 honest")
@@ -102,7 +106,7 @@ class TestGenerateBatch:
 
     def test_on_result_callback_fires_per_completion(self) -> None:
         s = self._session()
-        capture: list = []
+        capture: list[Any] = []
         _stub_generate_core(s, capture=capture)
 
         seen: list[tuple[int, str]] = []
@@ -120,6 +124,93 @@ class TestGenerateBatch:
 
 
 # ---------------------------------------------------------------------------
+# Prefix-cache eligibility — the predicates that decide whether a batch can
+# share one prefill.  CPU-only: they only read steering triggers, no model.
+# ---------------------------------------------------------------------------
+
+
+class TestPrefixCacheEligibility:
+    def _session(self):
+        from saklas.core.session import SaklasSession
+
+        return SaklasSession.__new__(SaklasSession)
+
+    @pytest.mark.parametrize(
+        "expr, expected_inactive",
+        [
+            (None, True),                          # no steering → reusable
+            ("0.5 honest", False),                 # default BOTH steers prefill
+            ("0.5 honest@response", True),         # response-phase: prompt untouched
+            ("0.5 honest@generated", True),        # decode-only
+            ("0.5 honest@after", True),            # after-N: prompt=False
+            ("0.5 honest@prompt", False),          # prompt-phase steers prefill
+            ("0.5 honest@both", False),            # explicit both
+            ("0.5 honest@when:honest.deceptive>0.4", True),  # probe-gated: inactive in prefill
+        ],
+    )
+    def test_steering_value_prefill_inactive(
+        self, expr: "str | None", expected_inactive: bool,
+    ) -> None:
+        s = self._session()
+        assert s._steering_value_prefill_inactive(expr) is expected_inactive
+
+    def test_mixed_terms_active_if_any_steers_prefill(self) -> None:
+        # One response-phase term + one default-BOTH term → prefill IS steered.
+        s = self._session()
+        assert s._steering_value_prefill_inactive("0.5 honest@response + 0.3 warm") is False
+
+    def test_malformed_expression_treated_as_active(self) -> None:
+        # A parse failure is conservatively prefill-active so the caller skips
+        # caching and lets the normal path surface the error.
+        s = self._session()
+        assert s._steering_value_prefill_inactive("0.5 !nope~bad") is False
+
+    def test_active_in_prefill_reads_the_live_stack(self) -> None:
+        from saklas.core.triggers import Trigger
+
+        s = self._session()
+        s._steering_stack = []
+        assert s._steering_active_in_prefill() is False
+        # Response-phase entry (prompt=False) → prefill untouched.
+        s._steering_stack = [{"honest": (0.5, Trigger.GENERATED_ONLY)}]
+        assert s._steering_active_in_prefill() is False
+        # Default BOTH entry → prefill steered.
+        s._steering_stack = [{"honest": (0.5, Trigger.BOTH)}]
+        assert s._steering_active_in_prefill() is True
+        # A probe-gated trigger reports inactive during prefill.
+        gated = Trigger.when("honest.deceptive", ">", 0.4)
+        s._steering_stack = [{"honest": (0.5, gated)}]
+        assert s._steering_active_in_prefill() is False
+
+    def test_batch_common_prefix_detection_keeps_scalar_walk_on_cpu(self) -> None:
+        import torch
+
+        s = self._session()
+        common = list(range(32))
+
+        def _prepare_input(
+            input: Any,
+            raw: bool = False,
+            thinking: bool = False,
+            stateless: bool = False,
+            parent_node_id: str | None = None,
+            user_role: str | None = None,
+            assistant_role: str | None = None,
+            to_device: bool = True,
+        ) -> torch.Tensor:
+            suffix = 100 if input == "a" else 101
+            return torch.tensor([common + [suffix]], dtype=torch.long)
+
+        cast(Any, s)._prepare_input = _prepare_input
+
+        prefix = s._batch_common_prefix_ids(["a", "b"], raw=False)
+
+        assert prefix is not None
+        assert prefix.device.type == "cpu"
+        assert prefix.tolist() == common
+
+
+# ---------------------------------------------------------------------------
 # session.generate_sweep — Cartesian product, applied_steering receipts.
 # ---------------------------------------------------------------------------
 
@@ -133,7 +224,7 @@ class TestGenerateSweep:
 
     def test_single_concept_sweep_yields_one_per_alpha(self) -> None:
         s = self._session()
-        capture: list = []
+        capture: list[Any] = []
         _stub_generate_core(s, capture=capture)
 
         results = s.generate_sweep(
@@ -152,7 +243,7 @@ class TestGenerateSweep:
 
     def test_two_concept_grid_full_product(self) -> None:
         s = self._session()
-        capture: list = []
+        capture: list[Any] = []
         _stub_generate_core(s, capture=capture)
 
         s.generate_sweep(
@@ -173,7 +264,7 @@ class TestGenerateSweep:
 
     def test_base_steering_composes_under_swept_terms(self) -> None:
         s = self._session()
-        capture: list = []
+        capture: list[Any] = []
         _stub_generate_core(s, capture=capture)
 
         s.generate_sweep(
@@ -190,7 +281,7 @@ class TestGenerateSweep:
 
     def test_on_result_carries_alpha_values(self) -> None:
         s = self._session()
-        capture: list = []
+        capture: list[Any] = []
         _stub_generate_core(s, capture=capture)
 
         seen: list[tuple[int, dict[str, float]]] = []
@@ -207,7 +298,7 @@ class TestGenerateSweep:
 
     def test_applied_steering_round_trips_canonical(self) -> None:
         s = self._session()
-        capture: list = []
+        capture: list[Any] = []
         _stub_generate_core(s, capture=capture)
 
         results = s.generate_sweep(
@@ -283,11 +374,11 @@ def fan_client():
     session = _mock_session_for_server()
 
     # Stub generate_sweep to return the standardized RunSet shape.
-    def _fake_sweep(prompt, sweep, *, base_steering=None, sampling=None,
-                   thinking=None, stateless=True, raw=False, on_result=None,
-                   parent_node_id=None, **kwargs):
-        results: list = []
-        node_ids: list = []
+    def _fake_sweep(prompt: Any, sweep: Any, *, base_steering: Any = None, sampling: Any = None,
+                   thinking: Any = None, stateless: bool = True, raw: bool = False, on_result: Any = None,
+                   parent_node_id: Any = None, **kwargs: Any) -> RunSet:
+        results: list[GenerationResult] = []
+        node_ids: list[Any] = []
         grid: list[dict[str, float]] = []
         idx = 0
         # Simple linearization: walk the first concept's alphas.
@@ -310,7 +401,7 @@ def fan_client():
 
 
 class TestExperimentFanEndpoint:
-    def test_fan_returns_rows_and_node_ids(self, fan_client) -> None:
+    def test_fan_returns_rows_and_node_ids(self, fan_client: Any) -> None:
         _session, client = fan_client
 
         body = {
@@ -335,19 +426,19 @@ class TestExperimentFanEndpoint:
             assert row["node_id"] == f"NODE_{i}"
             assert "applied_steering" in row["result"]
 
-    def test_fan_empty_grid_returns_400(self, fan_client) -> None:
+    def test_fan_empty_grid_returns_400(self, fan_client: Any) -> None:
         _session, client = fan_client
         body = {"prompt": "x", "grid": {}}
         r = client.post("/saklas/v1/sessions/default/experiments/fan", json=body)
         assert r.status_code == 400
 
-    def test_fan_empty_alpha_list_returns_400(self, fan_client) -> None:
+    def test_fan_empty_alpha_list_returns_400(self, fan_client: Any) -> None:
         _session, client = fan_client
         body = {"prompt": "x", "grid": {"a": []}}
         r = client.post("/saklas/v1/sessions/default/experiments/fan", json=body)
         assert r.status_code == 400
 
-    def test_fan_unknown_session_returns_404(self, fan_client) -> None:
+    def test_fan_unknown_session_returns_404(self, fan_client: Any) -> None:
         _session, client = fan_client
         body = {"prompt": "x", "grid": {"a": [0.0]}}
         r = client.post("/saklas/v1/sessions/missing/experiments/fan", json=body)

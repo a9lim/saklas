@@ -10,7 +10,7 @@ mock).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable, Protocol, runtime_checkable
+from typing import Any, Callable, Protocol, runtime_checkable
 
 import torch
 
@@ -86,7 +86,7 @@ class SaeLensBackend:
     release: str
     revision: str | None
     layers: frozenset[int]
-    _saes_by_layer: dict[int, "object"] = field(repr=False)
+    _saes_by_layer: dict[int, Any] = field(repr=False)
     sae_ids_by_layer: dict[str, str] = field(default_factory=dict)
 
     def encode_layer(self, idx: int, h: torch.Tensor) -> torch.Tensor:
@@ -118,12 +118,12 @@ def load_sae_backend(
     )
 
     try:
-        import sae_lens  # type: ignore[import-not-found]
-    except ImportError:
+        import sae_lens
+    except ImportError as e:
         raise SaeBackendImportError(
             f"requested SAE release '{release}' but `sae_lens` is not "
             f"installed. Install with `pip install -e \".[sae]\"`."
-        )
+        ) from e
     if sae_lens is None:
         # Tests (and some environments) may None-shadow the module.
         raise SaeBackendImportError(
@@ -131,7 +131,7 @@ def load_sae_backend(
             f"installed. Install with `pip install -e \".[sae]\"`."
         )
 
-    registry = sae_lens.get_pretrained_saes_directory()
+    registry = sae_lens.get_pretrained_saes_directory()  # pyright: ignore[reportAttributeAccessIssue]  # sae_lens optional dep; no stubs
     if release not in registry:
         import difflib
         all_releases = list(registry.keys())
@@ -160,16 +160,17 @@ def load_sae_backend(
         )
 
     layers: set[int] = set()
-    saes_by_layer: dict[int, object] = {}
+    saes_by_layer: dict[int, Any] = {}
     ids_by_layer: dict[str, str] = {}
     for sae_id, hook_layer in _canonical_layer_map(saes_map).items():
-        sae, cfg_dict, _sparsity = sae_lens.SAE.from_pretrained(
+        sae, cfg_dict, _sparsity = sae_lens.SAE.from_pretrained(  # pyright: ignore[reportAttributeAccessIssue]  # sae_lens optional dep; no stubs
             release=release,
             sae_id=sae_id,
             device=str(device),
         )
+        cfg_dict_any: Any = cfg_dict  # sae_lens SAEConfig has no stubs; treat as Any
         # Prefer the cfg's hook_layer if the registry and cfg disagree.
-        layer_idx = int(cfg_dict.get("hook_layer", hook_layer))
+        layer_idx = int(cfg_dict_any.get("hook_layer", hook_layer))
         layers.add(layer_idx)
         saes_by_layer[layer_idx] = sae
         ids_by_layer[str(layer_idx)] = sae_id
@@ -188,7 +189,7 @@ def load_sae_backend(
     )
 
 
-def _canonical_layer_map(saes_map: dict) -> dict[str, int]:
+def _canonical_layer_map(saes_map: dict[str, Any]) -> dict[str, int]:
     """Pick one sae_id per layer. Prefer narrowest width; warn on ambiguity.
 
     SAELens releases that ship multiple SAEs per layer (different widths, L0s)

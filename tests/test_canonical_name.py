@@ -5,10 +5,14 @@ Bipolar separator is `.` (see saklas.session.BIPOLAR_SEP).
 """
 from __future__ import annotations
 
+from typing import Any
+
 from saklas.core.session import (
     SaklasSession,
     _humanize_concept,
+    _role_for,
     _split_composite_source,
+    _system_for,
     canonical_concept_name,
 )
 
@@ -61,44 +65,21 @@ class TestHumanize:
         # Slug path is the identifier; humanize is for LLM prompts only.
         assert canonical_concept_name("artificial_intelligence") == "artificial_intelligence"
 
-    def test_scenarios_prompt_uses_humanized_form(self):
-        """Underscored slugs become spaces in the LLM-facing prompt."""
-        captured = {}
+    def test_system_for_humanizes_and_keys_on_kind(self):
+        """The A2 system prompt humanizes the slug and switches on kind."""
+        abstract = _system_for("artificial intelligence", "abstract")
+        assert "someone artificial intelligence" in abstract
+        assert "artificial_intelligence" not in abstract
+        concrete = _system_for("alien", "concrete")
+        assert "an alien" in concrete          # a/an article
+        assert "someone" not in concrete
 
-        class _FakeSession(SaklasSession):
-            def __init__(self):  # bypass real construction
-                pass
-
-            def _run_generator(self, system_msg, prompt, max_new_tokens):
-                captured["prompt"] = prompt
-                return "\n".join(f"{i}. domain {i}" for i in range(1, 10))
-
-        _FakeSession().generate_scenarios(
-            "artificial_intelligence", baseline=None, n=9,
+    def test_role_for_kind(self):
+        """Abstract -> someone_<slug>; concrete -> bare slug."""
+        assert _role_for("artificial_intelligence", "abstract") == (
+            "someone_artificial_intelligence"
         )
-        prompt = captured["prompt"]
-        assert "artificial intelligence" in prompt
-        assert "artificial_intelligence" not in prompt
-
-    def test_scenarios_prompt_humanizes_baseline(self):
-        captured = {}
-
-        class _FakeSession(SaklasSession):
-            def __init__(self):
-                pass
-
-            def _run_generator(self, system_msg, prompt, max_new_tokens):
-                captured["prompt"] = prompt
-                return "\n".join(f"{i}. domain {i}" for i in range(1, 10))
-
-        _FakeSession().generate_scenarios(
-            "high_context", baseline="low_context", n=9,
-        )
-        prompt = captured["prompt"]
-        assert "high context" in prompt
-        assert "low context" in prompt
-        assert "high_context" not in prompt
-        assert "low_context" not in prompt
+        assert _role_for("pirate", "concrete") == "pirate"
 
     def test_split_composite_source_splits_on_dot(self):
         # Composite "pos.neg" with no baseline: split into distinct poles.
@@ -120,25 +101,33 @@ class TestHumanize:
     def test_split_composite_source_strips_whitespace(self):
         assert _split_composite_source("human . ai", None) == ("human", "ai")
 
-    def test_pairs_prompt_uses_humanized_form(self):
-        captured = {}
+    def test_generate_responses_humanizes_and_sets_role(self, monkeypatch: Any):
+        """generate_responses humanizes the system prompt + sets the kind role."""
+        from saklas.core import vectors as V
+        monkeypatch.setattr(
+            V, "_load_baseline_prompts", lambda: ["How are you today?"],
+        )
+        captured: dict[str, Any] = {}
 
         class _FakeSession(SaklasSession):
-            def __init__(self):
+            def __init__(self) -> None:
                 pass
 
-            def _run_generator(self, system_msg, prompt, max_new_tokens):
-                captured.setdefault("prompts", []).append(prompt)
-                return (
-                    "1a. Statement one.\n1b. Statement two.\n"
-                    "2a. Statement three.\n2b. Statement four.\n"
-                )
+            def _run_generator_batch(self, system_msg: str, prompts: list[str], max_new_tokens: int, **kw: Any) -> list[str]:
+                captured["system"] = system_msg
+                captured["role"] = kw.get("role")
+                captured.setdefault("prompts", []).extend(prompts)
+                return ["a generated in-character response" for _ in prompts]
 
-        _FakeSession().generate_pairs(
-            "artificial_intelligence",
-            baseline=None, n=2, scenarios=["a domain"],
+        out = _FakeSession().generate_responses(
+            ["artificial_intelligence"], ["abstract"], samples_per_prompt=2,
         )
-        assert captured["prompts"], "pair generator was not invoked"
-        prompt = captured["prompts"][0]
-        assert "artificial intelligence" in prompt
-        assert "artificial_intelligence" not in prompt
+        assert "someone artificial intelligence" in captured["system"]
+        assert "artificial_intelligence" not in captured["system"]
+        assert captured["role"] == "someone_artificial_intelligence"
+        # 2 samples x 1 baseline prompt = 2 responses, each paired with the bare
+        # prompt (the shared brevity directive rides the system prompt instead).
+        from saklas.core.vectors import _LENGTH_DIRECTIVE
+        assert len(out["artificial_intelligence"]) == 2
+        assert captured["prompts"] == ["How are you today?", "How are you today?"]
+        assert captured["system"].startswith(_LENGTH_DIRECTIVE)

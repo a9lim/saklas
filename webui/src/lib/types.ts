@@ -21,8 +21,15 @@ export type Trigger =
   | "PROMPT" // alias of BEFORE
   | "GENERATED"; // alias of RESPONSE
 
-/** SAE variant suffix — ``raw`` (default), ``sae`` (unique), ``sae-<release>``. */
-export type Variant = "raw" | "sae" | `sae-${string}`;
+/** Tensor variant suffix from the shared steering grammar. */
+export type Variant =
+  | "raw"
+  | "sae"
+  | `sae-${string}`
+  | "role"
+  | `role-${string}`
+  | "from"
+  | `from-${string}`;
 
 // ----------------------------------------------------- session info --
 
@@ -60,6 +67,428 @@ export interface SessionInfo {
    * ``_TESTED_ARCHS``.  Server may or may not populate this; clients
    * should tolerate ``undefined``. */
   architecture?: string;
+  /** True iff the loaded model has no chat template — generation runs
+   *  as flat completion (no roles, no bubbles).  Older servers omit
+   *  this; clients treat ``undefined`` as ``false`` (chat model). */
+  is_base_model?: boolean;
+  /** True iff the loaded model family supports assistant-role
+   *  substitution (Qwen / Gemma / Llama / GLM / gpt-oss yes; Mistral /
+   *  talkie no). Drives whether the roles control is enabled. Older
+   *  servers omit this; treat ``undefined`` as ``false``. */
+  role_substitution_supported?: boolean;
+  /** True iff the family supports *user*-role substitution. Same family
+   *  set as the assistant side today. Treat ``undefined`` as ``false``. */
+  user_role_supported?: boolean;
+  /** The family's *standard* assistant-role label (e.g. Gemma ``model``,
+   *  ChatML ``assistant``), or ``null``/``undefined`` when the family can't
+   *  substitute the assistant side.  Seeds the assistant-role box so it
+   *  shows the live default; a box value equal to this is treated as "no
+   *  override" on send. */
+  default_assistant_role?: string | null;
+  /** The family's *standard* user-role label (``user`` everywhere today),
+   *  or ``null``/``undefined`` when unsupported.  Seeds the user-role box. */
+  default_user_role?: string | null;
+}
+
+// ----------------------------------------------------- manifolds --
+
+/** One axis of a Box manifold domain.  ``periodic`` axes wrap (the
+ *  authoring coordinate is taken mod ``period``); open axes clamp to
+ *  ``[lo, hi]``. */
+export interface AxisSpec {
+  name: string;
+  periodic: boolean;
+  /** Period of a periodic axis — server canonicalizes; for an open
+   *  axis this is typically ``hi - lo``. */
+  period: number;
+  lo: number;
+  hi: number;
+}
+
+/** Geometry of a steering manifold's authoring domain.  ``box`` carries
+ *  per-axis specs (1D/2D/3D in the webui builder); ``sphere`` is S^dim
+ *  with a chordal metric; ``custom`` is the JSON-authored escape hatch
+ *  the webui shows read-only. */
+export type ManifoldDomain =
+  | { type: "box"; axes: AxisSpec[] }
+  | { type: "sphere"; dim: number }
+  | { type: "custom"; [key: string]: unknown };
+
+/** One node of a manifold — a label, its authoring coordinates (one
+ *  per intrinsic dimension), and the statement corpus pooled into its
+ *  centroid. */
+export interface ManifoldNodeSpec {
+  label: string;
+  coords: number[];
+  statements: string[];
+  /** Optional per-node assistant-role substitution.  When set, this
+   *  node's centroid is pooled with the chat-template's assistant-role
+   *  label replaced by this slug — the persona-manifold building block
+   *  that lets one fitted manifold span multiple personas in
+   *  role-baselined activation space.  Slug must match
+   *  ``[a-z0-9._-]+``.  Omit / leave empty for the standard assistant
+   *  baseline (the legacy default).  Family-unsupported (Mistral-3 /
+   *  talkie) raises at fit time. */
+  role?: string | null;
+}
+
+/** PCA discover-fit diagnostics block surfaced in the inspector.
+ *  Wire-shape mirror of ``saklas.core.manifold.PcaDiagnostics``.  Tensor
+ *  fields are flattened to plain number[]'s server-side; everything
+ *  else is a primitive. */
+export interface ManifoldPcaDiagnostics {
+  per_component_variance: number[];
+  cumulative_variance: number[];
+  picked_k: number;
+  threshold: number;
+}
+
+/** Spectral (Laplacian-eigenmaps) discover-fit diagnostics block.
+ *  Wire-shape mirror of ``saklas.core.manifold.SpectralDiagnostics``. */
+export interface ManifoldSpectralDiagnostics {
+  eigenvalues: number[];
+  picked_k: number;
+  gap_index: number;
+  gap_magnitude: number;
+  bandwidth: number;
+  k_nn: number;
+  component_count: number;
+}
+
+/** Per-model fit record returned in the manifold detail shape.
+ *
+ *  ``fit_mode`` ``"authored"`` means the user supplied per-node coords;
+ *  ``"pca"`` / ``"spectral"`` mean the coords were derived per-model at
+ *  fit time and live in the safetensors payload, with ``diagnostics``
+ *  giving the variance bars or spectrum the inspector renders. */
+export interface ManifoldFitInfo {
+  stem: string;
+  method: string;
+  feature_space: string;
+  node_count: number;
+  nodes_sha256?: string;
+  /** Discriminator: ``authored`` for hand-placed coords, ``pca`` /
+   *  ``spectral`` for coords derived from per-node activations, ``baked``
+   *  for a corpus-less precomputed direction.  Older servers may omit
+   *  this; treat ``undefined`` as ``"authored"``. */
+  fit_mode?: "authored" | "pca" | "spectral" | "auto" | "baked";
+  /** Discover-mode only.  ``max_dim``/``var_threshold`` for PCA;
+   *  ``max_dim``/``k_nn``/``bandwidth``/``reference_layer`` for spectral. */
+  hyperparams?: Record<string, number | string>;
+  /** Discover-mode only.  Method-tagged via ``picked_k`` + presence of
+   *  ``per_component_variance`` (PCA) vs ``eigenvalues`` (spectral). */
+  diagnostics?: ManifoldPcaDiagnostics | ManifoldSpectralDiagnostics;
+}
+
+/** Manifold list/detail row.  The list route omits ``nodes``'
+ *  statements and ``fitted``; the detail route includes both. */
+export interface ManifoldInfo {
+  namespace: string;
+  name: string;
+  description: string;
+  domain: ManifoldDomain;
+  domain_label: string;
+  intrinsic_dim: number;
+  min_nodes: number;
+  node_count: number;
+  node_labels: string[];
+  node_coords: number[][];
+  /** Per-node assistant-role substitution recorded on the manifold,
+   *  aligned with ``node_labels``.  ``null`` for a given node means
+   *  "pooled under the standard assistant baseline" (the legacy
+   *  default).  An all-``null`` array (or absent) marks a non-role
+   *  manifold; any non-``null`` entry marks a persona / role-paired
+   *  manifold. */
+  node_roles?: (string | null)[];
+  fitted_models: string[];
+  /** True iff a tensor for the loaded session model is present. */
+  fitted_for_session: boolean;
+  /** True iff a fitted tensor's ``nodes_sha256`` no longer matches the
+   *  current node geometry — the fit is stale and should be re-run. */
+  stale: boolean;
+  /** Discriminator: ``authored`` for hand-placed coords, ``pca`` /
+   *  ``spectral`` for coords derived per-model from activations, ``auto``
+   *  for a discover folder whose flat-vs-curved geometry is resolved
+   *  per-model at fit time, ``baked`` for a corpus-less precomputed
+   *  direction.  Older servers may omit this; treat ``undefined`` as
+   *  ``"authored"``. */
+  fit_mode?: "authored" | "pca" | "spectral" | "auto" | "baked";
+  /** The geometry an ``auto`` folder resolved to for the loaded model —
+   *  ``"pca"`` (flat) / ``"spectral"`` (curved) once fitted, ``null`` when
+   *  not yet fitted (geometry unknown → show in both rack drawers).  For a
+   *  non-``auto`` folder this mirrors ``fit_mode``.  Absent on older
+   *  servers. */
+  resolved_fit_mode?: "pca" | "spectral" | "authored" | "baked" | null;
+  /** True for ``pca`` / ``spectral`` (coords derived per-model), false
+   *  for ``authored``.  Server-supplied; absent on older servers. */
+  is_discover?: boolean;
+  /** Category-valued tags off ``manifold.json`` (e.g. ``register`` /
+   *  ``cultural``).  Drives the category grouping in the shared RackDrawer.
+   *  NOTE: the ``GET /manifolds`` list serializer currently omits this
+   *  (``manifold_summary`` doesn't emit ``tags``), so it's usually
+   *  absent on the wire today — grouping degrades to "Other" until the
+   *  server adds the field. */
+  tags?: string[];
+  /** Resting steering coefficient hint for a concept axis.  Read by
+   *  ``recommendedAlpha`` (defaults to 0.5 when absent).  Not currently
+   *  emitted by the list serializer — provenance for a future field. */
+  recommended_alpha?: number;
+  /** Discover-mode only: the knobs the fit (will) use.  Empty / absent
+   *  on authored folders.  PCA accepts ``max_dim`` / ``var_threshold``;
+   *  spectral accepts ``max_dim`` / ``k_nn`` / ``bandwidth``. */
+  hyperparams?: Record<string, number | string>;
+  /** Detail-only: full node specs with statement corpora.  In discover
+   *  mode each node's ``coords`` is either the derived per-model layout
+   *  (when a fit exists) or ``null`` (pending fit). */
+  nodes?: (ManifoldNodeSpec | { label: string; coords: number[] | null; statements: string[] })[];
+  /** Detail-only: per-tensor fit records. */
+  fitted?: ManifoldFitInfo[];
+}
+
+export interface ManifoldListResponse {
+  manifolds: ManifoldInfo[];
+}
+
+/** One HF search-row carrying enough metadata to render a result row
+ *  without an extra round-trip.  Mirrors the pack-side ``RemotePackInfo``
+ *  but trades pack-specific fields (``recommended_alpha``,
+ *  ``tensor_models``-via-pack-format) for the manifold-specific ones
+ *  the picker needs (``domain_label``, ``node_count``, ``fit_mode``). */
+export interface RemoteManifoldInfo {
+  /** Concept slug on HF (``<name>`` half of ``<ns>/<name>``). */
+  name: string;
+  /** HF owner (``<ns>`` half of ``<ns>/<name>``). */
+  namespace: string;
+  description: string;
+  tags: string[];
+  node_count: number;
+  /** Short ``type(Nd)`` label — ``box(2d)``, ``sphere(3d)``,
+   *  ``discover-pca``, etc. */
+  domain_label: string;
+  /** ``"authored"``/``"pca"``/``"spectral"`` — the folder's fit-mode
+   *  discriminator. */
+  fit_mode: string;
+  /** Safe-model-id stems with a fitted tensor in the HF repo.  Same
+   *  shape ``RemotePackInfo.tensor_models`` carries. */
+  tensor_models: string[];
+}
+
+/** Body for POST /saklas/v1/manifolds/install. */
+export interface InstallManifoldRequest {
+  /** HF coord (``owner/repo[@revision]``) or local folder path. */
+  target: string;
+  /** Override the install destination (``<ns>/<name>``).  Wire field is
+   *  ``as_`` since ``as`` is a Python keyword — matches the route
+   *  body model. */
+  as_?: string;
+  force?: boolean;
+}
+
+/** One source folder in a manifold merge — fully qualified ``ns/name``. */
+export interface MergeManifoldSource {
+  namespace: string;
+  name: string;
+}
+
+/** Body for POST /saklas/v1/manifolds/merge.
+ *
+ *  Restricted to discover-mode (autofitted) sources by design — the
+ *  server unions their node corpora into one heap and writes a fresh
+ *  unfitted discover folder.  Run ``apiManifoldFitStream`` against the
+ *  merged folder to derive coords from the combined heap.
+ */
+export interface MergeManifoldRequest {
+  /** Destination namespace (defaults to ``"local"`` server-side). */
+  namespace?: string;
+  /** Destination manifold name. */
+  name: string;
+  description?: string;
+  /** ≥ 2 discover-mode source folders. */
+  sources: MergeManifoldSource[];
+  /** Override the merged folder's fit_mode.  Required when sources
+   *  disagree; defaults to the shared mode otherwise. */
+  fit_mode?: "pca" | "spectral";
+  hyperparams?: Record<string, unknown>;
+  force?: boolean;
+}
+
+/** Body for POST /saklas/v1/manifolds. */
+export interface CreateManifoldRequest {
+  namespace?: string;
+  name: string;
+  description: string;
+  domain: ManifoldDomain;
+  nodes: ManifoldNodeSpec[];
+}
+
+/** Body for PATCH /saklas/v1/manifolds/{ns}/{name}. */
+export interface UpdateManifoldRequest {
+  description?: string;
+  nodes?: ManifoldNodeSpec[];
+}
+
+/** One node of a discover-mode manifold — label + statements only.
+ *  Coords are derived per-model at fit time, so the authoring shape
+ *  carries no ``coords`` field. */
+export interface DiscoverManifoldNodeSpec {
+  label: string;
+  statements: string[];
+  /** Optional per-node assistant-role substitution; see
+   *  :class:`ManifoldNodeSpec` for semantics. */
+  role?: string | null;
+}
+
+/** Body for POST /saklas/v1/manifolds/discover.
+ *
+ *  The user supplies labeled statement corpora; the matching ``fit``
+ *  call derives node coordinates per-model via PCA, spectral embedding,
+ *  or ``auto`` (let ``select_topology`` pick the geometry per-model). */
+export interface CreateDiscoverManifoldRequest {
+  namespace?: string;
+  name: string;
+  description?: string;
+  fit_mode: "pca" | "spectral" | "auto";
+  nodes: DiscoverManifoldNodeSpec[];
+  hyperparams?: Record<string, number | string>;
+}
+
+/** One ``{user, assistant}`` chat-turn template. The slot token lives in
+ *  the assistant turn (read off its last content token); the user turn is
+ *  shared common-mode across nodes and carries no slot. */
+export interface TemplatePairSpec {
+  user: string;
+  assistant: string;
+}
+
+/** Body for POST /saklas/v1/manifolds/templated.
+ *
+ *  Author a *templated* discover manifold: the server fills ``slot`` across
+ *  ``values`` (one node per value) over every ``pairs`` template, so the node
+ *  corpora are the slot-filled assistant turns and the templates' user turns
+ *  become the per-manifold elicitation prompts the fit pools against. The
+ *  tool for categories one references rather than embodies — days, months,
+ *  colours, directions. Pair with ``POST .../fit`` (``fit_mode`` auto suits
+ *  cyclic categories). */
+export interface CreateTemplatedManifoldRequest {
+  namespace?: string;
+  name: string;
+  description?: string;
+  fit_mode: "pca" | "spectral" | "auto";
+  slot: string;
+  values: string[];
+  pairs: TemplatePairSpec[];
+  hyperparams?: Record<string, number | string>;
+}
+
+// ---- standalone templated-completion artifact (/saklas/v1/templates) ----
+
+/** One turn in a template context's multi-turn history. */
+export interface TemplateTurn {
+  role: "system" | "user" | "assistant";
+  content: string;
+}
+
+/** A multi-turn context: history turns + the slotted final assistant turn.
+ *  The slot appears exactly once in ``assistant`` and never in a history turn. */
+export interface TemplateContextSpec {
+  turns: TemplateTurn[];
+  assistant: string;
+}
+
+/** Body for POST /saklas/v1/templates — author a standalone template. */
+export interface CreateTemplateRequest {
+  namespace?: string;
+  name: string;
+  slot: string;
+  values: string[];
+  contexts: TemplateContextSpec[];
+  description?: string;
+  tags?: string[];
+  force?: boolean;
+}
+
+/** A template list-row / summary. */
+export interface TemplateSummary {
+  namespace: string;
+  name: string;
+  slot: string;
+  n_values: number;
+  n_contexts: number;
+  values: string[];
+  labels: string[];
+  description: string;
+  tags: string[];
+}
+
+/** A template detail (summary + the full contexts). */
+export interface TemplateDetail extends TemplateSummary {
+  contexts: TemplateContextSpec[];
+}
+
+/** One candidate's score within a context's distribution. */
+export interface ChoiceScore {
+  text: string;
+  label: string;
+  n_tokens: number;
+  sum_logprob: number;
+  mean_logprob: number;
+  prob_sum: number;
+  prob_mean: number;
+}
+
+/** One context's restricted-choice distribution. */
+export interface ChoiceScores {
+  steering: string | null;
+  choices: ChoiceScore[];
+}
+
+/** Response from POST /saklas/v1/templates/{ns}/{name}/score. */
+export interface ScoreTemplateResponse {
+  template: string;
+  namespace: string;
+  steering: string | null;
+  contexts: ChoiceScores[];
+}
+
+/** Body for POST /saklas/v1/manifolds/generate.
+ *
+ *  LLM-author a discover-mode manifold from a flat concept list: the
+ *  server runs ``SaklasSession.generate_responses`` (A2 conversational
+ *  extraction — each concept answers the shared baseline prompts in
+ *  character, one corpus per node) and writes a fresh discover folder
+ *  ready for ``POST .../fit``. */
+export interface GenerateManifoldRequest {
+  namespace?: string;
+  name: string;
+  description?: string;
+  concepts: string[];
+  /** Per-concept system-prompt framing: ``abstract`` → "someone {c}",
+   *  ``concrete`` → "{article} {c}".  Default abstract. */
+  kind?: "abstract" | "concrete";
+  /** In-character responses generated per shared baseline prompt. */
+  samples_per_prompt?: number;
+  fit_mode?: "pca" | "spectral" | "auto";
+  hyperparams?: Record<string, number | string>;
+  force?: boolean;
+  /** Persona-manifold opt-in: each ``concepts[i]`` slug doubles as
+   *  that node's assistant-role substitution at fit time, producing a
+   *  role-paired manifold.  Steering through it implies the nearest
+   *  node's role at decode time (the manifold lives in
+   *  role-baselined activation space). */
+  role_per_node?: boolean;
+}
+
+/** Body for POST /saklas/v1/manifolds/{ns}/{name}/fit.
+ *
+ *  Authored folders only consume ``sae`` / ``sae_revision``; discover
+ *  folders additionally accept ``fit_mode`` / ``hyperparams`` overrides
+ *  that get persisted into the folder before the fit runs so the cache
+ *  key reflects the actual inputs. */
+export interface FitManifoldRequest {
+  sae?: string | null;
+  sae_revision?: string | null;
+  fit_mode?: "pca" | "spectral" | "auto" | null;
+  hyperparams?: Record<string, number | string> | null;
 }
 
 // ----------------------------------------------------- vectors --
@@ -87,10 +516,29 @@ export interface ExtractRequest {
    * or a {pairs: [{positive, negative}, ...]} bundle. */
   source?: unknown;
   baseline?: string | null;
-  method?: "dim" | "pca" | null;
   dls?: boolean | null;
   sae?: string | null;
   sae_revision?: string | null;
+  /** Role-augmented extraction: replace the assistant-role label in
+   * the chat template with this slug at extract time (e.g. "pirate").
+   * The same substitution rides at steer time so the extract baseline
+   * matches the steer baseline.  The tensor lands under a
+   * ``_role-<slug>`` filename suffix and is steerable via the matching
+   * ``:role-<slug>`` variant.  Slug must match ``[a-z0-9._-]+``;
+   * mutually exclusive with ``sae``. */
+  role?: string | null;
+  /** Destination namespace for the extracted vector folder.  ``null`` /
+   *  unset lands the vector under ``~/.saklas/vectors/local/<canonical>/``
+   *  — the historical behavior.  Any other value relocates the folder
+   *  to ``~/.saklas/vectors/<namespace>/<canonical>/``.  Parity with
+   *  the manifold builder's namespace control. */
+  namespace?: string | null;
+  /** Force a fresh extraction even if a cached tensor / statements
+   *  file exists at the destination.  Wires to the engine's
+   *  ``force_statements`` flag.  Default ``false`` keeps the cache-hit
+   *  short-circuit.  Parity with the manifold builder's overwrite
+   *  control. */
+  force?: boolean;
   register?: boolean;
 }
 
@@ -100,34 +548,6 @@ export interface ExtractResponse {
   progress: string[];
 }
 
-export interface LoadVectorRequest {
-  name: string;
-  source_path: string;
-}
-
-/** Body for POST /sessions/{id}/vectors/merge — registered output is a
- * derived profile keyed by ``name``. */
-export interface MergeVectorRequest {
-  name: string;
-  expression: string;
-}
-
-export type MergeVectorResponse = VectorInfo;
-
-/** Body for POST /sessions/{id}/vectors/clone — wraps the clone CLI. */
-export interface CloneVectorRequest {
-  name: string;
-  corpus_path: string;
-  n_pairs?: number;
-  seed?: number;
-  baseline?: string | null;
-}
-
-export interface CloneVectorResponse {
-  canonical: string;
-  profile: VectorInfo;
-  progress: string[];
-}
 
 /** Output of GET /sessions/{id}/vectors/{name}/diagnostics — per-layer
  * ``||baked||`` magnitudes + bucket histogram + (optional) probe-quality
@@ -160,27 +580,125 @@ export interface VectorDiagnosticsResponse {
 
 // ----------------------------------------------------- probes --
 
+/** One attached probe — any rank.  The unified read-side row the server's
+ *  ``probe_routes._probe_info`` emits (the pre-4.0 split of vector probes vs
+ *  manifold probes collapsed onto one ``/probes`` collection).  ``is_affine``
+ *  is the flat-vs-curved discriminator the client classifies on: flat probes
+ *  (a 2-node concept axis through the rank-8 personas fan) are the *subspace*
+ *  family, curved fits the *manifold* family. */
 export interface ProbeInfo {
+  /** Registered probe name (defaults to the selector at attach time). */
   name: string;
-  active: boolean;
+  /** Underlying manifold display name (``ns/name`` or bare). */
+  manifold: string;
+  /** Per-token nearest-node list length. */
+  top_n: number;
+  /** Sorted ascending list of layer indices the probe reads from. */
   layers: number[];
+  /** Authoring node labels.  Aligned with ``node_coords`` when fitted. */
+  node_labels: string[];
+  node_count: number;
+  /** Manifold domain spec — same shape as ``ManifoldInfo.domain``.  ``{}``
+   *  for an unfitted discover manifold (``intrinsic_dim = 0`` then). */
+  domain: ManifoldDomain | Record<string, never>;
+  intrinsic_dim: number;
+  /** ``"raw"`` for plain activation space, ``"sae-<release>"`` for SAE. */
+  feature_space: string;
+  /** Flat (affine) ⇒ subspace family; curved ⇒ manifold family. */
+  is_affine: boolean;
+  /** Per-node authoring/display layout (K, n), aligned with ``node_labels``.
+   *  Backs the mini-map node dots + per-token trajectory lookup.  ``null``
+   *  on an unfitted discover manifold (no per-model layout yet). */
+  node_coords?: number[][] | null;
 }
 
 export interface ProbeListResponse {
   probes: ProbeInfo[];
 }
 
+/** Body for ``POST /saklas/v1/sessions/{id}/probes`` — attach any probe
+ *  shape by selector (the same ``[ns/]name[:variant]`` the ``%`` steering
+ *  term consumes). */
+export interface ProbeRequest {
+  selector: string;
+  name?: string;
+  top_n?: number;
+}
+
+// ------------------------------------------------- probe readings --
+
+/** One probe's reading — the single wire shape for *both* the per-token
+ *  stream and the end-of-gen aggregate (the aggregate is the reading pooled
+ *  at the last-content token).  Mirrors
+ *  ``saklas.core.results.ProbeReading.to_dict()``.  ``coords`` is the
+ *  domain-frame position (signed pole-normalized axis-0 at rank-1);
+ *  ``residual`` is ``0`` for a flat (subspace) fit and the normalized
+ *  off-surface distance for a curved (manifold) fit.  Per-layer maps are
+ *  string-keyed by layer index. */
+export interface ProbeReadingJSON {
+  fraction: number;
+  nearest: [string, number][];
+  coords: number[];
+  residual: number;
+  fraction_per_layer: Record<string, number>;
+  coords_per_layer: Record<string, number[]>;
+  residual_per_layer: Record<string, number>;
+  /** Per-layer whitened subspace coords (the live point + trail for the
+   *  probe-inspector geometry plot).  Keyed by layer-index string -> that
+   *  layer's ``(R,)`` whitened coords, in the same frame as the geometry
+   *  endpoint's ``node_white``.  Present only when the generate request set
+   *  ``persist_subspace_coords`` (the inspector being open); absent otherwise. */
+  subspace_coords_per_layer?: Record<string, number[]>;
+}
+
+// ----------------------------------------------------- probe geometry --
+
+/** One fitted layer's geometry for the probe-inspector plot.  All coords
+ *  are in the **whitened (Mahalanobis) frame** — distances are Mahalanobis
+ *  distances and the cloud is de-rogued.  ``rank`` (subspace dimension)
+ *  drives the plot branch: 1 -> line, 2 -> 2D scatter, 3+ -> 3D PCA scatter.
+ *  ``intrinsic_dim`` drives the overlay: 1 -> curve, 2 -> surface, else none. */
+export interface ProbeLayerGeometry {
+  layer: number;
+  rank: number;
+  intrinsic_dim: number;
+  is_affine: boolean;
+  /** (K, R) node centroids in whitened coords, aligned with node_labels. */
+  node_white: number[][];
+  /** (R,) neutral anchor in whitened coords (origin for a flat fit). */
+  neutral_white: number[];
+  /** (R, 3) projection onto the top-3 PCs of the node cloud; null for rank<3. */
+  pca_rotation: number[][] | null;
+  /** Variance share of the top-3 PCs; null for rank<3. */
+  explained_variance_pcs: number[] | null;
+  /** Per-layer Mahalanobis share — the steering budget; also the read weight. */
+  mahalanobis_share: number;
+  /** Curved-fit manifold overlay sampled into the whitened frame, or null. */
+  overlay: ProbeOverlay | null;
+}
+
+export interface ProbeOverlay {
+  kind: "curve" | "surface";
+  /** Sampled points (S, R) for a curve; (nu*nv, R) row-major for a surface. */
+  points: number[][];
+  /** [nu, nv] mesh dims; present for ``kind === "surface"`` only. */
+  grid_shape?: [number, number];
+}
+
+export interface ProbeGeometryResponse {
+  name: string;
+  manifold: string;
+  intrinsic_dim: number;
+  is_affine: boolean;
+  node_labels: string[];
+  /** False when a flat-DLS fit kept a different rank per layer. */
+  rank_uniform: boolean;
+  /** Keyed by layer-index string. */
+  layers: Record<string, ProbeLayerGeometry>;
+}
+
 export interface ProbeDefaultsResponse {
   defaults: string[];
-}
-
-export interface ScoreProbeRequest {
-  text: string;
-  probes?: string[] | null;
-}
-
-export interface ScoreProbeResponse {
-  readings: Record<string, number>;
 }
 
 // ----------------------------------------------------- correlation --
@@ -205,70 +723,6 @@ export interface PairwiseCompareResponse {
   layers_b: number[];
   matrix: (number | null)[][];
   model: string | null;
-}
-
-// ----------------------------------------------------- packs --
-
-export interface LocalPackInfo {
-  name: string;
-  namespace: string;
-  source: "bundled" | "local" | string;
-  description?: string;
-  tags?: string[];
-  layers?: number[];
-  has_tensor?: boolean;
-  has_sae?: boolean;
-  variants?: string[];
-  /** Loose passthrough for fields the server adds later. */
-  [key: string]: unknown;
-}
-
-export interface PackListResponse {
-  packs: LocalPackInfo[];
-}
-
-export interface RemotePackInfo {
-  repo_id: string;
-  description?: string;
-  downloads?: number;
-  likes?: number;
-  tags?: string[];
-  last_modified?: string;
-  /** Loose passthrough — HF rows have many optional fields. */
-  [key: string]: unknown;
-}
-
-export interface PackSearchResponse {
-  query: string;
-  results: RemotePackInfo[];
-}
-
-export interface InstallPackRequest {
-  /** HF coord (``owner/repo``) or local folder path. */
-  target: string;
-  /** Override the install namespace (``-a NS/N`` in the CLI).  Wire field
-   * is ``as`` (Python keyword in code, plain key in JSON). */
-  as?: string;
-  force?: boolean;
-  /** Statements-only install (skip per-model tensor pull). */
-  statements_only?: boolean;
-}
-
-export interface InstallPackResponse {
-  target: string;
-  installed_at: string;
-  statements_only: boolean;
-}
-
-export interface DeletePackResponse {
-  namespace: string;
-  name: string;
-  /** ``"bundled"`` / ``"local"`` / ``"hf://..."``.  Drives the
-   *  toast wording — bundled concepts re-materialize on restart. */
-  source: string;
-  removed: number;
-  /** Bundled concepts respawn on next session init. */
-  rematerializes_on_restart: boolean;
 }
 
 // ----------------------------------------------------- traits SSE --
@@ -307,6 +761,18 @@ export interface WSSampling {
    *  when any on_token consumer is live, just no top alternatives.
    *  Default 0 keeps the wire shape unchanged for opt-out users. */
   return_top_k?: number | null;
+  /** Native dashboard requests this so streamed token rows can rehydrate
+   *  the token-drilldown layer heatmap after a refresh. */
+  persist_per_layer_scores?: boolean | null;
+  /** Native dashboard requests per-layer whitened subspace coords on each
+   *  token's probe reading (the probe-inspector live point + fading trail).
+   *  Set true only while that inspector is open; forces per-token scoring. */
+  persist_subspace_coords?: boolean | null;
+  /** Per-message role-substitution labels (roleplay scaffold).  Ride each
+   *  generate / commit like ``seed``; stamped onto the produced loom nodes
+   *  and rendered per-turn.  null/empty = standard role label. */
+  user_role?: string | null;
+  assistant_role?: string | null;
 }
 
 export interface WSGenerateRequest {
@@ -411,6 +877,12 @@ export interface WSTokenEvent {
   /** Loom: node id this token belongs to.  Routes the token to the right
    * sibling render during n-way regen.  Optional. */
   node_id?: string | null;
+  /** Per-attached-probe reading for this token — every probe shape (a
+   *  2-node concept axis is the rank-1 case).  Keys are probe names; values
+   *  are the full ``ProbeReadingJSON``.  Omitted entirely when no probe is
+   *  attached, so clients read it defensively.  Distinct from ``scores``
+   *  (the magnitude-weighted axis-0 scalar the highlight tint still uses). */
+  probe_readings?: Record<string, ProbeReadingJSON>;
 }
 
 export interface WSDoneResultPerToken {
@@ -432,6 +904,11 @@ export interface WSDoneResult {
    *  response span (thinking tokens excluded by construction).  Null when
    *  logprob capture wasn't live (replay / no on_token consumer). */
   mean_logprob?: number | null;
+  /** End-of-generation per-attached-probe aggregate — the same
+   *  ``ProbeReadingJSON`` shape as the per-token stream (the aggregate is the
+   *  reading pooled at the last-content token).  Keys are probe names.
+   *  Omitted entirely when no probe is attached — read defensively. */
+  probe_readings?: Record<string, ProbeReadingJSON>;
 }
 
 export interface WSDoneEvent {
@@ -482,6 +959,11 @@ export interface LoomNodeJSON {
   parent_id: string | null;
   role: "user" | "assistant" | "system";
   text: string;
+  /** Per-turn role-substitution label (roleplay scaffold) — the custom
+   *  role this turn was *sent* with (e.g. "captain" / "pirate"), or null
+   *  for the standard role.  Drives the bubble heading + loom glyph.
+   *  Older servers omit this; treat undefined as null. */
+  role_label?: string | null;
   /** Assistant nodes only.  Mirrors saklas.core.loom.Recipe. */
   recipe?: {
     steering?: string | null;
@@ -720,6 +1202,14 @@ export interface TokenScore {
   score?: number;
   /** Full per-probe scores once available. */
   probes?: Record<string, number>;
+  /** Full per-axis domain-frame coordinates per probe, captured live from the
+   *  ``probe_readings`` wire channel.  Backs per-PC token highlighting (the
+   *  ``personas[3]`` axis targets) — axis 0 already lives in ``probes``, so
+   *  this is populated only for multi-axis (rank-R) probes.  The end-of-gen
+   *  ``per_token_probes`` pass is axis-0 only, so it survives ``done`` and
+   *  in-session navigation (held by reference in ``tokenScoreCache``) but is
+   *  absent after a transcript / localStorage reload. */
+  coordsByProbe?: Record<string, number[]>;
   /** Token-id from the WS event when available — useful for debugging. */
   tokenId?: number | null;
   /** Per-layer × per-probe heatmap data captured during streaming.
@@ -743,6 +1233,10 @@ export interface TokenScore {
 export interface ChatTurn {
   role: "user" | "assistant" | "system";
   text: string;
+  /** Per-turn role-substitution label (roleplay scaffold) carried from the
+   *  backing loom node — drives the bubble heading.  null/undefined =
+   *  standard role label. */
+  roleLabel?: string | null;
   /** Loom node backing this turn, when the server tree is active. */
   nodeId?: string | null;
   /** True iff any thinking content was emitted. */
@@ -772,28 +1266,85 @@ export interface ChatTurn {
   meanLogprob?: number | null;
 }
 
-// ----------------------------------------------------- vector rack --
+// ----------------------------------------------------- steer rack --
+//
+// One unified steering term, addressed as a position on a fitted geometry —
+// a steering vector is the K=2 flat case of a manifold, so there is no longer
+// a separate "vector" shape.  ``mode`` is the geometry family, the
+// discriminator the card branches on and the serializer reads:
+//
+//   ``subspace`` — a flat affine fit (a 2-node bipolar axis through the
+//                  rank-8 ``personas`` fan).  Every subspace term shares one
+//                  rack-level ``subspaceAlong`` master (the merged affine
+//                  subspace has a single slide), so the card carries NO
+//                  per-card along knob — only a position (snap-to-node /
+//                  XYPad).  Serializes ``<subspaceAlong> name[:variant]%pos``.
+//   ``manifold`` — a curved fit (e.g. ``emotions``).  Each curved term is its own
+//                  injection, so it keeps a per-card ``along`` + ``onto``.
+//                  Serializes ``<along[,onto]> name[:variant]%pos``.
+//
+// ``mode`` is set at add time (``RackDrawer`` picks the adder off the
+// catalog's ``fit_mode``: pca/baked → subspace, spectral/authored →
+// manifold) and at parse time (a curved ``%`` or an ``onto`` coeff → manifold;
+// else subspace).  The pre-4.1 ``~``/``|`` projection and ``!`` ablation are
+// no longer authorable in the rack (a ``%`` term can't carry them); a pasted
+// expression using them parses with a one-time warning and the operator
+// dropped.  ``:variant`` survives — it rides the atom (``name:sae%pos``).
 
-export interface ProjectionSpec {
-  op: "~" | "|";
-  target: string;
-}
-
-export interface VectorRackEntry {
-  /** Slider value in [-1, +1].  Sign is the user's typed sign — ``serialize``
-   * preserves it as the term coefficient. */
-  alpha: number;
-  trigger: Trigger;
+/** Subspace (flat affine) steering term — a position on a flat fit.  The
+ *  magnitude is the rack-level ``subspaceAlong`` master (shared across every
+ *  subspace term — the merged affine subspace slides once), so this entry
+ *  carries no per-card coefficient; relative weight between subspace terms is
+ *  expressed by how far each position sits from neutral. */
+export interface SubspaceSteerEntry {
+  mode: "subspace";
+  /** Authoring coordinates, one per intrinsic dimension.  Rank-1 (a 2-node
+   *  concept) is a single signed coord on the bipolar axis. */
+  coords: number[];
+  /** Node-label form (``name%label``); ``null`` = free coords (drag).  A
+   *  fresh 2-node concept defaults to its positive pole's label. */
+  label: string | null;
+  /** Tensor variant — rides the atom (``name:sae%pos``).  Not authorable via
+   *  the card today (kept for round-trip of pasted/legacy expressions). */
   variant: Variant;
-  /** Optional projection — keep (``~``) or remove (``|``) the shared
-   * component with another concept. */
-  projection: ProjectionSpec | null;
-  /** When true, term is rendered as ``!name``; bare ``!`` defaults to
-   * coeff=1.0 (fully replace).  Cannot compose with projection. */
-  ablate: boolean;
+  trigger: Trigger;
   /** When false, the term is excluded from serialization (visual but
    * not active). */
   enabled: boolean;
+}
+
+/** Manifold (curved) steering term — a placement on a curved fit with its own
+ *  per-card ``along`` + ``onto`` (each curved term is its own injection). */
+export interface ManifoldSteerEntry {
+  mode: "manifold";
+  /** ``along`` blend fraction in [0, 1] — how far to slide the in-subspace
+   *  foot toward the position.  Serializes as the first value of the ``%``
+   *  coefficient slot. */
+  blend: number;
+  /** ``onto`` collapse fraction in [0, 1] — pulls the off-surface in-subspace
+   *  residual onto the surface.  ``0`` = off.  Serializes as the second value
+   *  of the coefficient slot (``along,onto``) only when > 0. */
+  onto: number;
+  /** Authoring coordinates, one per intrinsic dimension. */
+  coords: number[];
+  /** Node-label form (``name%label``); ``null`` = free coords (drag). */
+  label: string | null;
+  /** Tensor variant — rides the atom (``name:sae%pos``). */
+  variant: Variant;
+  trigger: Trigger;
+  enabled: boolean;
+}
+
+/** A racked steering term — subspace (flat) or manifold (curved). */
+export type SteerEntry = SubspaceSteerEntry | ManifoldSteerEntry;
+
+// ----------------------------------------------------- extract pairs --
+
+/** One contrastive statement pair for custom-statement vector
+ *  extraction.  Mirrors the server's ``{positive, negative}`` shape. */
+export interface StatementPair {
+  positive: string;
+  negative: string;
 }
 
 // ----------------------------------------------------- probe rack --
@@ -801,14 +1352,44 @@ export interface VectorRackEntry {
 export type ProbeSortMode = "name" | "value" | "change";
 
 export interface ProbeRackEntry {
-  /** Last N values for the sparkline — ring-buffer-ish, capped client-side. */
+  /** Server-side row — metadata, domain, node layout, and the ``is_affine``
+   *  flat-vs-curved flag that selects the subspace vs manifold card. */
+  info: ProbeInfo;
+  /** Last N values of the primary scalar for the sparkline — ring-buffer-ish,
+   *  capped client-side.  Primary scalar is the signed axis-0 ``coords[0]``
+   *  for a subspace (flat) probe, the ``fraction`` for a manifold (curved). */
   sparkline: number[];
   current: number;
   previous: number;
   /** Most recent token's per-layer readings for *this* probe.  Layer-key
-   * strings keep the wire shape; ProbeStrip sorts numerically.  Empty
-   * until the first ``token`` event with ``per_layer_scores`` lands. */
+   * strings keep the wire shape; the card sorts numerically.  For a subspace
+   * probe this is axis-0 ``coords_per_layer``; for a manifold, ``fraction_per_layer``. */
   perLayer: Record<string, number>;
+  /** Latest full per-token reading (coords / fraction / nearest / residual +
+   *  per-layer traces).  Null until the first ``token`` event lands. */
+  reading: ProbeReadingJSON | null;
+  /** End-of-gen aggregate the ``done`` event lands — the settled reading.
+   *  Null between gens; set on ``done``, cleared on the next ``started``. */
+  aggregate: ProbeReadingJSON | null;
+  /** Most-recent per-token nearest list (ascending distance).  Drives the
+   *  inline nearest readout + mini-map hover; empty until the first token. */
+  nearest: [string, number][];
+  /** Inferred per-token coord trajectory for 2-D box mini-map rendering —
+   *  each token's ``nearest[0]`` looked up in ``info.node_coords``.  Empty
+   *  for non-2-D / sphere / custom probes and unfitted-discover (no coords). */
+  trajectory: number[][];
+  /** Ring buffer (last ~64 tokens) of per-layer whitened subspace coords for
+   *  the probe-inspector geometry plot's live point + fading trail.  Each entry
+   *  is one token's ``subspace_coords_per_layer`` (layer-key -> (R,) coords), so
+   *  the inspector can reproject for any scrubbed layer at render time.  Only
+   *  populated while the inspector is open (the ``persist_subspace_coords``
+   *  generate flag); cleared on each generation ``started``. */
+  subspaceTrail: SubspaceTrailSample[];
+}
+
+/** One token's per-layer whitened subspace coords for the inspector trail. */
+export interface SubspaceTrailSample {
+  perLayer: Record<string, number[]>;
 }
 
 // ----------------------------------------------------- gen status --
@@ -879,28 +1460,45 @@ export interface PendingAction {
 // ----------------------------------------------------- drawers --
 
 export type DrawerName =
-  | "load"
-  /** Unified vector management drawer (replaces the legacy
-   *  ``vector_picker`` + ``probe_picker`` pair).  Two sections split
-   *  on the server-supplied ``has_tensor`` flag: extracted rows get
-   *  steer/probe/delete toggles, statements-only rows get
-   *  extract/delete.  Opened from both rack "+ add" buttons. */
-  | "vectors"
-  /** Custom-vector extraction form — reached from the
-   *  "+ custom vector" button at the top of ``vectors``.  Submitting
-   *  closes back to the vectors drawer so the new row appears
-   *  reactively. */
-  | "extract"
+  /** Shared rack browser, subspace (flat) family — every flat affine
+   *  fit (``fit_mode`` pca / baked): 2-node concept axes plus higher-rank
+   *  flats like ``personas``.  White ``--accent``.  Split Fitted /
+   *  Unfitted, per-row steer / probe / re-fit / delete, with a
+   *  "+ build manifold" launcher (flat authoring folds into the manifold
+   *  builder's pca path).  ``RackDrawer`` with ``family: "subspace"``.
+   *  Opened from both rack "+ add" buttons. */
+  | "subspace"
+  /** Shared rack browser, manifold (curved) family — curved fits only
+   *  (``fit_mode`` spectral / authored), e.g. ``emotions``.  Purple
+   *  ``--accent-purple``.  Same layout as the subspace half, with a
+   *  "+ build manifold" launcher.  ``RackDrawer`` with
+   *  ``family: "manifold"``. */
+  | "manifolds"
+  /** Manifold authoring form — domain step + node editor.  Reached
+   *  from the "+ build manifold" button inside ``manifolds``. */
+  | "manifold_builder"
+  /** Discover-mode node-union merge.  Unions the node corpora of two or
+   *  more discover-mode manifolds into a fresh discover folder; restricted
+   *  to discover sources by design.  Reached from the workspace rail's
+   *  "manifolds → merge manifolds…" entry. */
+  | "manifold_merge"
+  /** Manifold-side counterpart to ``PackDrawer``.  Two tabs: local
+   *  catalog, plus HF search/install for ``saklas-manifold``-tagged
+   *  repos.  Reached from the workspace rail's "manifolds → packs…"
+   *  entry, parallel to "vectors → packs…". */
+  | "manifold_pack"
   | "save_conversation"
   | "load_conversation"
   | "compare"
-  | "pack"
-  | "merge"
-  | "clone"
   | "system_prompt"
   | "token_drilldown"
   | "correlation"
   | "layer_norms"
+  /** Per-probe inspector — subsumes the layer-norms view for probes and
+   *  adds a rank-aware whitened geometry plot (line / 2D scatter / 3D PCA
+   *  scatter) with a layer scrubber and a fading live trajectory trail.
+   *  Opened from a probe card's ⓘ button.  ``params: { name }``. */
+  | "probe_inspector"
   | "experiment_lab"
   | "activation_atlas"
   | "recipe_builder"
@@ -914,7 +1512,12 @@ export type DrawerName =
    * assistant nodes → compare those). */
   | "node_compare"
   /** Transcript export/import drawer — phase 5. */
-  | "transcript";
+  | "transcript"
+  /** Templated-completion lab — author standalone templates (slot + values
+   *  + multi-turn contexts) and score the restricted-choice value
+   *  distribution (steering-aware before/after). Reached from the workspace
+   *  rail's "manifolds → templates…" entry. */
+  | "template_lab";
 
 export interface DrawerState {
   open: DrawerName | null;

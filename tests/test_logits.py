@@ -9,6 +9,8 @@ sensible to add there.
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from saklas import TokenAlt
@@ -75,7 +77,7 @@ class TestTokenAlt:
     def test_frozen(self):
         alt = TokenAlt(id=1, text="a", logprob=-1.0)
         with pytest.raises((AttributeError, Exception)):
-            alt.id = 2  # type: ignore[misc]
+            alt.id = 2  # pyright: ignore[reportAttributeAccessIssue]  # frozen dataclass, intentional assignment to verify runtime error
 
     def test_equality(self):
         a = TokenAlt(id=7, text="x", logprob=-0.5)
@@ -109,6 +111,7 @@ class TestTokenEventTopAlts:
         ev = TokenEvent(text=" hello", token_id=1, index=0,
                         logprob=-1.2, top_alts=alts)
         assert ev.top_alts == alts
+        assert ev.top_alts is not None  # assigned alts above, always non-None here
         assert len(ev.top_alts) == 2
 
     def test_disabled_means_no_alts(self):
@@ -249,7 +252,7 @@ class TestConfigFileReturnTopK:
         cfg = ConfigFile()
         assert cfg.return_top_k is None
 
-    def test_load_valid(self, tmp_path):
+    def test_load_valid(self, tmp_path: Path):
         """YAML round-trip — ``return_top_k:`` lands on the dataclass."""
         from saklas.cli.config_file import ConfigFile
         p = tmp_path / "cfg.yaml"
@@ -257,35 +260,35 @@ class TestConfigFileReturnTopK:
         cfg = ConfigFile.load(p)
         assert cfg.return_top_k == 8
 
-    def test_load_zero(self, tmp_path):
+    def test_load_zero(self, tmp_path: Path):
         from saklas.cli.config_file import ConfigFile
         p = tmp_path / "cfg.yaml"
         p.write_text("return_top_k: 0\n")
         cfg = ConfigFile.load(p)
         assert cfg.return_top_k == 0
 
-    def test_load_rejects_negative(self, tmp_path):
+    def test_load_rejects_negative(self, tmp_path: Path):
         from saklas.cli.config_file import ConfigFile, ConfigFileError
         p = tmp_path / "cfg.yaml"
         p.write_text("return_top_k: -1\n")
         with pytest.raises(ConfigFileError):
             ConfigFile.load(p)
 
-    def test_load_rejects_above_256(self, tmp_path):
+    def test_load_rejects_above_256(self, tmp_path: Path):
         from saklas.cli.config_file import ConfigFile, ConfigFileError
         p = tmp_path / "cfg.yaml"
         p.write_text("return_top_k: 300\n")
         with pytest.raises(ConfigFileError):
             ConfigFile.load(p)
 
-    def test_load_rejects_non_int(self, tmp_path):
+    def test_load_rejects_non_int(self, tmp_path: Path):
         from saklas.cli.config_file import ConfigFile, ConfigFileError
         p = tmp_path / "cfg.yaml"
         p.write_text('return_top_k: "eight"\n')
         with pytest.raises(ConfigFileError):
             ConfigFile.load(p)
 
-    def test_load_rejects_bool(self, tmp_path):
+    def test_load_rejects_bool(self, tmp_path: Path):
         """YAML ``true`` would silently coerce to ``1`` without an
         explicit bool guard — reject it so users don't end up with
         K=1 from a typo'd boolean."""

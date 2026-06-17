@@ -7,35 +7,41 @@
 // page injects a key after load, call ``setApiKey()`` to refresh it.
 
 import type {
-  CloneVectorRequest,
-  CloneVectorResponse,
   CorrelationData,
-  DeletePackResponse,
+  CreateDiscoverManifoldRequest,
+  CreateManifoldRequest,
+  CreateTemplateRequest,
+  CreateTemplatedManifoldRequest,
   ExperimentFanRequest,
   ExperimentFanResponse,
   ExtractRequest,
   ExtractResponse,
   FilterMatchesJSON,
-  InstallPackRequest,
-  InstallPackResponse,
+  FitManifoldRequest,
+  GenerateManifoldRequest,
+  InstallManifoldRequest,
   JointLogprobRowJSON,
   JointLogprobsJSON,
-  LoadVectorRequest,
   LoomNodeJSON,
   LoomTreeJSON,
-  MergeVectorRequest,
-  MergeVectorResponse,
+  ManifoldInfo,
+  ManifoldListResponse,
+  MergeManifoldRequest,
   NodeDiffJSON,
-  PackListResponse,
-  PackSearchResponse,
   PairwiseCompareResponse,
   ProbeDefaultsResponse,
+  ProbeGeometryResponse,
+  ProbeInfo,
   ProbeListResponse,
-  ScoreProbeRequest,
-  ScoreProbeResponse,
+  ProbeRequest,
+  RemoteManifoldInfo,
+  ScoreTemplateResponse,
   SessionInfo,
+  TemplateDetail,
+  TemplateSummary,
   TraitsEvent,
   TranscriptLoadResponseJSON,
+  UpdateManifoldRequest,
   VectorDiagnosticsResponse,
   VectorInfo,
   VectorListResponse,
@@ -47,35 +53,41 @@ import type {
 // rather than via barrel-export keeps `import { ApiError, getSession }`
 // consumers one-stop without a separate type import line.
 export type {
-  CloneVectorRequest,
-  CloneVectorResponse,
   CorrelationData,
-  DeletePackResponse,
+  CreateDiscoverManifoldRequest,
+  CreateManifoldRequest,
+  CreateTemplateRequest,
+  CreateTemplatedManifoldRequest,
+  FitManifoldRequest,
+  GenerateManifoldRequest,
   ExperimentFanRequest,
   ExperimentFanResponse,
   ExtractRequest,
   ExtractResponse,
   FilterMatchesJSON,
-  InstallPackRequest,
-  InstallPackResponse,
+  InstallManifoldRequest,
   JointLogprobRowJSON,
   JointLogprobsJSON,
-  LoadVectorRequest,
   LoomNodeJSON,
   LoomTreeJSON,
-  MergeVectorRequest,
-  MergeVectorResponse,
+  ManifoldInfo,
+  ManifoldListResponse,
+  MergeManifoldRequest,
   NodeDiffJSON,
-  PackListResponse,
-  PackSearchResponse,
   PairwiseCompareResponse,
   ProbeDefaultsResponse,
+  ProbeGeometryResponse,
+  ProbeInfo,
   ProbeListResponse,
-  ScoreProbeRequest,
-  ScoreProbeResponse,
+  ProbeRequest,
+  RemoteManifoldInfo,
+  ScoreTemplateResponse,
   SessionInfo,
+  TemplateDetail,
+  TemplateSummary,
   TraitsEvent,
   TranscriptLoadResponseJSON,
+  UpdateManifoldRequest,
   VectorDiagnosticsResponse,
   VectorInfo,
   VectorListResponse,
@@ -101,7 +113,7 @@ const SESSION = "default";
 export const API = `/saklas/v1/sessions/${SESSION}`;
 
 const SESSION_BASE = (id: string = SESSION) => `/saklas/v1/sessions/${id}`;
-const PACKS_BASE = "/saklas/v1/packs";
+const MANIFOLDS_BASE = "/saklas/v1/manifolds";
 
 // --------------------------------------------------------- auth --
 
@@ -203,14 +215,6 @@ async function request<T>(
   return (await r.text()) as unknown as T;
 }
 
-/** Legacy export — preserved for the v1.6 stores.ts file.  Throws ``Error``
- * (not ``ApiError``) for backwards-compat. */
-export async function getJson<T>(path: string): Promise<T> {
-  const r = await fetch(path, { headers: authHeaders() });
-  if (!r.ok) throw new Error(`${path}: ${r.status}`);
-  return (await r.json()) as T;
-}
-
 function jsonBody(body: unknown): RequestInit {
   return {
     method: "POST",
@@ -268,9 +272,6 @@ export const apiVectors = {
   get(name: string, id: string = SESSION): Promise<VectorInfo> {
     return request(`${SESSION_BASE(id)}/vectors/${encodeURIComponent(name)}`);
   },
-  load(req: LoadVectorRequest, id: string = SESSION): Promise<VectorInfo> {
-    return request(`${SESSION_BASE(id)}/vectors`, jsonBody(req));
-  },
   delete(name: string, id: string = SESSION): Promise<void> {
     return request<void>(
       `${SESSION_BASE(id)}/vectors/${encodeURIComponent(name)}`,
@@ -281,19 +282,6 @@ export const apiVectors = {
    * ``apiExtractStream`` instead. */
   extract(req: ExtractRequest, id: string = SESSION): Promise<ExtractResponse> {
     return request(`${SESSION_BASE(id)}/extract`, jsonBody(req));
-  },
-  merge(
-    req: MergeVectorRequest,
-    id: string = SESSION,
-  ): Promise<MergeVectorResponse> {
-    return request(`${SESSION_BASE(id)}/vectors/merge`, jsonBody(req));
-  },
-  /** Synchronous clone.  Use ``apiCloneStream`` for SSE progress. */
-  clone(
-    req: CloneVectorRequest,
-    id: string = SESSION,
-  ): Promise<CloneVectorResponse> {
-    return request(`${SESSION_BASE(id)}/vectors/clone`, jsonBody(req));
   },
   diagnostics(
     name: string,
@@ -332,58 +320,237 @@ export const apiProbes = {
   defaults(id: string = SESSION): Promise<ProbeDefaultsResponse> {
     return request(`${SESSION_BASE(id)}/probes/defaults`);
   },
-  activate(name: string, id: string = SESSION): Promise<void> {
-    return request<void>(
-      `${SESSION_BASE(id)}/probes/${encodeURIComponent(name)}`,
-      { method: "POST" },
-    );
+  /** Attach any probe shape by selector — the same ``[ns/]name[:variant]``
+   *  the ``%`` steering term consumes (a 2-node concept axis is the rank-1
+   *  case).  Returns the attached probe row (``ProbeInfo``). */
+  attach(req: ProbeRequest, id: string = SESSION): Promise<ProbeInfo> {
+    return request(`${SESSION_BASE(id)}/probes`, jsonBody(req));
   },
-  deactivate(name: string, id: string = SESSION): Promise<void> {
+  detach(name: string, id: string = SESSION): Promise<void> {
     return request<void>(
       `${SESSION_BASE(id)}/probes/${encodeURIComponent(name)}`,
       { method: "DELETE" },
     );
   },
-  /** One-shot text scoring; no generation involved. */
-  score(req: ScoreProbeRequest, id: string = SESSION): Promise<ScoreProbeResponse> {
-    return request(`${SESSION_BASE(id)}/probe`, jsonBody(req));
+  /** Static whitened geometry for the probe-inspector plot — per-layer node
+   *  centroids, neutral anchor, top-3 PCA rotation (rank>=3), and the curved
+   *  manifold curve/surface overlay.  404 if the probe isn't attached. */
+  geometry(name: string, id: string = SESSION): Promise<ProbeGeometryResponse> {
+    return request(
+      `${SESSION_BASE(id)}/probes/${encodeURIComponent(name)}/geometry`,
+    );
   },
 };
 
-// ============================================================== packs ==
+// ========================================================== manifolds ==
 
-/** Pack endpoints are top-level (not under /sessions/{id}/) — server-side
- * pack management is independent of any active session.  Search lives at
- * /saklas/v1/packs/search; ``list`` and ``install`` share the collection
- * URL with method-based dispatch. */
-export const apiPacks = {
-  list(): Promise<PackListResponse> {
-    return request(PACKS_BASE);
+/** Steering-manifold endpoints — top-level (not session-scoped), like
+ *  packs.  All routes 404 on servers that pre-date the manifold HTTP
+ *  surface; callers should catch ``ApiError`` with status 404 and treat
+ *  manifolds as unavailable. */
+export const apiManifolds = {
+  list(): Promise<ManifoldListResponse> {
+    return request(MANIFOLDS_BASE);
   },
-  search(query: string, limit?: number): Promise<PackSearchResponse> {
-    const q = new URLSearchParams({ q: query });
-    if (limit !== undefined) q.set("limit", String(limit));
-    return request(`${PACKS_BASE}/search?${q.toString()}`);
+  get(namespace: string, name: string): Promise<ManifoldInfo> {
+    return request(
+      `${MANIFOLDS_BASE}/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}`,
+    );
   },
-  install(req: InstallPackRequest): Promise<InstallPackResponse> {
-    return request(PACKS_BASE, jsonBody(req));
+  /** Create an authored manifold folder.  Response is the detail shape
+   *  plus an ``advisories`` list of soft poisedness warnings. */
+  create(
+    req: CreateManifoldRequest,
+  ): Promise<ManifoldInfo & { advisories: string[] }> {
+    return request(MANIFOLDS_BASE, jsonBody(req));
   },
-  /** Remove a locally-installed pack folder.  Wraps the server's
-   *  ``cache_ops.uninstall`` on the ``ns/name`` selector and detaches
-   *  the concept from the session (steering rack / probes) first.
-   *  Bundled concepts re-materialize on next session init — the
-   *  response's ``rematerializes_on_restart`` lets the caller tailor
-   *  the success toast. */
+  /** Create a discover-mode manifold folder — labeled corpora only, no
+   *  coords (coords are derived per-model at fit time).  Pair with
+   *  ``apiManifoldFitStream`` to run the discover + fit. */
+  createDiscover(
+    req: CreateDiscoverManifoldRequest,
+  ): Promise<ManifoldInfo> {
+    return request(`${MANIFOLDS_BASE}/discover`, jsonBody(req));
+  },
+  /** Create a templated discover manifold — slot + values + chat-turn
+   *  templates, expanded server-side into per-value node corpora. Pair with
+   *  ``apiManifoldFitStream`` to fit. */
+  createTemplated(
+    req: CreateTemplatedManifoldRequest,
+  ): Promise<ManifoldInfo> {
+    return request(`${MANIFOLDS_BASE}/templated`, jsonBody(req));
+  },
+  update(
+    namespace: string,
+    name: string,
+    req: UpdateManifoldRequest,
+  ): Promise<ManifoldInfo> {
+    return request(
+      `${MANIFOLDS_BASE}/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}`,
+      { ...jsonBody(req), method: "PATCH" },
+    );
+  },
   delete(
     namespace: string,
     name: string,
-  ): Promise<DeletePackResponse> {
+  ): Promise<{ namespace: string; name: string; removed: boolean }> {
     return request(
-      `${PACKS_BASE}/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}`,
+      `${MANIFOLDS_BASE}/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}`,
       { method: "DELETE" },
     );
   },
+  /** HF-hub search proxy for ``saklas-manifold``-tagged repos — rows
+   *  carry the manifold-specific ``domain_label`` / ``node_count`` /
+   *  ``fit_mode`` fields.  503 when the server lacks ``huggingface_hub``,
+   *  502 on HF transport error. */
+  search(
+    query: string,
+    limit?: number,
+  ): Promise<{ results: RemoteManifoldInfo[] }> {
+    const q = new URLSearchParams({ q: query });
+    if (limit !== undefined) q.set("limit", String(limit));
+    return request(`${MANIFOLDS_BASE}/search?${q.toString()}`);
+  },
+  /** Install a manifold from an HF coord or local folder; under the
+   *  session lock server-side.  409 on conflict, 404 on missing source,
+   *  503/502 on HF surface failures. */
+  install(req: InstallManifoldRequest): Promise<ManifoldInfo> {
+    return request(`${MANIFOLDS_BASE}/install`, jsonBody(req));
+  },
+  /** Union N discover-mode manifolds' nodes into one fresh discover
+   *  folder.  Restricted to discover sources (autofitted) — authored
+   *  manifolds carry user-declared geometry and refuse merging.  The
+   *  merged folder is unfitted on disk; call ``apiManifoldFitStream``
+   *  next to derive coords + fit.  400 on mixed fit_modes (without
+   *  override) or label collisions, 404 on missing source, 409 on
+   *  destination conflict. */
+  merge(req: MergeManifoldRequest): Promise<ManifoldInfo> {
+    return request(`${MANIFOLDS_BASE}/merge`, jsonBody(req));
+  },
 };
+
+const TEMPLATES_BASE = "/saklas/v1/templates";
+
+/** The standalone templated-completion artifact — a slot + candidate values
+ *  + multi-turn contexts, read by both the completion scorer and a
+ *  ``manifold from-template`` fit. */
+export const apiTemplates = {
+  list(): Promise<{ templates: TemplateSummary[] }> {
+    return request(TEMPLATES_BASE);
+  },
+  get(namespace: string, name: string): Promise<TemplateDetail> {
+    return request(
+      `${TEMPLATES_BASE}/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}`,
+    );
+  },
+  create(req: CreateTemplateRequest): Promise<TemplateDetail> {
+    return request(TEMPLATES_BASE, jsonBody(req));
+  },
+  delete(
+    namespace: string,
+    name: string,
+  ): Promise<{ namespace: string; name: string; removed: boolean }> {
+    return request(
+      `${TEMPLATES_BASE}/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}`,
+      { method: "DELETE" },
+    );
+  },
+  /** Score the value distribution against each context. ``steering`` runs the
+   *  forward under a steering expression (the distributional before/after). */
+  score(
+    namespace: string,
+    name: string,
+    steering: string | null,
+  ): Promise<ScoreTemplateResponse> {
+    return request(
+      `${TEMPLATES_BASE}/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}/score`,
+      jsonBody({ steering }),
+    );
+  },
+};
+
+/** Streaming manifold fit — mirrors ``apiExtractStream``.  ``done``
+ *  data carries the detail shape plus ``layers_fitted`` /
+ *  ``feature_space``; ``progress`` events fire as the pipeline runs;
+ *  ``error`` data carries ``message`` + ``code`` (the engine emits
+ *  ``PoisednessError`` for an RBF poisedness failure). */
+export async function apiManifoldFitStream(
+  namespace: string,
+  name: string,
+  body: FitManifoldRequest,
+  onEvent: (ev: { event: string; data: unknown }) => void,
+): Promise<ManifoldInfo> {
+  const path = `${MANIFOLDS_BASE}/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}/fit`;
+  const r = await fetch(path, {
+    method: "POST",
+    headers: authHeaders({
+      "Content-Type": "application/json",
+      Accept: "text/event-stream",
+    }),
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) {
+    const { text, json } = await parseBody(r);
+    throw new ApiError(r.status, path, text, json);
+  }
+  if (!r.body) throw new Error("manifold fit: server returned no SSE body");
+  let final: ManifoldInfo | null = null;
+  let lastError: string | null = null;
+  for await (const evt of consumeSse(r.body)) {
+    onEvent(evt);
+    if (evt.event === "done" && evt.data && typeof evt.data === "object") {
+      final = evt.data as ManifoldInfo;
+    } else if (evt.event === "error") {
+      lastError =
+        (evt.data as { message?: string } | null)?.message ?? "fit failed";
+    }
+  }
+  if (lastError) throw new Error(lastError);
+  if (!final) throw new Error("manifold fit: stream ended without done event");
+  return final;
+}
+
+/** Streaming manifold generate — LLM-author a discover-mode folder from
+ *  a flat concept list.  Mirrors ``apiManifoldFitStream`` shape: SSE
+ *  progress events as the K-tuple generator runs, then a ``done`` event
+ *  carrying the freshly-written manifold detail.  Pair with a follow-up
+ *  ``apiManifoldFitStream`` call to derive coords + fit. */
+export async function apiManifoldGenerateStream(
+  body: GenerateManifoldRequest,
+  onEvent: (ev: { event: string; data: unknown }) => void,
+): Promise<ManifoldInfo> {
+  const path = `${MANIFOLDS_BASE}/generate`;
+  const r = await fetch(path, {
+    method: "POST",
+    headers: authHeaders({
+      "Content-Type": "application/json",
+      Accept: "text/event-stream",
+    }),
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) {
+    const { text, json } = await parseBody(r);
+    throw new ApiError(r.status, path, text, json);
+  }
+  if (!r.body) throw new Error("manifold generate: server returned no SSE body");
+  let final: ManifoldInfo | null = null;
+  let lastError: string | null = null;
+  for await (const evt of consumeSse(r.body)) {
+    onEvent(evt);
+    if (evt.event === "done" && evt.data && typeof evt.data === "object") {
+      final = evt.data as ManifoldInfo;
+    } else if (evt.event === "error") {
+      lastError =
+        (evt.data as { message?: string } | null)?.message ??
+        "generate failed";
+    }
+  }
+  if (lastError) throw new Error(lastError);
+  if (!final) {
+    throw new Error("manifold generate: stream ended without done event");
+  }
+  return final;
+}
 
 // ============================================================ extract ==
 
@@ -424,49 +591,6 @@ export async function apiExtractStream(
   }
   if (lastError) throw new Error(lastError);
   if (!final) throw new Error("extract: stream ended without done event");
-  return final;
-}
-
-// ============================================================== clone ==
-
-/** Streaming clone, mirrors ``apiExtractStream``.  ``done`` data carries
- * ``canonical`` + ``profile``; only the ``done`` and ``error`` events fire
- * (the underlying clone path has no progress callback). */
-export async function apiCloneStream(
-  req: CloneVectorRequest,
-  onEvent: (ev: { event: string; data: unknown }) => void,
-  id: string = SESSION,
-): Promise<{ canonical: string; profile: VectorInfo }> {
-  const path = `${SESSION_BASE(id)}/vectors/clone`;
-  const r = await fetch(path, {
-    method: "POST",
-    headers: authHeaders({
-      "Content-Type": "application/json",
-      Accept: "text/event-stream",
-    }),
-    body: JSON.stringify(req),
-  });
-  if (!r.ok) {
-    const { text, json } = await parseBody(r);
-    throw new ApiError(r.status, path, text, json);
-  }
-  if (!r.body) throw new Error("clone: server returned no SSE body");
-  let final: { canonical: string; profile: VectorInfo } | null = null;
-  let lastError: string | null = null;
-  for await (const evt of consumeSse(r.body)) {
-    onEvent(evt);
-    if (evt.event === "done" && evt.data && typeof evt.data === "object") {
-      const d = evt.data as { canonical?: string; profile?: VectorInfo };
-      if (d.canonical && d.profile) {
-        final = { canonical: d.canonical, profile: d.profile };
-      }
-    } else if (evt.event === "error") {
-      lastError =
-        (evt.data as { message?: string } | null)?.message ?? "clone failed";
-    }
-  }
-  if (lastError) throw new Error(lastError);
-  if (!final) throw new Error("clone: stream ended without done event");
   return final;
 }
 

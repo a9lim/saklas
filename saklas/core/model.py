@@ -2,7 +2,8 @@
 
 import logging
 import warnings
-from typing import cast
+from contextlib import suppress
+from typing import Any, cast
 
 import torch
 import torch.nn as nn
@@ -15,14 +16,14 @@ _ORIG_HISTC = None
 _ORIG_LDEXP = None
 
 
-def _histc_mps_safe(input, bins=100, min=0, max=0, *, out=None):
+def _histc_mps_safe(input: torch.Tensor, bins: int = 100, min: float = 0, max: float = 0, *, out: torch.Tensor | None = None) -> torch.Tensor:
     assert _ORIG_HISTC is not None
     if input.device.type == "mps" and not input.is_floating_point():
         input = input.float()
     return _ORIG_HISTC(input, bins=bins, min=min, max=max, out=out)
 
 
-def _ldexp_mps_safe(input, other, *, out=None):
+def _ldexp_mps_safe(input: Any, other: Any, *, out: torch.Tensor | None = None) -> Any:
     assert _ORIG_LDEXP is not None
     if hasattr(input, "device") and input.device.type == "mps":
         in_cpu = input.cpu()
@@ -47,19 +48,19 @@ def patch_torch_for_mps() -> bool:
     installed = False
     if getattr(torch.histc, "_saklas_mps_safe", False) is False:
         _ORIG_HISTC = torch.histc
-        _histc_mps_safe._saklas_mps_safe = True  # type: ignore[attr-defined]
+        _histc_mps_safe._saklas_mps_safe = True  # pyright: ignore[reportFunctionMemberAccess]  # FunctionType stub forbids dynamic attrs
         torch.histc = _histc_mps_safe
         installed = True
     if getattr(torch.ldexp, "_saklas_mps_safe", False) is False:
         _ORIG_LDEXP = torch.ldexp
-        _ldexp_mps_safe._saklas_mps_safe = True  # type: ignore[attr-defined]
+        _ldexp_mps_safe._saklas_mps_safe = True  # pyright: ignore[reportFunctionMemberAccess]  # FunctionType stub forbids dynamic attrs
         torch.ldexp = _ldexp_mps_safe
         installed = True
     return installed
 
-def _MODEL_LAYERS(m): return m.model.layers
-def _TRANSFORMER_H(m): return m.transformer.h
-def _VLM_LANGUAGE_LAYERS(m): return m.model.language_model.layers
+def _MODEL_LAYERS(m: Any) -> Any: return m.model.layers
+def _TRANSFORMER_H(m: Any) -> Any: return m.transformer.h
+def _VLM_LANGUAGE_LAYERS(m: Any) -> Any: return m.model.language_model.layers
 
 _LAYER_ACCESSORS = {
     # Llama family
@@ -79,6 +80,11 @@ _LAYER_ACCESSORS = {
     "gemma3_text": _MODEL_LAYERS,
     "gemma4": _VLM_LANGUAGE_LAYERS,
     "gemma4_text": _MODEL_LAYERS,
+    # Gemma-4 "unified" variant (gemma-4-12B-it, 2026-06): a multimodal
+    # wrapper whose text submodel weights live under model.language_model.*,
+    # so the VLM accessor + text-extraction prefix-strip both apply as-is.
+    "gemma4_unified": _VLM_LANGUAGE_LAYERS,
+    "gemma4_unified_text": _MODEL_LAYERS,
     "recurrent_gemma": _MODEL_LAYERS,
     # Phi family
     "phi": _MODEL_LAYERS,
@@ -146,6 +152,7 @@ _SUPPORTED_TYPES = sorted(_LAYER_ACCESSORS)
 _TESTED_ARCHS: frozenset[str] = frozenset({
     "qwen2", "qwen3", "qwen3_5", "qwen3_5_text", "qwen3_5_moe",
     "gemma2", "gemma3", "gemma3_text", "gemma4", "gemma4_text",
+    "gemma4_unified", "gemma4_unified_text",  # gemma-4-12B-it, time-experiment 2026-06-09
     "mistral3", "ministral3", "gpt_oss", "llama", "glm",
     "talkie",
 })
@@ -155,38 +162,149 @@ _warned: set[str] = set()
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2,
                torch.float8_e4m3fnuz, torch.float8_e5m2fnuz)
 
+# safetensors dtype tag -> torch dtype, for the manual (mmap-free) reader.
+_ST_DTYPES: dict[str, torch.dtype] = {
+    "F64": torch.float64, "F32": torch.float32, "F16": torch.float16,
+    "BF16": torch.bfloat16, "I64": torch.int64, "I32": torch.int32,
+    "I16": torch.int16, "I8": torch.int8, "U8": torch.uint8,
+    "BOOL": torch.bool, "F8_E4M3": torch.float8_e4m3fn, "F8_E5M2": torch.float8_e5m2,
+}
+
+
+def _read_safetensors_header(path: str) -> tuple[dict[str, Any], int]:
+    """Parse a safetensors header: ``(tensor_metadata, data_section_offset)``.
+
+    The format is an 8-byte little-endian header length, that many bytes
+    of JSON (name → ``{dtype, shape, data_offsets}``), then the packed
+    tensor data.  The ``__metadata__`` entry is dropped.
+    """
+    import json
+    with open(path, "rb") as f:
+        n = int.from_bytes(f.read(8), "little")
+        header = json.loads(f.read(n))
+    header.pop("__metadata__", None)
+    return header, 8 + n
+
+
+def _open_uncached(path: str) -> int:
+    """Open ``path`` read-only, asking the OS not to cache its pages.
+
+    On Apple Silicon the page cache shares the same physical RAM as MPS,
+    so mmap-reading a 62 GB checkpoint fills the cache *on top of* the
+    61 GB on-device model — ~2× the model size, which forces the unified
+    pool into compression/swap.  ``F_NOCACHE`` (macOS) reads straight
+    through without populating the unified buffer cache, holding the
+    host-side transient to a single tensor.  Elsewhere the page cache is
+    reclaimable and doesn't compete with discrete VRAM, so a plain fd is
+    fine.
+    """
+    import os
+    import sys
+    fd = os.open(path, os.O_RDONLY)
+    if sys.platform == "darwin":
+        import fcntl
+        with suppress(OSError):
+            fcntl.fcntl(fd, fcntl.F_NOCACHE, 1)
+    return fd
+
+
+def _read_st_tensor(fd: int, header: dict[str, Any], data_start: int, name: str) -> torch.Tensor:
+    """Read one tensor by name from an already-open safetensors fd.
+
+    ``pread`` at the tensor's recorded offset, wrap the bytes as a CPU
+    tensor (zero-copy view of the freshly-read buffer), reshape.  No mmap,
+    so with an :func:`_open_uncached` fd the bytes never enter the page
+    cache.
+    """
+    import os
+    import warnings
+    meta = header[name]
+    start, end = meta["data_offsets"]
+    nbytes = end - start
+    offset = data_start + start
+    # A single pread can't exceed INT_MAX bytes on macOS (EINVAL), and a
+    # bf16 embedding is ~2.8 GB, so read in capped chunks.
+    _CHUNK = 1 << 28  # 256 MiB
+    chunks: list[bytes] = []
+    got = 0
+    while got < nbytes:
+        block = os.pread(fd, min(_CHUNK, nbytes - got), offset + got)
+        if not block:
+            break
+        chunks.append(block)
+        got += len(block)
+    buf = chunks[0] if len(chunks) == 1 else b"".join(chunks)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # frombuffer warns on read-only bytes
+        flat = torch.frombuffer(buf, dtype=_ST_DTYPES[meta["dtype"]])
+    return flat.reshape(meta["shape"])
+
+
+class _NoTextWeightsExtracted(RuntimeError):
+    """No text-model weights matched the ``language_model.`` layout.
+
+    Raised by :func:`_load_text_from_multimodal` so the caller can fall
+    back to a standard full-model load rather than return a model full of
+    random initialization.
+    """
+
 
 def _load_text_from_multimodal(
     model_id: str,
-    text_config,
+    text_config: Any,
     dtype: torch.dtype,
     device: str,
 ):
     """Load just the text model from a multimodal checkpoint.
 
-    Multimodal checkpoints store text-model weights under a
-    ``language_model.`` prefix.  This function creates a text-only
-    model directly on the target device, then loads each safetensors
-    shard, strips the prefix, dequantizes FP8 weights, and copies
-    them in shard-by-shard.  Vision-tower weights are skipped.
+    Multimodal checkpoints store the text-model weights under a
+    ``language_model.`` path *segment* — either as a leading prefix
+    (Mistral-3 / Ministral: ``language_model.model.layers…``) or nested
+    inside the composite model (Gemma-3 / Gemma-4:
+    ``model.language_model.layers…``).  This function builds a text-only
+    model directly on the target device, then streams each safetensors
+    shard tensor-by-tensor, drops the ``language_model.`` segment to
+    recover the text model's own parameter names, dequantizes FP8
+    weights, and copies each into the preallocated parameter.  Vision
+    tower / projector weights (no ``language_model.`` segment) are
+    skipped.
 
-    Creating on-device and loading per-shard keeps peak CPU RSS low
-    (~6 GB vs ~30 GB), which matters on Apple Silicon where CPU and
-    MPS share unified memory.
+    Two memory disciplines matter on Apple Silicon, where CPU and MPS
+    share one unified-memory pool:
+
+    * **On-device construction** — ``from_config`` under
+      ``torch.device(device)`` allocates the model once, on the target
+      device, so there is never a second full-model copy.  The standard
+      ``from_pretrained(device_map={"": "mps"})`` path stages the entire
+      state dict in CPU RAM *and* copies it to MPS before freeing the CPU
+      side — ~2× the model size at peak (>128 GB for gemma-4-31B).
+    * **Cache-bypassing reads** — each shard is read with ``pread`` on an
+      :func:`_open_uncached` fd (``F_NOCACHE`` on macOS) rather than
+      mmap'd via ``safe_open``.  mmap would fault the whole 62 GB
+      checkpoint into the page cache, which on unified memory collides
+      with the on-device model; reading straight through holds the
+      host-side transient to a single tensor.
+
+    Raises :class:`_NoTextWeightsExtracted` if nothing matched, so the
+    caller can fall back to a full multimodal load.
     """
     import gc
     import json
-    from safetensors.torch import load_file
-    from transformers.utils import (
-        cached_file,
-        SAFE_WEIGHTS_INDEX_NAME,
-        SAFE_WEIGHTS_NAME,
-    )
+    import os
+    from transformers.utils import SAFE_WEIGHTS_INDEX_NAME, SAFE_WEIGHTS_NAME
+    from transformers.utils.hub import cached_file
 
     # Create directly on target device — avoids a CPU copy that would
     # spike RSS and eat into MPS's unified memory budget.
     with torch.device(device):
         model = AutoModelForCausalLM.from_config(text_config, dtype=dtype)
+
+    # The text model's own parameter / buffer names → their (already
+    # device-resident) tensors, so each shard tensor can be copy_'d in
+    # place.  named_parameters() de-dupes tied weights, so a tied lm_head
+    # is absent here and rides along on the shared embed_tokens storage.
+    targets: dict[str, torch.Tensor] = dict(model.named_parameters())
+    targets.update(model.named_buffers())
 
     # Prefer the sharded index; fall back to a single `model.safetensors`
     # for repos that ship consolidated weights (e.g. Ministral-3-3B).
@@ -203,33 +321,52 @@ def _load_text_from_multimodal(
         single_path = cached_file(model_id, SAFE_WEIGHTS_NAME)
         shard_paths = [single_path]
 
-    prefix = "language_model."
-
-    for sf in shard_paths:
-        shard = load_file(sf, device="cpu")
-        mapped: dict[str, torch.Tensor] = {}
-
-        for k, v in shard.items():
-            if not k.startswith(prefix):
+    matched = 0
+    with torch.no_grad():
+        for sf in shard_paths:
+            # cached_file returns str | None; None means a missing shard —
+            # skip it. In practice the single-shard path raises before here.
+            if sf is None:
                 continue
-            key = k[len(prefix):]
-            if key.endswith(".weight_scale_inv") or key.endswith(".activation_scale"):
-                continue
+            header, data_start = _read_safetensors_header(sf)
+            # Read in on-disk offset order so an uncached fd still streams
+            # sequentially (no per-tensor seek thrash).
+            names = sorted(header, key=lambda nm: header[nm]["data_offsets"][0])
+            fd = _open_uncached(sf)
+            try:
+                for name in names:
+                    if "language_model." not in name:
+                        continue  # vision tower / projector — skip
+                    # Drop the language_model. segment to recover the text
+                    # model's own parameter name. Works for both layouts:
+                    #   language_model.model.layers… -> model.layers…
+                    #   model.language_model.layers… -> model.layers…
+                    key = name.replace("language_model.", "", 1)
+                    if key.endswith((".weight_scale_inv", ".activation_scale")):
+                        continue
+                    target = targets.get(key)
+                    if target is None:
+                        continue
+                    v = _read_st_tensor(fd, header, data_start, name)
+                    # Dequantize FP8: real_weight = weight.to(dtype) * scale
+                    if v.dtype in _FP8_DTYPES:
+                        sk = name + "_scale_inv"
+                        scale = (_read_st_tensor(fd, header, data_start, sk)
+                                 if sk in header else None)
+                        v = v.to(dtype) * scale.to(dtype) if scale is not None else v.to(dtype)
+                    target.copy_(v)  # CPU→device cast + copy into preallocated param
+                    matched += 1
+                    del v
+            finally:
+                os.close(fd)
+            if device == "mps":
+                torch.mps.empty_cache()
+            gc.collect()
 
-            # Dequantize FP8: real_weight = weight.to(dtype) * scale
-            if v.dtype in _FP8_DTYPES:
-                scale = shard.get(k + "_scale_inv")
-                if scale is not None:
-                    v = v.to(dtype) * scale.to(dtype)
-                else:
-                    v = v.to(dtype)
-            mapped[key] = v.to(device=device, dtype=dtype)
-
-        if mapped:
-            model.load_state_dict(mapped, strict=False)
-
-        del shard, mapped
-        gc.collect()
+    if matched == 0:
+        raise _NoTextWeightsExtracted(
+            f"no text-model weights matched the language_model. layout in {model_id!r}"
+        )
 
     if device == "mps":
         torch.mps.empty_cache()
@@ -237,7 +374,7 @@ def _load_text_from_multimodal(
     return model
 
 
-def _run_compile_probes(compiled, model, device, bos_token_id: int, *, mode: str):
+def _run_compile_probes(compiled: Any, model: PreTrainedModel, device: str | torch.device, bos_token_id: int, *, mode: str) -> None:
     """Trigger compilation of the call shapes saklas actually uses.
 
     For ``mode="reduce-overhead"`` saklas's session generates through
@@ -323,7 +460,7 @@ def _run_compile_probes(compiled, model, device, bos_token_id: int, *, mode: str
 
 
 def _compile_with_probe(
-    model,
+    model: PreTrainedModel,
     tokenizer: PreTrainedTokenizerBase,
     device: str | torch.device,
     *,
@@ -406,7 +543,7 @@ def _pick_dtype(device: str) -> torch.dtype:
     return torch.float32
 
 
-def _resolve_dtype(dtype, device: str) -> torch.dtype:
+def _resolve_dtype(dtype: torch.dtype | str | None, device: str) -> torch.dtype:
     if dtype is None:
         return _pick_dtype(device)
     if isinstance(dtype, str):
@@ -471,7 +608,7 @@ def load_model(
     # so it fires for any mistralai/* repo (Mistral-Small, Ministral, etc.) and
     # third-party finetunes whose name carries the family.
     # https://huggingface.co/mistralai/Mistral-Small-3.1-24B-Instruct-2503/discussions/84
-    tokenizer_kwargs: dict = {"trust_remote_code": True}
+    tokenizer_kwargs: dict[str, Any] = {"trust_remote_code": True}
     if "mistral" in model_id.lower():
         tokenizer_kwargs["fix_mistral_regex"] = True
     tokenizer = AutoTokenizer.from_pretrained(model_id, **tokenizer_kwargs)
@@ -480,7 +617,8 @@ def load_model(
     if quantize and device != "cuda":
         warnings.warn(
             f"bitsandbytes quantization ({quantize}) requires CUDA. "
-            f"Ignoring --quantize on {device}, loading in {resolved_dtype}."
+            f"Ignoring --quantize on {device}, loading in {resolved_dtype}.",
+            stacklevel=2,
         )
         quantize = None
 
@@ -491,7 +629,7 @@ def load_model(
             # Availability check only — presence of the package flips
             # transformers onto the flash-attention-2 kernel. We never
             # call into flash_attn ourselves.
-            import flash_attn  # noqa: F401
+            import flash_attn  # pyright: ignore[reportMissingImports]  # noqa: F401
             attn_impl = "flash_attention_2"
         except ImportError:
             pass
@@ -531,25 +669,24 @@ def load_model(
     _MLA_TYPES = {"deepseek_v2", "deepseek_v3"}
     if device == "mps" and (
         native_type in _MLA_TYPES or native_text_type in _MLA_TYPES
-    ):
-        if attn_impl != "eager":
-            log.info(
-                "forcing eager attention on MPS for MLA model %r "
-                "(PyTorch MPS SDPA mishandles mismatched q/v head_dim)",
-                native_type or native_text_type,
-            )
-            attn_impl = "eager"
+    ) and attn_impl != "eager":
+        log.info(
+            "forcing eager attention on MPS for MLA model %r "
+            "(PyTorch MPS SDPA mishandles mismatched q/v head_dim)",
+            native_type or native_text_type,
+        )
+        attn_impl = "eager"
 
     # --- check for multimodal configs wrapping a text-only model ---
     # Some text-only models ship with a multimodal config whose
     # model_type isn't registered with AutoModelForCausalLM (e.g.
     # Ministral tagged as Mistral3).  If the config has a text_config
     # that IS a known causal-LM type, use that instead.
-    load_kwargs: dict = dict(
-        attn_implementation=attn_impl,
-        trust_remote_code=trust,
-        device_map=device_map,
-    )
+    load_kwargs: dict[str, Any] = {
+        "attn_implementation": attn_impl,
+        "trust_remote_code": trust,
+        "device_map": device_map,
+    }
     if quantize == "4bit":
         load_kwargs["quantization_config"] = BitsAndBytesConfig(
             load_in_4bit=True,
@@ -562,27 +699,42 @@ def load_model(
         load_kwargs["dtype"] = resolved_dtype
     config = AutoConfig.from_pretrained(model_id, trust_remote_code=trust)
     text_cfg = getattr(config, "text_config", None)
+    # A non-None text_config means a multimodal wrapper. When it wraps a
+    # text model saklas supports, load *only* the text submodel: it skips
+    # the unused vision tower and — crucially — loads on-device shard-by-
+    # shard so peak memory stays ~1× the model size instead of the ~2× the
+    # standard CPU-stage-then-device-copy path costs on unified memory (the
+    # >128 GB gemma-4-31B blowup). This fires even when the outer composite
+    # model_type is itself in _LAYER_ACCESSORS (gemma3/gemma4): the full
+    # multimodal model is still usable when handed to SaklasSession
+    # directly, but the from_pretrained path prefers text-only.
     extract_text_model = (
         text_cfg is not None
         and getattr(text_cfg, "model_type", None) in _LAYER_ACCESSORS
-        and getattr(config, "model_type", None) not in _LAYER_ACCESSORS
     )
 
+    model = None
     if extract_text_model:
-        # Multimodal checkpoint wrapping a supported text-only model
-        # (e.g. Ministral tagged as Mistral3).  Weights are stored
-        # with a "language_model." prefix that doesn't match the
-        # text-only model's parameter names.  Load manually.
+        # Weights live under a "language_model." path segment that doesn't
+        # match the text-only model's parameter names.  Load manually.
         # Propagate _name_or_path so cache paths resolve correctly.
+        assert text_cfg is not None  # guaranteed by extract_text_model condition above
         if not getattr(text_cfg, "_name_or_path", ""):
             text_cfg._name_or_path = model_id
         log.info("extracting text model (%s) from multimodal checkpoint (%s)",
                  text_cfg.model_type, config.model_type)
-        model = _load_text_from_multimodal(
-            model_id, text_cfg, load_kwargs.get("dtype", resolved_dtype),
-            device,
-        )
-    else:
+        try:
+            model = _load_text_from_multimodal(
+                model_id, text_cfg, load_kwargs.get("dtype", resolved_dtype),
+                device,
+            )
+        except _NoTextWeightsExtracted as e:
+            # Unexpected weight layout — don't ship random init; fall through
+            # to the standard full-model load below.
+            log.warning("%s; falling back to full multimodal load", e)
+            model = None
+
+    if model is None:
         # --- standard load (with attention, dtype, and device fallbacks) ---
         def _try_load_with_fallbacks():
             try:
@@ -611,10 +763,32 @@ def load_model(
             if "dtype" not in load_kwargs:
                 load_kwargs["dtype"] = torch.float32
             model = _try_load_with_fallbacks()
-            model = model.to(device)
+            model = model.to(device)  # pyright: ignore[reportArgumentType]  # transformers stub: .to(str) overload missing
 
     model.requires_grad_(False)
     model.train(False)
+
+    # --- reconcile the chat stop-token set -------------------------------
+    # A multimodal checkpoint's *text* sub-config can under-specify the
+    # end-of-turn tokens its chat template actually emits.  Gemma-4 is the
+    # live case: the composite config lists ``eos_token_id = [<eos>, <turn|>]``
+    # but the extracted ``gemma4_unified_text`` sub-config (what
+    # ``_load_text_from_multimodal`` builds from via ``from_config``) carries
+    # only ``<eos>``, so the loaded model's ``generation_config`` claims the
+    # sole stop token is ``<eos>`` while the model ends every turn with
+    # ``<turn|>``.  HF ``model.generate`` (the native-generate corpus path,
+    # ``session._run_generator``) reads ``generation_config.eos_token_id``, so
+    # without this it runs past every ``<turn|>`` to ``max_new_tokens`` — the
+    # model loops and leaks reasoning-channel name tokens (``thought``) that
+    # ``skip_special_tokens`` can't strip.  ``_get_eos_ids`` is the
+    # chat-correct set (config eos ∪ tokenizer eos ∪ the template's added
+    # end-of-turn tokens) and is exactly what the steered loop already stops
+    # on, so adopting it as the generation default unifies both paths.
+    from saklas.core.generation import _get_eos_ids
+    chat_eos = sorted(_get_eos_ids(model, tokenizer))
+    gen_cfg = getattr(model, "generation_config", None)
+    if chat_eos and gen_cfg is not None:
+        gen_cfg.eos_token_id = chat_eos if len(chat_eos) > 1 else chat_eos[0]
 
     # --- memory report ---
     mem_gb = _get_memory_gb(device)
@@ -630,9 +804,11 @@ def load_model(
     # Hooks added later via ``register_forward_hook`` on layer modules
     # (which live under ``model._orig_mod``) compose cleanly: compile
     # treats hooks as external state and recompiles only when the
-    # hook's *Python-scalar* inputs change.  Pinning the angle scalars
-    # to 0-dim tensors in :class:`SteeringHook._refresh_angular_cache`
-    # keeps a single compiled artifact across α changes between
+    # hook's *Python-scalar* inputs change.  The unified steering hook
+    # reads its per-gen coefficients from pre-traced per-layer ``(D,)``
+    # offset buffers updated in place (:meth:`SteeringManager.write_compiled_offsets`,
+    # installed by :func:`install_persistent_offset_hooks`), so compile sees
+    # no structural change and never retraces across α changes between
     # generations.
     if compile and device == "cuda":
         model = _compile_with_probe(model, tokenizer, device, mode=compile_mode)
@@ -664,7 +840,7 @@ def _get_memory_gb(device: str) -> float:
     return 0.0
 
 
-def get_layers(model) -> nn.ModuleList:
+def get_layers(model: PreTrainedModel) -> nn.ModuleList:
     """Return the sequential transformer blocks for a supported architecture."""
     model_type = model.config.model_type
     accessor = _LAYER_ACCESSORS.get(model_type)
@@ -684,13 +860,13 @@ def get_layers(model) -> nn.ModuleList:
     return accessor(model)
 
 
-def _text_config(model):
+def _text_config(model: PreTrainedModel) -> Any:
     """Return the text-specific config, handling multimodal wrappers."""
     cfg = model.config
     return getattr(cfg, "text_config", cfg)
 
 
-def get_model_info(model, tokenizer) -> dict:
+def get_model_info(model: PreTrainedModel, tokenizer: PreTrainedTokenizerBase) -> dict[str, Any]:
     """Summary dict: model_type, num_layers, hidden_dim, device, dtype, vram_used_gb, param_count."""
     layers = get_layers(model)
     first_param = next(model.parameters())

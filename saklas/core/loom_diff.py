@@ -13,10 +13,7 @@ Three primitives used by the cross-branch comparison surfaces:
   from "appeared at 0.1 (no prior reading)".
 - :func:`per_token_diff` — byte-offset-based alignment between two token
   sequences.  Stops at the shortest common prefix where bytes diverge;
-  per-token reading deltas land at aligned positions only.  The
-  ``reference_tokenize`` hook is a placeholder for re-tokenization
-  against a shared reference in a later phase — phase 5 leaves it
-  unused.
+  per-token reading deltas land at aligned positions only.
 
 Plus :func:`steering_delta` — render a compact label like
 ``"+0.2 calm"`` for the parent → child edge by walking both
@@ -27,7 +24,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from difflib import SequenceMatcher
-from typing import Any, Callable, Literal, Mapping, Sequence
+from typing import Any, Literal, Mapping, Sequence
 
 
 # ---------------------------------------------------------------------------
@@ -71,9 +68,9 @@ def text_diff(a: str, b: str) -> list[DiffSpan]:
 
     Uses :class:`difflib.SequenceMatcher` on whitespace-split tokens.
     Returns a flat list of :class:`DiffSpan` in order, suitable for
-    rendering unified-diff style or side-by-side.  Empty inputs produce
-    a single-span result (``equal`` for both empty, otherwise the
-    appropriate ``insert`` / ``delete`` of the non-empty side).
+    rendering unified-diff style or side-by-side.  Both-empty inputs
+    produce an empty list; an empty-vs-non-empty input produces a single
+    ``insert`` / ``delete`` span of the non-empty side.
     """
     a_toks = _tokenize_for_diff(a)
     b_toks = _tokenize_for_diff(b)
@@ -195,7 +192,6 @@ def per_token_diff(
     *,
     a_scores: Mapping[str, Sequence[float]] | None = None,
     b_scores: Mapping[str, Sequence[float]] | None = None,
-    reference_tokenize: Callable[[str], list[str]] | None = None,
 ) -> list[TokenDeltaSpan]:
     """Byte-offset alignment between two token sequences.
 
@@ -205,13 +201,8 @@ def per_token_diff(
     per-probe deltas pulled from the optional ``a_scores`` / ``b_scores``
     maps.  Position drift (one side adds bytes the other doesn't)
     surfaces as ``aligned=False`` spans and reading deltas drop.
-
-    The ``reference_tokenize`` hook is a placeholder for the
-    documented "re-tokenize against a common reference" mode — phase 5
-    leaves it unused; identical-tokenizer cases (same model on both
-    siblings) work without it.
+    Identical-tokenizer cases (same model on both siblings) align directly.
     """
-    del reference_tokenize  # placeholder for later phases — silence lint
     a_off = _token_byte_offsets(a_tokens)
     b_off = _token_byte_offsets(b_tokens)
 
@@ -316,12 +307,17 @@ def _entry_alpha(entry: Any) -> float:
     """Extract the numeric coefficient from a Steering.alphas entry.
 
     Handles bare floats, ``(alpha, trigger)`` tuples, ``ProjectedTerm``,
-    and ``AblationTerm`` uniformly so the delta formatter doesn't have
-    to special-case each shape.
+    ``AblationTerm``, and ``ManifoldTerm`` uniformly so the delta
+    formatter doesn't have to special-case each shape — every non-scalar
+    entry exposes a ``.coeff`` field.
     """
-    from saklas.core.steering_expr import AblationTerm, ProjectedTerm
+    from saklas.core.steering_expr import (
+        AblationTerm,
+        ManifoldTerm,
+        ProjectedTerm,
+    )
 
-    if isinstance(entry, (ProjectedTerm, AblationTerm)):
+    if isinstance(entry, (ProjectedTerm, AblationTerm, ManifoldTerm)):
         return float(entry.coeff)
     if isinstance(entry, tuple):
         return float(entry[0])
@@ -335,12 +331,9 @@ def _format_term(name: str, alpha: float, *, sign_prefix: bool = True) -> str:
     edge labels read like ``+0.2 calm`` / ``-0.3 honest``; turn off for
     the leading position in compound labels.
     """
-    if alpha == 0.0:
-        return f"−{name}"
     if sign_prefix and alpha >= 0:
         return f"+{alpha:g} {name}"
-    if alpha < 0:
-        return f"{alpha:g} {name}"
+    # A negative alpha already carries its ``-`` via ``%g``.
     return f"{alpha:g} {name}"
 
 
@@ -355,12 +348,13 @@ def steering_delta(parent_expr: str | None, child_expr: str | None) -> str:
     edge cases where one side fails to parse — UIs render whichever
     sentinel they receive.
 
-    Output format examples::
+    Output format examples (``X``/``Y`` stand for the canonical
+    ``Steering.alphas`` keys the grammar produces; the leading term carries
+    no sign prefix, later terms get ``+`` / ``-``)::
 
-        steering_delta(None, "0.3 calm")            == "+0.3 calm"
-        steering_delta("0.3 calm", "0.5 calm")      == "+0.2 calm"
-        steering_delta("0.3 calm", "")              == "-0.3 calm"
-        steering_delta("0.3 calm", "0.3 calm + 0.2 warm") == "+0.2 warm"
+        steering_delta(None, "0.3 X")              == "0.3 X"
+        steering_delta("0.3 X", "")                == "-0.3 X"
+        steering_delta("0.3 X", "0.5 X + 0.2 Y")   == "0.2 X +0.2 Y"
     """
     p = _parse_or_empty(parent_expr)
     c = _parse_or_empty(child_expr)

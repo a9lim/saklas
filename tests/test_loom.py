@@ -9,6 +9,7 @@ from __future__ import annotations
 import gzip
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -73,8 +74,9 @@ def test_begin_and_finalize_assistant():
     uid = t.add_user_turn("hello")
     aid = t.begin_assistant(uid, recipe=Recipe(steering="0.3 honest"))
     assert t.nodes[aid].role == "assistant"
-    assert t.nodes[aid].recipe is not None
-    assert t.nodes[aid].recipe.steering == "0.3 honest"
+    recipe = t.nodes[aid].recipe
+    assert recipe is not None  # guaranteed by begin_assistant with explicit Recipe arg
+    assert recipe.steering == "0.3 honest"
     assert t.active_node_id == aid
     t.finalize_assistant(
         aid, text="hi back",
@@ -122,6 +124,41 @@ def test_messages_for_explicit_leaf():
         {"role": "user", "content": "hi"},
         {"role": "assistant", "content": "hi there"},
     ]
+
+
+def test_flat_text_concatenates_active_path():
+    """Flat-mode buffer: every node's text joined, no roles, no markers."""
+    t = _seed_tree()
+    assert t.flat_text() == "hihello"
+
+
+def test_flat_text_skips_synthetic_root():
+    """An empty tree (bare system root) flattens to the empty string."""
+    t = LoomTree()
+    assert t.flat_text() == ""
+
+
+def test_flat_text_explicit_leaf():
+    """Flat text of an off-path branch walks that branch, not the active one."""
+    t = LoomTree()
+    u1 = t.add_user_turn("once upon a ")
+    a1 = t.begin_assistant(u1)
+    t.finalize_assistant(a1, text="time")
+    a2 = t.branch(a1, "day")
+    assert t.flat_text(a1) == "once upon a time"
+    assert t.flat_text(a2) == "once upon a day"
+
+
+def test_flat_text_assistant_chain():
+    """Bare continuations chain assistant-under-assistant — flat_text still
+    walks the whole path with no separators."""
+    t = LoomTree()
+    u1 = t.add_user_turn("seed ")
+    a1 = t.begin_assistant(u1)
+    t.finalize_assistant(a1, text="one ")
+    a2 = t.begin_assistant(a1)  # continuation hangs straight off a1
+    t.finalize_assistant(a2, text="two")
+    assert t.flat_text() == "seed one two"
     # active_path() still tracks the live cursor (now a2 after branch).
     assert t.active_node_id == a2
 
@@ -189,7 +226,7 @@ def test_edit_root_refused():
 def test_edit_emits_event():
     t = _seed_tree()
     bus = EventBus()
-    seen: list = []
+    seen: list[Any] = []
     bus.subscribe(seen.append)
     t.attach_events(bus)
     t.edit(t.active_node_id, "edited")
@@ -206,6 +243,7 @@ def test_branch_creates_sibling_and_preserves_original():
     t = _seed_tree()
     a1 = t.active_node_id
     parent = t.nodes[a1].parent_id
+    assert parent is not None  # a1 is a child of a user node in the seed tree
     a2 = t.branch(a1, "alternate reply")
     assert a2 != a1
     assert t.nodes[a2].parent_id == parent
@@ -539,7 +577,7 @@ def test_d15_engine_check_passes_for_explicit_grandparent():
 # stub lets us unit-test the contract without loading a model.
 
 
-def _bind_commit_methods(tree: LoomTree, tokenizer):
+def _bind_commit_methods(tree: LoomTree, tokenizer: Any):
     from saklas.core.session import SaklasSession
     stub = type(
         "S", (),
@@ -948,3 +986,39 @@ def test_load_refuses_future_format(tmp_path: Path):
     path.write_text(json.dumps(raw))
     with pytest.raises(Exception):
         LoomTree.load(path)
+
+
+# ---------------------------------------------------------------------------
+# Per-turn role labels (roleplay scaffold)
+# ---------------------------------------------------------------------------
+
+
+def test_role_label_stamped_and_round_trips():
+    t = LoomTree()
+    u = t.add_user_turn("hi", role_label="captain")
+    a = t.begin_assistant(u, recipe=None, role_label="pirate")
+    assert t.nodes[u].role_label == "captain"
+    assert t.nodes[a].role_label == "pirate"
+    # to_dict / from_dict carry the label.
+    d = t.nodes[u].to_dict()
+    assert d["role_label"] == "captain"
+    assert LoomNode.from_dict(d).role_label == "captain"
+
+
+def test_role_label_defaults_none():
+    t = LoomTree()
+    u = t.add_user_turn("hi")
+    assert t.nodes[u].role_label is None
+
+
+def test_messages_for_with_labels():
+    t = LoomTree()
+    u = t.add_user_turn("hi", role_label="captain")
+    t.begin_assistant(u, recipe=None, role_label="pirate")
+    labeled = t.messages_for(with_labels=True)
+    assert labeled[0]["role"] == "user"
+    assert labeled[0]["label"] == "captain"
+    assert labeled[1]["label"] == "pirate"
+    # Default shape stays {role, content} — no label key.
+    plain = t.messages_for()
+    assert "label" not in plain[0]

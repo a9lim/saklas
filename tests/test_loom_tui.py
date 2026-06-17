@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Callable
 from unittest.mock import MagicMock
 
 import pytest
@@ -52,7 +52,7 @@ def _make_app():
     session._layers = [0, 1, 2]
     session._monitor = MagicMock()
     session._monitor.probe_names = []
-    session._monitor.profiles = {}
+    session._monitor.manifolds = {}
     session._last_result = None
     session._last_per_token_scores = None
     session._tokenizer = MagicMock()
@@ -70,7 +70,10 @@ def _make_app():
     app._device_str = "cpu"
     app._alphas = {}
     app._enabled = {}
+    app._manifold_terms = {}
     app._supports_thinking = False
+    app._is_base_model = False
+    app._render_mode = "chat"
     app._thinking = False
     app._current_assistant_widget = None
     app._poll_timer = None
@@ -428,7 +431,7 @@ def test_format_compare_renders_sibling_diff():
     session = SimpleNamespace(tree=tree)
     _wire_real_diff(session, tree)
 
-    out = format_compare(session, bid)  # type: ignore[arg-type]
+    out = format_compare(session, bid)
     assert "compare" in out
     assert aid[:8] in out          # the sibling is listed
     assert "honest" in out         # steering delta term
@@ -446,8 +449,8 @@ def test_format_compare_one_reply_is_advisory():
     session = SimpleNamespace(tree=tree)
     # A turn with a single reply has nothing to compare — same advisory
     # whether the cursor sits on the assistant reply or the user node.
-    assert "one assistant reply" in format_compare(session, aid)  # type: ignore[arg-type]
-    assert "one assistant reply" in format_compare(session, uid)  # type: ignore[arg-type]
+    assert "one assistant reply" in format_compare(session, aid)
+    assert "one assistant reply" in format_compare(session, uid)
 
 
 def test_format_compare_user_turn_with_no_replies_is_advisory():
@@ -456,7 +459,7 @@ def test_format_compare_user_turn_with_no_replies_is_advisory():
     tree = LoomTree()
     uid = tree.add_user_turn("hi")
     session = SimpleNamespace(tree=tree)
-    out = format_compare(session, uid)  # type: ignore[arg-type]
+    out = format_compare(session, uid)
     assert "no assistant replies" in out
 
 
@@ -475,7 +478,7 @@ def test_format_compare_from_user_node_diffs_replies():
     session = SimpleNamespace(tree=tree)
     _wire_real_diff(session, tree)
 
-    out = format_compare(session, uid)  # type: ignore[arg-type]
+    out = format_compare(session, uid)
     assert "compare" in out
     assert "honest" in out         # steering delta term
     assert "calm" in out           # reading delta
@@ -642,7 +645,7 @@ def test_path_prints_summary():
     assert "hello" in out
 
 
-def test_save_writes_full_tree(tmp_path: Path, monkeypatch) -> None:
+def test_save_writes_full_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """`/save` serializes the whole loom tree to the conversations dir."""
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     app = _make_app()
@@ -653,7 +656,7 @@ def test_save_writes_full_tree(tmp_path: Path, monkeypatch) -> None:
     assert "saved tree" in _msgs(app)
 
 
-def test_save_load_preserves_branches(tmp_path: Path, monkeypatch) -> None:
+def test_save_load_preserves_branches(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """`/save` + `/load` round-trip every branch, not just the active path."""
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     app = _make_app()
@@ -672,7 +675,7 @@ def test_save_load_preserves_branches(tmp_path: Path, monkeypatch) -> None:
     assert "alt reply" in texts      # off-path branch
 
 
-def test_load_missing_file(tmp_path: Path, monkeypatch) -> None:
+def test_load_missing_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """`/load` on an absent name reports cleanly without raising."""
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     app = _make_app()
@@ -713,7 +716,7 @@ def test_fire_auto_regen_streams_into_shadow_column():
                    scores=None, perplexity=None),
     ]
 
-    def _fake_stream(*args, **kwargs):
+    def _fake_stream(*args: Any, **kwargs: Any) -> Any:
         # Confirm we routed through ``recipe_override`` (so the mode
         # actually lands) and ``parent_node_id`` (so the new node is a
         # sibling under the user-parent).
@@ -725,12 +728,12 @@ def test_fire_auto_regen_streams_into_shadow_column():
 
     # Synchronously run the worker the app would spawn so the test
     # doesn't depend on Textual's worker thread machinery.
-    workers: list = []
-    def _run_worker(fn, **_kw):
+    workers: list[Any] = []
+    def _run_worker(fn: Callable[..., Any], **_kw: Any) -> None:
         t = threading.Thread(target=fn)
         t.start()
         workers.append(t)
-    app.run_worker = _run_worker
+    app.run_worker = _run_worker  # pyright: ignore[reportAttributeAccessIssue]  # textual Worker stub mismatch
 
     app._fire_auto_regen(row)
 
@@ -743,11 +746,11 @@ def test_fire_auto_regen_streams_into_shadow_column():
         items.append(app._ui_token_queue.get_nowait())
     tok_items = [it for it in items if it[0] == "tok"]
     assert len(tok_items) == 2, items
-    # Position 7 (trailing flag) is the ``is_shadow`` tag.  Tuple shape
-    # post-Phase 3: (kind, text, thinking, scores, perplexity, logprob,
-    # widget, is_shadow) — eight elements after the logit-pass logprob
-    # field landed between perplexity and widget.
-    assert all(it[-1] is True for it in tok_items)
+    # Position 7 is the ``is_shadow`` tag.  Tuple shape:
+    # (kind, text, thinking, scores, perplexity, logprob, widget,
+    # is_shadow, probe_readings) — nine elements, the unified per-token
+    # ``ProbeReading`` dict in the tail slot.
+    assert all(it[7] is True for it in tok_items)
     # And the right column had its shadow widget mounted.
     app._chat_panel.start_shadow_message.assert_called_once_with(row)
 
@@ -767,7 +770,7 @@ def test_diff_unique_prefix_diffs_two_siblings():
     # rendering shape).
     import saklas
 
-    def _real_diff(a_id, b_id):
+    def _real_diff(a_id: str, b_id: str) -> Any:
         a = tree.get(a_id)
         b = tree.get(b_id)
         return saklas.NodeDiff(
@@ -799,7 +802,7 @@ def test_diff_siblings_two_kids_diffs_pair():
 
     import saklas
 
-    def _real_diff(a_id, b_id):
+    def _real_diff(a_id: str, b_id: str) -> Any:
         a = tree.get(a_id)
         b = tree.get(b_id)
         return saklas.NodeDiff(
@@ -931,7 +934,7 @@ def test_fan_parses_alpha_grid_and_kicks_worker():
     app._last_prompt = "do a thing"
     captured = {}
 
-    def _intercept(vector, alphas, prompt):
+    def _intercept(vector: str, alphas: list[float], prompt: str) -> None:
         captured["vector"] = vector
         captured["alphas"] = alphas
         captured["prompt"] = prompt
@@ -960,7 +963,7 @@ def test_regen_n_dispatches_through_loom_helper():
     app = _make_app()
     captured = {}
 
-    def _intercept(n):
+    def _intercept(n: int) -> None:
         captured["n"] = n
     app._run_regen_n_worker = _intercept
     app._dispatch_loom_regen = lambda n, *, mode=None: _intercept(n)
@@ -1024,12 +1027,12 @@ def test_regen_with_mode_calls_regen_with_modifier():
     uid, aid = _seed_tree(app._session.tree)
     captured = {}
 
-    def _intercept(n, mode):
+    def _intercept(n: int, mode: Any) -> None:
         captured["n"] = n
         captured["mode"] = mode
     app._run_regen_modifier_worker = _intercept
     # Make sure we aren't deferred onto the pending queue.
-    app._session.is_generating = False
+    app._session.is_generating = False  # pyright: ignore[reportAttributeAccessIssue]  # is_generating is a property; MagicMock session allows attribute assignment
 
     app._handle_command("/regen 4 inverted")
     assert captured.get("n") == 4
@@ -1111,11 +1114,12 @@ def test_user_submitted_on_user_node_routes_to_prefill():
     tree.navigate(uid)
     app._start_prefill = MagicMock()
     app._start_generation = MagicMock()
-    app.on_chat_panel_user_submitted(SimpleNamespace(text="It is sunny"))
+    app.on_chat_panel_user_submitted(SimpleNamespace(text="It is sunny"))  # pyright: ignore[reportArgumentType]  # SimpleNamespace used as UserSubmitted test double
     app._start_prefill.assert_called_once_with(uid, "It is sunny")
     app._start_generation.assert_not_called()
     # The prefill path must not optimistically mount a user row.
-    app._chat_panel.add_user_message.assert_not_called()
+    add_user_message: Any = app._chat_panel.add_user_message
+    add_user_message.assert_not_called()
 
 
 def test_user_submitted_on_assistant_node_routes_to_generation():
@@ -1126,10 +1130,11 @@ def test_user_submitted_on_assistant_node_routes_to_generation():
     tree.navigate(aid)
     app._start_prefill = MagicMock()
     app._start_generation = MagicMock()
-    app.on_chat_panel_user_submitted(SimpleNamespace(text="next question"))
+    app.on_chat_panel_user_submitted(SimpleNamespace(text="next question"))  # pyright: ignore[reportArgumentType]  # SimpleNamespace used as UserSubmitted test double
     app._start_generation.assert_called_once_with("next question")
     app._start_prefill.assert_not_called()
-    app._chat_panel.add_user_message.assert_called_once_with("next question")
+    add_user_message2: Any = app._chat_panel.add_user_message
+    add_user_message2.assert_called_once_with("next question")
 
 
 def test_user_submitted_on_user_node_defers_prefill_target_in_pending():
@@ -1143,10 +1148,10 @@ def test_user_submitted_on_user_node_defers_prefill_target_in_pending():
     tree = app._session.tree
     uid, _aid = _seed_tree(tree)
     tree.navigate(uid)
-    app._session.is_generating = True
+    app._session.is_generating = True  # pyright: ignore[reportAttributeAccessIssue]  # is_generating is a property; MagicMock session allows attribute assignment
     app._session.stop = MagicMock()
     app._start_prefill = MagicMock()
-    app.on_chat_panel_user_submitted(SimpleNamespace(text="seed it"))
+    app.on_chat_panel_user_submitted(SimpleNamespace(text="seed it"))  # pyright: ignore[reportArgumentType]  # SimpleNamespace used as UserSubmitted test double
     assert app._pending_queue == [
         PendingItem("submit", "seed it", (uid,)),
     ]
@@ -1236,7 +1241,7 @@ def test_commit_action_during_gen_queues_commit_user():
     _uid, aid = _seed_tree(tree)
     tree.navigate(aid)
     _stub_chat_input(app, "next bit")
-    app._session.is_generating = True
+    app._session.is_generating = True  # pyright: ignore[reportAttributeAccessIssue]  # is_generating is a property; MagicMock session allows attribute assignment
     app._session.stop = MagicMock()
     app._start_commit_user = MagicMock()
     app.action_commit_text()
@@ -1255,7 +1260,7 @@ def test_commit_action_during_gen_queues_commit_assistant_with_target():
     uid, _aid = _seed_tree(tree)
     tree.navigate(uid)
     _stub_chat_input(app, "the canned reply")
-    app._session.is_generating = True
+    app._session.is_generating = True  # pyright: ignore[reportAttributeAccessIssue]  # is_generating is a property; MagicMock session allows attribute assignment
     app._session.stop = MagicMock()
     app._start_commit_assistant = MagicMock()
     app.action_commit_text()
@@ -1264,6 +1269,59 @@ def test_commit_action_during_gen_queues_commit_assistant_with_target():
     ]
     app._start_commit_assistant.assert_not_called()
     app._session.stop.assert_not_called()
+
+
+def test_raw_commit_action_uses_buffer_draft():
+    """Ctrl+Enter in raw mode commits the flat buffer edit."""
+    app = _make_app()
+    app._render_mode = "raw"
+    app._chat_panel.raw_buffer = SimpleNamespace(  # pyright: ignore[reportAttributeAccessIssue]  # ChatPanel.raw_buffer is a property; MagicMock allows attribute override
+        draft="existing text plus edit",
+        is_dirty=True,
+    )
+    app._commit_raw_draft = MagicMock()
+
+    app.action_commit_text()
+
+    app._commit_raw_draft.assert_called_once_with("existing text plus edit")
+
+
+def test_dispatch_pending_raw_commit_routes_correctly():
+    from saklas.tui.chat_panel import PendingItem
+
+    app = _make_app()
+    app._start_raw_commit = MagicMock()
+
+    app._dispatch_pending_action(PendingItem("raw_commit", "queued flat text"))
+
+    app._start_raw_commit.assert_called_once_with("queued flat text")
+
+
+def test_nav_refuses_dirty_raw_buffer():
+    app = _make_app()
+    tree = app._session.tree
+    _uid, aid = _seed_tree(tree)
+    tree.navigate(tree.root_id)
+    app._render_mode = "raw"
+    app._chat_panel.raw_buffer = SimpleNamespace(is_dirty=True)  # pyright: ignore[reportAttributeAccessIssue]  # ChatPanel.raw_buffer is a property; MagicMock allows attribute override
+
+    app._handle_nav(aid[:8])
+
+    assert tree.active_node_id != aid
+    assert "uncommitted edits" in _msgs(app)
+
+
+def test_raw_edit_resyncs_buffer_after_tree_mutation():
+    app = _make_app()
+    tree = app._session.tree
+    _uid, aid = _seed_tree(tree)
+    tree.navigate(aid)
+    app._render_mode = "raw"
+    app._sync_raw_buffer_from_tree = MagicMock()
+
+    app._handle_edit("edited text")
+
+    app._sync_raw_buffer_from_tree.assert_called_once()
 
 
 def test_dispatch_pending_commit_user_routes_correctly():

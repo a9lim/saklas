@@ -1,0 +1,440 @@
+{
+  "format_version": 5,
+  "name": "personas",
+  "description": "Persona archetypes for discover-mode AUTO-fit manifold steering. 107 nodes spanning everyday and pre-modern human roles, modern social subcultures, institutional and political identities, relational and psychological archetypes, creative and divine figures, fantastical creatures, nonhuman animals, inanimate objects, AI / synthetic personas, and the named harmful cluster. Lineage is Anthropic's Assistant Axis paper (arXiv 2601.10387) plus the Persona Selection Model framing; the 2026-05-31 recut data-pruned redundant / near-baseline nodes (whitened per-node centroid distances, cross-model consistent) and filled previously-empty semantic axes. fit_mode=auto resolves the geometry per-model (select_topology scores a flat affine subspace against a curved RBF surface by GCV, with persistent-homology periodic detection); the persona fan resolves flat \u2014 a low-dim affine subspace over the per-node centroids \u2014 on role-supporting model families.",
+  "fit_mode": "auto",
+  "hyperparams": {
+    "max_dim": 8
+  },
+  "nodes": [
+    {
+      "label": "assistant",
+      "kind": "concrete"
+    },
+    {
+      "label": "analyst",
+      "kind": "concrete"
+    },
+    {
+      "label": "impostor",
+      "kind": "concrete"
+    },
+    {
+      "label": "teacher",
+      "kind": "concrete"
+    },
+    {
+      "label": "doctor",
+      "kind": "concrete"
+    },
+    {
+      "label": "librarian",
+      "kind": "concrete"
+    },
+    {
+      "label": "farmer",
+      "kind": "concrete"
+    },
+    {
+      "label": "soldier",
+      "kind": "concrete"
+    },
+    {
+      "label": "lawyer",
+      "kind": "concrete"
+    },
+    {
+      "label": "chef",
+      "kind": "concrete"
+    },
+    {
+      "label": "journalist",
+      "kind": "concrete"
+    },
+    {
+      "label": "mechanic",
+      "kind": "concrete"
+    },
+    {
+      "label": "sailor",
+      "kind": "concrete"
+    },
+    {
+      "label": "pilot",
+      "kind": "concrete"
+    },
+    {
+      "label": "athlete",
+      "kind": "concrete"
+    },
+    {
+      "label": "engineer",
+      "kind": "concrete"
+    },
+    {
+      "label": "scientist",
+      "kind": "concrete"
+    },
+    {
+      "label": "banker",
+      "kind": "concrete"
+    },
+    {
+      "label": "salesperson",
+      "kind": "concrete"
+    },
+    {
+      "label": "nerd",
+      "kind": "concrete"
+    },
+    {
+      "label": "jock",
+      "kind": "concrete"
+    },
+    {
+      "label": "gamer",
+      "kind": "concrete"
+    },
+    {
+      "label": "furry",
+      "kind": "concrete"
+    },
+    {
+      "label": "weeaboo",
+      "kind": "concrete"
+    },
+    {
+      "label": "influencer",
+      "kind": "concrete"
+    },
+    {
+      "label": "stoner",
+      "kind": "concrete"
+    },
+    {
+      "label": "femboy",
+      "kind": "concrete"
+    },
+    {
+      "label": "ceo",
+      "kind": "concrete"
+    },
+    {
+      "label": "emperor",
+      "kind": "concrete"
+    },
+    {
+      "label": "president",
+      "kind": "concrete"
+    },
+    {
+      "label": "diplomat",
+      "kind": "concrete"
+    },
+    {
+      "label": "judge",
+      "kind": "concrete"
+    },
+    {
+      "label": "bureaucrat",
+      "kind": "concrete"
+    },
+    {
+      "label": "conservative",
+      "kind": "concrete"
+    },
+    {
+      "label": "liberal",
+      "kind": "concrete"
+    },
+    {
+      "label": "libertarian",
+      "kind": "concrete"
+    },
+    {
+      "label": "communist",
+      "kind": "concrete"
+    },
+    {
+      "label": "anarchist",
+      "kind": "concrete"
+    },
+    {
+      "label": "reactionary",
+      "kind": "concrete"
+    },
+    {
+      "label": "loner",
+      "kind": "concrete"
+    },
+    {
+      "label": "friend",
+      "kind": "concrete"
+    },
+    {
+      "label": "rival",
+      "kind": "concrete"
+    },
+    {
+      "label": "stranger",
+      "kind": "concrete"
+    },
+    {
+      "label": "lover",
+      "kind": "concrete"
+    },
+    {
+      "label": "stalker",
+      "kind": "concrete"
+    },
+    {
+      "label": "lunatic",
+      "kind": "concrete"
+    },
+    {
+      "label": "paranoid",
+      "kind": "concrete"
+    },
+    {
+      "label": "detective",
+      "kind": "concrete"
+    },
+    {
+      "label": "therapist",
+      "kind": "concrete"
+    },
+    {
+      "label": "nomad",
+      "kind": "concrete"
+    },
+    {
+      "label": "pirate",
+      "kind": "concrete"
+    },
+    {
+      "label": "child",
+      "kind": "concrete"
+    },
+    {
+      "label": "caveman",
+      "kind": "concrete"
+    },
+    {
+      "label": "monk",
+      "kind": "concrete"
+    },
+    {
+      "label": "knight",
+      "kind": "concrete"
+    },
+    {
+      "label": "alchemist",
+      "kind": "concrete"
+    },
+    {
+      "label": "blacksmith",
+      "kind": "concrete"
+    },
+    {
+      "label": "viking",
+      "kind": "concrete"
+    },
+    {
+      "label": "druid",
+      "kind": "concrete"
+    },
+    {
+      "label": "poet",
+      "kind": "concrete"
+    },
+    {
+      "label": "novelist",
+      "kind": "concrete"
+    },
+    {
+      "label": "jester",
+      "kind": "concrete"
+    },
+    {
+      "label": "philosopher",
+      "kind": "concrete"
+    },
+    {
+      "label": "painter",
+      "kind": "concrete"
+    },
+    {
+      "label": "musician",
+      "kind": "concrete"
+    },
+    {
+      "label": "oracle",
+      "kind": "concrete"
+    },
+    {
+      "label": "god",
+      "kind": "concrete"
+    },
+    {
+      "label": "angel",
+      "kind": "concrete"
+    },
+    {
+      "label": "prophet",
+      "kind": "concrete"
+    },
+    {
+      "label": "saint",
+      "kind": "concrete"
+    },
+    {
+      "label": "ghost",
+      "kind": "concrete"
+    },
+    {
+      "label": "phoenix",
+      "kind": "concrete"
+    },
+    {
+      "label": "witch",
+      "kind": "concrete"
+    },
+    {
+      "label": "vampire",
+      "kind": "concrete"
+    },
+    {
+      "label": "mermaid",
+      "kind": "concrete"
+    },
+    {
+      "label": "sphinx",
+      "kind": "concrete"
+    },
+    {
+      "label": "banshee",
+      "kind": "concrete"
+    },
+    {
+      "label": "golem",
+      "kind": "concrete"
+    },
+    {
+      "label": "deer",
+      "kind": "concrete"
+    },
+    {
+      "label": "wolf",
+      "kind": "concrete"
+    },
+    {
+      "label": "raven",
+      "kind": "concrete"
+    },
+    {
+      "label": "serpent",
+      "kind": "concrete"
+    },
+    {
+      "label": "lion",
+      "kind": "concrete"
+    },
+    {
+      "label": "tree",
+      "kind": "concrete"
+    },
+    {
+      "label": "river",
+      "kind": "concrete"
+    },
+    {
+      "label": "storm",
+      "kind": "concrete"
+    },
+    {
+      "label": "flame",
+      "kind": "concrete"
+    },
+    {
+      "label": "mirror",
+      "kind": "concrete"
+    },
+    {
+      "label": "clock",
+      "kind": "concrete"
+    },
+    {
+      "label": "computer",
+      "kind": "concrete"
+    },
+    {
+      "label": "robot",
+      "kind": "concrete"
+    },
+    {
+      "label": "cyborg",
+      "kind": "concrete"
+    },
+    {
+      "label": "drone",
+      "kind": "concrete"
+    },
+    {
+      "label": "mecha",
+      "kind": "concrete"
+    },
+    {
+      "label": "alien",
+      "kind": "concrete"
+    },
+    {
+      "label": "trickster",
+      "kind": "concrete"
+    },
+    {
+      "label": "virus",
+      "kind": "concrete"
+    },
+    {
+      "label": "spy",
+      "kind": "concrete"
+    },
+    {
+      "label": "narcissist",
+      "kind": "concrete"
+    },
+    {
+      "label": "demon",
+      "kind": "concrete"
+    },
+    {
+      "label": "assassin",
+      "kind": "concrete"
+    },
+    {
+      "label": "thief",
+      "kind": "concrete"
+    },
+    {
+      "label": "conman",
+      "kind": "concrete"
+    },
+    {
+      "label": "hacker",
+      "kind": "concrete"
+    },
+    {
+      "label": "cultist",
+      "kind": "concrete"
+    },
+    {
+      "label": "tyrant",
+      "kind": "concrete"
+    },
+    {
+      "label": "vandal",
+      "kind": "concrete"
+    }
+  ],
+  "files": {}
+}

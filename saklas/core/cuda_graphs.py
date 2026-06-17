@@ -1,4 +1,4 @@
-"""CUDA-graphs / StaticCache support (Phase B of v2.2's perf push).
+"""CUDA-graphs / StaticCache support.
 
 When enabled (``cuda_graphs=True`` + device==cuda + supported architecture
 + fast-path-eligible steering), generation routes through
@@ -32,7 +32,7 @@ eligibility check lives at the steering layer, not here.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -59,39 +59,32 @@ def _support_cache_key(
     base = getattr(model, "_orig_mod", model)
     dtype: torch.dtype | None = None
     try:
-        dtype = next(base.parameters()).dtype  # type: ignore[union-attr]
-    except Exception:  # noqa: BLE001 - probe path must stay best-effort
+        dtype = next(base.parameters()).dtype
+    except Exception:
         dtype = None
     return id(base), str(device), dtype
 
 
-def is_cuda_graphs_supported(
+def is_static_cache_supported(
     model: "PreTrainedModel | torch.nn.Module",
     device: torch.device | str,
 ) -> tuple[bool, str | None]:
-    """Probe whether StaticCache + CUDA-graph capture is viable.
+    """Probe whether :class:`transformers.StaticCache` is viable here.
 
-    Returns ``(supported, reason)``.  When ``supported=False``, ``reason``
-    is a short human-readable string explaining the gate that failed —
-    logged once per model so the user sees why the fast path is off
-    without spamming subsequent generations.
+    **Device-agnostic** — unlike :func:`is_cuda_graphs_supported`, this does
+    not require CUDA.  StaticCache (pre-allocated, fixed-shape K/V) is the
+    enabler for ``torch.compile`` on *any* backend: fixed kernel shapes across
+    the decode loop let inductor reuse one trace instead of re-specializing as a
+    ``DynamicCache`` grows.  On MPS the fixed-shape benefit is real (measured
+    ~+16% eager, and it unlocks the ~1.7x ``compile`` win on top), not the
+    "negligible" the old CUDA-only gate assumed.
 
-    Checks (in order):
-
-    1. Device is CUDA.  StaticCache works on CPU/MPS too but graph capture
-       only fires on CUDA, and on MPS the static-shape benefit is
-       negligible against the device-context overhead.
-    2. ``transformers.StaticCache`` is importable (transformers ≥ 4.40).
-    3. StaticCache constructs successfully against the model's config
-       with a 1-token capacity.  Some architectures (notably MLA variants
-       and certain custom modeling files) raise here even when
-       DynamicCache works.
+    Returns ``(supported, reason)``.  Checks: (1) ``StaticCache`` importable
+    (transformers ≥ 4.40); (2) it constructs against the model config with a
+    1-token capacity — some architectures (MLA variants, certain custom
+    modeling files) raise here even when ``DynamicCache`` works.  Cached by
+    ``(module id, device, dtype)``.
     """
-    dev_str = str(device)
-    dev_type = getattr(device, "type", "") if hasattr(device, "type") else dev_str
-    if dev_type != "cuda" and not dev_str.startswith("cuda"):
-        return False, f"device={dev_str!r} (CUDA-only)"
-
     cache_key = _support_cache_key(model, device)
     cached = _support_cache.get(cache_key)
     if cached is not None:
@@ -109,14 +102,14 @@ def is_cuda_graphs_supported(
     # AttributeError on missing config fields, ValueError on shape
     # mismatches, NotImplementedError on unsupported attention layouts.
     try:
-        cfg = model.config  # type: ignore[union-attr]
+        cfg = model.config
         dtype = cache_key[2] or (
             next(model.parameters()).dtype
             if hasattr(model, "parameters")
             else torch.bfloat16
         )
         probe = StaticCache(
-            cfg,  # type: ignore[arg-type]
+            cfg,  # pyright: ignore[reportArgumentType]  # transformers stub types model.config as PreTrainedConfig|Tensor|Module
             max_cache_len=1,
             device=device,
             dtype=dtype,
@@ -141,6 +134,66 @@ def is_cuda_graphs_supported(
     return result
 
 
+def is_cuda_graphs_supported(
+    model: "PreTrainedModel | torch.nn.Module",
+    device: torch.device | str,
+) -> tuple[bool, str | None]:
+    """Probe whether StaticCache + **CUDA-graph** capture is viable.
+
+    The CUDA-specific superset of :func:`is_static_cache_supported`: CUDA-graph
+    capture (via ``torch.compile(mode="reduce-overhead")``) only fires on CUDA,
+    so this gates device first, then defers to the device-agnostic StaticCache
+    probe.  ``__init__`` consults it to decide ``reduce-overhead`` vs the
+    ``default`` (fusion-only) compile mode; the MPS/CPU fast path uses
+    :func:`is_static_cache_supported` directly with ``default`` mode.
+    """
+    dev_str = str(device)
+    dev_type = getattr(device, "type", "") if hasattr(device, "type") else dev_str
+    if dev_type != "cuda" and not dev_str.startswith("cuda"):
+        return False, f"device={dev_str!r} (CUDA-only)"
+    return is_static_cache_supported(model, device)
+
+
+_static_sliding_mask_patched = False
+
+
+def _patch_static_sliding_mask() -> None:
+    """Make a non-sliding StaticSlidingWindowLayer's ``get_mask_sizes`` constant.
+
+    The hybrid-cache recompile storm: ``StaticSlidingWindowLayer.get_mask_sizes``
+    branches on ``cumulative_length_int`` — a Python int that increments every
+    decode step — so inside a ``torch.compile`` graph dynamo specializes on its
+    value and recompiles every token until it hits ``recompile_limit`` and falls
+    back to eager.  But when the cache never slides (the whole generation fits the
+    static buffer — ``total_context <= max_cache_len``), ``get_mask_sizes`` is a
+    *constant* ``(max_cache_len, 0)`` for every decode step: ``is_full`` stays
+    False and ``kv_offset`` stays 0, so the original's ``else`` branch already
+    returns exactly this.  Returning it directly — gated on the per-cache
+    ``_saklas_static_mask`` flag :func:`make_static_cache` sets only when no slide
+    can occur — is byte-identical to the original in that regime, but drops the
+    per-step int guard so the mask stays in the compiled graph with no recompile.
+    A sliding cache (long context) keeps the original dynamic path.  Idempotent."""
+    global _static_sliding_mask_patched
+    if _static_sliding_mask_patched:
+        return
+    try:
+        from transformers.cache_utils import StaticSlidingWindowLayer
+    except Exception:
+        _static_sliding_mask_patched = True  # nothing to patch; don't retry
+        return
+
+    _orig = StaticSlidingWindowLayer.get_mask_sizes
+
+    def get_mask_sizes(self: Any, query_length: int) -> tuple[int, int]:
+        if getattr(self, "_saklas_static_mask", False):
+            return self.max_cache_len, 0
+        return _orig(self, query_length)
+
+    get_mask_sizes._saklas_orig = _orig  # type: ignore[attr-defined]
+    StaticSlidingWindowLayer.get_mask_sizes = get_mask_sizes  # type: ignore[method-assign]
+    _static_sliding_mask_patched = True
+
+
 def make_static_cache(
     model: "PreTrainedModel | torch.nn.Module",
     max_cache_len: int,
@@ -159,12 +212,25 @@ def make_static_cache(
     first and check the boolean.
     """
     from transformers import StaticCache
-    return StaticCache(
-        model.config,  # type: ignore[arg-type,union-attr]
+    _patch_static_sliding_mask()
+    cache = StaticCache(
+        model.config,  # pyright: ignore[reportArgumentType]  # transformers stub types model.config as PreTrainedConfig|Tensor|Module
         max_cache_len=max_cache_len,
         device=device,
         dtype=dtype,
     )
+    # Flag each sliding layer that can't slide for this generation (the whole
+    # ``max_cache_len`` context fits its static buffer) so the patched
+    # ``get_mask_sizes`` returns the guard-free constant and the hybrid-cache
+    # recompile storm doesn't fire.  A sliding layer caps its buffer to
+    # ``min(sliding_window, max_cache_len)``, so it never slides exactly when the
+    # requested total is within that buffer.
+    for layer in getattr(cache, "layers", []):
+        if getattr(layer, "is_sliding", False):
+            buf = getattr(layer, "max_cache_len", None)
+            if buf is not None:
+                layer._saklas_static_mask = max_cache_len <= buf
+    return cache
 
 
 def warn_once(model: "PreTrainedModel | torch.nn.Module", reason: str) -> None:

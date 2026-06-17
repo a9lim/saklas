@@ -18,6 +18,7 @@
     drawerState,
     loomTree,
   } from "../lib/stores.svelte";
+  import Select from "../lib/Select.svelte";
   import type {
     DiffReadingDeltaJSON,
     DiffTextSpanJSON,
@@ -387,17 +388,25 @@
     <div class="header-controls">
       <label class="header-ctl">
         <span>layout</span>
-        <select bind:value={layout} aria-label="Layout">
-          <option value="side-by-side">side-by-side</option>
-          <option value="unified">unified</option>
-        </select>
+        <Select
+          bind:value={layout}
+          options={[
+            { value: "side-by-side", label: "side-by-side" },
+            { value: "unified", label: "unified" },
+          ]}
+          ariaLabel="Layout"
+        />
       </label>
       <label class="header-ctl">
         <span>sort by</span>
-        <select bind:value={sortBy} aria-label="Sort readings by">
-          <option value="magnitude">|Δ| desc</option>
-          <option value="name">name</option>
-        </select>
+        <Select
+          bind:value={sortBy}
+          options={[
+            { value: "magnitude", label: "|Δ| desc" },
+            { value: "name", label: "name" },
+          ]}
+          ariaLabel="Sort readings by"
+        />
       </label>
     </div>
     <button type="button" class="close" aria-label="Close" onclick={closeDrawer}
@@ -734,14 +743,9 @@
     align-items: center;
     gap: var(--space-2);
   }
-  .header-ctl select {
-    background: var(--bg-alt);
-    color: var(--fg-strong);
-    border: 1px solid var(--border);
-    padding: var(--space-1) var(--space-2);
-    font: inherit;
-    font-family: var(--font-mono);
-    font-size: var(--text-xs);
+  /* Themed Select owns its own chrome. */
+  .header-ctl :global(.sk-select) {
+    min-width: 9em;
   }
   .close {
     background: transparent;

@@ -1,0 +1,85 @@
+"""Synthetic ``LayerWhitener`` + neutral means for CPU-only tests.
+
+The Euclidean fit/score path was removed in 4.0: activation-space manifold
+fits, ``~``/``|`` projections, and probe reads all *require* a whitener that
+covers every scored layer (a missing/partial whitener is a hard error, not a
+Euclidean fallback).  A whitener is cheap and synthesizable on CPU with no
+model load — :meth:`LayerWhitener.from_neutral_activations` only needs two
+in-memory ``{layer: tensor}`` dicts — so CPU tests build one over random
+neutral activations rather than reaching for the (now-deleted) Euclidean path.
+
+The returned ``means`` is the SAME dict the whitener centered on, so a stub
+``ModelHandle`` can expose it as both ``whitener`` and ``layer_means`` and the
+fit's neutral anchor agrees with the whitener's centering.
+"""
+from __future__ import annotations
+
+from collections.abc import Iterable
+
+import torch
+
+from saklas.core.mahalanobis import LayerWhitener
+
+
+def synthetic_means(
+    layers: Iterable[int], dim: int, *, seed: int = 11,
+) -> dict[int, torch.Tensor]:
+    """Per-layer neutral means ``{layer: [dim]}`` — small, deterministic."""
+    out: dict[int, torch.Tensor] = {}
+    for L in layers:
+        g = torch.Generator().manual_seed(seed + L)
+        out[L] = torch.randn(dim, generator=g, dtype=torch.float32) * 0.1
+    return out
+
+
+def synthetic_whitener(
+    layers: Iterable[int],
+    dim: int,
+    *,
+    n: int = 64,
+    means: dict[int, torch.Tensor] | None = None,
+    seed: int = 11,
+    ridge_scale: float = 1.0,
+) -> LayerWhitener:
+    """A ``LayerWhitener`` over synthetic anisotropic neutral activations.
+
+    Covers exactly ``layers`` at hidden dim ``dim``.  Pass ``means`` to share
+    the neutral anchor with the consuming handle's ``layer_means``.
+    """
+    layers = list(layers)
+    means = means if means is not None else synthetic_means(layers, dim, seed=seed)
+    acts: dict[int, torch.Tensor] = {}
+    for L in layers:
+        g = torch.Generator().manual_seed(seed * 7 + L)
+        # Anisotropic covariance so the whitened metric differs from Euclidean
+        # (a degenerate isotropic draw would make the two coincide).
+        scale = 0.5 + torch.rand(dim, generator=g, dtype=torch.float32)
+        X = torch.randn(n, dim, generator=g, dtype=torch.float32) * scale
+        acts[L] = X + means[L].reshape(1, dim)
+    return LayerWhitener.from_neutral_activations(
+        acts, means, ridge_scale=ridge_scale,
+    )
+
+
+def isotropic_whitener(
+    layers: Iterable[int],
+    dim: int,
+    *,
+    n: int = 512,
+    seed: int = 11,
+) -> LayerWhitener:
+    """A ``LayerWhitener`` over (near-)isotropic zero-mean neutral activations.
+
+    Σ ≈ σ²·I, so Σ⁻¹ ∝ I and the whitened readout reduces to the Euclidean
+    one (scale cancels in cosine / fraction ratios).  Used where a Mahalanobis
+    surface is now *mandatory* but the test asserts the geometric value that
+    was Euclidean before the collapse — the isotropic metric reproduces it to
+    a loose tolerance.  Zero means, so it doesn't recenter test vectors.
+    """
+    layers = list(layers)
+    means = {L: torch.zeros(dim, dtype=torch.float32) for L in layers}
+    acts: dict[int, torch.Tensor] = {}
+    for L in layers:
+        g = torch.Generator().manual_seed(seed * 7 + L)
+        acts[L] = torch.randn(n, dim, generator=g, dtype=torch.float32)
+    return LayerWhitener.from_neutral_activations(acts, means, ridge_scale=1.0)

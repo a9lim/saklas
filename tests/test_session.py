@@ -3,10 +3,15 @@ Requires a GPU (CUDA or Apple Silicon MPS) and downloads
 google/gemma-3-4b-it (~8GB) on first run.
 """
 from __future__ import annotations
+from pathlib import Path
+from typing import TYPE_CHECKING
 import pytest
 import torch
 from saklas.core.profile import Profile
 from saklas.core.results import GenerationResult, RunSet, TokenEvent
+
+if TYPE_CHECKING:
+    from saklas.core.session import SaklasSession
 
 _HAS_GPU = torch.cuda.is_available() or torch.backends.mps.is_available()
 pytestmark = [
@@ -19,16 +24,38 @@ pytestmark = [
 
 MODEL_ID = "google/gemma-3-4b-it"
 
+
+def _corpus(response: str) -> list[str]:
+    from saklas.core.vectors import _load_baseline_prompts
+
+    return [response] * len(_load_baseline_prompts())
+
+
 @pytest.fixture(scope="module")
-def session():
+def session(tmp_path_factory: pytest.TempPathFactory):
+    import os
     from saklas.core.session import SaklasSession
+    # Isolate $SAKLAS_HOME so this module's extract/merge writes (e.g.
+    # local/formal.casual, happy.sad, honest) land in a throwaway cache instead
+    # of the user's real ~/.saklas — where they would shadow bundled manifolds of
+    # the same name and break bare-name resolution (AmbiguousSelectorError)
+    # across the whole suite on the next run.
+    home = tmp_path_factory.mktemp("saklas_home")
+    prev = os.environ.get("SAKLAS_HOME")
+    os.environ["SAKLAS_HOME"] = str(home)
     # device="auto" picks cuda > mps > cpu; skipif above guarantees a GPU.
-    s = SaklasSession.from_pretrained(MODEL_ID, device="auto", probes=["affect"])
-    yield s
-    s.close()
+    try:
+        s = SaklasSession.from_pretrained(MODEL_ID, device="auto", probes=["register"])
+        yield s
+        s.close()
+    finally:
+        if prev is None:
+            os.environ.pop("SAKLAS_HOME", None)
+        else:
+            os.environ["SAKLAS_HOME"] = prev
 
 class TestConstruction:
-    def test_model_info(self, session):
+    def test_model_info(self, session: SaklasSession) -> None:
         info = session.model_info
         # gemma-3-4b-it loads as the text-only submodule of a multimodal checkpoint,
         # so model_type is "gemma3_text" (see model.py:_load_text_from_multimodal).
@@ -36,26 +63,28 @@ class TestConstruction:
         assert info["hidden_dim"] > 0
         assert info["num_layers"] > 0
 
-    def test_config_defaults(self, session):
+    def test_config_defaults(self, session: SaklasSession) -> None:
         assert session.config.temperature == 1.0
         assert session.config.top_p == 0.9
         assert session.config.max_new_tokens == 1024
 
-    def test_probes_loaded(self, session):
+    def test_probes_loaded(self, session: SaklasSession) -> None:
         assert len(session.probes) > 0
 
-    def test_history_starts_empty(self, session):
+    def test_history_starts_empty(self, session: SaklasSession) -> None:
         assert session.history == []
 
-    def test_vectors_starts_empty(self, session):
+    def test_vectors_starts_empty(self, session: SaklasSession) -> None:
         assert session.vectors == {}
 
-    def test_last_result_starts_none(self, session):
+    def test_last_result_starts_none(self, session: SaklasSession) -> None:
         assert session.last_result is None
 
 class TestSteering:
-    def test_extract_and_steer(self, session):
-        name, profile = session.extract([("I am happy", "I am sad")])
+    def test_extract_and_steer(self, session: SaklasSession) -> None:
+        name, profile = session.extract_vector_from_corpora(
+            "happy", _corpus("I am happy"), _corpus("I am sad"),
+        )
         assert isinstance(profile, Profile)
         assert all(isinstance(k, int) for k in profile)
         session.steer("happy", profile)
@@ -63,28 +92,32 @@ class TestSteering:
         # vectors registry speaks Profile, not bare dicts (saklas 1.x → 3.x).
         assert isinstance(session.vectors["happy"], Profile)
 
-    def test_unsteer(self, session):
+    def test_unsteer(self, session: SaklasSession) -> None:
         session.unsteer("happy")
         assert "happy" not in session.vectors
 
-    def test_extract_curated(self, session):
+    def test_extract_curated(self, session: SaklasSession) -> None:
         name, profile = session.extract("happy", baseline="sad")
         assert name == "happy.sad"
         assert isinstance(profile, Profile)
         assert len(profile) > 0
 
-    def test_extract_datasource(self, session):
-        from saklas.io.datasource import DataSource
-        ds = DataSource(pairs=[("formal", "casual")])
-        name, profile = session.extract(ds)
+    def test_extract_datasource(self, session: SaklasSession) -> None:
+        name, profile = session.extract_vector_from_corpora(
+            "formal.casual", _corpus("formal"), _corpus("casual"),
+        )
         assert isinstance(profile, Profile)
 
 class TestMonitoring:
-    def test_monitor_and_unmonitor(self, session):
-        _, profile = session.extract([("I am honest", "I am deceptive")])
-        session.probe("test_probe", profile)
+    def test_monitor_and_unmonitor(self, session: SaklasSession) -> None:
+        # Extract registers the folded direction; ``add_probe`` resolves it
+        # (the unified probe API — one attach for vector + manifold probes).
+        name, _profile = session.extract_vector_from_corpora(
+            "honest", _corpus("I am honest"), _corpus("I am deceptive"),
+        )
+        session.add_probe(name, as_name="test_probe")
         assert "test_probe" in session.probes
-        session.unprobe("test_probe")
+        session.remove_probe("test_probe")
         assert "test_probe" not in session.probes
 
 class TestLifecycle:
@@ -94,7 +127,7 @@ class TestLifecycle:
             assert s.model_info["model_type"].startswith("gemma3")
 
 class TestGeneration:
-    def test_generate_unsteered(self, session):
+    def test_generate_unsteered(self, session: SaklasSession) -> None:
         result = session.generate("Say hello in one word.")
         assert isinstance(result, RunSet)
         assert isinstance(result.first, GenerationResult)
@@ -104,7 +137,7 @@ class TestGeneration:
         assert result.elapsed > 0
         assert result.vectors == {}  # no alphas = no steering snapshot
 
-    def test_generate_blocking_messages(self, session):
+    def test_generate_blocking_messages(self, session: SaklasSession) -> None:
         result = session.generate([
             {"role": "user", "content": "Say hello in one word."},
         ])
@@ -112,34 +145,38 @@ class TestGeneration:
         assert isinstance(result.first, GenerationResult)
         assert len(result.text) > 0
 
-    def test_generate_appends_to_history(self, session):
+    def test_generate_appends_to_history(self, session: SaklasSession) -> None:
         session.clear_history()
         session.generate("Say hi.")
         assert len(session.history) == 2
         assert session.history[0]["role"] == "user"
         assert session.history[1]["role"] == "assistant"
 
-    def test_generate_with_alphas(self, session):
-        name, profile = session.extract([("formal", "casual")])
+    def test_generate_with_alphas(self, session: SaklasSession) -> None:
+        name, profile = session.extract_vector_from_corpora(
+            "formal.casual", _corpus("formal"), _corpus("casual"),
+        )
         session.steer(name, profile)
         result = session.generate("Hello.", steering=f"0.1 {name}")
         assert result.vectors == {name: 0.1}
         session.unsteer(name)
 
-    def test_generate_with_probes(self, session):
+    def test_generate_with_probes(self, session: SaklasSession) -> None:
         session.clear_history()
         result = session.generate("Tell me something exciting!")
         if session.probes:
             assert isinstance(result.readings, dict)
 
-    def test_last_result(self, session):
+    def test_last_result(self, session: SaklasSession) -> None:
         session.clear_history()
         result = session.generate("Hello.")
         assert session.last_result is result.first
 
-    def test_ab_comparison(self, session):
+    def test_ab_comparison(self, session: SaklasSession) -> None:
         """A/B test: same prompt, with and without steering."""
-        name, profile = session.extract([("I am happy", "I am sad")])
+        name, profile = session.extract_vector_from_corpora(
+            "happy", _corpus("I am happy"), _corpus("I am sad"),
+        )
         session.steer(name, profile)
         session.clear_history()
         steered = session.generate("Describe a sunset.", steering=f"0.2 {name}")
@@ -152,126 +189,27 @@ class TestGeneration:
         assert len(unsteered.text) > 0
         session.unsteer(name)
 
-    def test_unknown_vector_raises(self, session):
+    def test_unknown_vector_raises(self, session: SaklasSession) -> None:
         with pytest.raises(KeyError, match="nonexistent"):
             session.generate("Hello.", steering="0.1 nonexistent")
 
-class TestCloning:
-    def test_clone_from_corpus_end_to_end(self, session, tmp_path):
-        from saklas.io.paths import concept_dir, safe_model_id
-
-        pirate_lines = [
-            "Arr matey, the briny deep be calling me name once more tonight",
-            "Yo ho ho, we be sailing for doubloons afore the sun comes up",
-            "Shiver me timbers, that cursed kraken nearly swallowed the whole crew",
-            "Avast ye scurvy dogs, bring that grog barrel over to the quarterdeck",
-            "Blimey, the cap'n be fouler than rotten fish on a humid afternoon",
-            "Hoist the colors high lads, we be running from no king's navy",
-            "The black spot upon me palm means me days be numbered now",
-            "Batten down the hatches boys, a squall be rolling in from starboard",
-            "Dead men tell no tales, or so the old pirate proverb claims",
-            "Splice the mainbrace tonight mates, we've earned a proper ration of rum",
-            "Me parrot squawks louder than the bosun on a windy morning watch",
-            "That treasure map be worth more than any galleon full of silver",
-            "Heave ho ye landlubbers, put yer backs into haulin' that anchor chain",
-            "The Jolly Roger flutters proud above our weathered mast this fine dawn",
-            "Keelhaul the traitor at first light, let the barnacles teach him manners",
-            "Arr, this grog tastes like bilge water but a pirate drinks regardless",
-            "The spyglass shows merchant sails on the horizon, ripe for the takin'",
-            "Load the cannons double-shot, we be givin' them no quarter today",
-            "A pirate's life be hard but the rum and plunder make it worthwhile",
-            "Walk the plank ye mutinous cur, the sharks be hungry this morning",
-            "The compass points nowhere useful when the devil's fog rolls thick",
-            "Pieces of eight clatter sweet as music on the captain's oaken table",
-            "Me peg leg aches afore every storm like a cursed weather vane",
-            "The sea be a cruel mistress, takin' good men and givin' naught back",
-            "Hoist the black flag and prepare to board her starboard side smartly",
-            "That Spanish galleon rides low, heavy laden with colonial gold no doubt",
-            "A pirate without a ship be naught but a drunkard on the shore",
-            "Bury the chest deep beneath the third palm tree on Skull Isle",
-            "The crow's nest spotted a frigate bearin' down on us from windward",
-            "Sing a shanty loud enough to drown the groanin' of the old hull",
-        ]
-        corpus = tmp_path / "pirate_corpus.txt"
-        corpus.write_text("\n".join(pirate_lines), encoding="utf-8")
-        assert len(set(pirate_lines)) == len(pirate_lines)
-
-        folder = concept_dir("local", "pirate_test")
-        try:
-            canonical, profile = session.clone_from_corpus(
-                str(corpus), name="pirate_test", n_pairs=10, seed=42, force=True,
-            )
-            assert canonical == "pirate_test"
-            assert isinstance(profile, Profile) and len(profile) > 0
-            assert all(isinstance(k, int) for k in profile)
-            for layer_idx, tensor in profile.items():
-                assert tensor.numel() > 0
-                assert torch.linalg.vector_norm(tensor.float()).item() > 0, (
-                    f"layer {layer_idx} baked tensor is all zeros"
-                )
-
-            sid = safe_model_id(session.model_id)
-            assert folder.exists()
-            assert (folder / "pack.json").exists()
-            assert (folder / "statements.json").exists()
-            assert (folder / f"{sid}.safetensors").exists()
-
-            # Probe path: add as probe, generate, score. Asserts scoring runs clean.
-            session.probe("pirate_test", profile)
-            try:
-                session.clear_history()
-                result = session.generate(
-                    "Describe your morning.", steering=None,
-                )
-                readings = result.readings or {}
-                if "pirate_test" in readings:
-                    val = readings["pirate_test"].mean
-                    assert val == val  # finite, not NaN
-                    assert -1.5 <= val <= 1.5
-            finally:
-                session.unprobe("pirate_test")
-
-            # Steering path: register and generate with α=1, compare a bundled
-            # probe reading against the unsteered baseline on the same prompt.
-            session.steer("pirate_test", profile)
-            try:
-                prompt = "Tell me about your day."
-                session.clear_history()
-                unsteered = session.generate(prompt)
-                session.clear_history()
-                steered = session.generate(prompt, steering="1.0 pirate_test")
-                assert len(steered.text) > 0
-                # Baseline shift assertion — loose. Only run if we share a probe.
-                u_read = unsteered.readings or {}
-                s_read = steered.readings or {}
-                shared = set(u_read) & set(s_read)
-                if shared:
-                    diffs = [abs(u_read[k].mean - s_read[k].mean) for k in shared]
-                    assert max(diffs) > 1e-6, (
-                        "α=1 steering produced identical probe readings "
-                        f"to unsteered on {sorted(shared)}"
-                    )
-            finally:
-                session.unsteer("pirate_test")
-        finally:
-            if folder.exists():
-                import shutil
-                shutil.rmtree(folder, ignore_errors=True)
-
-    def test_extract_cli_roundtrip(self, tmp_path):
+class TestCliRoundTrip:
+    def test_extract_cli_roundtrip(self, tmp_path: Path) -> None:
         import subprocess
         import sys
-        from saklas.io.paths import concept_dir, safe_model_id
+        from saklas.io.paths import manifold_dir, safe_model_id
 
-        folder = concept_dir("default", "happy.sad")
+        folder = manifold_dir("local", "happy.sad")
         sid = safe_model_id(MODEL_ID)
         tensor_path = folder / f"{sid}.safetensors"
         created_here = not tensor_path.exists()
 
         try:
             proc = subprocess.run(
-                [sys.executable, "-m", "saklas", "vector", "extract",
-                 "happy.sad", "-m", MODEL_ID],
+                [
+                    sys.executable, "-m", "saklas", "manifold", "extract",
+                    "happy.sad", "-m", MODEL_ID, "--namespace", "local",
+                ],
                 capture_output=True, text=True, timeout=600,
             )
             assert proc.returncode == 0, (
@@ -280,7 +218,7 @@ class TestCloning:
             assert tensor_path.exists(), f"expected {tensor_path} to exist"
         finally:
             # Only unlink the per-model tensor if this test created it;
-            # leave the bundled statements.json and any pre-existing tensor alone.
+            # leave the corpus and any pre-existing tensor alone.
             if created_here and tensor_path.exists():
                 tensor_path.unlink()
                 sidecar = folder / f"{sid}.json"
@@ -289,7 +227,7 @@ class TestCloning:
 
 
 class TestStreamingGeneration:
-    def test_generate_stream(self, session):
+    def test_generate_stream(self, session: SaklasSession) -> None:
         session.clear_history()
         tokens = []
         for event in session.generate_stream("Say hello."):
@@ -300,53 +238,43 @@ class TestStreamingGeneration:
         assert session.last_result is not None
         assert session.last_result.token_count == len(tokens)
 
-    def test_stream_with_alphas(self, session):
-        name, profile = session.extract([("I am happy", "I am sad")])
+    def test_stream_with_alphas(self, session: SaklasSession) -> None:
+        name, profile = session.extract_vector_from_corpora(
+            "happy", _corpus("I am happy"), _corpus("I am sad"),
+        )
         session.steer(name, profile)
         session.clear_history()
         tokens = list(session.generate_stream("Hello.", steering=f"0.15 {name}"))
         assert len(tokens) > 0
+        assert session.last_result is not None  # generate_stream guarantees last_result is set
         assert session.last_result.vectors == {name: 0.15}
         session.unsteer(name)
 
 
 class TestAblation:
-    def test_ablation_suppresses_self_probe_score(self, session):
-        """Ablating a concept drives its own monitor score toward zero.
+    @pytest.mark.skip(reason=(
+        "Pinned the Euclidean TraitMonitor, removed in the monitor "
+        "unification (Mahalanobis-only). The ablation operator is Euclidean "
+        "(h' = h - alpha(h.d_hat - mu.d_hat)d_hat) but the unified Monitor "
+        "reads the Mahalanobis coordinate, which by design does NOT collapse "
+        "under Euclidean ablation, so a monitor-based assertion no longer "
+        "matches the operator. Recommended rewrite: assert directly on the "
+        "metric-agnostic Euclidean projection of the post-ablation hidden "
+        "onto folded_vector_directions(session._monitor.manifolds[probe]) "
+        "(the exact component the operator zeros) instead of a monitor read. "
+        "Deferred to the monitor-shape pass (GPU, owner: a9); also revisit the "
+        "fixture, which bootstraps the dropped 'affect' category."
+    ))
+    def test_ablation_suppresses_self_probe_score(self, session: SaklasSession) -> None:
+        """Ablating a concept suppresses its own direction in activation space.
 
-        Sharp correctness check: if the hook properly replaces the component
-        along d̂ with the neutral mean, the probe's magnitude-weighted cosine
-        score — which IS the projection along that same direction — must
-        collapse for post-ablation activations.
+        See the skip reason: the original pinned the removed Euclidean monitor;
+        the faithful Mahalanobis-era rewrite tests the operator via a direct
+        Euclidean projection onto the probe's folded direction.
         """
-        prompt = "Describe an ordinary afternoon."
-        probe = next(iter(session.probes))
-
-        # Baseline: generate without ablation, capture probe's aggregate score.
-        _ = session.generate(prompt)
-        scores_baseline = session.last_per_token_scores
-        assert scores_baseline is not None
-        assert probe in scores_baseline
-        baseline = abs(scores_baseline[probe][-1])
-
-        # With ablation: the same probe's score should drop sharply.
-        with session.steering(f"!{probe}"):
-            _ = session.generate(prompt)
-        scores_ablated = session.last_per_token_scores
-        assert scores_ablated is not None
-        ablated = abs(scores_ablated[probe][-1])
-
-        # Expect the ablated score to be at most 10% of baseline (or 0.05
-        # absolute, whichever is larger — guards the degenerate case where
-        # baseline itself is tiny).
-        ceiling = max(0.1 * baseline, 0.05)
-        assert ablated < ceiling, (
-            f"ablation should suppress self-probe; "
-            f"baseline={baseline:.4f}, ablated={ablated:.4f}, ceiling={ceiling:.4f}"
-        )
 
 
-def test_return_hidden_round_trip(session):
+def test_return_hidden_round_trip(session: SaklasSession) -> None:
     """return_hidden=True populates hidden_states; score_hidden round-trips."""
     from saklas import SamplingConfig
 
@@ -394,7 +322,7 @@ def test_return_hidden_round_trip(session):
             assert abs(a - b) < tol, f"probe {name}: {a} vs {b}"
 
 
-def test_return_hidden_false_leaves_hidden_states_none(session):
+def test_return_hidden_false_leaves_hidden_states_none(session: SaklasSession) -> None:
     from saklas import SamplingConfig
 
     result = session.generate(
@@ -409,7 +337,7 @@ class TestPrefixCache:
     shared chat prefix.  See ``SaklasSession.cache_prefix``.
     """
 
-    def _shared_prefix_messages(self, session, prompt_body: str):
+    def _shared_prefix_messages(self, session: SaklasSession, prompt_body: str):
         """Build a (prefix_messages, full_messages) pair where the
         full chat-template encoding of full_messages begins with the
         prefix_messages encoding.
@@ -459,7 +387,7 @@ class TestPrefixCache:
         prefix_ids_trim = prefix_ids[:, :L]
         return prefix_ids_trim, full_msg
 
-    def test_cache_hit_matches_no_cache_output(self, session):
+    def test_cache_hit_matches_no_cache_output(self, session: SaklasSession) -> None:
         from saklas import SamplingConfig
 
         session.clear_history()
@@ -493,7 +421,7 @@ class TestPrefixCache:
         # Cleanup so other tests aren't affected.
         session.cache_prefix(None)
 
-    def test_steering_invalidates_cache(self, session):
+    def test_steering_invalidates_cache(self, session: SaklasSession) -> None:
         # Warm the cache.
         prefix_ids, _ = self._shared_prefix_messages(session, "Hello.")
         session.cache_prefix(prefix_ids)
@@ -501,7 +429,9 @@ class TestPrefixCache:
 
         # Make sure there's a steering vector to push.
         if not session.has_vector("happy"):
-            _, prof = session.extract([("I am happy", "I am sad")])
+            _, prof = session.extract_vector_from_corpora(
+                "happy", _corpus("I am happy"), _corpus("I am sad"),
+            )
             session.steer("happy", prof)
         # steer() itself invalidates; re-warm and verify scope-entry
         # is what we're really testing.

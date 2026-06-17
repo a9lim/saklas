@@ -10,53 +10,34 @@ import re
 from pathlib import Path
 
 # Variant filename conventions:
-#   raw (DiM, default)  -> ``<safe_model_id>.safetensors``
-#   raw (PCA, legacy)   -> ``<safe_model_id>_pca.safetensors``
+#   raw (DiM)           -> ``<safe_model_id>.safetensors``
 #   SAE-DiM             -> ``<safe_model_id>_sae-<release>.safetensors``
-#   SAE-PCA (legacy)    -> ``<safe_model_id>_sae-<release>_pca.safetensors``
 #   transferred (v1.6)  -> ``<safe_model_id>_from-<safe_src>.safetensors``
+#   role                -> ``<safe_model_id>_role-<name>.safetensors``
 #
-# The literals ``_sae-`` and ``_from-`` are the *kind* separators — no HF
-# model id slug contains either, and the right-hand-side slugs (release
-# strings, safe-model-ids) follow the same ``[a-z0-9._-]`` discipline so
-# the parse is unambiguous.  ``_pca`` is a *method* suffix: applied last,
-# stripped first on parse, never composed with ``_from-`` (transfer
-# preserves the source method).  Default method is DiM (no suffix);
-# ``_pca`` opts into the legacy contrastive-PCA tensors that coexist with
-# the canonical DiM file.
+# The literals ``_sae-``, ``_from-``, and ``_role-`` are the *kind*
+# separators — no HF model id slug contains any of them, and the right-
+# hand-side slugs (release strings, safe-model-ids, role names) follow
+# the same ``[a-z0-9._-]`` discipline so the parse is unambiguous.
+# Difference-of-means is the only extraction method (4.0), so the raw
+# tensor carries no method suffix.  Kind suffixes are mutually exclusive
+# — a tensor is at most one of {SAE, transferred, role}.
 _VARIANT_SEP_SAE = "_sae-"
 _VARIANT_SEP_FROM = "_from-"
-_METHOD_SUFFIX_PCA = "_pca"
+_VARIANT_SEP_ROLE = "_role-"
 _VARIANT_SEPARATORS: tuple[tuple[str, str], ...] = (
     (_VARIANT_SEP_SAE, "sae"),
     (_VARIANT_SEP_FROM, "from"),
+    (_VARIANT_SEP_ROLE, "role"),
 )
-# Back-compat: the old single-separator alias many callers already
-# imported.  Kept identical to the SAE form because that's what every
-# external caller meant when they reached for it pre-1.6.
-_VARIANT_SEP = _VARIANT_SEP_SAE
 _UNSAFE_VARIANT_CHARS = re.compile(r"[^a-z0-9._-]+")
 
-# Recognised extraction methods.  ``"dim"`` is the canonical default
-# (difference-of-means, Im & Li 2025); ``"pca"`` is the legacy
-# contrastive-PCA path retained behind the ``--method pca`` flag and
-# the ``:pca`` selector variant.
-_KNOWN_METHODS: frozenset[str] = frozenset({"dim", "pca"})
-
-
-def _method_suffix(method: str) -> str:
-    """Filename suffix for an extraction method.  ``"dim"`` (default) returns
-    the empty string; ``"pca"`` returns ``_pca``.
-    """
-    if method == "dim":
-        return ""
-    if method == "pca":
-        return _METHOD_SUFFIX_PCA
-    raise ValueError(
-        f"unknown extraction method {method!r} (expected one of "
-        f"{sorted(_KNOWN_METHODS)})"
-    )
-
+# The trailing ``:<variant>`` scheme understood across selectors / runners.
+# One source of truth for the variant suffix grammar (this module owns the
+# tensor-filename variant scheme); ``io.selectors`` and ``cli.runners`` import it.
+VARIANT_SUFFIX_RE = re.compile(
+    r"^(raw|sae(?:-[a-z0-9._-]+)?|role(?:-[a-z0-9._-]+)?|from(?:-[a-z0-9._-]+)?)$"
+)
 
 def saklas_home() -> Path:
     """Return the root ~/.saklas/ directory. Honors $SAKLAS_HOME override."""
@@ -74,8 +55,68 @@ def models_dir() -> Path:
     return saklas_home() / "models"
 
 
+def manifolds_dir() -> Path:
+    """Root of the manifold-steering artifact tree.
+
+    Parallel to :func:`vectors_dir` — a manifold is its own artifact kind
+    (labeled nodes placed on an n-dimensional domain), not a concept
+    folder, so it lives under its own root.
+    """
+    return saklas_home() / "manifolds"
+
+
+def templates_dir() -> Path:
+    """Root of the templated-completion artifact tree.
+
+    A template is a first-class artifact (peer to a manifold): a slot, a set
+    of candidate values, and one or more multi-turn contexts whose final
+    assistant turn carries the slot. Two consumers read it — the manifold fit
+    (pools the slot-filled assistant centroids into nodes) and the completion
+    scorer (the restricted-choice logprob distribution over the values).
+    """
+    return saklas_home() / "templates"
+
+
+def ensure_within(root: Path, *parts: str) -> Path:
+    """Join ``parts`` onto ``root`` and verify the result stays inside ``root``.
+
+    Path-traversal barrier for user-supplied path components — namespaces,
+    concept / manifold names, model ids, and manifest-relative filenames all
+    reach the filesystem layer from HTTP request bodies, CLI args, and
+    downloaded ``pack.json`` / ``manifold.json`` manifests. A ``..`` segment
+    or an absolute component must not be allowed to escape the ``~/.saklas/``
+    subtree.
+
+    Normalizes the joined path (collapsing ``..`` segments) and rejects a
+    result that does not stay under ``root`` — the normalize-then-prefix-check
+    idiom. Returns the normalized in-bounds path; raises :class:`ValueError`
+    otherwise. ``NAME_REGEX`` / ``_LABEL_REGEX`` already reject traversal
+    syntax upstream, but this is the defense-in-depth barrier at the boundary
+    where the string actually becomes a path.
+    """
+    root_norm = os.path.normpath(os.fspath(root))
+    candidate = os.path.normpath(os.path.join(root_norm, *parts))
+    if candidate != root_norm and not candidate.startswith(root_norm + os.sep):
+        raise ValueError(f"unsafe path component {parts!r} escapes {root_norm!r}")
+    return Path(candidate)
+
+
+def manifold_dir(namespace: str, name: str) -> Path:
+    return ensure_within(manifolds_dir(), namespace, name)
+
+
 def neutral_statements_path() -> Path:
     return saklas_home() / "neutral_statements.json"
+
+
+def baseline_prompts_path() -> Path:
+    """User-override path for the shared A2 baseline user prompts.
+
+    Conversational extraction generates each node's corpus as responses to
+    this fixed prompt set; a node corpus aligns ``response[i] -> prompt[i % k]``.
+    Falls back to the bundled ``saklas/data/baseline_prompts.json`` when absent.
+    """
+    return saklas_home() / "baseline_prompts.json"
 
 
 def safe_model_id(model_id: str) -> str:
@@ -84,29 +125,19 @@ def safe_model_id(model_id: str) -> str:
 
 
 def concept_dir(namespace: str, concept: str) -> Path:
-    return vectors_dir() / namespace / concept
+    return ensure_within(vectors_dir(), namespace, concept)
 
 
 def model_dir(model_id: str) -> Path:
-    return models_dir() / safe_model_id(model_id)
+    return ensure_within(models_dir(), safe_model_id(model_id))
 
 
-def safe_variant_suffix(release: str | None) -> str:
-    """Render the SAE filename suffix.  ``None``/``""`` = raw (no suffix).
-
-    Kept for back-compat with callers that pre-date the v1.6 transfer
-    variant.  New code should prefer :func:`safe_sae_suffix` for SAE or
-    :func:`safe_from_suffix` for transferred profiles.
-    """
+def safe_sae_suffix(release: str | None) -> str:
+    """Filename suffix for an SAE variant.  ``None``/``""`` = raw (no suffix)."""
     if not release:
         return ""
     slug = _UNSAFE_VARIANT_CHARS.sub("_", release.lower())
     return f"{_VARIANT_SEP_SAE}{slug}"
-
-
-def safe_sae_suffix(release: str | None) -> str:
-    """Filename suffix for an SAE variant.  ``None``/``""`` = raw."""
-    return safe_variant_suffix(release)
 
 
 def safe_from_suffix(source_safe_id: str | None) -> str:
@@ -122,52 +153,58 @@ def safe_from_suffix(source_safe_id: str | None) -> str:
     return f"{_VARIANT_SEP_FROM}{slug}"
 
 
+def safe_role_suffix(role_name: str | None) -> str:
+    """Filename suffix for a role variant.  ``None``/``""`` = raw (no suffix).
+
+    The role name is slugified with the same ``[a-z0-9._-]`` discipline
+    as :func:`safe_sae_suffix` — lowercased, unsafe characters collapsed
+    to ``_`` — so the parse is unambiguous against neighbouring kind
+    separators.  ``parse_tensor_filename`` splits on the literal ``_role-``
+    separator, so inner hyphens/dots round-trip.
+    """
+    if not role_name:
+        return ""
+    slug = _UNSAFE_VARIANT_CHARS.sub("_", role_name.lower())
+    return f"{_VARIANT_SEP_ROLE}{slug}"
+
+
 def tensor_filename(
     model_id: str,
     *,
     release: str | None = None,
     transferred_from: str | None = None,
-    method: str = "dim",
+    role: str | None = None,
 ) -> str:
     """Construct the canonical tensor filename.
 
-    Exactly one of ``release`` and ``transferred_from`` may be set —
-    SAE-on-transferred and transferred-on-SAE are not supported as
-    composed variants in v1.6.  ``transferred_from`` accepts either an
-    HF model id (``"google/gemma-3-4b-it"``) or its safe form
+    At most one of ``release``, ``transferred_from``, and ``role`` may be
+    set — composed kind variants (SAE-on-transferred, role-on-SAE, etc.)
+    are not supported.  ``transferred_from`` accepts either an HF model id
+    (``"google/gemma-3-4b-it"``) or its safe form
     (``"google__gemma-3-4b-it"``); both flatten to the same slug.
 
-    ``method`` controls the trailing method suffix:
+    The raw tensor at the canonical path is difference-of-means (the only
+    extraction method as of 4.0), so it carries no method suffix.
 
-      * ``"dim"`` (default, v2.1+) — no suffix.  Tensors at the canonical
-        path were extracted via difference-of-means.
-      * ``"pca"`` — legacy contrastive-PCA tensors land at the same path
-        with a ``_pca`` suffix appended after any kind suffix.
-        ``transferred_from`` rejects ``method="pca"`` because transfers
-        preserve their source method (the source's sidecar carries the
-        provenance string).
+    ``role`` (optional) names a role/persona variant; the filename gets
+    a ``_role-<safe_role>`` suffix, slugified like the SAE release slug.
     """
-    if release and transferred_from:
+    if sum(bool(x) for x in (release, transferred_from, role)) > 1:
         raise ValueError(
-            "tensor_filename: release and transferred_from are mutually exclusive"
+            "tensor_filename: release, transferred_from, and role are "
+            "mutually exclusive"
         )
-    if transferred_from and method != "dim":
-        raise ValueError(
-            "tensor_filename: transferred_from preserves source method; "
-            "explicit method= is not supported"
-        )
-    suffix = _method_suffix(method)
     if release:
-        return (
-            f"{safe_model_id(model_id)}{safe_sae_suffix(release)}{suffix}.safetensors"
-        )
+        return f"{safe_model_id(model_id)}{safe_sae_suffix(release)}.safetensors"
     if transferred_from:
         # Accept either form; ``safe_model_id`` is idempotent on
         # already-safe ids (no '/' to replace), so callers can pass
         # whichever they have.
         src = safe_model_id(transferred_from)
         return f"{safe_model_id(model_id)}{safe_from_suffix(src)}.safetensors"
-    return f"{safe_model_id(model_id)}{suffix}.safetensors"
+    if role:
+        return f"{safe_model_id(model_id)}{safe_role_suffix(role)}.safetensors"
+    return f"{safe_model_id(model_id)}.safetensors"
 
 
 def sidecar_filename(
@@ -175,25 +212,22 @@ def sidecar_filename(
     *,
     release: str | None = None,
     transferred_from: str | None = None,
-    method: str = "dim",
+    role: str | None = None,
 ) -> str:
     """Sidecar JSON partner for a tensor filename."""
-    if release and transferred_from:
+    if sum(bool(x) for x in (release, transferred_from, role)) > 1:
         raise ValueError(
-            "sidecar_filename: release and transferred_from are mutually exclusive"
+            "sidecar_filename: release, transferred_from, and role are "
+            "mutually exclusive"
         )
-    if transferred_from and method != "dim":
-        raise ValueError(
-            "sidecar_filename: transferred_from preserves source method; "
-            "explicit method= is not supported"
-        )
-    suffix = _method_suffix(method)
     if release:
-        return f"{safe_model_id(model_id)}{safe_sae_suffix(release)}{suffix}.json"
+        return f"{safe_model_id(model_id)}{safe_sae_suffix(release)}.json"
     if transferred_from:
         src = safe_model_id(transferred_from)
         return f"{safe_model_id(model_id)}{safe_from_suffix(src)}.json"
-    return f"{safe_model_id(model_id)}{suffix}.json"
+    if role:
+        return f"{safe_model_id(model_id)}{safe_role_suffix(role)}.json"
+    return f"{safe_model_id(model_id)}.json"
 
 
 def parse_tensor_filename(
@@ -202,37 +236,20 @@ def parse_tensor_filename(
     """Reverse of :func:`tensor_filename`. Returns ``(safe_model_id, variant)``.
 
     ``variant`` is one of:
-      * ``None`` — raw DiM tensor (no separator, no method suffix).
-      * ``"pca"`` — raw PCA tensor (legacy method suffix only).
+      * ``None`` — raw DiM tensor (no separator).
       * ``"sae-<release>"`` — SAE-DiM variant.
-      * ``"sae-<release>-pca"`` — SAE-PCA variant (legacy).
-      * ``"from-<safe_src>"`` — transferred-from variant (method-agnostic;
-        transfers preserve source method).
+      * ``"from-<safe_src>"`` — transferred-from variant.
+      * ``"role-<name>"`` — role variant.
 
-    The variant string carries its kind / method tags so callers can
-    dispatch without re-parsing.  Returns ``None`` for filenames that
-    aren't ``.safetensors``.
+    The variant string carries its kind tag so callers can dispatch
+    without re-parsing.  Returns ``None`` for filenames that aren't
+    ``.safetensors``.
     """
     if not filename.endswith(".safetensors"):
         return None
     stem = filename[: -len(".safetensors")]
-    # Method suffix is parsed first (right-to-left): ``_pca`` is applied
-    # last on construction, so we strip it before looking for the kind
-    # separator.  ``_pca`` cannot legally appear inside any kind slug —
-    # ``_UNSAFE_VARIANT_CHARS`` keeps slugs to ``[a-z0-9._-]`` and the
-    # leading ``_`` rules out collision.
-    is_pca = stem.endswith(_METHOD_SUFFIX_PCA)
-    if is_pca:
-        stem = stem[: -len(_METHOD_SUFFIX_PCA)]
     for sep, kind in _VARIANT_SEPARATORS:
         if sep in stem:
             model, value = stem.split(sep, 1)
-            if kind == "from" and is_pca:
-                # Transferred-from never carries an explicit method —
-                # if a stray ``_pca`` ends up in the filename, treat it
-                # as part of the source slug to keep the round-trip
-                # idempotent.  No production path produces this.
-                value = f"{value}{_METHOD_SUFFIX_PCA}"
-            tag = f"{kind}-{value}"
-            return model, f"{tag}-pca" if is_pca and kind != "from" else tag
-    return stem, ("pca" if is_pca else None)
+            return model, f"{kind}-{value}"
+    return stem, None

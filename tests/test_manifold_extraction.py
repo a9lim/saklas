@@ -1,0 +1,915 @@
+"""ManifoldExtractionPipeline tests — CPU only, synthetic encoder.
+
+Mirrors the stub-encoder pattern in :mod:`tests.test_dim_extraction`:
+monkeypatch :func:`saklas.core.vectors._encode_and_capture_all` so no
+real model is needed.
+"""
+from __future__ import annotations
+
+import json
+import hashlib
+from pathlib import Path
+from typing import Any, cast
+
+import pytest
+import torch
+
+from saklas.core import vectors as V
+from saklas.core.events import EventBus, ManifoldExtracted
+from saklas.core.extraction import ManifoldExtractionPipeline
+from saklas.core.sae import MockSaeBackend
+from saklas.io.manifolds import MANIFOLD_FORMAT_VERSION, ManifoldFolder
+from tests._whitener import synthetic_means, synthetic_whitener
+
+_LABELS = ["calm", "uneasy", "afraid", "frantic", "numb"]
+_DIM = 8
+_N_LAYERS = 4
+
+
+def _stub_encoder(
+    model: Any, tokenizer: Any, prompt: str, response: str, layers: Any,
+    device: Any, **_kwargs: Any,
+) -> dict[int, torch.Tensor]:
+    """Synthetic per-layer activations, deterministic per node label.
+
+    Conversational signature: ignores the baseline ``prompt`` and keys off the
+    ``response`` (the node corpus entry, ``"<label> statement i"``)."""
+    label = response.split()[0]
+    seed = int(hashlib.sha256(label.encode("utf-8")).hexdigest()[:8], 16)
+    g = torch.Generator().manual_seed(seed)
+    base = torch.randn(_DIM, generator=g)
+    out: dict[int, torch.Tensor] = {}
+    for layer in range(len(layers)):
+        v = base.clone()
+        v[2] = 0.5 * layer            # layer-varying offset
+        out[layer] = v + 0.01 * torch.randn(_DIM)
+    return out
+
+
+def _stub_encoder_batch(
+    model: Any, tokenizer: Any, prompts: Any, responses: Any, layers: Any,
+    device: Any, **kwargs: Any,
+) -> dict[int, torch.Tensor]:
+    """Batched seam matching ``vectors._encode_and_capture_all_batch``.
+
+    Stacks the per-row :func:`_stub_encoder` over the chunk (same call order, so
+    the deterministic-per-label activations and RNG consumption are identical to
+    the old per-row capture).  Returns ``{layer: (B, D)}``."""
+    rows = [
+        _stub_encoder(model, tokenizer, p, r, layers, device, **kwargs)
+        for p, r in zip(prompts, responses)
+    ]
+    return {
+        idx: torch.stack([row[idx] for row in rows])
+        for idx in range(len(layers))
+    }
+
+
+class _Handle:
+    """Minimal ModelHandle stub.
+
+    Satisfies the ``ModelHandle`` protocol used by
+    ``ManifoldExtractionPipeline``.  The generator methods are never
+    called in CPU-only manifold-extraction tests; they exist only to
+    complete the structural protocol.
+    """
+
+    def __init__(self) -> None:
+        self.model_id = "stub-model"
+        # Use a real nn.Module so the protocol's ``model: nn.Module`` is met.
+        self.model: torch.nn.Module = torch.nn.Linear(1, 1)
+        self.tokenizer: Any = object()
+        self.device = torch.device("cpu")
+        self.dtype = torch.float32
+        self.layers: Any = [object()] * _N_LAYERS
+        # Activation-space fits require a covering whitener (no Euclidean
+        # fallback post-4.0); synthesize one + matching neutral means on CPU.
+        self.layer_means = synthetic_means(range(_N_LAYERS), _DIM)
+        self.whitener = synthetic_whitener(
+            range(_N_LAYERS), _DIM, means=self.layer_means,
+        )
+
+    def _run_generator(
+        self, system_msg: str, prompt: str, max_new_tokens: int,
+    ) -> str:
+        raise NotImplementedError("stub: not called in CPU manifold tests")
+
+    def generate_responses(
+        self,
+        concepts: list[str],
+        kinds: list[str | None],
+        *,
+        roles: dict[str, str | None] | None = None,
+        samples_per_prompt: int = 1,
+        max_new_tokens: int = 256,
+        on_progress: Any = None,
+    ) -> dict[str, list[str]]:
+        raise NotImplementedError("stub: not called in CPU manifold tests")
+
+
+def _box1d_domain(periodic: bool, k: int) -> dict[str, Any]:
+    axis = (
+        {"name": "t", "periodic": True, "period": 1.0}
+        if periodic
+        else {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}
+    )
+    return {"type": "box", "axes": [axis]}
+
+
+def _author_manifold(
+    root: Path,
+    *,
+    periodic: bool = True,
+    labels: list[str] | None = None,
+    domain: dict[str, Any] | None = None,
+    coords: list[list[float]] | None = None,
+) -> Path:
+    labels = labels or _LABELS
+    folder = root / "mood"
+    (folder / "nodes").mkdir(parents=True)
+    for idx, label in enumerate(labels):
+        (folder / "nodes" / f"{idx:02d}_{label}.json").write_text(
+            json.dumps([f"{label} statement {i}" for i in range(3)])
+        )
+    k = len(labels)
+    if domain is None:
+        domain = _box1d_domain(periodic, k)
+    if coords is None:
+        if periodic:
+            coords = [[i / k] for i in range(k)]
+        else:
+            coords = [[i / (k - 1)] for i in range(k)]
+    (folder / "manifold.json").write_text(json.dumps({
+        "format_version": MANIFOLD_FORMAT_VERSION,
+        "name": "mood",
+        "description": "moods",
+        "domain": domain,
+        "nodes": [
+            {"label": label, "coords": coords[i]}
+            for i, label in enumerate(labels)
+        ],
+        "files": {},
+    }))
+    return folder
+
+
+@pytest.fixture(autouse=True)
+def _stub(monkeypatch: pytest.MonkeyPatch) -> None:
+    torch.manual_seed(0)
+    monkeypatch.setattr(V, "_encode_and_capture_all_batch", _stub_encoder_batch)
+    # Single baseline prompt so any node corpus length is a multiple of k=1
+    # (the conversational alignment invariant); the stub ignores the prompt.
+    monkeypatch.setattr(V, "_load_baseline_prompts", lambda: ["baseline prompt"])
+
+
+def test_fit_produces_manifold(tmp_path: Path) -> None:
+    folder = _author_manifold(tmp_path)
+    pipe = ManifoldExtractionPipeline(_Handle(), EventBus())
+    manifold = pipe.fit(folder)
+
+    assert manifold.name == "mood"
+    assert manifold.domain.intrinsic_dim == 1
+    assert manifold.node_labels == _LABELS
+    assert sorted(manifold.layers) == list(range(_N_LAYERS))
+    assert manifold.feature_space == "raw"
+
+
+def test_fit_returns_node_roles_without_reload(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+    from saklas.core.manifold import load_manifold
+    from saklas.io.paths import tensor_filename
+
+    folder = _author_manifold(tmp_path)
+    meta = json.loads((folder / "manifold.json").read_text())
+    for node in meta["nodes"]:
+        node["role"] = node["label"]
+    (folder / "manifold.json").write_text(json.dumps(meta))
+
+    handle = _Handle()
+    handle.model.config = SimpleNamespace(model_type="gemma2")  # type: ignore[attr-defined]
+    manifold = ManifoldExtractionPipeline(handle, EventBus()).fit(folder)
+
+    assert manifold.node_roles == _LABELS
+    assert manifold.nearest_node_role(_LABELS[0]) == _LABELS[0]
+
+    loaded = load_manifold(folder / tensor_filename(handle.model_id))
+    assert loaded.node_roles == _LABELS
+
+
+def test_fit_writes_tensor_and_manifest(tmp_path: Path) -> None:
+    folder = _author_manifold(tmp_path)
+    ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder)
+    assert (folder / "stub-model.safetensors").exists()
+    assert (folder / "stub-model.json").exists()
+    mf = ManifoldFolder.load(folder)
+    assert "stub-model.safetensors" in mf.files
+    assert "stub-model.json" in mf.files
+
+
+def test_fit_emits_event(tmp_path: Path) -> None:
+    folder = _author_manifold(tmp_path)
+    events = EventBus()
+    seen = []
+    events.subscribe(lambda e: seen.append(e)
+                     if isinstance(e, ManifoldExtracted) else None)
+    ManifoldExtractionPipeline(_Handle(), events).fit(folder)
+    assert len(seen) == 1
+    assert seen[0].name == "mood"
+
+
+def test_fit_cache_hit_skips_forward_passes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    folder = _author_manifold(tmp_path)
+    pipe = ManifoldExtractionPipeline(_Handle(), EventBus())
+    pipe.fit(folder)
+
+    calls = {"n": 0}
+    real = _stub_encoder_batch
+
+    def _counting(*args: Any, **kwargs: Any) -> dict[int, torch.Tensor]:
+        calls["n"] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(V, "_encode_and_capture_all_batch", _counting)
+    manifold = pipe.fit(folder)  # second call — corpus unchanged
+    assert calls["n"] == 0       # cache hit, no pooling
+    assert manifold.name == "mood"
+
+
+def test_fit_cache_miss_on_corpus_change(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    folder = _author_manifold(tmp_path)
+    pipe = ManifoldExtractionPipeline(_Handle(), EventBus())
+    pipe.fit(folder)
+
+    (folder / "nodes" / "00_calm.json").write_text(
+        json.dumps(["calm statement 0", "calm statement 1"])
+    )
+
+    calls = {"n": 0}
+    real = _stub_encoder_batch
+
+    def _counting(*args: Any, **kwargs: Any) -> dict[int, torch.Tensor]:
+        calls["n"] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(V, "_encode_and_capture_all_batch", _counting)
+    pipe.fit(folder)
+    assert calls["n"] > 0  # corpus changed -> forward passes re-run
+
+
+def test_fit_cache_miss_on_domain_change(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    folder = _author_manifold(tmp_path, periodic=True)
+    pipe = ManifoldExtractionPipeline(_Handle(), EventBus())
+    pipe.fit(folder)
+
+    # Move a node coordinate — the geometry changes, so the cached
+    # tensor is stale even though the node corpus is byte-identical.
+    meta = json.loads((folder / "manifold.json").read_text())
+    meta["nodes"][1]["coords"] = [0.123]
+    (folder / "manifold.json").write_text(json.dumps(meta))
+
+    calls = {"n": 0}
+    real = _stub_encoder_batch
+
+    def _counting(*args: Any, **kwargs: Any) -> dict[int, torch.Tensor]:
+        calls["n"] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(V, "_encode_and_capture_all_batch", _counting)
+    pipe.fit(folder)
+    assert calls["n"] > 0  # geometry changed -> re-fit
+
+
+def test_fit_sae_variant(tmp_path: Path) -> None:
+    folder = _author_manifold(tmp_path)
+    sae = MockSaeBackend(
+        layers=frozenset(range(_N_LAYERS)), d_model=_DIM,
+        release="mock-rel",
+    )
+    manifold = ManifoldExtractionPipeline(_Handle(), EventBus()).fit(
+        folder, sae=sae,
+    )
+    assert manifold.feature_space == "sae-mock-rel"
+    assert sorted(manifold.layers) == list(range(_N_LAYERS))
+    assert (folder / "stub-model_sae-mock-rel.safetensors").exists()
+
+
+def test_fit_sae_variant_captures_only_covered_layers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    folder = _author_manifold(tmp_path)
+    sae = MockSaeBackend(
+        layers=frozenset({1, 3}), d_model=_DIM,
+        release="partial-rel",
+    )
+    seen: list[tuple[int, ...]] = []
+
+    def _filtered_batch(*args: Any, **kwargs: Any) -> dict[int, torch.Tensor]:
+        layer_indices = kwargs.get("layer_indices")
+        seen.append(tuple(layer_indices or range(_N_LAYERS)))
+        out = _stub_encoder_batch(*args, **kwargs)
+        if layer_indices is None:
+            return out
+        return {idx: out[idx] for idx in layer_indices}
+
+    monkeypatch.setattr(V, "_encode_and_capture_all_batch", _filtered_batch)
+
+    manifold = ManifoldExtractionPipeline(_Handle(), EventBus()).fit(
+        folder, sae=sae,
+    )
+
+    assert sorted(manifold.layers) == [1, 3]
+    assert seen
+    assert all(layers == (1, 3) for layers in seen)
+
+
+def test_fit_sae_no_coverage_raises_before_pooling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An SAE covering none of the model's layers raises ``SaeCoverageError``
+    *before* the per-node centroid pooling loop — fail-fast on the
+    ``ManifoldExtractionPipeline`` ordering contract."""
+    from saklas.core.errors import SaeCoverageError
+
+    folder = _author_manifold(tmp_path)
+    # SAE layers disjoint from [0, _N_LAYERS) — zero coverage.
+    sae = MockSaeBackend(
+        layers=frozenset({_N_LAYERS + 1, _N_LAYERS + 2}), d_model=_DIM,
+        release="empty-rel",
+    )
+
+    # Pooling must never run on the no-coverage path.
+    from saklas.core import manifold as M
+
+    def _explode(*_a: Any, **_k: Any) -> None:
+        raise AssertionError(
+            "compute_node_centroid called before SAE-coverage check"
+        )
+
+    monkeypatch.setattr(M, "compute_node_centroid", _explode)
+
+    with pytest.raises(SaeCoverageError, match="covers no layers"):
+        ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder, sae=sae)
+
+
+def test_fit_natural_manifold(tmp_path: Path) -> None:
+    from saklas.core.manifold import BoxDomain
+    folder = _author_manifold(tmp_path, periodic=False)
+    manifold = ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder)
+    assert manifold.domain.intrinsic_dim == 1
+    # The domain must be a BoxDomain (authored with box spec); narrowing
+    # the type lets pyright resolve the .axes attribute.
+    assert isinstance(manifold.domain, BoxDomain)
+    assert manifold.domain.axes[0].periodic is False
+    for sub in manifold.layers.values():
+        _np, _, _ = sub.rbf_params()
+        assert _np.shape[0] == len(_LABELS)
+
+
+def test_fit_n2_box_manifold(tmp_path: Path) -> None:
+    labels = [f"n{i}" for i in range(9)]
+    domain = {
+        "type": "box",
+        "axes": [
+            {"name": "u", "periodic": False, "lo": 0.0, "hi": 1.0},
+            {"name": "v", "periodic": False, "lo": 0.0, "hi": 1.0},
+        ],
+    }
+    coords = [[x, y] for x in (0.0, 0.5, 1.0) for y in (0.0, 0.5, 1.0)]
+    folder = _author_manifold(
+        tmp_path, labels=labels, domain=domain, coords=coords,
+    )
+    manifold = ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder)
+    assert manifold.domain.intrinsic_dim == 2
+    pt = manifold.manifold_point(0, (0.3, 0.7))
+    assert pt.shape == (_DIM,)
+
+
+def test_fit_rejects_poisedness_failure(tmp_path: Path) -> None:
+    # Five nodes on a 2-D domain, all collinear -> the affine term is
+    # underdetermined and the RBF fit raises.
+    labels = [f"n{i}" for i in range(5)]
+    domain = {
+        "type": "box",
+        "axes": [
+            {"name": "u", "periodic": False, "lo": 0.0, "hi": 1.0},
+            {"name": "v", "periodic": False, "lo": 0.0, "hi": 1.0},
+        ],
+    }
+    coords = [[t, t] for t in (0.0, 0.25, 0.5, 0.75, 1.0)]
+    with pytest.warns(UserWarning, match="poised"):
+        folder = _author_manifold(
+            tmp_path, labels=labels, domain=domain, coords=coords,
+        )
+        ManifoldFolder.load(folder)
+    with pytest.warns(UserWarning, match="poised"), \
+            pytest.raises(ValueError, match="poisedness"):
+        ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder)
+
+
+# ============================================================ discover mode ===
+
+# The stub encoder is deterministic per label, so discover-mode fits are
+# also deterministic — every node's centroid is fixed by its label, the
+# derived coords come straight out of the PCA/spectral analysis of those
+# centroids, and the per-layer RBF fits become repeatable.  No model
+# required.
+
+
+def _discover_folder(
+    root: Path,
+    *,
+    name: str = "personas",
+    fit_mode: str = "pca",
+    labels: list[str] | None = None,
+    hyperparams: dict[str, Any] | None = None,
+) -> Path:
+    """Hand-author a discover-mode manifold folder without going through
+    create_discover_manifold_folder (which writes to ~/.saklas/)."""
+    if labels is None:
+        labels = ["pirate", "caveman", "scholar", "assistant", "robot"]
+    folder = root / name
+    (folder / "nodes").mkdir(parents=True)
+    for idx, label in enumerate(labels):
+        (folder / "nodes" / f"{idx:02d}_{label}.json").write_text(
+            json.dumps([f"{label} statement {i}" for i in range(3)])
+        )
+    (folder / "manifold.json").write_text(json.dumps({
+        "format_version": MANIFOLD_FORMAT_VERSION,
+        "name": name,
+        "description": f"discover-{fit_mode}",
+        "fit_mode": fit_mode,
+        "hyperparams": hyperparams or {},
+        "nodes": [{"label": label} for label in labels],
+        "files": {},
+    }))
+    return folder
+
+
+def test_discover_pca_produces_custom_domain(tmp_path: Path) -> None:
+    """PCA discover fit produces a CustomDomain of the picked intrinsic dim."""
+    folder = _discover_folder(
+        tmp_path, fit_mode="pca",
+        hyperparams={"max_dim": 4, "var_threshold": 0.70},
+    )
+    manifold = ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder)
+
+    # CustomDomain with identity embedding — intrinsic_dim == embed_dim.
+    from saklas.core.manifold import CustomDomain
+    assert isinstance(manifold.domain, CustomDomain)
+    assert manifold.domain.intrinsic_dim == manifold.domain.embed_dim
+    assert 1 <= manifold.domain.intrinsic_dim <= 4
+
+    # Coords were derived from the activations; node_coords shape lines up.
+    assert manifold.node_coords.shape[0] == 5
+    assert manifold.node_coords.shape[1] == manifold.domain.intrinsic_dim
+
+    # Per-layer fits cover every layer in the model.
+    assert sorted(manifold.layers) == list(range(_N_LAYERS))
+
+
+def test_discover_pca_produces_affine_subspaces(tmp_path: Path) -> None:
+    """PCA discover fits a **flat affine** subspace per layer (no RBF surface)
+    — the 4.0 reclassification (ARCHITECTURE §1/§5): a personas-shaped artifact
+    is a rank-k flat subspace, not a curved manifold.  Each layer carries the
+    real per-layer node coords ``(K, R)``; the basis is whitened/Fisher (the
+    stub handle carries a covering synthetic whitener — activation-space fits
+    require one post-4.0, there is no Euclidean fit path)."""
+    folder = _discover_folder(
+        tmp_path, fit_mode="pca",
+        hyperparams={"max_dim": 4, "var_threshold": 0.70},
+    )
+    manifold = ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder)
+    assert manifold.layers  # at least one layer survived DLS
+    for sub in manifold.layers.values():
+        assert sub.is_affine                          # flat — no RBF surface
+        with pytest.raises(ValueError, match="affine"):
+            sub.rbf_params()                          # no RBF triple
+        assert sub.node_coords is not None            # real per-layer coords
+        assert sub.node_coords.shape[0] == 5          # one row per node
+        assert sub.node_coords.shape[1] == sub.rank   # (K, R)
+    # subspace_metric is always "mahalanobis": the stub carries a covering
+    # whitener and there is no Euclidean fit path.
+    sidecar = json.loads((folder / "stub-model.json").read_text())
+    assert sidecar["subspace_metric"] == "mahalanobis"
+
+
+def test_discover_pca_layout_is_neutral_centered(tmp_path: Path) -> None:
+    """The flat (pca) display layout is re-anchored on neutral instead of the
+    node centroid.  ``derive_pca_coords`` returns coords with a zero node mean
+    (PCA-centered), so pre-re-anchoring the origin *was* the centroid; after
+    re-anchoring the origin is neutral's projection into the layout span (the
+    closest layout point to neutral, like the geometry plot's ``neutral_white``),
+    so the centroid sits off-origin and a coord-form ``%`` at (0,…,0) pushes less
+    than one toward the centroid.  Re-anchoring is a pure translation, so node-
+    exact steering is unchanged: a coord-form push at a node's layout coords
+    still reproduces that node's label-form push, layer for layer."""
+    from saklas.core.session import _affine_manifold_push
+
+    folder = _discover_folder(
+        tmp_path, fit_mode="pca",
+        hyperparams={"max_dim": 4, "var_threshold": 0.99},
+    )
+    m = ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder)
+    k = m.domain.intrinsic_dim
+    centroid = m.node_coords.mean(dim=0)                    # (k,)
+
+    # (a) origin moved off the node centroid (PCA mean was exactly 0; the
+    #     re-anchor shifted it to −neutral_layout_coord).
+    assert float(centroid.norm()) > 1e-2
+
+    # (b) origin == neutral's projection ⇒ steering toward (0,…,0) displaces less
+    #     than steering toward the node centroid, and less than a full node push.
+    push_norm = lambda d: max(float(v.norm()) for v in d.values())  # noqa: E731
+    _, at_origin = _affine_manifold_push(m, tuple([0.0] * k))
+    _, at_centroid = _affine_manifold_push(m, tuple(centroid.tolist()))
+    _, at_node = _affine_manifold_push(m, m.node_labels[0])
+    assert push_norm(at_origin) < push_norm(at_centroid)
+    assert push_norm(at_origin) < push_norm(at_node)
+
+    # (c) node-exactness preserved by the shift: coord-form at a node's layout
+    #     coords reproduces its label-form push, layer for layer.
+    for i in range(len(m.node_labels)):
+        _, by_label = _affine_manifold_push(m, m.node_labels[i])
+        _, by_coord = _affine_manifold_push(m, tuple(m.node_coords[i].tolist()))
+        assert set(by_label) == set(by_coord)
+        for L in by_label:
+            assert torch.allclose(by_label[L], by_coord[L], atol=1e-4)
+
+
+def test_discover_records_fit_mode_and_diagnostics(tmp_path: Path) -> None:
+    """The sidecar carries fit_mode + diagnostics so the inspector can render."""
+    folder = _discover_folder(
+        tmp_path, fit_mode="pca",
+        hyperparams={"max_dim": 4, "var_threshold": 0.70},
+    )
+    ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder)
+
+    sidecar = json.loads((folder / "stub-model.json").read_text())
+    assert sidecar["fit_mode"] == "pca"
+    assert "diagnostics" in sidecar
+    diag = sidecar["diagnostics"]
+    assert "per_component_variance" in diag
+    assert "cumulative_variance" in diag
+    assert "picked_k" in diag
+    assert diag["picked_k"] >= 1
+    assert sidecar["hyperparams"]["max_dim"] == 4
+    assert sidecar["hyperparams"]["var_threshold"] == 0.70
+
+
+def test_discover_cache_hit_skips_forward_passes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second fit with unchanged inputs short-circuits to the cached tensor."""
+    folder = _discover_folder(tmp_path, fit_mode="pca")
+    ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder)
+
+    # Patch the centroid pooler to crash if called — cache hit must skip it.
+    def _explode(*_a: Any, **_k: Any) -> None:
+        raise AssertionError("compute_node_centroid called on cache hit")
+    from saklas.core import manifold as M
+    monkeypatch.setattr(M, "compute_node_centroid", _explode)
+
+    manifold = ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder)
+    assert manifold.name == "personas"
+
+
+def test_discover_cache_invalidates_on_hyperparam_change(tmp_path: Path) -> None:
+    """Changing max_dim refits rather than serving the cached tensor."""
+    folder = _discover_folder(
+        tmp_path, fit_mode="pca", hyperparams={"max_dim": 4},
+    )
+    m1 = ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder)
+
+    # Rewrite manifest with a different max_dim.
+    data = json.loads((folder / "manifold.json").read_text())
+    data["hyperparams"] = {"max_dim": 2}
+    (folder / "manifold.json").write_text(json.dumps(data))
+
+    m2 = ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder)
+    # The two fits agree on at most max_dim=2, so the second's intrinsic
+    # dim is bounded by 2; if cache had hit we'd still see m1's dim.
+    assert m1.domain.intrinsic_dim >= m2.domain.intrinsic_dim
+    assert m2.domain.intrinsic_dim <= 2
+
+
+def test_discover_cache_invalidates_on_fit_mode_change(tmp_path: Path) -> None:
+    """Switching pca ↔ spectral forces a refit.
+
+    Uses 9 labels so both fit modes pick a ``k`` satisfying
+    ``min_nodes(k) <= 9`` regardless of which one the eigengap
+    heuristic picks (worst case k=4 ⇒ min_nodes(4)=9).
+    """
+    labels = [f"p{i}" for i in range(9)]
+    folder = _discover_folder(
+        tmp_path, fit_mode="pca", labels=labels,
+        hyperparams={"max_dim": 4},
+    )
+    ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder)
+    sidecar_pca = json.loads((folder / "stub-model.json").read_text())
+    assert sidecar_pca["fit_mode"] == "pca"
+
+    data = json.loads((folder / "manifold.json").read_text())
+    data["fit_mode"] = "spectral"
+    (folder / "manifold.json").write_text(json.dumps(data))
+
+    ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder)
+    sidecar_spec = json.loads((folder / "stub-model.json").read_text())
+    assert sidecar_spec["fit_mode"] == "spectral"
+
+
+def test_discover_round_trip_through_load_manifold(tmp_path: Path) -> None:
+    """A fitted discover manifold loads back with the same domain + coords."""
+    from saklas.core.manifold import CustomDomain, load_manifold
+    folder = _discover_folder(
+        tmp_path, fit_mode="pca", hyperparams={"max_dim": 4},
+    )
+    m1 = ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder)
+    m2 = load_manifold(folder / "stub-model.safetensors")
+    assert isinstance(m2.domain, CustomDomain)
+    assert m2.domain.intrinsic_dim == m1.domain.intrinsic_dim
+    assert m2.node_labels == m1.node_labels
+    assert m2.node_coords.shape == m1.node_coords.shape
+    assert torch.allclose(m2.node_coords, m1.node_coords, atol=1e-5)
+    # Per-layer subspaces round-trip — every layer present, same shapes.
+    assert sorted(m2.layers) == sorted(m1.layers)
+    for L in m1.layers:
+        assert m2.layers[L].mean.shape == m1.layers[L].mean.shape
+        assert m2.layers[L].basis.shape == m1.layers[L].basis.shape
+
+
+def test_discover_subspace_inject_translates_by_target(tmp_path: Path) -> None:
+    """End-to-end behavior check: ``subspace_inject`` *translates* the in-subspace
+    component by the fixed offset ``along·target``.
+
+    A direct push call leaves ``kappa`` at its scalar-0 default (pure translate),
+    so ``along=1`` shifts the projected foot by the full ``target`` offset
+    (preserving the per-token spread) rather than snapping it onto ``target``.
+    The fit is flat (``fit_mode=pca``) so ``H_n ≡ 0`` and ``onto`` is vacuous; the
+    reduced coords land at exactly ``h_in + target`` (the soft norm cap does not
+    fire — the offset is small against the far-out hidden).
+    """
+    from saklas.core.manifold import subspace_inject
+    # Seed the global RNG before the fit: the stub encoder perturbs each
+    # layer's centroid with a generator-less ``torch.randn``, so without
+    # this the fitted subspace jitters with test order.
+    torch.manual_seed(0)
+    folder = _discover_folder(
+        tmp_path, fit_mode="pca", hyperparams={"max_dim": 4},
+    )
+    manifold = ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder)
+
+    layer = 0
+    sub = manifold.layers[layer]
+    domain = manifold.domain
+    n = domain.intrinsic_dim
+    position = manifold.node_coords[0].to(torch.float32)  # a coord on M (the target)
+
+    # Hidden states far from any natural manifold point so the translate is
+    # well-resolved against the soft norm cap.
+    g = torch.Generator().manual_seed(0)
+    hidden = 3.0 * torch.randn(1, 3, _DIM, generator=g)
+    seed = position.reshape((1,) * 2 + (n,)).expand(1, 3, n)
+    out, _foot = subspace_inject(
+        hidden, sub, domain, position, seed,
+        along=1.0, onto=1.0, gn_steps=4,
+    )
+
+    for pos in range(hidden.shape[1]):
+        h_in = (hidden[0, pos] - sub.mean) @ sub.basis.T
+        h_out = (out[0, pos] - sub.mean) @ sub.basis.T
+        # along=1, κ=0 ⇒ the in-subspace coord is translated by the full target
+        # offset: h_out == h_in + target (the per-token spread h_in is kept).
+        assert torch.allclose(h_out, h_in + position, atol=1e-3), (
+            f"position {pos}: expected translate h_in + target, "
+            f"got Δ={h_out - h_in} vs target={position}"
+        )
+
+
+def test_discover_pca_two_node_is_steering_vector(tmp_path: Path) -> None:
+    """A 2-node ``fit_mode=pca`` folder *is* a difference-of-means steering
+    vector — the 4.0 unification (ARCHITECTURE §1/§5, "a vector = a 2-node
+    folder").  K=2 ⇒ a rank-1 affine subspace; the RBF poisedness floor
+    ``min_nodes(1)=3`` does **not** gate the flat path (only ``k+1=2``
+    centroids are needed to span a 1-D subspace).  Each layer's two node
+    coords straddle the origin — the μ-centered pos/neg contrast is the DiM
+    axis itself.
+    """
+    folder = _discover_folder(
+        tmp_path, name="anger", fit_mode="pca",
+        labels=["angry", "calm"],
+        hyperparams={"max_dim": 4, "var_threshold": 0.70},
+    )
+    manifold = ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder)
+
+    assert manifold.domain.intrinsic_dim == 1          # rank-1 == a vector
+    assert manifold.node_labels == ["angry", "calm"]
+    assert manifold.node_coords.shape == (2, 1)
+    assert manifold.layers                             # survived DLS
+    for sub in manifold.layers.values():
+        assert sub.is_affine                           # flat — no RBF surface
+        assert sub.rank == 1
+        assert sub.node_coords is not None
+        assert sub.node_coords.shape == (2, 1)         # (K, R) = (2, 1)
+        # μ-centered ⇒ the angry/calm coords sit on opposite sides of 0:
+        # the difference-of-means axis, with neutral implicitly between.
+        assert sub.node_coords[0, 0] * sub.node_coords[1, 0] < 0
+
+
+def test_two_node_pca_reads_as_affine_pole_push(tmp_path: Path) -> None:
+    """A fitted 2-node pca manifold reads through the session's
+    ``_affine_manifold_push`` — the ``name%pole`` steer path — as a rank-1
+    affine push: per-layer basis + the pole node's real coord.  This closes
+    the author→fit→steer loop for "a vector = a 2-node folder": steering
+    toward the ``angry`` pole and toward the ``calm`` pole read
+    opposite-signed coords (the difference-of-means contrast).
+    """
+    from saklas.core.session import _affine_manifold_push
+
+    folder = _discover_folder(
+        tmp_path, name="anger", fit_mode="pca",
+        labels=["angry", "calm"],
+        hyperparams={"max_dim": 4, "var_threshold": 0.70},
+    )
+    manifold = ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder)
+
+    basis_angry, coord_angry = _affine_manifold_push(manifold, "angry")
+    assert set(basis_angry) == set(manifold.layers)
+    for L, sub in manifold.layers.items():
+        assert sub.node_coords is not None
+        assert torch.equal(basis_angry[L], sub.basis)        # per-layer basis
+        assert torch.equal(coord_angry[L], sub.node_coords[0])  # angry == node 0
+
+    _, coord_calm = _affine_manifold_push(manifold, "calm")
+    for L in manifold.layers:
+        # Opposite poles slide to opposite sides of the neutral-anchored origin.
+        assert coord_angry[L][0] * coord_calm[L][0] < 0
+
+
+def test_affine_push_coord_form_equals_label_at_node(tmp_path: Path) -> None:
+    """Coord form and label form are equivalent at the nodes: a free coord-form
+    position placed at a node's authoring coords reproduces the label-form push
+    (the cardinal RBF weights are ``e_idx`` at node ``idx``).  This is the
+    equivalence that makes ``personas%<pirate's coords>`` ≡ ``personas%pirate``.
+    """
+    from saklas.core.session import _affine_manifold_push
+
+    folder = _discover_folder(
+        tmp_path, name="trio", fit_mode="pca", labels=["a", "b", "c"],
+        hyperparams={"max_dim": 2, "var_threshold": 0.999},
+    )
+    manifold = ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder)
+    assert all(sub.is_affine for sub in manifold.layers.values())
+
+    for idx, label in enumerate(manifold.node_labels):
+        _, coord_label = _affine_manifold_push(manifold, label)
+        node_coords = tuple(float(c) for c in manifold.node_coords[idx].tolist())
+        _, coord_free = _affine_manifold_push(manifold, node_coords)
+        for L in manifold.layers:
+            assert torch.allclose(coord_free[L], coord_label[L], atol=1e-4), (
+                f"layer {L} node {label}: coord form != label form"
+            )
+
+
+def test_affine_push_coord_form_interpolates_between_nodes(tmp_path: Path) -> None:
+    """A free coord-form position between two nodes blends their per-layer
+    targets — distinct from either endpoint, and the layout's two nearest nodes
+    carry the dominant cardinal weight.
+    """
+    from saklas.core.manifold import rbf_cardinal_weights
+    from saklas.core.session import _affine_manifold_push
+
+    folder = _discover_folder(
+        tmp_path, name="trio2", fit_mode="pca", labels=["a", "b", "c"],
+        hyperparams={"max_dim": 2, "var_threshold": 0.999},
+    )
+    manifold = ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder)
+
+    mid = (manifold.node_coords[0] + manifold.node_coords[1]) / 2
+    w = rbf_cardinal_weights(manifold.node_coords, mid)
+    # nodes 0 and 1 dominate the blend at their midpoint
+    assert int(torch.argsort(w, descending=True)[0]) in (0, 1)
+    assert int(torch.argsort(w, descending=True)[1]) in (0, 1)
+
+    _, coord_mid = _affine_manifold_push(manifold, tuple(float(c) for c in mid))
+    _, coord_a = _affine_manifold_push(manifold, "a")
+    _, coord_b = _affine_manifold_push(manifold, "b")
+    for L in manifold.layers:
+        assert not torch.allclose(coord_mid[L], coord_a[L], atol=1e-3)
+        assert not torch.allclose(coord_mid[L], coord_b[L], atol=1e-3)
+
+
+def test_affine_push_coord_form_arity_mismatch_raises(tmp_path: Path) -> None:
+    """A coord-form position with the wrong number of coordinates raises
+    ``ManifoldArityError`` (a ``SteeringExprError``), matching the curved path.
+    """
+    from saklas.core.errors import ManifoldArityError
+    from saklas.core.steering_expr import SteeringExprError
+    from saklas.core.session import _affine_manifold_push
+
+    folder = _discover_folder(
+        tmp_path, name="trio3", fit_mode="pca", labels=["a", "b", "c"],
+        hyperparams={"max_dim": 2, "var_threshold": 0.999},
+    )
+    manifold = ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder)
+    n = manifold.domain.intrinsic_dim
+    with pytest.raises(ManifoldArityError) as exc:
+        _affine_manifold_push(manifold, tuple([0.0] * (n + 1)))
+    assert isinstance(exc.value, SteeringExprError)
+
+
+def test_discover_pca_flat_fit_skips_rbf_floor(tmp_path: Path) -> None:
+    """The flat (``pca``) path is gated by the affine-span floor ``k+1``, not
+    the RBF poisedness floor ``2k+1``: a flat subspace has no interpolant to
+    keep poised.  Three nodes picking ``k=2`` fit fine (``3 == k+1``) where the
+    old ``min_nodes(2)=5`` floor would have raised.  The ``2k+1`` floor stays in
+    force on the curved (``spectral``) path.
+    """
+    folder = _discover_folder(
+        tmp_path, fit_mode="pca", labels=["a", "b", "c"],
+        hyperparams={"max_dim": 2, "var_threshold": 0.999},
+    )
+    manifold = ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder)
+    assert manifold.domain.intrinsic_dim <= 2
+    assert manifold.layers
+    for sub in manifold.layers.values():
+        assert sub.is_affine
+
+
+# ----------------------------------------------------- fit_mode="auto" -------
+
+def _circle_encoder_batch(
+    model: Any, tokenizer: Any, prompts: Any, responses: Any, layers: Any,
+    device: Any, **kwargs: Any,
+) -> dict[int, torch.Tensor]:
+    """Place node ``node<NN>`` at angle ``2π·NN/12`` on a circle in dims 0–1.
+
+    Exercises the ``auto`` → persistent-homology → periodic ``BoxDomain`` path
+    end to end: the per-node centroids trace a loop, so ``select_topology``
+    must resolve a ``spectral`` curved fit over a 1-periodic box (a circle).
+    """
+    import math as _math
+    rows = []
+    for r in responses:
+        i = int(r.split()[0][4:])           # "node07 statement 2" -> 7
+        ang = 2.0 * _math.pi * i / 12.0
+        base = torch.zeros(_DIM)
+        base[0] = _math.cos(ang)
+        base[1] = _math.sin(ang)
+        out: dict[int, torch.Tensor] = {}
+        for layer in range(len(layers)):
+            v = base.clone()
+            v[2] = 0.3 * layer
+            out[layer] = v + 0.02 * torch.randn(_DIM)
+        rows.append(out)
+    return {
+        idx: torch.stack([row[idx] for row in rows]) for idx in range(len(layers))
+    }
+
+
+def test_auto_records_resolution_metadata(tmp_path: Path) -> None:
+    """An ``auto`` fit resolves a concrete geometry and records the ranking."""
+    folder = _discover_folder(
+        tmp_path, name="autoflat", fit_mode="auto",
+        labels=[f"n{i:02d}" for i in range(8)], hyperparams={"max_dim": 4},
+    )
+    manifold = ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder)
+
+    assert manifold.layers
+    meta = manifold.metadata
+    assert meta["fit_mode"] == "auto"
+    assert meta["resolved_fit_mode"] in {"pca", "spectral"}
+    assert meta["method"] == "manifold_discover_auto"
+    candidates = cast(list[dict[str, Any]], meta["topology_candidates"])
+    names = {c["name"] for c in candidates}
+    assert "flat-pca" in names
+    assert meta["topology_winner"] in names
+
+
+def test_auto_detects_circle_as_periodic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``auto`` on loop-structured centroids resolves a periodic BoxDomain."""
+    from saklas.core.manifold import BoxDomain
+    monkeypatch.setattr(V, "_encode_and_capture_all_batch", _circle_encoder_batch)
+    folder = _discover_folder(
+        tmp_path, name="autocircle", fit_mode="auto",
+        labels=[f"node{i:02d}" for i in range(12)], hyperparams={"max_dim": 4},
+    )
+    manifold = ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder)
+
+    assert isinstance(manifold.domain, BoxDomain)
+    assert manifold.domain.axes[0].periodic
+    assert manifold.metadata["resolved_fit_mode"] == "spectral"
+    assert manifold.metadata["topology_winner"] == "torus-T1"
+    # The curved fit landed an RBF surface per layer (not affine).
+    for sub in manifold.layers.values():
+        assert not sub.is_affine
+    # Fuzzy-manifold σ-field: the curved fit ran the within-node spread second
+    # pass (same monkeypatched encoder), attaching a log-σ RBF to each layer and
+    # stamping the sidecar summary.  End-to-end coverage of
+    # compute_node_reduced_covariance → fit_sigma_field → save/load.
+    for sub in manifold.layers.values():
+        assert sub.has_sigma
+        z = manifold.domain.embed(manifold.node_coords[0])
+        assert float(sub.sigma_at(z)) > 0.0
+    assert "sigma_field_per_layer" in manifold.metadata

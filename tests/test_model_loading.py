@@ -5,9 +5,12 @@ AutoModelForCausalLM calls and inspect the load_kwargs `load_model` passes.
 """
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch
 
+import pytest
 import torch
 
 from saklas.core import model as model_mod
@@ -34,10 +37,10 @@ class _FakeModel(SimpleNamespace):
         super().__init__()
         self.config = SimpleNamespace(_attn_implementation=attn_impl)
 
-    def requires_grad_(self, _flag):  # noqa: D401
+    def requires_grad_(self, _flag: bool) -> _FakeModel:  # noqa: D401
         return self
 
-    def train(self, _flag):
+    def train(self, _flag: bool) -> _FakeModel:
         return self
 
     def parameters(self):
@@ -48,9 +51,9 @@ def _captured_load_kwargs(device: str, model_type: str = "deepseek_v2"):
     """Run load_model with a mocked transformers stack; return the kwargs
     actually handed to AutoModelForCausalLM.from_pretrained."""
     cfg = _FakeConfig(model_type)
-    captured: dict = {}
+    captured: dict[str, Any] = {}
 
-    def _fake_from_pretrained(model_id, **kwargs):
+    def _fake_from_pretrained(model_id: str, **kwargs: Any) -> _FakeModel:
         captured.update(kwargs)
         return _FakeModel(kwargs.get("attn_implementation", "sdpa"))
 
@@ -94,9 +97,9 @@ def test_mla_in_text_config_also_triggers():
     """A multimodal wrapper whose text_config is deepseek_v2 must also
     fall through to eager on MPS."""
     cfg = _FakeConfig(model_type="some_vlm", text_model_type="deepseek_v2")
-    captured: dict = {}
+    captured: dict[str, Any] = {}
 
-    def _fake_from_pretrained(model_id, **kwargs):
+    def _fake_from_pretrained(model_id: str, **kwargs: Any) -> _FakeModel:
         captured.update(kwargs)
         return _FakeModel(kwargs.get("attn_implementation", "sdpa"))
 
@@ -109,12 +112,11 @@ def test_mla_in_text_config_also_triggers():
         mock_cfg.from_pretrained.return_value = cfg
         mock_model.from_pretrained.side_effect = _fake_from_pretrained
         # The text_config carries deepseek_v2 — model_type is the wrapper.
-        # extract_text_model takes the multimodal-wrapping branch only when
-        # the text_config's model_type IS in _LAYER_ACCESSORS *and* the
-        # outer model_type is NOT.  Both conditions hold for our fake, so
-        # load_model would route through _load_text_from_multimodal.  Stub
-        # it out — we only care that attn_impl was already flipped to eager
-        # *before* dispatch.
+        # extract_text_model takes the multimodal-wrapping branch whenever
+        # the text_config's model_type is in _LAYER_ACCESSORS, so load_model
+        # would route through _load_text_from_multimodal.  Stub it out — we
+        # only care that attn_impl was already flipped to eager *before*
+        # dispatch.
         with patch.object(model_mod, "_load_text_from_multimodal") as mlm:
             mlm.return_value = _FakeModel("eager")
             model_mod.load_model("fake/repo", device="mps")
@@ -131,9 +133,9 @@ def _captured_tokenizer_kwargs(model_id: str, model_type: str = "qwen3"):
     """Run load_model with a mocked transformers stack; return the kwargs
     actually handed to AutoTokenizer.from_pretrained."""
     cfg = _FakeConfig(model_type)
-    captured: dict = {}
+    captured: dict[str, Any] = {}
 
-    def _fake_tok_from_pretrained(mid, **kwargs):
+    def _fake_tok_from_pretrained(mid: str, **kwargs: Any) -> SimpleNamespace:
         captured.update(kwargs)
         return SimpleNamespace()
 
@@ -204,7 +206,7 @@ def _run_load_with_compile(
     Returns ``(compile_called, compile_kwargs, returned_model)``.
     """
     cfg = _FakeConfig(model_type)
-    compile_invocations: list[dict] = []
+    compile_invocations: list[dict[str, Any]] = []
     base_model = _FakeModel("sdpa")
 
     class _FakeCompiled:
@@ -213,14 +215,14 @@ def _run_load_with_compile(
         shape and return an object with ``.logits``."""
         _compiled_marker = True
 
-        def __init__(self, model):
+        def __init__(self, model: Any) -> None:
             self._orig_mod = model
 
-        def __call__(self, **fwd):
+        def __call__(self, **fwd: Any) -> SimpleNamespace:
             n = fwd["input_ids"].shape[1]
             return SimpleNamespace(logits=torch.zeros(1, n, 1))
 
-    def _fake_compile(model, **kwargs):
+    def _fake_compile(model: Any, **kwargs: Any) -> _FakeCompiled:
         compile_invocations.append({"model": model, **kwargs})
         return _FakeCompiled(model)
 
@@ -320,10 +322,10 @@ def test_compile_probe_failure_falls_back_to_eager():
     class _BrokenCompiled:
         _compiled_marker = True
 
-        def __init__(self, model):
+        def __init__(self, model: Any) -> None:
             self._orig_mod = model
 
-        def __call__(self, **fwd):
+        def __call__(self, **fwd: Any) -> None:
             raise RuntimeError("inductor codegen produced an invalid kernel")
 
     with (
@@ -359,7 +361,7 @@ def test_compile_mode_propagates():
     assert invocations[0]["mode"] == "reduce-overhead"
 
 
-def test_get_memory_gb_returns_zero_when_mps_backend_unavailable(monkeypatch):
+def test_get_memory_gb_returns_zero_when_mps_backend_unavailable(monkeypatch: pytest.MonkeyPatch):
     """``device='mps'`` on a host without an MPS backend (e.g. Linux CI)
     must not crash.  The CUDA branch already gates on
     ``torch.cuda.is_available()``; the MPS branch must mirror that — the
@@ -373,3 +375,206 @@ def test_get_memory_gb_returns_zero_when_mps_backend_unavailable(monkeypatch):
         raise RuntimeError("Cannot execute getCurrentAllocatedMemory() without MPS backend.")
     monkeypatch.setattr(torch.mps, "current_allocated_memory", _raise)
     assert model_mod._get_memory_gb("mps") == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Multimodal text-model extraction.
+#
+# A multimodal checkpoint stores the text model's weights under a
+# ``language_model.`` path segment and ships an unused vision tower.
+# ``_load_text_from_multimodal`` builds the text-only model on-device and
+# streams just the text weights in, dropping the ``language_model.`` segment
+# to recover the text model's own parameter names.  This both skips the
+# vision tower and — critically on unified memory — avoids the ~2× peak of
+# the standard CPU-stage-then-device-copy load (the >128 GB gemma-4-31B
+# blowup).  Two real wire layouts exist; both must round-trip:
+#
+#   gemma-3 / gemma-4 : model.language_model.layers…   (segment nested)
+#   mistral-3 / ministral : language_model.model.layers…  (leading prefix)
+#
+# These tests write a synthetic checkpoint with both text and fake vision
+# keys, then assert the loader recovers exactly the text weights.
+# ---------------------------------------------------------------------------
+
+
+def _tiny_text_config(tie: bool):
+    from transformers import AutoConfig as _AC
+    return _AC.for_model(
+        "llama", hidden_size=32, intermediate_size=64, num_hidden_layers=2,
+        num_attention_heads=4, num_key_value_heads=2, vocab_size=128,
+        head_dim=8, max_position_embeddings=64, pad_token_id=0,
+        bos_token_id=1, eos_token_id=2, tie_word_embeddings=tie,
+    )
+
+
+def _remap_to_layout(state_dict: dict[str, torch.Tensor], layout: str) -> dict[str, torch.Tensor]:
+    """Re-key a text-only state dict into a multimodal wire layout."""
+    out: dict[str, torch.Tensor] = {}
+    for k, v in state_dict.items():
+        if layout == "gemma":
+            # model.X -> model.language_model.X ; lm_head.X -> language_model.lm_head.X
+            nk = ("model.language_model." + k[len("model."):]
+                  if k.startswith("model.") else "language_model." + k)
+        elif layout == "mistral":
+            nk = "language_model." + k  # leading prefix on everything
+        else:  # pragma: no cover - guard
+            raise ValueError(layout)
+        out[nk] = v.clone()
+    return out
+
+
+def _write_synthetic_vlm(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, layout: str, tie: bool):
+    """Write a synthetic multimodal checkpoint (text + fake vision weights)
+    and patch ``cached_file`` so the loader resolves it.  Returns the
+    reference text-only model the checkpoint was derived from."""
+    from safetensors.torch import save_file
+    from transformers import AutoModelForCausalLM as _AM
+    from transformers.utils import SAFE_WEIGHTS_NAME
+
+    text_cfg = _tiny_text_config(tie)
+    torch.manual_seed(0)
+    ref = _AM.from_config(text_cfg)
+    remapped = _remap_to_layout(ref.state_dict(), layout)
+    # Vision-tower / projector weights carry no ``language_model.`` segment
+    # and must be skipped, not loaded into the text model.
+    remapped["model.vision_tower.encoder.layers.0.weight"] = torch.randn(8, 8)
+    remapped["model.multi_modal_projector.linear.weight"] = torch.randn(8, 8)
+
+    weights_path = tmp_path / "model.safetensors"
+    save_file(remapped, str(weights_path))
+
+    def _fake_cached_file(model_id: str, filename: str, **kw: Any):
+        # Single-file path: no index, weights resolve to our temp file.
+        return str(weights_path) if filename == SAFE_WEIGHTS_NAME else None
+
+    monkeypatch.setattr("transformers.utils.hub.cached_file", _fake_cached_file)
+    return text_cfg, ref
+
+
+@pytest.mark.parametrize(
+    "layout,tie",
+    [("gemma", True), ("mistral", False)],
+    ids=["gemma-nested-tied", "mistral-prefix-untied"],
+)
+def test_load_text_from_multimodal_round_trips(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, layout: str, tie: bool):
+    """The loaded text model's weights equal the reference's — for both
+    wire layouts, and with the lm_head both tied (gemma) and separate
+    (mistral, where ``language_model.lm_head.weight`` must be recovered)."""
+    text_cfg, ref = _write_synthetic_vlm(
+        tmp_path, monkeypatch, layout=layout, tie=tie,
+    )
+    loaded = model_mod._load_text_from_multimodal(
+        "fake/vlm", text_cfg, torch.float32, "cpu",
+    )
+
+    ref_params = dict(ref.named_parameters())
+    got_params = dict(loaded.named_parameters())
+    assert set(got_params) == set(ref_params), (
+        f"param-name mismatch after {layout} extraction"
+    )
+    for name, ref_t in ref_params.items():
+        assert torch.equal(got_params[name], ref_t), (
+            f"{layout}: param {name!r} did not round-trip through the "
+            f"language_model. rename"
+        )
+    # The vision tower never made it into the text model.
+    assert not any("vision" in n for n in got_params), (
+        "vision-tower weights leaked into the text model"
+    )
+    # And the extracted model is a usable causal LM.
+    assert len(model_mod.get_layers(loaded)) == text_cfg.num_hidden_layers
+
+
+def test_load_text_from_multimodal_raises_when_no_text_weights(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """A checkpoint with no ``language_model.`` weights (everything skipped)
+    must raise rather than silently return a randomly-initialized model."""
+    from safetensors.torch import save_file
+    from transformers.utils import SAFE_WEIGHTS_NAME
+
+    text_cfg = _tiny_text_config(tie=True)
+    weights_path = tmp_path / "model.safetensors"
+    save_file(
+        {"model.vision_tower.encoder.layers.0.weight": torch.randn(8, 8)},
+        str(weights_path),
+    )
+
+    def _fake_cached_file(model_id: str, filename: str, **kw: Any):
+        return str(weights_path) if filename == SAFE_WEIGHTS_NAME else None
+
+    monkeypatch.setattr("transformers.utils.hub.cached_file", _fake_cached_file)
+
+    with pytest.raises(model_mod._NoTextWeightsExtracted):
+        model_mod._load_text_from_multimodal(
+            "fake/vlm", text_cfg, torch.float32, "cpu",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Routing: when does load_model prefer the text-only extraction path?
+# ---------------------------------------------------------------------------
+
+
+def _routing_calls(cfg: _FakeConfig, *, extractor_raises: bool = False):
+    """Run load_model on CPU with a mocked stack; return
+    ``(text_extractor_called, from_pretrained_called)``."""
+    fp_called = {"v": False}
+
+    def _fake_from_pretrained(model_id: str, **kwargs: Any) -> _FakeModel:
+        fp_called["v"] = True
+        return _FakeModel(kwargs.get("attn_implementation", "sdpa"))
+
+    def _fake_extractor(*args: Any, **kwargs: Any) -> _FakeModel:
+        if extractor_raises:
+            raise model_mod._NoTextWeightsExtracted("synthetic miss")
+        return _FakeModel("sdpa")
+
+    with (
+        patch.object(model_mod, "AutoTokenizer") as mock_tok,
+        patch.object(model_mod, "AutoConfig") as mock_cfg,
+        patch.object(model_mod, "AutoModelForCausalLM") as mock_model,
+        patch.object(model_mod, "_load_text_from_multimodal",
+                     side_effect=_fake_extractor) as mock_extract,
+    ):
+        mock_tok.from_pretrained.return_value = SimpleNamespace()
+        mock_cfg.from_pretrained.return_value = cfg
+        mock_model.from_pretrained.side_effect = _fake_from_pretrained
+        model_mod.load_model("fake/repo", device="cpu")
+
+    return mock_extract.called, fp_called["v"]
+
+
+def test_multimodal_routes_to_text_extraction_even_when_outer_accessible():
+    """A gemma-style wrapper (outer ``gemma4`` *is* in _LAYER_ACCESSORS,
+    text ``gemma4_text`` also is) must still prefer text-only extraction —
+    otherwise the standard load pulls the whole multimodal model into
+    memory and double-buffers it on unified memory."""
+    cfg = _FakeConfig(model_type="gemma4", text_model_type="gemma4_text")
+    extractor_called, from_pretrained_called = _routing_calls(cfg)
+    assert extractor_called, "gemma4 should route through text extraction"
+    assert not from_pretrained_called, (
+        "the full multimodal from_pretrained must not run when text "
+        "extraction succeeds"
+    )
+
+
+def test_plain_text_model_uses_standard_load():
+    """A non-multimodal config (no text_config) takes the standard load —
+    there is nothing to extract."""
+    cfg = _FakeConfig(model_type="qwen3")  # text_config is None
+    extractor_called, from_pretrained_called = _routing_calls(cfg)
+    assert not extractor_called
+    assert from_pretrained_called
+
+
+def test_load_model_falls_back_to_full_load_on_no_text_weights():
+    """If text extraction raises ``_NoTextWeightsExtracted`` (unexpected
+    weight layout), load_model must fall back to the standard full load
+    rather than propagate the error or ship random init."""
+    cfg = _FakeConfig(model_type="some_vlm", text_model_type="qwen3")
+    extractor_called, from_pretrained_called = _routing_calls(
+        cfg, extractor_raises=True,
+    )
+    assert extractor_called, "extraction should be attempted first"
+    assert from_pretrained_called, (
+        "a failed extraction must fall back to the standard full load"
+    )

@@ -23,6 +23,7 @@
   import {
     applyTreeFilter,
     autoRegenState,
+    clearChat,
     clearNodeSelection,
     clearTreeFilter,
     currentRecipeOverride,
@@ -50,6 +51,8 @@
   import LoomEdge from "./LoomEdge.svelte";
   import WorkbenchCard from "../WorkbenchCard.svelte";
   import SamplingStrip from "../SamplingStrip.svelte";
+  import Select from "../../lib/Select.svelte";
+  import NumberInput from "../../lib/NumberInput.svelte";
   import type { LoomNodeJSON } from "../../lib/types";
 
   // ----------------------------------------- flat tree walk + depth --
@@ -376,7 +379,16 @@
     mode: "unsteered",
     error: "",
   });
-  let modalInput: HTMLInputElement | HTMLTextAreaElement | null = $state(null);
+  /** Focusable ref shared by every modal input variant — the regenerate
+   *  / regen_mode number-of-siblings field swaps in a themed
+   *  ``NumberInput`` which exposes a structurally-matching
+   *  ``focus()`` / ``select()`` pair, so the modal-open auto-focus
+   *  works regardless of which branch is rendered. */
+  type FocusableRef = {
+    focus: () => void;
+    select?: () => void;
+  };
+  let modalInput: FocusableRef | null = $state(null);
 
   async function openModal(
     kind: ModalState["kind"],
@@ -640,10 +652,34 @@
     void loomNavigate(node.id);
   }
 
+  /** True when a keydown originated in a text-entry element (an ``<input>``,
+   *  ``<textarea>``, ``<select>``, or a ``contenteditable`` host) — used to
+   *  keep the sidebar's bare-key nav shortcuts from stealing keystrokes meant
+   *  for a nested field. */
+  function _isEditableTarget(target: EventTarget | null): boolean {
+    const el = target as HTMLElement | null;
+    if (!el) return false;
+    const tag = el.tagName;
+    return (
+      tag === "INPUT" ||
+      tag === "TEXTAREA" ||
+      tag === "SELECT" ||
+      el.isContentEditable
+    );
+  }
+
   function onSidebarKey(ev: KeyboardEvent): void {
     // Only fire when the sidebar (or one of its children) is focused.
     if (modal.kind !== null || menu.open) return;
     const k = ev.key;
+    // The bare-key nav shortcuts (j/k/h/l/s/n//) bubble up from every child
+    // of the sidebar — including its own filter box and the SamplingStrip's
+    // role inputs, which live at the bottom of this column.  Letters like
+    // ``s`` / ``n`` / ``h`` / ``l`` and ``/`` are valid text there, so a
+    // keystroke originating in an editable element must fall through to the
+    // field instead of being hijacked (and ``preventDefault``-swallowed) as
+    // a tree command.  Escape still passes so it can defocus the field.
+    if (k !== "Escape" && _isEditableTarget(ev.target)) return;
     if (k === "j") { ev.preventDefault(); navSibling(+1); return; }
     if (k === "k") { ev.preventDefault(); navSibling(-1); return; }
     if (k === "h") { ev.preventDefault(); navUpDown(-1); return; }
@@ -841,6 +877,33 @@
 >
   <header class="loom-header">
     <span class="title">threads</span>
+    <!-- Tree-scope actions — clear / save / load act on the whole
+         conversation tree, not on the active chat path, so they live in
+         the threads-column header rather than buried in the chat. -->
+    <button
+      type="button"
+      class="action-btn"
+      onclick={clearChat}
+      title="Clear chat back to root"
+    >
+      clear
+    </button>
+    <button
+      type="button"
+      class="action-btn"
+      onclick={() => openDrawer("save_conversation")}
+      title="Save this conversation tree to disk"
+    >
+      save
+    </button>
+    <button
+      type="button"
+      class="action-btn"
+      onclick={() => openDrawer("load_conversation")}
+      title="Load a saved conversation tree"
+    >
+      load
+    </button>
     <button
       type="button"
       class="icon-btn"
@@ -1104,12 +1167,13 @@
       {#if modal.kind === "regenerate"}
         <label>
           <span>N siblings</span>
-          <input
-            bind:this={modalInput as HTMLInputElement}
-            bind:value={modal.n}
-            type="number"
-            min="1"
-            max="16"
+          <NumberInput
+            bind:this={modalInput}
+            value={modal.n}
+            min={1}
+            max={16}
+            step={1}
+            oninput={(v) => { if (v !== null) modal.n = v; }}
             onkeydown={(ev) => { if (ev.key === "Enter") { ev.preventDefault(); void commitModal(); } }}
           />
         </label>
@@ -1149,22 +1213,28 @@
       {:else if modal.kind === "regen_mode"}
         <label>
           <span>mode</span>
-          <select bind:value={modal.mode}>
-            <option value="unsteered">unsteered</option>
-            <option value="inverted">inverted</option>
-            <option value="reseed">reseed</option>
-            <option value="cool">cool</option>
-            <option value="hot">hot</option>
-          </select>
+          <Select
+            value={modal.mode ?? "unsteered"}
+            options={[
+              { value: "unsteered", label: "unsteered" },
+              { value: "inverted", label: "inverted" },
+              { value: "reseed", label: "reseed" },
+              { value: "cool", label: "cool" },
+              { value: "hot", label: "hot" },
+            ]}
+            onchange={(v) => { modal.mode = v; }}
+            ariaLabel="regen mode"
+          />
         </label>
         <label>
           <span>N siblings</span>
-          <input
-            bind:this={modalInput as HTMLInputElement}
-            bind:value={modal.n}
-            type="number"
-            min="1"
-            max="16"
+          <NumberInput
+            bind:this={modalInput}
+            value={modal.n}
+            min={1}
+            max={16}
+            step={1}
+            oninput={(v) => { if (v !== null) modal.n = v; }}
             onkeydown={(ev) => { if (ev.key === "Enter") { ev.preventDefault(); void commitModal(); } }}
           />
         </label>
@@ -1330,9 +1400,10 @@
 
   .loom-header {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
-    gap: var(--space-3);
-    padding: var(--space-2) var(--space-4);
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-3);
     border-bottom: 1px solid var(--border);
   }
   .title {

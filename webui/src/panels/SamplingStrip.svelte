@@ -19,8 +19,11 @@
     setSampling,
     patchSessionDefaults,
     openDrawer,
+    effectiveRawMode,
   } from "../lib/stores.svelte";
   import Slider from "../lib/Slider.svelte";
+  import NumberInput from "../lib/NumberInput.svelte";
+  import Checkbox from "../lib/Checkbox.svelte";
 
   // ------------------------------------------------------------------- consts
 
@@ -46,7 +49,6 @@
   const PENALTY_MIN = -2;
   const PENALTY_MAX = 2;
   const ALTS_MAX = 256;
-  const SEED_MAX = 2 ** 31; // exclusive — ``Math.random() * 2**31`` matches the prompt.
 
   // ------------------------------------------------------------------- ready
 
@@ -69,6 +71,32 @@
     sessionState.info?.thinking_is_optional ?? true,
   );
 
+  /** Per-message role boxes gate on family support + chat mode.  Base /
+   *  completion models (no chat template) and label-free families (Mistral
+   *  / talkie) can't relabel turns; raw mode has no roles either. */
+  const rawMode = $derived(effectiveRawMode());
+  const isBaseModel = $derived(sessionState.info?.is_base_model ?? false);
+  const userRoleSupported = $derived(
+    !isBaseModel &&
+      !rawMode &&
+      (sessionState.info?.user_role_supported ?? false),
+  );
+  const assistantRoleSupported = $derived(
+    !isBaseModel &&
+      !rawMode &&
+      (sessionState.info?.role_substitution_supported ?? false),
+  );
+
+  const ROLE_SLUG_RE = /^[a-z0-9._-]+$/;
+  const userRoleValid = $derived(
+    samplingState.user_role.trim() === "" ||
+      ROLE_SLUG_RE.test(samplingState.user_role.trim()),
+  );
+  const assistantRoleValid = $derived(
+    samplingState.assistant_role.trim() === "" ||
+      ROLE_SLUG_RE.test(samplingState.assistant_role.trim()),
+  );
+
   /** Tri-state for the title attribute and disabled gate. */
   const thinkingForced = $derived(
     thinkingSupported && !thinkingOptional,
@@ -86,9 +114,9 @@
   const maxView = $derived(samplingState.max_tokens || PLACEHOLDER.max_tokens);
   const presenceView = $derived(samplingState.presence_penalty);
   const frequencyView = $derived(samplingState.frequency_penalty);
-  const seedView = $derived(
-    samplingState.seed === null ? "" : String(samplingState.seed),
-  );
+  /** Bindable raw seed value for the NumberInput.  null = no per-call
+   *  seed pin (the placeholder dash shows). */
+  const seedView = $derived<number | null>(samplingState.seed);
   const thinkingView = $derived(samplingState.thinking ?? false);
 
   // ------------------------------------------------------------------- writes
@@ -122,17 +150,15 @@
     void persistDefault({ top_p: v });
   }
 
-  function onTopK(ev: Event): void {
-    const raw = Number((ev.currentTarget as HTMLInputElement).value);
-    if (!Number.isFinite(raw)) return;
+  function onTopK(raw: number | null): void {
+    if (raw === null) return;
     const v = Math.max(TOP_K_MIN, Math.min(TOP_K_MAX, Math.floor(raw)));
     setSampling("top_k", v);
     void persistDefault({ top_k: v });
   }
 
-  function onMax(ev: Event): void {
-    const raw = Number((ev.currentTarget as HTMLInputElement).value);
-    if (!Number.isFinite(raw)) return;
+  function onMax(raw: number | null): void {
+    if (raw === null) return;
     const v = Math.max(MAX_TOK_MIN, Math.min(MAX_TOK_MAX, Math.floor(raw)));
     setSampling("max_tokens", v);
     void persistDefault({ max_tokens: v });
@@ -140,41 +166,27 @@
 
   function onPenalty(
     key: "presence_penalty" | "frequency_penalty",
-    ev: Event,
+    raw: number | null,
   ): void {
-    const raw = Number((ev.currentTarget as HTMLInputElement).value);
-    if (!Number.isFinite(raw)) return;
+    if (raw === null) return;
     const v = Math.max(PENALTY_MIN, Math.min(PENALTY_MAX, raw));
     setSampling(key, v);
     // No session-PATCH path: the penalties ride on the per-call sampling
     // payload only, same as the (now-removed) advanced-drawer control.
   }
 
-  function onSeed(ev: Event): void {
-    const raw = (ev.currentTarget as HTMLInputElement).value.trim();
-    if (raw === "") {
+  function onSeed(raw: number | null): void {
+    if (raw === null) {
       setSampling("seed", null);
       return;
     }
-    const v = Number(raw);
-    if (!Number.isFinite(v)) return;
-    setSampling("seed", Math.floor(v));
+    setSampling("seed", Math.floor(raw));
     // There's no PATCH-able ``seed`` on the session — seed always rides
     // per-call (``buildSamplingPayload``).  A set seed pins every
-    // generation to that number; clear it (✕) to unpin.
+    // generation to that number; empty the field to unpin.
   }
 
-  function rollSeed(): void {
-    const v = Math.floor(Math.random() * SEED_MAX);
-    setSampling("seed", v);
-  }
-
-  function clearSeed(): void {
-    setSampling("seed", null);
-  }
-
-  function onThinking(ev: Event): void {
-    const v = (ev.currentTarget as HTMLInputElement).checked;
+  function onThinking(v: boolean): void {
     setSampling("thinking", v);
     void persistDefault({ thinking: v });
   }
@@ -186,9 +198,8 @@
    *  ``return_top_k``; it rides the WS sampling payload directly (see
    *  ``stores.svelte.ts::sendGenerate``).  Effective on the next
    *  generation; running gens keep their captured shape. */
-  function onAlts(ev: Event): void {
-    const raw = Number((ev.currentTarget as HTMLInputElement).value);
-    if (!Number.isFinite(raw)) return;
+  function onAlts(raw: number | null): void {
+    if (raw === null) return;
     const v = Math.max(0, Math.min(ALTS_MAX, Math.floor(raw)));
     setSampling("return_top_k", v);
   }
@@ -203,211 +214,240 @@
 </script>
 
 <section class="sampling-strip" aria-label="sampling controls">
-  <!-- Temperature -->
-  <label class="control" title="Sampling temperature (0=greedy, 2=chaos)">
-    <span class="label">T</span>
-    <span class="slider-cell">
-      <Slider
-        value={tempView}
-        min={TEMP_MIN}
-        max={TEMP_MAX}
-        step={TEMP_STEP}
-        disabled={!ready}
-        oninput={onTemp}
-        ariaLabel="temperature"
-      />
-    </span>
-    <span class="value">{tempView.toFixed(2)}</span>
-  </label>
+  <!-- Row 1: temperature + top-p sliders -->
+  <div class="row sliders">
+    <label class="control" title="Sampling temperature (0=greedy, 2=chaos)">
+      <span class="label">T</span>
+      <span class="slider-cell">
+        <Slider
+          value={tempView}
+          min={TEMP_MIN}
+          max={TEMP_MAX}
+          step={TEMP_STEP}
+          disabled={!ready}
+          oninput={onTemp}
+          ariaLabel="temperature"
+        />
+      </span>
+      <span class="value">{tempView.toFixed(2)}</span>
+    </label>
 
-  <!-- Top-p -->
-  <label class="control" title="Top-p (nucleus) cumulative probability cutoff">
-    <span class="label">P</span>
-    <span class="slider-cell">
-      <Slider
-        value={topPView}
-        min={TOP_P_MIN}
-        max={TOP_P_MAX}
-        step={TOP_P_STEP}
-        disabled={!ready}
-        oninput={onTopP}
-        ariaLabel="top-p"
-      />
-    </span>
-    <span class="value">{topPView.toFixed(2)}</span>
-  </label>
-
-  <!-- Top-k -->
-  <label class="control narrow" title="Top-k hard cap on candidate vocab size">
-    <span class="label">K</span>
-    <input
-      type="number"
-      min={TOP_K_MIN}
-      max={TOP_K_MAX}
-      step="1"
-      value={topKView}
-      disabled={!ready}
-      onchange={onTopK}
-      aria-label="top-k"
-    />
-  </label>
-
-  <!-- Max tokens -->
-  <label class="control narrow" title="Maximum tokens to generate">
-    <span class="label">max</span>
-    <input
-      type="number"
-      min={MAX_TOK_MIN}
-      max={MAX_TOK_MAX}
-      step="1"
-      value={maxView}
-      disabled={!ready}
-      onchange={onMax}
-      aria-label="max tokens"
-    />
-  </label>
-
-  <!-- Presence penalty -->
-  <label
-    class="control narrow"
-    title="Presence penalty: discourages tokens already present (−2…2)"
-  >
-    <span class="label">pres</span>
-    <input
-      type="number"
-      min={PENALTY_MIN}
-      max={PENALTY_MAX}
-      step="0.05"
-      value={presenceView}
-      disabled={!ready}
-      onchange={(ev) => onPenalty("presence_penalty", ev)}
-      aria-label="presence penalty"
-    />
-  </label>
-
-  <!-- Frequency penalty -->
-  <label
-    class="control narrow"
-    title="Frequency penalty: discourages tokens by repeat count (−2…2)"
-  >
-    <span class="label">freq</span>
-    <input
-      type="number"
-      min={PENALTY_MIN}
-      max={PENALTY_MAX}
-      step="0.05"
-      value={frequencyView}
-      disabled={!ready}
-      onchange={(ev) => onPenalty("frequency_penalty", ev)}
-      aria-label="frequency penalty"
-    />
-  </label>
-
-  <!-- Seed -->
-  <div class="control seed" title="RNG seed: empty means the model picks">
-    <span class="label">seed</span>
-    <input
-      type="number"
-      min="0"
-      step="1"
-      placeholder="—"
-      value={seedView}
-      disabled={!ready}
-      onchange={onSeed}
-      aria-label="seed"
-    />
-    <button
-      type="button"
-      class="icon-btn"
-      disabled={!ready}
-      onclick={rollSeed}
-      title="Random seed"
-      aria-label="Random seed"
-    >
-      🎲
-    </button>
-    {#if samplingState.seed !== null}
-      <button
-        type="button"
-        class="icon-btn"
-        disabled={!ready}
-        onclick={clearSeed}
-        title="Clear seed (back to model default)"
-        aria-label="Clear seed"
-      >
-        ✕
-      </button>
-    {/if}
+    <label class="control" title="Top-p (nucleus) cumulative probability cutoff">
+      <span class="label">P</span>
+      <span class="slider-cell">
+        <Slider
+          value={topPView}
+          min={TOP_P_MIN}
+          max={TOP_P_MAX}
+          step={TOP_P_STEP}
+          disabled={!ready}
+          oninput={onTopP}
+          ariaLabel="top-p"
+        />
+      </span>
+      <span class="value">{topPView.toFixed(2)}</span>
+    </label>
   </div>
 
-  <!-- Thinking toggle -->
-  <label
-    class="control toggle"
-    class:forced={thinkingForced}
-    title={!thinkingSupported
-      ? "This model doesn't support thinking"
-      : !thinkingOptional
-        ? "This model always thinks"
-        : "Force chain-of-thought thinking on/off (overrides auto)"}
-  >
-    <span class="label">think{thinkingForced ? " (forced)" : ""}</span>
-    <input
-      type="checkbox"
-      checked={thinkingForced ? true : thinkingView}
-      disabled={!ready || !thinkingSupported || thinkingForced}
-      onchange={onThinking}
-      aria-label="thinking mode"
-    />
-  </label>
+  <!-- Row 2: top-k, repetition (frequency) penalty, presence penalty -->
+  <div class="row">
+    <label class="control" title="Top-k hard cap on candidate vocab size">
+      <span class="label">K</span>
+      <span class="num-cell">
+        <NumberInput
+          value={topKView}
+          min={TOP_K_MIN}
+          max={TOP_K_MAX}
+          step={1}
+          disabled={!ready}
+          onchange={onTopK}
+          ariaLabel="top-k"
+        />
+      </span>
+    </label>
 
-  <!-- Top-K alternatives count (logit-pass).  0 disables capture; >0
-       populates the drilldown logits tab + the inline surprise highlight
-       mode.  Default 8 per Decision 1. -->
-  <label
-    class="control narrow"
-    title="Top-K alternative tokens to capture per position (0 disables; feeds the drilldown logits tab + surprise highlight)"
-  >
-    <span class="label">alts</span>
-    <input
-      type="number"
-      min="0"
-      max={ALTS_MAX}
-      step="1"
-      value={samplingState.return_top_k}
+    <label
+      class="control"
+      title="Repetition (frequency) penalty: discourages tokens by repeat count (−2…2)"
+    >
+      <span class="label">rep</span>
+      <span class="num-cell">
+        <NumberInput
+          value={frequencyView}
+          min={PENALTY_MIN}
+          max={PENALTY_MAX}
+          step={0.05}
+          disabled={!ready}
+          onchange={(v) => onPenalty("frequency_penalty", v)}
+          ariaLabel="repetition (frequency) penalty"
+        />
+      </span>
+    </label>
+
+    <label
+      class="control"
+      title="Presence penalty: discourages tokens already present (−2…2)"
+    >
+      <span class="label">pres</span>
+      <span class="num-cell">
+        <NumberInput
+          value={presenceView}
+          min={PENALTY_MIN}
+          max={PENALTY_MAX}
+          step={0.05}
+          disabled={!ready}
+          onchange={(v) => onPenalty("presence_penalty", v)}
+          ariaLabel="presence penalty"
+        />
+      </span>
+    </label>
+  </div>
+
+  <!-- Row 3: per-message role labels (roleplay scaffold).  Whatever's in
+       the box rides the next send and is stamped onto that turn —
+       immutable afterward.  Empty = standard role label. -->
+  <div class="row roles">
+    <div
+      class="control role"
+      title={userRoleSupported
+        ? "user-turn role label — sent with each message, stamped on that turn"
+        : "user-role substitution unavailable for this model / mode"}
+    >
+      <span class="label">user role</span>
+      <input
+        type="text"
+        class="role-input"
+        class:invalid={!userRoleValid}
+        bind:value={samplingState.user_role}
+        disabled={!ready || !userRoleSupported}
+        placeholder="—"
+        spellcheck="false"
+        aria-label="user role label"
+      />
+    </div>
+
+    <div
+      class="control role"
+      title={assistantRoleSupported
+        ? "assistant-turn role label — the persona the model generates the reply under"
+        : "assistant-role substitution unavailable for this model / mode"}
+    >
+      <span class="label">asst role</span>
+      <input
+        type="text"
+        class="role-input"
+        class:invalid={!assistantRoleValid}
+        bind:value={samplingState.assistant_role}
+        disabled={!ready || !assistantRoleSupported}
+        placeholder="—"
+        spellcheck="false"
+        aria-label="assistant role label"
+      />
+    </div>
+  </div>
+
+  <!-- Row 4: max tokens, alts (top-K capture), seed -->
+  <div class="row">
+    <label class="control" title="Maximum tokens to generate">
+      <span class="label">max</span>
+      <span class="num-cell">
+        <NumberInput
+          value={maxView}
+          min={MAX_TOK_MIN}
+          max={MAX_TOK_MAX}
+          step={1}
+          disabled={!ready}
+          onchange={onMax}
+          ariaLabel="max tokens"
+        />
+      </span>
+    </label>
+
+    <!-- Top-K alternatives count (logit-pass).  0 disables capture; >0
+         populates the drilldown logits tab + the inline surprise highlight
+         mode.  Default 8 per Decision 1. -->
+    <label
+      class="control"
+      title="Top-K alternative tokens to capture per position (0 disables; feeds the drilldown logits tab + surprise highlight)"
+    >
+      <span class="label">alts</span>
+      <span class="num-cell">
+        <NumberInput
+          value={samplingState.return_top_k}
+          min={0}
+          max={ALTS_MAX}
+          step={1}
+          disabled={!ready}
+          onchange={onAlts}
+          ariaLabel="top-K alternatives to capture"
+        />
+      </span>
+    </label>
+
+    <label class="control" title="RNG seed: empty means the model picks (clear the field to unpin)">
+      <span class="label">seed</span>
+      <span class="num-cell">
+        <NumberInput
+          value={seedView}
+          min={0}
+          step={1}
+          placeholder="—"
+          allowEmpty
+          disabled={!ready}
+          onchange={onSeed}
+          ariaLabel="seed"
+        />
+      </span>
+    </label>
+  </div>
+
+  <!-- Row 5: advanced / system-prompt drawers + thinking toggle -->
+  <div class="row actions">
+    <button
+      type="button"
+      class="sys-btn"
       disabled={!ready}
-      onchange={onAlts}
-      aria-label="top-K alternatives to capture"
-    />
-  </label>
+      onclick={openAdvanced}
+      title="Open stop strings, logit bias, and numeric top-K alternatives"
+    >
+      advanced
+    </button>
 
-  <button
-    type="button"
-    class="sys-btn"
-    disabled={!ready}
-    onclick={openAdvanced}
-    title="Open stop strings, logit bias, and numeric top-K alternatives"
-  >
-    advanced
-  </button>
+    <button
+      type="button"
+      class="sys-btn"
+      disabled={!ready}
+      onclick={openSystemPrompt}
+      title="Edit system prompt"
+    >
+      <span aria-hidden="true">⚙</span> system prompt
+    </button>
 
-  <!-- System prompt button -->
-  <button
-    type="button"
-    class="sys-btn"
-    disabled={!ready}
-    onclick={openSystemPrompt}
-    title="Edit system prompt"
-  >
-    <span aria-hidden="true">⚙</span> system prompt
-  </button>
+    <label
+      class="control toggle"
+      class:forced={thinkingForced}
+      title={!thinkingSupported
+        ? "This model doesn't support thinking"
+        : !thinkingOptional
+          ? "This model always thinks"
+          : "Force chain-of-thought thinking on/off (overrides auto)"}
+    >
+      <span class="label think-label">think{thinkingForced ? " (forced)" : ""}</span>
+      <Checkbox
+        checked={thinkingForced ? true : thinkingView}
+        disabled={!ready || !thinkingSupported || thinkingForced}
+        onchange={onThinking}
+        ariaLabel="thinking mode"
+      />
+    </label>
+  </div>
 </section>
 
 <style>
   .sampling-strip {
     display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: var(--space-4) var(--space-5);
+    flex-direction: column;
+    gap: var(--space-4);
     padding: var(--space-3) var(--space-5);
     border-top: 1px solid var(--border);
     border-bottom: 1px solid var(--border);
@@ -416,31 +456,73 @@
     color: var(--fg-strong);
   }
 
+  /* One logical group of controls per row, laid out as equal grid
+   * columns.  Because both 3-up rows (K/rep/pres and max/alts/seed) get
+   * the same three 1fr tracks — and both 2-up rows (sliders, roles) the
+   * same two — every control lines up vertically across rows and each
+   * row's right edge is flush.  minmax(0, 1fr) keeps the tracks equal
+   * even when a cell's content (the seed's 🎲 / ✕) would otherwise widen
+   * it; the field inside shrinks instead. */
+  .row {
+    display: grid;
+    grid-auto-flow: column;
+    grid-auto-columns: minmax(0, 1fr);
+    align-items: center;
+    gap: var(--space-5);
+    width: 100%;
+  }
+  .row > .control {
+    min-width: 0;
+  }
+  /* The action row sizes its buttons / toggle to content and spreads
+   * them, so the toggle's right edge still lands flush. */
+  .row.actions {
+    display: flex;
+    justify-content: space-between;
+  }
+  .row.actions > * {
+    flex: 0 0 auto;
+  }
+  /* Role labels are longer than the 3em label gutter the other rows
+   * reserve, so they'd otherwise start at the column's left edge instead
+   * of where the sliders / number boxes begin.  Indent each role control
+   * by one gutter so "USER ROLE" lines up with the slider's left edge;
+   * the box shortens from the left to match. */
+  .row.roles .control {
+    padding-left: calc(3em + var(--space-2));
+  }
+
   .control {
-    display: inline-flex;
+    display: flex;
     align-items: center;
     gap: var(--space-2);
     white-space: nowrap;
+    min-width: 0;
   }
 
-  .control.narrow input[type="number"] {
-    width: 5em;
-  }
-
-  .control.seed input[type="number"] {
-    width: 7em;
+  /* Boxed inputs fill their (grown) control after the fixed-width label.
+   * The inner <input> is width:100%, so the cell owns the sizing. */
+  .slider-cell,
+  .num-cell {
+    display: inline-flex;
+    flex: 1 1 0;
+    min-width: 0;
   }
 
   .label {
+    flex: 0 0 auto;
     color: var(--fg-dim);
     font-size: var(--text-xs);
     text-transform: uppercase;
     letter-spacing: 0;
-    min-width: 1.6em;
+    /* Fixed floor so the short labels reserve a consistent gutter and the
+     * boxes start at the same offset within each control. */
+    min-width: 3em;
     text-align: right;
   }
 
   .value {
+    flex: 0 0 auto;
     color: var(--fg-strong);
     font-variant-numeric: tabular-nums;
     min-width: 2.5em;
@@ -454,72 +536,11 @@
     color: var(--fg-dim);
     font-style: italic;
   }
-
-  /* Fixed-width host for the shared <Slider> inside the inline strip. */
-  .slider-cell {
-    display: flex;
-    width: 8em;
-  }
-
-  /* Number inputs */
-  input[type="number"] {
-    background: var(--bg);
-    color: var(--fg-strong);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    padding: var(--space-1) var(--space-2);
-    font-family: var(--font-mono);
-    font-size: var(--text-sm);
-    font-variant-numeric: tabular-nums;
-  }
-  input[type="number"]:focus {
-    outline: none;
-    border-color: var(--accent);
-  }
-  input[type="number"]:disabled {
-    color: var(--fg-muted);
-    border-color: var(--border);
-    cursor: not-allowed;
-  }
-  /* Trim Firefox / Chrome spinners — they steal width and the design tokens
-   * already make values legible. */
-  input[type="number"]::-webkit-outer-spin-button,
-  input[type="number"]::-webkit-inner-spin-button {
-    -webkit-appearance: none;
-    margin: 0;
-  }
-  input[type="number"] {
-    -moz-appearance: textfield;
-    appearance: textfield;
-  }
-
-  /* Checkbox sits flush with its label. */
-  input[type="checkbox"] {
-    accent-color: var(--accent);
-    cursor: pointer;
-  }
-  input[type="checkbox"]:disabled {
-    cursor: not-allowed;
-  }
-
-  /* Tiny inline buttons (🎲, ✕) */
-  .icon-btn {
-    background: transparent;
-    color: var(--fg-strong);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    padding: var(--space-1) var(--space-3);
-    font-size: var(--text-sm);
-    line-height: 1.2;
-  }
-  .icon-btn:hover:not(:disabled) {
-    background: var(--bg-elev);
-    border-color: var(--fg-muted);
-  }
-  .icon-btn:disabled {
-    color: var(--fg-muted);
-    border-color: var(--border);
-    cursor: not-allowed;
+  /* The think label hugs its checkbox rather than reserving the numeric
+   * gutter — it sits in the action row, not a field column. */
+  .think-label {
+    min-width: 0;
+    text-align: left;
   }
 
   .sys-btn {
@@ -542,14 +563,35 @@
     border-color: var(--border);
     cursor: not-allowed;
   }
-
-  /* Narrow viewports — strip wraps to two rows. */
-  @media (max-width: 900px) {
-    .sampling-strip {
-      gap: var(--space-3) var(--space-5);
-    }
-    .slider-cell {
-      width: 6em;
-    }
+  /* Per-message role inputs — text boxes matched to the themed
+     NumberInput cells (``.sk-number-input``) so height / background /
+     border / type read identically across the strip.  They fill their
+     grown control like the numeric cells do. */
+  .role-input {
+    box-sizing: border-box;
+    flex: 1 1 0;
+    min-width: 0;
+    background: var(--bg-elev);
+    color: var(--fg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: var(--space-2) var(--space-3);
+    font: inherit;
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+  }
+  .role-input::placeholder {
+    color: var(--fg-dim);
+  }
+  .role-input:focus-visible {
+    outline: none;
+    border-color: var(--accent);
+  }
+  .role-input:disabled {
+    color: var(--fg-muted);
+    cursor: not-allowed;
+  }
+  .role-input.invalid {
+    border-color: var(--accent-error);
   }
 </style>

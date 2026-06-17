@@ -192,11 +192,43 @@ def _build_registry() -> dict[str, SlashCommand]:
             name="/extract",
             handler=SaklasApp._handle_extract_only,
             usage=(
-                "Usage: /extract <concept>\n"
-                "       /extract <pos> . <neg>"
+                "Usage: /extract <concept> [--role <slug>]\n"
+                "       /extract <pos> . <neg> [--role <slug>]"
             ),
             min_args=1,
             max_args=None,
+        ),
+        SlashCommand(
+            name="/pairs",
+            handler=SaklasApp._handle_pairs,
+            usage="Usage: /pairs <name> [--role <slug>]",
+            min_args=1,
+            max_args=None,  # multi-word poles allowed via the period delim
+        ),
+        SlashCommand(
+            name="/manifold",
+            handler=SaklasApp._handle_manifold,
+            usage="Usage: /manifold fit <folder>",
+            min_args=1,
+            max_args=None,  # folder paths may contain whitespace
+        ),
+        SlashCommand(
+            name="/manifold-probe",
+            handler=SaklasApp._handle_manifold_probe,
+            usage=(
+                "Usage: /manifold-probe <selector>\n"
+                "  e.g. /manifold-probe emotions\n"
+                "       /manifold-probe alice/affect"
+            ),
+            min_args=1,
+            max_args=None,  # selectors are single tokens but allow trailing
+        ),
+        SlashCommand(
+            name="/manifold-probe-remove",
+            handler=SaklasApp._handle_manifold_probe_remove,
+            usage="Usage: /manifold-probe-remove <name>",
+            min_args=1,
+            max_args=1,
         ),
         SlashCommand(
             name="/seed",

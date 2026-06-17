@@ -1,9 +1,12 @@
 """Tests for the recipe-override regen mechanism (v2.3 phase 5)."""
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from saklas import Recipe, SamplingConfig
+from saklas.core.steering_expr import ManifoldTerm, parse_expr
 
 
 # ---------------------------------------------------------------------------
@@ -52,6 +55,7 @@ def test_overlay_steering_replaces_when_set():
 def test_invert_simple_term():
     r = Recipe(steering="0.3 honest.deceptive")
     inv = r.invert_steering()
+    assert inv.steering is not None  # invert_steering always returns a str
     assert "-0.3" in inv.steering
 
 
@@ -61,6 +65,7 @@ def test_invert_compound_expression():
     # Both signs flipped — first term renders ``-0.3`` directly; the
     # second renders as a ``- 0.5`` separator-and-magnitude pair through
     # ``format_expr``.  Either way both coefficients are negated.
+    assert inv.steering is not None  # invert_steering always returns a str
     assert "-0.3" in inv.steering
     assert "- 0.5" in inv.steering or "-0.5" in inv.steering
     # Trigger preserved.
@@ -71,6 +76,20 @@ def test_invert_empty_steering():
     r = Recipe(steering=None)
     inv = r.invert_steering()
     assert inv.steering == ""
+
+
+def test_invert_manifold_term():
+    # Regression: a recipe whose steering carries a manifold ``%`` term must
+    # invert without error — the directional ``along`` flips sign, ``onto``
+    # (a collapse fraction) carries through unchanged.
+    r = Recipe(steering="0.6,0.3 circumplex%happy")
+    inv = r.invert_steering()
+    assert inv.steering is not None
+    reparsed = parse_expr(inv.steering)
+    (term,) = reparsed.alphas.values()
+    assert isinstance(term, ManifoldTerm)
+    assert term.along == pytest.approx(-0.6)
+    assert term.onto == pytest.approx(0.3)
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +106,7 @@ def test_compose_unsteered():
 def test_compose_inverted_flips_signs():
     r = Recipe(steering="0.4 warm.clinical")
     mod = r.compose_modifier("inverted")
+    assert mod.steering is not None  # compose_modifier("inverted") always returns a str
     assert "-0.4" in mod.steering
 
 
@@ -100,12 +120,14 @@ def test_compose_reseed_gives_fresh_seed():
 def test_compose_cool():
     r = Recipe()
     mod = r.compose_modifier("cool")
+    assert mod.sampling is not None  # compose_modifier("cool") always sets sampling
     assert mod.sampling.temperature == pytest.approx(0.3)
 
 
 def test_compose_hot():
     r = Recipe()
     mod = r.compose_modifier("hot")
+    assert mod.sampling is not None  # compose_modifier("hot") always sets sampling
     assert mod.sampling.temperature == pytest.approx(1.2)
 
 
@@ -132,6 +154,7 @@ def test_compose_custom_via_overlay():
     partial = Recipe(sampling=SamplingConfig(temperature=0.5), seed=99)
     out = base.overlay(partial)
     assert out.steering == "0.3 honest"
+    assert out.sampling is not None  # overlay with explicit sampling always sets it
     assert out.sampling.temperature == pytest.approx(0.5)
     assert out.seed == 99
 
@@ -158,6 +181,10 @@ def test_compose_modifier_routes_through_overlay_in_regen_with_modifier():
             self.aid = aid
 
     stub = _StubSession()
+    stub_any: Any = stub
+    stub_any._resolve_anchor_recipe = SaklasSession._resolve_anchor_recipe.__get__(
+        stub, _StubSession
+    )
     resolve = SaklasSession._resolve_recipe_override.__get__(stub, _StubSession)
     custom = Recipe(sampling=SamplingConfig(temperature=0.4))
     new_steering, new_sampling, new_thinking = resolve(
@@ -192,6 +219,10 @@ def test_resolve_override_with_string_mode():
             self.aid = aid
 
     stub = _StubSession()
+    stub_any: Any = stub
+    stub_any._resolve_anchor_recipe = SaklasSession._resolve_anchor_recipe.__get__(
+        stub, _StubSession
+    )
     resolve = SaklasSession._resolve_recipe_override.__get__(stub, _StubSession)
     new_steering, new_sampling, new_thinking = resolve(
         "unsteered",
@@ -230,6 +261,10 @@ def test_resolve_override_with_custom_recipe():
             self.tree = LoomTree()
 
     stub = _StubSession()
+    stub_any: Any = stub
+    stub_any._resolve_anchor_recipe = SaklasSession._resolve_anchor_recipe.__get__(
+        stub, _StubSession
+    )
     resolve = SaklasSession._resolve_recipe_override.__get__(stub, _StubSession)
     partial = Recipe(sampling=SamplingConfig(temperature=0.9), seed=7)
     new_steering, new_sampling, new_thinking = resolve(

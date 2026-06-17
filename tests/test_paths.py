@@ -1,31 +1,35 @@
+from pathlib import Path
+
+import pytest
+
 from saklas.io import paths
 
 
-def test_default_home(monkeypatch, tmp_path):
+def test_default_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.delenv("SAKLAS_HOME", raising=False)
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
     assert paths.saklas_home() == tmp_path / ".saklas"
 
 
-def test_env_override(monkeypatch, tmp_path):
+def test_env_override(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     custom = tmp_path / "custom_root"
     monkeypatch.setenv("SAKLAS_HOME", str(custom))
     assert paths.saklas_home() == custom
 
 
-def test_subdirs(monkeypatch, tmp_path):
+def test_subdirs(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     assert paths.vectors_dir() == tmp_path / "vectors"
     assert paths.models_dir() == tmp_path / "models"
     assert paths.neutral_statements_path() == tmp_path / "neutral_statements.json"
 
 
-def test_concept_dir(monkeypatch, tmp_path):
+def test_concept_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     assert paths.concept_dir("default", "happy") == tmp_path / "vectors" / "default" / "happy"
 
 
-def test_model_dir_flattens_slashes(monkeypatch, tmp_path):
+def test_model_dir_flattens_slashes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     assert paths.model_dir("google/gemma-2-2b-it") == tmp_path / "models" / "google__gemma-2-2b-it"
 
@@ -36,18 +40,18 @@ def test_safe_model_id():
     assert paths.safe_model_id("local-model") == "local-model"
 
 
-def test_safe_variant_suffix_raw():
-    assert paths.safe_variant_suffix(None) == ""
-    assert paths.safe_variant_suffix("") == ""
+def test_safe_sae_suffix_raw():
+    assert paths.safe_sae_suffix(None) == ""
+    assert paths.safe_sae_suffix("") == ""
 
 
-def test_safe_variant_suffix_release():
-    assert paths.safe_variant_suffix("gemma-scope-2b-pt-res-canonical") == "_sae-gemma-scope-2b-pt-res-canonical"
+def test_safe_sae_suffix_release():
+    assert paths.safe_sae_suffix("gemma-scope-2b-pt-res-canonical") == "_sae-gemma-scope-2b-pt-res-canonical"
 
 
-def test_safe_variant_suffix_slugs_unsafe_chars():
+def test_safe_sae_suffix_slugs_unsafe_chars():
     # Slashes and upper-case get slugged to underscores / lowered.
-    assert paths.safe_variant_suffix("Org/Repo") == "_sae-org_repo"
+    assert paths.safe_sae_suffix("Org/Repo") == "_sae-org_repo"
 
 
 def test_tensor_filename_roundtrip_raw():
@@ -66,7 +70,7 @@ def test_tensor_filename_roundtrip_sae():
     assert parsed == ("google__gemma-2-2b-it", "sae-gemma-scope-2b-pt-res-canonical")
 
 
-def test_tensor_filename_roundtrip_from_transferred(monkeypatch):
+def test_tensor_filename_roundtrip_from_transferred(monkeypatch: pytest.MonkeyPatch) -> None:
     # Transferred profiles ride the same variant-suffix machinery as SAE.
     name = paths.tensor_filename(
         "Qwen/Qwen2.5-7B-Instruct",
@@ -110,3 +114,48 @@ def test_safe_from_suffix_slugs_unsafe_chars():
     assert paths.safe_from_suffix(None) == ""
     assert paths.safe_from_suffix("") == ""
     assert paths.safe_from_suffix("google__gemma-3-4b-it") == "_from-google__gemma-3-4b-it"
+
+
+def test_tensor_filename_roundtrip_role():
+    name = paths.tensor_filename("google/gemma-2-2b-it", role="pirate")
+    assert name == "google__gemma-2-2b-it_role-pirate.safetensors"
+    parsed = paths.parse_tensor_filename(name)
+    assert parsed == ("google__gemma-2-2b-it", "role-pirate")
+
+
+def test_tensor_filename_role_excludes_sae():
+    import pytest as _pytest
+
+    with _pytest.raises(ValueError, match="mutually exclusive"):
+        paths.tensor_filename(
+            "google/gemma-2-2b-it",
+            role="pirate",
+            release="gemma-scope-2b-pt-res-canonical",
+        )
+
+
+def test_tensor_filename_role_excludes_transferred():
+    import pytest as _pytest
+
+    with _pytest.raises(ValueError, match="mutually exclusive"):
+        paths.tensor_filename(
+            "Qwen/Qwen2.5-7B-Instruct",
+            role="pirate",
+            transferred_from="google/gemma-3-4b-it",
+        )
+
+
+def test_safe_role_suffix_slug_normalization():
+    # Uppercase + spaces + slashes get lowercased and slugified per
+    # _UNSAFE_VARIANT_CHARS — the same discipline as the SAE suffix.
+    assert paths.safe_role_suffix(None) == ""
+    assert paths.safe_role_suffix("") == ""
+    assert paths.safe_role_suffix("Pirate") == "_role-pirate"
+    assert paths.safe_role_suffix("Salty Pirate") == "_role-salty_pirate"
+    assert paths.safe_role_suffix("Org/Persona") == "_role-org_persona"
+
+
+def test_sidecar_filename_role_partners_tensor():
+    assert paths.sidecar_filename("google/gemma-2-2b-it", role="pirate") == (
+        "google__gemma-2-2b-it_role-pirate.json"
+    )

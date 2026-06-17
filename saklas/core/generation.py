@@ -1,15 +1,16 @@
 """Token-by-token generation loop with KV cache, steering hooks, and monitor integration."""
 
-import enum
 import math
 import queue
+import inspect
 import logging
 import threading
 import warnings
 from enum import IntEnum
-from typing import Callable
+from typing import Any, Callable, cast
 
 import torch
+from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 from saklas.core.results import TokenAlt
 from saklas.core.triggers import TriggerContext
@@ -22,33 +23,19 @@ class _ThinkState(IntEnum):
     RESPONSE_PREAMBLE = 3
 
 
-class ThinkingState(enum.Enum):
-    """Explicit lifecycle signal for the thinking state machine.
-
-    Parallel to the internal ``_ThinkState`` IntEnum — this one is the
-    public, stable signal exposed on ``GenerationState.thinking_state``
-    so consumers (session, TUI, tests) can ask "are we currently
-    generating thinking content?" without inferring it from
-    ``thinking_end_idx``.
-    """
-
-    IDLE = "idle"
-    PREAMBLE = "preamble"
-    THINKING = "thinking"
-    RESPONSE_PREAMBLE = "response_preamble"
-    RESPONSE = "response"
-    DONE = "done"
-
 log = logging.getLogger(__name__)
 
-def _tok_key(tokenizer) -> tuple[str, int]:
-    return (getattr(tokenizer, 'name_or_path', ''), tokenizer.vocab_size)
+def _tok_key(tokenizer: PreTrainedTokenizerBase) -> tuple[str, int]:
+    return (
+        getattr(tokenizer, "name_or_path", ""),
+        int(getattr(tokenizer, "vocab_size", 0) or 0),
+    )
 
 
 _eos_cache: dict[tuple[str, int], set[int]] = {}
 
 
-def _get_eos_ids(model, tokenizer) -> set[int]:
+def _get_eos_ids(model: PreTrainedModel, tokenizer: PreTrainedTokenizerBase) -> set[int]:
     """Return cached set of all EOS token IDs for model+tokenizer."""
     tok_key = _tok_key(tokenizer)
     cached = _eos_cache.get(tok_key)
@@ -61,8 +48,9 @@ def _get_eos_ids(model, tokenizer) -> set[int]:
             eos_ids.add(eid)
         else:
             eos_ids.update(eid)
-    if tokenizer.eos_token_id is not None:
-        eos_ids.add(tokenizer.eos_token_id)
+    tokenizer_eos = getattr(tokenizer, "eos_token_id", None)
+    if tokenizer_eos is not None:
+        eos_ids.add(int(tokenizer_eos))  # pyright: ignore[reportArgumentType]  # transformers stub over-widens eos_token_id
     # Pick up end-of-turn tokens that some models (Gemma 4, etc.) add as
     # special tokens but don't list in generation_config.eos_token_id.
     _EOT_NAMES = {"<end_of_turn>", "<|endoftext|>", "<|end|>", "<|eot_id|>",
@@ -78,7 +66,7 @@ def _get_eos_ids(model, tokenizer) -> set[int]:
 _token_table_cache: dict[tuple[str, int], list[str | None]] = {}
 
 
-def _get_token_table(tokenizer, vocab_size: int) -> list[str | None]:
+def _get_token_table(tokenizer: PreTrainedTokenizerBase, vocab_size: int) -> list[str | None]:
     """Return cached token-id-to-string lookup table.
 
     Replaces per-token ``convert_ids_to_tokens`` calls with a single
@@ -101,7 +89,7 @@ def _get_token_table(tokenizer, vocab_size: int) -> list[str | None]:
         end = min(start + _CHUNK, vocab_size)
         ids = [[i] for i in range(start, end)]
         try:
-            decoded = tokenizer.batch_decode(ids)
+            decoded: list[str] | None = cast(list[str], tokenizer.batch_decode(ids))  # transformers stub widens batch_decode return
         except Exception:
             decoded = None
         if decoded is not None and len(decoded) == (end - start):
@@ -110,7 +98,7 @@ def _get_token_table(tokenizer, vocab_size: int) -> list[str | None]:
         else:
             for i in range(start, end):
                 try:
-                    s = tokenizer.decode([i])
+                    s = cast(str, tokenizer.decode([i]))  # transformers stub widens decode return to str|list[str]
                     table[i] = s if '\ufffd' not in s else None
                 except Exception:
                     table[i] = ''
@@ -123,7 +111,7 @@ _none_result: tuple[int | None, int | None, int | None, bool] = (None, None, Non
 
 
 def _detect_bracket_delimiters(
-    tokenizer,
+    tokenizer: PreTrainedTokenizerBase,
 ) -> tuple[int | None, int | None, int | None, bool] | None:
     """Detect bracket-pair thinking delimiters (Mistral-3 Reasoning style).
 
@@ -146,7 +134,7 @@ def _detect_bracket_delimiters(
 
 
 def _detect_channel_delimiters(
-    tokenizer,
+    tokenizer: PreTrainedTokenizerBase,
 ) -> tuple[int | None, int | None, int | None, bool] | None:
     """Detect channel-based thinking for models that always use channels.
 
@@ -164,10 +152,10 @@ def _detect_channel_delimiters(
     # Check whether the generation prompt already opens a channel
     # (model starts in thinking) or the model must emit it explicitly.
     try:
-        gen_prompt = tokenizer.apply_chat_template(
+        gen_prompt = cast(str, tokenizer.apply_chat_template(  # transformers stub doesn't narrow tokenize=False return
             [{"role": "user", "content": "hi"}],
             add_generation_prompt=True, tokenize=False,
-        )
+        ))
     except Exception:
         gen_prompt = ""
     starts_in = "<|channel|>" in gen_prompt
@@ -185,7 +173,7 @@ def _detect_channel_delimiters(
 
 
 def _detect_think_delimiters(
-    tokenizer,
+    tokenizer: PreTrainedTokenizerBase,
 ) -> tuple[int | None, int | None, int | None, bool]:
     """Detect thinking start/end delimiter tokens from the chat template.
 
@@ -226,7 +214,7 @@ def _detect_think_delimiters(
             _detect_channel_delimiters(tokenizer)
             or _detect_bracket_delimiters(tokenizer)
         )
-        _think_delim_cache[tok_key] = result if result else _none_result
+        _think_delim_cache[tok_key] = result or _none_result
         return _think_delim_cache[tok_key]
 
     think_marker = "XTHINKCONTENTX"
@@ -253,10 +241,10 @@ def _detect_think_delimiters(
 
     for asst_msg in attempts:
         try:
-            rendered = tokenizer.apply_chat_template(
+            rendered = cast(str, tokenizer.apply_chat_template(  # transformers stub doesn't narrow tokenize=False return
                 [{"role": "user", "content": "hi"}, asst_msg],
                 tokenize=False, enable_thinking=True,
-            )
+            ))
         except Exception:
             continue
 
@@ -293,11 +281,11 @@ def _detect_think_delimiters(
         starts_in_thinking = False
         if start_id is not None and start_tok is not None:
             try:
-                gen_prompt = tokenizer.apply_chat_template(
+                gen_prompt = cast(str, tokenizer.apply_chat_template(  # transformers stub doesn't narrow tokenize=False return
                     [{"role": "user", "content": "hi"}],
                     add_generation_prompt=True, tokenize=False,
                     enable_thinking=True,
-                )
+                ))
                 if start_tok in gen_prompt:
                     starts_in_thinking = True
                     start_id = None  # nothing to detect at runtime
@@ -319,12 +307,12 @@ def _detect_think_delimiters(
     return _none_result
 
 
-def supports_thinking(tokenizer) -> bool:
+def supports_thinking(tokenizer: PreTrainedTokenizerBase) -> bool:
     """Check if the tokenizer's chat template supports thinking mode."""
     return _detect_think_delimiters(tokenizer) != _none_result
 
 
-def thinking_is_optional(tokenizer) -> bool:
+def thinking_is_optional(tokenizer: PreTrainedTokenizerBase) -> bool:
     """Return True iff the user can actually turn thinking off.
 
     Templates carry an ``enable_thinking`` Jinja variable for the
@@ -347,7 +335,20 @@ def thinking_is_optional(tokenizer) -> bool:
     return "enable_thinking" in template
 
 
-from dataclasses import dataclass  # noqa: E402
+def detect_base_model(tokenizer: PreTrainedTokenizerBase) -> bool:
+    """True when the tokenizer carries no chat template — a base model.
+
+    A base (completion) model has no ``chat_template``, so there are no
+    turns, roles, or system-prompt slots: input is raw text and output is
+    a continuation.  ``tokenizer.chat_template is None`` is the canonical
+    check used inline across the engine (``core/vectors.py``,
+    ``build_chat_input``); this names it so frontends can branch on a
+    single import and the session can expose it as a property.
+    """
+    return getattr(tokenizer, "chat_template", None) is None
+
+
+from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
@@ -379,6 +380,15 @@ def _sampler_candidates(
     next token. The returned probabilities are exactly the distribution the
     sampler draws from after temperature, top-k, and top-p renormalization.
     Greedy decoding is represented as a one-token distribution with p=1.
+
+    The non-greedy return is the **fixed-width** top-k pool (``topk_k``
+    entries): sub-top-p entries are zeroed in place (``torch.multinomial``
+    never draws a zero-prob index, and the top-1 floor keeps the pool
+    non-degenerate), so the shape is static.  A boolean-mask select would
+    make the output shape data-dependent and force a device→host sync every
+    decode token — on top of the unavoidable ``int(next_token.item())`` one,
+    that's two syncs/token.  Callers consume the fixed width and must treat
+    zero-prob entries as the excluded tail (see ``_sampler_logprob_vector``).
     """
     if config.temperature <= 0:
         token = logits.argmax(dim=-1).reshape(1).to(dtype=torch.long)
@@ -394,9 +404,7 @@ def _sampler_candidates(
     probs[:, :1].clamp_(min=1e-8)
     probs.div_(probs.sum(dim=-1, keepdim=True))
 
-    row_probs = probs[0]
-    valid = row_probs > 0
-    return top_idx[0][valid].to(dtype=torch.long), row_probs[valid].to(dtype=torch.float32)
+    return top_idx[0].to(dtype=torch.long), probs[0].to(dtype=torch.float32)
 
 
 def _sampler_logprob_vector(
@@ -412,8 +420,109 @@ def _sampler_logprob_vector(
         dtype=torch.float32,
         device=logits.device,
     )
-    out[ids] = probs.clamp_min(torch.finfo(torch.float32).tiny).log()
+    # ``_sampler_candidates`` now returns the fixed-width top-k pool, so
+    # ``ids`` includes the sub-top-p tail whose ``probs`` are exactly 0.
+    # Those must stay ``-inf`` (outside the sampler's support), so scatter
+    # ``log p`` only where ``p > 0`` — the in-support entries — and leave the
+    # zeroed tail at the initialized ``-inf``.  (Greedy returns a 1-element
+    # ``probs`` of all ones, so the ``where`` is a no-op there.)
+    out[ids] = torch.where(
+        probs > 0,
+        probs.clamp_min(torch.finfo(torch.float32).tiny).log(),
+        torch.full_like(probs, float("-inf")),
+    )
     return out
+
+
+def _effective_topk(config: GenerationConfig, vocab: int) -> int:
+    """Candidate-pool cap applied before top-p (llama.cpp/Ollama order).
+
+    ``top_k`` caps the candidate pool before top-p.  When unset, use 1024
+    as a performance ceiling (nucleus sampling is insensitive beyond that);
+    when set, honour the user's value as a hard cap.  Capped at ``vocab``.
+    """
+    user_top_k = config.top_k if (config.top_k and config.top_k > 0) else 1024
+    return min(int(user_top_k), int(vocab))
+
+
+# Modern HF ``CausalLM.forward`` accepts ``logits_to_keep`` (the current
+# name; ``num_logits_to_keep`` is the older one) — an int cap on how many
+# trailing positions get the LM head.  Passing ``1`` at prefill avoids
+# materializing a ``(1, T_prompt, V)`` logits tensor (hundreds of MB at a
+# 256k vocab) and the ~T× wasted head FLOPs when only the last row is used.
+# Some custom/older modeling files don't expose the kwarg, so we detect the
+# supported name once via signature inspection and cache it.
+_logits_keep_kwarg_cache: dict[int, str | None] = {}
+
+
+def _logits_keep_kwarg(model: PreTrainedModel) -> str | None:
+    """Return the ``logits_to_keep``/``num_logits_to_keep`` kwarg this model's
+    ``forward`` accepts, or ``None`` if neither is in the signature.
+
+    Cached per ``forward`` callable.  A ``**kwargs``-only signature reports
+    ``None`` here (the name isn't explicit); the caller's first-forward
+    try/except still catches a model that silently mishandles the kwarg.
+    A model with no ``forward`` (a non-``nn.Module`` test double calling via
+    ``__call__``) reports ``None`` — inspecting ``__call__`` would only see
+    ``nn.Module``'s ``*args, **kwargs`` wrapper, never the real param.
+    """
+    fwd = getattr(model, "forward", None)
+    if fwd is None:
+        return None
+    key = id(fwd)
+    cached = _logits_keep_kwarg_cache.get(key, "")
+    if cached != "":  # "" is the not-yet-computed sentinel; None is a real result
+        return cached
+    name: str | None = None
+    try:
+        params = inspect.signature(fwd).parameters
+    except (ValueError, TypeError):  # pragma: no cover — C/builtin forwards
+        params = {}
+    for cand in ("logits_to_keep", "num_logits_to_keep"):
+        if cand in params:
+            name = cand
+            break
+    _logits_keep_kwarg_cache[key] = name
+    return name
+
+
+def _advance_no_cache_input(
+    next_token: torch.Tensor,
+    *,
+    current_input: torch.Tensor,
+    no_cache_buf: torch.Tensor | None,
+    no_cache_len: int,
+    no_cache_mode: bool,
+    max_extra: int,
+) -> tuple[torch.Tensor, torch.Tensor | None, int]:
+    """Advance the decode input for one new token, KV-cached or not.
+
+    Returns the updated ``(current_input, no_cache_buf, no_cache_len)``.
+    With a KV cache the next forward only needs the single new token.  In
+    the O(N²) no-KV-cache fallback path the full running sequence must be
+    re-fed each step, so it lives in a pre-allocated ring buffer
+    (``prompt_len + max(max_extra, 1)``, where ``max_extra`` is the decode
+    budget — ``max_new_tokens`` for live generation, the forced-id count
+    for a logprob replay) that grows in place to avoid per-token
+    reallocation; the ``torch.cat`` branch is an unreachable cap guard.
+    """
+    if not no_cache_mode:
+        return next_token, no_cache_buf, no_cache_len
+    if no_cache_buf is None:
+        cap = int(current_input.shape[1]) + max(max_extra, 1)
+        no_cache_buf = torch.empty(
+            (1, cap), dtype=current_input.dtype, device=current_input.device,
+        )
+        no_cache_buf[:, :current_input.shape[1]].copy_(current_input)
+        no_cache_len = int(current_input.shape[1])
+    if no_cache_len < no_cache_buf.shape[1]:
+        no_cache_buf[:, no_cache_len:no_cache_len + 1].copy_(next_token)
+        no_cache_len += 1
+        current_input = no_cache_buf[:, :no_cache_len]
+    else:  # pragma: no cover - cap is prompt + decode budget by construction
+        current_input = torch.cat([current_input, next_token], dim=1)
+        no_cache_len = int(current_input.shape[1])
+    return current_input, no_cache_buf, no_cache_len
 
 
 class GenerationState:
@@ -421,19 +530,18 @@ class GenerationState:
 
     def __init__(self):
         self.stop_requested = threading.Event()
-        self.token_queue: queue.SimpleQueue = queue.SimpleQueue()
+        self.token_queue: queue.SimpleQueue[Any] = queue.SimpleQueue()
         self.thinking_end_idx: int = 0
         self.finish_reason: str = "stop"
-        self.thinking_state: ThinkingState = ThinkingState.IDLE
         # For each on_token emission, the index in generated_ids of the
         # token that triggered it (last buffered ID for multi-byte emits),
         # plus whether the emit was thinking.  Used by the TUI to map
         # per-token probe scores (which are in generated_ids space) back
         # to the emitted token stream.
         self.emit_map: list[tuple[int, bool]] = []
-        # Exact non-thinking text accepted by the streaming path. This is
-        # authoritative for final result text because stop sequences can trim
-        # only part of a decoded token while generated_ids still contains it.
+        # Exact non-thinking text accepted by a stop-sequence streaming path.
+        # Populated only when a stop sequence actually matches, because normal
+        # streaming finalization can decode generated ids directly.
         self.response_text: str | None = None
 
     def request_stop(self):
@@ -444,7 +552,6 @@ class GenerationState:
         self.token_queue = queue.SimpleQueue()
         self.thinking_end_idx = 0
         self.finish_reason = "stop"
-        self.thinking_state = ThinkingState.IDLE
         self.emit_map = []
         self.response_text = None
 
@@ -498,63 +605,107 @@ class _PenaltyState:
 # cheaply to tuples so the per-lookup hash cost is negligible.
 _CHAT_INPUT_CACHE_MAX = 128
 _chat_input_cache: dict[
-    tuple[int, str | None, tuple[tuple[str, str], ...], bool, bool],
+    tuple[
+        int, str | None, tuple[tuple[str, str, str | None], ...], bool, bool,
+        str | None,
+    ],
     torch.Tensor,
 ] = {}
 
 
 def _chat_input_cache_key(
-    tokenizer,
-    chat: list[dict[str, str]],
+    tokenizer: PreTrainedTokenizerBase,
+    chat: list[dict[str, Any]],
     system_prompt: str | None,
     thinking: bool,
     add_generation_prompt: bool,
-) -> tuple[int, str | None, tuple[tuple[str, str], ...], bool, bool]:
+    gen_role: str | None = None,
+) -> tuple[
+    int, str | None, tuple[tuple[str, str, str | None], ...], bool, bool, str | None
+]:
     return (
         id(tokenizer),
         system_prompt,
-        tuple((m["role"], m["content"]) for m in chat),
+        tuple((m["role"], m["content"], m.get("label")) for m in chat),
         thinking,
         add_generation_prompt,
+        gen_role,
     )
 
 
 def build_chat_input(
-    tokenizer,
-    messages: list[dict[str, str]],
+    tokenizer: PreTrainedTokenizerBase,
+    messages: list[dict[str, Any]],
     system_prompt: str | None = None,
     thinking: bool = False,
     *,
     add_generation_prompt: bool = True,
+    gen_role: str | None = None,
+    model_type: str | None = None,
 ) -> torch.Tensor:
-    chat = []
+    """Render a chat history to ``input_ids``.
+
+    Per-turn role substitution (the roleplay scaffold): each message may
+    carry a ``"label"`` key — a custom role label for *that* turn — and
+    ``gen_role`` is the label for the generation-prompt assistant header
+    (the turn about to be generated).  When no message carries a label and
+    ``gen_role`` is ``None`` (the common case) this is a zero-overhead
+    pass-through to ``tokenizer.apply_chat_template``.  When any label is
+    present, ``model_type`` is required so the family's role-header registry
+    entry can be looked up; pass ``model.config.model_type``.
+    """
+    chat: list[dict[str, Any]] = []
     if system_prompt:
         chat.append({"role": "system", "content": system_prompt})
     chat.extend(messages)
+    has_labels = gen_role is not None or any(m.get("label") for m in chat)
     if getattr(tokenizer, "chat_template", None) is not None:
         # Cache lookup: see _chat_input_cache docstring for invalidation
         # semantics.  Only the chat-template branch is cached — the
         # base-model fallback is sub-ms and not worth complicating.
+        # Per-turn labels + ``gen_role`` participate in the key so role-
+        # tagged renders never collide with plain renders of the same chat.
         key = _chat_input_cache_key(
-            tokenizer, chat, system_prompt, thinking, add_generation_prompt,
+            tokenizer, chat, system_prompt, thinking,
+            add_generation_prompt, gen_role,
         )
         cached = _chat_input_cache.get(key)
         if cached is not None:
             # Return a clone — callers (notably ``_prepare_input``) ``.to``
             # device-move the tensor and would otherwise alias the cache.
             return cached.clone()
-        kwargs: dict = {}
+        kwargs: dict[str, Any] = {}
         if "enable_thinking" in (getattr(tokenizer, "chat_template", "") or ""):
             kwargs["enable_thinking"] = thinking
-        result = tokenizer.apply_chat_template(
-            chat, add_generation_prompt=add_generation_prompt,
-            return_tensors="pt", **kwargs,
-        )
-        # Some tokenizers return a BatchEncoding dict instead of a raw tensor
-        if isinstance(result, torch.Tensor):
-            tensor = result
+        if not has_labels:
+            # Strip any (None-valued) label keys so apply_chat_template sees
+            # the canonical message shape.
+            clean = [{"role": m["role"], "content": m.get("content", "")} for m in chat]
+            result = tokenizer.apply_chat_template(
+                clean, add_generation_prompt=add_generation_prompt,
+                return_tensors="pt", **kwargs,
+            )
         else:
-            tensor = result["input_ids"]
+            if model_type is None:
+                raise ValueError(
+                    "build_chat_input: per-turn role labels / gen_role= require "
+                    "model_type= (model.config.model_type) so the family's "
+                    "role-header registry entry can be looked up"
+                )
+            from saklas.core.role_templates import apply_with_per_turn_roles
+            result = apply_with_per_turn_roles(
+                tokenizer, chat,
+                gen_role=gen_role, model_type=model_type,
+                add_generation_prompt=add_generation_prompt,
+                tokenize=True, return_tensors="pt",
+                **kwargs,
+            )
+        # Some tokenizers return a BatchEncoding dict instead of a raw tensor
+        tensor = (
+            result
+            if isinstance(result, torch.Tensor)
+            else cast(torch.Tensor, result["input_ids"])  # pyright: ignore[reportArgumentType, reportCallIssue]  # transformers BatchEncoding stub lacks str-key subscript
+        )
         # Insert into cache — evict FIFO at the size cap. dict insertion
         # order is the eviction order; popping the first key removes the
         # oldest entry. Not strictly LRU (no touch-on-hit reorder), but
@@ -565,14 +716,18 @@ def build_chat_input(
             _chat_input_cache.pop(next(iter(_chat_input_cache)))
         _chat_input_cache[key] = tensor
         return tensor.clone()
-    # Base model without chat template — add minimal role markers
+    # Base model without chat template — add minimal role markers.
+    # ``role`` has no chat template to splice into; the base-model
+    # surface is raw-completion and roles are irrelevant.  Silently
+    # ignore the kwarg here rather than raising — the engine routes
+    # base-model traffic to the raw path before this branch fires.
     text = "\n".join(f"{m['role'].capitalize()}: {m['content']}" for m in chat) + "\nAssistant:"
-    return tokenizer(text, return_tensors="pt")["input_ids"]
+    return cast(torch.Tensor, tokenizer(text, return_tensors="pt")["input_ids"])  # transformers BatchEncoding str-key subscript
 
 
 def generate_steered(
-    model,
-    tokenizer,
+    model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizerBase,
     input_ids: torch.Tensor,
     config: GenerationConfig,
     state: GenerationState,
@@ -585,11 +740,15 @@ def generate_steered(
     frequency_penalty: float = 0.0,
     logprobs: int | None = None,
     trigger_ctx: TriggerContext | None = None,
-    past_key_values=None,
+    past_key_values: Any = None,
     cache_position_offset: int = 0,
     score_callback: Callable[[], dict[str, float]] | None = None,
+    step_callback: Callable[[], None] | None = None,
     use_static_cache: bool = False,
     forced_prefix: list[int] | None = None,
+    steering_active: bool = True,
+    want_perplexity: bool = True,
+    cache_token_text: bool = True,
 ) -> list[int]:
     """
     Runs in a worker thread (not the async event loop).
@@ -613,14 +772,22 @@ def generate_steered(
     Sets ``state.finish_reason`` on exit: "stop" (EOS/external), "length"
     (max tokens), "stop_sequence" (stop string matched).
 
-    ``score_callback`` enables probe-gated triggers (v2.1): when set,
+    ``score_callback`` enables probe-gated triggers: when set,
     it's invoked after every forward pass and the returned
     ``dict[str, float]`` is written to ``trigger_ctx.probe_scores``
     so the next iteration's gates see fresh monitor readings.  Pay
     nothing on the no-gate path — session-level wiring sets this to
     ``None`` unless the active steering contains a gated trigger.
 
-    ``use_static_cache`` (v2.2 Phase B) routes generation through
+    ``step_callback`` is the per-token monitor-scoring hook (FIX F1):
+    invoked once per forward, post-``model()``, before ``score_callback``.
+    The session wires it to :meth:`HiddenCapture.fire_step_sink` so the
+    per-token probe scoring (and its device→host sync) runs *after* the
+    forward instead of inside the capture hook at the max probe layer,
+    keeping the sync out of the middle of the forward pass.  ``None`` when
+    no per-token scoring is needed (no probes, or aggregate-only capture).
+
+    ``use_static_cache`` routes generation through
     :class:`transformers.StaticCache` instead of the default
     ``DynamicCache`` — fixed-shape K/V buffers across decode steps,
     so the kernel shapes the compiled artifact saw on warmup don't
@@ -643,6 +810,10 @@ def generate_steered(
     sequence (delimiters included) up to and including the fork token so
     the thinking-state machine transitions identically.  ``None`` (the
     default) is the normal free-sampling path with zero added cost.
+
+    ``cache_token_text`` controls the eager token-id→text table used by
+    streaming/logprob renderers. Stop-sequence-only callers can turn it
+    off to avoid a full-vocab decode table for a bounded tail match.
 
     Returns list of generated token IDs.
     """
@@ -669,18 +840,30 @@ def generate_steered(
     generated_ids: list[int] = []
     _cfg = getattr(model.config, "text_config", model.config)
     _vocab = _cfg.vocab_size
-    # top_k caps the candidate pool before top-p.  When unset, use 1024 as a
-    # performance ceiling (nucleus sampling is insensitive beyond that).  When
-    # set, honour the user's value as a hard cap — matches llama.cpp/Ollama
-    # semantics where top_k is applied before top_p.
-    _user_top_k = config.top_k if (config.top_k and config.top_k > 0) else 1024
-    topk_k = min(_user_top_k, _vocab)
-    token_table = _get_token_table(tokenizer, _vocab) if on_token else None
+    topk_k = _effective_topk(config, _vocab)
+    token_table = (
+        _get_token_table(tokenizer, _vocab)
+        if on_token is not None and cache_token_text
+        else None
+    )
     seq_len = input_ids.shape[1] + cache_position_offset
     attn_mask_buf = torch.ones(1, seq_len, device=device, dtype=torch.long)
     prefill = True
 
-    # ---- StaticCache (Phase B, v2.2) -----------------------------------
+    # ---- logits_to_keep ------------------------------------------------
+    # Detect the trailing-logits cap kwarg once (signature inspection) so
+    # the per-step branch is a cheap dict spread.  ``logits_to_keep=1``
+    # computes the LM head over only the last position — a large win at
+    # prefill (no ``(1, T_prompt, V)`` transient) and correct everywhere
+    # (we only ever read ``outputs.logits[:, -1, :]``, including the
+    # no-KV-cache fallback that re-feeds the full sequence each step).
+    # ``logits_keep_failed`` arms a one-shot retry-without-kwarg if a model
+    # whose signature *looked* supportive rejects the value at runtime.
+    _lk_name = _logits_keep_kwarg(model)
+    logits_keep_kwargs: dict[str, int] = {_lk_name: 1} if _lk_name is not None else {}
+    logits_keep_failed = False
+
+    # ---- StaticCache ---------------------------------------------------
     # Caller flips ``use_static_cache`` after probing
     # :func:`saklas.core.cuda_graphs.is_cuda_graphs_supported` at session
     # construction time.  We allocate the static buffer here, sized to
@@ -717,7 +900,7 @@ def generate_steered(
                         device=device,
                         dtype=model_dtype,
                     )
-                except Exception as e:  # noqa: BLE001 — fallback on any failure
+                except Exception as e:
                     warnings.warn(
                         f"StaticCache allocation failed ({type(e).__name__}: "
                         f"{e}); falling back to DynamicCache",
@@ -750,7 +933,14 @@ def generate_steered(
         bias_idx = torch.tensor(list(logit_bias.keys()), dtype=torch.long, device=device)
         bias_val = torch.tensor(list(logit_bias.values()), dtype=torch.float32, device=device)
     stop_list = list(stop) if stop else None
-    completion_text = ""  # accumulated non-thinking emitted text, for stop matching
+    # ``completion_text`` is a *bounded tail* of the emitted non-thinking text,
+    # not the full completion: only the last ``_stop_keep`` chars are retained —
+    # enough for a stop string to straddle the previous/current emit boundary
+    # (a k-char stop can overlap the boundary by at most k−1 chars).  Keeps the
+    # per-token stop match O(tail+emit) instead of the old O(n) concat that grew
+    # the whole completion (O(n²) over the generation).
+    _stop_keep = (max(len(s) for s in stop_list) - 1) if stop_list else 0
+    completion_text = ""  # bounded tail of emitted non-thinking text, for stop matching
     state.finish_reason = "length"  # default: loop exhausted
 
     # Thinking state tracking.  Always detect delimiters even when the
@@ -787,20 +977,6 @@ def generate_steered(
         if (starts_in_thinking and think_end_id is not None)
         else _ThinkState.IDLE
     )
-    # Mirror the internal tstate onto the public ThinkingState enum.
-    # No delimiters detected → straight to RESPONSE; otherwise track the
-    # machine.  Note: even with ``thinking=False`` the machine engages
-    # for channel-based formats (gpt-oss) so the analysis is correctly
-    # classified rather than leaking into the response.
-    if think_end_id is not None:
-        state.thinking_state = (
-            ThinkingState.THINKING
-            if starts_in_thinking
-            else ThinkingState.IDLE
-        )
-    else:
-        state.thinking_state = ThinkingState.RESPONSE
-
     # Buffer for multi-token characters (emoji, rare Unicode).
     # Tokens whose table entry is None represent partial UTF-8 byte sequences;
     # they accumulate here until a complete-token follows, at which point the
@@ -810,38 +986,49 @@ def generate_steered(
     # Survives loop iterations so post-loop partial-flush can reuse it;
     # None when max_new_tokens=0 (degenerate, no forward ever ran).
     current_perplexity: float | None = None
-    if on_token is not None:
-        state.response_text = ""
+    response_chunks: list[str] | None = [] if (on_token is not None and stop_list) else None
+    response_char_len = 0
+    state.response_text = None
 
     no_cache_buf: torch.Tensor | None = None
     no_cache_len = int(current_input.shape[1])
 
     def _advance_current_input(next_token: torch.Tensor) -> None:
         nonlocal current_input, no_cache_buf, no_cache_len
-        if not no_cache_mode:
-            current_input = next_token
-            return
-        if no_cache_buf is None:
-            cap = int(current_input.shape[1]) + max(config.max_new_tokens, 1)
-            no_cache_buf = torch.empty(
-                (1, cap), dtype=current_input.dtype, device=current_input.device,
-            )
-            no_cache_buf[:, :current_input.shape[1]].copy_(current_input)
-            no_cache_len = int(current_input.shape[1])
-        if no_cache_len < no_cache_buf.shape[1]:
-            no_cache_buf[:, no_cache_len:no_cache_len + 1].copy_(next_token)
-            no_cache_len += 1
-            current_input = no_cache_buf[:, :no_cache_len]
-        else:  # pragma: no cover - cap is prompt + max_new_tokens by construction
-            current_input = torch.cat([current_input, next_token], dim=1)
-            no_cache_len = int(current_input.shape[1])
+        current_input, no_cache_buf, no_cache_len = _advance_no_cache_input(
+            next_token,
+            current_input=current_input,
+            no_cache_buf=no_cache_buf,
+            no_cache_len=no_cache_len,
+            no_cache_mode=no_cache_mode,
+            max_extra=config.max_new_tokens,
+        )
 
     def _emit_token(text: str, is_thinking: bool, token_id: int,
-                    logprob, top_alts, perplexity) -> None:
-        if not is_thinking and state.response_text is not None:
-            state.response_text += text
+                    logprob: float | None, top_alts: list[TokenAlt] | None,
+                    perplexity: float | None) -> None:
+        nonlocal response_char_len
+        if not is_thinking and response_chunks is not None:
+            response_chunks.append(text)
+            response_char_len += len(text)
         if on_token is not None:
             on_token(text, is_thinking, token_id, logprob, top_alts, perplexity)
+
+    def _response_prefix(chars: int) -> str:
+        if response_chunks is None or chars <= 0:
+            return ""
+        remaining = chars
+        out: list[str] = []
+        for chunk in response_chunks:
+            if remaining <= 0:
+                break
+            if len(chunk) <= remaining:
+                out.append(chunk)
+                remaining -= len(chunk)
+            else:
+                out.append(chunk[:remaining])
+                break
+        return "".join(out)
 
     def _decode_alt(tid: int) -> str:
         """Decode a single alt token id to text, preferring the cached
@@ -853,7 +1040,14 @@ def generate_steered(
             cached = token_table[tid]
             if cached is not None:
                 return cached
-        return tokenizer.decode([tid])
+        return cast(str, tokenizer.decode([tid]))  # transformers stub widens decode return to str|list[str]
+
+    def _decode_piece(tid: int) -> str | None:
+        """Decode one emitted token, preserving partial-UTF-8 buffering."""
+        if token_table is not None and 0 <= tid < _vocab:
+            return token_table[tid]
+        s = cast(str, tokenizer.decode([tid]))  # transformers stub widens decode return to str|list[str]
+        return None if "\ufffd" in s else s
 
     try:
         with torch.inference_mode():
@@ -893,26 +1087,70 @@ def generate_steered(
                 # Static-cache path passes ``cache_position`` explicitly so
                 # the model knows where to write into the pre-allocated
                 # K/V buffers.  Eager (DynamicCache) path leaves it
-                # implicit so HF derives positions from cache seq_length
-                # — bit-identical to the v1.x call shape.
-                if cache_position is not None:
-                    outputs = model(
-                        input_ids=current_input,
-                        attention_mask=attn_mask_buf if prefill else None,
-                        past_key_values=past_key_values,
-                        use_cache=True,
-                        cache_position=cache_position,
+                # implicit so HF derives positions from cache seq_length.
+                # ``logits_keep_kwargs`` (``{logits_to_keep: 1}`` or empty)
+                # caps the LM head to the last position; the one-shot
+                # ``TypeError`` retry below covers a model whose signature
+                # advertised the kwarg but rejects the value at runtime.
+                try:
+                    if cache_position is not None:
+                        outputs = model(
+                            input_ids=current_input,
+                            attention_mask=attn_mask_buf if prefill else None,
+                            past_key_values=past_key_values,
+                            use_cache=True,
+                            cache_position=cache_position,
+                            **logits_keep_kwargs,
+                        )
+                    else:
+                        outputs = model(
+                            input_ids=current_input,
+                            attention_mask=attn_mask_buf if prefill else None,
+                            past_key_values=past_key_values,
+                            use_cache=True,
+                            **logits_keep_kwargs,
+                        )
+                except TypeError:
+                    if not logits_keep_kwargs or logits_keep_failed:
+                        raise  # not our kwarg — a genuine signature error
+                    logits_keep_failed = True
+                    logits_keep_kwargs = {}
+                    warnings.warn(
+                        "model.forward rejected logits_to_keep at runtime — "
+                        "falling back to full-sequence logits (slower prefill)",
+                        stacklevel=2,
                     )
-                else:
-                    outputs = model(
-                        input_ids=current_input,
-                        attention_mask=attn_mask_buf if prefill else None,
-                        past_key_values=past_key_values,
-                        use_cache=True,
-                    )
+                    if cache_position is not None:
+                        outputs = model(
+                            input_ids=current_input,
+                            attention_mask=attn_mask_buf if prefill else None,
+                            past_key_values=past_key_values,
+                            use_cache=True,
+                            cache_position=cache_position,
+                        )
+                    else:
+                        outputs = model(
+                            input_ids=current_input,
+                            attention_mask=attn_mask_buf if prefill else None,
+                            past_key_values=past_key_values,
+                            use_cache=True,
+                        )
                 prefill = False
 
-                # Probe-gate scoring (v2.1): after the forward (so
+                # Per-token monitor scoring (FIX F1): run the capture's step
+                # sink HERE, post-forward, rather than from inside the capture
+                # hook at the max probe layer.  The sink's score read ends in a
+                # device→host sync; firing it mid-forward (in the hook) drained
+                # the device pipeline before the remaining transformer layers +
+                # LM head were even enqueued.  Post-forward the captures are
+                # equally fresh (every probe layer stored this step's slice
+                # during the forward), so the readings are identical — only the
+                # sync no longer stalls the tail of the forward.  Runs before
+                # ``score_callback`` so a probe gate reads the freshly-scored row.
+                if step_callback is not None:
+                    step_callback()
+
+                # Probe-gate scoring: after the forward (so
                 # ``HiddenCapture`` is freshly populated), refresh
                 # ``trigger_ctx.probe_scores`` so the *next* iteration's
                 # gates see last-step readings.  ``score_callback`` is
@@ -926,9 +1164,8 @@ def generate_steered(
                 # StaticCache mutates in place — the model returns the
                 # same object and re-assigning here would clobber our
                 # reference if a buggy modeling file returned ``None``.
-                # Plain DynamicCache path keeps the v1.x semantics: pull
-                # the cache out of the output, fall back to no-cache
-                # mode if missing.
+                # Plain DynamicCache path: pull the cache out of the
+                # output, fall back to no-cache mode if missing.
                 if cache_position is None:
                     past_key_values = outputs.past_key_values
                     if not no_cache_mode and past_key_values is None and current_input.shape[1] > 1:
@@ -959,9 +1196,12 @@ def generate_steered(
                 logits = outputs.logits[:, -1, :]
                 # Steering can push hidden states past fp16 range, cascading
                 # to inf/NaN logits.  nan_to_num clears NaN/inf first;
-                # clamp then bounds any remaining finite outliers.
-                logits.nan_to_num_(nan=0.0, posinf=100.0, neginf=-100.0)
-                logits.clamp_(-100.0, 100.0)
+                # clamp then bounds any remaining finite outliers.  These are
+                # two vocab-width kernels per token, only needed when steering
+                # is actually applied — the unsteered path skips them.
+                if steering_active:
+                    logits.nan_to_num_(nan=0.0, posinf=100.0, neginf=-100.0)
+                    logits.clamp_(-100.0, 100.0)
 
                 # Presence + frequency penalty (applied to raw logits,
                 # before temperature, per OpenAI semantics).
@@ -973,6 +1213,7 @@ def generate_steered(
                     )
 
                 if bias_idx is not None:
+                    assert bias_val is not None  # set together with bias_idx when logit_bias is non-empty
                     logits[0, bias_idx] += bias_val.to(logits.dtype)
 
                 chosen_logprob: float | None = None
@@ -1012,14 +1253,24 @@ def generate_steered(
                             [[forced_id]], device=device, dtype=cand_ids.dtype,
                         )
 
-                if capture_sampler_stats:
+                # ``cand_logp`` backs both the logprobs capture and the
+                # perplexity entropy.  Compute it only when one of them needs
+                # it, and pay the entropy ``.item()`` host sync (one sync per
+                # token) only when a consumer actually wants perplexity —
+                # ``want_perplexity=False`` (e.g. stateless server streaming,
+                # which never surfaces per-token ppl) skips it entirely.
+                want_ppl = want_perplexity and capture_sampler_stats
+                if logprobs is not None or want_ppl:
                     cand_logp = cand_probs.clamp_min(
                         torch.finfo(torch.float32).tiny,
                     ).log()
+                else:
+                    cand_logp = None
+                if want_ppl:
+                    assert cand_logp is not None  # set above when want_ppl
                     entropy_nats = float((-(cand_probs * cand_logp)).sum().item())
                     current_perplexity = math.exp(entropy_nats)
                 else:
-                    cand_logp = None
                     current_perplexity = float("nan")
 
                 token_id = int(next_token.item())
@@ -1027,17 +1278,29 @@ def generate_steered(
                 if logprobs is not None:
                     assert cand_logp is not None
                     if forced_in_pool:
-                        chosen_logprob = float(cand_logp[chosen_pos.item()].item())
+                        chosen_logprob = float(cand_logp[int(chosen_pos.item())].item())
                     else:
                         chosen_logprob = float(torch.log_softmax(
                             logits.float(), dim=-1,
                         )[0, token_id].item())
                     if logprobs > 0:
-                        tlv, tpos = cand_logp.topk(min(logprobs, cand_logp.numel()))
+                        # Only surface in-support alternatives.  Sub-top-p tail
+                        # entries were zeroed in ``cand_probs`` and clamped to
+                        # ``log(tiny)`` in ``cand_logp``; without this mask a
+                        # request for more alts than the nucleus holds pads the
+                        # list with tokens the sampler had zero probability of
+                        # drawing (reported at ~-87 nats).  Mask them to -inf,
+                        # take the top-k, then drop any -inf the topk had to
+                        # pad with — so a peaked step returns fewer than
+                        # ``logprobs`` alts rather than out-of-support ones.
+                        masked = cand_logp.masked_fill(cand_probs <= 0, float("-inf"))
+                        tlv, tpos = masked.topk(min(logprobs, cand_logp.numel()))
+                        keep = torch.isfinite(tlv)
+                        tlv, tpos = tlv[keep], tpos[keep]
                         tli = cand_ids.index_select(0, tpos)
                         top_alts = [
                             TokenAlt(id=int(i), text=_decode_alt(int(i)), logprob=float(v))
-                            for i, v in zip(tli.tolist(), tlv.tolist())
+                            for i, v in zip(tli.tolist(), tlv.tolist(), strict=True)
                         ]
 
                 if token_id in eos_ids:
@@ -1053,21 +1316,19 @@ def generate_steered(
                     _advance_current_input(next_token)
                     if tstate == _ThinkState.THINKING:
                         if on_token and pending_ids:
-                            _emit_token(tokenizer.decode(pending_ids),
+                            _emit_token(cast(str, tokenizer.decode(pending_ids)),
                                         pending_thinking, -1, None, None,
                                         current_perplexity)
                             pending_ids.clear()
                         tstate = _ThinkState.RESPONSE_PREAMBLE
-                        state.thinking_state = ThinkingState.RESPONSE_PREAMBLE
                     elif tstate == _ThinkState.PREAMBLE:
                         if on_token and pending_ids:
-                            _emit_token(tokenizer.decode(pending_ids),
+                            _emit_token(cast(str, tokenizer.decode(pending_ids)),
                                         pending_thinking, -1, None, None,
                                         current_perplexity)
                             pending_ids.clear()
                         tstate = _ThinkState.IDLE
                         state.thinking_end_idx = len(generated_ids)
-                        state.thinking_state = ThinkingState.RESPONSE
                     continue
 
                 # Advance KV cache state (common to all non-EOS paths)
@@ -1080,21 +1341,18 @@ def generate_steered(
                         and token_id == think_start_id
                         and tstate == _ThinkState.IDLE):
                     tstate = _ThinkState.PREAMBLE
-                    state.thinking_state = ThinkingState.PREAMBLE
                     continue  # suppress start delimiter
 
                 if tstate == _ThinkState.PREAMBLE:
                     if token_id == think_end_id:
                         tstate = _ThinkState.IDLE
                         state.thinking_end_idx = len(generated_ids)
-                        state.thinking_state = ThinkingState.RESPONSE
                         continue  # suppress end delimiter
                     if response_start_id is not None:
                         # Channel-style (gpt-oss): suppress channel-name
                         # tokens between ``<|channel|>`` and ``<|message|>``.
                         if token_id == response_start_id:
                             tstate = _ThinkState.THINKING
-                            state.thinking_state = ThinkingState.THINKING
                         continue  # suppress preamble
                     # Non-channel preamble (Qwen-style ``<think>\n``, or
                     # bracket-pair ``[THINK]…`` with no leading whitespace).
@@ -1106,8 +1364,7 @@ def generate_steered(
                     # pair case where the model goes directly from
                     # ``[THINK]`` into content).
                     tstate = _ThinkState.THINKING
-                    state.thinking_state = ThinkingState.THINKING
-                    tok_text = tokenizer.decode([token_id])
+                    tok_text = cast(str, tokenizer.decode([token_id]))  # transformers stub widens decode return
                     if tok_text == "" or tok_text.isspace():
                         continue  # swallow leading whitespace
                     # fall through to normal token handling below
@@ -1115,24 +1372,21 @@ def generate_steered(
                 # Handle end-of-thinking delimiter
                 if tstate == _ThinkState.THINKING and token_id == think_end_id:
                     if on_token and pending_ids:
-                        _emit_token(tokenizer.decode(pending_ids),
+                        _emit_token(cast(str, tokenizer.decode(pending_ids)),
                                     pending_thinking, -1, None, None,
                                     current_perplexity)
                         pending_ids.clear()
                     if response_start_id is not None:
                         tstate = _ThinkState.RESPONSE_PREAMBLE
-                        state.thinking_state = ThinkingState.RESPONSE_PREAMBLE
                     else:
                         tstate = _ThinkState.IDLE
                         state.thinking_end_idx = len(generated_ids)
-                        state.thinking_state = ThinkingState.RESPONSE
                     continue
 
                 if tstate == _ThinkState.RESPONSE_PREAMBLE:
                     if token_id == response_start_id:
                         tstate = _ThinkState.IDLE
                         state.thinking_end_idx = len(generated_ids)
-                        state.thinking_state = ThinkingState.RESPONSE
                     continue
 
                 # Penalty bookkeeping: count all emitted completion tokens
@@ -1142,7 +1396,7 @@ def generate_steered(
                     penalty_state.add(token_id)
 
                 if on_token:
-                    tok_str = token_table[token_id] if token_id < _vocab else ''
+                    tok_str = _decode_piece(token_id) if token_id < _vocab else ''
                     emit_text: str | None = None
                     emit_id = token_id
                     emit_thinking = tstate == _ThinkState.THINKING
@@ -1153,7 +1407,7 @@ def generate_steered(
                         pending_ids.append(token_id)
                     elif pending_ids:
                         pending_ids.append(token_id)
-                        emit_text = tokenizer.decode(pending_ids)
+                        emit_text = cast(str, tokenizer.decode(pending_ids))  # transformers stub widens decode return
                         emit_id = -1
                         emit_thinking = pending_thinking
                         pending_ids.clear()
@@ -1161,26 +1415,36 @@ def generate_steered(
                         emit_text = tok_str
 
                     if emit_text is not None:
-                        # Stop-sequence check (response text only).
+                        # Stop-sequence check (response text only).  Match
+                        # against the bounded tail + this emit: the tail never
+                        # holds a complete stop (we'd have broken already), so
+                        # any match necessarily completes within ``emit_text``,
+                        # and searching the short ``combined`` from 0 finds the
+                        # same boundary-relative hit the old full-text scan did.
                         if stop_list and not emit_thinking:
-                            prev_len = len(completion_text)
-                            new_text = completion_text + emit_text
+                            tail_len = len(completion_text)
+                            combined = completion_text + emit_text
                             hit_idx = -1
                             for s in stop_list:
-                                i = new_text.find(s, max(0, prev_len - len(s) + 1))
+                                i = combined.find(s)
                                 if i >= 0 and (hit_idx < 0 or i < hit_idx):
                                     hit_idx = i
                             if hit_idx >= 0:
-                                # Trim emit to the pre-stop portion only.
-                                trimmed = new_text[:hit_idx][prev_len:]
+                                keep_chars = max(0, response_char_len - tail_len + hit_idx)
+                                # Emit only this token's pre-stop portion (empty
+                                # when the stop began back in the retained tail).
+                                trimmed = combined[tail_len:hit_idx]
                                 if trimmed:
                                     state.emit_map.append((len(generated_ids) - 1, emit_thinking))
                                     _emit_token(trimmed, emit_thinking, emit_id,
                                                 chosen_logprob, top_alts,
                                                 current_perplexity)
+                                state.response_text = _response_prefix(keep_chars)
                                 state.finish_reason = "stop_sequence"
                                 break
-                            completion_text = new_text
+                            completion_text = (
+                                combined[-_stop_keep:] if _stop_keep > 0 else ""
+                            )
                         state.emit_map.append((len(generated_ids) - 1, emit_thinking))
                         _emit_token(emit_text, emit_thinking, emit_id,
                                     chosen_logprob, top_alts,
@@ -1193,12 +1457,11 @@ def generate_steered(
         if on_token and pending_ids:
             state.emit_map.append((len(generated_ids) - 1, pending_thinking))
             _emit_token(
-                tokenizer.decode(pending_ids), pending_thinking, -1, None, None,
+                cast(str, tokenizer.decode(pending_ids)), pending_thinking, -1, None, None,
                 current_perplexity,
             )
 
     finally:
-        state.thinking_state = ThinkingState.DONE
         # Flush MPS command buffers before signalling completion — without
         # this, a rapid regenerate can submit new work while Metal is still
         # processing the previous generation's command buffers, triggering

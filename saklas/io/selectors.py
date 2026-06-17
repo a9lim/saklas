@@ -1,8 +1,8 @@
-"""Selector grammar used by pack and vector subcommands.
+"""Selector grammar used by manifold and subspace subcommands.
 
 Kinds:
     name      : single concept; optionally scoped by namespace (Selector.namespace)
-    tag       : concepts whose pack.json.tags contains this value
+    tag       : concepts whose manifold.json tags contain this value
     namespace : all concepts under this namespace
     model     : resource scope (restrict operation to tensors for this model)
     all       : everything
@@ -16,16 +16,16 @@ resulting :class:`Selector` instances down.
 """
 from __future__ import annotations
 
-import re as _re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 from saklas.core.errors import SaklasError
-from saklas.io.packs import NAME_REGEX, PackFormatError, PackMetadata
-from saklas.io.paths import vectors_dir
+from saklas.io.packs import NAME_REGEX
+from saklas.io.paths import VARIANT_SUFFIX_RE, manifold_dir, manifolds_dir
 
-_VARIANT_REGEX = _re.compile(r"^(raw|pca|sae(?:-[a-z0-9._-]+)?)$")
+# Single source of truth lives in ``io.paths`` (owns the variant scheme).
+_VARIANT_REGEX = VARIANT_SUFFIX_RE
 
 
 class SelectorError(ValueError, SaklasError):
@@ -57,10 +57,15 @@ class Selector:
 
 @dataclass
 class ResolvedConcept:
+    """An installed concept — a fitted/authored manifold (4.0).
+
+    ``folder`` is the manifold folder (``~/.saklas/manifolds/<ns>/<name>/``);
+    ``tags`` carries the manifold's category tags for ``tag:`` selectors.
+    """
     namespace: str
     name: str
     folder: Path
-    metadata: PackMetadata
+    tags: list[str]
 
 
 _VALID_PREFIXES = {"tag", "namespace", "model"}
@@ -103,34 +108,54 @@ def parse(raw: str) -> Selector:
 # on cache_ops to call `invalidate()` after any mutation.
 _concepts_cache: dict[Path, list[ResolvedConcept]] = {}
 
+# Module-level cache keyed by manifolds root path, mirroring _concepts_cache.
+# resolve_manifold_label() walks every installed manifold from disk on every
+# call; the steering grammar invokes it on plain bare slugs, so a compound
+# expression resolves it repeatedly. We cache the full all-namespace walk once
+# (the namespace=None form) and filter in-memory, exactly as resolve() does for
+# concepts. Cleared in invalidate() so manifold install/refresh/remove drops it.
+_manifold_labels_cache: dict[Path, list["ResolvedManifoldLabel"]] = {}
+
+# Companion index over manifold *names* (not node labels) for the
+# vector-composite read path: a 2-node ``pca`` manifold named ``happy.sad``
+# resolves by its bare name to node 0 (the ``orient_to=0`` + pole), the way a
+# steering vector's composite name resolved before 4.0. Memoized + cleared in
+# invalidate() like the label index.
+_manifold_names_cache: dict[Path, list["ResolvedManifoldName"]] = {}
+
 
 def invalidate() -> None:
-    """Drop the cached concept walk. Call after install/delete/refresh."""
+    """Drop cached concept + manifold-label walks. Call after install/delete/refresh."""
     _concepts_cache.clear()
+    _manifold_labels_cache.clear()
+    _manifold_names_cache.clear()
 
 
 def _all_concepts() -> list[ResolvedConcept]:
-    root = vectors_dir()
+    """Every installed concept — i.e. every installed manifold (4.0).
+
+    Concepts and steering manifolds are the same artifact now, so this walks
+    ``manifolds_dir()`` via :func:`~saklas.io.manifolds.iter_manifold_folders`
+    (which already skips malformed folders).  Memoized on the manifolds root and
+    cleared by :func:`invalidate`, exactly as the manifold-label index is.
+    """
+    root = manifolds_dir()
     cached = _concepts_cache.get(root)
     if cached is not None:
         return cached
-    if not root.is_dir():
-        _concepts_cache[root] = []
-        return _concepts_cache[root]
+    from saklas.io.manifolds import ManifoldFormatError, iter_manifold_folders
+
     out: list[ResolvedConcept] = []
-    for ns_dir in sorted(root.iterdir()):
-        if not ns_dir.is_dir():
-            continue
-        for cdir in sorted(ns_dir.iterdir()):
-            if not cdir.is_dir() or not (cdir / "pack.json").is_file():
-                continue
-            try:
-                meta = PackMetadata.load(cdir)
-            except PackFormatError:
-                continue
-            out.append(ResolvedConcept(
-                namespace=ns_dir.name, name=cdir.name, folder=cdir, metadata=meta,
-            ))
+    try:
+        folders = list(iter_manifold_folders())
+    except ManifoldFormatError:
+        _concepts_cache[root] = out
+        return out
+    for ns, mf in folders:
+        out.append(ResolvedConcept(
+            namespace=ns, name=mf.name, folder=manifold_dir(ns, mf.name),
+            tags=list(mf.tags or []),
+        ))
     _concepts_cache[root] = out
     return out
 
@@ -145,16 +170,24 @@ def resolve(selector: Selector) -> list[ResolvedConcept]:
         return [c for c in concepts if c.namespace == selector.value]
 
     if selector.kind == "tag":
-        return [c for c in concepts if selector.value in c.metadata.tags]
+        return [c for c in concepts if selector.value in c.tags]
 
     if selector.kind == "model":
-        # ``model:X`` matches any concept with an installed tensor for X,
+        # ``model:X`` matches any concept (manifold) with a fitted tensor for X,
         # regardless of variant — raw or SAE.
-        from saklas.io.packs import enumerate_variants
-        return [
-            c for c in concepts
-            if enumerate_variants(c.folder, selector.value)
-        ]
+        # parse() guarantees selector.value is non-None for kind="model".
+        assert selector.value is not None
+        from saklas.io.paths import parse_tensor_filename, safe_model_id
+        sid = safe_model_id(selector.value)
+
+        def _has_tensor(folder: Path) -> bool:
+            for p in folder.glob("*.safetensors"):
+                parsed = parse_tensor_filename(p.name)
+                if parsed is not None and parsed[0] == sid:
+                    return True
+            return False
+
+        return [c for c in concepts if _has_tensor(c.folder)]
 
     if selector.kind == "name":
         matches = [
@@ -176,41 +209,27 @@ def resolve(selector: Selector) -> list[ResolvedConcept]:
 def resolve_pole(
     raw: str, namespace: Optional[str] = None,
 ) -> tuple[str, int, Optional["ResolvedConcept"], str]:
-    """Resolve a user-typed concept reference to ``(canonical, sign, match, variant)``.
+    """Peel a ``:variant`` suffix and canonicalize a concept reference.
 
     Grammar: ``<name_part>[":"<variant>]`` where ``<variant>`` is ``raw``
     (the default when no suffix is present), ``sae`` (unique SAE variant),
-    or ``sae-<release>``. The name part feeds the existing pole-alias
-    pipeline; variant is passed through unchanged for callers to propagate
-    to autoload / registry-key selection.
+    ``sae-<release>``, ``role``, ``role-<id>``, or ``from``/``from-<src>``.
+    Returns ``(canonical, +1, None, variant)`` — the canonicalized slug, a
+    positive sign, no resolved match, and the parsed variant.
 
-    Alias resolution for bipolar packs: if the user types a single-pole
-    name that appears on either side of an installed bipolar concept,
-    return the full composite with a sign of +1 (positive pole) or -1
-    (negative pole). Callers multiply the user-supplied alpha by ``sign``
-    before storing it.
-
-    Examples (assuming ``default/angry.calm`` is installed):
-      ``resolve_pole("angry")`` -> ``("angry.calm", +1, <resolved>, "raw")``
-      ``resolve_pole("calm")``  -> ``("angry.calm", -1, <resolved>, "raw")``
-      ``resolve_pole("angry.calm")`` -> ``("angry.calm", +1, <resolved>, "raw")``
-      ``resolve_pole("angry:sae")``  -> ``("angry.calm", +1, <resolved>, "sae")``
-
-    Not-installed names fall through as fresh monopolar concepts with
-    sign +1 and ``match=None`` so the caller can still feed them into
-    the extraction pipeline.
+    4.0 note: bipolar-pole alias resolution (``wolf`` → ``deer.wolf @ -0.5``)
+    moved entirely to the **manifold** tier — a bipolar concept is a 2-node
+    ``pca`` manifold, so a bare pole resolves through
+    :func:`resolve_manifold_label` (the node) / :func:`resolve_manifold_name`
+    (the composite name) in :func:`resolve_bare_name`, which the steering
+    grammar consults *before* the plain-vector fall-through.  This function no
+    longer scans installed concepts (doing so would only collide with the
+    manifold node), so ``match`` is always ``None`` and ``sign`` always ``+1``.
 
     Raises:
         SelectorError: when the ``:variant`` suffix doesn't match
-            ``_VARIANT_REGEX`` (``raw`` | ``sae`` | ``sae-<release>``).
-        AmbiguousSelectorError: when multiple installed concepts match
-            the input under different canonical names (e.g. both
-            ``alice/angry`` and ``default/angry.calm`` exist and the
-            caller didn't supply a namespace). Also raised for
-            intra-namespace collisions like ``default/happy.sad`` +
-            ``default/happy.calm``.
+            ``_VARIANT_REGEX``.
     """
-    # Variant suffix strips first — pole alias logic is variant-agnostic.
     variant = "raw"
     if ":" in raw:
         name_part, maybe_variant = raw.rsplit(":", 1)
@@ -220,46 +239,203 @@ def resolve_pole(
         else:
             raise SelectorError(f"unknown variant '{maybe_variant}' in '{raw}'")
 
-    # Lazy import to avoid a cycle: session.py imports this module for
-    # the broadened extract() lookup.
-    from saklas.core.session import BIPOLAR_SEP, canonical_concept_name
+    # Lazy import to avoid a cycle: session.py imports this module.
+    from saklas.core.session import canonical_concept_name
 
     slug = canonical_concept_name(raw)
-    scope = [c for c in _all_concepts()
-             if namespace is None or c.namespace == namespace]
+    return slug, +1, None, variant
 
-    matches: list[tuple[str, int, ResolvedConcept]] = []
-    for c in scope:
-        if c.name == slug:
-            matches.append((c.name, +1, c))
-            continue
-        if BIPOLAR_SEP in c.name:
-            pos, neg = c.name.split(BIPOLAR_SEP, 1)
-            if pos == slug:
-                matches.append((c.name, +1, c))
-            elif neg == slug:
-                matches.append((c.name, -1, c))
 
+@dataclass(frozen=True)
+class ResolvedManifoldLabel:
+    """A unique match for :func:`resolve_manifold_label`.
+
+    Carries both the manifold's namespace-qualified name (the form a
+    grammar ``%`` term consumes) and the bare label so the synthesized
+    term reads naturally:  ``<manifold_key>%<label>``.
+    """
+
+    namespace: str
+    manifold_name: str
+    label: str
+
+    @property
+    def manifold_key(self) -> str:
+        """``<ns>/<name>`` — the form the grammar uses to reference the manifold."""
+        return f"{self.namespace}/{self.manifold_name}"
+
+
+def _all_manifold_labels() -> list[ResolvedManifoldLabel]:
+    """Flattened (namespace, manifold, label) index over every installed manifold.
+
+    Memoized on ``manifolds_dir()`` like :func:`_all_concepts`; callers filter
+    in-memory by namespace + label. We cache the all-namespace walk (rather than
+    keying the cache by namespace too) so a single entry serves every lookup,
+    matching how ``resolve()`` filters the cached concept walk — bare-name
+    resolution dominates and a namespace-scoped query just narrows the same list.
+    """
+    root = manifolds_dir()
+    cached = _manifold_labels_cache.get(root)
+    if cached is not None:
+        return cached
+    # Lazy import — selectors.py lives under io/ and shouldn't import
+    # at module-load time from a peer that may import it back.
+    from saklas.io.manifolds import ManifoldFormatError, iter_manifold_folders
+
+    out: list[ResolvedManifoldLabel] = []
+    try:
+        manifolds = list(iter_manifold_folders())
+    except ManifoldFormatError:
+        # A single malformed folder shouldn't poison the whole resolve;
+        # ``iter_manifold_folders`` already skips them, but defensive.
+        _manifold_labels_cache[root] = out
+        return out
+    for ns, mf in manifolds:
+        out.extend(
+            ResolvedManifoldLabel(namespace=ns, manifold_name=mf.name, label=label)
+            for label in mf.node_labels
+        )
+    _manifold_labels_cache[root] = out
+    return out
+
+
+def resolve_manifold_label(
+    label: str, *, namespace: Optional[str] = None,
+) -> Optional[ResolvedManifoldLabel]:
+    """Resolve a bare label to (namespace, manifold, label) — or ``None``.
+
+    Scans the memoized manifold-label index (every installed manifold, or
+    every manifold inside ``namespace`` when set) for one whose
+    ``node_labels`` contains ``label``.  Returns a
+    :class:`ResolvedManifoldLabel` on a single
+    match, ``None`` when nothing matches (the caller falls through to
+    other resolution tiers — e.g. a fresh concept), and raises
+    :class:`AmbiguousSelectorError` when multiple manifolds carry a
+    node by the same label.  This is the manifold analogue of
+    :func:`resolve_pole`'s bipolar-pole alias; together they let
+    ``persona`` (the manifold node) and ``angry`` (the bipolar pole)
+    resolve through the same bare-name surface.
+
+    The lookup is a folder scan, not a fitted-tensor check — labels
+    exist on the artifact regardless of whether the manifold has been
+    fitted for the loaded model.  A persona manifold authored on
+    disk but never fitted still surfaces here.
+    """
+    index = _all_manifold_labels()
+    matches = [
+        m for m in index
+        if m.label == label
+        and (namespace is None or m.namespace == namespace)
+    ]
     if not matches:
-        return slug, +1, None, variant
-
-    # Ambiguous if the matches don't collapse to a single (canonical, sign)
-    # or span multiple namespaces when none was specified — both raise the
-    # same error class as resolve() does for plain selectors.
-    canonicals = {(m[0], m[1]) for m in matches}
-    namespaces = {m[2].namespace for m in matches}
-    if len(canonicals) > 1 or (namespace is None and len(namespaces) > 1):
+        return None
+    if len(matches) > 1:
         qualified = ", ".join(
-            f"{m[2].namespace}/{m[0]}{' (negated)' if m[1] < 0 else ''}"
-            for m in matches
+            f"{m.manifold_key} (label '{m.label}')" for m in matches
         )
         raise AmbiguousSelectorError(
-            f"ambiguous pole '{raw}': matches {qualified}. "
-            f"Specify the full composite or a namespace."
+            f"ambiguous manifold label '{label}': matches {qualified}. "
+            f"Specify the manifold explicitly as <ns>/<name>%{label}."
         )
+    return matches[0]
 
-    c_name, c_sign, c_resolved = matches[0]
-    return c_name, c_sign, c_resolved, variant
+
+def resolve_bare_name(
+    raw: str, *, namespace: Optional[str] = None,
+) -> Optional[ResolvedManifoldLabel]:
+    """Resolve a bare name through the manifold-label tier.
+
+    Returns the :class:`ResolvedManifoldLabel` when an installed manifold
+    owns a node labeled ``raw``, else ``None``.  A bipolar concept *is* a
+    2-node ``pca`` manifold now, so the historical bipolar-pole tier
+    collapsed into the manifold tier: ``resolve_pole`` no longer resolves a
+    distinct artifact (it only canonicalizes / peels the ``:variant``
+    suffix), so there is no cross-tier pole/label collision left to
+    arbitrate here.  A cross-namespace manifold-label collision still raises
+    :class:`AmbiguousSelectorError` from :func:`resolve_manifold_label`.
+
+    The caller routes a hit downstream: a ``manifold_hit`` synthesizes a
+    ``<manifold>%<label>`` :class:`~saklas.core.steering_expr.ManifoldTerm`.
+    """
+    return resolve_manifold_label(raw, namespace=namespace)
+
+
+@dataclass(frozen=True)
+class ResolvedManifoldName:
+    """A unique match for :func:`resolve_manifold_name`.
+
+    A 2-node ``pca`` manifold reads as a steering vector: its bare *name*
+    (the composite ``happy.sad``) resolves to ``pole_label`` = node 0, the
+    ``orient_to=0`` (+) pole, so ``0.5 happy.sad`` steers toward ``happy``
+    exactly as the bipolar vector did pre-4.0.
+    """
+
+    namespace: str
+    manifold_name: str
+    pole_label: str
+
+    @property
+    def manifold_key(self) -> str:
+        """``<ns>/<name>`` — the form the grammar uses to reference the manifold."""
+        return f"{self.namespace}/{self.manifold_name}"
+
+
+def _all_manifold_names() -> list[ResolvedManifoldName]:
+    """Memoized index of 2-node ``pca`` manifolds keyed for name resolution.
+
+    Only a 2-node ``pca`` fit reads as a vector composite — its name maps to
+    node 0.  Multi-node / curved / authored manifolds are addressed by
+    ``<name>%<label>`` only and never surface here.  Memoized on
+    ``manifolds_dir()`` and cleared by :func:`invalidate`, mirroring
+    :func:`_all_manifold_labels`.
+    """
+    root = manifolds_dir()
+    cached = _manifold_names_cache.get(root)
+    if cached is not None:
+        return cached
+    from saklas.io.manifolds import ManifoldFormatError, iter_manifold_folders
+
+    out: list[ResolvedManifoldName] = []
+    try:
+        manifolds = list(iter_manifold_folders())
+    except ManifoldFormatError:
+        _manifold_names_cache[root] = out
+        return out
+    for ns, mf in manifolds:
+        if mf.fit_mode == "pca" and len(mf.node_labels) == 2:
+            out.append(ResolvedManifoldName(
+                namespace=ns, manifold_name=mf.name, pole_label=mf.node_labels[0],
+            ))
+    _manifold_names_cache[root] = out
+    return out
+
+
+def resolve_manifold_name(
+    name: str, *, namespace: Optional[str] = None,
+) -> Optional[ResolvedManifoldName]:
+    """Resolve a 2-node ``pca`` manifold *name* to its node-0 (+) pole.
+
+    The vector-composite read path: ``happy.sad`` (the manifold name, which
+    contains a ``.`` and so skips the bare-label tier) resolves to the
+    ``happy`` pole.  Returns ``None`` on a miss (the caller falls through to
+    other tiers), and raises :class:`AmbiguousSelectorError` when the same
+    name lives in two namespaces and none was specified.
+    """
+    index = _all_manifold_names()
+    matches = [
+        m for m in index
+        if m.manifold_name == name
+        and (namespace is None or m.namespace == namespace)
+    ]
+    if not matches:
+        return None
+    if len(matches) > 1:
+        qualified = ", ".join(m.manifold_key for m in matches)
+        raise AmbiguousSelectorError(
+            f"ambiguous manifold name '{name}': matches {qualified}. "
+            f"Specify the namespace as <ns>/{name}."
+        )
+    return matches[0]
 
 
 def parse_args(tokens: list[str]) -> tuple[Selector, Optional[str]]:

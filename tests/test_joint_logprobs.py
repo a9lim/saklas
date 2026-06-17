@@ -11,6 +11,8 @@ forward-pass + cache + reorient path without HF weights.
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 
 from saklas.core.joint_logprobs import (
@@ -278,7 +280,7 @@ class _MockTokenizer:
         ids = [self._intern(t) for t in toks]
         return {"input_ids": torch.tensor([ids], dtype=torch.long)}
 
-    def decode(self, ids):
+    def decode(self, ids: Any) -> str:
         if isinstance(ids, list):
             return " ".join(self._rev.get(int(i), "<unk>") for i in ids)
         return self._rev.get(int(ids), "<unk>")
@@ -301,7 +303,7 @@ class _MockModel:
     def parameters(self):
         yield self._param
 
-    def __call__(self, *, input_ids, use_cache=False):
+    def __call__(self, *, input_ids: torch.Tensor, use_cache: bool = False) -> Any:
         del use_cache  # ignored — mock is stateless
         T = input_ids.shape[-1]
         # Logits flat across vocab → log_softmax = -log(vocab).
@@ -365,7 +367,7 @@ class _MockSession:
 def test_compute_joint_logprobs_runs_end_to_end_on_mock():
     from saklas.core.joint_logprobs import compute_joint_logprobs
 
-    session = _MockSession()
+    session: Any = _MockSession()
     result = compute_joint_logprobs(session, "a1", "a2")
     assert result.a_id == "a1"
     assert result.b_id == "a2"
@@ -395,7 +397,7 @@ def test_compute_joint_logprobs_runs_end_to_end_on_mock():
 def test_compute_joint_logprobs_to_dict_round_trip():
     from saklas.core.joint_logprobs import compute_joint_logprobs
 
-    session = _MockSession()
+    session: Any = _MockSession()
     result = compute_joint_logprobs(session, "a1", "a2")
     payload = result.to_dict()
     assert payload["a_id"] == "a1" and payload["b_id"] == "a2"

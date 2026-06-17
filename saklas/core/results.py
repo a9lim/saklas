@@ -25,16 +25,135 @@ class TokenAlt:
 
 @dataclass
 class ProbeReadings:
-    """Probe monitor readings across a generation run."""
-    per_generation: list[float]
-    mean: float
-    std: float
-    min: float
-    max: float
-    delta_per_gen: float
+    """Probe monitor readings across a generation run, per coordinate axis.
+
+    Vectorized for the coordinate readout: a probe is a rank-``R`` flat
+    subspace (``R = 1`` for a 2-node concept axis), so each per-generation
+    sample is the aggregate coordinate ``tuple[float, ...]`` of length
+    ``R`` and the summary statistics are reported per axis.  ``mean`` /
+    ``std`` / ``min`` / ``max`` / ``delta_per_gen`` are each an
+    ``R``-tuple aligned with the coordinate axes; ``per_generation`` is
+    the list of per-run coordinate tuples.  A scalar consumer reads axis
+    0 (``mean[0]``).
+    """
+    per_generation: list[tuple[float, ...]]
+    mean: tuple[float, ...]
+    std: tuple[float, ...]
+    min: tuple[float, ...]
+    max: tuple[float, ...]
+    delta_per_gen: tuple[float, ...]
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+def _stat_tuple(value: Any) -> tuple[Any, ...]:
+    """Normalize current tuple stats and legacy scalar stats to one shape."""
+    if isinstance(value, tuple):
+        return value
+    if isinstance(value, list):
+        return tuple(value)
+    return (value,)
+
+
+@dataclass
+class ProbeReading:
+    """Subspace-probe reading for one attached fit (flat or curved).
+
+    The **single** unified readout: a live per-token reading (gate / stream)
+    and the end-of-generation aggregate are the same shape — the aggregate
+    is just this reading evaluated at the pooled last-content token.  Every
+    field is populated for both flat and curved fits (the old flat/curved
+    asymmetry — flat-no-nearest, curved-no-coords — is gone; both run the
+    full per-layer geometry each token):
+
+    * ``coords`` — EV-weighted whitened in-subspace coordinate in the fit's
+      domain frame (``M_R⁻¹ B Σ⁻¹ (h − mean)`` mapped through the affine
+      inverse for a flat fit, the ``invert_parameterization`` foot solve for
+      a curved fit), an ``R``-tuple for a rank-``R`` fit (a 1-tuple for a
+      2-node concept axis).  Neutral-anchored, pole-normalized at rank-1
+      (``1.0`` at the positive node).
+    * ``fraction`` — ``||P_M(h−mean)||_M / ||h−mean||_M`` EV-weighted across
+      layers, the share of the centered activation living in the subspace,
+      ∈ [0, 1].
+    * ``nearest`` — top-N node labels by EV-weighted whitened distance,
+      ascending (ranked by **raw** whitened distance — literally nearest).  The
+      reported distance is rescaled into the probe's **typical label-spacing**
+      units (divided by ``AttachedManifoldProbe.label_scale``, the median node
+      nearest-neighbor whitened distance), so an ``@label`` gate threshold is
+      portable across probes (raw whitened distance spans ~60× by fit); the scale
+      is a per-probe constant, so the ranking is unchanged.  The synthetic label
+      ``"neutral"`` competes here as the frame anchor (the per-model neutral
+      mean): it is never a stored node, only a candidate the readout ranks, so it
+      surfaces when the activation sits closer to the origin than to any node.
+      Suppressed when a manifold already carries a real node named ``neutral``.
+    * ``residual`` — EV-weighted normalized off-manifold residual
+      ``dist_L / ||c_L||``; identically ``0.0`` for a flat fit (the surface
+      fills its subspace), the off-surface distance for a curved fit.
+
+    The ``*_per_layer`` maps carry the un-EV-collapsed per-layer trace of
+    the same three geometric quantities (coords / fraction / residual).
+
+    **Fuzzy-manifold readout** (the soft, distributional view of ``nearest`` /
+    ``residual``):
+
+    * ``assignment`` — a soft node-assignment posterior: ``(label, prob)`` over
+      the candidate nodes (+ the neutral anchor), ``softmax(−d²_M / 2τ²)`` with a
+      per-node bandwidth ``τ`` (a curved fit's within-node σ-field mapped into the
+      whitened metric, a flat fit's local layout scale).  The *distributional*
+      counterpart to the argmax ``nearest`` — ships the shape instead of the
+      winner.  Top-N by probability, descending; sums to ≤ 1 (the reported
+      head of the full simplex).  Empty when no bandwidth is available.
+    * ``membership`` — graded tube-fit ∈ [0, 1]: ``exp(−residual² / 2σ²)`` at the
+      foot under the within-node thickness ``σ(z)``, EV-averaged.  Distinguishes
+      *off-surface* (a real residual relative to a thin tube) from
+      *on-surface-but-diffuse* — the density taper a hard ``residual`` threshold
+      can't express.  ``1.0`` for a flat fit (the surface fills its subspace) and
+      for a curved fit with no σ-field (no tube information).
+    """
+    fraction: float
+    nearest: list[tuple[str, float]]
+    coords: tuple[float, ...] = ()
+    residual: float = 0.0
+    fraction_per_layer: dict[int, float] = field(default_factory=dict)
+    coords_per_layer: dict[int, tuple[float, ...]] = field(default_factory=dict)
+    residual_per_layer: dict[int, float] = field(default_factory=dict)
+    assignment: list[tuple[str, float]] = field(default_factory=list)
+    membership: float = 1.0
+    # Per-layer reduced subspace coords in the **whitened** frame
+    # (``cdist_query = c @ chol``, the same metric ``node_white`` lives in) — the
+    # current hidden state's position for the probe-inspector geometry plot +
+    # fading trajectory trail.  Empty by default; populated only when the session
+    # sets ``Monitor.set_subspace_coords(True)`` (the ``persist_subspace_coords``
+    # generate flag, on while the dashboard inspector is open), so the default
+    # hot path neither computes nor serializes it.  Keyed by layer index → the
+    # layer's ``(R,)`` whitened coords (R = that layer's subspace rank).
+    subspace_coords_per_layer: dict[int, tuple[float, ...]] = field(
+        default_factory=dict,
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "fraction": self.fraction,
+            "nearest": [[label, dist] for label, dist in self.nearest],
+            "coords": list(self.coords),
+            "residual": self.residual,
+            "fraction_per_layer": {
+                str(k): float(v) for k, v in self.fraction_per_layer.items()
+            },
+            "coords_per_layer": {
+                str(k): list(v) for k, v in self.coords_per_layer.items()
+            },
+            "residual_per_layer": {
+                str(k): float(v) for k, v in self.residual_per_layer.items()
+            },
+            "assignment": [[label, prob] for label, prob in self.assignment],
+            "membership": self.membership,
+            "subspace_coords_per_layer": {
+                str(k): list(v)
+                for k, v in self.subspace_coords_per_layer.items()
+            },
+        }
 
 
 @dataclass
@@ -71,6 +190,13 @@ class GenerationResult:
     # deliberately omits this field — tensors don't serialize cleanly to
     # the JSON path; persist explicitly with ``torch.save`` if needed.
     hidden_states: dict[int, torch.Tensor] | None = None
+    # End-of-generation manifold-probe aggregates, populated by
+    # ``Monitor.score_aggregate`` when at least one probe is attached
+    # (the same :class:`ProbeReading` shape the live per-token stream
+    # carries, pooled at the last-content token).  Empty dict otherwise.
+    # Keyed by registered probe name; round-trips through ``to_dict`` as a
+    # nested mapping.
+    probe_readings: dict[str, "ProbeReading"] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -84,6 +210,9 @@ class GenerationResult:
             "prompt_tokens": self.prompt_tokens,
             "finish_reason": self.finish_reason,
             "applied_steering": self.applied_steering,
+            "probe_readings": {
+                k: v.to_dict() for k, v in self.probe_readings.items()
+            },
         }
 
 
@@ -182,15 +311,25 @@ class TokenEvent:
     # carry decoded text so consumers don't re-tokenize.
     top_alts: list[TokenAlt] | None = None
     finish_reason: str | None = None
-    # Per-probe cosine similarities computed inline against the latest
-    # captured hidden state. Populated by ``generate_stream`` only when
-    # the session has active probes; otherwise None.
-    scores: dict[str, float] | None = None
+    # Per-probe subspace readings computed inline against the latest
+    # captured hidden state — the full coordinate readout
+    # (:class:`ProbeReading`: coords + fraction + nearest + residual,
+    # plus per-layer traces) for every attached probe, flat or curved (a
+    # 2-node concept axis is the ``R = 1`` case; ``coords`` is a 1-tuple).
+    # Populated by ``generate_stream`` only when the session has active
+    # probes; otherwise None.
+    scores: dict[str, "ProbeReading"] | None = None
     # Perplexity of the configured sampler distribution after temperature,
     # top-k, and top-p renormalization — ``exp`` of Shannon entropy in nats.
     # Bounded above by sampler support size; a confident prediction
     # approaches 1. Consumers take ``log`` to recover entropy-nats.
     perplexity: float | None = None
+    # Per-token manifold-probe readings, populated by ``generate_stream``
+    # only when at least one probe is attached and ``live_scores`` is True;
+    # otherwise ``None``.  Same :class:`ProbeReading` shape as ``scores``
+    # (the geometric wire field; kept distinct for the deferred frontend
+    # rewire).  Keyed by registered probe name.
+    probe_readings: dict[str, "ProbeReading"] | None = None
 
 
 class ResultCollector:
@@ -211,11 +350,24 @@ class ResultCollector:
             "elapsed": result.elapsed,
         }
         for probe_name, readings in result.readings.items():
-            row[f"probe_{probe_name}_mean"] = readings.mean
-            row[f"probe_{probe_name}_std"] = readings.std
-            row[f"probe_{probe_name}_min"] = readings.min
-            row[f"probe_{probe_name}_max"] = readings.max
-            row[f"probe_{probe_name}_delta"] = readings.delta_per_gen
+            # Per-coordinate columns.  A rank-1 probe (every 2-node
+            # concept axis) keeps the bare ``probe_<name>_<stat>`` column
+            # so existing concept-roster exports are unchanged; a
+            # higher-rank probe suffixes the axis index.
+            stats = {
+                "mean": readings.mean,
+                "std": readings.std,
+                "min": readings.min,
+                "max": readings.max,
+                "delta": readings.delta_per_gen,
+            }
+            for stat_name, vec in stats.items():
+                vec = _stat_tuple(vec)
+                if len(vec) == 1:
+                    row[f"probe_{probe_name}_{stat_name}"] = vec[0]
+                else:
+                    for k, val in enumerate(vec):
+                        row[f"probe_{probe_name}_{stat_name}_{k}"] = val
         for vec_name, alpha in result.vectors.items():
             row[f"vector_{vec_name}_alpha"] = alpha
         row.update(tags)
@@ -223,8 +375,7 @@ class ResultCollector:
 
     def to_jsonl(self, path: str) -> None:
         with open(path, "w") as f:
-            for row in self._rows:
-                f.write(json.dumps(row) + "\n")
+            f.writelines(json.dumps(row) + "\n" for row in self._rows)
 
     def to_csv(self, path: str) -> None:
         if not self._rows:
@@ -238,9 +389,9 @@ class ResultCollector:
     def to_dataframe(self) -> Any:
         try:
             import pandas as pd
-        except ImportError:
+        except ImportError as e:
             raise ImportError(
                 "pandas is required for to_dataframe(). "
                 "Install with: pip install saklas[research]"
-            )
+            ) from e
         return pd.DataFrame(self._rows)

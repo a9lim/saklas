@@ -53,12 +53,12 @@ def _make_result(
         elapsed=0.06,
         readings={
             "honest": ProbeReadings(
-                per_generation=[probe_mean - 0.05, probe_mean, probe_mean + 0.05],
-                mean=probe_mean,
-                std=0.05,
-                min=probe_mean - 0.05,
-                max=probe_mean + 0.05,
-                delta_per_gen=0.0,
+                per_generation=[(probe_mean - 0.05,), (probe_mean,), (probe_mean + 0.05,)],
+                mean=(probe_mean,),
+                std=(0.05,),
+                min=(probe_mean - 0.05,),
+                max=(probe_mean + 0.05,),
+                delta_per_gen=(0.0,),
             ),
         },
         vectors={"honest.deceptive": alpha},
@@ -119,12 +119,12 @@ class TestToDataFrame:
 
     def test_unsupported_source_raises(self) -> None:
         with pytest.raises(TypeError, match="unsupported source type"):
-            to_dataframe("not a collector")  # type: ignore[arg-type]
+            to_dataframe("not a collector")  # pyright: ignore[reportArgumentType]  # str is not a DataFrameSource — intentional bad-type test
 
     def test_mixed_list_raises(self) -> None:
         results = [_make_result(), {"text": "raw dict"}]
         with pytest.raises(TypeError, match="mixed types"):
-            to_dataframe(results)  # type: ignore[arg-type]
+            to_dataframe(results)  # mixed list[GenerationResult | dict] is a valid DataFrameSource at runtime
 
 
 # ---------------------------------------------------------------------------
@@ -141,7 +141,7 @@ class TestPlotAlphaSweep:
         fig = plot_alpha_sweep(rc)
 
         # One probe + tok_per_sec metric → 2 traces
-        names = [t.name for t in fig.data]
+        names = [t.name for t in fig.data]  # pyright: ignore[reportAttributeAccessIssue]
         assert "honest" in names
         assert "tok_per_sec" in names
         # Dual-axis configured
@@ -212,7 +212,7 @@ class TestPlotProbeCorrelation:
         }
         fig = plot_probe_correlation(profiles)
         # Heatmap z-matrix: diagonal entries should be 1.0.
-        z = fig.data[0].z
+        z = fig.data[0].z  # pyright: ignore[reportAttributeAccessIssue]
         assert z[0][0] == pytest.approx(1.0)
         assert z[1][1] == pytest.approx(1.0)
 
@@ -223,16 +223,19 @@ class TestPlotProbeCorrelation:
             "gamma": _make_profile({0: [1.0, 1.0]}),
         }
         fig = plot_probe_correlation(profiles)
-        assert list(fig.data[0].x) == ["alpha", "beta", "gamma"]
-        assert list(fig.data[0].y) == ["alpha", "beta", "gamma"]
+        assert list(fig.data[0].x) == ["alpha", "beta", "gamma"]  # pyright: ignore[reportAttributeAccessIssue]
+        assert list(fig.data[0].y) == ["alpha", "beta", "gamma"]  # pyright: ignore[reportAttributeAccessIssue]
 
     def test_symmetric_off_diagonal(self) -> None:
+        from tests._whitener import isotropic_whitener
         profiles = {
             "a": _make_profile({0: [1.0, 0.0]}),
             "b": _make_profile({0: [0.5, 0.5]}),
         }
-        fig = plot_probe_correlation(profiles)
-        z = fig.data[0].z
+        # Mahalanobis-only: pass a covering whitener so off-diagonals are real
+        # (Mahalanobis cosine is symmetric, so the matrix stays symmetric).
+        fig = plot_probe_correlation(profiles, whitener=isotropic_whitener([0], 2))
+        z = fig.data[0].z  # pyright: ignore[reportAttributeAccessIssue]
         assert z[0][1] == pytest.approx(z[1][0])
 
     def test_empty_profiles_raises(self) -> None:
@@ -251,11 +254,11 @@ class TestPlotLayerNorms:
         fig = plot_layer_norms(profile)
 
         bar = fig.data[0]
-        assert list(bar.x) == ["L0", "L5", "L12"]
-        assert len(bar.y) == 3
+        assert list(bar.x) == ["L0", "L5", "L12"]  # pyright: ignore[reportAttributeAccessIssue]
+        assert len(bar.y) == 3  # pyright: ignore[reportAttributeAccessIssue]
         # Magnitudes computed correctly (values are unit-norm vectors).
-        assert bar.y[0] == pytest.approx(1.0)
-        assert bar.y[2] == pytest.approx(2.0**0.5)
+        assert bar.y[0] == pytest.approx(1.0)  # pyright: ignore[reportAttributeAccessIssue]
+        assert bar.y[2] == pytest.approx(2.0**0.5)  # pyright: ignore[reportAttributeAccessIssue]
 
     def test_empty_profile_constructor_rejects(self) -> None:
         # Profile itself rejects empty dicts; this confirms our plot
@@ -275,17 +278,17 @@ class TestPlotTraitHistory:
     def test_one_trace_per_probe(self) -> None:
         readings = {
             "honest": ProbeReadings(
-                per_generation=[0.1, 0.2, 0.3],
-                mean=0.2, std=0.1, min=0.1, max=0.3, delta_per_gen=0.1,
+                per_generation=[(0.1,), (0.2,), (0.3,)],
+                mean=(0.2,), std=(0.1,), min=(0.1,), max=(0.3,), delta_per_gen=(0.1,),
             ),
             "warm": ProbeReadings(
-                per_generation=[0.5, 0.4, 0.3],
-                mean=0.4, std=0.1, min=0.3, max=0.5, delta_per_gen=-0.1,
+                per_generation=[(0.5,), (0.4,), (0.3,)],
+                mean=(0.4,), std=(0.1,), min=(0.3,), max=(0.5,), delta_per_gen=(-0.1,),
             ),
         }
         fig = plot_trait_history(readings)
 
-        trace_names = [t.name for t in fig.data]
+        trace_names = [t.name for t in fig.data]  # pyright: ignore[reportAttributeAccessIssue]
         # show_mean=True adds a dashed mean trace per probe (showlegend=False
         # but still in fig.data); the user-facing legend names land first.
         assert "honest" in trace_names
@@ -294,12 +297,12 @@ class TestPlotTraitHistory:
     def test_show_mean_off_yields_one_trace_per_probe(self) -> None:
         readings = {
             "honest": ProbeReadings(
-                per_generation=[0.1, 0.2, 0.3],
-                mean=0.2, std=0.1, min=0.1, max=0.3, delta_per_gen=0.1,
+                per_generation=[(0.1,), (0.2,), (0.3,)],
+                mean=(0.2,), std=(0.1,), min=(0.1,), max=(0.3,), delta_per_gen=(0.1,),
             ),
         }
         fig = plot_trait_history(readings, show_mean=False)
-        assert len(fig.data) == 1
+        assert len(fig.data) == 1  # pyright: ignore[reportArgumentType]
 
     def test_empty_readings_raises(self) -> None:
         with pytest.raises(ValueError, match="empty"):

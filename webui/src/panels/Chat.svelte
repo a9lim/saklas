@@ -18,6 +18,7 @@
   import { SvelteMap } from "svelte/reactivity";
   import StatusFooter from "./StatusFooter.svelte";
   import PendingBubbles from "./PendingBubbles.svelte";
+  import RawBuffer from "./RawBuffer.svelte";
   import {
     autoRegenState,
     chatLog,
@@ -39,11 +40,9 @@
     navigateInputHistory,
     cancelInputPull,
     consumePulledSlot,
-    resetChatToRoot,
     rewindSession,
     sendPrefill,
     sendCommit,
-    loomRegenerateFromUser,
     enqueuePending,
     pendingActions,
     cancelPendingAction,
@@ -52,6 +51,11 @@
     toggleAutoRegen,
     setAutoRegenMode,
     setAutoRegenCustom,
+    effectiveRawMode,
+    genUiMode,
+    setGenUiMode,
+    roleDisplayLabel,
+    highlightScale,
   } from "../lib/stores.svelte";
   import type { AutoRegenMode } from "../lib/stores.svelte";
   import type { ChatTurn, TokenScore } from "../lib/types";
@@ -62,7 +66,10 @@
     formatScoreTooltip,
     surpriseScore,
     SURPRISE_TARGET,
+    probeScoreForTarget,
   } from "../lib/tokens";
+  import Select from "../lib/Select.svelte";
+  import Checkbox from "../lib/Checkbox.svelte";
 
   // --------------------------------------------------------------- input --
 
@@ -102,15 +109,26 @@
   // On an assistant / root node you write the next *user* message (the
   // normal chat flow).  On a *user* node the turn below it is the
   // assistant's — so the input composes the assistant reply instead:
-  //   empty + send → generate a fresh assistant child (re-roll / fan)
   //   text  + send → answer-prefill — seed the reply with that text
+  //   empty        → no-op (send button is grayed, mirroring an
+  //                  assistant node).  Re-rolling / fanning a user node
+  //                  lives on the loom sidebar's regenerate / fan-out
+  //                  menu and the dedicated regen button, not here.
+  // Raw (flat completion) mode — base models, or an explicit override.
+  // In raw mode the role-aware commit derivations short-circuit: there
+  // are no roles, so the input box never enters prefill / commit mode.
+  const rawMode = $derived.by(() => {
+    void genUiMode.mode;
+    return effectiveRawMode();
+  });
+
   const activeNodeId = $derived(
     loomTree.rev > 0 ? (loomTree.active_node_id ?? null) : null,
   );
   const activeNode = $derived(
     activeNodeId ? (loomTree.nodes.get(activeNodeId) ?? null) : null,
   );
-  const liveOnUserNode = $derived(activeNode?.role === "user");
+  const liveOnUserNode = $derived(!rawMode && activeNode?.role === "user");
   // Queue-aware role: a queued ``commit user`` lands a user node before
   // this submission gets to run, so the next message should already be
   // in prefill / commit-assistant mode.  Walks the queue tail-first;
@@ -118,6 +136,7 @@
   // changes the role.  ``pendingActions.queue.length`` is touched so
   // the derived re-runs on queue mutations.
   const onUserNode = $derived.by(() => {
+    if (rawMode) return false;
     void pendingActions.queue.length;
     const predicted = predictedQueueEndOnUserNode();
     return predicted === null ? liveOnUserNode : predicted;
@@ -160,7 +179,7 @@
   const sendLabel = $derived(
     commitMode
       ? (onUserNode ? "commit assistant" : "commit user")
-      : (onUserNode ? (input.trim() ? "prefill" : "generate") : "send"),
+      : (onUserNode ? "prefill" : "send"),
   );
 
   /** Shared commit dispatch — used by both Ctrl/Cmd/Option+Enter and a
@@ -168,7 +187,7 @@
    *  the action (including the empty-input no-op), so the caller knows
    *  not to fall through to the normal send/prefill path: the modifier
    *  explicitly means "don't generate," so an empty commit silently
-   *  consumes rather than degrading to a regenerate. */
+   *  consumes rather than falling through. */
   function tryCommit(): boolean {
     const text = input.trim();
     // Forward the pulled slot (if any) so a re-edited queued commit
@@ -236,12 +255,11 @@
       } else if (replaceSlot !== null) {
         // Empty prefill on a pulled slot cancels the queued item.
         cancelPendingAction(pendingActions.queue[replaceSlot]?.id ?? "");
-      } else if (activeNodeId) {
-        // Empty + not pulled + live user node → re-roll the assistant.
-        // We can't re-roll a not-yet-existing queued user node, so this
-        // branch is gated to live ids only.
-        void loomRegenerateFromUser(activeNodeId);
       }
+      // Empty + not pulled → no-op.  The send button is grayed in this
+      // state (mirroring an assistant node); re-rolling the assistant
+      // for a selected user node lives on the loom sidebar's regenerate /
+      // fan-out menu, so the input bar no longer doubles as a regen.
       scrolledUp = false;
       queueScrollToBottom();
       queueMicrotask(autosize);
@@ -365,19 +383,72 @@
    * the live probe-rack — same source the ProbeRack panel uses. */
   const probeNames = $derived([...probeRack.active]);
 
-  function onHighlightChange(ev: Event): void {
-    const value = (ev.currentTarget as HTMLSelectElement).value;
+  function onHighlightChange(value: string): void {
     setHighlightTarget(value === "" ? null : value);
   }
 
-  function onCompareChange(ev: Event): void {
-    const value = (ev.currentTarget as HTMLSelectElement).value;
+  function onCompareChange(value: string): void {
     setCompareTarget(value === "" ? null : value);
   }
 
   function onCompareToggle(): void {
     toggleCompareTwo();
   }
+
+  /** Highlight options for one probe.  A rank-1 flat probe (a 2-node concept
+   *  axis) and every curved probe stay a single bare-name option — the bare
+   *  channel is the pole coordinate / subspace fraction.  A multi-axis flat
+   *  probe (the ``personas`` fan, a flat ``emotions``) fans out into one
+   *  option per coordinate so a token can be tinted by each PC; axis 0 keeps
+   *  the bare-name value (the channel that survives reload) while axis ``i``
+   *  uses the ``name[i]`` form that lines up with the ``@when:name[i]`` gate. */
+  function axisOptionsFor(name: string): { value: string; label: string }[] {
+    const info = probeRack.entries.get(name)?.info;
+    const dim = info?.intrinsic_dim ?? 0;
+    const flat = info?.is_affine ?? true;
+    // Labels strip the namespace prefix (``default/emotions`` → ``emotions``)
+    // to match the probe cards; the option value keeps the full registered
+    // name so lookups stay unambiguous.
+    const display = name.split("/").pop() ?? name;
+    if (flat && dim > 1) {
+      return Array.from({ length: dim }, (_, i) => ({
+        value: i === 0 ? name : `${name}[${i}]`,
+        label: `${display}[${i}]`,
+      }));
+    }
+    return [{ value: name, label: display }];
+  }
+
+  /** Highlight-target picker options: "(off)" + surprise sentinel + live
+   *  probe names, fanned out per coordinate axis for multi-axis probes. */
+  const highlightOptions = $derived.by<{ value: string; label: string }[]>(
+    () => {
+      const opts: { value: string; label: string }[] = [
+        { value: "", label: "(off)" },
+        { value: SURPRISE_TARGET, label: "surprise (logprob)" },
+      ];
+      for (const name of probeNames) opts.push(...axisOptionsFor(name));
+      return opts;
+    },
+  );
+
+  /** Compare-target picker — same shape but filtered so the A and B targets
+   *  don't pick the same axis.  Distinct axes of one probe (PC0 vs PC1) are
+   *  allowed — that's a useful two-stripe compare. */
+  const compareOptions = $derived.by<{ value: string; label: string }[]>(() => {
+    const opts: { value: string; label: string }[] = [
+      { value: "", label: "(off)" },
+    ];
+    if (highlightState.target !== SURPRISE_TARGET) {
+      opts.push({ value: SURPRISE_TARGET, label: "surprise (logprob)" });
+    }
+    for (const name of probeNames) {
+      for (const opt of axisOptionsFor(name)) {
+        if (opt.value !== highlightState.target) opts.push(opt);
+      }
+    }
+    return opts;
+  });
 
   // -------------------------------------------------- conversation actions --
   //
@@ -409,24 +480,6 @@
   async function regen(input: string): Promise<void> {
     await rewindSession();
     void sendGenerate(input);
-  }
-
-  function clearChat(): void {
-    if (genStatus.active || pendingActions.queue.length > 0) {
-      enqueuePending({
-        label: "/clear",
-        text: null,
-        apply: () => void resetChatToRoot(),
-        awaitsGen: false,
-        rebuild: null,
-        // /clear navigates to the synthetic root (system role) — not a
-        // user node, so the next submission goes through "message" mode
-        // and lands a fresh user branch off root.
-        endsOnUserNode: false,
-      });
-    } else {
-      void resetChatToRoot();
-    }
   }
 
   function regenAction(): void {
@@ -461,10 +514,8 @@
   // fan-out used to sit here too — both were redundant (the loom right-
   // click menu carries "regenerate…" and "fan out…", and the experiment
   // lab is one click away in the analysis menu) so they were removed.
-  function onAutoRegenModeChange(ev: Event): void {
-    setAutoRegenMode(
-      (ev.currentTarget as HTMLSelectElement).value as AutoRegenMode,
-    );
+  function onAutoRegenModeChange(v: AutoRegenMode): void {
+    setAutoRegenMode(v);
   }
 
   // ------------------------------------------------------------- A/B split --
@@ -658,7 +709,10 @@
   function pickScore(t: TokenScore, target: string | null): number | undefined {
     if (!target) return undefined;
     if (target === SURPRISE_TARGET) return surpriseScore(t.logprob);
-    if (t.probes && target in t.probes) return t.probes[target];
+    // Probe / per-axis lookup: the live per-PC coords first, then the
+    // axis-0 ``probes`` row (the channel ``done`` + reload restore).
+    const direct = probeScoreForTarget(t, target);
+    if (direct !== undefined) return direct;
     const latest = latestLayerScores(t);
     if (latest && target in latest) return latest[target];
     return t.score;
@@ -675,13 +729,15 @@
     const a = highlightState.target;
     if (!a) return {};
     const aScore = pickScore(t, a);
+    const scaleA = highlightScale(a);
     if (highlightState.compareTwo && highlightState.compareTarget) {
       const bScore = pickScore(t, highlightState.compareTarget);
+      const scaleB = highlightScale(highlightState.compareTarget);
       return highlightState.smoothBlend
-        ? twoBlendStyle(aScore, bScore)
-        : twoStripeStyle(aScore, bScore);
+        ? twoBlendStyle(aScore, bScore, scaleA, scaleB)
+        : twoStripeStyle(aScore, bScore, scaleA, scaleB);
     }
-    const bg = scoreToRgb(aScore);
+    const bg = scoreToRgb(aScore, scaleA);
     return bg === "transparent" ? {} : { backgroundColor: bg };
   }
 
@@ -724,6 +780,17 @@
       : `${lp}, chosen not in top-${alts.length}`;
   }
 
+  /** A dedicated tooltip line for an axis highlight target (``personas[3]``)
+   *  whose value isn't already in the bare-name ``probes`` row.  Returns null
+   *  for axis 0 / a plain probe (already shown) or when no value is known. */
+  function axisTooltipLine(t: TokenScore, target: string | null): string | null {
+    if (!target || target === SURPRISE_TARGET) return null;
+    if (t.probes && target in t.probes) return null;
+    const v = probeScoreForTarget(t, target);
+    if (v === undefined) return null;
+    return `${target} ${v >= 0 ? "+" : ""}${v.toFixed(3)}`;
+  }
+
   function tooltipFor(t: TokenScore): string {
     // Logit-pass: surprise mode owns the tooltip when active so the
     // surprise number is what hovers on the inline tint.
@@ -742,7 +809,19 @@
       const sup = surpriseTooltip(t);
       return probeTip ? `${probeTip}\n${sup}` : sup;
     }
-    if (t.probes) return formatScoreTooltip(t.probes);
+    if (t.probes) {
+      // Lead with the selected axis target(s) so a per-PC tint reports its
+      // own value, then the full axis-0 probe row underneath.
+      const extra: string[] = [];
+      const la = axisTooltipLine(t, highlightState.target);
+      if (la) extra.push(la);
+      if (highlightState.compareTwo) {
+        const lb = axisTooltipLine(t, highlightState.compareTarget);
+        if (lb) extra.push(lb);
+      }
+      const base = formatScoreTooltip(t.probes);
+      return extra.length ? `${extra.join("\n")}\n${base}` : base;
+    }
     const latest = latestLayerScores(t);
     if (latest) return formatScoreTooltip(latest);
     if (t.score !== undefined && highlightState.target) {
@@ -804,104 +883,85 @@
   <header class="chat-header">
     <label class="ctl">
       <span class="ctl-label">highlight</span>
-      <select
-        class="ctl-select"
-        value={highlightState.target ?? ""}
-        onchange={onHighlightChange}
-        aria-label="Highlight probe"
-      >
-        <option value="">(off)</option>
-        <!-- Logit-pass: ``surprise`` tints tokens by ``-logprob /
-             (1 - logprob)`` per Decision 4.  Sentinel value sits next to
-             real probe names in the same picker so a single dropdown
-             covers both axes. -->
-        <option value={SURPRISE_TARGET}>surprise (logprob)</option>
-        {#each probeNames as name (name)}
-          <option value={name}>{name}</option>
-        {/each}
-      </select>
+      <!-- Logit-pass: ``surprise`` tints tokens by ``-logprob /
+           (1 - logprob)`` per Decision 4.  Sentinel value sits next to
+           real probe names in the same picker so a single dropdown
+           covers both axes. -->
+      <span class="ctl-select">
+        <Select
+          value={highlightState.target ?? ""}
+          options={highlightOptions}
+          onchange={onHighlightChange}
+          ariaLabel="Highlight probe"
+        />
+      </span>
     </label>
 
-    <label class="ctl ctl-inline">
-      <input
-        type="checkbox"
+    <span class="ctl ctl-inline">
+      <Checkbox
         checked={highlightState.compareTwo}
         onchange={onCompareToggle}
+        ariaLabel="compare-two"
       />
       <span class="ctl-label">compare-two</span>
-    </label>
+    </span>
 
     {#if highlightState.compareTwo}
       <label class="ctl">
         <span class="ctl-label">vs.</span>
-        <select
-          class="ctl-select"
-          value={highlightState.compareTarget ?? ""}
-          onchange={onCompareChange}
-          disabled={!highlightState.compareTwo}
-          aria-label="Compare probe"
-        >
-          <option value="">(off)</option>
-          <!-- Allow surprise as the B-stripe target too — "probe X vs.
-               surprise" is a useful axis ("does probe X light up at the
-               surprising tokens?"). -->
-          {#if highlightState.target !== SURPRISE_TARGET}
-            <option value={SURPRISE_TARGET}>surprise (logprob)</option>
-          {/if}
-          {#each probeNames as name (name)}
-            {#if name !== highlightState.target}
-              <option value={name}>{name}</option>
-            {/if}
-          {/each}
-        </select>
+        <!-- Allow surprise as the B-stripe target too — "probe X vs.
+             surprise" is a useful axis ("does probe X light up at the
+             surprising tokens?"). -->
+        <span class="ctl-select">
+          <Select
+            value={highlightState.compareTarget ?? ""}
+            options={compareOptions}
+            onchange={onCompareChange}
+            disabled={!highlightState.compareTwo}
+            ariaLabel="Compare probe"
+          />
+        </span>
       </label>
     {/if}
 
-    <!-- Conversation actions — clear / save / load / transcript / auto-
-         regen sit inline at the end of the header so they're one click
-         away. -->
+    <!-- Render-mode badge — raw/chat toggle.  The mode is seeded from
+         the model (base → raw, chat → chat) the first time it is seen,
+         then it's a plain two-state toggle; the same control also sits
+         in the advanced sampling drawer. -->
+    <button
+      type="button"
+      class="mode-badge"
+      class:raw={rawMode}
+      onclick={() => setGenUiMode(rawMode ? "chat" : "raw")}
+      title={"render mode: " + genUiMode.mode + " — click to toggle"}
+    >
+      {genUiMode.mode}
+    </button>
+
+    <!-- Conversation actions — transcript + auto-regen.  Clear / save /
+         load moved up to the threads-column header (they act on the
+         whole tree, not on the active chat path). -->
     <div class="header-actions">
-      <button type="button" class="hbtn" onclick={clearChat}>
-        clear chat
-      </button>
-      <button
-        type="button"
-        class="hbtn"
-        onclick={() => openDrawer("save_conversation")}
-        title="Save this conversation tree to disk"
-      >
-        save conversation…
-      </button>
-      <button
-        type="button"
-        class="hbtn"
-        onclick={() => openDrawer("load_conversation")}
-        title="Load a saved conversation tree"
-      >
-        load conversation…
-      </button>
       <button type="button" class="hbtn" onclick={openTranscript}>
-        transcript…
+        transcript
       </button>
-      <label class="ctl ctl-inline">
-        <input
-          type="checkbox"
+      <span class="ctl ctl-inline">
+        <Checkbox
           checked={autoRegenState.enabled}
           onchange={toggleAutoRegen}
+          ariaLabel="auto-regen"
         />
         <span class="ctl-label">auto-regen</span>
-      </label>
+      </span>
       {#if autoRegenState.enabled}
-        <select
-          class="ctl-select"
-          value={autoRegenState.mode}
-          onchange={onAutoRegenModeChange}
-          aria-label="Auto-regen mode"
-        >
-          {#each AUTO_REGEN_MODES as opt (opt.value)}
-            <option value={opt.value}>{opt.label}</option>
-          {/each}
-        </select>
+        <span class="ctl-select">
+          <Select
+            value={autoRegenState.mode}
+            options={AUTO_REGEN_MODES}
+            onchange={onAutoRegenModeChange}
+            ariaLabel="Auto-regen mode"
+          />
+        </span>
         {#if autoRegenState.mode === "custom"}
           <input
             type="text"
@@ -919,6 +979,9 @@
     </div>
   </header>
 
+  {#if rawMode}
+    <RawBuffer />
+  {:else}
   <div
     class="log"
     class:ab={twoColumns}
@@ -961,7 +1024,7 @@
                 {@render bubble(turn.abPair, turnIdx, true)}
               {:else}
                 <div class="msg assistant placeholder" aria-hidden="true">
-                  <span class="role">assistant (alt)</span>
+                  <span class="role">{roleDisplayLabel("assistant")} (alt)</span>
                   <span class="placeholder-text">— pending —</span>
                 </div>
               {/if}
@@ -995,9 +1058,9 @@
       <button
         type="submit"
         class="send"
-        disabled={!input.trim() && (commitMode || !onUserNode)}
+        disabled={!input.trim()}
         title={onUserNode
-          ? "⏎ prefill reply (empty = generate fresh) · ⌃-click commit assistant · ⇧⏎ newline"
+          ? "⏎ prefill reply · ⌃-click commit assistant · ⇧⏎ newline"
           : "⏎ send · ⌃-click commit user · ⇧⏎ newline"}
       >{sendLabel}</button>
       <button
@@ -1016,6 +1079,7 @@
       >regen</button>
     </div>
   </form>
+  {/if}
 </div>
 
 {#snippet bubble(turn: ChatTurn, turnIdx: number, isShadow: boolean)}
@@ -1024,7 +1088,7 @@
     class:shadow={isShadow}
   >
     <span class="role">
-      {#if turn.role === "user"}user{:else if turn.role === "system"}system{:else}assistant{#if isShadow} (unsteered){/if}{/if}
+      {roleDisplayLabel(turn.role, turn.roleLabel)}{#if isShadow && !pinnedActive} (unsteered){/if}
     </span>
 
     {#if turn.role === "assistant"}
@@ -1129,25 +1193,38 @@
     cursor: pointer;
     user-select: none;
   }
-  .ctl-inline input {
-    accent-color: var(--accent);
-  }
   .ctl-label {
     color: var(--fg-muted);
     text-transform: lowercase;
     letter-spacing: 0;
   }
+  /* Layout host for the themed Select — Select owns its own theme. */
   .ctl-select {
-    background: var(--bg-alt);
-    color: var(--fg-strong);
+    display: inline-flex;
+    min-width: 9em;
+  }
+
+  /* Render-mode badge — compact raw/chat pill.  Sits between the
+   * highlight controls and the conversation actions. */
+  .mode-badge {
+    background: var(--accent-subtle);
+    color: var(--accent);
     border: 1px solid var(--border);
+    border-radius: var(--radius);
     padding: var(--space-1) var(--space-3);
     font: inherit;
     font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    text-transform: lowercase;
+    cursor: pointer;
+    transition: background var(--dur) var(--ease-out);
   }
-  .ctl-select:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
+  .mode-badge:hover {
+    background: var(--accent-glow);
+  }
+  .mode-badge.raw {
+    background: rgba(167, 139, 250, 0.12);
+    color: var(--accent-purple);
   }
 
   /* Conversation-actions strip — inline, pushed to the right edge of

@@ -19,7 +19,6 @@ from saklas.core.errors import (
     SaeModelMismatchError,
     SaeReleaseNotFoundError,
     SaklasError,
-    StaleSidecarError,
     UnknownVariantError,
 )
 from saklas.core.profile import ProfileError
@@ -28,12 +27,7 @@ from saklas.core.session import (
     VectorNotRegisteredError,
 )
 from saklas.core.steering_expr import SteeringExprError
-from saklas.io.cache_ops import InstallConflict, RefreshError
-from saklas.io.cloning import (
-    CorpusTooLongError,
-    CorpusTooShortError,
-    InsufficientPairsError,
-)
+from saklas.io.hf_manifolds import ManifoldInstallConflict
 from saklas.io.gguf_io import GGUFNotInstalled
 from saklas.io.hf import HFError
 from saklas.io.merge import MergeError
@@ -61,7 +55,6 @@ _OVERRIDES: list[tuple[type[SaklasError], int]] = [
     (SaeCoverageError, 400),
     (AmbiguousVariantError, 400),
     (UnknownVariantError, 404),
-    (StaleSidecarError, 409),
     # core/session.py
     (ConcurrentGenerationError, 409),
     (VectorNotRegisteredError, 404),
@@ -78,13 +71,8 @@ _OVERRIDES: list[tuple[type[SaklasError], int]] = [
     (PackFormatError, 400),
     # io/hf.py
     (HFError, 502),
-    # io/cache_ops.py
-    (InstallConflict, 409),
-    (RefreshError, 500),
-    # io/cloning.py
-    (CorpusTooShortError, 400),
-    (CorpusTooLongError, 400),
-    (InsufficientPairsError, 422),
+    # io/hf_manifolds.py
+    (ManifoldInstallConflict, 409),
     # io/gguf_io.py
     (GGUFNotInstalled, 400),
     # io/merge.py
@@ -198,7 +186,7 @@ def test_server_routes_user_message_status_codes():
         (ConcurrentGenerationError("busy"), 409),
         (AmbiguousSelectorError("'x' matches a/x and b/x"), 400),
         (HFError("network down"), 502),
-        (InstallConflict("already exists"), 409),
+        (ManifoldInstallConflict("already exists"), 409),
         (PackFormatError("malformed"), 400),
     ]
 

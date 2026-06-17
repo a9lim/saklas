@@ -8,8 +8,7 @@ CPU-only, no model load — alignment math runs over synthetic
 activation tensors.
 """
 from __future__ import annotations
-
-import json
+from pathlib import Path
 
 import pytest
 import torch
@@ -116,9 +115,21 @@ class TestFitAlignment:
 
 
 class TestTransferProfile:
+    # Transfer is Mahalanobis-only (4.0 collapse): the target-metric share
+    # re-bake is mandatory, so every transfer needs a target whitener covering
+    # the transferred layers (there is no Euclidean transfer).
+    @staticmethod
+    def _whitener(dim: int, layers: list[int]) -> object:
+        from saklas.core.mahalanobis import LayerWhitener
+        g = torch.Generator().manual_seed(7)
+        acts = {L: torch.randn(120, dim, generator=g) for L in layers}
+        means = {L: torch.zeros(dim) for L in layers}
+        return LayerWhitener.from_neutral_activations(acts, means)
+
     def test_applies_per_layer_map_and_records_provenance(self) -> None:
         torch.manual_seed(0)
-        # Identity alignment — transferred values should equal source.
+        # Identity alignment — direction preserved (magnitude re-baked to the
+        # target Mahalanobis norm).
         D = 4
         eye = torch.eye(D)
         M = {0: eye, 2: eye, 5: eye}
@@ -134,16 +145,22 @@ class TestTransferProfile:
             src_profile, M,
             source_model_id="google/gemma-3-4b-it",
             transfer_quality_estimate=0.85,
+            whitener=self._whitener(D, [0, 2, 5]),
         )
 
         assert transferred.layers == [0, 2, 5]
+        # Identity alignment ⇒ direction preserved (only magnitude re-baked).
         for layer in transferred.layers:
-            assert torch.allclose(transferred[layer], src_profile[layer], atol=1e-5)
+            sv = src_profile[layer].float()
+            tv = transferred[layer].float()
+            cos = torch.dot(sv / sv.norm(), tv / tv.norm())
+            assert abs(float(cos)) == pytest.approx(1.0, abs=1e-5)
 
-        # Provenance survives the wrap.
+        # Provenance survives the wrap; the re-bake is Mahalanobis.
         assert transferred.metadata["method"] == "procrustes_transfer"
         assert transferred.metadata["source_model_id"] == "google/gemma-3-4b-it"
         assert transferred.metadata["transfer_quality_estimate"] == pytest.approx(0.85)
+        assert transferred.metadata["bake"] == "mahalanobis"
 
     def test_drops_uncovered_layers(self) -> None:
         D = 4
@@ -152,8 +169,11 @@ class TestTransferProfile:
             {0: torch.ones(D), 2: torch.ones(D), 5: torch.ones(D)},
             metadata={"method": "contrastive_pca"},
         )
+        # The whitener covers the transferred (alignment-covered) layers {0, 5};
+        # layer 2 is dropped by the alignment before the whitener gate.
         transferred = transfer_profile(
             src_profile, M, source_model_id="src/model",
+            whitener=self._whitener(D, [0, 5]),
         )
         assert transferred.layers == [0, 5]
 
@@ -213,7 +233,7 @@ class TestAlignmentQuality:
 
 
 class TestAlignmentCache:
-    def test_cache_path_layout(self, tmp_path, monkeypatch) -> None:
+    def test_cache_path_layout(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
         ts, sc = alignment_cache_path("google/gemma-3-4b-it", "Qwen/Qwen2.5-7B-Instruct")
         # Layout: under the *target* model's dir.
@@ -223,7 +243,7 @@ class TestAlignmentCache:
         assert ts.suffix == ".safetensors"
         assert sc.suffix == ".json"
 
-    def test_save_load_round_trip(self, tmp_path, monkeypatch) -> None:
+    def test_save_load_round_trip(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
         D = 4
         M = {0: torch.eye(D), 5: torch.eye(D)}
@@ -245,38 +265,16 @@ class TestAlignmentCache:
         assert "0" in sidecar["quality_per_layer"]
         assert sidecar["quality_per_layer"]["0"] == pytest.approx(0.85)
 
-    def test_load_missing_returns_none(self, tmp_path, monkeypatch) -> None:
+    def test_load_missing_returns_none(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
         assert load_alignment_map("nope/src", "nope/tgt") is None
 
 
 # ---------------------------------------------------------------------------
-# Sidecar transfer fields round-trip through packs.Sidecar.
+# NOTE: ``TestSidecarTransferFields::test_round_trip`` was deleted in 4.0 —
+# ``saklas.io.packs.Sidecar`` (the ``vectors/`` per-tensor sidecar carrying the
+# ``source_model_id`` / ``alignment_map_hash`` / ``transfer_quality_estimate``
+# transfer fields) was removed.  Cross-model transfer is a manifold operation
+# now (``transfer_manifold`` writes a ``_from-<safe_src>`` ``ManifoldSidecar``);
+# its round-trip is covered by the manifold transfer tests.
 # ---------------------------------------------------------------------------
-
-
-class TestSidecarTransferFields:
-    def test_round_trip(self, tmp_path) -> None:
-        from saklas.io.packs import Sidecar
-
-        sc = Sidecar(
-            method="procrustes_transfer",
-            saklas_version="1.6.0",
-            source_model_id="google/gemma-3-4b-it",
-            alignment_map_hash="deadbeef",
-            transfer_quality_estimate=0.78,
-        )
-        path = tmp_path / "sidecar.json"
-        sc.write(path)
-
-        with open(path) as f:
-            raw = json.load(f)
-        assert raw["source_model_id"] == "google/gemma-3-4b-it"
-        assert raw["alignment_map_hash"] == "deadbeef"
-        assert raw["transfer_quality_estimate"] == pytest.approx(0.78)
-
-        loaded = Sidecar.load(path)
-        assert loaded.method == "procrustes_transfer"
-        assert loaded.source_model_id == "google/gemma-3-4b-it"
-        assert loaded.alignment_map_hash == "deadbeef"
-        assert loaded.transfer_quality_estimate == pytest.approx(0.78)

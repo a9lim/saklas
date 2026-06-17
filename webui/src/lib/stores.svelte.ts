@@ -7,7 +7,7 @@
 // Cross-cutting actions (open the WS, send a generate, queue a pending
 // rack edit during in-flight gen) live in this file as functions so panels
 // don't need to coordinate amongst themselves; they call ``sendGenerate(...)``
-// or ``setVectorAlpha(name, alpha)`` and the slice updates propagate.
+// or ``setSubspaceAlong(value)`` and the slice updates propagate.
 //
 // One singleton WS owned at the module level — the chat panel is no
 // longer responsible for lifecycle.  Subscribers register via
@@ -19,7 +19,7 @@ import {
   apiSessions,
   apiVectors,
   apiProbes,
-  apiPacks,
+  apiManifolds,
   apiTree,
   ApiError,
   connectWs,
@@ -28,6 +28,7 @@ import type {
   CorrelationData,
   LoomNodeJSON,
   LoomTreeJSON,
+  ManifoldInfo,
   SessionInfo,
   VectorInfo,
   WSClientMessage,
@@ -36,19 +37,26 @@ import type {
 import type {
   ChatTurn,
   GenStatus,
-  LocalPackInfo,
+  ManifoldSteerEntry,
   PendingAction,
+  ProbeInfo,
+  ProbeReadingJSON,
   ProbeRackEntry,
   ProbeSortMode,
-  ProjectionSpec,
+  SteerEntry,
+  SubspaceSteerEntry,
   TokenScore,
   Trigger,
   Variant,
-  VectorRackEntry,
   WSSampling,
 } from "./types";
 import { serializeExpression } from "./expression";
-import { SURPRISE_TARGET } from "./tokens";
+import {
+  SURPRISE_TARGET,
+  HIGHLIGHT_SAT,
+  nodeCoordExtent,
+  parseProbeTarget,
+} from "./tokens";
 import { pushToast } from "./stores/toasts.svelte";
 
 export * from "./stores/drawers.svelte";
@@ -89,6 +97,13 @@ export async function refreshSession(): Promise<void> {
   }
 }
 
+/** One-shot guard: the role boxes are client-sticky (they ride each send),
+ *  unlike the numeric sampling defaults which mirror server config on every
+ *  patch.  We seed them from the family's standard role labels exactly once,
+ *  on the first session-info load — re-seeding on later patches would clobber
+ *  a value the user typed. */
+let _roleDefaultsSeeded = false;
+
 /** Mirror the server's session.config defaults into the local
  * ``samplingState``.  The local store was previously pre-seeded with its
  * own constants (``max_tokens: 256`` etc.) which drifted away from the
@@ -97,7 +112,20 @@ export async function refreshSession(): Promise<void> {
  * was running against a 1024-token cap.  Sync once on every refresh so
  * the displayed cap matches what generation actually used. */
 function _hydrateSamplingFromInfo(): void {
-  const cfg = sessionState.info?.config;
+  const info = sessionState.info;
+  // Seed the sticky role boxes once, so they show e.g. ``user`` / ``model``
+  // instead of an empty ``—`` placeholder.  Only fills an empty box, so a
+  // value already in hand (typed before info landed) is never overwritten.
+  if (!_roleDefaultsSeeded && info) {
+    _roleDefaultsSeeded = true;
+    if (samplingState.user_role === "" && info.default_user_role) {
+      samplingState.user_role = info.default_user_role;
+    }
+    if (samplingState.assistant_role === "" && info.default_assistant_role) {
+      samplingState.assistant_role = info.default_assistant_role;
+    }
+  }
+  const cfg = info?.config;
   if (!cfg) return;
   if (typeof cfg.max_tokens === "number" && Number.isFinite(cfg.max_tokens)) {
     samplingState.max_tokens = cfg.max_tokens;
@@ -132,6 +160,28 @@ export async function patchSessionDefaults(
   _hydrateSamplingFromInfo();
 }
 
+/** Display label for a turn, honoring its per-message role-substitution
+ *  label (the roleplay scaffold stamped at send time).  ``roleLabel`` —
+ *  the node's ``role_label`` — wins when set; otherwise the structural
+ *  ``role`` (user / assistant / system) is shown verbatim. */
+export function roleDisplayLabel(
+  role: string,
+  roleLabel?: string | null,
+): string {
+  return roleLabel || role;
+}
+
+/** Single-character glyph for the loom node badge — first char of the
+ *  display label, uppercased.  Default roles reduce to ``U`` / ``A`` / ``S``;
+ *  a per-turn ``captain`` label yields ``C``. */
+export function roleGlyphLetter(
+  role: string,
+  roleLabel?: string | null,
+): string {
+  const label = roleDisplayLabel(role, roleLabel);
+  return (label.charAt(0) || role.charAt(0) || "?").toUpperCase();
+}
+
 /** "Clear chat" — preserves the loom tree and just navigates back to the
  *  synthetic system root.  The next submission lands a fresh user turn
  *  as a sibling branch off root rather than the legacy behaviour of
@@ -158,6 +208,28 @@ export async function resetChatToRoot(): Promise<void> {
   }
 }
 
+/** Clear the chat back to root.  Lifted out of Chat.svelte so the
+ *  threads-column action button can call the same code path the chat
+ *  header used to — queue-aware when generation is in flight, direct
+ *  when idle. */
+export function clearChat(): void {
+  if (genStatus.active || pendingActions.queue.length > 0) {
+    enqueuePending({
+      label: "/clear",
+      text: null,
+      apply: () => void resetChatToRoot(),
+      awaitsGen: false,
+      rebuild: null,
+      // /clear navigates to the synthetic root (system role) — not a
+      // user node, so the next submission goes through "message" mode
+      // and lands a fresh user branch off root.
+      endsOnUserNode: false,
+    });
+  } else {
+    void resetChatToRoot();
+  }
+}
+
 export async function rewindSession(): Promise<void> {
   await apiSessions.rewind();
   await refreshSession();
@@ -172,18 +244,46 @@ export async function rewindSession(): Promise<void> {
   }
 }
 
-// =========================================================== vectors ====
+// =========================================================== steering ===
+//
+// One unified steer rack.  A steering vector is the K=2 flat case of a
+// manifold, so every term is a position on a fitted geometry — one
+// ``entries`` map of tagged ``SteerEntry`` (``mode: "subspace" | "manifold"``),
+// one card, and one serializer.  Subspace (flat) terms share the rack-level
+// ``subspaceAlong`` master (the merged affine subspace slides once); manifold
+// (curved) terms keep their per-card along/onto.  The sidecars live here too:
+// ``profiles`` + ``correlation`` (vector metadata) and ``catalog`` +
+// ``unavailable`` / ``loading`` / ``error`` (the manifold HTTP surface).
 
-export interface VectorRack {
-  /** Rack key = atom display form (``honest``, ``ns/foo``, ``happy.sad``).
-   * One entry per concept.  Variant lives on the entry, not the key —
-   * matching the saklas parser's Steering.alphas semantics. */
-  entries: Map<string, VectorRackEntry>;
+/** Default shared subspace-along master — the ~0.5 coherent sweet spot
+ *  (matches the engine's ``_MANIFOLD_ALONG_GAIN`` calibration so a freshly
+ *  racked concept at its pole lands at a usable strength). */
+const DEFAULT_SUBSPACE_ALONG = 0.5;
+
+export interface SteerRack {
+  /** Rack key = atom display form (``honest``, ``ns/foo``, ``happy.sad``,
+   *  ``personas``).  One entry per name; ``mode`` discriminates subspace
+   *  (flat) vs manifold (curved).  Variant lives on the entry, not the key —
+   *  matching the saklas parser's Steering.alphas semantics. */
+  entries: Map<string, SteerEntry>;
+  /** Shared "subspace along" master — the single slide magnitude every
+   *  subspace (flat) term serializes with (the merged affine subspace has one
+   *  slide).  Unclamped (a high-share layer is meant to overshoot; the engine
+   *  bounds it via ``norm_cap``).  Defaults to the ~0.5 coherent sweet spot. */
+  subspaceAlong: number;
   /** Per-vector profile metadata fetched from GET /vectors/{name}.
    * Populated lazily; absent until the user opens a strip's expander. */
   profiles: Map<string, VectorInfo>;
   /** Cosine matrix from GET /correlation; refreshed after each generation. */
   correlation: CorrelationData | null;
+  /** Server-side catalog of available manifolds — refreshed by
+   *  ``refreshManifoldList``.  Empty (and ``unavailable`` true) on servers
+   *  that pre-date the manifold HTTP surface. */
+  catalog: ManifoldInfo[];
+  /** True when the manifold list route 404s — older server. */
+  unavailable: boolean;
+  loading: boolean;
+  error: string | null;
 }
 
 // SvelteMap from svelte/reactivity — plain Map mutations don't trigger
@@ -191,10 +291,15 @@ export interface VectorRack {
 // update wouldn't re-render the strips list.  SvelteMap.set/.delete is
 // rune-tracked.  Inner-object property writes still aren't tracked, so
 // callers that mutate an entry must reassign via .set(name, {...e, …}).
-export const vectorRack: VectorRack = $state({
+export const steerRack: SteerRack = $state({
   entries: new SvelteMap(),
+  subspaceAlong: DEFAULT_SUBSPACE_ALONG,
   profiles: new SvelteMap(),
   correlation: null,
+  catalog: [],
+  unavailable: false,
+  loading: false,
+  error: null,
 });
 
 /** Server-derived list of registered vectors — names only.  Mirrors
@@ -208,13 +313,13 @@ export async function refreshVectorList(): Promise<void> {
   vectorsState.names = r.vectors.map((v) => v.name);
   // Cache profile metadata — cheap, server already serialized.
   for (const v of r.vectors) {
-    vectorRack.profiles.set(v.name, v);
+    steerRack.profiles.set(v.name, v);
   }
 }
 
 export async function refreshVector(name: string): Promise<VectorInfo> {
   const info = await apiVectors.get(name);
-  vectorRack.profiles.set(name, info);
+  steerRack.profiles.set(name, info);
   return info;
 }
 
@@ -223,148 +328,385 @@ export async function refreshCorrelation(
 ): Promise<void> {
   try {
     const data = await apiVectors.correlation(names);
-    vectorRack.correlation = data;
+    steerRack.correlation = data;
   } catch {
-    vectorRack.correlation = null;
+    steerRack.correlation = null;
   }
 }
 
-// SvelteMap tracks .set/.delete; mutations on stored objects are NOT
-// tracked, so each setter reassigns the entry via .set with a fresh
-// spread.  This pattern is uniform across every rack mutator.
-export function setVectorAlpha(name: string, alpha: number): void {
-  enqueueOrApply(`alpha ${name} ${alpha.toFixed(3)}`, () => {
-    const e = vectorRack.entries.get(name);
-    if (e) {
-      vectorRack.entries.set(name, { ...e, alpha });
-    } else {
-      vectorRack.entries.set(name, defaultRackEntry(alpha));
-    }
+// ---------------------------------------------------- vector-mode mutators
+
+function defaultSubspaceEntry(
+  coords: number[] = [],
+  label: string | null = null,
+): SubspaceSteerEntry {
+  return { mode: "subspace", coords, label, variant: "raw", trigger: "BOTH", enabled: true };
+}
+
+/** Reassign a subspace-mode (flat) entry through ``fn``; no-op if the entry is
+ *  absent or is a manifold (curved) term. */
+function mutateSubspace(
+  name: string,
+  fn: (e: SubspaceSteerEntry) => SubspaceSteerEntry,
+): void {
+  const e = steerRack.entries.get(name);
+  if (e && e.mode === "subspace") steerRack.entries.set(name, fn(e));
+}
+
+// SvelteMap tracks .set/.delete; mutations on stored objects are NOT tracked,
+// so each setter reassigns the entry via .set with a fresh spread.  This
+// pattern is uniform across every rack mutator.
+
+/** The shared "subspace along" master — one slide magnitude for every
+ *  subspace (flat) term (the merged affine subspace slides once).  Adjusting
+ *  it scales every flat term uniformly. */
+export function setSubspaceAlong(along: number): void {
+  enqueueOrApply(`subspace along ${along.toFixed(3)}`, () => {
+    steerRack.subspaceAlong = along;
   });
 }
 
-export function setVectorEnabled(name: string, enabled: boolean): void {
+/** Set a subspace term's free authoring coords (XYPad / slider drag) — clears
+ *  the label-form binding so it serializes as a coord list. */
+export function setSubspaceCoords(name: string, coords: number[]): void {
+  enqueueOrApply(`subspace coords ${name}`, () => {
+    mutateSubspace(name, (e) => ({ ...e, coords: [...coords], label: null }));
+  });
+}
+
+/** Switch a subspace term to label-form (``<name>%<label>``).  ``label=null``
+ *  reverts to coord-form; a non-null label mirrors the node's coords onto the
+ *  entry so the XYPad still renders the position. */
+export function setSubspaceLabel(name: string, label: string | null): void {
+  enqueueOrApply(`subspace label ${name} ${label ?? "<null>"}`, () => {
+    if (label === null) {
+      mutateSubspace(name, (e) => ({ ...e, label: null }));
+      return;
+    }
+    const info = manifoldByName(name);
+    mutateSubspace(name, (e) => {
+      if (!info) return { ...e, label };
+      const idx = info.node_labels.indexOf(label);
+      const coords = idx >= 0 && info.node_coords[idx] ? [...info.node_coords[idx]] : e.coords;
+      return { ...e, label, coords };
+    });
+  });
+}
+
+export function setSubspaceVariant(name: string, variant: Variant): void {
+  enqueueOrApply(`subspace variant ${name} ${variant}`, () => {
+    mutateSubspace(name, (e) => ({ ...e, variant }));
+  });
+}
+
+export function setSubspaceTrigger(name: string, trigger: Trigger): void {
+  enqueueOrApply(`subspace trigger ${name} ${trigger}`, () => {
+    mutateSubspace(name, (e) => ({ ...e, trigger }));
+  });
+}
+
+export function setSubspaceEnabled(name: string, enabled: boolean): void {
   enqueueOrApply(`${enabled ? "enable" : "disable"} ${name}`, () => {
-    const e = vectorRack.entries.get(name);
-    if (e) vectorRack.entries.set(name, { ...e, enabled });
+    mutateSubspace(name, (e) => ({ ...e, enabled }));
   });
 }
 
-export function setVectorTrigger(name: string, trigger: Trigger): void {
-  enqueueOrApply(`trigger ${name} ${trigger}`, () => {
-    const e = vectorRack.entries.get(name);
-    if (e) vectorRack.entries.set(name, { ...e, trigger });
-  });
+/** Add a flat (subspace) term.  A 2-node concept defaults to its positive
+ *  pole (label form); a higher-rank flat (personas) to the domain centroid;
+ *  an uncatalogued typed name to its positive pole label.  Magnitude is the
+ *  shared ``subspaceAlong`` master, not per-card. */
+export function addSubspaceToRack(name: string): void {
+  if (steerRack.entries.has(name)) return;
+  const info = manifoldByName(name);
+  let coords: number[] = [];
+  let label: string | null = null;
+  if (info && info.node_count === 2 && info.node_labels.length > 0) {
+    label = info.node_labels[0];
+    coords = info.node_coords?.[0] ? [...info.node_coords[0]] : [];
+  } else if (info) {
+    coords = manifoldCentroid(info);
+  } else {
+    const bare = name.includes("/") ? name.slice(name.indexOf("/") + 1) : name;
+    label = bare.split(".")[0];
+  }
+  steerRack.entries.set(name, defaultSubspaceEntry(coords, label));
 }
 
-export function setVectorVariant(name: string, variant: Variant): void {
-  enqueueOrApply(`variant ${name} ${variant}`, () => {
-    const e = vectorRack.entries.get(name);
-    if (e) vectorRack.entries.set(name, { ...e, variant });
-  });
-}
-
-export function setVectorProjection(
-  name: string,
-  projection: ProjectionSpec | null,
-): void {
-  enqueueOrApply(`project ${name}`, () => {
-    const e = vectorRack.entries.get(name);
-    if (e) {
-      // Ablation can't compose with projection — clear if a projection
-      // was just set on top of an ablated entry.
-      vectorRack.entries.set(name, {
-        ...e,
-        projection,
-        ablate: projection ? false : e.ablate,
-      });
-    }
-  });
-}
-
-export function setVectorAblate(name: string, ablate: boolean): void {
-  enqueueOrApply(`ablate ${name} ${ablate}`, () => {
-    const e = vectorRack.entries.get(name);
-    if (e) {
-      vectorRack.entries.set(name, {
-        ...e,
-        ablate,
-        projection: ablate ? null : e.projection,
-      });
-    }
-  });
-}
-
-/** Default α for a freshly-added rack entry — matches DEFAULT_COEFF in
- * saklas.core.steering_expr (TUI's /steer assumes 0.5 when the user
- * types a bare term).  α=0 would serialize to an empty expression and
- * make the new strip invisible in the EXPR block. */
-const DEFAULT_RACK_ALPHA = 0.5;
-
-export function addVectorToRack(
-  name: string,
-  alpha: number = DEFAULT_RACK_ALPHA,
-  trigger: Trigger = "BOTH",
-): void {
-  if (vectorRack.entries.has(name)) return;
-  vectorRack.entries.set(name, defaultRackEntry(alpha, trigger));
-}
-
-export function removeVectorFromRack(name: string): void {
-  vectorRack.entries.delete(name);
-}
-
-function defaultRackEntry(
-  alpha: number = 0,
-  trigger: Trigger = "BOTH",
-): VectorRackEntry {
-  return {
-    alpha,
-    trigger,
-    variant: "raw",
-    projection: null,
-    ablate: false,
-    enabled: true,
-  };
+export function removeSubspaceFromRack(name: string): void {
+  steerRack.entries.delete(name);
 }
 
 /** The canonical expression string the rack would send to the server.
- * Recomputed on demand; cheap. */
+ * Recomputed on demand; cheap.  Subspace terms first (at the shared
+ * ``subspaceAlong`` master), then manifold (curved) terms. */
 export function currentSteeringExpression(): string {
-  return serializeExpression(vectorRack.entries);
+  return serializeExpression(steerRack.entries, steerRack.subspaceAlong);
+}
+
+// ------------------------------------------------------ manifold catalog
+
+/** Fetch the manifold catalog.  Tolerates a 404 from an older server —
+ *  flips ``unavailable`` and leaves the catalog empty. */
+export async function refreshManifoldList(): Promise<void> {
+  steerRack.loading = true;
+  try {
+    const r = await apiManifolds.list();
+    steerRack.catalog = r.manifolds;
+    steerRack.unavailable = false;
+    steerRack.error = null;
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 404) {
+      steerRack.unavailable = true;
+      steerRack.catalog = [];
+    } else {
+      steerRack.error = e instanceof Error ? e.message : String(e);
+    }
+  } finally {
+    steerRack.loading = false;
+  }
+}
+
+/** Look up a catalog row by display name (``ns/name`` or bare name). */
+export function manifoldByName(name: string): ManifoldInfo | null {
+  for (const m of steerRack.catalog) {
+    if (`${m.namespace}/${m.name}` === name || m.name === name) return m;
+  }
+  return null;
+}
+
+/** Domain-centroid coordinates for a manifold — the default rack
+ *  position.  Box: midpoint of each axis.  Sphere: the north pole
+ *  ``[0,…,0,1]`` in R^(dim+1) embedding (here we just author with
+ *  ``dim`` intrinsic coords, all zero, which the domain maps to a valid
+ *  point). */
+export function manifoldCentroid(m: ManifoldInfo): number[] {
+  if (m.domain.type === "box") {
+    return m.domain.axes.map((a) => (a.lo + a.hi) / 2);
+  }
+  // Sphere / custom — intrinsic_dim zeros is a safe authoring default.
+  return new Array(m.intrinsic_dim).fill(0);
+}
+
+// ---------------------------------------------------- manifold-mode mutators
+
+/** Reassign a manifold-mode (curved) entry through ``fn``; no-op if the entry
+ *  is absent or is a subspace (flat) term. */
+function mutateManifold(
+  name: string,
+  fn: (e: ManifoldSteerEntry) => ManifoldSteerEntry,
+): void {
+  const e = steerRack.entries.get(name);
+  if (e && e.mode === "manifold") steerRack.entries.set(name, fn(e));
+}
+
+/** Add a curved manifold to the rack at its domain centroid, along 0.5. */
+export function addManifoldToRack(name: string): void {
+  if (steerRack.entries.has(name)) return;
+  const info = manifoldByName(name);
+  const coords = info ? manifoldCentroid(info) : [];
+  steerRack.entries.set(name, {
+    mode: "manifold",
+    blend: 0.5,
+    onto: 0,
+    coords,
+    label: null,
+    variant: "raw",
+    trigger: "BOTH",
+    enabled: true,
+  });
+}
+
+export function removeManifoldFromRack(name: string): void {
+  steerRack.entries.delete(name);
+}
+
+export function setManifoldBlend(name: string, blend: number): void {
+  enqueueOrApply(`manifold blend ${name} ${blend.toFixed(3)}`, () => {
+    mutateManifold(name, (e) => ({ ...e, blend }));
+  });
+}
+
+/** Set the curved-manifold ``onto`` collapse fraction (the second
+ *  coefficient). */
+export function setManifoldOnto(name: string, onto: number): void {
+  enqueueOrApply(`manifold onto ${name} ${onto.toFixed(3)}`, () => {
+    mutateManifold(name, (e) => ({ ...e, onto }));
+  });
+}
+
+export function setManifoldCoords(name: string, coords: number[]): void {
+  // Pulling on the XYPad authors a free-form position; the term drops
+  // its label-form binding (if any) so the canonical expression
+  // serializes as a coord list and the snap-to-node dropdown shows
+  // "(free position)" until the user picks one.
+  enqueueOrApply(`manifold coords ${name}`, () => {
+    mutateManifold(name, (e) => ({ ...e, coords: [...coords], label: null }));
+  });
+}
+
+/** Switch the term to label-form (``<name>%<label>``).  ``label=null``
+ *  clears the binding and reverts to coord-form on the next
+ *  serialization.  When ``label`` is non-null the matching node's
+ *  coords are mirrored onto ``coords`` so the XYPad still renders the
+ *  position correctly. */
+export function setManifoldLabel(name: string, label: string | null): void {
+  enqueueOrApply(`manifold label ${name} ${label ?? "<null>"}`, () => {
+    if (label === null) {
+      mutateManifold(name, (e) => ({ ...e, label: null }));
+      return;
+    }
+    const info = manifoldByName(name);
+    mutateManifold(name, (e) => {
+      if (!info) {
+        // No catalog metadata — accept the label without mirroring
+        // coords; downstream resolution happens server-side.
+        return { ...e, label };
+      }
+      const idx = info.node_labels.indexOf(label);
+      const coords = (idx >= 0 && info.node_coords[idx])
+        ? [...info.node_coords[idx]]
+        : e.coords;
+      return { ...e, label, coords };
+    });
+  });
+}
+
+export function setManifoldTrigger(name: string, trigger: Trigger): void {
+  enqueueOrApply(`manifold trigger ${name} ${trigger}`, () => {
+    mutateManifold(name, (e) => ({ ...e, trigger }));
+  });
+}
+
+export function setManifoldEnabled(name: string, enabled: boolean): void {
+  enqueueOrApply(`manifold ${enabled ? "enable" : "disable"} ${name}`, () => {
+    mutateManifold(name, (e) => ({ ...e, enabled }));
+  });
 }
 
 // =========================================================== probes =====
+//
+// One unified read-side rack — every probe shape (a 2-node concept axis is
+// the rank-1 case, a discover / curved fit the rank-R case).  Each entry
+// carries the server ``ProbeInfo`` (with the ``is_affine`` flat-vs-curved
+// flag the cards classify on), a sparkline of the primary scalar, the
+// latest per-token ``reading`` + end-of-gen ``aggregate`` (one
+// ``ProbeReadingJSON`` shape), the most-recent ``nearest`` list, and — for
+// 2-D box probes — an inferred per-token ``trajectory`` for the mini-map.
+
+const MAX_SPARKLINE = 60;
+const MAX_PROBE_TRAJECTORY = 240;
+// Probe-inspector live trajectory trail depth (tokens).  Bounded so the
+// fading polyline + the stored per-layer coords stay cheap; the oldest
+// samples fade out as newer tokens push them off the ring.
+const MAX_SUBSPACE_TRAIL = 64;
 
 export interface ProbeRackState {
-  /** Per-probe sparkline + last-tick state.  Keys are probe names. */
+  /** Per-probe live state, keyed by registered probe name. */
   entries: Map<string, ProbeRackEntry>;
   sortMode: ProbeSortMode;
-  /** Mirrors sessionState.info?.probes — exposed separately so probe
-   * adds/removes refresh independently of full session info. */
+  /** Attached probe names (every listed probe is attached/active). */
   active: string[];
+  /** True when the server's probe route 404s (pre-read-side server). */
+  unavailable: boolean;
+  loading: boolean;
+  error: string | null;
 }
 
 export const probeRack: ProbeRackState = $state({
   entries: new SvelteMap(),
-  // Alphabetical by default — matches the TUI's ``TraitPanel._sort_mode
-  // = "name"`` initial state.  Sort by live value / change is a
-  // dropdown opt-in (value is interesting when probes are firing but
-  // unstable as a default — order shifts every token).
+  // Alphabetical by default — matches the TUI's initial state.  Sort by
+  // value / change is a dropdown opt-in.
   sortMode: "name",
   active: [],
+  unavailable: false,
+  loading: false,
+  error: null,
 });
 
-/** Computed: probes sorted per the user's chosen sort mode.  Returns
- * a fresh array on each access; consumers use it as a $derived
- * read-only view. */
+/** Primary scalar a probe's sparkline / sort tracks: the signed axis-0
+ *  coordinate for a flat (subspace) probe, the [0,1] subspace fraction for
+ *  a curved (manifold) probe. */
+function _primaryScalar(info: ProbeInfo, reading: ProbeReadingJSON): number {
+  if (info.is_affine) return reading.coords.length > 0 ? reading.coords[0] : 0;
+  return reading.fraction;
+}
+
+/** Per-layer column for the expanded layer strip: axis-0 ``coords_per_layer``
+ *  for a flat probe, ``fraction_per_layer`` for a curved one. */
+function _primaryPerLayer(
+  info: ProbeInfo,
+  reading: ProbeReadingJSON,
+): Record<string, number> {
+  if (!info.is_affine) return reading.fraction_per_layer ?? {};
+  const out: Record<string, number> = {};
+  for (const [layer, c] of Object.entries(reading.coords_per_layer ?? {})) {
+    out[layer] = Array.isArray(c) && c.length > 0 ? c[0] : 0;
+  }
+  return out;
+}
+
+/** A probe targets a 2-D-authored ``BoxDomain`` — the regime the mini-map
+ *  renders.  Higher-dim and sphere/custom probes attach but skip it. */
+function _probeIsMiniMapCandidate(info: ProbeInfo): boolean {
+  if (info.intrinsic_dim !== 2) return false;
+  const d = info.domain as { type?: string };
+  return d?.type === "box" && !!info.node_coords && info.node_coords.length > 0;
+}
+
+/** Look up ``node_coords`` for a label.  Null when absent or the row carries
+ *  no coords (unfitted discover).  Returns a copy so callers can push. */
+function _lookupNodeCoords(info: ProbeInfo, label: string): number[] | null {
+  const coords = info.node_coords;
+  if (!coords) return null;
+  const idx = info.node_labels.indexOf(label);
+  if (idx < 0 || idx >= coords.length) return null;
+  const row = coords[idx];
+  if (!Array.isArray(row)) return null;
+  return [...row];
+}
+
+function _emptyProbeEntry(info: ProbeInfo): ProbeRackEntry {
+  return {
+    info,
+    sparkline: [],
+    current: 0,
+    previous: 0,
+    perLayer: {},
+    reading: null,
+    aggregate: null,
+    nearest: [],
+    trajectory: [],
+    subspaceTrail: [],
+  };
+}
+
+/** Per-probe saturation scale for the bar / layer cells / token tint — the
+ *  axis-0 node-coordinate extent of the attached probe (``nodeCoordExtent``),
+ *  or 1 when the probe isn't attached / carries no coords.  Token highlighting
+ *  reads ``coords[0]`` (domain-frame) for every probe, flat or curved, so the
+ *  node extent is the right normalizer in both cases. */
+export function probeAxisScale(name: string, axis = 0): number {
+  return nodeCoordExtent(probeRack.entries.get(name)?.info?.node_coords, axis);
+}
+
+/** Saturation scale for a highlight target.  The surprise sentinel keeps the
+ *  fixed ``HIGHLIGHT_SAT`` cutoff (``surpriseScore`` is pre-scaled to it); a
+ *  real probe normalizes by its per-axis node extent — an axis target
+ *  (``personas[3]``) scales by that PC's own coordinate extent, so a tight
+ *  axis isn't pinned saturated by a wider sibling axis. */
+export function highlightScale(target: string | null): number {
+  if (!target || target === SURPRISE_TARGET) return HIGHLIGHT_SAT;
+  const { base, axis } = parseProbeTarget(target);
+  return probeAxisScale(base, axis);
+}
+
+/** Computed: probe names sorted per the chosen sort mode.  Fresh array each
+ *  access; consumers use it as a ``$derived`` read-only view. */
 export function activeProbeNames(): string[] {
   const arr = [...probeRack.active];
   if (probeRack.sortMode === "name") {
     arr.sort();
   } else if (probeRack.sortMode === "value") {
-    // Signed value desc — matches the TUI's trait_panel.py sort_key
-    // (line 191).  Magnitude sort is what "change" is for.
     arr.sort((a, b) => {
       const av = probeRack.entries.get(a)?.current ?? 0;
       const bv = probeRack.entries.get(b)?.current ?? 0;
@@ -382,123 +724,184 @@ export function activeProbeNames(): string[] {
   return arr;
 }
 
+/** Fetch the attached-probe catalog.  Tolerates a 404 from an older server
+ *  — flips ``unavailable`` and leaves the rack empty. */
 export async function refreshProbeList(): Promise<void> {
-  const r = await apiProbes.list();
-  probeRack.active = r.probes.filter((p) => p.active).map((p) => p.name);
-  // Drop any rack entries the server no longer reports active.
-  for (const name of [...probeRack.entries.keys()]) {
-    if (!probeRack.active.includes(name)) {
-      probeRack.entries.delete(name);
+  probeRack.loading = true;
+  try {
+    const r = await apiProbes.list();
+    const seen = new Set<string>();
+    for (const info of r.probes) {
+      seen.add(info.name);
+      const prev = probeRack.entries.get(info.name);
+      if (prev) {
+        // Refresh metadata in place; preserve live sparkline / aggregate.
+        probeRack.entries.set(info.name, { ...prev, info });
+      } else {
+        probeRack.entries.set(info.name, _emptyProbeEntry(info));
+      }
     }
-  }
-  // Seed entries for newly active probes.
-  for (const name of probeRack.active) {
-    if (!probeRack.entries.has(name)) {
-      probeRack.entries.set(name, {
-        sparkline: [],
-        current: 0,
-        previous: 0,
-        perLayer: {},
-      });
+    // Drop entries the server no longer reports (detached out-of-band).
+    for (const name of [...probeRack.entries.keys()]) {
+      if (!seen.has(name)) probeRack.entries.delete(name);
     }
+    probeRack.active = r.probes.map((p) => p.name);
+    probeRack.unavailable = false;
+    probeRack.error = null;
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 404) {
+      probeRack.unavailable = true;
+      probeRack.entries.clear();
+      probeRack.active = [];
+    } else {
+      probeRack.error = e instanceof Error ? e.message : String(e);
+    }
+  } finally {
+    probeRack.loading = false;
   }
 }
 
-export async function activateProbe(name: string): Promise<void> {
-  await apiProbes.activate(name);
-  await refreshProbeList();
-  // Auto-seed the highlight target when a probe is activated through
-  // the rack — matches the TUI's /probe behavior, which flips highlight
-  // on and points it at the new probe.
+/** Attach any probe shape by selector — the same ``[ns/]name[:variant]`` the
+ *  steering ``%`` term consumes; ``name`` defaults to the selector. */
+export async function attachProbe(
+  selector: string,
+  opts: { name?: string; top_n?: number } = {},
+): Promise<ProbeInfo> {
+  const info = await apiProbes.attach({
+    selector,
+    name: opts.name,
+    top_n: opts.top_n,
+  });
+  const prev = probeRack.entries.get(info.name);
+  if (prev) {
+    probeRack.entries.set(info.name, { ...prev, info });
+  } else {
+    probeRack.entries.set(info.name, _emptyProbeEntry(info));
+  }
+  if (!probeRack.active.includes(info.name)) {
+    probeRack.active = [...probeRack.active, info.name];
+  }
+  // Seed the highlight target when a probe is attached through the rack —
+  // matches the TUI pointing highlight at a fresh probe.
   if (highlightState.target === null) {
-    highlightState.target = name;
+    highlightState.target = info.name;
   }
+  return info;
 }
 
-export async function deactivateProbe(name: string): Promise<void> {
-  await apiProbes.deactivate(name);
-  await refreshProbeList();
-  if (highlightState.target === name) {
-    highlightState.target = null;
-  }
-  if (highlightState.compareTarget === name) {
-    highlightState.compareTarget = null;
-  }
+/** Detach a probe by registered name. */
+export async function detachProbe(name: string): Promise<void> {
+  await apiProbes.detach(name);
+  probeRack.entries.delete(name);
+  probeRack.active = probeRack.active.filter((n) => n !== name);
+  if (highlightState.target === name) highlightState.target = null;
+  if (highlightState.compareTarget === name) highlightState.compareTarget = null;
 }
 
 export function setProbeSortMode(mode: ProbeSortMode): void {
   probeRack.sortMode = mode;
 }
 
-/** Update probe rows from a streaming token's full per-layer × per-probe
- * map.  Each entry records:
- *   - ``current`` / ``sparkline`` — deepest-layer value, used by the row's
- *     value bar + sparkline (proxy for "live trait reading").
- *   - ``perLayer`` — the full per-layer column for that probe at this
- *     token, used by the expanded layer strip.
- *
- * Drops stale sparkline entries past ``MAX_SPARKLINE`` so memory stays
- * bounded across long sessions. */
-const MAX_SPARKLINE = 60;
-export function updateProbeFromScores(
-  perLayerScores: Record<string, Record<string, number>>,
-): void {
-  // Layer keys are zero-padded ints from the server; sort numerically so
-  // "deepest" really means highest index regardless of insertion order.
-  const layers = Object.keys(perLayerScores).sort(
-    (a, b) => Number(a) - Number(b),
-  );
-  if (layers.length === 0) return;
-  const deepest = layers[layers.length - 1];
-
-  // Pivot: gather per-probe column across all layers in one pass so the
-  // hot WS handler doesn't iterate L × P twice per token.
-  const probeNames = new Set<string>();
-  const perProbeLayer: Record<string, Record<string, number>> = {};
-  for (const layer of layers) {
-    const row = perLayerScores[layer] ?? {};
-    for (const [name, val] of Object.entries(row)) {
-      probeNames.add(name);
-      (perProbeLayer[name] ??= {})[layer] = val;
-    }
-  }
-
-  // Reassign the entry on every score so the SvelteMap fires reactivity
-  // for whichever component reads ``current`` / ``sparkline`` / ``perLayer``
-  // — bare ``entry.current = val`` would update the in-memory object but
-  // the map's ``set``-tracked subscribers never see it, leaving probe
-  // strips frozen at zero throughout a generation.
-  for (const name of probeNames) {
-    const prev = probeRack.entries.get(name);
-    const val = perLayerScores[deepest]?.[name] ?? 0;
-    const previous = prev?.current ?? 0;
-    const sparkline = prev ? prev.sparkline.slice() : [];
-    sparkline.push(val);
-    if (sparkline.length > MAX_SPARKLINE) {
-      sparkline.splice(0, sparkline.length - MAX_SPARKLINE);
-    }
+/** Reset per-gen streaming state at the start of a fresh generation.
+ *  Trajectory + aggregate + nearest live one gen each; the sparkline
+ *  carries across.  Called from the WS ``started`` handler. */
+export function resetProbeStreams(): void {
+  for (const [name, e] of probeRack.entries) {
     probeRack.entries.set(name, {
-      sparkline,
-      current: val,
-      previous,
-      perLayer: perProbeLayer[name] ?? {},
+      ...e,
+      nearest: [],
+      aggregate: null,
+      trajectory: [],
+      subspaceTrail: [],
     });
   }
 }
 
-/** Snapshot the current per-probe means as the new "previous" baseline
- * — call after a generation lands so the next gen's deltas are computed
- * against the post-gen state, not mid-gen. */
+/** Append one per-token reading per attached probe (the unified
+ *  ``probe_readings`` WS channel).  Drives the sparkline + per-layer strip +
+ *  nearest readout + 2-D trajectory.  No-ops on undefined.
+ *
+ *  Reassigns each entry (rather than mutating in place) so the SvelteMap
+ *  fires reactivity — a bare ``entry.current = v`` would freeze probe strips
+ *  at zero through a whole generation. */
+export function updateProbesFromReadings(
+  readings: Record<string, ProbeReadingJSON> | undefined,
+): void {
+  if (!readings) return;
+  for (const [name, reading] of Object.entries(readings)) {
+    const prev = probeRack.entries.get(name);
+    if (!prev) continue;
+    const scalar = _primaryScalar(prev.info, reading);
+    const sparkline = prev.sparkline.slice();
+    sparkline.push(scalar);
+    if (sparkline.length > MAX_SPARKLINE) {
+      sparkline.splice(0, sparkline.length - MAX_SPARKLINE);
+    }
+    let trajectory = prev.trajectory;
+    if (_probeIsMiniMapCandidate(prev.info) && reading.nearest.length > 0) {
+      const xy = _lookupNodeCoords(prev.info, reading.nearest[0][0]);
+      if (xy) {
+        trajectory = prev.trajectory.slice();
+        trajectory.push(xy);
+        if (trajectory.length > MAX_PROBE_TRAJECTORY) {
+          trajectory.splice(0, trajectory.length - MAX_PROBE_TRAJECTORY);
+        }
+      }
+    }
+    // Probe-inspector trail: append this token's per-layer whitened subspace
+    // coords (present only while the inspector requested them).  Stored across
+    // all probed layers so the inspector reprojects for any scrubbed layer.
+    let subspaceTrail = prev.subspaceTrail;
+    const sc = reading.subspace_coords_per_layer;
+    if (sc && Object.keys(sc).length > 0) {
+      subspaceTrail = prev.subspaceTrail.slice();
+      subspaceTrail.push({ perLayer: sc });
+      if (subspaceTrail.length > MAX_SUBSPACE_TRAIL) {
+        subspaceTrail.splice(0, subspaceTrail.length - MAX_SUBSPACE_TRAIL);
+      }
+    }
+    probeRack.entries.set(name, {
+      ...prev,
+      sparkline,
+      current: scalar,
+      previous: prev.current,
+      perLayer: _primaryPerLayer(prev.info, reading),
+      reading,
+      nearest: reading.nearest,
+      trajectory,
+      subspaceTrail,
+    });
+  }
+}
+
+/** Land the end-of-gen aggregate readings (the ``done`` event) — the settled
+ *  ``ProbeReading`` per probe. */
+export function setProbeAggregates(
+  aggregates: Record<string, ProbeReadingJSON> | undefined,
+): void {
+  if (!aggregates) return;
+  for (const [name, agg] of Object.entries(aggregates)) {
+    const prev = probeRack.entries.get(name);
+    if (!prev) continue;
+    probeRack.entries.set(name, {
+      ...prev,
+      aggregate: agg,
+      current: _primaryScalar(prev.info, agg),
+      perLayer: _primaryPerLayer(prev.info, agg),
+      nearest: agg.nearest,
+    });
+  }
+}
+
+/** Snapshot current per-probe scalars as the new "previous" baseline — call
+ *  after a gen lands so the next gen's deltas compute against post-gen state. */
 export function snapshotProbeBaseline(): void {
   for (const [name, e] of probeRack.entries) {
     probeRack.entries.set(name, { ...e, previous: e.current });
   }
 }
 
-/** Sentinel value the ProbeStrip layer strip falls back to when a probe
- * has been activated but no token has streamed yet.  Returned as a
- * computed default so consumers can switch on emptiness without a
- * separate ``hasReadings`` flag. */
+/** Sentinel for the layer strip when a probe has no token yet. */
 export const EMPTY_PER_LAYER: Readonly<Record<string, number>> = Object.freeze({});
 
 // ============================================================ chat ======
@@ -623,6 +1026,7 @@ function nodeToTurn(n: LoomNodeJSON): ChatTurn {
   const turn: ChatTurn = {
     role: n.role,
     text: n.text ?? "",
+    roleLabel: n.role_label ?? null,
     nodeId: n.id,
     appliedSteering: n.applied_steering ?? null,
     aggregateReadings: n.aggregate_readings ?? undefined,
@@ -873,6 +1277,16 @@ function applyTreeDelta(ev: {
   // and the live wire shape disagree, and ``null`` is the live shape.
   if (ev.active_node_id !== undefined && ev.active_node_id !== null) {
     loomTree.active_node_id = ev.active_node_id;
+  }
+  // A ``reset`` is the only mutation that drops the root: its ``removed`` list
+  // now includes the old root and ``added`` carries a fresh parentless one.
+  // ``applyTreeDelta`` never otherwise touches ``root_id``, so re-seed it here
+  // when the old root is gone — else the sidebar (which walks from ``root_id``)
+  // points at a deleted node and renders empty after a cross-client reset.
+  if (loomTree.root_id !== null && !loomTree.nodes.has(loomTree.root_id)) {
+    const newRoot = (ev.added ?? []).find((n) => n.parent_id == null)
+      ?? [...loomTree.nodes.values()].find((n) => n.parent_id == null);
+    if (newRoot) loomTree.root_id = newRoot.id;
   }
   loomTree.rev = ev.rev;
   // Phase 5: applied_steering strings can shift after edit/regen, so
@@ -1128,6 +1542,12 @@ export interface SamplingState {
    *  "show alts" toggle in ``SamplingStrip``; the canonical "on" value
    *  is ``8`` per Decision 1 of ``docs/plans/logit-pass.md``. */
   return_top_k: number;
+  /** Per-message role-substitution labels (roleplay scaffold).  Sticky
+   *  client state like ``seed`` — whatever's in the boxes rides the next
+   *  send and is stamped onto that turn's loom node (immutable afterward).
+   *  Empty string = standard role label (nothing sent). */
+  user_role: string;
+  assistant_role: string;
 }
 
 export const samplingState: SamplingState = $state({
@@ -1141,6 +1561,8 @@ export const samplingState: SamplingState = $state({
   logit_bias_text: "",
   presence_penalty: 0,
   frequency_penalty: 0,
+  user_role: "",
+  assistant_role: "",
   // Initial thinking state: explicit ``false`` so an unchecked checkbox
   // on first paint actually sends ``thinking: false`` to the server.
   // The previous ``null`` (auto) state silently fell through to whatever
@@ -1159,6 +1581,59 @@ export function setSampling<K extends keyof SamplingState>(
   value: SamplingState[K],
 ): void {
   samplingState[key] = value;
+}
+
+// ============================================ generation UI mode ========
+//
+// Base (non-chat) models have no chat template — the engine handles
+// them as flat completion.  ``genUiMode`` decides whether the chat panel
+// renders bubbles + roles (chat) or a single flat completion buffer
+// (raw).  It is a plain two-state toggle: the default is seeded from the
+// model's ``is_base_model`` flag (base → raw, chat → chat) the first
+// time a model is seen, then the user's explicit choice is persisted
+// per ``model_id`` and survives reloads.
+
+export interface GenUiModeState {
+  /** Which surface the chat panel renders — ``"chat"`` (bubbles +
+   *  roles) or ``"raw"`` (a single flat completion buffer). */
+  mode: "chat" | "raw";
+}
+
+export const genUiMode: GenUiModeState = $state({ mode: "chat" });
+
+/** Resolve the effective rendering mode — true means flat raw buffer. */
+export function effectiveRawMode(): boolean {
+  return genUiMode.mode === "raw";
+}
+
+const GENUI_KEY_PREFIX = "saklas.genui.v1.";
+
+function genUiKey(): string | null {
+  const id = sessionState.info?.model_id;
+  return id ? GENUI_KEY_PREFIX + id : null;
+}
+
+/** Load the per-model render mode.  Called from ``bootstrap`` once the
+ *  model id is known.  A stored preference wins; with none, the mode is
+ *  seeded from the model's nature — a base model defaults to ``raw``, a
+ *  chat model to ``chat``. */
+function loadGenUiMode(): void {
+  const key = genUiKey();
+  const stored = key ? safeLocalStorageGet(key) : null;
+  if (stored === "chat" || stored === "raw") {
+    genUiMode.mode = stored;
+  } else {
+    genUiMode.mode =
+      sessionState.info?.is_base_model === true ? "raw" : "chat";
+  }
+}
+
+/** Set (and persist) the render mode.  Toggling mode never mutates the
+ *  loom tree — only generation does. */
+export function setGenUiMode(mode: "chat" | "raw"): void {
+  genUiMode.mode = mode;
+  const key = genUiKey();
+  if (key) safeLocalStorageSet(key, mode);
 }
 
 function parsedStopSequences(): string[] | null {
@@ -1209,7 +1684,31 @@ function nonDefaultSamplingOverrides(): Partial<WSSampling> {
     ...(samplingState.return_top_k > 0
       ? { return_top_k: samplingState.return_top_k }
       : {}),
+    // Per-message role labels (roleplay scaffold) ride every send like
+    // ``seed`` — trimmed.  Empty = standard role, omitted.  A value equal to
+    // the family's standard label (the box's seeded default) is *also* a
+    // no-op, so we omit it too: the node isn't stamped with a redundant label
+    // and the bubble keeps its structural heading.  Only a genuine override
+    // (a label the user changed away from the default) is sent.
+    ...roleOverride(samplingState.user_role, sessionState.info?.default_user_role, "user_role"),
+    ...roleOverride(
+      samplingState.assistant_role,
+      sessionState.info?.default_assistant_role,
+      "assistant_role",
+    ),
   };
+}
+
+/** ``{key: value}`` when ``raw`` is a non-empty label that differs from the
+ *  family default, else ``{}`` (treated as "use the standard role"). */
+function roleOverride(
+  raw: string,
+  fallback: string | null | undefined,
+  key: "user_role" | "assistant_role",
+): Partial<WSSampling> {
+  const value = raw.trim();
+  if (!value || value === fallback) return {};
+  return { [key]: value };
 }
 
 function buildSamplingPayload(): WSSampling | null {
@@ -1219,40 +1718,20 @@ function buildSamplingPayload(): WSSampling | null {
   // advanced extras (penalties, stop, logit-bias, return_top_k) aren't
   // PATCH-able either — both always ride per-call.
   const payload: WSSampling = {
+    persist_per_layer_scores: true,
+    // The probe-inspector live point + fading trail need per-layer whitened
+    // subspace coords on each token reading.  Sent whenever a probe is attached
+    // so the trajectory is always captured — opening the inspector after any
+    // generation shows the run's path with no prior opt-in.  (The Python
+    // SamplingConfig default stays off, so non-webui callers and the throughput
+    // benchmark are unaffected.)
+    ...(probeRack.active.length > 0
+      ? { persist_subspace_coords: true }
+      : {}),
     ...nonDefaultSamplingOverrides(),
     ...(samplingState.seed !== null ? { seed: samplingState.seed } : {}),
   };
   return Object.keys(payload).length > 0 ? payload : null;
-}
-
-// ============================================================ packs ======
-
-export const packsState: {
-  /** ``ns/name`` strings — kept for the consumers that just want a
-   *  set membership check.  Mirrors ``infos`` and is recomputed by
-   *  ``refreshPacks``. */
-  installed: string[];
-  /** Full ``LocalPackInfo`` rows — the unified VectorsDrawer reads
-   *  this reactively so a successful extract / delete reshuffles
-   *  rows between the "Extracted" and "Statements only" sections
-   *  without remount. */
-  infos: LocalPackInfo[];
-  loading: boolean;
-  error: string | null;
-} = $state({ installed: [], infos: [], loading: false, error: null });
-
-export async function refreshPacks(): Promise<void> {
-  packsState.loading = true;
-  try {
-    const r = await apiPacks.list();
-    packsState.infos = r.packs;
-    packsState.installed = r.packs.map((p) => `${p.namespace}/${p.name}`);
-    packsState.error = null;
-  } catch (e) {
-    packsState.error = e instanceof Error ? e.message : String(e);
-  } finally {
-    packsState.loading = false;
-  }
 }
 
 // ===================================================== pending actions ===
@@ -1351,7 +1830,7 @@ export function discardPendingActions(): void {
  *  already a rack-mutation item, the fresh ``apply`` is chained onto it
  *  rather than appended as a new slot, and the bubble's label updates
  *  to the latest action.  A slider drag that fires 30+ intermediate
- *  ``setVectorAlpha`` calls mid-gen therefore leaves a single queued
+ *  ``setSubspaceAlong`` calls mid-gen therefore leaves a single queued
  *  bubble carrying the net effect — "one final steering adjustment" —
  *  instead of 30 stacked ghosts.  Coalescing stops at any non-rack
  *  item (send / commit / one-shot mutation): rack changes before and
@@ -1565,13 +2044,21 @@ function handleWsMessage(msg: WSServerMessage): void {
     }
     case "node_created": {
       // Pre-allocate the node so n-way regen render slots exist before
-      // token events tagged with this node_id arrive.  The full node
-      // body lands via a subsequent ``tree_mutated`` (added) event.
+      // token events tagged with this node_id arrive.  The full node body
+      // lands via a ``tree_mutated`` (added) event — which the server's
+      // forwarder actually enqueues *before* this ``node_created``.  So
+      // merge over any node already in hand rather than replacing it: a
+      // bare ``node_created`` payload omits ``role_label`` (among other
+      // fields), and ``upsertLoomNode`` is a full replace — a blind
+      // overwrite would wipe a custom role glyph back to the structural
+      // letter (U/A) until the next full-tree refetch (e.g. on click).
+      const existing = loomTree.nodes.get(msg.node_id);
       upsertLoomNode({
+        ...existing,
         id: msg.node_id,
         parent_id: msg.parent_id,
         role: msg.role,
-        text: loomTree.nodes.get(msg.node_id)?.text ?? "",
+        text: existing?.text ?? "",
       });
       if (msg.role === "assistant" && genStatus.active && !abState.processingAb) {
         adoptStreamingNode(msg.node_id);
@@ -1590,6 +2077,9 @@ function handleWsMessage(msg: WSServerMessage): void {
       genStatus.finishReason = null;
       liveTokenStream.responseTokens = [];
       liveTokenStream.thinkingTokens = [];
+      // Manifold probes: drop the previous gen's trajectory + aggregate so
+      // the inspector mini-map starts blank.  Sparkline carries across.
+      if (!abState.processingAb) resetProbeStreams();
       // Loom: record the target node so tree-driven sync attaches the
       // streaming turn to the right active-path entry, and so the chat
       // panel's "streaming" highlight fires on the right turn.
@@ -1681,6 +2171,19 @@ function handleWsMessage(msg: WSServerMessage): void {
         const s = msg.scores[highlightState.target];
         if (typeof s === "number") tokenScore.score = s;
       }
+      // Per-PC token highlighting: stash the full per-axis domain coords off
+      // the rich ``probe_readings`` channel so axis targets (``personas[3]``)
+      // can tint live.  Only multi-axis probes need it — axis 0 already rides
+      // ``msg.scores`` — and the row keeps it through ``done`` (the per-token
+      // settle pass is axis-0 only and never clobbers this field).
+      if (msg.probe_readings) {
+        const byProbe: Record<string, number[]> = {};
+        for (const [pname, r] of Object.entries(msg.probe_readings)) {
+          const coords = (r as ProbeReadingJSON).coords;
+          if (Array.isArray(coords) && coords.length > 1) byProbe[pname] = coords;
+        }
+        if (Object.keys(byProbe).length > 0) tokenScore.coordsByProbe = byProbe;
+      }
       const turn = _currentWriteTurn();
       if (turn) {
         if (msg.thinking) {
@@ -1699,13 +2202,14 @@ function handleWsMessage(msg: WSServerMessage): void {
           }
         }
       }
-      // Update probe rack from the full per-layer × per-probe map.  The
-      // store derives the deepest-layer scalar for ``current``/sparkline
-      // and keeps the per-layer column on each entry for the expanded
-      // layer-strip view.  Skip during shadow runs so the rack stays
-      // anchored to the steered branch's signal.
-      if (msg.per_layer_scores && !abState.processingAb) {
-        updateProbeFromScores(msg.per_layer_scores);
+      // Probe rack — unified per-token readings.  Every probe shape rides
+      // the one ``probe_readings`` channel (a 2-node concept axis is the
+      // rank-1 case); the field is omitted when no probe is attached, so the
+      // helper no-ops on undefined.  Skip shadow runs so the rack stays
+      // anchored to the steered branch.  ``msg.scores`` / ``per_layer_scores``
+      // above still feed highlight tinting + the token-drilldown heatmap.
+      if (!abState.processingAb) {
+        updateProbesFromReadings(msg.probe_readings);
       }
       return;
     }
@@ -1713,6 +2217,12 @@ function handleWsMessage(msg: WSServerMessage): void {
       adoptStreamingNode(msg.node_id);
       genStatus.active = false;
       genStatus.finishReason = msg.result?.finish_reason ?? "stop";
+      // Probe rack — end-of-gen aggregate (the settled ``ProbeReading`` per
+      // probe: coords / fraction / nearest / residual + per-layer traces).
+      // Same omitted-when-absent rule.
+      if (!abState.processingAb) {
+        setProbeAggregates(msg.result?.probe_readings);
+      }
       const perToken = msg.result?.per_token_probes ?? [];
       const turn = _currentWriteTurn();
       if (turn?.tokens && perToken.length) {
@@ -1938,6 +2448,12 @@ export async function sendGenerate(
         apply: item.apply,
         awaitsGen: item.awaitsGen,
         rebuild: item.rebuild,
+        // A send lands an assistant turn, so the post-drain active node is an
+        // assistant.  Forward the factory's value (mirrors sendPrefill /
+        // sendCommit); omitting it left the queued send as ``undefined``, so
+        // ``predictedQueueEndOnUserNode`` skipped it and the input mode
+        // mispredicted while a gen was in flight.
+        endsOnUserNode: item.endsOnUserNode,
       },
       { replaceSlot: replaceSlot ?? null },
     );
@@ -2123,6 +2639,7 @@ function buildCommitPending(
   role: "user" | "assistant",
   parentNodeId: string | null | "active@drain",
   text: string,
+  raw: boolean = false,
 ): PendingAction {
   return {
     id: `pa-${_pendingCounter++}`,
@@ -2136,10 +2653,11 @@ function buildCommitPending(
       const parent = parentNodeId === "active@drain"
         ? loomTree.active_node_id
         : parentNodeId;
-      return sendCommitNow(role, parent, text);
+      return sendCommitNow(role, parent, text, raw);
     },
     awaitsGen: true,
-    rebuild: (newText: string) => buildCommitPending(role, parentNodeId, newText),
+    rebuild: (newText: string) =>
+      buildCommitPending(role, parentNodeId, newText, raw),
     createdAt: Date.now(),
     endsOnUserNode: role === "user",
   };
@@ -2160,10 +2678,10 @@ export async function sendCommit(
   role: "user" | "assistant",
   parentNodeId: string | null | "active@drain",
   text: string,
-  opts: { replaceSlot?: number | null } = {},
+  opts: { replaceSlot?: number | null; raw?: boolean } = {},
 ): Promise<void> {
   if (isPendingBusy()) {
-    const item = buildCommitPending(role, parentNodeId, text);
+    const item = buildCommitPending(role, parentNodeId, text, opts.raw ?? false);
     enqueuePending(
       {
         label: item.label,
@@ -2183,20 +2701,30 @@ export async function sendCommit(
   const resolved = parentNodeId === "active@drain"
     ? loomTree.active_node_id
     : parentNodeId;
-  return sendCommitNow(role, resolved, text);
+  return sendCommitNow(role, resolved, text, opts.raw ?? false);
 }
 
 async function sendCommitNow(
   role: "user" | "assistant",
   parentNodeId: string | null,
   text: string,
+  raw: boolean = false,
 ): Promise<void> {
   const sock = await ensureWebSocket();
+  // Per-message role labels ride the commit too (roleplay scaffold), so an
+  // authored turn is stamped with the box value just like a generated one.
+  // Raw / flat commits carry no chat-template role — the server suppresses
+  // labels there regardless, but we still omit them for clarity.
+  const commitSampling = raw ? null : buildSamplingPayload();
   const payload: WSClientMessage = {
     type: "generate",
     commit_role: role,
     commit_text: text,
     parent_node_id: parentNodeId,
+    ...(commitSampling ? { sampling: commitSampling } : {}),
+    // ``raw`` lifts the user-under-user guard server-side — a flat
+    // (base-model) commit's authored span may hang under any role.
+    raw,
   };
   const send = () => sock.send(JSON.stringify(payload));
   if (sock.readyState === WebSocket.OPEN) send();
@@ -2968,12 +3496,18 @@ export async function bootstrap(): Promise<void> {
   // First-paint: load persisted (v2 cache or v1 migration) before
   // attaching the persist effect so we don't immediately overwrite.
   loadPersistedChat();
+  // Per-model render-mode override (base vs chat) — also model-scoped.
+  loadGenUiMode();
   attachPersistence();
   await Promise.allSettled([
     refreshVectorList(),
+    // Unified probe roster — every probe shape (flat subspace + curved
+    // manifold).  404 tolerated (pre-read-side server) → ``unavailable``.
     refreshProbeList(),
     refreshCorrelation(),
-    refreshPacks(),
+    // Manifold catalog — 404 tolerated (server pre-dates the manifold
+    // HTTP surface); ``refreshManifoldList`` flips ``unavailable``.
+    refreshManifoldList(),
     // Server tree wins — fetch and reconcile.  404 is a quiet no-op
     // (server pre-loom); other failures surface via loomTree.error.
     refreshLoomTree(),

@@ -10,8 +10,12 @@ from __future__ import annotations
 
 import argparse
 import json
+from typing import TYPE_CHECKING
 
 from saklas import SaklasSession, SamplingConfig
+
+if TYPE_CHECKING:
+    from saklas import RunSet
 
 
 def main() -> None:
@@ -41,7 +45,7 @@ def main() -> None:
     print("\n=== steered (alpha={:.2f}) ===".format(args.alpha))
     print(steered.text)
 
-    def probe_summary(result) -> dict[str, float]:
+    def probe_summary(result: RunSet) -> dict[str, float]:
         return {name: round(r.mean, 3) for name, r in result.readings.items()}
 
     print("\n=== probe means ===")

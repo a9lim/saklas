@@ -14,6 +14,7 @@ worker thread without needing asyncio plumbing at this layer.
 from __future__ import annotations
 
 import warnings
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, Callable, Union
 
@@ -22,6 +23,13 @@ from typing import Any, Callable, Union
 class VectorExtracted:
     name: str
     profile: Any  # Profile — forward ref to avoid import cycle
+    metadata: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ManifoldExtracted:
+    name: str
+    manifold: Any  # Manifold — forward ref to avoid import cycle
     metadata: dict[str, Any]
 
 
@@ -57,6 +65,7 @@ class GenerationFinished:
 
 Event = Union[
     VectorExtracted,
+    ManifoldExtracted,
     SteeringApplied,
     SteeringCleared,
     ProbeScored,
@@ -81,10 +90,8 @@ class EventBus:
         self._subs.append(callback)
 
         def _unsub() -> None:
-            try:
+            with suppress(ValueError):
                 self._subs.remove(callback)
-            except ValueError:
-                pass
 
         return _unsub
 
@@ -98,4 +105,5 @@ class EventBus:
                 warnings.warn(
                     f"event subscriber {type(cb).__name__} raised during emit",
                     RuntimeWarning,
+                    stacklevel=2,
                 )

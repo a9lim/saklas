@@ -11,7 +11,7 @@ direction from source-space to target-space.
 Public surface:
 
 * :func:`load_or_compute_neutral_activations` — disk-cached per-model
-  neutral-statement activations; ``[N=90, D]`` per layer in fp16.
+  neutral-statement activations; ``[N=90, D]`` per layer, stored fp32.
 * :func:`fit_alignment` — per-layer alignment map ``M_L : ℝ^D_src → ℝ^D_tgt``.
 * :func:`transfer_profile` — apply the alignment map to a profile.
 * :func:`alignment_cache_path` — disk cache for the fitted map keyed by
@@ -69,9 +69,14 @@ def load_or_compute_neutral_activations(
     discipline as ``layer_means``).  Stale cache → recompute, write,
     return.  Fresh cache → load and return.
 
-    Returns ``{layer_idx: [N, D] fp32 CPU tensor}``.  Stored as fp16 on
-    disk to keep the artifact ~30MB instead of ~60MB; promoted back to
-    fp32 in memory for the Procrustes fit.
+    Returns ``{layer_idx: [N, D] fp32 CPU tensor}``.  Stored fp32 on disk so
+    the whitener covariance is built and inverted at full precision and the
+    compute path (cache miss) and cache-hit path return bit-identical tensors
+    (no precision seam — bf16's ~0.4% input error landed on exactly the
+    inverted quantity).  fp16 was abandoned because its 65504 ceiling overflows
+    gemma-3's extreme late-layer channels to ±inf (poisoning ``λ`` / ``K``);
+    fp32 has the range and, unlike the former bf16 store, no input-precision
+    loss, at the cost of ~2× disk on this one cache.
     """
     from saklas.core.vectors import compute_neutral_activations
 
@@ -91,29 +96,56 @@ def load_or_compute_neutral_activations(
                 sc = json.load(f)
             if current_ns_hash is None or sc.get("statements_sha256") == current_ns_hash:
                 tensors = load_file(str(ts_path))
-                # Tensors stored as ``layer_<idx>``; lift fp16 → fp32 in
-                # memory because Procrustes wants fp32 precision.
+                # Tensors stored as ``layer_<idx>``; promote to fp32 in memory
+                # (a no-op now that the store is fp32) because Procrustes / the
+                # whitener want fp32 precision.
                 out = {
                     int(k.split("_", 1)[1]): v.float()
                     for k, v in tensors.items()
                 }
-                log.debug("Loaded cached neutral activations for %s", model_id)
-                return out
-            log.info(
-                "Neutral activations stale (neutral_statements changed); recomputing for %s",
-                model_id,
-            )
+                # Invalidate a legacy bf16/fp16 cache: the store is now fp32 so
+                # the compute path and the cache path stay bit-identical (no
+                # precision seam on the inverted whitener covariance).  Check
+                # the RAW on-disk dtype (``tensors``, not the ``.float()``-
+                # promoted ``out``), recompute as fp32 on mismatch.
+                if any(t.dtype != torch.float32 for t in tensors.values()):
+                    log.info(
+                        "Neutral activations for %s are non-fp32 (legacy "
+                        "bf16/fp16 cache); recomputing as fp32", model_id,
+                    )
+                # Self-heal a legacy fp16 cache whose values overflowed to
+                # ±inf: gemma-3's extreme late-layer channels exceed the
+                # fp16 max (65504), poisoning the whitener (``λ=inf`` →
+                # ``K=nan``).  A non-finite cache is treated as stale and
+                # recomputed (now stored fp32, with fp16's range and no
+                # bf16 precision loss).
+                elif all(bool(torch.isfinite(t).all()) for t in out.values()):
+                    log.debug("Loaded cached neutral activations for %s", model_id)
+                    return out
+                else:
+                    log.warning(
+                        "Cached neutral activations for %s are non-finite "
+                        "(legacy fp16 overflow); recomputing as fp32.", model_id,
+                    )
+            else:
+                log.info(
+                    "Neutral activations stale (neutral_statements changed); recomputing for %s",
+                    model_id,
+                )
         except Exception as e:
             log.warning("Corrupt neutral activations cache for %s, recomputing: %s", model_id, e)
 
     log.info("Computing neutral activations (one-time per model)...")
     activations = compute_neutral_activations(model, tokenizer, layers)
 
-    # Persist as fp16 — the alignment fit doesn't benefit from fp32
-    # precision in the input observations themselves; the Procrustes
-    # SVD lifts to fp32 internally.
-    fp16 = {f"layer_{idx}": t.contiguous().to(torch.float16).cpu() for idx, t in activations.items()}
-    save_file(fp16, str(ts_path))
+    # Persist fp32 — the whitener covariance is built and inverted from these,
+    # so the compute path (this fresh fp32 store) and the cache-hit path stay
+    # bit-identical (no precision seam) and the inversion is full-precision.
+    # fp32 carries the exponent range fp16 lacked (gemma-3's late layers exceed
+    # the fp16 max of 65504 and overflowed to ±inf) without bf16's input loss,
+    # at ~2× disk on this one cache.
+    fp32 = {f"layer_{idx}": t.contiguous().to(torch.float32).cpu() for idx, t in activations.items()}
+    save_file(fp32, str(ts_path))
     write_json_atomic(sc_path, {
         "method": "neutral_activations",
         "statements_sha256": current_ns_hash or "",
@@ -211,9 +243,9 @@ def alignment_quality(
     geometry; values near 0.0 mean transferred probes will be noisy.
 
     Surfaced through ``Sidecar.transfer_quality_estimate`` (median over
-    shared layers) so users see one summary number per transfer; the
-    full per-layer dict is exported through the `pack ls -v` JSON path
-    for callers that want it.
+    shared layers) so users see one summary number per transfer; the full
+    per-layer dict is exported in transfer sidecars and CLI JSON output for
+    callers that want it.
     """
     out: dict[int, float] = {}
     for layer, M_L in M.items():
@@ -243,6 +275,7 @@ def transfer_profile(
     *,
     source_model_id: str,
     transfer_quality_estimate: float | None = None,
+    whitener: "Any | None" = None,
 ) -> Profile:
     """Apply the alignment map to a source-space profile.
 
@@ -251,12 +284,36 @@ def transfer_profile(
     dropped — partial transfer is the only sensible behavior, since a
     direction with no map can't be lifted into target space.
 
+    **Target-metric re-bake (mandatory).**  The source tensor is
+    share-baked in the *source* model's metric — its per-layer Euclidean
+    magnitude is the source Mahalanobis norm of the raw mean-diff (the
+    unified subspace hook reads ``‖baked_L‖₂ / Σ‖baked‖₂`` back out as
+    the layer share).  The orthogonal Procrustes map preserves Euclidean norm, so a
+    bare transfer would carry the *source* cross-layer share into target
+    space — where it no longer matches the target's anisotropy.  The
+    ``whitener`` for the **target** model is **required** and must cover
+    every transferred layer (all-or-nothing, mirroring the DiM-bake /
+    monitor / manifold-fit gate); each layer is rescaled so its magnitude
+    becomes its *target* Mahalanobis norm::
+
+        v_tgt'_L = v_tgt_L · (‖v_tgt_L‖_M(target) / ‖v_tgt_L‖₂)
+
+    The direction is untouched; only the per-layer magnitude — and hence
+    the hook-recovered share — changes.  ``‖v_tgt_L‖₂`` carries
+    the transported source-signal strength (the best target-signal proxy
+    available without target contrastive pairs) and ``‖v̂_tgt_L‖_M(target)``
+    applies the target anisotropy correction, so the composite is the
+    target-metric analogue of a native DiM bake.  ``bake: "mahalanobis"``
+    is stamped on the result.  A missing or non-covering whitener raises
+    :class:`WhitenerError` — there is no Euclidean transfer.
+
     Carries provenance through ``Profile.metadata``:
 
     * ``method = "procrustes_transfer"``
     * ``source_model_id`` — HF coord of the source model.
     * ``transfer_quality_estimate`` — median R² across shared layers, if
       known.
+    * ``bake`` — always ``"mahalanobis"``.
 
     Existing diagnostics fields on the source profile pass through
     unchanged; users can still reason about source-side separation when
@@ -267,27 +324,55 @@ def transfer_profile(
 
         raise ProfileError("transfer_profile: alignment_map is empty")
 
-    out_tensors: dict[int, torch.Tensor] = {}
+    # Stage the transferred directions in fp32 (keyed by layer) plus the
+    # original per-layer dtype, so the target re-bake operates at full
+    # precision before the dtype restore.
+    staged: dict[int, torch.Tensor] = {}
+    orig_dtype: dict[int, torch.dtype] = {}
     for layer, src_vec in profile.items():
         M_L = alignment_map.get(layer)
         if M_L is None:
             continue
         v_src = src_vec.to(torch.float32).to(M_L.device)
-        v_tgt = M_L @ v_src
-        # Restore the source dtype convention so the new profile is
-        # bit-comparable with native ones at the same layer.
-        out_tensors[layer] = v_tgt.to(dtype=src_vec.dtype).cpu()
+        staged[layer] = (M_L @ v_src).cpu()
+        orig_dtype[layer] = src_vec.dtype
 
-    if not out_tensors:
+    if not staged:
         from saklas.core.profile import ProfileError
 
         raise ProfileError(
             "transfer_profile: alignment covered no layers in the source profile"
         )
 
+    # Mahalanobis-only target re-bake: the per-layer ‖·‖_M and ‖·‖₂ scales
+    # differ by a 1/√λ_L factor that doesn't cancel from the cross-layer
+    # share, so the target whitener must cover every transferred layer.
+    # No Euclidean transfer — a missing / partial whitener is an error.
+    from saklas.core.mahalanobis import WhitenerError
+
+    if whitener is None or not whitener.covers_all(staged.keys()):
+        raise WhitenerError(
+            "transfer_profile requires a Mahalanobis whitener covering every "
+            f"transferred layer {sorted(staged.keys())}; generate neutral "
+            "activations for the TARGET model first (the Euclidean path is gone)"
+        )
+    for layer, v_tgt in staged.items():
+        eucl = float(v_tgt.norm().item())
+        if eucl < 1e-8:
+            # Degenerate direction — leave it; rescaling a zero vector
+            # is undefined and it carries no share anyway.
+            continue
+        m_norm = whitener.mahalanobis_norm(layer, v_tgt)
+        staged[layer] = v_tgt * (m_norm / eucl)
+
+    out_tensors = {
+        layer: v.to(dtype=orig_dtype[layer]) for layer, v in staged.items()
+    }
+
     metadata = dict(profile.metadata)
     metadata["method"] = "procrustes_transfer"
     metadata["source_model_id"] = source_model_id
+    metadata["bake"] = "mahalanobis"
     if transfer_quality_estimate is not None:
         metadata["transfer_quality_estimate"] = float(transfer_quality_estimate)
     return Profile(out_tensors, metadata=metadata)

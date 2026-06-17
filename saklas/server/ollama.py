@@ -20,21 +20,29 @@ Key differences from real Ollama:
 
 from __future__ import annotations
 
-from saklas.server.app import acquire_session_lock
+from saklas.server.app import (
+    acquire_session_lock,
+    _build_sampling_config,
+    _flatten_content,
+    _probe_reading_aggregate,
+    _probe_token_readings,
+    _merge_steering,
+    _parse_req_steering,
+    _strict_model_enabled,
+)
 
 import hashlib
 import json
 import logging
 import math
-import os
 import time
 from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-from saklas.core.sampling import SamplingConfig
+from saklas.core.errors import SaklasError
 from saklas.core.session import ConcurrentGenerationError, SaklasSession
 from saklas.core.steering import Steering
 
@@ -108,8 +116,7 @@ def _normalise_family(model_type: str) -> str:
     """
     mt = (model_type or "").lower()
     for suffix in ("_text", "_moe", "forcausallm"):
-        if mt.endswith(suffix):
-            mt = mt[: -len(suffix)]
+        mt = mt.removesuffix(suffix)
     return mt
 
 
@@ -142,10 +149,6 @@ def _aliases_for(session: SaklasSession) -> list[str]:
 def _known_model_names(session: SaklasSession) -> set[str]:
     names = {session.model_id, *_aliases_for(session)}
     return {n.lower() for n in names}
-
-
-def _strict_mode() -> bool:
-    return os.environ.get("SAKLAS_STRICT_MODEL", "").lower() in ("1", "true", "yes", "on")
 
 
 def _digest_of(name: str) -> str:
@@ -240,22 +243,7 @@ def _tag_entries(session: SaklasSession) -> list[dict[str, Any]]:
 # Option / message translation
 # ---------------------------------------------------------------------------
 
-def _flatten_content(content: Any) -> str:
-    """Ollama allows content to be a string or a list of text parts."""
-    if isinstance(content, list):
-        pieces: list[str] = []
-        for part in content:
-            if isinstance(part, dict) and "text" in part:
-                pieces.append(str(part["text"]))
-            elif isinstance(part, str):
-                pieces.append(part)
-        return "".join(pieces)
-    if content is None:
-        return ""
-    return str(content)
-
-
-def _extract_messages(body: dict) -> list[dict[str, str]]:
+def _extract_messages(body: dict[str, Any]) -> list[dict[str, str]]:
     raw = body.get("messages") or []
     out: list[dict[str, str]] = []
     for m in raw:
@@ -276,7 +264,7 @@ _PROCESSED_OPTIONS: frozenset[str] = frozenset({
 
 
 def _resolve_options(
-    body: dict, default_steering: "Steering | None",
+    body: dict[str, Any], default_steering: "Steering | None",
 ) -> tuple[dict[str, Any], str | None]:
     """Translate Ollama `options` + top-level fields into session.generate kwargs.
 
@@ -336,22 +324,20 @@ def _resolve_options(
     if ignored:
         log.debug("ollama: unsupported options dropped: %s", ", ".join(sorted(ignored)))
 
-    from saklas.core.steering_expr import parse_expr
-
+    # Ollama-unique: `steer` rides `options` or the top level, must be a
+    # string (non-string is a clear client error rather than a parse
+    # failure).  The string-parse + key-level merge are the shared
+    # ``_parse_req_steering`` / ``_merge_steering`` the OpenAI path uses.
     steer_raw = opts["steer"] if "steer" in opts else body.get("steer")
-    req_steering: "Steering | None" = None
-    explicit_clear = False
-    if steer_raw is not None:
-        if not isinstance(steer_raw, str):
-            raise ValueError(
-                "Ollama 'steer' must be a steering expression string, "
-                "e.g. \"0.5 honest + 0.3 warm\""
-            )
-        text = steer_raw.strip()
-        explicit_clear = not text
-        if text:
-            req_steering = parse_expr(text)
+    if steer_raw is not None and not isinstance(steer_raw, str):
+        raise ValueError(
+            "Ollama 'steer' must be a steering expression string, "
+            "e.g. \"0.5 honest + 0.3 warm\""
+        )
+    req_steering, explicit_clear = _parse_req_steering(steer_raw)
 
+    # Ollama-unique thinking precedence: the steer expression's flag is
+    # the base, the top-level ``think`` bool wins when present.
     thinking: bool | None = None
     if req_steering is not None and req_steering.thinking is not None:
         thinking = req_steering.thinking
@@ -359,14 +345,7 @@ def _resolve_options(
     if think_flag is not None:
         thinking = bool(think_flag)
 
-    merged_alphas: dict = {}
-    if default_steering is not None and not explicit_clear:
-        merged_alphas.update(default_steering.alphas)
-    if req_steering is not None:
-        for k, v in req_steering.alphas.items():
-            merged_alphas[k] = v
-
-    sc = SamplingConfig(
+    sc = _build_sampling_config(
         temperature=temperature,
         top_p=top_p,
         top_k=top_k,
@@ -376,9 +355,9 @@ def _resolve_options(
         presence_penalty=presence_penalty,
         frequency_penalty=frequency_penalty,
     )
-    steering: Steering | None = None
-    if merged_alphas or thinking is not None:
-        steering = Steering(alphas=merged_alphas, thinking=thinking)
+    steering = _merge_steering(
+        req_steering, default_steering, explicit_clear, thinking,
+    )
 
     gen_kwargs = {
         "sampling": sc,
@@ -395,7 +374,7 @@ def _resolve_options(
 # Response assembly
 # ---------------------------------------------------------------------------
 
-def _duration_stats(result, elapsed_ns: int) -> dict[str, int]:
+def _duration_stats(result: Any, elapsed_ns: int) -> dict[str, int]:
     """Build Ollama's *_duration and *_count fields from a GenerationResult.
 
     All durations are in nanoseconds.  Saklas tracks tokens/sec so we split the
@@ -456,14 +435,16 @@ def register_ollama_routes(app: FastAPI) -> None:
 
     @app.get("/api/ps")
     def api_ps():
-        entries = []
-        for entry in _tag_entries(session):
-            entries.append({
-                **entry,
-                "expires_at": "9999-12-31T23:59:59Z",
-                "size_vram": int((session.model_info.get("vram_used_gb") or 0) * 1024**3),
-            })
-        return {"models": entries}
+        return {
+            "models": [
+                {
+                    **entry,
+                    "expires_at": "9999-12-31T23:59:59Z",
+                    "size_vram": int((session.model_info.get("vram_used_gb") or 0) * 1024**3),
+                }
+                for entry in _tag_entries(session)
+            ]
+        }
 
     @app.post("/api/show")
     async def api_show(request: Request):
@@ -522,7 +503,7 @@ def register_ollama_routes(app: FastAPI) -> None:
     @app.post("/api/push")
     async def api_push():
         return JSONResponse(status_code=501, content={
-            "error": "saklas does not implement /api/push. Use `saklas pack push` for concept packs.",
+            "error": "saklas does not implement /api/push. Use `saklas manifold push` to publish a manifold.",
         })
 
     @app.post("/api/create")
@@ -557,16 +538,18 @@ def register_ollama_routes(app: FastAPI) -> None:
 
     @app.head("/")
     def api_head_root():
-        # Ollama clients hit HEAD / to probe liveness.
-        return JSONResponse(status_code=200, content=None)
+        # Ollama clients hit HEAD / to probe liveness.  A HEAD response
+        # carries no body, so return a bodyless 200 rather than a JSON
+        # payload (which advertised a bogus Content-Length / content-type).
+        return Response(status_code=200)
 
     # -----------------------------------------------------------------------
     # Generation endpoints
     # -----------------------------------------------------------------------
 
-    def _check_model_or_404(body: dict) -> None:
+    def _check_model_or_404(body: dict[str, Any]) -> None:
         """In strict mode, reject requests whose `model` doesn't match the loaded session."""
-        if not _strict_mode():
+        if not _strict_model_enabled():
             return
         name = str(body.get("model") or "")
         if name and name.lower() not in _known_model_names(session):
@@ -580,11 +563,11 @@ def register_ollama_routes(app: FastAPI) -> None:
             )
 
     async def _run_and_build_chat_response(
-        body: dict,
+        body: dict[str, Any],
         is_chat: bool,
-        gen_kwargs: dict,
+        gen_kwargs: dict[str, Any],
         system: str | None,
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Shared non-streaming path for /api/chat and /api/generate.
 
         Option resolution is hoisted to the route handler so any
@@ -616,8 +599,10 @@ def register_ollama_routes(app: FastAPI) -> None:
         try:
             async with session.lock:
                 result = session.generate(input_payload, raw=raw, **gen_kwargs)
-        except ConcurrentGenerationError:
-            raise HTTPException(status_code=409, detail="Generation already in progress")
+        except ConcurrentGenerationError as e:
+            raise HTTPException(
+                status_code=409, detail="Generation already in progress",
+            ) from e
         elapsed_ns = time.monotonic_ns() - start_ns
 
         model_name = str(body.get("model") or session.model_id)
@@ -625,8 +610,16 @@ def register_ollama_routes(app: FastAPI) -> None:
         done_reason = _finish_to_done_reason(session._gen_state.finish_reason)
         stats = _duration_stats(result, elapsed_ns)
 
+        # Saklas-specific extension: per-attached-manifold-probe aggregate
+        # readings ride alongside the Ollama wire fields under a vendor-
+        # prefixed top-level key so Ollama clients that don't read it stay
+        # unaffected.  Mirrors the OpenAI extension shape on the choice
+        # ("x-saklas-probe-readings"), at the top level here because
+        # Ollama responses have no per-choice container to hang it off.
+        mf_agg = _probe_reading_aggregate(session)
+
         if is_chat:
-            return {
+            payload: dict[str, Any] = {
                 "model": model_name,
                 "created_at": created_at,
                 "message": {"role": "assistant", "content": result.text},
@@ -634,10 +627,13 @@ def register_ollama_routes(app: FastAPI) -> None:
                 "done": True,
                 **stats,
             }
+            if mf_agg:
+                payload["x-saklas-probe-readings"] = mf_agg
+            return payload
         # Note: Ollama's /api/generate returns a `context` field of tokenized
         # state for stateless continuation.  Saklas doesn't round-trip that,
         # so we omit the field entirely rather than lie with an empty list.
-        return {
+        payload = {
             "model": model_name,
             "created_at": created_at,
             "response": result.text,
@@ -645,21 +641,24 @@ def register_ollama_routes(app: FastAPI) -> None:
             "done": True,
             **stats,
         }
+        if mf_agg:
+            payload["x-saklas-probe-readings"] = mf_agg
+        return payload
 
     async def _stream_chat_or_generate(
-        body: dict,
+        body: dict[str, Any],
         is_chat: bool,
-        gen_kwargs: dict,
+        gen_kwargs: dict[str, Any],
         system: str | None,
     ):
         """Streaming NDJSON body for /api/chat and /api/generate.
 
         ``gen_kwargs`` and ``system`` are resolved by the caller (the
         route handler) so any ``SaklasError`` from ``parse_expr`` raises
-        *before* ``StreamingResponse`` flushes headers. Once the stream
-        has started, FastAPI's exception handler can no longer convert
-        an exception to a 400 — the client would just see a TCP cutoff
-        mid-stream.
+        *before* ``StreamingResponse`` flushes headers. Materialization
+        errors can still happen when generation starts, so the iterator
+        also converts ``SaklasError`` in-band instead of cutting the TCP
+        stream off mid-flight.
         """
         if is_chat:
             msgs = _extract_messages(body)
@@ -689,83 +688,103 @@ def register_ollama_routes(app: FastAPI) -> None:
                 }) + "\n"
                 return
 
-            if True:
-                start_ns = time.monotonic_ns()
-                try:
-                    stream_iter = session.generate_stream(input_payload, raw=raw, **gen_kwargs)
-                    for event in stream_iter:
-                        if event.thinking:
-                            # Ollama doesn't standardize a reasoning channel;
-                            # the canonical shape uses a `thinking` field on
-                            # the message.  Non-Ollama clients ignore it.
-                            if is_chat:
-                                chunk = {
-                                    "model": model_name,
-                                    "created_at": _now_iso(),
-                                    "message": {"role": "assistant", "content": "",
-                                                "thinking": event.text},
-                                    "done": False,
-                                }
-                            else:
-                                chunk = {
-                                    "model": model_name,
-                                    "created_at": _now_iso(),
-                                    "response": "",
-                                    "thinking": event.text,
-                                    "done": False,
-                                }
+            # One timestamp for the whole stream, reused on every chunk —
+            # matching the non-streaming path's single ``_now_iso()`` call.
+            created_at = _now_iso()
+            start_ns = time.monotonic_ns()
+            try:
+                stream_iter = session.generate_stream(input_payload, raw=raw, **gen_kwargs)
+                for event in stream_iter:
+                    if event.thinking:
+                        # Ollama doesn't standardize a reasoning channel;
+                        # the canonical shape uses a `thinking` field on
+                        # the message.  Non-Ollama clients ignore it.
+                        if is_chat:
+                            chunk = {
+                                "model": model_name,
+                                "created_at": created_at,
+                                "message": {"role": "assistant", "content": "",
+                                            "thinking": event.text},
+                                "done": False,
+                            }
                         else:
-                            if is_chat:
-                                chunk = {
-                                    "model": model_name,
-                                    "created_at": _now_iso(),
-                                    "message": {"role": "assistant", "content": event.text},
-                                    "done": False,
-                                }
-                            else:
-                                chunk = {
-                                    "model": model_name,
-                                    "created_at": _now_iso(),
-                                    "response": event.text,
-                                    "done": False,
-                                }
-                        yield json.dumps(chunk) + "\n"
-                except ConcurrentGenerationError:
-                    yield json.dumps({
-                        "model": model_name, "created_at": _now_iso(),
-                        "error": "Generation already in progress",
-                    }) + "\n"
-                    return
+                            chunk = {
+                                "model": model_name,
+                                "created_at": created_at,
+                                "response": "",
+                                "thinking": event.text,
+                                "done": False,
+                            }
+                    else:
+                        if is_chat:
+                            chunk = {
+                                "model": model_name,
+                                "created_at": created_at,
+                                "message": {"role": "assistant", "content": event.text},
+                                "done": False,
+                            }
+                        else:
+                            chunk = {
+                                "model": model_name,
+                                "created_at": created_at,
+                                "response": event.text,
+                                "done": False,
+                            }
+                    # Per-token manifold readings ride under the same
+                    # vendor-prefixed extension as the non-streaming
+                    # path; populated only when at least one manifold
+                    # probe is attached and ``live_scores`` is on.
+                    mf_token = _probe_token_readings(event)
+                    if mf_token is not None:
+                        chunk["x-saklas-probe-readings"] = mf_token
+                    yield json.dumps(chunk) + "\n"
+            except ConcurrentGenerationError:
+                yield json.dumps({
+                    "model": model_name, "created_at": created_at,
+                    "error": "Generation already in progress",
+                }) + "\n"
+                return
+            except SaklasError as e:
+                _status, msg = e.user_message()
+                yield json.dumps({
+                    "model": model_name,
+                    "created_at": created_at,
+                    "error": msg,
+                }) + "\n"
+                return
 
-                elapsed_ns = time.monotonic_ns() - start_ns
-                result = session._last_result
-                done_reason = _finish_to_done_reason(session._gen_state.finish_reason)
-                stats = _duration_stats(result, elapsed_ns) if result is not None else {
-                    "total_duration": elapsed_ns, "load_duration": 0,
-                    "prompt_eval_count": 0, "prompt_eval_duration": 0,
-                    "eval_count": 0, "eval_duration": elapsed_ns,
+            elapsed_ns = time.monotonic_ns() - start_ns
+            result = session._last_result
+            done_reason = _finish_to_done_reason(session._gen_state.finish_reason)
+            stats = _duration_stats(result, elapsed_ns) if result is not None else {
+                "total_duration": elapsed_ns, "load_duration": 0,
+                "prompt_eval_count": 0, "prompt_eval_duration": 0,
+                "eval_count": 0, "eval_duration": elapsed_ns,
+            }
+            mf_agg = _probe_reading_aggregate(session)
+            if is_chat:
+                final = {
+                    "model": model_name,
+                    "created_at": created_at,
+                    "message": {"role": "assistant", "content": ""},
+                    "done_reason": done_reason,
+                    "done": True,
+                    **stats,
                 }
-                if is_chat:
-                    final = {
-                        "model": model_name,
-                        "created_at": _now_iso(),
-                        "message": {"role": "assistant", "content": ""},
-                        "done_reason": done_reason,
-                        "done": True,
-                        **stats,
-                    }
-                else:
-                    # See note in _run_and_build_chat_response: `context` is
-                    # omitted because saklas can't round-trip it honestly.
-                    final = {
-                        "model": model_name,
-                        "created_at": _now_iso(),
-                        "response": "",
-                        "done_reason": done_reason,
-                        "done": True,
-                        **stats,
-                    }
-                yield json.dumps(final) + "\n"
+            else:
+                # See note in _run_and_build_chat_response: `context` is
+                # omitted because saklas can't round-trip it honestly.
+                final = {
+                    "model": model_name,
+                    "created_at": created_at,
+                    "response": "",
+                    "done_reason": done_reason,
+                    "done": True,
+                    **stats,
+                }
+            if mf_agg:
+                final["x-saklas-probe-readings"] = mf_agg
+            yield json.dumps(final) + "\n"
 
     @app.post("/api/chat")
     async def api_chat(request: Request):

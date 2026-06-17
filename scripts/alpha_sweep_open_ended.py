@@ -1,10 +1,9 @@
-"""Alpha sweep across three concepts using the open-ended extraction pipeline.
+"""Alpha sweep across three concepts using the A2 conversational extraction pipeline.
 
-For each concept, calls ``session.extract(..., force_statements=True)`` to
-trigger the full pipeline (generate scenarios → save scenarios.json →
-generate pairs → save statements.json → extract contrastive → save tensor)
-even when a bundled pack already has curated v1.4 statements. Then generates
-at fixed seed across alphas ∈ {0, 0.25, 0.5, 0.75, 1.0, 1.25}.
+For each concept, calls ``session.extract(..., force=True)`` to regenerate the
+shared-baseline response corpora, author a 1- or 2-node ``pca`` manifold, and
+fit its per-model tensor even when a cached manifold already exists. Then
+generates at fixed seed across alphas in the configured sweep.
 
 Defaults to ``google/gemma-4-e4b-it`` — a weak model that makes both the
 extraction framework and the coherent/incoherent alpha boundary visible.
@@ -61,7 +60,7 @@ def run_concept(
     session: SaklasSession,
     name: str,
     pos: str,
-    neg: str,
+    neg: str | None,
     prompt: str,
     use_neg_alphas: bool,
 ) -> None:
@@ -76,7 +75,7 @@ def run_concept(
     t0 = time.time()
     canonical, profile = session.extract(
         pos, baseline=neg,
-        force_statements=True,
+        force=True,
         on_progress=lambda m: print(f"  [extract] {m}", flush=True),
     )
     dt = time.time() - t0

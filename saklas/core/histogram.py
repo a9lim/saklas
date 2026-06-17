@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 # One knob for every per-layer histogram surface (TUI WHY footer, CLI
-# ``vector why``). Chosen so the full profile of any supported model
+# ``manifold why``). Chosen so the full profile of any supported model
 # collapses into a fixed-height block that fits without scrolling.
 HIST_BUCKETS = 16
 

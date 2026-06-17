@@ -34,6 +34,7 @@ import json
 import os
 import secrets
 import tempfile
+from contextlib import suppress
 import threading
 import time
 from dataclasses import dataclass, field, fields
@@ -225,7 +226,7 @@ class Recipe:
         parent (``Recipe.overlay``) and see the no-op.
         """
         from saklas.core.steering_expr import (
-            AblationTerm, ProjectedTerm, parse_expr, format_expr,
+            AblationTerm, ManifoldTerm, ProjectedTerm, parse_expr, format_expr,
         )
         from saklas.core.steering import Steering
 
@@ -250,6 +251,18 @@ class Recipe:
                     target=val.target,
                 )
                 continue
+            if isinstance(val, ManifoldTerm):
+                # Flip the directional ``along`` (the representative coeff);
+                # ``onto`` is a collapse fraction in [0, 1], not a signed
+                # push, so it carries through unchanged.
+                flipped[name] = ManifoldTerm(
+                    along=-val.along,
+                    onto=val.onto,
+                    trigger=val.trigger,
+                    manifold=val.manifold,
+                    position=val.position,
+                )
+                continue
             if isinstance(val, tuple):
                 flipped[name] = (-float(val[0]), val[1])
                 continue
@@ -258,9 +271,6 @@ class Recipe:
             alphas=flipped,
             thinking=parsed.thinking,
             trigger=parsed.trigger,
-            injection_mode=parsed.injection_mode,
-            theta_max=parsed.theta_max,
-            projection_metric=parsed.projection_metric,
         )
         return Recipe(steering=format_expr(new))
 
@@ -345,6 +355,14 @@ class LoomNode:
     parent_id: str | None
     role: Role
     text: str = ""
+    # Per-turn role-substitution label (roleplay scaffold).  The custom
+    # label this turn was *sent* with — ``"captain"`` on a user node,
+    # ``"pirate"`` on an assistant node — or ``None`` for the family's
+    # standard label.  Stamped at send time (immutable afterward) so the
+    # chat-render walks each turn with its own role and the transcript /
+    # glyph display matches.  Distinct from the steering-driven
+    # ``_active_role`` (transient, never persisted here).
+    role_label: str | None = None
     tokens: list[TokenScoreDict] | None = None
     thinking_tokens: list[TokenScoreDict] | None = None
     recipe: Recipe | None = None
@@ -382,6 +400,7 @@ class LoomNode:
             "parent_id": self.parent_id,
             "role": self.role,
             "text": self.text,
+            "role_label": self.role_label,
             "aggregate_readings": dict(self.aggregate_readings),
             "applied_steering": self.applied_steering,
             "finish_reason": self.finish_reason,
@@ -411,6 +430,7 @@ class LoomNode:
             parent_id=data.get("parent_id"),
             role=data["role"],
             text=data.get("text", ""),
+            role_label=data.get("role_label"),
             tokens=data.get("tokens"),
             thinking_tokens=data.get("thinking_tokens"),
             recipe=recipe,
@@ -530,7 +550,7 @@ ConflictChecker = Callable[[str, str], None]
 
 def _noop_conflict_check(node_id: str, op: str) -> None:
     del node_id, op  # signature is the protocol; no work to do here
-    return None
+    return
 
 
 class LoomTree:
@@ -651,6 +671,7 @@ class LoomTree:
         leaf_id: str | None = None,
         *,
         include_system: bool = False,
+        with_labels: bool = False,
     ) -> list[dict[str, str]]:
         """Return the active-path (or path to ``leaf_id``) as chat messages.
 
@@ -658,6 +679,12 @@ class LoomTree:
         the rest of the engine + servers consume.  Skips the synthetic
         root by default (its empty text isn't a real system prompt) —
         callers wanting an explicit system prompt prepend it themselves.
+
+        ``with_labels`` adds each node's per-turn ``role_label`` under a
+        ``"label"`` key (the roleplay scaffold) so the chat-render path can
+        splice each turn with its own role.  Off by default to keep the
+        canonical ``{role, content}`` shape transcript / server / OpenAI
+        consumers expect.
         """
         target = leaf_id if leaf_id is not None else self.active_node_id
         path = self.path_to(target)
@@ -665,8 +692,32 @@ class LoomTree:
         for node in path:
             if node.id == self.root_id and not include_system:
                 continue
-            out.append({"role": node.role, "content": node.text})
+            msg: dict[str, str] = {"role": node.role, "content": node.text}
+            if with_labels:
+                msg["label"] = node.role_label  # pyright: ignore[reportArgumentType]  # role_label is str | None; with_labels callers expect nullable label
+            out.append(msg)
         return out
+
+    def flat_text(self, leaf_id: str | None = None) -> str:
+        """Return the active-path (or path-to-``leaf_id``) text, concatenated.
+
+        The base-model / flat-completion analogue of :meth:`messages_for`:
+        no roles, no separators, no chat template — every node's text
+        joined in root-to-leaf order, with the synthetic system root
+        skipped.  The raw-mode generation path feeds this verbatim to the
+        tokenizer so a completion model sees one continuous buffer rather
+        than a chat-templated transcript.  Returns ``""`` when the tree is
+        empty (target resolves to ``None`` or the bare root).
+        """
+        target = leaf_id if leaf_id is not None else self.active_node_id
+        if target is None:
+            return ""
+        parts: list[str] = []
+        for node in self.path_to(target):
+            if node.id == self.root_id:
+                continue
+            parts.append(node.text)
+        return "".join(parts)
 
     def ancestors_of(self, node_id: str) -> Iterator[str]:
         """Yield ``node_id``'s ancestor ids (parent first, root last)."""
@@ -684,13 +735,11 @@ class LoomTree:
 
     def _emit(self, event: LoomMutated) -> None:
         if self._events is not None:
-            try:
+            # Event delivery must not break a mutation. ``EventBus`` itself
+            # swallows subscriber errors; this guard catches anything from a
+            # non-EventBus shim.
+            with suppress(Exception):
                 self._events.emit(event)
-            except Exception:
-                # Event delivery must not break a mutation.  ``EventBus``
-                # itself swallows subscriber errors; this guard catches
-                # anything from a non-EventBus shim.
-                pass
 
     def _add_child(self, parent_id: str, node: LoomNode) -> None:
         self.nodes[node.id] = node
@@ -707,6 +756,7 @@ class LoomTree:
         parent_id: str | None = None,
         *,
         dedup_existing: bool = True,
+        role_label: str | None = None,
     ) -> str:
         """Add a user turn under ``parent_id`` (default: the active node).
 
@@ -714,6 +764,10 @@ class LoomTree:
         child with the exact same text, returns that existing child's id
         without growing the tree.  This spares users a redundant tree level
         for the regen workflow where the user re-sends the same prompt.
+
+        ``role_label`` stamps the per-turn role-substitution label (the
+        roleplay scaffold) onto a freshly-created node; a dedup hit keeps
+        the existing node's label unchanged.
         """
         with self._lock:
             parent = parent_id if parent_id is not None else self.active_node_id
@@ -731,7 +785,10 @@ class LoomTree:
                             active_node_id=self.active_node_id,
                         ))
                         return sib.id
-            node = LoomNode(id=_ulid(), parent_id=parent, role="user", text=text)
+            node = LoomNode(
+                id=_ulid(), parent_id=parent, role="user", text=text,
+                role_label=role_label,
+            )
             self._add_child(parent, node)
             self.active_node_id = node.id
             self.rev += 1
@@ -745,12 +802,17 @@ class LoomTree:
         self,
         parent_id: str,
         recipe: Recipe | None = None,
+        *,
+        role_label: str | None = None,
     ) -> str:
         """Create an empty assistant node under ``parent_id``.
 
         Returns the new node id.  The session calls this in the gen
         preamble; subsequent ``append_token`` / ``finalize_assistant``
         calls populate the node as the generation streams.
+
+        ``role_label`` stamps the per-turn role-substitution label the
+        model is generating under (the roleplay scaffold).
         """
         with self._lock:
             if parent_id not in self.nodes:
@@ -761,6 +823,7 @@ class LoomTree:
                 parent_id=parent_id,
                 role="assistant",
                 recipe=recipe,
+                role_label=role_label,
                 tokens=[],
                 thinking_tokens=[],
             )
@@ -967,7 +1030,7 @@ class LoomTree:
             active_moved_to: str | None = None
             if self.active_node_id in removed_set:
                 # parent_id is non-None because node_id != root_id.
-                self.active_node_id = parent_id  # type: ignore[assignment]
+                self.active_node_id = parent_id  # pyright: ignore[reportAttributeAccessIssue]  # non-None: node_id != root_id guard above ensures it
                 active_moved_to = parent_id
 
             if parent_id is not None:
@@ -1022,7 +1085,12 @@ class LoomTree:
         """Drop the entire tree.  Refused under in-flight generation."""
         with self._lock:
             self._conflict_check(self.root_id, "reset")
-            removed = tuple(nid for nid in self.nodes if nid != self.root_id)
+            # Every current id is removed — including the *old* root, which the
+            # fresh ``_ulid()`` root below replaces.  Reporting the old root in
+            # ``removed`` keeps the delta self-consistent for id-tracking
+            # surfaces (the WS dashboard's ``applyTreeDelta``), which otherwise
+            # retain a stale orphan root.
+            removed = tuple(self.nodes)
             # Wipe everything; rebuild a fresh root.
             self.nodes.clear()
             self.children_of.clear()
@@ -1189,10 +1257,8 @@ class LoomTree:
 
         if token_payload is None:
             write_json_atomic(out_path, data)
-            try:
+            with suppress(FileNotFoundError):
                 sidecar.unlink()
-            except FileNotFoundError:
-                pass
             return
 
         sidecar.parent.mkdir(parents=True, exist_ok=True)
@@ -1208,10 +1274,8 @@ class LoomTree:
                 json.dump(token_payload, f, ensure_ascii=False, separators=(",", ":"))
             os.replace(tmp, sidecar)
         finally:
-            try:
+            with suppress(FileNotFoundError):
                 tmp.unlink()
-            except FileNotFoundError:
-                pass
         write_json_atomic(out_path, data)
 
     @classmethod

@@ -1,10 +1,10 @@
-"""SteeringHook per-trigger grouping + conditional apply.
+"""SteeringHook per-trigger conditional apply on the 4.0 subspace backend.
 
-Exercises the hook's fast path (BOTH-only → single composed tensor, no
-per-step trigger check) and the slow path (multiple groups, ctx-gated
-adds) without loading a real transformer layer.  A
-``nn.Identity``-equivalent module returning the hidden state unchanged
-is enough to drive the hook.
+The hook no longer has an additive fast path — every steering term lowers to a
+``subspace_inject`` group (the merged affine subspace + curved manifolds).  This
+exercises the surviving behavior: a group fires only on the decode steps where
+its :class:`Trigger` is active, and ``ctx`` mutation between forwards gates the
+apply.  A ``nn.Identity``-equivalent module is enough to drive the hook.
 """
 
 from __future__ import annotations
@@ -12,214 +12,133 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from saklas.core.hooks import SteeringHook, SteeringManager, _STEER_GAIN
+from saklas.core.hooks import SteeringHook, SteeringManager
+from saklas.core.manifold import CustomDomain, LayerSubspace, synthesize_subspace
 from saklas.core.triggers import Trigger, TriggerContext
 
 
-class _Passthrough(nn.Module):
-    """Module that returns (hidden,) so the hook can mutate it in place."""
-
-    def forward(self, hidden: torch.Tensor) -> tuple[torch.Tensor]:
-        return (hidden,)
+_DIM = 16
 
 
-def _unit_vec(dim: int, seed: int = 0) -> torch.Tensor:
+def _unit(dim: int, seed: int = 0) -> torch.Tensor:
     g = torch.Generator().manual_seed(seed)
     v = torch.randn(dim, generator=g)
     return v / v.norm()
 
 
-def test_fast_path_both_only_composes_single_tensor():
-    hook = SteeringHook(injection_mode="additive")
+_AffineEntry = tuple[
+    LayerSubspace,
+    CustomDomain,
+    torch.Tensor,
+    torch.Tensor,
+    float,
+    float,
+    torch.Tensor,
+    Trigger,
+]
+
+
+def _affine_group(layer: int, trigger: Trigger) -> _AffineEntry:
+    """One ``(sub, domain, target, origin, along, onto, kappa, trigger)`` entry.
+
+    A rank-1 affine subspace from a single push term — the merged-subspace shape
+    ``apply_to_model`` hands ``recompose``.
+    """
+    u = _unit(_DIM)
+    neutral = 20.0 + torch.randn(_DIM, generator=torch.Generator().manual_seed(1))
+    synth = synthesize_subspace(
+        push=[({layer: u.reshape(1, -1)}, {layer: torch.tensor([1.0])}, 0.8)],
+        ablate=[], neutral_means={layer: neutral},
+    )
+    sub = synth.layers[layer]
+    return (
+        sub, CustomDomain(sub.rank), synth.target_coord[layer],
+        torch.zeros(sub.rank), 1.0, 0.0, synth.kappa[layer], trigger,
+    )
+
+
+def _recompose(hook: SteeringHook, entry: _AffineEntry, ctx: TriggerContext) -> None:
+    hook.recompose([entry], ctx, device=torch.device("cpu"))
+
+
+# ----------------------------------------------------------------- grouping ---
+
+def test_recompose_stamps_group_and_cold_feet():
+    hook = SteeringHook()
     ctx = TriggerContext()
-    vec = _unit_vec(16)
-    hook.recompose(
-        additive_entries=[(vec, 1.0, Trigger.BOTH)],
-        ablation_entries=[],
-        device=torch.device("cpu"), dtype=torch.float32, ctx=ctx,
-    )
-    assert hook.composed is not None
-    assert hook.composed_groups == []
+    _recompose(hook, _affine_group(0, Trigger.AFTER_THINKING), ctx)
+    assert len(hook.manifold_groups) == 1
+    assert hook.manifold_groups[0][0] == Trigger.AFTER_THINKING
+    assert hook._manifold_feet == [None]
 
 
-def test_slow_path_non_both_uses_groups():
-    hook = SteeringHook(injection_mode="additive")
+def test_zero_coeff_group_dropped():
+    hook = SteeringHook()
     ctx = TriggerContext()
-    vec = _unit_vec(16)
-    hook.recompose(
-        additive_entries=[(vec, 1.0, Trigger.AFTER_THINKING)],
-        ablation_entries=[],
-        device=torch.device("cpu"), dtype=torch.float32, ctx=ctx,
+    sub, domain, target, origin, _along, _onto, _kappa, trig = _affine_group(
+        0, Trigger.BOTH,
     )
-    assert hook.composed is None
-    assert len(hook.composed_groups) == 1
-    assert hook.composed_groups[0][0] == Trigger.AFTER_THINKING
+    hook.recompose(
+        [(sub, domain, target, origin, 0.0, 0.0, 0.0, trig)],
+        ctx, device=torch.device("cpu"),
+    )
+    assert hook.manifold_groups == []
 
 
-def test_equal_triggers_collapse_into_single_group():
-    hook = SteeringHook(injection_mode="additive")
+# ------------------------------------------------------- conditional apply ---
+
+def test_both_trigger_always_applies():
+    hook = SteeringHook()
     ctx = TriggerContext()
-    v1 = _unit_vec(16, seed=1)
-    v2 = _unit_vec(16, seed=2)
-    # Two entries with the same trigger VALUE (distinct dataclass
-    # instances but equal fields) should share one composed tensor.
-    t_a = Trigger.AFTER_THINKING
-    t_b = Trigger(prompt=False, thinking=False)  # == AFTER_THINKING
-    hook.recompose(
-        additive_entries=[(v1, 1.0, t_a), (v2, 1.0, t_b)],
-        ablation_entries=[],
-        device=torch.device("cpu"), dtype=torch.float32, ctx=ctx,
-    )
-    assert hook.composed is None
-    assert len(hook.composed_groups) == 1
+    _recompose(hook, _affine_group(0, Trigger.BOTH), ctx)
+    hook._ctx = ctx
+    hidden = (20.0 + torch.randn(1, 3, _DIM)).to(torch.float32)
+    before = hidden.clone()
+    hook.hook_fn(None, None, hidden)
+    assert not torch.allclose(hidden, before, atol=1e-3)
 
 
-def test_mixed_both_and_non_both_keeps_both_in_slow_path():
-    hook = SteeringHook(injection_mode="additive")
+def test_non_both_skips_when_inactive():
+    hook = SteeringHook()
     ctx = TriggerContext()
-    v_both = _unit_vec(16, seed=1)
-    v_after = _unit_vec(16, seed=2)
-    hook.recompose(
-        additive_entries=[(v_both, 1.0, Trigger.BOTH),
-                          (v_after, 1.0, Trigger.AFTER_THINKING)],
-        ablation_entries=[],
-        device=torch.device("cpu"), dtype=torch.float32, ctx=ctx,
-    )
-    # Mixed groups → slow path; composed stays None even though one group
-    # is BOTH (fast-path collapse requires a single BOTH group only).
-    assert hook.composed is None
-    assert len(hook.composed_groups) == 2
-
-
-def test_zero_alpha_group_dropped():
-    hook = SteeringHook(injection_mode="additive")
-    ctx = TriggerContext()
-    vec = _unit_vec(16)
-    hook.recompose(
-        additive_entries=[(vec, 0.0, Trigger.AFTER_THINKING)],
-        ablation_entries=[],
-        device=torch.device("cpu"), dtype=torch.float32, ctx=ctx,
-    )
-    assert hook.composed is None
-    assert hook.composed_groups == []
-
-
-def test_fast_path_hook_apply_bit_identical_to_manual_add():
-    """Fast-path apply matches manual add+rescale for a BOTH-only hook."""
-    mod = _Passthrough()
-    hook = SteeringHook(injection_mode="additive")
-    ctx = TriggerContext()
-    vec = _unit_vec(16) * 0.5
-    hook.recompose(
-        additive_entries=[(vec, 1.0, Trigger.BOTH)],
-        ablation_entries=[],
-        device=torch.device("cpu"), dtype=torch.float32, ctx=ctx,
-    )
-    hook.attach(mod)
-
-    h = torch.randn(1, 4, 16)
-    h_copy = h.clone()
-    out = mod(h)[0]
-    # Manual apply: add vec to every position, rescale to pre norm.
-    expected = h_copy.clone()
-    norm_pre = expected.norm(dim=-1, keepdim=True, dtype=torch.float32)
-    expected.add_(vec)
-    norm_post = expected.norm(dim=-1, keepdim=True, dtype=torch.float32).clamp_(min=1e-6)
-    expected.mul_((norm_pre / norm_post).to(expected.dtype))
-    assert torch.allclose(out, expected, atol=1e-6)
-    hook.detach()
-
-
-def test_slow_path_skips_when_no_group_active():
-    """AFTER_THINKING during prefill should no-op — hidden unchanged."""
-    mod = _Passthrough()
-    hook = SteeringHook(injection_mode="additive")
-    ctx = TriggerContext(is_prefill=True)  # prefill → AFTER_THINKING off
-    vec = _unit_vec(16)
-    hook.recompose(
-        additive_entries=[(vec, 1.0, Trigger.AFTER_THINKING)],
-        ablation_entries=[],
-        device=torch.device("cpu"), dtype=torch.float32, ctx=ctx,
-    )
-    hook.attach(mod)
-
-    h = torch.randn(1, 4, 16)
-    h_before = h.clone()
-    mod(h)
-    assert torch.equal(h, h_before), "hidden state must be unchanged"
-    hook.detach()
-
-
-def test_slow_path_applies_when_group_active():
-    """AFTER_THINKING during decode-response should apply."""
-    mod = _Passthrough()
-    hook = SteeringHook(injection_mode="additive")
-    ctx = TriggerContext(is_prefill=False, thinking=False, gen_step=5)
-    vec = _unit_vec(16) * 0.5
-    hook.recompose(
-        additive_entries=[(vec, 1.0, Trigger.AFTER_THINKING)],
-        ablation_entries=[],
-        device=torch.device("cpu"), dtype=torch.float32, ctx=ctx,
-    )
-    hook.attach(mod)
-    h = torch.randn(1, 4, 16)
-    h_before = h.clone()
-    mod(h)
-    assert not torch.equal(h, h_before), "hook should have modified hidden"
-    hook.detach()
+    ctx.thinking = True  # inside the thinking section ⇒ AFTER_THINKING inactive
+    _recompose(hook, _affine_group(0, Trigger.AFTER_THINKING), ctx)
+    hook._ctx = ctx
+    hidden = (20.0 + torch.randn(1, 3, _DIM)).to(torch.float32)
+    before = hidden.clone()
+    hook.hook_fn(None, None, hidden)
+    assert torch.allclose(hidden, before, atol=1e-6)
 
 
 def test_ctx_mutation_between_forwards_gates_apply():
-    """Flipping ctx.is_prefill between forwards toggles the AFTER_THINKING group."""
-    mod = _Passthrough()
-    hook = SteeringHook(injection_mode="additive")
-    ctx = TriggerContext(is_prefill=True)
-    vec = _unit_vec(16) * 0.5
-    hook.recompose(
-        additive_entries=[(vec, 1.0, Trigger.AFTER_THINKING)],
-        ablation_entries=[],
-        device=torch.device("cpu"), dtype=torch.float32, ctx=ctx,
-    )
-    hook.attach(mod)
+    hook = SteeringHook()
+    ctx = TriggerContext()
+    ctx.thinking = True  # start inside thinking → inactive
+    _recompose(hook, _affine_group(0, Trigger.AFTER_THINKING), ctx)
+    hook._ctx = ctx
 
-    # Forward 1: prefill → no change.
-    h1 = torch.randn(1, 4, 16)
-    h1_before = h1.clone()
-    mod(h1)
-    assert torch.equal(h1, h1_before)
+    hidden = (20.0 + torch.randn(1, 1, _DIM)).to(torch.float32)
+    before = hidden.clone()
+    hook.hook_fn(None, None, hidden)  # inactive → no-op
+    assert torch.allclose(hidden, before, atol=1e-6)
 
-    # Mutate ctx → same hook, now fires.
-    ctx.is_prefill = False
-    h2 = torch.randn(1, 4, 16)
-    h2_before = h2.clone()
-    mod(h2)
-    assert not torch.equal(h2, h2_before)
-    hook.detach()
+    # Leave the thinking section; the same hook now fires on response tokens.
+    ctx.thinking = False
+    hidden2 = (20.0 + torch.randn(1, 1, _DIM)).to(torch.float32)
+    before2 = hidden2.clone()
+    hook.hook_fn(None, None, hidden2)
+    assert not torch.allclose(hidden2, before2, atol=1e-3)
 
 
 def test_manager_threads_ctx_into_hooks():
-    """SteeringManager.apply_to_model plumbs its shared ctx into every hook."""
-    mgr = SteeringManager(injection_mode="additive")
-    layers = nn.ModuleList([_Passthrough() for _ in range(3)])
-    profile = {1: _unit_vec(16), 2: _unit_vec(16, seed=1)}
-    mgr.add_vector("demo", profile, alpha=0.5, trigger=Trigger.AFTER_THINKING)
-    mgr.apply_to_model(layers, device=torch.device("cpu"), dtype=torch.float32)
-    for idx in (1, 2):
-        assert idx in mgr.hooks
-        assert mgr.hooks[idx]._ctx is mgr.ctx
-    # Unused layer has no hook.
-    assert 0 not in mgr.hooks
-    mgr.clear_all()
-
-
-def test_manager_alpha_scaled_by_steer_gain():
-    """Manager multiplies user alpha by _STEER_GAIN before composing."""
-    mgr = SteeringManager(injection_mode="additive")
-    layers = nn.ModuleList([_Passthrough() for _ in range(2)])
-    vec = _unit_vec(16)
-    mgr.add_vector("demo", {0: vec.clone()}, alpha=0.5, trigger=Trigger.BOTH)
-    mgr.apply_to_model(layers, device=torch.device("cpu"), dtype=torch.float32)
-    # Fast-path: composed == 0.5 * _STEER_GAIN * vec.
-    expected = (0.5 * _STEER_GAIN) * vec
-    assert torch.allclose(mgr.hooks[0].composed, expected, atol=1e-6)
-    mgr.clear_all()
+    mgr = SteeringManager()
+    synth = synthesize_subspace(
+        push=[({0: _unit(_DIM).reshape(1, -1)}, {0: torch.tensor([1.0])}, 0.5)],
+        ablate=[], neutral_means={0: 20.0 + torch.randn(_DIM)},
+    )
+    mgr.add_subspace("__affine__", synth)
+    layers = nn.ModuleList([nn.Identity() for _ in range(2)])
+    mgr.apply_to_model(layers, torch.device("cpu"), torch.float32)
+    # Every attached hook shares the manager's mutable context.
+    for hook in mgr.hooks.values():
+        assert hook._ctx is mgr.ctx

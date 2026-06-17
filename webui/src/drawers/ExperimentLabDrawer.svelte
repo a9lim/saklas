@@ -7,10 +7,11 @@
     loomNavigate,
     refreshLoomTree,
     samplingState,
-    vectorRack,
+    steerRack,
     vectorsState,
   } from "../lib/stores.svelte";
   import { serializeExpression } from "../lib/expression";
+  import Select from "../lib/Select.svelte";
 
   let _drawerProps: { params?: unknown } = $props();
   $effect(() => {
@@ -30,8 +31,8 @@
   const conceptOptions = $derived.by(() => {
     const names = new Set<string>([
       ...vectorsState.names,
-      ...vectorRack.entries.keys(),
-      ...vectorRack.profiles.keys(),
+      ...steerRack.entries.keys(),
+      ...steerRack.profiles.keys(),
     ]);
     return [...names].sort();
   });
@@ -56,7 +57,7 @@
   }
 
   function firstConcept(): string {
-    return [...vectorRack.entries.keys()][0] ?? vectorsState.names[0] ?? "";
+    return [...steerRack.entries.keys()][0] ?? vectorsState.names[0] ?? "";
   }
 
   function parseAlphaList(raw: string): number[] {
@@ -92,7 +93,7 @@
   function baseSteeringExcluding(axisNames: string[]): string | null {
     const excluded = new Set(axisNames.map((name) => name.trim()).filter(Boolean));
     const base = new Map(
-      [...vectorRack.entries.entries()].filter(([name]) => !excluded.has(name)),
+      [...steerRack.entries.entries()].filter(([name]) => !excluded.has(name)),
     );
     return serializeExpression(base) || null;
   }
@@ -228,11 +229,11 @@
       <div class="runbar">
         <label class="field metric">
           <span>metric</span>
-          <select bind:value={metric}>
-            {#each metrics as m (m)}
-              <option value={m}>{m}</option>
-            {/each}
-          </select>
+          <Select
+            bind:value={metric}
+            options={metrics.map((m) => ({ value: m, label: m }))}
+            ariaLabel="metric"
+          />
         </label>
         <button type="button" class="primary" disabled={busy} onclick={run}>
           {busy ? "running grid…" : "run experiment"}
@@ -313,9 +314,9 @@
   .setup, .results { border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); padding: var(--space-5); min-width: 0; }
   .field { display: grid; gap: var(--space-2); color: var(--fg-muted); font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0; }
   .prompt { margin-bottom: var(--space-5); }
-  input, textarea, select { width: 100%; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-deep); color: var(--fg); padding: var(--space-4); font-family: var(--font-mono); font-size: var(--text-xs); letter-spacing: 0; }
+  input, textarea { width: 100%; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-deep); color: var(--fg); padding: var(--space-4); font-family: var(--font-mono); font-size: var(--text-xs); letter-spacing: 0; }
   textarea { resize: vertical; line-height: 1.45; }
-  input:focus, textarea:focus, select:focus { outline: none; border-color: var(--accent); }
+  input:focus, textarea:focus { outline: none; border-color: var(--accent); }
   .axis-grid { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-5); }
   .runbar { display: grid; grid-template-columns: 1fr auto; align-items: end; gap: var(--space-5); margin-top: var(--space-5); }
   .primary { border: 1px solid var(--accent); border-radius: var(--radius); background: var(--accent); color: var(--text-on-accent); padding: var(--space-4) var(--space-5); font-weight: var(--weight-bold); }

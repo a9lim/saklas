@@ -3,11 +3,13 @@ import json
 import csv
 import tempfile
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 import torch
 from saklas.core.results import (
     ProbeReadings,
+    ProbeReading,
     GenerationResult,
     RunSet,
     TokenEvent,
@@ -17,11 +19,10 @@ from saklas.core.results import (
 
 class TestPublicAPI:
     def test_imports(self):
-        from saklas import SaklasSession, DataSource, ResultCollector
+        from saklas import SaklasSession, ResultCollector
         from saklas import RunSet
         from saklas import GenerationResult, TokenEvent, ProbeReadings
         assert SaklasSession is not None
-        assert DataSource is not None
         assert ResultCollector is not None
         assert RunSet is not None
         assert GenerationResult is not None
@@ -32,21 +33,22 @@ class TestPublicAPI:
 class TestProbeReadings:
     def test_from_per_generation_data(self):
         readings = ProbeReadings(
-            per_generation=[0.1, 0.3, 0.5, 0.4],
-            mean=0.325, std=0.1479, min=0.1, max=0.5, delta_per_gen=0.1,
+            per_generation=[(0.1,), (0.3,), (0.5,), (0.4,)],
+            mean=(0.325,), std=(0.1479,), min=(0.1,), max=(0.5,), delta_per_gen=(0.1,),
         )
-        assert readings.mean == 0.325
-        assert readings.min == 0.1
+        assert readings.mean == (0.325,)
+        assert readings.min == (0.1,)
         assert len(readings.per_generation) == 4
 
     def test_to_dict_returns_plain_types(self):
         readings = ProbeReadings(
-            per_generation=[0.1, 0.2], mean=0.15, std=0.05, min=0.1, max=0.2, delta_per_gen=0.1,
+            per_generation=[(0.1,), (0.2,)],
+            mean=(0.15,), std=(0.05,), min=(0.1,), max=(0.2,), delta_per_gen=(0.1,),
         )
         d = readings.to_dict()
         assert isinstance(d, dict)
         assert isinstance(d["per_generation"], list)
-        assert isinstance(d["mean"], float)
+        assert isinstance(d["mean"], tuple)
 
 
 class TestGenerationResult:
@@ -63,7 +65,8 @@ class TestGenerationResult:
 
     def test_to_dict_with_probes(self):
         readings = ProbeReadings(
-            per_generation=[0.5], mean=0.5, std=0.0, min=0.5, max=0.5, delta_per_gen=0.0,
+            per_generation=[(0.5,)],
+            mean=(0.5,), std=(0.0,), min=(0.5,), max=(0.5,), delta_per_gen=(0.0,),
         )
         result = GenerationResult(
             text="Hi", tokens=[1], token_count=1, tok_per_sec=5.0, elapsed=0.2,
@@ -134,11 +137,13 @@ class TestTokenEvent:
         assert event.top_alts == alts
 
     def test_scores_and_perplexity(self):
+        happy = ProbeReading(fraction=0.4, nearest=[], coords=(0.4,))
+        sad = ProbeReading(fraction=-0.1, nearest=[], coords=(-0.1,))
         event = TokenEvent(
             text="x", token_id=0, index=0,
-            scores={"happy": 0.4, "sad": -0.1}, perplexity=12.7,
+            scores={"happy": happy, "sad": sad}, perplexity=12.7,
         )
-        assert event.scores == {"happy": 0.4, "sad": -0.1}
+        assert event.scores == {"happy": happy, "sad": sad}
         assert event.perplexity == 12.7
 
     def test_finish_reason_set(self):
@@ -164,7 +169,8 @@ class TestResultCollector:
 
     def test_probe_readings_flattened(self):
         readings = ProbeReadings(
-            per_generation=[0.5], mean=0.5, std=0.0, min=0.5, max=0.5, delta_per_gen=0.0,
+            per_generation=[(0.5,)],
+            mean=(0.5,), std=(0.0,), min=(0.5,), max=(0.5,), delta_per_gen=(0.0,),
         )
         result = GenerationResult(
             text="Hi", tokens=[1], token_count=1, tok_per_sec=5.0, elapsed=0.2,
@@ -177,6 +183,23 @@ class TestResultCollector:
         assert d["probe_honest_std"] == 0.0
         assert d["probe_honest_min"] == 0.5
         assert d["probe_honest_max"] == 0.5
+
+    def test_probe_readings_flattened_accepts_legacy_scalar_stats(self):
+        readings = ProbeReadings(
+            per_generation=cast(Any, [0.5]),
+            mean=cast(Any, 0.5),
+            std=cast(Any, 0.0),
+            min=cast(Any, 0.5),
+            max=cast(Any, 0.5),
+            delta_per_gen=cast(Any, 0.0),
+        )
+        result = GenerationResult(
+            text="Hi", tokens=[1], token_count=1, tok_per_sec=5.0, elapsed=0.2,
+            readings={"honest": readings}, vectors={},
+        )
+        collector = ResultCollector()
+        collector.add(result)
+        assert collector.results[0]["probe_honest_mean"] == 0.5
 
     def test_to_jsonl(self):
         collector = ResultCollector()
@@ -302,36 +325,59 @@ def test_generation_result_hidden_states_can_be_set_and_is_omitted_from_to_dict(
 
 
 class TestTraitMonitorScoring:
-    """Tests for TraitMonitor probe scoring — runs anywhere (no GPU)."""
+    """Tests for unified ``Monitor`` probe scoring — runs anywhere (no GPU).
 
-    @staticmethod
-    def _make_monitor():
-        from saklas.core.monitor import TraitMonitor
-        dim = 16
-        # Create a probe vector pointing in a known direction
-        probe_vec = torch.zeros(dim)
+    Mahalanobis-only (4.0 collapse): probe scoring requires a covering
+    whitener.  A single steering direction is attached as a 1-node ray via
+    ``fold_directions_to_subspace`` (the session's vector-probe path); the read
+    is the in-subspace **domain coordinate** (``history`` stores the coordinate
+    tuple, axis 0 the scalar), so value assertions are structural (sign /
+    ordering / finiteness), not exact cosines.
+    """
+
+    _DIM = 16
+    # Zero neutral mean so the probe/hidden vectors below are already centered.
+    _MEANS = {0: torch.zeros(16)}
+
+    @classmethod
+    def _make_monitor(cls):
+        from saklas.core.monitor import Monitor
+        from saklas.core.vectors import fold_directions_to_subspace
+        from tests._whitener import synthetic_whitener
+        probe_vec = torch.zeros(cls._DIM)
         probe_vec[0] = 1.0  # unit vector along dim 0
-        probe_profile = {0: probe_vec}
-        layer_means = {0: torch.zeros(dim)}
-        return TraitMonitor({"test_probe": probe_profile}, layer_means)
+        whitener = synthetic_whitener([0], cls._DIM, means=cls._MEANS)
+        m = fold_directions_to_subspace(
+            "test_probe", {0: probe_vec}, dict(cls._MEANS), whitener=whitener,
+        )
+        return Monitor(
+            {"test_probe": m}, layer_means=dict(cls._MEANS), whitener=whitener,
+        )
 
-    def test_measure_from_hidden_matches_manual(self):
+    def test_measure_aligned_scores_positive(self):
         monitor = self._make_monitor()
-        # Hidden state pointing in the same direction as probe
+        # Hidden state pointing in the same direction as probe.
         h = torch.zeros(16)
         h[0] = 5.0
         monitor.measure_from_hidden({0: h})
         assert len(monitor.history["test_probe"]) == 1
-        # Cosine similarity of aligned vectors = 1.0
-        assert abs(monitor.history["test_probe"][0] - 1.0) < 1e-5
+        # Aligned with the probe ⇒ positive coordinate, finite.
+        v = monitor.history["test_probe"][0][0]
+        assert v == v and v > 0.0
 
-    def test_measure_from_hidden_orthogonal(self):
+    def test_measure_aligned_beats_anti_aligned(self):
         monitor = self._make_monitor()
-        # Hidden state orthogonal to probe — cosine = 0
-        h = torch.zeros(16)
-        h[1] = 5.0
-        monitor.measure_from_hidden({0: h})
-        assert abs(monitor.history["test_probe"][0]) < 1e-5
+        aligned = torch.zeros(16)
+        aligned[0] = 5.0
+        anti = torch.zeros(16)
+        anti[0] = -5.0
+        monitor.measure_from_hidden({0: aligned})
+        monitor.measure_from_hidden({0: anti})
+        # Aligned reads above anti-aligned (coordinate monotone in alignment).
+        assert (
+            monitor.history["test_probe"][0][0]
+            > monitor.history["test_probe"][1][0]
+        )
 
     def test_history_accumulates_across_calls(self):
         monitor = self._make_monitor()
@@ -342,7 +388,10 @@ class TestTraitMonitorScoring:
         monitor.measure_from_hidden({0: h1})
         monitor.measure_from_hidden({0: h2})
         assert len(monitor.history["test_probe"]) == 2
-        assert monitor.history["test_probe"][0] > monitor.history["test_probe"][1]
+        assert (
+            monitor.history["test_probe"][0][0]
+            > monitor.history["test_probe"][1][0]
+        )
 
     def test_stats_accumulate(self):
         monitor = self._make_monitor()

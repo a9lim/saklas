@@ -10,7 +10,7 @@ from typing import Any
 from rich.markup import escape as _rich_escape
 from textual import events as _textual_events
 from textual.app import ComposeResult
-from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.containers import Container, Horizontal, Vertical, VerticalScroll
 from textual.widgets import Static, TextArea, Collapsible
 from textual.widget import Widget
 from textual.message import Message
@@ -31,8 +31,10 @@ from saklas.tui.utils import BAR_WIDTH, build_bar
 # ``kind`` strings used by ``SaklasApp._dispatch_pending_action``.
 _KIND_LABELS: dict[str, str] = {
     "submit": "msg",
+    "raw_continue": "continue",
     "commit_user": "commit",
     "commit_assistant": "commit",
+    "raw_commit": "commit",
     "regenerate": "regen",
     "rewind": "/rewind",
     "clear": "/clear",
@@ -40,6 +42,7 @@ _KIND_LABELS: dict[str, str] = {
     "steer": "/steer",
     "probe": "/probe",
     "extract": "/extract",
+    "manifold_fit": "/manifold",
     "regen_n": "/regen",
     "fan": "/fan",
 }
@@ -62,6 +65,7 @@ _KIND_ENDS_ON_USER_NODE: dict[str, bool] = {
     "submit": False,           # send → assistant
     "commit_user": True,       # user turn lands → active = user
     "commit_assistant": False, # assistant turn lands → active = assistant
+    "raw_commit": True,        # raw span lands as a flat user node
     "regenerate": False,       # new assistant sibling
     "rewind": True,            # rewinds to the previous user turn
     "clear": False,            # resets to root (system, not user)
@@ -699,6 +703,309 @@ class ChatInput(TextArea):
         await super()._on_key(event)
 
 
+class RawBuffer(Vertical):
+    """Flat completion buffer — the raw-mode chat surface.
+
+    The loom active path flattened into one continuous string in a single
+    editable ``TextArea``.  No turn rows, no role headers: a base
+    (non-chat) model — or any model toggled into raw mode — sees the
+    whole buffer as a prefill, and ``Enter`` generates a continuation.
+    The TUI mirror of ``webui``'s ``RawBuffer.svelte``.
+
+    Two design choices let it drop into the existing engine plumbing
+    untouched:
+
+    - It implements the ``_AssistantMessage`` *streaming protocol*
+      (``append_token`` / ``append_token_score`` / ``set_token_data`` /
+      …), so ``SaklasApp._poll_generation`` routes a generation into it
+      as the stream ``widget`` with no special-casing.
+    - Per-token highlight survives through a read-only tinted ``Static``
+      mirror layered over the textarea, shown only while the buffer is
+      *clean* (not user-edited) — exactly the ``showTint`` rule the webui
+      uses.  The textarea stays focused underneath, so the first
+      keystroke flips ``_dirty`` and drops the mirror.
+
+    The buffer text is ``_committed_head`` (the loom path up to the
+    current generation) + the streamed continuation tokens.  Only that
+    streamed span carries per-token scores, so only it is tinted; the
+    committed prefix renders plain (loom nodes persist no probe scores,
+    same as chat-mode navigated history).
+    """
+
+    class Continue(Message):
+        """``Enter`` — generate a continuation from the current draft."""
+
+        def __init__(self, draft: str) -> None:
+            super().__init__()
+            self.draft = draft
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        # Committed text — the loom active path flattened, everything up
+        # to (and including) the divergence the current generation
+        # continues from.  The streamed tokens are appended on top.
+        self._committed_head: str = ""
+        self._streaming: bool = False
+        # Current generation's streamed tokens — the tinted span of the
+        # mirror.  Named to match the ``_AssistantMessage`` attribute
+        # ``SaklasApp._finalize_widget_highlight`` reads off the widget.
+        self._streamed_response_tokens: list[str] = []
+        # Always empty — base models have no thinking channel; present
+        # only so the finalize-highlight path's attribute read is safe.
+        self._streamed_thinking_tokens: list[str] = []
+        self._gen_probe_scores: dict[str, list[float]] = {}
+        self._gen_logprobs: list[float | None] = []
+        # True once the user edits the buffer — drops the tinted mirror
+        # and marks the draft divergent from the committed tree.
+        self._dirty: bool = False
+        # Guards programmatic ``load_text`` / ``insert`` against the
+        # ``TextArea.Changed`` handler that would otherwise read them as
+        # user edits.
+        self._internal_update: bool = False
+        self._highlight_on: bool = False
+        self._highlight_probe: str | None = None
+        self._textarea: _RawTextArea | None = None
+        self._mirror: Static | None = None
+        self._sysline: Static | None = None
+
+    def compose(self) -> ComposeResult:
+        # System-message line — the raw surface has no scrollback for the
+        # confirmations chat mode renders inline, so the most recent one
+        # sits dim at the top.
+        yield Static("", id="raw-sysline", classes="hidden")
+        # The textarea (editable, focused) and the tinted mirror share
+        # the same cell via layers; the mirror paints on top when shown.
+        with Container(id="raw-stack"):
+            yield _RawTextArea(
+                "", id="raw-textarea",
+                show_line_numbers=False, highlight_cursor_line=False,
+            )
+            yield Static("", id="raw-mirror", classes="hidden")
+
+    def on_mount(self) -> None:
+        self._textarea = self.query_one("#raw-textarea", _RawTextArea)
+        self._mirror = self.query_one("#raw-mirror", Static)
+        self._sysline = self.query_one("#raw-sysline", Static)
+
+    @property
+    def draft(self) -> str:
+        """The buffer's current editable text."""
+        return self._textarea.text if self._textarea is not None else ""
+
+    @property
+    def is_dirty(self) -> bool:
+        """True when the visible draft diverges from the committed tree."""
+        return self._dirty
+
+    def focus_input(self) -> None:
+        if self._textarea is not None:
+            self._textarea.focus()
+
+    # -- committed-text sync --
+
+    def sync_committed(self, flat_text: str) -> None:
+        """Reset the buffer to the loom active path's flattened text.
+
+        Called on mode-switch and after navigation / rewind / clear.
+        Drops the dirty + streaming state and any tinted span — the
+        buffer once again mirrors the tree verbatim, plain.
+        """
+        self._committed_head = flat_text
+        self._streamed_response_tokens = []
+        self._gen_probe_scores = {}
+        self._gen_logprobs = []
+        self._streaming = False
+        self._dirty = False
+        self._set_textarea_text(flat_text)
+        self._refresh_view()
+
+    def begin_continuation(self, draft: str) -> None:
+        """Mark the start of a streamed continuation from ``draft``.
+
+        ``draft`` is the full submitted buffer (committed prefix + the
+        edited / appended tail).  The engine records the divergent tail
+        as a node, so ``draft`` is exactly what the tree carries up to
+        the first generated token — it becomes the committed head and
+        the streamed tokens tint on top of it.
+        """
+        self._committed_head = draft
+        self._streamed_response_tokens = []
+        self._gen_probe_scores = {}
+        self._gen_logprobs = []
+        self._streaming = True
+        self._dirty = False
+        self._set_textarea_text(draft)
+        self._refresh_view()
+
+    def _full_text(self) -> str:
+        return self._committed_head + "".join(self._streamed_response_tokens)
+
+    def _set_textarea_text(self, text: str) -> None:
+        if self._textarea is None:
+            return
+        self._internal_update = True
+        try:
+            self._textarea.load_text(text)
+            try:
+                self._textarea.move_cursor(self._textarea.document.end)
+            except Exception:
+                pass
+            self._textarea.scroll_end(animate=False)
+        finally:
+            self._internal_update = False
+
+    def on_text_area_changed(self, event: TextArea.Changed) -> None:
+        # Programmatic loads + streamed appends route through
+        # ``_internal_update`` — only a genuine keystroke trips dirty.
+        if self._internal_update or self._streaming:
+            return
+        self._dirty = (
+            self._textarea is not None
+            and self._textarea.text != self._committed_head
+        )
+        # A user edit supersedes the tinted read view — webui's
+        # ``showTint`` gates on a clean buffer; mirror that.
+        self._refresh_view()
+
+    # -- streaming protocol (mirrors _AssistantMessage) --
+
+    def append_token(self, token: str) -> None:
+        self._streamed_response_tokens.append(token)
+        if self._textarea is not None and not self._dirty:
+            # Cheap append — ``insert`` at the end cursor is O(token),
+            # vs an O(n) full ``load_text`` per streamed token.
+            self._internal_update = True
+            try:
+                self._textarea.insert(token)
+            finally:
+                self._internal_update = False
+        self._refresh_view()
+
+    def append_thinking_token(self, token: str) -> None:
+        # Base models have no thinking channel; if a model in raw mode
+        # emits one anyway, fold it into the visible text so nothing is
+        # silently dropped.
+        self.append_token(token)
+
+    def ensure_thinking_collapsed(self) -> None:
+        # No thinking block in raw mode.
+        pass
+
+    def end_continuation(self) -> None:
+        """Mark the streamed continuation finished.
+
+        Clears the ``_streaming`` guard so subsequent keystrokes are
+        seen as user edits again.  Called from the app's ``done``
+        handler — robust against an errored gen that never reaches the
+        finalize path.
+        """
+        self._streaming = False
+        if self._textarea is not None:
+            # Reconcile the textarea with the final streamed span so a
+            # post-gen edit diffs cleanly against ``_committed_head``.
+            self._set_textarea_text(self._full_text())
+        self._refresh_view()
+
+    def append_token_score(
+        self, scores: dict[str, float], is_thinking: bool,
+    ) -> None:
+        for name, val in scores.items():
+            self._gen_probe_scores.setdefault(name, []).append(val)
+        if self._highlight_on:
+            self._refresh_view()
+
+    def append_token_logprob(
+        self, logprob: float | None, is_thinking: bool,
+    ) -> None:
+        self._gen_logprobs.append(logprob)
+        if self._highlight_on and self._highlight_probe == SURPRISE_PROBE:
+            self._refresh_view()
+
+    def set_token_data(
+        self,
+        response_token_strs: list[str],
+        response_probe_scores: dict[str, list[float]],
+        thinking_token_strs: list[str],
+        thinking_probe_scores: dict[str, list[float]],
+    ) -> None:
+        # Finalize: canonical projected scores replace the live ones.
+        n = len(response_token_strs)
+        self._streamed_response_tokens = list(response_token_strs)
+        self._gen_probe_scores = {
+            k: v for k, v in response_probe_scores.items() if len(v) == n
+        }
+        self._refresh_view()
+
+    def apply_highlight(self, on: bool, probe_name: str | None) -> None:
+        self._highlight_on = on
+        self._highlight_probe = probe_name
+        self._refresh_view()
+
+    # -- system message --
+
+    def show_system(self, text: str) -> None:
+        if self._sysline is None:
+            return
+        self._sysline.update(f"[dim]{_rich_escape(text)}[/]")
+        self._sysline.remove_class("hidden")
+
+    # -- rendering --
+
+    def _refresh_view(self) -> None:
+        """Refresh the visible surface — tinted mirror vs plain textarea.
+
+        The mirror shows only when a highlight probe is active and the
+        buffer is clean (not user-edited) and there is a streamed span
+        to tint.  Otherwise the plain editable textarea owns the view.
+        """
+        if self._textarea is None or self._mirror is None:
+            return
+        show_mirror = (
+            self._highlight_on
+            and self._highlight_probe is not None
+            and not self._dirty
+            and bool(self._streamed_response_tokens)
+        )
+        if show_mirror:
+            self._mirror.update(self._build_mirror_markup())
+            self._mirror.remove_class("hidden")
+        else:
+            self._mirror.add_class("hidden")
+
+    def _build_mirror_markup(self) -> str:
+        head = _rich_escape(self._committed_head)
+        probe = self._highlight_probe
+        if probe == SURPRISE_PROBE:
+            scores = [_surprise_score(lp) for lp in self._gen_logprobs]
+        else:
+            scores = self._gen_probe_scores.get(probe or "", [])
+        tail = _build_highlight_markup(self._streamed_response_tokens, scores)
+        return head + tail
+
+
+class _RawTextArea(TextArea):
+    """Editable raw completion buffer.
+
+    ``Enter`` posts :class:`RawBuffer.Continue` (generate a continuation
+    from the buffer); ``Shift+Enter`` / ``Ctrl+J`` insert a literal
+    newline.  ``Ctrl+Enter`` (commit) and ``Esc`` (stop) are app-level
+    priority bindings — they never reach this widget.
+    """
+
+    async def _on_key(self, event: _textual_events.Key) -> None:
+        if event.key == "enter":
+            event.stop()
+            event.prevent_default()
+            self.post_message(RawBuffer.Continue(self.text))
+            return
+        if event.key in ("shift+enter", "ctrl+j"):
+            event.stop()
+            event.prevent_default()
+            self.insert("\n")
+            return
+        await super()._on_key(event)
+
+
 class ChatPanel(Widget):
 
     class UserSubmitted(Message):
@@ -711,6 +1018,11 @@ class ChatPanel(Widget):
         self._log: VerticalScroll | None = None
         self._status_bar: Static | None = None
         self._ab_mode: bool = False
+        # Render mode — ``"chat"`` (turn rows + bubbles) or ``"raw"`` (a
+        # single flat completion buffer).  Toggled at runtime via
+        # :meth:`set_render_mode`; the app seeds it from the model's
+        # ``is_base_model`` flag.
+        self._render_mode: str = "chat"
         # In-memory mirror of system-message strings.  ``add_system_message``
         # mounts a ``Static`` widget AND appends to this list so callers
         # (tests, transcript export, future log search) can read the
@@ -720,6 +1032,9 @@ class ChatPanel(Widget):
 
     def compose(self) -> ComposeResult:
         yield VerticalScroll(id="chat-log")
+        # Raw-mode completion buffer — the alternate centre surface.
+        # Hidden by default (CSS); ``set_render_mode`` swaps it in.
+        yield RawBuffer(id="raw-buffer")
         yield Static("", id="status-bar")
         # Pending-queue strip — single-line summary of mid-gen
         # submissions waiting for the next ``done``.  Hidden when the
@@ -813,6 +1128,13 @@ class ChatPanel(Widget):
             inp = self.query_one("#chat-input", ChatInput)
         except Exception:
             return
+        if self._render_mode == "raw":
+            # Raw mode: the chat input is the command line — slash
+            # commands, or a prompt that appends + continues the buffer.
+            inp.placeholder = (
+                "/command or prompt to continue…  ⏎ send · ⇧⏎ newline"
+            )
+            return
         # Same `<verb>…  <bind list>` shape as the GUI's Chat.svelte
         # placeholder; terminals can't surface modifier-only keydown so
         # the TUI lacks the commit-key-held variants the GUI shows.
@@ -821,6 +1143,34 @@ class ChatPanel(Widget):
             if on
             else "message…  ⏎ send · ⌃⏎ commit · ⇧⏎ newline"
         )
+
+    # -- Render mode --
+
+    @property
+    def raw_buffer(self) -> RawBuffer:
+        return self.query_one("#raw-buffer", RawBuffer)
+
+    @property
+    def render_mode(self) -> str:
+        return self._render_mode
+
+    def set_render_mode(self, mode: str) -> None:
+        """Switch the centre surface between ``"chat"`` (turn rows) and
+        ``"raw"`` (a single flat completion buffer).
+
+        Non-destructive — both surfaces derive from the same loom tree;
+        the app re-paints the now-visible one.  The chat input stays
+        visible in both modes: in raw mode it is the command line (and
+        the webui-style "type a prompt to continue" entry point).
+        """
+        self._render_mode = mode
+        raw = mode == "raw"
+        try:
+            self.query_one("#chat-log").display = not raw
+            self.query_one("#raw-buffer").display = raw
+        except Exception:
+            pass
+        self.set_prefill_mode(False)
 
     # -- AB mode --
 
@@ -976,7 +1326,9 @@ class ChatPanel(Widget):
         if existing is not None:
             return existing
         row.shadow.remove_children()
-        widget = _AssistantMessage(classes="assistant-message shadow-message")
+        widget = _AssistantMessage(
+            classes="assistant-message shadow-message",
+        )
         row.shadow.mount(widget)
         return widget
 
@@ -985,10 +1337,15 @@ class ChatPanel(Widget):
         self._log_mounted.scroll_end(animate=False)
 
     def add_system_message(self, text: str) -> None:
+        self.messages.append(text)
+        if self._render_mode == "raw":
+            # Raw mode has no scrollback for inline confirmations — the
+            # most recent one sits dim at the top of the buffer.
+            self.raw_buffer.show_system(text)
+            return
         log = self._log_mounted
         log.mount(Static(f"[dim]{text}[/]", classes="system-message"))
         log.scroll_end(animate=False)
-        self.messages.append(text)
 
     def update_status(
         self,

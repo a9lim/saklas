@@ -53,6 +53,27 @@ class SamplingConfig:
     # ``__post_init__`` — beyond 256 is data nobody can act on and bytes
     # nobody wants on the wire.
     return_top_k: int = 0
+    # Per-message role-substitution labels (roleplay scaffold).  Like
+    # ``seed``, these are per-call and recorded on the produced loom nodes
+    # (the user turn gets ``user_role``, the generated assistant turn gets
+    # ``assistant_role``).  ``None`` leaves the family's standard label.
+    # A role-bearing steering scope (``:role-<slug>`` vectors / persona
+    # manifolds) still overrides ``assistant_role`` for the generation
+    # prompt so steer baseline matches extract baseline.
+    user_role: str | None = None
+    assistant_role: str | None = None
+    # Persist per-layer probe heatmaps on loom token rows.  Aggregate probe
+    # scores are cheap enough to keep by default for reloadable highlights;
+    # this heavier layer×probe payload is opt-in for surfaces such as the
+    # native dashboard token drilldown.
+    persist_per_layer_scores: bool = False
+    # Persist per-layer whitened subspace coords on each token's probe reading
+    # (``ProbeReading.subspace_coords_per_layer``) — the live point + fading
+    # trail for the dashboard probe-inspector geometry plot.  Heavier than the
+    # default per-token reading and only consumed by that one surface, so opt-in;
+    # set true by the native dashboard only while the inspector is open.  Forces
+    # per-token incremental scoring (else no per-token reading is produced).
+    persist_subspace_coords: bool = False
 
     def __post_init__(self) -> None:
         # Accept list[str] from callers; store as tuple so the frozen
@@ -87,6 +108,10 @@ class SamplingConfig:
         "logprobs": None,
         "return_hidden": False,
         "return_top_k": 0,
+        "user_role": None,
+        "assistant_role": None,
+        "persist_per_layer_scores": False,
+        "persist_subspace_coords": False,
     }
 
     def merged_with(self, other: "SamplingConfig | None") -> "SamplingConfig":

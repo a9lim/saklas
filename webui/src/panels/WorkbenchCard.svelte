@@ -15,33 +15,43 @@
 
 <section class="workbench" aria-label="Active workbench">
   <h2 title={model}>{model}</h2>
-  <p class="sub">{device}</p>
+  <span class="sub" title={device}>{device}</span>
 </section>
 
 <style>
   .workbench {
     /* margin-top:auto pins the card to the column floor even when the
      * tree above it is short (empty / error states don't flex-grow).
-     * Flat — border-top is the separator, no own fill. */
+     * Flat — border-top is the separator, no own fill.  Model id and
+     * device/dtype sit on one baseline row (model left, device right)
+     * rather than stacked. */
     margin-top: auto;
     flex: 0 0 auto;
     display: flex;
-    flex-direction: column;
-    gap: var(--space-1);
+    flex-direction: row;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: var(--space-4);
     padding: var(--space-3) var(--space-4);
     border-top: 1px solid var(--border);
   }
 
   .sub {
     margin: 0;
+    flex: 0 0 auto;
     color: var(--fg-muted);
     font-size: var(--text-xs);
     text-transform: uppercase;
     letter-spacing: 0;
+    white-space: nowrap;
   }
 
   h2 {
-    margin: var(--space-1) 0 0;
+    margin: 0;
+    /* Take the row's slack and ellipsize so a long model id never
+     * pushes the device readout off the right edge. */
+    flex: 1 1 auto;
+    min-width: 0;
     font-family: var(--font-mono);
     font-size: var(--text-sm);
     line-height: 1.25;

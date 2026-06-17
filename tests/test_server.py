@@ -2,13 +2,14 @@
 
 import asyncio
 import json
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
 
 from saklas.core.results import GenerationResult, TokenEvent
-from saklas.core.session import ConcurrentGenerationError
+from saklas.core.session import ConcurrentGenerationError, VectorNotRegisteredError
 
 
 # ---------------------------------------------------------------------------
@@ -75,7 +76,7 @@ def session_and_client():
 # ---------------------------------------------------------------------------
 
 class TestModels:
-    def test_list_models(self, client):
+    def test_list_models(self, client: Any) -> None:
         resp = client.get("/v1/models")
         assert resp.status_code == 200
         data = resp.json()
@@ -84,12 +85,12 @@ class TestModels:
         assert data["data"][0]["id"] == "test/model"
         assert data["data"][0]["owned_by"] == "local"
 
-    def test_get_model(self, client):
+    def test_get_model(self, client: Any) -> None:
         resp = client.get("/v1/models/test/model")
         assert resp.status_code == 200
         assert resp.json()["id"] == "test/model"
 
-    def test_get_model_not_found(self, client):
+    def test_get_model_not_found(self, client: Any) -> None:
         resp = client.get("/v1/models/other/model")
         assert resp.status_code == 404
 
@@ -99,7 +100,7 @@ class TestModels:
 # ---------------------------------------------------------------------------
 
 class TestChatCompletions:
-    def test_non_streaming(self, session_and_client):
+    def test_non_streaming(self, session_and_client: Any) -> None:
         session, client = session_and_client
         result = GenerationResult(
             text="Hello there!", tokens=[1, 2, 3], token_count=3,
@@ -124,7 +125,7 @@ class TestChatCompletions:
         assert messages[0]["role"] == "user"
         assert messages[0]["content"] == "Hi"
 
-    def test_with_steering_string(self, session_and_client):
+    def test_with_steering_string(self, session_and_client: Any) -> None:
         session, client = session_and_client
         session.generate.return_value = GenerationResult(
             text="Ok", tokens=[1], token_count=1,
@@ -141,10 +142,10 @@ class TestChatCompletions:
         assert dict(steering.alphas) == {"vec1": 0.3}
         assert "orthogonalize" not in call_kwargs
 
-    def test_streaming(self, session_and_client):
+    def test_streaming(self, session_and_client: Any) -> None:
         session, client = session_and_client
 
-        def _mock_stream(*args, **kwargs):
+        def _mock_stream(*args: Any, **kwargs: Any) -> Any:
             yield TokenEvent(text="Hello", token_id=1, index=0)
             yield TokenEvent(text=" world", token_id=2, index=1)
 
@@ -170,7 +171,35 @@ class TestChatCompletions:
         final = json.loads(lines[done_idx - 1].removeprefix("data: "))
         assert final["choices"][0]["finish_reason"] == "stop"
 
-    def test_conflict_on_concurrent_generation(self, session_and_client):
+    def test_streaming_saklas_error_is_sent_in_band(self, session_and_client: Any) -> None:
+        session, client = session_and_client
+
+        def _mock_stream(*args: Any, **kwargs: Any) -> Any:
+            if False:
+                yield TokenEvent(text="", token_id=0, index=0)
+            raise VectorNotRegisteredError("No vector registered for 'missing'")
+
+        session.generate_stream.return_value = _mock_stream()
+
+        resp = client.post("/v1/chat/completions", json={
+            "messages": [{"role": "user", "content": "Hi"}],
+            "stream": True,
+            "steering": "0.5 missing",
+        })
+        assert resp.status_code == 200
+
+        lines = [l for l in resp.text.strip().split("\n") if l.startswith("data: ")]
+        chunks = [
+            json.loads(l.removeprefix("data: "))
+            for l in lines
+            if l != "data: [DONE]"
+        ]
+        err = next(c["error"] for c in chunks if "error" in c)
+        assert err["code"] == 404
+        assert err["type"] == "invalid_request_error"
+        assert "No vector registered for 'missing'" in err["message"]
+
+    def test_conflict_on_concurrent_generation(self, session_and_client: Any) -> None:
         session, client = session_and_client
         session.generate.side_effect = ConcurrentGenerationError("Generation already in progress")
 
@@ -179,7 +208,7 @@ class TestChatCompletions:
         })
         assert resp.status_code == 409
 
-    def test_sampling_overrides_ride_on_sampling_config(self, session_and_client):
+    def test_sampling_overrides_ride_on_sampling_config(self, session_and_client: Any) -> None:
         session, client = session_and_client
         session.generate.return_value = GenerationResult(
             text="x", tokens=[1], token_count=1,
@@ -208,7 +237,7 @@ class TestChatCompletions:
 # ---------------------------------------------------------------------------
 
 class TestCompletions:
-    def test_non_streaming(self, session_and_client):
+    def test_non_streaming(self, session_and_client: Any) -> None:
         session, client = session_and_client
         session.generate.return_value = GenerationResult(
             text="42", tokens=[1], token_count=1,
@@ -279,14 +308,14 @@ class TestCLIParsing:
 # ---------------------------------------------------------------------------
 
 class TestOllamaApi:
-    def test_version(self, client):
+    def test_version(self, client: Any) -> None:
         resp = client.get("/api/version")
         assert resp.status_code == 200
         data = resp.json()
         assert "version" in data
         assert data["version"].startswith("saklas-")
 
-    def test_tags_lists_loaded_model(self, client):
+    def test_tags_lists_loaded_model(self, client: Any) -> None:
         resp = client.get("/api/tags")
         assert resp.status_code == 200
         models = resp.json()["models"]
@@ -312,7 +341,7 @@ class TestOllamaApi:
         assert "google/gemma-2-2b-it" in names
         assert "gemma2:2b" in names
 
-    def test_ps(self, client):
+    def test_ps(self, client: Any) -> None:
         resp = client.get("/api/ps")
         assert resp.status_code == 200
         entries = resp.json()["models"]
@@ -320,7 +349,7 @@ class TestOllamaApi:
         assert "expires_at" in entries[0]
         assert "size_vram" in entries[0]
 
-    def test_show(self, client):
+    def test_show(self, client: Any) -> None:
         resp = client.post("/api/show", json={"model": "test/model"})
         assert resp.status_code == 200
         data = resp.json()
@@ -332,7 +361,7 @@ class TestOllamaApi:
         assert data["model_info"]["gemma2.block_count"] == 26
         assert data["model_info"]["saklas.loaded_model"] == "test/model"
 
-    def test_chat_non_streaming(self, session_and_client):
+    def test_chat_non_streaming(self, session_and_client: Any) -> None:
         session, client = session_and_client
         session.generate.return_value = GenerationResult(
             text="Hello there!", tokens=[1, 2, 3], token_count=3, prompt_tokens=2,
@@ -358,7 +387,7 @@ class TestOllamaApi:
         assert messages[0]["role"] == "user"
         assert messages[0]["content"] == "Hi"
 
-    def test_chat_with_system_field(self, session_and_client):
+    def test_chat_with_system_field(self, session_and_client: Any) -> None:
         session, client = session_and_client
         session.generate.return_value = GenerationResult(
             text="ok", tokens=[1], token_count=1, prompt_tokens=5,
@@ -374,7 +403,7 @@ class TestOllamaApi:
         assert msgs[0] == {"role": "system", "content": "You are a pirate."}
         assert msgs[1]["role"] == "user"
 
-    def test_chat_options_passthrough(self, session_and_client):
+    def test_chat_options_passthrough(self, session_and_client: Any) -> None:
         session, client = session_and_client
         session.generate.return_value = GenerationResult(
             text="ok", tokens=[1], token_count=1, prompt_tokens=1,
@@ -405,7 +434,7 @@ class TestOllamaApi:
         assert session.config.top_p == 0.9
         assert session.config.max_new_tokens == 1024
 
-    def test_chat_repeat_penalty_maps_to_presence_penalty(self, session_and_client):
+    def test_chat_repeat_penalty_maps_to_presence_penalty(self, session_and_client: Any) -> None:
         # Ollama's repeat_penalty divides positive logits by the penalty,
         # which is equivalent to subtracting ln(penalty) from the logit.
         # That matches presence_penalty semantics (subtract a constant per
@@ -428,10 +457,10 @@ class TestOllamaApi:
         assert abs(sc.presence_penalty - math.log(1.3)) < 1e-6
         assert sc.frequency_penalty == 0.0
 
-    def test_chat_streaming(self, session_and_client):
+    def test_chat_streaming(self, session_and_client: Any) -> None:
         session, client = session_and_client
 
-        def _mock_stream(*args, **kwargs):
+        def _mock_stream(*args: Any, **kwargs: Any) -> Any:
             yield TokenEvent(text="Hello", token_id=1, index=0)
             yield TokenEvent(text=" world", token_id=2, index=1)
 
@@ -462,7 +491,31 @@ class TestOllamaApi:
         assert final["prompt_eval_count"] == 3
         assert final["message"]["content"] == ""
 
-    def test_generate_non_streaming(self, session_and_client):
+    def test_chat_streaming_materialization_error_is_ndjson(self, session_and_client: Any) -> None:
+        session, client = session_and_client
+
+        def _mock_stream(*args: Any, **kwargs: Any) -> Any:
+            if False:
+                yield TokenEvent(text="", token_id=0, index=0)
+            raise VectorNotRegisteredError("No vector registered for 'missing'")
+
+        session.generate_stream.return_value = _mock_stream()
+
+        resp = client.post("/api/chat", json={
+            "messages": [{"role": "user", "content": "Hi"}],
+            "stream": True,
+            "options": {"steer": "0.5 missing"},
+        })
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("application/x-ndjson")
+        lines = [json.loads(l) for l in resp.text.strip().split("\n") if l]
+        assert lines == [{
+            "model": "test/model",
+            "created_at": lines[0]["created_at"],
+            "error": "No vector registered for 'missing'",
+        }]
+
+    def test_generate_non_streaming(self, session_and_client: Any) -> None:
         session, client = session_and_client
         session.generate.return_value = GenerationResult(
             text="42", tokens=[1], token_count=1, prompt_tokens=1,
@@ -484,7 +537,7 @@ class TestOllamaApi:
         # callers must set "raw": true to bypass it.
         assert session.generate.call_args[1]["raw"] is False
 
-    def test_generate_raw_mode(self, session_and_client):
+    def test_generate_raw_mode(self, session_and_client: Any) -> None:
         session, client = session_and_client
         session.generate.return_value = GenerationResult(
             text="x", tokens=[1], token_count=1, prompt_tokens=1,
@@ -498,7 +551,7 @@ class TestOllamaApi:
         assert resp.status_code == 200
         assert session.generate.call_args[1]["raw"] is True
 
-    def test_generate_with_system_uses_chat_template(self, session_and_client):
+    def test_generate_with_system_uses_chat_template(self, session_and_client: Any) -> None:
         session, client = session_and_client
         session.generate.return_value = GenerationResult(
             text="arrr", tokens=[1], token_count=1, prompt_tokens=2,
@@ -515,18 +568,18 @@ class TestOllamaApi:
         msgs = session.generate.call_args[0][0]
         assert msgs[0]["role"] == "system"
 
-    def test_pull_known_model_is_success(self, client):
+    def test_pull_known_model_is_success(self, client: Any) -> None:
         resp = client.post("/api/pull", json={"model": "test/model"})
         assert resp.status_code == 200
         lines = [l for l in resp.text.strip().split("\n") if l]
         last = json.loads(lines[-1])
         assert last["status"] == "success"
 
-    def test_pull_unknown_model_404(self, client):
+    def test_pull_unknown_model_404(self, client: Any) -> None:
         resp = client.post("/api/pull", json={"model": "nope:latest"})
         assert resp.status_code == 404
 
-    def test_embeddings_not_implemented(self, client):
+    def test_embeddings_not_implemented(self, client: Any) -> None:
         resp = client.post("/api/embeddings", json={"model": "test/model", "prompt": "hi"})
         assert resp.status_code == 501
 
@@ -544,8 +597,8 @@ class TestOllamaApi:
         assert resp.status_code == 200
 
     def test_chat_streaming_bad_steer_returns_400_not_mid_stream_disconnect(
-        self, session_and_client, monkeypatch,
-    ):
+        self, session_and_client: Any, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         """Regression: ``options.steer`` parsing used to live inside the
         NDJSON streaming generator. By the time ``parse_expr`` raised,
         ``StreamingResponse`` had already flushed 200 OK headers, so the
@@ -563,7 +616,7 @@ class TestOllamaApi:
 
         real_parse = _sx.parse_expr
 
-        def _fake_parse(text, *, namespace=None):
+        def _fake_parse(text: str, *, namespace: str | None = None) -> Any:
             if text.strip() == "0.5 wolf":
                 raise AmbiguousSelectorError(
                     "ambiguous pole 'wolf': matches alice/wolf, default/deer.wolf"
@@ -588,8 +641,8 @@ class TestOllamaApi:
         session.generate_stream.assert_not_called()
 
     def test_chat_non_streaming_bad_steer_returns_400(
-        self, session_and_client, monkeypatch,
-    ):
+        self, session_and_client: Any, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         """Belt-and-suspenders: non-streaming Ollama already routed
         ``SaklasError`` through the FastAPI handler. Pin the contract."""
         from saklas.io.selectors import AmbiguousSelectorError
@@ -597,7 +650,7 @@ class TestOllamaApi:
 
         session, client = session_and_client
 
-        def _fake_parse(text, *, namespace=None):
+        def _fake_parse(text: str, *, namespace: str | None = None) -> Any:
             raise AmbiguousSelectorError("ambiguous pole 'wolf': matches a/wolf, b/wolf")
         monkeypatch.setattr(_sx, "parse_expr", _fake_parse)
 
@@ -616,7 +669,7 @@ class TestOllamaApi:
 # ---------------------------------------------------------------------------
 
 class TestLangChainCompat:
-    def test_empty_tools_accepted(self, session_and_client):
+    def test_empty_tools_accepted(self, session_and_client: Any) -> None:
         session, client = session_and_client
         session.generate.return_value = GenerationResult(
             text="hi", tokens=[1], token_count=1, tok_per_sec=1.0, elapsed=0.1,
@@ -629,7 +682,7 @@ class TestLangChainCompat:
         })
         assert resp.status_code == 200
 
-    def test_non_empty_tools_rejected(self, session_and_client):
+    def test_non_empty_tools_rejected(self, session_and_client: Any) -> None:
         session, client = session_and_client
         resp = client.post("/v1/chat/completions", json={
             "messages": [{"role": "user", "content": "hi"}],
@@ -638,7 +691,7 @@ class TestLangChainCompat:
         assert resp.status_code == 400
         assert "tool" in resp.json()["error"]["message"].lower()
 
-    def test_required_tool_choice_rejected(self, session_and_client):
+    def test_required_tool_choice_rejected(self, session_and_client: Any) -> None:
         session, client = session_and_client
         resp = client.post("/v1/chat/completions", json={
             "messages": [{"role": "user", "content": "hi"}],
@@ -646,7 +699,7 @@ class TestLangChainCompat:
         })
         assert resp.status_code == 400
 
-    def test_response_format_text_accepted(self, session_and_client):
+    def test_response_format_text_accepted(self, session_and_client: Any) -> None:
         session, client = session_and_client
         session.generate.return_value = GenerationResult(
             text="hi", tokens=[1], token_count=1, tok_per_sec=1.0, elapsed=0.1,
@@ -657,7 +710,7 @@ class TestLangChainCompat:
         })
         assert resp.status_code == 200
 
-    def test_response_format_json_object_rejected(self, session_and_client):
+    def test_response_format_json_object_rejected(self, session_and_client: Any) -> None:
         session, client = session_and_client
         resp = client.post("/v1/chat/completions", json={
             "messages": [{"role": "user", "content": "hi"}],
@@ -665,7 +718,7 @@ class TestLangChainCompat:
         })
         assert resp.status_code == 400
 
-    def test_response_format_json_schema_rejected(self, session_and_client):
+    def test_response_format_json_schema_rejected(self, session_and_client: Any) -> None:
         session, client = session_and_client
         resp = client.post("/v1/chat/completions", json={
             "messages": [{"role": "user", "content": "hi"}],
@@ -675,34 +728,40 @@ class TestLangChainCompat:
 
 
 class TestNativeSteeringField:
-    def test_top_level_steering_expression(self, session_and_client):
+    def test_top_level_steering_expression(self, session_and_client: Any) -> None:
         session, client = session_and_client
         session.generate.return_value = GenerationResult(
             text="ok", tokens=[1], token_count=1, tok_per_sec=1.0, elapsed=0.1,
         )
+        # ``myvec.baseline`` is a synthetic name outside the bundled-probe
+        # vocabulary, so it parses to a plain vector term (a bundled name
+        # like ``angry.calm`` now routes to a 2-node pca ManifoldTerm when
+        # the bundled manifolds are materialized in the active home).
         resp = client.post("/v1/chat/completions", json={
             "messages": [{"role": "user", "content": "hi"}],
-            "steering": "0.5 angry.calm",
+            "steering": "0.5 myvec.baseline",
         })
         assert resp.status_code == 200
         kw = session.generate.call_args[1]
         assert kw["steering"] is not None
-        assert kw["steering"].alphas == {"angry.calm": 0.5}
+        assert kw["steering"].alphas == {"myvec.baseline": 0.5}
 
-    def test_steering_projection_term(self, session_and_client):
+    def test_steering_projection_term(self, session_and_client: Any) -> None:
         session, client = session_and_client
         session.generate.return_value = GenerationResult(
             text="ok", tokens=[1], token_count=1, tok_per_sec=1.0, elapsed=0.1,
         )
         resp = client.post("/v1/chat/completions", json={
             "messages": [{"role": "user", "content": "hi"}],
-            "steering": "-0.4 wolf",
+            "steering": "-0.4 zzfakevec",
         })
         assert resp.status_code == 200
         kw = session.generate.call_args[1]
-        # Parser resolves ``wolf`` → identity with sign +1 when nothing is
-        # installed; coefficient carries through as -0.4.
-        assert kw["steering"].alphas == {"wolf": -0.4}
+        # A bare name matching no installed manifold/concept resolves to a plain
+        # vector term (identity, sign +1); the coefficient carries through as
+        # -0.4.  (Must NOT collide with a bundled node — ``wolf`` is a real
+        # ``personas`` node now, so it would resolve to ``personas%wolf``.)
+        assert kw["steering"].alphas == {"zzfakevec": -0.4}
 
     def test_steering_merges_with_server_defaults(self):
         from saklas.server import create_app
@@ -757,7 +816,7 @@ class TestNativeSteeringField:
         kw = session.generate.call_args[1]
         assert kw["steering"] is None
 
-    def test_thinking_field_default_is_none_auto(self, session_and_client):
+    def test_thinking_field_default_is_none_auto(self, session_and_client: Any) -> None:
         session, client = session_and_client
         session.generate.return_value = GenerationResult(
             text="ok", tokens=[1], token_count=1, tok_per_sec=1.0, elapsed=0.1,
@@ -769,7 +828,7 @@ class TestNativeSteeringField:
         kw = session.generate.call_args[1]
         assert kw["thinking"] is None
 
-    def test_thinking_explicit_false(self, session_and_client):
+    def test_thinking_explicit_false(self, session_and_client: Any) -> None:
         session, client = session_and_client
         session.generate.return_value = GenerationResult(
             text="ok", tokens=[1], token_count=1, tok_per_sec=1.0, elapsed=0.1,

@@ -16,6 +16,7 @@
   import { closeDrawer, drawerState, probeRack, vectorsState } from "../lib/stores.svelte";
   import { apiVectors, ApiError } from "../lib/api";
   import Bar from "../lib/charts/Bar.svelte";
+  import Select from "../lib/Select.svelte";
   import type { VectorDiagnosticsResponse } from "../lib/types";
 
   interface DrawerParams {
@@ -147,15 +148,14 @@
   <div class="picker-row">
     <label class="picker">
       <span class="picker-label">name</span>
-      <select bind:value={selected} disabled={names.length === 0}>
-        {#if names.length === 0}
-          <option value="">(empty)</option>
-        {:else}
-          {#each names as name (name)}
-            <option value={name}>{name}</option>
-          {/each}
-        {/if}
-      </select>
+      <Select
+        bind:value={selected}
+        options={names.length === 0
+          ? [{ value: "", label: "(empty)" }]
+          : names.map((n) => ({ value: n, label: n }))}
+        disabled={names.length === 0}
+        ariaLabel="Vector name"
+      />
     </label>
     {#if stoplight}
       <span class="stoplight {stoplight}" title="probe quality">
@@ -264,18 +264,9 @@
     color: var(--fg-muted);
     font-size: var(--text-sm);
   }
-  .picker select {
-    background: var(--bg-alt);
-    color: var(--fg);
-    border: 1px solid var(--border);
-    padding: var(--space-1) var(--space-2);
-    font: inherit;
-    font-size: var(--text-sm);
+  /* Themed Select fills its picker host; Select owns its own chrome. */
+  .picker :global(.sk-select) {
     flex: 1 1 auto;
-  }
-  .picker select:focus {
-    outline: 1px solid var(--accent);
-    outline-offset: -1px;
   }
   .stoplight {
     font-size: var(--text-xs);

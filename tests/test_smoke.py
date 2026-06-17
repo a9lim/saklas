@@ -10,6 +10,7 @@ import math
 import time
 import tempfile
 from pathlib import Path
+from typing import Any
 
 import pytest
 import torch
@@ -39,41 +40,96 @@ def model_and_tokenizer():
 
 
 @pytest.fixture(scope="module")
-def layers(model_and_tokenizer):
+def layers(model_and_tokenizer: Any) -> Any:
     from saklas.core.model import get_layers
     model, _ = model_and_tokenizer
     return get_layers(model)
 
 
 @pytest.fixture(scope="module")
-def num_layers(layers):
+def num_layers(layers: Any) -> int:
     return len(layers)
 
 
-def _extract_profile(model, tokenizer, concept, layers):
-    """Extract a profile for a single concept with one pair."""
-    from saklas.core.vectors import extract_contrastive
-    profile, _ = extract_contrastive(
-        model, tokenizer, [{"positive": concept, "negative": ""}], layers=layers,
+def _extract_profile(model: Any, tokenizer: Any, concept: str, layers: Any) -> Any:
+    """A per-layer direction profile for a single concept vs the empty pole.
+
+    The 4.0 equivalent of a difference-of-means vector: capture the two pole
+    centroids, take their per-layer difference ``δ = pos − neg``, and fold that
+    direction into a one-pole affine ray via the production
+    ``fold_directions_to_subspace``, then read its baked-direction view
+    (``folded_vector_directions``).  Same centroid-difference direction the old
+    DiM extractor produced, through the surviving fold primitive.
+    """
+    from saklas.core.vectors import (
+        _encode_and_capture_all,
+        fold_directions_to_subspace,
+        folded_vector_directions,
     )
-    return profile
+
+    device = next(model.parameters()).device
+    prompt = "Describe your current state."
+    pos = _encode_and_capture_all(model, tokenizer, prompt, concept, layers, device)
+    neg = _encode_and_capture_all(model, tokenizer, prompt, "", layers, device)
+    directions = {
+        L: (pos[L].to(torch.float32) - neg[L].to(torch.float32))
+        for L in pos if L in neg
+    }
+    mfld = fold_directions_to_subspace(concept, directions, None, label="p")
+    return folded_vector_directions(mfld)
 
 
 @pytest.fixture(scope="module")
-def layer_means(model_and_tokenizer, layers):
-    from saklas.core.vectors import compute_layer_means
+def layer_means(model_and_tokenizer: Any, layers: Any) -> Any:
+    # The probe-centering mean is the per-layer mean of the neutral activation
+    # stack (X.mean(0)) — same corpus, same pooling — so there is no separate
+    # compute_layer_means pass.
+    from saklas.core.vectors import compute_neutral_activations
     model, tokenizer = model_and_tokenizer
-    return compute_layer_means(model, tokenizer, layers)
+    acts = compute_neutral_activations(model, tokenizer, layers)
+    return {idx: X.mean(dim=0) for idx, X in acts.items()}
 
 
 @pytest.fixture(scope="module")
-def happy_profile(model_and_tokenizer, layers):
+def happy_profile(model_and_tokenizer: Any, layers: Any) -> Any:
     model, tokenizer = model_and_tokenizer
     return _extract_profile(model, tokenizer, "happy", layers)
 
 
+def _steer_subspace(mgr: Any, *pairs: Any) -> None:
+    """4.0: route baked ``(profile, alpha)`` pairs through the unified backend.
+
+    Every vector lowers to a rank-1 push fragment (unit dir + baked-magnitude
+    coord), all composed into one merged affine subspace via
+    ``synthesize_subspace`` + ``add_subspace`` — the dispatch the session does.
+    Anchored at zero (enough for the smoke "steering changes the output"
+    assertions; the GPU gate owns strength calibration).
+    """
+    from saklas.core.manifold import synthesize_subspace
+
+    push: list[Any] = []
+    neutral_means: dict[int, torch.Tensor] = {}
+    for profile, alpha in pairs:
+        basis_dirs: dict[int, torch.Tensor] = {}
+        coord_dirs: dict[int, torch.Tensor] = {}
+        for L, vec in profile.items():
+            v = vec.to(torch.float32).reshape(-1)
+            n = float(v.norm())
+            if n < 1e-12:
+                continue
+            basis_dirs[L] = (v / n).reshape(1, -1)
+            # Follow the profile's device (the loaded steering vectors live on
+            # the model device); a CPU-default coord would mismatch the
+            # on-device basis inside synthesize_subspace (``c_i @ B_i``).
+            coord_dirs[L] = torch.tensor([n], device=v.device)
+            neutral_means.setdefault(L, torch.zeros_like(v))
+        push.append((basis_dirs, coord_dirs, alpha))
+    synth = synthesize_subspace(push, [], neutral_means=neutral_means)
+    mgr.add_subspace("steer", synth)
+
+
 class TestVectorExtraction:
-    def test_returns_valid_profile(self, happy_profile, model_and_tokenizer):
+    def test_returns_valid_profile(self, happy_profile: Any, model_and_tokenizer: Any) -> None:
         model, _ = model_and_tokenizer
         cfg = getattr(model.config, "text_config", None) or model.config
         hidden_dim = cfg.hidden_size
@@ -85,7 +141,7 @@ class TestVectorExtraction:
             norm = vec.norm().item()
             assert norm > 0 and not math.isinf(norm) and not math.isnan(norm)
 
-    def test_extraction_fast_enough(self, model_and_tokenizer, layers):
+    def test_extraction_fast_enough(self, model_and_tokenizer: Any, layers: Any) -> None:
         """Single contrastive extraction should complete within the backend's budget."""
         model, tokenizer = model_and_tokenizer
         start = time.perf_counter()
@@ -97,7 +153,7 @@ class TestVectorExtraction:
 
 
 class TestSteering:
-    def test_steered_output_differs(self, model_and_tokenizer, layers, happy_profile):
+    def test_steered_output_differs(self, model_and_tokenizer: Any, layers: Any, happy_profile: Any) -> None:
         from saklas.core.hooks import SteeringManager
         from saklas.core.generation import GenerationConfig, GenerationState, generate_steered
 
@@ -119,7 +175,7 @@ class TestSteering:
 
         # Steered
         mgr = SteeringManager()
-        mgr.add_vector("happy", happy_profile, 1.5)
+        _steer_subspace(mgr, (happy_profile, 1.5))
         mgr.apply_to_model(layers, device, dtype)
 
         state1 = GenerationState()
@@ -129,7 +185,7 @@ class TestSteering:
 
         assert ids0 != ids1, "Steered output should differ from unsteered"
 
-    def test_hook_cleanup(self, model_and_tokenizer, layers, happy_profile):
+    def test_hook_cleanup(self, model_and_tokenizer: Any, layers: Any, happy_profile: Any) -> None:
         from saklas.core.hooks import SteeringManager
         from saklas.core.generation import GenerationConfig, GenerationState, generate_steered
 
@@ -149,7 +205,7 @@ class TestSteering:
 
         # Steered
         mgr = SteeringManager()
-        mgr.add_vector("happy", happy_profile, 2.0)
+        _steer_subspace(mgr, (happy_profile, 2.0))
         mgr.apply_to_model(layers, device, dtype)
         state_s = GenerationState()
         steered = generate_steered(model, tokenizer, input_ids.clone(), config, state_s)
@@ -164,15 +220,15 @@ class TestSteering:
 
 
 class TestSaveLoad:
-    def test_roundtrip(self, happy_profile):
+    def test_roundtrip(self, happy_profile: Any) -> None:
         from saklas.core.vectors import save_profile, load_profile
 
         with tempfile.TemporaryDirectory() as tmp:
             path = str(Path(tmp) / "test_profile.safetensors")
-            save_profile(happy_profile, path, {"method": "contrastive_pca"})
+            save_profile(happy_profile, path, {"method": "difference_of_means"})
             loaded_profile, loaded_meta = load_profile(path)
 
-            assert loaded_meta["method"] == "contrastive_pca"
+            assert loaded_meta["method"] == "difference_of_means"
             assert "scores" not in loaded_meta
             assert set(loaded_profile.keys()) == set(happy_profile.keys())
             for idx in happy_profile:
@@ -182,10 +238,12 @@ class TestSaveLoad:
 
 
 class TestTraitMonitor:
-    def test_monitor_records_history(self, model_and_tokenizer, layers, happy_profile, layer_means):
+    def test_monitor_records_history(self, model_and_tokenizer: Any, layers: Any, happy_profile: Any, layer_means: Any) -> None:
         from saklas.core.hooks import SteeringManager
-        from saklas.core.monitor import TraitMonitor
+        from saklas.core.monitor import Monitor
+        from saklas.core.vectors import fold_directions_to_subspace
         from saklas.core.generation import GenerationConfig, GenerationState, generate_steered
+        from tests._whitener import isotropic_whitener
 
         model, tokenizer = model_and_tokenizer
         device = next(model.parameters()).device
@@ -193,13 +251,27 @@ class TestTraitMonitor:
 
         sad_profile = _extract_profile(model, tokenizer, "sad", layers)
 
-        probe_profiles = {"happy": happy_profile, "sad": sad_profile}
-        monitor = TraitMonitor(probe_profiles, layer_means)
+        # Unified Monitor reads probes as folded 1-node rays (the vector-probe
+        # path).  Mahalanobis-only: attach needs a covering whitener — an
+        # isotropic one over the union of both probes' layers suffices for a
+        # records-history smoke check.
+        probe_layers = sorted(set(dict(happy_profile)) | set(dict(sad_profile)))
+        dim = next(iter(dict(happy_profile).values())).shape[0]
+        whit = isotropic_whitener(probe_layers, dim)
+        probe_profiles = {
+            "happy": fold_directions_to_subspace(
+                "happy", dict(happy_profile), dict(layer_means), whitener=whit,
+            ),
+            "sad": fold_directions_to_subspace(
+                "sad", dict(sad_profile), dict(layer_means), whitener=whit,
+            ),
+        }
+        monitor = Monitor(probe_profiles, layer_means, whitener=whit)
 
         # Steer toward happy
         mgr = SteeringManager()
         # α=0.6 sits mid coherent band (0.4–0.8); α=1 is at the cliff per CLAUDE.md.
-        mgr.add_vector("happy", happy_profile, 0.6)
+        _steer_subspace(mgr, (happy_profile, 0.6))
         mgr.apply_to_model(layers, device, dtype)
 
         input_ids = tokenizer.apply_chat_template(
@@ -211,9 +283,14 @@ class TestTraitMonitor:
         generated_ids = generate_steered(model, tokenizer, input_ids, config, state)
         mgr.clear_all()
 
-        # Measure on generated text
+        # Measure on generated text via the surviving hidden-state scoring API.
         text = tokenizer.decode(generated_ids, skip_special_tokens=True)
-        monitor.measure(model, tokenizer, layers, text, device=device)
+        from saklas.core.vectors import _encode_and_capture_all
+
+        hidden = _encode_and_capture_all(
+            model, tokenizer, "How are you feeling?", text, layers, device,
+        )
+        monitor.measure_from_hidden(hidden)
 
         # Should have one entry per generation
         happy_hist = monitor.history["happy"]
@@ -221,21 +298,22 @@ class TestTraitMonitor:
         assert len(happy_hist) == 1, "Monitor should record one entry per generation"
         assert len(sad_hist) == 1
 
-        # Structural: readings are finite floats in the expected cosine range.
-        # The semantic claim "happy steering → higher happy than sad reading
-        # when remeasured via a fresh forward pass" is noise-dominated at this
-        # model scale (3B-param, 20-token gen) — test_throughput_regression
-        # covers whether steering actually runs.
+        # Structural: the coordinate readings are finite (history stores the
+        # per-probe coordinate tuple; axis 0 is the scalar).  The semantic
+        # claim "happy steering → higher happy than sad reading when remeasured
+        # via a fresh forward pass" is noise-dominated at this model scale
+        # (3B-param, 20-token gen) — test_throughput_regression covers whether
+        # steering actually runs.
+        import math
         for hist in (happy_hist, sad_hist):
-            v = hist[0]
-            assert v == v  # not NaN
-            assert -1.5 <= v <= 1.5
+            v = hist[0][0]
+            assert math.isfinite(v)
 
         # Sparkline should be non-empty
         sparkline = monitor.get_sparkline("happy")
         assert len(sparkline) > 0
 
-    def test_throughput_regression(self, model_and_tokenizer, layers, happy_profile, layer_means):
+    def test_throughput_regression(self, model_and_tokenizer: Any, layers: Any, happy_profile: Any, layer_means: Any) -> None:
         """Steered generation should be at least 85% of vanilla throughput."""
         from saklas.core.hooks import SteeringManager
         from saklas.core.generation import GenerationConfig, GenerationState, generate_steered
@@ -260,11 +338,12 @@ class TestTraitMonitor:
         # Steered + monitored timing
         # 3 steering vectors
         mgr = SteeringManager()
-        mgr.add_vector("happy", happy_profile, 0.8)
         curious_profile = _extract_profile(model, tokenizer, "curious", layers)
-        mgr.add_vector("curious", curious_profile, 0.5)
         concise_profile = _extract_profile(model, tokenizer, "concise", layers)
-        mgr.add_vector("concise", concise_profile, 0.3)
+        # 3 vectors → one merged affine subspace (the dispatch composes them).
+        _steer_subspace(
+            mgr, (happy_profile, 0.8), (curious_profile, 0.5), (concise_profile, 0.3),
+        )
         mgr.apply_to_model(layers, device, dtype)
 
         state1 = GenerationState()
@@ -282,41 +361,8 @@ class TestTraitMonitor:
         )
 
 
-class TestExtractContrastive:
-    def test_returns_valid_profile(self, model_and_tokenizer, layers, num_layers):
-        from saklas.core.vectors import extract_contrastive
-        model, tokenizer = model_and_tokenizer
-        cfg = getattr(model.config, "text_config", None) or model.config
-        hidden_dim = cfg.hidden_size
-        pairs = [
-            {"positive": "I feel happy today", "negative": "I feel sad today"},
-            {"positive": "Everything is wonderful", "negative": "Everything is terrible"},
-            {"positive": "I love this", "negative": "I hate this"},
-        ]
-        profile, diagnostics = extract_contrastive(model, tokenizer, pairs, layers=layers)
-        assert isinstance(profile, dict)
-        assert len(profile) > 0
-        for idx, vec in profile.items():
-            assert 0 <= idx < num_layers
-            assert vec.shape == (hidden_dim,)
-            norm = vec.norm().item()
-            assert norm > 0 and not math.isinf(norm) and not math.isnan(norm)
-        # Diagnostics surface for multi-pair extractions; layer set must
-        # match the profile so downstream consumers can index either dict
-        # by layer index without branching.
-        assert set(diagnostics.keys()) == set(profile.keys())
-        for metrics in diagnostics.values():
-            assert {
-                "evr",
-                "intra_pair_variance_mean",
-                "intra_pair_variance_std",
-                "inter_pair_alignment",
-                "diff_principal_projection",
-            } <= set(metrics.keys())
-
-
 class TestBuildChatInput:
-    def test_chat_template_path(self, model_and_tokenizer):
+    def test_chat_template_path(self, model_and_tokenizer: Any) -> None:
         from saklas.core.generation import build_chat_input
         _, tokenizer = model_and_tokenizer
         messages = [{"role": "user", "content": "Hello"}]
@@ -325,7 +371,7 @@ class TestBuildChatInput:
         assert ids.shape[0] == 1
         assert ids.shape[1] > 0
 
-    def test_with_system_prompt(self, model_and_tokenizer):
+    def test_with_system_prompt(self, model_and_tokenizer: Any) -> None:
         from saklas.core.generation import build_chat_input
         _, tokenizer = model_and_tokenizer
         messages = [{"role": "user", "content": "Hello"}]
@@ -335,41 +381,6 @@ class TestBuildChatInput:
         assert ids_sys.shape[1] > ids_no_sys.shape[1]
 
 
-class TestProbesBootstrap:
-    def test_bootstrap_loads_from_cache(self, monkeypatch, model_and_tokenizer, layers, happy_profile):
-        """Bootstrap should return cached profiles without re-extracting."""
-        from saklas.io.probes_bootstrap import bootstrap_probes
-        from saklas.core.vectors import save_profile
-        from saklas.io.paths import concept_dir, safe_model_id
-        from saklas.io.packs import materialize_bundled, PackMetadata, hash_file
-        from saklas.core.model import get_model_info
-        model, tokenizer = model_and_tokenizer
-        model_info = get_model_info(model, tokenizer)
-
-        with tempfile.TemporaryDirectory() as tmp:
-            monkeypatch.setenv("SAKLAS_HOME", tmp)
-            materialize_bundled()
-            # Pre-populate the `happy.sad` concept tensor for this model
-            folder = concept_dir("default", "happy.sad")
-            ts_path = folder / f"{safe_model_id(model_info['model_id'])}.safetensors"
-            save_profile(happy_profile, str(ts_path), {
-                "method": "contrastive_pca",
-                "statements_sha256": hash_file(folder / "statements.json"),
-            })
-            # Refresh the pack.json files map to include the new tensor
-            meta = PackMetadata.load(folder)
-            meta.files[ts_path.name] = hash_file(ts_path)
-            meta.files[ts_path.with_suffix(".json").name] = hash_file(ts_path.with_suffix(".json"))
-            meta.write(folder)
-
-            probes = bootstrap_probes(
-                model, tokenizer, layers, model_info,
-                categories=["affect"],
-            )
-            assert isinstance(probes, dict)
-            assert "happy.sad" in probes
-
-
 class TestAblationPerformance:
     """Combined ablation + additive throughput must stay >= 80% of vanilla.
 
@@ -377,11 +388,11 @@ class TestAblationPerformance:
     does one extra matmul per active ablation layer per step. Intentional.
     """
 
-    def test_throughput_with_ablation(self, model_and_tokenizer, layers, layer_means):
+    def test_throughput_with_ablation(self, model_and_tokenizer: Any, layers: Any, layer_means: Any) -> None:
         from saklas.core.session import SaklasSession
 
         model, tokenizer = model_and_tokenizer
-        session = SaklasSession(model, tokenizer, probes=["affect"])
+        session = SaklasSession(model, tokenizer, probes=["register"])
 
         try:
             prompt = "Write a 200-word essay on the history of bicycles."
@@ -409,6 +420,146 @@ class TestAblationPerformance:
                 f"combined ablation + additive too slow: "
                 f"{ratio:.2%} of vanilla (vanilla={tok_s_vanilla:.1f} tok/s, "
                 f"combined={tok_s_combined:.1f} tok/s)"
+            )
+        finally:
+            session.close()
+
+
+class TestDiscoverManifoldEndToEnd:
+    """End-to-end discover-mode fit on a real model.
+
+    Exercises the integration path the unit-test suite skips: the LLM-side
+    K-tuple generator, the per-node centroid forward pass, the per-model
+    PCA + RBF fit, and the steered-generation hook at a manifold position.
+    Held to a tight time budget (corpus generation is the slow part — 1
+    scenario call + N_concepts × N_scenarios statement calls — so 5
+    concepts × 2 scenarios × 3 statements stays under ~6× the existing
+    extraction budget).
+
+    Asserts the structural invariants only: the fit produces a
+    ``CustomDomain(k)``, every node lands at distinct derived coords, and
+    a soft subspace-replace at one node's centroid produces *different*
+    text from a steered call at a different node's centroid.  Going
+    deeper (e.g. probe-score asymmetry between opposite node positions)
+    requires the manifold to encode a probe-aligned axis, which depends
+    on which concept heap the generator produces — too fragile for a
+    smoke test, properly the job of the naturalness eval.
+    """
+
+    _CONCEPTS = ["pirate", "scholar", "robot", "caveman", "assistant"]
+    _SAMPLES_PER_PROMPT = 1
+    # A2 conversational extraction: each concept answers every shared baseline
+    # prompt in character, so one corpus = samples_per_prompt × len(baseline
+    # prompts) responses (64 prompts bundled).  Generation is the dominant
+    # cost; the budget scales with the concept × prompt turn count.
+    _GENERATE_BUDGET_S = _EXTRACTION_BUDGET_S * 6
+    _FIT_BUDGET_S = _EXTRACTION_BUDGET_S * 2
+
+    def test_discover_pipeline(self, model_and_tokenizer: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from saklas.core.manifold import CustomDomain
+        from saklas.core.session import SaklasSession
+        from saklas.io.manifolds import create_discover_manifold_folder
+
+        # Pin SAKLAS_HOME to a per-test temp dir so the manifold folder
+        # lands somewhere disposable; bundled neutrals still copy in
+        # fresh on first session init.
+        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+
+        model, tokenizer = model_and_tokenizer
+        # probes=[] — the smoke test doesn't need probe scoring and
+        # skipping bootstrap shaves seconds off the discover gate.
+        session = SaklasSession(model, tokenizer, probes=[])
+        try:
+            # ---- 1. generate per-concept corpora (A2 conversational) ----
+            from saklas.core.vectors import _load_baseline_prompts
+            n_prompts = len(_load_baseline_prompts())
+            t0 = time.perf_counter()
+            corpora = session.generate_responses(
+                self._CONCEPTS,
+                [None] * len(self._CONCEPTS),
+                samples_per_prompt=self._SAMPLES_PER_PROMPT,
+            )
+            dt_gen = time.perf_counter() - t0
+            assert dt_gen < self._GENERATE_BUDGET_S, (
+                f"generate_responses took {dt_gen:.1f}s, "
+                f"budget {self._GENERATE_BUDGET_S:.1f}s"
+            )
+            assert set(corpora.keys()) == set(self._CONCEPTS)
+            expected_per_concept = self._SAMPLES_PER_PROMPT * n_prompts
+            for c, lines in corpora.items():
+                assert len(lines) == expected_per_concept, (
+                    f"corpus for {c!r}: {len(lines)} responses, "
+                    f"expected {expected_per_concept}"
+                )
+                # Length must be a multiple of the baseline-prompt count
+                # (response[i] ↔ baseline_prompt[i % k]).
+                assert len(lines) % n_prompts == 0
+
+            # ---- 2. author the discover folder ----
+            folder = create_discover_manifold_folder(
+                "local", "smoke_personas", "smoke-test discover",
+                fit_mode="pca",
+                node_corpora=corpora,
+                hyperparams={"max_dim": 2, "var_threshold": 0.70},
+            )
+
+            # ---- 3. fit through the session pipeline ----
+            t0 = time.perf_counter()
+            manifold = session.fit(folder)
+            dt_fit = time.perf_counter() - t0
+            assert dt_fit < self._FIT_BUDGET_S, (
+                f"session.fit took {dt_fit:.1f}s, "
+                f"budget {self._FIT_BUDGET_S:.1f}s"
+            )
+
+            # Discover-mode shape invariants.
+            assert isinstance(manifold.domain, CustomDomain)
+            k = manifold.domain.intrinsic_dim
+            assert 1 <= k <= 2
+            assert manifold.node_coords.shape == (
+                len(self._CONCEPTS), k,
+            )
+            # Derived coords must distinguish nodes — every pair distinct
+            # by at least a small floor, else the fit collapsed.
+            from itertools import combinations
+            for i, j in combinations(range(len(self._CONCEPTS)), 2):
+                dist = (
+                    manifold.node_coords[i] - manifold.node_coords[j]
+                ).norm().item()
+                assert dist > 1e-3, (
+                    f"derived coords for nodes {i} and {j} are "
+                    f"degenerate (dist={dist:.2e}) — fit collapsed"
+                )
+
+            # ---- 4. steered generation at one node vs another ----
+            # The manifold loads into session._manifolds lazily on
+            # scope entry; ManifoldTerm carries the authoring position.
+            label_a = manifold.node_labels[0]  # pirate
+            label_b = manifold.node_labels[2]  # robot
+            pos_a = ",".join(
+                f"{float(c):.4f}" for c in manifold.node_coords[0]
+            )
+            pos_b = ",".join(
+                f"{float(c):.4f}" for c in manifold.node_coords[2]
+            )
+            prompt = "Describe what you see in this room."
+
+            from saklas.core.sampling import SamplingConfig
+            sampling = SamplingConfig(
+                temperature=0.0, max_tokens=48, seed=0,
+            )
+            with session.steering(
+                f"1.0 local/smoke_personas%{pos_a}@response",
+            ):
+                r_a = session.generate(prompt, sampling=sampling)
+            with session.steering(
+                f"1.0 local/smoke_personas%{pos_b}@response",
+            ):
+                r_b = session.generate(prompt, sampling=sampling)
+            assert r_a.text != r_b.text, (
+                f"steering at node {label_a!r} produced identical text "
+                f"to node {label_b!r} — the manifold hook isn't moving "
+                f"activations"
             )
         finally:
             session.close()

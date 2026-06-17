@@ -1,18 +1,25 @@
 <script lang="ts">
-  // Single heatmap cell — a colored square keyed by a [-1, 1] score.
+  // Single heatmap cell — a colored square keyed by a score and a
+  // saturation ``scale`` (the value at which the ramp is full).
   //
   // Used by the Correlation matrix (cosine similarity per probe pair)
   // and by the click-token drilldown drawer (per-layer × per-probe
   // grid for a single token).  The score-to-RGB mapping is centralized
   // in tokens.ts::scoreToRgb so highlight tints stay consistent across
-  // surfaces.
+  // surfaces.  Cosine grids leave ``scale`` at its ``HIGHLIGHT_SAT``
+  // default ([-1, 1] data); probe-coordinate grids pass a per-probe
+  // node-coordinate extent so the cells aren't pinned full from coords
+  // that run well past ±1.
 
-  import { scoreToRgb } from "../tokens";
+  import { scoreToRgb, HIGHLIGHT_SAT } from "../tokens";
 
   interface Props {
-    /** Heatmap value, expected in [-1, 1].  ``null`` and non-finite
-     * values render as the empty-cell placeholder. */
+    /** Heatmap value.  Read against ``scale`` (full color at ``±scale``);
+     * ``null`` and non-finite values render as the empty-cell placeholder. */
     value: number | null | undefined;
+    /** Saturation scale — the value at which the ramp reaches full color.
+     * Defaults to ``HIGHLIGHT_SAT`` (the [-1, 1] cosine-grid regime). */
+    scale?: number;
     /** Cell width in pixels. */
     size?: number;
     /** Optional tooltip text override.  When omitted, the value is
@@ -27,6 +34,7 @@
 
   let {
     value,
+    scale = HIGHLIGHT_SAT,
     size = 14,
     title,
     showValue = false,
@@ -35,7 +43,9 @@
   const isNull = $derived(
     value === null || value === undefined || !Number.isFinite(value),
   );
-  const bg = $derived(isNull ? "var(--bg-alt)" : scoreToRgb(value as number));
+  const bg = $derived(
+    isNull ? "var(--bg-alt)" : scoreToRgb(value as number, scale),
+  );
   const tip = $derived(
     title ?? (isNull ? "—" : (value as number).toFixed(3)),
   );

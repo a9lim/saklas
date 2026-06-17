@@ -1,56 +1,176 @@
+from __future__ import annotations
+
+import re
 from collections import deque
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
 
 import torch
+
+from saklas.core.mahalanobis import WhitenerError
+from saklas.core.manifold import BoxDomain, invert_parameterization
+from saklas.core.results import ProbeReading
+
+if TYPE_CHECKING:
+    from saklas.core.manifold import Manifold
 
 _MAX_HISTORY = 8
 
 _EMPTY_STATS = {"count": 0, "sum": 0.0, "sum_sq": 0.0,
                 "min": float("inf"), "max": float("-inf")}
 
+# Default top-N nearest-node count for manifold probes.  Per-probe
+# override available on ``Monitor.add_probe``.
+DEFAULT_NEAREST_TOP_N: int = 3
 
-class TraitMonitor:
-    """Monitors model activations against a library of probe vectors.
+# Synthetic label for the neutral anchor in the nearest-node readout.  Every
+# fit is neutral-anchored (the per-model neutral mean is the frame origin), so
+# neutral is a *point* in the same whitened metric the nodes live in — not a
+# stored corpus node.  It competes in the ``nearest`` ranking as a virtual
+# candidate (computed, never written to ``node_labels`` / ``node_coords``): when
+# the running activation sits closer to the origin than to any node, ``nearest``
+# reports ``("neutral", dist)`` and ``flat_scalars`` exposes the uniform
+# ``<probe>@neutral`` gate channel.  Suppressed when a manifold already carries a
+# real node with this label (the corpus node owns the name).
+NEUTRAL_LABEL: str = "neutral"
 
-    Each probe has a profile (dict mapping layer_idx -> baked direction).
-    After generation, a single forward pass over the generated text
-    pools the last content token's hidden state at each layer.
-    Mean-centered cosine similarities against probe vectors, weighted by
-    the baked magnitude ||baked_i|| (which encodes share * ref_norm — the
-    same "how much does this layer steer per unit alpha" quantity),
-    give one value per probe per generation.
+# Floor for the per-layer share weight on a manifold layer with a
+# degenerate (near-zero) Mahalanobis share — keeps the share-weighted
+# cross-layer aggregation from collapsing to NaN on a manifold whose
+# every layer reports share ≈ 0.  Negligible against a real per-layer
+# share (~O(1) whitened units), so it doesn't de-peak the weighting.
+_MIN_SHARE_WEIGHT: float = 1e-6
+
+# Guard against division by zero in the subspace_fraction / cosine
+# denominator (a zero or near-zero activation norm).
+_FRACTION_EPSILON: float = 1e-8
+
+
+def _woodbury_apply(
+    v: torch.Tensor, X: torch.Tensor, K: torch.Tensor, lam: float,
+) -> torch.Tensor:
+    """On-device ``Σ_reg⁻¹ v = (1/λ)(v − Xᵀ K (X v))`` (Woodbury).
+
+    Shared by :class:`Monitor` and :class:`Monitor`.  Kept a
+    plain module-level function (not a method) so the per-token hot path is
+    a global lookup with no class attribute resolution — the hot-path
+    companion to :meth:`LayerWhitener.apply_inv` (which force-promotes
+    fp32/CPU and is wrong here).  ``v`` is ``[D]`` or ``[n, D]``; ``X`` is
+    ``[N, D]``, ``K`` is ``[N, N]``, all on the same device/dtype.  Pure
+    matmuls, no host sync.  For a ``[n, D]`` batch this is
+    ``(1/λ)(V − (V Xᵀ) K X)``; for ``[D]`` it broadcasts the same way.
+    """
+    Xv = v @ X.transpose(0, 1)        # [..., N]
+    KXv = Xv @ K.transpose(0, 1)      # [..., N]  (K symmetric; t() = K)
+    return (v - KXv @ X) / lam        # [..., D]
+
+
+class Monitor:
+    """Reads probes as whitened subspace coordinates — flat and curved alike.
+
+    **One** read shape, two execution paths.  Each probe is a
+    :class:`~saklas.core.manifold.Manifold`, and every read — live per token
+    (gate / stream) and the end-of-generation aggregate — produces one full
+    :class:`ProbeReading` (``coords`` + ``fraction`` + ``nearest`` +
+    ``residual`` plus their ``*_per_layer`` traces), with no flat/curved field
+    asymmetry: a flat (affine) probe recovers ``coords`` through the affine
+    reduced→domain map (off-surface ``residual`` identically 0), a curved probe
+    through the iterative :func:`invert_parameterization` foot solve (real
+    off-surface ``residual``).  The full per-token information (nearest, curved
+    coords, residual, per-layer) is the research-tool priority.
+
+    Execution is still no-redundancy on the hot path.  The whole *flat* roster
+    is scored together per layer in :meth:`_score_flat_batched` — one ``Σ⁻¹h``
+    Woodbury apply + stacked / block-diagonal matmuls + a **single** host
+    transfer for the roster — instead of re-running the apply and the R-dim
+    solve per probe per layer.  *Curved* probes keep the per-probe foot solve
+    (:meth:`_score_probe_full`), warm-started across decode tokens from the
+    previous token's foot (:meth:`enable_curved_warm`) on the sequential live
+    path.  And when nothing consumes a per-token reading (no gate, no stream),
+    the session skips per-token scoring entirely and pools the aggregate once
+    at finalize — see ``SaklasSession._begin_capture`` /
+    :meth:`score_aggregate`.
+
+    Coordinates are **domain-frame**: each layer's reduced activation
+    coordinate is inverted into the shared domain *before* EV-averaging,
+    because raw per-layer coords live in per-layer ``‖δ_L‖`` units and don't
+    average coherently.  At rank-1 this is the pole-normalized coordinate:
+    ``1.0`` sits at the positive node, signed, unbounded past it.
+
+    The Mahalanobis whitener is mandatory: every probed layer must be
+    covered, built per probe at attach (:func:`_build_whitened_factors`) —
+    a missing / non-covering whitener raises :class:`WhitenerError`, there is
+    no Euclidean readout (on real LMs the Euclidean metric is rogue-dominated,
+    a wrong answer not a degraded one).
+
+    TUI-facing scalar helpers (``get_stats`` / ``get_sparkline`` /
+    ``get_current_and_previous``) report coordinate **axis 0** so the
+    untouched trait panel keeps working; the full per-axis + per-layer data
+    flows through the :class:`ProbeReading` surface.
     """
 
     @staticmethod
-    def _empty_stats() -> dict:
+    def _empty_stats() -> dict[str, Any]:
         return dict(_EMPTY_STATS)
 
-    def __init__(self, probe_profiles: dict[str, dict[int, torch.Tensor]],
-                 layer_means: dict[int, torch.Tensor] | None = None):
+    def __init__(self, probe_manifolds: dict[str, "Manifold"] | None = None,
+                 layer_means: dict[int, torch.Tensor] | None = None,
+                 whitener: Any = None):
         """
-        probe_profiles: maps probe name -> profile dict (layer_idx -> baked vector)
-        layer_means: maps layer_idx -> mean activation vector for centering
+        probe_manifolds: maps probe name -> flat :class:`Manifold` (rank-1
+            concept axis or rank-R discover fit).  Ad-hoc baked directions
+            are wrapped into a 1-pole affine manifold by the session before
+            registration (``fold_directions_to_subspace``).
+        layer_means: maps layer_idx -> neutral mean activation (kept for
+            init-signature parity with :class:`Monitor`; the
+            coordinate readout centers on each fit's own ``LayerSubspace.mean``,
+            not the global layer mean, so this is not consulted on the hot
+            path — only exposed via the ``layer_means`` property).
+        whitener: the :class:`~saklas.core.mahalanobis.LayerWhitener`;
+            mandatory at scoring time (covers every probed layer or raise).
         """
-        self._raw_profiles: dict[str, dict[int, torch.Tensor]] = dict(probe_profiles)
+        self._probes: dict[str, AttachedManifoldProbe] = {}
         self._layer_means: dict[int, torch.Tensor] = dict(layer_means) if layer_means else {}
+        self._whitener: Any = whitener
+        self._whitener_factor_cache: dict[
+            tuple[int, str, torch.dtype],
+            tuple[torch.Tensor, torch.Tensor, float],
+        ] = {}
 
-        # Per-layer stacked cache, inverted from the previous {probe: {layer: ...}}
-        # form so one matmul scores every probe against a hidden state in a single
-        # kernel launch. For each layer that any probe covers:
-        #   V[P, D]  : unit-normed probe directions (zeros for probes missing L)
-        #   W[P]     : per-probe weight at layer L (= ||baked_L||, 0 if missing)
-        # The denominator per probe is built on-device as sum of W across layers
-        # where hidden is also present; no .item() on the hot path.
-        # Structure: {layer_idx: (V_stacked, W_stacked)}.
-        self._layer_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-        # Probe -> index into the P axis (stable, insertion order).
-        self._probe_index: dict[str, int] = {}
-        self._cache_device: torch.device | None = None
-        self._cache_probe_keys: tuple[str, ...] = ()
-        # Cache of layer_means cast to float32 on cache_device.
-        self._mean_cache: dict[int, torch.Tensor] = {}
+        # Cross-probe batched flat-read cache (the hot-path no-redundancy
+        # primitive).  For every *flat* (affine) probe the per-layer geometry
+        # is identical algebra (``_layer_geometry``) over a shared activation,
+        # so the whole flat roster is scored per layer with one ``Σ⁻¹h`` Woodbury
+        # apply + a handful of stacked / block-diagonal matmuls instead of
+        # re-running the apply and the R-dim solve once per probe per layer (the
+        # 17×-redundant cost that dominated decode once a probe roster was
+        # attached).  Curved probes keep the per-probe foot solve.  Built lazily
+        # per (device, roster, whitener); invalidated on any of the three
+        # changing.  ``_flat_layer_cache[L]`` holds the stacked factors for the
+        # flat probes covering layer ``L``; ``_flat_keys`` / ``_curved_keys``
+        # split the roster.
+        self._flat_layer_cache: dict[int, dict[str, Any]] = {}
+        self._flat_global: dict[str, Any] = {}
+        self._flat_keys: tuple[str, ...] = ()
+        self._curved_keys: tuple[str, ...] = ()
+        self._flat_cache_device: torch.device | None = None
+        # Dirty flag set by ``_invalidate_flat_cache`` on every roster / whitener
+        # mutation (FIX F5).  ``_ensure_flat_cache`` checks it instead of
+        # rebuilding ``tuple(self._probes.keys())`` + comparing it every token —
+        # the cache only changes when a mutation flips this, so the per-token
+        # guard is a bool + a device compare, not a per-token tuple alloc.
+        self._flat_cache_dirty: bool = True
 
-        self.history: dict[str, deque[float]] = {n: deque(maxlen=_MAX_HISTORY) for n in self._raw_profiles}
-        self._stats: dict[str, dict] = {n: self._empty_stats() for n in self._raw_profiles}
+        # Per-coordinate history + summary stats.  ``history`` holds the
+        # per-generation aggregate coordinate tuple; ``_stats`` is axis-0
+        # scalar stats (TUI compat) plus the per-axis accumulators the
+        # session reads for the vectorized ``ProbeReadings``.
+        self.history: dict[str, deque[tuple[float, ...]]] = {
+            n: deque(maxlen=_MAX_HISTORY) for n in self._probes
+        }
+        self._stats: dict[str, dict[str, Any]] = {
+            n: self._empty_stats() for n in self._probes
+        }
 
         # Aggregate path sets _pending_aggregate; per-token path sets _pending_per_token.
         # has_pending_data() returns aggregate readiness — the TUI uses it to refresh
@@ -58,23 +178,57 @@ class TraitMonitor:
         self._pending_aggregate = False
         self._pending_per_token = False
 
-        # Live running mean during streaming generation. ``update_live`` is
-        # called by ``generate_stream`` per emitted token; ``begin_live``
-        # resets the accumulator at gen start; ``end_live`` clears so
-        # post-gen reads fall back to the canonical history aggregate.
-        self._live_values: dict[str, float] = {}
+        # Live running mean (per coordinate axis) during streaming generation.
+        self._live_values: dict[str, list[float]] = {}
         self._live_count: int = 0
         self._live_pending: bool = False
+
+        # Curved-probe per-token foot-follow (read-side analogue of the steering
+        # foot-follower).  When ``_curved_warm`` is set — only the sequential
+        # incremental live-scoring path enables it, via ``enable_curved_warm`` —
+        # ``_score_probe_full`` seeds each curved probe's ``invert_parameterization``
+        # from the previous token's foot (keyed ``(probe_name, layer_idx)``) and
+        # stashes the refined foot for the next token, cutting the cold
+        # 12-iter/3-restart solve to ``warm_iter`` steps over two restarts.  Off
+        # by default and for one-off reads (``score_aggregate`` / ``score_hidden``
+        # / the non-incremental stream), so those stay bit-for-bit the cold path.
+        self._curved_feet: dict[tuple[str, int], torch.Tensor] = {}
+        self._curved_warm: bool = False
+
+        # Probe-inspector live trail: when set, every full read also stamps each
+        # probe's per-layer whitened query coords (``cdist_query``) onto the
+        # ``ProbeReading.subspace_coords_per_layer`` so the dashboard can plot the
+        # current hidden state (+ a fading trajectory trail) in the same whitened
+        # frame as the geometry endpoint's ``node_white``.  Off by default — the
+        # session flips it on only while a client requests it
+        # (``persist_subspace_coords``), so the default hot path never pays the
+        # post-pass.
+        self._emit_subspace_coords: bool = False
+
+        if probe_manifolds:
+            for _name, _m in probe_manifolds.items():
+                self.add_probe(_name, _m)
 
     @property
     def probe_names(self) -> list[str]:
         """Probe names in insertion order."""
-        return list(self._raw_profiles.keys())
+        return list(self._probes.keys())
 
     @property
-    def profiles(self) -> dict[str, dict[int, torch.Tensor]]:
-        """Probe profiles: name -> {layer_idx: baked vector}."""
-        return self._raw_profiles
+    def manifolds(self) -> dict[str, "Manifold"]:
+        """Attached probe manifolds: name -> flat :class:`Manifold`."""
+        return {n: p.manifold for n, p in self._probes.items()}
+
+    def probe_layers(self) -> set[int]:
+        """Union of fit-layer indices across every attached probe.
+
+        The capture-widening signal the session uses to retain every layer
+        a probe reads (peer of :meth:`Monitor.attached_layers`).
+        """
+        out: set[int] = set()
+        for probe in self._probes.values():
+            out.update(probe.manifold.layers.keys())
+        return out
 
     @property
     def layer_means(self) -> dict[int, torch.Tensor]:
@@ -82,293 +236,1506 @@ class TraitMonitor:
 
     @layer_means.setter
     def layer_means(self, value: dict[int, torch.Tensor]) -> None:
-        if value is not None and not isinstance(value, dict):
+        value_in: Any = value
+        if value_in is not None and not isinstance(value_in, dict):
             raise TypeError(f"layer_means must be a dict, got {type(value).__name__}")
         self._layer_means = dict(value) if value else {}
-        # Invalidate mean cache; v_unit cache is independent of means.
-        self._mean_cache = {}
 
-    def _ensure_cache(self, device: torch.device) -> None:
-        """Build/refresh the per-device float32 cache of stacked probe matrices + means.
+    @property
+    def whitener(self) -> Any:
+        """The wired :class:`LayerWhitener` (required for reads)."""
+        return self._whitener
 
-        Builds one ``(V[P,D], W[P])`` pair per layer that any probe covers. ``V`` holds
-        unit-normed directions (rows for probes missing that layer are zero, which
-        produces zero similarity — correct because ``W`` at that slot is also zero and
-        the denominator mask is shared). ``W[p] = ||baked_p_L||`` for probes that own
-        the layer, else 0. No ``.item()`` calls — norms stay on-device.
+    def set_whitener(self, whitener: Any) -> None:
+        """Wire (or clear) the Mahalanobis whitener and invalidate the cache.
+
+        Idempotent on the same instance — re-wiring the identical whitener
+        is a no-op.  Any change flushes the shared Woodbury-factor cache and
+        rebuilds each attached probe's per-layer whitened factors against the new
+        covariance (manifold reads are Mahalanobis-only, so a whitener that
+        doesn't cover an attached probe's fit layers raises here).
         """
-        probe_keys = tuple(self._raw_profiles.keys())
-        if (
-            self._cache_device == device
-            and self._cache_probe_keys == probe_keys
-            and self._mean_cache.keys() == self._layer_means.keys()
-            and self._layer_cache
-        ):
+        if whitener is self._whitener:
             return
+        self._whitener = whitener
+        self._whitener_factor_cache.clear()
+        self._invalidate_flat_cache()
+        for probe in self._probes.values():
+            probe.whitened = _build_whitened_factors(
+                whitener, probe, factor_cache=self._whitener_factor_cache,
+            )
 
-        self._cache_device = device
-        self._probe_index = {name: i for i, name in enumerate(probe_keys)}
-        self._cache_probe_keys = probe_keys
-        n_probes = len(probe_keys)
+    def enable_curved_warm(self, flag: bool) -> None:
+        """Enable/disable curved-probe per-token foot warm-starting.
 
-        # Union of layers across all probes, plus a per-layer probe membership map.
-        layer_members: dict[int, list[tuple[int, torch.Tensor]]] = {}
-        dim_for_layer: dict[int, int] = {}
-        for pi, name in enumerate(probe_keys):
-            for layer_idx, vec in self._raw_profiles[name].items():
-                v = vec.to(device=device, dtype=torch.float32)
-                layer_members.setdefault(layer_idx, []).append((pi, v))
-                dim_for_layer[layer_idx] = v.shape[-1]
+        The session flips this on only for the sequential incremental
+        live-scoring path (one ``score_single_token`` per decode step) and off
+        otherwise, so one-off / out-of-order reads (``score_aggregate``,
+        ``score_hidden``, the non-incremental per-token stream) stay on the cold
+        ``invert_parameterization`` path and remain bit-for-bit reproducible.
+        """
+        self._curved_warm = bool(flag)
 
-        new_layer_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-        for layer_idx, members in layer_members.items():
-            dim = dim_for_layer[layer_idx]
-            V = torch.zeros((n_probes, dim), device=device, dtype=torch.float32)
-            W = torch.zeros((n_probes,), device=device, dtype=torch.float32)
-            for pi, v in members:
-                vn = v.norm().clamp(min=1e-8)
-                V[pi] = v / vn
-                # Keep weight on-device; sync cost deferred to the final result.
-                W[pi] = vn
-            new_layer_cache[layer_idx] = (V, W)
-        self._layer_cache = new_layer_cache
+    def set_subspace_coords(self, flag: bool) -> None:
+        """Enable/disable the probe-inspector live whitened-coords post-pass.
 
-        self._mean_cache = {
-            idx: m.to(device=device, dtype=torch.float32)
-            for idx, m in self._layer_means.items()
+        Flipped on by the session for the duration of a generation when a client
+        sets ``persist_subspace_coords`` (the dashboard inspector being open), and
+        reset off at teardown.  Gates the only added work in :meth:`_score_full`,
+        so with it off the read path is byte-for-byte the legacy path.
+        """
+        self._emit_subspace_coords = bool(flag)
+
+    def reset_curved_feet(self) -> None:
+        """Cold-start every curved probe's per-token foot (call per generation).
+
+        Peer of ``SteeringManager.reset_manifold_feet`` — the carried foot is
+        per-generation state, so a new run must re-seed from the nearest node
+        rather than inherit the previous run's final foot.
+        """
+        self._curved_feet.clear()
+
+    def _invalidate_flat_cache(self) -> None:
+        """Drop the cross-probe batched flat-read cache.
+
+        Called whenever the roster, whitener, or scoring device changes — the
+        stacked / block-diagonal factors are rebuilt lazily on the next score.
+        """
+        self._flat_layer_cache = {}
+        self._flat_global = {}
+        self._flat_keys = ()
+        self._curved_keys = ()
+        self._flat_cache_device = None
+        self._flat_cache_dirty = True
+
+    def _score_probe_full(
+        self,
+        probe: "AttachedManifoldProbe",
+        hidden_per_layer: dict[int, torch.Tensor],
+        sih_cache: dict[int, torch.Tensor] | None = None,
+        *,
+        coords_only: bool = False,
+    ) -> ProbeReading:
+        """Full per-probe reading for one state — flat or curved, all fields.
+
+        ``coords_only`` (FIX F2): when a live consumer reads only the axis-0
+        coord / fraction, skip the per-token nearest-distance ranking, the soft
+        assignment, the off-surface residual / tube membership, and the per-layer
+        trace transfer — return a reading carrying just ``coords`` + ``fraction``
+        (``nearest``/``assignment`` empty, ``residual`` 0, ``membership`` 1.0).
+        The full aggregate is re-scored once at finalize, so nothing is lost.
+
+        Loops the probe's shared fit layers through :func:`_layer_geometry`
+        and **share**-weights across them (the layer carrying the most
+        Mahalanobis steering budget is also the most reliable to read from).
+        A flat (affine) probe recovers ``coords`` through the affine
+        reduced→domain map (off-surface ``residual`` 0); a curved probe
+        through the :func:`invert_parameterization` foot solve (real
+        off-surface ``residual``).  Returns the cross-layer share-weighted
+        ``coords`` / ``fraction`` / ``nearest`` / ``residual`` plus their
+        per-layer traces.  This is the single geometry primitive every read
+        entry point (live per token, aggregate) shares, so the aggregate at a
+        token index is bit-identical to the live read at that token.
+
+        ``sih_cache`` (optional, keyed by layer) shares the probe-independent
+        ``Σ⁻¹h`` apply across every curved probe in one ``_score_full`` pass; it
+        is valid only for the current state, so callers pass a fresh dict per
+        token / pool.
+        """
+        manifold = probe.manifold
+        sw = probe.share_weights
+        is_affine = probe.is_affine
+        shared = [idx for idx in manifold.layers if idx in hidden_per_layer]
+        if not shared:
+            return ProbeReading(fraction=0.0, nearest=[], coords=())
+        total_w = sum(sw.get(idx, 0.0) for idx in shared)
+        if total_w <= _MIN_SHARE_WEIGHT:
+            w_shared = {idx: 1.0 / len(shared) for idx in shared}
+        else:
+            w_shared = {idx: sw.get(idx, 0.0) / total_w for idx in shared}
+
+        K = probe.node_values_reduced[shared[0]].shape[0]
+        inject_neutral = probe.inject_neutral
+        Kc = K + (1 if inject_neutral else 0)   # candidate count incl. neutral
+        n_dim = manifold.domain.intrinsic_dim
+        dist_acc_t: torch.Tensor | None = None
+        # Per-layer terms + running share-weighted means are accumulated as
+        # on-device tensors and pulled to the host in a *single* transfer per
+        # probe at the end.  The earlier code called ``float(... .item())`` /
+        # ``.tolist()`` per layer, which on MPS is one command-buffer stall per
+        # layer per probe per token — the dominant decode-loop cost once a probe
+        # roster is attached (~31 host syncs/probe × 17 probes ≈ 140 ms/token on
+        # an M-series GPU).  Keeping everything on device until one batched
+        # ``.cpu()`` preserves every field of the full reading (the per-token
+        # info priority) at ~1 sync/probe.
+        frac_terms: list[torch.Tensor] = []        # each (1,)
+        resid_terms: list[torch.Tensor] = []       # each (1,)
+        coord_terms: list[torch.Tensor] = []       # each (n_dim,)
+        layer_order: list[int] = []
+        frac_mean_t: torch.Tensor | None = None    # (1,)
+        resid_mean_t: torch.Tensor | None = None   # (1,)
+        coords_mean_t: torch.Tensor | None = None  # (n_dim,)
+        mem_mean_t: torch.Tensor | None = None     # (1,) tube-fit membership
+
+        for layer_idx in shared:
+            sub = manifold.layers[layer_idx]
+            h = hidden_per_layer[layer_idx].to(torch.float32)
+            if h.ndim > 1:
+                h = h.reshape(-1, h.shape[-1])[-1]
+            wh = probe.whitened[layer_idx]
+            frac_t, cdist_query, invert_query, _cdist_nodes = _layer_geometry(
+                probe, layer_idx, h, sih_cache,
+            )
+            w = w_shared[layer_idx]
+
+            if not coords_only:
+                # Neutral competes as a virtual candidate at the ``K``-th row of
+                # the precomputed ``node_white_aug`` (FIX F4 — appended once at
+                # attach, not re-``cat``-ed per token): its whitened coord is
+                # ``wh.neutral_white`` (0 for an affine fit, the baked origin for
+                # a curved one), so the same cdist yields its distance with no
+                # special-casing downstream.  Skipped entirely under ``coords_only``
+                # (FIX F2) — nearest / assignment aren't read.
+                dists = torch.linalg.vector_norm(
+                    wh.node_white_aug - cdist_query.reshape(1, -1), dim=-1,
+                )
+                weighted_dists = dists * w
+                dist_acc_t = (
+                    weighted_dists
+                    if dist_acc_t is None
+                    else dist_acc_t + weighted_dists.to(dist_acc_t.device)
+                )
+
+            if is_affine:
+                # Affine map: coords are exact, no off-subspace residual.
+                pos_t = (
+                    wh.coord_S @ invert_query + wh.coord_b
+                    if wh.coord_S is not None and wh.coord_b is not None
+                    else invert_query
+                )
+                resid_t = frac_t.new_zeros(1)
+                mem_t = frac_t.new_ones(1)   # surface fills subspace ⇒ full fit
+            else:
+                # Curved probe: warm-start the nearest-point foot from the
+                # previous token's foot when the session enabled it for this
+                # (sequential) live-scoring pass; otherwise solve cold.  The foot
+                # solve is needed for ``coords`` regardless, so it always runs;
+                # only the residual / membership it feeds are ``coords_only``-gated.
+                foot_key = (probe.name, layer_idx)
+                warm = self._curved_feet.get(foot_key) if self._curved_warm else None
+                pos, res = invert_parameterization(
+                    sub, manifold.domain, invert_query.reshape(1, -1),
+                    manifold.node_coords, warm_start=warm,
+                )
+                if self._curved_warm:
+                    self._curved_feet[foot_key] = pos.detach()
+                pos_t = pos.reshape(-1)
+                if coords_only:
+                    resid_t = frac_t.new_zeros(1)
+                    mem_t = frac_t.new_ones(1)
+                else:
+                    par_norm = torch.linalg.vector_norm(invert_query)
+                    res_flat = res.reshape(-1)[:1]
+                    # norm_residual = res / ‖query‖, or 0 if the query is ~zero —
+                    # kept as a tensor (no ``.item()``) via a branchless ``where``.
+                    resid_t = torch.where(
+                        par_norm < _FRACTION_EPSILON,
+                        torch.zeros_like(res_flat),
+                        res_flat / par_norm.clamp(min=_FRACTION_EPSILON),
+                    )
+                    # Tube-fit membership ``exp(−res²/2σ²)`` at the foot — both
+                    # ``res`` and ``σ`` are raw reduced-space (un-whitened)
+                    # distances, so the ratio is unit-consistent.  No σ-field ⇒
+                    # no tube ⇒ full membership (1.0).
+                    if sub.has_sigma:
+                        sig_foot = sub.sigma_at(
+                            manifold.domain.embed(pos.reshape(1, -1)),
+                        ).reshape(1)
+                        mem_t = torch.exp(
+                            -(res_flat ** 2)
+                            / (2.0 * (sig_foot ** 2).clamp(min=_FRACTION_EPSILON))
+                        )
+                    else:
+                        mem_t = frac_t.new_ones(1)
+
+            frac_t = frac_t.reshape(1)
+            coord_t = pos_t.reshape(-1)[:n_dim]
+            if coord_t.numel() < n_dim:
+                coord_t = torch.cat(
+                    [coord_t, coord_t.new_zeros(n_dim - coord_t.numel())],
+                )
+            frac_mean_t = (
+                w * frac_t if frac_mean_t is None else frac_mean_t + w * frac_t
+            )
+            coords_mean_t = (
+                w * coord_t if coords_mean_t is None else coords_mean_t + w * coord_t
+            )
+            if coords_only:
+                # coords + fraction means are all the lean reading needs (FIX F2);
+                # skip the per-layer trace lists + residual / membership means.
+                continue
+            resid_t = resid_t.reshape(1)
+            mem_t = mem_t.reshape(1)
+            layer_order.append(layer_idx)
+            frac_terms.append(frac_t)
+            resid_terms.append(resid_t)
+            coord_terms.append(coord_t)
+            resid_mean_t = (
+                w * resid_t if resid_mean_t is None else resid_mean_t + w * resid_t
+            )
+            mem_mean_t = (
+                w * mem_t if mem_mean_t is None else mem_mean_t + w * mem_t
+            )
+
+        if coords_only:
+            # Lean reading: one host transfer of (fraction, coords) (FIX F2).
+            if frac_mean_t is None or coords_mean_t is None:
+                return ProbeReading(fraction=0.0, nearest=[], coords=())
+            lean = torch.cat(
+                [frac_mean_t.reshape(-1), coords_mean_t.reshape(-1)],
+            ).detach().cpu().tolist()
+            return ProbeReading(
+                fraction=lean[0],
+                nearest=[],
+                coords=tuple(lean[1:1 + n_dim]),
+                residual=0.0,
+                assignment=[],
+                membership=1.0,
+            )
+
+        requested_top_n = int(probe.top_n)
+        top_n = requested_top_n if requested_top_n >= 0 else Kc + requested_top_n
+        top_n = min(max(top_n, 0), Kc)
+        nearest_dist_t: torch.Tensor | None = None
+        nearest_idx_t: torch.Tensor | None = None
+        if top_n and dist_acc_t is not None:
+            # Rank by **raw** whitened distance (so ``nearest`` is literally the
+            # nearest node, distinct from the density-aware ``assignment``), then
+            # report it in units of the probe's typical label spacing
+            # ``label_scale`` (median node nearest-neighbor distance) — a single
+            # per-probe constant, so it rescales the value without reordering.
+            # Raw whitened distance spans ~60× across fits (a node sits 1.15..72
+            # from neutral), so a bare negated-distance ``@label`` gate was not
+            # portable; ``d / label_scale`` ≈ "typical label-spacings away"
+            # transfers across probes.  Assignment keeps raw ``dist_acc_t`` (it
+            # needs raw ``d`` for the Gaussian ``−d²/2τ²``).
+            nearest_dist_t, nearest_idx_t = torch.topk(
+                dist_acc_t, k=top_n, largest=False, sorted=True,
+            )
+            nearest_dist_t = nearest_dist_t / probe.label_scale
+        # Soft assignment: softmax(−d²/(2τ²) − R·log(τ)) — a proper isotropic
+        # R-D Gaussian-mixture posterior with uniform node prior.  The
+        # ``logvol_bias`` term is the missing Gaussian normalization; without it
+        # the bare softmax sends mass to whichever ``τ`` is largest regardless of
+        # distance (broadest-node-wins).
+        assign_prob_t: torch.Tensor | None = None
+        assign_idx_t: torch.Tensor | None = None
+        if (
+            top_n
+            and dist_acc_t is not None
+            and probe.assign_bandwidth is not None
+            and probe.assign_logvol_bias is not None
+        ):
+            tau = probe.assign_bandwidth.to(dist_acc_t.device, torch.float32)
+            lvb = probe.assign_logvol_bias.to(dist_acc_t.device, torch.float32)
+            if tau.numel() == dist_acc_t.numel() == lvb.numel():
+                logits = (
+                    -(dist_acc_t ** 2) / (2.0 * (tau ** 2).clamp(min=_FRACTION_EPSILON))
+                    + lvb
+                )
+                probs = torch.softmax(logits, dim=0)
+                assign_prob_t, assign_idx_t = torch.topk(
+                    probs, k=top_n, largest=True, sorted=True,
+                )
+
+        # --- one device→host transfer for the whole probe reading ---
+        # Means (1 + 1 + n_dim) ‖ per-layer traces (L + L + L·n_dim) ‖ nearest
+        # (top_n dists + top_n indices-as-float).  ``.cpu().tolist()`` once.
+        # ``shared`` is non-empty here (empty returns early above), so the loop
+        # ran and the running means are populated.
+        assert (
+            frac_mean_t is not None
+            and resid_mean_t is not None
+            and coords_mean_t is not None
+            and mem_mean_t is not None
+        )
+        L = len(layer_order)
+        parts: list[torch.Tensor] = [
+            frac_mean_t, resid_mean_t, coords_mean_t, mem_mean_t,
+            torch.cat(frac_terms), torch.cat(resid_terms),
+            torch.stack(coord_terms, 0).reshape(-1),
+        ]
+        if nearest_dist_t is not None and nearest_idx_t is not None:
+            parts.append(nearest_dist_t)
+            parts.append(nearest_idx_t.to(torch.float32))
+        if assign_prob_t is not None and assign_idx_t is not None:
+            parts.append(assign_prob_t)
+            parts.append(assign_idx_t.to(torch.float32))
+        flat = torch.cat([p.reshape(-1) for p in parts]).detach().cpu().tolist()
+
+        o = 0
+        frac_mean = flat[o]
+        o += 1
+        residual_mean = flat[o]
+        o += 1
+        coords_mean = flat[o:o + n_dim]
+        o += n_dim
+        membership = flat[o]
+        o += 1
+        frac_layer_vals = flat[o:o + L]
+        o += L
+        resid_layer_vals = flat[o:o + L]
+        o += L
+        coord_layer_vals = flat[o:o + L * n_dim]
+        o += L * n_dim
+        frac_per_layer = {layer_order[i]: frac_layer_vals[i] for i in range(L)}
+        residual_per_layer = {
+            layer_order[i]: resid_layer_vals[i] for i in range(L)
+        }
+        coords_per_layer = {
+            layer_order[i]: tuple(coord_layer_vals[i * n_dim:(i + 1) * n_dim])
+            for i in range(L)
+        }
+        def _label(idx: int) -> str:
+            # Index ``K`` is the synthetic neutral candidate (when injected);
+            # everything below indexes a real corpus node.
+            return (
+                NEUTRAL_LABEL
+                if inject_neutral and idx == K
+                else manifold.node_labels[idx]
+            )
+
+        if nearest_dist_t is not None:
+            tn = int(nearest_dist_t.numel())
+            nd_vals = flat[o:o + tn]
+            o += tn
+            ni_vals = flat[o:o + tn]
+            o += tn
+            nearest = [
+                (_label(int(round(ni_vals[j]))), nd_vals[j])
+                for j in range(tn)
+            ]
+        elif top_n:
+            nearest = [(_label(k), 0.0) for k in range(top_n)]
+        else:
+            nearest = []
+
+        assignment: list[tuple[str, float]] = []
+        if assign_prob_t is not None:
+            ta = int(assign_prob_t.numel())
+            ap_vals = flat[o:o + ta]
+            o += ta
+            ai_vals = flat[o:o + ta]
+            o += ta
+            assignment = [
+                (_label(int(round(ai_vals[j]))), ap_vals[j])
+                for j in range(ta)
+            ]
+
+        return ProbeReading(
+            fraction=frac_mean,
+            nearest=nearest,
+            coords=tuple(coords_mean),
+            residual=residual_mean,
+            fraction_per_layer=frac_per_layer,
+            coords_per_layer=coords_per_layer,
+            residual_per_layer=residual_per_layer,
+            assignment=assignment,
+            membership=membership,
+        )
+
+    def _score_full(
+        self, hidden_per_layer: dict[int, torch.Tensor],
+        *, only: set[str] | None = None, coords_only: bool = False,
+    ) -> dict[str, ProbeReading]:
+        """Full readings for every attached probe at one state.
+
+        **Cross-probe batched.**  Every *flat* (affine) probe shares the same
+        per-layer geometry algebra over a common activation, so the whole flat
+        roster is scored together — one ``Σ⁻¹h`` Woodbury apply + a few
+        stacked / block-diagonal matmuls per layer — in :meth:`_score_flat_batched`,
+        instead of re-running the apply and the R-dim solve once per probe per
+        layer.  Curved probes keep the per-probe foot solve
+        (:meth:`_score_probe_full`).  Every field of the full
+        :class:`ProbeReading` is populated either way, and the batched result is
+        bit-identical (to float tolerance) to the per-probe path the aggregate
+        uses.
+
+        ``only`` (a set of probe names) scores just that subset, routing every
+        probe in it — flat or curved — through the per-probe :meth:`_score_probe_full`
+        path (correct for both shapes, and cheap for the 1-2 probe subset a
+        gate-only step needs, where building the full batched roster would be
+        pure waste).  ``only=None`` is the full-roster behavior, byte-identical
+        to before.
+        """
+        out: dict[str, ProbeReading] = {}
+        if not hidden_per_layer or not self._probes:
+            return out
+        # ``Σ⁻¹h`` is probe-independent (depends only on the layer's hidden state
+        # + the shared whitener), so it is computed at most once per layer and
+        # reused across every curved probe in this pass.  Valid only for this
+        # ``hidden_per_layer`` — a fresh dict per call.
+        sih_cache: dict[int, torch.Tensor] = {}
+        if only is not None:
+            # Gate-only subset: per-probe path for both flat and curved.
+            for name in self._probes:
+                if name in only:
+                    out[name] = self._score_probe_full(
+                        self._probes[name], hidden_per_layer, sih_cache,
+                        coords_only=coords_only,
+                    )
+            return out
+        device = next(iter(hidden_per_layer.values())).device
+        self._ensure_flat_cache(device)
+        if self._flat_keys:
+            out.update(self._score_flat_batched(
+                hidden_per_layer, sih_cache, coords_only=coords_only,
+            ))
+        for name in self._curved_keys:
+            out[name] = self._score_probe_full(
+                self._probes[name], hidden_per_layer, sih_cache,
+                coords_only=coords_only,
+            )
+        # Defensive: any probe the cache didn't classify (it always should) is
+        # scored per-probe so nothing silently drops from the readings.
+        for name, probe in self._probes.items():
+            if name not in out:
+                out[name] = self._score_probe_full(
+                    probe, hidden_per_layer, sih_cache,
+                    coords_only=coords_only,
+                )
+        # Probe-inspector live trail (gated): stamp each probe's per-layer whitened
+        # query coords onto its reading.  Isolated post-pass — the hot batched
+        # flat cache is untouched; runs only while a client opted in.
+        if self._emit_subspace_coords:
+            for name, probe in self._probes.items():
+                reading = out.get(name)
+                if reading is not None:
+                    reading.subspace_coords_per_layer = (
+                        self._subspace_coords_for(probe, hidden_per_layer)
+                    )
+        # Preserve probe insertion order in the returned dict.
+        return {name: out[name] for name in self._probes if name in out}
+
+    def _score_probe_gate_scalars(
+        self,
+        probe: "AttachedManifoldProbe",
+        hidden_per_layer: dict[int, torch.Tensor],
+        gate_keys: set[str],
+        sih_cache: dict[int, torch.Tensor] | None = None,
+    ) -> dict[str, float]:
+        """Score only the exact scalar channels a probe gate consumes.
+
+        This is intentionally narrower than :meth:`_score_probe_full`: it is used
+        only by the gate-only decode path, where no UI/API consumer needs a full
+        :class:`ProbeReading`. Curved ``:fraction`` and ``@label`` / ``~label``
+        gates can skip the nearest-foot solve entirely; coord and membership
+        gates still run the geometry they semantically require.
+        """
+        name = probe.name
+        suffixes = {
+            key[len(name):]: key for key in gate_keys
+            if key == name
+            or key.startswith(f"{name}[")
+            or key.startswith(f"{name}:")
+            or key.startswith(f"{name}@")
+            or key.startswith(f"{name}~")
+        }
+        if not suffixes:
+            return {}
+
+        coord_axes: dict[int, str] = {}
+        if "" in suffixes:
+            coord_axes[0] = suffixes[""]
+        for suffix, key in suffixes.items():
+            if suffix.startswith("[") and suffix.endswith("]"):
+                try:
+                    axis = int(suffix[1:-1])
+                except ValueError:
+                    continue
+                if axis >= 0:
+                    coord_axes[axis] = key
+        fraction_key = suffixes.get(":fraction")
+        membership_key = suffixes.get(":membership")
+        dist_labels = {
+            suffix[1:]: key for suffix, key in suffixes.items()
+            if suffix.startswith("@") and len(suffix) > 1
+        }
+        assign_labels = {
+            suffix[1:]: key for suffix, key in suffixes.items()
+            if suffix.startswith("~") and len(suffix) > 1
         }
 
-    def _normalize_hidden(self, layer_idx: int, h: torch.Tensor) -> torch.Tensor:
-        """Center (per layer_means) and L2-normalize a hidden-state tensor.
+        need_coords = bool(coord_axes)
+        need_fraction = fraction_key is not None
+        need_membership = membership_key is not None
+        need_nearest = bool(dist_labels)
+        need_assignment = bool(assign_labels)
+        need_dist = bool(need_nearest or need_assignment)
+        if not (need_coords or need_fraction or need_membership or need_dist):
+            return {}
 
-        Works for both 1D (dim,) and 2D (seq, dim) — mean broadcasts over
-        rows, and ``dim=-1, keepdim=True`` is a no-op reshape for 1D.
-        """
-        mean = self._mean_cache.get(layer_idx)
-        if mean is not None:
-            h = h - mean
-        hn = h.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-        return h / hn
+        manifold = probe.manifold
+        sw = probe.share_weights
+        is_affine = probe.is_affine
+        shared = [idx for idx in manifold.layers if idx in hidden_per_layer]
+        if not shared:
+            return {}
+        total_w = sum(sw.get(idx, 0.0) for idx in shared)
+        if total_w <= _MIN_SHARE_WEIGHT:
+            w_shared = {idx: 1.0 / len(shared) for idx in shared}
+        else:
+            w_shared = {idx: sw.get(idx, 0.0) / total_w for idx in shared}
 
-    def _score_probes(self, hidden_per_layer: dict[int, torch.Tensor], accumulate: bool = True) -> dict[str, float]:
-        """Score all probes against hidden states.
+        K = probe.node_values_reduced[shared[0]].shape[0]
+        inject_neutral = probe.inject_neutral
+        Kc = K + (1 if inject_neutral else 0)
+        n_dim = manifold.domain.intrinsic_dim
+        frac_mean_t: torch.Tensor | None = None
+        coords_mean_t: torch.Tensor | None = None
+        mem_mean_t: torch.Tensor | None = None
+        dist_acc_t: torch.Tensor | None = None
 
-        When ``accumulate`` is True (default), history and stats are updated.
-        When False, the call is read-only — useful for stateless API requests
-        that must not mutate session-level probe accumulators.
-        """
-        probe_keys = self._cache_probe_keys if self._cache_device is not None else tuple(self._raw_profiles.keys())
-        if not hidden_per_layer:
-            vals = {name: 0.0 for name in self._raw_profiles}
-            if accumulate:
-                self._apply_accumulate(vals)
-            return vals
+        for layer_idx in shared:
+            sub = manifold.layers[layer_idx]
+            h = hidden_per_layer[layer_idx].to(torch.float32)
+            if h.ndim > 1:
+                h = h.reshape(-1, h.shape[-1])[-1]
+            wh = probe.whitened[layer_idx]
+            frac_t, cdist_query, invert_query, _cdist_nodes = _layer_geometry(
+                probe, layer_idx, h, sih_cache,
+            )
+            w = w_shared[layer_idx]
 
-        device = next(iter(hidden_per_layer.values())).device
-        self._ensure_cache(device)
-        probe_keys = self._cache_probe_keys
-        n_probes = len(probe_keys)
+            if need_fraction:
+                frac_t = frac_t.reshape(1)
+                frac_mean_t = (
+                    w * frac_t if frac_mean_t is None else frac_mean_t + w * frac_t
+                )
 
-        num = torch.zeros((n_probes,), device=device, dtype=torch.float32)
-        den = torch.zeros((n_probes,), device=device, dtype=torch.float32)
-        for layer_idx, h in hidden_per_layer.items():
-            entry = self._layer_cache.get(layer_idx)
-            if entry is None:
+            if need_dist:
+                # Neutral rides the precomputed ``node_white_aug`` (FIX F4 — no
+                # per-token ``cat``).
+                dists = torch.linalg.vector_norm(
+                    wh.node_white_aug - cdist_query.reshape(1, -1), dim=-1,
+                )
+                weighted_dists = dists * w
+                dist_acc_t = (
+                    weighted_dists
+                    if dist_acc_t is None
+                    else dist_acc_t + weighted_dists.to(dist_acc_t.device)
+                )
+
+            if need_coords or need_membership:
+                if is_affine:
+                    pos_t = (
+                        wh.coord_S @ invert_query + wh.coord_b
+                        if wh.coord_S is not None and wh.coord_b is not None
+                        else invert_query
+                    )
+                    mem_t = frac_t.new_ones(1)
+                else:
+                    foot_key = (probe.name, layer_idx)
+                    warm = self._curved_feet.get(foot_key) if self._curved_warm else None
+                    pos, res = invert_parameterization(
+                        sub, manifold.domain, invert_query.reshape(1, -1),
+                        manifold.node_coords, warm_start=warm,
+                    )
+                    if self._curved_warm:
+                        self._curved_feet[foot_key] = pos.detach()
+                    pos_t = pos.reshape(-1)
+                    if need_membership and sub.has_sigma:
+                        res_flat = res.reshape(-1)[:1]
+                        sig_foot = sub.sigma_at(
+                            manifold.domain.embed(pos.reshape(1, -1)),
+                        ).reshape(1)
+                        mem_t = torch.exp(
+                            -(res_flat ** 2)
+                            / (2.0 * (sig_foot ** 2).clamp(min=_FRACTION_EPSILON))
+                        )
+                    else:
+                        mem_t = frac_t.new_ones(1)
+
+                if need_coords:
+                    coord_t = pos_t.reshape(-1)[:n_dim]
+                    if coord_t.numel() < n_dim:
+                        coord_t = torch.cat(
+                            [coord_t, coord_t.new_zeros(n_dim - coord_t.numel())],
+                        )
+                    coords_mean_t = (
+                        w * coord_t
+                        if coords_mean_t is None
+                        else coords_mean_t + w * coord_t
+                    )
+                if need_membership:
+                    mem_t = mem_t.reshape(1)
+                    mem_mean_t = (
+                        w * mem_t
+                        if mem_mean_t is None
+                        else mem_mean_t + w * mem_t
+                    )
+
+        def _label(idx: int) -> str:
+            return (
+                NEUTRAL_LABEL
+                if inject_neutral and idx == K
+                else manifold.node_labels[idx]
+            )
+
+        out: dict[str, float] = {}
+        parts: list[torch.Tensor] = []
+        slots: list[tuple[str, Any]] = []
+        if need_fraction and frac_mean_t is not None and fraction_key is not None:
+            parts.append(frac_mean_t.reshape(1))
+            slots.append(("scalar", fraction_key))
+        if need_coords and coords_mean_t is not None:
+            for axis, key in sorted(coord_axes.items()):
+                if axis < int(coords_mean_t.numel()):
+                    parts.append(coords_mean_t[axis].reshape(1))
+                    slots.append(("scalar", key))
+        if need_membership and mem_mean_t is not None and membership_key is not None:
+            parts.append(mem_mean_t.reshape(1))
+            slots.append(("scalar", membership_key))
+
+        requested_top_n = int(probe.top_n)
+        top_n = requested_top_n if requested_top_n >= 0 else Kc + requested_top_n
+        top_n = min(max(top_n, 0), Kc)
+        if need_nearest and top_n and dist_acc_t is not None:
+            nearest_dist_t, nearest_idx_t = torch.topk(
+                dist_acc_t, k=top_n, largest=False, sorted=True,
+            )
+            parts.extend([
+                nearest_dist_t / probe.label_scale,
+                nearest_idx_t.to(torch.float32),
+            ])
+            slots.append(("nearest", int(nearest_dist_t.numel())))
+        if (
+            need_assignment
+            and top_n
+            and dist_acc_t is not None
+            and probe.assign_bandwidth is not None
+            and probe.assign_logvol_bias is not None
+        ):
+            tau = probe.assign_bandwidth.to(dist_acc_t.device, torch.float32)
+            lvb = probe.assign_logvol_bias.to(dist_acc_t.device, torch.float32)
+            if tau.numel() == dist_acc_t.numel() == lvb.numel():
+                logits = (
+                    -(dist_acc_t ** 2)
+                    / (2.0 * (tau ** 2).clamp(min=_FRACTION_EPSILON))
+                    + lvb
+                )
+                probs = torch.softmax(logits, dim=0)
+                assign_prob_t, assign_idx_t = torch.topk(
+                    probs, k=top_n, largest=True, sorted=True,
+                )
+                parts.extend([assign_prob_t, assign_idx_t.to(torch.float32)])
+                slots.append(("assignment", int(assign_prob_t.numel())))
+
+        if not parts:
+            return out
+        flat = torch.cat([p.reshape(-1) for p in parts]).detach().cpu().tolist()
+        pos = 0
+        for kind, meta in slots:
+            if kind == "scalar":
+                out[meta] = float(flat[pos])
+                pos += 1
+            elif kind == "nearest":
+                n = int(meta)
+                d_vals = flat[pos:pos + n]
+                pos += n
+                i_vals = flat[pos:pos + n]
+                pos += n
+                for label, dist in (
+                    (_label(int(round(i_vals[i]))), d_vals[i]) for i in range(n)
+                ):
+                    key = dist_labels.get(label)
+                    if key is not None:
+                        out[key] = -float(dist)
+            elif kind == "assignment":
+                n = int(meta)
+                p_vals = flat[pos:pos + n]
+                pos += n
+                i_vals = flat[pos:pos + n]
+                pos += n
+                for label, prob in (
+                    (_label(int(round(i_vals[i]))), p_vals[i]) for i in range(n)
+                ):
+                    key = assign_labels.get(label)
+                    if key is not None:
+                        out[key] = float(prob)
+        return out
+
+    def score_gate_scalars(
+        self,
+        hidden_per_layer: dict[int, torch.Tensor],
+        gate_keys: set[str],
+    ) -> dict[str, float]:
+        """Return exact gate scalar keys without building full readings."""
+        if not hidden_per_layer or not self._probes or not gate_keys:
+            return {}
+        # Only the probes a gate key actually references do any work (FIX F3):
+        # derive their names once (the prefix before the first ``[`` / ``:`` /
+        # ``@`` / ``~`` channel marker — ``NAME_REGEX`` forbids those in a name)
+        # and dispatch ``_score_probe_gate_scalars`` for those alone, instead of
+        # running it (and its per-probe suffix-dict build) for every probe in the
+        # roster every token.
+        names = {re.split(r"[\[:@~]", k, maxsplit=1)[0] for k in gate_keys}
+        sih_cache: dict[int, torch.Tensor] = {}
+        out: dict[str, float] = {}
+        for name in names:
+            probe = self._probes.get(name)
+            if probe is None:
                 continue
-            V, W = entry  # V: (P, D), W: (P,)
-            h_unit = self._normalize_hidden(layer_idx, h.float())  # (D,)
-            sims = V @ h_unit  # (P,)
-            num.add_(W * sims)
-            den.add_(W)
-        den.clamp_(min=1e-8)
-        result = (num / den).cpu().tolist()  # single sync
-        vals = {name: result[i] for i, name in enumerate(probe_keys)}
-        # Probes that exist but weren't in the cache (shouldn't happen post-ensure)
-        # still need a zero default to keep the output key set stable.
-        for name in self._raw_profiles:
-            vals.setdefault(name, 0.0)
+            out.update(
+                self._score_probe_gate_scalars(
+                    probe, hidden_per_layer, gate_keys, sih_cache,
+                )
+            )
+        return out
 
-        if accumulate:
-            self._apply_accumulate(vals)
-        return vals
+    def _subspace_coords_for(
+        self,
+        probe: "AttachedManifoldProbe",
+        hidden_per_layer: dict[int, torch.Tensor],
+    ) -> dict[int, tuple[float, ...]]:
+        """Per-layer whitened query coords for one probe (inspector trail).
 
-    def _apply_accumulate(self, vals: dict[str, float]) -> None:
-        for name, val in vals.items():
+        Reuses :func:`_layer_geometry` — the same primitive the read path runs —
+        so the live point lands in the identical whitened frame as the geometry
+        endpoint's ``node_white`` / ``neutral_white``.  One batched host transfer
+        per probe; only reached when ``_emit_subspace_coords`` is set.  Rank can
+        vary per layer (flat DLS prune), so each layer's slice length is tracked
+        explicitly rather than assumed uniform.
+        """
+        rows: list[torch.Tensor] = []
+        order: list[int] = []
+        lens: list[int] = []
+        for layer_idx in probe.manifold.layers:
+            if layer_idx not in hidden_per_layer:
+                continue
+            if probe.whitened.get(layer_idx) is None:
+                continue
+            h = hidden_per_layer[layer_idx].to(torch.float32)
+            if h.ndim > 1:
+                h = h.reshape(-1, h.shape[-1])[-1]
+            _, cdist_query, _, _ = _layer_geometry(probe, layer_idx, h)
+            cq = cdist_query.reshape(-1)
+            rows.append(cq)
+            order.append(layer_idx)
+            lens.append(int(cq.numel()))
+        if not rows:
+            return {}
+        flat = torch.cat(rows).detach().cpu().tolist()
+        out: dict[int, tuple[float, ...]] = {}
+        pos = 0
+        for i, ln in enumerate(lens):
+            out[order[i]] = tuple(flat[pos:pos + ln])
+            pos += ln
+        return out
+
+    def _ensure_flat_cache(self, device: torch.device) -> None:
+        """Build/refresh the cross-probe batched flat-read cache on ``device``.
+
+        Splits the roster into flat (``is_affine``) and curved probes, then
+        precomputes (a) a **global** per-probe layout — coord-offsets, node
+        counts, top-N, labels, a padded-node validity mask, and ``Rmax`` /
+        ``Kmax`` — and (b) per layer the stacked / block-diagonal factors plus
+        the scatter indices that let one batched sweep accumulate straight into
+        global per-probe slots.  Per layer ``L``:
+
+        * ``X`` / ``K_inv`` / ``lam`` — shared Woodbury factors (one ``Σ⁻¹h``
+          per layer covers every flat probe; the whitener is identical),
+        * ``basis_stack`` ``(ΣR, D)`` / ``gmean_stack`` ``(ΣR,)`` /
+          ``means_stack`` ``(P_L, D)`` / ``mm_stack`` ``(P_L,)`` — the stacked
+          ``B Σ⁻¹``, the ``B Σ⁻¹ μ`` shift, and the fraction-denominator cross
+          terms,
+        * ``Mblk`` / ``chol_blk`` / ``coordS_blk`` (block-diagonal) — per-probe
+          ``M_R⁻¹``, whitened-distance Cholesky, and the affine reduced→domain
+          map, each one block-diagonal matmul,
+        * ``cols`` ``(P_L,)`` / ``coords_gidx`` ``(Σnd_L,)`` / ``wt_perdim`` /
+          ``cq_scatter`` ``(ΣR_L,)`` — scatter indices into the global
+          ``frac_acc`` / ``coords_acc`` / ``dist_acc`` slots and into the padded
+          ``(P_L, Rmax)`` whitened query,
+        * ``node_white_pad`` ``(P_L, Kmax, Rmax)`` — padded whitened node coords
+          (real dims filled, the rest 0) so the per-layer nearest distance is one
+          batched ``(P_L, Kmax)`` norm,
+        * host ``present_cols`` / ``present_nd`` — for reconstructing the
+          per-layer traces after the single transfer.
+
+        Off the hot path; rebuilt only when the device, roster, or whitener
+        changes (the cache-key guard short-circuits otherwise).
+        """
+        # Per-token guard (FIX F5): a bool + a device compare.  ``_flat_cache_dirty``
+        # is flipped True by ``_invalidate_flat_cache`` on every roster / whitener
+        # change, so a clean cache on the same device short-circuits without
+        # rebuilding + comparing a ``tuple(self._probes.keys())`` each token.
+        if not self._flat_cache_dirty and self._flat_cache_device == device:
+            return
+        self._flat_cache_device = device
+        self._flat_cache_dirty = False
+        flat_names = [
+            n for n, p in self._probes.items()
+            if p.is_affine and p.manifold.layers
+        ]
+        self._flat_keys = tuple(flat_names)
+        self._curved_keys = tuple(
+            n for n, p in self._probes.items()
+            if not p.is_affine and p.manifold.layers
+        )
+        if not flat_names:
+            self._flat_layer_cache = {}
+            self._flat_global = {}
+            return
+
+        # --- global per-probe layout ---
+        P = len(flat_names)
+        nd_list = [
+            int(self._probes[n].manifold.domain.intrinsic_dim) for n in flat_names
+        ]
+        K_list = [
+            int(self._probes[n].manifold.node_coords.shape[0]) for n in flat_names
+        ]
+        # Neutral competes as a virtual candidate at column ``K`` per injecting
+        # probe.  A flat fit is neutral-anchored (origin = reduced 0), and
+        # ``node_pad`` is zero-initialized, so the reserved column already holds
+        # ``neutral_white`` — its distance falls out of the existing padded norm
+        # as ``‖cq‖`` with no hot-loop change.  ``Kc_list`` is the candidate
+        # count (nodes + neutral) per probe.
+        inj_list = [bool(self._probes[n].inject_neutral) for n in flat_names]
+        Kc_list = [K + (1 if inj else 0) for K, inj in zip(K_list, inj_list, strict=True)]
+        top_n_list: list[int] = []
+        for n, Kc in zip(flat_names, Kc_list, strict=True):
+            req = int(self._probes[n].top_n)
+            tn = req if req >= 0 else Kc + req
+            top_n_list.append(min(max(tn, 0), Kc))
+        topk_width = max(top_n_list, default=0)
+        nd_off: list[tuple[int, int]] = []
+        off = 0
+        for nd in nd_list:
+            nd_off.append((off, nd))
+            off += nd
+        nd_total = off
+        Kmax = max(Kc_list)
+        Rmax = max(
+            int(sub.basis.shape[0])
+            for n in flat_names
+            for sub in self._probes[n].whitened.values()
+        )
+        valid_mask = torch.zeros((P, Kmax), dtype=torch.bool, device=device)
+        for ci, Kc in enumerate(Kc_list):
+            valid_mask[ci, :Kc] = True
+        # Padded per-candidate soft-assignment bandwidth ``τ`` and the precomputed
+        # Gaussian log-volume bias ``−R·log(τ)`` ``(P, Kmax)`` each.  Filled from
+        # each probe's precomputed ``assign_bandwidth`` / ``assign_logvol_bias``
+        # (invalid/pad columns stay at the neutral defaults — band=1.0, bias=0 —
+        # but are masked to −inf logit by ``valid_mask`` in the softmax, so their
+        # value is irrelevant).  A probe without a bandwidth (degenerate) keeps
+        # the defaults and is suppressed from the assignment downstream via
+        # ``band_present``.
+        band_pad = torch.ones((P, Kmax), dtype=torch.float32, device=device)
+        logvol_pad = torch.zeros((P, Kmax), dtype=torch.float32, device=device)
+        band_present_list = [False] * P
+        for ci, n in enumerate(flat_names):
+            bw = self._probes[n].assign_bandwidth
+            lvb = self._probes[n].assign_logvol_bias
+            if (
+                bw is not None and lvb is not None
+                and bw.numel() == Kc_list[ci] and lvb.numel() == Kc_list[ci]
+            ):
+                band_pad[ci, :bw.numel()] = bw.to(device, torch.float32)
+                logvol_pad[ci, :lvb.numel()] = lvb.to(device, torch.float32)
+                band_present_list[ci] = True
+        # Per-probe ``@label`` distance scale ``(P,)`` — the robust median node
+        # spacing each probe carries.  The reported nearest distance is divided
+        # by it (a per-probe constant ⇒ preserves the raw ranking) to make the
+        # ``@label`` gate threshold portable across probes.
+        label_scale = torch.tensor(
+            [float(self._probes[n].label_scale) for n in flat_names],
+            device=device, dtype=torch.float32,
+        ).clamp(min=_FRACTION_EPSILON)
+        labels: list[list[str]] = []
+        for n, inj in zip(flat_names, inj_list, strict=True):
+            row = list(self._probes[n].manifold.node_labels)
+            if inj:
+                row.append(NEUTRAL_LABEL)   # index K → neutral
+            labels.append(row)
+        nd_counts = torch.tensor(nd_list, device=device, dtype=torch.long)
+        self._flat_global = {
+            "P": P, "nd_list": nd_list, "nd_off": nd_off, "nd_total": nd_total,
+            "K_list": K_list, "top_n_list": top_n_list,
+            "labels": labels,
+            "Kmax": Kmax, "Rmax": Rmax,
+            "topk_width": topk_width,
+            "valid_mask": valid_mask, "nd_counts": nd_counts,
+            "band_pad": band_pad, "logvol_pad": logvol_pad,
+            "band_present_list": band_present_list,
+            "band_present_any": any(band_present_list),
+            "label_scale": label_scale,
+        }
+
+        layer_members: dict[int, list[int]] = {}
+        for ci, n in enumerate(flat_names):
+            for layer_idx in self._probes[n].manifold.layers:
+                layer_members.setdefault(layer_idx, []).append(ci)
+
+        cache: dict[int, dict[str, Any]] = {}
+        for layer_idx, cis in layer_members.items():
+            present = [flat_names[ci] for ci in cis]
+            whs = [self._probes[n].whitened[layer_idx] for n in present]
+            X, K_inv, lam = whs[0].X, whs[0].K_inv, whs[0].lam
+            basis_stack = torch.cat([w.basis.to(device) for w in whs], dim=0)
+            means_stack = torch.stack([w.mean.to(device) for w in whs], dim=0)
+            simeans = [
+                _woodbury_apply(w.mean.to(device), X, K_inv, lam) for w in whs
+            ]
+            gmean_stack = torch.cat(
+                [w.basis.to(device) @ sm
+                 for w, sm in zip(whs, simeans, strict=True)],
+                dim=0,
+            )
+            mm_stack = torch.stack(
+                [(w.mean.to(device) * sm).sum()
+                 for w, sm in zip(whs, simeans, strict=True)],
+            )
+            Mblk = torch.block_diag(*[w.m_r_inv.to(device) for w in whs])
+            chol_blk = torch.block_diag(*[w.chol.to(device) for w in whs])
+            coordS_blk = torch.block_diag(*[
+                w.coord_S.to(device) if w.coord_S is not None
+                else torch.eye(
+                    int(w.basis.shape[0]), device=device, dtype=torch.float32,
+                )
+                for w in whs
+            ])
+            coordb_stack = torch.cat([
+                w.coord_b.to(device) if w.coord_b is not None
+                else torch.zeros(
+                    int(w.basis.shape[0]), device=device, dtype=torch.float32,
+                )
+                for w in whs
+            ])
+            wt = torch.tensor(
+                [float(self._probes[n].share_weights.get(layer_idx, 0.0))
+                 for n in present],
+                device=device, dtype=torch.float32,
+            )
+            # scatter indices + padded node coords
+            seg_ids_list: list[int] = []
+            cq_scatter_list: list[int] = []
+            coords_gidx_list: list[int] = []
+            wt_perdim_list: list[float] = []
+            present_nd: list[int] = []
+            node_pad = torch.zeros((len(present), Kmax, Rmax),
+                                   device=device, dtype=torch.float32)
+            for li, (n, w) in enumerate(zip(present, whs, strict=True)):
+                Rp = int(w.basis.shape[0])
+                seg_ids_list.extend([li] * Rp)
+                cq_scatter_list.extend(range(li * Rmax, li * Rmax + Rp))
+                ndp = nd_list[cis[li]]
+                present_nd.append(ndp)
+                g_off = nd_off[cis[li]][0]
+                coords_gidx_list.extend(range(g_off, g_off + ndp))
+                wt_perdim_list.extend([li] * ndp)  # local index → weight gather
+                nw = w.node_white.to(device)                       # (K_p, Rp)
+                node_pad[li, :nw.shape[0], :Rp] = nw
+            wt_perdim = wt[torch.tensor(
+                wt_perdim_list, device=device, dtype=torch.long,
+            )] if wt_perdim_list else wt.new_zeros(0)
+            cache[layer_idx] = {
+                "X": X, "K_inv": K_inv, "lam": lam,
+                "basis_stack": basis_stack, "means_stack": means_stack,
+                "gmean_stack": gmean_stack, "mm_stack": mm_stack,
+                "Mblk": Mblk, "chol_blk": chol_blk,
+                "coordS_blk": coordS_blk, "coordb_stack": coordb_stack,
+                "wt": wt,
+                "seg_ids": torch.tensor(seg_ids_list, device=device, dtype=torch.long),
+                "cq_scatter": torch.tensor(cq_scatter_list, device=device, dtype=torch.long),
+                "coords_gidx": torch.tensor(coords_gidx_list, device=device, dtype=torch.long),
+                "wt_perdim": wt_perdim,
+                "cols": torch.tensor(cis, device=device, dtype=torch.long),
+                "cols_list": list(cis),
+                "present_nd": present_nd,
+                "node_pad": node_pad,
+            }
+        self._flat_layer_cache = cache
+
+    def _score_flat_batched(
+        self, hidden_per_layer: dict[int, torch.Tensor],
+        sih_cache: dict[int, torch.Tensor] | None = None,
+        *,
+        coords_only: bool = False,
+    ) -> dict[str, ProbeReading]:
+        """Score the whole flat roster in one batched sweep + one host transfer.
+
+        Phase 1 (per layer, batched over every flat probe): one ``Σ⁻¹h``
+        Woodbury apply, stacked / block-diagonal matmuls for reduced coords,
+        domain coords, fraction, and a padded ``(P_L, Kmax)`` nearest-distance
+        norm — each scattered straight into global per-probe accumulators
+        (``frac_acc`` / ``coords_acc`` / ``dist_acc`` / ``wtsum``).  Phase 2
+        (device): share-normalize, one global ``topk`` sized to the largest requested
+        ``top_n`` for nearest, and **one**
+        ``.cpu()`` for the entire roster (means + per-layer traces + nearest).
+        Phase 3 (host): slice the flat blob back into per-probe
+        :class:`ProbeReading`s.  Values match the per-probe path (the aggregate
+        uses) to float tolerance.
+
+        ``sih_cache`` (optional, keyed by layer) is the per-pass ``Σ⁻¹h`` cache
+        shared with the curved per-probe path: the apply depends only on the
+        layer's hidden state + the shared whitener (identical Woodbury factors),
+        so a mixed flat+curved roster computes ``Σ⁻¹h`` once per layer total.
+        """
+        gl = self._flat_global
+        cache = self._flat_layer_cache
+        if not gl or not cache:
+            return {}
+        P = gl["P"]
+        Kmax = gl["Kmax"]
+        Rmax = gl["Rmax"]
+        topk_width = gl["topk_width"]
+        flat_names = self._flat_keys
+        device = gl["valid_mask"].device
+
+        frac_acc = torch.zeros(P, device=device, dtype=torch.float32)
+        wtsum = torch.zeros(P, device=device, dtype=torch.float32)
+        coords_acc = torch.zeros(gl["nd_total"], device=device, dtype=torch.float32)
+        dist_acc = torch.zeros((P, Kmax), device=device, dtype=torch.float32)
+        # Per-layer trace pieces (raw, unweighted) for the single transfer.
+        trace_frac: list[torch.Tensor] = []
+        trace_coords: list[torch.Tensor] = []
+        trace_layers: list[int] = []
+        seen: set[int] = set()
+
+        for layer_idx, h in hidden_per_layer.items():
+            ent = cache.get(layer_idx)
+            if ent is None:
+                continue
+            hf = h.to(torch.float32)
+            if hf.ndim > 1:
+                hf = hf.reshape(-1, hf.shape[-1])[-1]
+            # Σ⁻¹h — probe-independent, so share it with the curved per-probe
+            # path via the per-pass cache (same Woodbury factors per layer).
+            sih = None if sih_cache is None else sih_cache.get(layer_idx)
+            if sih is None:
+                sih = _woodbury_apply(hf, ent["X"], ent["K_inv"], ent["lam"])
+                if sih_cache is not None:
+                    sih_cache[layer_idx] = sih
+            h_sih = (hf * sih).sum()
+            g_all = ent["basis_stack"] @ sih - ent["gmean_stack"]   # (ΣR,)
+            c_all = ent["Mblk"] @ g_all                             # (ΣR,)
+            coords_all = ent["coordS_blk"] @ c_all + ent["coordb_stack"]  # (Σnd_L,)
+            hsm = ent["means_stack"] @ sih                          # (P_L,)
+            cols = ent["cols"]
+            n_present = cols.shape[0]
+            par2 = torch.zeros(
+                n_present, device=device, dtype=torch.float32,
+            ).index_add_(0, ent["seg_ids"], g_all * c_all)          # (P_L,)
+            x_m2 = (h_sih - 2.0 * hsm + ent["mm_stack"]).clamp(min=_FRACTION_EPSILON)
+            frac = (par2.clamp(min=0.0).sqrt() / x_m2.sqrt()).clamp(0.0, 1.0)  # (P_L,)
+
+            wt = ent["wt"]
+            frac_acc.index_add_(0, cols, wt * frac)
+            wtsum.index_add_(0, cols, wt)
+            coords_acc.index_add_(0, ent["coords_gidx"], ent["wt_perdim"] * coords_all)
+            seen.update(ent["cols_list"])
+            if coords_only:
+                # FIX F2: a live consumer that reads only the axis-0 coord /
+                # fraction (the trait stream, the loom probe row) doesn't need the
+                # nearest-distance norm over ``Kmax`` candidates, the assignment
+                # softmax, or the host-side per-layer trace reconstruction — skip
+                # them.  The full aggregate (which DOES need them) is re-scored
+                # once from the tail ring at finalize.
+                continue
+            cq_all = c_all @ ent["chol_blk"]                        # (ΣR,)
+            # Nearest: scatter cq into a padded (P_L, Rmax) query, batched norm.
+            cq_pad = torch.zeros(n_present * Rmax, device=device, dtype=torch.float32)
+            cq_pad = cq_pad.index_copy_(0, ent["cq_scatter"], cq_all).reshape(n_present, Rmax)
+            dist = torch.linalg.vector_norm(
+                ent["node_pad"] - cq_pad.unsqueeze(1), dim=-1,
+            )                                                       # (P_L, Kmax)
+            dist_acc.index_add_(0, cols, dist * wt.unsqueeze(1))
+            trace_frac.append(frac)
+            trace_coords.append(coords_all)
+            trace_layers.append(layer_idx)
+
+        # --- device finalize (share-normalize + one bounded global topk) ---
+        wtsum_safe = wtsum.clamp(min=_FRACTION_EPSILON)
+        frac_final = frac_acc / wtsum_safe
+        coords_final = coords_acc / wtsum_safe.repeat_interleave(
+            gl["nd_counts"],
+        ).clamp(min=_FRACTION_EPSILON)
+        if coords_only:
+            # Minimal blob: per-probe fraction + domain coords only (FIX F2).
+            blob = torch.cat([frac_final, coords_final]).detach().cpu().tolist()
+            frac_v = blob[:P]
+            coords_v = blob[P:P + gl["nd_total"]]
+            nd_off = gl["nd_off"]
+            out: dict[str, ProbeReading] = {}
+            for ci, name in enumerate(flat_names):
+                if ci not in seen:
+                    out[name] = ProbeReading(fraction=0.0, nearest=[], coords=())
+                    continue
+                g_off, nd = nd_off[ci]
+                out[name] = ProbeReading(
+                    fraction=frac_v[ci],
+                    nearest=[],
+                    coords=tuple(coords_v[g_off:g_off + nd]),
+                    residual=0.0,
+                    assignment=[],
+                    membership=1.0,
+                )
+            return out
+        dist_final = (dist_acc / wtsum_safe.unsqueeze(1)).masked_fill(
+            ~gl["valid_mask"], float("inf"),
+        )
+        if topk_width:
+            # Rank by **raw** distance (``nearest`` stays literally nearest), then
+            # divide the reported top-N distances by each probe's ``label_scale``
+            # (a per-probe constant ⇒ no reordering) for a portable ``@label``
+            # gate — distance in "typical label-spacings"; see ``_score_probe_full``.
+            # Assignment below keeps the raw ``dist_final``.
+            nd_sorted, ni_sorted = torch.topk(
+                dist_final, k=topk_width, largest=False, sorted=True,
+            )                                                       # (P, topk_width)
+            nd_sorted = nd_sorted / gl["label_scale"].unsqueeze(1)
+        else:
+            nd_sorted = dist_final.new_zeros((P, 0))
+            ni_sorted = torch.empty((P, 0), device=device, dtype=torch.long)
+        # Soft assignment: softmax(−d²/(2τ²) − R·log(τ)) per probe over valid
+        # candidates (invalid columns are +inf distance ⇒ −inf logit ⇒ 0
+        # probability), top-``topk_width`` by probability.  ``band_pad`` is the
+        # precomputed per-candidate bandwidth, ``logvol_pad`` the precomputed
+        # ``−R·log(τ)`` Gaussian normalization bias; together they make a proper
+        # isotropic R-D mixture posterior (vs. the bare ``−d²/2τ²`` softmax's
+        # broadest-node-wins pathology).  Rows without a bandwidth get the
+        # neutral defaults (band=1, bias=0) so the blob shape is static
+        # (suppressed per-probe on the host via ``band_present``).
+        if topk_width and gl["band_present_any"]:
+            assign_logits = -(dist_final ** 2) / (
+                2.0 * (gl["band_pad"] ** 2).clamp(min=_FRACTION_EPSILON)
+            ) + gl["logvol_pad"]
+            assign_probs = torch.softmax(assign_logits, dim=1)      # (P, Kmax)
+            ap_sorted, ai_sorted = torch.topk(
+                assign_probs, k=topk_width, largest=True, sorted=True,
+            )                                                       # (P, topk_width)
+        else:
+            ap_sorted = dist_final.new_zeros((P, topk_width))
+            ai_sorted = torch.zeros((P, topk_width), device=device, dtype=torch.long)
+
+        all_frac = (
+            torch.cat(trace_frac) if trace_frac
+            else frac_final.new_zeros(0)
+        )
+        all_coords = (
+            torch.cat(trace_coords) if trace_coords
+            else coords_final.new_zeros(0)
+        )
+        blob = torch.cat([
+            frac_final, coords_final,
+            nd_sorted.reshape(-1), ni_sorted.to(torch.float32).reshape(-1),
+            ap_sorted.reshape(-1), ai_sorted.to(torch.float32).reshape(-1),
+            all_frac, all_coords,
+        ]).detach().cpu().tolist()
+
+        # --- host reconstruction (one slice walk; no per-probe sync) ---
+        nd_off = gl["nd_off"]
+        top_n_list = gl["top_n_list"]
+        labels = gl["labels"]
+        o = 0
+        frac_v = blob[o:o + P]
+        o += P
+        coords_v = blob[o:o + gl["nd_total"]]
+        o += gl["nd_total"]
+        nd_v = blob[o:o + P * topk_width]
+        o += P * topk_width
+        ni_v = blob[o:o + P * topk_width]
+        o += P * topk_width
+        ap_v = blob[o:o + P * topk_width]
+        o += P * topk_width
+        ai_v = blob[o:o + P * topk_width]
+        o += P * topk_width
+        band_present = gl["band_present_list"]
+        # per-layer trace offsets within all_frac / all_coords
+        frac_per_layer_acc: list[dict[int, float]] = [{} for _ in range(P)]
+        coords_per_layer_acc: list[dict[int, tuple[float, ...]]] = [{} for _ in range(P)]
+        residual_per_layer_acc: list[dict[int, float]] = [{} for _ in range(P)]
+        fo = o
+        co = o + all_frac.numel()
+        for layer_idx in trace_layers:
+            ent = cache[layer_idx]
+            cols_list = ent["cols_list"]
+            present_nd = ent["present_nd"]
+            ndo = co
+            for li, ci in enumerate(cols_list):
+                frac_per_layer_acc[ci][layer_idx] = blob[fo + li]
+                ndp = present_nd[li]
+                coords_per_layer_acc[ci][layer_idx] = tuple(blob[ndo:ndo + ndp])
+                residual_per_layer_acc[ci][layer_idx] = 0.0
+                ndo += ndp
+            fo += len(cols_list)
+            co += sum(present_nd)
+
+        out: dict[str, ProbeReading] = {}
+        for ci, name in enumerate(flat_names):
+            if ci not in seen:
+                out[name] = ProbeReading(fraction=0.0, nearest=[], coords=())
+                continue
+            g_off, nd = nd_off[ci]
+            top_n = top_n_list[ci]
+            row = ci * topk_width
+            nearest = [
+                (labels[ci][int(round(ni_v[row + j]))], nd_v[row + j])
+                for j in range(top_n)
+            ]
+            assignment: list[tuple[str, float]] = []
+            if band_present[ci]:
+                assignment = [
+                    (labels[ci][int(round(ai_v[row + j]))], ap_v[row + j])
+                    for j in range(top_n)
+                ]
+            out[name] = ProbeReading(
+                fraction=frac_v[ci],
+                nearest=nearest,
+                coords=tuple(coords_v[g_off:g_off + nd]),
+                residual=0.0,
+                fraction_per_layer=frac_per_layer_acc[ci],
+                coords_per_layer=coords_per_layer_acc[ci],
+                residual_per_layer=residual_per_layer_acc[ci],
+                assignment=assignment,
+                membership=1.0,
+            )
+        return out
+
+    def _score_tokens(
+        self,
+        hidden_per_layer: dict[int, torch.Tensor],
+        accumulate: bool = True,
+        *,
+        only: set[str] | None = None,
+        coords_only: bool = False,
+    ) -> dict[str, ProbeReading]:
+        """Score every probe → ``{name: ProbeReading}`` (full reading).
+
+        ``accumulate`` folds the cross-layer coords into history/stats (the
+        in-flight per-token path passes False).  ``only`` restricts scoring to
+        a subset (gate-only per-token path); a subset read never accumulates
+        (the cross-gen stats want the full roster, not the gated probes alone).
+        ``coords_only`` (FIX F2) returns the lean coords+fraction reading.
+        """
+        out = self._score_full(
+            hidden_per_layer, only=only, coords_only=coords_only,
+        )
+        if out and accumulate and only is None:
+            self._apply_accumulate(out)
+        return out
+
+    def _apply_accumulate(
+        self, readings: dict[str, ProbeReading],
+    ) -> None:
+        """Fold per-probe aggregate coords into history + per-axis stats.
+
+        ``history`` stores the full coordinate tuple; ``_stats`` keeps
+        axis-0 scalar accumulators (TUI compat) plus per-axis ``sum`` /
+        ``sum_sq`` / ``min`` / ``max`` lists for the session's vectorized
+        :class:`ProbeReadings`.
+        """
+        for name, reading in readings.items():
             if name not in self.history:
                 continue
-            self.history[name].append(val)
+            coords = reading.coords or (0.0,)
+            self.history[name].append(tuple(coords))
             s = self._stats[name]
             s["count"] += 1
-            s["sum"] += val
-            s["sum_sq"] += val * val
-            if val < s["min"]:
-                s["min"] = val
-            if val > s["max"]:
-                s["max"] = val
+            v0 = coords[0]
+            s["sum"] += v0
+            s["sum_sq"] += v0 * v0
+            if v0 < s["min"]:
+                s["min"] = v0
+            if v0 > s["max"]:
+                s["max"] = v0
+            # Per-axis accumulators (lazily sized to the coord rank).
+            axes = s.setdefault("axes", [])
+            for i, v in enumerate(coords):
+                if i >= len(axes):
+                    axes.append({"sum": 0.0, "sum_sq": 0.0,
+                                 "min": float("inf"), "max": float("-inf")})
+                a = axes[i]
+                a["sum"] += v
+                a["sum_sq"] += v * v
+                if v < a["min"]:
+                    a["min"] = v
+                if v > a["max"]:
+                    a["max"] = v
         self._pending_aggregate = True
 
-    def score_single_token(self, hidden_per_layer: dict[int, torch.Tensor]) -> dict[str, float]:
-        """Score all probes against a single token's hidden states.
+    def accumulate_readings(
+        self, readings: dict[str, ProbeReading],
+    ) -> None:
+        """Fold an already-scored aggregate into history/stats.
 
-        Like :meth:`measure_from_hidden` but does NOT accumulate into
-        history/stats.  Designed for inline per-token scoring during live
-        SSE streaming where accumulation would corrupt the session-level
-        probe accumulators.
+        The normal stack-scoring path scores and accumulates in one call.  The
+        incremental capture path scores each token live, so finalization already
+        has the aggregate ``ProbeReading`` and should not rescore just to update
+        cross-generation stats.
         """
-        return self._score_probes(hidden_per_layer, accumulate=False)
+        self._apply_accumulate(readings)
+
+    def score_single_token(
+        self, hidden_per_layer: dict[int, torch.Tensor],
+        *, only: set[str] | None = None, coords_only: bool = False,
+    ) -> dict[str, "ProbeReading"]:
+        """Per-probe full reading for a single token (no accumulate).
+
+        The live per-token read source: returns ``{name: ProbeReading}``
+        with ``coords`` (domain frame) + ``fraction`` + ``nearest`` +
+        ``residual`` and their per-layer traces, every probe (flat or curved).
+        Does NOT touch history/stats — the in-flight gate/stream path must
+        not corrupt the session-level accumulators — but flips the
+        per-token pending flag so the TUI/webui can poll for a fresh reading.
+
+        ``only`` (a set of probe names) scores just that subset, returning
+        ``{name: ProbeReading}`` for the subset alone — the gate-only per-token
+        path, where the step sink consumes just the gated probes' scalars and
+        the big-K roster's nearest-distance work is pure waste.  ``only=None``
+        keeps the byte-identical full-roster behavior.  ``coords_only`` (FIX F2)
+        returns the lean coords+fraction reading (no nearest / assignment /
+        per-layer trace) for the axis-0-only live consumers.
+        """
+        out = self._score_tokens(
+            hidden_per_layer, accumulate=False, only=only,
+            coords_only=coords_only,
+        )
+        if out:
+            self._pending_per_token = True
+        return out
 
     def score_single_token_per_layer(
         self,
         hidden_per_layer: dict[int, torch.Tensor],
     ) -> dict[int, dict[str, float]]:
-        """Per-layer × per-probe cosine scores for a single token.
+        """Per-layer × per-probe domain coordinate (axis 0) for a single token.
 
-        Same input shape as :meth:`score_single_token` but returns the
-        raw per-layer cosines instead of the magnitude-weighted aggregate.
-        Powers the web UI's per-token × per-layer × per-probe heatmap
-        inspector — surfaces what each probe was reading at each layer
-        for each generated token, not just the rolled-up score.
-
-        Output: ``{layer_idx: {probe_name: cosine}}``.  Layers absent
-        from the cache (no probe covers them) are omitted from the
-        output entirely; missing-probe entries land as 0.0 to keep the
-        per-layer dict shape stable.
-
-        Cost: one matmul per layer × one ``.cpu().tolist()`` per layer.
-        Heavier than the aggregate ``score_single_token`` (one matmul
-        total + one sync); only called when at least one WS subscriber
-        is consuming the per-layer payload.  Probe-key set is the union
-        of registered probes — same as the aggregate path.
+        ``{layer_idx: {probe_name: coord}}`` — the un-aggregated axis-0
+        domain coordinate per layer, a view over the full reading's
+        ``coords_per_layer``.  Now covers curved probes too (their per-layer
+        coords fall out of the foot solve), not just the affine roster.
         """
-        if not hidden_per_layer or not self._raw_profiles:
-            return {}
-
-        device = next(iter(hidden_per_layer.values())).device
-        self._ensure_cache(device)
-        probe_keys = self._cache_probe_keys
-        if not probe_keys:
-            return {}
-
+        readings = self._score_full(hidden_per_layer)
         out: dict[int, dict[str, float]] = {}
-        for layer_idx, h in hidden_per_layer.items():
-            entry = self._layer_cache.get(layer_idx)
-            if entry is None:
-                continue
-            V, _W = entry  # V: (P, D) unit-normed
-            h_unit = self._normalize_hidden(layer_idx, h.float())
-            sims = (V @ h_unit).cpu().tolist()  # one sync per layer
-            out[layer_idx] = {
-                name: sims[i] for i, name in enumerate(probe_keys)
-            }
-            # Probes registered but not covering this layer fall to 0
-            # — keeps every layer's dict the same shape regardless of
-            # which subset of probes the layer's cache holds.
-            for name in self._raw_profiles:
-                out[layer_idx].setdefault(name, 0.0)
+        for name, reading in readings.items():
+            for layer_idx, coord in reading.coords_per_layer.items():
+                out.setdefault(layer_idx, {})[name] = coord[0] if coord else 0.0
         return out
 
-    def measure(self, model, tokenizer, layers, text: str, device=None, accumulate: bool = True) -> dict[str, float]:
-        """Run one forward pass over *text* and compute probe similarities.
-
-        Pools the last content token's hidden state per layer (same as
-        extraction), mean-centers, then computes score-weighted cosine
-        similarities against all probes. When ``accumulate`` is False,
-        history and stats are left untouched.
-        """
-        from saklas.core.vectors import _encode_and_capture_all
-
-        if device is None:
-            device = next(model.parameters()).device
-
-        hidden_per_layer = _encode_and_capture_all(model, tokenizer, text, layers, device)
-        return self._score_probes(hidden_per_layer, accumulate=accumulate)
-
-    def measure_from_hidden(self, hidden_per_layer: dict[int, torch.Tensor], accumulate: bool = True) -> dict[str, float]:
+    def measure_from_hidden(
+        self, hidden_per_layer: dict[int, torch.Tensor], accumulate: bool = True,
+    ) -> dict[str, "ProbeReading"]:
         """Score probes from pre-captured hidden states (no forward pass).
 
         Use when hidden states have already been captured during generation
         (e.g. via capture hooks), avoiding a redundant forward pass.
         """
-        return self._score_probes(hidden_per_layer, accumulate=accumulate)
+        return self._score_tokens(hidden_per_layer, accumulate=accumulate)
+
+    @staticmethod
+    def flat_scalars(
+        readings: dict[str, "ProbeReading"],
+    ) -> dict[str, float]:
+        """Flatten per-probe readings into namespaced gate-callback scalars.
+
+        The single gate emitter for every probe shape.  For each probe emits
+        the bare ``"<probe>"`` aliased to coordinate axis 0 (so
+        ``@when:angry.calm > 0.4`` reads the single coord of a 2-node concept
+        unchanged), one ``"<probe>[<i>]"`` per coordinate axis (so
+        ``@when:personas[3] > 0.4`` indexes an axis), ``"<probe>:fraction"``,
+        and one ``"<probe>@<label>"`` per nearest node as ``-distance`` (so
+        larger means closer and ``@when:emotions@happy > -0.1`` reads like a
+        similarity gate).  Under the unified full reading every probe — flat
+        and curved — carries coords *and* nearest, so flat probes now expose
+        ``@label`` similarity gates too (e.g. ``@when:personas@hacker``) and
+        the gate grammar is uniform.
+
+        **Fuzzy channels** (additive — the ``@label`` distance gates are
+        untouched): one ``"<probe>~<label>"`` per assigned node as the
+        soft-assignment *probability* (``@when:personas~hacker > 0.5`` — a
+        normalized, in-``[0,1]`` membership gate, unlike the unbounded
+        ``-distance``), and ``"<probe>:membership"`` as the graded tube-fit
+        (``@when:emotions:membership > 0.6`` — high when the activation sits
+        inside the manifold's learned thickness).  All shapes merge directly into
+        ``TriggerContext.probe_scores``.
+        """
+        out: dict[str, float] = {}
+        for name, reading in readings.items():
+            coords = reading.coords
+            if coords:
+                out[name] = coords[0]
+                for i, c in enumerate(coords):
+                    out[f"{name}[{i}]"] = c
+            out[f"{name}:fraction"] = reading.fraction
+            for label, dist in reading.nearest:
+                out[f"{name}@{label}"] = -dist
+            for label, prob in reading.assignment:
+                out[f"{name}~{label}"] = prob
+            out[f"{name}:membership"] = reading.membership
+        return out
+
+    def _per_token_coord_stream(
+        self, captured: dict[int, torch.Tensor], n: int,
+    ) -> dict[str, list[float]]:
+        """Axis-0 domain-coordinate stream per probe over ``n`` tokens.
+
+        Each token is scored ``coords_only`` (the flat affine map + curved foot
+        solve that axis 0 needs, skipping the big-K nearest norm, soft
+        assignment, and per-layer host reconstruction this stream discards), so
+        curved probes still carry a real per-token coord stream (not zeros).
+        Row ``i`` reads ``captured[L][i]`` (guarded), so an EOS overshoot is
+        ignored and a short capture leaves trailing zeros.
+        """
+        per_token: dict[str, list[float]] = {name: [0.0] * n for name in self._probes}
+        if not self._probes:
+            return per_token
+        for i in range(n):
+            tok = {L: h[i] for L, h in captured.items() if h.shape[0] > i}
+            if not tok:
+                continue
+            for name, reading in self._score_full(tok, coords_only=True).items():
+                per_token[name][i] = reading.coords[0] if reading.coords else 0.0
+        return per_token
 
     def score_per_token(
         self,
         captured: dict[int, torch.Tensor],
         generated_ids: list[int],
-        tokenizer,
+        tokenizer: Any,
         *,
         accumulate: bool = True,
-    ) -> tuple[dict[str, float], dict[str, list[float]]]:
+    ) -> tuple[dict[str, "ProbeReading"], dict[str, list[float]]]:
         """Score probes per generated token using pre-captured hidden states.
 
-        ``captured[layer_idx]`` must be a ``(n, dim)`` tensor where row ``k``
-        is the hidden state that produced generated token ``k`` (``n ==
-        len(generated_ids)``). Typically populated by a ``HiddenCapture`` hook
-        running in lockstep with the generation loop, so no extra forward
-        pass is needed.
-
-        Returns ``(aggregate_vals, per_token_scores)``. The aggregate is
-        pooled from the last non-special generated token and updates history
-        when ``accumulate`` is True. Per-token scores cover all
-        ``len(generated_ids)`` rows.
+        ``captured[layer_idx]`` is a ``(n, dim)`` stack where row ``k`` is
+        the hidden state that produced generated token ``k``.  Returns
+        ``(aggregate_readings, per_token_coord_stream)``: the aggregate is
+        the full :class:`ProbeReading` per probe pooled at the last
+        non-special token (updates history when ``accumulate``); the stream
+        is the per-token axis-0 domain coordinate.
         """
         n = len(generated_ids)
-        empty_agg = {name: 0.0 for name in self._raw_profiles}
+        empty_agg = {
+            name: ProbeReading(fraction=0.0, nearest=[], coords=())
+            for name in self._probes
+        }
         if n == 0 or not captured:
-            return empty_agg, {name: [] for name in self._raw_profiles}
+            return empty_agg, {name: [] for name in self._probes}
 
-        any_h = next(iter(captured.values()))
-        self._ensure_cache(any_h.device)
-
-        # Aggregate pool: last non-special generated token.
-        special_ids = set(getattr(tokenizer, "all_special_ids", []) or [])
-        agg_idx = n - 1
-        while agg_idx > 0 and int(generated_ids[agg_idx]) in special_ids:
-            agg_idx -= 1
+        from saklas.core.vectors import last_content_index
+        agg_idx = last_content_index(generated_ids, tokenizer)
         agg_hidden = {
             layer_idx: h[agg_idx] for layer_idx, h in captured.items()
             if h.shape[0] > agg_idx
         }
-        agg_vals = self._score_probes(agg_hidden, accumulate=accumulate)
-
-        probe_keys = self._cache_probe_keys
-        n_probes = len(probe_keys)
-        device = any_h.device
-        num = torch.zeros((n, n_probes), device=device, dtype=torch.float32)
-        den = torch.zeros((n_probes,), device=device, dtype=torch.float32)
-        for layer_idx, h in captured.items():
-            # Captures may overshoot generated_ids by one when generation
-            # terminates on an EOS token: the model forward fires (capture
-            # +1) and then the loop breaks without appending the EOS to
-            # generated_ids. Trim trailing extras to align capture[i] with
-            # generated_ids[i]. Skip if we somehow have fewer than n.
-            if h.shape[0] < n:
-                continue
-            if h.shape[0] > n:
-                h = h[:n]
-            entry = self._layer_cache.get(layer_idx)
-            if entry is None:
-                continue
-            V, W = entry  # V: (P, D), W: (P,)
-            h_unit = self._normalize_hidden(layer_idx, h.float())  # (n, D)
-            sims = h_unit @ V.t()  # (n, P)
-            num.add_(sims * W)  # broadcast over n
-            den.add_(W)
-        den.clamp_(min=1e-8)
-        result = (num / den).cpu().tolist()  # single sync: list[n] of list[P]
-        per_token: dict[str, list[float]] = {name: [] for name in self._raw_profiles}
-        for i, name in enumerate(probe_keys):
-            per_token[name] = [row[i] for row in result]
-        for name in self._raw_profiles:
-            if not per_token[name]:
-                per_token[name] = [0.0] * n
-
-        # Mirror score_stack's gate: the pending-per-token flag is TUI
-        # state, and stateless callers (server path with accumulate=False)
-        # must not leak into it.
+        agg = self._score_tokens(agg_hidden, accumulate=accumulate)
+        per_token = self._per_token_coord_stream(captured, n)
         if accumulate:
             self._pending_per_token = True
-        return agg_vals, per_token
+        return agg, per_token
 
     def score_stack(
         self,
@@ -376,23 +1743,21 @@ class TraitMonitor:
         *,
         agg_index: int | None = None,
         accumulate: bool = False,
-    ) -> tuple[dict[str, float], dict[str, list[float]]]:
+    ) -> tuple[dict[str, "ProbeReading"], dict[str, list[float]]]:
         """Score probes over a pre-captured ``[T, D]`` stack per layer.
 
-        Unlike :meth:`score_per_token`, this entry point does not require
-        ``generated_ids`` or a tokenizer — the caller has already decided
-        which rows are meaningful (e.g. already trimmed trailing special
-        tokens if they cared). Aggregate is pooled from row ``agg_index``
-        (defaults to the last row of each layer).
-
-        Returns ``(aggregate_vals, per_token_scores)``. ``accumulate``
-        defaults to ``False`` here (opposite of :meth:`score_per_token`)
-        because this path is for ad-hoc researcher probing, not the
-        in-flight generation loop.
+        Like :meth:`score_per_token` but without ``generated_ids`` /
+        tokenizer — the caller has already chosen the meaningful rows.
+        Aggregate is pooled from row ``agg_index`` (default the last row).
+        ``accumulate`` defaults to ``False`` (ad-hoc researcher probing,
+        not the in-flight loop).
         """
-        empty_agg = {name: 0.0 for name in self._raw_profiles}
+        empty_agg = {
+            name: ProbeReading(fraction=0.0, nearest=[], coords=())
+            for name in self._probes
+        }
         if not captured:
-            return empty_agg, {name: [] for name in self._raw_profiles}
+            return empty_agg, {name: [] for name in self._probes}
 
         any_h = next(iter(captured.values()))
         if any_h.ndim != 2:
@@ -401,7 +1766,7 @@ class TraitMonitor:
             )
         n = any_h.shape[0]
         if n == 0:
-            return empty_agg, {name: [] for name in self._raw_profiles}
+            return empty_agg, {name: [] for name in self._probes}
 
         # Uniform T across layers — mixed lengths are a caller bug.
         for layer_idx, h in captured.items():
@@ -410,8 +1775,6 @@ class TraitMonitor:
                     f"score_stack: layer {layer_idx} has shape {tuple(h.shape)}, "
                     f"expected [{n}, D]",
                 )
-
-        self._ensure_cache(any_h.device)
 
         agg_row = n - 1 if agg_index is None else int(agg_index)
         if not (0 <= agg_row < n):
@@ -425,40 +1788,11 @@ class TraitMonitor:
         agg_hidden = {
             layer_idx: h[agg_row] for layer_idx, h in captured.items()
         }
-        agg_vals = self._score_probes(agg_hidden, accumulate=accumulate)
-
-        probe_keys = self._cache_probe_keys
-        n_probes = len(probe_keys)
-        device = any_h.device
-        num = torch.zeros((n, n_probes), device=device, dtype=torch.float32)
-        den = torch.zeros((n_probes,), device=device, dtype=torch.float32)
-        for layer_idx, h in captured.items():
-            entry = self._layer_cache.get(layer_idx)
-            if entry is None:
-                continue
-            V, W = entry
-            h_unit = self._normalize_hidden(layer_idx, h.float())  # (n, D)
-            sims = h_unit @ V.t()  # (n, P)
-            num.add_(sims * W)
-            den.add_(W)
-        den.clamp_(min=1e-8)
-        result = (num / den).cpu().tolist()
-        per_token: dict[str, list[float]] = {name: [] for name in self._raw_profiles}
-        for i, name in enumerate(probe_keys):
-            per_token[name] = [row[i] for row in result]
-        for name in self._raw_profiles:
-            if not per_token[name]:
-                per_token[name] = [0.0] * n
-
-        # Only flip the pending flag when the caller is actually
-        # feeding this into history. Ad-hoc researcher calls
-        # (accumulate=False, the default here) must not surface as
-        # pending data on the monitor's TUI-facing consumer side —
-        # score_per_token sets this unconditionally because it's
-        # always in-flight; score_stack is not.
+        agg = self._score_tokens(agg_hidden, accumulate=accumulate)
+        per_token = self._per_token_coord_stream(captured, n)
         if accumulate:
             self._pending_per_token = True
-        return agg_vals, per_token
+        return agg, per_token
 
     def has_pending_data(self) -> bool:
         """True iff an aggregate measurement is waiting to be consumed."""
@@ -481,13 +1815,18 @@ class TraitMonitor:
         self._live_count = 0
         self._live_pending = False
 
-    def update_live(self, scores: dict[str, float]) -> None:
-        """Fold one token's per-probe scores into the running mean."""
+    def update_live(self, readings: dict[str, "ProbeReading"]) -> None:
+        """Fold one token's per-probe coordinate axis 0 into the running mean.
+
+        Accepts the per-token readings the score callback already produces;
+        the live mean tracks coordinate axis 0 (the TUI-facing scalar).
+        """
         self._live_count += 1
         c = self._live_count
-        for name, v in scores.items():
-            prev = self._live_values.get(name, 0.0)
-            self._live_values[name] = prev + (v - prev) / c
+        for name, reading in readings.items():
+            v = reading.coords[0] if reading.coords else 0.0
+            prev = self._live_values.get(name, [0.0])
+            self._live_values[name] = [prev[0] + (v - prev[0]) / c]
         self._live_pending = True
 
     def end_live(self) -> None:
@@ -497,63 +1836,841 @@ class TraitMonitor:
         self._live_pending = False
 
     def get_current_and_previous(self) -> tuple[dict[str, float], dict[str, float]]:
-        current = {}
-        previous = {}
-        for name in self._raw_profiles:
+        """Axis-0 scalar current/previous reading per probe (TUI compat)."""
+        current: dict[str, float] = {}
+        previous: dict[str, float] = {}
+        for name in self._probes:
             hist = self.history[name]
-            if name in self._live_values:
-                # Mid-gen: live running mean wins; previous = last canonical
-                # aggregate from history (or live itself if no history).
-                current[name] = self._live_values[name]
-                previous[name] = hist[-1] if hist else self._live_values[name]
+            live = self._live_values.get(name)
+            if live is not None:
+                current[name] = live[0]
+                previous[name] = hist[-1][0] if hist else live[0]
             elif len(hist) >= 2:
-                current[name] = hist[-1]
-                previous[name] = hist[-2]
+                current[name] = hist[-1][0]
+                previous[name] = hist[-2][0]
             elif hist:
-                current[name] = hist[-1]
-                previous[name] = hist[-1]
+                current[name] = hist[-1][0]
+                previous[name] = hist[-1][0]
             else:
                 current[name] = 0.0
                 previous[name] = 0.0
         return current, previous
 
-    def get_stats(self, name: str) -> dict:
+    def get_stats(self, name: str) -> dict[str, Any]:
         return self._stats.get(name, self._empty_stats())
+
+    def axis_stats(self, name: str) -> list[dict[str, Any]]:
+        """Per-coordinate-axis accumulators for the vectorized readings.
+
+        ``[{sum, sum_sq, min, max}, ...]`` aligned with the coordinate
+        axes; empty until the probe has accumulated a reading.  The
+        session reads this for the per-axis :class:`ProbeReadings`.
+        """
+        return self._stats.get(name, {}).get("axes", [])
 
     def get_sparkline(self, name: str) -> str:
         blocks = " ▁▂▃▄▅▆▇█"
-        values = self.history[name]
+        # Axis-0 coordinate history (TUI compat).
+        values = [c[0] for c in self.history[name]] if name in self.history else []
         if not values:
             return ""
         lo, hi = min(values), max(values)
         span = hi - lo if hi != lo else 1.0
         return "".join(blocks[min(8, max(0, int((v - lo) / span * 8)))] for v in values)
 
-    def add_probe(self, name: str, profile: dict[int, torch.Tensor]):
-        is_new = name not in self._raw_profiles
-        self._raw_profiles[name] = profile
+    def add_probe(self, name: str, manifold: "Manifold", *, top_n: int = DEFAULT_NEAREST_TOP_N):
+        """Register a :class:`Manifold` probe — flat (any rank) or curved.
+
+        Pre-caches the per-layer node values + EV weights + whitened factors
+        (and, for a flat fit, the affine reduced→domain coord map) via
+        :func:`_attach_manifold_probe`; the wired whitener must cover the
+        fit's layers.  Flat vs curved is cached once on the attached probe.
+        """
+        is_new = name not in self._probes
+        self._probes[name] = _attach_manifold_probe(
+            name, manifold, top_n=top_n, whitener=self._whitener,
+            factor_cache=self._whitener_factor_cache,
+        )
+        self._invalidate_flat_cache()
         if is_new:
             self.history[name] = deque(maxlen=_MAX_HISTORY)
             self._stats[name] = self._empty_stats()
-        # Invalidate stacked cache; rebuilt on next scoring call.
-        self._layer_cache = {}
-        self._cache_device = None
-        self._cache_probe_keys = ()
 
     def remove_probe(self, name: str):
-        if name in self._raw_profiles:
-            del self._raw_profiles[name]
+        self._probes.pop(name, None)
+        self._whitener_factor_cache.clear()
+        self._invalidate_flat_cache()
         if name in self.history:
             del self.history[name]
         if name in self._stats:
             del self._stats[name]
-        self._layer_cache = {}
-        self._cache_device = None
-        self._cache_probe_keys = ()
+
+    def attached_probes(self) -> dict[str, "AttachedManifoldProbe"]:
+        """Live attached-probe map (read-only view) — name → probe."""
+        return dict(self._probes)
+
+    def attached_layers(self) -> set[int]:
+        """Union of fit-layer indices across every attached probe.
+
+        Alias of :meth:`probe_layers` (capture-widening signal); kept for the
+        server/TUI surfaces that consumed the former ``ManifoldMonitor``.
+        """
+        return self.probe_layers()
+
+    def reset(self) -> None:
+        """Drop every attached probe (TUI ``/unsteer``-style reset)."""
+        self._probes.clear()
+        self.history.clear()
+        self._stats.clear()
+        self._whitener_factor_cache.clear()
+        self._invalidate_flat_cache()
+        self._invalidate_flat_cache()
+        self._pending_aggregate = False
+        self._pending_per_token = False
 
     def reset_history(self):
-        for name in self._raw_profiles:
+        for name in self._probes:
             self.history[name].clear()
             self._stats[name] = self._empty_stats()
         self._pending_aggregate = False
         self._pending_per_token = False
+
+    def score_aggregate(
+        self,
+        captured_per_layer: dict[int, torch.Tensor],
+        *,
+        agg_index: int | None = None,
+    ) -> dict[str, ProbeReading]:
+        """End-of-generation aggregate over pooled captures — all probes.
+
+        ``captured_per_layer[L]`` is the per-layer ``[T, D]`` capture stack.
+        The pooled activation is the **last non-special token** (``agg_index``,
+        default the final row) — the same single-state discipline extraction
+        uses, not a trajectory mean.  It routes through the same full scorer
+        as live single-token reads, so flat probe rosters use the batched
+        Woodbury path while curved probes keep their per-probe foot solve.
+        """
+        out: dict[str, ProbeReading] = {}
+        if not captured_per_layer or not self._probes:
+            return out
+
+        pooled: dict[int, torch.Tensor] = {}
+        for layer_idx, stack in captured_per_layer.items():
+            if stack is None or stack.numel() == 0:
+                continue
+            if stack.ndim == 1:
+                pooled[layer_idx] = stack.to(torch.float32)
+            else:
+                t = stack.shape[0]
+                row = t - 1 if agg_index is None else max(0, min(agg_index, t - 1))
+                pooled[layer_idx] = stack.to(torch.float32)[row]
+
+        return self._score_full(pooled)
+
+    def probe_geometry(
+        self, name: str, *, grid_resolution: int = 24,
+    ) -> dict[str, Any]:
+        """Static geometry payload for one attached probe (inspector plot).
+
+        Everything in the **whitened frame** the reads use: per-layer node
+        centroids (``wh.node_white``), the neutral anchor (``wh.neutral_white``),
+        a top-3 PCA rotation of the node cloud when ``rank >= 3``, and — for a
+        curved fit of intrinsic dim 1/2 embedded in a higher-rank subspace — the
+        manifold curve/surface sampled and whitened into the same frame.  Pairs
+        with the per-token ``ProbeReading.subspace_coords_per_layer`` (the live
+        point + trail), which carries the same ``cdist_query`` whitened coord.
+        CPU/fp32 for the SVD + grid (MPS-fallback discipline); off the hot path.
+        """
+        probe = self._probes.get(name)
+        if probe is None:
+            raise KeyError(name)
+        manifold = probe.manifold
+        domain = manifold.domain
+        n = int(domain.intrinsic_dim)
+        layers_out: dict[str, Any] = {}
+        ranks: set[int] = set()
+        for layer_idx in sorted(manifold.layers):
+            wh = probe.whitened.get(layer_idx)
+            if wh is None:
+                continue
+            sub = manifold.layers[layer_idx]
+            node_white = wh.node_white.detach().to(torch.float32).cpu()   # (K, R)
+            R = int(node_white.shape[1])
+            ranks.add(R)
+            neutral_white = (
+                wh.neutral_white.detach().to(torch.float32).cpu().reshape(-1)
+            )
+            pca_rotation: list[list[float]] | None = None
+            ev_pcs: list[float] | None = None
+            if R >= 3 and node_white.shape[0] >= 2:
+                centered = node_white - node_white.mean(dim=0, keepdim=True)
+                try:
+                    _u, s, vh = torch.linalg.svd(centered, full_matrices=False)
+                    pca_rotation = vh[:3].transpose(0, 1).contiguous().tolist()
+                    var = s ** 2
+                    tot = float(var.sum().clamp(min=1e-12))
+                    ev_pcs = [float(v) / tot for v in var[:3].tolist()]
+                except Exception:
+                    pca_rotation, ev_pcs = None, None
+            overlay: dict[str, Any] | None = None
+            if (
+                (not sub.is_affine)
+                and n in (1, 2)
+                and n < R
+                and isinstance(domain, BoxDomain)
+            ):
+                overlay = self._sample_overlay(sub, domain, wh, n, grid_resolution)
+            layers_out[str(layer_idx)] = {
+                "layer": layer_idx,
+                "rank": R,
+                "intrinsic_dim": n,
+                "is_affine": bool(sub.is_affine),
+                "node_white": node_white.tolist(),
+                "neutral_white": neutral_white.tolist(),
+                "pca_rotation": pca_rotation,
+                "explained_variance_pcs": ev_pcs,
+                "mahalanobis_share": float(
+                    manifold.mahalanobis_share.get(layer_idx, 0.0),
+                ),
+                "overlay": overlay,
+            }
+        return {
+            "name": name,
+            "manifold": manifold.name,
+            "intrinsic_dim": n,
+            "is_affine": bool(probe.is_affine),
+            "node_labels": list(manifold.node_labels),
+            "rank_uniform": len(ranks) <= 1,
+            "layers": layers_out,
+        }
+
+    @staticmethod
+    def _sample_overlay(
+        sub: Any, domain: BoxDomain, wh: Any, n: int, res: int,
+    ) -> dict[str, Any] | None:
+        """Sample a curved manifold's curve (n=1) / surface (n=2), whitened.
+
+        Returns the sampled points already in the ``node_white`` frame
+        (``r @ chol``), so the frontend overlays them on the same plot without a
+        second transform.  Off the hot path — CPU/fp32 throughout.
+        """
+        cpu = torch.device("cpu")
+        sub_c = sub.to(device=cpu, dtype=torch.float32)
+        chol = wh.chol.detach().to(torch.float32).cpu()       # (R, R)
+        basis = sub_c.basis                                   # (R, D)
+        mean = sub_c.mean                                     # (D,)
+        axes = domain.axes
+
+        def _axis_grid(ax: Any) -> torch.Tensor:
+            if ax.periodic:
+                return torch.linspace(
+                    0.0, float(ax.period), res + 1, dtype=torch.float32,
+                )[:-1]
+            return torch.linspace(
+                float(ax.lo), float(ax.hi), res, dtype=torch.float32,
+            )
+
+        def _whiten(coords: torch.Tensor) -> torch.Tensor:
+            world = sub_c.eval_at(domain.embed(domain.clamp_position(coords)))
+            reduced = (world - mean) @ basis.transpose(0, 1)  # (.., R)
+            return reduced @ chol                             # (.., R) whitened
+
+        if n == 1:
+            g = _axis_grid(axes[0]).reshape(-1, 1)            # (S, 1)
+            return {"kind": "curve", "points": _whiten(g).tolist()}
+        gu, gv = _axis_grid(axes[0]), _axis_grid(axes[1])
+        uu, vv = torch.meshgrid(gu, gv, indexing="ij")
+        grid = torch.stack([uu.reshape(-1), vv.reshape(-1)], dim=1)  # (nu*nv, 2)
+        return {
+            "kind": "surface",
+            "points": _whiten(grid).tolist(),
+            "grid_shape": [int(gu.numel()), int(gv.numel())],
+        }
+
+
+@dataclass
+class AttachedManifoldProbe:
+    """One manifold registered on a :class:`Monitor`.
+
+    Pairs the loaded :class:`Manifold` artifact with the per-layer cache
+    the monitor uses on the hot path: ``node_values_reduced`` is the
+    per-layer ``(K, R)`` tensor of node activations in subspace coords —
+    ``sub.node_coords`` for a flat fit (the M-projected node coords directly,
+    pruned-basis-consistent), else ``(sub.eval_at(domain.embed(node_coords)) -
+    sub.mean) @ sub.basis.T`` for a curved fit (RBF surface eval) —
+    pre-computed once at attach so per-token distance computations are one
+    batched cdist in R-dim per layer.  ``share_weights`` is the per-layer
+    Mahalanobis share (the steering budget) used to weight cross-layer
+    aggregation — the layer that carries the most push is the most reliable
+    to read from; floored at :data:`_MIN_SHARE_WEIGHT` so a degenerate layer
+    doesn't crash the aggregator.
+    """
+
+    name: str
+    manifold: "Manifold"
+    top_n: int = DEFAULT_NEAREST_TOP_N
+    is_affine: bool = True
+    # Whether the neutral anchor competes as a virtual candidate in this
+    # probe's ``nearest`` ranking (see :data:`NEUTRAL_LABEL`).  Set at attach to
+    # ``NEUTRAL_LABEL not in manifold.node_labels`` so a real node named
+    # ``neutral`` keeps sole ownership of the label.
+    inject_neutral: bool = True
+    # Per-layer cache, indexed by layer index — same set of layers as
+    # ``manifold.layers``.
+    node_values_reduced: dict[int, torch.Tensor] = field(default_factory=dict)
+    # Per-layer Mahalanobis-share weight, normalized to sum to 1 across
+    # attached layers.
+    share_weights: dict[int, float] = field(default_factory=dict)
+    # Per-candidate soft-assignment bandwidth ``τ`` ``(Kc,)`` in the **whitened**
+    # metric (the metric the nearest-node distances live in), share-weighted across
+    # layers, candidate order = nodes then the neutral anchor (when injected).
+    # A curved fit's within-node σ-field mapped into the whitened metric (×
+    # ``√(tr(M_R)/R)``, the isotropic-σ scale); a flat fit's local layout scale
+    # (each node's nearest-neighbor whitened distance).  Drives the
+    # ``softmax(−d²/2τ² − R·log(τ))`` soft assignment.  ``None`` until the
+    # post-attach bandwidth pass runs (an empty / degenerate manifold leaves it
+    # ``None`` ⇒ assignment empty, argmax ``nearest`` unaffected).
+    assign_bandwidth: torch.Tensor | None = None
+    # Per-candidate Gaussian log-volume bias ``−R·log(τ_k)`` ``(Kc,)`` —
+    # precomputed at attach so the hot-path logit is
+    # ``−d²/(2τ²) + logvol_bias`` (one add, no per-token ``log``).  This is the
+    # missing Gaussian normalization that turns the bare ``softmax(−d²/2τ²)``
+    # into a proper isotropic R-D mixture posterior with a uniform node prior:
+    # the bias penalizes diffuse-``τ`` candidates by their log-volume so a wide
+    # node can't swallow probability from far away (the "broadest-node-wins"
+    # pathology the bare form has).  ``R`` is the manifold's per-layer subspace
+    # rank — the effective dimension of the space ``τ`` measures.
+    assign_logvol_bias: torch.Tensor | None = None
+    # Robust per-probe scale for the ``nearest`` / ``@label`` distance: the
+    # **median node nearest-neighbor whitened spacing** (a single scalar, not the
+    # per-candidate ``τ`` above).  The reported nearest distance is divided by it
+    # so ``@label`` reads "how many typical label-spacings away" — portable across
+    # probes (raw whitened distance spans ~60× by fit), while staying a *uniform*
+    # rescale that preserves the raw nearest **ranking** (``nearest`` stays
+    # literally nearest, distinct from the density-aware ``assignment``).  A
+    # single-node fit / degenerate manifold leaves it ``1.0`` (raw distance).
+    label_scale: float = 1.0
+    # Per-layer Mahalanobis bundle, populated at attach.  The wired whitener
+    # must cover every layer of this manifold (all-or-nothing per probe), else
+    # ``_build_whitened`` raises ``WhitenerError`` — there is no Euclidean
+    # readout.  Each entry is ``_LayerWhiten`` — the precomputed factors that
+    # turn the per-token fraction + nearest-node distance into their whitened
+    # forms (M-orthogonal subspace projection + Mahalanobis distance).  Empty
+    # only for an empty manifold (no layers to read).
+    whitened: dict[int, "_LayerWhiten"] = field(default_factory=dict)
+
+
+@dataclass
+class _LayerWhiten:
+    """Precomputed per-layer Mahalanobis factors for a manifold probe.
+
+    Built at attach from the wired :class:`LayerWhitener` + the layer's
+    subspace.  ``m_r_inv`` and ``chol`` are the ``(R, R)`` inverse and
+    lower-Cholesky factor of the subspace-restricted inverse covariance
+    ``M_R = B Σ⁻¹ Bᵀ`` (:meth:`LayerWhitener.subspace_gram`); ``node_white``
+    is the ``(K, R)`` node coords transformed into the whitened metric
+    (``v_reduced @ chol``) so a plain cdist against the transformed query
+    yields the true Mahalanobis distance restricted to the subspace.
+    ``(X, K_inv, lam)`` are the on-device Woodbury factors for the per-token
+    ``Σ⁻¹ x`` apply.  All tensors live on the manifold's fit device.
+    """
+
+    m_r_inv: torch.Tensor      # (R, R) = (B Σ⁻¹ Bᵀ)⁻¹
+    chol: torch.Tensor         # (R, R) lower-tri, M_R = chol @ cholᵀ
+    node_white: torch.Tensor   # (K, R) = node_values_reduced @ chol
+    # Neutral anchor in the same whitened metric as ``node_white`` (R,).  For a
+    # neutral-anchored affine fit the frame origin *is* neutral, so this is the
+    # zero vector; a curved fit centers on the PCA-frame mean, so it is the baked
+    # per-layer ``origin`` (the authoring-coord foot of the neutral mean) mapped
+    # through ``eval_at`` → basis → ``chol``.  The neutral candidate's distance
+    # is then ``‖cdist_query − neutral_white‖``, identical machinery to a node.
+    neutral_white: torch.Tensor  # (R,)
+    # ``node_white`` with the neutral anchor appended as the ``K``-th candidate
+    # row **iff** the probe injects neutral — i.e. exactly the
+    # ``(Kc, R)`` cdist target the per-probe read needs.  Precomputed at attach
+    # so the per-token curved/gate path does one ``vector_norm`` against a
+    # standing tensor instead of re-``cat``-ing ``neutral_white`` onto
+    # ``node_white`` every token.  Equals ``node_white`` when neutral is not
+    # injected.
+    node_white_aug: torch.Tensor  # (Kc, R)
+    mean: torch.Tensor         # (D,) fit mean on the scoring device
+    basis: torch.Tensor        # (R, D) basis on the scoring device
+    X: torch.Tensor            # (N, D) centered neutral observations
+    K_inv: torch.Tensor        # (N, N) Woodbury inverse
+    lam: float                 # ridge λ
+    # Precomputed ``Σ⁻¹ mean`` (D,) — the per-probe-per-layer centering term.
+    # ``_woodbury_apply`` is exactly linear, so the per-token centered apply
+    # ``Σ⁻¹(h − mean)`` is ``Σ⁻¹h − s_mean``: one subtract against a shared
+    # ``Σ⁻¹h`` (the same for every probe at a layer, cached in ``_score_full``)
+    # instead of a full Woodbury apply per probe.  Baked at attach (and rebuilt
+    # on ``set_whitener``), since ``mean`` and the whitener are both constant.
+    s_mean: torch.Tensor       # (D,) = Σ⁻¹ mean
+    # Affine reduced→domain coordinate map (flat probes only; ``None`` for a
+    # curved fit, which recovers coords through ``invert_parameterization``).
+    # ``dom = c @ coord_S.T + coord_b`` sends the whitened M-orthogonal
+    # reduced coords ``c = M_R⁻¹ B Σ⁻¹ x`` to the fit's domain frame, fit by
+    # least squares so each node's reduced coord maps to its
+    # ``node_coords`` (the rank-1 case reproduces the old slope/intercept).
+    coord_S: torch.Tensor | None = None   # (n_dim, R)
+    coord_b: torch.Tensor | None = None   # (n_dim,)
+
+
+# ----------------------------------------------------------------------------
+# Shared subspace-read machinery — used by both read paths of the unified
+# :class:`Monitor`.  Flat (affine) probes get an analytic coordinate readout;
+# curved probes foot-solve against the aggregate.  Both share the
+# whitened-factor build, the per-layer geometry, and the attach-time node cache
+# — the read-side peer of the steering split (one ``subspace_inject`` kernel,
+# ``SteeringManager.{subspaces, manifolds}``).
+# ----------------------------------------------------------------------------
+
+
+def _probe_is_affine_for_manifold(manifold: "Manifold") -> bool:
+    """True iff a manifold's fit is flat (affine) — batched coordinate readout.
+
+    A manifold's layers are uniformly affine (``pca`` / 2-node concept) or
+    curved (``spectral`` / ``authored``), so the first fitted layer decides.
+    An empty manifold is treated as affine (it scores to nothing anyway).
+    """
+    for sub in manifold.layers.values():
+        return bool(sub.is_affine)
+    return True
+
+
+def _probe_is_affine(probe: "AttachedManifoldProbe") -> bool:
+    """Back-compat wrapper for tests / callers that ask about an attached probe."""
+    return probe.is_affine
+
+
+def _affine_coord_map(
+    sub: Any, manifold: "Manifold", m_r_inv: torch.Tensor,
+    X: torch.Tensor, K_inv: torch.Tensor, lam: float,
+) -> "tuple[torch.Tensor, torch.Tensor]":
+    """Least-squares affine map: whitened M-proj reduced coords → domain.
+
+    Returns ``(coord_S (n_dim, R), coord_b (n_dim,))`` such that
+    ``dom = c @ coord_Sᵀ + coord_b`` sends each node's whitened M-orthogonal
+    reduced coords ``c_k = M_R⁻¹ B Σ⁻¹ (v_k − mean)`` to its domain
+    ``node_coords`` — the rank-R generalization of the old rank-1 2-node
+    slope/intercept (which it reproduces exactly at R=1, K=2).  The small
+    solve runs on CPU (MPS has ``linalg.lstsq`` gaps); the per-node
+    ``Σ⁻¹`` apply rides the device Woodbury.
+    """
+    dev = X.device
+    sub_f = sub.to(device=dev, dtype=torch.float32)
+    basis = sub_f.basis                                   # (R, D)
+    mean = sub_f.mean                                     # (D,)
+    R = int(basis.shape[0])
+    node_coords = manifold.node_coords.to(device=dev, dtype=torch.float32)
+    K = int(node_coords.shape[0])
+    n_dim = int(manifold.domain.intrinsic_dim)
+    embedded = manifold.domain.embed(
+        manifold.domain.clamp_position(node_coords)
+    ).to(device=dev, dtype=torch.float32)
+    if sub_f.node_coords is not None:
+        # True per-layer node activation in-subspace: ``node_coords @ basis``
+        # (== ``eval_at`` − mean for a flat fit, but pruned-basis-consistent —
+        # the shared domain layout would mis-dimension a DLS-pruned layer).
+        v_centered = sub_f.node_coords.to(device=dev, dtype=torch.float32) @ basis
+    else:
+        v_centered = sub_f.eval_at(embedded) - mean      # (K, D) fallback
+    si_vc = _woodbury_apply(v_centered, X, K_inv, lam)    # (K, D) = Σ⁻¹ v_centered
+    g_nodes = si_vc @ basis.T                             # (K, R) = B Σ⁻¹ v_centered
+    c_nodes = (g_nodes @ m_r_inv.T).cpu()                # (K, R) whitened M-proj coords
+    dc = node_coords.reshape(K, -1)[:, :n_dim].cpu()     # (K, n_dim) domain target
+    if K == 1:
+        # Monopolar ray (R == 1): anchor through the origin (neutral → 0),
+        # the single node → its domain coord; minimal-norm S, b = 0.
+        c0 = c_nodes[0]
+        denom = (c0 @ c0).clamp(min=_FRACTION_EPSILON)
+        coord_S = torch.outer(dc[0], c0) / denom         # (n_dim, R)
+        coord_b = torch.zeros(n_dim, dtype=torch.float32)
+    else:
+        ones = torch.ones((K, 1), dtype=torch.float32)
+        c1 = torch.cat([c_nodes, ones], dim=1)           # (K, R+1)
+        sol = torch.linalg.lstsq(c1, dc).solution        # (R+1, n_dim)
+        coord_S = sol[:R].T.contiguous()                 # (n_dim, R)
+        coord_b = sol[R].contiguous()                    # (n_dim,)
+    return (
+        coord_S.to(device=dev, dtype=torch.float32),
+        coord_b.to(device=dev, dtype=torch.float32),
+    )
+
+
+def _build_whitened_factors(
+    whitener: Any, probe: "AttachedManifoldProbe",
+    *,
+    factor_cache: dict[
+        tuple[int, str, torch.dtype],
+        tuple[torch.Tensor, torch.Tensor, float],
+    ] | None = None,
+) -> dict[int, "_LayerWhiten"]:
+    """Per-layer :class:`_LayerWhiten` map for a probe (Mahalanobis-only).
+
+    The wired whitener is **required** and must cover **every** fit layer
+    (all-or-nothing per probe).  A missing/non-covering whitener raises
+    :class:`WhitenerError` — there is no Euclidean readout.  Off the hot
+    path; runs once at attach / on ``set_whitener``.
+    """
+    manifold = probe.manifold
+    if not manifold.layers:
+        return {}
+    layers = list(manifold.layers.keys())
+    if whitener is None or not whitener.covers_all(layers):
+        raise WhitenerError(
+            "subspace probe reads require a Mahalanobis whitener covering "
+            f"every fit layer {sorted(layers)}; regenerate the neutral "
+            "activation cache for this model (the Euclidean path is gone)"
+        )
+    out: dict[int, _LayerWhiten] = {}
+    for layer_idx, sub in manifold.layers.items():
+        v_reduced = probe.node_values_reduced.get(layer_idx)
+        if v_reduced is None:
+            raise WhitenerError(
+                f"subspace probe cache missing reduced node coords for "
+                f"layer {layer_idx}; rebuild the probe before scoring"
+            )
+        dev = v_reduced.device
+        basis = sub.basis.to(device=torch.device("cpu"), dtype=torch.float32)
+        # M_R = B Σ⁻¹ Bᵀ (R, R), PD for an orthonormal B and ridge-PD Σ.
+        m_r = whitener.subspace_gram(layer_idx, basis)  # CPU fp32
+        R = m_r.shape[0]
+        try:
+            chol = torch.linalg.cholesky(m_r)
+        except torch.linalg.LinAlgError:
+            # Defensive jitter for a near-singular subspace gram.
+            eye = torch.eye(R, dtype=m_r.dtype)
+            jitter = 1e-8 * float(m_r.diagonal().mean().clamp_min(1e-12))
+            chol = torch.linalg.cholesky(m_r + jitter * eye)
+        m_r_inv = torch.cholesky_inverse(chol)
+        cache_key = (layer_idx, str(dev), torch.float32)
+        if factor_cache is not None and cache_key in factor_cache:
+            X, K_inv, lam = factor_cache[cache_key]
+        else:
+            X, K_inv, lam = whitener.woodbury_factors(
+                layer_idx, device=dev, dtype=torch.float32,
+            )
+            if factor_cache is not None:
+                factor_cache[cache_key] = (X, K_inv, lam)
+        chol_dev = chol.to(device=dev, dtype=torch.float32)
+        m_r_inv_dev = m_r_inv.to(device=dev, dtype=torch.float32)
+        # Flat probes carry the affine reduced→domain coord map (the rank-R
+        # generalization of the rank-1 slope/intercept); a curved fit leaves
+        # it ``None`` and recovers coords via ``invert_parameterization``.
+        coord_S = coord_b = None
+        if sub.is_affine:
+            coord_S, coord_b = _affine_coord_map(
+                sub, manifold, m_r_inv_dev, X, K_inv, lam,
+            )
+        # Neutral anchor in the whitened metric.  Affine: the frame is
+        # neutral-anchored, so neutral is reduced coord 0.  Curved: map the
+        # baked per-layer ``origin`` (authoring-coord foot of the neutral mean)
+        # through the same eval_at → basis → chol pipeline as a node.  A curved
+        # fit without a stored origin falls back to the subspace mean (0).
+        if sub.is_affine:
+            neutral_white = torch.zeros(R, device=dev, dtype=torch.float32)
+        else:
+            o = manifold.origin.get(layer_idx)
+            if o is None:
+                neutral_white = torch.zeros(R, device=dev, dtype=torch.float32)
+            else:
+                o_dom = o.to(device=dev, dtype=torch.float32).reshape(1, -1)
+                emb = manifold.domain.embed(
+                    manifold.domain.clamp_position(o_dom)
+                ).to(device=dev, dtype=torch.float32)
+                v_centered = sub.eval_at(emb) - sub.mean.to(
+                    device=dev, dtype=torch.float32,
+                )
+                v_red = v_centered @ sub.basis.to(
+                    device=dev, dtype=torch.float32,
+                ).T                                  # (1, R)
+                neutral_white = (v_red @ chol_dev).reshape(-1)
+        mean_dev = sub.mean.to(device=dev, dtype=torch.float32)
+        # Precompute ``Σ⁻¹ mean`` once (constant in mean + whitener), so the
+        # per-token ``_layer_geometry`` centers via ``sih − s_mean`` against the
+        # shared ``Σ⁻¹h`` rather than a full per-probe Woodbury apply.
+        s_mean = _woodbury_apply(mean_dev, X, K_inv, lam)
+        node_white = v_reduced.to(torch.float32) @ chol_dev   # (K, R)
+        # Append the neutral anchor as the ``K``-th candidate once, here, so the
+        # per-token read does one ``vector_norm`` against a standing
+        # ``(Kc, R)`` tensor instead of a per-token ``cat`` (FIX F4).
+        node_white_aug = (
+            torch.cat([node_white, neutral_white.reshape(1, -1)], dim=0)
+            if probe.inject_neutral else node_white
+        )
+        out[layer_idx] = _LayerWhiten(
+            m_r_inv=m_r_inv_dev,
+            chol=chol_dev,
+            node_white=node_white,
+            neutral_white=neutral_white,
+            node_white_aug=node_white_aug,
+            mean=mean_dev,
+            basis=sub.basis.to(device=dev, dtype=torch.float32),
+            X=X, K_inv=K_inv, lam=lam,
+            s_mean=s_mean,
+            coord_S=coord_S, coord_b=coord_b,
+        )
+    return out
+
+
+def _attach_manifold_probe(
+    name: str,
+    manifold: "Manifold",
+    *,
+    top_n: int = DEFAULT_NEAREST_TOP_N,
+    whitener: Any = None,
+    factor_cache: dict[
+        tuple[int, str, torch.dtype],
+        tuple[torch.Tensor, torch.Tensor, float],
+    ] | None = None,
+) -> "AttachedManifoldProbe":
+    """Build an :class:`AttachedManifoldProbe`: node values + share weights + whitened.
+
+    Pre-caches, once at attach, the per-layer reduced ``(K, R)`` node
+    activations (hot-path cdist working space) and the normalized per-layer
+    Mahalanobis-share weights, then the Mahalanobis bundle via
+    :func:`_build_whitened_factors` (the whitener must cover the fit's layers).
+    The share is baked at fit under the same whitener the monitor requires, so
+    it is present for every probed layer; an absent share (CPU stub / partial
+    fit) falls back to uniform weighting via the floor.
+    """
+    if not manifold.layers:
+        raise ValueError(f"manifold {manifold.name!r} carries no fitted layers")
+    if manifold.node_coords.numel() == 0 or not manifold.node_labels:
+        raise ValueError(
+            f"manifold {manifold.name!r} carries no node coords / labels"
+        )
+    node_values_reduced: dict[int, torch.Tensor] = {}
+    share_weights_raw: dict[int, float] = {}
+    coords = manifold.node_coords.to(torch.float32)
+    clamped = manifold.domain.clamp_position(coords)
+    embedded = manifold.domain.embed(clamped)  # (K, m)
+    for layer_idx, sub in manifold.layers.items():
+        sub_f32 = sub.to(device=sub.mean.device, dtype=torch.float32)
+        if sub_f32.is_affine and sub_f32.node_coords is not None:
+            # Flat fit: the per-layer reduced node coords ARE the cdist working
+            # space — analytically ``c_k = node_coords`` in the same M-projected
+            # frame the running-activation query uses.  They're already pruned
+            # in lockstep with a DLS-pruned basis, whereas feeding the shared
+            # (intrinsic_dim) domain layout through ``eval_at`` mis-dimensions a
+            # pruned layer (basis rank R < intrinsic_dim ⇒ ``embedded @ basis``
+            # shape mismatch) *and* conflates the abstract layout frame with the
+            # per-layer activation frame.
+            v_reduced = sub_f32.node_coords.to(torch.float32)  # (K, R)
+        else:
+            embedded_dev = embedded.to(
+                device=sub_f32.mean.device, dtype=torch.float32,
+            )
+            v_world = sub_f32.eval_at(embedded_dev)  # (K, D)
+            v_centered = v_world - sub_f32.mean
+            v_reduced = v_centered @ sub_f32.basis.T  # (K, R)
+        node_values_reduced[layer_idx] = v_reduced.contiguous()
+        share_weights_raw[layer_idx] = float(
+            manifold.mahalanobis_share.get(layer_idx, 0.0)
+        )
+    total = sum(max(_MIN_SHARE_WEIGHT, w) for w in share_weights_raw.values())
+    if total <= 0.0:
+        n_layers = max(1, len(share_weights_raw))
+        share_weights = dict.fromkeys(share_weights_raw, 1.0 / n_layers)
+    else:
+        share_weights = {
+            idx: max(_MIN_SHARE_WEIGHT, w) / total
+            for idx, w in share_weights_raw.items()
+        }
+    probe = AttachedManifoldProbe(
+        name=name,
+        manifold=manifold,
+        top_n=int(top_n),
+        is_affine=_probe_is_affine_for_manifold(manifold),
+        inject_neutral=NEUTRAL_LABEL not in manifold.node_labels,
+        node_values_reduced=node_values_reduced,
+        share_weights=share_weights,
+    )
+    probe.whitened = _build_whitened_factors(
+        whitener, probe, factor_cache=factor_cache,
+    )
+    bw, lvb = _compute_assign_bandwidth(probe, embedded)
+    # Park the soft-assignment factors on the scoring device once (FIX F4), so
+    # the per-token ``probe.assign_bandwidth.to(dist_acc_t.device, fp32)`` in the
+    # curved/gate read is a no-op (``.to`` returns self on a device+dtype match)
+    # rather than a per-token host→device copy of the ``(Kc,)`` tensors.
+    probe_device = next(iter(node_values_reduced.values())).device
+    probe.assign_bandwidth = (
+        bw.to(device=probe_device, dtype=torch.float32) if bw is not None else None
+    )
+    probe.assign_logvol_bias = (
+        lvb.to(device=probe_device, dtype=torch.float32) if lvb is not None else None
+    )
+    # Robust per-probe ``@label`` distance scale: the median of the *node*
+    # bandwidths (``bw`` is candidate-order nodes-then-neutral; the node entries
+    # are each node's nearest-neighbor whitened spacing, share-weighted across
+    # layers).  Median, not per-candidate, so one crowded pair can't make a label
+    # weirdly ungateable; a single scalar, so it rescales the reported distance
+    # without reordering ``nearest``.  K=1 / no bandwidth ⇒ 1.0 (raw distance).
+    n_nodes = len(manifold.node_labels)
+    if bw is not None and bw.numel() >= 1 and n_nodes >= 1:
+        node_bw = bw[:n_nodes] if bw.numel() >= n_nodes else bw
+        if node_bw.numel():
+            probe.label_scale = float(
+                node_bw.median().clamp(min=_FRACTION_EPSILON)
+            )
+    return probe
+
+
+def _compute_assign_bandwidth(
+    probe: "AttachedManifoldProbe", embedded: torch.Tensor,
+) -> "tuple[torch.Tensor | None, torch.Tensor | None]":
+    """Per-candidate ``(τ, −R·log(τ))`` ``(Kc,)`` each, share-weighted.
+
+    ``τ`` is the soft-assignment bandwidth in the **whitened** metric the
+    nearest-node distances use, candidate order = nodes then the neutral anchor
+    (when ``inject_neutral``).  Two sources for ``τ``, per the chosen within-
+    node-thickness variance:
+
+    * **curved + σ-field**: each node's reduced within-node thickness
+      ``σ(z)`` (:meth:`LayerSubspace.sigma_at`) mapped into the whitened metric by
+      the isotropic scale ``√(tr(M_R)/R)`` (``M_R = chol cholᵀ``), so a
+      reduced-space σ is comparable to the chol-whitened distances; the neutral
+      anchor takes the per-layer median node σ.
+    * **flat / no σ-field**: each node's *local layout scale* — its
+      nearest-neighbor distance among the whitened node coords ``node_white`` —
+      so a dense cluster assigns sharply and an isolated node softly; the neutral
+      anchor takes its own nearest-node distance.
+
+    The second return ``−R·log(τ)`` is the precomputed Gaussian log-volume
+    bias for the soft-assignment logit: the proper isotropic R-D Gaussian
+    posterior is ``softmax(−d²/(2τ²) − R·log(τ))`` (the ``−R·log(τ)`` is the
+    log of the normalization ``(2πτ²)^(-R/2)`` with the constant dropped — it
+    cancels in softmax).  Without this term the bare ``−d²/2τ²`` softmax has a
+    *broadest-node-wins* pathology: a wide-``τ`` candidate's logit sits near 0
+    while crisp-``τ`` candidates have strongly-negative logits, so the diffuse
+    node swallows probability regardless of distance.  Precomputed once at
+    attach so the hot path is a single add.  ``R`` is the manifold's per-layer
+    subspace rank (one number per probe — fits are rank-uniform across layers).
+
+    Share-weighted across layers (same weights as every other cross-layer
+    read), floored positive.  Returns ``(None, None)`` for a degenerate
+    manifold (no layers / single node), which leaves the assignment empty
+    without disturbing ``nearest``.
+    """
+    shared = list(probe.manifold.layers.keys())
+    if not shared:
+        return None, None
+    K = probe.node_values_reduced[shared[0]].shape[0]
+    if K < 1:
+        return None, None
+    sw = probe.share_weights
+    acc: torch.Tensor | None = None
+    wsum = 0.0
+    for layer_idx in shared:
+        wh = probe.whitened.get(layer_idx)
+        if wh is None:
+            continue
+        sub = probe.manifold.layers[layer_idx]
+        node_white = wh.node_white.to(torch.float32)        # (K, R)
+        R = int(node_white.shape[1])
+        if (not sub.is_affine) and sub.has_sigma:
+            # σ-field (reduced units) → whitened via the isotropic scale.
+            emb = embedded.to(device=node_white.device, dtype=torch.float32)
+            sig_reduced = sub.sigma_at(emb).reshape(-1).to(torch.float32)  # (K,)
+            m_r = wh.chol @ wh.chol.transpose(-1, -2)        # M_R (R, R)
+            scale = float((torch.diagonal(m_r).sum() / max(R, 1)).clamp(min=1e-12).sqrt())
+            band = sig_reduced * scale                       # (K,) whitened
+            neutral_band = band.median()
+        else:
+            # Local layout scale: each node's nearest-neighbor whitened distance.
+            if K >= 2:
+                dmat = torch.cdist(node_white, node_white)   # (K, K)
+                dmat = dmat + torch.eye(
+                    K, device=dmat.device, dtype=dmat.dtype,
+                ) * 1e9                                       # mask self
+                band = dmat.min(dim=1).values                # (K,)
+            else:
+                band = node_white.new_ones(K)
+            if probe.inject_neutral:
+                nd = torch.linalg.vector_norm(
+                    node_white - wh.neutral_white.reshape(1, -1), dim=-1,
+                )                                            # (K,)
+                neutral_band = nd.min()
+            else:
+                neutral_band = band.median() if K else node_white.new_tensor(1.0)
+        cand = (
+            torch.cat([band, neutral_band.reshape(1)])
+            if probe.inject_neutral else band
+        )                                                    # (Kc,)
+        w = float(sw.get(layer_idx, 0.0))
+        acc = cand * w if acc is None else acc + cand * w
+        wsum += w
+    if acc is None:
+        return None, None
+    if wsum > _MIN_SHARE_WEIGHT:
+        acc = acc / wsum
+    # Floor positive so the softmax denominator never divides by ~0.
+    med = float(acc.median().clamp(min=1e-6))
+    tau = acc.clamp(min=1e-3 * med).to(torch.float32)
+    # Gaussian log-volume bias ``−R·log(τ)`` for the soft-assignment logit.
+    # ``R`` = the manifold's per-layer subspace rank (rank-uniform across a
+    # fit's layers), the effective dimension of the space the bandwidth ``τ``
+    # lives in.  Precomputed here so the hot path adds a single scalar per
+    # candidate with no per-token ``log()``.
+    R = int(next(iter(probe.manifold.layers.values())).rank)
+    logvol_bias = (-float(R) * torch.log(tau)).to(torch.float32)
+    return tau, logvol_bias
+
+
+def _layer_geometry(
+    probe: "AttachedManifoldProbe",
+    layer_idx: int,
+    h: torch.Tensor,
+    sih_cache: dict[int, torch.Tensor] | None = None,
+) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]":
+    """Per-layer readout pieces, shared by the per-token + aggregate paths.
+
+    Returns ``(frac, cdist_query, invert_query, cdist_nodes)``:
+
+    * ``frac`` — scalar tensor in ``[0, 1]``, the whitened **M-orthogonal**
+      in-subspace energy share ``sqrt(gᵀ M_R⁻¹ g) / ‖x‖_M`` with
+      ``g = B Σ⁻¹ x``.
+    * ``cdist_query`` — ``(1, R)`` query (``Lᵀc``) so a plain cdist against
+      ``cdist_nodes`` is the Mahalanobis distance.
+    * ``invert_query`` — ``(R,)`` M-orthogonal projection coords
+      ``c = M_R⁻¹ g`` for :func:`invert_parameterization`.
+    * ``cdist_nodes`` — ``(K, R)`` whitened node coords.
+
+    ``Σ⁻¹h`` depends only on the layer's hidden state + the shared whitener,
+    not on the probe, so within one :meth:`Monitor._score_full` pass (where ``h``
+    is fixed) it is computed once per layer and reused across every curved probe
+    at that layer.  ``sih_cache`` (keyed by ``layer_idx``, valid only for the
+    current ``h``) carries it; on a miss we compute and store it.  The centering
+    is then ``Σ⁻¹(h − mean) = Σ⁻¹h − Σ⁻¹mean = sih − wh.s_mean`` (one subtract,
+    ``_woodbury_apply`` being exactly linear), instead of a full per-probe apply.
+    ``None`` (one-off reads) computes ``Σ⁻¹h`` locally — bit-identical algebra.
+    """
+    wh = probe.whitened.get(layer_idx)
+    if wh is None:
+        raise WhitenerError(
+            f"subspace probe read missing whitened factors for layer "
+            f"{layer_idx}; rebuild the probe (the Euclidean path is gone)"
+        )
+    mean = wh.mean
+    basis = wh.basis
+    x = h - mean
+    # Σ⁻¹h is probe-independent — share it across the layer's curved probes via
+    # the per-pass cache, then center by subtracting the precomputed Σ⁻¹mean.
+    if sih_cache is not None:
+        sih = sih_cache.get(layer_idx)
+        if sih is None:
+            sih = _woodbury_apply(h, wh.X, wh.K_inv, wh.lam)  # Σ⁻¹ h  (D,)
+            sih_cache[layer_idx] = sih
+    else:
+        sih = _woodbury_apply(h, wh.X, wh.K_inv, wh.lam)       # Σ⁻¹ h  (D,)
+    sx = sih - wh.s_mean                  # Σ⁻¹ x = Σ⁻¹h − Σ⁻¹mean  (D,)
+    x_mnorm = torch.sqrt(
+        (x * sx).sum().clamp(min=0.0)
+    ).clamp(min=_FRACTION_EPSILON)
+    g = basis @ sx                       # (R,) = B Σ⁻¹ x
+    c = wh.m_r_inv @ g                   # (R,) = M_R⁻¹ g  (M-proj coords)
+    par_mnorm = torch.sqrt((g * c).sum().clamp(min=0.0))  # ‖P_M x‖_M
+    frac = (par_mnorm / x_mnorm).clamp(min=0.0, max=1.0)
+    cdist_query = (c.reshape(1, -1) @ wh.chol)  # (1, R) — Lᵀc as row
+    return frac, cdist_query, c, wh.node_white

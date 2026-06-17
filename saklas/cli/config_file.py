@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from saklas.core.errors import SaklasError
 
@@ -19,16 +19,9 @@ log = logging.getLogger(__name__)
 _KNOWN_KEYS = {
     "model", "vectors", "thinking",
     "temperature", "top_p", "max_tokens", "system_prompt",
-    "extraction_method",
-    "injection_mode", "theta_max",
-    "projection_metric",
     "compile", "cuda_graphs",
     "return_top_k",
 }
-
-_VALID_EXTRACTION_METHODS = ("dim", "pca")
-_VALID_INJECTION_MODES = ("angular", "additive")
-_VALID_PROJECTION_METRICS = ("mahalanobis", "euclidean")
 
 
 class ConfigFileError(ValueError, SaklasError):
@@ -45,10 +38,6 @@ class ConfigFile:
     top_p: Optional[float] = None
     max_tokens: Optional[int] = None
     system_prompt: Optional[str] = None
-    extraction_method: Optional[str] = None  # "dim" | "pca"; None = use default
-    injection_mode: Optional[str] = None     # "angular" | "additive"; None = default
-    theta_max: Optional[float] = None        # radians; None = default π/2
-    projection_metric: Optional[str] = None  # "mahalanobis" | "euclidean"; None = default
     compile: Optional[bool] = None           # CUDA torch.compile auto-enable; None = default (on)
     cuda_graphs: Optional[bool] = None       # CUDA StaticCache + graph capture; None = default (on)
     # Session-level default for SamplingConfig.return_top_k — the number
@@ -84,12 +73,11 @@ class ConfigFile:
             default = cls.load_default()
             if default is not None:
                 chain.append(default)
-        for p in extra_paths or []:
-            chain.append(cls.load(Path(p)))
+        chain.extend(cls.load(Path(p)) for p in extra_paths or [])
         return compose(chain) if chain else cls()
 
-    def to_dict(self) -> dict:
-        out: dict = {}
+    def to_dict(self) -> dict[str, object]:
+        out: dict[str, object] = {}
         for f in ("model", "thinking", "temperature", "top_p", "max_tokens", "system_prompt"):
             v = getattr(self, f)
             if v is not None:
@@ -144,55 +132,6 @@ class ConfigFile:
                     ) from e
                 vectors = text
 
-        extraction_method = data.get("extraction_method")
-        if extraction_method is not None:
-            if (
-                not isinstance(extraction_method, str)
-                or extraction_method not in _VALID_EXTRACTION_METHODS
-            ):
-                raise ConfigFileError(
-                    f"{path}: extraction_method must be one of "
-                    f"{list(_VALID_EXTRACTION_METHODS)} "
-                    f"(got {extraction_method!r})"
-                )
-
-        injection_mode = data.get("injection_mode")
-        if injection_mode is not None:
-            if (
-                not isinstance(injection_mode, str)
-                or injection_mode not in _VALID_INJECTION_MODES
-            ):
-                raise ConfigFileError(
-                    f"{path}: injection_mode must be one of "
-                    f"{list(_VALID_INJECTION_MODES)} "
-                    f"(got {injection_mode!r})"
-                )
-
-        theta_max = data.get("theta_max")
-        if theta_max is not None:
-            if not isinstance(theta_max, (int, float)) or isinstance(theta_max, bool):
-                raise ConfigFileError(
-                    f"{path}: theta_max must be a number (radians); "
-                    f"got {type(theta_max).__name__} {theta_max!r}"
-                )
-            if theta_max <= 0:
-                raise ConfigFileError(
-                    f"{path}: theta_max must be > 0 (got {theta_max!r})"
-                )
-            theta_max = float(theta_max)
-
-        projection_metric = data.get("projection_metric")
-        if projection_metric is not None:
-            if (
-                not isinstance(projection_metric, str)
-                or projection_metric not in _VALID_PROJECTION_METRICS
-            ):
-                raise ConfigFileError(
-                    f"{path}: projection_metric must be one of "
-                    f"{list(_VALID_PROJECTION_METRICS)} "
-                    f"(got {projection_metric!r})"
-                )
-
         compile_v = data.get("compile")
         if compile_v is not None and not isinstance(compile_v, bool):
             # ``compile: false`` is the documented opt-out; reject ints,
@@ -236,10 +175,6 @@ class ConfigFile:
             top_p=data.get("top_p"),
             max_tokens=data.get("max_tokens"),
             system_prompt=data.get("system_prompt"),
-            extraction_method=extraction_method,
-            injection_mode=injection_mode,
-            theta_max=theta_max,
-            projection_metric=projection_metric,
             compile=compile_v,
             cuda_graphs=cuda_graphs_v,
             return_top_k=return_top_k_v,
@@ -258,8 +193,7 @@ def compose(configs: list[ConfigFile]) -> ConfigFile:
         for f in (
             "model", "thinking", "temperature",
             "top_p", "max_tokens", "system_prompt", "vectors",
-            "extraction_method", "injection_mode", "theta_max",
-            "projection_metric", "compile", "cuda_graphs",
+            "compile", "cuda_graphs",
             "return_top_k",
         ):
             v = getattr(c, f)
@@ -268,10 +202,34 @@ def compose(configs: list[ConfigFile]) -> ConfigFile:
     return out
 
 
-def apply_flag_overrides(cfg_in: ConfigFile, **flags) -> ConfigFile:
+def apply_flag_overrides(cfg_in: ConfigFile, **flags: Any) -> ConfigFile:
     """Return a new ConfigFile with non-None flag values overriding cfg_in."""
     supplied = {k: v for k, v in flags.items() if v is not None}
     return replace(cfg_in, **supplied)
+
+
+def _bare_concept_resolves(concept: str) -> bool:
+    """True when a bare (un-namespaced) concept reference resolves to a manifold.
+
+    Mirrors the steering read path (:mod:`saklas.core.steering_expr`): a bare
+    pole or node label resolves via :func:`resolve_bare_name`, and a composite
+    name (``happy.sad``) resolves to its 2-node ``pca`` manifold via
+    :func:`resolve_manifold_name`.  An ambiguity counts as resolved (the
+    reference matches more than one installed artifact, not zero).
+    """
+    from saklas.io.selectors import (
+        AmbiguousSelectorError,
+        resolve_bare_name,
+        resolve_manifold_name,
+    )
+
+    try:
+        manifold_hit = resolve_bare_name(concept)
+        if manifold_hit is not None:
+            return True
+        return resolve_manifold_name(concept) is not None
+    except AmbiguousSelectorError:
+        return True
 
 
 def ensure_vectors_installed(config: ConfigFile, *, strict: bool) -> list[str]:
@@ -285,27 +243,27 @@ def ensure_vectors_installed(config: ConfigFile, *, strict: bool) -> list[str]:
     on any failure instead.
     """
     from saklas.core.steering_expr import referenced_selectors
-    from saklas.io.paths import concept_dir
-    from saklas.io.packs import materialize_bundled
-    from saklas.io import cache_ops
+    from saklas.io.paths import manifold_dir
+    from saklas.io.manifolds import materialize_bundled_manifolds
+    from saklas.io.templates import materialize_bundled_templates
+    from saklas.io import selectors as _selectors
 
     if config.vectors is None:
         return []
 
+    # Every concept is a manifold (4.0): bundled ones live under
+    # ``manifolds/default/<name>/``.  Materialize them up front so a bare or
+    # ``default/`` reference resolves against the just-dropped folders, and
+    # drop any stale resolver cache so the new folders are seen.  Templates
+    # first — a bundled manifold may ``template_ref`` a bundled template.
+    materialize_bundled_templates()
+    materialize_bundled_manifolds()
+    _selectors.invalidate()
+
     missing: list[str] = []
     for ns, concept, _variant in referenced_selectors(config.vectors):
         if ns is None:
-            from saklas.io.selectors import _all_concepts
-            slug = concept.split(".")[0] if "." in concept else concept
-            matches = [
-                c for c in _all_concepts()
-                if c.name == concept
-                or (
-                    "." in c.name
-                    and slug in c.name.split(".")
-                )
-            ]
-            if matches:
+            if _bare_concept_resolves(concept):
                 continue
             msg = f"vector {concept!r}: must be '<ns>/<name>' (no installed match)"
             if strict:
@@ -314,8 +272,7 @@ def ensure_vectors_installed(config: ConfigFile, *, strict: bool) -> list[str]:
             missing.append(concept)
             continue
         coord = f"{ns}/{concept}"
-        cdir = concept_dir(ns, concept)
-        if cdir.exists():
+        if (manifold_dir(ns, concept) / "manifold.json").exists():
             continue
         if ns == "local":
             msg = f"vector {coord!r}: local namespace, cannot auto-install"
@@ -325,17 +282,16 @@ def ensure_vectors_installed(config: ConfigFile, *, strict: bool) -> list[str]:
             missing.append(coord)
             continue
         if ns == "default":
-            materialize_bundled()
-            if cdir.exists():
-                continue
-            msg = f"vector {coord!r}: bundled concept missing from package data"
+            msg = f"vector {coord!r}: bundled manifold missing from package data"
             if strict:
                 raise ConfigFileError(msg)
             log.warning(msg)
             missing.append(coord)
             continue
         try:
-            cache_ops.install(coord, as_=None, force=False)
+            from saklas.io.hf_manifolds import install_manifold
+            install_manifold(coord, force=False)
+            _selectors.invalidate()
         except Exception as e:
             msg = f"vector {coord!r}: install failed ({e})"
             if strict:

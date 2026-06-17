@@ -179,14 +179,18 @@ def plot_alpha_sweep(
 def plot_probe_correlation(
     profiles: "dict[str, Profile]",
     *,
-    title: str = "Probe correlation (magnitude-weighted cosine)",
+    whitener: "Any | None" = None,
+    title: str = "Probe correlation (Mahalanobis cosine)",
     color_scale: str = "RdBu",
 ) -> "go.Figure":
-    """N×N magnitude-weighted cosine heatmap across profiles.
+    """N×N Mahalanobis-cosine heatmap across profiles.
 
-    Diagonal is 1.0; off-diagonals are ``Profile.cosine_similarity(...)``
-    aggregated across shared layers.  Profiles with no shared layers
-    render as ``NaN`` cells (plotly handles missing values cleanly).
+    Diagonal is 1.0; off-diagonals are ``Profile.cosine_similarity(...,
+    whitener=whitener)`` aggregated across shared layers.  The metric is
+    Mahalanobis-only (the Euclidean path is gone), so ``whitener`` (a
+    :class:`~saklas.core.mahalanobis.LayerWhitener` covering the profiles'
+    layers) is **required** — a missing or non-covering whitener renders the
+    affected cells as ``NaN`` (plotly handles missing values cleanly).
 
     Names are rendered in dict-iteration order along both axes so callers
     can pre-sort by category (e.g. affect/epistemic/...).
@@ -208,12 +212,10 @@ def plot_probe_correlation(
                 matrix[i][j] = 1.0
                 continue
             try:
-                # ``cosine_similarity`` without ``per_layer=`` returns
-                # the magnitude-weighted aggregate ``float`` — narrow
-                # explicitly because the method's union return type is
-                # ``float | dict[int, float]``.
-                agg = profiles[a_name].cosine_similarity(profiles[b_name])
-                cos = float(agg) if isinstance(agg, (int, float)) else float("nan")
+                agg = profiles[a_name].cosine_similarity(
+                    profiles[b_name], whitener=whitener,
+                )
+                cos = float(agg)
             except Exception:
                 cos = float("nan")
             matrix[i][j] = cos
@@ -254,7 +256,7 @@ def plot_layer_norms(
 
     Full resolution — one bar per retained layer.  This is the
     notebook-side counterpart to the TUI's 16-bucket histogram footer
-    and the ``saklas vector why`` output, surfaced here without bucketing
+    and the ``saklas manifold why`` output, surfaced here without bucketing
     so users can see the exact distribution.
     """
     go = _require_plotly()
@@ -306,7 +308,9 @@ def plot_trait_history(
 
     fig = go.Figure()
     for probe_name, r in readings.items():
-        series = list(r.per_generation)
+        # ``ProbeReadings`` is per-axis now; this timeline is a scalar
+        # consumer, so it reads coordinate axis 0 (``mean[0]`` likewise).
+        series = [coord[0] for coord in r.per_generation]
         x = list(range(len(series)))
         fig.add_trace(go.Scatter(
             x=x,
@@ -318,7 +322,7 @@ def plot_trait_history(
         if show_mean and series:
             fig.add_trace(go.Scatter(
                 x=[0, len(series) - 1] if len(series) > 1 else [0, 0],
-                y=[r.mean, r.mean],
+                y=[r.mean[0], r.mean[0]],
                 mode="lines",
                 name=f"{probe_name} mean",
                 line={"dash": "dash"},
@@ -335,5 +339,3 @@ def plot_trait_history(
         legend={"orientation": "h", "y": -0.2},
     )
     return fig
-
-

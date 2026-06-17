@@ -1,9 +1,10 @@
 <script lang="ts">
-  // Workspace rail — the primary navigation surface.  A slim 64px icon
+  // Workspace rail — the primary navigation surface.  A slim 56px icon
   // strip: three category icons, each opening a fly-out list of that
   // category's tools.  This is where the old Topbar "tools ▾" menu's
   // ~19 drawer launchers now live, so the topbar can stay a thin
-  // brand + status strip.
+  // brand + status strip.  Width is sized to fit the longest category
+  // label ("ANALYSIS") at ``--text-2xs`` without right-edge clipping.
   //
   // Fly-outs are ``position: fixed`` (the rail-zone clips overflow) and
   // anchored off the clicked icon's bounding rect.
@@ -26,14 +27,25 @@
 
   const CATEGORIES: Category[] = [
     {
-      key: "vectors",
-      label: "Steering & vectors",
-      icon: "M5 19L19 5M19 5h-7M19 5v7",
+      // The single steering-authoring surface.  Concepts are manifolds
+      // now — a flat (2-node / personas) fit is just a pca manifold — so
+      // there's no separate "subspaces" category and no standalone vector
+      // build/merge form; flat authoring folds into the manifold builder's
+      // pca path.  The catalog is the shared RackDrawer (family-split),
+      // reached from the rack "+" buttons.
+      key: "manifolds",
+      label: "Steering manifolds",
+      // Undulating spline curve — reads as "manifold" and is visually
+      // distinct from analysis' line graph.
+      icon: "M3 17c4-8 6-8 9-4s2 8 9 0",
+      // build authors a fit (pca → flat, spectral/authored → curved);
+      // merge unions discover node corpora; packs + templates are shared
+      // lifecycle surfaces.
       tools: [
-        { label: "load vector…", drawer: "load" },
-        { label: "merge vector…", drawer: "merge" },
-        { label: "clone vector…", drawer: "clone" },
-        { label: "packs…", drawer: "pack" },
+        { label: "build manifold…", drawer: "manifold_builder" },
+        { label: "merge manifolds…", drawer: "manifold_merge" },
+        { label: "packs…", drawer: "manifold_pack" },
+        { label: "templates…", drawer: "template_lab" },
       ],
     },
     {
@@ -155,7 +167,7 @@
   .rail {
     display: flex;
     flex-direction: column;
-    padding: var(--space-5) var(--space-4);
+    padding: var(--space-5) var(--space-2);
     background: var(--bg-deep);
     border-right: 1px solid var(--border);
     min-height: 0;
@@ -170,6 +182,9 @@
   .rail-btn {
     min-height: 3.25rem;
     width: 100%;
+    /* Allow the grid item (label span) to overflow centered without
+     * forcing the cell to grow past the rail's content width. */
+    min-width: 0;
     display: grid;
     place-items: center;
     gap: var(--space-1);
@@ -177,7 +192,7 @@
     border-radius: var(--radius);
     background: transparent;
     color: var(--fg-subtle);
-    padding: var(--space-2) var(--space-1);
+    padding: var(--space-2) 0;
     font-family: var(--font-ui);
     cursor: pointer;
     transition:

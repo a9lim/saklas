@@ -76,21 +76,52 @@ class UnknownVariantError(KeyError, SaklasError):
         return (404, str(msg))
 
 
-class StaleSidecarError(ValueError, SaklasError):
-    """Raised when an extracted tensor's recorded ``statements_sha256``
-    disagrees with the live ``statements.json`` on disk.
-
-    Hand-editing ``statements.json`` after extraction silently invalidates
-    the baked tensor: the contrastive PCA was run against different pairs
-    than the file now contains.  This used to log a warning and proceed;
-    the fail-loud contract makes the staleness an explicit, fixable
-    situation.
-
-    Set ``SAKLAS_ALLOW_STALE=1`` to escape-hatch the check (advanced
-    workflows where stale loads are deliberate, e.g. bisecting a corpus
-    edit).  The remediation in the message names the concrete
-    ``saklas pack refresh`` invocation that fixes the drift.
+class RoleBaselineMismatchWarning(UserWarning):
+    """Warns that a role-augmented steering expression mixes a plain term
+    in.  The plain term's baseline was the family's standard ``assistant``
+    role label; the role-augmented terms substitute a custom role label
+    into the chat-template render.  Composing them is supported but the
+    plain term's baseline doesn't track the substituted role, so the
+    interaction may behave unexpectedly.  The warning fires once per
+    mixed-baseline ``steering()`` scope.
     """
 
+
+class SteeringExprError(ValueError, SaklasError):
+    """Raised when a steering expression string cannot be parsed."""
+
+    def __init__(self, msg: str, *, col: int | None = None) -> None:
+        self.col = col
+        if col is not None:
+            msg = f"{msg} (col {col})"
+        super().__init__(msg)
+
     def user_message(self) -> tuple[int, str]:
-        return (409, str(self) or self.__class__.__name__)
+        return (400, str(self) or self.__class__.__name__)
+
+
+class ManifoldArityError(SteeringExprError):
+    """Raised when a ``%`` manifold position has the wrong number of
+    coordinates for the manifold's domain.
+
+    The grammar collects the position payload but cannot validate arity —
+    it does not know the domain.  ``SteeringManager.add_manifold`` checks
+    the coordinate count against the loaded domain's intrinsic dimension
+    and raises this when they disagree.  The manifold-surface analogue of
+    the vector surface's dedicated selector errors
+    (``AmbiguousSelectorError`` / ``AmbiguousVariantError``); subclasses
+    ``SteeringExprError`` so existing ``except SteeringExprError`` sites
+    still catch it.
+    """
+
+
+class OverlappingManifoldError(SteeringExprError):
+    """Raised when two manifold terms target the same layer.
+
+    Only one manifold may steer a given layer — composing two manifolds at
+    the same layer is the deferred frontier (see
+    ``docs/plans/manifold-composition.md``).  Subclasses
+    ``SteeringExprError`` so existing ``except SteeringExprError`` sites
+    still catch it; the dedicated type lets callers discriminate the
+    overlap failure from a generic parse error.
+    """

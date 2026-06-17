@@ -7,23 +7,66 @@ turns a user-supplied string into the same :class:`Steering` IR.
 Grammar::
 
     expr        := term (("+" | "-") term)*
-    term        := [coeff ["*"]] selector ["@" trigger]
-    selector    := atom (("~" | "|") atom)?
+    term        := [coeff ["*"]] ["!"] selector ["@" trigger]
+    selector    := atom (("~" | "|") atom | "%" position)?
+    position    := signed_num ("," signed_num)* | label   # coord list | node label
+    label       := NAME                                # a manifold node label
     atom        := [ns "/"] NAME ["." NAME] [":" variant]
     trigger     := preset | gate
     preset      := "before" | "after" | "both" | "thinking" | "response"
                  | "prompt" | "generated"
     gate        := "when" ":" probe_atom op NUM
-    probe_atom  := NAME ["." NAME]    # canonical concept (e.g. "angry.calm")
+    probe_atom  := NAME ["." NAME] ["[" INT "]"]       # vector probe (e.g. "angry.calm"),
+                                                       # optional coord-axis index
+                                                       # (e.g. "personas[3]")
+                 | NAME ":" ("fraction" | "membership")  # subspace fraction /
+                                                       # fuzzy tube-fit density
+                 | NAME "@" NAME                       # manifold label similarity (−dist)
+                 | NAME "~" NAME                       # fuzzy soft-assignment prob ∈[0,1]
     op          := ">" | ">=" | "<" | "<="
-    coeff       := signed_float   (optional; defaults to DEFAULT_COEFF = 0.5)
+    coeff       := signed_float ("," signed_float)?  # comma-run of ≤2;
+                                                       # >1 value is valid
+                                                       # ONLY on a "%" term.
+                                                       # 1→along (onto off),
+                                                       # 2→along,onto.
+                                                       # Optional; defaults
+                                                       # to DEFAULT_COEFF = 0.5
     variant     := "raw" | "sae" | "sae-" ID
+                 | "role" | "role-" ID | "from" | "from-" ID
+
+``!`` mean-ablates the selector (``h' = h − α(h·d̂ − μ·d̂)d̂``; bare
+``!x`` is α=1.0); it does not compose with ``~`` / ``|`` / ``%``.  The
+``%`` operator places a generation on a fitted manifold — the
+``position`` is either a comma-separated list of authoring coordinates
+(one per intrinsic dimension) or a single node-label string (sugar for
+that node's coords); the parser only collects the payload, arity /
+label-existence is validated at manifold-load time.
 
 Probe gates (v2.1): ``@when:<probe><op><threshold>`` fires the term only
 on decode steps where the named probe's last reading satisfies the
 comparison.  Implicit ``prompt=False`` (no probe reading during prefill).
 Compose with other windows via the programmatic surface — the v1
 grammar accepts a single ``@`` clause per term.
+
+Manifold-probe gates extend the same shape over the two scalar channels
+:class:`Monitor` exposes: ``@when:<manifold>:fraction <op> N``
+fires on the subspace-fraction reading (the share of the centered
+activation living in the manifold's PCA subspace), and
+``@when:<manifold>@<label> <op> N`` fires on the negated distance to a
+named node (larger = closer; label-similarity gates routinely use
+negative thresholds).  The gate's probe string is stored verbatim
+(``"emotions:fraction"``, ``"emotions@happy"``) so it matches the
+key ``Monitor.flat_scalars`` already merges into
+``TriggerContext.probe_scores``; no runtime gate machinery changes.
+
+Coordinate-axis gates: a vector probe now reads out a coordinate per
+intrinsic axis, so ``@when:<probe>[<i>] <op> N`` gates on one axis of the
+probe's coordinate vector (``@when:personas[3] > 0.4``).  The index is
+appended to the verbatim probe string (``"personas[3]"``) and the session
+writes a matching per-axis scalar channel into ``probe_scores`` for every
+axis, aliasing the bare ``<probe>`` to axis 0 — so an un-indexed gate on a
+2-node concept (``@when:angry.calm > 0.4``) reads its single coordinate
+exactly as before.
 
 Concept names are ASCII identifiers: letter followed by any of
 ``[a-z0-9_-]``.  Multi-word concepts use underscores
@@ -38,6 +81,18 @@ user-supplied coefficient before the term lands in
 ``Steering.alphas``.  Projection terms produce :class:`ProjectedTerm`
 values; the session materializes them into derived profiles on scope
 entry.
+
+Manifold steering: the ``%`` infix operator places a generation at a
+point of a fitted manifold — ``manifold % coord_list``, e.g.
+``0.7 emotions%0.3,0.8,0.0@response``.  The left operand is a manifold name
+(not a concept; no pole resolution), the right is a comma-separated list
+of authoring coordinates — one per intrinsic dimension of the manifold's
+domain.  The parser only collects the coordinate tuple; arity and range
+are validated at manifold-load time, when the domain is known.  A ``%``
+selector does not compose with the ``~`` / ``|`` projection operators or
+with ``!`` ablation.  Manifold terms produce :class:`ManifoldTerm` values;
+the session loads the manifold artifact and the hook does a soft
+subspace-replace.
 """
 from __future__ import annotations
 
@@ -45,21 +100,25 @@ import re
 from dataclasses import dataclass
 from typing import Literal, Optional, TYPE_CHECKING, cast
 
-from saklas.core.errors import SaklasError
+from saklas.core.errors import SteeringExprError
 from saklas.core.triggers import Trigger
 
 if TYPE_CHECKING:
     from saklas.core.steering import AlphaEntry, Steering
 
 
-# Default coefficient when a term omits the explicit number.  Matches the
-# ``recommended_alpha`` field on bundled packs — the observed coherent-α
-# sweet spot post-share-baking.  Future hook: when a per-vector default
-# alpha becomes available on the profile/pack metadata side, ``_fold``
-# should consult it and fall back to this constant.  ``_Term.explicit_coeff``
-# preserves the "user typed a number" signal so that late resolution can
-# tell a defaulted ``honest`` from an explicit ``0.5 honest``.
+# Default coefficient when a term omits the explicit number — the observed
+# coherent-α sweet spot post-share-baking.
 DEFAULT_COEFF = 0.5
+
+# Shared message for the two structurally-parallel "manifold doesn't
+# compose" parse guards (the ``%``-with-projection / second-``%`` guard
+# and the ``!``-with-``%`` guard).  Consolidated so both surfaces report
+# the same constraint in the same words.
+_MANIFOLD_COMPOSE_MSG = (
+    "a manifold term does not compose with projection ('~'/'|') or "
+    "ablation ('!')"
+)
 
 
 # Default coefficient for ablation terms.  Bare ``!x`` means "fully
@@ -114,29 +173,82 @@ class ProjectedTerm:
 class AblationTerm:
     """Mean-replacement ablation entry in ``Steering.alphas``.
 
-    The session resolves ``target`` through the auto-load fast path at
-    ``_SteeringContext`` entry, then hands ``(target_profile, coeff,
-    trigger, layer_means)`` to ``SteeringManager.add_ablation``.  Stored
-    as a value inside ``Steering.alphas``; the key is ``"!<target>"`` so
-    ablation entries never collide with plain-term entries on the same
-    concept.
+    The session lowers an ``AblationTerm`` to an ablate fragment in
+    ``_compose_steering_entries``, which ``synthesize_subspace`` folds into
+    the merged affine subspace (per-axis ``κ = 1`` on the ablation axes),
+    attached via ``SteeringManager.add_subspace``.  Stored as a value inside
+    ``Steering.alphas``; the key is ``"!<target>"`` so ablation entries never
+    collide with plain-term entries on the same concept.
     """
     coeff: float
     trigger: Trigger
     target: str
 
 
-class SteeringExprError(ValueError, SaklasError):
-    """Raised when a steering expression string cannot be parsed."""
+@dataclass(frozen=True)
+class ManifoldTerm:
+    """Manifold-steering entry in ``Steering.alphas``.
 
-    def __init__(self, msg: str, *, col: int | None = None) -> None:
-        self.col = col
-        if col is not None:
-            msg = f"{msg} (col {col})"
-        super().__init__(msg)
+    Produced by a ``manifold % position`` term.  The session loads the
+    named :class:`~saklas.core.manifold.Manifold` artifact on scope entry
+    and hands the hook a per-layer subspace + domain + the authoring
+    ``position`` coords; the hook runs the unified along/onto injection
+    (:func:`~saklas.core.manifold.subspace_inject`).  Stored as a value
+    inside ``Steering.alphas`` under the key ``"<manifold>%<position>"`` so
+    two positions on the same manifold compose as distinct entries and
+    never collide with plain / projected / ablation keys.
 
-    def user_message(self) -> tuple[int, str]:
-        return (400, str(self) or self.__class__.__name__)
+    The two coefficients (each clamped to ``[0, 1]`` at apply time):
+
+    - ``along`` — slide the projected foot toward ``position`` geodesically
+      in coordinate space (the principled "directional" op).
+    - ``onto`` — collapse the off-manifold, in-subspace residual onto the
+      surface (vacuous when the surface fills its subspace).
+
+    The off-*subspace* residual is always kept verbatim; the old third op
+    (``toward``) is removed — its ``~`` / ``|`` semantics are recovered by
+    routing those operators into the merged affine subspace as push/ablation
+    axes instead.
+
+    The grammar's coefficient slot expands to a comma-run of ≤ 2: one coeff
+    ⇒ ``along`` (``onto`` off); two ⇒ ``along, onto``.  ``manifold`` is the
+    registry key — namespace-qualified when the user typed a namespace,
+    variant-suffixed when not ``raw``.
+
+    ``position`` is either:
+
+    - A tuple of authoring coordinates — one float per intrinsic
+      dimension of the manifold's domain (the historical shape, e.g.
+      ``(0.3, 0.8)`` on a 2-D affect manifold).
+    - A node label string — sugar for "the coords of the node labeled
+      <s> on this manifold", resolved at scope entry via
+      :meth:`Manifold.resolve_position`.  The label form makes
+      ``persona%pirate`` a first-class steering term parallel to
+      ``persona%0.3,0.8``.
+
+    Round-trip via :func:`format_expr` preserves the authored form.
+    """
+    along: float
+    onto: float
+    trigger: Trigger
+    manifold: str
+    position: tuple[float, ...] | str
+
+    @property
+    def coeff(self) -> float:
+        """Representative scalar — the ``along`` (directional) coefficient.
+
+        Read by the uniform telemetry / snapshot / role-aggregation sites
+        that want one "how strongly is this term steering" number; ``along``
+        is the directional strength that picks the node, so it is the right
+        representative.  Not a stored field — there is no dual shape.
+        """
+        return self.along
+
+
+# ``SteeringExprError`` lives in :mod:`saklas.core.errors`; it is imported
+# above and re-exported here so
+# ``from saklas.core.steering_expr import SteeringExprError`` keeps working.
 
 
 # ---------------------------------------------------------------- lexer ---
@@ -148,7 +260,8 @@ _IDENT_CHAR_RE = re.compile(r"[A-Za-z0-9_]")
 _SINGLE_CHAR_TOKENS = {
     ".": "DOT", "/": "SLASH", ":": "COLON", "*": "STAR",
     "+": "PLUS", "-": "MINUS", "@": "AT", "~": "TILDE",
-    "|": "ORTHO", "!": "BANG",
+    "|": "ORTHO", "!": "BANG", "%": "PERCENT", ",": "COMMA",
+    "[": "LBRACK", "]": "RBRACK",
 }
 
 # Comparison-op tokens.  Two-char ops (``>=``, ``<=``) take precedence
@@ -241,7 +354,7 @@ def _lex(text: str) -> list[_Tok]:
 class _Atom:
     namespace: Optional[str]
     concept: str  # may contain a single '.' joining two poles
-    variant: str  # 'raw' (default) | 'sae' | 'sae-<release>'
+    variant: str  # 'raw' (default) or an io.selectors tensor variant
     col: int
 
 
@@ -250,6 +363,13 @@ class _Selector:
     base: _Atom
     operator: Optional[str]  # None | '~' | '|'
     onto: Optional[_Atom]
+    # Set when the selector is a manifold position term
+    # (``base % NUM (, NUM)*``); mutually exclusive with
+    # ``operator`` / ``onto``.
+    # ``tuple[float, ...]`` for coord-form (``%0.3,0.8``); ``str`` for
+    # label-form (``%pirate``).  ``None`` when this selector is not a
+    # manifold term.
+    manifold_position: Optional[tuple[float, ...] | str] = None
 
 
 @dataclass
@@ -262,11 +382,18 @@ class _Term:
     # produce a ``Trigger(prompt=False, gate=ProbeGate(...))`` directly
     # at parse time.  Rendered back to canonical form by ``_fmt_*``.
     trigger: Optional[Trigger]
-    # True iff the user typed a numeric coefficient; False when the parser
-    # substituted ``DEFAULT_COEFF``.  Internal — lets a future resolver step
-    # swap in per-vector defaults without re-parsing the expression.
-    explicit_coeff: bool
     ablation: bool = False  # True iff term was prefixed with `!`
+    # The full comma-run of coefficients the user typed.  A plain term
+    # carries a 1-tuple; a manifold ``%`` term may carry up to 2 mapping
+    # to (along, onto) via :func:`_expand_along_onto_coeffs`.
+    # ``coeff`` always equals ``coeffs[0]`` (the representative scalar all
+    # non-manifold code paths read), so existing single-coeff behavior is
+    # bit-identical; ``> 1`` on a non-manifold term is a parse-fold error.
+    coeffs: tuple[float, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.coeffs:
+            self.coeffs = (self.coeff,)
 
 
 # --------------------------------------------------------------- parser ---
@@ -319,9 +446,30 @@ class _Parser:
     def _term(self, sign: int) -> _Term:
         explicit = False
         coeff = float(sign) * DEFAULT_COEFF
+        coeffs: tuple[float, ...] = (coeff,)
         if self._peek().kind == "NUM":
             coeff = float(sign) * float(self._consume().value)
             explicit = True
+            # Comma-run of coefficients: the TERM-level coeff slot may carry
+            # up to 2 values mapping to (along, onto) on a manifold ``%``
+            # term.  This run is lexically unambiguous from the post-``%``
+            # position commas — those follow the manifold IDENT and ``%``,
+            # this precedes the selector.  Each subsequent value carries the
+            # term's leading sign (so ``-0.6,0.3`` is ``(-0.6, -0.3)``, the
+            # natural read of a signed term).  A 3rd value is a parse error;
+            # whether a comma-run is even legal for the selector kind
+            # (manifold-only) is enforced in ``_fold``.
+            run = [coeff]
+            while self._peek().kind == "COMMA":
+                self._consume()
+                run.append(float(sign) * self._signed_num())
+                if len(run) > 2:
+                    raise SteeringExprError(
+                        "a manifold coefficient slot takes at most 2 "
+                        "comma-separated values (along, onto); got more",
+                        col=self._peek(-1).col,
+                    )
+            coeffs = tuple(run)
             if self._peek().kind == "STAR":
                 self._consume()
         ablation = False
@@ -331,6 +479,7 @@ class _Parser:
             if not explicit:
                 # Bare `!x` defaults to fully-replace (coeff=1.0).
                 coeff = float(sign) * DEFAULT_ABLATION_COEFF
+                coeffs = (coeff,)
         selector = self._selector()
         trigger: Trigger | None = None
         if self._peek().kind == "AT":
@@ -364,28 +513,120 @@ class _Parser:
                 )
         return _Term(
             coeff=coeff, selector=selector, trigger=trigger,
-            explicit_coeff=explicit, ablation=ablation,
+            ablation=ablation, coeffs=coeffs,
         )
 
     def _parse_when_gate(self, when_col: int) -> Trigger:
         """Parse the ``when:`` payload into a probe-gated :class:`Trigger`.
 
-        Already consumed: ``@`` ``when`` ``:``.  Expects the probe
-        identifier (with optional ``.<pole>`` for bipolar concepts), one
-        of ``>``/``>=``/``<``/``<=``, then a numeric threshold.
+        Already consumed: ``@`` ``when`` ``:``.  Expects a probe
+        identifier, one of ``>``/``>=``/``<``/``<=``, then a numeric
+        threshold.
 
-        Probe atoms are simple identifiers — no namespace prefix in v2.1
-        (the monitor is keyed by canonical concept name regardless of
-        which pack the probe came from).  No SAE variant suffix
-        either: gates fire on the live monitor reading, which is
-        already a single number per probe, not a per-variant tensor.
+        Three probe identifier shapes are accepted:
+
+        - Vector probe: ``IDENT`` optionally followed by ``.IDENT`` for
+          a bipolar concept (e.g. ``angry.calm``), and an optional
+          ``[<i>]`` coordinate-axis index (e.g. ``personas[3]``,
+          ``angry.calm[0]``).  No namespace prefix in v2.1 (the monitor
+          is keyed by canonical concept name regardless of which pack the
+          probe came from), and no SAE variant suffix.  The index selects
+          one axis of the probe's coordinate readout; an un-indexed gate
+          reads axis 0 (the only axis of a 2-node concept), so existing
+          ``@when:angry.calm>0.4`` gates are unchanged.
+        - Manifold subspace-fraction probe:
+          ``<manifold>:fraction`` — fires on the fraction of the
+          centered activation that lives in the manifold's PCA
+          subspace.  Stored verbatim as the gate's probe string
+          (e.g. ``"emotions:fraction"``); the session's
+          :class:`Monitor.flat_scalars` already emits a
+          matching namespaced key, so ``Trigger.active`` looks it up
+          unchanged.
+        - Manifold label-similarity probe:
+          ``<manifold>@<label>`` — fires on the negated distance to
+          the named node (larger = closer).  Stored verbatim as the
+          gate's probe string (e.g. ``"emotions@happy"``); same
+          ``flat_scalars`` correspondence.
+
+        The discriminator on the trailing IDENT: a ``COLON`` after the
+        manifold name routes to the fraction form, an ``AT`` to the
+        label form, a ``DOT`` to the bipolar vector form, anything
+        else is a plain vector probe.  Within the ``when:`` body the
+        ``AT`` token cannot be a fresh trigger marker (one ``@`` clause
+        per term, already consumed), so the disambiguation is
+        unambiguous.
         """
         probe_tok = self._expect("IDENT")
         probe = str(probe_tok.value)
-        if self._peek().kind == "DOT":
+        nxt = self._peek().kind
+        if nxt == "COLON":
+            # Manifold subspace-fraction gate: ``<manifold>:fraction``.
+            # The suffix after the colon must be the literal slug
+            # ``fraction`` — the only fraction-channel scalar
+            # ``Monitor.flat_scalars`` emits.  Any other slug
+            # would silently never match a probe score, so we surface
+            # the typo here rather than letting the gate report
+            # inactive forever.
             self._consume()
-            rhs = self._expect("IDENT")
-            probe = f"{probe}.{rhs.value}"
+            suffix_tok = self._expect("IDENT")
+            suffix = str(suffix_tok.value)
+            # ``fraction`` (subspace energy share) and ``membership`` (the
+            # fuzzy-manifold tube-fit density ∈ [0,1]) are the two scalar
+            # ``:``-channels ``Monitor.flat_scalars`` emits.
+            if suffix not in ("fraction", "membership"):
+                raise SteeringExprError(
+                    f"unknown manifold gate channel "
+                    f"'{probe}:{suffix}'; expected "
+                    f"'<manifold>:fraction', '<manifold>:membership', "
+                    f"'<manifold>@<label>', or '<manifold>~<label>'",
+                    col=suffix_tok.col,
+                )
+            probe = f"{probe}:{suffix}"
+        elif nxt == "AT":
+            # Manifold label-similarity gate: ``<manifold>@<label>``.
+            # Label existence is not validated at parse time — the
+            # manifold artifact may not be loaded yet, and a stale
+            # gate against a removed label should report inactive (no
+            # matching key in ``flat_scalars``), not raise.
+            self._consume()
+            label_tok = self._expect("IDENT")
+            probe = f"{probe}@{label_tok.value}"
+        elif nxt == "TILDE":
+            # Fuzzy-manifold soft-assignment gate: ``<manifold>~<label>`` —
+            # fires on the node's assignment *probability* ∈ [0,1] (the
+            # normalized counterpart to the ``@<label>`` negated distance).
+            # Same verbatim-storage / ``flat_scalars`` correspondence; label
+            # existence unvalidated at parse time (stale → inactive, not raise).
+            self._consume()
+            label_tok = self._expect("IDENT")
+            probe = f"{probe}~{label_tok.value}"
+        else:
+            if nxt == "DOT":
+                self._consume()
+                rhs = self._expect("IDENT")
+                probe = f"{probe}.{rhs.value}"
+            # Optional coordinate-axis index for a multi-axis probe:
+            # ``personas[3]`` / ``angry.calm[0]``.  Selects one axis of the
+            # probe's coordinate readout.  The session writes a matching
+            # ``<probe>[<i>]`` scalar channel into ``probe_scores`` for
+            # every coord axis, and aliases the bare ``<probe>`` to axis 0,
+            # so an un-indexed gate on a 2-node concept reads its single
+            # coordinate exactly as before.  Indexing is not accepted after
+            # the ``:fraction`` / ``@label`` manifold channels — those are
+            # already scalar.
+            if self._peek().kind == "LBRACK":
+                self._consume()
+                idx_tok = self._expect("NUM")
+                idx_val = float(idx_tok.value)
+                idx = int(idx_val)
+                if idx_val != idx or idx < 0:
+                    raise SteeringExprError(
+                        f"coordinate index must be a non-negative integer, "
+                        f"got '{idx_tok.value}'",
+                        col=idx_tok.col,
+                    )
+                self._expect("RBRACK")
+                probe = f"{probe}[{idx}]"
         op_tok = self._consume()
         op_kind = op_tok.kind
         if op_kind not in ("GT", "GTE", "LT", "LTE"):
@@ -396,8 +637,12 @@ class _Parser:
             )
         op_str = {"GT": ">", "GTE": ">=", "LT": "<", "LTE": "<="}[op_kind]
         # Allow a leading ``-`` on the threshold so ``@when:x>-0.5``
-        # parses as ``threshold = -0.5``.  Comparison-op token already
-        # consumed; the next token may be MINUS or NUM.
+        # parses as ``threshold = -0.5``.
+        threshold = self._signed_num()
+        return Trigger.when(probe, op_str, threshold)  # pyright: ignore[reportArgumentType]  # dict[str,str] widens the literal op value; runtime is always a valid ProbeGateOp
+
+    def _signed_num(self) -> float:
+        """Parse an optionally signed numeric literal: ``[+|-] NUM``."""
         sign = +1.0
         if self._peek().kind == "MINUS":
             self._consume()
@@ -405,11 +650,47 @@ class _Parser:
         elif self._peek().kind == "PLUS":
             self._consume()
         num_tok = self._expect("NUM")
-        threshold = sign * float(num_tok.value)
-        return Trigger.when(probe, op_str, threshold)  # type: ignore[arg-type]
+        return sign * float(num_tok.value)
 
     def _selector(self) -> _Selector:
         base = self._atom()
+        if self._peek().kind == "PERCENT":
+            # Manifold position term: ``base % NUM(,NUM)*`` (coord form)
+            # OR ``base % IDENT`` (label form, sugar for "the coords of
+            # the node labeled <s>"; resolved at scope entry).  The
+            # parser only collects the position payload — arity (against
+            # the domain's intrinsic dimension) for the coord form, and
+            # label existence + role-paired lookup for the label form,
+            # are checked at manifold-load time when both the domain
+            # and the node labels are known.
+            self._consume()
+            head = self._peek()
+            position: tuple[float, ...] | str
+            if head.kind == "IDENT":
+                # Label form: a single bare identifier.  No comma list
+                # — a manifold node label is one slug, not a tuple.
+                # Variant suffixes (``%pirate:role-pirate``) are not
+                # meaningful on a position and so not part of the
+                # grammar; if the user typed one, it lexed as a
+                # separate ``:`` token and will fall out as a parse
+                # error on the trailing arm below.
+                tok = self._consume()
+                position = str(tok.value)
+            else:
+                coords: list[float] = [self._signed_num()]
+                while self._peek().kind == "COMMA":
+                    self._consume()
+                    coords.append(self._signed_num())
+                position = tuple(coords)
+            if self._peek().kind in ("TILDE", "ORTHO", "PERCENT"):
+                raise SteeringExprError(
+                    _MANIFOLD_COMPOSE_MSG,
+                    col=self._peek().col,
+                )
+            return _Selector(
+                base=base, operator=None, onto=None,
+                manifold_position=position,
+            )
         if self._peek().kind in ("TILDE", "ORTHO"):
             op_tok = self._consume()
             op = "~" if op_tok.kind == "TILDE" else "|"
@@ -576,12 +857,207 @@ def _merge_ablation(
     )
 
 
+def _resolve_manifold_atom(atom: _Atom) -> str:
+    """Return the registry key for a manifold atom.
+
+    Unlike :func:`_resolve_atom`, manifold atoms do *not* go through
+    ``resolve_pole`` — a manifold name is not a concept and must not
+    alias to one.  The key is the bare name, namespace-prefixed only when
+    the user typed a namespace, variant-suffixed when not ``raw``.
+    """
+    key = atom.concept
+    if atom.namespace is not None:
+        key = f"{atom.namespace}/{key}"
+    return _with_variant(key, atom.variant)
+
+
+def _fmt_position(position: tuple[float, ...] | str) -> str:
+    """Render a manifold position payload back to grammar form.
+
+    Coord tuple → comma-joined ``%g`` list (``0.3,0.8``).  Label string
+    → the slug verbatim (``pirate``).  The two forms are unambiguous
+    by shape — a node label is a slug-shaped identifier, a coord list
+    starts with a digit / sign.
+    """
+    if isinstance(position, str):
+        return position
+    return ",".join(f"{c:g}" for c in position)
+
+
+def _expand_along_onto_coeffs(
+    coeffs: tuple[float, ...],
+) -> tuple[float, float]:
+    """Map a 1/2-length coefficient run to ``(along, onto)``.
+
+    The manifold ``%`` coefficient slot expands a comma-run with the
+    collapse op (``onto``) defaulting **off** — it is opted into:
+
+    - ``c`` → ``along = c, onto = 0``  (pure directional slide)
+    - ``a, o`` → ``along = a, onto = o``
+
+    ``along`` is *the* steering knob: it slides the projected foot toward
+    the target on the manifold and keeps everything else.  ``onto`` (flatten
+    the off-manifold in-subspace residual) is aggressive and so off by
+    default.  The off-*subspace* residual is always kept verbatim — the old
+    third op (``toward``) that scaled it is removed.
+
+    A run of length 0 or > 2 is a programming error here — the parser
+    rejects the 3-coeff case at parse time and a term always carries at
+    least one coeff — but raise rather than index blindly.
+    """
+    n = len(coeffs)
+    if n == 1:
+        return (coeffs[0], 0.0)
+    if n == 2:
+        a, o = coeffs
+        return (a, o)
+    raise SteeringExprError(
+        "a manifold coefficient slot takes 1 or 2 comma-separated "
+        f"values (along, onto); got {n}"
+    )
+
+
+def _merge_manifold(
+    alphas: "dict[str, AlphaEntry]",
+    manifold: str,
+    coeffs: tuple[float, float],
+    position: tuple[float, ...] | str,
+    trig: Trigger,
+) -> None:
+    along, onto = coeffs
+    key = f"{manifold}%{_fmt_position(position)}"
+    if key not in alphas:
+        alphas[key] = ManifoldTerm(
+            along=along, onto=onto,
+            trigger=trig, manifold=manifold, position=position,
+        )
+        return
+    existing = alphas[key]
+    if not isinstance(existing, ManifoldTerm):
+        raise SteeringExprError(  # pragma: no cover — key namespace is disjoint
+            f"manifold '{key}' conflicts with a non-manifold entry"
+        )
+    if existing.trigger != trig:
+        raise SteeringExprError(
+            f"manifold '{key}' appears with conflicting "
+            f"triggers; merge triggers explicitly or split into separate "
+            f"Steering entries"
+        )
+    alphas[key] = ManifoldTerm(
+        along=existing.along + along,
+        onto=existing.onto + onto,
+        trigger=trig, manifold=manifold, position=position,
+    )
+
+
 def _fold(terms: list[_Term], *, namespace: Optional[str]) -> "Steering":
     from saklas.core.steering import Steering
 
     alphas: "dict[str, AlphaEntry]" = {}
     for term in terms:
         sel = term.selector
+        # Manifold position terms resolve before ``_resolve_atom`` — a
+        # manifold name must not run through concept pole-resolution.
+        if sel.manifold_position is not None:
+            if term.ablation:
+                raise SteeringExprError(_MANIFOLD_COMPOSE_MSG)
+            mfld_key = _resolve_manifold_atom(sel.base)
+            mfld_trig = (
+                term.trigger if term.trigger is not None else Trigger.BOTH
+            )
+            _merge_manifold(
+                alphas, mfld_key,
+                _expand_along_onto_coeffs(term.coeffs),
+                sel.manifold_position, mfld_trig,
+            )
+            continue
+        # Bare-name manifold-label tier (Phase C.2), tried FIRST for a
+        # plain term whose base is a bare slug (no namespace, no variant
+        # suffix, no bipolar ``.``, no projection / ablation): if the slug
+        # matches a manifold's node label, synthesize a label-form
+        # ManifoldTerm at that node instead of treating the slug as a fresh
+        # vector concept.  ``resolve_bare_name`` arbitrates only cross-
+        # *manifold* label collisions (raising ``AmbiguousSelectorError``);
+        # it knows nothing of poles.  A miss falls through to the
+        # composite-name tier (``resolve_manifold_name``) and then the
+        # ``resolve_pole`` canonicalization below — every bipolar pole is
+        # itself a node label, so a bare pole resolves here as an affine
+        # ``%`` push.
+        if (
+            sel.operator is None
+            and not term.ablation
+            and sel.base.variant == "raw"
+            and sel.base.namespace is None
+            and "." not in sel.base.concept
+        ):
+            from saklas.io.selectors import (
+                AmbiguousSelectorError,
+                resolve_bare_name,
+            )
+            try:
+                manifold_hit = resolve_bare_name(
+                    sel.base.concept, namespace=namespace,
+                )
+            except AmbiguousSelectorError:
+                raise
+            except Exception:
+                # Errors fall through to the historical resolve_pole
+                # path below; if the same error is genuine, it raises
+                # there with the canonical surface message.
+                manifold_hit = None
+            if manifold_hit is not None:
+                mfld_trig = (
+                    term.trigger if term.trigger is not None else Trigger.BOTH
+                )
+                _merge_manifold(
+                    alphas, manifold_hit.manifold_key,
+                    _expand_along_onto_coeffs(term.coeffs),
+                    manifold_hit.label, mfld_trig,
+                )
+                continue
+        # Composite-name manifold tier (4.0 step 6b): a plain term whose
+        # base names a 2-node ``pca`` manifold (``happy.sad`` — the ``.``
+        # makes it skip the bare-label tier above) steers toward node 0,
+        # the ``orient_to=0`` (+) pole — the steering-vector composite read
+        # path.  ``resolve_manifold_name`` returns None when no such manifold
+        # exists, so a genuine vector concept falls through unchanged.
+        if (
+            sel.operator is None
+            and not term.ablation
+            and sel.base.variant == "raw"
+        ):
+            from saklas.io.selectors import (
+                AmbiguousSelectorError,
+                resolve_manifold_name,
+            )
+            ns_scope = sel.base.namespace or namespace
+            try:
+                name_hit = resolve_manifold_name(
+                    sel.base.concept, namespace=ns_scope,
+                )
+            except AmbiguousSelectorError:
+                raise
+            except Exception:
+                name_hit = None
+            if name_hit is not None:
+                mfld_trig = (
+                    term.trigger if term.trigger is not None else Trigger.BOTH
+                )
+                _merge_manifold(
+                    alphas, name_hit.manifold_key,
+                    _expand_along_onto_coeffs(term.coeffs),
+                    name_hit.pole_label, mfld_trig,
+                )
+                continue
+        # Past this point the term is unambiguously a vector (plain /
+        # projection / ablation) — the comma-separated coefficient run is a
+        # manifold-``%``-only construct, so reject it here rather than
+        # silently dropping the extra values.
+        if len(term.coeffs) > 1:
+            raise SteeringExprError(
+                "comma-separated coefficients are only valid for "
+                "`manifold % position` terms"
+            )
         base_key, base_sign = _resolve_atom(sel.base, namespace)
         coeff = term.coeff * base_sign
         # ``_Term.trigger`` already carries a resolved Trigger object
@@ -652,6 +1128,9 @@ def format_expr(steering: "Steering") -> str:
         if isinstance(val, ProjectedTerm):
             parts.append(_fmt_projected(val))
             continue
+        if isinstance(val, ManifoldTerm):
+            parts.append(_fmt_manifold(val))
+            continue
         if isinstance(val, tuple):
             coeff, trig = float(val[0]), val[1]
         else:
@@ -691,6 +1170,30 @@ def _fmt_ablation(a: AblationTerm) -> str:
         body = f"{a.coeff:g} !{a.target}"
     if a.trigger != Trigger.BOTH:
         body += "@" + _trigger_name(a.trigger)
+    return body
+
+
+def _fmt_manifold(m: ManifoldTerm) -> str:
+    # Render the shortest coefficient form the (along, onto) pair collapses
+    # to — the inverse of ``_expand_along_onto_coeffs`` — so the round-trip is
+    # byte-for-byte.  The collapse op defaults off, so: onto zero → one coeff
+    # (along); else two (along, onto).
+    #
+    # The parser applies the term's *leading* sign (carried by ``along``) to
+    # every value in the comma-run (``-0.6,0.3`` parses as ``(-0.6, -0.3)``),
+    # so to make a programmatically-built mixed-sign term round-trip we render
+    # ``onto`` *relative to* ``along``'s sign: literal = onto·sign(along), which
+    # the parser then re-multiplies by sign(along) back to ``onto``.  For the
+    # parser's own output (where the whole run shares one sign) this is a no-op.
+    pos = _fmt_position(m.position)
+    if m.onto == 0.0:
+        coeff_str = f"{m.along:g}"
+    else:
+        onto_lit = -m.onto if m.along < 0 else m.onto
+        coeff_str = f"{m.along:g},{onto_lit:g}"
+    body = f"{coeff_str} {m.manifold}%{pos}"
+    if m.trigger != Trigger.BOTH:
+        body += "@" + _trigger_name(m.trigger)
     return body
 
 
@@ -738,6 +1241,7 @@ def referenced_selectors(
     Walks the AST before pole resolution so namespace prefixes survive —
     useful at install time, when the CLI needs to know which pack to fetch
     for each atom.  Projection terms contribute two entries (base + onto).
+    Manifold terms are skipped — a manifold name is not a concept.
     """
     if not text or not text.strip():
         return []
@@ -746,6 +1250,8 @@ def referenced_selectors(
     out: list[tuple[Optional[str], str, str]] = []
     for term in terms:
         sel = term.selector
+        if sel.manifold_position is not None:
+            continue
         out.append((sel.base.namespace, sel.base.concept, sel.base.variant))
         if sel.onto is not None:
             out.append((sel.onto.namespace, sel.onto.concept, sel.onto.variant))
@@ -756,6 +1262,7 @@ __all__ = [
     "DEFAULT_COEFF",
     "DEFAULT_ABLATION_COEFF",
     "AblationTerm",
+    "ManifoldTerm",
     "ProjectedTerm",
     "SteeringExprError",
     "parse_expr",

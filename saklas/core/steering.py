@@ -31,20 +31,27 @@ from typing import Mapping, TYPE_CHECKING, Union
 from saklas.core.triggers import Trigger
 
 if TYPE_CHECKING:
-    from saklas.core.steering_expr import AblationTerm, ProjectedTerm
+    from saklas.core.steering_expr import (
+        AblationTerm,
+        ManifoldTerm,
+        ProjectedTerm,
+    )
 
 #: Accepted shapes for a single entry in ``Steering.alphas`` — a bare
 #: alpha (inherits ``Steering.trigger``), a ``(alpha, Trigger)`` tuple for
 #: a per-entry trigger override, a
 #: :class:`~saklas.core.steering_expr.ProjectedTerm` for runtime
-#: projection (materialized into a derived profile by the session), or
-#: an :class:`~saklas.core.steering_expr.AblationTerm` for
-#: mean-replacement ablation.
+#: projection (materialized into a derived profile by the session), an
+#: :class:`~saklas.core.steering_expr.AblationTerm` for mean-replacement
+#: ablation, or a :class:`~saklas.core.steering_expr.ManifoldTerm` for
+#: spline-based manifold steering (resolved into a loaded manifold
+#: artifact by the session).
 AlphaEntry = Union[
     float,
     "tuple[float, Trigger]",
     "ProjectedTerm",
     "AblationTerm",
+    "ManifoldTerm",
 ]
 
 
@@ -62,36 +69,20 @@ class Steering:
         ``Trigger.BOTH`` — steer every token.  Entries given as
         ``(alpha, Trigger)`` tuples ignore this default; projection
         entries carry their own trigger inside the ``ProjectedTerm``.
-    injection_mode: per-call override for the steering math.
-        ``"angular"`` rotates the residual toward the concept direction;
-        ``"additive"`` is the legacy v1.x add-and-rescale path.  ``None``
-        (default) inherits the session-level setting passed to
-        :class:`SaklasSession`.  Programmatic only — the canonical
-        expression grammar does not (yet) round-trip this field.
-    theta_max: per-call override for the angular rotation cap (radians).
-        Defaults to the session value (``π/2`` unless overridden).  Has
-        no effect under ``injection_mode="additive"``.
-    projection_metric: per-call override for the metric used when
-        materializing ``~`` / ``|`` projection terms.  ``"mahalanobis"``
-        uses the closed-form LEACE projector against the session's
-        :class:`~saklas.core.mahalanobis.LayerWhitener` (default since
-        v2.1 — provably erases linearly-decodable information along
-        ``onto`` from ``base``).  ``"euclidean"`` is plain Gram-Schmidt
-        (the v2.0/v2.1 behavior).  ``None`` (default) inherits the
-        session-level setting.  Programmatic only — the canonical
-        expression grammar does not (yet) round-trip this field.
+
+    ``~`` / ``|`` projection terms always materialize through the
+    closed-form LEACE projector against the session's
+    :class:`~saklas.core.mahalanobis.LayerWhitener` — there is no
+    Euclidean path and no per-call metric override.
     """
 
     alphas: Mapping[str, AlphaEntry]
     thinking: bool | None = None
     trigger: Trigger = Trigger.BOTH
-    injection_mode: str | None = None
-    theta_max: float | None = None
-    projection_metric: str | None = None
 
     @classmethod
     def from_value(
-        cls, value: "str | Steering | None",
+        cls, value: object,
     ) -> "Steering | None":
         """Coerce a string / Steering / None into a Steering or None.
 
@@ -110,7 +101,7 @@ class Steering:
             return parse_expr(value)
         raise TypeError(
             f"Steering.from_value expects str | Steering | None, "
-            f"got {type(value).__name__}"  # pyright: ignore[reportUnreachable]
+            f"got {type(value).__name__}"
         )
 
     def normalized_entries(self) -> "dict[str, tuple[float, Trigger]]":
@@ -124,16 +115,21 @@ class Steering:
         downstream of pole resolution works in this shape.  Synthetic
         projection keys (``"<base><op><onto>"``) pass through verbatim;
         the session is responsible for materializing the derived profile
-        before the manager sees the key.  ``AblationTerm`` values are
-        skipped — ablation is dispatched directly off ``Steering.alphas``
-        at the session layer rather than through this flattened view.
+        before the manager sees the key.  ``AblationTerm`` and
+        ``ManifoldTerm`` values are skipped — ablation and manifold
+        steering are dispatched directly off ``Steering.alphas`` at the
+        session layer rather than through this flattened view.
         """
-        from saklas.core.steering_expr import AblationTerm, ProjectedTerm
+        from saklas.core.steering_expr import (
+            AblationTerm,
+            ManifoldTerm,
+            ProjectedTerm,
+        )
 
         out: dict[str, tuple[float, Trigger]] = {}
         default = self.trigger
         for name, val in self.alphas.items():
-            if isinstance(val, AblationTerm):
+            if isinstance(val, (AblationTerm, ManifoldTerm)):
                 continue
             if isinstance(val, ProjectedTerm):
                 out[name] = (float(val.coeff), val.trigger)
