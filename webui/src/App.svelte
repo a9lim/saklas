@@ -13,7 +13,6 @@
   import Toaster from "./lib/Toaster.svelte";
 
   import * as Drawers from "./drawers";
-  import TokenDrilldownDrawer from "./drawers/TokenDrilldownDrawer.svelte";
 
   import {
     bootstrap,
@@ -235,7 +234,7 @@
           {:else if drawerState.open === "export"}
             <Drawers.Export params={drawerState.params} />
           {:else if drawerState.open === "token_drilldown"}
-            <TokenDrilldownDrawer params={drawerState.params} />
+            <Drawers.TokenDrilldown params={drawerState.params} />
           {:else if drawerState.open === "correlation"}
             <Drawers.Correlation params={drawerState.params} />
           {:else if drawerState.open === "layer_norms"}

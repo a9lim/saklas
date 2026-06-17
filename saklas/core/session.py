@@ -4514,6 +4514,15 @@ class SaklasSession:
             R = len(axes)
             hist = [tuple(float(c) for c in coords)
                     for coords in self._monitor.history.get(name, [])]
+            # An empty reading is accumulated as the rank-1 ``(0.0,)`` fallback
+            # (monitor ``_apply_accumulate``), while ``axes`` grows to the max
+            # rank a probe ever saw — so a probe that yields both an empty and a
+            # full reading leaves ``hist`` ragged.  Pad short rows to ``R`` (zeros
+            # match the axis-0 empty fallback) so the per-axis delta never
+            # over-indexes and ``per_generation`` stays uniform-width.
+            if any(len(row) < R for row in hist):
+                hist = [row + (0.0,) * (R - len(row)) if len(row) < R else row
+                        for row in hist]
             means = tuple(a["sum"] / count for a in axes)
             stds = tuple(
                 max(0.0, a["sum_sq"] / count - (a["sum"] / count) ** 2) ** 0.5

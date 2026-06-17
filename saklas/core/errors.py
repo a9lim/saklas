@@ -125,21 +125,3 @@ class OverlappingManifoldError(SteeringExprError):
     still catch it; the dedicated type lets callers discriminate the
     overlap failure from a generic parse error.
     """
-
-
-class StaleSidecarError(ValueError, SaklasError):
-    """Raised when an extracted tensor's recorded corpus hash disagrees with disk.
-
-    Historical profile sidecars used ``statements_sha256`` over a legacy
-    ``statements.json`` pack; manifold tensors now use ``nodes_sha256`` over the
-    node corpus and geometry. In both cases, hand-editing the corpus after
-    extraction invalidates the tensor, so the stale-load path remains fail-loud.
-
-    Set ``SAKLAS_ALLOW_STALE=1`` to escape-hatch the check (advanced
-    workflows where stale loads are deliberate, e.g. bisecting a corpus
-    edit). The remediation should name the concrete refit/refresh command for
-    the artifact that drifted.
-    """
-
-    def user_message(self) -> tuple[int, str]:
-        return (409, str(self) or self.__class__.__name__)

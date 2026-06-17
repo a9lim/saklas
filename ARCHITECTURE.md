@@ -634,8 +634,8 @@ All subspace arithmetic runs in reduced (R-dim) coordinates; because `basis` is
 orthonormal, `‖H_n_reduced‖ = ‖H_n‖` exactly, so the cost is O(R) not O(D). fp32
 throughout. Order is fixed **along → onto** (the transport must precede `onto`
 scaling the transported residual). A soft cap `‖h_new‖ ≤ norm_cap·‖h‖`
-(`norm_cap = 3.0`) is the only norm guard — `onto` is *meant* to shrink
-`‖h − mean‖`, so there is no global norm preservation.
+(`norm_cap = 3.0`) is the only norm guard on this curved path — `onto` is *meant*
+to shrink `‖h − mean‖`, so there is no global norm preservation.
 
 **Flat (affine) shortcut.** When `subspace.is_affine` the surface fills the
 subspace: reduced coords *are* authoring coords (identity), the foot is `q`
@@ -646,7 +646,10 @@ foot solve, the RBF eval, and the tangent Gram-solve — it computes
 `a·target` offset (preserving per-token spread), `κ=1` ablation axes do
 `q + a·(0 − q)` (collapse the component toward 0), so push and ablation share one
 analytic op. This is load-bearing for throughput: a folded vector is the common
-case and the curved per-token solve would blow the throughput invariant.
+case and the curved per-token solve would blow the throughput invariant. The
+affine branch also drops the `norm_cap` — the displacement `(p_new − q)@basis` is
+bounded and added to a large-norm residual, so it can't push `‖h_new‖` past the
+cap, and skipping it saves two per-fire full-width norm reductions.
 
 **Curved foot-following.** The nearest-point foot on the surface is a function of
 the running activation, so it is tracked across tokens rather than re-solved.
@@ -727,7 +730,8 @@ zone where hard personas break. Committed but tagged a prototype in the source.
 
 There is **no `[0,1]` clamp and no water-fill on `along`**: a high-signal layer is
 *meant* to overshoot, the de-rogued whitened coords keep the overshoot controlled,
-and the kernel's `norm_cap = 3·‖h‖` is the only backstop. `onto` keeps its clamp
+and on the curved path `norm_cap = 3·‖h‖` is the only backstop (the affine fast
+path relies on the controlled coords alone). `onto` keeps its clamp
 (a collapse fraction past 1 inverts the residual). Per-persona strength variance
 persists — a hard persona peaks near its coherence edge where a robust one still
 has room; tune α per target.

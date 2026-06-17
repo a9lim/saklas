@@ -19,7 +19,6 @@ from saklas.core.errors import (
     SaeModelMismatchError,
     SaeReleaseNotFoundError,
     SaklasError,
-    StaleSidecarError,
     UnknownVariantError,
 )
 from saklas.core.profile import ProfileError
@@ -56,7 +55,6 @@ _OVERRIDES: list[tuple[type[SaklasError], int]] = [
     (SaeCoverageError, 400),
     (AmbiguousVariantError, 400),
     (UnknownVariantError, 404),
-    (StaleSidecarError, 409),
     # core/session.py
     (ConcurrentGenerationError, 409),
     (VectorNotRegisteredError, 404),

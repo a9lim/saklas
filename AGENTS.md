@@ -16,7 +16,7 @@ unified per-layer injection (the along/onto subspace kernel,
 Three frontends over one engine: `SaklasSession` (programmatic), `saklas serve`
 (HTTP), `saklas tui` (TUI).
 
-Version lives in `saklas/__init__.py` as `__version__` (currently 3.2.0).
+Version lives in `saklas/__init__.py` as `__version__` (currently 4.0.0).
 `pyproject.toml` reads it via `version = {attr = "saklas.__version__"}`, so there
 is one place to bump. Do not bump it as part of feature work — version bumps are
 user-owned.
@@ -363,8 +363,10 @@ off-subspace residual `h_perp` is always kept verbatim, which is what lets a
 vector and N orthogonal manifolds compose with zero cross-talk. A flat (affine)
 subspace takes an analytic shortcut (foot = the projected coord, no Gauss-Newton /
 RBF), load-bearing for throughput; a curved manifold runs a warm-started per-token
-nearest-point foot-follower. fp32 throughout; the only norm guard is the soft cap
-`‖h_new‖ ≤ 3·‖h‖`.
+nearest-point foot-follower. fp32 throughout; the soft cap `‖h_new‖ ≤ 3·‖h‖` is
+the only norm guard, and it rides the **curved path only** — the affine fast path
+skips it (a flat fit can't extrapolate off-domain, so the bounded displacement
+can't blow the norm).
 
 Gain (`core/hooks.py`): the per-layer share is normalized to **mean 1** (`Σ_L
 share_L = n_layers`) and `eff_along_L = share_L · _MANIFOLD_ALONG_GAIN`
@@ -655,7 +657,7 @@ All state under `~/.saklas/` (override via `$SAKLAS_HOME`):
 ```
 ~/.saklas/
   neutral_statements.json              # user-editable; organic responses to the
-                                       # baseline prompts (copy-on-miss from package)
+                                       # baseline prompts (read-through from package; not copied to ~/.saklas/)
   baseline_prompts.json                # user override for the shared A2 prompts
   templates/<ns>/<name>/               # standalone templated-completion artifact
     template.json                      # slot, values, contexts:[{turns:[{role,content}], assistant}]
@@ -708,9 +710,10 @@ tok/s):
   static-affine steered case (`static_steerable` — the hook is a fixed tensor-op
   sequence and StaticCache never bypasses forward hooks). Curved / gated / phased
   steering keeps the ctx-consulting general path (DynamicCache, eager); curved
-  manifolds pay a warm-started O(R) per-token foot solve. (StaticCache-with-steering
-  is CUDA-only, so MPS/CPU are unaffected; the through-the-hook graph capture wants a
-  CUDA validation pass.) Curved `%` steering is materially the slowest path —
+  manifolds pay a warm-started O(R) per-token foot solve. (StaticCache + the static
+  single-affine steered fast path compile on MPS too — inductor's MPS backend fuses
+  the per-layer kernels, ~1.7× measured on gemma-3-4b; only CUDA-graph capture
+  (`reduce-overhead`) stays CUDA-only.) Curved `%` steering is materially the slowest path —
   per token it runs a Gauss-Newton foot solve + frame-rotation transport (two RBF
   evals + two Jacobians), an `n≥2` fit hops to CPU for the SVD on MPS
   (`_svd_mps_safe`), and it forfeits StaticCache/`torch.compile`. Affine/flat
@@ -719,8 +722,8 @@ tok/s):
 - **Share baked at fit**, normalized to mean 1 at apply; the subspace foot
   translates by `share_L · _MANIFOLD_ALONG_GAIN · target` (the target already
   carries the coefficient; `_MANIFOLD_GAIN = 0.5` is now the `onto`-only gain). No
-  norm preservation (onto is meant to shrink `‖h‖`); `norm_cap = 3·‖h‖` is the
-  only bound.
+  norm preservation (onto is meant to shrink `‖h‖`); the curved path's `norm_cap =
+  3·‖h‖` is the only bound (the affine fast path carries no cap).
 - **Top-p via `torch.topk`**, not full-vocab sort; `top_k` (default 1024 cap) is a
   hard candidate-pool cap applied before top-p (llama.cpp/Ollama order).
 - **Monitor capture is hook-driven**, inline with generation — no second forward
