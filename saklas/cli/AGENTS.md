@@ -141,8 +141,8 @@ category list through verbatim (tagged concepts only, no multi-node sweep).
 - `manifold fit`: positional `target` (a manifold name *or* a folder path;
   `_run_manifold_fit` resolves it and reads `fit_mode`), `-m/--model`, `-f/--force`,
   `--sae RELEASE`, `--sae-revision REV`, plus the discover hyperparams
-  `--method pca|spectral|auto`, `--max-dim N`, `--var-threshold T`, `--k-nn K`,
-  `--bandwidth SIGMA`, `--max-subspace-dim R`, `--smoothing auto|0|LAMBDA`,
+  `--method pca|spectral|auto`, `--max-dim N`, `--min-dim N`, `--var-threshold T`,
+  `--k-nn K`, `--bandwidth SIGMA`, `--max-subspace-dim R`, `--smoothing auto|0|LAMBDA`,
   `--persistence-frac F`. An authored folder runs
   `ManifoldExtractionPipeline` directly; a discover folder (`pca`/`spectral`/`auto`)
   has any supplied hyperparam written into `manifold.json` atomically *before* the
@@ -151,7 +151,9 @@ category list through verbatim (tagged concepts only, no multi-node sweep).
   `select_topology` per-model. `--max-subspace-dim` caps the per-layer RBF subspace
   dim for the curved spectral fit (argparse-default `None` → engine 64) and is
   dropped by `_sanitize_hyperparams` for `--method pca` — a flat fit's subspace dim
-  is its `--max-dim` layout dim. `--smoothing` (curved only: GCV `auto` / exact `0`
+  is its `--max-dim` layout dim. `--min-dim` (spectral only) floors the intrinsic
+  dim the eigenvalue-ratio cliff picks (set `--min-dim == --max-dim` to pin it,
+  e.g. PAD's 3); ignored for `--method pca`. `--smoothing` (curved only: GCV `auto` / exact `0`
   / fixed λ) sets the penalized-RBF regularization; `--persistence-frac` (auto
   only) is the H1 loop-significance threshold. This verb folds the former separate
   `discover` verb.

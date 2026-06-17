@@ -557,9 +557,10 @@ the session passes False for stateless gens that aren't loom-attached / opted-in
 (server streaming never reads per-token ppl); `cand_logp` is still computed when
 `logprobs` needs it. Stop-sequence matching keeps only a bounded tail of the
 emitted text (`_stop_keep = max(len(s))−1` chars) instead of growing the full
-completion, so the per-token match is O(tail+emit) not the old O(n²) concat. `fork_from_token` / `prefill_assistant` /
-`append_user_turn` / `append_assistant_turn` are the fork / commit entry points.
-`detect_base_model` (no chat template) routes flat (`raw=True`) generation.
+completion, so the per-token match is O(tail+emit) not the old O(n²) concat. The
+`SaklasSession` fork/commit entry points (`fork_from_token` / `prefill_assistant`
+/ `append_user_turn` / `append_assistant_turn`, all in `session.py`) build on this
+decode loop. `detect_base_model` (no chat template) routes flat (`raw=True`) generation.
 Per-message role substitution (`role_templates.apply_with_per_turn_roles`) backs
 the roleplay scaffold; `_active_role` is the steering-driven role.
 `supports_thinking` / `_detect_think_delimiters` round-trips Qwen/Gemma
@@ -602,8 +603,8 @@ pipeline folds `concept − ν` into a 1-node neutral-anchored ray (see
 `extraction.py`), neutral implicit via `layer_means`. `generate_neutral_responses`
 is the neutral-corpus sibling (no system, standard label). `extract_vector_from_corpora(..., kind=...)` is the corpus-in sibling
 (hand-authored pairs skip generation; corpora pooled conversationally, each length
-a multiple of the baseline prompt set); `extract_manifold(folder)` is the
-multi-node delegate that returns a `Manifold`. All gate against `GenState.IDLE`
+a multiple of the baseline prompt set); `fit(folder)` is the multi-node delegate
+that returns a `Manifold`. All gate against `GenState.IDLE`
 (fitting runs forward passes). `_fit_vector_manifold` is the shared tail. (The
 training-free `clone_from_corpus` / `io.cloning` path is removed in 4.0.)
 

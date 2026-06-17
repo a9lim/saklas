@@ -165,10 +165,10 @@ per-model sidecar/tensor via `_resolve_intrinsic_dim` + a `load_manifold` read.
   `session.generate_responses` (A2 conversational extraction — each concept
   answers the shared baseline prompts in character, one corpus per node) under
   the session lock; SSE progress on `Accept: text/event-stream`, JSON otherwise.
-  `GenerateManifoldRequest` body carries `kind: "abstract"|"concrete"` +
-  `samples_per_prompt: int` (no `n_scenarios`/`statements_per_concept` — A2 has
-  no scenarios, so `scenarios.json` provenance is no longer written).
-  `role_per_node=true` → persona manifold.
+  `GenerateManifoldRequest` body carries `concepts: list[str]` (≥2, one node per
+  concept), `kind: "abstract"|"concrete"` + `samples_per_prompt: int` (no
+  `n_scenarios`/`statements_per_concept` — A2 has no scenarios, so `scenarios.json`
+  provenance is no longer written). `role_per_node=true` → persona manifold.
 - `PATCH /manifolds/{ns}/{name}` — `update_manifold_folder` (serializes against an
   in-flight fit). Existing tensors go stale, not deleted.
 - `DELETE /manifolds/{ns}/{name}` — `remove_manifold_folder` (single source of truth
@@ -230,6 +230,10 @@ monitor unification onto the session's single `Monitor`.
   lazy-load cache. 400 on an empty selector, 404 on `FileNotFoundError`, 400 on
   `KeyError`/`ValueError`.
 - `DELETE /probes/{name}` → `session.remove_probe`, 204; 404 if not attached.
+- `GET /probes/{name:path}/geometry` → `session._monitor.probe_geometry(name)`, the
+  static per-layer geometry (centroids, neutral anchor, PCA rotation for rank≥3,
+  curve/surface overlay) backing the dashboard probe-inspector plot; 404 if not
+  attached.
 
 The one-shot text-scoring endpoints (`POST .../probe`, `POST .../manifold-probe`)
 were removed in 4.0 — they re-rendered arbitrary text out of conversation context

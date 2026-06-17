@@ -223,13 +223,15 @@ def _build_vector_extract(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument(
         "--role", default=None, metavar="SLUG",
-        help="Role-augmented extraction: render pairs under a chat template "
-             "whose assistant-role label is replaced by SLUG (e.g. 'pirate'). "
-             "Writes the tensor under a ``_role-<slug>`` filename suffix; "
-             "steer it with the matching ``:role-<slug>`` variant in any "
-             "expression. Slug must match ``[a-z0-9._-]+``. Mutually "
-             "exclusive with ``--sae``. Mistral-3 families don't carry a "
-             "substitutable role label and raise at runtime.",
+        help="Role-augmented extraction: render the contrast pairs under a "
+             "chat template whose assistant-role label is replaced by SLUG "
+             "(e.g. 'pirate'), so the fit lives in role-baselined activation "
+             "space. The role bakes into the generated node corpora and the "
+             "fit writes the canonical tensor (there is no separate "
+             "``_role-<slug>`` file, and cross-session ``:role-<slug>`` "
+             "selection isn't wired up yet). Slug must match ``[a-z0-9._-]+``. "
+             "Mutually exclusive with ``--sae``. Mistral-3 families don't "
+             "carry a substitutable role label and raise at runtime.",
     )
     p.add_argument(
         "--namespace", default=None, metavar="NS",

@@ -25,7 +25,9 @@ per file:
 - `<safe_model>.safetensors` — raw DiM (canonical)
 - `<safe_model>_sae-<release>.safetensors` — fit in SAE feature space
 - `<safe_model>_from-<safe_src>.safetensors` — cross-model transfer
-- `<safe_model>_role-<slug>.safetensors` — role-augmented
+- `<safe_model>_role-<slug>.safetensors` — role-augmented (reserved: the filename
+  round-trips, but `extract --role` bakes the role into the corpus and writes the
+  canonical tensor, so no `_role-` file is emitted yet)
 
 `tensor_filename(model_id, *, release=None, transferred_from=None, role=None)` +
 `sidecar_filename(...)` construct (the three kind kwargs are mutually exclusive);

@@ -55,8 +55,8 @@ saklas tui <model_id> [--no-dls]
 saklas serve <model_id> [--no-web] [--steer/-S EXPR]
 saklas manifold extract <concept>|<pos> <neg> [-m MODEL] [--sae RELEASE] [--role SLUG] [--namespace NS] [-f]
 saklas manifold generate <name> --concepts C... [--kind abstract|concrete] [--samples-per-prompt K] [--seed S]
-saklas manifold from-template <template> [--name MANIFOLD] [--fit-mode auto|pca|spectral] [--max-dim N] [-f]   # derive a discover manifold from a standalone template
-saklas manifold fit <name>|<folder> [-m MODEL] [--sae REL] [--method pca|spectral|auto] [--max-dim N] [--var-threshold T] [--k-nn K] [--bandwidth SIGMA] [--max-subspace-dim R] [--smoothing auto|0|LAMBDA] [--persistence-frac F]  # authored or discover-mode (hyperparams apply only to discover folders; --smoothing curved only, --persistence-frac auto only)
+saklas manifold from-template <template> [--name MANIFOLD] [--fit-mode auto|pca|spectral] [--max-dim N] [--var-threshold T] [--description TEXT] [-f]   # derive a discover manifold from a standalone template
+saklas manifold fit <name>|<folder> [-m MODEL] [--sae REL] [--method pca|spectral|auto] [--max-dim N] [--min-dim N] [--var-threshold T] [--k-nn K] [--bandwidth SIGMA] [--max-subspace-dim R] [--smoothing auto|0|LAMBDA] [--persistence-frac F]  # authored or discover-mode (hyperparams apply only to discover folders; --smoothing curved only, --persistence-frac auto only)
 saklas manifold bake <name> <expression> [-m]    # shared grammar: "0.3 ns/a + 0.5 ns/b|ns/c"
 saklas manifold merge <name> <src...> [-f]           # union discover-mode node corpora
 saklas manifold transfer <name> --from SRC --to TGT [-f]   # cross-model Procrustes
@@ -667,7 +667,6 @@ All state under `~/.saklas/` (override via `$SAKLAS_HOME`):
                                        # discover/baked also carry node_coords (the layout)
     <safe_model_id>_sae-<rel>.safetensors    # SAE-space fit
     <safe_model_id>_from-<src>.safetensors   # cross-model transfer
-    <safe_model_id>_role-<slug>.safetensors  # role-augmented
   models/<safe_model_id>/
     neutral_activations.{safetensors,json}   # neutral corpus (mult. of 48) × layers, fp32;
                                        # the single per-model neutral artifact — the
@@ -681,9 +680,11 @@ All state under `~/.saklas/` (override via `$SAKLAS_HOME`):
 
 `manifold.json.files` is a sha256 map verified on load. A manifold folder can hold
 multiple fitted tensors per model, distinguished by filename suffix:
-`<safe>.safetensors` (raw DiM), `_sae-<release>`, `_from-<safe_src>` (transfer),
-`_role-<slug>` — at most one kind per file (no `pca` suffix). `tensor_filename` /
-`parse_tensor_filename` in `io/paths.py` round-trip them.
+`<safe>.safetensors` (raw DiM), `_sae-<release>`, `_from-<safe_src>` (transfer) —
+at most one kind per file (no `pca` suffix). `tensor_filename` /
+`parse_tensor_filename` in `io/paths.py` round-trip these (plus a `_role-<slug>`
+form that isn't emitted yet — `extract --role` bakes the role into the corpus and
+writes the canonical tensor).
 `materialize_bundled_manifolds()` is copy-on-miss. A pre-4.0 `vectors/` pack
 (`pack.json.format_version < PACK_FORMAT_VERSION = 3`) is *legacy*: ported to a
 2-node `pca` manifold on first steer touch (`_port_stale_legacy_vector` /
@@ -717,7 +718,7 @@ tok/s):
   constant-add fast path instead; prefer them where coherence allows.
 - **Share baked at fit**, normalized to mean 1 at apply; the subspace foot
   translates by `share_L · _MANIFOLD_ALONG_GAIN · target` (the target already
-  carries the coefficient; `_MANIFOLD_GAIN = 1.0` is now the `onto`-only gain). No
+  carries the coefficient; `_MANIFOLD_GAIN = 0.5` is now the `onto`-only gain). No
   norm preservation (onto is meant to shrink `‖h‖`); `norm_cap = 3·‖h‖` is the
   only bound.
 - **Top-p via `torch.topk`**, not full-vocab sort; `top_k` (default 1024 cap) is a
@@ -758,8 +759,9 @@ tok/s):
 
 `_TESTED_ARCHS` in `core/model.py` emits a one-time `UserWarning` on load when
 `model_type` isn't in the set. Known working: `qwen2`, `qwen3`, `qwen3_5`
-(+ `_text`/`_moe`), `gemma2`, `gemma3` (+ `_text`), `gemma4` (+ `_text`),
-`mistral3`, `ministral3`, `gpt_oss`, `llama`, `glm`, `talkie`. Many more are wired
+(+ `_text`/`_moe`), `gemma2`, `gemma3` (+ `_text`), `gemma4`
+(+ `_text`/`_unified`/`_unified_text`), `mistral3`, `ministral3`, `gpt_oss`,
+`llama`, `glm`, `talkie`. Many more are wired
 via `_LAYER_ACCESSORS` but untested — adding one is a single accessor entry.
 Architectures whose modeling ignores `past_key_values` (e.g. the original talkie
 port) auto-fall back to O(N²) no-KV-cache generation with a one-time warning.
