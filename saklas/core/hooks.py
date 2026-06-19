@@ -751,7 +751,7 @@ class SteeringHook:
 # beyond 1 would overshoot through the zero-thickness wire or σ-tube).
 #
 # This is the **onto** (off-surface collapse) gain only: ``eff_onto_L =
-# clamp(onto · share_L · _MANIFOLD_GAIN, 0, 1)``.  On a legacy zero-thickness
+# clamp(onto · share_L · _MANIFOLD_ONTO_GAIN, 0, 1)``.  On a legacy zero-thickness
 # curved fit the kernel scales the off-surface residual by ``(1 − eff_onto)``; on
 # a fuzzy σ-field fit it instead shrinks residual norm toward the local tube
 # thickness.  That residual carries the per-token content variation, so combined
@@ -766,7 +766,7 @@ class SteeringHook:
 # [0, 1] knob saturates into no dynamic range (``onto = 0.5 ≈ 1.0``).  A [0, 1]
 # dial whose top emits garbage is a bad dial, so ``onto = 1.0`` is deliberately the
 # coherent maximum, not the over-steer edge.
-_MANIFOLD_GAIN = 0.5
+_MANIFOLD_ONTO_GAIN = 0.5
 
 # --- translate gain (prototype) ----------------------------------------------
 # The injection *translates* the in-subspace foot by a fixed offset toward the
@@ -778,7 +778,7 @@ _MANIFOLD_GAIN = 0.5
 # Translate is unbounded where collapse saturated (a fixed offset compounds
 # across layers rather than landing *on* the target), so the slide gain runs ~an
 # order of magnitude below the old collapse gain.  A typical layer gets
-# ``eff_along ≈ _MANIFOLD_ALONG_GAIN``.
+# ``eff_along ≈ _SUBSPACE_GAIN``.
 #
 # **Whitened-normalization recalibration.**  ``synthesize_subspace`` now emits a
 # *whitened-unit* affine target (``‖target@basis‖_M = 1`` per push term, magnitude
@@ -806,9 +806,35 @@ _MANIFOLD_GAIN = 0.5
 # This is the payoff of the whitened normalization: pre-fix, ``0.5 formal%formal``
 # did nothing while ``0.5 personas%caveman`` slammed; now ``0.5`` of *either* lands
 # in the same coherent band.  (Tune up toward ``E ≈ 12`` — α ≈ 0.75 — for fuller
-# persona expression where the target tolerates it.)  ``_MANIFOLD_GAIN`` stays the
+# persona expression where the target tolerates it.)  ``_MANIFOLD_ONTO_GAIN`` stays the
 # gain for ``onto`` only (the off-surface collapse share-weight).
-_MANIFOLD_ALONG_GAIN = 16.0
+_SUBSPACE_GAIN = 16.0
+
+# --- curved-path translate gain (separate from the affine gain above) --------
+# The ``_SUBSPACE_GAIN = 16`` above was live-calibrated **entirely on the
+# affine path** (``formal.casual%formal``, ``personas%caveman/hacker`` — personas
+# resolves flat, so those are affine ``%``), where ``synthesize_subspace`` emits a
+# *whitened-unit* target and α is a free push *magnitude*: pushing 8 whitened units
+# past the node is safe because the affine map is linear and ``norm_cap`` bounds it.
+#
+# The **curved** path is different in kind.  Its target is the node's *raw domain
+# coordinates* and ``subspace_inject`` translates the foot by
+# ``eff_along·(target − origin)`` — so ``eff_along`` is a **fraction of the way to
+# the node** (``1.0`` lands on it), not a free magnitude.  Past ~1 the foot leaves
+# the fitted domain and the polyharmonic (``r³``) RBF *extrapolates cubically* →
+# activation blow-up → token-soup.  With the affine ``16`` even α=0.1 translated
+# ~1.6× to the node and α≥0.2 (~3×) detonated (gemma-4-12b ``weekday`` sweep).
+#
+# So curved steering needs a small *fraction* gain, not the affine magnitude gain.
+# Live-calibrated on the gemma-4-12b ``weekday`` α-sweep: the coherent + clearly
+# day-flavored band sat at ``eff_along ≈ 0.8`` ("fresh-start Monday") to ``≈ 1.6``
+# ("grind Monday"), detonating by ``≈ 3``.  ``1.5`` maps the user range onto that
+# band — α≈0.5 → ``0.75`` (near the node, the recommended sweet spot), α≈1.0 →
+# ``1.5`` (on / just past, strong but coherent) — matching the affine α convention
+# while staying scale-free across curved manifolds ("fraction to node" is
+# scale-invariant, so a faint fit and a strong one share one gain).  Prototype,
+# like its affine sibling.
+_MANIFOLD_ALONG_GAIN = 1.5
 
 # Max |cosine| between two *curved* manifold subspaces sharing a layer before
 # they are deemed overlapping (``OverlappingManifoldError``).  Curved manifolds
@@ -869,7 +895,7 @@ def _normalize_shares_mean1(raw: dict[int, float]) -> dict[int, float]:
 
     So ``eff_along_L = share_L · base`` is a clean per-layer slide fraction
     ≈ ``base`` on a typical layer and n_layers-invariant (see
-    ``_MANIFOLD_GAIN``).  Degenerate guard: an all-zero / near-zero total
+    ``_MANIFOLD_ONTO_GAIN``).  Degenerate guard: an all-zero / near-zero total
     falls back to a uniform ``1.0`` per layer.
     """
     n_layers = max(1, len(raw))
@@ -891,7 +917,7 @@ def _manifold_layer_shares(manifold: Any) -> dict[int, float]:
     # spread ``‖coords‖_F``.  Normalized to **mean 1** (``Σ_L share_L =
     # n_layers``, not 1) so ``eff_along_L = share_L · base_gain`` is a clean
     # per-layer slide fraction ≈ ``base`` on a typical layer and
-    # n_layers-invariant — see ``_MANIFOLD_GAIN``.
+    # n_layers-invariant — see ``_MANIFOLD_ONTO_GAIN``.
     baked = getattr(manifold, "mahalanobis_share", None)
     if baked and all(layer_idx in baked for layer_idx in manifold.layers):
         layer_scores: dict[int, float] = {
@@ -1105,7 +1131,7 @@ class SteeringManager:
         # discriminative the manifold is at that layer, normalized to mean 1
         # (``Σ_L share_L = n_layers``); ``base`` is the one gain constant.  No
         # lever / ``N`` and no water-fill (both torn out in Step 8 — see the
-        # ``_MANIFOLD_GAIN`` docstring): ``along`` is left un-clamped so a
+        # ``_MANIFOLD_ONTO_GAIN`` docstring): ``along`` is left un-clamped so a
         # high-share layer overshoots past the target (the ``norm_cap`` inside
         # ``subspace_inject`` is the only bound), while ``onto`` stays clamped
         # ``[0, 1]`` per layer (beyond 1 would overshoot through the wire/tube).
@@ -1128,15 +1154,16 @@ class SteeringManager:
 
             shares: dict[int, float] = m.get("shares", {})
 
-            # One gain constant, no lever (Step 8).  ``along`` is left
-            # un-clamped — a high-share layer is meant to overshoot past the
-            # target (``norm_cap`` bounds it); ``onto`` clamps per layer.
+            # Curved-path **fraction** gain (NOT the affine magnitude gain):
+            # ``eff_along`` is the fraction of the way to the node, so it must stay
+            # near [0, ~2] or the RBF extrapolates off-domain (see
+            # ``_MANIFOLD_ALONG_GAIN``).  ``onto`` clamps per layer.
             eff_along = {
                 L: along * shares[L] * _MANIFOLD_ALONG_GAIN
                 for L in manifold.layers
             }
             eff_onto = {
-                L: max(0.0, min(1.0, onto * shares[L] * _MANIFOLD_GAIN))
+                L: max(0.0, min(1.0, onto * shares[L] * _MANIFOLD_ONTO_GAIN))
                 for L in manifold.layers
             }
 
@@ -1241,7 +1268,7 @@ class SteeringManager:
                 # de-rogued real-coord target carries the magnitude; the per-axis
                 # share-weighted ``eff_along`` is unclamped (``norm_cap`` bounds
                 # it in ``subspace_inject``).
-                eff_along_L = shares[L] * _MANIFOLD_ALONG_GAIN
+                eff_along_L = shares[L] * _SUBSPACE_GAIN
                 manifold_by_layer.setdefault(L, []).append((
                     sub_L, sub_domain, sub_target, sub_origin,
                     eff_along_L, 0.0, sub_kappa, sub_trigger,
@@ -1336,7 +1363,7 @@ class SteeringManager:
                     return None  # ablation: injection depends on h, not a const
                 target = synth.target_coord[L].to(torch.float32)
                 basis = sub_L.basis.to(torch.float32)              # (R, D)
-                eff_along = shares[L] * _MANIFOLD_ALONG_GAIN
+                eff_along = shares[L] * _SUBSPACE_GAIN
                 c = (eff_along * target) @ basis                   # (D,)
                 offsets[L] = offsets[L] + c if L in offsets else c
         return offsets

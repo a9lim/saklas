@@ -17,7 +17,7 @@ import pytest
 import torch
 from torch import nn
 
-from saklas.core.hooks import _MANIFOLD_ALONG_GAIN, SteeringManager
+from saklas.core.hooks import _SUBSPACE_GAIN, SteeringManager
 from saklas.core.manifold import (
     CustomDomain,
     SynthesizedSubspace,
@@ -172,23 +172,23 @@ def test_custom_trigger_rides_through():
 
 def test_single_layer_share_one_gives_base_gain():
     # One covered layer ⇒ mean-1 share == 1; no lever, no clamp ⇒
-    # eff_along = 1.0 · _MANIFOLD_ALONG_GAIN (the translate slide gain).
+    # eff_along = 1.0 · _SUBSPACE_GAIN (the translate slide gain).
     synth = _single_layer_synth(0)
     mgr = SteeringManager()
     mgr.add_subspace("__affine__", synth)
     mgr.apply_to_model(_model_layers(1), torch.device("cpu"), torch.float32)
     along = _group(mgr, 0)[5]
-    assert along == pytest.approx(_MANIFOLD_ALONG_GAIN, abs=1e-6)
+    assert along == pytest.approx(_SUBSPACE_GAIN, abs=1e-6)
 
 
 def test_share_weight_mean_one_across_layers():
     # Equal per-layer magnitude ⇒ each mean-1 share = 1.0 (not 1/3); no lever ⇒
-    # eff_along = 1.0·_MANIFOLD_ALONG_GAIN at every layer — n_layers-invariant.
+    # eff_along = 1.0·_SUBSPACE_GAIN at every layer — n_layers-invariant.
     synth = _equal_share_synth((0, 1, 2))
     mgr = SteeringManager()
     mgr.add_subspace("__affine__", synth)
     mgr.apply_to_model(_model_layers(3), torch.device("cpu"), torch.float32)
-    expected = _MANIFOLD_ALONG_GAIN
+    expected = _SUBSPACE_GAIN
     for L in (0, 1, 2):
         # mean-1 normalization divides then re-scales in fp32, so the share
         # picks up ~gain·eps rounding (≈1.3e-6 at gain 16); rel tol, not the
@@ -206,7 +206,7 @@ def test_n_layers_invariance():
         mgr.add_subspace("__affine__", synth)
         mgr.apply_to_model(_model_layers(n), torch.device("cpu"), torch.float32)
         for L in range(n):
-            assert _group(mgr, L)[5] == pytest.approx(_MANIFOLD_ALONG_GAIN, abs=1e-6)
+            assert _group(mgr, L)[5] == pytest.approx(_SUBSPACE_GAIN, abs=1e-6)
 
 
 def test_high_share_layer_unclamped_share_weighting():
@@ -218,8 +218,8 @@ def test_high_share_layer_unclamped_share_weighting():
     mgr = SteeringManager()
     mgr.add_subspace("__affine__", synth)
     mgr.apply_to_model(_model_layers(2), torch.device("cpu"), torch.float32)
-    assert _group(mgr, 0)[5] == pytest.approx(1.5 * _MANIFOLD_ALONG_GAIN, abs=1e-6)
-    assert _group(mgr, 1)[5] == pytest.approx(0.5 * _MANIFOLD_ALONG_GAIN, abs=1e-6)
+    assert _group(mgr, 0)[5] == pytest.approx(1.5 * _SUBSPACE_GAIN, abs=1e-6)
+    assert _group(mgr, 1)[5] == pytest.approx(0.5 * _SUBSPACE_GAIN, abs=1e-6)
     # unclamped: the exact share ratio rides through (a [0, 1]/water-fill clamp
     # would distort it).
     assert _group(mgr, 0)[5] / _group(mgr, 1)[5] == pytest.approx(3.0, abs=1e-6)
@@ -243,7 +243,7 @@ def test_hot_path_translates_in_subspace_component_by_target():
     layers = _model_layers(1)
     mgr.apply_to_model(layers, torch.device("cpu"), torch.float32)
     eff = _group(mgr, 0)[5]
-    assert eff == pytest.approx(_MANIFOLD_ALONG_GAIN, abs=1e-6)  # share == 1
+    assert eff == pytest.approx(_SUBSPACE_GAIN, abs=1e-6)  # share == 1
     kappa = _group(mgr, 0)[7]
     assert isinstance(kappa, torch.Tensor)
     assert torch.allclose(kappa, torch.zeros(1), atol=1e-6)  # κ=0 (pure push)

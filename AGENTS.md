@@ -369,10 +369,14 @@ skips it (a flat fit can't extrapolate off-domain, so the bounded displacement
 can't blow the norm).
 
 Gain (`core/hooks.py`): the per-layer share is normalized to **mean 1** (`Σ_L
-share_L = n_layers`) and `eff_along_L = share_L · _MANIFOLD_ALONG_GAIN`
-(`= 16.0` — bumped from `0.125` when the affine target went whitened-unit and
-live-recalibrated on gemma-4-12b, see below; the translate-slide gain for both
-modes). `_MANIFOLD_GAIN` scales
+share_L = n_layers`) and `eff_along_L = share_L · gain`. The along-gain is
+**path-specific** — `_SUBSPACE_GAIN = 16.0` on the affine path (whitened-unit
+target, free push magnitude, overshoot-safe; bumped from `0.125` when the affine
+target went whitened-unit, live-recalibrated on gemma-4-12b, see below) and
+`_MANIFOLD_ALONG_GAIN = 1.5` on the curved path (the curved target is raw
+node coords, so `eff_along` is a *fraction to the node* — past ~1 the `r³` RBF
+extrapolates and blows up; the affine `16` detonated curved fits, `1.5` keeps them
+in the coherent fraction band). `_MANIFOLD_ONTO_GAIN` scales
 **onto** only (the curved off-surface collapse). For an affine term the
 coefficient α is folded into the translate *target* by `synthesize_subspace`, so α
 scales the offset magnitude (unclamped); for a curved term α is the (clamped
@@ -389,7 +393,7 @@ strength knob across ranks/targets; per-target *coherence* variance (~2-3×, §1
 remains. There is **no lever / N correction** and **no `[0,1]`
 clamp / water-fill on `along`** (a high-signal layer is meant to overshoot the
 target; the de-rogued whitened coords keep it controlled and `norm_cap` bounds
-it). `onto` stays clamped `[0,1]`. (`_MANIFOLD_ALONG_GAIN` is tagged a prototype —
+it). `onto` stays clamped `[0,1]`. (`_SUBSPACE_GAIN` is tagged a prototype —
 calibrated so `≈0.5 <concept>` lands at the coherent sweet spot; the whitened
 normalization changes the absolute scale, so this constant is **due for
 recalibration** against live output.) A steered layer always runs the slow (ctx-consulting) hook, so per-step
@@ -564,7 +568,7 @@ partial folder in the package tree without exposing it as a default manifold:
 Recommended α is vector-comparable: aim for `α ≈ 0.5`, tune up toward `α ≈ 1.0`
 for stronger expression. (For an affine push term α is unclamped — it sets the
 translate-offset magnitude; for a curved `%` term `along` clamps to `[0,1]`.) The
-global translate-slide gain `_MANIFOLD_ALONG_GAIN = 16.0` (live-calibrated on
+global translate-slide gain `_SUBSPACE_GAIN = 16.0` (live-calibrated on
 gemma-4-12b — it jumped from `0.125` when the affine target became whitened-unit, a
 unit-scale change of ~100×) targets `≈0.5 <concept>` at the coherent band for both
 tight concepts and personas (`α ≈ 1.0` is the strong / over-steer zone where hard
@@ -592,7 +596,7 @@ qualitative, MPS is not bitwise deterministic so compare qualitatively):
 > **Open frontiers** (see `ARCHITECTURE.md` §10): the fitted `personas` subspace is
 > a near-1-D "persona-ness" fan, so distinct personas can express the same generic
 > intense register (a steering-access problem, not the rogue problem — whitening
-> verifiably worked). The translate-slide gain (`_MANIFOLD_ALONG_GAIN`) is
+> verifiably worked). The translate-slide gain (`_SUBSPACE_GAIN`) is
 > live-calibrated but still coupled to that: with the geometric scale now whitened
 > away, what remains is per-target *coherence* variance (~2× — a hard persona like
 > hacker shatters at roughly half the effective gain a robust concept tolerates),
@@ -720,8 +724,9 @@ tok/s):
   terms (a folded vector, or `personas`/`emotions` when they resolve flat) take the
   constant-add fast path instead; prefer them where coherence allows.
 - **Share baked at fit**, normalized to mean 1 at apply; the subspace foot
-  translates by `share_L · _MANIFOLD_ALONG_GAIN · target` (the target already
-  carries the coefficient; `_MANIFOLD_GAIN = 0.5` is now the `onto`-only gain). No
+  translates by `share_L · gain · target` (affine `gain = _SUBSPACE_GAIN =
+  16.0`, target carries the coefficient; curved `gain = _MANIFOLD_ALONG_GAIN
+  = 1.5`, a fraction-to-node scale; `_MANIFOLD_ONTO_GAIN = 0.5` is the `onto`-only gain). No
   norm preservation (onto is meant to shrink `‖h‖`); the curved path's `norm_cap =
   3·‖h‖` is the only bound (the affine fast path carries no cap).
 - **Top-p via `torch.topk`**, not full-vocab sort; `top_k` (default 1024 cap) is a
