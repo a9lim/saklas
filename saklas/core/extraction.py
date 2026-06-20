@@ -79,6 +79,7 @@ class ModelHandle(Protocol):
         kinds: list[str | None],
         *,
         roles: dict[str, str | None] | None = None,
+        custom_system: str | None = None,
         samples_per_prompt: int = ...,
         max_new_tokens: int = ...,
         on_progress: Callable[[str], None] | None = None,

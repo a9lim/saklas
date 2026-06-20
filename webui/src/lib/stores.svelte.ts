@@ -256,7 +256,7 @@ export async function rewindSession(): Promise<void> {
 // ``unavailable`` / ``loading`` / ``error`` (the manifold HTTP surface).
 
 /** Default shared subspace-along master — the ~0.5 coherent sweet spot
- *  (matches the engine's ``_MANIFOLD_ALONG_GAIN`` calibration so a freshly
+ *  (matches the engine's ``_SUBSPACE_GAIN`` calibration so a freshly
  *  racked concept at its pole lands at a usable strength). */
 const DEFAULT_SUBSPACE_ALONG = 0.5;
 

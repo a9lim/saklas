@@ -54,7 +54,7 @@ pip install -e ".[sae]"                         # SAELens-backed SAE extraction
 saklas tui <model_id> [--no-dls]
 saklas serve <model_id> [--no-web] [--steer/-S EXPR]
 saklas manifold extract <concept>|<pos> <neg> [-m MODEL] [--sae RELEASE] [--role SLUG] [--namespace NS] [-f]
-saklas manifold generate <name> --concepts C... [--kind abstract|concrete] [--samples-per-prompt K] [--seed S]
+saklas manifold generate <name> --concepts C... [--kind abstract|concrete|custom] [--system TEMPLATE] [--samples-per-prompt K] [--seed S]
 saklas manifold from-template <template> [--name MANIFOLD] [--fit-mode auto|pca|spectral] [--max-dim N] [--var-threshold T] [--description TEXT] [-f]   # derive a discover manifold from a standalone template
 saklas manifold fit <name>|<folder> [-m MODEL] [--sae REL] [--method pca|spectral|auto] [--max-dim N] [--min-dim N] [--var-threshold T] [--k-nn K] [--bandwidth SIGMA] [--max-subspace-dim R] [--smoothing auto|0|LAMBDA] [--persistence-frac F]  # authored or discover-mode (hyperparams apply only to discover folders; --smoothing curved only, --persistence-frac auto only)
 saklas manifold bake <name> <expression> [-m]    # shared grammar: "0.3 ns/a + 0.5 ns/b|ns/c"
@@ -369,10 +369,19 @@ skips it (a flat fit can't extrapolate off-domain, so the bounded displacement
 can't blow the norm).
 
 Gain (`core/hooks.py`): the per-layer share is normalized to **mean 1** (`Σ_L
-share_L = n_layers`) and `eff_along_L = share_L · _MANIFOLD_ALONG_GAIN`
-(`= 16.0` — bumped from `0.125` when the affine target went whitened-unit and
-live-recalibrated on gemma-4-12b, see below; the translate-slide gain for both
-modes). `_MANIFOLD_GAIN` scales
+share_L = n_layers`) and `eff_along_L = share_L · gain`. The along-gain is
+**path-specific** — `_SUBSPACE_GAIN = 16.0` on the affine path (whitened-unit
+target, free push magnitude, overshoot-safe; bumped from `0.125` when the affine
+target went whitened-unit, live-recalibrated on gemma-4-12b, see below) and
+`_MANIFOLD_ALONG_GAIN = 4.0` on the curved path (the curved target is raw
+node coords, so `eff_along` is a *fraction to the node* — `1.0` lands on it,
+`norm_cap` bounds off-domain RBF extrapolation; clean-stateless-calibrated on
+`months_loop%january` so `along=1.0` → `eff_along≈4` lands the vivid coherent winter
+sweet spot. CAVEAT: non-monotonic above on *periodic* fits — share-weighted
+`eff_along` wraps each layer around the ring at its own rate past ~1, scattering the
+layers onto different nodes; `4` rides a coherent part of the wrap, not a magnitude.
+Deferred fix: clamp curved `eff_along` to `[0,1]` + drop share-weighting on periodic
+domains). `_MANIFOLD_ONTO_GAIN` scales
 **onto** only (the curved off-surface collapse). For an affine term the
 coefficient α is folded into the translate *target* by `synthesize_subspace`, so α
 scales the offset magnitude (unclamped); for a curved term α is the (clamped
@@ -389,7 +398,7 @@ strength knob across ranks/targets; per-target *coherence* variance (~2-3×, §1
 remains. There is **no lever / N correction** and **no `[0,1]`
 clamp / water-fill on `along`** (a high-signal layer is meant to overshoot the
 target; the de-rogued whitened coords keep it controlled and `norm_cap` bounds
-it). `onto` stays clamped `[0,1]`. (`_MANIFOLD_ALONG_GAIN` is tagged a prototype —
+it). `onto` stays clamped `[0,1]`. (`_SUBSPACE_GAIN` is tagged a prototype —
 calibrated so `≈0.5 <concept>` lands at the coherent sweet spot; the whitened
 normalization changes the absolute scale, so this constant is **due for
 recalibration** against live output.) A steered layer always runs the slow (ctx-consulting) hook, so per-step
@@ -522,9 +531,12 @@ and routes one periodic axis, while rejecting arcs/lines/grids/blobs/persona-fan
 exact interpolation, a float is a fixed λ; the penalty regularizes the surface
 against centroid noise without touching the hot-path evaluator.
 
-`manifold generate <name> --concepts ... [--kind abstract|concrete]` LLM-authors a
-discover folder via `session.generate_responses` — each concept answers the shared
-baseline prompts in character (one corpus per node). The shared baseline prompts
+`manifold generate <name> --concepts ... [--kind abstract|concrete|custom]
+[--system TEMPLATE]` LLM-authors a discover folder via
+`session.generate_responses` — each concept answers the shared baseline prompts
+in character (one corpus per node; `--kind custom` rides the `--system` template
+— `{c}` = concept — with no role swap, the system-only frame that works on every
+model family). The shared baseline prompts
 hold topic common-mode across nodes (response[i] ↔ prompt[i % k]), so the
 per-concept centroids stay comparable without a per-manifold scenario set.
 `manifold fit <name>` then fits — the two steps are deliberate (a flaky
@@ -560,11 +572,19 @@ partial folder in the package tree without exposing it as a default manifold:
   per-model (flat affine vs curved RBF by GCV, with periodic detection); on
   gemma-4-12B it resolves to a flat 3-D affect subspace. It materializes only after
   all 20 mood corpora exist; incomplete package-data output is skipped.
+- **`months`** — an **authored** periodic 1-D `BoxDomain` loop, 12 first-person
+  month nodes (`january`…`december` at coords 0…11, December wrapping to January).
+  The corpus is `kind=custom` seasonal-embodiment ("I am January…") pooled in
+  standard-assistant space. The cyclic geometry is authored, not auto-discovered —
+  the year is a known cycle, and a per-model auto-fit GCV-prefers a flat subspace,
+  so the closed ring is declared in `manifold.json` (regen fills the corpora only).
+  The corpus carries a warm↔cold seasonal axis and a period-2 solstice/equinox
+  "extremeness" axis that lift the ring into a saddle.
 
 Recommended α is vector-comparable: aim for `α ≈ 0.5`, tune up toward `α ≈ 1.0`
 for stronger expression. (For an affine push term α is unclamped — it sets the
 translate-offset magnitude; for a curved `%` term `along` clamps to `[0,1]`.) The
-global translate-slide gain `_MANIFOLD_ALONG_GAIN = 16.0` (live-calibrated on
+global translate-slide gain `_SUBSPACE_GAIN = 16.0` (live-calibrated on
 gemma-4-12b — it jumped from `0.125` when the affine target became whitened-unit, a
 unit-scale change of ~100×) targets `≈0.5 <concept>` at the coherent band for both
 tight concepts and personas (`α ≈ 1.0` is the strong / over-steer zone where hard
@@ -592,7 +612,7 @@ qualitative, MPS is not bitwise deterministic so compare qualitatively):
 > **Open frontiers** (see `ARCHITECTURE.md` §10): the fitted `personas` subspace is
 > a near-1-D "persona-ness" fan, so distinct personas can express the same generic
 > intense register (a steering-access problem, not the rogue problem — whitening
-> verifiably worked). The translate-slide gain (`_MANIFOLD_ALONG_GAIN`) is
+> verifiably worked). The translate-slide gain (`_SUBSPACE_GAIN`) is
 > live-calibrated but still coupled to that: with the geometric scale now whitened
 > away, what remains is per-target *coherence* variance (~2× — a hard persona like
 > hacker shatters at roughly half the effective gain a robust concept tolerates),
@@ -720,8 +740,11 @@ tok/s):
   terms (a folded vector, or `personas`/`emotions` when they resolve flat) take the
   constant-add fast path instead; prefer them where coherence allows.
 - **Share baked at fit**, normalized to mean 1 at apply; the subspace foot
-  translates by `share_L · _MANIFOLD_ALONG_GAIN · target` (the target already
-  carries the coefficient; `_MANIFOLD_GAIN = 0.5` is now the `onto`-only gain). No
+  translates by `share_L · gain · target` (affine `gain = _SUBSPACE_GAIN =
+  16.0`, target carries the coefficient; curved `gain = _MANIFOLD_ALONG_GAIN
+  = 4.0`, a fraction-to-node scale (clean-stateless-calibrated on months;
+  non-monotonic above the sweet spot on periodic fits — see Gain note);
+  `_MANIFOLD_ONTO_GAIN = 0.5` is the `onto`-only gain). No
   norm preservation (onto is meant to shrink `‖h‖`); the curved path's `norm_cap =
   3·‖h‖` is the only bound (the affine fast path carries no cap).
 - **Top-p via `torch.topk`**, not full-vocab sort; `top_k` (default 1024 cap) is a

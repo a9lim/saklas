@@ -18,7 +18,7 @@ from torch import nn
 
 from saklas.core.hooks import (
     _MANIFOLD_ALONG_GAIN,
-    _MANIFOLD_GAIN,
+    _MANIFOLD_ONTO_GAIN,
     _manifold_layer_shares,
     SteeringHook,
     SteeringManager,
@@ -331,7 +331,7 @@ def test_manager_user_coeffs_clamped_to_unit():
     mgr.apply_to_model(layers, torch.device("cpu"), torch.float32)
     along, onto = _coeffs(mgr.hooks[0])
     assert along == pytest.approx(_MANIFOLD_ALONG_GAIN, abs=1e-6)  # along: translate gain
-    assert onto == pytest.approx(min(1.0, _MANIFOLD_GAIN), abs=1e-6)  # onto: collapse gain
+    assert onto == pytest.approx(min(1.0, _MANIFOLD_ONTO_GAIN), abs=1e-6)  # onto: collapse gain
 
 
 def test_manager_along_share_weighting_mean_one():
@@ -376,10 +376,10 @@ def test_manager_along_unclamped_overshoots():
 
 def test_manager_onto_clamped_per_layer():
     """onto is a bounded collapse fraction: ``eff_onto_L = clamp(onto · share_L ·
-    _MANIFOLD_GAIN, 0, 1)``, clamped to [0, 1] per layer (a fraction > 1 would
+    _MANIFOLD_ONTO_GAIN, 0, 1)``, clamped to [0, 1] per layer (a fraction > 1 would
     invert the residual).  Each layer follows the share-weighted formula and the
     highest-spread layer (largest mean-1 share) carries the largest onto,
-    saturating at 1.0 only once ``share_L · _MANIFOLD_GAIN ≥ 1`` (gain-dependent,
+    saturating at 1.0 only once ``share_L · _MANIFOLD_ONTO_GAIN ≥ 1`` (gain-dependent,
     so asserted against the formula, not a hardcoded 1.0)."""
     n_layers = 3
     manifold = _manifold(layers=tuple(range(n_layers)))
@@ -389,10 +389,10 @@ def test_manager_onto_clamped_per_layer():
     ontos = [_coeffs(h)[1] for h in mgr.hooks.values()]
     assert all(0.0 <= o <= 1.0 + 1e-6 for o in ontos)            # clamp holds
     shares = _manifold_layer_shares(manifold)
-    expected = [min(1.0, shares[L] * _MANIFOLD_GAIN) for L in shares]
+    expected = [min(1.0, shares[L] * _MANIFOLD_ONTO_GAIN) for L in shares]
     assert sorted(ontos) == pytest.approx(sorted(expected), abs=1e-6)
     assert max(ontos) == pytest.approx(
-        min(1.0, max(shares.values()) * _MANIFOLD_GAIN), abs=1e-6,
+        min(1.0, max(shares.values()) * _MANIFOLD_ONTO_GAIN), abs=1e-6,
     )
 
 

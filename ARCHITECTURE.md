@@ -694,19 +694,19 @@ sum 1 (`_manifold_layer_shares` prefers the baked `mahalanobis_share`, else the
 Euclidean `‖eval_rbf(node_params)‖_F`), then:
 
 - **Merged affine subspace** (`add_subspace`): `eff_along_L = share_L ·
-  _MANIFOLD_ALONG_GAIN`, `onto = 0`. The coefficient α is already folded into
+  _SUBSPACE_GAIN`, `onto = 0`. The coefficient α is already folded into
   `target_coord` by `synthesize_subspace` (`Δ = Σ coeffᵢ·poleᵢ`, required for
   multi-term composition), so α scales the *size* of the translate offset and
   `share_L·base` scales the per-layer slide fraction. α is unclamped (it sets the
   offset magnitude).
 - **Curved manifold** (`add_manifold`): `eff_along_L = along · share_L ·
-  _MANIFOLD_ALONG_GAIN`, `eff_onto_L = clamp(onto · share_L · _MANIFOLD_GAIN, 0,
+  _SUBSPACE_GAIN`, `eff_onto_L = clamp(onto · share_L · _MANIFOLD_ONTO_GAIN, 0,
   1)`; the target is the full node position, so `along` is the slide fraction (the
   historic `%` knob), clamped to `[0,1]` at apply time. `onto` stays a `[0,1]`
   collapse fraction.
 
-**Two gain constants.** `_MANIFOLD_ALONG_GAIN = 16.0` (live-calibrated) scales
-**along** (the translate slide) in both modes; `_MANIFOLD_GAIN = 0.5` now scales **onto** only
+**Two gain constants.** `_SUBSPACE_GAIN = 16.0` (live-calibrated) scales
+**along** (the translate slide) in both modes; `_MANIFOLD_ONTO_GAIN = 0.5` now scales **onto** only
 (the off-surface collapse share-weight, curved-only — calibrated on the
 gemma-4-12b `emotions%dominant` onto sweep: at `1.0` even `onto=0.5` fragmented and
 `onto=1.0` collapsed into looping, since collapsing the off-surface residual
@@ -969,9 +969,9 @@ straight-chord additive baseline alongside.
   the between-persona covariance at fit time; strip the shared axis from the
   target), not the metric.
 - **`base_gain` magnitude.** Steering now uses **two** constants:
-  `_MANIFOLD_ALONG_GAIN = 16.0` (the translate slide, both modes) and
-  `_MANIFOLD_GAIN = 0.5` (onto / off-surface collapse only). Both are committed but
-  tagged prototypes. `_MANIFOLD_ALONG_GAIN` was bumped ~130×
+  `_SUBSPACE_GAIN = 16.0` (the translate slide, both modes) and
+  `_MANIFOLD_ONTO_GAIN = 0.5` (onto / off-surface collapse only). Both are committed but
+  tagged prototypes. `_SUBSPACE_GAIN` was bumped ~130×
   from the prior `0.125` when the affine target became whitened-unit (§5.3): the
   avg per-layer whitened push is now `GAIN·α` for *every* target, where the old
   raw-Euclidean target scaled it by each node's distance from neutral (a ~100×
@@ -979,7 +979,7 @@ straight-chord additive baseline alongside.
   slammed). `16.0` is live-calibrated on a gemma-4-12b α-sweep so α≈0.5 (effective
   `GAIN·α ≈ 8`) clearly steers concepts and personas alike while staying coherent
   for fragile personas; the per-target *coherence* ceiling (~2× variance, §10), not
-  the geometric scale, now caps it — α≈1.0 over-steers hard personas. `_MANIFOLD_GAIN`
+  the geometric scale, now caps it — α≈1.0 over-steers hard personas. `_MANIFOLD_ONTO_GAIN`
   was likewise calibrated on the gemma-4-12b `emotions%dominant`
   onto sweep: at `1.0` (combined with a directional push) `onto=0.5` already
   fragmented and `onto=1.0` collapsed into looping — collapsing the off-surface

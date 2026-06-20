@@ -232,7 +232,7 @@ independent) per-layer budget weight (`DEFAULT_N_COMPONENTS = 64`).
 `Manifold` — domain + per-layer `LayerSubspace`s + `node_labels`/`node_coords`/
 `node_roles`/`node_kinds` + the bakes `mahalanobis_share`/`origin` +
 `feature_space`/`metadata`. The `Profile` analogue. `node_kinds`
-(abstract/concrete) is generation-only provenance — it selects the system template
+(abstract/concrete/custom) is generation-only provenance — it selects the system template
 + elicitation role label at authoring time, but is NOT consumed at fit; it
 round-trips through the save/load sidecar. `manifold_point`, `tangent` (analytic
 RBF Jacobian), `resolve_position` (coord payload or label),
@@ -366,17 +366,27 @@ normalized — `_manifold_layer_shares` prefers the baked `mahalanobis_share`, e
 the Euclidean `‖eval_rbf(node_params)‖_F`), orthogonalizes the affine subspace
 against curved spans (`_orthogonalize_affine_against` — curved wins shared
 directions), and enforces `_CURVED_ORTHO_TOL = 1e-3` between two curved manifolds
-(`OverlappingManifoldError`). Gain: two constants — `_MANIFOLD_ALONG_GAIN = 16.0`
-(live-calibrated — see below) scales `along` (the translate slide, both modes),
-`_MANIFOLD_GAIN = 0.5` scales
-`onto` only (calibrated on the gemma-4-12b `emotions%dominant` onto sweep — at `1.0`
-even `onto=0.5` fragmented and `onto=1.0` collapsed; `0.5` makes `onto∈[0,1]` a
-usable dial with `1.0` a coherent ceiling). `eff_along_L = share_L · _MANIFOLD_ALONG_GAIN` (affine: α already in
-`target_coord`; curved: × clamped user `along`); `eff_onto_L = clamp(onto ·
-share_L · _MANIFOLD_GAIN, 0, 1)`. **No lever / N, no `[0,1]` clamp / water-fill on
+(`OverlappingManifoldError`). Gain: three constants — `_SUBSPACE_GAIN = 16.0`
+scales `along` on the **affine** path (whitened-unit target → free push *magnitude*,
+overshoot-safe; live-calibrated — see below); `_MANIFOLD_ALONG_GAIN = 4.0`
+scales `along` on the **curved** path, where the target is raw node coords so
+`eff_along` is a *fraction of the way to the node* (`1.0` lands on it; `norm_cap`
+bounds off-domain RBF extrapolation). Clean-stateless-calibrated on a gemma-4-12b
+`months_loop%january` sweep: `along=1.0` → `eff_along≈4` lands the vivid coherent
+winter sweet spot. CAVEAT — non-monotonic above on **periodic** fits: `eff_along` is
+share-weighted (`share∈[0.19,1.47]`) and `translate_foot` wraps, so past `~1` each
+layer orbits the ring at its own rate and lands on a *different* month, scattering
+the signal; `4` rides a coherent part of the wrap, not a magnitude. Deferred fix:
+clamp curved `eff_along` to `[0,1]` + drop share-weighting on periodic domains.
+`_MANIFOLD_ONTO_GAIN = 0.5`
+scales `onto` only (calibrated on the gemma-4-12b `emotions%dominant` onto sweep — at
+`1.0` even `onto=0.5` fragmented and `onto=1.0` collapsed; `0.5` makes `onto∈[0,1]` a
+usable dial with `1.0` a coherent ceiling). `eff_along_L = share_L · gain` (affine:
+`gain=16`, α already in `target_coord`; curved: `gain=4.0` × clamped user `along`);
+`eff_onto_L = clamp(onto · share_L · _MANIFOLD_ONTO_GAIN, 0, 1)`. **No lever / N, no `[0,1]` clamp / water-fill on
 `along`** (a high-share layer is meant to overshoot; `norm_cap` bounds it). `onto`
 stays clamped `[0,1]` (beyond 1 would overshoot through the wire/tube).
-(`_MANIFOLD_ALONG_GAIN` jumped ~130× *up* from the prior `0.125` when the affine
+(`_SUBSPACE_GAIN` jumped ~130× *up* from the prior `0.125` when the affine
 target went whitened-unit — the avg per-layer whitened push is now `GAIN·α`,
 target-independent, where it used to scale with each node's raw-Euclidean distance
 from neutral; `16.0` is live-calibrated on a gemma-4-12b α-sweep so `α ≈ 0.5`
@@ -582,15 +592,17 @@ does the HF load + layer-mean compute + probe bootstrap — there is no
 elicitation). Module-level helpers `_manifold_is_affine` / `_affine_manifold_push`
 (per-layer basis rows + node-coord targets for a flat manifold) back the dispatch.
 Conversational-elicitation helpers `_KIND_TEMPLATES` / `_article` / `_system_for`
-(the per-kind system prompt) / `_role_for` (the swapped assistant-role label:
-abstract → `someone_{slug}`, concrete → `{slug}`) author each node's corpus.
+(the per-kind system prompt — `custom` takes a caller-supplied template) /
+`_role_for` (the swapped assistant-role label: abstract → `someone_{slug}`,
+concrete → `{slug}`, `custom` → `None` (no swap — the custom system carries the
+frame, pooled in standard-assistant space)) author each node's corpus.
 
 `extract(concept, baseline, *, kind="abstract", ...)` authors a 2-node
 discover-`pca` manifold (`create_discover_manifold_folder`,
 `hyperparams={"max_dim": 1}`) and fits it via `ManifoldExtractionPipeline`,
 returning `(canonical_name, folded_vector_directions(manifold))`. The corpus is
 generated conversationally — `generate_responses(concepts, kinds, *, roles=None,
-samples_per_prompt=1, …)` has each pole answer the shared baseline prompts *in
+custom_system=None, samples_per_prompt=1, …)` has each pole answer the shared baseline prompts *in
 character*, the concept riding both the system prompt (`_system_for`) and the
 swapped assistant-role label (`_role_for`); responses are emitted samples-outer /
 prompts-inner so `response[i] ↔ prompt[i % k]`. Generation is **batched** —

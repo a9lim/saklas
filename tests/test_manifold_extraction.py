@@ -100,6 +100,7 @@ class _Handle:
         kinds: list[str | None],
         *,
         roles: dict[str, str | None] | None = None,
+        custom_system: str | None = None,
         samples_per_prompt: int = 1,
         max_new_tokens: int = 256,
         on_progress: Any = None,

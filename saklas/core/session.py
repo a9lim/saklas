@@ -222,20 +222,41 @@ def _article(word: str) -> str:
     return "an" if word[:1].lower() in "aeiou" else "a"
 
 
-def _system_for(concept_h: str, kind: str | None) -> str:
-    """A2 system prompt for a humanized concept under its kind (default abstract)."""
+def _system_for(
+    concept_h: str, kind: str | None, custom: str | None = None,
+) -> str:
+    """A2 system prompt for a humanized concept under its kind (default abstract).
+
+    ``abstract`` reads as "someone {c}", ``concrete`` as "{art} {c}", and
+    ``custom`` uses the caller-supplied ``custom`` template — a free-form
+    elicitation frame (``{c}``/``{art}`` placeholders) for a concept that is
+    neither a trait nor an entity (a month embodying its season, say), so the
+    generation framing is no longer limited to the two fixed templates.
+    """
+    if (kind or "abstract") == "custom":
+        if not custom:
+            raise ValueError(
+                "_system_for: kind='custom' requires a custom system template"
+            )
+        return custom.format(c=concept_h, art=_article(concept_h))
     template = _KIND_TEMPLATES.get(kind or "abstract", _KIND_TEMPLATES["abstract"])
     return template.format(c=concept_h, art=_article(concept_h))
 
 
-def _role_for(slug: str, kind: str | None) -> str:
+def _role_for(slug: str, kind: str | None) -> str | None:
     """A2 elicitation role label (the swapped assistant header) for a node.
 
     Abstract traits get a ``someone_{slug}`` speaker ("someone happy"); concrete
     entities are the bare slug ("pirate").  The underscore de-slugs to a space
-    at render (:func:`saklas.core.role_templates._render_label`).
+    at render (:func:`saklas.core.role_templates._render_label`).  ``custom``
+    returns ``None`` — no role swap; the custom system prompt carries the
+    framing and the corpus is pooled in standard-assistant space (the
+    persona-stays-generation-only pattern).
     """
-    return f"someone_{slug}" if (kind or "abstract") == "abstract" else slug
+    k = kind or "abstract"
+    if k == "custom":
+        return None
+    return f"someone_{slug}" if k == "abstract" else slug
 
 
 def _split_composite_source(
@@ -1568,6 +1589,7 @@ class SaklasSession:
         kinds: list[str | None],
         *,
         roles: dict[str, str | None] | None = None,
+        custom_system: str | None = None,
         samples_per_prompt: int = 1,
         max_new_tokens: int = _RESPONSE_MAX_TOKENS,
         on_progress: Callable[[str], None] | None = None,
@@ -1585,13 +1607,27 @@ class SaklasSession:
         ``prompt[i % k]`` -- the alignment :func:`compute_node_centroid` and the
         node corpus files assume.
 
+        ``custom_system`` is the system template used for any concept whose
+        ``kind`` is ``"custom"`` (``{c}`` = the humanized concept) -- the
+        free-form elicitation frame, e.g. ``"You are the month of {c}; speak as
+        that month."``.  ``custom`` kinds do **not** role-swap (role is ``None``,
+        the framing rides the system prompt and the corpus pools in
+        standard-assistant space), so ``custom`` works on every family including
+        those without a substitutable role header.
+
         Returns ``{concept: [response, ...]}`` with
         ``len == max(1, samples_per_prompt) * len(baseline_prompts)`` per
-        concept.  Always role-swaps (no system-only fallback); a family without
-        role support raises ``RoleSubstitutionUnsupportedError`` at generation.
+        concept.  ``abstract``/``concrete`` role-swap (a family without role
+        support raises ``RoleSubstitutionUnsupportedError`` at generation);
+        ``custom`` is the system-only exception.
         """
         from saklas.core.vectors import _LENGTH_DIRECTIVE, _load_baseline_prompts
 
+        if any((k or "abstract") == "custom" for k in kinds) and not custom_system:
+            raise ValueError(
+                "generate_responses: kind='custom' requires custom_system "
+                "(a system template with a {c} placeholder)"
+            )
         prompts = _load_baseline_prompts()
         roles = roles or {}
         reps = max(1, samples_per_prompt)
@@ -1602,7 +1638,7 @@ class SaklasSession:
             # The length directive leads the persona system prompt (and is the
             # whole system for the neutral baseline + capture), so it is shared
             # common-mode that cancels at extraction.
-            system = f"{_LENGTH_DIRECTIVE} {_system_for(concept_h, kind)}"
+            system = f"{_LENGTH_DIRECTIVE} {_system_for(concept_h, kind, custom_system)}"
             gen_role = roles.get(concept) or _role_for(_slug(concept), kind)
             responses: list[str] = []
             for _ in range(reps):

@@ -383,11 +383,22 @@ def _build_manifold_generate(generate: argparse.ArgumentParser) -> None:
         help="Concept slugs to generate corpora for (>= 2)",
     )
     generate.add_argument(
-        "--kind", choices=("abstract", "concrete"), default="abstract",
+        "--kind", choices=("abstract", "concrete", "custom"), default="abstract",
         help=(
             "Conceptual kind for every node (default: abstract).  Selects the "
-            "system template + elicitation role label: abstract -> 'someone "
-            "{c}', concrete -> '{art} {c}'."
+            "generation system template + elicitation role label: abstract -> "
+            "'someone {c}', concrete -> '{art} {c}', custom -> the --system "
+            "template (no role swap)."
+        ),
+    )
+    generate.add_argument(
+        "--system", dest="custom_system", default=None, metavar="TEMPLATE",
+        help=(
+            "Custom elicitation system prompt for --kind custom; use {c} for "
+            "the concept (e.g. \"You are the month of {c}; speak as that "
+            "month.\").  The framing rides the system prompt and the corpus "
+            "pools in standard-assistant space, so it works on every model "
+            "family.  Required when --kind custom."
         ),
     )
     generate.add_argument(
