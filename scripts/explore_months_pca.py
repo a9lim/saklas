@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from typing import Any
 
 import numpy as np
 import torch
@@ -67,7 +68,7 @@ CONTEXTS = [
 ]
 
 
-def capture_month_centroids(session, contexts):
+def capture_month_centroids(session: SaklasSession, contexts: list[tuple[str, str]]):
     """Return {layer: (12, D)} fp32 CPU — month-token centroids, ctx-averaged."""
     prompts: list[str] = []
     responses: list[str] = []
@@ -101,7 +102,7 @@ def capture_month_centroids(session, contexts):
     return centroids
 
 
-def whitened_grams(session, centroids):
+def whitened_grams(session: SaklasSession, centroids: dict[int, torch.Tensor]):
     """Per-layer whitened (K,K) Grams + between-month spread tr(G_L)."""
     whitener = session.whitener
     if whitener is None:
@@ -121,11 +122,11 @@ def whitened_grams(session, centroids):
     return grams, spread, layers
 
 
-def consensus_over(grams, subset):
+def consensus_over(grams: dict[int, torch.Tensor], subset: list[int]):
     return torch.stack([grams[idx] for idx in subset]).mean(dim=0)
 
 
-def neighbor_metrics(gram):
+def neighbor_metrics(gram: torch.Tensor):
     """Ring diagnostic straight from the whitened Gram.
 
     Pairwise whitened distances d²(i,j) = G_ii + G_jj - 2 G_ij (full-dim, no
@@ -141,7 +142,7 @@ def neighbor_metrics(gram):
     np.fill_diagonal(d2, np.inf)
     n = len(MONTHS)
 
-    def cyc(i, j):
+    def cyc(i: int, j: int):
         d = abs(i - j)
         return min(d, n - d)
 
@@ -156,7 +157,7 @@ def neighbor_metrics(gram):
     return mean_nn, hits / n, nn.tolist()
 
 
-def coords_from_gram(gram, k=3):
+def coords_from_gram(gram: torch.Tensor, k: int = 3):
     """Classical-MDS / PCA-from-Gram: top-k eigvecs scaled by sqrt(eigval)."""
     g = gram.numpy().astype(np.float64)
     vals, vecs = np.linalg.eigh(g)                        # ascending
@@ -168,7 +169,7 @@ def coords_from_gram(gram, k=3):
     return coords, vals_pos, ev_ratio
 
 
-def raw_pca_at(centroids, layer, k=3):
+def raw_pca_at(centroids: dict[int, torch.Tensor], layer: int, k: int = 3):
     x = centroids[layer].numpy().astype(np.float64)
     x = x - x.mean(axis=0, keepdims=True)
     u, s, vt = np.linalg.svd(x, full_matrices=False)
@@ -177,8 +178,9 @@ def raw_pca_at(centroids, layer, k=3):
     return coords, ev_ratio
 
 
-def plot(wcoords, w_ev, rcoords, r_ev, best_layer, spread, layers, band,
-         nn_dist, recall2, chance, model_id, out):
+def plot(wcoords: Any, w_ev: float, rcoords: Any, r_ev: float, best_layer: int,
+         spread: dict[int, float], layers: list[int], band: list[int],
+         nn_dist: float, recall2: float, chance: float, model_id: str, out: str):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -196,7 +198,7 @@ def plot(wcoords, w_ev, rcoords, r_ev, best_layer, spread, layers, band,
         fontsize=13,
     )
 
-    def scatter3d(ax, coords, title):
+    def scatter3d(ax: Any, coords: Any, title: str):
         ax.scatter(coords[:, 0], coords[:, 1], coords[:, 2],
                    c=colors, s=80, depthshade=False)
         # connect in calendar order — a ring shows as a closed loop, scatter
@@ -207,7 +209,9 @@ def plot(wcoords, w_ev, rcoords, r_ev, best_layer, spread, layers, band,
         for i, ab in enumerate(ABBR):
             ax.text(coords[i, 0], coords[i, 1], coords[i, 2], ab, fontsize=8)
         ax.set_title(title, fontsize=10)
-        ax.set_xticklabels([]); ax.set_yticklabels([]); ax.set_zticklabels([])
+        ax.set_xticklabels([])
+        ax.set_yticklabels([])
+        ax.set_zticklabels([])
 
     # whitened from two angles (3D-on-2D needs a second view)
     ax1 = fig.add_subplot(2, 3, 1, projection="3d")
@@ -240,7 +244,8 @@ def plot(wcoords, w_ev, rcoords, r_ev, best_layer, spread, layers, band,
     ax5.axvspan(band[0] - 0.5, band[-1] + 0.5, color="seagreen", alpha=0.08)
     ax5.axvline(best_layer, color="crimson", lw=1, ls="--",
                 label=f"best band = L{best_layer}")
-    ax5.set_xlabel("layer"); ax5.set_ylabel("tr(G_L)  (whitened σ² units)")
+    ax5.set_xlabel("layer")
+    ax5.set_ylabel("tr(G_L)  (whitened σ² units)")
     ax5.set_title("between-month separation per layer\n"
                   "(green = semantic band; early spikes = lexical)", fontsize=9)
     ax5.legend(fontsize=8)
@@ -301,7 +306,7 @@ def main():
         print(f"  nearest-neighbor cyclic-cal dist: {nn_dist:.2f}  "
               f"(1.0 = perfect ring, ~{chance:.2f} = chance)")
         print(f"  calendar-neighbor recall@2: {recall2:.0%}")
-        print(f"  each month -> nearest month: "
+        print("  each month -> nearest month: "
               + ", ".join(f"{ABBR[i]}->{ABBR[nn[i]]}" for i in range(len(MONTHS))))
 
     # primary plot = the semantic band (the honest 'is the structure there' view)

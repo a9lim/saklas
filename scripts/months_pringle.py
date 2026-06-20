@@ -25,6 +25,7 @@ import json
 import math
 import os
 import shutil
+from typing import Any
 
 import numpy as np
 import torch
@@ -45,7 +46,7 @@ EMB = "/Users/a9lim/.saklas/manifolds/local/months_seasonal"
 LOOP_NS, LOOP_NAME = "local", "months_loop"
 
 
-def pool_centroids(session, prompts):
+def pool_centroids(session: SaklasSession, prompts: list[str]):
     """{month: concat-all-layer centroid} from the embodiment corpora."""
     fs = sorted(glob.glob(f"{EMB}/nodes/*.json"),
                 key=lambda p: int(os.path.basename(p)[:2]))
@@ -59,7 +60,7 @@ def pool_centroids(session, prompts):
     return np.stack(X)  # (12, D)
 
 
-def pringle_decompose(X):
+def pringle_decompose(X: np.ndarray):
     """Force the calendar circle; return ring coords, out-of-plane axis, fits."""
     Xc = X - X.mean(0, keepdims=True)
     th = np.array([2 * math.pi * k / 12 for k in range(12)])
@@ -76,7 +77,7 @@ def pringle_decompose(X):
     U, S, Vt = np.linalg.svd(resid, full_matrices=False)
     z = U[:, 0] * S[0]                                  # (12,) out-of-plane coord
 
-    def r2(design):
+    def r2(design: list[np.ndarray]):
         A = np.column_stack(design + [np.ones(12)])
         coef, *_ = np.linalg.lstsq(A, z, rcond=None)
         pred = A @ coef
@@ -92,8 +93,9 @@ def pringle_decompose(X):
                 oop_frac=float(oop_var / (ring_var + oop_var)))
 
 
-def plot(dec, out):
-    import matplotlib; matplotlib.use("Agg")
+def plot(dec: dict[str, Any], out: str):
+    import matplotlib
+    matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib import cm
     colors = cm.twilight(np.linspace(0, 1, 12, endpoint=False))
@@ -118,14 +120,16 @@ def plot(dec, out):
     tt = np.linspace(0, 2*math.pi, 240)
     from numpy import interp
     thx = np.concatenate([th, [2*math.pi]])
-    def wrap(v): return interp(tt, thx, np.concatenate([v, v[:1]]), period=2*math.pi)
+    def wrap(v: np.ndarray): return interp(tt, thx, np.concatenate([v, v[:1]]), period=2*math.pi)
     ax.plot(wrap(ring[:,0]), wrap(ring[:,1]), wrap(zz), color="0.6", lw=1.2)
     ax.scatter(ring[:,0], ring[:,1], zz, c=colors, s=220, depthshade=False,
                edgecolor="k", lw=0.4)
     for i, ab in enumerate(ABBR):
         ax.text(ring[i,0], ring[i,1], zz[i], "  "+ab, fontsize=9, weight="bold")
     ax.set_title("forced calendar circle (x,y) lifted by out-of-plane axis (z)", fontsize=11)
-    ax.set_xlabel("ring cos"); ax.set_ylabel("ring sin"); ax.set_zlabel("out-of-plane")
+    ax.set_xlabel("ring cos")
+    ax.set_ylabel("ring sin")
+    ax.set_zlabel("out-of-plane")
     ax.view_init(elev=22, azim=40)
 
     ax2 = fig.add_subplot(1, 2, 2)
@@ -133,21 +137,25 @@ def plot(dec, out):
     ax2.plot(range(12), z, "-o", color="0.5", zorder=1)
     ax2.scatter(range(12), z, c=colors, s=160, zorder=2, edgecolor="k", lw=0.4)
     # overlay best period-2 cosine for visual
-    c2 = np.cos(2*th); s2 = np.sin(2*th)
-    A = np.column_stack([c2, s2, np.ones(12)]); coef,*_=np.linalg.lstsq(A,z,rcond=None)
+    c2 = np.cos(2*th)
+    s2 = np.sin(2*th)
+    A = np.column_stack([c2, s2, np.ones(12)])
+    coef, *_ = np.linalg.lstsq(A, z, rcond=None)
     fine = np.linspace(0,11,240)
     ax2.plot(fine, (np.column_stack([np.cos(2*2*math.pi*fine/12),
              np.sin(2*2*math.pi*fine/12), np.ones_like(fine)])@coef),
              "r--", lw=1, label=f"period-2 fit (R²={dec['r2_period2']:.2f})")
-    ax2.set_xticks(range(12)); ax2.set_xticklabels(ABBR, fontsize=8)
-    ax2.set_ylabel("out-of-plane coord"); ax2.legend(fontsize=9)
+    ax2.set_xticks(range(12))
+    ax2.set_xticklabels(ABBR, fontsize=8)
+    ax2.set_ylabel("out-of-plane coord")
+    ax2.legend(fontsize=9)
     ax2.set_title("out-of-plane vs month — period-2 = saddle rim (up-down-up-down)", fontsize=11)
     fig.tight_layout(rect=(0,0,1,0.93))
     fig.savefig(out, dpi=140)
     print(f"wrote {out}")
 
 
-def fit_saklas_loop(session):
+def fit_saklas_loop(session: SaklasSession):
     """Author + fit the real periodic 1D BoxDomain manifold on embodiment corpora."""
     folder = f"/Users/a9lim/.saklas/manifolds/{LOOP_NS}/{LOOP_NAME}"
     if os.path.exists(folder):

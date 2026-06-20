@@ -20,7 +20,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import glob
 import json
 import os
 import shutil
@@ -53,7 +52,7 @@ SEASONAL_SYSTEM = (
 )
 
 
-def generate(session, max_new_tokens):
+def generate(session: SaklasSession, max_new_tokens: int):
     prompts = _load_baseline_prompts()
     print(f"  {len(prompts)} baseline prompts x {len(MONTHS)} months "
           f"= {len(prompts) * len(MONTHS)} responses @ {max_new_tokens} tok")
@@ -75,14 +74,14 @@ def generate(session, max_new_tokens):
     return corpora
 
 
-def neighbor_metrics(coords):
+def neighbor_metrics(coords: np.ndarray):
     """Calendar-neighbor ring diagnostic on the layout coords (Euclidean)."""
     x = np.asarray(coords, dtype=np.float64)
     d2 = ((x[:, None, :] - x[None, :, :]) ** 2).sum(-1)
     np.fill_diagonal(d2, np.inf)
     n = len(MONTHS)
 
-    def cyc(i, j):
+    def cyc(i: int, j: int):
         d = abs(i - j)
         return min(d, n - d)
 
@@ -93,7 +92,8 @@ def neighbor_metrics(coords):
     return mean_nn, hits / n, nn.tolist(), chance
 
 
-def plot(coords, resolved, nn_dist, recall2, chance, model_id, out):
+def plot(coords: np.ndarray, resolved: str, nn_dist: float, recall2: float,
+         chance: float, model_id: str, out: str):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -119,8 +119,10 @@ def plot(coords, resolved, nn_dist, recall2, chance, model_id, out):
             ax.annotate(ab, (x[i, 0], x[i, 1]), fontsize=11, ha="center",
                         va="center", color="white", weight="bold", zorder=3)
         ax.set_title(f"month -> {mode} color", fontsize=13)
-        ax.set_xlabel("layout dim 0"); ax.set_ylabel("layout dim 1")
-        ax.set_aspect("equal", adjustable="datalim"); ax.grid(alpha=0.25)
+        ax.set_xlabel("layout dim 0")
+        ax.set_ylabel("layout dim 1")
+        ax.set_aspect("equal", adjustable="datalim")
+        ax.grid(alpha=0.25)
     verdict = ("RING" if nn_dist < 1.6 and "periodic" in resolved.lower()
                else "ARC / ordinal" if nn_dist < 1.6 else "FLAT scatter")
     fig.suptitle(

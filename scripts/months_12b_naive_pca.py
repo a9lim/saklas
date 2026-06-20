@@ -11,6 +11,8 @@ pipeline's own compute_node_centroid so the centroids match what the fit saw.
 from __future__ import annotations
 
 import json
+from typing import Any
+
 import numpy as np
 import torch
 
@@ -26,14 +28,15 @@ ABBR = [m[:3] for m in MONTHS]
 MAN = "/Users/a9lim/.saklas/manifolds/local"
 
 
-def node_files(folder):
-    import glob, os
+def node_files(folder: str):
+    import glob
+    import os
     fs = sorted(glob.glob(f"{MAN}/{folder}/nodes/*.json"),
                 key=lambda p: int(os.path.basename(p)[:2]))
     return [json.load(open(f)) for f in fs]   # list[ list[str] ], month-ordered
 
 
-def pool_set(session, corpora, prompts):
+def pool_set(session: SaklasSession, corpora: list[list[str]], prompts: list[str]):
     """{month_idx: concat-over-layers centroid vector} via compute_node_centroid."""
     vecs = []
     for i, responses in enumerate(corpora):
@@ -47,7 +50,7 @@ def pool_set(session, corpora, prompts):
     return np.stack(vecs)  # (12, D_total)
 
 
-def naive_pca3(X):
+def naive_pca3(X: np.ndarray):
     Xc = X - X.mean(0, keepdims=True)
     U, S, Vt = np.linalg.svd(Xc, full_matrices=False)
     coords = U[:, :3] * S[:3][None, :]
@@ -73,7 +76,8 @@ def main():
     print(f"\ntemplate naive top-3 explained var:   {evt:.0%}")
     print(f"embodiment naive top-3 explained var: {eve:.0%}")
 
-    import matplotlib; matplotlib.use("Agg")
+    import matplotlib
+    matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib import cm
     colors = cm.twilight(np.linspace(0, 1, 12, endpoint=False))
@@ -83,7 +87,7 @@ def main():
                  f"TEMPLATE 'it is currently X' (top-3 var {evt:.0%})   vs   "
                  f"EMBODIMENT 'I am January...' (top-3 var {eve:.0%})", fontsize=13)
 
-    def scat(ax, C, title, azim):
+    def scat(ax: Any, C: np.ndarray, title: str, azim: int):
         loop = np.vstack([C, C[:1]])
         ax.plot(loop[:,0], loop[:,1], loop[:,2], color="0.6", lw=0.8, alpha=0.7)
         ax.scatter(C[:,0], C[:,1], C[:,2], c=colors, s=90, depthshade=False)
@@ -91,7 +95,9 @@ def main():
             ax.text(C[i,0], C[i,1], C[i,2], ab, fontsize=8)
         ax.set_title(title, fontsize=10)
         ax.view_init(elev=18, azim=azim)
-        ax.set_xticklabels([]); ax.set_yticklabels([]); ax.set_zticklabels([])
+        ax.set_xticklabels([])
+        ax.set_yticklabels([])
+        ax.set_zticklabels([])
 
     for col, (C, name) in enumerate([(Ct, "TEMPLATE"), (Ce, "EMBODIMENT")]):
         for row, azim in enumerate([35, 125]):
