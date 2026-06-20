@@ -368,17 +368,21 @@ against curved spans (`_orthogonalize_affine_against` — curved wins shared
 directions), and enforces `_CURVED_ORTHO_TOL = 1e-3` between two curved manifolds
 (`OverlappingManifoldError`). Gain: three constants — `_SUBSPACE_GAIN = 16.0`
 scales `along` on the **affine** path (whitened-unit target → free push *magnitude*,
-overshoot-safe; live-calibrated — see below); `_MANIFOLD_ALONG_GAIN = 1.5`
+overshoot-safe; live-calibrated — see below); `_MANIFOLD_ALONG_GAIN = 4.0`
 scales `along` on the **curved** path, where the target is raw node coords so
-`eff_along` is a *fraction of the way to the node* (`1.0` lands on it) and past ~1
-the `r³` RBF extrapolates → blow-up — so curved needs a small fraction gain, not the
-affine magnitude gain (calibrated on a gemma-4-12b `weekday` curved sweep: the
-affine `16` detonated even α=0.2; `1.5` maps user α onto the coherent
-`eff_along ≈ 0.8–1.6` band, scale-free across curved fits); `_MANIFOLD_ONTO_GAIN = 0.5`
+`eff_along` is a *fraction of the way to the node* (`1.0` lands on it; `norm_cap`
+bounds off-domain RBF extrapolation). Clean-stateless-calibrated on a gemma-4-12b
+`months_loop%january` sweep: `along=1.0` → `eff_along≈4` lands the vivid coherent
+winter sweet spot. CAVEAT — non-monotonic above on **periodic** fits: `eff_along` is
+share-weighted (`share∈[0.19,1.47]`) and `translate_foot` wraps, so past `~1` each
+layer orbits the ring at its own rate and lands on a *different* month, scattering
+the signal; `4` rides a coherent part of the wrap, not a magnitude. Deferred fix:
+clamp curved `eff_along` to `[0,1]` + drop share-weighting on periodic domains.
+`_MANIFOLD_ONTO_GAIN = 0.5`
 scales `onto` only (calibrated on the gemma-4-12b `emotions%dominant` onto sweep — at
 `1.0` even `onto=0.5` fragmented and `onto=1.0` collapsed; `0.5` makes `onto∈[0,1]` a
 usable dial with `1.0` a coherent ceiling). `eff_along_L = share_L · gain` (affine:
-`gain=16`, α already in `target_coord`; curved: `gain=1.5` × clamped user `along`);
+`gain=16`, α already in `target_coord`; curved: `gain=4.0` × clamped user `along`);
 `eff_onto_L = clamp(onto · share_L · _MANIFOLD_ONTO_GAIN, 0, 1)`. **No lever / N, no `[0,1]` clamp / water-fill on
 `along`** (a high-share layer is meant to overshoot; `norm_cap` bounds it). `onto`
 stays clamped `[0,1]` (beyond 1 would overshoot through the wire/tube).

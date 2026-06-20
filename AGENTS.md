@@ -373,10 +373,15 @@ share_L = n_layers`) and `eff_along_L = share_L · gain`. The along-gain is
 **path-specific** — `_SUBSPACE_GAIN = 16.0` on the affine path (whitened-unit
 target, free push magnitude, overshoot-safe; bumped from `0.125` when the affine
 target went whitened-unit, live-recalibrated on gemma-4-12b, see below) and
-`_MANIFOLD_ALONG_GAIN = 1.5` on the curved path (the curved target is raw
-node coords, so `eff_along` is a *fraction to the node* — past ~1 the `r³` RBF
-extrapolates and blows up; the affine `16` detonated curved fits, `1.5` keeps them
-in the coherent fraction band). `_MANIFOLD_ONTO_GAIN` scales
+`_MANIFOLD_ALONG_GAIN = 4.0` on the curved path (the curved target is raw
+node coords, so `eff_along` is a *fraction to the node* — `1.0` lands on it,
+`norm_cap` bounds off-domain RBF extrapolation; clean-stateless-calibrated on
+`months_loop%january` so `along=1.0` → `eff_along≈4` lands the vivid coherent winter
+sweet spot. CAVEAT: non-monotonic above on *periodic* fits — share-weighted
+`eff_along` wraps each layer around the ring at its own rate past ~1, scattering the
+layers onto different nodes; `4` rides a coherent part of the wrap, not a magnitude.
+Deferred fix: clamp curved `eff_along` to `[0,1]` + drop share-weighting on periodic
+domains). `_MANIFOLD_ONTO_GAIN` scales
 **onto** only (the curved off-surface collapse). For an affine term the
 coefficient α is folded into the translate *target* by `synthesize_subspace`, so α
 scales the offset magnitude (unclamped); for a curved term α is the (clamped
@@ -737,7 +742,9 @@ tok/s):
 - **Share baked at fit**, normalized to mean 1 at apply; the subspace foot
   translates by `share_L · gain · target` (affine `gain = _SUBSPACE_GAIN =
   16.0`, target carries the coefficient; curved `gain = _MANIFOLD_ALONG_GAIN
-  = 1.5`, a fraction-to-node scale; `_MANIFOLD_ONTO_GAIN = 0.5` is the `onto`-only gain). No
+  = 4.0`, a fraction-to-node scale (clean-stateless-calibrated on months;
+  non-monotonic above the sweet spot on periodic fits — see Gain note);
+  `_MANIFOLD_ONTO_GAIN = 0.5` is the `onto`-only gain). No
   norm preservation (onto is meant to shrink `‖h‖`); the curved path's `norm_cap =
   3·‖h‖` is the only bound (the affine fast path carries no cap).
 - **Top-p via `torch.topk`**, not full-vocab sort; `top_k` (default 1024 cap) is a

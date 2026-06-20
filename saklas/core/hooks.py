@@ -811,30 +811,33 @@ _MANIFOLD_ONTO_GAIN = 0.5
 _SUBSPACE_GAIN = 16.0
 
 # --- curved-path translate gain (separate from the affine gain above) --------
-# The ``_SUBSPACE_GAIN = 16`` above was live-calibrated **entirely on the
-# affine path** (``formal.casual%formal``, ``personas%caveman/hacker`` — personas
-# resolves flat, so those are affine ``%``), where ``synthesize_subspace`` emits a
-# *whitened-unit* target and α is a free push *magnitude*: pushing 8 whitened units
-# past the node is safe because the affine map is linear and ``norm_cap`` bounds it.
+# The ``_SUBSPACE_GAIN = 16`` above is the **affine** path's free-magnitude gain
+# (whitened-unit target, ``norm_cap``-bounded).  The **curved** path is different
+# in kind: its target is the node's *raw domain coordinates* and ``subspace_inject``
+# translates the foot by ``eff_along·(target − origin)`` (``domain.translate_foot``),
+# so ``eff_along`` is a **fraction of the way to the node** (``1.0`` lands on it),
+# not a free magnitude.  ``norm_cap = 3·‖h‖`` bounds the off-domain RBF
+# extrapolation, so a curved fit doesn't detonate the way the affine path would —
+# instead, *past* ``eff_along ≈ 1`` the foot keeps translating past the node.
 #
-# The **curved** path is different in kind.  Its target is the node's *raw domain
-# coordinates* and ``subspace_inject`` translates the foot by
-# ``eff_along·(target − origin)`` — so ``eff_along`` is a **fraction of the way to
-# the node** (``1.0`` lands on it), not a free magnitude.  Past ~1 the foot leaves
-# the fitted domain and the polyharmonic (``r³``) RBF *extrapolates cubically* →
-# activation blow-up → token-soup.  With the affine ``16`` even α=0.1 translated
-# ~1.6× to the node and α≥0.2 (~3×) detonated (gemma-4-12b ``weekday`` sweep).
+# Live-calibrated on a CLEAN gemma-4-12b ``months_loop%january`` α-sweep
+# (stateless=True — earlier sweeps were confounded by conversation accumulation;
+# see ``scripts/curved_gain_calibrate.py`` / ``months_low_gain.py``).  ``along=1.0``
+# at gain ``4`` (``eff_along ≈ 4``) lands the vivid coherent winter sweet spot
+# ("skeletal trees heavy with frost", consistent across seeds); gain ``2`` is milder
+# but clearly cold; the prior ``1.5`` was too weak (only a "cool prickle").
 #
-# So curved steering needs a small *fraction* gain, not the affine magnitude gain.
-# Live-calibrated on the gemma-4-12b ``weekday`` α-sweep: the coherent + clearly
-# day-flavored band sat at ``eff_along ≈ 0.8`` ("fresh-start Monday") to ``≈ 1.6``
-# ("grind Monday"), detonating by ``≈ 3``.  ``1.5`` maps the user range onto that
-# band — α≈0.5 → ``0.75`` (near the node, the recommended sweet spot), α≈1.0 →
-# ``1.5`` (on / just past, strong but coherent) — matching the affine α convention
-# while staying scale-free across curved manifolds ("fraction to node" is
-# scale-invariant, so a faint fit and a strong one share one gain).  Prototype,
-# like its affine sibling.
-_MANIFOLD_ALONG_GAIN = 1.5
+# CAVEAT — non-monotonic above the sweet spot on PERIODIC fits (a9 will revisit).
+# ``months_loop`` is a period-12 ring; ``translate_foot`` wraps, and ``eff_along`` is
+# share-weighted (per-layer ``share ∈ [0.19, 1.47]``), so past ``~1`` each layer
+# orbits the loop at its own rate and the layers land on *different* months → the
+# seasonal signal washes out / scatters rather than intensifying (foot-ring
+# geometry: ``scripts/months_foot_ring.py``).  ``4`` rides a coincidentally-coherent
+# part of the wrap; it is NOT a "stronger = more january" magnitude.  The principled
+# fix (deferred) is to clamp the curved ``eff_along`` to ``[0,1]`` and stop
+# share-weighting it on periodic domains so ``along=1`` lands every layer exactly on
+# the node.  Prototype, like its affine sibling.
+_MANIFOLD_ALONG_GAIN = 4.0
 
 # Max |cosine| between two *curved* manifold subspaces sharing a layer before
 # they are deemed overlapping (``OverlappingManifoldError``).  Curved manifolds
