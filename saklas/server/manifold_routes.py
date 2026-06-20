@@ -168,7 +168,10 @@ class GenerateManifoldRequest(BaseModel):
     name: str
     description: str = ""
     concepts: list[str]
-    kind: Literal["abstract", "concrete"] = "abstract"
+    kind: Literal["abstract", "concrete", "custom"] = "abstract"
+    # Required when ``kind == "custom"`` — the free-form elicitation system
+    # prompt (``{c}`` = the concept), no role swap (pools in standard space).
+    custom_system: str | None = None
     samples_per_prompt: int = 1
     fit_mode: Literal["pca", "spectral", "auto"] = "pca"
     hyperparams: dict[str, Any] = {}
@@ -742,6 +745,11 @@ def register_manifold_routes(app: FastAPI) -> None:
         # persona manifold, pooled in role-baselined space).  Otherwise the
         # node's ``kind`` drives a generation-only elicitation role and capture
         # stays standard (swap-back).
+        if req.kind == "custom" and not req.custom_system:
+            raise HTTPException(
+                400, "kind='custom' requires custom_system (a system template "
+                "with a {c} placeholder)",
+            )
         node_roles_map: dict[str, str | None] | None = None
         if req.role_per_node:
             node_roles_map = {c: c for c in req.concepts}
@@ -768,6 +776,7 @@ def register_manifold_routes(app: FastAPI) -> None:
                 corpora = session.generate_responses(
                     [concept], [req.kind],
                     roles=gen_roles,
+                    custom_system=req.custom_system,
                     samples_per_prompt=req.samples_per_prompt,
                     on_progress=on_progress,
                 )

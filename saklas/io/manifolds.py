@@ -204,16 +204,18 @@ def _validate_node_role(name: str, label: str, role: Any) -> str | None:
     return role
 
 
-_NODE_KINDS = ("abstract", "concrete")
+_NODE_KINDS = ("abstract", "concrete", "custom")
 
 
 def _validate_node_kind(name: str, label: str, kind: Any) -> str | None:
     """Validate an optional per-node ``kind`` field.
 
     ``None`` / missing means "unspecified".  A non-empty value must be one of
-    :data:`_NODE_KINDS` (``"abstract"`` / ``"concrete"``).  Generation-time
-    provenance only — it selects the system template and elicitation role label
-    when authoring a node's conversational corpus, and never feeds the fit.
+    :data:`_NODE_KINDS` (``"abstract"`` / ``"concrete"`` / ``"custom"``).
+    Generation-time provenance only — it selects the system template and
+    elicitation role label when authoring a node's conversational corpus
+    (``custom`` = a caller-supplied system prompt, no role swap), and never
+    feeds the fit.
     """
     if kind is None:
         return None

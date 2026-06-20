@@ -74,7 +74,8 @@ bipolar separator and the `%label` lexer would mis-read it), branches on
 `fit_mode`, enforces `min_nodes` on authored folders (discover at fit time),
 verifies `files`, and demands a sidecar per fitted tensor. `source`
 (`local`/`bundled`/`hf://...`) and `tags` ride `manifold.json`. Each node entry
-also carries an optional `kind` ∈ {`abstract`, `concrete`} (`_validate_node_kind`),
+also carries an optional `kind` ∈ {`abstract`, `concrete`, `custom`} (`_validate_node_kind`;
+`custom` = a caller-supplied generation system prompt, no role swap),
 parallel to the optional `role` — generation-only provenance (it selects the
 generation system template + elicitation role label) that the fit never consumes;
 it rides `ManifoldFolder.node_kinds` / `ManifoldSidecar.node_kinds` and is emitted

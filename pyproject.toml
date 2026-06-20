@@ -44,7 +44,9 @@ classifiers = [
 ]
 dependencies = [
     "torch>=2.2",
-    "transformers>=4.51",
+    # >=5.10: gemma4_unified (the Gemma-4 unified arch, a tested arch) lands in
+    # the 5.10 line; 5.8/5.9 only ship the non-unified gemma4 and fail to load it.
+    "transformers>=5.10",
     "accelerate>=0.27",
     "safetensors>=0.7.0",
     "textual>=0.50",

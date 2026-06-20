@@ -1508,6 +1508,14 @@ def _run_manifold_generate(args: argparse.Namespace) -> None:
     from saklas.io.paths import manifold_dir
 
     _require_model(args)
+    if args.kind == "custom" and not getattr(args, "custom_system", None):
+        print(
+            "manifold generate: --kind custom requires --system "
+            '(a template with a {c} placeholder, e.g. "You are the month of '
+            '{c}; speak as that month.")',
+            file=sys.stderr,
+        )
+        sys.exit(2)
     if len(args.concepts) < 2:
         print(
             "manifold generate: need >= 2 concepts (a discover manifold is "
@@ -1582,6 +1590,7 @@ def _run_manifold_generate(args: argparse.Namespace) -> None:
             corpora = session.generate_responses(
                 [concept], [args.kind],
                 roles=gen_roles,
+                custom_system=getattr(args, "custom_system", None),
                 samples_per_prompt=args.samples_per_prompt,
                 on_progress=lambda m: print(f"  {m}"),
             )

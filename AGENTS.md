@@ -54,7 +54,7 @@ pip install -e ".[sae]"                         # SAELens-backed SAE extraction
 saklas tui <model_id> [--no-dls]
 saklas serve <model_id> [--no-web] [--steer/-S EXPR]
 saklas manifold extract <concept>|<pos> <neg> [-m MODEL] [--sae RELEASE] [--role SLUG] [--namespace NS] [-f]
-saklas manifold generate <name> --concepts C... [--kind abstract|concrete] [--samples-per-prompt K] [--seed S]
+saklas manifold generate <name> --concepts C... [--kind abstract|concrete|custom] [--system TEMPLATE] [--samples-per-prompt K] [--seed S]
 saklas manifold from-template <template> [--name MANIFOLD] [--fit-mode auto|pca|spectral] [--max-dim N] [--var-threshold T] [--description TEXT] [-f]   # derive a discover manifold from a standalone template
 saklas manifold fit <name>|<folder> [-m MODEL] [--sae REL] [--method pca|spectral|auto] [--max-dim N] [--min-dim N] [--var-threshold T] [--k-nn K] [--bandwidth SIGMA] [--max-subspace-dim R] [--smoothing auto|0|LAMBDA] [--persistence-frac F]  # authored or discover-mode (hyperparams apply only to discover folders; --smoothing curved only, --persistence-frac auto only)
 saklas manifold bake <name> <expression> [-m]    # shared grammar: "0.3 ns/a + 0.5 ns/b|ns/c"
@@ -526,9 +526,12 @@ and routes one periodic axis, while rejecting arcs/lines/grids/blobs/persona-fan
 exact interpolation, a float is a fixed λ; the penalty regularizes the surface
 against centroid noise without touching the hot-path evaluator.
 
-`manifold generate <name> --concepts ... [--kind abstract|concrete]` LLM-authors a
-discover folder via `session.generate_responses` — each concept answers the shared
-baseline prompts in character (one corpus per node). The shared baseline prompts
+`manifold generate <name> --concepts ... [--kind abstract|concrete|custom]
+[--system TEMPLATE]` LLM-authors a discover folder via
+`session.generate_responses` — each concept answers the shared baseline prompts
+in character (one corpus per node; `--kind custom` rides the `--system` template
+— `{c}` = concept — with no role swap, the system-only frame that works on every
+model family). The shared baseline prompts
 hold topic common-mode across nodes (response[i] ↔ prompt[i % k]), so the
 per-concept centroids stay comparable without a per-manifold scenario set.
 `manifold fit <name>` then fits — the two steps are deliberate (a flaky
@@ -564,6 +567,14 @@ partial folder in the package tree without exposing it as a default manifold:
   per-model (flat affine vs curved RBF by GCV, with periodic detection); on
   gemma-4-12B it resolves to a flat 3-D affect subspace. It materializes only after
   all 20 mood corpora exist; incomplete package-data output is skipped.
+- **`months`** — an **authored** periodic 1-D `BoxDomain` loop, 12 first-person
+  month nodes (`january`…`december` at coords 0…11, December wrapping to January).
+  The corpus is `kind=custom` seasonal-embodiment ("I am January…") pooled in
+  standard-assistant space. The cyclic geometry is authored, not auto-discovered —
+  the year is a known cycle, and a per-model auto-fit GCV-prefers a flat subspace,
+  so the closed ring is declared in `manifold.json` (regen fills the corpora only).
+  The corpus carries a warm↔cold seasonal axis and a period-2 solstice/equinox
+  "extremeness" axis that lift the ring into a saddle.
 
 Recommended α is vector-comparable: aim for `α ≈ 0.5`, tune up toward `α ≈ 1.0`
 for stronger expression. (For an affine push term α is unclamped — it sets the

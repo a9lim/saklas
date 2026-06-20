@@ -131,11 +131,13 @@ category list through verbatim (tagged concepts only, no multi-node sweep).
   `--method`/`--legacy`** — difference-of-means (a 2-node `pca` fit) is the only
   method.
 - `manifold generate`: `name` + `--concepts C...` (required, ≥2),
-  `[--kind {abstract,concrete}] [--samples-per-prompt K] [--seed INT]
-  [--role-per-node] [-m] [-f]`. LLM-authors a discover folder via
+  `[--kind {abstract,concrete,custom}] [--system TEMPLATE] [--samples-per-prompt K]
+  [--seed INT] [--role-per-node] [-m] [-f]`. LLM-authors a discover folder via
   `session.generate_responses` — each node's corpus is in-character responses to
   the shared A2 baseline prompts (`--kind` selects the system template +
-  elicitation role label; `--samples-per-prompt` is responses per baseline prompt,
+  elicitation role label: abstract → `someone {c}`, concrete → `{art} {c}`,
+  `custom` → the `--system` template ({c} = concept, no role swap, required when
+  `--kind custom`); `--samples-per-prompt` is responses per baseline prompt,
   default 1). `--role-per-node` doubles each concept slug as that node's
   assistant-role substitution → a persona manifold.
 - `manifold fit`: positional `target` (a manifold name *or* a folder path;

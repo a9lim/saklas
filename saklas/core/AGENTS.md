@@ -232,7 +232,7 @@ independent) per-layer budget weight (`DEFAULT_N_COMPONENTS = 64`).
 `Manifold` — domain + per-layer `LayerSubspace`s + `node_labels`/`node_coords`/
 `node_roles`/`node_kinds` + the bakes `mahalanobis_share`/`origin` +
 `feature_space`/`metadata`. The `Profile` analogue. `node_kinds`
-(abstract/concrete) is generation-only provenance — it selects the system template
+(abstract/concrete/custom) is generation-only provenance — it selects the system template
 + elicitation role label at authoring time, but is NOT consumed at fit; it
 round-trips through the save/load sidecar. `manifold_point`, `tangent` (analytic
 RBF Jacobian), `resolve_position` (coord payload or label),
@@ -588,15 +588,17 @@ does the HF load + layer-mean compute + probe bootstrap — there is no
 elicitation). Module-level helpers `_manifold_is_affine` / `_affine_manifold_push`
 (per-layer basis rows + node-coord targets for a flat manifold) back the dispatch.
 Conversational-elicitation helpers `_KIND_TEMPLATES` / `_article` / `_system_for`
-(the per-kind system prompt) / `_role_for` (the swapped assistant-role label:
-abstract → `someone_{slug}`, concrete → `{slug}`) author each node's corpus.
+(the per-kind system prompt — `custom` takes a caller-supplied template) /
+`_role_for` (the swapped assistant-role label: abstract → `someone_{slug}`,
+concrete → `{slug}`, `custom` → `None` (no swap — the custom system carries the
+frame, pooled in standard-assistant space)) author each node's corpus.
 
 `extract(concept, baseline, *, kind="abstract", ...)` authors a 2-node
 discover-`pca` manifold (`create_discover_manifold_folder`,
 `hyperparams={"max_dim": 1}`) and fits it via `ManifoldExtractionPipeline`,
 returning `(canonical_name, folded_vector_directions(manifold))`. The corpus is
 generated conversationally — `generate_responses(concepts, kinds, *, roles=None,
-samples_per_prompt=1, …)` has each pole answer the shared baseline prompts *in
+custom_system=None, samples_per_prompt=1, …)` has each pole answer the shared baseline prompts *in
 character*, the concept riding both the system prompt (`_system_for`) and the
 swapped assistant-role label (`_role_for`); responses are emitted samples-outer /
 prompts-inner so `response[i] ↔ prompt[i % k]`. Generation is **batched** —
