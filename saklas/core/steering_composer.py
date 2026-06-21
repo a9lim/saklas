@@ -926,7 +926,19 @@ class SteeringComposer:
         self.install_composed_steering()
 
     def snapshot_steering_alphas(self) -> dict[str, float]:
-        """Flatten the active steering stack for ``GenerationResult.vectors``."""
+        """Flatten the active steering stack for ``GenerationResult.vectors``.
+
+        For a plain vector entry, ``entry[0]`` is the additive alpha (the
+        strength coefficient, typically in ``[0, 1]``).
+
+        For a :class:`~saklas.core.steering_expr.ManifoldTerm`, ``entry.coeff``
+        delegates to ``entry.along`` — the *slide fraction* toward the manifold
+        position (clamped ``[0, 1]`` at injection time), not an additive
+        scalar.  These two kinds are semantically different (slide fraction vs
+        additive alpha), but both are reported as a single ``float`` here for
+        a uniform telemetry snapshot.  Callers that need to distinguish them
+        should inspect the live ``Steering.alphas`` dict directly.
+        """
         snap: dict[str, float] = {}
         for name, entry in self.flatten_steering_stack().items():
             if isinstance(entry, (AblationTerm, ManifoldTerm)):

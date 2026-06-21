@@ -99,7 +99,7 @@ objects. Don't decompose them. There are exactly two clean seams worth cutting.
 
 ## Tier 2 — The taste headline: epoch residue
 
-- [ ] **T2.1 — Retire "vector" from the public Python surface.**
+- [x] **T2.1 — Retire "vector" from the public Python surface.** — DONE (additive): `session.profiles` already existed (returns the raw mutable registry, used pervasively) so `vectors`' docstring now points to it as canonical; `GenerationResult.steering_alphas` property added aliasing the `vectors` field (field + wire key kept for compat); `steering_composer.snapshot_steering_alphas` got a clarifying docstring noting a `ManifoldTerm`'s coeff is its `along` slide-fraction, not an additive alpha (no behavior change). Wire/CSV keys deliberately left unchanged.
   `session.vectors` returns `dict[str, Profile]` (`session.py:1233`);
   `GenerationResult.vectors` (`results.py:167`) is a `{name: coeff}` alpha dict that
   also mislabels `ManifoldTerm.along` as additive strength
@@ -111,7 +111,7 @@ objects. Don't decompose them. There are exactly two clean seams worth cutting.
   deprecated `vectors` property; update `ResultCollector` column names. Leave the
   `/vectors/*` wire routes for compat. Ship the rename, drop shims next major.
 
-- [ ] **T2.2 — `TokenEvent` carries the same data twice.**
+- [x] **T2.2 — `TokenEvent` carries the same data twice.** — DONE: collapsed to one `probe_readings` field + a `scores` read-only property shim. VERIFIED behavior-preserving: the two payload keys (`readings`/`probe_readings`) are the same `agg` object, and the old `probe_readings` gate `_wants_live_token_scores` is set to `bool(live_scores)` (session.py:5386) — i.e. always equal to the `readings` population condition, so they never diverged. WS path reads the payload directly (untouched). Construction site + two tests migrated.
   `results.py:321,332` — `scores` and `probe_readings` are the same `dict[str,
   ProbeReading]`; the comment admits "kept distinct for the deferred frontend
   rewire." Every streaming consumer branches `event.scores or event.probe_readings`
@@ -120,7 +120,7 @@ objects. Don't decompose them. There are exactly two clean seams worth cutting.
   migrate the `or`-branching consumers (`session.py:5371`, `app.py:1440`,
   `ws_events.py:76`).
 
-- [ ] **T2.3 — Public return types aren't exported.**
+- [x] **T2.3 — Public return types aren't exported.** — DONE: `ChoiceScores`/`ChoiceScore`, `parse_expr`/`format_expr`, `ManifoldTerm`/`ProjectedTerm`/`AblationTerm`, `SelectorError`/`AmbiguousSelectorError`, `ManifoldNotRegisteredError`/`VectorNotRegisteredError` added to `saklas/__init__.py` (`_EXPORTS`/`__all__`/`TYPE_CHECKING`). Import smoke-test passes.
   `score_choices`/`score_template` are public, but `ChoiceScores`/`ChoiceScore`
   (`core/scoring.py`) aren't in `__init__.py`. Same for `parse_expr`/`format_expr`,
   `SelectorError`/`AmbiguousSelectorError`, `ManifoldNotRegisteredError`, and the

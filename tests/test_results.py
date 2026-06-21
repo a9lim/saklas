@@ -141,8 +141,10 @@ class TestTokenEvent:
         sad = ProbeReading(fraction=-0.1, nearest=[], coords=(-0.1,))
         event = TokenEvent(
             text="x", token_id=0, index=0,
-            scores={"happy": happy, "sad": sad}, perplexity=12.7,
+            probe_readings={"happy": happy, "sad": sad}, perplexity=12.7,
         )
+        # ``scores`` is now a back-compat property alias for ``probe_readings``.
+        assert event.probe_readings == {"happy": happy, "sad": sad}
         assert event.scores == {"happy": happy, "sad": sad}
         assert event.perplexity == 12.7
 

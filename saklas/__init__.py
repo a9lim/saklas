@@ -60,6 +60,18 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "TranscriptModelMismatch": ("saklas.core.transcript", "TranscriptModelMismatch"),
     "TranscriptProbeDriftError": ("saklas.core.transcript", "TranscriptProbeDriftError"),
     "TranscriptTurn": ("saklas.core.transcript", "Turn"),
+    # T2.3 — public types returned/raised by public methods
+    "ChoiceScores": ("saklas.core.scoring", "ChoiceScores"),
+    "ChoiceScore": ("saklas.core.scoring", "ChoiceScore"),
+    "parse_expr": ("saklas.core.steering_expr", "parse_expr"),
+    "format_expr": ("saklas.core.steering_expr", "format_expr"),
+    "ManifoldTerm": ("saklas.core.steering_expr", "ManifoldTerm"),
+    "ProjectedTerm": ("saklas.core.steering_expr", "ProjectedTerm"),
+    "AblationTerm": ("saklas.core.steering_expr", "AblationTerm"),
+    "SelectorError": ("saklas.io.selectors", "SelectorError"),
+    "AmbiguousSelectorError": ("saklas.io.selectors", "AmbiguousSelectorError"),
+    "ManifoldNotRegisteredError": ("saklas.core.session", "ManifoldNotRegisteredError"),
+    "VectorNotRegisteredError": ("saklas.core.session", "VectorNotRegisteredError"),
 }
 
 __all__ = [
@@ -115,6 +127,18 @@ __all__ = [
     "TranscriptModelMismatch",
     "TranscriptProbeDriftError",
     "TranscriptTurn",
+    # T2.3 — public types returned/raised by public methods
+    "ChoiceScores",
+    "ChoiceScore",
+    "parse_expr",
+    "format_expr",
+    "ManifoldTerm",
+    "ProjectedTerm",
+    "AblationTerm",
+    "SelectorError",
+    "AmbiguousSelectorError",
+    "ManifoldNotRegisteredError",
+    "VectorNotRegisteredError",
 ]
 
 
@@ -194,3 +218,20 @@ if TYPE_CHECKING:
         parse_filter as parse_filter,
     )
     from saklas.core.triggers import Trigger as Trigger
+    # T2.3 — public types returned/raised by public methods
+    from saklas.core.scoring import ChoiceScore as ChoiceScore, ChoiceScores as ChoiceScores
+    from saklas.core.steering_expr import (
+        AblationTerm as AblationTerm,
+        ManifoldTerm as ManifoldTerm,
+        ProjectedTerm as ProjectedTerm,
+        format_expr as format_expr,
+        parse_expr as parse_expr,
+    )
+    from saklas.io.selectors import (
+        AmbiguousSelectorError as AmbiguousSelectorError,
+        SelectorError as SelectorError,
+    )
+    from saklas.core.session import (
+        ManifoldNotRegisteredError as ManifoldNotRegisteredError,
+        VectorNotRegisteredError as VectorNotRegisteredError,
+    )

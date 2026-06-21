@@ -165,6 +165,11 @@ class GenerationResult:
     tok_per_sec: float
     elapsed: float
     readings: dict[str, ProbeReadings] = field(default_factory=dict)
+    # Active-steering alpha map at generation time: name -> coefficient.
+    # Legacy field name — "vectors" is a misnomer (these are per-term
+    # coefficients, not direction tensors).  See :attr:`steering_alphas`
+    # for the canonical public accessor.  The field and its ``to_dict()``
+    # key ("vectors") are kept unchanged for wire / CSV compatibility.
     vectors: dict[str, float] = field(default_factory=dict)
     prompt_tokens: int = 0
     finish_reason: str = "stop"
@@ -197,6 +202,18 @@ class GenerationResult:
     # Keyed by registered probe name; round-trips through ``to_dict`` as a
     # nested mapping.
     probe_readings: dict[str, "ProbeReading"] = field(default_factory=dict)
+
+    @property
+    def steering_alphas(self) -> "dict[str, float]":
+        """Active-steering coefficient map at generation time.
+
+        Canonical public name for :attr:`vectors`.  Per-term coefficients
+        (the ``along`` slide fraction for a :class:`ManifoldTerm`, the
+        additive alpha for a plain vector term) keyed by term name.  The
+        backing :attr:`vectors` field and its ``to_dict()`` key are kept
+        unchanged for wire / CSV compatibility.
+        """
+        return self.vectors
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -318,18 +335,23 @@ class TokenEvent:
     # 2-node concept axis is the ``R = 1`` case; ``coords`` is a 1-tuple).
     # Populated by ``generate_stream`` only when the session has active
     # probes; otherwise None.
-    scores: dict[str, "ProbeReading"] | None = None
+    probe_readings: dict[str, "ProbeReading"] | None = None
     # Perplexity of the configured sampler distribution after temperature,
     # top-k, and top-p renormalization — ``exp`` of Shannon entropy in nats.
     # Bounded above by sampler support size; a confident prediction
     # approaches 1. Consumers take ``log`` to recover entropy-nats.
     perplexity: float | None = None
-    # Per-token manifold-probe readings, populated by ``generate_stream``
-    # only when at least one probe is attached and ``live_scores`` is True;
-    # otherwise ``None``.  Same :class:`ProbeReading` shape as ``scores``
-    # (the geometric wire field; kept distinct for the deferred frontend
-    # rewire).  Keyed by registered probe name.
-    probe_readings: dict[str, "ProbeReading"] | None = None
+
+    @property
+    def scores(self) -> "dict[str, ProbeReading] | None":
+        """Back-compat alias for :attr:`probe_readings`.
+
+        The two fields were formerly kept distinct ("for the deferred
+        frontend rewire"); they always carried the same dict.  Collapsed to
+        one field (``probe_readings``) in 4.1; this property preserves the
+        old name for any reader that still accesses ``event.scores``.
+        """
+        return self.probe_readings
 
 
 class ResultCollector:

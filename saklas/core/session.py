@@ -1231,7 +1231,17 @@ class SaklasSession:
 
     @property
     def vectors(self) -> dict[str, Profile]:
-        """Registered steering vector profiles: name -> Profile."""
+        """Registered steering vector profiles: name -> :class:`Profile`.
+
+        Returns a snapshot dict — each entry is a fresh :class:`Profile`
+        wrapping the backing tensors.  The raw tensor dict lives on
+        :attr:`profiles` (internal / mutable accessor); use this property
+        for read-only public access and prefer ``profiles`` when you need
+        in-place mutation of the registry.
+
+        Note: the name ``vectors`` pre-dates the manifold unification;
+        ``profiles`` is the internal canonical name for the same registry.
+        """
         return {name: Profile(tensors) for name, tensors in self._profiles.items()}
 
     def analytics_names(self) -> list[str]:
@@ -5352,24 +5362,23 @@ class SaklasSession:
         idx_counter = [0]
 
         def _push(text: str, is_thinking: bool, tid: int | None, lp: float | None, top_alts: Any, perplexity: float | None) -> None:
-            readings: dict[str, "ProbeReading"] | None = None
-            probe_readings = None
+            probe_readings: dict[str, "ProbeReading"] | None = None
             if live_scores and self._monitor.probe_names:
                 payload = self._last_token_probe_payload or {}
                 raw_readings = payload.get("readings")
                 if isinstance(raw_readings, dict) and raw_readings:
-                    readings = raw_readings
+                    probe_readings = raw_readings
                     # ``update_live`` folds coordinate axis 0 of each reading
-                    # into the running mean; ``TokenEvent.scores`` carries the
-                    # readings dict verbatim (the live-stream consumer reads
+                    # into the running mean; ``TokenEvent.probe_readings`` carries
+                    # the readings dict verbatim (the live-stream consumer reads
                     # ``fraction`` / ``nearest`` / ``coords`` off each).
-                    self._monitor.update_live(readings)
-                probe_readings = payload.get("probe_readings")
+                    # ``TokenEvent.scores`` is a back-compat property alias for
+                    # ``probe_readings`` — no second field to populate.
+                    self._monitor.update_live(probe_readings)
             event = TokenEvent(
                 text=text, token_id=tid if tid is not None else -1, index=idx_counter[0],
                 thinking=is_thinking, logprob=lp, top_alts=top_alts,
-                scores=readings, perplexity=perplexity,
-                probe_readings=probe_readings,
+                probe_readings=probe_readings, perplexity=perplexity,
             )
             idx_counter[0] += 1
             q.put(event)

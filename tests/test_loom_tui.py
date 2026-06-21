@@ -709,11 +709,12 @@ def test_fire_auto_regen_streams_into_shadow_column():
     row = MagicMock()
 
     # Stub ``generate_stream`` to yield two token events synchronously.
+    # ``scores`` is now a back-compat property; pass ``probe_readings`` instead.
     fake_events = [
         TokenEvent(text="hi", token_id=1, index=0, thinking=False,
-                   scores=None, perplexity=None),
+                   probe_readings=None, perplexity=None),
         TokenEvent(text=" there", token_id=2, index=1, thinking=False,
-                   scores=None, perplexity=None),
+                   probe_readings=None, perplexity=None),
     ]
 
     def _fake_stream(*args: Any, **kwargs: Any) -> Any:
