@@ -758,8 +758,20 @@ def _gcv_select_lambda(
     ``tr(I − S) = 0`` and GCV is the indeterminate ``0/0`` — the smallest
     grid ``λ`` is the near-interpolating limit.  Returns
     ``(λ*, edf = tr S_{λ*}, V(λ*))``.
+
+    Demmler–Reinsch form (derived from the same saddle ``_rbf_smoother_matrix``
+    solves: ``ŷ = y − λw``, ``w = Q2 z``, ``(G + λI) z = Q2ᵀ y``):
+    ``I − S_λ = λ·Q2 (G + λI)⁻¹ Q2ᵀ`` with ``Q2`` an orthonormal basis for
+    ``null(Qᵀ)`` (a complete QR of ``Q``) and ``G = Q2ᵀ E Q2`` the reduced
+    kernel.  One ``eigh(G) = UΛUᵀ`` collapses every grid point to scalar
+    evals of ``γⱼ/(γⱼ+λ)`` — ``tr(I−S_λ) = Σⱼ λ/(γⱼ+λ)`` and
+    ``‖(I−S_λ)Y‖²_F = Σ_{j,r} [λ/(γⱼ+λ)]² bⱼᵣ²`` with ``b = Uᵀ Q2ᵀ Y`` — so the
+    sweep is one QR + one eigh + vectorized scalars instead of ``n_grid``
+    ``(K+m+1)``-saddle solves (the dominant cost of an ``auto`` fit on a large
+    heap).  Selection is identical to the smoother-matrix loop.
     """
-    K = E.shape[0]
+    K = int(E.shape[0])
+    mp1 = int(Q.shape[1])
     # Scale the grid by the mean off-diagonal kernel magnitude (diag(E) = 0),
     # so the search range is invariant to coordinate scale.
     denom = K * K - K
@@ -767,24 +779,32 @@ def _gcv_select_lambda(
     if not math.isfinite(e_scale) or e_scale <= 0.0:
         e_scale = 1.0
     grid = e_scale * torch.logspace(-6.0, 3.0, n_grid, dtype=E.dtype)
-    eye = torch.eye(K, dtype=E.dtype)
-    best_lam = float(grid[0].item())
-    best_gcv = math.inf
-    best_edf = float(K)
-    for lam_t in grid:
-        lam = float(lam_t.item())
-        S = _rbf_smoother_matrix(E, Q, lam)
-        ImS = eye - S
-        tr = float(ImS.diagonal().sum().item())
-        if tr <= 0.0:
-            continue
-        rss = float((ImS @ values).pow(2).sum().item())
-        gcv = K * rss / (tr * tr)
-        if gcv < best_gcv:
-            best_gcv = gcv
-            best_lam = lam
-            best_edf = float(K) - tr
-    return best_lam, best_edf, best_gcv
+    null_dim = K - mp1
+    if null_dim <= 0:
+        # Q full-rank square ⇒ no penalized null space; the polynomial fits
+        # every node exactly (S = I) and GCV is the indeterminate 0/0 over the
+        # whole grid.  Match the all-skipped loop: smallest λ at interp edf.
+        return float(grid[0].item()), float(K), math.inf
+    # Q2: an orthonormal basis of null(Qᵀ) from a complete QR of Q.
+    q_full, _ = torch.linalg.qr(Q, mode="complete")        # (K, K)
+    q2 = q_full[:, mp1:]                                    # (K, null_dim)
+    g = q2.transpose(0, 1) @ E @ q2                         # (null_dim, null_dim)
+    g = 0.5 * (g + g.transpose(0, 1))                       # symmetrize vs roundoff
+    gamma, u = torch.linalg.eigh(g)                         # γⱼ ≥ 0 (cond. PSD)
+    gamma = gamma.clamp_min(0.0)
+    b = u.transpose(0, 1) @ (q2.transpose(0, 1) @ values)  # (null_dim, R)
+    b_sq = b.pow(2).sum(dim=1)                              # Σ_r bⱼᵣ²  (null_dim,)
+    # ratios[i, j] = λᵢ / (γⱼ + λᵢ) — the eigenvalues of (I − S_{λᵢ}).
+    ratios = grid.unsqueeze(1) / (gamma.unsqueeze(0) + grid.unsqueeze(1))
+    tr = ratios.sum(dim=1)                                  # tr(I − S_λ)  (n_grid,)
+    rss = (ratios.pow(2) * b_sq.unsqueeze(0)).sum(dim=1)    # ‖(I − S_λ)Y‖²_F
+    gcv = torch.where(tr > 0.0, K * rss / (tr * tr), torch.full_like(tr, math.inf))
+    best_idx = int(torch.argmin(gcv).item())               # first (smallest λ) on ties
+    return (
+        float(grid[best_idx].item()),
+        float(K) - float(tr[best_idx].item()),             # edf = tr S_{λ*}
+        float(gcv[best_idx].item()),
+    )
 
 
 def fit_rbf_smoothed(

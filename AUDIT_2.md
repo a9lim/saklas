@@ -225,10 +225,14 @@ decompositions. Cut exactly these two seams:
   stdout not stderr (`runners.py:282,295`); `template` uses `args.json` while the
   rest uses `args.json_output` (`parsers.py:781,786,814`). The CLI agent's
   `_boot_session()` extraction folds the serve/tui asymmetry away — worth it.
-- [ ] **T5.3 — GCV perf (optional).** `_gcv_select_lambda` (`manifold.py:745`) runs 40
-  sequential LU solves per layer per candidate; an eigendecomposition-once approach
-  makes it 40 scalar ops. Dominant cost of `auto` fit on large discover manifolds;
-  not blocking.
+- [x] **T5.3 — GCV perf.** — DONE: rewrote `_gcv_select_lambda` from 40 sequential
+  saddle solves to the Demmler-Reinsch eigen form — `I − S_λ = λ·Q2(G+λI)⁻¹Q2ᵀ`
+  (`Q2 = null(Qᵀ)` via complete QR, `G = Q2ᵀEQ2`), so one QR + one `eigh(G)` collapses
+  every grid point to vectorized scalar evals of `γⱼ/(γⱼ+λ)`. Derived from the same
+  saddle, so λ-selection is identical (pinned bit-comparably by
+  `test_gcv_select_lambda_eigen_matches_smoother_reference`). Measured **8.4×** on a
+  K=107 personas-sized layer (3.42 → 0.41 ms/layer; scales better for larger heaps).
+  `_rbf_smoother_matrix`/`_rbf_saddle` kept for the fixed-λ + final-fit callers.
 
 ## Still open from round one
 

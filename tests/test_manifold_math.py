@@ -26,6 +26,7 @@ from saklas.core.manifold import (
     fit_rbf_interpolant,
     fit_rbf_smoothed,
     fit_sigma_field,
+    _gcv_select_lambda,
     _off_surface_var,
     _off_surface_vars,
     _rbf_smoother_matrix,
@@ -330,6 +331,44 @@ def test_fit_rbf_smoothed_poisedness_rejection():
     )
     with pytest.raises(ValueError, match="poisedness"):
         fit_rbf_smoothed(line, torch.randn(6, 3), smoothing="auto")
+
+
+def test_gcv_select_lambda_eigen_matches_smoother_reference():
+    """The Demmler-Reinsch eigen reformulation of ``_gcv_select_lambda`` must
+    reproduce the smoother-matrix GCV curve bit-comparably — the optimization
+    is only valid if it selects the SAME lambda the saddle-solve loop did."""
+    torch.manual_seed(7)
+    for k, m, r in [(12, 2, 3), (20, 1, 1), (9, 3, 2), (15, 2, 5)]:
+        node = torch.randn(k, m, dtype=torch.float32)
+        values = torch.randn(k, r, dtype=torch.float32)
+        e = torch.cdist(node, node).pow(3)
+        q = torch.cat([torch.ones(k, 1), node], dim=1)
+
+        # Reference: brute-force GCV over the same grid via the full smoother
+        # matrix S_lambda (the pre-optimization formulation).
+        denom = k * k - k
+        e_scale = float(e.abs().sum() / denom)
+        grid = e_scale * torch.logspace(-6.0, 3.0, 40, dtype=torch.float32)
+        eye = torch.eye(k)
+        ref_lam, ref_edf, ref_gcv = float(grid[0]), float(k), math.inf
+        best = math.inf
+        for lam_t in grid:
+            lam = float(lam_t)
+            im_s = eye - _rbf_smoother_matrix(e, q, lam)
+            tr = float(im_s.diagonal().sum())
+            if tr <= 0.0:
+                continue
+            gcv = k * float((im_s @ values).pow(2).sum()) / (tr * tr)
+            if gcv < best:
+                best = gcv
+                ref_lam, ref_edf, ref_gcv = lam, float(k) - tr, gcv
+
+        lam, edf, gcv = _gcv_select_lambda(e, q, values)
+        # Same grid point selected (logspace steps are ~1.7x apart, so an exact
+        # match means no argmin drift), and matching edf/gcv scalars.
+        assert lam == pytest.approx(ref_lam, rel=1e-5)
+        assert edf == pytest.approx(ref_edf, rel=1e-3)
+        assert gcv == pytest.approx(ref_gcv, rel=1e-3)
 
 
 def test_eval_rbf_jacobian_matches_finite_difference():
