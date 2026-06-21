@@ -217,6 +217,8 @@ normalization). `is_affine ⇔ node_params is None`. Flat layers carry `node_coo
 (K,R) — the real neutral-anchored per-layer node positions (steer-target source).
 `affine(mean, basis, node_coords=)`, `select_axes(kept)` (per-axis DLS prune),
 `eval_at`, `jacobian_at`, `rbf_params()` (raises on a flat subspace).
+`manifold_is_affine(manifold)` — public module-level predicate (promoted from
+`session._manifold_is_affine` in T2.4); `session.py` keeps a back-compat alias.
 
 `_pca_basis(X, *, n_components, whitener, layer)` — μ-centered PCA: Euclidean SVD,
 or the whitened/Fisher generalized eigenproblem `(S_b, Σ)` via the Woodbury Σ⁻¹
@@ -345,9 +347,16 @@ in the recovered cyclic order. Gated `7 ≤ K ≤ 128`. Validated for specificit
 (~0.4% false-positive on random K=7 Gaussian heaps, ~0 for K≥10; the thresholds
 trade a small elongated-ellipse false-negative, which doesn't arise in the sphered
 whitened metric, for a low false-positive rate on real concept heaps).
-Naturalness eval: `to_hellinger`, `bhattacharyya_distance`, `fit_behavior_manifold`,
-`trajectory_naturalness`, `compute_node_behavior_centroid`,
-`compute_trajectory_distributions`, `compute_node_centroid`.
+## naturalness.py
+
+Behavior-space naturalness eval, extracted from `manifold.py` to restore its
+pure-tensor contract (naturalness drives a live model forward pass, which has no
+place in a geometry module): `to_hellinger`, `bhattacharyya_distance`,
+`fit_behavior_manifold`, `trajectory_naturalness`,
+`compute_node_behavior_centroid`, `compute_trajectory_distributions`,
+`_next_token_distribution`. Import sites in `cli/runners.py` and
+`tests/test_naturalness.py` point here. `compute_node_centroid` remains in
+`manifold.py` (shared primitive — activation centroid, no model).
 
 ## hooks.py
 
@@ -381,11 +390,11 @@ scales `along` on the **curved** path, where the target is raw node coords so
 `eff_along` is a *fraction of the way to the node* (`1.0` lands on it; `norm_cap`
 bounds off-domain RBF extrapolation). Clean-stateless-calibrated on a gemma-4-12b
 `months_loop%january` sweep: `along=1.0` → `eff_along≈4` lands the vivid coherent
-winter sweet spot. CAVEAT — non-monotonic above on **periodic** fits: `eff_along` is
-share-weighted (`share∈[0.19,1.47]`) and `translate_foot` wraps, so past `~1` each
-layer orbits the ring at its own rate and lands on a *different* month, scattering
-the signal; `4` rides a coherent part of the wrap, not a magnitude. Deferred fix:
-clamp curved `eff_along` to `[0,1]` + drop share-weighting on periodic domains.
+winter sweet spot. For **periodic `BoxDomain` fits** `eff_along` is now clamped
+and share-weighting dropped: `eff_along = max(0, min(1, along·_MANIFOLD_ALONG_GAIN))`,
+uniform per layer, so no layer wraps past the target node. Non-periodic curved fits
+keep the share-weighted unclamped path (`eff_along = share_L · gain`, which can
+exceed 1 on high-share layers and is bounded only by `norm_cap`).
 `_MANIFOLD_ONTO_GAIN = 0.5`
 scales `onto` only (calibrated on the gemma-4-12b `emotions%dominant` onto sweep — at
 `1.0` even `onto=0.5` fragmented and `onto=1.0` collapsed; `0.5` makes `onto∈[0,1]` a
@@ -557,6 +566,17 @@ The bundled roster is the fitted 2-node `Manifold`s themselves
 (`measure`) is gone — every read source is live hooks scoring captured hidden
 states, no second forward pass.
 
+## monitor_attach.py
+
+Attach-time probe algebra, extracted from `monitor.py` (which it shrank by ~620
+lines, to ~2057 L). Runs once per `add_probe` call, entirely off the hot path.
+Hosts: `AttachedManifoldProbe`, `_LayerWhiten`, `_build_whitened_factors`,
+`_attach_manifold_probe`, `_compute_assign_bandwidth`, `_layer_geometry`, the
+affine-coord helpers, and `_woodbury_apply`. The hot path in `monitor.py` imports
+`_layer_geometry`, `AttachedManifoldProbe`, `_build_whitened_factors`, and
+`_attach_manifold_probe` back from this module (no circular dependency —
+`monitor_attach` imports only `mahalanobis` and `manifold`).
+
 ## triggers.py
 
 `Trigger` (frozen): phase flags + optional `ProbeGate`. `Trigger.active(ctx)`
@@ -633,8 +653,11 @@ does the HF load + layer-mean compute + probe bootstrap — there is no
 `injection_mode`/`theta_max` param. `__init__` takes a pre-loaded model. Both call
 `materialize_bundled_manifolds()` + `selectors.invalidate()` early.
 `_RESPONSE_MAX_TOKENS = 256` caps each in-character response (4.0 / A2
-elicitation). Module-level helpers `_manifold_is_affine` / `_affine_manifold_push`
-(per-layer basis rows + node-coord targets for a flat manifold) back the dispatch.
+elicitation). Module-level helper `_affine_manifold_push`
+(per-layer basis rows + node-coord targets for a flat manifold) backs the dispatch;
+`_manifold_is_affine` is a back-compat alias of the public `core.manifold.manifold_is_affine`
+(promoted there in T2.4 — `session.py` keeps the alias for `steering_composer` and legacy
+call sites).
 Conversational-elicitation helpers `_KIND_TEMPLATES` / `_article` / `_system_for`
 (the per-kind system prompt — `custom` takes a caller-supplied template) /
 `_role_for` (the swapped assistant-role label: abstract → `someone_{slug}`,
@@ -819,8 +842,9 @@ context. Surfaced as `session.score_choices` / `session.score_template`.
 `ProbeReading`, `ResultCollector`. `RunSet` is the
 list-like multi-run shape (`node_ids`/`grid`/`.first`/`.to_collector()`/
 `.to_dataframe()`). `TokenEvent` carries `thinking`, `logprob`, `top_alts`,
-`finish_reason`, `scores` (per-probe `ProbeReading`s — the full readings,
-live-stream-gated), `perplexity`, `probe_readings`. `GenerationResult`
+`finish_reason`, `perplexity`, `probe_readings` (per-probe `ProbeReading`s — the
+full readings, live-stream-gated); `scores` is a read-only back-compat property
+alias for `probe_readings`. `GenerationResult`
 carries `prompt_tokens`, `finish_reason`, optional `logprobs`, `readings`
 (per-probe `ProbeReadings`), `probe_readings`, and `applied_steering` (the
 canonical expression, round-trips through `parse_expr`). `ProbeReading`

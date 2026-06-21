@@ -102,7 +102,7 @@ longer calls `write_manifold_scenarios` (the helper still exists and round-trips
 explicit `scenarios=` corpus, but generation does not feed it).
 
 Authoring: `create_manifold_folder` (authored webui/HTTP path, returns `(folder,
-advisories)`), `create_discover_manifold_folder` (`_sanitize_hyperparams` drops
+advisories)`), `create_discover_manifold_folder` (`sanitize_hyperparams` drops
 cross-method keys at the IO boundary, gated by `_HYPERPARAMS_BY_MODE`; takes
 `node_roles=` / `node_kinds=` maps),
 `create_baked_manifold_folder` + `save_baked_manifold_tensor` (the `subspace
@@ -197,7 +197,7 @@ is no model-generation step. No template-derived bundled manifold ships at prese
 ## selectors.py
 
 Selector grammar shared by `core.session` and the CLI (lives in `io` so neither
-imports up into `cli`). A concept *is* a manifold now: `_all_concepts` walks
+imports up into `cli`). A concept *is* a manifold now: `all_concepts` walks
 `manifolds_dir()` via `iter_manifold_folders`, and `ResolvedConcept.folder` is the
 manifold folder. `Selector(kind, value, namespace)` with kinds `name` / `tag` /
 `namespace` / `model` / `all`; `parse(raw)` handles `ns/name`, the prefixes, and a
@@ -236,7 +236,7 @@ ResolvedManifoldLabel | None` is *just* the manifold-label tier (delegates to
 
 Both gutted to the surface that survives the collapse.
 
-`cache_ops.py` is now just GGUF export: `_export_gguf_manifold(ns, name, *,
+`cache_ops.py` is now just GGUF export: `export_gguf_manifold(ns, name, *,
 model_scope, output, model_hint)` folds a fitted 2-node `pca` manifold to a single
 direction (`folded_vector_directions`) and writes a llama.cpp control-vector GGUF
 (one `.gguf` per model; refuses in-place export for bundled manifolds);

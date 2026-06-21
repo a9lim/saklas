@@ -12,7 +12,7 @@ ride `event.probe_readings` and the end-of-gen aggregate is
 splits the one probe set by geometry — flat (affine) probes drive the scalar
 MONITOR PROBES section, curved probes the MANIFOLD PROBES section — the TUI
 mirror of the webui's subspace/manifold rack split (`_refresh_probe_panels` is
-the funnel; it keys on `core.session._manifold_is_affine`).
+the funnel; it keys on `core.manifold.manifold_is_affine` — `core.session._manifold_is_affine` is a back-compat alias).
 
 ## Files
 
@@ -55,7 +55,7 @@ A bare slug typed into `/steer` (`/steer 0.7 pirate`) resolves in `core.steering
 
 `/steer` and friends take a full steering expression parsed by `saklas.core.steering_expr.parse_expr` — bare poles resolve through `resolve_bare_atom`'s manifold-label tier (a bipolar pole is a node label, lowered to a `%` push); variant suffixes (`:sae`, `:sae-<release>`, `:role-<slug>`), triggers (`@after`, `@when:…`), and manifold `%` terms are accepted. Projection (`a~b`, `a|b`) and ablation (`!x`) terms are **rejected** from `/steer` with an "express them in the YAML config" system message — they need session-level materialization the live `/steer` path doesn't run (`_handle_steer` rejects `ProjectedTerm`/`AblationTerm`). A bare term with no coefficient uses `DEFAULT_COEFF` (0.5). `/probe <name>` also seeds the highlight probe and turns highlighting on.
 
-Namespace bulk forms (`/steer ns/`, `/probe ns/`, `/unsteer ns/`, `/unprobe ns/`): the trailing-slash form is caught by `_detect_namespace_selector` before the parser runs. Add-side enumerates `_all_concepts()` (the manifold walk) for the namespace and routes through `session._ensure_profile_registered` (folds a fitted 2-node manifold — no fitting forward pass). `/steer ns/` registers loaded concepts at `DEFAULT_ALPHA = 0.5` with `enabled=False`. Concepts with no fitted tensor for this model get a one-line summary plus a re-extract hint.
+Namespace bulk forms (`/steer ns/`, `/probe ns/`, `/unsteer ns/`, `/unprobe ns/`): the trailing-slash form is caught by `_detect_namespace_selector` before the parser runs. Add-side enumerates `all_concepts()` (the manifold walk) for the namespace and routes through `session._ensure_profile_registered` (folds a fitted 2-node manifold — no fitting forward pass). `/steer ns/` registers loaded concepts at `DEFAULT_ALPHA = 0.5` with `enabled=False`. Concepts with no fitted tensor for this model get a one-line summary plus a re-extract hint.
 
 ## Keybindings
 
@@ -135,7 +135,7 @@ Gotchas:
 
 **Left panel** (`vector_panel.py::LeftPanel`): MODEL info, STEERING VECTORS, GENERATION block, KEYS reference. `_render_gen_config` is right-edge-aligned to `RIGHT_W = 11 + BAR_WIDTH + 4`: `Temp`/`Top-p` bars, then `Max`/`Think`/`Sys`/`HL` rows with trailing dim hint glyphs. The `HL` line is the persistent highlight-mode readout, set via `LeftPanel.update_highlight(mode)`, guarded against pre-mount calls.
 
-**Monitor-probes panel** (`trait_panel.py::TraitPanel` — the class/file keep the `trait` name, but the panel header renders `MONITOR PROBES`). The one unified `session._monitor` feeds both sections; `app._refresh_probe_panels` splits the probe set by `core.session._manifold_is_affine` — flat (affine) probes to the scalar MONITOR PROBES section, curved probes to the MANIFOLD PROBES section below — the TUI mirror of the webui's subspace/manifold rack split. A probe shows in exactly one section.
+**Monitor-probes panel** (`trait_panel.py::TraitPanel` — the class/file keep the `trait` name, but the panel header renders `MONITOR PROBES`). The one unified `session._monitor` feeds both sections; `app._refresh_probe_panels` splits the probe set by `core.manifold.manifold_is_affine` (`core.session._manifold_is_affine` is a back-compat alias) — flat (affine) probes to the scalar MONITOR PROBES section, curved probes to the MANIFOLD PROBES section below — the TUI mirror of the webui's subspace/manifold rack split. A probe shows in exactly one section.
 
 The scalar MONITOR PROBES section renders two lines per flat probe — `> <name> <sparkline>` then `<bar> <val><arrow>`, the bar reading coordinate axis 0 (the pole-normalized coord for a 2-node concept). Full untruncated names; `_nav_items` is `list[str]`. The bottom WHY footer (`#why-header`, set to literal `LAYERS` by `update_why`) shows per-layer importance as a horizontal histogram bucketed into `HIST_BUCKETS = 16` groups (from `saklas.core.histogram`, shared with `cli manifold why`): the per-layer `||baked||` of the folded direction for a foldable rank-1 probe (a 2-node concept axis), falling back to the per-layer Mahalanobis share for a multi-axis flat fit (e.g. personas) that has no single baked direction. `_refresh_trait_why` reads the selected probe's `Manifold` off `session._monitor.manifolds`. Driven on trait nav / probe add-remove / finalize / clear / mount — not per streamed token. No `/why` command.
 

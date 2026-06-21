@@ -153,7 +153,7 @@ per-model sidecar/tensor via `_resolve_intrinsic_dim` + a `load_manifold` read.
   box/sphere domain; per-node `role` optional). Returns detail + `advisories`. 409
   on existing folder, 400 malformed.
 - `POST /manifolds/discover` — author a *discover* artifact
-  (`create_discover_manifold_folder`; nodes carry no coords; `_sanitize_hyperparams`
+  (`create_discover_manifold_folder`; nodes carry no coords; `sanitize_hyperparams`
   drops cross-method keys).
 - `POST /manifolds/merge` — `merge_discover_manifolds` (discover-mode sources only:
   authored geometry isn't mergeable without a shared coordinate system). Pools node
@@ -184,7 +184,7 @@ per-model sidecar/tensor via `_resolve_intrinsic_dim` + a `load_manifold` read.
   rematerializes_on_restart}`.
 - `POST /manifolds/{ns}/{name}/fit` — `session.fit` under the lock; SSE
   / JSON. Discover folders accept `fit_mode` / `hyperparams` overrides, written
-  atomically into `manifold.json` (after `_sanitize_hyperparams`) *before* the fit;
+  atomically into `manifold.json` (after `sanitize_hyperparams`) *before* the fit;
   authored folders reject them with 400. Poisedness `ValueError` →
   `code: "PoisednessError"`; `ConcurrentExtractionError` → 409. Steering a fitted
   manifold needs no route — a `%` term loads it lazily on scope entry.
@@ -227,8 +227,9 @@ monitor unification onto the session's single `Monitor`.
   (`{name, manifold, top_n, layers, node_labels, node_count, domain, intrinsic_dim,
   feature_space}`). `_probe_info` also emits `is_affine` (the flat/curved
   discriminator the client classifies subspace-vs-manifold on, via
-  `core.session._manifold_is_affine`, defensively guarded → `False` on any read
-  failure) and `node_coords` (the per-node layout backing the client mini-map,
+  `core.manifold.manifold_is_affine` — `core.session._manifold_is_affine` is a
+  back-compat alias — defensively guarded → `False` on any read failure) and
+  `node_coords` (the per-node layout backing the client mini-map,
   `null` when the manifold has none materialized).
 - `GET /probes/defaults` returns the default roster.
 - `POST /probes` body `{selector, name?, top_n?}` → `session.add_probe(selector,

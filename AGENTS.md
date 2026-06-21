@@ -377,11 +377,10 @@ target went whitened-unit, live-recalibrated on gemma-4-12b, see below) and
 node coords, so `eff_along` is a *fraction to the node* — `1.0` lands on it,
 `norm_cap` bounds off-domain RBF extrapolation; clean-stateless-calibrated on
 `months_loop%january` so `along=1.0` → `eff_along≈4` lands the vivid coherent winter
-sweet spot. CAVEAT: non-monotonic above on *periodic* fits — share-weighted
-`eff_along` wraps each layer around the ring at its own rate past ~1, scattering the
-layers onto different nodes; `4` rides a coherent part of the wrap, not a magnitude.
-Deferred fix: clamp curved `eff_along` to `[0,1]` + drop share-weighting on periodic
-domains). `_MANIFOLD_ONTO_GAIN` scales
+sweet spot. For **periodic `BoxDomain` fits** `eff_along` is now clamped and
+share-weighting dropped: `eff_along = max(0, min(1, along·_MANIFOLD_ALONG_GAIN))`,
+uniform per layer, so no layer wraps past the target node. Non-periodic curved fits
+keep the share-weighted unclamped path). `_MANIFOLD_ONTO_GAIN` scales
 **onto** only (the curved off-surface collapse). For an affine term the
 coefficient α is folded into the translate *target* by `synthesize_subspace`, so α
 scales the offset magnitude (unclamped); for a curved term α is the (clamped
@@ -667,7 +666,11 @@ Key contracts:
 - `saklas/__init__.py` pins the public surface (`SaklasSession`, `Profile`,
   `Steering`, `SamplingConfig`, `Trigger`, `LayerWhitener`, the `RunSet`/
   `TokenEvent`/`ResultCollector` result types, the `EventBus` + event dataclasses,
-  the `LoomTree`/`Recipe`/`Transcript` suites, and their error types). `from saklas
+  the `LoomTree`/`Recipe`/`Transcript` suites, their error types, and additionally:
+  `ChoiceScores`/`ChoiceScore`; `parse_expr`/`format_expr`; term types
+  `ManifoldTerm`/`ProjectedTerm`/`AblationTerm`; selector errors
+  `SelectorError`/`AmbiguousSelectorError`; and
+  `ManifoldNotRegisteredError`/`VectorNotRegisteredError`). `from saklas
   import X` is stable; private submodule paths are not.
 
 ## Cache layout
@@ -743,7 +746,8 @@ tok/s):
   translates by `share_L · gain · target` (affine `gain = _SUBSPACE_GAIN =
   16.0`, target carries the coefficient; curved `gain = _MANIFOLD_ALONG_GAIN
   = 4.0`, a fraction-to-node scale (clean-stateless-calibrated on months;
-  non-monotonic above the sweet spot on periodic fits — see Gain note);
+  periodic `BoxDomain` fits clamp `eff_along` to `[0,1]` and drop share-weighting
+  — see Gain note for the full split);
   `_MANIFOLD_ONTO_GAIN = 0.5` is the `onto`-only gain). No
   norm preservation (onto is meant to shrink `‖h‖`); the curved path's `norm_cap =
   3·‖h‖` is the only bound (the affine fast path carries no cap).
