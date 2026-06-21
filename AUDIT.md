@@ -146,11 +146,15 @@ Three of the four largest files are accretion-point god objects:
 - [x] **T4.5 — CI: add a coverage gate + Python-version matrix** — DONE: 3.11/3.12/3.13 matrix
   (`fail-fast: false`); informational `--cov=saklas --cov-report=term-missing` (no fail-under,
   `pytest-cov` added to `[dev]`).
-- [ ] **T4.6 — Docs-as-map.** AGENTS.md (59KB, auto-loaded every session) + ARCHITECTURE.md
-  (63KB) co-maintain the same gain constants and engine deep-dives in parallel; concrete
-  drift already hit (T1.1, `server/AGENTS.md`). Make AGENTS.md a map (what-this-is, subtree
-  pointers, commands, one-paragraph-per-subsystem); move engine internals into
-  ARCHITECTURE.md. Target ≤20KB. Subtree AGENTS.md files are right-sized — leave them.
+- [x] **T4.6 — Docs currency + drift fix** (REFRAMED — the original "make AGENTS.md a thin map"
+  was **rejected**: a full session of work proved the density is an asset, not a liability — it's
+  what lets agents make surgical changes without re-deriving the architecture). DONE instead:
+  brought root `AGENTS.md` + `ARCHITECTURE.md` current with the post-refactor module homes
+  (`io/manifold_folder.py`/`manifold_authoring.py`/`manifold_lifecycle.py`,
+  `core/manifold.py::transfer_manifold_subspaces`); fixed a real pre-existing drift — ARCHITECTURE.md
+  claimed "two gain constants / `_SUBSPACE_GAIN` both modes" but the code has three
+  (`_MANIFOLD_ALONG_GAIN = 4.0` drives the curved-along path). Density preserved; subtree AGENTS.md
+  left as-is (already current from the refactors).
 
 ---
 

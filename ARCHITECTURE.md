@@ -134,7 +134,7 @@ Tensor-filename variants (`io/paths.py`) are `raw` (canonical), `sae-<release>`,
 `from-<safe_src>`, `role-<slug>` — at most one kind per file, mutually exclusive.
 There is no `pca` variant and no method suffix; difference-of-means is the only
 vector extraction method. `manifold.json.files` carries a sha256 map verified on
-load (`io/manifolds.py` + the `packs.py` integrity helpers).
+load (`io/manifold_folder.py` + the `packs.py` integrity helpers).
 
 The `manifold.json::fit_mode` discriminates the folder shape and the fit path:
 `authored` (curved, user coords) · `pca` (flat, derived coords) · `spectral`
@@ -461,7 +461,7 @@ prompts-inner, so `response[i] ↔ baseline_prompt[i % k]` — the alignment
 per-manifold scenario set (so no `scenarios.json` is written). Returns
 `{concept: [response, ...]}`. The vector path calls it with `[pos, neg]`;
 discover authoring (`manifold generate`, the HTTP route) loops it per node, writing
-each via the resumable discover writers (`io/manifolds.py`).
+each via the resumable discover writers (`io/manifold_authoring.py`).
 `session.generate_neutral_responses` is the neutral sibling (the length directive
 as its *only* system — no persona — standard label) that fills
 `neutral_statements.json` with organic responses to the same prompts. The
@@ -700,13 +700,16 @@ Euclidean `‖eval_rbf(node_params)‖_F`), then:
   `share_L·base` scales the per-layer slide fraction. α is unclamped (it sets the
   offset magnitude).
 - **Curved manifold** (`add_manifold`): `eff_along_L = along · share_L ·
-  _SUBSPACE_GAIN`, `eff_onto_L = clamp(onto · share_L · _MANIFOLD_ONTO_GAIN, 0,
+  _MANIFOLD_ALONG_GAIN`, `eff_onto_L = clamp(onto · share_L · _MANIFOLD_ONTO_GAIN, 0,
   1)`; the target is the full node position, so `along` is the slide fraction (the
   historic `%` knob), clamped to `[0,1]` at apply time. `onto` stays a `[0,1]`
   collapse fraction.
 
-**Two gain constants.** `_SUBSPACE_GAIN = 16.0` (live-calibrated) scales
-**along** (the translate slide) in both modes; `_MANIFOLD_ONTO_GAIN = 0.5` now scales **onto** only
+**Three gain constants.** `_SUBSPACE_GAIN = 16.0` (live-calibrated) scales
+**along** on the **affine** path (whitened-unit target, free push magnitude);
+`_MANIFOLD_ALONG_GAIN = 4.0` scales **along** on the **curved** path (raw node-coord
+target, so `eff_along` is a fraction-to-node — `1.0` lands on it);
+`_MANIFOLD_ONTO_GAIN = 0.5` now scales **onto** only
 (the off-surface collapse share-weight, curved-only — calibrated on the
 gemma-4-12b `emotions%dominant` onto sweep: at `1.0` even `onto=0.5` fragmented and
 `onto=1.0` collapsed into looping, since collapsing the off-surface residual
@@ -931,7 +934,8 @@ re-bakes each magnitude to its *target* Mahalanobis norm so the share is in the
 target metric. The target whitener is **required** and must cover the transferred
 layers (Mahalanobis-only — a missing/partial whitener raises `WhitenerError`;
 generate neutral activations for the target model first, there is no Euclidean
-rebake). `transfer_manifold` (`io/manifolds.py`) maps a fitted manifold's per-layer
+rebake). `transfer_manifold` (`io/manifold_lifecycle.py`, with the pure-tensor core lifted to
+`core/manifold.py::transfer_manifold_subspaces`) maps a fitted manifold's per-layer
 `mean → M_L mean` and `basis → basis @ M_Lᵀ`, leaves the RBF + `node_coords`
 untouched (subspace/authoring-coordinate space, invariant under the model-space
 map), re-bakes the Mahalanobis **share** in target space (same whitener
@@ -968,8 +972,9 @@ straight-chord additive baseline alongside.
   fix is about how steering *accesses* the subdominant identity directions (sphere
   the between-persona covariance at fit time; strip the shared axis from the
   target), not the metric.
-- **`base_gain` magnitude.** Steering now uses **two** constants:
-  `_SUBSPACE_GAIN = 16.0` (the translate slide, both modes) and
+- **`base_gain` magnitude.** Steering now uses **three** constants:
+  `_SUBSPACE_GAIN = 16.0` (along on the affine path), `_MANIFOLD_ALONG_GAIN = 4.0`
+  (along on the curved path — a fraction-to-node scale), and
   `_MANIFOLD_ONTO_GAIN = 0.5` (onto / off-surface collapse only). Both are committed but
   tagged prototypes. `_SUBSPACE_GAIN` was bumped ~130×
   from the prior `0.125` when the affine target became whitened-unit (§5.3): the

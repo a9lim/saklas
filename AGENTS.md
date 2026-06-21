@@ -249,7 +249,7 @@ The template is a first-class artifact with **two** consumers:
   messages, choices, …)` / `session.score_template(name, steering=…)` return one
   `ChoiceScores` per context.
 - **A manifold fit** — `manifold from-template <tmpl>`
-  (`io/manifolds.py::create_manifold_from_template`) resolves the template, expands
+  (`io/manifold_authoring.py::create_manifold_from_template`) resolves the template, expands
   its `values × contexts` into per-value node corpora (the slot-filled assistant
   turns, `corpus[i]` aligned to `contexts[i]`), and writes a discover folder that
   stores the corpus **and** a `template_ref`. At fit time the pipeline resolves the
@@ -423,7 +423,7 @@ polyharmonic RBF; at n=1 over an open axis it reproduces the natural cubic splin
 A manifold lives under `~/.saklas/manifolds/<ns>/<name>/` as `manifold.json`
 (domain spec + per-node `{label, coords}` for authored; `fit_mode` + hyperparams +
 `{label}` for discover) + `nodes/NN_<label>.json` corpora — by hand or via the
-webui builder (`io.manifolds.create_manifold_folder` /
+webui builder (`io.manifold_authoring.create_manifold_folder` /
 `create_discover_manifold_folder`). `manifold fit`, the webui fit action, and
 `POST .../fit` all run `ManifoldExtractionPipeline`: pool each node's centroid,
 embed coords through the domain (or derive them for discover mode), fit a per-layer
@@ -541,7 +541,7 @@ hold topic common-mode across nodes (response[i] ↔ prompt[i % k]), so the
 per-concept centroids stay comparable without a per-manifold scenario set.
 `manifold fit <name>` then fits — the two steps are deliberate (a flaky
 generation leaves inspectable corpora). Cross-model Procrustes alignment for discover coords is deferred (TODO
-in `io/manifolds.py`). The naturalness eval (`experiment naturalness`) fits a
+in `io/manifold_lifecycle.py`). The naturalness eval (`experiment naturalness`) fits a
 behavior-space manifold over node output distributions in Hellinger space and
 reports the per-step Bhattacharyya distance of a steered trajectory to it (low =
 natural; `--compare-linear` scores a straight-chord baseline alongside).
