@@ -178,13 +178,13 @@ decompositions. Cut exactly these two seams:
 
 ## Tier 4 — Tests don't cover the hard parts
 
-- [ ] **T4.1 — Two capture modes have zero coverage.**
+- [x] **T4.1 — Two capture modes have zero coverage.** — DONE: `test_finalize_lean_incremental_probe_path` + `test_finalize_gating_subset_probe_path` in `tests/test_generation.py` assert the tail-ring aggregate is the FULL reading (not a lean row) and the correct branch dispatch; spot-checked to fail when the behavior is broken.
   `LEAN_INCREMENTAL` and `GATING_SUBSET` (the F2/FIX-4 conditional-scoring paths the
   server and TUI actually select) appear in tests only as import lines; only `FULL`
   and `INCREMENTAL` are exercised. Add two ~30-line CPU tests mirroring
   `test_finalize_incremental_probe_path_does_not_stack_capture`.
 
-- [ ] **T4.2 — The geometrically-hard code is untested + the gain is unguarded.**
+- [x] **T4.2 — The geometrically-hard code is untested + the gain is unguarded.** — DONE (gain) / ALREADY-COVERED (topology): added `test_affine_steer_coeff_half_displaces_in_sane_whitened_band` (a 0.5 steer lands in `[1.0, 25.0]` whitened units — catches a 10× gain error either way without pinning the calibration). Topology turned out already well-covered by `tests/test_manifold_topology.py` (flat/line/curve/circle/ellipse/torus-T2/faint-ring fallback/false-positive-rate/PH/harmonic-dedup) — no new tests needed.
   `select_topology` (PH, the single-cycle faint-ring fallback), the curved
   foot-solver, and the gain constants have no behavioral guard —
   `_SUBSPACE_GAIN`/`_MANIFOLD_ALONG_GAIN` are tagged "due for recalibration" but
@@ -192,14 +192,14 @@ decompositions. Cut exactly these two seams:
   steer lands in `[0.2, 3.0]` whitened units. Add a `select_topology` test over a
   synthetic ring vs flat fan.
 
-- [ ] **T4.3 — The webui is untested and carries a 600-line corpse.**
+- [x] **T4.3 — The webui is untested and carries a 600-line corpse.** — DONE (delete path): confirmed `parseExpression` had no caller (only `serializeExpression` is used) and deleted it + its exclusively-owned lexer/parser/helpers (`expression.ts` 705 → 130 L). `npm run check` clean; `npm run build` leaves the committed `dist/` bundle byte-identical (the dead code was never bundled). Vitest setup deliberately NOT added (out of scope for a dead-code removal).
   No Vitest, no `test` script. `webui/src/lib/expression.ts::parseExpression` (a
   full grammar parser with a documented round-trip invariant) has **no caller** —
   dead, and free to drift from the Python `steering_expr`.
   **Fix:** delete it, OR add Vitest + a round-trip test against the Python
   `test_steering_expr` fixtures and wire it into deserialization. Decide and commit.
 
-- [ ] **T4.4 — Shared fakes never consolidated → a vacuous test.**
+- [x] **T4.4 — Shared fakes never consolidated → a vacuous test.** — DONE (partial, by design): fixed the concrete bug — `test_web.py` mocked `session._monitor` while the server reads public `session.monitor` (vacuous assertions) → now assigns through the public surface. Created `tests/_fakes.py::make_mock_session`. The 4 server mock factories were NOT force-merged — only the genuinely-shared wiring lives in `_fakes.py`; `test_server`/`test_saklas_api`/`test_vectors_diagnostics_api` keep their divergent factories (Ollama-specific model_info, real trait-queue/EventBus logic, private-vs-public monitor attrs) with documented reasons rather than a lossy merge.
   The T4.3-followup `tests/_fakes.py` never landed; four server test files each
   define a drifting `_mock_session()`. One (`test_web.py:71`) mocks
   `session._monitor` while the server reads public `session.monitor`, so those

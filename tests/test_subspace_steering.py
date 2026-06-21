@@ -269,3 +269,57 @@ def test_clear_all_drops_subspaces():
     mgr.clear_all()
     assert mgr.subspaces == {}
     assert mgr.hooks == {}
+
+
+# ----------------------------------------------------------------- gain bound ---
+
+def test_affine_steer_coeff_half_displaces_in_sane_whitened_band():
+    """A coefficient-0.5 affine steer on a synthetic whitened subspace displaces
+    the in-subspace foot by a whitened amount in ``[0.2, 3.0]`` — bounding both the
+    "did nothing" and "blew up" failure modes WITHOUT pinning the exact calibration.
+
+    The test constructs a geometry where the whitened displacement is knowable:
+    one layer, one direction, isotropic whitener (Σ ≈ I) so the whitened norm ≈
+    the Euclidean norm.  The actual displacement per step is
+    ``eff_along * target_coord = share * _SUBSPACE_GAIN * target_coord``.
+
+    For a single-layer synth: ``share = 1.0`` (mean-1 of one layer), and
+    ``target_coord = coeff * 1.0 = 0.5`` (whitened-unit target scaled by α).
+    So the expected per-layer displacement is ``_SUBSPACE_GAIN * 0.5``.
+
+    The bound ``[1.0, 25.0]`` catches a 10× error in either direction:
+    - < 1.0 would mean _SUBSPACE_GAIN was accidentally set to ≤ 2.0, which
+      would make ``α≈0.5`` steer too weakly to be coherent on any model.
+    - > 25.0 would mean _SUBSPACE_GAIN was accidentally set to ≥ 50.0, which
+      is wildly beyond the live-calibrated value and would shatter outputs.
+    """
+    # Single direction in DIM-space; whitened target is coeff * unit whitened dir.
+    u = _unit(torch.randn(_DIM))
+    neutral = torch.zeros(_DIM)   # zero neutral so decompose is clean
+    synth = synthesize_subspace(
+        push=[({0: _row(u)}, {0: torch.tensor([1.0])}, 0.5)],
+        ablate=[], neutral_means={0: neutral},
+    )
+
+    mgr = SteeringManager()
+    mgr.add_subspace("__affine__", synth)
+    layers = _model_layers(1)
+    mgr.apply_to_model(layers, torch.device("cpu"), torch.float32)
+
+    # Displacement = eff_along * target_coord.
+    # eff_along = share * _SUBSPACE_GAIN = 1.0 * _SUBSPACE_GAIN.
+    # target_coord = synthesize puts the whitened-unit direction scaled by coeff.
+    # Without a whitener the fallback is Euclidean: target_coord = 0.5 * 1.0 = 0.5.
+    eff_along = _group(mgr, 0)[5]
+    target_coord = synth.target_coord[0]
+
+    # In-subspace displacement = |eff_along * target_coord| per axis.
+    displacement = float((eff_along * target_coord).abs().sum())
+
+    assert 1.0 <= displacement <= 25.0, (
+        f"Affine steer with coeff=0.5 produced displacement={displacement:.4f}, "
+        f"outside sane band [1.0, 25.0].  "
+        f"(eff_along={eff_along:.4f}, target_coord={target_coord.tolist()}, "
+        f"_SUBSPACE_GAIN={_SUBSPACE_GAIN}).  "
+        "This catches a >10x miscalibration of _SUBSPACE_GAIN."
+    )
