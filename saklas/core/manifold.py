@@ -3839,32 +3839,15 @@ def compute_node_reduced_covariance(
     return covs
 
 
-def _reduced_tangent(
-    sub: "LayerSubspace", domain: "ManifoldDomain", coord: torch.Tensor,
-) -> torch.Tensor:
-    """Reduced-space surface tangent ``(R, n)`` at authoring coord ``(n,)``.
-
-    The columns span the directions the surface can move *along* at this point,
-    in the layer's reduced frame — the RBF Jacobian chained through the domain's
-    embedding Jacobian, mirroring :func:`subspace_inject`'s ``j_old``.  Its
-    orthogonal complement in ``ℝ^R`` is the *off-surface* (tube-thickness)
-    subspace.
-    """
-    np_, rw, pc = sub.rbf_params()
-    emb = sub._normalize(domain.embed(coord))  # (m,)
-    j_red = eval_rbf_jacobian(np_, rw, pc, emb) / sub.coord_scale  # (R, m)
-    return j_red @ domain.embed_jacobian(coord)  # (R, n)
-
-
 def _reduced_tangents(
     sub: "LayerSubspace", domain: "ManifoldDomain", coords: torch.Tensor,
 ) -> torch.Tensor:
     """Batched reduced-space surface tangents ``(K, R, n)``.
 
-    Fit-time companion to :func:`_reduced_tangent`: every structured domain's
-    ``embed`` / ``embed_jacobian`` is batch-generic, and ``eval_rbf_jacobian`` is
-    vectorized, so the σ-field pass can compute all node tangent frames for a
-    layer in one tensor sweep instead of K small Python/RBF calls.
+    Computes the RBF Jacobian chained through the domain's embedding Jacobian
+    for every node at once — ``embed`` / ``embed_jacobian`` are batch-generic
+    and ``eval_rbf_jacobian`` is vectorized, so the σ-field pass covers all K
+    node tangent frames for a layer in one tensor sweep.
     """
     np_, rw, pc = sub.rbf_params()
     coords_f = coords.to(torch.float32)
@@ -3873,6 +3856,8 @@ def _reduced_tangents(
     return j_red @ domain.embed_jacobian(coords_f)                # (K, R, n)
 
 
+# test-only: production code uses the batched _off_surface_vars; this scalar
+# form is exercised directly in tests/test_manifold_math.py.
 def _off_surface_var(
     cov: torch.Tensor, tangent: torch.Tensor, R: int, n: int,
 ) -> float:

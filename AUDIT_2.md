@@ -211,12 +211,13 @@ decompositions. Cut exactly these two seams:
 
 ## Tier 5 — Cheap hygiene (batchable)
 
-- [ ] **T5.1 — Trivia sweep.** Double `_invalidate_flat_cache()` (`monitor.py:1926–1927`);
+- [x] **T5.1 — Trivia sweep.** — DONE: monitor items (double `_invalidate_flat_cache`, `_woodbury_apply` docstring) in Phase 2; `f"-{x*-1.0:g}"` → `abs(x)`; `_resolve_atom`'s vestigial `default_namespace` param + always-`+1` `sign_flip` return removed (3 call sites simplified); `_reduced_tangent` deleted (truly dead), `_off_surface_var` marked `# test-only` (used by `test_manifold_math.py`).
+  Original list: double `_invalidate_flat_cache()` (`monitor.py:1926–1927`);
   `_woodbury_apply` docstring "Shared by `Monitor` and `Monitor`" (`monitor.py:54`);
   `f"-{x * -1.0:g}"` → `-x`/`abs(x)` (`steering_expr.py:1203`); dead singular
   `_reduced_tangent`/`_off_surface_var` (test-only, move or mark);
   vestigial `default_namespace`/`sign_flip` in `_resolve_atom` (`steering_expr.py:762`).
-- [ ] **T5.2 — CLI consistency.** `serve` can't take its model from `-c config.yaml`
+- [x] **T5.2 — CLI consistency.** — DONE (6 fixes): `serve` now accepts its model from `-c config.yaml` (`nargs="?"` + post-config guard, symmetric with `tui`); `template rm` resolves bare names cross-namespace via `resolve_template`; `config show` emits `compile`/`cuda_graphs`/`return_top_k`; `pack search` exits 1 on network/import failure; `_setup_steering_vectors` errors go to stderr; `template ls/show/score` `--json` unified to `dest="json_output"`. The `_boot_session` extraction was scoped out (larger refactor, noted below). Original list: `serve` can't take its model from `-c config.yaml`
   while `tui` can (`parsers.py:15`, asymmetric `nargs`); `template rm` resolves bare
   names to `local/` only while `show`/`score` cross-namespace (`runners.py:1792`);
   `config show` drops `compile`/`cuda_graphs`/`return_top_k` (`config_file.py:79`);
@@ -231,7 +232,7 @@ decompositions. Cut exactly these two seams:
 
 ## Still open from round one
 
-- [ ] **Periodic `eff_along` clamp** (`hooks.py:1205`, documented deferred in AGENTS.md).
+- [x] **Periodic `eff_along` clamp** (`hooks.py:1205`, documented deferred in AGENTS.md). — DONE: periodic `BoxDomain` fits now drop share-weighting and clamp `eff_along` to `[0,1]` (`max(0, min(1, along·_MANIFOLD_ALONG_GAIN))`, uniform per layer); non-periodic curved fits keep the share-weighted unclamped path. Test redesign: the 3 share-weighting tests repointed to a new non-periodic `_manifold_open` helper (their mechanics still hold there), + a new `test_manager_periodic_clamps_and_drops_share_weighting`. The AGENTS.md "Deferred fix"/"CAVEAT" note can now be dropped (docs pass).
   On periodic fits (`months`), share-weighted `eff_along` can exceed 1 and wrap the
   ring, so `_MANIFOLD_ALONG_GAIN = 4.0` rides a coherent wrap rather than being a
   safe magnitude — fragile to any share/gain change. **Fix:** clamp curved

@@ -8,6 +8,7 @@ from typing import Any
 import torch
 
 from saklas.core.manifold import (
+    BoxDomain,
     CustomDomain,
     LayerSubspace,
     ManifoldDomain,
@@ -1219,10 +1220,26 @@ class SteeringManager:
             # ``eff_along`` is the fraction of the way to the node, so it must stay
             # near [0, ~2] or the RBF extrapolates off-domain (see
             # ``_MANIFOLD_ALONG_GAIN``).  ``onto`` clamps per layer.
-            eff_along = {
-                L: along * shares[L] * _MANIFOLD_ALONG_GAIN
-                for L in manifold.layers
-            }
+            #
+            # Periodic (loop) domains: drop share-weighting and clamp eff_along to
+            # [0, 1] so no layer wraps past the target node.  (AGENTS.md deferred
+            # fix — share∈[0.19,1.47] × gain 4 sends many layers past 1 on a ring,
+            # scattering the signal across different nodes.)  Non-periodic curved
+            # fits keep the existing share-weighted, unclamped behavior.
+            domain = manifold.domain
+            _is_periodic = isinstance(domain, BoxDomain) and any(
+                ax.periodic for ax in domain.axes
+            )
+            if _is_periodic:
+                eff_along = {
+                    L: max(0.0, min(1.0, along * _MANIFOLD_ALONG_GAIN))
+                    for L in manifold.layers
+                }
+            else:
+                eff_along = {
+                    L: along * shares[L] * _MANIFOLD_ALONG_GAIN
+                    for L in manifold.layers
+                }
             eff_onto = {
                 L: max(0.0, min(1.0, onto * shares[L] * _MANIFOLD_ONTO_GAIN))
                 for L in manifold.layers
@@ -1231,7 +1248,6 @@ class SteeringManager:
             # Target is layer-independent (one authoring position); clamp it
             # into the domain once.  The cold-start origin seed ``O_L`` is
             # per-layer (each layer's neutral foot) — picked inside the loop.
-            domain = manifold.domain
             n_dim = domain.intrinsic_dim
             target_coord = domain.clamp_position(
                 torch.tensor([float(c) for c in position], dtype=torch.float32)

@@ -279,7 +279,7 @@ def _setup_steering_vectors(
             if verbose:
                 print(f"  Failed to resolve '{raw_name}': {e}", file=sys.stderr)
                 sys.exit(1)
-            print(f"  Failed to register '{display}': {e}")
+            print(f"  Failed to register '{display}': {e}", file=sys.stderr)
             continue
         try:
             if verbose:
@@ -293,7 +293,7 @@ def _setup_steering_vectors(
         except Exception as e:
             if verbose:
                 raise
-            print(f"  Failed to register '{display}': {e}")
+            print(f"  Failed to register '{display}': {e}", file=sys.stderr)
             continue
         registry_key = canonical
         session.steer(registry_key, profile)
@@ -372,6 +372,14 @@ def _run_serve(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     _load_effective_config(args)
+    if not args.model:
+        print(
+            "saklas serve: model required. Pass a HuggingFace repo id (e.g.\n"
+            "  saklas serve google/gemma-2-2b-it\n"
+            "or supply it via -c setup.yaml with a `model:` field.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
     _print_startup(args)
     session = _make_session(args)
@@ -1740,7 +1748,7 @@ def _run_template_ls(args: argparse.Namespace) -> None:
     from saklas.io.templates import iter_template_folders
 
     rows = list(iter_template_folders())
-    if getattr(args, "json", False):
+    if getattr(args, "json_output", False):
         print(_json.dumps([t.summary() for t in rows], indent=2))
         return
     if not rows:
@@ -1768,7 +1776,7 @@ def _run_template_show(args: argparse.Namespace) -> None:
     except (TemplateNotFoundError, AmbiguousTemplateError) as e:
         print(f"template show: {e}", file=sys.stderr)
         sys.exit(1)
-    if getattr(args, "json", False):
+    if getattr(args, "json_output", False):
         payload = t.summary()
         payload["contexts"] = [
             {"turns": list(c.turns), "assistant": c.assistant} for c in t.contexts
@@ -1787,9 +1795,18 @@ def _run_template_show(args: argparse.Namespace) -> None:
 
 
 def _run_template_rm(args: argparse.Namespace) -> None:
-    from saklas.io.templates import remove_template_folder
+    from saklas.io.templates import (
+        AmbiguousTemplateError, TemplateNotFoundError, remove_template_folder,
+        resolve_template,
+    )
 
-    namespace, name = _split_manifold_ns_name(args.name)
+    try:
+        t = resolve_template(args.name)
+    except (TemplateNotFoundError, AmbiguousTemplateError) as e:
+        print(f"template rm: {e}", file=sys.stderr)
+        sys.exit(1)
+    namespace = t.path.parent.name if t.path else "local"
+    name = t.name
     if not args.yes:
         print(
             f"remove template {namespace}/{name}? pass -y/--yes to confirm",
@@ -1824,7 +1841,7 @@ def _run_template_score(args: argparse.Namespace) -> None:
     ) as session:
         per_ctx = score_template(session, tmpl, steering=args.steer)
 
-    if getattr(args, "json", False):
+    if getattr(args, "json_output", False):
         print(_json.dumps({
             "template": tmpl.name,
             "model": args.model,
@@ -1878,10 +1895,10 @@ def _run_pack_search(args: argparse.Namespace) -> None:
         rows = search_manifolds(args.query or None)
     except ImportError as e:
         print(f"saklas manifold search unavailable: {e}", file=sys.stderr)
-        return
+        sys.exit(1)
     except Exception as e:
         print(f"hf search failed: {type(e).__name__}: {e}", file=sys.stderr)
-        return
+        sys.exit(1)
     if getattr(args, "json_output", False):
         print(_json.dumps(rows, indent=2))
         return

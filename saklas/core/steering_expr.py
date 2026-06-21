@@ -736,30 +736,21 @@ def _with_variant(canonical: str, variant: str) -> str:
     return canonical if variant == "raw" else f"{canonical}:{variant}"
 
 
-def _resolve_atom(
-    atom: _Atom, default_namespace: Optional[str],
-) -> tuple[str, int]:
-    """Return ``(alphas_key, sign_flip)`` for a **pole** atom.
+def _resolve_atom(atom: _Atom) -> str:
+    """Return the ``alphas_key`` for a **pole** atom.
 
-    ``alphas_key`` is the key under which this atom lands in
-    ``Steering.alphas``: the canonical concept name from
-    ``canonicalize_atom``, prefixed with ``<namespace>/`` when the user
-    explicitly typed a namespace (so two installed packs sharing a
-    concept name — ``alice/foo`` vs ``bob/foo`` — stay distinct
-    through the registry-key path), and suffixed with ``:<variant>``
-    when the variant is anything other than ``raw``.  ``sign_flip`` is
-    always +1 now (the bipolar-pole sign-flip moved to the manifold
-    tier); the tuple shape is kept so projection/ablation call sites are
-    untouched.
+    The key is the canonical concept name from ``canonicalize_atom``,
+    prefixed with ``<namespace>/`` when the user explicitly typed a
+    namespace (so two installed packs sharing a concept name —
+    ``alice/foo`` vs ``bob/foo`` — stay distinct through the
+    registry-key path), and suffixed with ``:<variant>`` when the
+    variant is anything other than ``raw``.
 
     This is the **pole canonicalization tier in isolation** — the base
     of a projection / ablation term and a projection ``onto`` direction
     are always vector concepts and must not route through the manifold
     tiers; the plain-term path in :func:`_fold` runs the full
     :func:`~saklas.io.selectors.resolve_bare_atom` ladder instead.
-    ``default_namespace`` is vestigial (the retired ``resolve_pole`` never
-    consumed it — canonicalization is namespace-independent); kept in the
-    signature so the projection / ablation call sites stay untouched.
     """
     from saklas.io.selectors import canonicalize_atom
 
@@ -769,7 +760,7 @@ def _resolve_atom(
     canonical, variant = canonicalize_atom(raw)
     if atom.namespace is not None:
         canonical = f"{atom.namespace}/{canonical}"
-    return _with_variant(canonical, variant), +1
+    return _with_variant(canonical, variant)
 
 
 def _merge_plain(
@@ -1029,8 +1020,8 @@ def _fold(terms: list[_Term], *, namespace: Optional[str]) -> "Steering":
                 "comma-separated coefficients are only valid for "
                 "`manifold % position` terms"
             )
-        base_key, base_sign = _resolve_atom(sel.base, namespace)
-        coeff = term.coeff * base_sign
+        base_key = _resolve_atom(sel.base)
+        coeff = term.coeff
         # ``_Term.trigger`` already carries a resolved Trigger object
         # (built by :class:`_Parser._term`) — preset names map through
         # _TRIGGER_PRESETS at parse time, gates produce a fresh
@@ -1052,7 +1043,7 @@ def _fold(terms: list[_Term], *, namespace: Optional[str]) -> "Steering":
         # the onto direction (``a|b`` yields the same result as
         # ``a|(-b)``); the base sign is already folded into ``coeff``.
         assert sel.onto is not None
-        onto_key, _onto_sign = _resolve_atom(sel.onto, namespace)
+        onto_key = _resolve_atom(sel.onto)
         effective_trig = trig if trig is not None else Trigger.BOTH
         op: Literal["~", "|"] = cast(Literal["~", "|"], sel.operator)
         syn_key = f"{base_key}{op}{onto_key}"
@@ -1200,7 +1191,7 @@ def _fmt_number(x: float) -> str:
     fractions render at full precision without scientific notation.
     """
     if x < 0:
-        return f"-{x * -1.0:g}"
+        return f"-{abs(x):g}"
     return f"{x:g}"
 
 
