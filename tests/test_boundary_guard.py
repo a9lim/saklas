@@ -150,3 +150,70 @@ def test_allowlist_entries_are_still_present() -> None:
         "ALLOWLIST has entries with no matching reach-in (remove them): "
         + ", ".join(stale)
     )
+
+
+# ---------------------------------------------------------------------------
+# Promoted-name regression guard (T2.4)
+# ---------------------------------------------------------------------------
+
+# The four names that were promoted from underscore-private to public in T2.4.
+# Frontends must now import the public form; importing the old underscore name
+# from any module is a regression against the promotion.
+_PROMOTED_OLD_NAMES = frozenset([
+    "_manifold_is_affine",
+    "_export_gguf_manifold",
+    "_all_concepts",
+    "_sanitize_hyperparams",
+])
+
+# All frontend directories (cli is included here because it too imports these
+# symbols and was updated as part of T2.4).
+_ALL_FRONTEND_DIRS = ("tui", "server", "cli")
+
+_UNDERSCORE_IMPORT_RE = re.compile(
+    r"(?:^|\s)from\s+[\w.]+\s+import\s+[^#\n]*\b(_[A-Za-z]\w*)"
+)
+
+
+def _find_promoted_old_name_imports() -> list[str]:
+    """Return one diagnostic string per import of a now-promoted name."""
+    root = _saklas_root()
+    offenders: list[str] = []
+    for sub in _ALL_FRONTEND_DIRS:
+        for path in sorted((root / sub).rglob("*.py")):
+            rel = path.relative_to(root).as_posix()
+            code = _strip_comments_and_strings(path.read_text(encoding="utf-8"))
+            for lineno, line in enumerate(code.splitlines(), start=1):
+                for m in _UNDERSCORE_IMPORT_RE.finditer(line):
+                    name = m.group(1)
+                    if name in _PROMOTED_OLD_NAMES:
+                        offenders.append(f"{rel}:{lineno}: import of old name {name!r}")
+    return offenders
+
+
+def test_promoted_names_not_imported_by_old_underscore_form() -> None:
+    """Frontends must not import the four T2.4-promoted names by their old
+    underscore form.
+
+    Each of these was renamed to a public name and the old ``_``-prefixed form
+    is now only a back-compat alias kept for monkeypatching in tests.  A fresh
+    cross-module import of the old name is a boundary violation.
+
+    NOTE — blanket "no module-level underscore imports anywhere" would also flag
+    these pre-existing legitimate patterns (not enforced here, recorded for a
+    future decision):
+      server/traits_routes.py:   _resolve_session_id  (internal server helper)
+      server/probe_routes.py:    _resolve_session_id  (internal server helper)
+      server/vector_routes.py:   _refuse_if_busy, _summarize_diagnostics (internal)
+      server/app.py:             _aliases_for (internal ollama helper)
+      tui/app.py:                _INPUT_HISTORY_MAX (internal TUI cap)
+      tui/extraction_controller.py: _Profile (local alias, type-annotation only)
+      cli/main.py:               _build_root_parser, _COMMAND_RUNNERS (internal CLI)
+    """
+    offenders = _find_promoted_old_name_imports()
+    assert not offenders, (
+        "Frontend code imports a now-public name by its old underscore form.\n"
+        "Use the public name (manifold_is_affine / export_gguf_manifold / "
+        "all_concepts / sanitize_hyperparams) instead.\n\n"
+        + "\n".join(offenders)
+    )

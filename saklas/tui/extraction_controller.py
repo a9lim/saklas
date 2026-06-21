@@ -873,11 +873,11 @@ class ExtractionController:
         no scenario gen, no network. Worker-thread safe (only touches
         ``session.profiles`` and the on-disk pack files).
         """
-        from saklas.io.selectors import _all_concepts
+        from saklas.io.selectors import all_concepts
 
         loaded: list[str] = []
         skipped: list[str] = []
-        concepts = [c for c in _all_concepts() if c.namespace == ns]
+        concepts = [c for c in all_concepts() if c.namespace == ns]
         for c in concepts:
             key = f"{ns}/{c.name}"
             if key in self._app._session.profiles:
@@ -920,8 +920,8 @@ class ExtractionController:
             self._app._enqueue_pending(PendingItem("steer", f"/steer {arg}", (arg,)))
             return
 
-        from saklas.io.selectors import _all_concepts
-        if not [c for c in _all_concepts() if c.namespace == ns]:
+        from saklas.io.selectors import all_concepts
+        if not [c for c in all_concepts() if c.namespace == ns]:
             chat.add_system_message(f"No concepts installed under '{ns}/'.")
             return
 
@@ -967,8 +967,8 @@ class ExtractionController:
             self._app._enqueue_pending(PendingItem("probe", f"/probe {arg}", (arg,)))
             return
 
-        from saklas.io.selectors import _all_concepts
-        if not [c for c in _all_concepts() if c.namespace == ns]:
+        from saklas.io.selectors import all_concepts
+        if not [c for c in all_concepts() if c.namespace == ns]:
             chat.add_system_message(f"No concepts installed under '{ns}/'.")
             return
 

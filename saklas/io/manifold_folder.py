@@ -139,7 +139,7 @@ def domain_label(spec: dict[str, Any]) -> str:
     return f"{kind}({n}d)"
 
 
-def _sanitize_hyperparams(
+def sanitize_hyperparams(
     fit_mode: str, hyperparams: dict[str, Any] | None,
 ) -> dict[str, Any]:
     """Drop hyperparam keys that don't apply to ``fit_mode``.
@@ -157,6 +157,10 @@ def _sanitize_hyperparams(
     if allowed is None:
         return dict(hyperparams)
     return {k: v for k, v in hyperparams.items() if k in allowed}
+
+
+# Back-compat alias: the function was renamed to the public ``sanitize_hyperparams``.
+_sanitize_hyperparams = sanitize_hyperparams
 
 # Manifold artifact format version.  Decoupled from concept packs'
 # ``PACK_FORMAT_VERSION`` so the two formats can churn independently.

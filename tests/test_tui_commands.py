@@ -910,14 +910,14 @@ def test_detect_namespace_selector_rejects_non_bulk_forms():
 
 
 def _stub_concepts(monkeypatch: pytest.MonkeyPatch, concepts: Any) -> None:
-    """Patch ``_all_concepts`` to return a synthetic list of namespaced
+    """Patch ``all_concepts`` to return a synthetic list of namespaced
     folders. Each entry is a SimpleNamespace with ``namespace`` and
     ``name`` attributes — the only fields the bulk handlers read.
     """
     import saklas.io.selectors as _sel
 
     fakes = [SimpleNamespace(namespace=ns, name=n) for ns, n in concepts]
-    monkeypatch.setattr(_sel, "_all_concepts", lambda: fakes)
+    monkeypatch.setattr(_sel, "all_concepts", lambda: fakes)
 
 
 def _drain_workers(app: Any) -> None:

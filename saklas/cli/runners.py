@@ -550,9 +550,9 @@ def _run_config_validate(args: argparse.Namespace) -> None:
             print(f"{p}: ok")
             return
         # Dry-run: don't install, just check resolvability.
-        from saklas.io.selectors import _all_concepts
-        installed = {(c.namespace, c.name) for c in _all_concepts()}
-        installed_names = {c.name for c in _all_concepts()}
+        from saklas.io.selectors import all_concepts
+        installed = {(c.namespace, c.name) for c in all_concepts()}
+        installed_names = {c.name for c in all_concepts()}
         missing: list[str] = []
         for ns, concept, _variant in referenced_selectors(cfg.vectors):
             if ns is None:
@@ -562,7 +562,7 @@ def _run_config_validate(args: argparse.Namespace) -> None:
                 slug = concept.split(".")[0] if "." in concept else concept
                 if any(
                     slug in c.name.split(".")
-                    for c in _all_concepts()
+                    for c in all_concepts()
                     if "." in c.name
                 ):
                     continue
@@ -1074,7 +1074,7 @@ def _run_manifold_fit(args: argparse.Namespace) -> None:
     import json as _json
     from saklas.io.atomic import write_json_atomic
     from saklas.io.manifolds import (
-        ManifoldFolder, ManifoldFormatError, _sanitize_hyperparams,
+        ManifoldFolder, ManifoldFormatError, sanitize_hyperparams,
         domain_label,
     )
 
@@ -1155,7 +1155,7 @@ def _run_manifold_fit(args: argparse.Namespace) -> None:
         # Auto-only: periodic-detection persistence threshold.
         if getattr(args, "persistence_frac", None) is not None:
             new_hyperparams["persistence_frac"] = float(args.persistence_frac)
-        new_hyperparams = _sanitize_hyperparams(new_fit_mode, new_hyperparams)
+        new_hyperparams = sanitize_hyperparams(new_fit_mode, new_hyperparams)
 
         # Write back if anything changed.  Staged write — a crash mid-rewrite
         # would leave the folder unreadable and ``ManifoldFolder.load`` would
@@ -2156,11 +2156,11 @@ def _run_pack_export(args: argparse.Namespace) -> None:
     if fmt != "gguf":
         print(f"Unknown export format: {fmt}", file=sys.stderr)
         sys.exit(2)
-    from saklas.io.cache_ops import _export_gguf_manifold
+    from saklas.io.cache_ops import export_gguf_manifold
 
     ns, name = _resolve_manifold_ns_name(args.name)
     try:
-        written = _export_gguf_manifold(
+        written = export_gguf_manifold(
             ns, name,
             model_scope=args.model,
             output=args.output,

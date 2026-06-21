@@ -22,11 +22,10 @@ from typing import Any, Callable, Literal
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from saklas.core.manifold import domain_from_spec
+from saklas.core.manifold import domain_from_spec, manifold_is_affine
 from saklas.core.session import (
     ConcurrentExtractionError,
     SaklasSession,
-    _manifold_is_affine,
 )
 from saklas.io.atomic import write_json_atomic
 from saklas.io.hf_manifolds import (
@@ -38,7 +37,7 @@ from saklas.io.hf_manifolds import (
 from saklas.io.manifolds import (
     ManifoldFolder,
     ManifoldFormatError,
-    _sanitize_hyperparams,
+    sanitize_hyperparams,
     append_discover_manifold_node,
     create_discover_manifold_folder,
     create_manifold_folder,
@@ -350,7 +349,7 @@ def _manifold_json(
                 [float(x) for x in row]
                 for row in m.node_coords.tolist()
             ]
-            resolved_affine = _manifold_is_affine(m)
+            resolved_affine = manifold_is_affine(m)
         except (FileNotFoundError, KeyError, ValueError):
             derived_coords = []
 
@@ -948,7 +947,7 @@ def register_manifold_routes(app: FastAPI) -> None:
             if req.hyperparams is not None:
                 new_hp.update(req.hyperparams)
             # Method-incompatible knobs get dropped at the IO boundary.
-            new_hp = _sanitize_hyperparams(new_fit_mode, new_hp)
+            new_hp = sanitize_hyperparams(new_fit_mode, new_hp)
             data = json.loads((folder / "manifold.json").read_text())
             data["fit_mode"] = new_fit_mode
             data["hyperparams"] = new_hp

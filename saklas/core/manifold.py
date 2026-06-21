@@ -4501,6 +4501,18 @@ def invert_parameterization(
     )
 
 
+def manifold_is_affine(manifold: "Manifold") -> bool:
+    """True iff every layer subspace is flat — an affine ``%`` joins the merge.
+
+    A fit is all-affine (``fit_mode=pca``) or all-curved (authored / spectral);
+    a curved ``%`` gets its own two-op instead.
+    """
+    layers = getattr(manifold, "layers", None)
+    if not layers:
+        return False
+    return all(sub.is_affine for sub in layers.values())
+
+
 __all__ = [
     "DEFAULT_N_COMPONENTS",
     "DEFAULT_INVERSION_MAX_ITER",
@@ -4532,4 +4544,5 @@ __all__ = [
     "save_manifold",
     "load_manifold",
     "invert_parameterization",
+    "manifold_is_affine",
 ]

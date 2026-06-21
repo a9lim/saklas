@@ -460,7 +460,7 @@ def _replay_branch_logprobs(
     intentionally absent so long branches do not allocate dense
     ``[n_rows, vocab]`` tensors filled mostly with ``-inf``.
     """
-    model = session._model
+    model = session.model
     try:
         device = next(model.parameters()).device
     except StopIteration:  # pragma: no cover - defensive for odd test doubles

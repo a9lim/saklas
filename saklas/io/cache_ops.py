@@ -50,7 +50,7 @@ def _resolve_model_hint(safe_id: str) -> str:
     return str(mt)
 
 
-def _export_gguf_manifold(
+def export_gguf_manifold(
     ns: str,
     name: str,
     *,

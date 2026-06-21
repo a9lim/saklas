@@ -112,7 +112,7 @@ def _const_logits_fn(value_for_id: dict[int, float]) -> Any:
 def _make_session(logits_fn: Any, *, steering_cm: Any = None) -> Any:
     """A duck-typed session exposing exactly what ``score_choices`` touches.
 
-    The scorer reads ``session._model`` / ``session._tokenizer`` and, when
+    The scorer reads ``session.model`` / ``session.tokenizer`` and, when
     ``steering`` is passed, calls ``session.steering(expr)`` for a context
     manager.  Everything else is irrelevant.
     """
@@ -129,7 +129,9 @@ def _make_session(logits_fn: Any, *, steering_cm: Any = None) -> Any:
         return contextlib.nullcontext()
 
     return SimpleNamespace(
-        _model=model, _tokenizer=tok, steering=steering, _steer_calls=calls,
+        model=model, tokenizer=tok,
+        _model=model, _tokenizer=tok,  # kept for any direct stub reads in tests
+        steering=steering, _steer_calls=calls,
     )
 
 
@@ -401,7 +403,7 @@ def test_steering_actually_shifts_distribution():
     def steering(expr: Any) -> Any:
         return cm()
 
-    session: Any = SimpleNamespace(_model=base, _tokenizer=tok, steering=steering)
+    session: Any = SimpleNamespace(model=base, tokenizer=tok, _model=base, _tokenizer=tok, steering=steering)
 
     before = score_choices(session, [{"role": "user", "content": "q"}], ["a", "b"])
     after = score_choices(

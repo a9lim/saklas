@@ -49,7 +49,7 @@ from saklas.core.results import (
 from saklas.core.sampling import SamplingConfig
 from saklas.core.steering import Steering
 from saklas.core.steering_expr import AblationTerm, ManifoldTerm
-from saklas.core.manifold import Manifold
+from saklas.core.manifold import Manifold, manifold_is_affine
 
 if TYPE_CHECKING:
     from saklas.core.scoring import ChoiceScores
@@ -439,16 +439,10 @@ class ConcurrentExtractionError(RuntimeError, SaklasError):
 SteeringStackEntry = tuple[float, Trigger] | AblationTerm | ManifoldTerm
 
 
-def _manifold_is_affine(manifold: "Manifold") -> bool:
-    """True iff every layer subspace is flat — an affine ``%`` joins the merge.
-
-    A fit is all-affine (``fit_mode=pca``) or all-curved (authored / spectral);
-    a curved ``%`` gets its own two-op instead.
-    """
-    layers = getattr(manifold, "layers", None)
-    if not layers:
-        return False
-    return all(sub.is_affine for sub in layers.values())
+# Back-compat alias: the function was moved to core/manifold.py as the public
+# ``manifold_is_affine``.  Tests that monkeypatch ``session._manifold_is_affine``
+# and internal callers that reference it by its old name continue to resolve here.
+_manifold_is_affine = manifold_is_affine
 
 
 def _affine_manifold_push(

@@ -1113,12 +1113,12 @@ class SaklasApp(App[None]):
             self._trait_panel.set_active_probes(set())
             self._trait_panel.set_active_manifold_probes({})
             return
-        from saklas.core.session import _manifold_is_affine
+        from saklas.core.manifold import manifold_is_affine
         flat: set[str] = set()
         curved: dict[str, Any] = {}
         for name in monitor.probe_names:
             manifold = monitor.manifolds.get(name)
-            if manifold is not None and not _manifold_is_affine(manifold):
+            if manifold is not None and not manifold_is_affine(manifold):
                 curved[name] = manifold
             else:
                 flat.add(name)

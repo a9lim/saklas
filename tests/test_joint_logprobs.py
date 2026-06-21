@@ -354,6 +354,7 @@ class _MockSession:
         for word in ("User:", "ask", "Assistant:", "hello", "a", "b"):
             self.tokenizer._intern(word)
         self._model = _MockModel(vocab=len(self.tokenizer._vocab) + 16)
+        self.model = self._model
         self.tree = _MockTree()
         self.config = _MockConfig()
 

@@ -27,7 +27,7 @@ from saklas.io.manifold_folder import (
     _node_filename,
     _node_payload_authored,
     _node_payload_discover,
-    _sanitize_hyperparams,
+    sanitize_hyperparams,
     _validate_node_kind,
     _validate_node_role,
     min_nodes,
@@ -423,7 +423,7 @@ def create_discover_manifold_folder(
         "name": name,
         "description": description,
         "fit_mode": fit_mode,
-        "hyperparams": _sanitize_hyperparams(fit_mode, hyperparams),
+        "hyperparams": sanitize_hyperparams(fit_mode, hyperparams),
         "nodes": [
             _node_payload_discover(label, roles_resolved[label], kinds_resolved[label])
             for label in node_corpora
@@ -753,7 +753,7 @@ def init_discover_manifold_folder(
         "name": name,
         "description": description,
         "fit_mode": fit_mode,
-        "hyperparams": _sanitize_hyperparams(fit_mode, hyperparams),
+        "hyperparams": sanitize_hyperparams(fit_mode, hyperparams),
         "nodes": [
             _node_payload_discover(label, roles_resolved[label], kinds_resolved[label])
             for label in labels
@@ -840,7 +840,7 @@ def _discover_manifest_payload(
         "name": name,
         "description": description,
         "fit_mode": fit_mode,
-        "hyperparams": _sanitize_hyperparams(fit_mode, hyperparams),
+        "hyperparams": sanitize_hyperparams(fit_mode, hyperparams),
         "nodes": [
             _node_payload_discover(label, roles.get(label), kinds.get(label))
             for label in labels

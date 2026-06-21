@@ -131,7 +131,7 @@ def invalidate() -> None:
     _manifold_names_cache.clear()
 
 
-def _all_concepts() -> list[ResolvedConcept]:
+def all_concepts() -> list[ResolvedConcept]:
     """Every installed concept — i.e. every installed manifold (4.0).
 
     Concepts and steering manifolds are the same artifact now, so this walks
@@ -160,8 +160,13 @@ def _all_concepts() -> list[ResolvedConcept]:
     return out
 
 
+# Back-compat alias: callers that import ``_all_concepts`` by the old name
+# continue to resolve here.  The public name is ``all_concepts``.
+_all_concepts = all_concepts
+
+
 def resolve(selector: Selector) -> list[ResolvedConcept]:
-    concepts = _all_concepts()
+    concepts = all_concepts()
 
     if selector.kind == "all":
         return concepts

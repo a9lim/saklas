@@ -129,7 +129,7 @@ objects. Don't decompose them. There are exactly two clean seams worth cutting.
   Consider moving `ManifoldNotRegisteredError`/`VectorNotRegisteredError` from
   `session.py` to `core/errors.py`.
 
-- [ ] **T2.4 — Boundary guard's module-level blind spot.**
+- [x] **T2.4 — Boundary guard's module-level blind spot.** — DONE: promoted `_manifold_is_affine` → `core/manifold.py::manifold_is_affine` (session keeps a back-compat alias for `steering_composer`), `_export_gguf_manifold` → `export_gguf_manifold`, `_all_concepts` → `all_concepts` (alias kept; tests monkeypatch the module name), `_sanitize_hyperparams` → `sanitize_hyperparams` (fixed the underscore-in-`__all__` contradiction); all import sites in server/tui/cli/tests updated. `scoring.py`/`joint_logprobs.py` switched to public `session.model`/`tokenizer`. `test_boundary_guard.py` got a targeted regression check for the four names (a blanket module-level ban was scoped out — it would flag legitimate intra-frontend helpers; the candidates are recorded for a future decision).
   T2.0 banned `session._` instance reach-ins; module-level underscored functions
   still cross layers: `_manifold_is_affine` (imported by `manifold_routes.py:29`,
   `probe_routes.py:25`), `_export_gguf_manifold`/`_all_concepts`/

@@ -22,7 +22,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel
 
-from saklas.core.session import _manifold_is_affine
+from saklas.core.manifold import manifold_is_affine
 from saklas.server import saklas_api as _api
 from saklas.server.saklas_api import _resolve_session_id
 
@@ -52,7 +52,7 @@ def _probe_info(name: str, probe: Any) -> dict[str, Any]:
     except Exception:
         node_coords = None
     try:
-        is_affine = _manifold_is_affine(manifold)
+        is_affine = manifold_is_affine(manifold)
     except Exception:
         is_affine = False
     return {

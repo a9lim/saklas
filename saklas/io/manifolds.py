@@ -61,7 +61,7 @@ from saklas.io.manifold_folder import (
     _node_filename,
     _node_payload_authored,
     _node_payload_discover,
-    _sanitize_hyperparams,
+    sanitize_hyperparams,
     _validate_node_kind,
     _validate_node_role,
     _warn_authoring_quality,
@@ -409,5 +409,5 @@ __all__ = [
     "domain_label",
     "bundled_manifold_names",
     "materialize_bundled_manifolds",
-    "_sanitize_hyperparams",
+    "sanitize_hyperparams",
 ]
