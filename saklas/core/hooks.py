@@ -968,15 +968,32 @@ def _manifold_layer_shares(manifold: Any) -> dict[int, float]:
             layer_idx: float(baked[layer_idx]) for layer_idx in manifold.layers
         }
     else:
+        # Euclidean centroid-spread fallback: used only when no whitener was
+        # present at fit time (CPU test stubs without a neutral cache).
+        # Guard on ``is_affine`` first — ``rbf_params()`` raises on flat
+        # subspaces (documented in core/AGENTS.md), so we must never call it
+        # on concepts / personas / any pca-fit manifold (T1.5 fix).
         layer_scores = {}
         for layer_idx, sub in manifold.layers.items():
-            _np, _rw, _pc = sub.rbf_params()
-            node_coords = eval_rbf(
-                _np, _rw, _pc, _np,
-            )  # (K, R) — exact centered coords at the fit nodes
-            layer_scores[layer_idx] = float(
-                torch.linalg.vector_norm(node_coords).item()
-            )
+            if sub.is_affine:
+                # Flat subspace: use the Euclidean norm of the per-layer
+                # real node coords (K, R) stored on every affine LayerSubspace.
+                # Falls back to 1.0 when node_coords is absent (degenerate stub).
+                nc = sub.node_coords
+                score = (
+                    float(torch.linalg.vector_norm(nc.to(torch.float32)).item())
+                    if nc is not None
+                    else 1.0
+                )
+            else:
+                # Curved subspace: eval the RBF at the fit nodes to get the
+                # (K, R) reduced coords and use their Frobenius norm as a spread.
+                _np, _rw, _pc = sub.rbf_params()
+                node_coords = eval_rbf(
+                    _np, _rw, _pc, _np,
+                )  # (K, R) — exact centered coords at the fit nodes
+                score = float(torch.linalg.vector_norm(node_coords).item())
+            layer_scores[layer_idx] = score
     return _normalize_shares_mean1(layer_scores)
 
 

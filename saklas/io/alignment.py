@@ -31,6 +31,7 @@ from typing import Any
 import torch
 from safetensors.torch import load_file, save_file
 
+from saklas.core.errors import SaklasError
 from saklas.core.profile import Profile
 from saklas.io.atomic import write_json_atomic
 from saklas.io.paths import model_dir, neutral_statements_path, safe_model_id
@@ -160,8 +161,11 @@ def load_or_compute_neutral_activations(
 # ---------------------------------------------------------------------------
 
 
-class AlignmentError(ValueError):
+class AlignmentError(ValueError, SaklasError):
     """Raised when an alignment can't be fit (insufficient shared layers)."""
+
+    def user_message(self) -> tuple[int, str]:
+        return (422, str(self) or self.__class__.__name__)
 
 
 def fit_alignment(

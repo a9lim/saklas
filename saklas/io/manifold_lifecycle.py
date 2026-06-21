@@ -22,7 +22,7 @@ from typing import Any, Optional
 import torch
 
 from saklas.io.atomic import write_json_atomic
-from saklas.core.errors import SaklasError
+from saklas.core.errors import ManifoldExistsError, ManifoldNotFoundError, SaklasError
 from saklas.core.manifold import domain_from_spec
 from saklas.io.manifold_folder import (
     BakedManifoldError,
@@ -130,7 +130,7 @@ def clear_manifold_tensors(
     """
     folder = manifold_dir(namespace, name)
     if not (folder / "manifold.json").exists():
-        raise FileNotFoundError(f"manifold {namespace}/{name} not found at {folder}")
+        raise ManifoldNotFoundError(f"manifold {namespace}/{name} not found at {folder}")
     # Load *before* unlinking — once the tensors are gone the populated
     # ``files`` manifest would fail the integrity check on a reload.  Keep
     # the in-memory folder and re-hash from disk afterward, the same shape
@@ -170,7 +170,7 @@ def remove_manifold_folder(namespace: str, name: str) -> dict[str, Any]:
     """
     folder = manifold_dir(namespace, name)
     if not (folder / "manifold.json").exists():
-        raise FileNotFoundError(f"manifold {namespace}/{name} not found at {folder}")
+        raise ManifoldNotFoundError(f"manifold {namespace}/{name} not found at {folder}")
     # Read the source tier before deleting (best-effort — a corrupt
     # manifest just reports the namespace-implied tier).
     try:
@@ -216,7 +216,7 @@ def refresh_manifold(
     """
     folder = manifold_dir(namespace, name)
     if not (folder / "manifold.json").exists():
-        raise FileNotFoundError(f"manifold {namespace}/{name} not found at {folder}")
+        raise ManifoldNotFoundError(f"manifold {namespace}/{name} not found at {folder}")
 
     if model_scope is not None:
         # Scoped refresh: drop just that model's fitted tensor pair so it
@@ -332,7 +332,7 @@ def transfer_manifold(
     safe_from = safe_model_id(from_model)
     src_tensor = folder / f"{safe_from}.safetensors"
     if not src_tensor.exists():
-        raise FileNotFoundError(
+        raise ManifoldNotFoundError(
             f"manifold {folder.name!r} has no fit for source model "
             f"{from_model!r} at {src_tensor}"
         )
@@ -364,7 +364,7 @@ def transfer_manifold(
 
     out_path = folder / tensor_filename(to_model, transferred_from=from_model)
     if out_path.exists() and not force:
-        raise FileExistsError(
+        raise ManifoldExistsError(
             f"{out_path} already exists; pass force=True to overwrite"
         )
 

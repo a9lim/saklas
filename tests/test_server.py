@@ -509,11 +509,21 @@ class TestOllamaApi:
         assert resp.status_code == 200
         assert resp.headers["content-type"].startswith("application/x-ndjson")
         lines = [json.loads(l) for l in resp.text.strip().split("\n") if l]
-        assert lines == [{
-            "model": "test/model",
-            "created_at": lines[0]["created_at"],
-            "error": "No vector registered for 'missing'",
-        }]
+        # An in-band error frame, then a terminating ``done`` frame so
+        # ollama-python / ChatOllama don't stall waiting for stream end.
+        assert lines == [
+            {
+                "model": "test/model",
+                "created_at": lines[0]["created_at"],
+                "error": "No vector registered for 'missing'",
+            },
+            {
+                "model": "test/model",
+                "created_at": lines[1]["created_at"],
+                "done": True,
+                "done_reason": "error",
+            },
+        ]
 
     def test_generate_non_streaming(self, session_and_client: Any) -> None:
         session, client = session_and_client

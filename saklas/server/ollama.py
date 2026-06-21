@@ -663,6 +663,7 @@ def register_ollama_routes(app: FastAPI) -> None:
         is_chat: bool,
         gen_kwargs: dict[str, Any],
         system: str | None,
+        request: Request | None = None,
     ):
         """Streaming NDJSON body for /api/chat and /api/generate.
 
@@ -672,6 +673,11 @@ def register_ollama_routes(app: FastAPI) -> None:
         errors can still happen when generation starts, so the iterator
         also converts ``SaklasError`` in-band instead of cutting the TCP
         stream off mid-flight.
+
+        ``request`` is threaded in from the route handler so we can bail
+        early on client disconnect (``is_disconnected()``).  Library and
+        test callers that don't have a live request pass ``None`` — the
+        disconnect check is simply skipped.
         """
         if is_chat:
             msgs = _extract_messages(body)
@@ -705,9 +711,15 @@ def register_ollama_routes(app: FastAPI) -> None:
             # matching the non-streaming path's single ``_now_iso()`` call.
             created_at = _now_iso()
             start_ns = time.monotonic_ns()
+            stream_iter = None
             try:
                 stream_iter = session.generate_stream(input_payload, raw=raw, **gen_kwargs)
                 for event in stream_iter:
+                    # Bail out if the client has hung up — close the inner
+                    # generator (handled in ``finally``) and stop spending
+                    # the GPU on tokens nobody is reading.
+                    if request is not None and await request.is_disconnected():
+                        return
                     if event.thinking:
                         # Ollama doesn't standardize a reasoning channel;
                         # the canonical shape uses a `thinking` field on
@@ -756,6 +768,12 @@ def register_ollama_routes(app: FastAPI) -> None:
                     "model": model_name, "created_at": created_at,
                     "error": "Generation already in progress",
                 }) + "\n"
+                # Terminating done frame so ollama-python / ChatOllama don't
+                # stall waiting for it after an in-band error chunk.
+                yield json.dumps({
+                    "model": model_name, "created_at": created_at,
+                    "done": True, "done_reason": "error",
+                }) + "\n"
                 return
             except SaklasError as e:
                 _status, msg = e.user_message()
@@ -764,7 +782,22 @@ def register_ollama_routes(app: FastAPI) -> None:
                     "created_at": created_at,
                     "error": msg,
                 }) + "\n"
+                # Terminating done frame so ollama-python / ChatOllama don't
+                # stall waiting for it after an in-band error chunk.
+                yield json.dumps({
+                    "model": model_name, "created_at": created_at,
+                    "done": True, "done_reason": "error",
+                }) + "\n"
                 return
+            finally:
+                # Deterministically tear down the engine worker thread
+                # (stop-flag + join) on every exit — normal completion
+                # (no-op on an exhausted generator), an in-band error, or
+                # an early client-disconnect ``return`` — rather than
+                # leaving it to GC.
+                close = getattr(stream_iter, "close", None)
+                if callable(close):
+                    close()
 
             elapsed_ns = time.monotonic_ns() - start_ns
             result = session.last_result
@@ -813,6 +846,7 @@ def register_ollama_routes(app: FastAPI) -> None:
             return StreamingResponse(
                 _stream_chat_or_generate(
                     body, is_chat=True, gen_kwargs=gen_kwargs, system=system,
+                    request=request,
                 ),
                 media_type="application/x-ndjson",
             )
@@ -829,6 +863,7 @@ def register_ollama_routes(app: FastAPI) -> None:
             return StreamingResponse(
                 _stream_chat_or_generate(
                     body, is_chat=False, gen_kwargs=gen_kwargs, system=system,
+                    request=request,
                 ),
                 media_type="application/x-ndjson",
             )

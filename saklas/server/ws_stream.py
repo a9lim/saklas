@@ -24,7 +24,12 @@ from saklas.core.results import GenerationResult, RunSet
 from saklas.core.sampling import SamplingConfig
 from saklas.core.session import SaklasSession
 from saklas.core.steering import Steering
-from saklas.server.app import _merge_steering, _parse_req_steering, ws_auth_ok
+from saklas.server.app import (
+    _merge_steering,
+    _parse_req_steering,
+    acquire_session_lock,
+    ws_auth_ok,
+)
 from saklas.server.streaming import probe_reading_aggregate
 from saklas.server.ws_events import build_token_event
 from saklas.server.saklas_api import (
@@ -433,7 +438,17 @@ async def _ws_handle_generate(
         commit_asst_role = (
             msg.sampling.assistant_role if msg.sampling is not None else None
         ) or None
-        async with session.lock:
+        async with acquire_session_lock(session) as acquired:
+            if not acquired:
+                await send_json({
+                    "type": "error",
+                    "message": "session locked — try again when the current generation finishes",
+                    "code": "SessionLocked",
+                    "status": 503,
+                    "node_id": None,
+                    "sibling_index": 0,
+                })
+                return
             try:
                 if msg.commit_role == "user":
                     # ``raw`` flags a flat (base-model) commit — the
@@ -501,8 +516,20 @@ async def _ws_handle_generate(
     # concurrent WS clients serialize FIFO instead of overlapping.
     # ``session.generate_stream`` itself uses the threading ``_gen_lock``
     # to gate the actual generation, but the async-level lock is what
-    # queues HTTP/WS endpoints fairly.
-    async with session.lock:
+    # queues HTTP/WS endpoints fairly.  Bounded to SESSION_LOCK_TIMEOUT_SECONDS
+    # (300 s) so a long-running generation doesn't pin the lock forever;
+    # a timeout surfaces as a WS error frame (no HTTP in the WS context).
+    async with acquire_session_lock(session) as acquired:
+        if not acquired:
+            await send_json({
+                "type": "error",
+                "message": "session locked — try again when the current generation finishes",
+                "code": "SessionLocked",
+                "status": 503,
+                "node_id": None,
+                "sibling_index": 0,
+            })
+            return
         for sibling_idx, seed_i in enumerate(seeds):
             generation_id = uuid.uuid4().hex[:12]
 

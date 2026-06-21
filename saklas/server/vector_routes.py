@@ -18,6 +18,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response
 
 from saklas.core.profile import Profile
+from saklas.server.app import acquire_session_lock
 from saklas.server.sse import ProgressCallback, progress_sse_response
 from saklas.server.saklas_api import (
     BakeVectorRequest,
@@ -408,7 +409,9 @@ def register_vector_routes(app: FastAPI) -> None:
             )
 
         progress_msgs: list[str] = []
-        async with session.lock:
+        async with acquire_session_lock(session) as acquired:
+            if not acquired:
+                raise HTTPException(503, "session locked")
             canonical, profile = await asyncio.to_thread(_run, progress_msgs.append)
             registry_name = _extract_registry_name(canonical, req.namespace)
             if req.auto_register:
@@ -436,7 +439,9 @@ def register_vector_routes(app: FastAPI) -> None:
         from saklas.server.manifold_routes import _refuse_if_busy
         _resolve_session_id(session, session_id)
 
-        async with session.lock:
+        async with acquire_session_lock(session) as acquired:
+            if not acquired:
+                raise HTTPException(503, "session locked")
             # Refuse (409) while an in-flight extract holds the engine
             # gen-lock — parity with the manifold mutating routes, so a
             # merge can't race a concurrent extraction.

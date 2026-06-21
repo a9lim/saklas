@@ -145,7 +145,9 @@ def register_tree_routes(app: FastAPI) -> None:
         in the tree itself).
         """
         _resolve_session_id(session, session_id)
-        async with session.lock:
+        async with acquire_session_lock(session) as acquired:
+            if not acquired:
+                raise HTTPException(503, "session locked")
             session.clear_history()
         return Response(status_code=204)
 
@@ -214,7 +216,9 @@ def register_tree_routes(app: FastAPI) -> None:
         ) -> None:
             captured.append(str(message))
 
-        async with session.lock:
+        async with acquire_session_lock(session) as acquired:
+            if not acquired:
+                raise HTTPException(503, "session locked")
             with warnings.catch_warnings():
                 warnings.showwarning = _on_warning
                 try:

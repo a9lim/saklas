@@ -125,3 +125,25 @@ class OverlappingManifoldError(SteeringExprError):
     still catch it; the dedicated type lets callers discriminate the
     overlap failure from a generic parse error.
     """
+
+
+class ManifoldNotFoundError(FileNotFoundError, SaklasError):
+    """Raised when a manifold folder or its fitted tensor is not found.
+
+    Preserves ``FileNotFoundError`` in the MRO so existing
+    ``except FileNotFoundError`` call sites (server, CLI) still catch it.
+    """
+
+    def user_message(self) -> tuple[int, str]:
+        return (404, str(self) or self.__class__.__name__)
+
+
+class ManifoldExistsError(FileExistsError, SaklasError):
+    """Raised when a manifold tensor already exists and ``force`` is off.
+
+    Preserves ``FileExistsError`` in the MRO so existing
+    ``except FileExistsError`` call sites (server, CLI) still catch it.
+    """
+
+    def user_message(self) -> tuple[int, str]:
+        return (409, str(self) or self.__class__.__name__)
