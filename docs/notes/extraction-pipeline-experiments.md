@@ -8,7 +8,7 @@ that capture activations under more on-distribution conditions. Three
 experiments across two models. Closed off without a pipeline change;
 the negative result is itself the useful finding.
 
-Scripts (all under `scripts/`, untracked):
+Scripts (all under `scripts/experiments/`):
 
 - `happy_sad_prefill_vs_generation.py` — first-cut cosine comparison
   of prefill-extracted vs generation-extracted directions

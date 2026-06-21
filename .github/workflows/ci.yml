@@ -35,14 +35,20 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
       - run: python -m pip install --upgrade pip
       - run: pip install -e ".[dev]"
-      - run: pytest -q -m "not gpu"
+      # Coverage is informational only — no --cov-fail-under, and --cov stays out
+      # of pyproject addopts so local runs without pytest-cov keep working.
+      - run: pytest -q -m "not gpu" --cov=saklas --cov-report=term-missing
 
   build:
     # Validates the PEP 621 dynamic-version setup in pyproject.toml: confirms

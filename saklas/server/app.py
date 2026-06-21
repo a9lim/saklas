@@ -25,6 +25,11 @@ from saklas.core.errors import SaklasError
 from saklas.core.sampling import SamplingConfig
 from saklas.core.session import ConcurrentGenerationError, SaklasSession
 from saklas.core.steering import Steering
+from saklas.server.streaming import (
+    _usage_dict,
+    probe_reading_aggregate,
+    stream_finalizer,
+)
 
 
 SESSION_LOCK_TIMEOUT_SECONDS = 300
@@ -278,9 +283,9 @@ def _probe_reading_dict(
 ) -> dict[str, Any]:
     # build_readings() already scopes to monitor.probe_names, but cross-check
     # explicitly so a client never sees a probe that isn't active in the monitor.
-    monitor_names = set(session._monitor.probe_names)
+    monitor_names = set(session.monitor.probe_names)
     if readings is None:
-        result = getattr(session, "_last_result", None)
+        result = getattr(session, "last_result", None)
         readings = getattr(result, "readings", None) if result is not None else None
     if readings is None:
         readings = session.build_readings()
@@ -293,30 +298,15 @@ def _probe_reading_dict(
 
 
 def _probe_reading_aggregate(session: SaklasSession) -> dict[str, Any]:
-    """Per-attached-probe ``ProbeReading.to_dict()`` from ``_last_result``.
+    """Per-attached-probe ``ProbeReading.to_dict()`` from ``last_result``.
 
-    Returns ``{}`` when no result is recorded or no manifold probes are
-    attached.  Surfaced under the ``x-saklas-probe-readings`` extension
-    on OpenAI and Ollama responses so vector-probe clients keep working
-    unchanged and manifold-aware clients pick up the geometric channel.
+    Thin wrapper over the shared :func:`server.streaming.probe_reading_aggregate`
+    bound to ``session.last_result`` — the source the non-streaming OpenAI /
+    Ollama handlers read.  Surfaced under the ``x-saklas-probe-readings``
+    extension so vector-probe clients keep working unchanged and manifold-aware
+    clients pick up the geometric channel.
     """
-    result = getattr(session, "_last_result", None)
-    if result is None:
-        return {}
-    readings = getattr(result, "probe_readings", None) or {}
-    if not readings:
-        return {}
-    try:
-        attached = set(session._monitor.probe_names)
-    except Exception:
-        attached = set(readings.keys())
-    out: dict[str, Any] = {}
-    for name, agg in readings.items():
-        if name not in attached:
-            continue
-        with suppress(Exception):
-            out[name] = agg.to_dict()
-    return out
+    return probe_reading_aggregate(session, getattr(session, "last_result", None))
 
 
 def _probe_token_readings(event: Any) -> dict[str, Any] | None:
@@ -478,12 +468,6 @@ def _sampling_kwargs(
     }
 
 
-def _usage_dict(result: GenerationResult) -> dict[str, int]:
-    pt = result.prompt_tokens
-    ct = result.token_count
-    return {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}
-
-
 def _token_bytes(text: str) -> list[int]:
     try:
         return list(text.encode("utf-8"))
@@ -494,7 +478,7 @@ def _token_bytes(text: str) -> list[int]:
 def _render_logprobs_chat(result: GenerationResult, session: SaklasSession) -> dict[str, Any] | None:
     if result.logprobs is None:
         return None
-    tok = session._tokenizer
+    tok = session.tokenizer
     content = []
     # Inner ``top`` is now ``list[TokenAlt]`` (id/text/logprob triples
     # decoded by the engine at top-K capture time); the previous
@@ -529,7 +513,7 @@ def _render_logprobs_completions(result: GenerationResult, session: SaklasSessio
     """
     if result.logprobs is None:
         return None
-    tok = session._tokenizer
+    tok = session.tokenizer
     tokens: list[str] = []
     token_logprobs: list[float] = []
     top_logprobs: list[dict[str, float]] = []
@@ -555,6 +539,7 @@ async def _stream_generation(
     stream_iter: Iterator[Any], rid: str, model_id: str, object_type: str,
     format_delta: Callable[[Any], dict[str, Any]], empty_delta: dict[str, Any],
     include_usage: bool = False, role_delta: bool = False,
+    request: Request | None = None,
 ):
     """Shared SSE generator for chat and completion streaming.
 
@@ -562,6 +547,12 @@ async def _stream_generation(
     stream lifetime (streams inherit queue semantics rather than 409).
     Per-request sampling overrides are carried in the iterator's own
     ``sampling=`` kwarg (bound at caller site) — no session.config rebind.
+
+    The inner ``stream_iter`` is always ``.close()``d in a ``finally`` so the
+    engine's worker-thread teardown (stop-flag + join) fires deterministically
+    on early exit rather than waiting on GC.  When a ``request`` is wired in,
+    a periodic ``is_disconnected()`` check stops generation early once the
+    client is gone, so the GPU isn't spent on a stream nobody reads.
     """
     created_ts = int(time.time())
     async with acquire_session_lock(session) as acquired:
@@ -579,6 +570,11 @@ async def _stream_generation(
             yield f"data: {json.dumps(chunk)}\n\n"
         try:
             for event in stream_iter:
+                # Bail out if the client has hung up — close the inner
+                # generator (handled in ``finally``) and stop spending the
+                # GPU on tokens nobody is reading.
+                if request is not None and await request.is_disconnected():
+                    return
                 choice: dict[str, Any] = {
                     "index": 0, **format_delta(event), "finish_reason": None,
                 }
@@ -618,13 +614,20 @@ async def _stream_generation(
             }
             yield f"data: {json.dumps(err)}\n\n"
             return
+        finally:
+            # Deterministically tear down the engine worker thread (stop-flag
+            # + join) on every exit — normal completion (no-op on an exhausted
+            # generator), an in-band error, or an early client-disconnect
+            # ``return`` — rather than leaving it to GC.
+            close = getattr(stream_iter, "close", None)
+            if callable(close):
+                close()
 
-        finish_reason = session._gen_state.finish_reason
+        last_result = getattr(session, "last_result", None)
+        finish_reason, usage, mf_agg = stream_finalizer(session, last_result)
         final_choice: dict[str, Any] = {
             "index": 0, **empty_delta, "finish_reason": finish_reason,
         }
-        last_result = getattr(session, "_last_result", None)
-        mf_agg = _probe_reading_aggregate(session)
         if mf_agg:
             final_choice["x-saklas-probe-readings"] = mf_agg
         compat_probe_readings = _probe_reading_dict(
@@ -641,11 +644,11 @@ async def _stream_generation(
         }
         yield f"data: {json.dumps(final)}\n\n"
 
-        if include_usage and session._last_result is not None:
+        if include_usage and usage is not None:
             usage_chunk = {
                 "id": rid, "object": object_type, "created": created_ts,
                 "model": model_id, "choices": [],
-                "usage": _usage_dict(session._last_result),
+                "usage": usage,
             }
             yield f"data: {json.dumps(usage_chunk)}\n\n"
 
@@ -798,11 +801,16 @@ def _register_routes(app: FastAPI) -> None:
 
     async def _run_blocking(req: _SamplingBase, prompt_or_messages: Any, *, raw: bool) -> Any:
         gen_kwargs = _sampling_kwargs(req, app.state.default_steering)
-        async with session.lock:
+        # Bounded lock so a non-streaming request can't queue forever behind
+        # a stuck generation — it 503s like the streaming paths do.  Returns
+        # a ``JSONResponse`` on timeout; callers return it verbatim.
+        async with acquire_session_lock(session) as acquired:
+            if not acquired:
+                return _error(503, "Server busy", "server_error")
             return session.generate(prompt_or_messages, raw=raw, **gen_kwargs)
 
     @app.post("/v1/chat/completions")
-    async def chat_completions(req: ChatCompletionRequest):
+    async def chat_completions(req: ChatCompletionRequest, request: Request):
         _check_openai_model_strict(session, req.model)
         messages = [{"role": m.role, "content": m.content} for m in req.messages]
         rid = _make_id()
@@ -824,13 +832,16 @@ def _register_routes(app: FastAPI) -> None:
                 _stream_generation(session,
                                    stream_iter, rid, model_id,
                                    "chat.completion.chunk", _chat_delta, {"delta": {}},
-                                   include_usage=include_usage, role_delta=True),
+                                   include_usage=include_usage, role_delta=True,
+                                   request=request),
                 media_type="text/event-stream",
             )
         try:
             result = await _run_blocking(req, messages, raw=False)
         except ConcurrentGenerationError:
             return _error(409, "Generation already in progress", "conflict")
+        if isinstance(result, JSONResponse):  # bounded-lock timeout → 503
+            return result
 
         chat_choice: dict[str, Any] = {
             "index": 0,
@@ -856,7 +867,7 @@ def _register_routes(app: FastAPI) -> None:
     # -----------------------------------------------------------------------
 
     @app.post("/v1/completions")
-    async def completions(req: CompletionRequest):
+    async def completions(req: CompletionRequest, request: Request):
         _check_openai_model_strict(session, req.model)
         rid = _make_id()
         model_id = session.model_id
@@ -869,13 +880,16 @@ def _register_routes(app: FastAPI) -> None:
                 _stream_generation(session,
                                    stream_iter, rid, model_id,
                                    "text_completion", lambda e: {"text": e.text}, {"text": ""},
-                                   include_usage=include_usage, role_delta=False),
+                                   include_usage=include_usage, role_delta=False,
+                                   request=request),
                 media_type="text/event-stream",
             )
         try:
             result = await _run_blocking(req, req.prompt, raw=True)
         except ConcurrentGenerationError:
             return _error(409, "Generation already in progress", "conflict")
+        if isinstance(result, JSONResponse):  # bounded-lock timeout → 503
+            return result
 
         completion_choice: dict[str, Any] = {
             "index": 0,

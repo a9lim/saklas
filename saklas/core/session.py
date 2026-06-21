@@ -6,8 +6,9 @@ import queue
 import re
 import threading
 import time
-from contextlib import suppress
-from enum import IntEnum
+from contextlib import contextmanager, suppress
+from dataclasses import dataclass
+from enum import Enum, IntEnum
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Literal, cast, overload
 
@@ -52,6 +53,7 @@ from saklas.core.manifold import Manifold
 
 if TYPE_CHECKING:
     from saklas.core.scoring import ChoiceScores
+    from saklas.core.steering_composer import SteeringComposer
     from saklas.io.templates import TemplateFolder
 from saklas.core.triggers import Trigger
 from saklas.core.vectors import load_profile as _load_profile
@@ -320,6 +322,74 @@ class GenState(IntEnum):
     PREAMBLE = 1
     RUNNING = 2
     FINALIZING = 3
+
+
+class CaptureMode(Enum):
+    """How the per-gen hidden-state capture scores its probes (legal-by-construction).
+
+    Replaces the five correlated capture booleans (``_capture_incremental`` /
+    ``_capture_aggregate_only`` / ``_capture_lean`` / ``_capture_gating_subset``)
+    that a hand-kept if/elif chain used to keep consistent — illegal combinations
+    (e.g. incremental *and* aggregate-only) were representable.  One mode is the
+    single source of truth; :meth:`SaklasSession._begin_capture` picks it and every
+    ``_score_*`` dispatch keys off it.  The modes trade only *when/how* scoring
+    runs (per token vs once) and what memory the capture keeps (length-1 buffer vs
+    tail ring vs full stack); every read is a full per-probe ``ProbeReading`` (see
+    ``hooks.py`` ``HiddenCapture``).
+
+    - ``INCREMENTAL`` — a full-reading live consumer wants per-token readings:
+      score each token live (full roster) into ``_incremental_readings``.
+    - ``LEAN_INCREMENTAL`` (FIX F2) — the only per-token consumers read axis-0
+      coords (trait stream / loom probe row): score each token ``coords_only`` and
+      re-score the full aggregate once at finalize from a bounded tail ring.
+    - ``AGGREGATE_ONLY`` — probes attached but nothing consumes a per-token
+      reading (e.g. stateless server gen): NO per-token scoring, pool the last
+      content token once at finalize from a bounded tail ring.
+    - ``GATING_SUBSET`` (FIX #4) — per-token scoring is needed *only* to feed probe
+      gates: score just the gated subset per token (into ``_incremental_gate_scores``)
+      while a tail ring lets finalize pool the FULL roster once.
+    - ``FULL`` — full-retention append (``return_hidden`` widen, or any
+      non-incremental read), or the degenerate no-probe / capture-disabled state:
+      distinct clones per step so ``stacked()`` builds the full ``[T, D]``.
+    """
+
+    INCREMENTAL = "incremental"
+    LEAN_INCREMENTAL = "lean_incremental"
+    AGGREGATE_ONLY = "aggregate_only"
+    GATING_SUBSET = "gating_subset"
+    FULL = "full"
+
+
+@dataclass
+class CaptureState:
+    """Per-generation capture configuration — the legal-by-construction state.
+
+    Carries the one :class:`CaptureMode` plus the orthogonal ``persistent`` flag
+    (capture rides the always-on compile-clean buffers rather than transient
+    per-gen hooks) and, for :attr:`CaptureMode.GATING_SUBSET`, the gated probe
+    names / scalar keys.  Set wholesale in :meth:`SaklasSession._begin_capture`;
+    read by the ``_score_*`` dispatch, the gating callback, and the streaming tap.
+    The convenience predicates name the modes so the read sites stay legible.
+    """
+
+    mode: "CaptureMode" = CaptureMode.FULL
+    persistent: bool = False
+    gating_subset: "set[str] | None" = None
+    gating_keys: "set[str] | None" = None
+
+    @property
+    def incremental(self) -> bool:
+        return self.mode is CaptureMode.INCREMENTAL
+
+    @property
+    def lean(self) -> bool:
+        return self.mode is CaptureMode.LEAN_INCREMENTAL
+
+    @property
+    def aggregate_only(self) -> bool:
+        # GATING_SUBSET also finalizes off the tail ring (its per-token rows feed
+        # only the gate), so it shares the aggregate-only full-roster pool.
+        return self.mode in (CaptureMode.AGGREGATE_ONLY, CaptureMode.GATING_SUBSET)
 
 
 class ConcurrentGenerationError(RuntimeError, SaklasError):
@@ -850,13 +920,12 @@ class SaklasSession:
                 self._static_cache_active = True
             elif sc_reason is not None:
                 warn_once(self._model, sc_reason)
-        # LIFO stack of per-scope entries dicts pushed by session.steering().
-        # Each entry is ``{name: (alpha, Trigger)}`` — triggers are
-        # preserved through stack flattening so nested scopes with
-        # different trigger regimes compose cleanly.  The flattened head
-        # (later entries overwrite earlier ones) is what the steering
-        # manager installs when a generation begins.
-        self._steering_stack: list[dict[str, SteeringStackEntry]] = []
+        # The LIFO steering stack + every push/pop-frequency steering method now
+        # live on the ``SteeringComposer`` collaborator (instantiated near the end
+        # of ``__init__``, once ``_monitor`` exists).  ``self._steering_stack`` is a
+        # settable property over ``_steering_composer._stack`` — see the property
+        # below; the composer is lazily created on first access so ``__new__`` test
+        # stubs that bypass ``__init__`` still resolve it.
 
         # Set by ``_install_composed_steering`` when the current steering lowers
         # to the persistent compile-clean offset buffers (static-affine push,
@@ -876,12 +945,11 @@ class SaklasSession:
         # Per-gen flags: ``_compiled_clean_eligible`` (set early in
         # ``_generate_core``) means this gen *can* take the compiled clean path —
         # compiled MPS, static cache, capture buffers present, not return_hidden —
-        # provided steering also lowers to offsets.  ``_capture_persistent`` (set
-        # in ``_begin_capture``) means the active capture rides the persistent
+        # provided steering also lowers to offsets.  ``_capture_state.persistent``
+        # (set in ``_begin_capture``) means the active capture rides the persistent
         # buffers, so the decode loop wires ``ingest_persistent`` as its step
         # callback and the routing keeps the compiled module.
         self._compiled_clean_eligible: bool = False
-        self._capture_persistent: bool = False
 
         # Active assistant-role label for the current ``session.steering()``
         # scope — populated when every role-tagged term in the resolved
@@ -904,39 +972,25 @@ class SaklasSession:
         # generate_steered when probes are active so scoring happens
         # without a second forward pass.
         self._capture = HiddenCapture()
-        # Incremental-capture state. In the common monitored case
-        # (probes attached, no return_hidden) the capture scores each token
-        # as it is produced and keeps only the latest hidden slice per layer
-        # plus the already-computed ProbeReading rows here — O(layers·D)
-        # device memory instead of the full O(T·layers·D) hidden stack.
-        # ``_capture_incremental`` tells ``_finalize_generation`` to build
-        # (aggregate, per_token) from these readings instead of rescoring
-        # captured hidden states. Reset at each ``_begin_capture`` and on
-        # teardown.
+        # Per-gen capture configuration — one :class:`CaptureMode` plus the
+        # orthogonal ``persistent`` flag (and the gated subset / keys for
+        # ``GATING_SUBSET``).  Replaces the former five correlated booleans
+        # (``_capture_incremental`` / ``_capture_aggregate_only`` /
+        # ``_capture_lean`` / ``_capture_gating_subset`` / ``_capture_persistent``)
+        # that a hand-kept if/elif chain had to keep consistent; the enum makes
+        # illegal combinations unrepresentable.  Set wholesale in
+        # ``_begin_capture`` and reset on teardown; the ``_score_*`` dispatch keys
+        # off ``mode``.  Each mode and its memory/scoring trade-off is documented
+        # on :class:`CaptureMode`.
+        self._capture_state: CaptureState = CaptureState()
+        # Per-token reading buffers the modes append into (the *data*, distinct
+        # from the *config* above).  ``_incremental_readings`` holds the full /
+        # lean per-token ``ProbeReading`` rows (INCREMENTAL / LEAN_INCREMENTAL);
+        # ``_incremental_gate_scores`` holds the gated-subset scalar dicts
+        # (GATING_SUBSET).  ``_finalize_generation`` builds (aggregate, per_token)
+        # from these instead of rescoring captured hidden states.  Reset at each
+        # ``_begin_capture`` and on teardown.
         self._incremental_readings: list[dict[str, ProbeReading]] = []
-        self._capture_incremental: bool = False
-        # Aggregate-only capture: probes attached but nothing consumes a
-        # per-token reading (no probe gate, no loom row, no trait stream, no
-        # live scores) — so the decode loop pays NO per-token scoring and the
-        # capture keeps only a bounded tail ring; ``_finalize_generation``
-        # scores the aggregate once via ``_score_aggregate_only``. Mutually
-        # exclusive with ``_capture_incremental``. Set in ``_begin_capture``.
-        self._capture_aggregate_only: bool = False
-        # Lean-incremental capture (FIX F2): a per-token consumer wants only the
-        # axis-0 coord (the trait stream / loom probe row), no nearest /
-        # assignment / per-layer trace and no probe gate.  The step sink scores
-        # each token ``coords_only`` (cheap), stores the lean rows for the
-        # per-token stream, and a bounded tail ring lets ``_finalize_generation``
-        # re-score the FULL aggregate once via ``_score_lean_incremental``.
-        # Mutually exclusive with ``_capture_incremental`` / ``_capture_aggregate_only``.
-        self._capture_lean: bool = False
-        # Gating-only subset capture (FIX #4): per-token scoring is needed ONLY
-        # to feed probe gates, so the step sink scores just the gated probes
-        # (``_capture_gating_subset`` holds their names) while a bounded tail
-        # ring is kept so ``_finalize_generation`` can pool the FULL roster
-        # once. Empty/None ⇒ not in this mode. Set in ``_begin_capture``.
-        self._capture_gating_subset: set[str] | None = None
-        self._capture_gating_keys: set[str] | None = None
         self._incremental_gate_scores: list[dict[str, float]] = []
 
         # Reentrant — ``_generate_core`` acquires it for the whole gen,
@@ -1111,6 +1165,13 @@ class SaklasSession:
             probe_manifolds, self._layer_means, whitener=self._whitener,
         )
 
+        # Steering-resolution + stack collaborator (extracted from the session).
+        # Instantiated last among the steering state because its push/pop methods
+        # read ``_monitor.probe_names``; lazily importable so the module-load graph
+        # stays acyclic (composer imports session-level symbols at import time).
+        from saklas.core.steering_composer import SteeringComposer
+        self._steering_composer: SteeringComposer = SteeringComposer(self)
+
         # Prefix KV cache (opt-in, off by default).  Populated by
         # :meth:`cache_prefix`; consumed by :meth:`_generate_core` when the
         # incoming ``input_ids`` start with the cached prefix.  Shape:
@@ -1277,6 +1338,126 @@ class SaklasSession:
     @property
     def last_per_token_scores(self) -> dict[str, list[float]] | None:
         return self._last_per_token_scores
+
+    @property
+    def monitor(self) -> Monitor:
+        """The unified read-side :class:`Monitor` (probe roster + scoring).
+
+        Frontends read ``monitor.probe_names`` / ``monitor.manifolds`` to
+        enumerate the attached probes without reaching past the public API.
+        """
+        return self._monitor
+
+    @property
+    def manifolds(self) -> dict[str, Manifold]:
+        """Loaded-manifold registry: registry key (``[ns/]name[:variant]``) ->
+        :class:`Manifold`.  The live dict — mutating it mutates the session
+        registry (the CLI/server prune fitted entries through it)."""
+        return self._manifolds
+
+    @property
+    def profiles(self) -> dict[str, dict[int, torch.Tensor]]:
+        """In-memory baked steering-direction registry: name -> per-layer
+        tensors.  The raw backing of :attr:`vectors` (which wraps each entry
+        in a :class:`Profile`); the live dict, mutating it mutates the
+        registry."""
+        return self._profiles
+
+    def _get_steering_composer(self) -> "SteeringComposer":
+        """The steering collaborator, created lazily if absent.
+
+        Real sessions set ``_steering_composer`` in ``__init__``; ``__new__`` test
+        stubs that bypass it (and custom-``__init__`` stubs) get one built on first
+        touch so the ``_steering_stack`` property and the steering forwarders below
+        resolve without the caller wiring the collaborator by hand.
+        """
+        composer = self.__dict__.get("_steering_composer")
+        if composer is None:
+            from saklas.core.steering_composer import SteeringComposer
+            composer = SteeringComposer(self)
+            self._steering_composer = composer
+        return composer
+
+    @property
+    def _steering_stack(self) -> list[dict[str, SteeringStackEntry]]:
+        """The LIFO steering stack — owned by the :class:`SteeringComposer`.
+
+        A read/write view over ``_steering_composer._stack``.  Settable so the
+        existing test stubs (and any caller) can assign a fresh stack; the setter
+        routes the assignment into the composer.
+        """
+        return self._get_steering_composer()._stack
+
+    @_steering_stack.setter
+    def _steering_stack(
+        self, value: list[dict[str, SteeringStackEntry]],
+    ) -> None:
+        self._get_steering_composer()._stack = value
+
+    @property
+    def model_metadata(self) -> Any:
+        """The structured model-info object (id, arch, layer count, …).
+
+        Distinct from :attr:`model_info`, which returns a plain ``dict`` copy;
+        this is the live object the loader produced, consumed by panels that
+        want the typed fields.
+        """
+        return self._model_info
+
+    @property
+    def generation_state(self) -> GenerationState:
+        """The current per-call :class:`GenerationState` (finish reason, emit
+        map, thinking spans, stop event).
+
+        Distinct from :attr:`gen_state`, which reports the coarse lifecycle
+        *phase* (``IDLE``/``RUNNING``/…); this is the live mutable streaming
+        state the server/TUI read while a generation is in flight.
+        """
+        return self._gen_state
+
+    @property
+    def gen_lock(self) -> "threading.RLock":
+        """The exclusive-GPU re-entry lock.  Callers that need to probe
+        whether a generation is in flight without blocking use
+        ``gen_lock.acquire(blocking=False)`` / ``release()``."""
+        return self._gen_lock
+
+    @property
+    def joint_logprob_cache(self) -> dict[tuple[str, str], Any]:
+        """Cross-branch joint-logprob cache (loom NodeCompareDrawer).
+
+        Read/write — assigning a fresh cache object is supported (the native
+        API swaps it to bound memory)."""
+        return self._joint_logprob_cache
+
+    @joint_logprob_cache.setter
+    def joint_logprob_cache(self, cache: dict[tuple[str, str], Any]) -> None:
+        self._joint_logprob_cache = cache
+
+    @property
+    def loom_conflict_check(self) -> "Callable[[str, str], None]":
+        """The bound tree-mutation conflict checker, for handing to a freshly
+        loaded :class:`LoomTree` via ``set_conflict_check`` — raises
+        :class:`MutationDuringGenerationError` on a conflicting op."""
+        return self._loom_conflict_check
+
+    def ensure_manifold_loaded(self, key: str) -> None:
+        """Load the manifold artifact for registry key ``key`` if absent.
+
+        Public wrapper over the lazy loader — ``key`` is the grammar's
+        ``[ns/]name[:variant]`` registry key.  See the private for the full
+        contract (raises :class:`ManifoldNotRegisteredError` on a miss)."""
+        self._ensure_manifold_loaded(key)
+
+    def ensure_profile_registered(
+        self, name: str, *, role: str = "vector",
+    ) -> dict[int, torch.Tensor]:
+        """Resolve and register a steering direction for ``name``, returning
+        its per-layer tensors.
+
+        Public wrapper over the manifold-first resolution chain (in-memory
+        bake → fitted 2-node ``pca`` manifold → ported legacy vector)."""
+        return self._ensure_profile_registered(name, role=role)
 
     @property
     def gen_state(self) -> GenState:
@@ -1702,6 +1883,32 @@ class SaklasSession:
                 responses.extend(text.strip() for text in texts)
         return responses
 
+    @contextmanager
+    def _model_exclusive(
+        self,
+        busy_msg: str,
+        *,
+        phase_msg: str | None = None,
+        exc: type[Exception] = ConcurrentExtractionError,
+    ) -> Iterator[None]:
+        """Hold the exclusive-GPU ``_gen_lock`` for a model op.
+
+        Acquires non-blocking — a cross-thread model op in flight raises
+        ``exc(busy_msg)`` rather than races PyTorch's single global MPS
+        command buffer (which would abort the process).  When ``phase_msg``
+        is given, also guards ``_gen_phase is IDLE`` (raises ``exc(phase_msg)``
+        on a generation in flight); ``add_probe`` passes ``None`` to skip the
+        phase guard.  Releases in ``finally``.
+        """
+        if not self._gen_lock.acquire(blocking=False):
+            raise exc(busy_msg)
+        try:
+            if phase_msg is not None and self._gen_phase is not GenState.IDLE:
+                raise exc(phase_msg)
+            yield
+        finally:
+            self._gen_lock.release()
+
     def extract(
         self,
         concept: str,
@@ -1754,16 +1961,10 @@ class SaklasSession:
         Gated against generation: fitting runs forward passes through the
         model and would race an active gen.
         """
-        if not self._gen_lock.acquire(blocking=False):
-            raise ConcurrentExtractionError(
-                "session.extract called while another model use is in flight"
-            )
-        try:
-            if self._gen_phase is not GenState.IDLE:
-                raise ConcurrentExtractionError(
-                    "session.extract called while a generation is in flight"
-                )
-            from saklas.io.manifolds import create_discover_manifold_folder
+        with self._model_exclusive(
+            "session.extract called while another model use is in flight",
+            phase_msg="session.extract called while a generation is in flight",
+        ):
             from saklas.io.paths import manifold_dir
 
             ns = namespace or "local"
@@ -1788,6 +1989,7 @@ class SaklasSession:
 
             folder = manifold_dir(ns, name)
             manifest = folder / "manifold.json"
+            node_corpora: dict[str, list[str]] | None = None
             if force or not manifest.exists():
                 gen_roles: dict[str, str | None] | None = (
                     {c: role for c in gen_concepts} if role else None
@@ -1800,27 +2002,14 @@ class SaklasSession:
                     label: corpora[c]
                     for label, c in zip(labels, gen_concepts, strict=True)
                 }
-                node_kinds: dict[str, str | None] = {
-                    label: kind for label in labels
-                }
-                node_roles: dict[str, str | None] | None = (
-                    {label: role for label in labels} if role else None
-                )
-                if manifest.exists():
-                    import shutil
-                    shutil.rmtree(folder)
-                create_discover_manifold_folder(
-                    ns, name, desc, fit_mode="pca",
-                    node_corpora=node_corpora,
-                    hyperparams={"max_dim": 1, "var_threshold": 0.7},
-                    node_roles=node_roles, node_kinds=node_kinds,
-                )
-            return self._fit_vector_manifold(
-                name, folder, sae=sae, sae_revision=sae_revision,
-                role=role, on_progress=on_progress,
+            node_kinds: dict[str, str | None] = {
+                label: kind for label in labels
+            }
+            return self._author_and_fit_2node(
+                ns, name, desc, node_corpora=node_corpora, node_kinds=node_kinds,
+                role=role, force=force, sae=sae, sae_revision=sae_revision,
+                on_progress=on_progress,
             )
-        finally:
-            self._gen_lock.release()
 
     def extract_vector_from_corpora(
         self,
@@ -1851,48 +2040,73 @@ class SaklasSession:
         set.  ``kind`` is recorded per node (provenance); ``role`` opts into a
         persona-baselined fit as in :meth:`extract`.
         """
-        if not self._gen_lock.acquire(blocking=False):
-            raise ConcurrentExtractionError(
-                "session.extract_vector_from_corpora called while another "
-                "model use is in flight"
-            )
-        try:
-            if self._gen_phase is not GenState.IDLE:
-                raise ConcurrentExtractionError(
-                    "session.extract_vector_from_corpora called while a "
-                    "generation is in flight"
-                )
-            from saklas.io.manifolds import create_discover_manifold_folder
-            from saklas.io.paths import manifold_dir
-
+        with self._model_exclusive(
+            "session.extract_vector_from_corpora called while another "
+            "model use is in flight",
+            phase_msg="session.extract_vector_from_corpora called while a "
+            "generation is in flight",
+        ):
             ns = namespace or "local"
             pos_raw, neg_raw = _split_composite_source(name, None)
             canonical = canonical_concept_name(name)
             pos_label = _slug(pos_raw)
             neg_label = _slug(neg_raw) if neg_raw is not None else f"{pos_label}_neg"
-
-            folder = manifold_dir(ns, canonical)
-            manifest = folder / "manifold.json"
-            if force or not manifest.exists():
-                node_roles: dict[str, str | None] | None = (
-                    {pos_label: role, neg_label: role} if role else None
-                )
-                if manifest.exists():
-                    import shutil
-                    shutil.rmtree(folder)
-                create_discover_manifold_folder(
-                    ns, canonical, description, fit_mode="pca",
-                    node_corpora={pos_label: positive, neg_label: negative},
-                    hyperparams={"max_dim": 1, "var_threshold": 0.7},
-                    node_roles=node_roles,
-                    node_kinds={pos_label: kind, neg_label: kind},
-                )
-            return self._fit_vector_manifold(
-                canonical, folder, sae=sae, sae_revision=sae_revision,
-                role=role, on_progress=on_progress,
+            return self._author_and_fit_2node(
+                ns, canonical, description,
+                node_corpora={pos_label: positive, neg_label: negative},
+                node_kinds={pos_label: kind, neg_label: kind},
+                role=role, force=force, sae=sae, sae_revision=sae_revision,
+                on_progress=on_progress,
             )
-        finally:
-            self._gen_lock.release()
+
+    def _author_and_fit_2node(
+        self,
+        ns: str,
+        name: str,
+        description: str,
+        *,
+        node_corpora: dict[str, list[str]] | None,
+        node_kinds: dict[str, str | None],
+        role: str | None,
+        force: bool,
+        sae: str | None,
+        sae_revision: str | None,
+        on_progress: Callable[[str], None] | None,
+    ) -> tuple[str, Profile]:
+        """Author a 2-node ``pca`` folder (when stale) + fit it — the shared tail
+        of :meth:`extract` / :meth:`extract_vector_from_corpora`.
+
+        Both callers differ only in their corpus source (generate vs given); by
+        the time they reach here they hold ``node_corpora`` (label → corpus) and
+        ``node_kinds`` (label → kind).  This rmtrees + re-authors the folder when
+        ``force`` or the manifest is missing (``node_corpora`` is consulted only
+        then, so a cache-hit caller may pass ``None``), then delegates to
+        :meth:`_fit_vector_manifold`.  Runs with ``_gen_lock`` already held by
+        the caller.
+        """
+        from saklas.io.manifolds import create_discover_manifold_folder
+        from saklas.io.paths import manifold_dir
+
+        folder = manifold_dir(ns, name)
+        manifest = folder / "manifold.json"
+        if force or not manifest.exists():
+            assert node_corpora is not None
+            node_roles: dict[str, str | None] | None = (
+                {label: role for label in node_corpora} if role else None
+            )
+            if manifest.exists():
+                import shutil
+                shutil.rmtree(folder)
+            create_discover_manifold_folder(
+                ns, name, description, fit_mode="pca",
+                node_corpora=node_corpora,
+                hyperparams={"max_dim": 1, "var_threshold": 0.7},
+                node_roles=node_roles, node_kinds=node_kinds,
+            )
+        return self._fit_vector_manifold(
+            name, folder, sae=sae, sae_revision=sae_revision,
+            role=role, on_progress=on_progress,
+        )
 
     def _fit_vector_manifold(
         self,
@@ -1961,25 +2175,20 @@ class SaklasSession:
         Gated against generation like :meth:`extract`: manifold fitting runs
         forward passes through the model.
         """
-        if not self._gen_lock.acquire(blocking=False):
-            raise ConcurrentExtractionError(
-                "session.fit called while another model use is in flight"
-            )
-        try:
-            if self._gen_phase is not GenState.IDLE:
-                raise ConcurrentExtractionError(
-                    "session.fit called while a generation is in flight"
+        with self._model_exclusive(
+            "session.fit called while another model use is in flight",
+            phase_msg="session.fit called while a generation is in flight",
+        ):
+            try:
+                from saklas.core.extraction import ManifoldExtractionPipeline
+                pipe = ManifoldExtractionPipeline(self, self.events)
+                return pipe.fit(
+                    folder, sae=sae, sae_revision=sae_revision,
+                    on_progress=on_progress,
                 )
-            from saklas.core.extraction import ManifoldExtractionPipeline
-            pipe = ManifoldExtractionPipeline(self, self.events)
-            return pipe.fit(
-                folder, sae=sae, sae_revision=sae_revision,
-                on_progress=on_progress,
-            )
-        finally:
-            # A re-fit changes the folded directions any probe reads from.
-            self._invalidate_analytics_cache()
-            self._gen_lock.release()
+            finally:
+                # A re-fit changes the folded directions any probe reads from.
+                self._invalidate_analytics_cache()
 
     def bake(
         self,
@@ -2062,7 +2271,7 @@ class SaklasSession:
         pre-built :class:`Steering`.  Dict inputs are not accepted; build
         :class:`Steering` directly if you need typed construction.
 
-        Pole aliases (``io.selectors.resolve_pole``) resolve at parse
+        Pole aliases (``io.selectors.resolve_bare_atom``) resolve at parse
         time; this is the canonical resolver site — CLI, server, and
         TUI all route through here.  Nesting flattens: an inner
         ``steering("0.5 angry.calm")`` overrides the outer
@@ -2244,342 +2453,59 @@ class SaklasSession:
 
     def _materialize_projections(self, steering: Steering) -> dict[str, object]:
         """Populate ``self._profiles`` with derived profiles for every
-        :class:`~saklas.core.steering_expr.ProjectedTerm` in
-        ``steering.alphas``.
+        :class:`~saklas.core.steering_expr.ProjectedTerm` in ``steering.alphas``.
 
-        Ensures the ``base`` and ``onto`` profiles are loaded (invoking
-        the autoload path when needed), runs
-        :func:`saklas.core.vectors.project_profile` to build the derived
-        tensor dict, and registers it under the synthetic key
-        ``"<base><op><onto>"``.  The synthetic key matches what the parser
-        used for the ``Steering.alphas`` key, so downstream pole
-        resolution + hook install find the profile via the
-        ``name in self._profiles`` fast path.
-
-        Projection is Mahalanobis-only: the call site passes
-        ``self.whitener`` to ``project_profile``, which uses the
-        closed-form LEACE projector — provably erases linearly-decodable
-        concept information along ``onto``.  ``project_profile`` requires
-        the whitener to cover every projected layer (``covers_all``) and
-        raises :class:`~saklas.core.mahalanobis.WhitenerError` otherwise;
-        there is no Euclidean path.  A ``probes=[]`` session that hasn't
-        built a neutral-activation cache yet therefore can't materialize a
-        ``~``/``|`` term — regenerate the neutral cache first.
-
-        Returns a snapshot dict ``{syn_key: prev_value_or_PROFILE_ABSENT}``
-        of the synthetic-projection bindings this call clobbered, so
-        the caller can restore them on scope exit.  Without this
-        nested scopes that materialize the same ``a|b`` synthetic
-        key would leak the inner tensor back into the outer scope's
-        hooks after pop — the global ``self._profiles`` registry is
-        shared across all active scopes.
+        Thin forwarder to :meth:`SteeringComposer.materialize_projections`.
         """
-        from saklas.core.steering_expr import ProjectedTerm
-        from saklas.core.vectors import project_profile
-
-        whitener = self.whitener
-
-        snapshots: dict[str, object] = {}
-        for syn_key, val in steering.alphas.items():
-            if not isinstance(val, ProjectedTerm):
-                continue
-            base_tensors = self._ensure_profile_registered(
-                val.base, role="projection base",
-            )
-            onto_tensors = self._ensure_profile_registered(
-                val.onto, role="projection onto",
-            )
-            projected = project_profile(
-                base_tensors, onto_tensors, val.operator,
-                whitener=whitener,
-            )
-            # Snapshot prior binding *before* overwrite so the
-            # context manager can restore on exit.  ``setdefault`` —
-            # if the same syn_key appears twice in this Steering, only
-            # the first occurrence's snapshot matters (subsequent
-            # writes are this scope's own, not the outer's).
-            if syn_key not in snapshots:
-                if syn_key in self._profiles:
-                    snapshots[syn_key] = self._profiles[syn_key]
-                else:
-                    snapshots[syn_key] = _PROFILE_ABSENT
-            self._profiles[syn_key] = projected
-        return snapshots
+        return self._get_steering_composer().materialize_projections(steering)
 
     def _ensure_manifold_loaded(self, key: str) -> None:
         """Load the manifold artifact for registry key ``key`` if absent.
 
-        ``key`` is the manifold registry key produced by the grammar:
-        ``[ns/]name[:variant]``.  ``raw`` (default) selects the
-        residual-stream tensor; ``sae-<release>`` selects the SAE-variant
-        tensor.  A bare name (no namespace) searches every namespace
-        under ``manifolds/``.  The loaded :class:`Manifold` is promoted
-        onto the session device (kept fp32 — the spline math wants it).
-        Raises :class:`ManifoldNotRegisteredError` on a miss.
+        Thin forwarder to :meth:`SteeringComposer.ensure_manifold_loaded`;
+        ``_bootstrap_manifold_probes`` / ``_resolve_probe_manifold`` and the
+        manifold-probe tests call it on the session (the tests monkeypatch it).
         """
-        if key in self._manifolds:
-            return
-        from saklas.core.manifold import load_manifold
-        from saklas.io.paths import manifold_dir, manifolds_dir, tensor_filename
-
-        name_part, variant = (
-            key.rsplit(":", 1) if ":" in key else (key, "raw")
-        )
-        if "/" in name_part:
-            ns, name = name_part.split("/", 1)
-            search_ns = [ns]
-        else:
-            name = name_part
-            root = manifolds_dir()
-            search_ns = (
-                sorted(d.name for d in root.iterdir() if d.is_dir())
-                if root.exists() else []
-            )
-        if variant == "raw":
-            release: str | None = None
-        elif variant.startswith("sae-"):
-            release = variant[len("sae-"):]
-        else:
-            raise ManifoldNotRegisteredError(
-                f"manifold '{key}': unsupported variant '{variant}'"
-            )
-        fname = tensor_filename(self.model_id, release=release)
-
-        matches = [
-            (ns, manifold_dir(ns, name) / fname)
-            for ns in search_ns
-            if (manifold_dir(ns, name) / fname).exists()
-        ]
-        if not matches:
-            raise ManifoldNotRegisteredError(
-                f"manifold '{key}' has no fitted tensor for {self.model_id}; "
-                f"run `saklas manifold fit` first"
-            )
-        if len(matches) > 1:
-            # A bare name collided across namespaces — refuse rather than
-            # silently pick one, mirroring concept selector resolution.
-            from saklas.io.selectors import AmbiguousSelectorError
-            qualified = ", ".join(f"{ns}/{name}" for ns, _ in matches)
-            raise AmbiguousSelectorError(
-                f"ambiguous manifold '{name}': matches {qualified}. "
-                f"Qualify it with a namespace."
-            )
-        manifold = load_manifold(matches[0][1])
-        self._manifolds[key] = manifold.to(
-            device=self._device, dtype=torch.float32,
-        )
+        self._get_steering_composer().ensure_manifold_loaded(key)
 
     def _resolve_pole_aliases(
         self, entries: dict[str, tuple[float, Trigger]],
     ) -> dict[str, tuple[float, Trigger]]:
         """Apply pole-alias resolution + sign flipping + variant routing.
 
-        Returned keys carry the full variant-qualified name:
-        ``canonical`` for raw, ``f"{canonical}:{variant}"`` otherwise. Autoload
-        is variant-aware — ``honest:sae`` will look for a ``_sae-*`` tensor
-        file, not the raw one.
-
-        Namespace-qualified inputs (``alice/foo``) keep the namespace
-        through resolution: the prefix is split off, fed to ``resolve_pole``
-        as the ``namespace=`` kwarg so the lookup scopes to that namespace,
-        and re-attached to the registry key.  This is what lets two
-        installed packs that share a concept name across namespaces stay
-        addressable via their fully-qualified form.
-
-        Names already in ``self._profiles`` pass through verbatim — a caller
-        who pre-registered under a specific key stays addressed by that key.
+        Thin forwarder to :meth:`SteeringComposer.resolve_pole_aliases`; test
+        stubs override this on the session.
         """
-        from saklas.io.selectors import resolve_pole
-
-        out: dict[str, tuple[float, Trigger]] = {}
-        for name, (alpha, trig) in entries.items():
-            if name in self._profiles:
-                out[name] = (float(alpha), trig)
-                continue
-            # Split namespace prefix so re-resolution scopes to the
-            # namespace the user originally typed (parser preserves it
-            # in the key when supplied).  Bare names leave ``ns=None``
-            # so cross-namespace collisions still raise.
-            ns: str | None = None
-            bare_name = name
-            if "/" in name:
-                ns, bare_name = name.split("/", 1)
-            try:
-                canonical, sign, _match, variant = resolve_pole(
-                    bare_name, namespace=ns,
-                )
-            except Exception:
-                out[name] = (float(alpha), trig)
-                continue
-            canonical_qualified = (
-                canonical if ns is None else f"{ns}/{canonical}"
-            )
-            registry_key = (
-                canonical_qualified
-                if variant == "raw"
-                else f"{canonical_qualified}:{variant}"
-            )
-            if registry_key not in self._profiles:
-                try:
-                    # Unified resolution: fold a fitted manifold, or port a
-                    # legacy vectors/ folder on first touch.  May raise
-                    # Ambiguous/UnknownVariantError — keep the user's original
-                    # name in ``out`` so the error surfaces at hook-install
-                    # with a clear message.
-                    self._ensure_profile_registered(registry_key)
-                except Exception:
-                    out[name] = (float(alpha), trig)
-                    continue
-            effective = float(alpha) * (1 if sign >= 0 else -1)
-            if registry_key in self._profiles:
-                prev_alpha = out.get(registry_key, (0.0, trig))[0]
-                out[registry_key] = (prev_alpha + effective, trig)
-            else:
-                out[name] = (float(alpha), trig)
-        return out
+        return self._get_steering_composer().resolve_pole_aliases(entries)
 
     def _ensure_profile_registered(
         self, name: str, *, role: str = "vector",
     ) -> dict[int, torch.Tensor]:
         """Direction profile for ``name`` — registered tensor or folded manifold.
 
-        4.0 unifies the sources a steering direction can come from, **manifold
-        first** (the 6e "prefer-manifold" stance):
-
-        1. an in-memory baked direction already in ``_profiles`` (ad-hoc
-           ``extract``/``clone``/``merge`` results, ``~``/``|`` projection
-           derivations) — returned verbatim;
-        2. a fitted 2-node ``pca`` manifold on disk (native, or one a prior
-           steer already ported) — loaded via :meth:`_ensure_manifold_loaded`
-           and folded by :func:`~saklas.core.vectors.folded_vector_directions`,
-           then memoized in ``_profiles``;
-        3. a **stale** (`< PACK_FORMAT_VERSION`) statements-bearing legacy
-           ``vectors/<ns>/<name>/`` folder — ported to a 2-node manifold on
-           first touch (:meth:`_port_stale_legacy_vector`).  The port is
-           file-only; fitting runs forward passes through the model and can't
-           re-enter the generation lock from dispatch, so a freshly-ported
-           manifold has no tensor yet and the call raises with the exact
-           ``manifold fit`` command to run (or the bulk migration with ``-m``).
-
-        Raises :class:`VectorNotRegisteredError` when nothing resolves.
+        Thin forwarder to :meth:`SteeringComposer.ensure_profile_registered`;
+        ``test_vector_migration`` calls it on the session.
         """
-        existing = self._profiles.get(name)
-        if existing is not None:
-            return existing
-        if ":" in name:
-            canonical, variant = name.rsplit(":", 1)
-        else:
-            canonical, variant = name, "raw"
-
-        # (2) Manifold first — native or previously ported.
-        folded = self._try_fold_manifold(name)
-        if folded is not None:
-            self._profiles[name] = folded
-            return folded
-
-        # (3) Stale legacy vectors/ folder → port (file-only) and nudge to fit.
-        if variant == "raw":
-            ported = self._port_stale_legacy_vector(canonical)
-            if ported is not None:
-                folded = self._try_fold_manifold(name)
-                if folded is not None:
-                    self._profiles[name] = folded
-                    return folded
-                ns, bare = ported
-                raise VectorNotRegisteredError(
-                    f"ported legacy vector '{canonical}' to manifold "
-                    f"'{ns}/{bare}' (a 2-node pca subspace), but it has no "
-                    f"fitted tensor for {self.model_id} yet — porting is "
-                    f"file-only. Fit it: "
-                    f"`saklas manifold fit {ns}/{bare} -m {self.model_id}` "
-                    f"(or `python scripts/upgrade_packs.py --all -m {self.model_id}` "
-                    f"to migrate + fit every legacy vector at once)."
-                )
-
-        raise VectorNotRegisteredError(
-            f"No vector registered for {role} '{name}'"
-        )
+        return self._get_steering_composer().ensure_profile_registered(name, role=role)
 
     def _try_fold_manifold(
         self, name: str,
     ) -> dict[int, torch.Tensor] | None:
         """Load a 2-node ``pca`` manifold for ``name`` and fold it to a vector.
 
-        Returns the per-layer direction dict, or ``None`` when no fitted
-        manifold resolves (so the caller falls through to porting / autoload).
-        Re-raises only when a manifold *does* load but isn't a foldable 2-node
-        affine subspace — that's a usage error, not a miss.
+        Thin forwarder to :meth:`SteeringComposer.try_fold_manifold`.
         """
-        try:
-            self._ensure_manifold_loaded(name)
-        except Exception:
-            return None
-        from saklas.core.vectors import folded_vector_directions
-        try:
-            return folded_vector_directions(self._manifolds[name])
-        except Exception as e:
-            raise VectorNotRegisteredError(
-                f"'{name}' is a manifold that does not fold to a single "
-                f"steering direction (not a 2-node affine subspace): {e}"
-            ) from e
+        return self._get_steering_composer().try_fold_manifold(name)
 
     def _port_stale_legacy_vector(
         self, canonical: str,
     ) -> tuple[str, str] | None:
         """Port a stale legacy ``vectors/`` folder to a 2-node ``pca`` manifold.
 
-        4.0 6e port-on-detect.  ``canonical`` is a concept name, optionally
-        ``ns/``-qualified.  Scans ``vectors/`` *directly* (not through the
-        resolver, which after the v3 bump skips stale v2 folders) for a
-        statements-bearing folder whose ``pack.json`` is below
-        :data:`~saklas.io.packs.PACK_FORMAT_VERSION`, and ports it via
-        :func:`~saklas.io.manifolds.port_legacy_vector_folder` (file-only — no
-        tensors carried; they re-fit lazily).  Current-version packs are left
-        for the autoload path; tensor-only packs (no ``statements.json``) can't
-        re-fit and are skipped.
-
-        Returns ``(namespace, name)`` when a folder was ported or a matching
-        manifold already exists (so the caller nudges to fit), else ``None``.
+        Thin forwarder to :meth:`SteeringComposer.port_stale_legacy_vector`;
+        ``test_vector_migration`` calls it on the session.
         """
-        import json as _json
-        from saklas.io.packs import PACK_FORMAT_VERSION
-        from saklas.io.paths import vectors_dir, concept_dir, manifold_dir
-        from saklas.io.manifolds import port_legacy_vector_folder
-        from saklas.io.selectors import invalidate as _invalidate_selectors
-
-        if "/" in canonical:
-            ns, bare = canonical.split("/", 1)
-            candidates = [(ns, concept_dir(ns, bare))]
-        else:
-            bare = canonical
-            root = vectors_dir()
-            candidates = (
-                [(nsd.name, nsd / bare) for nsd in sorted(root.iterdir())
-                 if nsd.is_dir() and (nsd / bare).is_dir()]
-                if root.exists() else []
-            )
-
-        for namespace, vfolder in candidates:
-            pack_path = vfolder / "pack.json"
-            if not pack_path.exists():
-                continue
-            if not (vfolder / "statements.json").exists():
-                continue  # tensor-only — can't re-fit, leave to autoload
-            try:
-                fmt = _json.loads(pack_path.read_text()).get("format_version", 1)
-            except (OSError, ValueError):
-                fmt = 1
-            if isinstance(fmt, int) and fmt >= PACK_FORMAT_VERSION:
-                continue  # current — keep its tensor via autoload-fold
-            if (manifold_dir(namespace, bare) / "manifold.json").exists():
-                return (namespace, bare)  # already ported; nudge to fit
-            try:
-                port_legacy_vector_folder(vfolder, namespace=namespace, force=False)
-            except Exception:
-                continue
-            _invalidate_selectors()
-            return (namespace, bare)
-        return None
+        return self._get_steering_composer().port_stale_legacy_vector(canonical)
 
     def _bootstrap_manifold_probes(
         self, categories: list[str], *, include_fitted_defaults: bool = False,
@@ -2675,255 +2601,71 @@ class SaklasSession:
     ) -> None:
         """Push an entries dict onto the steering stack and rebuild hooks.
 
-        If ``_rebuild_steering_hooks`` raises (e.g. an unknown vector
-        name hits ``VectorNotRegisteredError``) the just-pushed entry is
-        rolled back before the exception propagates, so the stack is
-        never left with stale half-committed state.
-
-        Thread-safety: acquires :attr:`_gen_lock` (blocking) for the
-        rebuild phase.  In-flight generations hold the lock for their
-        whole forward+sample loop, so concurrent ``session.steering()
-        .__enter__()`` from a different thread waits until the active
-        generation finishes rather than mutating hook tensors mid-step.
-        Single-threaded users (TUI, CLI) pay an uncontended acquire;
-        the server's per-session asyncio lock serializes requests
-        upstream so the contention path is exercised mostly by
-        ad-hoc multi-threaded callers.
-
-        Phase guard: rejects calls from the gen worker thread when
-        :attr:`_gen_phase` is ``RUNNING`` or ``FINALIZING`` (i.e. an
-        ``on_token`` callback re-entered the API mid-step).  RLock would
-        otherwise let the same-thread caller pass straight through —
-        the lock alone protects against cross-thread races, not
-        callback reentry.  Legitimate same-thread callers reach
-        ``_push_steering`` only during ``PREAMBLE`` (the internal
-        steering scope that ``_generate_core`` opens before flipping
-        to ``RUNNING``) or ``IDLE`` (regular user code between gens).
+        Thin forwarder to :meth:`SteeringComposer.push`; ``_SteeringContext``
+        calls it on the session, so it stays as a session method.
         """
-        # ``_generate_core``'s internal ``steering_cm.__enter__()`` runs
-        # during ``PREAMBLE`` (before the ``RUNNING`` flip), so push
-        # never needs the ``_internal_steering_pop`` bypass — only the
-        # exit path fires under ``RUNNING``/``FINALIZING``.  The check
-        # here catches genuine callback reentry where ``on_token`` /
-        # ``score_callback`` calls back into ``session.steering(...)``
-        # mid-step.
-        if self._gen_phase in (GenState.RUNNING, GenState.FINALIZING):
-            raise ConcurrentGenerationError(
-                "cannot enter session.steering() from inside a generation "
-                "callback (e.g. on_token) — the steering stack mutation "
-                f"would clobber hook tensors mid-step (gen_phase="
-                f"{self._gen_phase.name})"
-            )
-        with self._gen_lock:
-            self._steering_stack.append(dict(entries))
-            try:
-                self._rebuild_steering_hooks()
-            except BaseException:
-                self._steering_stack.pop()
-                raise
-            # Steering hooks just changed.  A cached prefix is *unsteered*
-            # (``cache_prefix`` refuses to run inside a steering scope), so it
-            # only stops representing the current pre-attention residual stream
-            # when the new stack actually steers the prefill.  A prefill-
-            # inactive scope (``@response`` / ``@generated`` / probe-gated)
-            # leaves the prompt region untouched, so the unsteered prefix stays
-            # valid and we keep it — this is what lets ``generate_batch`` reuse
-            # one prefill across a steered batch.  Drop it only when prefill is
-            # genuinely steered.
-            if self._steering_active_in_prefill():
-                self._invalidate_prefix_cache()
-        self._emit_steering_applied()
+        self._get_steering_composer().push(entries)
 
     def _pop_steering(self) -> None:
         """Pop the top of the steering stack and rebuild hooks.
 
-        Mirrors :meth:`_push_steering` for thread-safety and phase
-        guarding: acquires :attr:`_gen_lock` so the rebuild can't fire
-        mid-step in another thread's generation, and rejects same-
-        thread callback reentry during ``RUNNING`` / ``FINALIZING``.
+        Thin forwarder to :meth:`SteeringComposer.pop`; ``_SteeringContext``
+        calls it on the session, so it stays as a session method.
         """
-        if not self._steering_stack:
-            return
-        # Same internal-vs-callback distinction as ``_push_steering``.
-        # ``_generate_core``'s finally block sets the flag around the
-        # ``steering_cm.__exit__()`` it owns, so its own scope cleanup
-        # passes through; callback reentry (on_token, score_callback)
-        # from inside the running loop hits the reject path.
-        if (
-            not self._internal_steering_pop
-            and self._gen_phase in (GenState.RUNNING, GenState.FINALIZING)
-        ):
-            raise ConcurrentGenerationError(
-                "cannot exit session.steering() from inside a generation "
-                "callback — the steering stack mutation would clobber "
-                f"hook tensors mid-step (gen_phase={self._gen_phase.name})"
-            )
-        with self._gen_lock:
-            self._steering_stack.pop()
-            self._rebuild_steering_hooks()
-            # Symmetric with ``_push_steering``: the cached prefix is unsteered,
-            # so only invalidate when what remains on the stack still steers the
-            # prefill.  Popping back to a prefill-inactive (or empty) stack keeps
-            # the unsteered prefix valid for the next reuse.
-            if self._steering_active_in_prefill():
-                self._invalidate_prefix_cache()
-        if not self._steering_stack:
-            self.events.emit(SteeringCleared())
-        else:
-            self._emit_steering_applied()
+        self._get_steering_composer().pop()
 
     def _emit_steering_applied(self) -> None:
         """Emit SteeringApplied with alphas-only + full entries.
 
-        ``alphas`` carries the flat ``{name: alpha}`` shape; ``entries``
-        carries the full ``{name: (alpha, trigger)}`` mapping.  Ablation
-        entries keyed under ``!<target>`` flatten to their ``(coeff,
-        trigger)`` pair so subscribers see one uniform tuple shape.
+        Thin forwarder to :meth:`SteeringComposer.emit_steering_applied`.
         """
-        flat = self._flatten_steering_stack()
-        alphas_only: dict[str, float] = {}
-        entries_out: dict[str, tuple[float, Trigger]] = {}
-        for name, entry in flat.items():
-            if isinstance(entry, (AblationTerm, ManifoldTerm)):
-                alphas_only[name] = entry.coeff
-                entries_out[name] = (entry.coeff, entry.trigger)
-                continue
-            alphas_only[name] = entry[0]
-            entries_out[name] = entry
-        self.events.emit(SteeringApplied(alphas=alphas_only, entries=entries_out))
+        self._get_steering_composer().emit_steering_applied()
 
     def _flatten_steering_stack(self) -> dict[str, SteeringStackEntry]:
-        """Collapse the LIFO stack into a single entries dict (later wins)."""
-        flat: dict[str, SteeringStackEntry] = {}
-        for entry in self._steering_stack:
-            flat.update(entry)
-        return flat
+        """Collapse the LIFO stack into a single entries dict (later wins).
+
+        Thin forwarder to :meth:`SteeringComposer.flatten_steering_stack`.
+        """
+        return self._get_steering_composer().flatten_steering_stack()
 
     def _steering_needs_probe_gating(self) -> bool:
         """Return True iff any active steering trigger carries a
         :class:`~saklas.core.triggers.ProbeGate`.
 
-        Walks the flattened steering stack head — entry tuples'
-        triggers and ablation entries' triggers both inspected.
-        Cheap pre-flight check that lets ``_generate_core`` decide
-        whether to wire the per-step score callback at all.
+        Thin forwarder to :meth:`SteeringComposer.steering_needs_probe_gating`;
+        ``joint_logprobs.py`` and the probe-gate tests call it on the session.
         """
-        flat = self._flatten_steering_stack()
-        for entry in flat.values():
-            if isinstance(entry, (AblationTerm, ManifoldTerm)):
-                if entry.trigger.gate is not None:
-                    return True
-                continue
-            # entry is (alpha, Trigger) — the additive / projection shape
-            _alpha, trig = entry
-            if trig.gate is not None:
-                return True
-        return False
+        return self._get_steering_composer().steering_needs_probe_gating()
 
     def _gated_probe_names(self) -> set[str]:
         """Registered probe names referenced by active probe gates.
 
-        Walks the flattened steering stack, pulls each trigger's
-        :class:`~saklas.core.triggers.ProbeGate`, and maps the gate's scalar
-        ``probe`` key back to the registered monitor probe NAME — the prefix
-        before the first of ``[`` / ``:`` / ``@`` / ``~`` (e.g.
-        ``"personas[3]"`` → ``"personas"``, ``"emotions:fraction"`` →
-        ``"emotions"``, ``"confident.uncertain"`` → itself).  Only names that
-        are actually attached probes are kept, so a stale / non-probe gate key
-        doesn't shrink an otherwise-empty subset to "score nothing".  Used by
-        :meth:`_begin_capture` to scope the per-token step sink to just the
-        gated probes when gating is the sole per-token consumer (FIX #4).
+        Thin forwarder to :meth:`SteeringComposer.gated_probe_names`.
         """
-        attached = set(self._monitor.probe_names)
-        out: set[str] = set()
-        for entry in self._flatten_steering_stack().values():
-            if isinstance(entry, (AblationTerm, ManifoldTerm)):
-                trig = entry.trigger
-            else:  # (alpha, Trigger)
-                _alpha, trig = entry
-            gate = trig.gate
-            if gate is None:
-                continue
-            # Split off the channel suffix: the probe name is everything up to
-            # the first axis/fraction/label/assignment marker.
-            name = re.split(r"[\[:@~]", gate.probe, maxsplit=1)[0]
-            if name in attached:
-                out.add(name)
-        return out
+        return self._get_steering_composer().gated_probe_names()
 
     def _gated_probe_keys(self) -> set[str]:
-        """Exact monitor scalar keys referenced by active probe gates."""
-        attached = set(self._monitor.probe_names)
-        out: set[str] = set()
-        for entry in self._flatten_steering_stack().values():
-            if isinstance(entry, (AblationTerm, ManifoldTerm)):
-                trig = entry.trigger
-            else:  # (alpha, Trigger)
-                _alpha, trig = entry
-            gate = trig.gate
-            if gate is None:
-                continue
-            name = re.split(r"[\[:@~]", gate.probe, maxsplit=1)[0]
-            if name in attached:
-                out.add(gate.probe)
-        return out
+        """Exact monitor scalar keys referenced by active probe gates.
+
+        Thin forwarder to :meth:`SteeringComposer.gated_probe_keys`.
+        """
+        return self._get_steering_composer().gated_probe_keys()
 
     def _steering_active_in_prefill(self) -> bool:
         """Return True iff any active steering term fires during prompt prefill.
 
-        A term touches the prefill residual stream iff its trigger has
-        ``prompt=True`` and carries no probe gate (probe gates report
-        inactive during prefill — there's no post-forward score yet; see
-        :meth:`~saklas.core.triggers.Trigger.active`).  When this is False the
-        prefill is numerically identical to the *unsteered* prefill, so a
-        cached unsteered prefix KV (the only kind :meth:`cache_prefix` builds)
-        stays valid for reuse.  This is the gate the prefix-cache consume path
-        keys on, and the condition under which steering push/pop preserves the
-        cache.  Mirrors :meth:`_steering_needs_probe_gating`'s stack walk.
+        Thin forwarder to :meth:`SteeringComposer.steering_active_in_prefill`.
         """
-        flat = self._flatten_steering_stack()
-        for entry in flat.values():
-            if isinstance(entry, (AblationTerm, ManifoldTerm)):
-                trig = entry.trigger
-            else:  # (alpha, Trigger)
-                _alpha, trig = entry
-            if trig.prompt and trig.gate is None:
-                return True
-        return False
+        return self._get_steering_composer().steering_active_in_prefill()
 
     def _steering_value_prefill_inactive(
         self, value: "str | Steering | None",
     ) -> bool:
         """Return True iff steering ``value`` would not touch the prompt prefill.
 
-        Pre-flight form of :meth:`_steering_active_in_prefill` over an
-        *incoming* steering value (before any scope push) — used by
-        :meth:`generate_batch` to decide whether a shared-prefix KV cache is
-        reusable across the batch.  ``None`` (no steering) is trivially
-        prefill-inactive; otherwise a term is prefill-active iff its trigger
-        has ``prompt=True`` and no probe gate.  A malformed expression (raises
-        on parse) is conservatively reported active so the caller skips
-        caching and lets the normal path surface the error.
+        Thin forwarder to :meth:`SteeringComposer.steering_value_prefill_inactive`.
         """
-        from saklas.core.steering_expr import ProjectedTerm
-
-        try:
-            s = Steering.from_value(value)
-        except Exception:
-            return False
-        if s is None:
-            return True
-        default = s.trigger
-        for val in s.alphas.values():
-            if isinstance(val, (AblationTerm, ManifoldTerm, ProjectedTerm)):
-                trig = val.trigger
-            elif isinstance(val, tuple):
-                trig = val[1]
-            else:  # bare float — inherits the Steering default trigger
-                trig = default
-            if trig.prompt and trig.gate is None:
-                return False
-        return True
+        return self._get_steering_composer().steering_value_prefill_inactive(value)
 
     def _exit_internal_steering(self, steering_cm: Any, *, swallow: bool) -> None:
         """Pop ``_generate_core``'s internally-entered steering scope.
@@ -2960,50 +2702,14 @@ class SaklasSession:
         """Return a closure that scores latest captures into a
         ``dict[str, float]`` for ``generate_steered``'s ``score_callback``.
 
-        The closure pulls ``self._capture.latest_per_layer()`` (the
-        most-recent ``[D]`` slice per layer the steering hooks captured) and
-        runs it through :meth:`Monitor.score_single_token` — one unified pass
-        over every probe shape — flattening to gate scalars via
-        :meth:`Monitor.flat_scalars`.  Returns an empty dict when the capture
-        is empty (e.g. before the first forward) so probe gates report
-        inactive instead of seeing stale values from a previous gen.
-
-        Caller-side guard: only invoked when
-        :meth:`_steering_needs_probe_gating` is True, so the no-gate
-        path stays at zero overhead.
+        Thin forwarder to :meth:`SteeringComposer.build_gating_score_callback`;
+        ``joint_logprobs.py`` and the manifold-probe tests call this on the
+        session.  The returned closure is per-token (under an active probe gate);
+        the composer binds ``capture``/``monitor`` to locals and reads the
+        session capture state through the back-ref, so no new per-token
+        indirection is added.
         """
-        capture = self._capture
-        monitor = self._monitor
-
-        def _score() -> dict[str, float]:
-            incremental_readings = getattr(self, "_incremental_readings", [])
-            incremental_gate_scores = getattr(self, "_incremental_gate_scores", [])
-            # The step sink already scored this token's readings — reuse them so
-            # the gate doesn't trigger a second pass.  In gating-only-subset mode
-            # (FIX #4) the rows hold just the gated probes, which is exactly the
-            # set the gate consults; in the full incremental mode they hold the
-            # whole roster.  Both reuse the latest appended row.
-            gating_subset = getattr(self, "_capture_gating_subset", None)
-            if gating_subset and incremental_gate_scores:
-                return incremental_gate_scores[-1]
-            if getattr(self, "_capture_incremental", False) and incremental_readings:
-                return monitor.flat_scalars(incremental_readings[-1])
-            latest = capture.latest_per_layer()
-            if not latest:
-                return {}
-            gate_keys = getattr(self, "_capture_gating_keys", None)
-            if gating_subset and gate_keys:
-                return monitor.score_gate_scalars(latest, gate_keys)
-            # Flatten the coordinate readings into gate-callback scalars
-            # (``name`` aliases axis 0, ``name[i]`` per axis, ``name:fraction``,
-            # ``name@label`` for curved nearest).  Scope to the gated subset
-            # when the per-token path is gating-only (avoids the full roster).
-            agg = monitor.score_single_token(
-                latest, only=gating_subset if gating_subset else None,
-            )
-            return monitor.flat_scalars(agg)
-
-        return _score
+        return self._get_steering_composer().build_gating_score_callback()
 
     def _compose_steering_entries(
         self,
@@ -3011,175 +2717,25 @@ class SaklasSession:
     ) -> None:
         """Lower the active steering entries into the ``SteeringManager`` (4.0).
 
-        Classifies every entry and composes the one unified backend:
-
-        - **push** terms (vectors, poles, ``~``/``|`` projections, affine-``%``
-          manifolds) and **ablation** terms (``!``) are grouped by trigger;
-          each group is synthesized into one merged affine subspace via
-          :func:`~saklas.core.manifold.synthesize_subspace` and registered with
-          :meth:`SteeringManager.add_subspace`;
-        - **curved-``%``** manifold terms each get their own two-op via
-          :meth:`SteeringManager.add_manifold`.
-
-        A push fragment is ``(unit-dir rows, ‖d_L‖ coord, coeff)`` so the
-        synthesizer's ``Δ = Σ coeff·(coord @ basis)`` recovers the baked
-        direction; the coeff is the term's ``along`` (the strength composes into
-        the merged target).  Ablation directions slide their axis to the
-        neutral-anchored origin (coord 0 = mean-replacement).  The neutral
-        anchor is :attr:`layer_means`; a layer with no anchor is skipped.
+        Thin forwarder to :meth:`SteeringComposer.compose_steering_entries`.
         """
-        from saklas.core.manifold import synthesize_subspace
-
-        self._steering.clear_all()
-        # Raw attr (not the lazily-building ``layer_means`` property): real
-        # sessions populate it at construction / first extraction, and a
-        # model-less context (test stub) keeps an empty dict rather than
-        # triggering a model-dependent build.  An empty anchor ⇒ the synthesizer
-        # skips every layer (no steering), the same degenerate path the old
-        # ablation took without ``layer_means``.
-        neutral_means = self._layer_means
-
-        # Whitened push normalization (Mahalanobis-only): hand the synthesizer the
-        # session whitener so the per-layer ``along`` budget is the whitened
-        # displacement ``‖Δ‖_M`` and the target is a whitened-unit direction —
-        # making ``along`` a scale-stable strength knob instead of inheriting each
-        # node's raw-Euclidean distance from neutral (which spans ~100× across
-        # targets).  Gated on a real session (means populated): a model-less stub
-        # keeps the Euclidean fallback, and the property soft-fails to ``None``
-        # (covers_all is then false) so a missing whitener degrades, never raises.
-        whitener = self.whitener if neutral_means else None
-
-        # trigger -> {"push": [(basis_dirs, coord_dirs, coeff)], "ablate": [dirs]}
-        grouped: dict[Trigger, dict[str, list[Any]]] = {}
-
-        def _bucket(trigger: Trigger) -> dict[str, list[Any]]:
-            return grouped.setdefault(trigger, {"push": [], "ablate": []})
-
-        from saklas.core.vectors import fold_directions_to_subspace
-
-        for name, entry in entries.items():
-            if isinstance(entry, AblationTerm):
-                ablate_prof = self._ensure_profile_registered(
-                    entry.target, role="ablation target",
-                )
-                ablate_dirs = {
-                    L: v.to(torch.float32).reshape(-1)
-                    for L, v in ablate_prof.items()
-                }
-                _bucket(entry.trigger)["ablate"].append(ablate_dirs)
-                continue
-            if isinstance(entry, ManifoldTerm):
-                manifold = self._manifolds.get(entry.manifold)
-                if manifold is None:
-                    raise ManifoldNotRegisteredError(
-                        f"No manifold registered for '{entry.manifold}'"
-                    )
-                if _manifold_is_affine(manifold):
-                    # Affine ``%`` joins the merged subspace as a rank-R push
-                    # toward the position's per-layer coords — a node's real
-                    # coords for label form (``personas%pirate``) or the cardinal
-                    # RBF layout blend for free coord form (``personas%c0,c1,…``).
-                    basis_dirs, coord_dirs = _affine_manifold_push(
-                        manifold, entry.position,
-                    )
-                    _bucket(entry.trigger)["push"].append(
-                        (basis_dirs, coord_dirs, entry.along),
-                    )
-                else:
-                    self._steering.add_manifold(
-                        entry.manifold, manifold,
-                        position=entry.position,
-                        along=entry.along, onto=entry.onto,
-                        trigger=entry.trigger,
-                    )
-                continue
-            alpha, trigger = entry
-            # 4.0 step 6b: every in-memory direction (ad-hoc extracts, clones,
-            # merges, ``~``/``|`` projections, or a folded bundled concept)
-            # lowers through the one push path — fold it to a neutral-anchored
-            # one-pole-ray subspace and push label-form, exactly as an affine
-            # ``%`` term does.  There is no separate baked-vector fragment.
-            prof = self._ensure_profile_registered(name)
-            folded = fold_directions_to_subspace(name, prof, neutral_means)
-            if not folded.layers:
-                continue
-            basis_dirs, coord_dirs = _affine_manifold_push(
-                folded, folded.node_labels[0],
-            )
-            _bucket(trigger)["push"].append((basis_dirs, coord_dirs, alpha))
-
-        # One merged affine subspace per active trigger group.
-        for i, (trigger, terms) in enumerate(grouped.items()):
-            if not terms["push"] and not terms["ablate"]:
-                continue
-            synth = synthesize_subspace(
-                terms["push"], terms["ablate"], neutral_means=neutral_means,
-                whitener=whitener,
-            )
-            if not synth.layers:
-                continue
-            self._steering.add_subspace(
-                f"__affine__{i}", synth, trigger=trigger,
-            )
+        self._get_steering_composer().compose_steering_entries(entries)
 
     def _install_composed_steering(self) -> None:
         """Attach the currently-composed steering entries to model layers.
 
-        Compiled fast path (MPS): a static-affine pure-push steering lowers to
-        the persistent branchless offset buffers (traced into the compiled
-        graph) instead of transient ctx-consulting hooks — the latter would
-        force a per-gen ``torch.compile`` recompile and graph-break at every
-        layer.  Gated on the offsets being available (compiled session) and on
-        the capture being compile-clean too: either no probes, or this gen is
-        ``_compiled_clean_eligible`` so :meth:`_begin_capture` will ride the
-        persistent capture buffers instead of transient capture hooks (slice 2).
-        Anything that isn't a constant add (curved ``%``, gate, phase, ``!``
-        ablation) returns ``None`` from :meth:`compute_static_offsets` and falls
-        through to the transient eager path.
+        Thin forwarder to :meth:`SteeringComposer.install_composed_steering`.
         """
-        self._steering_uses_compiled_offsets = False
-        # ``getattr`` defaults keep skeleton sessions (``__new__`` test stubs that
-        # bypass ``__init__``) on the transient path — they never compile.
-        if (
-            getattr(self, "_compiled", False)
-            and self._device.type == "mps"
-            and self._steering.has_compiled_offsets()
-            and (
-                not self._monitor.probe_names
-                or getattr(self, "_compiled_clean_eligible", False)
-            )
-        ):
-            offsets = self._steering.compute_static_offsets()
-            if offsets is not None:
-                self._steering.detach_transient_hooks()
-                self._steering.write_compiled_offsets(offsets)
-                self._steering_uses_compiled_offsets = True
-                return
-        # Eager / general path: zero the persistent offsets (no stale push leaks
-        # into the eager model, whose layers carry the same persistent hooks)
-        # and attach the transient ctx-consulting hooks.
-        if self._steering.has_compiled_offsets():
-            self._steering.zero_compiled_offsets()
-        self._steering.apply_to_model(
-            self._layers, self._device, self._dtype,
-        )
+        self._get_steering_composer().install_composed_steering()
 
     def _rebuild_steering_hooks(self) -> None:
         """Tear down existing hooks and install from the flattened stack head.
 
-        Called on every push/pop.  When the stack is empty this is a clean
-        ``clear_all``.  One hook installation per active layer regardless of
-        nesting depth — ``_compose_steering_entries`` synthesizes the merged
-        affine subspace(s) + registers curved manifolds, and
-        ``SteeringManager.apply_to_model`` lowers them to per-layer
-        ``subspace_inject`` groups.
+        Thin forwarder to :meth:`SteeringComposer.rebuild_hooks`; kept on the
+        session because test stubs override it (and the composer's push/pop reach
+        it through the session back-ref).
         """
-        flat = self._flatten_steering_stack()
-        if not flat:
-            self._steering.clear_all()
-            return
-        self._compose_steering_entries(flat)
-        self._install_composed_steering()
+        self._get_steering_composer().rebuild_hooks()
 
     def _begin_capture(
         self, *, widen: bool = False, need_per_token: bool = True,
@@ -3222,11 +2778,8 @@ class SaklasSession:
         else:
             union: set[int] = self._monitor.probe_layers()
             if not union:
-                self._capture_incremental = False
-                self._capture_aggregate_only = False
-                self._capture_lean = False
-                self._capture_gating_subset = None
-                self._capture_persistent = False
+                # No probes ⇒ the degenerate FULL (capture-disabled) state.
+                self._capture_state = CaptureState()
                 self._incremental_readings = []
                 return False
             layer_idxs = sorted(union)
@@ -3253,13 +2806,12 @@ class SaklasSession:
             self._capture.attach_persistent(layer_idxs, self._capture_buffers)
         else:
             self._capture.attach(self._layers, layer_idxs)
-        self._capture_persistent = use_persistent
+        # Default this gen to FULL (append / full-retention); the mode branches
+        # below replace it.  ``persistent`` is orthogonal to the mode — set here
+        # from the compiled-clean routing decision and carried through unchanged.
+        self._capture_state = CaptureState(persistent=use_persistent)
         self._incremental_readings = []
         self._incremental_gate_scores = []
-        self._capture_aggregate_only = False
-        self._capture_lean = False
-        self._capture_gating_subset = None
-        self._capture_gating_keys = None
         # Gating-only-subset path: per-token scoring is needed solely to feed
         # probe gates, so the step sink scores only the gated probes (the gate
         # consumes only those scalars), skipping the big-K roster's per-token
@@ -3288,17 +2840,12 @@ class SaklasSession:
                 )
 
             # Deep tail ring (full-roster finalize via ``tail_slice_at``) PLUS a
-            # per-token step sink (gated subset, for the gate).  ``set_incremental``
-            # would force a length-1 buffer and drop the ring, and
-            # ``set_aggregate_tail`` installs no sink, so we arm the ring first
-            # and wire the sink directly — the hook fires the sink whenever it is
-            # set, independent of the tail depth (see ``HiddenCapture._hook``).
-            self._capture.set_aggregate_tail(_AGG_TAIL_DEPTH)
-            self._capture._step_sink = _score_step_subset
-            self._capture_incremental = False
-            self._capture_aggregate_only = True
-            self._capture_gating_subset = subset
-            self._capture_gating_keys = gate_keys
+            # per-token step sink (gated subset, for the gate) — armed together by
+            # ``set_tail_with_sink`` (neither single setter gives both).
+            self._capture.set_tail_with_sink(_AGG_TAIL_DEPTH, _score_step_subset)
+            self._capture_state.mode = CaptureMode.GATING_SUBSET
+            self._capture_state.gating_subset = subset
+            self._capture_state.gating_keys = gate_keys
             # The subset is scored one token per step in order, so curved gated
             # probes can warm-start their foot; cold-start the feet first.
             self._monitor.reset_curved_feet()
@@ -3322,11 +2869,8 @@ class SaklasSession:
 
             # Deep tail ring (full-roster aggregate at finalize) PLUS the lean
             # per-token step sink — same dual-arming as the gating-subset path.
-            self._capture.set_aggregate_tail(_AGG_TAIL_DEPTH)
-            self._capture._step_sink = _score_step_lean
-            self._capture_incremental = False
-            self._capture_aggregate_only = False
-            self._capture_lean = True
+            self._capture.set_tail_with_sink(_AGG_TAIL_DEPTH, _score_step_lean)
+            self._capture_state.mode = CaptureMode.LEAN_INCREMENTAL
             # Lean rows are scored one token per step in order, so curved probes
             # can warm-start their foot for the per-token coord stream.
             self._monitor.reset_curved_feet()
@@ -3342,7 +2886,7 @@ class SaklasSession:
                 )
 
             self._capture.set_incremental(_score_step)
-            self._capture_incremental = True
+            self._capture_state.mode = CaptureMode.INCREMENTAL
             # The step sink scores one token per decode step in order, so curved
             # probes can warm-start their nearest-point foot from the previous
             # token. Cold-start the feet for this generation first.
@@ -3354,14 +2898,13 @@ class SaklasSession:
             # last content token once. Curved warm-start is a sequential-live
             # optimization, so leave it off for the one-shot aggregate read.
             self._capture.set_aggregate_tail(_AGG_TAIL_DEPTH)
-            self._capture_incremental = False
-            self._capture_aggregate_only = True
+            self._capture_state.mode = CaptureMode.AGGREGATE_ONLY
             self._monitor.enable_curved_warm(False)
         else:
-            self._capture_incremental = False
-            # Non-incremental reads (return_hidden full stack, or no probes) are
-            # scored out of order / one-shot, so keep curved probes on the cold
-            # foot solve for reproducibility.
+            # FULL retention (the ``CaptureState`` default): return_hidden full
+            # stack, or no per-token consumer on a non-tail read.  Scored out of
+            # order / one-shot, so keep curved probes on the cold foot solve for
+            # reproducibility.
             self._monitor.enable_curved_warm(False)
         return True
 
@@ -3439,21 +2982,23 @@ class SaklasSession:
             captured, generated_ids, self._tokenizer, accumulate=accumulate,
         )
 
-    def _score_incremental(
-        self, generated_ids: list[int], *, accumulate: bool = True,
-    ) -> tuple[dict[str, "ProbeReading"], dict[str, list[float]]]:
-        """Aggregate readings + per-token coord stream from live-scored rows."""
-        names = list(self._monitor.probe_names)
-        empty_agg = {
+    def _empty_readings(self, names: list[str]) -> dict[str, "ProbeReading"]:
+        """A zero ``ProbeReading`` per probe — the no-tokens / missing-pool
+        fallback shared by the incremental and aggregate-only score paths."""
+        return {
             name: ProbeReading(fraction=0.0, nearest=[], coords=())
             for name in names
         }
-        n = len(generated_ids)
-        if n == 0 or not self._incremental_readings:
-            return empty_agg, {name: [] for name in names}
 
-        from saklas.core.vectors import last_content_index
-        rows = self._incremental_readings[:n]
+    def _extract_coord_stream(
+        self, rows: list[dict[str, "ProbeReading"]], n: int, names: list[str],
+    ) -> dict[str, list[float]]:
+        """Per-probe axis-0 coord stream from per-token reading rows.
+
+        Reads ``reading.coords[0]`` (0.0 when a row is empty) into a length-``n``
+        per-probe list — the loop shared by the (full) incremental and the lean
+        incremental score paths.
+        """
         per_token: dict[str, list[float]] = {name: [0.0] * n for name in names}
         for i, readings in enumerate(rows):
             for name, reading in readings.items():
@@ -3461,7 +3006,22 @@ class SaklasSession:
                     per_token[name][i] = (
                         reading.coords[0] if reading.coords else 0.0
                     )
+        return per_token
 
+    def _score_incremental(
+        self, generated_ids: list[int], *, accumulate: bool = True,
+    ) -> tuple[dict[str, "ProbeReading"], dict[str, list[float]]]:
+        """Aggregate readings + per-token coord stream from live-scored rows."""
+        names = list(self._monitor.probe_names)
+        n = len(generated_ids)
+        if n == 0 or not self._incremental_readings:
+            return self._empty_readings(names), {name: [] for name in names}
+
+        from saklas.core.vectors import last_content_index
+        rows = self._incremental_readings[:n]
+        per_token = self._extract_coord_stream(rows, n, names)
+
+        empty_agg = self._empty_readings(names)
         agg_idx = last_content_index(generated_ids, self._tokenizer)
         agg_row = rows[agg_idx] if agg_idx < len(rows) else {}
         agg_vals = {
@@ -3476,18 +3036,17 @@ class SaklasSession:
     ) -> dict[str, "ProbeReading"]:
         """Score *only* the end-of-gen aggregate from the bounded tail ring.
 
-        The aggregate-only capture path (``_capture_aggregate_only``) scored
-        nothing per token; here we pool the last content token's slice from the
+        The aggregate-only capture path (``CaptureMode.AGGREGATE_ONLY``, shared by
+        ``GATING_SUBSET`` whose per-token rows feed only the gate) scored nothing
+        of the full roster per token; here we pool the last content token's slice
+        from the
         tail ring and run one :meth:`Monitor.score_aggregate`.  ``generated_ids``
         token ``k`` was produced by decode forward ``k``, so the last content
         token's forward index is ``last_content_index(generated_ids)`` — which
         :meth:`HiddenCapture.tail_slice_at` maps into the ring.
         """
         names = list(self._monitor.probe_names)
-        empty = {
-            name: ProbeReading(fraction=0.0, nearest=[], coords=())
-            for name in names
-        }
+        empty = self._empty_readings(names)
         if not generated_ids:
             return empty
         from saklas.core.vectors import last_content_index
@@ -3523,14 +3082,8 @@ class SaklasSession:
         """
         names = list(self._monitor.probe_names)
         n = len(generated_ids)
-        per_token: dict[str, list[float]] = {name: [0.0] * n for name in names}
         rows = self._incremental_readings[:n]
-        for i, readings in enumerate(rows):
-            for name, reading in readings.items():
-                if name in per_token:
-                    per_token[name][i] = (
-                        reading.coords[0] if reading.coords else 0.0
-                    )
+        per_token = self._extract_coord_stream(rows, n, names)
         agg_vals = self._score_aggregate_only(
             generated_ids, accumulate=accumulate,
         )
@@ -3681,16 +3234,12 @@ class SaklasSession:
         # global MPS command buffer (which would abort the process).  Hold the
         # exclusive-GPU ``_gen_lock`` non-blocking: a cross-thread model op in
         # flight refuses rather than races; same-thread reentry passes (RLock).
-        if not self._gen_lock.acquire(blocking=False):
-            raise ConcurrentExtractionError(
-                "add_probe called while another model operation is in "
-                "flight; retry shortly"
-            )
-        try:
+        with self._model_exclusive(
+            "add_probe called while another model operation is in "
+            "flight; retry shortly"
+        ):
             manifold = self._resolve_probe_manifold(selector)
             self._monitor.add_probe(name, manifold, top_n=top_n)
-        finally:
-            self._gen_lock.release()
         # New probe → _begin_capture attaches a different layer set than was
         # live when the prefix was prefilled; drop the cache so the next gen
         # re-prefills with the fresh capture-attach layout in place.
@@ -4609,6 +4158,7 @@ class SaklasSession:
             _decoded = self._tokenizer.decode(response_ids, skip_special_tokens=True)
             text = _decoded if isinstance(_decoded, str) else _decoded[0]
 
+        capture_mode = self._capture_state.mode
         captured_stack: dict[int, torch.Tensor] = {}
         if (
             generated_ids
@@ -4616,31 +4166,30 @@ class SaklasSession:
                 return_hidden
                 or (
                     self._monitor.probe_names
-                    and not self._capture_incremental
-                    and not self._capture_aggregate_only
-                    and not self._capture_lean
+                    and capture_mode is CaptureMode.FULL
                 )
             )
         ):
             # Full stack only for return_hidden or the non-incremental
-            # full-retention path; the aggregate-only / lean tail ring is pooled
-            # via ``_score_aggregate_only`` (``stacked()`` would stack the tail
-            # ring, not the full [T, D]).
+            # full-retention (FULL) path; the aggregate-only / lean tail ring is
+            # pooled via ``_score_aggregate_only`` (``stacked()`` would stack the
+            # tail ring, not the full [T, D]).
             captured_stack = self._capture.stacked()
 
         agg_vals: dict[str, ProbeReading] = {}
         if self._monitor.probe_names and generated_ids:
-            if self._capture_incremental:
+            if capture_mode is CaptureMode.INCREMENTAL:
                 agg_vals, per_token = self._score_incremental(
                     generated_ids, accumulate=not stateless,
                 )
-            elif self._capture_lean:
+            elif capture_mode is CaptureMode.LEAN_INCREMENTAL:
                 # Lean per-token coord stream + full aggregate from the tail ring.
                 agg_vals, per_token = self._score_lean_incremental(
                     generated_ids, accumulate=not stateless,
                 )
-            elif self._capture_aggregate_only:
-                # No per-token stream was produced — score the aggregate once.
+            elif self._capture_state.aggregate_only:
+                # AGGREGATE_ONLY / GATING_SUBSET: no full-roster per-token stream —
+                # score the aggregate once from the tail ring.
                 agg_vals = self._score_aggregate_only(
                     generated_ids, accumulate=not stateless,
                 )
@@ -4948,13 +4497,7 @@ class SaklasSession:
 
     def _snapshot_steering_alphas(self) -> dict[str, float]:
         """Flatten the active steering stack for ``GenerationResult.vectors``."""
-        snap: dict[str, float] = {}
-        for name, entry in self._flatten_steering_stack().items():
-            if isinstance(entry, (AblationTerm, ManifoldTerm)):
-                snap[name] = entry.coeff
-                continue
-            snap[name] = entry[0]
-        return snap
+        return self._get_steering_composer().snapshot_steering_alphas()
 
     def _start_loom_assistant(
         self,
@@ -5080,8 +4623,8 @@ class SaklasSession:
         # persistent branchless offset + capture hooks present (attached
         # pre-compile), so the compiled module is correct exactly when the live
         # hook topology matches that: no *transient* per-token capture hooks
-        # (``self._capture._handles`` empty — true for the persistent-capture and
-        # no-probe paths) AND either unsteered or a static-affine steering that
+        # (``self._capture.is_transient()`` false — true for the persistent-capture
+        # and no-probe paths) AND either unsteered or a static-affine steering that
         # lowered to the persistent offset buffers (``_steering_uses_compiled_offsets``
         # — the push rides the offset, no transient hook).  A probed gen on the
         # persistent-capture path (slice 2) satisfies both, so it now keeps the
@@ -5093,7 +4636,7 @@ class SaklasSession:
         # the hooked path.  CUDA keeps its existing graph-capture path untouched.
         gen_model = self._model
         if self._compiled and self._device.type == "mps":
-            compiled_clean = not self._capture._handles and (
+            compiled_clean = not self._capture.is_transient() and (
                 self._steering_uses_compiled_offsets
                 or self._steering.all_fast_path()
             )
@@ -5122,7 +4665,7 @@ class SaklasSession:
             # sink is installed (aggregate-only / full-retention / no-probe).
             step_callback=(
                 self._capture.ingest_persistent
-                if self._capture_persistent
+                if self._capture_state.persistent
                 else self._capture.fire_step_sink
             ),
             use_static_cache=use_static_cache,
@@ -5252,13 +4795,13 @@ class SaklasSession:
                 # ``_persists_layer_scores`` / ``_persists_subspace_coords``), so the
                 # stored lean rows are reused exactly like the full-incremental rows.
                 has_incremental_reading = bool(
-                    (self._capture_incremental or self._capture_lean)
+                    (self._capture_state.incremental or self._capture_state.lean)
                     and self._incremental_readings
                 )
                 if needs_scores and not has_incremental_reading:
                     latest_hidden_for_token = {
                         layer_idx: bucket[-1]
-                        for layer_idx, bucket in self._capture._per_layer.items()
+                        for layer_idx, bucket in self._capture.per_layer_buckets().items()
                         if bucket
                     }
                 if (
@@ -5624,15 +5167,11 @@ class SaklasSession:
             # streaming target is no longer live.
             self._active_gen_reservation = None
             self._last_token_probe_payload = None
-            # Reset incremental-capture state so the next gen starts clean
-            # (finalize has already consumed the rows by now). Belt-and-
-            # suspenders: ``_begin_capture`` resets these at gen start too.
-            self._capture_incremental = False
-            self._capture_lean = False
-            self._capture_aggregate_only = False
-            self._capture_gating_subset = None
-            self._capture_gating_keys = None
-            self._capture_persistent = False
+            # Reset capture state to the default (FULL, non-persistent) so the
+            # next gen starts clean (finalize has already consumed the rows by
+            # now). Belt-and-suspenders: ``_begin_capture`` resets it at gen start
+            # too.
+            self._capture_state = CaptureState()
             self._compiled_clean_eligible = False
             self._incremental_readings = []
             self._incremental_gate_scores = []
@@ -5731,7 +5270,7 @@ class SaklasSession:
             input: prompt string or list of message dicts.
             steering: expression string (e.g. ``"0.5 honest + 0.3 warm"``)
                 or a pre-built :class:`Steering`.  Pole aliases resolve at
-                parse time via ``io.selectors.resolve_pole``.  ``None`` =
+                parse time via ``io.selectors.resolve_bare_atom``.  ``None`` =
                 no steering.
             sampling: per-call ``SamplingConfig``.  ``None`` fields fall
                 through to the session's ``GenerationConfig`` defaults.

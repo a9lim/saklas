@@ -198,6 +198,24 @@ class HiddenCapture:
         self._tail_depth = max(1, int(depth))
         self._max_layer = max(self._per_layer) if self._per_layer else None
 
+    def set_tail_with_sink(
+        self, depth: int, step_sink: Callable[[dict[int, torch.Tensor]], None],
+    ) -> None:
+        """Bounded-tail ring PLUS a per-token step sink (gating-subset / lean).
+
+        Must be called after :meth:`attach`.  This combination can't be had
+        through either single setter — :meth:`set_incremental` forces a length-1
+        buffer and drops the ring, :meth:`set_aggregate_tail` installs no sink —
+        so this arms the deep ring and wires the sink together.  The hook fires
+        the sink whenever one is set, independent of tail depth (see
+        :meth:`attach`'s ``_hook``).  Used by the GATING_SUBSET (gated-subset
+        scalar scoring) and LEAN_INCREMENTAL (``coords_only`` per-token scoring)
+        capture modes, both of which still pool the FULL roster once at finalize
+        from the retained ring.
+        """
+        self.set_aggregate_tail(depth)
+        self._step_sink = step_sink
+
     def attach_persistent(
         self, layer_indices: list[int], buffers: dict[int, torch.Tensor],
     ) -> None:
@@ -335,6 +353,29 @@ class HiddenCapture:
             if bucket:
                 out[idx] = bucket[-1]
         return out
+
+    def per_layer_buckets(self) -> dict[int, list[torch.Tensor]]:
+        """The raw per-layer capture buckets (``{layer: [slice, …]}``).
+
+        The public accessor for the streaming-tap read that builds the latest
+        per-layer ``[D]`` dict from each non-empty bucket's ``[-1]``.  A plain
+        attribute return — **no per-token cost** (it is read once per token on the
+        WS path) — the caller does the ``[-1]`` selection so a length-1 / tail-ring
+        bucket reads identically.  (:meth:`latest_per_layer` is the packaged form;
+        this exposes the buckets for callers that filter on emptiness themselves.)
+        """
+        return self._per_layer
+
+    def is_transient(self) -> bool:
+        """True iff transient per-gen forward hooks are registered (vs persistent).
+
+        The compiled-clean routing gate: the captured graph was traced with only
+        the always-on persistent capture/offset hooks present, so it stays valid
+        exactly when no *transient* ``register_forward_hook`` was installed —
+        ``attach_persistent`` (no transient hook) and the no-probe path both leave
+        ``_handles`` empty.  ``attach`` registers one transient hook per layer.
+        """
+        return bool(self._handles)
 
     def fire_step_sink(self) -> None:
         """Run the per-token step sink once, **after** the model forward (FIX F1).

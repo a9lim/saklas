@@ -465,14 +465,14 @@ def _refuse_if_busy(session: SaklasSession) -> None:
     ``session.lock`` (the asyncio HTTP serializer) orders manifold
     mutations against each other and the JSON fit path, but an SSE fit
     whose request was cancelled leaves its worker thread — and the
-    ``_gen_lock`` it holds — alive past the cancel.  A non-blocking probe
-    of ``_gen_lock`` refuses a folder mutation while that thread runs.
+    ``gen_lock`` it holds — alive past the cancel.  A non-blocking probe
+    of ``gen_lock`` refuses a folder mutation while that thread runs.
     """
-    if not session._gen_lock.acquire(blocking=False):
+    if not session.gen_lock.acquire(blocking=False):
         raise HTTPException(
             409, "a model operation is in flight; retry shortly",
         )
-    session._gen_lock.release()
+    session.gen_lock.release()
 
 
 def _evict_manifold(session: SaklasSession, namespace: str, name: str) -> None:
@@ -483,10 +483,10 @@ def _evict_manifold(session: SaklasSession, namespace: str, name: str) -> None:
     delete / re-fit does not leave a stale tensor live.
     """
     prefixes = (name, f"{namespace}/{name}")
-    for key in list(session._manifolds):
+    for key in list(session.manifolds):
         head = key.rsplit(":", 1)[0] if ":" in key else key
         if head in prefixes:
-            session._manifolds.pop(key, None)
+            session.manifolds.pop(key, None)
 
 
 # ------------------------------------------------------------------- routes ---

@@ -4217,6 +4217,121 @@ def load_manifold(path: str | Path) -> Manifold:
     )
 
 
+def transfer_manifold_subspaces(
+    src: Manifold,
+    alignment: dict[int, torch.Tensor],
+    *,
+    whitener: "LayerWhitener | None",
+    from_model: str,
+    to_model: str,
+) -> Manifold:
+    """Map a fitted manifold's per-layer subspaces into a target model's space.
+
+    The pure-tensor core of the cross-model Procrustes transfer (the folder
+    read/write orchestration stays in :func:`saklas.io.manifold_lifecycle.
+    transfer_manifold`).  Takes the already-loaded **source** ``Manifold``, a
+    per-layer alignment map ``{layer: M_L}`` (``v_tgt = M_L @ v_src``, the shape
+    :func:`saklas.io.alignment.fit_alignment` produces), and the **target**
+    model's whitener, and returns a new ``Manifold`` whose subspaces live in
+    target space.
+
+    Each covered layer's affine subspace maps as ``mean_tgt = M_L @ mean_src``
+    and ``basis_tgt = basis_src @ M_Lᵀ`` (each basis row transforms like a
+    vector).  Layers the alignment doesn't cover are dropped.  The RBF
+    interpolant fields (``node_params`` / ``rbf_weights`` / ``poly_coeffs`` /
+    ``coord_offset`` / ``coord_scale``) and the shared ``node_coords`` live in
+    subspace/authoring-coordinate space, not model space, so they ride through
+    untouched — the subspace relocates via the transformed ``mean``/``basis``
+    and the in-subspace parameterization is invariant.
+
+    **Target-metric share re-bake (mandatory).**  The source fit's per-layer
+    Mahalanobis ``share`` is a per-model quantity (``Σ`` belongs to
+    ``from_model``), so it can't carry across.  The target ``whitener`` is
+    **required** and must cover every transferred layer (all-or-nothing,
+    mirroring the fit gate); the share is recomputed in target space via
+    :func:`subspace_share` (``sqrt(Σ_k coordsᵀ (B_tgt Σ_tgt⁻¹ B_tgtᵀ) coords)``
+    — the same formula the fit pipeline bakes).  A missing or non-covering
+    whitener raises :class:`~saklas.core.mahalanobis.WhitenerError`; there is no
+    Euclidean rebake.  ``origin`` (the per-layer foot of the *source* neutral
+    mean) is per-model too, so it is cleared — the apply path falls back to a
+    zero-coord seed per layer.
+
+    Folder-level format guards (empty alignment, source fit missing) are the
+    caller's concern; this function raises only :class:`~saklas.core.
+    mahalanobis.WhitenerError` (missing / partial target whitener) and
+    ``ValueError`` when ``alignment`` covers none of the source's fitted layers.
+    """
+    from dataclasses import replace as _dc_replace
+
+    from saklas.core.mahalanobis import WhitenerError
+
+    # Map each covered layer's subspace into target space.  ``M_L`` is
+    # ``(D_tgt, D_src)`` so ``mean_tgt = M_L @ mean_src`` and each basis row
+    # transforms the same way → ``basis_tgt = basis_src @ M_L^T``.
+    new_layers: dict[int, LayerSubspace] = {}
+    for layer, sub in src.layers.items():
+        M_L = alignment.get(layer)
+        if M_L is None:
+            continue
+        M = M_L.to(dtype=torch.float32)
+        mean_f = sub.mean.to(torch.float32)
+        basis_f = sub.basis.to(torch.float32)
+        mean_tgt = (M @ mean_f).to(dtype=sub.mean.dtype)
+        basis_tgt = (basis_f @ M.transpose(0, 1)).to(dtype=sub.basis.dtype)
+        new_layers[layer] = _dc_replace(sub, mean=mean_tgt, basis=basis_tgt)
+
+    if not new_layers:
+        raise ValueError(
+            f"alignment for {from_model!r} → {to_model!r} covered none of the "
+            f"source manifold's fitted layers ({sorted(src.layers)})"
+        )
+
+    # The source model's Mahalanobis share is per-model (Σ and the neutral
+    # activations are both ``from_model`` quantities), so it's invalid in
+    # ``to_model`` space.  The **target** whitener is mandatory and must cover
+    # every transferred layer (all-or-nothing, mirroring the fit gate);
+    # recompute the share in target space.  No Euclidean rebake — a missing /
+    # partial whitener is an error.
+    if whitener is None or not whitener.covers_all(new_layers.keys()):
+        raise WhitenerError(
+            "manifold transfer requires a Mahalanobis whitener covering every "
+            f"transferred layer {sorted(new_layers.keys())}; generate neutral "
+            "activations for the TARGET model first (the Euclidean path is gone)"
+        )
+
+    new_share: dict[int, float] = {}
+    for layer, sub_tgt in new_layers.items():
+        sub_f = sub_tgt.to(device=torch.device("cpu"), dtype=torch.float32)
+        # ``coords`` are the reduced node values in subspace-coordinate space —
+        # invariant under the model-space alignment, so identical to the source
+        # fit.  ``subspace_share`` computes the μ-centered whitened spread
+        # ``sqrt(Σ_k c_kᵀ M_R c_k)`` (``M_R = B_tgt Σ_tgt⁻¹ B_tgtᵀ`` via
+        # ``subspace_gram``, the *target* Σ⁻¹ restricted to the transferred
+        # basis) — the same formula the fit pipeline bakes, now in target space.
+        # It μ-centers internally only if fed μ-centered coords, so do the
+        # centering here: flat fits carry neutral-anchored real coords in
+        # ``node_coords``; curved fits read μ-centered node values off the RBF.
+        if sub_f.is_affine:
+            coords = sub_f.node_coords  # (K, R) neutral-anchored
+            assert coords is not None  # affine ⇒ node_coords set
+        else:
+            _np, _rw, _pc = sub_f.rbf_params()
+            coords = eval_rbf(_np, _rw, _pc, _np)  # (K, R)
+        mu_coords = coords - coords.mean(dim=0, keepdim=True)  # μ-center
+        new_share[layer] = subspace_share(
+            mu_coords, sub_f.basis, whitener=whitener, layer=layer,
+        )
+
+    return _dc_replace(
+        src, layers=new_layers,
+        mahalanobis_share=new_share,
+        # ``origin`` is the per-layer foot of the *source* model's neutral mean
+        # — a per-model quantity invalid in target space (same reason the share
+        # is cleared); the apply path falls back to a zero-coord seed per layer.
+        origin={},
+    )
+
+
 def _gn_step(
     p: torch.Tensor,
     q: torch.Tensor,

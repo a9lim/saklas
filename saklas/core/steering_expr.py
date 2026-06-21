@@ -76,8 +76,9 @@ identifiers are rejected.  Bipolar pairs join with ``.``
 (``human.artificial_intelligence``).
 
 Pole aliases (``wolf`` on top of an installed ``deer.wolf``) resolve via
-:func:`saklas.io.selectors.resolve_pole`; the sign flip folds into the
-user-supplied coefficient before the term lands in
+:func:`saklas.io.selectors.resolve_bare_atom`'s manifold-label tier (a
+bipolar pole is itself a node label, lowered to an affine ``%`` push)
+before the term lands in
 ``Steering.alphas``.  Projection terms produce :class:`ProjectedTerm`
 values; the session materializes them into derived profiles on scope
 entry.
@@ -738,34 +739,37 @@ def _with_variant(canonical: str, variant: str) -> str:
 def _resolve_atom(
     atom: _Atom, default_namespace: Optional[str],
 ) -> tuple[str, int]:
-    """Return ``(alphas_key, sign_flip)`` for an atom.
+    """Return ``(alphas_key, sign_flip)`` for a **pole** atom.
 
     ``alphas_key`` is the key under which this atom lands in
     ``Steering.alphas``: the canonical concept name from
-    ``resolve_pole``, prefixed with ``<namespace>/`` when the user
+    ``canonicalize_atom``, prefixed with ``<namespace>/`` when the user
     explicitly typed a namespace (so two installed packs sharing a
     concept name — ``alice/foo`` vs ``bob/foo`` — stay distinct
     through the registry-key path), and suffixed with ``:<variant>``
-    when the variant is anything other than ``raw``.  ``sign_flip``
-    is +1 or -1 per ``resolve_pole``; callers multiply their
-    user-supplied coefficient by this flip.
+    when the variant is anything other than ``raw``.  ``sign_flip`` is
+    always +1 now (the bipolar-pole sign-flip moved to the manifold
+    tier); the tuple shape is kept so projection/ablation call sites are
+    untouched.
 
-    Bare references (no user-typed namespace) keep the canonical
-    name as the key — matches v2.0 behavior and lets cross-namespace
-    bare-pole collisions surface at parse time via
-    :class:`AmbiguousSelectorError` rather than silently picking
-    one.
+    This is the **pole canonicalization tier in isolation** — the base
+    of a projection / ablation term and a projection ``onto`` direction
+    are always vector concepts and must not route through the manifold
+    tiers; the plain-term path in :func:`_fold` runs the full
+    :func:`~saklas.io.selectors.resolve_bare_atom` ladder instead.
+    ``default_namespace`` is vestigial (the retired ``resolve_pole`` never
+    consumed it — canonicalization is namespace-independent); kept in the
+    signature so the projection / ablation call sites stay untouched.
     """
-    from saklas.io.selectors import resolve_pole
+    from saklas.io.selectors import canonicalize_atom
 
     raw = atom.concept
     if atom.variant != "raw":
         raw = f"{raw}:{atom.variant}"
-    ns = atom.namespace if atom.namespace is not None else default_namespace
-    canonical, sign, _match, variant = resolve_pole(raw, namespace=ns)
+    canonical, variant = canonicalize_atom(raw)
     if atom.namespace is not None:
         canonical = f"{atom.namespace}/{canonical}"
-    return _with_variant(canonical, variant), sign
+    return _with_variant(canonical, variant), +1
 
 
 def _merge_plain(
@@ -861,7 +865,7 @@ def _resolve_manifold_atom(atom: _Atom) -> str:
     """Return the registry key for a manifold atom.
 
     Unlike :func:`_resolve_atom`, manifold atoms do *not* go through
-    ``resolve_pole`` — a manifold name is not a concept and must not
+    pole canonicalization — a manifold name is not a concept and must not
     alias to one.  The key is the bare name, namespace-prefixed only when
     the user typed a namespace, variant-suffixed when not ``raw``.
     """
@@ -971,84 +975,51 @@ def _fold(terms: list[_Term], *, namespace: Optional[str]) -> "Steering":
                 sel.manifold_position, mfld_trig,
             )
             continue
-        # Bare-name manifold-label tier (Phase C.2), tried FIRST for a
-        # plain term whose base is a bare slug (no namespace, no variant
-        # suffix, no bipolar ``.``, no projection / ablation): if the slug
-        # matches a manifold's node label, synthesize a label-form
-        # ManifoldTerm at that node instead of treating the slug as a fresh
-        # vector concept.  ``resolve_bare_name`` arbitrates only cross-
-        # *manifold* label collisions (raising ``AmbiguousSelectorError``);
-        # it knows nothing of poles.  A miss falls through to the
-        # composite-name tier (``resolve_manifold_name``) and then the
-        # ``resolve_pole`` canonicalization below — every bipolar pole is
-        # itself a node label, so a bare pole resolves here as an affine
-        # ``%`` push.
-        if (
-            sel.operator is None
-            and not term.ablation
-            and sel.base.variant == "raw"
-            and sel.base.namespace is None
-            and "." not in sel.base.concept
-        ):
-            from saklas.io.selectors import (
-                AmbiguousSelectorError,
-                resolve_bare_name,
+        # Bare-atom tier ladder.  A plain term (no projection operator, no
+        # ablation) runs the unified ladder that
+        # :func:`~saklas.io.selectors.resolve_bare_atom` owns end to end —
+        # manifold-label tier first (a bare slug matching a node label →
+        # label-form ``%`` push), then the composite-name tier (a 2-node
+        # ``pca`` manifold name like ``happy.sad`` → its node-0 (+) pole),
+        # then the pole canonicalization that falls through to the plain
+        # vector path below.  Every bipolar pole is itself a node label, so a
+        # bare pole resolves through the label tier as an affine ``%`` push.
+        # Ordering + cross-tier ``AmbiguousSelectorError`` arbitration live in
+        # the resolver, not here.
+        if sel.operator is None and not term.ablation:
+            from saklas.io.selectors import resolve_bare_atom
+
+            atom = resolve_bare_atom(
+                sel.base.concept,
+                namespace=namespace,
+                typed_namespace=sel.base.namespace,
+                variant=sel.base.variant,
             )
-            try:
-                manifold_hit = resolve_bare_name(
-                    sel.base.concept, namespace=namespace,
-                )
-            except AmbiguousSelectorError:
-                raise
-            except Exception:
-                # Errors fall through to the historical resolve_pole
-                # path below; if the same error is genuine, it raises
-                # there with the canonical surface message.
-                manifold_hit = None
-            if manifold_hit is not None:
+            if atom.kind == "label":
+                assert atom.manifold is not None
                 mfld_trig = (
                     term.trigger if term.trigger is not None else Trigger.BOTH
                 )
                 _merge_manifold(
-                    alphas, manifold_hit.manifold_key,
+                    alphas, atom.manifold.manifold_key,
                     _expand_along_onto_coeffs(term.coeffs),
-                    manifold_hit.label, mfld_trig,
+                    atom.manifold.label, mfld_trig,
                 )
                 continue
-        # Composite-name manifold tier (4.0 step 6b): a plain term whose
-        # base names a 2-node ``pca`` manifold (``happy.sad`` — the ``.``
-        # makes it skip the bare-label tier above) steers toward node 0,
-        # the ``orient_to=0`` (+) pole — the steering-vector composite read
-        # path.  ``resolve_manifold_name`` returns None when no such manifold
-        # exists, so a genuine vector concept falls through unchanged.
-        if (
-            sel.operator is None
-            and not term.ablation
-            and sel.base.variant == "raw"
-        ):
-            from saklas.io.selectors import (
-                AmbiguousSelectorError,
-                resolve_manifold_name,
-            )
-            ns_scope = sel.base.namespace or namespace
-            try:
-                name_hit = resolve_manifold_name(
-                    sel.base.concept, namespace=ns_scope,
-                )
-            except AmbiguousSelectorError:
-                raise
-            except Exception:
-                name_hit = None
-            if name_hit is not None:
+            if atom.kind == "name":
+                assert atom.manifold_name is not None
                 mfld_trig = (
                     term.trigger if term.trigger is not None else Trigger.BOTH
                 )
                 _merge_manifold(
-                    alphas, name_hit.manifold_key,
+                    alphas, atom.manifold_name.manifold_key,
                     _expand_along_onto_coeffs(term.coeffs),
-                    name_hit.pole_label, mfld_trig,
+                    atom.manifold_name.pole_label, mfld_trig,
                 )
                 continue
+            # kind == "pole": fall through to the plain vector path below
+            # (re-resolved via ``_resolve_atom`` for the namespace-prefixed
+            # registry key).
         # Past this point the term is unambiguously a vector (plain /
         # projection / ablation) — the comma-separated coefficient run is a
         # manifold-``%``-only construct, so reject it here rather than
@@ -1099,10 +1070,10 @@ def parse_expr(
 ) -> "Steering":
     """Parse a steering expression string into a :class:`Steering` IR.
 
-    ``namespace`` scopes bare pole resolution to a single namespace; when
-    ``None``, :func:`saklas.io.selectors.resolve_pole` raises
-    :class:`~saklas.io.selectors.AmbiguousSelectorError` if a bare pole
-    matches concepts across multiple namespaces.
+    ``namespace`` scopes bare-atom resolution to a single namespace; when
+    ``None``, :func:`saklas.io.selectors.resolve_bare_atom` raises
+    :class:`~saklas.io.selectors.AmbiguousSelectorError` if a bare atom
+    matches manifolds across multiple namespaces.
     """
     if not text or not text.strip():
         raise SteeringExprError("empty steering expression")

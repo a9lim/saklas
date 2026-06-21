@@ -15,7 +15,7 @@ from saklas.core.generation import (
     generate_steered,
 )
 from saklas.core.results import ProbeReading
-from saklas.core.session import SaklasSession
+from saklas.core.session import CaptureMode, CaptureState, SaklasSession
 
 
 class _StopTokenizer:
@@ -166,6 +166,7 @@ def test_stop_sequence_trimmed_text_is_final_result_text():
     session._tokenizer = tokenizer
     session._monitor = SimpleNamespace(probe_names=[])
     session._capture = SimpleNamespace(stacked=lambda: {})
+    session._capture_state = CaptureState(mode=CaptureMode.FULL)
     session._last_per_token_scores = None
     session._last_result = None
     session.build_readings = lambda: {}
@@ -285,9 +286,7 @@ def test_finalize_reuses_scored_probe_aggregate() -> None:
     session._tokenizer = _StopTokenizer()
     session._monitor = Monitor()
     session._capture = capture
-    session._capture_incremental = False
-    session._capture_aggregate_only = False
-    session._capture_lean = False
+    session._capture_state = CaptureState(mode=CaptureMode.FULL)
     session._last_per_token_scores = None
     session._last_result = None
     session.events = SimpleNamespace(emit=lambda _event: None)
@@ -339,7 +338,7 @@ def test_finalize_incremental_probe_path_does_not_stack_capture() -> None:
     session._tokenizer = _StopTokenizer()
     session._monitor = Monitor()
     session._capture = Capture()
-    session._capture_incremental = True
+    session._capture_state = CaptureState(mode=CaptureMode.INCREMENTAL)
     session._incremental_readings = [
         {"toy": reading0},
         {"toy": reading1},

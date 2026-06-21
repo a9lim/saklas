@@ -10,7 +10,7 @@ non-streaming), plus per-token ``probe_readings`` on the native WS
 the session — the goal is to pin the wire shape, not re-run engine
 integration.
 
-The monitor was unified (``a498895``): one ``session._monitor`` (methods
+The monitor was unified (``a498895``): one ``session.monitor`` (methods
 ``attached_probes()`` / ``probe_names``), one ``session.add_probe`` /
 ``remove_probe``, and one ``ProbeReading`` collapsing the former
 ``ManifoldAggregate`` + ``ManifoldTokenReading`` (so the per-token reading
@@ -114,7 +114,7 @@ def _mock_session():
     session.vectors = {}
     session.probes = {}
     session.history = []
-    session._manifolds = {}
+    session.manifolds = {}
 
     # The unified monitor: one object, both ``probe_names`` (the wire/gate
     # surface) and ``attached_probes()`` (the serializer source).
@@ -122,13 +122,13 @@ def _mock_session():
     monitor.probe_names = []
     monitor.profiles = {}
     monitor.attached_probes.return_value = {}
-    session._monitor = monitor
+    session.monitor = monitor
 
-    session._tokenizer = MagicMock()
-    session._tokenizer.decode.side_effect = lambda ids: f"<{ids[0]}>" if ids else ""
+    session.tokenizer = MagicMock()
+    session.tokenizer.decode.side_effect = lambda ids: f"<{ids[0]}>" if ids else ""
     session._layers = []
-    session._last_per_token_scores = None
-    session._last_result = None
+    session.last_per_token_scores = None
+    session.last_result = None
     session.last_per_token_scores = None
     session.last_result = None
     # The WS token-frame builder consults this first; a real None lets the
@@ -138,7 +138,7 @@ def _mock_session():
 
     gen_state = MagicMock()
     gen_state.finish_reason = "stop"
-    session._gen_state = gen_state
+    session.generation_state = gen_state
 
     session.build_readings.return_value = {}
     session.lock = asyncio.Lock()
@@ -175,8 +175,8 @@ class TestProbeRoutes:
 
         def _add(selector: str, *, as_name: str | None = None, top_n: int = 3) -> str:
             registered = as_name or selector
-            session._monitor.probe_names = [registered]
-            session._monitor.attached_probes.return_value = {
+            session.monitor.probe_names = [registered]
+            session.monitor.attached_probes.return_value = {
                 registered: probe,
             }
             return registered
@@ -213,8 +213,8 @@ class TestProbeRoutes:
 
         def _add(selector: str, *, as_name: str | None = None, top_n: int = 3) -> str:
             registered = as_name or selector
-            session._monitor.probe_names = [registered]
-            session._monitor.attached_probes.return_value = {
+            session.monitor.probe_names = [registered]
+            session.monitor.attached_probes.return_value = {
                 registered: probe,
             }
             return registered
@@ -255,7 +255,7 @@ class TestProbeRoutes:
 
     def test_delete_round_trip(self, session_and_client: Any) -> None:
         session, client = session_and_client
-        session._monitor.probe_names = ["circumplex"]
+        session.monitor.probe_names = ["circumplex"]
 
         resp = client.delete(f"{_PROBES}/circumplex")
         assert resp.status_code == 204
@@ -263,7 +263,7 @@ class TestProbeRoutes:
 
     def test_delete_404_on_unknown_name(self, session_and_client: Any) -> None:
         session, client = session_and_client
-        session._monitor.probe_names = []
+        session.monitor.probe_names = []
         resp = client.delete(f"{_PROBES}/missing")
         assert resp.status_code == 404
         session.remove_probe.assert_not_called()
@@ -274,7 +274,7 @@ class TestProbeRoutes:
         must accept that via ``{name:path}`` or the webui ✕ button 404s.
         """
         session, client = session_and_client
-        session._monitor.probe_names = ["default/personas"]
+        session.monitor.probe_names = ["default/personas"]
 
         # Both raw-slash and percent-encoded forms must reach the
         # handler with the slash intact.  encodeURIComponent in the
@@ -284,7 +284,7 @@ class TestProbeRoutes:
         session.remove_probe.assert_called_once_with("default/personas")
 
         session.remove_probe.reset_mock()
-        session._monitor.probe_names = ["default/personas"]
+        session.monitor.probe_names = ["default/personas"]
         resp = client.delete(f"{_PROBES}/default%2Fpersonas")
         assert resp.status_code == 204
         session.remove_probe.assert_called_once_with("default/personas")
@@ -487,8 +487,8 @@ class TestManifoldCrudRoutes:
 def _attach_aggregate(session: Any, *, name: str = "circumplex") -> None:
     manifold = _mock_manifold(name)
     probe = _mock_probe(name, manifold)
-    session._monitor.probe_names = [name]
-    session._monitor.attached_probes.return_value = {name: probe}
+    session.monitor.probe_names = [name]
+    session.monitor.attached_probes.return_value = {name: probe}
 
 
 def _populate_last_result(session: Any, *, name: str = "circumplex") -> GenerationResult:
@@ -506,7 +506,7 @@ def _populate_last_result(session: Any, *, name: str = "circumplex") -> Generati
         tok_per_sec=5.0, elapsed=0.1,
         probe_readings={name: aggregate},
     )
-    session._last_result = result
+    session.last_result = result
     return result
 
 
@@ -558,7 +558,7 @@ class TestOpenAIProbeExtension:
         session, client = session_and_client
         _attach_aggregate(session)
         result = _populate_last_result(session)
-        session._last_result = result
+        session.last_result = result
 
         token_reading = ProbeReading(
             fraction=0.51,
@@ -660,7 +660,7 @@ class TestOllamaProbeExtension:
         session, client = session_and_client
         _attach_aggregate(session)
         result = _populate_last_result(session)
-        session._last_result = result
+        session.last_result = result
 
         token_reading = ProbeReading(
             fraction=0.33,
@@ -706,7 +706,7 @@ class TestWebSocketProbeReadings:
     and the final ``done`` event still carries the aggregate.  Manifold
     readings have no persisted-loom-row path, so the server scores
     directly off ``session._capture._per_layer`` via
-    ``session._monitor.score_single_token`` inside the WS token-frame
+    ``session.monitor.score_single_token`` inside the WS token-frame
     builder.
 
     Regression for the Phase 3c bug where the webui mini-map cursor
@@ -717,8 +717,8 @@ class TestWebSocketProbeReadings:
     def _attach_probe(self, session: Any, *, name: str = "circumplex") -> Any:
         manifold = _mock_manifold(name)
         probe = _mock_probe(name, manifold)
-        session._monitor.probe_names = [name]
-        session._monitor.attached_probes.return_value = {name: probe}
+        session.monitor.probe_names = [name]
+        session.monitor.attached_probes.return_value = {name: probe}
 
         # Per-token reading the monitor returns each time the WS
         # builder hits the inline-score branch.
@@ -730,7 +730,7 @@ class TestWebSocketProbeReadings:
         def _score(hidden: Any) -> dict[str, Any]:
             return {name: reading}
 
-        session._monitor.score_single_token.side_effect = _score
+        session.monitor.score_single_token.side_effect = _score
         return reading
 
     def _wire_capture(self, session: Any) -> None:
@@ -768,9 +768,9 @@ class TestWebSocketProbeReadings:
                     {"circumplex": aggregate} if aggregate else {}
                 ),
             )
-            session._last_result = result
             session.last_result = result
-            session._last_per_token_scores = None
+            session.last_result = result
+            session.last_per_token_scores = None
             session.last_per_token_scores = None
             return result
 
@@ -858,7 +858,7 @@ class TestWebSocketProbeReadings:
         session, client = session_and_client
         # Probe list stays empty; capture wiring left default so the
         # inline branch never triggers.
-        session._monitor.probe_names = []
+        session.monitor.probe_names = []
         self._attach_generate(session, ["Hi"])
 
         with client.websocket_connect(

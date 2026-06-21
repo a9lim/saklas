@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import math
 import queue
-import shlex
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -18,7 +17,7 @@ from textual.timer import Timer
 from textual import events as _textual_events
 
 from saklas import Recipe, SamplingConfig, Steering
-from saklas.io.selectors import AmbiguousSelectorError, resolve_pole
+from saklas.io.selectors import AmbiguousSelectorError
 from saklas.core.errors import SaklasError
 from saklas.core.generation import supports_thinking, thinking_is_optional
 from saklas.io.paths import saklas_home
@@ -28,7 +27,6 @@ from saklas.core.session import MIN_ELAPSED_FOR_RATE
 from saklas.tui.chat_panel import (
     ACTIVE_AT_DRAIN,
     SURPRISE_PROBE,
-    _KIND_CHAIN_INLINE,
     _KIND_ENDS_ON_USER_NODE,
     ChatInput,
     ChatPanel,
@@ -43,6 +41,9 @@ from saklas.tui.trait_panel import TraitPanel
 
 if TYPE_CHECKING:
     from saklas.core.session import SaklasSession
+    from saklas.tui.extraction_controller import ExtractionController
+    from saklas.tui.input_history_controller import InputHistoryController
+    from saklas.tui.loom_controller import LoomController
 
 DEFAULT_ALPHA = 0.5
 _POLL_FPS = 15
@@ -58,10 +59,13 @@ _BIPOLAR_DELIM = " . "
 _ALPHA_STEP_FINE = 0.01
 _ALPHA_STEP_COARSE = 0.1
 
-# Cap on shell-style input history (↑/↓ in the chat input).  Bounded to
-# keep ``_input_history`` from growing without limit over a long session
-# — same order of magnitude as readline's default ``HISTSIZE``.
-_INPUT_HISTORY_MAX = 200
+# Cap on shell-style input history (↑/↓ in the chat input).  The single
+# source of truth lives on :class:`InputHistoryController` (which owns the
+# ring + cap); re-exported here so ``from saklas.tui.app import
+# _INPUT_HISTORY_MAX`` and the test suite keep resolving it through the App
+# module.  (``input_history_controller`` has no top-level import of this
+# module, so the import is cycle-free.)
+from saklas.tui.input_history_controller import _INPUT_HISTORY_MAX  # noqa: E402,F401
 
 
 def _detect_namespace_selector(text: str) -> str | None:
@@ -210,21 +214,18 @@ class SaklasApp(App[None]):
         # property; the four pop-sites that mutated it in v2.2 now route
         # through :meth:`_rewind_active_assistant` so the tree stays
         # consistent with the visible state.
-        self._device_str = str(session._device)
+        self._device_str = str(session.device)
 
-        # Local steering state — alphas and enabled flags per vector.
-        # Session holds the profiles; the TUI holds the alphas.
-        self._alphas: dict[str, float] = {}
-        self._enabled: dict[str, bool] = {}
-        # Manifold steering terms, keyed by the grammar's manifold key
-        # (``<manifold>%<coords>``).  A ``ManifoldTerm`` is not a
-        # :class:`Profile`, so it can't live in ``_alphas`` (typed
-        # ``dict[str, float]``) — this parallel dict carries the term
-        # values and is merged into the built ``Steering.alphas`` at
-        # generation time (``AlphaEntry`` already admits ``ManifoldTerm``,
-        # so the engine needs no change).  ``_enabled`` is shared — a
-        # manifold key toggles through the same left-panel control.
-        self._manifold_terms: dict[str, Any] = {}
+        # Steering / probe extraction lives on :class:`ExtractionController`;
+        # the TUI-local steering state (``_alphas`` / ``_enabled`` /
+        # ``_manifold_terms``) is owned by it and reached through the proxy
+        # properties below.  The framework-dispatched ``_handle_*`` surface on
+        # this App is a set of one-line forwarders into it.  Built through the
+        # lazy factory (cycle-safe import); the input-history ring + pending
+        # queue similarly live on :class:`InputHistoryController` and are
+        # reached through their proxy properties.
+        self._get_extraction_controller()
+        self._get_input_history_controller()
         # Base (non-chat) model detection — a base model has no chat
         # template, so role headers / thinking blocks make no sense.  When
         # base, the chat panel renders flat continuous text and thinking
@@ -233,13 +234,13 @@ class SaklasApp(App[None]):
         self._is_base_model: bool = session.is_base_model
         self._supports_thinking: bool = (
             False if self._is_base_model
-            else supports_thinking(session._tokenizer)
+            else supports_thinking(session.tokenizer)
         )
         # Forced-thinking families (gpt-oss / Mistral-3 Reasoning /
         # Qwen3-Thinking) have no ``enable_thinking`` template switch,
         # so ``thinking=False`` is a no-op at the prompt layer.  We
         # surface this in the vector panel and the ⌃T handler.
-        self._thinking_optional: bool = thinking_is_optional(session._tokenizer)
+        self._thinking_optional: bool = thinking_is_optional(session.tokenizer)
         # Thinking defaults to off on both surfaces — the explicit
         # binary toggle (``⌃T``) is the user's affirmative opt-in, matching
         # the GUI's ``samplingState.thinking = false`` default.  Previous
@@ -260,25 +261,10 @@ class SaklasApp(App[None]):
         self._poll_timer: Timer | None = None
         self._last_prompt: str | None = None
 
-        # Shell-style input history.  ``_input_history`` is the ring of
-        # submitted lines (slash commands and chat messages alike, because
-        # both flow through ``ChatPanel.UserSubmitted``); ``_history_index``
-        # is the cursor into it (``None`` = at the live "current" slot, no
-        # recall in flight); ``_history_stash`` saves whatever the user was
-        # typing the moment they first pressed ↑ so ↓-past-the-end restores
-        # it.  Capped at ``_INPUT_HISTORY_MAX`` to keep the list bounded
-        # over a long session.
-        self._input_history: list[str] = []
-        self._history_index: int | None = None
-        self._history_stash: str = ""
-        # Pending-queue cursor (separate from ``_history_index`` so the
-        # two rings can interleave at the natural ↑-walks-newest-first
-        # boundary).  ``None`` = no pending slot is pulled; ``int`` =
-        # index into ``_pending_queue`` of the slot currently mirrored
-        # into the input box.  When the user re-submits while pulled
-        # the new item *replaces* slot ``_pulled_slot`` (preserves
-        # order); an empty re-submit *removes* the slot (cancel).
-        self._pulled_slot: int | None = None
+        # (The shell-style input-history ring + pull cursor —
+        # ``_input_history`` / ``_history_index`` / ``_history_stash`` /
+        # ``_pulled_slot`` — live on ``_input_history_ctl``, reached through the
+        # proxy properties below.)
         # ``_ab_mode`` is the persistent two-column-layout toggle (Ctrl+A);
         # ``_ab_shadow_active`` is the transient flag set while a shadow
         # gen worker is streaming — gates panels/highlight/probe-rack
@@ -297,32 +283,17 @@ class SaklasApp(App[None]):
         # we can locate the row to fire its shadow into without a tree
         # walk per gen.
         self._row_for_widget: dict[int, _TurnRow] = {}
-        # Mid-generation submissions queue here rather than tearing the
-        # in-flight stream down.  Drained one item per ``done`` event in
-        # :meth:`_poll_generation` via :meth:`_drain_next_pending`; the
-        # ``PendingStrip`` widget in the chat panel renders the live
-        # list so the user can see what's queued and pull items back
-        # for edit with ``↑``.  Replaces the v2.3 single-slot
-        # ``_pending_action: tuple | None`` — the old behavior was to
-        # call ``session.stop()`` and stash a tuple, which lost
-        # un-emitted tokens; the queue model keeps the current gen
-        # running and serializes the new work behind it.
-        self._pending_queue: list[PendingItem] = []
-        # Phase-4 loom: stashed prune expression + auto-regen mode.  Phase 5
-        # consumes them; phase 4 only carries the strings so users can set
-        # them up before phase 5 evaluator lands.
-        self._loom_prune_expr: str | None = None
-        # str for built-in modes (unsteered/inverted/reseed/cool/hot);
-        # Recipe for the custom-mode path ``/auto-regen custom: <expr>``.
-        # ``_render_auto_regen_mode`` renders either shape for display.
-        self._loom_auto_regen_mode: "str | Recipe" = "unsteered"
-        # Phase 5: auto-regen on/off — when on, every primary
-        # ``_generate_core`` completion fires a sibling regen with the
-        # configured override.  Default-off; ``Ctrl+A`` toggles.  The
-        # existing ``_ab_mode`` flag stays as the visible two-column
-        # layout (per plan decision 13: A/B becomes the default mode of
-        # the more general auto-regen modifier).
-        self._loom_auto_regen_on: bool = False
+        # (The mid-generation pending queue — ``_pending_queue`` — lives on
+        # ``_input_history_ctl``, reached through the proxy property below; it
+        # and the ↑/↓ pull cursor are one coupled state machine, so they're
+        # owned together.)
+        # (The phase-4/5 loom stash — ``_loom_prune_expr`` /
+        # ``_loom_auto_regen_mode`` / ``_loom_auto_regen_on`` — lives on
+        # ``_loom_ctl``, reached through the proxy properties below; the
+        # loom slash/worker *logic* lives there too.  ``_poll_generation``
+        # reads the auto-regen mode each tick and ``_fire_auto_regen``
+        # (generation lifecycle, kept here) reads it to fire the sibling.)
+        self._get_loom_controller()
         # UI-side gen flag.  Tracks the *TUI's* gen lifecycle, which differs
         # slightly from the session's: the TUI counts a gen as "still going"
         # until the ``("done",)`` sentinel lands on the local ``_ui_token_queue``
@@ -361,6 +332,152 @@ class SaklasApp(App[None]):
             for cat, probes_list in defaults.items()
         }
 
+    # -- Controllers -----------------------------------------------------
+    #
+    # The steering/probe extraction state + handlers and the input-history
+    # ring + pending queue live on two plain controllers composed onto this
+    # App.  ``__init__`` wires them; the ``__new__``-bypassing test stubs (and
+    # any caller) get one built on first touch via these factories — the same
+    # lazy pattern ``SaklasSession._get_steering_composer`` uses — so the proxy
+    # properties below resolve before a full ``__init__`` has run.  Imported
+    # lazily to break the import cycle (both controllers reference this module).
+
+    def _get_extraction_controller(self) -> "ExtractionController":
+        ctl = self.__dict__.get("_extraction")
+        if ctl is None:
+            from saklas.tui.extraction_controller import ExtractionController
+            ctl = ExtractionController(self)
+            self._extraction = ctl
+        return ctl
+
+    def _get_input_history_controller(self) -> "InputHistoryController":
+        ctl = self.__dict__.get("_input_history_ctl")
+        if ctl is None:
+            from saklas.tui.input_history_controller import (
+                InputHistoryController,
+            )
+            ctl = InputHistoryController(self)
+            self._input_history_ctl = ctl
+        return ctl
+
+    def _get_loom_controller(self) -> "LoomController":
+        ctl = self.__dict__.get("_loom_ctl")
+        if ctl is None:
+            from saklas.tui.loom_controller import LoomController
+            ctl = LoomController(self)
+            self._loom_ctl = ctl
+        return ctl
+
+    # -- Steering-state proxies (own: ExtractionController) ---------------
+    #
+    # Read/write views into the controller's TUI-local steering state so the
+    # panel actions (``action_remove_vector`` / ``action_toggle_vector`` /
+    # ``_adjust_alpha``), the status line, and the test suite reach the same
+    # dicts the moved ``_handle_*`` handlers mutate.
+
+    @property
+    def _alphas(self) -> dict[str, float]:
+        return self._get_extraction_controller()._alphas
+
+    @_alphas.setter
+    def _alphas(self, value: dict[str, float]) -> None:
+        self._get_extraction_controller()._alphas = value
+
+    @property
+    def _enabled(self) -> dict[str, bool]:
+        return self._get_extraction_controller()._enabled
+
+    @_enabled.setter
+    def _enabled(self, value: dict[str, bool]) -> None:
+        self._get_extraction_controller()._enabled = value
+
+    @property
+    def _manifold_terms(self) -> dict[str, Any]:
+        return self._get_extraction_controller()._manifold_terms
+
+    @_manifold_terms.setter
+    def _manifold_terms(self, value: dict[str, Any]) -> None:
+        self._get_extraction_controller()._manifold_terms = value
+
+    # -- Input-history / pending-queue proxies (own: InputHistoryController)
+    #
+    # Read/write views into the controller's coupled ring state so the
+    # framework handlers (``on_key`` recall, ``action_stop_generation``,
+    # submit/commit), the ``_is_busy`` gate, ``_poll_generation``'s drain, and
+    # the test suite all reach the same five attrs.
+
+    @property
+    def _input_history(self) -> list[str]:
+        return self._get_input_history_controller()._input_history
+
+    @_input_history.setter
+    def _input_history(self, value: list[str]) -> None:
+        self._get_input_history_controller()._input_history = value
+
+    @property
+    def _history_index(self) -> int | None:
+        return self._get_input_history_controller()._history_index
+
+    @_history_index.setter
+    def _history_index(self, value: int | None) -> None:
+        self._get_input_history_controller()._history_index = value
+
+    @property
+    def _history_stash(self) -> str:
+        return self._get_input_history_controller()._history_stash
+
+    @_history_stash.setter
+    def _history_stash(self, value: str) -> None:
+        self._get_input_history_controller()._history_stash = value
+
+    @property
+    def _pulled_slot(self) -> int | None:
+        return self._get_input_history_controller()._pulled_slot
+
+    @_pulled_slot.setter
+    def _pulled_slot(self, value: int | None) -> None:
+        self._get_input_history_controller()._pulled_slot = value
+
+    @property
+    def _pending_queue(self) -> list[PendingItem]:
+        return self._get_input_history_controller()._pending_queue
+
+    @_pending_queue.setter
+    def _pending_queue(self, value: list[PendingItem]) -> None:
+        self._get_input_history_controller()._pending_queue = value
+
+    # -- Loom-state proxies (own: LoomController) -------------------------
+    #
+    # The phase-4/5 loom stash lives on :class:`LoomController`.  These are
+    # read/write views so ``_poll_generation`` (the auto-regen routing + the
+    # status-footer dedupe tuple), ``_fire_auto_regen`` (kept on the App as
+    # generation lifecycle), ``loom_screen.py``, and the test suite all reach
+    # the same three attrs.
+
+    @property
+    def _loom_prune_expr(self) -> str | None:
+        return self._get_loom_controller()._loom_prune_expr
+
+    @_loom_prune_expr.setter
+    def _loom_prune_expr(self, value: str | None) -> None:
+        self._get_loom_controller()._loom_prune_expr = value
+
+    @property
+    def _loom_auto_regen_mode(self) -> "str | Recipe":
+        return self._get_loom_controller()._loom_auto_regen_mode
+
+    @_loom_auto_regen_mode.setter
+    def _loom_auto_regen_mode(self, value: "str | Recipe") -> None:
+        self._get_loom_controller()._loom_auto_regen_mode = value
+
+    @property
+    def _loom_auto_regen_on(self) -> bool:
+        return self._get_loom_controller()._loom_auto_regen_on
+
+    @_loom_auto_regen_on.setter
+    def _loom_auto_regen_on(self, value: bool) -> None:
+        self._get_loom_controller()._loom_auto_regen_on = value
+
     @property
     def _messages(self) -> list[dict[str, str]]:
         """Compat shim — derived view over the loom tree's active path.
@@ -394,66 +511,17 @@ class SaklasApp(App[None]):
         return True
 
     def _active_alphas(self) -> dict[str, Any]:
-        """Build the alphas dict for generation from enabled entries.
-
-        Merges plain scalar vectors (``_alphas``) with manifold terms
-        (``_manifold_terms``); both share the ``_enabled`` flag map so a
-        manifold row toggles through the same left-panel control.  The
-        returned dict's values are ``float`` for vectors and
-        :class:`~saklas.core.steering_expr.ManifoldTerm` for manifolds —
-        ``Steering.alphas``'s ``AlphaEntry`` union admits both.
-        """
-        out: dict[str, Any] = {
-            name: alpha for name, alpha in self._alphas.items()
-            if self._enabled.get(name, True)
-        }
-        for key, term in self._manifold_terms.items():
-            if self._enabled.get(key, True):
-                out[key] = term
-        return out
+        """Enabled steering entries for generation — derived off the
+        controller's ``_alphas`` / ``_manifold_terms`` / ``_enabled``."""
+        return self._get_extraction_controller()._active_alphas()
 
     def _vector_list_for_panel(self) -> list[dict[str, Any]]:
-        """Build the list[dict] format the left panel expects.
-
-        Each entry carries a ``kind`` discriminator: ``"vector"`` rows
-        carry an alpha bar; ``"manifold"`` rows carry a fixed position
-        and a blend coefficient instead (no scalar alpha to nudge).
-        """
-        result = []
-        for name, alpha in self._alphas.items():
-            profile = self._session._profiles.get(name)
-            if profile is None:
-                continue
-            # Bind ``profile`` to a default-arg so pyright keeps the
-            # narrowed-non-None type across the lambda capture (it
-            # otherwise widens to include None inside the closure).
-            result.append({
-                "kind": "vector",
-                "name": name,
-                "profile": profile,
-                "alpha": alpha,
-                "enabled": self._enabled.get(name, True),
-                "peak": max(
-                    profile,
-                    key=lambda k, p=profile: float(p[k].norm().item()),
-                ),
-                "n_active": len(profile),
-            })
-        for key, term in self._manifold_terms.items():
-            coords_str = ",".join(f"{c:g}" for c in term.position)
-            result.append({
-                "kind": "manifold",
-                "name": key,
-                "manifold": term.manifold,
-                "coords": coords_str,
-                "blend": term.coeff,
-                "enabled": self._enabled.get(key, True),
-            })
-        return result
+        """Left-panel row list — derived off the controller's steering state."""
+        return self._get_extraction_controller()._vector_list_for_panel()
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="main-area"):
-            yield LeftPanel(self._session._model_info, id="left-panel")
+            yield LeftPanel(self._session.model_metadata, id="left-panel")
             yield ChatPanel(id="chat-panel")
             yield TraitPanel(categories=self._probe_categories, id="trait-panel")
 
@@ -487,7 +555,7 @@ class SaklasApp(App[None]):
 
         loaded = (
             f"Model loaded: "
-            f"{self._session._model_info.get('model_id', 'unknown')}. "
+            f"{self._session.model_metadata.get('model_id', 'unknown')}. "
         )
         if self._is_base_model:
             loaded += (
@@ -882,732 +950,66 @@ class SaklasApp(App[None]):
             return concept, baseline, alpha
         return concept, baseline
 
-    @staticmethod
-    def _peel_role_flag(text: str) -> tuple[str, str | None]:
-        """Peel a trailing ``--role <slug>`` off a slash-command argument
-        string.  Returns ``(rest, role)`` — ``role`` is ``None`` when the
-        flag is absent.
-
-        Accepted forms:
-            ``... --role pirate``
-            ``... --role=pirate``
-
-        Anywhere on the line is fine; first match wins, the flag and
-        its value are excised, the rest is re-joined with a single
-        space.  Slug validation is left to ``core.role_templates`` —
-        we just route the raw string.  Multi-word slugs are not
-        supported (the engine slug regex is ``[a-z0-9._-]+``).
-        """
-        import re
-
-        m = re.search(r"\s*--role(?:=|\s+)(\S+)", text)
-        if m is None:
-            return text, None
-        head = text[: m.start()].rstrip()
-        tail = text[m.end():].lstrip()
-        rest = (head + (" " + tail if tail else "")).strip()
-        return rest, m.group(1)
+    # -- Extraction / steering / probe handlers (own: ExtractionController) --
+    #
+    # The steering/probe slash-command *logic* lives on
+    # :class:`ExtractionController`; the ``_handle_*`` names stay on the App
+    # because the slash-command registry (``commands.py``) binds them by
+    # attribute, so each is a one-line forwarder into the controller.  The
+    # controller reaches the session + widgets + App orchestration helpers
+    # (``_run_worker_with_queue`` / ``_steer_status`` / ``_parse_args`` /
+    # ``_on_vector_extracted`` / …) back through its ``self._app`` ref.
 
     def _handle_extract(self, text: str, include_alpha: bool,
                         on_success: "Callable[..., Any]",
                         pending_type: str | None = None,
                         variant: str = "raw",
                         namespace: str | None = None) -> None:
-        chat = self._chat_panel
-        if self._ab_shadow_active:
-            chat.add_system_message("Cannot modify vectors during A/B shadow gen.")
-            return
-        if pending_type is None:
-            pending_type = "steer" if include_alpha else "probe"
-        if self._is_busy:
-            # Reconstruct the canonical slash-command form so pulling
-            # the item back via ↑ surfaces something the user can
-            # re-Enter as a slash command.  ``payload[0]`` carries the
-            # raw args the dispatcher hands to the handler.
-            display_text = f"/{pending_type} {text}".rstrip()
-            self._enqueue_pending(
-                PendingItem(pending_type, display_text, (text,))
-            )
-            return
-        # Peel ``--role <slug>`` off the args before the bipolar parser
-        # runs, so a multi-word pole (``a dog . a pair of cats``) doesn't
-        # have to compete with the trailing flag for tokens.
-        text, role = self._peel_role_flag(text)
-        try:
-            if include_alpha:
-                concept, baseline, alpha = self._parse_args(text, include_alpha=True)
-            else:
-                concept, baseline = self._parse_args(text)
-                alpha = None
-        except (ValueError, IndexError) as e:
-            chat.add_system_message(
-                f"Parse error: {e}\n"
-                f"Usage: /{pending_type} <pos> . <neg>"
-                + (" [alpha]" if include_alpha else "")
-                + " [--role <slug>]"
-            )
-            return
-
-        # Alias resolution: a bare pole name may refer to an installed
-        # bipolar pack (e.g. `/steer wolf` when `deer.wolf` exists).
-        # Sign flip is applied to the user's alpha so `/steer calm 0.5`
-        # on top of `angry.calm` lands as `alphas["angry.calm"] = -0.5`.
-        # ``resolve_pole`` also peels any ``:variant`` suffix typed
-        # directly on the concept (``honest:sae-gemma-scope...``) — that
-        # explicit form wins over the ``variant`` kwarg when both are set.
-        # Explicit bipolar form (`concept - baseline`) skips resolution
-        # so the user's declared poles always win.
-        # ``namespace`` (when set) scopes the resolution so ``alice/foo``
-        # and ``bob/foo`` stay distinct.
-        sign = 1
-        if baseline is None:
-            try:
-                resolved_name, sign, _match, explicit_variant = resolve_pole(
-                    concept, namespace=namespace,
-                )
-                if resolved_name != concept:
-                    chat.add_system_message(
-                        f"  Resolved '{concept}' → '{resolved_name}'"
-                        + (" (negated)" if sign < 0 else "")
-                    )
-                concept = resolved_name
-                # Explicit ``:sae-<release>`` on the concept overrides the
-                # ``--sae`` preamble's variant. Lets users route a specific
-                # release without the fuzzy release-detection heuristic.
-                if explicit_variant != "raw":
-                    variant = explicit_variant
-            except AmbiguousSelectorError as e:
-                chat.add_system_message(f"Error: {e.user_message()[1]}")
-                return
-            if alpha is not None:
-                alpha *= sign
-
-        # Variant routing. ``--sae`` alone (variant == "sae") means "pick the
-        # unique already-extracted SAE tensor for this concept on disk" —
-        # session autoload handles it. To drive a fresh extraction, users
-        # pass the explicit ``:sae-<release>`` suffix, which routes the
-        # release through ``session.extract(sae=RELEASE)``.  Same shape
-        # for role-augmented extraction via the ``:role-<slug>`` variant
-        # — the variant tail wins over an explicit ``--role`` flag (the
-        # variant rode through ``resolve_pole``'s ``explicit_variant``
-        # arm and is the canonical form).
-        sae_release: str | None = None
-        if variant.startswith("sae-"):
-            sae_release = variant[len("sae-"):]
-        if variant.startswith("role-"):
-            role = variant[len("role-"):]
-
-        display = concept if len(concept) <= 20 else concept[:17] + "..."
-        suffix = f" vs '{baseline}'" if baseline else ""
-        variant_note = f" [{variant}]" if variant != "raw" else ""
-        role_note = f" as :role-{role}" if role else ""
-        chat.add_system_message(
-            f"Extracting '{display}'{suffix}{variant_note}{role_note}..."
+        self._get_extraction_controller()._handle_extract(
+            text, include_alpha, on_success,
+            pending_type=pending_type, variant=variant, namespace=namespace,
         )
-
-        def _work() -> None:
-            def _progress(msg: str) -> None:
-                self.call_from_thread(self._steer_status, msg)
-            # Bare ``--sae`` (variant == "sae") routes the load through
-            # the unified profile resolver (manifold-fold) rather than a
-            # fresh extract — it means "use the SAE variant that's already
-            # on disk". Ambiguous / missing cases surface via the session
-            # errors / the None-check below.
-            if variant == "sae" and sae_release is None:
-                from contextlib import suppress as _suppress
-                autoload_key = (
-                    concept if namespace is None
-                    else f"{namespace}/{concept}"
-                )
-                key = f"{autoload_key}:sae"
-                with _suppress(Exception):
-                    self._session._ensure_profile_registered(key)
-                profile_dict = self._session._profiles.get(key)
-                if profile_dict is None:
-                    raise ValueError(
-                        f"no SAE variant loaded for '{autoload_key}' — "
-                        f"run `saklas subspace extract {autoload_key} --sae <RELEASE>` "
-                        f"first, or pick a release with "
-                        f"`:sae-<release>` in the concept name."
-                    )
-                on_success(key, profile_dict, alpha)
-                return
-
-            extract_kwargs = {"baseline": baseline, "on_progress": _progress}
-            if sae_release is not None:
-                extract_kwargs["sae"] = sae_release
-            if namespace is not None:
-                extract_kwargs["namespace"] = namespace
-            if role is not None:
-                extract_kwargs["role"] = role
-            # ``session.extract`` already returns the fully-qualified
-            # canonical name — including the ``:sae-<release>`` suffix
-            # when ``sae=`` was passed. Rebuilding it here would
-            # double-suffix the key and break every downstream
-            # ``/alpha`` / ``/unsteer`` / pole lookup.
-            canonical, profile = self._session.extract(concept, **extract_kwargs)
-            if namespace is not None:
-                # Re-attach the namespace so the registered key matches
-                # what the parser produced (so ``/alpha`` / ``/unsteer``
-                # against the namespace-qualified form keep working).
-                if ":" in canonical:
-                    bare, suffix = canonical.rsplit(":", 1)
-                    canonical = f"{namespace}/{bare}:{suffix}"
-                else:
-                    canonical = f"{namespace}/{canonical}"
-            on_success(canonical, profile, alpha)
-
-        self._run_worker_with_queue(_work)
 
     def _handle_steer(self, text: str) -> None:
-        """Apply a steering expression — the shared grammar from
-        :mod:`saklas.core.steering_expr`.
-
-        Each plain term (``<coeff> <concept>`` with optional ``@trigger``
-        and ``:variant``) updates the TUI's local alpha state. Concepts
-        not yet registered are extracted + steered behind the scenes.
-        Extraction-on-demand for a *new* bipolar pair (``pos . neg``
-        space-delimited) lives on ``/extract``, not ``/steer``; projection
-        terms are accepted and routed through session-level materialization.
-        """
-        from saklas.core.steering_expr import (
-            AblationTerm, ManifoldTerm, ProjectedTerm, SteeringExprError,
-            parse_expr,
-        )
-
-        chat = self._chat_panel
-        text = text.strip()
-        if not text:
-            chat.add_system_message(
-                'Usage: /steer <expression>\n'
-                '  e.g. /steer 0.5 honest\n'
-                '       /steer 0.3 warm@after\n'
-                '       /steer 0.5 honest|sycophantic\n'
-                '       /steer alice/                (bulk; default-off)\n'
-                "  For new concept extraction use /extract <pos> <neg>."
-            )
-            return
-        ns = _detect_namespace_selector(text)
-        if ns is not None:
-            self._handle_steer_namespace(ns)
-            return
-        try:
-            steering = parse_expr(text)
-        except SteeringExprError as e:
-            chat.add_system_message(f"Steering expression error: {e.user_message()[1]}")
-            return
-        except SaklasError as e:
-            # ``parse_expr`` calls ``resolve_pole`` per term, which raises
-            # ``AmbiguousSelectorError`` (a ``SelectorError(ValueError,
-            # SaklasError)``) on cross-namespace bare-pole collisions —
-            # not caught by the ``SteeringExprError`` arm above. Same for
-            # ``AmbiguousVariantError`` from ``:sae`` resolution. Surface
-            # cleanly instead of crashing the Textual worker.
-            chat.add_system_message(f"Error: {e.user_message()[1]}")
-            return
-
-        # Iterate the parsed IR; for each term dispatch through the
-        # existing extract pipeline to load or compute profiles, then
-        # stash the effective alpha on the TUI's local state.
-        for key, val in steering.alphas.items():
-            if isinstance(val, ProjectedTerm):
-                chat.add_system_message(
-                    f"Projection terms aren't yet supported from /steer "
-                    f"(got '{key}'); express them in the YAML config."
-                )
-                return
-            if isinstance(val, AblationTerm):
-                # Ablation terms (``!x``) are dispatched through a
-                # separate hook path than additive steering; the TUI's
-                # `/steer` surface only wires the additive side.  Reject
-                # cleanly with the same pattern as `ProjectedTerm` above
-                # rather than crash on ``float(AblationTerm)`` below.
-                chat.add_system_message(
-                    f"Ablation terms (!{key.lstrip('!')}) aren't supported "
-                    f"from /steer; express them in the YAML config."
-                )
-                return
-            if isinstance(val, ManifoldTerm):
-                # Manifold steering (``manifold%coords``) routes through a
-                # separate hook path — not bound to the per-vector alpha
-                # sliders.  Dispatch through a worker that eager-loads and
-                # validates the artifact, then stash it on
-                # ``_manifold_terms`` (a ``ManifoldTerm`` is not a
-                # ``Profile``, so it can't live in the scalar ``_alphas``).
-                # ``continue`` rather than ``return`` so a mixed
-                # expression still applies its vector siblings.
-                self._dispatch_manifold_term(key, val)
-                continue
-            if isinstance(val, tuple):
-                alpha, _trig = val
-            else:
-                alpha = float(val)
-            alpha = max(-MAX_ALPHA, min(MAX_ALPHA, float(alpha)))
-            # Peel variant suffix so the extract path sees a bare concept.
-            if ":" in key:
-                concept, variant = key.rsplit(":", 1)
-            else:
-                concept, variant = key, "raw"
-            # Peel namespace prefix so ``_handle_extract`` -> ``resolve_pole``
-            # scopes to the user's typed namespace instead of slugging
-            # ``ns/name`` into a single token.  ``_handle_extract`` will
-            # use ``namespace`` as the kwarg into ``session.extract`` so
-            # disk discovery stays scoped too.
-            namespace: str | None = None
-            if "/" in concept:
-                namespace, concept = concept.split("/", 1)
-            self._dispatch_steer_term(
-                concept, variant, alpha, namespace=namespace,
-            )
-
-    def _dispatch_steer_term(
-        self, concept: str, variant: str, alpha: float,
-        *, namespace: str | None = None,
-    ) -> None:
-        """Route one plain steering term through the extract pipeline.
-
-        The concept has already been canonicalized and sign-flipped by
-        ``parse_expr``; ``_handle_extract`` will re-run ``resolve_pole``
-        on the canonical form which is idempotent (returns sign +1).
-        ``namespace`` (when set) scopes that re-resolution and the
-        downstream ``session.extract`` call so ``alice/foo`` and
-        ``bob/foo`` stay distinct end-to-end.
-        """
-        def _on_success(name: str, profile: Any, a: float) -> None:
-            self._session.steer(name, profile)
-            self._alphas[name] = a
-            self._enabled[name] = True
-            self.call_from_thread(self._on_vector_extracted, name, a, profile)
-        # _handle_extract's own parser expects a "<concept> <alpha>" text;
-        # embed the variant in the concept token so resolve_pole strips it.
-        concept_with_variant = (
-            concept if variant == "raw" else f"{concept}:{variant}"
-        )
-        text = f"{concept_with_variant} {alpha}"
-        self._handle_extract(
-            text, include_alpha=True, on_success=_on_success,
-            variant=variant, namespace=namespace,
-        )
-
-    def _dispatch_manifold_term(self, key: str, term: Any) -> None:
-        """Route one manifold term through eager artifact validation.
-
-        ``key`` is the grammar's manifold registry key
-        (``<manifold>%<coords>``); ``term`` is the parsed
-        :class:`~saklas.core.steering_expr.ManifoldTerm`.  A worker
-        eager-loads the artifact via ``session._ensure_manifold_loaded``
-        — which raises :class:`ManifoldNotRegisteredError` when the named
-        manifold has no fitted tensor for the loaded model — and then
-        validates the position-tuple arity against the loaded manifold's
-        domain.  On success the term lands in ``_manifold_terms`` and the
-        left panel refreshes; any failure surfaces as a system message.
-        """
-        chat = self._chat_panel
-        if self._ab_shadow_active:
-            chat.add_system_message(
-                "Cannot modify steering during A/B shadow gen."
-            )
-            return
-        # Position can be a node-label string (``persona%pirate``) or a
-        # coord tuple (``persona%0.3,0.8``); display each in its
-        # natural form.  Arity is only meaningful in coord form — the
-        # label form resolves to whatever coords the node carries.
-        if isinstance(term.position, str):
-            pos_str = term.position
-        else:
-            pos_str = ",".join(f"{c:g}" for c in term.position)
-        chat.add_system_message(
-            f"Loading manifold '{term.manifold}' % {pos_str}..."
-        )
-
-        def _worker() -> None:
-            try:
-                self._session._ensure_manifold_loaded(term.manifold)
-                manifold = self._session._manifolds[term.manifold]
-                # ``resolve_position`` validates label-form (raises
-                # UnknownManifoldLabelError on miss) and passes through
-                # coord-form unchanged.  A test-double manifold without
-                # ``resolve_position`` falls back to ``term.position``
-                # directly — fine for coord form, raises here for
-                # label form (the real engine path catches it).
-                resolve = getattr(manifold, "resolve_position", None)
-                if resolve is not None:
-                    resolved = resolve(term.position)
-                elif isinstance(term.position, str):
-                    raise ValueError(
-                        f"manifold '{term.manifold}' cannot resolve "
-                        f"label {term.position!r} — manifold lacks "
-                        f"resolve_position()"
-                    )
-                else:
-                    resolved = term.position
-                want = manifold.domain.intrinsic_dim
-                got = len(resolved)
-                if got != want:
-                    raise ValueError(
-                        f"manifold '{term.manifold}' is {want}-dimensional "
-                        f"but the position has {got} coordinate(s)"
-                    )
-            except SaklasError as e:
-                self.call_from_thread(
-                    self._steer_status, e.user_message()[1],
-                )
-                return
-            except ValueError as e:
-                self.call_from_thread(self._steer_status, str(e))
-                return
-            except Exception as e:
-                self.call_from_thread(
-                    self._steer_status, f"{type(e).__name__}: {e}",
-                )
-                return
-            else:
-                self.call_from_thread(self._on_manifold_added, key, term)
-            finally:
-                # Advance the queue drain — manifold loading runs on a
-                # worker, not the gen loop, so no natural ``done`` lands.
-                self._ui_token_queue.put(("done", False))
-
-        self.run_worker(_worker, thread=True)
-
-    def _on_manifold_added(self, key: str, term: Any) -> None:
-        """Register a validated manifold term and refresh the left panel."""
-        self._manifold_terms[key] = term
-        self._enabled[key] = True
-        coords_str = ",".join(f"{c:g}" for c in term.position)
-        self._chat_panel.add_system_message(
-            f"Manifold '{term.manifold}' % {coords_str} active "
-            f"(blend {term.coeff:.2f})"
-        )
-        self._refresh_left_panel()
+        self._get_extraction_controller()._handle_steer(text)
 
     def _handle_probe(self, text: str) -> None:
-        ns = _detect_namespace_selector(text.strip())
-        if ns is not None:
-            self._handle_probe_namespace(ns)
-            return
-
-        def _on_success(name: str, _profile: Any, _alpha: Any) -> None:
-            # ``_handle_extract`` already registered the folded direction in
-            # ``session._profiles[name]``; ``add_probe`` resolves it from
-            # there (folding the 2-node concept to a rank-1 probe) and
-            # attaches it to the unified monitor.
-            self._session.add_probe(name)
-            self.call_from_thread(self._on_probe_added, name)
-        self._handle_extract(text, include_alpha=False, on_success=_on_success)
+        self._get_extraction_controller()._handle_probe(text)
 
     def _handle_extract_only(self, text: str) -> None:
-        def _on_success(name: str, _profile: Any, _alpha: Any) -> None:
-            # Pure cache-warm: no steering, no probe, no panel state.
-            self.call_from_thread(
-                self._steer_status, f"extracted '{name}'"
-            )
-        self._handle_extract(
-            text, include_alpha=False, on_success=_on_success,
-            pending_type="extract",
-        )
+        self._get_extraction_controller()._handle_extract_only(text)
 
     def _handle_manifold(self, text: str) -> None:
-        """`/manifold fit <folder>` — fit a steering manifold.
-
-        Manifold *authoring* (writing ``manifold.json`` + ``nodes/*.json``)
-        stays out of the TUI; this command only fits an already-authored
-        manifold pack folder for the loaded model.  Gated like
-        ``/extract`` — refused during an A/B shadow gen, deferred behind
-        an in-flight generation via the pending queue.
-        """
-        chat = self._chat_panel
-        text = (text or "").strip()
-        parts = text.split(maxsplit=1)
-        verb = parts[0].lower() if parts else ""
-        if verb != "fit":
-            chat.add_system_message("Usage: /manifold fit <folder>")
-            return
-        folder_arg = parts[1].strip() if len(parts) > 1 else ""
-        folder_arg = _unquote(folder_arg)
-        if not folder_arg:
-            chat.add_system_message("Usage: /manifold fit <folder>")
-            return
-        if self._ab_shadow_active:
-            chat.add_system_message(
-                "Cannot fit a manifold during A/B shadow gen."
-            )
-            return
-        if self._is_busy:
-            self._enqueue_pending(
-                PendingItem(
-                    "manifold_fit", f"/manifold fit {folder_arg}",
-                    (folder_arg,),
-                )
-            )
-            return
-        self._start_manifold_fit(folder_arg)
-
-    def _start_manifold_fit(self, folder_arg: str) -> None:
-        """Run ``session.fit`` on a worker thread.
-
-        Mirrors ``_handle_extract``'s worker structure: progress lines
-        stream to the chat pane, errors surface as system messages, and
-        the ``finally`` block enqueues a ``done`` sentinel so the pending
-        queue keeps draining (manifold fitting runs off the gen loop).
-        """
-        from pathlib import Path
-
-        folder = Path(folder_arg).expanduser()
-        chat = self._chat_panel
-        if not (folder / "manifold.json").exists():
-            chat.add_system_message(
-                f"/manifold fit: no manifold.json in {folder}"
-            )
-            self._ui_token_queue.put(("done", False))
-            return
-        chat.add_system_message(f"Fitting manifold from {folder}...")
-
-        def _work() -> None:
-            def _progress(msg: str) -> None:
-                self.call_from_thread(self._steer_status, msg)
-            # ``fit_rbf_interpolant`` raises a bare ``ValueError`` on
-            # poisedness failure — not a ``SaklasError``; the shared
-            # worker wrapper surfaces it as a plain string.
-            manifold = self._session.fit(
-                folder, on_progress=_progress,
-            )
-            self.call_from_thread(
-                self._steer_status,
-                f"fitted manifold '{manifold.name}' "
-                f"({len(manifold.layers)}L, "
-                f"{len(manifold.node_labels)} nodes) — "
-                f"steer it with `/steer <coeff> {manifold.name}%<coords>`",
-            )
-
-        self._run_worker_with_queue(_work)
+        self._get_extraction_controller()._handle_manifold(text)
 
     def _handle_manifold_probe(self, text: str) -> None:
-        """``/manifold-probe <selector>`` — attach a curved manifold probe.
-
-        Routes through the unified ``session.add_probe`` — the selector can
-        be a bundled name (``emotions``, ``personas``), an ``ns/name`` form, or an
-        already-loaded manifold's registered name; the session's lazy-load
-        path (``_ensure_manifold_loaded``) handles resolution.  This is the
-        curved-probe front-end (the TUI mirror of the webui's "+ manifold
-        probe" launcher); ``/probe`` is the flat/concept front-end.  Both
-        land in the one monitor.  Refused
-        during A/B shadow gen for the same reason ``/probe`` is —
-        modifying the monitor set mid-shadow would interleave readings
-        across the steered/unsteered split.  Deferred behind an
-        in-flight gen via the pending queue (kind ``manifold_probe``).
-        """
-        chat = self._chat_panel
-        selector = (text or "").strip()
-        selector = _unquote(selector)
-        if not selector:
-            chat.add_system_message("Usage: /manifold-probe <selector>")
-            return
-        if self._ab_shadow_active:
-            chat.add_system_message(
-                "Cannot attach a manifold probe during A/B shadow gen."
-            )
-            return
-        if self._is_busy:
-            self._enqueue_pending(
-                PendingItem(
-                    "manifold_probe", f"/manifold-probe {selector}",
-                    (selector,),
-                )
-            )
-            return
-        self._start_manifold_probe_attach(selector)
-
-    def _start_manifold_probe_attach(self, selector: str) -> None:
-        """Run ``session.add_probe`` on a worker thread.
-
-        Mirrors ``_start_manifold_fit``'s worker structure — errors
-        surface as system messages and a ``done`` sentinel re-enters
-        the queue drain so a queued attach doesn't stall subsequent
-        items.
-        """
-        chat = self._chat_panel
-        chat.add_system_message(f"Attaching manifold probe '{selector}'...")
-
-        def _worker() -> None:
-            try:
-                name = self._session.add_probe(selector)
-            except SaklasError as e:
-                self.call_from_thread(self._steer_status, e.user_message()[1])
-                return
-            except Exception as e:
-                self.call_from_thread(
-                    self._steer_status, f"{type(e).__name__}: {e}",
-                )
-                return
-            finally:
-                self._ui_token_queue.put(("done", False))
-            self.call_from_thread(self._on_manifold_probe_added, name)
-
-        self.run_worker(_worker, thread=True)
-
-    def _on_manifold_probe_added(self, name: str) -> None:
-        """Mirror probe wiring — refresh the trait panel + announce."""
-        self._refresh_probe_panels()
-        self._refresh_trait_why()
-        self._chat_panel.add_system_message(
-            f"Manifold probe '{name}' active."
-        )
+        self._get_extraction_controller()._handle_manifold_probe(text)
 
     def _handle_manifold_probe_remove(self, text: str) -> None:
-        """``/manifold-probe-remove <name>`` — detach an attached probe.
-
-        After the monitor unification there is one probe set, so this and
-        ``/unprobe`` are interchangeable; the command is kept for muscle
-        memory and detaches any probe shape via ``session.remove_probe``.
-        """
-        chat = self._chat_panel
-        name = (text or "").strip()
-        name = _unquote(name)
-        if not name:
-            chat.add_system_message("Usage: /manifold-probe-remove <name>")
-            return
-        monitor = self._session._monitor
-        if monitor is None or name not in monitor.probe_names:
-            chat.add_system_message(f"Manifold probe '{name}' not active.")
-            return
-        try:
-            self._session.remove_probe(name)
-        except SaklasError as e:
-            chat.add_system_message(e.user_message()[1])
-            return
-        except Exception as e:
-            chat.add_system_message(f"{type(e).__name__}: {e}")
-            return
-        self._refresh_probe_panels()
-        self._refresh_trait_why()
-        chat.add_system_message(f"Manifold probe '{name}' removed.")
-
-    def _refresh_probe_panels(self) -> None:
-        """Split the unified monitor's probe set across the trait panel.
-
-        After the monitor unification there is one probe set; the panel
-        renders it in two sections by geometry — flat (affine) probes drive
-        the scalar MONITOR PROBES section (axis-0 bar + sparkline + WHY),
-        curved probes the MANIFOLD PROBES section (fraction bar + nearest
-        labels + mini-map).  This mirrors the webui's subspace/manifold rack
-        split.  Curved probes carry their :class:`Manifold` artifact so the
-        panel can introspect the domain for the 2-D mini-map at render time.
-        """
-        monitor = self._session._monitor
-        if monitor is None:
-            self._trait_panel.set_active_probes(set())
-            self._trait_panel.set_active_manifold_probes({})
-            return
-        from saklas.core.session import _manifold_is_affine
-        flat: set[str] = set()
-        curved: dict[str, Any] = {}
-        for name in monitor.probe_names:
-            manifold = monitor.manifolds.get(name)
-            if manifold is not None and not _manifold_is_affine(manifold):
-                curved[name] = manifold
-            else:
-                flat.add(name)
-        self._trait_panel.set_active_probes(flat)
-        self._trait_panel.set_active_manifold_probes(curved)
+        self._get_extraction_controller()._handle_manifold_probe_remove(text)
 
     def _handle_pairs(self, text: str) -> None:
-        """`/pairs <name>` — open the custom-statement extraction modal.
+        self._get_extraction_controller()._handle_pairs(text)
 
-        Opens :class:`~saklas.tui.pairs_modal.CustomPairsModal`, a
-        multi-line editor for hand-authored ``positive | negative``
-        contrastive pairs.  On submit the lines are parsed into a pairs
-        list and handed straight to ``session.extract`` — bypassing
-        scenario / pair generation.
+    def _start_manifold_fit(self, folder_arg: str) -> None:
+        # Drained from the pending queue by ``_dispatch_pending_action`` for a
+        # ``manifold_fit`` item (the deferred ``/manifold fit`` path).
+        self._get_extraction_controller()._start_manifold_fit(folder_arg)
 
-        A modal cannot be a :class:`PendingItem`, so ``/pairs`` is
-        refused mid-generation rather than queued (matching how other
-        modal-requiring commands behave).
-        """
-        chat = self._chat_panel
-        raw_args = (text or "").strip()
-        raw_args, role = self._peel_role_flag(raw_args)
-        name = _unquote(raw_args)
-        if not name:
-            chat.add_system_message("Usage: /pairs <name> [--role <slug>]")
-            return
-        if self._ab_shadow_active:
-            chat.add_system_message(
-                "Cannot extract a vector during A/B shadow gen."
-            )
-            return
-        if self._is_busy:
-            chat.add_system_message(
-                "/pairs opens a modal — finish or stop the current "
-                "generation first."
-            )
-            return
-
-        from saklas.tui.pairs_modal import CustomPairsModal
-
-        def _on_submit(pairs: list[tuple[str, str]] | None) -> None:
-            if not pairs:
-                return  # modal cancelled
-            self._start_pairs_extract(name, pairs, role=role)
-
-        self.push_screen(CustomPairsModal(name), _on_submit)
+    def _start_manifold_probe_attach(self, selector: str) -> None:
+        # Drained from the pending queue by ``_dispatch_pending_action`` for a
+        # ``manifold_probe`` item (the deferred ``/manifold-probe`` path).
+        self._get_extraction_controller()._start_manifold_probe_attach(selector)
 
     def _start_pairs_extract(
         self, name: str, pairs: list[tuple[str, str]],
         *, role: str | None = None,
     ) -> None:
-        """Extract a steering vector from hand-authored contrastive pairs.
-
-        ``session.extract`` accepts a list of ``(positive, negative)``
-        tuples directly as ``source``, skipping scenario / pair
-        generation.  The extracted vector is steered at
-        :data:`DEFAULT_ALPHA` and registered on the left panel, mirroring
-        ``/steer``'s post-extraction wiring.
-        """
-        chat = self._chat_panel
-        role_note = f" as :role-{role}" if role else ""
-        chat.add_system_message(
-            f"Extracting '{name}'{role_note} from {len(pairs)} custom pair(s)..."
+        # The ``/pairs`` modal-submit callback fires this on the App; the
+        # extraction worker lives on the controller.
+        self._get_extraction_controller()._start_pairs_extract(
+            name, pairs, role=role,
         )
-
-        def _on_success(canonical: str, profile: Any, alpha: float) -> None:
-            self._session.steer(canonical, profile)
-            self._alphas[canonical] = alpha
-            self._enabled[canonical] = True
-            self.call_from_thread(
-                self._on_vector_extracted, canonical, alpha, profile,
-            )
-
-        def _worker() -> None:
-            def _progress(msg: str) -> None:
-                self.call_from_thread(self._steer_status, msg)
-            try:
-                # Hand-authored contrastive examples become the two pole
-                # corpora of a 2-node ``pca`` manifold — positive pole vs its
-                # opposite — fit directly (no scenario / pair generation).
-                positive = [pos for pos, _ in pairs]
-                negative = [neg for _, neg in pairs]
-                extract_kwargs: dict[str, Any] = {
-                    "on_progress": _progress, "namespace": "local",
-                }
-                if role is not None:
-                    extract_kwargs["role"] = role
-                canonical, profile = self._session.extract_vector_from_corpora(
-                    name, positive, negative, **extract_kwargs,
-                )
-                _on_success(canonical, profile, DEFAULT_ALPHA)
-            except SaklasError as e:
-                self.call_from_thread(self._steer_status, e.user_message()[1])
-            except (ValueError, TypeError) as e:
-                self.call_from_thread(self._steer_status, str(e))
-            except Exception as e:
-                self.call_from_thread(
-                    self._steer_status, f"{type(e).__name__}: {e}",
-                )
-            finally:
-                self._ui_token_queue.put(("done", False))
-
-        self.run_worker(_worker, thread=True)
 
     def _run_worker_with_queue(
         self,
@@ -1656,7 +1058,7 @@ class SaklasApp(App[None]):
         self._chat_panel.add_system_message(msg)
 
     def _on_probe_added(self, name: str) -> None:
-        self._trait_panel.set_active_probes(set(self._session._monitor.probe_names))
+        self._trait_panel.set_active_probes(set(self._session.monitor.probe_names))
         # Per-token highlight default-on when a probe is explicitly added
         # via /probe. Seed to this probe; Ctrl+Y cycles the mode.
         self._highlight_probe = name
@@ -1667,6 +1069,61 @@ class SaklasApp(App[None]):
 
     def _refresh_left_panel(self) -> None:
         self._left_panel.update_vectors(self._vector_list_for_panel())
+
+    def _on_manifold_added(self, key: str, term: Any) -> None:
+        """Register a validated manifold term and refresh the left panel.
+
+        Called back (via ``call_from_thread``) by
+        ``ExtractionController._dispatch_manifold_term`` once the artifact has
+        loaded + the position arity validated.
+        """
+        self._manifold_terms[key] = term
+        self._enabled[key] = True
+        coords_str = ",".join(f"{c:g}" for c in term.position)
+        self._chat_panel.add_system_message(
+            f"Manifold '{term.manifold}' % {coords_str} active "
+            f"(blend {term.coeff:.2f})"
+        )
+        self._refresh_left_panel()
+
+    def _on_manifold_probe_added(self, name: str) -> None:
+        """Mirror probe wiring — refresh the trait panel + announce.
+
+        Called back by ``ExtractionController._start_manifold_probe_attach``.
+        """
+        self._refresh_probe_panels()
+        self._refresh_trait_why()
+        self._chat_panel.add_system_message(
+            f"Manifold probe '{name}' active."
+        )
+
+    def _refresh_probe_panels(self) -> None:
+        """Split the unified monitor's probe set across the trait panel.
+
+        After the monitor unification there is one probe set; the panel
+        renders it in two sections by geometry — flat (affine) probes drive
+        the scalar MONITOR PROBES section (axis-0 bar + sparkline + WHY),
+        curved probes the MANIFOLD PROBES section (fraction bar + nearest
+        labels + mini-map).  This mirrors the webui's subspace/manifold rack
+        split.  Curved probes carry their :class:`Manifold` artifact so the
+        panel can introspect the domain for the 2-D mini-map at render time.
+        """
+        monitor = self._session.monitor
+        if monitor is None:
+            self._trait_panel.set_active_probes(set())
+            self._trait_panel.set_active_manifold_probes({})
+            return
+        from saklas.core.session import _manifold_is_affine
+        flat: set[str] = set()
+        curved: dict[str, Any] = {}
+        for name in monitor.probe_names:
+            manifold = monitor.manifolds.get(name)
+            if manifold is not None and not _manifold_is_affine(manifold):
+                curved[name] = manifold
+            else:
+                flat.add(name)
+        self._trait_panel.set_active_probes(flat)
+        self._trait_panel.set_active_manifold_probes(curved)
 
     def _do_clear(self) -> None:
         self._session.clear_history()
@@ -1831,7 +1288,7 @@ class SaklasApp(App[None]):
         return bool(
             self._highlighting
             and self._highlight_probe not in (None, SURPRISE_PROBE)
-            and self._session._monitor.probe_names
+            and self._session.monitor.probe_names
         )
 
     @property
@@ -1992,7 +1449,7 @@ class SaklasApp(App[None]):
                 msg = e.user_message()[1] if isinstance(e, SaklasError) else str(e)
                 self._ui_token_queue.put(("error", msg, False))
             finally:
-                if self._session._device.type == "mps":
+                if self._session.device.type == "mps":
                     try:
                         torch.mps.synchronize()
                     except Exception:
@@ -2225,7 +1682,7 @@ class SaklasApp(App[None]):
                 msg = e.user_message()[1] if isinstance(e, SaklasError) else str(e)
                 self._ui_token_queue.put(("error", msg, False))
             finally:
-                if self._session._device.type == "mps":
+                if self._session.device.type == "mps":
                     try:
                         torch.mps.synchronize()
                     except Exception:
@@ -2652,11 +2109,11 @@ class SaklasApp(App[None]):
                 ),
             )
 
-        if self._session._monitor and self._session._monitor.has_pending_data():
-            self._session._monitor.consume_pending()
-            current, previous = self._session._monitor.get_current_and_previous()
-            sparklines = {name: self._session._monitor.get_sparkline(name)
-                          for name in self._session._monitor.probe_names}
+        if self._session.monitor and self._session.monitor.has_pending_data():
+            self._session.monitor.consume_pending()
+            current, previous = self._session.monitor.get_current_and_previous()
+            sparklines = {name: self._session.monitor.get_sparkline(name)
+                          for name in self._session.monitor.probe_names}
             self._trait_panel.update_values(
                 current, previous, sparklines,
             )
@@ -2689,7 +2146,7 @@ class SaklasApp(App[None]):
     def _remove_selected_probe(self) -> None:
         tp = self._trait_panel
         probe_name = tp.get_selected_probe()
-        if not probe_name or not self._session._monitor:
+        if not probe_name or not self._session.monitor:
             return
         self._session.remove_probe(probe_name)
         self._refresh_probe_panels()
@@ -2842,7 +2299,7 @@ class SaklasApp(App[None]):
         per_token = self._session.last_per_token_scores
         if not per_token or not widget.is_mounted:
             return
-        emit_map = self._session._gen_state.emit_map
+        emit_map = self._session.generation_state.emit_map
         if not emit_map:
             return
 
@@ -2893,7 +2350,7 @@ class SaklasApp(App[None]):
         if last is None:
             return
         aggregates = getattr(last, "probe_readings", None) or {}
-        monitor = self._session._monitor
+        monitor = self._session.monitor
         if not aggregates and (monitor is None or not monitor.probe_names):
             return
         self._trait_panel.update_manifold_readings(aggregates=aggregates)
@@ -2901,483 +2358,45 @@ class SaklasApp(App[None]):
     # -- New slash command handlers --
 
     def _handle_alpha(self, arg: str) -> None:
-        chat = self._chat_panel
-        try:
-            tokens = shlex.split(arg)
-        except ValueError as e:
-            chat.add_system_message(f"Parse error: {e}")
-            return
-        if len(tokens) != 2:
-            chat.add_system_message("Usage: /alpha <value> <name>")
-            return
-        val_str, raw = tokens
-        matches = _resolve_active_name(raw, self._alphas)
-        if len(matches) == 0:
-            chat.add_system_message(
-                f"'{raw}' is not active. Use /steer to add it first."
-            )
-            return
-        if len(matches) > 1:
-            chat.add_system_message(
-                f"'{raw}' is ambiguous: {', '.join(matches)}"
-            )
-            return
-        try:
-            val = float(val_str)
-        except ValueError:
-            chat.add_system_message(f"Invalid alpha: {val_str}")
-            return
-        name = matches[0]
-        if name != raw:
-            # Sign flip when the user typed the negative pole.
-            from saklas.core.session import BIPOLAR_SEP, canonical_concept_name
-            slug = canonical_concept_name(raw)
-            if BIPOLAR_SEP in name:
-                _pos, neg = name.split(BIPOLAR_SEP, 1)
-                if slug == neg:
-                    val = -val
-        val = max(-MAX_ALPHA, min(MAX_ALPHA, val))
-        self._alphas[name] = val
-        self._refresh_left_panel()
-        chat.add_system_message(f"Alpha for '{name}' set to {val:+.2f}")
+        self._get_extraction_controller()._handle_alpha(arg)
 
     def _handle_unsteer(self, arg: str) -> None:
-        chat = self._chat_panel
-        raw = arg.strip()
-        if not raw:
-            chat.add_system_message("Usage: /unsteer <name>")
-            return
-        ns = _detect_namespace_selector(raw)
-        if ns is not None:
-            self._handle_unsteer_namespace(ns)
-            return
-        # Resolve against both racks — scalar vectors (``_alphas``) and
-        # manifold terms (``_manifold_terms``).  A ``/steer`` with a
-        # ``%`` term lands in ``_manifold_terms``; without this the
-        # slash command would report a racked manifold as "not active".
-        matches = _resolve_active_name(
-            raw, [*self._alphas.keys(), *self._manifold_terms.keys()]
-        )
-        if len(matches) == 0:
-            chat.add_system_message(f"'{raw}' is not active.")
-            return
-        if len(matches) > 1:
-            chat.add_system_message(f"'{raw}' is ambiguous: {', '.join(matches)}")
-            return
-        name = matches[0]
-        if name in self._manifold_terms:
-            # Manifold rows aren't session-registered profiles — drop the
-            # local term and let the next gen rebuild ``Steering``
-            # without it (mirrors the panel backspace/delete path).
-            self._manifold_terms.pop(name, None)
-            self._enabled.pop(name, None)
-            self._refresh_left_panel()
-            chat.add_system_message(f"Removed manifold '{name}'.")
-            return
-        self._session.unsteer(name)
-        self._alphas.pop(name, None)
-        self._enabled.pop(name, None)
-        self._refresh_left_panel()
-        chat.add_system_message(f"Removed '{name}'.")
+        self._get_extraction_controller()._handle_unsteer(arg)
 
     def _handle_unprobe(self, arg: str) -> None:
-        chat = self._chat_panel
-        raw = arg.strip()
-        if not raw:
-            chat.add_system_message("Usage: /unprobe <name>")
-            return
-        ns = _detect_namespace_selector(raw)
-        if ns is not None:
-            self._handle_unprobe_namespace(ns)
-            return
-        monitor = self._session._monitor
-        if not monitor:
-            chat.add_system_message(f"Probe '{raw}' not active.")
-            return
-        matches = _resolve_active_name(raw, monitor.probe_names)
-        if len(matches) == 0:
-            chat.add_system_message(f"Probe '{raw}' not active.")
-            return
-        if len(matches) > 1:
-            chat.add_system_message(f"'{raw}' is ambiguous: {', '.join(matches)}")
-            return
-        name = matches[0]
-        self._session.remove_probe(name)
-        self._refresh_probe_panels()
-        if self._highlight_probe == name:
-            self._highlight_probe = None
-            self._highlighting = False
-            self._apply_highlight_to_all()
-        self._refresh_trait_why()
-        chat.add_system_message(f"Probe '{name}' removed.")
-
-    # -- Namespace bulk handlers (/steer ns/, /probe ns/, /unsteer ns/, /unprobe ns/) --
-
-    def _bulk_autoload_namespace(self, ns: str) -> tuple[list[str], list[str]]:
-        """Autoload every concept in ``ns`` whose tensor is on disk.
-
-        Returns ``(loaded, skipped)`` lists of namespace-qualified names.
-        ``loaded`` is what landed in ``session._profiles`` (already-present
-        plus freshly loaded); ``skipped`` is concepts whose ``raw`` variant
-        isn't extracted for the current model. Cache-hit only — no PCA,
-        no scenario gen, no network. Worker-thread safe (only touches
-        ``session._profiles`` and the on-disk pack files).
-        """
-        from saklas.io.selectors import _all_concepts
-
-        loaded: list[str] = []
-        skipped: list[str] = []
-        concepts = [c for c in _all_concepts() if c.namespace == ns]
-        for c in concepts:
-            key = f"{ns}/{c.name}"
-            if key in self._session._profiles:
-                loaded.append(key)
-                continue
-            try:
-                self._session._ensure_profile_registered(key)
-            except SaklasError:
-                # Unresolved / not-yet-fit concepts surface to the user
-                # below by leaving the concept in ``skipped``; the
-                # detailed message would drown out the bulk summary.
-                pass
-            except Exception:
-                pass
-            if key in self._session._profiles:
-                loaded.append(key)
-            else:
-                skipped.append(key)
-        return loaded, skipped
-
-    def _bulk_skip_message(self, ns: str, skipped: list[str]) -> str:
-        """Two-line note for skipped concepts: list + one-line refresh hint."""
-        return (
-            f"Skipped {len(skipped)} not yet extracted for this model: "
-            f"{', '.join(sorted(skipped))}\n"
-            f"  Run `saklas pack refresh {ns} -m <model>` to extract."
-        )
+        self._get_extraction_controller()._handle_unprobe(arg)
 
     def _handle_steer_namespace(self, ns: str) -> None:
-        """Bulk-register every cached concept under ``ns/`` as a steering
-        vector with α = ``DEFAULT_ALPHA`` and ``enabled=False`` so users
-        can flip them on individually from the left panel.
-        """
-        chat = self._chat_panel
-        if self._ab_shadow_active:
-            chat.add_system_message("Cannot modify vectors during A/B shadow gen.")
-            return
-        if self._is_busy:
-            arg = f"{ns}/"
-            self._enqueue_pending(PendingItem("steer", f"/steer {arg}", (arg,)))
-            return
-
-        from saklas.io.selectors import _all_concepts
-        if not [c for c in _all_concepts() if c.namespace == ns]:
-            chat.add_system_message(f"No concepts installed under '{ns}/'.")
-            return
-
-        chat.add_system_message(f"Loading '{ns}/' vectors (toggled off)...")
-
-        def _worker() -> None:
-            loaded, skipped = self._bulk_autoload_namespace(ns)
-
-            def _finish() -> None:
-                from saklas.core.profile import Profile as _Profile
-                for key in loaded:
-                    profile = self._session._profiles.get(key)
-                    if profile is None:
-                        continue
-                    # _profiles stores dict[int, Tensor]; steer() expects Profile.
-                    self._session.steer(key, _Profile(profile))
-                    self._alphas[key] = DEFAULT_ALPHA
-                    self._enabled[key] = False
-                self._refresh_left_panel()
-                lines = [
-                    f"Bulk steer '{ns}/': "
-                    f"added {len(loaded)} vector(s) (toggled off)."
-                ]
-                if skipped:
-                    lines.append(self._bulk_skip_message(ns, skipped))
-                chat.add_system_message("\n".join(lines))
-
-            self.call_from_thread(_finish)
-
-        self.run_worker(_worker, thread=True)
+        self._get_extraction_controller()._handle_steer_namespace(ns)
 
     def _handle_probe_namespace(self, ns: str) -> None:
-        """Bulk-register every cached concept under ``ns/`` as a probe.
-        Highlight seeds to the last-loaded probe so the per-token overlay
-        lights up immediately, matching the single-probe ``/probe`` UX.
-        """
-        chat = self._chat_panel
-        if self._ab_shadow_active:
-            chat.add_system_message("Cannot modify vectors during A/B shadow gen.")
-            return
-        if self._is_busy:
-            arg = f"{ns}/"
-            self._enqueue_pending(PendingItem("probe", f"/probe {arg}", (arg,)))
-            return
-
-        from saklas.io.selectors import _all_concepts
-        if not [c for c in _all_concepts() if c.namespace == ns]:
-            chat.add_system_message(f"No concepts installed under '{ns}/'.")
-            return
-
-        chat.add_system_message(f"Loading '{ns}/' probes...")
-
-        def _worker() -> None:
-            loaded, skipped = self._bulk_autoload_namespace(ns)
-
-            def _finish() -> None:
-                for key in loaded:
-                    if self._session._profiles.get(key) is None:
-                        continue
-                    # The folded direction is already in ``_profiles[key]``;
-                    # ``add_probe`` resolves it from there and attaches to the
-                    # unified monitor.
-                    self._session.add_probe(key)
-                if loaded and self._session._monitor is not None:
-                    self._refresh_probe_panels()
-                    # Seed highlight to the last loaded probe — same UX as
-                    # single ``/probe``: the user immediately sees one of
-                    # them lit up and can navigate the trait panel to flip.
-                    self._highlight_probe = sorted(loaded)[-1]
-                    self._highlighting = True
-                    self._apply_highlight_to_all()
-                    self._refresh_trait_why()
-                lines = [f"Bulk probe '{ns}/': added {len(loaded)} probe(s)."]
-                if loaded:
-                    lines.append("  Highlight on (⌃Y to cycle).")
-                if skipped:
-                    lines.append(self._bulk_skip_message(ns, skipped))
-                chat.add_system_message("\n".join(lines))
-
-            self.call_from_thread(_finish)
-
-        self.run_worker(_worker, thread=True)
+        self._get_extraction_controller()._handle_probe_namespace(ns)
 
     def _handle_unsteer_namespace(self, ns: str) -> None:
-        """Remove every active steering vector whose registry key sits
-        under ``ns/``. Mirrors the single-vector ``/unsteer`` no-defer
-        policy — modifying ``_profiles`` mid-gen doesn't disturb hooks
-        already attached to the in-flight forward pass.
-        """
-        chat = self._chat_panel
-        prefix = f"{ns}/"
-        matches = [n for n in list(self._alphas.keys()) if n.startswith(prefix)]
-        # Manifold terms share the ``ns/name`` key shape — sweep them too.
-        manifold_matches = [
-            n for n in list(self._manifold_terms.keys()) if n.startswith(prefix)
-        ]
-        if not matches and not manifold_matches:
-            chat.add_system_message(f"No active vectors under '{ns}/'.")
-            return
-        for name in matches:
-            self._session.unsteer(name)
-            self._alphas.pop(name, None)
-            self._enabled.pop(name, None)
-        for name in manifold_matches:
-            self._manifold_terms.pop(name, None)
-            self._enabled.pop(name, None)
-        self._refresh_left_panel()
-        total = len(matches) + len(manifold_matches)
-        chat.add_system_message(
-            f"Removed {total} vector(s) from '{ns}/'."
-        )
+        self._get_extraction_controller()._handle_unsteer_namespace(ns)
 
     def _handle_unprobe_namespace(self, ns: str) -> None:
-        """Remove every active probe whose registry key sits under ``ns/``.
-        Clears the highlight seed when it points into the namespace.
-        """
-        chat = self._chat_panel
-        monitor = self._session._monitor
-        if monitor is None:
-            chat.add_system_message(f"No active probes under '{ns}/'.")
-            return
-        prefix = f"{ns}/"
-        matches = [n for n in list(monitor.probe_names) if n.startswith(prefix)]
-        if not matches:
-            chat.add_system_message(f"No active probes under '{ns}/'.")
-            return
-        for name in matches:
-            self._session.remove_probe(name)
-        self._refresh_probe_panels()
-        if self._highlight_probe is not None and self._highlight_probe.startswith(prefix):
-            self._highlight_probe = None
-            self._highlighting = False
-            self._apply_highlight_to_all()
-        self._refresh_trait_why()
-        chat.add_system_message(
-            f"Removed {len(matches)} probe(s) from '{ns}/'."
-        )
+        self._get_extraction_controller()._handle_unprobe_namespace(ns)
 
-    # -- Input history (↑/↓ in chat input) --
+    # -- Input history (↑/↓ in chat input) — own: InputHistoryController --
+    #
+    # The recall ring + pending queue are one coupled state machine on
+    # :class:`InputHistoryController`; the methods stay on the App as thin
+    # forwarders because the framework handlers (``on_key`` recall,
+    # ``action_stop_generation`` cancel, submit/commit) call them by name and
+    # the test suite drives them on the App.
 
     def _push_input_history(self, text: str) -> None:
-        """Append a freshly-submitted line to the recall ring.
-
-        De-dupes against the *immediately preceding* entry (readline /
-        bash semantics — repeated identical lines collapse, but a
-        ping-pong A→B→A still records both A's). Resets the recall
-        cursor so the next ↑ starts at the bottom of the ring.
-        """
-        text = text.rstrip()
-        if not text:
-            return
-        if self._input_history and self._input_history[-1] == text:
-            self._history_index = None
-            self._history_stash = ""
-            return
-        self._input_history.append(text)
-        if len(self._input_history) > _INPUT_HISTORY_MAX:
-            # Drop oldest in one slice rather than calling pop(0) per
-            # overflow — slice is O(N) but only fires once per overflow.
-            del self._input_history[: len(self._input_history) - _INPUT_HISTORY_MAX]
-        self._history_index = None
-        self._history_stash = ""
+        self._get_input_history_controller()._push_input_history(text)
 
     def _history_navigate(self, delta: int) -> None:
-        """Walk the combined ring of pending items + input history.
-
-        Pending items come first (most-recently-queued is one ``↑`` from
-        live, oldest pending is one further ``↑``), then committed
-        input history (newest first).  ``↓`` walks the same ring in
-        reverse and clears the cursor when it returns to the live
-        slot, restoring the stash captured on the first ``↑``.
-
-        Pulling a pending slot via this walk sets ``_pulled_slot`` —
-        which makes the next ``Enter`` *replace* that slot rather than
-        append (slot-preserving edit) and the next ``Esc`` cancel
-        the pull (slot stays as-is).  An empty ``Enter`` while a
-        slot is pulled *removes* that slot (the keyboard equivalent
-        of the GUI's per-bubble ``×``).
-
-        The chat input is a multi-line :class:`ChatInput` (TextArea),
-        so the recalled text replaces the entire buffer via
-        ``load_text`` and the cursor lands at the end of the last line.
-        """
-        try:
-            inp = self.query_one("#chat-input", ChatInput)
-        except Exception:
-            return
-
-        n_pending = len(self._pending_queue)
-        n_history = len(self._input_history)
-        if n_pending == 0 and n_history == 0:
-            return
-
-        # Compose a position in the combined ring:
-        #   pos in [0, n_pending) — pending slot (n_pending-1-pos counts
-        #     back from the queue tail, so pos=0 is the most-recent
-        #     pending item — i.e. the first ``↑`` destination).
-        #   pos in [n_pending, n_pending + n_history) — history offset
-        #     (newest at n_pending, oldest at the end).
-        #   pos == -1 — sentinel for "live slot, no cursor."
-        cur_pos = self._current_input_cursor_pos()
-        if cur_pos < 0:
-            if delta > 0:
-                return  # Already at live slot — ``↓`` is a no-op.
-            # First ``↑`` from live — stash whatever the user typed so
-            # ``↓`` past the newest entry restores it.
-            self._history_stash = inp.text
-            new_pos = 0
-        else:
-            # ``↑`` (delta<0) walks toward older items — increment the
-            # ring position.  ``↓`` (delta>0) walks toward newer items
-            # and eventually back to the live slot — decrement.
-            new_pos = cur_pos + (1 if delta < 0 else -1)
-            if new_pos >= n_pending + n_history:
-                # Past the oldest history entry — pin to it; matches
-                # readline (no wrap, no error).
-                new_pos = n_pending + n_history - 1
-            elif new_pos < 0:
-                # Past the newest pending item / newest history entry —
-                # back to live.  Restore the stash and reset the cursor.
-                self._pulled_slot = None
-                self._history_index = None
-                self._set_input_text(inp, self._history_stash)
-                self._history_stash = ""
-                self._sync_pull_state()
-                return
-
-        # Apply the new position.
-        if new_pos < n_pending:
-            slot = n_pending - 1 - new_pos
-            self._pulled_slot = slot
-            self._history_index = None
-            self._set_input_text(inp, self._pending_queue[slot].text)
-        else:
-            self._pulled_slot = None
-            self._history_index = (n_pending + n_history - 1) - new_pos
-            self._set_input_text(inp, self._input_history[self._history_index])
-        self._sync_pull_state()
-
-    def _current_input_cursor_pos(self) -> int:
-        """Return the combined-ring position of the current cursor.
-
-        ``-1`` = live slot.  See :meth:`_history_navigate` for the
-        encoding of pending and history positions.
-        """
-        n_pending = len(self._pending_queue)
-        if self._pulled_slot is not None and 0 <= self._pulled_slot < n_pending:
-            return n_pending - 1 - self._pulled_slot
-        if self._history_index is not None:
-            n_history = len(self._input_history)
-            if 0 <= self._history_index < n_history:
-                return n_pending + (n_history - 1 - self._history_index)
-        return -1
+        self._get_input_history_controller()._history_navigate(delta)
 
     def _cancel_pull(self) -> None:
-        """``Esc`` while a pending slot is pulled — restore the live stash.
-
-        Leaves the slot in the queue untouched; the user backed out
-        of the edit but didn't cancel the queued action.
-        """
-        if self._pulled_slot is None:
-            return
-        try:
-            inp = self.query_one("#chat-input", ChatInput)
-        except Exception:
-            self._pulled_slot = None
-            self._sync_pull_state()
-            return
-        self._pulled_slot = None
-        self._history_index = None
-        self._set_input_text(inp, self._history_stash)
-        self._history_stash = ""
-        self._sync_pull_state()
+        self._get_input_history_controller()._cancel_pull()
 
     def _sync_pull_state(self) -> None:
-        """Reflect ``_pulled_slot`` into the chat input + pending strip.
-
-        Two things follow from a pull change:
-
-        * :attr:`ChatInput.allow_empty_submit` flips on while pulled
-          so an empty ``Enter`` reaches the dispatcher as the slot-
-          cancel gesture (mirrors the GUI's per-bubble ``×``).
-        * The :class:`PendingStrip` re-renders so the ``✎`` editing
-          marker tracks the currently-pulled slot.
-
-        Single helper called from every site that mutates
-        ``_pulled_slot`` so the two derived surfaces stay in lockstep.
-        """
-        try:
-            inp = self.query_one("#chat-input", ChatInput)
-        except Exception:
-            pass
-        else:
-            inp.allow_empty_submit = self._pulled_slot is not None
-        self._refresh_pending_strip()
-
-    @staticmethod
-    def _set_input_text(inp: ChatInput, text: str) -> None:
-        """Replace the chat input's content and park the cursor at the
-        end of the last line — the equivalent of ``Input.value = text;
-        cursor_position = len(value)`` for the TextArea-backed input.
-        """
-        inp.load_text(text)
-        last_row = inp.document.line_count - 1
-        last_col = len(inp.document.get_line(last_row))
-        inp.cursor_location = (last_row, last_col)
+        self._get_input_history_controller()._sync_pull_state()
 
     def _handle_seed(self, arg: str) -> None:
         chat = self._chat_panel
@@ -3456,8 +2475,8 @@ class SaklasApp(App[None]):
 
         # The deserialized tree carries no event bus / conflict hook.
         loaded.attach_events(self._session.events)
-        loaded.set_conflict_check(self._session._loom_conflict_check)
-        live_model = self._session._model_info.get("model_id")
+        loaded.set_conflict_check(self._session.loom_conflict_check)
+        live_model = self._session.model_metadata.get("model_id")
         if loaded.model_id is None:
             loaded.model_id = live_model
         elif live_model is not None and loaded.model_id != live_model:
@@ -3466,8 +2485,8 @@ class SaklasApp(App[None]):
                 f"'{live_model}' — steering/probe vectors may not match"
             )
         self._session.tree = loaded
-        if self._session._monitor is not None:
-            self._session._monitor.reset_history()
+        if self._session.monitor is not None:
+            self._session.monitor.reset_history()
 
         # Repaint the chat log along the loaded tree's active path so the
         # conversation is visible immediately (loaded nodes carry no
@@ -3498,15 +2517,15 @@ class SaklasApp(App[None]):
 
     def _handle_model_info(self) -> None:
         chat = self._chat_panel
-        info = self._session._model_info
+        info = self._session.model_metadata
         lines = [
             f"Model: {info.get('model_id', 'unknown')}",
             f"Arch: {info.get('model_type', 'unknown')}  "
             f"Device: {self._device_str}  "
-            f"Layers: {len(self._session._layers)}",
+            f"Layers: {len(self._session.layers)}",
             f"Thinking: {self._thinking_status_str()}",
             f"Active vectors: {list(self._alphas.keys()) or '(none)'}",
-            f"Active probes: {list(self._session._monitor.probe_names) if self._session._monitor else '(none)'}",
+            f"Active probes: {list(self._session.monitor.probe_names) if self._session.monitor else '(none)'}",
             f"Seed: {self._default_seed}",
         ]
         chat.add_system_message("\n".join(lines))
@@ -3525,7 +2544,7 @@ class SaklasApp(App[None]):
         a probe lights up on — no token list duplicated here.
         """
         probe = self._trait_panel.get_selected_probe()
-        monitor = self._session._monitor
+        monitor = self._session.monitor
         if probe is None or monitor is None or probe not in monitor.manifolds:
             self._trait_panel.update_why(None, [])
             return
@@ -3546,104 +2565,9 @@ class SaklasApp(App[None]):
         self._trait_panel.update_why(probe, layer_norms)
 
     def _handle_compare(self, arg: str) -> None:
-        chat = self._chat_panel
-        if not arg:
-            chat.add_system_message("Usage: /compare <name> [other_name]")
-            return
+        self._get_extraction_controller()._handle_compare(arg)
 
-        parts = arg.split()
-
-        # Gather all available profiles: session profiles + monitor probes.
-        # The monitor stores each probe as a ``Manifold`` now; fold it to the
-        # per-layer baked direction view (``{L: δ̂_L · share_L}``) so both
-        # sources expose the same cosine_similarity API.  A multi-axis /
-        # curved probe has no single direction to compare and is skipped.
-        from saklas.core.profile import Profile
-        all_profiles: dict[str, Profile] = {}
-        for name, prof in self._session._profiles.items():
-            if isinstance(prof, Profile):
-                all_profiles[name] = prof
-            elif isinstance(prof, dict) and prof:
-                all_profiles[name] = Profile(prof)
-        monitor = self._session._monitor
-        if monitor:
-            from saklas.core.vectors import folded_vector_directions
-            for name in monitor.probe_names:
-                if name in all_profiles:
-                    continue
-                manifold = monitor.manifolds.get(name)
-                if manifold is None:
-                    continue
-                try:
-                    folded = folded_vector_directions(manifold)
-                except Exception:
-                    continue
-                if folded:
-                    all_profiles[name] = Profile(folded)
-
-        def _resolve(raw: str) -> str | None:
-            matches = _resolve_active_name(raw, all_profiles)
-            if len(matches) == 1:
-                return matches[0]
-            if len(matches) > 1:
-                chat.add_system_message(f"'{raw}' is ambiguous: {', '.join(matches)}")
-                return None
-            chat.add_system_message(f"No profile found for '{raw}'")
-            return None
-
-        if len(parts) == 1:
-            # 1-arg: ranked comparison against all loaded profiles.
-            target_name = _resolve(parts[0])
-            if target_name is None:
-                return
-            target = all_profiles[target_name]
-            others = {n: p for n, p in all_profiles.items() if n != target_name}
-            if not others:
-                chat.add_system_message("No other profiles loaded to compare against.")
-                return
-            # Mahalanobis-only: ``cosine_similarity`` requires the session
-            # whitener (the Euclidean path is gone).  Pairs whose shared
-            # layers the whitener doesn't cover raise and are skipped.
-            whitener = getattr(self._session, "whitener", None)
-            scores = {}
-            for name, prof in others.items():
-                try:
-                    scores[name] = target.cosine_similarity(prof, whitener=whitener)
-                except Exception:
-                    continue
-            if not scores:
-                chat.add_system_message("No comparable profiles (no shared layers).")
-                return
-            ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-            width = max(len(n) for n, _ in ranked)
-            lines = [f"{target_name} vs loaded profiles:"]
-            for name, score in ranked:
-                lines.append(f"  {name:<{width}}  {score:+.4f}")
-            chat.add_system_message("\n".join(lines))
-
-        elif len(parts) == 2:
-            # 2-arg: pairwise.
-            a_name = _resolve(parts[0])
-            if a_name is None:
-                return
-            b_name = _resolve(parts[1])
-            if b_name is None:
-                return
-            # Mahalanobis-only (see the 1-arg branch above).
-            whitener = getattr(self._session, "whitener", None)
-            try:
-                sim = all_profiles[a_name].cosine_similarity(
-                    all_profiles[b_name], whitener=whitener,
-                )
-            except Exception as e:
-                chat.add_system_message(f"Compare failed: {e}")
-                return
-            chat.add_system_message(f"{a_name} ~ {b_name}: {sim:+.4f}")
-
-        else:
-            chat.add_system_message("Usage: /compare <name> [other_name]")
-
-    # -- Pending queue --------------------------------------------------
+    # -- Pending queue — own: InputHistoryController ----------------------
 
     def _enqueue_pending(
         self,
@@ -3651,89 +2575,18 @@ class SaklasApp(App[None]):
         *,
         replace_slot: int | None = None,
     ) -> None:
-        """Append ``item`` to the pending queue (or replace a slot in place).
-
-        ``replace_slot`` is the slot the user pulled into the input box
-        via the up-arrow walk; passing it keeps a re-submitted edit at
-        its original position rather than dropping it to the tail of
-        the queue.  Out-of-range values fall back to append.
-
-        After mutation the chat panel's :class:`PendingStrip` is
-        refreshed so the visible list stays in sync, and the input-mode
-        placeholder is re-derived so a queued role-shifting item
-        (``commit_user`` / ``rewind``) flips the next submission's mode
-        immediately.
-        """
-        q = self._pending_queue
-        if (
-            replace_slot is not None
-            and 0 <= replace_slot < len(q)
-        ):
-            q[replace_slot] = item
-        else:
-            q.append(item)
-        self._refresh_pending_strip()
-        self._refresh_input_mode()
-
-    def _remove_pending_slot(self, slot: int) -> None:
-        """Drop a pulled slot from the queue (empty-input re-submit / cancel)."""
-        q = self._pending_queue
-        if 0 <= slot < len(q):
-            del q[slot]
-            self._refresh_pending_strip()
-            self._refresh_input_mode()
-
-    def _refresh_pending_strip(self) -> None:
-        """Push the queue + pulled-slot into the chat panel's strip.
-
-        Single funnel so callers don't have to remember to forward
-        ``_pulled_slot``; any mutation that touches either the queue
-        or the pulled state should call this.
-        """
-        self._chat_panel.update_pending(
-            self._pending_queue, pulled_slot=self._pulled_slot,
+        self._get_input_history_controller()._enqueue_pending(
+            item, replace_slot=replace_slot,
         )
 
+    def _remove_pending_slot(self, slot: int) -> None:
+        self._get_input_history_controller()._remove_pending_slot(slot)
+
+    def _refresh_pending_strip(self) -> None:
+        self._get_input_history_controller()._refresh_pending_strip()
+
     def _drain_next_pending(self) -> bool:
-        """Drain queued items in FIFO until an async kind takes over.
-
-        Returns ``True`` when at least one item ran, ``False`` when the
-        queue was empty.  Called from :meth:`_poll_generation`'s
-        ``done`` branch (and recursively from itself via the chain
-        loop).
-
-        Kinds in :data:`_KIND_CHAIN_INLINE` (``clear`` / ``rewind`` /
-        ``steer`` / ``probe``) are fully synchronous — drain through
-        them inline so a chain of slash commands doesn't stall waiting
-        for a ``done`` that will never fire.  Every other kind either
-        kicks a generation (its own ``done`` re-enters here) or fires
-        a worker that enqueues ``("done", False)`` in its finally
-        block (the commit / extract pattern).  Without this loop a
-        queued commit_user left the rest of the queue stuck — root
-        cause of the "queue stuck after commit" bug.
-
-        Keeps :attr:`_pulled_slot` accounting honest across each pop:
-        if the user pulled slot 0 we cancel the pull (the slot they
-        were editing is now being dispatched); if they pulled a
-        later slot we decrement the index so they keep tracking the
-        same item.
-        """
-        drained = False
-        while self._pending_queue:
-            if self._pulled_slot is not None:
-                if self._pulled_slot == 0:
-                    self._cancel_pull()
-                else:
-                    self._pulled_slot -= 1
-            item = self._pending_queue.pop(0)
-            self._refresh_pending_strip()
-            self._dispatch_pending_action(item)
-            drained = True
-            if item.kind not in _KIND_CHAIN_INLINE:
-                # Async kind — let its own done sentinel drive the
-                # next drain so the worker isn't raced.
-                break
-        return drained
+        return self._get_input_history_controller()._drain_next_pending()
 
     @property
     def _is_busy(self) -> bool:
@@ -4065,7 +2918,7 @@ class SaklasApp(App[None]):
                 msg = e.user_message()[1] if isinstance(e, SaklasError) else str(e)
                 self._ui_token_queue.put(("error", msg, True))
             finally:
-                if self._session._device.type == "mps":
+                if self._session.device.type == "mps":
                     try:
                         torch.mps.synchronize()
                     except Exception:
@@ -4078,108 +2931,35 @@ class SaklasApp(App[None]):
         self._trait_panel.cycle_sort()
 
     # ----------------------------------------------------------------
-    # Phase 4 — loom slash commands + bindings
+    # Loom slash commands + bindings (logic on LoomController)
     # ----------------------------------------------------------------
+    #
+    # The loom slash-command + worker *logic* lives on
+    # :class:`~saklas.tui.loom_controller.LoomController`; the framework-
+    # dispatched surface (registry handlers named by attribute in
+    # ``commands.py``, the ``action_*`` keybindings, the ``loom_screen.py``
+    # back-calls, and the ``_dispatch_pending_action`` drain) stays on the App
+    # as thin one-line forwarders into it.  The worker bodies
+    # (``_run_fan_worker`` / ``_run_regen_*_worker``) stay reachable here so a
+    # test that monkeypatches ``app._run_fan_worker`` and the pending-queue
+    # drain that calls the App method both hit the same surface.
 
     def action_open_loom(self) -> None:
         """Ctrl+L — open the loom screen."""
-        self._handle_tree("")
+        self._get_loom_controller()._handle_tree("")
 
     def _handle_tree(self, _arg: str) -> None:
-        """`/tree` — push the LoomScreen onto the Textual screen stack.
-
-        Esc on the loom screen pops back to the chat screen.  Mutations
-        from the loom screen flow into ``session.tree`` directly; the
-        chat screen's `_messages` property (a derived view) picks them
-        up on the next render.
-        """
-
-        from saklas.tui.loom_screen import LoomScreen
-
-        if self._raw_mode and self._chat_panel.raw_buffer.is_dirty:
-            self._chat_panel.add_system_message(
-                "Raw buffer has uncommitted edits; press Ctrl+Enter to "
-                "commit them, or Enter to continue before opening the tree."
-            )
-            return
-        try:
-            self.push_screen(LoomScreen(self))
-        except Exception as e:
-            self._chat_panel.add_system_message(f"/tree failed: {e}")
+        self._get_loom_controller()._handle_tree(_arg)
 
     def _handle_nav(self, arg: str) -> None:
-        """`/nav <id-prefix>` — navigate active node by ulid prefix.
-
-        Matches any case-insensitive prefix of an existing node id;
-        ambiguous prefixes report the candidates.
-        """
-
-        from saklas.tui.loom_helpers import resolve_node_prefix
-
-        chat = self._chat_panel
-        prefix = arg.strip()
-        if not prefix:
-            chat.add_system_message("Usage: /nav <id-prefix>")
-            return
-        if self._raw_mode and chat.raw_buffer.is_dirty:
-            chat.add_system_message(
-                "Raw buffer has uncommitted edits; press Ctrl+Enter to "
-                "commit them, or Enter to continue before navigating."
-            )
-            return
-        match = resolve_node_prefix(self._session.tree, prefix)
-        if match.missing:
-            chat.add_system_message(f"no node matches '{prefix}'")
-            return
-        if match.ambiguous:
-            cands = ", ".join(c[:12] for c in match.candidates[:8])
-            chat.add_system_message(f"ambiguous '{prefix}': {cands}")
-            return
-        # node_id is non-None here: match.missing and match.ambiguous are both False,
-        # which by PrefixMatch's invariant means node_id was assigned a str hit.
-        assert match.node_id is not None  # noqa: S101
-        try:
-            self._session.tree.navigate(match.node_id)
-        except Exception as e:
-            chat.add_system_message(f"navigate failed: {e}")
-            return
-        self._repaint_chat_from_active_path()
-        chat.add_system_message(f"navigated to {match.node_id[:8]}")
+        self._get_loom_controller()._handle_nav(arg)
 
     def action_nav_picker(self) -> None:
         """Ctrl+N — phase 4: same as `/tree` so users can pick visually."""
-        self._handle_tree("")
+        self._get_loom_controller()._handle_tree("")
 
     def _handle_edit(self, arg: str) -> None:
-        """`/edit <text...>` — in-place edit of the active node.
-
-        Phase-4 inline form: full replacement text comes on the same
-        line.  The richer loom-screen overlay (which pre-fills the
-        buffer with current text) lands via the `e` binding inside
-        the loom screen.
-        """
-
-        from saklas.core.loom import (
-            LoomTreeError, MutationDuringGenerationError,
-            InvalidNodeOperationError, UnknownNodeError,
-        )
-
-        chat = self._chat_panel
-        if not arg.strip():
-            chat.add_system_message("Usage: /edit <text...>")
-            return
-        target = self._session.tree.active_node_id
-        if target == self._session.tree.root_id:
-            chat.add_system_message("/edit: active node is the root.")
-            return
-        try:
-            self._session.tree.edit(target, arg)
-        except (UnknownNodeError, MutationDuringGenerationError,
-                InvalidNodeOperationError, LoomTreeError) as e:
-            chat.add_system_message(f"/edit failed: {e}")
-            return
-        self._sync_raw_buffer_from_tree()
-        chat.add_system_message(f"edited {target[:8]}")
+        self._get_loom_controller()._handle_edit(arg)
 
     def action_edit_active(self) -> None:
         """Ctrl+E — open the loom screen so the user can edit visually.
@@ -4188,80 +2968,17 @@ class SaklasApp(App[None]):
         the loom screen's `e` binding gives the in-place buffer the
         plan describes.
         """
-        self._handle_tree("")
+        self._get_loom_controller()._handle_tree("")
 
     def _handle_branch(self, arg: str) -> None:
-        """`/branch [text]` — sibling of the active node with the given text.
-
-        Empty text is the "branch from blank" UI flavor; otherwise the
-        text becomes the new sibling's content.  Inherits the active
-        node's role unless the active node is the root (rejected).
-        """
-
-        from saklas.core.loom import (
-            LoomTreeError, MutationDuringGenerationError,
-            InvalidNodeOperationError, UnknownNodeError,
-        )
-
-        chat = self._chat_panel
-        text = arg or ""
-        target = self._session.tree.active_node_id
-        if target == self._session.tree.root_id:
-            chat.add_system_message("/branch: active node is the root.")
-            return
-        try:
-            new_id = self._session.tree.branch(target, text)
-        except (UnknownNodeError, MutationDuringGenerationError,
-                InvalidNodeOperationError, LoomTreeError) as e:
-            chat.add_system_message(f"/branch failed: {e}")
-            return
-        self._sync_raw_buffer_from_tree()
-        chat.add_system_message(f"branched {target[:8]} → {new_id[:8]}")
+        self._get_loom_controller()._handle_branch(arg)
 
     def action_branch_active(self) -> None:
         """Ctrl+B — open the loom screen for visual branching."""
-        self._handle_tree("")
+        self._get_loom_controller()._handle_tree("")
 
     def _handle_del(self, arg: str) -> None:
-        """`/del [yes]` — delete the active subtree.
-
-        Requires explicit ``yes`` confirmation by default to avoid
-        accidental wipes; ``Ctrl+D`` from the chat screen uses this
-        path too.  :meth:`LoomTree.delete_subtree` repoints the active
-        pointer to the surviving parent when the doomed subtree
-        contains the active node (root case → fresh start), so this
-        path is a straight-through call; the post-delete message
-        surfaces the new active id so the jump isn't silent.
-        """
-
-        from saklas.core.loom import (
-            LoomTreeError, MutationDuringGenerationError,
-            InvalidNodeOperationError, UnknownNodeError,
-        )
-
-        chat = self._chat_panel
-        confirm = (arg or "").strip().lower()
-        if confirm != "yes":
-            chat.add_system_message(
-                "/del: type '/del yes' to delete the active subtree."
-            )
-            return
-        tree = self._session.tree
-        target = tree.active_node_id
-        if target == tree.root_id:
-            chat.add_system_message("/del: nothing to delete (at root).")
-            return
-        try:
-            removed = tree.delete_subtree(target)
-        except (UnknownNodeError, MutationDuringGenerationError,
-                InvalidNodeOperationError, LoomTreeError) as e:
-            chat.add_system_message(f"/del failed: {e}")
-            return
-        new_active_id = tree.active_node_id
-        self._sync_raw_buffer_from_tree()
-        chat.add_system_message(
-            f"deleted {removed} node(s); active now {new_active_id[:8]}"
-        )
+        self._get_loom_controller()._handle_del(arg)
 
     def action_delete_subtree(self) -> None:
         """Ctrl+D — surface the `/del yes` confirm hint.
@@ -4272,450 +2989,65 @@ class SaklasApp(App[None]):
         modal-overlay confirm flow; this chat-screen path is the cheaper
         UX of "print hint, let the user confirm by typing".
         """
-        self._handle_del("")
+        self._get_loom_controller()._handle_del("")
 
     def _handle_star(self, _arg: str) -> None:
-        chat = self._chat_panel
-        target = self._session.tree.active_node_id
-        try:
-            node = self._session.tree.get(target)
-            self._session.tree.star(target, on=not node.starred)
-        except Exception as e:
-            chat.add_system_message(f"/star failed: {e}")
-            return
-        chat.add_system_message(
-            f"{'starred' if not node.starred else 'unstarred'} {target[:8]}"
-        )
+        self._get_loom_controller()._handle_star(_arg)
 
     def _handle_note(self, arg: str) -> None:
-        chat = self._chat_panel
-        target = self._session.tree.active_node_id
-        try:
-            self._session.tree.annotate(target, arg or "")
-        except Exception as e:
-            chat.add_system_message(f"/note failed: {e}")
-            return
-        chat.add_system_message(f"noted {target[:8]}")
+        self._get_loom_controller()._handle_note(arg)
 
     def _handle_path(self, _arg: str) -> None:
-        from saklas.tui.loom_helpers import format_path_summary
-        self._chat_panel.add_system_message(
-            format_path_summary(self._session.tree)
-        )
+        self._get_loom_controller()._handle_path(_arg)
 
     def _handle_fan(self, arg: str) -> None:
-        """`/fan <vector> <alphas>` — N-way regen with per-sibling alpha override.
-
-        Keep it minimal: token-split on the first
-        whitespace, treat everything after as the alpha grid.  The
-        webui fan grammar (linspace / range / comma list) is
-        shared via :func:`parse_alpha_list`.
-        """
-
-        chat = self._chat_panel
-        raw = arg.strip()
-        if not raw:
-            chat.add_system_message("Usage: /fan <vector> <alphas>")
-            return
-        parts = raw.split(None, 1)
-        if len(parts) < 2:
-            chat.add_system_message("Usage: /fan <vector> <alphas>")
-            return
-        vector, alphas_str = parts[0], parts[1]
-        from saklas.tui.loom_helpers import parse_alpha_list, AlphaListError
-        try:
-            alphas = parse_alpha_list(alphas_str)
-        except AlphaListError as e:
-            chat.add_system_message(f"/fan alpha grid error: {e}")
-            return
-        if not alphas:
-            chat.add_system_message("/fan: alpha grid is empty.")
-            return
-        self._dispatch_loom_fan_alphas(vector, alphas)
+        self._get_loom_controller()._handle_fan(arg)
 
     def _dispatch_loom_fan(self, raw: str) -> None:
         """Called from the loom-screen overlay's fan-out form."""
-        self._handle_fan(raw)
+        self._get_loom_controller()._dispatch_loom_fan(raw)
 
     def _dispatch_loom_fan_alphas(self, vector: str, alphas: list[float]) -> None:
-        """Kick off the fan-out generation.
-
-        Routes through ``session.generate_sweep`` so every alpha row
-        lands as a sibling under one shared user turn. When a
-        generation is already in flight we stash the request as a
-        pending action so it fires after the current worker resolves.
-        """
-
-        chat = self._chat_panel
-        prompt = self._last_prompt
-        # We need a prompt to regen from; if there isn't one yet, lift
-        # it off the active path.
-        if not prompt:
-            hist = self._messages
-            if hist and hist[-1]["role"] == "user":
-                prompt = hist[-1]["content"]
-        if not prompt:
-            chat.add_system_message("/fan: no prior prompt to fan out from.")
-            return
-
-        # Queue the fan-out behind any in-flight work; ``_run_fan_worker``
-        # is invoked by ``_dispatch_pending_action`` once the queue head
-        # is drained.
-        if self._is_busy:
-            display_text = f"/fan {vector} ({len(alphas)} α)"
-            self._enqueue_pending(
-                PendingItem("fan", display_text, (vector, alphas, prompt))
-            )
-            return
-        self._run_fan_worker(vector, alphas, prompt)
+        self._get_loom_controller()._dispatch_loom_fan_alphas(vector, alphas)
 
     def _run_fan_worker(
         self, vector: str, alphas: list[float], prompt: str,
     ) -> None:
-        """Actually kick the engine.
-
-        Routes through :meth:`SaklasSession.generate_sweep` so every
-        sibling lands under one shared user-turn anchor in the loom tree.
-        """
-
-        chat = self._chat_panel
-        chat.add_system_message(
-            f"/fan {vector} × {len(alphas)} (α: "
-            f"{', '.join(f'{a:+.2f}' for a in alphas[:6])}"
-            f"{'…' if len(alphas) > 6 else ''})"
-        )
-
-        from saklas import SamplingConfig
-
-        def _worker() -> None:
-            try:
-                tree = self._session.tree
-                # Anchor under the active node's user-parent (so the
-                # sweep's auto-spawned user turn lands as a sibling of
-                # the existing user turn rather than nested under the
-                # previous assistant).
-                anchor_id = tree.active_node_id
-                anchor = tree.nodes.get(anchor_id)
-                if anchor is not None and anchor.role == "assistant" and anchor.parent_id is not None:
-                    parent_for_sweep = anchor.parent_id
-                    # If the active path's current user turn already
-                    # holds the prompt we're sweeping, anchor under
-                    # *that* user turn so generate_sweep's dedup folds
-                    # the new sweep into the existing user node.
-                    user_node = tree.nodes.get(anchor.parent_id)
-                    if user_node is not None and user_node.role == "user":
-                        parent_for_sweep = user_node.parent_id
-                else:
-                    parent_for_sweep = anchor_id
-
-                sampling = SamplingConfig(
-                    temperature=self._session.config.temperature,
-                    top_p=self._session.config.top_p,
-                    max_tokens=self._session.config.max_new_tokens,
-                    seed=self._default_seed,
-                )
-                runset = self._session.generate_sweep(
-                    prompt,
-                    {vector: [float(a) for a in alphas]},
-                    sampling=sampling,
-                    stateless=False,
-                    parent_node_id=parent_for_sweep,
-                )
-                node_ids = runset.node_ids
-                kept = [nid for nid in node_ids if nid]
-                self.call_from_thread(
-                    self._chat_panel.add_system_message,
-                    f"/fan {vector}: {len(kept)} siblings landed "
-                    f"({', '.join(nid[:8] for nid in kept[:6])}"
-                    f"{'…' if len(kept) > 6 else ''})",
-                )
-            except BaseException as e:
-                msg = e.user_message()[1] if isinstance(e, SaklasError) else str(e)
-                self.call_from_thread(
-                    self._chat_panel.add_system_message,
-                    f"/fan error: {msg}",
-                )
-
-        self.run_worker(_worker, thread=True)
+        self._get_loom_controller()._run_fan_worker(vector, alphas, prompt)
 
     def _dispatch_loom_regen(
         self, n: int, *, mode: "str | Recipe | None" = None,
     ) -> None:
-        """`/regen N [mode]`: serialize an N-way regen with optional mode.
-
-        Phase 1's engine already serializes via ``session.generate(...,
-        n=N)``; phase 5 routes the optional ``mode`` argument through
-        ``session.regen_with_modifier``.  ``mode`` accepts the built-in
-        strings or a :class:`Recipe` partial for the custom-mode path.
-        When a gen is already running we defer through
-        the pending queue like every other interrupting slash command.
-        """
-        if self._is_busy:
-            mode_tag = f" {mode}" if isinstance(mode, str) else ""
-            self._enqueue_pending(
-                PendingItem("regen_n", f"/regen {n}{mode_tag}", (n, mode))
-            )
-            return
-        if mode is not None:
-            self._run_regen_modifier_worker(n, mode)
-            return
-        self._run_regen_n_worker(n)
+        self._get_loom_controller()._dispatch_loom_regen(n, mode=mode)
 
     def _run_regen_modifier_worker(
         self, n: int, mode: "str | Recipe",
     ) -> None:
-        """Worker for `/regen N <mode>` — routes through ``regen_with_modifier``."""
-        chat = self._chat_panel
-        tree = self._session.tree
-        active = tree.nodes.get(tree.active_node_id)
-        if active is None:
-            chat.add_system_message("/regen: no active node to regen from.")
-            return
-        if active.role == "assistant":
-            user_parent_id = active.parent_id
-        elif active.role == "user":
-            user_parent_id = active.id
-        else:
-            chat.add_system_message("/regen: active node is not part of a turn.")
-            return
-        if user_parent_id is None:
-            chat.add_system_message("/regen: no user-parent to anchor regen under.")
-            return
-
-        rendered = self._render_auto_regen_mode(mode)
-
-        def _worker() -> None:
-            try:
-                self._session.regen_with_modifier(
-                    user_parent_id, mode, n=n,
-                )
-                if self._raw_mode:
-                    self.call_from_thread(self._sync_raw_buffer_from_tree)
-            except BaseException as e:
-                msg = e.user_message()[1] if isinstance(e, SaklasError) else str(e)
-                self.call_from_thread(
-                    self._chat_panel.add_system_message,
-                    f"/regen {rendered} error: {msg}",
-                )
-            finally:
-                self.call_from_thread(
-                    self._chat_panel.add_system_message,
-                    f"/regen × {n} ({rendered}): done.",
-                )
-
-        self.run_worker(_worker, thread=True)
+        self._get_loom_controller()._run_regen_modifier_worker(n, mode)
 
     def _run_regen_n_worker(self, n: int) -> None:
-        chat = self._chat_panel
-        # Read prompt off the active path.
-        hist = self._messages
-        prompt = None
-        if hist and hist[-1]["role"] == "user":
-            prompt = hist[-1]["content"]
-        elif hist:
-            # Walk back to the last user turn.
-            for msg in reversed(hist):
-                if msg["role"] == "user":
-                    prompt = msg["content"]
-                    break
-        if not prompt:
-            chat.add_system_message("/regen: no user turn to regenerate.")
-            return
-
-        # Move active to the user-parent so siblings attach correctly.
-        self._rewind_active_assistant()
-
-        # After the rewind, active is a user node — passing
-        # ``parent_node_id=<user.parent_id>`` lets add_user_turn's dedup
-        # land the regen as a sibling under the existing user turn
-        # (avoiding D15's user-under-user reject).
-        tree = self._session.tree
-        active_node = tree.nodes.get(tree.active_node_id)
-        regen_parent_id: str | None = None
-        if (active_node is not None and active_node.role == "user"
-                and active_node.parent_id is not None):
-            regen_parent_id = active_node.parent_id
-
-        from saklas import SamplingConfig
-
-        def _worker() -> None:
-            try:
-                sampling = SamplingConfig(
-                    temperature=self._session.config.temperature,
-                    top_p=self._session.config.top_p,
-                    max_tokens=self._session.config.max_new_tokens,
-                    seed=self._default_seed,
-                )
-                steering = (
-                    None if not self._active_alphas()
-                    else __import__("saklas").Steering(
-                        alphas=dict(self._active_alphas()),
-                        thinking=self._thinking,
-                    )
-                )
-                self._session.generate(
-                    prompt,
-                    steering=steering,
-                    sampling=sampling,
-                    stateless=False,
-                    n=n,
-                    raw=self._raw_mode,
-                    parent_node_id=regen_parent_id,
-                )
-                if self._raw_mode:
-                    self.call_from_thread(self._sync_raw_buffer_from_tree)
-            except BaseException as e:
-                msg = e.user_message()[1] if isinstance(e, SaklasError) else str(e)
-                self.call_from_thread(
-                    self._chat_panel.add_system_message,
-                    f"/regen error: {msg}",
-                )
-            finally:
-                self.call_from_thread(
-                    self._chat_panel.add_system_message,
-                    f"/regen × {n}: done.",
-                )
-
-        self.run_worker(_worker, thread=True)
+        self._get_loom_controller()._run_regen_n_worker(n)
 
     def _handle_prune(self, arg: str) -> None:
-        """`/prune <filter-expr>` — set the loom-screen filter highlight.
+        self._get_loom_controller()._handle_prune(arg)
 
-        The grammar is :func:`saklas.core.tree_filter.parse_filter`
-        (``agg:`` / ``any:`` / ``last:`` prefix on per-node probe
-        aggregates; clauses combined with ``,`` are AND).  Empty arg
-        clears.  Validation happens through ``parse_filter`` so users
-        get a single ``FilterParseError`` message before the loom
-        screen tries to apply the filter.
-        """
-        from saklas.core.tree_filter import parse_filter, FilterParseError
-
-        chat = self._chat_panel
-        expr = arg.strip()
-        if not expr:
-            self._loom_prune_expr = None
-            chat.add_system_message("/prune cleared.")
-            return
-        try:
-            parse_filter(expr)
-        except FilterParseError as e:
-            chat.add_system_message(f"/prune parse error: {e}")
-            return
-        self._loom_prune_expr = expr
-        try:
-            matching = self._session.tree.filter_by_expr(expr)
-        except FilterParseError as e:
-            chat.add_system_message(f"/prune evaluation error: {e}")
-            return
-        chat.add_system_message(
-            f"/prune active: {expr}  ({len(matching)} node(s) match)"
-        )
-
-    _AUTO_REGEN_MODES = ("unsteered", "inverted", "reseed", "cool", "hot")
-
-    @staticmethod
-    def _render_auto_regen_mode(mode: "str | Recipe") -> str:
-        """Display string for either a named-mode string or a custom Recipe.
-
-        Recipe partials render as ``"custom"`` for footer / status use;
-        the full canonical steering expression rides on the Recipe and
-        is reported in the chat-message on configure / fire.
-        """
-        if isinstance(mode, Recipe):
-            return "custom"
-        return mode
+    def _render_auto_regen_mode(self, mode: "str | Recipe") -> str:
+        return self._get_loom_controller()._render_auto_regen_mode(mode)
 
     def _parse_custom_auto_regen(self, raw: str) -> "Recipe | None":
-        """Parse ``custom: <expr>`` into a Recipe partial.
-
-        ``<expr>`` is a steering expression (the shared grammar from
-        ``saklas.core.steering_expr``).  Returns a Recipe carrying the
-        canonical-form steering string; other Recipe fields (sampling,
-        thinking, seed) inherit from the parent on overlay.  Returns
-        ``None`` and posts an error to chat on parse failure — callers
-        treat ``None`` as "don't update mode."
-        """
-        from saklas.core.steering_expr import (
-            SteeringExprError, format_expr, parse_expr,
-        )
-        prefix = raw[len("custom:"):].strip()
-        chat = self._chat_panel
-        if not prefix:
-            chat.add_system_message(
-                "/auto-regen: custom mode needs an expression. "
-                "Example: /auto-regen custom: 0.3 honest + 0.5 calm"
-            )
-            return None
-        try:
-            parsed = parse_expr(prefix)
-        except (SteeringExprError, AmbiguousSelectorError, SaklasError) as e:
-            chat.add_system_message(f"/auto-regen custom parse error: {e}")
-            return None
-        # Round-trip through format_expr so the canonical text is what
-        # rides on the Recipe — round-trip-safe with replay.
-        return Recipe(steering=format_expr(parsed))
+        return self._get_loom_controller()._parse_custom_auto_regen(raw)
 
     def _handle_auto_regen(self, arg: str) -> None:
-        """`/auto-regen [on|off|<mode>]` — configure the regen modifier.
+        self._get_loom_controller()._handle_auto_regen(arg)
 
-        Phase 5 wiring: ``on`` / ``off`` toggle whether every primary
-        gen fires a sibling auto-regen; ``<mode>`` sets the override.
-        Built-in modes (``unsteered`` / ``inverted`` / ``reseed`` /
-        ``cool`` / ``hot``) stash as strings; ``custom: <expression>``
-        parses the steering expression and stashes a :class:`Recipe`
-        partial.  Bare ``/auto-regen`` reports the current state.
-        ``Ctrl+A`` toggles on/off via :meth:`action_ab_compare` (the
-        keymap meaning is preserved per plan decision 13).
-        """
+    def _handle_diff(self, arg: str) -> None:
+        self._get_loom_controller()._handle_diff(arg)
 
-        chat = self._chat_panel
-        arg = arg.strip()
-        rendered = self._render_auto_regen_mode(self._loom_auto_regen_mode)
-        if not arg:
-            state = "on" if self._loom_auto_regen_on else "off"
-            chat.add_system_message(
-                f"auto-regen: {state}, mode={rendered}"
-            )
-            return
-        low = arg.lower()
-        if low == "on":
-            self._loom_auto_regen_on = True
-            chat.add_system_message(
-                f"auto-regen on (mode={rendered})"
-            )
-            return
-        if low == "off":
-            self._loom_auto_regen_on = False
-            chat.add_system_message("auto-regen off")
-            return
-        # Custom mode: parse the steering expression into a Recipe and
-        # stash typed so the engine's compose_modifier(Recipe) path
-        # picks it up without re-parsing.
-        if low.startswith("custom:"):
-            recipe = self._parse_custom_auto_regen(arg)
-            if recipe is None:
-                return  # error already posted
-            self._loom_auto_regen_mode = recipe
-            chat.add_system_message(
-                f"auto-regen mode set to: custom ({recipe.steering})"
-                + (" (auto-regen is currently off — /auto-regen on to enable)"
-                   if not self._loom_auto_regen_on else "")
-            )
-            return
-        # Built-in named mode.
-        if low not in self._AUTO_REGEN_MODES:
-            chat.add_system_message(
-                "/auto-regen: unknown mode. Valid: "
-                + ", ".join(self._AUTO_REGEN_MODES)
-                + " or 'custom: <steering expression>'"
-            )
-            return
-        self._loom_auto_regen_mode = low
-        chat.add_system_message(
-            f"auto-regen mode set to: {low}"
-            + (" (auto-regen is currently off — /auto-regen on to enable)"
-               if not self._loom_auto_regen_on else "")
-        )
+    def _render_node_diff(self, diff: Any, *, full: bool) -> str:
+        return self._get_loom_controller()._render_node_diff(diff, full=full)
+
+    def _handle_diff_siblings(self, *, full: bool) -> None:
+        self._get_loom_controller()._handle_diff_siblings(full=full)
 
     def _fire_auto_regen(self, row: "_TurnRow | None" = None) -> None:
         """Post-gen hook: fire a sibling regen under the configured mode.
@@ -4729,9 +3061,12 @@ class SaklasApp(App[None]):
         background-worker form that only emits a one-line system message
         on completion.
 
-        The sibling lands under the user-parent of the active assistant
-        in both paths — the visual placement is the only thing that
-        differs.
+        Generation lifecycle (it streams into the shadow column via the
+        ``_ui_token_queue``), so it stays on the App with the rest of the
+        gen orchestration; it *reads* the loom controller's mode state via
+        the proxy properties.  The sibling lands under the user-parent of
+        the active assistant in both paths — the visual placement is the
+        only thing that differs.
         """
         if not self._loom_auto_regen_on:
             return
@@ -4819,7 +3154,7 @@ class SaklasApp(App[None]):
                 msg = e.user_message()[1] if isinstance(e, SaklasError) else str(e)
                 self._ui_token_queue.put(("error", msg, True))
             finally:
-                if self._session._device.type == "mps":
+                if self._session.device.type == "mps":
                     try:
                         torch.mps.synchronize()
                     except Exception:
@@ -4827,181 +3162,3 @@ class SaklasApp(App[None]):
                 self._ui_token_queue.put(("done", True))
 
         self.run_worker(_stream_worker, thread=True)
-
-    def _handle_diff(self, arg: str) -> None:
-        """`/diff <id1> <id2> [--full]` / `/diff --siblings` (phase 5).
-
-        Resolves each id by ulid prefix via :func:`resolve_node_prefix`,
-        calls :meth:`SaklasSession.diff_nodes`, and prints a compact
-        unified text-diff plus the top-5 reading deltas (signed-colored
-        via Rich markup).  ``--full`` extends the readings table to
-        every entry; ``--siblings`` walks the active user-parent's
-        assistant children and prints a pairwise matrix.
-        """
-        from saklas.tui.loom_helpers import resolve_node_prefix
-
-        chat = self._chat_panel
-        tokens = shlex.split(arg) if arg else []
-        if not tokens:
-            chat.add_system_message(
-                "Usage: /diff <id1> <id2> [--full]  |  /diff --siblings"
-            )
-            return
-
-        full = "--full" in tokens
-        ids = [t for t in tokens if not t.startswith("--")]
-
-        if "--siblings" in tokens:
-            self._handle_diff_siblings(full=full)
-            return
-
-        if len(ids) != 2:
-            chat.add_system_message(
-                "Usage: /diff <id1> <id2> [--full]  |  /diff --siblings"
-            )
-            return
-
-        m1 = resolve_node_prefix(self._session.tree, ids[0])
-        m2 = resolve_node_prefix(self._session.tree, ids[1])
-        for label, m, raw in (("id1", m1, ids[0]), ("id2", m2, ids[1])):
-            if m.missing:
-                chat.add_system_message(f"/diff: {label}: no node matches '{raw}'")
-                return
-            if m.ambiguous:
-                cands = ", ".join(c[:12] for c in m.candidates[:8])
-                chat.add_system_message(
-                    f"/diff: {label}: ambiguous '{raw}': {cands}"
-                )
-                return
-
-        # node_id is non-None here: the loop above verified neither match is missing/ambiguous,
-        # which by PrefixMatch's invariant means both node_ids were assigned str hits.
-        assert m1.node_id is not None and m2.node_id is not None  # noqa: S101
-        try:
-            diff = self._session.diff_nodes(m1.node_id, m2.node_id)
-        except Exception as e:
-            chat.add_system_message(f"/diff failed: {e}")
-            return
-
-        chat.add_system_message(self._render_node_diff(diff, full=full))
-
-    def _render_node_diff(self, diff: Any, *, full: bool) -> str:
-        """Format a :class:`NodeDiff` for the chat panel.
-
-        Unified-diff prose (cheap on terminal width) plus top-5 readings
-        deltas, signed-colored via Rich markup.  ``full=True`` extends
-        the readings table to every entry.
-        """
-        a8 = diff.a_id[:8]
-        b8 = diff.b_id[:8]
-        lines: list[str] = []
-        lines.append(f"=== diff: {a8} vs {b8} ===")
-        if diff.parent_id is not None:
-            lines.append(f"  shared parent: {diff.parent_id[:8]}")
-        else:
-            lines.append("  (no shared parent — cross-branch comparison)")
-
-        lines.append("")
-        lines.append("--- text (unified, word-level) ---")
-        if not diff.text:
-            lines.append("(no text)")
-        else:
-            for span in diff.text:
-                if span.state == "equal":
-                    lines.append(f"  {span.text}")
-                elif span.state == "delete":
-                    lines.append(f"[red]- {span.text}[/red]")
-                else:  # insert
-                    lines.append(f"[green]+ {span.text}[/green]")
-
-        lines.append("")
-        cap = None if full else 5
-        cap_label = "" if full else f"top {min(5, len(diff.readings))} of "
-        lines.append(
-            f"--- readings Δ (b - a, {cap_label}{len(diff.readings)}) ---"
-        )
-        if not diff.readings:
-            lines.append("(no readings)")
-        else:
-            for r in diff.readings[: (cap if cap is not None else len(diff.readings))]:
-                color = "green" if r.delta > 0 else ("red" if r.delta < 0 else "dim")
-                lines.append(
-                    f"  [{color}]{r.delta:+.4f}[/{color}]  "
-                    f"{r.name:<28}  ({r.a_value:+.3f} → {r.b_value:+.3f})"
-                )
-        return "\n".join(lines)
-
-    def _handle_diff_siblings(self, *, full: bool) -> None:
-        """`/diff --siblings` — diff every assistant sibling of the active
-        user-parent.
-
-        Two siblings → one pairwise diff (same as `/diff a b`).  Three or
-        more → a small per-pair top-1 reading-delta matrix.
-        """
-        chat = self._chat_panel
-        tree = self._session.tree
-        # Find the active node's user-parent.
-        active = tree.nodes.get(tree.active_node_id)
-        if active is None:
-            chat.add_system_message("/diff --siblings: no active node.")
-            return
-        user_parent_id: str | None = None
-        if active.role == "user":
-            user_parent_id = active.id
-        elif active.role == "assistant" and active.parent_id is not None:
-            user_parent_id = active.parent_id
-        if user_parent_id is None:
-            chat.add_system_message(
-                "/diff --siblings: active node has no user-parent to "
-                "compare children under."
-            )
-            return
-
-        sibs = [
-            cid for cid in tree.child_ids(user_parent_id)
-            if tree.get(cid).role == "assistant"
-        ]
-        if len(sibs) < 2:
-            chat.add_system_message(
-                "/diff --siblings: need ≥2 assistant siblings under the "
-                "active user-parent (have "
-                f"{len(sibs)})."
-            )
-            return
-
-        if len(sibs) == 2:
-            try:
-                diff = self._session.diff_nodes(sibs[0], sibs[1])
-            except Exception as e:
-                chat.add_system_message(f"/diff --siblings failed: {e}")
-                return
-            chat.add_system_message(self._render_node_diff(diff, full=full))
-            return
-
-        # ≥3 siblings: print a top-1 pairwise matrix.  Avoids dumping
-        # full diffs N²-style; users follow up with `/diff a b` for the
-        # full text + readings on any pair that looks interesting.
-        lines: list[str] = [
-            f"=== sibling matrix ({len(sibs)} children of {user_parent_id[:8]}) ===",
-            "  pair                top Δ reading",
-        ]
-        for i in range(len(sibs)):
-            for j in range(i + 1, len(sibs)):
-                a_id, b_id = sibs[i], sibs[j]
-                try:
-                    diff = self._session.diff_nodes(a_id, b_id)
-                except Exception as e:
-                    lines.append(f"  {a_id[:8]} ↔ {b_id[:8]}  (error: {e})")
-                    continue
-                if diff.readings:
-                    top = diff.readings[0]
-                    color = "green" if top.delta > 0 else ("red" if top.delta < 0 else "dim")
-                    lines.append(
-                        f"  {a_id[:8]} ↔ {b_id[:8]}   "
-                        f"[{color}]{top.delta:+.4f}[/{color}]  {top.name}"
-                    )
-                else:
-                    lines.append(
-                        f"  {a_id[:8]} ↔ {b_id[:8]}   (no readings)"
-                    )
-        chat.add_system_message("\n".join(lines))

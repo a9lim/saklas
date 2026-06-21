@@ -126,14 +126,14 @@ def _load_or_fit_transfer_alignment(
         src_model, device="auto", probes=[],
     ) as src_sess:
         src_acts = load_or_compute_neutral_activations(
-            src_sess._model, src_sess._tokenizer, src_sess._layers,
+            src_sess.model, src_sess.tokenizer, src_sess.layers,
             model_id=src_model, force=force,
         )
     with SaklasSession.from_pretrained(
         tgt_model, device="auto", probes=[],
     ) as tgt_sess:
         tgt_acts = load_or_compute_neutral_activations(
-            tgt_sess._model, tgt_sess._tokenizer, tgt_sess._layers,
+            tgt_sess.model, tgt_sess.tokenizer, tgt_sess.layers,
             model_id=tgt_model, force=force,
         )
     try:
@@ -259,10 +259,10 @@ def _setup_steering_vectors(
 
     Walks the raw AST via :func:`referenced_selectors` so namespace
     prefixes drive extraction site selection, then returns the parsed
-    :class:`Steering` with every atom pre-warmed in ``session._profiles``.
+    :class:`Steering` with every atom pre-warmed in ``session.profiles``.
     Returns ``None`` when ``expression`` is empty / falsy.
     """
-    from saklas.io.selectors import resolve_pole, AmbiguousSelectorError
+    from saklas.io.selectors import canonicalize_atom, AmbiguousSelectorError
     from saklas.core.steering_expr import (
         parse_expr, referenced_selectors,
     )
@@ -274,7 +274,7 @@ def _setup_steering_vectors(
         raw_name = concept
         display = f"{ns}/{concept}" if ns else concept
         try:
-            canonical, sign, _match, _variant = resolve_pole(raw_name, namespace=ns)
+            canonical, _variant = canonicalize_atom(raw_name)
         except AmbiguousSelectorError as e:
             if verbose:
                 print(f"  Failed to resolve '{raw_name}': {e}", file=sys.stderr)
@@ -283,10 +283,7 @@ def _setup_steering_vectors(
             continue
         try:
             if verbose:
-                print(
-                    f"Extracting steering vector: {canonical}"
-                    + (f" (negated from '{raw_name}')" if sign < 0 else "")
-                )
+                print(f"Extracting steering vector: {canonical}")
                 _, profile = session.extract(
                     canonical, on_progress=lambda m: print(f"  {m}"),
                     namespace=ns,
@@ -2382,8 +2379,8 @@ def _run_experiment_naturalness(args: argparse.Namespace) -> None:
             )
             sys.exit(2)
         mt = mterms[0]
-        session._ensure_manifold_loaded(mt.manifold)
-        act_manifold = session._manifolds[mt.manifold]
+        session.ensure_manifold_loaded(mt.manifold)
+        act_manifold = session.manifolds[mt.manifold]
         # Resolve label-form positions to coords up front — every
         # downstream call here wants a coord tuple, and the chord
         # baseline is per-coord arithmetic that can't operate on a

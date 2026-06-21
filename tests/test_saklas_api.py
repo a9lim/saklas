@@ -37,22 +37,22 @@ def _mock_session():
     session.vectors = {}
     session.probes = {}
     session.history = []
-    session._manifolds = {}
+    session.manifolds = {}
 
     monitor = MagicMock()
     monitor.probe_names = []
     monitor.attached_probes.return_value = {}
-    session._monitor = monitor
-    session._tokenizer = MagicMock()
+    session.monitor = monitor
+    session.tokenizer = MagicMock()
     session._layers = []
-    session._last_per_token_scores = None
-    session._last_result = None
+    session.last_per_token_scores = None
+    session.last_result = None
     session.last_per_token_scores = None
     session.last_result = None
 
     gen_state = MagicMock()
     gen_state.finish_reason = "stop"
-    session._gen_state = gen_state
+    session.generation_state = gen_state
 
     session.build_readings.return_value = {}
     session.lock = asyncio.Lock()
@@ -172,10 +172,10 @@ class TestSessions:
     def _set_family(session: Any, model_type: str) -> None:
         """Pin the mock session's resolved model_type so the role-header
         registries (and thus role-support gating) see a real family."""
-        session._model = MagicMock()
-        session._model.config = MagicMock()
-        session._model.config.text_config = None
-        session._model.config.model_type = model_type
+        session.model = MagicMock()
+        session.model.config = MagicMock()
+        session.model.config.text_config = None
+        session.model.config.model_type = model_type
 
     def test_session_info_exposes_role_support(self, session_and_client: Any) -> None:
         """Per-message role boxes gate on these flags — keep them on the wire."""
@@ -257,7 +257,7 @@ class TestProbes:
             domain=SimpleNamespace(to_spec=lambda: {}, intrinsic_dim=1),
         )
         session.add_probe.return_value = "happy"
-        session._monitor.attached_probes.return_value = {
+        session.monitor.attached_probes.return_value = {
             "happy": SimpleNamespace(top_n=3, manifold=mani),
         }
         resp = client.post(
@@ -494,12 +494,12 @@ class TestWebSocket:
                 token_count=len(tokens), tok_per_sec=50.0, elapsed=0.05,
                 finish_reason="stop",
             )
-            session._last_result = result
+            session.last_result = result
             session.last_result = result
             per_token = {
                 "happy": [0.1 * (i + 1) for i in range(len(tokens))],
             }
-            session._last_per_token_scores = per_token
+            session.last_per_token_scores = per_token
             session.last_per_token_scores = per_token
             return result
 
@@ -551,9 +551,9 @@ class TestWebSocket:
                 text=text, tokens=tokens, token_count=len(tokens),
                 tok_per_sec=50.0, elapsed=0.01, finish_reason="stop",
             )
-            session._last_result = result
             session.last_result = result
-            session._last_per_token_scores = {}
+            session.last_result = result
+            session.last_per_token_scores = {}
             session.last_per_token_scores = {}
             return result
 
@@ -625,9 +625,9 @@ class TestWebSocket:
                 token_count=1, tok_per_sec=50.0, elapsed=0.02,
                 finish_reason="stop",
             )
-            session._last_result = result
             session.last_result = result
-            session._last_per_token_scores = {}
+            session.last_result = result
+            session.last_per_token_scores = {}
             session.last_per_token_scores = {}
             return result
 
@@ -696,7 +696,7 @@ class TestWebSocket:
 
     def test_bad_steering_does_not_kill_connection(self, session_and_client: Any, monkeypatch: Any) -> None:
         """Regression: a bad steering expression on a generate frame used
-        to escape ``_build_steering`` and bubble out to the outer reader
+        to escape ``_parse_req_steering`` and bubble out to the outer reader
         loop's ``except Exception``, which closed the WS with code 1011.
 
         FastAPI's ``@app.exception_handler(SaklasError)`` doesn't apply
@@ -1122,7 +1122,7 @@ class TestManifoldRoutes:
         monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
         session, client = session_and_client
         client.post("/saklas/v1/manifolds", json=_box1d_payload())
-        session._gen_lock.acquire.return_value = False
+        session.gen_lock.acquire.return_value = False
         assert client.delete(
             "/saklas/v1/manifolds/local/mood").status_code == 409
 
@@ -1345,10 +1345,15 @@ class TestAnalyticsMultiNodeProbe:
             },
         )
 
+        # These stubs feed the *engine's own* analytics methods, bound real
+        # below — ``analytics_names`` / ``_live_direction_tensors`` read the
+        # session privates (``self._profiles`` / ``self._monitor``) directly, so
+        # the stub seeds the private backing, not the public alias.  (The public
+        # ``monitor`` / ``profiles`` properties just return these same objects.)
         session._profiles = {"vx": vx}
         session._monitor.probe_names = ["vp", "fan"]
         session._monitor.manifolds = {"vp": vp, "fan": fan}
-        session._gen_lock = threading.Lock()
+        session.gen_lock = threading.Lock()
         session._analytics_cpu_cache = {}
         # Bind the real analytics methods onto the mock so the endpoint
         # exercises the production fold path, not a vacuous MagicMock.

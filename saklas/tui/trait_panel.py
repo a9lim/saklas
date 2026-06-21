@@ -8,9 +8,9 @@ from typing import TYPE_CHECKING, Any
 from textual.app import ComposeResult
 from textual.containers import VerticalScroll
 from textual.widgets import Static
-from textual.widget import Widget
 
 from saklas.core.histogram import HIST_BUCKETS, bucketize
+from saklas.tui.selectable import SelectableListWidget
 from saklas.tui.utils import BAR_WIDTH, build_bar
 
 if TYPE_CHECKING:
@@ -26,7 +26,8 @@ MINIMAP_W = 17
 MINIMAP_H = 7
 
 
-class TraitPanel(Widget):
+class TraitPanel(SelectableListWidget):
+    # Probe nav clamps at the list ends (no wrap) — the base default.
 
     def __init__(self, categories: dict[str, list[str]] | None = None, **kwargs: Any) -> None:
         super().__init__(**kwargs)
@@ -37,7 +38,6 @@ class TraitPanel(Widget):
         self._active_probes: set[str] = set()
         self._sort_mode: str = "name"
         self._nav_items: list[str] = []
-        self._nav_idx: int = 0
         self._cached_render_text: str = ""
         # Curved-probe state.  After the monitor unification this section
         # renders the *curved* (non-affine) probes of the one unified
@@ -119,28 +119,29 @@ class TraitPanel(Widget):
         )
         self._render_probes()
 
+    def _cursor_len(self) -> int:
+        return len(self._nav_items)
+
     def get_selected_probe(self) -> str | None:
         """Return the name of the currently nav-selected probe, or None."""
         if not self._nav_items:
             return None
-        if self._nav_idx >= len(self._nav_items):
+        if self._cursor_idx >= len(self._nav_items):
             return None
-        return self._nav_items[self._nav_idx]
+        return self._nav_items[self._cursor_idx]
 
     def nav_down(self) -> None:
-        if self._nav_items and self._nav_idx < len(self._nav_items) - 1:
-            self._nav_idx += 1
+        if self.cursor_next():
             self._render_probes()
 
     def nav_up(self) -> None:
-        if self._nav_items and self._nav_idx > 0:
-            self._nav_idx -= 1
+        if self.cursor_prev():
             self._render_probes()
 
     def _render_probes(self) -> None:
         self._nav_items = []
         lines: list[str] = []
-        nav_idx = self._nav_idx
+        nav_idx = self._cursor_idx
         cur = self._current_values
         prv = self._previous_values
         sparks = self._sparklines
@@ -185,8 +186,8 @@ class TraitPanel(Widget):
 
                 mini_spark = sparks.get(name, "")
 
-                sel = ">" if is_nav_selected else " "
-                name_str = f"[bold]{name}[/]" if is_nav_selected else name
+                sel = self.selection_marker(is_nav_selected)
+                name_str = self.name_markup(name, is_nav_selected)
                 spark_tail = f" [dim]{mini_spark}[/]" if mini_spark else ""
 
                 line = (

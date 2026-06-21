@@ -125,12 +125,20 @@ bundled), `clear_manifold_tensors(... model_scope=None, variant="all")` (filter
 raw/sae/from/all; keeps `manifold.json` + corpus), `refresh_manifold` (unscoped:
 `local` → skip, `bundled` → re-materialize, `hf://` → re-pull; scoped → drop one
 model's fit), `transfer_manifold(folder, *, from_model, to_model, alignment,
-whitener, ...)` (pure-io: applies a caller-supplied per-layer Procrustes
-`alignment` to the fitted subspaces — `mean → M_L mean`, `basis → basis @ M_Lᵀ` —
-leaves RBF + `node_coords` untouched, re-bakes the Mahalanobis **share** in target
-space — the target whitener is **required** and must cover the transferred layers
-(`WhitenerError` otherwise; no Euclidean rebake) — clears `origin`, writes the
-`_from-<safe_src>` variant). `manifold_summary(folder)` is the session-independent
+whitener, ...)` (folder read/write orchestration only — the subspace math itself
+moved to `core.manifold.transfer_manifold_subspaces`). It loads the source tensor,
+hands the loaded `Manifold` + caller-supplied per-layer Procrustes `alignment` +
+target whitener to the core compute (which maps `mean → M_L mean`,
+`basis → basis @ M_Lᵀ`, leaves RBF + `node_coords` untouched, re-bakes the
+Mahalanobis **share** in target space — target whitener **required**, `WhitenerError`
+otherwise; no Euclidean rebake — and clears `origin`), then writes the
+`_from-<safe_src>` variant + patches the transfer-provenance sidecar. The core
+function raises a plain `ValueError` when the alignment covers no fitted layer; this
+function surfaces it as `ManifoldFormatError` (the `WhitenerError`, a `ValueError`
+subclass, propagates verbatim via a `SaklasError`-first `except`). The lazy core
+imports are now just `load_manifold` / `save_manifold` /
+`transfer_manifold_subspaces` — no `LayerSubspace` / `eval_rbf` / `subspace_share` /
+`mahalanobis.WhitenerError`. `manifold_summary(folder)` is the session-independent
 serializer shared by `pack show -j` + the HTTP summary route.
 `iter_manifold_folders`, `bundled_manifold_names`, `materialize_bundled_manifolds`
 (copy-on-miss into `default/` for complete package-data folders only, plus a
@@ -198,19 +206,27 @@ trailing `:variant` via `_VARIANT_REGEX = ^(raw | sae[-…] | role[-…] | from[
 any manifold with a fitted tensor for X.
 
 Bare-pole resolution moved entirely to the manifold tier (a bipolar concept is a
-2-node `pca` manifold): `resolve_pole(raw, namespace=)` only peels the `:variant`
-suffix + canonicalizes (always `match=None`, `sign=+1`).
+2-node `pca` manifold). **`resolve_bare_atom(concept, *, namespace=,
+typed_namespace=, variant=) → ResolvedBareAtom`** is the **single owner** of the
+whole bare-atom tier ladder (ordering + cross-tier arbitration) — `core/steering_expr`
+calls it once instead of hand-sequencing the tiers. It returns a tagged
+`ResolvedBareAtom(kind ∈ {label, name, pole})`: (1) **label** tier — a bare
+dot-free slug (`variant=="raw"`, no typed namespace) matching a node label, via
+`resolve_bare_name`; (2) **name** tier — a `variant=="raw"` 2-node `pca` manifold
+*name* (dotted `formal.casual` skips tier 1), via `resolve_manifold_name`,
+resolving to node 0 (the `orient_to=0` + pole); (3) **pole** tier — neither
+matched, so `canonicalize_atom` peels the `:variant` suffix + canonicalizes the
+slug. Every bipolar pole is itself a node label, so a bare pole resolves through
+tier 1 as an affine `%` push. The retired `resolve_pole` folded into
+**`canonicalize_atom(raw) → (canonical, variant)`** (the pure slug + variant peel —
+no `match`/`sign` slots, since the bipolar sign-flip is gone); the external
+canonicalizer consumers (`session._resolve_pole_aliases`, `tui/app`, `cli/runners`)
+call it directly. The underlying tier steps stay public:
 `resolve_manifold_label(label, *, namespace=)` finds a node by label across
 installed manifolds; `resolve_manifold_name(name, *, namespace=)` resolves a 2-node
-`pca` manifold's *name* (e.g. `formal.casual`) to node 0 (the `orient_to=0` + pole) —
-the vector-composite read path. `resolve_bare_name(raw, *, namespace=) →
-ResolvedManifoldLabel | None` is *just* the manifold-label tier (it delegates to
-`resolve_manifold_label`, raising on cross-manifold collision); it knows nothing of
-poles. The tier ordering lives in the caller (`core/steering_expr`): a bare dot-free
-slug hits `resolve_bare_name` (the label tier) first, then the composite-name tier
-(`resolve_manifold_name`, for a dotted `formal.casual`), then `resolve_pole`
-canonicalization — every bipolar pole is itself a node label, so a bare pole
-resolves through the label tier as an affine `%` push. Three memoized walks
+`pca` manifold's *name* to node 0; `resolve_bare_name(raw, *, namespace=) →
+ResolvedManifoldLabel | None` is *just* the manifold-label tier (delegates to
+`resolve_manifold_label`, raising on cross-manifold collision). Three memoized walks
 (`_concepts_cache`/`_manifold_labels_cache`/`_manifold_names_cache`) keyed on
 `manifolds_dir()`; `invalidate()` clears all three — mutating code must call it.
 `parse_args(tokens)` splits a token list into one concept selector + one optional

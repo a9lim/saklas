@@ -19,8 +19,8 @@ materialized into derived profiles by
 
 Pole aliasing is NOT resolved here — that happens inside
 ``SaklasSession.steering()`` (the canonical resolver site, per the plan).
-Callers that pre-resolve a pole via ``cli_selectors.resolve_pole`` can pass
-the canonical name directly.
+Callers that pre-resolve a pole via ``io.selectors.canonicalize_atom`` can
+pass the canonical name directly.
 """
 
 from __future__ import annotations

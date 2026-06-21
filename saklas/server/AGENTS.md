@@ -12,18 +12,25 @@ the vectors-under-session routes (extract/merge); HF upload stays CLI-only.
 `register_ollama_routes(app)` (`ollama.py`) and `register_saklas_routes(app)`
 (`saklas_api.py`), then mounts the Svelte SPA last (so its catch-all can't shadow
 the API). `register_saklas_routes` is the native-tree orchestrator — it delegates
-to sub-module registrars and registers a few route groups in place:
+to sub-module registrars (and owns the shared request bodies + serializer helpers
+those registrars import):
 
 - `manifold_routes.register_manifold_routes` — `/saklas/v1/manifolds/*`
 - `template_routes.register_template_routes` — `/saklas/v1/templates/*` (templated-completion artifact + scorer)
 - `session_routes.register_session_routes` — `/saklas/v1/sessions` CRUD + clear/rewind
+- `tree_routes.register_tree_routes` — the loom `/sessions/{id}/tree/*` routes
+- `vector_routes.register_vector_routes` — the `/sessions/{id}/vectors/*` routes + `/sessions/{id}/correlation`
 - `probe_routes.register_probe_routes` — `/sessions/{id}/probes/*` (unified: list / defaults / attach / detach — every probe shape)
 - `experiment_routes.register_experiment_routes` — `/sessions/{id}/experiments/fan`
 - `traits_routes.register_traits_routes` — `/sessions/{id}/traits/stream` (SSE)
-- in place: the loom `tree/*` routes, the `/sessions/{id}/vectors/*` routes, and
-  the `WS /sessions/{id}/stream`
+- `ws_stream.register_ws_stream` — the `WS /sessions/{id}/stream` co-stream engine
 
-`server/sse.py` and `server/ws_events.py` are the shared SSE / WS plumbing.
+`server/sse.py`, `server/streaming.py`, and `server/ws_events.py` are the shared
+SSE / WS plumbing. `server/streaming.py` owns the end-of-stream derivation shared by
+all three streaming protocols — `stream_finalizer(session, result)` yields
+`(finish_reason, usage, probe_agg)`, and `probe_reading_aggregate(session, result)` /
+`_usage_dict(result)` are its result-parameterized parts (the SSE, NDJSON, and WS
+finalization sites each format the triple into their own wire shape).
 
 ## app.py (OpenAI)
 
@@ -90,7 +97,7 @@ to an HTTP status and picks the Ollama vs OpenAI error shape by path prefix;
 `RequestValidationError` maps to the OpenAI shape. Not supported by either compat
 protocol: tool calling, JSON-schema/structured-output mode, embeddings.
 
-## saklas_api.py (native tree orchestrator + in-place routes)
+## saklas_api.py (native tree orchestrator + shared bodies/helpers)
 
 URL paths carry `{session_id}` for a multi-session shape, but the impl is
 single-session: the one session has id `"default"`, and the loaded model id also
@@ -242,7 +249,7 @@ scoring during generation is unchanged: it rides the traits SSE stream and the
 probe reading extensions on the OpenAI / Ollama / WS paths, which use live hooks,
 not a re-render pass.
 
-### Vectors under `/sessions/{id}/vectors` (in `saklas_api.py`)
+### Vectors under `/sessions/{id}/vectors` (in `vector_routes.py`)
 
 - `GET` list, `GET /{name}` profile JSON, `POST` load-from-disk, `DELETE /{name}`
   (also drops the name from `default_steering`).
@@ -275,7 +282,7 @@ over a same-named probe). Mahalanobis-only: passes `session.whitener` to
 `cosine_similarity`; a missing whitener is 409, and a pair the whitener doesn't
 fully cover lands as `null`. Default covers everything; `names` restricts.
 
-### Loom tree (in `saklas_api.py`)
+### Loom tree (in `tree_routes.py`)
 
 `/sessions/{id}/tree`: full-tree GET, active-path GET, and navigate / edit / branch /
 delete / star / note / reset mutations, plus `edge_label`, `filter`, branch `diff`,
@@ -299,7 +306,7 @@ across generations; multiple clients supported. Events: `start`
 (`{generation_id}`), `token` (`{idx, text, thinking, probes}`), `done`
 (`{generation_id, finish_reason, aggregate}`), `: heartbeat` every 15 s when idle.
 
-### WS /saklas/v1/sessions/{id}/stream (in `saklas_api.py`)
+### WS /saklas/v1/sessions/{id}/stream (in `ws_stream.py`)
 
 Bidirectional WebSocket; only `session_id == "default"` is reachable (HF ids contain
 `/`). Client → server: `{type: "stop"}`, or `{type: "generate", input, steering,

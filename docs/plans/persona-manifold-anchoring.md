@@ -30,7 +30,7 @@ Adding a `default` node fills that gap too.
 
 ## Empirical baseline (experiment 1)
 
-Script: `scripts/persona_default_mode_experiment.py`. Loads the
+Script: `scripts/experiments/persona_default_mode_experiment.py`. Loads the
 bundled persona manifold (gemma-4-31b-it, 60 fit layers, K=100,
 8-D discover coords, per-layer PCA R=64), has gemma respond to a
 stock assistant prompt with hidden-state capture, projects the
@@ -92,7 +92,7 @@ heirloom   → how do i take care of an antique my grandmother left me
 scarcity   → i'm running low on money before my next paycheck, any tips
 ```
 
-## Implementation: `scripts/anchor_personas_to_default.py`
+## Implementation: `scripts/experiments/anchor_personas_to_default.py`
 
 Approximate post-hoc augmentation. Keeps the existing per-layer
 PCA bases unchanged (adding 1 of 101 shifts the basis by O(1/100),
@@ -207,7 +207,7 @@ suppress thinking-mode at the chat-template level for gemma-4 and
 keep the corpus + measurement in pure default-response register.
 
 This is the version that needs to run next session. Edits committed
-to `scripts/anchor_personas_to_default.py`:
+to `scripts/experiments/anchor_personas_to_default.py`:
 
 - `generate_default_corpus`: opener responses now use `thinking=False`
 - `run_experiment`: verification prompt response also `thinking=False`
@@ -247,9 +247,9 @@ Once we re-run with thinking suppressed:
 
 ## Files / state
 
-- `scripts/persona_default_mode_experiment.py` — experiment 1
+- `scripts/experiments/persona_default_mode_experiment.py` — experiment 1
   (baseline measurement)
-- `scripts/anchor_personas_to_default.py` — experiment 2 (anchor +
+- `scripts/experiments/anchor_personas_to_default.py` — experiment 2 (anchor +
   verify); patched with `thinking=False`, ready to re-run
 - `~/.saklas/manifolds/local/personas-anchored/` — the forked
   augmented manifold from the contaminated run; will be overwritten
@@ -266,7 +266,7 @@ Once we re-run with thinking suppressed:
 Run the patched script:
 
 ```
-.venv/bin/python scripts/anchor_personas_to_default.py
+.venv/bin/python scripts/experiments/anchor_personas_to_default.py
 ```
 
 The first three things to check in the output:
