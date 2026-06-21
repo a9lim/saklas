@@ -87,7 +87,7 @@ objects. Don't decompose them. There are exactly two clean seams worth cutting.
   cache, against the comment's promise.
   **Fix:** guard on `sub.is_affine`; use `‖sub.node_coords‖` as the affine spread.
 
-- [ ] **T1.6 — `-O` strips invariant-guarding asserts.** *[confirmed class]*
+- [x] **T1.6 — `-O` strips invariant-guarding asserts.** *[confirmed class]* — DONE (with T3.1/T3.2): `manifold.py:4316` + the moved `compute_node_behavior_centroid` assert → `raise SaklasError`; `monitor.py:556` → early-return of the empty `ProbeReading`.
   `manifold.py:4316` (corrupt-sidecar affine load), `manifold.py:4608`,
   `monitor.py:556` (narrowing before a `torch.cat` that would otherwise `TypeError`
   on `None`). Under `python -O` these become silent-wrong-answer / confusing
@@ -150,7 +150,7 @@ objects. Don't decompose them. There are exactly two clean seams worth cutting.
 — four agents independently declined to split them. Don't re-propose those
 decompositions. Cut exactly these two seams:
 
-- [ ] **T3.1 — `manifold.py` → `core/naturalness.py` (~186 L).**
+- [x] **T3.1 — `manifold.py` → `core/naturalness.py` (~186 L).** — DONE: 7 naturalness-only functions moved (`to_hellinger`, `bhattacharyya_distance`, `fit_behavior_manifold`, `trajectory_naturalness`, `compute_node_behavior_centroid`, `compute_trajectory_distributions`, `_next_token_distribution`); `compute_node_centroid` left (shared primitive); import sites in `cli/runners.py` + `tests/test_naturalness.py` repointed; no re-exports.
   The module's first line claims "pure tensor math, no session/IO coupling," then
   `manifold.py:4500–4686` (the behavior-manifold/naturalness cluster) **calls
   `model(...)` directly** — raw HF forwards with KV cache + sampling. It's the one
@@ -161,7 +161,7 @@ decompositions. Cut exactly these two seams:
   `compute_trajectory_distributions`, `_next_token_distribution` to
   `core/naturalness.py`; update import sites; restore the pure-tensor contract.
 
-- [ ] **T3.2 — `monitor.py` → `core/monitor_attach.py` (~560 L).**
+- [x] **T3.2 — `monitor.py` → `core/monitor_attach.py` (~560 L).** — DONE: attach-time block (lines 2091–2677: `AttachedManifoldProbe`, `_LayerWhiten`, `_build_whitened_factors`, `_attach_manifold_probe`, `_compute_assign_bandwidth`, `_layer_geometry`, the affine helpers + `_woodbury_apply`) moved; monitor.py 2677→2057 L; `_layer_geometry`/`AttachedManifoldProbe`/`_build_whitened_factors`/`_attach_manifold_probe` imported back (no cycle — monitor_attach imports only mahalanobis + manifold). The M7 per-layer-R bandwidth concern left as a deferred note. T5.1 monitor items (double-invalidate, `_woodbury_apply` docstring) folded in here.
   The bottom third (`AttachedManifoldProbe`, `_LayerWhiten`, `_build_whitened_factors`,
   `_attach_manifold_probe`, `_compute_assign_bandwidth`, `_layer_geometry`,
   `monitor.py:2091–2677`) is attach-time algebra with **zero hot-path coupling** —

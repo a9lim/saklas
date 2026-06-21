@@ -4313,7 +4313,11 @@ def transfer_manifold_subspaces(
         # ``node_coords``; curved fits read μ-centered node values off the RBF.
         if sub_f.is_affine:
             coords = sub_f.node_coords  # (K, R) neutral-anchored
-            assert coords is not None  # affine ⇒ node_coords set
+            if coords is None:  # affine ⇒ node_coords set; sidecar corruption guard
+                raise SaklasError(
+                    "transfer_manifold_subspaces: affine LayerSubspace has"
+                    " node_coords=None — the saved manifold sidecar may be corrupt"
+                )
         else:
             _np, _rw, _pc = sub_f.rbf_params()
             coords = eval_rbf(_np, _rw, _pc, _np)  # (K, R)
@@ -4497,155 +4501,6 @@ def invert_parameterization(
     )
 
 
-# ================================================ behavior-space manifold ===
-#
-# The naturalness eval (Goodfire's paper, second half): fit a manifold
-# over the model's *output* distributions, then measure how far a steered
-# generation's behavioral trajectory strays off it.  Output distributions
-# are mapped to Hellinger space via ``p -> sqrt(p)`` -- there the ordinary
-# Euclidean distance is the Hellinger distance, which linearizes the
-# probability simplex so the same RBF machinery applies.
-
-def to_hellinger(p: torch.Tensor) -> torch.Tensor:
-    """Map a probability distribution to Hellinger space: ``p -> sqrt(p)``.
-
-    In Hellinger space the L2 distance between two mapped distributions
-    is their Hellinger distance, and the inner product is the
-    Bhattacharyya coefficient -- which linearizes the simplex enough for
-    a Euclidean PCA + RBF fit.
-    """
-    return p.clamp(min=0.0).sqrt()
-
-
-def bhattacharyya_distance(p: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
-    """Bhattacharyya distance ``-ln sum sqrt(p*q)`` between distributions.
-
-    ``p`` and ``q`` are probability distributions over the last axis.
-    Returns the distance over any leading batch dims.
-    """
-    bc = (p.clamp(min=0.0) * q.clamp(min=0.0)).sqrt().sum(dim=-1)
-    return -torch.log(bc.clamp(min=1e-12))
-
-
-def fit_behavior_manifold(
-    centroid_dists: torch.Tensor,
-    node_params: torch.Tensor,
-    *,
-    n_components: int = DEFAULT_N_COMPONENTS,
-) -> LayerSubspace:
-    """Fit an RBF interpolant through per-node output-distribution centroids.
-
-    ``centroid_dists`` is ``(K, V)`` -- one mean next-token distribution
-    per manifold node -- and ``node_params`` is ``(K, m)`` the embedded
-    domain coordinates.  The distributions are mapped to Hellinger space
-    (``sqrt``) and the same :func:`fit_layer_subspace` PCA + RBF fit is
-    applied there.  Returns the fitted :class:`LayerSubspace` (the
-    behavior manifold).
-    """
-    sub, _ev = fit_layer_subspace(
-        to_hellinger(centroid_dists), node_params, n_components=n_components,
-    )
-    return sub
-
-
-def trajectory_naturalness(
-    traj_dists: torch.Tensor,
-    behavior: LayerSubspace,
-    domain: ManifoldDomain,
-    node_coords: torch.Tensor,
-) -> torch.Tensor:
-    """Per-step Bhattacharyya distance from a trajectory to a behavior manifold.
-
-    ``traj_dists`` is ``(T, V)`` -- the sequence of next-token
-    distributions a generation produced.  ``behavior`` is a behavior
-    manifold from :func:`fit_behavior_manifold`, ``domain`` its
-    :class:`ManifoldDomain`, and ``node_coords`` ``(K, n)`` the manifold's
-    authoring node coordinates (warm-start seeds for the inverse map).
-    For each step the nearest point on the behavior manifold is found (in
-    Hellinger space) and the Bhattacharyya distance to it is returned --
-    low means the step sits on the natural behavior manifold, high flags
-    an off-manifold "teleportation" artifact.
-
-    Returns a ``(T,)`` tensor of per-step distances.
-    """
-    h = to_hellinger(traj_dists)  # (T, V)
-    coords = (h - behavior.mean) @ behavior.basis.T  # (T, R)
-    pos, _ = invert_parameterization(behavior, domain, coords, node_coords)
-    embedded = domain.embed(pos)  # (T, m)
-    curve_coords = eval_rbf(
-        *behavior.rbf_params(), behavior._normalize(embedded),
-    )  # (T, R)
-    curve_h = curve_coords @ behavior.basis + behavior.mean  # (T, V)
-    # In Hellinger space ||h_a - h_b||^2 = 2 - 2*BC, so the Bhattacharyya
-    # coefficient is BC = 1 - d^2/2 and the distance is -ln(BC).
-    d2 = ((h - curve_h) ** 2).sum(dim=-1)
-    bc = (1.0 - d2 / 2.0).clamp(min=1e-12)
-    return -torch.log(bc)
-
-
-def compute_node_behavior_centroid(
-    model: object,
-    tokenizer: object,
-    device: torch.device,
-    statements: list[str],
-) -> torch.Tensor:
-    """Mean next-token probability distribution over a node's statements.
-
-    The behavior-space analogue of :func:`compute_node_centroid`: each
-    statement is run through the model and the softmax over the
-    final-position logits is taken; the per-statement distributions are
-    averaged.  Returns a ``(V,)`` distribution in fp32 on CPU.
-    """
-    if not statements:
-        raise ValueError("manifold node has no statements")
-    is_mps = getattr(device, "type", None) == "mps"
-    acc: torch.Tensor | None = None
-    for text in statements:
-        dist = _next_token_distribution(model, tokenizer, text, device)
-        acc = dist if acc is None else acc + dist
-        if is_mps:
-            torch.mps.empty_cache()
-    assert acc is not None
-    return acc / len(statements)
-
-
-def compute_trajectory_distributions(
-    model: object,
-    tokenizer: object,
-    device: torch.device,
-    text: str,
-) -> torch.Tensor:
-    """Per-position next-token distributions for a generated ``text``.
-
-    One forward pass over the full token sequence; returns ``(T, V)`` --
-    the behavioral trajectory the eval scores against the behavior
-    manifold.  Kept off the generation hot path: the steered text is
-    produced first, then re-run once here.
-    """
-    enc = tokenizer(text, return_tensors="pt", add_special_tokens=False)  # pyright: ignore[reportCallIssue]  # tokenizer typed as object
-    ids = enc["input_ids"].to(device)
-    if ids.shape[1] == 0:
-        raise ValueError("trajectory text tokenized to zero tokens")
-    with torch.inference_mode():
-        logits = model(input_ids=ids, use_cache=False).logits  # pyright: ignore[reportCallIssue]  # model typed as object
-    return torch.softmax(logits[0].float(), dim=-1).detach().to("cpu")
-
-
-def _next_token_distribution(
-    model: object, tokenizer: object, text: str, device: torch.device,
-) -> torch.Tensor:
-    """Softmax over the final-position logits for ``text`` -- ``(V,)`` fp32 CPU."""
-    enc = tokenizer(text, return_tensors="pt", add_special_tokens=False)  # pyright: ignore[reportCallIssue]  # tokenizer typed as object
-    ids = enc["input_ids"]
-    if ids.numel() == 0:
-        bos = getattr(tokenizer, "bos_token_id", None) or 0
-        ids = torch.tensor([[bos]])
-    ids = ids.to(device)
-    with torch.inference_mode():
-        logits = model(input_ids=ids, use_cache=False).logits  # pyright: ignore[reportCallIssue]  # model typed as object
-    return torch.softmax(logits[0, -1].float(), dim=-1).detach().to("cpu")
-
-
 __all__ = [
     "DEFAULT_N_COMPONENTS",
     "DEFAULT_INVERSION_MAX_ITER",
@@ -4677,10 +4532,4 @@ __all__ = [
     "save_manifold",
     "load_manifold",
     "invert_parameterization",
-    "to_hellinger",
-    "bhattacharyya_distance",
-    "fit_behavior_manifold",
-    "trajectory_naturalness",
-    "compute_node_behavior_centroid",
-    "compute_trajectory_distributions",
 ]

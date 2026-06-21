@@ -6,9 +6,8 @@ import math
 import torch
 
 from tests.conftest import CharTokenizer, FakeLogitsModel
-from saklas.core.manifold import (
-    BoxAxis,
-    BoxDomain,
+from saklas.core.manifold import BoxAxis, BoxDomain
+from saklas.core.naturalness import (
     bhattacharyya_distance,
     compute_node_behavior_centroid,
     compute_trajectory_distributions,

@@ -2304,10 +2304,10 @@ def _run_experiment_naturalness(args: argparse.Namespace) -> None:
 
     import torch
 
-    from saklas.core.manifold import (
+    from saklas.core.manifold import domain_from_spec
+    from saklas.core.naturalness import (
         compute_node_behavior_centroid,
         compute_trajectory_distributions,
-        domain_from_spec,
         fit_behavior_manifold,
         trajectory_naturalness,
     )
