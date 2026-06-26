@@ -758,8 +758,20 @@ def _gcv_select_lambda(
     ``tr(I − S) = 0`` and GCV is the indeterminate ``0/0`` — the smallest
     grid ``λ`` is the near-interpolating limit.  Returns
     ``(λ*, edf = tr S_{λ*}, V(λ*))``.
+
+    Demmler–Reinsch form (derived from the same saddle ``_rbf_smoother_matrix``
+    solves: ``ŷ = y − λw``, ``w = Q2 z``, ``(G + λI) z = Q2ᵀ y``):
+    ``I − S_λ = λ·Q2 (G + λI)⁻¹ Q2ᵀ`` with ``Q2`` an orthonormal basis for
+    ``null(Qᵀ)`` (a complete QR of ``Q``) and ``G = Q2ᵀ E Q2`` the reduced
+    kernel.  One ``eigh(G) = UΛUᵀ`` collapses every grid point to scalar
+    evals of ``γⱼ/(γⱼ+λ)`` — ``tr(I−S_λ) = Σⱼ λ/(γⱼ+λ)`` and
+    ``‖(I−S_λ)Y‖²_F = Σ_{j,r} [λ/(γⱼ+λ)]² bⱼᵣ²`` with ``b = Uᵀ Q2ᵀ Y`` — so the
+    sweep is one QR + one eigh + vectorized scalars instead of ``n_grid``
+    ``(K+m+1)``-saddle solves (the dominant cost of an ``auto`` fit on a large
+    heap).  Selection is identical to the smoother-matrix loop.
     """
-    K = E.shape[0]
+    K = int(E.shape[0])
+    mp1 = int(Q.shape[1])
     # Scale the grid by the mean off-diagonal kernel magnitude (diag(E) = 0),
     # so the search range is invariant to coordinate scale.
     denom = K * K - K
@@ -767,24 +779,32 @@ def _gcv_select_lambda(
     if not math.isfinite(e_scale) or e_scale <= 0.0:
         e_scale = 1.0
     grid = e_scale * torch.logspace(-6.0, 3.0, n_grid, dtype=E.dtype)
-    eye = torch.eye(K, dtype=E.dtype)
-    best_lam = float(grid[0].item())
-    best_gcv = math.inf
-    best_edf = float(K)
-    for lam_t in grid:
-        lam = float(lam_t.item())
-        S = _rbf_smoother_matrix(E, Q, lam)
-        ImS = eye - S
-        tr = float(ImS.diagonal().sum().item())
-        if tr <= 0.0:
-            continue
-        rss = float((ImS @ values).pow(2).sum().item())
-        gcv = K * rss / (tr * tr)
-        if gcv < best_gcv:
-            best_gcv = gcv
-            best_lam = lam
-            best_edf = float(K) - tr
-    return best_lam, best_edf, best_gcv
+    null_dim = K - mp1
+    if null_dim <= 0:
+        # Q full-rank square ⇒ no penalized null space; the polynomial fits
+        # every node exactly (S = I) and GCV is the indeterminate 0/0 over the
+        # whole grid.  Match the all-skipped loop: smallest λ at interp edf.
+        return float(grid[0].item()), float(K), math.inf
+    # Q2: an orthonormal basis of null(Qᵀ) from a complete QR of Q.
+    q_full, _ = torch.linalg.qr(Q, mode="complete")        # (K, K)
+    q2 = q_full[:, mp1:]                                    # (K, null_dim)
+    g = q2.transpose(0, 1) @ E @ q2                         # (null_dim, null_dim)
+    g = 0.5 * (g + g.transpose(0, 1))                       # symmetrize vs roundoff
+    gamma, u = torch.linalg.eigh(g)                         # γⱼ ≥ 0 (cond. PSD)
+    gamma = gamma.clamp_min(0.0)
+    b = u.transpose(0, 1) @ (q2.transpose(0, 1) @ values)  # (null_dim, R)
+    b_sq = b.pow(2).sum(dim=1)                              # Σ_r bⱼᵣ²  (null_dim,)
+    # ratios[i, j] = λᵢ / (γⱼ + λᵢ) — the eigenvalues of (I − S_{λᵢ}).
+    ratios = grid.unsqueeze(1) / (gamma.unsqueeze(0) + grid.unsqueeze(1))
+    tr = ratios.sum(dim=1)                                  # tr(I − S_λ)  (n_grid,)
+    rss = (ratios.pow(2) * b_sq.unsqueeze(0)).sum(dim=1)    # ‖(I − S_λ)Y‖²_F
+    gcv = torch.where(tr > 0.0, K * rss / (tr * tr), torch.full_like(tr, math.inf))
+    best_idx = int(torch.argmin(gcv).item())               # first (smallest λ) on ties
+    return (
+        float(grid[best_idx].item()),
+        float(K) - float(tr[best_idx].item()),             # edf = tr S_{λ*}
+        float(gcv[best_idx].item()),
+    )
 
 
 def fit_rbf_smoothed(
@@ -3839,32 +3859,15 @@ def compute_node_reduced_covariance(
     return covs
 
 
-def _reduced_tangent(
-    sub: "LayerSubspace", domain: "ManifoldDomain", coord: torch.Tensor,
-) -> torch.Tensor:
-    """Reduced-space surface tangent ``(R, n)`` at authoring coord ``(n,)``.
-
-    The columns span the directions the surface can move *along* at this point,
-    in the layer's reduced frame — the RBF Jacobian chained through the domain's
-    embedding Jacobian, mirroring :func:`subspace_inject`'s ``j_old``.  Its
-    orthogonal complement in ``ℝ^R`` is the *off-surface* (tube-thickness)
-    subspace.
-    """
-    np_, rw, pc = sub.rbf_params()
-    emb = sub._normalize(domain.embed(coord))  # (m,)
-    j_red = eval_rbf_jacobian(np_, rw, pc, emb) / sub.coord_scale  # (R, m)
-    return j_red @ domain.embed_jacobian(coord)  # (R, n)
-
-
 def _reduced_tangents(
     sub: "LayerSubspace", domain: "ManifoldDomain", coords: torch.Tensor,
 ) -> torch.Tensor:
     """Batched reduced-space surface tangents ``(K, R, n)``.
 
-    Fit-time companion to :func:`_reduced_tangent`: every structured domain's
-    ``embed`` / ``embed_jacobian`` is batch-generic, and ``eval_rbf_jacobian`` is
-    vectorized, so the σ-field pass can compute all node tangent frames for a
-    layer in one tensor sweep instead of K small Python/RBF calls.
+    Computes the RBF Jacobian chained through the domain's embedding Jacobian
+    for every node at once — ``embed`` / ``embed_jacobian`` are batch-generic
+    and ``eval_rbf_jacobian`` is vectorized, so the σ-field pass covers all K
+    node tangent frames for a layer in one tensor sweep.
     """
     np_, rw, pc = sub.rbf_params()
     coords_f = coords.to(torch.float32)
@@ -3873,6 +3876,8 @@ def _reduced_tangents(
     return j_red @ domain.embed_jacobian(coords_f)                # (K, R, n)
 
 
+# test-only: production code uses the batched _off_surface_vars; this scalar
+# form is exercised directly in tests/test_manifold_math.py.
 def _off_surface_var(
     cov: torch.Tensor, tangent: torch.Tensor, R: int, n: int,
 ) -> float:
@@ -4217,6 +4222,125 @@ def load_manifold(path: str | Path) -> Manifold:
     )
 
 
+def transfer_manifold_subspaces(
+    src: Manifold,
+    alignment: dict[int, torch.Tensor],
+    *,
+    whitener: "LayerWhitener | None",
+    from_model: str,
+    to_model: str,
+) -> Manifold:
+    """Map a fitted manifold's per-layer subspaces into a target model's space.
+
+    The pure-tensor core of the cross-model Procrustes transfer (the folder
+    read/write orchestration stays in :func:`saklas.io.manifold_lifecycle.
+    transfer_manifold`).  Takes the already-loaded **source** ``Manifold``, a
+    per-layer alignment map ``{layer: M_L}`` (``v_tgt = M_L @ v_src``, the shape
+    :func:`saklas.io.alignment.fit_alignment` produces), and the **target**
+    model's whitener, and returns a new ``Manifold`` whose subspaces live in
+    target space.
+
+    Each covered layer's affine subspace maps as ``mean_tgt = M_L @ mean_src``
+    and ``basis_tgt = basis_src @ M_Lᵀ`` (each basis row transforms like a
+    vector).  Layers the alignment doesn't cover are dropped.  The RBF
+    interpolant fields (``node_params`` / ``rbf_weights`` / ``poly_coeffs`` /
+    ``coord_offset`` / ``coord_scale``) and the shared ``node_coords`` live in
+    subspace/authoring-coordinate space, not model space, so they ride through
+    untouched — the subspace relocates via the transformed ``mean``/``basis``
+    and the in-subspace parameterization is invariant.
+
+    **Target-metric share re-bake (mandatory).**  The source fit's per-layer
+    Mahalanobis ``share`` is a per-model quantity (``Σ`` belongs to
+    ``from_model``), so it can't carry across.  The target ``whitener`` is
+    **required** and must cover every transferred layer (all-or-nothing,
+    mirroring the fit gate); the share is recomputed in target space via
+    :func:`subspace_share` (``sqrt(Σ_k coordsᵀ (B_tgt Σ_tgt⁻¹ B_tgtᵀ) coords)``
+    — the same formula the fit pipeline bakes).  A missing or non-covering
+    whitener raises :class:`~saklas.core.mahalanobis.WhitenerError`; there is no
+    Euclidean rebake.  ``origin`` (the per-layer foot of the *source* neutral
+    mean) is per-model too, so it is cleared — the apply path falls back to a
+    zero-coord seed per layer.
+
+    Folder-level format guards (empty alignment, source fit missing) are the
+    caller's concern; this function raises only :class:`~saklas.core.
+    mahalanobis.WhitenerError` (missing / partial target whitener) and
+    ``ValueError`` when ``alignment`` covers none of the source's fitted layers.
+    """
+    from dataclasses import replace as _dc_replace
+
+    from saklas.core.mahalanobis import WhitenerError
+
+    # Map each covered layer's subspace into target space.  ``M_L`` is
+    # ``(D_tgt, D_src)`` so ``mean_tgt = M_L @ mean_src`` and each basis row
+    # transforms the same way → ``basis_tgt = basis_src @ M_L^T``.
+    new_layers: dict[int, LayerSubspace] = {}
+    for layer, sub in src.layers.items():
+        M_L = alignment.get(layer)
+        if M_L is None:
+            continue
+        M = M_L.to(dtype=torch.float32)
+        mean_f = sub.mean.to(torch.float32)
+        basis_f = sub.basis.to(torch.float32)
+        mean_tgt = (M @ mean_f).to(dtype=sub.mean.dtype)
+        basis_tgt = (basis_f @ M.transpose(0, 1)).to(dtype=sub.basis.dtype)
+        new_layers[layer] = _dc_replace(sub, mean=mean_tgt, basis=basis_tgt)
+
+    if not new_layers:
+        raise ValueError(
+            f"alignment for {from_model!r} → {to_model!r} covered none of the "
+            f"source manifold's fitted layers ({sorted(src.layers)})"
+        )
+
+    # The source model's Mahalanobis share is per-model (Σ and the neutral
+    # activations are both ``from_model`` quantities), so it's invalid in
+    # ``to_model`` space.  The **target** whitener is mandatory and must cover
+    # every transferred layer (all-or-nothing, mirroring the fit gate);
+    # recompute the share in target space.  No Euclidean rebake — a missing /
+    # partial whitener is an error.
+    if whitener is None or not whitener.covers_all(new_layers.keys()):
+        raise WhitenerError(
+            "manifold transfer requires a Mahalanobis whitener covering every "
+            f"transferred layer {sorted(new_layers.keys())}; generate neutral "
+            "activations for the TARGET model first (the Euclidean path is gone)"
+        )
+
+    new_share: dict[int, float] = {}
+    for layer, sub_tgt in new_layers.items():
+        sub_f = sub_tgt.to(device=torch.device("cpu"), dtype=torch.float32)
+        # ``coords`` are the reduced node values in subspace-coordinate space —
+        # invariant under the model-space alignment, so identical to the source
+        # fit.  ``subspace_share`` computes the μ-centered whitened spread
+        # ``sqrt(Σ_k c_kᵀ M_R c_k)`` (``M_R = B_tgt Σ_tgt⁻¹ B_tgtᵀ`` via
+        # ``subspace_gram``, the *target* Σ⁻¹ restricted to the transferred
+        # basis) — the same formula the fit pipeline bakes, now in target space.
+        # It μ-centers internally only if fed μ-centered coords, so do the
+        # centering here: flat fits carry neutral-anchored real coords in
+        # ``node_coords``; curved fits read μ-centered node values off the RBF.
+        if sub_f.is_affine:
+            coords = sub_f.node_coords  # (K, R) neutral-anchored
+            if coords is None:  # affine ⇒ node_coords set; sidecar corruption guard
+                raise SaklasError(
+                    "transfer_manifold_subspaces: affine LayerSubspace has"
+                    " node_coords=None — the saved manifold sidecar may be corrupt"
+                )
+        else:
+            _np, _rw, _pc = sub_f.rbf_params()
+            coords = eval_rbf(_np, _rw, _pc, _np)  # (K, R)
+        mu_coords = coords - coords.mean(dim=0, keepdim=True)  # μ-center
+        new_share[layer] = subspace_share(
+            mu_coords, sub_f.basis, whitener=whitener, layer=layer,
+        )
+
+    return _dc_replace(
+        src, layers=new_layers,
+        mahalanobis_share=new_share,
+        # ``origin`` is the per-layer foot of the *source* model's neutral mean
+        # — a per-model quantity invalid in target space (same reason the share
+        # is cleared); the apply path falls back to a zero-coord seed per layer.
+        origin={},
+    )
+
+
 def _gn_step(
     p: torch.Tensor,
     q: torch.Tensor,
@@ -4382,153 +4506,16 @@ def invert_parameterization(
     )
 
 
-# ================================================ behavior-space manifold ===
-#
-# The naturalness eval (Goodfire's paper, second half): fit a manifold
-# over the model's *output* distributions, then measure how far a steered
-# generation's behavioral trajectory strays off it.  Output distributions
-# are mapped to Hellinger space via ``p -> sqrt(p)`` -- there the ordinary
-# Euclidean distance is the Hellinger distance, which linearizes the
-# probability simplex so the same RBF machinery applies.
+def manifold_is_affine(manifold: "Manifold") -> bool:
+    """True iff every layer subspace is flat — an affine ``%`` joins the merge.
 
-def to_hellinger(p: torch.Tensor) -> torch.Tensor:
-    """Map a probability distribution to Hellinger space: ``p -> sqrt(p)``.
-
-    In Hellinger space the L2 distance between two mapped distributions
-    is their Hellinger distance, and the inner product is the
-    Bhattacharyya coefficient -- which linearizes the simplex enough for
-    a Euclidean PCA + RBF fit.
+    A fit is all-affine (``fit_mode=pca``) or all-curved (authored / spectral);
+    a curved ``%`` gets its own two-op instead.
     """
-    return p.clamp(min=0.0).sqrt()
-
-
-def bhattacharyya_distance(p: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
-    """Bhattacharyya distance ``-ln sum sqrt(p*q)`` between distributions.
-
-    ``p`` and ``q`` are probability distributions over the last axis.
-    Returns the distance over any leading batch dims.
-    """
-    bc = (p.clamp(min=0.0) * q.clamp(min=0.0)).sqrt().sum(dim=-1)
-    return -torch.log(bc.clamp(min=1e-12))
-
-
-def fit_behavior_manifold(
-    centroid_dists: torch.Tensor,
-    node_params: torch.Tensor,
-    *,
-    n_components: int = DEFAULT_N_COMPONENTS,
-) -> LayerSubspace:
-    """Fit an RBF interpolant through per-node output-distribution centroids.
-
-    ``centroid_dists`` is ``(K, V)`` -- one mean next-token distribution
-    per manifold node -- and ``node_params`` is ``(K, m)`` the embedded
-    domain coordinates.  The distributions are mapped to Hellinger space
-    (``sqrt``) and the same :func:`fit_layer_subspace` PCA + RBF fit is
-    applied there.  Returns the fitted :class:`LayerSubspace` (the
-    behavior manifold).
-    """
-    sub, _ev = fit_layer_subspace(
-        to_hellinger(centroid_dists), node_params, n_components=n_components,
-    )
-    return sub
-
-
-def trajectory_naturalness(
-    traj_dists: torch.Tensor,
-    behavior: LayerSubspace,
-    domain: ManifoldDomain,
-    node_coords: torch.Tensor,
-) -> torch.Tensor:
-    """Per-step Bhattacharyya distance from a trajectory to a behavior manifold.
-
-    ``traj_dists`` is ``(T, V)`` -- the sequence of next-token
-    distributions a generation produced.  ``behavior`` is a behavior
-    manifold from :func:`fit_behavior_manifold`, ``domain`` its
-    :class:`ManifoldDomain`, and ``node_coords`` ``(K, n)`` the manifold's
-    authoring node coordinates (warm-start seeds for the inverse map).
-    For each step the nearest point on the behavior manifold is found (in
-    Hellinger space) and the Bhattacharyya distance to it is returned --
-    low means the step sits on the natural behavior manifold, high flags
-    an off-manifold "teleportation" artifact.
-
-    Returns a ``(T,)`` tensor of per-step distances.
-    """
-    h = to_hellinger(traj_dists)  # (T, V)
-    coords = (h - behavior.mean) @ behavior.basis.T  # (T, R)
-    pos, _ = invert_parameterization(behavior, domain, coords, node_coords)
-    embedded = domain.embed(pos)  # (T, m)
-    curve_coords = eval_rbf(
-        *behavior.rbf_params(), behavior._normalize(embedded),
-    )  # (T, R)
-    curve_h = curve_coords @ behavior.basis + behavior.mean  # (T, V)
-    # In Hellinger space ||h_a - h_b||^2 = 2 - 2*BC, so the Bhattacharyya
-    # coefficient is BC = 1 - d^2/2 and the distance is -ln(BC).
-    d2 = ((h - curve_h) ** 2).sum(dim=-1)
-    bc = (1.0 - d2 / 2.0).clamp(min=1e-12)
-    return -torch.log(bc)
-
-
-def compute_node_behavior_centroid(
-    model: object,
-    tokenizer: object,
-    device: torch.device,
-    statements: list[str],
-) -> torch.Tensor:
-    """Mean next-token probability distribution over a node's statements.
-
-    The behavior-space analogue of :func:`compute_node_centroid`: each
-    statement is run through the model and the softmax over the
-    final-position logits is taken; the per-statement distributions are
-    averaged.  Returns a ``(V,)`` distribution in fp32 on CPU.
-    """
-    if not statements:
-        raise ValueError("manifold node has no statements")
-    is_mps = getattr(device, "type", None) == "mps"
-    acc: torch.Tensor | None = None
-    for text in statements:
-        dist = _next_token_distribution(model, tokenizer, text, device)
-        acc = dist if acc is None else acc + dist
-        if is_mps:
-            torch.mps.empty_cache()
-    assert acc is not None
-    return acc / len(statements)
-
-
-def compute_trajectory_distributions(
-    model: object,
-    tokenizer: object,
-    device: torch.device,
-    text: str,
-) -> torch.Tensor:
-    """Per-position next-token distributions for a generated ``text``.
-
-    One forward pass over the full token sequence; returns ``(T, V)`` --
-    the behavioral trajectory the eval scores against the behavior
-    manifold.  Kept off the generation hot path: the steered text is
-    produced first, then re-run once here.
-    """
-    enc = tokenizer(text, return_tensors="pt", add_special_tokens=False)  # pyright: ignore[reportCallIssue]  # tokenizer typed as object
-    ids = enc["input_ids"].to(device)
-    if ids.shape[1] == 0:
-        raise ValueError("trajectory text tokenized to zero tokens")
-    with torch.inference_mode():
-        logits = model(input_ids=ids, use_cache=False).logits  # pyright: ignore[reportCallIssue]  # model typed as object
-    return torch.softmax(logits[0].float(), dim=-1).detach().to("cpu")
-
-
-def _next_token_distribution(
-    model: object, tokenizer: object, text: str, device: torch.device,
-) -> torch.Tensor:
-    """Softmax over the final-position logits for ``text`` -- ``(V,)`` fp32 CPU."""
-    enc = tokenizer(text, return_tensors="pt", add_special_tokens=False)  # pyright: ignore[reportCallIssue]  # tokenizer typed as object
-    ids = enc["input_ids"]
-    if ids.numel() == 0:
-        bos = getattr(tokenizer, "bos_token_id", None) or 0
-        ids = torch.tensor([[bos]])
-    ids = ids.to(device)
-    with torch.inference_mode():
-        logits = model(input_ids=ids, use_cache=False).logits  # pyright: ignore[reportCallIssue]  # model typed as object
-    return torch.softmax(logits[0, -1].float(), dim=-1).detach().to("cpu")
+    layers = getattr(manifold, "layers", None)
+    if not layers:
+        return False
+    return all(sub.is_affine for sub in layers.values())
 
 
 __all__ = [
@@ -4562,10 +4549,5 @@ __all__ = [
     "save_manifold",
     "load_manifold",
     "invert_parameterization",
-    "to_hellinger",
-    "bhattacharyya_distance",
-    "fit_behavior_manifold",
-    "trajectory_naturalness",
-    "compute_node_behavior_centroid",
-    "compute_trajectory_distributions",
+    "manifold_is_affine",
 ]

@@ -33,22 +33,29 @@ def _make_app():
     from saklas import LoomTree as _LoomTree
     session.tree = _LoomTree()
     session.history = []
-    session._profiles = {}
-    session._model_info = {"model_id": "mock/mock", "model_type": "mock"}
-    session._device = SimpleNamespace(type="cpu")
-    session._layers = [0, 1, 2]
+    # Stub the *public* accessors the TUI reads — the frontend talks to the
+    # session through its public API only (no ``session._monitor`` / ``._profiles``
+    # reach-ins).  On a ``MagicMock`` the private backing name and the public
+    # property are unrelated children, so configuring the public name is what
+    # production sees.  ``profiles`` is the in-memory baked-direction registry;
+    # ``model_metadata`` the structured model-info object; ``device`` / ``layers``
+    # / ``tokenizer`` the engine handles.
+    session.profiles = {}
+    session.model_metadata = {"model_id": "mock/mock", "model_type": "mock"}
+    session.device = SimpleNamespace(type="cpu")
+    session.layers = [0, 1, 2]
     # One unified monitor now.  ``manifolds`` maps probe-name → the attached
     # ``Manifold``; the TUI's ``_refresh_probe_panels`` splits the probe set
     # by geometry (flat → scalar section, curved → manifold section).  Tests
     # that exercise curved-probe routing seed ``manifolds`` with a stub whose
     # layers report ``is_affine = False``; the default empty dict makes every
     # probe read as flat.
-    session._monitor = MagicMock()
-    session._monitor.probe_names = []
-    session._monitor.manifolds = {}
-    session._last_result = None
-    session._last_per_token_scores = None
-    session._tokenizer = MagicMock()
+    session.monitor = MagicMock()
+    session.monitor.probe_names = []
+    session.monitor.manifolds = {}
+    session.last_result = None
+    session.last_per_token_scores = None
+    session.tokenizer = MagicMock()
     session.config = SimpleNamespace(
         temperature=0.7, top_p=0.9, max_new_tokens=128,
         system_prompt=None,
@@ -259,12 +266,12 @@ def test_unprobe_missing():
 
 def test_unprobe_removes():
     app = _make_app()
-    app._session._monitor.probe_names = ["happy.sad"]
+    app._session.monitor.probe_names = ["happy.sad"]
     app._trait_panel.set_active_probes = MagicMock()
     app._apply_highlight_to_all = MagicMock()
 
     def _remove_probe(name: Any) -> None:
-        app._session._monitor.probe_names = []
+        app._session.monitor.probe_names = []
     app._session.remove_probe.side_effect = _remove_probe
 
     app._highlight_probe = "happy.sad"
@@ -337,7 +344,7 @@ def test_help_mentions_new_bindings():
 
 def test_generate_worker_uses_generate_stream(monkeypatch: pytest.MonkeyPatch):
     app = _make_app()
-    app._session._device = SimpleNamespace(type="cpu")
+    app._session.device = SimpleNamespace(type="cpu")
     # Stub generate_stream to capture kwargs and yield one event.
     captured = {}
 
@@ -385,8 +392,8 @@ def test_generate_worker_uses_generate_stream(monkeypatch: pytest.MonkeyPatch):
 
 def test_generate_worker_enables_live_scores_for_probe_highlight():
     app = _make_app()
-    app._session._device = SimpleNamespace(type="cpu")
-    app._session._monitor.probe_names = ["happy.sad"]
+    app._session.device = SimpleNamespace(type="cpu")
+    app._session.monitor.probe_names = ["happy.sad"]
     app._highlighting = True
     app._highlight_probe = "happy.sad"
     captured = {}
@@ -414,7 +421,7 @@ def test_start_generation_inherits_highlight_state():
     post-gen).
     """
     app = _make_app()
-    app._session._device = SimpleNamespace(type="cpu")
+    app._session.device = SimpleNamespace(type="cpu")
     app._highlighting = True
     app._highlight_probe = "honest.deceptive"
 
@@ -432,7 +439,7 @@ def test_start_generation_inherits_highlight_state():
 
 def test_start_generation_skips_highlight_when_off():
     app = _make_app()
-    app._session._device = SimpleNamespace(type="cpu")
+    app._session.device = SimpleNamespace(type="cpu")
     app._highlighting = False
 
     widget = MagicMock()
@@ -475,7 +482,7 @@ def test_generate_worker_passes_steering_when_alphas_active():
 def test_probe_seeds_highlight():
     app = _make_app()
     # Simulate probe-added callback (what _handle_probe ends up calling).
-    app._session._monitor.probe_names = ["happy.sad"]
+    app._session.monitor.probe_names = ["happy.sad"]
     app._trait_panel.set_active_probes = MagicMock()
     app._assistant_messages = []
     app._on_probe_added("happy.sad")
@@ -492,11 +499,11 @@ def test_compare_pairwise():
 
     app = _make_app()
     t = {0: torch.randn(8), 1: torch.randn(8)}
-    app._session._profiles = {
+    app._session.profiles = {
         "angry.calm": Profile(t),
         "happy.sad": Profile({k: v.clone() for k, v in t.items()}),
     }
-    app._session._monitor.profiles = {}
+    app._session.monitor.profiles = {}
     # /compare is Mahalanobis-only now: the session exposes a covering whitener.
     app._session.whitener = isotropic_whitener([0, 1], 8)
     app._handle_command("/compare angry.calm happy.sad")
@@ -511,12 +518,12 @@ def test_compare_ranked():
 
     app = _make_app()
     base = {0: torch.randn(8), 1: torch.randn(8)}
-    app._session._profiles = {
+    app._session.profiles = {
         "angry.calm": Profile(base),
         "happy.sad": Profile({k: torch.randn(8) for k in base}),
         "formal.casual": Profile({k: torch.randn(8) for k in base}),
     }
-    app._session._monitor.profiles = {
+    app._session.monitor.profiles = {
         "angry.calm": Profile(base),
         "happy.sad": Profile({k: torch.randn(8) for k in base}),
         "formal.casual": Profile({k: torch.randn(8) for k in base}),
@@ -529,8 +536,8 @@ def test_compare_ranked():
 
 def test_compare_unknown_name():
     app = _make_app()
-    app._session._profiles = {}
-    app._session._monitor.profiles = {}
+    app._session.profiles = {}
+    app._session.monitor.profiles = {}
     app._handle_command("/compare ghost")
     msg = _msgs(app)
     assert "not found" in msg.lower() or "no profile" in msg.lower()
@@ -800,9 +807,9 @@ def test_handle_extract_bare_sae_uses_autoload(monkeypatch: pytest.MonkeyPatch, 
     # _ensure_profile_registered populates _profiles[<concept>:sae].
     def _ensure(key: Any, **kw: Any) -> Any:
         assert key == "honest:sae"
-        app._session._profiles["honest:sae"] = {0: torch.zeros(4)}
-        return app._session._profiles["honest:sae"]
-    app._session._ensure_profile_registered = _ensure
+        app._session.profiles["honest:sae"] = {0: torch.zeros(4)}
+        return app._session.profiles["honest:sae"]
+    app._session.ensure_profile_registered = _ensure
 
     def _run_worker(fn: Any, thread: bool = True) -> None:
         fn()
@@ -903,14 +910,14 @@ def test_detect_namespace_selector_rejects_non_bulk_forms():
 
 
 def _stub_concepts(monkeypatch: pytest.MonkeyPatch, concepts: Any) -> None:
-    """Patch ``_all_concepts`` to return a synthetic list of namespaced
+    """Patch ``all_concepts`` to return a synthetic list of namespaced
     folders. Each entry is a SimpleNamespace with ``namespace`` and
     ``name`` attributes — the only fields the bulk handlers read.
     """
     import saklas.io.selectors as _sel
 
     fakes = [SimpleNamespace(namespace=ns, name=n) for ns, n in concepts]
-    monkeypatch.setattr(_sel, "_all_concepts", lambda: fakes)
+    monkeypatch.setattr(_sel, "all_concepts", lambda: fakes)
 
 
 def _drain_workers(app: Any) -> None:
@@ -949,10 +956,10 @@ def test_handle_steer_namespace_bulk_loads_cached_and_warns_on_skip(monkeypatch:
         # bulk handler's Profile(...) wrap — which re-validates the cached
         # dict before re-registering — passes.
         if key in cached_keys:
-            app._session._profiles[key] = {0: torch.zeros(2)}
-            return app._session._profiles[key]
+            app._session.profiles[key] = {0: torch.zeros(2)}
+            return app._session.profiles[key]
         raise VectorNotRegisteredError(f"no manifold for '{key}'")
-    app._session._ensure_profile_registered = _ensure
+    app._session.ensure_profile_registered = _ensure
     app.run_worker = MagicMock()
     app.call_from_thread = lambda fn, *a, **kw: fn(*a, **kw)
     app._refresh_left_panel = MagicMock()
@@ -998,8 +1005,8 @@ def test_handle_probe_namespace_bulk_loads_and_seeds_highlight(monkeypatch: pyte
         ("alice", "calm.angry"),
         ("alice", "happy.sad"),
     ])
-    app._session._profiles["alice/calm.angry"] = {0: object()}
-    app._session._profiles["alice/happy.sad"] = {0: object()}
+    app._session.profiles["alice/calm.angry"] = {0: object()}
+    app._session.profiles["alice/happy.sad"] = {0: object()}
     app.run_worker = MagicMock()
     app.call_from_thread = lambda fn, *a, **kw: fn(*a, **kw)
     app._apply_highlight_to_all = MagicMock()
@@ -1052,7 +1059,7 @@ def test_handle_unsteer_namespace_empty_match_reports_clean():
 
 def test_handle_unprobe_namespace_clears_highlight_when_seed_is_in_namespace():
     app = _make_app()
-    app._session._monitor.probe_names = ["alice/calm", "alice/happy", "default/keep"]
+    app._session.monitor.probe_names = ["alice/calm", "alice/happy", "default/keep"]
     app._highlight_probe = "alice/happy"
     app._highlighting = True
     app._apply_highlight_to_all = MagicMock()
@@ -1061,15 +1068,15 @@ def test_handle_unprobe_namespace_clears_highlight_when_seed_is_in_namespace():
     # Mutate probe_names as ``unprobe`` would so ``set_active_probes``
     # afterward observes the trimmed set.
     def _unprobe(name: Any) -> None:
-        app._session._monitor.probe_names = [
-            p for p in app._session._monitor.probe_names if p != name
+        app._session.monitor.probe_names = [
+            p for p in app._session.monitor.probe_names if p != name
         ]
     app._session.remove_probe.side_effect = _unprobe
 
     app._handle_command("/unprobe alice/")
 
     assert app._session.remove_probe.call_count == 2
-    assert app._session._monitor.probe_names == ["default/keep"]
+    assert app._session.monitor.probe_names == ["default/keep"]
     # Highlight seed sat inside the namespace — gets dropped.
     assert app._highlight_probe is None
     assert app._highlighting is False
@@ -1078,15 +1085,15 @@ def test_handle_unprobe_namespace_clears_highlight_when_seed_is_in_namespace():
 
 def test_handle_unprobe_namespace_keeps_highlight_when_seed_outside_namespace():
     app = _make_app()
-    app._session._monitor.probe_names = ["alice/x", "default/keep"]
+    app._session.monitor.probe_names = ["alice/x", "default/keep"]
     app._highlight_probe = "default/keep"
     app._highlighting = True
     app._apply_highlight_to_all = MagicMock()
     app._refresh_trait_why = MagicMock()
 
     def _unprobe(name: Any) -> None:
-        app._session._monitor.probe_names = [
-            p for p in app._session._monitor.probe_names if p != name
+        app._session.monitor.probe_names = [
+            p for p in app._session.monitor.probe_names if p != name
         ]
     app._session.remove_probe.side_effect = _unprobe
 
@@ -1901,9 +1908,9 @@ def test_steer_manifold_term_validates_and_registers(monkeypatch: pytest.MonkeyP
     manifold = SimpleNamespace(domain=domain)
 
     def _ensure(key: Any) -> None:
-        app._session._manifolds[key] = manifold
-    app._session._ensure_manifold_loaded = _ensure
-    app._session._manifolds = {}
+        app._session.manifolds[key] = manifold
+    app._session.ensure_manifold_loaded = _ensure
+    app._session.manifolds = {}
     app.run_worker = lambda fn, thread=True: fn()
     app.call_from_thread = lambda fn, *a, **kw: fn(*a, **kw)
 
@@ -1929,9 +1936,9 @@ def test_steer_manifold_term_arity_mismatch_reports(monkeypatch: pytest.MonkeyPa
     manifold = SimpleNamespace(domain=domain)
 
     def _ensure(key: Any) -> None:
-        app._session._manifolds[key] = manifold
-    app._session._ensure_manifold_loaded = _ensure
-    app._session._manifolds = {}
+        app._session.manifolds[key] = manifold
+    app._session.ensure_manifold_loaded = _ensure
+    app._session.manifolds = {}
     app.run_worker = lambda fn, thread=True: fn()
     app.call_from_thread = lambda fn, *a, **kw: fn(*a, **kw)
 
@@ -1950,13 +1957,13 @@ def test_steer_manifold_unregistered_reports(monkeypatch: pytest.MonkeyPatch, tm
     from saklas.core.session import ManifoldNotRegisteredError
 
     app = _make_app()
-    app._session._manifolds = {}
+    app._session.manifolds = {}
 
     def _ensure(key: Any) -> None:
         raise ManifoldNotRegisteredError(
             f"manifold '{key}' has no fitted tensor"
         )
-    app._session._ensure_manifold_loaded = _ensure
+    app._session.ensure_manifold_loaded = _ensure
     app.run_worker = lambda fn, thread=True: fn()
     app.call_from_thread = lambda fn, *a, **kw: fn(*a, **kw)
 
@@ -1986,9 +1993,9 @@ def test_steer_mixed_expression_applies_vector_siblings(monkeypatch: pytest.Monk
     manifold = SimpleNamespace(domain=domain)
 
     def _ensure(key: Any) -> None:
-        app._session._manifolds[key] = manifold
-    app._session._ensure_manifold_loaded = _ensure
-    app._session._manifolds = {}
+        app._session.manifolds[key] = manifold
+    app._session.ensure_manifold_loaded = _ensure
+    app._session.manifolds = {}
     app.run_worker = lambda fn, thread=True: fn()
     app.call_from_thread = lambda fn, *a, **kw: fn(*a, **kw)
 
@@ -2123,8 +2130,8 @@ def test_manifold_probe_attach_routes_through_session(monkeypatch: pytest.Monkey
         captured["selector"] = selector
         # Pretend the session registered the probe under the selector
         # name and populated the unified monitor.
-        app._session._monitor.probe_names = [selector]
-        app._session._monitor.manifolds = {selector: manifold}
+        app._session.monitor.probe_names = [selector]
+        app._session.monitor.manifolds = {selector: manifold}
         return selector
     app._session.add_probe = _fake_add
     app._trait_panel.set_active_probes = MagicMock()
@@ -2144,14 +2151,14 @@ def test_manifold_probe_attach_routes_through_session(monkeypatch: pytest.Monkey
 
 def test_manifold_probe_remove_routes_through_session():
     app = _make_app()
-    app._session._monitor.probe_names = ["circumplex"]
-    app._session._monitor.manifolds = {
+    app._session.monitor.probe_names = ["circumplex"]
+    app._session.monitor.manifolds = {
         "circumplex": SimpleNamespace(layers={0: SimpleNamespace(is_affine=False)}),
     }
 
     def _fake_remove(name: Any) -> None:
-        app._session._monitor.probe_names = []
-        app._session._monitor.manifolds = {}
+        app._session.monitor.probe_names = []
+        app._session.monitor.manifolds = {}
     app._session.remove_probe.side_effect = _fake_remove
     app._trait_panel.set_active_probes = MagicMock()
     app._trait_panel.set_active_manifold_probes = MagicMock()
@@ -2159,14 +2166,14 @@ def test_manifold_probe_remove_routes_through_session():
 
     app._handle_command("/manifold-probe-remove circumplex")
 
-    assert app._session._monitor.probe_names == []
+    assert app._session.monitor.probe_names == []
     app._trait_panel.set_active_manifold_probes.assert_called_with({})
     assert "removed" in _msgs(app).lower()
 
 
 def test_manifold_probe_remove_missing_reports():
     app = _make_app()
-    app._session._monitor.probe_names = []
+    app._session.monitor.probe_names = []
     app._handle_command("/manifold-probe-remove ghost")
     assert "not active" in _msgs(app)
 
@@ -2214,7 +2221,7 @@ def test_pull_manifold_aggregates_pushes_from_last_result():
     )
     app._session.last_result = result
     # Pretend a probe is attached so the early-out guard lets us through.
-    app._session._monitor.probe_names = ["circumplex"]
+    app._session.monitor.probe_names = ["circumplex"]
     app._trait_panel.update_manifold_readings = MagicMock()
 
     app._pull_manifold_aggregates()

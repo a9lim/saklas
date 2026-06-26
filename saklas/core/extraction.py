@@ -521,9 +521,9 @@ class ManifoldExtractionPipeline:
             # homology.  ``select_topology`` returns the resolved fit_mode +
             # coords + domain; the per-layer fit below runs unchanged on the
             # resolved mode.  Sphere is authored-only (not an auto candidate).
-            from saklas.io.manifolds import _sanitize_hyperparams
+            from saklas.io.manifolds import sanitize_hyperparams
             from saklas.core.manifold import select_topology
-            st_hyper = _sanitize_hyperparams("auto", dict(mf.hyperparams))
+            st_hyper = sanitize_hyperparams("auto", dict(mf.hyperparams))
             consensus_gram = torch.stack(
                 [layer_grams[idx] for idx in fit_layers]
             ).mean(dim=0)
@@ -594,8 +594,8 @@ class ManifoldExtractionPipeline:
             # a since-removed key (e.g. the old ``anchor_origin``) can't reach
             # ``discover_coords`` as an unexpected kwarg.  Author/CLI paths
             # already sanitize; this guards legacy + hand-edited folders.
-            from saklas.io.manifolds import _sanitize_hyperparams
-            hyperparams = _sanitize_hyperparams(mf.fit_mode, dict(mf.hyperparams))
+            from saklas.io.manifolds import sanitize_hyperparams
+            hyperparams = sanitize_hyperparams(mf.fit_mode, dict(mf.hyperparams))
             # ``max_subspace_dim`` is consumed by the curved per-layer fit,
             # not by ``discover_coords`` — pop it before the discover call so
             # the dispatcher doesn't get an unexpected kwarg.  (Sanitized out

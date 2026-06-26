@@ -217,6 +217,8 @@ normalization). `is_affine ⇔ node_params is None`. Flat layers carry `node_coo
 (K,R) — the real neutral-anchored per-layer node positions (steer-target source).
 `affine(mean, basis, node_coords=)`, `select_axes(kept)` (per-axis DLS prune),
 `eval_at`, `jacobian_at`, `rbf_params()` (raises on a flat subspace).
+`manifold_is_affine(manifold)` — public module-level predicate (promoted from
+`session._manifold_is_affine` in T2.4); `session.py` keeps a back-compat alias.
 
 `_pca_basis(X, *, n_components, whitener, layer)` — μ-centered PCA: Euclidean SVD,
 or the whitened/Fisher generalized eigenproblem `(S_b, Σ)` via the Woodbury Σ⁻¹
@@ -275,8 +277,16 @@ point projection.
 basis[,node_params,rbf_weights,poly_coeffs,coord_offset,coord_scale]}` + shared
 `node_coords` + optional `origin`) + sidecar (`mahalanobis_share_per_layer`,
 `origin_per_layer`, `share_metric`, `subspace_metric` — no
-`explained_variance_per_layer`, no `lever_per_layer`). (Cross-model
-`transfer_manifold` lives in `io/manifolds.py`.) Discover: `derive_pca_coords`
+`explained_variance_per_layer`, no `lever_per_layer`). `transfer_manifold_subspaces(src,
+alignment, *, whitener, from_model, to_model)` is the pure-tensor core of the
+cross-model Procrustes transfer: maps each covered layer's subspace into target
+space (`mean → M_L mean`, `basis → basis @ M_Lᵀ`), re-bakes the Mahalanobis
+**share** in target space via `subspace_share` (target whitener **required** —
+`WhitenerError` on a missing / partial one, no Euclidean rebake), clears `origin`,
+and returns the transferred `Manifold` (RBF + `node_coords` ride through untouched).
+The folder read/write orchestration around it (load the source tensor, write the
+`_from-<safe_src>` variant, patch the sidecar) stays in
+`io/manifold_lifecycle.py::transfer_manifold`. Discover: `derive_pca_coords`
 (cumulative-variance prefix) / `derive_spectral_coords` (Laplacian eigenmaps,
 eigenvalue-ratio cliff)
 / `discover_coords` dispatcher, with `PcaDiagnostics`/`SpectralDiagnostics`;
@@ -337,9 +347,16 @@ in the recovered cyclic order. Gated `7 ≤ K ≤ 128`. Validated for specificit
 (~0.4% false-positive on random K=7 Gaussian heaps, ~0 for K≥10; the thresholds
 trade a small elongated-ellipse false-negative, which doesn't arise in the sphered
 whitened metric, for a low false-positive rate on real concept heaps).
-Naturalness eval: `to_hellinger`, `bhattacharyya_distance`, `fit_behavior_manifold`,
-`trajectory_naturalness`, `compute_node_behavior_centroid`,
-`compute_trajectory_distributions`, `compute_node_centroid`.
+## naturalness.py
+
+Behavior-space naturalness eval, extracted from `manifold.py` to restore its
+pure-tensor contract (naturalness drives a live model forward pass, which has no
+place in a geometry module): `to_hellinger`, `bhattacharyya_distance`,
+`fit_behavior_manifold`, `trajectory_naturalness`,
+`compute_node_behavior_centroid`, `compute_trajectory_distributions`,
+`_next_token_distribution`. Import sites in `cli/runners.py` and
+`tests/test_naturalness.py` point here. `compute_node_centroid` remains in
+`manifold.py` (shared primitive — activation centroid, no model).
 
 ## hooks.py
 
@@ -373,11 +390,11 @@ scales `along` on the **curved** path, where the target is raw node coords so
 `eff_along` is a *fraction of the way to the node* (`1.0` lands on it; `norm_cap`
 bounds off-domain RBF extrapolation). Clean-stateless-calibrated on a gemma-4-12b
 `months_loop%january` sweep: `along=1.0` → `eff_along≈4` lands the vivid coherent
-winter sweet spot. CAVEAT — non-monotonic above on **periodic** fits: `eff_along` is
-share-weighted (`share∈[0.19,1.47]`) and `translate_foot` wraps, so past `~1` each
-layer orbits the ring at its own rate and lands on a *different* month, scattering
-the signal; `4` rides a coherent part of the wrap, not a magnitude. Deferred fix:
-clamp curved `eff_along` to `[0,1]` + drop share-weighting on periodic domains.
+winter sweet spot. For **periodic `BoxDomain` fits** `eff_along` is now clamped
+and share-weighting dropped: `eff_along = max(0, min(1, along·_MANIFOLD_ALONG_GAIN))`,
+uniform per layer, so no layer wraps past the target node. Non-periodic curved fits
+keep the share-weighted unclamped path (`eff_along = share_L · gain`, which can
+exceed 1 on high-share layers and is bounded only by `norm_cap`).
 `_MANIFOLD_ONTO_GAIN = 0.5`
 scales `onto` only (calibrated on the gemma-4-12b `emotions%dominant` onto sweep — at
 `1.0` even `onto=0.5` fragmented and `onto=1.0` collapsed; `0.5` makes `onto∈[0,1]` a
@@ -395,10 +412,25 @@ clearly steers concepts *and* personas while staying coherent for the fragile on
 persona breaks by `α ≈ 1.0`). Tagged a prototype.)
 `reset_manifold_feet` cold-starts followers per generation.
 
-`HiddenCapture` — `attach`/`detach`/`stacked`/`latest_per_layer`. Three modes,
-chosen by `_begin_capture` from `need_per_token`:
+`HiddenCapture` — public API: `attach`/`attach_persistent`/`detach`/`clear`,
+`stacked`/`latest_per_layer`/`per_layer_buckets`/`tail_slice_at`, the mode setters
+`set_incremental`/`set_aggregate_tail`/`set_tail_with_sink`, the post-forward
+`fire_step_sink`/`ingest_persistent`, and `is_transient()` (true iff transient
+per-gen forward hooks are registered — the compiled-clean routing gate). No
+caller reaches into `_per_layer`/`_handles`/`_step_sink`: `per_layer_buckets()`
+returns the raw bucket dict (a plain attribute return — **zero per-token cost** on
+the WS read path), `set_tail_with_sink(depth, sink)` arms a deep tail ring AND a
+per-token sink together (neither single setter gives both — `set_incremental`
+forces length-1 and drops the ring, `set_aggregate_tail` installs no sink), and
+`is_transient()` replaces the `not _handles` check.
 
-- **incremental** (`set_incremental`) — a full-reading live consumer wants
+The session picks the capture mode in `_begin_capture` from `need_per_token` and
+stores it as one `CaptureMode` on a `CaptureState` dataclass (`session.py`;
+`mode` + orthogonal `persistent` + the GATING_SUBSET `gating_subset`/`gating_keys`
+— replacing the five correlated booleans that used to make illegal combinations
+representable). The `_score_*` dispatch keys off `mode`:
+
+- **`INCREMENTAL`** (`set_incremental`) — a full-reading live consumer wants
   per-token readings: overwrites a single preallocated length-1 buffer per layer
   via `copy_` (zero per-step capture allocation, O(layers·D) memory). The step
   sink scores each token live — but it now fires **post-forward** (`generate_steered`
@@ -406,24 +438,28 @@ chosen by `_begin_capture` from `need_per_token`:
   hook at the max probe layer; FIX F1), so the host-side score read no longer drains
   the device pipeline mid-forward. The per-token `ProbeReading` rows back
   `_score_incremental`'s (aggregate, per-token).
-- **lean-incremental** (session `_capture_lean`, FIX F2) — the live consumers
+- **`LEAN_INCREMENTAL`** (FIX F2) — the live consumers
   read only the axis-0 coord (the SSE trait stream / loom probe row), no nearest /
   assignment / per-layer trace and no probe gate: the post-forward step sink scores
   each token `coords_only=True` (skips the big-K nearest norm + assignment softmax +
   per-layer host reconstruction) into the per-token coord stream, while a bounded
   tail ring lets `_score_lean_incremental` re-score the **full** aggregate once at
-  finalize. Built on `set_aggregate_tail` + a session-level sink, like the
-  gating-only-subset path.
-- **aggregate-only** (`set_aggregate_tail`) — probes attached but *nothing*
+  finalize. Built on `set_tail_with_sink`, like the gating-subset path.
+- **`AGGREGATE_ONLY`** (`set_aggregate_tail`) — probes attached but *nothing*
   consumes a per-token reading (no gate, no loom row, no trait stream, no live
   scores — e.g. a stateless server gen): keeps a bounded tail ring
   (`_AGG_TAIL_DEPTH = 8`) and runs NO step sink, so the decode loop pays zero
   per-token scoring; `_finalize_generation`/`_score_aggregate_only` pool the last
   *content* token once via `tail_slice_at` (the ring is deep enough to walk back
   past trailing specials) and one `Monitor.score_aggregate`.
-- **full retention** (append) — `return_hidden` (widen) or any non-incremental
-  read: distinct clones per step so `stacked()` builds the full `[T, D]`;
-  `score_per_token`.
+- **`GATING_SUBSET`** (FIX #4) — per-token scoring is needed *only* to feed probe
+  gates (`set_tail_with_sink`): the sink scores just the gated subset's scalars per
+  token (into `_incremental_gate_scores`) while the tail ring lets finalize pool the
+  FULL roster once. `CaptureState.aggregate_only` covers this mode too — its
+  per-token rows feed only the gate, so it shares the aggregate-only finalize.
+- **`FULL`** (append) — `return_hidden` (widen) or any non-incremental
+  read, plus the degenerate no-probe / capture-disabled state: distinct clones per
+  step so `stacked()` builds the full `[T, D]`; `score_per_token`.
 
 Every read is a full per-probe `ProbeReading` either way; the modes trade only
 *when/how often* scoring runs (per token vs once) and memory (length-1 vs tail
@@ -530,6 +566,17 @@ The bundled roster is the fitted 2-node `Manifold`s themselves
 (`measure`) is gone — every read source is live hooks scoring captured hidden
 states, no second forward pass.
 
+## monitor_attach.py
+
+Attach-time probe algebra, extracted from `monitor.py` (which it shrank by ~620
+lines, to ~2057 L). Runs once per `add_probe` call, entirely off the hot path.
+Hosts: `AttachedManifoldProbe`, `_LayerWhiten`, `_build_whitened_factors`,
+`_attach_manifold_probe`, `_compute_assign_bandwidth`, `_layer_geometry`, the
+affine-coord helpers, and `_woodbury_apply`. The hot path in `monitor.py` imports
+`_layer_geometry`, `AttachedManifoldProbe`, `_build_whitened_factors`, and
+`_attach_manifold_probe` back from this module (no circular dependency —
+`monitor_attach` imports only `mahalanobis` and `manifold`).
+
 ## triggers.py
 
 `Trigger` (frozen): phase flags + optional `ProbeGate`. `Trigger.active(ctx)`
@@ -582,15 +629,35 @@ detectors; the internal `_ThinkState` machine + `GenerationState` drive streamin
 `SaklasSession` owns the model, the in-memory profile registry (`_profiles`), the
 loaded-manifold registry (`_manifolds`), the unified `Monitor` (`_monitor`),
 `SteeringManager`, `HiddenCapture`, generation defaults (`session.config`), the loom
-tree, and a synchronous `events: EventBus`. `from_pretrained(model_id, *, device,
+tree, and a synchronous `events: EventBus`. Steering resolution + the LIFO steering
+stack live on a `SteeringComposer` collaborator (`core/steering_composer.py`),
+instantiated in `__init__` after `_monitor` (lazily rebuilt via
+`_get_steering_composer()` for `__new__` test stubs). The composer owns the stack
+(`_stack`); the session exposes a settable `_steering_stack` property over it, and
+keeps a thin forwarder for every moved method — `_push_steering`/`_pop_steering`
+(called by `_SteeringContext`), `_compose_steering_entries`/`_install_composed_steering`/
+`_rebuild_steering_hooks`, `_ensure_manifold_loaded`/`_ensure_profile_registered`/
+`_try_fold_manifold`/`_port_stale_legacy_vector`, `_resolve_pole_aliases`,
+`_materialize_projections`, `_steering_needs_probe_gating`/`_build_gating_score_callback`
+(also called by `joint_logprobs.py`), and the stack predicates — so the public + test
+surface is byte-identical (tests monkeypatch / `__get__`-bind these on the session).
+The composer reaches session state through `self._session` at push/pop frequency, off
+the per-token path; the one near-hot method, `build_gating_score_callback`, binds
+`capture`/`monitor` to locals and reads the session capture state through the back-ref
+exactly as before, so the per-token gate path gains no new indirection. Push/pop call
+the session's `_rebuild_steering_hooks` forwarder (not the composer's own) so stub
+overrides take effect. `from_pretrained(model_id, *, device,
 dtype, quantize, probes, system_prompt, max_tokens=1024, dls=True, compile=False,
 compile_mode=None, cuda_graphs=False, return_top_k=0)`
 does the HF load + layer-mean compute + probe bootstrap — there is no
 `injection_mode`/`theta_max` param. `__init__` takes a pre-loaded model. Both call
 `materialize_bundled_manifolds()` + `selectors.invalidate()` early.
 `_RESPONSE_MAX_TOKENS = 256` caps each in-character response (4.0 / A2
-elicitation). Module-level helpers `_manifold_is_affine` / `_affine_manifold_push`
-(per-layer basis rows + node-coord targets for a flat manifold) back the dispatch.
+elicitation). Module-level helper `_affine_manifold_push`
+(per-layer basis rows + node-coord targets for a flat manifold) backs the dispatch;
+`_manifold_is_affine` is a back-compat alias of the public `core.manifold.manifold_is_affine`
+(promoted there in T2.4 — `session.py` keeps the alias for `steering_composer` and legacy
+call sites).
 Conversational-elicitation helpers `_KIND_TEMPLATES` / `_article` / `_system_for`
 (the per-kind system prompt — `custom` takes a caller-supplied template) /
 `_role_for` (the swapped assistant-role label: abstract → `someone_{slug}`,
@@ -628,8 +695,9 @@ profiles (`_materialize_projections` → `project_profile` with `session.whitene
 which is Mahalanobis-only — a `~`/`|` term on a session with no covering whitener
 raises `WhitenerError`), and pushes a per-scope entries dict onto a LIFO stack so
 nested scopes compose. There is no per-call projection-metric override.
-`_resolve_pole_aliases` canonicalizes + sign-flips bare poles through the manifold
-tier and routes variants.
+`_resolve_pole_aliases` canonicalizes bare poles via `io.selectors.canonicalize_atom`
+(the sign-flip is retired — a bare pole resolves through the manifold-label tier as
+a `%` push) and routes variants.
 
 **Steering resolution (manifold-first).** `_ensure_profile_registered(name)`
 resolves a direction from, in order: (1) an in-memory baked direction already in
@@ -672,10 +740,12 @@ re-scorable via `session.score_hidden`. Probes ride the same plumbing:
 (a 2-node `pca` concept folds to a rank-1 probe via `_fold_profile_probe`; a
 multi-node manifold attaches whole) and registers on the unified `_monitor`;
 `remove_probe(name)` detaches. `_begin_capture` widens to `_monitor.probe_layers()`
-and picks the capture mode from `need_per_token` (gate ∨ loom row ∨ trait stream ∨
-live scores ∨ per-layer persist — see hooks.py `HiddenCapture`): per-token
-incremental scoring when something consumes a per-token reading, else aggregate-only
-(no per-token scoring, pool once at finalize). The gate callback runs one
+and picks the `CaptureMode` from `need_per_token` (gate ∨ loom row ∨ trait stream ∨
+live scores ∨ per-layer persist — see hooks.py `HiddenCapture`), storing it on the
+`CaptureState` dataclass (`mode` + `persistent` + the GATING_SUBSET subset/keys —
+the legal-by-construction replacement for the former five correlated booleans):
+per-token incremental scoring when something consumes a per-token reading, else
+aggregate-only (no per-token scoring, pool once at finalize). The gate callback runs one
 `_monitor.score_single_token` through `flat_scalars` into
 `TriggerContext.probe_scores` (one key space —
 `"<name>"`/`"<name>[i]"`/`"<name>:fraction"`/`"<name>@<label>"`);
@@ -772,8 +842,9 @@ context. Surfaced as `session.score_choices` / `session.score_template`.
 `ProbeReading`, `ResultCollector`. `RunSet` is the
 list-like multi-run shape (`node_ids`/`grid`/`.first`/`.to_collector()`/
 `.to_dataframe()`). `TokenEvent` carries `thinking`, `logprob`, `top_alts`,
-`finish_reason`, `scores` (per-probe `ProbeReading`s — the full readings,
-live-stream-gated), `perplexity`, `probe_readings`. `GenerationResult`
+`finish_reason`, `perplexity`, `probe_readings` (per-probe `ProbeReading`s — the
+full readings, live-stream-gated); `scores` is a read-only back-compat property
+alias for `probe_readings`. `GenerationResult`
 carries `prompt_tokens`, `finish_reason`, optional `logprobs`, `readings`
 (per-probe `ProbeReadings`), `probe_readings`, and `applied_steering` (the
 canonical expression, round-trips through `parse_expr`). `ProbeReading`

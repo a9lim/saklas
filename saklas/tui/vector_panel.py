@@ -7,21 +7,22 @@ from typing import Any
 from textual.app import ComposeResult
 from textual.containers import VerticalScroll
 from textual.widgets import Static
-from textual.widget import Widget
 
+from saklas.tui.selectable import SelectableListWidget
 from saklas.tui.utils import BAR_WIDTH, build_bar
 
 MAX_ALPHA = 1.0
 
 
-class LeftPanel(Widget):
+class LeftPanel(SelectableListWidget):
     """Entire left column: model, vectors, gen config, keys."""
+
+    _cursor_wrap = True  # the vector rack wraps around its ends
 
     def __init__(self, model_info: dict[str, Any], **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._model_info = model_info
         self._vectors: list[dict[str, Any]] = []
-        self._selected_idx: int = 0
         self._thinking: bool | None = None  # None = model doesn't support it
         # True when the model thinks unconditionally (gpt-oss / Mistral-3
         # Reasoning / Qwen3-Thinking) — the toggle is shown locked so
@@ -84,12 +85,15 @@ class LeftPanel(Widget):
             id="key-ref",
         )
 
+    def _cursor_len(self) -> int:
+        return len(self._vectors)
+
     def update_vectors(self, vectors: list[dict[str, Any]]) -> None:
         self._vectors = vectors
         if self._vectors:
-            self._selected_idx = min(self._selected_idx, len(self._vectors) - 1)
+            self._cursor_idx = min(self._cursor_idx, len(self._vectors) - 1)
         else:
-            self._selected_idx = 0
+            self._cursor_idx = 0
         self._render_vectors()
 
     def update_gen_config(self, temperature: float, top_p: float,
@@ -114,18 +118,16 @@ class LeftPanel(Widget):
             self._render_gen_config()
 
     def select_next(self) -> None:
-        if self._vectors:
-            self._selected_idx = (self._selected_idx + 1) % len(self._vectors)
+        if self.cursor_next():
             self._render_vectors()
 
     def select_prev(self) -> None:
-        if self._vectors:
-            self._selected_idx = (self._selected_idx - 1) % len(self._vectors)
+        if self.cursor_prev():
             self._render_vectors()
 
     def get_selected(self) -> dict[str, Any] | None:
-        if self._vectors and 0 <= self._selected_idx < len(self._vectors):
-            return self._vectors[self._selected_idx]
+        if self._vectors and 0 <= self._cursor_idx < len(self._vectors):
+            return self._vectors[self._cursor_idx]
         return None
 
     def _render_vectors(self) -> None:
@@ -138,7 +140,7 @@ class LeftPanel(Widget):
 
         lines: list[str] = []
         for i, v in enumerate(self._vectors):
-            is_selected = i == self._selected_idx
+            is_selected = i == self._cursor_idx
             enabled = v.get("enabled", True)
             name = v["name"]
 
@@ -159,18 +161,10 @@ class LeftPanel(Widget):
             else:
                 color = "ansi_default"
 
-            marker = ">" if is_selected else " "
+            marker = self.selection_marker(is_selected)
             dot = "[ansi_green]●[/]" if enabled else "[dim]○[/]"
             hint = " [dim]←/→[/]" if is_selected else ""
-
-            if is_selected and enabled:
-                name_str = f"[bold]{name}[/]"
-            elif is_selected and not enabled:
-                name_str = f"[dim bold]{name}[/]"
-            elif not enabled:
-                name_str = f"[dim]{name}[/]"
-            else:
-                name_str = name
+            name_str = self.name_markup(name, is_selected, enabled)
 
             dim_prefix = "dim " if not enabled else ""
             text = (
@@ -197,17 +191,9 @@ class LeftPanel(Widget):
         coords = v.get("coords", "")
         blend = v.get("blend", 0.0)
 
-        marker = ">" if is_selected else " "
+        marker = self.selection_marker(is_selected)
         dot = "[ansi_green]●[/]" if enabled else "[dim]○[/]"
-
-        if is_selected and enabled:
-            name_str = f"[bold]{manifold}[/]"
-        elif is_selected and not enabled:
-            name_str = f"[dim bold]{manifold}[/]"
-        elif not enabled:
-            name_str = f"[dim]{manifold}[/]"
-        else:
-            name_str = manifold
+        name_str = self.name_markup(manifold, is_selected, enabled)
 
         dim_prefix = "dim " if not enabled else ""
         # Phase C.3: manifold rows render in purple

@@ -8,6 +8,7 @@ from typing import Any
 import torch
 
 from saklas.core.manifold import (
+    BoxDomain,
     CustomDomain,
     LayerSubspace,
     ManifoldDomain,
@@ -198,6 +199,24 @@ class HiddenCapture:
         self._tail_depth = max(1, int(depth))
         self._max_layer = max(self._per_layer) if self._per_layer else None
 
+    def set_tail_with_sink(
+        self, depth: int, step_sink: Callable[[dict[int, torch.Tensor]], None],
+    ) -> None:
+        """Bounded-tail ring PLUS a per-token step sink (gating-subset / lean).
+
+        Must be called after :meth:`attach`.  This combination can't be had
+        through either single setter — :meth:`set_incremental` forces a length-1
+        buffer and drops the ring, :meth:`set_aggregate_tail` installs no sink —
+        so this arms the deep ring and wires the sink together.  The hook fires
+        the sink whenever one is set, independent of tail depth (see
+        :meth:`attach`'s ``_hook``).  Used by the GATING_SUBSET (gated-subset
+        scalar scoring) and LEAN_INCREMENTAL (``coords_only`` per-token scoring)
+        capture modes, both of which still pool the FULL roster once at finalize
+        from the retained ring.
+        """
+        self.set_aggregate_tail(depth)
+        self._step_sink = step_sink
+
     def attach_persistent(
         self, layer_indices: list[int], buffers: dict[int, torch.Tensor],
     ) -> None:
@@ -335,6 +354,29 @@ class HiddenCapture:
             if bucket:
                 out[idx] = bucket[-1]
         return out
+
+    def per_layer_buckets(self) -> dict[int, list[torch.Tensor]]:
+        """The raw per-layer capture buckets (``{layer: [slice, …]}``).
+
+        The public accessor for the streaming-tap read that builds the latest
+        per-layer ``[D]`` dict from each non-empty bucket's ``[-1]``.  A plain
+        attribute return — **no per-token cost** (it is read once per token on the
+        WS path) — the caller does the ``[-1]`` selection so a length-1 / tail-ring
+        bucket reads identically.  (:meth:`latest_per_layer` is the packaged form;
+        this exposes the buckets for callers that filter on emptiness themselves.)
+        """
+        return self._per_layer
+
+    def is_transient(self) -> bool:
+        """True iff transient per-gen forward hooks are registered (vs persistent).
+
+        The compiled-clean routing gate: the captured graph was traced with only
+        the always-on persistent capture/offset hooks present, so it stays valid
+        exactly when no *transient* ``register_forward_hook`` was installed —
+        ``attach_persistent`` (no transient hook) and the no-probe path both leave
+        ``_handles`` empty.  ``attach`` registers one transient hook per layer.
+        """
+        return bool(self._handles)
 
     def fire_step_sink(self) -> None:
         """Run the per-token step sink once, **after** the model forward (FIX F1).
@@ -927,15 +969,32 @@ def _manifold_layer_shares(manifold: Any) -> dict[int, float]:
             layer_idx: float(baked[layer_idx]) for layer_idx in manifold.layers
         }
     else:
+        # Euclidean centroid-spread fallback: used only when no whitener was
+        # present at fit time (CPU test stubs without a neutral cache).
+        # Guard on ``is_affine`` first — ``rbf_params()`` raises on flat
+        # subspaces (documented in core/AGENTS.md), so we must never call it
+        # on concepts / personas / any pca-fit manifold (T1.5 fix).
         layer_scores = {}
         for layer_idx, sub in manifold.layers.items():
-            _np, _rw, _pc = sub.rbf_params()
-            node_coords = eval_rbf(
-                _np, _rw, _pc, _np,
-            )  # (K, R) — exact centered coords at the fit nodes
-            layer_scores[layer_idx] = float(
-                torch.linalg.vector_norm(node_coords).item()
-            )
+            if sub.is_affine:
+                # Flat subspace: use the Euclidean norm of the per-layer
+                # real node coords (K, R) stored on every affine LayerSubspace.
+                # Falls back to 1.0 when node_coords is absent (degenerate stub).
+                nc = sub.node_coords
+                score = (
+                    float(torch.linalg.vector_norm(nc.to(torch.float32)).item())
+                    if nc is not None
+                    else 1.0
+                )
+            else:
+                # Curved subspace: eval the RBF at the fit nodes to get the
+                # (K, R) reduced coords and use their Frobenius norm as a spread.
+                _np, _rw, _pc = sub.rbf_params()
+                node_coords = eval_rbf(
+                    _np, _rw, _pc, _np,
+                )  # (K, R) — exact centered coords at the fit nodes
+                score = float(torch.linalg.vector_norm(node_coords).item())
+            layer_scores[layer_idx] = score
     return _normalize_shares_mean1(layer_scores)
 
 
@@ -1161,10 +1220,26 @@ class SteeringManager:
             # ``eff_along`` is the fraction of the way to the node, so it must stay
             # near [0, ~2] or the RBF extrapolates off-domain (see
             # ``_MANIFOLD_ALONG_GAIN``).  ``onto`` clamps per layer.
-            eff_along = {
-                L: along * shares[L] * _MANIFOLD_ALONG_GAIN
-                for L in manifold.layers
-            }
+            #
+            # Periodic (loop) domains: drop share-weighting and clamp eff_along to
+            # [0, 1] so no layer wraps past the target node.  (AGENTS.md deferred
+            # fix — share∈[0.19,1.47] × gain 4 sends many layers past 1 on a ring,
+            # scattering the signal across different nodes.)  Non-periodic curved
+            # fits keep the existing share-weighted, unclamped behavior.
+            domain = manifold.domain
+            _is_periodic = isinstance(domain, BoxDomain) and any(
+                ax.periodic for ax in domain.axes
+            )
+            if _is_periodic:
+                eff_along = {
+                    L: max(0.0, min(1.0, along * _MANIFOLD_ALONG_GAIN))
+                    for L in manifold.layers
+                }
+            else:
+                eff_along = {
+                    L: along * shares[L] * _MANIFOLD_ALONG_GAIN
+                    for L in manifold.layers
+                }
             eff_onto = {
                 L: max(0.0, min(1.0, onto * shares[L] * _MANIFOLD_ONTO_GAIN))
                 for L in manifold.layers
@@ -1173,7 +1248,6 @@ class SteeringManager:
             # Target is layer-independent (one authoring position); clamp it
             # into the domain once.  The cold-start origin seed ``O_L`` is
             # per-layer (each layer's neutral foot) — picked inside the loop.
-            domain = manifold.domain
             n_dim = domain.intrinsic_dim
             target_coord = domain.clamp_position(
                 torch.tensor([float(c) for c in position], dtype=torch.float32)

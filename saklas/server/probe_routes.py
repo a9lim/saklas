@@ -22,7 +22,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel
 
-from saklas.core.session import _manifold_is_affine
+from saklas.core.manifold import manifold_is_affine
 from saklas.server import saklas_api as _api
 from saklas.server.saklas_api import _resolve_session_id
 
@@ -52,7 +52,7 @@ def _probe_info(name: str, probe: Any) -> dict[str, Any]:
     except Exception:
         node_coords = None
     try:
-        is_affine = _manifold_is_affine(manifold)
+        is_affine = manifold_is_affine(manifold)
     except Exception:
         is_affine = False
     return {
@@ -84,7 +84,7 @@ def register_probe_routes(app: FastAPI) -> None:
     def list_probes(session_id: str):
         _resolve_session_id(session, session_id)
         try:
-            attached = session._monitor.attached_probes()
+            attached = session.monitor.attached_probes()
         except Exception:
             attached = {}
         return {
@@ -110,7 +110,7 @@ def register_probe_routes(app: FastAPI) -> None:
         """
         _resolve_session_id(session, session_id)
         try:
-            return session._monitor.probe_geometry(name)
+            return session.monitor.probe_geometry(name)
         except KeyError as e:
             raise HTTPException(404, f"probe '{name}' not attached") from e
 
@@ -128,7 +128,7 @@ def register_probe_routes(app: FastAPI) -> None:
             raise HTTPException(404, str(e)) from e
         except (KeyError, ValueError) as e:
             raise HTTPException(400, str(e)) from e
-        attached = session._monitor.attached_probes()
+        attached = session.monitor.attached_probes()
         probe = attached.get(registered)
         if probe is None:
             raise HTTPException(
@@ -141,7 +141,7 @@ def register_probe_routes(app: FastAPI) -> None:
     )
     def remove_probe(session_id: str, name: str):
         _resolve_session_id(session, session_id)
-        if name not in session._monitor.probe_names:
+        if name not in session.monitor.probe_names:
             raise HTTPException(404, f"probe '{name}' not attached")
         session.remove_probe(name)
         return Response(status_code=204)

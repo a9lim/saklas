@@ -22,11 +22,10 @@ from typing import Any, Callable, Literal
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from saklas.core.manifold import domain_from_spec
+from saklas.core.manifold import domain_from_spec, manifold_is_affine
 from saklas.core.session import (
     ConcurrentExtractionError,
     SaklasSession,
-    _manifold_is_affine,
 )
 from saklas.io.atomic import write_json_atomic
 from saklas.io.hf_manifolds import (
@@ -38,7 +37,7 @@ from saklas.io.hf_manifolds import (
 from saklas.io.manifolds import (
     ManifoldFolder,
     ManifoldFormatError,
-    _sanitize_hyperparams,
+    sanitize_hyperparams,
     append_discover_manifold_node,
     create_discover_manifold_folder,
     create_manifold_folder,
@@ -53,6 +52,7 @@ from saklas.io.manifolds import (
     update_manifold_folder,
 )
 from saklas.io.paths import manifold_dir, safe_model_id
+from saklas.server.app import acquire_session_lock
 from saklas.server.sse import ProgressCallback, progress_sse_response
 
 log = logging.getLogger("saklas.api")
@@ -349,7 +349,7 @@ def _manifold_json(
                 [float(x) for x in row]
                 for row in m.node_coords.tolist()
             ]
-            resolved_affine = _manifold_is_affine(m)
+            resolved_affine = manifold_is_affine(m)
         except (FileNotFoundError, KeyError, ValueError):
             derived_coords = []
 
@@ -465,14 +465,14 @@ def _refuse_if_busy(session: SaklasSession) -> None:
     ``session.lock`` (the asyncio HTTP serializer) orders manifold
     mutations against each other and the JSON fit path, but an SSE fit
     whose request was cancelled leaves its worker thread — and the
-    ``_gen_lock`` it holds — alive past the cancel.  A non-blocking probe
-    of ``_gen_lock`` refuses a folder mutation while that thread runs.
+    ``gen_lock`` it holds — alive past the cancel.  A non-blocking probe
+    of ``gen_lock`` refuses a folder mutation while that thread runs.
     """
-    if not session._gen_lock.acquire(blocking=False):
+    if not session.gen_lock.acquire(blocking=False):
         raise HTTPException(
             409, "a model operation is in flight; retry shortly",
         )
-    session._gen_lock.release()
+    session.gen_lock.release()
 
 
 def _evict_manifold(session: SaklasSession, namespace: str, name: str) -> None:
@@ -483,10 +483,10 @@ def _evict_manifold(session: SaklasSession, namespace: str, name: str) -> None:
     delete / re-fit does not leave a stale tensor live.
     """
     prefixes = (name, f"{namespace}/{name}")
-    for key in list(session._manifolds):
+    for key in list(session.manifolds):
         head = key.rsplit(":", 1)[0] if ":" in key else key
         if head in prefixes:
-            session._manifolds.pop(key, None)
+            session.manifolds.pop(key, None)
 
 
 # ------------------------------------------------------------------- routes ---
@@ -652,7 +652,9 @@ def register_manifold_routes(app: FastAPI) -> None:
                 f"manifold merge: need >= 2 sources, got {len(req.sources)}",
             )
         source_tuples = [(s.namespace, s.name) for s in req.sources]
-        async with session.lock:
+        async with acquire_session_lock(session) as acquired:
+            if not acquired:
+                raise HTTPException(503, "session locked")
             _refuse_if_busy(session)
             try:
                 folder = await asyncio.to_thread(
@@ -693,7 +695,9 @@ def register_manifold_routes(app: FastAPI) -> None:
         manifold-detail JSON shape ``GET /saklas/v1/manifolds/{ns}/{name}``
         ships.
         """
-        async with session.lock:
+        async with acquire_session_lock(session) as acquired:
+            if not acquired:
+                raise HTTPException(503, "session locked")
             _refuse_if_busy(session)
             try:
                 folder = await asyncio.to_thread(
@@ -819,7 +823,9 @@ def register_manifold_routes(app: FastAPI) -> None:
                 logger=log,
             )
 
-        async with session.lock:
+        async with acquire_session_lock(session) as acquired:
+            if not acquired:
+                raise HTTPException(503, "session locked")
             try:
                 return await asyncio.to_thread(_gen, lambda _msg: None)
             except ValueError as e:
@@ -842,12 +848,15 @@ def register_manifold_routes(app: FastAPI) -> None:
             [n.model_dump() for n in req.nodes]
             if req.nodes is not None else None
         )
-        # ``session.lock`` serializes against another PATCH and the JSON
-        # fit path; the ``_gen_lock`` probe additionally refuses while a
-        # fit thread is in flight (an SSE fit whose request was cancelled
-        # leaves the worker thread — and the lock — alive past the cancel)
-        # so a node-corpus rewrite can't race a fit reading ``nodes/``.
-        async with session.lock:
+        # Bounded via ``acquire_session_lock`` (300 s → 503) so a
+        # long-running fit doesn't pin the lock for this PATCH indefinitely.
+        # The ``_gen_lock`` probe additionally refuses while a fit thread is
+        # in flight (an SSE fit whose request was cancelled leaves the worker
+        # thread — and the lock — alive past the cancel) so a node-corpus
+        # rewrite can't race a fit reading ``nodes/``.
+        async with acquire_session_lock(session) as acquired:
+            if not acquired:
+                raise HTTPException(503, "session locked")
             _refuse_if_busy(session)
             try:
                 await asyncio.to_thread(
@@ -885,7 +894,9 @@ def register_manifold_routes(app: FastAPI) -> None:
         folder = manifold_dir(namespace, name)
         if not (folder / "manifold.json").exists():
             raise HTTPException(404, f"manifold {namespace}/{name} not found")
-        async with session.lock:
+        async with acquire_session_lock(session) as acquired:
+            if not acquired:
+                raise HTTPException(503, "session locked")
             _refuse_if_busy(session)
             _evict_manifold(session, namespace, name)
             try:
@@ -936,7 +947,7 @@ def register_manifold_routes(app: FastAPI) -> None:
             if req.hyperparams is not None:
                 new_hp.update(req.hyperparams)
             # Method-incompatible knobs get dropped at the IO boundary.
-            new_hp = _sanitize_hyperparams(new_fit_mode, new_hp)
+            new_hp = sanitize_hyperparams(new_fit_mode, new_hp)
             data = json.loads((folder / "manifold.json").read_text())
             data["fit_mode"] = new_fit_mode
             data["hyperparams"] = new_hp
@@ -989,7 +1000,9 @@ def register_manifold_routes(app: FastAPI) -> None:
                 logger=log,
             )
 
-        async with session.lock:
+        async with acquire_session_lock(session) as acquired:
+            if not acquired:
+                raise HTTPException(503, "session locked")
             try:
                 return await asyncio.to_thread(_fit, lambda _msg: None)
             except ConcurrentExtractionError as e:

@@ -24,6 +24,7 @@ from saklas.core.joint_logprobs import (
     _shared_prefix_len,
     reorient_for_request,
 )
+from tests.conftest import FakeLogitsModel
 
 
 # ---------------------------------------------------------------------------
@@ -286,29 +287,22 @@ class _MockTokenizer:
         return self._rev.get(int(ids), "<unk>")
 
 
-class _MockModel:
+def _MockModel(vocab: int) -> FakeLogitsModel:
     """Returns a constant log-uniform distribution at every position.
 
     All chosen-token logprobs equal ``-log(vocab)``; cross-evaluation
-    matches self-evaluation exactly (KL is zero everywhere).  Cheap
-    parameter list satisfies ``next(model.parameters()).device``.
+    matches self-evaluation exactly (KL is zero everywhere).  The shared
+    ``FakeLogitsModel`` (conftest) supplies the ``.logits`` wrapper and the
+    throwaway ``parameters()`` that ``next(model.parameters()).device`` needs;
+    the flat-logits ``logits_fn`` is the only thing specific to this test.
     """
 
-    def __init__(self, vocab: int):
-        self._vocab = vocab
-        # One throwaway parameter so ``next(model.parameters()).device``
-        # works — the actual values are irrelevant.
-        self._param = torch.zeros(1, requires_grad=False)
-
-    def parameters(self):
-        yield self._param
-
-    def __call__(self, *, input_ids: torch.Tensor, use_cache: bool = False) -> Any:
-        del use_cache  # ignored — mock is stateless
+    def _logits(input_ids: torch.Tensor) -> torch.Tensor:
         T = input_ids.shape[-1]
         # Logits flat across vocab → log_softmax = -log(vocab).
-        logits = torch.zeros((1, T, self._vocab), dtype=torch.float32)
-        return type("Out", (), {"logits": logits})()
+        return torch.zeros((1, T, vocab), dtype=torch.float32)
+
+    return FakeLogitsModel(_logits)
 
 
 class _MockTree:
@@ -360,6 +354,7 @@ class _MockSession:
         for word in ("User:", "ask", "Assistant:", "hello", "a", "b"):
             self.tokenizer._intern(word)
         self._model = _MockModel(vocab=len(self.tokenizer._vocab) + 16)
+        self.model = self._model
         self.tree = _MockTree()
         self.config = _MockConfig()
 

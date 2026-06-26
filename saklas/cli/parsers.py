@@ -186,7 +186,28 @@ def _build_tui_parser(parser: argparse.ArgumentParser) -> None:
 
 
 def _build_serve_parser(parser: argparse.ArgumentParser) -> None:
-    _add_common_args(parser)
+    # When a -c/--config YAML with model: set is supplied, the positional
+    # can be omitted. Handled in _run_serve via the composed config (mirrors
+    # the same pattern in _build_tui_parser / _run_tui).
+    parser.add_argument("model", nargs="?", default=None,
+                        help="HuggingFace model ID or local path")
+    parser.add_argument(
+        "-q", "--quantize",
+        choices=["4bit", "8bit"],
+        default=None,
+        help="Quantization mode (default: bf16/fp16)",
+    )
+    parser.add_argument(
+        "-d", "--device",
+        default="auto",
+        help="Device: auto (detect), cuda, mps, or cpu (default: auto)",
+    )
+    parser.add_argument(
+        "-p", "--probes",
+        nargs="*",
+        default=None,
+        help="Probe categories: all, none, epistemic, alignment, register, cultural (default: all)",
+    )
     parser.add_argument("-H", "--host", default="0.0.0.0", help="Bind address")
     parser.add_argument("-P", "--port", type=int, default=8000, help="Bind port")
     parser.add_argument("-S", "--steer", default=None, metavar="EXPR",
@@ -778,12 +799,12 @@ def _build_template_create(p: argparse.ArgumentParser) -> None:
 
 
 def _build_template_ls(p: argparse.ArgumentParser) -> None:
-    p.add_argument("-j", "--json", action="store_true", help="JSON output")
+    p.add_argument("-j", "--json", dest="json_output", action="store_true", help="JSON output")
 
 
 def _build_template_show(p: argparse.ArgumentParser) -> None:
     p.add_argument("name", help="Template name (or ns/name)")
-    p.add_argument("-j", "--json", action="store_true", help="JSON output")
+    p.add_argument("-j", "--json", dest="json_output", action="store_true", help="JSON output")
 
 
 def _build_template_rm(p: argparse.ArgumentParser) -> None:
@@ -811,7 +832,7 @@ def _build_template_score(p: argparse.ArgumentParser) -> None:
                    help="Device: auto (detect), cuda, mps, or cpu")
     p.add_argument("-q", "--quantize", choices=["4bit", "8bit"], default=None,
                    help="Quantization mode (default: bf16/fp16)")
-    p.add_argument("-j", "--json", action="store_true", help="JSON output")
+    p.add_argument("-j", "--json", dest="json_output", action="store_true", help="JSON output")
 
 
 _TEMPLATE_DESCRIPTIONS: dict[str, str] = {

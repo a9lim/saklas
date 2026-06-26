@@ -37,7 +37,7 @@ with no subverb) prints help and exits 0, not argparse's exit 2.
   (`ls`/`show`/`install`/`search`/`push`/`rm`/`clear`/`refresh`/`export`),
   hand-dispatched by `_run_pack` (table `_PACK_VERBS`). `export gguf <name>` folds
   a fitted 2-node `pca` manifold to a steering vector and writes a llama.cpp
-  control-vector GGUF, via `cache_ops._export_gguf_manifold`. These verbs are
+  control-vector GGUF, via `cache_ops.export_gguf_manifold`. These verbs are
   pure-IO over `~/.saklas/manifolds/`, addressed by `(namespace, name)` pairs —
   no model load (except none; `search`/`install` hit HF).
 - Bare-name resolution is shared by both dispatchers and splits by intent: verbs
@@ -152,7 +152,7 @@ category list through verbatim (tagged concepts only, no multi-node sweep).
   `--method auto` defers flat-vs-curved + periodic-axis selection to
   `select_topology` per-model. `--max-subspace-dim` caps the per-layer RBF subspace
   dim for the curved spectral fit (argparse-default `None` → engine 64) and is
-  dropped by `_sanitize_hyperparams` for `--method pca` — a flat fit's subspace dim
+  dropped by `sanitize_hyperparams` for `--method pca` — a flat fit's subspace dim
   is its `--max-dim` layout dim. `--min-dim` (spectral only) floors the intrinsic
   dim the eigenvalue-ratio cliff picks (set `--min-dim == --max-dim` to pin it,
   e.g. PAD's 3); ignored for `--method pca`. `--smoothing` (curved only: GCV `auto` / exact `0`

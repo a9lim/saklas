@@ -42,10 +42,10 @@ def _mock_session():
     # Gen state carries the real finish_reason after each generation.
     gen_state = MagicMock()
     gen_state.finish_reason = "stop"
-    session._gen_state = gen_state
-    session._last_result = None
-    session._tokenizer = MagicMock()
-    session._tokenizer.decode.side_effect = lambda ids: f"<{ids[0]}>" if ids else ""
+    session.generation_state = gen_state
+    session.last_result = None
+    session.tokenizer = MagicMock()
+    session.tokenizer.decode.side_effect = lambda ids: f"<{ids[0]}>" if ids else ""
 
     session.build_readings.return_value = {}
     # Real asyncio.Lock so `async with session.lock:` works under the
@@ -465,7 +465,7 @@ class TestOllamaApi:
             yield TokenEvent(text=" world", token_id=2, index=1)
 
         session.generate_stream.side_effect = _mock_stream
-        session._last_result = GenerationResult(
+        session.last_result = GenerationResult(
             text="Hello world", tokens=[1, 2], token_count=2, prompt_tokens=3,
             tok_per_sec=5.0, elapsed=0.4,
         )
@@ -509,11 +509,21 @@ class TestOllamaApi:
         assert resp.status_code == 200
         assert resp.headers["content-type"].startswith("application/x-ndjson")
         lines = [json.loads(l) for l in resp.text.strip().split("\n") if l]
-        assert lines == [{
-            "model": "test/model",
-            "created_at": lines[0]["created_at"],
-            "error": "No vector registered for 'missing'",
-        }]
+        # An in-band error frame, then a terminating ``done`` frame so
+        # ollama-python / ChatOllama don't stall waiting for stream end.
+        assert lines == [
+            {
+                "model": "test/model",
+                "created_at": lines[0]["created_at"],
+                "error": "No vector registered for 'missing'",
+            },
+            {
+                "model": "test/model",
+                "created_at": lines[1]["created_at"],
+                "done": True,
+                "done_reason": "error",
+            },
+        ]
 
     def test_generate_non_streaming(self, session_and_client: Any) -> None:
         session, client = session_and_client

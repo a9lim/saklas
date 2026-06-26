@@ -41,7 +41,7 @@ def build_token_event(
         ]
 
     with suppress(Exception):
-        emap = session._gen_state.emit_map
+        emap = session.generation_state.emit_map
         if emap:
             event["raw_index"] = int(emap[-1][0])
 
@@ -75,7 +75,7 @@ def build_token_event(
         if isinstance(payload, dict):
             readings = payload.get("readings") or payload.get("probe_readings")
         if readings is None:
-            mf_monitor = getattr(session, "_monitor", None)
+            mf_monitor = getattr(session, "monitor", None)
             capture = getattr(session, "_capture", None)
             per_layer = (
                 getattr(capture, "_per_layer", None)

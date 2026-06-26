@@ -34,7 +34,7 @@ from saklas.core.results import (
     ProbeReading,
     TokenEvent,
 )
-from saklas.core.session import SaklasSession
+from saklas.core.session import CaptureMode, CaptureState, SaklasSession
 
 
 def fit_layer_subspace(*args: Any, **kwargs: Any) -> Any:
@@ -108,8 +108,9 @@ def _stub_session() -> SaklasSession:
         _per_layer={},
         set_incremental=lambda _sink: None,
     )
-    session._capture_incremental = False
+    session._capture_state = CaptureState()
     session._incremental_readings = []
+    session._incremental_gate_scores = []
     session._layers = []
     # Minimal prefix-cache invalidator + tree spy.
     session._prefix_cache = None
@@ -126,6 +127,13 @@ def _stub_session() -> SaklasSession:
     session.remove_probe = types.MethodType(SaklasSession.remove_probe, session)
     session._resolve_probe_manifold = types.MethodType(
         SaklasSession._resolve_probe_manifold, session,
+    )
+    # The steering collaborator owns the gating-score-callback builder; wire a
+    # real one (the MagicMock spec would otherwise auto-mock the lazy accessor).
+    from saklas.core.steering_composer import SteeringComposer
+    session._steering_composer = SteeringComposer(session)
+    session._get_steering_composer = types.MethodType(
+        SaklasSession._get_steering_composer, session,
     )
     return session
 
@@ -211,13 +219,14 @@ def test_begin_capture_widens_to_manifold_layers():
     # forward through to anything that touches the layers).
     session._layers = [None] * 4  # pyright: ignore[reportAttributeAccessIssue]  # test stub: list[None] satisfies len() contract
     session._incremental_readings = []
+    session._incremental_gate_scores = []
 
     # Bind the real _begin_capture and run it.
     ok = SaklasSession._begin_capture(session, widen=False)
     assert ok
     # Manifold covers layers 0, 1, 2 — capture must attach to all of them.
     assert set(attached_layers) == {0, 1, 2}
-    assert session._capture_incremental is True
+    assert session._capture_state.mode is CaptureMode.INCREMENTAL
     assert len(incremental_sinks) == 1
 
 

@@ -30,6 +30,7 @@ from saklas.server.app import (
     _parse_req_steering,
     _strict_model_enabled,
 )
+from saklas.server.streaming import stream_finalizer
 
 import hashlib
 import json
@@ -456,7 +457,7 @@ def register_ollama_routes(app: FastAPI) -> None:
         # Go-template syntax while HF uses Jinja — clients that parse this
         # will fail either way, so returning the honest Jinja template is
         # more useful than the meaningless "{{ .Prompt }}" placeholder.
-        tpl = getattr(session._tokenizer, "chat_template", None) or "{{ .Prompt }}"
+        tpl = getattr(session.tokenizer, "chat_template", None) or "{{ .Prompt }}"
         return {
             "license": "See upstream model card.",
             "modelfile": f"# saklas: {session.model_id}\nFROM {session.model_id}\n",
@@ -567,7 +568,7 @@ def register_ollama_routes(app: FastAPI) -> None:
         is_chat: bool,
         gen_kwargs: dict[str, Any],
         system: str | None,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | JSONResponse:
         """Shared non-streaming path for /api/chat and /api/generate.
 
         Option resolution is hoisted to the route handler so any
@@ -596,18 +597,30 @@ def register_ollama_routes(app: FastAPI) -> None:
                 raw = bool(body.get("raw", False))
 
         start_ns = time.monotonic_ns()
-        try:
-            async with session.lock:
+        # Bounded lock so a non-streaming request can't queue forever behind a
+        # stuck generation — it 503s like the streaming path does.  The route
+        # handler returns this ``JSONResponse`` verbatim.
+        async with acquire_session_lock(session) as acquired:
+            if not acquired:
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "model": str(body.get("model") or session.model_id),
+                        "created_at": _now_iso(),
+                        "error": "server busy",
+                    },
+                )
+            try:
                 result = session.generate(input_payload, raw=raw, **gen_kwargs)
-        except ConcurrentGenerationError as e:
-            raise HTTPException(
-                status_code=409, detail="Generation already in progress",
-            ) from e
+            except ConcurrentGenerationError as e:
+                raise HTTPException(
+                    status_code=409, detail="Generation already in progress",
+                ) from e
         elapsed_ns = time.monotonic_ns() - start_ns
 
         model_name = str(body.get("model") or session.model_id)
         created_at = _now_iso()
-        done_reason = _finish_to_done_reason(session._gen_state.finish_reason)
+        done_reason = _finish_to_done_reason(session.generation_state.finish_reason)
         stats = _duration_stats(result, elapsed_ns)
 
         # Saklas-specific extension: per-attached-manifold-probe aggregate
@@ -650,6 +663,7 @@ def register_ollama_routes(app: FastAPI) -> None:
         is_chat: bool,
         gen_kwargs: dict[str, Any],
         system: str | None,
+        request: Request | None = None,
     ):
         """Streaming NDJSON body for /api/chat and /api/generate.
 
@@ -659,6 +673,11 @@ def register_ollama_routes(app: FastAPI) -> None:
         errors can still happen when generation starts, so the iterator
         also converts ``SaklasError`` in-band instead of cutting the TCP
         stream off mid-flight.
+
+        ``request`` is threaded in from the route handler so we can bail
+        early on client disconnect (``is_disconnected()``).  Library and
+        test callers that don't have a live request pass ``None`` — the
+        disconnect check is simply skipped.
         """
         if is_chat:
             msgs = _extract_messages(body)
@@ -692,9 +711,15 @@ def register_ollama_routes(app: FastAPI) -> None:
             # matching the non-streaming path's single ``_now_iso()`` call.
             created_at = _now_iso()
             start_ns = time.monotonic_ns()
+            stream_iter = None
             try:
                 stream_iter = session.generate_stream(input_payload, raw=raw, **gen_kwargs)
                 for event in stream_iter:
+                    # Bail out if the client has hung up — close the inner
+                    # generator (handled in ``finally``) and stop spending
+                    # the GPU on tokens nobody is reading.
+                    if request is not None and await request.is_disconnected():
+                        return
                     if event.thinking:
                         # Ollama doesn't standardize a reasoning channel;
                         # the canonical shape uses a `thinking` field on
@@ -743,6 +768,12 @@ def register_ollama_routes(app: FastAPI) -> None:
                     "model": model_name, "created_at": created_at,
                     "error": "Generation already in progress",
                 }) + "\n"
+                # Terminating done frame so ollama-python / ChatOllama don't
+                # stall waiting for it after an in-band error chunk.
+                yield json.dumps({
+                    "model": model_name, "created_at": created_at,
+                    "done": True, "done_reason": "error",
+                }) + "\n"
                 return
             except SaklasError as e:
                 _status, msg = e.user_message()
@@ -751,17 +782,32 @@ def register_ollama_routes(app: FastAPI) -> None:
                     "created_at": created_at,
                     "error": msg,
                 }) + "\n"
+                # Terminating done frame so ollama-python / ChatOllama don't
+                # stall waiting for it after an in-band error chunk.
+                yield json.dumps({
+                    "model": model_name, "created_at": created_at,
+                    "done": True, "done_reason": "error",
+                }) + "\n"
                 return
+            finally:
+                # Deterministically tear down the engine worker thread
+                # (stop-flag + join) on every exit — normal completion
+                # (no-op on an exhausted generator), an in-band error, or
+                # an early client-disconnect ``return`` — rather than
+                # leaving it to GC.
+                close = getattr(stream_iter, "close", None)
+                if callable(close):
+                    close()
 
             elapsed_ns = time.monotonic_ns() - start_ns
-            result = session._last_result
-            done_reason = _finish_to_done_reason(session._gen_state.finish_reason)
+            result = session.last_result
+            finish_reason, _usage, mf_agg = stream_finalizer(session, result)
+            done_reason = _finish_to_done_reason(finish_reason)
             stats = _duration_stats(result, elapsed_ns) if result is not None else {
                 "total_duration": elapsed_ns, "load_duration": 0,
                 "prompt_eval_count": 0, "prompt_eval_duration": 0,
                 "eval_count": 0, "eval_duration": elapsed_ns,
             }
-            mf_agg = _probe_reading_aggregate(session)
             if is_chat:
                 final = {
                     "model": model_name,
@@ -800,6 +846,7 @@ def register_ollama_routes(app: FastAPI) -> None:
             return StreamingResponse(
                 _stream_chat_or_generate(
                     body, is_chat=True, gen_kwargs=gen_kwargs, system=system,
+                    request=request,
                 ),
                 media_type="application/x-ndjson",
             )
@@ -816,6 +863,7 @@ def register_ollama_routes(app: FastAPI) -> None:
             return StreamingResponse(
                 _stream_chat_or_generate(
                     body, is_chat=False, gen_kwargs=gen_kwargs, system=system,
+                    request=request,
                 ),
                 media_type="application/x-ndjson",
             )

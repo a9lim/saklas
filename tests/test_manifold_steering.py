@@ -87,6 +87,29 @@ def _manifold(layers: Sequence[int] = (0, 1)) -> Manifold:
     )
 
 
+def _manifold_open(layers: Sequence[int] = (0, 1)) -> Manifold:
+    """A 1-D *non-periodic* (open interval) manifold over 6 nodes.
+
+    Same activation pattern as ``_manifold`` so share-weighting tests that
+    assert share > 1 still hold; the only change is the domain, which disables
+    the periodic clamping fix and keeps the pre-fix share-weighted path.
+    """
+    domain = BoxDomain([BoxAxis("t", periodic=False, lo=0.0, hi=1.0)])
+    node_coords = torch.tensor([[i / 6] for i in range(6)])
+    node_params = domain.embed(node_coords)
+    return Manifold(
+        name="mood_open",
+        domain=domain,
+        node_labels=[f"n{i}" for i in range(6)],
+        node_coords=node_coords,
+        layers={
+            L: fit_layer_subspace_only(_circle(6, _DIM, 1.0 + 0.2 * L), node_params)
+            for L in layers
+        },
+        feature_space="raw",
+    )
+
+
 def _manifold2d(layers: Sequence[int] = (0,)) -> Manifold:
     """A 2-D box (disk-like) manifold over a 3x3 grid of 9 nodes."""
     domain = BoxDomain([
@@ -323,8 +346,11 @@ def test_manager_position_length_mismatch_raises():
 def test_manager_user_coeffs_clamped_to_unit():
     """User along/onto clamp to [0, 1].  With a single covered layer the
     mean-1 share == 1, so eff_along = base and eff_onto = min(1, base) — onto
-    stays clamped per layer; along does not (Step 8)."""
-    manifold = _manifold(layers=(0,))
+    stays clamped per layer; along does not (Step 8).
+
+    Uses a non-periodic (open interval) manifold so the pre-fix share-weighted,
+    unclamped path applies; the periodic path is tested separately."""
+    manifold = _manifold_open(layers=(0,))
     mgr = SteeringManager()
     mgr.add_manifold("mood", manifold, position=(0.5,), along=5.0, onto=5.0)
     layers = _model_layers(1)
@@ -358,12 +384,15 @@ def test_manager_along_share_weighting_mean_one():
 
 
 def test_manager_along_unclamped_overshoots():
-    """along is NOT clamped per layer (Step 8).  The per-layer centroid spread
-    differs (scale ∝ 1 + 0.2·L), so the top layer's mean-1 share > 1 slides it
-    strictly past base — no [0, 1] cap.  ``norm_cap`` (kernel) is the only
-    bound."""
+    """along is NOT clamped per layer for non-periodic fits (Step 8).  The
+    per-layer centroid spread differs (scale ∝ 1 + 0.2·L), so the top layer's
+    mean-1 share > 1 slides it strictly past base — no [0, 1] cap.
+    ``norm_cap`` (kernel) is the only bound.
+
+    Uses a non-periodic (open interval) manifold; the periodic path clamps
+    eff_along to [0, 1] and is tested separately."""
     n_layers = 3
-    manifold = _manifold(layers=tuple(range(n_layers)))
+    manifold = _manifold_open(layers=tuple(range(n_layers)))
     mgr = SteeringManager()
     mgr.add_manifold("mood", manifold, position=(0.5,), along=1.0, onto=0.0)
     mgr.apply_to_model(_model_layers(n_layers), torch.device("cpu"), torch.float32)
@@ -412,8 +441,11 @@ def test_manager_share_weighting_weights_by_centroid_spread():
     """The per-layer share is proportional to centroid spread — the
     wider-spread (more discriminative) layer absorbs a larger slice of along,
     the ratio is preserved by the mean-1 normalization, and the total sums to
-    ``along · base · n_layers``."""
-    domain = BoxDomain([BoxAxis("t", periodic=True, period=1.0)])
+    ``along · base · n_layers``.
+
+    Uses a non-periodic (open interval) domain so the share-weighted path
+    applies; the periodic path drops share-weighting and is tested separately."""
+    domain = BoxDomain([BoxAxis("t", periodic=False, lo=0.0, hi=1.0)])
     node_coords = torch.tensor([[i / 6] for i in range(6)])
     node_params = domain.embed(node_coords)
     manifold = Manifold(
@@ -438,6 +470,40 @@ def test_manager_share_weighting_weights_by_centroid_spread():
     assert (along_0 + along_1) == pytest.approx(
         user_along * _MANIFOLD_ALONG_GAIN * 2, abs=1e-4
     )
+
+
+def test_manager_periodic_clamps_and_drops_share_weighting():
+    """Periodic (loop) fits: eff_along is equal across all layers (no
+    share-weighting) and clamped to [0, 1] so no layer wraps around the ring.
+
+    Concretely: ``eff_along_L = clamp(along * _MANIFOLD_ALONG_GAIN, 0, 1)``
+    for every layer, regardless of the per-layer centroid spread.
+
+    - ``along=1.0``: each layer gets ``min(1.0, 1.0 * 4.0) = 1.0``.
+    - ``along=0.1``: each layer gets ``min(1.0, 0.1 * 4.0) = 0.4``.
+    """
+    n_layers = 3
+    manifold = _manifold(layers=tuple(range(n_layers)))  # periodic loop
+
+    for along, expected in [(1.0, min(1.0, 1.0 * _MANIFOLD_ALONG_GAIN)),
+                             (0.1, min(1.0, 0.1 * _MANIFOLD_ALONG_GAIN))]:
+        mgr = SteeringManager()
+        mgr.add_manifold(
+            "mood", manifold, position=(0.5,), along=along, onto=0.0,
+        )
+        mgr.apply_to_model(
+            _model_layers(n_layers), torch.device("cpu"), torch.float32,
+        )
+        budgets = [_coeffs(hook)[0] for hook in mgr.hooks.values()]
+        assert len(budgets) == n_layers
+        # All layers equal — no share-weighting.
+        assert all(b == pytest.approx(expected, abs=1e-6) for b in budgets), (
+            f"along={along}: expected all budgets={expected}, got {budgets}"
+        )
+        # Strictly clamped to [0, 1].
+        assert all(b <= 1.0 + 1e-9 for b in budgets), (
+            f"along={along}: eff_along exceeded 1.0: {budgets}"
+        )
 
 
 def _euclidean_shares(manifold: Manifold) -> dict[int, float]:

@@ -78,7 +78,10 @@ class ConfigFile:
 
     def to_dict(self) -> dict[str, object]:
         out: dict[str, object] = {}
-        for f in ("model", "thinking", "temperature", "top_p", "max_tokens", "system_prompt"):
+        for f in (
+            "model", "thinking", "temperature", "top_p", "max_tokens",
+            "system_prompt", "compile", "cuda_graphs", "return_top_k",
+        ):
             v = getattr(self, f)
             if v is not None:
                 out[f] = v

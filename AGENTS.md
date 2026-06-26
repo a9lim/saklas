@@ -249,7 +249,7 @@ The template is a first-class artifact with **two** consumers:
   messages, choices, …)` / `session.score_template(name, steering=…)` return one
   `ChoiceScores` per context.
 - **A manifold fit** — `manifold from-template <tmpl>`
-  (`io/manifolds.py::create_manifold_from_template`) resolves the template, expands
+  (`io/manifold_authoring.py::create_manifold_from_template`) resolves the template, expands
   its `values × contexts` into per-value node corpora (the slot-filled assistant
   turns, `corpus[i]` aligned to `contexts[i]`), and writes a discover folder that
   stores the corpus **and** a `template_ref`. At fit time the pipeline resolves the
@@ -377,11 +377,10 @@ target went whitened-unit, live-recalibrated on gemma-4-12b, see below) and
 node coords, so `eff_along` is a *fraction to the node* — `1.0` lands on it,
 `norm_cap` bounds off-domain RBF extrapolation; clean-stateless-calibrated on
 `months_loop%january` so `along=1.0` → `eff_along≈4` lands the vivid coherent winter
-sweet spot. CAVEAT: non-monotonic above on *periodic* fits — share-weighted
-`eff_along` wraps each layer around the ring at its own rate past ~1, scattering the
-layers onto different nodes; `4` rides a coherent part of the wrap, not a magnitude.
-Deferred fix: clamp curved `eff_along` to `[0,1]` + drop share-weighting on periodic
-domains). `_MANIFOLD_ONTO_GAIN` scales
+sweet spot. For **periodic `BoxDomain` fits** `eff_along` is now clamped and
+share-weighting dropped: `eff_along = max(0, min(1, along·_MANIFOLD_ALONG_GAIN))`,
+uniform per layer, so no layer wraps past the target node. Non-periodic curved fits
+keep the share-weighted unclamped path). `_MANIFOLD_ONTO_GAIN` scales
 **onto** only (the curved off-surface collapse). For an affine term the
 coefficient α is folded into the translate *target* by `synthesize_subspace`, so α
 scales the offset magnitude (unclamped); for a curved term α is the (clamped
@@ -423,7 +422,7 @@ polyharmonic RBF; at n=1 over an open axis it reproduces the natural cubic splin
 A manifold lives under `~/.saklas/manifolds/<ns>/<name>/` as `manifold.json`
 (domain spec + per-node `{label, coords}` for authored; `fit_mode` + hyperparams +
 `{label}` for discover) + `nodes/NN_<label>.json` corpora — by hand or via the
-webui builder (`io.manifolds.create_manifold_folder` /
+webui builder (`io.manifold_authoring.create_manifold_folder` /
 `create_discover_manifold_folder`). `manifold fit`, the webui fit action, and
 `POST .../fit` all run `ManifoldExtractionPipeline`: pool each node's centroid,
 embed coords through the domain (or derive them for discover mode), fit a per-layer
@@ -541,7 +540,7 @@ hold topic common-mode across nodes (response[i] ↔ prompt[i % k]), so the
 per-concept centroids stay comparable without a per-manifold scenario set.
 `manifold fit <name>` then fits — the two steps are deliberate (a flaky
 generation leaves inspectable corpora). Cross-model Procrustes alignment for discover coords is deferred (TODO
-in `io/manifolds.py`). The naturalness eval (`experiment naturalness`) fits a
+in `io/manifold_lifecycle.py`). The naturalness eval (`experiment naturalness`) fits a
 behavior-space manifold over node output distributions in Hellinger space and
 reports the per-step Bhattacharyya distance of a steered trajectory to it (low =
 natural; `--compare-linear` scores a straight-chord baseline alongside).
@@ -667,7 +666,11 @@ Key contracts:
 - `saklas/__init__.py` pins the public surface (`SaklasSession`, `Profile`,
   `Steering`, `SamplingConfig`, `Trigger`, `LayerWhitener`, the `RunSet`/
   `TokenEvent`/`ResultCollector` result types, the `EventBus` + event dataclasses,
-  the `LoomTree`/`Recipe`/`Transcript` suites, and their error types). `from saklas
+  the `LoomTree`/`Recipe`/`Transcript` suites, their error types, and additionally:
+  `ChoiceScores`/`ChoiceScore`; `parse_expr`/`format_expr`; term types
+  `ManifoldTerm`/`ProjectedTerm`/`AblationTerm`; selector errors
+  `SelectorError`/`AmbiguousSelectorError`; and
+  `ManifoldNotRegisteredError`/`VectorNotRegisteredError`). `from saklas
   import X` is stable; private submodule paths are not.
 
 ## Cache layout
@@ -743,7 +746,8 @@ tok/s):
   translates by `share_L · gain · target` (affine `gain = _SUBSPACE_GAIN =
   16.0`, target carries the coefficient; curved `gain = _MANIFOLD_ALONG_GAIN
   = 4.0`, a fraction-to-node scale (clean-stateless-calibrated on months;
-  non-monotonic above the sweet spot on periodic fits — see Gain note);
+  periodic `BoxDomain` fits clamp `eff_along` to `[0,1]` and drop share-weighting
+  — see Gain note for the full split);
   `_MANIFOLD_ONTO_GAIN = 0.5` is the `onto`-only gain). No
   norm preservation (onto is meant to shrink `‖h‖`); the curved path's `norm_cap =
   3·‖h‖` is the only bound (the affine fast path carries no cap).

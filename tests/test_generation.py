@@ -15,7 +15,7 @@ from saklas.core.generation import (
     generate_steered,
 )
 from saklas.core.results import ProbeReading
-from saklas.core.session import SaklasSession
+from saklas.core.session import CaptureMode, CaptureState, SaklasSession
 
 
 class _StopTokenizer:
@@ -166,6 +166,7 @@ def test_stop_sequence_trimmed_text_is_final_result_text():
     session._tokenizer = tokenizer
     session._monitor = SimpleNamespace(probe_names=[])
     session._capture = SimpleNamespace(stacked=lambda: {})
+    session._capture_state = CaptureState(mode=CaptureMode.FULL)
     session._last_per_token_scores = None
     session._last_result = None
     session.build_readings = lambda: {}
@@ -285,9 +286,7 @@ def test_finalize_reuses_scored_probe_aggregate() -> None:
     session._tokenizer = _StopTokenizer()
     session._monitor = Monitor()
     session._capture = capture
-    session._capture_incremental = False
-    session._capture_aggregate_only = False
-    session._capture_lean = False
+    session._capture_state = CaptureState(mode=CaptureMode.FULL)
     session._last_per_token_scores = None
     session._last_result = None
     session.events = SimpleNamespace(emit=lambda _event: None)
@@ -339,7 +338,7 @@ def test_finalize_incremental_probe_path_does_not_stack_capture() -> None:
     session._tokenizer = _StopTokenizer()
     session._monitor = Monitor()
     session._capture = Capture()
-    session._capture_incremental = True
+    session._capture_state = CaptureState(mode=CaptureMode.INCREMENTAL)
     session._incremental_readings = [
         {"toy": reading0},
         {"toy": reading1},
@@ -361,6 +360,191 @@ def test_finalize_incremental_probe_path_does_not_stack_capture() -> None:
     assert result.probe_readings == {"toy": reading1}
     assert result.readings["toy"].mean == (0.25,)
     assert session._last_per_token_scores == {"toy": [0.1, 0.25]}
+
+
+def test_finalize_lean_incremental_probe_path() -> None:
+    """LEAN_INCREMENTAL: per-token coord stream from lean rows + full aggregate
+    re-scored from the tail ring.
+
+    Key invariants:
+    1. The capture's ``stacked()`` is never called (lean uses the tail ring).
+    2. The per-token coord stream is populated from ``_incremental_readings``
+       (the lean per-token rows stored by the step sink).
+    3. The aggregate in the result IS the full ``ProbeReading`` (with ``nearest``
+       populated), NOT a lean coords-only row — ``_score_lean_incremental``
+       re-scores via ``_score_aggregate_only`` → ``monitor.score_aggregate``.
+    4. ``_last_per_token_scores`` holds the coord stream (not the lean reading).
+    """
+
+    # Lean per-token rows: only coords populated (nearest empty — the lean path).
+    lean0 = ProbeReading(
+        fraction=0.15,
+        nearest=[],
+        coords=(0.1,),
+        fraction_per_layer={},
+        coords_per_layer={},
+    )
+    lean1 = ProbeReading(
+        fraction=0.3,
+        nearest=[],
+        coords=(0.3,),
+        fraction_per_layer={},
+        coords_per_layer={},
+    )
+    # Full aggregate reading from the tail ring re-score.
+    full_agg = ProbeReading(
+        fraction=0.3,
+        nearest=[("node", 0.2)],
+        coords=(0.3,),
+        fraction_per_layer={0: 0.3},
+        coords_per_layer={0: (0.3,)},
+    )
+
+    pooled_slice = {0: torch.randn(4)}
+
+    class Capture:
+        def stacked(self) -> dict[int, torch.Tensor]:
+            raise AssertionError("LEAN_INCREMENTAL must not call stacked()")
+
+        def tail_slice_at(self, _idx: int) -> dict[int, torch.Tensor]:
+            return pooled_slice
+
+    class Monitor:
+        probe_names = ["toy"]
+        _agg_calls = 0
+
+        def enable_curved_warm(self, _flag: bool) -> None:
+            pass
+
+        def score_aggregate(
+            self, captured: dict[int, torch.Tensor], **_kw: Any
+        ) -> dict[str, ProbeReading]:
+            self._agg_calls += 1
+            assert captured is pooled_slice
+            return {"toy": full_agg}
+
+        def accumulate_readings(self, _vals: Any) -> None:
+            pass
+
+    monitor = Monitor()
+    state = GenerationState()
+    state.finish_reason = "length"
+
+    session: Any = SaklasSession.__new__(SaklasSession)
+    session._gen_state = state
+    session._tokenizer = _StopTokenizer()
+    session._monitor = monitor
+    session._capture = Capture()
+    session._capture_state = CaptureState(mode=CaptureMode.LEAN_INCREMENTAL)
+    session._incremental_readings = [
+        {"toy": lean0},
+        {"toy": lean1},
+    ]
+    session._last_per_token_scores = None
+    session._last_result = None
+    session.events = SimpleNamespace(emit=lambda _event: None)
+    session.build_readings = lambda: {}
+
+    result = SaklasSession._finalize_generation(
+        session,
+        "prompt",
+        [0, 1],
+        elapsed=1.0,
+        vector_snapshot={},
+        stateless=True,
+    )
+
+    # Invariant 3: aggregate carries the full reading (nearest populated).
+    assert result.probe_readings == {"toy": full_agg}
+    assert result.probe_readings["toy"].nearest == [("node", 0.2)]
+    # Invariant 2+4: per-token coord stream extracted from lean rows.
+    assert session._last_per_token_scores == {"toy": [0.1, 0.3]}
+    # Invariant 3: monitor.score_aggregate was called exactly once.
+    assert monitor._agg_calls == 1
+
+
+def test_finalize_gating_subset_probe_path() -> None:
+    """GATING_SUBSET: per-token scoring is only for probe gates (subset scalars);
+    the full-roster aggregate is pooled once from the tail ring at finalize.
+
+    Key invariants:
+    1. ``stacked()`` is never called.
+    2. ``per_token`` in the result is empty (GATING_SUBSET shares the
+       ``aggregate_only`` finalize path — no full per-token stream).
+    3. The aggregate reading IS the full ``ProbeReading`` from ``score_aggregate``.
+    4. ``_last_per_token_scores`` is None (no full per-token coord stream).
+    """
+
+    full_agg = ProbeReading(
+        fraction=0.6,
+        nearest=[("confident", 0.1)],
+        coords=(0.6,),
+        fraction_per_layer={0: 0.6},
+        coords_per_layer={0: (0.6,)},
+    )
+    pooled_slice = {0: torch.randn(4)}
+
+    class Capture:
+        def stacked(self) -> dict[int, torch.Tensor]:
+            raise AssertionError("GATING_SUBSET must not call stacked()")
+
+        def tail_slice_at(self, _idx: int) -> dict[int, torch.Tensor]:
+            return pooled_slice
+
+    class Monitor:
+        probe_names = ["toy"]
+        _agg_calls = 0
+
+        def enable_curved_warm(self, _flag: bool) -> None:
+            pass
+
+        def score_aggregate(
+            self, captured: dict[int, torch.Tensor], **_kw: Any
+        ) -> dict[str, ProbeReading]:
+            self._agg_calls += 1
+            assert captured is pooled_slice
+            return {"toy": full_agg}
+
+        def accumulate_readings(self, _vals: Any) -> None:
+            pass
+
+    monitor = Monitor()
+    state = GenerationState()
+    state.finish_reason = "length"
+
+    session: Any = SaklasSession.__new__(SaklasSession)
+    session._gen_state = state
+    session._tokenizer = _StopTokenizer()
+    session._monitor = monitor
+    session._capture = Capture()
+    # GATING_SUBSET: CaptureState.aggregate_only returns True for this mode.
+    session._capture_state = CaptureState(
+        mode=CaptureMode.GATING_SUBSET,
+        gating_subset={"toy"},
+        gating_keys={"toy"},
+    )
+    session._incremental_readings = []  # gate scores not used by finalize
+    session._last_per_token_scores = None
+    session._last_result = None
+    session.events = SimpleNamespace(emit=lambda _event: None)
+    session.build_readings = lambda: {}
+
+    result = SaklasSession._finalize_generation(
+        session,
+        "prompt",
+        [0, 1],
+        elapsed=1.0,
+        vector_snapshot={},
+        stateless=True,
+    )
+
+    # Invariant 3: full aggregate reading from tail ring.
+    assert result.probe_readings == {"toy": full_agg}
+    assert result.probe_readings["toy"].nearest == [("confident", 0.1)]
+    # Invariant 2+4: no per-token coord stream.
+    assert session._last_per_token_scores is None
+    # Invariant 3: score_aggregate called exactly once.
+    assert monitor._agg_calls == 1
 
 
 def test_penalty_state_applies_sparse_counts_on_device():

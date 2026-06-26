@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 
 from rich.markup import escape
 
+from saklas.core.errors import SaklasError
 from saklas.core.loom import LoomNode, LoomTree
 
 if TYPE_CHECKING:
@@ -27,8 +28,11 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 
 
-class AlphaListError(ValueError):
+class AlphaListError(ValueError, SaklasError):
     """Raised when ``parse_alpha_list`` can't make sense of its input."""
+
+    def user_message(self) -> tuple[int, str]:
+        return (400, str(self) or self.__class__.__name__)
 
 
 _LINSPACE_RE = re.compile(

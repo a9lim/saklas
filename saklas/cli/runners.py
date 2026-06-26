@@ -126,14 +126,14 @@ def _load_or_fit_transfer_alignment(
         src_model, device="auto", probes=[],
     ) as src_sess:
         src_acts = load_or_compute_neutral_activations(
-            src_sess._model, src_sess._tokenizer, src_sess._layers,
+            src_sess.model, src_sess.tokenizer, src_sess.layers,
             model_id=src_model, force=force,
         )
     with SaklasSession.from_pretrained(
         tgt_model, device="auto", probes=[],
     ) as tgt_sess:
         tgt_acts = load_or_compute_neutral_activations(
-            tgt_sess._model, tgt_sess._tokenizer, tgt_sess._layers,
+            tgt_sess.model, tgt_sess.tokenizer, tgt_sess.layers,
             model_id=tgt_model, force=force,
         )
     try:
@@ -259,10 +259,10 @@ def _setup_steering_vectors(
 
     Walks the raw AST via :func:`referenced_selectors` so namespace
     prefixes drive extraction site selection, then returns the parsed
-    :class:`Steering` with every atom pre-warmed in ``session._profiles``.
+    :class:`Steering` with every atom pre-warmed in ``session.profiles``.
     Returns ``None`` when ``expression`` is empty / falsy.
     """
-    from saklas.io.selectors import resolve_pole, AmbiguousSelectorError
+    from saklas.io.selectors import canonicalize_atom, AmbiguousSelectorError
     from saklas.core.steering_expr import (
         parse_expr, referenced_selectors,
     )
@@ -274,19 +274,16 @@ def _setup_steering_vectors(
         raw_name = concept
         display = f"{ns}/{concept}" if ns else concept
         try:
-            canonical, sign, _match, _variant = resolve_pole(raw_name, namespace=ns)
+            canonical, _variant = canonicalize_atom(raw_name)
         except AmbiguousSelectorError as e:
             if verbose:
                 print(f"  Failed to resolve '{raw_name}': {e}", file=sys.stderr)
                 sys.exit(1)
-            print(f"  Failed to register '{display}': {e}")
+            print(f"  Failed to register '{display}': {e}", file=sys.stderr)
             continue
         try:
             if verbose:
-                print(
-                    f"Extracting steering vector: {canonical}"
-                    + (f" (negated from '{raw_name}')" if sign < 0 else "")
-                )
+                print(f"Extracting steering vector: {canonical}")
                 _, profile = session.extract(
                     canonical, on_progress=lambda m: print(f"  {m}"),
                     namespace=ns,
@@ -296,7 +293,7 @@ def _setup_steering_vectors(
         except Exception as e:
             if verbose:
                 raise
-            print(f"  Failed to register '{display}': {e}")
+            print(f"  Failed to register '{display}': {e}", file=sys.stderr)
             continue
         registry_key = canonical
         session.steer(registry_key, profile)
@@ -375,6 +372,14 @@ def _run_serve(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     _load_effective_config(args)
+    if not args.model:
+        print(
+            "saklas serve: model required. Pass a HuggingFace repo id (e.g.\n"
+            "  saklas serve google/gemma-2-2b-it\n"
+            "or supply it via -c setup.yaml with a `model:` field.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
     _print_startup(args)
     session = _make_session(args)
@@ -553,9 +558,9 @@ def _run_config_validate(args: argparse.Namespace) -> None:
             print(f"{p}: ok")
             return
         # Dry-run: don't install, just check resolvability.
-        from saklas.io.selectors import _all_concepts
-        installed = {(c.namespace, c.name) for c in _all_concepts()}
-        installed_names = {c.name for c in _all_concepts()}
+        from saklas.io.selectors import all_concepts
+        installed = {(c.namespace, c.name) for c in all_concepts()}
+        installed_names = {c.name for c in all_concepts()}
         missing: list[str] = []
         for ns, concept, _variant in referenced_selectors(cfg.vectors):
             if ns is None:
@@ -565,7 +570,7 @@ def _run_config_validate(args: argparse.Namespace) -> None:
                 slug = concept.split(".")[0] if "." in concept else concept
                 if any(
                     slug in c.name.split(".")
-                    for c in _all_concepts()
+                    for c in all_concepts()
                     if "." in c.name
                 ):
                     continue
@@ -1077,7 +1082,7 @@ def _run_manifold_fit(args: argparse.Namespace) -> None:
     import json as _json
     from saklas.io.atomic import write_json_atomic
     from saklas.io.manifolds import (
-        ManifoldFolder, ManifoldFormatError, _sanitize_hyperparams,
+        ManifoldFolder, ManifoldFormatError, sanitize_hyperparams,
         domain_label,
     )
 
@@ -1158,7 +1163,7 @@ def _run_manifold_fit(args: argparse.Namespace) -> None:
         # Auto-only: periodic-detection persistence threshold.
         if getattr(args, "persistence_frac", None) is not None:
             new_hyperparams["persistence_frac"] = float(args.persistence_frac)
-        new_hyperparams = _sanitize_hyperparams(new_fit_mode, new_hyperparams)
+        new_hyperparams = sanitize_hyperparams(new_fit_mode, new_hyperparams)
 
         # Write back if anything changed.  Staged write — a crash mid-rewrite
         # would leave the folder unreadable and ``ManifoldFolder.load`` would
@@ -1743,7 +1748,7 @@ def _run_template_ls(args: argparse.Namespace) -> None:
     from saklas.io.templates import iter_template_folders
 
     rows = list(iter_template_folders())
-    if getattr(args, "json", False):
+    if getattr(args, "json_output", False):
         print(_json.dumps([t.summary() for t in rows], indent=2))
         return
     if not rows:
@@ -1771,7 +1776,7 @@ def _run_template_show(args: argparse.Namespace) -> None:
     except (TemplateNotFoundError, AmbiguousTemplateError) as e:
         print(f"template show: {e}", file=sys.stderr)
         sys.exit(1)
-    if getattr(args, "json", False):
+    if getattr(args, "json_output", False):
         payload = t.summary()
         payload["contexts"] = [
             {"turns": list(c.turns), "assistant": c.assistant} for c in t.contexts
@@ -1790,9 +1795,18 @@ def _run_template_show(args: argparse.Namespace) -> None:
 
 
 def _run_template_rm(args: argparse.Namespace) -> None:
-    from saklas.io.templates import remove_template_folder
+    from saklas.io.templates import (
+        AmbiguousTemplateError, TemplateNotFoundError, remove_template_folder,
+        resolve_template,
+    )
 
-    namespace, name = _split_manifold_ns_name(args.name)
+    try:
+        t = resolve_template(args.name)
+    except (TemplateNotFoundError, AmbiguousTemplateError) as e:
+        print(f"template rm: {e}", file=sys.stderr)
+        sys.exit(1)
+    namespace = t.path.parent.name if t.path else "local"
+    name = t.name
     if not args.yes:
         print(
             f"remove template {namespace}/{name}? pass -y/--yes to confirm",
@@ -1827,7 +1841,7 @@ def _run_template_score(args: argparse.Namespace) -> None:
     ) as session:
         per_ctx = score_template(session, tmpl, steering=args.steer)
 
-    if getattr(args, "json", False):
+    if getattr(args, "json_output", False):
         print(_json.dumps({
             "template": tmpl.name,
             "model": args.model,
@@ -1881,10 +1895,10 @@ def _run_pack_search(args: argparse.Namespace) -> None:
         rows = search_manifolds(args.query or None)
     except ImportError as e:
         print(f"saklas manifold search unavailable: {e}", file=sys.stderr)
-        return
+        sys.exit(1)
     except Exception as e:
         print(f"hf search failed: {type(e).__name__}: {e}", file=sys.stderr)
-        return
+        sys.exit(1)
     if getattr(args, "json_output", False):
         print(_json.dumps(rows, indent=2))
         return
@@ -2159,11 +2173,11 @@ def _run_pack_export(args: argparse.Namespace) -> None:
     if fmt != "gguf":
         print(f"Unknown export format: {fmt}", file=sys.stderr)
         sys.exit(2)
-    from saklas.io.cache_ops import _export_gguf_manifold
+    from saklas.io.cache_ops import export_gguf_manifold
 
     ns, name = _resolve_manifold_ns_name(args.name)
     try:
-        written = _export_gguf_manifold(
+        written = export_gguf_manifold(
             ns, name,
             model_scope=args.model,
             output=args.output,
@@ -2307,10 +2321,10 @@ def _run_experiment_naturalness(args: argparse.Namespace) -> None:
 
     import torch
 
-    from saklas.core.manifold import (
+    from saklas.core.manifold import domain_from_spec
+    from saklas.core.naturalness import (
         compute_node_behavior_centroid,
         compute_trajectory_distributions,
-        domain_from_spec,
         fit_behavior_manifold,
         trajectory_naturalness,
     )
@@ -2382,8 +2396,8 @@ def _run_experiment_naturalness(args: argparse.Namespace) -> None:
             )
             sys.exit(2)
         mt = mterms[0]
-        session._ensure_manifold_loaded(mt.manifold)
-        act_manifold = session._manifolds[mt.manifold]
+        session.ensure_manifold_loaded(mt.manifold)
+        act_manifold = session.manifolds[mt.manifold]
         # Resolve label-form positions to coords up front — every
         # downstream call here wants a coord tuple, and the chord
         # baseline is per-coord arithmetic that can't operate on a

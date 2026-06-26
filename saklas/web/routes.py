@@ -14,8 +14,10 @@ from pathlib import Path
 
 from fastapi import FastAPI
 
+from saklas.core.errors import SaklasError
 
-class WebUINotBuilt(RuntimeError):
+
+class WebUINotBuilt(RuntimeError, SaklasError):
     """Raised when ``saklas serve`` runs against an empty dist dir.
 
     The wheel ships a pre-built bundle; this only fires in source-tree
@@ -23,6 +25,9 @@ class WebUINotBuilt(RuntimeError):
     ``--no-web`` to skip the dashboard mount when the bundle is missing
     on purpose.
     """
+
+    def user_message(self) -> tuple[int, str]:
+        return (500, "dashboard not built — run `cd webui && npm run build`")
 
 
 def dist_path() -> Path:

@@ -213,96 +213,81 @@ def test_parse_args_two_models_raises():
         sel.parse_args(["happy", "model:a", "model:b"])
 
 
-# --- resolve_pole alias resolution -----------------------------------------
+# --- canonicalize_atom (the retired resolve_pole's surviving behavior) -------
 
-class TestResolvePole:
-    """4.0: ``resolve_pole`` no longer scans disk or resolves bipolar aliases.
-
-    It always returns ``(canonical_slug, +1, None, variant)`` — peeling a
-    ``:variant`` suffix and canonicalizing the name.  Bipolar-pole STEERING
-    (``wolf`` → ``deer.wolf``) moved to the manifold tier
-    (:func:`resolve_manifold_label` / ``resolve_bare_name`` in the steering
-    grammar), so the old positive/negative-alias, collision, sign-flip, and
-    namespaced-scoped tests are obsolete and were deleted.
+class TestCanonicalizeAtom:
+    """4.0: ``resolve_pole`` is retired; :func:`canonicalize_atom` carries its
+    surviving behavior — peel a ``:variant`` suffix and canonicalize the name,
+    returning ``(canonical_slug, variant)``.  Bipolar-pole STEERING
+    (``wolf`` → ``deer.wolf``) moved to the manifold tier (the label tier of
+    :func:`resolve_bare_atom`), so there is no sign-flip / match slot anymore.
     """
 
     def test_monopolar_exact_match(self) -> None:
-        name, sign, m, _v = sel.resolve_pole("agentic")
+        name, _v = sel.canonicalize_atom("agentic")
         assert name == "agentic"
-        assert sign == 1
-        assert m is None
 
     def test_composite_literal(self) -> None:
-        name, sign, m, _v = sel.resolve_pole("angry.calm")
+        name, _v = sel.canonicalize_atom("angry.calm")
         assert name == "angry.calm"
-        assert sign == 1
-        assert m is None
 
     def test_slug_normalization(self) -> None:
-        name, sign, _m, _v = sel.resolve_pole("High-Context")
+        name, _v = sel.canonicalize_atom("High-Context")
         assert name == "high_context"
-        assert sign == 1
 
     def test_unknown_falls_through(self) -> None:
-        name, sign, m, _v = sel.resolve_pole("xyzzy")
+        name, _v = sel.canonicalize_atom("xyzzy")
         assert name == "xyzzy"
-        assert sign == 1
-        assert m is None
 
 
-def test_resolve_pole_strips_raw_variant() -> None:
-    from saklas.io.selectors import resolve_pole
+def test_canonicalize_atom_strips_raw_variant() -> None:
+    from saklas.io.selectors import canonicalize_atom
 
-    canonical, sign, match, variant = resolve_pole("honest:raw")
+    canonical, variant = canonicalize_atom("honest:raw")
     assert canonical == "honest"
-    assert sign == 1
-    assert match is None
     assert variant == "raw"
 
 
-def test_resolve_pole_sae_variant() -> None:
-    from saklas.io.selectors import resolve_pole
+def test_canonicalize_atom_sae_variant() -> None:
+    from saklas.io.selectors import canonicalize_atom
 
-    canonical, sign, match, variant = resolve_pole("honest:sae")
+    canonical, variant = canonicalize_atom("honest:sae")
     assert canonical == "honest"
-    assert match is None
     assert variant == "sae"
 
 
-def test_resolve_pole_sae_with_release() -> None:
-    from saklas.io.selectors import resolve_pole
+def test_canonicalize_atom_sae_with_release() -> None:
+    from saklas.io.selectors import canonicalize_atom
 
-    canonical, sign, match, variant = resolve_pole("honest:sae-gemma-scope-2b-pt-res-canonical")
+    _canonical, variant = canonicalize_atom("honest:sae-gemma-scope-2b-pt-res-canonical")
     assert variant == "sae-gemma-scope-2b-pt-res-canonical"
 
 
-def test_resolve_pole_no_variant_defaults_to_raw() -> None:
-    from saklas.io.selectors import resolve_pole
+def test_canonicalize_atom_no_variant_defaults_to_raw() -> None:
+    from saklas.io.selectors import canonicalize_atom
 
-    canonical, sign, match, variant = resolve_pole("honest")
+    _canonical, variant = canonicalize_atom("honest")
     assert variant == "raw"
 
 
-def test_resolve_pole_variant_strips_suffix() -> None:
-    """A ``:variant`` suffix peels off; the name canonicalizes, sign stays +1.
+def test_canonicalize_atom_variant_strips_suffix() -> None:
+    """A ``:variant`` suffix peels off; the name canonicalizes.
 
     (Pre-4.0 this asserted a bipolar sign flip for ``wolf:sae`` →
     ``deer.wolf @ -1``; that resolution moved to the manifold tier.)
     """
-    from saklas.io.selectors import resolve_pole
+    from saklas.io.selectors import canonicalize_atom
 
-    canonical, sign, match, variant = resolve_pole("wolf:sae")
+    canonical, variant = canonicalize_atom("wolf:sae")
     assert canonical == "wolf"
-    assert sign == 1
-    assert match is None
     assert variant == "sae"
 
 
-def test_resolve_pole_rejects_invalid_variant() -> None:
-    from saklas.io.selectors import resolve_pole, SelectorError
+def test_canonicalize_atom_rejects_invalid_variant() -> None:
+    from saklas.io.selectors import canonicalize_atom, SelectorError
 
     with pytest.raises(SelectorError):
-        resolve_pole("honest:weird-variant")
+        canonicalize_atom("honest:weird-variant")
 
 
 def test_parse_accepts_variant_suffix():
@@ -329,23 +314,19 @@ def test_parse_role_variant():
     assert s.namespace is None
 
 
-def test_resolve_pole_role_variant() -> None:
-    from saklas.io.selectors import resolve_pole
+def test_canonicalize_atom_role_variant() -> None:
+    from saklas.io.selectors import canonicalize_atom
 
-    canonical, sign, match, variant = resolve_pole("angry:role-pirate")
+    canonical, variant = canonicalize_atom("angry:role-pirate")
     assert canonical == "angry"
-    assert sign == 1
-    assert match is None
     assert variant == "role-pirate"
 
 
-def test_resolve_pole_role_with_dotted_id() -> None:
-    from saklas.io.selectors import resolve_pole
+def test_canonicalize_atom_role_with_dotted_id() -> None:
+    from saklas.io.selectors import canonicalize_atom
 
-    canonical, sign, match, variant = resolve_pole("happy.sad:role-mad-scientist")
+    canonical, variant = canonicalize_atom("happy.sad:role-mad-scientist")
     assert canonical == "happy.sad"
-    assert sign == 1
-    assert match is None
     assert variant == "role-mad-scientist"
 
 
@@ -363,6 +344,87 @@ def test_parse_role_with_namespace():
     assert s.kind == "name"
     assert s.value == "honest"
     assert s.namespace == "default"
+
+
+# --- resolve_bare_atom: the single-owner bare-atom tier ladder ---------------
+
+def _mk_nodes(ns: str, name: str, labels: list[str]) -> Path:
+    """Author an installed discover manifold with the given node labels."""
+    return create_discover_manifold_folder(
+        ns, name, "x", fit_mode="pca",
+        node_corpora={lbl: [f"{lbl} statement."] for lbl in labels},
+        hyperparams={"max_dim": 1},
+    )
+
+
+def test_bare_atom_label_tier(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A bare slug matching a multi-node manifold's node label → label hit."""
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    _mk_nodes("default", "personas", ["pirate", "wizard", "vandal"])
+    sel.invalidate()
+    atom = sel.resolve_bare_atom("pirate")
+    assert atom.kind == "label"
+    assert atom.manifold is not None
+    assert atom.manifold.manifold_key == "default/personas"
+    assert atom.manifold.label == "pirate"
+
+
+def test_bare_atom_name_tier(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A dotted 2-node ``pca`` manifold *name* → composite-name hit (node 0).
+
+    The ``.`` makes it skip the label tier and land on the name tier.
+    """
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    _mk_nodes("default", "deer.wolf", ["deer", "wolf"])
+    sel.invalidate()
+    atom = sel.resolve_bare_atom("deer.wolf")
+    assert atom.kind == "name"
+    assert atom.manifold_name is not None
+    assert atom.manifold_name.manifold_key == "default/deer.wolf"
+    assert atom.manifold_name.pole_label == "deer"  # node 0
+
+
+def test_bare_atom_pole_fallthrough(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """No manifold match → pole canonicalization (peel variant + slug)."""
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    sel.invalidate()
+    atom = sel.resolve_bare_atom("Xyzzy-Thing", variant="sae")
+    assert atom.kind == "pole"
+    assert atom.pole == ("xyzzy_thing", "sae")
+
+
+def test_bare_atom_variant_skips_label_tier(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A non-``raw`` variant skips both manifold tiers (variant addressing)."""
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    _mk_nodes("default", "personas", ["pirate"])
+    sel.invalidate()
+    atom = sel.resolve_bare_atom("pirate", variant="sae")
+    assert atom.kind == "pole"
+    assert atom.pole == ("pirate", "sae")
+
+
+def test_bare_atom_typed_namespace_skips_label_tier(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A user-typed namespace skips the bare-label tier (but not the name tier)."""
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    _mk_nodes("alice", "personas", ["pirate"])
+    sel.invalidate()
+    atom = sel.resolve_bare_atom("pirate", typed_namespace="alice")
+    assert atom.kind == "pole"
+    assert atom.pole == ("pirate", "raw")
+
+
+def test_bare_atom_cross_manifold_label_collision_raises(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Two manifolds owning the same node label → AmbiguousSelectorError."""
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    _mk_nodes("default", "personas", ["pirate"])
+    _mk_nodes("default", "roles", ["pirate"])
+    sel.invalidate()
+    with pytest.raises(sel.AmbiguousSelectorError):
+        sel.resolve_bare_atom("pirate")
 
 
 # NOTE: ``test_materialize_then_invalidate_makes_bundled_visible`` was deleted

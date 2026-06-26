@@ -2,14 +2,12 @@
 from __future__ import annotations
 
 import math
-from types import SimpleNamespace
-from typing import Any
 
 import torch
 
-from saklas.core.manifold import (
-    BoxAxis,
-    BoxDomain,
+from tests.conftest import CharTokenizer, FakeLogitsModel
+from saklas.core.manifold import BoxAxis, BoxDomain
+from saklas.core.naturalness import (
     bhattacharyya_distance,
     compute_node_behavior_centroid,
     compute_trajectory_distributions,
@@ -108,24 +106,27 @@ def test_off_manifold_trajectory_scores_higher():
 
 
 # -------------------------------------------------------- mock-model path ---
+#
+# The behavior reads (centroid / trajectory) only care that the model returns a
+# per-position ``.logits``; the shared ``FakeLogitsModel`` (conftest) supplies
+# that wrapper, parametrized by a seeded-random ``logits_fn`` so the trajectory
+# stays deterministic per token sequence.  ``CharTokenizer(mod=13)`` reproduces
+# the old whitespace-free char-code tokenizer.
 
-class _MockTok:
-    bos_token_id = 0
 
-    def __call__(self, text: str, return_tensors: str | None = None, add_special_tokens: bool | None = None) -> dict[str, Any]:
-        ids = [(ord(c) % 13) + 1 for c in text] or [1]
-        return {"input_ids": torch.tensor([ids])}
-
-
-class _MockModel:
-    def __init__(self, vocab: int):
-        self.vocab = vocab
-
-    def __call__(self, input_ids: torch.Tensor | None = None, use_cache: bool | None = None) -> SimpleNamespace:
-        assert input_ids is not None  # callers always pass a tensor
+def _MockModel(vocab: int) -> FakeLogitsModel:
+    def _logits(input_ids: torch.Tensor) -> torch.Tensor:
         seq = input_ids.shape[1]
         torch.manual_seed(int(input_ids.sum()))
-        return SimpleNamespace(logits=torch.randn(1, seq, self.vocab))
+        return torch.randn(1, seq, vocab)
+
+    # No ``parameters()`` consumer on this path (the behavior reads pass an
+    # explicit device), so keep the stub minimal.
+    return FakeLogitsModel(_logits, with_parameters=False)
+
+
+def _MockTok() -> CharTokenizer:
+    return CharTokenizer(mod=13)
 
 
 def test_compute_node_behavior_centroid_is_distribution():

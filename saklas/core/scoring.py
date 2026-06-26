@@ -119,8 +119,8 @@ def score_choices(
     """
     if not choices:
         raise ValueError("score_choices: empty choice set")
-    model = session._model
-    tokenizer = session._tokenizer
+    model = session.model
+    tokenizer = session.tokenizer
     device = next(model.parameters()).device
     labels = labels if labels is not None else list(choices)
     if len(labels) != len(choices):

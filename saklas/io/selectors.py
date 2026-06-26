@@ -131,7 +131,7 @@ def invalidate() -> None:
     _manifold_names_cache.clear()
 
 
-def _all_concepts() -> list[ResolvedConcept]:
+def all_concepts() -> list[ResolvedConcept]:
     """Every installed concept — i.e. every installed manifold (4.0).
 
     Concepts and steering manifolds are the same artifact now, so this walks
@@ -160,8 +160,13 @@ def _all_concepts() -> list[ResolvedConcept]:
     return out
 
 
+# Back-compat alias: callers that import ``_all_concepts`` by the old name
+# continue to resolve here.  The public name is ``all_concepts``.
+_all_concepts = all_concepts
+
+
 def resolve(selector: Selector) -> list[ResolvedConcept]:
-    concepts = _all_concepts()
+    concepts = all_concepts()
 
     if selector.kind == "all":
         return concepts
@@ -206,25 +211,20 @@ def resolve(selector: Selector) -> list[ResolvedConcept]:
     raise SelectorError(f"unknown selector kind: {selector.kind}")
 
 
-def resolve_pole(
-    raw: str, namespace: Optional[str] = None,
-) -> tuple[str, int, Optional["ResolvedConcept"], str]:
+def canonicalize_atom(raw: str) -> tuple[str, str]:
     """Peel a ``:variant`` suffix and canonicalize a concept reference.
 
     Grammar: ``<name_part>[":"<variant>]`` where ``<variant>`` is ``raw``
     (the default when no suffix is present), ``sae`` (unique SAE variant),
     ``sae-<release>``, ``role``, ``role-<id>``, or ``from``/``from-<src>``.
-    Returns ``(canonical, +1, None, variant)`` — the canonicalized slug, a
-    positive sign, no resolved match, and the parsed variant.
-
-    4.0 note: bipolar-pole alias resolution (``wolf`` → ``deer.wolf @ -0.5``)
-    moved entirely to the **manifold** tier — a bipolar concept is a 2-node
-    ``pca`` manifold, so a bare pole resolves through
-    :func:`resolve_manifold_label` (the node) / :func:`resolve_manifold_name`
-    (the composite name) in :func:`resolve_bare_name`, which the steering
-    grammar consults *before* the plain-vector fall-through.  This function no
-    longer scans installed concepts (doing so would only collide with the
-    manifold node), so ``match`` is always ``None`` and ``sign`` always ``+1``.
+    Returns ``(canonical, variant)`` — the canonicalized slug and the parsed
+    variant.  This is the surviving behavior of the retired ``resolve_pole``:
+    bipolar-pole alias resolution (``wolf`` → ``deer.wolf @ -0.5``) moved
+    entirely to the **manifold** tier (a bipolar concept is a 2-node ``pca``
+    manifold), so a bare pole resolves through the label tier of
+    :func:`resolve_bare_atom` as an affine ``%`` push and there is no distinct
+    pole artifact left to scan / sign-flip — only the slug + variant peel
+    remains.
 
     Raises:
         SelectorError: when the ``:variant`` suffix doesn't match
@@ -243,7 +243,7 @@ def resolve_pole(
     from saklas.core.session import canonical_concept_name
 
     slug = canonical_concept_name(raw)
-    return slug, +1, None, variant
+    return slug, variant
 
 
 @dataclass(frozen=True)
@@ -311,10 +311,10 @@ def resolve_manifold_label(
     match, ``None`` when nothing matches (the caller falls through to
     other resolution tiers — e.g. a fresh concept), and raises
     :class:`AmbiguousSelectorError` when multiple manifolds carry a
-    node by the same label.  This is the manifold analogue of
-    :func:`resolve_pole`'s bipolar-pole alias; together they let
-    ``persona`` (the manifold node) and ``angry`` (the bipolar pole)
-    resolve through the same bare-name surface.
+    node by the same label.  This is the manifold tier of
+    :func:`resolve_bare_atom`; the bare-pole/label collapse (a bipolar
+    concept *is* a 2-node manifold) lets ``persona`` (the manifold node)
+    and ``angry`` (the bipolar pole) resolve through the same surface.
 
     The lookup is a folder scan, not a fitted-tensor check — labels
     exist on the artifact regardless of whether the manifold has been
@@ -348,13 +348,15 @@ def resolve_bare_name(
     Returns the :class:`ResolvedManifoldLabel` when an installed manifold
     owns a node labeled ``raw``, else ``None``.  A bipolar concept *is* a
     2-node ``pca`` manifold now, so the historical bipolar-pole tier
-    collapsed into the manifold tier: ``resolve_pole`` no longer resolves a
-    distinct artifact (it only canonicalizes / peels the ``:variant``
-    suffix), so there is no cross-tier pole/label collision left to
-    arbitrate here.  A cross-namespace manifold-label collision still raises
-    :class:`AmbiguousSelectorError` from :func:`resolve_manifold_label`.
+    collapsed into the manifold tier: :func:`canonicalize_atom` no longer
+    resolves a distinct artifact (it only canonicalizes / peels the
+    ``:variant`` suffix), so there is no cross-tier pole/label collision left
+    to arbitrate here.  A cross-namespace manifold-label collision still
+    raises :class:`AmbiguousSelectorError` from
+    :func:`resolve_manifold_label`.
 
-    The caller routes a hit downstream: a ``manifold_hit`` synthesizes a
+    This is tier 1 of :func:`resolve_bare_atom`, which owns the full ladder
+    (label → composite name → pole canonicalization); a hit routes to a
     ``<manifold>%<label>`` :class:`~saklas.core.steering_expr.ManifoldTerm`.
     """
     return resolve_manifold_label(raw, namespace=namespace)
@@ -436,6 +438,106 @@ def resolve_manifold_name(
             f"Specify the namespace as <ns>/{name}."
         )
     return matches[0]
+
+
+@dataclass(frozen=True)
+class ResolvedBareAtom:
+    """The outcome of :func:`resolve_bare_atom` — the bare-atom tier ladder.
+
+    Exactly one of ``manifold`` / ``manifold_name`` / ``pole`` is set,
+    discriminated by ``kind``:
+
+    - ``"label"``: a manifold node-label hit — ``manifold`` is the
+      :class:`ResolvedManifoldLabel` (the caller synthesizes a label-form
+      ``<manifold>%<label>`` ``ManifoldTerm``).
+    - ``"name"``: a 2-node ``pca`` manifold *name* hit — ``manifold_name`` is
+      the :class:`ResolvedManifoldName` (the caller synthesizes a ``%``
+      push to node 0, the ``orient_to=0`` + pole).
+    - ``"pole"``: neither manifold tier matched — ``pole`` is the
+      ``(canonical_slug, variant)`` pair from :func:`canonicalize_atom`, a
+      plain vector concept.
+    """
+
+    kind: str  # "label" | "name" | "pole"
+    manifold: Optional[ResolvedManifoldLabel] = None
+    manifold_name: Optional[ResolvedManifoldName] = None
+    pole: Optional[tuple[str, str]] = None
+
+
+def resolve_bare_atom(
+    concept: str,
+    *,
+    namespace: Optional[str] = None,
+    typed_namespace: Optional[str] = None,
+    variant: str = "raw",
+) -> ResolvedBareAtom:
+    """Resolve a bare atom through the whole bare-atom tier ladder.
+
+    This is the **single owner** of the ordering + arbitration the steering
+    grammar used to hand-sequence (`core.steering_expr`): a concept *is* a
+    manifold now, so a bare reference resolves, in order:
+
+    1. **manifold-label tier** (:func:`resolve_bare_name`) — when the atom is a
+       plain bare slug (``variant == "raw"``, no user-typed namespace, no
+       bipolar ``.``), a hit on a manifold's node label routes to a label-form
+       ``%`` push.  Cross-*manifold* label collisions raise
+       :class:`AmbiguousSelectorError` here.
+    2. **composite-name tier** (:func:`resolve_manifold_name`) — when
+       ``variant == "raw"``, a name that *is* a 2-node ``pca`` manifold
+       (``formal.casual`` — the ``.`` skips tier 1) routes to its node-0 (+)
+       pole.  Scoped by the user-typed namespace when present, else
+       ``namespace``.
+    3. **pole canonicalization** (:func:`canonicalize_atom`) — neither manifold
+       tier matched, so the atom is a plain vector concept: peel the
+       ``:variant`` suffix + canonicalize the slug.  Every bipolar pole is
+       itself a node label, so a bare pole has already resolved through tier 1
+       — this tier carries the genuine fresh-vector / variant / dotted-name
+       references.
+
+    ``namespace`` is the default (expression-level) namespace scope;
+    ``typed_namespace`` is the namespace the user explicitly typed on the atom
+    (``None`` for a bare reference).  A non-``AmbiguousSelectorError`` failure
+    from a manifold tier falls through to the pole canonicalization, where a
+    genuine error re-surfaces with the canonical message.
+
+    Raises:
+        AmbiguousSelectorError: a cross-namespace / cross-manifold collision in
+            either manifold tier.
+        SelectorError: an unknown ``:variant`` suffix (from tier 3).
+    """
+    # Tier 1 — manifold-label.  Gated to a plain bare slug: a typed namespace,
+    # a non-``raw`` variant, or a bipolar ``.`` all skip it (those forms are
+    # addressed explicitly and must not alias to an arbitrary node label).
+    if (
+        variant == "raw"
+        and typed_namespace is None
+        and "." not in concept
+    ):
+        try:
+            label_hit = resolve_bare_name(concept, namespace=namespace)
+        except AmbiguousSelectorError:
+            raise
+        except Exception:
+            label_hit = None
+        if label_hit is not None:
+            return ResolvedBareAtom(kind="label", manifold=label_hit)
+
+    # Tier 2 — composite-name (the 2-node ``pca`` vector-composite read path).
+    # ``formal.casual`` skips tier 1 on the ``.`` and lands here.
+    if variant == "raw":
+        ns_scope = typed_namespace or namespace
+        try:
+            name_hit = resolve_manifold_name(concept, namespace=ns_scope)
+        except AmbiguousSelectorError:
+            raise
+        except Exception:
+            name_hit = None
+        if name_hit is not None:
+            return ResolvedBareAtom(kind="name", manifold_name=name_hit)
+
+    # Tier 3 — plain vector concept: peel + canonicalize.
+    raw = concept if variant == "raw" else f"{concept}:{variant}"
+    return ResolvedBareAtom(kind="pole", pole=canonicalize_atom(raw))
 
 
 def parse_args(tokens: list[str]) -> tuple[Selector, Optional[str]]:
