@@ -17,7 +17,6 @@ from textual.timer import Timer
 from textual import events as _textual_events
 
 from saklas import Recipe, SamplingConfig, Steering
-from saklas.io.selectors import AmbiguousSelectorError
 from saklas.core.errors import SaklasError
 from saklas.core.generation import supports_thinking, thinking_is_optional
 from saklas.io.paths import saklas_home

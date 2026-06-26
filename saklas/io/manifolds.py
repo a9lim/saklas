@@ -45,12 +45,6 @@ from saklas.io.paths import manifolds_dir, saklas_home
 
 # -- format core ---------------------------------------------------------
 from saklas.io.manifold_folder import (
-    _FIT_MODES_ALL,
-    _FIT_MODES_BAKED,
-    _FIT_MODES_DISCOVER,
-    _HYPERPARAMS_BY_MODE,
-    _LABEL_REGEX,
-    _NODE_KINDS,
     MANIFOLD_FORMAT_VERSION,
     BakedManifoldError,
     DiscoverGenerationPlan,
@@ -59,12 +53,7 @@ from saklas.io.manifold_folder import (
     ManifoldSidecar,
     _canonical_json,
     _node_filename,
-    _node_payload_authored,
-    _node_payload_discover,
     sanitize_hyperparams,
-    _validate_node_kind,
-    _validate_node_role,
-    _warn_authoring_quality,
     domain_label,
     hash_manifold_files,
     min_nodes,
@@ -72,12 +61,6 @@ from saklas.io.manifold_folder import (
 
 # -- discovery + authoring ----------------------------------------------
 from saklas.io.manifold_authoring import (
-    _discover_manifest_payload,
-    _load_with_advisories,
-    _validate_authored_nodes,
-    _validate_discover_corpora,
-    _validate_discover_labels,
-    _write_node_corpus,
     append_discover_manifold_node,
     create_baked_manifold_folder,
     create_discover_manifold_folder,
@@ -96,8 +79,6 @@ from saklas.io.manifold_authoring import (
 
 # -- lifecycle / transfer / summary -------------------------------------
 from saklas.io.manifold_lifecycle import (
-    _manifold_tensor_files,
-    _manifold_tensor_variant_matches,
     clear_manifold_tensors,
     manifold_summary,
     refresh_manifold,
@@ -390,9 +371,11 @@ __all__ = [
     "hash_manifold_files",
     "iter_manifold_folders",
     "create_manifold_folder",
+    "create_manifold_from_template",
     "create_discover_manifold_folder",
     "create_baked_manifold_folder",
     "save_baked_manifold_tensor",
+    "port_legacy_vector_folder",
     "init_discover_manifold_folder",
     "append_discover_manifold_node",
     "write_manifold_scenarios",

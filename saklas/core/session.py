@@ -21,8 +21,6 @@ from saklas.core.events import (
     GenerationFinished,
     GenerationStarted,
     ProbeScored,
-    SteeringApplied,
-    SteeringCleared,
     VectorExtracted,
 )
 from saklas.core.generation import GenerationConfig, GenerationState, build_chat_input, detect_base_model, generate_steered, supports_thinking

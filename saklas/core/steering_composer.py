@@ -29,13 +29,12 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from saklas.core.events import SteeringApplied, SteeringCleared
 from saklas.core.session import (
     CaptureState,
     ConcurrentGenerationError,
     GenState,
     ManifoldNotRegisteredError,
-    SteeringApplied,
-    SteeringCleared,
     SteeringStackEntry,
     Trigger,
     VectorNotRegisteredError,
