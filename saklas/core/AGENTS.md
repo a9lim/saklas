@@ -340,20 +340,35 @@ spectral eigenpairs coordinate them (`_detect_periodic_axes`, `_is_angular_harmo
 dedups a circle's `cos kθ` harmonics), routing to a periodic `BoxDomain`. Returns a
 `TopologyChoice` (`fit_mode`/`coords`/`domain` + ranked `TopologyCandidate`s for
 the sidecar). Sphere is **authored-only** — not an auto candidate. PH counts loops
-by *hole size*, so a **faint ring** (a small cyclic modulation on a near-equidistant
-heap — e.g. day-of-week centroids at ~16% modulation) has too thin a hole to clear
-the persistence threshold; `_faint_cycle_coords` is the complementary single-cycle
-fallback (`_detect_periodic_axes` runs it only when PH counts zero). It fires on a
-structure that is **1-D** (symmetric 2-NN graph max-degree ≤ 3 — rejects 2-D grids
-and high-D persona-style fans), **closed** (a greedy+2-opt tour `_nn_tour` has
-near-uniform edges, `max/median < 2.0` — rejects open arcs/lines), **local** (each
-node's two tour-neighbours among its two nearest, recall ≥ 0.90 — rejects branched
-theta/Y and tours manufactured across a blob), and **graded** (mean distance grows
-from cyclic-separation 1→2 ≥ 1.08), returning a uniform `2π·rank/K` `S¹` coordinate
-in the recovered cyclic order. Gated `7 ≤ K ≤ 128`. Validated for specificity
-(~0.4% false-positive on random K=7 Gaussian heaps, ~0 for K≥10; the thresholds
-trade a small elongated-ellipse false-negative, which doesn't arise in the sphered
-whitened metric, for a low false-positive rate on real concept heaps).
+by *hole size*, so two kinds of real ring slip under its threshold;
+`_faint_cycle_coords` is the complementary single-cycle fallback
+(`_detect_periodic_axes` runs it only when PH counts zero), recovering the cyclic
+order in either of two sampling regimes off a greedy+2-opt tour (`_nn_tour`):
+**uniform** — a faint ring (small cyclic modulation on a near-equidistant heap,
+e.g. day-of-week centroids at ~16% modulation): too thin a hole for PH but
+near-equidistant, so the classic guards fire — **1-D** (symmetric 2-NN max-degree
+≤ 3), **closed** (tour edges near-uniform, `max/median < 2.0`), **local**
+(tour-neighbours among the two nearest, recall ≥ 0.90); and **clustered** — tight
+clumps spaced around the loop, the sampling real concept families have
+(months→seasons, days→weekday/weekend): the tour edges go **bimodal** (tiny
+intra-cluster, big inter-cluster) so closure/recall fail though the loop is real,
+accepted instead when the inter-cluster gaps are **≥2** in number, **decisively
+bimodal** (smallest gap ≥ 3.5× the small-edge scale — the guard that screens a
+diffuse low-D random cloud whose many accidental long edges only marginally clear
+the gap cutoff), **mutually regular** (`max/min ≤ 2.5`), and the loop has a **real
+far antipode** (tour-antipode/tour-neighbour mean distance ≥ 2.5 — rejects a blob/
+fan). Both regimes also require **graded** growth (`d(sep=2)/d(sep=1) ≥ 1.08`) and
+1-D-ness at the looser clustered bound (degree ≤ 4 — a tight clump reaches 4),
+returning a uniform `2π·rank/K` `S¹` coordinate in the recovered cyclic *order*
+(exact spacing dropped — topology, not metric, is what the periodic domain needs).
+Gated `7 ≤ K ≤ 128`. Validated (`geometry_stress.py periodic`) for specificity
+(~0% false-positive on random Gaussian heaps K≥9, and on grids/fans/arcs/blobs/
+lines) and clustered-ring sensitivity (100% recall for tight-to-moderate clumps);
+the bimodality guard trades two documented false-negatives — a very-loose cluster
+heap approaching uniform, and an eccentric ellipse `> 6:1` — for that 0% FP rate.
+A **gapped ring** (a uniform ring with one missing sector) is geometrically the
+*same point cloud* as an open arc, so it correctly stays non-periodic — the
+closure guard rejecting both is right, not a miss.
 ## naturalness.py
 
 Behavior-space naturalness eval, extracted from `manifold.py` to restore its

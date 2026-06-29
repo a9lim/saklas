@@ -77,6 +77,17 @@ for syntactic parse trees (Hewitt-Manning structural probe). The open lever is
 cross-model: saklas fits per-model geometry, so whether another architecture
 recovers a ring or a tree where gemma flattens is untested.
 
+One caveat on "even `months` auto-fits flat": that line was load-bearing evidence
+for the flattening account, and the detector-validation work below found a
+**clustered/gapped-ring blind spot** — for a while the periodic detector could not
+see a ring sampled in tight clumps (the seasonal sampling `months` has) or with a
+missing sector, *even in clean synthetic data*. So "auto-fits flat" was partly a
+detector limit for those shapes, not purely a model fact. The clustered case is now
+fixed (see below); the gapped case is inherent (a gapped ring is the same point
+cloud as an open arc). The honest read: a real-model re-fit of `months`/days under
+the fixed detector is the test that would settle whether they flatten or merely
+sampled into the old blind spot — still TODO.
+
 ## Detector validation — is `select_topology` trustworthy?
 
 `geometry_stress.py` maps the detector's operating characteristics on synthetic
@@ -86,12 +97,34 @@ rogue-channel activation space whitened by the Fisher metric).
 What's solid: rogue-channel **invariance is perfect** — a whitener with channels
 at 200× the background gives byte-identical verdicts to an isotropic one, so the
 Fisher metric divides massive activations out exactly as intended. Periodic
-detection has 100% T1 recall and 0% false-positives across blob/grid/fan/arc/line;
-the faint-cycle fallback recovers rings down to ~8% modulation; the read is
-deterministic and stable in `persistence_frac`. Envelope edges: a torus needs ≥7
-points per loop (coarser tori fill inside the `eps_max=2·eps_c` window and read
-flat), and T3+ is out of practical reach (the points-per-loop needed pushes K past
-the periodic regime). Neither arises in a bundled manifold.
+detection has 100% T1 recall and 0% false-positives across blob/plane/grid/fan/arc/
+line/gapped-ring (`periodic` sweep, sub-tests a–f); the faint-cycle fallback
+recovers uniform rings down to ~8% modulation **and clustered rings** (below); the
+read is deterministic and stable in `persistence_frac`. Envelope edges: a torus
+needs ≥7 points per loop (coarser tori fill inside the `eps_max=2·eps_c` window and
+read flat), T3+ is out of practical reach (the points-per-loop needed pushes K past
+the periodic regime), and an eccentric ellipse `> 6:1` falls to the fallback whose
+bimodal-gap test then can't see it. None arises in a bundled manifold.
+
+What it found — **a clustered/gapped-ring blind spot, clustered case now fixed.**
+Every synthetic ring the harness tested was *uniformly* sampled, but real concept
+rings never are: `months` clusters into seasons, days into weekday/weekend. A ring
+sampled in tight clumps makes the tour edges **bimodal** (tiny intra-cluster, big
+inter-cluster), so H1 counts no fat loop *and* the uniform faint path's
+closure/recall guards both fail — the ring read **flat**, even in clean synthetic
+data. The probe also exposed a sharp eccentricity cliff (6:1 rings → periodic,
+10:1 → flat). The fix adds a second fallback regime: a clustered ring is accepted
+from ≥2 inter-cluster gaps that are decisively bimodal (smallest gap ≥ 3.5× the
+small-edge scale), mutually regular, and bracket a real far antipode — which an
+open arc (one gap), a blob/fan (no antipode), and a 2-D grid or diffuse low-D cloud
+(gaps not decisively bimodal) all fail. Clustered rings now detect at 100% for
+tight-to-moderate clumps across iso/aniso/rogue whiteners with the 0% FP rate
+intact. Two cases stay rejected *by design*: a **gapped ring** (one missing sector)
+is geometrically identical to an open arc — the same point cloud, so there is no
+local signal to separate them — and a **very-loose cluster heap** approaching a
+uniform ring sits in the narrow handoff gap between the two fallback regimes.
+Guarded by `tests/test_manifold_topology.py` (clustered-ring section) and the
+`periodic` sweep's clustered-recall + FP sub-tests.
 
 What it found — **a flat-bias bug, now fixed.** The flat-vs-curved decision
 compared the flat candidate at its PCA variance-threshold dim against the curved

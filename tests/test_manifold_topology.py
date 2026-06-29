@@ -321,6 +321,86 @@ def test_select_blob_not_spuriously_periodic() -> None:
         assert not isinstance(choice.domain, BoxDomain), f"seed {seed} spurious ring"
 
 
+# ----------------------------- clustered-ring fallback ----------------------
+#
+# Real concept families don't tile a ring uniformly — months cluster into
+# seasons, days into weekday/weekend. A clustered ring (tight clumps spaced
+# around the loop) makes the tour edges *bimodal*, so H1 counts no fat loop AND
+# the uniform faint path's closure/recall guards fail, yet the loop is real. The
+# clustered path recovers it from >=2 regular inter-cluster gaps + a real far
+# antipode, while still rejecting the 2-D grids and high-D fans that the looser
+# degree bound would otherwise admit.
+
+
+def _clustered_ring(k_per: int, n_clusters: int, spread: float) -> torch.Tensor:
+    """A ring sampled in ``n_clusters`` tight clumps of ``k_per`` (seasonal
+    sampling); ``spread`` is each clump's angular half-width (radians)."""
+    centers = torch.linspace(0, 2 * math.pi, n_clusters + 1)[:-1]
+    th = torch.cat([c + torch.linspace(-spread, spread, k_per) for c in centers])
+    return torch.stack([torch.cos(th), torch.sin(th)], dim=1)
+
+
+def _gapped_ring(k: int, gap_sectors: int) -> torch.Tensor:
+    """A uniform ring with one contiguous sector removed. Geometrically this is
+    *identical* to an open arc — same point cloud — so it correctly stays
+    NON-periodic; the closure guard rejecting both is right, not a miss."""
+    full = k + gap_sectors
+    th = torch.linspace(0, 2 * math.pi, full + 1)[:-1][:k]
+    return torch.stack([torch.cos(th), torch.sin(th)], dim=1)
+
+
+@pytest.mark.parametrize("name,points,want", [
+    ("clustered-4x3", _clustered_ring(3, 4, 0.18), True),
+    ("clustered-3x4", _clustered_ring(4, 3, 0.25), True),
+    ("clustered-6x2", _clustered_ring(2, 6, 0.20), True),
+    ("clustered-4x5", _clustered_ring(5, 4, 0.20), True),
+    ("clustered-5x3", _clustered_ring(3, 5, 0.22), True),
+    # must reject — the impostors the clustered path's guards screen out:
+    ("grid-5x5", _grid(5), False),       # 2-D: gaps not decisively bimodal
+    ("grid-6x6", _grid(6), False),
+    ("grid-7x7", _grid(7), False),
+    ("persona-fan-K60", _persona_fan(60, 8, 4), False),  # high-D: degree >> 4
+    ("gapped-K22-g2", _gapped_ring(22, 2), False),   # == open arc (1 gap)
+    ("gapped-K18-g6", _gapped_ring(18, 6), False),
+])
+def test_faint_cycle_clustered(name: str, points: torch.Tensor, want: bool) -> None:
+    got = _faint_cycle_coords(torch.cdist(points, points)) is not None
+    assert got is want, name
+
+
+def test_faint_cycle_clustered_recovers_cyclic_order() -> None:
+    """The clustered path recovers the true cyclic order: each input clump stays
+    contiguous on the recovered loop. Walking the recovered cycle, the cluster id
+    changes exactly ``n_clusters`` times (a scrambled tour would change far more).
+    Robust to the tour's start point, rotation, and reflection."""
+    k_per, n_clusters = 3, 4
+    pts = _clustered_ring(k_per, n_clusters, 0.18)
+    coords = _faint_cycle_coords(torch.cdist(pts, pts))
+    assert coords is not None
+    order = torch.argsort(coords).tolist()            # nodes in recovered cyclic order
+    cluster_of = [i // k_per for i in order]
+    transitions = sum(cluster_of[i] != cluster_of[(i + 1) % len(order)]
+                      for i in range(len(order)))
+    assert transitions == n_clusters
+
+
+def test_select_clustered_ring_is_periodic() -> None:
+    """End-to-end: a clustered ring routes to a periodic BoxDomain (the case the
+    uniform faint path and H1 both miss)."""
+    choice = _choose(_clustered_ring(3, 4, 0.18), noise=0.03)
+    assert choice.winner_name == "torus-T1"
+    assert isinstance(choice.domain, BoxDomain)
+    assert choice.domain.axes[0].periodic
+
+
+def test_select_grid_not_spuriously_periodic() -> None:
+    """The looser clustered-path degree bound must not turn a 2-D grid (which now
+    reaches the tour stage) into a ring."""
+    for side in (5, 6, 7):
+        choice = _choose(_grid(side), noise=0.03)
+        assert not isinstance(choice.domain, BoxDomain), f"grid-{side} spurious ring"
+
+
 # ====================== flat<->curved dim-match (flat-bias fix) =============
 #
 # The flat-vs-curved GCV comparison used to be unfair: the flat candidate took

@@ -18,8 +18,10 @@ Fisher/Mahalanobis metric). It answers four questions:
                  a flat-bias margin vs the raw reconstruction gain? (the
                  research-critical de-confound of "the model is flat")
   periodic    -- recall/precision of ring & torus detection: arc-extent sweep,
-                 faint-ring recall, T2/T3, and false-positive rate on
-                 blob/grid/persona-fan/arc (the funky-geometry path)
+                 faint-ring recall, T2/T3, false-positive rate on blob/plane/grid/
+                 persona-fan/arc/gapped-ring, clustered-ring recall (seasonal
+                 sampling -- the blind spot the clustered fallback closes), and an
+                 eccentricity sweep (the funky-geometry path)
   stability   -- persistence_frac sensitivity, determinism, K sensitivity
 
 Pure CPU, no model load: ``select_topology`` operates on coordinate Grams, so the
@@ -185,6 +187,27 @@ def gen_faint_ring(k: int, mod: float = 0.16, common: int = 8) -> torch.Tensor:
     return torch.cat([ring, torch.ones(k, common)], dim=1)
 
 
+def gen_clustered_ring(k_per: int, n_clusters: int, spread: float) -> torch.Tensor:
+    """A ring sampled in ``n_clusters`` tight clumps of ``k_per`` points, ``spread``
+    the clump half-width (radians). The seasonal sampling real concept families
+    have (months->seasons, days->weekday/weekend): the tour edges are bimodal
+    (tiny intra-cluster, large inter-cluster), so H1 counts no fat loop and the
+    uniform faint path's closure/recall both fail -- the clustered fallback is
+    what recovers it. The blind spot this harness was extended to cover."""
+    centers = torch.linspace(0, 2 * math.pi, n_clusters + 1)[:-1]
+    th = torch.cat([c + torch.linspace(-spread, spread, k_per) for c in centers])
+    return torch.stack([torch.cos(th), torch.sin(th)], dim=1)
+
+
+def gen_gapped_ring(k: int, gap_sectors: int) -> torch.Tensor:
+    """A uniform ring with one contiguous sector removed -- geometrically the same
+    cloud as an open arc, so it correctly stays NON-periodic (the gapped ring and
+    the open arc are indistinguishable point sets)."""
+    full = k + gap_sectors
+    th = torch.linspace(0, 2 * math.pi, full + 1)[:-1][:k]
+    return torch.stack([torch.cos(th), torch.sin(th)], dim=1)
+
+
 def gen_torus(d: int, side: int) -> torch.Tensor:
     grids = torch.meshgrid(
         *[torch.linspace(0, 2 * math.pi, side + 1)[:-1] for _ in range(d)],
@@ -233,6 +256,7 @@ def topology_zoo(seed: int) -> list[tuple[str, torch.Tensor, str]]:
         ("circle", gen_circle(36), "periodic-T1"),
         ("ellipse", gen_ellipse(36), "periodic-T1"),
         ("faint-ring", gen_faint_ring(12), "periodic-T1"),
+        ("clustered-ring", gen_clustered_ring(3, 4, 0.18), "periodic-T1"),
         ("torus-T2", gen_torus(2, 7), "periodic-T2"),
         ("torus-T3", gen_torus(3, 4), "periodic-T3"),
         ("grid", gen_grid(6), "flat"),
@@ -518,12 +542,18 @@ def sweep_periodic(args: argparse.Namespace) -> dict[str, object]:
         print(f"{name:<12}truth={truth:<14}acc={acc:>5.2f}  {dict(regs)}{note}")
     out["torus"] = torus_res
 
-    # 3d. Periodic FALSE POSITIVE rate on non-cyclic shapes.
+    # 3d. Periodic FALSE POSITIVE rate on non-cyclic shapes. The grids (grid-5x5,
+    # grid-7x7) are the cases the clustered-ring path put at risk -- its looser
+    # 2-NN degree bound lets a 2-D grid reach the tour stage, so the bimodal-gap
+    # guard is what must keep them rejected.
     print("\n--- (d) periodic FALSE-POSITIVE rate (must be ~0) ---")
     fp_shapes = [("blob", lambda s: gen_blob(40, seed=s)),
                  ("plane", lambda s: gen_plane(40, seed=s)),
-                 ("grid", lambda s: gen_grid(6)),
+                 ("grid-6x6", lambda s: gen_grid(6)),
+                 ("grid-5x5", lambda s: gen_grid(5)),
+                 ("grid-7x7", lambda s: gen_grid(7)),
                  ("arc-200", lambda s: gen_arc(30, 200)),
+                 ("gapped-ring", lambda s: gen_gapped_ring(22, 2)),  # == open arc
                  ("persona-fan", lambda s: gen_persona_fan(40, seed=s)),
                  ("line", lambda s: gen_line(30))]
     fp_res = {}
@@ -540,6 +570,49 @@ def sweep_periodic(args: argparse.Namespace) -> dict[str, object]:
         flag = "" if rate <= 0.05 else "  <-- HIGH FP"
         print(f"{name:<14}FP rate = {rate:>5.2f}  ({fp}/{nseed}){flag}")
     out["fp"] = fp_res
+
+    # 3e. Clustered-ring recall: tight clumps spaced around the loop (seasonal
+    # sampling). The blind spot the clustered fallback closes -- H1 and the
+    # uniform faint path both miss these. Swept over cluster count x clump width.
+    print("\n--- (e) clustered-ring recall (seasonal sampling) ---")
+    clu_cfgs = [("4clust x3", 3, 4), ("3clust x4", 4, 3), ("6clust x2", 2, 6),
+                ("4clust x5", 5, 4), ("5clust x3", 3, 5)]
+    spreads = [0.15, 0.20, 0.30, 0.45]
+    print(f"{'config':<12}" + "".join(f"sp={s:<5}" for s in spreads))
+    clu_res = {}
+    for name, kpc, nc in clu_cfgs:
+        cells = []
+        for sp in spreads:
+            hit = 0
+            for seed in seeds:
+                wh, clean = make_whitener("aniso", layers, dim, seed=850 + seed)
+                low = gen_clustered_ring(kpc, nc, sp)
+                r = detect(low, wh, clean, layers=layers, dim=dim, noise=0.06, seed=seed)
+                hit += r.regime.startswith("periodic")
+            rate = hit / len(seeds)
+            cells.append(rate)
+            clu_res[f"{name}_sp{sp}"] = rate
+        print(f"{name:<12}" + "".join(f"{c:<8.2f}" for c in cells))
+    out["clustered"] = clu_res
+    print("  (loosest clumps sp=0.45 approach a uniform ring -- a documented "
+          "known-limit\n   false-negative, not a leak)")
+
+    # 3f. Eccentricity sweep: how elongated an ellipse still rings. PH reads a
+    # circle and a moderate ellipse as one loop; past ~6:1 the hole thins and it
+    # falls to the fallback, whose bimodal-gap test has its own (documented) limit.
+    print("\n--- (f) eccentricity sweep (ellipse a:b -> still periodic?) ---")
+    eccs = [2.0, 4.0, 6.0, 10.0, 16.0]
+    ecc_res = {}
+    for ecc in eccs:
+        hit = 0
+        for seed in seeds:
+            wh, clean = make_whitener("aniso", layers, dim, seed=880 + seed)
+            low = gen_ellipse(36, ecc, 1.0)
+            r = detect(low, wh, clean, layers=layers, dim=dim, noise=0.03, seed=seed)
+            hit += r.regime.startswith("periodic")
+        ecc_res[ecc] = hit / len(seeds)
+        print(f"  {ecc:>4}:1   periodic-rate={ecc_res[ecc]:.2f}")
+    out["eccentricity"] = ecc_res
     return out
 
 

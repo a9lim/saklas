@@ -3325,17 +3325,34 @@ def _count_persistent_loops(
     return min(count, max_dim)
 
 
-# Faint single-cycle fallback thresholds (complement H1 persistence, which only
-# counts *fat* loops — a thin ring slips under it).  Validated for sensitivity
-# (synthetic faint rings + real day-of-week centroids) and specificity (~0.4%
-# false-positive on random K=7 Gaussian heaps, ~0 for K>=10; lines, open arcs,
-# grids, branched theta/Y, and high-D persona-style fans all rejected).
+# Single-cycle fallback thresholds (complement H1 persistence, which only counts
+# *fat* loops — a thin ring slips under it).  The detector covers two sampling
+# regimes: a **uniform** ring (near-equidistant nodes — a faint thin loop) and a
+# **clustered** ring (tight clumps spaced around the loop — the seasonal sampling
+# real concept families have: months→seasons, days→weekday/weekend).  Validated
+# for sensitivity (synthetic faint + clustered rings, real day-of-week centroids)
+# and specificity (~0% false-positive on random Gaussian heaps K>=9; lines, open
+# arcs, grids, branched theta/Y, and high-D persona-style fans all rejected).
 _CYCLE_MIN_NODES = 7        # below this, too few points to detect a ring reliably
 _CYCLE_MAX_NODES = 128      # above this, robust loops are visible to H1; cap the tour
-_CYCLE_MAX_DEGREE = 3       # symmetric 2-NN graph: a 1-D loop; 2-D/fan => deg >= 4
-_CYCLE_CLOSURE_MAX = 2.0    # max/median tour edge: a closed loop is edge-uniform
-_CYCLE_RECALL_MIN = 0.90    # tour-neighbour top-2 recall: the cycle is *local*
-_CYCLE_CONTRAST_MIN = 1.08  # mean d(sep=2)/d(sep=1): genuine cyclic growth
+_CYCLE_MAX_DEGREE = 3       # uniform path: symmetric 2-NN degree of a 1-D loop
+_CYCLE_CLOSURE_MAX = 2.0    # uniform path: max/median tour edge (no single long edge)
+_CYCLE_RECALL_MIN = 0.90    # uniform path: tour-neighbour top-2 recall (loop is local)
+_CYCLE_CONTRAST_MIN = 1.08  # mean d(sep=2)/d(sep=1): genuine cyclic growth (both paths)
+# Clustered-ring path: tight clumps make the tour edges *bimodal* (tiny intra-
+# cluster, large inter-cluster), so closure/recall fail — but the inter-cluster
+# gaps are >=2, mutually regular, and the loop has a real far antipode.  These
+# reject what would otherwise leak in: an open arc (exactly 1 gap), a blob/fan (no
+# antipode), and a 2-D grid (gaps are noise-marginal, not decisively bimodal).
+_CYCLE_MAX_DEGREE_CLUSTER = 4   # a tight clump pushes a node to degree 4 (vs 1-D's 2-3)
+_CYCLE_LARGE_FACTOR = 2.5       # a tour edge is an inter-cluster gap past this x small-scale
+_CYCLE_GAPS_MIN = 2             # >=2 regular gaps => a closed cycle of clumps (1 => arc)
+_CYCLE_GAP_REG_MAX = 2.5        # the gaps must be mutually comparable (an even-ish ring)
+_CYCLE_ANTIPODE_MIN = 2.5       # tour-antipode/tour-neighbour distance: a ring has a far side
+_CYCLE_BIMODAL_MIN = 3.5        # the *smallest* gap must clear this x small-scale: a clustered
+                                # ring is *decisively* bimodal (tight clumps, big gaps, no edge
+                                # in between), screening a diffuse low-D cloud whose many
+                                # accidental long edges only marginally clear _CYCLE_LARGE_FACTOR
 
 
 def _nn_tour(dist: torch.Tensor) -> list[int]:
@@ -3375,38 +3392,51 @@ def _nn_tour(dist: torch.Tensor) -> list[int]:
 
 
 def _faint_cycle_coords(distances: torch.Tensor) -> torch.Tensor | None:
-    """Recover a single periodic coordinate for a faint ``S^1`` that H1 misses.
+    """Recover a single periodic coordinate for an ``S^1`` that H1 misses.
 
-    Vietoris–Rips H1 persistence counts loops by *hole size*; a faint ring — a
-    small cyclic modulation on a near-equidistant heap, e.g. day-of-week
-    centroids at a ~16% modulation — has too thin a hole to clear the
-    persistence threshold, yet is unambiguously cyclic by graph topology.  This
-    complementary test runs only when persistence found nothing, and fires only
-    on a structure that is, in the whitened consensus metric:
+    Vietoris–Rips H1 persistence counts loops by *hole size*, so two kinds of
+    ring slip under its threshold even though both are unambiguously cyclic by
+    graph topology.  This complementary test runs only when persistence found
+    nothing, and recovers the cyclic order in either of two sampling regimes:
 
-    - **1-D**: max degree ``<= _CYCLE_MAX_DEGREE`` in the symmetric 2-NN graph
-      (a 2-D grid or high-D fan has degree ``>= 4`` — rejects persona-style heaps
-      before any tour runs);
-    - **closed**: a greedy + 2-opt tour has near-uniform edges
-      (``max/median < _CYCLE_CLOSURE_MAX``) — a line / open arc needs one long
-      closing edge;
-    - **local**: each node's two tour-neighbours are among its two nearest
-      (``recall >= _CYCLE_RECALL_MIN``) — rejects a tour manufactured across a
-      blob or a branched (theta / Y) structure; and
-    - **graded**: mean distance grows from cyclic-separation 1 to 2
-      (``>= _CYCLE_CONTRAST_MIN``) — a real ring, not a flat simplex.
+    **Uniform** — a faint ring: a small cyclic modulation on a near-equidistant
+    heap (e.g. day-of-week centroids at ~16% modulation).  Too thin a hole for
+    H1, but near-equidistant, so the original guards fire: **1-D** (symmetric
+    2-NN max degree ``<= _CYCLE_MAX_DEGREE``), **closed** (greedy+2-opt tour
+    edges near-uniform, ``max/median < _CYCLE_CLOSURE_MAX`` — a line/arc needs
+    one long closing edge), and **local** (each node's two tour-neighbours among
+    its two nearest, ``recall >= _CYCLE_RECALL_MIN``).
 
-    Returns the per-node angle ``(K,)`` = ``2*pi*tour_rank/K`` (a uniform
-    ``S^1`` parameterisation in the recovered cyclic order), or ``None``.  All
-    four guards must hold; they trade a small elongated-ellipse false-negative
-    (those don't arise in the sphered whitened metric, and fall back to the
-    curved fit) for a low false-positive rate on real non-cyclic concept heaps.
+    **Clustered** — tight clumps spaced around the loop, the sampling real
+    concept families have (months→seasons, days→weekday/weekend).  Here the tour
+    edges are **bimodal** (tiny intra-cluster, large inter-cluster), so closure
+    and recall both fail though the loop is real.  It is accepted when the
+    inter-cluster gaps (edges ``> _CYCLE_LARGE_FACTOR`` × the small-edge scale)
+    are (a) ``>= _CYCLE_GAPS_MIN`` in number, (b) mutually regular
+    (``max/min <= _CYCLE_GAP_REG_MAX``), and (c) the loop has a real far antipode
+    (tour-antipode/tour-neighbour mean distance ``>= _CYCLE_ANTIPODE_MIN``).
+    Each guard rejects a distinct impostor that the bimodality alone would admit:
+    an **open arc** has exactly one large edge (its closing chord), a **blob/fan**
+    has no antipode, and a **2-D grid**'s gaps are noise-marginal — not decisively
+    bimodal — so they don't clear ``_CYCLE_LARGE_FACTOR``.  Both regimes also
+    require **graded** growth (mean ``d(sep=2)/d(sep=1) >= _CYCLE_CONTRAST_MIN``)
+    and ``1-D``-ness (degree ``<= _CYCLE_MAX_DEGREE_CLUSTER``, looser than the
+    uniform path's ``_CYCLE_MAX_DEGREE`` because a tight clump reaches degree 4).
+
+    Returns the per-node angle ``(K,)`` = ``2*pi*tour_rank/K`` (a uniform ``S^1``
+    parameterisation in the recovered cyclic *order* — exact spacing is dropped,
+    which is fine: the loop's topology, not its metric, is what the periodic
+    domain needs), or ``None``.  The clustered path's bimodal-gap test trades two
+    documented false-negatives — a very-loose cluster heap approaching uniform,
+    and an eccentric ellipse ``> 6:1`` (its gaps aren't decisively bimodal) — for
+    a ~0% false-positive rate that holds against grids, fans, arcs and blobs.
     """
     K = int(distances.shape[0])
     if K < _CYCLE_MIN_NODES or K > _CYCLE_MAX_NODES:
         return None
     dist = distances.detach().to(torch.float32)
-    # (1) 1-D filter: max degree in the symmetric 2-NN graph.
+    # 1-D filter (shared, at the looser clustered bound): a high-D fan has degree
+    # >> 4 and is rejected before any tour runs; the uniform path tightens to 3.
     nn2 = dist.argsort(dim=1)[:, 1:3].tolist()
     deg: dict[int, int] = {}
     edges_uv: set[tuple[int, int]] = set()
@@ -3416,27 +3446,23 @@ def _faint_cycle_coords(distances: torch.Tensor) -> torch.Tensor | None:
     for u, v in edges_uv:
         deg[u] = deg.get(u, 0) + 1
         deg[v] = deg.get(v, 0) + 1
-    if max(deg.values()) > _CYCLE_MAX_DEGREE:
+    max_degree = max(deg.values())
+    if max_degree > _CYCLE_MAX_DEGREE_CLUSTER:
         return None
-    # (2) closed: tour edges near-uniform (no single long closing edge).
+    # Recover the cyclic order (shared by both regimes).
     tour = _nn_tour(dist)
     D = dist.tolist()
-    tour_edges = sorted(D[tour[i]][tour[(i + 1) % K]] for i in range(K))
-    median = (tour_edges[K // 2] if K % 2
-              else 0.5 * (tour_edges[K // 2 - 1] + tour_edges[K // 2]))
-    if median <= 0.0 or tour_edges[-1] / median >= _CYCLE_CLOSURE_MAX:
-        return None
-    # (3) local: tour-neighbours among the two nearest neighbours.
-    nn2_set = [set(row) for row in nn2]
     pos = [0] * K
     for i, n in enumerate(tour):
         pos[n] = i
-    hits = 0
-    for i, n in enumerate(tour):
-        hits += len({tour[(i - 1) % K], tour[(i + 1) % K]} & nn2_set[n])
-    if hits / (2 * K) < _CYCLE_RECALL_MIN:
+    tour_edges = [D[tour[i]][tour[(i + 1) % K]] for i in range(K)]
+    sorted_edges = sorted(tour_edges)
+    median = (sorted_edges[K // 2] if K % 2
+              else 0.5 * (sorted_edges[K // 2 - 1] + sorted_edges[K // 2]))
+    if median <= 0.0:
         return None
-    # (4) graded: distance grows from cyclic separation 1 to 2.
+    # graded (shared): mean distance grows from cyclic separation 1 to 2 — a real
+    # cyclic order, not a flat simplex.
     s1 = s1n = s2 = s2n = 0.0
     for a in range(K):
         for b in range(a + 1, K):
@@ -3450,6 +3476,32 @@ def _faint_cycle_coords(distances: torch.Tensor) -> torch.Tensor | None:
     if s1n == 0 or s2n == 0:
         return None
     if (s2 / s2n) / max(s1 / s1n, 1e-9) < _CYCLE_CONTRAST_MIN:
+        return None
+    # Uniform regime: near-equidistant nodes — tight closure + local recall.
+    nn2_set = [set(row) for row in nn2]
+    hits = sum(len({tour[(i - 1) % K], tour[(i + 1) % K]} & nn2_set[n])
+               for i, n in enumerate(tour))
+    recall = hits / (2 * K)
+    closure = sorted_edges[-1] / median
+    uniform_ok = (max_degree <= _CYCLE_MAX_DEGREE
+                  and closure < _CYCLE_CLOSURE_MAX
+                  and recall >= _CYCLE_RECALL_MIN)
+    # Clustered regime: >=2 regular, decisively-bimodal inter-cluster gaps + a
+    # real far antipode.  The bimodality strength (smallest gap >> small scale) is
+    # what screens a diffuse low-D random cloud, whose tour throws off many edges
+    # that only marginally clear _CYCLE_LARGE_FACTOR.
+    small = sorted_edges[:max(1, K // 2)]
+    small_scale = small[len(small) // 2]
+    gaps = [e for e in tour_edges if e > _CYCLE_LARGE_FACTOR * small_scale]
+    half = K // 2
+    near = sum(tour_edges) / K
+    far = sum(D[tour[i]][tour[(i + half) % K]] for i in range(K)) / K
+    antipode = far / max(near, 1e-9)
+    clustered_ok = (len(gaps) >= _CYCLE_GAPS_MIN
+                    and min(gaps) >= _CYCLE_BIMODAL_MIN * small_scale
+                    and max(gaps) / min(gaps) <= _CYCLE_GAP_REG_MAX
+                    and antipode >= _CYCLE_ANTIPODE_MIN)
+    if not (uniform_ok or clustered_ok):
         return None
     # Uniform S^1 coordinate in the recovered cyclic order.
     angles = torch.zeros(K, dtype=torch.float32)
