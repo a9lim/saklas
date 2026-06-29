@@ -27,7 +27,8 @@ from saklas.core.manifold import (
     _is_angular_harmonic,
     select_topology,
 )
-from tests._whitener import isotropic_whitener
+from saklas.core.mahalanobis import LayerWhitener
+from tests._whitener import isotropic_whitener, rogue_whitener
 
 _LAYERS = list(range(6))
 _D = 48
@@ -318,3 +319,178 @@ def test_select_blob_not_spuriously_periodic() -> None:
         g = torch.Generator().manual_seed(seed)
         choice = _choose(torch.randn(9, 4, generator=g))
         assert not isinstance(choice.domain, BoxDomain), f"seed {seed} spurious ring"
+
+
+# ====================== flat<->curved dim-match (flat-bias fix) =============
+#
+# The flat-vs-curved GCV comparison used to be unfair: the flat candidate took
+# its PCA variance-threshold dim while the curved candidate took the spectral
+# eigenvalue-ratio-cliff dim, and that cliff systematically *undershoots* (one
+# dominant Fiedler mode picks k=1).  So a curved manifold linearly embedded in a
+# k_flat-plane read flat -- the flat affine fit reconstructs the in-plane curve
+# near-perfectly while the under-dimensioned curved fit can't match it, losing on
+# reconstruction it would *win* at matched dim.  ``select_topology`` now floors
+# the curved candidate to the flat dim (``min_dim=k_flat``).  These guard that
+# fix and that it does NOT spuriously flip genuinely flat shapes.  (Mechanism +
+# the production evidence -- personas flat-8 vs spectral-2, emotions flat-3 vs
+# spectral-1 -- live in scripts/experiments/concept_geometry/geometry_stress.py.)
+
+
+def _curve_in_plane(k: int, c: float) -> torch.Tensor:
+    """A 1-D curve whose nonlinear (curved) energy is set by ``c``.
+
+    At ``c=0`` the embedding is affine in the intrinsic ``t`` (a straight line);
+    as ``c`` grows the quadratic/cubic terms an affine map can't reproduce grow
+    while the cloud stays inside a low-dim plane -- the geometry that read flat
+    before the dim-match fix.
+    """
+    t = torch.linspace(0, 1, k)
+
+    def s(x: torch.Tensor) -> torch.Tensor:
+        return (x - x.mean()) / x.std().clamp(min=1e-9)
+
+    return torch.stack(
+        [s(t), c * s(t * t - t), c * s(t ** 3 - 1.5 * t ** 2 + 0.5 * t)], dim=1,
+    )
+
+
+@pytest.mark.parametrize("c", [0.8, 1.2, 2.0])
+def test_select_curve_in_plane_is_curved(c: float) -> None:
+    """A genuinely curved manifold embedded in a plane reads curved, not flat.
+
+    The headline flat-bias regression: without the dim-match floor this routed to
+    ``flat-pca`` for every ``c`` (the flat 2-affine fit reconstructs the in-plane
+    curve, the spectral candidate undershoots to 1-D and loses).
+    """
+    choice = _choose(_curve_in_plane(40, c), noise=0.01)
+    assert choice.fit_mode == "spectral", (
+        f"c={c}: curved-in-plane mislabelled {choice.winner_name!r}"
+    )
+
+
+@pytest.mark.parametrize("c", [0.8, 1.2, 2.0])
+def test_select_curved_candidate_dim_matches_flat(c: float) -> None:
+    """The dim-match invariant: the viable curved candidate is floored to the flat dim.
+
+    This is exactly what ``min_dim=k_flat`` guarantees; without it the spectral
+    cliff undershoots and the GCV comparison is rigged toward flat.
+    """
+    choice = _choose(_curve_in_plane(40, c), noise=0.01)
+    flat = next(x for x in choice.candidates if x.name == "flat-pca")
+    spec = next((x for x in choice.candidates if x.name == "spectral"), None)
+    assert spec is not None and spec.viable
+    assert spec.intrinsic_dim >= flat.intrinsic_dim, (
+        f"c={c}: curved dim {spec.intrinsic_dim} < flat dim {flat.intrinsic_dim}"
+    )
+
+
+@pytest.mark.parametrize("name,low", [
+    ("line", torch.stack([torch.linspace(0, 1, 30),
+                          2 * torch.linspace(0, 1, 30),
+                          -torch.linspace(0, 1, 30)], 1)),
+    ("blob", torch.randn(40, 3, generator=torch.Generator().manual_seed(0))),
+    ("plane", torch.randn(40, 2, generator=torch.Generator().manual_seed(1))),
+    ("grid", _grid(6)),
+    ("persona-fan", _persona_fan(40, 8, 2)),
+    ("arc-shallow", _arc(30, 90)),
+])
+def test_select_flat_shapes_unaffected_by_dim_match(name: str, low: torch.Tensor) -> None:
+    """The dim-match fix must not turn genuinely flat shapes curved.
+
+    A flat fan (personas), plane, grid, line, or shallow arc stays ``pca``: the
+    floored curved candidate gains coordinates but no reconstruction it can't get
+    affinely, so GCV's edf penalty keeps flat the winner.
+    """
+    choice = _choose(low, noise=0.02)
+    assert choice.fit_mode == "pca", f"{name} spuriously curved -> {choice.winner_name!r}"
+
+
+# ============================== rogue-channel invariance ====================
+#
+# Every topology test above runs under an isotropic whitener.  The whitened /
+# Fisher metric exists for the opposite condition -- a few massive-activation
+# channels at 100x+ the background -- which it must divide out.  These confirm
+# the topology read is invariant to rogue channels (signal lifted into the clean
+# dims; rogue dims are background-only).
+
+_ROGUE_DIM = 48
+
+
+def _stacks_clean(low: torch.Tensor, clean: list[int], *, noise: float,
+                  dim: int = _ROGUE_DIM) -> dict[int, torch.Tensor]:
+    """Per-layer lift restricted to ``clean`` dims (whitener-visible signal)."""
+    k, p = low.shape
+    low = low - low.mean(0, keepdim=True)
+    low = low / low.std().clamp(min=1e-9)
+    ct = torch.tensor(clean, dtype=torch.long)
+    out: dict[int, torch.Tensor] = {}
+    for layer in _LAYERS:
+        g = torch.Generator().manual_seed(100 + layer)
+        proj = torch.zeros(p, dim, dtype=torch.float32)
+        proj[:, ct] = torch.randn(p, len(clean), generator=g) / math.sqrt(p)
+        out[layer] = (low @ proj + noise * torch.randn(k, dim, generator=g)).float()
+    return out
+
+
+def _choose_clean(low: torch.Tensor, wh: LayerWhitener, clean: list[int],
+                  *, noise: float):
+    stacks = _stacks_clean(low, clean, noise=noise)
+    grams = {
+        L: wh.subspace_gram(L, stacks[L] - stacks[L].mean(0, keepdim=True))
+        for L in _LAYERS
+    }
+    consensus = torch.stack([grams[L] for L in _LAYERS]).mean(0)
+    return select_topology(stacks, grams, consensus, whitener=wh, max_dim=6)
+
+
+@pytest.mark.parametrize("name,low,want_mode", [
+    ("circle", _circle(36), "spectral"),       # periodic rides the curved path
+    ("curve", _curve_in_plane(40, 1.2), "spectral"),
+    ("blob", torch.randn(40, 3, generator=torch.Generator().manual_seed(0)), "pca"),
+])
+def test_select_invariant_to_rogue_channels(name: str, low: torch.Tensor,
+                                            want_mode: str) -> None:
+    """The topology read is invariant to massive-activation (rogue) channels.
+
+    The Fisher metric divides them out, so an isotropic whitener and one with
+    four channels at 200x the background must agree -- and on the right answer.
+    """
+    iso = isotropic_whitener(_LAYERS, _ROGUE_DIM)
+    rogue, clean = rogue_whitener(_LAYERS, _ROGUE_DIM, rogue_mag=200.0)
+    iso_choice = _choose_clean(low, iso, list(range(_ROGUE_DIM)), noise=0.03)
+    rogue_choice = _choose_clean(low, rogue, clean, noise=0.03)
+    assert iso_choice.fit_mode == rogue_choice.fit_mode == want_mode, (
+        f"{name}: iso={iso_choice.winner_name!r} rogue={rogue_choice.winner_name!r}"
+    )
+
+
+# ================================= determinism ==============================
+
+
+def test_select_topology_deterministic() -> None:
+    """Repeated ``select_topology`` on identical input is bit-reproducible (CPU).
+
+    Guards the sidecar / regression-test contract: the winner and every
+    candidate's GCV score must match across calls (``inf == inf`` for an unviable
+    candidate is fine; finite scores are bit-identical on CPU).
+    """
+    g = torch.Generator().manual_seed(0)
+    shapes = [_circle(36), _curve_in_plane(40, 1.2), _torus_t2(7),
+              torch.randn(40, 3, generator=g)]
+    for low in shapes:
+        a = _choose(low, noise=0.03)
+        b = _choose(low, noise=0.03)
+        assert a.winner_name == b.winner_name
+        assert {c.name: c.score for c in a.candidates} == \
+               {c.name: c.score for c in b.candidates}
+
+
+def test_select_torus_t2_coarseness_floor() -> None:
+    """T2 is reliably detected at >= 7 points per loop (the coarseness floor).
+
+    Below ~7 the loops' holes fill inside the ``eps_max=2*eps_c`` window and read
+    flat; side-7 is the validated floor (T3 and coarser tori are out of the
+    practical envelope -- see geometry_stress.py).
+    """
+    choice = _choose(_torus_t2(7))
+    assert choice.winner_name == "torus-T2"

@@ -61,6 +61,40 @@ def synthetic_whitener(
     )
 
 
+def rogue_whitener(
+    layers: Iterable[int],
+    dim: int,
+    *,
+    n: int = 256,
+    seed: int = 11,
+    rogue_count: int = 4,
+    rogue_mag: float = 100.0,
+) -> tuple[LayerWhitener, list[int]]:
+    """A whitener with a few massive-activation (rogue) channels + the clean dims.
+
+    Models the real activation-space condition the Fisher / whitened metric
+    exists to suppress: a handful of channels at ``rogue_mag``x the background
+    variance.  A robust topology read must be invariant to these — the metric
+    divides them out — so the signal must be lifted into the returned
+    ``clean_dims`` (rogue dims are background-only; placing signal there would be
+    correctly *down-weighted*, a different test).  Returns ``(whitener,
+    clean_dims)``.
+    """
+    layers = list(layers)
+    means = {L: torch.zeros(dim, dtype=torch.float32) for L in layers}
+    rogue = sorted({int(round(i * (dim - 1) / max(1, rogue_count - 1)))
+                    for i in range(rogue_count)})
+    clean = [d for d in range(dim) if d not in rogue]
+    acts: dict[int, torch.Tensor] = {}
+    for L in layers:
+        g = torch.Generator().manual_seed(seed * 7 + L)
+        scale = torch.ones(dim, dtype=torch.float32)
+        for d in rogue:
+            scale[d] = float(rogue_mag)
+        acts[L] = torch.randn(n, dim, generator=g, dtype=torch.float32) * scale
+    return LayerWhitener.from_neutral_activations(acts, means, ridge_scale=1.0), clean
+
+
 def isotropic_whitener(
     layers: Iterable[int],
     dim: int,

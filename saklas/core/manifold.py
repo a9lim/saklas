@@ -3540,11 +3540,18 @@ def select_topology(
 
     **(a) flat vs curved** — compare the flat affine fit (``pca`` mode, at its
     PCA variance-threshold dim) against the curved RBF fit (``spectral`` mode,
-    at its eigenvalue-ratio-cliff dim) by **GCV** in a shared per-layer
-    whitened / Fisher reduced metric (``targets[L] = X̃_L · basis_Lᵀ``).  GCV's
-    ``(K − edf)²`` denominator charges each mode for its own effective dof, and
-    each mode picks its *own* intrinsic dim with its own heuristic, so this is a
-    fair model-selection comparison rather than a coordinate-count race.
+    floored to the *same* dim) by **GCV** in a shared per-layer whitened / Fisher
+    reduced metric (``targets[L] = X̃_L · basis_Lᵀ``).  GCV's ``(K − edf)²``
+    denominator charges each mode for its own effective dof, so a more flexible
+    candidate must earn its flexibility — a fair model-selection comparison
+    rather than a coordinate-count race.  The curved candidate's dim is floored
+    to the flat candidate's (``min_dim=k_flat``) because the spectral
+    eigenvalue-ratio cliff systematically *undershoots* (one dominant Fiedler
+    mode picks ``k=1``); without the floor the curved fit competes starved of
+    coordinates and a curved manifold linearly embedded in a ``k_flat``-plane is
+    mislabelled flat — the flat affine fit reconstructs it near-perfectly while
+    the under-dimensioned curved fit cannot, even though a dim-matched curved fit
+    *wins*.
 
     **(b) periodic axes** — independently, :func:`_detect_periodic_axes` counts
     loops by Vietoris–Rips H1 *persistent homology* (a circle and an ellipse both
@@ -3593,8 +3600,23 @@ def select_topology(
     curved: tuple[torch.Tensor, ManifoldDomain] | None = None
     spec_diag: object | None = None
     try:
+        # Floor the curved candidate's intrinsic dim to the flat PCA dim so flat
+        # and curved are compared at *matched expressiveness*.  The spectral
+        # eigenvalue-ratio cliff systematically undershoots (its documented
+        # failure mode: one dominant Fiedler mode makes λ₂/λ₁ the largest ratio,
+        # picking k=1 regardless of the true geometry), which starves the curved
+        # RBF of coordinates and biases the GCV comparison toward flat — a curved
+        # manifold linearly embedded in a k_flat-plane is reconstructed near-
+        # perfectly by the flat k_flat-affine fit, but the under-dimensioned curved
+        # fit can't match it and loses on reconstruction it would *win* at matched
+        # dim.  ``min_dim`` is the floor :func:`derive_spectral_coords` already
+        # carries for exactly this undershoot; wiring it into auto-mode is what
+        # makes the flat-vs-curved verdict trustworthy rather than an artifact of
+        # the dim mismatch.  (The periodic path sets its own dim from the H1 loop
+        # count, so it is unaffected.)
         coords_spec, spec_diag = derive_spectral_coords(
-            consensus_gram, max_dim=max_dim, k_nn=k_nn, bandwidth=bandwidth,
+            consensus_gram, max_dim=max_dim, min_dim=k_flat,
+            k_nn=k_nn, bandwidth=bandwidth,
         )
         k_spec = int(coords_spec.shape[1])
         if (2 * k_spec + 1) > K:

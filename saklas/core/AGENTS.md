@@ -324,8 +324,15 @@ consensus_gram, *, whitener, …)` picks the discover geometry per-model in two
 decoupled decisions (decoupling dodges the dimension bias that makes a single
 reconstruction score always crown the highest-dim candidate): **(a) flat vs
 curved** — GCV of the flat affine (`pca`) vs curved RBF (`spectral`) fit in a
-shared whitened-reduced target metric, each at its own intrinsic dim
-(`_ols_gcv_score`/`_rbf_gcv_score`); **(b) periodic axes** — Vietoris–Rips H1
+shared whitened-reduced target metric (`_ols_gcv_score`/`_rbf_gcv_score`), the
+curved candidate floored to the **flat candidate's dim** (`min_dim=k_flat`) so the
+two compete at matched expressiveness — the spectral eigenvalue-ratio cliff
+systematically undershoots (one dominant Fiedler mode picks k=1), and without the
+floor a curved manifold linearly embedded in a `k_flat`-plane reads flat (the flat
+affine fit reconstructs the in-plane curve, the under-dimensioned curved fit
+can't, losing reconstruction it would win at matched dim — the flat-bias the
+`scripts/experiments/concept_geometry/geometry_stress.py` harness surfaced);
+**(b) periodic axes** — Vietoris–Rips H1
 *persistent homology* (`_rips_h1_persistence` boundary-matrix reduction →
 `_count_persistent_loops`, essential loops at `eps_max=2ε_c`) counts the loops
 (ellipse/noise-robust — a circle and a 6:1 ellipse both read as one loop), the

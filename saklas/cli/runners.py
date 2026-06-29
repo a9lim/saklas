@@ -1187,6 +1187,7 @@ def _run_manifold_fit(args: argparse.Namespace) -> None:
             folder,
             sae=getattr(args, "sae", None),
             sae_revision=getattr(args, "sae_revision", None),
+            force=bool(getattr(args, "force", False)),
             on_progress=lambda m: print(f"  {m}"),
         )
     except (ValueError, ManifoldFormatError) as e:

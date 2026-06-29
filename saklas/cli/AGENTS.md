@@ -145,10 +145,16 @@ category list through verbatim (tagged concepts only, no multi-node sweep).
   `--sae RELEASE`, `--sae-revision REV`, plus the discover hyperparams
   `--method pca|spectral|auto`, `--max-dim N`, `--min-dim N`, `--var-threshold T`,
   `--k-nn K`, `--bandwidth SIGMA`, `--max-subspace-dim R`, `--smoothing auto|0|LAMBDA`,
-  `--persistence-frac F`. An authored folder runs
-  `ManifoldExtractionPipeline` directly; a discover folder (`pca`/`spectral`/`auto`)
-  has any supplied hyperparam written into `manifold.json` atomically *before* the
-  fit. Supplying a discover hyperparam against an authored folder is an error.
+  `--persistence-frac F`. `-f/--force` bypasses the per-model tensor cache and
+  re-pools/re-fits unconditionally — threaded `args.force` → `session.fit` →
+  `ManifoldExtractionPipeline.fit(force=)`, which skips the `nodes_sha256`
+  cache-hit. Needed because `manifold fit` (unlike `manifold extract -f`) doesn't
+  re-author the corpus, so without it an unchanged corpus always cache-hits and a
+  code-level fit change (e.g. a topology-selection fix) can't be picked up. An
+  authored folder runs `ManifoldExtractionPipeline` directly; a discover folder
+  (`pca`/`spectral`/`auto`) has any supplied hyperparam written into
+  `manifold.json` atomically *before* the fit. Supplying a discover hyperparam
+  against an authored folder is an error.
   `--method auto` defers flat-vs-curved + periodic-axis selection to
   `select_topology` per-model. `--max-subspace-dim` caps the per-layer RBF subspace
   dim for the curved spectral fit (argparse-default `None` → engine 64) and is

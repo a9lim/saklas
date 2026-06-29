@@ -22,6 +22,16 @@ random geometries. The key check is that the eigenvalue planarity λ2/λ1 separa
 true ring (≈0.99) from a bipolar line (≈0.08) even when the line's sorted order
 fakes high cyclic adjacency.
 
+`geometry_stress.py` — synthetic ground-truth stress harness for the geometry
+*detector itself* (`select_topology`), no model load. Every finding above asks
+whether the model flattens; this asks the prior question of whether the detector
+is trustworthy when it says "flat". It runs known-topology clouds (line, blob,
+plane, arc, curve, circle, ellipse, faint ring, T2/T3 torus, grid, sphere,
+persona-fan) through the detector under isotropic / anisotropic / rogue-channel
+whiteners and reports a confusion matrix, the flat↔curved decision boundary, the
+periodic recall/precision envelope, and stability sweeps. See "Detector
+validation" below.
+
 `delta_probe_fromfit.py` — δ on already-fitted saklas manifolds, no model load
 (for an affine fit `layer_N.node_coords` is the activation-space node geometry in an
 orthonormal basis). Cross-checks the probe on known shapes: personas/emotions read
@@ -67,9 +77,71 @@ for syntactic parse trees (Hewitt-Manning structural probe). The open lever is
 cross-model: saklas fits per-model geometry, so whether another architecture
 recovers a ring or a tree where gemma flattens is untested.
 
+## Detector validation — is `select_topology` trustworthy?
+
+`geometry_stress.py` maps the detector's operating characteristics on synthetic
+clouds of known topology, in the conditions real fits run in (anisotropic,
+rogue-channel activation space whitened by the Fisher metric).
+
+What's solid: rogue-channel **invariance is perfect** — a whitener with channels
+at 200× the background gives byte-identical verdicts to an isotropic one, so the
+Fisher metric divides massive activations out exactly as intended. Periodic
+detection has 100% T1 recall and 0% false-positives across blob/grid/fan/arc/line;
+the faint-cycle fallback recovers rings down to ~8% modulation; the read is
+deterministic and stable in `persistence_frac`. Envelope edges: a torus needs ≥7
+points per loop (coarser tori fill inside the `eps_max=2·eps_c` window and read
+flat), and T3+ is out of practical reach (the points-per-loop needed pushes K past
+the periodic regime). Neither arises in a bundled manifold.
+
+What it found — **a flat-bias bug, now fixed.** The flat-vs-curved decision
+compared the flat candidate at its PCA variance-threshold dim against the curved
+candidate at its spectral eigenvalue-ratio-cliff dim — and that cliff
+systematically *undershoots* (one dominant Fiedler mode picks k=1). So a curved
+manifold linearly embedded in a k-plane read **flat**: the flat affine fit
+reconstructs the in-plane curve near-perfectly, while the under-dimensioned curved
+candidate couldn't match reconstruction it would *win* at matched dim (proved
+directly — give the curved RBF the flat candidate's coords and its GCV → 0). This
+is the mechanism that could have made "the model is flat" a detector artifact. The
+production evidence: the bundled `personas` fit had flat dim 8 vs spectral dim 2,
+`emotions` flat dim 3 vs spectral dim 1 — both decided by a comparison rigged
+against curved. The fix floors the curved candidate to the flat dim
+(`min_dim=k_flat` in `select_topology`, using the floor `derive_spectral_coords`
+already carried for exactly this undershoot), so the two compete at matched
+expressiveness; a synthetic curved-in-plane manifold now reads curved, and no
+genuinely flat shape (line/blob/grid/plane/persona-fan/arc) regresses. Guarded by
+`tests/test_manifold_topology.py`.
+
+The bearing on the findings above: the δ-hyperbolicity and planarity probes are
+purpose-built and don't route through `select_topology`, so the taxonomy and
+circumplex conclusions stand. `personas`/`emotions` use `fit_mode=auto`, so
+re-fitting them after the fix gives a fair flat-vs-curved verdict.
+
+**Validated (gemma-4-12b, re-fit post-fix): both stay flat under the fair
+comparison.** The dim-match floored the curved candidate to the flat dim and its
+GCV dropped to an honest value, but flat still wins comfortably:
+
+| manifold | flat (GCV)  | spectral before fix | spectral after fix | verdict |
+|----------|-------------|---------------------|--------------------|---------|
+| emotions | dim-3, 237  | dim-1, 1447 (rigged)| dim-3, 571 (fair)  | flat    |
+| personas | dim-8, 251  | dim-2, 1417 (rigged)| dim-8, 756 (fair)  | flat    |
+
+So the flatness was real, not an artifact of the spectral undershoot — flat beats
+a *fairly-dimensioned* curved fit by ~2.4–3×. The "gemma flattens structured
+concept geometry" account is strengthened, not overturned: the persona fan and the
+PAD affect space are genuinely flat. The winning flat tensors are unchanged (the
+flat-pca GCVs matched the pre-fix fits to 15 digits); only the recorded
+`topology_candidates` margin is now honest. The fix matters for *future* discover
+fits — a curved-in-a-flat-subspace concept on another model would now be detected
+rather than mislabelled flat.
+
 ## Reproduce
 
 ```bash
+# detector validation (no model) — confusion matrix, flat<->curved boundary,
+# periodic envelope, stability; --quick for fewer seeds
+python geometry_stress.py all --quick
+python geometry_stress.py flatcurved      # the flat-bias boundary map
+
 # calibration (no model)
 python validate_delta.py
 python validate_circumplex.py

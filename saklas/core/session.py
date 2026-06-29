@@ -2166,6 +2166,7 @@ class SaklasSession:
         *,
         sae: str | None = None,
         sae_revision: str | None = None,
+        force: bool = False,
         on_progress: Callable[[str], None] | None = None,
     ) -> Manifold:
         """Fit a steering manifold from a manifold folder (authored or discover).
@@ -2175,7 +2176,8 @@ class SaklasSession:
         per-layer PCA + spline fit (dispatching on the folder's ``fit_mode``),
         and the cache short-circuit.  The Python mirror of CLI ``manifold fit``.
         Gated against generation like :meth:`extract`: manifold fitting runs
-        forward passes through the model.
+        forward passes through the model.  ``force=True`` bypasses the per-model
+        tensor cache and re-pools/re-fits unconditionally (CLI ``-f/--force``).
         """
         with self._model_exclusive(
             "session.fit called while another model use is in flight",
@@ -2186,7 +2188,7 @@ class SaklasSession:
                 pipe = ManifoldExtractionPipeline(self, self.events)
                 return pipe.fit(
                     folder, sae=sae, sae_revision=sae_revision,
-                    on_progress=on_progress,
+                    force=force, on_progress=on_progress,
                 )
             finally:
                 # A re-fit changes the folded directions any probe reads from.
