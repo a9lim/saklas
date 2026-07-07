@@ -45,8 +45,9 @@ helpers behind the neutral/layer-means/alignment caches and the manifold integri
 manifest), `PackFormatError`, and `PACK_FORMAT_VERSION = 3` — the *legacy-vector
 migration sentinel*: a `vectors/` pack whose `pack.json.format_version` is below it
 is legacy and ported to a 2-node `pca` manifold on touch
-(`scripts/upgrade_packs.py` / `session._port_stale_legacy_vector`). Also stamped
-onto the profile-cache sidecars `vectors.save_profile` writes.
+(`scripts/upgrade_packs.py` / `SteeringComposer.port_stale_legacy_vector`). Also stamped
+onto the profile-cache sidecars `profile.save_profile` writes
+(`vectors.save_profile` remains a compatibility alias).
 
 ## manifolds.py
 
@@ -98,8 +99,10 @@ the shared A2 baseline user prompts — `response[i]` answers `baseline_prompt[i
 (`baseline_prompts_path`), so a corpus length must be a multiple of `k`. The shared
 baseline prompts are global (bundled `saklas/data/baseline_prompts.json`), not
 per-manifold, so the generation path no longer writes `scenarios.json` and no
-longer calls `write_manifold_scenarios` (the helper still exists and round-trips an
-explicit `scenarios=` corpus, but generation does not feed it).
+longer calls `write_manifold_scenarios`. Fresh discover authoring has no
+`scenarios=` parameter; only legacy vector-folder migration writes
+`scenarios.json` while porting old packs, and the standalone read/write helpers
+remain for compatibility tests and old folders.
 
 Authoring: `create_manifold_folder` (authored webui/HTTP path, returns `(folder,
 advisories)`), `create_discover_manifold_folder` (`sanitize_hyperparams` drops
@@ -220,7 +223,7 @@ slug. Every bipolar pole is itself a node label, so a bare pole resolves through
 tier 1 as an affine `%` push. The retired `resolve_pole` folded into
 **`canonicalize_atom(raw) → (canonical, variant)`** (the pure slug + variant peel —
 no `match`/`sign` slots, since the bipolar sign-flip is gone); the external
-canonicalizer consumers (`session._resolve_pole_aliases`, `tui/app`, `cli/runners`)
+canonicalizer consumers (`SteeringComposer.resolve_pole_aliases`, `tui/app`, `cli/runners`)
 call it directly. The underlying tier steps stay public:
 `resolve_manifold_label(label, *, namespace=)` finds a node by label across
 installed manifolds; `resolve_manifold_name(name, *, namespace=)` resolves a 2-node
@@ -319,6 +322,23 @@ must cover the transferred layers (`WhitenerError` otherwise; Mahalanobis-only �
 Euclidean transfer). The fitted map round-trips under the *target* model dir
 (`models/<safe_tgt>/alignments/<safe_src>.…`). `transfer_manifold`
 (`manifolds.py`) is the manifold counterpart.
+
+## lens.py
+
+The per-model Jacobian-lens artifact — `models/<safe_model_id>/jlens.
+{safetensors,json}`, peer to the neutral-activation cache and shaped like it
+(`layer_<idx>` tensor keys + atomic JSON sidecar). `LENS_FORMAT_VERSION = 1`;
+a wrong version, non-finite tensors, or a corrupt sidecar all log a warning and
+read as "no lens" (`load_lens → None`) rather than crash — the caller decides
+whether to error (`LensNotFittedError` with the `lens fit` hint) or re-fit.
+Storage is **fp16** (deliberately unlike the neutral cache's fp32 invariant:
+J entries are O(1) so range is no constraint, and nothing here feeds a
+covariance inversion), promoted to fp32 on load. The sidecar records `method`,
+`n_prompts`, `d_model`, `source_layers`, the corpus spec + sha256 (the
+resume/staleness key — `session.fit_jlens` resumes when the hash matches and
+the stored `n_prompts` is short of the request), `seq_len`, `dim_batch`, and
+`skip_first_positions`. `lens_paths` / `save_lens` / `load_lens` /
+`remove_lens`; the fit itself lives in `core/jlens.py`.
 
 ## atomic.py / staging.py
 

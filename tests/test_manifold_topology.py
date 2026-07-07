@@ -27,7 +27,8 @@ from saklas.core.manifold import (
     _is_angular_harmonic,
     select_topology,
 )
-from tests._whitener import isotropic_whitener
+from saklas.core.mahalanobis import LayerWhitener
+from tests._whitener import isotropic_whitener, rogue_whitener
 
 _LAYERS = list(range(6))
 _D = 48
@@ -318,3 +319,258 @@ def test_select_blob_not_spuriously_periodic() -> None:
         g = torch.Generator().manual_seed(seed)
         choice = _choose(torch.randn(9, 4, generator=g))
         assert not isinstance(choice.domain, BoxDomain), f"seed {seed} spurious ring"
+
+
+# ----------------------------- clustered-ring fallback ----------------------
+#
+# Real concept families don't tile a ring uniformly — months cluster into
+# seasons, days into weekday/weekend. A clustered ring (tight clumps spaced
+# around the loop) makes the tour edges *bimodal*, so H1 counts no fat loop AND
+# the uniform faint path's closure/recall guards fail, yet the loop is real. The
+# clustered path recovers it from >=2 regular inter-cluster gaps + a real far
+# antipode, while still rejecting the 2-D grids and high-D fans that the looser
+# degree bound would otherwise admit.
+
+
+def _clustered_ring(k_per: int, n_clusters: int, spread: float) -> torch.Tensor:
+    """A ring sampled in ``n_clusters`` tight clumps of ``k_per`` (seasonal
+    sampling); ``spread`` is each clump's angular half-width (radians)."""
+    centers = torch.linspace(0, 2 * math.pi, n_clusters + 1)[:-1]
+    th = torch.cat([c + torch.linspace(-spread, spread, k_per) for c in centers])
+    return torch.stack([torch.cos(th), torch.sin(th)], dim=1)
+
+
+def _gapped_ring(k: int, gap_sectors: int) -> torch.Tensor:
+    """A uniform ring with one contiguous sector removed. Geometrically this is
+    *identical* to an open arc — same point cloud — so it correctly stays
+    NON-periodic; the closure guard rejecting both is right, not a miss."""
+    full = k + gap_sectors
+    th = torch.linspace(0, 2 * math.pi, full + 1)[:-1][:k]
+    return torch.stack([torch.cos(th), torch.sin(th)], dim=1)
+
+
+@pytest.mark.parametrize("name,points,want", [
+    ("clustered-4x3", _clustered_ring(3, 4, 0.18), True),
+    ("clustered-3x4", _clustered_ring(4, 3, 0.25), True),
+    ("clustered-6x2", _clustered_ring(2, 6, 0.20), True),
+    ("clustered-4x5", _clustered_ring(5, 4, 0.20), True),
+    ("clustered-5x3", _clustered_ring(3, 5, 0.22), True),
+    # must reject — the impostors the clustered path's guards screen out:
+    ("grid-5x5", _grid(5), False),       # 2-D: gaps not decisively bimodal
+    ("grid-6x6", _grid(6), False),
+    ("grid-7x7", _grid(7), False),
+    ("persona-fan-K60", _persona_fan(60, 8, 4), False),  # high-D: degree >> 4
+    ("gapped-K22-g2", _gapped_ring(22, 2), False),   # == open arc (1 gap)
+    ("gapped-K18-g6", _gapped_ring(18, 6), False),
+])
+def test_faint_cycle_clustered(name: str, points: torch.Tensor, want: bool) -> None:
+    got = _faint_cycle_coords(torch.cdist(points, points)) is not None
+    assert got is want, name
+
+
+def test_faint_cycle_clustered_recovers_cyclic_order() -> None:
+    """The clustered path recovers the true cyclic order: each input clump stays
+    contiguous on the recovered loop. Walking the recovered cycle, the cluster id
+    changes exactly ``n_clusters`` times (a scrambled tour would change far more).
+    Robust to the tour's start point, rotation, and reflection."""
+    k_per, n_clusters = 3, 4
+    pts = _clustered_ring(k_per, n_clusters, 0.18)
+    coords = _faint_cycle_coords(torch.cdist(pts, pts))
+    assert coords is not None
+    order = torch.argsort(coords).tolist()            # nodes in recovered cyclic order
+    cluster_of = [i // k_per for i in order]
+    transitions = sum(cluster_of[i] != cluster_of[(i + 1) % len(order)]
+                      for i in range(len(order)))
+    assert transitions == n_clusters
+
+
+def test_select_clustered_ring_is_periodic() -> None:
+    """End-to-end: a clustered ring routes to a periodic BoxDomain (the case the
+    uniform faint path and H1 both miss)."""
+    choice = _choose(_clustered_ring(3, 4, 0.18), noise=0.03)
+    assert choice.winner_name == "torus-T1"
+    assert isinstance(choice.domain, BoxDomain)
+    assert choice.domain.axes[0].periodic
+
+
+def test_select_grid_not_spuriously_periodic() -> None:
+    """The looser clustered-path degree bound must not turn a 2-D grid (which now
+    reaches the tour stage) into a ring."""
+    for side in (5, 6, 7):
+        choice = _choose(_grid(side), noise=0.03)
+        assert not isinstance(choice.domain, BoxDomain), f"grid-{side} spurious ring"
+
+
+# ====================== flat<->curved dim-match (flat-bias fix) =============
+#
+# The flat-vs-curved GCV comparison used to be unfair: the flat candidate took
+# its PCA variance-threshold dim while the curved candidate took the spectral
+# eigenvalue-ratio-cliff dim, and that cliff systematically *undershoots* (one
+# dominant Fiedler mode picks k=1).  So a curved manifold linearly embedded in a
+# k_flat-plane read flat -- the flat affine fit reconstructs the in-plane curve
+# near-perfectly while the under-dimensioned curved fit can't match it, losing on
+# reconstruction it would *win* at matched dim.  ``select_topology`` now floors
+# the curved candidate to the flat dim (``min_dim=k_flat``).  These guard that
+# fix and that it does NOT spuriously flip genuinely flat shapes.  (Mechanism +
+# the production evidence -- personas flat-8 vs spectral-2, emotions flat-3 vs
+# spectral-1 -- live in scripts/experiments/concept_geometry/geometry_stress.py.)
+
+
+def _curve_in_plane(k: int, c: float) -> torch.Tensor:
+    """A 1-D curve whose nonlinear (curved) energy is set by ``c``.
+
+    At ``c=0`` the embedding is affine in the intrinsic ``t`` (a straight line);
+    as ``c`` grows the quadratic/cubic terms an affine map can't reproduce grow
+    while the cloud stays inside a low-dim plane -- the geometry that read flat
+    before the dim-match fix.
+    """
+    t = torch.linspace(0, 1, k)
+
+    def s(x: torch.Tensor) -> torch.Tensor:
+        return (x - x.mean()) / x.std().clamp(min=1e-9)
+
+    return torch.stack(
+        [s(t), c * s(t * t - t), c * s(t ** 3 - 1.5 * t ** 2 + 0.5 * t)], dim=1,
+    )
+
+
+@pytest.mark.parametrize("c", [0.8, 1.2, 2.0])
+def test_select_curve_in_plane_is_curved(c: float) -> None:
+    """A genuinely curved manifold embedded in a plane reads curved, not flat.
+
+    The headline flat-bias regression: without the dim-match floor this routed to
+    ``flat-pca`` for every ``c`` (the flat 2-affine fit reconstructs the in-plane
+    curve, the spectral candidate undershoots to 1-D and loses).
+    """
+    choice = _choose(_curve_in_plane(40, c), noise=0.01)
+    assert choice.fit_mode == "spectral", (
+        f"c={c}: curved-in-plane mislabelled {choice.winner_name!r}"
+    )
+
+
+@pytest.mark.parametrize("c", [0.8, 1.2, 2.0])
+def test_select_curved_candidate_dim_matches_flat(c: float) -> None:
+    """The dim-match invariant: the viable curved candidate is floored to the flat dim.
+
+    This is exactly what ``min_dim=k_flat`` guarantees; without it the spectral
+    cliff undershoots and the GCV comparison is rigged toward flat.
+    """
+    choice = _choose(_curve_in_plane(40, c), noise=0.01)
+    flat = next(x for x in choice.candidates if x.name == "flat-pca")
+    spec = next((x for x in choice.candidates if x.name == "spectral"), None)
+    assert spec is not None and spec.viable
+    assert spec.intrinsic_dim >= flat.intrinsic_dim, (
+        f"c={c}: curved dim {spec.intrinsic_dim} < flat dim {flat.intrinsic_dim}"
+    )
+
+
+@pytest.mark.parametrize("name,low", [
+    ("line", torch.stack([torch.linspace(0, 1, 30),
+                          2 * torch.linspace(0, 1, 30),
+                          -torch.linspace(0, 1, 30)], 1)),
+    ("blob", torch.randn(40, 3, generator=torch.Generator().manual_seed(0))),
+    ("plane", torch.randn(40, 2, generator=torch.Generator().manual_seed(1))),
+    ("grid", _grid(6)),
+    ("persona-fan", _persona_fan(40, 8, 2)),
+    ("arc-shallow", _arc(30, 90)),
+])
+def test_select_flat_shapes_unaffected_by_dim_match(name: str, low: torch.Tensor) -> None:
+    """The dim-match fix must not turn genuinely flat shapes curved.
+
+    A flat fan (personas), plane, grid, line, or shallow arc stays ``pca``: the
+    floored curved candidate gains coordinates but no reconstruction it can't get
+    affinely, so GCV's edf penalty keeps flat the winner.
+    """
+    choice = _choose(low, noise=0.02)
+    assert choice.fit_mode == "pca", f"{name} spuriously curved -> {choice.winner_name!r}"
+
+
+# ============================== rogue-channel invariance ====================
+#
+# Every topology test above runs under an isotropic whitener.  The whitened /
+# Fisher metric exists for the opposite condition -- a few massive-activation
+# channels at 100x+ the background -- which it must divide out.  These confirm
+# the topology read is invariant to rogue channels (signal lifted into the clean
+# dims; rogue dims are background-only).
+
+_ROGUE_DIM = 48
+
+
+def _stacks_clean(low: torch.Tensor, clean: list[int], *, noise: float,
+                  dim: int = _ROGUE_DIM) -> dict[int, torch.Tensor]:
+    """Per-layer lift restricted to ``clean`` dims (whitener-visible signal)."""
+    k, p = low.shape
+    low = low - low.mean(0, keepdim=True)
+    low = low / low.std().clamp(min=1e-9)
+    ct = torch.tensor(clean, dtype=torch.long)
+    out: dict[int, torch.Tensor] = {}
+    for layer in _LAYERS:
+        g = torch.Generator().manual_seed(100 + layer)
+        proj = torch.zeros(p, dim, dtype=torch.float32)
+        proj[:, ct] = torch.randn(p, len(clean), generator=g) / math.sqrt(p)
+        out[layer] = (low @ proj + noise * torch.randn(k, dim, generator=g)).float()
+    return out
+
+
+def _choose_clean(low: torch.Tensor, wh: LayerWhitener, clean: list[int],
+                  *, noise: float):
+    stacks = _stacks_clean(low, clean, noise=noise)
+    grams = {
+        L: wh.subspace_gram(L, stacks[L] - stacks[L].mean(0, keepdim=True))
+        for L in _LAYERS
+    }
+    consensus = torch.stack([grams[L] for L in _LAYERS]).mean(0)
+    return select_topology(stacks, grams, consensus, whitener=wh, max_dim=6)
+
+
+@pytest.mark.parametrize("name,low,want_mode", [
+    ("circle", _circle(36), "spectral"),       # periodic rides the curved path
+    ("curve", _curve_in_plane(40, 1.2), "spectral"),
+    ("blob", torch.randn(40, 3, generator=torch.Generator().manual_seed(0)), "pca"),
+])
+def test_select_invariant_to_rogue_channels(name: str, low: torch.Tensor,
+                                            want_mode: str) -> None:
+    """The topology read is invariant to massive-activation (rogue) channels.
+
+    The Fisher metric divides them out, so an isotropic whitener and one with
+    four channels at 200x the background must agree -- and on the right answer.
+    """
+    iso = isotropic_whitener(_LAYERS, _ROGUE_DIM)
+    rogue, clean = rogue_whitener(_LAYERS, _ROGUE_DIM, rogue_mag=200.0)
+    iso_choice = _choose_clean(low, iso, list(range(_ROGUE_DIM)), noise=0.03)
+    rogue_choice = _choose_clean(low, rogue, clean, noise=0.03)
+    assert iso_choice.fit_mode == rogue_choice.fit_mode == want_mode, (
+        f"{name}: iso={iso_choice.winner_name!r} rogue={rogue_choice.winner_name!r}"
+    )
+
+
+# ================================= determinism ==============================
+
+
+def test_select_topology_deterministic() -> None:
+    """Repeated ``select_topology`` on identical input is bit-reproducible (CPU).
+
+    Guards the sidecar / regression-test contract: the winner and every
+    candidate's GCV score must match across calls (``inf == inf`` for an unviable
+    candidate is fine; finite scores are bit-identical on CPU).
+    """
+    g = torch.Generator().manual_seed(0)
+    shapes = [_circle(36), _curve_in_plane(40, 1.2), _torus_t2(7),
+              torch.randn(40, 3, generator=g)]
+    for low in shapes:
+        a = _choose(low, noise=0.03)
+        b = _choose(low, noise=0.03)
+        assert a.winner_name == b.winner_name
+        assert {c.name: c.score for c in a.candidates} == \
+               {c.name: c.score for c in b.candidates}
+
+
+def test_select_torus_t2_coarseness_floor() -> None:
+    """T2 is reliably detected at >= 7 points per loop (the coarseness floor).
+
+    Below ~7 the loops' holes fill inside the ``eps_max=2*eps_c`` window and read
+    flat; side-7 is the validated floor (T3 and coarser tori are out of the
+    practical envelope -- see geometry_stress.py).
+    """
+    choice = _choose(_torus_t2(7))
+    assert choice.winner_name == "torus-T2"

@@ -34,6 +34,7 @@ def _mock_session():
     session.config.top_p = 0.9
     session.config.max_new_tokens = 1024
     session.config.system_prompt = None
+    session.config.thinking = None
 
     session.vectors = {}
     session.probes = {}
@@ -387,6 +388,21 @@ class TestOllamaApi:
         assert messages[0]["role"] == "user"
         assert messages[0]["content"] == "Hi"
 
+    def test_chat_non_streaming_done_reason_comes_from_result(self, session_and_client: Any) -> None:
+        session, client = session_and_client
+        session.generation_state.finish_reason = "length"
+        session.generate.return_value = GenerationResult(
+            text="Hello there!", tokens=[1, 2, 3], token_count=3, prompt_tokens=2,
+            tok_per_sec=10.0, elapsed=0.3, finish_reason="stop",
+        )
+        resp = client.post("/api/chat", json={
+            "model": "test/model",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "stream": False,
+        })
+        assert resp.status_code == 200
+        assert resp.json()["done_reason"] == "stop"
+
     def test_chat_with_system_field(self, session_and_client: Any) -> None:
         session, client = session_and_client
         session.generate.return_value = GenerationResult(
@@ -433,6 +449,28 @@ class TestOllamaApi:
         assert session.config.temperature == 1.0
         assert session.config.top_p == 0.9
         assert session.config.max_new_tokens == 1024
+
+    def test_chat_malformed_ollama_option_returns_400(self, session_and_client: Any) -> None:
+        session, client = session_and_client
+        resp = client.post("/api/chat", json={
+            "messages": [{"role": "user", "content": "Hi"}],
+            "stream": False,
+            "options": {"presence_penalty": {"bad": "type"}},
+        })
+        assert resp.status_code == 400
+        assert "presence_penalty" in resp.json()["error"]
+        session.generate.assert_not_called()
+
+    def test_chat_malformed_steer_type_returns_400(self, session_and_client: Any) -> None:
+        session, client = session_and_client
+        resp = client.post("/api/chat", json={
+            "messages": [{"role": "user", "content": "Hi"}],
+            "stream": False,
+            "options": {"steer": 3},
+        })
+        assert resp.status_code == 400
+        assert "steer" in resp.json()["error"]
+        session.generate.assert_not_called()
 
     def test_chat_repeat_penalty_maps_to_presence_penalty(self, session_and_client: Any) -> None:
         # Ollama's repeat_penalty divides positive logits by the penalty,
@@ -891,3 +929,147 @@ class TestSessionLockBackpressure:
         from saklas.server import create_app
         app = create_app(_mock_session())
         assert not hasattr(app.state, "gen_lock")
+
+
+# ---------------------------------------------------------------------------
+# Jacobian-lens token readout
+# ---------------------------------------------------------------------------
+
+
+class TestLensTokenReadout:
+    """Route contract for ``GET /saklas/v1/sessions/{id}/lens/token-readout``."""
+
+    _SESSION_OUT = {
+        "node_id": "n1",
+        "raw_index": 3,
+        "token_id": 42,
+        "token_text": " magic",
+        "steering": "0.3 formal.casual",
+        "workspace_band": [12, 18],
+        "readout": {
+            18: [(" b", -0.51234, 7), (" c", -1.2, 9)],
+            12: [(" a", -0.25, 5), (" d", -2.0, 3)],
+        },
+    }
+
+    def test_happy_path_wire_shape(self, session_and_client: Any) -> None:
+        session, client = session_and_client
+        session.jlens_token_readout.return_value = dict(self._SESSION_OUT)
+        resp = client.get(
+            "/saklas/v1/sessions/default/lens/token-readout",
+            params={"node_id": "n1", "raw_index": 3, "top_k": 2},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["node_id"] == "n1"
+        assert data["token_id"] == 42
+        assert data["steering"] == "0.3 formal.casual"
+        # rows sorted ascending by layer, band flags derived from the band list
+        assert [row["layer"] for row in data["layers"]] == [12, 18]
+        assert all(row["in_band"] for row in data["layers"])
+        assert data["layers"][1]["tokens"][0] == {
+            "token": " b", "id": 7, "logprob": -0.5123,
+        }
+        kwargs = session.jlens_token_readout.call_args.kwargs
+        assert kwargs["apply_steering"] is True
+        assert kwargs["raw"] is False
+        assert kwargs["layers"] is None
+        assert kwargs["top_k"] == 2
+
+    def test_steered_and_layers_params_thread_through(
+        self, session_and_client: Any,
+    ) -> None:
+        session, client = session_and_client
+        session.jlens_token_readout.return_value = dict(self._SESSION_OUT)
+        resp = client.get(
+            "/saklas/v1/sessions/default/lens/token-readout",
+            params={
+                "node_id": "n1", "raw_index": 3,
+                "steered": "false", "raw": "true", "layers": "12,18",
+            },
+        )
+        assert resp.status_code == 200
+        kwargs = session.jlens_token_readout.call_args.kwargs
+        assert kwargs["apply_steering"] is False
+        assert kwargs["raw"] is True
+        assert kwargs["layers"] == [12, 18]
+
+    def test_lens_not_fitted_404(self, session_and_client: Any) -> None:
+        from saklas.core.jlens import LensNotFittedError
+
+        session, client = session_and_client
+        session.jlens_token_readout.side_effect = LensNotFittedError(
+            "no Jacobian lens fitted"
+        )
+        resp = client.get(
+            "/saklas/v1/sessions/default/lens/token-readout",
+            params={"node_id": "n1", "raw_index": 0},
+        )
+        assert resp.status_code == 404
+        assert "lens" in resp.json()["detail"]
+
+    def test_unknown_node_404(self, session_and_client: Any) -> None:
+        from saklas.core.loom import UnknownNodeError
+
+        session, client = session_and_client
+        session.jlens_token_readout.side_effect = UnknownNodeError("nope")
+        resp = client.get(
+            "/saklas/v1/sessions/default/lens/token-readout",
+            params={"node_id": "nope", "raw_index": 0},
+        )
+        assert resp.status_code == 404
+
+    def test_invalid_node_operation_400(self, session_and_client: Any) -> None:
+        from saklas.core.loom import InvalidNodeOperationError
+
+        session, client = session_and_client
+        session.jlens_token_readout.side_effect = InvalidNodeOperationError(
+            "raw_index 9 out of range"
+        )
+        resp = client.get(
+            "/saklas/v1/sessions/default/lens/token-readout",
+            params={"node_id": "n1", "raw_index": 9},
+        )
+        assert resp.status_code == 400
+
+    def test_malformed_layers_400(self, session_and_client: Any) -> None:
+        _, client = session_and_client
+        resp = client.get(
+            "/saklas/v1/sessions/default/lens/token-readout",
+            params={"node_id": "n1", "raw_index": 0, "layers": "12,x"},
+        )
+        assert resp.status_code == 400
+
+    def test_top_k_bounds_400(self, session_and_client: Any) -> None:
+        _, client = session_and_client
+        resp = client.get(
+            "/saklas/v1/sessions/default/lens/token-readout",
+            params={"node_id": "n1", "raw_index": 0, "top_k": 0},
+        )
+        assert resp.status_code == 400
+
+    def test_wrong_session_404(self, session_and_client: Any) -> None:
+        _, client = session_and_client
+        resp = client.get(
+            "/saklas/v1/sessions/elsewhere/lens/token-readout",
+            params={"node_id": "n1", "raw_index": 0},
+        )
+        assert resp.status_code == 404
+
+    def test_session_info_carries_jlens_fitted(
+        self, session_and_client: Any, tmp_path: Any, monkeypatch: Any,
+    ) -> None:
+        """``jlens_fitted`` is a path-existence read, never a lens load."""
+        from saklas.io.lens import lens_paths
+
+        _, client = session_and_client
+        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+        resp = client.get("/saklas/v1/sessions/default")
+        assert resp.status_code == 200
+        assert resp.json()["jlens_fitted"] is False
+
+        ts_path, _ = lens_paths("test/model")
+        ts_path.parent.mkdir(parents=True, exist_ok=True)
+        ts_path.write_bytes(b"\x00")
+        resp = client.get("/saklas/v1/sessions/default")
+        assert resp.json()["jlens_fitted"] is True

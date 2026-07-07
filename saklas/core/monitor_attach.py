@@ -604,11 +604,12 @@ def _compute_assign_bandwidth(
         wsum += w
     if acc is None:
         return None, None
+    acc_t = acc
     if wsum > _MIN_SHARE_WEIGHT:
-        acc = acc / wsum
+        acc_t = acc_t / wsum
     # Floor positive so the softmax denominator never divides by ~0.
-    med = float(acc.median().clamp(min=1e-6))
-    tau = acc.clamp(min=1e-3 * med).to(torch.float32)
+    med = float(acc_t.median().clamp(min=1e-6))
+    tau = acc_t.clamp(min=1e-3 * med).to(torch.float32)
     # Gaussian log-volume bias ``−R·log(τ)`` for the soft-assignment logit.
     # ``R`` = the manifold's per-layer subspace rank (rank-uniform across a
     # fit's layers), the effective dimension of the space the bandwidth ``τ``
@@ -653,19 +654,23 @@ def _layer_geometry(
             f"subspace probe read missing whitened factors for layer "
             f"{layer_idx}; rebuild the probe (the Euclidean path is gone)"
         )
-    mean = wh.mean
-    basis = wh.basis
+    device = h.device
+    mean = wh.mean.to(device)
+    basis = wh.basis.to(device)
+    X = wh.X.to(device)
+    K_inv = wh.K_inv.to(device)
+    s_mean = wh.s_mean.to(device)
     x = h - mean
     # Σ⁻¹h is probe-independent — share it across the layer's curved probes via
     # the per-pass cache, then center by subtracting the precomputed Σ⁻¹mean.
     if sih_cache is not None:
         sih = sih_cache.get(layer_idx)
         if sih is None:
-            sih = _woodbury_apply(h, wh.X, wh.K_inv, wh.lam)  # Σ⁻¹ h  (D,)
+            sih = _woodbury_apply(h, X, K_inv, wh.lam)  # Σ⁻¹ h  (D,)
             sih_cache[layer_idx] = sih
     else:
-        sih = _woodbury_apply(h, wh.X, wh.K_inv, wh.lam)       # Σ⁻¹ h  (D,)
-    sx = sih - wh.s_mean                  # Σ⁻¹ x = Σ⁻¹h − Σ⁻¹mean  (D,)
+        sih = _woodbury_apply(h, X, K_inv, wh.lam)       # Σ⁻¹ h  (D,)
+    sx = sih - s_mean                  # Σ⁻¹ x = Σ⁻¹h − Σ⁻¹mean  (D,)
     x_mnorm = torch.sqrt(
         (x * sx).sum().clamp(min=0.0)
     ).clamp(min=_FRACTION_EPSILON)

@@ -18,6 +18,7 @@ def test_defaults():
     assert sc.frequency_penalty == 0.0
     assert sc.logprobs is None
     assert sc.return_hidden is False
+    assert sc.return_probe_readings is True
 
 
 def test_frozen():
@@ -69,6 +70,13 @@ def test_merged_with_all_defaults_is_noop():
 def test_sampling_config_return_hidden_defaults_false():
     cfg = SamplingConfig()
     assert cfg.return_hidden is False
+
+
+def test_sampling_config_return_probe_readings_opt_out_merges():
+    base = SamplingConfig(return_probe_readings=True)
+    override = SamplingConfig(return_probe_readings=False)
+    merged = base.merged_with(override)
+    assert merged.return_probe_readings is False
 
 
 def test_sampling_config_return_hidden_merged_with_override():

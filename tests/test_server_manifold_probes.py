@@ -539,8 +539,10 @@ class TestOpenAIProbeExtension:
             "messages": [{"role": "user", "content": "Hi"}],
         })
         assert resp.status_code == 200
-        choice = resp.json()["choices"][0]
+        body = resp.json()
+        choice = body["choices"][0]
         assert "x-saklas-probe-readings" not in choice
+        assert "probe_readings" not in body
 
     def test_text_completion_carries_extension_on_choice(self, session_and_client: Any) -> None:
         session, client = session_and_client
@@ -704,10 +706,9 @@ class TestWebSocketProbeReadings:
     """The native ``/saklas/v1/sessions/{id}/stream`` WS must carry
     ``probe_readings`` on every ``token`` frame when probes are attached,
     and the final ``done`` event still carries the aggregate.  Manifold
-    readings have no persisted-loom-row path, so the server scores
-    directly off ``session._capture._per_layer`` via
-    ``session.monitor.score_single_token`` inside the WS token-frame
-    builder.
+    readings are supplied by the session token tap via
+    ``session._last_token_probe_payload``; the WS token-frame builder only
+    serializes that payload.
 
     Regression for the Phase 3c bug where the webui mini-map cursor
     stayed stuck at ``awaiting first token...`` because the WS ``token``
@@ -757,6 +758,12 @@ class TestWebSocketProbeReadings:
         ) -> GenerationResult:
             for i, tok in enumerate(tokens):
                 if on_token is not None:
+                    if getattr(session.monitor, "probe_names", None):
+                        session._last_token_probe_payload = {
+                            "probe_readings": session.monitor.score_single_token({}),
+                        }
+                    else:
+                        session._last_token_probe_payload = None
                     on_token(tok, False, 1000 + i, None, None)
                 time.sleep(0.001)
             result = GenerationResult(

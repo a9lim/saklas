@@ -7,7 +7,7 @@ import json
 import os
 import time
 import uuid
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Iterator
 
 if TYPE_CHECKING:
@@ -22,12 +22,21 @@ from pydantic import BaseModel, model_validator
 from starlette.datastructures import Headers
 
 from saklas.core.errors import SaklasError
-from saklas.core.sampling import SamplingConfig
 from saklas.core.session import ConcurrentGenerationError, SaklasSession
 from saklas.core.steering import Steering
+from saklas.server.request_helpers import (
+    UnsupportedContentError,
+    build_sampling_config as _build_sampling_config,
+    flatten_content as _flatten_content,
+    merge_steering as _merge_steering,
+    parse_request_steering as _parse_req_steering,
+    probe_reading_aggregate as _probe_reading_aggregate,
+    probe_reading_dict as _probe_reading_dict,
+    probe_token_readings as _probe_token_readings,
+    strict_model_enabled as _strict_model_enabled,
+)
 from saklas.server.streaming import (
     _usage_dict,
-    probe_reading_aggregate,
     stream_finalizer,
 )
 
@@ -54,42 +63,6 @@ async def acquire_session_lock(session: SaklasSession) -> AsyncIterator[bool]:
         yield True
     finally:
         session.lock.release()
-
-
-class UnsupportedContentError(ValueError, SaklasError):
-    """Non-text content parts submitted to a text-only endpoint."""
-
-    def user_message(self) -> tuple[int, str]:
-        return (400, str(self) or self.__class__.__name__)
-
-
-def _flatten_content(content: Any) -> str:
-    """Concatenate the text parts of an OpenAI multimodal content array.
-
-    Accepts a string (passed through), a list of content parts (each a
-    ``{"type": "text", "text": ...}`` dict or a bare string — non-text
-    parts raise :class:`UnsupportedContentError`), ``None`` (→ ``""``,
-    the Ollama convention), or any other scalar (stringified).  Shared
-    by ``ChatMessage._flatten_content`` (OpenAI routes) and the Ollama
-    shim's message/prompt extraction.
-    """
-    if isinstance(content, list):
-        pieces: list[str] = []
-        for part in content:
-            if isinstance(part, dict) and part.get("type") == "text":
-                pieces.append(str(part.get("text", "")))
-            elif isinstance(part, str):
-                pieces.append(part)
-            else:
-                raise UnsupportedContentError(
-                    "non-text content parts are not supported by this model"
-                )
-        return "".join(pieces)
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content
-    return str(content)
 
 
 # ---------------------------------------------------------------------------
@@ -275,138 +248,6 @@ def ws_auth_ok(websocket: WebSocket) -> bool:
     # Browser WebSocket constructors cannot attach Authorization headers.
     # The bundled dashboard sends the same bearer value as ?token=... .
     return websocket.query_params.get("token") == expected
-
-
-def _probe_reading_dict(
-    session: SaklasSession,
-    readings: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    # build_readings() already scopes to monitor.probe_names, but cross-check
-    # explicitly so a client never sees a probe that isn't active in the monitor.
-    monitor_names = set(session.monitor.probe_names)
-    if readings is None:
-        result = getattr(session, "last_result", None)
-        readings = getattr(result, "readings", None) if result is not None else None
-    if readings is None:
-        readings = session.build_readings()
-    out: dict[str, Any] = {}
-    for name, r in readings.items():
-        if name not in monitor_names:
-            continue
-        out[name] = r.to_dict()
-    return out
-
-
-def _probe_reading_aggregate(session: SaklasSession) -> dict[str, Any]:
-    """Per-attached-probe ``ProbeReading.to_dict()`` from ``last_result``.
-
-    Thin wrapper over the shared :func:`server.streaming.probe_reading_aggregate`
-    bound to ``session.last_result`` — the source the non-streaming OpenAI /
-    Ollama handlers read.  Surfaced under the ``x-saklas-probe-readings``
-    extension so vector-probe clients keep working unchanged and manifold-aware
-    clients pick up the geometric channel.
-    """
-    return probe_reading_aggregate(session, getattr(session, "last_result", None))
-
-
-def _probe_token_readings(event: Any) -> dict[str, Any] | None:
-    """Serialize a :class:`TokenEvent`'s ``probe_readings`` for the wire.
-
-    Returns ``None`` when the event carries no manifold readings (no
-    probes attached, or ``live_scores=False`` was passed to
-    ``generate_stream``).  Used by both OpenAI and Ollama streaming
-    paths so the per-token geometric channel rides on each chunk
-    without breaking clients that ignore the field.
-    """
-    readings = getattr(event, "probe_readings", None)
-    if not readings:
-        return None
-    out: dict[str, Any] = {}
-    for name, reading in readings.items():
-        with suppress(Exception):
-            out[name] = reading.to_dict()
-    return out or None
-
-
-def _parse_req_steering(
-    expr: str | None,
-) -> tuple["Steering | None", bool]:
-    """Parse a per-request steering expression string.
-
-    Returns ``(req_steering, explicit_clear)``: ``None`` expression
-    inherits the server default (``explicit_clear=False``); an explicit
-    empty / whitespace string is a clear request (``explicit_clear=True``,
-    ``req_steering=None``); a non-empty string parses through the shared
-    grammar.  Shared by the OpenAI and Ollama route families.
-    """
-    from saklas.core.steering_expr import parse_expr
-
-    if expr is None:
-        return None, False
-    if not expr.strip():
-        return None, True
-    return parse_expr(expr), False
-
-
-def _merge_steering(
-    req_steering: "Steering | None",
-    default_steering: "Steering | None",
-    explicit_clear: bool,
-    thinking: bool | None,
-) -> "Steering | None":
-    """Compose a parsed request steering over the server default.
-
-    Per-request keys override the default at the key level; default-only
-    keys pass through; ``explicit_clear`` drops the default entirely.
-    Returns ``None`` when the composed alphas are empty and no ``thinking``
-    override is in play.  Pole aliasing happens inside ``session.steering()``
-    — the server does not resolve poles here.  Each protocol resolves its
-    own ``thinking`` precedence (OpenAI's native field, Ollama's top-level
-    ``think``) before calling in, since the sources differ.
-    """
-    merged_alphas: dict[str, Any] = {}
-    if default_steering is not None and not explicit_clear:
-        merged_alphas.update(default_steering.alphas)
-    if req_steering is not None:
-        merged_alphas.update(req_steering.alphas)
-    if not merged_alphas and thinking is None:
-        return None
-    return Steering(alphas=merged_alphas, thinking=thinking)
-
-
-def _build_sampling_config(
-    *,
-    temperature: float | None,
-    top_p: float | None,
-    top_k: int | None = None,
-    max_tokens: int | None,
-    seed: int | None,
-    stop: tuple[str, ...] | None,
-    logit_bias: dict[int, float] | None = None,
-    presence_penalty: float,
-    frequency_penalty: float,
-    logprobs: int | None = None,
-) -> SamplingConfig:
-    """Build a :class:`SamplingConfig` from already-normalized fields.
-
-    Shared by the OpenAI and Ollama route families.  Each protocol does
-    its own field normalization upstream (OpenAI: logprobs bool/int
-    coercion, no ``top_k``; Ollama: ``num_predict`` → ``max_tokens``,
-    ``repeat_penalty`` → ``presence_penalty`` via ``ln``, ``top_k``) and
-    hands the result here so the construction lives in one place.
-    """
-    return SamplingConfig(
-        temperature=temperature,
-        top_p=top_p,
-        top_k=top_k,
-        max_tokens=max_tokens,
-        seed=seed,
-        stop=stop,
-        logit_bias=logit_bias,
-        presence_penalty=presence_penalty,
-        frequency_penalty=frequency_penalty,
-        logprobs=logprobs,
-    )
 
 
 def _sampling_kwargs(
@@ -623,7 +464,10 @@ async def _stream_generation(
             if callable(close):
                 close()
 
-        last_result = getattr(session, "last_result", None)
+        last_result = (
+            getattr(stream_iter, "result", None)
+            or getattr(session, "last_result", None)
+        )
         finish_reason, usage, mf_agg = stream_finalizer(session, last_result)
         final_choice: dict[str, Any] = {
             "index": 0, **empty_delta, "finish_reason": finish_reason,
@@ -640,8 +484,9 @@ async def _stream_generation(
             "created": created_ts,
             "model": model_id,
             "choices": [final_choice],
-            "probe_readings": compat_probe_readings,
         }
+        if compat_probe_readings:
+            final["probe_readings"] = compat_probe_readings
         yield f"data: {json.dumps(final)}\n\n"
 
         if include_usage and usage is not None:
@@ -731,10 +576,6 @@ def create_app(session: SaklasSession,
     return app
 
 
-def _strict_model_enabled() -> bool:
-    return os.environ.get("SAKLAS_STRICT_MODEL", "").lower() in ("1", "true", "yes", "on")
-
-
 def _openai_known_model_names(session: SaklasSession) -> set[str]:
     """Names accepted for OpenAI routes in strict mode.
 
@@ -742,8 +583,9 @@ def _openai_known_model_names(session: SaklasSession) -> set[str]:
     — the OpenAI catalogue is a superset so clients hitting either
     protocol with the same name keep working.
     """
-    from saklas.server.ollama import _aliases_for
-    return {n.lower() for n in {session.model_id, *_aliases_for(session)}}
+    from saklas.server.model_names import known_model_names
+
+    return known_model_names(session)
 
 
 def _check_openai_model_strict(session: SaklasSession, name: str | None) -> None:
@@ -849,18 +691,21 @@ def _register_routes(app: FastAPI) -> None:
             "logprobs": _render_logprobs_chat(result, session),
             "finish_reason": result.finish_reason,
         }
-        mf_chat = _probe_reading_aggregate(session)
+        mf_chat = _probe_reading_aggregate(session, result)
         if mf_chat:
             chat_choice["x-saklas-probe-readings"] = mf_chat
-        return {
+        body = {
             "id": rid,
             "object": "chat.completion",
             "created": int(time.time()),
             "model": model_id,
             "choices": [chat_choice],
             "usage": _usage_dict(result),
-            "probe_readings": _probe_reading_dict(session),
         }
+        compat_probe_readings = _probe_reading_dict(session, readings=result.readings)
+        if compat_probe_readings:
+            body["probe_readings"] = compat_probe_readings
+        return body
 
     # -----------------------------------------------------------------------
     # Text completions
@@ -897,15 +742,18 @@ def _register_routes(app: FastAPI) -> None:
             "logprobs": _render_logprobs_completions(result, session),
             "finish_reason": result.finish_reason,
         }
-        mf_completion = _probe_reading_aggregate(session)
+        mf_completion = _probe_reading_aggregate(session, result)
         if mf_completion:
             completion_choice["x-saklas-probe-readings"] = mf_completion
-        return {
+        body = {
             "id": rid,
             "object": "text_completion",
             "created": int(time.time()),
             "model": model_id,
             "choices": [completion_choice],
             "usage": _usage_dict(result),
-            "probe_readings": _probe_reading_dict(session),
         }
+        compat_probe_readings = _probe_reading_dict(session, readings=result.readings)
+        if compat_probe_readings:
+            body["probe_readings"] = compat_probe_readings
+        return body

@@ -346,7 +346,7 @@ def test_repr_long_form_shows_range_and_count():
 def test_save_metadata_override_merges_on_top_of_self_metadata(tmp_path: Path):
     """``metadata=`` kwarg to ``save`` overrides matching keys in ``self.metadata``.
 
-    The wire sidecar is deliberately slim (see ``saklas.core.vectors.save_profile``)
+    The wire sidecar is deliberately slim (see ``saklas.core.profile.save_profile``)
     — only the allowlisted provenance fields round-trip.  We verify the merge
     via ``method`` (override wins) and ``statements_sha256`` (self-metadata
     field that the override doesn't touch).

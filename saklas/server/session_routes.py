@@ -9,11 +9,11 @@ import logging
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response
 
-from saklas.server.saklas_api import (
+from saklas.server.native_common import resolve_session_id
+from saklas.server.session_models import (
     CreateSessionRequest,
     PatchSessionRequest,
-    _resolve_session_id,
-    _session_info,
+    session_info,
 )
 
 
@@ -23,7 +23,7 @@ def register_session_routes(app: FastAPI) -> None:
 
     @app.get("/saklas/v1/sessions")
     def list_sessions():
-        return {"sessions": [_session_info(session, app.state.default_steering)]}
+        return {"sessions": [session_info(session, app.state.default_steering)]}
 
     @app.post("/saklas/v1/sessions")
     def create_session(req: CreateSessionRequest):
@@ -34,16 +34,16 @@ def register_session_routes(app: FastAPI) -> None:
                 req.model,
                 session.model_id,
             )
-        return _session_info(session, app.state.default_steering)
+        return session_info(session, app.state.default_steering)
 
     @app.get("/saklas/v1/sessions/{session_id}")
     def get_session(session_id: str):
-        _resolve_session_id(session, session_id)
-        return _session_info(session, app.state.default_steering)
+        resolve_session_id(session, session_id)
+        return session_info(session, app.state.default_steering)
 
     @app.delete("/saklas/v1/sessions/{session_id}", status_code=204)
     def delete_session(session_id: str):
-        _resolve_session_id(session, session_id)
+        resolve_session_id(session, session_id)
         logging.getLogger("saklas.api").warning(
             "DELETE /saklas/v1/sessions/%s: single-session mode, no-op",
             session_id,
@@ -52,7 +52,7 @@ def register_session_routes(app: FastAPI) -> None:
 
     @app.patch("/saklas/v1/sessions/{session_id}")
     def patch_session(session_id: str, req: PatchSessionRequest):
-        _resolve_session_id(session, session_id)
+        resolve_session_id(session, session_id)
         overrides: dict[str, Any] = {}
         if req.temperature is not None:
             overrides["temperature"] = req.temperature
@@ -64,23 +64,25 @@ def register_session_routes(app: FastAPI) -> None:
             overrides["max_new_tokens"] = req.max_tokens
         if req.system_prompt is not None:
             overrides["system_prompt"] = req.system_prompt
+        if req.thinking is not None:
+            overrides["thinking"] = req.thinking
         if overrides:
             if is_dataclass(session.config):
                 session.config = replace(cast(Any, session.config), **overrides)
             else:
                 for key, value in overrides.items():
                     setattr(session.config, key, value)
-        return _session_info(session, app.state.default_steering)
+        return session_info(session, app.state.default_steering)
 
     @app.post("/saklas/v1/sessions/{session_id}/clear", status_code=204)
     def clear_session(session_id: str):
-        _resolve_session_id(session, session_id)
+        resolve_session_id(session, session_id)
         session.clear_history()
         return Response(status_code=204)
 
     @app.post("/saklas/v1/sessions/{session_id}/rewind", status_code=204)
     def rewind_session(session_id: str):
-        _resolve_session_id(session, session_id)
+        resolve_session_id(session, session_id)
         if not session.history:
             raise HTTPException(400, "History is empty")
         session.rewind()

@@ -166,9 +166,10 @@ _PROMOTED_OLD_NAMES = frozenset([
     "_sanitize_hyperparams",
 ])
 
-# All frontend directories (cli is included here because it too imports these
-# symbols and was updated as part of T2.4).
-_ALL_FRONTEND_DIRS = ("tui", "server", "cli")
+# All cross-module import surfaces (cli/server/tui plus core helpers) must use
+# the promoted public names.  The old underscore aliases stay only for
+# back-compat monkeypatching in tests.
+_ALL_FRONTEND_DIRS = ("tui", "server", "cli", "core")
 
 _UNDERSCORE_IMPORT_RE = re.compile(
     r"(?:^|\s)from\s+[\w.]+\s+import\s+[^#\n]*\b(_[A-Za-z]\w*)"
@@ -204,8 +205,7 @@ def test_promoted_names_not_imported_by_old_underscore_form() -> None:
     future decision):
       server/traits_routes.py:   _resolve_session_id  (internal server helper)
       server/probe_routes.py:    _resolve_session_id  (internal server helper)
-      server/vector_routes.py:   _refuse_if_busy, _summarize_diagnostics (internal)
-      server/app.py:             _aliases_for (internal ollama helper)
+      server/vector_routes.py:   _refuse_if_busy (internal)
       tui/app.py:                _INPUT_HISTORY_MAX (internal TUI cap)
       tui/extraction_controller.py: _Profile (local alias, type-annotation only)
       cli/main.py:               _build_root_parser, _COMMAND_RUNNERS (internal CLI)

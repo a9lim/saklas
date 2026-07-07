@@ -357,18 +357,20 @@ class LoomScreen(Screen[None]):
         yield Static(f"{_KEYHINT_NAV}\n{_KEYHINT_ACT}", id="loom-keyhint")
 
     def on_mount(self) -> None:
-        self._tree_widget = self.query_one("#loom-tree", Tree)
+        tree_widget = self.query_one("#loom-tree", Tree)
+        detail_scroll = self.query_one("#loom-detail-scroll", VerticalScroll)
+        self._tree_widget = tree_widget
         self._detail = self.query_one("#loom-detail", Static)
-        self._detail_scroll = self.query_one("#loom-detail-scroll", VerticalScroll)
+        self._detail_scroll = detail_scroll
         self._header = self.query_one("#loom-header", Static)
         self._keyhint = self.query_one("#loom-keyhint", Static)
         # The detail pane scrolls with the mouse but never steals Tab
         # focus from the tree.
-        self._detail_scroll.can_focus = False
-        self._tree_widget.show_root = False
-        self._tree_widget.guide_depth = 2
+        detail_scroll.can_focus = False
+        tree_widget.show_root = False
+        tree_widget.guide_depth = 2
         self._rebuild_tree()
-        self._tree_widget.focus()
+        tree_widget.focus()
 
     def check_action(
         self, action: str, parameters: tuple[object, ...],

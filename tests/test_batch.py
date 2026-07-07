@@ -1,8 +1,8 @@
 """Batched generation: ``session.generate_batch`` / ``generate_sweep``.
 
-Wrapper-loop approach — each prompt acquires the gen-lock, runs through
-``_generate_core``, releases.  Tests cover ordering, sweep grid shape,
-``applied_steering`` round-trip, and the experiment fan endpoint.
+Tests cover the serial wrapper contract plus compatible stateless fast paths:
+ordering, sweep grid shape, ``applied_steering`` round-trip, and the experiment
+fan endpoint.
 
 CPU-only.  Mock ``_generate_core`` so we exercise the wrapper logic
 without spinning up a real model.
@@ -11,13 +11,14 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
 
-from saklas.core.results import GenerationResult, RunSet
+from saklas.core.results import GenerationResult, ProbeReading, RunSet
 
 if TYPE_CHECKING:
     from saklas.core.session import SaklasSession
@@ -66,6 +67,191 @@ def _stub_generate_core(session: SaklasSession, *, capture: list[Any]) -> None:
         return _make_result(f"out_{idx}", applied=applied)
 
     session._generate_core = _fake
+
+
+class _NoopSteeringContext:
+    def __enter__(self) -> "_NoopSteeringContext":
+        return self
+
+    def __exit__(self, *args: Any) -> None:
+        return None
+
+
+def _install_noop_steering(session: SaklasSession) -> None:
+    session_any = cast(Any, session)
+    session_any._profiles = {"a": {}}
+    session_any.steering = lambda value: _NoopSteeringContext()
+    session_any._snapshot_steering_alphas = lambda: {"a": 0.0}
+    session_any._exit_internal_steering = (
+        lambda steering_cm, *, swallow: steering_cm.__exit__(None, None, None)
+    )
+
+
+class _BatchTokenizer:
+    pad_token_id = 0
+    eos_token_id = 99
+    name_or_path = "batch-test-tokenizer"
+    vocab_size = 200
+    chat_template = ""
+    added_tokens_encoder: dict[str, int] = {}
+
+    def decode(
+        self,
+        ids: list[int],
+        skip_special_tokens: bool = True,
+    ) -> str:
+        del skip_special_tokens
+        return " ".join(str(i) for i in ids)
+
+
+class _BatchModel:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self.config = SimpleNamespace(vocab_size=200)
+        self.generation_config = SimpleNamespace(eos_token_id=99)
+
+    def generate(self, **kwargs: Any):
+        import torch
+
+        self.calls.append(kwargs)
+        input_ids = kwargs["input_ids"]
+        tail = torch.tensor(
+            [
+                [10, 11, 99],
+                [12, 13, 14],
+                [15, 0, 0],
+            ],
+            dtype=torch.long,
+            device=input_ids.device,
+        )
+        return torch.cat([input_ids, tail[: input_ids.shape[0]]], dim=1)
+
+
+class _BatchProbeMonitor:
+    def __init__(self) -> None:
+        self.probe_names = ["mood"]
+        self.scored: list[float] = []
+
+    def probe_layers(self) -> set[int]:
+        return {0}
+
+    def enable_curved_warm(self, flag: bool) -> None:
+        del flag
+
+    def score_aggregate(
+        self,
+        hidden_per_layer: dict[int, Any],
+    ) -> dict[str, ProbeReading]:
+        value = float(hidden_per_layer[0].reshape(-1)[0])
+        self.scored.append(value)
+        return {"mood": ProbeReading(fraction=value, nearest=[], coords=(value,))}
+
+
+class _ProbeBatchModel(_BatchModel):
+    def __init__(self, layers: Any) -> None:
+        super().__init__()
+        self.layers = layers
+
+    def generate(self, **kwargs: Any):
+        import torch
+
+        input_ids = kwargs["input_ids"]
+        for values in ([1.0, 10.0, 100.0], [2.0, 20.0, 200.0], [3.0, 30.0, 300.0]):
+            hidden = torch.tensor(
+                values[: input_ids.shape[0]],
+                dtype=torch.float32,
+                device=input_ids.device,
+            ).reshape(input_ids.shape[0], 1, 1)
+            for layer in self.layers:
+                layer(hidden)
+        return super().generate(**kwargs)
+
+
+def _fast_batch_session():
+    import torch
+    from saklas.core.generation import GenerationConfig, GenerationState
+    from saklas.core.session import CaptureState, GenState, SaklasSession
+    from saklas.core.triggers import TriggerContext
+
+    s = SaklasSession.__new__(SaklasSession)
+    model = _BatchModel()
+    s_any = cast(Any, s)
+    s_any._model = model
+    s_any._tokenizer = _BatchTokenizer()
+    s._device = torch.device("cpu")
+    s_any._gen_lock = threading.Lock()
+    s._gen_phase = GenState.IDLE
+    s._gen_state = GenerationState()
+    s_any._monitor = SimpleNamespace(probe_names=[])
+    s._profiles = {}
+    s._manifolds = {}
+    s._default_return_top_k = 0
+    s.config = GenerationConfig(
+        max_new_tokens=3,
+        temperature=0.0,
+        top_p=1.0,
+        top_k=None,
+    )
+    events = SimpleNamespace(emitted=[])
+    events.emit = lambda event: events.emitted.append(event)
+    s_any.events = events
+    s_any._steering = SimpleNamespace(
+        ctx=TriggerContext(),
+        reset_manifold_feet=lambda: None,
+        has_compiled_offsets=lambda: False,
+        zero_compiled_offsets=lambda: None,
+    )
+    s._live_lens = None
+    s._trait_queues = []
+    s._active_gen_reservation = None
+    s._last_token_probe_payload = None
+    s._capture_state = CaptureState()
+    s._compiled_clean_eligible = False
+    s._incremental_readings = []
+    s._incremental_gate_scores = []
+    s._steering_uses_compiled_offsets = False
+    s._last_per_token_scores = None
+    s._last_result = None
+    s._internal_steering_pop = False
+    s._active_role = None
+    s._steering_stack = []
+    s.build_readings = lambda: {}
+
+    def _prepare_input(
+        input: Any,
+        raw: bool = False,
+        thinking: bool = False,
+        stateless: bool = False,
+        parent_node_id: str | None = None,
+        user_role: str | None = None,
+        assistant_role: str | None = None,
+        to_device: bool = True,
+    ):
+        del raw, thinking, stateless, parent_node_id
+        del user_role, assistant_role, to_device
+        mapping = {
+            "alpha": [1, 2],
+            "beta": [3, 4, 5],
+            "gamma": [6],
+        }
+        return torch.tensor([mapping[input]], dtype=torch.long)
+
+    s._prepare_input = _prepare_input
+    return s, model
+
+
+def _probe_fast_batch_session():
+    import torch
+    from saklas.core.hooks import HiddenCapture
+
+    s, _model = _fast_batch_session()
+    s._layers = torch.nn.ModuleList([torch.nn.Identity()])
+    s._capture = HiddenCapture()
+    s_any = cast(Any, s)
+    s_any._monitor = _BatchProbeMonitor()
+    model = _ProbeBatchModel(s._layers)
+    s_any._model = model
+    return s, model
 
 
 # ---------------------------------------------------------------------------
@@ -121,6 +307,155 @@ class TestGenerateBatch:
         s = self._session()
         with pytest.raises(ValueError, match="non-empty list"):
             s.generate_batch([])
+
+    def test_compatible_batch_uses_one_model_generate(self) -> None:
+        s, model = _fast_batch_session()
+
+        def _fail_generate_core(*args: Any, **kwargs: Any) -> GenerationResult:
+            raise AssertionError("serial generation path should not run")
+
+        s._generate_core = _fail_generate_core
+        seen: list[tuple[int, str]] = []
+
+        runset = s.generate_batch(
+            ["alpha", "beta", "gamma"],
+            thinking=False,
+            on_result=lambda idx, result: seen.append((idx, result.text)),
+        )
+
+        assert len(model.calls) == 1
+        call = model.calls[0]
+        assert call["input_ids"].shape == (3, 3)
+        assert call["attention_mask"].tolist() == [
+            [0, 1, 1],
+            [1, 1, 1],
+            [0, 0, 1],
+        ]
+        assert [r.tokens for r in runset] == [[10, 11], [12, 13, 14], [15]]
+        assert [r.finish_reason for r in runset] == ["stop", "length", "stop"]
+        assert [r.text for r in runset] == ["10 11", "12 13 14", "15"]
+        assert runset.grid == [
+            {"prompt_index": 0},
+            {"prompt_index": 1},
+            {"prompt_index": 2},
+        ]
+        assert runset.node_ids == [None, None, None]
+        assert seen == [(0, "10 11"), (1, "12 13 14"), (2, "15")]
+        assert runset.metrics["batch_token_count"] == 6
+        assert runset.metrics["batch_elapsed"] > 0.0
+        assert "batch_tok_per_sec" in runset.metrics
+        assert s.last_result is runset[-1]
+
+    def test_greedy_batch_allows_seeded_sampling_config(self) -> None:
+        from saklas.core.sampling import SamplingConfig
+
+        s, model = _fast_batch_session()
+
+        def _fail_generate_core(*args: Any, **kwargs: Any) -> GenerationResult:
+            raise AssertionError("serial generation path should not run")
+
+        s._generate_core = _fail_generate_core
+
+        runset = s.generate_batch(
+            ["alpha", "beta"],
+            sampling=SamplingConfig(seed=123),
+            thinking=False,
+        )
+
+        assert len(model.calls) == 1
+        assert [r.tokens for r in runset] == [[10, 11], [12, 13, 14]]
+
+    def test_stochastic_seeded_batch_stays_serial(self) -> None:
+        from saklas.core.sampling import SamplingConfig
+
+        s, model = _fast_batch_session()
+        capture: list[Any] = []
+        _stub_generate_core(s, capture=capture)
+
+        runset = s.generate_batch(
+            ["alpha", "beta"],
+            sampling=SamplingConfig(seed=123, temperature=0.7),
+            thinking=False,
+        )
+
+        assert len(model.calls) == 0
+        assert [r.text for r in runset] == ["out_0", "out_1"]
+        assert [c["input"] for c in capture] == ["alpha", "beta"]
+
+    def test_probes_fall_back_to_serial_generation(self) -> None:
+        s, model = _fast_batch_session()
+        cast(Any, s._monitor).probe_names = ["mood"]
+        capture: list[Any] = []
+        _stub_generate_core(s, capture=capture)
+
+        runset = s.generate_batch(["alpha", "beta"], thinking=False)
+
+        assert len(model.calls) == 0
+        assert [r.text for r in runset] == ["out_0", "out_1"]
+        assert [c["input"] for c in capture] == ["alpha", "beta"]
+
+    def test_probe_batch_fast_path_scores_per_row_aggregate(self) -> None:
+        s, model = _probe_fast_batch_session()
+
+        def _fail_generate_core(*args: Any, **kwargs: Any) -> GenerationResult:
+            raise AssertionError("serial generation path should not run")
+
+        s._generate_core = _fail_generate_core
+
+        runset = s.generate_batch(["alpha", "beta", "gamma"], thinking=False)
+
+        assert len(model.calls) == 1
+        assert [r.tokens for r in runset] == [[10, 11], [12, 13, 14], [15]]
+        assert [r.probe_readings["mood"].coords for r in runset] == [
+            (2.0,),
+            (30.0,),
+            (100.0,),
+        ]
+        assert [r.readings["mood"].mean for r in runset] == [
+            (2.0,),
+            (30.0,),
+            (100.0,),
+        ]
+        assert cast(Any, s._monitor).scored == [2.0, 30.0, 100.0]
+
+    def test_deterministic_fan_uses_batched_generation(self) -> None:
+        s, model = _fast_batch_session()
+
+        def _fail_generate_core(*args: Any, **kwargs: Any) -> GenerationResult:
+            raise AssertionError("serial generation path should not run")
+
+        s._generate_core = _fail_generate_core
+
+        runset = s.generate("alpha", n=3, stateless=True, thinking=False)
+
+        assert len(model.calls) == 1
+        assert model.calls[0]["input_ids"].shape == (3, 2)
+        assert runset.kind == "fan"
+        assert runset.grid == [{}, {}, {}]
+        assert runset.node_ids == [None, None, None]
+        assert [r.tokens for r in runset] == [[10, 11], [12, 13, 14], [15]]
+
+    def test_deterministic_fan_with_seed_uses_batched_generation(self) -> None:
+        from saklas.core.sampling import SamplingConfig
+
+        s, model = _fast_batch_session()
+
+        def _fail_generate_core(*args: Any, **kwargs: Any) -> GenerationResult:
+            raise AssertionError("serial generation path should not run")
+
+        s._generate_core = _fail_generate_core
+
+        runset = s.generate(
+            "alpha",
+            n=3,
+            sampling=SamplingConfig(seed=123),
+            stateless=True,
+            thinking=False,
+        )
+
+        assert len(model.calls) == 1
+        assert runset.kind == "fan"
+        assert [r.tokens for r in runset] == [[10, 11], [12, 13, 14], [15]]
 
 
 # ---------------------------------------------------------------------------
@@ -208,6 +543,191 @@ class TestPrefixCacheEligibility:
         assert prefix is not None
         assert prefix.device.type == "cpu"
         assert prefix.tolist() == common
+
+    def test_static_prefix_hit_requires_static_eligibility_and_headroom(self) -> None:
+        import torch
+        from saklas.core.session import _PrefixCacheEntry
+
+        s = self._session()
+        cache = object()
+        s._prefix_cache = _PrefixCacheEntry(
+            prefix_ids_cpu=torch.tensor([1, 2]),
+            past_key_values=cache,
+            prefix_len=2,
+            static=True,
+            max_cache_len=5,
+        )
+        ids = torch.tensor([[1, 2, 3]], dtype=torch.long)
+
+        assert s._try_prefix_cache_hit(
+            ids, static_eligible=False, required_max_new_tokens=1,
+        ) is None
+        assert s._try_prefix_cache_hit(
+            ids, static_eligible=True, required_max_new_tokens=3,
+        ) is None
+
+        hit = s._try_prefix_cache_hit(
+            ids, static_eligible=True, required_max_new_tokens=2,
+        )
+        assert hit is not None
+        suffix, hit_cache, prefix_len, is_static = hit
+        assert suffix.tolist() == [[3]]
+        assert hit_cache is cache
+        assert prefix_len == 2
+        assert is_static is True
+
+    def test_generation_loop_keeps_static_cache_on_static_prefix_hit(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import torch
+        from saklas.core.generation import GenerationConfig
+        from saklas.core.session import CaptureState, _PrefixCacheEntry
+
+        class _Cache:
+            def __init__(self) -> None:
+                self.crops: list[int] = []
+
+            def crop(self, length: int) -> None:
+                self.crops.append(length)
+
+        s = self._session()
+        cache = _Cache()
+        s._prefix_cache = _PrefixCacheEntry(
+            prefix_ids_cpu=torch.tensor([1, 2]),
+            past_key_values=cache,
+            prefix_len=2,
+            static=True,
+            max_cache_len=8,
+        )
+        s._static_cache_active = True
+        s_any = cast(Any, s)
+        s_any._steering = SimpleNamespace(
+            all_fast_path=lambda: True,
+            static_steerable=lambda: False,
+            ctx=None,
+            hooks={},
+        )
+        s._steering_active_in_prefill = lambda: False
+        s._steering_needs_probe_gating = lambda: False
+        s_any._build_gating_score_callback = lambda: None
+        s._compiled = False
+        s._device = torch.device("cpu")
+        s_any._model = object()
+        s_any._tokenizer = object()
+        s_any._gen_state = object()
+        s._capture_state = CaptureState(persistent=False)
+        s_any._capture = SimpleNamespace(
+            ingest_persistent=lambda: None,
+            fire_step_sink=lambda: None,
+        )
+
+        seen: dict[str, Any] = {}
+
+        def _fake_generate(
+            model: Any,
+            tokenizer: Any,
+            input_ids: torch.Tensor,
+            config: GenerationConfig,
+            state: Any,
+            **kwargs: Any,
+        ) -> list[int]:
+            del model, tokenizer, config, state
+            seen["input_ids"] = input_ids.clone()
+            seen.update(kwargs)
+            return [42]
+
+        monkeypatch.setattr("saklas.core.session.generate_steered", _fake_generate)
+
+        out, _elapsed = s._run_generation_loop(
+            torch.tensor([[1, 2, 3]], dtype=torch.long),
+            GenerationConfig(max_new_tokens=2),
+            use_thinking=False,
+            want_hidden=False,
+            effective_tap=None,
+            seed=None,
+            stop_list=None,
+            logit_bias=None,
+            presence_penalty=0.0,
+            frequency_penalty=0.0,
+            lp_count=None,
+        )
+
+        assert out == [42]
+        assert seen["input_ids"].tolist() == [[3]]
+        assert seen["past_key_values"] is cache
+        assert seen["cache_position_offset"] == 2
+        assert seen["use_static_cache"] is True
+        assert cache.crops == [2]
+
+    def test_cache_prefix_can_build_static_cache_entry(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import torch
+        from saklas.core.generation import GenerationConfig
+
+        s = self._session()
+        s._static_cache_active = True
+        s._device = torch.device("cpu")
+        s.config = GenerationConfig(max_new_tokens=4)
+        s._steering_stack = []
+        s._prefix_cache = None
+        from saklas.core.session import GenState
+        s._gen_phase = GenState.IDLE
+        s._end_capture = lambda: None
+
+        static_cache = object()
+        made: dict[str, Any] = {}
+
+        def _make_static_cache(model: Any, max_cache_len: int, device: Any, dtype: Any) -> object:
+            made.update({
+                "model": model,
+                "max_cache_len": max_cache_len,
+                "device": device,
+                "dtype": dtype,
+            })
+            return static_cache
+
+        monkeypatch.setattr(
+            "saklas.core.cuda_graphs.make_static_cache", _make_static_cache,
+        )
+
+        class _Model:
+            config = object()
+
+            def __init__(self) -> None:
+                self.calls: list[dict[str, Any]] = []
+                self.param = torch.zeros(1, dtype=torch.float16)
+
+            def parameters(self):
+                return iter([self.param])
+
+            def __call__(self, **kwargs: Any) -> Any:
+                self.calls.append(kwargs)
+                return SimpleNamespace(past_key_values=kwargs.get("past_key_values"))
+
+        model = _Model()
+        cast(Any, s)._model = model
+
+        prefix_len = s.cache_prefix(
+            torch.tensor([[4, 5, 6]], dtype=torch.long),
+            max_new_tokens=7,
+            prefer_static=True,
+        )
+
+        assert prefix_len == 3
+        assert s._prefix_cache is not None
+        assert s._prefix_cache.static is True
+        assert s._prefix_cache.max_cache_len == 10
+        assert s._prefix_cache.past_key_values is static_cache
+        assert made == {
+            "model": model,
+            "max_cache_len": 10,
+            "device": torch.device("cpu"),
+            "dtype": torch.float16,
+        }
+        call = model.calls[0]
+        assert call["past_key_values"] is static_cache
+        assert call["cache_position"].tolist() == [0, 1, 2]
 
 
 # ---------------------------------------------------------------------------
@@ -308,6 +828,36 @@ class TestGenerateSweep:
         # Stub propagates ``steering`` to ``applied_steering``; the
         # canonical receipt round-trips through generate_sweep.
         assert results[0].applied_steering == "0.4 honest"
+
+    def test_degenerate_greedy_sweep_uses_batched_generation(self) -> None:
+        s, model = _fast_batch_session()
+        _install_noop_steering(s)
+
+        def _fail_generate_core(*args: Any, **kwargs: Any) -> GenerationResult:
+            raise AssertionError("serial generation path should not run")
+
+        s._generate_core = _fail_generate_core
+        seen: list[tuple[int, str, dict[str, float]]] = []
+
+        runset = s.generate_sweep(
+            "alpha",
+            sweep={"a": [0.0, 0.0, 0.0]},
+            thinking=False,
+            on_result=lambda idx, result, alphas: seen.append(
+                (idx, result.text, dict(alphas)),
+            ),
+        )
+
+        assert len(model.calls) == 1
+        assert model.calls[0]["input_ids"].shape == (3, 2)
+        assert runset.kind == "fan"
+        assert runset.grid == [{"a": 0.0}, {"a": 0.0}, {"a": 0.0}]
+        assert [r.tokens for r in runset] == [[10, 11], [12, 13, 14], [15]]
+        assert seen == [
+            (0, "10 11", {"a": 0.0}),
+            (1, "12 13 14", {"a": 0.0}),
+            (2, "15", {"a": 0.0}),
+        ]
 
     def test_empty_sweep_dict_raises(self) -> None:
         s = self._session()

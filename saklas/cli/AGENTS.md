@@ -1,11 +1,14 @@
 # cli/
 
-Seven-verb root parser
-(`tui`/`serve`/`manifold`/`pack`/`experiment`/`config`/`template`). `manifold` is the
+Eight-verb root parser
+(`tui`/`serve`/`manifold`/`pack`/`experiment`/`config`/`template`/`lens`).
+`manifold` is the
 unified compute surface (extract/generate/from-template/fit/bake/merge/transfer/
 compare/why); `pack` is the lifecycle/distribution verb (ls/show/install/search/
 push/rm/clear/refresh/export gguf); `template` owns the standalone
-templated-completion artifact (create/ls/show/score/rm). There is no `vector` alias
+templated-completion artifact (create/ls/show/score/rm); `lens` owns the
+per-model Jacobian-lens artifact (fit/show/top/decompose/rm). There is no
+`vector` alias
 — install via `pack install` and export via `pack export gguf`. Split across:
 - `cli/main.py` — entry point, `parse_args`, `main`, `_COMMAND_RUNNERS` dispatch
 - `cli/parsers.py` — `_build_root_parser` + every `_build_X_parser`, the verb tables
@@ -60,6 +63,17 @@ with no subverb) prints help and exits 0, not argparse's exit 2.
   (`session.score_template`), steering-aware via `-S`. Bare names default to
   `local/` (`_split_manifold_ns_name`); `score`/`show`/`rm` resolve cross-namespace
   via `resolve_template`.
+- `lens` = the per-model Jacobian-lens artifact
+  (`fit`/`show`/`top`/`decompose`/`rm`) via `_LENS_VERBS`; `_run_lens`
+  hand-dispatches (`@_saklas_error_exit`-wrapped, like `_run_experiment` — the
+  lens error family carries `user_message()`). `fit`/`top`/`decompose` load a
+  model with `probes=[]` (no default probe bootstrap); `show`/`rm` are pure-IO
+  over `models/<safe_id>/jlens.*`. `fit` sources its corpus from `--corpus FILE`
+  (one document per line, or JSONL with a `text` field) or streams the default
+  fineweb-edu sample via the optional `datasets` dependency
+  (`_load_lens_corpus`), and resumes a matching partial fit by default. The
+  model is a **positional** on `fit`/`show`/`top`/`rm` (the artifact is
+  per-model); `decompose` takes a selector positional + required `-m`.
 
 ## Config loading
 
@@ -145,10 +159,16 @@ category list through verbatim (tagged concepts only, no multi-node sweep).
   `--sae RELEASE`, `--sae-revision REV`, plus the discover hyperparams
   `--method pca|spectral|auto`, `--max-dim N`, `--min-dim N`, `--var-threshold T`,
   `--k-nn K`, `--bandwidth SIGMA`, `--max-subspace-dim R`, `--smoothing auto|0|LAMBDA`,
-  `--persistence-frac F`. An authored folder runs
-  `ManifoldExtractionPipeline` directly; a discover folder (`pca`/`spectral`/`auto`)
-  has any supplied hyperparam written into `manifold.json` atomically *before* the
-  fit. Supplying a discover hyperparam against an authored folder is an error.
+  `--persistence-frac F`. `-f/--force` bypasses the per-model tensor cache and
+  re-pools/re-fits unconditionally — threaded `args.force` → `session.fit` →
+  `ManifoldExtractionPipeline.fit(force=)`, which skips the `nodes_sha256`
+  cache-hit. Needed because `manifold fit` (unlike `manifold extract -f`) doesn't
+  re-author the corpus, so without it an unchanged corpus always cache-hits and a
+  code-level fit change (e.g. a topology-selection fix) can't be picked up. An
+  authored folder runs `ManifoldExtractionPipeline` directly; a discover folder
+  (`pca`/`spectral`/`auto`) has any supplied hyperparam written into
+  `manifold.json` atomically *before* the fit. Supplying a discover hyperparam
+  against an authored folder is an error.
   `--method auto` defers flat-vs-curved + periodic-axis selection to
   `select_topology` per-model. `--max-subspace-dim` caps the per-layer RBF subspace
   dim for the curved spectral fit (argparse-default `None` → engine 64) and is
@@ -199,6 +219,22 @@ category list through verbatim (tagged concepts only, no multi-node sweep).
 - `experiment naturalness`: `model` + `prompt`, `--manifold FOLDER` / `-S/--steer
   EXPR` (required), `--compare-linear`, `--max-tokens` (128), `-j`.
 - `config show`/`validate` — flags as in `config_file`.
+- `lens fit`: positional `model`, `--corpus FILE`, `--prompts N` (100),
+  `--seq-len T` (128), `--dim-batch K` (8; total backward work is K-invariant,
+  so the knob trades memory for per-pass overhead — halves automatically on
+  OOM), `--layers L1,L2,...` (restrict source layers — skips all forward-graph
+  and backward work below the lowest one, the one real wall-time lever; a
+  stored lens whose layers mismatch the request refits instead of resuming),
+  `-f/--force` (restart from zero instead of resuming), `-d`, `-q`.
+- `lens show`: positional `model`, `-j`.
+- `lens top`: positionals `model` + `prompt` (raw text, no chat template),
+  `-k/--top-k` (8), `--layers L1,L2,...` (default: 9 evenly spaced fitted
+  layers), `--position P` (repeatable, negative ok; default final position),
+  `-d`, `-q`, `-j`.
+- `lens decompose`: positional `selector`, `-m/--model` (required),
+  `-k/--top-k` (16 — the sparsity budget), `--layers L1,L2,...`, `-d`, `-q`,
+  `-j`.
+- `lens rm`: positional `model`, `-y/--yes`.
 
 ## Error handling
 

@@ -101,14 +101,12 @@ Svelte 5 `$state` doesn't track plain `Map.set` / `Set.add` or inner-object prop
 The dashboard speaks the existing `/saklas/v1/*` native API:
 
 * `GET /saklas/v1/sessions/default` — `SessionInfo`
-* `GET/POST/DELETE /saklas/v1/sessions/default/vectors[/{name}]` — list / load-from-disk / drop, with per-layer `||baked||` on the GET
-* `GET /saklas/v1/sessions/default/vectors/{name}/diagnostics` — 16-bucket layer-magnitude histogram + summary metrics (powers `saklas vector why`; falls back to monitor profiles for probes)
-* `GET /saklas/v1/sessions/default/correlation[?names=a,b]` — N×N cosine
-* `GET/POST/DELETE /saklas/v1/sessions/default/probes[/{name}]` — list / activate / deactivate
+* `GET /saklas/v1/sessions/default/correlation[?names=a,b]` — N×N cosine over active analytics profiles
+* `GET/POST/DELETE /saklas/v1/sessions/default/probes[/{name}]` — list / activate / deactivate probes
 * `POST /saklas/v1/sessions/default/extract` — JSON or SSE-progress when `Accept: text/event-stream`
-* `POST /saklas/v1/sessions/default/experiments/fan` — alpha grid as loom siblings
-* `POST /saklas/v1/sessions/default/vectors/{merge,clone}` — register a derived vector
-* `GET /saklas/v1/packs[/search]`, `POST /saklas/v1/packs`, `DELETE /saklas/v1/packs/{ns}/{name}` — pack browse, install, and remove. The list response carries a session-relative `has_tensor` flag so the unified Vectors drawer can split rows into extracted and statements-only sections; DELETE detaches the concept from the rack before removing the folder.
+* `GET /saklas/v1/manifolds`, `POST /saklas/v1/manifolds`, `PATCH/DELETE /saklas/v1/manifolds/{ns}/{name}` — author, edit, and remove manifold folders
+* `POST /saklas/v1/manifolds/generate`, `POST /saklas/v1/manifolds/{ns}/{name}/fit`, `POST /saklas/v1/manifolds/merge` — generate discover corpora, fit tensors, and merge discover sources
+* `GET /saklas/v1/packs[/search]`, `POST /saklas/v1/packs`, `DELETE /saklas/v1/packs/{ns}/{name}` — pack browse, install, and remove. The list response carries a session-relative `has_tensor` flag so the rack can split rows by fitted availability; DELETE detaches the manifold before removing the folder.
 * `GET /saklas/v1/sessions/default/tree` and `/tree/active` — full loom tree or active path
 * `POST /saklas/v1/sessions/default/tree/{navigate,edit,branch,star,note,reset}` and `DELETE /tree/{node_id}` — loom mutations
 * `GET /saklas/v1/sessions/default/tree/{edge_label,filter}` — branch labels and search/filter support

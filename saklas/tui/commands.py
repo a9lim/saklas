@@ -224,6 +224,17 @@ def _build_registry() -> dict[str, SlashCommand]:
             max_args=None,  # selectors are single tokens but allow trailing
         ),
         SlashCommand(
+            name="/lens",
+            handler=SaklasApp._handle_lens,
+            usage=(
+                "Usage: /lens              (toggle, default mid-band layers)\n"
+                "       /lens 20,30,40     (specific fitted layers)\n"
+                "       /lens off"
+            ),
+            min_args=0,
+            max_args=1,
+        ),
+        SlashCommand(
             name="/manifold-probe-remove",
             handler=SaklasApp._handle_manifold_probe_remove,
             usage="Usage: /manifold-probe-remove <name>",

@@ -406,7 +406,7 @@
   // ============================================================ discover ===
 
   type DiscoverFitMode = "pca" | "spectral" | "auto";
-  type DiscoverKind = "abstract" | "concrete";
+  type DiscoverKind = "abstract" | "concrete" | "custom";
   // ``auto`` is the friendly default — ``select_topology`` picks
   // flat / curved / periodic per-model, so a newcomer needn't know which
   // geometry their concepts want.  pca / spectral pin it for power users.
@@ -417,6 +417,7 @@
   // ``samplesPerPrompt`` is the in-character responses generated per
   // shared baseline prompt.
   let discoverKind: DiscoverKind = $state("abstract");
+  let discoverCustomSystem = $state("You are {c}.");
   let discoverSamplesPerPrompt = $state(1);
   let discoverMaxDim = $state(8);
   let discoverVarThreshold = $state(0.70);
@@ -470,6 +471,14 @@
     if (discoverSamplesPerPrompt <= 0) {
       messages.push("samples_per_prompt must be > 0");
     }
+    if (discoverKind === "custom") {
+      const template = discoverCustomSystem.trim();
+      if (!template) {
+        messages.push("custom system template is required");
+      } else if (!template.includes("{c}")) {
+        messages.push('custom system template must include "{c}"');
+      }
+    }
     if (discoverMaxDim < 1) messages.push("max_dim must be >= 1");
     if (
       (discoverFitMode === "pca" || discoverFitMode === "auto") &&
@@ -512,6 +521,8 @@
       description: description.trim(),
       concepts: discoverConcepts.map((c) => slug(c)),
       kind: discoverKind,
+      custom_system:
+        discoverKind === "custom" ? discoverCustomSystem.trim() : undefined,
       samples_per_prompt: discoverSamplesPerPrompt,
       fit_mode: discoverFitMode,
       hyperparams: buildDiscoverHyperparams(),
@@ -1170,6 +1181,7 @@
             <div class="radio-row">
               <Radio bind:group={discoverKind} value="abstract" label="abstract" />
               <Radio bind:group={discoverKind} value="concrete" label="concrete" />
+              <Radio bind:group={discoverKind} value="custom" label="custom" />
             </div>
           </div>
           <label class="field">
@@ -1189,6 +1201,17 @@
           <strong>{discoverKind}</strong> framing,
           <strong>{discoverSamplesPerPrompt}</strong> response(s) per prompt.
         </p>
+        {#if discoverKind === "custom"}
+          <label class="field">
+            <span class="label">system template</span>
+            <textarea
+              class="input"
+              rows="3"
+              bind:value={discoverCustomSystem}
+              spellcheck="false"
+            ></textarea>
+          </label>
+        {/if}
       </section>
 
       <section class="step">

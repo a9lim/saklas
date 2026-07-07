@@ -85,6 +85,13 @@ def test_parse_pack_export_gguf():
     assert args.model == "foo/bar"
 
 
+def test_lens_layers_empty_string_errors(capsys: pytest.CaptureFixture[str]):
+    with pytest.raises(SystemExit) as ex:
+        cli_runners._parse_layer_list("")
+    assert ex.value.code == 2
+    assert "at least one source layer" in capsys.readouterr().err
+
+
 # ---------------------------------------------------------------------------
 # config subtree
 # ---------------------------------------------------------------------------

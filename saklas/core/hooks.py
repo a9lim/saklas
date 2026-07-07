@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
+from typing import Any, cast
 
 import torch
 
@@ -95,6 +95,12 @@ class HiddenCapture:
         # same accumulation + step-sink the in-hook path does.  Empty ⇒ the normal
         # transient-hook path.
         self._persistent_buffers: dict[int, torch.Tensor] = {}
+        # Batched aggregate-only capture: ``generate_batch`` can delegate the
+        # decode loop to ``transformers.generate`` and still retain the final
+        # per-row probe state by storing one ``[B, D]`` tail slice per layer per
+        # forward.  The normal single-row paths keep using ``_per_layer``.
+        self._batch_per_layer: dict[int, list[torch.Tensor]] = {}
+        self._batch_forward_count: int = 0
 
     def attach(
         self, layers: "torch.nn.ModuleList", layer_indices: list[int]
@@ -160,6 +166,41 @@ class HiddenCapture:
                         # Full-retention mode: each step is a distinct clone so
                         # ``stacked()`` can build the [T, D] history.
                         bucket_ref.append(src.clone())
+                return _hook
+
+            self._handles.append(
+                layers[idx].register_forward_hook(_make(bucket, idx)),
+            )
+
+    def attach_batch_tail(
+        self,
+        layers: "torch.nn.ModuleList",
+        layer_indices: list[int],
+        *,
+        depth: int,
+    ) -> None:
+        """Capture batched ``[B, D]`` last-position slices in a bounded ring.
+
+        Used by the ``generate_batch`` fast path for stateless aggregate probe
+        reads.  It deliberately does not support per-token sinks, hidden-state
+        returns, or persistent compile-clean buffers; those remain on the custom
+        single-row loop where their per-step semantics are already explicit.
+        """
+        self.clear()
+        self._batch_per_layer = {idx: [] for idx in layer_indices}
+        tail_depth = max(1, int(depth))
+        for idx in layer_indices:
+            bucket = self._batch_per_layer[idx]
+
+            def _make(bucket_ref: list[torch.Tensor], layer_idx: int) -> Any:
+                def _hook(module: Any, input: Any, output: Any) -> None:
+                    h = output if isinstance(output, torch.Tensor) else output[0]
+                    src = h[:, -1, :].detach().clone()
+                    bucket_ref.append(src)
+                    if len(bucket_ref) > tail_depth:
+                        bucket_ref.pop(0)
+                    if layer_idx == layer_indices[-1]:
+                        self._batch_forward_count += 1
                 return _hook
 
             self._handles.append(
@@ -297,12 +338,14 @@ class HiddenCapture:
 
     def clear(self) -> None:
         self._per_layer = {}
+        self._batch_per_layer = {}
         self._handles = []
         self._incremental = False
         self._step_sink = None
         self._max_layer = None
         self._tail_depth = 1
         self._forward_count = 0
+        self._batch_forward_count = 0
         self._persistent_buffers = {}
 
     def tail_slice_at(self, forward_index: int) -> dict[int, torch.Tensor]:
@@ -325,6 +368,26 @@ class HiddenCapture:
             pos = forward_index - start
             pos = max(0, min(pos, len(bucket) - 1))
             out[idx] = bucket[pos]
+        return out
+
+    def batch_tail_slice_at(
+        self,
+        row_index: int,
+        forward_index: int,
+    ) -> dict[int, torch.Tensor]:
+        """Per-layer ``[D]`` slice for one row from the batched tail ring."""
+        out: dict[int, torch.Tensor] = {}
+        F = self._batch_forward_count
+        for idx, bucket in self._batch_per_layer.items():
+            if not bucket:
+                continue
+            start = F - len(bucket)
+            pos = forward_index - start
+            pos = max(0, min(pos, len(bucket) - 1))
+            batch_slice = bucket[pos]
+            if row_index < 0 or row_index >= int(batch_slice.shape[0]):
+                continue
+            out[idx] = batch_slice[row_index]
         return out
 
     def stacked(self) -> dict[int, torch.Tensor]:
@@ -448,6 +511,18 @@ class SteeringHook:
             torch.Tensor, torch.Tensor, float, float, torch.Tensor,
             "float | torch.Tensor",
         ] | None = None
+        # Model-dtype low-rank fast path for the single-affine mixed
+        # push+ablation case.  The full ``subspace_inject`` fallback casts the
+        # entire residual stream to fp32 and copies a full-width result back.
+        # For an affine subspace the update is exactly low-rank:
+        # ``q = h Bᵀ - μBᵀ`` and ``h += (along·(target - κq))B``.  Keeping the
+        # small reduced-space math in the model dtype avoids the full fp32
+        # residual copy while preserving the same geometry; pure-push still uses
+        # the even cheaper constant-add path above this.
+        self._single_affine_lowrank: tuple[
+            torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+            torch.Tensor, float,
+        ] | None = None
         # Constant-add fast path for a **pure-push** affine group (all-zero
         # κ — no ``!`` ablation).  When such a group's foot translates by the
         # fixed offset ``along·target`` (κ=0 ⇒ ``p_new − q = along·target``,
@@ -532,7 +607,7 @@ class SteeringHook:
                 origin.to(device=device, dtype=torch.float32),
                 float(along),
                 float(onto),
-                kappa.to(device=device, dtype=torch.float32)
+                cast(torch.Tensor, kappa).to(device=device, dtype=torch.float32)
                 if isinstance(kappa, torch.Tensor) else float(kappa),
             ))
         self.manifold_groups = manifold_groups
@@ -575,8 +650,18 @@ class SteeringHook:
             self._const_single = self._pure_push_constant(
                 _g[1], _g[3], _g[5], _g[7], device=device, dtype=dtype,
             )
+            self._single_affine_lowrank = (
+                self._mixed_affine_lowrank(
+                    _g[1], _g[3], _g[5], _g[7],
+                    mean_proj=self._single_affine_fast[6],
+                    device=device,
+                    dtype=dtype,
+                )
+                if self._const_single is None else None
+            )
         else:
             self._const_single = None
+            self._single_affine_lowrank = None
         self._const_groups = [
             self._pure_push_constant(
                 sub, target, along, kappa, device=device, dtype=dtype,
@@ -617,7 +702,8 @@ class SteeringHook:
         # push iff every entry is zero.  Any ablation axis (κ≠0) disqualifies —
         # the injection then depends on ``h``.
         if isinstance(kappa, torch.Tensor):
-            if bool(kappa.any()):
+            kappa_tensor = cast(torch.Tensor, kappa)
+            if bool(kappa_tensor.any()):
                 return None
         elif float(kappa) != 0.0:
             return None
@@ -635,6 +721,35 @@ class SteeringHook:
         # it removes the two per-fire norm reductions the cap needs.
         return c.to(dtype) if dtype is not None else c
 
+    @staticmethod
+    def _mixed_affine_lowrank(
+        sub: LayerSubspace,
+        target: torch.Tensor,
+        along: float,
+        kappa: "float | torch.Tensor",
+        *,
+        mean_proj: torch.Tensor,
+        device: torch.device,
+        dtype: "torch.dtype | None",
+    ) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float] | None":
+        """Precompute model-dtype tensors for mixed affine push+ablation."""
+        if dtype is None:
+            return None
+        if isinstance(kappa, torch.Tensor):
+            kappa_tensor = cast(torch.Tensor, kappa)
+            if not bool(kappa_tensor.any()):
+                return None
+            kappa_t = kappa_tensor.to(device=device, dtype=dtype)
+        else:
+            if float(kappa) == 0.0:
+                return None
+            kappa_t = torch.full_like(target, float(kappa), device=device, dtype=dtype)
+        basis = sub.basis.to(device=device, dtype=dtype)       # (R, D)
+        basis_t = basis.T.contiguous()                         # (D, R)
+        target_t = target.to(device=device, dtype=dtype)       # (R,)
+        mean_proj_t = mean_proj.to(device=device, dtype=dtype) # (R,)
+        return basis, basis_t, target_t, kappa_t, mean_proj_t, float(along)
+
     def hook_fn(self, module: Any, input: Any, output: Any) -> Any:
         # Constant-add fast path: one always-active **pure-push** affine group
         # (the dominant steering case — any push term / merge with no ``!``
@@ -645,6 +760,20 @@ class SteeringHook:
         if const is not None:
             hidden = output if isinstance(output, torch.Tensor) else output[0]
             hidden.add_(const)
+            return output
+        lowrank = self._single_affine_lowrank
+        if lowrank is not None:
+            hidden = output if isinstance(output, torch.Tensor) else output[0]
+            basis, basis_t, target, kappa, mean_proj, along = lowrank
+            if hidden.dtype != basis.dtype:
+                basis = basis.to(hidden.dtype)
+                basis_t = basis.T.contiguous()
+                target = target.to(hidden.dtype)
+                kappa = kappa.to(hidden.dtype)
+                mean_proj = mean_proj.to(hidden.dtype)
+            q = hidden @ basis_t - mean_proj
+            delta = (along * (target - kappa * q)) @ basis
+            hidden.add_(delta)
             return output
         # Fast path: one always-active affine group (the common steering case).
         # Skips the group loop, the trigger re-check, and the foot-seed branch;

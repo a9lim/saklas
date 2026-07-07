@@ -5,10 +5,10 @@ Three layers, all CPU-only (no model):
 1. ``port_legacy_vector_folder`` (io) — the shared port primitive: a legacy
    concept folder's ``statements.json`` + ``scenarios.json`` reconstruct the
    equivalent 2-node manifold authoring; no tensors carried.
-2. ``SaklasSession._port_stale_legacy_vector`` / ``_ensure_profile_registered``
-   — port-on-detect in the live steer path (prefer-manifold), gated on
-   staleness, with the actionable "fit it" raise (fitting can't re-enter the
-   gen lock from dispatch).
+2. ``SteeringComposer.port_stale_legacy_vector`` /
+   ``ensure_profile_registered`` — port-on-detect in the live steer path
+   (prefer-manifold), gated on staleness, with the actionable "fit it" raise
+   (fitting can't re-enter the gen lock from dispatch).
 3. ``scripts/upgrade_packs.py`` — the bulk migrator: port statements-bearing
    folders, re-stamp tensor-only ones to the current ``format_version``.
 """
@@ -25,6 +25,7 @@ from saklas.io import selectors as _sel
 from saklas.io.manifolds import port_legacy_vector_folder
 from saklas.io.packs import PACK_FORMAT_VERSION
 from saklas.io.paths import concept_dir, manifold_dir, vectors_dir
+from saklas.core.steering_composer import SteeringComposer
 
 
 @pytest.fixture(autouse=True)
@@ -166,6 +167,7 @@ def _bare_session(model_id: str = "test/model"):
     sess._profiles = {}
     sess._manifolds = {}
     sess._model_info = {"model_id": model_id}  # model_id is a read-only property
+    sess._steering_composer = SteeringComposer(sess)
     return sess
 
 
@@ -173,21 +175,21 @@ class TestPortOnDetect:
     def test_stale_statements_folder_is_ported(self) -> None:
         _make_legacy_vector("local", "happy.sad", version=PACK_FORMAT_VERSION - 1)
         sess = _bare_session()
-        hit = sess._port_stale_legacy_vector("local/happy.sad")
+        hit = sess._steering_composer.port_stale_legacy_vector("local/happy.sad")
         assert hit == ("local", "happy.sad")
         assert (manifold_dir("local", "happy.sad") / "manifold.json").exists()
 
     def test_bare_name_scans_namespaces(self) -> None:
         _make_legacy_vector("alice", "happy.sad", version=PACK_FORMAT_VERSION - 1)
         sess = _bare_session()
-        hit = sess._port_stale_legacy_vector("happy.sad")
+        hit = sess._steering_composer.port_stale_legacy_vector("happy.sad")
         assert hit == ("alice", "happy.sad")
 
     def test_current_version_folder_not_ported(self) -> None:
         # A current-version pack keeps its tensor via autoload — don't port it.
         _make_legacy_vector("local", "fresh", version=PACK_FORMAT_VERSION)
         sess = _bare_session()
-        assert sess._port_stale_legacy_vector("local/fresh") is None
+        assert sess._steering_composer.port_stale_legacy_vector("local/fresh") is None
         assert not (manifold_dir("local", "fresh") / "manifold.json").exists()
 
     def test_tensor_only_folder_not_ported(self) -> None:
@@ -197,14 +199,17 @@ class TestPortOnDetect:
             version=PACK_FORMAT_VERSION - 1, with_statements=False,
         )
         sess = _bare_session()
-        assert sess._port_stale_legacy_vector("local/tensoronly") is None
+        assert (
+            sess._steering_composer.port_stale_legacy_vector("local/tensoronly")
+            is None
+        )
 
     def test_already_ported_returns_hit_without_reporting(self) -> None:
         _make_legacy_vector("local", "happy.sad", version=PACK_FORMAT_VERSION - 1)
         sess = _bare_session()
-        sess._port_stale_legacy_vector("local/happy.sad")
+        sess._steering_composer.port_stale_legacy_vector("local/happy.sad")
         # Second call: manifold exists → returns the hit, no re-port crash.
-        hit = sess._port_stale_legacy_vector("local/happy.sad")
+        hit = sess._steering_composer.port_stale_legacy_vector("local/happy.sad")
         assert hit == ("local", "happy.sad")
 
     def test_ensure_profile_registered_ports_then_nudges_to_fit(self) -> None:
@@ -213,7 +218,7 @@ class TestPortOnDetect:
         _make_legacy_vector("local", "happy.sad", version=PACK_FORMAT_VERSION - 1)
         sess = _bare_session()
         with pytest.raises(VectorNotRegisteredError) as exc:
-            sess._ensure_profile_registered("local/happy.sad")
+            sess._steering_composer.ensure_profile_registered("local/happy.sad")
         msg = str(exc.value)
         # The artifact was ported (file-only) ...
         assert (manifold_dir("local", "happy.sad") / "manifold.json").exists()

@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from saklas.core.events import SteeringApplied, SteeringCleared
+from saklas.core.manifold import manifold_is_affine
 from saklas.core.session import (
     CaptureState,
     ConcurrentGenerationError,
@@ -40,7 +41,6 @@ from saklas.core.session import (
     VectorNotRegisteredError,
     _PROFILE_ABSENT,
     _affine_manifold_push,
-    _manifold_is_affine,
 )
 from saklas.core.steering_expr import AblationTerm, ManifoldTerm
 
@@ -304,6 +304,17 @@ class SteeringComposer:
             canonical, variant = name.rsplit(":", 1)
         else:
             canonical, variant = name, "raw"
+
+        # (1b) Reserved J-lens namespace: ``jlens/<word>`` resolves lazily
+        # through the model's fitted Jacobian lens (a per-layer ``W_U[v]@J_l``
+        # direction registered into the ordinary profile registry).  Raises
+        # ``LensNotFittedError`` (with the fit command) or
+        # ``MultiTokenWordError`` — never falls through to extraction.
+        if canonical.startswith("jlens/") and variant == "raw":
+            registered = self._session.register_jlens_direction(
+                canonical.split("/", 1)[1]
+            )
+            return profiles[registered]
 
         # (2) Manifold first — native or previously ported.
         folded = self.try_fold_manifold(name)
@@ -666,7 +677,9 @@ class SteeringComposer:
         from saklas.core.steering_expr import ProjectedTerm
 
         try:
-            s = Steering.from_value(value)
+            s = Steering.from_value(
+                value, profile_names=set(getattr(self._session, "_profiles", {})),
+            )
         except Exception:
             return False
         if s is None:
@@ -720,15 +733,24 @@ class SteeringComposer:
             # whole roster.  Both reuse the latest appended row.
             state = getattr(session, "_capture_state", None) or CaptureState()
             gating_subset = state.gating_subset
+            gate_keys = state.gating_keys
             if gating_subset and incremental_gate_scores:
                 return incremental_gate_scores[-1]
             if state.incremental and incremental_readings:
-                return monitor.flat_scalars(incremental_readings[-1])
+                scalars = monitor.flat_scalars(incremental_readings[-1])
+                if gate_keys:
+                    missing = gate_keys - set(scalars)
+                    if missing:
+                        latest = capture.latest_per_layer()
+                        if latest:
+                            scalars.update(
+                                monitor.score_gate_scalars(latest, missing)
+                            )
+                return scalars
             latest = capture.latest_per_layer()
             if not latest:
                 return {}
-            gate_keys = state.gating_keys
-            if gating_subset and gate_keys:
+            if gate_keys:
                 return monitor.score_gate_scalars(latest, gate_keys)
             # Flatten the coordinate readings into gate-callback scalars
             # (``name`` aliases axis 0, ``name[i]`` per axis, ``name:fraction``,
@@ -815,7 +837,7 @@ class SteeringComposer:
                     raise ManifoldNotRegisteredError(
                         f"No manifold registered for '{entry.manifold}'"
                     )
-                if _manifold_is_affine(manifold):
+                if manifold_is_affine(manifold):
                     # Affine ``%`` joins the merged subspace as a rank-R push
                     # toward the position's per-layer coords — a node's real
                     # coords for label form (``personas%pirate``) or the cardinal

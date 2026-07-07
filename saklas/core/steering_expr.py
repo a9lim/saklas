@@ -174,10 +174,10 @@ class ProjectedTerm:
 class AblationTerm:
     """Mean-replacement ablation entry in ``Steering.alphas``.
 
-    The session lowers an ``AblationTerm`` to an ablate fragment in
-    ``_compose_steering_entries``, which ``synthesize_subspace`` folds into
-    the merged affine subspace (per-axis ``κ = 1`` on the ablation axes),
-    attached via ``SteeringManager.add_subspace``.  Stored as a value inside
+    The composer lowers an ``AblationTerm`` to an ablate fragment in
+    ``compose_steering_entries``, which ``synthesize_subspace`` folds into the
+    merged affine subspace (per-axis ``κ = 1`` on the ablation axes), attached
+    via ``SteeringManager.add_subspace``. Stored as a value inside
     ``Steering.alphas``; the key is ``"!<target>"`` so ablation entries never
     collide with plain-term entries on the same concept.
     """
@@ -549,6 +549,10 @@ class _Parser:
           gate's probe string (e.g. ``"emotions@happy"``); same
           ``flat_scalars`` correspondence.
 
+        Every shape also accepts a leading ``<ns>/`` namespace segment
+        (``jlens/fake``, ``default/emotions@happy``) — consumed before
+        the channel discriminators, stored verbatim.
+
         The discriminator on the trailing IDENT: a ``COLON`` after the
         manifold name routes to the fraction form, an ``AT`` to the
         label form, a ``DOT`` to the bipolar vector form, anything
@@ -559,6 +563,16 @@ class _Parser:
         """
         probe_tok = self._expect("IDENT")
         probe = str(probe_tok.value)
+        if self._peek().kind == "SLASH":
+            # Namespaced probe: ``<ns>/<name>`` — a J-lens token probe
+            # (``jlens/fake``) or a probe attached under a qualified selector
+            # (``default/emotions``).  Consumed before the channel
+            # discriminators so every channel shape composes with a
+            # namespaced probe; stored verbatim, matching the keys
+            # ``Monitor.flat_scalars`` emits.
+            self._consume()
+            ns_rhs = self._expect("IDENT")
+            probe = f"{probe}/{ns_rhs.value}"
         nxt = self._peek().kind
         if nxt == "COLON":
             # Manifold subspace-fraction gate: ``<manifold>:fraction``.
@@ -945,10 +959,16 @@ def _merge_manifold(
     )
 
 
-def _fold(terms: list[_Term], *, namespace: Optional[str]) -> "Steering":
+def _fold(
+    terms: list[_Term],
+    *,
+    namespace: Optional[str],
+    profile_names: Optional[set[str]] = None,
+) -> "Steering":
     from saklas.core.steering import Steering
 
     alphas: "dict[str, AlphaEntry]" = {}
+    registered_profiles = profile_names or set()
     for term in terms:
         sel = term.selector
         # Manifold position terms resolve before ``_resolve_atom`` — a
@@ -978,6 +998,16 @@ def _fold(terms: list[_Term], *, namespace: Optional[str]) -> "Steering":
         # Ordering + cross-tier ``AmbiguousSelectorError`` arbitration live in
         # the resolver, not here.
         if sel.operator is None and not term.ablation:
+            profile_key = _resolve_atom(sel.base)
+            if profile_key in registered_profiles:
+                if len(term.coeffs) > 1:
+                    raise SteeringExprError(
+                        "comma-separated coefficients are only valid for "
+                        "`manifold % position` terms"
+                    )
+                _merge_plain(alphas, profile_key, term.coeff, term.trigger)
+                continue
+
             from saklas.io.selectors import resolve_bare_atom
 
             atom = resolve_bare_atom(
@@ -1057,7 +1087,10 @@ def _fold(terms: list[_Term], *, namespace: Optional[str]) -> "Steering":
 # ---------------------------------------------------------------- public ---
 
 def parse_expr(
-    text: str, *, namespace: Optional[str] = None,
+    text: str,
+    *,
+    namespace: Optional[str] = None,
+    profile_names: Optional[set[str]] = None,
 ) -> "Steering":
     """Parse a steering expression string into a :class:`Steering` IR.
 
@@ -1065,12 +1098,16 @@ def parse_expr(
     ``None``, :func:`saklas.io.selectors.resolve_bare_atom` raises
     :class:`~saklas.io.selectors.AmbiguousSelectorError` if a bare atom
     matches manifolds across multiple namespaces.
+
+    ``profile_names`` is a session-local override set: when a plain term's
+    canonical registry key exactly matches an in-memory profile, that profile
+    wins over the installed-manifold tiers for that parse only.
     """
     if not text or not text.strip():
         raise SteeringExprError("empty steering expression")
     toks = _lex(text)
     terms = _Parser(toks).parse()
-    return _fold(terms, namespace=namespace)
+    return _fold(terms, namespace=namespace, profile_names=profile_names)
 
 
 def format_expr(steering: "Steering") -> str:

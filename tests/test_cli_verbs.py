@@ -1,9 +1,10 @@
-"""The seven-verb root CLI.
+"""The eight-verb root CLI.
 
 ``manifold`` is the steering-vector / manifold *compute* surface
 (extract/generate/from-template/fit/bake/merge/transfer/compare/why); ``pack`` is
 the manifold *lifecycle* surface (ls/show/install/search/push/rm/clear/refresh/
-export); ``template`` owns the standalone templated-completion artifact.  The
+export); ``template`` owns the standalone templated-completion artifact; ``lens``
+owns the per-model Jacobian-lens artifact (fit/show/top/decompose/rm).  The
 former ``subspace`` verb and the deprecated ``vector`` alias are gone — the
 flat-artifact verbs folded into ``manifold``.  These tests exercise the parser
 shape + dispatch wiring, not the backends.
@@ -34,9 +35,10 @@ def _isolated_home(
 # Root verb set
 # ---------------------------------------------------------------------------
 
-def test_seven_top_level_verbs() -> None:
+def test_eight_top_level_verbs() -> None:
     assert set(_COMMAND_RUNNERS) == {
         "tui", "serve", "manifold", "pack", "config", "experiment", "template",
+        "lens",
     }
 
 
@@ -201,3 +203,61 @@ def test_subspace_verb_removed() -> None:
 def test_vector_alias_removed() -> None:
     with pytest.raises(SystemExit):
         cli.parse_args(["vector", "extract", "happy", "sad"])
+
+
+# ---------------------------------------------------------------------------
+# lens
+# ---------------------------------------------------------------------------
+
+def test_lens_fit_parses() -> None:
+    args = cli.parse_args([
+        "lens", "fit", "m/x", "--prompts", "50", "--dim-batch", "32", "-f",
+    ])
+    assert args.command == "lens"
+    assert args.lens_cmd == "fit"
+    assert args.model == "m/x"
+    assert args.prompts == 50
+    assert args.dim_batch == 32
+    assert args.force is True
+
+
+def test_lens_top_parses() -> None:
+    args = cli.parse_args([
+        "lens", "top", "m/x", "some prompt", "-k", "5",
+        "--layers", "12,24", "--position", "-1",
+    ])
+    assert args.command == "lens"
+    assert args.lens_cmd == "top"
+    assert args.model == "m/x"
+    assert args.prompt == "some prompt"
+    assert args.top_k == 5
+    assert args.layers == "12,24"
+    assert args.position == [-1]
+
+
+def test_lens_decompose_parses() -> None:
+    args = cli.parse_args([
+        "lens", "decompose", "confident.uncertain", "-m", "m/x", "-j",
+    ])
+    assert args.command == "lens"
+    assert args.lens_cmd == "decompose"
+    assert args.selector == "confident.uncertain"
+    assert args.model == "m/x"
+    assert args.json_output is True
+
+
+def test_lens_show_and_rm_parse() -> None:
+    show = cli.parse_args(["lens", "show", "m/x", "-j"])
+    assert (show.lens_cmd, show.model, show.json_output) == ("show", "m/x", True)
+    rm = cli.parse_args(["lens", "rm", "m/x", "-y"])
+    assert (rm.lens_cmd, rm.model, rm.yes) == ("rm", "m/x", True)
+
+
+def test_bare_lens_prints_help_exit_0(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["lens"])
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    assert "saklas lens <verb>" in out

@@ -10,9 +10,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, TypeVar
 
 from saklas.cli.parsers import (
-    _EXPERIMENT_VERBS, _MANIFOLD_VERBS, _PACK_VERBS, _TEMPLATE_VERBS,
+    _EXPERIMENT_VERBS, _LENS_VERBS, _MANIFOLD_VERBS, _PACK_VERBS, _TEMPLATE_VERBS,
 )
 from saklas.core.errors import SaklasError
+from saklas.core.histogram import summarize_diagnostics
 from saklas.core.stats import median_or_zero
 from saklas.io.paths import VARIANT_SUFFIX_RE
 
@@ -965,7 +966,7 @@ def _run_manifold_why(args: argparse.Namespace) -> None:
                 str(layer): {k: round(float(v), 6) for k, v in metrics.items()}
                 for layer, metrics in sorted(diagnostics.items())
             }
-            result["diagnostics_summary"] = _summarize_diagnostics(diagnostics)
+            result["diagnostics_summary"] = summarize_diagnostics(diagnostics)
         print(_json.dumps(result, indent=2))
     else:
         _print_why_histogram(concept_name, args.model, total_layers, layer_mags)
@@ -973,57 +974,9 @@ def _run_manifold_why(args: argparse.Namespace) -> None:
             _print_diagnostics(diagnostics)
 
 
-def _summarize_diagnostics(
-    diagnostics: dict[int, dict[str, float]],
-) -> dict[str, float | str]:
-    """Aggregate per-layer metrics into a small summary block.
-
-    Reports medians (robust to outlier layers) for the four metrics, plus
-    a coarse ``quality`` stoplight derived from the same thresholds the
-    extraction-time warning uses.  Mirrored in the JSON output so callers
-    don't have to recompute it client-side.
-    """
-    evrs = [m["evr"] for m in diagnostics.values() if "evr" in m]
-    intras = [
-        m["intra_pair_variance_mean"]
-        for m in diagnostics.values()
-        if "intra_pair_variance_mean" in m
-    ]
-    aligns = [
-        m["inter_pair_alignment"]
-        for m in diagnostics.values()
-        if "inter_pair_alignment" in m
-    ]
-    projs = [
-        m["diff_principal_projection"]
-        for m in diagnostics.values()
-        if "diff_principal_projection" in m
-    ]
-
-    med_evr = median_or_zero(evrs)
-    med_intra = median_or_zero(intras)
-    med_align = median_or_zero(aligns)
-    med_proj = median_or_zero(projs)
-
-    if (med_evr > 0.95 and med_intra < 0.01) or med_align < 0.2:
-        quality = "poor"
-    elif med_align < 0.4 or med_evr < 0.2:
-        quality = "shaky"
-    else:
-        quality = "solid"
-
-    return {
-        "median_evr": round(med_evr, 4),
-        "median_intra_pair_variance": round(med_intra, 4),
-        "median_inter_pair_alignment": round(med_align, 4),
-        "median_diff_principal_projection": round(med_proj, 4),
-        "quality": quality,
-    }
-
-
 def _print_diagnostics(diagnostics: dict[int, dict[str, float]]) -> None:
     """Render the diagnostics summary + per-layer table beneath the histogram."""
-    summary = _summarize_diagnostics(diagnostics)
+    summary = summarize_diagnostics(diagnostics)
     quality = summary["quality"]
     print()
     print(f"  DIAGNOSTICS (probe quality: {quality}):")
@@ -1187,6 +1140,7 @@ def _run_manifold_fit(args: argparse.Namespace) -> None:
             folder,
             sae=getattr(args, "sae", None),
             sae_revision=getattr(args, "sae_revision", None),
+            force=bool(getattr(args, "force", False)),
             on_progress=lambda m: print(f"  {m}"),
         )
     except (ValueError, ManifoldFormatError) as e:
@@ -2291,6 +2245,291 @@ def _run_template(args: argparse.Namespace) -> None:
     runner(args)
 
 
+# --- lens verbs -----------------------------------------------------------
+
+_DEFAULT_LENS_CORPUS = ("HuggingFaceFW/fineweb-edu", "sample-10BT")
+#: Documents are sliced to this many characters before tokenization — the fit
+#: truncates to --seq-len tokens anyway, so tokenizing a full web page is waste.
+_LENS_DOC_CHARS = 4000
+
+
+def _parse_layer_list(raw: "str | None") -> "list[int] | None":
+    if raw is None:
+        return None
+    try:
+        layers = [int(part) for part in raw.split(",") if part.strip() != ""]
+    except ValueError:
+        print(f"lens: bad --layers value {raw!r} (want e.g. 12,24,36)", file=sys.stderr)
+        sys.exit(2)
+    if not layers:
+        print("lens: --layers must name at least one source layer", file=sys.stderr)
+        sys.exit(2)
+    return layers
+
+
+def _load_lens_corpus(args: argparse.Namespace) -> tuple[list[str], str]:
+    """Return ``(documents, corpus_spec)`` for ``lens fit``.
+
+    ``--corpus FILE`` reads one document per line (a JSON object line with a
+    ``text`` field also works). Unset, streams the default web-text sample
+    via the optional ``datasets`` dependency.
+    """
+    import json as _json
+
+    n = int(args.prompts)
+    if args.corpus is not None:
+        path = Path(args.corpus)
+        if not path.exists():
+            print(f"lens fit: corpus file not found: {path}", file=sys.stderr)
+            sys.exit(2)
+        docs: list[str] = []
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                if line.startswith("{"):
+                    try:
+                        obj = _json.loads(line)
+                        line = str(obj.get("text", "")) or line
+                    except _json.JSONDecodeError:
+                        pass
+                docs.append(line[:_LENS_DOC_CHARS])
+                if len(docs) >= n:
+                    break
+        return docs, f"file:{path.name}"
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        print(
+            "lens fit: no --corpus given and the `datasets` library is not "
+            "installed. Either pass --corpus FILE (one document per line) or "
+            "`pip install 'saklas[hf]'` to stream the default web-text sample.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    repo, config = _DEFAULT_LENS_CORPUS
+    print(f"Streaming {n} documents from {repo} ({config})...")
+    stream = load_dataset(repo, name=config, split="train", streaming=True)
+    docs = []
+    for row in stream:
+        text = str(row.get("text", "")).strip()
+        if text:
+            docs.append(text[:_LENS_DOC_CHARS])
+        if len(docs) >= n:
+            break
+    return docs, f"hf:{repo}/{config}"
+
+
+def _run_lens_fit(args: argparse.Namespace) -> None:
+    from saklas.core.session import SaklasSession
+    from saklas.io.lens import lens_paths
+
+    docs, spec = _load_lens_corpus(args)
+    _print_startup(args)
+    with SaklasSession.from_pretrained(
+        args.model, device=args.device, quantize=args.quantize, probes=[],
+    ) as session:
+        _print_model_info(session)
+        if args.force:
+            print("Refitting from zero (-f).")
+        lens = session.fit_jlens(
+            docs,
+            corpus_spec=spec,
+            source_layers=_parse_layer_list(getattr(args, "layers", None)),
+            dim_batch=args.dim_batch,
+            seq_len=args.seq_len,
+            force=args.force,
+            on_progress=lambda m: print(f"  {m}"),
+        )
+    ts_path, _ = lens_paths(args.model)
+    size_mb = ts_path.stat().st_size / 1024**2 if ts_path.exists() else 0.0
+    print(
+        f"Fitted Jacobian lens: {len(lens.source_layers)} layers, "
+        f"{lens.n_prompts} prompts, d_model={lens.d_model}"
+    )
+    print(f"Artifact: {ts_path} ({size_mb:.0f} MB)")
+
+
+def _run_lens_show(args: argparse.Namespace) -> None:
+    import json as _json
+
+    from saklas.io.lens import lens_paths, load_lens
+
+    loaded = load_lens(args.model)
+    if loaded is None:
+        print(
+            f"no fitted lens for {args.model} — run "
+            f"`saklas lens fit {args.model}`",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    lens, sidecar = loaded
+    ts_path, _ = lens_paths(args.model)
+    size_mb = ts_path.stat().st_size / 1024**2
+    if getattr(args, "json_output", False):
+        print(_json.dumps({
+            "model": args.model,
+            "path": str(ts_path),
+            "size_mb": round(size_mb, 1),
+            **sidecar,
+        }, indent=2))
+        return
+    print(f"Jacobian lens for {args.model}")
+    print(f"  layers:   {lens.source_layers[0]}..{lens.source_layers[-1]} "
+          f"({len(lens.source_layers)})")
+    print(f"  d_model:  {lens.d_model}")
+    print(f"  prompts:  {lens.n_prompts}")
+    print(f"  corpus:   {sidecar.get('corpus_spec', '?')} "
+          f"(sha256 {str(sidecar.get('corpus_sha256', ''))[:12]}…)")
+    print(f"  seq_len:  {sidecar.get('seq_len', '?')}, "
+          f"skip_first: {sidecar.get('skip_first_positions', '?')}")
+    print(f"  artifact: {ts_path} ({size_mb:.0f} MB)")
+
+
+def _lens_default_top_layers(source_layers: list[int], count: int = 9) -> list[int]:
+    """Evenly spaced fitted layers for the ``lens top`` default view."""
+    if len(source_layers) <= count:
+        return list(source_layers)
+    step = (len(source_layers) - 1) / (count - 1)
+    return sorted({source_layers[round(i * step)] for i in range(count)})
+
+
+def _run_lens_top(args: argparse.Namespace) -> None:
+    import json as _json
+
+    from saklas.core.session import SaklasSession
+
+    layers = _parse_layer_list(args.layers)
+    _print_startup(args)
+    with SaklasSession.from_pretrained(
+        args.model, device=args.device, quantize=args.quantize, probes=[],
+    ) as session:
+        _print_model_info(session)
+        lens = session.jlens
+        if lens is None:
+            print(
+                f"no fitted lens for {args.model} — run "
+                f"`saklas lens fit {args.model}`",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if layers is None:
+            layers = _lens_default_top_layers(lens.source_layers)
+        out = session.jlens_readout(
+            args.prompt, layers=layers, positions=args.position,
+            top_k=args.top_k,
+        )
+    if getattr(args, "json_output", False):
+        print(_json.dumps({
+            "model": args.model,
+            "prompt": args.prompt,
+            "positions": args.position or [-1],
+            "layers": {
+                str(layer): [
+                    [{"token": t, "logprob": round(lp, 4)} for t, lp in row]
+                    for row in rows
+                ]
+                for layer, rows in out.items()
+            },
+        }, indent=2))
+        return
+    positions = args.position or [-1]
+    for pos_idx, pos in enumerate(positions):
+        if len(positions) > 1:
+            print(f"\nposition {pos}:")
+        for layer in sorted(out):
+            row = out[layer][pos_idx]
+            toks = "  ".join(f"{t.strip() or repr(t)}" for t, _ in row)
+            print(f"  L{layer:>3}  {toks}")
+
+
+def _run_lens_decompose(args: argparse.Namespace) -> None:
+    import json as _json
+
+    from saklas.core.session import SaklasSession
+
+    layers = _parse_layer_list(args.layers)
+    _print_startup(args)
+    with SaklasSession.from_pretrained(
+        args.model, device=args.device, quantize=args.quantize, probes=[],
+    ) as session:
+        _print_model_info(session)
+        out = session.jspace_decompose(
+            args.selector, k=args.top_k, layers=layers,
+        )
+    shares = [share for share, _ in out.values()]
+    mean_share = sum(shares) / len(shares)
+    if getattr(args, "json_output", False):
+        print(_json.dumps({
+            "selector": args.selector,
+            "model": args.model,
+            "k": args.top_k,
+            "mean_share": round(mean_share, 4),
+            "layers": {
+                str(layer): {
+                    "share": round(share, 4),
+                    "tokens": [
+                        {"token": t, "coeff": round(c, 4)} for t, c in tokens
+                    ],
+                }
+                for layer, (share, tokens) in out.items()
+            },
+        }, indent=2))
+        return
+    print(f"J-space share of '{args.selector}' (k={args.top_k}):")
+    print(f"  mean over {len(out)} layers: {mean_share:.1%}")
+    for layer in sorted(out):
+        share, tokens = out[layer]
+        head = "  ".join(f"{t.strip() or repr(t)}" for t, _ in tokens[:6])
+        print(f"  L{layer:>3}  {share:>6.1%}  {head}")
+
+
+def _run_lens_rm(args: argparse.Namespace) -> None:
+    from saklas.io.lens import lens_paths, remove_lens
+
+    ts_path, _ = lens_paths(args.model)
+    if not ts_path.exists():
+        print(f"no fitted lens for {args.model}", file=sys.stderr)
+        sys.exit(1)
+    if not args.yes:
+        answer = input(f"Remove {ts_path}? [y/N] ").strip().lower()
+        if answer not in ("y", "yes"):
+            print("Aborted.")
+            return
+    remove_lens(args.model)
+    print(f"Removed lens artifact for {args.model}.")
+
+
+_LENS_RUNNERS = {
+    "fit":       _run_lens_fit,
+    "show":      _run_lens_show,
+    "top":       _run_lens_top,
+    "decompose": _run_lens_decompose,
+    "rm":        _run_lens_rm,
+}
+
+
+@_saklas_error_exit
+def _run_lens(args: argparse.Namespace) -> None:
+    """Dispatch ``saklas lens <verb>`` (the per-model Jacobian lens)."""
+    cmd = getattr(args, "lens_cmd", None)
+    if cmd is None:
+        print("usage: saklas lens <verb> [...]")
+        print()
+        width = max(len(v) for v, _ in _LENS_VERBS)
+        for v, desc in _LENS_VERBS:
+            print(f"  {v:<{width}}  {desc}")
+        print()
+        print("Run `saklas lens <verb> -h` for verb-specific options.")
+        sys.exit(0)
+    runner = _LENS_RUNNERS.get(cmd)
+    if runner is None:
+        print(f"unknown lens verb {cmd!r}", file=sys.stderr)
+        sys.exit(2)
+    runner(args)
+
+
 @_saklas_error_exit
 def _run_experiment(args: argparse.Namespace) -> None:
     """Dispatch ``saklas experiment <verb>``."""
@@ -2610,4 +2849,5 @@ _COMMAND_RUNNERS = {
     "config":     _run_config,
     "experiment": _run_experiment,
     "template":   _run_template,
+    "lens":       _run_lens,
 }

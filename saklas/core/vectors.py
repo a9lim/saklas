@@ -4,18 +4,13 @@ from __future__ import annotations
 
 import functools
 import json
-import logging
 import warnings
 from collections.abc import Sequence
-from contextlib import suppress
 from importlib import resources as _resources
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import torch
-from safetensors.torch import load_file, save_file
-
-log = logging.getLogger(__name__)
 
 
 # Default chunk size for the batched capture path (:func:`_encode_and_capture_all_batch`
@@ -67,7 +62,11 @@ def _capture_all_hidden_states(
         torch.arange(input_ids.shape[0], device=input_ids.device)
         if per_row else None
     )
-    _pos = pool_index.to(input_ids.device) if isinstance(pool_index, torch.Tensor) else None
+    _pos = (
+        cast(torch.Tensor, pool_index).to(input_ids.device)
+        if isinstance(pool_index, torch.Tensor)
+        else None
+    )
 
     def _make_hook(idx: int):
         def _hook(module: torch.nn.Module, input: Any, output: Any):
@@ -763,133 +762,17 @@ def save_profile(
     path: str | Path,
     metadata: dict[str, Any],
 ) -> None:
-    """Save a baked vector profile as .safetensors with a slim .json sidecar.
+    """Compatibility alias for :func:`saklas.core.profile.save_profile`."""
+    from saklas.core.profile import save_profile as _save_profile
 
-    ``metadata`` must contain at minimum:
-        method            - str, e.g. "merge" / "procrustes_transfer" /
-                            "neutral_activations" / "gguf_import"
-
-    Optional keys honored:
-        statements_sha256 - str, hash of the source neutral corpus at write time
-        components        - dict, merge provenance (method="merge" only)
-        diagnostics       - dict[int, dict[str, float]], per-layer probe-quality
-                            metrics (see ``_compute_layer_diagnostics``).
-                            Persisted as ``diagnostics_by_layer`` on the
-                            sidecar with stringified layer keys.
-
-    The safetensors file contains keys ``"layer_{i}"`` for each active layer.
-    Tensors are already baked (share pre-multiplied into magnitude) — the
-    sidecar carries only method/saklas_version plus the optional fields above.
-    """
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    # fp32 write invariant: every saklas safetensor writer enforces fp32
-    # on disk (matches gguf_io.py's ``.to(dtype=torch.float32)``), so the
-    # stored dtype is a guarantee rather than a coincidence of the caller.
-    tensors = {
-        f"layer_{idx}": vec.to(dtype=torch.float32).contiguous().cpu()
-        for idx, vec in profile.items()
-    }
-    save_file(tensors, str(path))
-
-    from saklas import __version__ as _saklas_version
-    from saklas.io.packs import PACK_FORMAT_VERSION
-    sidecar: dict[str, Any] = {
-        "format_version": PACK_FORMAT_VERSION,
-        "method": metadata.get("method", "unknown"),
-        "saklas_version": _saklas_version,
-    }
-    if "statements_sha256" in metadata:
-        sidecar["statements_sha256"] = metadata["statements_sha256"]
-    if "components" in metadata:
-        sidecar["components"] = metadata["components"]
-    # v2.1: bake method records which scoring metric drove share allocation
-    # (``"euclidean"`` = legacy ``||m||_2 / r``; ``"mahalanobis"`` =
-    # ``||m||_M / r`` via per-layer activation covariance).  Loaders read
-    # this only for diagnostics; the runtime hook reads tensor magnitudes
-    # regardless of bake flavor.  Default ``"euclidean"`` is back-compat
-    # for tensors written before the bake field existed.
-    if "bake" in metadata:
-        sidecar["bake"] = metadata["bake"]
-    # SAE provenance — present only when extraction used an SAE backend.
-    for key in ("sae_release", "sae_revision", "sae_ids_by_layer"):
-        if key in metadata:
-            sidecar[key] = metadata[key]
-    # Transfer provenance — present only on transferred profiles
-    # (method="procrustes_transfer").  ``alignment_map_hash`` pins the
-    # specific Procrustes fit; ``transfer_quality_estimate`` is the
-    # median per-layer R² across shared layers.
-    for key in (
-        "source_model_id",
-        "alignment_map_hash",
-        "transfer_quality_estimate",
-    ):
-        if key in metadata:
-            sidecar[key] = metadata[key]
-    # Diagnostics: stringify layer keys so the JSON round-trips through
-    # standard parsers (JSON object keys must be strings).  Reader inverts.
-    diagnostics = metadata.get("diagnostics")
-    if diagnostics:
-        sidecar["diagnostics_by_layer"] = {
-            str(layer): {k: float(v) for k, v in metrics.items()}
-            for layer, metrics in diagnostics.items()
-        }
-
-    from saklas.io.atomic import write_json_atomic
-    meta_path = path.with_suffix(".json")
-    write_json_atomic(meta_path, sidecar)
-
-    log.info("Saved profile (%d layers) to %s", len(profile), path)
+    _save_profile(profile, path, metadata)
 
 
 def load_profile(path: str | Path) -> tuple[dict[int, torch.Tensor], dict[str, Any]]:
-    """Load a baked vector profile and its metadata.
+    """Compatibility alias for :func:`saklas.core.profile.load_profile`."""
+    from saklas.core.profile import load_profile as _load_profile
 
-    Dispatches on file extension: ``.safetensors`` reads the companion
-    ``.json`` sidecar; ``.gguf`` reads the control-vector metadata embedded
-    in the GGUF header (see :mod:`saklas.gguf_io`). Both paths yield the
-    same ``(profile, metadata)`` shape — callers don't need to branch.
-
-    Returns:
-        (profile dict mapping layer_idx -> baked vector, metadata dict)
-    """
-    path = Path(path)
-    if path.suffix == ".gguf":
-        from saklas.io.gguf_io import read_gguf_profile
-        return read_gguf_profile(path)
-
-    tensors = load_file(str(path))
-    meta_path = path.with_suffix(".json")
-    with open(meta_path) as f:
-        metadata = json.load(f)
-
-    from saklas.io.packs import PACK_FORMAT_VERSION
-    from saklas.core.profile import ProfileError
-    fmt_ver = metadata.get("format_version", 1)
-    if not isinstance(fmt_ver, int) or fmt_ver < PACK_FORMAT_VERSION:
-        raise ProfileError(
-            f"pack format is from saklas < 2.0 "
-            f"(sidecar {meta_path} format_version={fmt_ver!r}, "
-            f"need >= {PACK_FORMAT_VERSION}); "
-            f"run `python scripts/upgrade_packs.py {path.parent}` to migrate"
-        )
-
-    profile = {int(key.split("_", 1)[1]): tensor for key, tensor in tensors.items()}
-
-    # Invert the layer-key stringification done at save time so diagnostics
-    # are addressable by ``int`` consistently with the profile dict.
-    raw_diag = metadata.get("diagnostics_by_layer")
-    if isinstance(raw_diag, dict) and raw_diag:
-        # Malformed diagnostics leave the raw dict in place; downstream readers
-        # can decide whether to fall back. The tensors themselves are still valid.
-        with suppress(TypeError, ValueError):
-            metadata["diagnostics"] = {
-                int(layer): dict(metrics)
-                for layer, metrics in raw_diag.items()
-            }
-
-    return profile, metadata
+    return _load_profile(path)
 
 
 def project_profile(

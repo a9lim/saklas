@@ -5,7 +5,7 @@ from __future__ import annotations
 from importlib import import_module
 from typing import TYPE_CHECKING, Any
 
-__version__ = "4.1.1"
+__version__ = "4.2.0"
 
 _EXPORTS: dict[str, tuple[str, str]] = {
     "SaklasSession": ("saklas.core.session", "SaklasSession"),
@@ -72,6 +72,12 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "AmbiguousSelectorError": ("saklas.io.selectors", "AmbiguousSelectorError"),
     "ManifoldNotRegisteredError": ("saklas.core.session", "ManifoldNotRegisteredError"),
     "VectorNotRegisteredError": ("saklas.core.session", "VectorNotRegisteredError"),
+    # Jacobian lens (the verbalizable-workspace readout)
+    "JacobianLens": ("saklas.core.jlens", "JacobianLens"),
+    "JSpaceDecomposition": ("saklas.core.jlens", "JSpaceDecomposition"),
+    "JacobianLensError": ("saklas.core.jlens", "JacobianLensError"),
+    "LensNotFittedError": ("saklas.core.jlens", "LensNotFittedError"),
+    "MultiTokenWordError": ("saklas.core.jlens", "MultiTokenWordError"),
 }
 
 __all__ = [
@@ -139,6 +145,12 @@ __all__ = [
     "AmbiguousSelectorError",
     "ManifoldNotRegisteredError",
     "VectorNotRegisteredError",
+    # Jacobian lens (the verbalizable-workspace readout)
+    "JacobianLens",
+    "JSpaceDecomposition",
+    "JacobianLensError",
+    "LensNotFittedError",
+    "MultiTokenWordError",
 ]
 
 
@@ -234,4 +246,11 @@ if TYPE_CHECKING:
     from saklas.core.session import (
         ManifoldNotRegisteredError as ManifoldNotRegisteredError,
         VectorNotRegisteredError as VectorNotRegisteredError,
+    )
+    from saklas.core.jlens import (
+        JacobianLens as JacobianLens,
+        JacobianLensError as JacobianLensError,
+        JSpaceDecomposition as JSpaceDecomposition,
+        LensNotFittedError as LensNotFittedError,
+        MultiTokenWordError as MultiTokenWordError,
     )

@@ -20,15 +20,15 @@ Key differences from real Ollama:
 
 from __future__ import annotations
 
-from saklas.server.app import (
-    acquire_session_lock,
-    _build_sampling_config,
-    _flatten_content,
-    _probe_reading_aggregate,
-    _probe_token_readings,
-    _merge_steering,
-    _parse_req_steering,
-    _strict_model_enabled,
+from saklas.server.app import acquire_session_lock
+from saklas.server.request_helpers import (
+    build_sampling_config,
+    flatten_content,
+    merge_steering,
+    parse_request_steering,
+    probe_reading_aggregate,
+    probe_token_readings,
+    strict_model_enabled,
 )
 from saklas.server.streaming import stream_finalizer
 
@@ -46,110 +46,26 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from saklas.core.errors import SaklasError
 from saklas.core.session import ConcurrentGenerationError, SaklasSession
 from saklas.core.steering import Steering
+from saklas.server.model_names import aliases_for_session, known_model_names
 
 log = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Model-name aliasing
-# ---------------------------------------------------------------------------
-#
-# Ollama model names are short and loose (`llama3.2`, `qwen2.5:7b`).  HF repo
-# ids are precise (`meta-llama/Llama-3.2-3B-Instruct`).  This table records a
-# few popular mappings so Ollama clients that pick a model from /api/tags get
-# meaningful aliases advertised for the currently-loaded session.
-#
-# The mapping is *advisory*: client requests may set `model` to anything, and
-# saklas always generates with the loaded session regardless.  The table only
-# affects what /api/tags and /api/show advertise.
+class OllamaBadRequest(ValueError, SaklasError):
+    """400-grade Ollama compatibility error for malformed request fields."""
 
-# Manual overrides for HF ids whose canonical Ollama tags need to match
-# Ollama's actual catalogue (e.g. Gemma-2-2b is ~2.6B params but Ollama
-# advertises it as `gemma2:2b`), plus cases where we want to advertise the
-# `:latest` tag or where model_type lacks the version number (Llama).
-# If an HF id appears here, inference is skipped — overrides are authoritative.
-_HF_TO_OLLAMA_ALIASES: dict[str, list[str]] = {
-    # Llama 3.x — model_type is just "llama", no version suffix to infer from
-    "meta-llama/Llama-3.2-1B-Instruct": ["llama3.2:1b", "llama3.2:1b-instruct"],
-    "meta-llama/Llama-3.2-3B-Instruct": ["llama3.2", "llama3.2:latest", "llama3.2:3b"],
-    "meta-llama/Meta-Llama-3.1-8B-Instruct": ["llama3.1", "llama3.1:latest", "llama3.1:8b"],
-    "meta-llama/Llama-3.3-70B-Instruct": ["llama3.3", "llama3.3:latest", "llama3.3:70b"],
-    # Qwen — override to match Ollama's rounded size tags
-    "Qwen/Qwen2.5-0.5B-Instruct": ["qwen2.5:0.5b"],
-    "Qwen/Qwen2.5-1.5B-Instruct": ["qwen2.5:1.5b"],
-    "Qwen/Qwen2.5-3B-Instruct": ["qwen2.5:3b"],
-    "Qwen/Qwen2.5-7B-Instruct": ["qwen2.5", "qwen2.5:latest", "qwen2.5:7b"],
-    "Qwen/Qwen3-4B-Instruct": ["qwen3:4b"],
-    "Qwen/Qwen3-8B": ["qwen3", "qwen3:latest", "qwen3:8b"],
-    # Gemma — Ollama advertises rounded sizes (2b not 2.6b, 9b not 9.2b)
-    "google/gemma-2-2b-it": ["gemma2:2b"],
-    "google/gemma-2-9b-it": ["gemma2", "gemma2:latest", "gemma2:9b"],
-    "google/gemma-3-4b-it": ["gemma3", "gemma3:latest", "gemma3:4b"],
-    # Mistral
-    "mistralai/Mistral-7B-Instruct-v0.3": ["mistral", "mistral:latest", "mistral:7b"],
-    "mistralai/Ministral-8B-Instruct-2410": ["ministral:8b"],
-    # Phi
-    "microsoft/Phi-3.5-mini-instruct": ["phi3.5", "phi3.5:latest"],
-}
-
-
-def _size_tag(params: int) -> str:
-    """Render parameter count as an Ollama-style size tag: 3b, 1.5b, 27b, 8x7b."""
-    if params <= 0:
-        return ""
-    if params >= 1_000_000_000:
-        b = params / 1_000_000_000
-        if b >= 10:
-            return f"{round(b)}b"
-        # Keep one decimal for sub-10B models, strip trailing zeros (1.0→1, 1.5→1.5).
-        return f"{b:.1f}".rstrip("0").rstrip(".") + "b"
-    if params >= 1_000_000:
-        return f"{round(params / 1_000_000)}m"
-    return ""
-
-
-def _normalise_family(model_type: str) -> str:
-    """Map an HF model_type to an Ollama-ish family name.
-
-    HF reports things like 'gemma3_text', 'qwen2_moe', 'llama'; Ollama uses
-    'gemma3', 'qwen2', 'llama'.  Strips the common suffixes without being
-    clever — unknown families pass through unchanged.
-    """
-    mt = (model_type or "").lower()
-    for suffix in ("_text", "_moe", "forcausallm"):
-        mt = mt.removesuffix(suffix)
-    return mt
-
-
-def _infer_aliases(session: SaklasSession) -> list[str]:
-    """Derive `<family>:<size>` aliases from model_info."""
-    info = session.model_info
-    family = _normalise_family(str(info.get("model_type", "")))
-    size = _size_tag(int(info.get("param_count", 0) or 0))
-    if not family or not size:
-        return []
-    return [f"{family}:{size}"]
+    def user_message(self) -> tuple[int, str]:
+        return 400, str(self)
 
 
 def _aliases_for(session: SaklasSession) -> list[str]:
-    """Return Ollama-style aliases for the loaded session.
-
-    If the HF id is in the manual override table, returns those entries
-    verbatim — overrides are authoritative and match Ollama's actual
-    catalogue (e.g. Ollama advertises Gemma-2-2b as `gemma2:2b` even though
-    it's actually 2.6B params).  Otherwise falls back to `<family>:<size>`
-    inferred from model_info so new architectures get sensible defaults
-    without a table update.
-    """
-    overrides = _HF_TO_OLLAMA_ALIASES.get(session.model_id)
-    if overrides:
-        return list(overrides)
-    return _infer_aliases(session)
+    """Backward-compatible wrapper for tests/imports; new code uses model_names."""
+    return aliases_for_session(session)
 
 
 def _known_model_names(session: SaklasSession) -> set[str]:
-    names = {session.model_id, *_aliases_for(session)}
-    return {n.lower() for n in names}
+    """Backward-compatible wrapper for tests/imports; new code uses model_names."""
+    return known_model_names(session)
 
 
 def _digest_of(name: str) -> str:
@@ -252,7 +168,7 @@ def _extract_messages(body: dict[str, Any]) -> list[dict[str, str]]:
             continue
         out.append({
             "role": str(m.get("role", "user")),
-            "content": _flatten_content(m.get("content")),
+            "content": flatten_content(m.get("content")),
         })
     return out
 
@@ -288,8 +204,37 @@ def _resolve_options(
     Non-standard saklas fields (accepted at the top level or inside options):
     ``steer`` (a steering expression string), ``think`` (bool).
     """
-    opts = dict(body.get("options") or {})
+    raw_options = body.get("options") or {}
+    if not isinstance(raw_options, dict):
+        raise OllamaBadRequest("Ollama 'options' must be an object")
+    opts = dict(raw_options)
     top_system = body.get("system")
+
+    def _number_option(name: str, default: float | None = None) -> float | None:
+        raw = opts.get(name)
+        if raw is None:
+            return default
+        try:
+            value = float(raw)
+        except (TypeError, ValueError) as e:
+            raise OllamaBadRequest(
+                f"Ollama option '{name}' must be a finite number"
+            ) from e
+        if not math.isfinite(value):
+            raise OllamaBadRequest(
+                f"Ollama option '{name}' must be a finite number"
+            )
+        return value
+
+    def _int_option(name: str, raw: Any) -> int | None:
+        if raw is None:
+            return None
+        try:
+            return int(raw)
+        except (TypeError, ValueError) as e:
+            raise OllamaBadRequest(
+                f"Ollama option '{name}' must be an integer"
+            ) from e
 
     stop_raw = opts.get("stop") or body.get("stop")
     if isinstance(stop_raw, str):
@@ -299,27 +244,32 @@ def _resolve_options(
     else:
         stop_tuple = None
 
-    temperature = opts.get("temperature")
-    top_p = opts.get("top_p")
+    temperature = _number_option("temperature")
+    top_p = _number_option("top_p")
     top_k_raw = opts.get("top_k")
-    try:
-        top_k = int(top_k_raw) if top_k_raw is not None else None
-    except (TypeError, ValueError):
-        top_k = None
+    top_k = _int_option("top_k", top_k_raw)
     if top_k is not None and top_k <= 0:
         top_k = None
-    max_tokens = opts.get("num_predict") or body.get("num_predict")
+    max_tokens = (
+        opts.get("num_predict")
+        if "num_predict" in opts
+        else body.get("num_predict")
+    )
     seed = opts.get("seed")
-    presence_penalty = float(opts.get("presence_penalty", 0.0) or 0.0)
-    frequency_penalty = float(opts.get("frequency_penalty", 0.0) or 0.0)
+    presence_penalty = _number_option("presence_penalty", 0.0) or 0.0
+    frequency_penalty = _number_option("frequency_penalty", 0.0) or 0.0
     repeat_raw = opts.get("repeat_penalty")
     if repeat_raw is not None and presence_penalty == 0.0:
         try:
             rp = float(repeat_raw)
+            if not math.isfinite(rp):
+                raise ValueError
             if rp > 1.0:
                 presence_penalty = math.log(rp)
-        except (TypeError, ValueError):
-            pass
+        except (TypeError, ValueError) as e:
+            raise OllamaBadRequest(
+                "Ollama option 'repeat_penalty' must be a finite number"
+            ) from e
 
     ignored = [k for k in opts if k not in _PROCESSED_OPTIONS]
     if ignored:
@@ -328,14 +278,14 @@ def _resolve_options(
     # Ollama-unique: `steer` rides `options` or the top level, must be a
     # string (non-string is a clear client error rather than a parse
     # failure).  The string-parse + key-level merge are the shared
-    # ``_parse_req_steering`` / ``_merge_steering`` the OpenAI path uses.
+    # ``parse_request_steering`` / ``merge_steering`` the OpenAI path uses.
     steer_raw = opts["steer"] if "steer" in opts else body.get("steer")
     if steer_raw is not None and not isinstance(steer_raw, str):
-        raise ValueError(
+        raise OllamaBadRequest(
             "Ollama 'steer' must be a steering expression string, "
             "e.g. \"0.5 honest + 0.3 warm\""
         )
-    req_steering, explicit_clear = _parse_req_steering(steer_raw)
+    req_steering, explicit_clear = parse_request_steering(steer_raw)
 
     # Ollama-unique thinking precedence: the steer expression's flag is
     # the base, the top-level ``think`` bool wins when present.
@@ -346,17 +296,17 @@ def _resolve_options(
     if think_flag is not None:
         thinking = bool(think_flag)
 
-    sc = _build_sampling_config(
+    sc = build_sampling_config(
         temperature=temperature,
         top_p=top_p,
         top_k=top_k,
-        max_tokens=int(max_tokens) if max_tokens is not None else None,
+        max_tokens=_int_option("num_predict", max_tokens),
         seed=seed,
         stop=stop_tuple,
         presence_penalty=presence_penalty,
         frequency_penalty=frequency_penalty,
     )
-    steering = _merge_steering(
+    steering = merge_steering(
         req_steering, default_steering, explicit_clear, thinking,
     )
 
@@ -504,7 +454,7 @@ def register_ollama_routes(app: FastAPI) -> None:
     @app.post("/api/push")
     async def api_push():
         return JSONResponse(status_code=501, content={
-            "error": "saklas does not implement /api/push. Use `saklas manifold push` to publish a manifold.",
+            "error": "saklas does not implement /api/push. Use `saklas pack push` to publish a manifold.",
         })
 
     @app.post("/api/create")
@@ -550,7 +500,7 @@ def register_ollama_routes(app: FastAPI) -> None:
 
     def _check_model_or_404(body: dict[str, Any]) -> None:
         """In strict mode, reject requests whose `model` doesn't match the loaded session."""
-        if not _strict_model_enabled():
+        if not strict_model_enabled():
             return
         name = str(body.get("model") or "")
         if name and name.lower() not in _known_model_names(session):
@@ -583,7 +533,7 @@ def register_ollama_routes(app: FastAPI) -> None:
             input_payload: Any = msgs
             raw = False
         else:
-            prompt = _flatten_content(body.get("prompt", ""))
+            prompt = flatten_content(body.get("prompt", ""))
             if system:
                 # /api/generate's `system` field belongs at the top of the
                 # chat template.  Route through the chat path to honour it.
@@ -620,7 +570,7 @@ def register_ollama_routes(app: FastAPI) -> None:
 
         model_name = str(body.get("model") or session.model_id)
         created_at = _now_iso()
-        done_reason = _finish_to_done_reason(session.generation_state.finish_reason)
+        done_reason = _finish_to_done_reason(getattr(result, "finish_reason", None))
         stats = _duration_stats(result, elapsed_ns)
 
         # Saklas-specific extension: per-attached-manifold-probe aggregate
@@ -629,7 +579,7 @@ def register_ollama_routes(app: FastAPI) -> None:
         # unaffected.  Mirrors the OpenAI extension shape on the choice
         # ("x-saklas-probe-readings"), at the top level here because
         # Ollama responses have no per-choice container to hang it off.
-        mf_agg = _probe_reading_aggregate(session)
+        mf_agg = probe_reading_aggregate(session, result)
 
         if is_chat:
             payload: dict[str, Any] = {
@@ -686,7 +636,7 @@ def register_ollama_routes(app: FastAPI) -> None:
             input_payload: Any = msgs
             raw = False
         else:
-            prompt = _flatten_content(body.get("prompt", ""))
+            prompt = flatten_content(body.get("prompt", ""))
             if system:
                 input_payload = [
                     {"role": "system", "content": system},
@@ -759,7 +709,7 @@ def register_ollama_routes(app: FastAPI) -> None:
                     # vendor-prefixed extension as the non-streaming
                     # path; populated only when at least one manifold
                     # probe is attached and ``live_scores`` is on.
-                    mf_token = _probe_token_readings(event)
+                    mf_token = probe_token_readings(event)
                     if mf_token is not None:
                         chunk["x-saklas-probe-readings"] = mf_token
                     yield json.dumps(chunk) + "\n"
@@ -800,7 +750,10 @@ def register_ollama_routes(app: FastAPI) -> None:
                     close()
 
             elapsed_ns = time.monotonic_ns() - start_ns
-            result = session.last_result
+            result = (
+                getattr(stream_iter, "result", None)
+                or getattr(session, "last_result", None)
+            )
             finish_reason, _usage, mf_agg = stream_finalizer(session, result)
             done_reason = _finish_to_done_reason(finish_reason)
             stats = _duration_stats(result, elapsed_ns) if result is not None else {

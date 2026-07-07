@@ -108,8 +108,10 @@ ignore = ["E501", "E741", "E402", "E731"]
 # Pyright — whole-project type checking.  Historically scoped to the
 # public-API surface because the engine/CLI/server/TUI layers lean on
 # torch/transformers/fastapi/textual internals whose stubs are uneven;
-# the tree is now fully annotated, so the checker runs across everything
-# and the strict rules below hold project-wide.
+# the maintained library, tests, examples, and utility scripts are now fully
+# annotated, so the strict rules below hold across those surfaces. Exploratory
+# research experiments stay out of the strict gate; they are linted, but not
+# required to carry production-grade annotations while hypotheses are moving.
 #
 # ``standard`` mode (rather than ``strict``) is deliberate: ``strict``
 # turns on ``reportUnknown*`` and those fire constantly on legitimate
@@ -125,7 +127,7 @@ include = [
     "scripts",
     "examples",
 ]
-exclude = ["**/__pycache__", "**/node_modules"]
+exclude = ["**/__pycache__", "**/node_modules", "scripts/experiments"]
 pythonVersion = "3.11"
 typeCheckingMode = "standard"
 reportMissingTypeStubs = false

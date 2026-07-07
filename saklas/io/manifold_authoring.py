@@ -72,6 +72,31 @@ def iter_manifold_folders(
                 continue
 
 
+#: Namespaces no manifold may be authored under. ``jlens`` is the steering
+#: grammar's lazily-resolved Jacobian-lens tier (``jlens/<word>`` = a lens
+#: token direction) — a manifold folder there would shadow that resolution.
+RESERVED_NAMESPACES = frozenset({"jlens"})
+
+
+def _validate_ns_name(namespace: str, name: str) -> None:
+    """Shared name/namespace gate for every folder-creation entry point."""
+    if not NAME_REGEX.match(name):
+        raise ManifoldFormatError(
+            f"manifold name {name!r} invalid; must match {NAME_REGEX.pattern}"
+        )
+    if not NAME_REGEX.match(namespace):
+        raise ManifoldFormatError(
+            f"manifold namespace {namespace!r} invalid; "
+            f"must match {NAME_REGEX.pattern}"
+        )
+    if namespace in RESERVED_NAMESPACES:
+        raise ManifoldFormatError(
+            f"manifold namespace {namespace!r} is reserved — "
+            f"'jlens/<word>' resolves through the model's Jacobian lens, "
+            f"not a manifold folder"
+        )
+
+
 def _validate_authored_nodes(name: str, domain: Any, nodes: Any) -> None:
     """Validate a webui/CLI-authored node list against the domain.
 
@@ -182,15 +207,7 @@ def create_manifold_folder(
     Raises :class:`ManifoldFormatError` on any validation failure and
     :class:`FileExistsError` when a manifold already lives at the path.
     """
-    if not NAME_REGEX.match(name):
-        raise ManifoldFormatError(
-            f"manifold name {name!r} invalid; must match {NAME_REGEX.pattern}"
-        )
-    if not NAME_REGEX.match(namespace):
-        raise ManifoldFormatError(
-            f"manifold namespace {namespace!r} invalid; "
-            f"must match {NAME_REGEX.pattern}"
-        )
+    _validate_ns_name(namespace, name)
     try:
         domain = domain_from_spec(domain_spec)
     except (ValueError, KeyError) as e:
@@ -331,7 +348,6 @@ def create_discover_manifold_folder(
     hyperparams: Optional[dict[str, Any]] = None,
     node_roles: Optional[dict[str, str | None]] = None,
     node_kinds: Optional[dict[str, str | None]] = None,
-    scenarios: Optional[list[str]] = None,
     template_ref: Optional[str] = None,
 ) -> Path:
     """Author a fresh discover-mode manifold artifact folder on disk.
@@ -342,10 +358,10 @@ def create_discover_manifold_folder(
     empty ``files`` manifest) and the ``nodes/`` corpus.  Returns the
     folder path.
 
-    ``scenarios`` (when given) is persisted to ``scenarios.json`` as the
-    generation-provenance record — the discover-manifold analogue of the
-    vector pipeline's ``scenarios.json``, so a later re-fit/refresh can
-    regenerate against the same shared domains instead of drifting.
+    Current A2 conversational corpora use the bundled global baseline prompts,
+    not per-manifold scenario lists. Legacy ``scenarios.json`` writing is kept
+    behind :func:`port_legacy_vector_folder` so old vector packs can be ported
+    faithfully without re-exposing scenario provenance on new authoring paths.
 
     Coords are derived per-model at fit time
     (:func:`saklas.core.manifold.discover_coords` runs over the per-node
@@ -362,15 +378,36 @@ def create_discover_manifold_folder(
     ``vector transfer`` path builds and writes a ``_from-<safe_src>``
     variant tensor, mirroring how transferred steering vectors land.
     """
-    if not NAME_REGEX.match(name):
-        raise ManifoldFormatError(
-            f"manifold name {name!r} invalid; must match {NAME_REGEX.pattern}"
-        )
-    if not NAME_REGEX.match(namespace):
-        raise ManifoldFormatError(
-            f"manifold namespace {namespace!r} invalid; "
-            f"must match {NAME_REGEX.pattern}"
-        )
+    return _create_discover_manifold_folder(
+        namespace, name, description,
+        fit_mode=fit_mode,
+        node_corpora=node_corpora,
+        hyperparams=hyperparams,
+        node_roles=node_roles,
+        node_kinds=node_kinds,
+        template_ref=template_ref,
+    )
+
+
+def _create_discover_manifold_folder(
+    namespace: str,
+    name: str,
+    description: str,
+    *,
+    fit_mode: str,
+    node_corpora: dict[str, list[str]],
+    hyperparams: Optional[dict[str, Any]] = None,
+    node_roles: Optional[dict[str, str | None]] = None,
+    node_kinds: Optional[dict[str, str | None]] = None,
+    template_ref: Optional[str] = None,
+    legacy_scenarios: Optional[list[str]] = None,
+) -> Path:
+    """Internal discover writer.
+
+    ``legacy_scenarios`` exists only for legacy vector-folder migration. New
+    discover authoring must not write per-manifold scenario provenance.
+    """
+    _validate_ns_name(namespace, name)
     if fit_mode not in _FIT_MODES_DISCOVER:
         raise ManifoldFormatError(
             f"discover manifold {name!r} fit_mode {fit_mode!r} invalid; "
@@ -433,8 +470,8 @@ def create_discover_manifold_folder(
     if template_ref is not None:
         payload["template_ref"] = template_ref
     write_json_atomic(folder / "manifold.json", payload)
-    if scenarios is not None:
-        write_manifold_scenarios(folder, scenarios)
+    if legacy_scenarios is not None:
+        write_manifold_scenarios(folder, legacy_scenarios)
     return folder
 
 
@@ -476,15 +513,7 @@ def create_baked_manifold_folder(
     :class:`FileExistsError` when a manifold already lives at the path and
     ``force`` is ``False``.
     """
-    if not NAME_REGEX.match(name):
-        raise ManifoldFormatError(
-            f"manifold name {name!r} invalid; must match {NAME_REGEX.pattern}"
-        )
-    if not NAME_REGEX.match(namespace):
-        raise ManifoldFormatError(
-            f"manifold namespace {namespace!r} invalid; "
-            f"must match {NAME_REGEX.pattern}"
-        )
+    _validate_ns_name(namespace, name)
 
     folder = manifold_dir(namespace, name)
     if (folder / "manifold.json").exists():
@@ -646,12 +675,12 @@ def port_legacy_vector_folder(
             )
         shutil.rmtree(target)
 
-    create_discover_manifold_folder(
+    _create_discover_manifold_folder(
         namespace, name, description,
         fit_mode="pca",
         node_corpora={pos_label: pos_corpus, neg_label: neg_corpus},
         hyperparams={"max_dim": 1, "var_threshold": 0.70},
-        scenarios=scenarios,
+        legacy_scenarios=scenarios,
     )
     mf = ManifoldFolder.load(target)
     if tags:
@@ -705,15 +734,7 @@ def init_discover_manifold_folder(
     label / role, and :class:`FileExistsError` when a manifold already
     lives at the path.
     """
-    if not NAME_REGEX.match(name):
-        raise ManifoldFormatError(
-            f"manifold name {name!r} invalid; must match {NAME_REGEX.pattern}"
-        )
-    if not NAME_REGEX.match(namespace):
-        raise ManifoldFormatError(
-            f"manifold namespace {namespace!r} invalid; "
-            f"must match {NAME_REGEX.pattern}"
-        )
+    _validate_ns_name(namespace, name)
     if fit_mode not in _FIT_MODES_DISCOVER:
         raise ManifoldFormatError(
             f"discover manifold {name!r} fit_mode {fit_mode!r} invalid; "

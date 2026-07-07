@@ -55,6 +55,12 @@ class TraitPanel(SelectableListWidget):
         self._manifold_readings: dict[str, "ProbeReading"] = {}
         self._manifold_aggregates: dict[str, "ProbeReading"] = {}
         self._cached_manifold_text: str = ""
+        # Live J-lens workspace readout (``/lens``): the layer list the
+        # session's ``enable_live_lens`` resolved (None = section hidden) and
+        # the latest per-step ``{layer: [(token, score), ...]}`` payload.
+        self._lens_layers: list[int] | None = None
+        self._lens_readout: dict[int, list[tuple[str, float]]] = {}
+        self._cached_lens_text: str = ""
 
     def compose(self) -> ComposeResult:
         yield Static(
@@ -68,6 +74,10 @@ class TraitPanel(SelectableListWidget):
         yield VerticalScroll(
             Static("", id="manifold-content"), id="manifold-scroll",
         )
+        yield Static("", id="lens-header", classes="section-header")
+        yield VerticalScroll(
+            Static("", id="lens-content"), id="lens-scroll",
+        )
         yield Static("[dim]⌫ remove · ⌃S sort · ⌃Y highlight[/]",
                       id="trait-hints")
         yield Static("[bold]WHY[/]", id="why-header", classes="section-header")
@@ -78,10 +88,13 @@ class TraitPanel(SelectableListWidget):
         self._trait_content = self.query_one("#trait-content", Static)
         self._manifold_header = self.query_one("#manifold-header", Static)
         self._manifold_content = self.query_one("#manifold-content", Static)
+        self._lens_header = self.query_one("#lens-header", Static)
+        self._lens_content = self.query_one("#lens-content", Static)
         self._why_header = self.query_one("#why-header", Static)
         self._why_content = self.query_one("#why-content", Static)
         # Initial render so empty-state surfaces don't print None.
         self._render_manifold_probes()
+        self._render_lens()
 
     def set_active_probes(self, probe_names: set[str]) -> None:
         self._active_probes = probe_names
@@ -343,6 +356,62 @@ class TraitPanel(SelectableListWidget):
         if text != self._cached_manifold_text:
             self._cached_manifold_text = text
             self._manifold_content.update(text)
+
+    # ------------------------------------------------- live lens readout --
+
+    def set_lens_active(self, layers: list[int] | None) -> None:
+        """Arm/disarm the WORKSPACE (J-lens) section.
+
+        ``layers`` is the resolved layer list from
+        ``session.enable_live_lens`` — ``None`` hides the section and drops
+        any stale readout.
+        """
+        self._lens_layers = list(layers) if layers is not None else None
+        if layers is None:
+            self._lens_readout = {}
+        self._render_lens()
+
+    def update_lens_readout(
+        self, readout: dict[int, list[tuple[str, float]]],
+    ) -> None:
+        """Push one decode step's lens readout (``{layer: [(token, score)]}``)."""
+        self._lens_readout = dict(readout)
+        self._render_lens()
+
+    def clear_lens_readout(self) -> None:
+        self._lens_readout = {}
+        self._render_lens()
+
+    def _render_lens(self) -> None:
+        if not hasattr(self, "_lens_header"):
+            return
+        if self._lens_layers is None:
+            self._lens_header.update("")
+            self._lens_content.update("")
+            self._cached_lens_text = ""
+            return
+        self._lens_header.update("[bold]WORKSPACE[/] [dim](J-lens)[/]")
+        lines: list[str] = []
+        for layer in self._lens_layers:
+            row = self._lens_readout.get(layer)
+            if not row:
+                lines.append(f" [dim]L{layer:<3} —[/]")
+                continue
+            toks = "  ".join(
+                f"[ansi_cyan]{self._lens_token_markup(tok)}[/]"
+                for tok, _ in row
+            )
+            lines.append(f" [dim]L{layer:<3}[/] {toks}")
+        text = "\n".join(lines)
+        if text != self._cached_lens_text:
+            self._cached_lens_text = text
+            self._lens_content.update(text)
+
+    @staticmethod
+    def _lens_token_markup(token: str) -> str:
+        """Rich-escape a raw vocab token for the readout row."""
+        cleaned = token.strip() or repr(token)
+        return cleaned.replace("[", r"\[")
 
     def _render_minimap(
         self,

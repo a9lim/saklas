@@ -461,6 +461,14 @@ def test_pole_composite_name_resolves_to_node0(tmp_path: Path) -> None:
     assert term.along == 0.5
 
 
+def test_registered_profile_can_shadow_installed_manifold(tmp_path: Path) -> None:
+    _mk(tmp_path, "default", "deer.wolf")
+    _mk(tmp_path, "local", "deer.wolf")
+    sel.invalidate()
+    s = parse_expr("0.5 deer.wolf", profile_names={"deer.wolf"})
+    assert s.alphas == {"deer.wolf": 0.5}
+
+
 # -------------------------------------------------------- format/round-trip ---
 
 def test_format_single():

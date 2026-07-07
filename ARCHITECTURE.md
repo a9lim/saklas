@@ -877,9 +877,42 @@ win is memory, not throughput.)
 canonical scalar key `Monitor.flat_scalars` emits — a coordinate axis
 (`"confident.uncertain"` = axis 0, or `"personas[3]"` = axis 3 via the
 `@when:<probe>[<i>]` grammar), a subspace fraction (`"emotions:fraction"`), or a label
-similarity (`"emotions@happy"`). The runtime lookup is identical for every shape; only
+similarity (`"emotions@happy"`). Every shape composes with a leading `<ns>/`
+segment (`"jlens/fake"`, `"default/emotions@happy"`), stored verbatim. The
+runtime lookup is identical for every shape; only
 the parser knows the difference. Gated triggers report inactive during prefill (no
 reading yet) and for missing probes (no raise).
+
+### 6.4 The Jacobian lens (verbalizable-workspace reads)
+
+A second, per-model read primitive alongside the whitened probe reads (Gurnee
+et al., Transformer Circuits 2026). `core/jlens.py` fits
+`J_l = E[∂h_final/∂h_l]` per source layer over a web-text corpus — the only
+backward passes in saklas (the estimator seeds an autograd leaf at the first
+block's input under `torch.enable_grad()` and reads per-layer grads with
+`tensor.register_hook`; everything else stays `inference_mode`). The artifact
+(`io/lens.py`, `models/<safe_id>/jlens.safetensors`, fp16) then supports four
+consumers with zero hot-path cost when unused:
+
+- the **readout** `softmax(W_U · norm(J_l h))` (`session.jlens_readout`
+  offline; `enable_live_lens` per decode step at the token tap — no forward
+  hooks, so steering fast-path/compile eligibility is untouched);
+- **steering atoms**: `jlens/<word>` lowers to the per-layer direction
+  `W_U[v] @ J_l` registered lazily as an ordinary profile — it folds, pushes,
+  ablates, and projects like any extracted vector, but restricted to the
+  workspace band (40–90% depth): in the motor regime the direction converges
+  on the raw unembedding row, so pushing there is token-forcing, not concept
+  induction (live-verified: unrestricted, it shatters into token loops at
+  every α). Lens atoms run hotter than concept vectors — α≈0.3 is the
+  gemma-3-4b sweet spot;
+- **gates**: `@when:jlens/<word>` attaches the same direction as a rank-1
+  probe. Deliberate semantics: the gate reads the saklas-native *whitened
+  coordinate* along the direction (one gate pipeline, whitener required), not
+  the paper's raw inner product — the raw view lives in the readout channel,
+  which writes no gate scalars;
+- the **J-space decomposition** (`sparse_nonneg_decompose`): greedy pursuit of
+  any direction against the dictionary `W_U J_l` (never materialized), the
+  per-layer *verbalizable share* + contributing tokens.
 
 ---
 
@@ -895,8 +928,8 @@ selector := atom (("~" | "|") atom | "%" position)?
 position := signed_num ("," signed_num)* | label
 atom     := [ns "/"] NAME ["." NAME] [":" variant]
 trigger  := preset | "when" ":" probe op NUM
-probe    := NAME ["." NAME] ["[" INT "]"]   # vector probe, optional coord axis
-          | NAME ":" "fraction" | NAME "@" NAME   # manifold channels
+probe    := [ns "/"] NAME ["." NAME] ["[" INT "]"]   # vector probe (jlens/fake ok), optional coord axis
+          | [ns "/"] NAME ":" "fraction" | [ns "/"] NAME "@" NAME   # manifold channels
 ```
 
 `+`/`−` add terms, `*` attaches a coefficient, `~` projects onto a direction
@@ -909,7 +942,9 @@ resolves in `core/steering_expr`: first as a bipolar pole/name of a 2-node `pca`
 manifold (`resolve_pole`/`resolve_manifold_name`), then via
 `io.selectors.resolve_bare_name` (the manifold-label tier) as a multi-node manifold
 node label (synthesizing a label-form `ManifoldTerm`); cross-tier ambiguity raises.
-Term types (`ProjectedTerm`/`AblationTerm`/
+The `jlens` namespace is reserved: `jlens/<word>` parses as an ordinary `ns/name`
+atom but resolves at dispatch through the fitted Jacobian lens (§6.4), and no
+manifold may be authored under it. Term types (`ProjectedTerm`/`AblationTerm`/
 `ManifoldTerm` + plain tuples) survive as parse-time markers the dispatch
 synthesizer consumes.
 
@@ -998,6 +1033,15 @@ straight-chord additive baseline alongside.
   `node_coords` as-is. Authored manifolds (shared coords) transfer cleanly.
 - **MPS non-determinism.** Metal kernels are not bitwise deterministic even at
   temperature 0, so run-to-run wording jitters; compare qualitatively.
+- **J-lens single-token vocabulary.** The lens (§6.4) can only name concepts
+  that are single tokens: `jlens/<word>` raises on multi-token words, and a
+  concept the model represents diffusely across pieces won't surface cleanly in
+  the readout (the paper's own stated limitation). Multi-token direction
+  synthesis is an open extension. Relatedly, the gate channel reads a
+  *whitened coordinate* along the lens direction while the paper's experiments
+  use raw inner products — the two orderings usually agree but are not
+  identical; a raw-score gate channel would be a small addition if the
+  distinction ever matters for a replication.
 
 ---
 

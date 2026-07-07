@@ -74,6 +74,11 @@ class SamplingConfig:
     # set true by the native dashboard only while the inspector is open.  Forces
     # per-token incremental scoring (else no per-token reading is produced).
     persist_subspace_coords: bool = False
+    # Return final aggregate probe readings on the result.  True preserves the
+    # existing API contract.  False is a real control-path optimization for
+    # probe-gated generation: the session can capture only layers needed by the
+    # gate and skip the full-roster aggregate at finalization.
+    return_probe_readings: bool = True
 
     def __post_init__(self) -> None:
         # Accept list[str] from callers; store as tuple so the frozen
@@ -112,6 +117,7 @@ class SamplingConfig:
         "assistant_role": None,
         "persist_per_layer_scores": False,
         "persist_subspace_coords": False,
+        "return_probe_readings": True,
     }
 
     def merged_with(self, other: "SamplingConfig | None") -> "SamplingConfig":

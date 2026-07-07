@@ -5,8 +5,9 @@ The pack *format/distribution* surface (``PackMetadata`` / ``Sidecar`` /
 ``is_stale`` / ``version_mismatch`` / ``bundled_concept_names``) was retired
 when concepts collapsed into manifolds.  What remains in ``io.packs`` is the
 cross-cutting integrity infra — ``hash_file`` / ``verify_integrity`` — plus the
-``save_profile`` / ``load_profile`` tensor-dict cache helpers (now in
-``core.vectors``).  This module covers exactly those.
+``save_profile`` / ``load_profile`` tensor-dict cache helpers (owned by
+``core.profile`` and still aliased from ``core.vectors``).  This module covers
+exactly those.
 """
 from pathlib import Path
 

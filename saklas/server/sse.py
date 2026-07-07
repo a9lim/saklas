@@ -73,7 +73,13 @@ def progress_sse_response(
                         break
             finally:
                 if not task.done():
-                    task.cancel()
+                    # Keep the lock owned by the real worker lifetime.  Many
+                    # callers run blocking model/artifact work via
+                    # ``asyncio.to_thread``; cancelling this wrapper only
+                    # cancels the await, not the thread.  Await completion so a
+                    # disconnected SSE client cannot release ``session.lock``
+                    # while the underlying job is still mutating session state
+                    # or writing artifacts.
                     with suppress(BaseException):
                         await task
 

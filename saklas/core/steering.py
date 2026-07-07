@@ -82,7 +82,7 @@ class Steering:
 
     @classmethod
     def from_value(
-        cls, value: object,
+        cls, value: object, *, profile_names: set[str] | None = None,
     ) -> "Steering | None":
         """Coerce a string / Steering / None into a Steering or None.
 
@@ -98,7 +98,7 @@ class Steering:
             return value
         if isinstance(value, str):
             from saklas.core.steering_expr import parse_expr
-            return parse_expr(value)
+            return parse_expr(value, profile_names=profile_names)
         raise TypeError(
             f"Steering.from_value expects str | Steering | None, "
             f"got {type(value).__name__}"

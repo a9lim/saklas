@@ -236,6 +236,31 @@ def test_fit_cache_hit_skips_forward_passes(tmp_path: Path, monkeypatch: pytest.
     assert manifold.name == "mood"
 
 
+def test_fit_force_bypasses_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``force=True`` re-pools/re-fits even when the cache is valid.
+
+    The discover/multi-node analogue of ``manifold extract -f``: with the corpus
+    unchanged, a plain refit cache-hits (previous test), so a code-level fit
+    change (e.g. the topology-selection dim-match fix) can only be picked up via
+    ``force``.
+    """
+    folder = _author_manifold(tmp_path)
+    pipe = ManifoldExtractionPipeline(_Handle(), EventBus())
+    pipe.fit(folder)
+
+    calls = {"n": 0}
+    real = _stub_encoder_batch
+
+    def _counting(*args: Any, **kwargs: Any) -> dict[int, torch.Tensor]:
+        calls["n"] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(V, "_encode_and_capture_all_batch", _counting)
+    manifold = pipe.fit(folder, force=True)  # corpus unchanged, but forced
+    assert calls["n"] > 0        # cache bypassed, forward passes re-run
+    assert manifold.name == "mood"
+
+
 def test_fit_cache_miss_on_corpus_change(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     folder = _author_manifold(tmp_path)
     pipe = ManifoldExtractionPipeline(_Handle(), EventBus())

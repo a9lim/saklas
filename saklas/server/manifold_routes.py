@@ -17,7 +17,7 @@ import asyncio
 import json
 import logging
 import shutil
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Literal, cast
 
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -137,12 +137,11 @@ class TemplatePairSpec(BaseModel):
 class CreateTemplatedManifoldRequest(BaseModel):
     """Author a templated discover manifold from a slot + values + pair set.
 
-    The server expands ``slot`` across ``values`` into per-value node corpora
-    (the slot-filled assistant turns) and writes a discover folder carrying the
-    ``template`` block — re-expansion provenance plus the user-turn elicitation
-    prompts the fit pools against. The right tool for categories one references
-    rather than embodies (days, months, colours, directions). Pair with
-    ``POST .../fit`` (``fit_mode`` auto suits cyclic categories).
+    The server writes a standalone template, expands ``slot`` across ``values``
+    into per-value node corpora, and writes a discover folder carrying a
+    ``template_ref`` back to that source template. The right tool for categories
+    one references rather than embodies (days, months, colours, directions).
+    Pair with ``POST .../fit`` (``fit_mode`` auto suits cyclic categories).
     """
 
     namespace: str = "local"
@@ -153,6 +152,7 @@ class CreateTemplatedManifoldRequest(BaseModel):
     values: list[str]
     pairs: list[TemplatePairSpec]
     hyperparams: dict[str, Any] = {}
+    force: bool = False
 
 
 class GenerateManifoldRequest(BaseModel):
@@ -588,14 +588,14 @@ def register_manifold_routes(app: FastAPI) -> None:
             create_template_folder(
                 req.namespace, req.name,
                 slot=req.slot, values=list(req.values), contexts=contexts,
-                description=req.description, force=True,
+                description=req.description, force=req.force,
             )
             folder = create_manifold_from_template(
                 req.namespace, req.name, req.description,
                 template_ref=f"{req.namespace}/{req.name}",
                 fit_mode=req.fit_mode,
                 hyperparams=req.hyperparams or None,
-                force=True,
+                force=req.force,
             )
         except FileExistsError as e:
             raise HTTPException(409, str(e)) from e
@@ -800,12 +800,13 @@ def register_manifold_routes(app: FastAPI) -> None:
 
             def _format_error(e: Exception) -> dict[str, Any] | None:
                 if isinstance(e, HTTPException):
+                    http_error = cast(HTTPException, e)
                     # The generate job only raises HTTPException to wrap a
                     # ManifoldFormatError, whose detail embeds the on-disk
                     # manifold path.  Log the detail server-side and surface a
                     # path-free frame (SSE info-disclosure discipline — see
                     # server/AGENTS.md).
-                    log.warning("manifold generate: format error: %s", e.detail)
+                    log.warning("manifold generate: format error: %s", http_error.detail)
                     return {
                         "message": "manifold has an unsupported on-disk format",
                         "code": "ManifoldFormatError",
@@ -924,21 +925,14 @@ def register_manifold_routes(app: FastAPI) -> None:
         if not (folder / "manifold.json").exists():
             raise HTTPException(404, f"manifold {namespace}/{name} not found")
 
-        # Discover-mode hyperparam overrides: write to the folder
-        # manifest *before* the fit so the cache key reflects the
-        # actual fit inputs.  Authored folders ignore these fields
-        # (FitManifoldRequest accepts them, the discriminator below
-        # gates the rewrite).
-        if req.fit_mode is not None or req.hyperparams is not None:
-            try:
-                pre_mf = ManifoldFolder.load(folder)
-            except ManifoldFormatError as e:
-                raise HTTPException(400, str(e)) from e
+        def _apply_fit_overrides() -> None:
+            if req.fit_mode is None and req.hyperparams is None:
+                return
+            pre_mf = ManifoldFolder.load(folder)
             if not pre_mf.is_discover and (
                 req.fit_mode is not None or req.hyperparams is not None
             ):
-                raise HTTPException(
-                    400,
+                raise ValueError(
                     f"fit_mode/hyperparams overrides are discover-mode "
                     f"only; {namespace}/{name} is authored",
                 )
@@ -960,6 +954,12 @@ def register_manifold_routes(app: FastAPI) -> None:
             write_json_atomic(folder / "manifold.json", data)
 
         def _fit(on_progress: Callable[[str], None]) -> dict[str, Any]:
+            # Discover-mode hyperparam overrides must happen inside the same
+            # session lock as the fit.  The manifest rewrite changes the fit
+            # cache key, so racing it against generation/extraction can make a
+            # request observe one set of inputs while the tensor cache records
+            # another.
+            _apply_fit_overrides()
             manifold = session.fit(
                 folder, sae=req.sae, sae_revision=req.sae_revision,
                 on_progress=on_progress,

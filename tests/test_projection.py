@@ -198,7 +198,7 @@ class _Stub(SaklasSession):
         self._rebuild_calls: list[dict[str, Any]] = []
         self._rebuild_entries: list[dict[str, Any]] = []
         # Build a covering whitener over the union of profile layers/dim so
-        # ``_materialize_projections`` → ``project_profile`` has its mandatory
+        # the projection materializer → ``project_profile`` has its mandatory
         # whitener.  ``None`` when there are no profiles (degenerate stub).
         layers: set[int] = set()
         dim = 0
@@ -213,7 +213,7 @@ class _Stub(SaklasSession):
         return self._stub_whitener
 
     def _rebuild_steering_hooks(self) -> None:
-        flat = self._flatten_steering_stack()
+        flat = self._get_steering_composer().flatten_steering_stack()
         for name in flat:
             if name not in self._profiles:
                 raise VectorNotRegisteredError(f"No vector registered for '{name}'")
@@ -222,9 +222,6 @@ class _Stub(SaklasSession):
         self._rebuild_calls.append(
             {name: alpha for name, (alpha, _trig) in flat_any.items()},
         )
-
-    def _resolve_pole_aliases(self, entries):  # pyright: ignore[reportMissingParameterType]  # stub override with untyped entries param
-        return {k: (float(v[0]), v[1]) for k, v in entries.items()}
 
 
 def _profile_a():
@@ -537,7 +534,7 @@ class TestComputeDlsAxes:
 class TestNestedProjectionScopeLeak:
     """Inner scope's projection should not leak back to outer scope.
 
-    ``_materialize_projections`` writes synthetic keys (``a|b``) into
+    ``SteeringComposer.materialize_projections`` writes synthetic keys (``a|b``) into
     the global ``self._profiles`` registry.  Without snapshot+restore
     on the ``_SteeringContext`` exit path, an inner scope materializing
     the same synthetic key under a different ``projection_metric`` (or

@@ -24,7 +24,63 @@ warning + eager fallback (`use_static_cuda_launcher` forced off — Gemma-4 + to
 sub-models (Ministral-as-Mistral3), strips `language_model.` prefixes,
 dequantizes FP8. `patch_torch_for_mps()` installs two lazy MPS-only workarounds
 (`torch.histc` integer→float for MoE routing; `torch.ldexp` MXFP4 round-trip
-through CPU honoring `out=`).
+through CPU honoring `out=`). `get_unembedding(model)` returns `W_U`
+(`get_output_embeddings().weight`, `[vocab, d]`) and `get_final_norm(model)` the
+pre-unembedding norm module (found as a sibling of the `get_layers` ModuleList —
+`norm`/`final_layernorm`/`ln_f`/`final_norm` — rather than a second per-arch
+table); both exist for the Jacobian lens readout, nothing else in saklas touches
+the unembedding outside the model's own forward.
+
+## jlens.py
+
+The Jacobian lens (Gurnee et al. 2026): `J_l = E[∂h_final/∂h_l]` per source
+layer, averaged over positions ≥ `SKIP_FIRST_POSITIONS` (16, attention sinks)
+and a text corpus. `fit_jacobian_lens(model, tokenizer, prompts, layer_modules,
+…)` is the **only backward-pass code in saklas**: everything else runs under
+`inference_mode`, and with frozen params + integer inputs no autograd graph
+exists at all, so the fit runs under `torch.enable_grad()` with a
+`register_forward_pre_hook` on the first block that returns a
+`requires_grad_(True)` clone of its input (reuses `get_layers`, zero per-arch
+wiring). Per prompt: one forward with the prompt replicated `dim_batch`× on the
+batch axis (graph retained), then `ceil(d_model/dim_batch)` backwards — batch
+element `b` of pass `p` carries a one-hot cotangent at output dim
+`p·dim_batch+b` injected at every valid target position, so the grad at source
+position `t` is `Σ_{t'≥t} ∂h_final[t']/∂h_l[t]`; mean over source positions;
+one backward populates every source layer. Grads come from
+`torch.autograd.grad(final, sources)` — NOT `backward()` + `retain_grad()`,
+whose `.grad` accumulation across the multi-backward loop would corrupt the
+rows — which also stops the graph walk at the shallowest requested source, so
+a `--layers`-restricted fit never backprops below its lowest layer. Each pass
+writes its row block into reused per-layer **on-device** fp32 buffers; the
+device→host transfer is one fold per prompt into the CPU fp32 accumulator,
+all-or-nothing on success (an OOM retry, which halves `dim_batch`, can't
+double-count). Sync discipline is bounded from both sides: per-pass `.cpu()`
+transfers cost ~6% (removed), but a *fully unsynced* loop lets the CPU enqueue
+arbitrarily far ahead and Metal fails **asynchronously** — no Python
+exception, the work silently never runs, the fold reads zeros — so the pass
+loop drains the queue every `_MPS_SYNC_EVERY_PASSES` (4) on MPS and the fold
+raises on any zero row (impossible for a real transformer; phrased as "out of
+memory" so the dim_batch-halving retry catches it). The fit is compute-bound —
+`d_model × 2` forward-equivalents per prompt, dim_batch-invariant (measured
+flat 8/32/64) — so `source_layers` restriction is the one real wall-time
+lever (1.73× for the 40–90% band); `empty_cache` runs at checkpoint cadence
+only.
+`checkpoint_cb` fires every `DEFAULT_CHECKPOINT_EVERY` (25) prompts for
+resumable fits; `JacobianLens.merge` is the n_prompts-weighted shard combiner.
+
+`JacobianLens` holds the fp32 matrices: `transport(h, layer)` maps a residual
+into the final basis; `token_direction(v, unembed)` is `W_U[v] @ J_l` per layer
+— the profile-shaped direction behind `jlens/<word>` atoms; `lens_logits`
+(free function) is the full readout `W_U · norm(J_l h)` (matvec in the
+unembed's own dtype — a fp32 W_U copy would be GBs). `resolve_word_token` maps
+a word to its single vocab id (leading-space piece first, decode-and-compare
+sanity check, `MultiTokenWordError` with the pieces otherwise).
+`sparse_nonneg_decompose` is the J-space split: greedy pursuit against the
+dictionary `W_U J_l` — never materialized (scores are the composed matvec,
+normalized by chunk-computed atom norms; only selected rows form), coefficient
+re-solve as a tiny projected-gradient NNLS per step — returning
+`JSpaceDecomposition(layer, share, tokens)`. Errors: `JacobianLensError` (422),
+`LensNotFittedError` (404), `MultiTokenWordError` (400), all `SaklasError`s.
 
 ## vectors.py
 
@@ -89,13 +145,15 @@ multi-dim manifold. Dispatch lowers every plain vector term through
 `fold_directions_to_subspace` → `_affine_manifold_push` (`session.py`) onto the
 merged affine subspace.
 
-`save_profile`/`load_profile` round-trip a baked `dict[int, Tensor]` to
-`.safetensors` + a slim `.json` sidecar (stamped with `PACK_FORMAT_VERSION` from
-`io/packs.py`); they back the per-model `layer_means`/`neutral_activations`/
-alignment caches and the folded-profile interchange. `project_profile(base, onto,
-operator, *, whitener=...)` is the per-layer `~`/`|` projection — closed-form
-LEACE, Mahalanobis-only: the whitener is **required** and must cover every
-projected layer (`covers_all`), else `WhitenerError` (no Euclidean path).
+`profile.save_profile`/`profile.load_profile` own the baked-profile wire format:
+a `dict[int, Tensor]` to `.safetensors` + a slim `.json` sidecar (stamped with
+`PACK_FORMAT_VERSION` from `io/packs.py`). `vectors.save_profile`/
+`vectors.load_profile` remain compatibility aliases for the per-model
+`layer_means`/`neutral_activations`/alignment caches and folded-profile
+interchange. `project_profile(base, onto, operator, *, whitener=...)` is the
+per-layer `~`/`|` projection — closed-form LEACE, Mahalanobis-only: the whitener
+is **required** and must cover every projected layer (`covers_all`), else
+`WhitenerError` (no Euclidean path).
 
 ## extraction.py
 
@@ -324,8 +382,15 @@ consensus_gram, *, whitener, …)` picks the discover geometry per-model in two
 decoupled decisions (decoupling dodges the dimension bias that makes a single
 reconstruction score always crown the highest-dim candidate): **(a) flat vs
 curved** — GCV of the flat affine (`pca`) vs curved RBF (`spectral`) fit in a
-shared whitened-reduced target metric, each at its own intrinsic dim
-(`_ols_gcv_score`/`_rbf_gcv_score`); **(b) periodic axes** — Vietoris–Rips H1
+shared whitened-reduced target metric (`_ols_gcv_score`/`_rbf_gcv_score`), the
+curved candidate floored to the **flat candidate's dim** (`min_dim=k_flat`) so the
+two compete at matched expressiveness — the spectral eigenvalue-ratio cliff
+systematically undershoots (one dominant Fiedler mode picks k=1), and without the
+floor a curved manifold linearly embedded in a `k_flat`-plane reads flat (the flat
+affine fit reconstructs the in-plane curve, the under-dimensioned curved fit
+can't, losing reconstruction it would win at matched dim — the flat-bias the
+`scripts/experiments/concept_geometry/geometry_stress.py` harness surfaced);
+**(b) periodic axes** — Vietoris–Rips H1
 *persistent homology* (`_rips_h1_persistence` boundary-matrix reduction →
 `_count_persistent_loops`, essential loops at `eps_max=2ε_c`) counts the loops
 (ellipse/noise-robust — a circle and a 6:1 ellipse both read as one loop), the
@@ -333,20 +398,35 @@ spectral eigenpairs coordinate them (`_detect_periodic_axes`, `_is_angular_harmo
 dedups a circle's `cos kθ` harmonics), routing to a periodic `BoxDomain`. Returns a
 `TopologyChoice` (`fit_mode`/`coords`/`domain` + ranked `TopologyCandidate`s for
 the sidecar). Sphere is **authored-only** — not an auto candidate. PH counts loops
-by *hole size*, so a **faint ring** (a small cyclic modulation on a near-equidistant
-heap — e.g. day-of-week centroids at ~16% modulation) has too thin a hole to clear
-the persistence threshold; `_faint_cycle_coords` is the complementary single-cycle
-fallback (`_detect_periodic_axes` runs it only when PH counts zero). It fires on a
-structure that is **1-D** (symmetric 2-NN graph max-degree ≤ 3 — rejects 2-D grids
-and high-D persona-style fans), **closed** (a greedy+2-opt tour `_nn_tour` has
-near-uniform edges, `max/median < 2.0` — rejects open arcs/lines), **local** (each
-node's two tour-neighbours among its two nearest, recall ≥ 0.90 — rejects branched
-theta/Y and tours manufactured across a blob), and **graded** (mean distance grows
-from cyclic-separation 1→2 ≥ 1.08), returning a uniform `2π·rank/K` `S¹` coordinate
-in the recovered cyclic order. Gated `7 ≤ K ≤ 128`. Validated for specificity
-(~0.4% false-positive on random K=7 Gaussian heaps, ~0 for K≥10; the thresholds
-trade a small elongated-ellipse false-negative, which doesn't arise in the sphered
-whitened metric, for a low false-positive rate on real concept heaps).
+by *hole size*, so two kinds of real ring slip under its threshold;
+`_faint_cycle_coords` is the complementary single-cycle fallback
+(`_detect_periodic_axes` runs it only when PH counts zero), recovering the cyclic
+order in either of two sampling regimes off a greedy+2-opt tour (`_nn_tour`):
+**uniform** — a faint ring (small cyclic modulation on a near-equidistant heap,
+e.g. day-of-week centroids at ~16% modulation): too thin a hole for PH but
+near-equidistant, so the classic guards fire — **1-D** (symmetric 2-NN max-degree
+≤ 3), **closed** (tour edges near-uniform, `max/median < 2.0`), **local**
+(tour-neighbours among the two nearest, recall ≥ 0.90); and **clustered** — tight
+clumps spaced around the loop, the sampling real concept families have
+(months→seasons, days→weekday/weekend): the tour edges go **bimodal** (tiny
+intra-cluster, big inter-cluster) so closure/recall fail though the loop is real,
+accepted instead when the inter-cluster gaps are **≥2** in number, **decisively
+bimodal** (smallest gap ≥ 3.5× the small-edge scale — the guard that screens a
+diffuse low-D random cloud whose many accidental long edges only marginally clear
+the gap cutoff), **mutually regular** (`max/min ≤ 2.5`), and the loop has a **real
+far antipode** (tour-antipode/tour-neighbour mean distance ≥ 2.5 — rejects a blob/
+fan). Both regimes also require **graded** growth (`d(sep=2)/d(sep=1) ≥ 1.08`) and
+1-D-ness at the looser clustered bound (degree ≤ 4 — a tight clump reaches 4),
+returning a uniform `2π·rank/K` `S¹` coordinate in the recovered cyclic *order*
+(exact spacing dropped — topology, not metric, is what the periodic domain needs).
+Gated `7 ≤ K ≤ 128`. Validated (`geometry_stress.py periodic`) for specificity
+(~0% false-positive on random Gaussian heaps K≥9, and on grids/fans/arcs/blobs/
+lines) and clustered-ring sensitivity (100% recall for tight-to-moderate clumps);
+the bimodality guard trades two documented false-negatives — a very-loose cluster
+heap approaching uniform, and an eccentric ellipse `> 6:1` — for that 0% FP rate.
+A **gapped ring** (a uniform ring with one missing sector) is geometrically the
+*same point cloud* as an open arc, so it correctly stays non-periodic — the
+closure guard rejecting both is right, not a miss.
 ## naturalness.py
 
 Behavior-space naturalness eval, extracted from `manifold.py` to restore its
@@ -634,13 +714,16 @@ stack live on a `SteeringComposer` collaborator (`core/steering_composer.py`),
 instantiated in `__init__` after `_monitor` (lazily rebuilt via
 `_get_steering_composer()` for `__new__` test stubs). The composer owns the stack
 (`_stack`); the session exposes a settable `_steering_stack` property over it, and
-keeps a thin forwarder for every moved method — `_push_steering`/`_pop_steering`
-(called by `_SteeringContext`), `_compose_steering_entries`/`_install_composed_steering`/
-`_rebuild_steering_hooks`, `_ensure_manifold_loaded`/`_ensure_profile_registered`/
-`_try_fold_manifold`/`_port_stale_legacy_vector`, `_resolve_pole_aliases`,
-`_materialize_projections`, `_steering_needs_probe_gating`/`_build_gating_score_callback`
-(also called by `joint_logprobs.py`), and the stack predicates — so the public + test
-surface is byte-identical (tests monkeypatch / `__get__`-bind these on the session).
+owns projection materialization, pole alias resolution, profile/manifold loading,
+legacy vector port-on-detect, stack flattening, probe-gate predicates, steering
+lowering, and hook installation. The session keeps only narrow compatibility
+wrappers for `_push_steering`/`_pop_steering` (called by `_SteeringContext`),
+`_rebuild_steering_hooks`, `_ensure_manifold_loaded`, `_ensure_profile_registered`,
+`_steering_needs_probe_gating`, and `_build_gating_score_callback`; production
+generation and steering setup should call the composer directly when adding new
+code.
+`joint_logprobs.py` still uses the gating compatibility wrappers because it accepts
+session-like test doubles.
 The composer reaches session state through `self._session` at push/pop frequency, off
 the per-token path; the one near-hot method, `build_gating_score_callback`, binds
 `capture`/`monitor` to locals and reads the session capture state through the back-ref
@@ -691,21 +774,24 @@ training-free `clone_from_corpus` / `io.cloning` path is removed in 4.0.)
 Steering | None` (dicts rejected), `sampling`, `thinking=None`, plus loom args;
 both return `RunSet` (`.first` is the `GenerationResult`). `session.steering(value)`
 coerces via `Steering.from_value`, materializes `ProjectedTerm`s into derived
-profiles (`_materialize_projections` → `project_profile` with `session.whitener`,
+profiles (`SteeringComposer.materialize_projections` → `project_profile` with `session.whitener`,
 which is Mahalanobis-only — a `~`/`|` term on a session with no covering whitener
 raises `WhitenerError`), and pushes a per-scope entries dict onto a LIFO stack so
 nested scopes compose. There is no per-call projection-metric override.
-`_resolve_pole_aliases` canonicalizes bare poles via `io.selectors.canonicalize_atom`
+`SteeringComposer.resolve_pole_aliases` canonicalizes bare poles via `io.selectors.canonicalize_atom`
 (the sign-flip is retired — a bare pole resolves through the manifold-label tier as
 a `%` push) and routes variants.
 
-**Steering resolution (manifold-first).** `_ensure_profile_registered(name)`
+**Steering resolution (manifold-first).** `SteeringComposer.ensure_profile_registered(name)`
 resolves a direction from, in order: (1) an in-memory baked direction already in
-`_profiles` (ad-hoc `extract`/`merge`/projection results); (2) a fitted
-2-node `pca` manifold on disk — `_try_fold_manifold` → `_ensure_manifold_loaded`
+`_profiles` (ad-hoc `extract`/`merge`/projection results); (1b) the reserved
+`jlens/` namespace — `register_jlens_direction` resolves the word through the
+fitted Jacobian lens (raising `LensNotFittedError`/`MultiTokenWordError`, never
+falling through to extraction); (2) a fitted
+2-node `pca` manifold on disk — `try_fold_manifold` → `ensure_manifold_loaded`
 (load `[ns/]name[:variant]`, raw or `sae-<release>`) + `folded_vector_directions`,
 memoized into `_profiles`; (3) a stale (`< PACK_FORMAT_VERSION`) legacy
-`vectors/<ns>/<name>/` folder — `_port_stale_legacy_vector` ports it to a 2-node
+`vectors/<ns>/<name>/` folder — `port_stale_legacy_vector` ports it to a 2-node
 manifold file-only (no tensor yet) and raises with the exact `manifold fit` command
 to run. `_bootstrap_manifold_probes(categories, *, include_fitted_defaults)` is the
 probe-roster bootstrap — one pass, two tiers. **Tagged concept axes**: for each
@@ -721,12 +807,12 @@ This folds the former serve-only `_attach_default_manifold_probes` into the
 construction-time pass, so every frontend (TUI / serve / programmatic) gets the
 same roster; an explicit `probes=[...]` category list skips the multi-node sweep.
 
-`_compose_steering_entries` is the dispatch (`ARCHITECTURE.md` §4): classify each
+`SteeringComposer.compose_steering_entries` is the dispatch (`ARCHITECTURE.md` §4): classify each
 entry — `AblationTerm` → ablation fragment; `ManifoldTerm` → affine `%` joins the
 merge (`_affine_manifold_push`) or curved `%` → `add_manifold`; plain `(alpha,
-trigger)` → `_ensure_profile_registered` → `fold_directions_to_subspace` →
+trigger)` → `ensure_profile_registered` → `fold_directions_to_subspace` →
 `_affine_manifold_push` push fragment — group push+ablate by trigger,
-`synthesize_subspace` per group, `add_subspace`. `_install_composed_steering` →
+`synthesize_subspace` per group, `add_subspace`. `install_composed_steering` →
 `apply_to_model`. There are **no** persistent hooks. Manifold-implied roles
 aggregate under soft-warn + highest-`|coeff|`-wins (`RoleBaselineMismatchWarning`).
 
@@ -766,6 +852,40 @@ per row). The alpha *sweep* steers the prompt at varying strength by constructio
 events: `GenerationStarted`/`SteeringApplied`/
 `SteeringCleared`/`ProbeScored`/`GenerationFinished` + `VectorExtracted`/
 `ManifoldExtracted`; threaded subscribers hop via `loop.call_soon_threadsafe`.
+
+**Jacobian-lens surface.** `session.jlens` lazy-loads the per-model artifact
+(`io/lens.py`, like `whitener`); `fit_jlens(prompts, …)` pre-filters too-short
+prompts (so the saved `n_prompts` counts consumed prompts exactly — what makes
+resume slicing sound), hashes the filtered corpus, resumes a matching partial
+fit by default (`force=True` restarts), checkpoints via the io layer, and gates
+under `_model_exclusive` (forward AND backward passes).
+`jlens_readout(prompt, layers=, positions=, top_k=)` is the offline readout
+(captures via `_capture_all_hidden_states`, default final position only).
+`jlens_token_readout(node_id, raw_index, *, layers=, top_k=, apply_steering=,
+raw=)` is the loom-anchored readout behind the dashboard drilldown's j-lens
+tab: fork-style validation (assistant node, `raw_token_ids`, range), rebuild
+the node's exact prompt render via `_prepare_input` (stamped role labels +
+recipe thinking; `raw=` selects the flat render — raw-ness isn't stamped on
+the node, the caller supplies it), append `raw_token_ids[:raw_index]`, one
+capture forward, per-layer top-k at the final position — the forward that
+*produced* the clicked token. `apply_steering` replays under the node's
+recipe steering; the steering scope opens OUTSIDE `_model_exclusive`
+(`SteeringComposer.push`/`pop` take `_gen_lock` blocking — nesting would
+self-deadlock; same ordering as `score_choices`).
+`register_jlens_direction(word)` lands `W_U[v] @ J_l` in `_profiles` under
+`jlens/<word>` — the shared resolver behind the two lazy `jlens/` branches
+(steering: `ensure_profile_registered`; probes: `_resolve_probe_manifold`,
+without which a gate-only `add_probe("jlens/x")` would fall through to
+`extract()` and author a nonsense manifold). `jspace_decompose(selector, k=,
+layers=)` resolves any steerable direction and splits it against the lens
+dictionary. **Live lens** (`enable_live_lens`/`disable_live_lens`/
+`live_lens_layers`): the selected layers' `J_l` go device-resident, join the
+capture-widen union in `_begin_capture` (which also forces transient — not
+persistent — capture routing, and arms a bounded tail ring when no probes are
+attached), and `_live_lens_readout_step` runs at the token tap post-forward —
+no new forward hooks, `static_steerable` untouched — landing the per-step
+top-k on `TokenEvent.lens_readout` and the `_last_token_probe_payload["lens"]`
+slot. Default layer subset: five fitted layers over the 40–90% depth band.
 
 ## loom.py
 
@@ -880,7 +1000,8 @@ returns `(http_status, text)`. `SteeringExprError` lives here (re-exported from
 layer, in `apply_to_model`). `profile.py` — `Profile` wraps `dict[int, Tensor]`
 with `.layers`/`.save`/`.load`/`.to_gguf`/`.merged`/`.merged_with`/`.promoted_to`/
 `.cosine_similarity(other, *, per_layer=False, whitener=None)` (magnitude-weighted)/
-`.projected_away`; empty layer intersection raises `ProfileError`.
+`.projected_away`; it also owns `save_profile`/`load_profile` for the safetensors
+sidecar format. Empty layer intersection raises `ProfileError`.
 
 `steering_expr.py` hosts the unified grammar (`parse_expr(text, *, namespace=None)`
 → `Steering`; `format_expr` round-trips; `referenced_selectors` for install-time

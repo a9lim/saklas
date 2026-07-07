@@ -860,6 +860,51 @@ def get_layers(model: PreTrainedModel) -> nn.ModuleList:
     return accessor(model)
 
 
+def get_unembedding(model: PreTrainedModel) -> torch.Tensor:
+    """Return the unembedding matrix ``W_U``, shape ``[vocab, hidden]``.
+
+    Uses the HF-standard ``get_output_embeddings()`` (the lm_head module,
+    whether or not its weight is tied to the input embedding). Nothing else in
+    saklas touches the unembedding outside the model's own forward; this
+    accessor exists for the Jacobian lens readout.
+    """
+    out = model.get_output_embeddings()
+    weight = getattr(out, "weight", None)
+    if weight is None:
+        raise ValueError(
+            f"model_type {model.config.model_type!r} exposes no output "
+            "embedding weight (get_output_embeddings() returned "
+            f"{type(out).__name__}); cannot build a vocabulary readout"
+        )
+    return weight
+
+
+_FINAL_NORM_ATTRS = ("norm", "final_layernorm", "ln_f", "final_norm")
+
+
+def get_final_norm(model: PreTrainedModel) -> nn.Module:
+    """Return the final pre-unembedding normalization module.
+
+    Every supported decoder keeps its final norm as a sibling of the
+    transformer block list (``.norm`` on the llama/qwen/gemma families,
+    ``.ln_f`` on the GPT-2 family, ``.final_layernorm`` on GLM-shaped
+    models), so the owner of the ``get_layers`` ModuleList is searched for
+    the first matching attribute rather than adding a second per-architecture
+    accessor table.
+    """
+    layers = get_layers(model)
+    for module in model.modules():
+        if any(child is layers for child in module.children()):
+            for attr in _FINAL_NORM_ATTRS:
+                cand = getattr(module, attr, None)
+                if isinstance(cand, nn.Module):
+                    return cand
+    raise ValueError(
+        f"model_type {model.config.model_type!r}: no final norm found next to "
+        f"the layer list (tried attributes {', '.join(_FINAL_NORM_ATTRS)})"
+    )
+
+
 def _text_config(model: PreTrainedModel) -> Any:
     """Return the text-specific config, handling multimodal wrappers."""
     cfg = model.config

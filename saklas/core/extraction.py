@@ -153,6 +153,7 @@ class ManifoldExtractionPipeline:
         *,
         sae: str | SaeBackend | None = None,
         sae_revision: str | None = None,
+        force: bool = False,
         on_progress: Callable[[str], None] | None = None,
     ):
         """Fit (or load from cache) a manifold for the session's model.
@@ -169,6 +170,11 @@ class ManifoldExtractionPipeline:
         short-circuits the forward passes.  For discover-mode folders
         the staleness key folds in ``fit_mode`` + ``hyperparams``, so
         a refit with different hyperparameters reliably misses cache.
+        ``force=True`` bypasses the cache and re-pools/re-fits unconditionally
+        — the discover/multi-node analogue of ``manifold extract -f`` (which
+        forces a refit by re-authoring the corpus); without it a code change to
+        the fit itself, e.g. a topology-selection fix, can't be picked up while
+        the corpus is unchanged.
         """
         from saklas.core.manifold import (
             CustomDomain,
@@ -235,7 +241,7 @@ class ManifoldExtractionPipeline:
         cached_revision = (
             sae_backend.revision if sae_backend is not None else None
         )
-        if tensor_path.exists() and sidecar_path.exists():
+        if not force and tensor_path.exists() and sidecar_path.exists():
             try:
                 sc = ManifoldSidecar.load(sidecar_path)
             except (KeyError, ValueError):

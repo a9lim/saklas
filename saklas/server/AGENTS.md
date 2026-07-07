@@ -23,6 +23,7 @@ those registrars import):
 - `probe_routes.register_probe_routes` — `/sessions/{id}/probes/*` (unified: list / defaults / attach / detach — every probe shape)
 - `experiment_routes.register_experiment_routes` — `/sessions/{id}/experiments/fan`
 - `traits_routes.register_traits_routes` — `/sessions/{id}/traits/stream` (SSE)
+- `lens_routes.register_lens_routes` — `/sessions/{id}/lens/token-readout`
 - `ws_stream.register_ws_stream` — the `WS /sessions/{id}/stream` co-stream engine
 
 `server/sse.py`, `server/streaming.py`, and `server/ws_events.py` are the shared
@@ -77,8 +78,9 @@ reading when at least one probe is attached and `live_scores` is on; the final
 chunk carries the aggregate. The field is omitted entirely when no probe is
 attached, so OpenAI clients that don't read the extension see no shape change.
 `_probe_reading_aggregate(session)`
-and `_probe_token_readings(event)` are the shared helpers (also imported by
-`ollama.py`).
+and `_probe_token_readings(event)` are imported aliases over
+`server.request_helpers.probe_reading_aggregate` /
+`server.request_helpers.probe_token_readings`, shared with `ollama.py`.
 
 Auth: bearer token from `SAKLAS_API_KEY` / `--api-key`, applied as an app-level
 dependency over HTTP and WebSocket routes. `_require_auth` + `_check_bearer` gate
@@ -97,7 +99,18 @@ to an HTTP status and picks the Ollama vs OpenAI error shape by path prefix;
 `RequestValidationError` maps to the OpenAI shape. Not supported by either compat
 protocol: tool calling, JSON-schema/structured-output mode, embeddings.
 
-## saklas_api.py (native tree orchestrator + shared bodies/helpers)
+## Native route modules and schemas
+
+`saklas_api.py` is now only the native-route registrar plus a backcompat re-export
+surface for old imports. New route-specific request bodies and serializers live
+beside their route groups:
+
+- `native_common.py` — single-session id resolution.
+- `session_models.py` — session request bodies and `session_info`.
+- `vector_models.py` — vector/extract/bake request bodies and vector serializers.
+- `tree_models.py` — loom-tree request bodies and tree serializers.
+- `ws_models.py` — WebSocket request bodies, sampling conversion, token/result helpers.
+- `experiment_models.py` — experiment request bodies.
 
 URL paths carry `{session_id}` for a multi-session shape, but the impl is
 single-session: the one session has id `"default"`, and the loaded model id also
@@ -119,10 +132,12 @@ body + any typed safe-message formatter.
 ### session_routes.py
 
 - `GET/POST /saklas/v1/sessions` — list / idempotent create (a model mismatch warns
-  and returns the existing session). `_session_info` carries `is_base_model` plus
+  and returns the existing session). `session_info` carries `is_base_model` plus
   `role_substitution_supported` / `user_role_supported` (against `ROLE_HEADERS` /
   `USER_ROLE_HEADERS` for the resolved `model_type`) and the resolved
-  `default_assistant_role` / `default_user_role`, so the webui can gate roles.
+  `default_assistant_role` / `default_user_role`, so the webui can gate roles,
+  plus `jlens_fitted` (a `lens_paths` existence check gating the drilldown's
+  j-lens tab — deliberately not the lazy `session.jlens` load).
 - `GET/PATCH/DELETE /saklas/v1/sessions/{id}` — info / update defaults / no-op 204.
 - `POST /saklas/v1/sessions/{id}/{clear,rewind}`.
 
@@ -261,7 +276,7 @@ not a re-render pass.
   whitened cosine is single-layer, so each cell is whitened in `a`'s row-layer frame.
   `session.whitener` must cover every row-layer of `a`, else 409 (regenerate the
   neutral cache). Registered *before* `GET /vectors/{name}` so the literal path wins.
-- `POST /extract` — in `asyncio.to_thread`; SSE / JSON. `_coerce_corpora`
+- `POST /extract` — in `asyncio.to_thread`; SSE / JSON. `coerce_corpora`
   normalizes `source`: a concept name routes to `session.extract` (a composite
   name fits a 2-node `pca`; a monopolar name with no baseline fits the 1-node
   neutral-anchored ray), while two pole corpora (`{positive, negative}` /
@@ -298,6 +313,23 @@ grid is validated server-side (empty → 400), then `session.generate_sweep(...,
 stateless=False)` runs in a worker thread under the lock. Returns `{kind, total,
 node_ids, rows}`.
 
+### lens_routes.py — Jacobian-lens token readout
+
+`GET /sessions/{id}/lens/token-readout?node_id=&raw_index=[&top_k=8][&steered=
+true][&raw=false][&layers=csv]` — the workspace readout at one decode step of a
+loom node (`session.jlens_token_readout` in `asyncio.to_thread` under
+`acquire_session_lock`, 503 on timeout): the per-layer J-lens top-k matrix at
+the forward that produced the clicked token, each row
+`{layer, in_band, tokens:[{token, id, logprob}]}` sorted ascending (`in_band` =
+the 40–90% workspace band). `steered` (default on) replays under the node's
+recipe steering — `steered=false` is the unsteered counterfactual; `raw` marks
+a flat-buffer node (raw-ness isn't stamped server-side, the client's render
+mode supplies it). Errors: `LensNotFittedError`/`UnknownNodeError` → 404,
+`InvalidNodeOperationError`/bad `layers`/`top_k` → 400, other `SaklasError`s →
+their `user_message()` status. Lens *fitting* stays CLI-only; discovery rides
+the session-info `jlens_fitted` field (a `lens_paths` existence check — never
+the ~GB lazy artifact load).
+
 ### traits_routes.py — live traits SSE
 
 `GET /sessions/{id}/traits/stream` — per-token probe scores in real time during any
@@ -312,7 +344,7 @@ across generations; multiple clients supported. Events: `start`
 Bidirectional WebSocket; only `session_id == "default"` is reachable (HF ids contain
 `/`). Client → server: `{type: "stop"}`, or `{type: "generate", input, steering,
 sampling, thinking, stateless, raw, parent_node_id?, n?, recipe_override?}`. The
-`sampling` block (`WSSamplingParams` → `_build_sampling` → `SamplingConfig`) carries
+`sampling` block (`WSSamplingParams` → `build_sampling` → `SamplingConfig`) carries
 `user_role`/`assistant_role` (the per-message role-substitution labels, stamped
 onto the produced loom nodes and rendered faithfully per-turn), plus `return_top_k`
 (per-request top-K-alts override) and `persist_per_layer_scores` (the per-layer

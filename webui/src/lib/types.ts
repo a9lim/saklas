@@ -39,10 +39,12 @@ export interface SamplingFields {
   top_k: number | null;
   max_tokens: number | null;
   system_prompt: string | null;
+  thinking: boolean | null;
 }
 
 export interface SessionInfo {
   id: string;
+  aliases?: string[];
   model_id: string;
   device: string;
   dtype: string;
@@ -71,6 +73,11 @@ export interface SessionInfo {
    *  as flat completion (no roles, no bubbles).  Older servers omit
    *  this; clients treat ``undefined`` as ``false`` (chat model). */
   is_base_model?: boolean;
+  /** True iff a Jacobian lens artifact is fitted for the loaded model
+   *  (a server-side path check, not a load).  Gates the token
+   *  drilldown's j-lens tab; ``undefined`` (older server) reads as
+   *  ``false`` and the tab shows the fit hint. */
+  jlens_fitted?: boolean;
   /** True iff the loaded model family supports assistant-role
    *  substitution (Qwen / Gemma / Llama / GLM / gpt-oss yes; Mistral /
    *  talkie no). Drives whether the roles control is enabled. Older
@@ -88,6 +95,42 @@ export interface SessionInfo {
   /** The family's *standard* user-role label (``user`` everywhere today),
    *  or ``null``/``undefined`` when unsupported.  Seeds the user-role box. */
   default_user_role?: string | null;
+}
+
+// -------------------------------------------------- jacobian lens --
+
+/** One vocabulary entry of a per-layer J-lens readout row. */
+export interface LensReadoutTokenJSON {
+  token: string;
+  id: number;
+  /** ``log softmax(W_U · norm(J_l h))`` at this token — exp() for the
+   *  within-row probability. */
+  logprob: number;
+}
+
+/** One layer row of the workspace readout matrix. */
+export interface LensReadoutLayerJSON {
+  layer: number;
+  /** True iff the layer sits in the 40–90% depth workspace band (the
+   *  regime where the lens reads a verbalizable workspace rather than
+   *  early noise / late motor-copy). */
+  in_band: boolean;
+  tokens: LensReadoutTokenJSON[];
+}
+
+/** ``GET /sessions/{id}/lens/token-readout`` — the J-lens workspace
+ *  readout at one decode step of a loom node (the forward that produced
+ *  the clicked token). */
+export interface LensTokenReadoutJSON {
+  node_id: string;
+  raw_index: number;
+  /** The clicked token — for highlighting its appearances in the matrix. */
+  token_id: number;
+  token_text: string;
+  /** The steering expression the replay ran under, or ``null`` for an
+   *  unsteered read (no recipe steering, or ``steered=false``). */
+  steering: string | null;
+  layers: LensReadoutLayerJSON[];
 }
 
 // ----------------------------------------------------- manifolds --
@@ -463,8 +506,11 @@ export interface GenerateManifoldRequest {
   description?: string;
   concepts: string[];
   /** Per-concept system-prompt framing: ``abstract`` → "someone {c}",
-   *  ``concrete`` → "{article} {c}".  Default abstract. */
-  kind?: "abstract" | "concrete";
+   *  ``concrete`` → "{article} {c}", ``custom`` → ``custom_system``.
+   *  Default abstract. */
+  kind?: "abstract" | "concrete" | "custom";
+  /** Required for ``kind: "custom"``; ``{c}`` is replaced by each concept. */
+  custom_system?: string;
   /** In-character responses generated per shared baseline prompt. */
   samples_per_prompt?: number;
   fit_mode?: "pca" | "spectral" | "auto";
@@ -761,6 +807,8 @@ export interface WSSampling {
    *  when any on_token consumer is live, just no top alternatives.
    *  Default 0 keeps the wire shape unchanged for opt-out users. */
   return_top_k?: number | null;
+  /** Skip final aggregate probe scoring when only gate control is needed. */
+  return_probe_readings?: boolean | null;
   /** Native dashboard requests this so streamed token rows can rehydrate
    *  the token-drilldown layer heatmap after a refresh. */
   persist_per_layer_scores?: boolean | null;

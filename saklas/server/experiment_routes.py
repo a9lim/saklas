@@ -7,11 +7,9 @@ import asyncio
 from fastapi import FastAPI, HTTPException
 
 from saklas.server.app import acquire_session_lock
-from saklas.server.saklas_api import (
-    ExperimentFanRequest,
-    _build_sampling,
-    _resolve_session_id,
-)
+from saklas.server.experiment_models import ExperimentFanRequest
+from saklas.server.native_common import resolve_session_id
+from saklas.server.ws_models import build_sampling
 
 
 def register_experiment_routes(app: FastAPI) -> None:
@@ -21,14 +19,14 @@ def register_experiment_routes(app: FastAPI) -> None:
     @app.post("/saklas/v1/sessions/{session_id}/experiments/fan")
     async def run_experiment_fan(session_id: str, req: ExperimentFanRequest):
         """Run an alpha grid as loom siblings and return a RunSet summary."""
-        _resolve_session_id(session, session_id)
+        resolve_session_id(session, session_id)
 
         if not req.grid:
             raise HTTPException(400, "grid must be non-empty")
         for name, alphas in req.grid.items():
             if not alphas:
                 raise HTTPException(400, f"grid['{name}'] must be non-empty")
-        sampling_cfg = _build_sampling(req.sampling)
+        sampling_cfg = build_sampling(req.sampling)
 
         async with acquire_session_lock(session) as acquired:
             if not acquired:
