@@ -1,11 +1,14 @@
 # cli/
 
-Seven-verb root parser
-(`tui`/`serve`/`manifold`/`pack`/`experiment`/`config`/`template`). `manifold` is the
+Eight-verb root parser
+(`tui`/`serve`/`manifold`/`pack`/`experiment`/`config`/`template`/`lens`).
+`manifold` is the
 unified compute surface (extract/generate/from-template/fit/bake/merge/transfer/
 compare/why); `pack` is the lifecycle/distribution verb (ls/show/install/search/
 push/rm/clear/refresh/export gguf); `template` owns the standalone
-templated-completion artifact (create/ls/show/score/rm). There is no `vector` alias
+templated-completion artifact (create/ls/show/score/rm); `lens` owns the
+per-model Jacobian-lens artifact (fit/show/top/decompose/rm). There is no
+`vector` alias
 — install via `pack install` and export via `pack export gguf`. Split across:
 - `cli/main.py` — entry point, `parse_args`, `main`, `_COMMAND_RUNNERS` dispatch
 - `cli/parsers.py` — `_build_root_parser` + every `_build_X_parser`, the verb tables
@@ -60,6 +63,17 @@ with no subverb) prints help and exits 0, not argparse's exit 2.
   (`session.score_template`), steering-aware via `-S`. Bare names default to
   `local/` (`_split_manifold_ns_name`); `score`/`show`/`rm` resolve cross-namespace
   via `resolve_template`.
+- `lens` = the per-model Jacobian-lens artifact
+  (`fit`/`show`/`top`/`decompose`/`rm`) via `_LENS_VERBS`; `_run_lens`
+  hand-dispatches (`@_saklas_error_exit`-wrapped, like `_run_experiment` — the
+  lens error family carries `user_message()`). `fit`/`top`/`decompose` load a
+  model with `probes=[]` (no default probe bootstrap); `show`/`rm` are pure-IO
+  over `models/<safe_id>/jlens.*`. `fit` sources its corpus from `--corpus FILE`
+  (one document per line, or JSONL with a `text` field) or streams the default
+  fineweb-edu sample via the optional `datasets` dependency
+  (`_load_lens_corpus`), and resumes a matching partial fit by default. The
+  model is a **positional** on `fit`/`show`/`top`/`rm` (the artifact is
+  per-model); `decompose` takes a selector positional + required `-m`.
 
 ## Config loading
 
@@ -205,6 +219,18 @@ category list through verbatim (tagged concepts only, no multi-node sweep).
 - `experiment naturalness`: `model` + `prompt`, `--manifold FOLDER` / `-S/--steer
   EXPR` (required), `--compare-linear`, `--max-tokens` (128), `-j`.
 - `config show`/`validate` — flags as in `config_file`.
+- `lens fit`: positional `model`, `--corpus FILE`, `--prompts N` (100),
+  `--seq-len T` (128), `--dim-batch K` (8; halves automatically on OOM),
+  `-f/--force` (restart from zero instead of resuming), `-d`, `-q`.
+- `lens show`: positional `model`, `-j`.
+- `lens top`: positionals `model` + `prompt` (raw text, no chat template),
+  `-k/--top-k` (8), `--layers L1,L2,...` (default: 9 evenly spaced fitted
+  layers), `--position P` (repeatable, negative ok; default final position),
+  `-d`, `-q`, `-j`.
+- `lens decompose`: positional `selector`, `-m/--model` (required),
+  `-k/--top-k` (16 — the sparsity budget), `--layers L1,L2,...`, `-d`, `-q`,
+  `-j`.
+- `lens rm`: positional `model`, `-y/--yes`.
 
 ## Error handling
 

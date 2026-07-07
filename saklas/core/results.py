@@ -341,6 +341,10 @@ class TokenEvent:
     # Bounded above by sampler support size; a confident prediction
     # approaches 1. Consumers take ``log`` to recover entropy-nats.
     perplexity: float | None = None
+    # Live J-lens workspace readout for this step: ``{layer: [(token,
+    # score), ...]}`` — the top-k lens tokens at each selected layer.
+    # ``None`` when ``session.enable_live_lens`` is off.
+    lens_readout: dict[int, list[tuple[str, float]]] | None = None
 
     @property
     def scores(self) -> "dict[str, ProbeReading] | None":

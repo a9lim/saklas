@@ -1,9 +1,10 @@
 """CLI entry point for saklas.
 
-Seven top-level verbs.  ``manifold`` is the steering-vector / manifold *compute*
+Eight top-level verbs.  ``manifold`` is the steering-vector / manifold *compute*
 surface (a steering vector is the K=2 case of a flat manifold); ``pack`` is the
 manifold *lifecycle* surface (install / share / inspect / remove); ``template``
-owns the standalone templated-completion artifact:
+owns the standalone templated-completion artifact; ``lens`` owns the per-model
+Jacobian-lens artifact (residual→output transport + vocabulary readout):
 
     saklas tui <model> [...]
     saklas serve <model> [...]
@@ -12,6 +13,7 @@ owns the standalone templated-completion artifact:
     saklas experiment {fan,transcript,naturalness} ...
     saklas config {show,validate} ...
     saklas template {create,ls,show,score,rm} ...
+    saklas lens {fit,show,top,decompose,rm} ...
 
 There is no bare-TUI mode. ``saklas`` with no arguments prints help.
 """

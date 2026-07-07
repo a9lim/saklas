@@ -76,23 +76,29 @@ saklas experiment naturalness <model> "<prompt>" --manifold F -S EXPR  # behavio
 saklas template create <name> --slot TOKEN --values V... --contexts FILE [--description TEXT] [-f]
 saklas template ls [-j] | show <name> [-j] | rm <name> [-y]
 saklas template score <name> -m MODEL [-S EXPR] [--by sum|mean] [-j]   # restricted-choice value distribution
+saklas lens fit <model> [--corpus FILE] [--prompts N] [--seq-len T] [--dim-batch K] [-f]   # per-model Jacobian lens (backward passes; resumes by default)
+saklas lens show <model> [-j] | rm <model> [-y]
+saklas lens top <model> "<prompt>" [-k K] [--layers L1,L2] [--position P] [-j]   # workspace readout on a raw prompt
+saklas lens decompose <selector> -m MODEL [-k K] [--layers L1,L2] [-j]   # J-space share + tokens of a direction
 saklas config show [-c PATH ...] [--no-default] [-m MODEL]
 saklas config validate <file>
 pytest tests/                                   # all; GPU tests gated on CUDA/MPS
 ```
 
-The root parser has exactly seven verbs: `tui`, `serve`, `manifold`, `pack`,
-`experiment`, `config`, `template`. There is no `vector` alias. `manifold` is the
-unified compute surface
+The root parser has exactly eight verbs: `tui`, `serve`, `manifold`, `pack`,
+`experiment`, `config`, `template`, `lens`. There is no `vector` alias. `manifold`
+is the unified compute surface
 (extract/generate/from-template/fit/bake/merge/transfer/compare/why); `pack` owns
 lifecycle and distribution (ls/show/install/search/push/rm/clear/refresh/export
 gguf), so install via `pack install` and export via `pack export gguf`; `template`
 owns the standalone templated-completion artifact (create/ls/show/score/rm — a slot
 + candidate values + multi-turn contexts, read by both the completion **scorer**
-and a `manifold from-template` fit). No `argv[0]` peeking, no bare-TUI fallback —
+and a `manifold from-template` fit); `lens` owns the per-model Jacobian-lens
+artifact (fit/show/top/decompose/rm — see "Jacobian lens" below). No `argv[0]`
+peeking, no bare-TUI fallback —
 `saklas google/gemma-2-2b-it` is an argparse error. Bare `saklas` / `saklas
 manifold` / `saklas pack` / `saklas experiment` / `saklas config` / `saklas
-template` print help and exit 0.
+template` / `saklas lens` print help and exit 0.
 
 Every subcommand that takes `-c/--config` auto-loads `~/.saklas/config.yaml`
 first, then composes explicit `-c` files on top (later overrides earlier). The
@@ -143,10 +149,10 @@ atom        := [ns "/"] NAME ["." NAME] [":" variant]
 trigger     := preset | gate
 preset      := before | after | both | thinking | response | prompt | generated
 gate        := "when" ":" probe_atom op NUM        # op ∈ > >= < <=
-probe_atom  := NAME ["." NAME] ["[" INT "]"]       # vector probe (e.g. confident.uncertain),
-                                                   # optional coord axis (personas[3])
-             | NAME ":" "fraction"                 # manifold subspace fraction
-             | NAME "@" NAME                       # manifold label similarity
+probe_atom  := [ns "/"] NAME ["." NAME] ["[" INT "]"]  # vector probe (e.g. confident.uncertain,
+                                                   # jlens/fake); optional coord axis (personas[3])
+             | [ns "/"] NAME ":" "fraction"        # manifold subspace fraction
+             | [ns "/"] NAME "@" NAME              # manifold label similarity
 ```
 
 `+`/`-` add terms, `*` attaches a coefficient (omit → 0.5), `~` projects onto a
@@ -158,7 +164,11 @@ that fires only on decode steps where the monitor reading satisfies the comparis
 (`@after&when:…`) are programmatic-only.
 
 Probe gates accept these identifier shapes against the merged scalars the session
-writes into `TriggerContext.probe_scores`. Vector probes are concept names whose
+writes into `TriggerContext.probe_scores`. Every shape also takes an optional
+leading `<ns>/` segment — a J-lens token probe (`@when:jlens/fake > 0.4`, whitened
+coordinate along the lens direction; see "Jacobian lens") or a probe attached
+under a qualified selector (`@when:default/emotions@happy > -0.5`) — stored
+verbatim. Vector probes are concept names whose
 bare form reads coordinate axis 0 (`@when:confident.uncertain > 0.4`) and whose `[i]` form
 reads a specific coordinate axis of a multi-axis fit (`@when:personas[3] > 0.4`);
 both match the keys `Monitor.flat_scalars` emits. The coordinate is
@@ -259,6 +269,64 @@ The template is a first-class artifact with **two** consumers:
   is its materialization, and the resolved template's content hash folds into
   `nodes_sha256` so a context/value edit re-fits. There is no embedded `template`
   block anymore — `manifold from-template` replaces the former `manifold template`.
+
+## Jacobian lens
+
+The third artifact family, **per-model** rather than per-concept (Gurnee et al.,
+"Verbalizable Representations Form a Global Workspace in Language Models",
+Transformer Circuits 2026). The lens is one matrix per source layer,
+`J_l = E[∂h_final/∂h_l]` — the average first-order effect of a layer's residual
+on the final-layer residual over positions and a web-text corpus — stored at
+`models/<safe_model_id>/jlens.{safetensors,json}` (fp16, `LENS_FORMAT_VERSION = 1`,
+sidecar records the corpus spec + sha256). `lens fit` runs the estimator
+(`core/jlens.py::fit_jacobian_lens` — one forward per prompt with the prompt
+replicated `dim_batch`× and the graph retained, then `ceil(d_model/dim_batch)`
+backwards with one-hot cotangents at every valid target position; the **only**
+backward passes in saklas — everything else runs under `inference_mode`, so the
+fit seeds a grad leaf at the first block's input via a pre-hook and reads
+per-layer grads with `tensor.register_hook`, never `retain_grad`). Fits resume
+by default (corpus-hash match + checkpoint every 25 prompts); `-f` restarts.
+
+Three read surfaces, one write surface:
+
+- **Readout** — `lens top` / `session.jlens_readout`: `softmax(W_U · norm(J_l h))`
+  ranks the vocabulary by what an intermediate activation is disposed to make the
+  model say. `session.enable_live_lens()` streams the top-k per selected layer
+  every decode step (`TokenEvent.lens_readout`, TUI `/lens` → WORKSPACE section);
+  the reader consumes the capture's latest slices post-forward at the token tap —
+  no new forward hooks, so steering fast-path/compile eligibility is untouched.
+- **Steering atoms** — `jlens/<word>` is an ordinary `ns/name` atom; the J-lens
+  direction for vocab id v at layer l is `W_U[v] @ J_l`, a per-layer direction
+  registered lazily into the profile registry (`session.register_jlens_direction`,
+  reached from both `ensure_profile_registered` and `_resolve_probe_manifold`)
+  and **restricted to the workspace band** (40–90% depth) — in the motor regime
+  the lens direction converges on the raw unembedding row, so pushing there is
+  token-forcing (live-verified to shatter into token loops at every α), and the
+  early third is noise. `0.3 jlens/orange` pushes, `!jlens/fake` ablates (the
+  paper's eval-awareness ablation), and it composes with every other term.
+  Lens atoms run **hotter** than concept vectors: on gemma-3-4b α≈0.3 is the
+  coherent sweet spot and α≥0.5 over-steers into repetition (a single sharp
+  token direction, not a distributed contrast). Single-token words only —
+  a multi-token word raises `MultiTokenWordError` listing the pieces. The `jlens`
+  manifold namespace is reserved (authoring under it raises).
+- **Gates** — `@when:jlens/<word> > x` attaches the direction as a rank-1 probe.
+  NOTE the semantics: the gate reads the saklas-native **whitened coordinate**
+  along the lens direction (one gate pipeline, whitener required), not the
+  paper's raw inner product — the paper-faithful raw readout is the top-k lens
+  channel, which is display-only. The `@when:` grammar also accepts a namespaced
+  probe on every channel shape (`default/emotions@happy`).
+- **Decomposition** — `lens decompose` / `session.jspace_decompose`: greedy
+  sparse nonnegative pursuit of any steerable direction against the lens
+  dictionary `W_U J_l` (never materialized; norm-normalized correlations,
+  k≈16), reporting the per-layer variance **share** — how verbalizable the
+  direction is; the paper finds ~6–15% for concept vectors — plus the
+  contributing tokens.
+
+The fit needs a pretraining-like corpus: `--corpus FILE` (one document per
+line) or, unset, a streamed fineweb-edu sample via the optional `datasets`
+dependency (`pip install 'saklas[hf]'`). ~100 prompts is usable, 1000 is
+paper-parity; gemma-3-4b at `--dim-batch 32` fits 100 prompts in ~15–20 min
+on an M5 Max.
 
 ## Extraction
 
@@ -669,8 +737,10 @@ Key contracts:
   the `LoomTree`/`Recipe`/`Transcript` suites, their error types, and additionally:
   `ChoiceScores`/`ChoiceScore`; `parse_expr`/`format_expr`; term types
   `ManifoldTerm`/`ProjectedTerm`/`AblationTerm`; selector errors
-  `SelectorError`/`AmbiguousSelectorError`; and
-  `ManifoldNotRegisteredError`/`VectorNotRegisteredError`). `from saklas
+  `SelectorError`/`AmbiguousSelectorError`;
+  `ManifoldNotRegisteredError`/`VectorNotRegisteredError`; and the Jacobian-lens
+  suite `JacobianLens`/`JSpaceDecomposition` with errors
+  `JacobianLensError`/`LensNotFittedError`/`MultiTokenWordError`). `from saklas
   import X` is stable; private submodule paths are not.
 
 ## Cache layout
@@ -698,6 +768,8 @@ All state under `~/.saklas/` (override via `$SAKLAS_HOME`):
                                        # probe-centering mean is its per-layer X.mean(0),
                                        # the whitener covariance is built from the stack
     alignments/<safe_src>.{safetensors,json} # optional cross-model Procrustes map
+    jlens.{safetensors,json}           # per-model Jacobian lens (fp16 J_l per
+                                       # layer + corpus-spec sidecar; `lens fit`)
   vectors/<ns>/<concept>/              # LEGACY (pre-4.0) packs only — ported to
                                        # manifolds/ on first touch; no longer written
   conversations/<name>.json            # explicit loom-tree saves (no autosave)

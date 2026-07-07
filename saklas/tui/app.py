@@ -806,6 +806,40 @@ class SaklasApp(App[None]):
         chat.add_system_message(f"{label} set to {val}")
         self._refresh_gen_config()
 
+    def _handle_lens(self, arg: str) -> None:
+        """``/lens [off | L1,L2,...]`` — toggle the live J-lens workspace readout.
+
+        Bare ``/lens`` enables with the default mid-band layer subset (or
+        disables when already on); ``/lens off`` disables; a comma-separated
+        layer list selects specific fitted layers.
+        """
+        arg = arg.strip()
+        if arg == "off" or (not arg and self._session.live_lens_layers is not None):
+            self._session.disable_live_lens()
+            self._trait_panel.set_lens_active(None)
+            self._chat_panel.add_system_message("Live lens readout off.")
+            return
+        layers: list[int] | None = None
+        if arg:
+            try:
+                layers = [int(part) for part in arg.split(",") if part.strip()]
+            except ValueError:
+                self._chat_panel.add_system_message(
+                    f"/lens: bad layer list {arg!r} (want e.g. /lens 20,30,40)"
+                )
+                return
+        try:
+            resolved = self._session.enable_live_lens(layers=layers)
+        except SaklasError as e:
+            self._chat_panel.add_system_message(e.user_message()[1])
+            return
+        self._trait_panel.set_lens_active(resolved)
+        self._chat_panel.add_system_message(
+            "Live lens readout on — layers "
+            + ",".join(str(l) for l in resolved)
+            + ". Top workspace tokens stream in the WORKSPACE section."
+        )
+
     def _handle_temp(self, arg: str) -> None:
         self._set_config_value(
             "temperature", arg,
@@ -1436,9 +1470,12 @@ class SaklasApp(App[None]):
                         # attached or ``live_scores`` is off; otherwise the
                         # full per-probe ``ProbeReading`` dict the trait
                         # panel's curved section renders mid-gen.
+                        # Optional 10th slot: the live J-lens workspace
+                        # readout (``/lens``) — None when the live lens is
+                        # off.
                         ("tok", event.text, event.thinking, event.scores,
                          event.perplexity, event.logprob, widget, False,
-                         event.probe_readings),
+                         event.probe_readings, event.lens_readout),
                     )
                     self._gen_token_count += 1
                 # Normal completion — pull per-token scores out of the
@@ -1928,7 +1965,13 @@ class SaklasApp(App[None]):
                 # section renders mid-gen.  Falls back to ``None`` for legacy
                 # producers (e.g. test stubs) that emit the 8-element form.
                 manifold_readings = None
-                if len(item) >= 9:
+                lens_readout = None
+                if len(item) >= 10:
+                    (
+                        _, token, is_thinking, scores, perplexity, logprob,
+                        widget, is_shadow, manifold_readings, lens_readout,
+                    ) = item
+                elif len(item) >= 9:
                     (
                         _, token, is_thinking, scores, perplexity, logprob,
                         widget, is_shadow, manifold_readings,
@@ -1947,6 +1990,10 @@ class SaklasApp(App[None]):
                     self._trait_panel.update_manifold_readings(
                         per_token=manifold_readings,
                     )
+                if lens_readout is not None and not is_shadow:
+                    # Live J-lens workspace readout (``/lens``): same
+                    # shadow-skip rule as the probe rack.
+                    self._trait_panel.update_lens_readout(lens_readout)
                 if widget is not None:
                     if is_thinking:
                         widget.append_thinking_token(token)

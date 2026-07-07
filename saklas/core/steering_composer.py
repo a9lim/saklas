@@ -305,6 +305,17 @@ class SteeringComposer:
         else:
             canonical, variant = name, "raw"
 
+        # (1b) Reserved J-lens namespace: ``jlens/<word>`` resolves lazily
+        # through the model's fitted Jacobian lens (a per-layer ``W_U[v]@J_l``
+        # direction registered into the ordinary profile registry).  Raises
+        # ``LensNotFittedError`` (with the fit command) or
+        # ``MultiTokenWordError`` — never falls through to extraction.
+        if canonical.startswith("jlens/") and variant == "raw":
+            registered = self._session.register_jlens_direction(
+                canonical.split("/", 1)[1]
+            )
+            return profiles[registered]
+
         # (2) Manifold first — native or previously ported.
         folded = self.try_fold_manifold(name)
         if folded is not None:

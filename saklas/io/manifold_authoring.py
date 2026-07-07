@@ -72,6 +72,31 @@ def iter_manifold_folders(
                 continue
 
 
+#: Namespaces no manifold may be authored under. ``jlens`` is the steering
+#: grammar's lazily-resolved Jacobian-lens tier (``jlens/<word>`` = a lens
+#: token direction) — a manifold folder there would shadow that resolution.
+RESERVED_NAMESPACES = frozenset({"jlens"})
+
+
+def _validate_ns_name(namespace: str, name: str) -> None:
+    """Shared name/namespace gate for every folder-creation entry point."""
+    if not NAME_REGEX.match(name):
+        raise ManifoldFormatError(
+            f"manifold name {name!r} invalid; must match {NAME_REGEX.pattern}"
+        )
+    if not NAME_REGEX.match(namespace):
+        raise ManifoldFormatError(
+            f"manifold namespace {namespace!r} invalid; "
+            f"must match {NAME_REGEX.pattern}"
+        )
+    if namespace in RESERVED_NAMESPACES:
+        raise ManifoldFormatError(
+            f"manifold namespace {namespace!r} is reserved — "
+            f"'jlens/<word>' resolves through the model's Jacobian lens, "
+            f"not a manifold folder"
+        )
+
+
 def _validate_authored_nodes(name: str, domain: Any, nodes: Any) -> None:
     """Validate a webui/CLI-authored node list against the domain.
 
@@ -182,15 +207,7 @@ def create_manifold_folder(
     Raises :class:`ManifoldFormatError` on any validation failure and
     :class:`FileExistsError` when a manifold already lives at the path.
     """
-    if not NAME_REGEX.match(name):
-        raise ManifoldFormatError(
-            f"manifold name {name!r} invalid; must match {NAME_REGEX.pattern}"
-        )
-    if not NAME_REGEX.match(namespace):
-        raise ManifoldFormatError(
-            f"manifold namespace {namespace!r} invalid; "
-            f"must match {NAME_REGEX.pattern}"
-        )
+    _validate_ns_name(namespace, name)
     try:
         domain = domain_from_spec(domain_spec)
     except (ValueError, KeyError) as e:
@@ -362,15 +379,7 @@ def create_discover_manifold_folder(
     ``vector transfer`` path builds and writes a ``_from-<safe_src>``
     variant tensor, mirroring how transferred steering vectors land.
     """
-    if not NAME_REGEX.match(name):
-        raise ManifoldFormatError(
-            f"manifold name {name!r} invalid; must match {NAME_REGEX.pattern}"
-        )
-    if not NAME_REGEX.match(namespace):
-        raise ManifoldFormatError(
-            f"manifold namespace {namespace!r} invalid; "
-            f"must match {NAME_REGEX.pattern}"
-        )
+    _validate_ns_name(namespace, name)
     if fit_mode not in _FIT_MODES_DISCOVER:
         raise ManifoldFormatError(
             f"discover manifold {name!r} fit_mode {fit_mode!r} invalid; "
@@ -476,15 +485,7 @@ def create_baked_manifold_folder(
     :class:`FileExistsError` when a manifold already lives at the path and
     ``force`` is ``False``.
     """
-    if not NAME_REGEX.match(name):
-        raise ManifoldFormatError(
-            f"manifold name {name!r} invalid; must match {NAME_REGEX.pattern}"
-        )
-    if not NAME_REGEX.match(namespace):
-        raise ManifoldFormatError(
-            f"manifold namespace {namespace!r} invalid; "
-            f"must match {NAME_REGEX.pattern}"
-        )
+    _validate_ns_name(namespace, name)
 
     folder = manifold_dir(namespace, name)
     if (folder / "manifold.json").exists():
@@ -705,15 +706,7 @@ def init_discover_manifold_folder(
     label / role, and :class:`FileExistsError` when a manifold already
     lives at the path.
     """
-    if not NAME_REGEX.match(name):
-        raise ManifoldFormatError(
-            f"manifold name {name!r} invalid; must match {NAME_REGEX.pattern}"
-        )
-    if not NAME_REGEX.match(namespace):
-        raise ManifoldFormatError(
-            f"manifold namespace {namespace!r} invalid; "
-            f"must match {NAME_REGEX.pattern}"
-        )
+    _validate_ns_name(namespace, name)
     if fit_mode not in _FIT_MODES_DISCOVER:
         raise ManifoldFormatError(
             f"discover manifold {name!r} fit_mode {fit_mode!r} invalid; "

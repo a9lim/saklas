@@ -10,6 +10,7 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from enum import Enum, IntEnum
 from types import TracebackType
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Literal, cast, overload
 
 import torch
@@ -1120,6 +1121,10 @@ class SaklasSession:
         # ad-hoc later extraction lazily builds via ``self.whitener``.
         self._layer_means: dict[int, torch.Tensor] = {}
         self._whitener: Any = None
+        self._jlens: Any = None  # lazy per-model Jacobian lens (io/lens.py)
+        # Live workspace readout (enable_live_lens): device-resident J_l
+        # subset + settings, or None when off.
+        self._live_lens: dict[str, Any] | None = None
         if probe_categories:
             self._layer_means = bootstrap_layer_means(
                 self._model, self._tokenizer, self._layers, self._model_info,
@@ -1612,6 +1617,410 @@ class SaklasSession:
                 type(exc).__name__, exc,
             )
             return None
+
+    # -- Jacobian lens (verbalizable-workspace readout) --
+
+    @property
+    def jlens(self) -> "Any":
+        """The model's fitted Jacobian lens, or ``None`` when not fitted.
+
+        Loaded lazily from the per-model artifact
+        (``models/<safe_id>/jlens.safetensors``); fit one with
+        :meth:`fit_jlens` or ``saklas lens fit``. Returns a
+        :class:`saklas.core.jlens.JacobianLens`.
+        """
+        if self._jlens is None:
+            from saklas.io.lens import load_lens
+
+            loaded = load_lens(self.model_id)
+            if loaded is not None:
+                self._jlens = loaded[0]
+        return self._jlens
+
+    def _require_jlens(self) -> "Any":
+        from saklas.core.jlens import LensNotFittedError
+
+        lens = self.jlens
+        if lens is None:
+            raise LensNotFittedError(
+                f"no Jacobian lens fitted for {self.model_id} — run "
+                f"`saklas lens fit {self.model_id}` first"
+            )
+        return lens
+
+    def fit_jlens(
+        self,
+        prompts: "Sequence[str]",
+        *,
+        corpus_spec: str = "custom",
+        source_layers: "Sequence[int] | None" = None,
+        dim_batch: int | None = None,
+        seq_len: int | None = None,
+        force: bool = False,
+        on_progress: Callable[[str], None] | None = None,
+    ) -> "Any":
+        """Fit (or resume fitting) this model's Jacobian lens and persist it.
+
+        Prompts too short for the estimator (≤ ``SKIP_FIRST_POSITIONS + 1``
+        tokens) are dropped up front so the saved ``n_prompts`` counts
+        consumed prompts exactly — that is what makes resume slicing sound.
+        Resume-by-default: when a saved lens matches this corpus (sha256 of
+        the filtered prompts) and covers fewer prompts than requested, only
+        the remainder is fitted and merged in; ``force=True`` restarts from
+        zero. Checkpoints every ``DEFAULT_CHECKPOINT_EVERY`` prompts, so an
+        interrupted fit resumes from the last checkpoint.
+
+        Gated against generation: the fit runs forward *and backward* passes
+        through the model (the only backward passes in saklas).
+        """
+        import hashlib
+
+        from saklas.core.jlens import (
+            DEFAULT_DIM_BATCH,
+            DEFAULT_SEQ_LEN,
+            SKIP_FIRST_POSITIONS,
+            JacobianLens,
+            JacobianLensError,
+            fit_jacobian_lens,
+        )
+        from saklas.io.lens import load_lens, save_lens
+
+        dim_batch = dim_batch or DEFAULT_DIM_BATCH
+        seq_len = seq_len or DEFAULT_SEQ_LEN
+
+        with self._model_exclusive(
+            "session.fit_jlens called while another model use is in flight",
+            phase_msg="session.fit_jlens called while a generation is in flight",
+        ):
+            usable = [
+                p for p in prompts
+                if self._tokenizer(p, return_tensors="pt")["input_ids"].shape[1]
+                > SKIP_FIRST_POSITIONS + 1
+            ]
+            if len(usable) < len(prompts) and on_progress is not None:
+                on_progress(
+                    f"dropped {len(prompts) - len(usable)} too-short prompts "
+                    f"({len(usable)} usable)"
+                )
+            if not usable:
+                raise JacobianLensError(
+                    "no usable prompts: the Jacobian estimator needs prompts "
+                    f"longer than {SKIP_FIRST_POSITIONS + 1} tokens"
+                )
+            corpus_sha = hashlib.sha256(
+                "\n\x00".join(usable).encode("utf-8")
+            ).hexdigest()
+
+            base: Any = None
+            if not force:
+                existing = load_lens(self.model_id)
+                if existing is not None:
+                    lens, sidecar = existing
+                    if (
+                        sidecar.get("corpus_sha256") == corpus_sha
+                        and sidecar.get("seq_len") == seq_len
+                    ):
+                        if lens.n_prompts >= len(usable):
+                            if on_progress is not None:
+                                on_progress(
+                                    f"lens already fitted on {lens.n_prompts} "
+                                    "prompts — nothing to do"
+                                )
+                            self._jlens = lens
+                            return lens
+                        base = lens
+                        usable = usable[lens.n_prompts:]
+                        if on_progress is not None:
+                            on_progress(
+                                f"resuming from {lens.n_prompts} prompts "
+                                f"({len(usable)} remaining)"
+                            )
+
+            def _save(partial: "Any") -> "Any":
+                merged = (
+                    JacobianLens.merge([base, partial]) if base is not None else partial
+                )
+                save_lens(
+                    merged, self.model_id,
+                    corpus_spec=corpus_spec, corpus_sha256=corpus_sha,
+                    seq_len=seq_len, dim_batch=dim_batch,
+                    skip_first=SKIP_FIRST_POSITIONS,
+                )
+                return merged
+
+            fitted = fit_jacobian_lens(
+                self._model, self._tokenizer, usable, self._layers,
+                source_layers=source_layers, dim_batch=dim_batch,
+                max_seq_len=seq_len, checkpoint_cb=_save,
+                on_progress=on_progress,
+            )
+            merged = _save(fitted)
+            self._jlens = merged
+            return merged
+
+    def jlens_readout(
+        self,
+        prompt: str,
+        *,
+        layers: "Sequence[int] | None" = None,
+        positions: "Sequence[int] | None" = None,
+        top_k: int = 10,
+    ) -> dict[int, list[list[tuple[str, float]]]]:
+        """Jacobian-lens readout on a raw prompt: the top-``top_k`` vocabulary
+        tokens per (layer, position), with log-probabilities.
+
+        ``layers`` defaults to every fitted layer; ``positions`` defaults to
+        the final position only (pass explicit indices, negative ok, for
+        more). Returns ``{layer: [per-position [(token, logprob), ...]]}``.
+        One vocab-sized matvec per (layer, position row) — full-position
+        sweeps over all layers are an offline-analysis cost, not a decode
+        cost.
+        """
+        from saklas.core.jlens import lens_logits
+        from saklas.core.model import get_final_norm, get_unembedding
+        from saklas.core.vectors import _capture_all_hidden_states
+
+        lens = self._require_jlens()
+        req = list(layers) if layers is not None else list(lens.source_layers)
+        missing = [l for l in req if l not in lens.jacobians]
+        if missing:
+            raise ValueError(
+                f"layers {missing} not in the fitted lens "
+                f"(fitted: {lens.source_layers[0]}..{lens.source_layers[-1]})"
+            )
+        with self._model_exclusive(
+            "session.jlens_readout called while another model use is in flight",
+            phase_msg="session.jlens_readout called while a generation is in flight",
+        ):
+            ids = self._tokenizer(prompt, return_tensors="pt")["input_ids"].to(
+                self._device
+            )
+            hidden = _capture_all_hidden_states(
+                self._model, self._layers, ids, layer_indices=req,
+            )
+            unembed = get_unembedding(self._model)
+            norm = get_final_norm(self._model)
+            n_pos = ids.shape[1]
+            pos = (
+                [n_pos - 1]
+                if positions is None
+                else [p if p >= 0 else n_pos + p for p in positions]
+            )
+            out: dict[int, list[list[tuple[str, float]]]] = {}
+            for layer in req:
+                h = hidden[layer][0, pos, :]
+                logits = lens_logits(
+                    lens, {layer: h}, unembed=unembed, final_norm=norm,
+                    layers=[layer],
+                )[layer]
+                logprobs = torch.log_softmax(logits, dim=-1)
+                vals, idxs = logprobs.topk(top_k, dim=-1)
+                out[layer] = [
+                    [
+                        (str(self._tokenizer.decode([int(i)])), float(v))
+                        for v, i in zip(vrow, irow)
+                    ]
+                    for vrow, irow in zip(vals.cpu(), idxs.cpu())
+                ]
+            return out
+
+    def register_jlens_direction(self, word: str) -> str:
+        """Register the J-lens direction for a single-token word as a profile.
+
+        The direction (``W_U[v] @ J_l`` per layer) lands in the ordinary
+        profile registry under ``jlens/<word>``, so it steers, ablates, and
+        probes exactly like an extracted vector. Idempotent. This is the
+        shared resolver behind the lazy ``jlens/`` steering and probe
+        branches.
+
+        Restricted to the **workspace band** (40–90% depth): in the motor
+        regime a lens direction converges on the raw unembedding row, so
+        pushing there is direct token-forcing — live-verified on gemma-3-4b
+        to shatter into token loops at every α — and the early third of the
+        lens is noise. The paper's own injection/ablation experiments act on
+        the workspace layers only.
+        """
+        from saklas.core.jlens import resolve_word_token
+        from saklas.core.model import get_unembedding
+
+        name = f"jlens/{word}"
+        if name in self._profiles:
+            return name
+        lens = self._require_jlens()
+        token_id = resolve_word_token(self._tokenizer, word)
+        directions = lens.token_direction(token_id, get_unembedding(self._model))
+        band = set(self._jlens_workspace_band(lens))
+        self._profiles[name] = {
+            l: d for l, d in directions.items() if l in band
+        }
+        self._invalidate_prefix_cache()
+        self._invalidate_analytics_cache()
+        return name
+
+    def enable_live_lens(
+        self,
+        *,
+        layers: "Sequence[int] | None" = None,
+        top_k: int = 5,
+    ) -> list[int]:
+        """Stream the J-lens readout live during generation.
+
+        Every decode step, the top-``top_k`` lens tokens at each selected
+        layer ride ``TokenEvent.lens_readout`` (and the TUI's ``/lens``
+        panel). ``layers`` defaults to five fitted layers evenly spaced over
+        the 40–90% depth band (the paper's workspace range). The selected
+        layers' ``J_l`` move device-resident here, once — the per-step cost
+        is one d×d matvec + one vocab matvec + an on-device top-k per layer.
+
+        Attaches **no forward hooks** (the reader consumes the capture's
+        existing latest-slice buffers post-forward), so steering fast-path /
+        compile eligibility is untouched; the one concession is that capture
+        itself routes through transient hooks while the live lens is on
+        (the persistent compiled-clean capture buffers only cover probe
+        layers). Returns the resolved layer list.
+        """
+        from saklas.core.model import get_final_norm, get_unembedding
+
+        lens = self._require_jlens()
+        if layers is None:
+            band = self._jlens_workspace_band(lens)
+            count = min(5, len(band))
+            step = (len(band) - 1) / max(count - 1, 1)
+            layers = sorted({band[round(i * step)] for i in range(count)})
+        else:
+            layers = sorted(set(int(l) for l in layers))
+            missing = [l for l in layers if l not in lens.jacobians]
+            if missing:
+                raise ValueError(
+                    f"layers {missing} not in the fitted lens "
+                    f"(fitted: {lens.source_layers[0]}..{lens.source_layers[-1]})"
+                )
+        device = self._device
+        self._live_lens = {
+            "layers": list(layers),
+            "top_k": int(top_k),
+            "J": {l: lens.jacobians[l].to(device) for l in layers},
+            "unembed": get_unembedding(self._model),
+            "norm": get_final_norm(self._model),
+            "decode_cache": {},
+        }
+        return list(layers)
+
+    def disable_live_lens(self) -> None:
+        """Stop streaming the live lens readout and free the device J_l copies."""
+        self._live_lens = None
+
+    @property
+    def live_lens_layers(self) -> list[int] | None:
+        """The live lens readout's layer list, or ``None`` when it's off."""
+        if self._live_lens is None:
+            return None
+        return list(self._live_lens["layers"])
+
+    def _jlens_workspace_band(self, lens: "Any") -> list[int]:
+        """Fitted lens layers in the 40–90% depth band — the paper's
+        workspace range. Falls back to every fitted layer for models too
+        shallow to have a band (the CPU-test toys)."""
+        n = len(self._layers)
+        band = [
+            l for l in lens.source_layers if 0.40 <= l / max(n - 1, 1) <= 0.90
+        ]
+        return band or list(lens.source_layers)
+
+    def _live_lens_readout_step(self) -> "dict[int, list[tuple[str, float]]] | None":
+        """One decode step's lens readout from the capture's latest slices.
+
+        Runs post-forward at the token tap (never inside a hook). On-device
+        matvecs + top-k; one small host transfer per step; token decoding
+        memoized across steps.
+        """
+        state = self._live_lens
+        if state is None:
+            return None
+        buckets = self._capture.per_layer_buckets()
+        unembed = state["unembed"]
+        cache: dict[int, str] = state["decode_cache"]
+        vals_by_layer: list[torch.Tensor] = []
+        idxs_by_layer: list[torch.Tensor] = []
+        layers_present: list[int] = []
+        for layer in state["layers"]:
+            bucket = buckets.get(layer)
+            if not bucket:
+                continue
+            h = bucket[-1].to(torch.float32)
+            transported = h @ state["J"][layer].T
+            normed = state["norm"](transported)
+            logits = normed.to(unembed.dtype) @ unembed.T
+            vals, idxs = logits.float().topk(state["top_k"])
+            layers_present.append(layer)
+            vals_by_layer.append(vals)
+            idxs_by_layer.append(idxs)
+        if not layers_present:
+            return None
+        # one batched host transfer for the whole step
+        all_vals = torch.stack(vals_by_layer).cpu()
+        all_idxs = torch.stack(idxs_by_layer).cpu()
+        out: dict[int, list[tuple[str, float]]] = {}
+        for row, layer in enumerate(layers_present):
+            pairs: list[tuple[str, float]] = []
+            for v, i in zip(all_vals[row], all_idxs[row]):
+                tid = int(i)
+                tok = cache.get(tid)
+                if tok is None:
+                    tok = str(self._tokenizer.decode([tid]))
+                    cache[tid] = tok
+                pairs.append((tok, float(v)))
+            out[layer] = pairs
+        return out
+
+    def jspace_decompose(
+        self,
+        selector: str,
+        *,
+        k: int = 16,
+        layers: "Sequence[int] | None" = None,
+    ) -> dict[int, tuple[float, list[tuple[str, float]]]]:
+        """Split a direction into its J-space component, per layer.
+
+        ``selector`` resolves through the ordinary steering resolver
+        (registered profile → fitted 2-node manifold → …), so any steerable
+        vector decomposes. Returns ``{layer: (share, [(token, coeff), ...])}``
+        — ``share`` is the fraction of the direction's variance carried by
+        its best sparse nonnegative combination of ``k`` J-lens vectors
+        (the paper's measure of how *verbalizable* the direction is; ~6–15%
+        is typical for concept vectors, most of whose variance lies outside
+        the workspace).
+        """
+        from saklas.core.jlens import sparse_nonneg_decompose
+        from saklas.core.model import get_unembedding
+
+        lens = self._require_jlens()
+        directions = self._ensure_profile_registered(selector)
+        unembed = get_unembedding(self._model)
+        req = [
+            l
+            for l in (layers if layers is not None else lens.source_layers)
+            if l in directions and l in lens.jacobians
+        ]
+        if not req:
+            raise ValueError(
+                f"no overlap between {selector!r}'s layers and the fitted "
+                f"lens layers"
+            )
+        out: dict[int, tuple[float, list[tuple[str, float]]]] = {}
+        for layer in req:
+            dec = sparse_nonneg_decompose(
+                directions[layer], lens.jacobians[layer], unembed,
+                layer=layer, k=k,
+            )
+            out[layer] = (
+                dec.share,
+                [
+                    (str(self._tokenizer.decode([tok])), coeff)
+                    for tok, coeff in dec.tokens
+                ],
+            )
+        return out
 
     # -- Extraction --
 
@@ -2777,10 +3186,17 @@ class SaklasSession:
         token once and scores every probe (the gated subset live-scored, the
         rest one-shot).  ``None`` (or empty) keeps the full per-token scoring.
         """
+        # ``getattr`` like ``_compiled_clean_eligible`` below — spec'd mock
+        # stubs carry class attributes only, not instance state.
+        live_lens = getattr(self, "_live_lens", None)
         if widen:
             layer_idxs = list(range(len(self._layers)))
         else:
             union: set[int] = self._monitor.probe_layers()
+            if live_lens is not None:
+                # The live workspace readout consumes the same latest-slice
+                # buffers the monitor does — its layers join the capture set.
+                union = union | set(live_lens["layers"])
             if not union:
                 # No probes ⇒ the degenerate FULL (capture-disabled) state.
                 self._capture_state = CaptureState()
@@ -2798,6 +3214,11 @@ class SaklasSession:
         # ``return_hidden``) falls back to transient capture hooks.
         use_persistent = bool(
             not widen
+            # The persistent compiled-clean buffers only cover probe layers;
+            # a live lens adds its own layers, so it routes capture through
+            # transient hooks (steering compile eligibility is unaffected —
+            # this is capture routing only).
+            and live_lens is None
             and getattr(self, "_compiled_clean_eligible", False)
             and self._capture_buffers
             and (
@@ -2903,6 +3324,14 @@ class SaklasSession:
             # optimization, so leave it off for the one-shot aggregate read.
             self._capture.set_aggregate_tail(_AGG_TAIL_DEPTH)
             self._capture_state.mode = CaptureMode.AGGREGATE_ONLY
+            self._monitor.enable_curved_warm(False)
+        elif not widen and live_lens is not None:
+            # Lens-only capture (live lens on, no probes): a bounded tail
+            # ring keeps the reader's latest slice fresh without FULL
+            # retention growing over the generation.  No step sink — the
+            # lens reader runs at the token tap, and with an empty probe
+            # roster finalize has nothing to score.
+            self._capture.set_aggregate_tail(_AGG_TAIL_DEPTH)
             self._monitor.enable_curved_warm(False)
         else:
             # FULL retention (the ``CaptureState`` default): return_hidden full
@@ -3267,6 +3696,8 @@ class SaklasSession:
         Mirrors the steering resolver, in order: (1) an in-memory baked
         ``Profile`` already in ``_profiles`` (ad-hoc ``extract`` / ``merge`` /
         projection results) → folded into a 1-node neutral-anchored ray;
+        (1b) a reserved ``jlens/<word>`` selector → the J-lens token direction
+        registered lazily then folded like any profile;
         (2) a fitted manifold on disk (``[ns/]name[:variant]``) → loaded
         directly, so a 2-node ``pca`` reads rank-1 and a discover / curved fit
         reads rank-R; (3) a bare concept with neither → extracted, then folded.
@@ -3274,6 +3705,13 @@ class SaklasSession:
         profile = self._profiles.get(selector)
         if profile is not None:
             return self._fold_profile_probe(selector, profile)
+        # Reserved J-lens namespace: resolve through the fitted lens artifact
+        # — WITHOUT this branch a gate-only ``add_probe("jlens/fake")`` would
+        # fall through to ``extract()`` and author a nonsense persona
+        # manifold literally named "jlens/fake".
+        if selector.startswith("jlens/"):
+            registered = self.register_jlens_direction(selector.split("/", 1)[1])
+            return self._fold_profile_probe(registered, self._profiles[registered])
         try:
             self._ensure_manifold_loaded(selector)
             return self._manifolds[selector]
@@ -4862,6 +5300,9 @@ class SaklasSession:
                     "readings": vector_readings,
                     "per_layer_scores": per_layer_payload,
                     "probe_readings": probe_readings,
+                    # Live workspace readout (None when off): the step's
+                    # top-k lens tokens per selected layer.
+                    "lens": self._live_lens_readout_step(),
                 }
                 if assistant_node_id is not None and tid is not None:
                     token_row: dict[str, Any] = {
@@ -5356,9 +5797,9 @@ class SaklasSession:
         idx_counter = [0]
 
         def _push(text: str, is_thinking: bool, tid: int | None, lp: float | None, top_alts: Any, perplexity: float | None) -> None:
+            payload = self._last_token_probe_payload or {}
             probe_readings: dict[str, "ProbeReading"] | None = None
             if live_scores and self._monitor.probe_names:
-                payload = self._last_token_probe_payload or {}
                 raw_readings = payload.get("readings")
                 if isinstance(raw_readings, dict) and raw_readings:
                     probe_readings = raw_readings
@@ -5373,6 +5814,7 @@ class SaklasSession:
                 text=text, token_id=tid if tid is not None else -1, index=idx_counter[0],
                 thinking=is_thinking, logprob=lp, top_alts=top_alts,
                 probe_readings=probe_readings, perplexity=perplexity,
+                lens_readout=payload.get("lens"),
             )
             idx_counter[0] += 1
             q.put(event)

@@ -359,6 +359,20 @@ ChatPanel.ab-on .turn-col.shadow {
     height: auto;
 }
 
+#lens-header {
+    height: auto;
+}
+
+#lens-scroll {
+    height: auto;
+    max-height: 12;
+    overflow-y: auto;
+}
+
+#lens-content {
+    height: auto;
+}
+
 #why-header {
     height: 1;
 }

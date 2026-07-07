@@ -498,6 +498,23 @@ Selectors are shared across surfaces: `<name>`, `<ns>/<name>`, `tag:<tag>`, `nam
 
 ---
 
+## Jacobian lens
+
+The Jacobian lens ([Gurnee et al. 2026](https://transformer-circuits.pub/2026/workspace/index.html)) reads out what an intermediate activation is disposed to make the model *say*: a per-layer matrix transports the residual into the final-layer basis, and the model's own unembedding decodes it into ranked vocabulary tokens. The paper shows these verbalizable directions form the model's global workspace — the small subspace its flexible reasoning routes through.
+
+Fit it once per model, then read, steer, gate, and decompose:
+
+```bash
+saklas lens fit google/gemma-3-4b-it --prompts 100        # one-time; resumes if interrupted
+saklas lens top google/gemma-3-4b-it "Fact: the currency used in the country shaped like a boot is"
+saklas lens decompose confident.uncertain -m google/gemma-3-4b-it   # how verbalizable is a concept vector?
+saklas serve google/gemma-3-4b-it -S "!jlens/fake"        # ablate a lens direction
+```
+
+`jlens/<word>` works anywhere a concept does: `0.3 jlens/orange` steers toward a token's lens direction, `!jlens/fake` ablates it, and `@when:jlens/fake > 0.4` gates another term on it. Lens directions run hotter than concept vectors — start around 0.3 rather than 0.5. In the TUI, `/lens` streams the top workspace tokens per layer live while the model generates. The fit needs a web-text corpus — pass `--corpus FILE` or `pip install 'saklas[hf]'` to stream a default sample.
+
+---
+
 ## Supported architectures
 
 **Tested**: Qwen, Gemma, Ministral, gpt-oss, Llama, GLM, Talkie.

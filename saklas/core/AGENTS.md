@@ -24,7 +24,49 @@ warning + eager fallback (`use_static_cuda_launcher` forced off — Gemma-4 + to
 sub-models (Ministral-as-Mistral3), strips `language_model.` prefixes,
 dequantizes FP8. `patch_torch_for_mps()` installs two lazy MPS-only workarounds
 (`torch.histc` integer→float for MoE routing; `torch.ldexp` MXFP4 round-trip
-through CPU honoring `out=`).
+through CPU honoring `out=`). `get_unembedding(model)` returns `W_U`
+(`get_output_embeddings().weight`, `[vocab, d]`) and `get_final_norm(model)` the
+pre-unembedding norm module (found as a sibling of the `get_layers` ModuleList —
+`norm`/`final_layernorm`/`ln_f`/`final_norm` — rather than a second per-arch
+table); both exist for the Jacobian lens readout, nothing else in saklas touches
+the unembedding outside the model's own forward.
+
+## jlens.py
+
+The Jacobian lens (Gurnee et al. 2026): `J_l = E[∂h_final/∂h_l]` per source
+layer, averaged over positions ≥ `SKIP_FIRST_POSITIONS` (16, attention sinks)
+and a text corpus. `fit_jacobian_lens(model, tokenizer, prompts, layer_modules,
+…)` is the **only backward-pass code in saklas**: everything else runs under
+`inference_mode`, and with frozen params + integer inputs no autograd graph
+exists at all, so the fit runs under `torch.enable_grad()` with a
+`register_forward_pre_hook` on the first block that returns a
+`requires_grad_(True)` clone of its input (reuses `get_layers`, zero per-arch
+wiring). Per prompt: one forward with the prompt replicated `dim_batch`× on the
+batch axis (graph retained), then `ceil(d_model/dim_batch)` backwards — batch
+element `b` of pass `p` carries a one-hot cotangent at output dim
+`p·dim_batch+b` injected at every valid target position, so the grad at source
+position `t` is `Σ_{t'≥t} ∂h_final[t']/∂h_l[t]`; mean over source positions;
+one backward populates every source layer. Grads are read with
+`tensor.register_hook` — NOT `retain_grad()`, whose `.grad` accumulation across
+the multi-backward loop would corrupt the rows — into per-prompt CPU fp32
+buffers folded into the accumulator only on success (an OOM retry, which halves
+`dim_batch`, can't double-count). `checkpoint_cb` fires every
+`DEFAULT_CHECKPOINT_EVERY` (25) prompts for resumable fits;
+`JacobianLens.merge` is the n_prompts-weighted shard combiner.
+
+`JacobianLens` holds the fp32 matrices: `transport(h, layer)` maps a residual
+into the final basis; `token_direction(v, unembed)` is `W_U[v] @ J_l` per layer
+— the profile-shaped direction behind `jlens/<word>` atoms; `lens_logits`
+(free function) is the full readout `W_U · norm(J_l h)` (matvec in the
+unembed's own dtype — a fp32 W_U copy would be GBs). `resolve_word_token` maps
+a word to its single vocab id (leading-space piece first, decode-and-compare
+sanity check, `MultiTokenWordError` with the pieces otherwise).
+`sparse_nonneg_decompose` is the J-space split: greedy pursuit against the
+dictionary `W_U J_l` — never materialized (scores are the composed matvec,
+normalized by chunk-computed atom norms; only selected rows form), coefficient
+re-solve as a tiny projected-gradient NNLS per step — returning
+`JSpaceDecomposition(layer, share, tokens)`. Errors: `JacobianLensError` (422),
+`LensNotFittedError` (404), `MultiTokenWordError` (400), all `SaklasError`s.
 
 ## vectors.py
 
@@ -723,7 +765,10 @@ a `%` push) and routes variants.
 
 **Steering resolution (manifold-first).** `_ensure_profile_registered(name)`
 resolves a direction from, in order: (1) an in-memory baked direction already in
-`_profiles` (ad-hoc `extract`/`merge`/projection results); (2) a fitted
+`_profiles` (ad-hoc `extract`/`merge`/projection results); (1b) the reserved
+`jlens/` namespace — `register_jlens_direction` resolves the word through the
+fitted Jacobian lens (raising `LensNotFittedError`/`MultiTokenWordError`, never
+falling through to extraction); (2) a fitted
 2-node `pca` manifold on disk — `_try_fold_manifold` → `_ensure_manifold_loaded`
 (load `[ns/]name[:variant]`, raw or `sae-<release>`) + `folded_vector_directions`,
 memoized into `_profiles`; (3) a stale (`< PACK_FORMAT_VERSION`) legacy
@@ -788,6 +833,29 @@ per row). The alpha *sweep* steers the prompt at varying strength by constructio
 events: `GenerationStarted`/`SteeringApplied`/
 `SteeringCleared`/`ProbeScored`/`GenerationFinished` + `VectorExtracted`/
 `ManifoldExtracted`; threaded subscribers hop via `loop.call_soon_threadsafe`.
+
+**Jacobian-lens surface.** `session.jlens` lazy-loads the per-model artifact
+(`io/lens.py`, like `whitener`); `fit_jlens(prompts, …)` pre-filters too-short
+prompts (so the saved `n_prompts` counts consumed prompts exactly — what makes
+resume slicing sound), hashes the filtered corpus, resumes a matching partial
+fit by default (`force=True` restarts), checkpoints via the io layer, and gates
+under `_model_exclusive` (forward AND backward passes).
+`jlens_readout(prompt, layers=, positions=, top_k=)` is the offline readout
+(captures via `_capture_all_hidden_states`, default final position only).
+`register_jlens_direction(word)` lands `W_U[v] @ J_l` in `_profiles` under
+`jlens/<word>` — the shared resolver behind the two lazy `jlens/` branches
+(steering: `ensure_profile_registered`; probes: `_resolve_probe_manifold`,
+without which a gate-only `add_probe("jlens/x")` would fall through to
+`extract()` and author a nonsense manifold). `jspace_decompose(selector, k=,
+layers=)` resolves any steerable direction and splits it against the lens
+dictionary. **Live lens** (`enable_live_lens`/`disable_live_lens`/
+`live_lens_layers`): the selected layers' `J_l` go device-resident, join the
+capture-widen union in `_begin_capture` (which also forces transient — not
+persistent — capture routing, and arms a bounded tail ring when no probes are
+attached), and `_live_lens_readout_step` runs at the token tap post-forward —
+no new forward hooks, `static_steerable` untouched — landing the per-step
+top-k on `TokenEvent.lens_readout` and the `_last_token_probe_payload["lens"]`
+slot. Default layer subset: five fitted layers over the 40–90% depth band.
 
 ## loom.py
 

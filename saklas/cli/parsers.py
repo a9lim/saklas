@@ -119,6 +119,19 @@ _TEMPLATE_VERBS: list[tuple[str, str]] = [
     ("rm",      "Remove a template folder"),
 ]
 
+# Verb table for ``saklas lens <verb>`` — the per-model Jacobian lens
+# (Gurnee et al. 2026): per-layer transport ``J_l = E[∂h_final/∂h_l]`` +
+# vocabulary readout.  ``fit`` loads a model and runs the only backward
+# passes in saklas; ``top``/``decompose`` load a model for one forward;
+# ``show``/``rm`` are pure-IO over ``models/<safe_id>/jlens.*``.
+_LENS_VERBS: list[tuple[str, str]] = [
+    ("fit",       "Fit the model's Jacobian lens over a text corpus"),
+    ("show",      "Show the fitted lens artifact (layers, prompts, corpus)"),
+    ("top",       "Lens readout on a prompt: top vocabulary tokens per layer"),
+    ("decompose", "Split a steerable direction into its J-space component"),
+    ("rm",        "Remove a model's fitted lens artifact"),
+]
+
 
 def _add_injection_args(p: argparse.ArgumentParser) -> None:
     """Steering / extraction options shared between ``tui`` and ``serve``.
@@ -869,6 +882,137 @@ _TEMPLATE_BUILDERS = {
 }
 
 
+# --- lens subtree ---------------------------------------------------------
+
+def _build_lens_fit(p: argparse.ArgumentParser) -> None:
+    p.add_argument("model", help="HuggingFace model ID or local path")
+    p.add_argument(
+        "--corpus", default=None, metavar="FILE",
+        help="Text corpus: one document per line (a JSONL line with a 'text' "
+             "field also works). Unset: stream the default web-text sample "
+             "via the `datasets` library (pip install 'saklas[hf]').",
+    )
+    p.add_argument(
+        "--prompts", type=int, default=100, metavar="N",
+        help="Number of corpus documents to average over (default 100 — "
+             "quality saturates quickly; the paper used 1000)",
+    )
+    p.add_argument(
+        "--seq-len", type=int, default=None, metavar="T",
+        help="Truncate each document to this many tokens (default 128)",
+    )
+    p.add_argument(
+        "--dim-batch", type=int, default=None, metavar="K",
+        help="Output dims per backward pass (default 8; raise toward 32 on "
+             "large/unified memory for a proportionally faster fit — halves "
+             "automatically on OOM)",
+    )
+    p.add_argument(
+        "-f", "--force", action="store_true",
+        help="Restart from zero (default: resume a matching partial fit)",
+    )
+    p.add_argument("-d", "--device", default="auto",
+                   help="Device: auto (detect), cuda, mps, or cpu")
+    p.add_argument("-q", "--quantize", choices=["4bit", "8bit"], default=None,
+                   help="Quantization mode (default: bf16/fp16)")
+
+
+def _build_lens_show(p: argparse.ArgumentParser) -> None:
+    p.add_argument("model", help="Model ID whose lens artifact to inspect")
+    p.add_argument("-j", "--json", dest="json_output", action="store_true", help="JSON output")
+
+
+def _build_lens_top(p: argparse.ArgumentParser) -> None:
+    p.add_argument("model", help="HuggingFace model ID or local path")
+    p.add_argument("prompt", help="Raw prompt to read out (no chat template)")
+    p.add_argument(
+        "-k", "--top-k", type=int, default=8, metavar="K",
+        help="Tokens per (layer, position) readout (default 8)",
+    )
+    p.add_argument(
+        "--layers", default=None, metavar="L1,L2,...",
+        help="Comma-separated layer indices (default: 9 evenly spaced fitted layers)",
+    )
+    p.add_argument(
+        "--position", type=int, action="append", default=None, metavar="P",
+        help="Token position to read (repeatable; negative from the end; "
+             "default: final position)",
+    )
+    p.add_argument("-d", "--device", default="auto",
+                   help="Device: auto (detect), cuda, mps, or cpu")
+    p.add_argument("-q", "--quantize", choices=["4bit", "8bit"], default=None,
+                   help="Quantization mode (default: bf16/fp16)")
+    p.add_argument("-j", "--json", dest="json_output", action="store_true", help="JSON output")
+
+
+def _build_lens_decompose(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "selector",
+        help="Steerable direction to split (concept name, ns/name, or "
+             "jlens/<word>)",
+    )
+    p.add_argument(
+        "-m", "--model", required=True, metavar="MODEL_ID",
+        help="Model whose lens + fitted direction to use",
+    )
+    p.add_argument(
+        "-k", "--top-k", type=int, default=16, metavar="K",
+        help="Sparsity budget: atoms in the J-space component (default 16)",
+    )
+    p.add_argument(
+        "--layers", default=None, metavar="L1,L2,...",
+        help="Comma-separated layer indices (default: every fitted layer the "
+             "direction covers)",
+    )
+    p.add_argument("-d", "--device", default="auto",
+                   help="Device: auto (detect), cuda, mps, or cpu")
+    p.add_argument("-q", "--quantize", choices=["4bit", "8bit"], default=None,
+                   help="Quantization mode (default: bf16/fp16)")
+    p.add_argument("-j", "--json", dest="json_output", action="store_true", help="JSON output")
+
+
+def _build_lens_rm(p: argparse.ArgumentParser) -> None:
+    p.add_argument("model", help="Model ID whose lens artifact to remove")
+    p.add_argument("-y", "--yes", action="store_true", help="Skip confirmation")
+
+
+_LENS_DESCRIPTIONS: dict[str, str] = {
+    "fit": (
+        "Fit the per-model Jacobian lens: J_l = E[dh_final/dh_l], the average "
+        "first-order effect of each layer's residual on the final-layer "
+        "residual over a web-text corpus. One forward + ceil(d_model/dim_batch) "
+        "backward passes per document — the only backward passes in saklas. "
+        "The artifact lands at ~/.saklas/models/<model>/jlens.safetensors "
+        "(fp16, ~0.5-1.5 GB) and backs `lens top`, `lens decompose`, the "
+        "jlens/<word> steering atoms, and @when:jlens/<word> gates. "
+        "Interrupted fits checkpoint and resume by default."
+    ),
+    "show": "Print a fitted lens artifact's sidecar (layers, prompts, corpus, size).",
+    "top": (
+        "Run one forward pass on a raw prompt and decode selected layers' "
+        "residuals through the lens: softmax(W_U · norm(J_l h)) — the tokens "
+        "the activation is disposed to make the model say. The window into "
+        "unverbalized intermediate computation (Gurnee et al. 2026)."
+    ),
+    "decompose": (
+        "Split a steerable direction into its J-space component: the best "
+        "sparse nonnegative combination of k J-lens token vectors, per layer. "
+        "Reports the variance share (how *verbalizable* the direction is — "
+        "concept vectors typically carry only ~6-15% of their variance in the "
+        "workspace) and the contributing tokens."
+    ),
+    "rm": "Delete a model's fitted lens artifact (jlens.safetensors + sidecar).",
+}
+
+_LENS_BUILDERS = {
+    "fit":       _build_lens_fit,
+    "show":      _build_lens_show,
+    "top":       _build_lens_top,
+    "decompose": _build_lens_decompose,
+    "rm":        _build_lens_rm,
+}
+
+
 def _build_manifold_parser(parser: argparse.ArgumentParser) -> None:
     """``saklas manifold`` — the steering-vector / manifold compute verbs."""
     sub = parser.add_subparsers(dest="manifold_cmd", required=False, metavar="VERB")
@@ -900,6 +1044,17 @@ def _build_template_parser(parser: argparse.ArgumentParser) -> None:
             description=_TEMPLATE_DESCRIPTIONS.get(verb, desc),
         )
         _TEMPLATE_BUILDERS[verb](child)
+
+
+def _build_lens_parser(parser: argparse.ArgumentParser) -> None:
+    """``saklas lens`` — the per-model Jacobian-lens artifact."""
+    sub = parser.add_subparsers(dest="lens_cmd", required=False, metavar="VERB")
+    for verb, desc in _LENS_VERBS:
+        child = sub.add_parser(
+            verb, help=desc,
+            description=_LENS_DESCRIPTIONS.get(verb, desc),
+        )
+        _LENS_BUILDERS[verb](child)
 
 
 # --- config subtree ------------------------------------------------------
@@ -1118,5 +1273,15 @@ def _build_root_parser() -> argparse.ArgumentParser:
                     "and score the restricted-choice value distribution",
     )
     _build_template_parser(template)
+
+    lens = sub.add_parser(
+        "lens",
+        help="Jacobian lens (fit/show/top/decompose/rm)",
+        description="Per-model Jacobian lens: fit the residual→output "
+                    "transport, read out what intermediate activations are "
+                    "disposed to say, and split directions into their "
+                    "verbalizable (J-space) component",
+    )
+    _build_lens_parser(lens)
 
     return root

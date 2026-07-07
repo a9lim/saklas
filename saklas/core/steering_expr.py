@@ -549,6 +549,10 @@ class _Parser:
           gate's probe string (e.g. ``"emotions@happy"``); same
           ``flat_scalars`` correspondence.
 
+        Every shape also accepts a leading ``<ns>/`` namespace segment
+        (``jlens/fake``, ``default/emotions@happy``) — consumed before
+        the channel discriminators, stored verbatim.
+
         The discriminator on the trailing IDENT: a ``COLON`` after the
         manifold name routes to the fraction form, an ``AT`` to the
         label form, a ``DOT`` to the bipolar vector form, anything
@@ -559,6 +563,16 @@ class _Parser:
         """
         probe_tok = self._expect("IDENT")
         probe = str(probe_tok.value)
+        if self._peek().kind == "SLASH":
+            # Namespaced probe: ``<ns>/<name>`` — a J-lens token probe
+            # (``jlens/fake``) or a probe attached under a qualified selector
+            # (``default/emotions``).  Consumed before the channel
+            # discriminators so every channel shape composes with a
+            # namespaced probe; stored verbatim, matching the keys
+            # ``Monitor.flat_scalars`` emits.
+            self._consume()
+            ns_rhs = self._expect("IDENT")
+            probe = f"{probe}/{ns_rhs.value}"
         nxt = self._peek().kind
         if nxt == "COLON":
             # Manifold subspace-fraction gate: ``<manifold>:fraction``.

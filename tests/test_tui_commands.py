@@ -2408,3 +2408,49 @@ def test_pairs_extract_routes_through_session_extract():
     assert captured["positive"] == ["happy", "calm"]
     assert captured["negative"] == ["sad", "angry"]
     assert "mood" in app._alphas
+
+
+# -- /lens ------------------------------------------------------------------
+
+
+def test_lens_toggles_on_and_off():
+    app = _make_app()
+    app._session.live_lens_layers = None
+    app._session.enable_live_lens = MagicMock(return_value=[20, 30, 40])
+    app._trait_panel.set_lens_active = MagicMock()
+
+    app._handle_command("/lens")
+    app._session.enable_live_lens.assert_called_once_with(layers=None)
+    app._trait_panel.set_lens_active.assert_called_with([20, 30, 40])
+    assert "Live lens readout on" in _msgs(app)
+
+    # session now reports the lens armed → bare /lens toggles off
+    app._session.live_lens_layers = [20, 30, 40]
+    app._handle_command("/lens")
+    app._session.disable_live_lens.assert_called_once()
+    app._trait_panel.set_lens_active.assert_called_with(None)
+
+
+def test_lens_explicit_layers_and_bad_input():
+    app = _make_app()
+    app._session.live_lens_layers = None
+    app._session.enable_live_lens = MagicMock(return_value=[12, 24])
+    app._trait_panel.set_lens_active = MagicMock()
+
+    app._handle_command("/lens 12,24")
+    app._session.enable_live_lens.assert_called_once_with(layers=[12, 24])
+
+    app._handle_command("/lens banana")
+    assert "bad layer list" in _msgs(app)
+
+
+def test_lens_unfitted_reports_hint():
+    from saklas.core.jlens import LensNotFittedError
+
+    app = _make_app()
+    app._session.live_lens_layers = None
+    app._session.enable_live_lens = MagicMock(
+        side_effect=LensNotFittedError("no lens — run saklas lens fit first")
+    )
+    app._handle_command("/lens")
+    assert "saklas lens fit" in _msgs(app)
