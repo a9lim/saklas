@@ -261,6 +261,26 @@ def test_fit_force_bypasses_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     assert manifold.name == "mood"
 
 
+def test_curved_raw_fit_reuses_retained_rows_for_sigma_field(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Known-curved raw fits should not re-run capture for the sigma field."""
+    folder = _author_manifold(tmp_path)
+    calls = {"n": 0}
+    real = _stub_encoder_batch
+
+    def _counting(*args: Any, **kwargs: Any) -> dict[int, torch.Tensor]:
+        calls["n"] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(V, "_encode_and_capture_all_batch", _counting)
+    manifold = ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder)
+
+    assert calls["n"] == len(_LABELS)
+    assert all(sub.has_sigma for sub in manifold.layers.values())
+    assert "sigma_field_per_layer" in manifold.metadata
+
+
 def test_fit_cache_miss_on_corpus_change(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     folder = _author_manifold(tmp_path)
     pipe = ManifoldExtractionPipeline(_Handle(), EventBus())

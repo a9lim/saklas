@@ -250,6 +250,7 @@ def test_enable_live_lens_defaults_and_disable() -> None:
     assert layers and all(l in (0, 1) for l in layers)
     assert s._live_lens is not None
     assert s._live_lens["layers"] == layers
+    assert "J" not in s._live_lens
     s.disable_live_lens()
     assert s._live_lens is None
 

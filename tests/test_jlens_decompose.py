@@ -37,6 +37,26 @@ def test_recovers_planted_sparse_combination() -> None:
     assert dec.share > 0.99
 
 
+def test_positive_tiny_solve_skips_projected_gradient(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    d = 8
+    jacobian = torch.eye(d)
+    unembed = torch.eye(d)
+    target = 2.0 * unembed[2] + 1.5 * unembed[5]
+
+    def _explode(*_args: object, **_kwargs: object) -> torch.Tensor:
+        raise AssertionError("positive NNLS case should not need eigvalsh/PGD")
+
+    monkeypatch.setattr(torch.linalg, "eigvalsh", _explode)
+    dec = sparse_nonneg_decompose(target, jacobian, unembed, layer=0, k=2)
+
+    got = dict(dec.tokens)
+    assert got[2] == pytest.approx(2.0, abs=1e-5)
+    assert got[5] == pytest.approx(1.5, abs=1e-5)
+    assert dec.share == pytest.approx(1.0)
+
+
 def test_share_low_for_offspace_direction() -> None:
     jacobian, unembed = _dictionary()
     # a direction orthogonal to every atom's positive span is unreachable

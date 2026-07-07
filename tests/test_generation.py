@@ -665,8 +665,13 @@ def test_gating_callback_backfills_exact_keys_hidden_by_top_n() -> None:
             return {"toy@nearest": -0.1}
 
         def score_gate_scalars(
-            self, _latest: dict[int, torch.Tensor], gate_keys: set[str],
+            self,
+            _latest: dict[int, torch.Tensor],
+            gate_keys: set[str],
+            *,
+            probe_names: set[str] | None = None,
         ) -> dict[str, float]:
+            assert probe_names is None
             self.requested = set(gate_keys)
             return {"toy@hidden": -2.0}
 

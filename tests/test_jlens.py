@@ -131,6 +131,23 @@ def test_fit_skips_short_prompts_and_raises_when_all_short() -> None:
         fit_jacobian_lens(model, tokenizer, ["tiny"], _layers(model), dim_batch=3)
 
 
+def test_fit_can_reuse_pretokenized_rows_without_tokenizer_call() -> None:
+    model = _frozen_model(n_layers=2)
+    tokenizer = _CharTokenizer()
+    ids = tokenizer("a prompt that is long enough.")["input_ids"][0].tolist()
+
+    class BombTokenizer:
+        def __call__(self, *_args: Any, **_kwargs: Any) -> Any:
+            raise AssertionError("fit should reuse input_id_rows")
+
+    lens = fit_jacobian_lens(
+        model, BombTokenizer(), ["already-tokenized"], _layers(model),
+        dim_batch=3, input_id_rows=[ids],
+    )
+
+    assert lens.n_prompts == 1
+
+
 def test_fit_checkpoint_callback_fires() -> None:
     model = _frozen_model(n_layers=2)
     tokenizer = _CharTokenizer()

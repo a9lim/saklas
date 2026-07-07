@@ -179,8 +179,10 @@ class ManifoldExtractionPipeline:
         from saklas.core.manifold import (
             CustomDomain,
             Manifold,
+            compute_node_activation_rows,
             compute_node_centroid,
             compute_node_reduced_covariance,
+            compute_node_reduced_covariance_from_rows,
             discover_coords,
             domain_from_spec,
             fit_affine_subspace,
@@ -323,6 +325,18 @@ class ManifoldExtractionPipeline:
             baseline_prompts = [ctx.messages() for ctx in tmpl.contexts]
         else:
             baseline_prompts = _load_baseline_prompts()
+        # Curved raw authored/spectral fits need within-node reduced covariance
+        # after the basis exists to fit the fuzzy sigma field.  Retain the
+        # first-pass per-response rows for those known-curved modes so the sigma
+        # pass can avoid a second model capture.  Auto topology is intentionally
+        # left on the streaming-centroid path until it resolves; otherwise a
+        # flat auto/persona fit could retain a very large row stack needlessly.
+        retain_node_rows = (
+            sae_backend is None and mf.fit_mode in {"authored", "spectral"}
+        )
+        retained_rows: list[dict[int, torch.Tensor]] | None = (
+            [] if retain_node_rows else None
+        )
         per_node: list[dict[int, torch.Tensor]] = []
         for (label, responses), role in zip(node_groups, node_roles, strict=True):
             role_note = f" [role={role}]" if role else ""
@@ -330,11 +344,23 @@ class ManifoldExtractionPipeline:
                 f"Pooling node '{label}'{role_note} "
                 f"({len(responses)} responses)..."
             )
-            per_node.append(compute_node_centroid(
-                model, tokenizer, layers, device, responses, baseline_prompts,
-                role=role, model_type=model_type,
-                layer_indices=fit_layers,
-            ))
+            if retained_rows is not None:
+                rows = compute_node_activation_rows(
+                    model, tokenizer, layers, device, responses, baseline_prompts,
+                    role=role, model_type=model_type,
+                    layer_indices=fit_layers,
+                )
+                retained_rows.append(rows)
+                per_node.append({
+                    idx: rows[idx].mean(dim=0).to(torch.float32)
+                    for idx in fit_layers
+                })
+            else:
+                per_node.append(compute_node_centroid(
+                    model, tokenizer, layers, device, responses, baseline_prompts,
+                    role=role, model_type=model_type,
+                    layer_indices=fit_layers,
+                ))
 
         # 1b. Monopolar (concept-vs-neutral).  A 1-node ``pca`` folder has no
         #     second pole to span an affine subspace, so it can only mean one
@@ -862,15 +888,21 @@ class ManifoldExtractionPipeline:
                 f"Fitting within-node σ-field across {len(layer_subs)} layers "
                 f"({K} nodes, second capture pass)..."
             )
-            node_covs: list[dict[int, torch.Tensor]] = []
-            for (label, responses), role in zip(
-                node_groups, node_roles, strict=True,
-            ):
-                node_covs.append(compute_node_reduced_covariance(
-                    model, tokenizer, layers, device, responses,
-                    baseline_prompts, layer_subs,
-                    role=role, model_type=model_type,
-                ))
+            if retained_rows is not None:
+                node_covs = [
+                    compute_node_reduced_covariance_from_rows(rows, layer_subs)
+                    for rows in retained_rows
+                ]
+            else:
+                node_covs = []
+                for (label, responses), role in zip(
+                    node_groups, node_roles, strict=True,
+                ):
+                    node_covs.append(compute_node_reduced_covariance(
+                        model, tokenizer, layers, device, responses,
+                        baseline_prompts, layer_subs,
+                        role=role, model_type=model_type,
+                    ))
             sigma_field_per_layer = fit_sigma_field(
                 layer_subs, domain, node_coords, node_covs,
                 smoothing=(

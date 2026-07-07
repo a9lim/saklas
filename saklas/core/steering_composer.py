@@ -744,14 +744,22 @@ class SteeringComposer:
                         latest = capture.latest_per_layer()
                         if latest:
                             scalars.update(
-                                monitor.score_gate_scalars(latest, missing)
+                                monitor.score_gate_scalars(
+                                    latest,
+                                    missing,
+                                    probe_names=gating_subset if gating_subset else None,
+                                )
                             )
                 return scalars
             latest = capture.latest_per_layer()
             if not latest:
                 return {}
             if gate_keys:
-                return monitor.score_gate_scalars(latest, gate_keys)
+                return monitor.score_gate_scalars(
+                    latest,
+                    gate_keys,
+                    probe_names=gating_subset if gating_subset else None,
+                )
             # Flatten the coordinate readings into gate-callback scalars
             # (``name`` aliases axis 0, ``name[i]`` per axis, ``name:fraction``,
             # ``name@label`` for curved nearest).  Scope to the gated subset

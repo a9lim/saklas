@@ -1860,6 +1860,7 @@ class SaklasSession:
                         return lens
                     base = lens
                     usable = usable[lens.n_prompts:]
+                    consumed_ids = consumed_ids[lens.n_prompts:]
                     if on_progress is not None:
                         on_progress(
                             f"resuming from {lens.n_prompts} prompts "
@@ -1888,6 +1889,7 @@ class SaklasSession:
                 max_seq_len=seq_len,
                 checkpoint_cb=lambda partial: _save(partial, durable=False),
                 on_progress=on_progress,
+                input_id_rows=consumed_ids,
             )
             prompt_base = base.n_prompts if base is not None else 0
             total_prompts = prompt_base + fitted.n_prompts
@@ -2303,12 +2305,8 @@ class SaklasSession:
                 )
         device = self._device
         layer_list = list(layers)
-        transports = [
-            lens.jacobians[l].to(device=device, dtype=torch.float32)
-            for l in layer_list
-        ]
-        if transports:
-            j_stack = torch.stack(transports, dim=0)
+        if layer_list:
+            j_stack = self._jlens_transport_stack(lens, layer_list, device)
         else:
             sample = next(iter(lens.jacobians.values()))
             j_stack = torch.empty(
@@ -2317,7 +2315,6 @@ class SaklasSession:
         self._live_lens = {
             "layers": layer_list,
             "top_k": int(top_k),
-            "J": {l: t for l, t in zip(layer_list, transports)},
             "J_stack": j_stack,
             "layer_rows": {l: i for i, l in enumerate(layer_list)},
             "unembed": get_unembedding(self._model),
@@ -3626,7 +3623,9 @@ class SaklasSession:
                 # aligned with decode forwards.  The full roster is pooled once at
                 # finalize from the tail ring (``_score_aggregate_only``).
                 self._incremental_gate_scores.append(
-                    self._monitor.score_gate_scalars(latest, gate_keys)
+                    self._monitor.score_gate_scalars(
+                        latest, gate_keys, probe_names=subset,
+                    )
                     if latest and gate_keys else {}
                 )
 

@@ -348,12 +348,16 @@ def sparse_nonneg_decompose(
         rows.append(unembed[best].float() @ J)
         A = torch.stack(rows)  # [s, d]
         gram = A @ A.T
-        # CPU hop: eigvalsh is unimplemented on MPS, and the gram is ≤ k×k.
-        lipschitz = float(torch.linalg.eigvalsh(gram.cpu())[-1].clamp(min=1e-12))
         b = A @ t
         c = torch.cat([coeffs, coeffs.new_zeros(1)])
-        for _ in range(nnls_iters):
-            c = torch.clamp(c - (gram @ c - b) / lipschitz, min=0.0)
+        solved = _try_unconstrained_nonnegative(gram, b, device=device)
+        if solved is None:
+            # CPU hop: eigvalsh is unimplemented on MPS, and the gram is ≤ k×k.
+            lipschitz = float(torch.linalg.eigvalsh(gram.cpu())[-1].clamp(min=1e-12))
+            for _ in range(nnls_iters):
+                c = torch.clamp(c - (gram @ c - b) / lipschitz, min=0.0)
+        else:
+            c = solved
         coeffs = c
         residual = t - A.T @ coeffs
 
@@ -363,6 +367,35 @@ def sparse_nonneg_decompose(
         key=lambda p: -p[1],
     )
     return JSpaceDecomposition(layer, share, pairs)
+
+
+def _try_unconstrained_nonnegative(
+    gram: torch.Tensor,
+    b: torch.Tensor,
+    *,
+    device: torch.device,
+    tol: float = 1e-7,
+) -> torch.Tensor | None:
+    """Exact tiny least-squares solve when its coefficients are already >= 0.
+
+    The greedy J-space step solves ``min ||A^T c - t||²`` over the selected
+    atoms.  If the unconstrained normal-equation solution is nonnegative, it is
+    also the NNLS optimum, so the 200-step projected-gradient loop is pure
+    overhead.  If any coefficient is negative or the tiny system is singular, the
+    caller keeps the existing PGD fallback.
+    """
+    g_cpu = gram.detach().to("cpu", torch.float32)
+    b_cpu = b.detach().to("cpu", torch.float32)
+    eye = torch.eye(g_cpu.shape[0], dtype=torch.float32)
+    try:
+        sol = torch.linalg.solve(g_cpu + 1e-7 * eye, b_cpu)
+    except RuntimeError:
+        return None
+    if not bool(torch.isfinite(sol).all()):
+        return None
+    if bool((sol < -tol).any()):
+        return None
+    return sol.clamp(min=0.0).to(device=device, dtype=torch.float32)
 
 
 def _atom_norms(
@@ -395,6 +428,7 @@ def fit_jacobian_lens(
     checkpoint_every: int = DEFAULT_CHECKPOINT_EVERY,
     checkpoint_cb: Callable[[JacobianLens], None] | None = None,
     on_progress: Callable[[str], None] | None = None,
+    input_id_rows: Sequence[Sequence[int]] | None = None,
 ) -> JacobianLens:
     """Fit ``J_l`` for every source layer over ``prompts``.
 
@@ -402,7 +436,12 @@ def fit_jacobian_lens(
     docstring for the estimator). ``checkpoint_cb`` receives the partial lens
     every ``checkpoint_every`` prompts — the io layer uses it for resumable
     fits (callers merging with a prior shard do so outside this function).
-    ``dim_batch`` halves automatically on device OOM.
+    ``input_id_rows`` is the pre-tokenized sibling of ``prompts``.  When supplied
+    it must be aligned 1:1 with ``prompts`` and already reflect the caller's
+    truncation/hash policy; the fit still applies ``max_seq_len`` defensively.
+    This lets session-level resume/filtering reuse the IDs it already computed
+    instead of tokenizing the corpus a second time.  ``dim_batch`` halves
+    automatically on device OOM.
 
     Raises :class:`JacobianLensError` when no prompt in the corpus is long
     enough (each needs > ``skip_first + 1`` tokens).
@@ -419,6 +458,11 @@ def fit_jacobian_lens(
         raise ValueError(
             f"source_layers must lie in [0, {final_idx}) — the final layer is "
             f"the transport target, not a source; got {sources}"
+        )
+    if input_id_rows is not None and len(input_id_rows) != len(prompts):
+        raise ValueError(
+            "input_id_rows must be aligned with prompts "
+            f"({len(input_id_rows)} != {len(prompts)})"
         )
 
     # Cross-prompt state, threaded through every per-prompt sweep: the CPU
@@ -440,7 +484,13 @@ def fit_jacobian_lens(
 
     with torch.enable_grad():
         for prompt_idx, prompt in enumerate(prompts):
-            ids = tokenizer(prompt, return_tensors="pt")["input_ids"][:, :max_seq_len]
+            if input_id_rows is None:
+                ids = tokenizer(prompt, return_tensors="pt")["input_ids"][
+                    :, :max_seq_len
+                ]
+            else:
+                row = [int(tok) for tok in input_id_rows[prompt_idx]][:max_seq_len]
+                ids = torch.tensor([row], dtype=torch.long)
             seq_len = ids.shape[1]
             if seq_len < skip_first + 2:
                 log.warning(

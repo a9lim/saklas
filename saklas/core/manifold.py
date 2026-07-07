@@ -3842,6 +3842,101 @@ def compute_node_centroid(
     return {idx: sums[idx] / n for idx in capture_layers}
 
 
+def compute_node_activation_rows(
+    model: torch.nn.Module,
+    tokenizer: object,
+    layers: torch.nn.ModuleList,
+    device: torch.device,
+    responses: list[str],
+    prompts: "list[str] | list[list[dict[str, str]]]",
+    *,
+    role: str | None = None,
+    model_type: str | None = None,
+    layer_indices: Sequence[int] | None = None,
+) -> dict[int, torch.Tensor]:
+    """Per-response pooled activations for one node, fp32 on CPU.
+
+    This is the row-retaining sibling of :func:`compute_node_centroid`: same
+    conversational rendering, batching, last-content pooling, role handling, and
+    MPS cache discipline, but it returns ``{layer: (N, D)}`` instead of reducing
+    to a centroid.  Curved raw manifold fits use it to derive both centroids and
+    the fuzzy-manifold σ-field from one capture pass.
+    """
+    from saklas.core.vectors import _CAPTURE_BATCH, _encode_and_capture_all_batch
+
+    if not responses:
+        raise ValueError("manifold node has no responses")
+    if not prompts:
+        raise ValueError("conversational capture needs at least one baseline prompt")
+    k = len(prompts)
+    if len(responses) % k != 0:
+        raise ValueError(
+            f"node corpus ({len(responses)} responses) must be a multiple of "
+            f"the baseline prompt set ({k}); responses align response[i] -> "
+            f"prompt[i % k]"
+        )
+
+    capture_layers = (
+        list(range(len(layers)))
+        if layer_indices is None
+        else [int(idx) for idx in layer_indices]
+    )
+    chunks_by_layer: dict[int, list[torch.Tensor]] = {
+        idx: [] for idx in capture_layers
+    }
+    is_mps = getattr(device, "type", None) == "mps"
+    n = len(responses)
+    aligned_prompts = [prompts[i % k] for i in range(n)]
+
+    for start in range(0, n, _CAPTURE_BATCH):
+        end = min(start + _CAPTURE_BATCH, n)
+        per_layer = _encode_and_capture_all_batch(
+            model, tokenizer,
+            aligned_prompts[start:end], responses[start:end],
+            layers, device, role=role, model_type=model_type,
+            layer_indices=capture_layers,
+        )
+        for idx in capture_layers:
+            chunks_by_layer[idx].append(
+                per_layer[idx].detach().to("cpu", torch.float32),
+            )
+        del per_layer
+        if is_mps:
+            torch.mps.empty_cache()
+
+    return {
+        idx: torch.cat(chunks, dim=0)
+        for idx, chunks in chunks_by_layer.items()
+    }
+
+
+def compute_node_reduced_covariance_from_rows(
+    activation_rows: dict[int, torch.Tensor],
+    layer_subs: "dict[int, LayerSubspace]",
+) -> dict[int, torch.Tensor]:
+    """Within-node reduced covariance from retained pooled activations.
+
+    ``activation_rows`` must carry the same ``{layer: (N, D)}`` rows returned by
+    :func:`compute_node_activation_rows`.  The result is identical to
+    :func:`compute_node_reduced_covariance` without re-running the model.
+    """
+    covs: dict[int, torch.Tensor] = {}
+    for idx, sub in layer_subs.items():
+        rows = activation_rows[idx].to("cpu", torch.float32)
+        n = int(rows.shape[0])
+        mean = sub.mean.to(torch.float32)
+        basis = sub.basis.to(torch.float32)
+        z = (rows - mean) @ basis.T
+        if n <= 1:
+            covs[idx] = torch.zeros(
+                (sub.rank, sub.rank), dtype=torch.float32,
+            )
+            continue
+        centered = z - z.mean(dim=0, keepdim=True)
+        covs[idx] = centered.T @ centered / float(n - 1)
+    return covs
+
+
 def compute_node_reduced_covariance(
     model: torch.nn.Module,
     tokenizer: object,
@@ -3856,7 +3951,7 @@ def compute_node_reduced_covariance(
 ) -> dict[int, torch.Tensor]:
     """Within-node **reduced** covariance ``(R, R)`` per layer for one node.
 
-    The fuzzy-manifold second pass (curved fits only).  Re-captures the node's
+    The fuzzy-manifold fallback pass (curved fits only).  Re-captures the node's
     corpus exactly as :func:`compute_node_centroid` does — same conversational
     ``[directive, prompt, response]`` framing, same last-content-token fp32
     pooling — but instead of pooling to the centroid it projects every sample
@@ -3866,14 +3961,13 @@ def compute_node_reduced_covariance(
     ``count − 1`` denominator; zeros for a single-sample node).
 
     This needs the per-layer ``mean``/``basis`` (hence ``layer_subs``), which
-    only exist *after* the surface fit — so it is a deliberate **second
-    fit-time forward pass** over the corpus, run only for curved manifolds
-    (``emotions``-shaped), where the reduced dim ``R`` keeps the accumulators tiny
-    (``(R, R)`` with ``R ≤ 64``, ``O(1)`` memory vs. the activation width).
-    The "no second forward pass" invariant governs generation / monitoring, not
-    the rare off-hot-path fit.  The off-surface reduction of these covariances
-    into per-node ``σ`` lives in the extraction pipeline (it needs the surface
-    tangent too).  fp32 on CPU, same MPS ``empty_cache`` discipline.
+    only exist *after* the surface fit.  When the extraction pipeline already
+    retained first-pass activation rows it uses
+    :func:`compute_node_reduced_covariance_from_rows` instead; this function is
+    the low-memory fallback for paths that did not retain them (notably
+    auto-topology fits that resolved curved after centroid pooling).  The
+    off-surface reduction of these covariances into per-node ``σ`` lives in the
+    extraction pipeline.  fp32 on CPU, same MPS ``empty_cache`` discipline.
     """
     from saklas.core.vectors import _CAPTURE_BATCH, _encode_and_capture_all_batch
 
@@ -4621,6 +4715,8 @@ __all__ = [
     "neutral_layout_coord",
     "select_topology",
     "compute_node_centroid",
+    "compute_node_activation_rows",
+    "compute_node_reduced_covariance_from_rows",
     "save_manifold",
     "load_manifold",
     "invert_parameterization",

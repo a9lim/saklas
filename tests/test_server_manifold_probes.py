@@ -556,28 +556,22 @@ class TestOpenAIProbeExtension:
         assert ext is not None
         assert ext["circumplex"]["fraction"] == pytest.approx(0.42)
 
-    def test_chat_stream_surface_per_token_and_aggregate(self, session_and_client: Any) -> None:
+    def test_chat_stream_surfaces_aggregate_without_default_live_scores(self, session_and_client: Any) -> None:
         session, client = session_and_client
         _attach_aggregate(session)
         result = _populate_last_result(session)
         session.last_result = result
 
-        token_reading = ProbeReading(
-            fraction=0.51,
-            nearest=[("happy", 0.18), ("calm", 0.31)],
-        )
-
         def _mock_stream(*args: Any, **kwargs: Any) -> Any:
+            assert kwargs.get("live_scores") is False
             yield TokenEvent(
                 text="Hi", token_id=1, index=0,
-                probe_readings={"circumplex": token_reading},
             )
             yield TokenEvent(
                 text=" there", token_id=2, index=1,
-                probe_readings={"circumplex": token_reading},
             )
 
-        session.generate_stream.return_value = _mock_stream()
+        session.generate_stream.side_effect = _mock_stream
 
         resp = client.post("/v1/chat/completions", json={
             "messages": [{"role": "user", "content": "Hi"}],
@@ -592,10 +586,7 @@ class TestOpenAIProbeExtension:
         token_chunks = [c for c in chunks if c["choices"][0].get("delta", {}).get("content")]
         assert token_chunks
         for c in token_chunks:
-            ext = c["choices"][0].get("x-saklas-probe-readings")
-            assert ext is not None
-            assert ext["circumplex"]["fraction"] == pytest.approx(0.51)
-            assert ext["circumplex"]["nearest"] == [["happy", 0.18], ["calm", 0.31]]
+            assert "x-saklas-probe-readings" not in c["choices"][0]
 
         # Final chunk carries the aggregate.
         final = next(
@@ -658,21 +649,16 @@ class TestOllamaProbeExtension:
         assert ext is not None
         assert ext["circumplex"]["fraction"] == pytest.approx(0.42)
 
-    def test_chat_streaming_surface_per_token_and_aggregate(self, session_and_client: Any) -> None:
+    def test_chat_streaming_surfaces_aggregate_without_default_live_scores(self, session_and_client: Any) -> None:
         session, client = session_and_client
         _attach_aggregate(session)
         result = _populate_last_result(session)
         session.last_result = result
 
-        token_reading = ProbeReading(
-            fraction=0.33,
-            nearest=[("happy", 0.2)],
-        )
-
         def _mock_stream(*args: Any, **kwargs: Any) -> Any:
+            assert kwargs.get("live_scores") is False
             yield TokenEvent(
                 text="Hi", token_id=1, index=0,
-                probe_readings={"circumplex": token_reading},
             )
 
         session.generate_stream.side_effect = _mock_stream
@@ -683,12 +669,10 @@ class TestOllamaProbeExtension:
         })
         assert resp.status_code == 200
         chunks = [json.loads(l) for l in resp.text.strip().split("\n") if l]
-        # First chunk: per-token reading rides under the extension key.
+        # First chunk: compatible streams do not opt into live per-token readings.
         first = chunks[0]
         assert first["done"] is False
-        ext = first.get("x-saklas-probe-readings")
-        assert ext is not None
-        assert ext["circumplex"]["fraction"] == pytest.approx(0.33)
+        assert "x-saklas-probe-readings" not in first
         # Final chunk: aggregate.
         final = chunks[-1]
         assert final["done"] is True

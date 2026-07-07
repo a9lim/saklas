@@ -936,6 +936,8 @@ class Monitor:
         self,
         hidden_per_layer: dict[int, torch.Tensor],
         gate_keys: set[str],
+        *,
+        probe_names: set[str] | None = None,
     ) -> dict[str, float]:
         """Return exact gate scalar keys without building full readings."""
         if not hidden_per_layer or not self._probes or not gate_keys:
@@ -945,8 +947,13 @@ class Monitor:
         # ``@`` / ``~`` channel marker — ``NAME_REGEX`` forbids those in a name)
         # and dispatch ``_score_probe_gate_scalars`` for those alone, instead of
         # running it (and its per-probe suffix-dict build) for every probe in the
-        # roster every token.
-        names = {re.split(r"[\[:@~]", k, maxsplit=1)[0] for k in gate_keys}
+        # roster every token.  The generation hot path can pass the composer-owned
+        # probe subset directly, avoiding this parse work on every decode step.
+        names = (
+            set(probe_names)
+            if probe_names is not None
+            else {re.split(r"[\[:@~]", k, maxsplit=1)[0] for k in gate_keys}
+        )
         sih_cache: dict[int, torch.Tensor] = {}
         out: dict[str, float] = {}
         for name in names:
