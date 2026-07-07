@@ -1228,6 +1228,8 @@ class SaklasSession:
         self._layer_means: dict[int, torch.Tensor] = {}
         self._whitener: Any = None
         self._jlens: Any = None  # lazy per-model Jacobian lens (io/lens.py)
+        self._jlens_device_cache: dict[tuple[int, str, tuple[int, ...]], torch.Tensor] = {}
+        self._jlens_decode_cache: dict[int, str] = {}
         # Live workspace readout (enable_live_lens): device-resident J_l
         # subset + settings, or None when off.
         self._live_lens: dict[str, Any] | None = None
@@ -1743,6 +1745,7 @@ class SaklasSession:
             loaded = load_lens(self.model_id)
             if loaded is not None:
                 self._jlens = loaded[0]
+                self._jlens_device_cache = {}
         return self._jlens
 
     def _require_jlens(self) -> "Any":
@@ -1761,7 +1764,7 @@ class SaklasSession:
         prompts: "Sequence[str]",
         *,
         corpus_spec: str = "custom",
-        source_layers: "Sequence[int] | None" = None,
+        source_layers: "Sequence[int] | str | None" = None,
         dim_batch: int | None = None,
         seq_len: int | None = None,
         force: bool = False,
@@ -1791,7 +1794,7 @@ class SaklasSession:
             JacobianLensError,
             fit_jacobian_lens,
         )
-        from saklas.io.lens import load_lens, save_lens
+        from saklas.io.lens import load_lens, load_lens_sidecar, save_lens
 
         dim_batch = dim_batch or DEFAULT_DIM_BATCH
         seq_len = seq_len or DEFAULT_SEQ_LEN
@@ -1800,11 +1803,17 @@ class SaklasSession:
             "session.fit_jlens called while another model use is in flight",
             phase_msg="session.fit_jlens called while a generation is in flight",
         ):
-            usable = [
-                p for p in prompts
-                if self._tokenizer(p, return_tensors="pt")["input_ids"].shape[1]
-                > SKIP_FIRST_POSITIONS + 1
-            ]
+            fit_model = getattr(self._model, "_orig_mod", self._model)
+            fit_layers = list(get_layers(fit_model))
+            usable: list[str] = []
+            consumed_ids: list[list[int]] = []
+            for prompt in prompts:
+                ids = self._tokenizer(prompt, return_tensors="pt")["input_ids"][
+                    :, :seq_len
+                ]
+                if ids.shape[1] > SKIP_FIRST_POSITIONS + 1:
+                    usable.append(prompt)
+                    consumed_ids.append([int(tok) for tok in ids[0].tolist()])
             if len(usable) < len(prompts) and on_progress is not None:
                 on_progress(
                     f"dropped {len(prompts) - len(usable)} too-short prompts "
@@ -1816,69 +1825,209 @@ class SaklasSession:
                     f"longer than {SKIP_FIRST_POSITIONS + 1} tokens"
                 )
             corpus_sha = hashlib.sha256(
-                "\n\x00".join(usable).encode("utf-8")
+                repr(consumed_ids).encode("utf-8")
             ).hexdigest()
+            corpus_hash_kind = "token_ids_v1"
 
-            expected_sources = (
-                sorted(set(source_layers))
-                if source_layers is not None
-                else list(range(len(self._layers) - 1))
+            expected_sources = self._resolve_jlens_source_layers(
+                source_layers, n_layers=len(fit_layers),
             )
             base: Any = None
+            last_saved_n_prompts = -1
             if not force:
-                existing = load_lens(self.model_id)
+                sidecar = load_lens_sidecar(self.model_id)
+                if (
+                    sidecar is not None
+                    and sidecar.get("corpus_sha256") == corpus_sha
+                    and sidecar.get("corpus_hash_kind") == corpus_hash_kind
+                    and sidecar.get("seq_len") == seq_len
+                    and [int(l) for l in sidecar.get("source_layers", [])]
+                    == expected_sources
+                ):
+                    existing = load_lens(self.model_id)
+                else:
+                    existing = None
                 if existing is not None:
                     lens, sidecar = existing
-                    if (
-                        sidecar.get("corpus_sha256") == corpus_sha
-                        and sidecar.get("seq_len") == seq_len
-                        # A source-layer mismatch can't resume-merge — treat
-                        # the stored lens as stale and refit from zero.
-                        and lens.source_layers == expected_sources
-                    ):
-                        if lens.n_prompts >= len(usable):
-                            if on_progress is not None:
-                                on_progress(
-                                    f"lens already fitted on {lens.n_prompts} "
-                                    "prompts — nothing to do"
-                                )
-                            self._jlens = lens
-                            return lens
-                        base = lens
-                        usable = usable[lens.n_prompts:]
+                    if lens.n_prompts >= len(usable):
                         if on_progress is not None:
                             on_progress(
-                                f"resuming from {lens.n_prompts} prompts "
-                                f"({len(usable)} remaining)"
+                                f"lens already fitted on {lens.n_prompts} "
+                                "prompts — nothing to do"
                             )
+                        self._jlens = lens
+                        self._jlens_device_cache = {}
+                        return lens
+                    base = lens
+                    usable = usable[lens.n_prompts:]
+                    if on_progress is not None:
+                        on_progress(
+                            f"resuming from {lens.n_prompts} prompts "
+                            f"({len(usable)} remaining)"
+                        )
 
-            def _save(partial: "Any") -> "Any":
+            def _save(partial: "Any", *, durable: bool) -> "Any":
+                nonlocal last_saved_n_prompts
                 merged = (
                     JacobianLens.merge([base, partial]) if base is not None else partial
                 )
                 save_lens(
                     merged, self.model_id,
                     corpus_spec=corpus_spec, corpus_sha256=corpus_sha,
+                    corpus_hash_kind=corpus_hash_kind,
                     seq_len=seq_len, dim_batch=dim_batch,
                     skip_first=SKIP_FIRST_POSITIONS,
+                    durable=durable,
                 )
+                last_saved_n_prompts = merged.n_prompts
                 return merged
 
             fitted = fit_jacobian_lens(
-                self._model, self._tokenizer, usable, list(self._layers),
-                source_layers=source_layers, dim_batch=dim_batch,
-                max_seq_len=seq_len, checkpoint_cb=_save,
+                fit_model, self._tokenizer, usable, fit_layers,
+                source_layers=expected_sources, dim_batch=dim_batch,
+                max_seq_len=seq_len,
+                checkpoint_cb=lambda partial: _save(partial, durable=False),
                 on_progress=on_progress,
             )
-            merged = _save(fitted)
+            prompt_base = base.n_prompts if base is not None else 0
+            total_prompts = prompt_base + fitted.n_prompts
+            if last_saved_n_prompts == total_prompts:
+                merged = (
+                    JacobianLens.merge([base, fitted]) if base is not None else fitted
+                )
+            else:
+                merged = _save(fitted, durable=True)
             self._jlens = merged
+            self._jlens_device_cache = {}
             return merged
+
+    def _resolve_jlens_layers(
+        self,
+        lens: "Any",
+        layers: "Sequence[int] | str | None",
+        *,
+        sample_count: int = 9,
+    ) -> list[int]:
+        if layers is None or layers == "all":
+            return list(lens.source_layers)
+        if isinstance(layers, str):
+            mode = layers.lower()
+            if mode in {"band", "workspace"}:
+                return self._jlens_workspace_band(lens)
+            if mode == "sample":
+                source_layers = list(lens.source_layers)
+                if len(source_layers) <= sample_count:
+                    return source_layers
+                step = (len(source_layers) - 1) / max(sample_count - 1, 1)
+                return sorted({source_layers[round(i * step)] for i in range(sample_count)})
+            raise ValueError(f"unknown J-lens layer mode {layers!r}")
+        return [int(layer) for layer in layers]
+
+    def _resolve_jlens_source_layers(
+        self,
+        source_layers: "Sequence[int] | str | None",
+        *,
+        n_layers: int,
+    ) -> list[int]:
+        final_idx = n_layers - 1
+        if source_layers is None or source_layers == "all":
+            return list(range(final_idx))
+        if isinstance(source_layers, str):
+            mode = source_layers.lower()
+            if mode in {"workspace", "band"}:
+                band = [
+                    l for l in range(final_idx)
+                    if 0.40 <= l / max(n_layers - 1, 1) <= 0.90
+                ]
+                return band or list(range(final_idx))
+            if mode == "sample":
+                all_sources = list(range(final_idx))
+                if len(all_sources) <= 9:
+                    return all_sources
+                step = (len(all_sources) - 1) / 8
+                return sorted({all_sources[round(i * step)] for i in range(9)})
+            raise ValueError(f"unknown J-lens source-layer mode {source_layers!r}")
+        return sorted(set(int(layer) for layer in source_layers))
+
+    def _jlens_transport_stack(
+        self, lens: "Any", layers: list[int], device: torch.device,
+    ) -> torch.Tensor:
+        cache = cast(
+            "dict[tuple[int, str, tuple[int, ...]], torch.Tensor] | None",
+            getattr(self, "_jlens_device_cache", None),
+        )
+        if cache is None:
+            cache = {}
+            self._jlens_device_cache = cache
+        key = (id(lens), str(device), tuple(layers))
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
+        stack = torch.stack([
+            lens.jacobians[layer].to(device=device, dtype=torch.float32)
+            for layer in layers
+        ])
+        cache[key] = stack
+        return stack
+
+    def _jlens_topk_rows(
+        self,
+        lens: "Any",
+        rows: list[tuple[int, torch.Tensor]],
+        *,
+        top_k: int,
+    ) -> list[list[tuple[str, float, int]]]:
+        from saklas.core.jlens import topk_logprobs
+        from saklas.core.model import get_final_norm, get_unembedding
+
+        if not rows:
+            return []
+        unembed = get_unembedding(self._model)
+        device = unembed.device
+        unique_layers = sorted({layer for layer, _ in rows})
+        J_unique = self._jlens_transport_stack(lens, unique_layers, device)
+        layer_to_row = {layer: idx for idx, layer in enumerate(unique_layers)}
+        J_rows = J_unique.index_select(
+            0,
+            torch.tensor(
+                [layer_to_row[layer] for layer, _ in rows],
+                device=device,
+                dtype=torch.long,
+            ),
+        )
+        H = torch.stack([
+            hidden.detach().to(torch.float32) for _, hidden in rows
+        ]).to(device)
+        transported = torch.bmm(J_rows, H.unsqueeze(-1)).squeeze(-1)
+        normed = get_final_norm(self._model)(transported)
+        logits = normed.to(unembed.dtype) @ unembed.T
+        vals, idxs = topk_logprobs(logits, top_k)
+        all_vals = vals.cpu()
+        all_idxs = idxs.cpu()
+        decode_cache = cast(
+            "dict[int, str] | None", getattr(self, "_jlens_decode_cache", None),
+        )
+        if decode_cache is None:
+            decode_cache = {}
+            self._jlens_decode_cache = decode_cache
+        out: list[list[tuple[str, float, int]]] = []
+        for vrow, irow in zip(all_vals, all_idxs):
+            row: list[tuple[str, float, int]] = []
+            for value, idx in zip(vrow, irow):
+                token_id = int(idx)
+                tok = decode_cache.get(token_id)
+                if tok is None:
+                    tok = str(self._tokenizer.decode([token_id]))
+                    decode_cache[token_id] = tok
+                row.append((tok, float(value), token_id))
+            out.append(row)
+        return out
 
     def jlens_readout(
         self,
         prompt: str,
         *,
-        layers: "Sequence[int] | None" = None,
+        layers: "Sequence[int] | str | None" = None,
         positions: "Sequence[int] | None" = None,
         top_k: int = 10,
     ) -> dict[int, list[list[tuple[str, float]]]]:
@@ -1892,12 +2041,10 @@ class SaklasSession:
         sweeps over all layers are an offline-analysis cost, not a decode
         cost.
         """
-        from saklas.core.jlens import lens_logits
-        from saklas.core.model import get_final_norm, get_unembedding
         from saklas.core.vectors import _capture_all_hidden_states
 
         lens = self._require_jlens()
-        req = list(layers) if layers is not None else list(lens.source_layers)
+        req = self._resolve_jlens_layers(lens, layers)
         missing = [l for l in req if l not in lens.jacobians]
         if missing:
             raise ValueError(
@@ -1911,33 +2058,32 @@ class SaklasSession:
             ids = self._tokenizer(prompt, return_tensors="pt")["input_ids"].to(
                 self._device
             )
-            hidden = _capture_all_hidden_states(
-                self._model, self._layers, ids, layer_indices=req,
-            )
-            unembed = get_unembedding(self._model)
-            norm = get_final_norm(self._model)
             n_pos = ids.shape[1]
             pos = (
                 [n_pos - 1]
                 if positions is None
                 else [p if p >= 0 else n_pos + p for p in positions]
             )
+            hidden = _capture_all_hidden_states(
+                self._model, self._layers, ids, layer_indices=req,
+                pool_index=(n_pos - 1 if positions is None else None),
+            )
+            row_refs: list[tuple[int, int, torch.Tensor]] = []
+            for layer in req:
+                if positions is None:
+                    row_refs.append((layer, 0, hidden[layer]))
+                else:
+                    h = hidden[layer][0, pos, :]
+                    for pos_idx, row in enumerate(h):
+                        row_refs.append((layer, pos_idx, row))
+            decoded = self._jlens_topk_rows(
+                lens, [(layer, row) for layer, _, row in row_refs], top_k=top_k,
+            )
             out: dict[int, list[list[tuple[str, float]]]] = {}
             for layer in req:
-                h = hidden[layer][0, pos, :]
-                logits = lens_logits(
-                    lens, {layer: h}, unembed=unembed, final_norm=norm,
-                    layers=[layer],
-                )[layer]
-                logprobs = torch.log_softmax(logits, dim=-1)
-                vals, idxs = logprobs.topk(top_k, dim=-1)
-                out[layer] = [
-                    [
-                        (str(self._tokenizer.decode([int(i)])), float(v))
-                        for v, i in zip(vrow, irow)
-                    ]
-                    for vrow, irow in zip(vals.cpu(), idxs.cpu())
-                ]
+                out[layer] = [[] for _ in pos]
+            for (layer, pos_idx, _), row in zip(row_refs, decoded):
+                out[layer][pos_idx] = [(tok, lp) for tok, lp, _ in row]
             return out
 
     def jlens_token_readout(
@@ -1945,7 +2091,7 @@ class SaklasSession:
         node_id: str,
         raw_index: int,
         *,
-        layers: "Sequence[int] | None" = None,
+        layers: "Sequence[int] | str | None" = None,
         top_k: int = 8,
         apply_steering: bool = True,
         raw: bool = False,
@@ -1980,12 +2126,10 @@ class SaklasSession:
         :class:`InvalidNodeOperationError` on a bad target (mirrors
         :meth:`fork_from_token`), ``ValueError`` on an unfitted layer.
         """
-        from saklas.core.jlens import lens_logits
-        from saklas.core.model import get_final_norm, get_unembedding
         from saklas.core.vectors import _capture_all_hidden_states
 
         lens = self._require_jlens()
-        req = list(layers) if layers is not None else list(lens.source_layers)
+        req = self._resolve_jlens_layers(lens, layers)
         missing = [l for l in req if l not in lens.jacobians]
         if missing:
             raise ValueError(
@@ -2066,22 +2210,14 @@ class SaklasSession:
             ):
                 hidden = _capture_all_hidden_states(
                     self._model, self._layers, ids, layer_indices=req,
+                    pool_index=ids.shape[1] - 1,
                 )
-                unembed = get_unembedding(self._model)
-                norm = get_final_norm(self._model)
-                readout: dict[int, list[tuple[str, float, int]]] = {}
-                for layer in req:
-                    h = hidden[layer][0, -1:, :]
-                    logits = lens_logits(
-                        lens, {layer: h}, unembed=unembed, final_norm=norm,
-                        layers=[layer],
-                    )[layer]
-                    logprobs = torch.log_softmax(logits, dim=-1)
-                    vals, idxs = logprobs.topk(top_k, dim=-1)
-                    readout[layer] = [
-                        (str(self._tokenizer.decode([int(i)])), float(v), int(i))
-                        for v, i in zip(vals[0].cpu(), idxs[0].cpu())
-                    ]
+                decoded = self._jlens_topk_rows(
+                    lens, [(layer, hidden[layer]) for layer in req], top_k=top_k,
+                )
+                readout = {
+                    layer: row for layer, row in zip(req, decoded)
+                }
         return {
             "node_id": node_id,
             "raw_index": int(raw_index),
@@ -2116,8 +2252,10 @@ class SaklasSession:
             return name
         lens = self._require_jlens()
         token_id = resolve_word_token(self._tokenizer, word)
-        directions = lens.token_direction(token_id, get_unembedding(self._model))
         band = set(self._jlens_workspace_band(lens))
+        directions = lens.token_direction(
+            token_id, get_unembedding(self._model), layers=sorted(band),
+        )
         self._profiles[name] = {
             l: d for l, d in directions.items() if l in band
         }
@@ -2217,7 +2355,7 @@ class SaklasSession:
         memoized across steps.
         """
         state = self._live_lens
-        if state is None:
+        if state is None or not getattr(self, "_live_lens_active_for_generation", True):
             return None
         buckets = self._capture.per_layer_buckets()
         unembed = state["unembed"]
@@ -2264,7 +2402,7 @@ class SaklasSession:
         selector: str,
         *,
         k: int = 16,
-        layers: "Sequence[int] | None" = None,
+        layers: "Sequence[int] | str | None" = None,
     ) -> dict[int, tuple[float, list[tuple[str, float]]]]:
         """Split a direction into its J-space component, per layer.
 
@@ -2284,8 +2422,7 @@ class SaklasSession:
         directions = self._ensure_profile_registered(selector)
         unembed = get_unembedding(self._model)
         req = [
-            l
-            for l in (layers if layers is not None else lens.source_layers)
+            l for l in self._resolve_jlens_layers(lens, layers)
             if l in directions and l in lens.jacobians
         ]
         if not req:
@@ -2297,7 +2434,7 @@ class SaklasSession:
         for layer in req:
             dec = sparse_nonneg_decompose(
                 directions[layer], lens.jacobians[layer], unembed,
-                layer=layer, k=k,
+                layer=layer, k=k, atom_norms=lens.atom_norms(layer, unembed),
             )
             out[layer] = (
                 dec.share,
@@ -3362,6 +3499,7 @@ class SaklasSession:
         gating_probe_keys: set[str] | None = None,
         lean_per_token: bool = False,
         final_probe_aggregate: bool = True,
+        live_lens_active: bool = True,
     ) -> bool:
         """Attach hidden-state capture. Returns True if attached.
 
@@ -3398,7 +3536,7 @@ class SaklasSession:
         """
         # ``getattr`` like ``_compiled_clean_eligible`` below — spec'd mock
         # stubs carry class attributes only, not instance state.
-        live_lens = getattr(self, "_live_lens", None)
+        live_lens = getattr(self, "_live_lens", None) if live_lens_active else None
         if widen:
             layer_idxs = list(range(len(self._layers)))
         else:
@@ -5549,6 +5687,11 @@ class SaklasSession:
                 or _persists_probe_row
                 or stop_list is not None
             )
+            _has_lens_consumer = bool(
+                getattr(self, "_live_lens", None) is not None
+                and on_token is not None
+                and getattr(on_token, "_saklas_wants_lens_readout", False)
+            )
             _effective_tap = _token_tap if _need_tap else None
             _tap_has_text_consumer = bool(
                 on_token is not None
@@ -5677,6 +5820,7 @@ class SaklasSession:
                 and not _full_reading_consumer
                 and self._monitor.probe_names
             )
+            self._live_lens_active_for_generation = _has_lens_consumer
             self.events.emit(GenerationStarted(input=input, stateless=stateless))
             try:
                 # Capture attach + monitor live + ctx.reset live INSIDE the
@@ -5689,6 +5833,7 @@ class SaklasSession:
                     gating_probe_keys=gating_probe_keys,
                     lean_per_token=lean_per_token,
                     final_probe_aggregate=return_probe_readings,
+                    live_lens_active=_has_lens_consumer,
                 )
                 self._monitor.begin_live()
                 # Reset the steering manager's TriggerContext for this gen;
@@ -5797,6 +5942,7 @@ class SaklasSession:
             # streaming target is no longer live.
             self._active_gen_reservation = None
             self._last_token_probe_payload = None
+            self._live_lens_active_for_generation = True
             # Reset capture state to the default (FULL, non-persistent) so the
             # next gen starts clean (finalize has already consumed the rows by
             # now). Belt-and-suspenders: ``_begin_capture`` resets it at gen start
@@ -6061,6 +6207,7 @@ class SaklasSession:
             q.put(event)
         _push_flags: Any = _push
         _push_flags._saklas_wants_live_scores = bool(live_scores)
+        _push_flags._saklas_wants_lens_readout = True
 
         def _worker():
             try:
@@ -6145,8 +6292,6 @@ class SaklasSession:
         if not self._batch_fast_runtime_available():
             return None
         if self._batch_fast_sampling_blocked(sampling):
-            return None
-        if getattr(self, "_live_lens", None) is not None:
             return None
         if getattr(self, "_trait_queues", None):
             return None

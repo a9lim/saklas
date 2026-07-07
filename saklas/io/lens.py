@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -44,48 +46,8 @@ def lens_paths(model_id: str) -> tuple[Path, Path]:
     return md / f"{_LENS_NAME}.safetensors", md / f"{_LENS_NAME}.json"
 
 
-def save_lens(
-    lens: JacobianLens,
-    model_id: str,
-    *,
-    corpus_spec: str,
-    corpus_sha256: str,
-    seq_len: int,
-    dim_batch: int,
-    skip_first: int,
-) -> Path:
-    """Persist a fitted lens (fp16 tensors + atomic JSON sidecar)."""
-    ts_path, sc_path = lens_paths(model_id)
-    ts_path.parent.mkdir(parents=True, exist_ok=True)
-    tensors = {
-        f"layer_{idx}": J.contiguous().to(torch.float16).cpu()
-        for idx, J in lens.jacobians.items()
-    }
-    save_file(tensors, str(ts_path))
-    write_json_atomic(sc_path, {
-        "format_version": LENS_FORMAT_VERSION,
-        "method": _LENS_METHOD,
-        "n_prompts": lens.n_prompts,
-        "d_model": lens.d_model,
-        "source_layers": lens.source_layers,
-        "dtype": "float16",
-        "corpus_spec": corpus_spec,
-        "corpus_sha256": corpus_sha256,
-        "seq_len": seq_len,
-        "dim_batch": dim_batch,
-        "skip_first_positions": skip_first,
-    })
-    return ts_path
-
-
-def load_lens(model_id: str) -> tuple[JacobianLens, dict[str, Any]] | None:
-    """Load a model's fitted lens, or ``None`` when absent or unusable.
-
-    Self-healing like the neutral-activation cache: a wrong format version,
-    non-finite tensors, or any parse failure logs a warning and reads as
-    "no lens" (the caller decides whether to error or re-fit) rather than
-    crashing the session.
-    """
+def load_lens_sidecar(model_id: str) -> dict[str, Any] | None:
+    """Load validated lens metadata without loading the tensor artifact."""
     ts_path, sc_path = lens_paths(model_id)
     if not (ts_path.exists() and sc_path.exists()):
         return None
@@ -99,10 +61,6 @@ def load_lens(model_id: str) -> tuple[JacobianLens, dict[str, Any]] | None:
                 "— re-fit with `saklas lens fit`", model_id, version, LENS_FORMAT_VERSION,
             )
             return None
-        tensors = load_file(str(ts_path))
-        jacobians = {
-            int(k.split("_", 1)[1]): v.to(torch.float32) for k, v in tensors.items()
-        }
         d_model = int(sidecar.get("d_model", 0) or 0)
         source_layers_raw = sidecar.get("source_layers")
         if (
@@ -115,7 +73,96 @@ def load_lens(model_id: str) -> tuple[JacobianLens, dict[str, Any]] | None:
                 "— re-fit with `saklas lens fit`", model_id,
             )
             return None
-        source_layers = sorted(int(layer) for layer in source_layers_raw)
+        # Normalize the layer values for metadata-only callers, matching
+        # ``JacobianLens.source_layers`` without touching the safetensors file.
+        sidecar = dict(sidecar)
+        sidecar["source_layers"] = sorted(int(layer) for layer in source_layers_raw)
+        sidecar["d_model"] = d_model
+        return sidecar
+    except Exception as exc:
+        log.warning("Corrupt jlens sidecar for %s; ignoring: %s", model_id, exc)
+        return None
+
+
+def save_lens(
+    lens: JacobianLens,
+    model_id: str,
+    *,
+    corpus_spec: str,
+    corpus_sha256: str,
+    seq_len: int,
+    dim_batch: int,
+    skip_first: int,
+    corpus_hash_kind: str = "text_v1",
+    durable: bool = True,
+) -> Path:
+    """Persist a fitted lens (fp16 tensors + atomic JSON sidecar)."""
+    ts_path, sc_path = lens_paths(model_id)
+    ts_path.parent.mkdir(parents=True, exist_ok=True)
+    tensors = {
+        f"layer_{idx}": J.contiguous().to(torch.float16).cpu()
+        for idx, J in lens.jacobians.items()
+    }
+    _save_safetensors_atomic(ts_path, tensors, durable=durable)
+    write_json_atomic(sc_path, {
+        "format_version": LENS_FORMAT_VERSION,
+        "method": _LENS_METHOD,
+        "n_prompts": lens.n_prompts,
+        "d_model": lens.d_model,
+        "source_layers": lens.source_layers,
+        "dtype": "float16",
+        "corpus_spec": corpus_spec,
+        "corpus_sha256": corpus_sha256,
+        "corpus_hash_kind": corpus_hash_kind,
+        "seq_len": seq_len,
+        "dim_batch": dim_batch,
+        "skip_first_positions": skip_first,
+    })
+    return ts_path
+
+
+def _save_safetensors_atomic(
+    path: Path, tensors: dict[str, torch.Tensor], *, durable: bool = True,
+) -> None:
+    """Atomically replace a safetensors artifact, preserving the prior file on error."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp") if path.suffix else path.with_name(
+        path.name + ".tmp"
+    )
+    try:
+        save_file(tensors, str(tmp))
+        if durable:
+            fd = os.open(tmp, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+    except BaseException:
+        with suppress(FileNotFoundError):
+            tmp.unlink()
+        raise
+    os.replace(tmp, path)
+
+
+def load_lens(model_id: str) -> tuple[JacobianLens, dict[str, Any]] | None:
+    """Load a model's fitted lens, or ``None`` when absent or unusable.
+
+    Self-healing like the neutral-activation cache: a wrong format version,
+    non-finite tensors, or any parse failure logs a warning and reads as
+    "no lens" (the caller decides whether to error or re-fit) rather than
+    crashing the session.
+    """
+    ts_path, sc_path = lens_paths(model_id)
+    sidecar = load_lens_sidecar(model_id)
+    if sidecar is None:
+        return None
+    try:
+        tensors = load_file(str(ts_path))
+        jacobians = {
+            int(k.split("_", 1)[1]): v.to(torch.float32) for k, v in tensors.items()
+        }
+        d_model = int(sidecar["d_model"])
+        source_layers = [int(layer) for layer in sidecar["source_layers"]]
         tensor_layers = sorted(jacobians)
         if tensor_layers != source_layers:
             log.warning(

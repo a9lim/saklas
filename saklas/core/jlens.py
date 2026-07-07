@@ -142,6 +142,7 @@ class JacobianLens:
         self.source_layers = sorted(self.jacobians)
         self.n_prompts = int(n_prompts)
         self.d_model = int(d_model)
+        self._atom_norm_cache: dict[tuple[int, str, str, int, tuple[int, ...]], torch.Tensor] = {}
 
     def __repr__(self) -> str:
         span = (
@@ -165,7 +166,11 @@ class JacobianLens:
         return hidden.to(torch.float32) @ J.T
 
     def token_direction(
-        self, token_id: int, unembed: torch.Tensor
+        self,
+        token_id: int,
+        unembed: torch.Tensor,
+        *,
+        layers: Sequence[int] | None = None,
     ) -> dict[int, torch.Tensor]:
         """Per-layer J-lens direction for one vocab id: ``W_U[v] @ J_l``.
 
@@ -174,7 +179,38 @@ class JacobianLens:
         ``Profile``) expects.
         """
         w = unembed[token_id].detach().to(torch.float32).cpu()
-        return {l: w @ J for l, J in self.jacobians.items()}
+        requested = self.source_layers if layers is None else [int(l) for l in layers]
+        missing = [l for l in requested if l not in self.jacobians]
+        if missing:
+            raise LensNotFittedError(
+                f"layers {missing} not in fitted lens layers "
+                f"{self.source_layers[:3]}..{self.source_layers[-3:]}"
+            )
+        return {l: w @ self.jacobians[l] for l in requested}
+
+    def atom_norms(self, layer: int, unembed: torch.Tensor) -> torch.Tensor:
+        """Cached per-token norms of the layer's J-lens dictionary atoms."""
+        if layer not in self.jacobians:
+            raise LensNotFittedError(
+                f"layer {layer} not in fitted lens layers "
+                f"{self.source_layers[:3]}..{self.source_layers[-3:]}"
+            )
+        key = (
+            int(layer),
+            str(unembed.device),
+            str(unembed.dtype),
+            int(unembed.data_ptr()),
+            tuple(int(x) for x in unembed.shape),
+        )
+        cached = self._atom_norm_cache.get(key)
+        if cached is not None:
+            return cached
+        norms = _atom_norms(
+            self.jacobians[layer].to(device=unembed.device, dtype=torch.float32),
+            unembed,
+        )
+        self._atom_norm_cache[key] = norms
+        return norms
 
     @classmethod
     def merge(cls, lenses: Sequence["JacobianLens"]) -> "JacobianLens":
@@ -226,6 +262,20 @@ def lens_logits(
     return out
 
 
+def topk_logprobs(logits: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Top-k log-probabilities without materializing a full log-softmax tensor.
+
+    ``topk(log_softmax(x))`` has the same indices as ``topk(x)``.  Computing
+    only the selected log-probabilities saves one vocab-sized tensor allocation
+    per readout row, which matters for large vocabularies and multi-layer
+    J-lens sweeps.
+    """
+    logits_f = logits.float()
+    vals, idxs = logits_f.topk(k, dim=-1)
+    vals = vals - logits_f.logsumexp(dim=-1, keepdim=True)
+    return vals, idxs
+
+
 class JSpaceDecomposition:
     """One layer's sparse nonnegative split of a direction against the J-lens
     dictionary: ``share`` = fraction of the direction's variance carried by
@@ -254,6 +304,7 @@ def sparse_nonneg_decompose(
     layer: int,
     k: int = 16,
     nnls_iters: int = 200,
+    atom_norms: torch.Tensor | None = None,
 ) -> JSpaceDecomposition:
     """Greedy sparse nonnegative pursuit of ``target`` against the J-lens
     dictionary ``D = W_U @ J_l`` (the paper's gradient-pursuit decomposition).
@@ -274,7 +325,12 @@ def sparse_nonneg_decompose(
     t_norm_sq = float(t.pow(2).sum())
     if t_norm_sq == 0.0:
         return JSpaceDecomposition(layer, 0.0, [])
-    atom_norms = _atom_norms(J, unembed).clamp(min=1e-12)
+    norms = (
+        _atom_norms(J, unembed)
+        if atom_norms is None
+        else atom_norms.to(device=device, dtype=torch.float32)
+    )
+    norms = norms.clamp(min=1e-12)
 
     selected: list[int] = []
     rows: list[torch.Tensor] = []
@@ -282,7 +338,7 @@ def sparse_nonneg_decompose(
     residual = t.clone()
     for _ in range(k):
         # normalized correlation over the vocabulary, D never materialized
-        scores = (unembed @ (J @ residual).to(unembed.dtype)).float() / atom_norms
+        scores = (unembed @ (J @ residual).to(unembed.dtype)).float() / norms
         if selected:
             scores[torch.tensor(selected, device=device)] = -torch.inf
         best = int(scores.argmax())
@@ -368,7 +424,9 @@ def fit_jacobian_lens(
     # Cross-prompt state, threaded through every per-prompt sweep: the CPU
     # fp32 accumulator, plus per-layer on-device row buffers reused across
     # prompts (allocated once d_model is known).
-    state: dict[str, Any] = {"acc": None, "d_model": 0, "dev_rows": None}
+    state: dict[str, Any] = {
+        "acc": None, "d_model": 0, "dev_rows": None, "row_norms": None,
+    }
     n_done = 0
 
     def _partial() -> JacobianLens:
@@ -393,6 +451,7 @@ def fit_jacobian_lens(
             ids = ids.to(device)
             batch = max(1, min(dim_batch, state["d_model"] or dim_batch))
             while True:
+                retry_batch: int | None = None
                 try:
                     _accumulate_prompt_jacobian(
                         model, ids, layer_modules, sources, final_idx, state,
@@ -400,11 +459,14 @@ def fit_jacobian_lens(
                     )
                     break
                 except RuntimeError as exc:  # OOM → halve dim_batch and retry
-                    if "out of memory" not in str(exc).lower() or batch <= 1:
+                    msg = str(exc).lower()
+                    if "out of memory" not in msg or batch <= 1:
                         raise
-                    batch = max(1, batch // 2)
-                    _empty_device_cache(device)
-                    log.warning("jlens: OOM — retrying prompt with dim_batch=%d", batch)
+                    retry_batch = max(1, batch // 2)
+                assert retry_batch is not None
+                batch = retry_batch
+                _empty_device_cache(device)
+                log.warning("jlens: OOM — retrying prompt with dim_batch=%d", batch)
             dim_batch = batch
             n_done += 1
             if on_progress is not None:
@@ -495,6 +557,10 @@ def _accumulate_prompt_jacobian(
                     l: torch.zeros(d_model, d_model, dtype=torch.float32, device=device)
                     for l in sources
                 }
+                state["row_norms"] = {
+                    l: torch.zeros(d_model, dtype=torch.float32, device=device)
+                    for l in sources
+                }
             except RuntimeError as exc:  # device too tight for the buffers
                 if "out of memory" not in str(exc).lower():
                     raise
@@ -502,11 +568,16 @@ def _accumulate_prompt_jacobian(
                     l: torch.zeros(d_model, d_model, dtype=torch.float32)
                     for l in sources
                 }
+                state["row_norms"] = {
+                    l: torch.zeros(d_model, dtype=torch.float32)
+                    for l in sources
+                }
                 log.warning(
                     "jlens: device row buffers do not fit — accumulating on "
                     "CPU (per-pass sync transfers; the fit will be slower)"
                 )
         dev_rows: dict[int, torch.Tensor] = state["dev_rows"]
+        row_norms: dict[int, torch.Tensor] = state["row_norms"]
         on_device = next(iter(dev_rows.values())).device == device
         source_tensors: list[torch.Tensor] = []
         for l in sources:
@@ -516,7 +587,7 @@ def _accumulate_prompt_jacobian(
                     "reach the residual stream (unsupported block call shape?)"
                 )
             source_tensors.append(captured[l])
-            dev_rows[l].zero_()
+            row_norms[l].zero_()
 
         n_passes = math.ceil(d_model / batch)
         cot = torch.zeros_like(final)
@@ -538,8 +609,12 @@ def _accumulate_prompt_jacobian(
                 block = g[:n_dims, skip_first : seq_len - 1].mean(
                     dim=1, dtype=torch.float32
                 )
+                norm = block.abs().sum(dim=1)
                 dev_rows[l][dim_start : dim_start + n_dims] = (
                     block if on_device else block.cpu()
+                )
+                row_norms[l][dim_start : dim_start + n_dims] = (
+                    norm if on_device else norm.cpu()
                 )
             if device.type == "mps" and (p + 1) % _MPS_SYNC_EVERY_PASSES == 0:
                 torch.mps.synchronize()
@@ -547,13 +622,14 @@ def _accumulate_prompt_jacobian(
         # failure mid-fold must not leave some layers already accumulated
         # (the OOM retry would double-count them).
         host_rows = {l: dev_rows[l].cpu() for l in sources}
+        host_norms = {l: row_norms[l].cpu() for l in sources}
         for l in sources:
             # A zero ROW of J_l is impossible for a real transformer (the
             # residual identity path alone makes every output dim depend on
             # every layer) — it means the device dropped that pass's work,
             # i.e. an asynchronous command-buffer OOM. Raise with the
             # "out of memory" phrasing so the dim_batch-halving retry fires.
-            if bool((host_rows[l].abs().sum(dim=1) == 0).any()):
+            if bool((host_norms[l] == 0).any()):
                 raise JacobianLensError(
                     f"layer {l} came back with zero rows from the device — "
                     "likely an asynchronous out of memory on the command "

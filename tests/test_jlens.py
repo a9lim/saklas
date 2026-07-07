@@ -20,6 +20,7 @@ from saklas.core.jlens import (
     fit_jacobian_lens,
     lens_logits,
     resolve_word_token,
+    topk_logprobs,
 )
 from saklas.core.model import get_final_norm, get_unembedding
 from tests._jlens_toys import TOY_D as _D
@@ -202,6 +203,24 @@ def test_token_direction_shape_and_math() -> None:
     dirs = lens.token_direction(5, unembed)
     assert set(dirs) == {0, 1}
     assert torch.allclose(dirs[1], unembed[5] @ J[1])
+
+
+def test_token_direction_can_restrict_layers() -> None:
+    J = torch.randn(2, _D, _D)
+    lens = JacobianLens({0: J[0], 1: J[1]}, n_prompts=1, d_model=_D)
+    unembed = torch.randn(_VOCAB, _D)
+    dirs = lens.token_direction(5, unembed, layers=[1])
+    assert set(dirs) == {1}
+    assert torch.allclose(dirs[1], unembed[5] @ J[1])
+
+
+def test_topk_logprobs_matches_full_log_softmax() -> None:
+    logits = torch.randn(4, _VOCAB)
+    vals, idxs = topk_logprobs(logits, 7)
+    expected = torch.log_softmax(logits, dim=-1)
+    exp_vals, exp_idxs = expected.topk(7, dim=-1)
+    assert torch.equal(idxs, exp_idxs)
+    assert torch.allclose(vals, exp_vals)
 
 
 class _WordTokenizer:

@@ -792,7 +792,7 @@ export const apiLens = {
   tokenReadout(
     nodeId: string,
     rawIndex: number,
-    opts: { topK?: number; steered?: boolean; raw?: boolean } = {},
+    opts: { topK?: number; steered?: boolean; raw?: boolean; layers?: string } = {},
     id: string = SESSION,
   ): Promise<LensTokenReadoutJSON> {
     const params = new URLSearchParams({
@@ -802,6 +802,7 @@ export const apiLens = {
       steered: String(opts.steered ?? true),
       raw: String(opts.raw ?? false),
     });
+    if (opts.layers) params.set("layers", opts.layers);
     return request(`${SESSION_BASE(id)}/lens/token-readout?${params}`);
   },
 };

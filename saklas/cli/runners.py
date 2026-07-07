@@ -2253,13 +2253,20 @@ _DEFAULT_LENS_CORPUS = ("HuggingFaceFW/fineweb-edu", "sample-10BT")
 _LENS_DOC_CHARS = 4000
 
 
-def _parse_layer_list(raw: "str | None") -> "list[int] | None":
+def _parse_layer_list(raw: "str | None") -> "list[int] | str | None":
     if raw is None:
         return None
+    lowered = raw.strip().lower()
+    if lowered in {"workspace", "band", "sample", "all"}:
+        return lowered
     try:
         layers = [int(part) for part in raw.split(",") if part.strip() != ""]
     except ValueError:
-        print(f"lens: bad --layers value {raw!r} (want e.g. 12,24,36)", file=sys.stderr)
+        print(
+            f"lens: bad --layers value {raw!r} "
+            "(want e.g. 12,24,36 or workspace)",
+            file=sys.stderr,
+        )
         sys.exit(2)
     if not layers:
         print("lens: --layers must name at least one source layer", file=sys.stderr)
@@ -2354,19 +2361,19 @@ def _run_lens_fit(args: argparse.Namespace) -> None:
 def _run_lens_show(args: argparse.Namespace) -> None:
     import json as _json
 
-    from saklas.io.lens import lens_paths, load_lens
+    from saklas.io.lens import lens_paths, load_lens_sidecar
 
-    loaded = load_lens(args.model)
-    if loaded is None:
+    sidecar = load_lens_sidecar(args.model)
+    if sidecar is None:
         print(
             f"no fitted lens for {args.model} — run "
             f"`saklas lens fit {args.model}`",
             file=sys.stderr,
         )
         sys.exit(1)
-    lens, sidecar = loaded
     ts_path, _ = lens_paths(args.model)
     size_mb = ts_path.stat().st_size / 1024**2
+    source_layers = [int(layer) for layer in sidecar["source_layers"]]
     if getattr(args, "json_output", False):
         print(_json.dumps({
             "model": args.model,
@@ -2376,10 +2383,10 @@ def _run_lens_show(args: argparse.Namespace) -> None:
         }, indent=2))
         return
     print(f"Jacobian lens for {args.model}")
-    print(f"  layers:   {lens.source_layers[0]}..{lens.source_layers[-1]} "
-          f"({len(lens.source_layers)})")
-    print(f"  d_model:  {lens.d_model}")
-    print(f"  prompts:  {lens.n_prompts}")
+    print(f"  layers:   {source_layers[0]}..{source_layers[-1]} "
+          f"({len(source_layers)})")
+    print(f"  d_model:  {sidecar['d_model']}")
+    print(f"  prompts:  {sidecar.get('n_prompts', '?')}")
     print(f"  corpus:   {sidecar.get('corpus_spec', '?')} "
           f"(sha256 {str(sidecar.get('corpus_sha256', ''))[:12]}…)")
     print(f"  seq_len:  {sidecar.get('seq_len', '?')}, "

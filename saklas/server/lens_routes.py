@@ -25,14 +25,21 @@ from saklas.server.app import acquire_session_lock
 from saklas.server.native_common import resolve_session_id
 
 
-def _parse_layers(layers: str | None) -> list[int] | None:
-    """``"3,7,11"`` → ``[3, 7, 11]``; ``None``/empty → ``None`` (all fitted)."""
+def _parse_layers(layers: str | None) -> list[int] | str | None:
+    """``"3,7,11"`` → ``[3, 7, 11]``; named modes pass through."""
     if layers is None or not layers.strip():
         return None
+    lowered = layers.strip().lower()
+    if lowered in {"workspace", "band", "sample", "all"}:
+        return lowered
     try:
         return [int(part) for part in layers.split(",") if part.strip()]
     except ValueError as e:
-        raise HTTPException(400, f"malformed layers list: {layers!r}") from e
+        raise HTTPException(
+            400,
+            f"malformed layers list: {layers!r} "
+            "(want csv, workspace, sample, or all)",
+        ) from e
 
 
 def register_lens_routes(app: FastAPI) -> None:
@@ -56,11 +63,11 @@ def register_lens_routes(app: FastAPI) -> None:
         ``steered=false`` for the unsteered counterfactual read of the same
         token stream.  ``raw`` selects the flat (base-model / raw-buffer)
         render; the client supplies it because raw-ness isn't stamped on
-        the node.  ``layers`` restricts the readout (csv), default every
-        fitted layer.
+        the node.  ``layers`` restricts the readout (csv or workspace/sample/all);
+        default is the fitted workspace band.
         """
         resolve_session_id(session, session_id)
-        req_layers = _parse_layers(layers)
+        req_layers = _parse_layers(layers) or "workspace"
         if not 1 <= top_k <= 50:
             raise HTTPException(400, "top_k must be in [1, 50]")
         async with acquire_session_lock(session) as acquired:

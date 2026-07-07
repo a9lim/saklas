@@ -331,8 +331,9 @@
   const lensKey = $derived.by<string | null>(() => {
     const nodeId = loomNodeId;
     const rawIndex = token?.rawIndex;
+    const raw = effectiveRawMode();
     if (!nodeId || rawIndex == null) return null;
-    return `${nodeId}:${rawIndex}:${lensSteered ? 1 : 0}`;
+    return `${nodeId}:${rawIndex}:${lensSteered ? 1 : 0}:${raw ? 1 : 0}:workspace`;
   });
 
   $effect(() => {
@@ -355,6 +356,7 @@
         topK: LENS_TOP_K,
         steered: lensSteered,
         raw: effectiveRawMode(),
+        layers: "workspace",
       })
       .then((d) => {
         lensCache.set(key, d);

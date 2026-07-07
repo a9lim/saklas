@@ -908,12 +908,13 @@ def _build_lens_fit(p: argparse.ArgumentParser) -> None:
              "and barely moves wall time; halves automatically on OOM.",
     )
     p.add_argument(
-        "--layers", default=None, metavar="L1,L2,...",
+        "--layers", default=None, metavar="L1,L2,...|workspace",
         help="Fit only these source layers (default: every layer below the "
              "final one). Restricting to the workspace band — roughly the "
              "40-90%% depth the jlens/<word> atoms use — skips the backward "
              "work below the lowest requested layer and shrinks the artifact; "
-             "readout surfaces then cover only the fitted layers.",
+             "readout surfaces then cover only the fitted layers. Pass "
+             "`workspace` as shorthand for that band.",
     )
     p.add_argument(
         "-f", "--force", action="store_true",
@@ -938,8 +939,8 @@ def _build_lens_top(p: argparse.ArgumentParser) -> None:
         help="Tokens per (layer, position) readout (default 8)",
     )
     p.add_argument(
-        "--layers", default=None, metavar="L1,L2,...",
-        help="Comma-separated layer indices (default: 9 evenly spaced fitted layers)",
+        "--layers", default=None, metavar="L1,L2,...|sample|workspace|all",
+        help="Comma-separated layer indices or a layer mode (default: 9 evenly spaced fitted layers)",
     )
     p.add_argument(
         "--position", type=int, action="append", default=None, metavar="P",
@@ -968,9 +969,9 @@ def _build_lens_decompose(p: argparse.ArgumentParser) -> None:
         help="Sparsity budget: atoms in the J-space component (default 16)",
     )
     p.add_argument(
-        "--layers", default=None, metavar="L1,L2,...",
-        help="Comma-separated layer indices (default: every fitted layer the "
-             "direction covers)",
+        "--layers", default=None, metavar="L1,L2,...|workspace|all",
+        help="Comma-separated layer indices or a layer mode (default: every "
+             "fitted layer the direction covers)",
     )
     p.add_argument("-d", "--device", default="auto",
                    help="Device: auto (detect), cuda, mps, or cpu")

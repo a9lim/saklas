@@ -110,9 +110,9 @@ def session_info(
         assistant_role_ok = user_role_ok = False
         default_assistant_role = default_user_role = None
     try:
-        from saklas.io.lens import lens_paths
+        from saklas.io.lens import load_lens_sidecar
 
-        jlens_fitted = lens_paths(session.model_id)[0].exists()
+        jlens_fitted = load_lens_sidecar(session.model_id) is not None
     except Exception:
         jlens_fitted = False
     return {

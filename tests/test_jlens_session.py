@@ -34,6 +34,10 @@ class _StubSession:
     _require_jlens = SaklasSession._require_jlens
     fit_jlens = SaklasSession.fit_jlens
     jlens_readout = SaklasSession.jlens_readout
+    _resolve_jlens_layers = SaklasSession._resolve_jlens_layers
+    _resolve_jlens_source_layers = SaklasSession._resolve_jlens_source_layers
+    _jlens_transport_stack = SaklasSession._jlens_transport_stack
+    _jlens_topk_rows = SaklasSession._jlens_topk_rows
     register_jlens_direction = SaklasSession.register_jlens_direction
     enable_live_lens = SaklasSession.enable_live_lens
     disable_live_lens = SaklasSession.disable_live_lens
@@ -113,10 +117,15 @@ def test_fit_jlens_resumes_from_partial_and_matches_full_fit() -> None:
     # Simulate an interrupted fit: a checkpoint covering the first 2 prompts.
     partial = _StubSession()
     head = partial.fit_jlens(_PROMPTS[:2], force=True)
-    corpus_sha = hashlib.sha256("\n\x00".join(_PROMPTS).encode("utf-8")).hexdigest()
+    consumed = [
+        [int(tok) for tok in partial._tokenizer(p, return_tensors="pt")["input_ids"][0].tolist()]
+        for p in _PROMPTS
+    ]
+    corpus_sha = hashlib.sha256(repr(consumed).encode("utf-8")).hexdigest()
     save_lens(
         head, _MODEL_ID,
         corpus_spec="test", corpus_sha256=corpus_sha,
+        corpus_hash_kind="token_ids_v1",
         seq_len=128, dim_batch=8, skip_first=16,
     )
 
@@ -144,7 +153,22 @@ def test_fit_jlens_drops_short_prompts() -> None:
 def test_jlens_readout_shape_and_default_position() -> None:
     s = _StubSession()
     s.fit_jlens(_PROMPTS)
-    out = s.jlens_readout("a prompt that is long enough.", top_k=3)
+    seen_pool: list[int | None] = []
+    import saklas.core.vectors as _vectors
+
+    real_capture = _vectors._capture_all_hidden_states
+
+    def _spy(model: Any, layers: Any, ids: torch.Tensor, **kw: Any) -> Any:
+        pool = kw.get("pool_index")
+        seen_pool.append(int(pool) if pool is not None else None)
+        return real_capture(model, layers, ids, **kw)
+
+    _vectors._capture_all_hidden_states = _spy
+    try:
+        out = s.jlens_readout("a prompt that is long enough.", top_k=3)
+    finally:
+        _vectors._capture_all_hidden_states = real_capture
+    assert seen_pool == [len(s._tokenizer.encode("a prompt that is long enough.")) - 1]
     assert set(out) == {0, 1}  # 3-layer toy: sources are 0 and 1
     for rows in out.values():
         assert len(rows) == 1  # default: final position only
@@ -169,8 +193,22 @@ def test_jlens_readout_rejects_unfitted_layer() -> None:
 def test_register_jlens_direction_registers_profile() -> None:
     s = _StubSession()
     lens = s.fit_jlens(_PROMPTS)
+    seen_layers: list[list[int] | None] = []
+    real_token_direction = lens.token_direction
+
+    def _spy_token_direction(
+        token_id: int,
+        unembed: torch.Tensor,
+        *,
+        layers: list[int] | None = None,
+    ) -> dict[int, torch.Tensor]:
+        seen_layers.append(layers)
+        return real_token_direction(token_id, unembed, layers=layers)
+
+    lens.token_direction = _spy_token_direction  # type: ignore[method-assign]
     name = s.register_jlens_direction("g")  # 'g' round-trips in the toy vocab
     assert name == "jlens/g"
+    assert seen_layers == [[1]]
     dirs = s._profiles[name]
     # restricted to the workspace band — for the 3-layer toy that's layer 1
     # (layer 0 sits at 0% depth, outside the 40–90% band)
@@ -343,13 +381,14 @@ def test_jlens_token_readout_shape_and_position() -> None:
     raw_ids = s._tokenizer.encode("abcdefg")
     node_id = _tree_with_assistant(s, raw_ids)
 
-    seen_lens: list[int] = []
+    seen_lens: list[tuple[int, int | None]] = []
     import saklas.core.vectors as _vectors
 
     real_capture = _vectors._capture_all_hidden_states
 
     def _spy(model: Any, layers: Any, ids: torch.Tensor, **kw: Any) -> Any:
-        seen_lens.append(int(ids.shape[1]))
+        pool = kw.get("pool_index")
+        seen_lens.append((int(ids.shape[1]), int(pool) if pool is not None else None))
         return real_capture(model, layers, ids, **kw)
 
     _vectors._capture_all_hidden_states = _spy
@@ -361,7 +400,7 @@ def test_jlens_token_readout_shape_and_position() -> None:
     prompt_len = len(s._tokenizer.encode(_PROMPT_RENDER))
     # readout position: the forward that PRODUCED the clicked token —
     # prompt + raw[:3], never including the clicked token itself.
-    assert seen_lens == [prompt_len + 3]
+    assert seen_lens == [(prompt_len + 3, prompt_len + 2)]
     assert out["node_id"] == node_id
     assert out["raw_index"] == 3
     assert out["token_id"] == raw_ids[3]
@@ -383,13 +422,14 @@ def test_jlens_token_readout_index_zero_reads_prompt_only() -> None:
     s.fit_jlens(_PROMPTS)
     node_id = _tree_with_assistant(s, s._tokenizer.encode("abc"))
 
-    seen_lens: list[int] = []
+    seen_lens: list[tuple[int, int | None]] = []
     import saklas.core.vectors as _vectors
 
     real_capture = _vectors._capture_all_hidden_states
 
     def _spy(model: Any, layers: Any, ids: torch.Tensor, **kw: Any) -> Any:
-        seen_lens.append(int(ids.shape[1]))
+        pool = kw.get("pool_index")
+        seen_lens.append((int(ids.shape[1]), int(pool) if pool is not None else None))
         return real_capture(model, layers, ids, **kw)
 
     _vectors._capture_all_hidden_states = _spy
@@ -397,7 +437,8 @@ def test_jlens_token_readout_index_zero_reads_prompt_only() -> None:
         s.jlens_token_readout(node_id, 0, top_k=2)
     finally:
         _vectors._capture_all_hidden_states = real_capture
-    assert seen_lens == [len(s._tokenizer.encode(_PROMPT_RENDER))]
+    prompt_len = len(s._tokenizer.encode(_PROMPT_RENDER))
+    assert seen_lens == [(prompt_len, prompt_len - 1)]
 
 
 def test_jlens_token_readout_steering_scope() -> None:

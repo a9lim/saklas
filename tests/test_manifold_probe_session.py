@@ -281,6 +281,23 @@ def test_begin_capture_live_lens_uses_persistent_capture_when_available():
     assert session._capture_state.persistent is True
 
 
+def test_begin_capture_live_lens_ignored_without_consumer():
+    """A globally enabled live lens should not widen capture for a generation
+    that cannot surface ``TokenEvent.lens_readout``."""
+    session = _stub_session()
+    session._layers = [None] * 4  # pyright: ignore[reportAttributeAccessIssue]
+    session._live_lens = {"layers": [1, 3]}
+    session._capture.attach = lambda *args, **kw: None
+    session._capture.clear = lambda: None
+    session._incremental_readings = []
+
+    ok = SaklasSession._begin_capture(
+        session, widen=False, live_lens_active=False,
+    )
+
+    assert ok is False
+
+
 # ===================================================== gating callback ===
 
 def test_gating_callback_emits_probe_scalars():

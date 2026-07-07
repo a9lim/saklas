@@ -92,6 +92,12 @@ def test_lens_layers_empty_string_errors(capsys: pytest.CaptureFixture[str]):
     assert "at least one source layer" in capsys.readouterr().err
 
 
+def test_lens_layers_named_modes_parse() -> None:
+    assert cli_runners._parse_layer_list("workspace") == "workspace"
+    assert cli_runners._parse_layer_list("band") == "band"
+    assert cli_runners._parse_layer_list("all") == "all"
+
+
 # ---------------------------------------------------------------------------
 # config subtree
 # ---------------------------------------------------------------------------

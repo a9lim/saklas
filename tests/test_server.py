@@ -973,7 +973,7 @@ class TestLensTokenReadout:
         kwargs = session.jlens_token_readout.call_args.kwargs
         assert kwargs["apply_steering"] is True
         assert kwargs["raw"] is False
-        assert kwargs["layers"] is None
+        assert kwargs["layers"] == "workspace"
         assert kwargs["top_k"] == 2
 
     def test_steered_and_layers_params_thread_through(
@@ -993,6 +993,16 @@ class TestLensTokenReadout:
         assert kwargs["apply_steering"] is False
         assert kwargs["raw"] is True
         assert kwargs["layers"] == [12, 18]
+
+    def test_layer_mode_params_thread_through(self, session_and_client: Any) -> None:
+        session, client = session_and_client
+        session.jlens_token_readout.return_value = dict(self._SESSION_OUT)
+        resp = client.get(
+            "/saklas/v1/sessions/default/lens/token-readout",
+            params={"node_id": "n1", "raw_index": 3, "layers": "all"},
+        )
+        assert resp.status_code == 200
+        assert session.jlens_token_readout.call_args.kwargs["layers"] == "all"
 
     def test_lens_not_fitted_404(self, session_and_client: Any) -> None:
         from saklas.core.jlens import LensNotFittedError
@@ -1059,8 +1069,11 @@ class TestLensTokenReadout:
     def test_session_info_carries_jlens_fitted(
         self, session_and_client: Any, tmp_path: Any, monkeypatch: Any,
     ) -> None:
-        """``jlens_fitted`` is a path-existence read, never a lens load."""
-        from saklas.io.lens import lens_paths
+        """``jlens_fitted`` validates sidecar metadata, never loading tensors."""
+        import torch
+
+        from saklas.core.jlens import JacobianLens
+        from saklas.io.lens import lens_paths, save_lens
 
         _, client = session_and_client
         monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
@@ -1071,5 +1084,17 @@ class TestLensTokenReadout:
         ts_path, _ = lens_paths("test/model")
         ts_path.parent.mkdir(parents=True, exist_ok=True)
         ts_path.write_bytes(b"\x00")
+        resp = client.get("/saklas/v1/sessions/default")
+        assert resp.json()["jlens_fitted"] is False
+
+        save_lens(
+            JacobianLens({0: torch.eye(2)}, n_prompts=1, d_model=2),
+            "test/model",
+            corpus_spec="test",
+            corpus_sha256="abc123",
+            seq_len=8,
+            dim_batch=1,
+            skip_first=0,
+        )
         resp = client.get("/saklas/v1/sessions/default")
         assert resp.json()["jlens_fitted"] is True
