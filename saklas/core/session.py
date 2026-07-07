@@ -1711,6 +1711,11 @@ class SaklasSession:
                 "\n\x00".join(usable).encode("utf-8")
             ).hexdigest()
 
+            expected_sources = (
+                sorted(set(source_layers))
+                if source_layers is not None
+                else list(range(len(self._layers) - 1))
+            )
             base: Any = None
             if not force:
                 existing = load_lens(self.model_id)
@@ -1719,6 +1724,9 @@ class SaklasSession:
                     if (
                         sidecar.get("corpus_sha256") == corpus_sha
                         and sidecar.get("seq_len") == seq_len
+                        # A source-layer mismatch can't resume-merge — treat
+                        # the stored lens as stale and refit from zero.
+                        and lens.source_layers == expected_sources
                     ):
                         if lens.n_prompts >= len(usable):
                             if on_progress is not None:

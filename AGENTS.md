@@ -283,9 +283,17 @@ sidecar records the corpus spec + sha256). `lens fit` runs the estimator
 replicated `dim_batch`× and the graph retained, then `ceil(d_model/dim_batch)`
 backwards with one-hot cotangents at every valid target position; the **only**
 backward passes in saklas — everything else runs under `inference_mode`, so the
-fit seeds a grad leaf at the first block's input via a pre-hook and reads
-per-layer grads with `tensor.register_hook`, never `retain_grad`). Fits resume
-by default (corpus-hash match + checkpoint every 25 prompts); `-f` restarts.
+fit seeds a grad leaf at the lowest source block's input via a pre-hook and
+reads per-layer grads from `torch.autograd.grad(final, sources)`, never
+`retain_grad`). Row blocks accumulate in on-device buffers with one host fold
+per prompt — never per pass — and on MPS the pass loop drains the command
+queue every few passes (`_MPS_SYNC_EVERY_PASSES`): Metal reports queue
+exhaustion as an *asynchronous* command-buffer error that silently zeroes the
+work rather than raising, so a fully unsynced loop corrupts the fit (a
+zero-row fold guard converts any escape into the dim_batch-halving retry).
+`--layers` restricts the fit to a source band and skips all forward *and*
+backward graph work below it. Fits resume by default (corpus-hash +
+source-layer match + checkpoint every 25 prompts); `-f` restarts.
 
 Three read surfaces, one write surface:
 
@@ -333,8 +341,15 @@ Three read surfaces, one write surface:
 The fit needs a pretraining-like corpus: `--corpus FILE` (one document per
 line) or, unset, a streamed fineweb-edu sample via the optional `datasets`
 dependency (`pip install 'saklas[hf]'`). ~100 prompts is usable, 1000 is
-paper-parity; gemma-3-4b at `--dim-batch 32` fits 100 prompts in ~15–20 min
-on an M5 Max.
+paper-parity. The fit is **compute-bound** — each prompt costs ~`d_model × 2`
+forward-equivalents of backward work, and total FLOPs are `--dim-batch`-
+invariant (measured flat on an M5 Max: 93.6/96.9/102.5 s/prompt at
+dim_batch 8/32/64 on gemma-3-4b, identical output — so a full-depth
+100-prompt fit is ~2.6 h, and the knob is a memory dial, not a speed dial).
+The real wall-time levers: `--layers` (a 40–90% workspace-band fit measures
+1.73× faster at 54s/prompt and shrinks the artifact proportionally),
+`--seq-len` (≈linear), or fitting on a CUDA box and letting the per-model
+artifact ride over.
 
 ## Extraction
 

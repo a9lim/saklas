@@ -220,7 +220,11 @@ category list through verbatim (tagged concepts only, no multi-node sweep).
   EXPR` (required), `--compare-linear`, `--max-tokens` (128), `-j`.
 - `config show`/`validate` — flags as in `config_file`.
 - `lens fit`: positional `model`, `--corpus FILE`, `--prompts N` (100),
-  `--seq-len T` (128), `--dim-batch K` (8; halves automatically on OOM),
+  `--seq-len T` (128), `--dim-batch K` (8; total backward work is K-invariant,
+  so the knob trades memory for per-pass overhead — halves automatically on
+  OOM), `--layers L1,L2,...` (restrict source layers — skips all forward-graph
+  and backward work below the lowest one, the one real wall-time lever; a
+  stored lens whose layers mismatch the request refits instead of resuming),
   `-f/--force` (restart from zero instead of resuming), `-d`, `-q`.
 - `lens show`: positional `model`, `-j`.
 - `lens top`: positionals `model` + `prompt` (raw text, no chat template),

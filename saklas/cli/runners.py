@@ -2379,6 +2379,7 @@ def _run_lens_fit(args: argparse.Namespace) -> None:
         lens = session.fit_jlens(
             docs,
             corpus_spec=spec,
+            source_layers=_parse_layer_list(getattr(args, "layers", None)),
             dim_batch=args.dim_batch,
             seq_len=args.seq_len,
             force=args.force,

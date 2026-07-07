@@ -76,6 +76,25 @@ def test_estimator_matches_exact_jacobian() -> None:
         )
 
 
+def test_restricted_source_layers_match_exact_jacobian() -> None:
+    """A band-restricted fit seeds at its lowest source layer (blocks below
+    run graph-free) — the estimate must be unchanged by the truncation."""
+    model = _frozen_model(n_layers=3)
+    tokenizer = _CharTokenizer()
+    prompt = "the quick brown fox js"
+    skip = 16
+
+    lens = fit_jacobian_lens(
+        model, tokenizer, [prompt], model.model.layers,
+        source_layers=[1], dim_batch=4, skip_first=skip,
+    )
+    assert lens.source_layers == [1]
+
+    ids = tokenizer(prompt)["input_ids"]
+    exact = _exact_jacobian(model, ids, 1, skip_first=skip)
+    assert torch.allclose(lens.jacobians[1], exact, atol=1e-5)
+
+
 def test_fit_averages_over_prompts_and_merge_agrees() -> None:
     model = _frozen_model(n_layers=2)
     tokenizer = _CharTokenizer()

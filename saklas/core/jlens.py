@@ -25,10 +25,23 @@ This is the ONLY module in saklas that runs backward passes. The fit builds
 its own autograd-enabled forward (``torch.enable_grad()`` + a grad-seeding
 pre-hook on the first block) — the ``inference_mode`` capture machinery in
 ``vectors.py`` cannot be reused, because inference tensors never re-enter
-autograd. Per-layer grads are read with ``tensor.register_hook``, NOT
-``retain_grad()``: ``.grad`` accumulates across the multi-backward loop and
-would corrupt the one-hot-cotangent rows. Accumulators are fp32 on CPU (the
-reference convention; entries are O(1) so fp16 storage downstream is safe).
+autograd. Per-layer grads come from ``torch.autograd.grad(final, sources)``
+— NOT ``backward()`` + ``retain_grad()`` (``.grad`` accumulates across the
+multi-backward loop and would corrupt the one-hot-cotangent rows) — which
+also stops the graph walk at the shallowest requested source layer, so a
+band-restricted fit never backprops below its lowest source. Each pass
+writes its row block into a per-layer ON-DEVICE fp32 buffer; the only
+device→host transfer is one fold per prompt into the CPU fp32 cross-prompt
+accumulator (a per-pass ``.cpu()`` is a blocking sync per source layer —
+worth ~6% on MPS). The sync budget is bounded from BOTH sides: a fully
+unsynced pass loop lets the CPU enqueue arbitrarily far ahead of the device,
+and Metal reports the resulting queue exhaustion asynchronously — no Python
+exception, the work silently never runs, the fold reads zeros — hence the
+periodic drain (``_MPS_SYNC_EVERY_PASSES``) plus the zero-row fold guard.
+The fit is compute-bound (each prompt ≈ ``d_model × 2`` forward-equivalents
+of backward, dim_batch-invariant); restricting ``source_layers`` is the one
+lever that removes work. Entries are O(1), so fp16 storage downstream is
+safe.
 """
 
 from __future__ import annotations
@@ -49,9 +62,21 @@ log = logging.getLogger(__name__)
 #: positions act as attention sinks with atypical residual statistics.
 SKIP_FIRST_POSITIONS = 16
 DEFAULT_SEQ_LEN = 128
+#: Output dims per backward pass. Total backward FLOPs are dim_batch-invariant
+#: (pass count halves as pass width doubles), so this knob trades memory for
+#: per-pass overhead and barely moves wall time — measured on an M5 Max /
+#: gemma-3-4b, 8 is the sweet spot (93.6s/prompt vs 96.9s at 32, 102.5s at
+#: 64, identical output). Halves automatically on OOM.
 DEFAULT_DIM_BATCH = 8
 #: Checkpoint cadence (prompts) for resumable fits.
 DEFAULT_CHECKPOINT_EVERY = 25
+#: Backward passes between queue drains on MPS. Metal reports command-queue
+#: exhaustion as an *asynchronous* command-buffer error — no Python exception,
+#: the encoded ops silently never complete — so an unsynchronized pass loop
+#: that runs ahead of the device turns into all-zero gradients, not an OOM.
+#: A bounded drain every few passes caps the in-flight transients; the
+#: all-zero fold guard below catches whatever still slips through.
+_MPS_SYNC_EVERY_PASSES = 4
 
 
 class JacobianLensError(RuntimeError, SaklasError):
@@ -338,16 +363,19 @@ def fit_jacobian_lens(
             f"the transport target, not a source; got {sources}"
         )
 
-    acc: dict[int, torch.Tensor] | None = None  # allocated once d_model is known
-    d_model = 0
+    # Cross-prompt state, threaded through every per-prompt sweep: the CPU
+    # fp32 accumulator, plus per-layer on-device row buffers reused across
+    # prompts (allocated once d_model is known).
+    state: dict[str, Any] = {"acc": None, "d_model": 0, "dev_rows": None}
     n_done = 0
 
     def _partial() -> JacobianLens:
+        acc = state["acc"]
         assert acc is not None
         return JacobianLens(
             {l: a / max(n_done, 1) for l, a in acc.items()},
             n_prompts=n_done,
-            d_model=d_model,
+            d_model=state["d_model"],
         )
 
     with torch.enable_grad():
@@ -361,16 +389,13 @@ def fit_jacobian_lens(
                 )
                 continue
             ids = ids.to(device)
-            batch = max(1, min(dim_batch, d_model or dim_batch))
+            batch = max(1, min(dim_batch, state["d_model"] or dim_batch))
             while True:
                 try:
                     _accumulate_prompt_jacobian(
-                        model, ids, layer_modules, sources, final_idx,
-                        acc_ref := {"acc": acc, "d_model": d_model},
+                        model, ids, layer_modules, sources, final_idx, state,
                         batch=batch, skip_first=skip_first,
                     )
-                    acc = acc_ref["acc"]
-                    d_model = acc_ref["d_model"]
                     break
                 except RuntimeError as exc:  # OOM → halve dim_batch and retry
                     if "out of memory" not in str(exc).lower() or batch <= 1:
@@ -380,13 +405,16 @@ def fit_jacobian_lens(
                     log.warning("jlens: OOM — retrying prompt with dim_batch=%d", batch)
             dim_batch = batch
             n_done += 1
-            _empty_device_cache(device)
             if on_progress is not None:
                 on_progress(f"prompt {n_done}/{len(prompts)} (dim_batch={batch})")
             if checkpoint_cb is not None and n_done % checkpoint_every == 0:
                 checkpoint_cb(_partial())
+                # Allocator hygiene at checkpoint cadence only — a per-prompt
+                # empty_cache forces a sync and dumps the pool the very next
+                # prompt re-allocates.
+                _empty_device_cache(device)
 
-    if acc is None or n_done == 0:
+    if state["acc"] is None or n_done == 0:
         raise JacobianLensError(
             f"no usable prompts: every prompt had <= {skip_first + 1} tokens"
         )
@@ -399,22 +427,24 @@ def _accumulate_prompt_jacobian(
     layer_modules: Sequence[nn.Module],
     sources: Sequence[int],
     final_idx: int,
-    acc_ref: dict[str, Any],
+    state: dict[str, Any],
     *,
     batch: int,
     skip_first: int,
 ) -> None:
-    """Run one prompt's forward + backward sweep, adding into ``acc_ref``."""
+    """Run one prompt's forward + backward sweep, adding into ``state``.
+
+    The fold into ``state["acc"]`` happens once at the end, all-or-nothing,
+    so a mid-prompt OOM retry never double-counts. Row blocks land in the
+    reused per-layer device buffers (``state["dev_rows"]``) — each
+    ``(pass, layer)`` writes a disjoint block, and the device→host transfer
+    happens once per prompt, off the backward critical path.
+    """
     seq_len = ids.shape[1]
     device = ids.device
     valid = torch.arange(skip_first, seq_len - 1, device=device)
     captured: dict[int, torch.Tensor] = {}
     handles: list[Any] = []
-    # Written before each backward pass; read by the per-layer grad sinks.
-    span = {"dim_start": 0, "n_dims": 0}
-    # Per-prompt on-CPU row sums, folded into the cross-prompt accumulator at
-    # the end so a mid-prompt OOM retry never double-counts.
-    prompt_rows: dict[int, torch.Tensor] = {}
 
     def seed_hook(
         _module: nn.Module, args: tuple[Any, ...], kwargs: dict[str, Any]
@@ -432,15 +462,14 @@ def _accumulate_prompt_jacobian(
             captured[idx] = _output_tensor(output)
         return hook
 
-    def make_grad_sink(idx: int) -> Callable[[torch.Tensor], None]:
-        def sink(grad: torch.Tensor) -> None:
-            n = span["n_dims"]
-            rows = grad[:n].index_select(1, valid).to(torch.float32).mean(dim=1)
-            prompt_rows[idx][span["dim_start"] : span["dim_start"] + n] += rows.cpu()
-        return sink
-
+    # Seed at the LOWEST source block, not block 0: everything below it then
+    # runs graph-free (frozen params + a detached input build no autograd
+    # state), so a band-restricted fit pays neither graph memory nor backward
+    # depth below its band. For the default all-layer fit this is block 0.
     handles.append(
-        layer_modules[0].register_forward_pre_hook(seed_hook, with_kwargs=True)
+        layer_modules[min(sources)].register_forward_pre_hook(
+            seed_hook, with_kwargs=True
+        )
     )
     for idx in {*sources, final_idx}:
         handles.append(layer_modules[idx].register_forward_hook(make_capture(idx)))
@@ -453,21 +482,39 @@ def _accumulate_prompt_jacobian(
             model(input_ids=replicated)
         final = captured[final_idx]
         d_model = final.shape[-1]
-        if acc_ref["acc"] is None:
-            acc_ref["acc"] = {
+        if state["acc"] is None:
+            state["acc"] = {
                 l: torch.zeros(d_model, d_model, dtype=torch.float32) for l in sources
             }
-            acc_ref["d_model"] = d_model
-        prompt_rows.update(
-            {l: torch.zeros(d_model, d_model, dtype=torch.float32) for l in sources}
-        )
+            state["d_model"] = d_model
+        if state["dev_rows"] is None:
+            try:
+                state["dev_rows"] = {
+                    l: torch.zeros(d_model, d_model, dtype=torch.float32, device=device)
+                    for l in sources
+                }
+            except RuntimeError as exc:  # device too tight for the buffers
+                if "out of memory" not in str(exc).lower():
+                    raise
+                state["dev_rows"] = {
+                    l: torch.zeros(d_model, d_model, dtype=torch.float32)
+                    for l in sources
+                }
+                log.warning(
+                    "jlens: device row buffers do not fit — accumulating on "
+                    "CPU (per-pass sync transfers; the fit will be slower)"
+                )
+        dev_rows: dict[int, torch.Tensor] = state["dev_rows"]
+        on_device = next(iter(dev_rows.values())).device == device
+        source_tensors: list[torch.Tensor] = []
         for l in sources:
             if not captured[l].requires_grad:
                 raise JacobianLensError(
                     f"layer {l} output carries no grad — the seed hook did not "
                     "reach the residual stream (unsupported block call shape?)"
                 )
-            captured[l].register_hook(make_grad_sink(l))
+            source_tensors.append(captured[l])
+            dev_rows[l].zero_()
 
         n_passes = math.ceil(d_model / batch)
         cot = torch.zeros_like(final)
@@ -475,16 +522,43 @@ def _accumulate_prompt_jacobian(
         for p in range(n_passes):
             dim_start = p * batch
             n_dims = min(batch, d_model - dim_start)
-            span["dim_start"] = dim_start
-            span["n_dims"] = n_dims
             cot.zero_()
             rows = batch_rows[:n_dims].unsqueeze(1)
             cot[rows, valid.unsqueeze(0), (dim_start + batch_rows[:n_dims]).unsqueeze(1)] = 1.0
-            torch.autograd.backward(
-                final, grad_tensors=cot, retain_graph=p < n_passes - 1
+            # grad(final, sources) rather than backward(): the grads return
+            # directly (no hooks), and the walk stops at the shallowest
+            # requested layer instead of descending to the seed leaf.
+            grads = torch.autograd.grad(
+                final, source_tensors, grad_outputs=cot,
+                retain_graph=p < n_passes - 1,
             )
+            for l, g in zip(sources, grads):
+                block = g[:n_dims, skip_first : seq_len - 1].mean(
+                    dim=1, dtype=torch.float32
+                )
+                dev_rows[l][dim_start : dim_start + n_dims] = (
+                    block if on_device else block.cpu()
+                )
+            if device.type == "mps" and (p + 1) % _MPS_SYNC_EVERY_PASSES == 0:
+                torch.mps.synchronize()
+        # Two-phase fold: transfer everything first, then add — a transfer
+        # failure mid-fold must not leave some layers already accumulated
+        # (the OOM retry would double-count them).
+        host_rows = {l: dev_rows[l].cpu() for l in sources}
         for l in sources:
-            acc_ref["acc"][l] += prompt_rows[l]
+            # A zero ROW of J_l is impossible for a real transformer (the
+            # residual identity path alone makes every output dim depend on
+            # every layer) — it means the device dropped that pass's work,
+            # i.e. an asynchronous command-buffer OOM. Raise with the
+            # "out of memory" phrasing so the dim_batch-halving retry fires.
+            if bool((host_rows[l].abs().sum(dim=1) == 0).any()):
+                raise JacobianLensError(
+                    f"layer {l} came back with zero rows from the device — "
+                    "likely an asynchronous out of memory on the command "
+                    "queue; retrying at a smaller dim_batch"
+                )
+        for l in sources:
+            state["acc"][l] += host_rows[l]
     finally:
         for handle in handles:
             handle.remove()

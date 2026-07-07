@@ -903,9 +903,17 @@ def _build_lens_fit(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument(
         "--dim-batch", type=int, default=None, metavar="K",
-        help="Output dims per backward pass (default 8; raise toward 32 on "
-             "large/unified memory for a proportionally faster fit — halves "
-             "automatically on OOM)",
+        help="Output dims per backward pass (default 8). Total backward work "
+             "is K-invariant — the knob trades memory for per-pass overhead "
+             "and barely moves wall time; halves automatically on OOM.",
+    )
+    p.add_argument(
+        "--layers", default=None, metavar="L1,L2,...",
+        help="Fit only these source layers (default: every layer below the "
+             "final one). Restricting to the workspace band — roughly the "
+             "40-90%% depth the jlens/<word> atoms use — skips the backward "
+             "work below the lowest requested layer and shrinks the artifact; "
+             "readout surfaces then cover only the fitted layers.",
     )
     p.add_argument(
         "-f", "--force", action="store_true",
