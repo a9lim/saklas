@@ -387,6 +387,21 @@ class TestOllamaApi:
         assert messages[0]["role"] == "user"
         assert messages[0]["content"] == "Hi"
 
+    def test_chat_non_streaming_done_reason_comes_from_result(self, session_and_client: Any) -> None:
+        session, client = session_and_client
+        session.generation_state.finish_reason = "length"
+        session.generate.return_value = GenerationResult(
+            text="Hello there!", tokens=[1, 2, 3], token_count=3, prompt_tokens=2,
+            tok_per_sec=10.0, elapsed=0.3, finish_reason="stop",
+        )
+        resp = client.post("/api/chat", json={
+            "model": "test/model",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "stream": False,
+        })
+        assert resp.status_code == 200
+        assert resp.json()["done_reason"] == "stop"
+
     def test_chat_with_system_field(self, session_and_client: Any) -> None:
         session, client = session_and_client
         session.generate.return_value = GenerationResult(

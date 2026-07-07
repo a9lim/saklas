@@ -22,7 +22,7 @@ from saklas.core.errors import SaklasError
 from saklas.core.jlens import LensNotFittedError
 from saklas.core.loom import InvalidNodeOperationError, UnknownNodeError
 from saklas.server.app import acquire_session_lock
-from saklas.server.saklas_api import _resolve_session_id
+from saklas.server.native_common import resolve_session_id
 
 
 def _parse_layers(layers: str | None) -> list[int] | None:
@@ -59,7 +59,7 @@ def register_lens_routes(app: FastAPI) -> None:
         the node.  ``layers`` restricts the readout (csv), default every
         fitted layer.
         """
-        _resolve_session_id(session, session_id)
+        resolve_session_id(session, session_id)
         req_layers = _parse_layers(layers)
         if not 1 <= top_k <= 50:
             raise HTTPException(400, "top_k must be in [1, 50]")

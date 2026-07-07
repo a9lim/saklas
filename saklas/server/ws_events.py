@@ -65,35 +65,14 @@ def build_token_event(
 
     # Rich channel: the full per-probe reading (coords + fraction + nearest)
     # for the latest token.  ``readings`` and ``probe_readings`` in the payload
-    # are the *same* unified per-probe dict — the 4.0 monitor reads every probe
-    # shape (flat + curved) into one ``agg`` — so prefer whichever the token tap
-    # populated; if neither is present (probes attached but the tap didn't
-    # score), fall back to scoring the latest captured hidden states directly.
+    # are the *same* unified per-probe dict — the token tap is the single owner
+    # of live probe scoring, so event shaping never reaches into private capture
+    # buffers or re-scores the token on the WebSocket path.
     with suppress(Exception):
         payload = getattr(session, "_last_token_probe_payload", None)
         readings = None
         if isinstance(payload, dict):
             readings = payload.get("readings") or payload.get("probe_readings")
-        if readings is None:
-            mf_monitor = getattr(session, "monitor", None)
-            capture = getattr(session, "_capture", None)
-            per_layer = (
-                getattr(capture, "_per_layer", None)
-                if capture is not None
-                else None
-            )
-            if (
-                mf_monitor is not None
-                and mf_monitor.probe_names
-                and per_layer
-            ):
-                latest_hidden = {
-                    layer_idx: bucket[-1]
-                    for layer_idx, bucket in per_layer.items()
-                    if bucket
-                }
-                if latest_hidden:
-                    readings = mf_monitor.score_single_token(latest_hidden)
         if readings:
             event["probe_readings"] = {
                 name: r.to_dict() for name, r in readings.items()

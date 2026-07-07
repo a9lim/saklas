@@ -375,7 +375,10 @@ def _branch_inputs(session: "SaklasSession", node_id: str) -> _ReplayBranch:
     node = tree.nodes[node_id]
     recipe = getattr(node, "recipe", None)
     sampling = _sampling_from_recipe(recipe)
-    steering = Steering.from_value(getattr(recipe, "steering", None))
+    steering = Steering.from_value(
+        getattr(recipe, "steering", None),
+        profile_names=set(getattr(session, "_profiles", {})),
+    )
 
     stamped_thinking = getattr(recipe, "thinking", None)
     if stamped_thinking is None:

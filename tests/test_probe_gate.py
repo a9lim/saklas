@@ -22,6 +22,7 @@ import pytest
 from saklas.core.events import EventBus
 from saklas.core.session import SaklasSession
 from saklas.core.steering import Steering
+from saklas.core.steering_composer import SteeringComposer
 from saklas.core.steering_expr import (
     SteeringExprError, format_expr, parse_expr,
 )
@@ -262,17 +263,21 @@ class _StubSession(SaklasSession):
         self.events = EventBus()
 
 
+def _composer(session: _StubSession) -> SteeringComposer:
+    return session._get_steering_composer()
+
+
 class TestSessionProbeGateDetection:
     def test_empty_stack_returns_false(self):
         s = _StubSession()
-        assert s._steering_needs_probe_gating() is False
+        assert _composer(s).steering_needs_probe_gating() is False
 
     def test_no_gates_returns_false(self):
         s = _StubSession()
         s._steering_stack.append({
             "angry.calm": (0.5, Trigger.BOTH),
         })
-        assert s._steering_needs_probe_gating() is False
+        assert _composer(s).steering_needs_probe_gating() is False
 
     def test_after_thinking_no_gate_returns_false(self):
         # Preset triggers without a gate stay false — ``AFTER_THINKING``
@@ -281,7 +286,7 @@ class TestSessionProbeGateDetection:
         s._steering_stack.append({
             "angry.calm": (0.5, Trigger.AFTER_THINKING),
         })
-        assert s._steering_needs_probe_gating() is False
+        assert _composer(s).steering_needs_probe_gating() is False
 
     def test_gate_in_first_scope_returns_true(self):
         s = _StubSession()
@@ -289,7 +294,7 @@ class TestSessionProbeGateDetection:
         s._steering_stack.append({
             "calm": (0.5, gate_trig),
         })
-        assert s._steering_needs_probe_gating() is True
+        assert _composer(s).steering_needs_probe_gating() is True
 
     def test_gate_in_outer_scope_under_inner(self):
         s = _StubSession()
@@ -302,7 +307,7 @@ class TestSessionProbeGateDetection:
         s._steering_stack.append({
             "happy.sad": (0.3, Trigger.BOTH),
         })
-        assert s._steering_needs_probe_gating() is True
+        assert _composer(s).steering_needs_probe_gating() is True
 
     def test_inner_overrides_outer_gate(self):
         # Inner shadows the outer's gated entry under the same key, so
@@ -317,7 +322,7 @@ class TestSessionProbeGateDetection:
         s._steering_stack.append({
             "calm": (0.5, Trigger.BOTH),
         })
-        assert s._steering_needs_probe_gating() is False
+        assert _composer(s).steering_needs_probe_gating() is False
 
 
 # -------------------------------------------------- Steering integration ---

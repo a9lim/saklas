@@ -116,7 +116,7 @@ def session_and_client():
 class TestSessions:
     def test_list(self, session_and_client: Any) -> None:
         _, client = session_and_client
-        with patch("saklas.server.saklas_api.supports_thinking", return_value=False):
+        with patch("saklas.server.session_models.supports_thinking", return_value=False):
             resp = client.get("/saklas/v1/sessions")
         assert resp.status_code == 200
         data = resp.json()
@@ -129,21 +129,21 @@ class TestSessions:
 
     def test_create_idempotent(self, session_and_client: Any) -> None:
         _, client = session_and_client
-        with patch("saklas.server.saklas_api.supports_thinking", return_value=False):
+        with patch("saklas.server.session_models.supports_thinking", return_value=False):
             resp = client.post("/saklas/v1/sessions", json={})
         assert resp.status_code == 200
         assert resp.json()["id"] == "default"
 
     def test_create_model_mismatch_logs_warning(self, session_and_client: Any, caplog: Any) -> None:
         _, client = session_and_client
-        with patch("saklas.server.saklas_api.supports_thinking", return_value=False):
+        with patch("saklas.server.session_models.supports_thinking", return_value=False):
             resp = client.post("/saklas/v1/sessions", json={"model": "other/model"})
         assert resp.status_code == 200
         assert resp.json()["model_id"] == "test/model"
 
     def test_get_by_default(self, session_and_client: Any) -> None:
         _, client = session_and_client
-        with patch("saklas.server.saklas_api.supports_thinking", return_value=False):
+        with patch("saklas.server.session_models.supports_thinking", return_value=False):
             resp = client.get("/saklas/v1/sessions/default")
         assert resp.status_code == 200
 
@@ -159,7 +159,7 @@ class TestSessions:
 
     def test_patch_updates_config(self, session_and_client: Any) -> None:
         session, client = session_and_client
-        with patch("saklas.server.saklas_api.supports_thinking", return_value=False):
+        with patch("saklas.server.session_models.supports_thinking", return_value=False):
             resp = client.patch(
                 "/saklas/v1/sessions/default",
                 json={"temperature": 0.3, "system_prompt": "Be brief."},
@@ -181,7 +181,7 @@ class TestSessions:
         """Per-message role boxes gate on these flags — keep them on the wire."""
         session, client = session_and_client
         self._set_family(session, "gemma2")
-        with patch("saklas.server.saklas_api.supports_thinking", return_value=False):
+        with patch("saklas.server.session_models.supports_thinking", return_value=False):
             resp = client.get("/saklas/v1/sessions/default")
         assert resp.status_code == 200
         body = resp.json()
@@ -239,7 +239,7 @@ class TestProbes:
     def test_defaults(self, session_and_client: Any) -> None:
         _, client = session_and_client
         with patch(
-            "saklas.server.saklas_api.load_defaults",
+            "saklas.server.probe_routes.load_default_manifolds",
             return_value={"emotion": ["happiness"]},
         ):
             resp = client.get("/saklas/v1/sessions/default/probes/defaults")
@@ -696,8 +696,8 @@ class TestWebSocket:
 
     def test_bad_steering_does_not_kill_connection(self, session_and_client: Any, monkeypatch: Any) -> None:
         """Regression: a bad steering expression on a generate frame used
-        to escape ``_parse_req_steering`` and bubble out to the outer reader
-        loop's ``except Exception``, which closed the WS with code 1011.
+        to escape request-steering parsing and bubble out to the outer
+        reader loop's ``except Exception``, which closed the WS with code 1011.
 
         FastAPI's ``@app.exception_handler(SaklasError)`` doesn't apply
         to WebSocket routes, so the handler has to convert the error in-
@@ -1068,6 +1068,14 @@ class TestManifoldRoutes:
         monday = next(n for n in detail["nodes"] if n["label"] == "monday")
         assert monday["statements"] == ["today is Monday", "it's Monday"]
 
+        conflict = client.post("/saklas/v1/manifolds/templated", json=payload)
+        assert conflict.status_code == 409
+        forced = client.post(
+            "/saklas/v1/manifolds/templated",
+            json={**payload, "force": True},
+        )
+        assert forced.status_code == 201, forced.text
+
     def test_create_templated_slot_in_user_rejected(
         self, session_and_client: Any, tmp_path: Any, monkeypatch: Any,
     ) -> None:
@@ -1238,9 +1246,9 @@ class TestTemplateRoutes:
 class TestRoleSampling:
     def test_build_sampling_carries_roles(self):
         """WS sampling roles map onto SamplingConfig (the per-send carrier)."""
-        from saklas.server.saklas_api import WSSamplingParams, _build_sampling
+        from saklas.server.ws_models import WSSamplingParams, build_sampling
 
-        sc = _build_sampling(
+        sc = build_sampling(
             WSSamplingParams(user_role="captain", assistant_role="oracle")
         )
         assert sc is not None
@@ -1249,9 +1257,9 @@ class TestRoleSampling:
 
     def test_build_sampling_blank_roles_omitted(self):
         """Empty-string role boxes are treated as "no label" (None)."""
-        from saklas.server.saklas_api import WSSamplingParams, _build_sampling
+        from saklas.server.ws_models import WSSamplingParams, build_sampling
 
-        sc = _build_sampling(WSSamplingParams(user_role="", assistant_role=""))
+        sc = build_sampling(WSSamplingParams(user_role="", assistant_role=""))
         assert sc is not None
         assert sc.user_role is None
         assert sc.assistant_role is None

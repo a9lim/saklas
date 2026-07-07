@@ -69,7 +69,7 @@ class _Stub(SaklasSession):
         self._rebuild_entries: list[dict[str, Any]] = []
 
     def _rebuild_steering_hooks(self) -> None:
-        flat = self._flatten_steering_stack()
+        flat = self._get_steering_composer().flatten_steering_stack()
         for name in flat:
             if name not in self._profiles:
                 raise VectorNotRegisteredError(f"No vector registered for '{name}'")
@@ -81,15 +81,10 @@ class _Stub(SaklasSession):
             {name: alpha for name, (alpha, _trig) in flat_any.items()},
         )
 
-    def _resolve_pole_aliases(self, entries):  # pyright: ignore[reportMissingParameterType]  # intentionally untyped stub override
-        return {k: (float(v[0]), v[1]) for k, v in entries.items()}
-
     # Override the lazy whitener property so tests stay model-free —
     # the stub doesn't have a model/tokenizer to feed
-    # ``_build_whitener_from_cache_or_compute``.  Returns ``None`` so
-    # ``_materialize_projections`` falls back to Euclidean per-layer
-    # transparently (same path real sessions hit when neutral
-    # activations aren't cached yet).
+    # ``_build_whitener_from_cache_or_compute``.  Returns ``None`` because
+    # these steering-stack tests never materialize projection terms.
     @property
     def whitener(self) -> None:
         return None

@@ -756,7 +756,6 @@ class Monitor:
 
         K = probe.node_values_reduced[shared[0]].shape[0]
         inject_neutral = probe.inject_neutral
-        Kc = K + (1 if inject_neutral else 0)
         n_dim = manifold.domain.intrinsic_dim
         frac_mean_t: torch.Tensor | None = None
         coords_mean_t: torch.Tensor | None = None
@@ -842,12 +841,19 @@ class Monitor:
                         else mem_mean_t + w * mem_t
                     )
 
-        def _label(idx: int) -> str:
-            return (
-                NEUTRAL_LABEL
-                if inject_neutral and idx == K
-                else manifold.node_labels[idx]
-            )
+        label_to_idx = {label: idx for idx, label in enumerate(manifold.node_labels)}
+        if inject_neutral:
+            label_to_idx[NEUTRAL_LABEL] = K
+        dist_requests = [
+            (key, label_to_idx[label])
+            for label, key in dist_labels.items()
+            if label in label_to_idx
+        ]
+        assign_requests = [
+            (key, label_to_idx[label])
+            for label, key in assign_labels.items()
+            if label in label_to_idx
+        ]
 
         out: dict[str, float] = {}
         parts: list[torch.Tensor] = []
@@ -864,21 +870,17 @@ class Monitor:
             parts.append(mem_mean_t.reshape(1))
             slots.append(("scalar", membership_key))
 
-        requested_top_n = int(probe.top_n)
-        top_n = requested_top_n if requested_top_n >= 0 else Kc + requested_top_n
-        top_n = min(max(top_n, 0), Kc)
-        if need_nearest and top_n and dist_acc_t is not None:
-            nearest_dist_t, nearest_idx_t = torch.topk(
-                dist_acc_t, k=top_n, largest=False, sorted=True,
+        if need_nearest and dist_requests and dist_acc_t is not None:
+            idx_t = torch.tensor(
+                [idx for _key, idx in dist_requests],
+                device=dist_acc_t.device,
+                dtype=torch.long,
             )
-            parts.extend([
-                nearest_dist_t / probe.label_scale,
-                nearest_idx_t.to(torch.float32),
-            ])
-            slots.append(("nearest", int(nearest_dist_t.numel())))
+            parts.append(dist_acc_t.index_select(0, idx_t) / probe.label_scale)
+            slots.append(("nearest_exact", [key for key, _idx in dist_requests]))
         if (
             need_assignment
-            and top_n
+            and assign_requests
             and dist_acc_t is not None
             and probe.assign_bandwidth is not None
             and probe.assign_logvol_bias is not None
@@ -892,11 +894,13 @@ class Monitor:
                     + lvb
                 )
                 probs = torch.softmax(logits, dim=0)
-                assign_prob_t, assign_idx_t = torch.topk(
-                    probs, k=top_n, largest=True, sorted=True,
+                idx_t = torch.tensor(
+                    [idx for _key, idx in assign_requests],
+                    device=probs.device,
+                    dtype=torch.long,
                 )
-                parts.extend([assign_prob_t, assign_idx_t.to(torch.float32)])
-                slots.append(("assignment", int(assign_prob_t.numel())))
+                parts.append(probs.index_select(0, idx_t))
+                slots.append(("assignment_exact", [key for key, _idx in assign_requests]))
 
         if not parts:
             return out
@@ -906,30 +910,18 @@ class Monitor:
             if kind == "scalar":
                 out[meta] = float(flat[pos])
                 pos += 1
-            elif kind == "nearest":
-                n = int(meta)
-                d_vals = flat[pos:pos + n]
-                pos += n
-                i_vals = flat[pos:pos + n]
-                pos += n
-                for label, dist in (
-                    (_label(int(round(i_vals[i]))), d_vals[i]) for i in range(n)
-                ):
-                    key = dist_labels.get(label)
-                    if key is not None:
-                        out[key] = -float(dist)
-            elif kind == "assignment":
-                n = int(meta)
-                p_vals = flat[pos:pos + n]
-                pos += n
-                i_vals = flat[pos:pos + n]
-                pos += n
-                for label, prob in (
-                    (_label(int(round(i_vals[i]))), p_vals[i]) for i in range(n)
-                ):
-                    key = assign_labels.get(label)
-                    if key is not None:
-                        out[key] = float(prob)
+            elif kind == "nearest_exact":
+                keys = list(meta)
+                vals = flat[pos:pos + len(keys)]
+                pos += len(keys)
+                for key, dist in zip(keys, vals, strict=True):
+                    out[key] = -float(dist)
+            elif kind == "assignment_exact":
+                keys = list(meta)
+                vals = flat[pos:pos + len(keys)]
+                pos += len(keys)
+                for key, prob in zip(keys, vals, strict=True):
+                    out[key] = float(prob)
         return out
 
     def score_gate_scalars(
@@ -1149,7 +1141,9 @@ class Monitor:
         for layer_idx, cis in layer_members.items():
             present = [flat_names[ci] for ci in cis]
             whs = [self._probes[n].whitened[layer_idx] for n in present]
-            X, K_inv, lam = whs[0].X, whs[0].K_inv, whs[0].lam
+            X = whs[0].X.to(device)
+            K_inv = whs[0].K_inv.to(device)
+            lam = whs[0].lam
             basis_stack = torch.cat([w.basis.to(device) for w in whs], dim=0)
             means_stack = torch.stack([w.mean.to(device) for w in whs], dim=0)
             simeans = [
@@ -1674,6 +1668,7 @@ class Monitor:
         tokenizer: Any,
         *,
         accumulate: bool = True,
+        aggregate_index: int | None = None,
     ) -> tuple[dict[str, "ProbeReading"], dict[str, list[float]]]:
         """Score probes per generated token using pre-captured hidden states.
 
@@ -1692,8 +1687,17 @@ class Monitor:
         if n == 0 or not captured:
             return empty_agg, {name: [] for name in self._probes}
 
-        from saklas.core.vectors import last_content_index
-        agg_idx = last_content_index(generated_ids, tokenizer)
+        if aggregate_index is not None and int(aggregate_index) < 0:
+            agg = empty_agg
+            per_token = self._per_token_coord_stream(captured, n)
+            if accumulate:
+                self._pending_per_token = True
+            return agg, per_token
+        if aggregate_index is None:
+            from saklas.core.vectors import last_content_index
+            agg_idx = last_content_index(generated_ids, tokenizer)
+        else:
+            agg_idx = max(0, min(int(aggregate_index), n - 1))
         agg_hidden = {
             layer_idx: h[agg_idx] for layer_idx, h in captured.items()
             if h.shape[0] > agg_idx
@@ -2052,6 +2056,3 @@ class Monitor:
             "points": _whiten(grid).tolist(),
             "grid_shape": [int(gu.numel()), int(gv.numel())],
         }
-
-
-

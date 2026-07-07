@@ -152,6 +152,15 @@ def test_source_layers_must_precede_final() -> None:
         )
 
 
+def test_source_layers_must_not_be_empty() -> None:
+    model = _frozen_model(n_layers=2)
+    with pytest.raises(ValueError, match="at least one"):
+        fit_jacobian_lens(
+            model, _CharTokenizer(), ["a prompt that is long enough."],
+            _layers(model), source_layers=[],
+        )
+
+
 def test_lens_logits_matches_model_at_identity_transport() -> None:
     """With J_l = I at the last source layer... the readout must equal running
     the remaining blocks' *absence* — i.e. norm+unembed of the residual itself

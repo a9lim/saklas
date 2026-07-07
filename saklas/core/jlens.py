@@ -357,6 +357,8 @@ def fit_jacobian_lens(
     sources = (
         sorted(set(source_layers)) if source_layers is not None else list(range(final_idx))
     )
+    if not sources:
+        raise ValueError("source_layers must name at least one source layer")
     if any(l < 0 or l >= final_idx for l in sources):
         raise ValueError(
             f"source_layers must lie in [0, {final_idx}) — the final layer is "

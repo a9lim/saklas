@@ -145,13 +145,15 @@ multi-dim manifold. Dispatch lowers every plain vector term through
 `fold_directions_to_subspace` → `_affine_manifold_push` (`session.py`) onto the
 merged affine subspace.
 
-`save_profile`/`load_profile` round-trip a baked `dict[int, Tensor]` to
-`.safetensors` + a slim `.json` sidecar (stamped with `PACK_FORMAT_VERSION` from
-`io/packs.py`); they back the per-model `layer_means`/`neutral_activations`/
-alignment caches and the folded-profile interchange. `project_profile(base, onto,
-operator, *, whitener=...)` is the per-layer `~`/`|` projection — closed-form
-LEACE, Mahalanobis-only: the whitener is **required** and must cover every
-projected layer (`covers_all`), else `WhitenerError` (no Euclidean path).
+`profile.save_profile`/`profile.load_profile` own the baked-profile wire format:
+a `dict[int, Tensor]` to `.safetensors` + a slim `.json` sidecar (stamped with
+`PACK_FORMAT_VERSION` from `io/packs.py`). `vectors.save_profile`/
+`vectors.load_profile` remain compatibility aliases for the per-model
+`layer_means`/`neutral_activations`/alignment caches and folded-profile
+interchange. `project_profile(base, onto, operator, *, whitener=...)` is the
+per-layer `~`/`|` projection — closed-form LEACE, Mahalanobis-only: the whitener
+is **required** and must cover every projected layer (`covers_all`), else
+`WhitenerError` (no Euclidean path).
 
 ## extraction.py
 
@@ -712,13 +714,16 @@ stack live on a `SteeringComposer` collaborator (`core/steering_composer.py`),
 instantiated in `__init__` after `_monitor` (lazily rebuilt via
 `_get_steering_composer()` for `__new__` test stubs). The composer owns the stack
 (`_stack`); the session exposes a settable `_steering_stack` property over it, and
-keeps a thin forwarder for every moved method — `_push_steering`/`_pop_steering`
-(called by `_SteeringContext`), `_compose_steering_entries`/`_install_composed_steering`/
-`_rebuild_steering_hooks`, `_ensure_manifold_loaded`/`_ensure_profile_registered`/
-`_try_fold_manifold`/`_port_stale_legacy_vector`, `_resolve_pole_aliases`,
-`_materialize_projections`, `_steering_needs_probe_gating`/`_build_gating_score_callback`
-(also called by `joint_logprobs.py`), and the stack predicates — so the public + test
-surface is byte-identical (tests monkeypatch / `__get__`-bind these on the session).
+owns projection materialization, pole alias resolution, profile/manifold loading,
+legacy vector port-on-detect, stack flattening, probe-gate predicates, steering
+lowering, and hook installation. The session keeps only narrow compatibility
+wrappers for `_push_steering`/`_pop_steering` (called by `_SteeringContext`),
+`_rebuild_steering_hooks`, `_ensure_manifold_loaded`, `_ensure_profile_registered`,
+`_steering_needs_probe_gating`, and `_build_gating_score_callback`; production
+generation and steering setup should call the composer directly when adding new
+code.
+`joint_logprobs.py` still uses the gating compatibility wrappers because it accepts
+session-like test doubles.
 The composer reaches session state through `self._session` at push/pop frequency, off
 the per-token path; the one near-hot method, `build_gating_score_callback`, binds
 `capture`/`monitor` to locals and reads the session capture state through the back-ref
@@ -769,24 +774,24 @@ training-free `clone_from_corpus` / `io.cloning` path is removed in 4.0.)
 Steering | None` (dicts rejected), `sampling`, `thinking=None`, plus loom args;
 both return `RunSet` (`.first` is the `GenerationResult`). `session.steering(value)`
 coerces via `Steering.from_value`, materializes `ProjectedTerm`s into derived
-profiles (`_materialize_projections` → `project_profile` with `session.whitener`,
+profiles (`SteeringComposer.materialize_projections` → `project_profile` with `session.whitener`,
 which is Mahalanobis-only — a `~`/`|` term on a session with no covering whitener
 raises `WhitenerError`), and pushes a per-scope entries dict onto a LIFO stack so
 nested scopes compose. There is no per-call projection-metric override.
-`_resolve_pole_aliases` canonicalizes bare poles via `io.selectors.canonicalize_atom`
+`SteeringComposer.resolve_pole_aliases` canonicalizes bare poles via `io.selectors.canonicalize_atom`
 (the sign-flip is retired — a bare pole resolves through the manifold-label tier as
 a `%` push) and routes variants.
 
-**Steering resolution (manifold-first).** `_ensure_profile_registered(name)`
+**Steering resolution (manifold-first).** `SteeringComposer.ensure_profile_registered(name)`
 resolves a direction from, in order: (1) an in-memory baked direction already in
 `_profiles` (ad-hoc `extract`/`merge`/projection results); (1b) the reserved
 `jlens/` namespace — `register_jlens_direction` resolves the word through the
 fitted Jacobian lens (raising `LensNotFittedError`/`MultiTokenWordError`, never
 falling through to extraction); (2) a fitted
-2-node `pca` manifold on disk — `_try_fold_manifold` → `_ensure_manifold_loaded`
+2-node `pca` manifold on disk — `try_fold_manifold` → `ensure_manifold_loaded`
 (load `[ns/]name[:variant]`, raw or `sae-<release>`) + `folded_vector_directions`,
 memoized into `_profiles`; (3) a stale (`< PACK_FORMAT_VERSION`) legacy
-`vectors/<ns>/<name>/` folder — `_port_stale_legacy_vector` ports it to a 2-node
+`vectors/<ns>/<name>/` folder — `port_stale_legacy_vector` ports it to a 2-node
 manifold file-only (no tensor yet) and raises with the exact `manifold fit` command
 to run. `_bootstrap_manifold_probes(categories, *, include_fitted_defaults)` is the
 probe-roster bootstrap — one pass, two tiers. **Tagged concept axes**: for each
@@ -802,12 +807,12 @@ This folds the former serve-only `_attach_default_manifold_probes` into the
 construction-time pass, so every frontend (TUI / serve / programmatic) gets the
 same roster; an explicit `probes=[...]` category list skips the multi-node sweep.
 
-`_compose_steering_entries` is the dispatch (`ARCHITECTURE.md` §4): classify each
+`SteeringComposer.compose_steering_entries` is the dispatch (`ARCHITECTURE.md` §4): classify each
 entry — `AblationTerm` → ablation fragment; `ManifoldTerm` → affine `%` joins the
 merge (`_affine_manifold_push`) or curved `%` → `add_manifold`; plain `(alpha,
-trigger)` → `_ensure_profile_registered` → `fold_directions_to_subspace` →
+trigger)` → `ensure_profile_registered` → `fold_directions_to_subspace` →
 `_affine_manifold_push` push fragment — group push+ablate by trigger,
-`synthesize_subspace` per group, `add_subspace`. `_install_composed_steering` →
+`synthesize_subspace` per group, `add_subspace`. `install_composed_steering` →
 `apply_to_model`. There are **no** persistent hooks. Manifold-implied roles
 aggregate under soft-warn + highest-`|coeff|`-wins (`RoleBaselineMismatchWarning`).
 
@@ -995,7 +1000,8 @@ returns `(http_status, text)`. `SteeringExprError` lives here (re-exported from
 layer, in `apply_to_model`). `profile.py` — `Profile` wraps `dict[int, Tensor]`
 with `.layers`/`.save`/`.load`/`.to_gguf`/`.merged`/`.merged_with`/`.promoted_to`/
 `.cosine_similarity(other, *, per_layer=False, whitener=None)` (magnitude-weighted)/
-`.projected_away`; empty layer intersection raises `ProfileError`.
+`.projected_away`; it also owns `save_profile`/`load_profile` for the safetensors
+sidecar format. Empty layer intersection raises `ProfileError`.
 
 `steering_expr.py` hosts the unified grammar (`parse_expr(text, *, namespace=None)`
 → `Steering`; `format_expr` round-trips; `referenced_selectors` for install-time

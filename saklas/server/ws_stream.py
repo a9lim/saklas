@@ -24,21 +24,17 @@ from saklas.core.results import GenerationResult, RunSet
 from saklas.core.sampling import SamplingConfig
 from saklas.core.session import SaklasSession
 from saklas.core.steering import Steering
-from saklas.server.app import (
-    _merge_steering,
-    _parse_req_steering,
-    acquire_session_lock,
-    ws_auth_ok,
-)
+from saklas.server.app import acquire_session_lock, ws_auth_ok
+from saklas.server.native_common import SINGLE_SESSION_ID
+from saklas.server.request_helpers import merge_steering, parse_request_steering
 from saklas.server.streaming import probe_reading_aggregate
+from saklas.server.tree_models import node_json
 from saklas.server.ws_events import build_token_event
-from saklas.server.saklas_api import (
-    _SINGLE_SESSION_ID,
+from saklas.server.ws_models import (
     WSGenerateMessage,
-    _build_sampling,
-    _node_json,
-    _per_token_probes,
-    _result_to_json,
+    build_sampling,
+    per_token_probes,
+    result_to_json,
 )
 
 
@@ -55,7 +51,7 @@ def register_ws_stream(app: FastAPI) -> None:
         if not ws_auth_ok(websocket):
             await websocket.close(code=1008, reason="unauthorized")
             return
-        if session_id not in (_SINGLE_SESSION_ID, session.model_id):
+        if session_id not in (SINGLE_SESSION_ID, session.model_id):
             await websocket.accept()
             await websocket.close(code=1008, reason="session not found")
             return
@@ -118,7 +114,7 @@ def register_ws_stream(app: FastAPI) -> None:
             try:
                 tree = session.tree
                 added_nodes = [
-                    _node_json(session, nid)
+                    node_json(session, nid)
                     for nid in event.added
                     if tree.has(nid)
                 ]
@@ -131,7 +127,7 @@ def register_ws_stream(app: FastAPI) -> None:
                 "added": added_nodes,
                 "removed": list(event.removed),
                 "updated": [
-                    _node_json(session, nid)
+                    node_json(session, nid)
                     for nid in event.updated
                     if session.tree.has(nid)
                 ],
@@ -295,17 +291,17 @@ async def _ws_handle_generate(
     """
     loop = asyncio.get_running_loop()
 
-    sampling = _build_sampling(msg.sampling)
+    sampling = build_sampling(msg.sampling)
     try:
-        req_steering, explicit_clear = _parse_req_steering(msg.steering)
+        req_steering, explicit_clear = parse_request_steering(msg.steering)
         thinking_override: bool | None = None
         if req_steering is not None and req_steering.thinking is not None:
             thinking_override = req_steering.thinking
-        steering = _merge_steering(
+        steering = merge_steering(
             req_steering, default_steering, explicit_clear, thinking_override,
         )
     except SaklasError as e:
-        # ``_parse_req_steering`` -> ``parse_expr`` -> ``resolve_bare_atom`` can
+        # ``parse_request_steering`` -> ``parse_expr`` -> ``resolve_bare_atom`` can
         # raise ``SteeringExprError`` / ``AmbiguousSelectorError`` /
         # ``AmbiguousVariantError`` on malformed or colliding input.
         # FastAPI's ``@app.exception_handler(SaklasError)`` doesn't apply
@@ -730,9 +726,9 @@ async def _ws_handle_generate(
                 return
 
             result = result_holder[0] if result_holder else None
-            result_json = _result_to_json(result)
+            result_json = result_to_json(result)
             if result is not None:
-                result_json["per_token_probes"] = _per_token_probes(
+                result_json["per_token_probes"] = per_token_probes(
                     session, getattr(result, "token_count", 0) or 0,
                 )
                 # Per-attached-manifold-probe aggregate readings ride on

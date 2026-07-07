@@ -137,12 +137,11 @@ class TemplatePairSpec(BaseModel):
 class CreateTemplatedManifoldRequest(BaseModel):
     """Author a templated discover manifold from a slot + values + pair set.
 
-    The server expands ``slot`` across ``values`` into per-value node corpora
-    (the slot-filled assistant turns) and writes a discover folder carrying the
-    ``template`` block — re-expansion provenance plus the user-turn elicitation
-    prompts the fit pools against. The right tool for categories one references
-    rather than embodies (days, months, colours, directions). Pair with
-    ``POST .../fit`` (``fit_mode`` auto suits cyclic categories).
+    The server writes a standalone template, expands ``slot`` across ``values``
+    into per-value node corpora, and writes a discover folder carrying a
+    ``template_ref`` back to that source template. The right tool for categories
+    one references rather than embodies (days, months, colours, directions).
+    Pair with ``POST .../fit`` (``fit_mode`` auto suits cyclic categories).
     """
 
     namespace: str = "local"
@@ -153,6 +152,7 @@ class CreateTemplatedManifoldRequest(BaseModel):
     values: list[str]
     pairs: list[TemplatePairSpec]
     hyperparams: dict[str, Any] = {}
+    force: bool = False
 
 
 class GenerateManifoldRequest(BaseModel):
@@ -588,14 +588,14 @@ def register_manifold_routes(app: FastAPI) -> None:
             create_template_folder(
                 req.namespace, req.name,
                 slot=req.slot, values=list(req.values), contexts=contexts,
-                description=req.description, force=True,
+                description=req.description, force=req.force,
             )
             folder = create_manifold_from_template(
                 req.namespace, req.name, req.description,
                 template_ref=f"{req.namespace}/{req.name}",
                 fit_mode=req.fit_mode,
                 hyperparams=req.hyperparams or None,
-                force=True,
+                force=req.force,
             )
         except FileExistsError as e:
             raise HTTPException(409, str(e)) from e

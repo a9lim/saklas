@@ -677,7 +677,9 @@ class SteeringComposer:
         from saklas.core.steering_expr import ProjectedTerm
 
         try:
-            s = Steering.from_value(value)
+            s = Steering.from_value(
+                value, profile_names=set(getattr(self._session, "_profiles", {})),
+            )
         except Exception:
             return False
         if s is None:

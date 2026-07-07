@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 import torch
+from safetensors.torch import save_file
 
 from saklas.core.jlens import JacobianLens
 from saklas.io.lens import (
@@ -86,6 +87,22 @@ def test_load_non_finite_returns_none() -> None:
     lens = _lens()
     lens.jacobians[1][0, 0] = float("inf")
     _save(lens)
+    assert load_lens(_MODEL) is None
+
+
+def test_load_wrong_tensor_shape_returns_none() -> None:
+    _save(_lens())
+    ts_path, _sc_path = lens_paths(_MODEL)
+    save_file({"layer_0": torch.randn(_D, _D + 1)}, str(ts_path))
+    assert load_lens(_MODEL) is None
+
+
+def test_load_sidecar_layer_mismatch_returns_none() -> None:
+    _save(_lens())
+    _ts_path, sc_path = lens_paths(_MODEL)
+    sidecar = json.loads(sc_path.read_text())
+    sidecar["source_layers"] = [0, 1, 9]
+    sc_path.write_text(json.dumps(sidecar))
     assert load_lens(_MODEL) is None
 
 

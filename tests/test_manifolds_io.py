@@ -1629,24 +1629,16 @@ def test_init_and_append_discover_streaming(
     assert dict(mf.node_groups())["beta"] == ["beta one", "beta two"]
 
 
-def test_create_discover_persists_scenarios(
+def test_create_discover_does_not_write_scenarios(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
-    """The all-at-once writer writes scenarios.json iff the kwarg is set."""
+    """Current all-at-once discover authoring has no scenario provenance."""
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     folder = create_discover_manifold_folder(
-        "local", "scn", "d", fit_mode="pca",
-        node_corpora={"a": ["x"], "b": ["y"], "default": ["z"]},
-        scenarios=["d1", "d2", "d3"],
-    )
-    assert json.loads((folder / "scenarios.json").read_text()) == {
-        "scenarios": ["d1", "d2", "d3"]
-    }
-    folder2 = create_discover_manifold_folder(
         "local", "noscn", "d", fit_mode="pca",
-        node_corpora={"a": ["x"], "b": ["y"]},
+        node_corpora={"a": ["x"], "b": ["y"], "default": ["z"]},
     )
-    assert not (folder2 / "scenarios.json").exists()
+    assert not (folder / "scenarios.json").exists()
 
 
 def test_init_discover_rejects_duplicate_and_bad_label(

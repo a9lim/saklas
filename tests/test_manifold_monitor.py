@@ -555,6 +555,24 @@ def test_gate_scalar_fraction_label_assignment_skip_curved_foot(
     assert scalars["curve~c"] == pytest.approx(full["curve~c"])
 
 
+def test_gate_scalar_requested_labels_ignore_probe_top_n():
+    m = _toy_manifold()
+    mon = _iso_monitor(m)
+    mon.add_probe("toy", m, top_n=1)
+    hidden = {L: _node_world(m, L)[2] for L in m.layers}  # nearest is "c"
+
+    full = mon.flat_scalars(mon.score_single_token(hidden))
+    assert "toy@c" in full
+    assert "toy@a" not in full
+    assert "toy~a" not in full
+
+    scalars = mon.score_gate_scalars(hidden, {"toy@a", "toy~a"})
+    assert "toy@a" in scalars
+    assert scalars["toy@a"] < 0.0
+    assert "toy~a" in scalars
+    assert 0.0 <= scalars["toy~a"] <= 1.0
+
+
 def test_membership_high_on_surface_low_off_tube():
     # With a σ-field, membership is ~1 on the surface and collapses far off it.
     m = _curved_toy(dim=8)

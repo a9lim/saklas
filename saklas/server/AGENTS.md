@@ -78,8 +78,9 @@ reading when at least one probe is attached and `live_scores` is on; the final
 chunk carries the aggregate. The field is omitted entirely when no probe is
 attached, so OpenAI clients that don't read the extension see no shape change.
 `_probe_reading_aggregate(session)`
-and `_probe_token_readings(event)` are the shared helpers (also imported by
-`ollama.py`).
+and `_probe_token_readings(event)` are imported aliases over
+`server.request_helpers.probe_reading_aggregate` /
+`server.request_helpers.probe_token_readings`, shared with `ollama.py`.
 
 Auth: bearer token from `SAKLAS_API_KEY` / `--api-key`, applied as an app-level
 dependency over HTTP and WebSocket routes. `_require_auth` + `_check_bearer` gate
@@ -98,7 +99,18 @@ to an HTTP status and picks the Ollama vs OpenAI error shape by path prefix;
 `RequestValidationError` maps to the OpenAI shape. Not supported by either compat
 protocol: tool calling, JSON-schema/structured-output mode, embeddings.
 
-## saklas_api.py (native tree orchestrator + shared bodies/helpers)
+## Native route modules and schemas
+
+`saklas_api.py` is now only the native-route registrar plus a backcompat re-export
+surface for old imports. New route-specific request bodies and serializers live
+beside their route groups:
+
+- `native_common.py` — single-session id resolution.
+- `session_models.py` — session request bodies and `session_info`.
+- `vector_models.py` — vector/extract/bake request bodies and vector serializers.
+- `tree_models.py` — loom-tree request bodies and tree serializers.
+- `ws_models.py` — WebSocket request bodies, sampling conversion, token/result helpers.
+- `experiment_models.py` — experiment request bodies.
 
 URL paths carry `{session_id}` for a multi-session shape, but the impl is
 single-session: the one session has id `"default"`, and the loaded model id also
@@ -120,7 +132,7 @@ body + any typed safe-message formatter.
 ### session_routes.py
 
 - `GET/POST /saklas/v1/sessions` — list / idempotent create (a model mismatch warns
-  and returns the existing session). `_session_info` carries `is_base_model` plus
+  and returns the existing session). `session_info` carries `is_base_model` plus
   `role_substitution_supported` / `user_role_supported` (against `ROLE_HEADERS` /
   `USER_ROLE_HEADERS` for the resolved `model_type`) and the resolved
   `default_assistant_role` / `default_user_role`, so the webui can gate roles,
@@ -264,7 +276,7 @@ not a re-render pass.
   whitened cosine is single-layer, so each cell is whitened in `a`'s row-layer frame.
   `session.whitener` must cover every row-layer of `a`, else 409 (regenerate the
   neutral cache). Registered *before* `GET /vectors/{name}` so the literal path wins.
-- `POST /extract` — in `asyncio.to_thread`; SSE / JSON. `_coerce_corpora`
+- `POST /extract` — in `asyncio.to_thread`; SSE / JSON. `coerce_corpora`
   normalizes `source`: a concept name routes to `session.extract` (a composite
   name fits a 2-node `pca`; a monopolar name with no baseline fits the 1-node
   neutral-anchored ray), while two pole corpora (`{positive, negative}` /
@@ -332,7 +344,7 @@ across generations; multiple clients supported. Events: `start`
 Bidirectional WebSocket; only `session_id == "default"` is reachable (HF ids contain
 `/`). Client → server: `{type: "stop"}`, or `{type: "generate", input, steering,
 sampling, thinking, stateless, raw, parent_node_id?, n?, recipe_override?}`. The
-`sampling` block (`WSSamplingParams` → `_build_sampling` → `SamplingConfig`) carries
+`sampling` block (`WSSamplingParams` → `build_sampling` → `SamplingConfig`) carries
 `user_role`/`assistant_role` (the per-message role-substitution labels, stamped
 onto the produced loom nodes and rendered faithfully per-turn), plus `return_top_k`
 (per-request top-K-alts override) and `persist_per_layer_scores` (the per-layer

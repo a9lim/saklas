@@ -103,6 +103,35 @@ def load_lens(model_id: str) -> tuple[JacobianLens, dict[str, Any]] | None:
         jacobians = {
             int(k.split("_", 1)[1]): v.to(torch.float32) for k, v in tensors.items()
         }
+        d_model = int(sidecar.get("d_model", 0) or 0)
+        source_layers_raw = sidecar.get("source_layers")
+        if (
+            d_model <= 0
+            or not isinstance(source_layers_raw, list)
+            or not source_layers_raw
+        ):
+            log.warning(
+                "jlens cache for %s has invalid sidecar shape metadata; ignoring "
+                "— re-fit with `saklas lens fit`", model_id,
+            )
+            return None
+        source_layers = sorted(int(layer) for layer in source_layers_raw)
+        tensor_layers = sorted(jacobians)
+        if tensor_layers != source_layers:
+            log.warning(
+                "jlens cache for %s has tensor layers %s but sidecar declares %s; "
+                "ignoring — re-fit with `saklas lens fit`",
+                model_id, tensor_layers, source_layers,
+            )
+            return None
+        for layer, J in jacobians.items():
+            if J.ndim != 2 or tuple(J.shape) != (d_model, d_model):
+                log.warning(
+                    "jlens cache for %s layer %d has shape %s (need %dx%d); "
+                    "ignoring — re-fit with `saklas lens fit`",
+                    model_id, layer, tuple(J.shape), d_model, d_model,
+                )
+                return None
         if not all(bool(torch.isfinite(j).all()) for j in jacobians.values()):
             log.warning(
                 "jlens cache for %s contains non-finite values; ignoring — "
@@ -112,7 +141,7 @@ def load_lens(model_id: str) -> tuple[JacobianLens, dict[str, Any]] | None:
         lens = JacobianLens(
             jacobians,
             n_prompts=int(sidecar.get("n_prompts", 0)),
-            d_model=int(sidecar.get("d_model", 0)),
+            d_model=d_model,
         )
         return lens, sidecar
     except Exception as exc:

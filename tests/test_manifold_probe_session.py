@@ -242,13 +242,52 @@ def test_begin_capture_no_probes_returns_false():
     assert ok is False
 
 
+def test_begin_capture_live_lens_uses_persistent_capture_when_available():
+    """Live J-lens layers ride compile-clean persistent capture buffers."""
+    session = _stub_session()
+    session._layers = [None] * 4  # pyright: ignore[reportAttributeAccessIssue]  # test stub: list[None] satisfies len() contract
+    session._live_lens = {"layers": [1, 3]}
+    session._compiled_clean_eligible = True
+    session._steering_uses_compiled_offsets = False
+    session._capture_buffers = {
+        idx: torch.zeros(8) for idx in range(4)
+    }
+    session._steering = types.SimpleNamespace(
+        all_fast_path=lambda: True,
+    )
+
+    persistent_layers: list[int] = []
+    transient_layers: list[int] = []
+    tail_depths: list[int] = []
+
+    def _attach_persistent(layer_indices: list[int], buffers: dict[int, torch.Tensor]) -> None:
+        assert buffers is session._capture_buffers
+        persistent_layers.extend(layer_indices)
+
+    def _attach(_layers: Any, layer_indices: list[int]) -> None:
+        transient_layers.extend(layer_indices)
+
+    session._capture.attach_persistent = _attach_persistent
+    session._capture.attach = _attach
+    session._capture.clear = lambda: None
+    session._capture.set_aggregate_tail = lambda depth: tail_depths.append(depth)
+
+    ok = SaklasSession._begin_capture(session, widen=False)
+
+    assert ok is True
+    assert set(persistent_layers) == {1, 3}
+    assert transient_layers == []
+    assert tail_depths
+    assert session._capture_state.persistent is True
+
+
 # ===================================================== gating callback ===
 
 def test_gating_callback_emits_probe_scalars():
-    """The closure built by ``_build_gating_score_callback`` must score the
-    latest captures through the unified monitor and emit gate scalars —
-    fraction + per-node distance + coordinate axis — for every attached
-    probe (a vector probe is the rank-1 case of the same readout)."""
+    """The composer-built gating callback must score the latest captures
+    through the unified monitor and emit gate scalars — fraction + per-node
+    distance + coordinate axis — for every attached probe (a vector probe is
+    the rank-1 case of the same readout)."""
     session = _stub_session()
     m = _toy_manifold()
     session._ensure_manifold_loaded = lambda key: session._manifolds.update(
@@ -272,7 +311,7 @@ def test_gating_callback_emits_probe_scalars():
         if bucket
     }
 
-    cb = SaklasSession._build_gating_score_callback(session)
+    cb = session._steering_composer.build_gating_score_callback()
     flat = cb()
     # Manifold keys are present: fraction + per-node distance + coord axis 0.
     assert "toy:fraction" in flat
@@ -294,7 +333,7 @@ def test_gating_callback_empty_capture_returns_empty():
     session.add_probe("toy")
     session._capture.latest_per_layer = lambda: {}
 
-    cb = SaklasSession._build_gating_score_callback(session)
+    cb = session._steering_composer.build_gating_score_callback()
     assert cb() == {}
 
 

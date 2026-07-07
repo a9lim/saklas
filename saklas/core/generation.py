@@ -543,6 +543,11 @@ class GenerationState:
         # Populated only when a stop sequence actually matches, because normal
         # streaming finalization can decode generated ids directly.
         self.response_text: str | None = None
+        # Raw generated_ids index whose hidden state corresponds to the visible
+        # response endpoint. Stop-sequence trimming can hide the final generated
+        # token(s), so final probe aggregation must not blindly pool the last
+        # content token from ``generated_ids`` on that path.
+        self.response_aggregate_index: int | None = None
 
     def request_stop(self):
         self.stop_requested.set()
@@ -554,6 +559,7 @@ class GenerationState:
         self.finish_reason = "stop"
         self.emit_map = []
         self.response_text = None
+        self.response_aggregate_index = None
 
 
 class _PenaltyState:
@@ -989,6 +995,8 @@ def generate_steered(
     response_chunks: list[str] | None = [] if (on_token is not None and stop_list) else None
     response_char_len = 0
     state.response_text = None
+    state.response_aggregate_index = None
+    lazy_token_text: dict[int, str | None] = {}
 
     no_cache_buf: torch.Tensor | None = None
     no_cache_len = int(current_input.shape[1])
@@ -1030,6 +1038,20 @@ def generate_steered(
                 break
         return "".join(out)
 
+    def _last_response_emit_index() -> int | None:
+        for raw_index, is_thinking in reversed(state.emit_map):
+            if not is_thinking:
+                return raw_index
+        return None
+
+    def _decode_one(tid: int) -> str:
+        cached = lazy_token_text.get(tid)
+        if cached is not None:
+            return cached
+        s = cast(str, tokenizer.decode([tid]))  # transformers stub widens decode return to str|list[str]
+        lazy_token_text[tid] = s
+        return s
+
     def _decode_alt(tid: int) -> str:
         """Decode a single alt token id to text, preferring the cached
         token_table (already built once for the chosen-token rendering
@@ -1040,13 +1062,18 @@ def generate_steered(
             cached = token_table[tid]
             if cached is not None:
                 return cached
-        return cast(str, tokenizer.decode([tid]))  # transformers stub widens decode return to str|list[str]
+        return _decode_one(tid)
 
     def _decode_piece(tid: int) -> str | None:
         """Decode one emitted token, preserving partial-UTF-8 buffering."""
         if token_table is not None and 0 <= tid < _vocab:
             return token_table[tid]
-        s = cast(str, tokenizer.decode([tid]))  # transformers stub widens decode return to str|list[str]
+        if tid in lazy_token_text:
+            return lazy_token_text[tid]
+        s = _decode_one(tid)
+        if "\ufffd" in s:
+            lazy_token_text[tid] = None
+            return None
         return None if "\ufffd" in s else s
 
     try:
@@ -1440,6 +1467,7 @@ def generate_steered(
                                                 chosen_logprob, top_alts,
                                                 current_perplexity)
                                 state.response_text = _response_prefix(keep_chars)
+                                state.response_aggregate_index = _last_response_emit_index()
                                 state.finish_reason = "stop_sequence"
                                 break
                             completion_text = (

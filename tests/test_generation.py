@@ -14,7 +14,7 @@ from saklas.core.generation import (
     _PenaltyState,
     generate_steered,
 )
-from saklas.core.results import ProbeReading
+from saklas.core.results import GenerationResult, ProbeReading
 from saklas.core.session import CaptureMode, CaptureState, SaklasSession
 
 
@@ -160,6 +160,7 @@ def test_stop_sequence_trimmed_text_is_final_result_text():
     assert emitted == ["Hello"]
     assert state.finish_reason == "stop_sequence"
     assert state.response_text == "Hello"
+    assert state.response_aggregate_index == 0
 
     session: Any = SaklasSession.__new__(SaklasSession)
     session._gen_state = state
@@ -202,6 +203,57 @@ def test_stop_sequence_split_across_tokens_trims_final_text():
     assert emitted == ["Hello S"]
     assert state.finish_reason == "stop_sequence"
     assert state.response_text == "Hello"
+    assert state.response_aggregate_index == 0
+
+
+def test_stop_sequence_probe_aggregate_uses_visible_endpoint():
+    model: Any = _StopModel()
+    tokenizer: Any = _StopTokenizer()
+    state = GenerationState()
+    generated_ids = generate_steered(
+        model,
+        cast(Any, tokenizer),
+        torch.tensor([[0]]),
+        GenerationConfig(max_new_tokens=5, temperature=0.0),
+        state,
+        on_token=lambda *_args: None,
+        stop=[" STOP"],
+    )
+
+    visible = ProbeReading(coords=(0.25,), fraction=0.25, nearest=[])
+    hidden_stop = ProbeReading(coords=(0.99,), fraction=0.99, nearest=[])
+
+    class Capture:
+        def stacked(self) -> dict[int, torch.Tensor]:
+            raise AssertionError("incremental stop aggregate should not stack")
+
+    class Monitor:
+        probe_names = ["toy"]
+
+    session: Any = SaklasSession.__new__(SaklasSession)
+    session._gen_state = state
+    session._tokenizer = tokenizer
+    session._monitor = Monitor()
+    session._capture = Capture()
+    session._capture_state = CaptureState(mode=CaptureMode.INCREMENTAL)
+    session._incremental_readings = [{"toy": visible}, {"toy": hidden_stop}]
+    session._last_per_token_scores = None
+    session._last_result = None
+    session.events = SimpleNamespace(emit=lambda _event: None)
+    session.build_readings = lambda: {}
+
+    result = SaklasSession._finalize_generation(
+        session,
+        "prompt",
+        generated_ids,
+        elapsed=1.0,
+        vector_snapshot={},
+        stateless=True,
+    )
+
+    assert result.text == "Hello"
+    assert result.probe_readings == {"toy": visible}
+    assert result.readings["toy"].mean == (0.25,)
 
 
 def test_stop_sequence_only_tap_can_skip_full_token_table():
@@ -268,10 +320,12 @@ def test_finalize_reuses_scored_probe_aggregate() -> None:
             tokenizer: Any,
             *,
             accumulate: bool = True,
+            aggregate_index: int | None = None,
         ) -> tuple[dict[str, ProbeReading], dict[str, list[float]]]:
             assert list(captured) == [0]
             assert generated_ids == [0, 1]
             assert accumulate is False
+            assert aggregate_index == 1
             return {"toy": reading}, {"toy": [0.1, 0.25]}
 
         def score_aggregate(self, *_args: Any, **_kwargs: Any) -> None:
@@ -305,6 +359,27 @@ def test_finalize_reuses_scored_probe_aggregate() -> None:
     assert result.probe_readings == {"toy": reading}
     assert result.readings["toy"].mean == (0.25,)
     assert session._last_per_token_scores == {"toy": [0.1, 0.25]}
+
+
+def test_generate_stream_exposes_current_result() -> None:
+    result = GenerationResult(
+        text="ok", tokens=[7], token_count=1, tok_per_sec=1.0, elapsed=1.0,
+    )
+
+    def _fake_generate_core(*_args: Any, **kwargs: Any) -> GenerationResult:
+        kwargs["on_token"]("ok", False, 7, None, None, None)
+        return result
+
+    session: Any = SaklasSession.__new__(SaklasSession)
+    session._gen_state = GenerationState()
+    session._monitor = SimpleNamespace(probe_names=[])
+    session._last_token_probe_payload = {}
+    session._generate_core = _fake_generate_core
+
+    stream = session.generate_stream("prompt")
+    events = list(stream)
+    assert [e.text for e in events] == ["ok"]
+    assert stream.result is result
 
 
 def test_finalize_incremental_probe_path_does_not_stack_capture() -> None:

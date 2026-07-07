@@ -14,7 +14,12 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Literal, cast, overload
 
 import torch
-from transformers import PreTrainedModel, PreTrainedTokenizerBase
+from transformers import (
+    PreTrainedModel,
+    PreTrainedTokenizerBase,
+    StoppingCriteria,
+    StoppingCriteriaList,
+)
 
 from saklas.core.errors import SaklasError
 from saklas.core.events import (
@@ -24,7 +29,15 @@ from saklas.core.events import (
     ProbeScored,
     VectorExtracted,
 )
-from saklas.core.generation import GenerationConfig, GenerationState, build_chat_input, detect_base_model, generate_steered, supports_thinking
+from saklas.core.generation import (
+    GenerationConfig,
+    GenerationState,
+    _get_eos_ids,
+    build_chat_input,
+    detect_base_model,
+    generate_steered,
+    supports_thinking,
+)
 from saklas.core.hooks import HiddenCapture, SteeringManager
 from saklas.core.loom import (
     InvalidNodeOperationError,
@@ -37,7 +50,7 @@ from saklas.core.loom import (
 from saklas.core.model import load_model, get_layers, get_model_info
 from saklas.core.monitor import Monitor
 from saklas.io.probes_bootstrap import bootstrap_layer_means
-from saklas.core.profile import Profile
+from saklas.core.profile import Profile, load_profile as _load_profile
 from saklas.core.results import (
     GenerationResult,
     ProbeReading,
@@ -47,7 +60,7 @@ from saklas.core.results import (
 )
 from saklas.core.sampling import SamplingConfig
 from saklas.core.steering import Steering
-from saklas.core.steering_expr import AblationTerm, ManifoldTerm
+from saklas.core.steering_expr import AblationTerm, ManifoldTerm, ProjectedTerm
 from saklas.core.manifold import Manifold, manifold_is_affine
 
 if TYPE_CHECKING:
@@ -55,7 +68,6 @@ if TYPE_CHECKING:
     from saklas.core.steering_composer import SteeringComposer
     from saklas.io.templates import TemplateFolder
 from saklas.core.triggers import Trigger
-from saklas.core.vectors import load_profile as _load_profile
 
 _log = logging.getLogger(__name__)
 
@@ -175,6 +187,87 @@ _AGG_TAIL_DEPTH = 8
 # (``_try_prefix_cache_hit`` requires it), so the cached length is capped at
 # ``min_row_len - 1``.
 _PREFIX_CACHE_MIN_TOKENS = 16
+
+
+@dataclass(slots=True)
+class _PrefixCacheEntry:
+    prefix_ids_cpu: torch.Tensor
+    past_key_values: object
+    prefix_len: int
+    static: bool = False
+    max_cache_len: int | None = None
+
+
+@dataclass(slots=True)
+class _SerialGenerationJob:
+    input: Any
+    steering: Any = None
+    sampling: SamplingConfig | None = None
+    raw: bool = False
+    thinking: bool | None = None
+    on_token: Callable[..., None] | None = None
+    parent_node_id: str | None = None
+    recipe_override: Any = None
+    grid: dict[str, Any] | None = None
+
+
+class _SessionStopCriteria(StoppingCriteria):
+    """Bridge ``SaklasSession.stop()`` into ``transformers.generate``."""
+
+    def __init__(self, state: GenerationState) -> None:
+        self._state = state
+
+    def __call__(
+        self,
+        input_ids: torch.LongTensor,
+        scores: torch.FloatTensor | None,
+        **kwargs: Any,
+    ) -> Any:
+        del scores, kwargs
+        stop = 1 if self._state.stop_requested.is_set() else 0
+        return input_ids.new_full((int(input_ids.shape[0]),), stop).bool()
+
+
+def _run_serial_generation_jobs(
+    session: Any,
+    jobs: list[_SerialGenerationJob],
+    *,
+    stateless: bool,
+    kind: str,
+    on_result: Callable[[int, GenerationResult, dict[str, Any]], None] | None = None,
+    stop_between_jobs: bool = False,
+) -> RunSet:
+    """Run generation jobs through the shared serial executor.
+
+    This is still a one-row-at-a-time runner; centralizing it gives the
+    eventual true batched decode path one place to branch from, instead of
+    keeping separate loops in fan, batch, and sweep surfaces.
+    """
+    results: list[GenerationResult] = []
+    node_ids: list[str | None] = []
+    grid_rows: list[dict[str, Any]] = []
+    for idx, job in enumerate(jobs):
+        result = session._generate_core(
+            job.input,
+            steering=job.steering,
+            sampling=job.sampling,
+            stateless=stateless,
+            raw=job.raw,
+            thinking=job.thinking,
+            on_token=job.on_token,
+            parent_node_id=job.parent_node_id,
+            recipe_override=job.recipe_override,
+        )
+        row = dict(job.grid or {})
+        results.append(result)
+        node_ids.append(session.tree.active_node_id if not stateless else None)
+        grid_rows.append(row)
+        if on_result is not None:
+            on_result(idx, result, row)
+        if stop_between_jobs and session._gen_state.stop_requested.is_set():
+            break
+    return RunSet(results, node_ids=node_ids, grid=grid_rows, kind=kind)
+
 
 PROBE_CATEGORIES = [
     "epistemic",
@@ -433,8 +526,8 @@ class ConcurrentExtractionError(RuntimeError, SaklasError):
 # Internal steering-stack entry shape: additive entries are
 # ``(alpha, Trigger)`` tuples; ablation entries are ``AblationTerm``
 # values carrying their own coeff + trigger + target.  The union flows
-# through the stack, ``_flatten``, ``_push``/``_pop``, and is dispatched
-# by type in ``_compose_steering_entries``.
+# through the stack, ``flatten_steering_stack``, ``push``/``pop``, and is
+# dispatched by type in ``SteeringComposer.compose_steering_entries``.
 SteeringStackEntry = tuple[float, Trigger] | AblationTerm | ManifoldTerm
 
 
@@ -761,16 +854,18 @@ class SaklasSession:
                 install_persistent_offset_hooks,
             )
             from saklas.core.model import _compile_with_probe, get_layers
-            # Attach the persistent branchless steering + capture hooks BEFORE
+            # Attach the persistent branchless steering hooks BEFORE
             # compile so they ride inside the captured graph (post-compile hook
             # changes are not retraced — ``skip_nnmodule_hook_guards``).  The
-            # offset hooks (``add_(offset)``) carry static-affine steering; the
-            # capture hooks (``copy_`` the last-token slice) carry probe reads.
-            # Both update their buffers in place per gen, so the compiled fast
-            # path sees a stable hook topology and never recompiles — that is what
-            # lets steered *and probed* generation stay on the compiled graph
-            # (slice 2).  ``hidden_size`` falls back to the text sub-config for
-            # multimodal wrappers (Gemma-3/4).
+            # offset hooks (``add_(offset)``) carry static-affine steering and
+            # update their buffers in place per gen, so the compiled fast path
+            # sees a stable hook topology and never recompiles. Persistent
+            # capture hooks (``copy_`` the last-token slice) are installed only
+            # when the construction-time probe roster is non-empty/default; an
+            # explicit ``probes=[]`` session takes a no-capture compiled mode and
+            # later ad-hoc probes fall back to transient capture. ``hidden_size``
+            # falls back to the text sub-config for multimodal wrappers
+            # (Gemma-3/4).
             hidden_size = getattr(model.config, "hidden_size", None)
             if hidden_size is None and hasattr(model.config, "get_text_config"):
                 hidden_size = model.config.get_text_config().hidden_size
@@ -780,9 +875,12 @@ class SaklasSession:
                 offset_buffers, offset_handles = install_persistent_offset_hooks(
                     layers_ml, int(hidden_size), device_obj, model_dtype,
                 )
-                capture_buffers, capture_handles = install_persistent_capture_hooks(
-                    layers_ml, int(hidden_size), device_obj, model_dtype,
-                )
+                if probes is None or bool(probes):
+                    capture_buffers, capture_handles = (
+                        install_persistent_capture_hooks(
+                            layers_ml, int(hidden_size), device_obj, model_dtype,
+                        )
+                    )
             model = _compile_with_probe(
                 model, tokenizer, device_obj,
                 mode=effective_compile_mode,
@@ -920,10 +1018,10 @@ class SaklasSession:
         # below; the composer is lazily created on first access so ``__new__`` test
         # stubs that bypass ``__init__`` still resolve it.
 
-        # Set by ``_install_composed_steering`` when the current steering lowers
-        # to the persistent compile-clean offset buffers (static-affine push,
-        # compiled MPS session) instead of transient hooks — routes the decode
-        # loop to the compiled module + StaticCache.
+        # Set by ``SteeringComposer.install_composed_steering`` when the current
+        # steering lowers to the persistent compile-clean offset buffers
+        # (static-affine push, compiled MPS session) instead of transient hooks —
+        # routes the decode loop to the compiled module + StaticCache.
         self._steering_uses_compiled_offsets: bool = False
 
         # Persistent compile-clean *capture* buffers + hook handles, adopted from
@@ -1172,14 +1270,16 @@ class SaklasSession:
         # Prefix KV cache (opt-in, off by default).  Populated by
         # :meth:`cache_prefix`; consumed by :meth:`_generate_core` when the
         # incoming ``input_ids`` start with the cached prefix.  Shape:
-        # ``(prefix_token_ids: torch.Tensor [seq_len] long, past_key_values,
-        # prefix_len: int)``.  ``past_key_values`` is the live HF cache
-        # (DynamicCache et al.) returned by the prefix-prefill forward pass
-        # — generation cropping back to ``prefix_len`` after each consuming
-        # call keeps it reusable.  Invalidated on any state change that
-        # would alter the cached prefix's hidden-state semantics: steering
-        # push/pop/steer/unsteer, probe install/remove, profile mutation.
-        self._prefix_cache: tuple[torch.Tensor, object, int] | None = None
+        # ``_PrefixCacheEntry(prefix_token_ids_cpu, past_key_values,
+        # prefix_len, static, max_cache_len)``.  ``past_key_values`` is the
+        # live HF cache returned/mutated by the prefix-prefill forward pass.
+        # Dynamic entries crop back to ``prefix_len`` after reuse; StaticCache
+        # entries additionally carry capacity so oversized generations miss
+        # safely instead of writing past the preallocated buffers.  Invalidated
+        # on any state change that would alter the cached prefix's hidden-state
+        # semantics: steering push/pop/steer/unsteer, probe install/remove,
+        # profile mutation.
+        self._prefix_cache: _PrefixCacheEntry | None = None
 
     # -- ModelHandle protocol surface (consumed by ManifoldExtractionPipeline) --
 
@@ -2100,26 +2200,27 @@ class SaklasSession:
         buckets = self._capture.per_layer_buckets()
         unembed = state["unembed"]
         cache: dict[int, str] = state["decode_cache"]
-        vals_by_layer: list[torch.Tensor] = []
-        idxs_by_layer: list[torch.Tensor] = []
         layers_present: list[int] = []
+        hidden_rows: list[torch.Tensor] = []
+        transports: list[torch.Tensor] = []
         for layer in state["layers"]:
             bucket = buckets.get(layer)
             if not bucket:
                 continue
-            h = bucket[-1].to(torch.float32)
-            transported = h @ state["J"][layer].T
-            normed = state["norm"](transported)
-            logits = normed.to(unembed.dtype) @ unembed.T
-            vals, idxs = logits.float().topk(state["top_k"])
             layers_present.append(layer)
-            vals_by_layer.append(vals)
-            idxs_by_layer.append(idxs)
+            hidden_rows.append(bucket[-1].to(torch.float32))
+            transports.append(state["J"][layer].to(torch.float32))
         if not layers_present:
             return None
+        H = torch.stack(hidden_rows, dim=0)
+        J = torch.stack(transports, dim=0).to(H.device)
+        transported = torch.bmm(J, H.unsqueeze(-1)).squeeze(-1)
+        normed = state["norm"](transported)
+        logits = normed.to(unembed.dtype) @ unembed.T
+        vals, idxs = logits.float().topk(state["top_k"], dim=-1)
         # one batched host transfer for the whole step
-        all_vals = torch.stack(vals_by_layer).cpu()
-        all_idxs = torch.stack(idxs_by_layer).cpu()
+        all_vals = vals.cpu()
+        all_idxs = idxs.cpu()
         out: dict[int, list[tuple[str, float]]] = {}
         for row, layer in enumerate(layers_present):
             pairs: list[tuple[str, float]] = []
@@ -2855,7 +2956,9 @@ class SaklasSession:
         Unknown vector names raise ``VectorNotRegisteredError``; genuinely
         ambiguous pole names propagate ``AmbiguousSelectorError``.
         """
-        steering_obj = Steering.from_value(value)
+        steering_obj = Steering.from_value(
+            value, profile_names=set(self._profiles),
+        )
         if steering_obj is None:
             raise TypeError(
                 "session.steering() requires a non-None expression string "
@@ -2866,10 +2969,11 @@ class SaklasSession:
         # Must run before ``normalized_entries`` because the normalized
         # form flattens ``ProjectedTerm`` into ``(coeff, trigger)`` and
         # loses the ``base`` / ``onto`` / ``operator`` fields.
-        snapshots = self._materialize_projections(steering_obj)
+        composer = self._get_steering_composer()
+        snapshots = composer.materialize_projections(steering_obj)
         raw_entries = steering_obj.normalized_entries()
         resolved: dict[str, SteeringStackEntry] = dict(
-            self._resolve_pole_aliases(raw_entries)
+            composer.resolve_pole_aliases(raw_entries)
         )
 
         # Role-augmented extraction (role-extraction Phase 7):
@@ -3024,61 +3128,25 @@ class SaklasSession:
             active_role=active_role,
         )
 
-    def _materialize_projections(self, steering: Steering) -> dict[str, object]:
-        """Populate ``self._profiles`` with derived profiles for every
-        :class:`~saklas.core.steering_expr.ProjectedTerm` in ``steering.alphas``.
-
-        Thin forwarder to :meth:`SteeringComposer.materialize_projections`.
-        """
-        return self._get_steering_composer().materialize_projections(steering)
-
     def _ensure_manifold_loaded(self, key: str) -> None:
         """Load the manifold artifact for registry key ``key`` if absent.
 
-        Thin forwarder to :meth:`SteeringComposer.ensure_manifold_loaded`;
-        ``_bootstrap_manifold_probes`` / ``_resolve_probe_manifold`` and the
-        manifold-probe tests call it on the session (the tests monkeypatch it).
+        Compatibility wrapper over
+        :meth:`SteeringComposer.ensure_manifold_loaded`; production steering
+        code talks to the composer directly.
         """
         self._get_steering_composer().ensure_manifold_loaded(key)
-
-    def _resolve_pole_aliases(
-        self, entries: dict[str, tuple[float, Trigger]],
-    ) -> dict[str, tuple[float, Trigger]]:
-        """Apply pole-alias resolution + sign flipping + variant routing.
-
-        Thin forwarder to :meth:`SteeringComposer.resolve_pole_aliases`; test
-        stubs override this on the session.
-        """
-        return self._get_steering_composer().resolve_pole_aliases(entries)
 
     def _ensure_profile_registered(
         self, name: str, *, role: str = "vector",
     ) -> dict[int, torch.Tensor]:
         """Direction profile for ``name`` — registered tensor or folded manifold.
 
-        Thin forwarder to :meth:`SteeringComposer.ensure_profile_registered`;
-        ``test_vector_migration`` calls it on the session.
+        Compatibility wrapper over
+        :meth:`SteeringComposer.ensure_profile_registered`; public callers
+        should prefer :meth:`ensure_profile_registered`.
         """
         return self._get_steering_composer().ensure_profile_registered(name, role=role)
-
-    def _try_fold_manifold(
-        self, name: str,
-    ) -> dict[int, torch.Tensor] | None:
-        """Load a 2-node ``pca`` manifold for ``name`` and fold it to a vector.
-
-        Thin forwarder to :meth:`SteeringComposer.try_fold_manifold`.
-        """
-        return self._get_steering_composer().try_fold_manifold(name)
-
-    def _port_stale_legacy_vector(
-        self, canonical: str,
-    ) -> tuple[str, str] | None:
-        """Port a stale legacy ``vectors/`` folder to a 2-node ``pca`` manifold.
-
-        Thin forwarder to :meth:`SteeringComposer.port_stale_legacy_vector`;
-        ``test_vector_migration`` calls it on the session.
-        """
-        return self._get_steering_composer().port_stale_legacy_vector(canonical)
 
     def _bootstrap_manifold_probes(
         self, categories: list[str], *, include_fitted_defaults: bool = False,
@@ -3125,10 +3193,10 @@ class SaklasSession:
                 key = f"default/{name}"
                 try:
                     try:
-                        self._ensure_manifold_loaded(key)
+                        self._get_steering_composer().ensure_manifold_loaded(key)
                     except ManifoldNotRegisteredError:
                         self.fit(manifold_dir("default", name))
-                        self._ensure_manifold_loaded(key)
+                        self._get_steering_composer().ensure_manifold_loaded(key)
                     probes[name] = self._manifolds[key]
                 except Exception as e:
                     _log.warning("manifold probe '%s' failed to fit/load: %s", name, e)
@@ -3162,7 +3230,7 @@ class SaklasSession:
                 )
                 continue
             try:
-                self._ensure_manifold_loaded(key)
+                self._get_steering_composer().ensure_manifold_loaded(key)
                 probes[key] = self._manifolds[key]
             except Exception as e:
                 _log.warning("manifold probe '%s' failed to load: %s", key, e)
@@ -3187,42 +3255,15 @@ class SaklasSession:
         """
         self._get_steering_composer().pop()
 
-    def _emit_steering_applied(self) -> None:
-        """Emit SteeringApplied with alphas-only + full entries.
-
-        Thin forwarder to :meth:`SteeringComposer.emit_steering_applied`.
-        """
-        self._get_steering_composer().emit_steering_applied()
-
-    def _flatten_steering_stack(self) -> dict[str, SteeringStackEntry]:
-        """Collapse the LIFO stack into a single entries dict (later wins).
-
-        Thin forwarder to :meth:`SteeringComposer.flatten_steering_stack`.
-        """
-        return self._get_steering_composer().flatten_steering_stack()
-
     def _steering_needs_probe_gating(self) -> bool:
         """Return True iff any active steering trigger carries a
         :class:`~saklas.core.triggers.ProbeGate`.
 
-        Thin forwarder to :meth:`SteeringComposer.steering_needs_probe_gating`;
-        ``joint_logprobs.py`` and the probe-gate tests call it on the session.
+        Compatibility wrapper over
+        :meth:`SteeringComposer.steering_needs_probe_gating`; production
+        generation code talks to the composer directly.
         """
         return self._get_steering_composer().steering_needs_probe_gating()
-
-    def _gated_probe_names(self) -> set[str]:
-        """Registered probe names referenced by active probe gates.
-
-        Thin forwarder to :meth:`SteeringComposer.gated_probe_names`.
-        """
-        return self._get_steering_composer().gated_probe_names()
-
-    def _gated_probe_keys(self) -> set[str]:
-        """Exact monitor scalar keys referenced by active probe gates.
-
-        Thin forwarder to :meth:`SteeringComposer.gated_probe_keys`.
-        """
-        return self._get_steering_composer().gated_probe_keys()
 
     def _steering_active_in_prefill(self) -> bool:
         """Return True iff any active steering term fires during prompt prefill.
@@ -3275,31 +3316,11 @@ class SaklasSession:
         """Return a closure that scores latest captures into a
         ``dict[str, float]`` for ``generate_steered``'s ``score_callback``.
 
-        Thin forwarder to :meth:`SteeringComposer.build_gating_score_callback`;
-        ``joint_logprobs.py`` and the manifold-probe tests call this on the
-        session.  The returned closure is per-token (under an active probe gate);
-        the composer binds ``capture``/``monitor`` to locals and reads the
-        session capture state through the back-ref, so no new per-token
-        indirection is added.
+        Compatibility wrapper over
+        :meth:`SteeringComposer.build_gating_score_callback`; production
+        generation code talks to the composer directly.
         """
         return self._get_steering_composer().build_gating_score_callback()
-
-    def _compose_steering_entries(
-        self,
-        entries: dict[str, SteeringStackEntry],
-    ) -> None:
-        """Lower the active steering entries into the ``SteeringManager`` (4.0).
-
-        Thin forwarder to :meth:`SteeringComposer.compose_steering_entries`.
-        """
-        self._get_steering_composer().compose_steering_entries(entries)
-
-    def _install_composed_steering(self) -> None:
-        """Attach the currently-composed steering entries to model layers.
-
-        Thin forwarder to :meth:`SteeringComposer.install_composed_steering`.
-        """
-        self._get_steering_composer().install_composed_steering()
 
     def _rebuild_steering_hooks(self) -> None:
         """Tear down existing hooks and install from the flattened stack head.
@@ -3374,11 +3395,10 @@ class SaklasSession:
         # ``return_hidden``) falls back to transient capture hooks.
         use_persistent = bool(
             not widen
-            # The persistent compiled-clean buffers only cover probe layers;
-            # a live lens adds its own layers, so it routes capture through
-            # transient hooks (steering compile eligibility is unaffected —
-            # this is capture routing only).
-            and live_lens is None
+            # Persistent capture buffers are installed for every layer before
+            # compile; layer_idxs selects the subset this generation consumes.
+            # Live lens layers can therefore ride the same compile-clean path
+            # instead of forcing transient hooks.
             and getattr(self, "_compiled_clean_eligible", False)
             and self._capture_buffers
             and (
@@ -3575,6 +3595,19 @@ class SaklasSession:
             captured, generated_ids, self._tokenizer, accumulate=accumulate,
         )
 
+    def _aggregate_forward_index(self, generated_ids: list[int]) -> int | None:
+        """Forward index to use for the end-of-generation aggregate read."""
+        idx = getattr(self._gen_state, "response_aggregate_index", None)
+        if idx is not None and 0 <= int(idx) < len(generated_ids):
+            return int(idx)
+        if (
+            self._gen_state.finish_reason == "stop_sequence"
+            and getattr(self._gen_state, "response_text", None) is not None
+        ):
+            return None
+        from saklas.core.vectors import last_content_index
+        return last_content_index(generated_ids, self._tokenizer)
+
     def _empty_readings(self, names: list[str]) -> dict[str, "ProbeReading"]:
         """A zero ``ProbeReading`` per probe — the no-tokens / missing-pool
         fallback shared by the incremental and aggregate-only score paths."""
@@ -3610,13 +3643,12 @@ class SaklasSession:
         if n == 0 or not self._incremental_readings:
             return self._empty_readings(names), {name: [] for name in names}
 
-        from saklas.core.vectors import last_content_index
         rows = self._incremental_readings[:n]
         per_token = self._extract_coord_stream(rows, n, names)
 
         empty_agg = self._empty_readings(names)
-        agg_idx = last_content_index(generated_ids, self._tokenizer)
-        agg_row = rows[agg_idx] if agg_idx < len(rows) else {}
+        agg_idx = self._aggregate_forward_index(generated_ids)
+        agg_row = rows[agg_idx] if agg_idx is not None and agg_idx < len(rows) else {}
         agg_vals = {
             name: agg_row.get(name, empty_agg[name]) for name in names
         }
@@ -3642,8 +3674,9 @@ class SaklasSession:
         empty = self._empty_readings(names)
         if not generated_ids:
             return empty
-        from saklas.core.vectors import last_content_index
-        agg_fwd = last_content_index(generated_ids, self._tokenizer)
+        agg_fwd = self._aggregate_forward_index(generated_ids)
+        if agg_fwd is None:
+            return empty
         pooled = self._capture.tail_slice_at(agg_fwd)
         if not pooled:
             return empty
@@ -4461,6 +4494,9 @@ class SaklasSession:
     def cache_prefix(
         self,
         messages: "list[dict[str, str]] | torch.Tensor | None",
+        *,
+        max_new_tokens: int | None = None,
+        prefer_static: bool = False,
     ) -> int:
         """Pre-prefill an identical chat prefix so subsequent ``generate()``
         calls forward only the suffix.
@@ -4482,6 +4518,13 @@ class SaklasSession:
           fixed instruction concatenated into the user message before
           the variable prompt body).
         - ``None``: clear the cache. Equivalent to ``cache_prefix()``.
+
+        ``prefer_static=True`` builds a StaticCache-backed prefix entry when the
+        session supports StaticCache. ``max_new_tokens`` sizes the decode
+        headroom; callers that pass a larger generation budget later will miss
+        this static entry and fall back to the regular full-prefill path. When
+        StaticCache construction or prefill fails, the method falls back to the
+        ordinary DynamicCache prefix entry.
 
         Returns the cached prefix length in tokens (0 when clearing).
 
@@ -4553,14 +4596,83 @@ class SaklasSession:
         # configurations, so the bracketing here is always safe.
         self._end_capture()
 
-        with torch.inference_mode():
-            outputs = self._model(
-                input_ids=prefix_ids,
-                attention_mask=torch.ones_like(prefix_ids),
-                use_cache=True,
-            )
+        use_static = bool(prefer_static and getattr(self, "_static_cache_active", False))
+        static_max_cache_len: int | None = None
+        past_key_values: object | None = None
+        cache_position: torch.Tensor | None = None
+        if use_static:
+            try:
+                from saklas.core.cuda_graphs import make_static_cache
 
-        past_key_values = outputs.past_key_values
+                model_dtype = next(self._model.parameters()).dtype
+                headroom = int(
+                    max_new_tokens
+                    if max_new_tokens is not None
+                    else self.config.max_new_tokens
+                )
+                static_max_cache_len = prefix_len + max(headroom, 1)
+                past_key_values = make_static_cache(
+                    self._model,
+                    max_cache_len=static_max_cache_len,
+                    device=self._device,
+                    dtype=model_dtype,
+                )
+                cache_position = torch.arange(
+                    prefix_len, device=self._device, dtype=torch.long,
+                )
+            except Exception as exc:
+                _log.debug(
+                    "cache_prefix: StaticCache prefix skipped (%s)", exc,
+                )
+                use_static = False
+                past_key_values = None
+                cache_position = None
+                static_max_cache_len = None
+
+        try:
+            with torch.inference_mode():
+                if use_static and past_key_values is not None and cache_position is not None:
+                    outputs = self._model(
+                        input_ids=prefix_ids,
+                        attention_mask=torch.ones_like(prefix_ids),
+                        past_key_values=past_key_values,
+                        use_cache=True,
+                        cache_position=cache_position,
+                    )
+                else:
+                    outputs = self._model(
+                        input_ids=prefix_ids,
+                        attention_mask=torch.ones_like(prefix_ids),
+                        use_cache=True,
+                    )
+        except Exception:
+            if not use_static:
+                raise
+            _log.debug(
+                "cache_prefix: StaticCache prefill failed; retrying DynamicCache",
+                exc_info=True,
+            )
+            use_static = False
+            past_key_values = None
+            cache_position = None
+            static_max_cache_len = None
+            with torch.inference_mode():
+                outputs = self._model(
+                    input_ids=prefix_ids,
+                    attention_mask=torch.ones_like(prefix_ids),
+                    use_cache=True,
+                )
+
+        if use_static and past_key_values is not None:
+            # StaticCache mutates in place. Some modeling files return the same
+            # object, others may return ``None``; keep the preallocated cache in
+            # both cases.
+            returned_pkv = outputs.past_key_values
+            past_key_values = (
+                returned_pkv if returned_pkv is not None else past_key_values
+            )
+        else:
+            past_key_values = outputs.past_key_values
         if past_key_values is None:
             # Model doesn't expose KV cache (custom modeling that ignores
             # use_cache).  Nothing to cache; drop the prefix.
@@ -4574,7 +4686,13 @@ class SaklasSession:
         # Store on CPU so we can ``.equal`` against fresh device tensors
         # without round-trip cost; the cache itself stays on device.
         prefix_ids_cpu = prefix_ids[0].detach().to("cpu")
-        self._prefix_cache = (prefix_ids_cpu, past_key_values, prefix_len)
+        self._prefix_cache = _PrefixCacheEntry(
+            prefix_ids_cpu=prefix_ids_cpu,
+            past_key_values=past_key_values,
+            prefix_len=prefix_len,
+            static=use_static,
+            max_cache_len=static_max_cache_len,
+        )
         return prefix_len
 
     def _invalidate_prefix_cache(self) -> None:
@@ -4589,27 +4707,53 @@ class SaklasSession:
         self._prefix_cache = None
 
     def _try_prefix_cache_hit(
-        self, input_ids: torch.Tensor,
-    ) -> tuple[torch.Tensor, object, int] | None:
-        """Return (suffix_ids, past_key_values, prefix_len) on cache hit, else None.
+        self,
+        input_ids: torch.Tensor,
+        *,
+        static_eligible: bool = False,
+        required_max_new_tokens: int | None = None,
+    ) -> tuple[torch.Tensor, object, int, bool] | None:
+        """Return (suffix_ids, past_key_values, prefix_len, static) on hit.
 
         Cache-hit precondition: the cached prefix tokens match
         ``input_ids[0, :prefix_len]`` byte-for-byte AND the suffix is
         non-empty (a zero-length suffix has no last-token logit to
         sample from on the first iteration; we'd need a different
         codepath to handle it — for now, fall through to no-cache).
+
+        StaticCache entries additionally require the current generation to be
+        StaticCache-eligible and to fit inside the entry's preallocated
+        ``max_cache_len``. Oversized static entries miss safely; the caller can
+        then do a regular full-prefill with a freshly sized StaticCache.
         """
-        cache = self._prefix_cache
-        if cache is None:
+        entry = self._prefix_cache
+        if entry is None:
             return None
-        prefix_ids_cpu, past_key_values, prefix_len = cache
+        # Tolerate stale test sentinels or pre-dataclass tuples by treating
+        # anything unexpected as a miss. Real cache entries are always
+        # ``_PrefixCacheEntry``.
+        if not isinstance(entry, _PrefixCacheEntry):
+            return None
+        prefix_ids_cpu = entry.prefix_ids_cpu
+        prefix_len = entry.prefix_len
         if input_ids.shape[1] <= prefix_len:
             return None
         head = input_ids[0, :prefix_len].detach().to("cpu")
         if not torch.equal(head, prefix_ids_cpu):
             return None
         suffix_ids = input_ids[:, prefix_len:].contiguous()
-        return suffix_ids, past_key_values, prefix_len
+        if entry.static:
+            if not static_eligible:
+                return None
+            if entry.max_cache_len is not None:
+                required = (
+                    prefix_len
+                    + int(suffix_ids.shape[1])
+                    + max(int(required_max_new_tokens or 0), 1)
+                )
+                if required > entry.max_cache_len:
+                    return None
+        return suffix_ids, entry.past_key_values, prefix_len, entry.static
 
     # -- Generation helpers --
 
@@ -4747,168 +4891,21 @@ class SaklasSession:
         mean_logprob: float | None = None,
         mean_surprise: float | None = None,
     ) -> GenerationResult:
-        """Shared post-generation: decode, measure probes, build result, update history."""
-        token_count = len(generated_ids)
-        tok_per_sec = token_count / elapsed if elapsed > MIN_ELAPSED_FOR_RATE else 0.0
-        response_ids = generated_ids[self._gen_state.thinking_end_idx:]
-        if (
-            self._gen_state.finish_reason == "stop_sequence"
-            and self._gen_state.response_text is not None
-        ):
-            text: str = self._gen_state.response_text
-        else:
-            _decoded = self._tokenizer.decode(response_ids, skip_special_tokens=True)
-            text = _decoded if isinstance(_decoded, str) else _decoded[0]
+        """Finalize result state through the generation finalizer collaborator."""
+        from saklas.core.generation_finalizer import finalize_generation
 
-        capture_mode = self._capture_state.mode
-        captured_stack: dict[int, torch.Tensor] = {}
-        if (
-            generated_ids
-            and (
-                return_hidden
-                or (
-                    self._monitor.probe_names
-                    and capture_mode is CaptureMode.FULL
-                )
-            )
-        ):
-            # Full stack only for return_hidden or the non-incremental
-            # full-retention (FULL) path; the aggregate-only / lean tail ring is
-            # pooled via ``_score_aggregate_only`` (``stacked()`` would stack the
-            # tail ring, not the full [T, D]).
-            captured_stack = self._capture.stacked()
-
-        agg_vals: dict[str, ProbeReading] = {}
-        if self._monitor.probe_names and generated_ids:
-            if capture_mode is CaptureMode.INCREMENTAL:
-                agg_vals, per_token = self._score_incremental(
-                    generated_ids, accumulate=not stateless,
-                )
-            elif capture_mode is CaptureMode.LEAN_INCREMENTAL:
-                # Lean per-token coord stream + full aggregate from the tail ring.
-                agg_vals, per_token = self._score_lean_incremental(
-                    generated_ids, accumulate=not stateless,
-                )
-            elif self._capture_state.aggregate_only:
-                # AGGREGATE_ONLY / GATING_SUBSET: no full-roster per-token stream —
-                # score the aggregate once from the tail ring.
-                agg_vals = self._score_aggregate_only(
-                    generated_ids, accumulate=not stateless,
-                )
-                per_token = {}
-            else:
-                if captured_stack:
-                    agg_vals, per_token = self._monitor.score_per_token(
-                        captured_stack, generated_ids, self._tokenizer,
-                        accumulate=not stateless,
-                    )
-                else:
-                    agg_vals, per_token = {}, {}
-            self._last_per_token_scores = per_token or None
-            if stateless:
-                # Stateless gens never touch the monitor's running history,
-                # so synthesize a single-generation ``ProbeReadings`` per
-                # probe straight from this gen's aggregate coordinate tuple
-                # (zero spread — one observation).  ``r.coords`` is the
-                # ``R``-tuple of authoring coords; a degenerate empty reading
-                # falls back to a single 0.0 axis.
-                readings = {}
-                for name, r in agg_vals.items():
-                    c = r.coords or (0.0,)
-                    zeros = tuple(0.0 for _ in c)
-                    readings[name] = ProbeReadings(
-                        per_generation=[c], mean=c, std=zeros,
-                        min=c, max=c, delta_per_gen=zeros,
-                    )
-            else:
-                readings = self.build_readings()
-        else:
-            self._last_per_token_scores = None
-            readings = self.build_readings()
-
-        hidden_states: dict[int, torch.Tensor] | None = None
-        if return_hidden and generated_ids and captured_stack:
-            raw = captured_stack  # {layer_idx: [n_captured, D] on device}
-            n = len(generated_ids)
-            trimmed: dict[int, torch.Tensor] = {}
-            for layer_idx, h in raw.items():
-                # Same EOS off-by-one trim score_per_token applies.
-                if h.shape[0] > n:
-                    h = h[:n]
-                elif h.shape[0] < n:
-                    # Under-capture: shouldn't happen on this code path, but
-                    # skip the layer rather than returning a short tensor the
-                    # caller would misalign with generated_ids.
-                    continue
-                # `.to("cpu")` from a device tensor allocates a fresh
-                # CPU tensor already; no redundant `.clone()` needed.
-                trimmed[layer_idx] = h.detach().to("cpu")
-            hidden_states = trimmed
-
-        # Geometric aggregate over the pooled captures — every attached probe
-        # (flat coords via the affine map, curved via the foot solve).  Skipped
-        # when no probe is attached or generation produced no tokens.  Reuses
-        # the captured stack the per-axis path consumed — no second forward pass.
-        manifold_aggregates: dict[str, Any] = {}
-        if self._monitor.probe_names and generated_ids:
-            # ``score_per_token`` / ``_score_incremental`` above already pools
-            # this same last-content-token aggregate and returns the full
-            # ProbeReading shape; reusing it avoids a second geometry pass and,
-            # on the incremental path, avoids retaining the full capture stack.
-            manifold_aggregates = dict(agg_vals)
-
-        result = GenerationResult(
-            text=text, tokens=list(generated_ids), token_count=token_count,
-            tok_per_sec=tok_per_sec, elapsed=elapsed,
-            readings=readings, vectors=vector_snapshot,
+        return finalize_generation(
+            self, input, generated_ids, elapsed, vector_snapshot,
             prompt_tokens=prompt_tokens,
-            finish_reason=self._gen_state.finish_reason,
-            logprobs=logprobs_list,
+            stateless=stateless,
+            logprobs_list=logprobs_list,
             applied_steering=applied_steering,
-            hidden_states=hidden_states,
-            probe_readings=manifold_aggregates,
+            return_hidden=return_hidden,
+            assistant_node_id=assistant_node_id,
+            mean_logprob=mean_logprob,
+            mean_surprise=mean_surprise,
+            min_elapsed_for_rate=MIN_ELAPSED_FOR_RATE,
         )
-        self._last_result = result
-
-        if readings:
-            # ``ProbeScored`` / the loom layer take a scalar per probe; the
-            # cross-gen ``mean`` is now a per-axis tuple, so collapse to
-            # coordinate axis 0 (the bare ``@when:<probe>`` channel).
-            scalar_readings = {
-                name: (r.mean[0] if r.mean else 0.0)
-                for name, r in readings.items()
-            }
-            self.events.emit(ProbeScored(readings=scalar_readings))
-
-        # Finalize the in-flight assistant node in the tree (loom v2.3).
-        # The user node was added by the gen preamble; the assistant node
-        # was created via ``begin_assistant`` and accumulated tokens along
-        # the way.  Stateless gens skip the entire tree mutation path —
-        # ``assistant_node_id`` is None on that branch.
-        # ``mean_logprob`` / ``mean_surprise`` come pre-computed from
-        # ``_generate_core`` (the only function with scope on the
-        # ``_token_tap`` accumulator); both are ``None`` when no logprob
-        # capture was live, so legacy paths land cleanly.
-        if not stateless and assistant_node_id is not None:
-            self._stamp_raw_indices(assistant_node_id)
-            self.tree.finalize_assistant(
-                assistant_node_id,
-                text=text,
-                # Loom nodes store one scalar per probe (``readings_diff``
-                # wants ``dict[str, float]``); collapse the per-axis ``mean``
-                # tuple to coordinate axis 0.
-                aggregate_readings={
-                    n: (r.mean[0] if r.mean else 0.0)
-                    for n, r in readings.items()
-                },
-                applied_steering=applied_steering,
-                finish_reason=self._gen_state.finish_reason,
-                mean_logprob=mean_logprob,
-                mean_surprise=mean_surprise,
-                raw_token_ids=generated_ids,
-            )
-
-        return result
 
     def _stamp_raw_indices(self, node_id: str) -> None:
         """Stamp each emitted token row with its ``generated_ids`` index.
@@ -5054,7 +5051,9 @@ class SaklasSession:
         list[Any] | None,
     ]:
         """Normalize per-call generation controls before model work."""
-        steering_obj = Steering.from_value(steering)
+        steering_obj = Steering.from_value(
+            steering, profile_names=set(self._profiles),
+        )
         if thinking is None:
             if steering_obj is not None and steering_obj.thinking is not None:
                 use_thinking_req = steering_obj.thinking
@@ -5179,7 +5178,15 @@ class SaklasSession:
         """Run the decode loop once capture and steering are installed."""
         cached_pkv = None
         cache_position_offset = 0
+        cached_static = False
         effective_input_ids = input_ids
+        static_cache_eligible = (
+            self._static_cache_active
+            and (
+                self._steering.all_fast_path()
+                or self._steering.static_steerable()
+            )
+        )
         # The cached prefix KV is unsteered.  It's safe to reuse whenever the
         # active steering doesn't touch the prefill region — ``@response`` /
         # ``@generated`` / probe-gated steering leaves the prompt KV identical
@@ -5192,15 +5199,20 @@ class SaklasSession:
             and not self._steering_active_in_prefill()
             and self._prefix_cache is not None
         ):
-            hit = self._try_prefix_cache_hit(input_ids)
+            hit = self._try_prefix_cache_hit(
+                input_ids,
+                static_eligible=static_cache_eligible,
+                required_max_new_tokens=gen_config.max_new_tokens,
+            )
             if hit is not None:
-                suffix_ids, cached_pkv, cache_position_offset = hit
+                suffix_ids, cached_pkv, cache_position_offset, cached_static = hit
                 effective_input_ids = suffix_ids
 
         start = time.monotonic()
+        composer = self._get_steering_composer()
         gating_callback = (
-            self._build_gating_score_callback()
-            if self._steering_needs_probe_gating()
+            composer.build_gating_score_callback()
+            if composer.steering_needs_probe_gating()
             else None
         )
         # StaticCache (+ compile fusion on MPS, + CUDA-graph capture on CUDA) is
@@ -5213,13 +5225,8 @@ class SaklasSession:
         # ``_static_cache_active`` is device-agnostic (set when compile stuck or
         # CUDA graphs are on).  Curved / gated / phased steering keeps the eager
         # DynamicCache path.
-        use_static_cache = (
-            self._static_cache_active
-            and cached_pkv is None
-            and (
-                self._steering.all_fast_path()
-                or self._steering.static_steerable()
-            )
+        use_static_cache = static_cache_eligible and (
+            cached_pkv is None or cached_static
         )
         # Compiled-model routing (MPS).  The graph was traced with ONLY the
         # persistent branchless offset + capture hooks present (attached
@@ -5243,7 +5250,9 @@ class SaklasSession:
                 or self._steering.all_fast_path()
             )
             if compiled_clean:
-                use_static_cache = self._static_cache_active and cached_pkv is None
+                use_static_cache = self._static_cache_active and (
+                    cached_pkv is None or cached_static
+                )
             else:
                 gen_model = getattr(self._model, "_orig_mod", self._model)
                 use_static_cache = False
@@ -5368,6 +5377,7 @@ class SaklasSession:
                 sampling is not None and sampling.persist_subspace_coords
             )
             self._monitor.set_subspace_coords(_persists_subspace_coords)
+            from saklas.core.token_payloads import build_token_probe_payload
 
             def _token_tap(text: str, is_thinking: bool, tid: int | None, lp: float | None, top_alts: Any, perplexity: float | None) -> None:
                 nonlocal mean_logprob_sum, mean_logprob_count
@@ -5377,11 +5387,6 @@ class SaklasSession:
                 if lp is not None and tid is not None and tid >= 0 and not is_thinking:
                     mean_logprob_sum += lp
                     mean_logprob_count += 1
-                latest_hidden_for_token: dict[int, torch.Tensor] | None = None
-                scores: dict[str, float] | None = None
-                vector_readings: dict[str, "ProbeReading"] | None = None
-                per_layer_payload: dict[str, dict[str, float]] | None = None
-                probe_readings = None
                 needs_scores = bool(
                     self._monitor.probe_names
                     and (
@@ -5391,79 +5396,23 @@ class SaklasSession:
                         or _persists_subspace_coords
                     )
                 )
-                # Lean-incremental rows carry coords+fraction only (FIX F2); the tap's
-                # consumers in lean mode read just axis-0 ``scores`` (the lean
-                # precondition rules out ``_wants_live_token_scores`` /
-                # ``_persists_layer_scores`` / ``_persists_subspace_coords``), so the
-                # stored lean rows are reused exactly like the full-incremental rows.
-                has_incremental_reading = bool(
-                    (self._capture_state.incremental or self._capture_state.lean)
-                    and self._incremental_readings
+                payload = build_token_probe_payload(
+                    monitor=self._monitor,
+                    capture=self._capture,
+                    capture_state=self._capture_state,
+                    incremental_readings=self._incremental_readings,
+                    needs_scores=needs_scores,
+                    wants_live_token_scores=_wants_live_token_scores,
+                    persists_layer_scores=_persists_layer_scores,
+                    assistant_node_id=assistant_node_id,
                 )
-                if needs_scores and not has_incremental_reading:
-                    latest_hidden_for_token = {
-                        layer_idx: bucket[-1]
-                        for layer_idx, bucket in self._capture.per_layer_buckets().items()
-                        if bucket
-                    }
-                if (
-                    needs_scores
-                    and has_incremental_reading
-                ):
-                    agg = self._incremental_readings[-1]
-                    if agg:
-                        vector_readings = agg
-                        scores = {
-                            p: (r.coords[0] if r.coords else 0.0)
-                            for p, r in agg.items()
-                        }
-                        if _wants_live_token_scores:
-                            probe_readings = agg
-                        if assistant_node_id is not None and _persists_layer_scores:
-                            by_layer: dict[str, dict[str, float]] = {}
-                            for p, r in agg.items():
-                                for layer, coord in r.coords_per_layer.items():
-                                    by_layer.setdefault(str(layer), {})[p] = round(
-                                        float(coord[0] if coord else 0.0), 6,
-                                    )
-                            per_layer_payload = by_layer or None
-                elif needs_scores and latest_hidden_for_token:
-                    # One unified pass over every probe shape — flat coords + curved
-                    # fraction/nearest in one dict.
-                    agg = self._monitor.score_single_token(latest_hidden_for_token)
-                    if agg:
-                        # Keep the full readings dict for the live-mean fold +
-                        # ``TokenEvent``; collapse to coordinate axis 0 for the
-                        # scalar trait stream + per-token ``probes`` row (the bare
-                        # ``@when:<probe>`` channel).
-                        vector_readings = agg
-                        scores = {
-                            p: (r.coords[0] if r.coords else 0.0)
-                            for p, r in agg.items()
-                        }
-                        # The per-token geometric wire field (full reading) only
-                        # when a client wants the live per-token stream.
-                        if _wants_live_token_scores:
-                            probe_readings = agg
-                        # Per-layer axis-0 heatmap row — read straight off the
-                        # full reading's ``coords_per_layer`` (no second pass).
-                        if assistant_node_id is not None and _persists_layer_scores:
-                            by_layer: dict[str, dict[str, float]] = {}
-                            for p, r in agg.items():
-                                for layer, coord in r.coords_per_layer.items():
-                                    by_layer.setdefault(str(layer), {})[p] = round(
-                                        float(coord[0] if coord else 0.0), 6,
-                                    )
-                            per_layer_payload = by_layer or None
-                self._last_token_probe_payload = {
-                    "scores": scores,
-                    "readings": vector_readings,
-                    "per_layer_scores": per_layer_payload,
-                    "probe_readings": probe_readings,
+                scores = payload.scores
+                per_layer_payload = payload.per_layer_scores
+                self._last_token_probe_payload = payload.to_token_payload(
                     # Live workspace readout (None when off): the step's
                     # top-k lens tokens per selected layer.
-                    "lens": self._live_lens_readout_step(),
-                }
+                    lens=self._live_lens_readout_step(),
+                )
                 if assistant_node_id is not None and tid is not None:
                     token_row: dict[str, Any] = {
                         "token_id": int(tid),
@@ -5537,10 +5486,11 @@ class SaklasSession:
             )
 
             # Compiled-clean eligibility for this gen, decided BEFORE the steering
-            # context enters (``steering_cm.__enter__`` runs ``_install_composed_steering``,
-            # which consults this to decide whether a probed gen may still lower
-            # steering to the persistent offset buffers — slice 2).  Eligible when the
-            # compiled MPS graph + static cache are live, the persistent capture
+            # context enters (``steering_cm.__enter__`` runs
+            # ``SteeringComposer.install_composed_steering``, which consults this
+            # to decide whether a probed gen may still lower steering to the
+            # persistent offset buffers — slice 2). Eligible when the compiled
+            # MPS graph + static cache are live, the persistent capture
             # buffers were adopted, and the caller didn't ask for the full per-step
             # hidden stack (``return_hidden`` keeps the transient full-retention
             # capture).  Capture then rides the persistent buffers; steering rides the
@@ -5610,7 +5560,8 @@ class SaklasSession:
             # Otherwise (probes attached but only the aggregate wanted, e.g. a
             # stateless server gen) the capture skips per-token scoring entirely
             # and pools the aggregate once at finalize.
-            _needs_gating = self._steering_needs_probe_gating()
+            composer = self._get_steering_composer()
+            _needs_gating = composer.steering_needs_probe_gating()
             # The five UI / trait / loom / persist consumers each need a
             # per-token reading for the FULL roster.  When NONE of them is live
             # but a probe gate is, gating is the SOLE per-token consumer (FIX
@@ -5626,12 +5577,12 @@ class SaklasSession:
             )
             need_per_token = bool(_needs_gating or _per_token_full_consumer)
             gating_only_probes: set[str] | None = (
-                self._gated_probe_names()
+                composer.gated_probe_names()
                 if (_needs_gating and not _per_token_full_consumer)
                 else None
             )
             gating_probe_keys: set[str] | None = (
-                self._gated_probe_keys()
+                composer.gated_probe_keys()
                 if (_needs_gating and not _per_token_full_consumer)
                 else None
             )
@@ -5822,38 +5773,94 @@ class SaklasSession:
             node_id = self.tree.active_node_id if not stateless else None
             return RunSet([result], node_ids=[node_id], kind="generation")
 
+        fast_fan = self._generate_fan_fast(
+            input,
+            steering=steering,
+            sampling=sampling,
+            stateless=stateless,
+            raw=raw,
+            thinking=thinking,
+            on_token=on_token,
+            parent_node_id=parent_node_id,
+            n=n,
+            recipe_override=recipe_override,
+        )
+        if fast_fan is not None:
+            return fast_fan
+
         # N-way regen: derive per-sibling seeds from the supplied base seed
         # (or a fresh entropy-derived one). Each iteration runs
         # ``_generate_core`` independently; ``add_user_turn`` dedups so all
         # siblings share the same user-parent.
         base_seed = sampling.seed if sampling is not None else None
         schedule = derive_seed_schedule(base_seed, n)
-        results: list[GenerationResult] = []
-        node_ids: list[str | None] = []
+        jobs: list[_SerialGenerationJob] = []
         for seed_i in schedule:
             from dataclasses import replace as _replace
             si = sampling if sampling is not None else SamplingConfig()
             si = _replace(si, seed=seed_i)
-            r = self._generate_core(
-                input,
+            jobs.append(_SerialGenerationJob(
+                input=input,
                 steering=steering,
                 sampling=si,
-                stateless=stateless,
                 raw=raw,
                 thinking=thinking,
                 on_token=on_token,
                 parent_node_id=parent_node_id,
                 recipe_override=recipe_override,
-            )
-            results.append(r)
-            node_ids.append(self.tree.active_node_id if not stateless else None)
-            # External stop requested mid-batch: cancel the remainder.
-            # Sibling boundaries are the only valid stop points.
-            if self._gen_state.stop_requested.is_set():
-                break
-        return RunSet(results, node_ids=node_ids, kind="fan")
+            ))
+        return _run_serial_generation_jobs(
+            self,
+            jobs,
+            stateless=stateless,
+            kind="fan",
+            stop_between_jobs=True,
+        )
 
     # -- Generation: blocking --
+
+    def _generate_fan_fast(
+        self,
+        input: Any,
+        *,
+        steering: "str | Steering | None",
+        sampling: SamplingConfig | None,
+        stateless: bool,
+        raw: bool,
+        thinking: bool | None,
+        on_token: Callable[..., None] | None,
+        parent_node_id: str | None,
+        n: int,
+        recipe_override: "Recipe | str | None",
+    ) -> RunSet | None:
+        """Batch deterministic fan-out without changing seed semantics."""
+        del parent_node_id
+        if (
+            n <= 1
+            or not stateless
+            or on_token is not None
+            or recipe_override is not None
+        ):
+            return None
+        if self._compose_gen_config(sampling).temperature > 0:
+            return None
+        fast = self._generate_batch_fast(
+            [input for _ in range(n)],
+            steering=steering,
+            sampling=sampling,
+            thinking=thinking,
+            stateless=stateless,
+            raw=raw,
+            on_result=None,
+        )
+        if fast is None:
+            return None
+        return RunSet(
+            fast,
+            node_ids=[None] * len(fast),
+            grid=[{} for _ in fast],
+            kind="fan",
+        )
 
     def generate(
         self,
@@ -6003,19 +6010,518 @@ class SaklasSession:
         worker = threading.Thread(target=_worker, daemon=True)
         worker.start()
 
-        try:
-            while True:
-                item = q.get()
-                if item is done:
-                    break
-                yield item
-        finally:
-            self._gen_state.stop_requested.set()
-            worker.join(timeout=5.0)
-            if exc_holder and not result_holder:
-                raise exc_holder[0]
+        def _events() -> Iterator[TokenEvent]:
+            try:
+                while True:
+                    item = q.get()
+                    if item is done:
+                        break
+                    yield item
+            finally:
+                self._gen_state.stop_requested.set()
+                worker.join()
+                if exc_holder and not result_holder:
+                    raise exc_holder[0]
+
+        class _GenerationStream:
+            def __init__(self, iterator: Iterator[TokenEvent]) -> None:
+                self._iterator = iterator
+
+            def __iter__(self) -> "_GenerationStream":
+                return self
+
+            def __next__(self) -> TokenEvent:
+                return next(self._iterator)
+
+            def close(self) -> None:
+                close = getattr(self._iterator, "close", None)
+                if callable(close):
+                    close()
+
+            @property
+            def result(self) -> GenerationResult | None:
+                return result_holder[0] if result_holder else None
+
+        return _GenerationStream(_events())
 
     # -- Generation: batch + sweep --
+
+    def _generate_batch_fast(
+        self,
+        prompts: list[Any],
+        *,
+        steering: "str | Steering | None",
+        sampling: SamplingConfig | None,
+        thinking: bool | None,
+        stateless: bool,
+        raw: bool,
+        on_result: Callable[[int, GenerationResult], None] | None,
+    ) -> RunSet | None:
+        """Run a compatible stateless batch through one HF ``generate`` call.
+
+        ``None`` means "fall back to the serial Saklas decode loop."  The fast
+        path is intentionally narrow: no per-token consumers/logprobs/stop
+        strings, no stateful loom writes, and only always-active steering.  When
+        probes are attached it uses a batched aggregate-only capture ring and
+        scores one final reading per row after decode; per-token probe gates and
+        streams stay on the serial Saklas loop.
+        """
+        if len(prompts) < 2 or not stateless:
+            return None
+        if not self._batch_fast_runtime_available():
+            return None
+        if self._batch_fast_sampling_blocked(sampling):
+            return None
+        if getattr(self, "_live_lens", None) is not None:
+            return None
+        if getattr(self, "_trait_queues", None):
+            return None
+        has_probes = bool(getattr(getattr(self, "_monitor", None), "probe_names", []))
+        if has_probes and not (
+            hasattr(self, "_layers")
+            and hasattr(self, "_capture")
+            and callable(getattr(self._monitor, "probe_layers", None))
+        ):
+            return None
+
+        (
+            steering_obj,
+            use_thinking_req,
+            gen_config,
+            lp_count,
+            seed,
+            stop_list,
+            logit_bias,
+            presence_penalty,
+            frequency_penalty,
+            logprobs_list,
+        ) = self._prepare_generation_call(steering, sampling, thinking)
+        if (
+            use_thinking_req
+            or gen_config.max_new_tokens < 1
+            or lp_count is not None
+            or (seed is not None and gen_config.temperature > 0)
+            or stop_list is not None
+            or logit_bias is not None
+            or presence_penalty != 0.0
+            or frequency_penalty != 0.0
+            or logprobs_list is not None
+            or not self._batch_fast_steering_is_always_on(steering_obj)
+        ):
+            return None
+
+        model = self._batch_generate_model()
+        if model is None:
+            return None
+
+        return self._run_generate_batch_fast(
+            prompts,
+            model=model,
+            steering_obj=steering_obj,
+            sampling=sampling,
+            gen_config=gen_config,
+            stateless=stateless,
+            raw=raw,
+            on_result=on_result,
+        )
+
+    @staticmethod
+    def _stateless_readings_from_probe_aggregate(
+        agg_vals: dict[str, ProbeReading],
+    ) -> dict[str, ProbeReadings]:
+        """Stateless ``GenerationResult.readings`` from one aggregate row."""
+        readings: dict[str, ProbeReadings] = {}
+        for name, reading in agg_vals.items():
+            coords = reading.coords or (0.0,)
+            zeros = tuple(0.0 for _ in coords)
+            readings[name] = ProbeReadings(
+                per_generation=[coords],
+                mean=coords,
+                std=zeros,
+                min=coords,
+                max=coords,
+                delta_per_gen=zeros,
+            )
+        return readings
+
+    def _finalize_batch_probe_result(
+        self,
+        *,
+        generated_ids: list[int],
+        elapsed: float,
+        vector_snapshot: dict[str, float],
+        prompt_tokens: int,
+        finish_reason: str,
+        applied_steering: str | None,
+        probe_readings: dict[str, ProbeReading],
+    ) -> GenerationResult:
+        """Build a stateless batch result with pre-scored probe aggregates."""
+        token_count = len(generated_ids)
+        tok_per_sec = (
+            token_count / elapsed if elapsed > MIN_ELAPSED_FOR_RATE else 0.0
+        )
+        decoded = self._tokenizer.decode(generated_ids, skip_special_tokens=True)
+        text = decoded if isinstance(decoded, str) else decoded[0]
+        readings = self._stateless_readings_from_probe_aggregate(probe_readings)
+        result = GenerationResult(
+            text=text,
+            tokens=list(generated_ids),
+            token_count=token_count,
+            tok_per_sec=tok_per_sec,
+            elapsed=elapsed,
+            readings=readings,
+            vectors=vector_snapshot,
+            prompt_tokens=prompt_tokens,
+            finish_reason=finish_reason,
+            logprobs=None,
+            applied_steering=applied_steering,
+            hidden_states=None,
+            probe_readings=probe_readings,
+        )
+        self._last_result = result
+        self._last_per_token_scores = None
+        if readings:
+            scalar_readings = {
+                name: (reading.mean[0] if reading.mean else 0.0)
+                for name, reading in readings.items()
+            }
+            self.events.emit(ProbeScored(readings=scalar_readings))
+        return result
+
+    def _batch_probe_aggregate_for_row(
+        self,
+        row_index: int,
+        generated_ids: list[int],
+        probe_names: list[str],
+    ) -> dict[str, ProbeReading]:
+        """Score the final aggregate probe reading for one batched row."""
+        empty = self._empty_readings(probe_names)
+        if not generated_ids:
+            return empty
+        from saklas.core.vectors import last_content_index
+        agg_fwd = last_content_index(generated_ids, self._tokenizer)
+        pooled = self._capture.batch_tail_slice_at(row_index, agg_fwd)
+        if not pooled:
+            return empty
+        self._monitor.enable_curved_warm(False)
+        agg_vals = self._monitor.score_aggregate(pooled)
+        return {name: agg_vals.get(name, empty[name]) for name in probe_names}
+
+    def _batch_fast_runtime_available(self) -> bool:
+        """Return True when a real session has the pieces the fast path uses."""
+        required = (
+            "_model",
+            "_tokenizer",
+            "_device",
+            "_gen_lock",
+            "_gen_phase",
+            "_gen_state",
+            "_monitor",
+            "_profiles",
+            "_steering",
+            "_default_return_top_k",
+            "config",
+            "events",
+        )
+        return all(hasattr(self, name) for name in required)
+
+    @staticmethod
+    def _batch_fast_sampling_blocked(sampling: SamplingConfig | None) -> bool:
+        """True iff per-row custom-loop sampling features are requested."""
+        if sampling is None:
+            return False
+        return bool(
+            sampling.stop is not None
+            or sampling.logit_bias is not None
+            or sampling.presence_penalty != 0.0
+            or sampling.frequency_penalty != 0.0
+            or sampling.logprobs is not None
+            or sampling.return_hidden
+            or sampling.return_top_k != 0
+            or sampling.persist_per_layer_scores
+            or sampling.persist_subspace_coords
+        )
+
+    @staticmethod
+    def _batch_fast_steering_is_always_on(
+        steering_obj: Steering | None,
+    ) -> bool:
+        """HF ``generate`` can batch only trigger-free/``Trigger.BOTH`` terms."""
+        if steering_obj is None:
+            return True
+        for entry in steering_obj.alphas.values():
+            if isinstance(entry, (ProjectedTerm, AblationTerm, ManifoldTerm)):
+                trigger = entry.trigger
+            elif isinstance(entry, tuple):
+                trigger = entry[1]
+            else:
+                trigger = steering_obj.trigger
+            if trigger is not Trigger.BOTH:
+                return False
+        return True
+
+    def _batch_generate_model(self) -> Any | None:
+        """Model object exposing ``generate``; unwrap compiled modules if needed."""
+        model = self._model
+        if callable(getattr(model, "generate", None)):
+            return model
+        orig = getattr(model, "_orig_mod", None)
+        if orig is not None and callable(getattr(orig, "generate", None)):
+            return orig
+        return None
+
+    def _batch_pad_token_id(self) -> int:
+        """Pad id for left-padded generation batches."""
+        for attr in ("pad_token_id", "eos_token_id"):
+            value = getattr(self._tokenizer, attr, None)
+            if value is None:
+                continue
+            if isinstance(value, (list, tuple)):
+                if value:
+                    return int(value[0])
+            else:
+                return int(value)
+        return 0
+
+    def _prepare_batch_input_ids(
+        self,
+        prompts: list[Any],
+        *,
+        sampling: SamplingConfig | None,
+        raw: bool,
+        pad_id: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
+        """Render and left-pad a stateless prompt batch."""
+        rendered: list[torch.Tensor] = []
+        user_role = sampling.user_role if sampling is not None else None
+        assistant_role = sampling.assistant_role if sampling is not None else None
+        for prompt in prompts:
+            ids = self._prepare_input(
+                prompt,
+                raw=raw,
+                thinking=False,
+                stateless=True,
+                user_role=user_role,
+                assistant_role=assistant_role,
+                to_device=False,
+            )
+            if ids.ndim != 2 or ids.shape[0] != 1:
+                raise RuntimeError(
+                    "generate_batch fast path expected rendered prompt shape [1, T]"
+                )
+            rendered.append(ids[0].detach().to(device="cpu", dtype=torch.long))
+
+        lengths = [int(ids.shape[0]) for ids in rendered]
+        max_len = max(lengths)
+        batch = torch.full(
+            (len(rendered), max_len), pad_id, dtype=torch.long,
+        )
+        attention = torch.zeros_like(batch)
+        for row, ids in enumerate(rendered):
+            length = lengths[row]
+            batch[row, max_len - length:] = ids
+            attention[row, max_len - length:] = 1
+        return (
+            batch.to(self._device),
+            attention.to(self._device),
+            lengths,
+        )
+
+    @staticmethod
+    def _batch_generated_tokens(
+        row: torch.Tensor,
+        *,
+        eos_ids: set[int],
+        pad_id: int,
+        max_new_tokens: int,
+    ) -> tuple[list[int], str]:
+        """Trim HF batch output into Saklas' generated-token convention."""
+        raw_ids = [int(tok) for tok in row.detach().to("cpu").tolist()]
+        tokens: list[int] = []
+        finish_reason = "length"
+        for token_id in raw_ids:
+            if token_id in eos_ids:
+                finish_reason = "stop"
+                break
+            tokens.append(token_id)
+        else:
+            stripped_pad = False
+            while tokens and tokens[-1] == pad_id:
+                tokens.pop()
+                stripped_pad = True
+            if stripped_pad or len(tokens) < max_new_tokens:
+                finish_reason = "stop"
+        return tokens, finish_reason
+
+    def _run_generate_batch_fast(
+        self,
+        prompts: list[Any],
+        *,
+        model: Any,
+        steering_obj: Steering | None,
+        sampling: SamplingConfig | None,
+        gen_config: GenerationConfig,
+        stateless: bool,
+        raw: bool,
+        on_result: Callable[[int, GenerationResult], None] | None,
+    ) -> RunSet:
+        """Implementation of the compatible batched ``model.generate`` path."""
+        if not self._gen_lock.acquire(blocking=False):
+            raise ConcurrentGenerationError("Generation already in progress")
+        if self._gen_phase is not GenState.IDLE:
+            self._gen_lock.release()
+            raise ConcurrentGenerationError("session generation already in flight")
+
+        self._gen_phase = GenState.PREAMBLE
+        steering_cm = None
+        failed = False
+        try:
+            if steering_obj is not None and steering_obj.alphas:
+                steering_cm = self.steering(steering_obj)
+                steering_cm.__enter__()
+            vector_snapshot: dict[str, float] = (
+                self._snapshot_steering_alphas()
+                if self._steering_stack or steering_cm is not None
+                else {}
+            )
+            pad_id = self._batch_pad_token_id()
+            input_ids, attention_mask, prompt_lengths = self._prepare_batch_input_ids(
+                prompts,
+                sampling=sampling,
+                raw=raw,
+                pad_id=pad_id,
+            )
+            probe_names = list(getattr(self._monitor, "probe_names", []))
+            if probe_names:
+                layer_idxs = sorted(self._monitor.probe_layers())
+                self._capture.clear()
+                if layer_idxs:
+                    self._capture.attach_batch_tail(
+                        self._layers,
+                        layer_idxs,
+                        depth=_AGG_TAIL_DEPTH,
+                    )
+                self._capture_state = CaptureState(mode=CaptureMode.AGGREGATE_ONLY)
+                self._monitor.enable_curved_warm(False)
+            self._gen_state.reset()
+            self._steering.ctx.reset()
+            self._steering.reset_manifold_feet()
+            self._gen_phase = GenState.RUNNING
+            for prompt in prompts:
+                self.events.emit(GenerationStarted(input=prompt, stateless=stateless))
+
+            generate_kwargs: dict[str, Any] = {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "max_new_tokens": int(gen_config.max_new_tokens),
+                "pad_token_id": pad_id,
+                "stopping_criteria": StoppingCriteriaList([
+                    _SessionStopCriteria(self._gen_state),
+                ]),
+            }
+            eos_token_id = getattr(self._tokenizer, "eos_token_id", None)
+            if eos_token_id is not None:
+                generate_kwargs["eos_token_id"] = eos_token_id
+            do_sample = gen_config.temperature > 0
+            generate_kwargs["do_sample"] = do_sample
+            if do_sample:
+                generate_kwargs["temperature"] = float(gen_config.temperature)
+                generate_kwargs["top_p"] = float(gen_config.top_p)
+                if gen_config.top_k is not None:
+                    generate_kwargs["top_k"] = int(gen_config.top_k)
+
+            start = time.monotonic()
+            with torch.inference_mode():
+                generated = model.generate(**generate_kwargs)
+            elapsed = time.monotonic() - start
+            if probe_names:
+                self._end_capture()
+            sequences = getattr(generated, "sequences", generated)
+            if not isinstance(sequences, torch.Tensor) or sequences.ndim != 2:
+                raise RuntimeError(
+                    "generate_batch fast path expected model.generate to return "
+                    "a [batch, sequence] tensor"
+                )
+
+            eos_ids = _get_eos_ids(model, self._tokenizer)
+            max_prompt_len = int(input_ids.shape[1])
+            self._gen_phase = GenState.FINALIZING
+            results: list[GenerationResult] = []
+            node_ids: list[str | None] = []
+            grid_rows: list[dict[str, Any]] = []
+            applied_steering = (
+                str(steering_obj) if steering_obj is not None else None
+            )
+            for idx, prompt in enumerate(prompts):
+                generated_ids, finish_reason = self._batch_generated_tokens(
+                    sequences[idx, max_prompt_len:],
+                    eos_ids=eos_ids,
+                    pad_id=pad_id,
+                    max_new_tokens=int(gen_config.max_new_tokens),
+                )
+                self._gen_state.thinking_end_idx = 0
+                self._gen_state.emit_map = []
+                self._gen_state.response_text = None
+                self._gen_state.response_aggregate_index = None
+                self._gen_state.finish_reason = finish_reason
+                if probe_names:
+                    probe_readings = self._batch_probe_aggregate_for_row(
+                        idx,
+                        generated_ids,
+                        probe_names,
+                    )
+                    result = self._finalize_batch_probe_result(
+                        generated_ids=generated_ids,
+                        elapsed=elapsed,
+                        vector_snapshot=vector_snapshot,
+                        prompt_tokens=prompt_lengths[idx],
+                        finish_reason=finish_reason,
+                        applied_steering=applied_steering,
+                        probe_readings=probe_readings,
+                    )
+                else:
+                    result = self._finalize_generation(
+                        prompt,
+                        generated_ids,
+                        elapsed,
+                        vector_snapshot,
+                        prompt_tokens=prompt_lengths[idx],
+                        stateless=stateless,
+                        logprobs_list=None,
+                        applied_steering=applied_steering,
+                        return_hidden=False,
+                        assistant_node_id=None,
+                    )
+                results.append(result)
+                node_ids.append(None)
+                row = {"prompt_index": idx}
+                grid_rows.append(row)
+                self.events.emit(GenerationFinished(result=result))
+                if on_result is not None:
+                    on_result(idx, result)
+            self._gen_state.stop_requested.set()
+            return RunSet(results, node_ids=node_ids, grid=grid_rows, kind="batch")
+        except BaseException:
+            failed = True
+            raise
+        finally:
+            try:
+                if steering_cm is not None:
+                    self._exit_internal_steering(steering_cm, swallow=failed)
+            finally:
+                if hasattr(self, "_capture"):
+                    self._end_capture()
+                self._active_gen_reservation = None
+                self._last_token_probe_payload = None
+                self._capture_state = CaptureState()
+                self._compiled_clean_eligible = False
+                self._incremental_readings = []
+                self._incremental_gate_scores = []
+                self._steering_uses_compiled_offsets = False
+                if self._steering.has_compiled_offsets():
+                    self._steering.zero_compiled_offsets()
+                self._gen_phase = GenState.IDLE
+                self._gen_lock.release()
 
     def generate_batch(
         self,
@@ -6030,11 +6536,14 @@ class SaklasSession:
     ) -> RunSet:
         """Run N prompts under the same steering, return a ``RunSet``.
 
-        Wrapper-loop over the existing single-prompt generation path:
-        each prompt acquires the gen-lock, runs through ``_generate_core``,
-        releases.  The session's threading lock keeps concurrent
-        ``generate_batch`` calls from interleaving — they queue FIFO at
-        the per-call level, same as today's ``generate``.
+        Compatible stateless batches run through one ``transformers.generate``
+        call, including aggregate-only probe reads via batched tail capture.
+        Anything that needs Saklas' row-shaped custom loop (stateful history,
+        live lens, hidden capture returns, logprobs, stop strings, seeded
+        per-row sampling, penalties, or phased/gated triggers) falls back to the
+        serial single-prompt path.  The session's threading lock keeps concurrent
+        ``generate_batch`` calls from interleaving — they queue FIFO at the
+        per-call level, same as today's ``generate``.
 
         Args mirror ``generate``.  ``stateless`` defaults to ``True``
         (batch generation is overwhelmingly used for sweeps and evals
@@ -6064,35 +6573,49 @@ class SaklasSession:
         if not isinstance(prompts_in, list) or not prompts_in:
             raise ValueError("generate_batch: prompts must be a non-empty list")
 
+        fast = self._generate_batch_fast(
+            prompts,
+            steering=steering,
+            sampling=sampling,
+            thinking=thinking,
+            stateless=stateless,
+            raw=raw,
+            on_result=on_result,
+        )
+        if fast is not None:
+            return fast
+
         prefix_cached = self._maybe_cache_batch_prefix(
             prompts, steering=steering, sampling=sampling,
             thinking=thinking, stateless=stateless, raw=raw,
         )
         try:
-            results: list[GenerationResult] = []
-            node_ids: list[str | None] = []
-            for idx, prompt in enumerate(prompts):
-                r = self._generate_core(
-                    prompt,
+            jobs = [
+                _SerialGenerationJob(
+                    input=prompt,
                     steering=steering,
                     sampling=sampling,
-                    stateless=stateless,
                     raw=raw,
                     thinking=thinking,
+                    grid={"prompt_index": idx},
                 )
-                results.append(r)
-                node_ids.append(self.tree.active_node_id if not stateless else None)
-                if on_result is not None:
-                    on_result(idx, r)
+                for idx, prompt in enumerate(prompts)
+            ]
+            runset = _run_serial_generation_jobs(
+                self,
+                jobs,
+                stateless=stateless,
+                kind="batch",
+                on_result=(
+                    (lambda idx, result, _row: on_result(idx, result))
+                    if on_result is not None
+                    else None
+                ),
+            )
         finally:
             if prefix_cached:
                 self.cache_prefix(None)
-        return RunSet(
-            results,
-            node_ids=node_ids,
-            grid=[{"prompt_index": i} for i in range(len(results))],
-            kind="batch",
-        )
+        return runset
 
     def _maybe_cache_batch_prefix(
         self,
@@ -6128,7 +6651,22 @@ class SaklasSession:
             common = self._batch_common_prefix_ids(prompts, raw=raw)
             if common is None:
                 return False
-            return self.cache_prefix(common) >= _PREFIX_CACHE_MIN_TOKENS
+            max_new_tokens = (
+                sampling.max_tokens
+                if sampling is not None and sampling.max_tokens is not None
+                else self.config.max_new_tokens
+            )
+            return (
+                self.cache_prefix(
+                    common,
+                    max_new_tokens=max_new_tokens,
+                    prefer_static=bool(
+                        getattr(self, "_static_cache_active", False)
+                        and steering is None
+                    ),
+                )
+                >= _PREFIX_CACHE_MIN_TOKENS
+            )
         except Exception as exc:
             # Prefix caching is a pure optimization: a cache_prefix guard
             # (active scope / in-flight gen), a render failure, or an
@@ -6174,6 +6712,66 @@ class SaklasSession:
         if common < _PREFIX_CACHE_MIN_TOKENS:
             return None
         return ref[:common].clone()
+
+    def _generate_sweep_fast(
+        self,
+        jobs: list[_SerialGenerationJob],
+        *,
+        stateless: bool,
+        on_result: Callable[[int, GenerationResult, dict[str, Any]], None] | None,
+    ) -> RunSet | None:
+        """Fast path for exact degenerate sweeps.
+
+        Different alpha rows intentionally install different hook coefficients,
+        so they must stay on the serial path until the hook layer can carry
+        per-row steering.  When every row resolves to the same steering
+        expression, however, a stateless greedy sweep is equivalent to a batch
+        of repeated prompts under one steering scope; route that through the
+        shared ``generate_batch`` fast path.
+        """
+        if len(jobs) < 2 or not stateless:
+            return None
+        if not self._batch_fast_runtime_available():
+            return None
+        first = jobs[0]
+        gen_config = self._compose_gen_config(first.sampling)
+        if gen_config.temperature > 0:
+            return None
+        for job in jobs[1:]:
+            if (
+                job.input != first.input
+                or job.steering != first.steering
+                or job.raw != first.raw
+                or job.thinking != first.thinking
+                or job.recipe_override is not None
+                or self._compose_gen_config(job.sampling).temperature > 0
+            ):
+                return None
+
+        def _batch_on_result(
+            idx: int,
+            result: GenerationResult,
+        ) -> None:
+            if on_result is not None:
+                on_result(idx, result, jobs[idx].grid or {})
+
+        fast = self._generate_batch_fast(
+            [job.input for job in jobs],
+            steering=first.steering,
+            sampling=first.sampling,
+            thinking=first.thinking,
+            stateless=True,
+            raw=first.raw,
+            on_result=_batch_on_result if on_result is not None else None,
+        )
+        if fast is None:
+            return None
+        return RunSet(
+            list(fast),
+            node_ids=[None] * len(fast),
+            grid=[job.grid or {} for job in jobs],
+            kind="fan",
+        )
 
     def generate_sweep(
         self,
@@ -6266,9 +6864,7 @@ class SaklasSession:
         else:
             gen_parent_id = parent_node_id
 
-        results: list[GenerationResult] = []
-        sibling_node_ids: list[str | None] = []
-        grid_rows: list[dict[str, float]] = []
+        jobs: list[_SerialGenerationJob] = []
         for idx, combo in enumerate(itertools.product(*alpha_lists)):
             alpha_values = dict(zip(concept_names, combo, strict=True))
             alpha_values = {k: float(v) for k, v in alpha_values.items()}
@@ -6281,30 +6877,44 @@ class SaklasSession:
             si = sampling if sampling is not None else SamplingConfig()
             si = _replace(si, seed=seed_schedule[idx])
 
-            r = self._generate_core(
-                prompt,
+            jobs.append(_SerialGenerationJob(
+                input=prompt,
                 steering=expr,
                 sampling=si,
-                stateless=stateless,
                 raw=raw,
                 thinking=thinking,
                 parent_node_id=gen_parent_id,
-            )
-            results.append(r)
-            # The sibling's assistant node id is the active node after
-            # ``_generate_core`` returns — ``finalize_assistant`` leaves
-            # it active so the path-walker view stays coherent.
-            sib_id = self.tree.active_node_id if not stateless else None
-            sibling_node_ids.append(sib_id)
-            grid_rows.append(alpha_values)
-            if on_result is not None:
-                on_result(idx, r, alpha_values)
+                grid=alpha_values,
+            ))
 
-        return RunSet(
-            results,
-            node_ids=sibling_node_ids,
-            grid=grid_rows,
+        fast_sweep_fn = getattr(self, "_generate_sweep_fast", None)
+        if callable(fast_sweep_fn):
+            fast_sweep = fast_sweep_fn(
+                jobs,
+                stateless=stateless,
+                on_result=(
+                    (lambda idx, result, row: on_result(
+                        idx, result, cast(dict[str, float], row),
+                    ))
+                    if on_result is not None
+                    else None
+                ),
+            )
+            if fast_sweep is not None:
+                return cast(RunSet, fast_sweep)
+
+        return _run_serial_generation_jobs(
+            self,
+            jobs,
+            stateless=stateless,
             kind="fan",
+            on_result=(
+                (lambda idx, result, row: on_result(
+                    idx, result, cast(dict[str, float], row),
+                ))
+                if on_result is not None
+                else None
+            ),
         )
 
     # -- Generation control --

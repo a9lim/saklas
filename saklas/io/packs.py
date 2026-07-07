@@ -14,7 +14,7 @@ infrastructure several layers still share:
 - ``PACK_FORMAT_VERSION`` — the legacy-vector-folder migration sentinel: a v2
   ``vectors/`` pack (``format_version`` below this) is *legacy*, ported to a
   2-node ``pca`` manifold on first touch
-  (:meth:`saklas.core.session.SaklasSession._port_stale_legacy_vector` /
+  (:meth:`saklas.core.steering_composer.SteeringComposer.port_stale_legacy_vector` /
   ``scripts/upgrade_packs.py``).  Also stamped onto the profile-cache sidecars
   written by :func:`saklas.core.vectors.save_profile`.
 """
@@ -34,8 +34,8 @@ NAME_REGEX = re.compile(r"^[a-z][a-z0-9._-]{0,63}$")
 # K=2 case of a flat affine subspace, so the canonical artifact for a concept
 # is now a 2-node ``pca`` manifold under ``manifolds/``, not a baked DiM tensor
 # under ``vectors/``.  v2 vector packs are legacy: ``scripts/upgrade_packs.py``
-# (and ``_port_stale_legacy_vector``) port statements-bearing folders to
-# manifolds on touch.
+# (and ``SteeringComposer.port_stale_legacy_vector``) port statements-bearing
+# folders to manifolds on touch.
 PACK_FORMAT_VERSION = 3
 
 

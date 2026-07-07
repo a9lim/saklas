@@ -13,6 +13,7 @@ from saklas.cli.parsers import (
     _EXPERIMENT_VERBS, _LENS_VERBS, _MANIFOLD_VERBS, _PACK_VERBS, _TEMPLATE_VERBS,
 )
 from saklas.core.errors import SaklasError
+from saklas.core.histogram import summarize_diagnostics
 from saklas.core.stats import median_or_zero
 from saklas.io.paths import VARIANT_SUFFIX_RE
 
@@ -965,7 +966,7 @@ def _run_manifold_why(args: argparse.Namespace) -> None:
                 str(layer): {k: round(float(v), 6) for k, v in metrics.items()}
                 for layer, metrics in sorted(diagnostics.items())
             }
-            result["diagnostics_summary"] = _summarize_diagnostics(diagnostics)
+            result["diagnostics_summary"] = summarize_diagnostics(diagnostics)
         print(_json.dumps(result, indent=2))
     else:
         _print_why_histogram(concept_name, args.model, total_layers, layer_mags)
@@ -973,57 +974,9 @@ def _run_manifold_why(args: argparse.Namespace) -> None:
             _print_diagnostics(diagnostics)
 
 
-def _summarize_diagnostics(
-    diagnostics: dict[int, dict[str, float]],
-) -> dict[str, float | str]:
-    """Aggregate per-layer metrics into a small summary block.
-
-    Reports medians (robust to outlier layers) for the four metrics, plus
-    a coarse ``quality`` stoplight derived from the same thresholds the
-    extraction-time warning uses.  Mirrored in the JSON output so callers
-    don't have to recompute it client-side.
-    """
-    evrs = [m["evr"] for m in diagnostics.values() if "evr" in m]
-    intras = [
-        m["intra_pair_variance_mean"]
-        for m in diagnostics.values()
-        if "intra_pair_variance_mean" in m
-    ]
-    aligns = [
-        m["inter_pair_alignment"]
-        for m in diagnostics.values()
-        if "inter_pair_alignment" in m
-    ]
-    projs = [
-        m["diff_principal_projection"]
-        for m in diagnostics.values()
-        if "diff_principal_projection" in m
-    ]
-
-    med_evr = median_or_zero(evrs)
-    med_intra = median_or_zero(intras)
-    med_align = median_or_zero(aligns)
-    med_proj = median_or_zero(projs)
-
-    if (med_evr > 0.95 and med_intra < 0.01) or med_align < 0.2:
-        quality = "poor"
-    elif med_align < 0.4 or med_evr < 0.2:
-        quality = "shaky"
-    else:
-        quality = "solid"
-
-    return {
-        "median_evr": round(med_evr, 4),
-        "median_intra_pair_variance": round(med_intra, 4),
-        "median_inter_pair_alignment": round(med_align, 4),
-        "median_diff_principal_projection": round(med_proj, 4),
-        "quality": quality,
-    }
-
-
 def _print_diagnostics(diagnostics: dict[int, dict[str, float]]) -> None:
     """Render the diagnostics summary + per-layer table beneath the histogram."""
-    summary = _summarize_diagnostics(diagnostics)
+    summary = summarize_diagnostics(diagnostics)
     quality = summary["quality"]
     print()
     print(f"  DIAGNOSTICS (probe quality: {quality}):")
@@ -2304,10 +2257,14 @@ def _parse_layer_list(raw: "str | None") -> "list[int] | None":
     if raw is None:
         return None
     try:
-        return [int(part) for part in raw.split(",") if part.strip() != ""]
+        layers = [int(part) for part in raw.split(",") if part.strip() != ""]
     except ValueError:
         print(f"lens: bad --layers value {raw!r} (want e.g. 12,24,36)", file=sys.stderr)
         sys.exit(2)
+    if not layers:
+        print("lens: --layers must name at least one source layer", file=sys.stderr)
+        sys.exit(2)
+    return layers
 
 
 def _load_lens_corpus(args: argparse.Namespace) -> tuple[list[str], str]:
