@@ -8,7 +8,7 @@ import warnings
 from collections.abc import Sequence
 from importlib import resources as _resources
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import torch
 
@@ -62,7 +62,11 @@ def _capture_all_hidden_states(
         torch.arange(input_ids.shape[0], device=input_ids.device)
         if per_row else None
     )
-    _pos = pool_index.to(input_ids.device) if isinstance(pool_index, torch.Tensor) else None
+    _pos = (
+        cast(torch.Tensor, pool_index).to(input_ids.device)
+        if isinstance(pool_index, torch.Tensor)
+        else None
+    )
 
     def _make_hook(idx: int):
         def _hook(module: torch.nn.Module, input: Any, output: Any):

@@ -17,7 +17,7 @@ import asyncio
 import json
 import logging
 import shutil
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Literal, cast
 
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -800,12 +800,13 @@ def register_manifold_routes(app: FastAPI) -> None:
 
             def _format_error(e: Exception) -> dict[str, Any] | None:
                 if isinstance(e, HTTPException):
+                    http_error = cast(HTTPException, e)
                     # The generate job only raises HTTPException to wrap a
                     # ManifoldFormatError, whose detail embeds the on-disk
                     # manifold path.  Log the detail server-side and surface a
                     # path-free frame (SSE info-disclosure discipline — see
                     # server/AGENTS.md).
-                    log.warning("manifold generate: format error: %s", e.detail)
+                    log.warning("manifold generate: format error: %s", http_error.detail)
                     return {
                         "message": "manifold has an unsupported on-disk format",
                         "code": "ManifoldFormatError",

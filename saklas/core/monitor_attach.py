@@ -604,11 +604,12 @@ def _compute_assign_bandwidth(
         wsum += w
     if acc is None:
         return None, None
+    acc_t = acc
     if wsum > _MIN_SHARE_WEIGHT:
-        acc = acc / wsum
+        acc_t = acc_t / wsum
     # Floor positive so the softmax denominator never divides by ~0.
-    med = float(acc.median().clamp(min=1e-6))
-    tau = acc.clamp(min=1e-3 * med).to(torch.float32)
+    med = float(acc_t.median().clamp(min=1e-6))
+    tau = acc_t.clamp(min=1e-3 * med).to(torch.float32)
     # Gaussian log-volume bias ``−R·log(τ)`` for the soft-assignment logit.
     # ``R`` = the manifold's per-layer subspace rank (rank-uniform across a
     # fit's layers), the effective dimension of the space the bandwidth ``τ``

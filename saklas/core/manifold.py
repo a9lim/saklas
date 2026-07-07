@@ -44,7 +44,7 @@ import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Sequence
+from typing import TYPE_CHECKING, Any, Sequence, cast
 
 import torch
 from safetensors.torch import load_file, save_file
@@ -1624,7 +1624,7 @@ class Manifold:
         """Coerce ``float | Sequence[float] | Tensor`` to a ``(n,)`` tensor."""
         n = self.domain.intrinsic_dim
         if isinstance(position, torch.Tensor):
-            pos = position.to(device=device, dtype=dtype).reshape(-1)
+            pos = cast(torch.Tensor, position).to(device=device, dtype=dtype).reshape(-1)
         else:
             if isinstance(position, (int, float)):
                 position = (float(position),)
@@ -1683,7 +1683,8 @@ class Manifold:
             row = self.node_coords[idx]
             return tuple(float(c) for c in row.tolist())
         if isinstance(position, torch.Tensor):
-            return tuple(float(c) for c in position.reshape(-1).tolist())
+            tensor_position = cast(torch.Tensor, position)
+            return tuple(float(c) for c in tensor_position.reshape(-1).tolist())
         if isinstance(position, (int, float)):
             return (float(position),)
         return tuple(float(c) for c in position)

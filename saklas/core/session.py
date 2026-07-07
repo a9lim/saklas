@@ -3408,9 +3408,12 @@ class SaklasSession:
                 and not final_probe_aggregate
                 and self._monitor.probe_names
             )
-            union: set[int] = self._monitor.probe_layers(
-                set(gating_only_probes) if gate_only_no_final else None,
+            gate_probe_names = (
+                set(gating_only_probes)
+                if gate_only_no_final and gating_only_probes is not None
+                else None
             )
+            union: set[int] = self._monitor.probe_layers(gate_probe_names)
             if live_lens is not None:
                 # The live workspace readout consumes the same latest-slice
                 # buffers the monitor does — its layers join the capture set.
@@ -4617,7 +4620,7 @@ class SaklasSession:
 
         # Build prefix tokens.
         if isinstance(messages, torch.Tensor):
-            prefix_ids = messages
+            prefix_ids = cast(torch.Tensor, messages)
             if prefix_ids.dim() == 1:
                 prefix_ids = prefix_ids.unsqueeze(0)
             prefix_ids = prefix_ids.to(device=self._device, dtype=torch.long)
@@ -5109,14 +5112,15 @@ class SaklasSession:
             steering, profile_names=set(self._profiles),
         )
         if thinking is None:
+            config_thinking = getattr(self.config, "thinking", None)
             if steering_obj is not None and steering_obj.thinking is not None:
-                use_thinking_req = steering_obj.thinking
-            elif getattr(self.config, "thinking", None) is not None:
-                use_thinking_req = self.config.thinking
+                use_thinking_req = bool(steering_obj.thinking)
+            elif config_thinking is not None:
+                use_thinking_req = bool(config_thinking)
             else:
                 use_thinking_req = supports_thinking(self._tokenizer)
         else:
-            use_thinking_req = thinking
+            use_thinking_req = bool(thinking)
 
         gen_config = self._compose_gen_config(sampling)
         raw_lp = sampling.logprobs if sampling is not None else None

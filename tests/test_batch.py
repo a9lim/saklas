@@ -78,11 +78,12 @@ class _NoopSteeringContext:
 
 
 def _install_noop_steering(session: SaklasSession) -> None:
-    session._profiles = {"a": {}}
-    session.steering = lambda _value: _NoopSteeringContext()
-    session._snapshot_steering_alphas = lambda: {"a": 0.0}
-    session._exit_internal_steering = (
-        lambda cm, *, swallow: cm.__exit__(None, None, None)
+    session_any = cast(Any, session)
+    session_any._profiles = {"a": {}}
+    session_any.steering = lambda value: _NoopSteeringContext()
+    session_any._snapshot_steering_alphas = lambda: {"a": 0.0}
+    session_any._exit_internal_steering = (
+        lambda steering_cm, *, swallow: steering_cm.__exit__(None, None, None)
     )
 
 
@@ -174,13 +175,14 @@ def _fast_batch_session():
 
     s = SaklasSession.__new__(SaklasSession)
     model = _BatchModel()
-    s._model = model
-    s._tokenizer = _BatchTokenizer()
+    s_any = cast(Any, s)
+    s_any._model = model
+    s_any._tokenizer = _BatchTokenizer()
     s._device = torch.device("cpu")
-    s._gen_lock = threading.Lock()
+    s_any._gen_lock = threading.Lock()
     s._gen_phase = GenState.IDLE
     s._gen_state = GenerationState()
-    s._monitor = SimpleNamespace(probe_names=[])
+    s_any._monitor = SimpleNamespace(probe_names=[])
     s._profiles = {}
     s._manifolds = {}
     s._default_return_top_k = 0
@@ -192,8 +194,8 @@ def _fast_batch_session():
     )
     events = SimpleNamespace(emitted=[])
     events.emit = lambda event: events.emitted.append(event)
-    s.events = events
-    s._steering = SimpleNamespace(
+    s_any.events = events
+    s_any._steering = SimpleNamespace(
         ctx=TriggerContext(),
         reset_manifold_feet=lambda: None,
         has_compiled_offsets=lambda: False,
@@ -245,9 +247,10 @@ def _probe_fast_batch_session():
     s, _model = _fast_batch_session()
     s._layers = torch.nn.ModuleList([torch.nn.Identity()])
     s._capture = HiddenCapture()
-    s._monitor = _BatchProbeMonitor()
+    s_any = cast(Any, s)
+    s_any._monitor = _BatchProbeMonitor()
     model = _ProbeBatchModel(s._layers)
-    s._model = model
+    s_any._model = model
     return s, model
 
 
@@ -381,7 +384,7 @@ class TestGenerateBatch:
 
     def test_probes_fall_back_to_serial_generation(self) -> None:
         s, model = _fast_batch_session()
-        s._monitor.probe_names = ["mood"]
+        cast(Any, s._monitor).probe_names = ["mood"]
         capture: list[Any] = []
         _stub_generate_core(s, capture=capture)
 
@@ -413,7 +416,7 @@ class TestGenerateBatch:
             (30.0,),
             (100.0,),
         ]
-        assert s._monitor.scored == [2.0, 30.0, 100.0]
+        assert cast(Any, s._monitor).scored == [2.0, 30.0, 100.0]
 
     def test_deterministic_fan_uses_batched_generation(self) -> None:
         s, model = _fast_batch_session()
@@ -597,7 +600,8 @@ class TestPrefixCacheEligibility:
             max_cache_len=8,
         )
         s._static_cache_active = True
-        s._steering = SimpleNamespace(
+        s_any = cast(Any, s)
+        s_any._steering = SimpleNamespace(
             all_fast_path=lambda: True,
             static_steerable=lambda: False,
             ctx=None,
@@ -605,14 +609,14 @@ class TestPrefixCacheEligibility:
         )
         s._steering_active_in_prefill = lambda: False
         s._steering_needs_probe_gating = lambda: False
-        s._build_gating_score_callback = lambda: None
+        s_any._build_gating_score_callback = lambda: None
         s._compiled = False
         s._device = torch.device("cpu")
-        s._model = object()
-        s._tokenizer = object()
-        s._gen_state = object()
+        s_any._model = object()
+        s_any._tokenizer = object()
+        s_any._gen_state = object()
         s._capture_state = CaptureState(persistent=False)
-        s._capture = SimpleNamespace(
+        s_any._capture = SimpleNamespace(
             ingest_persistent=lambda: None,
             fire_step_sink=lambda: None,
         )
@@ -702,7 +706,7 @@ class TestPrefixCacheEligibility:
                 return SimpleNamespace(past_key_values=kwargs.get("past_key_values"))
 
         model = _Model()
-        s._model = model
+        cast(Any, s)._model = model
 
         prefix_len = s.cache_prefix(
             torch.tensor([[4, 5, 6]], dtype=torch.long),

@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import threading
 import types
-from typing import Any
+from typing import Any, cast
 from unittest.mock import MagicMock
 
 import pytest
@@ -252,7 +252,7 @@ def test_begin_capture_live_lens_uses_persistent_capture_when_available():
     session._capture_buffers = {
         idx: torch.zeros(8) for idx in range(4)
     }
-    session._steering = types.SimpleNamespace(
+    cast(Any, session)._steering = types.SimpleNamespace(
         all_fast_path=lambda: True,
     )
 
@@ -268,7 +268,7 @@ def test_begin_capture_live_lens_uses_persistent_capture_when_available():
         transient_layers.extend(layer_indices)
 
     session._capture.attach_persistent = _attach_persistent
-    session._capture.attach = _attach
+    cast(Any, session._capture).attach = _attach
     session._capture.clear = lambda: None
     session._capture.set_aggregate_tail = lambda depth: tail_depths.append(depth)
 

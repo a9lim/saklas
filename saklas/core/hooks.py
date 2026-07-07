@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
+from typing import Any, cast
 
 import torch
 
@@ -607,7 +607,7 @@ class SteeringHook:
                 origin.to(device=device, dtype=torch.float32),
                 float(along),
                 float(onto),
-                kappa.to(device=device, dtype=torch.float32)
+                cast(torch.Tensor, kappa).to(device=device, dtype=torch.float32)
                 if isinstance(kappa, torch.Tensor) else float(kappa),
             ))
         self.manifold_groups = manifold_groups
@@ -702,7 +702,8 @@ class SteeringHook:
         # push iff every entry is zero.  Any ablation axis (κ≠0) disqualifies —
         # the injection then depends on ``h``.
         if isinstance(kappa, torch.Tensor):
-            if bool(kappa.any()):
+            kappa_tensor = cast(torch.Tensor, kappa)
+            if bool(kappa_tensor.any()):
                 return None
         elif float(kappa) != 0.0:
             return None
@@ -735,9 +736,10 @@ class SteeringHook:
         if dtype is None:
             return None
         if isinstance(kappa, torch.Tensor):
-            if not bool(kappa.any()):
+            kappa_tensor = cast(torch.Tensor, kappa)
+            if not bool(kappa_tensor.any()):
                 return None
-            kappa_t = kappa.to(device=device, dtype=dtype)
+            kappa_t = kappa_tensor.to(device=device, dtype=dtype)
         else:
             if float(kappa) == 0.0:
                 return None

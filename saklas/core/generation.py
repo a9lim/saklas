@@ -511,19 +511,26 @@ def _advance_no_cache_input(
         return next_token, no_cache_buf, no_cache_len
     if no_cache_buf is None:
         cap = int(current_input.shape[1]) + max(max_extra, 1)
-        no_cache_buf = torch.empty(
-            (1, cap), dtype=current_input.dtype, device=current_input.device,
+        new_buf = cast(
+            torch.Tensor,
+            torch.empty(
+                (1, cap), dtype=current_input.dtype, device=current_input.device,
+            ),
         )
-        no_cache_buf[:, :current_input.shape[1]].copy_(current_input)
+        no_cache_buf = new_buf
+        new_buf[:, :current_input.shape[1]].copy_(current_input)
         no_cache_len = int(current_input.shape[1])
-    if no_cache_len < no_cache_buf.shape[1]:
-        no_cache_buf[:, no_cache_len:no_cache_len + 1].copy_(next_token)
+    buf = no_cache_buf
+    assert buf is not None
+    assert no_cache_len is not None
+    if no_cache_len < buf.shape[1]:
+        buf[:, no_cache_len:no_cache_len + 1].copy_(next_token)
         no_cache_len += 1
-        current_input = no_cache_buf[:, :no_cache_len]
+        current_input = buf[:, :no_cache_len]
     else:  # pragma: no cover - cap is prompt + decode budget by construction
         current_input = torch.cat([current_input, next_token], dim=1)
         no_cache_len = int(current_input.shape[1])
-    return current_input, no_cache_buf, no_cache_len
+    return current_input, buf, no_cache_len
 
 
 class GenerationState:

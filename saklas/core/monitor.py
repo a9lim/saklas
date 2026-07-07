@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from collections import deque
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 
@@ -479,6 +479,7 @@ class Monitor:
         nearest_dist_t: torch.Tensor | None = None
         nearest_idx_t: torch.Tensor | None = None
         if top_n and dist_acc_t is not None:
+            label_scale = float(probe.label_scale)
             # Rank by **raw** whitened distance (so ``nearest`` is literally the
             # nearest node, distinct from the density-aware ``assignment``), then
             # report it in units of the probe's typical label spacing
@@ -489,10 +490,11 @@ class Monitor:
             # portable; ``d / label_scale`` ≈ "typical label-spacings away"
             # transfers across probes.  Assignment keeps raw ``dist_acc_t`` (it
             # needs raw ``d`` for the Gaussian ``−d²/2τ²``).
-            nearest_dist_t, nearest_idx_t = torch.topk(
+            nearest_dist_raw, nearest_idx_raw = torch.topk(
                 dist_acc_t, k=top_n, largest=False, sorted=True,
             )
-            nearest_dist_t = nearest_dist_t / probe.label_scale
+            nearest_dist_t = cast(torch.Tensor, nearest_dist_raw) / label_scale
+            nearest_idx_t = cast(torch.Tensor, nearest_idx_raw)
         # Soft assignment: softmax(−d²/(2τ²) − R·log(τ)) — a proper isotropic
         # R-D Gaussian-mixture posterior with uniform node prior.  The
         # ``logvol_bias`` term is the missing Gaussian normalization; without it

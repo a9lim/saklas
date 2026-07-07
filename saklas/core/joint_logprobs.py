@@ -30,7 +30,7 @@ from __future__ import annotations
 import contextlib
 import math
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 
@@ -150,7 +150,11 @@ def _approx_kl_topk(
 
 def _finite_float(value: torch.Tensor | float) -> float | None:
     """Convert finite tensor/float values to JSON-safe floats."""
-    out = float(value.item()) if isinstance(value, torch.Tensor) else float(value)
+    out = (
+        float(cast(torch.Tensor, value).item())
+        if isinstance(value, torch.Tensor)
+        else float(value)
+    )
     return out if math.isfinite(out) else None
 
 

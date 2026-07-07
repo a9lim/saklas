@@ -96,6 +96,7 @@ def test_role_header_matches_live_template(family: str):
             f"could not load tokenizer for {family} ({model_id}): {e}. "
             f"set HF_TOKEN and accept any gated licenses to run this family."
         )
+        return
 
     if tok.chat_template is None:
         pytest.skip(

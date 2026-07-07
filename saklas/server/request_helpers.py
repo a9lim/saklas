@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from contextlib import suppress
-from typing import Any
+from typing import Any, cast
 
 from saklas.core.errors import SaklasError
 from saklas.core.sampling import SamplingConfig
@@ -56,7 +56,7 @@ def probe_reading_dict(
         result = getattr(session, "last_result", None)
         readings = getattr(result, "readings", None) if result is not None else None
     if readings is None:
-        readings = session.build_readings()
+        readings = cast(dict[str, Any], session.build_readings())
     out: dict[str, Any] = {}
     for name, reading in readings.items():
         if name not in monitor_names:
