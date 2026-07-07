@@ -22,6 +22,7 @@ import type {
   InstallManifoldRequest,
   JointLogprobRowJSON,
   JointLogprobsJSON,
+  LensTokenReadoutJSON,
   LoomNodeJSON,
   LoomTreeJSON,
   ManifoldInfo,
@@ -68,6 +69,7 @@ export type {
   InstallManifoldRequest,
   JointLogprobRowJSON,
   JointLogprobsJSON,
+  LensTokenReadoutJSON,
   LoomNodeJSON,
   LoomTreeJSON,
   ManifoldInfo,
@@ -775,6 +777,32 @@ export const apiExperiments = {
       `${SESSION_BASE(id)}/experiments/fan`,
       jsonBody(body),
     );
+  },
+};
+
+// ====================================================== jacobian lens ==
+
+export const apiLens = {
+  /** Workspace readout at one decode step of a loom node — the per-layer
+   * J-lens top-k matrix at the forward that produced the clicked token.
+   * ``steered`` (default true) replays under the node's recipe steering;
+   * pass ``false`` for the unsteered counterfactual read.  ``raw`` marks a
+   * flat-buffer (raw-mode) node — raw-ness isn't stamped server-side, so
+   * the client's render mode supplies it. */
+  tokenReadout(
+    nodeId: string,
+    rawIndex: number,
+    opts: { topK?: number; steered?: boolean; raw?: boolean } = {},
+    id: string = SESSION,
+  ): Promise<LensTokenReadoutJSON> {
+    const params = new URLSearchParams({
+      node_id: nodeId,
+      raw_index: String(rawIndex),
+      top_k: String(opts.topK ?? 8),
+      steered: String(opts.steered ?? true),
+      raw: String(opts.raw ?? false),
+    });
+    return request(`${SESSION_BASE(id)}/lens/token-readout?${params}`);
   },
 };
 

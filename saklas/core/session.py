@@ -6,7 +6,7 @@ import queue
 import re
 import threading
 import time
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager, nullcontext, suppress
 from dataclasses import dataclass
 from enum import Enum, IntEnum
 from types import TracebackType
@@ -1823,6 +1823,158 @@ class SaklasSession:
                     for vrow, irow in zip(vals.cpu(), idxs.cpu())
                 ]
             return out
+
+    def jlens_token_readout(
+        self,
+        node_id: str,
+        raw_index: int,
+        *,
+        layers: "Sequence[int] | None" = None,
+        top_k: int = 8,
+        apply_steering: bool = True,
+        raw: bool = False,
+    ) -> dict[str, Any]:
+        """Jacobian-lens readout at one decode step of a loom node.
+
+        Rebuilds the exact token stream that *produced* the clicked token —
+        the node's rendered prompt (the same render :meth:`fork_from_token`
+        replays: loom path + stamped role labels + the recipe's thinking
+        toggle) plus ``raw_token_ids[:raw_index]`` — runs one capture
+        forward, and reads ``softmax(W_U · norm(J_l h))`` at the final
+        position per layer.  The row is the workspace counterpart to the
+        token's sampled logits: what each layer's residual was disposed to
+        make the model say at the step that chose this token.
+
+        ``apply_steering`` (default on) replays under the node's recipe
+        steering, so a steered generation reads its *steered* workspace.
+        For an always-active affine term (the dominant case) the single
+        forward reproduces the original decode injections exactly — the
+        slide is position-independent; phase-split (``@response`` /
+        ``@thinking``) and probe-gated terms don't reproduce (a bare
+        forward has no decode phases or per-step scores), so their terms
+        fire as the trigger context's rest state decides — same fidelity
+        class as the fork replay.  ``raw`` selects the flat (base-model /
+        raw-buffer) render — the raw flag isn't stamped on the node, so
+        the caller supplies it.
+
+        Returns ``{node_id, raw_index, token_id, token_text, steering,
+        workspace_band, readout: {layer: [(token, logprob, id), ...]}}``.
+        Raises :class:`~saklas.core.jlens.LensNotFittedError` with no
+        fitted lens, :class:`UnknownNodeError` /
+        :class:`InvalidNodeOperationError` on a bad target (mirrors
+        :meth:`fork_from_token`), ``ValueError`` on an unfitted layer.
+        """
+        from saklas.core.jlens import lens_logits
+        from saklas.core.model import get_final_norm, get_unembedding
+        from saklas.core.vectors import _capture_all_hidden_states
+
+        lens = self._require_jlens()
+        req = list(layers) if layers is not None else list(lens.source_layers)
+        missing = [l for l in req if l not in lens.jacobians]
+        if missing:
+            raise ValueError(
+                f"layers {missing} not in the fitted lens "
+                f"(fitted: {lens.source_layers[0]}..{lens.source_layers[-1]})"
+            )
+        node = self.tree.get(node_id)
+        if node.role != "assistant":
+            raise InvalidNodeOperationError(
+                f"jlens_token_readout: {node_id!r} is a {node.role} node, "
+                f"not an assistant node with a decode record"
+            )
+        raw_ids = node.raw_token_ids
+        if not raw_ids:
+            raise InvalidNodeOperationError(
+                f"jlens_token_readout: {node_id!r} has no raw token record "
+                f"(legacy or transcript-loaded node)"
+            )
+        if not 0 <= raw_index < len(raw_ids):
+            raise InvalidNodeOperationError(
+                f"jlens_token_readout: raw_index {raw_index} out of range "
+                f"[0, {len(raw_ids)}) for {node_id!r}"
+            )
+        user_node = (
+            self.tree.nodes.get(node.parent_id) if node.parent_id else None
+        )
+        if not raw and (user_node is None or user_node.role != "user"):
+            raise InvalidNodeOperationError(
+                f"jlens_token_readout: {node_id!r} has no user parent to "
+                f"rebuild the prompt from (raw-mode node? pass raw=true)"
+            )
+
+        recipe = node.recipe
+        steering_expr = (
+            recipe.steering if (apply_steering and recipe is not None) else None
+        )
+
+        # The steering scope opens OUTSIDE the exclusive-GPU guard:
+        # ``SteeringComposer.push``/``pop`` acquire ``_gen_lock`` blocking
+        # (non-reentrant), so nesting the scope inside ``_model_exclusive``
+        # would self-deadlock — the same ordering ``score_choices`` uses.
+        scope = (
+            self.steering(steering_expr) if steering_expr else nullcontext()
+        )
+        with scope:
+            thinking_req = recipe.thinking if recipe is not None else None
+            use_thinking = (
+                supports_thinking(self._tokenizer)
+                if thinking_req is None
+                else bool(thinking_req) and supports_thinking(self._tokenizer)
+            )
+            if raw:
+                prompt_ids = self._prepare_input(
+                    "", raw=True, parent_node_id=node.parent_id,
+                )
+            else:
+                assert user_node is not None  # narrowed above
+                prompt_ids = self._prepare_input(
+                    user_node.text,
+                    thinking=use_thinking,
+                    parent_node_id=user_node.parent_id,
+                    user_role=user_node.role_label,
+                    assistant_role=node.role_label,
+                )
+            if raw_index > 0:
+                prefix = torch.tensor(
+                    [[int(t) for t in raw_ids[:raw_index]]],
+                    dtype=prompt_ids.dtype, device=prompt_ids.device,
+                )
+                ids = torch.cat([prompt_ids, prefix], dim=1)
+            else:
+                ids = prompt_ids
+            with self._model_exclusive(
+                "session.jlens_token_readout called while another model use "
+                "is in flight",
+                phase_msg="session.jlens_token_readout called while a "
+                "generation is in flight",
+            ):
+                hidden = _capture_all_hidden_states(
+                    self._model, self._layers, ids, layer_indices=req,
+                )
+                unembed = get_unembedding(self._model)
+                norm = get_final_norm(self._model)
+                readout: dict[int, list[tuple[str, float, int]]] = {}
+                for layer in req:
+                    h = hidden[layer][0, -1:, :]
+                    logits = lens_logits(
+                        lens, {layer: h}, unembed=unembed, final_norm=norm,
+                        layers=[layer],
+                    )[layer]
+                    logprobs = torch.log_softmax(logits, dim=-1)
+                    vals, idxs = logprobs.topk(top_k, dim=-1)
+                    readout[layer] = [
+                        (str(self._tokenizer.decode([int(i)])), float(v), int(i))
+                        for v, i in zip(vals[0].cpu(), idxs[0].cpu())
+                    ]
+        return {
+            "node_id": node_id,
+            "raw_index": int(raw_index),
+            "token_id": int(raw_ids[raw_index]),
+            "token_text": str(self._tokenizer.decode([int(raw_ids[raw_index])])),
+            "steering": steering_expr,
+            "workspace_band": self._jlens_workspace_band(lens),
+            "readout": readout,
+        }
 
     def register_jlens_direction(self, word: str) -> str:
         """Register the J-lens direction for a single-token word as a profile.

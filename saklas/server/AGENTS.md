@@ -23,6 +23,7 @@ those registrars import):
 - `probe_routes.register_probe_routes` — `/sessions/{id}/probes/*` (unified: list / defaults / attach / detach — every probe shape)
 - `experiment_routes.register_experiment_routes` — `/sessions/{id}/experiments/fan`
 - `traits_routes.register_traits_routes` — `/sessions/{id}/traits/stream` (SSE)
+- `lens_routes.register_lens_routes` — `/sessions/{id}/lens/token-readout`
 - `ws_stream.register_ws_stream` — the `WS /sessions/{id}/stream` co-stream engine
 
 `server/sse.py`, `server/streaming.py`, and `server/ws_events.py` are the shared
@@ -122,7 +123,9 @@ body + any typed safe-message formatter.
   and returns the existing session). `_session_info` carries `is_base_model` plus
   `role_substitution_supported` / `user_role_supported` (against `ROLE_HEADERS` /
   `USER_ROLE_HEADERS` for the resolved `model_type`) and the resolved
-  `default_assistant_role` / `default_user_role`, so the webui can gate roles.
+  `default_assistant_role` / `default_user_role`, so the webui can gate roles,
+  plus `jlens_fitted` (a `lens_paths` existence check gating the drilldown's
+  j-lens tab — deliberately not the lazy `session.jlens` load).
 - `GET/PATCH/DELETE /saklas/v1/sessions/{id}` — info / update defaults / no-op 204.
 - `POST /saklas/v1/sessions/{id}/{clear,rewind}`.
 
@@ -297,6 +300,23 @@ conflict checks (409 when they would corrupt an in-flight generation).
 grid is validated server-side (empty → 400), then `session.generate_sweep(...,
 stateless=False)` runs in a worker thread under the lock. Returns `{kind, total,
 node_ids, rows}`.
+
+### lens_routes.py — Jacobian-lens token readout
+
+`GET /sessions/{id}/lens/token-readout?node_id=&raw_index=[&top_k=8][&steered=
+true][&raw=false][&layers=csv]` — the workspace readout at one decode step of a
+loom node (`session.jlens_token_readout` in `asyncio.to_thread` under
+`acquire_session_lock`, 503 on timeout): the per-layer J-lens top-k matrix at
+the forward that produced the clicked token, each row
+`{layer, in_band, tokens:[{token, id, logprob}]}` sorted ascending (`in_band` =
+the 40–90% workspace band). `steered` (default on) replays under the node's
+recipe steering — `steered=false` is the unsteered counterfactual; `raw` marks
+a flat-buffer node (raw-ness isn't stamped server-side, the client's render
+mode supplies it). Errors: `LensNotFittedError`/`UnknownNodeError` → 404,
+`InvalidNodeOperationError`/bad `layers`/`top_k` → 400, other `SaklasError`s →
+their `user_message()` status. Lens *fitting* stays CLI-only; discovery rides
+the session-info `jlens_fitted` field (a `lens_paths` existence check — never
+the ~GB lazy artifact load).
 
 ### traits_routes.py — live traits SSE
 

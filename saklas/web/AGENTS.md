@@ -38,6 +38,15 @@ The dashboard speaks the native `/saklas/v1/*` API (`saklas/server/saklas_api.py
 - **POST `/sessions/{id}/experiments/fan`** — alpha grid as loom siblings, JSON `RunSet` summary.
 - **Loom tree** under `/sessions/{id}/tree` — `tree`/`tree/active` GETs; `navigate`/`edit`/`branch`/`delete`/`star`/`note`/`reset` mutations; `edge_label`, `filter`, `diff`, `joint_logprobs`; `transcript` export/import.
 - **GET `/sessions/{id}/traits/stream`** — live per-token probe SSE.
+- **GET `/sessions/{id}/lens/token-readout?node_id=&raw_index=…`** — the J-lens
+  workspace readout at one decode step: per-layer top-k matrix
+  (`layers: [{layer, in_band, tokens:[{token, id, logprob}]}]`) at the forward
+  that produced the clicked token, recomputed on demand server-side (node prompt
+  render + raw prefix replay under the node's recipe steering; `steered=false`
+  for the unsteered counterfactual, `raw=true` for flat-buffer nodes — the
+  client's render mode supplies raw-ness). Backs `TokenDrilldownDrawer`'s
+  **j-lens** tab via `apiLens.tokenReadout`; gated on the session-info
+  `jlens_fitted` flag (unfitted → the tab shows the `saklas lens fit` hint).
 
 ## Source layout
 
@@ -166,7 +175,7 @@ The server loom tree is authoritative. The browser keeps a first-paint cache of 
 
 ## Per-token highlighting
 
-Highlighting lives on the chat token spans, driven by a single highlight-probe dropdown in the chat header with an optional two-stripe compare-two mode. It tints **live** as tokens stream: the WS `token` event's `scores` aggregate feeds the same `scoreToRgb` ramp the post-generation pass uses, so streaming and finalized tints match (and match the TUI). Clicking any token opens the `token_drilldown` drawer with the per-layer × per-probe heatmap regardless of whether a highlight probe is selected.
+Highlighting lives on the chat token spans, driven by a single highlight-probe dropdown in the chat header with an optional two-stripe compare-two mode. It tints **live** as tokens stream: the WS `token` event's `scores` aggregate feeds the same `scoreToRgb` ramp the post-generation pass uses, so streaming and finalized tints match (and match the TUI). Clicking any token opens the `token_drilldown` drawer regardless of whether a highlight probe is selected — three tabs: **probes** (the per-layer × per-probe heatmap), **logits** (ranked top-K alts + logit fork), and **j-lens** (the workspace readout matrix — rows are lens layers ascending with the 40–90% band marked in blue and off-band rows dimmed, cells the top-K tokens tinted by probability via `color-mix`, the produced token outlined where it appears; an `apply recipe steering` checkbox flips to the unsteered counterfactual, responses cached per `(node, raw_index, steered)` for the drawer's life). The j-lens tab needs `sessionState.info.jlens_fitted` and a `token.rawIndex` (same in-session constraint as forking); data comes from `apiLens.tokenReadout` on demand — nothing lens-shaped is stored per token at generation time. A **token scrubber** in the drawer header (`◀ N / M ▶`, or `←`/`→` anywhere in the drawer outside a focusable field) walks the *inspected* position along the turn's token list — every tab follows (probes/logits read stream-captured data instantly, j-lens refetches per position against its cache), while the tab/branch reset effects key off the *clicked* index (`paramTokenIdx`), so scrubbing never kicks the user off their tab; a fresh token click (params identity change) snaps the scrub back, and an `↩ clicked` header button does the same explicitly.
 
 ## Toasts
 

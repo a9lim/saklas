@@ -891,3 +891,147 @@ class TestSessionLockBackpressure:
         from saklas.server import create_app
         app = create_app(_mock_session())
         assert not hasattr(app.state, "gen_lock")
+
+
+# ---------------------------------------------------------------------------
+# Jacobian-lens token readout
+# ---------------------------------------------------------------------------
+
+
+class TestLensTokenReadout:
+    """Route contract for ``GET /saklas/v1/sessions/{id}/lens/token-readout``."""
+
+    _SESSION_OUT = {
+        "node_id": "n1",
+        "raw_index": 3,
+        "token_id": 42,
+        "token_text": " magic",
+        "steering": "0.3 formal.casual",
+        "workspace_band": [12, 18],
+        "readout": {
+            18: [(" b", -0.51234, 7), (" c", -1.2, 9)],
+            12: [(" a", -0.25, 5), (" d", -2.0, 3)],
+        },
+    }
+
+    def test_happy_path_wire_shape(self, session_and_client: Any) -> None:
+        session, client = session_and_client
+        session.jlens_token_readout.return_value = dict(self._SESSION_OUT)
+        resp = client.get(
+            "/saklas/v1/sessions/default/lens/token-readout",
+            params={"node_id": "n1", "raw_index": 3, "top_k": 2},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["node_id"] == "n1"
+        assert data["token_id"] == 42
+        assert data["steering"] == "0.3 formal.casual"
+        # rows sorted ascending by layer, band flags derived from the band list
+        assert [row["layer"] for row in data["layers"]] == [12, 18]
+        assert all(row["in_band"] for row in data["layers"])
+        assert data["layers"][1]["tokens"][0] == {
+            "token": " b", "id": 7, "logprob": -0.5123,
+        }
+        kwargs = session.jlens_token_readout.call_args.kwargs
+        assert kwargs["apply_steering"] is True
+        assert kwargs["raw"] is False
+        assert kwargs["layers"] is None
+        assert kwargs["top_k"] == 2
+
+    def test_steered_and_layers_params_thread_through(
+        self, session_and_client: Any,
+    ) -> None:
+        session, client = session_and_client
+        session.jlens_token_readout.return_value = dict(self._SESSION_OUT)
+        resp = client.get(
+            "/saklas/v1/sessions/default/lens/token-readout",
+            params={
+                "node_id": "n1", "raw_index": 3,
+                "steered": "false", "raw": "true", "layers": "12,18",
+            },
+        )
+        assert resp.status_code == 200
+        kwargs = session.jlens_token_readout.call_args.kwargs
+        assert kwargs["apply_steering"] is False
+        assert kwargs["raw"] is True
+        assert kwargs["layers"] == [12, 18]
+
+    def test_lens_not_fitted_404(self, session_and_client: Any) -> None:
+        from saklas.core.jlens import LensNotFittedError
+
+        session, client = session_and_client
+        session.jlens_token_readout.side_effect = LensNotFittedError(
+            "no Jacobian lens fitted"
+        )
+        resp = client.get(
+            "/saklas/v1/sessions/default/lens/token-readout",
+            params={"node_id": "n1", "raw_index": 0},
+        )
+        assert resp.status_code == 404
+        assert "lens" in resp.json()["detail"]
+
+    def test_unknown_node_404(self, session_and_client: Any) -> None:
+        from saklas.core.loom import UnknownNodeError
+
+        session, client = session_and_client
+        session.jlens_token_readout.side_effect = UnknownNodeError("nope")
+        resp = client.get(
+            "/saklas/v1/sessions/default/lens/token-readout",
+            params={"node_id": "nope", "raw_index": 0},
+        )
+        assert resp.status_code == 404
+
+    def test_invalid_node_operation_400(self, session_and_client: Any) -> None:
+        from saklas.core.loom import InvalidNodeOperationError
+
+        session, client = session_and_client
+        session.jlens_token_readout.side_effect = InvalidNodeOperationError(
+            "raw_index 9 out of range"
+        )
+        resp = client.get(
+            "/saklas/v1/sessions/default/lens/token-readout",
+            params={"node_id": "n1", "raw_index": 9},
+        )
+        assert resp.status_code == 400
+
+    def test_malformed_layers_400(self, session_and_client: Any) -> None:
+        _, client = session_and_client
+        resp = client.get(
+            "/saklas/v1/sessions/default/lens/token-readout",
+            params={"node_id": "n1", "raw_index": 0, "layers": "12,x"},
+        )
+        assert resp.status_code == 400
+
+    def test_top_k_bounds_400(self, session_and_client: Any) -> None:
+        _, client = session_and_client
+        resp = client.get(
+            "/saklas/v1/sessions/default/lens/token-readout",
+            params={"node_id": "n1", "raw_index": 0, "top_k": 0},
+        )
+        assert resp.status_code == 400
+
+    def test_wrong_session_404(self, session_and_client: Any) -> None:
+        _, client = session_and_client
+        resp = client.get(
+            "/saklas/v1/sessions/elsewhere/lens/token-readout",
+            params={"node_id": "n1", "raw_index": 0},
+        )
+        assert resp.status_code == 404
+
+    def test_session_info_carries_jlens_fitted(
+        self, session_and_client: Any, tmp_path: Any, monkeypatch: Any,
+    ) -> None:
+        """``jlens_fitted`` is a path-existence read, never a lens load."""
+        from saklas.io.lens import lens_paths
+
+        _, client = session_and_client
+        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+        resp = client.get("/saklas/v1/sessions/default")
+        assert resp.status_code == 200
+        assert resp.json()["jlens_fitted"] is False
+
+        ts_path, _ = lens_paths("test/model")
+        ts_path.parent.mkdir(parents=True, exist_ok=True)
+        ts_path.write_bytes(b"\x00")
+        resp = client.get("/saklas/v1/sessions/default")
+        assert resp.json()["jlens_fitted"] is True

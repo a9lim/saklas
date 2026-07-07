@@ -23,9 +23,17 @@
     loomTree,
     sendFork,
     samplingState,
+    sessionState,
+    effectiveRawMode,
     probeAxisScale,
   } from "../lib/stores.svelte";
-  import type { ChatTurn, TokenAltJSON, TokenScore } from "../lib/types";
+  import { ApiError, apiLens } from "../lib/api";
+  import type {
+    ChatTurn,
+    LensTokenReadoutJSON,
+    TokenAltJSON,
+    TokenScore,
+  } from "../lib/types";
   import HeatmapCell from "../lib/charts/HeatmapCell.svelte";
 
   interface DrawerParams {
@@ -46,8 +54,25 @@
 
   const params = $derived(drawerState.params as DrawerParams | null);
   const turnIdx = $derived(params?.turnIdx ?? -1);
-  const tokenIdx = $derived(params?.tokenIdx ?? -1);
+  /** The token index the user actually CLICKED — the drawer's anchor.
+   *  Tab / branch resets key off this, never the scrubbed position, so
+   *  walking the scrubber doesn't kick the user off their tab. */
+  const paramTokenIdx = $derived(params?.tokenIdx ?? -1);
   const isThinking = $derived(params?.isThinking === true);
+
+  /** Scrubber override — walks the inspected position along the turn's
+   *  token list without re-opening the drawer.  ``null`` means "at the
+   *  clicked token"; any fresh click (params object identity changes)
+   *  snaps back to it. */
+  let scrubTokenIdx = $state<number | null>(null);
+  $effect(() => {
+    void params;
+    scrubTokenIdx = null;
+  });
+
+  /** The effective inspected token index — every view (probes heatmap,
+   *  logits table, j-lens matrix, fork actions) reads this one. */
+  const tokenIdx = $derived(scrubTokenIdx ?? paramTokenIdx);
 
   /** Which branch we're inspecting — "primary" is the steered turn,
    * "shadow" is the unsteered abPair when available.  Local UI state
@@ -64,7 +89,7 @@
    * on a new token should always start on the primary side. */
   $effect(() => {
     void turnIdx;
-    void tokenIdx;
+    void paramTokenIdx;
     branch = "primary";
   });
 
@@ -166,15 +191,16 @@
   // routes the user to the SamplingStrip ``alts`` toggle when capture
   // wasn't on.
 
-  type Tab = "probes" | "logits";
+  type Tab = "probes" | "logits" | "lens";
   let tab: Tab = $state<Tab>("probes");
 
-  /** Reset to probes tab when the click target changes.  Drilldown stays
-   *  on whatever tab the user had open within a single token view, but a
-   *  fresh open should always show the default surface. */
+  /** Reset to probes tab when the CLICK target changes (scrubbing keeps
+   *  the tab).  Drilldown stays on whatever tab the user had open within
+   *  a single token view, but a fresh open should always show the
+   *  default surface. */
   $effect(() => {
     void turnIdx;
-    void tokenIdx;
+    void paramTokenIdx;
     tab = "probes";
   });
 
@@ -279,16 +305,142 @@
     }
   }
 
+  // ---- j-lens tab (workspace readout) -----------------------------------
+  //
+  // On-demand recompute, not stored stream data: the server rebuilds the
+  // node's prompt render + raw decode prefix up to this token and reads
+  // the per-layer J-lens top-k at the forward that produced it — so any
+  // in-session token drills down, steered generations read their steered
+  // workspace (recipe replay), and nothing is paid per-token at gen time.
+  // Responses are cached per (node, raw_index, steered) while the drawer
+  // lives; the steered toggle refetches the unsteered counterfactual.
+
+  const LENS_TOP_K = 8;
+
+  let lensData = $state<LensTokenReadoutJSON | null>(null);
+  let lensLoading = $state(false);
+  let lensError = $state<string | null>(null);
+  /** Replay under the node's recipe steering (server default).  Flipping
+   *  it off reads the unsteered counterfactual workspace of the same
+   *  token stream.  Sticky across tokens within one drawer life. */
+  let lensSteered = $state(true);
+  const lensCache = new Map<string, LensTokenReadoutJSON>();
+
+  const jlensFitted = $derived(sessionState.info?.jlens_fitted === true);
+
+  const lensKey = $derived.by<string | null>(() => {
+    const nodeId = loomNodeId;
+    const rawIndex = token?.rawIndex;
+    if (!nodeId || rawIndex == null) return null;
+    return `${nodeId}:${rawIndex}:${lensSteered ? 1 : 0}`;
+  });
+
+  $effect(() => {
+    if (tab !== "lens" || !jlensFitted) return;
+    const key = lensKey;
+    const nodeId = loomNodeId;
+    const rawIndex = token?.rawIndex;
+    if (!key || !nodeId || rawIndex == null) return;
+    const hit = lensCache.get(key);
+    if (hit) {
+      lensData = hit;
+      lensError = null;
+      return;
+    }
+    lensLoading = true;
+    lensError = null;
+    lensData = null;
+    apiLens
+      .tokenReadout(nodeId, rawIndex, {
+        topK: LENS_TOP_K,
+        steered: lensSteered,
+        raw: effectiveRawMode(),
+      })
+      .then((d) => {
+        lensCache.set(key, d);
+        if (key === lensKey) lensData = d;
+      })
+      .catch((e) => {
+        if (key !== lensKey) return;
+        const detail =
+          e instanceof ApiError &&
+          typeof (e.body as { detail?: unknown } | null)?.detail === "string"
+            ? (e.body as { detail: string }).detail
+            : null;
+        lensError = detail ?? (e instanceof Error ? e.message : String(e));
+      })
+      .finally(() => {
+        if (key === lensKey) lensLoading = false;
+      });
+  });
+
+  /** Whether to offer the steered/unsteered toggle: the node actually has
+   *  recipe steering (the steered fetch reported an expression), or the
+   *  user already flipped to unsteered and needs the way back. */
+  const lensHasSteering = $derived(
+    (lensData?.steering ?? null) !== null || !lensSteered,
+  );
+
+  function lensCellStyle(logprob: number): string {
+    const p = Math.min(1, Math.exp(logprob));
+    const pct = Math.round(p * 60);
+    return `background: color-mix(in srgb, var(--accent-blue) ${pct}%, transparent);`;
+  }
+
+  function lensCellTitle(layer: number, t: { token: string; logprob: number }): string {
+    const p = Math.exp(t.logprob);
+    const pTxt = p >= 0.001 ? p.toFixed(4) : p.toExponential(2);
+    return `L${layer} · ${JSON.stringify(t.token)} · p=${pTxt} · logprob=${t.logprob.toFixed(3)}`;
+  }
+
+  function lensCellText(t: { token: string }): string {
+    const trimmed = t.token.trim();
+    return trimmed.length > 0 ? trimmed : JSON.stringify(t.token);
+  }
+
   // ---- drawer chrome ---------------------------------------------------
 
   function onClose(): void {
     closeDrawer();
   }
 
+  // ---- token scrubber ----------------------------------------------------
+  //
+  // ◀ ▶ in the header (or ←/→ anywhere in the drawer) walk the inspected
+  // position along the turn's token list.  Every tab follows — the probes
+  // heatmap and logits table read stream-captured data (instant), the
+  // j-lens tab refetches per position (cached per (node, raw_index,
+  // steered), so a revisit is instant).  A fresh token click snaps back.
+
+  function scrubTo(i: number): void {
+    if (i < 0 || i >= tokenList.length) return;
+    scrubTokenIdx = i === paramTokenIdx ? null : i;
+  }
+
+  const canScrubBack = $derived(tokenIdx > 0);
+  const canScrubFwd = $derived(tokenIdx < tokenList.length - 1);
+
   function onKeydown(ev: KeyboardEvent): void {
     if (ev.key === "Escape") {
       ev.preventDefault();
       onClose();
+      return;
+    }
+    // Arrow scrubbing — but never steal arrows from a focusable field
+    // (the chat input lives outside the drawer and must keep caret keys).
+    const t = ev.target as HTMLElement | null;
+    if (
+      t &&
+      (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable)
+    ) {
+      return;
+    }
+    if (ev.key === "ArrowLeft" && canScrubBack) {
+      ev.preventDefault();
+      scrubTo(tokenIdx - 1);
+    } else if (ev.key === "ArrowRight" && canScrubFwd) {
+      ev.preventDefault();
+      scrubTo(tokenIdx + 1);
     }
   }
 
@@ -308,7 +460,32 @@
         <span class="label">token</span>
         <code class="tok-text">{JSON.stringify(token.text)}</code>
         <span class="coord">
-          turn {turnIdx} · {isThinking ? "thinking" : "response"} token {tokenIdx}
+          turn {turnIdx} · {isThinking ? "thinking" : "response"} token
+          <span class="scrub" title="Walk the inspected token along this turn (← / →); every tab follows">
+            <button
+              type="button"
+              class="scrub-btn"
+              disabled={!canScrubBack}
+              onclick={() => scrubTo(tokenIdx - 1)}
+              aria-label="Previous token"
+            >◀</button>
+            <span class="scrub-pos">{tokenIdx + 1} / {tokenList.length}</span>
+            <button
+              type="button"
+              class="scrub-btn"
+              disabled={!canScrubFwd}
+              onclick={() => scrubTo(tokenIdx + 1)}
+              aria-label="Next token"
+            >▶</button>
+          </span>
+          {#if scrubTokenIdx !== null}
+            <button
+              type="button"
+              class="scrub-btn scrub-home"
+              onclick={() => (scrubTokenIdx = null)}
+              title="Snap back to the clicked token"
+            >↩ clicked</button>
+          {/if}
         </span>
       {:else}
         <span class="label">token</span>
@@ -357,6 +534,13 @@
       class:active={tab === "logits"}
       onclick={() => (tab = "logits")}
     >logits</button>
+    <button
+      type="button"
+      role="tab"
+      aria-selected={tab === "lens"}
+      class:active={tab === "lens"}
+      onclick={() => (tab = "lens")}
+    >j-lens</button>
   </div>
 
   <div class="body">
@@ -406,7 +590,7 @@
           </table>
         </div>
       {/if}
-    {:else}
+    {:else if tab === "logits"}
       <!-- Logits tab.  Three states: ranked rows present, alts captured
            but empty (degenerate / stop token), nothing captured at all. -->
       {#if rankRows.length > 0}
@@ -509,6 +693,100 @@
           </p>
         </div>
       {/if}
+    {:else}
+      <!-- J-lens tab.  The workspace readout matrix — rows are lens
+           layers (ascending; workspace-band rows marked), cells the
+           top-K vocabulary tokens each layer's residual was disposed to
+           say at the forward that produced this token.  Recomputed
+           on demand server-side (node prompt render + raw prefix replay),
+           so it works for any in-session token, no per-token gen cost. -->
+      {#if !jlensFitted}
+        <div class="empty">
+          <p>
+            No Jacobian lens is fitted for
+            <code>{sessionState.info?.model_id ?? "this model"}</code>.
+          </p>
+          <p>
+            Fit one from a terminal —
+            <code>saklas lens fit {sessionState.info?.model_id ?? "<model>"}</code>
+            — then reopen this drawer.
+          </p>
+        </div>
+      {:else if token.rawIndex == null}
+        <div class="empty">
+          This token has no raw-decode index — the readout needs a node
+          generated in this session (legacy / replayed turns can't be
+          re-read, same constraint as forking).
+        </div>
+      {:else if !loomNodeId}
+        <div class="empty">
+          No loom assistant node is available for this token.
+        </div>
+      {:else if lensLoading}
+        <div class="empty">
+          computing workspace readout (one prefix forward)…
+        </div>
+      {:else if lensError}
+        <div class="empty">
+          <p>Workspace readout failed: {lensError}</p>
+        </div>
+      {:else if lensData}
+        <div class="logits-summary">
+          <div>
+            produced: <code class="tok-text">{JSON.stringify(lensData.token_text)}</code>
+            {#if lensData.steering !== null}
+              <span class="kv steer-chip" title="The replay ran under the node's recipe steering">
+                steered: <code>{lensData.steering}</code>
+              </span>
+            {:else if !lensSteered}
+              <span class="kv">unsteered counterfactual</span>
+            {/if}
+            {#if lensHasSteering}
+              <label class="kv steer-toggle" title="Replay under the node's recipe steering vs the unsteered counterfactual of the same token stream">
+                <input type="checkbox" bind:checked={lensSteered} />
+                apply recipe steering
+              </label>
+            {/if}
+          </div>
+        </div>
+        <div class="grid-scroll">
+          <table class="lens-table">
+            <thead>
+              <tr>
+                <th class="corner">L \ rank</th>
+                {#each { length: LENS_TOP_K } as _, i (i)}
+                  <th class="num">{i + 1}</th>
+                {/each}
+              </tr>
+            </thead>
+            <tbody>
+              {#each lensData.layers as row (row.layer)}
+                <tr class:off-band={!row.in_band}>
+                  <th
+                    class="row-label"
+                    class:band={row.in_band}
+                    title={row.in_band
+                      ? `Layer ${row.layer} — workspace band (40–90% depth)`
+                      : `Layer ${row.layer} — outside the workspace band`}
+                  >
+                    L{row.layer}
+                  </th>
+                  {#each row.tokens as cell (cell.id)}
+                    <td
+                      class="lens-cell"
+                      class:hit={cell.id === lensData.token_id}
+                      style={lensCellStyle(cell.logprob)}
+                      title={lensCellTitle(row.layer, cell)}
+                    >
+                      {lensCellText(cell)}
+                    </td>
+                  {/each}
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+        </div>
+      {/if}
     {/if}
   </div>
 
@@ -518,10 +796,16 @@
         Tints map each probe's coordinate to its node extent (full color at
         the most extreme node), clamped to ±1. Green = +pole, red = −pole,
         transparent ≈ 0.
-      {:else}
+      {:else if tab === "logits"}
         Logprob is the chosen-token natural-log probability under the
         post-temperature / post-top-p / post-top-k distribution the sampler
         drew from.
+      {:else}
+        Each row ranks softmax(W_U · norm(J_l·h)) at the forward that
+        produced this token — what that layer's residual was disposed to
+        make the model say. Cell tint = probability; blue row labels mark
+        the 40–90% workspace band (early rows are noise, late rows converge
+        on the raw logits). Highlighted cells match the produced token.
       {/if}
     </span>
   </footer>
@@ -575,6 +859,41 @@
   .coord {
     color: var(--fg-dim);
     font-size: var(--text-sm);
+  }
+  .scrub {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-1);
+    margin-left: var(--space-1);
+  }
+  .scrub-btn {
+    background: transparent;
+    color: var(--fg-muted);
+    border: 1px solid var(--border);
+    font: inherit;
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    line-height: 1.2;
+    padding: 0 var(--space-2);
+    cursor: pointer;
+  }
+  .scrub-btn:hover:not(:disabled) {
+    color: var(--fg-strong);
+    border-color: var(--fg-muted);
+  }
+  .scrub-btn:disabled {
+    color: var(--border);
+    cursor: default;
+  }
+  .scrub-pos {
+    color: var(--fg-dim);
+    font-size: var(--text-xs);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  .scrub-home {
+    color: var(--accent);
+    margin-left: var(--space-2);
   }
   .close {
     background: transparent;
@@ -787,6 +1106,79 @@
     background: var(--accent-subtle);
     color: var(--fg-strong);
   }
+  /* J-lens tab — the workspace readout matrix.  Same table chrome as the
+     logits table; cells carry an inline probability tint, so the static
+     styles stay layout-only. */
+  .lens-table {
+    border-collapse: separate;
+    border-spacing: 0;
+    font-variant-numeric: tabular-nums;
+    font-size: var(--text-sm);
+  }
+  .lens-table th,
+  .lens-table td {
+    padding: var(--space-1) var(--space-3);
+    border-bottom: 1px solid var(--border);
+    text-align: left;
+    background: var(--bg-alt);
+  }
+  .lens-table thead th {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    color: var(--fg-muted);
+    font-weight: var(--weight-normal);
+    font-size: var(--text-xs);
+    text-transform: uppercase;
+  }
+  .lens-table .corner {
+    position: sticky;
+    left: 0;
+    z-index: 3;
+    border-right: 1px solid var(--border);
+  }
+  .lens-table .row-label {
+    position: sticky;
+    left: 0;
+    z-index: 1;
+    text-align: right;
+    color: var(--fg-dim);
+    font-size: var(--text-xs);
+    border-right: 1px solid var(--border);
+    white-space: nowrap;
+  }
+  .lens-table .row-label.band {
+    color: var(--accent-blue);
+  }
+  .lens-table tr.off-band td {
+    opacity: 0.55;
+  }
+  .lens-cell {
+    font-family: var(--font-mono);
+    color: var(--fg-strong);
+    white-space: nowrap;
+    max-width: 12ch;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .lens-cell.hit {
+    outline: 1px solid var(--accent);
+    outline-offset: -1px;
+  }
+  .steer-chip code {
+    color: var(--fg-strong);
+    background: transparent;
+  }
+  .steer-toggle {
+    cursor: pointer;
+    user-select: none;
+  }
+  .steer-toggle input {
+    accent-color: var(--accent);
+    vertical-align: middle;
+    margin-right: var(--space-1);
+  }
+
   .mini {
     border: 1px solid var(--border);
     border-radius: var(--radius);

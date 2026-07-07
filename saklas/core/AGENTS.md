@@ -842,6 +842,17 @@ fit by default (`force=True` restarts), checkpoints via the io layer, and gates
 under `_model_exclusive` (forward AND backward passes).
 `jlens_readout(prompt, layers=, positions=, top_k=)` is the offline readout
 (captures via `_capture_all_hidden_states`, default final position only).
+`jlens_token_readout(node_id, raw_index, *, layers=, top_k=, apply_steering=,
+raw=)` is the loom-anchored readout behind the dashboard drilldown's j-lens
+tab: fork-style validation (assistant node, `raw_token_ids`, range), rebuild
+the node's exact prompt render via `_prepare_input` (stamped role labels +
+recipe thinking; `raw=` selects the flat render — raw-ness isn't stamped on
+the node, the caller supplies it), append `raw_token_ids[:raw_index]`, one
+capture forward, per-layer top-k at the final position — the forward that
+*produced* the clicked token. `apply_steering` replays under the node's
+recipe steering; the steering scope opens OUTSIDE `_model_exclusive`
+(`SteeringComposer.push`/`pop` take `_gen_lock` blocking — nesting would
+self-deadlock; same ordering as `score_choices`).
 `register_jlens_direction(word)` lands `W_U[v] @ J_l` in `_profiles` under
 `jlens/<word>` — the shared resolver behind the two lazy `jlens/` branches
 (steering: `ensure_profile_registered`; probes: `_resolve_probe_manifold`,

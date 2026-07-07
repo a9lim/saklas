@@ -381,6 +381,15 @@ def _session_info(
     except Exception:
         assistant_role_ok = user_role_ok = False
         default_assistant_role = default_user_role = None
+    # Path-existence check only — the lens artifact is fitted fp16 matrices
+    # (hundreds of MB); the lazy ``session.jlens`` load must never ride a
+    # session-info poll.
+    try:
+        from saklas.io.lens import lens_paths
+
+        jlens_fitted = lens_paths(session.model_id)[0].exists()
+    except Exception:
+        jlens_fitted = False
     return {
         "id": _SINGLE_SESSION_ID,
         "model_id": session.model_id,
@@ -394,6 +403,7 @@ def _session_info(
         "supports_thinking": thinks,
         "thinking_is_optional": thinks_optional,
         "is_base_model": is_base,
+        "jlens_fitted": jlens_fitted,
         "default_steering": default_expr,
         "role_substitution_supported": assistant_role_ok,
         "user_role_supported": user_role_ok,
@@ -674,6 +684,9 @@ def register_saklas_routes(app: FastAPI) -> None:
 
     from saklas.server.traits_routes import register_traits_routes
     register_traits_routes(app)
+
+    from saklas.server.lens_routes import register_lens_routes
+    register_lens_routes(app)
 
     # ----- WebSocket token+probe co-stream -------------------------------
 

@@ -16,6 +16,12 @@ import pytest
 import torch
 
 from saklas.core.jlens import LensNotFittedError, MultiTokenWordError
+from saklas.core.loom import (
+    InvalidNodeOperationError,
+    LoomTree,
+    Recipe,
+    UnknownNodeError,
+)
 from saklas.core.session import SaklasSession
 from saklas.io.lens import load_lens, save_lens
 from tests._jlens_toys import CharTokenizer, frozen_toy
@@ -263,3 +269,178 @@ def test_live_lens_readout_step_reads_latest_slices() -> None:
 def test_live_lens_readout_step_none_when_off() -> None:
     s = _StubSession()
     assert SaklasSession._live_lens_readout_step(s) is None  # type: ignore[arg-type]
+
+
+# --------------------------------------------------- token readout (loom) ----
+
+
+_PROMPT_RENDER = "the prompt render, chat shaped."
+
+
+class _TreeStubSession(_StubSession):
+    """Stub with a real loom tree + recorded prompt render / steering scopes."""
+
+    jlens_token_readout = SaklasSession.jlens_token_readout
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.tree = LoomTree(model_id=_MODEL_ID)
+        self.prepare_calls: list[dict[str, Any]] = []
+        self.steering_scopes: list[Any] = []
+
+    def _prepare_input(
+        self,
+        input: Any,
+        raw: bool = False,
+        thinking: bool = False,
+        stateless: bool = False,
+        parent_node_id: str | None = None,
+        user_role: str | None = None,
+        assistant_role: str | None = None,
+        to_device: bool = True,
+    ) -> torch.Tensor:
+        self.prepare_calls.append({
+            "input": input, "raw": raw, "thinking": thinking,
+            "parent_node_id": parent_node_id,
+            "user_role": user_role, "assistant_role": assistant_role,
+        })
+        return torch.tensor(
+            [self._tokenizer.encode(_PROMPT_RENDER)], dtype=torch.long,
+        )
+
+    @contextmanager
+    def steering(self, value: Any):
+        self.steering_scopes.append(value)
+        yield
+
+
+def _tree_with_assistant(
+    s: _TreeStubSession,
+    raw_ids: list[int] | None,
+    recipe: Recipe | None = None,
+) -> str:
+    user_id = s.tree.add_user_turn("a user turn")
+    node_id = s.tree.begin_assistant(user_id, recipe=recipe)
+    s.tree.finalize_assistant(
+        node_id, text="an assistant turn", finish_reason="stop",
+        raw_token_ids=raw_ids,
+    )
+    return node_id
+
+
+def test_jlens_token_readout_shape_and_position() -> None:
+    s = _TreeStubSession()
+    s.fit_jlens(_PROMPTS)
+    raw_ids = s._tokenizer.encode("abcdefg")
+    node_id = _tree_with_assistant(s, raw_ids)
+
+    seen_lens: list[int] = []
+    import saklas.core.vectors as _vectors
+
+    real_capture = _vectors._capture_all_hidden_states
+
+    def _spy(model: Any, layers: Any, ids: torch.Tensor, **kw: Any) -> Any:
+        seen_lens.append(int(ids.shape[1]))
+        return real_capture(model, layers, ids, **kw)
+
+    _vectors._capture_all_hidden_states = _spy
+    try:
+        out = s.jlens_token_readout(node_id, 3, top_k=4)
+    finally:
+        _vectors._capture_all_hidden_states = real_capture
+
+    prompt_len = len(s._tokenizer.encode(_PROMPT_RENDER))
+    # readout position: the forward that PRODUCED the clicked token —
+    # prompt + raw[:3], never including the clicked token itself.
+    assert seen_lens == [prompt_len + 3]
+    assert out["node_id"] == node_id
+    assert out["raw_index"] == 3
+    assert out["token_id"] == raw_ids[3]
+    assert out["token_text"] == s._tokenizer.decode([raw_ids[3]])
+    assert out["steering"] is None
+    assert out["workspace_band"] == [1]  # 3-layer toy: 40-90% band keeps L1
+    assert set(out["readout"]) == {0, 1}  # fitted sources of the 3-layer toy
+    for rows in out["readout"].values():
+        assert len(rows) == 4
+        tok, lp, tid = rows[0]
+        assert isinstance(tok, str) and lp <= 0.0 and isinstance(tid, int)
+    # user_role/assistant_role of the replayed render come off the nodes
+    assert s.prepare_calls[0]["input"] == "a user turn"
+    assert s.prepare_calls[0]["raw"] is False
+
+
+def test_jlens_token_readout_index_zero_reads_prompt_only() -> None:
+    s = _TreeStubSession()
+    s.fit_jlens(_PROMPTS)
+    node_id = _tree_with_assistant(s, s._tokenizer.encode("abc"))
+
+    seen_lens: list[int] = []
+    import saklas.core.vectors as _vectors
+
+    real_capture = _vectors._capture_all_hidden_states
+
+    def _spy(model: Any, layers: Any, ids: torch.Tensor, **kw: Any) -> Any:
+        seen_lens.append(int(ids.shape[1]))
+        return real_capture(model, layers, ids, **kw)
+
+    _vectors._capture_all_hidden_states = _spy
+    try:
+        s.jlens_token_readout(node_id, 0, top_k=2)
+    finally:
+        _vectors._capture_all_hidden_states = real_capture
+    assert seen_lens == [len(s._tokenizer.encode(_PROMPT_RENDER))]
+
+
+def test_jlens_token_readout_steering_scope() -> None:
+    s = _TreeStubSession()
+    s.fit_jlens(_PROMPTS)
+    recipe = Recipe(steering="0.3 formal.casual", thinking=False)
+    node_id = _tree_with_assistant(s, s._tokenizer.encode("abcd"), recipe)
+
+    out = s.jlens_token_readout(node_id, 2, top_k=2)
+    assert s.steering_scopes == ["0.3 formal.casual"]
+    assert out["steering"] == "0.3 formal.casual"
+
+    s.steering_scopes.clear()
+    out = s.jlens_token_readout(node_id, 2, top_k=2, apply_steering=False)
+    assert s.steering_scopes == []
+    assert out["steering"] is None
+
+
+def test_jlens_token_readout_raw_mode_render() -> None:
+    s = _TreeStubSession()
+    s.fit_jlens(_PROMPTS)
+    node_id = _tree_with_assistant(s, s._tokenizer.encode("abcd"))
+
+    s.jlens_token_readout(node_id, 1, top_k=2, raw=True)
+    call = s.prepare_calls[0]
+    assert call["raw"] is True and call["input"] == ""
+    # raw render anchors at the assistant node's parent (the flat prefix)
+    assert call["parent_node_id"] == s.tree.get(node_id).parent_id
+
+
+def test_jlens_token_readout_errors() -> None:
+    s = _TreeStubSession()
+    node_id = _tree_with_assistant(s, s._tokenizer.encode("abc"))
+
+    with pytest.raises(LensNotFittedError):
+        s.jlens_token_readout(node_id, 0)
+
+    s.fit_jlens(_PROMPTS)
+    user_id = s.tree.get(node_id).parent_id
+    assert user_id is not None
+    with pytest.raises(UnknownNodeError):
+        s.jlens_token_readout("nope", 0)
+    with pytest.raises(InvalidNodeOperationError, match="not an assistant"):
+        s.jlens_token_readout(user_id, 0)
+    with pytest.raises(InvalidNodeOperationError, match="out of range"):
+        s.jlens_token_readout(node_id, 3)
+    with pytest.raises(InvalidNodeOperationError, match="out of range"):
+        s.jlens_token_readout(node_id, -1)
+    with pytest.raises(ValueError, match="not in the fitted lens"):
+        s.jlens_token_readout(node_id, 0, layers=[9])
+
+    bare = s.tree.begin_assistant(user_id)
+    s.tree.finalize_assistant(bare, text="no raw record", finish_reason="stop")
+    with pytest.raises(InvalidNodeOperationError, match="no raw token record"):
+        s.jlens_token_readout(bare, 0)

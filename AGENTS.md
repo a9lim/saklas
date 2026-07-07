@@ -295,6 +295,14 @@ Three read surfaces, one write surface:
   every decode step (`TokenEvent.lens_readout`, TUI `/lens` → WORKSPACE section);
   the reader consumes the capture's latest slices post-forward at the token tap —
   no new forward hooks, so steering fast-path/compile eligibility is untouched.
+  `session.jlens_token_readout(node_id, raw_index)` is the loom-anchored variant
+  behind the dashboard token drilldown's **j-lens tab** (`GET /saklas/v1/
+  sessions/{id}/lens/token-readout`): rebuild the node's prompt render + raw
+  decode prefix, one capture forward under the node's recipe steering (exact for
+  always-active affine terms — the slide is position-independent; phase/gated
+  terms don't reproduce on a bare forward), and read the full fitted-layer top-k
+  matrix at the position that produced the clicked token. On-demand recompute,
+  zero decode-time cost; `steered=false` reads the unsteered counterfactual.
 - **Steering atoms** — `jlens/<word>` is an ordinary `ns/name` atom; the J-lens
   direction for vocab id v at layer l is `W_U[v] @ J_l`, a per-layer direction
   registered lazily into the profile registry (`session.register_jlens_direction`,
