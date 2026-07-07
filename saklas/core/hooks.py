@@ -511,6 +511,18 @@ class SteeringHook:
             torch.Tensor, torch.Tensor, float, float, torch.Tensor,
             "float | torch.Tensor",
         ] | None = None
+        # Model-dtype low-rank fast path for the single-affine mixed
+        # push+ablation case.  The full ``subspace_inject`` fallback casts the
+        # entire residual stream to fp32 and copies a full-width result back.
+        # For an affine subspace the update is exactly low-rank:
+        # ``q = h Bᵀ - μBᵀ`` and ``h += (along·(target - κq))B``.  Keeping the
+        # small reduced-space math in the model dtype avoids the full fp32
+        # residual copy while preserving the same geometry; pure-push still uses
+        # the even cheaper constant-add path above this.
+        self._single_affine_lowrank: tuple[
+            torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+            torch.Tensor, float,
+        ] | None = None
         # Constant-add fast path for a **pure-push** affine group (all-zero
         # κ — no ``!`` ablation).  When such a group's foot translates by the
         # fixed offset ``along·target`` (κ=0 ⇒ ``p_new − q = along·target``,
@@ -638,8 +650,18 @@ class SteeringHook:
             self._const_single = self._pure_push_constant(
                 _g[1], _g[3], _g[5], _g[7], device=device, dtype=dtype,
             )
+            self._single_affine_lowrank = (
+                self._mixed_affine_lowrank(
+                    _g[1], _g[3], _g[5], _g[7],
+                    mean_proj=self._single_affine_fast[6],
+                    device=device,
+                    dtype=dtype,
+                )
+                if self._const_single is None else None
+            )
         else:
             self._const_single = None
+            self._single_affine_lowrank = None
         self._const_groups = [
             self._pure_push_constant(
                 sub, target, along, kappa, device=device, dtype=dtype,
@@ -698,6 +720,34 @@ class SteeringHook:
         # it removes the two per-fire norm reductions the cap needs.
         return c.to(dtype) if dtype is not None else c
 
+    @staticmethod
+    def _mixed_affine_lowrank(
+        sub: LayerSubspace,
+        target: torch.Tensor,
+        along: float,
+        kappa: "float | torch.Tensor",
+        *,
+        mean_proj: torch.Tensor,
+        device: torch.device,
+        dtype: "torch.dtype | None",
+    ) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float] | None":
+        """Precompute model-dtype tensors for mixed affine push+ablation."""
+        if dtype is None:
+            return None
+        if isinstance(kappa, torch.Tensor):
+            if not bool(kappa.any()):
+                return None
+            kappa_t = kappa.to(device=device, dtype=dtype)
+        else:
+            if float(kappa) == 0.0:
+                return None
+            kappa_t = torch.full_like(target, float(kappa), device=device, dtype=dtype)
+        basis = sub.basis.to(device=device, dtype=dtype)       # (R, D)
+        basis_t = basis.T.contiguous()                         # (D, R)
+        target_t = target.to(device=device, dtype=dtype)       # (R,)
+        mean_proj_t = mean_proj.to(device=device, dtype=dtype) # (R,)
+        return basis, basis_t, target_t, kappa_t, mean_proj_t, float(along)
+
     def hook_fn(self, module: Any, input: Any, output: Any) -> Any:
         # Constant-add fast path: one always-active **pure-push** affine group
         # (the dominant steering case — any push term / merge with no ``!``
@@ -708,6 +758,20 @@ class SteeringHook:
         if const is not None:
             hidden = output if isinstance(output, torch.Tensor) else output[0]
             hidden.add_(const)
+            return output
+        lowrank = self._single_affine_lowrank
+        if lowrank is not None:
+            hidden = output if isinstance(output, torch.Tensor) else output[0]
+            basis, basis_t, target, kappa, mean_proj, along = lowrank
+            if hidden.dtype != basis.dtype:
+                basis = basis.to(hidden.dtype)
+                basis_t = basis.T.contiguous()
+                target = target.to(hidden.dtype)
+                kappa = kappa.to(hidden.dtype)
+                mean_proj = mean_proj.to(hidden.dtype)
+            q = hidden @ basis_t - mean_proj
+            delta = (along * (target - kappa * q)) @ basis
+            hidden.add_(delta)
             return output
         # Fast path: one always-active affine group (the common steering case).
         # Skips the group loop, the trigger re-check, and the foot-seed branch;

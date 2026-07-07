@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from saklas.core.events import SteeringApplied, SteeringCleared
+from saklas.core.manifold import manifold_is_affine
 from saklas.core.session import (
     CaptureState,
     ConcurrentGenerationError,
@@ -40,7 +41,6 @@ from saklas.core.session import (
     VectorNotRegisteredError,
     _PROFILE_ABSENT,
     _affine_manifold_push,
-    _manifold_is_affine,
 )
 from saklas.core.steering_expr import AblationTerm, ManifoldTerm
 
@@ -733,15 +733,24 @@ class SteeringComposer:
             # whole roster.  Both reuse the latest appended row.
             state = getattr(session, "_capture_state", None) or CaptureState()
             gating_subset = state.gating_subset
+            gate_keys = state.gating_keys
             if gating_subset and incremental_gate_scores:
                 return incremental_gate_scores[-1]
             if state.incremental and incremental_readings:
-                return monitor.flat_scalars(incremental_readings[-1])
+                scalars = monitor.flat_scalars(incremental_readings[-1])
+                if gate_keys:
+                    missing = gate_keys - set(scalars)
+                    if missing:
+                        latest = capture.latest_per_layer()
+                        if latest:
+                            scalars.update(
+                                monitor.score_gate_scalars(latest, missing)
+                            )
+                return scalars
             latest = capture.latest_per_layer()
             if not latest:
                 return {}
-            gate_keys = state.gating_keys
-            if gating_subset and gate_keys:
+            if gate_keys:
                 return monitor.score_gate_scalars(latest, gate_keys)
             # Flatten the coordinate readings into gate-callback scalars
             # (``name`` aliases axis 0, ``name[i]`` per axis, ``name:fraction``,
@@ -828,7 +837,7 @@ class SteeringComposer:
                     raise ManifoldNotRegisteredError(
                         f"No manifold registered for '{entry.manifold}'"
                     )
-                if _manifold_is_affine(manifold):
+                if manifold_is_affine(manifold):
                     # Affine ``%`` joins the merged subspace as a rank-R push
                     # toward the position's per-layer coords — a node's real
                     # coords for label form (``personas%pirate``) or the cardinal

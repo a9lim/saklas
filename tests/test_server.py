@@ -34,6 +34,7 @@ def _mock_session():
     session.config.top_p = 0.9
     session.config.max_new_tokens = 1024
     session.config.system_prompt = None
+    session.config.thinking = None
 
     session.vectors = {}
     session.probes = {}
@@ -448,6 +449,28 @@ class TestOllamaApi:
         assert session.config.temperature == 1.0
         assert session.config.top_p == 0.9
         assert session.config.max_new_tokens == 1024
+
+    def test_chat_malformed_ollama_option_returns_400(self, session_and_client: Any) -> None:
+        session, client = session_and_client
+        resp = client.post("/api/chat", json={
+            "messages": [{"role": "user", "content": "Hi"}],
+            "stream": False,
+            "options": {"presence_penalty": {"bad": "type"}},
+        })
+        assert resp.status_code == 400
+        assert "presence_penalty" in resp.json()["error"]
+        session.generate.assert_not_called()
+
+    def test_chat_malformed_steer_type_returns_400(self, session_and_client: Any) -> None:
+        session, client = session_and_client
+        resp = client.post("/api/chat", json={
+            "messages": [{"role": "user", "content": "Hi"}],
+            "stream": False,
+            "options": {"steer": 3},
+        })
+        assert resp.status_code == 400
+        assert "steer" in resp.json()["error"]
+        session.generate.assert_not_called()
 
     def test_chat_repeat_penalty_maps_to_presence_penalty(self, session_and_client: Any) -> None:
         # Ollama's repeat_penalty divides positive logits by the penalty,

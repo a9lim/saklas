@@ -924,21 +924,14 @@ def register_manifold_routes(app: FastAPI) -> None:
         if not (folder / "manifold.json").exists():
             raise HTTPException(404, f"manifold {namespace}/{name} not found")
 
-        # Discover-mode hyperparam overrides: write to the folder
-        # manifest *before* the fit so the cache key reflects the
-        # actual fit inputs.  Authored folders ignore these fields
-        # (FitManifoldRequest accepts them, the discriminator below
-        # gates the rewrite).
-        if req.fit_mode is not None or req.hyperparams is not None:
-            try:
-                pre_mf = ManifoldFolder.load(folder)
-            except ManifoldFormatError as e:
-                raise HTTPException(400, str(e)) from e
+        def _apply_fit_overrides() -> None:
+            if req.fit_mode is None and req.hyperparams is None:
+                return
+            pre_mf = ManifoldFolder.load(folder)
             if not pre_mf.is_discover and (
                 req.fit_mode is not None or req.hyperparams is not None
             ):
-                raise HTTPException(
-                    400,
+                raise ValueError(
                     f"fit_mode/hyperparams overrides are discover-mode "
                     f"only; {namespace}/{name} is authored",
                 )
@@ -960,6 +953,12 @@ def register_manifold_routes(app: FastAPI) -> None:
             write_json_atomic(folder / "manifold.json", data)
 
         def _fit(on_progress: Callable[[str], None]) -> dict[str, Any]:
+            # Discover-mode hyperparam overrides must happen inside the same
+            # session lock as the fit.  The manifest rewrite changes the fit
+            # cache key, so racing it against generation/extraction can make a
+            # request observe one set of inputs while the tensor cache records
+            # another.
+            _apply_fit_overrides()
             manifold = session.fit(
                 folder, sae=req.sae, sae_revision=req.sae_revision,
                 on_progress=on_progress,

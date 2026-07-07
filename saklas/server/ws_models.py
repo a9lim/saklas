@@ -22,6 +22,7 @@ class WSSamplingParams(BaseModel):
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
     return_top_k: int = 0
+    return_probe_readings: bool = True
     persist_per_layer_scores: bool = False
     persist_subspace_coords: bool = False
     user_role: str | None = None
@@ -63,6 +64,7 @@ def build_sampling(body: WSSamplingParams | None) -> SamplingConfig | None:
         presence_penalty=body.presence_penalty or 0.0,
         frequency_penalty=body.frequency_penalty or 0.0,
         return_top_k=body.return_top_k,
+        return_probe_readings=bool(body.return_probe_readings),
         user_role=(body.user_role or None),
         assistant_role=(body.assistant_role or None),
         persist_per_layer_scores=bool(body.persist_per_layer_scores),

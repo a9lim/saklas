@@ -51,6 +51,13 @@ from saklas.server.model_names import aliases_for_session, known_model_names
 log = logging.getLogger(__name__)
 
 
+class OllamaBadRequest(ValueError, SaklasError):
+    """400-grade Ollama compatibility error for malformed request fields."""
+
+    def user_message(self) -> tuple[int, str]:
+        return 400, str(self)
+
+
 def _aliases_for(session: SaklasSession) -> list[str]:
     """Backward-compatible wrapper for tests/imports; new code uses model_names."""
     return aliases_for_session(session)
@@ -197,8 +204,37 @@ def _resolve_options(
     Non-standard saklas fields (accepted at the top level or inside options):
     ``steer`` (a steering expression string), ``think`` (bool).
     """
-    opts = dict(body.get("options") or {})
+    raw_options = body.get("options") or {}
+    if not isinstance(raw_options, dict):
+        raise OllamaBadRequest("Ollama 'options' must be an object")
+    opts = dict(raw_options)
     top_system = body.get("system")
+
+    def _number_option(name: str, default: float | None = None) -> float | None:
+        raw = opts.get(name)
+        if raw is None:
+            return default
+        try:
+            value = float(raw)
+        except (TypeError, ValueError) as e:
+            raise OllamaBadRequest(
+                f"Ollama option '{name}' must be a finite number"
+            ) from e
+        if not math.isfinite(value):
+            raise OllamaBadRequest(
+                f"Ollama option '{name}' must be a finite number"
+            )
+        return value
+
+    def _int_option(name: str, raw: Any) -> int | None:
+        if raw is None:
+            return None
+        try:
+            return int(raw)
+        except (TypeError, ValueError) as e:
+            raise OllamaBadRequest(
+                f"Ollama option '{name}' must be an integer"
+            ) from e
 
     stop_raw = opts.get("stop") or body.get("stop")
     if isinstance(stop_raw, str):
@@ -208,27 +244,32 @@ def _resolve_options(
     else:
         stop_tuple = None
 
-    temperature = opts.get("temperature")
-    top_p = opts.get("top_p")
+    temperature = _number_option("temperature")
+    top_p = _number_option("top_p")
     top_k_raw = opts.get("top_k")
-    try:
-        top_k = int(top_k_raw) if top_k_raw is not None else None
-    except (TypeError, ValueError):
-        top_k = None
+    top_k = _int_option("top_k", top_k_raw)
     if top_k is not None and top_k <= 0:
         top_k = None
-    max_tokens = opts.get("num_predict") or body.get("num_predict")
+    max_tokens = (
+        opts.get("num_predict")
+        if "num_predict" in opts
+        else body.get("num_predict")
+    )
     seed = opts.get("seed")
-    presence_penalty = float(opts.get("presence_penalty", 0.0) or 0.0)
-    frequency_penalty = float(opts.get("frequency_penalty", 0.0) or 0.0)
+    presence_penalty = _number_option("presence_penalty", 0.0) or 0.0
+    frequency_penalty = _number_option("frequency_penalty", 0.0) or 0.0
     repeat_raw = opts.get("repeat_penalty")
     if repeat_raw is not None and presence_penalty == 0.0:
         try:
             rp = float(repeat_raw)
+            if not math.isfinite(rp):
+                raise ValueError
             if rp > 1.0:
                 presence_penalty = math.log(rp)
-        except (TypeError, ValueError):
-            pass
+        except (TypeError, ValueError) as e:
+            raise OllamaBadRequest(
+                "Ollama option 'repeat_penalty' must be a finite number"
+            ) from e
 
     ignored = [k for k in opts if k not in _PROCESSED_OPTIONS]
     if ignored:
@@ -240,7 +281,7 @@ def _resolve_options(
     # ``parse_request_steering`` / ``merge_steering`` the OpenAI path uses.
     steer_raw = opts["steer"] if "steer" in opts else body.get("steer")
     if steer_raw is not None and not isinstance(steer_raw, str):
-        raise ValueError(
+        raise OllamaBadRequest(
             "Ollama 'steer' must be a steering expression string, "
             "e.g. \"0.5 honest + 0.3 warm\""
         )
@@ -259,7 +300,7 @@ def _resolve_options(
         temperature=temperature,
         top_p=top_p,
         top_k=top_k,
-        max_tokens=int(max_tokens) if max_tokens is not None else None,
+        max_tokens=_int_option("num_predict", max_tokens),
         seed=seed,
         stop=stop_tuple,
         presence_penalty=presence_penalty,
@@ -413,7 +454,7 @@ def register_ollama_routes(app: FastAPI) -> None:
     @app.post("/api/push")
     async def api_push():
         return JSONResponse(status_code=501, content={
-            "error": "saklas does not implement /api/push. Use `saklas manifold push` to publish a manifold.",
+            "error": "saklas does not implement /api/push. Use `saklas pack push` to publish a manifold.",
         })
 
     @app.post("/api/create")

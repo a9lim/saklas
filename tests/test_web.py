@@ -63,6 +63,7 @@ def _mock_session_with_vectors(vectors: dict[str, Profile]):
     session.config.top_k = None
     session.config.max_new_tokens = 64
     session.config.system_prompt = None
+    session.config.thinking = None
 
     session.vectors = vectors
     session.probes = {}

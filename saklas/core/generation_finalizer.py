@@ -22,6 +22,7 @@ def finalize_generation(
     applied_steering: str | None = None,
     *,
     return_hidden: bool = False,
+    return_probe_readings: bool = True,
     assistant_node_id: str | None = None,
     mean_logprob: float | None = None,
     mean_surprise: float | None = None,
@@ -50,7 +51,8 @@ def finalize_generation(
         and (
             return_hidden
             or (
-                session._monitor.probe_names
+                return_probe_readings
+                and session._monitor.probe_names
                 and capture_mode_name == "FULL"
             )
         )
@@ -58,7 +60,7 @@ def finalize_generation(
         captured_stack = session._capture.stacked()
 
     agg_vals: dict[str, ProbeReading] = {}
-    if session._monitor.probe_names and generated_ids:
+    if return_probe_readings and session._monitor.probe_names and generated_ids:
         if capture_mode_name == "INCREMENTAL":
             agg_vals, per_token = session._score_incremental(
                 generated_ids, accumulate=not stateless,
@@ -98,7 +100,7 @@ def finalize_generation(
             readings = session.build_readings()
     else:
         session._last_per_token_scores = None
-        readings = session.build_readings()
+        readings = {} if stateless else session.build_readings()
 
     hidden_states: dict[int, torch.Tensor] | None = None
     if return_hidden and generated_ids and captured_stack:
@@ -113,7 +115,7 @@ def finalize_generation(
         hidden_states = trimmed
 
     manifold_aggregates: dict[str, Any] = {}
-    if session._monitor.probe_names and generated_ids:
+    if return_probe_readings and session._monitor.probe_names and generated_ids:
         manifold_aggregates = dict(agg_vals)
 
     result = GenerationResult(

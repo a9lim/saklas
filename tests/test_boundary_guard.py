@@ -166,9 +166,10 @@ _PROMOTED_OLD_NAMES = frozenset([
     "_sanitize_hyperparams",
 ])
 
-# All frontend directories (cli is included here because it too imports these
-# symbols and was updated as part of T2.4).
-_ALL_FRONTEND_DIRS = ("tui", "server", "cli")
+# All cross-module import surfaces (cli/server/tui plus core helpers) must use
+# the promoted public names.  The old underscore aliases stay only for
+# back-compat monkeypatching in tests.
+_ALL_FRONTEND_DIRS = ("tui", "server", "cli", "core")
 
 _UNDERSCORE_IMPORT_RE = re.compile(
     r"(?:^|\s)from\s+[\w.]+\s+import\s+[^#\n]*\b(_[A-Za-z]\w*)"

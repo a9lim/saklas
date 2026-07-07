@@ -64,6 +64,8 @@ def register_session_routes(app: FastAPI) -> None:
             overrides["max_new_tokens"] = req.max_tokens
         if req.system_prompt is not None:
             overrides["system_prompt"] = req.system_prompt
+        if req.thinking is not None:
+            overrides["thinking"] = req.thinking
         if overrides:
             if is_dataclass(session.config):
                 session.config = replace(cast(Any, session.config), **overrides)

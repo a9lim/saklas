@@ -367,6 +367,7 @@ class GenerationConfig:
     top_p: float = 0.9
     top_k: int | None = None
     system_prompt: str | None = None
+    thinking: bool | None = None
 
 
 def _sampler_candidates(

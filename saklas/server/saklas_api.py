@@ -15,8 +15,10 @@ from saklas.server.experiment_models import ExperimentFanRequest
 from saklas.server.native_common import (
     SINGLE_SESSION_ID,
     _SINGLE_SESSION_ID,
+    _session_aliases,
     _resolve_session_id,
     resolve_session_id,
+    session_aliases,
 )
 from saklas.server.session_models import (
     CreateSessionRequest,
@@ -108,6 +110,7 @@ __all__ = [
     "_resolve_session_id",
     "_result_to_json",
     "_role_support",
+    "_session_aliases",
     "_session_config_dict",
     "_session_info",
     "_session_model_type",
@@ -127,6 +130,7 @@ __all__ = [
     "resolve_session_id",
     "result_to_json",
     "role_support",
+    "session_aliases",
     "session_config_dict",
     "session_info",
     "session_model_type",

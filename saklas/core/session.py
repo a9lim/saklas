@@ -458,16 +458,17 @@ class CaptureState:
 
     Carries the one :class:`CaptureMode` plus the orthogonal ``persistent`` flag
     (capture rides the always-on compile-clean buffers rather than transient
-    per-gen hooks) and, for :attr:`CaptureMode.GATING_SUBSET`, the gated probe
-    names / scalar keys.  Set wholesale in :meth:`SaklasSession._begin_capture`;
-    read by the ``_score_*`` dispatch, the gating callback, and the streaming tap.
-    The convenience predicates name the modes so the read sites stay legible.
+    per-gen hooks) and, for gated generations, the gated probe names / exact
+    scalar keys.  Set wholesale in :meth:`SaklasSession._begin_capture`; read by
+    the ``_score_*`` dispatch, the gating callback, and the streaming tap.  The
+    convenience predicates name the modes so the read sites stay legible.
     """
 
     mode: "CaptureMode" = CaptureMode.FULL
     persistent: bool = False
     gating_subset: "set[str] | None" = None
     gating_keys: "set[str] | None" = None
+    final_probe_aggregate: bool = True
 
     @property
     def incremental(self) -> bool:
@@ -480,8 +481,15 @@ class CaptureState:
     @property
     def aggregate_only(self) -> bool:
         # GATING_SUBSET also finalizes off the tail ring (its per-token rows feed
-        # only the gate), so it shares the aggregate-only full-roster pool.
-        return self.mode in (CaptureMode.AGGREGATE_ONLY, CaptureMode.GATING_SUBSET)
+        # only the gate), so it shares the aggregate-only full-roster pool when
+        # the caller still wants a final full probe aggregate.
+        return (
+            self.mode is CaptureMode.AGGREGATE_ONLY
+            or (
+                self.mode is CaptureMode.GATING_SUBSET
+                and self.final_probe_aggregate
+            )
+        )
 
 
 class ConcurrentGenerationError(RuntimeError, SaklasError):
@@ -2156,10 +2164,24 @@ class SaklasSession:
                     f"(fitted: {lens.source_layers[0]}..{lens.source_layers[-1]})"
                 )
         device = self._device
+        layer_list = list(layers)
+        transports = [
+            lens.jacobians[l].to(device=device, dtype=torch.float32)
+            for l in layer_list
+        ]
+        if transports:
+            j_stack = torch.stack(transports, dim=0)
+        else:
+            sample = next(iter(lens.jacobians.values()))
+            j_stack = torch.empty(
+                (0, *sample.shape), device=device, dtype=torch.float32,
+            )
         self._live_lens = {
-            "layers": list(layers),
+            "layers": layer_list,
             "top_k": int(top_k),
-            "J": {l: lens.jacobians[l].to(device) for l in layers},
+            "J": {l: t for l, t in zip(layer_list, transports)},
+            "J_stack": j_stack,
+            "layer_rows": {l: i for i, l in enumerate(layer_list)},
             "unembed": get_unembedding(self._model),
             "norm": get_final_norm(self._model),
             "decode_cache": {},
@@ -2202,18 +2224,21 @@ class SaklasSession:
         cache: dict[int, str] = state["decode_cache"]
         layers_present: list[int] = []
         hidden_rows: list[torch.Tensor] = []
-        transports: list[torch.Tensor] = []
+        transport_rows: list[int] = []
+        layer_rows: dict[int, int] = state["layer_rows"]
         for layer in state["layers"]:
             bucket = buckets.get(layer)
             if not bucket:
                 continue
             layers_present.append(layer)
             hidden_rows.append(bucket[-1].to(torch.float32))
-            transports.append(state["J"][layer].to(torch.float32))
+            transport_rows.append(layer_rows[layer])
         if not layers_present:
             return None
-        H = torch.stack(hidden_rows, dim=0)
-        J = torch.stack(transports, dim=0).to(H.device)
+        J_stack: torch.Tensor = state["J_stack"]
+        rows = torch.tensor(transport_rows, device=J_stack.device, dtype=torch.long)
+        J = J_stack.index_select(0, rows)
+        H = torch.stack(hidden_rows, dim=0).to(J.device)
         transported = torch.bmm(J, H.unsqueeze(-1)).squeeze(-1)
         normed = state["norm"](transported)
         logits = normed.to(unembed.dtype) @ unembed.T
@@ -3336,6 +3361,7 @@ class SaklasSession:
         gating_only_probes: set[str] | None = None,
         gating_probe_keys: set[str] | None = None,
         lean_per_token: bool = False,
+        final_probe_aggregate: bool = True,
     ) -> bool:
         """Attach hidden-state capture. Returns True if attached.
 
@@ -3362,10 +3388,13 @@ class SaklasSession:
         the set of gated probe names.  The incremental step sink then scores
         just that subset every token (the gate consumes only those scalars),
         while the big-K roster's per-token nearest-distance work is skipped.
-        The end-of-gen aggregate still covers the **full** roster: the tail ring
-        is also kept, so :meth:`_finalize_generation` pools the last content
-        token once and scores every probe (the gated subset live-scored, the
-        rest one-shot).  ``None`` (or empty) keeps the full per-token scoring.
+        If ``final_probe_aggregate`` is true, the end-of-gen aggregate still
+        covers the **full** roster: the tail ring is also kept, so
+        :meth:`_finalize_generation` pools the last content token once and scores
+        every probe (the gated subset live-scored, the rest one-shot).  When the
+        caller explicitly disables final probe readings, capture narrows to the
+        gated probe layers and keeps no full-roster tail. ``None`` (or empty)
+        keeps the full per-token scoring.
         """
         # ``getattr`` like ``_compiled_clean_eligible`` below — spec'd mock
         # stubs carry class attributes only, not instance state.
@@ -3373,14 +3402,26 @@ class SaklasSession:
         if widen:
             layer_idxs = list(range(len(self._layers)))
         else:
-            union: set[int] = self._monitor.probe_layers()
+            gate_only_no_final = bool(
+                gating_only_probes
+                and need_per_token
+                and not final_probe_aggregate
+                and self._monitor.probe_names
+            )
+            union: set[int] = self._monitor.probe_layers(
+                set(gating_only_probes) if gate_only_no_final else None,
+            )
             if live_lens is not None:
                 # The live workspace readout consumes the same latest-slice
                 # buffers the monitor does — its layers join the capture set.
                 union = union | set(live_lens["layers"])
             if not union:
                 # No probes ⇒ the degenerate FULL (capture-disabled) state.
-                self._capture_state = CaptureState()
+                self._capture_state = CaptureState(
+                    gating_keys=set(gating_probe_keys or ())
+                    if gating_probe_keys else None,
+                    final_probe_aggregate=final_probe_aggregate,
+                )
                 self._incremental_readings = []
                 return False
             layer_idxs = sorted(union)
@@ -3414,7 +3455,11 @@ class SaklasSession:
         # Default this gen to FULL (append / full-retention); the mode branches
         # below replace it.  ``persistent`` is orthogonal to the mode — set here
         # from the compiled-clean routing decision and carried through unchanged.
-        self._capture_state = CaptureState(persistent=use_persistent)
+        self._capture_state = CaptureState(
+            persistent=use_persistent,
+            gating_keys=set(gating_probe_keys or ()) if gating_probe_keys else None,
+            final_probe_aggregate=final_probe_aggregate,
+        )
         self._incremental_readings = []
         self._incremental_gate_scores = []
         # Gating-only-subset path: per-token scoring is needed solely to feed
@@ -3444,13 +3489,20 @@ class SaklasSession:
                     if latest and gate_keys else {}
                 )
 
-            # Deep tail ring (full-roster finalize via ``tail_slice_at``) PLUS a
-            # per-token step sink (gated subset, for the gate) — armed together by
-            # ``set_tail_with_sink`` (neither single setter gives both).
-            self._capture.set_tail_with_sink(_AGG_TAIL_DEPTH, _score_step_subset)
+            if final_probe_aggregate:
+                # Deep tail ring (full-roster finalize via ``tail_slice_at``) PLUS a
+                # per-token step sink (gated subset, for the gate) — armed together by
+                # ``set_tail_with_sink`` (neither single setter gives both).
+                self._capture.set_tail_with_sink(_AGG_TAIL_DEPTH, _score_step_subset)
+            else:
+                # Pure control/gating call: no final aggregate requested, so a
+                # length-1 incremental buffer is enough and capture has already been
+                # narrowed to the gated probes' layer union.
+                self._capture.set_incremental(_score_step_subset)
             self._capture_state.mode = CaptureMode.GATING_SUBSET
             self._capture_state.gating_subset = subset
             self._capture_state.gating_keys = gate_keys
+            self._capture_state.final_probe_aggregate = final_probe_aggregate
             # The subset is scored one token per step in order, so curved gated
             # probes can warm-start their foot; cold-start the feet first.
             self._monitor.reset_curved_feet()
@@ -4887,6 +4939,7 @@ class SaklasSession:
         applied_steering: str | None = None,
         *,
         return_hidden: bool = False,
+        return_probe_readings: bool = True,
         assistant_node_id: str | None = None,
         mean_logprob: float | None = None,
         mean_surprise: float | None = None,
@@ -4901,6 +4954,7 @@ class SaklasSession:
             logprobs_list=logprobs_list,
             applied_steering=applied_steering,
             return_hidden=return_hidden,
+            return_probe_readings=return_probe_readings,
             assistant_node_id=assistant_node_id,
             mean_logprob=mean_logprob,
             mean_surprise=mean_surprise,
@@ -5057,6 +5111,8 @@ class SaklasSession:
         if thinking is None:
             if steering_obj is not None and steering_obj.thinking is not None:
                 use_thinking_req = steering_obj.thinking
+            elif getattr(self.config, "thinking", None) is not None:
+                use_thinking_req = self.config.thinking
             else:
                 use_thinking_req = supports_thinking(self._tokenizer)
         else:
@@ -5244,9 +5300,12 @@ class SaklasSession:
         # and capture, so correctness holds and ``compile=True`` never regresses
         # the hooked path.  CUDA keeps its existing graph-capture path untouched.
         gen_model = self._model
+        steering_uses_compiled_offsets = bool(
+            getattr(self, "_steering_uses_compiled_offsets", False)
+        )
         if self._compiled and self._device.type == "mps":
             compiled_clean = not self._capture.is_transient() and (
-                self._steering_uses_compiled_offsets
+                steering_uses_compiled_offsets
                 or self._steering.all_fast_path()
             )
             if compiled_clean:
@@ -5281,7 +5340,9 @@ class SaklasSession:
             ),
             use_static_cache=use_static_cache,
             forced_prefix=forced_prefix,
-            steering_active=bool(self._steering.hooks),
+            steering_active=bool(
+                self._steering.hooks or steering_uses_compiled_offsets
+            ),
             want_perplexity=want_perplexity,
             cache_token_text=cache_token_text,
         )
@@ -5349,6 +5410,9 @@ class SaklasSession:
                 frequency_penalty,
                 logprobs_list,
             ) = self._prepare_generation_call(steering, sampling, thinking)
+            return_probe_readings = bool(
+                sampling is None or sampling.return_probe_readings
+            )
             # ``mean_logprob_accum`` averages chosen-token logprobs over the
             # non-thinking response span — surfaced on ``LoomNode.mean_logprob``
             # at finalize-assistant time so the loom sidebar can sort siblings
@@ -5469,7 +5533,11 @@ class SaklasSession:
             # onto the loom row when probes are loaded and the gen is loom-
             # attached — required so a webui refresh can rehydrate highlight
             # tints and the token-drilldown heatmap from the server tree.
-            _persists_probe_row = bool(not stateless and self._monitor.probe_names)
+            _persists_probe_row = bool(
+                return_probe_readings
+                and not stateless
+                and self._monitor.probe_names
+            )
             _need_tap = (
                 on_token is not None
                 or logprobs_list is not None
@@ -5576,13 +5644,13 @@ class SaklasSession:
                 or _persists_subspace_coords
             )
             need_per_token = bool(_needs_gating or _per_token_full_consumer)
-            gating_only_probes: set[str] | None = (
-                composer.gated_probe_names()
-                if (_needs_gating and not _per_token_full_consumer)
-                else None
-            )
             gating_probe_keys: set[str] | None = (
                 composer.gated_probe_keys()
+                if _needs_gating
+                else None
+            )
+            gating_only_probes: set[str] | None = (
+                composer.gated_probe_names()
                 if (_needs_gating and not _per_token_full_consumer)
                 else None
             )
@@ -5616,6 +5684,7 @@ class SaklasSession:
                     gating_only_probes=gating_only_probes,
                     gating_probe_keys=gating_probe_keys,
                     lean_per_token=lean_per_token,
+                    final_probe_aggregate=return_probe_readings,
                 )
                 self._monitor.begin_live()
                 # Reset the steering manager's TriggerContext for this gen;
@@ -5689,6 +5758,7 @@ class SaklasSession:
                 logprobs_list=logprobs_list,
                 applied_steering=applied_steering,
                 return_hidden=want_hidden,
+                return_probe_readings=return_probe_readings,
                 assistant_node_id=assistant_node_id,
                 mean_logprob=_mean_logprob_out,
                 mean_surprise=_mean_surprise_out,
@@ -6500,7 +6570,21 @@ class SaklasSession:
                 if on_result is not None:
                     on_result(idx, result)
             self._gen_state.stop_requested.set()
-            return RunSet(results, node_ids=node_ids, grid=grid_rows, kind="batch")
+            total_tokens = sum(r.token_count for r in results)
+            batch_tok_per_sec = (
+                total_tokens / elapsed if elapsed > MIN_ELAPSED_FOR_RATE else 0.0
+            )
+            return RunSet(
+                results,
+                node_ids=node_ids,
+                grid=grid_rows,
+                kind="batch",
+                metrics={
+                    "batch_elapsed": elapsed,
+                    "batch_token_count": total_tokens,
+                    "batch_tok_per_sec": batch_tok_per_sec,
+                },
+            )
         except BaseException:
             failed = True
             raise

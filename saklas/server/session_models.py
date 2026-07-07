@@ -10,7 +10,7 @@ from pydantic import BaseModel
 from saklas.core.generation import supports_thinking, thinking_is_optional
 from saklas.core.session import SaklasSession
 from saklas.core.steering import Steering
-from saklas.server.native_common import resolve_session_id
+from saklas.server.native_common import resolve_session_id, session_aliases
 
 
 class CreateSessionRequest(BaseModel):
@@ -36,6 +36,7 @@ def session_config_dict(session: SaklasSession) -> dict[str, Any]:
         "top_k": getattr(cfg, "top_k", None),
         "max_tokens": getattr(cfg, "max_new_tokens", None),
         "system_prompt": getattr(cfg, "system_prompt", None),
+        "thinking": getattr(cfg, "thinking", None),
     }
 
 
@@ -116,6 +117,7 @@ def session_info(
         jlens_fitted = False
     return {
         "id": "default",
+        "aliases": session_aliases(session),
         "model_id": session.model_id,
         "device": device,
         "dtype": dtype,

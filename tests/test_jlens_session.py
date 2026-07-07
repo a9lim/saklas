@@ -250,6 +250,15 @@ def test_live_lens_readout_step_reads_latest_slices() -> None:
     s = _StubSession()
     s.fit_jlens(_PROMPTS)
     s.enable_live_lens(layers=[0, 1], top_k=3)
+    # The per-step reader should use the pre-stacked transport cache, not the
+    # per-layer dict.  Replacing the dict entries would have blown up the old
+    # per-token ``state["J"][layer].to(...)`` path.
+    class Bomb:
+        def to(self, *_args: Any, **_kwargs: Any) -> Any:
+            raise AssertionError("live lens readout should use J_stack")
+
+    assert s._live_lens is not None
+    s._live_lens["J"] = {0: Bomb(), 1: Bomb()}
     gen = torch.Generator().manual_seed(11)
     s._capture = _FakeCapture({
         0: torch.randn(6, generator=gen),

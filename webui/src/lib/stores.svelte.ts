@@ -142,6 +142,9 @@ function _hydrateSamplingFromInfo(): void {
   if (typeof cfg.system_prompt === "string") {
     samplingState.system_prompt = cfg.system_prompt;
   }
+  if (typeof cfg.thinking === "boolean") {
+    samplingState.thinking = cfg.thinking;
+  }
 }
 
 export async function patchSessionDefaults(

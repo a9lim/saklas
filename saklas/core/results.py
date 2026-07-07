@@ -250,6 +250,7 @@ class RunSet(list[GenerationResult]):
         node_ids: Iterable[str | None] | None = None,
         grid: Iterable[dict[str, Any]] | None = None,
         kind: str = "generation",
+        metrics: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(results)
         self.node_ids: list[str | None] = (
@@ -263,6 +264,7 @@ class RunSet(list[GenerationResult]):
         if len(self.grid) < len(self):
             self.grid.extend({} for _ in range(len(self) - len(self.grid)))
         self.kind = kind
+        self.metrics: dict[str, Any] = dict(metrics or {})
 
     @property
     def results(self) -> list[GenerationResult]:
@@ -309,6 +311,7 @@ class RunSet(list[GenerationResult]):
             "kind": self.kind,
             "node_ids": list(self.node_ids),
             "grid": [dict(row) for row in self.grid],
+            "metrics": dict(self.metrics),
             "results": [result.to_dict() for result in self],
         }
 

@@ -11,6 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from saklas.core.results import GenerationResult
+from saklas.server.ws_models import WSSamplingParams, build_sampling
 
 
 def _mock_session():
@@ -33,6 +34,7 @@ def _mock_session():
     session.config.top_k = None
     session.config.max_new_tokens = 1024
     session.config.system_prompt = None
+    session.config.thinking = None
 
     session.vectors = {}
     session.probes = {}
@@ -146,6 +148,15 @@ class TestSessions:
         with patch("saklas.server.session_models.supports_thinking", return_value=False):
             resp = client.get("/saklas/v1/sessions/default")
         assert resp.status_code == 200
+        data = resp.json()
+        assert "test__model" in data["aliases"]
+
+    def test_get_by_safe_model_alias(self, session_and_client: Any) -> None:
+        _, client = session_and_client
+        with patch("saklas.server.session_models.supports_thinking", return_value=False):
+            resp = client.get("/saklas/v1/sessions/test__model")
+        assert resp.status_code == 200
+        assert resp.json()["model_id"] == "test/model"
 
     def test_get_not_found(self, session_and_client: Any) -> None:
         _, client = session_and_client
@@ -162,11 +173,17 @@ class TestSessions:
         with patch("saklas.server.session_models.supports_thinking", return_value=False):
             resp = client.patch(
                 "/saklas/v1/sessions/default",
-                json={"temperature": 0.3, "system_prompt": "Be brief."},
+                json={
+                    "temperature": 0.3,
+                    "system_prompt": "Be brief.",
+                    "thinking": False,
+                },
             )
         assert resp.status_code == 200
         assert session.config.temperature == 0.3
         assert session.config.system_prompt == "Be brief."
+        assert session.config.thinking is False
+        assert resp.json()["config"]["thinking"] is False
 
     @staticmethod
     def _set_family(session: Any, model_type: str) -> None:
@@ -480,6 +497,12 @@ class TestExtract:
 # ---- WebSocket token+probe co-stream ------------------------------------
 
 
+def test_ws_sampling_can_disable_final_probe_readings() -> None:
+    sc = build_sampling(WSSamplingParams(return_probe_readings=False))
+    assert sc is not None
+    assert sc.return_probe_readings is False
+
+
 class TestWebSocket:
     def _attach_generate(self, session: Any, tokens: Any) -> None:
         """Install a fake ``session.generate`` that drives ``on_token``."""
@@ -583,6 +606,16 @@ class TestWebSocket:
             msg = ws.receive_json()
             assert msg["type"] == "error"
             assert "unknown message type" in msg["message"]
+
+    def test_generate_rejects_nonpositive_n(self, session_and_client: Any) -> None:
+        session, client = session_and_client
+        with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
+            ws.send_json({"type": "generate", "input": "hi", "n": 0})
+            msg = ws.receive_json()
+            assert msg["type"] == "error"
+            assert msg["status"] == 400
+            assert "n must be >= 1" in msg["message"]
+        session.generate.assert_not_called()
 
     def test_multi_turn_no_recv_race(self, session_and_client: Any) -> None:
         """Three back-to-back generate turns on the same WS.

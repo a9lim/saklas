@@ -16,6 +16,7 @@ from saklas.core.generation import (
 )
 from saklas.core.results import GenerationResult, ProbeReading
 from saklas.core.session import CaptureMode, CaptureState, SaklasSession
+from saklas.core.steering import Steering
 
 
 class _StopTokenizer:
@@ -58,6 +59,30 @@ class _EchoTokenizer:
 
 def _decode_echo(ids: torch.Tensor) -> str:
     return "".join(chr(int(t)) for t in ids[0])
+
+
+def test_prepare_generation_uses_session_thinking_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    session: Any = SaklasSession.__new__(SaklasSession)
+    session._profiles = {}
+    session._tokenizer = object()
+    session._default_return_top_k = 0
+    session.config = GenerationConfig(thinking=False)
+    monkeypatch.setattr("saklas.core.session.supports_thinking", lambda _tok: True)
+
+    _steering, use_thinking, *_rest = SaklasSession._prepare_generation_call(
+        session, None, None, None,
+    )
+    assert use_thinking is False
+
+    _steering, use_thinking, *_rest = SaklasSession._prepare_generation_call(
+        session, Steering(alphas={}, thinking=True), None, None,
+    )
+    assert use_thinking is True
+
+    _steering, use_thinking, *_rest = SaklasSession._prepare_generation_call(
+        session, None, None, True,
+    )
+    assert use_thinking is True
 
 
 def test_prepare_input_raw_feeds_flat_active_path():
@@ -620,6 +645,187 @@ def test_finalize_gating_subset_probe_path() -> None:
     assert session._last_per_token_scores is None
     # Invariant 3: score_aggregate called exactly once.
     assert monitor._agg_calls == 1
+
+
+def test_gating_callback_backfills_exact_keys_hidden_by_top_n() -> None:
+    """Full per-token readings can truncate label channels; gates still need the
+    exact requested scalar keys."""
+
+    from saklas.core.steering_composer import SteeringComposer
+
+    class Capture:
+        def latest_per_layer(self) -> dict[int, torch.Tensor]:
+            return {0: torch.ones(4)}
+
+    class Monitor:
+        def __init__(self) -> None:
+            self.requested: set[str] | None = None
+
+        def flat_scalars(self, _readings: Any) -> dict[str, float]:
+            return {"toy@nearest": -0.1}
+
+        def score_gate_scalars(
+            self, _latest: dict[int, torch.Tensor], gate_keys: set[str],
+        ) -> dict[str, float]:
+            self.requested = set(gate_keys)
+            return {"toy@hidden": -2.0}
+
+    monitor = Monitor()
+    session: Any = SimpleNamespace(
+        _capture=Capture(),
+        _monitor=monitor,
+        _capture_state=CaptureState(
+            mode=CaptureMode.INCREMENTAL,
+            gating_keys={"toy@nearest", "toy@hidden"},
+        ),
+        _incremental_readings=[{"toy": object()}],
+        _incremental_gate_scores=[],
+    )
+
+    scores = SteeringComposer(session).build_gating_score_callback()()
+
+    assert scores == {"toy@nearest": -0.1, "toy@hidden": -2.0}
+    assert monitor.requested == {"toy@hidden"}
+
+
+def test_stateless_zero_token_probe_result_does_not_use_history() -> None:
+    """A stateless empty generation has no current-run probe aggregate."""
+
+    class Capture:
+        def stacked(self) -> dict[int, torch.Tensor]:
+            raise AssertionError("no generated tokens should not stack capture")
+
+    class Monitor:
+        probe_names = ["toy"]
+
+    state = GenerationState()
+    state.finish_reason = "length"
+
+    session: Any = SaklasSession.__new__(SaklasSession)
+    session._gen_state = state
+    session._tokenizer = _StopTokenizer()
+    session._monitor = Monitor()
+    session._capture = Capture()
+    session._capture_state = CaptureState(mode=CaptureMode.FULL)
+    session._last_per_token_scores = {"toy": [99.0]}
+    session._last_result = None
+    session.events = SimpleNamespace(emit=lambda _event: None)
+    session.build_readings = lambda: {
+        "toy": SimpleNamespace(mean=(42.0,), to_dict=lambda: {})
+    }
+
+    result = SaklasSession._finalize_generation(
+        session,
+        "prompt",
+        [],
+        elapsed=1.0,
+        vector_snapshot={},
+        stateless=True,
+    )
+
+    assert result.readings == {}
+    assert result.probe_readings == {}
+    assert session._last_per_token_scores is None
+
+
+def test_return_probe_readings_false_skips_probe_finalization() -> None:
+    class Capture:
+        def stacked(self) -> dict[int, torch.Tensor]:
+            raise AssertionError("probe finalization disabled")
+
+    class Monitor:
+        probe_names = ["toy"]
+
+    state = GenerationState()
+    state.finish_reason = "length"
+
+    session: Any = SaklasSession.__new__(SaklasSession)
+    session._gen_state = state
+    session._tokenizer = _StopTokenizer()
+    session._monitor = Monitor()
+    session._capture = Capture()
+    session._capture_state = CaptureState(mode=CaptureMode.FULL)
+    session._last_per_token_scores = None
+    session._last_result = None
+    session.events = SimpleNamespace(emit=lambda _event: None)
+    session.build_readings = lambda: {
+        "toy": SimpleNamespace(mean=(42.0,), to_dict=lambda: {})
+    }
+
+    result = SaklasSession._finalize_generation(
+        session,
+        "prompt",
+        [0],
+        elapsed=1.0,
+        vector_snapshot={},
+        stateless=True,
+        return_probe_readings=False,
+    )
+
+    assert result.readings == {}
+    assert result.probe_readings == {}
+
+
+def test_gate_only_without_final_probe_aggregate_narrows_capture_layers() -> None:
+    class Capture:
+        def __init__(self) -> None:
+            self.attached: list[int] | None = None
+            self.incremental = False
+            self.tail_with_sink = False
+
+        def clear(self) -> None:
+            pass
+
+        def attach(self, _layers: Any, layer_idxs: list[int]) -> None:
+            self.attached = list(layer_idxs)
+
+        def set_incremental(self, _sink: Any) -> None:
+            self.incremental = True
+
+        def set_tail_with_sink(self, *_args: Any, **_kwargs: Any) -> None:
+            self.tail_with_sink = True
+
+    class Monitor:
+        probe_names = ["gate", "other"]
+
+        def __init__(self) -> None:
+            self.layer_query: set[str] | None = None
+
+        def probe_layers(self, names: set[str] | None = None) -> set[int]:
+            self.layer_query = names
+            return {2} if names == {"gate"} else {2, 5}
+
+        def reset_curved_feet(self) -> None:
+            pass
+
+        def enable_curved_warm(self, _enabled: bool) -> None:
+            pass
+
+    capture = Capture()
+    monitor = Monitor()
+    session: Any = SaklasSession.__new__(SaklasSession)
+    session._layers = [object()] * 8
+    session._monitor = monitor
+    session._capture = capture
+    session._capture_buffers = {}
+    session._compiled_clean_eligible = False
+    session._steering_uses_compiled_offsets = False
+    session._live_lens = None
+
+    SaklasSession._begin_capture(
+        session,
+        need_per_token=True,
+        gating_only_probes={"gate"},
+        gating_probe_keys={"gate@x"},
+        final_probe_aggregate=False,
+    )
+
+    assert monitor.layer_query == {"gate"}
+    assert capture.attached == [2]
+    assert capture.incremental is True
+    assert capture.tail_with_sink is False
+    assert session._capture_state.mode is CaptureMode.GATING_SUBSET
+    assert session._capture_state.final_probe_aggregate is False
 
 
 def test_penalty_state_applies_sparse_counts_on_device():

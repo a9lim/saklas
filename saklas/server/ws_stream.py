@@ -319,7 +319,7 @@ async def _ws_handle_generate(
         })
         return
 
-    n = msg.n if msg.n and msg.n > 0 else 1
+    n = msg.n
     if n < 1:
         await send_json({
             "type": "error",

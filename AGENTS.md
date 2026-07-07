@@ -16,7 +16,7 @@ unified per-layer injection (the along/onto subspace kernel,
 Three frontends over one engine: `SaklasSession` (programmatic), `saklas serve`
 (HTTP), `saklas tui` (TUI).
 
-Version lives in `saklas/__init__.py` as `__version__` (currently 4.0.0).
+Version lives in `saklas/__init__.py` as `__version__`.
 `pyproject.toml` reads it via `version = {attr = "saklas.__version__"}`, so there
 is one place to bump. Do not bump it as part of feature work — version bumps are
 user-owned.
@@ -104,10 +104,12 @@ Every subcommand that takes `-c/--config` auto-loads `~/.saklas/config.yaml`
 first, then composes explicit `-c` files on top (later overrides earlier). The
 `vectors:` YAML key is a single steering expression parsed by
 `saklas.core.steering_expr.parse_expr`. `cli/AGENTS.md` has the full per-verb flag
-set. There is no `--steer-mode`/`--theta-max`/`--method`/`--legacy`/
-`--projection-metric` surface — the injection kernel is unified, difference-of-means
-is the only vector extraction method, `~`/`|` projection is Mahalanobis-only, and
-the only steering knob at the CLI is `--no-dls`.
+set. There is no `--steer-mode`/`--theta-max`/`--legacy`/
+`--projection-metric` surface; `--method` belongs only to discover-mode
+manifold fitting/merging, not vector extraction or steering. The injection kernel
+is unified, difference-of-means is the only vector extraction method, `~`/`|`
+projection is Mahalanobis-only, and the only steering knob at the CLI is
+`--no-dls`.
 
 ## Selector grammar
 

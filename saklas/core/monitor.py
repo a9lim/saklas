@@ -183,14 +183,20 @@ class Monitor:
         """Attached probe manifolds: name -> flat :class:`Manifold`."""
         return {n: p.manifold for n, p in self._probes.items()}
 
-    def probe_layers(self) -> set[int]:
-        """Union of fit-layer indices across every attached probe.
+    def probe_layers(self, names: set[str] | None = None) -> set[int]:
+        """Union of fit-layer indices across attached probes.
 
         The capture-widening signal the session uses to retain every layer
-        a probe reads (peer of :meth:`Monitor.attached_layers`).
+        a probe reads (peer of :meth:`Monitor.attached_layers`).  ``names``
+        narrows the union for gate-only control calls that do not need a final
+        full-roster probe aggregate.
         """
         out: set[int] = set()
-        for probe in self._probes.values():
+        probes = (
+            (p for n, p in self._probes.items() if n in names)
+            if names is not None else self._probes.values()
+        )
+        for probe in probes:
             out.update(probe.manifold.layers.keys())
         return out
 

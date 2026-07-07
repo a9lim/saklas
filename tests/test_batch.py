@@ -338,6 +338,9 @@ class TestGenerateBatch:
         ]
         assert runset.node_ids == [None, None, None]
         assert seen == [(0, "10 11"), (1, "12 13 14"), (2, "15")]
+        assert runset.metrics["batch_token_count"] == 6
+        assert runset.metrics["batch_elapsed"] > 0.0
+        assert "batch_tok_per_sec" in runset.metrics
         assert s.last_result is runset[-1]
 
     def test_greedy_batch_allows_seeded_sampling_config(self) -> None:
