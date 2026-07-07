@@ -53,7 +53,8 @@ def consensus_gram(centroids_by_layer, whit, layers):
         else:
             GL = Cc @ Cc.T
         GL = 0.5 * (GL + GL.T)
-        G += GL; used += 1
+        G += GL
+        used += 1
     return G / max(used, 1)
 
 
@@ -61,7 +62,8 @@ def mds_coords(G, dim=2):
     """Classical-MDS embedding from a centered Gram; returns coords + eig spectrum."""
     w, V = np.linalg.eigh(G)            # ascending
     order = np.argsort(w)[::-1]
-    w = w[order]; V = V[:, order]
+    w = w[order]
+    V = V[:, order]
     pos = np.clip(w, 0, None)
     coords = V[:, :dim] * np.sqrt(pos[:dim])
     spectrum = pos / pos.sum()
@@ -78,7 +80,8 @@ def gram_to_dist(G):
 def circ_corr(a, b):
     def cmean(x):
         return np.arctan2(np.sin(x).mean(), np.cos(x).mean())
-    sa = np.sin(a - cmean(a)); sb = np.sin(b - cmean(b))
+    sa = np.sin(a - cmean(a))
+    sb = np.sin(b - cmean(b))
     return float((sa @ sb) / (np.sqrt((sa**2).sum() * (sb**2).sum()) + 1e-12))
 
 

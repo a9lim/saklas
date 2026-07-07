@@ -24,7 +24,9 @@ def _dictionary(seed: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
 def test_recovers_planted_sparse_combination() -> None:
     jacobian, unembed = _dictionary()
     atoms = {7: 3.0, 21: 2.0, 40: 1.2}
-    target = sum(c * (unembed[v].float() @ jacobian) for v, c in atoms.items())
+    target = torch.zeros(_D)
+    for v, c in atoms.items():
+        target = target + c * (unembed[v].float() @ jacobian)
 
     dec = sparse_nonneg_decompose(target, jacobian, unembed, layer=0, k=8)
 

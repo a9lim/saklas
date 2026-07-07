@@ -65,7 +65,7 @@ def main():
     G = consensus_gram(cents, whit, layers)
     coords, spec = mds_coords(G, 3)
     axis1 = coords[:, 0]
-    print(f"\ndominant axis (53% of spread) sorts the 10 values as:")
+    print("\ndominant axis (53% of spread) sorts the 10 values as:")
     sorted_vals = [LABELS[i] for i in np.argsort(axis1)]
     print("  " + "  <  ".join(sorted_vals))
     print("(if this runs self-enhancement <-> self-transcendence, it's the "

@@ -31,7 +31,8 @@ _WHITENER = None
 
 
 def _pearson(x, y):
-    x = np.asarray(x, float); y = np.asarray(y, float)
+    x = np.asarray(x, float)
+    y = np.asarray(y, float)
     if x.std() < 1e-12 or y.std() < 1e-12:
         return float("nan")
     return float(np.corrcoef(x, y)[0, 1])

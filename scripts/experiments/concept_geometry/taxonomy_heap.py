@@ -89,7 +89,8 @@ def get_taxonomy(name):
 def depth_of(node, parent=PARENT):
     d = 0
     while parent[node] is not None:
-        node = parent[node]; d += 1
+        node = parent[node]
+        d += 1
     return d
 
 

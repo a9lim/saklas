@@ -11,6 +11,7 @@ from typing import Any, cast
 
 import pytest
 import torch
+from torch import nn
 
 from saklas.core.jlens import (
     JacobianLens,
@@ -26,6 +27,10 @@ from tests._jlens_toys import TOY_VOCAB as _VOCAB
 from tests._jlens_toys import CharTokenizer as _CharTokenizer
 from tests._jlens_toys import ToyCausalLM as _TinyCausalLM
 from tests._jlens_toys import frozen_toy as _frozen_model
+
+
+def _layers(model: _TinyCausalLM) -> list[nn.Module]:
+    return list(model.model.layers)
 
 
 def _exact_jacobian(
@@ -64,7 +69,7 @@ def test_estimator_matches_exact_jacobian() -> None:
     skip = 16
 
     lens = fit_jacobian_lens(
-        model, tokenizer, [prompt], model.model.layers,
+        model, tokenizer, [prompt], _layers(model),
         dim_batch=4, skip_first=skip,
     )
 
@@ -85,7 +90,7 @@ def test_restricted_source_layers_match_exact_jacobian() -> None:
     skip = 16
 
     lens = fit_jacobian_lens(
-        model, tokenizer, [prompt], model.model.layers,
+        model, tokenizer, [prompt], _layers(model),
         source_layers=[1], dim_batch=4, skip_first=skip,
     )
     assert lens.source_layers == [1]
@@ -101,9 +106,9 @@ def test_fit_averages_over_prompts_and_merge_agrees() -> None:
     p1 = "a prompt that is long enough."
     p2 = "another, quite different one!!"
 
-    joint = fit_jacobian_lens(model, tokenizer, [p1, p2], model.model.layers, dim_batch=3)
-    solo1 = fit_jacobian_lens(model, tokenizer, [p1], model.model.layers, dim_batch=3)
-    solo2 = fit_jacobian_lens(model, tokenizer, [p2], model.model.layers, dim_batch=3)
+    joint = fit_jacobian_lens(model, tokenizer, [p1, p2], _layers(model), dim_batch=3)
+    solo1 = fit_jacobian_lens(model, tokenizer, [p1], _layers(model), dim_batch=3)
+    solo2 = fit_jacobian_lens(model, tokenizer, [p2], _layers(model), dim_batch=3)
     merged = JacobianLens.merge([solo1, solo2])
 
     assert joint.n_prompts == merged.n_prompts == 2
@@ -117,12 +122,12 @@ def test_fit_skips_short_prompts_and_raises_when_all_short() -> None:
 
     long_prompt = "a prompt that is long enough."
     lens = fit_jacobian_lens(
-        model, tokenizer, ["tiny", long_prompt], model.model.layers, dim_batch=3,
+        model, tokenizer, ["tiny", long_prompt], _layers(model), dim_batch=3,
     )
     assert lens.n_prompts == 1
 
     with pytest.raises(JacobianLensError, match="no usable prompts"):
-        fit_jacobian_lens(model, tokenizer, ["tiny"], model.model.layers, dim_batch=3)
+        fit_jacobian_lens(model, tokenizer, ["tiny"], _layers(model), dim_batch=3)
 
 
 def test_fit_checkpoint_callback_fires() -> None:
@@ -132,7 +137,7 @@ def test_fit_checkpoint_callback_fires() -> None:
     seen: list[int] = []
 
     fit_jacobian_lens(
-        model, tokenizer, [prompt] * 3, model.model.layers,
+        model, tokenizer, [prompt] * 3, _layers(model),
         dim_batch=3, checkpoint_every=2, checkpoint_cb=lambda l: seen.append(l.n_prompts),
     )
     assert seen == [2]
@@ -143,7 +148,7 @@ def test_source_layers_must_precede_final() -> None:
     with pytest.raises(ValueError, match="source_layers"):
         fit_jacobian_lens(
             model, _CharTokenizer(), ["a prompt that is long enough."],
-            model.model.layers, source_layers=[1],
+            _layers(model), source_layers=[1],
         )
 
 

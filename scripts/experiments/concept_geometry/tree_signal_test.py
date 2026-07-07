@@ -29,7 +29,8 @@ def offdiag(M):
 
 
 def pearson(x, y):
-    x = x - x.mean(); y = y - y.mean()
+    x = x - x.mean()
+    y = y - y.mean()
     return float((x @ y) / (np.linalg.norm(x) * np.linalg.norm(y) + 1e-12))
 
 
@@ -63,7 +64,8 @@ def main():
         whit = LayerWhitener.from_cache(args.model)
         metric = "Mahalanobis"
     except Exception as e:
-        whit = None; metric = "Euclidean"
+        whit = None
+        metric = "Euclidean"
         print(f"(no whitener: {e}; Euclidean metric)")
 
     tree_vec = offdiag(treeD)

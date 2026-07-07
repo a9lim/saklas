@@ -48,11 +48,11 @@ def probe_manifold(name, model_tag="google__gemma-4-12b-it", basepoint="all"):
         cands = sorted(glob.glob(base + "/*.safetensors"))
         st = cands[0] if cands else None
     if not st:
-        print(f"[{name}] no fitted tensor found"); return None
+        print(f"[{name}] no fitted tensor found")
+        return None
 
     mj = json.load(open(os.path.join(base, "manifold.json")))
     fit_mode = mj.get("fit_mode")
-    n_nodes = len(mj.get("nodes", []))
 
     with safe_open(st, framework="pt") as f:
         keys = list(f.keys())
@@ -61,18 +61,21 @@ def probe_manifold(name, model_tag="google__gemma-4-12b-it", basepoint="all"):
         source, lk = ("node_coords(activation)", coord_keys) if coord_keys \
             else ("node_params(authored-domain)", param_keys)
         if not lk:
-            print(f"[{name}] no per-layer coords"); return None
+            print(f"[{name}] no per-layer coords")
+            return None
         per_layer = {L: f.get_tensor(k).float().numpy() for L, k in lk.items()}
 
     K = next(iter(per_layer.values())).shape[0]
     R = next(iter(per_layer.values())).shape[1]
     if K < 4:
-        print(f"[{name}] n={K} < 4, δ undefined (need a 4-tuple)"); return None
+        print(f"[{name}] n={K} < 4, δ undefined (need a 4-tuple)")
+        return None
 
     rels, ds = [], []
     for L, X in per_layer.items():
         r = gromov_delta(_cdist(X), basepoint=basepoint)
-        rels.append((L, r["delta_rel"])); ds.append(r["delta_rel"])
+        rels.append((L, r["delta_rel"]))
+        ds.append(r["delta_rel"])
     ds = np.array(ds)
     rels.sort(key=lambda t: t[1])
 
@@ -80,7 +83,8 @@ def probe_manifold(name, model_tag="google__gemma-4-12b-it", basepoint="all"):
     print(f"   δ_rel over {len(ds)} layers:  "
           f"min={ds.min():.3f}  median={np.median(ds):.3f}  "
           f"mean={ds.mean():.3f}  max={ds.max():.3f}")
-    most = rels[0]; least = rels[-1]
+    most = rels[0]
+    least = rels[-1]
     print(f"   most tree-like layer {most[0]}: δ_rel={most[1]:.3f}   "
           f"least tree-like layer {least[0]}: δ_rel={least[1]:.3f}")
     return ds

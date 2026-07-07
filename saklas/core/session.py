@@ -1757,7 +1757,7 @@ class SaklasSession:
                 return merged
 
             fitted = fit_jacobian_lens(
-                self._model, self._tokenizer, usable, self._layers,
+                self._model, self._tokenizer, usable, list(self._layers),
                 source_layers=source_layers, dim_batch=dim_batch,
                 max_seq_len=seq_len, checkpoint_cb=_save,
                 on_progress=on_progress,
