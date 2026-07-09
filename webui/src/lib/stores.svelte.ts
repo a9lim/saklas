@@ -120,19 +120,29 @@ export interface LensState {
    * + salience-weighted depth center of mass).  Same lifecycle as
    * ``readout``. */
   aggregate: [string, number, number, number][] | null;
+  /** Presentation order for the aggregate workspace cards.  Kept in the
+   * shared lens state so switching inspector tabs does not reset it. */
+  workspaceSortMode: LensWorkspaceSortMode;
   /** In-flight toggle guard (the enable moves J_l device-resident and
    * waits on the session lock, so it can lag behind a long stream). */
   busy: boolean;
 }
 
+export type LensWorkspaceSortMode = "strength" | "name" | "depth";
+
 export const lensState: LensState = $state({
   layers: null,
   readout: null,
   aggregate: null,
+  workspaceSortMode: "strength",
   busy: false,
 });
 
-/** Inspector-column mode: the linear-probe racks vs the J-lens surface.
+export function setLensWorkspaceSortMode(mode: LensWorkspaceSortMode): void {
+  lensState.workspaceSortMode = mode;
+}
+
+/** Inspector-column mode: the CAA racks vs the J-lens surface.
  *  Both tabs are views over the ONE steering expression / probe roster —
  *  the split is presentational (each tab shows its own term/probe family). */
 export type InspectorTab = "probes" | "jlens";

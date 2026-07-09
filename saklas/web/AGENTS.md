@@ -92,8 +92,8 @@ webui/src/
     style/{tokens.css,global.css}
   panels/
     WorkspaceRail.svelte      # left rail: category fly-outs
-    InspectorPanel.svelte     # right rack: PROBES / J-LENS tab strip (strip renders only when jlens_fitted); PROBES tab = steering + probe racks splitting the column (both render a subspace group then a manifold group), J-LENS tab = JLensPanel
-    JLensPanel.svelte         # J-LENS tab: STEER token chips (mode:"jlens" rack entries → "α jlens/word" terms, per-chip α default 0.3), PROBES pinned-token chips (attachProbe("jlens/w") — live axis-0 coord + depth CoM), WORKSPACE aggregate chip row (lens_aggregate; click a chip to pin it) with the per-layer matrix behind a Disclosure; toggle → apiLens.setLive({top_k: 8})
+    InspectorPanel.svelte     # right rack: CAA / J-LENS tab strip; CAA tab = STEER + PROBE racks splitting the column (both render a subspace group then a manifold group), J-LENS tab = JLensPanel
+    JLensPanel.svelte         # J-LENS tab: STEER token chips (mode:"jlens" rack entries → "α jlens/word" terms, per-chip α default 0.3), sortable PROBE pinned-token chips (attachProbe("jlens/w") — live axis-0 coord + depth CoM), sortable WORKSPACE aggregate chip row (lens_aggregate; click a chip to pin it) with the per-layer matrix behind a Disclosure; toggle → apiLens.setLive({top_k: 8})
     WorkbenchCard.svelte      # active-workbench card (model + device); bottom of threads column
     StatusFooter.svelte       # gen progress · t/s · elapsed · ppl + pending-queue count badge; mounted inside Chat above the input row
     PendingBubbles.svelte     # ghosted bubbles for queued sends/commits/mutations + per-item × cancel; mounted between StatusFooter and the input row

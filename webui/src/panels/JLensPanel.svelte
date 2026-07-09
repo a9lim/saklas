@@ -1,7 +1,7 @@
 <script lang="ts">
   // J-LENS — the inspector column's Jacobian-lens tab: the open- and
   // closed-vocabulary views of the workspace readout, card-based and
-  // symmetric with the linear-probe tab (every row wears RackCard; the
+  // symmetric with the CAA tab (every row wears RackCard; the
   // j-lens family accent is blue, marker ■/□).
   //
   //   STEER    — one card per ``α jlens/<word>`` token atom in the ONE
@@ -10,7 +10,7 @@
   //              like a concept vector).  Per-card α slider + trigger
   //              pill (lens atoms run hotter than concept vectors;
   //              default 0.3).
-  //   PROBES   — one card per pinned ``jlens/<word>`` token probe
+  //   PROBE    — one card per pinned ``jlens/<word>`` token probe
   //              (ordinary probe-rack entries): signed whitened-
   //              coordinate bar, sparkline, depth CoM, per-layer strip.
   //   WORKSPACE— the open-vocab live readout: one card per aggregate
@@ -26,23 +26,31 @@
   // auto-enables when the artifact lands.  Every section needs the artifact.
 
   import Bar from "../lib/charts/Bar.svelte";
+  import Select from "../lib/Select.svelte";
   import JLensProbeCard from "./rack/JLensProbeCard.svelte";
   import JLensSteerCard from "./rack/JLensSteerCard.svelte";
   import JLensTokenCard from "./rack/JLensTokenCard.svelte";
   import {
     addJLensToRack,
+    activeProbeNames,
     attachProbe,
     checkLensFit,
     lensFitState,
     lensState,
     probeRack,
     sessionState,
+    setLensWorkspaceSortMode,
     setLiveLens,
+    setProbeSortMode,
     startLensFit,
     steerRack,
   } from "../lib/stores.svelte";
   import { pushToast } from "../lib/stores/toasts.svelte";
-  import type { JLensSteerEntry } from "../lib/types";
+  import type {
+    JLensSteerEntry,
+    ProbeSortMode,
+  } from "../lib/types";
+  import type { LensWorkspaceSortMode } from "../lib/stores.svelte";
 
   const fitted = $derived(sessionState.info?.jlens_fitted === true);
   const liveOn = $derived(lensState.layers !== null);
@@ -74,12 +82,18 @@
     steerInput = "";
   }
 
-  // ---------- PROBES: pinned jlens/ probe-rack entries ----------
+  // ---------- PROBE: pinned jlens/ probe-rack entries ----------
   const pinnedCards = $derived.by(() => {
-    const names = probeRack.active.filter((n) => n.startsWith("jlens/"));
-    names.sort((a, b) => a.localeCompare(b));
+    const names = activeProbeNames().filter((n) => n.startsWith("jlens/"));
     return names.map((n) => ({ name: n, entry: probeRack.entries.get(n) }));
   });
+
+  const probeSortMode = $derived(probeRack.sortMode);
+  const PROBE_SORT_OPTIONS: { value: ProbeSortMode; label: string }[] = [
+    { value: "name", label: "name" },
+    { value: "value", label: "value" },
+    { value: "change", label: "change" },
+  ];
 
   let probeInput = $state("");
   let probeBusy = $state(false);
@@ -107,7 +121,7 @@
     probeInput = "";
   }
 
-  // ---------- WORKSPACE: aggregate token cards, strength-ranked ----------
+  // ---------- WORKSPACE: aggregate token cards, user-sorted ----------
 
   interface AggRow {
     /** Raw vocabulary token text (untrimmed — the strip matches on it). */
@@ -118,18 +132,35 @@
     pinned: boolean;
   }
 
+  const WORKSPACE_SORT_OPTIONS: {
+    value: LensWorkspaceSortMode;
+    label: string;
+  }[] = [
+    { value: "strength", label: "strength" },
+    { value: "name", label: "name" },
+    { value: "depth", label: "depth" },
+  ];
+
   const aggRows = $derived.by((): AggRow[] => {
     const rows = lensState.aggregate;
     if (!rows || rows.length === 0) return [];
-    return rows
-      .map(([token, strength, com, spread]) => ({
-        token,
-        strength,
-        com,
-        spread,
-        pinned: probeRack.active.includes(`jlens/${token.trim()}`),
-      }))
-      .sort((a, b) => b.strength - a.strength);
+    const out = rows.map(([token, strength, com, spread]) => ({
+      token,
+      strength,
+      com,
+      spread,
+      pinned: probeRack.active.includes(`jlens/${token.trim()}`),
+    }));
+    if (lensState.workspaceSortMode === "name") {
+      out.sort((a, b) =>
+        a.token.trim().localeCompare(b.token.trim()) || b.strength - a.strength,
+      );
+    } else if (lensState.workspaceSortMode === "depth") {
+      out.sort((a, b) => a.com - b.com || b.strength - a.strength);
+    } else {
+      out.sort((a, b) => b.strength - a.strength);
+    }
+    return out;
   });
 
   function onToggleLive(): void {
@@ -143,7 +174,6 @@
       <header class="header">
         <div class="header-text">
           <span class="title">J-LENS</span>
-          <span class="subtitle">not fitted</span>
         </div>
       </header>
       {#if lensFitState.running}
@@ -199,7 +229,6 @@
       <header class="header">
         <div class="header-text">
           <span class="title">STEER</span>
-          <span class="subtitle">token atoms</span>
         </div>
         <span class="count">{steerCards.length} term{steerCards.length === 1 ? "" : "s"}</span>
       </header>
@@ -228,14 +257,24 @@
       </form>
     </section>
 
-    <!-- PROBES — pinned closed-vocab token-probe cards. -->
+    <!-- PROBE — pinned closed-vocab token-probe cards. -->
     <section class="section">
       <header class="header">
         <div class="header-text">
-          <span class="title">PROBES</span>
-          <span class="subtitle">pinned tokens</span>
+          <span class="title">PROBE</span>
+          <span class="count">{pinnedCards.length} pinned</span>
         </div>
-        <span class="count">{pinnedCards.length} pinned</span>
+        <label class="sort">
+          <span class="sort-label">sort</span>
+          <span class="sort-select">
+            <Select
+              value={probeSortMode}
+              options={PROBE_SORT_OPTIONS}
+              onchange={setProbeSortMode}
+              ariaLabel="Sort J-lens probes by"
+            />
+          </span>
+        </label>
       </header>
 
       {#if pinnedCards.length > 0}
@@ -272,21 +311,31 @@
     <section class="section">
       <header class="header">
         <div class="header-text">
+          <button
+            type="button"
+            class="toggle"
+            class:on={liveOn}
+            disabled={lensState.busy}
+            onclick={onToggleLive}
+            title={liveOn
+              ? "Stop streaming the live workspace readout"
+              : "Stream the layer-aggregated J-lens readout live during generation"}
+          >
+            {liveOn ? "live: on" : "live: off"}
+          </button>
           <span class="title">WORKSPACE</span>
-          <span class="subtitle">aggregate readout</span>
         </div>
-        <button
-          type="button"
-          class="toggle"
-          class:on={liveOn}
-          disabled={lensState.busy}
-          onclick={onToggleLive}
-          title={liveOn
-            ? "Stop streaming the live workspace readout"
-            : "Stream the layer-aggregated J-lens readout live during generation"}
-        >
-          {liveOn ? "live: on" : "live: off"}
-        </button>
+        <label class="sort">
+          <span class="sort-label">sort</span>
+          <span class="sort-select">
+            <Select
+              value={lensState.workspaceSortMode}
+              options={WORKSPACE_SORT_OPTIONS}
+              onchange={setLensWorkspaceSortMode}
+              ariaLabel="Sort workspace tokens by"
+            />
+          </span>
+        </label>
       </header>
 
       {#if liveOn}
@@ -360,10 +409,22 @@
     font-size: var(--text-sm);
     text-transform: uppercase;
   }
-  .subtitle,
   .count {
     color: var(--fg-muted);
     font-size: var(--text-sm);
+  }
+  .sort {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-3);
+  }
+  .sort-label {
+    color: var(--fg-muted);
+    font-size: var(--text-sm);
+  }
+  .sort-select {
+    display: inline-flex;
+    min-width: 8em;
   }
 
   .hint {

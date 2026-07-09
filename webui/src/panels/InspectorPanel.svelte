@@ -2,7 +2,7 @@
   // Inspector — the right-hand control rack, split into two tabs over the
   // ONE steering expression + probe roster:
   //
-  //   PROBES — the linear-probe surface: steering rack (subspace +
+  //   CAA    — the activation-steering surface: steering rack (subspace +
   //            manifold terms) over the probe rack.
   //   J-LENS — the Jacobian-lens surface: token steer cards, pinned token
   //            probes, and the layer-aggregated workspace readout as
@@ -30,7 +30,7 @@
       class:active={tab === "probes"}
       aria-pressed={tab === "probes"}
       onclick={() => setInspectorTab("probes")}
-    >PROBES</button>
+    >CAA</button>
     <button
       type="button"
       class="tab"

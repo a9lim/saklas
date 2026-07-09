@@ -73,7 +73,7 @@
 <section class="rack" aria-label="Probe rack">
   <header class="header">
     <div class="header-text">
-      <span class="title">PROBES</span>
+      <span class="title">PROBE</span>
       <span class="count" aria-live="polite">
         {count} attached
       </span>

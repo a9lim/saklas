@@ -322,7 +322,7 @@ Three read surfaces, one write surface:
   **every** fitted layer in the 40–90% band, and `saklas serve` auto-enables the
   live lens at startup when the artifact exists (serve-side policy; library +
   TUI stay opt-in). The dashboard's **J-LENS tab** is
-  the server sibling (the inspector column always carries PROBES / J-LENS tabs;
+  the server sibling (the inspector column always carries CAA / J-LENS tabs;
   with no fitted lens the J-LENS tab hosts a "fit j-lens" button that drives
   the background fit route `POST /saklas/v1/sessions/{id}/lens/fit` —
   workspace-band fit, polled progress, live readout auto-enabled on
@@ -331,10 +331,10 @@ Three read surfaces, one write surface:
   `lens_readout` + the chip list as `lens_aggregate`, and session info's
   `live_lens_layers` rehydrates the toggle across reloads. The tab's STEER
   section authors `α jlens/<word>` cards into the shared steering expression;
-  its PROBES section pins `jlens/<word>` token probes (ordinary probe-rack
+  its PROBE section pins `jlens/<word>` token probes (ordinary probe-rack
   entries, rendered as cards — live whitened-coordinate bar, depth CoM,
   per-layer strip) and the WORKSPACE section renders the open-vocab aggregate
-  readout as strength-ranked per-token cards with per-layer salience strips.
+  readout as sortable per-token cards with per-layer salience strips.
   `session.jlens_token_readout(node_id, raw_index)` is the loom-anchored variant
   behind the dashboard token drilldown's **j-lens tab** (`GET /saklas/v1/
   sessions/{id}/lens/token-readout`): rebuild the node's prompt render + raw

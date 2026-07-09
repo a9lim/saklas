@@ -46,7 +46,7 @@
 <section class="rack" aria-label="Steering rack">
   <header class="header">
     <div class="header-text">
-      <span class="title">STEERING</span>
+      <span class="title">STEER</span>
     </div>
     <span class="count" aria-live="polite">
       {count} term{count === 1 ? "" : "s"}
