@@ -38,6 +38,7 @@ import type {
 import type {
   ChatTurn,
   GenStatus,
+  JLensSteerEntry,
   ManifoldSteerEntry,
   PendingAction,
   ProbeInfo,
@@ -114,6 +115,11 @@ export interface LensState {
    * ``[token, rawLensLogit]`` top-k.  Overwritten per token frame;
    * kept after ``done`` so the settled matrix stays readable. */
   readout: Record<string, [string, number][]> | null;
+  /** Layer-aggregated chip list riding the same step — ``[token,
+   * strength, com, spread]`` strength-descending (mean band probability
+   * + salience-weighted depth center of mass).  Same lifecycle as
+   * ``readout``. */
+  aggregate: [string, number, number, number][] | null;
   /** In-flight toggle guard (the enable moves J_l device-resident and
    * waits on the session lock, so it can lag behind a long stream). */
   busy: boolean;
@@ -122,17 +128,35 @@ export interface LensState {
 export const lensState: LensState = $state({
   layers: null,
   readout: null,
+  aggregate: null,
   busy: false,
 });
 
-/** Toggle the live workspace readout server-side (WORKSPACE panel). */
+/** Inspector-column mode: the linear-probe racks vs the J-lens surface.
+ *  Both tabs are views over the ONE steering expression / probe roster —
+ *  the split is presentational (each tab shows its own term/probe family). */
+export type InspectorTab = "probes" | "jlens";
+
+export const inspectorState: { tab: InspectorTab } = $state({ tab: "probes" });
+
+export function setInspectorTab(tab: InspectorTab): void {
+  inspectorState.tab = tab;
+}
+
+/** Toggle the live workspace readout server-side (J-LENS tab).  ``top_k``
+ * 8 (over the route's default 5) — the aggregate chip row is the primary
+ * readout surface now, and 8 chips is the read the design settled on;
+ * the per-layer matrix behind the disclosure widens with it. */
 export async function setLiveLens(enabled: boolean): Promise<void> {
   if (lensState.busy) return;
   lensState.busy = true;
   try {
-    const out = await apiLens.setLive({ enabled });
+    const out = await apiLens.setLive({ enabled, top_k: 8 });
     lensState.layers = out.enabled ? (out.layers ?? []) : null;
-    if (!out.enabled) lensState.readout = null;
+    if (!out.enabled) {
+      lensState.readout = null;
+      lensState.aggregate = null;
+    }
   } catch (e) {
     pushToast(
       `live lens ${enabled ? "enable" : "disable"} failed: ` +
@@ -568,6 +592,57 @@ export function addManifoldToRack(name: string): void {
 
 export function removeManifoldFromRack(name: string): void {
   steerRack.entries.delete(name);
+}
+
+// ---------------------------------------------------- j-lens-mode mutators
+
+/** Default α for a fresh J-lens token chip — lens atoms run hotter than
+ *  concept vectors (a single sharp token direction, not a distributed
+ *  contrast): ≈0.3 is the coherent sweet spot, ≥0.5 over-steers into
+ *  repetition. */
+export const JLENS_DEFAULT_ALPHA = 0.3;
+
+/** Reassign a jlens-mode entry through ``fn``; no-op on absent / other-mode. */
+function mutateJLens(
+  name: string,
+  fn: (e: JLensSteerEntry) => JLensSteerEntry,
+): void {
+  const e = steerRack.entries.get(name);
+  if (e && e.mode === "jlens") steerRack.entries.set(name, fn(e));
+}
+
+/** Add a J-lens token steering chip (``α jlens/<word>``).  Accepts a bare
+ *  word or a full ``jlens/…`` atom; the rack key is the full atom.
+ *  Single-token validation is deferred to the engine (a multi-token word
+ *  raises ``MultiTokenWordError`` at generation, surfaced as the stream's
+ *  error toast) — there is no dry-run tokenize endpoint. */
+export function addJLensToRack(word: string): void {
+  const bare = word.trim().replace(/^jlens\//, "");
+  if (!bare) return;
+  const name = `jlens/${bare}`;
+  if (steerRack.entries.has(name)) return;
+  steerRack.entries.set(name, {
+    mode: "jlens",
+    alpha: JLENS_DEFAULT_ALPHA,
+    trigger: "BOTH",
+    enabled: true,
+  });
+}
+
+export function removeJLensFromRack(name: string): void {
+  steerRack.entries.delete(name);
+}
+
+export function setJLensAlpha(name: string, alpha: number): void {
+  enqueueOrApply(`jlens alpha ${name} ${alpha.toFixed(3)}`, () => {
+    mutateJLens(name, (e) => ({ ...e, alpha }));
+  });
+}
+
+export function setJLensEnabled(name: string, enabled: boolean): void {
+  enqueueOrApply(`${enabled ? "enable" : "disable"} ${name}`, () => {
+    mutateJLens(name, (e) => ({ ...e, enabled }));
+  });
 }
 
 export function setManifoldBlend(name: string, blend: number): void {
@@ -2260,10 +2335,11 @@ function handleWsMessage(msg: WSServerMessage): void {
       // above still feed highlight tinting + the token-drilldown heatmap.
       if (!abState.processingAb) {
         updateProbesFromReadings(msg.probe_readings);
-        // WORKSPACE panel — the live J-lens matrix.  Present only while
+        // J-LENS tab — the live workspace readout.  Present only while
         // the session's live lens is enabled; shadow runs skipped like
         // the probe rack so the matrix tracks the steered branch.
         if (msg.lens_readout) lensState.readout = msg.lens_readout;
+        if (msg.lens_aggregate) lensState.aggregate = msg.lens_aggregate;
       }
       return;
     }

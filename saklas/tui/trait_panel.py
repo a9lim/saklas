@@ -60,6 +60,7 @@ class TraitPanel(SelectableListWidget):
         # the latest per-step ``{layer: [(token, score), ...]}`` payload.
         self._lens_layers: list[int] | None = None
         self._lens_readout: dict[int, list[tuple[str, float]]] = {}
+        self._lens_aggregate: list[tuple[str, float, float, float]] = []
         self._cached_lens_text: str = ""
 
     def compose(self) -> ComposeResult:
@@ -369,17 +370,26 @@ class TraitPanel(SelectableListWidget):
         self._lens_layers = list(layers) if layers is not None else None
         if layers is None:
             self._lens_readout = {}
+            self._lens_aggregate = []
         self._render_lens()
 
     def update_lens_readout(
-        self, readout: dict[int, list[tuple[str, float]]],
+        self,
+        readout: dict[int, list[tuple[str, float]]],
+        *,
+        aggregate: list[tuple[str, float, float, float]] | None = None,
     ) -> None:
-        """Push one decode step's lens readout (``{layer: [(token, score)]}``)."""
+        """Push one decode step's lens readout (``{layer: [(token, score)]}``)
+        plus its layer-aggregated chip list (``[(token, strength, com,
+        spread), ...]``, strength-descending)."""
         self._lens_readout = dict(readout)
+        if aggregate is not None:
+            self._lens_aggregate = list(aggregate)
         self._render_lens()
 
     def clear_lens_readout(self) -> None:
         self._lens_readout = {}
+        self._lens_aggregate = []
         self._render_lens()
 
     def _render_lens(self) -> None:
@@ -392,6 +402,15 @@ class TraitPanel(SelectableListWidget):
             return
         self._lens_header.update("[bold]WORKSPACE[/] [dim](J-lens)[/]")
         lines: list[str] = []
+        if self._lens_aggregate:
+            # Layer-aggregated chip row first: token@com, strength-descending
+            # (com = salience-weighted depth center of mass, 0..1).
+            toks = "  ".join(
+                f"[ansi_cyan]{self._lens_token_markup(tok)}[/]"
+                f"[dim]@{com:.2f}[/]"
+                for tok, _strength, com, _spread in self._lens_aggregate
+            )
+            lines.append(f" [dim]Σ   [/] {toks}")
         for layer in self._lens_layers:
             row = self._lens_readout.get(layer)
             if not row:

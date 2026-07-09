@@ -324,7 +324,10 @@ loom node (`session.jlens_token_readout` in `asyncio.to_thread` under
 `acquire_session_lock`, 503 on timeout): the per-layer J-lens top-k matrix at
 the forward that produced the clicked token, each row
 `{layer, in_band, tokens:[{token, id, logprob}]}` sorted ascending (`in_band` =
-the 40–90% workspace band). `steered` (default on) replays under the node's
+the 40–90% workspace band), plus the layer-aggregated `aggregate:
+[{token, strength, com, spread}]` block (per-layer softmax → mean band
+probability + salience-weighted depth center of mass; band-restricted,
+strength-descending; `[]` from a session dict without the key). `steered` (default on) replays under the node's
 recipe steering — `steered=false` is the unsteered counterfactual; `raw` marks
 a flat-buffer node (raw-ness isn't stamped server-side, the client's render
 mode supplies it). Errors: `LensNotFittedError`/`UnknownNodeError` → 404,
@@ -387,9 +390,11 @@ token), `node_created`, `tree_mutated`, `token` (per token — `logprob`/`top_al
 when captured, `scores`/`per_layer_scores` when probes are loaded, `probe_readings`
 `Record<name, {fraction, nearest}>` when any probe is attached, computed
 inline off `session._capture._per_layer`, and `lens_readout`
-`Record<layerStr, [token, score][]>` while the live lens is on — the WS
+`Record<layerStr, [token, score][]>` + `lens_aggregate`
+`[token, strength, com, spread][]` while the live lens is on — the WS
 `_on_token` stamps `_saklas_wants_lens_readout` so the engine computes the
-step readout, and `build_token_event` copies the token tap's `lens` slot onto
+step readout, and `build_token_event` copies the token tap's `lens` /
+`lens_aggregate` slots onto
 the frame), `done` (`result` with `text`, `tokens`,
 `finish_reason`, `usage`, `per_token_probes`, `mean_logprob`, `mean_surprise`,
 `probe_readings` aggregate), `error` (validation errors keep the connection open;

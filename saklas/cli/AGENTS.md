@@ -235,7 +235,10 @@ category list through verbatim (tagged concepts only, no multi-node sweep).
 - `lens top`: positionals `model` + `prompt` (raw text, no chat template),
   `-k/--top-k` (8), `--layers L1,L2,...` (default: 9 evenly spaced fitted
   layers), `--position P` (repeatable, negative ok; default final position),
-  `-d`, `-q`, `-j`.
+  `-d`, `-q`, `-j`. Output leads with the layer-aggregated block (`token ·
+  strength · com ±spread`, computed over the workspace-band subset of the
+  displayed layers via `jlens_readout(aggregate=True)` — same forward), then
+  the per-layer matrix; JSON carries both under `aggregate` / `layers`.
 - `lens decompose`: positional `selector`, `-m/--model` (required),
   `-k/--top-k` (16 — the sparsity budget), `--layers L1,L2,...`, `-d`, `-q`,
   `-j`.

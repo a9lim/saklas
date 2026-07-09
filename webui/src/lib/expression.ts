@@ -24,6 +24,7 @@
 // the per-card ``along[,onto]`` for manifold terms.
 
 import type {
+  JLensSteerEntry,
   ManifoldSteerEntry,
   SteerEntry,
   SubspaceSteerEntry,
@@ -62,6 +63,11 @@ export function serializeExpression(
   for (const [name, entry] of rack) {
     if (entry.enabled && entry.mode === "subspace") {
       parts.push(formatSubspaceTerm(name, entry, subspaceAlong));
+    }
+  }
+  for (const [name, entry] of rack) {
+    if (entry.enabled && entry.mode === "jlens") {
+      parts.push(formatJLensTerm(name, entry));
     }
   }
   for (const [name, entry] of rack) {
@@ -111,6 +117,14 @@ function formatCoeff(coeff: number): string {
 function formatTriggerSuffix(trigger: Trigger): string {
   const kw = TRIGGER_TO_KEYWORD[trigger];
   return kw ? `@${kw}` : "";
+}
+
+/** Render one J-lens token term — the plain atom ``<alpha> jlens/<word>``
+ *  plus an optional ``@trigger``.  The rack key is the full atom (the
+ *  engine resolves it through ``register_jlens_direction``); per-chip
+ *  ``alpha`` because lens atoms run hotter than concept vectors. */
+function formatJLensTerm(name: string, entry: JLensSteerEntry): string {
+  return `${formatCoeff(entry.alpha)} ${name}${formatTriggerSuffix(entry.trigger)}`;
 }
 
 /** Render one manifold (curved) rack entry — ``<along[,onto]>

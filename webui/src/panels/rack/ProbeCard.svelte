@@ -113,6 +113,10 @@
   const residual = $derived(aggregate?.residual ?? null);
   const trajectory = $derived(entry.trajectory ?? []);
 
+  // ---------- depth stats (where in the layer stack the probe reads) ----------
+  const depthCom = $derived(latest?.depth_com?.[0] ?? null);
+  const depthSpread = $derived(latest?.depth_spread?.[0] ?? null);
+
   /** Mini-map gating — only 2-D box-domain probes with attached node coords
    *  render the visual (intrinsic_dim 1 of a 2-node axis and the custom
    *  carrier of a flat discover fan both fall out here). */
@@ -298,13 +302,23 @@
       </div>
     {/each}
 
-    {#if !affine && residual !== null}
-      <!-- Curved-only settled meta: how far off-surface the point came to
-           rest (the in-subspace coords are now the bars above). -->
+    {#if depthCom !== null || (!affine && residual !== null)}
+      <!-- Settled meta: the depth center of mass of the per-layer read
+           (both families), plus the curved-only off-surface residual. -->
       <div class="meta">
-        <span class="meta-item" title="normalized off-surface residual">
-          residual {fmtCoord(residual)}
-        </span>
+        {#if depthCom !== null}
+          <span
+            class="meta-item"
+            title="depth center of mass of the per-layer read, share-weighted (0 = first block, 1 = last)"
+          >
+            com {fmtCoord(depthCom)}{depthSpread !== null ? ` ±${fmtCoord(depthSpread)}` : ""}
+          </span>
+        {/if}
+        {#if !affine && residual !== null}
+          <span class="meta-item" title="normalized off-surface residual">
+            residual {fmtCoord(residual)}
+          </span>
+        {/if}
       </div>
     {/if}
 

@@ -751,6 +751,24 @@
             {/if}
           </div>
         </div>
+        {#if (lensData.aggregate ?? []).length > 0}
+          <!-- Layer-aggregated view of the same logits (band-restricted):
+               strength = mean band probability, com = salience-weighted
+               depth center of mass (0 = first block, 1 = last). -->
+          <div class="lens-agg" role="list" aria-label="Aggregate lens tokens">
+            <span class="lens-agg-label">aggregate</span>
+            {#each lensData.aggregate ?? [] as chip, i (i)}
+              <span
+                class="lens-agg-chip"
+                role="listitem"
+                title={`"${chip.token}" — strength ${chip.strength.toFixed(3)} · com ${chip.com.toFixed(2)} ±${chip.spread.toFixed(2)}`}
+              >
+                <span class="lens-agg-tok">{chip.token.trim() || JSON.stringify(chip.token)}</span>
+                <span class="lens-agg-com">@{chip.com.toFixed(2)}</span>
+              </span>
+            {/each}
+          </div>
+        {/if}
         <div class="grid-scroll">
           <table class="lens-table">
             <thead>
@@ -1107,6 +1125,38 @@
   .logits-table tr.chosen td {
     background: var(--accent-subtle);
     color: var(--fg-strong);
+  }
+  /* J-lens tab — the layer-aggregated chip row above the matrix. */
+  .lens-agg {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: var(--space-2);
+    margin-bottom: var(--space-3);
+  }
+  .lens-agg-label {
+    color: var(--fg-muted);
+    font-size: var(--text-xs);
+    text-transform: uppercase;
+    margin-right: var(--space-2);
+  }
+  .lens-agg-chip {
+    display: inline-flex;
+    align-items: baseline;
+    gap: var(--space-1);
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 0 var(--space-3);
+  }
+  .lens-agg-tok {
+    color: var(--accent);
+  }
+  .lens-agg-com {
+    color: var(--fg-muted);
+    font-size: var(--text-2xs);
+    font-variant-numeric: tabular-nums;
   }
   /* J-lens tab — the workspace readout matrix.  Same table chrome as the
      logits table; cells carry an inline probability tint, so the static

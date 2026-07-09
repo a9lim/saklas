@@ -1,51 +1,109 @@
 <script lang="ts">
-  // Inspector — the right-hand control rack: two equal sections, the
-  // steering rack on top, the (fused vector + manifold) probe rack on
-  // the bottom.  The sampling strip moved to the bottom of the threads
-  // column (below the workbench card), giving these racks this column's
-  // whole budget.
+  // Inspector — the right-hand control rack, split into two tabs over the
+  // ONE steering expression + probe roster:
   //
-  // Manifold probes used to live in their own third rack; they fused
-  // into ProbeRack so the two surfaces (vector + manifold) read as one
-  // family — same shape SteeringRack already uses for vector + manifold
-  // steering.
+  //   PROBES — the linear-probe surface: steering rack (subspace +
+  //            manifold terms) over the probe rack.
+  //   J-LENS — the Jacobian-lens surface: token steer chips, pinned token
+  //            probes, and the layer-aggregated workspace readout (the
+  //            per-layer matrix behind a disclosure).
+  //
+  // The split is presentational — each tab shows its own term/probe
+  // family; a j-lens steer chip and a subspace card serialize into the
+  // same expression.  The tab strip only renders when a lens is fitted
+  // for the model (``session_info.jlens_fitted``); otherwise the probes
+  // surface owns the column and nothing hints at the absent channel.
 
   import SteeringRack from "./SteeringRack.svelte";
   import ProbeRack from "./ProbeRack.svelte";
-  import WorkspacePanel from "./WorkspacePanel.svelte";
+  import JLensPanel from "./JLensPanel.svelte";
+  import {
+    inspectorState,
+    sessionState,
+    setInspectorTab,
+  } from "../lib/stores.svelte";
+
+  const lensAvailable = $derived(sessionState.info?.jlens_fitted === true);
+  const tab = $derived(lensAvailable ? inspectorState.tab : "probes");
 </script>
 
 <aside class="inspector" aria-label="Saklas inspector">
-  <div class="rack-grid">
-    <SteeringRack />
-    <ProbeRack />
-    <!-- WORKSPACE (J-lens) — renders nothing when no lens is fitted, so
-         the auto row collapses and the two racks keep the full budget. -->
-    <WorkspacePanel />
-  </div>
+  {#if lensAvailable}
+    <nav class="tabs" aria-label="Inspector mode">
+      <button
+        type="button"
+        class="tab"
+        class:active={tab === "probes"}
+        aria-pressed={tab === "probes"}
+        onclick={() => setInspectorTab("probes")}
+      >PROBES</button>
+      <button
+        type="button"
+        class="tab"
+        class:active={tab === "jlens"}
+        aria-pressed={tab === "jlens"}
+        onclick={() => setInspectorTab("jlens")}
+      >J-LENS</button>
+    </nav>
+  {/if}
+
+  {#if tab === "jlens"}
+    <JLensPanel />
+  {:else}
+    <div class="rack-grid">
+      <SteeringRack />
+      <ProbeRack />
+    </div>
+  {/if}
 </aside>
 
 <style>
-  /* One flat panel — no outer padding, so the two rack sections run
-   * edge to edge and the hairline between them is full-bleed. */
+  /* One flat panel — no outer padding, so the rack sections run edge to
+   * edge and the hairlines between them are full-bleed. */
   .inspector {
     display: grid;
-    grid-template-rows: minmax(0, 1fr);
+    grid-template-rows: auto minmax(0, 1fr);
     height: 100%;
     max-height: 100%;
     min-height: 0;
     overflow: hidden;
     background: var(--bg-alt);
   }
+  /* No tab strip (no fitted lens) → the single content row owns the
+   * column. */
+  .inspector:not(:has(.tabs)) {
+    grid-template-rows: minmax(0, 1fr);
+  }
+
+  .tabs {
+    display: flex;
+    border-bottom: 1px solid var(--border);
+  }
+  .tab {
+    flex: 1 1 0;
+    background: transparent;
+    border: 0;
+    border-bottom: 2px solid transparent;
+    color: var(--fg-muted);
+    font-size: var(--text-sm);
+    font-weight: var(--weight-bold);
+    text-transform: uppercase;
+    padding: var(--space-3) 0;
+    cursor: pointer;
+  }
+  .tab:hover {
+    color: var(--fg);
+  }
+  .tab.active {
+    color: var(--accent);
+    border-bottom-color: var(--accent);
+  }
 
   /* Two equal flat rack sections, divided only by SteeringRack's
-   * border-bottom hairline — no gap, no nested boxes.  The third ``auto``
-   * row is the WORKSPACE (J-lens) readout, content-sized: zero when no
-   * lens is fitted (the panel renders nothing), a header strip when off,
-   * a bounded matrix while live. */
+   * border-bottom hairline — no gap, no nested boxes. */
   .rack-grid {
     display: grid;
-    grid-template-rows: minmax(0, 1fr) minmax(0, 1fr) auto;
+    grid-template-rows: minmax(0, 1fr) minmax(0, 1fr);
     height: 100%;
     max-height: 100%;
     min-height: 0;

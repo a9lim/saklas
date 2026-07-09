@@ -18,6 +18,7 @@ from saklas.core.jlens import (
     JacobianLens,
     JacobianLensError,
     MultiTokenWordError,
+    aggregate_readout,
     fit_jacobian_lens,
     lens_logits,
     resolve_word_token,
@@ -306,6 +307,78 @@ def test_topk_logprobs_matches_full_log_softmax() -> None:
     exp_vals, exp_idxs = expected.topk(7, dim=-1)
     assert torch.equal(idxs, exp_idxs)
     assert torch.allclose(vals, exp_vals)
+
+
+def test_aggregate_readout_strength_is_mean_probability() -> None:
+    logits = torch.randn(3, _VOCAB)
+    depths = [0.4, 0.6, 0.8]
+    rows = aggregate_readout(logits, depths, top_k=_VOCAB)
+    probs = logits.softmax(dim=-1).mean(dim=0)
+    got = {tok: s for tok, s, _, _ in rows}
+    assert len(got) == _VOCAB
+    for tok, s in got.items():
+        assert s == pytest.approx(float(probs[tok]), abs=1e-6)
+    # sorted by descending strength
+    strengths = [s for _, s, _, _ in rows]
+    assert strengths == sorted(strengths, reverse=True)
+
+
+def test_aggregate_readout_com_tracks_where_a_token_leads() -> None:
+    # Token 0 dominates the earliest layer, token 1 the latest; a token that
+    # never leads anywhere (uniform row) should sit near the salience-mean
+    # depth. Sharp logits make each layer's salience concentrate on its
+    # leader.
+    depths = [0.2, 0.5, 0.8]
+    logits = torch.full((3, _VOCAB), -10.0)
+    logits[0, 0] = 10.0
+    logits[1, 3] = 10.0
+    logits[2, 1] = 10.0
+    rows = {tok: (com, spread) for tok, _, com, spread in
+            aggregate_readout(logits, depths, top_k=_VOCAB)}
+    com0, _ = rows[0]
+    com1, _ = rows[1]
+    assert com0 < 0.3          # leads only the early layer
+    assert com1 > 0.7          # leads only the late layer
+    assert com0 < rows[3][0] < com1  # mid-layer leader sits between
+
+
+def test_aggregate_readout_single_layer_degenerates() -> None:
+    logits = torch.randn(1, _VOCAB)
+    rows = aggregate_readout(logits, [0.55], top_k=4)
+    assert len(rows) == 4
+    for _, strength, com, spread in rows:
+        assert 0.0 <= strength <= 1.0
+        assert com == pytest.approx(0.55, abs=1e-6)
+        assert spread == pytest.approx(0.0, abs=1e-6)
+
+
+def test_aggregate_readout_salience_com_beats_mass_com_late_bias() -> None:
+    # The design point: a token that LEADS a diffuse early layer but is
+    # rank-2 in a sharp late layer should read early by salience, even
+    # though raw probability mass is concentrated late.
+    depths = [0.3, 0.9]
+    logits = torch.zeros(2, _VOCAB)
+    logits[0, 0] = 1.0          # diffuse early layer, token 0 barely leads
+    logits[1, 1] = 12.0         # sharp late layer led by token 1
+    logits[1, 0] = 9.0          # token 0 clearly present but not leading
+    rows = {tok: com for tok, _, com, _ in
+            aggregate_readout(logits, depths, top_k=_VOCAB)}
+    # mass CoM for token 0 would be ≈0.9 (its late p dwarfs the diffuse
+    # early p); salience CoM must pull it toward the early layer it leads.
+    early_sal = 1.0                       # leads layer 0
+    late_sal = math.exp(9.0 - 12.0)       # relative to the late leader
+    expected = (0.3 * early_sal + 0.9 * late_sal) / (early_sal + late_sal)
+    assert rows[0] == pytest.approx(expected, abs=0.02)
+    assert rows[0] < 0.5 < rows[1]
+
+
+def test_aggregate_readout_validates_shapes() -> None:
+    with pytest.raises(ValueError):
+        aggregate_readout(torch.randn(_VOCAB), [0.5], top_k=3)
+    with pytest.raises(ValueError):
+        aggregate_readout(torch.randn(2, _VOCAB), [0.5], top_k=3)
+    with pytest.raises(ValueError):
+        aggregate_readout(torch.randn(0, _VOCAB), [], top_k=3)
 
 
 class _WordTokenizer:

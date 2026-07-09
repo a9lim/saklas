@@ -44,6 +44,10 @@ class _StubSession:
     _resolve_jlens_source_layers = SaklasSession._resolve_jlens_source_layers
     _jlens_transport_stack = SaklasSession._jlens_transport_stack
     _jlens_topk_rows = SaklasSession._jlens_topk_rows
+    _jlens_logits_rows = SaklasSession._jlens_logits_rows
+    _jlens_aggregate_rows = SaklasSession._jlens_aggregate_rows
+    _jlens_decode_id = SaklasSession._jlens_decode_id
+    _jlens_depths = SaklasSession._jlens_depths
     register_jlens_direction = SaklasSession.register_jlens_direction
     enable_live_lens = SaklasSession.enable_live_lens
     disable_live_lens = SaklasSession.disable_live_lens
@@ -241,6 +245,47 @@ def test_jlens_readout_shape_and_default_position() -> None:
         assert isinstance(token, str) and logprob <= 0.0
 
 
+def test_jlens_readout_aggregate_rides_same_logits() -> None:
+    s = _StubSession()
+    s.fit_jlens(_PROMPTS)
+    result = s.jlens_readout(
+        "a prompt that is long enough.", top_k=3, aggregate=True,
+    )
+    out, agg = result
+    assert set(out) == {0, 1}
+    # default position only → one aggregate list
+    assert len(agg) == 1
+    rows = agg[0]
+    assert len(rows) == 3
+    strengths = [r[1] for r in rows]
+    assert strengths == sorted(strengths, reverse=True)
+    for tok, strength, com, spread in rows:
+        assert isinstance(tok, str)
+        assert 0.0 <= strength <= 1.0
+        assert 0.0 <= com <= 1.0
+        assert spread >= 0.0
+    # 3-layer toy: the 40-90% band keeps only L1, so the aggregate is the
+    # single-layer degenerate case — com pinned at L1's normalized depth,
+    # spread 0.
+    depth_l1 = 1 / (3 - 1)
+    for _, _, com, spread in rows:
+        assert com == pytest.approx(depth_l1, abs=1e-6)
+        assert spread == pytest.approx(0.0, abs=1e-6)
+
+
+def test_jlens_readout_aggregate_multi_position() -> None:
+    s = _StubSession()
+    s.fit_jlens(_PROMPTS)
+    result = s.jlens_readout(
+        "a prompt that is long enough.", positions=[-2, -1], top_k=2,
+        aggregate=True,
+    )
+    out, agg = result
+    assert all(len(rows) == 2 for rows in out.values())
+    assert len(agg) == 2
+    assert all(len(rows) == 2 for rows in agg)
+
+
 def test_jlens_readout_requires_fitted_lens() -> None:
     s = _StubSession()
     with pytest.raises(LensNotFittedError, match="saklas lens fit"):
@@ -368,14 +413,27 @@ def test_live_lens_readout_step_reads_latest_slices() -> None:
         1: torch.randn(6, generator=gen),
     })
 
-    out = SaklasSession._live_lens_readout_step(s)  # type: ignore[arg-type]
-    assert out is not None and set(out) == {0, 1}
+    step = SaklasSession._live_lens_readout_step(s)  # type: ignore[arg-type]
+    assert step is not None
+    out, agg = step
+    assert set(out) == {0, 1}
     for row in out.values():
         assert len(row) == 3
         assert all(isinstance(tok, str) for tok, _ in row)
     # scores are descending
     scores = [sc for _, sc in out[0]]
     assert scores == sorted(scores, reverse=True)
+    # the aggregate chip list rides the same step: top_k rows of
+    # (token, strength, com, spread) with strength descending in [0, 1]
+    # and com/spread valid normalized depths
+    assert len(agg) == 3
+    strengths = [srow[1] for srow in agg]
+    assert strengths == sorted(strengths, reverse=True)
+    for tok, strength, com, spread in agg:
+        assert isinstance(tok, str)
+        assert 0.0 <= strength <= 1.0
+        assert 0.0 <= com <= 1.0
+        assert spread >= 0.0
 
 
 def test_live_lens_readout_step_none_when_off() -> None:
@@ -477,6 +535,14 @@ def test_jlens_token_readout_shape_and_position() -> None:
         assert len(rows) == 4
         tok, lp, tid = rows[0]
         assert isinstance(tok, str) and lp <= 0.0 and isinstance(tid, int)
+    # the aggregate block rides the same logits, band-restricted (L1 only
+    # in the 3-layer toy → single-layer degenerate com/spread)
+    assert len(out["aggregate"]) == 4
+    for tok, strength, com, spread in out["aggregate"]:
+        assert isinstance(tok, str)
+        assert 0.0 <= strength <= 1.0
+        assert com == pytest.approx(1 / (3 - 1), abs=1e-6)
+        assert spread == pytest.approx(0.0, abs=1e-6)
     # user_role/assistant_role of the replayed render come off the nodes
     assert s.prepare_calls[0]["input"] == "a user turn"
     assert s.prepare_calls[0]["raw"] is False

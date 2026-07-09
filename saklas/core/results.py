@@ -110,6 +110,17 @@ class ProbeReading:
       *on-surface-but-diffuse* — the density taper a hard ``residual`` threshold
       can't express.  ``1.0`` for a flat fit (the surface fills its subspace) and
       for a curved fit with no σ-field (no tube information).
+
+    **Depth statistics** (where in the layer stack the probe reads):
+
+    * ``depth_com`` / ``depth_spread`` — per-axis depth center of mass (+ std)
+      of the per-layer coordinate trace, in normalized depth (0 = first
+      block, 1 = last).  Mass per layer is ``share_weight_L · |coord_L|`` —
+      where the probe's signal actually reads, weighted the same way the
+      cross-layer aggregate coordinate is.  Aligned with ``coords`` (one
+      entry per domain axis).  Empty when the reading carries no per-layer
+      trace (lean per-token modes) or the monitor wasn't given the model
+      depth.
     """
     fraction: float
     nearest: list[tuple[str, float]]
@@ -120,6 +131,8 @@ class ProbeReading:
     residual_per_layer: dict[int, float] = field(default_factory=dict)
     assignment: list[tuple[str, float]] = field(default_factory=list)
     membership: float = 1.0
+    depth_com: tuple[float, ...] = ()
+    depth_spread: tuple[float, ...] = ()
     # Per-layer reduced subspace coords in the **whitened** frame
     # (``cdist_query = c @ chol``, the same metric ``node_white`` lives in) — the
     # current hidden state's position for the probe-inspector geometry plot +
@@ -149,6 +162,8 @@ class ProbeReading:
             },
             "assignment": [[label, prob] for label, prob in self.assignment],
             "membership": self.membership,
+            "depth_com": list(self.depth_com),
+            "depth_spread": list(self.depth_spread),
             "subspace_coords_per_layer": {
                 str(k): list(v)
                 for k, v in self.subspace_coords_per_layer.items()
@@ -348,6 +363,13 @@ class TokenEvent:
     # score), ...]}`` — the top-k lens tokens at each selected layer.
     # ``None`` when ``session.enable_live_lens`` is off.
     lens_readout: dict[int, list[tuple[str, float]]] | None = None
+    # Layer-aggregated view of the same step's lens readout: ``[(token,
+    # strength, com, spread), ...]`` — per-layer softmax → mean-probability
+    # strength over the workspace-band subset of the live layers, plus the
+    # salience-weighted depth center of mass (0 = first block, 1 = last)
+    # and its std (:func:`saklas.core.jlens.aggregate_readout`). ``None``
+    # when the live lens is off.
+    lens_aggregate: list[tuple[str, float, float, float]] | None = None
 
     @property
     def scores(self) -> "dict[str, ProbeReading] | None":

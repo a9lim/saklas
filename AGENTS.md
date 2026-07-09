@@ -301,22 +301,42 @@ Three read surfaces, one write surface:
 
 - **Readout** — `lens top` / `session.jlens_readout`: `softmax(W_U · norm(J_l h))`
   ranks the vocabulary by what an intermediate activation is disposed to make the
-  model say. `session.enable_live_lens()` streams the top-k per selected layer
-  every decode step (`TokenEvent.lens_readout`, TUI `/lens` → WORKSPACE section);
-  the reader consumes the capture's latest slices post-forward at the token tap —
-  no new forward hooks, so steering fast-path/compile eligibility is untouched.
-  The dashboard's WORKSPACE panel is the server sibling: `POST /saklas/v1/
-  sessions/{id}/lens/live` toggles the live lens, the native WS `token` frame
-  carries the per-step matrix as `lens_readout`, and session info's
-  `live_lens_layers` rehydrates the toggle across reloads.
+  model say. Every readout surface also carries the **layer-aggregated** view
+  (`core/jlens.py::aggregate_readout`, from the same logits — no extra matvec):
+  per-layer softmax calibrates away the cross-layer logit scale, then per token
+  `strength = mean_l p_l(v)` (mean band probability, 0..1; uniform layer weights —
+  softmax already lets a confident layer dominate) and a depth center of mass
+  `com` (+ `spread`) weighted by the within-layer *salience*
+  `p_l(v)/max_v' p_l(v')` rather than raw mass (early workspace layers are
+  diffuse, so mass-CoM reads late for every token; salience lets each layer vote
+  on *where the token is near the top of the readout*). Top-k selection runs on
+  the aggregated full-vocab strengths. The aggregate is restricted to the
+  **workspace-band subset** of the requested layers (falling back to all when
+  none are in band — same band policy as steering); the per-layer matrix always
+  covers the full request. `session.enable_live_lens()` streams the top-k per
+  selected layer plus the aggregate chip list every decode step
+  (`TokenEvent.lens_readout` / `TokenEvent.lens_aggregate`, TUI `/lens` →
+  WORKSPACE section with a `Σ` aggregate row); the reader consumes the capture's
+  latest slices post-forward at the token tap — no new forward hooks, so steering
+  fast-path/compile eligibility is untouched. The dashboard's **J-LENS tab** is
+  the server sibling (the inspector column splits into PROBES / J-LENS tabs when
+  a lens is fitted): `POST /saklas/v1/sessions/{id}/lens/live` toggles the live
+  lens, the native WS `token` frame carries the per-step matrix as
+  `lens_readout` + the chip list as `lens_aggregate`, and session info's
+  `live_lens_layers` rehydrates the toggle across reloads. The tab's STEER
+  section authors `α jlens/<word>` chips into the shared steering expression;
+  its PROBE section pins `jlens/<word>` token probes (ordinary probe-rack
+  entries — chips showing the live whitened coordinate + depth CoM) and shows
+  the open-vocab aggregate readout with the matrix behind a disclosure.
   `session.jlens_token_readout(node_id, raw_index)` is the loom-anchored variant
   behind the dashboard token drilldown's **j-lens tab** (`GET /saklas/v1/
   sessions/{id}/lens/token-readout`): rebuild the node's prompt render + raw
   decode prefix, one capture forward under the node's recipe steering (exact for
   always-active affine terms — the slide is position-independent; phase/gated
   terms don't reproduce on a bare forward), and read the full fitted-layer top-k
-  matrix at the position that produced the clicked token. On-demand recompute,
-  zero decode-time cost; `steered=false` reads the unsteered counterfactual.
+  matrix + the band-restricted aggregate block at the position that produced the
+  clicked token. On-demand recompute, zero decode-time cost; `steered=false`
+  reads the unsteered counterfactual.
 - **Steering atoms** — `jlens/<word>` is an ordinary `ns/name` atom; the J-lens
   direction for vocab id v at layer l is `W_U[v] @ J_l`, a per-layer direction
   registered lazily into the profile registry (`session.register_jlens_direction`,
@@ -857,7 +877,9 @@ tok/s):
 - **Monitor capture is hook-driven**, inline with generation — no second forward
   pass. The unified `Monitor` reads every probe — flat or curved — as a whitened
   **coordinate**, emitting a full `ProbeReading` (`coords` domain-frame + `fraction`
-  + `nearest` + `residual`, plus per-layer traces). The full-reading *shape* is the
+  + `nearest` + `residual`, plus per-layer traces, plus the per-axis depth stats
+  `depth_com`/`depth_spread` — the share-weighted `Σ_L depth_L·share_L·|coord_L|`
+  center of mass of where in the stack the probe reads, normalized 0..1). The full-reading *shape* is the
   research-tool priority; execution is no-redundancy: the whole **flat** roster is
   scored together (`_score_flat_batched` — one `Σ⁻¹h` Woodbury apply + block-diagonal
   matmuls + a single host transfer per layer), **curved** probes run the per-probe

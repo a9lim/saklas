@@ -31,8 +31,11 @@
   // activeProbeNames() reads probeRack.active + entries + sortMode, all
   // $state-tracked, so this $derived re-runs on any of those changes.  We
   // then split it into the two families, preserving the sort order within
-  // each.
-  const sorted = $derived(activeProbeNames());
+  // each.  ``jlens/`` token probes are excluded — they render as pinned
+  // chips in the J-LENS tab, not as rack rows here.
+  const sorted = $derived(
+    activeProbeNames().filter((n) => !n.startsWith("jlens/")),
+  );
 
   const subspaceProbes = $derived.by(() =>
     sorted.filter((n) => probeRack.entries.get(n)?.info.is_affine === true),

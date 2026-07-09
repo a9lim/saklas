@@ -2492,15 +2492,30 @@ def _run_lens_top(args: argparse.Namespace) -> None:
             sys.exit(1)
         if layers is None:
             layers = _lens_default_top_layers(lens.source_layers)
-        out = session.jlens_readout(
+        out, agg = session.jlens_readout(
             args.prompt, layers=layers, positions=args.position,
-            top_k=args.top_k,
+            top_k=args.top_k, aggregate=True,
         )
     if getattr(args, "json_output", False):
         print(_json.dumps({
             "model": args.model,
             "prompt": args.prompt,
             "positions": args.position or [-1],
+            # Layer-aggregated view (workspace-band subset of the layers):
+            # per-layer softmax → mean-probability strength +
+            # salience-weighted depth center of mass, strength-descending.
+            "aggregate": [
+                [
+                    {
+                        "token": t,
+                        "strength": round(s, 6),
+                        "com": round(c, 4),
+                        "spread": round(sp, 4),
+                    }
+                    for t, s, c, sp in rows
+                ]
+                for rows in agg
+            ],
             "layers": {
                 str(layer): [
                     [{"token": t, "logprob": round(lp, 4)} for t, lp in row]
@@ -2514,6 +2529,13 @@ def _run_lens_top(args: argparse.Namespace) -> None:
     for pos_idx, pos in enumerate(positions):
         if len(positions) > 1:
             print(f"\nposition {pos}:")
+        print("  aggregate (workspace band):")
+        for t, s, c, sp in agg[pos_idx]:
+            tok = t.strip() or repr(t)
+            print(
+                f"    {tok:<20} strength {s:.3f}   com {c:.2f} ±{sp:.2f}"
+            )
+        print("  per-layer:")
         for layer in sorted(out):
             row = out[layer][pos_idx]
             toks = "  ".join(f"{t.strip() or repr(t)}" for t, _ in row)

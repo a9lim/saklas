@@ -29,6 +29,51 @@ _EMPTY_STATS = {"count": 0, "sum": 0.0, "sum_sq": 0.0,
                 "min": float("inf"), "max": float("-inf")}
 
 
+def _depth_stats(
+    coords_per_layer: dict[int, tuple[float, ...]],
+    weights: dict[int, float],
+    denom: float,
+) -> tuple[tuple[float, ...], tuple[float, ...]]:
+    """Per-axis depth center of mass (+ std) of a per-layer coordinate trace.
+
+    Mass per (layer, axis) is ``weight_L · |coord_L[axis]|`` — where in depth
+    the probe's signal actually reads, weighted the same way the cross-layer
+    aggregate coordinate is (the Mahalanobis share).  Depths are
+    ``layer / denom`` (``denom = n_layers − 1``), so 0 = first block, 1 =
+    last.  Pure host-side arithmetic over values already transferred — no
+    tensor work.  Empty tuples when the trace is empty or ``denom`` unset;
+    a zero-mass axis (activation at neutral) reports ``(0.0, 0.0)``.
+    """
+    if not coords_per_layer or denom <= 0.0:
+        return (), ()
+    n_dim = max(len(c) for c in coords_per_layer.values())
+    coms: list[float] = []
+    spreads: list[float] = []
+    for axis in range(n_dim):
+        total = 0.0
+        first_moment = 0.0
+        for layer, coords in coords_per_layer.items():
+            if axis >= len(coords):
+                continue
+            m = weights.get(layer, 0.0) * abs(coords[axis])
+            total += m
+            first_moment += m * (layer / denom)
+        if total <= 1e-12:
+            coms.append(0.0)
+            spreads.append(0.0)
+            continue
+        com = first_moment / total
+        var = 0.0
+        for layer, coords in coords_per_layer.items():
+            if axis >= len(coords):
+                continue
+            m = weights.get(layer, 0.0) * abs(coords[axis])
+            var += m * ((layer / denom) - com) ** 2
+        coms.append(com)
+        spreads.append(max(var / total, 0.0) ** 0.5)
+    return tuple(coms), tuple(spreads)
+
+
 class Monitor:
     """Reads probes as whitened subspace coordinates — flat and curved alike.
 
@@ -79,7 +124,8 @@ class Monitor:
 
     def __init__(self, probe_manifolds: dict[str, "Manifold"] | None = None,
                  layer_means: dict[int, torch.Tensor] | None = None,
-                 whitener: Any = None):
+                 whitener: Any = None,
+                 n_layers: int | None = None):
         """
         probe_manifolds: maps probe name -> flat :class:`Manifold` (rank-1
             concept axis or rank-R discover fit).  Ad-hoc baked directions
@@ -92,10 +138,17 @@ class Monitor:
             path — only exposed via the ``layer_means`` property).
         whitener: the :class:`~saklas.core.mahalanobis.LayerWhitener`;
             mandatory at scoring time (covers every probed layer or raise).
+        n_layers: the model's block count — the depth axis for the
+            ``depth_com``/``depth_spread`` reading statistics.  ``None``
+            (direct-constructed test monitors) leaves them empty.
         """
         self._probes: dict[str, AttachedManifoldProbe] = {}
         self._layer_means: dict[int, torch.Tensor] = dict(layer_means) if layer_means else {}
         self._whitener: Any = whitener
+        # Depth denominator for _depth_stats: layer / (n_layers − 1) ∈ [0, 1].
+        self._depth_denom: float = (
+            float(n_layers - 1) if n_layers is not None and n_layers > 1 else 0.0
+        )
         self._whitener_factor_cache: dict[
             tuple[int, str, torch.dtype],
             tuple[torch.Tensor, torch.Tensor, float],
@@ -607,6 +660,9 @@ class Monitor:
                 for j in range(ta)
             ]
 
+        depth_com, depth_spread = _depth_stats(
+            coords_per_layer, w_shared, self._depth_denom,
+        )
         return ProbeReading(
             fraction=frac_mean,
             nearest=nearest,
@@ -617,6 +673,8 @@ class Monitor:
             residual_per_layer=residual_per_layer,
             assignment=assignment,
             membership=membership,
+            depth_com=depth_com,
+            depth_spread=depth_spread,
         )
 
     def _score_full(
@@ -1467,6 +1525,11 @@ class Monitor:
                     (labels[ci][int(round(ai_v[row + j]))], ap_v[row + j])
                     for j in range(top_n)
                 ]
+            depth_com, depth_spread = _depth_stats(
+                coords_per_layer_acc[ci],
+                self._probes[name].share_weights,
+                self._depth_denom,
+            )
             out[name] = ProbeReading(
                 fraction=frac_v[ci],
                 nearest=nearest,
@@ -1477,6 +1540,8 @@ class Monitor:
                 residual_per_layer=residual_per_layer_acc[ci],
                 assignment=assignment,
                 membership=1.0,
+                depth_com=depth_com,
+                depth_spread=depth_spread,
             )
         return out
 

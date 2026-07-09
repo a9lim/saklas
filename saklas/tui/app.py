@@ -1470,12 +1470,13 @@ class SaklasApp(App[None]):
                         # attached or ``live_scores`` is off; otherwise the
                         # full per-probe ``ProbeReading`` dict the trait
                         # panel's curved section renders mid-gen.
-                        # Optional 10th slot: the live J-lens workspace
-                        # readout (``/lens``) — None when the live lens is
-                        # off.
+                        # Optional 10th/11th slots: the live J-lens workspace
+                        # readout (``/lens``) + its layer-aggregated chip
+                        # list — None when the live lens is off.
                         ("tok", event.text, event.thinking, event.scores,
                          event.perplexity, event.logprob, widget, False,
-                         event.probe_readings, event.lens_readout),
+                         event.probe_readings, event.lens_readout,
+                         event.lens_aggregate),
                     )
                     self._gen_token_count += 1
                 # Normal completion — pull per-token scores out of the
@@ -1966,7 +1967,14 @@ class SaklasApp(App[None]):
                 # producers (e.g. test stubs) that emit the 8-element form.
                 manifold_readings = None
                 lens_readout = None
-                if len(item) >= 10:
+                lens_aggregate = None
+                if len(item) >= 11:
+                    (
+                        _, token, is_thinking, scores, perplexity, logprob,
+                        widget, is_shadow, manifold_readings, lens_readout,
+                        lens_aggregate,
+                    ) = item
+                elif len(item) >= 10:
                     (
                         _, token, is_thinking, scores, perplexity, logprob,
                         widget, is_shadow, manifold_readings, lens_readout,
@@ -1993,7 +2001,9 @@ class SaklasApp(App[None]):
                 if lens_readout is not None and not is_shadow:
                     # Live J-lens workspace readout (``/lens``): same
                     # shadow-skip rule as the probe rack.
-                    self._trait_panel.update_lens_readout(lens_readout)
+                    self._trait_panel.update_lens_readout(
+                        lens_readout, aggregate=lens_aggregate,
+                    )
                 if widget is not None:
                     if is_thinking:
                         widget.append_thinking_token(token)

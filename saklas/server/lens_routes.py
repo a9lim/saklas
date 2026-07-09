@@ -123,6 +123,18 @@ def register_lens_routes(app: FastAPI) -> None:
             "token_id": out["token_id"],
             "token_text": out["token_text"],
             "steering": out["steering"],
+            # Layer-aggregated view of the same logits (band-restricted):
+            # mean band probability + salience-weighted depth center of
+            # mass, strength-descending.
+            "aggregate": [
+                {
+                    "token": tok,
+                    "strength": round(strength, 6),
+                    "com": round(com, 4),
+                    "spread": round(spread, 4),
+                }
+                for tok, strength, com, spread in out.get("aggregate", [])
+            ],
             "layers": [
                 {
                     "layer": layer,

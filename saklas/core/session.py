@@ -1268,6 +1268,7 @@ class SaklasSession:
         # without grammar changes.
         self._monitor = Monitor(
             probe_manifolds, self._layer_means, whitener=self._whitener,
+            n_layers=len(self._layers),
         )
 
         # Steering-resolution + stack collaborator (extracted from the session).
@@ -2089,18 +2090,38 @@ class SaklasSession:
         cache[key] = stack
         return stack
 
-    def _jlens_topk_rows(
+    def _jlens_decode_id(self, token_id: int) -> str:
+        """Cache-backed single-token decode shared by every lens readout."""
+        decode_cache = cast(
+            "dict[int, str] | None", getattr(self, "_jlens_decode_cache", None),
+        )
+        if decode_cache is None:
+            decode_cache = {}
+            self._jlens_decode_cache = decode_cache
+        tok = decode_cache.get(token_id)
+        if tok is None:
+            tok = str(self._tokenizer.decode([token_id]))
+            decode_cache[token_id] = tok
+        return tok
+
+    def _jlens_depths(self, layers: "Sequence[int]") -> list[float]:
+        """Normalized layer depths (``layer / (n_layers − 1)``, 0 = first
+        block, 1 = last) — the depth axis of the aggregate readout's
+        center-of-mass statistic."""
+        denom = max(len(self._layers) - 1, 1)
+        return [layer / denom for layer in layers]
+
+    def _jlens_logits_rows(
         self,
         lens: "Any",
         rows: list[tuple[int, torch.Tensor]],
-        *,
-        top_k: int,
-    ) -> list[list[tuple[str, float, int]]]:
-        from saklas.core.jlens import topk_logprobs
+    ) -> torch.Tensor:
+        """Full-vocab lens logits ``[n_rows, vocab]`` for a batch of
+        ``(layer, hidden_row)`` pairs — the shared front half of the
+        per-layer top-k and the layer-aggregated readout (one bmm + one
+        unembed matvec serves both)."""
         from saklas.core.model import get_final_norm, get_unembedding
 
-        if not rows:
-            return []
         unembed = get_unembedding(self._model)
         device = unembed.device
         unique_layers = sorted({layer for layer, _ in rows})
@@ -2119,28 +2140,78 @@ class SaklasSession:
         ]).to(device)
         transported = torch.bmm(J_rows, H.unsqueeze(-1)).squeeze(-1)
         normed = get_final_norm(self._model)(transported)
-        logits = normed.to(unembed.dtype) @ unembed.T
+        return normed.to(unembed.dtype) @ unembed.T
+
+    def _jlens_aggregate_rows(
+        self,
+        logits: torch.Tensor,
+        layers: "Sequence[int]",
+        *,
+        top_k: int,
+    ) -> list[tuple[str, float, float, float]]:
+        """Layer-aggregate per-layer lens logits into the decoded chip list
+        ``[(token, strength, com, spread), ...]`` (see
+        :func:`saklas.core.jlens.aggregate_readout` for the statistics)."""
+        from saklas.core.jlens import aggregate_readout
+
+        rows = aggregate_readout(
+            logits.float(), self._jlens_depths(layers), top_k=top_k,
+        )
+        return [
+            (self._jlens_decode_id(token_id), strength, com, spread)
+            for token_id, strength, com, spread in rows
+        ]
+
+    def _jlens_topk_rows(
+        self,
+        lens: "Any",
+        rows: list[tuple[int, torch.Tensor]],
+        *,
+        top_k: int,
+        logits: torch.Tensor | None = None,
+    ) -> list[list[tuple[str, float, int]]]:
+        from saklas.core.jlens import topk_logprobs
+
+        if not rows:
+            return []
+        if logits is None:
+            logits = self._jlens_logits_rows(lens, rows)
         vals, idxs = topk_logprobs(logits, top_k)
         all_vals = vals.cpu()
         all_idxs = idxs.cpu()
-        decode_cache = cast(
-            "dict[int, str] | None", getattr(self, "_jlens_decode_cache", None),
-        )
-        if decode_cache is None:
-            decode_cache = {}
-            self._jlens_decode_cache = decode_cache
         out: list[list[tuple[str, float, int]]] = []
         for vrow, irow in zip(all_vals, all_idxs):
             row: list[tuple[str, float, int]] = []
             for value, idx in zip(vrow, irow):
                 token_id = int(idx)
-                tok = decode_cache.get(token_id)
-                if tok is None:
-                    tok = str(self._tokenizer.decode([token_id]))
-                    decode_cache[token_id] = tok
-                row.append((tok, float(value), token_id))
+                row.append((self._jlens_decode_id(token_id), float(value), token_id))
             out.append(row)
         return out
+
+    @overload
+    def jlens_readout(
+        self,
+        prompt: str,
+        *,
+        layers: "Sequence[int] | str | None" = None,
+        positions: "Sequence[int] | None" = None,
+        top_k: int = 10,
+        aggregate: Literal[False] = False,
+    ) -> dict[int, list[list[tuple[str, float]]]]: ...
+
+    @overload
+    def jlens_readout(
+        self,
+        prompt: str,
+        *,
+        layers: "Sequence[int] | str | None" = None,
+        positions: "Sequence[int] | None" = None,
+        top_k: int = 10,
+        aggregate: Literal[True],
+    ) -> tuple[
+        dict[int, list[list[tuple[str, float]]]],
+        list[list[tuple[str, float, float, float]]],
+    ]: ...
 
     def jlens_readout(
         self,
@@ -2149,7 +2220,14 @@ class SaklasSession:
         layers: "Sequence[int] | str | None" = None,
         positions: "Sequence[int] | None" = None,
         top_k: int = 10,
-    ) -> dict[int, list[list[tuple[str, float]]]]:
+        aggregate: bool = False,
+    ) -> (
+        dict[int, list[list[tuple[str, float]]]]
+        | tuple[
+            dict[int, list[list[tuple[str, float]]]],
+            list[list[tuple[str, float, float, float]]],
+        ]
+    ):
         """Jacobian-lens readout on a raw prompt: the top-``top_k`` vocabulary
         tokens per (layer, position), with log-probabilities.
 
@@ -2159,6 +2237,19 @@ class SaklasSession:
         One vocab-sized matvec per (layer, position row) — full-position
         sweeps over all layers are an offline-analysis cost, not a decode
         cost.
+
+        ``aggregate=True`` additionally layer-aggregates each position's
+        readout (per-layer softmax → mean-probability strength +
+        salience-weighted depth center of mass; see
+        :func:`saklas.core.jlens.aggregate_readout`) and returns the pair
+        ``(per_layer, aggregate)`` where ``aggregate`` is one
+        ``[(token, strength, com, spread), ...]`` list per position, from
+        the same logits (no extra forward or matvec).  The aggregate uses
+        the **workspace-band subset** of the requested layers (past 90%
+        depth the lens converges on the sampled next-token distribution and
+        the early third is noise — the same band policy ``jlens/`` steering
+        hard-codes), falling back to every requested layer when none are in
+        band; the per-layer matrix always covers the full request.
         """
         from saklas.core.vectors import _capture_all_hidden_states
 
@@ -2195,15 +2286,33 @@ class SaklasSession:
                     h = hidden[layer][0, pos, :]
                     for pos_idx, row in enumerate(h):
                         row_refs.append((layer, pos_idx, row))
+            pair_rows = [(layer, row) for layer, _, row in row_refs]
+            logits = self._jlens_logits_rows(lens, pair_rows)
             decoded = self._jlens_topk_rows(
-                lens, [(layer, row) for layer, _, row in row_refs], top_k=top_k,
+                lens, pair_rows, top_k=top_k, logits=logits,
             )
             out: dict[int, list[list[tuple[str, float]]]] = {}
             for layer in req:
                 out[layer] = [[] for _ in pos]
             for (layer, pos_idx, _), row in zip(row_refs, decoded):
                 out[layer][pos_idx] = [(tok, lp) for tok, lp, _ in row]
-            return out
+            if not aggregate:
+                return out
+            band = set(self._jlens_workspace_band(lens))
+            agg_layers = [l for l in req if l in band] or list(req)
+            keep = set(agg_layers)
+            agg: list[list[tuple[str, float, float, float]]] = []
+            for pos_idx in range(len(pos)):
+                sel = [
+                    i for i, (layer, p, _) in enumerate(row_refs)
+                    if p == pos_idx and layer in keep
+                ]
+                agg.append(self._jlens_aggregate_rows(
+                    logits[sel],
+                    [row_refs[i][0] for i in sel],
+                    top_k=top_k,
+                ))
+            return out, agg
 
     def jlens_token_readout(
         self,
@@ -2239,7 +2348,11 @@ class SaklasSession:
         the caller supplies it.
 
         Returns ``{node_id, raw_index, token_id, token_text, steering,
-        workspace_band, readout: {layer: [(token, logprob, id), ...]}}``.
+        workspace_band, readout: {layer: [(token, logprob, id), ...]},
+        aggregate: [(token, strength, com, spread), ...]}`` — ``aggregate``
+        is the layer-aggregated view of the same logits (per-layer softmax
+        → mean-probability strength + salience-weighted depth center of
+        mass; :func:`saklas.core.jlens.aggregate_readout`).
         Raises :class:`~saklas.core.jlens.LensNotFittedError` with no
         fitted lens, :class:`UnknownNodeError` /
         :class:`InvalidNodeOperationError` on a bad target (mirrors
@@ -2331,12 +2444,27 @@ class SaklasSession:
                     self._model, self._layers, ids, layer_indices=req,
                     pool_index=ids.shape[1] - 1,
                 )
+                pair_rows = [(layer, hidden[layer]) for layer in req]
+                logits = self._jlens_logits_rows(lens, pair_rows)
                 decoded = self._jlens_topk_rows(
-                    lens, [(layer, hidden[layer]) for layer in req], top_k=top_k,
+                    lens, pair_rows, top_k=top_k, logits=logits,
                 )
                 readout = {
                     layer: row for layer, row in zip(req, decoded)
                 }
+                # Same band policy as jlens_readout: aggregate over the
+                # workspace-band subset (the route's default request IS the
+                # band, so this is a no-op there), matrix over the full
+                # request.
+                band = set(self._jlens_workspace_band(lens))
+                agg_idx = [i for i, l in enumerate(req) if l in band]
+                if not agg_idx:
+                    agg_idx = list(range(len(req)))
+                agg = self._jlens_aggregate_rows(
+                    logits[agg_idx],
+                    [req[i] for i in agg_idx],
+                    top_k=top_k,
+                )
         return {
             "node_id": node_id,
             "raw_index": int(raw_index),
@@ -2345,6 +2473,7 @@ class SaklasSession:
             "steering": steering_expr,
             "workspace_band": self._jlens_workspace_band(lens),
             "readout": readout,
+            "aggregate": agg,
         }
 
     def register_jlens_direction(self, word: str) -> str:
@@ -2429,6 +2558,7 @@ class SaklasSession:
             j_stack = torch.empty(
                 (0, *sample.shape), device=device, dtype=torch.float32,
             )
+        band = set(self._jlens_workspace_band(lens))
         self._live_lens = {
             "layers": layer_list,
             "top_k": int(top_k),
@@ -2436,7 +2566,13 @@ class SaklasSession:
             "layer_rows": {l: i for i, l in enumerate(layer_list)},
             "unembed": get_unembedding(self._model),
             "norm": get_final_norm(self._model),
-            "decode_cache": {},
+            # Aggregate over the workspace-band subset of the live layers
+            # (falling back to all of them) — the same band policy every
+            # other aggregate surface applies.
+            "agg_layers": (
+                frozenset(l for l in layer_list if l in band)
+                or frozenset(layer_list)
+            ),
         }
         return list(layers)
 
@@ -2461,19 +2597,29 @@ class SaklasSession:
         ]
         return band or list(lens.source_layers)
 
-    def _live_lens_readout_step(self) -> "dict[int, list[tuple[str, float]]] | None":
+    def _live_lens_readout_step(
+        self,
+    ) -> (
+        tuple[
+            dict[int, list[tuple[str, float]]],
+            list[tuple[str, float, float, float]],
+        ]
+        | None
+    ):
         """One decode step's lens readout from the capture's latest slices.
 
         Runs post-forward at the token tap (never inside a hook). On-device
-        matvecs + top-k; one small host transfer per step; token decoding
-        memoized across steps.
+        matvecs + top-k; a handful of small host transfers per step; token
+        decoding memoized across steps. Returns ``(per_layer, aggregate)``
+        — the top-k tokens per selected layer plus the layer-aggregated
+        chip list ``[(token, strength, com, spread), ...]`` over the
+        workspace-band subset of the live layers.
         """
         state = self._live_lens
         if state is None or not getattr(self, "_live_lens_active_for_generation", True):
             return None
         buckets = self._capture.per_layer_buckets()
         unembed = state["unembed"]
-        cache: dict[int, str] = state["decode_cache"]
         layers_present: list[int] = []
         hidden_rows: list[torch.Tensor] = []
         transport_rows: list[int] = []
@@ -2495,21 +2641,25 @@ class SaklasSession:
         normed = state["norm"](transported)
         logits = normed.to(unembed.dtype) @ unembed.T
         vals, idxs = logits.float().topk(state["top_k"], dim=-1)
-        # one batched host transfer for the whole step
+        # one batched host transfer for the per-layer block
         all_vals = vals.cpu()
         all_idxs = idxs.cpu()
         out: dict[int, list[tuple[str, float]]] = {}
         for row, layer in enumerate(layers_present):
             pairs: list[tuple[str, float]] = []
             for v, i in zip(all_vals[row], all_idxs[row]):
-                tid = int(i)
-                tok = cache.get(tid)
-                if tok is None:
-                    tok = str(self._tokenizer.decode([tid]))
-                    cache[tid] = tok
-                pairs.append((tok, float(v)))
+                pairs.append((self._jlens_decode_id(int(i)), float(v)))
             out[layer] = pairs
-        return out
+        agg_keep: frozenset[int] = state["agg_layers"]
+        agg_sel = [
+            row for row, layer in enumerate(layers_present) if layer in agg_keep
+        ] or list(range(len(layers_present)))
+        agg = self._jlens_aggregate_rows(
+            logits[agg_sel],
+            [layers_present[row] for row in agg_sel],
+            top_k=state["top_k"],
+        )
+        return out, agg
 
     def jspace_decompose(
         self,
@@ -5730,10 +5880,15 @@ class SaklasSession:
                 )
                 scores = payload.scores
                 per_layer_payload = payload.per_layer_scores
+                # Live workspace readout (None when off): the step's top-k
+                # lens tokens per selected layer + the layer-aggregated
+                # chip list.
+                lens_step = self._live_lens_readout_step()
                 self._last_token_probe_payload = payload.to_token_payload(
-                    # Live workspace readout (None when off): the step's
-                    # top-k lens tokens per selected layer.
-                    lens=self._live_lens_readout_step(),
+                    lens=lens_step[0] if lens_step is not None else None,
+                    lens_aggregate=(
+                        lens_step[1] if lens_step is not None else None
+                    ),
                 )
                 if assistant_node_id is not None and tid is not None:
                     token_row: dict[str, Any] = {
@@ -6318,6 +6473,7 @@ class SaklasSession:
                 thinking=is_thinking, logprob=lp, top_alts=top_alts,
                 probe_readings=probe_readings, perplexity=perplexity,
                 lens_readout=payload.get("lens"),
+                lens_aggregate=payload.get("lens_aggregate"),
             )
             idx_counter[0] += 1
             q.put(event)

@@ -950,6 +950,10 @@ class TestLensTokenReadout:
             18: [(" b", -0.51234, 7), (" c", -1.2, 9)],
             12: [(" a", -0.25, 5), (" d", -2.0, 3)],
         },
+        "aggregate": [
+            (" a", 0.4123456, 0.31234, 0.05678),
+            (" b", 0.2, 0.8, 0.1),
+        ],
     }
 
     def test_happy_path_wire_shape(self, session_and_client: Any) -> None:
@@ -970,11 +974,31 @@ class TestLensTokenReadout:
         assert data["layers"][1]["tokens"][0] == {
             "token": " b", "id": 7, "logprob": -0.5123,
         }
+        # aggregate block passes through as keyed objects, rounded
+        assert data["aggregate"][0] == {
+            "token": " a", "strength": 0.412346, "com": 0.3123,
+            "spread": 0.0568,
+        }
+        assert len(data["aggregate"]) == 2
         kwargs = session.jlens_token_readout.call_args.kwargs
         assert kwargs["apply_steering"] is True
         assert kwargs["raw"] is False
         assert kwargs["layers"] == "workspace"
         assert kwargs["top_k"] == 2
+
+    def test_aggregate_absent_from_session_is_empty_list(
+        self, session_and_client: Any,
+    ) -> None:
+        session, client = session_and_client
+        out = dict(self._SESSION_OUT)
+        out.pop("aggregate")
+        session.jlens_token_readout.return_value = out
+        resp = client.get(
+            "/saklas/v1/sessions/default/lens/token-readout",
+            params={"node_id": "n1", "raw_index": 3},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["aggregate"] == []
 
     def test_steered_and_layers_params_thread_through(
         self, session_and_client: Any,
@@ -1239,3 +1263,26 @@ class TestWSTokenEventLens:
     def test_absent_when_no_payload(self) -> None:
         event = self._event(None)
         assert "lens_readout" not in event
+
+    def test_lens_aggregate_rides_token_frame(self) -> None:
+        event = self._event(
+            {
+                "readings": None,
+                "lens": {12: [(" a", 0.5)]},
+                "lens_aggregate": [
+                    (" a", 0.41, 0.31, 0.05),
+                    (" b", 0.2, 0.8, 0.1),
+                ],
+            }
+        )
+        # 4-arrays: [token, strength, com, spread], strength-descending.
+        assert event["lens_aggregate"] == [
+            [" a", 0.41, 0.31, 0.05],
+            [" b", 0.2, 0.8, 0.1],
+        ]
+
+    def test_lens_aggregate_absent_when_off(self) -> None:
+        event = self._event(
+            {"readings": None, "lens": None, "lens_aggregate": None}
+        )
+        assert "lens_aggregate" not in event

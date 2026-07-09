@@ -72,7 +72,15 @@ same-corpus layer shards.
 into the final basis; `token_direction(v, unembed)` is `W_U[v] @ J_l` per layer
 — the profile-shaped direction behind `jlens/<word>` atoms; `lens_logits`
 (free function) is the full readout `W_U · norm(J_l h)` (matvec in the
-unembed's own dtype — a fp32 W_U copy would be GBs). `resolve_word_token` maps
+unembed's own dtype — a fp32 W_U copy would be GBs). `aggregate_readout(logits,
+depths, top_k)` is the **layer-aggregation** of a stacked `[L, vocab]` readout:
+per-layer softmax (calibrates away the cross-layer logit scale), then per token
+`strength = mean_l p_l(v)` (mean band probability) and a depth center of mass +
+std weighted by the within-layer *salience* `p_l(v)/max_v' p_l(v')` — not raw
+mass, which reads late for every token because early workspace layers are
+diffuse. Top-k by aggregated full-vocab strength (a per-layer top-k union would
+miss a mid-pack-everywhere token); returns `[(vocab_id, strength, com,
+spread)]`, one batched host transfer. `resolve_word_token` maps
 a word to its single vocab id (leading-space piece first, decode-and-compare
 sanity check, `MultiTokenWordError` with the pieces otherwise).
 `sparse_nonneg_decompose` is the J-space split: greedy pursuit against the
@@ -558,7 +566,12 @@ global per-probe slots) and runs each *curved* probe through `_score_probe_full`
 tokens from the previous foot when `enable_curved_warm` is set — the sequential
 live path). No flat/curved field asymmetry — both yield the full `ProbeReading`
 (the research-tool priority is full per-token information: nearest, curved coords,
-residual, per-layer). `score_aggregate` pools one token (the last content token)
+residual, per-layer). Both assembly sites also stamp the per-axis
+`depth_com`/`depth_spread` stats via the module-level `_depth_stats` (mass
+`share_weight_L · |coord_L[axis]|`, depths `layer/(n_layers−1)` — the
+`n_layers` ctor kwarg the session supplies; unset ⇒ stats stay empty). Pure
+host-side arithmetic over values the reading already transferred — zero tensor
+cost. `score_aggregate` pools one token (the last content token)
 and runs the per-probe `_score_probe_full`, so the aggregate is bit-identical to
 the live read at that index. Each layer's `_layer_geometry` yields the M-orthogonal
 **fraction** `sqrt(gᵀ M_R⁻¹ g)/‖x‖_M` (`g = B Σ⁻¹ x`), the whitened query for the
@@ -858,16 +871,27 @@ events: `GenerationStarted`/`SteeringApplied`/
 prompts (so the saved `n_prompts` counts consumed prompts exactly — what makes
 resume slicing sound), hashes the filtered corpus, resumes a matching partial
 fit by default (`force=True` restarts), checkpoints via the io layer, and gates
-under `_model_exclusive` (forward AND backward passes).
-`jlens_readout(prompt, layers=, positions=, top_k=)` is the offline readout
-(captures via `_capture_all_hidden_states`, default final position only).
+under `_model_exclusive` (forward AND backward passes). Shared readout helpers:
+`_jlens_logits_rows` (the one bmm + unembed matvec over `(layer, hidden)` rows
+— per-layer top-k and aggregate both consume it), `_jlens_topk_rows` (accepts
+precomputed `logits=`), `_jlens_aggregate_rows` (`aggregate_readout` + decode),
+`_jlens_depths` (`layer/(n_layers−1)`), `_jlens_decode_id` (the one cache-backed
+single-token decode).
+`jlens_readout(prompt, layers=, positions=, top_k=, aggregate=)` is the offline
+readout (captures via `_capture_all_hidden_states`, default final position
+only); `aggregate=True` returns `(per_layer, per-position aggregate)` from the
+same logits, the aggregate restricted to the **workspace-band subset** of the
+requested layers (falling back to all when none are in band — the same band
+policy `jlens/` steering hard-codes; the matrix always covers the full
+request).
 `jlens_token_readout(node_id, raw_index, *, layers=, top_k=, apply_steering=,
 raw=)` is the loom-anchored readout behind the dashboard drilldown's j-lens
 tab: fork-style validation (assistant node, `raw_token_ids`, range), rebuild
 the node's exact prompt render via `_prepare_input` (stamped role labels +
 recipe thinking; `raw=` selects the flat render — raw-ness isn't stamped on
 the node, the caller supplies it), append `raw_token_ids[:raw_index]`, one
-capture forward, per-layer top-k at the final position — the forward that
+capture forward, per-layer top-k + the band-restricted `aggregate` block at the
+final position — the forward that
 *produced* the clicked token. `apply_steering` replays under the node's
 recipe steering; the steering scope opens OUTSIDE `_model_exclusive`
 (`SteeringComposer.push`/`pop` take `_gen_lock` blocking — nesting would
@@ -883,9 +907,12 @@ dictionary. **Live lens** (`enable_live_lens`/`disable_live_lens`/
 capture-widen union in `_begin_capture` (which also forces transient — not
 persistent — capture routing, and arms a bounded tail ring when no probes are
 attached), and `_live_lens_readout_step` runs at the token tap post-forward —
-no new forward hooks, `static_steerable` untouched — landing the per-step
-top-k on `TokenEvent.lens_readout` and the `_last_token_probe_payload["lens"]`
-slot. Default layer subset: five fitted layers over the 40–90% depth band.
+no new forward hooks, `static_steerable` untouched — returning `(per_layer,
+aggregate)` and landing them on `TokenEvent.lens_readout` /
+`TokenEvent.lens_aggregate` and the `_last_token_probe_payload["lens"]` /
+`["lens_aggregate"]` slots. The aggregate covers the workspace-band subset of
+the live layers (precomputed at enable as `state["agg_layers"]`). Default
+layer subset: five fitted layers over the 40–90% depth band.
 
 ## loom.py
 
@@ -963,18 +990,26 @@ context. Surfaced as `session.score_choices` / `session.score_template`.
 list-like multi-run shape (`node_ids`/`grid`/`.first`/`.to_collector()`/
 `.to_dataframe()`). `TokenEvent` carries `thinking`, `logprob`, `top_alts`,
 `finish_reason`, `perplexity`, `probe_readings` (per-probe `ProbeReading`s — the
-full readings, live-stream-gated); `scores` is a read-only back-compat property
+full readings, live-stream-gated), and — while the live lens is on —
+`lens_readout` (per-layer top-k) + `lens_aggregate` (the layer-aggregated
+`[(token, strength, com, spread)]` chip list); `scores` is a read-only
+back-compat property
 alias for `probe_readings`. `GenerationResult`
 carries `prompt_tokens`, `finish_reason`, optional `logprobs`, `readings`
 (per-probe `ProbeReadings`), `probe_readings`, and `applied_steering` (the
 canonical expression, round-trips through `parse_expr`). `ProbeReading`
 (`coords`/`fraction`/`nearest`/`residual` + `assignment`/`membership` +
-`fraction_per_layer`/`coords_per_layer`/`residual_per_layer`) is the **single**
+`fraction_per_layer`/`coords_per_layer`/`residual_per_layer` +
+`depth_com`/`depth_spread`) is the **single**
 reading shape for both the live per-token stream and the end-of-gen aggregate (the
 aggregate is the reading pooled at the last-content token). `assignment`
 (`[(label, prob)]` soft node posterior) and `membership` (tube-fit density, default
 `1.0`) are the fuzzy-manifold readout — empty/`1.0` defaults keep serialization
-back-compat. Every field is populated for flat and curved fits alike;
+back-compat. `depth_com`/`depth_spread` are the per-axis depth center of mass
+(+ std) of the per-layer coordinate trace — mass `share_weight_L · |coord_L|`,
+depths `layer/(n_layers−1)` — computed at both monitor assembly sites
+(`monitor.py::_depth_stats`); empty when the reading has no per-layer trace
+(lean modes) or the `Monitor` wasn't given `n_layers`. Every field is populated for flat and curved fits alike;
 `residual` is `0` for a flat fit (the surface fills its subspace) and the
 normalized off-surface distance for a curved fit. `ProbeReadings` is vectorized per
 coordinate axis (`mean`/`std`/`min`/`max`/`delta_per_gen` are `tuple[float,...]`,

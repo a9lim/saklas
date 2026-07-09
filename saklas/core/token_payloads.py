@@ -19,13 +19,16 @@ class TokenProbePayload:
     per_layer_scores: dict[str, dict[str, float]] | None = None
     probe_readings: dict[str, ProbeReading] | None = None
 
-    def to_token_payload(self, *, lens: Any = None) -> dict[str, Any]:
+    def to_token_payload(
+        self, *, lens: Any = None, lens_aggregate: Any = None,
+    ) -> dict[str, Any]:
         return {
             "scores": self.scores,
             "readings": self.readings,
             "per_layer_scores": self.per_layer_scores,
             "probe_readings": self.probe_readings,
             "lens": lens,
+            "lens_aggregate": lens_aggregate,
         }
 
 

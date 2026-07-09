@@ -324,6 +324,74 @@ def topk_logprobs(logits: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Ten
     return vals, idxs
 
 
+def aggregate_readout(
+    logits: torch.Tensor,
+    depths: "Sequence[float]",
+    *,
+    top_k: int = 8,
+) -> list[tuple[int, float, float, float]]:
+    """Layer-aggregate a per-layer lens readout into one ranked token list.
+
+    ``logits`` is ``[L, vocab]`` — one full-vocabulary lens readout row per
+    layer (:func:`lens_logits` output stacked); ``depths`` the matching
+    normalized layer depths in ``[0, 1]`` (``layer / (n_layers − 1)``).
+    Returns ``[(vocab_id, strength, com, spread), ...]`` sorted by
+    descending strength.
+
+    Raw lens logits are uncalibrated across layers, so each layer is first
+    put through its own softmax.  From the per-layer probabilities
+    ``p_l(v)``, two statistics per token:
+
+    - ``strength = mean_l p_l(v)`` — the mean probability over the layer
+      band, in ``[0, 1]``.  Uniform layer weights: the softmax already
+      lets a confident layer dominate the ranking, so extra confidence
+      weighting would double-count.
+    - ``com``/``spread`` — the depth center of mass (+ std) weighted by
+      the within-layer *salience* ``s_l(v) = p_l(v) / max_v' p_l(v')``,
+      not by raw mass.  Early workspace layers are diffuse, so raw-mass
+      CoM reads late for every token; salience lets each layer vote
+      equally on *where this token sits near the top of the readout*.
+
+    Top-k selection runs on the aggregated full-vocab strengths — a
+    per-layer top-k union would miss a token that ranks mid-pack at every
+    layer but top at none.
+    """
+    if logits.ndim != 2 or logits.shape[0] == 0:
+        raise ValueError(
+            f"aggregate_readout expects [layers, vocab] logits, got shape "
+            f"{tuple(logits.shape)}"
+        )
+    if len(depths) != logits.shape[0]:
+        raise ValueError(
+            f"aggregate_readout: {logits.shape[0]} logit rows but "
+            f"{len(depths)} depths"
+        )
+    probs = logits.float().softmax(dim=-1)                      # [L, V]
+    strength = probs.mean(dim=0)                                # [V]
+    sal = probs / probs.amax(dim=-1, keepdim=True).clamp_min(1e-12)
+    d = torch.tensor(
+        [float(x) for x in depths], dtype=torch.float32, device=probs.device,
+    ).unsqueeze(-1)                                             # [L, 1]
+    mass = sal.sum(dim=0).clamp_min(1e-12)                      # [V]
+    com = (sal * d).sum(dim=0) / mass                           # [V]
+    var = (sal * (d - com.unsqueeze(0)) ** 2).sum(dim=0) / mass
+    spread = var.clamp_min(0.0).sqrt()
+    k = min(int(top_k), int(strength.shape[-1]))
+    vals, idxs = strength.topk(k)
+    # one batched host transfer for the whole readout
+    stats = torch.stack([vals, com[idxs], spread[idxs]]).cpu()
+    idx_cpu = idxs.cpu()
+    return [
+        (
+            int(idx_cpu[j]),
+            float(stats[0, j]),
+            float(stats[1, j]),
+            float(stats[2, j]),
+        )
+        for j in range(k)
+    ]
+
+
 class JSpaceDecomposition:
     """One layer's sparse nonnegative split of a direction against the J-lens
     dictionary: ``share`` = fraction of the direction's variance carried by

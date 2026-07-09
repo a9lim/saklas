@@ -90,5 +90,16 @@ def build_token_event(
                 str(layer): [[tok, float(score)] for tok, score in pairs]
                 for layer, pairs in lens.items()
             }
+        # The layer-aggregated chip list riding the same step: ``[token,
+        # strength, com, spread]`` 4-arrays, strength-descending (mean
+        # band probability + salience-weighted depth center of mass).
+        agg = (
+            payload.get("lens_aggregate") if isinstance(payload, dict) else None
+        )
+        if agg:
+            event["lens_aggregate"] = [
+                [tok, float(s), float(com), float(spread)]
+                for tok, s, com, spread in agg
+            ]
 
     return event

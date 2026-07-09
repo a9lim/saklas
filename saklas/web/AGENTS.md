@@ -26,7 +26,7 @@ The Svelte source lives at the repo's `webui/` directory (peer of `saklas/`). `c
 
 The dashboard speaks the native `/saklas/v1/*` API (`saklas/server/saklas_api.py`):
 
-- **WS `/saklas/v1/sessions/{id}/stream`** — token + probe co-stream. With probes loaded, the `token` event carries `scores` (`dict[str, float]`, the magnitude-weighted axis-0 aggregate — drives the highlight tinting), `per_layer_scores` (`dict[str, dict[str, float]]`, string-keyed, feeds the token-drilldown heatmap), `probe_readings` (`Record<name, ProbeReading>` — the unified per-probe reading for *every* probe shape, flat or curved, populated whenever any probe is attached), `raw_index` (decode-step index into the backing node's `raw_token_ids`), and — while the live lens is on — `lens_readout` (`Record<layerStr, [token, score][]>`, the per-step J-lens top-k matrix feeding the WORKSPACE panel). The `done` event's `result` carries `probe_readings` of the **same** `ProbeReading` shape (aggregated at the last-content token, so per-token and aggregate are one shape). A `generate` message with `fork_node_id`/`fork_raw_index`/`fork_alt_token_id` is the **logit fork** — replays the node's raw decode prefix with one token swapped, resampling the continuation as a sibling. A `generate` with `prefill_node_id`/`prefill_text` is **answer-prefill** — seeds an assistant reply under a *user* node. A `generate` with `commit_role`/`commit_text` is **commit (no-generation send)** — `commit_role="user"` lands a user turn under `parent_node_id`/active node; `commit_role="assistant"` lands an authored assistant turn under the user node `parent_node_id` (required), with `commit_text` as the whole turn. Short-circuits the streaming machinery: one `started` (node_id=null) + one `done` (`result.kind="commit"`, `result.node_id`, `result.role`, `result.text`), no token frames. Mutually exclusive with fork and prefill. Driven from `Chat.svelte` by `Ctrl`/`Cmd`/`Option`+`Enter` (also `Ctrl`/`Cmd`/`Option`-click on the send button — `ev.ctrlKey || ev.metaKey || ev.altKey`); live `modHeld` window listener swaps the send-button label between `send`/`prefill` and `commit user`/`commit assistant` while the modifier is held.
+- **WS `/saklas/v1/sessions/{id}/stream`** — token + probe co-stream. With probes loaded, the `token` event carries `scores` (`dict[str, float]`, the magnitude-weighted axis-0 aggregate — drives the highlight tinting), `per_layer_scores` (`dict[str, dict[str, float]]`, string-keyed, feeds the token-drilldown heatmap), `probe_readings` (`Record<name, ProbeReading>` — the unified per-probe reading for *every* probe shape, flat or curved, populated whenever any probe is attached), `raw_index` (decode-step index into the backing node's `raw_token_ids`), and — while the live lens is on — `lens_readout` (`Record<layerStr, [token, score][]>`, the per-step J-lens top-k matrix) plus `lens_aggregate` (`[token, strength, com, spread][]` 4-arrays, strength-descending — the layer-aggregated chip list feeding the J-LENS tab's WORKSPACE section). The `done` event's `result` carries `probe_readings` of the **same** `ProbeReading` shape (aggregated at the last-content token, so per-token and aggregate are one shape). A `generate` message with `fork_node_id`/`fork_raw_index`/`fork_alt_token_id` is the **logit fork** — replays the node's raw decode prefix with one token swapped, resampling the continuation as a sibling. A `generate` with `prefill_node_id`/`prefill_text` is **answer-prefill** — seeds an assistant reply under a *user* node. A `generate` with `commit_role`/`commit_text` is **commit (no-generation send)** — `commit_role="user"` lands a user turn under `parent_node_id`/active node; `commit_role="assistant"` lands an authored assistant turn under the user node `parent_node_id` (required), with `commit_text` as the whole turn. Short-circuits the streaming machinery: one `started` (node_id=null) + one `done` (`result.kind="commit"`, `result.node_id`, `result.role`, `result.text`), no token frames. Mutually exclusive with fork and prefill. Driven from `Chat.svelte` by `Ctrl`/`Cmd`/`Option`+`Enter` (also `Ctrl`/`Cmd`/`Option`-click on the send button — `ev.ctrlKey || ev.metaKey || ev.altKey`); live `modHeld` window listener swaps the send-button label between `send`/`prefill` and `commit user`/`commit assistant` while the modifier is held.
 - **GET `/sessions/{id}/correlation[?names=…]`** — N×N magnitude-weighted cosine matrix; default pool unions steering vectors + active probes.
 - **GET `/sessions/{id}/vectors/pairwise?a=…&b=…`** — cross-layer cosine matrix between two named vectors / probes. Distinct from `correlation`: one pair, two-axis matrix indexed by layer rather than by name; backs the pairwise-compare analysis drawer. Registered *before* `GET /vectors/{name}` so the literal path wins the routing match.
 - **GET `/sessions/{id}/vectors/{name}/diagnostics`** — 16-bucket layer-magnitude histogram + per-layer magnitudes; falls back to monitor profiles when `name` is a probe.
@@ -40,19 +40,23 @@ The dashboard speaks the native `/saklas/v1/*` API (`saklas/server/saklas_api.py
 - **GET `/sessions/{id}/traits/stream`** — live per-token probe SSE.
 - **GET `/sessions/{id}/lens/token-readout?node_id=&raw_index=…`** — the J-lens
   workspace readout at one decode step: per-layer top-k matrix
-  (`layers: [{layer, in_band, tokens:[{token, id, logprob}]}]`) at the forward
-  that produced the clicked token, recomputed on demand server-side (node prompt
-  render + raw prefix replay under the node's recipe steering; `steered=false`
-  for the unsteered counterfactual, `raw=true` for flat-buffer nodes — the
-  client's render mode supplies raw-ness). Backs `TokenDrilldownDrawer`'s
-  **j-lens** tab via `apiLens.tokenReadout`; gated on the session-info
-  `jlens_fitted` flag (unfitted → the tab shows the `saklas lens fit` hint).
+  (`layers: [{layer, in_band, tokens:[{token, id, logprob}]}]`) plus the
+  layer-aggregated `aggregate: [{token, strength, com, spread}]` block
+  (per-layer softmax → mean band probability + salience-weighted depth center
+  of mass, band-restricted) at the forward that produced the clicked token,
+  recomputed on demand server-side (node prompt render + raw prefix replay
+  under the node's recipe steering; `steered=false` for the unsteered
+  counterfactual, `raw=true` for flat-buffer nodes — the client's render mode
+  supplies raw-ness). Backs `TokenDrilldownDrawer`'s **j-lens** tab via
+  `apiLens.tokenReadout`; gated on the session-info `jlens_fitted` flag
+  (unfitted → the tab shows the `saklas lens fit` hint).
 - **POST `/sessions/{id}/lens/live`** — toggle the *live* workspace readout
   (`{enabled, layers?, top_k?}` → `{enabled, layers}`; layers omitted picks
-  the 40–90% band default). While on, each WS `token` frame carries the
-  `lens_readout` matrix and session info reports `live_lens_layers` (`null`
-  while off — the WORKSPACE panel's rehydration read). `apiLens.setLive`;
-  backs `WorkspacePanel`.
+  the 40–90% band default; the dashboard passes `top_k: 8` — the aggregate
+  chip row is the primary surface). While on, each WS `token` frame carries
+  the `lens_readout` matrix + the `lens_aggregate` chip list and session info
+  reports `live_lens_layers` (`null` while off — the J-LENS tab's rehydration
+  read). `apiLens.setLive`; backs `JLensPanel`'s WORKSPACE section.
 
 ## Source layout
 
@@ -88,8 +92,8 @@ webui/src/
     style/{tokens.css,global.css}
   panels/
     WorkspaceRail.svelte      # left rail: category fly-outs
-    InspectorPanel.svelte     # right rack: steering + probe racks splitting the column (both render a subspace group then a manifold group) + the WORKSPACE strip
-    WorkspacePanel.svelte     # WORKSPACE (J-lens): live per-layer top-k matrix off the WS lens_readout channel; toggle → apiLens.setLive; renders nothing when no lens is fitted
+    InspectorPanel.svelte     # right rack: PROBES / J-LENS tab strip (strip renders only when jlens_fitted); PROBES tab = steering + probe racks splitting the column (both render a subspace group then a manifold group), J-LENS tab = JLensPanel
+    JLensPanel.svelte         # J-LENS tab: STEER token chips (mode:"jlens" rack entries → "α jlens/word" terms, per-chip α default 0.3), PROBES pinned-token chips (attachProbe("jlens/w") — live axis-0 coord + depth CoM), WORKSPACE aggregate chip row (lens_aggregate; click a chip to pin it) with the per-layer matrix behind a Disclosure; toggle → apiLens.setLive({top_k: 8})
     WorkbenchCard.svelte      # active-workbench card (model + device); bottom of threads column
     StatusFooter.svelte       # gen progress · t/s · elapsed · ppl + pending-queue count badge; mounted inside Chat above the input row
     PendingBubbles.svelte     # ghosted bubbles for queued sends/commits/mutations + per-item × cancel; mounted between StatusFooter and the input row
@@ -182,7 +186,7 @@ The server loom tree is authoritative. The browser keeps a first-paint cache of 
 
 ## Per-token highlighting
 
-Highlighting lives on the chat token spans, driven by a single highlight-probe dropdown in the chat header with an optional two-stripe compare-two mode. It tints **live** as tokens stream: the WS `token` event's `scores` aggregate feeds the same `scoreToRgb` ramp the post-generation pass uses, so streaming and finalized tints match (and match the TUI). Clicking any token opens the `token_drilldown` drawer regardless of whether a highlight probe is selected — three tabs: **probes** (the per-layer × per-probe heatmap), **logits** (ranked top-K alts + logit fork), and **j-lens** (the workspace readout matrix — rows are lens layers ascending with the 40–90% band marked in blue and off-band rows dimmed, cells the top-K tokens tinted by probability via `color-mix`, the produced token outlined where it appears; an `apply recipe steering` checkbox flips to the unsteered counterfactual, responses cached per `(node, raw_index, steered)` for the drawer's life). The j-lens tab needs `sessionState.info.jlens_fitted` and a `token.rawIndex` (same in-session constraint as forking); data comes from `apiLens.tokenReadout` on demand — nothing lens-shaped is stored per token at generation time. A **token scrubber** in the drawer header (`◀ N / M ▶`, or `←`/`→` anywhere in the drawer outside a focusable field) walks the *inspected* position along the turn's token list — every tab follows (probes/logits read stream-captured data instantly, j-lens refetches per position against its cache), while the tab/branch reset effects key off the *clicked* index (`paramTokenIdx`), so scrubbing never kicks the user off their tab; a fresh token click (params identity change) snaps the scrub back, and an `↩ clicked` header button does the same explicitly.
+Highlighting lives on the chat token spans, driven by a single highlight-probe dropdown in the chat header with an optional two-stripe compare-two mode. It tints **live** as tokens stream: the WS `token` event's `scores` aggregate feeds the same `scoreToRgb` ramp the post-generation pass uses, so streaming and finalized tints match (and match the TUI). Clicking any token opens the `token_drilldown` drawer regardless of whether a highlight probe is selected — three tabs: **probes** (the per-layer × per-probe heatmap), **logits** (ranked top-K alts + logit fork), and **j-lens** (the workspace readout — an aggregate chip row first (`token@com` chips off the response's `aggregate` block), then the per-layer matrix: rows are lens layers ascending with the 40–90% band marked in blue and off-band rows dimmed, cells the top-K tokens tinted by probability via `color-mix`, the produced token outlined where it appears; an `apply recipe steering` checkbox flips to the unsteered counterfactual, responses cached per `(node, raw_index, steered)` for the drawer's life). The j-lens tab needs `sessionState.info.jlens_fitted` and a `token.rawIndex` (same in-session constraint as forking); data comes from `apiLens.tokenReadout` on demand — nothing lens-shaped is stored per token at generation time. A **token scrubber** in the drawer header (`◀ N / M ▶`, or `←`/`→` anywhere in the drawer outside a focusable field) walks the *inspected* position along the turn's token list — every tab follows (probes/logits read stream-captured data instantly, j-lens refetches per position against its cache), while the tab/branch reset effects key off the *clicked* index (`paramTokenIdx`), so scrubbing never kicks the user off their tab; a fresh token click (params identity change) snaps the scrub back, and an `↩ clicked` header button does the same explicitly.
 
 ## Toasts
 

@@ -123,6 +123,17 @@ export interface LensReadoutLayerJSON {
   tokens: LensReadoutTokenJSON[];
 }
 
+/** One token of the layer-aggregated workspace readout: per-layer softmax
+ *  → mean band probability (``strength``, 0..1) + the salience-weighted
+ *  depth center of mass (``com``, 0 = first block, 1 = last) and its std
+ *  (``spread``). */
+export interface LensAggregateTokenJSON {
+  token: string;
+  strength: number;
+  com: number;
+  spread: number;
+}
+
 /** ``GET /sessions/{id}/lens/token-readout`` — the J-lens workspace
  *  readout at one decode step of a loom node (the forward that produced
  *  the clicked token). */
@@ -135,6 +146,9 @@ export interface LensTokenReadoutJSON {
   /** The steering expression the replay ran under, or ``null`` for an
    *  unsteered read (no recipe steering, or ``steered=false``). */
   steering: string | null;
+  /** Layer-aggregated view of the same logits (workspace-band subset),
+   *  strength-descending.  Empty from a pre-aggregate server. */
+  aggregate?: LensAggregateTokenJSON[];
   layers: LensReadoutLayerJSON[];
 }
 
@@ -694,6 +708,14 @@ export interface ProbeReadingJSON {
   fraction_per_layer: Record<string, number>;
   coords_per_layer: Record<string, number[]>;
   residual_per_layer: Record<string, number>;
+  /** Per-axis depth center of mass (+ std) of the per-layer coordinate
+   *  trace — where in the layer stack the probe reads, in normalized
+   *  depth (0 = first block, 1 = last).  Mass per layer is
+   *  ``share_weight_L · |coord_L|``.  Aligned with ``coords``; empty when
+   *  the reading carries no per-layer trace (lean per-token modes) or the
+   *  server predates the field. */
+  depth_com?: number[];
+  depth_spread?: number[];
   /** Per-layer whitened subspace coords (the live point + trail for the
    *  probe-inspector geometry plot).  Keyed by layer-index string -> that
    *  layer's ``(R,)`` whitened coords, in the same frame as the geometry
@@ -942,6 +964,11 @@ export interface WSTokenEvent {
    *  ``per_layer_scores``); values the top-k ``[token, score]`` pairs,
    *  descending by raw lens logit.  Feeds the WORKSPACE panel. */
   lens_readout?: Record<string, [string, number][]>;
+  /** Layer-aggregated view of the same step's lens readout —
+   *  ``[token, strength, com, spread]`` 4-arrays, strength-descending
+   *  (mean band probability + salience-weighted depth center of mass).
+   *  Present under the same conditions as ``lens_readout``. */
+  lens_aggregate?: [string, number, number, number][];
 }
 
 export interface WSDoneResultPerToken {
@@ -1394,8 +1421,23 @@ export interface ManifoldSteerEntry {
   enabled: boolean;
 }
 
-/** A racked steering term — subspace (flat) or manifold (curved). */
-export type SteerEntry = SubspaceSteerEntry | ManifoldSteerEntry;
+/** J-lens token steering term — pushes along the lens direction
+ *  ``W_U[v] @ J_l`` over the workspace band (``α jlens/<word>``).  The rack
+ *  key is the full ``jlens/<word>`` atom.  Per-chip ``alpha`` (not the
+ *  shared ``subspaceAlong`` master): lens atoms run hotter than concept
+ *  vectors — α≈0.3 is the coherent sweet spot, α≥0.5 over-steers into
+ *  repetition — so each token needs its own dial. */
+export interface JLensSteerEntry {
+  mode: "jlens";
+  /** Push coefficient (the plain-atom α slot). */
+  alpha: number;
+  trigger: Trigger;
+  enabled: boolean;
+}
+
+/** A racked steering term — subspace (flat), manifold (curved), or a
+ *  J-lens token atom. */
+export type SteerEntry = SubspaceSteerEntry | ManifoldSteerEntry | JLensSteerEntry;
 
 // ----------------------------------------------------- extract pairs --
 

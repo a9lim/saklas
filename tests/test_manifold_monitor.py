@@ -37,7 +37,7 @@ def fit_layer_subspace(*args: Any, **kwargs: Any) -> Any:
     return sub
 
 
-def _iso_monitor(m: "Manifold") -> Monitor:
+def _iso_monitor(m: "Manifold", *, n_layers: int | None = None) -> Monitor:
     """A ``Monitor`` wired with an isotropic whitener over ``m``'s
     fit layers.
 
@@ -50,7 +50,7 @@ def _iso_monitor(m: "Manifold") -> Monitor:
     from tests._whitener import isotropic_whitener
     dim = next(iter(m.layers.values())).mean.shape[0]
     whitener = isotropic_whitener(list(m.layers.keys()), dim)
-    return Monitor(whitener=whitener)
+    return Monitor(whitener=whitener, n_layers=n_layers)
 
 
 def _node_world(m: Manifold, layer_idx: int) -> torch.Tensor:
@@ -1189,3 +1189,93 @@ def test_coords_only_mixed_flat_and_curved_roster():
     for L in curved.layers:
         hidden[L] = _node_world(curved, L)[1]
     _assert_lean_matches_full(mon, hidden)
+
+
+# ==================================================== depth statistics ===
+# depth_com / depth_spread: per-axis depth center of mass of the per-layer
+# coordinate trace, mass = share_weight_L · |coord_L[axis]|, depths
+# normalized layer/(n_layers−1).
+
+
+def test_depth_stats_math():
+    from saklas.core.monitor import _depth_stats
+
+    coords = {0: (1.0,), 8: (3.0,)}
+    weights = {0: 0.5, 8: 0.5}
+    com, spread = _depth_stats(coords, weights, 8.0)
+    # masses: L0 → 0.5·|1| = 0.5 at depth 0; L8 → 0.5·|3| = 1.5 at depth 1
+    assert com == pytest.approx((1.5 / 2.0,))
+    expected_var = (0.5 * (0 - 0.75) ** 2 + 1.5 * (1 - 0.75) ** 2) / 2.0
+    assert spread[0] == pytest.approx(expected_var ** 0.5)
+    # sign-independent mass: flipping a coordinate's sign moves nothing
+    com_neg, _ = _depth_stats({0: (-1.0,), 8: (-3.0,)}, weights, 8.0)
+    assert com_neg == pytest.approx(com)
+
+
+def test_depth_stats_empty_and_zero_mass():
+    from saklas.core.monitor import _depth_stats
+
+    assert _depth_stats({}, {}, 8.0) == ((), ())
+    # denominator unset (monitor constructed without n_layers)
+    assert _depth_stats({0: (1.0,)}, {0: 1.0}, 0.0) == ((), ())
+    # zero-mass axis (activation at neutral): defined-but-degenerate
+    com, spread = _depth_stats({0: (0.0,), 4: (0.0,)}, {0: 1.0, 4: 1.0}, 4.0)
+    assert com == (0.0,)
+    assert spread == (0.0,)
+
+
+def test_depth_stats_per_axis_independent():
+    from saklas.core.monitor import _depth_stats
+
+    # axis 0 reads only at L0, axis 1 only at L4 → coms split to the ends
+    coords = {0: (2.0, 0.0), 4: (0.0, 2.0)}
+    weights = {0: 1.0, 4: 1.0}
+    com, spread = _depth_stats(coords, weights, 4.0)
+    assert com == pytest.approx((0.0, 1.0))
+    assert spread == pytest.approx((0.0, 0.0))
+
+
+def test_reading_carries_depth_stats_flat_batched_path():
+    rc = torch.tensor([[1.0], [-1.0]])
+    m = _flat_manifold(reduced_coords=rc, labels=["pos", "neg"])
+    mon = _iso_monitor(m, n_layers=2)
+    mon.add_probe("ax", m)
+    r = mon.score_single_token(_flat_node_hidden(m, 0))["ax"]
+    assert len(r.depth_com) == len(r.coords) == 1
+    assert len(r.depth_spread) == 1
+    assert 0.0 <= r.depth_com[0] <= 1.0
+    assert r.depth_spread[0] >= 0.0
+    # both layers read the same node coord, so with 2 layers at depths
+    # {0, 1} the com must sit strictly inside the interval
+    assert 0.0 < r.depth_com[0] < 1.0
+
+
+def test_reading_carries_depth_stats_curved_path():
+    m = _toy_manifold()
+    mon = _iso_monitor(m, n_layers=2)
+    mon.add_probe("toy", m)
+    hidden = {L: _node_world(m, L)[2] for L in m.layers}
+    r = mon.score_single_token(hidden)["toy"]
+    assert len(r.depth_com) == len(r.coords)
+    assert all(0.0 <= c <= 1.0 for c in r.depth_com)
+    assert all(s >= 0.0 for s in r.depth_spread)
+
+
+def test_reading_depth_stats_empty_without_n_layers():
+    rc = torch.tensor([[1.0], [-1.0]])
+    m = _flat_manifold(reduced_coords=rc)
+    mon = _iso_monitor(m)   # no n_layers → no depth axis
+    mon.add_probe("ax", m)
+    r = mon.score_single_token(_flat_node_hidden(m, 0))["ax"]
+    assert r.depth_com == ()
+    assert r.depth_spread == ()
+
+
+def test_depth_stats_serialize_in_to_dict():
+    rc = torch.tensor([[1.0], [-1.0]])
+    m = _flat_manifold(reduced_coords=rc)
+    mon = _iso_monitor(m, n_layers=2)
+    mon.add_probe("ax", m)
+    d = mon.score_single_token(_flat_node_hidden(m, 0))["ax"].to_dict()
+    assert "depth_com" in d and "depth_spread" in d
+    assert isinstance(d["depth_com"], list)
