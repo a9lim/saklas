@@ -20,6 +20,7 @@ import {
   apiVectors,
   apiProbes,
   apiManifolds,
+  apiLens,
   apiTree,
   ApiError,
   connectWs,
@@ -92,8 +93,54 @@ export async function refreshSession(): Promise<void> {
     sessionState.lastRefresh = Date.now();
     sessionState.error = null;
     _hydrateSamplingFromInfo();
+    // Rehydrate the WORKSPACE toggle from server state (the live lens is
+    // session-side, so a page reload must not read as "off" while the
+    // server keeps streaming lens frames).  Older servers omit the field.
+    lensState.layers = info.live_lens_layers ?? null;
   } catch (e) {
     sessionState.error = e instanceof Error ? e.message : String(e);
+  }
+}
+
+// ======================================================== live lens ====
+
+export interface LensState {
+  /** Resolved fitted-layer list while the live workspace readout is
+   * enabled; ``null`` while off.  Mirrors the server's
+   * ``live_lens_layers`` — the panel toggle reads this, not a local
+   * boolean, so reloads and multi-tab stay honest. */
+  layers: number[] | null;
+  /** Latest decode step's readout: layer-index string → descending
+   * ``[token, rawLensLogit]`` top-k.  Overwritten per token frame;
+   * kept after ``done`` so the settled matrix stays readable. */
+  readout: Record<string, [string, number][]> | null;
+  /** In-flight toggle guard (the enable moves J_l device-resident and
+   * waits on the session lock, so it can lag behind a long stream). */
+  busy: boolean;
+}
+
+export const lensState: LensState = $state({
+  layers: null,
+  readout: null,
+  busy: false,
+});
+
+/** Toggle the live workspace readout server-side (WORKSPACE panel). */
+export async function setLiveLens(enabled: boolean): Promise<void> {
+  if (lensState.busy) return;
+  lensState.busy = true;
+  try {
+    const out = await apiLens.setLive({ enabled });
+    lensState.layers = out.enabled ? (out.layers ?? []) : null;
+    if (!out.enabled) lensState.readout = null;
+  } catch (e) {
+    pushToast(
+      `live lens ${enabled ? "enable" : "disable"} failed: ` +
+        (e instanceof Error ? e.message : String(e)),
+      { kind: "error" },
+    );
+  } finally {
+    lensState.busy = false;
   }
 }
 
@@ -2213,6 +2260,10 @@ function handleWsMessage(msg: WSServerMessage): void {
       // above still feed highlight tinting + the token-drilldown heatmap.
       if (!abState.processingAb) {
         updateProbesFromReadings(msg.probe_readings);
+        // WORKSPACE panel — the live J-lens matrix.  Present only while
+        // the session's live lens is enabled; shadow runs skipped like
+        // the probe rack so the matrix tracks the steered branch.
+        if (msg.lens_readout) lensState.readout = msg.lens_readout;
       }
       return;
     }

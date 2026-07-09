@@ -305,6 +305,10 @@ Three read surfaces, one write surface:
   every decode step (`TokenEvent.lens_readout`, TUI `/lens` → WORKSPACE section);
   the reader consumes the capture's latest slices post-forward at the token tap —
   no new forward hooks, so steering fast-path/compile eligibility is untouched.
+  The dashboard's WORKSPACE panel is the server sibling: `POST /saklas/v1/
+  sessions/{id}/lens/live` toggles the live lens, the native WS `token` frame
+  carries the per-step matrix as `lens_readout`, and session info's
+  `live_lens_layers` rehydrates the toggle across reloads.
   `session.jlens_token_readout(node_id, raw_index)` is the loom-anchored variant
   behind the dashboard token drilldown's **j-lens tab** (`GET /saklas/v1/
   sessions/{id}/lens/token-readout`): rebuild the node's prompt render + raw

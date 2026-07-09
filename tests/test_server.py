@@ -1098,3 +1098,144 @@ class TestLensTokenReadout:
         )
         resp = client.get("/saklas/v1/sessions/default")
         assert resp.json()["jlens_fitted"] is True
+
+
+# ---------------------------------------------------------------------------
+# Live workspace readout (lens/live toggle + WS token frame)
+# ---------------------------------------------------------------------------
+
+
+class TestLensLiveToggle:
+    """Route contract for ``POST /saklas/v1/sessions/{id}/lens/live``."""
+
+    def test_enable_returns_resolved_layers(self, session_and_client: Any) -> None:
+        session, client = session_and_client
+        session.enable_live_lens.return_value = [10, 14, 18]
+        resp = client.post(
+            "/saklas/v1/sessions/default/lens/live",
+            json={"enabled": True},
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {"enabled": True, "layers": [10, 14, 18], "top_k": 5}
+        kwargs = session.enable_live_lens.call_args.kwargs
+        assert kwargs["layers"] is None  # server picks the workspace band
+        assert kwargs["top_k"] == 5
+
+    def test_enable_threads_layers_and_top_k(self, session_and_client: Any) -> None:
+        session, client = session_and_client
+        session.enable_live_lens.return_value = [12, 18]
+        resp = client.post(
+            "/saklas/v1/sessions/default/lens/live",
+            json={"enabled": True, "layers": [12, 18], "top_k": 3},
+        )
+        assert resp.status_code == 200
+        kwargs = session.enable_live_lens.call_args.kwargs
+        assert kwargs["layers"] == [12, 18]
+        assert kwargs["top_k"] == 3
+
+    def test_disable(self, session_and_client: Any) -> None:
+        session, client = session_and_client
+        resp = client.post(
+            "/saklas/v1/sessions/default/lens/live",
+            json={"enabled": False},
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {"enabled": False, "layers": None}
+        session.disable_live_lens.assert_called_once()
+        session.enable_live_lens.assert_not_called()
+
+    def test_not_fitted_404(self, session_and_client: Any) -> None:
+        from saklas.core.jlens import LensNotFittedError
+
+        session, client = session_and_client
+        session.enable_live_lens.side_effect = LensNotFittedError("no lens")
+        resp = client.post(
+            "/saklas/v1/sessions/default/lens/live",
+            json={"enabled": True},
+        )
+        assert resp.status_code == 404
+
+    def test_bad_layers_400(self, session_and_client: Any) -> None:
+        session, client = session_and_client
+        session.enable_live_lens.side_effect = ValueError(
+            "layers [99] not in the fitted lens"
+        )
+        resp = client.post(
+            "/saklas/v1/sessions/default/lens/live",
+            json={"enabled": True, "layers": [99]},
+        )
+        assert resp.status_code == 400
+
+    def test_top_k_bounds_400(self, session_and_client: Any) -> None:
+        _, client = session_and_client
+        resp = client.post(
+            "/saklas/v1/sessions/default/lens/live",
+            json={"enabled": True, "top_k": 0},
+        )
+        assert resp.status_code == 400
+
+    def test_wrong_session_404(self, session_and_client: Any) -> None:
+        _, client = session_and_client
+        resp = client.post(
+            "/saklas/v1/sessions/elsewhere/lens/live",
+            json={"enabled": True},
+        )
+        assert resp.status_code == 404
+
+    def test_session_info_carries_live_lens_layers(
+        self, session_and_client: Any,
+    ) -> None:
+        """Info reports the resolved layer list while on, null while off —
+        and coerces a stub session (bare MagicMock attribute) to off."""
+        session, client = session_and_client
+        # Bare mock attribute (not a real list) → reads as off.
+        resp = client.get("/saklas/v1/sessions/default")
+        assert resp.status_code == 200
+        assert resp.json()["live_lens_layers"] is None
+
+        session.live_lens_layers = [10, 14, 18]
+        resp = client.get("/saklas/v1/sessions/default")
+        assert resp.json()["live_lens_layers"] == [10, 14, 18]
+
+
+class TestWSTokenEventLens:
+    """``build_token_event`` copies the token tap's lens slot onto the frame."""
+
+    @staticmethod
+    def _event(payload: Any) -> dict[str, Any]:
+        from types import SimpleNamespace
+
+        from saklas.server.ws_events import build_token_event
+
+        session = SimpleNamespace(_last_token_probe_payload=payload)
+        return build_token_event(
+            session,
+            [None],
+            text=" x",
+            is_thinking=False,
+            tid=5,
+            lp=-0.1,
+            top_alts=None,
+        )
+
+    def test_lens_readout_rides_token_frame(self) -> None:
+        event = self._event(
+            {
+                "readings": None,
+                "lens": {12: [(" a", 0.5), (" b", -1.0)], 18: [(" c", 2.0)]},
+            }
+        )
+        # String layer keys (the ``per_layer_scores`` wire convention);
+        # pairs serialize as 2-arrays.
+        assert event["lens_readout"] == {
+            "12": [[" a", 0.5], [" b", -1.0]],
+            "18": [[" c", 2.0]],
+        }
+
+    def test_absent_when_lens_off(self) -> None:
+        event = self._event({"readings": None, "lens": None})
+        assert "lens_readout" not in event
+
+    def test_absent_when_no_payload(self) -> None:
+        event = self._event(None)
+        assert "lens_readout" not in event

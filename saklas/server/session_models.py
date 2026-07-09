@@ -87,6 +87,22 @@ def device_dtype(session: SaklasSession) -> tuple[str, str]:
     return device, dtype
 
 
+def _live_lens_layers(session: SaklasSession) -> list[int] | None:
+    """The session's live-lens layer list, or ``None`` when off.
+
+    Coerces defensively: only a real int sequence passes through, so a
+    stub session (MagicMock in tests, or a pre-lens engine) reads as
+    "live lens off" rather than an unserializable payload.
+    """
+    layers = getattr(session, "live_lens_layers", None)
+    if isinstance(layers, (list, tuple)):
+        try:
+            return [int(l) for l in layers]
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
 def session_info(
     session: SaklasSession, default_steering: Steering | None,
 ) -> dict[str, Any]:
@@ -130,6 +146,11 @@ def session_info(
         "thinking_is_optional": thinks_optional,
         "is_base_model": is_base,
         "jlens_fitted": jlens_fitted,
+        # Live workspace readout state (POST .../lens/live): the resolved
+        # layer list while enabled, null while off — lets the dashboard
+        # rehydrate its WORKSPACE panel toggle on reload.  Coerced so a
+        # stub session (tests) reads as off rather than unserializable.
+        "live_lens_layers": _live_lens_layers(session),
         "default_steering": default_expr,
         "role_substitution_supported": assistant_role_ok,
         "user_role_supported": user_role_ok,

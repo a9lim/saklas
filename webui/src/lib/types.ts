@@ -78,6 +78,11 @@ export interface SessionInfo {
    *  drilldown's j-lens tab; ``undefined`` (older server) reads as
    *  ``false`` and the tab shows the fit hint. */
   jlens_fitted?: boolean;
+  /** Live workspace-readout state (``POST .../lens/live``): the resolved
+   *  layer list while the live lens is enabled, ``null`` while off.
+   *  Rehydrates the WORKSPACE panel toggle across page reloads; older
+   *  servers omit it (reads as off). */
+  live_lens_layers?: number[] | null;
   /** True iff the loaded model family supports assistant-role
    *  substitution (Qwen / Gemma / Llama / GLM / gpt-oss yes; Mistral /
    *  talkie no). Drives whether the roles control is enabled. Older
@@ -931,6 +936,12 @@ export interface WSTokenEvent {
    *  attached, so clients read it defensively.  Distinct from ``scores``
    *  (the magnitude-weighted axis-0 scalar the highlight tint still uses). */
   probe_readings?: Record<string, ProbeReadingJSON>;
+  /** Live J-lens workspace readout for this decode step — present only
+   *  while the session's live lens is enabled (``POST .../lens/live``).
+   *  Keys are layer-index strings (same convention as
+   *  ``per_layer_scores``); values the top-k ``[token, score]`` pairs,
+   *  descending by raw lens logit.  Feeds the WORKSPACE panel. */
+  lens_readout?: Record<string, [string, number][]>;
 }
 
 export interface WSDoneResultPerToken {

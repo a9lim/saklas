@@ -78,4 +78,17 @@ def build_token_event(
                 name: r.to_dict() for name, r in readings.items()
             }
 
+    # Live J-lens workspace readout: the step's top-k lens tokens per selected
+    # layer (``enable_live_lens``), stashed by the token tap alongside the
+    # probe readings.  String layer keys to match ``per_layer_scores``' wire
+    # shape; ``[token, score]`` pairs serialize as 2-arrays.
+    with suppress(Exception):
+        payload = getattr(session, "_last_token_probe_payload", None)
+        lens = payload.get("lens") if isinstance(payload, dict) else None
+        if lens:
+            event["lens_readout"] = {
+                str(layer): [[tok, float(score)] for tok, score in pairs]
+                for layer, pairs in lens.items()
+            }
+
     return event

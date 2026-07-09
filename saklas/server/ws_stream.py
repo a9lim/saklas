@@ -569,6 +569,12 @@ async def _ws_handle_generate(
             _on_token_flags: Any = _on_token
             _on_token_flags._saklas_wants_live_scores = True
             _on_token_flags._saklas_wants_per_layer_scores = True
+            # Live J-lens workspace readout: computed only when the session's
+            # live lens is enabled (POST .../lens/live) AND the tap consumer
+            # declares interest — this stamp is the declaration (mirrors
+            # ``generate_stream``'s ``_push_flags``), so an enabled lens
+            # streams per-step top-k on the ``token`` frame's ``lens_readout``.
+            _on_token_flags._saklas_wants_lens_readout = True
 
             result_holder: list[GenerationResult | RunSet] = []
             error_holder: list[BaseException] = []

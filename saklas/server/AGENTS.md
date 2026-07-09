@@ -23,7 +23,8 @@ those registrars import):
 - `probe_routes.register_probe_routes` — `/sessions/{id}/probes/*` (unified: list / defaults / attach / detach — every probe shape)
 - `experiment_routes.register_experiment_routes` — `/sessions/{id}/experiments/fan`
 - `traits_routes.register_traits_routes` — `/sessions/{id}/traits/stream` (SSE)
-- `lens_routes.register_lens_routes` — `/sessions/{id}/lens/token-readout`
+- `lens_routes.register_lens_routes` — `/sessions/{id}/lens/*` (token readout +
+  the live-lens toggle)
 - `ws_stream.register_ws_stream` — the `WS /sessions/{id}/stream` co-stream engine
 
 `server/sse.py`, `server/streaming.py`, and `server/ws_events.py` are the shared
@@ -137,7 +138,9 @@ body + any typed safe-message formatter.
   `USER_ROLE_HEADERS` for the resolved `model_type`) and the resolved
   `default_assistant_role` / `default_user_role`, so the webui can gate roles,
   plus `jlens_fitted` (a `lens_paths` existence check gating the drilldown's
-  j-lens tab — deliberately not the lazy `session.jlens` load).
+  j-lens tab — deliberately not the lazy `session.jlens` load) and
+  `live_lens_layers` (the live workspace readout's resolved layer list, `null`
+  while off; coerced so stub sessions read as off).
 - `GET/PATCH/DELETE /saklas/v1/sessions/{id}` — info / update defaults / no-op 204.
 - `POST /saklas/v1/sessions/{id}/{clear,rewind}`.
 
@@ -313,7 +316,7 @@ grid is validated server-side (empty → 400), then `session.generate_sweep(...,
 stateless=False)` runs in a worker thread under the lock. Returns `{kind, total,
 node_ids, rows}`.
 
-### lens_routes.py — Jacobian-lens token readout
+### lens_routes.py — Jacobian-lens routes
 
 `GET /sessions/{id}/lens/token-readout?node_id=&raw_index=[&top_k=8][&steered=
 true][&raw=false][&layers=csv]` — the workspace readout at one decode step of a
@@ -329,6 +332,19 @@ mode supplies it). Errors: `LensNotFittedError`/`UnknownNodeError` → 404,
 their `user_message()` status. Lens *fitting* stays CLI-only; discovery rides
 the session-info `jlens_fitted` field (a `lens_paths` existence check — never
 the ~GB lazy artifact load).
+
+`POST /sessions/{id}/lens/live` body `{enabled, layers?, top_k?=5}` — toggle
+the **live** workspace readout (`session.enable_live_lens` /
+`disable_live_lens` under `acquire_session_lock`, so it never races an
+in-flight stream and applies to the next generation). Enabling moves the
+selected layers' `J_l` device-resident; `layers` omitted picks five fitted
+layers over the 40–90% band (the TUI `/lens` default). Returns `{enabled,
+layers}` (the resolved list). While enabled, the native WS `token` frame
+carries the per-step matrix as `lens_readout` (see ws_stream below) and
+session info reports the layer list as `live_lens_layers` (`null` while off —
+the dashboard's WORKSPACE-panel rehydration read). Errors:
+`LensNotFittedError` → 404, bad `layers` → 400, `top_k` outside `[1, 50]` →
+400.
 
 ### traits_routes.py — live traits SSE
 
@@ -370,7 +386,11 @@ derived seeds. Server → client: `started` (node_id filled lazily by the first
 token), `node_created`, `tree_mutated`, `token` (per token — `logprob`/`top_alts`
 when captured, `scores`/`per_layer_scores` when probes are loaded, `probe_readings`
 `Record<name, {fraction, nearest}>` when any probe is attached, computed
-inline off `session._capture._per_layer`), `done` (`result` with `text`, `tokens`,
+inline off `session._capture._per_layer`, and `lens_readout`
+`Record<layerStr, [token, score][]>` while the live lens is on — the WS
+`_on_token` stamps `_saklas_wants_lens_readout` so the engine computes the
+step readout, and `build_token_event` copies the token tap's `lens` slot onto
+the frame), `done` (`result` with `text`, `tokens`,
 `finish_reason`, `usage`, `per_token_probes`, `mean_logprob`, `mean_surprise`,
 `probe_readings` aggregate), `error` (validation errors keep the connection open;
 other failures close 1011).

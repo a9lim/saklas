@@ -12,12 +12,16 @@
 
   import SteeringRack from "./SteeringRack.svelte";
   import ProbeRack from "./ProbeRack.svelte";
+  import WorkspacePanel from "./WorkspacePanel.svelte";
 </script>
 
 <aside class="inspector" aria-label="Saklas inspector">
   <div class="rack-grid">
     <SteeringRack />
     <ProbeRack />
+    <!-- WORKSPACE (J-lens) — renders nothing when no lens is fitted, so
+         the auto row collapses and the two racks keep the full budget. -->
+    <WorkspacePanel />
   </div>
 </aside>
 
@@ -34,11 +38,14 @@
     background: var(--bg-alt);
   }
 
-  /* Two equal flat sections, divided only by SteeringRack's border-bottom
-   * hairline — no gap, no nested boxes. */
+  /* Two equal flat rack sections, divided only by SteeringRack's
+   * border-bottom hairline — no gap, no nested boxes.  The third ``auto``
+   * row is the WORKSPACE (J-lens) readout, content-sized: zero when no
+   * lens is fitted (the panel renders nothing), a header strip when off,
+   * a bounded matrix while live. */
   .rack-grid {
     display: grid;
-    grid-template-rows: minmax(0, 1fr) minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr) minmax(0, 1fr) auto;
     height: 100%;
     max-height: 100%;
     min-height: 0;

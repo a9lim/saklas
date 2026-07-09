@@ -805,6 +805,18 @@ export const apiLens = {
     if (opts.layers) params.set("layers", opts.layers);
     return request(`${SESSION_BASE(id)}/lens/token-readout?${params}`);
   },
+
+  /** Toggle the live workspace readout.  While enabled, each WS ``token``
+   * frame carries a ``lens_readout`` matrix (per selected layer, the top-k
+   * lens tokens for that decode step).  ``layers`` omitted lets the server
+   * pick five fitted layers over the 40–90% workspace band (the TUI's
+   * ``/lens`` default).  Applies to generations started after the call. */
+  setLive(
+    body: { enabled: boolean; layers?: number[] | null; top_k?: number },
+    id: string = SESSION,
+  ): Promise<{ enabled: boolean; layers: number[] | null }> {
+    return request(`${SESSION_BASE(id)}/lens/live`, jsonBody(body));
+  },
 };
 
 // =========================================================== traits ====
