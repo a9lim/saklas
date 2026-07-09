@@ -76,17 +76,19 @@ unembed's own dtype — a fp32 W_U copy would be GBs). `aggregate_readout(logits
 depths, top_k)` is the **layer-aggregation** of a stacked `[L, vocab]` readout:
 per-layer softmax (calibrates away the cross-layer logit scale), then per token
 `strength = mean_l p_l(v)` (mean band probability) and a depth center of mass +
-std weighted by the within-layer *salience* `p_l(v)/max_v' p_l(v')` — not raw
-mass, which reads late for every token because early workspace layers are
-diffuse. Top-k by aggregated full-vocab strength (a per-layer top-k union would
+std weighted by the same per-layer probability `p_l(v)` — the band readout is
+sharp, and what changes over depth is *which* token leads, so a token's
+probability profile over depth is its depth signal (a diffuse noise layer's
+vote is discounted by its own lack of mass; the former within-layer salience
+gave it a full vote). Top-k by aggregated full-vocab strength (a per-layer top-k union would
 miss a mid-pack-everywhere token); returns `[(vocab_id, strength, com,
 spread)]`, one batched host transfer. `token_readout_stats(logits, depths,
 token_ids)` is the **single-token restriction** of the same calibration — read
 at pinned vocabulary ids instead of top-k selection, returning per id
 `(strength, com, spread, per_layer[p_l])` where `strength = mean_l p_l(v)`
 (∈ [0,1], the ONE probe/gate/display channel — apples-to-apples across
-tokens and layers; within-layer salience survives only as the internal
-depth-CoM weighting, matching `aggregate_readout`) — the math behind
+tokens and layers; the depth-CoM mass is the same `p_l`, matching
+`aggregate_readout`) — the math behind
 `jlens/<word>` probe readings and gate scalars. `resolve_word_token` maps
 a word to its single vocab id (leading-space piece first, decode-and-compare
 sanity check, `MultiTokenWordError` with the pieces otherwise).
@@ -920,8 +922,8 @@ direction fold, no whitener. The reading is the readout-channel synthesis of
 `ProbeReading` (`_score_lens_probes` over `jlens.token_readout_stats`):
 `coords = (strength,)` — the ONE channel, mean band probability
 `mean_l p_l(v)` (the gate channel `@when:jlens/<word>` and the workspace
-card's `strength`) — `coords_per_layer[l] = (p_l,)`, salience-weighted
-`depth_com` (internal weighting only), geometry fields defaulted. The live
+card's `strength`) — `coords_per_layer[l] = (p_l,)`, probability-mass-weighted
+`depth_com`, geometry fields defaulted. The live
 per-layer top-k display wire carries per-layer softmax probabilities too
 (`_live_lens_readout_step` softmaxes before top-k; monotone, so the
 ranking is unchanged), so every lens surface reads one unit. Three read sites,

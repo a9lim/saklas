@@ -1235,7 +1235,7 @@ class SaklasSession:
         self._live_lens: dict[str, Any] | None = None
         # Pinned J-lens token probes: name -> {word, token_id, layers}.  NOT
         # monitor probes — they read the lens readout channel (per-layer
-        # softmax salience/probability), not a whitened subspace coordinate,
+        # softmax probability), not a whitened subspace coordinate,
         # and are scored on the post-forward lens path (`_score_lens_probes`).
         self._lens_probes: dict[str, dict[str, Any]] = {}
         # Per-forward stash: the gate callback computes band logits first
@@ -2262,7 +2262,7 @@ class SaklasSession:
 
         ``aggregate=True`` additionally layer-aggregates each position's
         readout (per-layer softmax → mean-probability strength +
-        salience-weighted depth center of mass; see
+        probability-mass-weighted depth center of mass; see
         :func:`saklas.core.jlens.aggregate_readout`) and returns the pair
         ``(per_layer, aggregate)`` where ``aggregate`` is one
         ``[(token, strength, com, spread), ...]`` list per position, from
@@ -2373,8 +2373,8 @@ class SaklasSession:
         workspace_band, readout: {layer: [(token, logprob, id), ...]},
         aggregate: [(token, strength, com, spread), ...]}`` — ``aggregate``
         is the layer-aggregated view of the same logits (per-layer softmax
-        → mean-probability strength + salience-weighted depth center of
-        mass; :func:`saklas.core.jlens.aggregate_readout`).
+        → mean-probability strength + probability-mass-weighted depth
+        center of mass; :func:`saklas.core.jlens.aggregate_readout`).
         Raises :class:`~saklas.core.jlens.LensNotFittedError` with no
         fitted lens, :class:`UnknownNodeError` /
         :class:`InvalidNodeOperationError` on a bad target (mirrors
@@ -2506,7 +2506,7 @@ class SaklasSession:
         exactly like an extracted vector. Idempotent. This is the resolver
         behind the lazy ``jlens/`` steering branch — *probes* no longer
         fold this direction: a ``jlens/<word>`` probe reads the readout
-        channel (per-layer softmax salience/probability) via the session
+        channel (per-layer softmax probability) via the session
         lens-probe registry instead.
 
         Restricted to the **workspace band** (40–90% depth): in the motor
@@ -4386,9 +4386,9 @@ class SaklasSession:
         length.  Resolution order is in :meth:`_resolve_probe_manifold`.
         """
         # Reserved J-lens namespace: a ``jlens/<word>`` probe is NOT a linear
-        # probe — it reads the readout channel (per-layer softmax salience +
-        # probability of the token under ``softmax(W_U · norm(J_l h))``, mean-
-        # banded), the paper-native "how disposed is the model to say this
+        # probe — it reads the readout channel (per-layer softmax probability
+        # of the token under ``softmax(W_U · norm(J_l h))``, mean-banded),
+        # the paper-native "how disposed is the model to say this
         # word" quantity, not a whitened coordinate along ``W_U[v] @ J_l``.
         # Routed to the session lens-probe registry; the Monitor never sees it
         # (no whitener requirement — the softmax is the calibration).
@@ -4681,7 +4681,9 @@ class SaklasSession:
             # A lens probe has no baked tensor — hash the readout-channel
             # identity (model, token, band, channel version) so transcript
             # drift detection still works across a semantics change (v2:
-            # single strength axis; v1 carried a salience axis).
+            # single strength axis; v1 carried a salience axis; the depth-CoM
+            # mass moved salience→probability within v2 — display-only, the
+            # coords channel is bit-identical, so no bump).
             import hashlib
             digest = hashlib.sha256(
                 repr(

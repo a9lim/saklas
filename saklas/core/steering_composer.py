@@ -749,7 +749,7 @@ class SteeringComposer:
         capture = session._capture
         monitor = session._monitor
         # J-lens token probes referenced by active gates score on the lens
-        # path (readout-channel salience/strength), not through the Monitor —
+        # path (readout-channel strength), not through the Monitor —
         # detected once per generation here, merged into every return below.
         has_lens_gates = bool(self.gated_lens_probe_keys())
 
@@ -804,7 +804,7 @@ class SteeringComposer:
         def _score() -> dict[str, float]:
             out = _monitor_scalars()
             if has_lens_gates:
-                # Once per forward: band lens logits → salience/strength
+                # Once per forward: band lens logits → strength
                 # scalars (also stashed for the display step to reuse).
                 lens_scalars = session._score_lens_gate_scalars()
                 if lens_scalars:

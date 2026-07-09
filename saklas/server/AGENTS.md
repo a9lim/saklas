@@ -347,7 +347,7 @@ the forward that produced the clicked token, each row
 `{layer, in_band, tokens:[{token, id, logprob}]}` sorted ascending (`in_band` =
 the 40–90% workspace band), plus the layer-aggregated `aggregate:
 [{token, strength, com, spread}]` block (per-layer softmax → mean band
-probability + salience-weighted depth center of mass; band-restricted,
+probability + probability-mass-weighted depth center of mass; band-restricted,
 strength-descending; `[]` from a session dict without the key). `steered` (default on) replays under the node's
 recipe steering — `steered=false` is the unsteered counterfactual; `raw` marks
 a flat-buffer node (raw-ness isn't stamped server-side, the client's render

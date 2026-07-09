@@ -307,10 +307,13 @@ Three read surfaces, one write surface:
   per-layer softmax calibrates away the cross-layer logit scale, then per token
   `strength = mean_l p_l(v)` (mean band probability, 0..1; uniform layer weights —
   softmax already lets a confident layer dominate) and a depth center of mass
-  `com` (+ `spread`) weighted by the within-layer *salience*
-  `p_l(v)/max_v' p_l(v')` rather than raw mass (early workspace layers are
-  diffuse, so mass-CoM reads late for every token; salience lets each layer vote
-  on *where the token is near the top of the readout*). Top-k selection runs on
+  `com` (+ `spread`) weighted by the same per-layer probability `p_l(v)` — the
+  band readout is sharp, not diffuse (median per-layer max ≈ 0.8 on gemma-3-4b),
+  and what changes over depth is *which* token leads, so a token's probability
+  profile over depth is its depth signal; one channel backs every readout
+  statistic (a former within-layer salience weighting handed a diffuse noise
+  layer's relative-top token a full vote; in band the two agree to ≲0.01).
+  Top-k selection runs on
   the aggregated full-vocab strengths. The aggregate is restricted to the
   **workspace-band subset** of the requested layers (falling back to all when
   none are in band — same band policy as steering); the per-layer matrix always
@@ -378,9 +381,9 @@ Three read surfaces, one write surface:
   channel — `coords = (strength,)`, the **mean band probability**
   `mean_l p_l(v)` ∈ [0,1] (`@when:jlens/fake > 0.01`, the workspace card's
   `strength`) — objective and apples-to-apples across tokens and layers
-  (a within-layer max normalization isn't; salience survives only as the
-  internal depth-CoM weighting shared with `aggregate_readout`, never as a
-  reported value). The synthesized `ProbeReading` carries the per-layer
+  (a within-layer max normalization isn't; the depth-CoM mass is the same
+  `p_l`, so `p_l` is the one unit behind every lens statistic). The
+  synthesized `ProbeReading` carries the per-layer
   `(p_l,)` trace; the live per-layer top-k wire also reports per-layer
   softmax probabilities, so every lens surface reads the same unit.
   Geometry fields are defaulted (`fraction`/

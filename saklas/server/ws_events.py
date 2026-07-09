@@ -92,7 +92,7 @@ def build_token_event(
             }
         # The layer-aggregated chip list riding the same step: ``[token,
         # strength, com, spread]`` 4-arrays, strength-descending (mean
-        # band probability + salience-weighted depth center of mass).
+        # band probability + probability-mass-weighted depth center of mass).
         agg = (
             payload.get("lens_aggregate") if isinstance(payload, dict) else None
         )

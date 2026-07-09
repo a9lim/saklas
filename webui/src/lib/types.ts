@@ -136,9 +136,9 @@ export interface LensReadoutLayerJSON {
 }
 
 /** One token of the layer-aggregated workspace readout: per-layer softmax
- *  → mean band probability (``strength``, 0..1) + the salience-weighted
- *  depth center of mass (``com``, 0 = first block, 1 = last) and its std
- *  (``spread``). */
+ *  → mean band probability (``strength``, 0..1) + the probability-mass-
+ *  weighted depth center of mass (``com``, 0 = first block, 1 = last) and
+ *  its std (``spread``). */
 export interface LensAggregateTokenJSON {
   token: string;
   strength: number;
@@ -1003,8 +1003,8 @@ export interface WSTokenEvent {
   lens_readout?: Record<string, [string, number][]>;
   /** Layer-aggregated view of the same step's lens readout —
    *  ``[token, strength, com, spread]`` 4-arrays, strength-descending
-   *  (mean band probability + salience-weighted depth center of mass).
-   *  Present under the same conditions as ``lens_readout``. */
+   *  (mean band probability + probability-mass-weighted depth center of
+   *  mass).  Present under the same conditions as ``lens_readout``. */
   lens_aggregate?: [string, number, number, number][];
 }
 

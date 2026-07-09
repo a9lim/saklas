@@ -324,10 +324,9 @@ def test_aggregate_readout_strength_is_mean_probability() -> None:
 
 
 def test_aggregate_readout_com_tracks_where_a_token_leads() -> None:
-    # Token 0 dominates the earliest layer, token 1 the latest; a token that
-    # never leads anywhere (uniform row) should sit near the salience-mean
-    # depth. Sharp logits make each layer's salience concentrate on its
-    # leader.
+    # Token 0 dominates the earliest layer, token 1 the latest. Sharp
+    # logits concentrate each layer's probability mass on its leader, so
+    # each token's depth CoM sits at the layer(s) it leads.
     depths = [0.2, 0.5, 0.8]
     logits = torch.full((3, _VOCAB), -10.0)
     logits[0, 0] = 10.0
@@ -352,24 +351,32 @@ def test_aggregate_readout_single_layer_degenerates() -> None:
         assert spread == pytest.approx(0.0, abs=1e-6)
 
 
-def test_aggregate_readout_salience_com_beats_mass_com_late_bias() -> None:
-    # The design point: a token that LEADS a diffuse early layer but is
-    # rank-2 in a sharp late layer should read early by salience, even
-    # though raw probability mass is concentrated late.
+def test_aggregate_readout_com_is_probability_mass_weighted() -> None:
+    # The design point (2026-07-09): the band readout is sharp, and what
+    # changes over depth is WHICH token leads — so depth CoM weights by
+    # the per-layer probability itself, the same channel behind strength.
+    # A fully-diffuse layer (uniform readout — nothing is being "said")
+    # must not pin any token's depth: its vote is discounted by its own
+    # lack of mass. The former within-layer salience handed the uniform
+    # layer a FULL vote for every token (sal = 1.0 at the tied max),
+    # reading token 0 early (com ≈ 0.33 here) even though its readout
+    # probability concentrates late. (At the toy vocab of 13 the uniform
+    # layer still carries p = 1/13 per token; at a real ~260k vocab the
+    # discount is ~4e-6 and the pull toward the sharp layer is total.)
     depths = [0.3, 0.9]
-    logits = torch.zeros(2, _VOCAB)
-    logits[0, 0] = 1.0          # diffuse early layer, token 0 barely leads
-    logits[1, 1] = 12.0         # sharp late layer led by token 1
-    logits[1, 0] = 9.0          # token 0 clearly present but not leading
+    logits = torch.zeros(2, _VOCAB)   # layer 0 uniform (fully diffuse)
+    logits[1, 1] = 12.0               # sharp late layer led by token 1
+    logits[1, 0] = 9.0                # token 0 present but not leading
+    p = logits.softmax(dim=-1)
+    d = torch.tensor(depths)
     rows = {tok: com for tok, _, com, _ in
             aggregate_readout(logits, depths, top_k=_VOCAB)}
-    # mass CoM for token 0 would be ≈0.9 (its late p dwarfs the diffuse
-    # early p); salience CoM must pull it toward the early layer it leads.
-    early_sal = 1.0                       # leads layer 0
-    late_sal = math.exp(9.0 - 12.0)       # relative to the late leader
-    expected = (0.3 * early_sal + 0.9 * late_sal) / (early_sal + late_sal)
-    assert rows[0] == pytest.approx(expected, abs=0.02)
-    assert rows[0] < 0.5 < rows[1]
+    for tok in (0, 1):
+        expected = float((p[:, tok] * d).sum() / p[:, tok].sum())
+        assert rows[tok] == pytest.approx(expected, abs=1e-6)
+    # token 0's depth is pulled past the uniform layer toward its mass
+    assert rows[0] > 0.5
+    assert rows[1] > 0.8
 
 
 def test_aggregate_readout_validates_shapes() -> None:

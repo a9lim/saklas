@@ -347,10 +347,15 @@ def aggregate_readout(
       lets a confident layer dominate the ranking, so extra confidence
       weighting would double-count.
     - ``com``/``spread`` — the depth center of mass (+ std) weighted by
-      the within-layer *salience* ``s_l(v) = p_l(v) / max_v' p_l(v')``,
-      not by raw mass.  Early workspace layers are diffuse, so raw-mass
-      CoM reads late for every token; salience lets each layer vote
-      equally on *where this token sits near the top of the readout*.
+      the same per-layer probability ``p_l(v)``.  The workspace-band
+      readout is sharp, not diffuse (median per-layer max ≈ 0.8 on
+      gemma-3-4b) — what changes over depth is *which* token leads, so a
+      token's probability profile over depth IS its depth signal.
+      Probability mass also discounts a genuinely diffuse (noise) layer
+      automatically; the former within-layer salience ``p_l/max_v' p_l``
+      handed such a layer's relative-top token a full vote regardless of
+      absolute mass (in band the two weightings agree to ≲0.01 — one
+      channel, ``p_l``, now backs every readout statistic).
 
     Top-k selection runs on the aggregated full-vocab strengths — a
     per-layer top-k union would miss a token that ranks mid-pack at every
@@ -368,13 +373,12 @@ def aggregate_readout(
         )
     probs = logits.float().softmax(dim=-1)                      # [L, V]
     strength = probs.mean(dim=0)                                # [V]
-    sal = probs / probs.amax(dim=-1, keepdim=True).clamp_min(1e-12)
     d = torch.tensor(
         [float(x) for x in depths], dtype=torch.float32, device=probs.device,
     ).unsqueeze(-1)                                             # [L, 1]
-    mass = sal.sum(dim=0).clamp_min(1e-12)                      # [V]
-    com = (sal * d).sum(dim=0) / mass                           # [V]
-    var = (sal * (d - com.unsqueeze(0)) ** 2).sum(dim=0) / mass
+    mass = probs.sum(dim=0).clamp_min(1e-12)                    # [V]
+    com = (probs * d).sum(dim=0) / mass                         # [V]
+    var = (probs * (d - com.unsqueeze(0)) ** 2).sum(dim=0) / mass
     spread = var.clamp_min(0.0).sqrt()
     k = min(int(top_k), int(strength.shape[-1]))
     vals, idxs = strength.topk(k)
@@ -408,10 +412,11 @@ def token_readout_stats(
       (objective and apples-to-apples across tokens and layers, unlike a
       within-layer max normalization).
     - ``com`` / ``spread`` — depth center of mass (+ std), weighted by the
-      within-layer salience ``p_l(v)/max_v' p_l(v')`` exactly like
-      :func:`aggregate_readout` (an internal weighting only — raw-mass CoM
-      reads late for every token because early workspace layers are
-      diffuse; salience never surfaces as a reported value).
+      same per-layer probability ``p_l(v)`` exactly like
+      :func:`aggregate_readout` — the one channel backs every statistic
+      (the band readout is sharp, so a token's probability profile over
+      depth is its depth signal; a diffuse noise layer's vote is
+      discounted by its own lack of mass).
     - ``per_layer`` — ``[p_l, ...]`` aligned with the logit rows.
 
     Returns one ``(strength, com, spread, per_layer)`` tuple per requested
@@ -434,14 +439,13 @@ def token_readout_stats(
         [int(v) for v in token_ids], dtype=torch.long, device=probs.device,
     )
     p = probs.index_select(-1, ids)                             # [L, K]
-    sal = p / probs.amax(dim=-1, keepdim=True).clamp_min(1e-12)  # [L, K]
     strength = p.mean(dim=0)                                    # [K]
     d = torch.tensor(
         [float(x) for x in depths], dtype=torch.float32, device=probs.device,
     ).unsqueeze(-1)                                             # [L, 1]
-    mass = sal.sum(dim=0).clamp_min(1e-12)                      # [K]
-    com = (sal * d).sum(dim=0) / mass                           # [K]
-    var = (sal * (d - com.unsqueeze(0)) ** 2).sum(dim=0) / mass
+    mass = p.sum(dim=0).clamp_min(1e-12)                        # [K]
+    com = (p * d).sum(dim=0) / mass                             # [K]
+    var = (p * (d - com.unsqueeze(0)) ** 2).sum(dim=0) / mass
     spread = var.clamp_min(0.0).sqrt()
     # one batched host transfer: 3 aggregate rows + the per-layer block
     host = torch.cat(

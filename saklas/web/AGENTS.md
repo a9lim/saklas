@@ -42,8 +42,8 @@ The dashboard speaks the native `/saklas/v1/*` API (`saklas/server/saklas_api.py
   workspace readout at one decode step: per-layer top-k matrix
   (`layers: [{layer, in_band, tokens:[{token, id, logprob}]}]`) plus the
   layer-aggregated `aggregate: [{token, strength, com, spread}]` block
-  (per-layer softmax → mean band probability + salience-weighted depth center
-  of mass, band-restricted) at the forward that produced the clicked token,
+  (per-layer softmax → mean band probability + probability-mass-weighted depth
+  center of mass, band-restricted) at the forward that produced the clicked token,
   recomputed on demand server-side (node prompt render + raw prefix replay
   under the node's recipe steering; `steered=false` for the unsteered
   counterfactual, `raw=true` for flat-buffer nodes — the client's render mode

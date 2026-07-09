@@ -753,8 +753,8 @@
         </div>
         {#if (lensData.aggregate ?? []).length > 0}
           <!-- Layer-aggregated view of the same logits (band-restricted):
-               strength = mean band probability, com = salience-weighted
-               depth center of mass (0 = first block, 1 = last). -->
+               strength = mean band probability, com = probability-mass-
+               weighted depth center of mass (0 = first block, 1 = last). -->
           <div class="lens-agg" role="list" aria-label="Aggregate lens tokens">
             <span class="lens-agg-label">aggregate</span>
             {#each lensData.aggregate ?? [] as chip, i (i)}

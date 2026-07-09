@@ -90,8 +90,8 @@ def test_ensure_profile_registered_jlens_requires_fitted_lens() -> None:
 
 
 def test_add_probe_routes_jlens_to_lens_registry() -> None:
-    """A ``jlens/<word>`` probe is a READOUT-channel probe (salience /
-    probability under the lens softmax), not a linear probe — ``add_probe``
+    """A ``jlens/<word>`` probe is a READOUT-channel probe (probability
+    under the lens softmax), not a linear probe — ``add_probe``
     routes it to the session lens-probe registry, never folding the
     ``W_U[v] @ J_l`` direction and never falling through to ``extract()``."""
     session = _StubSession()

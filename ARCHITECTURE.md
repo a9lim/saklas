@@ -918,8 +918,8 @@ consumers with zero hot-path cost when unused:
   `coords = (strength,)` — the mean band **probability** `mean_l p_l(v)`
   (the `@when:jlens/<word>` gate channel — [0,1], the workspace
   `strength`, one number across every card and layer; a within-layer max
-  normalization is not apples-to-apples, so salience survives only as the
-  internal depth-CoM weighting shared with `aggregate_readout`). The
+  normalization is not apples-to-apples, and the depth CoM weights by the
+  same `p_l`, so `p_l` is the one unit behind every lens statistic). The
   synthesized `ProbeReading` carries per-layer `(p_l,)`, and the live
   top-k display wire reports per-layer softmax probabilities too. Scoring is post-forward on the lens path
   (display rides the live-lens step's logits; gate scalars compute once per

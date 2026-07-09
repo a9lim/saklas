@@ -2506,7 +2506,7 @@ def _run_lens_top(args: argparse.Namespace) -> None:
             "positions": args.position or [-1],
             # Layer-aggregated view (workspace-band subset of the layers):
             # per-layer softmax → mean-probability strength +
-            # salience-weighted depth center of mass, strength-descending.
+            # probability-mass-weighted depth center of mass, strength-descending.
             "aggregate": [
                 [
                     {

@@ -119,7 +119,7 @@ export interface LensState {
   readout: Record<string, [string, number][]> | null;
   /** Layer-aggregated chip list riding the same step — ``[token,
    * strength, com, spread]`` strength-descending (mean band probability
-   * + salience-weighted depth center of mass).  Same lifecycle as
+   * + probability-mass-weighted depth center of mass).  Same lifecycle as
    * ``readout``. */
   aggregate: [string, number, number, number][] | null;
   /** Rolling buffer of recent aggregate frames (``[token, strength]``

@@ -366,7 +366,7 @@ class TokenEvent:
     # Layer-aggregated view of the same step's lens readout: ``[(token,
     # strength, com, spread), ...]`` — per-layer softmax → mean-probability
     # strength over the workspace-band subset of the live layers, plus the
-    # salience-weighted depth center of mass (0 = first block, 1 = last)
+    # probability-mass-weighted depth center of mass (0 = first block, 1 = last)
     # and its std (:func:`saklas.core.jlens.aggregate_readout`). ``None``
     # when the live lens is off.
     lens_aggregate: list[tuple[str, float, float, float]] | None = None

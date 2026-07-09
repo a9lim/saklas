@@ -404,7 +404,7 @@ class TraitPanel(SelectableListWidget):
         lines: list[str] = []
         if self._lens_aggregate:
             # Layer-aggregated chip row first: token@com, strength-descending
-            # (com = salience-weighted depth center of mass, 0..1).
+            # (com = probability-mass-weighted depth center of mass, 0..1).
             toks = "  ".join(
                 f"[ansi_cyan]{self._lens_token_markup(tok)}[/]"
                 f"[dim]@{com:.2f}[/]"
