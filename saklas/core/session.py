@@ -1768,6 +1768,7 @@ class SaklasSession:
         dim_batch: int | None = None,
         seq_len: int | None = None,
         force: bool = False,
+        checkpoint_every: int | None = None,
         on_progress: Callable[[str], None] | None = None,
     ) -> "Any":
         """Fit (or resume fitting) this model's Jacobian lens and persist it.
@@ -1787,6 +1788,7 @@ class SaklasSession:
         import hashlib
 
         from saklas.core.jlens import (
+            DEFAULT_CHECKPOINT_EVERY,
             DEFAULT_DIM_BATCH,
             DEFAULT_SEQ_LEN,
             SKIP_FIRST_POSITIONS,
@@ -1795,9 +1797,18 @@ class SaklasSession:
             fit_jacobian_lens,
         )
         from saklas.io.lens import load_lens, load_lens_sidecar, save_lens
+        from saklas.io.lens import (
+            load_lens_checkpoint,
+            remove_lens_checkpoint,
+            save_lens_checkpoint,
+        )
 
         dim_batch = dim_batch or DEFAULT_DIM_BATCH
         seq_len = seq_len or DEFAULT_SEQ_LEN
+        checkpoint_every = checkpoint_every or DEFAULT_CHECKPOINT_EVERY
+        prompt_list = list(prompts)
+        raw_corpus_sha = hashlib.sha256(repr(prompt_list).encode("utf-8")).hexdigest()
+        raw_prompt_count = len(prompt_list)
 
         with self._model_exclusive(
             "session.fit_jlens called while another model use is in flight",
@@ -1805,18 +1816,49 @@ class SaklasSession:
         ):
             fit_model = getattr(self._model, "_orig_mod", self._model)
             fit_layers = list(get_layers(fit_model))
+            expected_sources = self._resolve_jlens_source_layers(
+                source_layers, n_layers=len(fit_layers),
+            )
+            expected_set = set(expected_sources)
+            if force:
+                remove_lens_checkpoint(self.model_id)
+            else:
+                sidecar = load_lens_sidecar(self.model_id)
+                if (
+                    sidecar is not None
+                    and sidecar.get("raw_corpus_sha256") == raw_corpus_sha
+                    and sidecar.get("raw_prompt_count") == raw_prompt_count
+                    and sidecar.get("seq_len") == seq_len
+                    and set(int(l) for l in sidecar.get("source_layers", []))
+                    >= expected_set
+                ):
+                    usable_count = int(sidecar.get("usable_prompt_count", -1))
+                    existing = load_lens(self.model_id)
+                    if existing is not None:
+                        lens, _ = existing
+                        if usable_count >= 0 and lens.n_prompts >= usable_count:
+                            if on_progress is not None:
+                                on_progress(
+                                    f"lens already fitted on {lens.n_prompts} "
+                                    "prompts — nothing to do"
+                                )
+                            selected = lens.select_layers(expected_sources)
+                            self._jlens = selected
+                            self._jlens_device_cache = {}
+                            return selected
+
             usable: list[str] = []
             consumed_ids: list[list[int]] = []
-            for prompt in prompts:
+            for prompt in prompt_list:
                 ids = self._tokenizer(prompt, return_tensors="pt")["input_ids"][
                     :, :seq_len
                 ]
                 if ids.shape[1] > SKIP_FIRST_POSITIONS + 1:
                     usable.append(prompt)
                     consumed_ids.append([int(tok) for tok in ids[0].tolist()])
-            if len(usable) < len(prompts) and on_progress is not None:
+            if len(usable) < raw_prompt_count and on_progress is not None:
                 on_progress(
-                    f"dropped {len(prompts) - len(usable)} too-short prompts "
+                    f"dropped {raw_prompt_count - len(usable)} too-short prompts "
                     f"({len(usable)} usable)"
                 )
             if not usable:
@@ -1828,12 +1870,7 @@ class SaklasSession:
                 repr(consumed_ids).encode("utf-8")
             ).hexdigest()
             corpus_hash_kind = "token_ids_v1"
-
-            expected_sources = self._resolve_jlens_source_layers(
-                source_layers, n_layers=len(fit_layers),
-            )
             base: Any = None
-            last_saved_n_prompts = -1
             if not force:
                 sidecar = load_lens_sidecar(self.model_id)
                 if (
@@ -1841,64 +1878,144 @@ class SaklasSession:
                     and sidecar.get("corpus_sha256") == corpus_sha
                     and sidecar.get("corpus_hash_kind") == corpus_hash_kind
                     and sidecar.get("seq_len") == seq_len
-                    and [int(l) for l in sidecar.get("source_layers", [])]
-                    == expected_sources
                 ):
                     existing = load_lens(self.model_id)
                 else:
                     existing = None
                 if existing is not None:
                     lens, sidecar = existing
+                    existing_set = set(lens.source_layers)
                     if lens.n_prompts >= len(usable):
+                        if existing_set >= expected_set:
+                            if on_progress is not None:
+                                on_progress(
+                                    f"lens already fitted on {lens.n_prompts} "
+                                    "prompts — nothing to do"
+                                )
+                            selected = lens.select_layers(expected_sources)
+                            self._jlens = selected
+                            self._jlens_device_cache = {}
+                            return selected
+                        missing_sources = sorted(expected_set - existing_set)
                         if on_progress is not None:
                             on_progress(
-                                f"lens already fitted on {lens.n_prompts} "
-                                "prompts — nothing to do"
+                                "reusing existing fitted layers; fitting missing "
+                                f"J-lens layers {missing_sources}"
                             )
-                        self._jlens = lens
+                        missing = fit_jacobian_lens(
+                            fit_model, self._tokenizer, usable, fit_layers,
+                            source_layers=missing_sources, dim_batch=dim_batch,
+                            max_seq_len=seq_len, on_progress=on_progress,
+                            input_id_rows=consumed_ids,
+                        )
+                        merged = JacobianLens.union_layers([lens, missing])
+                        save_lens(
+                            merged, self.model_id,
+                            corpus_spec=corpus_spec, corpus_sha256=corpus_sha,
+                            corpus_hash_kind=corpus_hash_kind,
+                            seq_len=seq_len, dim_batch=dim_batch,
+                            skip_first=SKIP_FIRST_POSITIONS,
+                            durable=True,
+                            raw_corpus_sha256=raw_corpus_sha,
+                            raw_prompt_count=raw_prompt_count,
+                            usable_prompt_count=len(consumed_ids),
+                        )
+                        remove_lens_checkpoint(self.model_id)
+                        selected = merged.select_layers(expected_sources)
+                        self._jlens = selected
                         self._jlens_device_cache = {}
-                        return lens
-                    base = lens
-                    usable = usable[lens.n_prompts:]
-                    consumed_ids = consumed_ids[lens.n_prompts:]
+                        return selected
+                    if existing_set >= expected_set:
+                        base = lens.select_layers(expected_sources)
+                    else:
+                        base = None
+                ckpt = load_lens_checkpoint(self.model_id)
+                if ckpt is not None:
+                    partial, ckpt_sidecar = ckpt
+                    ckpt_matches = (
+                        ckpt_sidecar.get("corpus_sha256") == corpus_sha
+                        and ckpt_sidecar.get("corpus_hash_kind") == corpus_hash_kind
+                        and ckpt_sidecar.get("seq_len") == seq_len
+                        and [int(l) for l in ckpt_sidecar.get("source_layers", [])]
+                        == expected_sources
+                    )
+                    if ckpt_matches:
+                        ckpt_base_n = int(ckpt_sidecar.get("base_n_prompts", -1))
+                        if base is not None and ckpt_base_n == base.n_prompts:
+                            base = JacobianLens.merge([base, partial])
+                            if on_progress is not None:
+                                on_progress(
+                                    "resuming from checkpoint at "
+                                    f"{base.n_prompts} prompts"
+                                )
+                        elif base is None and ckpt_base_n == 0:
+                            base = partial
+                            if on_progress is not None:
+                                on_progress(
+                                    "resuming from checkpoint at "
+                                    f"{base.n_prompts} prompts"
+                                )
+                if base is not None:
+                    base_n_prompts = base.n_prompts
+                    usable = usable[base_n_prompts:]
+                    consumed_ids = consumed_ids[base_n_prompts:]
                     if on_progress is not None:
                         on_progress(
-                            f"resuming from {lens.n_prompts} prompts "
+                            f"resuming from {base_n_prompts} prompts "
                             f"({len(usable)} remaining)"
                         )
 
-            def _save(partial: "Any", *, durable: bool) -> "Any":
-                nonlocal last_saved_n_prompts
-                merged = (
-                    JacobianLens.merge([base, partial]) if base is not None else partial
-                )
+            prompt_base = base.n_prompts if base is not None else 0
+
+            def _save_full(lens: "Any") -> "Any":
                 save_lens(
-                    merged, self.model_id,
+                    lens, self.model_id,
                     corpus_spec=corpus_spec, corpus_sha256=corpus_sha,
                     corpus_hash_kind=corpus_hash_kind,
                     seq_len=seq_len, dim_batch=dim_batch,
                     skip_first=SKIP_FIRST_POSITIONS,
-                    durable=durable,
+                    durable=True,
+                    raw_corpus_sha256=raw_corpus_sha,
+                    raw_prompt_count=raw_prompt_count,
+                    usable_prompt_count=len(consumed_ids) + prompt_base,
                 )
-                last_saved_n_prompts = merged.n_prompts
+                remove_lens_checkpoint(self.model_id)
+                return lens
+
+            def _save_checkpoint(partial: "Any") -> None:
+                save_lens_checkpoint(
+                    partial, self.model_id,
+                    base_n_prompts=prompt_base,
+                    corpus_spec=corpus_spec,
+                    corpus_sha256=corpus_sha,
+                    corpus_hash_kind=corpus_hash_kind,
+                    seq_len=seq_len,
+                    dim_batch=dim_batch,
+                    skip_first=SKIP_FIRST_POSITIONS,
+                    raw_corpus_sha256=raw_corpus_sha,
+                    raw_prompt_count=raw_prompt_count,
+                    usable_prompt_count=len(consumed_ids) + prompt_base,
+                )
+
+            if base is not None and not usable:
+                merged = _save_full(base)
+                self._jlens = merged
+                self._jlens_device_cache = {}
                 return merged
 
             fitted = fit_jacobian_lens(
                 fit_model, self._tokenizer, usable, fit_layers,
                 source_layers=expected_sources, dim_batch=dim_batch,
                 max_seq_len=seq_len,
-                checkpoint_cb=lambda partial: _save(partial, durable=False),
+                checkpoint_cb=_save_checkpoint,
+                checkpoint_every=checkpoint_every,
                 on_progress=on_progress,
                 input_id_rows=consumed_ids,
             )
-            prompt_base = base.n_prompts if base is not None else 0
-            total_prompts = prompt_base + fitted.n_prompts
-            if last_saved_n_prompts == total_prompts:
-                merged = (
-                    JacobianLens.merge([base, fitted]) if base is not None else fitted
-                )
-            else:
-                merged = _save(fitted, durable=True)
+            merged = (
+                JacobianLens.merge([base, fitted]) if base is not None else fitted
+            )
+            merged = _save_full(merged)
             self._jlens = merged
             self._jlens_device_cache = {}
             return merged

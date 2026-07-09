@@ -2328,11 +2328,79 @@ def _load_lens_corpus(args: argparse.Namespace) -> tuple[list[str], str]:
     return docs, f"hf:{repo}/{config}"
 
 
+def _lens_fit_source_preflight_matches(
+    sidecar: dict[str, object],
+    requested_layers: "list[int] | str | None",
+) -> bool:
+    raw_layers = sidecar.get("source_layers", [])
+    if not isinstance(raw_layers, list):
+        return False
+    source_layers = [int(layer) for layer in raw_layers]
+    if not source_layers:
+        return False
+    if isinstance(requested_layers, list):
+        return set(source_layers) >= set(requested_layers)
+    if requested_layers is None or requested_layers == "all":
+        return source_layers == list(range(source_layers[-1] + 1))
+    return False
+
+
+def _try_lens_fit_noop_preflight(
+    args: argparse.Namespace,
+    docs: list[str],
+    requested_layers: "list[int] | str | None",
+) -> bool:
+    """Return True after printing the no-op result without loading the model."""
+    import hashlib
+
+    from saklas.core.jlens import DEFAULT_SEQ_LEN
+    from saklas.io.lens import lens_paths, load_lens_sidecar
+
+    if args.force:
+        return False
+    sidecar = load_lens_sidecar(args.model)
+    if sidecar is None:
+        return False
+    seq_len = args.seq_len or DEFAULT_SEQ_LEN
+    raw_sha = hashlib.sha256(repr(docs).encode("utf-8")).hexdigest()
+    usable_count = int(sidecar.get("usable_prompt_count", -1))
+    if (
+        sidecar.get("raw_corpus_sha256") != raw_sha
+        or sidecar.get("raw_prompt_count") != len(docs)
+        or sidecar.get("seq_len") != seq_len
+        or int(sidecar.get("n_prompts", -1)) < usable_count
+        or usable_count < 0
+        or not _lens_fit_source_preflight_matches(sidecar, requested_layers)
+    ):
+        return False
+    ts_path, _ = lens_paths(args.model)
+    size_mb = ts_path.stat().st_size / 1024**2 if ts_path.exists() else 0.0
+    source_layers = [int(layer) for layer in sidecar["source_layers"]]
+    print(
+        f"Fitted Jacobian lens: {len(source_layers)} layers, "
+        f"{sidecar.get('n_prompts', usable_count)} prompts, "
+        f"d_model={sidecar.get('d_model', '?')}"
+    )
+    print("Already fitted for this corpus — nothing to do.")
+    print(f"Artifact: {ts_path} ({size_mb:.0f} MB)")
+    return True
+
+
 def _run_lens_fit(args: argparse.Namespace) -> None:
     from saklas.core.session import SaklasSession
     from saklas.io.lens import lens_paths
 
     docs, spec = _load_lens_corpus(args)
+    requested_layers = _parse_layer_list(getattr(args, "layers", None))
+    if requested_layers == "sample":
+        print(
+            "lens fit: --layers sample is not a wall-time optimization; "
+            "use --layers workspace or an explicit comma-separated band",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if _try_lens_fit_noop_preflight(args, docs, requested_layers):
+        return
     _print_startup(args)
     with SaklasSession.from_pretrained(
         args.model, device=args.device, quantize=args.quantize, probes=[],
@@ -2343,10 +2411,11 @@ def _run_lens_fit(args: argparse.Namespace) -> None:
         lens = session.fit_jlens(
             docs,
             corpus_spec=spec,
-            source_layers=_parse_layer_list(getattr(args, "layers", None)),
+            source_layers=requested_layers,
             dim_batch=args.dim_batch,
             seq_len=args.seq_len,
             force=args.force,
+            checkpoint_every=args.checkpoint_every,
             on_progress=lambda m: print(f"  {m}"),
         )
     ts_path, _ = lens_paths(args.model)

@@ -23,7 +23,13 @@ from saklas.core.loom import (
     UnknownNodeError,
 )
 from saklas.core.session import SaklasSession
-from saklas.io.lens import load_lens, save_lens
+from saklas.io.lens import (
+    lens_checkpoint_paths,
+    lens_paths,
+    load_lens,
+    save_lens,
+    save_lens_checkpoint,
+)
 from tests._jlens_toys import CharTokenizer, frozen_toy
 
 _MODEL_ID = "toy/jlens-model"
@@ -68,6 +74,15 @@ class _StubSession:
         pass
 
 
+class _CountingTokenizer(CharTokenizer):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def __call__(self, text: str, return_tensors: str = "pt") -> dict[str, torch.Tensor]:
+        self.calls += 1
+        return super().__call__(text, return_tensors=return_tensors)
+
+
 _PROMPTS = [
     "a first prompt that is long enough..",
     "the second prompt, also long enough.",
@@ -110,6 +125,18 @@ def test_fit_jlens_already_done_short_circuits() -> None:
         )
 
 
+def test_fit_jlens_raw_sidecar_noop_skips_tokenization() -> None:
+    s = _StubSession()
+    s._tokenizer = _CountingTokenizer()
+    s.fit_jlens(_PROMPTS)
+    s._tokenizer.calls = 0
+
+    again = s.fit_jlens(_PROMPTS, source_layers=[1])
+
+    assert again.source_layers == [1]
+    assert s._tokenizer.calls == 0
+
+
 def test_fit_jlens_resumes_from_partial_and_matches_full_fit() -> None:
     s = _StubSession()
     full = s.fit_jlens(_PROMPTS, force=True)
@@ -140,6 +167,43 @@ def test_fit_jlens_resumes_from_partial_and_matches_full_fit() -> None:
         assert torch.allclose(
             resumed.jacobians[layer], full.jacobians[layer], atol=2e-3,
         ), f"layer {layer}: resumed fit diverges from the from-scratch fit"
+
+
+def test_fit_jlens_resumes_from_checkpoint_without_full_artifact() -> None:
+    full = _StubSession().fit_jlens(_PROMPTS, force=True)
+    head_session = _StubSession()
+    head = head_session.fit_jlens(_PROMPTS[:2], force=True)
+    for path in lens_paths(_MODEL_ID):
+        path.unlink()
+    consumed = [
+        [int(tok) for tok in head_session._tokenizer(
+            p, return_tensors="pt",
+        )["input_ids"][0].tolist()]
+        for p in _PROMPTS
+    ]
+    corpus_sha = hashlib.sha256(repr(consumed).encode("utf-8")).hexdigest()
+    save_lens_checkpoint(
+        head, _MODEL_ID,
+        base_n_prompts=0,
+        corpus_spec="test",
+        corpus_sha256=corpus_sha,
+        corpus_hash_kind="token_ids_v1",
+        seq_len=128,
+        dim_batch=8,
+        skip_first=16,
+    )
+
+    messages: list[str] = []
+    resumed = _StubSession().fit_jlens(_PROMPTS, on_progress=messages.append)
+
+    assert any("resuming from checkpoint at 2 prompts" in m for m in messages)
+    assert resumed.n_prompts == len(_PROMPTS)
+    for layer in full.source_layers:
+        assert torch.allclose(
+            resumed.jacobians[layer], full.jacobians[layer], atol=2e-3,
+        )
+    assert load_lens(_MODEL_ID) is not None
+    assert not any(path.exists() for path in lens_checkpoint_paths(_MODEL_ID))
 
 
 def test_fit_jlens_drops_short_prompts() -> None:

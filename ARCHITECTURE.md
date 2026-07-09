@@ -889,9 +889,15 @@ A second, per-model read primitive alongside the whitened probe reads (Gurnee
 et al., Transformer Circuits 2026). `core/jlens.py` fits
 `J_l = E[∂h_final/∂h_l]` per source layer over a web-text corpus — the only
 backward passes in saklas (the estimator seeds an autograd leaf at the first
-block's input under `torch.enable_grad()` and reads per-layer grads with
-`tensor.register_hook`; everything else stays `inference_mode`). The artifact
-(`io/lens.py`, `models/<safe_id>/jlens.safetensors`, fp16) then supports four
+fitted block's input under `torch.enable_grad()` and reads per-layer grads with
+`torch.autograd.grad`; everything else stays `inference_mode`). The default fit
+uses a single unreplicated prompt forward plus batched VJPs
+(`is_grads_batched=True`) for `ceil(d_model/dim_batch)` output-dim blocks, with
+an env-overridable replicated-prompt fallback (`SAKLAS_JLENS_VJP`). MPS uses small
+row stripes instead of full per-layer `[d_model,d_model]` device buffers, and
+checkpoints are partial shards (`jlens.partial.*`) merged into the full fp16
+artifact only at durable finalization. The artifact (`io/lens.py`,
+`models/<safe_id>/jlens.safetensors`, fp16) then supports four
 consumers with zero hot-path cost when unused:
 
 - the **readout** `softmax(W_U · norm(J_l h))` (`session.jlens_readout`

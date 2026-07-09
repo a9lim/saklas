@@ -222,10 +222,15 @@ category list through verbatim (tagged concepts only, no multi-node sweep).
 - `lens fit`: positional `model`, `--corpus FILE`, `--prompts N` (100),
   `--seq-len T` (128), `--dim-batch K` (8; total backward work is K-invariant,
   so the knob trades memory for per-pass overhead — halves automatically on
-  OOM), `--layers L1,L2,...` (restrict source layers — skips all forward-graph
-  and backward work below the lowest one, the one real wall-time lever; a
-  stored lens whose layers mismatch the request refits instead of resuming),
-  `-f/--force` (restart from zero instead of resuming), `-d`, `-q`.
+  OOM, then can grow back after clean prompts), `--checkpoint-every N` (25,
+  writes a resumable partial shard; the full artifact is rewritten once at
+  finalization), `--layers L1,L2,...|workspace` (restrict source layers — skips
+  all forward-graph and backward work below the lowest one, the one real
+  wall-time lever; `sample` is rejected for fitting because it still includes
+  layer 0 and is artifact-size/debug only), `-f/--force` (restart from zero
+  instead of resuming), `-d`, `-q`. A same-raw-corpus no-op can return from
+  sidecar metadata before model load; a superset stored lens satisfies narrower
+  layer requests without refit, and missing layers are fitted as a top-up.
 - `lens show`: positional `model`, `-j`.
 - `lens top`: positionals `model` + `prompt` (raw text, no chat template),
   `-k/--top-k` (8), `--layers L1,L2,...` (default: 9 evenly spaced fitted

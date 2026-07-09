@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
@@ -77,6 +78,14 @@ DEFAULT_CHECKPOINT_EVERY = 25
 #: A bounded drain every few passes caps the in-flight transients; the
 #: all-zero fold guard below catches whatever still slips through.
 _MPS_SYNC_EVERY_PASSES = 4
+#: MPS unified memory is most fragile when every fitted layer owns a full
+#: ``[d_model, d_model]`` fp32 device buffer.  Keep a small per-layer stripe on
+#: device, validate it, then fold into a local CPU prompt buffer.
+_MPS_ROW_STRIPE = 256
+#: After an OOM halves ``dim_batch``, try the original width again only after a
+#: few successful prompts.  One unusually long prompt should not punish the
+#: remainder of the corpus forever.
+_DIM_BATCH_GROW_AFTER_PROMPTS = 4
 
 
 class JacobianLensError(RuntimeError, SaklasError):
@@ -188,6 +197,25 @@ class JacobianLens:
             )
         return {l: w @ self.jacobians[l] for l in requested}
 
+    def select_layers(self, layers: Sequence[int]) -> "JacobianLens":
+        """Return a view-like lens containing only ``layers``.
+
+        The tensors are shared with ``self``; callers that persist the result
+        will materialize their own fp16 copy through ``save_lens``.
+        """
+        requested = sorted(set(int(l) for l in layers))
+        missing = [l for l in requested if l not in self.jacobians]
+        if missing:
+            raise LensNotFittedError(
+                f"layers {missing} not in fitted lens layers "
+                f"{self.source_layers[:3]}..{self.source_layers[-3:]}"
+            )
+        return JacobianLens(
+            {layer: self.jacobians[layer] for layer in requested},
+            n_prompts=self.n_prompts,
+            d_model=self.d_model,
+        )
+
     def atom_norms(self, layer: int, unembed: torch.Tensor) -> torch.Tensor:
         """Cached per-token norms of the layer's J-lens dictionary atoms."""
         if layer not in self.jacobians:
@@ -235,6 +263,26 @@ class JacobianLens:
                 acc += lens.jacobians[layer] * (lens.n_prompts / total)
             merged[layer] = acc
         return cls(merged, n_prompts=total, d_model=first.d_model)
+
+    @classmethod
+    def union_layers(cls, lenses: Sequence["JacobianLens"]) -> "JacobianLens":
+        """Combine same-corpus lenses that cover different source layers.
+
+        Unlike :meth:`merge`, this is not a prompt-weighted average; every input
+        must describe the same prompt set and ``d_model``.  Later inputs replace
+        duplicate layers, which lets a missing-layer top-up overwrite a stale
+        partial layer cleanly.
+        """
+        if not lenses:
+            raise ValueError("union_layers() needs at least one lens")
+        first = lenses[0]
+        for other in lenses[1:]:
+            if other.n_prompts != first.n_prompts or other.d_model != first.d_model:
+                raise ValueError("lenses disagree on n_prompts / d_model")
+        union: dict[int, torch.Tensor] = {}
+        for lens in lenses:
+            union.update(lens.jacobians)
+        return cls(union, n_prompts=first.n_prompts, d_model=first.d_model)
 
 
 def lens_logits(
@@ -415,6 +463,77 @@ def _output_tensor(output: Any) -> torch.Tensor:
     return output[0] if isinstance(output, tuple) else output
 
 
+class _BatchedVjpUnavailable(RuntimeError):
+    """Internal signal: retry the current prompt with replicated VJPs."""
+
+
+def _resolve_vjp_mode(mode: str) -> str:
+    env = os.environ.get("SAKLAS_JLENS_VJP")
+    raw = (env or mode).strip().lower()
+    if raw not in {"auto", "batched", "replicated"}:
+        raise ValueError(
+            "vjp_mode must be 'auto', 'batched', or 'replicated' "
+            f"(got {mode!r})"
+        )
+    return raw
+
+
+def _looks_like_batched_vjp_unsupported(exc: RuntimeError) -> bool:
+    msg = str(exc).lower()
+    if "out of memory" in msg:
+        return False
+    return any(
+        needle in msg
+        for needle in (
+            "is_grads_batched",
+            "vmap",
+            "batching rule",
+            "batched grad",
+            "not implemented",
+            "not supported",
+        )
+    )
+
+
+def _install_fit_hooks(
+    layer_modules: Sequence[nn.Module],
+    sources: Sequence[int],
+    final_idx: int,
+) -> tuple[dict[int, torch.Tensor], list[Any]]:
+    captured: dict[int, torch.Tensor] = {}
+    handles: list[Any] = []
+
+    def seed_hook(
+        _module: nn.Module, args: tuple[Any, ...], kwargs: dict[str, Any]
+    ) -> tuple[tuple[Any, ...], dict[str, Any]]:
+        # With frozen params and integer inputs no autograd graph exists at
+        # all — seed a leaf into the residual stream at the first fitted block.
+        if args:
+            seeded = args[0].detach().clone().requires_grad_(True)
+            return (seeded, *args[1:]), kwargs
+        seeded = kwargs["hidden_states"].detach().clone().requires_grad_(True)
+        return args, {**kwargs, "hidden_states": seeded}
+
+    def make_capture(idx: int) -> Callable[..., None]:
+        def hook(_module: nn.Module, _args: tuple[Any, ...], output: Any) -> None:
+            captured[idx] = _output_tensor(output)
+
+        return hook
+
+    # Seed at the LOWEST source block, not block 0: everything below it then
+    # runs graph-free (frozen params + a detached input build no autograd
+    # state), so a band-restricted fit pays neither graph memory nor backward
+    # depth below its band. For the default all-layer fit this is block 0.
+    handles.append(
+        layer_modules[min(sources)].register_forward_pre_hook(
+            seed_hook, with_kwargs=True,
+        )
+    )
+    for idx in {*sources, final_idx}:
+        handles.append(layer_modules[idx].register_forward_hook(make_capture(idx)))
+    return captured, handles
+
+
 def fit_jacobian_lens(
     model: Any,
     tokenizer: Any,
@@ -429,6 +548,7 @@ def fit_jacobian_lens(
     checkpoint_cb: Callable[[JacobianLens], None] | None = None,
     on_progress: Callable[[str], None] | None = None,
     input_id_rows: Sequence[Sequence[int]] | None = None,
+    vjp_mode: str = "auto",
 ) -> JacobianLens:
     """Fit ``J_l`` for every source layer over ``prompts``.
 
@@ -440,8 +560,13 @@ def fit_jacobian_lens(
     it must be aligned 1:1 with ``prompts`` and already reflect the caller's
     truncation/hash policy; the fit still applies ``max_seq_len`` defensively.
     This lets session-level resume/filtering reuse the IDs it already computed
-    instead of tokenizing the corpus a second time.  ``dim_batch`` halves
-    automatically on device OOM.
+    instead of tokenizing the corpus a second time.  ``vjp_mode="batched"``
+    computes each output-dim block with ``is_grads_batched=True`` from a single
+    prompt forward instead of replicating the forward graph; ``"auto"`` tries
+    that path first and falls back to the reference replicated estimator if the
+    backend lacks vmap coverage.  ``dim_batch`` halves automatically on device
+    OOM and cautiously grows back toward the requested value after successful
+    prompts.
 
     Raises :class:`JacobianLensError` when no prompt in the corpus is long
     enough (each needs > ``skip_first + 1`` tokens).
@@ -464,14 +589,25 @@ def fit_jacobian_lens(
             "input_id_rows must be aligned with prompts "
             f"({len(input_id_rows)} != {len(prompts)})"
         )
+    requested_vjp_mode = _resolve_vjp_mode(vjp_mode)
 
     # Cross-prompt state, threaded through every per-prompt sweep: the CPU
     # fp32 accumulator, plus per-layer on-device row buffers reused across
     # prompts (allocated once d_model is known).
     state: dict[str, Any] = {
-        "acc": None, "d_model": 0, "dev_rows": None, "row_norms": None,
+        "acc": None,
+        "d_model": 0,
+        "dev_rows": None,
+        "row_norms": None,
+        "stripe_rows": None,
+        "stripe_norms": None,
+        "vjp_mode": "batched" if requested_vjp_mode == "auto" else requested_vjp_mode,
+        "requested_vjp_mode": requested_vjp_mode,
     }
     n_done = 0
+    target_dim_batch = int(dim_batch)
+    active_dim_batch = int(dim_batch)
+    successes_since_resize = 0
 
     def _partial() -> JacobianLens:
         acc = state["acc"]
@@ -482,51 +618,76 @@ def fit_jacobian_lens(
             d_model=state["d_model"],
         )
 
-    with torch.enable_grad():
-        for prompt_idx, prompt in enumerate(prompts):
-            if input_id_rows is None:
-                ids = tokenizer(prompt, return_tensors="pt")["input_ids"][
-                    :, :max_seq_len
-                ]
-            else:
-                row = [int(tok) for tok in input_id_rows[prompt_idx]][:max_seq_len]
-                ids = torch.tensor([row], dtype=torch.long)
-            seq_len = ids.shape[1]
-            if seq_len < skip_first + 2:
-                log.warning(
-                    "jlens: skipping prompt %d — %d tokens, need > %d",
-                    prompt_idx, seq_len, skip_first + 1,
-                )
-                continue
-            ids = ids.to(device)
-            batch = max(1, min(dim_batch, state["d_model"] or dim_batch))
-            while True:
-                retry_batch: int | None = None
-                try:
-                    _accumulate_prompt_jacobian(
-                        model, ids, layer_modules, sources, final_idx, state,
-                        batch=batch, skip_first=skip_first,
+    captured, handles = _install_fit_hooks(layer_modules, sources, final_idx)
+    try:
+        with torch.enable_grad():
+            for prompt_idx, prompt in enumerate(prompts):
+                if input_id_rows is None:
+                    ids = tokenizer(prompt, return_tensors="pt")["input_ids"][
+                        :, :max_seq_len
+                    ]
+                else:
+                    row = [int(tok) for tok in input_id_rows[prompt_idx]][:max_seq_len]
+                    ids = torch.tensor([row], dtype=torch.long)
+                seq_len = ids.shape[1]
+                if seq_len < skip_first + 2:
+                    log.warning(
+                        "jlens: skipping prompt %d — %d tokens, need > %d",
+                        prompt_idx, seq_len, skip_first + 1,
                     )
-                    break
-                except RuntimeError as exc:  # OOM → halve dim_batch and retry
-                    msg = str(exc).lower()
-                    if "out of memory" not in msg or batch <= 1:
-                        raise
-                    retry_batch = max(1, batch // 2)
-                assert retry_batch is not None
-                batch = retry_batch
-                _empty_device_cache(device)
-                log.warning("jlens: OOM — retrying prompt with dim_batch=%d", batch)
-            dim_batch = batch
-            n_done += 1
-            if on_progress is not None:
-                on_progress(f"prompt {n_done}/{len(prompts)} (dim_batch={batch})")
-            if checkpoint_cb is not None and n_done % checkpoint_every == 0:
-                checkpoint_cb(_partial())
-                # Allocator hygiene at checkpoint cadence only — a per-prompt
-                # empty_cache forces a sync and dumps the pool the very next
-                # prompt re-allocates.
-                _empty_device_cache(device)
+                    continue
+                ids = ids.to(device)
+                batch = max(1, min(active_dim_batch, state["d_model"] or active_dim_batch))
+                while True:
+                    retry_batch: int | None = None
+                    try:
+                        _accumulate_prompt_jacobian(
+                            model, ids, layer_modules, sources, final_idx, state,
+                            captured=captured, batch=batch, skip_first=skip_first,
+                        )
+                        break
+                    except _BatchedVjpUnavailable:
+                        assert requested_vjp_mode == "auto"
+                        state["vjp_mode"] = "replicated"
+                        log.warning(
+                            "jlens: batched VJP is unavailable on this backend — "
+                            "falling back to replicated-prompt VJPs"
+                        )
+                        continue
+                    except RuntimeError as exc:  # OOM → halve dim_batch and retry
+                        msg = str(exc).lower()
+                        if "out of memory" not in msg or batch <= 1:
+                            raise
+                        retry_batch = max(1, batch // 2)
+                    assert retry_batch is not None
+                    batch = retry_batch
+                    active_dim_batch = batch
+                    successes_since_resize = 0
+                    _empty_device_cache(device)
+                    log.warning("jlens: OOM — retrying prompt with dim_batch=%d", batch)
+                n_done += 1
+                successes_since_resize += 1
+                if on_progress is not None:
+                    mode = str(state["vjp_mode"])
+                    on_progress(
+                        f"prompt {n_done}/{len(prompts)} "
+                        f"(dim_batch={batch}, vjp={mode})"
+                    )
+                if (
+                    active_dim_batch < target_dim_batch
+                    and successes_since_resize >= _DIM_BATCH_GROW_AFTER_PROMPTS
+                ):
+                    active_dim_batch = min(target_dim_batch, active_dim_batch * 2)
+                    successes_since_resize = 0
+                if checkpoint_cb is not None and n_done % checkpoint_every == 0:
+                    checkpoint_cb(_partial())
+                    # Allocator hygiene at checkpoint cadence only — a per-prompt
+                    # empty_cache forces a sync and dumps the pool the very next
+                    # prompt re-allocates.
+                    _empty_device_cache(device)
+    finally:
+        for handle in handles:
+            handle.remove()
 
     if state["acc"] is None or n_done == 0:
         raise JacobianLensError(
@@ -543,6 +704,7 @@ def _accumulate_prompt_jacobian(
     final_idx: int,
     state: dict[str, Any],
     *,
+    captured: dict[int, torch.Tensor],
     batch: int,
     skip_first: int,
 ) -> None:
@@ -555,41 +717,14 @@ def _accumulate_prompt_jacobian(
     happens once per prompt, off the backward critical path.
     """
     seq_len = ids.shape[1]
+    del layer_modules
     device = ids.device
     valid = torch.arange(skip_first, seq_len - 1, device=device)
-    captured: dict[int, torch.Tensor] = {}
-    handles: list[Any] = []
-
-    def seed_hook(
-        _module: nn.Module, args: tuple[Any, ...], kwargs: dict[str, Any]
-    ) -> tuple[tuple[Any, ...], dict[str, Any]]:
-        # With frozen params and integer inputs no autograd graph exists at
-        # all — seed a leaf into the residual stream at the first block.
-        if args:
-            seeded = args[0].detach().clone().requires_grad_(True)
-            return (seeded, *args[1:]), kwargs
-        seeded = kwargs["hidden_states"].detach().clone().requires_grad_(True)
-        return args, {**kwargs, "hidden_states": seeded}
-
-    def make_capture(idx: int) -> Callable[..., None]:
-        def hook(_module: nn.Module, _args: tuple[Any, ...], output: Any) -> None:
-            captured[idx] = _output_tensor(output)
-        return hook
-
-    # Seed at the LOWEST source block, not block 0: everything below it then
-    # runs graph-free (frozen params + a detached input build no autograd
-    # state), so a band-restricted fit pays neither graph memory nor backward
-    # depth below its band. For the default all-layer fit this is block 0.
-    handles.append(
-        layer_modules[min(sources)].register_forward_pre_hook(
-            seed_hook, with_kwargs=True
-        )
-    )
-    for idx in {*sources, final_idx}:
-        handles.append(layer_modules[idx].register_forward_hook(make_capture(idx)))
-
+    captured.clear()
     try:
-        replicated = ids.expand(batch, -1)
+        vjp_mode = str(state["vjp_mode"])
+        forward_batch = 1 if vjp_mode == "batched" else batch
+        replicated = ids.expand(forward_batch, -1)
         try:
             model(input_ids=replicated, use_cache=False)
         except TypeError:  # toy/CPU-test models without a use_cache kwarg
@@ -601,7 +736,14 @@ def _accumulate_prompt_jacobian(
                 l: torch.zeros(d_model, d_model, dtype=torch.float32) for l in sources
             }
             state["d_model"] = d_model
-        if state["dev_rows"] is None:
+        if state["dev_rows"] is None and device.type == "mps":
+            state["dev_rows"] = {
+                l: torch.empty(0, dtype=torch.float32, device=device) for l in sources
+            }
+            state["row_norms"] = {
+                l: torch.empty(0, dtype=torch.float32, device=device) for l in sources
+            }
+        elif state["dev_rows"] is None:
             try:
                 state["dev_rows"] = {
                     l: torch.zeros(d_model, d_model, dtype=torch.float32, device=device)
@@ -629,6 +771,22 @@ def _accumulate_prompt_jacobian(
         dev_rows: dict[int, torch.Tensor] = state["dev_rows"]
         row_norms: dict[int, torch.Tensor] = state["row_norms"]
         on_device = next(iter(dev_rows.values())).device == device
+        use_striped_rows = device.type == "mps" and on_device
+        if use_striped_rows and state["stripe_rows"] is None:
+            stripe = min(_MPS_ROW_STRIPE, d_model)
+            state["stripe_rows"] = {
+                l: torch.empty(stripe, d_model, dtype=torch.float32, device=device)
+                for l in sources
+            }
+            state["stripe_norms"] = {
+                l: torch.empty(stripe, dtype=torch.float32, device=device)
+                for l in sources
+            }
+        host_rows: dict[int, torch.Tensor] | None = None
+        host_norms: dict[int, torch.Tensor] | None = None
+        stripe_rows: dict[int, torch.Tensor] | None = state["stripe_rows"]
+        stripe_norms: dict[int, torch.Tensor] | None = state["stripe_norms"]
+        stripe_start = 0
         source_tensors: list[torch.Tensor] = []
         for l in sources:
             if not captured[l].requires_grad:
@@ -637,42 +795,104 @@ def _accumulate_prompt_jacobian(
                     "reach the residual stream (unsupported block call shape?)"
                 )
             source_tensors.append(captured[l])
-            row_norms[l].zero_()
+            if use_striped_rows:
+                if host_rows is None:
+                    host_rows = {
+                        layer: torch.empty(d_model, d_model, dtype=torch.float32)
+                        for layer in sources
+                    }
+                    host_norms = {
+                        layer: torch.empty(d_model, dtype=torch.float32)
+                        for layer in sources
+                    }
+            else:
+                row_norms[l].zero_()
+
+        def flush_stripe(end: int) -> None:
+            nonlocal stripe_start
+            if not use_striped_rows or end <= stripe_start:
+                return
+            assert host_rows is not None and host_norms is not None
+            assert stripe_rows is not None and stripe_norms is not None
+            n = end - stripe_start
+            for layer in sources:
+                norms = stripe_norms[layer][:n].cpu()
+                if bool((norms == 0).any()):
+                    raise JacobianLensError(
+                        f"layer {layer} came back with zero rows from the device — "
+                        "likely an asynchronous out of memory on the command "
+                        "queue; retrying at a smaller dim_batch"
+                    )
+                host_rows[layer][stripe_start:end] = stripe_rows[layer][:n].cpu()
+                host_norms[layer][stripe_start:end] = norms
+            stripe_start = end
 
         n_passes = math.ceil(d_model / batch)
-        cot = torch.zeros_like(final)
+        cot = None
+        prev_dims: torch.Tensor | None = None
         batch_rows = torch.arange(batch, device=device)
         for p in range(n_passes):
             dim_start = p * batch
             n_dims = min(batch, d_model - dim_start)
-            cot.zero_()
-            rows = batch_rows[:n_dims].unsqueeze(1)
-            cot[rows, valid.unsqueeze(0), (dim_start + batch_rows[:n_dims]).unsqueeze(1)] = 1.0
+            dims = dim_start + batch_rows[:n_dims]
             # grad(final, sources) rather than backward(): the grads return
             # directly (no hooks), and the walk stops at the shallowest
             # requested layer instead of descending to the seed leaf.
-            grads = torch.autograd.grad(
-                final, source_tensors, grad_outputs=cot,
-                retain_graph=p < n_passes - 1,
-            )
+            try:
+                grads = _grad_row_block(
+                    final, source_tensors, valid, dims,
+                    mode=vjp_mode,
+                    retain_graph=p < n_passes - 1,
+                    cotangent=cot,
+                    prev_dims=prev_dims,
+                )
+            except RuntimeError as exc:
+                if (
+                    state["requested_vjp_mode"] == "auto"
+                    and vjp_mode == "batched"
+                    and _looks_like_batched_vjp_unsupported(exc)
+                ):
+                    raise _BatchedVjpUnavailable() from exc
+                raise
+            if vjp_mode == "replicated":
+                if cot is None:
+                    cot = torch.zeros_like(final)
+                prev_dims = dims
+            write_end = dim_start + n_dims
+            stripe_offset = 0
+            if use_striped_rows:
+                assert stripe_rows is not None and stripe_norms is not None
+                if write_end - stripe_start > stripe_rows[sources[0]].shape[0]:
+                    flush_stripe(dim_start)
+                stripe_offset = dim_start - stripe_start
             for l, g in zip(sources, grads):
-                block = g[:n_dims, skip_first : seq_len - 1].mean(
-                    dim=1, dtype=torch.float32
+                block = _source_grad_block(
+                    g, mode=vjp_mode, n_dims=n_dims,
+                    skip_first=skip_first, seq_len=seq_len,
                 )
                 norm = block.abs().sum(dim=1)
-                dev_rows[l][dim_start : dim_start + n_dims] = (
-                    block if on_device else block.cpu()
-                )
-                row_norms[l][dim_start : dim_start + n_dims] = (
-                    norm if on_device else norm.cpu()
-                )
+                if use_striped_rows:
+                    assert stripe_rows is not None and stripe_norms is not None
+                    stripe_rows[l][stripe_offset : stripe_offset + n_dims] = block
+                    stripe_norms[l][stripe_offset : stripe_offset + n_dims] = norm
+                else:
+                    dev_rows[l][dim_start : write_end] = (
+                        block if on_device else block.cpu()
+                    )
+                    row_norms[l][dim_start : write_end] = (
+                        norm if on_device else norm.cpu()
+                    )
             if device.type == "mps" and (p + 1) % _MPS_SYNC_EVERY_PASSES == 0:
                 torch.mps.synchronize()
+        flush_stripe(d_model)
         # Two-phase fold: transfer everything first, then add — a transfer
         # failure mid-fold must not leave some layers already accumulated
         # (the OOM retry would double-count them).
-        host_rows = {l: dev_rows[l].cpu() for l in sources}
-        host_norms = {l: row_norms[l].cpu() for l in sources}
+        if use_striped_rows:
+            assert host_rows is not None and host_norms is not None
+        else:
+            host_rows = {l: dev_rows[l].cpu() for l in sources}
+            host_norms = {l: row_norms[l].cpu() for l in sources}
         for l in sources:
             # A zero ROW of J_l is impossible for a real transformer (the
             # residual identity path alone makes every output dim depend on
@@ -688,9 +908,58 @@ def _accumulate_prompt_jacobian(
         for l in sources:
             state["acc"][l] += host_rows[l]
     finally:
-        for handle in handles:
-            handle.remove()
         captured.clear()
+
+
+def _grad_row_block(
+    final: torch.Tensor,
+    source_tensors: Sequence[torch.Tensor],
+    valid: torch.Tensor,
+    dims: torch.Tensor,
+    *,
+    mode: str,
+    retain_graph: bool,
+    cotangent: torch.Tensor | None,
+    prev_dims: torch.Tensor | None,
+) -> tuple[torch.Tensor, ...]:
+    if mode == "batched":
+        outputs = final[0, valid[:, None], dims[None, :]].sum(dim=0)
+        eye = torch.eye(dims.numel(), dtype=final.dtype, device=final.device)
+        return torch.autograd.grad(
+            outputs, source_tensors, grad_outputs=eye,
+            retain_graph=retain_graph, is_grads_batched=True,
+        )
+
+    if cotangent is None:
+        cotangent = torch.zeros_like(final)
+    rows = torch.arange(dims.numel(), device=final.device).unsqueeze(1)
+    if prev_dims is not None:
+        prev_rows = torch.arange(prev_dims.numel(), device=final.device).unsqueeze(1)
+        cotangent[prev_rows, valid.unsqueeze(0), prev_dims.unsqueeze(1)] = 0.0
+    cotangent[rows, valid.unsqueeze(0), dims.unsqueeze(1)] = 1.0
+    return torch.autograd.grad(
+        final, source_tensors, grad_outputs=cotangent,
+        retain_graph=retain_graph,
+    )
+
+
+def _source_grad_block(
+    grad: torch.Tensor,
+    *,
+    mode: str,
+    n_dims: int,
+    skip_first: int,
+    seq_len: int,
+) -> torch.Tensor:
+    if mode == "batched":
+        # [n_dims, 1, T, D] from batched VJP.
+        return grad[:n_dims, 0, skip_first : seq_len - 1].mean(
+            dim=1, dtype=torch.float32,
+        )
+    # [replicated_batch, T, D] from the reference replicated-prompt path.
+    return grad[:n_dims, skip_first : seq_len - 1].mean(
+        dim=1, dtype=torch.float32,
+    )
 
 
 def _empty_device_cache(device: torch.device) -> None:

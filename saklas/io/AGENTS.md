@@ -334,11 +334,15 @@ whether to error (`LensNotFittedError` with the `lens fit` hint) or re-fit.
 Storage is **fp16** (deliberately unlike the neutral cache's fp32 invariant:
 J entries are O(1) so range is no constraint, and nothing here feeds a
 covariance inversion), promoted to fp32 on load. The sidecar records `method`,
-`n_prompts`, `d_model`, `source_layers`, the corpus spec + sha256 (the
-resume/staleness key — `session.fit_jlens` resumes when the hash matches and
-the stored `n_prompts` is short of the request), `seq_len`, `dim_batch`, and
-`skip_first_positions`. `lens_paths` / `save_lens` / `load_lens` /
-`remove_lens`; the fit itself lives in `core/jlens.py`.
+`n_prompts`, `d_model`, `source_layers`, the corpus spec + token-id sha256 (the
+resume/staleness key), optional raw-corpus sha/count metadata for model-load-free
+no-op checks, `seq_len`, `dim_batch`, and `skip_first_positions`. Resumable
+checkpoints live beside the full artifact as `jlens.partial.{safetensors,json}`:
+they store only the new partial shard plus `base_n_prompts`, so checkpoints do
+not rewrite a multi-GB merged lens every cadence; finalization writes the full
+artifact durably and removes the checkpoint. `lens_paths` / `lens_checkpoint_paths`
+/ `save_lens` / `save_lens_checkpoint` / `load_lens` /
+`load_lens_checkpoint` / `remove_lens`; the fit itself lives in `core/jlens.py`.
 
 ## atomic.py / staging.py
 

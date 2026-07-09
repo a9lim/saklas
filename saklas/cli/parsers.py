@@ -908,6 +908,12 @@ def _build_lens_fit(p: argparse.ArgumentParser) -> None:
              "and barely moves wall time; halves automatically on OOM.",
     )
     p.add_argument(
+        "--checkpoint-every", type=int, default=None, metavar="N",
+        help="Write a resumable partial checkpoint every N usable prompts "
+             "(default 25). Checkpoints store only the new shard; the full "
+             "artifact is rewritten once at finalization.",
+    )
+    p.add_argument(
         "--layers", default=None, metavar="L1,L2,...|workspace",
         help="Fit only these source layers (default: every layer below the "
              "final one). Restricting to the workspace band — roughly the "

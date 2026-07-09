@@ -41,32 +41,32 @@ and a text corpus. `fit_jacobian_lens(model, tokenizer, prompts, layer_modules,
 exists at all, so the fit runs under `torch.enable_grad()` with a
 `register_forward_pre_hook` on the first block that returns a
 `requires_grad_(True)` clone of its input (reuses `get_layers`, zero per-arch
-wiring). Per prompt: one forward with the prompt replicated `dim_batch`× on the
-batch axis (graph retained), then `ceil(d_model/dim_batch)` backwards — batch
-element `b` of pass `p` carries a one-hot cotangent at output dim
-`p·dim_batch+b` injected at every valid target position, so the grad at source
-position `t` is `Σ_{t'≥t} ∂h_final[t']/∂h_l[t]`; mean over source positions;
-one backward populates every source layer. Grads come from
-`torch.autograd.grad(final, sources)` — NOT `backward()` + `retain_grad()`,
-whose `.grad` accumulation across the multi-backward loop would corrupt the
-rows — which also stops the graph walk at the shallowest requested source, so
-a `--layers`-restricted fit never backprops below its lowest layer. Each pass
-writes its row block into reused per-layer **on-device** fp32 buffers; the
-device→host transfer is one fold per prompt into the CPU fp32 accumulator,
-all-or-nothing on success (an OOM retry, which halves `dim_batch`, can't
-double-count). Sync discipline is bounded from both sides: per-pass `.cpu()`
-transfers cost ~6% (removed), but a *fully unsynced* loop lets the CPU enqueue
-arbitrarily far ahead and Metal fails **asynchronously** — no Python
-exception, the work silently never runs, the fold reads zeros — so the pass
-loop drains the queue every `_MPS_SYNC_EVERY_PASSES` (4) on MPS and the fold
-raises on any zero row (impossible for a real transformer; phrased as "out of
-memory" so the dim_batch-halving retry catches it). The fit is compute-bound —
-`d_model × 2` forward-equivalents per prompt, dim_batch-invariant (measured
-flat 8/32/64) — so `source_layers` restriction is the one real wall-time
-lever (1.73× for the 40–90% band); `empty_cache` runs at checkpoint cadence
-only.
+wiring). Per prompt: one forward (batched VJP path) and
+`ceil(d_model/dim_batch)` backwards. Each backward selects one block of output
+dims, sums those dims over the valid target positions, and calls
+`torch.autograd.grad(..., is_grads_batched=True)` so `dim_batch` VJPs come from a
+single unreplicated prompt graph. `SAKLAS_JLENS_VJP=replicated` restores the
+reference replicated-prompt estimator, and `auto` falls back to that path when a
+backend lacks vmap coverage. Grads come from `torch.autograd.grad(final,
+sources)` — NOT `backward()` + `retain_grad()`, whose `.grad` accumulation across
+the multi-backward loop would corrupt the rows — which also stops the graph walk
+at the shallowest requested source, so a `--layers`-restricted fit never
+backprops below its lowest layer. On CUDA/CPU, row blocks write into reused
+per-layer row buffers and fold once per prompt into the CPU fp32 accumulator,
+all-or-nothing on success. On MPS, full `[d_model,d_model]×layers` row buffers are
+skipped; small `_MPS_ROW_STRIPE` buffers flush after zero-row checks to a local
+CPU prompt buffer, avoiding the unified-memory cliff while preserving all-or-
+nothing retries. A fully unsynced MPS loop can still let the CPU enqueue too far
+ahead, so the pass loop drains the queue every `_MPS_SYNC_EVERY_PASSES` (4), and
+zero rows raise with "out of memory" wording so the dim-batch-halving retry catches
+them. After an OOM, `dim_batch` can grow back toward the requested width after a
+few successful prompts. The fit is compute-bound; `source_layers` restriction is
+the one real wall-time lever (1.73× for the 40–90% band).
 `checkpoint_cb` fires every `DEFAULT_CHECKPOINT_EVERY` (25) prompts for
-resumable fits; `JacobianLens.merge` is the n_prompts-weighted shard combiner.
+resumable fits; session checkpoints store only the new partial shard, while the
+full lens is merged/written durably once at finalization. `JacobianLens.merge` is
+the n_prompts-weighted shard combiner; `JacobianLens.union_layers` combines
+same-corpus layer shards.
 
 `JacobianLens` holds the fp32 matrices: `transport(h, layer)` maps a residual
 into the final basis; `token_direction(v, unembed)` is `W_U[v] @ J_l` per layer

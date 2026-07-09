@@ -12,11 +12,14 @@ from safetensors.torch import save_file
 from saklas.core.jlens import JacobianLens
 from saklas.io.lens import (
     LENS_FORMAT_VERSION,
+    lens_checkpoint_paths,
     lens_paths,
     load_lens,
+    load_lens_checkpoint,
     load_lens_sidecar,
     remove_lens,
     save_lens,
+    save_lens_checkpoint,
 )
 
 _MODEL = "test-org/tiny-model"
@@ -70,6 +73,34 @@ def test_save_load_round_trip() -> None:
     assert sidecar["corpus_sha256"] == "abc123"
     assert sidecar["corpus_hash_kind"] == "text_v1"
     assert sidecar["skip_first_positions"] == 16
+
+
+def test_save_load_checkpoint_round_trip() -> None:
+    partial = _lens(n_layers=2, n_prompts=5)
+    save_lens_checkpoint(
+        partial, _MODEL,
+        base_n_prompts=7,
+        corpus_spec="test-corpus",
+        corpus_sha256="abc123",
+        seq_len=128,
+        dim_batch=8,
+        skip_first=16,
+        raw_corpus_sha256="raw456",
+        raw_prompt_count=13,
+        usable_prompt_count=12,
+    )
+
+    loaded = load_lens_checkpoint(_MODEL)
+    assert loaded is not None
+    got, sidecar = loaded
+    assert got.n_prompts == 5
+    assert got.source_layers == [0, 1]
+    assert sidecar["checkpoint"] is True
+    assert sidecar["base_n_prompts"] == 7
+    assert sidecar["partial_n_prompts"] == 5
+    assert sidecar["raw_corpus_sha256"] == "raw456"
+    assert sidecar["raw_prompt_count"] == 13
+    assert sidecar["usable_prompt_count"] == 12
 
 
 def test_load_lens_sidecar_does_not_read_tensors(
@@ -156,6 +187,18 @@ def test_load_corrupt_sidecar_returns_none() -> None:
 
 def test_remove_lens() -> None:
     _save(_lens())
+    save_lens_checkpoint(
+        _lens(n_layers=1), _MODEL,
+        base_n_prompts=0,
+        corpus_spec="test-corpus",
+        corpus_sha256="abc123",
+        seq_len=128,
+        dim_batch=8,
+        skip_first=16,
+    )
+    ckpt_ts, ckpt_sc = lens_checkpoint_paths(_MODEL)
+    assert ckpt_ts.exists() and ckpt_sc.exists()
     assert remove_lens(_MODEL) is True
     assert load_lens(_MODEL) is None
+    assert load_lens_checkpoint(_MODEL) is None
     assert remove_lens(_MODEL) is False

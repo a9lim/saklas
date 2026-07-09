@@ -7,6 +7,7 @@ match the exact averaged Jacobian computed with ``torch.autograd.functional``.
 
 from __future__ import annotations
 
+import math
 from typing import Any, cast
 
 import pytest
@@ -82,6 +83,39 @@ def test_estimator_matches_exact_jacobian() -> None:
         )
 
 
+def test_batched_vjp_uses_single_prompt_forward_and_expected_grad_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _frozen_model(n_layers=3)
+    tokenizer = _CharTokenizer()
+    prompt = "the quick brown fox js"
+    seen_batches: list[int] = []
+    grad_calls = 0
+    real_forward = model.forward
+    real_grad = torch.autograd.grad
+
+    def counted_forward(input_ids: torch.Tensor, use_cache: bool = False) -> Any:
+        seen_batches.append(int(input_ids.shape[0]))
+        return real_forward(input_ids=input_ids, use_cache=use_cache)
+
+    def counted_grad(*args: Any, **kwargs: Any) -> Any:
+        nonlocal grad_calls
+        grad_calls += 1
+        assert kwargs.get("is_grads_batched") is True
+        return real_grad(*args, **kwargs)
+
+    monkeypatch.setattr(model, "forward", counted_forward)
+    monkeypatch.setattr(torch.autograd, "grad", counted_grad)
+
+    fit_jacobian_lens(
+        model, tokenizer, [prompt], _layers(model),
+        dim_batch=4, skip_first=16, vjp_mode="batched",
+    )
+
+    assert seen_batches == [1]
+    assert grad_calls == math.ceil(_D / 4)
+
+
 def test_restricted_source_layers_match_exact_jacobian() -> None:
     """A band-restricted fit seeds at its lowest source layer (blocks below
     run graph-free) — the estimate must be unchanged by the truncation."""
@@ -101,6 +135,23 @@ def test_restricted_source_layers_match_exact_jacobian() -> None:
     assert torch.allclose(lens.jacobians[1], exact, atol=1e-5)
 
 
+def test_replicated_vjp_mode_matches_exact_jacobian() -> None:
+    model = _frozen_model(n_layers=3)
+    tokenizer = _CharTokenizer()
+    prompt = "the quick brown fox js"
+    skip = 16
+
+    lens = fit_jacobian_lens(
+        model, tokenizer, [prompt], _layers(model),
+        dim_batch=4, skip_first=skip, vjp_mode="replicated",
+    )
+
+    ids = tokenizer(prompt)["input_ids"]
+    for source in (0, 1):
+        exact = _exact_jacobian(model, ids, source, skip_first=skip)
+        assert torch.allclose(lens.jacobians[source], exact, atol=1e-5)
+
+
 def test_fit_averages_over_prompts_and_merge_agrees() -> None:
     model = _frozen_model(n_layers=2)
     tokenizer = _CharTokenizer()
@@ -115,6 +166,23 @@ def test_fit_averages_over_prompts_and_merge_agrees() -> None:
     assert joint.n_prompts == merged.n_prompts == 2
     for layer in joint.source_layers:
         assert torch.allclose(joint.jacobians[layer], merged.jacobians[layer], atol=1e-6)
+
+
+def test_select_and_union_layers() -> None:
+    j0 = torch.randn(_D, _D)
+    j1 = torch.randn(_D, _D)
+    j2 = torch.randn(_D, _D)
+    lens = JacobianLens({0: j0, 1: j1}, n_prompts=3, d_model=_D)
+
+    selected = lens.select_layers([1])
+    assert selected.source_layers == [1]
+    assert torch.equal(selected.jacobians[1], lens.jacobians[1])
+
+    union = JacobianLens.union_layers([
+        selected,
+        JacobianLens({2: j2}, n_prompts=3, d_model=_D),
+    ])
+    assert union.source_layers == [1, 2]
 
 
 def test_fit_skips_short_prompts_and_raises_when_all_short() -> None:
