@@ -138,9 +138,10 @@ body + any typed safe-message formatter.
   `USER_ROLE_HEADERS` for the resolved `model_type`) and the resolved
   `default_assistant_role` / `default_user_role`, so the webui can gate roles,
   plus `jlens_fitted` (a `lens_paths` existence check gating the drilldown's
-  j-lens tab — deliberately not the lazy `session.jlens` load) and
+  j-lens tab — deliberately not the lazy `session.jlens` load),
   `live_lens_layers` (the live workspace readout's resolved layer list, `null`
-  while off; coerced so stub sessions read as off).
+  while off; coerced so stub sessions read as off), and `live_probe_scores`
+  (the CAA live toggle; coerced so stub sessions read as the default-on).
 - `GET/PATCH/DELETE /saklas/v1/sessions/{id}` — info / update defaults / no-op 204.
 - `POST /saklas/v1/sessions/{id}/{clear,rewind}`.
 
@@ -254,8 +255,22 @@ monitor unification onto the session's single `Monitor`.
   as_name=name, top_n=top_n)`, 201 + the probe info. The selector rides the same
   `[ns/]name[:variant]` shape `%` steering consumes — probe and steering share the
   lazy-load cache. 400 on an empty selector, 404 on `FileNotFoundError`, 400 on
-  `KeyError`/`ValueError`.
-- `DELETE /probes/{name}` → `session.remove_probe`, 204; 404 if not attached.
+  `KeyError`/`ValueError`, and any other `SaklasError` maps through
+  `user_message()` (a `jlens/<word>` selector's `LensNotFittedError` → 404).
+- `DELETE /probes/{name}` → `session.remove_probe`, 204; 404 if not attached
+  (either roster — monitor or lens).
+- **Lens probes** — a `jlens/<word>` selector lands in the session lens-probe
+  registry (the READOUT channel), not the Monitor; `GET /probes` appends those
+  rows via `_lens_probe_info` (shape-compatible with `_probe_info` plus the
+  `lens: true` discriminator, `word`, `token_id`; `feature_space: "readout"`,
+  `intrinsic_dim: 1` — the one `strength` axis, no `node_coords`),
+  and `POST /probes` returns the same shape for a lens attach. `GET
+  .../geometry` 404s on a lens probe (no subspace geometry behind it).
+- `POST /probes/live` body `{enabled}` → `session.set_live_probe_scores` under
+  the session lock — the **CAA live toggle**: off ⇒ per-token monitor scoring
+  is disabled for UI/trait/loom consumers (aggregate-only capture; probe gates
+  still force the subset they need). Session info reports the state as
+  `live_probe_scores` (coerced default-on for stub sessions).
 - `GET /probes/{name:path}/geometry` → `session._monitor.probe_geometry(name)`, the
   static per-layer geometry (centroids, neutral anchor, PCA rotation for rank≥3,
   curve/surface overlay) backing the dashboard probe-inspector plot; 404 if not

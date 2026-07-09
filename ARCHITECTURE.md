@@ -911,11 +911,25 @@ consumers with zero hot-path cost when unused:
   induction (live-verified: unrestricted, it shatters into token loops at
   every α). Lens atoms run hotter than concept vectors — α≈0.3 is the
   gemma-3-4b sweet spot;
-- **gates**: `@when:jlens/<word>` attaches the same direction as a rank-1
-  probe. Deliberate semantics: the gate reads the saklas-native *whitened
-  coordinate* along the direction (one gate pipeline, whitener required), not
-  the paper's raw inner product — the raw view lives in the readout channel,
-  which writes no gate scalars;
+- **probes + gates**: a `jlens/<word>` probe reads the *readout channel*, not
+  a whitened coordinate — `add_probe` lands it in the session lens-probe
+  registry (never the Monitor; no whitener, no direction fold), and the
+  reading is the token's standing in the band readout: ONE channel,
+  `coords = (strength,)` — the mean band **probability** `mean_l p_l(v)`
+  (the `@when:jlens/<word>` gate channel — [0,1], the workspace
+  `strength`, one number across every card and layer; a within-layer max
+  normalization is not apples-to-apples, so salience survives only as the
+  internal depth-CoM weighting shared with `aggregate_readout`). The
+  synthesized `ProbeReading` carries per-layer `(p_l,)`, and the live
+  top-k display wire reports per-layer softmax probabilities too. Scoring is post-forward on the lens path
+  (display rides the live-lens step's logits; gate scalars compute once per
+  forward in the gating callback and stash for the display step; the
+  finalize aggregate pools the capture tail ring) — a lens gate forces its
+  own per-step compute regardless of the live toggles, and a lens-only gate
+  does not force per-token monitor scoring. The steering direction and the
+  probe read are deliberately different objects: pushing acts on the
+  activation, the probe asks the paper's question — *how disposed is the
+  model to say this word*;
 - the **J-space decomposition** (`sparse_nonneg_decompose`): greedy pursuit of
   any direction against the dictionary `W_U J_l` (never materialized), the
   per-layer *verbalizable share* + contributing tokens.
@@ -934,7 +948,7 @@ selector := atom (("~" | "|") atom | "%" position)?
 position := signed_num ("," signed_num)* | label
 atom     := [ns "/"] NAME ["." NAME] [":" variant]
 trigger  := preset | "when" ":" probe op NUM
-probe    := [ns "/"] NAME ["." NAME] ["[" INT "]"]   # vector probe (jlens/fake ok), optional coord axis
+probe    := [ns "/"] NAME ["." NAME] ["[" INT "]"]   # vector probe (jlens/fake = readout strength), optional coord axis
           | [ns "/"] NAME ":" "fraction" | [ns "/"] NAME "@" NAME   # manifold channels
 ```
 
@@ -1043,11 +1057,12 @@ straight-chord additive baseline alongside.
   that are single tokens: `jlens/<word>` raises on multi-token words, and a
   concept the model represents diffusely across pieces won't surface cleanly in
   the readout (the paper's own stated limitation). Multi-token direction
-  synthesis is an open extension. Relatedly, the gate channel reads a
-  *whitened coordinate* along the lens direction while the paper's experiments
-  use raw inner products — the two orderings usually agree but are not
-  identical; a raw-score gate channel would be a small addition if the
-  distinction ever matters for a replication.
+  synthesis is an open extension. The probe/gate channel is paper-native
+  (per-layer softmax of the readout — one strength/probability axis);
+  one wrinkle inherited from the softmax: a token nowhere near any layer's
+  top has vanishing readout mass, so its depth CoM is numerically
+  meaningless (the same degeneracy `aggregate_readout` has below top-k —
+  read CoM only when strength is clearly nonzero).
 
 ---
 

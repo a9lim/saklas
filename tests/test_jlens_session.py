@@ -53,6 +53,10 @@ class _StubSession:
     disable_live_lens = SaklasSession.disable_live_lens
     _live_lens_readout_step = SaklasSession._live_lens_readout_step
     _jlens_workspace_band = SaklasSession._jlens_workspace_band
+    _add_lens_probe = SaklasSession._add_lens_probe
+    _lens_probe_layers = SaklasSession._lens_probe_layers
+    _score_lens_probes = SaklasSession._score_lens_probes
+    _score_lens_gate_scalars = SaklasSession._score_lens_gate_scalars
 
     def __init__(self) -> None:
         model = frozen_toy(n_layers=3)
@@ -64,6 +68,11 @@ class _StubSession:
         self._jlens: Any = None
         self._live_lens: Any = None
         self._capture: Any = None
+        self._lens_probes: dict[str, Any] = {}
+        self._probe_hash_cache: dict[str, str] = {}
+        self._lens_step_stash: Any = None
+        self._last_lens_step_readings: Any = None
+        self._monitor: Any = None
         self.model_id = _MODEL_ID
 
     @contextmanager
@@ -420,9 +429,11 @@ def test_live_lens_readout_step_reads_latest_slices() -> None:
     for row in out.values():
         assert len(row) == 3
         assert all(isinstance(tok, str) for tok, _ in row)
-    # scores are descending
+    # display scores are per-layer softmax probabilities, descending — the
+    # one strength unit every lens surface reports
     scores = [sc for _, sc in out[0]]
     assert scores == sorted(scores, reverse=True)
+    assert all(0.0 <= sc <= 1.0 for sc in scores)
     # the aggregate chip list rides the same step: top_k rows of
     # (token, strength, com, spread) with strength descending in [0, 1]
     # and com/spread valid normalized depths

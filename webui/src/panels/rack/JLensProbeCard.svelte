@@ -1,29 +1,25 @@
 <script lang="ts">
   // J-lens probe card — one pinned ``jlens/<word>`` token probe, wearing
-  // the same RackCard chrome as the probe tab's cards.  The entry is an
-  // ordinary probeRack row (the jlens direction registers as a rank-1
-  // flat probe), so the sparkline / per-layer trace / depth stats are all
-  // already in the store — this card renders what the old chip dropped.
+  // the same RackCard chrome as the probe tab's cards.  A lens probe is a
+  // READOUT-channel probe (not a linear probe): the reading is the token's
+  // standing in ``softmax(W_U · norm(J_l h))`` over the workspace band —
+  // the workspace card's quantity, so a pinned card is the *same shape* as
+  // its unpinned discovery sibling (JLensTokenCard), just persistent and
+  // gate-able:
   //
-  //   statline : ■/□ highlight-select · word · sparkline · ✕ detach
-  //   body     : the signed whitened-coordinate bar (axis 0 along the
-  //              lens direction), the depth-CoM meta row, and the
-  //              per-layer heatmap strip with L endcaps.
-  //
-  // No subspaceness row (a rank-1 token direction's fraction carries no
-  // extra signal over the coordinate) and no nearest-node cell (the fit
-  // has no real nodes) — otherwise a full sibling of ProbeCard.
+  //   statline : ■ pin toggle (click to unpin) · word · @com ±spread ·
+  //              strength-history sparkline
+  //   body     : the strength bar (mean band probability, 0→1 absolute,
+  //              the @when:jlens/<word> gate channel — the ONE readout
+  //              channel), then the per-layer strength strip (p_l per
+  //              layer, cell color normalized to the card's own max —
+  //              same convention as the workspace token cards).
 
   import type { ProbeRackEntry } from "../../lib/types";
   import Bar from "../../lib/charts/Bar.svelte";
   import HeatmapCell from "../../lib/charts/HeatmapCell.svelte";
   import Sparkline from "../../lib/charts/Sparkline.svelte";
-  import { nodeCoordExtent, parseProbeTarget } from "../../lib/tokens";
-  import {
-    detachProbe,
-    highlightState,
-    setHighlightTarget,
-  } from "../../lib/stores.svelte";
+  import { detachProbe } from "../../lib/stores.svelte";
   import { pushToast } from "../../lib/stores/toasts.svelte";
   import RackCard from "./RackCard.svelte";
 
@@ -38,40 +34,26 @@
 
   // ---------- latest reading: live during gen, settled (aggregate) after ----------
   const latest = $derived(entry.aggregate ?? entry.reading);
-  /** Whitened coordinate along the lens direction (axis 0). */
-  const value = $derived(latest?.coords?.[0] ?? entry.current ?? 0);
-  /** Bar + heatmap saturation scale — node extent when the registered
-   *  rank-1 fit carries coords, else the fixed unit fallback. */
-  const axisScale = $derived(nodeCoordExtent(entry.info.node_coords, 0));
+  /** Mean band probability (axis 0 — the gate channel + workspace number). */
+  const strength = $derived(latest?.coords?.[0] ?? entry.current ?? 0);
 
   const sparkline = $derived(entry.sparkline ?? []);
 
   const depthCom = $derived(latest?.depth_com?.[0] ?? null);
   const depthSpread = $derived(latest?.depth_spread?.[0] ?? null);
 
-  // ---------- highlight select (same gesture as ProbeCard) ----------
-  const isHighlight = $derived(
-    highlightState.target !== null &&
-      parseProbeTarget(highlightState.target).base === name,
-  );
-  const selectGlyph = $derived(isHighlight ? "■" : "□");
-
-  function toggleHighlight(): void {
-    setHighlightTarget(isHighlight ? null : name);
-  }
-
-  function onRowKey(ev: KeyboardEvent): void {
-    if (ev.key === "Enter" || ev.key === " ") {
-      ev.preventDefault();
-      toggleHighlight();
-    }
-  }
-
-  // ---------- per-layer strip ----------
+  // ---------- per-layer strength strip (the store's axis-0 per-layer map) ----------
   const layerKeys = $derived<string[]>(
     entry.perLayer
       ? Object.keys(entry.perLayer).sort((a, b) => Number(a) - Number(b))
       : [],
+  );
+
+  /** Color scale — the card's own max p (absolute p spans orders of
+   *  magnitude, so a fixed 0→1 scale would render near-black strips).
+   *  Same convention as the workspace token cards. */
+  const cellScale = $derived(
+    Math.max(...layerKeys.map((l) => entry.perLayer?.[l] ?? 0), 1e-12),
   );
 
   const CELL_SIZE = 14;
@@ -81,96 +63,77 @@
     if (typeof v !== "number" || !Number.isFinite(v)) {
       return `L${layer} · —`;
     }
-    return `L${layer} · ${v >= 0 ? "+" : ""}${v.toFixed(3)}`;
+    return `L${layer} · p ${v.toPrecision(3)}`;
   }
 
   function fmtCoord(v: number): string {
     return Number.isFinite(v) ? v.toFixed(2) : "0.00";
   }
 
-  async function onDetach(ev: MouseEvent): Promise<void> {
-    ev.stopPropagation();
+  let unpinBusy = $state(false);
+
+  async function onUnpin(): Promise<void> {
+    if (unpinBusy) return;
+    unpinBusy = true;
     try {
       await detachProbe(name);
-      pushToast(`detached probe ${name}`, { kind: "info" });
+      pushToast(`unpinned ${name}`, { kind: "info" });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      pushToast(`detach ${name} failed — ${msg}`, {
+      pushToast(`unpin ${name} failed — ${msg}`, {
         kind: "error",
         ttlMs: null,
       });
+    } finally {
+      unpinBusy = false;
     }
   }
 </script>
 
 <RackCard accent="--accent-blue" disabled={false}>
   {#snippet statline()}
-    <div
-      class="select-cluster"
-      role="button"
-      tabindex="0"
-      aria-pressed={isHighlight}
-      aria-label={isHighlight
-        ? `Deselect ${name} as highlight target`
-        : `Select ${name} as highlight target`}
-      onclick={toggleHighlight}
-      onkeydown={onRowKey}
-    >
+    <button
+      type="button"
+      class="pin-glyph"
+      disabled={unpinBusy}
+      onclick={() => void onUnpin()}
+      title="Pinned (click to unpin)"
+      aria-label="Unpin probe {name}"
+      aria-pressed="true"
+    >■</button>
+
+    <span class="name" title="probe {name} — readout strength over the workspace band">
+      {word}
+    </span>
+
+    {#if depthCom !== null}
       <span
-        class="select-glyph"
-        class:selected={isHighlight}
-        aria-hidden="true"
-        title={isHighlight
-          ? "Selected (click to deselect)"
-          : "Click to select for highlighting"}
-      >{selectGlyph}</span>
-      <span class="name" title="probe {name} — whitened coordinate along the lens direction">
-        {word}
-      </span>
-    </div>
+        class="com"
+        title="salience-weighted depth center of mass ±spread (0 = first block, 1 = last)"
+      >@{fmtCoord(depthCom)}{depthSpread !== null ? ` ±${fmtCoord(depthSpread)}` : ""}</span>
+    {/if}
 
     <span class="spacer"></span>
 
     <Sparkline points={sparkline} width={56} height={14} />
-
-    <button
-      type="button"
-      class="icon remove"
-      aria-label="Unpin probe {name}"
-      title="Unpin probe"
-      onclick={onDetach}
-    >✕</button>
   {/snippet}
 
   {#snippet body()}
-    <!-- The one meter: signed whitened coordinate along the token's lens
-         direction (positive = the activation leans toward saying it). -->
+    <!-- Strength: mean band probability, absolute 0→1 (the gate channel). -->
     <div class="reading">
       <span
         class="row-label"
-        title="whitened coordinate along the jlens/{word} direction (axis 0)"
-      >coord</span>
+        title="strength — mean probability of this token across the workspace band (0–1); the @when:jlens/{word} gate channel"
+      >strength</span>
       <div class="bar-cell" aria-hidden="true">
-        <Bar value={value} max={axisScale} width={160} height={8} bipolar />
+        <Bar value={strength} max={1} width={160} height={8} color="var(--card-accent)" />
       </div>
-      <span class="value" class:pos={value > 0} class:neg={value < 0}>
-        {value >= 0 ? "+" : ""}{value.toFixed(2)}
-      </span>
+      <span class="filler" aria-hidden="true"></span>
+      <span class="value">{strength.toFixed(2)}</span>
     </div>
 
-    {#if depthCom !== null}
-      <div class="meta">
-        <span
-          class="meta-item"
-          title="depth center of mass of the per-layer read, share-weighted (0 = first block, 1 = last)"
-        >
-          com {fmtCoord(depthCom)}{depthSpread !== null ? ` ±${fmtCoord(depthSpread)}` : ""}
-        </span>
-      </div>
-    {/if}
-
-    <!-- Per-layer heatmap strip with L0 / Ln endcaps. -->
-    <div class="layers" aria-label="Per-layer readings for {name}">
+    <!-- Per-layer strength strip with L endcaps. -->
+    <div class="layers" aria-label="Per-layer strength for {name}">
       {#if layerKeys.length === 0}
         <div class="layers-status">no data yet, generate a token first</div>
       {:else}
@@ -179,7 +142,7 @@
           {#each layerKeys as layer (layer)}
             <HeatmapCell
               value={entry.perLayer?.[layer]}
-              scale={axisScale}
+              scale={cellScale}
               size={CELL_SIZE}
               title={cellTooltip(layer)}
             />
@@ -194,32 +157,23 @@
 </RackCard>
 
 <style>
-  /* ----- statline (mirrors ProbeCard) ----- */
-  .select-cluster {
-    display: flex;
-    align-items: center;
-    gap: var(--space-2);
-    min-width: 0;
-    cursor: pointer;
-    user-select: none;
-    border-radius: var(--radius);
-  }
-  .select-cluster:hover {
-    background: var(--bg-elev);
-  }
-  .select-cluster:focus-visible {
-    outline: 1px solid var(--card-accent);
-    outline-offset: -1px;
-  }
-  .select-glyph {
-    color: var(--fg-muted);
+  /* ----- statline (mirrors JLensTokenCard) ----- */
+  .pin-glyph {
+    background: transparent;
+    border: 0;
+    padding: 0 var(--space-1);
+    color: var(--card-accent);
     font-size: var(--text);
     line-height: 1;
-    padding: 0 var(--space-1);
     flex: 0 0 auto;
+    cursor: pointer;
   }
-  .select-glyph.selected {
-    color: var(--card-accent);
+  .pin-glyph:hover:not(:disabled) {
+    color: var(--accent-red);
+  }
+  .pin-glyph:disabled {
+    cursor: default;
+    opacity: 0.5;
   }
   .name {
     color: var(--fg-strong);
@@ -230,39 +184,30 @@
     white-space: nowrap;
     min-width: 0;
   }
+  .com {
+    color: var(--fg-muted);
+    font-size: var(--text-xs);
+    font-variant-numeric: tabular-nums;
+    flex: 0 0 auto;
+  }
   .spacer {
     flex: 1 1 auto;
     min-width: 0;
   }
-  .icon {
-    background: transparent;
-    border: 0;
-    color: var(--fg-muted);
-    font-size: var(--text);
-    line-height: 1;
-    padding: var(--space-1) var(--space-2);
-    border-radius: var(--radius);
-    flex: 0 0 auto;
-    cursor: pointer;
-    transition: color var(--dur) var(--ease-out),
-      background var(--dur) var(--ease-out);
-  }
-  .icon:hover:not(:disabled) {
-    color: var(--fg-strong);
-    background: var(--bg-elev);
-  }
-  .remove:hover:not(:disabled) {
-    color: var(--accent-red);
-  }
 
-  /* ----- body: coordinate row (ProbeCard's reading grid) ----- */
+  /* ----- body: reading row — ProbeCard's EXACT four-column grid
+     (label · bar · nearest-or-empty · value), so the bar column aligns
+     pixel-for-pixel with the CAA cards across the tab switch. ----- */
   .reading {
     display: grid;
     align-items: center;
     gap: var(--space-2);
     min-width: 0;
     min-height: 24px;
-    grid-template-columns: minmax(2.5em, 1fr) minmax(60px, 2.6fr) 3.5em;
+    grid-template-columns: minmax(2.5em, 1fr) minmax(60px, 2.6fr) minmax(2.5em, 1fr) 3.5em;
+  }
+  .filler {
+    min-width: 0;
   }
   .row-label {
     color: var(--fg-muted);
@@ -289,27 +234,8 @@
     text-align: right;
     flex: 0 0 auto;
   }
-  .value.pos {
-    color: var(--accent-green);
-  }
-  .value.neg {
-    color: var(--accent-red);
-  }
 
-  /* ----- body: meta ----- */
-  .meta {
-    display: flex;
-    flex-wrap: wrap;
-    gap: var(--space-3);
-    color: var(--card-accent);
-    font-size: var(--text-xs);
-    font-variant-numeric: tabular-nums;
-  }
-  .meta-item {
-    flex: 0 0 auto;
-  }
-
-  /* ----- body: per-layer heatmap (mirrors ProbeCard) ----- */
+  /* ----- body: per-layer strip (mirrors ProbeCard) ----- */
   .layers {
     display: flex;
     align-items: center;

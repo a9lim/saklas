@@ -167,8 +167,9 @@ that fires only on decode steps where the monitor reading satisfies the comparis
 
 Probe gates accept these identifier shapes against the merged scalars the session
 writes into `TriggerContext.probe_scores`. Every shape also takes an optional
-leading `<ns>/` segment — a J-lens token probe (`@when:jlens/fake > 0.4`, whitened
-coordinate along the lens direction; see "Jacobian lens") or a probe attached
+leading `<ns>/` segment — a J-lens token probe (`@when:jlens/fake > 0.01`, the
+readout-channel mean band **probability** — strength, the probe's one
+channel; see "Jacobian lens") or a probe attached
 under a qualified selector (`@when:default/emotions@happy > -0.5`) — stored
 verbatim. Vector probes are concept names whose
 bare form reads coordinate axis 0 (`@when:confident.uncertain > 0.4`) and whose `[i]` form
@@ -331,10 +332,20 @@ Three read surfaces, one write surface:
   `lens_readout` + the chip list as `lens_aggregate`, and session info's
   `live_lens_layers` rehydrates the toggle across reloads. The tab's STEER
   section authors `α jlens/<word>` cards into the shared steering expression;
-  its PROBE section pins `jlens/<word>` token probes (ordinary probe-rack
-  entries, rendered as cards — live whitened-coordinate bar, depth CoM,
-  per-layer strip) and the WORKSPACE section renders the open-vocab aggregate
-  readout as sortable per-token cards with per-layer salience strips.
+  its **PROBE section is the merged workspace readout** — pinned
+  `jlens/<word>` token probes (persistent, gate-able; the ■ glyph unpins)
+  above the unpinned live top-k aggregate cards (□ pins), both the same
+  card shape (strength bar + per-layer strength strip + depth CoM chip),
+  one sort control, the card list scrolling under an anchored header +
+  add form, with the live-lens toggle in
+  the section header (live off ⇒ no per-step lens compute; pinned probes
+  settle to the end-of-gen aggregate). The CAA tab's PROBE section carries
+  the symmetric **live toggle** (`POST /saklas/v1/sessions/{id}/probes/live`
+  → `session.set_live_probe_scores`, rehydrated via session info's
+  `live_probe_scores`): off ⇒ per-token monitor scoring is disabled for
+  UI/trait/loom consumers (aggregate-only capture; gates still force the
+  subset they need), so a compute-constrained session can run with neither
+  family live.
   `session.jlens_token_readout(node_id, raw_index)` is the loom-anchored variant
   behind the dashboard token drilldown's **j-lens tab** (`GET /saklas/v1/
   sessions/{id}/lens/token-readout`): rebuild the node's prompt render + raw
@@ -347,7 +358,8 @@ Three read surfaces, one write surface:
 - **Steering atoms** — `jlens/<word>` is an ordinary `ns/name` atom; the J-lens
   direction for vocab id v at layer l is `W_U[v] @ J_l`, a per-layer direction
   registered lazily into the profile registry (`session.register_jlens_direction`,
-  reached from both `ensure_profile_registered` and `_resolve_probe_manifold`)
+  reached from `ensure_profile_registered` — steering only; probes read the
+  readout channel instead, see **Probes + gates** below)
   and **restricted to the workspace band** (40–90% depth) — in the motor regime
   the lens direction converges on the raw unembedding row, so pushing there is
   token-forcing (live-verified to shatter into token loops at every α), and the
@@ -358,12 +370,30 @@ Three read surfaces, one write surface:
   token direction, not a distributed contrast). Single-token words only —
   a multi-token word raises `MultiTokenWordError` listing the pieces. The `jlens`
   manifold namespace is reserved (authoring under it raises).
-- **Gates** — `@when:jlens/<word> > x` attaches the direction as a rank-1 probe.
-  NOTE the semantics: the gate reads the saklas-native **whitened coordinate**
-  along the lens direction (one gate pipeline, whitener required), not the
-  paper's raw inner product — the paper-faithful raw readout is the top-k lens
-  channel, which is display-only. The `@when:` grammar also accepts a namespaced
-  probe on every channel shape (`default/emotions@happy`).
+- **Probes + gates** — a `jlens/<word>` probe is a **readout-channel** probe,
+  not a linear probe: `add_probe("jlens/<word>")` lands in the session
+  lens-probe registry (never the Monitor — no whitener involved, no direction
+  fold), and the reading is the token's standing in the paper-native
+  `softmax(W_U · norm(J_l h))` over the workspace band. The reading is ONE
+  channel — `coords = (strength,)`, the **mean band probability**
+  `mean_l p_l(v)` ∈ [0,1] (`@when:jlens/fake > 0.01`, the workspace card's
+  `strength`) — objective and apples-to-apples across tokens and layers
+  (a within-layer max normalization isn't; salience survives only as the
+  internal depth-CoM weighting shared with `aggregate_readout`, never as a
+  reported value). The synthesized `ProbeReading` carries the per-layer
+  `(p_l,)` trace; the live per-layer top-k wire also reports per-layer
+  softmax probabilities, so every lens surface reads the same unit.
+  Geometry fields are defaulted (`fraction`/
+  `residual` 0, `nearest` empty). Scoring is post-forward on the lens path:
+  per-step readings ride the live-lens step's own logits (zero extra matvecs),
+  gate scalars come from `session._score_lens_gate_scalars` in the gating
+  score callback (computed once per forward and stashed for the display step
+  to reuse), and the finalize aggregate pools the last content token from the
+  capture tail ring exactly like the monitor roster. A lens gate forces its
+  per-step lens computation regardless of the live toggles (a gate can't fire
+  on aggregates); a lens-only gate does NOT force per-token *monitor* scoring.
+  The `@when:` grammar also accepts a namespaced probe on every channel shape
+  (`default/emotions@happy`).
 - **Decomposition** — `lens decompose` / `session.jspace_decompose`: greedy
   sparse nonnegative pursuit of any steerable direction against the lens
   dictionary `W_U J_l` (never materialized; norm-normalized correlations,

@@ -87,6 +87,16 @@ def device_dtype(session: SaklasSession) -> tuple[str, str]:
     return device, dtype
 
 
+def _live_probe_scores(session: SaklasSession) -> bool:
+    """The session's CAA live-toggle state, defensively coerced.
+
+    Only a real bool passes through; a stub session (MagicMock in tests,
+    or a pre-toggle engine) reads as the default-on.
+    """
+    state = getattr(session, "live_probe_scores", True)
+    return state if isinstance(state, bool) else True
+
+
 def _live_lens_layers(session: SaklasSession) -> list[int] | None:
     """The session's live-lens layer list, or ``None`` when off.
 
@@ -151,6 +161,10 @@ def session_info(
         # rehydrate its WORKSPACE panel toggle on reload.  Coerced so a
         # stub session (tests) reads as off rather than unserializable.
         "live_lens_layers": _live_lens_layers(session),
+        # CAA live toggle state (POST .../probes/live): whether per-token
+        # monitor scoring feeds live consumers.  Coerced so a stub session
+        # (tests) reads as the default-on.
+        "live_probe_scores": _live_probe_scores(session),
         "default_steering": default_expr,
         "role_substitution_supported": assistant_role_ok,
         "user_role_supported": user_role_ok,

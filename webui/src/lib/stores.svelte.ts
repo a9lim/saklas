@@ -94,10 +94,11 @@ export async function refreshSession(): Promise<void> {
     sessionState.lastRefresh = Date.now();
     sessionState.error = null;
     _hydrateSamplingFromInfo();
-    // Rehydrate the WORKSPACE toggle from server state (the live lens is
-    // session-side, so a page reload must not read as "off" while the
-    // server keeps streaming lens frames).  Older servers omit the field.
+    // Rehydrate the PROBE-section toggles from server state (both are
+    // session-side, so a page reload must not read as "off"/"on" while
+    // the server disagrees).  Older servers omit the fields.
     lensState.layers = info.live_lens_layers ?? null;
+    probesLiveState.enabled = info.live_probe_scores ?? true;
   } catch (e) {
     sessionState.error = e instanceof Error ? e.message : String(e);
   }
@@ -112,14 +113,20 @@ export interface LensState {
    * boolean, so reloads and multi-tab stay honest. */
   layers: number[] | null;
   /** Latest decode step's readout: layer-index string → descending
-   * ``[token, rawLensLogit]`` top-k.  Overwritten per token frame;
-   * kept after ``done`` so the settled matrix stays readable. */
+   * ``[token, p]`` top-k (per-layer softmax probability — the one
+   * strength unit every lens surface reports).  Overwritten per token
+   * frame; kept after ``done`` so the settled matrix stays readable. */
   readout: Record<string, [string, number][]> | null;
   /** Layer-aggregated chip list riding the same step — ``[token,
    * strength, com, spread]`` strength-descending (mean band probability
    * + salience-weighted depth center of mass).  Same lifecycle as
    * ``readout``. */
   aggregate: [string, number, number, number][] | null;
+  /** Rolling buffer of recent aggregate frames (``[token, strength]``
+   * pairs per step, newest last, capped like the probe sparklines) —
+   * backs the workspace token cards' sparklines.  Carries across
+   * generations like probe sparklines; cleared on live-lens disable. */
+  aggHistory: [string, number][][];
   /** Presentation order for the aggregate workspace cards.  Kept in the
    * shared lens state so switching inspector tabs does not reset it. */
   workspaceSortMode: LensWorkspaceSortMode;
@@ -134,12 +141,42 @@ export const lensState: LensState = $state({
   layers: null,
   readout: null,
   aggregate: null,
+  aggHistory: [],
   workspaceSortMode: "strength",
   busy: false,
 });
 
 export function setLensWorkspaceSortMode(mode: LensWorkspaceSortMode): void {
   lensState.workspaceSortMode = mode;
+}
+
+// ================================================== CAA live toggle ====
+
+/** CAA PROBE-section live toggle — whether per-token monitor scoring
+ *  feeds live consumers.  The J-lens sibling is ``lensState.layers``
+ *  (the live lens); with both off a compute-constrained session pays no
+ *  per-token scoring at all, and every probe still reports its
+ *  end-of-gen aggregate. */
+export const probesLiveState: { enabled: boolean; busy: boolean } = $state({
+  enabled: true,
+  busy: false,
+});
+
+export async function setLiveProbes(enabled: boolean): Promise<void> {
+  if (probesLiveState.busy) return;
+  probesLiveState.busy = true;
+  try {
+    const out = await apiProbes.setLive({ enabled });
+    probesLiveState.enabled = out.enabled;
+  } catch (e) {
+    pushToast(
+      `live probes ${enabled ? "enable" : "disable"} failed: ` +
+        (e instanceof Error ? e.message : String(e)),
+      { kind: "error" },
+    );
+  } finally {
+    probesLiveState.busy = false;
+  }
 }
 
 /** Inspector-column mode: the CAA racks vs the J-lens surface.
@@ -166,6 +203,7 @@ export async function setLiveLens(enabled: boolean): Promise<void> {
     if (!out.enabled) {
       lensState.readout = null;
       lensState.aggregate = null;
+      lensState.aggHistory = [];
     }
   } catch (e) {
     pushToast(
@@ -868,20 +906,25 @@ export const probeRack: ProbeRackState = $state({
 });
 
 /** Primary scalar a probe's sparkline / sort tracks: the signed axis-0
- *  coordinate for a flat (subspace) probe, the [0,1] subspace fraction for
- *  a curved (manifold) probe. */
+ *  coordinate for a flat (subspace) probe, the [0,1] readout strength
+ *  (axis 0 — mean band probability) for a J-lens token probe, the [0,1]
+ *  subspace fraction for a curved (manifold) probe. */
 function _primaryScalar(info: ProbeInfo, reading: ProbeReadingJSON): number {
-  if (info.is_affine) return reading.coords.length > 0 ? reading.coords[0] : 0;
+  if (info.is_affine || info.lens) {
+    return reading.coords.length > 0 ? reading.coords[0] : 0;
+  }
   return reading.fraction;
 }
 
 /** Per-layer column for the expanded layer strip: axis-0 ``coords_per_layer``
- *  for a flat probe, ``fraction_per_layer`` for a curved one. */
+ *  for a flat or J-lens probe (band-layer probability ``p_l`` for the
+ *  latter — the strip's cell values), ``fraction_per_layer`` for a curved
+ *  one. */
 function _primaryPerLayer(
   info: ProbeInfo,
   reading: ProbeReadingJSON,
 ): Record<string, number> {
-  if (!info.is_affine) return reading.fraction_per_layer ?? {};
+  if (!info.is_affine && !info.lens) return reading.fraction_per_layer ?? {};
   const out: Record<string, number> = {};
   for (const [layer, c] of Object.entries(reading.coords_per_layer ?? {})) {
     out[layer] = Array.isArray(c) && c.length > 0 ? c[0] : 0;
@@ -2458,7 +2501,19 @@ function handleWsMessage(msg: WSServerMessage): void {
         // the session's live lens is enabled; shadow runs skipped like
         // the probe rack so the matrix tracks the steered branch.
         if (msg.lens_readout) lensState.readout = msg.lens_readout;
-        if (msg.lens_aggregate) lensState.aggregate = msg.lens_aggregate;
+        if (msg.lens_aggregate) {
+          lensState.aggregate = msg.lens_aggregate;
+          // Rolling strength history for the workspace-card sparklines —
+          // one compact [token, strength] frame per step, probe-sparkline
+          // cap, carries across generations like probe sparklines.
+          const frame: [string, number][] = msg.lens_aggregate.map(
+            ([tok, strength]) => [tok, strength],
+          );
+          const hist = lensState.aggHistory.slice();
+          hist.push(frame);
+          if (hist.length > MAX_SPARKLINE) hist.shift();
+          lensState.aggHistory = hist;
+        }
       }
       return;
     }

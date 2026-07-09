@@ -344,6 +344,16 @@ export const apiProbes = {
       `${SESSION_BASE(id)}/probes/${encodeURIComponent(name)}/geometry`,
     );
   },
+  /** CAA live toggle — enable/disable live per-token monitor scoring.
+   *  Off ⇒ probes report only the end-of-gen aggregate (no per-token
+   *  stream / loom rows / trait events); probe gates still force what
+   *  they need. */
+  setLive(
+    req: { enabled: boolean },
+    id: string = SESSION,
+  ): Promise<{ enabled: boolean }> {
+    return request(`${SESSION_BASE(id)}/probes/live`, jsonBody(req));
+  },
 };
 
 // ========================================================== manifolds ==

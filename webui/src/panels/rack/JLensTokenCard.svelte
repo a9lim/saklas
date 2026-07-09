@@ -2,22 +2,24 @@
   // Workspace token card — one aggregate-readout token as a RackCard,
   // replacing the chip cloud + separate matrix view.  Blue j-lens accent.
   //
-  //   statline : token · @com ±spread · pin action
+  //   statline : □ pin glyph (the steer cards' square, click to pin) ·
+  //              token · @com ±spread · strength-history sparkline
   //   body     : the strength bar (mean band probability, absolute 0→1 —
-  //              calibrated across tokens and steps, so no more opacity
-  //              encoding), then the per-layer salience strip.
+  //              calibrated across tokens and steps), then the per-layer
+  //              strength strip.
   //
   // The strip carries the matrix's information per token: each cell is
-  // the token's within-layer salience ``p_l(v) / max_v' p_l(v')`` — for
-  // tokens present in a layer's streamed top-k this is EXACT, not an
-  // approximation, because the readout rows arrive sorted by raw logit
-  // and the softmax denominator cancels in the ratio:
-  // ``exp(s_i − s_top)``.  An empty cell means the token sits below that
-  // layer's top-k cutoff (the full ranking lives in the token
-  // drilldown's j-lens tab).
+  // the token's per-layer softmax probability ``p_l(v)`` — the streamed
+  // readout rows carry probabilities directly, so this is the SAME unit
+  // as the bar (strength = their band mean), just per layer.  Cell color
+  // normalizes to the card's own max (absolute p spans orders of
+  // magnitude); the tooltip carries the absolute value.  An empty cell
+  // means the token sits below that layer's top-k cutoff (the full
+  // ranking lives in the token drilldown's j-lens tab).
 
   import Bar from "../../lib/charts/Bar.svelte";
   import HeatmapCell from "../../lib/charts/HeatmapCell.svelte";
+  import Sparkline from "../../lib/charts/Sparkline.svelte";
   import RackCard from "./RackCard.svelte";
 
   interface Props {
@@ -29,6 +31,8 @@
     com: number;
     /** Depth spread around the CoM. */
     spread: number;
+    /** Recent strength history (0 = fell below the streamed top-k). */
+    series: number[];
     /** Streamed layer list — the strip's cells, in order. */
     layers: number[];
     /** The per-layer top-k matrix (``lensState.readout``). */
@@ -40,30 +44,37 @@
     onpin: (word: string) => void;
   }
 
-  let { token, strength, com, spread, layers, readout, pinned, busy, onpin }: Props =
-    $props();
+  let {
+    token, strength, com, spread, series, layers, readout, pinned, busy, onpin,
+  }: Props = $props();
 
   const display = $derived(token.trim() || JSON.stringify(token));
   /** Whitespace-only tokens have no pinnable single-token word. */
   const pinnable = $derived(token.trim().length > 0);
 
-  /** Per-layer within-layer salience for this token — exact ``p/max p``
-   *  from the sorted raw-logit row; ``null`` = below the top-k cutoff. */
+  /** Per-layer softmax probability for this token, straight off the
+   *  streamed readout row; ``null`` = below the top-k cutoff. */
   const cells = $derived.by(() =>
     layers.map((layer) => {
       const pairs = readout?.[String(layer)];
-      if (!pairs || pairs.length === 0) return { layer, salience: null as number | null };
+      if (!pairs || pairs.length === 0) return { layer, p: null as number | null };
       const hit =
         pairs.find(([text]) => text === token) ??
         pairs.find(([text]) => text.trim() === display);
-      if (!hit) return { layer, salience: null as number | null };
-      return { layer, salience: Math.exp(hit[1] - pairs[0][1]) };
+      if (!hit) return { layer, p: null as number | null };
+      return { layer, p: hit[1] };
     }),
   );
 
+  /** Color scale — the card's own max p (absolute p spans orders of
+   *  magnitude, so a fixed 0→1 scale would render near-black strips). */
+  const cellScale = $derived(
+    Math.max(...cells.map((c) => c.p ?? 0), 1e-12),
+  );
+
   function cellTooltip(cell: (typeof cells)[number]): string {
-    if (cell.salience === null) return `L${cell.layer} · below top-k`;
-    return `L${cell.layer} · salience ${cell.salience.toFixed(2)}`;
+    if (cell.p === null) return `L${cell.layer} · below top-k`;
+    return `L${cell.layer} · p ${cell.p.toPrecision(3)}`;
   }
 
   const CELL_SIZE = 14;
@@ -71,29 +82,33 @@
 
 <RackCard accent="--accent-blue" disabled={false}>
   {#snippet statline()}
-    <span class="name" title={`"${token}" — aggregate workspace token`}>
-      {display}
-    </span>
-
-    <span class="spacer"></span>
-
-    <span
-      class="com"
-      title="salience-weighted depth center of mass ±spread (0 = first block, 1 = last)"
-    >@{com.toFixed(2)} ±{spread.toFixed(2)}</span>
-
     <button
       type="button"
-      class="pin"
+      class="pin-glyph"
+      class:pinned
       disabled={pinned || busy || !pinnable}
       onclick={() => onpin(display)}
       title={pinned
         ? `jlens/${display} is already pinned`
         : `Pin jlens/${display} as a token probe`}
       aria-label="Pin {display} as a J-lens probe"
+      aria-pressed={pinned}
     >
-      {pinned ? "pinned" : "+ pin"}
+      {pinned ? "■" : "□"}
     </button>
+
+    <span class="name" title={`"${token}" — aggregate workspace token`}>
+      {display}
+    </span>
+
+    <span
+      class="com"
+      title="salience-weighted depth center of mass ±spread (0 = first block, 1 = last)"
+    >@{com.toFixed(2)} ±{spread.toFixed(2)}</span>
+
+    <span class="spacer"></span>
+
+    <Sparkline points={series} width={56} height={14} />
   {/snippet}
 
   {#snippet body()}
@@ -106,11 +121,12 @@
       <div class="bar-cell" aria-hidden="true">
         <Bar value={strength} max={1} width={160} height={8} color="var(--card-accent)" />
       </div>
+      <span class="filler" aria-hidden="true"></span>
       <span class="value">{strength.toFixed(2)}</span>
     </div>
 
-    <!-- Per-layer salience strip with L endcaps. -->
-    <div class="layers" aria-label="Per-layer salience for {display}">
+    <!-- Per-layer strength strip with L endcaps. -->
+    <div class="layers" aria-label="Per-layer strength for {display}">
       {#if cells.length === 0}
         <div class="layers-status">no layer data</div>
       {:else}
@@ -118,8 +134,8 @@
         <div class="cells">
           {#each cells as cell (cell.layer)}
             <HeatmapCell
-              value={cell.salience}
-              scale={1}
+              value={cell.p}
+              scale={cellScale}
               size={CELL_SIZE}
               title={cellTooltip(cell)}
             />
@@ -152,36 +168,41 @@
     font-variant-numeric: tabular-nums;
     flex: 0 0 auto;
   }
-  .pin {
+  /* Pin glyph — the steer cards' ■/□ square, left of the name.  Muted
+   * until hover (pinning is an action, not a state, on unpinned cards). */
+  .pin-glyph {
     background: transparent;
+    border: 0;
+    padding: 0 var(--space-1);
     color: var(--fg-muted);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    font-size: var(--text-xs);
-    line-height: 1.2;
-    padding: var(--space-1) var(--space-3);
+    font-size: var(--text);
+    line-height: 1;
     flex: 0 0 auto;
     cursor: pointer;
-    transition: color var(--dur) var(--ease-out),
-      border-color var(--dur) var(--ease-out);
   }
-  .pin:hover:not(:disabled) {
+  .pin-glyph:hover:not(:disabled) {
     color: var(--card-accent);
-    border-color: var(--card-accent);
   }
-  .pin:disabled {
-    opacity: 0.5;
+  .pin-glyph.pinned {
+    color: var(--card-accent);
+  }
+  .pin-glyph:disabled {
     cursor: default;
   }
 
-  /* ----- body: strength row (ProbeCard's reading grid) ----- */
+  /* ----- body: strength row — ProbeCard's EXACT four-column grid
+     (label · bar · nearest-or-empty · value), so the bar column aligns
+     pixel-for-pixel with the CAA cards across the tab switch. ----- */
   .reading {
     display: grid;
     align-items: center;
     gap: var(--space-2);
     min-width: 0;
     min-height: 24px;
-    grid-template-columns: minmax(2.5em, 1fr) minmax(60px, 2.6fr) 3.5em;
+    grid-template-columns: minmax(2.5em, 1fr) minmax(60px, 2.6fr) minmax(2.5em, 1fr) 3.5em;
+  }
+  .filler {
+    min-width: 0;
   }
   .row-label {
     color: var(--fg-muted);

@@ -80,7 +80,14 @@ std weighted by the within-layer *salience* `p_l(v)/max_v' p_l(v')` — not raw
 mass, which reads late for every token because early workspace layers are
 diffuse. Top-k by aggregated full-vocab strength (a per-layer top-k union would
 miss a mid-pack-everywhere token); returns `[(vocab_id, strength, com,
-spread)]`, one batched host transfer. `resolve_word_token` maps
+spread)]`, one batched host transfer. `token_readout_stats(logits, depths,
+token_ids)` is the **single-token restriction** of the same calibration — read
+at pinned vocabulary ids instead of top-k selection, returning per id
+`(strength, com, spread, per_layer[p_l])` where `strength = mean_l p_l(v)`
+(∈ [0,1], the ONE probe/gate/display channel — apples-to-apples across
+tokens and layers; within-layer salience survives only as the internal
+depth-CoM weighting, matching `aggregate_readout`) — the math behind
+`jlens/<word>` probe readings and gate scalars. `resolve_word_token` maps
 a word to its single vocab id (leading-space piece first, decode-and-compare
 sanity check, `MultiTokenWordError` with the pieces otherwise).
 `sparse_nonneg_decompose` is the J-space split: greedy pursuit against the
@@ -835,10 +842,13 @@ context, `_begin_capture`/`_end_capture`, `_finalize_generation`, and teardown.
 Monitor scoring is in-flight (no second forward pass); `SamplingConfig(return_hidden=
 True)` widens capture to every layer and lands `GenerationResult.hidden_states`,
 re-scorable via `session.score_hidden`. Probes ride the same plumbing:
-`add_probe(selector, *, as_name=None, top_n=3)` resolves via `_resolve_probe_manifold`
+`add_probe(selector, *, as_name=None, top_n=3)` routes a reserved
+`jlens/<word>` selector to the lens-probe registry (`_add_lens_probe` — the
+readout channel, see "Lens probes" below), else resolves via
+`_resolve_probe_manifold`
 (a 2-node `pca` concept folds to a rank-1 probe via `_fold_profile_probe`; a
 multi-node manifold attaches whole) and registers on the unified `_monitor`;
-`remove_probe(name)` detaches. `_begin_capture` widens to `_monitor.probe_layers()`
+`remove_probe(name)` detaches either kind. `_begin_capture` widens to `_monitor.probe_layers()`
 and picks the `CaptureMode` from `need_per_token` (gate ∨ loom row ∨ trait stream ∨
 live scores ∨ per-layer persist — see hooks.py `HiddenCapture`), storing it on the
 `CaptureState` dataclass (`mode` + `persistent` + the GATING_SUBSET subset/keys —
@@ -897,12 +907,51 @@ recipe steering; the steering scope opens OUTSIDE `_model_exclusive`
 (`SteeringComposer.push`/`pop` take `_gen_lock` blocking — nesting would
 self-deadlock; same ordering as `score_choices`).
 `register_jlens_direction(word)` lands `W_U[v] @ J_l` in `_profiles` under
-`jlens/<word>` — the shared resolver behind the two lazy `jlens/` branches
-(steering: `ensure_profile_registered`; probes: `_resolve_probe_manifold`,
-without which a gate-only `add_probe("jlens/x")` would fall through to
-`extract()` and author a nonsense manifold). `jspace_decompose(selector, k=,
+`jlens/<word>` — the resolver behind the lazy `jlens/` *steering* branch
+(`ensure_profile_registered`) only. `jspace_decompose(selector, k=,
 layers=)` resolves any steerable direction and splits it against the lens
-dictionary. **Live lens** (`enable_live_lens`/`disable_live_lens`/
+dictionary.
+
+**Lens probes (readout channel).** `add_probe("jlens/<word>")` routes to the
+session lens-probe registry (`_lens_probes: name -> {word, token_id, layers}`,
+band-restricted; `_add_lens_probe` validates the artifact + single-token word
+and pre-warms the device transport stack) — **never** the Monitor, never a
+direction fold, no whitener. The reading is the readout-channel synthesis of
+`ProbeReading` (`_score_lens_probes` over `jlens.token_readout_stats`):
+`coords = (strength,)` — the ONE channel, mean band probability
+`mean_l p_l(v)` (the gate channel `@when:jlens/<word>` and the workspace
+card's `strength`) — `coords_per_layer[l] = (p_l,)`, salience-weighted
+`depth_com` (internal weighting only), geometry fields defaulted. The live
+per-layer top-k display wire carries per-layer softmax probabilities too
+(`_live_lens_readout_step` softmaxes before top-k; monotone, so the
+ranking is unchanged), so every lens surface reads one unit. Three read sites,
+one math: per-step display readings ride the live-lens step's own logits
+(`_last_lens_step_readings`, merged into every populated payload channel via
+`TokenProbePayload.merge_readings`); gate scalars come from
+`_score_lens_gate_scalars` in the gating score callback (once per forward,
+`Monitor.flat_scalars` over the synthesized readings, and the computed logits
+are stashed in `_lens_step_stash` for the display step to reuse — the gate
+callback runs before the token tap); the finalize aggregate
+(`_score_lens_probes_aggregate`, called from `generation_finalizer`) pools
+the last content token from the capture tail ring like `_score_aggregate_only`.
+Capture accounting: lens-probe band layers join the `_begin_capture` union;
+the INCREMENTAL branch swaps `set_incremental` for `set_tail_with_sink` when
+lens probes are attached (finalize needs the ring); the lens-only tail branch
+covers `_lens_probes` as well as the live lens; and a **lens-only** gate does
+not force per-token *monitor* scoring — `need_per_token` keys on
+monitor-attached gate keys (`gated_probe_keys`), while
+`SteeringComposer.gated_lens_probe_keys` detects lens gates for the callback
+merge. `probe_hashes`/`_probe_hash` stamp lens probes with a deterministic
+identity digest (`jlens-readout-v1`, model, word, token id, band).
+
+**CAA live toggle.** `live_probe_scores` / `set_live_probe_scores(bool)` —
+when off, `_generate_core` masks every per-token monitor consumer at the
+source (trait stream, loom probe rows, live token scores, per-layer persist,
+subspace-coords persist, the tap's `needs_scores`), so generations run
+aggregate-only capture; probe gates still force the subset they need.
+Surfaced as `POST .../probes/live` + session info `live_probe_scores`.
+
+**Live lens** (`enable_live_lens`/`disable_live_lens`/
 `live_lens_layers`): the selected layers' `J_l` go device-resident, join the
 capture-widen union in `_begin_capture` (which also forces transient — not
 persistent — capture routing, and arms a bounded tail ring when no probes are

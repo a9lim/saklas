@@ -6,7 +6,7 @@
   // uniformly and branches only on *presentation*.
   //
   //   statline : ●/○ (flat) or ◆/◇ (curved) highlight-select · name
-  //              · sparkline · ✕ detach
+  //              · @com ±spread · sparkline · ✕ detach
   //   body     : the subspaceness row (white 0→1 bar segmented into
   //                intrinsic-dim notches · nearest node · fraction), then
   //                one signed bar per coordinate axis (poles on a rank-1
@@ -223,6 +223,13 @@
       <span class="name" title="probe {name}">{displayName}</span>
     </div>
 
+    {#if depthCom !== null}
+      <span
+        class="com"
+        title="depth center of mass of the per-layer read, share-weighted ±spread (0 = first block, 1 = last)"
+      >@{fmtCoord(depthCom)}{depthSpread !== null ? ` ±${fmtCoord(depthSpread)}` : ""}</span>
+    {/if}
+
     <span class="spacer"></span>
 
     <!-- Curved (fraction) probes are [0,1]-bounded → cap the sparkline at 1;
@@ -302,23 +309,13 @@
       </div>
     {/each}
 
-    {#if depthCom !== null || (!affine && residual !== null)}
-      <!-- Settled meta: the depth center of mass of the per-layer read
-           (both families), plus the curved-only off-surface residual. -->
+    {#if !affine && residual !== null}
+      <!-- Settled meta: the curved-only off-surface residual (the depth
+           CoM moved to the statline, right of the probe name). -->
       <div class="meta">
-        {#if depthCom !== null}
-          <span
-            class="meta-item"
-            title="depth center of mass of the per-layer read, share-weighted (0 = first block, 1 = last)"
-          >
-            com {fmtCoord(depthCom)}{depthSpread !== null ? ` ±${fmtCoord(depthSpread)}` : ""}
-          </span>
-        {/if}
-        {#if !affine && residual !== null}
-          <span class="meta-item" title="normalized off-surface residual">
-            residual {fmtCoord(residual)}
-          </span>
-        {/if}
+        <span class="meta-item" title="normalized off-surface residual">
+          residual {fmtCoord(residual)}
+        </span>
       </div>
     {/if}
 
@@ -392,6 +389,12 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     min-width: 0;
+  }
+  .com {
+    color: var(--fg-muted);
+    font-size: var(--text-xs);
+    font-variant-numeric: tabular-nums;
+    flex: 0 0 auto;
   }
   .spacer {
     flex: 1 1 auto;

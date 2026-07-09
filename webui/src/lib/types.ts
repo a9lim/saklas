@@ -83,6 +83,11 @@ export interface SessionInfo {
    *  Rehydrates the WORKSPACE panel toggle across page reloads; older
    *  servers omit it (reads as off). */
   live_lens_layers?: number[] | null;
+  /** CAA live toggle state (``POST .../probes/live``): whether per-token
+   *  monitor scoring feeds live consumers.  Off ⇒ probes report only the
+   *  end-of-gen aggregate (gates still force what they need).  Older
+   *  servers omit it (reads as on). */
+  live_probe_scores?: boolean;
   /** True iff the loaded model family supports assistant-role
    *  substitution (Qwen / Gemma / Llama / GLM / gpt-oss yes; Mistral /
    *  talkie no). Drives whether the roles control is enabled. Older
@@ -691,6 +696,15 @@ export interface ProbeInfo {
    *  Backs the mini-map node dots + per-token trajectory lookup.  ``null``
    *  on an unfitted discover manifold (no per-model layout yet). */
   node_coords?: number[][] | null;
+  /** True for a pinned J-lens token probe (the READOUT channel — the one
+   *  coordinate axis is ``strength`` in [0,1], the mean band probability;
+   *  per-layer traces are ``(p_l,)`` over the workspace band; no subspace
+   *  geometry behind it). */
+  lens?: boolean;
+  /** The lens probe's word (``jlens/<word>``). */
+  word?: string;
+  /** The lens probe's resolved single-token vocabulary id. */
+  token_id?: number | null;
 }
 
 export interface ProbeListResponse {

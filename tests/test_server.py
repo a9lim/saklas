@@ -1286,3 +1286,129 @@ class TestWSTokenEventLens:
             {"readings": None, "lens": None, "lens_aggregate": None}
         )
         assert "lens_aggregate" not in event
+
+
+class TestProbesLiveToggle:
+    """Route contract for ``POST /saklas/v1/sessions/{id}/probes/live``
+    (the CAA live toggle) + its session-info rehydration field."""
+
+    def test_disable_and_enable(self, session_and_client: Any) -> None:
+        session, client = session_and_client
+        session.set_live_probe_scores.return_value = False
+        resp = client.post(
+            "/saklas/v1/sessions/default/probes/live",
+            json={"enabled": False},
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {"enabled": False}
+        session.set_live_probe_scores.assert_called_once_with(False)
+
+        session.set_live_probe_scores.return_value = True
+        resp = client.post(
+            "/saklas/v1/sessions/default/probes/live",
+            json={"enabled": True},
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {"enabled": True}
+
+    def test_wrong_session_404(self, session_and_client: Any) -> None:
+        _session, client = session_and_client
+        resp = client.post(
+            "/saklas/v1/sessions/nope/probes/live", json={"enabled": False},
+        )
+        assert resp.status_code == 404
+
+    def test_session_info_carries_live_probe_scores(
+        self, session_and_client: Any,
+    ) -> None:
+        """Info reports the toggle state — and coerces a stub session
+        (bare MagicMock attribute) to the default-on."""
+        session, client = session_and_client
+        # Bare mock attribute (not a real bool) → reads as on.
+        resp = client.get("/saklas/v1/sessions/default")
+        assert resp.status_code == 200
+        assert resp.json()["live_probe_scores"] is True
+
+        session.live_probe_scores = False
+        resp = client.get("/saklas/v1/sessions/default")
+        assert resp.json()["live_probe_scores"] is False
+
+
+class TestLensProbeRoutes:
+    """Lens (readout-channel) probes on the unified ``/probes`` routes."""
+
+    _SPEC = {"word": "fake", "token_id": 42, "layers": [12, 14, 18]}
+
+    def test_list_includes_lens_probes(self, session_and_client: Any) -> None:
+        session, client = session_and_client
+        session.monitor.attached_probes.return_value = {}
+        session._lens_probes = {"jlens/fake": dict(self._SPEC)}
+        resp = client.get("/saklas/v1/sessions/default/probes")
+        assert resp.status_code == 200
+        (row,) = resp.json()["probes"]
+        assert row["name"] == "jlens/fake"
+        assert row["lens"] is True
+        assert row["word"] == "fake"
+        assert row["token_id"] == 42
+        assert row["layers"] == [12, 14, 18]
+        assert row["feature_space"] == "readout"
+        assert row["intrinsic_dim"] == 1  # the one strength axis
+        assert row["node_coords"] is None
+
+    def test_attach_returns_lens_info(self, session_and_client: Any) -> None:
+        session, client = session_and_client
+
+        def _attach(selector: str, **_kw: Any) -> str:
+            session._lens_probes = {selector: dict(TestLensProbeRoutes._SPEC)}
+            return selector
+
+        session.add_probe.side_effect = _attach
+        resp = client.post(
+            "/saklas/v1/sessions/default/probes",
+            json={"selector": "jlens/fake"},
+        )
+        assert resp.status_code == 201
+        assert resp.json()["lens"] is True
+        assert resp.json()["name"] == "jlens/fake"
+
+    def test_attach_lens_not_fitted_404(self, session_and_client: Any) -> None:
+        from saklas.core.jlens import LensNotFittedError
+
+        session, client = session_and_client
+        session.add_probe.side_effect = LensNotFittedError(
+            "no lens fitted — run `saklas lens fit test/model`"
+        )
+        resp = client.post(
+            "/saklas/v1/sessions/default/probes",
+            json={"selector": "jlens/fake"},
+        )
+        assert resp.status_code == 404
+        assert "lens fit" in resp.json()["detail"]
+
+    def test_attach_multi_token_word_400(self, session_and_client: Any) -> None:
+        from saklas.core.jlens import MultiTokenWordError
+
+        session, client = session_and_client
+        session.add_probe.side_effect = MultiTokenWordError(
+            "'antidisestablishment' is not a single token"
+        )
+        resp = client.post(
+            "/saklas/v1/sessions/default/probes",
+            json={"selector": "jlens/antidisestablishment"},
+        )
+        assert resp.status_code == 400
+
+    def test_detach_lens_probe(self, session_and_client: Any) -> None:
+        session, client = session_and_client
+        session.monitor.probe_names = []
+        session._lens_probes = {"jlens/fake": dict(self._SPEC)}
+        resp = client.delete("/saklas/v1/sessions/default/probes/jlens%2Ffake")
+        assert resp.status_code == 204
+        session.remove_probe.assert_called_once_with("jlens/fake")
+
+    def test_detach_unknown_404(self, session_and_client: Any) -> None:
+        session, client = session_and_client
+        session.monitor.probe_names = []
+        session._lens_probes = {}
+        resp = client.delete("/saklas/v1/sessions/default/probes/jlens%2Ffake")
+        assert resp.status_code == 404

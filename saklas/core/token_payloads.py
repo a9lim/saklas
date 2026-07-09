@@ -31,6 +31,29 @@ class TokenProbePayload:
             "lens_aggregate": lens_aggregate,
         }
 
+    def merge_readings(
+        self,
+        extra: dict[str, ProbeReading],
+        *,
+        per_layer: bool = False,
+        live: bool = False,
+    ) -> None:
+        """Merge additional per-probe readings (e.g. J-lens token probes,
+        which score on the lens path rather than through the Monitor) into
+        every populated channel, mirroring the shaping the monitor readings
+        got in :func:`build_token_probe_payload`."""
+        if not extra:
+            return
+        self.scores = {**(self.scores or {}), **_axis0_scores(extra)}
+        self.readings = {**(self.readings or {}), **extra}
+        if per_layer:
+            merged = dict(self.per_layer_scores or {})
+            for layer, row in (_per_layer_axis0(extra) or {}).items():
+                merged[layer] = {**merged.get(layer, {}), **row}
+            self.per_layer_scores = merged or None
+        if live:
+            self.probe_readings = {**(self.probe_readings or {}), **extra}
+
 
 def _axis0_scores(
     readings: dict[str, ProbeReading],

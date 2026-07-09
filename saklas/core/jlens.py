@@ -392,6 +392,74 @@ def aggregate_readout(
     ]
 
 
+def token_readout_stats(
+    logits: torch.Tensor,
+    depths: "Sequence[float]",
+    token_ids: "Sequence[int]",
+) -> list[tuple[float, float, float, list[float]]]:
+    """Per-token readout statistics for pinned vocabulary ids.
+
+    The single-token restriction of :func:`aggregate_readout`: the same
+    per-layer softmax calibration, read at the requested ``token_ids``
+    instead of selected top-k.  For each id:
+
+    - ``strength = mean_l p_l(v)`` — mean band probability, the aggregate
+      readout's ranking stat and the ONE probe/gate/display channel
+      (objective and apples-to-apples across tokens and layers, unlike a
+      within-layer max normalization).
+    - ``com`` / ``spread`` — depth center of mass (+ std), weighted by the
+      within-layer salience ``p_l(v)/max_v' p_l(v')`` exactly like
+      :func:`aggregate_readout` (an internal weighting only — raw-mass CoM
+      reads late for every token because early workspace layers are
+      diffuse; salience never surfaces as a reported value).
+    - ``per_layer`` — ``[p_l, ...]`` aligned with the logit rows.
+
+    Returns one ``(strength, com, spread, per_layer)`` tuple per requested
+    id, with a single batched host transfer.
+    """
+    if logits.ndim != 2 or logits.shape[0] == 0:
+        raise ValueError(
+            f"token_readout_stats expects [layers, vocab] logits, got shape "
+            f"{tuple(logits.shape)}"
+        )
+    if len(depths) != logits.shape[0]:
+        raise ValueError(
+            f"token_readout_stats: {logits.shape[0]} logit rows but "
+            f"{len(depths)} depths"
+        )
+    if not token_ids:
+        return []
+    probs = logits.float().softmax(dim=-1)                      # [L, V]
+    ids = torch.tensor(
+        [int(v) for v in token_ids], dtype=torch.long, device=probs.device,
+    )
+    p = probs.index_select(-1, ids)                             # [L, K]
+    sal = p / probs.amax(dim=-1, keepdim=True).clamp_min(1e-12)  # [L, K]
+    strength = p.mean(dim=0)                                    # [K]
+    d = torch.tensor(
+        [float(x) for x in depths], dtype=torch.float32, device=probs.device,
+    ).unsqueeze(-1)                                             # [L, 1]
+    mass = sal.sum(dim=0).clamp_min(1e-12)                      # [K]
+    com = (sal * d).sum(dim=0) / mass                           # [K]
+    var = (sal * (d - com.unsqueeze(0)) ** 2).sum(dim=0) / mass
+    spread = var.clamp_min(0.0).sqrt()
+    # one batched host transfer: 3 aggregate rows + the per-layer block
+    host = torch.cat(
+        [torch.stack([strength, com, spread]), p], dim=0,
+    ).cpu()                                                     # [3+L, K]
+    n_layers = int(logits.shape[0])
+    out: list[tuple[float, float, float, list[float]]] = []
+    for j in range(len(token_ids)):
+        per_layer = [float(host[3 + l, j]) for l in range(n_layers)]
+        out.append(
+            (
+                float(host[0, j]), float(host[1, j]), float(host[2, j]),
+                per_layer,
+            )
+        )
+    return out
+
+
 class JSpaceDecomposition:
     """One layer's sparse nonnegative split of a direction against the J-lens
     dictionary: ``share`` = fraction of the direction's variance carried by

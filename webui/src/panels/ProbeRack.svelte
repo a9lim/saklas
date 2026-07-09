@@ -22,11 +22,18 @@
     activeProbeNames,
     openDrawer,
     probeRack,
+    probesLiveState,
+    setLiveProbes,
     setProbeSortMode,
   } from "../lib/stores.svelte";
   import type { ProbeSortMode } from "../lib/types";
 
   const sortMode = $derived(probeRack.sortMode);
+  const liveOn = $derived(probesLiveState.enabled);
+
+  function onToggleLive(): void {
+    void setLiveProbes(!liveOn);
+  }
 
   // activeProbeNames() reads probeRack.active + entries + sortMode, all
   // $state-tracked, so this $derived re-runs on any of those changes.  We
@@ -74,6 +81,18 @@
   <header class="header">
     <div class="header-text">
       <span class="title">PROBE</span>
+      <button
+        type="button"
+        class="toggle"
+        class:on={liveOn}
+        disabled={probesLiveState.busy}
+        onclick={onToggleLive}
+        title={liveOn
+          ? "Stop live per-token probe scoring (probes settle to the end-of-gen aggregate; gates still fire)"
+          : "Score probes live every token (per-token stream, loom rows, trait events)"}
+      >
+        {liveOn ? "live: on" : "live: off"}
+      </button>
       <span class="count" aria-live="polite">
         {count} attached
       </span>
@@ -192,6 +211,29 @@
     color: var(--fg-muted);
     font-size: var(--text-sm);
     flex: 0 0 auto;
+  }
+  /* Live toggle — same chrome as the J-LENS PROBE section's, so the two
+   * tabs' headers read as siblings. */
+  .toggle {
+    font-size: var(--text-sm);
+    color: var(--fg-muted);
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    padding: 1px var(--space-3);
+    cursor: pointer;
+  }
+  .toggle:hover:not(:disabled) {
+    color: var(--fg);
+    border-color: var(--fg-muted);
+  }
+  .toggle.on {
+    color: var(--accent);
+    border-color: var(--accent);
+  }
+  .toggle:disabled {
+    opacity: 0.5;
+    cursor: default;
   }
   .sort {
     display: inline-flex;

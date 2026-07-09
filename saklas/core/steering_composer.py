@@ -636,6 +636,32 @@ class SteeringComposer:
                 out.add(gate.probe)
         return out
 
+    def gated_lens_probe_keys(self) -> set[str]:
+        """Exact gate scalar keys referencing attached J-lens token probes.
+
+        The lens siblings of :meth:`gated_probe_keys`: lens probes live in the
+        session lens-probe registry (readout channel), not the Monitor, and
+        their gate scalars come from ``session._score_lens_gate_scalars`` in
+        the gating score callback.  Only keys whose base name is an attached
+        lens probe count, mirroring the monitor filter.
+        """
+        attached = set(getattr(self._session, "_lens_probes", None) or ())
+        if not attached:
+            return set()
+        out: set[str] = set()
+        for entry in self.flatten_steering_stack().values():
+            if isinstance(entry, (AblationTerm, ManifoldTerm)):
+                trig = entry.trigger
+            else:  # (alpha, Trigger)
+                _alpha, trig = entry
+            gate = trig.gate
+            if gate is None:
+                continue
+            name = re.split(r"[\[:@~]", gate.probe, maxsplit=1)[0]
+            if name in attached:
+                out.add(gate.probe)
+        return out
+
     def steering_active_in_prefill(self) -> bool:
         """Return True iff any active steering term fires during prompt prefill.
 
@@ -722,8 +748,12 @@ class SteeringComposer:
         session = self._session
         capture = session._capture
         monitor = session._monitor
+        # J-lens token probes referenced by active gates score on the lens
+        # path (readout-channel salience/strength), not through the Monitor —
+        # detected once per generation here, merged into every return below.
+        has_lens_gates = bool(self.gated_lens_probe_keys())
 
-        def _score() -> dict[str, float]:
+        def _monitor_scalars() -> dict[str, float]:
             incremental_readings = getattr(session, "_incremental_readings", [])
             incremental_gate_scores = getattr(session, "_incremental_gate_scores", [])
             # The step sink already scored this token's readings — reuse them so
@@ -751,6 +781,8 @@ class SteeringComposer:
                                 )
                             )
                 return scalars
+            if not monitor.probe_names:
+                return {}
             latest = capture.latest_per_layer()
             if not latest:
                 return {}
@@ -768,6 +800,16 @@ class SteeringComposer:
                 latest, only=gating_subset if gating_subset else None,
             )
             return monitor.flat_scalars(agg)
+
+        def _score() -> dict[str, float]:
+            out = _monitor_scalars()
+            if has_lens_gates:
+                # Once per forward: band lens logits → salience/strength
+                # scalars (also stashed for the display step to reuse).
+                lens_scalars = session._score_lens_gate_scalars()
+                if lens_scalars:
+                    out = {**out, **lens_scalars}
+            return out
 
         return _score
 

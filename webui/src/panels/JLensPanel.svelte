@@ -1,24 +1,26 @@
 <script lang="ts">
-  // J-LENS — the inspector column's Jacobian-lens tab: the open- and
-  // closed-vocabulary views of the workspace readout, card-based and
-  // symmetric with the CAA tab (every row wears RackCard; the
-  // j-lens family accent is blue, marker ■/□).
+  // J-LENS — the inspector column's Jacobian-lens tab: two sections,
+  // card-based and symmetric with the CAA tab (every row wears RackCard;
+  // the j-lens family accent is blue, marker ■/□).
   //
-  //   STEER    — one card per ``α jlens/<word>`` token atom in the ONE
-  //              steering expression (the engine folds the lens direction
-  //              over the workspace band with whitened shares, exactly
-  //              like a concept vector).  Per-card α slider + trigger
-  //              pill (lens atoms run hotter than concept vectors;
-  //              default 0.3).
-  //   PROBE    — one card per pinned ``jlens/<word>`` token probe
-  //              (ordinary probe-rack entries): signed whitened-
-  //              coordinate bar, sparkline, depth CoM, per-layer strip.
-  //   WORKSPACE— the open-vocab live readout: one card per aggregate
-  //              token (strength = mean band probability as an absolute
-  //              0→1 bar, com = salience-weighted depth center of mass),
-  //              each with a per-layer salience strip distilled from the
-  //              same streamed matrix.  The full per-layer ranking lives
-  //              in the transcript token drilldown's j-lens tab.
+  //   STEER — one card per ``α jlens/<word>`` token atom in the ONE
+  //           steering expression (the engine folds the lens direction
+  //           over the workspace band with whitened shares, exactly
+  //           like a concept vector).  Per-card α slider + trigger
+  //           pill (lens atoms run hotter than concept vectors;
+  //           default 0.3).
+  //   PROBE — the workspace readout, pinned and unpinned in ONE section
+  //           (pinning a token just makes its card persistent and
+  //           gate-able — both card kinds are the same shape: strength
+  //           bar + per-layer strength strip; the pinned card's ■ unpins,
+  //           the unpinned card's □ pins).  Pinned ``jlens/<word>`` token
+  //           probes first, then the live open-vocab aggregate cards for
+  //           the top-k tokens not already pinned.  The card list owns
+  //           the scroll (header + add form stay anchored, like the CAA
+  //           racks).  The header's live toggle is the lens live switch:
+  //           off ⇒ no per-step lens computation — pinned probes settle
+  //           to the end-of-gen aggregate, discovery cards go quiet.  The
+  //           full per-layer ranking lives in the transcript drilldown.
   //
   // With no fitted lens (``session_info.jlens_fitted``) the tab renders a
   // "fit j-lens" button instead — it kicks off the server's background fit
@@ -41,15 +43,11 @@
     sessionState,
     setLensWorkspaceSortMode,
     setLiveLens,
-    setProbeSortMode,
     startLensFit,
     steerRack,
   } from "../lib/stores.svelte";
   import { pushToast } from "../lib/stores/toasts.svelte";
-  import type {
-    JLensSteerEntry,
-    ProbeSortMode,
-  } from "../lib/types";
+  import type { JLensSteerEntry, ProbeRackEntry } from "../lib/types";
   import type { LensWorkspaceSortMode } from "../lib/stores.svelte";
 
   const fitted = $derived(sessionState.info?.jlens_fitted === true);
@@ -82,18 +80,90 @@
     steerInput = "";
   }
 
-  // ---------- PROBE: pinned jlens/ probe-rack entries ----------
-  const pinnedCards = $derived.by(() => {
+  // ---------- PROBE: pinned probe cards + unpinned aggregate cards ----------
+  // One merged section — pinning a workspace token just makes its card
+  // persistent (and gate-able); both card families share the one sort
+  // control (strength / name / depth).
+
+  interface PinnedRow {
+    name: string;
+    entry: ProbeRackEntry;
+    /** Sort keys mirroring the aggregate rows' (axis 0 = strength). */
+    value: number;
+    com: number;
+  }
+
+  interface AggRow {
+    /** Raw vocabulary token text (untrimmed — the strip matches on it). */
+    token: string;
+    strength: number;
+    com: number;
+    spread: number;
+    /** Recent strength history (0 where the token fell below top-k). */
+    series: number[];
+  }
+
+  const SORT_OPTIONS: {
+    value: LensWorkspaceSortMode;
+    label: string;
+  }[] = [
+    { value: "strength", label: "strength" },
+    { value: "name", label: "name" },
+    { value: "depth", label: "depth" },
+  ];
+
+  const pinnedCards = $derived.by((): PinnedRow[] => {
     const names = activeProbeNames().filter((n) => n.startsWith("jlens/"));
-    return names.map((n) => ({ name: n, entry: probeRack.entries.get(n) }));
+    const rows: PinnedRow[] = [];
+    for (const name of names) {
+      const entry = probeRack.entries.get(name);
+      if (!entry) continue;
+      const latest = entry.aggregate ?? entry.reading;
+      rows.push({
+        name,
+        entry,
+        value: latest?.coords?.[0] ?? entry.current ?? 0,
+        com: latest?.depth_com?.[0] ?? 0,
+      });
+    }
+    if (lensState.workspaceSortMode === "name") {
+      rows.sort((a, b) => a.name.localeCompare(b.name));
+    } else if (lensState.workspaceSortMode === "depth") {
+      rows.sort((a, b) => a.com - b.com || b.value - a.value);
+    } else {
+      rows.sort((a, b) => b.value - a.value || a.name.localeCompare(b.name));
+    }
+    return rows;
   });
 
-  const probeSortMode = $derived(probeRack.sortMode);
-  const PROBE_SORT_OPTIONS: { value: ProbeSortMode; label: string }[] = [
-    { value: "name", label: "name" },
-    { value: "value", label: "value" },
-    { value: "change", label: "change" },
-  ];
+  const aggRows = $derived.by((): AggRow[] => {
+    const rows = lensState.aggregate;
+    if (!rows || rows.length === 0) return [];
+    const hist = lensState.aggHistory;
+    // Pinned tokens already have a persistent card above — the aggregate
+    // group carries only the unpinned remainder of the top-k.
+    const out = rows
+      .filter(([token]) => !probeRack.active.includes(`jlens/${token.trim()}`))
+      .map(([token, strength, com, spread]) => ({
+        token,
+        strength,
+        com,
+        spread,
+        series: hist.map(
+          (frame) => frame.find(([t]) => t === token)?.[1] ?? 0,
+        ),
+      }));
+    if (lensState.workspaceSortMode === "name") {
+      out.sort((a, b) =>
+        a.token.trim().localeCompare(b.token.trim()) || b.strength - a.strength,
+      );
+    } else if (lensState.workspaceSortMode === "depth") {
+      out.sort((a, b) => a.com - b.com || b.strength - a.strength);
+    } else {
+      out.sort((a, b) => b.strength - a.strength);
+    }
+    return out;
+  });
 
   let probeInput = $state("");
   let probeBusy = $state(false);
@@ -120,48 +190,6 @@
     void pinWord(probeInput);
     probeInput = "";
   }
-
-  // ---------- WORKSPACE: aggregate token cards, user-sorted ----------
-
-  interface AggRow {
-    /** Raw vocabulary token text (untrimmed — the strip matches on it). */
-    token: string;
-    strength: number;
-    com: number;
-    spread: number;
-    pinned: boolean;
-  }
-
-  const WORKSPACE_SORT_OPTIONS: {
-    value: LensWorkspaceSortMode;
-    label: string;
-  }[] = [
-    { value: "strength", label: "strength" },
-    { value: "name", label: "name" },
-    { value: "depth", label: "depth" },
-  ];
-
-  const aggRows = $derived.by((): AggRow[] => {
-    const rows = lensState.aggregate;
-    if (!rows || rows.length === 0) return [];
-    const out = rows.map(([token, strength, com, spread]) => ({
-      token,
-      strength,
-      com,
-      spread,
-      pinned: probeRack.active.includes(`jlens/${token.trim()}`),
-    }));
-    if (lensState.workspaceSortMode === "name") {
-      out.sort((a, b) =>
-        a.token.trim().localeCompare(b.token.trim()) || b.strength - a.strength,
-      );
-    } else if (lensState.workspaceSortMode === "depth") {
-      out.sort((a, b) => a.com - b.com || b.strength - a.strength);
-    } else {
-      out.sort((a, b) => b.strength - a.strength);
-    }
-    return out;
-  });
 
   function onToggleLive(): void {
     void setLiveLens(!liveOn);
@@ -225,7 +253,7 @@
     </section>
   {:else}
     <!-- STEER — token-atom cards in the shared steering expression. -->
-    <section class="section">
+    <section class="section steer">
       <header class="header">
         <div class="header-text">
           <span class="title">STEER</span>
@@ -234,7 +262,7 @@
       </header>
 
       {#if steerCards.length > 0}
-        <div class="cards" role="list">
+        <div class="cards steer-cards" role="list">
           {#each steerCards as [name, entry] (name)}
             <div role="listitem">
               <JLensSteerCard {name} {entry} />
@@ -257,39 +285,86 @@
       </form>
     </section>
 
-    <!-- PROBE — pinned closed-vocab token-probe cards. -->
-    <section class="section">
+    <!-- PROBE — the merged workspace readout: pinned token-probe cards
+         (persistent, gate-able) + the unpinned live aggregate cards.
+         The card list owns the scroll; header + add form stay anchored
+         (the CAA racks' fixed-chrome / scrollable-middle shape). -->
+    <section class="section probe">
       <header class="header">
         <div class="header-text">
           <span class="title">PROBE</span>
+          <button
+            type="button"
+            class="toggle"
+            class:on={liveOn}
+            disabled={lensState.busy}
+            onclick={onToggleLive}
+            title={liveOn
+              ? "Stop the per-step lens readout (pinned probes settle to the end-of-gen aggregate)"
+              : "Stream the J-lens readout live during generation (pinned probes + workspace top-k)"}
+          >
+            {liveOn ? "live: on" : "live: off"}
+          </button>
           <span class="count">{pinnedCards.length} pinned</span>
         </div>
         <label class="sort">
           <span class="sort-label">sort</span>
           <span class="sort-select">
             <Select
-              value={probeSortMode}
-              options={PROBE_SORT_OPTIONS}
-              onchange={setProbeSortMode}
-              ariaLabel="Sort J-lens probes by"
+              value={lensState.workspaceSortMode}
+              options={SORT_OPTIONS}
+              onchange={setLensWorkspaceSortMode}
+              ariaLabel="Sort J-lens probe tokens by"
             />
           </span>
         </label>
       </header>
 
-      {#if pinnedCards.length > 0}
-        <div class="cards" role="list">
-          {#each pinnedCards as { name, entry } (name)}
-            {#if entry}
+      <div class="scroll">
+        {#if pinnedCards.length > 0}
+          <div class="cards" role="list" aria-label="Pinned lens token probes">
+            {#each pinnedCards as row (row.name)}
               <div role="listitem">
-                <JLensProbeCard {name} {entry} />
+                <JLensProbeCard name={row.name} entry={row.entry} />
               </div>
-            {/if}
-          {/each}
-        </div>
-      {/if}
+            {/each}
+          </div>
+        {/if}
 
-      <form class="add-form" onsubmit={onAddProbe}>
+        {#if liveOn}
+          {#if aggRows.length > 0}
+            <div class="cards" role="list" aria-label="Workspace aggregate tokens">
+              {#each aggRows as row (row.token)}
+                <div role="listitem">
+                  <JLensTokenCard
+                    token={row.token}
+                    strength={row.strength}
+                    com={row.com}
+                    spread={row.spread}
+                    series={row.series}
+                    layers={lensState.layers ?? []}
+                    readout={lensState.readout}
+                    pinned={false}
+                    busy={probeBusy}
+                    onpin={pinWord}
+                  />
+                </div>
+              {/each}
+            </div>
+            <p class="hint drill-hint">
+              click a transcript token for its full per-layer matrix
+            </p>
+          {:else}
+            <p class="hint">workspace top-k streams on the next generation</p>
+          {/if}
+        {:else}
+          <p class="hint">
+            live off — pinned probes report the end-of-gen aggregate only
+          </p>
+        {/if}
+      </div>
+
+      <form class="add-form anchored" onsubmit={onAddProbe}>
         <input
           class="add-input"
           type="text"
@@ -306,74 +381,20 @@
         </button>
       </form>
     </section>
-
-    <!-- WORKSPACE — the open-vocab aggregate readout as token cards. -->
-    <section class="section">
-      <header class="header">
-        <div class="header-text">
-          <button
-            type="button"
-            class="toggle"
-            class:on={liveOn}
-            disabled={lensState.busy}
-            onclick={onToggleLive}
-            title={liveOn
-              ? "Stop streaming the live workspace readout"
-              : "Stream the layer-aggregated J-lens readout live during generation"}
-          >
-            {liveOn ? "live: on" : "live: off"}
-          </button>
-          <span class="title">WORKSPACE</span>
-        </div>
-        <label class="sort">
-          <span class="sort-label">sort</span>
-          <span class="sort-select">
-            <Select
-              value={lensState.workspaceSortMode}
-              options={WORKSPACE_SORT_OPTIONS}
-              onchange={setLensWorkspaceSortMode}
-              ariaLabel="Sort workspace tokens by"
-            />
-          </span>
-        </label>
-      </header>
-
-      {#if liveOn}
-        {#if aggRows.length > 0}
-          <div class="cards" role="list" aria-label="Aggregate lens tokens">
-            {#each aggRows as row (row.token)}
-              <div role="listitem">
-                <JLensTokenCard
-                  token={row.token}
-                  strength={row.strength}
-                  com={row.com}
-                  spread={row.spread}
-                  layers={lensState.layers ?? []}
-                  readout={lensState.readout}
-                  pinned={row.pinned}
-                  busy={probeBusy}
-                  onpin={pinWord}
-                />
-              </div>
-            {/each}
-          </div>
-          <p class="hint drill-hint">
-            click a transcript token for its full per-layer matrix
-          </p>
-        {:else}
-          <p class="hint">streams on the next generation</p>
-        {/if}
-      {/if}
-    </section>
   {/if}
 </div>
 
 <style>
+  /* Fixed-chrome column, matching the CAA rack-grid: STEER sizes to its
+     content, PROBE takes the rest and scrolls internally so the header +
+     add form stay visible (the ProbeRack header/strips/actions shape). */
   .jlens {
     display: flex;
     flex-direction: column;
+    height: 100%;
+    max-height: 100%;
     min-height: 0;
-    overflow-y: auto;
+    overflow: hidden;
   }
 
   /* Flat sections divided by hairlines, matching the rack chrome. */
@@ -386,6 +407,38 @@
   }
   .section:last-child {
     border-bottom: 0;
+  }
+  .section.steer {
+    flex: 0 1 auto;
+    min-height: 0;
+  }
+  /* A pathological steer-card pile scrolls inside its own list rather
+     than eating the probe section's share of the column. */
+  .steer-cards {
+    overflow-y: auto;
+    max-height: 30vh;
+  }
+  .section.probe {
+    flex: 1 1 0;
+    min-height: 0;
+    overflow: hidden;
+  }
+  /* The scrollable middle — cards + hints; header and add form stay put. */
+  .scroll {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+    flex: 1 1 0;
+    min-height: 2.4rem;
+    overflow-y: auto;
+    padding-right: var(--space-1);
+  }
+  /* Anchored footer — same border-top treatment as the CAA racks'
+     actions row. */
+  .add-form.anchored {
+    flex: 0 0 auto;
+    border-top: 1px solid var(--border);
+    padding-top: var(--space-3);
   }
 
   /* Rack-style section header — underlined, matching ProbeRack /

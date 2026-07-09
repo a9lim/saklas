@@ -117,6 +117,17 @@ def finalize_generation(
     manifold_aggregates: dict[str, Any] = {}
     if return_probe_readings and session._monitor.probe_names and generated_ids:
         manifold_aggregates = dict(agg_vals)
+    # Pinned J-lens token probes (readout channel — not monitor probes):
+    # one band readout pooled at the last content token, same aggregate
+    # semantics as the monitor roster.
+    if (
+        return_probe_readings
+        and generated_ids
+        and getattr(session, "_lens_probes", None)
+    ):
+        manifold_aggregates.update(
+            session._score_lens_probes_aggregate(generated_ids)
+        )
 
     result = GenerationResult(
         text=text, tokens=list(generated_ids), token_count=token_count,
