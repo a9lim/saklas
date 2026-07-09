@@ -152,6 +152,22 @@ export interface LensTokenReadoutJSON {
   layers: LensReadoutLayerJSON[];
 }
 
+/** ``POST/GET /sessions/{id}/lens/fit`` — the background lens fit's
+ *  polled status.  ``running`` false + ``finished_at`` set + no
+ *  ``error`` = the fit landed (refresh session info for
+ *  ``jlens_fitted``). */
+export interface LensFitStatusJSON {
+  running: boolean;
+  prompts_done: number;
+  prompts_total: number;
+  message: string | null;
+  error: string | null;
+  started_at: number | null;
+  finished_at: number | null;
+  /** Layers the post-fit auto-enable turned live, when it ran. */
+  live_layers: number[] | null;
+}
+
 // ----------------------------------------------------- manifolds --
 
 /** One axis of a Box manifold domain.  ``periodic`` axes wrap (the

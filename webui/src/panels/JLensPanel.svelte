@@ -20,19 +20,25 @@
   //              same streamed matrix.  The full per-layer ranking lives
   //              in the transcript token drilldown's j-lens tab.
   //
-  // Renders a fit hint when no Jacobian lens is fitted for the model
-  // (``session_info.jlens_fitted``); every section needs the artifact.
+  // With no fitted lens (``session_info.jlens_fitted``) the tab renders a
+  // "fit j-lens" button instead — it kicks off the server's background fit
+  // (``POST .../lens/fit``) and shows polled progress; the live readout
+  // auto-enables when the artifact lands.  Every section needs the artifact.
 
+  import Bar from "../lib/charts/Bar.svelte";
   import JLensProbeCard from "./rack/JLensProbeCard.svelte";
   import JLensSteerCard from "./rack/JLensSteerCard.svelte";
   import JLensTokenCard from "./rack/JLensTokenCard.svelte";
   import {
     addJLensToRack,
     attachProbe,
+    checkLensFit,
+    lensFitState,
     lensState,
     probeRack,
     sessionState,
     setLiveLens,
+    startLensFit,
     steerRack,
   } from "../lib/stores.svelte";
   import { pushToast } from "../lib/stores/toasts.svelte";
@@ -40,6 +46,12 @@
 
   const fitted = $derived(sessionState.info?.jlens_fitted === true);
   const liveOn = $derived(lensState.layers !== null);
+
+  // Resume-visibility: a page reload mid-fit should pick the progress
+  // polling back up (the fit runs server-side regardless of the client).
+  $effect(() => {
+    if (!fitted) void checkLensFit();
+  });
 
   // ---------- STEER: jlens-mode rack entries (alphabetical) ----------
   const steerCards = $derived.by(() => {
@@ -129,12 +141,57 @@
   {#if !fitted}
     <section class="section">
       <header class="header">
-        <span class="title">J-LENS</span>
+        <div class="header-text">
+          <span class="title">J-LENS</span>
+          <span class="subtitle">not fitted</span>
+        </div>
       </header>
-      <p class="hint">
-        no Jacobian lens fitted for this model — run
-        <code>saklas lens fit &lt;model&gt;</code>
-      </p>
+      {#if lensFitState.running}
+        <div class="fit-progress" aria-label="Lens fit progress">
+          <div class="fit-line">
+            <span class="fit-msg">{lensFitState.message ?? "fitting…"}</span>
+            {#if lensFitState.promptsTotal > 0}
+              <span class="fit-count">
+                {lensFitState.promptsDone}/{lensFitState.promptsTotal}
+              </span>
+            {/if}
+          </div>
+          <div class="fit-bar" aria-hidden="true">
+            <Bar
+              value={lensFitState.promptsDone}
+              max={Math.max(lensFitState.promptsTotal, 1)}
+              width={160}
+              height={8}
+              color="var(--accent-blue)"
+            />
+          </div>
+          <p class="hint">
+            the fit holds the model — generations error until it lands;
+            an interrupted fit resumes from its last checkpoint
+          </p>
+        </div>
+      {:else}
+        <p class="hint">
+          no Jacobian lens fitted for this model — the workspace readout,
+          token atoms, and token probes all need the per-model artifact
+        </p>
+        {#if lensFitState.error}
+          <p class="hint fit-error">last fit: {lensFitState.error}</p>
+        {/if}
+        <button
+          type="button"
+          class="fit-btn"
+          onclick={() => void startLensFit()}
+          title="Fit the Jacobian lens over the workspace band (~100 web-text prompts; hours of wall clock, checkpointed and resumable)"
+        >
+          fit j-lens
+        </button>
+        <p class="hint">
+          ≈100 web-text prompts over the 40–90% workspace band —
+          compute-bound (hours on Apple silicon), checkpointed every 25
+          prompts, resumable; live readout turns on when it lands
+        </p>
+      {/if}
     </section>
   {:else}
     <!-- STEER — token-atom cards in the shared steering expression. -->
@@ -314,14 +371,59 @@
     color: var(--fg-muted);
     font-size: var(--text-sm);
   }
-  .hint code {
-    font-family: var(--font-mono);
-    font-size: var(--text-xs);
-    color: var(--fg);
-  }
   .drill-hint {
     font-size: var(--text-xs);
     color: var(--fg-dim);
+  }
+
+  /* ----- fit button + progress (the not-fitted state) ----- */
+  .fit-btn {
+    align-self: flex-start;
+    background: color-mix(in srgb, var(--accent-blue) 10%, transparent);
+    color: var(--accent-blue);
+    border: 1px solid var(--accent-blue);
+    border-radius: var(--radius);
+    font-size: var(--text-sm);
+    padding: var(--space-2) var(--space-5);
+    cursor: pointer;
+    transition: background var(--dur) var(--ease-out);
+  }
+  .fit-btn:hover {
+    background: color-mix(in srgb, var(--accent-blue) 18%, transparent);
+  }
+  .fit-error {
+    color: var(--accent-red);
+  }
+  .fit-progress {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+  .fit-line {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: var(--space-3);
+  }
+  .fit-msg {
+    color: var(--fg);
+    font-size: var(--text-sm);
+    font-family: var(--font-mono);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+  }
+  .fit-count {
+    color: var(--fg-muted);
+    font-size: var(--text-sm);
+    font-variant-numeric: tabular-nums;
+    flex: 0 0 auto;
+  }
+  .fit-bar :global(.bar) {
+    width: 100%;
+    height: 8px;
+    display: block;
   }
 
   /* Card stack — same rhythm as the probe rack's strips. */

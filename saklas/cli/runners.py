@@ -414,6 +414,19 @@ def _run_serve(args: argparse.Namespace) -> None:
 
     _warmup_session(session)
 
+    # Live-lens-on by default: when the model has a fitted Jacobian lens,
+    # serve starts with the full-band live workspace readout streaming, so
+    # the dashboard's J-LENS tab is hot on first load (the toggle still
+    # turns it off per session).  Serve-side policy only — the library and
+    # TUI stay opt-in.  ``top_k=8`` matches the dashboard's readout width.
+    from saklas.io.lens import load_lens_sidecar
+    if load_lens_sidecar(session.model_id) is not None:
+        try:
+            layers = session.enable_live_lens(top_k=8)
+            print(f"Live J-lens readout: on ({len(layers)} workspace-band layers)")
+        except Exception as e:  # noqa: BLE001 — never block serve startup
+            print(f"Live J-lens readout: enable failed ({e})", file=sys.stderr)
+
     print(f"\nServing on http://{args.host}:{args.port}")
     print(f"OpenAI-compatible:  http://{args.host}:{args.port}/v1")
     print(f"Ollama-compatible:  http://{args.host}:{args.port}/api")
@@ -2247,9 +2260,10 @@ def _run_template(args: argparse.Namespace) -> None:
 
 # --- lens verbs -----------------------------------------------------------
 
-_DEFAULT_LENS_CORPUS = ("HuggingFaceFW/fineweb-edu", "sample-10BT")
 #: Documents are sliced to this many characters before tokenization — the fit
 #: truncates to --seq-len tokens anyway, so tokenizing a full web page is waste.
+#: (The default-corpus streamer lives in ``io.lens`` — shared with the server's
+#: fit route — and applies the same slice.)
 _LENS_DOC_CHARS = 4000
 
 
@@ -2305,27 +2319,16 @@ def _load_lens_corpus(args: argparse.Namespace) -> tuple[list[str], str]:
                 if len(docs) >= n:
                     break
         return docs, f"file:{path.name}"
-    try:
-        from datasets import load_dataset
-    except ImportError:
-        print(
-            "lens fit: no --corpus given and the `datasets` library is not "
-            "installed. Either pass --corpus FILE (one document per line) or "
-            "`pip install 'saklas[hf]'` to stream the default web-text sample.",
-            file=sys.stderr,
-        )
-        sys.exit(2)
-    repo, config = _DEFAULT_LENS_CORPUS
+    from saklas.core.jlens import JacobianLensError
+    from saklas.io.lens import DEFAULT_LENS_CORPUS, stream_default_lens_corpus
+
+    repo, config = DEFAULT_LENS_CORPUS
     print(f"Streaming {n} documents from {repo} ({config})...")
-    stream = load_dataset(repo, name=config, split="train", streaming=True)
-    docs = []
-    for row in stream:
-        text = str(row.get("text", "")).strip()
-        if text:
-            docs.append(text[:_LENS_DOC_CHARS])
-        if len(docs) >= n:
-            break
-    return docs, f"hf:{repo}/{config}"
+    try:
+        return stream_default_lens_corpus(n)
+    except JacobianLensError as e:
+        print(f"lens fit: {e}", file=sys.stderr)
+        sys.exit(2)
 
 
 def _lens_fit_source_preflight_matches(

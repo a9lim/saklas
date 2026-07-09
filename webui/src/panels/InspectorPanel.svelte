@@ -10,42 +10,35 @@
   //
   // The split is presentational — each tab shows its own term/probe
   // family; a j-lens steer chip and a subspace card serialize into the
-  // same expression.  The tab strip only renders when a lens is fitted
-  // for the model (``session_info.jlens_fitted``); otherwise the probes
-  // surface owns the column and nothing hints at the absent channel.
+  // same expression.  The tab strip always renders: with no fitted lens
+  // the J-LENS tab hosts the "fit j-lens" button (the entry point to the
+  // server's background fit), so the absent channel advertises itself.
 
   import SteeringRack from "./SteeringRack.svelte";
   import ProbeRack from "./ProbeRack.svelte";
   import JLensPanel from "./JLensPanel.svelte";
-  import {
-    inspectorState,
-    sessionState,
-    setInspectorTab,
-  } from "../lib/stores.svelte";
+  import { inspectorState, setInspectorTab } from "../lib/stores.svelte";
 
-  const lensAvailable = $derived(sessionState.info?.jlens_fitted === true);
-  const tab = $derived(lensAvailable ? inspectorState.tab : "probes");
+  const tab = $derived(inspectorState.tab);
 </script>
 
 <aside class="inspector" aria-label="Saklas inspector">
-  {#if lensAvailable}
-    <nav class="tabs" aria-label="Inspector mode">
-      <button
-        type="button"
-        class="tab"
-        class:active={tab === "probes"}
-        aria-pressed={tab === "probes"}
-        onclick={() => setInspectorTab("probes")}
-      >PROBES</button>
-      <button
-        type="button"
-        class="tab"
-        class:active={tab === "jlens"}
-        aria-pressed={tab === "jlens"}
-        onclick={() => setInspectorTab("jlens")}
-      >J-LENS</button>
-    </nav>
-  {/if}
+  <nav class="tabs" aria-label="Inspector mode">
+    <button
+      type="button"
+      class="tab"
+      class:active={tab === "probes"}
+      aria-pressed={tab === "probes"}
+      onclick={() => setInspectorTab("probes")}
+    >PROBES</button>
+    <button
+      type="button"
+      class="tab"
+      class:active={tab === "jlens"}
+      aria-pressed={tab === "jlens"}
+      onclick={() => setInspectorTab("jlens")}
+    >J-LENS</button>
+  </nav>
 
   {#if tab === "jlens"}
     <JLensPanel />
@@ -69,12 +62,6 @@
     overflow: hidden;
     background: var(--bg-alt);
   }
-  /* No tab strip (no fitted lens) → the single content row owns the
-   * column. */
-  .inspector:not(:has(.tabs)) {
-    grid-template-rows: minmax(0, 1fr);
-  }
-
   .tabs {
     display: flex;
     border-bottom: 1px solid var(--border);

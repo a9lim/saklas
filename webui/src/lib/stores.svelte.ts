@@ -168,6 +168,109 @@ export async function setLiveLens(enabled: boolean): Promise<void> {
   }
 }
 
+// ------------------------------------------------- lens fit (button) --
+
+export interface LensFitState {
+  /** Mirrors the server's background-fit status (polled). */
+  running: boolean;
+  promptsDone: number;
+  promptsTotal: number;
+  message: string | null;
+  error: string | null;
+  /** Poll-loop guard — one interval regardless of how many panels ask. */
+  polling: boolean;
+}
+
+export const lensFitState: LensFitState = $state({
+  running: false,
+  promptsDone: 0,
+  promptsTotal: 0,
+  message: null,
+  error: null,
+  polling: false,
+});
+
+const LENS_FIT_POLL_MS = 3000;
+
+function _applyFitStatus(st: {
+  running: boolean;
+  prompts_done: number;
+  prompts_total: number;
+  message: string | null;
+  error: string | null;
+  finished_at: number | null;
+}): void {
+  lensFitState.running = st.running;
+  lensFitState.promptsDone = st.prompts_done;
+  lensFitState.promptsTotal = st.prompts_total;
+  lensFitState.message = st.message;
+  lensFitState.error = st.error;
+}
+
+/** Poll the background lens fit until it settles.  On completion the
+ *  session info is refreshed (``jlens_fitted`` flips, and the server's
+ *  post-fit auto-enable lands in ``live_lens_layers`` → the WORKSPACE
+ *  toggle reads on). */
+export async function pollLensFit(): Promise<void> {
+  if (lensFitState.polling) return;
+  lensFitState.polling = true;
+  try {
+    for (;;) {
+      const st = await apiLens.fitStatus();
+      _applyFitStatus(st);
+      if (!st.running) {
+        if (st.finished_at !== null) {
+          if (st.error) {
+            pushToast(`lens fit failed — ${st.error}`, {
+              kind: "error",
+              ttlMs: null,
+            });
+          } else {
+            pushToast("J-lens fitted — live readout on", { kind: "info" });
+          }
+          await refreshSession();
+        }
+        return;
+      }
+      await new Promise((r) => setTimeout(r, LENS_FIT_POLL_MS));
+    }
+  } catch (e) {
+    lensFitState.error = e instanceof Error ? e.message : String(e);
+  } finally {
+    lensFitState.polling = false;
+  }
+}
+
+/** Kick off the background Jacobian-lens fit (the "fit j-lens" button) and
+ *  start polling.  Server defaults: 100 fineweb-edu prompts, workspace-band
+ *  source layers, resume-if-matching. */
+export async function startLensFit(): Promise<void> {
+  if (lensFitState.running || lensFitState.polling) return;
+  try {
+    const st = await apiLens.fit({});
+    _applyFitStatus(st);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    pushToast(`lens fit start failed — ${msg}`, { kind: "error" });
+    return;
+  }
+  void pollLensFit();
+}
+
+/** Resume-visibility check for panel mount: if a fit is already running
+ *  server-side (page reload mid-fit), pick up the polling loop. */
+export async function checkLensFit(): Promise<void> {
+  if (lensFitState.polling) return;
+  try {
+    const st = await apiLens.fitStatus();
+    _applyFitStatus(st);
+    if (st.running) void pollLensFit();
+  } catch {
+    // Older server without the fit route — the button will surface the
+    // error if clicked; the status check stays silent.
+  }
+}
+
 /** One-shot guard: the role boxes are client-sticky (they ride each send),
  *  unlike the numeric sampling defaults which mirror server config on every
  *  patch.  We seed them from the family's standard role labels exactly once,

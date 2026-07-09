@@ -332,7 +332,7 @@ recipe steering — `steered=false` is the unsteered counterfactual; `raw` marks
 a flat-buffer node (raw-ness isn't stamped server-side, the client's render
 mode supplies it). Errors: `LensNotFittedError`/`UnknownNodeError` → 404,
 `InvalidNodeOperationError`/bad `layers`/`top_k` → 400, other `SaklasError`s →
-their `user_message()` status. Lens *fitting* stays CLI-only; discovery rides
+their `user_message()` status. Discovery rides
 the session-info `jlens_fitted` field (a `lens_paths` existence check — never
 the ~GB lazy artifact load).
 
@@ -340,14 +340,33 @@ the ~GB lazy artifact load).
 the **live** workspace readout (`session.enable_live_lens` /
 `disable_live_lens` under `acquire_session_lock`, so it never races an
 in-flight stream and applies to the next generation). Enabling moves the
-selected layers' `J_l` device-resident; `layers` omitted picks five fitted
-layers over the 40–90% band (the TUI `/lens` default). Returns `{enabled,
+selected layers' `J_l` device-resident; `layers` omitted enables every
+fitted layer in the 40–90% band (the TUI `/lens` default). Returns `{enabled,
 layers}` (the resolved list). While enabled, the native WS `token` frame
 carries the per-step matrix as `lens_readout` (see ws_stream below) and
 session info reports the layer list as `live_lens_layers` (`null` while off —
 the dashboard's WORKSPACE-panel rehydration read). Errors:
 `LensNotFittedError` → 404, bad `layers` → 400, `top_k` outside `[1, 50]` →
-400.
+400. `saklas serve` auto-enables the live lens at startup when the artifact
+exists (`_run_serve`, `top_k=8`), so the dashboard opens hot; the toggle
+still disables per session.
+
+`POST /sessions/{id}/lens/fit` body `{prompts?=100, seq_len?, layers?=
+"workspace", force?=false}` — kick off the **background lens fit** (the
+dashboard's "fit j-lens" button; the former CLI-only policy). 202 + the
+initial status; one fit at a time (409 while running); `layers="sample"`
+rejected (not fittable). The job streams the default fineweb-edu corpus
+(`io.lens.stream_default_lens_corpus` — needs the optional `datasets` dep,
+else a clean typed error), runs `session.fit_jlens` (resume-by-default,
+checkpointed) in a worker thread, and auto-enables the full-band live lens
+when the artifact lands. Deliberately **polled, not SSE**: the fit is hours
+of wall clock and progress must survive page reloads. `GET
+/sessions/{id}/lens/fit` returns `{running, prompts_done, prompts_total,
+message, error, started_at, finished_at, live_layers}` (per-prompt counts
+parsed from the engine's `prompt N/M` progress lines). Error text follows
+the SSE scrubbing discipline (typed `user_message()`, else exception type
+only). Generations attempted while the fit holds the model raise through
+the ordinary busy path — surfaced client-side by the sticky WS error toast.
 
 ### traits_routes.py — live traits SSE
 

@@ -912,7 +912,12 @@ aggregate)` and landing them on `TokenEvent.lens_readout` /
 `TokenEvent.lens_aggregate` and the `_last_token_probe_payload["lens"]` /
 `["lens_aggregate"]` slots. The aggregate covers the workspace-band subset of
 the live layers (precomputed at enable as `state["agg_layers"]`). Default
-layer subset: five fitted layers over the 40–90% depth band.
+layer subset: **every** fitted layer in the 40–90% depth band (the per-step
+matvec+top-k is cheap enough that the full band beats a subsample; the
+device-resident `J_l` cost is `n_band · d_model² · 4` bytes — pass an
+explicit `layers` list to trade coverage for memory). `saklas serve`
+auto-enables the live lens at startup when the artifact exists (serve-side
+policy; library + TUI stay opt-in).
 
 ## loom.py
 

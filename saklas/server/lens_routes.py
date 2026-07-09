@@ -1,6 +1,6 @@
 """Native Jacobian-lens route group — the workspace readout surfaces.
 
-Two routes under ``/saklas/v1/sessions/{id}/lens``:
+Routes under ``/saklas/v1/sessions/{id}/lens``:
 
 - ``GET .../token-readout`` — the dashboard's token-drilldown ``j-lens`` tab
   asks for the per-layer workspace readout at a clicked token
@@ -12,10 +12,16 @@ Two routes under ``/saklas/v1/sessions/{id}/lens``:
   per-decode-step top-k rides the native WS ``token`` frame's
   ``lens_readout`` channel (see ``ws_events.build_token_event``), and the
   session-info ``live_lens_layers`` field carries the resolved layer list.
+- ``POST .../fit`` / ``GET .../fit`` — kick off / poll a background lens
+  fit (the dashboard's "fit j-lens" button).  The fit is hours of wall
+  clock (compute-bound backward passes), so it runs as ONE background
+  task with a polled status dict rather than an SSE stream — progress
+  must survive page reloads, and the engine-side fit checkpoints/resumes
+  regardless of what happens to the client.  Generations attempted while
+  a fit holds the model raise cleanly through the ordinary busy path.
 
-Lens *fitting* stays CLI-only (``saklas lens fit`` — backward passes,
-minutes of wall clock); discovery rides ``jlens_fitted`` on the session info
-payload (a path-existence check, never the ~GB lazy artifact load).
+Discovery rides ``jlens_fitted`` on the session info payload (a
+path-existence check, never the ~GB lazy artifact load).
 """
 
 # pyright: reportUnusedFunction=false
@@ -23,9 +29,12 @@ payload (a path-existence check, never the ~GB lazy artifact load).
 from __future__ import annotations
 
 import asyncio
+import logging
+import re
+import time
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from saklas.core.errors import SaklasError
 from saklas.core.jlens import LensNotFittedError
@@ -33,18 +42,40 @@ from saklas.core.loom import InvalidNodeOperationError, UnknownNodeError
 from saklas.server.app import acquire_session_lock
 from saklas.server.native_common import resolve_session_id
 
+log = logging.getLogger(__name__)
+
+#: ``fit_jacobian_lens`` per-prompt progress line — "prompt 12/100 (…)".
+_FIT_PROGRESS_RE = re.compile(r"prompt (\d+)/(\d+)")
+
 
 class LiveLensRequest(BaseModel):
     """Body for ``POST .../lens/live``.
 
-    ``layers`` is an explicit fitted-layer list; omitted, the session picks
-    five fitted layers evenly spaced over the 40–90% workspace band (the
-    same default the TUI's ``/lens`` uses).
+    ``layers`` is an explicit fitted-layer list; omitted, the session
+    enables every fitted layer in the 40–90% workspace band (the same
+    default the TUI's ``/lens`` uses).
     """
 
     enabled: bool
     layers: list[int] | None = None
     top_k: int = 5
+
+
+class LensFitRequest(BaseModel):
+    """Body for ``POST .../fit`` — all fields optional.
+
+    Defaults mirror CLI ``lens fit`` except ``layers``, which defaults to
+    the **workspace band** rather than full depth: every dashboard surface
+    (live readout, ``jlens/`` steering atoms, the drilldown matrix, the
+    aggregate) defaults to the band, and the band-restricted fit measures
+    ~1.7× faster.  Pass ``layers="all"`` for a CLI-parity full-depth fit.
+    A matching partial fit resumes by default; ``force`` restarts.
+    """
+
+    prompts: int = Field(default=100, ge=1, le=5000)
+    seq_len: int | None = Field(default=None, ge=32, le=4096)
+    layers: str = "workspace"
+    force: bool = False
 
 
 def _parse_layers(layers: str | None) -> list[int] | str | None:
@@ -65,8 +96,23 @@ def _parse_layers(layers: str | None) -> list[int] | str | None:
 
 
 def register_lens_routes(app: FastAPI) -> None:
-    """Mount the Jacobian-lens read routes."""
+    """Mount the Jacobian-lens read + fit routes."""
     session = app.state.session
+
+    # One background fit at a time; the status dict is the polled surface.
+    # Plain-dict mutation from the worker thread's ``on_progress`` is safe
+    # under the GIL (single-writer, readers only format it).
+    app.state.lens_fit = {
+        "running": False,
+        "prompts_done": 0,
+        "prompts_total": 0,
+        "message": None,
+        "error": None,
+        "started_at": None,
+        "finished_at": None,
+        "live_layers": None,
+    }
+    app.state.lens_fit_task = None
 
     @app.get("/saklas/v1/sessions/{session_id}/lens/token-readout")
     async def lens_token_readout(
@@ -181,3 +227,113 @@ def register_lens_routes(app: FastAPI) -> None:
                 status, text = e.user_message()
                 raise HTTPException(status, text) from e
         return {"enabled": True, "layers": resolved, "top_k": body.top_k}
+
+    def _fit_status_payload() -> dict[str, object]:
+        st = app.state.lens_fit
+        return {
+            "running": st["running"],
+            "prompts_done": st["prompts_done"],
+            "prompts_total": st["prompts_total"],
+            "message": st["message"],
+            "error": st["error"],
+            "started_at": st["started_at"],
+            "finished_at": st["finished_at"],
+            "live_layers": st["live_layers"],
+        }
+
+    async def _lens_fit_job(
+        body: LensFitRequest, source_layers: "list[int] | str",
+    ) -> None:
+        """The one background fit: stream corpus → fit → live-on.
+
+        Error frames follow the SSE scrubbing discipline — typed saklas
+        errors surface their ``user_message()``, anything else logs the
+        traceback server-side and reports only the exception type.
+        """
+        from saklas.io.lens import stream_default_lens_corpus
+
+        st = app.state.lens_fit
+        try:
+            st["message"] = f"streaming {body.prompts} corpus documents…"
+            docs, spec = await asyncio.to_thread(
+                stream_default_lens_corpus, body.prompts,
+            )
+
+            def on_progress(msg: str) -> None:
+                m = _FIT_PROGRESS_RE.search(msg)
+                if m is not None:
+                    st["prompts_done"] = int(m.group(1))
+                    st["prompts_total"] = int(m.group(2))
+                st["message"] = msg
+
+            st["message"] = "fitting…"
+            await asyncio.to_thread(
+                session.fit_jlens,
+                docs,
+                corpus_spec=spec,
+                source_layers=source_layers,
+                seq_len=body.seq_len,
+                force=body.force,
+                on_progress=on_progress,
+            )
+            # Live-on by default: hot the full-band readout the moment the
+            # artifact lands, same policy as serve startup.  Session lock so
+            # the enable never races a just-unblocked generation.
+            async with acquire_session_lock(session) as acquired:
+                if acquired:
+                    st["live_layers"] = await asyncio.to_thread(
+                        session.enable_live_lens, top_k=8,
+                    )
+            st["message"] = "done"
+            st["error"] = None
+        except SaklasError as e:
+            _, text = e.user_message()
+            st["error"] = text
+        except Exception as e:  # noqa: BLE001 — scrubbed, logged server-side
+            log.exception("lens fit failed")
+            st["error"] = f"lens fit failed ({type(e).__name__})"
+        finally:
+            st["running"] = False
+            st["finished_at"] = time.time()
+
+    @app.post("/saklas/v1/sessions/{session_id}/lens/fit", status_code=202)
+    async def lens_fit_start(session_id: str, body: LensFitRequest | None = None):
+        """Kick off a background Jacobian-lens fit (the "fit j-lens" button).
+
+        Returns 202 with the initial status; poll ``GET .../lens/fit``.
+        The fit holds the engine's model-exclusive lock, so generations
+        attempted while it runs fail with the ordinary busy error.  A
+        matching interrupted fit resumes from its last checkpoint.
+        """
+        resolve_session_id(session, session_id)
+        body = body or LensFitRequest()
+        source_layers = _parse_layers(body.layers) or "workspace"
+        if source_layers == "sample":
+            raise HTTPException(
+                400,
+                "layers='sample' is not fittable (debug readout only) — "
+                "use 'workspace', 'all', or an explicit csv list",
+            )
+        st = app.state.lens_fit
+        if st["running"]:
+            raise HTTPException(409, "a lens fit is already running")
+        st.update(
+            running=True,
+            prompts_done=0,
+            prompts_total=body.prompts,
+            message="starting…",
+            error=None,
+            started_at=time.time(),
+            finished_at=None,
+        )
+        # Keep a handle so the task isn't GC'd mid-fit.
+        app.state.lens_fit_task = asyncio.create_task(
+            _lens_fit_job(body, source_layers),
+        )
+        return _fit_status_payload()
+
+    @app.get("/saklas/v1/sessions/{session_id}/lens/fit")
+    async def lens_fit_status(session_id: str):
+        """Poll the background lens fit (progress / error / completion)."""
+        resolve_session_id(session, session_id)
+        return _fit_status_payload()

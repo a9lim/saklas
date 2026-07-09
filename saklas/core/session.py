@@ -2526,10 +2526,15 @@ class SaklasSession:
 
         Every decode step, the top-``top_k`` lens tokens at each selected
         layer ride ``TokenEvent.lens_readout`` (and the TUI's ``/lens``
-        panel). ``layers`` defaults to five fitted layers evenly spaced over
-        the 40–90% depth band (the paper's workspace range). The selected
-        layers' ``J_l`` move device-resident here, once — the per-step cost
-        is one d×d matvec + one vocab matvec + an on-device top-k per layer.
+        panel). ``layers`` defaults to **every** fitted layer in the 40–90%
+        depth band (the paper's workspace range) — the per-step cost is one
+        d×d matvec + one vocab matvec + an on-device top-k per layer, cheap
+        enough that the full band beats a 5-layer subsample (which
+        under-sampled the depth CoM). The selected layers' ``J_l`` move
+        device-resident here, once — a full-band residency is
+        ``n_band · d_model² · 4`` bytes (~450 MB on a 4B, ~1.5 GB on a
+        12B); pass an explicit ``layers`` subset to trade coverage for
+        memory.
 
         Attaches **no forward hooks** (the reader consumes the capture's
         existing latest-slice buffers post-forward), so steering fast-path /
@@ -2542,10 +2547,7 @@ class SaklasSession:
 
         lens = self._require_jlens()
         if layers is None:
-            band = self._jlens_workspace_band(lens)
-            count = min(5, len(band))
-            step = (len(band) - 1) / max(count - 1, 1)
-            layers = sorted({band[round(i * step)] for i in range(count)})
+            layers = sorted(self._jlens_workspace_band(lens))
         else:
             layers = sorted(set(int(l) for l in layers))
             missing = [l for l in layers if l not in lens.jacobians]

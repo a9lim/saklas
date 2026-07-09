@@ -331,3 +331,43 @@ def remove_lens(model_id: str) -> bool:
             path.unlink()
             removed = True
     return removed
+
+
+#: Default web-text corpus for a lens fit (repo, config) — the paper-parity
+#: pretraining-like sample.  Shared by CLI ``lens fit`` and the server's
+#: ``POST .../lens/fit`` route.
+DEFAULT_LENS_CORPUS = ("HuggingFaceFW/fineweb-edu", "sample-10BT")
+#: Documents are sliced to this many characters before tokenization — the fit
+#: truncates to ``seq_len`` tokens anyway, so tokenizing a full web page is
+#: waste.
+LENS_DOC_CHARS = 4000
+
+
+def stream_default_lens_corpus(n: int) -> tuple[list[str], str]:
+    """Stream ``n`` documents from the default web-text corpus.
+
+    Returns ``(documents, corpus_spec)``.  Needs the optional ``datasets``
+    dependency (``pip install 'saklas[hf]'``); raises
+    :class:`~saklas.core.jlens.JacobianLensError` without it so both the CLI
+    and the fit route surface the same actionable message.
+    """
+    from saklas.core.jlens import JacobianLensError
+
+    try:
+        from datasets import load_dataset
+    except ImportError as e:
+        raise JacobianLensError(
+            "the default lens corpus streams via the optional `datasets` "
+            "dependency — `pip install 'saklas[hf]'`, or supply a corpus "
+            "file (one document per line)"
+        ) from e
+    repo, config = DEFAULT_LENS_CORPUS
+    stream = load_dataset(repo, name=config, split="train", streaming=True)
+    docs: list[str] = []
+    for row in stream:
+        text = str(row.get("text", "")).strip()
+        if text:
+            docs.append(text[:LENS_DOC_CHARS])
+        if len(docs) >= n:
+            break
+    return docs, f"hf:{repo}/{config}"

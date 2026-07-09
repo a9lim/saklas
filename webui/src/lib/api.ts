@@ -22,6 +22,7 @@ import type {
   InstallManifoldRequest,
   JointLogprobRowJSON,
   JointLogprobsJSON,
+  LensFitStatusJSON,
   LensTokenReadoutJSON,
   LoomNodeJSON,
   LoomTreeJSON,
@@ -69,6 +70,7 @@ export type {
   InstallManifoldRequest,
   JointLogprobRowJSON,
   JointLogprobsJSON,
+  LensFitStatusJSON,
   LensTokenReadoutJSON,
   LoomNodeJSON,
   LoomTreeJSON,
@@ -808,14 +810,34 @@ export const apiLens = {
 
   /** Toggle the live workspace readout.  While enabled, each WS ``token``
    * frame carries a ``lens_readout`` matrix (per selected layer, the top-k
-   * lens tokens for that decode step).  ``layers`` omitted lets the server
-   * pick five fitted layers over the 40–90% workspace band (the TUI's
-   * ``/lens`` default).  Applies to generations started after the call. */
+   * lens tokens for that decode step).  ``layers`` omitted enables every
+   * fitted layer in the 40–90% workspace band (the TUI's ``/lens``
+   * default).  Applies to generations started after the call. */
   setLive(
     body: { enabled: boolean; layers?: number[] | null; top_k?: number },
     id: string = SESSION,
   ): Promise<{ enabled: boolean; layers: number[] | null }> {
     return request(`${SESSION_BASE(id)}/lens/live`, jsonBody(body));
+  },
+
+  /** Kick off a background Jacobian-lens fit (the "fit j-lens" button).
+   * 202 with the initial status; poll ``fitStatus``.  Defaults: 100
+   * corpus prompts, workspace-band source layers, resume-if-matching. */
+  fit(
+    body: {
+      prompts?: number;
+      seq_len?: number;
+      layers?: string;
+      force?: boolean;
+    } = {},
+    id: string = SESSION,
+  ): Promise<LensFitStatusJSON> {
+    return request(`${SESSION_BASE(id)}/lens/fit`, jsonBody(body));
+  },
+
+  /** Poll the background lens fit's progress / error / completion. */
+  fitStatus(id: string = SESSION): Promise<LensFitStatusJSON> {
+    return request(`${SESSION_BASE(id)}/lens/fit`);
   },
 };
 
