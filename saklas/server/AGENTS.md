@@ -333,6 +333,12 @@ node_ids, rows}`.
 
 ### lens_routes.py — Jacobian-lens routes
 
+`POST /sessions/{id}/lens/token/validate` body `{word}` — a read-only tokenizer
+check for the dashboard's J-lens STEER and PROBE add forms. Returns
+`{word, token_id}` only when the word round-trips as exactly one vocabulary
+token; multi-token words return 400. It never registers a direction or probe;
+the engine registration boundaries still revalidate the invariant.
+
 `GET /sessions/{id}/lens/token-readout?node_id=&raw_index=[&top_k=8][&steered=
 true][&raw=false][&layers=csv]` — the workspace readout at one decode step of a
 loom node (`session.jlens_token_readout` in `asyncio.to_thread` under

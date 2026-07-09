@@ -23,6 +23,7 @@ import type {
   JointLogprobRowJSON,
   JointLogprobsJSON,
   LensFitStatusJSON,
+  LensTokenValidationJSON,
   LensTokenReadoutJSON,
   LoomNodeJSON,
   LoomTreeJSON,
@@ -71,6 +72,7 @@ export type {
   JointLogprobRowJSON,
   JointLogprobsJSON,
   LensFitStatusJSON,
+  LensTokenValidationJSON,
   LensTokenReadoutJSON,
   LoomNodeJSON,
   LoomTreeJSON,
@@ -795,6 +797,19 @@ export const apiExperiments = {
 // ====================================================== jacobian lens ==
 
 export const apiLens = {
+  /** Check that ``word`` round-trips through the loaded model tokenizer as
+   * exactly one vocabulary token.  Read-only: steering/probe state is not
+   * changed when validation fails. */
+  validateToken(
+    word: string,
+    id: string = SESSION,
+  ): Promise<LensTokenValidationJSON> {
+    return request(
+      `${SESSION_BASE(id)}/lens/token/validate`,
+      jsonBody({ word }),
+    );
+  },
+
   /** Workspace readout at one decode step of a loom node — the per-layer
    * J-lens top-k matrix at the forward that produced the clicked token.
    * ``steered`` (default true) replays under the node's recipe steering;

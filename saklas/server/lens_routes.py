@@ -2,6 +2,8 @@
 
 Routes under ``/saklas/v1/sessions/{id}/lens``:
 
+- ``POST .../token/validate`` — read-only single-token validation for the
+  dashboard's J-lens steer/probe add forms.
 - ``GET .../token-readout`` — the dashboard's token-drilldown ``j-lens`` tab
   asks for the per-layer workspace readout at a clicked token
   (``session.jlens_token_readout`` — rebuild the node's prompt render + raw
@@ -37,7 +39,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from saklas.core.errors import SaklasError
-from saklas.core.jlens import LensNotFittedError
+from saklas.core.jlens import LensNotFittedError, resolve_word_token
 from saklas.core.loom import InvalidNodeOperationError, UnknownNodeError
 from saklas.server.app import acquire_session_lock
 from saklas.server.native_common import resolve_session_id
@@ -59,6 +61,12 @@ class LiveLensRequest(BaseModel):
     enabled: bool
     layers: list[int] | None = None
     top_k: int = 5
+
+
+class LensTokenValidationRequest(BaseModel):
+    """Body for ``POST .../lens/token/validate``."""
+
+    word: str
 
 
 class LensFitRequest(BaseModel):
@@ -113,6 +121,27 @@ def register_lens_routes(app: FastAPI) -> None:
         "live_layers": None,
     }
     app.state.lens_fit_task = None
+
+    @app.post("/saklas/v1/sessions/{session_id}/lens/token/validate")
+    def validate_lens_token(
+        session_id: str, body: LensTokenValidationRequest,
+    ):
+        """Resolve a prospective J-lens atom without changing session state.
+
+        Both dashboard add forms call this before adding their rack/probe
+        card.  Steering and probe registration still revalidate at their
+        engine boundaries, so this is an early UX check rather than a bypass
+        of the core invariant.
+        """
+        resolve_session_id(session, session_id)
+        word = body.word.strip()
+        if not word:
+            raise HTTPException(400, "word must not be empty")
+        try:
+            token_id = resolve_word_token(session.tokenizer, word)
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from e
+        return {"word": word, "token_id": token_id}
 
     @app.get("/saklas/v1/sessions/{session_id}/lens/token-readout")
     async def lens_token_readout(

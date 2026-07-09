@@ -32,6 +32,7 @@
   import JLensProbeCard from "./rack/JLensProbeCard.svelte";
   import JLensSteerCard from "./rack/JLensSteerCard.svelte";
   import JLensTokenCard from "./rack/JLensTokenCard.svelte";
+  import { ApiError, apiLens } from "../lib/api";
   import {
     addJLensToRack,
     activeProbeNames,
@@ -69,15 +70,38 @@
   });
 
   let steerInput = $state("");
+  let steerBusy = $state(false);
 
-  function onAddSteer(ev: SubmitEvent): void {
+  function describeError(e: unknown): string {
+    if (e instanceof ApiError) {
+      return e.body && typeof e.body === "object" && "detail" in e.body
+        ? String((e.body as { detail: unknown }).detail)
+        : e.message;
+    }
+    return e instanceof Error ? e.message : String(e);
+  }
+
+  function bareWord(value: string): string {
+    return value.trim().replace(/^jlens\//, "");
+  }
+
+  async function onAddSteer(ev: SubmitEvent): Promise<void> {
     ev.preventDefault();
-    const word = steerInput.trim();
-    if (!word) return;
-    // Single-token validation happens engine-side at the next generation
-    // (MultiTokenWordError → stream error toast) — no dry-run endpoint.
-    addJLensToRack(word);
-    steerInput = "";
+    const submitted = steerInput;
+    const word = bareWord(submitted);
+    if (!word || steerBusy) return;
+    steerBusy = true;
+    try {
+      const validated = await apiLens.validateToken(word);
+      addJLensToRack(validated.word);
+      if (steerInput === submitted) steerInput = "";
+    } catch (e) {
+      pushToast(`steer jlens/${word} failed — ${describeError(e)}`, {
+        kind: "error",
+      });
+    } finally {
+      steerBusy = false;
+    }
   }
 
   // ---------- PROBE: pinned probe cards + unpinned aggregate cards ----------
@@ -168,27 +192,34 @@
   let probeInput = $state("");
   let probeBusy = $state(false);
 
-  async function pinWord(word: string): Promise<void> {
-    const bare = word.trim().replace(/^jlens\//, "");
-    if (!bare || probeBusy) return;
+  async function pinWord(word: string): Promise<boolean> {
+    const bare = bareWord(word);
+    if (!bare || probeBusy) return false;
     const selector = `jlens/${bare}`;
-    if (probeRack.active.includes(selector)) return;
+    if (probeRack.active.includes(selector)) return true;
     probeBusy = true;
     try {
-      await attachProbe(selector);
-      pushToast(`pinned ${selector}`, { kind: "info" });
+      const validated = await apiLens.validateToken(bare);
+      const validatedSelector = `jlens/${validated.word}`;
+      await attachProbe(validatedSelector);
+      pushToast(`pinned ${validatedSelector}`, { kind: "info" });
+      return true;
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      pushToast(`pin ${selector} failed — ${msg}`, { kind: "error" });
+      pushToast(`pin ${selector} failed — ${describeError(e)}`, {
+        kind: "error",
+      });
+      return false;
     } finally {
       probeBusy = false;
     }
   }
 
-  function onAddProbe(ev: SubmitEvent): void {
+  async function onAddProbe(ev: SubmitEvent): Promise<void> {
     ev.preventDefault();
-    void pinWord(probeInput);
-    probeInput = "";
+    const submitted = probeInput;
+    if (await pinWord(submitted)) {
+      if (probeInput === submitted) probeInput = "";
+    }
   }
 
   function onToggleLive(): void {
@@ -279,7 +310,11 @@
           bind:value={steerInput}
           aria-label="Add a J-lens steering token"
         />
-        <button type="submit" class="add-btn" disabled={!steerInput.trim()}>
+        <button
+          type="submit"
+          class="add-btn"
+          disabled={steerBusy || !steerInput.trim()}
+        >
           + steer
         </button>
       </form>

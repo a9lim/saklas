@@ -764,9 +764,8 @@ function mutateJLens(
 
 /** Add a J-lens token steering chip (``α jlens/<word>``).  Accepts a bare
  *  word or a full ``jlens/…`` atom; the rack key is the full atom.
- *  Single-token validation is deferred to the engine (a multi-token word
- *  raises ``MultiTokenWordError`` at generation, surfaced as the stream's
- *  error toast) — there is no dry-run tokenize endpoint. */
+ *  Dashboard callers validate through ``apiLens.validateToken`` before this
+ *  local mutation; the engine revalidates when it resolves the atom. */
 export function addJLensToRack(word: string): void {
   const bare = word.trim().replace(/^jlens\//, "");
   if (!bare) return;

@@ -109,6 +109,13 @@ export interface SessionInfo {
 
 // -------------------------------------------------- jacobian lens --
 
+/** ``POST /sessions/{id}/lens/token/validate`` — a read-only check that a
+ *  J-lens word resolves to exactly one vocabulary token. */
+export interface LensTokenValidationJSON {
+  word: string;
+  token_id: number;
+}
+
 /** One vocabulary entry of a per-layer J-lens readout row. */
 export interface LensReadoutTokenJSON {
   token: string;

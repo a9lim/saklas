@@ -50,6 +50,10 @@ The dashboard speaks the native `/saklas/v1/*` API (`saklas/server/saklas_api.py
   supplies raw-ness). Backs `TokenDrilldownDrawer`'s **j-lens** tab via
   `apiLens.tokenReadout`; gated on the session-info `jlens_fitted` flag
   (unfitted → the tab shows the `saklas lens fit` hint).
+- **POST `/sessions/{id}/lens/token/validate`** — read-only `{word}` →
+  `{word, token_id}` single-token check. Both J-LENS add forms call it before
+  mutating the steering rack or attaching a probe; a rejected word remains in
+  the input and is surfaced as an error toast.
 - **POST `/sessions/{id}/lens/live`** — toggle the *live* workspace readout
   (`{enabled, layers?, top_k?}` → `{enabled, layers}`; layers omitted picks
   the 40–90% band default; the dashboard passes `top_k: 8` — the aggregate

@@ -936,6 +936,64 @@ class TestSessionLockBackpressure:
 # ---------------------------------------------------------------------------
 
 
+class TestLensTokenValidation:
+    """Read-only single-token check used by both J-lens menu add forms."""
+
+    def test_single_token_returns_vocab_id_without_applying(
+        self, session_and_client: Any,
+    ) -> None:
+        session, client = session_and_client
+        session.tokenizer.encode.return_value = [42]
+        session.tokenizer.decode.side_effect = None
+        session.tokenizer.decode.return_value = " magic"
+
+        resp = client.post(
+            "/saklas/v1/sessions/default/lens/token/validate",
+            json={"word": "  magic  "},
+        )
+
+        assert resp.status_code == 200
+        assert resp.json() == {"word": "magic", "token_id": 42}
+        session.add_probe.assert_not_called()
+        session.register_jlens_direction.assert_not_called()
+
+    def test_multi_token_word_is_rejected_without_applying(
+        self, session_and_client: Any,
+    ) -> None:
+        session, client = session_and_client
+        session.tokenizer.encode.return_value = [3, 4]
+        session.tokenizer.decode.side_effect = lambda ids: {
+            3: "anti", 4: "disestablishment",
+        }[ids[0]]
+
+        resp = client.post(
+            "/saklas/v1/sessions/default/lens/token/validate",
+            json={"word": "antidisestablishment"},
+        )
+
+        assert resp.status_code == 400
+        assert "not a single token" in resp.json()["detail"]
+        session.add_probe.assert_not_called()
+        session.register_jlens_direction.assert_not_called()
+
+    def test_empty_word_is_rejected(self, session_and_client: Any) -> None:
+        _, client = session_and_client
+        resp = client.post(
+            "/saklas/v1/sessions/default/lens/token/validate",
+            json={"word": "   "},
+        )
+        assert resp.status_code == 400
+        assert resp.json()["detail"] == "word must not be empty"
+
+    def test_wrong_session_is_rejected(self, session_and_client: Any) -> None:
+        _, client = session_and_client
+        resp = client.post(
+            "/saklas/v1/sessions/elsewhere/lens/token/validate",
+            json={"word": "magic"},
+        )
+        assert resp.status_code == 404
+
+
 class TestLensTokenReadout:
     """Route contract for ``GET /saklas/v1/sessions/{id}/lens/token-readout``."""
 
