@@ -19,7 +19,6 @@
   // ``s`` / ``m`` are the narrowed entry views the template renders behind
   // ``{#if s}`` / ``{#if m}`` so svelte-check enforces mode-correct access.
 
-  import type { Trigger } from "../../lib/types";
   import type { SteerEntry, SubspaceSteerEntry, ManifoldSteerEntry } from "../../lib/types";
   import {
     setSubspaceCoords,
@@ -40,6 +39,7 @@
   import Select from "../../lib/Select.svelte";
   import XYPad from "../manifold/XYPad.svelte";
   import RackCard from "./RackCard.svelte";
+  import { TRIGGER_LABEL, TRIGGER_WORD, nextTrigger } from "./triggers";
 
   interface Props {
     name: string;
@@ -74,39 +74,10 @@
   const fitted = $derived(info?.fitted_for_session === true);
   const stale = $derived(info?.stale === true);
 
-  // ---------- trigger cycle (shared) ----------
-
-  const TRIGGER_ORDER: Trigger[] = [
-    "BOTH",
-    "BEFORE",
-    "AFTER",
-    "THINKING",
-    "RESPONSE",
-    "PROMPT",
-    "GENERATED",
-  ];
-  const TRIGGER_WORD: Record<Trigger, string> = {
-    BOTH: "both",
-    BEFORE: "before",
-    AFTER: "after",
-    THINKING: "thinking",
-    RESPONSE: "response",
-    PROMPT: "prompt",
-    GENERATED: "generated",
-  };
-  const TRIGGER_LABEL: Record<Trigger, string> = {
-    BOTH: "both: steer the whole turn (default)",
-    BEFORE: "before: steer thinking and response",
-    AFTER: "after: steer the after-thinking response only",
-    THINKING: "thinking: steer the chain-of-thought only",
-    RESPONSE: "response: steer the generated response only",
-    PROMPT: "prompt (alias of before)",
-    GENERATED: "generated (alias of response)",
-  };
+  // ---------- trigger cycle (shared vocabulary in ./triggers) ----------
 
   function cycleTrigger(): void {
-    const idx = TRIGGER_ORDER.indexOf(entry.trigger);
-    const next = TRIGGER_ORDER[(idx + 1) % TRIGGER_ORDER.length];
+    const next = nextTrigger(entry.trigger);
     if (entry.mode === "subspace") setSubspaceTrigger(name, next);
     else setManifoldTrigger(name, next);
   }

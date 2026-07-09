@@ -1,38 +1,37 @@
 <script lang="ts">
   // J-LENS — the inspector column's Jacobian-lens tab: the open- and
-  // closed-vocabulary views of the workspace readout, parallel to the
-  // linear-probe tab's STEER/PROBE racks.
+  // closed-vocabulary views of the workspace readout, card-based and
+  // symmetric with the linear-probe tab (every row wears RackCard; the
+  // j-lens family accent is blue, marker ■/□).
   //
-  //   STEER    — token chips compiling to ``α jlens/<word>`` terms in the
-  //              ONE steering expression (the engine folds the lens
-  //              direction over the workspace band with whitened shares,
-  //              exactly like a concept vector).  Per-chip α (lens atoms
-  //              run hotter than concept vectors; default 0.3).
-  //   PROBES   — pinned token chips: ``jlens/<word>`` attached through the
-  //              ordinary probe pipeline (rank-1 whitened coordinate,
-  //              sparkline-backed in the store; the chip surfaces the live
-  //              axis-0 value + the depth center of mass).
-  //   WORKSPACE— the open-vocab live readout: the layer-aggregated chip
-  //              list (strength = mean band probability, com =
-  //              salience-weighted depth center of mass) as the primary
-  //              surface, the per-layer matrix behind a disclosure.
-  //              Clicking a readout chip pins it as a probe.
+  //   STEER    — one card per ``α jlens/<word>`` token atom in the ONE
+  //              steering expression (the engine folds the lens direction
+  //              over the workspace band with whitened shares, exactly
+  //              like a concept vector).  Per-card α slider + trigger
+  //              pill (lens atoms run hotter than concept vectors;
+  //              default 0.3).
+  //   PROBES   — one card per pinned ``jlens/<word>`` token probe
+  //              (ordinary probe-rack entries): signed whitened-
+  //              coordinate bar, sparkline, depth CoM, per-layer strip.
+  //   WORKSPACE— the open-vocab live readout: one card per aggregate
+  //              token (strength = mean band probability as an absolute
+  //              0→1 bar, com = salience-weighted depth center of mass),
+  //              each with a per-layer salience strip distilled from the
+  //              same streamed matrix.  The full per-layer ranking lives
+  //              in the transcript token drilldown's j-lens tab.
   //
   // Renders a fit hint when no Jacobian lens is fitted for the model
   // (``session_info.jlens_fitted``); every section needs the artifact.
 
-  import Disclosure from "../lib/Disclosure.svelte";
-  import Slider from "../lib/Slider.svelte";
+  import JLensProbeCard from "./rack/JLensProbeCard.svelte";
+  import JLensSteerCard from "./rack/JLensSteerCard.svelte";
+  import JLensTokenCard from "./rack/JLensTokenCard.svelte";
   import {
     addJLensToRack,
     attachProbe,
-    detachProbe,
     lensState,
     probeRack,
-    removeJLensFromRack,
     sessionState,
-    setJLensAlpha,
-    setJLensEnabled,
     setLiveLens,
     steerRack,
   } from "../lib/stores.svelte";
@@ -43,7 +42,7 @@
   const liveOn = $derived(lensState.layers !== null);
 
   // ---------- STEER: jlens-mode rack entries (alphabetical) ----------
-  const steerChips = $derived.by(() => {
+  const steerCards = $derived.by(() => {
     const arr = [...steerRack.entries.entries()].filter(
       (kv): kv is [string, JLensSteerEntry] => kv[1].mode === "jlens",
     );
@@ -64,7 +63,7 @@
   }
 
   // ---------- PROBES: pinned jlens/ probe-rack entries ----------
-  const pinnedChips = $derived.by(() => {
+  const pinnedCards = $derived.by(() => {
     const names = probeRack.active.filter((n) => n.startsWith("jlens/"));
     names.sort((a, b) => a.localeCompare(b));
     return names.map((n) => ({ name: n, entry: probeRack.entries.get(n) }));
@@ -96,81 +95,30 @@
     probeInput = "";
   }
 
-  async function onUnpin(name: string): Promise<void> {
-    try {
-      await detachProbe(name);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      pushToast(`detach ${name} failed — ${msg}`, { kind: "error" });
-    }
-  }
+  // ---------- WORKSPACE: aggregate token cards, strength-ranked ----------
 
-  /** Live axis-0 whitened coordinate + depth-CoM for a pinned chip —
-   *  settled aggregate preferred, live reading during generation. */
-  function chipStats(entry: (typeof pinnedChips)[number]["entry"]): {
-    value: number | null;
-    com: number | null;
-  } {
-    if (!entry) return { value: null, com: null };
-    const reading = entry.aggregate ?? entry.reading;
-    const value = entry.current ?? null;
-    const com = reading?.depth_com?.[0] ?? null;
-    return { value, com };
-  }
-
-  // ---------- WORKSPACE: aggregate chips + matrix disclosure ----------
-
-  interface AggChip {
+  interface AggRow {
+    /** Raw vocabulary token text (untrimmed — the strip matches on it). */
     token: string;
     strength: number;
     com: number;
     spread: number;
-    /** Within-list brightness — strength over the list max. */
-    weight: number;
+    pinned: boolean;
   }
 
-  const aggChips = $derived.by((): AggChip[] => {
+  const aggRows = $derived.by((): AggRow[] => {
     const rows = lensState.aggregate;
     if (!rows || rows.length === 0) return [];
-    const top = Math.max(...rows.map(([, s]) => s)) || 1;
-    return rows.map(([token, strength, com, spread]) => ({
-      token: token.trim() || JSON.stringify(token),
-      strength,
-      com,
-      spread,
-      weight: strength / top,
-    }));
+    return rows
+      .map(([token, strength, com, spread]) => ({
+        token,
+        strength,
+        com,
+        spread,
+        pinned: probeRack.active.includes(`jlens/${token.trim()}`),
+      }))
+      .sort((a, b) => b.strength - a.strength);
   });
-
-  interface LensRow {
-    layer: number;
-    tokens: { text: string; weight: number }[];
-  }
-
-  const matrixRows = $derived.by((): LensRow[] => {
-    const layers = lensState.layers;
-    if (!layers) return [];
-    const readout = lensState.readout;
-    return layers.map((layer) => {
-      const pairs = readout?.[String(layer)] ?? [];
-      if (pairs.length === 0) return { layer, tokens: [] };
-      // Raw lens logits are uncalibrated across layers — normalise within
-      // the row (top token full brightness) so each row reads as its own
-      // ranked distribution.
-      const max = Math.max(...pairs.map(([, s]) => s));
-      const exps = pairs.map(([, s]) => Math.exp(s - max));
-      const top = Math.max(...exps) || 1;
-      return {
-        layer,
-        tokens: pairs.map(([text], i) => ({
-          text: text.trim() || JSON.stringify(text),
-          weight: exps[i] / top,
-        })),
-      };
-    });
-  });
-
-  let matrixOpen = $state(false);
 
   function onToggleLive(): void {
     void setLiveLens(!liveOn);
@@ -189,48 +137,25 @@
       </p>
     </section>
   {:else}
-    <!-- STEER — token chips in the shared steering expression. -->
+    <!-- STEER — token-atom cards in the shared steering expression. -->
     <section class="section">
       <header class="header">
         <div class="header-text">
           <span class="title">STEER</span>
           <span class="subtitle">token atoms</span>
         </div>
-        <span class="count">{steerChips.length} term{steerChips.length === 1 ? "" : "s"}</span>
+        <span class="count">{steerCards.length} term{steerCards.length === 1 ? "" : "s"}</span>
       </header>
 
-      {#each steerChips as [name, entry] (name)}
-        <div class="chip-row" class:disabled={!entry.enabled}>
-          <button
-            type="button"
-            class="chip steer-chip"
-            class:off={!entry.enabled}
-            title={entry.enabled
-              ? `${name} — click to disable`
-              : `${name} — click to enable`}
-            onclick={() => setJLensEnabled(name, !entry.enabled)}
-          >{name.slice("jlens/".length)}</button>
-          <div class="chip-slider">
-            <Slider
-              value={entry.alpha}
-              min={0}
-              max={1}
-              step={0.05}
-              ariaLabel="alpha for {name}"
-              title="α — push coefficient (lens atoms run hot; ≈0.3 is the sweet spot)"
-              oninput={(v) => Number.isFinite(v) && setJLensAlpha(name, v)}
-            />
-          </div>
-          <span class="chip-value">{entry.alpha.toFixed(2)}</span>
-          <button
-            type="button"
-            class="icon remove"
-            aria-label="Remove steering term {name}"
-            title="Remove term"
-            onclick={() => removeJLensFromRack(name)}
-          >✕</button>
+      {#if steerCards.length > 0}
+        <div class="cards" role="list">
+          {#each steerCards as [name, entry] (name)}
+            <div role="listitem">
+              <JLensSteerCard {name} {entry} />
+            </div>
+          {/each}
         </div>
-      {/each}
+      {/if}
 
       <form class="add-form" onsubmit={onAddSteer}>
         <input
@@ -246,51 +171,27 @@
       </form>
     </section>
 
-    <!-- PROBES — pinned closed-vocab token probes. -->
+    <!-- PROBES — pinned closed-vocab token-probe cards. -->
     <section class="section">
       <header class="header">
         <div class="header-text">
           <span class="title">PROBES</span>
           <span class="subtitle">pinned tokens</span>
         </div>
-        <span class="count">{pinnedChips.length} pinned</span>
+        <span class="count">{pinnedCards.length} pinned</span>
       </header>
 
-      {#each pinnedChips as { name, entry } (name)}
-        {@const stats = chipStats(entry)}
-        <div class="chip-row">
-          <span
-            class="chip probe-chip"
-            title="{name} — whitened coordinate along the lens direction"
-          >{name.slice("jlens/".length)}</span>
-          <span class="chip-stats">
-            {#if stats.value !== null}
-              <span
-                class="stat"
-                class:pos={stats.value > 0}
-                class:neg={stats.value < 0}
-                title="live whitened coordinate (axis 0)"
-              >{stats.value >= 0 ? "+" : ""}{stats.value.toFixed(2)}</span>
+      {#if pinnedCards.length > 0}
+        <div class="cards" role="list">
+          {#each pinnedCards as { name, entry } (name)}
+            {#if entry}
+              <div role="listitem">
+                <JLensProbeCard {name} {entry} />
+              </div>
             {/if}
-            {#if stats.com !== null}
-              <span
-                class="stat com"
-                title="depth center of mass of the per-layer read (0 = first block, 1 = last)"
-              >com {stats.com.toFixed(2)}</span>
-            {/if}
-            {#if stats.value === null && stats.com === null}
-              <span class="stat empty">—</span>
-            {/if}
-          </span>
-          <button
-            type="button"
-            class="icon remove"
-            aria-label="Unpin probe {name}"
-            title="Unpin probe"
-            onclick={() => onUnpin(name)}
-          >✕</button>
+          {/each}
         </div>
-      {/each}
+      {/if}
 
       <form class="add-form" onsubmit={onAddProbe}>
         <input
@@ -310,8 +211,8 @@
       </form>
     </section>
 
-    <!-- WORKSPACE — the open-vocab aggregate readout (+ matrix disclosure). -->
-    <section class="section workspace">
+    <!-- WORKSPACE — the open-vocab aggregate readout as token cards. -->
+    <section class="section">
       <header class="header">
         <div class="header-text">
           <span class="title">WORKSPACE</span>
@@ -332,45 +233,30 @@
       </header>
 
       {#if liveOn}
-        {#if aggChips.length > 0}
-          <div class="agg-chips" aria-label="Aggregate lens tokens">
-            {#each aggChips as chip, i (i)}
-              <button
-                type="button"
-                class="chip agg-chip"
-                style="opacity: {0.4 + 0.6 * chip.weight}"
-                title={`"${chip.token}" — strength ${chip.strength.toFixed(3)} · com ${chip.com.toFixed(2)} ±${chip.spread.toFixed(2)} · click to pin as probe`}
-                onclick={() => void pinWord(chip.token)}
-              >
-                <span class="agg-token">{chip.token}</span>
-                <span class="agg-com">@{chip.com.toFixed(2)}</span>
-              </button>
-            {/each}
-          </div>
-        {:else}
-          <p class="hint">streams on the next generation</p>
-        {/if}
-
-        <Disclosure bind:expanded={matrixOpen} summary="per-layer matrix" flush>
-          <div class="rows" role="list">
-            {#each matrixRows as row (row.layer)}
-              <div class="row" role="listitem">
-                <span class="layer">L{row.layer}</span>
-                {#if row.tokens.length === 0}
-                  <span class="empty">—</span>
-                {:else}
-                  <span class="tokens">
-                    {#each row.tokens as tok, i (i)}
-                      <span class="tok" style="opacity: {0.35 + 0.65 * tok.weight}"
-                        >{tok.text}</span
-                      >
-                    {/each}
-                  </span>
-                {/if}
+        {#if aggRows.length > 0}
+          <div class="cards" role="list" aria-label="Aggregate lens tokens">
+            {#each aggRows as row (row.token)}
+              <div role="listitem">
+                <JLensTokenCard
+                  token={row.token}
+                  strength={row.strength}
+                  com={row.com}
+                  spread={row.spread}
+                  layers={lensState.layers ?? []}
+                  readout={lensState.readout}
+                  pinned={row.pinned}
+                  busy={probeBusy}
+                  onpin={pinWord}
+                />
               </div>
             {/each}
           </div>
-        </Disclosure>
+          <p class="hint drill-hint">
+            click a transcript token for its full per-layer matrix
+          </p>
+        {:else}
+          <p class="hint">streams on the next generation</p>
+        {/if}
       {/if}
     </section>
   {/if}
@@ -396,10 +282,14 @@
     border-bottom: 0;
   }
 
+  /* Rack-style section header — underlined, matching ProbeRack /
+     SteeringRack so the two tabs read as siblings. */
   .header {
     display: flex;
     align-items: baseline;
     justify-content: space-between;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: var(--space-3);
   }
   .header-text {
     display: flex;
@@ -429,91 +319,16 @@
     font-size: var(--text-xs);
     color: var(--fg);
   }
-
-  /* ----- chips ----- */
-  .chip {
-    font-family: var(--font-mono);
-    font-size: var(--text-sm);
-    color: var(--accent);
-    background: transparent;
-    border: 1px solid var(--border);
-    border-radius: 999px;
-    padding: 1px var(--space-3);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  button.chip {
-    cursor: pointer;
-  }
-  button.chip:hover {
-    border-color: var(--accent);
-  }
-  .steer-chip.off {
-    color: var(--fg-muted);
-    border-style: dashed;
-  }
-  .probe-chip {
-    color: var(--fg-strong);
+  .drill-hint {
+    font-size: var(--text-xs);
+    color: var(--fg-dim);
   }
 
-  .chip-row {
+  /* Card stack — same rhythm as the probe rack's strips. */
+  .cards {
     display: flex;
-    align-items: center;
-    gap: var(--space-3);
-    min-width: 0;
-  }
-  .chip-row.disabled {
-    opacity: 0.7;
-  }
-  .chip-slider {
-    flex: 1 1 auto;
-    min-width: 40px;
-  }
-  .chip-value {
-    color: var(--fg-muted);
-    font-size: var(--text-sm);
-    font-variant-numeric: tabular-nums;
-    flex: 0 0 auto;
-  }
-  .chip-stats {
-    display: flex;
-    gap: var(--space-3);
-    margin-left: auto;
-    flex: 0 0 auto;
-  }
-  .stat {
-    color: var(--fg-muted);
-    font-size: var(--text-sm);
-    font-variant-numeric: tabular-nums;
-  }
-  .stat.pos {
-    color: var(--accent-green);
-  }
-  .stat.neg {
-    color: var(--accent-red);
-  }
-  .stat.com {
-    color: var(--fg-muted);
-  }
-  .stat.empty {
-    font-style: italic;
-  }
-
-  .icon {
-    background: transparent;
-    border: 0;
-    color: var(--fg-muted);
-    font-size: var(--text);
-    line-height: 1;
-    padding: var(--space-1) var(--space-2);
-    border-radius: var(--radius);
-    flex: 0 0 auto;
-    cursor: pointer;
-  }
-  .icon:hover {
-    color: var(--accent-red);
-    background: var(--bg-elev);
+    flex-direction: column;
+    gap: var(--space-2);
   }
 
   /* ----- add forms ----- */
@@ -555,7 +370,7 @@
     cursor: default;
   }
 
-  /* ----- workspace ----- */
+  /* ----- workspace live toggle ----- */
   .toggle {
     font-size: var(--text-sm);
     color: var(--fg-muted);
@@ -576,60 +391,5 @@
   .toggle:disabled {
     opacity: 0.5;
     cursor: default;
-  }
-
-  .agg-chips {
-    display: flex;
-    flex-wrap: wrap;
-    gap: var(--space-2);
-  }
-  .agg-chip {
-    display: inline-flex;
-    align-items: baseline;
-    gap: var(--space-1);
-  }
-  .agg-token {
-    color: var(--accent);
-  }
-  .agg-com {
-    color: var(--fg-muted);
-    font-size: var(--text-2xs);
-    font-variant-numeric: tabular-nums;
-  }
-
-  .rows {
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-2);
-    max-height: 160px;
-    overflow-y: auto;
-  }
-  .row {
-    display: flex;
-    align-items: baseline;
-    gap: var(--space-3);
-    min-width: 0;
-  }
-  .layer {
-    flex: 0 0 34px;
-    color: var(--fg-muted);
-    font-size: var(--text-xs);
-    font-family: var(--font-mono);
-  }
-  .tokens {
-    display: flex;
-    gap: var(--space-3);
-    min-width: 0;
-    overflow: hidden;
-    white-space: nowrap;
-  }
-  .tok {
-    color: var(--accent);
-    font-size: var(--text-sm);
-    font-family: var(--font-mono);
-  }
-  .empty {
-    color: var(--fg-muted);
-    font-size: var(--text-sm);
   }
 </style>

@@ -4,9 +4,9 @@
   //
   //   PROBES — the linear-probe surface: steering rack (subspace +
   //            manifold terms) over the probe rack.
-  //   J-LENS — the Jacobian-lens surface: token steer chips, pinned token
-  //            probes, and the layer-aggregated workspace readout (the
-  //            per-layer matrix behind a disclosure).
+  //   J-LENS — the Jacobian-lens surface: token steer cards, pinned token
+  //            probes, and the layer-aggregated workspace readout as
+  //            per-token cards (blue family accent, RackCard chrome).
   //
   // The split is presentational — each tab shows its own term/probe
   // family; a j-lens steer chip and a subspace card serialize into the

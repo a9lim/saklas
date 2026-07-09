@@ -2504,8 +2504,13 @@ class SaklasSession:
         directions = lens.token_direction(
             token_id, get_unembedding(self._model), layers=sorted(band),
         )
+        # ``token_direction`` returns CPU tensors; land the profile on the
+        # session device so the probe fold (which follows the directions'
+        # device) builds device-consistent whitened factors — CPU factors
+        # crash the per-probe read paths (``_subspace_coords_for``) against
+        # on-device activations.
         self._profiles[name] = {
-            l: d for l, d in directions.items() if l in band
+            l: d.to(self._device) for l, d in directions.items() if l in band
         }
         self._invalidate_prefix_cache()
         self._invalidate_analytics_cache()

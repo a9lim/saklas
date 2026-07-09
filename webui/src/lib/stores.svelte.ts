@@ -645,6 +645,12 @@ export function setJLensEnabled(name: string, enabled: boolean): void {
   });
 }
 
+export function setJLensTrigger(name: string, trigger: Trigger): void {
+  enqueueOrApply(`jlens trigger ${name} ${trigger}`, () => {
+    mutateJLens(name, (e) => ({ ...e, trigger }));
+  });
+}
+
 export function setManifoldBlend(name: string, blend: number): void {
   enqueueOrApply(`manifold blend ${name} ${blend.toFixed(3)}`, () => {
     mutateManifold(name, (e) => ({ ...e, blend }));
@@ -2504,6 +2510,15 @@ function handleWsMessage(msg: WSServerMessage): void {
         loomTree.pendingNodeId = null;
         if (loomTree.rev > 0) syncChatLogFromTree();
       }
+      // The system turn appended above is rebuilt away whenever
+      // ``syncChatLogFromTree`` runs (the tree knows nothing of it), so a
+      // server-owned log rendered generation errors as a silent empty
+      // node.  A sticky toast survives every tree sync — errors must
+      // never be silent.
+      pushToast(`generation error: ${msg.message}`, {
+        kind: "error",
+        ttlMs: null,
+      });
       abState.processingAb = false;
       abState.pendingTurnIdx = null;
       // Drain the next pending action even on error so the UI doesn't
