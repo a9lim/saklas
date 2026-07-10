@@ -2341,15 +2341,24 @@ class SaklasSession:
         layers: "Sequence[int]",
         *,
         top_k: int,
+        probabilities: torch.Tensor | None = None,
     ) -> list[tuple[str, float, float, float]]:
         """Layer-aggregate per-layer lens logits into the decoded chip list
         ``[(token, strength, com, spread), ...]`` (see
         :func:`saklas.core.jlens.aggregate_readout` for the statistics)."""
-        from saklas.core.jlens import aggregate_readout
-
-        rows = aggregate_readout(
-            logits.float(), self._jlens_depths(layers), top_k=top_k,
+        from saklas.core.jlens import (
+            aggregate_readout,
+            aggregate_readout_from_probabilities,
         )
+
+        if probabilities is None:
+            rows = aggregate_readout(
+                logits.float(), self._jlens_depths(layers), top_k=top_k,
+            )
+        else:
+            rows = aggregate_readout_from_probabilities(
+                probabilities, self._jlens_depths(layers), top_k=top_k,
+            )
         return [
             (self._jlens_decode_id(token_id), strength, com, spread)
             for token_id, strength, com, spread in rows
@@ -2856,20 +2865,29 @@ class SaklasSession:
             transported = torch.bmm(J, H.unsqueeze(-1)).squeeze(-1)
             normed = state["norm"](transported)
             logits = normed.to(unembed.dtype) @ unembed.T
-        # Pinned lens probes ride the same logits — per-step readout-channel
-        # readings for the payload merge (zero extra matvecs).
+        from saklas.core.jlens import readout_probabilities
+
+        probabilities = (
+            stash.get("probabilities")
+            if stash is not None and logits is stash.get("logits")
+            else None
+        )
+        if probabilities is None:
+            # One full-vocabulary normalization serves pinned probes,
+            # per-layer cards, and the aggregate.
+            probabilities = readout_probabilities(logits)
+        # Pinned lens probes ride the same calibrated matrix — per-step
+        # readout-channel readings for the payload merge.
         if getattr(self, "_lens_probes", None):
             self._last_lens_step_readings = self._score_lens_probes(
-                {}, logits=logits, layers=list(layers_present),
+                {}, probabilities=probabilities, layers=list(layers_present),
             )
         else:
             self._last_lens_step_readings = None
         # Display scores are per-layer softmax probabilities — the one
         # strength unit every lens surface reports (softmax is monotone, so
         # the top-k selection is unchanged from the raw-logit ranking).
-        vals, idxs = logits.float().softmax(dim=-1).topk(
-            state["top_k"], dim=-1,
-        )
+        vals, idxs = probabilities.topk(state["top_k"], dim=-1)
         # one batched host transfer for the per-layer block
         all_vals = vals.cpu()
         all_idxs = idxs.cpu()
@@ -2887,6 +2905,7 @@ class SaklasSession:
             logits[agg_sel],
             [layers_present[row] for row in agg_sel],
             top_k=state["top_k"],
+            probabilities=probabilities[agg_sel],
         )
         return out, agg
 
@@ -4782,6 +4801,7 @@ class SaklasSession:
         hidden: dict[int, torch.Tensor],
         *,
         logits: torch.Tensor | None = None,
+        probabilities: torch.Tensor | None = None,
         layers: "Sequence[int] | None" = None,
     ) -> dict[str, "ProbeReading"]:
         """Score every attached lens probe from hidden slices (or reuse
@@ -4795,7 +4815,10 @@ class SaklasSession:
         ``assignment`` empty, ``membership`` 1.0).  Empty when no probe
         layer is available.
         """
-        from saklas.core.jlens import token_readout_stats
+        from saklas.core.jlens import (
+            token_readout_stats,
+            token_readout_stats_from_probabilities,
+        )
 
         if not self._lens_probes:
             return {}
@@ -4803,7 +4826,9 @@ class SaklasSession:
         if lens is None:
             return {}
         band = self._lens_probe_layers()
-        if logits is None:
+        if logits is not None and probabilities is not None:
+            raise ValueError("pass lens logits or probabilities, not both")
+        if logits is None and probabilities is None:
             layers = sorted(l for l in band if l in hidden)
             if not layers:
                 return {}
@@ -4818,14 +4843,22 @@ class SaklasSession:
             if not keep:
                 return {}
             if len(keep) != len(layers):
-                logits = logits[keep]
+                if logits is not None:
+                    logits = logits[keep]
+                if probabilities is not None:
+                    probabilities = probabilities[keep]
             layers = [layers[i] for i in keep]
         names = list(self._lens_probes)
-        stats = token_readout_stats(
-            logits.float(),
-            self._jlens_depths(layers),
-            [self._lens_probes[n]["token_id"] for n in names],
-        )
+        token_ids = [self._lens_probes[n]["token_id"] for n in names]
+        if probabilities is None:
+            assert logits is not None
+            stats = token_readout_stats(
+                logits.float(), self._jlens_depths(layers), token_ids,
+            )
+        else:
+            stats = token_readout_stats_from_probabilities(
+                probabilities, self._jlens_depths(layers), token_ids,
+            )
         out: dict[str, ProbeReading] = {}
         for name, (strength, com, spread, per_layer) in zip(names, stats):
             out[name] = ProbeReading(
@@ -4863,13 +4896,21 @@ class SaklasSession:
         layers = sorted(l for l in band if l in latest)
         if not layers:
             return {}
+        from saklas.core.jlens import readout_probabilities
+
         logits = self._jlens_logits_rows(
             lens, [(l, latest[l]) for l in layers],
         )
+        probabilities = readout_probabilities(logits)
         self._lens_step_stash = {
-            "layers": tuple(layers), "logits": logits, "fresh": True,
+            "layers": tuple(layers),
+            "logits": logits,
+            "probabilities": probabilities,
+            "fresh": True,
         }
-        readings = self._score_lens_probes({}, logits=logits, layers=layers)
+        readings = self._score_lens_probes(
+            {}, probabilities=probabilities, layers=layers,
+        )
         return Monitor.flat_scalars(readings)
 
     def _score_lens_probes_aggregate(

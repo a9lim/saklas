@@ -19,8 +19,10 @@ from saklas.core.jlens import (
     JacobianLensError,
     MultiTokenWordError,
     aggregate_readout,
+    aggregate_readout_from_probabilities,
     fit_jacobian_lens,
     lens_logits,
+    readout_probabilities,
     resolve_word_token,
     topk_logprobs,
 )
@@ -572,6 +574,16 @@ def test_aggregate_readout_strength_is_mean_probability() -> None:
     # sorted by descending strength
     strengths = [s for _, s, _, _ in rows]
     assert strengths == sorted(strengths, reverse=True)
+
+
+def test_aggregate_readout_reuses_calibrated_probabilities_exactly() -> None:
+    logits = torch.randn(5, _VOCAB)
+    depths = [0.41, 0.52, 0.63, 0.74, 0.85]
+    expected = aggregate_readout(logits, depths, top_k=4)
+    got = aggregate_readout_from_probabilities(
+        readout_probabilities(logits), depths, top_k=4,
+    )
+    assert got == expected
 
 
 def test_aggregate_readout_com_tracks_where_a_token_leads() -> None:

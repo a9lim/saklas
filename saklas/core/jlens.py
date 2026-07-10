@@ -369,6 +369,66 @@ def topk_logprobs(logits: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Ten
     return vals, idxs
 
 
+def readout_probabilities(logits: torch.Tensor) -> torch.Tensor:
+    """Calibrate per-layer lens logits into the shared probability unit.
+
+    Kept as one explicit primitive so a live decode step can normalize its
+    full ``[layers, vocab]`` matrix once, then share the result between pinned
+    probes, per-layer cards, and the aggregate readout.
+    """
+    return logits.float().softmax(dim=-1)
+
+
+def aggregate_readout_from_probabilities(
+    probabilities: torch.Tensor,
+    depths: "Sequence[float]",
+    *,
+    top_k: int = 8,
+) -> list[tuple[int, float, float, float]]:
+    """Aggregate already-calibrated ``[layers, vocab]`` probabilities.
+
+    Strength must be computed over the whole vocabulary before selection, but
+    depth CoM/spread are needed only for the selected tokens.  Gathering those
+    columns first preserves the exact statistic while avoiding full-vocabulary
+    depth tensors.
+    """
+    if probabilities.ndim != 2 or probabilities.shape[0] == 0:
+        raise ValueError(
+            "aggregate_readout_from_probabilities expects [layers, vocab] "
+            f"probabilities, got shape {tuple(probabilities.shape)}"
+        )
+    if len(depths) != probabilities.shape[0]:
+        raise ValueError(
+            "aggregate_readout_from_probabilities: "
+            f"{probabilities.shape[0]} probability rows but {len(depths)} depths"
+        )
+    strength = probabilities.mean(dim=0)                       # [V]
+    k = min(int(top_k), int(strength.shape[-1]))
+    vals, idxs = strength.topk(k)
+    p = probabilities.index_select(-1, idxs)                   # [L, K]
+    d = torch.tensor(
+        [float(x) for x in depths],
+        dtype=torch.float32,
+        device=probabilities.device,
+    ).unsqueeze(-1)                                             # [L, 1]
+    mass = p.sum(dim=0).clamp_min(1e-12)                        # [K]
+    com = (p * d).sum(dim=0) / mass                             # [K]
+    var = (p * (d - com.unsqueeze(0)) ** 2).sum(dim=0) / mass
+    spread = var.clamp_min(0.0).sqrt()
+    # one batched host transfer for the whole readout
+    stats = torch.stack([vals, com, spread]).cpu()
+    idx_cpu = idxs.cpu()
+    return [
+        (
+            int(idx_cpu[j]),
+            float(stats[0, j]),
+            float(stats[1, j]),
+            float(stats[2, j]),
+        )
+        for j in range(k)
+    ]
+
+
 def aggregate_readout(
     logits: torch.Tensor,
     depths: "Sequence[float]",
@@ -416,29 +476,60 @@ def aggregate_readout(
             f"aggregate_readout: {logits.shape[0]} logit rows but "
             f"{len(depths)} depths"
         )
-    probs = logits.float().softmax(dim=-1)                      # [L, V]
-    strength = probs.mean(dim=0)                                # [V]
-    d = torch.tensor(
-        [float(x) for x in depths], dtype=torch.float32, device=probs.device,
-    ).unsqueeze(-1)                                             # [L, 1]
-    mass = probs.sum(dim=0).clamp_min(1e-12)                    # [V]
-    com = (probs * d).sum(dim=0) / mass                         # [V]
-    var = (probs * (d - com.unsqueeze(0)) ** 2).sum(dim=0) / mass
-    spread = var.clamp_min(0.0).sqrt()
-    k = min(int(top_k), int(strength.shape[-1]))
-    vals, idxs = strength.topk(k)
-    # one batched host transfer for the whole readout
-    stats = torch.stack([vals, com[idxs], spread[idxs]]).cpu()
-    idx_cpu = idxs.cpu()
-    return [
-        (
-            int(idx_cpu[j]),
-            float(stats[0, j]),
-            float(stats[1, j]),
-            float(stats[2, j]),
+    return aggregate_readout_from_probabilities(
+        readout_probabilities(logits), depths, top_k=top_k,
+    )
+
+
+def token_readout_stats_from_probabilities(
+    probabilities: torch.Tensor,
+    depths: "Sequence[float]",
+    token_ids: "Sequence[int]",
+) -> list[tuple[float, float, float, list[float]]]:
+    """Per-token statistics from already-calibrated readout probabilities."""
+    if probabilities.ndim != 2 or probabilities.shape[0] == 0:
+        raise ValueError(
+            "token_readout_stats_from_probabilities expects [layers, vocab] "
+            f"probabilities, got shape {tuple(probabilities.shape)}"
         )
-        for j in range(k)
-    ]
+    if len(depths) != probabilities.shape[0]:
+        raise ValueError(
+            "token_readout_stats_from_probabilities: "
+            f"{probabilities.shape[0]} probability rows but {len(depths)} depths"
+        )
+    if not token_ids:
+        return []
+    ids = torch.tensor(
+        [int(v) for v in token_ids],
+        dtype=torch.long,
+        device=probabilities.device,
+    )
+    p = probabilities.index_select(-1, ids)                    # [L, K]
+    strength = p.mean(dim=0)                                    # [K]
+    d = torch.tensor(
+        [float(x) for x in depths],
+        dtype=torch.float32,
+        device=probabilities.device,
+    ).unsqueeze(-1)                                             # [L, 1]
+    mass = p.sum(dim=0).clamp_min(1e-12)                        # [K]
+    com = (p * d).sum(dim=0) / mass                             # [K]
+    var = (p * (d - com.unsqueeze(0)) ** 2).sum(dim=0) / mass
+    spread = var.clamp_min(0.0).sqrt()
+    # one batched host transfer: 3 aggregate rows + the per-layer block
+    host = torch.cat(
+        [torch.stack([strength, com, spread]), p], dim=0,
+    ).cpu()                                                     # [3+L, K]
+    n_layers = int(probabilities.shape[0])
+    out: list[tuple[float, float, float, list[float]]] = []
+    for j in range(len(token_ids)):
+        per_layer = [float(host[3 + l, j]) for l in range(n_layers)]
+        out.append(
+            (
+                float(host[0, j]), float(host[1, j]), float(host[2, j]),
+                per_layer,
+            )
+        )
+    return out
 
 
 def token_readout_stats(
@@ -479,34 +570,9 @@ def token_readout_stats(
         )
     if not token_ids:
         return []
-    probs = logits.float().softmax(dim=-1)                      # [L, V]
-    ids = torch.tensor(
-        [int(v) for v in token_ids], dtype=torch.long, device=probs.device,
+    return token_readout_stats_from_probabilities(
+        readout_probabilities(logits), depths, token_ids,
     )
-    p = probs.index_select(-1, ids)                             # [L, K]
-    strength = p.mean(dim=0)                                    # [K]
-    d = torch.tensor(
-        [float(x) for x in depths], dtype=torch.float32, device=probs.device,
-    ).unsqueeze(-1)                                             # [L, 1]
-    mass = p.sum(dim=0).clamp_min(1e-12)                        # [K]
-    com = (p * d).sum(dim=0) / mass                             # [K]
-    var = (p * (d - com.unsqueeze(0)) ** 2).sum(dim=0) / mass
-    spread = var.clamp_min(0.0).sqrt()
-    # one batched host transfer: 3 aggregate rows + the per-layer block
-    host = torch.cat(
-        [torch.stack([strength, com, spread]), p], dim=0,
-    ).cpu()                                                     # [3+L, K]
-    n_layers = int(logits.shape[0])
-    out: list[tuple[float, float, float, list[float]]] = []
-    for j in range(len(token_ids)):
-        per_layer = [float(host[3 + l, j]) for l in range(n_layers)]
-        out.append(
-            (
-                float(host[0, j]), float(host[1, j]), float(host[2, j]),
-                per_layer,
-            )
-        )
-    return out
 
 
 class JSpaceDecomposition:

@@ -322,7 +322,10 @@ Three read surfaces, one write surface:
   statistic (a former within-layer salience weighting handed a diffuse noise
   layer's relative-top token a full vote; in band the two agree to ≲0.01).
   Top-k selection runs on
-  the aggregated full-vocab strengths. The aggregate is restricted to the
+  the aggregated full-vocab strengths; depth CoM/spread are then computed only
+  for the selected tokens. A live step calibrates the full layer-vocabulary
+  logits once and shares that probability matrix across pinned probes,
+  per-layer cards, and this aggregate. The aggregate is restricted to the
   **workspace-band subset** of the requested layers (falling back to all when
   none are in band — same band policy as steering); the per-layer matrix always
   covers the full request. `session.enable_live_lens()` streams the top-k per

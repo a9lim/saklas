@@ -688,6 +688,9 @@ class _FakeCapture:
     def per_layer_buckets(self) -> dict[int, list[torch.Tensor]]:
         return self._buckets
 
+    def latest_per_layer(self) -> dict[int, torch.Tensor]:
+        return {layer: rows[-1] for layer, rows in self._buckets.items()}
+
 
 def test_enable_live_lens_defaults_and_disable() -> None:
     s = _StubSession()
@@ -774,6 +777,35 @@ def test_live_lens_readout_step_reads_latest_slices() -> None:
         assert 0.0 <= strength <= 1.0
         assert 0.0 <= com <= 1.0
         assert spread >= 0.0
+
+
+def test_live_lens_step_normalizes_once_across_all_consumers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import saklas.core.jlens as jlens_module
+
+    s = _StubSession()
+    s.fit_jlens(_PROMPTS)
+    s.enable_live_lens(layers=[1], top_k=3)
+    s._add_lens_probe("jlens/g", as_name=None)
+    s._capture = _FakeCapture({1: torch.randn(6)})
+    calls = 0
+    original = jlens_module.readout_probabilities
+
+    def counting_probabilities(logits: torch.Tensor) -> torch.Tensor:
+        nonlocal calls
+        calls += 1
+        return original(logits)
+
+    monkeypatch.setattr(
+        jlens_module, "readout_probabilities", counting_probabilities,
+    )
+
+    # A gated pinned probe calibrates before the token tap and stashes the
+    # matrix. Cards, pinned readings, and aggregate must all reuse it.
+    assert s._score_lens_gate_scalars()
+    assert SaklasSession._live_lens_readout_step(s) is not None  # type: ignore[arg-type]
+    assert calls == 1
 
 
 def test_live_lens_readout_step_none_when_off() -> None:

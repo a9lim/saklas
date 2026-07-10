@@ -86,8 +86,12 @@ sharp, and what changes over depth is *which* token leads, so a token's
 probability profile over depth is its depth signal (a diffuse noise layer's
 vote is discounted by its own lack of mass; the former within-layer salience
 gave it a full vote). Top-k by aggregated full-vocab strength (a per-layer top-k union would
-miss a mid-pack-everywhere token); returns `[(vocab_id, strength, com,
-spread)]`, one batched host transfer. `token_readout_stats(logits, depths,
+miss a mid-pack-everywhere token); CoM/spread are evaluated only for those
+selected columns, then returned as `[(vocab_id, strength, com, spread)]` in one
+batched host transfer. `readout_probabilities` is the shared calibration
+primitive; `_live_lens_readout_step` computes it once per logits matrix and
+passes the result to pinned probes, per-layer cards, and the aggregate through
+the `*_from_probabilities` helpers. `token_readout_stats(logits, depths,
 token_ids)` is the **single-token restriction** of the same calibration — read
 at pinned vocabulary ids instead of top-k selection, returning per id
 `(strength, com, spread, per_layer[p_l])` where `strength = mean_l p_l(v)`
@@ -978,12 +982,14 @@ card's `strength`) — `coords_per_layer[l] = (p_l,)`, probability-mass-weighted
 per-layer top-k display wire carries per-layer softmax probabilities too
 (`_live_lens_readout_step` softmaxes before top-k; monotone, so the
 ranking is unchanged), so every lens surface reads one unit. Three read sites,
-one math: per-step display readings ride the live-lens step's own logits
+one math: per-step display readings ride the live-lens step's one calibrated
+probability matrix
 (`_last_lens_step_readings`, merged into every populated payload channel via
 `TokenProbePayload.merge_readings`); gate scalars come from
 `_score_lens_gate_scalars` in the gating score callback (once per forward,
 `Monitor.flat_scalars` over the synthesized readings, and the computed logits
-are stashed in `_lens_step_stash` for the display step to reuse — the gate
+plus probabilities are stashed in `_lens_step_stash` for the display step to
+reuse — the gate
 callback runs before the token tap); the finalize aggregate
 (`_score_lens_probes_aggregate`, called from `generation_finalizer`) pools
 the last content token from the capture tail ring like `_score_aggregate_only`.
