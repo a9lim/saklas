@@ -33,15 +33,16 @@ import torch
 from safetensors import safe_open
 
 from saklas.core.jlens import JacobianLens
-from saklas.io.atomic import write_json_atomic
+from saklas.io.atomic import artifact_lock, write_json_atomic
 from saklas.io.paths import model_dir
 
 log = logging.getLogger(__name__)
 
-LENS_FORMAT_VERSION = 2
+LENS_FORMAT_VERSION = 3
 _LENS_NAME = "jlens"
 _LENS_CHECKPOINT_NAME = "jlens.partial"
 _LENS_METHOD = "jlens_cotangent_sum"
+LENS_CORPUS_PREPROCESS_VERSION = 1
 
 
 def lens_paths(model_id: str) -> tuple[Path, Path]:
@@ -59,6 +60,20 @@ def lens_checkpoint_paths(model_id: str) -> tuple[Path, Path]:
     )
 
 
+def lens_estimator_policy(*, skip_first: int | None = None) -> dict[str, Any]:
+    """Fit semantics that must match before any final/checkpoint reuse."""
+    from saklas.core.jlens import SKIP_FIRST_POSITIONS
+
+    return {
+        "method": _LENS_METHOD,
+        "skip_first_positions": (
+            SKIP_FIRST_POSITIONS if skip_first is None else int(skip_first)
+        ),
+        "corpus_preprocess_version": LENS_CORPUS_PREPROCESS_VERSION,
+        "doc_chars": LENS_DOC_CHARS,
+    }
+
+
 def _load_sidecar_at(
     model_id: str, ts_path: Path, sc_path: Path, *, label: str,
 ) -> dict[str, Any] | None:
@@ -73,6 +88,12 @@ def _load_sidecar_at(
                 "%s for %s has format_version %r (need %d); ignoring "
                 "— re-fit with `saklas lens fit`",
                 label, model_id, version, LENS_FORMAT_VERSION,
+            )
+            return None
+        if sidecar.get("estimator_policy") != lens_estimator_policy():
+            log.warning(
+                "%s for %s uses a different estimator/preprocessing policy; "
+                "ignoring — re-fit with `saklas lens fit`", label, model_id,
             )
             return None
         d_model = int(sidecar.get("d_model", 0) or 0)
@@ -92,6 +113,16 @@ def _load_sidecar_at(
         sidecar = dict(sidecar)
         sidecar["source_layers"] = sorted(int(layer) for layer in source_layers_raw)
         sidecar["d_model"] = d_model
+        expected_keys = [f"layer_{layer}" for layer in sidecar["source_layers"]]
+        with safe_open(str(ts_path), framework="pt", device="cpu") as tensors:
+            if sorted(tensors.keys()) != sorted(expected_keys):
+                raise ValueError("tensor layer keys do not match sidecar")
+            for key in expected_keys:
+                view = tensors.get_slice(key)
+                if tuple(view.get_shape()) != (d_model, d_model):
+                    raise ValueError(f"{key} shape does not match sidecar")
+                if view.get_dtype() != "F16":
+                    raise ValueError(f"{key} is not float16")
         return sidecar
     except Exception as exc:
         log.warning("Corrupt %s sidecar for %s; ignoring: %s", label, model_id, exc)
@@ -101,7 +132,8 @@ def _load_sidecar_at(
 def load_lens_sidecar(model_id: str) -> dict[str, Any] | None:
     """Load validated lens metadata without loading the tensor artifact."""
     ts_path, sc_path = lens_paths(model_id)
-    return _load_sidecar_at(model_id, ts_path, sc_path, label="jlens cache")
+    with artifact_lock(ts_path):
+        return _load_sidecar_at(model_id, ts_path, sc_path, label="jlens cache")
 
 
 def save_lens(
@@ -217,29 +249,30 @@ def save_lens_checkpoint_accumulator(
     """
     ts_path, sc_path = lens_checkpoint_paths(model_id)
     total_prompts = int(n_prompts) + (base.n_prompts if base is not None else 0)
-    _save_lens_components(
-        sums, total_prompts, d_model, ts_path, sc_path,
-        corpus_spec=corpus_spec,
-        corpus_sha256=corpus_sha256,
-        seq_len=seq_len,
-        dim_batch=dim_batch,
-        skip_first=skip_first,
-        corpus_hash_kind=corpus_hash_kind,
-        durable=False,
-        raw_corpus_sha256=raw_corpus_sha256,
-        raw_prompt_count=raw_prompt_count,
-        usable_prompt_count=usable_prompt_count,
-        model_layer_count=model_layer_count,
-        model_fingerprint=model_fingerprint,
-        model_source_fingerprint=model_source_fingerprint,
-        raw_sum_count=int(n_prompts),
-        average_base=base,
-        extra_sidecar={
-            "checkpoint": True,
-            "base_n_prompts": 0,
-            "partial_n_prompts": total_prompts,
-        },
-    )
+    with artifact_lock(ts_path):
+        _save_lens_components(
+            sums, total_prompts, d_model, ts_path, sc_path,
+            corpus_spec=corpus_spec,
+            corpus_sha256=corpus_sha256,
+            seq_len=seq_len,
+            dim_batch=dim_batch,
+            skip_first=skip_first,
+            corpus_hash_kind=corpus_hash_kind,
+            durable=False,
+            raw_corpus_sha256=raw_corpus_sha256,
+            raw_prompt_count=raw_prompt_count,
+            usable_prompt_count=usable_prompt_count,
+            model_layer_count=model_layer_count,
+            model_fingerprint=model_fingerprint,
+            model_source_fingerprint=model_source_fingerprint,
+            raw_sum_count=int(n_prompts),
+            average_base=base,
+            extra_sidecar={
+                "checkpoint": True,
+                "base_n_prompts": 0,
+                "partial_n_prompts": total_prompts,
+            },
+        )
     return ts_path
 
 
@@ -263,23 +296,24 @@ def _save_lens_at(
     model_source_fingerprint: str | None = None,
     extra_sidecar: dict[str, Any] | None = None,
 ) -> None:
-    _save_lens_components(
-        lens.jacobians, lens.n_prompts, lens.d_model, ts_path, sc_path,
-        corpus_spec=corpus_spec,
-        corpus_sha256=corpus_sha256,
-        seq_len=seq_len,
-        dim_batch=dim_batch,
-        skip_first=skip_first,
-        corpus_hash_kind=corpus_hash_kind,
-        durable=durable,
-        raw_corpus_sha256=raw_corpus_sha256,
-        raw_prompt_count=raw_prompt_count,
-        usable_prompt_count=usable_prompt_count,
-        model_layer_count=model_layer_count,
-        model_fingerprint=model_fingerprint,
-        model_source_fingerprint=model_source_fingerprint,
-        extra_sidecar=extra_sidecar,
-    )
+    with artifact_lock(ts_path):
+        _save_lens_components(
+            lens.jacobians, lens.n_prompts, lens.d_model, ts_path, sc_path,
+            corpus_spec=corpus_spec,
+            corpus_sha256=corpus_sha256,
+            seq_len=seq_len,
+            dim_batch=dim_batch,
+            skip_first=skip_first,
+            corpus_hash_kind=corpus_hash_kind,
+            durable=durable,
+            raw_corpus_sha256=raw_corpus_sha256,
+            raw_prompt_count=raw_prompt_count,
+            usable_prompt_count=usable_prompt_count,
+            model_layer_count=model_layer_count,
+            model_fingerprint=model_fingerprint,
+            model_source_fingerprint=model_source_fingerprint,
+            extra_sidecar=extra_sidecar,
+        )
 
 
 def _save_lens_components(
@@ -339,6 +373,7 @@ def _save_lens_components(
         "seq_len": seq_len,
         "dim_batch": dim_batch,
         "skip_first_positions": skip_first,
+        "estimator_policy": lens_estimator_policy(skip_first=skip_first),
         "tensor_sha256": tensor_sha256,
     }
     if raw_corpus_sha256 is not None:
@@ -444,15 +479,25 @@ def load_lens(model_id: str) -> tuple[JacobianLens, dict[str, Any]] | None:
     crashing the session.
     """
     ts_path, sc_path = lens_paths(model_id)
-    sidecar = load_lens_sidecar(model_id)
-    return _load_lens_at(model_id, ts_path, sc_path, sidecar, label="jlens cache")
+    with artifact_lock(ts_path):
+        sidecar = _load_sidecar_at(
+            model_id, ts_path, sc_path, label="jlens cache",
+        )
+        return _load_lens_at(
+            model_id, ts_path, sc_path, sidecar, label="jlens cache",
+        )
 
 
 def load_lens_checkpoint(model_id: str) -> tuple[JacobianLens, dict[str, Any]] | None:
     """Load a resumable partial lens shard, or ``None`` when absent/unusable."""
     ts_path, sc_path = lens_checkpoint_paths(model_id)
-    sidecar = _load_sidecar_at(model_id, ts_path, sc_path, label="jlens checkpoint")
-    return _load_lens_at(model_id, ts_path, sc_path, sidecar, label="jlens checkpoint")
+    with artifact_lock(ts_path):
+        sidecar = _load_sidecar_at(
+            model_id, ts_path, sc_path, label="jlens checkpoint",
+        )
+        return _load_lens_at(
+            model_id, ts_path, sc_path, sidecar, label="jlens checkpoint",
+        )
 
 
 def _load_lens_at(
@@ -536,21 +581,25 @@ def _load_lens_at(
 
 def remove_lens_checkpoint(model_id: str) -> bool:
     """Delete a resumable checkpoint shard. Returns True when anything was removed."""
-    removed = False
-    for path in lens_checkpoint_paths(model_id):
-        if path.exists():
-            path.unlink()
-            removed = True
-    return removed
+    ts_path, sc_path = lens_checkpoint_paths(model_id)
+    with artifact_lock(ts_path):
+        removed = False
+        for path in (ts_path, sc_path):
+            if path.exists():
+                path.unlink()
+                removed = True
+        return removed
 
 
 def remove_lens(model_id: str) -> bool:
     """Delete a model's lens artifact. Returns True when anything was removed."""
     removed = False
-    for path in (*lens_paths(model_id), *lens_checkpoint_paths(model_id)):
-        if path.exists():
-            path.unlink()
-            removed = True
+    for ts_path, sc_path in (lens_paths(model_id), lens_checkpoint_paths(model_id)):
+        with artifact_lock(ts_path):
+            for path in (ts_path, sc_path):
+                if path.exists():
+                    path.unlink()
+                    removed = True
     return removed
 
 
@@ -581,7 +630,11 @@ def resolved_default_lens_corpus_spec() -> tuple[str, str]:
         raise JacobianLensError(
             f"Hugging Face returned no immutable dataset revision for {repo}"
         )
-    return str(revision), f"hf:{repo}/{config}@{revision}"
+    return (
+        str(revision),
+        f"hf:{repo}/{config}@{revision};preprocess="
+        f"{LENS_CORPUS_PREPROCESS_VERSION};doc_chars={LENS_DOC_CHARS}",
+    )
 
 
 def stream_default_lens_corpus(n: int) -> tuple[list[str], str]:

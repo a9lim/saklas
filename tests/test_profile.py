@@ -82,12 +82,14 @@ def test_save_load_roundtrip(tmp_path: Path):
     assert loaded.metadata["format_version"] == PACK_FORMAT_VERSION
 
 
-def test_merged_intersection_semantics():
+def test_merged_union_semantics():
     a = Profile({0: torch.ones(4), 1: torch.ones(4), 2: torch.ones(4)})
     b = Profile({1: torch.ones(4) * 2, 2: torch.ones(4) * 2, 3: torch.ones(4) * 2})
     merged = Profile.merged([(a, 1.0), (b, 0.5)])
-    # intersection = {1, 2}
-    assert merged.layers == [1, 2]
+    # Live expression parity: missing terms contribute zero on union layers.
+    assert merged.layers == [0, 1, 2, 3]
+    assert torch.allclose(merged[0], torch.ones(4))
+    assert torch.allclose(merged[3], torch.ones(4))
     # 1*1 + 0.5*2 = 2
     assert torch.allclose(merged[1], torch.full((4,), 2.0))
     assert torch.allclose(merged[2], torch.full((4,), 2.0))

@@ -332,6 +332,12 @@ def test_write_metadata_populates_files(tmp_path: Path):
     mf = ManifoldFolder.load(folder)
     assert mf.files == {}
     mf.write_metadata()
+    # Metadata-only rewrites preserve trusted entries; fitted writers name
+    # their exact successful outputs explicitly.
+    assert mf.files == {}
+    mf.update_file_hashes(
+        folder / "stub-model.safetensors", folder / "stub-model.json",
+    )
     assert "stub-model.safetensors" in mf.files
     assert "stub-model.json" in mf.files
     assert not any(k.startswith("nodes/") for k in mf.files)
@@ -364,6 +370,62 @@ def test_update_file_hashes_only_reads_new_artifact(
 
     assert hashed == [new_tensor, new_sidecar]
     assert ManifoldFolder.load(folder).files == mf.files
+
+
+def test_update_file_hashes_merges_latest_manifest_from_stale_instances(
+    tmp_path: Path,
+) -> None:
+    """Concurrent fit snapshots cannot drop each other's fitted pair."""
+    folder = _author_manifold(tmp_path)
+    first = ManifoldFolder.load(folder)
+    second = ManifoldFolder.load(folder)
+    paths: list[Path] = []
+    sidecar_payload = {
+        "method": "manifold_pca", "saklas_version": "0",
+        "domain": {"type": "box", "axes": [
+            {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0},
+        ]},
+        "node_count": 4, "node_labels": [],
+    }
+    for stem in ("model-a", "model-b"):
+        tensor = folder / f"{stem}.safetensors"
+        sidecar = folder / f"{stem}.json"
+        tensor.write_bytes(stem.encode())
+        sidecar.write_text(json.dumps(sidecar_payload))
+        paths.extend((tensor, sidecar))
+
+    first.update_file_hashes(*paths[:2])
+    second.update_file_hashes(*paths[2:])
+
+    files = ManifoldFolder.load(folder).files
+    assert set(paths_item.name for paths_item in paths) <= set(files)
+
+
+def test_update_file_hashes_does_not_launder_unrelated_untracked_pair(
+    tmp_path: Path,
+) -> None:
+    folder = _author_manifold(tmp_path)
+    sidecar_payload = {
+        "method": "manifold_pca", "saklas_version": "0",
+        "domain": {"type": "box", "axes": [
+            {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0},
+        ]},
+        "node_count": 4, "node_labels": [],
+    }
+    stale_tensor = folder / "stale.safetensors"
+    stale_sidecar = folder / "stale.json"
+    stale_tensor.write_bytes(b"untrusted")
+    stale_sidecar.write_text(json.dumps(sidecar_payload))
+    good_tensor = folder / "good.safetensors"
+    good_sidecar = folder / "good.json"
+    good_tensor.write_bytes(b"new")
+    good_sidecar.write_text(json.dumps(sidecar_payload))
+
+    mf = ManifoldFolder.load(folder, verify_manifest=False)
+    mf.update_file_hashes(good_tensor, good_sidecar)
+
+    files = ManifoldFolder.load(folder, verify_manifest=False).files
+    assert set(files) == {"good.safetensors", "good.json"}
 
 
 def test_manifold_sidecar_load(tmp_path: Path):
@@ -615,6 +677,36 @@ def test_iter_manifold_folders(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     assert found == {("local", "one"), ("shared", "two")}
     only_local = {(ns, mf.name) for ns, mf in iter_manifold_folders("local")}
     assert only_local == {("local", "one")}
+
+
+def test_iter_manifold_folders_is_metadata_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from saklas.io import manifold_folder as manifold_folder_module
+
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    domain = {"type": "box", "axes": [
+        {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]}
+    folder, _ = create_manifold_folder(
+        "local", "one", "", domain, _author_nodes(["a", "b", "c"]),
+    )
+    _add_dummy_tensor(folder)
+    ManifoldFolder.load(folder, verify_manifest=False).update_file_hashes(
+        folder / "stub-model.safetensors",
+    )
+
+    def _must_not_verify(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("ordinary manifold discovery verified payload hashes")
+
+    monkeypatch.setattr(
+        manifold_folder_module, "verify_integrity", _must_not_verify,
+    )
+    assert [(ns, mf.name) for ns, mf in iter_manifold_folders()] == [
+        ("local", "one"),
+    ]
+    assert manifold_summary(folder)["name"] == "one"
+    with pytest.raises(AssertionError, match="verified payload hashes"):
+        ManifoldFolder.load(folder)
 
 
 # ============================================================ discover mode ===
@@ -1075,8 +1167,9 @@ def _fake_fit_tensor(folder: Path, model_id: str, *, release: str | None = None)
             {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]},
         "node_count": 3, "node_labels": [],
     }))
-    # Refresh the integrity manifest so a later load doesn't reject.
-    ManifoldFolder.load(folder).write_metadata()
+    # Trust only this successful pair; metadata rewrites never scan-and-bless
+    # unrelated fitted files.
+    ManifoldFolder.load(folder, verify_manifest=False).update_file_hashes(ts, sc)
     return ts
 
 
@@ -1095,7 +1188,9 @@ def test_clear_manifold_tensors_removes_tensors_keeps_corpus(
     sidecar = json.loads(sidecar_path.read_text())
     sidecar["capture_sha256"] = capture_sha
     sidecar_path.write_text(json.dumps(sidecar))
-    ManifoldFolder.load(folder, verify_manifest=False).write_metadata()
+    ManifoldFolder.load(folder, verify_manifest=False).update_file_hashes(
+        fitted, sidecar_path,
+    )
     from saklas.io.paths import model_dir
 
     capture_dir = model_dir("google/gemma-3-4b-it") / "manifold_capture"
@@ -1113,6 +1208,77 @@ def test_clear_manifold_tensors_removes_tensors_keeps_corpus(
     assert mf.node_labels == ["a", "b", "c"]
     # The integrity manifest no longer references the removed files.
     assert not any(k.endswith(".safetensors") for k in mf.files)
+
+
+def test_clear_manifold_tensors_repairs_orphan_sidecar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    domain = {"type": "box", "axes": [
+        {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]}
+    folder, _ = create_manifold_folder(
+        "local", "mood", "", domain, _author_nodes(["a", "b", "c"]),
+    )
+    fitted = _fake_fit_tensor(folder, "google/gemma-3-4b-it")
+    fitted.unlink()
+
+    assert clear_manifold_tensors("local", "mood") == 1
+    assert not fitted.with_suffix(".json").exists()
+    loaded = ManifoldFolder.load(folder)
+    assert not any("gemma-3-4b-it" in name for name in loaded.files)
+
+
+def test_clear_manifold_tensors_repairs_orphan_tensor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    domain = {"type": "box", "axes": [
+        {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]}
+    folder, _ = create_manifold_folder(
+        "local", "mood", "", domain, _author_nodes(["a", "b", "c"]),
+    )
+    fitted = _fake_fit_tensor(folder, "google/gemma-3-4b-it")
+    fitted.with_suffix(".json").unlink()
+
+    assert clear_manifold_tensors("local", "mood") == 1
+    assert not fitted.exists()
+    ManifoldFolder.load(folder)
+
+
+def test_clear_manifold_tensors_repairs_corrupt_fitted_pair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    domain = {"type": "box", "axes": [
+        {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]}
+    folder, _ = create_manifold_folder(
+        "local", "mood", "", domain, _author_nodes(["a", "b", "c"]),
+    )
+    fitted = _fake_fit_tensor(folder, "google/gemma-3-4b-it")
+    fitted.write_bytes(b"same path, different fitted bytes")
+
+    with pytest.raises(ManifoldFormatError, match="integrity"):
+        ManifoldFolder.load(folder)
+    assert clear_manifold_tensors("local", "mood") == 2
+    ManifoldFolder.load(folder)
+
+
+def test_scoped_clear_never_launders_unselected_corruption(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    domain = {"type": "box", "axes": [
+        {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]}
+    folder, _ = create_manifold_folder(
+        "local", "mood", "", domain, _author_nodes(["a", "b", "c"]),
+    )
+    corrupt = _fake_fit_tensor(folder, "model/a")
+    _fake_fit_tensor(folder, "model/b")
+    corrupt.write_bytes(b"tampered but not selected")
+
+    assert clear_manifold_tensors("local", "mood", "model/b") == 2
+    with pytest.raises(ManifoldFormatError, match="integrity"):
+        ManifoldFolder.load(folder)
 
 
 def test_clear_manifold_tensors_variant_filter(
@@ -1330,7 +1496,8 @@ def _fit_real_manifold(folder: Path, model_id: str, *, dim: int = 6, seed: int =
     """
     import torch
     from saklas.core.manifold import (
-        BoxAxis, BoxDomain, Manifold, fit_layer_subspace, save_manifold,
+        MANIFOLD_FIT_POLICY_VERSION, BoxAxis, BoxDomain, Manifold,
+        fit_layer_subspace, save_manifold,
     )
 
     g = torch.Generator().manual_seed(seed)
@@ -1355,7 +1522,13 @@ def _fit_real_manifold(folder: Path, model_id: str, *, dim: int = 6, seed: int =
     )
     from saklas.io.paths import tensor_filename
     out = folder / tensor_filename(model_id)
-    save_manifold(man, out, {"method": "manifold_pca", "nodes_sha256": "src"})
+    mf = ManifoldFolder.load(folder, verify_manifest=False)
+    save_manifold(man, out, {
+        "method": "manifold_pca", "nodes_sha256": mf.nodes_sha256(),
+        "model_fingerprint": f"fp:{model_id}",
+        "fit_policy_version": MANIFOLD_FIT_POLICY_VERSION,
+    })
+    mf.update_file_hashes(out, out.with_suffix(".json"))
     return out
 
 
@@ -1384,6 +1557,8 @@ def test_transfer_manifold_identity_alignment_preserves_geometry(
     out = transfer_manifold(
         folder, from_model=src_model, to_model=tgt_model,
         alignment=align, transfer_quality_estimate=0.9,
+        source_model_fingerprint=f"fp:{src_model}",
+        target_model_fingerprint=f"fp:{tgt_model}",
         whitener=_target_whitener(),
     )
     # Filename uses the transfer variant suffix.
@@ -1443,6 +1618,8 @@ def test_transfer_manifold_rebakes_share_in_target_space(
     out = transfer_manifold(
         folder, from_model=src_model, to_model=tgt_model,
         alignment=align, whitener=w,
+        source_model_fingerprint=f"fp:{src_model}",
+        target_model_fingerprint=f"fp:{tgt_model}",
     )
     tgt_man = load_manifold(out)
 
@@ -1484,6 +1661,8 @@ def test_transfer_manifold_rotation_maps_subspace(
 
     out = transfer_manifold(
         folder, from_model=src_model, to_model=tgt_model, alignment=align,
+        source_model_fingerprint=f"fp:{src_model}",
+        target_model_fingerprint=f"fp:{tgt_model}",
         whitener=_target_whitener(),
     )
     tgt_man = load_manifold(out)
@@ -1513,6 +1692,8 @@ def test_transfer_manifold_drops_uncovered_layers(
     align = {5: torch.eye(6)}
     out = transfer_manifold(
         folder, from_model=src_model, to_model=tgt_model, alignment=align,
+        source_model_fingerprint=f"fp:{src_model}",
+        target_model_fingerprint=f"fp:{tgt_model}",
         whitener=_target_whitener(layers=(5,)),
     )
     tgt_man = load_manifold(out)
@@ -1533,6 +1714,8 @@ def test_transfer_manifold_missing_source_raises(
         transfer_manifold(
             folder, from_model="never/fitted", to_model="tgt/m",
             alignment={0: torch.eye(4)},
+            source_model_fingerprint="fp:never/fitted",
+            target_model_fingerprint="fp:tgt/m",
         )
 
 
@@ -1549,6 +1732,8 @@ def test_transfer_manifold_empty_alignment_raises(
     with pytest.raises(ManifoldFormatError, match="empty"):
         transfer_manifold(
             folder, from_model="src/m", to_model="tgt/m", alignment={},
+            source_model_fingerprint="fp:src/m",
+            target_model_fingerprint="fp:tgt/m",
         )
 
 
@@ -1568,6 +1753,8 @@ def test_transfer_manifold_no_overlap_raises(
         transfer_manifold(
             folder, from_model="src/m", to_model="tgt/m",
             alignment={0: torch.eye(6), 1: torch.eye(6)},
+            source_model_fingerprint="fp:src/m",
+            target_model_fingerprint="fp:tgt/m",
         )
 
 
@@ -1588,14 +1775,20 @@ def test_transfer_manifold_refuses_overwrite_without_force(
     w = _target_whitener()
     transfer_manifold(
         folder, from_model="src/m", to_model="tgt/m", alignment=align, whitener=w,
+        source_model_fingerprint="fp:src/m",
+        target_model_fingerprint="fp:tgt/m",
     )
     with pytest.raises(FileExistsError):
         transfer_manifold(
             folder, from_model="src/m", to_model="tgt/m", alignment=align, whitener=w,
+            source_model_fingerprint="fp:src/m",
+            target_model_fingerprint="fp:tgt/m",
         )
     # force=True overwrites cleanly.
     transfer_manifold(
         folder, from_model="src/m", to_model="tgt/m", alignment=align,
+        source_model_fingerprint="fp:src/m",
+        target_model_fingerprint="fp:tgt/m",
         whitener=w, force=True,
     )
 
@@ -1671,6 +1864,8 @@ def test_manifold_summary_reports_transfer_variant(
     align = {L: torch.eye(6) for L in load_manifold(src_tensor).layers}
     transfer_manifold(
         folder, from_model="src/m", to_model="tgt/m", alignment=align,
+        source_model_fingerprint="fp:src/m",
+        target_model_fingerprint="fp:tgt/m",
         whitener=_target_whitener(),
     )
     summ = manifold_summary(folder)
@@ -1941,7 +2136,7 @@ def test_baked_manifold_round_trip(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     manifold, directions = _baked_manifold("merged")
     folder, mf = create_baked_manifold_folder(
         "local", "merged", "a merged vector", manifold, "test/model",
-        method="merge",
+        method="merge", model_fingerprint="fp:test/model",
     )
     assert mf.fit_mode == "baked"
     assert mf.is_discover is False
@@ -1969,6 +2164,7 @@ def test_baked_manifold_clear_and_scoped_refresh_refused(
     manifold, _ = _baked_manifold("merged")
     create_baked_manifold_folder(
         "local", "merged", "", manifold, "test/model", method="merge",
+        model_fingerprint="fp:test/model",
     )
     # Both tensor-deleting ops refuse — a baked manifold can't re-fit, so
     # clearing its tensor would destroy the only copy of its geometry.
@@ -1983,6 +2179,7 @@ def test_baked_manifold_node_groups_refused(tmp_path: Path, monkeypatch: pytest.
     manifold, _ = _baked_manifold("merged")
     _, mf = create_baked_manifold_folder(
         "local", "merged", "", manifold, "test/model", method="merge",
+        model_fingerprint="fp:test/model",
     )
     with pytest.raises(ManifoldFormatError, match="no node corpus"):
         mf.node_groups()

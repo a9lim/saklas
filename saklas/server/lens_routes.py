@@ -22,8 +22,8 @@ Routes under ``/saklas/v1/sessions/{id}/lens``:
   regardless of what happens to the client.  Generations attempted while
   a fit holds the model raise cleanly through the ordinary busy path.
 
-Discovery rides ``jlens_fitted`` on the session info payload (a
-path-existence check, never the ~GB lazy artifact load).
+Discovery rides ``jlens_fitted`` on the session info payload (a v3 sidecar,
+payload, and live-weight compatibility check, never the ~GB fp32 lens load).
 """
 
 # pyright: reportUnusedFunction=false
@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import threading
 import time
 
 from fastapi import FastAPI, HTTPException
@@ -122,6 +123,17 @@ def register_lens_routes(app: FastAPI) -> None:
         "live_layers": None,
     }
     app.state.lens_fit_task = None
+    app.state.lens_fit_cancel = None
+
+    async def _stop_lens_fit() -> None:
+        event = app.state.lens_fit_cancel
+        task = app.state.lens_fit_task
+        if event is not None:
+            event.set()
+        if task is not None and not task.done():
+            await task
+
+    app.router.on_shutdown.append(_stop_lens_fit)
 
     @app.post("/saklas/v1/sessions/{session_id}/lens/token/validate")
     def validate_lens_token(
@@ -280,6 +292,7 @@ def register_lens_routes(app: FastAPI) -> None:
         errors surface their ``user_message()``, anything else logs the
         traceback server-side and reports only the exception type.
         """
+        from saklas.core.jlens import JacobianLensCancelled
         from saklas.io.lens import stream_default_lens_corpus
 
         st = app.state.lens_fit
@@ -306,6 +319,7 @@ def register_lens_routes(app: FastAPI) -> None:
                 prompt_batch=body.prompt_batch,
                 force=body.force,
                 on_progress=on_progress,
+                cancel_event=app.state.lens_fit_cancel,
             )
             # Live-on by default: hot the full-band readout the moment the
             # artifact lands, same policy as serve startup.  Session lock so
@@ -316,6 +330,9 @@ def register_lens_routes(app: FastAPI) -> None:
                         session.enable_live_lens, top_k=8,
                     )
             st["message"] = "done"
+            st["error"] = None
+        except JacobianLensCancelled:
+            st["message"] = "cancelled"
             st["error"] = None
         except SaklasError as e:
             _, text = e.user_message()
@@ -358,6 +375,7 @@ def register_lens_routes(app: FastAPI) -> None:
             finished_at=None,
         )
         # Keep a handle so the task isn't GC'd mid-fit.
+        app.state.lens_fit_cancel = threading.Event()
         app.state.lens_fit_task = asyncio.create_task(
             _lens_fit_job(body, source_layers),
         )
@@ -367,4 +385,16 @@ def register_lens_routes(app: FastAPI) -> None:
     async def lens_fit_status(session_id: str):
         """Poll the background lens fit (progress / error / completion)."""
         resolve_session_id(session, session_id)
+        return _fit_status_payload()
+
+    @app.delete("/saklas/v1/sessions/{session_id}/lens/fit", status_code=202)
+    async def lens_fit_cancel(session_id: str):
+        """Request cooperative cancellation at the next prompt boundary."""
+        resolve_session_id(session, session_id)
+        st = app.state.lens_fit
+        event = app.state.lens_fit_cancel
+        if not st["running"] or event is None:
+            raise HTTPException(409, "no lens fit is running")
+        event.set()
+        st["message"] = "cancelling…"
         return _fit_status_payload()

@@ -17,7 +17,9 @@ import pytest
 
 from saklas.io import selectors as _sel
 from saklas.core.events import EventBus, SteeringApplied, SteeringCleared
-from saklas.core.session import SaklasSession, VectorNotRegisteredError
+from saklas.core.session import (
+    ConcurrentExtractionError, SaklasSession, VectorNotRegisteredError,
+)
 from saklas.core.steering import Steering
 from saklas.core.triggers import Trigger
 
@@ -102,6 +104,13 @@ def test_single_scope_push_pop():
     assert s._rebuild_calls[1] == {}
     kinds = [type(e).__name__ for e in events]
     assert kinds == ["SteeringApplied", "SteeringCleared"]
+
+
+def test_fit_refuses_active_steering_before_touching_artifacts(tmp_path: Path) -> None:
+    s = _Stub({"a": None})
+    with s.steering("0.3 a"):
+        with pytest.raises(ConcurrentExtractionError, match="active steering"):
+            s.fit(tmp_path / "does-not-exist")
 
 
 def test_nested_flattens_inner_wins():

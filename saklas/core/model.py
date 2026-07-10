@@ -3,10 +3,12 @@
 import hashlib
 import json
 import logging
+import threading
 import warnings
+import weakref
 from contextlib import suppress
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Iterable, cast
 
 import torch
 import torch.nn as nn
@@ -17,8 +19,74 @@ log = logging.getLogger(__name__)
 
 _ORIG_HISTC = None
 _ORIG_LDEXP = None
-_MODEL_FILE_HASH_CACHE: dict[str, tuple[int, int, str]] = {}
+_MODEL_FILE_HASH_CACHE: dict[str, tuple[int, int, int, int, int, str]] = {}
+_MODEL_FINGERPRINT_CACHE: "weakref.WeakKeyDictionary[Any, tuple[object, str, str]]" = (
+    weakref.WeakKeyDictionary()
+)
+_MODEL_FINGERPRINT_LOCK = threading.Lock()
 _SOURCE_FINGERPRINT_VERSION = 1
+
+
+def _model_state_signature(model: Any) -> object:
+    """Cheap mutation signature for memoizing an exact loaded-state digest."""
+    config = getattr(model, "config", None)
+    config_payload = (
+        config.to_dict() if config is not None and hasattr(config, "to_dict")
+        else repr(config)
+    )
+    rows: list[tuple[object, ...]] = []
+    named_parameters = getattr(model, "named_parameters", None)
+    parameter_rows: Any
+    if callable(named_parameters):
+        parameter_rows = named_parameters()
+    else:
+        parameters = getattr(model, "parameters", None)
+        parameters_any: Any = parameters
+        parameter_rows = (
+            (
+                (str(index), tensor)
+                for index, tensor in enumerate(
+                    cast(Iterable[Any], parameters_any())
+                )
+            )
+            if callable(parameters_any) else ()
+        )
+    named_buffers = getattr(model, "named_buffers", None)
+    buffer_rows: Any = named_buffers() if callable(named_buffers) else ()
+    for kind, tensors in (
+        ("parameter", parameter_rows),
+        ("buffer", buffer_rows),
+    ):
+        for name, tensor in tensors:
+            try:
+                pointer = int(tensor.data_ptr())
+            except (RuntimeError, TypeError, AttributeError):
+                pointer = id(tensor)
+            rows.append((
+                kind, name, tuple(int(dim) for dim in tensor.shape),
+                str(tensor.dtype), str(tensor.device), pointer,
+                int(getattr(tensor, "_version", 0)),
+            ))
+    return (
+        hashlib.sha256(json.dumps(
+            config_payload, sort_keys=True, separators=(",", ":"), default=str,
+        ).encode("utf-8")).hexdigest(),
+        tuple(rows),
+    )
+
+
+def invalidate_loaded_model_fingerprint(model: Any) -> None:
+    """Mark out-of-band weight/storage mutation before persistent-cache use.
+
+    Saklas-owned models are immutable after load; steering is per-call and does
+    not mutate parameters. Integrations that replace adapters or write through
+    ``Tensor.data`` must call this hook because those writes can bypass
+    PyTorch's tensor ``_version`` counter.
+    """
+    base = getattr(model, "_orig_mod", model)
+    setattr(base, "_saklas_state_invalidated", True)
+    with _MODEL_FINGERPRINT_LOCK:
+        _MODEL_FINGERPRINT_CACHE.pop(base, None)
 
 
 def _local_model_files(path: Path) -> list[tuple[str, int, str]]:
@@ -27,25 +95,34 @@ def _local_model_files(path: Path) -> list[tuple[str, int, str]]:
         return []
     from saklas.io.packs import hash_file
 
-    patterns = (
-        "*.safetensors", "*.bin", "*.index.json", "config.json",
-        "generation_config.json", "tokenizer*.json", "*.model",
-        "special_tokens_map.json", "added_tokens.json", "vocab.json",
-        "vocab.txt", "merges.txt", "chat_template.jinja", "*.py",
-    )
     found: dict[str, Path] = {}
-    for pattern in patterns:
-        for file_path in path.rglob(pattern):
-            if file_path.is_file():
-                found[str(file_path.relative_to(path))] = file_path
+    ignored_parts = {".git", ".locks", "__pycache__"}
+    for file_path in path.rglob("*"):
+        relative_path = file_path.relative_to(path)
+        if (
+            file_path.is_file()
+            and not any(part in ignored_parts for part in relative_path.parts)
+            and file_path.suffix not in {".lock", ".tmp", ".pyc"}
+        ):
+            # trust_remote_code and custom tokenizers may consume arbitrary
+            # adjacent resources. A filename whitelist cannot prove source
+            # identity; hash every stable regular snapshot file instead.
+            found[str(relative_path)] = file_path
     result: list[tuple[str, int, str]] = []
     for relative, file_path in sorted(found.items()):
         stat = file_path.stat()
         key = str(file_path.resolve())
         cached = _MODEL_FILE_HASH_CACHE.get(key)
-        identity = (int(stat.st_size), int(stat.st_mtime_ns))
-        if cached is not None and cached[:2] == identity:
-            file_hash = cached[2]
+        # Size+mtime can be restored after an in-place same-size rewrite.
+        # ctime catches that rewrite; device+inode also distinguish atomic
+        # replacement at the same path without forcing another full hash when
+        # the snapshot is genuinely unchanged.
+        identity = (
+            int(stat.st_size), int(stat.st_mtime_ns), int(stat.st_ctime_ns),
+            int(stat.st_dev), int(stat.st_ino),
+        )
+        if cached is not None and cached[:-1] == identity:
+            file_hash = cached[-1]
         else:
             file_hash = hash_file(file_path)
             _MODEL_FILE_HASH_CACHE[key] = (*identity, file_hash)
@@ -141,47 +218,19 @@ def loaded_model_fingerprint(model: Any, model_id: str) -> str:
             "commit": getattr(config, "_commit_hash", None),
         }
     )
-    parameter_schema: list[tuple[str, tuple[int, ...], str, int]] = []
-    buffer_schema: list[tuple[str, tuple[int, ...], str, int]] = []
-    samples_by_device: dict[str, list[torch.Tensor]] = {}
-    try:
-        for name, parameter in base.named_parameters():
-            parameter_schema.append((
-                name, tuple(int(dim) for dim in parameter.shape),
-                str(parameter.dtype), int(getattr(parameter, "_version", 0)),
-            ))
-            flat = parameter.detach().reshape(-1)
-            if flat.numel() == 0:
-                continue
-            positions = torch.tensor(
-                sorted({0, flat.numel() // 2, flat.numel() - 1}),
-                dtype=torch.long, device=flat.device,
-            )
-            samples_by_device.setdefault(str(flat.device), []).append(
-                flat.index_select(0, positions).to(torch.float32)
-            )
-    except (RuntimeError, TypeError, AttributeError):
-        # Some quantized wrappers do not expose indexable parameters. Their
-        # resolved commit/local shard identity remains the authoritative key.
-        samples_by_device = {}
-    try:
-        for name, buffer in base.named_buffers():
-            buffer_schema.append((
-                name, tuple(int(dim) for dim in buffer.shape),
-                str(buffer.dtype), int(getattr(buffer, "_version", 0)),
-            ))
-            flat = buffer.detach().reshape(-1)
-            if flat.numel() == 0:
-                continue
-            positions = torch.tensor(
-                sorted({0, flat.numel() // 2, flat.numel() - 1}),
-                dtype=torch.long, device=flat.device,
-            )
-            samples_by_device.setdefault(str(flat.device), []).append(
-                flat.index_select(0, positions).to(torch.float32)
-            )
-    except (RuntimeError, TypeError, AttributeError):
-        samples_by_device = {}
+    state_signature = _model_state_signature(base)
+    with _MODEL_FINGERPRINT_LOCK:
+        cached = _MODEL_FINGERPRINT_CACHE.get(base)
+    if cached is not None and cached[:2] == (state_signature, model_id):
+        return cached[2]
+    parameter_schema = [
+        (name, tuple(int(dim) for dim in parameter.shape), str(parameter.dtype))
+        for name, parameter in base.named_parameters()
+    ]
+    buffer_schema = [
+        (name, tuple(int(dim) for dim in buffer.shape), str(buffer.dtype))
+        for name, buffer in base.named_buffers()
+    ]
     trusted_source = getattr(base, "_saklas_source_fingerprint", None)
     payload = {
         "model_id": model_id,
@@ -194,22 +243,17 @@ def loaded_model_fingerprint(model: Any, model_id: str) -> str:
     digest = hashlib.sha256(json.dumps(
         payload, sort_keys=True, separators=(",", ":"), default=str,
     ).encode("utf-8"))
-    if trusted_source:
-        # Only models loaded by saklas carry this marker.  A config that merely
-        # claims a commit is not proof that an arbitrary in-memory module still
-        # contains those weights.  Fold lightweight live samples + schema so
-        # ordinary adapter/in-place mutations invalidate the trusted source.
-        for device_name in sorted(samples_by_device):
-            digest.update(device_name.encode("utf-8"))
-            joined = torch.cat(samples_by_device[device_name]).to(
-                device="cpu", dtype=torch.float32,
-            )
-            digest.update(joined.numpy().tobytes())
-    else:
+    loaded_signature = getattr(base, "_saklas_loaded_state_signature", None)
+    if (
+        not trusted_source
+        or state_signature != loaded_signature
+        or bool(getattr(base, "_saklas_state_invalidated", False))
+    ):
         # No trusted load provenance exists (programmatically constructed,
-        # separately initialized, or externally wrapped). Persistent reuse is
-        # safe only with an exact state hash. Stream bounded chunks instead of
-        # cloning the whole model.
+        # separately initialized, externally wrapped, or mutated after saklas
+        # loaded it). Persistent reuse is safe only with an exact state hash.
+        # Stream bounded chunks instead of cloning the whole model. Clean
+        # saklas-owned loads use the exact immutable source fingerprint above.
         tensors = list(base.named_parameters()) + list(base.named_buffers())
         for name, tensor in tensors:
             digest.update(name.encode("utf-8"))
@@ -224,7 +268,10 @@ def loaded_model_fingerprint(model: Any, model_id: str) -> str:
                 # float64 ULPs and integer/bool buffers); float32 promotion would
                 # make distinct live states collide.
                 digest.update(chunk.view(torch.uint8).numpy().tobytes())
-    return digest.hexdigest()
+    fingerprint = digest.hexdigest()
+    with _MODEL_FINGERPRINT_LOCK:
+        _MODEL_FINGERPRINT_CACHE[base] = (state_signature, model_id, fingerprint)
+    return fingerprint
 
 
 def _histc_mps_safe(input: torch.Tensor, bins: int = 100, min: float = 0, max: float = 0, *, out: torch.Tensor | None = None) -> torch.Tensor:
@@ -465,6 +512,7 @@ def _load_text_from_multimodal(
     text_config: Any,
     dtype: torch.dtype,
     device: str,
+    revision: str | None = None,
 ):
     """Load just the text model from a multimodal checkpoint.
 
@@ -520,16 +568,20 @@ def _load_text_from_multimodal(
     # Prefer the sharded index; fall back to a single `model.safetensors`
     # for repos that ship consolidated weights (e.g. Ministral-3-3B).
     index_path = cached_file(
-        model_id, SAFE_WEIGHTS_INDEX_NAME, _raise_exceptions_for_missing_entries=False
+        model_id, SAFE_WEIGHTS_INDEX_NAME, revision=revision,
+        _raise_exceptions_for_missing_entries=False,
     )
     if index_path is not None:
         with open(index_path) as f:
             shard_names = sorted(set(json.load(f)["weight_map"].values()))
         # Resolve each shard through cached_file so HF hub downloads it
         # if it isn't already local (the index can land before the shards).
-        shard_paths = [cached_file(model_id, name) for name in shard_names]
+        shard_paths = [
+            cached_file(model_id, name, revision=revision)
+            for name in shard_names
+        ]
     else:
-        single_path = cached_file(model_id, SAFE_WEIGHTS_NAME)
+        single_path = cached_file(model_id, SAFE_WEIGHTS_NAME, revision=revision)
         shard_paths = [single_path]
 
     matched = 0
@@ -812,6 +864,20 @@ def load_model(
     resolved_dtype = _resolve_dtype(dtype, device)
     log.info("Device: %s", device)
 
+    # Resolve one config snapshot first, then pin every subsequent tokenizer,
+    # config, custom shard, and model read to that immutable commit. Without a
+    # single pin, a mutable Hub branch can advance between independent
+    # ``from_pretrained`` calls and leave caches stamped with config A over
+    # weights B. Local paths carry no commit and remain path-hash identified.
+    probe_config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+    resolved_revision = (
+        getattr(probe_config, "_commit_hash", None)
+        or getattr(getattr(probe_config, "text_config", None), "_commit_hash", None)
+    )
+    pin_kwargs: dict[str, str] = (
+        {"revision": str(resolved_revision)} if resolved_revision else {}
+    )
+
     # HF-distributed Mistral checkpoints ship a buggy pre-tokenizer regex
     # that mis-splits ~1% of tokens (e.g. ``"'The'"`` → ``["'", "T", "he", "'"]``
     # instead of ``["'", "The", "'"]``).  ``fix_mistral_regex=True`` swaps in the
@@ -822,7 +888,9 @@ def load_model(
     tokenizer_kwargs: dict[str, Any] = {"trust_remote_code": True}
     if "mistral" in model_id.lower():
         tokenizer_kwargs["fix_mistral_regex"] = True
-    tokenizer = AutoTokenizer.from_pretrained(model_id, **tokenizer_kwargs)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_id, **tokenizer_kwargs, **pin_kwargs,
+    )
 
     # --- quantization config ---
     if quantize and device != "cuda":
@@ -856,7 +924,6 @@ def load_model(
     # against newer transformers.  When the architecture is already
     # supported natively, skip the custom code entirely.
     from transformers.models.auto.configuration_auto import CONFIG_MAPPING
-    probe_config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
     native_type = getattr(probe_config, "model_type", None)
     native_text_type = getattr(getattr(probe_config, "text_config", None),
                                "model_type", None)
@@ -897,6 +964,7 @@ def load_model(
         "attn_implementation": attn_impl,
         "trust_remote_code": trust,
         "device_map": device_map,
+        **pin_kwargs,
     }
     if quantize == "4bit":
         load_kwargs["quantization_config"] = BitsAndBytesConfig(
@@ -908,7 +976,9 @@ def load_model(
         load_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
     else:
         load_kwargs["dtype"] = resolved_dtype
-    config = AutoConfig.from_pretrained(model_id, trust_remote_code=trust)
+    config = AutoConfig.from_pretrained(
+        model_id, trust_remote_code=trust, **pin_kwargs,
+    )
     text_cfg = getattr(config, "text_config", None)
     # A non-None text_config means a multimodal wrapper. When it wraps a
     # text model saklas supports, load *only* the text submodel: it skips
@@ -937,7 +1007,7 @@ def load_model(
         try:
             model = _load_text_from_multimodal(
                 model_id, text_cfg, load_kwargs.get("dtype", resolved_dtype),
-                device,
+                device, revision=str(resolved_revision) if resolved_revision else None,
             )
         except _NoTextWeightsExtracted as e:
             # Unexpected weight layout — don't ship random init; fall through
@@ -990,6 +1060,8 @@ def load_model(
     )
     if source_fingerprint is not None:
         setattr(model, "_saklas_source_fingerprint", source_fingerprint)
+        setattr(model, "_saklas_loaded_state_signature", _model_state_signature(model))
+        setattr(model, "_saklas_state_invalidated", False)
 
     # --- reconcile the chat stop-token set -------------------------------
     # A multimodal checkpoint's *text* sub-config can under-specify the

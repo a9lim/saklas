@@ -145,8 +145,7 @@ def test_fit_stops_before_final_norm_and_lm_head(
 
 
 def test_restricted_source_layers_match_exact_jacobian() -> None:
-    """A band-restricted fit seeds at its lowest source layer (blocks below
-    run graph-free) — the estimate must be unchanged by the truncation."""
+    """A restricted fit seeds at its lowest source output without changing J."""
     model = _frozen_model(n_layers=3)
     tokenizer = _CharTokenizer()
     prompt = "the quick brown fox js"
@@ -310,6 +309,42 @@ def test_committed_row_oom_at_dim_one_restarts_with_smaller_prompt_batch(
         )
 
 
+def test_repeated_oom_after_committed_rows_never_double_counts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import saklas.core.jlens as jlens_module
+
+    model = _frozen_model(n_layers=2)
+    tokenizer = _CharTokenizer()
+    prompts = [
+        "a first prompt that is long enough.",
+        "a second prompt that is long enough.",
+    ]
+    expected = fit_jacobian_lens(
+        model, tokenizer, prompts, _layers(model),
+        dim_batch=2, prompt_batch=1,
+    )
+    real_block = jlens_module._grad_row_block
+    calls = 0
+
+    def _oom_twice(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        if calls in {2, 3}:
+            raise RuntimeError("synthetic out of memory")
+        return real_block(*args, **kwargs)
+
+    monkeypatch.setattr(jlens_module, "_grad_row_block", _oom_twice)
+    resumed = fit_jacobian_lens(
+        model, tokenizer, prompts, _layers(model),
+        dim_batch=2, prompt_batch=2,
+    )
+    for layer in expected.source_layers:
+        assert torch.allclose(
+            resumed.jacobians[layer], expected.jacobians[layer], atol=1e-6,
+        )
+
+
 @pytest.mark.parametrize("fail_call", [1, 3])
 def test_auto_scalar_fallback_stays_single_prompt_and_never_double_counts(
     monkeypatch: pytest.MonkeyPatch, fail_call: int,
@@ -411,6 +446,39 @@ def test_fit_checkpoint_callback_fires() -> None:
         dim_batch=3, checkpoint_every=2, checkpoint_cb=lambda l: seen.append(l.n_prompts),
     )
     assert seen == [2]
+
+
+def test_fit_cancellation_persists_completed_prefix_and_removes_hooks() -> None:
+    import threading
+
+    from saklas.core.jlens import JacobianLensCancelled
+
+    model = _frozen_model(n_layers=2)
+    event = threading.Event()
+    saved: list[int] = []
+
+    def _progress(_message: str) -> None:
+        event.set()
+
+    with pytest.raises(JacobianLensCancelled, match="after 1 prompts"):
+        fit_jacobian_lens(
+            model,
+            _CharTokenizer(),
+            ["a prompt that is long enough."] * 3,
+            _layers(model),
+            dim_batch=3,
+            prompt_batch=1,
+            checkpoint_every=3,
+            checkpoint_accumulator_cb=(
+                lambda _sums, count, _dim: saved.append(count)
+            ),
+            on_progress=_progress,
+            cancel_event=event,
+        )
+
+    assert saved == [1]
+    assert all(not layer._forward_hooks for layer in _layers(model))
+    assert all(not layer._forward_pre_hooks for layer in _layers(model))
 
 
 def test_source_layers_must_precede_final() -> None:

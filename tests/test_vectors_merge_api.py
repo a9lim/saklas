@@ -89,6 +89,7 @@ class TestMergeVector:
             fold_directions_to_subspace, folded_vector_directions,
         )
         from saklas.core.manifold import load_manifold
+        from saklas.core.model import loaded_model_fingerprint
         from saklas.io.manifolds import create_baked_manifold_folder
         from saklas.io.paths import tensor_filename
 
@@ -96,6 +97,9 @@ class TestMergeVector:
         manifold = fold_directions_to_subspace("noble", dirs, None, label="merged")
         merged_folder, _ = create_baked_manifold_folder(
             "local", "noble", "merged", manifold, session.model_id, method="merge",
+            model_fingerprint=loaded_model_fingerprint(
+                session._model, session.model_id,
+            ),
         )
         tensor_path = merged_folder / tensor_filename(session.model_id)
         expected = folded_vector_directions(load_manifold(tensor_path))

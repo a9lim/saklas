@@ -38,16 +38,16 @@ layer, averaged over positions ≥ `SKIP_FIRST_POSITIONS` (16, attention sinks)
 and a text corpus. `fit_jacobian_lens(model, tokenizer, prompts, layer_modules,
 …)` is the **only backward-pass code in saklas**: everything else runs under
 `inference_mode`, and with frozen params + integer inputs no autograd graph
-exists at all, so the fit runs under `torch.enable_grad()` with a
-`register_forward_pre_hook` on the first block that returns a
-`requires_grad_(True)` clone of its input (reuses `get_layers`, zero per-arch
-wiring). Consecutive ragged prompts share one right-padded graph (`prompt_batch`,
-CPU/CUDA default 4, MPS 1) and `ceil(d_model/dim_batch)` backwards. Each backward selects one block of output
+exists at all, so the fit runs under `torch.enable_grad()` with a returning
+forward hook on the first fitted block that replaces its output with a detached
+`requires_grad_(True)` leaf (reuses `get_layers`, zero per-arch wiring).
+Consecutive ragged prompts share one right-padded graph (`prompt_batch`,
+CPU/CUDA default 4, MPS 2) and `ceil(d_model/dim_batch)` backwards. Each backward selects one block of output
 dims, sums those dims over the valid target positions, and calls
 `torch.autograd.grad(..., is_grads_batched=True)` so `dim_batch` VJPs come from a
 single unreplicated graph while preserving equal-prompt weighting.
 `SAKLAS_JLENS_VJP=replicated` restores the reference replicated-prompt estimator,
-and `auto` falls back to exact unreplicated scalar VJPs when a backend lacks vmap
+and `auto` falls back to exact replicated row-batch VJPs when a backend lacks vmap
 coverage. Grads come from `torch.autograd.grad(final,
 sources)` — NOT `backward()` + `retain_grad()`, whose `.grad` accumulation across
 the multi-backward loop would corrupt the rows — which also stops the graph walk
@@ -203,9 +203,12 @@ mmap spool for later covariance instead of capturing the corpus twice or holding
 the whole roster in fp32 RAM. A token-exact per-model capture cache lets domain,
 topology, and smoothing refits skip model forwards; its identity includes node
 boundaries, and its digest metadata validates centroid payloads plus exact
-per-layer row tensors; subset fits map/hash only requested row layers. Layer
-coverage is unioned/topped up, so full→subset needs no forward and overlapping
-subsets capture only missing layers. Cache groups prune oldest-first past 8 GiB
+per-layer row tensors; subset fits map/hash only requested row layers and validate
+the complete safetensors key/shape header without re-hashing the multi-GiB row
+container. The shared per-model capture stem is protected by `artifact_lock`
+across read/top-up/publish, and safetensors stage through unique same-directory
+tempfiles. Layer coverage is unioned/topped up, so full→subset needs no forward
+and overlapping subsets capture only missing layers. Cache groups prune oldest-first past 8 GiB
 (`SAKLAS_MANIFOLD_CAPTURE_CACHE_GB`) and `pack clear` / `pack rm` remove referenced
 group. `layer_indices` accepts an explicit set or the canonical 40–90% workspace
 band. It threads the folder's `node_kinds` /
@@ -925,7 +928,7 @@ events: `GenerationStarted`/`SteeringApplied`/
 `SteeringCleared`/`ProbeScored`/`GenerationFinished` + `VectorExtracted`/
 `ManifoldExtracted`; threaded subscribers hop via `loop.call_soon_threadsafe`.
 
-**Jacobian-lens surface.** `session.jlens` validates v2 sidecar/live-weight
+**Jacobian-lens surface.** `session.jlens` validates v3 sidecar/live-weight
 identity before loading, then verifies the payload digest while promoting each
 layer (`io/lens.py`, like `whitener`); `fit_jlens(prompts, …)` pre-filters too-short
 prompts (so the saved `n_prompts` counts consumed prompts exactly — what makes

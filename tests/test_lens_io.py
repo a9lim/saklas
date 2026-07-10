@@ -134,19 +134,16 @@ def test_checkpoint_accumulator_is_self_contained_and_merges_prefix() -> None:
         )
 
 
-def test_load_lens_sidecar_does_not_read_tensors(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_load_lens_sidecar_validates_tensor_header_without_materializing() -> None:
     _save(_lens())
-
-    def _boom(*_args: object, **_kwargs: object) -> object:
-        raise AssertionError("metadata-only load should not read safetensors")
-
-    monkeypatch.setattr("saklas.io.lens.safe_open", _boom)
     sidecar = load_lens_sidecar(_MODEL)
     assert sidecar is not None
     assert sidecar["source_layers"] == [0, 1, 2]
     assert sidecar["d_model"] == _D
+
+    ts_path, _ = lens_paths(_MODEL)
+    ts_path.write_bytes(ts_path.read_bytes()[:32])
+    assert load_lens_sidecar(_MODEL) is None
 
 
 def test_save_lens_preserves_existing_tensor_on_failed_replace(
@@ -182,6 +179,16 @@ def test_load_wrong_format_version_returns_none() -> None:
     sidecar = json.loads(sc_path.read_text())
     sidecar["format_version"] = LENS_FORMAT_VERSION + 1
     sc_path.write_text(json.dumps(sidecar))
+    assert load_lens(_MODEL) is None
+
+
+def test_load_changed_estimator_policy_returns_none() -> None:
+    _save(_lens())
+    _, sc_path = lens_paths(_MODEL)
+    sidecar = json.loads(sc_path.read_text())
+    sidecar["estimator_policy"]["skip_first_positions"] += 1
+    sc_path.write_text(json.dumps(sidecar))
+    assert load_lens_sidecar(_MODEL) is None
     assert load_lens(_MODEL) is None
 
 

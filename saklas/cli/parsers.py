@@ -259,12 +259,6 @@ def _build_vector_extract(p: argparse.ArgumentParser) -> None:
              "No implicit default — you must name a release.",
     )
     p.add_argument(
-        "--sae-revision", dest="sae_revision", default=None, metavar="REV",
-        help="Pin a specific HF revision when the installed SAELens loader "
-             "supports revision= (otherwise errors rather than stamping an "
-             "unhonored pin)",
-    )
-    p.add_argument(
         "--role", default=None, metavar="SLUG",
         help="Role-augmented extraction: render the contrast pairs under a "
              "chat template whose assistant-role label is replaced by SLUG "
@@ -357,10 +351,6 @@ def _build_manifold_fit(fit: argparse.ArgumentParser) -> None:
         "--sae", default=None, metavar="RELEASE",
         help="Fit in an SAELens SAE feature space (requires `.[sae]`); "
              "centroids are reconstructed through the SAE before the fit.",
-    )
-    fit.add_argument(
-        "--sae-revision", dest="sae_revision", default=None, metavar="REV",
-        help="Pin a specific HF revision for the SAE release",
     )
     # Discover-mode hyperparam overrides.  Written into ``manifold.json``
     # before the fit; rejected against an authored folder.

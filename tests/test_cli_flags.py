@@ -267,32 +267,17 @@ def test_run_extract_corrupt_tensor_does_not_short_circuit(monkeypatch: pytest.M
 
 
 @pytest.mark.parametrize(
-    "argv,runner",
+    "argv",
     [
-        (
-            ["manifold", "extract", "happy", "-m", "fake/model",
-             "--sae-revision", "rev"],
-            cli_runners._run_manifold_extract,
-        ),
-        (
-            ["manifold", "fit", "missing", "-m", "fake/model",
-             "--sae-revision", "rev"],
-            cli_runners._run_manifold_fit,
-        ),
+        ["manifold", "extract", "happy", "-m", "fake/model",
+         "--sae-revision", "rev"],
+        ["manifold", "fit", "missing", "-m", "fake/model",
+         "--sae-revision", "rev"],
     ],
 )
-def test_sae_revision_without_release_fails_before_model_load(
-    argv: list[str], runner: Any, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    args = cli.parse_args(argv)
-    monkeypatch.setattr(
-        cli_runners, "_make_session",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("invalid flags loaded the model"),
-        ),
-    )
+def test_sae_revision_flag_is_not_advertised(argv: list[str]) -> None:
     with pytest.raises(SystemExit) as exc:
-        runner(args)
+        cli.parse_args(argv)
     assert exc.value.code == 2
 
 
@@ -901,7 +886,7 @@ def test_config_bare_pole_resolves_canonical(monkeypatch: pytest.MonkeyPatch, tm
 
 
 # ---------------------------------------------------------------------------
-# vector extract --sae / --sae-revision
+# vector extract --sae
 # ---------------------------------------------------------------------------
 
 def test_vector_extract_parses_sae_flag():
@@ -912,18 +897,16 @@ def test_vector_extract_parses_sae_flag():
         "--sae", "gemma-scope-2b-pt-res-canonical",
     ])
     assert args.sae == "gemma-scope-2b-pt-res-canonical"
-    assert args.sae_revision is None
+    assert not hasattr(args, "sae_revision")
 
 
-def test_vector_extract_sae_revision():
-    args = cli.parse_args([
-        "manifold","extract", "honest.deceptive",
-        "-m", "google/gemma-2-2b-it",
-        "--sae", "release-x",
-        "--sae-revision", "v1.0",
-    ])
-    assert args.sae == "release-x"
-    assert args.sae_revision == "v1.0"
+def test_vector_extract_sae_revision_is_rejected():
+    with pytest.raises(SystemExit):
+        cli.parse_args([
+            "manifold", "extract", "honest.deceptive",
+            "-m", "google/gemma-2-2b-it", "--sae", "release-x",
+            "--sae-revision", "v1.0",
+        ])
 
 
 def test_vector_extract_no_sae_defaults_to_none():
@@ -931,7 +914,7 @@ def test_vector_extract_no_sae_defaults_to_none():
         "manifold","extract", "honest.deceptive", "-m", "model",
     ])
     assert args.sae is None
-    assert args.sae_revision is None
+    assert not hasattr(args, "sae_revision")
 
 
 def test_vector_extract_sae_requires_value():

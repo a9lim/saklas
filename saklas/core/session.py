@@ -1650,9 +1650,10 @@ class SaklasSession:
         that later need the means — DLS centering at extraction time,
         the Mahalanobis whitener, the trait monitor — hit this
         property, which triggers the bootstrap once and caches the
-        result on ``self._layer_means``.  Disk-cached when the
-        ``neutral_statements.json`` hash matches the on-disk
-        ``layer_means.safetensors``; recomputes otherwise.
+        result on ``self._layer_means``. The means are derived from the single
+        fp32 ``neutral_activations`` cache, whose loaded-model identity, exact
+        rendered token rows, layer schema, and payload digest must all match;
+        there is no separate layer-means artifact.
 
         Returns ``{}`` only if the bootstrap path itself fails (model
         not loaded, missing neutrals pack, etc.) — DLS / whitener
@@ -1665,16 +1666,25 @@ class SaklasSession:
         :func:`compute_dls_axes`).  The property closes that footgun.
         """
         if not self._layer_means:
-            try:
-                self._layer_means = bootstrap_layer_means(
-                    self._model, self._tokenizer, self._layers, self._model_info,
-                )
-            except Exception as exc:  # pragma: no cover — defensive
-                _log.warning(
-                    "session.layer_means lazy build failed: %s; "
-                    "DLS and Mahalanobis paths will fall back to "
-                    "no-baseline behavior", exc,
-                )
+            with self._model_exclusive(
+                "layer_means requested while another model use is in flight",
+                phase_msg="layer_means requested while generation is in flight",
+            ):
+                SaklasSession._assert_unsteered_artifact_operation(self)
+                # Double-check after acquiring: another caller may have built
+                # the neutral artifact while this thread waited.
+                if not self._layer_means:
+                    try:
+                        self._layer_means = bootstrap_layer_means(
+                            self._model, self._tokenizer, self._layers,
+                            self._model_info,
+                        )
+                    except Exception as exc:  # pragma: no cover — defensive
+                        _log.warning(
+                            "session.layer_means lazy build failed: %s; "
+                            "DLS and Mahalanobis paths will fall back to "
+                            "no-baseline behavior", exc,
+                        )
         return self._layer_means
 
     # -- Mahalanobis whitener (v2.1) --
@@ -1693,17 +1703,18 @@ class SaklasSession:
         scoring stays alive).
         """
         if self._whitener is None:
-            self._whitener = self._build_whitener_from_cache_or_compute()
-            # Keep the trait monitor's read metric in lock-step with the
-            # session whitener: when it's built lazily (e.g. a ``probes=[]``
-            # session that later extracts), push it into the monitor so
-            # probe reads switch to the Mahalanobis cosine.  ``set_whitener``
-            # is a no-op when the identity is unchanged.  Guarded with
-            # ``getattr`` because the property can be touched mid-init
-            # before ``_monitor`` is assigned.
-            monitor = getattr(self, "_monitor", None)
-            if monitor is not None and self._whitener is not None:
-                monitor.set_whitener(self._whitener)
+            with self._model_exclusive(
+                "whitener requested while another model use is in flight",
+                phase_msg="whitener requested while generation is in flight",
+            ):
+                SaklasSession._assert_unsteered_artifact_operation(self)
+                if self._whitener is None:
+                    self._whitener = self._build_whitener_from_cache_or_compute()
+                    # Keep the trait monitor's read metric in lock-step with the
+                    # session whitener when it is built lazily.
+                    monitor = getattr(self, "_monitor", None)
+                    if monitor is not None and self._whitener is not None:
+                        monitor.set_whitener(self._whitener)
         return self._whitener
 
     def _build_whitener_from_cache_or_compute(self) -> "Any":
@@ -1805,6 +1816,41 @@ class SaklasSession:
             )
         return lens
 
+    def _adopt_fitted_jlens(self, lens: "Any") -> "Any":
+        """Replace a fitted lens and rebuild every derived live consumer."""
+        previous_live = self._live_lens
+        previous_layers = (
+            list(previous_live["layers"]) if previous_live is not None else []
+        )
+        previous_top_k = (
+            int(previous_live["top_k"]) if previous_live is not None else 5
+        )
+
+        self._jlens = lens
+        self._jlens_device_cache = {}
+        for key in list(self._profiles):
+            if key.startswith("jlens/"):
+                self._profiles.pop(key, None)
+
+        band = [int(layer) for layer in self._jlens_workspace_band(lens)]
+        for name, spec in self._lens_probes.items():
+            spec["layers"] = list(band)
+            self._probe_hash_cache.pop(name, None)
+        if self._lens_probes and band:
+            self._jlens_transport_stack(lens, sorted(band), self._device)
+
+        if previous_live is not None:
+            valid = [layer for layer in previous_layers if layer in lens.jacobians]
+            self.enable_live_lens(
+                layers=(valid or band), top_k=previous_top_k,
+            )
+        else:
+            self._live_lens = None
+
+        self._invalidate_prefix_cache()
+        self._invalidate_analytics_cache()
+        return lens
+
     def fit_jlens(
         self,
         prompts: "Sequence[str]",
@@ -1817,6 +1863,7 @@ class SaklasSession:
         force: bool = False,
         checkpoint_every: int | None = None,
         on_progress: Callable[[str], None] | None = None,
+        cancel_event: "Any | None" = None,
     ) -> "Any":
         """Fit (or resume fitting) this model's Jacobian lens and persist it.
 
@@ -1842,6 +1889,7 @@ class SaklasSession:
             DEFAULT_SEQ_LEN,
             SKIP_FIRST_POSITIONS,
             JacobianLens,
+            JacobianLensCancelled,
             JacobianLensError,
             fit_jacobian_lens,
         )
@@ -1866,11 +1914,14 @@ class SaklasSession:
         prompt_list = list(prompts)
         raw_corpus_sha = hashlib.sha256(repr(prompt_list).encode("utf-8")).hexdigest()
         raw_prompt_count = len(prompt_list)
+        if cancel_event is not None and cancel_event.is_set():
+            raise JacobianLensCancelled("Jacobian-lens fit cancelled before start")
 
         with self._model_exclusive(
             "session.fit_jlens called while another model use is in flight",
             phase_msg="session.fit_jlens called while a generation is in flight",
         ):
+            SaklasSession._assert_unsteered_artifact_operation(self)
             fit_model = getattr(self._model, "_orig_mod", self._model)
             fit_layers = list(get_layers(fit_model))
             model_fingerprint = loaded_model_fingerprint(
@@ -1954,9 +2005,7 @@ class SaklasSession:
                                     "prompts — nothing to do"
                                 )
                             selected = lens.select_layers(expected_sources)
-                            self._jlens = selected
-                            self._jlens_device_cache = {}
-                            return selected
+                            return SaklasSession._adopt_fitted_jlens(self, selected)
                         missing_sources = sorted(expected_set - existing_set)
                         if on_progress is not None:
                             on_progress(
@@ -2025,6 +2074,7 @@ class SaklasSession:
                                 on_progress=on_progress,
                                 progress_base=topup_offset,
                                 input_id_rows=topup_ids,
+                                cancel_event=cancel_event,
                             )
                             missing = (
                                 JacobianLens.merge_into(
@@ -2052,9 +2102,7 @@ class SaklasSession:
                         )
                         remove_lens_checkpoint(self.model_id)
                         selected = merged.select_layers(expected_sources)
-                        self._jlens = selected
-                        self._jlens_device_cache = {}
-                        return selected
+                        return SaklasSession._adopt_fitted_jlens(self, selected)
                     if existing_set >= expected_set:
                         base = lens.select_layers(expected_sources)
                     else:
@@ -2149,9 +2197,7 @@ class SaklasSession:
 
             if base is not None and not usable:
                 merged = _save_full(base)
-                self._jlens = merged
-                self._jlens_device_cache = {}
-                return merged
+                return SaklasSession._adopt_fitted_jlens(self, merged)
 
             fitted = fit_jacobian_lens(
                 fit_model, self._tokenizer, usable, fit_layers,
@@ -2163,15 +2209,14 @@ class SaklasSession:
                 on_progress=on_progress,
                 progress_base=prompt_base,
                 input_id_rows=consumed_ids,
+                cancel_event=cancel_event,
             )
             merged = (
                 JacobianLens.merge_into([base, fitted], target=-1)
                 if base is not None else fitted
             )
             merged = _save_full(merged)
-            self._jlens = merged
-            self._jlens_device_cache = {}
-            return merged
+            return SaklasSession._adopt_fitted_jlens(self, merged)
 
     def _resolve_jlens_layers(
         self,
@@ -3191,6 +3236,19 @@ class SaklasSession:
         finally:
             self._gen_lock.release()
 
+    def _assert_unsteered_artifact_operation(self) -> None:
+        """Refuse persisted neutral/fit work under active steering hooks."""
+        try:
+            active = bool(self._steering_stack)
+        except (AttributeError, TypeError):
+            # Minimal protocol stubs may not carry the steering collaborator.
+            active = False
+        if active:
+            raise ConcurrentExtractionError(
+                "artifact-producing model operations cannot run inside an "
+                "active steering scope; exit session.steering() first"
+            )
+
     def extract(
         self,
         concept: str,
@@ -3247,6 +3305,7 @@ class SaklasSession:
             "session.extract called while another model use is in flight",
             phase_msg="session.extract called while a generation is in flight",
         ):
+            SaklasSession._assert_unsteered_artifact_operation(self)
             from saklas.io.paths import manifold_dir
 
             ns = namespace or "local"
@@ -3271,6 +3330,18 @@ class SaklasSession:
 
             folder = manifold_dir(ns, name)
             manifest = folder / "manifold.json"
+            if manifest.exists() and not force:
+                from saklas.io.manifold_folder import ManifoldFolder
+
+                existing = ManifoldFolder.load(
+                    folder, verify_manifest=False,
+                )._roles_padded()
+                if not existing or not all(value == role for value in existing):
+                    raise ValueError(
+                        f"manifold {ns}/{name} already carries role baseline "
+                        f"{existing!r}, not uniformly {role!r}; pass force=True "
+                        "to regenerate its corpus for the requested baseline"
+                    )
             node_corpora: dict[str, list[str]] | None = None
             if force or not manifest.exists():
                 gen_roles: dict[str, str | None] | None = (
@@ -3328,6 +3399,7 @@ class SaklasSession:
             phase_msg="session.extract_vector_from_corpora called while a "
             "generation is in flight",
         ):
+            SaklasSession._assert_unsteered_artifact_operation(self)
             ns = namespace or "local"
             pos_raw, neg_raw = _split_composite_source(name, None)
             canonical = canonical_concept_name(name)
@@ -3367,24 +3439,43 @@ class SaklasSession:
         the caller.
         """
         from saklas.io.manifolds import create_discover_manifold_folder
+        from saklas.io.manifold_folder import ManifoldFolder
         from saklas.io.paths import manifold_dir
+
+        if sae is not None and role is not None:
+            raise ValueError(
+                "SAE-backed and role-baselined extraction are mutually exclusive"
+            )
 
         folder = manifold_dir(ns, name)
         manifest = folder / "manifold.json"
-        if force or not manifest.exists():
-            assert node_corpora is not None
-            node_roles: dict[str, str | None] | None = (
-                {label: role for label in node_corpora} if role else None
-            )
-            if manifest.exists():
-                import shutil
-                shutil.rmtree(folder)
-            create_discover_manifold_folder(
-                ns, name, description, fit_mode="pca",
-                node_corpora=node_corpora,
-                hyperparams={"max_dim": 1, "var_threshold": 0.7},
-                node_roles=node_roles, node_kinds=node_kinds,
-            )
+        from saklas.io.manifold_folder import _locked_manifest
+
+        with _locked_manifest(folder):
+            if manifest.exists() and not force:
+                existing = ManifoldFolder.load(
+                    folder, verify_manifest=False,
+                )._roles_padded()
+                if not existing or not all(value == role for value in existing):
+                    raise ValueError(
+                        f"manifold {ns}/{name} already carries role baseline "
+                        f"{existing!r}, not uniformly {role!r}; pass "
+                        "force=True to replace its corpus"
+                    )
+            if force or not manifest.exists():
+                assert node_corpora is not None
+                node_roles: dict[str, str | None] | None = (
+                    {label: role for label in node_corpora} if role else None
+                )
+                if manifest.exists():
+                    import shutil
+                    shutil.rmtree(folder)
+                create_discover_manifold_folder(
+                    ns, name, description, fit_mode="pca",
+                    node_corpora=node_corpora,
+                    hyperparams={"max_dim": 1, "var_threshold": 0.7},
+                    node_roles=node_roles, node_kinds=node_kinds,
+                )
         return self._fit_vector_manifold(
             name, folder, sae=sae, sae_revision=sae_revision,
             role=role, on_progress=on_progress,
@@ -3419,8 +3510,7 @@ class SaklasSession:
         manifold = pipe.fit(
             folder, sae=sae, sae_revision=sae_revision, on_progress=on_progress,
         )
-        # The newly-fit manifold changes folded directions a probe may read.
-        self._invalidate_analytics_cache()
+        self._adopt_fitted_manifold(folder, manifold)
         if sae:
             ret_name = f"{name}:sae-{sae}"
         elif role:
@@ -3438,7 +3528,76 @@ class SaklasSession:
         self.events.emit(VectorExtracted(
             name=ret_name, profile=profile, metadata=dict(profile.metadata),
         ))
+        if ret_name in self._profiles:
+            self._profiles[ret_name] = self._promote_profile(profile.as_dict())
         return ret_name, profile
+
+    def _adopt_fitted_manifold(self, folder: Any, manifold: Manifold) -> None:
+        """Refresh every in-memory consumer of a newly fitted artifact.
+
+        A fit replaces an on-disk tensor under an existing selector. Loaded
+        manifolds, folded profiles, attached monitor factors, and cached prefix
+        K/V must therefore move together; keeping any one of them would mix old
+        geometry with the new fit in the same session.
+        """
+        from pathlib import Path
+        from saklas.core.vectors import (
+            folded_vector_directions,
+            is_foldable_vector_manifold,
+        )
+
+        folder_path = Path(folder)
+        qualified = f"{folder_path.parent.name}/{folder_path.name}"
+        artifact_names = {folder_path.name, qualified}
+
+        def _matches_key(key: str) -> bool:
+            head, variant = (
+                key.rsplit(":", 1) if ":" in key else (key, "raw")
+            )
+            if head not in artifact_names:
+                return False
+            if variant.startswith("sae-"):
+                feature = variant
+            elif variant == "raw" or variant.startswith("role-"):
+                feature = "raw"
+            else:
+                # Cross-model transfers and other derived variants are
+                # independent artifacts, not aliases of this fitted tensor.
+                return False
+            return feature == manifold.feature_space
+
+        old_objects: set[int] = set()
+        matching_keys: list[str] = []
+        for key, loaded in list(self._manifolds.items()):
+            if _matches_key(key):
+                matching_keys.append(key)
+                old_objects.add(id(loaded))
+
+        promoted = manifold.to(device=self._device, dtype=torch.float32)
+        for key in matching_keys:
+            self._manifolds[key] = promoted
+
+        # Rebuild attach-time whitened factors for probes backed by an evicted
+        # object. Preserve public probe name and nearest-node roster size.
+        for probe_name, attached in self._monitor.attached_probes().items():
+            if id(attached.manifold) not in old_objects:
+                continue
+            top_n = attached.top_n
+            self._monitor.remove_probe(probe_name)
+            self._monitor.add_probe(probe_name, promoted, top_n=top_n)
+            self._probe_hash_cache.pop(probe_name, None)
+
+        matching_profiles = [key for key in self._profiles if _matches_key(key)]
+        if matching_profiles and is_foldable_vector_manifold(manifold):
+            folded = self._promote_profile(folded_vector_directions(manifold))
+            for key in matching_profiles:
+                self._profiles[key] = dict(folded)
+        else:
+            for key in matching_profiles:
+                self._profiles.pop(key, None)
+
+        self._invalidate_prefix_cache()
+        self._invalidate_analytics_cache()
 
     def fit(
         self,
@@ -3466,13 +3625,16 @@ class SaklasSession:
             "session.fit called while another model use is in flight",
             phase_msg="session.fit called while a generation is in flight",
         ):
+            SaklasSession._assert_unsteered_artifact_operation(self)
             try:
                 from saklas.core.extraction import ManifoldExtractionPipeline
                 pipe = ManifoldExtractionPipeline(self, self.events)
-                return pipe.fit(
+                manifold = pipe.fit(
                     folder, sae=sae, sae_revision=sae_revision,
                     layer_indices=layers, force=force, on_progress=on_progress,
                 )
+                self._adopt_fitted_manifold(folder, manifold)
+                return manifold
             finally:
                 # A re-fit changes the folded directions any probe reads from.
                 self._invalidate_analytics_cache()
@@ -3485,7 +3647,7 @@ class SaklasSession:
         force: bool = True,
         strict: bool = False,
     ) -> tuple[str, Profile]:
-        """Bake a steering expression into a corpus-less manifold (the merge op).
+        """Bake additive steering terms into a corpus-less manifold.
 
         The Python mirror of CLI ``manifold bake``.  Wraps
         :func:`saklas.io.merge.merge_into_manifold`, model-scoped to this
@@ -3494,14 +3656,20 @@ class SaklasSession:
         fitted tensor back to a steering :class:`Profile` and registers it
         (:meth:`steer`) so it is immediately steerable.  Returns
         ``(name, Profile)``, the same shape :meth:`extract` returns.
+
+        Dynamic terms and Mahalanobis projection operators are rejected because
+        the offline merge path does not carry an identity-matched whitener.
         """
         from saklas.io.merge import MergeError, merge_into_manifold
         from saklas.io.paths import tensor_filename
         from saklas.core.manifold import load_manifold
+        from saklas.core.model import loaded_model_fingerprint
         from saklas.core.vectors import folded_vector_directions
 
+        live_fingerprint = loaded_model_fingerprint(self._model, self.model_id)
         dst_folder = merge_into_manifold(
             name, expression, self.model_id, force=force, strict=strict,
+            expected_model_fingerprint=live_fingerprint,
         )
         tensor_path = dst_folder / tensor_filename(self.model_id)
         if not tensor_path.is_file():
@@ -4520,10 +4688,6 @@ class SaklasSession:
         # (no whitener requirement — the softmax is the calibration).
         if selector.startswith("jlens/"):
             return self._add_lens_probe(selector, as_name=as_name)
-        # Manifold reads are Mahalanobis-only: force the lazy whitener build
-        # (and its push into the monitor) before attaching, or ``add_probe`` →
-        # ``_build_whitened_factors`` raises on a missing covering whitener.
-        _ = self.whitener
         name = as_name if as_name is not None else selector
         # Probe attach loads the manifold onto the model device and builds
         # device-resident whitened factors — GPU work that must not run
@@ -4535,6 +4699,11 @@ class SaklasSession:
             "add_probe called while another model operation is in "
             "flight; retry shortly"
         ):
+            # Manifold reads are Mahalanobis-only. Build the neutral artifact
+            # under this same exclusive section so a concurrent generation
+            # cannot race it; the lazy property refuses an active steering
+            # scope before persisting anything under a neutral identity.
+            _ = self.whitener
             manifold = self._resolve_probe_manifold(selector)
             self._monitor.add_probe(name, manifold, top_n=top_n)
         # New probe → _begin_capture attaches a different layer set than was

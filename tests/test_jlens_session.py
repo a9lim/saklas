@@ -128,6 +128,26 @@ def test_fit_jlens_persists_and_property_loads() -> None:
     assert fresh.jlens.n_prompts == len(_PROMPTS)
 
 
+def test_refit_rebuilds_live_lens_probes_and_evicts_directions() -> None:
+    s = _StubSession()
+    s.fit_jlens(_PROMPTS, source_layers=[0])
+    s.enable_live_lens(layers=[0], top_k=7)
+    old_stack = s._live_lens["J_stack"]
+    s._profiles["jlens/a"] = {0: torch.ones(4)}
+    s._lens_probes["jlens/a"] = {
+        "word": "a", "token_id": 1, "layers": [0],
+    }
+
+    fitted = s.fit_jlens(_PROMPTS, source_layers=[1], force=True)
+
+    assert fitted.source_layers == [1]
+    assert s._live_lens["layers"] == [1]
+    assert s._live_lens["top_k"] == 7
+    assert s._live_lens["J_stack"] is not old_stack
+    assert s._lens_probes["jlens/a"]["layers"] == [1]
+    assert "jlens/a" not in s._profiles
+
+
 def test_jlens_property_rejects_legacy_sidecar_without_weight_identity() -> None:
     fitted = _StubSession()
     fitted.fit_jlens(_PROMPTS)
@@ -278,6 +298,40 @@ def test_loaded_model_fingerprint_hashes_buffers_and_original_dtype_bits() -> No
     assert loaded_model_fingerprint(buffer_changed, "toy") != fp
 
 
+def test_loaded_model_fingerprint_memoizes_until_sanctioned_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = torch.nn.Linear(8, 8, bias=False)
+    real_to = torch.Tensor.to
+    transfers = 0
+
+    def counted_to(self: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
+        nonlocal transfers
+        if kwargs.get("device") == "cpu":
+            transfers += 1
+        return real_to(self, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", counted_to)
+    first = loaded_model_fingerprint(model, "toy")
+    after_first = transfers
+    assert loaded_model_fingerprint(model, "toy") == first
+    assert transfers == after_first
+    with torch.no_grad():
+        model.weight.reshape(-1)[3].add_(0.5)
+    assert loaded_model_fingerprint(model, "toy") != first
+    assert transfers > after_first
+
+
+def test_loaded_model_fingerprint_explicitly_invalidates_data_writes() -> None:
+    from saklas.core.model import invalidate_loaded_model_fingerprint
+
+    model = torch.nn.Linear(10, 10, bias=False)
+    first = loaded_model_fingerprint(model, "toy")
+    model.weight.data.reshape(-1)[7].add_(10)
+    invalidate_loaded_model_fingerprint(model)
+    assert loaded_model_fingerprint(model, "toy") != first
+
+
 def test_local_source_fingerprint_includes_remote_code_and_tokenizer_files(
     tmp_path: Path,
 ) -> None:
@@ -310,6 +364,40 @@ def test_local_source_fingerprint_includes_remote_code_and_tokenizer_files(
         parameter_dtype=torch.float32,
     )
     assert third != second
+    arbitrary_resource = model_dir / "bpe.codes"
+    arbitrary_resource.write_text("old rules")
+    fourth = model_source_fingerprint(
+        str(model_dir), config=config, device="cpu",
+        parameter_dtype=torch.float32,
+    )
+    assert fourth != third
+
+
+def test_local_source_fingerprint_detects_same_size_rewrite_with_restored_mtime(
+    tmp_path: Path,
+) -> None:
+    import os
+
+    model_dir = tmp_path / "local-model"
+    model_dir.mkdir()
+    weights = model_dir / "model.safetensors"
+    weights.write_bytes(b"weights-a")
+    config = SimpleNamespace(
+        model_type="custom", _commit_hash=None, _name_or_path=str(model_dir),
+    )
+    first = model_source_fingerprint(
+        str(model_dir), config=config, device="cpu",
+        parameter_dtype=torch.float32,
+    )
+    original = weights.stat()
+    weights.write_bytes(b"weights-b")
+    os.utime(weights, ns=(original.st_atime_ns, original.st_mtime_ns))
+
+    second = model_source_fingerprint(
+        str(model_dir), config=config, device="cpu",
+        parameter_dtype=torch.float32,
+    )
+    assert second != first
 
 
 def test_jlens_property_rejects_changed_loaded_weights() -> None:

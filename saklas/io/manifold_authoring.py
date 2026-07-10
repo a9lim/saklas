@@ -9,9 +9,11 @@ live in :mod:`saklas.io.manifold_lifecycle` (not corpus authoring).
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import shutil
 import warnings
+from functools import wraps
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
@@ -37,6 +39,39 @@ from saklas.io.packs import NAME_REGEX
 from saklas.io.paths import manifold_dir, manifolds_dir
 
 
+def _lock_namespace_name(func: Any) -> Any:
+    """Serialize a mutation whose first arguments are namespace and name."""
+    signature = inspect.signature(func)
+    first, second = tuple(signature.parameters)[:2]
+
+    @wraps(func)
+    def wrapped(*args: Any, **kwargs: Any) -> Any:
+        from saklas.io.manifold_folder import _locked_manifest
+
+        bound = signature.bind(*args, **kwargs)
+        namespace = str(bound.arguments[first])
+        name = str(bound.arguments[second])
+        with _locked_manifest(manifold_dir(namespace, name)):
+            return func(*args, **kwargs)
+    return wrapped
+
+
+def _lock_folder_arg(func: Any) -> Any:
+    """Serialize a mutation whose first argument is a manifold folder."""
+    signature = inspect.signature(func)
+    first = next(iter(signature.parameters))
+
+    @wraps(func)
+    def wrapped(*args: Any, **kwargs: Any) -> Any:
+        from saklas.io.manifold_folder import _locked_manifest
+
+        bound = signature.bind(*args, **kwargs)
+        folder = Path(bound.arguments[first])
+        with _locked_manifest(Path(folder)):
+            return func(*args, **kwargs)
+    return wrapped
+
+
 # ===================================================== discovery + authoring ===
 #
 # The functions below are the shared backend for `saklas manifold`
@@ -53,7 +88,9 @@ def iter_manifold_folders(
 
     Walks ``~/.saklas/manifolds/<ns>/<name>/``; malformed folders are
     skipped rather than raising, so one bad manifold does not break a
-    listing.  Optionally filtered to a single ``namespace``.
+    listing.  Discovery is metadata-only: fitted payload hashes are verified
+    at explicit use/publish/install boundaries, not while routing selectors or
+    rendering inventories.  Optionally filtered to a single ``namespace``.
     """
     root = manifolds_dir()
     if not root.exists():
@@ -67,7 +104,9 @@ def iter_manifold_folders(
             if not (mdir / "manifold.json").exists():
                 continue
             try:
-                yield ns_dir.name, ManifoldFolder.load(mdir)
+                yield ns_dir.name, ManifoldFolder.load(
+                    mdir, verify_manifest=False,
+                )
             except ManifoldFormatError:
                 continue
 
@@ -187,6 +226,7 @@ def _load_with_advisories(folder: Path) -> tuple["ManifoldFolder", list[str]]:
     return mf, [str(w.message) for w in caught]
 
 
+@_lock_namespace_name
 def create_manifold_folder(
     namespace: str,
     name: str,
@@ -298,6 +338,7 @@ def _validate_discover_labels(name: str, labels: object) -> list[str]:
     return out
 
 
+@_lock_namespace_name
 def create_manifold_from_template(
     namespace: str,
     name: str,
@@ -338,6 +379,7 @@ def create_manifold_from_template(
     )
 
 
+@_lock_namespace_name
 def create_discover_manifold_folder(
     namespace: str,
     name: str,
@@ -475,6 +517,7 @@ def _create_discover_manifold_folder(
     return folder
 
 
+@_lock_namespace_name
 def create_baked_manifold_folder(
     namespace: str,
     name: str,
@@ -487,6 +530,8 @@ def create_baked_manifold_folder(
     source: str = "local",
     force: bool = False,
     components: Optional[dict[str, Any]] = None,
+    model_fingerprint: str,
+    model_id_is_safe: bool = False,
 ) -> tuple[Path, "ManifoldFolder"]:
     """Persist a corpus-less pre-baked Manifold as a ``fit_mode="baked"`` folder.
 
@@ -538,15 +583,18 @@ def create_baked_manifold_folder(
         payload["source"] = source
     write_json_atomic(folder / "manifold.json", payload)
 
-    save_baked_manifold_tensor(
+    tensor_path = save_baked_manifold_tensor(
         folder, manifold, model_id, method=method, components=components,
+        model_fingerprint=model_fingerprint,
+        model_id_is_safe=model_id_is_safe,
     )
 
-    mf = ManifoldFolder.load(folder)
-    mf.write_metadata()  # back-fill the files integrity manifest
+    mf = ManifoldFolder.load(folder, verify_manifest=False)
+    mf.update_file_hashes(tensor_path, tensor_path.with_suffix(".json"))
     return folder, mf
 
 
+@_lock_folder_arg
 def save_baked_manifold_tensor(
     folder: Path,
     manifold: "Any",
@@ -554,6 +602,8 @@ def save_baked_manifold_tensor(
     *,
     method: str,
     components: Optional[dict[str, Any]] = None,
+    model_fingerprint: str,
+    model_id_is_safe: bool = False,
 ) -> Path:
     """Write one per-model tensor + sidecar into a ``fit_mode="baked"`` folder.
 
@@ -578,12 +628,21 @@ def save_baked_manifold_tensor(
         "fit_mode": "baked",
         "nodes_sha256": nodes_sha,
     }
+    if not model_fingerprint:
+        raise ValueError("baked manifold tensors require a proven model fingerprint")
+    save_meta["model_fingerprint"] = model_fingerprint
     share_metric = manifold.metadata.get("share_metric")
     if share_metric:
         save_meta["share_metric"] = share_metric
     if components:
         save_meta["components"] = components
-    tensor_path = folder / tensor_filename(model_id)
+    if method == "merge":
+        from saklas.io.manifold_folder import MERGE_BAKE_POLICY
+
+        save_meta["bake_policy"] = MERGE_BAKE_POLICY
+    tensor_path = folder / tensor_filename(
+        model_id, model_id_is_safe=model_id_is_safe,
+    )
     save_manifold(manifold, tensor_path, save_meta)
     return tensor_path
 
@@ -667,28 +726,32 @@ def port_legacy_vector_folder(
             pass
 
     target = manifold_dir(namespace, name)
-    if (target / "manifold.json").exists():
-        if not force:
-            raise FileExistsError(
-                f"manifold {namespace}/{name} already exists; pass force=True "
-                f"to re-port"
-            )
-        shutil.rmtree(target)
+    from saklas.io.manifold_folder import _locked_manifest
 
-    _create_discover_manifold_folder(
-        namespace, name, description,
-        fit_mode="pca",
-        node_corpora={pos_label: pos_corpus, neg_label: neg_corpus},
-        hyperparams={"max_dim": 1, "var_threshold": 0.70},
-        legacy_scenarios=scenarios,
-    )
-    mf = ManifoldFolder.load(target)
-    if tags:
-        mf.tags = tags
-        mf.write_metadata(files=mf.files)
-    return target, mf
+    with _locked_manifest(target):
+        if (target / "manifold.json").exists():
+            if not force:
+                raise FileExistsError(
+                    f"manifold {namespace}/{name} already exists; pass "
+                    "force=True to re-port"
+                )
+            shutil.rmtree(target)
+
+        _create_discover_manifold_folder(
+            namespace, name, description,
+            fit_mode="pca",
+            node_corpora={pos_label: pos_corpus, neg_label: neg_corpus},
+            hyperparams={"max_dim": 1, "var_threshold": 0.70},
+            legacy_scenarios=scenarios,
+        )
+        mf = ManifoldFolder.load(target)
+        if tags:
+            mf.tags = tags
+            mf.write_metadata(files=mf.files)
+        return target, mf
 
 
+@_lock_folder_arg
 def write_manifold_scenarios(folder: Path, scenarios: list[str]) -> None:
     """Persist the shared scenario list to ``<folder>/scenarios.json``.
 
@@ -706,6 +769,7 @@ def write_manifold_scenarios(folder: Path, scenarios: list[str]) -> None:
     )
 
 
+@_lock_namespace_name
 def init_discover_manifold_folder(
     namespace: str,
     name: str,
@@ -785,6 +849,7 @@ def init_discover_manifold_folder(
     return folder
 
 
+@_lock_folder_arg
 def append_discover_manifold_node(
     folder: Path, index: int, label: str, statements: list[str],
 ) -> None:
@@ -1049,6 +1114,7 @@ def plan_discover_generation(
     )
 
 
+@_lock_namespace_name
 def merge_discover_manifolds(
     target_namespace: str,
     target_name: str,
@@ -1191,6 +1257,7 @@ def merge_discover_manifolds(
     )
 
 
+@_lock_folder_arg
 def update_manifold_folder(
     folder: Path,
     *,

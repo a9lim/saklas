@@ -404,3 +404,44 @@ def test_namespace_qualified_bare_name_still_resolves(tmp_path: Path, monkeypatc
     assert isinstance(term, ManifoldTerm)
     assert term.manifold == "local/persona"
     assert term.position == "pirate"
+
+
+def test_vector_authoring_rejects_role_cache_alias(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from typing import Any, cast
+    from types import SimpleNamespace
+
+    from saklas.core.session import SaklasSession
+    from saklas.io.manifolds import create_discover_manifold_folder
+
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    create_discover_manifold_folder(
+        "local", "honest.deceptive", "", fit_mode="pca",
+        node_corpora={"honest": ["yes"], "deceptive": ["no"]},
+        node_roles={"honest": "pirate", "deceptive": "pirate"},
+    )
+    with pytest.raises(ValueError, match="not uniformly None"):
+        SaklasSession._author_and_fit_2node(
+            cast(Any, SimpleNamespace()), "local", "honest.deceptive", "",
+            node_corpora=None,
+            node_kinds={"honest": "abstract", "deceptive": "abstract"},
+            role=None, force=False, sae=None, sae_revision=None,
+            on_progress=None,
+        )
+
+
+def test_vector_authoring_centrally_rejects_sae_plus_role() -> None:
+    from typing import Any, cast
+    from types import SimpleNamespace
+
+    from saklas.core.session import SaklasSession
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        SaklasSession._author_and_fit_2node(
+            cast(Any, SimpleNamespace()), "local", "honest.deceptive", "",
+            node_corpora=None,
+            node_kinds={"honest": "abstract", "deceptive": "abstract"},
+            role="pirate", force=False, sae="release", sae_revision=None,
+            on_progress=None,
+        )

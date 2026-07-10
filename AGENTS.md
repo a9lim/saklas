@@ -57,7 +57,7 @@ saklas manifold extract <concept>|<pos> <neg> [-m MODEL] [--sae RELEASE] [--role
 saklas manifold generate <name> --concepts C... [--kind abstract|concrete|custom] [--system TEMPLATE] [--samples-per-prompt K] [--seed S]
 saklas manifold from-template <template> [--name MANIFOLD] [--fit-mode auto|pca|spectral] [--max-dim N] [--var-threshold T] [--description TEXT] [-f]   # derive a discover manifold from a standalone template
 saklas manifold fit <name>|<folder> [-m MODEL] [--sae REL] [--layers L1,L2|workspace|all] [--method pca|spectral|auto] [--max-dim N] [--min-dim N] [--var-threshold T] [--k-nn K] [--bandwidth SIGMA] [--max-subspace-dim R] [--smoothing auto|0|LAMBDA] [--persistence-frac F]  # authored or discover-mode (hyperparams apply only to discover folders; --smoothing curved only, --persistence-frac auto only)
-saklas manifold bake <name> <expression> [-m]    # shared grammar: "0.3 ns/a + 0.5 ns/b|ns/c"
+saklas manifold bake <name> <expression> [-m]    # additive subset: "0.3 ns/a + 0.5 ns/b"
 saklas manifold merge <name> <src...> [-f]           # union discover-mode node corpora
 saklas manifold transfer <name> --from SRC --to TGT [-f]   # cross-model Procrustes
 saklas manifold compare <concepts...> -m MODEL [--ridge-scale R]
@@ -137,8 +137,11 @@ and `.` is used over `~` because HF repo names reject `~`.
 
 ## Steering expression grammar
 
-Every input surface — Python, YAML, HTTP, TUI, `manifold bake` — speaks the
-grammar in `saklas.core.steering_expr`. `parse_expr(text)` → `Steering`;
+Every live steering surface — Python, YAML, HTTP, and TUI — speaks the grammar
+in `saklas.core.steering_expr`. `manifold bake` parses the same syntax but accepts
+only namespace-qualified additive/subtractive scalar terms: dynamic `!`/`%`,
+triggers, multi-coefficients, and Mahalanobis `~`/`|` projections require a live
+model and are rejected offline. `parse_expr(text)` → `Steering`;
 `format_expr` round-trips it back.
 
 ```
@@ -280,15 +283,15 @@ The third artifact family, **per-model** rather than per-concept (Gurnee et al.,
 Transformer Circuits 2026). The lens is one matrix per source layer,
 `J_l = E[∂h_final/∂h_l]` — the average first-order effect of a layer's residual
 on the final-layer residual over positions and a web-text corpus — stored at
-`models/<safe_model_id>/jlens.{safetensors,json}` (fp16, `LENS_FORMAT_VERSION = 2`,
+`models/<safe_model_id>/jlens.{safetensors,json}` (fp16, `LENS_FORMAT_VERSION = 3`,
 sidecar records the immutable corpus spec + token-id sha256, exact source/live
 model identities, and tensor payload sha256).
 `lens fit` runs the estimator (`core/jlens.py::fit_jacobian_lens` — consecutive
 ragged prompts share one graph, then batched VJPs recover `dim_batch` output rows
 per backward without replicating the forward; unsupported batched VJPs fall back
-to exact scalar VJPs; the **only**
+to exact replicated row batches; the **only**
 backward passes in saklas — everything else runs under `inference_mode`, so the
-fit seeds a grad leaf at the lowest source block's input via a pre-hook and
+fit seeds a grad leaf at the lowest source block's output via a returning hook and
 reads per-layer grads from `torch.autograd.grad(final, sources)`, never
 `retain_grad`). The final-block hook stops the forward before final norm + LM
 head. Row blocks transfer through bounded stripes directly into the CPU
@@ -412,15 +415,15 @@ Three read surfaces, one write surface:
 The fit needs a pretraining-like corpus: `--corpus FILE` (one document per
 line) or, unset, a streamed fineweb-edu sample via the optional `datasets`
 dependency (`pip install 'saklas[hf]'`). ~100 prompts is usable, 1000 is
-paper-parity. The fit is **compute-bound** — each prompt costs ~`d_model × 2`
-forward-equivalents of backward work, and total FLOPs are `--dim-batch`-
-invariant (measured flat on an M5 Max: 93.6/96.9/102.5 s/prompt at
-dim_batch 8/32/64 on gemma-3-4b, identical output — so a full-depth
-100-prompt fit is ~2.6 h, and the knob is a memory dial, not a speed dial).
-The real wall-time levers: `--layers` (a 40–90% workspace-band fit measures
-1.73× faster at 54s/prompt and shrinks the artifact proportionally),
-`--seq-len` (≈linear), or fitting on a CUDA box and letting the per-model
-artifact ride over.
+paper-parity. The fit is **compute-bound** and total backward FLOPs are
+approximately `--dim-batch`-invariant; that knob is principally a memory dial.
+The older replicated, one-prompt M5 Max reference measured 93.6/96.9/102.5
+s/prompt at dim_batch 8/32/64 and 54 s/prompt for a workspace-band fit, but
+those absolute times predate batched VJPs and prompt microbatching. The current
+checked-in workspace benchmark measures two prompts in 49.08 s at
+prompt_batch=2. The real wall-time levers remain `--layers`, `--seq-len`
+(≈linear), prompt batching, or fitting on a CUDA box and letting the artifact
+ride over.
 
 ## Extraction
 
@@ -812,8 +815,8 @@ Key contracts:
 - `extract()` returns `(name, Profile)`; the `Profile` is the folded view of the
   2-node manifold. `extract_vector_from_corpora` is the corpus-in sibling;
   `fit(folder)` fits a multi-node manifold and returns a `Manifold`;
-  `bake(name, expression)` lands a corpus-less baked manifold from a steering
-  expression (the mirror of `manifold bake`). `Profile` wraps `dict[int, Tensor]`
+  `bake(name, expression)` lands a corpus-less baked manifold from qualified
+  additive scalar terms (the mirror of `manifold bake`). `Profile` wraps `dict[int, Tensor]`
   (mapping interface plus `layers`, `metadata`, `save`/`load`, `merged`,
   `projected_away`, `cosine_similarity`).
 - `session.score_choices(messages, choices, *, assistant_prefix="", steering=None)`

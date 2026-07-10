@@ -53,6 +53,23 @@ def test_verify_integrity_missing_file(tmp_path: Path):
     assert bad == ["statements.json"]
 
 
+def test_verify_integrity_detects_same_size_rewrite_with_restored_mtime(
+    tmp_path: Path,
+) -> None:
+    import os
+
+    target = tmp_path / "x.bin"
+    target.write_bytes(b"AAAA")
+    expected = packs.hash_file(target)
+    assert packs.verify_integrity(tmp_path, {"x.bin": expected}) == (True, [])
+    original = target.stat()
+    target.write_bytes(b"BBBB")
+    os.utime(target, ns=(original.st_atime_ns, original.st_mtime_ns))
+    ok, bad = packs.verify_integrity(tmp_path, {"x.bin": expected})
+    assert not ok
+    assert bad == ["x.bin"]
+
+
 def test_verify_integrity_rejects_path_traversal(tmp_path: Path):
     # A manifest entry resolving outside the folder fails rather than reading
     # off-tree (ensure_within is the path-traversal barrier).

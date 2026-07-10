@@ -16,9 +16,78 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from contextlib import suppress
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
+
+
+_ARTIFACT_LOCKS_GUARD = threading.Lock()
+_ARTIFACT_LOCKS: dict[Path, threading.RLock] = {}
+_ARTIFACT_LOCK_STATE = threading.local()
+
+
+def _lock_handle(handle: Any) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+
+
+def _unlock_handle(handle: Any) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def artifact_lock(path: Path):
+    """Cross-process, thread-reentrant lock for one logical artifact pair."""
+    path = Path(path).expanduser().resolve(strict=False)
+    lock_dir = path.parent / ".locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_dir / f"{path.name}.lock"
+    with _ARTIFACT_LOCKS_GUARD:
+        thread_lock = _ARTIFACT_LOCKS.setdefault(lock_path, threading.RLock())
+    with thread_lock:
+        depths = getattr(_ARTIFACT_LOCK_STATE, "depths", {})
+        depth = int(depths.get(lock_path, 0))
+        depths[lock_path] = depth + 1
+        _ARTIFACT_LOCK_STATE.depths = depths
+        if depth:
+            try:
+                yield
+            finally:
+                depths[lock_path] -= 1
+            return
+        acquired = False
+        try:
+            with open(lock_path, "a+b") as handle:
+                _lock_handle(handle)
+                acquired = True
+                try:
+                    yield
+                finally:
+                    if acquired:
+                        _unlock_handle(handle)
+        finally:
+            depths.pop(lock_path, None)
 
 
 def _temp_path(path: Path) -> Path:

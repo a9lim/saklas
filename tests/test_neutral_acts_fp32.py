@@ -21,10 +21,32 @@ import torch
 from safetensors.torch import load_file, save_file
 
 from saklas.core.mahalanobis import LayerWhitener, WhitenerError
-from saklas.io.alignment import _neutral_acts_paths, load_or_compute_neutral_activations
+from saklas.io.alignment import (
+    _neutral_acts_paths,
+    load_or_compute_neutral_activations,
+    validate_neutral_cache_metadata,
+)
 from saklas.io.paths import model_dir
 
 MODEL_ID = "test-org/test-model"
+
+
+class _Tokenizer:
+    chat_template = None
+    all_special_ids: list[int] = []
+    added_tokens_encoder: dict[str, int] = {}
+    bos_token_id = 1
+    eos_token_id = 2
+
+    def __call__(
+        self, text: str, *, return_tensors: str, add_special_tokens: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        del return_tensors, add_special_tokens
+        return {"input_ids": torch.tensor([[3 + ord(char) % 31 for char in text]])}
+
+
+TOKENIZER = _Tokenizer()
+MODEL = torch.nn.Module()
 
 
 def _deterministic_acts() -> dict[int, torch.Tensor]:
@@ -50,7 +72,10 @@ def _patch_compute(
     """Monkeypatch the compute entry point to a fixed fp32 dict + count calls."""
     calls = {"n": 0}
 
-    def _fake_compute(model: object, tokenizer: object, layers: object) -> dict[int, torch.Tensor]:
+    def _fake_compute(
+        model: object, tokenizer: object, layers: object, **kwargs: object,
+    ) -> dict[int, torch.Tensor]:
+        del model, tokenizer, layers, kwargs
         calls["n"] += 1
         return {idx: t.clone() for idx, t in acts.items()}
 
@@ -63,7 +88,7 @@ def _patch_compute(
 
 def _compute() -> dict[int, torch.Tensor]:
     return load_or_compute_neutral_activations(
-        model=None, tokenizer=None, layers=[0, 1, 2], model_id=MODEL_ID
+        model=MODEL, tokenizer=TOKENIZER, layers=[0, 1, 2], model_id=MODEL_ID
     )
 
 
@@ -79,6 +104,25 @@ def test_store_is_fp32(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     assert on_disk, "expected neutral-activation tensors on disk"
     for k, t in on_disk.items():
         assert t.dtype == torch.float32, f"{k} stored {t.dtype}, expected fp32"
+
+
+def test_metadata_preflight_does_not_materialize_tensor_payload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_home(tmp_path, monkeypatch)
+    _patch_compute(monkeypatch, _deterministic_acts())
+    _compute()
+
+    import saklas.io.alignment as alignment
+
+    monkeypatch.setattr(
+        alignment, "load_file",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("metadata preflight materialized tensors")
+        ),
+    )
+    sidecar = validate_neutral_cache_metadata(MODEL_ID)
+    assert sidecar["n_prompts"] == 6
 
 
 def test_compute_and_cache_paths_bit_identical(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -165,15 +209,16 @@ def test_from_cache_rejects_legacy_bf16(tmp_path: Path, monkeypatch: pytest.Monk
     """
     _install_home(tmp_path, monkeypatch)
     acts = _deterministic_acts()
+    _patch_compute(monkeypatch, acts)
+    _compute()
     md = model_dir(MODEL_ID)
-    md.mkdir(parents=True, exist_ok=True)
 
     save_file(
         {f"layer_{i}": t.contiguous().to(torch.bfloat16).cpu() for i, t in acts.items()},
         str(md / "neutral_activations.safetensors"),
     )
 
-    with pytest.raises(WhitenerError, match="non-fp32"):
+    with pytest.raises(WhitenerError, match="corrupt|legacy"):
         LayerWhitener.from_cache(MODEL_ID)
 
 
@@ -189,12 +234,8 @@ def test_from_cache_builds_without_layer_means(
     """
     _install_home(tmp_path, monkeypatch)
     acts = _deterministic_acts()
-    md = model_dir(MODEL_ID)
-    md.mkdir(parents=True, exist_ok=True)
-    save_file(
-        {f"layer_{i}": t.contiguous() for i, t in acts.items()},
-        str(md / "neutral_activations.safetensors"),
-    )
+    _patch_compute(monkeypatch, acts)
+    _compute()
 
     got = LayerWhitener.from_cache(MODEL_ID)
     expected = LayerWhitener.from_neutral_activations(

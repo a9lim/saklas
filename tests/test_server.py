@@ -1151,7 +1151,7 @@ class TestLensTokenReadout:
     def test_session_info_carries_jlens_fitted(
         self, session_and_client: Any, tmp_path: Any, monkeypatch: Any,
     ) -> None:
-        """``jlens_fitted`` validates sidecar metadata, never loading tensors."""
+        """``jlens_fitted`` validates metadata plus the tensor header."""
         import torch
 
         from saklas.core.jlens import JacobianLens
@@ -1176,7 +1176,7 @@ class TestLensTokenReadout:
             corpus_sha256="abc123",
             seq_len=8,
             dim_batch=1,
-            skip_first=0,
+            skip_first=16,
         )
         resp = client.get("/saklas/v1/sessions/default")
         assert resp.json()["jlens_fitted"] is True
@@ -1187,6 +1187,83 @@ class TestLensTokenReadout:
         sidecar_path.write_text(json.dumps(sidecar))
         resp = client.get("/saklas/v1/sessions/default")
         assert resp.json()["jlens_fitted"] is False
+
+
+# ---------------------------------------------------------------------------
+# Background J-lens fit lifecycle
+# ---------------------------------------------------------------------------
+
+
+class TestLensFitLifecycle:
+    def test_start_returns_202_and_rejects_second_fit(
+        self, session_and_client: Any, monkeypatch: Any,
+    ) -> None:
+        _, client = session_and_client
+        monkeypatch.setattr(
+            "saklas.io.lens.stream_default_lens_corpus",
+            lambda _n: (["a prompt that is long enough."], "test"),
+        )
+        response = client.post(
+            "/saklas/v1/sessions/default/lens/fit",
+            json={"prompts": 1, "layers": "workspace"},
+        )
+        assert response.status_code == 202
+
+        client.app.state.lens_fit["running"] = True
+        response = client.post(
+            "/saklas/v1/sessions/default/lens/fit",
+            json={"prompts": 1},
+        )
+        assert response.status_code == 409
+
+    def test_cancel_sets_event_and_requires_running_fit(
+        self, session_and_client: Any,
+    ) -> None:
+        import threading
+
+        _, client = session_and_client
+        response = client.delete("/saklas/v1/sessions/default/lens/fit")
+        assert response.status_code == 409
+
+        event = threading.Event()
+        client.app.state.lens_fit["running"] = True
+        client.app.state.lens_fit_cancel = event
+        response = client.delete("/saklas/v1/sessions/default/lens/fit")
+        assert response.status_code == 202
+        assert event.is_set()
+        assert response.json()["message"] == "cancelling…"
+
+    def test_shutdown_requests_cancel_and_awaits_worker(
+        self, session_and_client: Any,
+    ) -> None:
+        import asyncio
+        import threading
+
+        _, client = session_and_client
+        stop = next(
+            handler
+            for handler in client.app.router.on_shutdown
+            if getattr(handler, "__name__", "") == "_stop_lens_fit"
+        )
+
+        async def _scenario() -> None:
+            event = threading.Event()
+            finished: list[bool] = []
+
+            async def _worker() -> None:
+                while not event.is_set():
+                    await asyncio.sleep(0)
+                finished.append(True)
+
+            task = asyncio.create_task(_worker())
+            client.app.state.lens_fit_cancel = event
+            client.app.state.lens_fit_task = task
+            await stop()
+            assert event.is_set()
+            assert task.done()
+            assert finished == [True]
+
+        asyncio.run(_scenario())
 
 
 # ---------------------------------------------------------------------------

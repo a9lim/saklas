@@ -19,15 +19,23 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import resource
+import shutil
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable
 
+try:  # POSIX only; Windows still runs the benchmark without the RSS field.
+    import resource
+except ImportError:  # pragma: no cover - exercised on Windows
+    resource = None  # type: ignore[assignment]
 
-def _peak_rss_bytes() -> int:
+
+def _peak_rss_bytes() -> int | None:
+    if resource is None:
+        return None
     value = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
     return value if sys.platform == "darwin" else value * 1024
 
@@ -49,7 +57,9 @@ def _measure(
     # force-fit run; repeating it on later phases would falsely imply a
     # phase-local cache/no-op measurement.
     if report_process_peak:
-        row["process_peak_rss_bytes"] = _peak_rss_bytes()
+        peak = _peak_rss_bytes()
+        if peak is not None:
+            row["process_peak_rss_bytes"] = peak
     print(json.dumps(row, sort_keys=True), flush=True)
     return result, row
 
@@ -68,6 +78,30 @@ def _load_prompts(path: Path, limit: int) -> list[str]:
     if len(prompts) < limit:
         raise ValueError(f"{path} has {len(prompts)} non-empty lines; need {limit}")
     return prompts[:limit]
+
+
+@contextmanager
+def _staged_authoring_folder(source: Path):
+    """Copy authoring inputs so ``force=True`` never mutates *source*."""
+    source = source.expanduser().resolve()
+    if not (source / "manifold.json").is_file():
+        raise ValueError(f"{source} is not a manifold folder")
+    with tempfile.TemporaryDirectory(prefix="saklas-manifold-benchmark-") as root:
+        staged = Path(root) / source.name
+        shutil.copytree(source, staged, ignore=shutil.ignore_patterns(".locks"))
+        for path in staged.glob("*.safetensors"):
+            path.unlink()
+        for path in staged.glob("*.gguf"):
+            path.unlink()
+        for path in staged.glob("*.json"):
+            if path.name not in {"manifold.json", "scenarios.json"}:
+                path.unlink()
+        manifest = json.loads((staged / "manifold.json").read_text())
+        manifest["files"] = {}
+        (staged / "manifold.json").write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+        )
+        yield staged
 
 
 def _run_jlens(args: argparse.Namespace) -> None:
@@ -103,28 +137,28 @@ def _run_jlens(args: argparse.Namespace) -> None:
 def _run_manifold(args: argparse.Namespace) -> None:
     from saklas.core.session import SaklasSession
 
-    with SaklasSession.from_pretrained(
-        args.model, device=args.device, quantize=args.quantize, probes=[],
-    ) as session:
-        counters, handle = _install_forward_counter(session._model)
-        try:
-            fit_kwargs = {
-                "layers": args.layers,
-                "sae": args.sae,
-                "sae_revision": args.sae_revision,
-            }
-            _measure(
-                "manifold_force_fit",
-                lambda: session.fit(args.folder, force=True, **fit_kwargs),
-                counters, report_process_peak=True,
-            )
-            _measure(
-                "manifold_exact_cache_repeat",
-                lambda: session.fit(args.folder, force=False, **fit_kwargs),
-                counters,
-            )
-        finally:
-            handle.remove()
+    with _staged_authoring_folder(args.folder) as staged:
+        with SaklasSession.from_pretrained(
+            args.model, device=args.device, quantize=args.quantize, probes=[],
+        ) as session:
+            counters, handle = _install_forward_counter(session._model)
+            try:
+                fit_kwargs = {
+                    "layers": args.layers,
+                    "sae": args.sae,
+                }
+                _measure(
+                    "manifold_force_fit",
+                    lambda: session.fit(staged, force=True, **fit_kwargs),
+                    counters, report_process_peak=True,
+                )
+                _measure(
+                    "manifold_exact_cache_repeat",
+                    lambda: session.fit(staged, force=False, **fit_kwargs),
+                    counters,
+                )
+            finally:
+                handle.remove()
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -151,7 +185,6 @@ def _parser() -> argparse.ArgumentParser:
     model_args(manifold)
     manifold.add_argument("folder", type=Path)
     manifold.add_argument("--sae")
-    manifold.add_argument("--sae-revision")
     manifold.set_defaults(run=_run_manifold)
     return parser
 

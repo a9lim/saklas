@@ -75,8 +75,9 @@ def _manifold_tensor_files(
 ) -> list[Path]:
     """Per-model fitted tensors + their ``.json`` sidecars under ``folder``.
 
-    Globs ``*.safetensors``, filters by ``variant`` (``raw`` / ``sae`` /
-    ``from`` / ``all``), and pairs each kept tensor with its sidecar.  The
+    Scans fitted tensors and sidecars independently, filters by ``variant``
+    (``raw`` / ``sae`` / ``from`` / ``all``), and keeps orphaned halves so
+    ``clear`` can repair an interrupted or corrupted fit.  The
     node corpus and ``manifold.json`` are never touched — this is the
     fitted-artifact layer only.
 
@@ -90,9 +91,19 @@ def _manifold_tensor_files(
     from saklas.io.paths import parse_tensor_filename, safe_model_id
 
     target_safe = safe_model_id(model_scope) if model_scope is not None else None
-    out: list[Path] = []
-    for ts in sorted(folder.glob("*.safetensors")):
-        parsed = parse_tensor_filename(ts.name)
+    out: set[Path] = set()
+    candidates = list(folder.glob("*.safetensors")) + [
+        sidecar
+        for sidecar in folder.glob("*.json")
+        if sidecar.name != "manifold.json"
+    ]
+    for candidate in candidates:
+        tensor_name = (
+            candidate.with_suffix(".safetensors").name
+            if candidate.suffix == ".json"
+            else candidate.name
+        )
+        parsed = parse_tensor_filename(tensor_name)
         if parsed is None:
             continue
         model, var = parsed
@@ -101,14 +112,24 @@ def _manifold_tensor_files(
         key = "raw" if var is None else var
         if not _manifold_tensor_variant_matches(key, variant):
             continue
-        out.append(ts)
-        sc = ts.with_suffix(".json")
-        if sc.exists():
-            out.append(sc)
-    return out
+        out.add(candidate)
+    return sorted(out)
 
 
 def clear_manifold_tensors(
+    namespace: str, name: str, model_scope: Optional[str] = None, *, variant: str = "all",
+) -> int:
+    """Atomically clear selected fitted pairs and their manifest entries."""
+    from saklas.io.manifold_folder import _locked_manifest
+
+    folder = manifold_dir(namespace, name)
+    with _locked_manifest(folder):
+        return _clear_manifold_tensors_locked(
+            namespace, name, model_scope, variant=variant,
+        )
+
+
+def _clear_manifold_tensors_locked(
     namespace: str, name: str, model_scope: Optional[str] = None, *, variant: str = "all",
 ) -> int:
     """Delete a manifold's per-model fitted tensors, keeping the corpus.
@@ -131,12 +152,18 @@ def clear_manifold_tensors(
     folder = manifold_dir(namespace, name)
     if not (folder / "manifold.json").exists():
         raise ManifoldNotFoundError(f"manifold {namespace}/{name} not found at {folder}")
-    # Load *before* unlinking — once the tensors are gone the populated
-    # ``files`` manifest would fail the integrity check on a reload.  Keep
-    # the in-memory folder and re-hash from disk afterward, the same shape
-    # ``cache_ops.delete_tensors`` uses (load, mutate, re-hash).
-    mf = ManifoldFolder.load(folder)
-    if mf.fit_mode == "baked":
+    # This is a repair operation: even the non-integrity folder loader parses
+    # every fitted sidecar and rejects orphan halves. Read only the authoring
+    # manifest so the corrupt selected artifacts remain deletable.
+    manifest_path = folder / "manifold.json"
+    try:
+        with open(manifest_path) as handle:
+            manifest_data = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ManifoldFormatError(
+            f"manifold {namespace}/{name} manifest is unreadable: {exc}"
+        ) from exc
+    if manifest_data.get("fit_mode") == "baked":
         # A baked manifold has no corpus to re-fit from — deleting its tensor
         # would destroy the only copy of its geometry.  Refuse; ``manifold rm``
         # is the way to remove it wholesale.
@@ -160,7 +187,7 @@ def clear_manifold_tensors(
         except (OSError, json.JSONDecodeError, TypeError):
             pass
     for f in files:
-        f.unlink()
+        f.unlink(missing_ok=True)
     if capture_groups:
         from saklas.io.paths import models_dir
 
@@ -168,14 +195,51 @@ def clear_manifold_tensors(
             cache_dir = models_dir() / safe_model / "manifold_capture"
             for cached in cache_dir.glob(f"{capture_sha}.*"):
                 cached.unlink()
-    if files:
-        # ``write_metadata`` defaults to re-hashing the now-smaller
-        # on-disk tensor set via ``hash_manifold_files``.
-        mf.write_metadata()
+    # Repair only the selected manifest entries. Re-hashing every survivor
+    # here would bless an unrelated corrupt model/variant while clearing this
+    # one. Preserve untouched expected digests byte-for-byte.
+    from saklas.io.paths import safe_model_id
+
+    target_safe = safe_model_id(model_scope) if model_scope is not None else None
+
+    def _selected_manifest_entry(filename: str) -> bool:
+        candidate = (
+            Path(filename).with_suffix(".safetensors").name
+            if filename.endswith(".json")
+            else filename
+        )
+        parsed = parse_tensor_filename(candidate)
+        if parsed is None:
+            return False
+        safe_model, parsed_variant = parsed
+        key = "raw" if parsed_variant is None else parsed_variant
+        return (
+            (target_safe is None or safe_model == target_safe)
+            and _manifold_tensor_variant_matches(key, variant)
+        )
+
+    manifest_files = manifest_data.get("files", {})
+    if not isinstance(manifest_files, dict):
+        raise ManifoldFormatError("manifold files manifest must be an object")
+    manifest_data["files"] = {
+        name: digest
+        for name, digest in manifest_files.items()
+        if not _selected_manifest_entry(name)
+    }
+    write_json_atomic(manifest_path, manifest_data)
     return len(files)
 
 
 def remove_manifold_folder(namespace: str, name: str) -> dict[str, Any]:
+    """Remove a whole folder while excluding concurrent fits/mutations."""
+    from saklas.io.manifold_folder import _locked_manifest
+
+    folder = manifold_dir(namespace, name)
+    with _locked_manifest(folder):
+        return _remove_manifold_folder_locked(namespace, name)
+
+
+def _remove_manifold_folder_locked(namespace: str, name: str) -> dict[str, Any]:
     """Remove a whole manifold folder (rm), bundled-respawn semantics.
 
     The manifold analogue of ``saklas.io.cache_ops.uninstall`` for a
@@ -233,6 +297,19 @@ def remove_manifold_folder(namespace: str, name: str) -> dict[str, Any]:
 
 
 def refresh_manifold(
+    namespace: str, name: str, *, model_scope: Optional[str] = None, force: bool = True,
+) -> str:
+    """Refresh a folder while excluding concurrent fits/mutations."""
+    from saklas.io.manifold_folder import _locked_manifest
+
+    folder = manifold_dir(namespace, name)
+    with _locked_manifest(folder):
+        return _refresh_manifold_locked(
+            namespace, name, model_scope=model_scope, force=force,
+        )
+
+
+def _refresh_manifold_locked(
     namespace: str, name: str, *, model_scope: Optional[str] = None, force: bool = True,
 ) -> str:
     """Re-pull / re-materialize a manifold from its source.
@@ -309,6 +386,40 @@ def transfer_manifold(
     to_model: str,
     alignment: dict[int, torch.Tensor],
     transfer_quality_estimate: Optional[float] = None,
+    source_model_fingerprint: str,
+    target_model_fingerprint: str,
+    whitener: "Any | None" = None,
+    force: bool = False,
+) -> Path:
+    """Publish one transferred tensor/sidecar/manifest update atomically."""
+    from saklas.io.atomic import artifact_lock
+    from saklas.io.manifold_folder import _locked_manifest
+    from saklas.io.paths import tensor_filename
+
+    target = Path(folder) / tensor_filename(
+        to_model, transferred_from=from_model,
+    )
+    with _locked_manifest(Path(folder)):
+        with artifact_lock(target):
+            return _transfer_manifold_locked(
+                folder, from_model=from_model, to_model=to_model,
+                alignment=alignment,
+                transfer_quality_estimate=transfer_quality_estimate,
+                source_model_fingerprint=source_model_fingerprint,
+                target_model_fingerprint=target_model_fingerprint,
+                whitener=whitener, force=force,
+            )
+
+
+def _transfer_manifold_locked(
+    folder: Path,
+    *,
+    from_model: str,
+    to_model: str,
+    alignment: dict[int, torch.Tensor],
+    transfer_quality_estimate: Optional[float] = None,
+    source_model_fingerprint: str,
+    target_model_fingerprint: str,
     whitener: "Any | None" = None,
     force: bool = False,
 ) -> Path:
@@ -370,11 +481,10 @@ def transfer_manifold(
         save_manifold,
         transfer_manifold_subspaces,
     )
-    from saklas.io.paths import safe_model_id, tensor_filename
+    from saklas.io.paths import tensor_filename
 
     folder = Path(folder)
-    safe_from = safe_model_id(from_model)
-    src_tensor = folder / f"{safe_from}.safetensors"
+    src_tensor = folder / tensor_filename(from_model)
     if not src_tensor.exists():
         raise ManifoldNotFoundError(
             f"manifold {folder.name!r} has no fit for source model "
@@ -387,6 +497,18 @@ def transfer_manifold(
         )
 
     src = load_manifold(src_tensor)
+    # ``load_manifold`` returns metadata from the same locked pair read.  Do
+    # not reopen the sidecar outside that transaction and create a TOCTOU gap.
+    source_sidecar: dict[str, Any] = dict(src.metadata)
+    if not source_model_fingerprint or not target_model_fingerprint:
+        raise ManifoldFormatError(
+            "transfer requires proven source and target model fingerprints"
+        )
+    if source_sidecar.get("model_fingerprint") != source_model_fingerprint:
+        raise ManifoldFormatError(
+            "transfer source manifold was fitted for different loaded weights; "
+            "refit the source manifold before transfer"
+        )
     # The subspace re-mapping + target-space share re-bake is pure-tensor
     # compute owned by ``core.manifold``; this io function only orchestrates the
     # folder read/write around it.  ``transfer_manifold_subspaces`` raises
@@ -417,12 +539,10 @@ def transfer_manifold(
     # stamp the transfer method + source id.  ``save_manifold`` reads
     # provenance keys off this metadata dict.
     metadata: dict[str, object] = dict(src.metadata)
-    src_sidecar_path = src_tensor.with_suffix(".json")
-    if src_sidecar_path.exists():
-        with open(src_sidecar_path) as f:
-            metadata.update(json.load(f))
+    metadata.update(source_sidecar)
     metadata["method"] = "manifold_procrustes_transfer"
     metadata["source_model_id"] = from_model
+    metadata["model_fingerprint"] = target_model_fingerprint
     # Record the *target* share metric (the source sidecar's value rode in
     # via the ``metadata.update`` above and would be misleading).
     # ``subspace_metric`` is left as the source carried it — the basis was
@@ -444,13 +564,17 @@ def transfer_manifold(
     with open(sidecar_path) as f:
         sc_data = json.load(f)
     sc_data["source_model_id"] = from_model
+    sc_data["source_model_fingerprint"] = source_model_fingerprint
+    sc_data["model_fingerprint"] = target_model_fingerprint
     if transfer_quality_estimate is not None:
         sc_data["transfer_quality_estimate"] = float(transfer_quality_estimate)
     write_json_atomic(sidecar_path, sc_data)
     # Refresh the folder integrity manifest so the new tensor + sidecar
     # are covered (mirrors the fit path).  The sidecar patch above must
     # happen *before* this re-hash so the manifest covers the final bytes.
-    ManifoldFolder.load(folder).write_metadata()
+    ManifoldFolder.load(folder, verify_manifest=False).update_file_hashes(
+        out_path, sidecar_path,
+    )
     return out_path
 
 
@@ -486,7 +610,11 @@ def manifold_summary(folder: Path) -> dict[str, Any]:
     :class:`ManifoldFormatError` on a malformed folder.
     """
     folder = Path(folder)
-    mf = ManifoldFolder.load(folder)
+    # A summary reports authoring metadata and fitted filenames only.  Payload
+    # integrity remains mandatory when a tensor is installed, pushed, or used;
+    # hashing every historical fit here makes ordinary show/detail routing
+    # scale with artifact bytes rather than metadata size.
+    mf = ManifoldFolder.load(folder, verify_manifest=False)
     namespace = folder.parent.name
 
     if mf.fit_mode == "authored" and mf.domain:

@@ -35,6 +35,7 @@ this module owns folder discovery, the node corpus, and integrity.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 import hashlib
 import json
 import re
@@ -82,6 +83,16 @@ _FIT_MODES_BAKED: frozenset[str] = frozenset({"baked"})
 _FIT_MODES_ALL: frozenset[str] = (
     frozenset({"authored"}) | _FIT_MODES_DISCOVER | _FIT_MODES_BAKED
 )
+MERGE_BAKE_POLICY = "additive_union_v1"
+
+
+@contextmanager
+def _locked_manifest(folder: Path):
+    """Serialize cross-process manifest read-modify-write for one folder."""
+    from saklas.io.atomic import artifact_lock
+
+    with artifact_lock(folder.parent / f"{folder.name}.manifest"):
+        yield
 
 # Per-method hyperparameter whitelists.  Anything outside the whitelist
 # for a given fit_mode is dropped at folder-create time so a user
@@ -311,11 +322,13 @@ class ManifoldSidecar:
     nodes_sha256: Optional[str] = None
     sae_release: Optional[str] = None
     sae_revision: Optional[str] = None
+    sae_fingerprint: Optional[str] = None
     sae_ids_by_layer: dict[str, str] = field(default_factory=dict)
     sae_full_coverage: bool = False
     model_fingerprint: Optional[str] = None
     capture_sha256: Optional[str] = None
     fitted_layers: list[int] = field(default_factory=list)
+    fit_policy_version: Optional[int] = None
     # Discover-mode-only fields.  ``None`` on authored fits.
     fit_mode: str = "authored"
     hyperparams: dict[str, Any] = field(default_factory=dict)
@@ -328,11 +341,12 @@ class ManifoldSidecar:
     # steerable subspace).  Empty on fits that predate it.
     node_spread_per_layer: dict[str, Any] = field(default_factory=dict)
     # Merge provenance on a ``fit_mode="baked"`` manifold — the
-    # ``{coord: {alpha, project_away, tensor_sha256}}`` map written by
+    # ``{coord: {alpha, tensor_sha256}}`` map written by
     # :func:`saklas.io.merge.merge_into_manifold`.  ``None`` on every fit that
     # isn't a merge (the common case).  Informational only — a baked
     # manifold never re-fits, so nothing branches on it.
     components: Optional[dict[str, Any]] = None
+    bake_policy: Optional[str] = None
     # Per-node assistant-role substitution used at fit time, in
     # ``node_labels`` index order.  ``None`` for a given node (and an
     # empty list as a whole) = "standard assistant baseline" — the
@@ -366,11 +380,13 @@ class ManifoldSidecar:
             nodes_sha256=data.get("nodes_sha256"),
             sae_release=data.get("sae_release"),
             sae_revision=data.get("sae_revision"),
+            sae_fingerprint=data.get("sae_fingerprint"),
             sae_ids_by_layer=dict(data.get("sae_ids_by_layer", {})),
             sae_full_coverage=bool(data.get("sae_full_coverage", False)),
             model_fingerprint=data.get("model_fingerprint"),
             capture_sha256=data.get("capture_sha256"),
             fitted_layers=sorted(int(idx) for idx in data.get("fitted_layers", [])),
+            fit_policy_version=data.get("fit_policy_version"),
             fit_mode=data.get("fit_mode", "authored"),
             hyperparams=dict(data.get("hyperparams", {})),
             diagnostics=dict(data.get("diagnostics", {})),
@@ -378,6 +394,7 @@ class ManifoldSidecar:
             node_roles=list(data.get("node_roles", [])),
             node_kinds=list(data.get("node_kinds", [])),
             components=data.get("components"),
+            bake_policy=data.get("bake_policy"),
         )
 
 
@@ -903,74 +920,83 @@ class ManifoldFolder:
     # -- manifest ----------------------------------------------------------
 
     def write_metadata(self, *, files: Optional[dict[str, str]] = None) -> None:
-        """Rewrite ``manifold.json``, re-hashing the ``files`` manifest.
+        """Rewrite authoring metadata while preserving trusted fitted hashes.
 
-        Called by the fit step after writing a new per-model tensor so the
-        integrity manifest covers every fitted artifact.
+        Fitted writers must call :meth:`update_file_hashes` with their exact
+        outputs. A metadata-only rewrite never scans and blesses unrelated
+        top-level files. The locked latest manifest supplies ``files`` when an
+        explicit trusted mapping is not provided.
         """
-        if files is None:
-            files = hash_manifold_files(self.folder)
-        self.files = files
-        payload: dict[str, Any] = {
-            "format_version": MANIFOLD_FORMAT_VERSION,
-            "name": self.name,
-            "description": self.description,
-            "fit_mode": self.fit_mode,
-            "files": files,
-        }
+        with _locked_manifest(self.folder):
+            if files is None:
+                with open(self.folder / "manifold.json") as handle:
+                    latest = json.load(handle).get("files", {})
+                if not isinstance(latest, dict):
+                    raise ManifoldFormatError(
+                        "manifold files manifest is not an object"
+                    )
+                files = dict(latest)
+            self.files = files
+            payload: dict[str, Any] = {
+                "format_version": MANIFOLD_FORMAT_VERSION,
+                "name": self.name,
+                "description": self.description,
+                "fit_mode": self.fit_mode,
+                "files": files,
+            }
         # Preserve provenance across re-fits, mirroring how a pack's
         # ``source`` survives ``PackMetadata.write``.  Only the default
         # ``"local"`` is omitted, so a hand-authored / generated folder
         # stays byte-identical to the pre-source shape; an ``hf://`` or
         # ``bundled`` tier is written so ``refresh_manifold`` can find it
         # after a fit has rewritten the manifest.
-        if self.source and self.source != "local":
-            payload["source"] = self.source
+            if self.source and self.source != "local":
+                payload["source"] = self.source
         # Category tags survive re-fit, written only when non-empty so a
         # tagless manifold stays byte-identical to the pre-tags shape.
-        if self.tags:
-            payload["tags"] = list(self.tags)
+            if self.tags:
+                payload["tags"] = list(self.tags)
         # The template reference is fit-time provenance (its multi-turn contexts
         # are the elicitation prefixes), so it must survive the post-fit manifest
         # rewrite — written only when set, keeping non-templated manifests
         # byte-identical.
-        if self.template_ref is not None:
-            payload["template_ref"] = self.template_ref
+            if self.template_ref is not None:
+                payload["template_ref"] = self.template_ref
         # Per-node ``role`` is written only when set — keeps the legacy
         # shape (every node carries ``{label, coords}`` or ``{label}``
         # only) byte-identical for non-role manifolds, and a stray
         # ``role: null`` doesn't leak into the manifest for a node that
         # opted out.
-        if self.fit_mode == "authored":
-            payload["domain"] = self.domain
-            payload["nodes"] = [
-                _node_payload_authored(label, coords, role, kind)
-                for label, coords, role, kind in zip(
-                    self.node_labels, self.node_coords,
-                    self._roles_padded(), self._kinds_padded(),
-                    strict=True,
-                )
-            ]
-        elif self.fit_mode == "baked":
-            # Display domain + label-only nodes (no coords, no hyperparams).
-            payload["domain"] = self.domain
-            payload["nodes"] = [
-                _node_payload_discover(label, role, kind)
-                for label, role, kind in zip(
-                    self.node_labels, self._roles_padded(), self._kinds_padded(),
-                    strict=True,
-                )
-            ]
-        else:
-            payload["hyperparams"] = self.hyperparams
-            payload["nodes"] = [
-                _node_payload_discover(label, role, kind)
-                for label, role, kind in zip(
-                    self.node_labels, self._roles_padded(), self._kinds_padded(),
-                    strict=True,
-                )
-            ]
-        write_json_atomic(self.folder / "manifold.json", payload)
+            if self.fit_mode == "authored":
+                payload["domain"] = self.domain
+                payload["nodes"] = [
+                    _node_payload_authored(label, coords, role, kind)
+                    for label, coords, role, kind in zip(
+                        self.node_labels, self.node_coords,
+                        self._roles_padded(), self._kinds_padded(),
+                        strict=True,
+                    )
+                ]
+            elif self.fit_mode == "baked":
+                # Display domain + label-only nodes (no coords, no hyperparams).
+                payload["domain"] = self.domain
+                payload["nodes"] = [
+                    _node_payload_discover(label, role, kind)
+                    for label, role, kind in zip(
+                        self.node_labels, self._roles_padded(),
+                        self._kinds_padded(), strict=True,
+                    )
+                ]
+            else:
+                payload["hyperparams"] = self.hyperparams
+                payload["nodes"] = [
+                    _node_payload_discover(label, role, kind)
+                    for label, role, kind in zip(
+                        self.node_labels, self._roles_padded(),
+                        self._kinds_padded(), strict=True,
+                    )
+                ]
+            write_json_atomic(self.folder / "manifold.json", payload)
 
     def update_file_hashes(self, *paths: Path) -> None:
         """Refresh only newly written fitted artifacts in the integrity manifest.
@@ -979,22 +1005,36 @@ class ManifoldFolder:
         model and variant in the folder makes persistence scale with old
         artifacts rather than the work just completed; the existing manifest
         was already verified by :meth:`load`, so unchanged entries can be kept.
-        A legacy/unfitted folder with no manifest gets one full population on
-        its first write so pre-existing files do not become silently untracked.
+        Starting from an empty manifest still records only the paths named by
+        the successful writer.  Unrelated pre-existing pairs remain untrusted;
+        implicitly hashing them here would launder an interrupted or tampered
+        artifact merely because another model was fitted.
         """
-        if not self.files:
-            self.write_metadata()
-            return
-        files = dict(self.files)
-        for path in paths:
-            resolved = Path(path)
+        resolved_paths = [Path(path) for path in paths]
+        for resolved in resolved_paths:
             if resolved.parent != self.folder or not resolved.is_file():
                 raise ValueError(
                     f"manifest update path must be a fitted file in {self.folder}: "
                     f"{resolved}"
                 )
-            files[resolved.name] = hash_file(resolved)
-        self.write_metadata(files=files)
+        with _locked_manifest(self.folder):
+            manifest_path = self.folder / "manifold.json"
+            try:
+                with open(manifest_path) as handle:
+                    payload = json.load(handle)
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ManifoldFormatError(
+                    f"cannot update unreadable manifest at {manifest_path}: {exc}"
+                ) from exc
+            latest = payload.get("files", {})
+            if not isinstance(latest, dict):
+                raise ManifoldFormatError("manifold files manifest is not an object")
+            files = dict(latest)
+            for resolved in resolved_paths:
+                files[resolved.name] = hash_file(resolved)
+            payload["files"] = files
+            write_json_atomic(manifest_path, payload)
+            self.files = files
 
     def _roles_padded(self) -> list[str | None]:
         """Return ``node_roles`` padded to ``len(node_labels)`` with ``None``s.

@@ -233,6 +233,9 @@ class TestAlignmentQuality:
 
 
 class TestAlignmentCache:
+    _SRC_ID = {"model_fingerprint": "src", "capture_sha256": "a" * 64}
+    _TGT_ID = {"model_fingerprint": "tgt", "capture_sha256": "b" * 64}
+
     def test_cache_path_layout(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
         ts, sc = alignment_cache_path("google/gemma-3-4b-it", "Qwen/Qwen2.5-7B-Instruct")
@@ -249,8 +252,14 @@ class TestAlignmentCache:
         M = {0: torch.eye(D), 5: torch.eye(D)}
         quality = {0: 0.85, 5: 0.72}
 
-        save_alignment_map(M, "a/b", "c/d", quality_per_layer=quality)
-        result = load_alignment_map("a/b", "c/d")
+        save_alignment_map(
+            M, "a/b", "c/d", source_identity=self._SRC_ID,
+            target_identity=self._TGT_ID, quality_per_layer=quality,
+        )
+        result = load_alignment_map(
+            "a/b", "c/d", source_identity=self._SRC_ID,
+            target_identity=self._TGT_ID,
+        )
         assert result is not None
         loaded_M, sidecar = result
 
@@ -267,7 +276,24 @@ class TestAlignmentCache:
 
     def test_load_missing_returns_none(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-        assert load_alignment_map("nope/src", "nope/tgt") is None
+        assert load_alignment_map(
+            "nope/src", "nope/tgt", source_identity=self._SRC_ID,
+            target_identity=self._TGT_ID,
+        ) is None
+
+    def test_identity_drift_invalidates_alignment(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+        save_alignment_map(
+            {0: torch.eye(3)}, "a/b", "c/d",
+            source_identity=self._SRC_ID, target_identity=self._TGT_ID,
+        )
+        changed = {**self._SRC_ID, "model_fingerprint": "changed"}
+        assert load_alignment_map(
+            "a/b", "c/d", source_identity=changed,
+            target_identity=self._TGT_ID,
+        ) is None
 
 
 # ---------------------------------------------------------------------------

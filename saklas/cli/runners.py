@@ -64,7 +64,9 @@ def _resolve_probes(raw: list[str] | None) -> list[str] | None:
     return raw
 
 
-def _target_whitener_from_neutral_cache(model_id: str) -> Any:
+def _target_whitener_from_neutral_cache(
+    model_id: str, *, expected_identity: dict[str, Any] | None = None,
+) -> Any:
     """Build a target-model whitener from neutral activations without loading a model.
 
     Transfer re-bakes the share in the target Mahalanobis metric, which is
@@ -76,7 +78,9 @@ def _target_whitener_from_neutral_cache(model_id: str) -> Any:
     from saklas.core.mahalanobis import LayerWhitener, WhitenerError
 
     try:
-        return LayerWhitener.from_cache(model_id)
+        return LayerWhitener.from_cache(
+            model_id, expected_identity=expected_identity,
+        )
     except WhitenerError:
         raise
     except Exception as e:
@@ -94,7 +98,9 @@ def _load_or_fit_transfer_alignment(
     *,
     force: bool,
     label: str,
-) -> tuple[dict[int, Any], dict[int, float], Path]:
+) -> tuple[
+    dict[int, Any], dict[int, float], Path, dict[str, Any], dict[str, Any],
+]:
     """Load or fit a Procrustes alignment for vector/manifold transfer."""
     from saklas.io.alignment import (
         AlignmentError,
@@ -103,16 +109,47 @@ def _load_or_fit_transfer_alignment(
         fit_alignment,
         load_alignment_map,
         load_or_compute_neutral_activations,
+        neutral_cache_identity,
         save_alignment_map,
+        validate_neutral_cache_metadata,
     )
 
-    cached = None if force else load_alignment_map(src_model, tgt_model)
-    if cached is not None:
-        M, sidecar = cached
-        raw_q = sidecar.get("quality_per_layer") or {}
-        quality_per_layer = {int(k): float(v) for k, v in raw_q.items()}
-        map_path, _ = alignment_cache_path(src_model, tgt_model)
-        return M, quality_per_layer, map_path
+    # Exact no-model repeat: immutable Hub commit or local snapshot identity
+    # proves that both validated neutral caches still describe the requested
+    # sources, and the alignment binds those cache identities + its own digest.
+    if not force:
+        try:
+            from saklas.core.model import model_source_fingerprint
+
+            src_cached_sidecar = validate_neutral_cache_metadata(src_model)
+            tgt_cached_sidecar = validate_neutral_cache_metadata(tgt_model)
+            src_identity = neutral_cache_identity(src_cached_sidecar)
+            tgt_identity = neutral_cache_identity(tgt_cached_sidecar)
+            src_source = model_source_fingerprint(src_model)
+            tgt_source = model_source_fingerprint(tgt_model)
+            if (
+                src_source is not None
+                and tgt_source is not None
+                and src_identity.get("model_source_fingerprint") == src_source
+                and tgt_identity.get("model_source_fingerprint") == tgt_source
+            ):
+                cached = load_alignment_map(
+                    src_model, tgt_model,
+                    source_identity=src_identity, target_identity=tgt_identity,
+                )
+                if cached is not None:
+                    M, sidecar = cached
+                    raw_q = sidecar.get("quality_per_layer") or {}
+                    quality_per_layer = {
+                        int(k): float(v) for k, v in raw_q.items()
+                    }
+                    map_path, _ = alignment_cache_path(src_model, tgt_model)
+                    return (
+                        M, quality_per_layer, map_path,
+                        src_identity, tgt_identity,
+                    )
+        except (OSError, RuntimeError, ValueError, TypeError, KeyError):
+            pass
 
     # Need both models loaded to compute neutrals.  Loading two large models
     # simultaneously is non-trivial, so serialize: source, then target.
@@ -130,6 +167,8 @@ def _load_or_fit_transfer_alignment(
             src_sess.model, src_sess.tokenizer, src_sess.layers,
             model_id=src_model, force=force,
         )
+        src_sidecar = validate_neutral_cache_metadata(src_model)
+        src_identity = neutral_cache_identity(src_sidecar)
     with SaklasSession.from_pretrained(
         tgt_model, device="auto", probes=[],
     ) as tgt_sess:
@@ -137,6 +176,18 @@ def _load_or_fit_transfer_alignment(
             tgt_sess.model, tgt_sess.tokenizer, tgt_sess.layers,
             model_id=tgt_model, force=force,
         )
+        tgt_sidecar = validate_neutral_cache_metadata(tgt_model)
+        tgt_identity = neutral_cache_identity(tgt_sidecar)
+    cached = None if force else load_alignment_map(
+        src_model, tgt_model,
+        source_identity=src_identity, target_identity=tgt_identity,
+    )
+    if cached is not None:
+        M, sidecar = cached
+        raw_q = sidecar.get("quality_per_layer") or {}
+        quality_per_layer = {int(k): float(v) for k, v in raw_q.items()}
+        map_path, _ = alignment_cache_path(src_model, tgt_model)
+        return M, quality_per_layer, map_path, src_identity, tgt_identity
     try:
         M = fit_alignment(src_acts, tgt_acts)
     except AlignmentError as e:
@@ -146,9 +197,10 @@ def _load_or_fit_transfer_alignment(
     quality_per_layer = alignment_quality(M, src_acts, tgt_acts)
     map_path = save_alignment_map(
         M, src_model, tgt_model,
+        source_identity=src_identity, target_identity=tgt_identity,
         quality_per_layer=quality_per_layer,
     )
-    return M, quality_per_layer, map_path
+    return M, quality_per_layer, map_path, src_identity, tgt_identity
 
 
 def _make_session(args: argparse.Namespace, *, load_probes: bool = True):
@@ -485,9 +537,6 @@ def _run_manifold_extract(args: argparse.Namespace) -> None:
         sys.exit(2)
 
     requested_release = getattr(args, "sae", None)
-    if getattr(args, "sae_revision", None) and not requested_release:
-        print("extract: --sae-revision requires --sae", file=sys.stderr)
-        sys.exit(2)
     requested_role = getattr(args, "role", None)
     if requested_release and requested_role:
         print(
@@ -512,8 +561,6 @@ def _run_manifold_extract(args: argparse.Namespace) -> None:
     extract_kwargs: dict[str, Any] = {}
     if requested_release:
         extract_kwargs["sae"] = args.sae
-    if getattr(args, "sae_revision", None):
-        extract_kwargs["sae_revision"] = args.sae_revision
     if requested_role:
         extract_kwargs["role"] = requested_role
     if getattr(args, "namespace", None) is not None:
@@ -1056,9 +1103,6 @@ def _run_manifold_fit(args: argparse.Namespace) -> None:
     )
 
     _require_model(args)
-    if getattr(args, "sae_revision", None) and not getattr(args, "sae", None):
-        print("manifold fit: --sae-revision requires --sae", file=sys.stderr)
-        sys.exit(2)
 
     # Resolve ``target`` to a folder.  A path that exists on disk (or that
     # carries a ``manifold.json``) is taken as an authored-folder path —
@@ -1175,7 +1219,6 @@ def _run_manifold_fit(args: argparse.Namespace) -> None:
         manifold = session.fit(
             folder,
             sae=getattr(args, "sae", None),
-            sae_revision=getattr(args, "sae_revision", None),
             layers=getattr(args, "layers", None),
             force=bool(getattr(args, "force", False)),
             on_progress=lambda m: print(f"  {m}"),
@@ -2093,8 +2136,10 @@ def _run_manifold_transfer(args: argparse.Namespace) -> None:
         )
         sys.exit(1)
 
-    M, quality_per_layer, _ = _load_or_fit_transfer_alignment(
+    M, quality_per_layer, _, source_identity, target_identity = (
+        _load_or_fit_transfer_alignment(
         args.src_model, args.tgt_model, force=args.force, label="manifold transfer",
+        )
     )
 
     median_quality = median_or_zero(list(quality_per_layer.values())) if quality_per_layer else None
@@ -2108,7 +2153,9 @@ def _run_manifold_transfer(args: argparse.Namespace) -> None:
     from saklas.core.mahalanobis import WhitenerError
 
     try:
-        target_whitener = _target_whitener_from_neutral_cache(args.tgt_model)
+        target_whitener = _target_whitener_from_neutral_cache(
+            args.tgt_model, expected_identity=target_identity,
+        )
     except WhitenerError as e:
         print(f"manifold transfer failed: {e}", file=sys.stderr)
         sys.exit(1)
@@ -2120,6 +2167,8 @@ def _run_manifold_transfer(args: argparse.Namespace) -> None:
             to_model=args.tgt_model,
             alignment=M,
             transfer_quality_estimate=median_quality,
+            source_model_fingerprint=source_identity["model_fingerprint"],
+            target_model_fingerprint=target_identity["model_fingerprint"],
             whitener=target_whitener,
             force=args.force,
         )

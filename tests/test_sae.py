@@ -190,6 +190,18 @@ def test_sae_lens_backend_encodes_and_decodes(monkeypatch: pytest.MonkeyPatch):
     assert seen_revisions[-1] == "commit-123"
 
 
+def test_installed_sae_lens_registry_api_resolves_without_loading_weights() -> None:
+    pytest.importorskip("sae_lens")
+    from saklas.core.sae import load_sae_backend
+
+    backend = load_sae_backend(
+        "gemma-scope-2-4b-it-res",
+        model_id="google/gemma-3-4b-it", device="cpu",
+    )
+    assert backend.layers == frozenset({9, 17, 22, 29})
+    assert backend._active_sae is None
+
+
 def test_sae_lens_backend_missing_dep_raises(monkeypatch: pytest.MonkeyPatch):
     """When sae_lens isn't installed, load_sae_backend raises SaeBackendImportError."""
     import sys
@@ -289,6 +301,25 @@ def test_sae_lens_backend_canonical_layer_map_warns_on_multiple(monkeypatch: pyt
     assert len(warnings_about_multiple) >= 1
     # Layers 0 and 2 are both represented.
     assert backend.layers == frozenset({0, 2})
+
+
+def test_canonical_layer_map_sorts_width_and_l0_numerically() -> None:
+    from saklas.core.sae import _canonical_layer_map
+
+    with pytest.warns(UserWarning, match="multiple SAEs"):
+        chosen = _canonical_layer_map({
+            "layer_0_width_131k_l0_small": 0,
+            "layer_0_width_16k_l0_big": 0,
+            "layer_0_width_16k_l0_medium": 0,
+            "layer_0_width_16k_l0_small": 0,
+            "layer_1/width_16k/average_l0_105": 1,
+            "layer_1/width_16k/average_l0_13": 1,
+        })
+
+    assert chosen == {
+        "layer_0_width_16k_l0_small": 0,
+        "layer_1/width_16k/average_l0_13": 1,
+    }
 
 
 # --- DLS tests (raw PCA path; co-located with the SAE extract tests above

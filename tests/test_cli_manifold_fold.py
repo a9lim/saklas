@@ -23,7 +23,8 @@ import torch
 from saklas import cli
 from saklas.cli.runners import _run_manifold_compare, _run_manifold_why
 from saklas.core.manifold import (
-    CustomDomain, Manifold, fit_affine_subspace, save_manifold, subspace_share,
+    MANIFOLD_FIT_POLICY_VERSION, CustomDomain, Manifold,
+    fit_affine_subspace, save_manifold, subspace_share,
 )
 from saklas.io.paths import manifold_dir, model_dir, tensor_filename
 
@@ -58,7 +59,10 @@ def _seed_neutral_cache(model_id: str, *, n: int = 64, seed: int = 5) -> None:
     probe-centering mean is derived from these activations (``X.mean(0)``), so
     there is no separate ``layer_means`` cache to seed.
     """
+    import json
+
     from safetensors.torch import save_file
+    from saklas.io.packs import hash_file
 
     md = model_dir(model_id)
     md.mkdir(parents=True, exist_ok=True)
@@ -69,7 +73,27 @@ def _seed_neutral_cache(model_id: str, *, n: int = 64, seed: int = 5) -> None:
         mu = torch.randn(_DIM, generator=g, dtype=torch.float32) * 0.1
         X = torch.randn(n, _DIM, generator=g, dtype=torch.float32) * scale + mu
         acts[f"layer_{L}"] = X
-    save_file(acts, str(md / "neutral_activations.safetensors"))
+    tensor_path = md / "neutral_activations.safetensors"
+    save_file(acts, str(tensor_path))
+    (md / "neutral_activations.json").write_text(json.dumps({
+        "method": "neutral_activations",
+        "format_version": 2,
+        "capture_version": 1,
+        "capture_sha256": "test-capture",
+        "model_fingerprint": "test-fingerprint",
+        "model_source_fingerprint": "test-source",
+        "tensor_sha256": hash_file(tensor_path),
+        "layers": list(_LAYERS),
+        "tensor_schema": {
+            str(layer): {
+                "shape": list(acts[f"layer_{layer}"].shape),
+                "dtype": "torch.float32",
+            }
+            for layer in _LAYERS
+        },
+        "n_prompts": n,
+        "n_layers": len(_LAYERS),
+    }))
 
 
 def _write_fitted_manifold(
@@ -109,8 +133,19 @@ def _write_fitted_manifold(
     folder = manifold_dir(ns, name)
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / tensor_filename(_MODEL, release=None)
-    save_manifold(mfld, path, {"method": "folded_vector",
-                               "share_metric": "euclidean"})
+    metadata: dict[str, object] = {
+        "method": "folded_vector", "share_metric": "euclidean",
+        "model_fingerprint": "test-fingerprint",
+    }
+    manifest = folder / "manifold.json"
+    if manifest.exists():
+        from saklas.io.manifolds import ManifoldFolder
+
+        metadata["nodes_sha256"] = ManifoldFolder.load(
+            folder, verify_manifest=False,
+        ).nodes_sha256()
+        metadata["fit_policy_version"] = MANIFOLD_FIT_POLICY_VERSION
+    save_manifold(mfld, path, metadata)
     return path
 
 

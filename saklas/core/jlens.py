@@ -24,7 +24,7 @@ unreplicated scalar VJPs; replicated VJPs remain an explicit reference mode.
 
 This is the ONLY module in saklas that runs backward passes. The fit builds
 its own autograd-enabled forward (``torch.enable_grad()`` + a grad-seeding
-pre-hook on the first block) — the ``inference_mode`` capture machinery in
+output hook on the first fitted block) — the ``inference_mode`` capture machinery in
 ``vectors.py`` cannot be reused, because inference tensors never re-enter
 autograd. Per-layer grads come from ``torch.autograd.grad(final, sources)``
 — NOT ``backward()`` + ``retain_grad()`` (``.grad`` accumulates across the
@@ -70,10 +70,11 @@ DEFAULT_SEQ_LEN = 128
 #: 64, identical output). Halves automatically on OOM.
 DEFAULT_DIM_BATCH = 8
 # Consecutive corpus prompts per autograd graph on CPU/CUDA.  Their Jacobians
-# remain equal-prompt weighted (not equal-token weighted); MPS defaults to one
-# until real-device measurements justify the larger graph there.  OOM backoff
-# reduces this independently of ``dim_batch``.
+# remain equal-prompt weighted (not equal-token weighted).  MPS defaults to two
+# after the M5 Max / gemma-3-4b sweep measured 1.72x over one with unchanged
+# peak RSS. OOM backoff reduces this independently of ``dim_batch``.
 DEFAULT_PROMPT_BATCH = 4
+DEFAULT_MPS_PROMPT_BATCH = 2
 #: Checkpoint cadence (prompts) for resumable fits.
 DEFAULT_CHECKPOINT_EVERY = 25
 #: Backward passes between queue drains on MPS. Metal reports command-queue
@@ -101,6 +102,13 @@ class LensNotFittedError(JacobianLensError):
 
     def user_message(self) -> tuple[int, str]:
         return (404, str(self) or self.__class__.__name__)
+
+
+class JacobianLensCancelled(JacobianLensError):
+    """Raised after a cooperative fit stop at a complete-prompt boundary."""
+
+    def user_message(self) -> tuple[int, str]:
+        return (409, str(self) or "Jacobian-lens fit cancelled")
 
 
 class MultiTokenWordError(ValueError, SaklasError):
@@ -696,34 +704,30 @@ def _install_fit_hooks(
     captured: dict[int, torch.Tensor] = {}
     handles: list[Any] = []
 
-    def seed_hook(
-        _module: nn.Module, args: tuple[Any, ...], kwargs: dict[str, Any]
-    ) -> tuple[tuple[Any, ...], dict[str, Any]]:
-        # With frozen params and integer inputs no autograd graph exists at
-        # all — seed a leaf into the residual stream at the first fitted block.
-        if args:
-            seeded = args[0].detach().clone().requires_grad_(True)
-            return (seeded, *args[1:]), kwargs
-        seeded = kwargs["hidden_states"].detach().clone().requires_grad_(True)
-        return args, {**kwargs, "hidden_states": seeded}
+    first_source = min(sources)
 
-    def make_capture(idx: int) -> Callable[..., None]:
-        def hook(_module: nn.Module, _args: tuple[Any, ...], output: Any) -> None:
-            captured[idx] = _output_tensor(output)
+    def make_capture(idx: int) -> Callable[..., Any]:
+        def hook(_module: nn.Module, _args: tuple[Any, ...], output: Any) -> Any:
+            residual = _output_tensor(output)
+            if idx == first_source:
+                # Seed at the source block's OUTPUT. Autograd gradients target
+                # this residual, so retaining the block's QKV/MLP internals
+                # cannot affect J but costs a full block of graph memory.
+                residual = residual.detach().clone().requires_grad_(True)
+                captured[idx] = residual
+                if isinstance(output, tuple):
+                    return (residual, *output[1:])
+                return residual
+            captured[idx] = residual
             if idx == final_idx:
                 raise _FitForwardComplete()
+            return None
 
         return hook
 
-    # Seed at the LOWEST source block, not block 0: everything below it then
-    # runs graph-free (frozen params + a detached input build no autograd
-    # state), so a band-restricted fit pays neither graph memory nor backward
-    # depth below its band. For the default all-layer fit this is block 0.
-    handles.append(
-        layer_modules[min(sources)].register_forward_pre_hook(
-            seed_hook, with_kwargs=True,
-        )
-    )
+    # Everything through the LOWEST source block runs graph-free. The returned
+    # leaf then seeds later blocks, so restricted fits retain no graph below
+    # the fitted band and no internals for its first block.
     for idx in {*sources, final_idx}:
         handles.append(layer_modules[idx].register_forward_hook(make_capture(idx)))
     return captured, handles
@@ -749,6 +753,7 @@ def fit_jacobian_lens(
     progress_base: int = 0,
     input_id_rows: Sequence[Sequence[int]] | None = None,
     vjp_mode: str = "auto",
+    cancel_event: Any | None = None,
 ) -> JacobianLens:
     """Fit ``J_l`` for every source layer over ``prompts``.
 
@@ -769,7 +774,7 @@ def fit_jacobian_lens(
     prompt forward instead of replicating the forward graph; ``"auto"`` tries
     that path first and falls back to exact scalar VJPs if the backend lacks
     vmap coverage. ``prompt_batch`` controls consecutive ragged prompts per
-    graph (CPU/CUDA default 4, MPS default 1); both prompt and output-dimension
+    graph (CPU/CUDA default 4, MPS default 2); both prompt and output-dimension
     batch widths back off independently on device OOM and stay below a proven
     failure ceiling for the rest of the fit.
 
@@ -844,7 +849,11 @@ def fit_jacobian_lens(
         else (
             prompt_batch
             if prompt_batch is not None
-            else (1 if device.type == "mps" else DEFAULT_PROMPT_BATCH)
+            else (
+                DEFAULT_MPS_PROMPT_BATCH
+                if device.type == "mps"
+                else DEFAULT_PROMPT_BATCH
+            )
         )
     )
     active_prompt_batch = target_prompt_batch
@@ -864,6 +873,17 @@ def fit_jacobian_lens(
     try:
         with torch.enable_grad():
             while cursor < len(prepared_rows):
+                if cancel_event is not None and cancel_event.is_set():
+                    if n_done > 0:
+                        if checkpoint_accumulator_cb is not None:
+                            checkpoint_accumulator_cb(
+                                state["acc"], n_done, state["d_model"],
+                            )
+                        if checkpoint_cb is not None:
+                            checkpoint_cb(_partial())
+                    raise JacobianLensCancelled(
+                        f"Jacobian-lens fit cancelled after {n_done} prompts"
+                    )
                 # Never cross a checkpoint boundary: every persisted count is a
                 # prefix address into the corpus, even with prompt microbatches.
                 until_checkpoint = checkpoint_every - (n_done % checkpoint_every)
@@ -907,19 +927,19 @@ def fit_jacobian_lens(
                         break
                     except _BatchedVjpUnavailable as exc:
                         assert requested_vjp_mode == "auto"
-                        state["vjp_mode"] = "scalar"
+                        state["vjp_mode"] = "replicated"
                         target_prompt_batch = 1
                         active_prompt_batch = 1
+                        durable = max(committed_row, exc.committed_until)
                         log.warning(
                             "jlens: batched VJP is unavailable on this backend — "
-                            "falling back to unreplicated scalar VJPs"
+                            "falling back to replicated output-row VJPs"
                         )
-                        if exc.committed_until > committed_row:
-                            # A backend normally reports missing vmap coverage
-                            # on the first VJP. If it fails late, some rows of
-                            # this prompt batch may already be in the corpus
-                            # accumulator. Restart this suffix fit from zero in
-                            # scalar mode rather than double-counting them.
+                        if width > 1 and durable > 0:
+                            # Rows committed from a multi-prompt graph cannot
+                            # be split into the B=1 graph replicated mode needs.
+                            # Restart the suffix shard rather than count them
+                            # again under the narrower corpus width.
                             for accumulator in state["acc"].values():
                                 accumulator.zero_()
                             n_done = 0
@@ -929,12 +949,13 @@ def fit_jacobian_lens(
                             log.warning(
                                 "jlens: batched VJP failed after committed "
                                 "rows; restarting the current fit shard in "
-                                "scalar mode"
+                                "replicated mode"
                             )
                             break
                         if width > 1:
                             restart_with_smaller_prompts = True
                             break
+                        committed_row = durable
                         continue
                     except _PromptRowsCommitted as exc:
                         committed_row = exc.committed_until
@@ -977,6 +998,17 @@ def fit_jacobian_lens(
                         if not is_out_of_memory_error(exc):
                             raise
                         if width > 1:
+                            if committed_row > 0:
+                                # A previous row block from this prompt graph
+                                # already lives in the shard accumulator.  The
+                                # raw OOM gives us no further durable boundary;
+                                # narrowing the prompt graph in place would add
+                                # those rows twice. Restart the suffix shard.
+                                for accumulator in state["acc"].values():
+                                    accumulator.zero_()
+                                n_done = 0
+                                cursor = 0
+                                committed_row = 0
                             prompt_bad_ceiling = (
                                 width if prompt_bad_ceiling is None
                                 else min(prompt_bad_ceiling, width)

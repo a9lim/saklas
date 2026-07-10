@@ -14,7 +14,8 @@ Every `~/.saklas/` path resolves through `saklas_home()` (honors `$SAKLAS_HOME`)
 Helpers: `manifolds_dir`, `manifold_dir(ns, name)`, `templates_dir`, `models_dir`, `model_dir(id)`,
 `neutral_statements_path`, `baseline_prompts_path` (user override for the shared A2
 baseline user prompts; falls back to bundled `saklas/data/baseline_prompts.json`),
-`safe_model_id` (`/` → `__`), `ensure_within(root, *parts)` (path-traversal
+`safe_model_id` (ordinary Hub ids preserve `/` → `__`; ambiguous/local ids use
+a reversible `_z` base64url tier), `ensure_within(root, *parts)` (path-traversal
 barrier). `vectors_dir` / `concept_dir` survive only for the legacy-port scan — no
 current writer targets them.
 
@@ -144,8 +145,10 @@ subclass, propagates verbatim via a `SaklasError`-first `except`). The lazy core
 imports are now just `load_manifold` / `save_manifold` /
 `transfer_manifold_subspaces` — no `LayerSubspace` / `eval_rbf` / `subspace_share` /
 `mahalanobis.WhitenerError`. `manifold_summary(folder)` is the session-independent
-serializer shared by `pack show -j` + the HTTP summary route.
-`iter_manifold_folders`, `bundled_manifold_names`, `materialize_bundled_manifolds`
+serializer shared by `pack show -j` + the HTTP summary route. Ordinary
+discovery/summary routing (`iter_manifold_folders`, `manifold_summary`, HTTP
+lookup) loads metadata with `verify_manifest=False`; install/push/fitted-tensor
+use stays strict. `bundled_manifold_names`, `materialize_bundled_manifolds`
 (copy-on-miss into `default/` for complete package-data folders only, plus a
 re-copy when the bundled manifest hash drifts or the on-disk `format_version`
 predates `MANIFOLD_FORMAT_VERSION`). Per-node `role`
@@ -299,29 +302,37 @@ Offline direction merging into a corpus-less `fit_mode="baked"` manifold.
 `merge_into_manifold(name, expression, model, *, force, strict)` resolves each
 component to a per-layer direction by folding a fitted 2-node `pca` manifold
 (`folded_vector_directions`), linearly combines the directions (`linear_sum`,
-`|` project-away via `project_away`), folds the result to a one-pole ray
+over the union of their layer coverage), folds the result to a one-pole ray
 (`fold_directions_to_subspace`), and writes a baked manifold to
 `manifolds/local/<name>/` — one fitted tensor per shared model
 (`create_baked_manifold_folder` / `save_baked_manifold_tensor`), all sharing one
-`manifold.json`. The shared grammar's `|` is accepted; triggers + bare
-un-namespaced poles are rejected. `shared_models(expression)` returns the models
-every term has a fitted tensor for. The baked sidecar carries `method="merge"` +
-per-component `components` provenance.
+`manifold.json`. Only namespace-qualified additive/subtractive scalar terms are
+accepted. Triggers, `!`, `%`, multi-coefficients, and `~`/`|` are rejected;
+projection is Mahalanobis-only and cannot be reproduced without a live whitener.
+`shared_models(expression)` returns the models every term has a fitted tensor
+for. The baked sidecar carries `method="merge"`, the unanimous component model
+fingerprint, and per-component `components` provenance. Legacy projected bakes
+are rejected at load and must be rebuilt.
 
 ## alignment.py
 
 Cross-model probe alignment via per-layer Procrustes.
 `load_or_compute_neutral_activations(...)` is the disk-cached per-model neutrals
-(the neutral corpus × layers, **fp32** — the project-wide invariant; self-heals legacy
-bf16/fp16/non-finite caches). These are what the Mahalanobis whitener builds its
-covariance from. `fit_alignment(src, tgt, *, min_shared_layers=10) → {layer: M_L}`
+(the neutral corpus × layers, **fp32** — the project-wide invariant; exact loaded
+model + rendered-token + layer-schema identity, payload-digest verified; self-heals
+legacy bf16/fp16/non-finite caches). These are what the Mahalanobis whitener builds its
+covariance from. `validate_neutral_cache_metadata` checks the digest plus
+safetensors key/shape/dtype header without paging payloads for an exact-repeat
+preflight; the materializing loader additionally checks finiteness.
+`fit_alignment(src, tgt, *, min_shared_layers=10) → {layer: M_L}`
 (orthogonal Procrustes for matched dim, rectangular least-squares otherwise; both
 center first); `alignment_quality` is per-layer R². `transfer_profile(profile,
 alignment_map, *, source_model_id, ..., whitener)` applies `M_L @ v_src` per
 layer (uncovered layers dropped, `method="procrustes_transfer"`), re-scaling each
 magnitude to its *target* Mahalanobis norm. The target whitener is **required** and
 must cover the transferred layers (`WhitenerError` otherwise; Mahalanobis-only — no
-Euclidean transfer). The fitted map round-trips under the *target* model dir
+Euclidean transfer). The fitted map binds both validated neutral-cache identities,
+both model fingerprints, and its own payload digest under the *target* model dir
 (`models/<safe_tgt>/alignments/<safe_src>.…`). `transfer_manifold`
 (`manifolds.py`) is the manifold counterpart.
 
@@ -329,7 +340,7 @@ Euclidean transfer). The fitted map round-trips under the *target* model dir
 
 The per-model Jacobian-lens artifact — `models/<safe_model_id>/jlens.
 {safetensors,json}`, peer to the neutral-activation cache and shaped like it
-(`layer_<idx>` tensor keys + atomic JSON sidecar). `LENS_FORMAT_VERSION = 2`;
+(`layer_<idx>` tensor keys + atomic JSON sidecar). `LENS_FORMAT_VERSION = 3`;
 a wrong version, missing/mismatched payload digest, non-finite tensors, or a corrupt sidecar all log a warning and
 read as "no lens" (`load_lens → None`) rather than crash — the caller decides
 whether to error (`LensNotFittedError` with the `lens fit` hint) or re-fit.

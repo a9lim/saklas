@@ -122,9 +122,8 @@ and port pre-4.0 packs.)
                                                    #   also carry node_coords (the derived layout)
     <safe_model>_sae-<rel>.safetensors             # SAE-space fit
     <safe_model>_from-<safe_src>.safetensors       # cross-model transfer
-    <safe_model>_role-<slug>.safetensors           # role-augmented
+    <safe_model>_role-<slug>.safetensors           # reserved; role fits validate the canonical tensor
   models/<safe_model>/
-    layer_means.{safetensors,json}                 # probe-centering baseline
     neutral_activations.{safetensors,json}         # neutral corpus × layers, fp32
     alignments/<safe_src>.{safetensors,json}       # Procrustes map
   vectors/<ns>/<concept>/                          # LEGACY (pre-4.0) only — ported on touch
@@ -907,9 +906,9 @@ A second, per-model read primitive alongside the whitened probe reads (Gurnee
 et al., Transformer Circuits 2026). `core/jlens.py` fits
 `J_l = E[∂h_final/∂h_l]` per source layer over a web-text corpus — the only
 backward passes in saklas (the estimator seeds an autograd leaf at the first
-fitted block's input under `torch.enable_grad()` and reads per-layer grads with
+fitted block's output under `torch.enable_grad()` and reads per-layer grads with
 `torch.autograd.grad`; everything else stays `inference_mode`). The default fit
-uses exact ragged prompt microbatches (CPU/CUDA default 4, MPS 1) plus batched
+uses exact ragged prompt microbatches (CPU/CUDA default 4, MPS 2) plus batched
 VJPs (`is_grads_batched=True`) for `ceil(d_model/dim_batch)` output-dim blocks,
 with an exact scalar fallback and env-overridable replicated reference mode
 (`SAKLAS_JLENS_VJP`). A final-block hook stops before norm + LM head. Every
@@ -965,8 +964,10 @@ consumers with zero hot-path cost when unused:
 
 ## 7. Grammar (`core/steering_expr.py`)
 
-`parse_expr(text) → Steering`; `format_expr` round-trips. Every input surface
-(Python, YAML, HTTP, TUI, `manifold bake`) speaks it.
+`parse_expr(text) → Steering`; `format_expr` round-trips. Every live steering
+surface (Python, YAML, HTTP, TUI) speaks it. `manifold bake` parses that grammar's
+namespace-qualified additive scalar subset; it rejects dynamic terms and
+Mahalanobis `~`/`|` projections because no identity-matched whitener is loaded.
 
 ```
 expr     := term (("+" | "-") term)*

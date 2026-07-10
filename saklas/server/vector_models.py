@@ -17,7 +17,6 @@ class ExtractRequest(BaseModel):
     source: Any = None
     baseline: str | None = None
     sae: str | None = None
-    sae_revision: str | None = None
     role: str | None = None
     namespace: str | None = None
     force: bool = False

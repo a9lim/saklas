@@ -8,6 +8,41 @@ import pytest
 from saklas.io import hf
 
 
+def _write_fitted_manifold(
+    folder: Path, model_id: str, *, release: str | None = None,
+) -> Path:
+    import torch
+
+    from saklas.core.manifold import (
+        MANIFOLD_FIT_POLICY_VERSION, save_manifold,
+    )
+    from saklas.core.vectors import fold_directions_to_subspace
+    from saklas.io.manifolds import ManifoldFolder
+    from saklas.io.paths import tensor_filename
+
+    manifold = fold_directions_to_subspace(
+        folder.name, {0: torch.tensor([1.0, 0.0])}, None, label="test",
+        feature_space="raw" if release is None else f"sae-{release}",
+    )
+    mf = ManifoldFolder.load(folder, verify_manifest=False)
+    path = folder / tensor_filename(model_id, release=release)
+    metadata: dict[str, Any] = {
+        "method": "manifold_pca",
+        "nodes_sha256": mf.nodes_sha256(),
+        "model_fingerprint": f"fp:{model_id}",
+        "fit_policy_version": MANIFOLD_FIT_POLICY_VERSION,
+    }
+    if release is not None:
+        metadata.update(
+            sae_release=release,
+            sae_revision="test",
+            sae_fingerprint=f"sae:{release}",
+        )
+    save_manifold(manifold, path, metadata)
+    mf.update_file_hashes(path, path.with_suffix(".json"))
+    return path
+
+
 def test_split_revision_plain():
     assert hf.split_revision("user/happy") == ("user/happy", None)
 
@@ -50,10 +85,7 @@ def test_resolve_target_coord_uses_whoami(monkeypatch: pytest.MonkeyPatch):
 
 def _author_fake_manifold(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, name: str = "mood"):
     """Author a tiny authored manifold + one fake fitted tensor under SAKLAS_HOME."""
-    import json as _json
-    from saklas.io.manifolds import (
-        ManifoldFolder, create_manifold_folder, hash_manifold_files,
-    )
+    from saklas.io.manifolds import create_manifold_folder
 
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     domain = {"type": "box", "axes": [
@@ -65,19 +97,7 @@ def _author_fake_manifold(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, na
     ]
     folder, _ = create_manifold_folder("local", name, "a mood axis", domain, nodes)
 
-    def fit(model_id: str, *, release: str | None = None):
-        from saklas.io.paths import sidecar_filename, tensor_filename
-        ts = folder / tensor_filename(model_id, release=release)
-        sc = folder / sidecar_filename(model_id, release=release)
-        ts.write_bytes(b"\x00" * 16)
-        sc.write_text(_json.dumps({
-            "method": "manifold_pca", "saklas_version": "0",
-            "domain": domain, "node_count": 3, "node_labels": [],
-        }))
-        ManifoldFolder.load(folder).write_metadata(files=hash_manifold_files(folder))
-        return ts
-
-    fit("google/gemma-2-2b-it")
+    _write_fitted_manifold(folder, "google/gemma-2-2b-it")
     return folder
 
 
@@ -173,25 +193,16 @@ def test_push_manifold_uploads_once(tmp_path: Path, monkeypatch: pytest.MonkeyPa
 
 def test_push_manifold_model_scope_and_variant_filter(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     from saklas.io import hf_manifolds as hfm
-    from saklas.io.manifolds import ManifoldFolder, hash_manifold_files
-    import json as _json
+    from saklas.io.manifolds import ManifoldFolder
 
     folder = _author_fake_manifold(tmp_path, monkeypatch)
     # Add a second model's tensor + an SAE variant for the first model.
-    domain = {"type": "box", "axes": [
-        {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]}
-    from saklas.io.paths import sidecar_filename, tensor_filename
     for model_id, release in (
         ("meta/llama-3-8b", None),
         ("google/gemma-2-2b-it", "gemma-scope"),
     ):
-        ts = folder / tensor_filename(model_id, release=release)
-        ts.write_bytes(b"\x00" * 16)
-        (folder / sidecar_filename(model_id, release=release)).write_text(
-            _json.dumps({"method": "manifold_pca", "saklas_version": "0",
-                         "domain": domain, "node_count": 3, "node_labels": []})
-        )
-    ManifoldFolder.load(folder).write_metadata(files=hash_manifold_files(folder))
+        _write_fitted_manifold(folder, model_id, release=release)
+    ManifoldFolder.load(folder)
 
     staged = _capture_push_staging(monkeypatch)
     # model_scope = gemma, variant = raw → only the canonical gemma tensor.
@@ -230,6 +241,20 @@ def test_push_manifold_corpus_only_when_unfitted(tmp_path: Path, monkeypatch: py
     assert "manifold.json" in staged
     assert "nodes/00_a.json" in staged
     assert not any(k.endswith(".safetensors") for k in staged)
+
+
+def test_push_manifold_rejects_fitted_tensor_after_corpus_edit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from saklas.io import hf_manifolds as hfm
+    from saklas.io.manifolds import ManifoldFormatError
+
+    folder = _author_fake_manifold(tmp_path, monkeypatch)
+    node = folder / "nodes" / "00_calm.json"
+    node.write_text(json.dumps(["changed source corpus"]))
+
+    with pytest.raises(ManifoldFormatError, match="stale"):
+        hfm.push_manifold(folder, "alice/mood", dry_run=True)
 
 
 # ========================================================== legacy-pack port ===

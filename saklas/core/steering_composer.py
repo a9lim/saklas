@@ -141,7 +141,8 @@ class SteeringComposer:
         ``key`` is the manifold registry key produced by the grammar:
         ``[ns/]name[:variant]``.  ``raw`` (default) selects the
         residual-stream tensor; ``sae-<release>`` selects the SAE-variant
-        tensor.  A bare name (no namespace) searches every namespace
+        tensor; ``from-*`` selects a cross-model transfer; ``role-*``
+        validates the canonical tensor's role baseline. A bare name searches
         under ``manifolds/``.  The loaded :class:`Manifold` is promoted
         onto the session device (kept fp32 — the spline math wants it).
         Raises :class:`ManifoldNotRegisteredError` on a miss.
@@ -167,15 +168,26 @@ class SteeringComposer:
                 sorted(d.name for d in root.iterdir() if d.is_dir())
                 if root.exists() else []
             )
+        transferred_from: str | None = None
+        requested_role: str | None = None
         if variant == "raw":
             release: str | None = None
         elif variant.startswith("sae-"):
             release = variant[len("sae-"):]
+        elif variant.startswith("from-"):
+            release = None
+            transferred_from = variant[len("from-"):]
+        elif variant.startswith("role-"):
+            release = None
+            requested_role = variant[len("role-"):]
         else:
             raise ManifoldNotRegisteredError(
                 f"manifold '{key}': unsupported variant '{variant}'"
             )
-        fname = tensor_filename(model_id, release=release)
+        fname = tensor_filename(
+            model_id, release=release, transferred_from=transferred_from,
+            transferred_from_is_safe=transferred_from is not None,
+        )
 
         matches = [
             (ns, manifold_dir(ns, name) / fname)
@@ -197,22 +209,62 @@ class SteeringComposer:
                 f"Qualify it with a namespace."
             )
         tensor_path = matches[0][1]
-        sidecar_path = tensor_path.with_suffix(".json")
-        if sidecar_path.exists():
-            from saklas.core.model import loaded_model_fingerprint
-            from saklas.io.manifolds import ManifoldSidecar
+        manifold = load_manifold(tensor_path)
+        metadata = manifold.metadata
+        from saklas.core.model import loaded_model_fingerprint
+        from saklas.io.paths import safe_model_id
 
-            sidecar = ManifoldSidecar.load(sidecar_path)
+        live_fingerprint = loaded_model_fingerprint(
+            self._session._model, model_id,
+        )
+        if transferred_from is not None:
+            source_id = metadata.get("source_model_id")
             if (
-                sidecar.model_fingerprint != loaded_model_fingerprint(
-                    self._session._model, model_id,
-                )
+                not isinstance(source_id, str)
+                or safe_model_id(source_id).lower() != transferred_from.lower()
             ):
                 raise ManifoldNotRegisteredError(
-                    f"manifold '{key}' was fitted for different loaded weights "
-                    f"under {model_id}; run `saklas manifold fit` again"
+                    f"manifold '{key}' transfer provenance does not match "
+                    f"source {transferred_from!r}; recompute the transfer"
                 )
-        manifold = load_manifold(tensor_path)
+        raw_roles = metadata.get("node_roles")
+        roles = (
+            list(raw_roles)
+            if isinstance(raw_roles, list)
+            else [None] * len(manifold.node_labels)
+        )
+        if requested_role is not None and (
+            not roles or not all(role == requested_role for role in roles)
+        ):
+            raise ManifoldNotRegisteredError(
+                f"manifold '{key}' was not fitted uniformly with role "
+                f"{requested_role!r}; refit it with that role"
+            )
+        if variant == "raw" and any(role is not None for role in roles):
+            raise ManifoldNotRegisteredError(
+                f"manifold '{key}' was fitted with role baseline "
+                f"{roles!r}; steer it as :role-<name> or refit raw"
+            )
+        if metadata.get("model_fingerprint") != live_fingerprint:
+            raise ManifoldNotRegisteredError(
+                f"manifold '{key}' was fitted for different loaded weights "
+                f"under {model_id}; run `saklas manifold fit` again"
+            )
+        if metadata.get("fit_mode", "authored") != "baked":
+            from saklas.core.extraction import prepare_manifold_capture_identity
+            from saklas.io.manifold_folder import ManifoldFolder
+
+            folder_mf = ManifoldFolder.load(
+                tensor_path.parent, verify_manifest=False,
+            )
+            expected_capture = prepare_manifold_capture_identity(
+                self._session, folder_mf, live_fingerprint,
+            )[3]
+            if metadata.get("capture_sha256") != expected_capture:
+                raise ManifoldNotRegisteredError(
+                    f"manifold '{key}' capture inputs changed (tokenizer, chat "
+                    "template, role framing, or baseline prompts); refit it"
+                )
         manifolds[key] = manifold.to(
             device=self._session._device, dtype=torch.float32,
         )
@@ -261,6 +313,58 @@ class SteeringComposer:
             canonical_qualified = (
                 canonical if ns is None else f"{ns}/{canonical}"
             )
+            if variant in {"sae", "from", "role"}:
+                import json
+
+                from saklas.core.errors import (
+                    AmbiguousVariantError, UnknownVariantError,
+                )
+                from saklas.io.paths import (
+                    manifold_dir, manifolds_dir, parse_tensor_filename,
+                    safe_model_id,
+                )
+
+                roots = (
+                    [(ns, manifold_dir(ns, canonical))]
+                    if ns is not None else [
+                        (entry.name, entry / canonical)
+                        for entry in manifolds_dir().iterdir()
+                        if entry.is_dir()
+                    ] if manifolds_dir().exists() else []
+                )
+                concrete: set[str] = set()
+                safe_model = safe_model_id(self._session.model_id)
+                for _candidate_ns, folder in roots:
+                    if variant == "role":
+                        sidecar_path = folder / f"{safe_model}.json"
+                        if not sidecar_path.exists():
+                            continue
+                        with open(sidecar_path) as handle:
+                            raw_sidecar = json.load(handle)
+                        roles = raw_sidecar.get("node_roles") or [
+                            None
+                        ] * int(raw_sidecar.get("node_count", 0))
+                        if roles and all(role == roles[0] for role in roles):
+                            if roles[0] is not None:
+                                concrete.add(f"role-{roles[0]}")
+                        continue
+                    for tensor_path in folder.glob(f"{safe_model}_*.safetensors"):
+                        parsed = parse_tensor_filename(tensor_path.name)
+                        if parsed is None or parsed[1] is None:
+                            continue
+                        parsed_variant = parsed[1]
+                        if parsed_variant.startswith(f"{variant}-"):
+                            concrete.add(parsed_variant)
+                if len(concrete) != 1:
+                    error = (
+                        UnknownVariantError
+                        if not concrete else AmbiguousVariantError
+                    )
+                    raise error(
+                        f"manifold '{canonical_qualified}:{variant}' resolves "
+                        f"to {sorted(concrete) or 'no fitted variants'}"
+                    )
+                variant = next(iter(concrete))
             registry_key = (
                 canonical_qualified
                 if variant == "raw"

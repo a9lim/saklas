@@ -138,13 +138,14 @@ category list through verbatim (tagged concepts only, no multi-node sweep).
   `--no-web`.
 - `manifold extract`: positional `concept` (one concept or two poles, `nargs="+"`),
   `-m/--model`, `-f/--force` (re-authors the pole corpora + bypasses the tensor
-  cache), `--sae RELEASE`, `--sae-revision REV`, `--role SLUG` (mutually exclusive
+  cache), `--sae RELEASE`, `--role SLUG` (mutually exclusive
   with `--sae`; the role bakes into the node corpora and writes the **canonical**
   tensor — no `_role-` suffix — while returning a `:role-<slug>` name tail; slug
   `[a-z0-9._-]+`), `--namespace NS` (destination; unset → `local/`). There is **no
   `--method`/`--legacy`** — difference-of-means (a 2-node `pca` fit) is the only
-  method. An existing destination tensor exits before model load; a real extract
-  constructs its session with `probes=[]` so probe bootstrap is not part of
+  method. The loaded session/pipeline validates model, corpus, tokenizer, role,
+  SAE-transform, and manifest identity before accepting a cache hit; extraction
+  constructs that session with `probes=[]` so probe bootstrap is not part of
   artifact training.
 - `manifold generate`: `name` + `--concepts C...` (required, ≥2),
   `[--kind {abstract,concrete,custom}] [--system TEMPLATE] [--samples-per-prompt K]
@@ -158,7 +159,7 @@ category list through verbatim (tagged concepts only, no multi-node sweep).
   assistant-role substitution → a persona manifold.
 - `manifold fit`: positional `target` (a manifold name *or* a folder path;
   `_run_manifold_fit` resolves it and reads `fit_mode`), `-m/--model`, `-f/--force`,
-  `--sae RELEASE`, `--sae-revision REV`, `--layers L1,L2,...|workspace|all`
+  `--sae RELEASE`, `--layers L1,L2,...|workspace|all`
   (default all; subset artifacts contain only those injection layers), plus the discover hyperparams
   `--method pca|spectral|auto`, `--max-dim N`, `--min-dim N`, `--var-threshold T`,
   `--k-nn K`, `--bandwidth SIGMA`, `--max-subspace-dim R`, `--smoothing auto|0|LAMBDA`,
@@ -187,7 +188,9 @@ category list through verbatim (tagged concepts only, no multi-node sweep).
   only) is the H1 loop-significance threshold. This verb folds the former separate
   `discover` verb.
 - `manifold bake`: `name` + `expression`, `-f`, `-s/--strict`, `-m/--model`. Lands
-  a corpus-less baked manifold via `merge_into_manifold`.
+  a corpus-less baked manifold via `merge_into_manifold`; accepts only
+  namespace-qualified additive/subtractive scalar terms. Dynamic terms and
+  Mahalanobis `~`/`|` projections are rejected without a live whitener.
 - `manifold merge`: `name` + `sources` (1+), `-f`. Unions the node corpora of
   discover-mode manifolds into a fresh folder — distinct from `bake` (which lowers a
   steering expression).
@@ -229,7 +232,7 @@ category list through verbatim (tagged concepts only, no multi-node sweep).
 - `lens fit`: positional `model`, `--corpus FILE`, `--prompts N` (100),
   `--seq-len T` (128), `--dim-batch K` (8; total backward work is K-invariant,
   so the knob trades memory for per-pass overhead), `--prompt-batch B`
-  (consecutive ragged prompts per graph; CPU/CUDA default 4, MPS 1; both widths
+  (consecutive ragged prompts per graph; CPU/CUDA default 4, MPS 2; both widths
   halve independently on OOM and stay below a proven ceiling),
   `--checkpoint-every N` (25,
   writes a self-contained checkpoint directly from the live accumulator; the

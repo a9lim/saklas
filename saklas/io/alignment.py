@@ -25,21 +25,27 @@ transferred probe as just another tensor on disk.
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Any
+import hashlib
+import json
 
 import torch
+from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 
 from saklas.core.errors import SaklasError
 from saklas.core.profile import Profile
 from saklas.io.atomic import write_json_atomic
-from saklas.io.paths import model_dir, neutral_statements_path, safe_model_id
+from saklas.io.paths import model_dir, safe_model_id
 from saklas.io.packs import hash_file
 
 log = logging.getLogger(__name__)
 
 _NEUTRAL_ACTS_NAME = "neutral_activations"
+_NEUTRAL_CACHE_FORMAT_VERSION = 2
+_NEUTRAL_CAPTURE_VERSION = 1
 
 
 # ---------------------------------------------------------------------------
@@ -56,6 +62,100 @@ def _neutral_acts_paths(model_id: str) -> tuple[Path, Path]:
     )
 
 
+def validate_neutral_cache_metadata(model_id: str) -> dict[str, Any]:
+    """Validate a neutral cache's identity and tensor header without paging data.
+
+    The payload digest proves bytes, while ``safe_open`` checks the declared
+    key/shape/dtype schema from the mmap header. This is the cheap preflight for
+    exact transfer repeats; numerical finite checks remain in the materializing
+    loader used by fits and whiteners.
+    """
+    from saklas.io.atomic import artifact_lock
+
+    ts_path, _ = _neutral_acts_paths(model_id)
+    with artifact_lock(ts_path):
+        return _validate_neutral_cache_metadata_locked(model_id)
+
+
+def _validate_neutral_cache_metadata_locked(model_id: str) -> dict[str, Any]:
+    """Header/digest validation with the neutral pair lock already held."""
+    ts_path, sc_path = _neutral_acts_paths(model_id)
+    if not ts_path.exists() or not sc_path.exists():
+        raise FileNotFoundError(f"neutral activation cache missing for {model_id}")
+    with open(sc_path) as handle:
+        sidecar = json.load(handle)
+    if (
+        sidecar.get("format_version") != _NEUTRAL_CACHE_FORMAT_VERSION
+        or sidecar.get("capture_version") != _NEUTRAL_CAPTURE_VERSION
+        or sidecar.get("tensor_sha256") != hash_file(ts_path)
+    ):
+        raise ValueError("neutral activation cache identity or payload digest mismatch")
+    layers = sidecar.get("layers")
+    schema = sidecar.get("tensor_schema")
+    if not isinstance(layers, list) or not isinstance(schema, dict):
+        raise ValueError("neutral activation cache sidecar has no layer schema")
+    expected_keys = {f"layer_{int(layer)}" for layer in layers}
+    expected_n = int(sidecar.get("n_prompts", -1))
+    with safe_open(str(ts_path), framework="pt", device="cpu") as tensors:
+        if set(tensors.keys()) != expected_keys:
+            raise ValueError("neutral activation cache layer keys do not match sidecar")
+        for key in tensors.keys():
+            layer = int(key.split("_", 1)[1])
+            spec = schema.get(str(layer), {})
+            view = tensors.get_slice(key)
+            shape = list(view.get_shape())
+            if (
+                view.get_dtype() != "F32"
+                or spec.get("dtype") != "torch.float32"
+                or shape != spec.get("shape")
+                or len(shape) != 2
+                or shape[0] != expected_n
+            ):
+                raise ValueError(
+                    f"neutral activation cache layer {layer} header failed validation"
+                )
+    return sidecar
+
+
+def load_validated_neutral_cache(
+    model_id: str,
+) -> tuple[dict[int, torch.Tensor], dict[str, Any]]:
+    """Materialize and fully validate a neutral cache without loading the model."""
+    from saklas.io.atomic import artifact_lock
+
+    ts_path, _ = _neutral_acts_paths(model_id)
+    with artifact_lock(ts_path):
+        sidecar = _validate_neutral_cache_metadata_locked(model_id)
+        tensors = load_file(str(ts_path))
+    out: dict[int, torch.Tensor] = {}
+    schema = sidecar["tensor_schema"]
+    expected_n = int(sidecar.get("n_prompts", -1))
+    for key, tensor in tensors.items():
+        layer = int(key.split("_", 1)[1])
+        expected_shape = schema.get(str(layer), {}).get("shape")
+        if (
+            tensor.dtype != torch.float32
+            or list(tensor.shape) != expected_shape
+            or tensor.ndim != 2
+            or int(tensor.shape[0]) != expected_n
+            or not bool(torch.isfinite(tensor).all())
+        ):
+            raise ValueError(f"neutral activation cache layer {layer} failed validation")
+        out[layer] = tensor
+    return out, sidecar
+
+
+def neutral_cache_identity(sidecar: dict[str, Any]) -> dict[str, Any]:
+    """Stable identity subset embedded into dependent alignment artifacts."""
+    keys = (
+        "format_version", "capture_version", "model_fingerprint",
+        "model_source_fingerprint",
+        "capture_sha256", "tensor_sha256", "layers", "tensor_schema",
+        "n_prompts",
+    )
+    return {key: sidecar.get(key) for key in keys}
+
+
 def load_or_compute_neutral_activations(
     model: Any,
     tokenizer: Any,
@@ -66,9 +166,9 @@ def load_or_compute_neutral_activations(
 ) -> dict[int, torch.Tensor]:
     """Disk-cached per-statement activations for one model.
 
-    Cache key: sha256 of ``~/.saklas/neutral_statements.json`` (same
-    discipline as ``layer_means``).  Stale cache → recompute, write,
-    return.  Fresh cache → load and return.
+    Cache identity binds the exact rendered token rows and pooling positions,
+    the loaded model weights, and the fitted layer set. The tensor payload is
+    digest-verified before reuse. Stale/legacy cache → recompute and replace.
 
     Returns ``{layer_idx: [N, D] fp32 CPU tensor}``.  Stored fp32 on disk so
     the whitener covariance is built and inverted at full precision and the
@@ -79,65 +179,65 @@ def load_or_compute_neutral_activations(
     fp32 has the range and, unlike the former bf16 store, no input-precision
     loss, at the cost of ~2× disk on this one cache.
     """
-    from saklas.core.vectors import compute_neutral_activations
+    from saklas.core.model import loaded_model_fingerprint
+    from saklas.core.vectors import (
+        _neutral_pairs,
+        _prepare_capture_batch,
+        compute_neutral_activations,
+    )
 
     ts_path, sc_path = _neutral_acts_paths(model_id)
     md = model_dir(model_id)
     md.mkdir(parents=True, exist_ok=True)
 
-    current_ns_hash: str | None = None
-    if neutral_statements_path().exists():
-        current_ns_hash = hash_file(neutral_statements_path())
+    pairs = _neutral_pairs()
+    prompts = [prompt for prompt, _ in pairs]
+    responses = [response for _, response in pairs]
+    prepared = _prepare_capture_batch(
+        tokenizer, prompts, responses, torch.device("cpu"),
+    )
+    rendered_payload = [
+        {"input_ids": ids[0].tolist(), "content_end": int(content_end)}
+        for ids, content_end in prepared
+    ]
+    capture_sha = hashlib.sha256(json.dumps(
+        {"capture_version": _NEUTRAL_CAPTURE_VERSION, "rows": rendered_payload},
+        sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    model_fingerprint = loaded_model_fingerprint(model, model_id)
+    base_model = getattr(model, "_orig_mod", model)
+    model_source_fingerprint = getattr(
+        base_model, "_saklas_source_fingerprint", None,
+    )
+    expected_layers = list(range(len(layers)))
 
     if not force and ts_path.exists() and sc_path.exists():
         try:
-            import json
-
-            with open(sc_path) as f:
-                sc = json.load(f)
-            if current_ns_hash is None or sc.get("statements_sha256") == current_ns_hash:
-                tensors = load_file(str(ts_path))
-                # Tensors stored as ``layer_<idx>``; promote to fp32 in memory
-                # (a no-op now that the store is fp32) because Procrustes / the
-                # whitener want fp32 precision.
-                out = {
-                    int(k.split("_", 1)[1]): v.float()
-                    for k, v in tensors.items()
-                }
-                # Invalidate a legacy bf16/fp16 cache: the store is now fp32 so
-                # the compute path and the cache path stay bit-identical (no
-                # precision seam on the inverted whitener covariance).  Check
-                # the RAW on-disk dtype (``tensors``, not the ``.float()``-
-                # promoted ``out``), recompute as fp32 on mismatch.
-                if any(t.dtype != torch.float32 for t in tensors.values()):
-                    log.info(
-                        "Neutral activations for %s are non-fp32 (legacy "
-                        "bf16/fp16 cache); recomputing as fp32", model_id,
-                    )
-                # Self-heal a legacy fp16 cache whose values overflowed to
-                # ±inf: gemma-3's extreme late-layer channels exceed the
-                # fp16 max (65504), poisoning the whitener (``λ=inf`` →
-                # ``K=nan``).  A non-finite cache is treated as stale and
-                # recomputed (now stored fp32, with fp16's range and no
-                # bf16 precision loss).
-                elif all(bool(torch.isfinite(t).all()) for t in out.values()):
-                    log.debug("Loaded cached neutral activations for %s", model_id)
-                    return out
-                else:
-                    log.warning(
-                        "Cached neutral activations for %s are non-finite "
-                        "(legacy fp16 overflow); recomputing as fp32.", model_id,
-                    )
+            out, sc = load_validated_neutral_cache(model_id)
+            identity_matches = (
+                sc.get("format_version") == _NEUTRAL_CACHE_FORMAT_VERSION
+                and sc.get("capture_version") == _NEUTRAL_CAPTURE_VERSION
+                and sc.get("capture_sha256") == capture_sha
+                and sc.get("model_fingerprint") == model_fingerprint
+                and sc.get("model_source_fingerprint") == model_source_fingerprint
+                and sc.get("layers") == expected_layers
+            )
+            if identity_matches:
+                log.debug("Loaded cached neutral activations for %s", model_id)
+                return out
             else:
                 log.info(
-                    "Neutral activations stale (neutral_statements changed); recomputing for %s",
+                    "Neutral activations stale (model/token/corpus/layer identity changed); "
+                    "recomputing for %s",
                     model_id,
                 )
         except Exception as e:
             log.warning("Corrupt neutral activations cache for %s, recomputing: %s", model_id, e)
 
     log.info("Computing neutral activations (one-time per model)...")
-    activations = compute_neutral_activations(model, tokenizer, layers)
+    activations = compute_neutral_activations(
+        model, tokenizer, layers, rendered=prepared,
+    )
 
     # Persist fp32 — the whitener covariance is built and inverted from these,
     # so the compute path (this fresh fp32 store) and the cache-hit path stay
@@ -146,13 +246,30 @@ def load_or_compute_neutral_activations(
     # the fp16 max of 65504 and overflowed to ±inf) without bf16's input loss,
     # at ~2× disk on this one cache.
     fp32 = {f"layer_{idx}": t.contiguous().to(torch.float32).cpu() for idx, t in activations.items()}
-    save_file(fp32, str(ts_path))
-    write_json_atomic(sc_path, {
-        "method": "neutral_activations",
-        "statements_sha256": current_ns_hash or "",
-        "n_prompts": next(iter(activations.values())).shape[0] if activations else 0,
-        "n_layers": len(activations),
-    })
+    from saklas.io.atomic import artifact_lock
+
+    with artifact_lock(ts_path):
+        tmp_path = ts_path.with_suffix(ts_path.suffix + ".tmp")
+        save_file(fp32, str(tmp_path))
+        os.replace(tmp_path, ts_path)
+        write_json_atomic(sc_path, {
+            "method": "neutral_activations",
+            "format_version": _NEUTRAL_CACHE_FORMAT_VERSION,
+            "capture_version": _NEUTRAL_CAPTURE_VERSION,
+            "capture_sha256": capture_sha,
+            "model_fingerprint": model_fingerprint,
+            "model_source_fingerprint": model_source_fingerprint,
+            "tensor_sha256": hash_file(ts_path),
+            "layers": sorted(activations),
+            "tensor_schema": {
+                str(idx): {"shape": list(t.shape), "dtype": str(t.dtype)}
+                for idx, t in sorted(activations.items())
+            },
+            "n_prompts": (
+                next(iter(activations.values())).shape[0] if activations else 0
+            ),
+            "n_layers": len(activations),
+        })
     return activations
 
 
@@ -405,6 +522,8 @@ def save_alignment_map(
     src_model_id: str,
     tgt_model_id: str,
     *,
+    source_identity: dict[str, Any],
+    target_identity: dict[str, Any],
     quality_per_layer: dict[int, float] | None = None,
 ) -> Path:
     """Persist a fitted alignment map.
@@ -417,37 +536,75 @@ def save_alignment_map(
     ts_path.parent.mkdir(parents=True, exist_ok=True)
 
     tensors = {f"layer_{idx}": M_L.contiguous().cpu() for idx, M_L in M.items()}
-    save_file(tensors, str(ts_path))
+    from saklas.io.atomic import artifact_lock
 
-    sidecar: dict[str, Any] = {
-        "method": "procrustes_alignment",
-        "source_model_id": src_model_id,
-        "target_model_id": tgt_model_id,
-        "shared_layers": sorted(M.keys()),
-    }
-    if quality_per_layer:
-        sidecar["quality_per_layer"] = {
-            str(layer): round(float(q), 6) for layer, q in quality_per_layer.items()
+    with artifact_lock(ts_path):
+        tmp_path = ts_path.with_suffix(ts_path.suffix + ".tmp")
+        save_file(tensors, str(tmp_path))
+        os.replace(tmp_path, ts_path)
+        sidecar: dict[str, Any] = {
+            "format_version": 2,
+            "method": "procrustes_alignment",
+            "source_model_id": src_model_id,
+            "target_model_id": tgt_model_id,
+            "shared_layers": sorted(M.keys()),
+            "tensor_schema": {
+                str(layer): list(tensor.shape)
+                for layer, tensor in sorted(M.items())
+            },
+            "source_neutral_identity": source_identity,
+            "target_neutral_identity": target_identity,
+            "tensor_sha256": hash_file(ts_path),
         }
-    write_json_atomic(sc_path, sidecar)
+        if quality_per_layer:
+            sidecar["quality_per_layer"] = {
+                str(layer): round(float(q), 6)
+                for layer, q in quality_per_layer.items()
+            }
+        write_json_atomic(sc_path, sidecar)
     return ts_path
 
 
 def load_alignment_map(
     src_model_id: str, tgt_model_id: str,
+    *,
+    source_identity: dict[str, Any],
+    target_identity: dict[str, Any],
 ) -> tuple[dict[int, torch.Tensor], dict[str, Any]] | None:
     """Load a cached alignment map.  Returns ``None`` when not on disk."""
     import json
 
     ts_path, sc_path = alignment_cache_path(src_model_id, tgt_model_id)
-    if not ts_path.exists() or not sc_path.exists():
-        return None
-    try:
-        tensors = load_file(str(ts_path))
-        with open(sc_path) as f:
-            sidecar = json.load(f)
-        M = {int(k.split("_", 1)[1]): v for k, v in tensors.items()}
-        return M, sidecar
-    except Exception as e:
-        log.warning("Corrupt alignment map cache (%s → %s): %s", src_model_id, tgt_model_id, e)
-        return None
+    from saklas.io.atomic import artifact_lock
+
+    with artifact_lock(ts_path):
+        if not ts_path.exists() or not sc_path.exists():
+            return None
+        try:
+            tensors = load_file(str(ts_path))
+            with open(sc_path) as f:
+                sidecar = json.load(f)
+            if (
+                sidecar.get("format_version") != 2
+                or sidecar.get("source_neutral_identity") != source_identity
+                or sidecar.get("target_neutral_identity") != target_identity
+                or sidecar.get("tensor_sha256") != hash_file(ts_path)
+            ):
+                return None
+            M = {int(k.split("_", 1)[1]): v for k, v in tensors.items()}
+            expected_layers = sidecar.get("shared_layers")
+            schema = sidecar.get("tensor_schema") or {}
+            if sorted(M) != expected_layers or any(
+                list(tensor.shape) != schema.get(str(layer))
+                or tensor.ndim != 2
+                or not bool(torch.isfinite(tensor).all())
+                for layer, tensor in M.items()
+            ):
+                return None
+            return M, sidecar
+        except Exception as e:
+            log.warning(
+                "Corrupt alignment map cache (%s → %s): %s",
+                src_model_id, tgt_model_id, e,
+            )
+            return None

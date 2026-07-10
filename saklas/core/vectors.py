@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import functools
 import json
 import warnings
 from collections.abc import Sequence
@@ -275,7 +274,9 @@ def special_token_ids(tokenizer: Any) -> set[int]:
     return skip
 
 
-def last_content_index(token_ids: Sequence[int], tokenizer: Any) -> int:
+def last_content_index(
+    token_ids: Sequence[int], tokenizer: Any, *, skip: set[int] | None = None,
+) -> int:
     """Index of the last non-special token in ``token_ids``.
 
     Walks backward from the final position past every id in
@@ -292,7 +293,7 @@ def last_content_index(token_ids: Sequence[int], tokenizer: Any) -> int:
     idx = len(token_ids) - 1
     if idx < 0:
         return 0
-    skip = special_token_ids(tokenizer)
+    skip = special_token_ids(tokenizer) if skip is None else skip
     if skip:
         while idx > 0 and int(token_ids[idx]) in skip:
             idx -= 1
@@ -488,15 +489,97 @@ def _prepare_capture_batch(
     if roles is not None and role is not None:
         raise ValueError("capture preparation accepts role= or roles=, not both")
     row_roles = roles if roles is not None else [role] * len(prompts)
-    return [
-        _render_and_tokenize_for_capture(
-            tokenizer, prompt, response, device,
-            role=row_role, model_type=model_type, system_msg=system_msg,
+    skip = special_token_ids(tokenizer)
+    texts = [
+        _render_capture_text(
+            tokenizer, prompt, response, role=row_role,
+            model_type=model_type, system_msg=system_msg,
         )
         for prompt, response, row_role in zip(
             prompts, responses, row_roles, strict=True,
         )
     ]
+    # Fast tokenizers amortize normalization/pretokenization over the full
+    # corpus. Keep a strict fallback for minimal/test tokenizers and custom
+    # implementations that accept only scalar strings.
+    try:
+        encoded = tokenizer(texts, add_special_tokens=False)["input_ids"]
+        if isinstance(encoded, torch.Tensor):
+            encoded = encoded.tolist()
+        if len(encoded) != len(texts) or any(
+            not isinstance(row, (list, tuple)) for row in encoded
+        ):
+            raise TypeError("batch tokenizer returned an unexpected shape")
+        rows: list[tuple[torch.Tensor, int]] = []
+        for token_row in encoded:
+            values = [int(token) for token in token_row]
+            if not values:
+                bos_id = tokenizer.bos_token_id
+                if bos_id is None:
+                    bos_id = tokenizer.eos_token_id or 0
+                values = [int(bos_id)]
+            ids = torch.tensor([values], dtype=torch.long)
+            rows.append((
+                ids, last_content_index(values, tokenizer, skip=skip),
+            ))
+        return rows
+    except (TypeError, ValueError, RuntimeError, KeyError):
+        pass
+    return [
+        _render_and_tokenize_for_capture(
+            tokenizer, prompt, response, device,
+            role=row_role, model_type=model_type, system_msg=system_msg,
+            special_ids=skip,
+        )
+        for prompt, response, row_role in zip(
+            prompts, responses, row_roles, strict=True,
+        )
+    ]
+
+
+def _render_capture_text(
+    tokenizer: Any,
+    prompt: "str | list[dict[str, str]]",
+    response: str,
+    *,
+    role: str | None = None,
+    model_type: str | None = None,
+    system_msg: str = _LENGTH_DIRECTIVE,
+) -> str:
+    """Render one conversational capture row without tokenizing it."""
+    history: list[dict[str, str]] = (
+        [{"role": "user", "content": prompt}] if isinstance(prompt, str)
+        else [dict(t) for t in prompt]
+    )
+    if getattr(tokenizer, "chat_template", None) is not None:
+        kwargs: dict[str, Any] = {}
+        if "enable_thinking" in (getattr(tokenizer, "chat_template", "") or ""):
+            kwargs["enable_thinking"] = False
+        messages = []
+        if system_msg:
+            messages.append({"role": "system", "content": system_msg})
+        messages.extend(history)
+        messages.append({"role": "assistant", "content": response})
+        if role is None:
+            return tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=False, **kwargs,
+            )
+        if model_type is None:
+            raise ValueError(
+                "_render_and_tokenize_for_capture: role= requires model_type= "
+                "so the family's role-header registry entry can be looked up"
+            )
+        from saklas.core.role_templates import apply_with_role
+
+        return apply_with_role(
+            tokenizer, messages, role=role, model_type=model_type,
+            add_generation_prompt=False, tokenize=False, **kwargs,
+        )
+    hist_text = "\n".join(turn["content"] for turn in history)
+    return (
+        f"{system_msg}\n{hist_text}\n{response}"
+        if system_msg else f"{hist_text}\n{response}"
+    )
 
 
 def _render_and_tokenize_for_capture(
@@ -508,6 +591,7 @@ def _render_and_tokenize_for_capture(
     role: str | None = None,
     model_type: str | None = None,
     system_msg: str = _LENGTH_DIRECTIVE,
+    special_ids: set[int] | None = None,
 ) -> tuple[torch.Tensor, int]:
     """Render a ``[system, *history, assistant]`` turn + tokenize, locating the last content token.
 
@@ -525,45 +609,10 @@ def _render_and_tokenize_for_capture(
     CPU, content_end)`` where ``content_end`` is the response's last
     non-special token — the canonical pooling position.
     """
-    history: list[dict[str, str]] = (
-        [{"role": "user", "content": prompt}] if isinstance(prompt, str)
-        else [dict(t) for t in prompt]
+    text = _render_capture_text(
+        tokenizer, prompt, response, role=role,
+        model_type=model_type, system_msg=system_msg,
     )
-    if getattr(tokenizer, "chat_template", None) is not None:
-        # Disable thinking/reasoning mode for models that support it
-        # (Qwen 3.5, QwQ, etc.) — thinking tokens would contaminate pooling.
-        kwargs: dict[str, Any] = {}
-        if "enable_thinking" in (getattr(tokenizer, "chat_template", "") or ""):
-            kwargs["enable_thinking"] = False
-
-        messages = []
-        if system_msg:
-            messages.append({"role": "system", "content": system_msg})
-        messages.extend(history)
-        messages.append({"role": "assistant", "content": response})
-        if role is None:
-            text = tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=False, **kwargs,
-            )
-        else:
-            if model_type is None:
-                raise ValueError(
-                    "_render_and_tokenize_for_capture: role= requires model_type= "
-                    "so the family's role-header registry entry can be looked up"
-                )
-            from saklas.core.role_templates import apply_with_role
-            text = apply_with_role(
-                tokenizer, messages,
-                role=role, model_type=model_type,
-                add_generation_prompt=False, tokenize=False, **kwargs,
-            )
-    else:
-        # Base model (no chat template) — there are no turn roles to render and
-        # A2 role-swap cannot apply; capture the history+response continuation as
-        # raw text, with the length directive prepended (when set) so the framing
-        # still matches generation.
-        hist_text = "\n".join(t["content"] for t in history)
-        text = f"{system_msg}\n{hist_text}\n{response}" if system_msg else f"{hist_text}\n{response}"
     enc = tokenizer(text, return_tensors="pt", add_special_tokens=False)
     ids = enc["input_ids"]
     if ids.numel() == 0:
@@ -576,12 +625,13 @@ def _render_and_tokenize_for_capture(
     # are disconnected from content.  ``last_content_index`` is the canonical
     # walkback (skips ``all_special_ids`` + ``added_tokens_encoder``), shared by
     # every single-state readout so the pooling position is defined once.
-    content_end = last_content_index(ids[0].tolist(), tokenizer)
+    content_end = last_content_index(
+        ids[0].tolist(), tokenizer, skip=special_ids,
+    )
     del device  # retained in the private signature for compatibility callers
     return ids, content_end
 
 
-@functools.cache
 def _load_neutral_prompts() -> list[str]:
     """Load neutral prompts, preferring a user override at ~/.saklas/neutral_statements.json."""
     from saklas.io.paths import neutral_statements_path
@@ -593,7 +643,6 @@ def _load_neutral_prompts() -> list[str]:
         return json.load(f)
 
 
-@functools.cache
 def _load_baseline_prompts() -> list[str]:
     """Load the shared A2 baseline user prompts.
 
@@ -639,6 +688,8 @@ def compute_neutral_activations(
     tokenizer: Any,
     layers: torch.nn.ModuleList,
     device: torch.device | None = None,
+    *,
+    rendered: Sequence[tuple[torch.Tensor, int]] | None = None,
 ) -> dict[int, torch.Tensor]:
     """Per-layer ``[N, D]`` stack across the neutral corpus.
 
@@ -671,22 +722,47 @@ def compute_neutral_activations(
     pairs = _neutral_pairs()
     prompts = [prompt for prompt, _ in pairs]
     responses = [response for _, response in pairs]
+    if rendered is not None and len(rendered) != len(pairs):
+        raise ValueError(
+            "prepared neutral rows must align with the neutral corpus "
+            f"({len(rendered)} != {len(pairs)})"
+        )
     n = len(pairs)
 
-    for start in range(0, n, _CAPTURE_BATCH):
-        end = min(start + _CAPTURE_BATCH, n)
-        per_layer = _encode_and_capture_all_batch(
-            model, tokenizer,
-            prompts[start:end], responses[start:end],
-            layers, device,
-        )
-        # Move each chunk's (B, D) to CPU before discarding the GPU-side dict —
-        # same MPS discipline as before, now per chunk instead of per pair.
-        for idx in range(n_layers):
-            chunks_by_layer[idx].append(per_layer[idx].detach().to("cpu"))
-        del per_layer
-        if _mps:
-            torch.mps.empty_cache()
+    active_batch = _CAPTURE_BATCH_MAX
+    capture_layers = list(range(n_layers))
+    with _ReusablePooledCapture(
+        model, layers, capture_layers,
+    ) as capture_context:
+        start = 0
+        while start < n:
+            end = min(start + active_batch, n)
+            try:
+                per_layer = _encode_and_capture_all_batch(
+                    model, tokenizer,
+                    prompts[start:end], responses[start:end],
+                    layers, device,
+                    rendered=None if rendered is None else rendered[start:end],
+                    capture_context=capture_context,
+                )
+            except RuntimeError as exc:
+                from saklas.core.errors import is_out_of_memory_error
+
+                if not is_out_of_memory_error(exc) or active_batch <= 1:
+                    raise
+                active_batch = max(1, active_batch // 2)
+                if _mps:
+                    torch.mps.empty_cache()
+                elif device.type == "cuda":
+                    torch.cuda.empty_cache()
+                continue
+            # Move each chunk's (B, D) to CPU before discarding device rows.
+            for idx in range(n_layers):
+                chunks_by_layer[idx].append(per_layer[idx].detach().to("cpu"))
+            del per_layer
+            start = end
+            if _mps:
+                torch.mps.empty_cache()
 
     return {
         idx: torch.cat(chunks, dim=0)  # (N, D), fp32 on cpu

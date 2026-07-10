@@ -593,19 +593,23 @@ def test_run_manifold_transfer_calls_backend(monkeypatch: pytest.MonkeyPatch, tm
     src_model = "google/gemma-3-4b-it"
     (folder / f"{safe_model_id(src_model)}.safetensors").write_bytes(b"x")
 
-    # Alignment cache hit so no model load happens — mirror _run_transfer's
-    # cached branch.  ``load_alignment_map`` returns ``(M, sidecar)``.
     import torch
     fake_M = {14: torch.eye(4), 15: torch.eye(4)}
     monkeypatch.setattr(
-        "saklas.io.alignment.load_alignment_map",
-        lambda src, tgt: (fake_M, {"quality_per_layer": {"14": 0.9, "15": 0.8}}),
+        "saklas.cli.runners._load_or_fit_transfer_alignment",
+        lambda *args, **kwargs: (
+            fake_M, {14: 0.9, 15: 0.8}, tmp_path / "alignment.safetensors",
+            {"model_fingerprint": "src-fp"},
+            {"model_fingerprint": "tgt-fp"},
+        ),
     )
 
     calls: list[dict[str, Any]] = []
 
     def fake_transfer(folder_arg: Path, *, from_model: str, to_model: str,
                       alignment: Any, transfer_quality_estimate: Any = None,
+                      source_model_fingerprint: Any = None,
+                      target_model_fingerprint: Any = None,
                       whitener: Any = None, layer_means: Any = None,
                       force: bool = False) -> Path:
         calls.append({
@@ -620,7 +624,7 @@ def test_run_manifold_transfer_calls_backend(monkeypatch: pytest.MonkeyPatch, tm
     # the (mocked) backend.  No model/cache here, so stub the helper.
     monkeypatch.setattr(
         "saklas.cli.runners._target_whitener_from_neutral_cache",
-        lambda model_id: object(),
+        lambda model_id, **kwargs: object(),
     )
     cli.main([
         "manifold", "transfer", "local/circumplex",
@@ -649,8 +653,12 @@ def test_run_manifold_transfer_json(monkeypatch: pytest.MonkeyPatch, tmp_path: P
 
     import torch
     monkeypatch.setattr(
-        "saklas.io.alignment.load_alignment_map",
-        lambda src, tgt: ({10: torch.eye(2)}, {"quality_per_layer": {"10": 0.5}}),
+        "saklas.cli.runners._load_or_fit_transfer_alignment",
+        lambda *args, **kwargs: (
+            {10: torch.eye(2)}, {10: 0.5}, tmp_path / "alignment.safetensors",
+            {"model_fingerprint": "src-fp"},
+            {"model_fingerprint": "tgt-fp"},
+        ),
     )
     monkeypatch.setattr(
         "saklas.io.manifolds.transfer_manifold",
@@ -658,7 +666,7 @@ def test_run_manifold_transfer_json(monkeypatch: pytest.MonkeyPatch, tmp_path: P
     )
     monkeypatch.setattr(
         "saklas.cli.runners._target_whitener_from_neutral_cache",
-        lambda model_id: object(),
+        lambda model_id, **kwargs: object(),
     )
     cli.main([
         "manifold", "transfer", "local/circumplex",

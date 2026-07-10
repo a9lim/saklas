@@ -228,6 +228,65 @@ def _refresh_all_bundled_nodes(pkg_root: Any, target: Path) -> None:
             stale.unlink()
 
 
+def _materialize_one_bundled_manifold(default_dir: Path, name: str) -> None:
+    """Refresh one bundled folder under the same lock used by fitting."""
+    from saklas.io.manifold_folder import _locked_manifest
+
+    target = default_dir / name
+    pkg_root = _resources.files("saklas.data.manifolds").joinpath(name)
+    with _locked_manifest(target):
+        if not target.exists():
+            _copy_bundled_manifold_fresh(pkg_root, target)
+            return
+
+        on_disk_manifest = target / "manifold.json"
+        if not on_disk_manifest.exists():
+            return
+        try:
+            with open(on_disk_manifest) as f:
+                on_disk_payload = json.load(f)
+        except Exception:
+            return
+
+        bundled_manifest_bytes = (pkg_root / "manifold.json").read_bytes()
+        on_disk_manifest_bytes = on_disk_manifest.read_bytes()
+        manifest_changed = (
+            _canonical_json_sha256(on_disk_manifest_bytes)
+            != _canonical_json_sha256(bundled_manifest_bytes)
+        )
+        fmt = on_disk_payload.get("format_version")
+        format_stale = isinstance(fmt, int) and fmt < MANIFOLD_FORMAT_VERSION
+        if not manifest_changed and not format_stale:
+            return
+
+        write_bytes_atomic(
+            on_disk_manifest.with_suffix(".json.bak"), on_disk_manifest_bytes,
+        )
+        write_bytes_atomic(on_disk_manifest, bundled_manifest_bytes)
+        _refresh_all_bundled_nodes(pkg_root, target)
+        for entry in pkg_root.iterdir():
+            if not _is_bundled_json_file(entry) or entry.name == "manifold.json":
+                continue
+            write_bytes_atomic(target / entry.name, entry.read_bytes())
+
+        reason = (
+            f"v{fmt}->v{MANIFOLD_FORMAT_VERSION} (format_version)"
+            if format_stale else "manifest content changed"
+        )
+        warnings.warn(
+            f"materialize_bundled_manifolds: refreshed default/{name} — "
+            f"{reason}; any local edits to its node corpus were overwritten "
+            f"(fork under local/ to keep a custom corpus)",
+            UserWarning,
+            stacklevel=3,
+        )
+        _log.warning(
+            "materialize_bundled_manifolds: refreshed default/%s — %s "
+            "(node corpus re-copied, local edits overwritten)",
+            name, reason,
+        )
+
+
 def materialize_bundled_manifolds() -> None:
     """Copy bundled manifolds into ``~/.saklas/manifolds/default/``.
 
@@ -286,79 +345,7 @@ def materialize_bundled_manifolds() -> None:
     default_dir = manifolds_dir() / "default"
     default_dir.mkdir(parents=True, exist_ok=True)
     for name in bundled_manifold_names():
-        target = default_dir / name
-        pkg_root = _resources.files("saklas.data.manifolds").joinpath(name)
-
-        if not target.exists():
-            _copy_bundled_manifold_fresh(pkg_root, target)
-            continue
-
-        on_disk_manifest = target / "manifold.json"
-        if not on_disk_manifest.exists():
-            # Folder exists without a manifold.json — refuse to fabricate one.
-            continue
-
-        try:
-            with open(on_disk_manifest) as f:
-                on_disk_payload = json.load(f)
-        except Exception:
-            # Corrupt; don't stomp user state.
-            continue
-
-        bundled_manifest_bytes = (pkg_root / "manifold.json").read_bytes()
-        on_disk_manifest_bytes = on_disk_manifest.read_bytes()
-        manifest_changed = (
-            _canonical_json_sha256(on_disk_manifest_bytes)
-            != _canonical_json_sha256(bundled_manifest_bytes)
-        )
-        fmt = on_disk_payload.get("format_version")
-        format_stale = isinstance(fmt, int) and fmt < MANIFOLD_FORMAT_VERSION
-
-        if not manifest_changed and not format_stale:
-            # Same bundle, current format — nothing to do.
-            continue
-
-        # Bundle update — manifest moved or format_version bumped.  Both
-        # cases want the new bundled state to win; user node-edits are
-        # interpreted as stale-against-old-bundle and replaced.
-        write_bytes_atomic(
-            on_disk_manifest.with_suffix(".json.bak"), on_disk_manifest_bytes,
-        )
-        write_bytes_atomic(on_disk_manifest, bundled_manifest_bytes)
-
-        _refresh_all_bundled_nodes(pkg_root, target)
-
-        # Re-copy other top-level shipped JSON files (e.g. scenarios.json
-        # provenance) that aren't manifold.json or under nodes/.
-        for entry in pkg_root.iterdir():
-            if not _is_bundled_json_file(entry) or entry.name == "manifold.json":
-                continue
-            write_bytes_atomic(target / entry.name, entry.read_bytes())
-
-        reason = (
-            f"v{fmt}->v{MANIFOLD_FORMAT_VERSION} (format_version)"
-            if format_stale
-            else "manifest content changed"
-        )
-        # Unlike ``packs.materialize_bundled`` (which preserves a
-        # user-edited ``statements.json``), the bundle-update path here
-        # re-copies every node file unconditionally — a node "edit" is
-        # stale-against-old-bundle once the manifest moves.  That clobber
-        # is intentional, but a user who hand-edited a bundled node corpus
-        # deserves to *see* that their edit was overwritten, so this is a
-        # user-facing warning rather than an INFO log they'd never notice.
-        warnings.warn(
-            f"materialize_bundled_manifolds: refreshed default/{name} — "
-            f"{reason}; any local edits to its node corpus were overwritten "
-            f"(fork under local/ to keep a custom corpus)",
-            UserWarning,
-            stacklevel=2,
-        )
-        _log.warning(
-            "materialize_bundled_manifolds: refreshed default/%s — %s "
-            "(node corpus re-copied, local edits overwritten)",
-            name, reason,
-        )
+        _materialize_one_bundled_manifold(default_dir, name)
 
 
 __all__ = [

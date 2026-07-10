@@ -55,7 +55,7 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import Iterable, Mapping
+from typing import Any, Iterable, Mapping
 
 import torch
 
@@ -108,7 +108,7 @@ def _decode_layer_tensor_map(
 
 def _require_fp32_neutral_cache(
     model_id: str,
-    acts_raw: Mapping[str, torch.Tensor],
+    acts_raw: Mapping[Any, torch.Tensor],
 ) -> None:
     if any(v.dtype != torch.float32 for v in acts_raw.values()):
         raise WhitenerError(
@@ -260,6 +260,7 @@ class LayerWhitener:
         model_id: str,
         *,
         ridge_scale: float = DEFAULT_RIDGE_SCALE,
+        expected_identity: dict[str, Any] | None = None,
     ) -> "LayerWhitener":
         """Load a whitener from ``neutral_activations.safetensors`` alone (no model load).
 
@@ -276,8 +277,8 @@ class LayerWhitener:
         Use :meth:`from_neutral_activations` instead when the activations are
         already in memory (e.g. inside a live ``SaklasSession``).
         """
-        from safetensors.torch import load_file
         from saklas.io.paths import model_dir
+        from saklas.io.alignment import load_validated_neutral_cache
 
         md = model_dir(model_id)
         acts_path = md / "neutral_activations.safetensors"
@@ -289,7 +290,18 @@ class LayerWhitener:
                 f"session-level extract on this model, or prepare a transfer "
                 f"that targets {model_id})"
             )
-        acts_raw = load_file(str(acts_path))
+        try:
+            acts_raw, sidecar = load_validated_neutral_cache(model_id)
+            if expected_identity is not None:
+                from saklas.io.alignment import neutral_cache_identity
+
+                if neutral_cache_identity(sidecar) != expected_identity:
+                    raise ValueError("neutral cache identity changed")
+        except Exception as exc:
+            raise WhitenerError(
+                f"whitener cache for {model_id} is stale, corrupt, or legacy; "
+                "load the model once to regenerate neutral activations"
+            ) from exc
         # Refuse a legacy non-fp32 neutral-activation store (the pre-fp32
         # bf16/fp16 cache).  Unlike ``load_or_compute_neutral_activations``,
         # which invalidates + recomputes such a cache, ``from_cache`` has no
@@ -308,9 +320,7 @@ class LayerWhitener:
         # activation channel) rather than poisoning the inverse, leaving that
         # layer uncovered — so a corrupt cache makes ``covers_all`` False and
         # consumers raise (no Euclidean path), it doesn't silently degrade.
-        acts = _decode_layer_tensor_map(
-            acts_raw, label=f"{model_id} neutral_activations",
-        )
+        acts = {layer: tensor.float() for layer, tensor in acts_raw.items()}
         means = {layer: tensor.mean(dim=0) for layer, tensor in acts.items()}
         return cls.from_neutral_activations(
             acts, means, ridge_scale=ridge_scale,

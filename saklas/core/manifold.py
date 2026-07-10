@@ -60,6 +60,11 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+# Numerical fitting semantics are independent of the folder/tensor wire
+# format. Bump this whenever PCA/Fisher selection, topology choice, RBF/sigma
+# fitting, DLS, or share allocation changes incompatibly.
+MANIFOLD_FIT_POLICY_VERSION = 1
+
 
 class UnknownManifoldLabelError(KeyError, SaklasError):
     """Raised when a manifold position payload names an unknown node label.
@@ -4166,12 +4171,28 @@ class ActivationRowStore:
         )
         store._layers = {}
         with safe_open(str(path), framework="pt", device="cpu") as tensors:
+            layer_keys: dict[int, str] = {}
             for key in tensors.keys():
                 if not key.startswith("layer_"):
-                    continue
-                idx = int(key.split("_", 1)[1])
+                    raise ValueError(
+                        f"invalid activation-row cache key {key!r} at {path}"
+                    )
+                try:
+                    idx = int(key.split("_", 1)[1])
+                except ValueError as exc:
+                    raise ValueError(
+                        f"invalid activation-row cache key {key!r} at {path}"
+                    ) from exc
+                shape = tuple(int(dim) for dim in tensors.get_slice(key).get_shape())
+                if len(shape) != 2 or shape[0] != store.total_rows:
+                    raise ValueError(
+                        f"invalid activation-row cache tensor {key!r} at {path}"
+                    )
+                layer_keys[idx] = key
                 if selected is None or idx in selected:
                     store._layers[idx] = tensors.get_tensor(key)
+            if not layer_keys:
+                raise ValueError(f"empty activation-row cache at {path}")
         if not store._layers or any(
             rows.ndim != 2 or int(rows.shape[0]) != store.total_rows
             for rows in store._layers.values()
@@ -4225,12 +4246,22 @@ class ActivationRowStore:
         if self._closed:
             raise RuntimeError("activation-row store is closed")
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        save_file(
-            {f"layer_{idx}": rows.contiguous() for idx, rows in self._layers.items()},
-            str(tmp),
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f".{path.name}.", suffix=".tmp", dir=path.parent,
         )
-        os.replace(tmp, path)
+        os.close(fd)
+        tmp = Path(tmp_name)
+        try:
+            save_file(
+                {
+                    f"layer_{idx}": rows.contiguous()
+                    for idx, rows in self._layers.items()
+                },
+                str(tmp),
+            )
+            os.replace(tmp, path)
+        finally:
+            tmp.unlink(missing_ok=True)
 
     def __iter__(self) -> Iterator[dict[int, torch.Tensor]]:
         for node_idx in range(len(self.node_sizes)):
@@ -4276,7 +4307,6 @@ def compute_manifold_node_stats(
     capture source dtype.
     """
     from saklas.core.vectors import (
-        _CAPTURE_BATCH,
         _CAPTURE_BATCH_MAX,
         _encode_and_capture_all_batch,
         _prepare_capture_batch,
@@ -4333,9 +4363,11 @@ def compute_manifold_node_stats(
         sorted(range(len(flat)), key=lambda i: int(prepared[i][0].shape[1]))
         if prepared is not None else list(range(len(flat)))
     )
-    active_batch = _CAPTURE_BATCH
-    bad_batch_ceiling: int | None = None
-    successes = 0
+    # Optimistically try the proven maximum and halve on OOM. Starting at the
+    # old conservative 16 made a 107-node fit spend four successful forwards
+    # merely climbing to the width that the same device had already shown it
+    # could run.
+    active_batch = _CAPTURE_BATCH_MAX
     start = 0
     is_mps = getattr(device, "type", None) == "mps"
     while start < len(order):
@@ -4361,12 +4393,7 @@ def compute_manifold_node_stats(
         except RuntimeError as exc:
             if not is_out_of_memory_error(exc) or active_batch <= 1:
                 raise
-            bad_batch_ceiling = (
-                active_batch if bad_batch_ceiling is None
-                else min(bad_batch_ceiling, active_batch)
-            )
             active_batch = max(1, active_batch // 2)
-            successes = 0
             if is_mps:
                 torch.mps.empty_cache()
             elif getattr(device, "type", None) == "cuda":
@@ -4407,12 +4434,6 @@ def compute_manifold_node_stats(
                 )
         del per_layer
         start = end
-        successes += 1
-        if active_batch < _CAPTURE_BATCH_MAX and successes >= 4:
-            candidate = min(_CAPTURE_BATCH_MAX, active_batch * 2)
-            if bad_batch_ceiling is None or candidate < bad_batch_ceiling:
-                active_batch = candidate
-            successes = 0
         if is_mps:
             torch.mps.empty_cache()
 
@@ -4729,8 +4750,6 @@ def save_manifold(
             tensors[f"layer_{idx}.sigma_poly_coeffs"] = (
                 sub.sigma_poly_coeffs.contiguous().to(torch.float32).cpu()
             )
-    save_file(tensors, str(path))
-
     from saklas import __version__ as _saklas_version
 
     sidecar: dict[str, object] = {
@@ -4761,9 +4780,11 @@ def save_manifold(
             for idx, o in manifold.origin.items()
         }
     for key in (
-        "nodes_sha256", "sae_release", "sae_revision", "sae_ids_by_layer",
+        "nodes_sha256", "sae_release", "sae_revision", "sae_fingerprint",
+        "sae_ids_by_layer",
         "sae_full_coverage",
         "model_fingerprint", "capture_sha256", "fitted_layers",
+        "fit_policy_version",
         # Share-weighting metric ("mahalanobis" / "euclidean") — the
         # manifold analogue of the vector sidecar's ``bake`` field.
         "share_metric",
@@ -4814,30 +4835,142 @@ def save_manifold(
         # ``node_labels``.  Generation-time provenance (system template +
         # elicitation role label); absent when no node carries a kind.
         "node_kinds",
-        # Merge provenance ({coord: {alpha, project_away, tensor_sha256}}),
+        # Merge provenance ({coord: {alpha, tensor_sha256}}),
         # carried on a ``fit_mode="baked"`` manifold produced by
         # :func:`saklas.io.merge.merge_into_manifold`.  Informational only — a
         # baked manifold never re-fits, so nothing branches on it; surfaced
         # by the inspector the way the legacy pack sidecar's ``components``
         # was.  Absent on every non-merge fit.
-        "components",
+        "components", "bake_policy",
     ):
         if key in metadata:
             sidecar[key] = metadata[key]
 
-    from saklas.io.atomic import write_json_atomic
+    from saklas.io.atomic import artifact_lock, write_json_atomic
 
-    write_json_atomic(path.with_suffix(".json"), sidecar)
+    with artifact_lock(path):
+        tensor_tmp = path.with_suffix(path.suffix + ".tmp")
+        save_file(tensors, str(tensor_tmp))
+        os.replace(tensor_tmp, path)
+        write_json_atomic(path.with_suffix(".json"), sidecar)
     log.info("Saved manifold %r (%d layers) to %s",
              manifold.name, len(manifold.layers), path)
 
 
-def load_manifold(path: str | Path) -> Manifold:
-    """Load a fitted manifold and its sidecar metadata."""
+def load_manifold(
+    path: str | Path, *, verify_manifest: bool = True,
+) -> Manifold:
+    """Load a fitted manifold, verifying its targeted manifest pair by default."""
+    from saklas.io.atomic import artifact_lock
+    from saklas.io.manifold_folder import _locked_manifest
+
+    resolved = Path(path)
+    if verify_manifest:
+        # Global lock order for fitted artifacts is folder -> tensor pair.
+        # Fit/publication already uses this order; readers must match it or a
+        # reader holding the pair can deadlock a fitter holding the folder.
+        with _locked_manifest(resolved.parent):
+            with artifact_lock(resolved):
+                return _load_manifold_locked(
+                    resolved, verify_manifest=verify_manifest,
+                )
+    with artifact_lock(resolved):
+        return _load_manifold_locked(resolved, verify_manifest=False)
+
+
+def _load_manifold_locked(
+    path: str | Path, *, verify_manifest: bool = True,
+) -> Manifold:
+    """Read one fitted manifold while its tensor/sidecar pair lock is held."""
     path = Path(path)
+    manifest_path = path.parent / "manifold.json"
+    verified_tensor_sha256: str | None = None
+    if verify_manifest and manifest_path.exists():
+        from saklas.io.manifold_folder import ManifoldFormatError
+        from saklas.io.packs import verify_integrity
+
+        try:
+            with open(manifest_path) as handle:
+                manifest = json.load(handle)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ManifoldFormatError(
+                f"manifold manifest is unreadable at {manifest_path}: {exc}"
+            ) from exc
+        from saklas.io.manifolds import MANIFOLD_FORMAT_VERSION
+
+        if manifest.get("format_version") != MANIFOLD_FORMAT_VERSION:
+            raise ManifoldFormatError(
+                f"manifold format_version={manifest.get('format_version')!r}; "
+                f"need exactly {MANIFOLD_FORMAT_VERSION}"
+            )
+        fit_mode = manifest.get("fit_mode", "authored")
+        if not isinstance(manifest.get("name"), str) or fit_mode not in {
+            "authored", "pca", "spectral", "auto", "baked",
+        }:
+            raise ManifoldFormatError("manifold manifest identity is incomplete")
+        files = manifest.get("files", {})
+        if not isinstance(files, dict):
+            raise ManifoldFormatError("manifold integrity manifest is not an object")
+        pair_names = (path.name, path.with_suffix(".json").name)
+        missing = [name for name in pair_names if name not in files]
+        if missing:
+            raise ManifoldFormatError(
+                f"manifold integrity manifest has no proof for {missing}"
+            )
+        expected = {name: files[name] for name in pair_names}
+        ok, bad = verify_integrity(path.parent, expected)
+        if not ok:
+            raise ManifoldFormatError(
+                f"manifold integrity check failed for {path.name}: {bad}"
+            )
+        verified_tensor_sha256 = str(expected[path.name])
     tensors = load_file(str(path))
     with open(path.with_suffix(".json")) as f:
         sidecar = json.load(f)
+    if verified_tensor_sha256 is not None:
+        sidecar["_tensor_sha256"] = verified_tensor_sha256
+    if (
+        verify_manifest
+        and manifest_path.exists()
+        and sidecar.get("fit_mode", "authored") != "baked"
+    ):
+        from saklas.io.manifold_folder import ManifoldFolder, ManifoldFormatError
+
+        # ``load_manifold`` holds the folder lock outside the pair lock.
+        current_nodes = ManifoldFolder.load(
+            path.parent, verify_manifest=False,
+        ).nodes_sha256()
+        if sidecar.get("nodes_sha256") != current_nodes:
+            raise ManifoldFormatError(
+                f"fitted manifold {path.name} is stale for the live corpus/"
+                "domain/template inputs; refit before loading"
+            )
+        if sidecar.get("fit_policy_version") != MANIFOLD_FIT_POLICY_VERSION:
+            raise ManifoldFormatError(
+                f"fitted manifold {path.name} uses an older numerical fit "
+                "policy; refit it with the current saklas"
+            )
+    if verify_manifest and sidecar.get("method") == "merge":
+        from saklas.io.manifold_folder import MERGE_BAKE_POLICY
+
+        if sidecar.get("bake_policy") != MERGE_BAKE_POLICY:
+            from saklas.io.manifold_folder import ManifoldFormatError
+
+            raise ManifoldFormatError(
+                "legacy projected bake has no current additive/Mahalanobis "
+                "policy stamp; rebake the expression"
+            )
+        components = sidecar.get("components")
+        if isinstance(components, dict) and any(
+            isinstance(info, dict) and info.get("project_away") is not None
+            for info in components.values()
+        ):
+            from saklas.io.manifold_folder import ManifoldFormatError
+
+            raise ManifoldFormatError(
+                "legacy projected bake used Euclidean projection; rebake the "
+                "expression under the current Mahalanobis-only policy"
+            )
 
     # The shared, layer-agnostic node_coords tensor — pop it before the
     # per-layer key split, which assumes ``layer_<idx>.<field>``.

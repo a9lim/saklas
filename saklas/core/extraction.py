@@ -22,6 +22,7 @@ import json
 import math
 import os
 import pathlib
+import tempfile
 import time
 from collections.abc import Sequence
 from contextlib import nullcontext
@@ -31,9 +32,13 @@ import torch
 from safetensors.torch import load_file, save_file
 
 from saklas.core.events import EventBus, ManifoldExtracted
+from saklas.core.manifold import MANIFOLD_FIT_POLICY_VERSION
 from saklas.core.model import loaded_model_fingerprint, workspace_layer_indices
 from saklas.core.sae import SaeBackend
 from saklas.io.paths import model_dir, tensor_filename
+
+
+_CAPTURE_CACHE_FORMAT_VERSION = 3
 
 
 def _tensor_sha256(tensor: torch.Tensor) -> str:
@@ -46,6 +51,23 @@ def _tensor_sha256(tensor: torch.Tensor) -> str:
         chunk = flat[start:start + 1_048_576].to(device="cpu").contiguous()
         digest.update(chunk.view(torch.uint8).numpy().tobytes())
     return digest.hexdigest()
+
+
+def _save_safetensors_atomic(
+    tensors: dict[str, torch.Tensor], path: pathlib.Path,
+) -> None:
+    """Publish safetensors through a unique same-directory staging file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent,
+    )
+    os.close(fd)
+    tmp = pathlib.Path(tmp_name)
+    try:
+        save_file(tensors, str(tmp))
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def _prune_manifold_capture_cache(
@@ -146,6 +168,93 @@ class ModelHandle(Protocol):
     ) -> dict[str, list[str]]: ...
 
 
+def prepare_manifold_capture_identity(
+    handle: ModelHandle,
+    mf: Any,
+    model_fingerprint: str,
+) -> tuple[
+    list[tuple[str, list[str]]],
+    list[str | list[dict[str, str]]],
+    list[tuple[torch.Tensor, int]] | None,
+    str | None,
+    list[str | None],
+    list[str | None],
+    str | None,
+]:
+    """Render/tokenize all fit rows and return their exact capture identity."""
+    model = handle.model
+    base_model = getattr(model, "_orig_mod", model)
+    config = getattr(base_model, "config", getattr(model, "config", None))
+    node_groups = mf.node_groups()
+    node_roles = mf._roles_padded()
+    node_kinds = mf._kinds_padded()
+    model_type = getattr(getattr(model, "config", None), "model_type", None)
+    if any(role is not None for role in node_roles) and model_type is None:
+        raise ValueError(
+            f"manifold {mf.name!r} carries per-node roles but model config "
+            "has no 'model_type' — cannot resolve role headers"
+        )
+    if mf.template_ref is not None:
+        from saklas.io.templates import resolve_template
+
+        tmpl = resolve_template(mf.template_ref)
+        baseline_prompts: list[str | list[dict[str, str]]] = [
+            context.messages() for context in tmpl.contexts
+        ]
+    else:
+        from saklas.core.vectors import _load_baseline_prompts
+
+        baseline_prompts = list(_load_baseline_prompts())
+    tokenizer = handle.tokenizer
+    prepared_rows: list[tuple[torch.Tensor, int]] | None = None
+    capture_sha: str | None = None
+    if callable(tokenizer):
+        from saklas.core.vectors import _prepare_capture_batch
+
+        flat_prompts: list[str | list[dict[str, str]]] = []
+        flat_responses: list[str] = []
+        flat_roles: list[str | None] = []
+        k_prompts = len(baseline_prompts)
+        for (_label, responses), role in zip(
+            node_groups, node_roles, strict=True,
+        ):
+            for row_idx, response in enumerate(responses):
+                flat_prompts.append(baseline_prompts[row_idx % k_prompts])
+                flat_responses.append(response)
+                flat_roles.append(role)
+        prepared_rows = _prepare_capture_batch(
+            tokenizer, flat_prompts, flat_responses, handle.device,
+            roles=flat_roles, model_type=model_type,
+        )
+        capture_model_fingerprint = {
+            "model_id": handle.model_id,
+            "model_class": (
+                f"{type(base_model).__module__}.{type(base_model).__qualname__}"
+            ),
+            "commit": getattr(config, "_commit_hash", None),
+            "name_or_path": getattr(config, "_name_or_path", None),
+            "model_type": getattr(config, "model_type", None),
+            "capture_version": 3,
+            "fingerprint": model_fingerprint,
+        }
+        capture_hash = hashlib.sha256(json.dumps(
+            capture_model_fingerprint, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8"))
+        capture_hash.update(json.dumps(
+            {"node_sizes": [len(rows) for _label, rows in node_groups]},
+            sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8"))
+        for ids, content_end in prepared_rows:
+            capture_hash.update(
+                repr((ids[0].tolist(), int(content_end))).encode("utf-8")
+            )
+        capture_sha = capture_hash.hexdigest()
+    return (
+        node_groups, baseline_prompts, prepared_rows, capture_sha,
+        node_roles, node_kinds, model_type,
+    )
+
+
 def _diagnostics_to_dict(diag: Any) -> dict[str, Any]:
     """Convert a discover-mode diagnostics dataclass into a JSON-safe dict.
 
@@ -217,6 +326,28 @@ class ManifoldExtractionPipeline:
         force: bool = False,
         on_progress: Callable[[str], None] | None = None,
     ):
+        """Serialize one folder's fit/cache/publication transaction."""
+        from saklas.io.manifold_folder import _locked_manifest
+
+        folder_path = pathlib.Path(folder)
+        with _locked_manifest(folder_path):
+            return self._fit_locked(
+                folder_path, sae=sae, sae_revision=sae_revision,
+                layer_indices=layer_indices, force=force,
+                on_progress=on_progress,
+            )
+
+    def _fit_locked(
+        self,
+        folder: str | pathlib.Path,
+        *,
+        sae: str | SaeBackend | None = None,
+        sae_revision: str | None = None,
+        layer_indices: "Sequence[int] | str | None" = None,
+        force: bool = False,
+        on_progress: Callable[[str], None] | None = None,
+        _capture_lock_held: bool = False,
+    ):
         """Fit (or load from cache) a manifold for the session's model.
 
         ``folder`` is a manifold pack directory — either authored (the
@@ -272,6 +403,28 @@ class ManifoldExtractionPipeline:
         mf = ManifoldFolder.load(
             pathlib.Path(folder), verify_manifest=False,
         )
+        if mf.template_ref is not None:
+            from saklas.io.manifold_authoring import _write_node_corpus
+            from saklas.io.templates import resolve_template
+
+            tmpl = resolve_template(mf.template_ref)
+            expected_corpora = tmpl.node_corpora()
+            current_corpora = dict(mf.node_groups())
+            if current_corpora != expected_corpora:
+                _write_node_corpus(
+                    pathlib.Path(folder),
+                    [
+                        {"label": label, "statements": statements}
+                        for label, statements in expected_corpora.items()
+                    ],
+                )
+                mf.node_labels = list(expected_corpora)
+                mf.node_roles = [None] * len(mf.node_labels)
+                mf.node_kinds = [None] * len(mf.node_labels)
+                mf.write_metadata()
+                mf = ManifoldFolder.load(
+                    pathlib.Path(folder), verify_manifest=False,
+                )
         nodes_sha = mf.nodes_sha256()
         model = self._handle.model
         layers = self._handle.layers
@@ -302,17 +455,14 @@ class ManifoldExtractionPipeline:
                 f"layer_indices must lie in [0, {n_layers}); got "
                 f"{requested_fit_layers}"
             )
-        base_model = getattr(model, "_orig_mod", model)
-        config = getattr(base_model, "config", getattr(model, "config", None))
         model_fingerprint = loaded_model_fingerprint(
             model, self._handle.model_id,
         )
 
-        # Resolve the requested variant name before touching SAELens.  A fitted
-        # tensor is self-contained model-space data, so a valid cache hit must
-        # not import the optional backend, consult its registry, or load any SAE
-        # weights.  Unpinned string requests accept the revision recorded in the
-        # cached sidecar; explicit revisions remain exact.
+        # Resolve string requests through SAELens metadata before accepting a
+        # hit: transform identity is part of the cache key. Registry/import
+        # work is therefore allowed here, but the backend remains one-layer
+        # lazy and no SAE weights are loaded on a valid fitted-tensor hit.
         sae_backend: SaeBackend | None
         sae_release: str | None
         if sae is None:
@@ -325,6 +475,20 @@ class ManifoldExtractionPipeline:
             sae_backend = sae
             sae_release = sae.release
 
+        if isinstance(sae, str):
+            from saklas.core.sae import load_sae_backend
+
+            sae_backend = load_sae_backend(
+                sae,
+                revision=sae_revision,
+                model_id=self._handle.model_id,
+                device=self._handle.device,
+            )
+        sae_fingerprint = (
+            getattr(sae_backend, "fingerprint", None)
+            if sae_backend is not None else None
+        )
+
         tensor_path = pathlib.Path(folder) / tensor_filename(
             self._handle.model_id, release=sae_release,
         )
@@ -333,72 +497,21 @@ class ManifoldExtractionPipeline:
         # tensor cache.  Source-text hashes alone miss baseline-prompt edits and
         # tokenizer/chat-template changes; both alter the actual residuals even
         # when the authored node files are byte-identical.
-        node_groups = mf.node_groups()
+        (
+            node_groups, baseline_prompts, prepared_rows, capture_sha,
+            node_roles, node_kinds, model_type,
+        ) = prepare_manifold_capture_identity(
+            self._handle, mf, model_fingerprint,
+        )
         tokenizer = self._handle.tokenizer
         device = self._handle.device
         K = len(node_groups)
-        model_type = getattr(getattr(model, "config", None), "model_type", None)
-        node_roles = mf._roles_padded()
-        node_kinds = mf._kinds_padded()
         any_role = any(r is not None for r in node_roles)
         any_kind = any(k is not None for k in node_kinds)
-        if any_role and model_type is None:
+        if any_role and sae is not None:
             raise ValueError(
-                f"manifold {mf.name!r} carries per-node roles but model "
-                f"config has no 'model_type' — cannot resolve the role-header "
-                f"registry entry"
+                "SAE-backed and role-baselined manifold fits are mutually exclusive"
             )
-        from saklas.core.vectors import _load_baseline_prompts
-        if mf.template_ref is not None:
-            from saklas.io.templates import resolve_template
-
-            tmpl = resolve_template(mf.template_ref)
-            baseline_prompts = [ctx.messages() for ctx in tmpl.contexts]
-        else:
-            baseline_prompts = _load_baseline_prompts()
-        prepared_rows: list[tuple[torch.Tensor, int]] | None = None
-        capture_sha: str | None = None
-        if callable(tokenizer):
-            from saklas.core.vectors import _prepare_capture_batch
-
-            flat_prompts: list[str | list[dict[str, str]]] = []
-            flat_responses: list[str] = []
-            flat_roles: list[str | None] = []
-            k_prompts = len(baseline_prompts)
-            for (_label, responses), role in zip(
-                node_groups, node_roles, strict=True,
-            ):
-                for row_idx, response in enumerate(responses):
-                    flat_prompts.append(baseline_prompts[row_idx % k_prompts])
-                    flat_responses.append(response)
-                    flat_roles.append(role)
-            prepared_rows = _prepare_capture_batch(
-                tokenizer, flat_prompts, flat_responses, device,
-                roles=flat_roles, model_type=model_type,
-            )
-            capture_model_fingerprint = {
-                "model_id": self._handle.model_id,
-                "model_class": (
-                    f"{type(base_model).__module__}.{type(base_model).__qualname__}"
-                ),
-                "commit": getattr(config, "_commit_hash", None),
-                "name_or_path": getattr(config, "_name_or_path", None),
-                "model_type": getattr(config, "model_type", None),
-                "capture_version": 3,
-                "fingerprint": model_fingerprint,
-            }
-            capture_hash = hashlib.sha256(json.dumps(
-                capture_model_fingerprint, sort_keys=True, separators=(",", ":"),
-            ).encode("utf-8"))
-            capture_hash.update(json.dumps(
-                {"node_sizes": [len(responses) for _label, responses in node_groups]},
-                sort_keys=True, separators=(",", ":"),
-            ).encode("utf-8"))
-            for ids, content_end in prepared_rows:
-                capture_hash.update(
-                    repr((ids[0].tolist(), int(content_end))).encode("utf-8")
-                )
-            capture_sha = capture_hash.hexdigest()
 
         # Cache hit: tensor present + every fit-affecting input unchanged.
         # ``nodes_sha256`` folds in the corpus, plus either the domain
@@ -439,12 +552,20 @@ class ManifoldExtractionPipeline:
                 and sc.nodes_sha256 == nodes_sha
                 and sc.sae_release == sae_release
                 and (
+                    sae_release is None
+                    or (
+                        sae_fingerprint is not None
+                        and sc.sae_fingerprint == sae_fingerprint
+                    )
+                )
+                and (
                     sc.sae_revision == cached_revision
                     if cached_revision is not None or sae_release is None
                     else True
                 )
                 and sc.model_fingerprint == model_fingerprint
                 and sc.capture_sha256 == capture_sha
+                and sc.fit_policy_version == MANIFOLD_FIT_POLICY_VERSION
                 and (
                     sc.fitted_layers == requested_fit_layers
                     if sae_release is None or layer_indices is not None
@@ -458,16 +579,6 @@ class ManifoldExtractionPipeline:
                     metadata=dict(manifold.metadata),
                 ))
                 return manifold
-
-        if isinstance(sae, str):
-            from saklas.core.sae import load_sae_backend
-
-            sae_backend = load_sae_backend(
-                sae,
-                revision=sae_revision,
-                model_id=self._handle.model_id,
-                device=self._handle.device,
-            )
 
         # SAE coverage — fail-fast.  Validate the fit-layer set here, before
         # the expensive per-node centroid pooling, so an SAE release that
@@ -494,6 +605,31 @@ class ManifoldExtractionPipeline:
         else:
             fit_layers = requested_fit_layers
             feature_space = "raw"
+
+        # Capture payloads are shared per model and token identity, not per
+        # manifold folder.  Re-enter the fit once while holding that logical
+        # capture-stem lock so the centroid/row/meta snapshot is read, topped
+        # up, and published as one transaction across otherwise independent
+        # manifold fits.  Passing an already-resolved SAE backend avoids a
+        # second registry resolution on this internal re-entry.
+        if capture_sha is not None and not _capture_lock_held:
+            from saklas.io.atomic import artifact_lock
+
+            capture_lock_stem = (
+                model_dir(self._handle.model_id)
+                / "manifold_capture"
+                / capture_sha
+            )
+            with artifact_lock(capture_lock_stem):
+                return self._fit_locked(
+                    folder,
+                    sae=(sae_backend if isinstance(sae, str) else sae),
+                    sae_revision=sae_revision,
+                    layer_indices=layer_indices,
+                    force=force,
+                    on_progress=on_progress,
+                    _capture_lock_held=True,
+                )
 
         # 1. Per-node centroids (one forward pass per response) — shared
         #    between authored and discover paths.  Conversational (4.0 / A2):
@@ -540,6 +676,7 @@ class ManifoldExtractionPipeline:
         cached_rows = None
         centroid_layers: set[int] = set()
         row_layers: set[int] = set()
+        loaded_row_layers: set[int] = set()
         cached_row_shapes: dict[str, object] = {}
         cached_row_dtypes: dict[str, object] = {}
         cached_row_digests: dict[str, object] = {}
@@ -554,14 +691,24 @@ class ManifoldExtractionPipeline:
                 with open(cache_meta) as handle:
                     meta = json.load(handle)
                 if (
-                    int(meta.get("format_version", 0)) != 2
+                    int(meta.get("format_version", 0))
+                    != _CAPTURE_CACHE_FORMAT_VERSION
                     or meta.get("capture_sha256") != capture_sha
                     or [int(size) for size in meta.get("node_sizes", [])]
                     != node_sizes
                 ):
                     raise ValueError("capture cache metadata identity mismatch")
                 cache_files = dict(meta.get("files", {}))
-                ok, _bad = verify_integrity(capture_dir, cache_files)
+                # Row caches are frequently multi-GiB. Their safetensors header
+                # is validated by ``ActivationRowStore.load`` and every selected
+                # layer is checked against its exact tensor digest below; do not
+                # hash the entire container merely to select a few layers.
+                files_to_verify = {
+                    centroid_cache.name: cache_files.get(
+                        centroid_cache.name, "",
+                    )
+                }
+                ok, _bad = verify_integrity(capture_dir, files_to_verify)
                 if not ok:
                     raise ValueError("capture cache payload digest mismatch")
                 cached = load_file(str(centroid_cache), device="cpu")
@@ -573,6 +720,7 @@ class ManifoldExtractionPipeline:
                     int(idx) for idx in meta.get("centroid_layers", [])
                 }
                 row_layers = {int(idx) for idx in meta.get("row_layers", [])}
+                loaded_row_layers = set(row_layers)
                 if centroid_cache.name not in cache_files:
                     raise ValueError("capture cache metadata omits payload digest")
                 cached_row_shapes = dict(meta.get("row_shapes", {}))
@@ -593,7 +741,7 @@ class ManifoldExtractionPipeline:
                     raise ValueError("centroid cache metadata shape mismatch")
                 if not row_layers <= centroid_layers:
                     raise ValueError("row-cache layers exceed centroid coverage")
-                if row_layers and retain_node_rows:
+                if row_layers and retain_node_rows and mf.fit_mode != "auto":
                     if row_cache is None or not row_cache.exists():
                         raise ValueError("capture metadata names a missing row cache")
                     selected_row_layers = sorted(row_layers & set(fit_layers))
@@ -626,7 +774,7 @@ class ManifoldExtractionPipeline:
                     cached_rows = None
 
         needed_layers = set(fit_layers) - centroid_layers
-        if retain_node_rows:
+        if retain_node_rows and mf.fit_mode != "auto":
             needed_layers |= set(fit_layers) - row_layers
         capture_layers = sorted(needed_layers)
         new_rows = None
@@ -709,30 +857,88 @@ class ManifoldExtractionPipeline:
 
             try:
                 capture_dir.mkdir(parents=True, exist_ok=True)
-                tmp = centroid_cache.with_suffix(centroid_cache.suffix + ".tmp")
-                save_file({
-                    f"layer_{idx}": stacks_cached[idx]
-                    for idx in sorted(centroid_layers)
-                }, str(tmp))
-                os.replace(tmp, centroid_cache)
-                if retained_rows is not None and row_cache is not None:
+                persist_rows_now = mf.fit_mode != "auto"
+                # A row cache is one safetensors container.  When a disjoint
+                # layer request tops it up, carry forward the unselected
+                # tensors before replacing that container; otherwise the new
+                # metadata and payload would silently discard prior coverage.
+                if (
+                    persist_rows_now
+                    and retained_rows is not None
+                    and row_cache is not None
+                    and row_cache.exists()
+                ):
+                    durable_only = sorted(
+                        row_layers - set(retained_rows.layer_indices)
+                    )
+                    if durable_only:
+                        from saklas.core.manifold import ActivationRowStore
+
+                        durable_rows = ActivationRowStore.load(
+                            row_cache, node_sizes, layer_indices=durable_only,
+                        )
+                        try:
+                            if any(
+                                cached_row_shapes.get(str(idx))
+                                != list(durable_rows.flat_rows(idx).shape)
+                                or cached_row_dtypes.get(str(idx))
+                                != str(durable_rows.flat_rows(idx).dtype)
+                                or cached_row_digests.get(str(idx))
+                                != _tensor_sha256(durable_rows.flat_rows(idx))
+                                for idx in durable_only
+                            ):
+                                raise ValueError(
+                                    "durable row cache metadata mismatch"
+                                )
+                            combined_rows = ActivationRowStore(node_sizes)
+                            flat_indices = torch.arange(
+                                sum(node_sizes), dtype=torch.long,
+                            )
+                            for store in (durable_rows, retained_rows):
+                                for idx in store.layer_indices:
+                                    combined_rows.write(
+                                        idx, flat_indices, store.flat_rows(idx),
+                                    )
+                            retained_rows.close()
+                            retained_rows = combined_rows
+                        finally:
+                            durable_rows.close()
+                _save_safetensors_atomic(
+                    {
+                        f"layer_{idx}": stacks_cached[idx]
+                        for idx in sorted(centroid_layers)
+                    },
+                    centroid_cache,
+                )
+                if (
+                    persist_rows_now
+                    and retained_rows is not None and row_cache is not None
+                ):
                     retained_rows.persist(row_cache)
                     row_layers = set(retained_rows.layer_indices)
-                elif not row_layers and row_cache is not None and row_cache.exists():
+                elif (
+                    (not row_layers or (not persist_rows_now and not loaded_row_layers))
+                    and row_cache is not None and row_cache.exists()
+                ):
                     row_cache.unlink()
                 files = {centroid_cache.name: hash_file(centroid_cache)}
+                metadata_row_layers = (
+                    sorted(row_layers) if persist_rows_now
+                    else sorted(loaded_row_layers)
+                )
                 row_digests = (
                     {
                         str(idx): _tensor_sha256(retained_rows.flat_rows(idx))
                         for idx in retained_rows.layer_indices
-                    } if retained_rows is not None else cached_row_digests
+                    } if persist_rows_now and retained_rows is not None
+                    else cached_row_digests
                 )
                 write_json_atomic(cache_meta, {
-                    "format_version": 2,
+                    "format_version": _CAPTURE_CACHE_FORMAT_VERSION,
                     "capture_sha256": capture_sha,
                     "node_sizes": node_sizes,
                     "centroid_layers": sorted(centroid_layers),
-                    "row_layers": sorted(row_layers),
+                    "row_layers": metadata_row_layers,
                     "centroid_shapes": {
                         str(idx): list(stacks_cached[idx].shape)
                         for idx in sorted(centroid_layers)
@@ -741,13 +947,15 @@ class ManifoldExtractionPipeline:
                         {
                             str(idx): list(retained_rows.flat_rows(idx).shape)
                             for idx in retained_rows.layer_indices
-                        } if retained_rows is not None else cached_row_shapes
+                        } if persist_rows_now and retained_rows is not None
+                        else cached_row_shapes
                     ),
                     "row_dtypes": (
                         {
                             str(idx): str(retained_rows.flat_rows(idx).dtype)
                             for idx in retained_rows.layer_indices
-                        } if retained_rows is not None else cached_row_dtypes
+                        } if persist_rows_now and retained_rows is not None
+                        else cached_row_dtypes
                     ),
                     "row_tensor_sha256": row_digests,
                     "files": files,
@@ -830,6 +1038,7 @@ class ManifoldExtractionPipeline:
                 "model_fingerprint": model_fingerprint,
                 "capture_sha256": capture_sha,
                 "fitted_layers": list(fit_layers),
+                "fit_policy_version": MANIFOLD_FIT_POLICY_VERSION,
                 "monopolar": True,
                 # The fold keeps the raw δ̂ basis (``concept − ν`` cancels
                 # common-mode like DiM by differencing), so the subspace is
@@ -842,6 +1051,7 @@ class ManifoldExtractionPipeline:
             if sae_backend is not None:
                 metadata["sae_release"] = sae_backend.release
                 metadata["sae_revision"] = sae_backend.revision
+                metadata["sae_fingerprint"] = sae_backend.fingerprint
                 metadata["sae_ids_by_layer"] = dict(
                     getattr(sae_backend, "sae_ids_by_layer", {})
                 )
@@ -889,7 +1099,9 @@ class ManifoldExtractionPipeline:
         #     the per-layer subspace fit so the SAE round-trip runs a single
         #     time.  (K, D) fp32 on CPU per layer.
         def _stacked_centroids(idx: int) -> torch.Tensor:
-            s = torch.stack([per_node[k][idx] for k in range(K)])  # (K, D) fp32 CPU
+            # The capture cache already owns the contiguous (K,D) stack. Alias
+            # it instead of rebuilding the same ~K*D payload from row views.
+            s = stacks_cached[idx]
             if sae_backend is not None:
                 with torch.no_grad():
                     feat = sae_backend.encode_layer(idx, s.to(device))
@@ -914,7 +1126,6 @@ class ManifoldExtractionPipeline:
         #     signal (low explained variance).  The per-layer Grams are also the
         #     summands of the discover consensus Gram, so the discover branch
         #     reuses ``layer_grams`` instead of recomputing them.
-        centered_stacks: dict[int, torch.Tensor] = {}
         whitened_rows: dict[int, torch.Tensor] = {}
         layer_grams: dict[int, torch.Tensor] = {}
         for idx in fit_layers:
@@ -922,7 +1133,6 @@ class ManifoldExtractionPipeline:
             xc = xc - xc.mean(dim=0, keepdim=True)
             sinv_xc = maha_whitener.apply_inv(idx, xc).to(torch.float32)
             gram = xc @ sinv_xc.transpose(0, 1)
-            centered_stacks[idx] = xc
             whitened_rows[idx] = sinv_xc
             layer_grams[idx] = 0.5 * (gram + gram.transpose(0, 1))  # (K, K)
         node_spread_per_layer: dict[int, float] = {
@@ -1293,7 +1503,8 @@ class ManifoldExtractionPipeline:
                 if nu is None:
                     g_cols = []
                     break
-                xc = centered_stacks[idx]
+                xc = stacks[idx].to(torch.float32)
+                xc = xc - xc.mean(dim=0, keepdim=True)
                 mu_L = stacks[idx].to(torch.float32).mean(dim=0, keepdim=True)
                 nu_c = nu.to(torch.float32).reshape(1, -1) - mu_L  # (1, D) ν − μ
                 g_cols.append(whitened_rows[idx] @ nu_c.reshape(-1))  # (K,) x̃ᵀΣ⁻¹ν̃
@@ -1320,11 +1531,146 @@ class ManifoldExtractionPipeline:
         #     is vacuous) — both leave ``σ`` absent ⇒ exact zero-thickness legacy.
         sigma_field_per_layer: dict[int, dict[str, float]] = {}
         if effective_fit_mode != "pca" and sae_backend is None and layer_subs:
+            if mf.fit_mode == "auto":
+                from saklas.core.manifold import ActivationRowStore
+
+                stores: list[ActivationRowStore] = []
+                if retained_rows is not None:
+                    stores.append(retained_rows)
+                cached_auto_rows = None
+                selected_cached_layers = sorted(row_layers & set(fit_layers))
+                if (
+                    selected_cached_layers and row_cache is not None
+                    and row_cache.exists()
+                ):
+                    try:
+                        cached_auto_rows = ActivationRowStore.load(
+                            row_cache, node_sizes,
+                            layer_indices=selected_cached_layers,
+                        )
+                        if any(
+                            cached_row_shapes.get(str(idx))
+                            != list(cached_auto_rows.flat_rows(idx).shape)
+                            or cached_row_dtypes.get(str(idx))
+                            != str(cached_auto_rows.flat_rows(idx).dtype)
+                            or cached_row_digests.get(str(idx))
+                            != _tensor_sha256(cached_auto_rows.flat_rows(idx))
+                            for idx in selected_cached_layers
+                        ):
+                            raise ValueError("row cache metadata mismatch")
+                        stores.append(cached_auto_rows)
+                    except (OSError, RuntimeError, ValueError, KeyError):
+                        if cached_auto_rows is not None:
+                            cached_auto_rows.close()
+                        cached_auto_rows = None
+                covered_rows = {
+                    idx for store in stores for idx in store.layer_indices
+                }
+                missing_row_layers = sorted(set(fit_layers) - covered_rows)
+                if missing_row_layers:
+                    from saklas.core.vectors import _ReusablePooledCapture
+
+                    reusable = all(
+                        hasattr(layers[idx], "register_forward_hook")
+                        for idx in missing_row_layers
+                    )
+                    capture_scope = (
+                        _ReusablePooledCapture(model, layers, missing_row_layers)
+                        if reusable else nullcontext(None)
+                    )
+                    with capture_scope as capture_context:
+                        _unused, missing_rows = compute_manifold_node_stats(
+                            model, tokenizer, layers, device,
+                            node_groups, baseline_prompts,
+                            roles=node_roles, model_type=model_type,
+                            layer_indices=missing_row_layers, retain_rows=True,
+                            prepared_rows=prepared_rows,
+                            capture_context=capture_context,
+                        )
+                    assert missing_rows is not None
+                    stores.append(missing_rows)
+                if len(stores) > 1:
+                    combined = ActivationRowStore(node_sizes)
+                    flat_indices = torch.arange(sum(node_sizes), dtype=torch.long)
+                    for store in stores:
+                        for idx in store.layer_indices:
+                            combined.write(idx, flat_indices, store.flat_rows(idx))
+                        store.close()
+                    retained_rows = combined
+                elif stores:
+                    retained_rows = stores[0]
             if retained_rows is None:
                 raise RuntimeError(
                     "curved raw manifold fit lost its retained activation-row "
                     "spool before the sigma-field pass"
                 )
+            # Auto kept a temporary mmap during its one model pass but did not
+            # publish/hash the multi-GiB row cache speculatively. Curvature has
+            # now won, so make that reusable payload durable before consuming
+            # the spool; flat auto fits closed it above without this I/O.
+            if (
+                mf.fit_mode == "auto"
+                and row_cache is not None
+                and cache_meta is not None
+                and cache_meta.exists()
+            ):
+                from saklas.core.manifold import ActivationRowStore
+                from saklas.io.atomic import write_json_atomic
+
+                try:
+                    durable_only = sorted(
+                        row_layers - set(retained_rows.layer_indices)
+                    )
+                    if durable_only:
+                        durable_rows = ActivationRowStore.load(
+                            row_cache, node_sizes, layer_indices=durable_only,
+                        )
+                        try:
+                            if any(
+                                cached_row_shapes.get(str(idx))
+                                != list(durable_rows.flat_rows(idx).shape)
+                                or cached_row_dtypes.get(str(idx))
+                                != str(durable_rows.flat_rows(idx).dtype)
+                                or cached_row_digests.get(str(idx))
+                                != _tensor_sha256(durable_rows.flat_rows(idx))
+                                for idx in durable_only
+                            ):
+                                raise ValueError(
+                                    "durable row cache metadata mismatch"
+                                )
+                            combined_rows = ActivationRowStore(node_sizes)
+                            flat_indices = torch.arange(
+                                sum(node_sizes), dtype=torch.long,
+                            )
+                            for store in (durable_rows, retained_rows):
+                                for idx in store.layer_indices:
+                                    combined_rows.write(
+                                        idx, flat_indices, store.flat_rows(idx),
+                                    )
+                            retained_rows.close()
+                            retained_rows = combined_rows
+                        finally:
+                            durable_rows.close()
+                    retained_rows.persist(row_cache)
+                    with open(cache_meta) as handle:
+                        cache_payload = json.load(handle)
+                    durable_layers = list(retained_rows.layer_indices)
+                    cache_payload["row_layers"] = durable_layers
+                    cache_payload["row_shapes"] = {
+                        str(idx): list(retained_rows.flat_rows(idx).shape)
+                        for idx in durable_layers
+                    }
+                    cache_payload["row_dtypes"] = {
+                        str(idx): str(retained_rows.flat_rows(idx).dtype)
+                        for idx in durable_layers
+                    }
+                    cache_payload["row_tensor_sha256"] = {
+                        str(idx): _tensor_sha256(retained_rows.flat_rows(idx))
+                        for idx in durable_layers
+                    }
+                    write_json_atomic(cache_meta, cache_payload)
+                except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
+                    _progress(f"Deferred activation-row cache write skipped: {exc}")
             _progress(
                 f"Fitting within-node σ-field across {len(layer_subs)} layers "
                 f"({K} nodes, retained activation rows)..."
@@ -1386,6 +1732,7 @@ class ManifoldExtractionPipeline:
             "model_fingerprint": model_fingerprint,
             "capture_sha256": capture_sha,
             "fitted_layers": list(fit_layers),
+            "fit_policy_version": MANIFOLD_FIT_POLICY_VERSION,
             # Provenance only (nothing branches on these at load).  The
             # whitener is mandatory for an activation-space fit, so both the
             # per-layer share weighting and the PCA *subspace selection* are
@@ -1419,6 +1766,7 @@ class ManifoldExtractionPipeline:
         if sae_backend is not None:
             metadata["sae_release"] = sae_backend.release
             metadata["sae_revision"] = sae_backend.revision
+            metadata["sae_fingerprint"] = sae_backend.fingerprint
             metadata["sae_ids_by_layer"] = dict(
                 getattr(sae_backend, "sae_ids_by_layer", {})
             )

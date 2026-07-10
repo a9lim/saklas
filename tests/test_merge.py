@@ -1,4 +1,4 @@
-"""vector merge — expression grammar + baked-manifold writer + projection math."""
+"""Offline additive merge grammar and baked-manifold writer."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -44,16 +44,26 @@ def test_trigger_rejected():
         )
 
 
-def test_aligned_operator_rejected():
-    """``~`` (component-aligned with onto) isn't meaningful at merge time —
-    require ``|`` (project-away).  Pre-v2.1 merge accepted ``~`` and
-    treated it as project-away, which silently inverted the meaning vs
-    the unified grammar (``~`` keeps aligned, ``|`` projects away).
-    """
-    with pytest.raises(merge.MergeError, match=r"\|"):
+@pytest.mark.parametrize("operator", ["~", "|"])
+def test_projection_operator_rejected(operator: str):
+    """Offline bake cannot replace live Mahalanobis projection with Euclidean."""
+    with pytest.raises(merge.MergeError, match="Mahalanobis"):
         merge.merge_into_manifold(
-            "x", "0.5 default/happy~default/sad", model=None,
+            "x", f"0.5 default/happy{operator}default/sad", model=None,
         )
+
+
+@pytest.mark.parametrize(
+    ("expression", "message"),
+    [
+        ("!default/happy", "ablation"),
+        ("0.5 default/happy%label", "manifold-position"),
+        ("0.5,0.2 default/happy", "one scalar"),
+    ],
+)
+def test_dynamic_or_multicoeff_term_rejected(expression: str, message: str):
+    with pytest.raises(merge.MergeError, match=message):
+        merge.merge_into_manifold("x", expression, model=None)
 
 
 def test_empty_expression_rejected():
@@ -76,21 +86,31 @@ def test_linear_sum_equal_layers():
     assert torch.allclose(out[1], torch.tensor([0.0, 1.0]))
 
 
-def test_linear_sum_layer_intersection():
+def test_linear_sum_layer_union_matches_live_composition():
     a = {0: torch.tensor([1.0, 0.0]),
          1: torch.tensor([0.0, 1.0]),
          2: torch.tensor([1.0, 1.0])}
     b = {1: torch.tensor([0.0, 2.0]),
          2: torch.tensor([2.0, 2.0])}
     out = merge.linear_sum([(a, 1.0), (b, 1.0)])
-    assert sorted(out.keys()) == [1, 2]
+    assert sorted(out.keys()) == [0, 1, 2]
+    assert torch.allclose(out[0], a[0])
 
 
-def test_linear_sum_empty_intersection_raises():
+def test_linear_sum_disjoint_layers_uses_union():
     a = {0: torch.tensor([1.0])}
     b = {1: torch.tensor([2.0])}
-    with pytest.raises(merge.MergeError, match="no common layers"):
-        merge.linear_sum([(a, 1.0), (b, 1.0)])
+    out = merge.linear_sum([(a, 1.0), (b, 1.0)])
+    assert sorted(out) == [0, 1]
+    assert torch.equal(out[0], a[0])
+    assert torch.equal(out[1], b[1])
+
+
+def test_linear_sum_strict_rejects_different_layer_coverage():
+    a = {0: torch.tensor([1.0]), 1: torch.tensor([2.0])}
+    b = {1: torch.tensor([3.0])}
+    with pytest.raises(merge.MergeError, match="coverage differs"):
+        merge.linear_sum([(a, 1.0), (b, 1.0)], strict=True)
 
 
 def test_linear_sum_single_component():
@@ -122,9 +142,13 @@ def _make_concept_with_tensors(
         if folder is None:
             folder, _mf = create_baked_manifold_folder(
                 ns, name, "x", manifold, model_id, method="test",
+                model_fingerprint=f"fp:{model_id}",
             )
         else:
-            save_baked_manifold_tensor(folder, manifold, model_id, method="test")
+            save_baked_manifold_tensor(
+                folder, manifold, model_id, method="test",
+                model_fingerprint=f"fp:{model_id}",
+            )
     assert folder is not None
     ManifoldFolder.load(folder).write_metadata()
     return folder
@@ -148,6 +172,57 @@ def test_shared_models_empty_raises(monkeypatch: pytest.MonkeyPatch, tmp_path: P
     _make_concept_with_tensors(tmp_path, "a9lim", "archaic", {"qwen": profile})
     with pytest.raises(merge.MergeError, match="no shared models"):
         merge.shared_models("0.5 default/happy + 0.5 a9lim/archaic")
+
+
+def test_role_variant_uses_and_validates_canonical_tensor(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    folder = _make_concept_with_tensors(
+        tmp_path, "default", "happy", {"gemma": {0: torch.tensor([1.0])}},
+    )
+    sidecar_path = folder / "gemma.json"
+    payload = __import__("json").loads(sidecar_path.read_text())
+    payload["node_roles"] = ["pirate"] * int(payload["node_count"])
+    sidecar_path.write_text(__import__("json").dumps(payload))
+    ManifoldFolder.load(folder, verify_manifest=False).update_file_hashes(
+        folder / "gemma.safetensors", sidecar_path,
+    )
+
+    assert merge.shared_models("default/happy:role-pirate") == ["gemma"]
+    with pytest.raises(merge.MergeError, match="no shared models"):
+        merge.shared_models("default/happy:raw")
+    dst = merge.merge_into_manifold(
+        "pirate_happy", "default/happy:role-pirate", model=None,
+    )
+    assert (dst / "gemma.safetensors").is_file()
+
+
+def test_transfer_variant_routes_concrete_tensor(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    folder = _make_concept_with_tensors(
+        tmp_path, "default", "happy", {"src": {0: torch.tensor([1.0])}},
+    )
+    from saklas.io.paths import tensor_filename
+
+    target_tensor = folder / tensor_filename("target", transferred_from="src")
+    target_sidecar = target_tensor.with_suffix(".json")
+    target_tensor.write_bytes((folder / "src.safetensors").read_bytes())
+    payload = __import__("json").loads((folder / "src.json").read_text())
+    payload["source_model_id"] = "src"
+    payload["model_fingerprint"] = "fp:target"
+    target_sidecar.write_text(__import__("json").dumps(payload))
+    ManifoldFolder.load(folder, verify_manifest=False).update_file_hashes(
+        target_tensor, target_sidecar,
+    )
+
+    assert merge.shared_models("default/happy:from-src") == ["target"]
+    dst = merge.merge_into_manifold(
+        "transferred_happy", "default/happy:from-src", model=None,
+    )
+    assert (dst / "target.safetensors").is_file()
 
 
 def test_merge_into_manifold_single_model(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -175,8 +250,8 @@ def test_merge_into_manifold_single_model(monkeypatch: pytest.MonkeyPatch, tmp_p
     assert sc.fit_mode == "baked"
     # merge always records component provenance; assert guards the Optional
     assert sc.components is not None
-    assert set(sc.components.keys()) == {"default/happy", "a9lim/archaic"}
-    assert sc.components["default/happy"]["alpha"] == 0.5
+    assert set(sc.components.keys()) == {"0:default/happy", "1:a9lim/archaic"}
+    assert sc.components["0:default/happy"]["alpha"] == 0.5
     # The baked tensor folds back to the linear combination:
     # 0.5·[1,0] + 0.25·[0,2] = [0.5, 0.5].
     folded = folded_vector_directions(load_manifold(dst / "gemma.safetensors"))
@@ -203,9 +278,9 @@ def test_merge_into_manifold_explicit_model(monkeypatch: pytest.MonkeyPatch, tmp
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     p = {0: torch.tensor([1.0])}
     _make_concept_with_tensors(tmp_path, "default", "happy",
-                                {"google__gemma-2-2b-it": p, "qwen": p})
+                                {"google/gemma-2-2b-it": p, "qwen": p})
     _make_concept_with_tensors(tmp_path, "a9lim", "archaic",
-                                {"google__gemma-2-2b-it": p, "qwen": p})
+                                {"google/gemma-2-2b-it": p, "qwen": p})
     dst = merge.merge_into_manifold(
         "bard",
         "0.5 default/happy + 0.5 a9lim/archaic",
@@ -216,61 +291,26 @@ def test_merge_into_manifold_explicit_model(monkeypatch: pytest.MonkeyPatch, tmp
     assert not (dst / "qwen.safetensors").is_file()
 
 
-def test_merge_into_manifold_with_projection(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    """merge applies project-away when the ``|`` operator is used.
-
-    v2.1 fix-up: pre-v2.1 merge accepted ``~`` for project-away,
-    inverting the unified-grammar semantics (``~`` keeps aligned,
-    ``|`` projects away).  Now ``|`` is the canonical spelling.
-    """
+def test_legacy_projected_bake_requires_rebake(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    # a = [1, 2]; b = [1, 0]: projecting b out of a removes the x-component,
-    # leaving [0, 2] — orthogonal to b, the meaningful projection result.
-    p_a = {0: torch.tensor([1.0, 2.0])}
-    p_b = {0: torch.tensor([1.0, 0.0])}
-    _make_concept_with_tensors(tmp_path, "default", "a_vec", {"gemma": p_a})
-    _make_concept_with_tensors(tmp_path, "default", "b_vec", {"gemma": p_b})
-    dst = merge.merge_into_manifold(
-        "projected",
-        "1.0 default/a_vec|default/b_vec",
-        model=None,
-        force=False,
+    folder = _make_concept_with_tensors(
+        tmp_path, "local", "legacy", {"gemma": {0: torch.tensor([1.0, 2.0])}},
     )
-    assert (dst / "gemma.safetensors").is_file()
-    # The baked tensor folds back to the projected direction [0, 2]:
-    # orthogonal to b, magnitude preserved on the kept axis.
-    folded = folded_vector_directions(load_manifold(dst / "gemma.safetensors"))
-    assert torch.allclose(folded[0].float(), torch.tensor([0.0, 2.0]), atol=1e-5)
-    assert abs(torch.dot(folded[0].float(), p_b[0])) < 1e-5
-
-
-# ------------------------------------------------- project_away math ---
-
-def test_project_away_orthogonality():
-    b = {0: torch.tensor([1.0, 0.0, 0.0]), 1: torch.tensor([0.0, 1.0, 0.0])}
-    a = {0: torch.tensor([1.0, 2.0, 0.0]), 1: torch.tensor([3.0, 1.0, 5.0])}
-    result = merge.project_away(a, b)
-    dot0 = torch.dot(result[0].float(), b[0].float()).item()
-    assert abs(dot0) < 1e-6
-    dot1 = torch.dot(result[1].float(), b[1].float()).item()
-    assert abs(dot1) < 1e-6
-    assert torch.allclose(result[0].float(), torch.tensor([0.0, 2.0, 0.0]), atol=1e-6)
-    assert torch.allclose(result[1].float(), torch.tensor([3.0, 0.0, 5.0]), atol=1e-6)
-
-
-def test_project_away_near_zero_b_skipped():
-    a = {0: torch.tensor([1.0, 2.0]), 1: torch.tensor([3.0, 4.0])}
-    b = {0: torch.tensor([0.0, 0.0]), 1: torch.tensor([1.0, 0.0])}
-    result = merge.project_away(a, b)
-    assert torch.allclose(result[0], a[0])
-    dot = torch.dot(result[1].float(), b[1].float()).item()
-    assert abs(dot) < 1e-6
-
-
-def test_project_away_layer_in_a_not_b():
-    a = {0: torch.tensor([1.0, 2.0]), 1: torch.tensor([3.0, 4.0])}
-    b = {1: torch.tensor([1.0, 0.0])}
-    result = merge.project_away(a, b)
-    assert torch.allclose(result[0], a[0])
-    dot = torch.dot(result[1].float(), b[1].float()).item()
-    assert abs(dot) < 1e-6
+    sidecar_path = folder / "gemma.json"
+    sidecar = sidecar_path.read_text()
+    payload = __import__("json").loads(sidecar)
+    payload["method"] = "merge"
+    payload["components"] = {
+        "default/a": {
+            "alpha": 1.0,
+            "project_away": "default/b",
+            "tensor_sha256": "legacy",
+        }
+    }
+    sidecar_path.write_text(__import__("json").dumps(payload))
+    mf = ManifoldFolder.load(folder, verify_manifest=False)
+    mf.update_file_hashes(sidecar_path, folder / "gemma.safetensors")
+    with pytest.raises(Exception, match="legacy projected bake"):
+        load_manifold(folder / "gemma.safetensors")

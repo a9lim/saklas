@@ -124,7 +124,8 @@ The two many-node manifolds are **`personas`** (107 archetype nodes from `assist
 
 ### The steering grammar
 
-Every surface (Python, YAML, HTTP, the TUI, `manifold bake`) speaks the same grammar.
+Every live steering surface (Python, YAML, HTTP, the TUI) speaks the same grammar.
+`manifold bake` accepts its namespace-qualified additive scalar subset.
 
 ```python
 session.generate("...", steering="0.3 honest + 0.4 warm")   # add two concepts
@@ -492,7 +493,7 @@ saklas manifold compare <concepts...> -m MODEL
 saklas manifold why <concept> -m MODEL [-j]
 ```
 
-`manifold extract` writes a 2-node concept; `manifold bake` lands a corpus-less manifold straight from a steering expression. Bake and merge share the steering grammar, so `saklas manifold bake honest_unsyco "0.8 honest.deceptive | sycophantic.blunt"` gives you honesty with sycophancy projected out.
+`manifold extract` writes a 2-node concept; `manifold bake` lands a corpus-less manifold from namespace-qualified additive/subtractive scalar terms, for example `saklas manifold bake balanced "0.8 default/honest.deceptive - 0.2 default/sycophantic.blunt"`. Dynamic terms and `~`/`|` projection are rejected offline because live projection is Mahalanobis-only and requires the loaded model's whitener.
 
 Selectors are shared across surfaces: `<name>`, `<ns>/<name>`, `tag:<tag>`, `namespace:<ns>`, `model:<m>`, `default`, `all`, optionally suffixed with a variant (`:raw`, `:sae`, `:sae-<release>`, `:from-<safe_src>`, `:role-<slug>`). Bare names resolve across namespaces and error if ambiguous.
 

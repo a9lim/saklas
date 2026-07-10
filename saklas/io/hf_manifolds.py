@@ -76,6 +76,22 @@ def pull_manifold(
     force: bool,
     revision: Optional[str] = None,
 ) -> Path:
+    """Download and atomically install while holding the target folder lock."""
+    from saklas.io.manifold_folder import _locked_manifest
+
+    with _locked_manifest(Path(target_folder)):
+        return _pull_manifold_locked(
+            coord, target_folder, force=force, revision=revision,
+        )
+
+
+def _pull_manifold_locked(
+    coord: str,
+    target_folder: Path,
+    *,
+    force: bool,
+    revision: Optional[str] = None,
+) -> Path:
     """Download ``coord`` from HF and install into ``target_folder``.
 
     Stage-verify-swap discipline (same shape ``pull_pack`` uses):
@@ -232,13 +248,13 @@ def _manifold_sidecar_stem_to_hf_coord(stem: str) -> Optional[str]:
     ``base_model:`` frontmatter lists the clean base model, then flips
     ``__`` → ``/``.  Returns ``None`` for stems that don't parse.
     """
-    from saklas.io.paths import parse_tensor_filename
+    from saklas.io.paths import parse_tensor_filename, unsafe_model_id
 
     parsed = parse_tensor_filename(f"{stem}.safetensors")
     if parsed is None:
         return None
     safe_model, _variant = parsed
-    return safe_model.replace("__", "/")
+    return unsafe_model_id(safe_model)
 
 
 def _render_manifold_card(
@@ -297,7 +313,7 @@ def _render_manifold_card(
         ]
         from saklas.io.paths import parse_tensor_filename
         for stem in sorted(tensor_stems):
-            base = _manifold_sidecar_stem_to_hf_coord(stem) or stem.replace("__", "/")
+            base = _manifold_sidecar_stem_to_hf_coord(stem) or stem
             parsed = parse_tensor_filename(f"{stem}.safetensors")
             variant = "raw" if (parsed is None or parsed[1] is None) else parsed[1]
             body.append(f"| `{base}` | `{variant}` |")
@@ -358,7 +374,9 @@ def push_manifold(
     import tempfile
 
     from saklas.io.atomic import write_bytes_atomic
-    from saklas.io.manifolds import ManifoldFolder, hash_manifold_files
+    from saklas.io.manifolds import (
+        ManifoldFolder, ManifoldFormatError, hash_manifold_files,
+    )
     from saklas.io.paths import parse_tensor_filename, safe_model_id as _safe_id
 
     mf = ManifoldFolder.load(folder)  # runs integrity check
@@ -387,6 +405,8 @@ def push_manifold(
 
         # Stage the fitted tensors that survive the model/variant filter,
         # each with its sidecar.
+        from saklas.core.manifold import load_manifold
+
         kept_stems: list[str] = []
         for ts in sorted(folder.glob("*.safetensors")):
             parsed = parse_tensor_filename(ts.name)
@@ -398,11 +418,19 @@ def push_manifold(
             vkey = "raw" if var_slug is None else var_slug
             if not _manifold_variant_matches(vkey, variant):
                 continue
+            sc = ts.with_suffix(".json")
+            if not sc.exists():
+                raise ManifoldFormatError(
+                    f"cannot push unpaired fitted tensor {ts.name}"
+                )
+            # Targeted runtime validation covers the trusted manifest pair,
+            # fit policy, and current corpus/domain/template identity. Without
+            # it a metadata edit could publish a current corpus beside a stale
+            # fitted tensor whose old bytes still pass the folder hash map.
+            load_manifold(ts)
             write_bytes_atomic(staging / ts.name, ts.read_bytes())
             kept_stems.append(ts.stem)
-            sc = ts.with_suffix(".json")
-            if sc.exists():
-                write_bytes_atomic(staging / sc.name, sc.read_bytes())
+            write_bytes_atomic(staging / sc.name, sc.read_bytes())
 
         # Re-hash the staged copy so the uploaded manifest matches the
         # bytes we upload (a model/variant filter changes the file set).
@@ -691,17 +719,22 @@ def _install_local_manifold(
         )
 
     dst = manifold_dir(dst_ns, dst_name)
-    if dst.exists():
-        if not force:
-            raise ManifoldInstallConflict(
-                f"{dst} already exists; pass force=True or as_=<ns>/<name>"
-            )
-        shutil.rmtree(dst)
+    from saklas.io.manifold_folder import _locked_manifest
 
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    if is_manifold:
-        shutil.copytree(src, dst)
-    else:
-        from saklas.io.manifolds import port_legacy_vector_folder
-        port_legacy_vector_folder(src, namespace=dst_ns, name=dst_name, force=force)
+    with _locked_manifest(dst):
+        if dst.exists():
+            if not force:
+                raise ManifoldInstallConflict(
+                    f"{dst} already exists; pass force=True or as_=<ns>/<name>"
+                )
+            shutil.rmtree(dst)
+
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if is_manifold:
+            shutil.copytree(src, dst)
+        else:
+            from saklas.io.manifolds import port_legacy_vector_folder
+            port_legacy_vector_folder(
+                src, namespace=dst_ns, name=dst_name, force=force,
+            )
     return dst

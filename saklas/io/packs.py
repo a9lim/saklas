@@ -72,10 +72,10 @@ def hash_folder_files(folder: Path) -> dict[str, str]:
 
 
 # In-process fingerprint cache keyed by absolute file path.
-# Entry: (size, mtime_ns, expected_sha256) -> last verified sha256 matched.
+# Entry: stable file identity + expected sha256 -> last verification matched.
 # Short-circuits full hashing on warm loads. First load, or any stat change,
 # still runs the full sha256 before the entry is (re-)populated.
-_FINGERPRINT_CACHE: dict[str, tuple[int, int, str]] = {}
+_FINGERPRINT_CACHE: dict[str, tuple[int, int, int, int, int, str]] = {}
 
 
 def verify_integrity(folder: Path, files: dict[str, str]) -> tuple[bool, list[str]]:
@@ -83,7 +83,7 @@ def verify_integrity(folder: Path, files: dict[str, str]) -> tuple[bool, list[st
 
     Returns (all_ok, list_of_bad_paths). A missing file counts as bad.
 
-    Uses an in-process (size, mtime_ns) fingerprint cache to avoid re-hashing
+    Uses an in-process stat-identity fingerprint cache to avoid re-hashing
     on warm loads. On first load and after any stat change, the full sha256
     still runs — the cache is purely an optimization and does not weaken the
     integrity contract.
@@ -108,7 +108,10 @@ def verify_integrity(folder: Path, files: dict[str, str]) -> tuple[bool, list[st
         except OSError:
             bad.append(rel)
             continue
-        fp_key = (st.st_size, st.st_mtime_ns, expected)
+        fp_key = (
+            st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_dev, st.st_ino,
+            expected,
+        )
         cached = _FINGERPRINT_CACHE.get(key)
         if cached == fp_key:
             continue

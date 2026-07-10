@@ -38,6 +38,23 @@ def test_safe_model_id():
     assert paths.safe_model_id("google/gemma-2-2b-it") == "google__gemma-2-2b-it"
     assert paths.safe_model_id("Qwen/Qwen2.5-7B-Instruct") == "Qwen__Qwen2.5-7B-Instruct"
     assert paths.safe_model_id("local-model") == "local-model"
+    # Single underscores keep the released cache spelling.
+    assert paths.safe_model_id("org/model_name") == "org__model_name"
+
+
+@pytest.mark.parametrize(
+    "model_id",
+    [
+        "org/model_name",
+        "org__model_name",
+        r"C:\\models\\local model",
+        "local/%model",
+        "组织/模型",
+        "_z-prefixed/model",
+    ],
+)
+def test_safe_model_id_round_trips_every_supported_id(model_id: str) -> None:
+    assert paths.unsafe_model_id(paths.safe_model_id(model_id)) == model_id
 
 
 def test_safe_sae_suffix_raw():
@@ -95,6 +112,31 @@ def test_tensor_filename_rejects_double_variant():
 def test_parse_tensor_filename_rejects_non_safetensors():
     assert paths.parse_tensor_filename("model.json") is None
     assert paths.parse_tensor_filename("model.gguf") is None
+
+
+@pytest.mark.parametrize("reserved", ["_sae-", "_from-", "_role-"])
+def test_tensor_filename_round_trips_reserved_separator_in_model_id(
+    reserved: str,
+) -> None:
+    model_id = f"org/model{reserved}name"
+    filename = paths.tensor_filename(model_id)
+    assert paths.parse_tensor_filename(filename) == (
+        paths.safe_model_id(model_id), None,
+    )
+
+
+def test_transfer_filename_round_trips_reserved_separators_in_both_ids() -> None:
+    target = "org/target_sae-name"
+    source = "org/source_from-name_role-x"
+    filename = paths.tensor_filename(target, transferred_from=source)
+    assert paths.parse_tensor_filename(filename) == (
+        paths.safe_model_id(target),
+        f"from-{paths.safe_model_id(source).lower()}",
+    )
+
+
+def test_safe_model_id_is_bijective_across_slash_and_literal_double_underscore() -> None:
+    assert paths.safe_model_id("org/model") != paths.safe_model_id("org__model")
 
 
 def test_sidecar_filename_partners_tensor():

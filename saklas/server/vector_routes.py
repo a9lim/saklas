@@ -378,13 +378,13 @@ def register_vector_routes(app: FastAPI) -> None:
                 return session.extract_vector_from_corpora(
                     req.name, positive, negative,
                     on_progress=on_progress,
-                    sae=req.sae, sae_revision=req.sae_revision,
+                    sae=req.sae,
                     role=req.role, namespace=req.namespace, force=req.force,
                 )
             return session.extract(
                 coerced, req.baseline,
                 on_progress=on_progress,
-                sae=req.sae, sae_revision=req.sae_revision,
+                sae=req.sae,
                 role=req.role, namespace=req.namespace, force=req.force,
             )
 

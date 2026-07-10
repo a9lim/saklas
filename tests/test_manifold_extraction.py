@@ -6,8 +6,10 @@ real model is needed.
 """
 from __future__ import annotations
 
-import json
 import hashlib
+import json
+import threading
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, cast
 
@@ -193,6 +195,41 @@ def test_fit_produces_manifold(tmp_path: Path) -> None:
     assert manifold.feature_space == "raw"
 
 
+def test_templated_fit_rematerializes_value_and_assistant_edits() -> None:
+    from saklas.io.manifolds import create_manifold_from_template
+    from saklas.io.templates import create_template_folder
+
+    create_template_folder(
+        "local", "weekday", slot="[DAY]",
+        values=["Monday", "Tuesday", "Sunday"],
+        contexts=[{
+            "turns": [{"role": "user", "content": "which day?"}],
+            "assistant": "[DAY] speaks",
+        }],
+    )
+    folder = create_manifold_from_template(
+        "local", "weekday-fit", "", template_ref="local/weekday",
+        fit_mode="pca",
+    )
+    pipe = ManifoldExtractionPipeline(_Handle(), EventBus())
+    pipe.fit(folder)
+
+    create_template_folder(
+        "local", "weekday", slot="[DAY]",
+        values=["Monday", "Wednesday", "Sunday"],
+        contexts=[{
+            "turns": [{"role": "user", "content": "which day?"}],
+            "assistant": "[DAY] answers now",
+        }],
+        force=True,
+    )
+    fitted = pipe.fit(folder)
+    mf = ManifoldFolder.load(folder, verify_manifest=False)
+
+    assert fitted.node_labels == ["monday", "wednesday", "sunday"]
+    assert dict(mf.node_groups())["wednesday"] == ["Wednesday answers now"]
+
+
 def test_fit_can_restrict_transformer_layers(tmp_path: Path) -> None:
     folder = _author_manifold(tmp_path)
     pipe = ManifoldExtractionPipeline(_Handle(), EventBus())
@@ -267,6 +304,178 @@ def test_full_capture_cache_serves_subset_without_forward(
     subset = pipe.fit(folder, layer_indices=[1, 3])
     assert sorted(subset.layers) == [1, 3]
     assert loaded_scopes == [[1, 3]]
+
+
+def test_shared_capture_stem_lock_serializes_independent_folders(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The per-model capture is one transaction across manifold folders."""
+    from saklas.io import atomic
+
+    folder_a = _author_manifold(tmp_path / "a")
+    folder_b = _author_manifold(tmp_path / "b")
+    handle = _Handle()
+    entered_capture = threading.Event()
+    release_capture = threading.Event()
+    second_waiting = threading.Event()
+    second_acquired = threading.Event()
+    calls = 0
+    calls_guard = threading.Lock()
+
+    def _blocking_encoder(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        with calls_guard:
+            calls += 1
+            call_number = calls
+        if call_number == 1:
+            entered_capture.set()
+            assert release_capture.wait(timeout=5)
+        return _stub_encoder_batch(*args, **kwargs)
+
+    real_artifact_lock = atomic.artifact_lock
+
+    @contextmanager
+    def _tracked_lock(path: Path):
+        is_second_capture = (
+            threading.current_thread().name == "capture-second"
+            and path.parent.name == "manifold_capture"
+        )
+        if is_second_capture:
+            second_waiting.set()
+        with real_artifact_lock(path):
+            if is_second_capture:
+                second_acquired.set()
+            yield
+
+    monkeypatch.setattr(V, "_encode_and_capture_all_batch", _blocking_encoder)
+    monkeypatch.setattr(atomic, "artifact_lock", _tracked_lock)
+    errors: list[BaseException] = []
+
+    def _run(folder: Path) -> None:
+        try:
+            ManifoldExtractionPipeline(handle, EventBus()).fit(
+                folder, layer_indices=[0],
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    first = threading.Thread(target=_run, args=(folder_a,), name="capture-first")
+    second = threading.Thread(target=_run, args=(folder_b,), name="capture-second")
+    first.start()
+    assert entered_capture.wait(timeout=5)
+    second.start()
+    assert second_waiting.wait(timeout=5)
+    assert not second_acquired.is_set()
+    release_capture.set()
+    first.join(timeout=10)
+    second.join(timeout=10)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert errors == []
+    assert second_acquired.is_set()
+    assert calls == 1
+
+
+def test_disjoint_layer_top_up_preserves_existing_row_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Replacing the row safetensors carries forward unselected layers."""
+    from safetensors import safe_open
+    from saklas.io.paths import model_dir
+
+    folder_a = _author_manifold(tmp_path / "a")
+    folder_b = _author_manifold(tmp_path / "b")
+    handle = _Handle()
+    ManifoldExtractionPipeline(handle, EventBus()).fit(
+        folder_a, layer_indices=[0],
+    )
+    scopes: list[list[int]] = []
+
+    def _counting(*args: Any, **kwargs: Any) -> Any:
+        scopes.append(list(kwargs["layer_indices"]))
+        return _stub_encoder_batch(*args, **kwargs)
+
+    monkeypatch.setattr(V, "_encode_and_capture_all_batch", _counting)
+    ManifoldExtractionPipeline(handle, EventBus()).fit(
+        folder_b, layer_indices=[1],
+    )
+
+    capture_dir = model_dir("stub-model") / "manifold_capture"
+    meta_path, = capture_dir.glob("*.json")
+    row_path, = capture_dir.glob("*.rows.safetensors")
+    meta = json.loads(meta_path.read_text())
+    assert scopes == [[1]]
+    assert meta["centroid_layers"] == [0, 1]
+    assert meta["row_layers"] == [0, 1]
+    with safe_open(str(row_path), framework="pt", device="cpu") as tensors:
+        assert set(tensors.keys()) == {"layer_0", "layer_1"}
+
+
+def test_row_cache_uses_layer_digests_without_container_rehash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from saklas.io import packs
+    from saklas.io.paths import model_dir
+
+    real_hash_file = packs.hash_file
+    hashed: list[Path] = []
+
+    def _tracked_hash(path: Path) -> str:
+        resolved = Path(path)
+        hashed.append(resolved)
+        if resolved.name.endswith(".rows.safetensors"):
+            raise AssertionError("row container was hashed as one multi-GiB blob")
+        return real_hash_file(resolved)
+
+    monkeypatch.setattr(packs, "hash_file", _tracked_hash)
+    folder = _author_manifold(tmp_path)
+    pipe = ManifoldExtractionPipeline(_Handle(), EventBus())
+    pipe.fit(folder)
+
+    # Force a geometry refit with identical token rows, exercising the cache
+    # read path as well as publication.
+    manifest = json.loads((folder / "manifold.json").read_text())
+    manifest["nodes"][0]["coords"] = [0.125]
+    (folder / "manifold.json").write_text(json.dumps(manifest))
+    pipe.fit(folder)
+
+    capture_dir = model_dir("stub-model") / "manifold_capture"
+    meta_path, = capture_dir.glob("*.json")
+    meta = json.loads(meta_path.read_text())
+    assert meta["format_version"] == 3
+    assert set(meta["row_tensor_sha256"]) == {"0", "1", "2", "3"}
+    assert set(meta["files"]) == {
+        next(capture_dir.glob("*.centroids.safetensors")).name,
+    }
+    assert any(path.name.endswith(".centroids.safetensors") for path in hashed)
+    assert not any(path.name.endswith(".rows.safetensors") for path in hashed)
+
+
+def test_selected_row_digest_tamper_recaptures_that_layer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from safetensors.torch import load_file, save_file
+    from saklas.io.paths import model_dir
+
+    folder = _author_manifold(tmp_path)
+    pipe = ManifoldExtractionPipeline(_Handle(), EventBus())
+    pipe.fit(folder)
+    capture_dir = model_dir("stub-model") / "manifold_capture"
+    row_path, = capture_dir.glob("*.rows.safetensors")
+    tensors = load_file(str(row_path), device="cpu")
+    tensors["layer_1"] = tensors["layer_1"].clone()
+    tensors["layer_1"][0, 0] += 1.0
+    save_file(tensors, str(row_path))
+    scopes: list[list[int]] = []
+
+    def _counting(*args: Any, **kwargs: Any) -> Any:
+        scopes.append(list(kwargs["layer_indices"]))
+        return _stub_encoder_batch(*args, **kwargs)
+
+    monkeypatch.setattr(V, "_encode_and_capture_all_batch", _counting)
+    pipe.fit(folder, layer_indices=[1])
+    assert scopes == [[1]]
 
 
 def test_baseline_prompt_change_invalidates_final_tensor_cache(
@@ -592,10 +801,10 @@ def test_fit_sae_variant(tmp_path: Path) -> None:
     assert (folder / "stub-model_sae-mock-rel.safetensors").exists()
 
 
-def test_fit_sae_cache_hit_does_not_load_backend(
+def test_fit_sae_cache_hit_resolves_identity_without_loading_weights(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A self-contained fitted SAE tensor should load without SAELens."""
+    """A fitted SAE tensor resolves transform identity but loads no weights."""
     folder = _author_manifold(tmp_path)
     pipe = ManifoldExtractionPipeline(_Handle(), EventBus())
     sae = MockSaeBackend(
@@ -606,11 +815,26 @@ def test_fit_sae_cache_hit_does_not_load_backend(
 
     import saklas.core.sae as sae_module
 
-    def _must_not_load(*_args: Any, **_kwargs: Any) -> Any:
-        raise AssertionError("valid manifold cache hit loaded the SAE backend")
+    resolved = 0
 
-    monkeypatch.setattr(sae_module, "load_sae_backend", _must_not_load)
+    def _metadata_only(*_args: Any, **_kwargs: Any) -> Any:
+        nonlocal resolved
+        resolved += 1
+        return MockSaeBackend(
+            layers=frozenset(range(_N_LAYERS)), d_model=_DIM,
+            release="mock-rel", revision="rev-1",
+            fingerprint=sae.fingerprint,
+            encode_fn=lambda *_args: (_ for _ in ()).throw(
+                AssertionError("cache hit loaded/used SAE weights")
+            ),
+            decode_fn=lambda *_args: (_ for _ in ()).throw(
+                AssertionError("cache hit loaded/used SAE weights")
+            ),
+        )
+
+    monkeypatch.setattr(sae_module, "load_sae_backend", _metadata_only)
     cached = pipe.fit(folder, sae="mock-rel", sae_revision="rev-1")
+    assert resolved == 1
     assert cached.feature_space == "sae-mock-rel"
 
 
@@ -1266,3 +1490,58 @@ def test_auto_detects_circle_as_periodic(
         z = manifold.domain.embed(manifold.node_coords[0])
         assert float(sub.sigma_at(z)) > 0.0
     assert "sigma_field_per_layer" in manifold.metadata
+def test_adopt_fitted_manifold_rebinds_loaded_probe_profile_and_prefix(
+    tmp_path: Path,
+) -> None:
+    from types import SimpleNamespace
+
+    from saklas.core.session import SaklasSession
+    from saklas.core.vectors import fold_directions_to_subspace
+
+    old = fold_directions_to_subspace(
+        "mood", {0: torch.tensor([1.0, 0.0])}, None, label="mood",
+    )
+    new = fold_directions_to_subspace(
+        "mood", {0: torch.tensor([0.0, 2.0])}, None, label="mood",
+    )
+
+    class _Monitor:
+        def __init__(self) -> None:
+            self.probes = {
+                "mood-probe": SimpleNamespace(manifold=old, top_n=4),
+            }
+
+        def attached_probes(self):
+            return dict(self.probes)
+
+        def remove_probe(self, name: str) -> None:
+            self.probes.pop(name)
+
+        def add_probe(self, name: str, manifold: Any, *, top_n: int) -> None:
+            self.probes[name] = SimpleNamespace(
+                manifold=manifold, top_n=top_n,
+            )
+
+    session: Any = object.__new__(SaklasSession)
+    session._device = torch.device("cpu")
+    session._dtype = torch.float32
+    session._manifolds = {"local/mood": old}
+    session._profiles = {"local/mood": {0: torch.tensor([1.0, 0.0])}}
+    session._monitor = _Monitor()
+    session._probe_hash_cache = {"mood-probe": "old"}
+    session._analytics_cpu_cache = {"local/mood": object()}
+    session._prefix_cache = object()
+
+    session._adopt_fitted_manifold(tmp_path / "local" / "mood", new)
+
+    live = session._manifolds["local/mood"]
+    assert torch.equal(live.layers[0].basis, new.layers[0].basis)
+    attached = session._monitor.probes["mood-probe"]
+    assert attached.manifold is live
+    assert attached.top_n == 4
+    assert torch.allclose(
+        session._profiles["local/mood"][0], torch.tensor([0.0, 2.0]),
+    )
+    assert session._prefix_cache is None
+    assert session._analytics_cpu_cache == {}
+    assert "mood-probe" not in session._probe_hash_cache

@@ -51,7 +51,7 @@ from saklas.io.manifolds import (
     remove_manifold_folder,
     update_manifold_folder,
 )
-from saklas.io.paths import manifold_dir, safe_model_id
+from saklas.io.paths import manifold_dir
 from saklas.server.app import acquire_session_lock
 from saklas.server.sse import ProgressCallback, progress_sse_response
 
@@ -192,7 +192,7 @@ class UpdateManifoldRequest(BaseModel):
 class FitManifoldRequest(BaseModel):
     """Body for ``POST /manifolds/{ns}/{name}/fit``.
 
-    For authored manifolds only ``sae`` / ``sae_revision`` are honored.
+    For authored manifolds only ``sae`` is honored.
     For discover-mode manifolds ``fit_mode`` and ``hyperparams`` can
     override the folder's stored values; when provided, the folder
     manifest is rewritten *before* the fit so the cache key reflects
@@ -200,7 +200,6 @@ class FitManifoldRequest(BaseModel):
     """
 
     sae: str | None = None
-    sae_revision: str | None = None
     layers: list[int] | Literal["workspace", "all"] | None = None
     force: bool = False
     # Discover-mode override fields — ignored when the folder is authored.
@@ -317,7 +316,9 @@ def _manifold_json(
     folder = manifold_dir(namespace, mf.name)
     out: dict[str, Any] = manifold_summary(folder)
 
-    session_stem = safe_model_id(session.model_id)
+    from saklas.io.paths import tensor_filename
+
+    session_stem = tensor_filename(session.model_id).removesuffix(".safetensors")
     fitted_models = out["fitted_models"]
     fitted_for_session = session_stem in fitted_models
     n, effective_domain = _resolve_intrinsic_dim(mf, session_stem)
@@ -325,9 +326,16 @@ def _manifold_json(
     stale = False
     if fitted_for_session:
         try:
-            stale = mf.sidecar(session_stem).nodes_sha256 != mf.nodes_sha256()
+            from saklas.core.model import loaded_model_fingerprint
+
+            sidecar = mf.sidecar(session_stem)
+            stale = (
+                sidecar.nodes_sha256 != mf.nodes_sha256()
+                or sidecar.model_fingerprint
+                != loaded_model_fingerprint(session.model, session.model_id)
+            )
         except (KeyError, ManifoldFormatError, OSError):
-            stale = False
+            stale = True
 
     # Roles are index-aligned with ``node_labels``; ``manifold_summary``
     # already padded them via ``_roles_padded`` so a consumer can ``zip``
@@ -454,7 +462,7 @@ def _find_manifold(
     if not (folder / "manifold.json").exists():
         raise HTTPException(404, f"manifold {namespace}/{name} not found")
     try:
-        return namespace, ManifoldFolder.load(folder)
+        return namespace, ManifoldFolder.load(folder, verify_manifest=False)
     except ManifoldFormatError as e:
         raise HTTPException(
             400, f"manifold {namespace}/{name} is malformed: {e}",
@@ -974,7 +982,7 @@ def register_manifold_routes(app: FastAPI) -> None:
             # another.
             _apply_fit_overrides()
             manifold = session.fit(
-                folder, sae=req.sae, sae_revision=req.sae_revision,
+                folder, sae=req.sae,
                 layers=req.layers,
                 force=req.force,
                 on_progress=on_progress,
