@@ -3598,13 +3598,20 @@ class SaklasSession:
 
         # Rebuild attach-time whitened factors for probes backed by an evicted
         # object. Preserve public probe name and nearest-node roster size.
-        for probe_name, attached in self._monitor.attached_probes().items():
-            if id(attached.manifold) not in old_objects:
-                continue
-            top_n = attached.top_n
-            self._monitor.remove_probe(probe_name)
-            self._monitor.add_probe(probe_name, promoted, top_n=top_n)
-            self._probe_hash_cache.pop(probe_name, None)
+        # ``_monitor`` doesn't exist yet when a fit runs from the constructor's
+        # probe bootstrap (``_bootstrap_manifold_probes`` re-fits a stale
+        # tagged axis in-session before the Monitor is built) — there are no
+        # attached probes to refresh at that point; the fresh manifold reaches
+        # the Monitor through its constructor roster instead.
+        monitor = getattr(self, "_monitor", None)
+        if monitor is not None:
+            for probe_name, attached in monitor.attached_probes().items():
+                if id(attached.manifold) not in old_objects:
+                    continue
+                top_n = attached.top_n
+                monitor.remove_probe(probe_name)
+                monitor.add_probe(probe_name, promoted, top_n=top_n)
+                self._probe_hash_cache.pop(probe_name, None)
 
         matching_profiles = [key for key in self._profiles if _matches_key(key)]
         if matching_profiles and is_foldable_vector_manifold(manifold):

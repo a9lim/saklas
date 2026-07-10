@@ -40,7 +40,7 @@ from importlib import resources as _resources
 from pathlib import Path
 from typing import Any
 
-from saklas.io.atomic import write_bytes_atomic
+from saklas.io.atomic import write_bytes_atomic, write_json_atomic
 from saklas.io.paths import manifolds_dir, saklas_home
 
 # -- format core ---------------------------------------------------------
@@ -160,19 +160,27 @@ def bundled_manifold_names() -> list[str]:
     )
 
 
-def _canonical_json_sha256(data: bytes) -> str:
-    """Content-stable sha256 of a JSON byte payload.
+def _manifest_content_sha256(data: bytes) -> str:
+    """Bundle-drift sha of a manifest payload — canonical JSON (sorted
+    keys, no whitespace, so cosmetic differences compare equal) with the
+    ``files`` integrity map stripped before hashing.
 
-    Hashes the canonical-JSON form (sorted keys, no surrounding
-    whitespace) so cosmetic-only differences (key order, indent, trailing
-    newline) compare equal.  Falls back to a raw sha256 if the bytes don't
-    parse as JSON, so unparseable on-disk content is treated as "user
-    edited" rather than silently overwritten.
+    ``files`` accumulates per-model fit proofs *locally*
+    (:meth:`ManifoldFolder.update_file_hashes` after every fit), so it is
+    local state, not bundle content.  Comparing the raw manifest against
+    the shipped one misreads every fit as a bundle update; the refresh
+    then clobbered the manifest with the shipped bytes (whose ``files`` is
+    empty), orphaning the fitted tensors — the strict per-tensor loader
+    refuses a tensor with no proof.  Falls back to a raw sha256 if the
+    bytes don't parse as JSON, so unparseable on-disk content is treated
+    as "user edited" rather than silently overwritten.
     """
     try:
         parsed = json.loads(data)
     except (json.JSONDecodeError, UnicodeDecodeError):
         return hashlib.sha256(data).hexdigest()
+    if isinstance(parsed, dict):
+        parsed.pop("files", None)
     return hashlib.sha256(_canonical_json(parsed)).hexdigest()
 
 
@@ -250,9 +258,14 @@ def _materialize_one_bundled_manifold(default_dir: Path, name: str) -> None:
 
         bundled_manifest_bytes = (pkg_root / "manifold.json").read_bytes()
         on_disk_manifest_bytes = on_disk_manifest.read_bytes()
+        # Drift-compare with the local ``files`` integrity map stripped —
+        # fit proofs are local state, and comparing them against the
+        # shipped manifest made every fitted bundled manifold read as a
+        # bundle update on the next launch (the refresh then wiped the
+        # proofs, orphaning the tensors).
         manifest_changed = (
-            _canonical_json_sha256(on_disk_manifest_bytes)
-            != _canonical_json_sha256(bundled_manifest_bytes)
+            _manifest_content_sha256(on_disk_manifest_bytes)
+            != _manifest_content_sha256(bundled_manifest_bytes)
         )
         fmt = on_disk_payload.get("format_version")
         format_stale = isinstance(fmt, int) and fmt < MANIFOLD_FORMAT_VERSION
@@ -262,7 +275,39 @@ def _materialize_one_bundled_manifold(default_dir: Path, name: str) -> None:
         write_bytes_atomic(
             on_disk_manifest.with_suffix(".json.bak"), on_disk_manifest_bytes,
         )
-        write_bytes_atomic(on_disk_manifest, bundled_manifest_bytes)
+        # A genuine bundle update: take the shipped manifest, but carry the
+        # per-model fit proofs forward for artifacts still on disk that the
+        # bundle doesn't ship (fitted tensors + sidecars).  The tensors
+        # deliberately stay put across bundle updates; without their proofs
+        # the strict loader can't read them, and re-verification against
+        # the carried hash still runs on every load — nothing is laundered,
+        # while the per-tensor ``nodes_sha256`` staleness check remains the
+        # thing that decides whether an old fit is still current.
+        try:
+            merged_payload = json.loads(bundled_manifest_bytes)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            merged_payload = None
+        old_files = on_disk_payload.get("files", {})
+        if isinstance(merged_payload, dict) and isinstance(old_files, dict):
+            shipped = {
+                entry.name for entry in pkg_root.iterdir()
+                if _is_bundled_json_file(entry)
+            }
+            carried = {
+                fname: digest
+                for fname, digest in old_files.items()
+                if isinstance(fname, str)
+                and fname not in shipped
+                and (target / fname).is_file()
+            }
+            bundled_files = merged_payload.get("files", {})
+            merged_payload["files"] = {
+                **carried,
+                **(bundled_files if isinstance(bundled_files, dict) else {}),
+            }
+            write_json_atomic(on_disk_manifest, merged_payload)
+        else:
+            write_bytes_atomic(on_disk_manifest, bundled_manifest_bytes)
         _refresh_all_bundled_nodes(pkg_root, target)
         for entry in pkg_root.iterdir():
             if not _is_bundled_json_file(entry) or entry.name == "manifold.json":

@@ -2079,6 +2079,122 @@ def test_bundled_materialization_helpers_ignore_non_json_payloads(tmp_path: Path
     assert not (target / "nodes" / ".DS_Store").exists()
 
 
+def test_bundled_refresh_ignores_local_fit_proofs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fit proofs in ``files`` must not read as a bundle update.
+
+    A fit appends its tensor/sidecar hashes to ``manifold.json.files``
+    (``update_file_hashes``).  The bundle-drift comparison has to ignore
+    that local state — before the fix it didn't, so the next launch saw
+    "manifest changed", refreshed the manifest from the bundle, and wiped
+    the proofs, orphaning every fitted tensor of every bundled manifold.
+    """
+    from saklas.io import manifolds as M
+
+    root = tmp_path / "bundled"
+    pkg = root / "axis"
+    (pkg / "nodes").mkdir(parents=True)
+    bundled_manifest = {
+        "format_version": M.MANIFOLD_FORMAT_VERSION,
+        "name": "axis",
+        "fit_mode": "pca",
+        "nodes": [{"label": "pos"}, {"label": "neg"}],
+    }
+    (pkg / "manifold.json").write_text(json.dumps(bundled_manifest))
+    (pkg / "nodes" / "00_pos.json").write_text('["a"]')
+    (pkg / "nodes" / "01_neg.json").write_text('["b"]')
+    monkeypatch.setattr(
+        M._resources, "files",
+        lambda package: root if package == "saklas.data.manifolds" else None,
+    )
+
+    default_dir = tmp_path / "default"
+    M._materialize_one_bundled_manifold(default_dir, "axis")
+    target = default_dir / "axis"
+
+    # Simulate a fit: tensor + sidecar land, update_file_hashes records them.
+    (target / "model.safetensors").write_bytes(b"tensor-bytes")
+    (target / "model.json").write_text("{}")
+    on_disk = json.loads((target / "manifold.json").read_text())
+    on_disk["files"] = {
+        "model.safetensors": "aa" * 32,
+        "model.json": "bb" * 32,
+    }
+    (target / "manifold.json").write_text(json.dumps(on_disk))
+
+    M._materialize_one_bundled_manifold(default_dir, "axis")
+
+    refreshed = json.loads((target / "manifold.json").read_text())
+    assert refreshed["files"] == on_disk["files"], "proofs were clobbered"
+    assert not (target / "manifold.json.bak").exists(), (
+        "a proofs-only difference must not be treated as a bundle update"
+    )
+
+
+def test_bundled_refresh_carries_tensor_proofs_forward(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A genuine bundle update keeps proofs for surviving fitted artifacts.
+
+    Fitted tensors deliberately stay put across bundle updates (the
+    ``nodes_sha256`` staleness check owns re-fit decisions); their
+    integrity proofs must travel with them or the strict loader refuses
+    the files.  Entries for since-deleted files and for bundle-shipped
+    files are dropped.
+    """
+    from saklas.io import manifolds as M
+
+    root = tmp_path / "bundled"
+    pkg = root / "axis"
+    (pkg / "nodes").mkdir(parents=True)
+
+    def manifest(description: str) -> str:
+        return json.dumps({
+            "format_version": M.MANIFOLD_FORMAT_VERSION,
+            "name": "axis",
+            "fit_mode": "pca",
+            "description": description,
+            "nodes": [{"label": "pos"}, {"label": "neg"}],
+        })
+
+    (pkg / "manifold.json").write_text(manifest("v1"))
+    (pkg / "nodes" / "00_pos.json").write_text('["a"]')
+    (pkg / "nodes" / "01_neg.json").write_text('["b"]')
+    monkeypatch.setattr(
+        M._resources, "files",
+        lambda package: root if package == "saklas.data.manifolds" else None,
+    )
+
+    default_dir = tmp_path / "default"
+    M._materialize_one_bundled_manifold(default_dir, "axis")
+    target = default_dir / "axis"
+
+    (target / "model.safetensors").write_bytes(b"tensor-bytes")
+    (target / "model.json").write_text("{}")
+    on_disk = json.loads((target / "manifold.json").read_text())
+    on_disk["files"] = {
+        "model.safetensors": "aa" * 32,
+        "model.json": "bb" * 32,
+        "gone.safetensors": "cc" * 32,   # file no longer on disk
+        "manifold.json": "dd" * 32,      # bundle-shipped name — never carried
+    }
+    (target / "manifold.json").write_text(json.dumps(on_disk))
+
+    # Ship a real bundle update.
+    (pkg / "manifold.json").write_text(manifest("v2"))
+    with pytest.warns(UserWarning, match="refreshed default/axis"):
+        M._materialize_one_bundled_manifold(default_dir, "axis")
+
+    refreshed = json.loads((target / "manifold.json").read_text())
+    assert refreshed["description"] == "v2"
+    assert refreshed["files"] == {
+        "model.safetensors": "aa" * 32,
+        "model.json": "bb" * 32,
+    }
+    assert (target / "manifold.json.bak").exists()
+
+
 def test_bundled_manifold_names_skips_incomplete_package_data(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

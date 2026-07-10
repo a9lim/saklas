@@ -151,7 +151,17 @@ lookup) loads metadata with `verify_manifest=False`; install/push/fitted-tensor
 use stays strict. `bundled_manifold_names`, `materialize_bundled_manifolds`
 (copy-on-miss into `default/` for complete package-data folders only, plus a
 re-copy when the bundled manifest hash drifts or the on-disk `format_version`
-predates `MANIFOLD_FORMAT_VERSION`). Per-node `role`
+predates `MANIFOLD_FORMAT_VERSION`). Bundle-drift comparison runs on the
+**`files`-stripped** canonical payload (`_manifest_content_sha256`) — the
+integrity map accumulates per-model fit proofs locally
+(`update_file_hashes`), so comparing it against the shipped manifest
+misread every fitted bundled manifold as a bundle update and the refresh
+clobbered the proofs, orphaning the tensors (the strict loader refuses a
+tensor with no proof). On a genuine bundle update the refresh **carries
+forward** `files` entries for still-present non-bundle-shipped artifacts
+(fitted tensors + sidecars) — proofs still verify on every load, and
+`nodes_sha256` staleness remains the thing that decides whether an old
+fit is current. Per-node `role`
 (slug `[a-z0-9._-]+`) rides the fit to `compute_node_centroid` for role-baselined
 centroids; family-unsupported raises `RoleSubstitutionUnsupportedError` at fit time.
 
