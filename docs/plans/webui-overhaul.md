@@ -1,5 +1,12 @@
 # Webui UI/UX overhaul
 
+> **Partially superseded (2026-07-10):** the ground-up redesign for the next
+> major release replaces this doc's *visual language* goal (match a9l.im) with
+> the Observatory+ direction (four-pillar instrument stack, pillar-hue system,
+> gradients + live glow). The UX principles here — dark-only, density stays
+> visible, legible-not-opaque — carry forward. See `docs/plans/sae-pillar.md`
+> for the fourth pillar's runtime sketch.
+
 Plan for a full audit and redesign of the `saklas` webui — the Svelte
 workbench served by `saklas serve` and mounted from `saklas/web/`.
 
