@@ -321,6 +321,33 @@ def test_write_metadata_populates_files(tmp_path: Path):
     assert reloaded.files == mf.files
 
 
+def test_update_file_hashes_only_reads_new_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    folder = _author_manifold(tmp_path)
+    _add_dummy_tensor(folder)
+    mf = ManifoldFolder.load(folder)
+    mf.write_metadata()
+    new_tensor = folder / "other-model.safetensors"
+    new_sidecar = folder / "other-model.json"
+    new_tensor.write_bytes(b"new tensor")
+    new_sidecar.write_bytes((folder / "stub-model.json").read_bytes())
+
+    from saklas.io import manifold_folder as folder_mod
+    real_hash = folder_mod.hash_file
+    hashed: list[Path] = []
+
+    def _spy(path: Path) -> str:
+        hashed.append(Path(path))
+        return real_hash(path)
+
+    monkeypatch.setattr(folder_mod, "hash_file", _spy)
+    mf.update_file_hashes(new_tensor, new_sidecar)
+
+    assert hashed == [new_tensor, new_sidecar]
+    assert ManifoldFolder.load(folder).files == mf.files
+
+
 def test_manifold_sidecar_load(tmp_path: Path):
     path = tmp_path / "m.json"
     path.write_text(json.dumps({

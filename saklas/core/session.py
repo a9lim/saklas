@@ -10,7 +10,7 @@ from contextlib import contextmanager, nullcontext, suppress
 from dataclasses import dataclass
 from enum import Enum, IntEnum
 from types import TracebackType
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Literal, cast, overload
 
 import torch
@@ -1248,9 +1248,6 @@ class SaklasSession:
         # still force the per-token subset they need.
         self._live_probe_scores: bool = True
         if probe_categories:
-            self._layer_means = bootstrap_layer_means(
-                self._model, self._tokenizer, self._layers, self._model_info,
-            )
             self._whitener = self._build_whitener_from_cache_or_compute()
 
         # DLS toggle stored on the session so ad-hoc ``session.extract``
@@ -1707,8 +1704,11 @@ class SaklasSession:
         """Compute or load the per-model whitener.
 
         Uses ``load_or_compute_neutral_activations`` (alignment.py) for
-        disk caching; combines with the in-memory ``_layer_means`` to
-        instantiate the :class:`LayerWhitener`.  Soft-fails to ``None``
+        disk caching; derives missing centering means from that same loaded
+        tensor set, then instantiates the :class:`LayerWhitener`.  The shared
+        load matters on a cold model: probe bootstrap no longer reads the
+        neutral cache once for means and immediately again for covariance.
+        Soft-fails to ``None``
         on any error — but the engine is Mahalanobis-only now, so a
         ``None`` whitener makes the activation-space consumers (fit,
         ``~``/``|`` projection, probe scoring, ``manifold compare``) raise
@@ -1723,30 +1723,23 @@ class SaklasSession:
         from saklas.core.mahalanobis import LayerWhitener
         from saklas.io.alignment import load_or_compute_neutral_activations
 
-        if not self._layer_means:
-            # Whitener requires the centering means; if they haven't been
-            # built yet, build them now.  This keeps ``session.whitener``
-            # working even on ``probes=[]`` sessions where the eager init
-            # path was skipped.
-            try:
-                self._layer_means = bootstrap_layer_means(
-                    self._model, self._tokenizer, self._layers, self._model_info,
-                )
-            except Exception as exc:  # pragma: no cover — defensive
-                _log.warning("whitener: layer_means build failed: %s", exc)
-                return None
         try:
             neutral_acts = load_or_compute_neutral_activations(
                 self._model, self._tokenizer, self._layers,
                 model_id=self._model_info.get("model_id", "unknown"),
             )
+            if not self._layer_means:
+                self._layer_means = {
+                    idx: activations.mean(dim=0)
+                    for idx, activations in neutral_acts.items()
+                }
             return LayerWhitener.from_neutral_activations(
                 neutral_acts, self._layer_means,
             )
         except Exception as exc:
             _log.warning(
-                "whitener: build failed (%s); DiM extraction will use "
-                "Euclidean scoring. Error: %s",
+                "whitener: build failed (%s); Mahalanobis-only fitting, "
+                "projection, and probe reads are unavailable. Error: %s",
                 type(exc).__name__, exc,
             )
             return None
@@ -1823,12 +1816,18 @@ class SaklasSession:
         from saklas.io.lens import (
             load_lens_checkpoint,
             remove_lens_checkpoint,
-            save_lens_checkpoint,
+            save_lens_checkpoint_accumulator,
         )
 
         dim_batch = dim_batch or DEFAULT_DIM_BATCH
         seq_len = seq_len or DEFAULT_SEQ_LEN
         checkpoint_every = checkpoint_every or DEFAULT_CHECKPOINT_EVERY
+        if dim_batch <= 0:
+            raise ValueError("dim_batch must be > 0")
+        if seq_len <= 0:
+            raise ValueError("seq_len must be > 0")
+        if checkpoint_every <= 0:
+            raise ValueError("checkpoint_every must be > 0")
         prompt_list = list(prompts)
         raw_corpus_sha = hashlib.sha256(repr(prompt_list).encode("utf-8")).hexdigest()
         raw_prompt_count = len(prompt_list)
@@ -1873,9 +1872,16 @@ class SaklasSession:
             usable: list[str] = []
             consumed_ids: list[list[int]] = []
             for prompt in prompt_list:
-                ids = self._tokenizer(prompt, return_tensors="pt")["input_ids"][
-                    :, :seq_len
-                ]
+                try:
+                    ids = self._tokenizer(
+                        prompt, return_tensors="pt", truncation=True,
+                        max_length=seq_len,
+                    )["input_ids"]
+                except TypeError:
+                    # Minimal/test tokenizers may not expose HF truncation kwargs.
+                    ids = self._tokenizer(prompt, return_tensors="pt")[
+                        "input_ids"
+                    ][:, :seq_len]
                 if ids.shape[1] > SKIP_FIRST_POSITIONS + 1:
                     usable.append(prompt)
                     consumed_ids.append([int(tok) for tok in ids[0].tolist()])
@@ -1925,12 +1931,72 @@ class SaklasSession:
                                 "reusing existing fitted layers; fitting missing "
                                 f"J-lens layers {missing_sources}"
                             )
-                        missing = fit_jacobian_lens(
-                            fit_model, self._tokenizer, usable, fit_layers,
-                            source_layers=missing_sources, dim_batch=dim_batch,
-                            max_seq_len=seq_len, on_progress=on_progress,
-                            input_id_rows=consumed_ids,
+                        missing_base = None
+                        topup_ckpt = load_lens_checkpoint(self.model_id)
+                        if topup_ckpt is not None:
+                            partial, topup_sidecar = topup_ckpt
+                            if (
+                                topup_sidecar.get("corpus_sha256") == corpus_sha
+                                and topup_sidecar.get("corpus_hash_kind")
+                                == corpus_hash_kind
+                                and topup_sidecar.get("seq_len") == seq_len
+                                and int(topup_sidecar.get("base_n_prompts", -1)) == 0
+                                and partial.source_layers == missing_sources
+                            ):
+                                missing_base = partial
+                                if on_progress is not None:
+                                    on_progress(
+                                        "resuming missing-layer checkpoint at "
+                                        f"{partial.n_prompts} prompts"
+                                    )
+                        topup_offset = (
+                            missing_base.n_prompts
+                            if missing_base is not None else 0
                         )
+                        topup_prompts = usable[topup_offset:]
+                        topup_ids = consumed_ids[topup_offset:]
+
+                        def _save_topup_accumulator(
+                            sums: "Mapping[int, torch.Tensor]",
+                            completed: int,
+                            d_model: int,
+                        ) -> None:
+                            save_lens_checkpoint_accumulator(
+                                sums, completed, d_model, self.model_id,
+                                base=missing_base,
+                                corpus_spec=corpus_spec,
+                                corpus_sha256=corpus_sha,
+                                corpus_hash_kind=corpus_hash_kind,
+                                seq_len=seq_len,
+                                dim_batch=dim_batch,
+                                skip_first=SKIP_FIRST_POSITIONS,
+                                raw_corpus_sha256=raw_corpus_sha,
+                                raw_prompt_count=raw_prompt_count,
+                                usable_prompt_count=len(consumed_ids),
+                                model_layer_count=len(fit_layers),
+                            )
+
+                        if topup_prompts:
+                            missing_tail = fit_jacobian_lens(
+                                fit_model, self._tokenizer, topup_prompts,
+                                fit_layers, source_layers=missing_sources,
+                                dim_batch=dim_batch, max_seq_len=seq_len,
+                                checkpoint_accumulator_cb=(
+                                    _save_topup_accumulator
+                                ),
+                                checkpoint_every=checkpoint_every,
+                                on_progress=on_progress,
+                                input_id_rows=topup_ids,
+                            )
+                            missing = (
+                                JacobianLens.merge_into(
+                                    [missing_base, missing_tail], target=-1,
+                                )
+                                if missing_base is not None else missing_tail
+                            )
+                        else:
+                            assert missing_base is not None
+                            missing = missing_base
                         merged = JacobianLens.union_layers([lens, missing])
                         save_lens(
                             merged, self.model_id,
@@ -1942,6 +2008,7 @@ class SaklasSession:
                             raw_corpus_sha256=raw_corpus_sha,
                             raw_prompt_count=raw_prompt_count,
                             usable_prompt_count=len(consumed_ids),
+                            model_layer_count=len(fit_layers),
                         )
                         remove_lens_checkpoint(self.model_id)
                         selected = merged.select_layers(expected_sources)
@@ -1964,15 +2031,23 @@ class SaklasSession:
                     )
                     if ckpt_matches:
                         ckpt_base_n = int(ckpt_sidecar.get("base_n_prompts", -1))
-                        if base is not None and ckpt_base_n == base.n_prompts:
-                            base = JacobianLens.merge([base, partial])
+                        if ckpt_base_n == 0 and (
+                            base is None or partial.n_prompts >= base.n_prompts
+                        ):
+                            # New checkpoints are self-contained.  Prefer the
+                            # furthest durable accumulator even when an older
+                            # full artifact is also present; otherwise a second
+                            # interruption would silently rewind to that artifact.
+                            base = partial
                             if on_progress is not None:
                                 on_progress(
                                     "resuming from checkpoint at "
                                     f"{base.n_prompts} prompts"
                                 )
-                        elif base is None and ckpt_base_n == 0:
-                            base = partial
+                        elif base is not None and ckpt_base_n == base.n_prompts:
+                            base = JacobianLens.merge_into(
+                                [base, partial], target=-1,
+                            )
                             if on_progress is not None:
                                 on_progress(
                                     "resuming from checkpoint at "
@@ -2001,14 +2076,19 @@ class SaklasSession:
                     raw_corpus_sha256=raw_corpus_sha,
                     raw_prompt_count=raw_prompt_count,
                     usable_prompt_count=len(consumed_ids) + prompt_base,
+                    model_layer_count=len(fit_layers),
                 )
                 remove_lens_checkpoint(self.model_id)
                 return lens
 
-            def _save_checkpoint(partial: "Any") -> None:
-                save_lens_checkpoint(
-                    partial, self.model_id,
-                    base_n_prompts=prompt_base,
+            def _save_checkpoint_accumulator(
+                sums: "Mapping[int, torch.Tensor]",
+                completed: int,
+                d_model: int,
+            ) -> None:
+                save_lens_checkpoint_accumulator(
+                    sums, completed, d_model, self.model_id,
+                    base=base,
                     corpus_spec=corpus_spec,
                     corpus_sha256=corpus_sha,
                     corpus_hash_kind=corpus_hash_kind,
@@ -2018,6 +2098,7 @@ class SaklasSession:
                     raw_corpus_sha256=raw_corpus_sha,
                     raw_prompt_count=raw_prompt_count,
                     usable_prompt_count=len(consumed_ids) + prompt_base,
+                    model_layer_count=len(fit_layers),
                 )
 
             if base is not None and not usable:
@@ -2030,13 +2111,14 @@ class SaklasSession:
                 fit_model, self._tokenizer, usable, fit_layers,
                 source_layers=expected_sources, dim_batch=dim_batch,
                 max_seq_len=seq_len,
-                checkpoint_cb=_save_checkpoint,
+                checkpoint_accumulator_cb=_save_checkpoint_accumulator,
                 checkpoint_every=checkpoint_every,
                 on_progress=on_progress,
                 input_id_rows=consumed_ids,
             )
             merged = (
-                JacobianLens.merge([base, fitted]) if base is not None else fitted
+                JacobianLens.merge_into([base, fitted], target=-1)
+                if base is not None else fitted
             )
             merged = _save_full(merged)
             self._jlens = merged
@@ -4652,9 +4734,7 @@ class SaklasSession:
         same primitive ``extract`` uses for a monopolar concept.
         """
         if not self._layer_means:
-            self._layer_means = bootstrap_layer_means(
-                self._model, self._tokenizer, self._layers, self._model_info,
-            )
+            _ = self.layer_means
             self._monitor.layer_means = self._layer_means
         from saklas.core.vectors import fold_directions_to_subspace
         return fold_directions_to_subspace(

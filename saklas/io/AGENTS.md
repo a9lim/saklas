@@ -92,7 +92,9 @@ share/subspace metrics, fit_mode, hyperparams, diagnostics, and
 `node_spread_per_layer` — the whitened between-node spread `{str(L): tr(G_L)}`,
 a diagnostic concept-signal-by-layer profile, empty on pre-4.0 fits); the tensor
 save/load itself lives in `core/manifold.py`. `hash_manifold_files` reuses
-`packs.hash_file` for the per-file sha256 integrity manifest.
+`packs.hash_file` for the per-file sha256 integrity manifest. After the first
+manifest population, `ManifoldFolder.update_file_hashes` hashes only the tensor
+and sidecar just replaced; already-verified historical variants are preserved.
 
 A node corpus is now a list of conversational *responses* (`list[str]`) aligned to
 the shared A2 baseline user prompts — `response[i]` answers `baseline_prompt[i % k]`
@@ -336,12 +338,18 @@ J entries are O(1) so range is no constraint, and nothing here feeds a
 covariance inversion), promoted to fp32 on load. The sidecar records `method`,
 `n_prompts`, `d_model`, `source_layers`, the corpus spec + token-id sha256 (the
 resume/staleness key), optional raw-corpus sha/count metadata for model-load-free
-no-op checks, `seq_len`, `dim_batch`, and `skip_first_positions`. Resumable
+no-op checks, `seq_len`, `dim_batch`, `skip_first_positions`, and the model's
+layer count (needed to prove `all`/`workspace` coverage without loading it).
+Loading uses `safe_open` one layer at a time, so fp16 source storage is released
+as the fp32 lens is materialized rather than coexisting as a full mapping. Resumable
 checkpoints live beside the full artifact as `jlens.partial.{safetensors,json}`:
-they store only the new partial shard plus `base_n_prompts`, so checkpoints do
-not rewrite a multi-GB merged lens every cadence; finalization writes the full
-artifact durably and removes the checkpoint. `lens_paths` / `lens_checkpoint_paths`
-/ `save_lens` / `save_lens_checkpoint` / `load_lens` /
+the estimator writes a self-contained averaged checkpoint directly from raw sums,
+merging a prior prefix one layer at a time during fp16 conversion. This avoids a
+second full fp32 lens at checkpoint cadence and makes repeated interruptions
+independent of an older full artifact (`base_n_prompts=0`). Finalization writes
+the full artifact durably and removes the checkpoint. `lens_paths` /
+`lens_checkpoint_paths` / `save_lens` / `save_lens_checkpoint_accumulator` /
+`save_lens_checkpoint` (compatibility) / `load_lens` /
 `load_lens_checkpoint` / `remove_lens`; the fit itself lives in `core/jlens.py`.
 
 ## atomic.py / staging.py

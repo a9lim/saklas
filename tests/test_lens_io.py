@@ -20,6 +20,7 @@ from saklas.io.lens import (
     remove_lens,
     save_lens,
     save_lens_checkpoint,
+    save_lens_checkpoint_accumulator,
 )
 
 _MODEL = "test-org/tiny-model"
@@ -103,6 +104,36 @@ def test_save_load_checkpoint_round_trip() -> None:
     assert sidecar["usable_prompt_count"] == 12
 
 
+def test_checkpoint_accumulator_is_self_contained_and_merges_prefix() -> None:
+    base = _lens(n_layers=2, n_prompts=3)
+    tail = _lens(n_layers=2, n_prompts=2)
+    sums = {layer: J * tail.n_prompts for layer, J in tail.jacobians.items()}
+
+    save_lens_checkpoint_accumulator(
+        sums, tail.n_prompts, _D, _MODEL,
+        base=base,
+        corpus_spec="test-corpus",
+        corpus_sha256="abc123",
+        seq_len=128,
+        dim_batch=8,
+        skip_first=16,
+        model_layer_count=3,
+    )
+
+    loaded = load_lens_checkpoint(_MODEL)
+    assert loaded is not None
+    got, sidecar = loaded
+    expected = JacobianLens.merge([base, tail])
+    assert got.n_prompts == expected.n_prompts == 5
+    assert sidecar["base_n_prompts"] == 0
+    assert sidecar["partial_n_prompts"] == 5
+    assert sidecar["model_layer_count"] == 3
+    for layer in got.source_layers:
+        assert torch.allclose(
+            got.jacobians[layer], expected.jacobians[layer], atol=2e-3,
+        )
+
+
 def test_load_lens_sidecar_does_not_read_tensors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -111,7 +142,7 @@ def test_load_lens_sidecar_does_not_read_tensors(
     def _boom(*_args: object, **_kwargs: object) -> object:
         raise AssertionError("metadata-only load should not read safetensors")
 
-    monkeypatch.setattr("saklas.io.lens.load_file", _boom)
+    monkeypatch.setattr("saklas.io.lens.safe_open", _boom)
     sidecar = load_lens_sidecar(_MODEL)
     assert sidecar is not None
     assert sidecar["source_layers"] == [0, 1, 2]

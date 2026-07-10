@@ -24,10 +24,12 @@ import logging
 import os
 from contextlib import suppress
 from pathlib import Path
+from collections.abc import Mapping
 from typing import Any
 
 import torch
-from safetensors.torch import load_file, save_file
+from safetensors import safe_open
+from safetensors.torch import save_file
 
 from saklas.core.jlens import JacobianLens
 from saklas.io.atomic import write_json_atomic
@@ -115,6 +117,7 @@ def save_lens(
     raw_corpus_sha256: str | None = None,
     raw_prompt_count: int | None = None,
     usable_prompt_count: int | None = None,
+    model_layer_count: int | None = None,
 ) -> Path:
     """Persist a fitted lens (fp16 tensors + atomic JSON sidecar)."""
     ts_path, sc_path = lens_paths(model_id)
@@ -130,6 +133,7 @@ def save_lens(
         raw_corpus_sha256=raw_corpus_sha256,
         raw_prompt_count=raw_prompt_count,
         usable_prompt_count=usable_prompt_count,
+        model_layer_count=model_layer_count,
     )
     return ts_path
 
@@ -148,6 +152,7 @@ def save_lens_checkpoint(
     raw_corpus_sha256: str | None = None,
     raw_prompt_count: int | None = None,
     usable_prompt_count: int | None = None,
+    model_layer_count: int | None = None,
 ) -> Path:
     """Persist a resumable partial shard without rewriting the full lens."""
     ts_path, sc_path = lens_checkpoint_paths(model_id)
@@ -163,10 +168,63 @@ def save_lens_checkpoint(
         raw_corpus_sha256=raw_corpus_sha256,
         raw_prompt_count=raw_prompt_count,
         usable_prompt_count=usable_prompt_count,
+        model_layer_count=model_layer_count,
         extra_sidecar={
             "checkpoint": True,
             "base_n_prompts": int(base_n_prompts),
             "partial_n_prompts": partial.n_prompts,
+        },
+    )
+    return ts_path
+
+
+def save_lens_checkpoint_accumulator(
+    sums: Mapping[int, torch.Tensor],
+    n_prompts: int,
+    d_model: int,
+    model_id: str,
+    *,
+    base: JacobianLens | None,
+    corpus_spec: str,
+    corpus_sha256: str,
+    seq_len: int,
+    dim_batch: int,
+    skip_first: int,
+    corpus_hash_kind: str = "text_v1",
+    raw_corpus_sha256: str | None = None,
+    raw_prompt_count: int | None = None,
+    usable_prompt_count: int | None = None,
+    model_layer_count: int | None = None,
+) -> Path:
+    """Write a self-contained checkpoint directly from raw estimator sums.
+
+    Normalization and optional prefix merging happen one layer at a time while
+    converting to fp16, avoiding the extra full-fp32 ``JacobianLens`` that the
+    compatibility checkpoint callback requires.  The resulting shard always has
+    ``base_n_prompts=0`` and can therefore survive any number of interruptions
+    without depending on a separate full artifact.
+    """
+    ts_path, sc_path = lens_checkpoint_paths(model_id)
+    total_prompts = int(n_prompts) + (base.n_prompts if base is not None else 0)
+    _save_lens_components(
+        sums, total_prompts, d_model, ts_path, sc_path,
+        corpus_spec=corpus_spec,
+        corpus_sha256=corpus_sha256,
+        seq_len=seq_len,
+        dim_batch=dim_batch,
+        skip_first=skip_first,
+        corpus_hash_kind=corpus_hash_kind,
+        durable=False,
+        raw_corpus_sha256=raw_corpus_sha256,
+        raw_prompt_count=raw_prompt_count,
+        usable_prompt_count=usable_prompt_count,
+        model_layer_count=model_layer_count,
+        raw_sum_count=int(n_prompts),
+        average_base=base,
+        extra_sidecar={
+            "checkpoint": True,
+            "base_n_prompts": 0,
+            "partial_n_prompts": total_prompts,
         },
     )
     return ts_path
@@ -187,20 +245,67 @@ def _save_lens_at(
     raw_corpus_sha256: str | None = None,
     raw_prompt_count: int | None = None,
     usable_prompt_count: int | None = None,
+    model_layer_count: int | None = None,
+    extra_sidecar: dict[str, Any] | None = None,
+) -> None:
+    _save_lens_components(
+        lens.jacobians, lens.n_prompts, lens.d_model, ts_path, sc_path,
+        corpus_spec=corpus_spec,
+        corpus_sha256=corpus_sha256,
+        seq_len=seq_len,
+        dim_batch=dim_batch,
+        skip_first=skip_first,
+        corpus_hash_kind=corpus_hash_kind,
+        durable=durable,
+        raw_corpus_sha256=raw_corpus_sha256,
+        raw_prompt_count=raw_prompt_count,
+        usable_prompt_count=usable_prompt_count,
+        model_layer_count=model_layer_count,
+        extra_sidecar=extra_sidecar,
+    )
+
+
+def _save_lens_components(
+    jacobians: Mapping[int, torch.Tensor],
+    n_prompts: int,
+    d_model: int,
+    ts_path: Path,
+    sc_path: Path,
+    *,
+    corpus_spec: str,
+    corpus_sha256: str,
+    seq_len: int,
+    dim_batch: int,
+    skip_first: int,
+    corpus_hash_kind: str,
+    durable: bool,
+    raw_corpus_sha256: str | None = None,
+    raw_prompt_count: int | None = None,
+    usable_prompt_count: int | None = None,
+    model_layer_count: int | None = None,
+    raw_sum_count: int | None = None,
+    average_base: JacobianLens | None = None,
     extra_sidecar: dict[str, Any] | None = None,
 ) -> None:
     ts_path.parent.mkdir(parents=True, exist_ok=True)
-    tensors = {
-        f"layer_{idx}": J.contiguous().to(torch.float16).cpu()
-        for idx, J in lens.jacobians.items()
-    }
+    tensors: dict[str, torch.Tensor] = {}
+    for idx, J in jacobians.items():
+        value = J
+        if raw_sum_count is not None:
+            value = J.clone()
+            if average_base is not None:
+                value.add_(
+                    average_base.jacobians[idx], alpha=average_base.n_prompts,
+                )
+            value.mul_(1.0 / max(int(n_prompts), 1))
+        tensors[f"layer_{idx}"] = value.contiguous().to(torch.float16).cpu()
     _save_safetensors_atomic(ts_path, tensors, durable=durable)
     sidecar: dict[str, Any] = {
         "format_version": LENS_FORMAT_VERSION,
         "method": _LENS_METHOD,
-        "n_prompts": lens.n_prompts,
-        "d_model": lens.d_model,
-        "source_layers": lens.source_layers,
+        "n_prompts": int(n_prompts),
+        "d_model": int(d_model),
+        "source_layers": sorted(int(layer) for layer in jacobians),
         "dtype": "float16",
         "corpus_spec": corpus_spec,
         "corpus_sha256": corpus_sha256,
@@ -215,6 +320,8 @@ def _save_lens_at(
         sidecar["raw_prompt_count"] = int(raw_prompt_count)
     if usable_prompt_count is not None:
         sidecar["usable_prompt_count"] = int(usable_prompt_count)
+    if model_layer_count is not None:
+        sidecar["model_layer_count"] = int(model_layer_count)
     if extra_sidecar:
         sidecar.update(extra_sidecar)
     write_json_atomic(sc_path, sidecar)
@@ -274,34 +381,39 @@ def _load_lens_at(
     if sidecar is None:
         return None
     try:
-        tensors = load_file(str(ts_path))
-        jacobians = {
-            int(k.split("_", 1)[1]): v.to(torch.float32) for k, v in tensors.items()
-        }
         d_model = int(sidecar["d_model"])
         source_layers = [int(layer) for layer in sidecar["source_layers"]]
-        tensor_layers = sorted(jacobians)
-        if tensor_layers != source_layers:
-            log.warning(
-                "%s for %s has tensor layers %s but sidecar declares %s; "
-                "ignoring — re-fit with `saklas lens fit`",
-                label, model_id, tensor_layers, source_layers,
+        jacobians: dict[int, torch.Tensor] = {}
+        with safe_open(str(ts_path), framework="pt", device="cpu") as tensors:
+            tensor_layers = sorted(
+                int(k.split("_", 1)[1]) for k in tensors.keys()
             )
-            return None
-        for layer, J in jacobians.items():
-            if J.ndim != 2 or tuple(J.shape) != (d_model, d_model):
+            if tensor_layers != source_layers:
                 log.warning(
-                    "%s for %s layer %d has shape %s (need %dx%d); "
+                    "%s for %s has tensor layers %s but sidecar declares %s; "
                     "ignoring — re-fit with `saklas lens fit`",
-                    label, model_id, layer, tuple(J.shape), d_model, d_model,
+                    label, model_id, tensor_layers, source_layers,
                 )
                 return None
-        if not all(bool(torch.isfinite(j).all()) for j in jacobians.values()):
-            log.warning(
-                "%s for %s contains non-finite values; ignoring — "
-                "re-fit with `saklas lens fit`", label, model_id,
-            )
-            return None
+            # Convert and validate one layer at a time.  ``load_file`` kept the
+            # complete fp16 mapping alive while also materializing the complete
+            # fp32 lens, producing a needless ~1.5x artifact peak on resume.
+            for layer in tensor_layers:
+                J = tensors.get_tensor(f"layer_{layer}").to(torch.float32)
+                if J.ndim != 2 or tuple(J.shape) != (d_model, d_model):
+                    log.warning(
+                        "%s for %s layer %d has shape %s (need %dx%d); "
+                        "ignoring — re-fit with `saklas lens fit`",
+                        label, model_id, layer, tuple(J.shape), d_model, d_model,
+                    )
+                    return None
+                if not bool(torch.isfinite(J).all()):
+                    log.warning(
+                        "%s for %s contains non-finite values; ignoring — "
+                        "re-fit with `saklas lens fit`", label, model_id,
+                    )
+                    return None
+                jacobians[layer] = J
         lens = JacobianLens(
             jacobians,
             n_prompts=int(sidecar.get("n_prompts", 0)),

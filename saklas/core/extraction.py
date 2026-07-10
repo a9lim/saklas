@@ -179,8 +179,7 @@ class ManifoldExtractionPipeline:
         from saklas.core.manifold import (
             CustomDomain,
             Manifold,
-            compute_node_activation_rows,
-            compute_node_centroid,
+            compute_manifold_node_stats,
             compute_node_reduced_covariance,
             compute_node_reduced_covariance_from_rows,
             discover_coords,
@@ -191,6 +190,7 @@ class ManifoldExtractionPipeline:
             invert_parameterization,
             load_manifold,
             neutral_layout_coord,
+            prepare_rbf_fit_plan,
             save_manifold,
             subspace_share,
         )
@@ -206,7 +206,6 @@ class ManifoldExtractionPipeline:
                 on_progress(msg)
 
         mf = ManifoldFolder.load(pathlib.Path(folder))
-        node_groups = mf.node_groups()
         nodes_sha = mf.nodes_sha256()
 
         # Resolve the SAE backend once (lazy import — non-SAE callers
@@ -261,6 +260,10 @@ class ManifoldExtractionPipeline:
                 ))
                 return manifold
 
+        # Parse/validate node JSON only after a cache miss.  ``nodes_sha256``
+        # already read the raw bytes needed for staleness; a hit should not pay a
+        # second JSON pass over a large roster.
+        node_groups = mf.node_groups()
         model = self._handle.model
         tokenizer = self._handle.tokenizer
         layers = self._handle.layers
@@ -334,33 +337,15 @@ class ManifoldExtractionPipeline:
         retain_node_rows = (
             sae_backend is None and mf.fit_mode in {"authored", "spectral"}
         )
-        retained_rows: list[dict[int, torch.Tensor]] | None = (
-            [] if retain_node_rows else None
+        _progress(
+            f"Pooling {len(node_groups)} nodes in fit-wide batches "
+            f"({sum(len(responses) for _, responses in node_groups)} responses)..."
         )
-        per_node: list[dict[int, torch.Tensor]] = []
-        for (label, responses), role in zip(node_groups, node_roles, strict=True):
-            role_note = f" [role={role}]" if role else ""
-            _progress(
-                f"Pooling node '{label}'{role_note} "
-                f"({len(responses)} responses)..."
-            )
-            if retained_rows is not None:
-                rows = compute_node_activation_rows(
-                    model, tokenizer, layers, device, responses, baseline_prompts,
-                    role=role, model_type=model_type,
-                    layer_indices=fit_layers,
-                )
-                retained_rows.append(rows)
-                per_node.append({
-                    idx: rows[idx].mean(dim=0).to(torch.float32)
-                    for idx in fit_layers
-                })
-            else:
-                per_node.append(compute_node_centroid(
-                    model, tokenizer, layers, device, responses, baseline_prompts,
-                    role=role, model_type=model_type,
-                    layer_indices=fit_layers,
-                ))
+        per_node, retained_rows = compute_manifold_node_stats(
+            model, tokenizer, layers, device, node_groups, baseline_prompts,
+            roles=node_roles, model_type=model_type,
+            layer_indices=fit_layers, retain_rows=retain_node_rows,
+        )
 
         # 1b. Monopolar (concept-vs-neutral).  A 1-node ``pca`` folder has no
         #     second pole to span an affine subspace, so it can only mean one
@@ -447,7 +432,7 @@ class ManifoldExtractionPipeline:
                 metadata["node_kinds"] = list(node_kinds)
             save_manifold(manifold, tensor_path, metadata)
             manifold.metadata.update(metadata)
-            mf.write_metadata()
+            mf.update_file_hashes(tensor_path, tensor_path.with_suffix(".json"))
             self._events.emit(ManifoldExtracted(
                 name=mf.name, manifold=manifold, metadata=metadata,
             ))
@@ -506,11 +491,17 @@ class ManifoldExtractionPipeline:
         #     signal (low explained variance).  The per-layer Grams are also the
         #     summands of the discover consensus Gram, so the discover branch
         #     reuses ``layer_grams`` instead of recomputing them.
+        centered_stacks: dict[int, torch.Tensor] = {}
+        whitened_rows: dict[int, torch.Tensor] = {}
         layer_grams: dict[int, torch.Tensor] = {}
         for idx in fit_layers:
             xc = stacks[idx].to(torch.float32)
             xc = xc - xc.mean(dim=0, keepdim=True)
-            layer_grams[idx] = maha_whitener.subspace_gram(idx, xc)  # (K, K)
+            sinv_xc = maha_whitener.apply_inv(idx, xc).to(torch.float32)
+            gram = xc @ sinv_xc.transpose(0, 1)
+            centered_stacks[idx] = xc
+            whitened_rows[idx] = sinv_xc
+            layer_grams[idx] = 0.5 * (gram + gram.transpose(0, 1))  # (K, K)
         node_spread_per_layer: dict[int, float] = {
             idx: float(layer_grams[idx].diagonal().sum()) for idx in fit_layers
         }
@@ -568,6 +559,7 @@ class ManifoldExtractionPipeline:
                 {idx: layer_grams[idx] for idx in fit_layers},
                 consensus_gram,
                 whitener=maha_whitener,
+                whitened_rows=whitened_rows,
                 max_dim=int(st_hyper.get("max_dim", 8)),
                 smoothing=st_hyper.get("smoothing", "auto"),
                 persistence_frac=float(st_hyper.get("persistence_frac", 0.5)),
@@ -728,6 +720,7 @@ class ManifoldExtractionPipeline:
         )
         layer_subs = {}
         mahalanobis_share: dict[int, float] = {}
+        rbf_plan = None
         # Per-layer penalized-RBF provenance (curved + ``smoothing`` only):
         # ``{layer: {"lambda", "edf", "gcv"}}`` from the GCV select, for the
         # sidecar + inspector.  Empty for exact / flat fits.
@@ -784,6 +777,7 @@ class ManifoldExtractionPipeline:
                     stacked, neutral_mean=_neutral_for(idx),
                     whitener=maha_whitener, layer=idx,
                     whitened_gram=layer_grams[idx],
+                    whitened_rows=whitened_rows[idx],
                     orient_to=0, **affine_kwargs,
                 )
                 raw_fits[idx] = (sub, mu_coords)
@@ -807,6 +801,9 @@ class ManifoldExtractionPipeline:
             # CURVED (authored / spectral): RBF surface fit, neutral-anchored.
             # ``curved_smoothing`` is ``None`` for authored (exact-interpolation
             # contract) and the GCV / fixed-λ selector for ``spectral``.
+            rbf_plan = prepare_rbf_fit_plan(
+                node_params, smoothing=curved_smoothing,
+            )
             for idx in fit_layers:
                 stacked = stacks[idx]
                 # ``neutral_mean`` neutral-anchors the frame; ``maha_whitener``
@@ -817,8 +814,10 @@ class ManifoldExtractionPipeline:
                     whitener=maha_whitener, layer=idx,
                     neutral_mean=_neutral_for(idx),
                     whitened_gram=layer_grams[idx],
+                    whitened_rows=whitened_rows[idx],
                     smoothing=curved_smoothing,
                     rbf_info=_rbf_info,
+                    rbf_plan=rbf_plan,
                     **fit_kwargs,
                 )
                 layer_subs[idx] = sub
@@ -860,11 +859,10 @@ class ManifoldExtractionPipeline:
                 if nu is None:
                     g_cols = []
                     break
-                xc = stacks[idx].to(torch.float32)
-                mu_L = xc.mean(dim=0, keepdim=True)               # (1, D) node mean
+                xc = centered_stacks[idx]
+                mu_L = stacks[idx].to(torch.float32).mean(dim=0, keepdim=True)
                 nu_c = nu.to(torch.float32).reshape(1, -1) - mu_L  # (1, D) ν − μ
-                sinv_xc = maha_whitener.apply_inv(idx, xc - mu_L)  # (K, D) Σ⁻¹ x̃
-                g_cols.append(sinv_xc @ nu_c.reshape(-1))          # (K,) x̃ᵀΣ⁻¹ν̃
+                g_cols.append(whitened_rows[idx] @ nu_c.reshape(-1))  # (K,) x̃ᵀΣ⁻¹ν̃
             if g_cols:
                 g_nu = torch.stack(g_cols).mean(dim=0)             # (K,) layer-avg
                 neutral_coords = neutral_layout_coord(node_coords, g_nu)
@@ -874,7 +872,8 @@ class ManifoldExtractionPipeline:
         # 4b. Fuzzy-manifold σ-field (curved + raw only).  A **second** fit-time
         #     capture pass accumulates each node's within-node reduced ``(R, R)``
         #     covariance (``compute_node_reduced_covariance`` — needs the
-        #     just-fitted per-layer basis, hence a second pass), then
+        #     just-fitted per-layer basis; known-curved modes retained the first
+        #     capture's rows, while auto-curved falls back to a second pass), then
         #     ``fit_sigma_field`` reduces it to one off-surface ``σ`` per node and
         #     fits a ``log σ`` RBF onto each ``LayerSubspace`` (mutated in place).
         #     This gives the surface a *tube thickness* that soft-``onto`` steers
@@ -884,9 +883,13 @@ class ManifoldExtractionPipeline:
         #     is vacuous) — both leave ``σ`` absent ⇒ exact zero-thickness legacy.
         sigma_field_per_layer: dict[int, dict[str, float]] = {}
         if effective_fit_mode != "pca" and sae_backend is None and layer_subs:
+            covariance_source = (
+                "retained activation rows" if retained_rows is not None
+                else "second capture pass"
+            )
             _progress(
                 f"Fitting within-node σ-field across {len(layer_subs)} layers "
-                f"({K} nodes, second capture pass)..."
+                f"({K} nodes, {covariance_source})..."
             )
             if retained_rows is not None:
                 node_covs = [
@@ -908,6 +911,7 @@ class ManifoldExtractionPipeline:
                 smoothing=(
                     curved_smoothing if curved_smoothing is not None else "auto"
                 ),
+                rbf_plan=(rbf_plan if effective_fit_mode != "pca" else None),
             )
 
         # Origin ``O_L`` — the per-layer foot of the neutral mean on ``M``, in
@@ -997,7 +1001,7 @@ class ManifoldExtractionPipeline:
         metadata.update(discover_metadata)
         save_manifold(manifold, tensor_path, metadata)
         manifold.metadata.update(metadata)
-        mf.write_metadata()
+        mf.update_file_hashes(tensor_path, tensor_path.with_suffix(".json"))
 
         self._events.emit(ManifoldExtracted(
             name=mf.name, manifold=manifold, metadata=metadata,

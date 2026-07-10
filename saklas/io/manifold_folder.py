@@ -947,6 +947,30 @@ class ManifoldFolder:
             ]
         write_json_atomic(self.folder / "manifold.json", payload)
 
+    def update_file_hashes(self, *paths: Path) -> None:
+        """Refresh only newly written fitted artifacts in the integrity manifest.
+
+        A fit replaces one tensor/sidecar pair.  Re-reading every historical
+        model and variant in the folder makes persistence scale with old
+        artifacts rather than the work just completed; the existing manifest
+        was already verified by :meth:`load`, so unchanged entries can be kept.
+        A legacy/unfitted folder with no manifest gets one full population on
+        its first write so pre-existing files do not become silently untracked.
+        """
+        if not self.files:
+            self.write_metadata()
+            return
+        files = dict(self.files)
+        for path in paths:
+            resolved = Path(path)
+            if resolved.parent != self.folder or not resolved.is_file():
+                raise ValueError(
+                    f"manifest update path must be a fitted file in {self.folder}: "
+                    f"{resolved}"
+                )
+            files[resolved.name] = hash_file(resolved)
+        self.write_metadata(files=files)
+
     def _roles_padded(self) -> list[str | None]:
         """Return ``node_roles`` padded to ``len(node_labels)`` with ``None``s.
 

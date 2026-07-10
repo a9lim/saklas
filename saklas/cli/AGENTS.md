@@ -143,7 +143,9 @@ category list through verbatim (tagged concepts only, no multi-node sweep).
   tensor — no `_role-` suffix — while returning a `:role-<slug>` name tail; slug
   `[a-z0-9._-]+`), `--namespace NS` (destination; unset → `local/`). There is **no
   `--method`/`--legacy`** — difference-of-means (a 2-node `pca` fit) is the only
-  method.
+  method. An existing destination tensor exits before model load; a real extract
+  constructs its session with `probes=[]` so probe bootstrap is not part of
+  artifact training.
 - `manifold generate`: `name` + `--concepts C...` (required, ≥2),
   `[--kind {abstract,concrete,custom}] [--system TEMPLATE] [--samples-per-prompt K]
   [--seed INT] [--role-per-node] [-m] [-f]`. LLM-authors a discover folder via
@@ -168,7 +170,10 @@ category list through verbatim (tagged concepts only, no multi-node sweep).
   authored folder runs `ManifoldExtractionPipeline` directly; a discover folder
   (`pca`/`spectral`/`auto`) has any supplied hyperparam written into
   `manifold.json` atomically *before* the fit. Supplying a discover hyperparam
-  against an authored folder is an error.
+  against an authored folder is an error. For a raw unchanged fit, the runner
+  checks the tensor sidecar's `nodes_sha256` before model load and exits there;
+  actual fit sessions also use `probes=[]` so artifact training does not eagerly
+  bootstrap the unrelated probe roster.
   `--method auto` defers flat-vs-curved + periodic-axis selection to
   `select_topology` per-model. `--max-subspace-dim` caps the per-layer RBF subspace
   dim for the curved spectral fit (argparse-default `None` → engine 64) and is
@@ -223,14 +228,17 @@ category list through verbatim (tagged concepts only, no multi-node sweep).
   `--seq-len T` (128), `--dim-batch K` (8; total backward work is K-invariant,
   so the knob trades memory for per-pass overhead — halves automatically on
   OOM, then can grow back after clean prompts), `--checkpoint-every N` (25,
-  writes a resumable partial shard; the full artifact is rewritten once at
-  finalization), `--layers L1,L2,...|workspace` (restrict source layers — skips
+  writes a self-contained checkpoint directly from the live accumulator; the
+  full artifact is written durably once at finalization),
+  `--layers L1,L2,...|workspace` (restrict source layers — skips
   all forward-graph and backward work below the lowest one, the one real
   wall-time lever; `sample` is rejected for fitting because it still includes
   layer 0 and is artifact-size/debug only), `-f/--force` (restart from zero
-  instead of resuming), `-d`, `-q`. A same-raw-corpus no-op can return from
-  sidecar metadata before model load; a superset stored lens satisfies narrower
-  layer requests without refit, and missing layers are fitted as a top-up.
+  instead of resuming), `-d`, `-q`. All four numeric fit flags are positive-only.
+  A same-raw-corpus no-op can return from sidecar metadata before model load;
+  `model_layer_count` makes the `all` and `workspace` proof exact. A superset
+  stored lens satisfies narrower layer requests without refit, and missing layers
+  are fitted as a checkpointed/resumable top-up.
 - `lens show`: positional `model`, `-j`.
 - `lens top`: positionals `model` + `prompt` (raw text, no chat template),
   `-k/--top-k` (8), `--layers L1,L2,...` (default: 9 evenly spaced fitted

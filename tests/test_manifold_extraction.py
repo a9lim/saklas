@@ -276,7 +276,9 @@ def test_curved_raw_fit_reuses_retained_rows_for_sigma_field(
     monkeypatch.setattr(V, "_encode_and_capture_all_batch", _counting)
     manifold = ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder)
 
-    assert calls["n"] == len(_LABELS)
+    # Five one-response nodes now share one fit-wide batch; sigma reuses those
+    # retained rows rather than adding a second pass.
+    assert calls["n"] == 1
     assert all(sub.has_sigma for sub in manifold.layers.values())
     assert "sigma_field_per_layer" in manifold.metadata
 

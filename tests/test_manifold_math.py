@@ -26,6 +26,7 @@ from saklas.core.manifold import (
     fit_rbf_interpolant,
     fit_rbf_smoothed,
     fit_sigma_field,
+    prepare_rbf_fit_plan,
     _gcv_select_lambda,
     _off_surface_var,
     _off_surface_vars,
@@ -276,6 +277,25 @@ def test_fit_rbf_smoothed_gcv_picks_interior_lambda():
     assert math.isfinite(info["gcv"]) and info["gcv"] > 0.0
 
 
+@pytest.mark.parametrize("smoothing", [None, 0.25, "auto"])
+def test_rbf_fit_plan_matches_standalone_fit(smoothing: float | str | None):
+    torch.manual_seed(41)
+    node = torch.rand(14, 2)
+    values = torch.randn(14, 5)
+    plan = prepare_rbf_fit_plan(node, smoothing=smoothing)
+
+    expected = fit_rbf_smoothed(
+        plan.node_params, values, smoothing=smoothing,
+    )
+    actual = fit_rbf_smoothed(
+        plan.node_params, values, smoothing=smoothing, plan=plan,
+    )
+
+    assert torch.allclose(actual[0], expected[0], atol=2e-5, rtol=2e-5)
+    assert torch.allclose(actual[1], expected[1], atol=2e-5, rtol=2e-5)
+    assert actual[2] == pytest.approx(expected[2], rel=2e-5, abs=2e-5)
+
+
 def test_fit_rbf_smoothed_edf_monotone_to_polynomial():
     # The rigorous correctness check on the penalty form: as λ grows the
     # effective dof tr(S_λ) must fall monotonically from K (interpolation) to
@@ -494,12 +514,14 @@ def test_fit_affine_subspace_reuses_precomputed_whitened_gram():
         def __init__(self, inner: Any) -> None:
             self.inner = inner
             self.subspace_gram_calls = 0
+            self.apply_inv_calls = 0
 
         def subspace_gram(self, *args: Any, **kwargs: Any) -> torch.Tensor:
             self.subspace_gram_calls += 1
             return self.inner.subspace_gram(*args, **kwargs)
 
         def apply_inv(self, *args: Any, **kwargs: Any) -> torch.Tensor:
+            self.apply_inv_calls += 1
             return self.inner.apply_inv(*args, **kwargs)
 
     counting = CountingWhitener(base)
@@ -510,6 +532,7 @@ def test_fit_affine_subspace_reuses_precomputed_whitened_gram():
         whitener=counting,  # type: ignore[arg-type]
         layer=0,
         whitened_gram=gram,
+        whitened_rows=base.apply_inv(0, X),
     )
     ref_sub, ref_mu_coords, ref_ev = fit_affine_subspace(
         centroids,
@@ -520,6 +543,7 @@ def test_fit_affine_subspace_reuses_precomputed_whitened_gram():
     )
 
     assert counting.subspace_gram_calls == 0
+    assert counting.apply_inv_calls == 0
     assert torch.allclose(sub.basis, ref_sub.basis, atol=1e-5)
     assert torch.allclose(mu_coords, ref_mu_coords, atol=1e-5)
     assert ev == pytest.approx(ref_ev, abs=1e-6)

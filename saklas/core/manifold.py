@@ -720,6 +720,99 @@ def _rbf_saddle(
     return torch.linalg.solve(M, rhs)
 
 
+@dataclass(frozen=True)
+class RbfFitPlan:
+    """Fit-wide geometry shared by every layer over one node layout.
+
+    ``node_params`` is already unit-box normalized.  The kernel/polynomial
+    blocks, Demmler-Reinsch eigensystem, λ grid, and (for an exact/fixed-λ
+    surface) saddle LU depend only on this geometry—not on a layer's activation
+    targets.  Building them once turns the per-layer fit into RHS work instead
+    of repeating cubic QR/eigh/factorization for every layer and again for the
+    sigma field.
+    """
+
+    node_params: torch.Tensor
+    coord_offset: torch.Tensor
+    coord_scale: torch.Tensor
+    E: torch.Tensor
+    Q: torch.Tensor
+    grid: torch.Tensor
+    q2: torch.Tensor
+    gamma: torch.Tensor
+    eigenvectors: torch.Tensor
+    fixed_lambda: float | None
+    fixed_lu: torch.Tensor | None
+    fixed_pivots: torch.Tensor | None
+
+
+def prepare_rbf_fit_plan(
+    node_params: torch.Tensor,
+    *,
+    smoothing: float | str | None,
+) -> RbfFitPlan:
+    """Precompute layout-only RBF work for a multi-layer curved fit."""
+    raw = node_params.to(device="cpu", dtype=torch.float32)
+    _rbf_poised(raw)
+    lo = raw.min(dim=0).values
+    hi = raw.max(dim=0).values
+    scale = (hi - lo).clamp(min=1e-9)
+    normalized = ((raw - lo) / scale).contiguous()
+    K = int(normalized.shape[0])
+    E = torch.cdist(normalized, normalized).pow(3)
+    Q = torch.cat([torch.ones(K, 1, dtype=torch.float32), normalized], dim=1)
+    denom = K * K - K
+    e_scale = float(E.abs().sum() / denom) if denom > 0 else 1.0
+    if not math.isfinite(e_scale) or e_scale <= 0.0:
+        e_scale = 1.0
+    grid = e_scale * torch.logspace(-6.0, 3.0, 40, dtype=E.dtype)
+    mp1 = int(Q.shape[1])
+    if K > mp1:
+        q_full, _ = torch.linalg.qr(Q, mode="complete")
+        q2 = q_full[:, mp1:]
+        g = q2.transpose(0, 1) @ E @ q2
+        g = 0.5 * (g + g.transpose(0, 1))
+        gamma, eigenvectors = torch.linalg.eigh(g)
+        gamma = gamma.clamp_min(0.0)
+    else:
+        q2 = torch.empty(K, 0, dtype=E.dtype)
+        gamma = torch.empty(0, dtype=E.dtype)
+        eigenvectors = torch.empty(0, 0, dtype=E.dtype)
+
+    fixed_lambda: float | None = None
+    if smoothing is None:
+        fixed_lambda = 0.0
+    elif isinstance(smoothing, (int, float)):
+        fixed_lambda = float(smoothing) * e_scale
+    fixed_lu: torch.Tensor | None = None
+    fixed_pivots: torch.Tensor | None = None
+    if fixed_lambda is not None:
+        A = E + fixed_lambda * torch.eye(K, dtype=E.dtype)
+        mp1 = int(Q.shape[1])
+        M = torch.cat([
+            torch.cat([A, Q], dim=1),
+            torch.cat([
+                Q.transpose(0, 1),
+                torch.zeros(mp1, mp1, dtype=E.dtype),
+            ], dim=1),
+        ], dim=0)
+        fixed_lu, fixed_pivots = torch.linalg.lu_factor(M)
+    return RbfFitPlan(
+        node_params=normalized,
+        coord_offset=lo,
+        coord_scale=scale,
+        E=E,
+        Q=Q,
+        grid=grid,
+        q2=q2,
+        gamma=gamma,
+        eigenvectors=eigenvectors,
+        fixed_lambda=fixed_lambda,
+        fixed_lu=fixed_lu,
+        fixed_pivots=fixed_pivots,
+    )
+
+
 def _rbf_smoother_matrix(
     E: torch.Tensor, Q: torch.Tensor, lam: float,
 ) -> torch.Tensor:
@@ -744,7 +837,7 @@ def _rbf_smoother_matrix(
 
 def _gcv_select_lambda(
     E: torch.Tensor, Q: torch.Tensor, values: torch.Tensor,
-    *, n_grid: int = 40,
+    *, n_grid: int = 40, plan: RbfFitPlan | None = None,
 ) -> tuple[float, float, float]:
     """Pick the smoothing ``λ`` minimizing generalized cross-validation.
 
@@ -772,26 +865,34 @@ def _gcv_select_lambda(
     """
     K = int(E.shape[0])
     mp1 = int(Q.shape[1])
-    # Scale the grid by the mean off-diagonal kernel magnitude (diag(E) = 0),
-    # so the search range is invariant to coordinate scale.
-    denom = K * K - K
-    e_scale = float(E.abs().sum() / denom) if denom > 0 else 1.0
-    if not math.isfinite(e_scale) or e_scale <= 0.0:
-        e_scale = 1.0
-    grid = e_scale * torch.logspace(-6.0, 3.0, n_grid, dtype=E.dtype)
     null_dim = K - mp1
+    if plan is not None and n_grid == 40:
+        grid = plan.grid
+    else:
+        # Scale the grid by the mean off-diagonal kernel magnitude (diag(E) = 0),
+        # so the search range is invariant to coordinate scale.
+        denom = K * K - K
+        e_scale = float(E.abs().sum() / denom) if denom > 0 else 1.0
+        if not math.isfinite(e_scale) or e_scale <= 0.0:
+            e_scale = 1.0
+        grid = e_scale * torch.logspace(-6.0, 3.0, n_grid, dtype=E.dtype)
     if null_dim <= 0:
         # Q full-rank square ⇒ no penalized null space; the polynomial fits
         # every node exactly (S = I) and GCV is the indeterminate 0/0 over the
         # whole grid.  Match the all-skipped loop: smallest λ at interp edf.
         return float(grid[0].item()), float(K), math.inf
     # Q2: an orthonormal basis of null(Qᵀ) from a complete QR of Q.
-    q_full, _ = torch.linalg.qr(Q, mode="complete")        # (K, K)
-    q2 = q_full[:, mp1:]                                    # (K, null_dim)
-    g = q2.transpose(0, 1) @ E @ q2                         # (null_dim, null_dim)
-    g = 0.5 * (g + g.transpose(0, 1))                       # symmetrize vs roundoff
-    gamma, u = torch.linalg.eigh(g)                         # γⱼ ≥ 0 (cond. PSD)
-    gamma = gamma.clamp_min(0.0)
+    if plan is not None:
+        q2 = plan.q2
+        gamma = plan.gamma
+        u = plan.eigenvectors
+    else:
+        q_full, _ = torch.linalg.qr(Q, mode="complete")    # (K, K)
+        q2 = q_full[:, mp1:]                                # (K, null_dim)
+        g = q2.transpose(0, 1) @ E @ q2                     # (null_dim, null_dim)
+        g = 0.5 * (g + g.transpose(0, 1))                   # symmetrize vs roundoff
+        gamma, u = torch.linalg.eigh(g)                     # γⱼ ≥ 0 (cond. PSD)
+        gamma = gamma.clamp_min(0.0)
     b = u.transpose(0, 1) @ (q2.transpose(0, 1) @ values)  # (null_dim, R)
     b_sq = b.pow(2).sum(dim=1)                              # Σ_r bⱼᵣ²  (null_dim,)
     # ratios[i, j] = λᵢ / (γⱼ + λᵢ) — the eigenvalues of (I − S_{λᵢ}).
@@ -812,6 +913,7 @@ def fit_rbf_smoothed(
     values: torch.Tensor,
     *,
     smoothing: float | str | None = "auto",
+    plan: RbfFitPlan | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
     """Fit a *penalized* ``r**3`` polyharmonic RBF — the smoothing generalization.
 
@@ -850,16 +952,29 @@ def fit_rbf_smoothed(
     # Exact path: delegate so ``λ = 0`` reproduces ``fit_rbf_interpolant``
     # bit-for-bit (the cardinal-weight + interpolation tests pin this).
     if smoothing is None or (isinstance(smoothing, (int, float)) and float(smoothing) == 0.0):
-        w, c = fit_rbf_interpolant(node_params, values)
+        if plan is not None and plan.fixed_lambda == 0.0:
+            assert plan.fixed_lu is not None and plan.fixed_pivots is not None
+            mp1 = plan.Q.shape[1]
+            rhs = torch.cat([
+                values,
+                torch.zeros(mp1, values.shape[1], dtype=values.dtype),
+            ], dim=0)
+            sol = torch.linalg.lu_solve(plan.fixed_lu, plan.fixed_pivots, rhs)
+            w, c = sol[:node_params.shape[0]], sol[node_params.shape[0]:]
+        else:
+            w, c = fit_rbf_interpolant(node_params, values)
         return w, c, {"lambda": 0.0, "edf": float(node_params.shape[0]), "gcv": -1.0}
 
     K, _ = _rbf_poised(node_params)
-    dist = torch.cdist(node_params, node_params)
-    E = dist.pow(3)
-    Q = torch.cat([torch.ones(K, 1, dtype=torch.float32), node_params], dim=1)
+    if plan is not None:
+        E, Q = plan.E, plan.Q
+    else:
+        dist = torch.cdist(node_params, node_params)
+        E = dist.pow(3)
+        Q = torch.cat([torch.ones(K, 1, dtype=torch.float32), node_params], dim=1)
 
     if smoothing == "auto":
-        lam, edf, gcv = _gcv_select_lambda(E, Q, values)
+        lam, edf, gcv = _gcv_select_lambda(E, Q, values, plan=plan)
     elif isinstance(smoothing, (int, float)):
         denom = K * K - K
         e_scale = float(E.abs().sum() / denom) if denom > 0 else 1.0
@@ -872,8 +987,21 @@ def fit_rbf_smoothed(
             f"smoothing must be 'auto', a float, or 0/None; got {smoothing!r}"
         )
 
-    A = E + lam * torch.eye(K, dtype=torch.float32)
-    sol = _rbf_saddle(A, Q, values)
+    if (
+        plan is not None
+        and plan.fixed_lambda is not None
+        and math.isclose(lam, plan.fixed_lambda, rel_tol=0.0, abs_tol=0.0)
+    ):
+        assert plan.fixed_lu is not None and plan.fixed_pivots is not None
+        mp1 = Q.shape[1]
+        rhs = torch.cat([
+            values,
+            torch.zeros(mp1, values.shape[1], dtype=values.dtype),
+        ], dim=0)
+        sol = torch.linalg.lu_solve(plan.fixed_lu, plan.fixed_pivots, rhs)
+    else:
+        A = E + lam * torch.eye(K, dtype=torch.float32)
+        sol = _rbf_saddle(A, Q, values)
     w, c = sol[:K].contiguous(), sol[K:].contiguous()
     return w, c, {"lambda": float(lam), "edf": float(edf), "gcv": float(gcv)}
 
@@ -1214,6 +1342,7 @@ def _pca_basis(
     whitener: "LayerWhitener | None" = None,
     layer: int | None = None,
     whitened_gram: torch.Tensor | None = None,
+    whitened_rows: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, float]:
     """μ-centered PCA basis — Euclidean (default) or whitened/Fisher.
 
@@ -1237,7 +1366,10 @@ def _pca_basis(
 
     ``whitened_gram`` may provide a precomputed ``X Σ⁻¹ Xᵀ`` for fit
     callers that already built the same Gram for diagnostics or discover
-    coordinate derivation, avoiding a second Woodbury pass over the layer.
+    coordinate derivation. ``whitened_rows`` is the matching precomputed
+    ``Σ⁻¹X`` row batch; when both are supplied the Fisher directions are
+    ``Aᵀ(Σ⁻¹X)`` directly, so Gram construction, PCA, and neutral-layout
+    anchoring share one Woodbury application over the node scatter.
     """
     K = int(X.shape[0])
     if whitener is not None and layer is not None:
@@ -1259,10 +1391,19 @@ def _pca_basis(
         rank = int((mu_pos > 1e-6 * mu_pos[-1].clamp(min=1e-12)).sum().item())
         R = max(1, min(n_components, K - 1, rank))
         top = torch.argsort(mu, descending=True)[:R]
-        XtA = X.transpose(0, 1) @ A[:, top]             # (D, R) = Xᵀ a_r
-        directions = whitener.apply_inv(
-            layer, XtA.transpose(0, 1).contiguous(),
-        )                                               # (R, D) = Σ⁻¹ Xᵀ a_r
+        if whitened_rows is not None:
+            sinv_x = whitened_rows.to(dtype=torch.float32, device="cpu")
+            if sinv_x.shape != X.shape:
+                raise ValueError(
+                    f"whitened_rows shape {tuple(sinv_x.shape)} does not match "
+                    f"centered scatter shape {tuple(X.shape)}"
+                )
+            directions = A[:, top].transpose(0, 1) @ sinv_x
+        else:
+            XtA = X.transpose(0, 1) @ A[:, top]         # (D, R) = Xᵀ a_r
+            directions = whitener.apply_inv(
+                layer, XtA.transpose(0, 1).contiguous(),
+            )                                           # (R, D) = Σ⁻¹ Xᵀ a_r
         # QR → orthonormal column span identical to the discriminant span;
         # transpose back to (R, D) rows the LayerSubspace expects.
         basis = torch.linalg.qr(
@@ -1294,6 +1435,7 @@ def fit_affine_subspace(
     whitener: "LayerWhitener | None" = None,
     layer: int | None = None,
     whitened_gram: torch.Tensor | None = None,
+    whitened_rows: torch.Tensor | None = None,
     orient_to: int | None = 0,
 ) -> tuple[LayerSubspace, torch.Tensor, float]:
     """Fit a flat (affine, no-RBF) subspace from per-node centroids (§5).
@@ -1340,7 +1482,7 @@ def fit_affine_subspace(
     X = centroids - mu  # (K, D) μ-centered
     basis, ev_ratio = _pca_basis(
         X, n_components=n_components, whitener=whitener, layer=layer,
-        whitened_gram=whitened_gram,
+        whitened_gram=whitened_gram, whitened_rows=whitened_rows,
     )
     if orient_to is not None:
         proj = basis @ (centroids[orient_to] - mu)      # (R,)
@@ -1399,8 +1541,10 @@ def fit_layer_subspace(
     layer: int | None = None,
     neutral_mean: torch.Tensor | None = None,
     whitened_gram: torch.Tensor | None = None,
+    whitened_rows: torch.Tensor | None = None,
     smoothing: float | str | None = None,
     rbf_info: dict[str, float] | None = None,
+    rbf_plan: RbfFitPlan | None = None,
 ) -> tuple[LayerSubspace, float]:
     """Fit a PCA subspace + RBF interpolant for one layer (curved).
 
@@ -1473,7 +1617,7 @@ def fit_layer_subspace(
     # differs.
     basis, ev_ratio = _pca_basis(
         X, n_components=n_components, whitener=whitener, layer=layer,
-        whitened_gram=whitened_gram,
+        whitened_gram=whitened_gram, whitened_rows=whitened_rows,
     )
     # Neutral-anchor the frame (§5): ``mean = P_basis(anchor)`` and the RBF
     # interpolates **anchor-relative** reduced coords, so neutral lands at
@@ -1490,11 +1634,12 @@ def fit_layer_subspace(
     mean = (anchor @ basis.T) @ basis           # P_basis(anchor) (D,)
     coords = (centroids - anchor) @ basis.T     # (K, R) anchor-relative RBF targets
 
-    lo = node_params.min(dim=0).values
-    hi = node_params.max(dim=0).values
-    coord_offset = lo
-    coord_scale = (hi - lo).clamp(min=1e-9)
-    normalized = (node_params - coord_offset) / coord_scale
+    plan = rbf_plan or prepare_rbf_fit_plan(
+        node_params, smoothing=smoothing,
+    )
+    coord_offset = plan.coord_offset
+    coord_scale = plan.coord_scale
+    normalized = plan.node_params
 
     # Exact interpolation by default (``smoothing=None``) — every existing
     # caller (authored fits, the behavior-manifold naturalness fit, the test
@@ -1503,17 +1648,22 @@ def fit_layer_subspace(
     # ``λ``/edf flow back through the optional ``rbf_info`` out-dict for the
     # sidecar, leaving the 2-tuple return arity untouched.
     if smoothing is None:
-        rbf_weights, poly_coeffs = fit_rbf_interpolant(normalized, coords)
+        rbf_weights, poly_coeffs, _ = fit_rbf_smoothed(
+            normalized, coords, smoothing=0.0, plan=plan,
+        )
     else:
         rbf_weights, poly_coeffs, _info = fit_rbf_smoothed(
-            normalized, coords, smoothing=smoothing,
+            normalized, coords, smoothing=smoothing, plan=plan,
         )
         if rbf_info is not None:
             rbf_info.update(_info)
     sub = LayerSubspace(
-        mean=mean, basis=basis, node_params=normalized,
+        # Geometry is shared through ``rbf_plan`` while fitting, but each layer's
+        # persistent payload owns these tiny tensors: safetensors deliberately
+        # rejects aliases across keys.
+        mean=mean, basis=basis, node_params=normalized.clone(),
         rbf_weights=rbf_weights, poly_coeffs=poly_coeffs,
-        coord_offset=coord_offset, coord_scale=coord_scale,
+        coord_offset=coord_offset.clone(), coord_scale=coord_scale.clone(),
     )
     return sub, ev_ratio
 
@@ -2827,6 +2977,7 @@ def derive_spectral_coords(
     min_dim: int | None = None,
     k_nn: int | None = None,
     bandwidth: float | None = None,
+    _eigen_result: tuple[torch.Tensor, torch.Tensor, int, float] | None = None,
 ) -> tuple[torch.Tensor, SpectralDiagnostics]:
     """Derive node coordinates from a Laplacian-eigenmaps spectral embedding.
 
@@ -2899,9 +3050,12 @@ def derive_spectral_coords(
     # sphere/torus spectral derivations.  The square + ``K < 4`` validation
     # above stays here so the spectral-specific error messages are preserved;
     # ``_laplacian_eigen`` re-checks defensively for its other callers.
-    nontrivial_vals, nontrivial_vecs, k_nn, bandwidth = _laplacian_eigen(
-        gram, k_nn=k_nn, bandwidth=bandwidth,
-    )
+    if _eigen_result is None:
+        nontrivial_vals, nontrivial_vecs, k_nn, bandwidth = _laplacian_eigen(
+            gram, k_nn=k_nn, bandwidth=bandwidth,
+        )
+    else:
+        nontrivial_vals, nontrivial_vecs, k_nn, bandwidth = _eigen_result
 
     # Pick k by the eigenvalue-ratio heuristic.  For each candidate
     # ``k`` in ``[1, cap]`` the ratio ``nontrivial[k] / nontrivial[k-1]``
@@ -3089,12 +3243,12 @@ def _rbf_gcv_score(
     hi = node_params.max(dim=0).values
     norm = (node_params - lo) / (hi - lo).clamp(min=1e-9)
     K = norm.shape[0]
-    E = torch.cdist(norm, norm).pow(3)
-    Q = torch.cat([torch.ones(K, 1, dtype=torch.float32), norm], dim=1)
+    plan = prepare_rbf_fit_plan(norm, smoothing=smoothing)
+    E, Q = plan.E, plan.Q
     total = 0.0
     for y in targets.values():
         if smoothing == "auto":
-            _lam, _edf, gcv = _gcv_select_lambda(E, Q, y)
+            _lam, _edf, gcv = _gcv_select_lambda(E, Q, y, plan=plan)
         else:
             denom_e = K * K - K
             e_scale = float(E.abs().sum() / denom_e) if denom_e > 0 else 1.0
@@ -3313,6 +3467,14 @@ def _count_persistent_loops(
     if eps_c <= 0.0:
         return 0
     eps_max = 2.0 * eps_c
+    # At the ceiling a complete Rips graph has the full simplex as its clique
+    # complex, hence trivial H1.  This is exactly the outlier-inflated personas
+    # case and lets the loop *counter* skip constructing/reducing O(K^3)
+    # triangles.  ``_rips_h1_persistence`` itself keeps its full finite-pair
+    # contract; this shortcut is valid here because the caller only counts
+    # classes still essential at ``eps_max``.
+    if bool((lens <= eps_max).all()):
+        return 0
     pairs = _rips_h1_persistence(distances, eps_max)
     threshold = persistence_frac * eps_c
     count = 0
@@ -3578,6 +3740,7 @@ def select_topology(
     consensus_gram: torch.Tensor,
     *,
     whitener: "LayerWhitener",
+    whitened_rows: dict[int, torch.Tensor] | None = None,
     max_dim: int = 8,
     smoothing: float | str = "auto",
     score_dim: int | None = None,
@@ -3637,6 +3800,9 @@ def select_topology(
         basis, _ev = _pca_basis(
             X, n_components=R, whitener=whitener, layer=L,
             whitened_gram=layer_grams[L],
+            whitened_rows=(
+                whitened_rows.get(L) if whitened_rows is not None else None
+            ),
         )
         targets[L] = (X @ basis.transpose(0, 1)).contiguous()      # (K, R)
 
@@ -3652,6 +3818,7 @@ def select_topology(
     gcv_curved = math.inf
     curved: tuple[torch.Tensor, ManifoldDomain] | None = None
     spec_diag: object | None = None
+    spectral_eigen: tuple[torch.Tensor, torch.Tensor, int, float] | None = None
     try:
         # Floor the curved candidate's intrinsic dim to the flat PCA dim so flat
         # and curved are compared at *matched expressiveness*.  The spectral
@@ -3667,9 +3834,13 @@ def select_topology(
         # makes the flat-vs-curved verdict trustworthy rather than an artifact of
         # the dim mismatch.  (The periodic path sets its own dim from the H1 loop
         # count, so it is unaffected.)
+        spectral_eigen = _laplacian_eigen(
+            consensus_gram, k_nn=k_nn, bandwidth=bandwidth,
+        )
         coords_spec, spec_diag = derive_spectral_coords(
             consensus_gram, max_dim=max_dim, min_dim=k_flat,
             k_nn=k_nn, bandwidth=bandwidth,
+            _eigen_result=spectral_eigen,
         )
         k_spec = int(coords_spec.shape[1])
         if (2 * k_spec + 1) > K:
@@ -3686,9 +3857,11 @@ def select_topology(
     # loops (ellipse/noise-robust), spectral eigenpairs coordinate them.
     periodic: tuple[torch.Tensor, ManifoldDomain, float] | None = None
     try:
-        _vals, eigvecs, _knn, _bw = _laplacian_eigen(
-            consensus_gram, k_nn=k_nn, bandwidth=bandwidth,
-        )
+        if spectral_eigen is None:
+            spectral_eigen = _laplacian_eigen(
+                consensus_gram, k_nn=k_nn, bandwidth=bandwidth,
+            )
+        _vals, eigvecs, _knn, _bw = spectral_eigen
         # Whitened pairwise distances off the consensus Gram (same metric the
         # eigenmap embeds): d²_ij = G_ii + G_jj − 2 G_ij.
         cg = 0.5 * (consensus_gram + consensus_gram.transpose(0, 1))
@@ -3881,9 +4054,7 @@ def compute_node_activation_rows(
         if layer_indices is None
         else [int(idx) for idx in layer_indices]
     )
-    chunks_by_layer: dict[int, list[torch.Tensor]] = {
-        idx: [] for idx in capture_layers
-    }
+    rows_by_layer: dict[int, torch.Tensor] = {}
     is_mps = getattr(device, "type", None) == "mps"
     n = len(responses)
     aligned_prompts = [prompts[i % k] for i in range(n)]
@@ -3897,17 +4068,130 @@ def compute_node_activation_rows(
             layer_indices=capture_layers,
         )
         for idx in capture_layers:
-            chunks_by_layer[idx].append(
-                per_layer[idx].detach().to("cpu", torch.float32),
-            )
+            chunk = per_layer[idx].detach().to("cpu", torch.float32)
+            if idx not in rows_by_layer:
+                rows_by_layer[idx] = torch.empty(
+                    n, chunk.shape[1], dtype=torch.float32,
+                )
+            rows_by_layer[idx][start:end].copy_(chunk)
         del per_layer
         if is_mps:
             torch.mps.empty_cache()
 
-    return {
-        idx: torch.cat(chunks, dim=0)
-        for idx, chunks in chunks_by_layer.items()
-    }
+    return rows_by_layer
+
+
+def compute_manifold_node_stats(
+    model: torch.nn.Module,
+    tokenizer: object,
+    layers: torch.nn.ModuleList,
+    device: torch.device,
+    node_groups: "Sequence[tuple[str, list[str]]]",
+    prompts: "Sequence[str | list[dict[str, str]]]",
+    *,
+    roles: "Sequence[str | None]",
+    model_type: str | None = None,
+    layer_indices: Sequence[int] | None = None,
+    retain_rows: bool = False,
+) -> tuple[list[dict[int, torch.Tensor]], list[dict[int, torch.Tensor]] | None]:
+    """Fit-wide batched capture for all manifold nodes.
+
+    Rows carry their node/within-node indices through one stream, so short
+    template corpora share batches across node boundaries instead of paying one
+    underfilled model forward per node.  Standard 48-response nodes retain the
+    same chunking, while OOM backoff halves the active batch and cautiously grows
+    it again.  Returns per-node centroids plus optional retained fp32 rows.
+    """
+    from saklas.core.vectors import _CAPTURE_BATCH, _encode_and_capture_all_batch
+
+    if not prompts:
+        raise ValueError("conversational capture needs at least one baseline prompt")
+    if len(node_groups) != len(roles):
+        raise ValueError("node_groups and roles must be aligned")
+    capture_layers = (
+        list(range(len(layers)))
+        if layer_indices is None else [int(idx) for idx in layer_indices]
+    )
+    k = len(prompts)
+    flat: list[
+        tuple[int, int, str | list[dict[str, str]], str, str | None]
+    ] = []
+    node_sizes: list[int] = []
+    for node_idx, ((_label, responses), role) in enumerate(
+        zip(node_groups, roles, strict=True),
+    ):
+        if not responses or len(responses) % k != 0:
+            raise ValueError(
+                f"node corpus ({len(responses)} responses) must be a non-empty "
+                f"multiple of the baseline prompt set ({k})"
+            )
+        node_sizes.append(len(responses))
+        flat.extend(
+            (node_idx, row_idx, prompts[row_idx % k], response, role)
+            for row_idx, response in enumerate(responses)
+        )
+
+    sums: dict[int, torch.Tensor] = {}
+    retained: list[dict[int, torch.Tensor]] | None = (
+        [dict() for _ in node_groups] if retain_rows else None
+    )
+    active_batch = _CAPTURE_BATCH
+    successes = 0
+    start = 0
+    is_mps = getattr(device, "type", None) == "mps"
+    while start < len(flat):
+        end = min(start + active_batch, len(flat))
+        chunk = flat[start:end]
+        try:
+            per_layer = _encode_and_capture_all_batch(
+                model, tokenizer,
+                [row[2] for row in chunk],
+                [row[3] for row in chunk],
+                layers, device,
+                roles=[row[4] for row in chunk],
+                model_type=model_type,
+                layer_indices=capture_layers,
+            )
+        except RuntimeError as exc:
+            if "out of memory" not in str(exc).lower() or active_batch <= 1:
+                raise
+            active_batch = max(1, active_batch // 2)
+            successes = 0
+            if is_mps:
+                torch.mps.empty_cache()
+            elif getattr(device, "type", None) == "cuda":
+                torch.cuda.empty_cache()
+            continue
+
+        for idx in capture_layers:
+            host = per_layer[idx].detach().to("cpu", torch.float32)
+            if idx not in sums:
+                sums[idx] = torch.zeros(
+                    len(node_groups), host.shape[1], dtype=torch.float32,
+                )
+                if retained is not None:
+                    for node_idx, size in enumerate(node_sizes):
+                        retained[node_idx][idx] = torch.empty(
+                            size, host.shape[1], dtype=torch.float32,
+                        )
+            for batch_idx, (node_idx, row_idx, *_rest) in enumerate(chunk):
+                sums[idx][node_idx].add_(host[batch_idx])
+                if retained is not None:
+                    retained[node_idx][idx][row_idx].copy_(host[batch_idx])
+        del per_layer
+        start = end
+        successes += 1
+        if active_batch < _CAPTURE_BATCH and successes >= 4:
+            active_batch = min(_CAPTURE_BATCH, active_batch * 2)
+            successes = 0
+        if is_mps:
+            torch.mps.empty_cache()
+
+    centroids = [
+        {idx: sums[idx][node_idx] / node_sizes[node_idx] for idx in capture_layers}
+        for node_idx in range(len(node_groups))
+    ]
+    return centroids, retained
 
 
 def compute_node_reduced_covariance_from_rows(
@@ -4096,6 +4380,7 @@ def fit_sigma_field(
     *,
     smoothing: float | str | None = "auto",
     floor_frac: float = 1e-3,
+    rbf_plan: RbfFitPlan | None = None,
 ) -> dict[int, dict[str, float]]:
     """Attach a fuzzy-manifold ``log σ`` RBF to each curved layer (mutates them).
 
@@ -4117,6 +4402,10 @@ def fit_sigma_field(
     n = int(domain.intrinsic_dim)
     coords_f = node_coords.to(torch.float32)
     info: dict[int, dict[str, float]] = {}
+    if rbf_plan is None and layer_subs:
+        first = next(iter(layer_subs.values()))
+        np_, _rw, _pc = first.rbf_params()
+        rbf_plan = prepare_rbf_fit_plan(np_, smoothing=smoothing)
     for idx, sub in layer_subs.items():
         R = sub.rank
         covs = torch.stack(
@@ -4131,6 +4420,7 @@ def fit_sigma_field(
         np_, _rw, _pc = sub.rbf_params()
         w, c, rinfo = fit_rbf_smoothed(
             np_.to(torch.float32), log_sigma, smoothing=smoothing,
+            plan=rbf_plan,
         )
         sub.sigma_rbf_weights = w
         sub.sigma_poly_coeffs = c
@@ -4699,6 +4989,8 @@ __all__ = [
     "Manifold",
     "fit_rbf_interpolant",
     "fit_rbf_smoothed",
+    "RbfFitPlan",
+    "prepare_rbf_fit_plan",
     "eval_rbf",
     "eval_rbf_jacobian",
     "rbf_cardinal_weights",
@@ -4716,6 +5008,7 @@ __all__ = [
     "select_topology",
     "compute_node_centroid",
     "compute_node_activation_rows",
+    "compute_manifold_node_stats",
     "compute_node_reduced_covariance_from_rows",
     "save_manifold",
     "load_manifold",

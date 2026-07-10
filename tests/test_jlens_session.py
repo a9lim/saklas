@@ -27,6 +27,7 @@ from saklas.io.lens import (
     lens_checkpoint_paths,
     lens_paths,
     load_lens,
+    load_lens_checkpoint,
     save_lens,
     save_lens_checkpoint,
 )
@@ -217,6 +218,102 @@ def test_fit_jlens_resumes_from_checkpoint_without_full_artifact() -> None:
         )
     assert load_lens(_MODEL_ID) is not None
     assert not any(path.exists() for path in lens_checkpoint_paths(_MODEL_ID))
+
+
+def test_fit_jlens_checkpoint_survives_two_interruptions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import saklas.core.jlens as jlens_mod
+
+    full = _StubSession().fit_jlens(_PROMPTS, force=True)
+    head_session = _StubSession()
+    head = head_session.fit_jlens(_PROMPTS[:2], force=True)
+    consumed = [
+        [int(tok) for tok in head_session._tokenizer(
+            prompt, return_tensors="pt",
+        )["input_ids"][0].tolist()]
+        for prompt in _PROMPTS
+    ]
+    corpus_sha = hashlib.sha256(repr(consumed).encode("utf-8")).hexdigest()
+    save_lens_checkpoint(
+        head, _MODEL_ID,
+        base_n_prompts=0,
+        corpus_spec="test",
+        corpus_sha256=corpus_sha,
+        corpus_hash_kind="token_ids_v1",
+        seq_len=128,
+        dim_batch=8,
+        skip_first=16,
+    )
+
+    real_fit = jlens_mod.fit_jacobian_lens
+
+    def _interrupt_after_one(*args: Any, **kwargs: Any) -> Any:
+        prompts = list(args[2])
+        args = (*args[:2], prompts[:1], *args[3:])
+        kwargs["input_id_rows"] = kwargs["input_id_rows"][:1]
+        kwargs["checkpoint_every"] = 1
+        real_fit(*args, **kwargs)
+        raise RuntimeError("simulated second interruption")
+
+    monkeypatch.setattr(jlens_mod, "fit_jacobian_lens", _interrupt_after_one)
+    with pytest.raises(RuntimeError, match="second interruption"):
+        _StubSession().fit_jlens(_PROMPTS)
+
+    checkpoint = load_lens_checkpoint(_MODEL_ID)
+    assert checkpoint is not None
+    assert checkpoint[0].n_prompts == 3
+    assert checkpoint[1]["base_n_prompts"] == 0
+
+    monkeypatch.setattr(jlens_mod, "fit_jacobian_lens", real_fit)
+    messages: list[str] = []
+    resumed = _StubSession().fit_jlens(_PROMPTS, on_progress=messages.append)
+    assert any("checkpoint at 3 prompts" in message for message in messages)
+    for layer in full.source_layers:
+        assert torch.allclose(
+            resumed.jacobians[layer], full.jacobians[layer], atol=2e-3,
+        )
+
+
+def test_fit_jlens_missing_layer_topup_resumes_checkpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import saklas.core.jlens as jlens_mod
+
+    full = _StubSession().fit_jlens(
+        _PROMPTS, force=True, source_layers=[0, 1],
+    )
+    _StubSession().fit_jlens(_PROMPTS, force=True, source_layers=[0])
+    real_fit = jlens_mod.fit_jacobian_lens
+
+    def _interrupt_topup(*args: Any, **kwargs: Any) -> Any:
+        assert kwargs.get("source_layers") == [1]
+        prompts = list(args[2])
+        args = (*args[:2], prompts[:2], *args[3:])
+        kwargs["input_id_rows"] = kwargs["input_id_rows"][:2]
+        kwargs["checkpoint_every"] = 1
+        real_fit(*args, **kwargs)
+        raise RuntimeError("simulated topup interruption")
+
+    monkeypatch.setattr(jlens_mod, "fit_jacobian_lens", _interrupt_topup)
+    with pytest.raises(RuntimeError, match="topup interruption"):
+        _StubSession().fit_jlens(_PROMPTS, source_layers=[0, 1])
+
+    checkpoint = load_lens_checkpoint(_MODEL_ID)
+    assert checkpoint is not None
+    assert checkpoint[0].source_layers == [1]
+    assert checkpoint[0].n_prompts == 2
+
+    monkeypatch.setattr(jlens_mod, "fit_jacobian_lens", real_fit)
+    messages: list[str] = []
+    resumed = _StubSession().fit_jlens(
+        _PROMPTS, source_layers=[0, 1], on_progress=messages.append,
+    )
+    assert any("missing-layer checkpoint at 2" in message for message in messages)
+    for layer in full.source_layers:
+        assert torch.allclose(
+            resumed.jacobians[layer], full.jacobians[layer], atol=2e-3,
+        )
 
 
 def test_fit_jlens_drops_short_prompts() -> None:

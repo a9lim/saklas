@@ -151,9 +151,9 @@ def _load_or_fit_transfer_alignment(
     return M, quality_per_layer, map_path
 
 
-def _make_session(args: argparse.Namespace):
+def _make_session(args: argparse.Namespace, *, load_probes: bool = True):
     from saklas.core.session import SaklasSession
-    probe_categories = _resolve_probes(args.probes)
+    probe_categories = _resolve_probes(args.probes) if load_probes else []
     # ``~`` / ``|`` projection is Mahalanobis-only (closed-form LEACE);
     # ``--no-dls`` opts out of the discriminative-layer mask.  The flag and
     # YAML are already merged onto ``args`` by ``_load_effective_config``.
@@ -489,10 +489,6 @@ def _run_manifold_extract(args: argparse.Namespace) -> None:
         )
         sys.exit(2)
 
-    _print_startup(args)
-    session = _make_session(args)
-    _print_model_info(session)
-
     # A steering vector is a 2-node ``pca`` manifold (4.0); it lives under
     # ``manifolds/<ns>/<canonical>/``.  The per-model fitted tensor (raw or
     # ``_sae-<release>``) inside it is the existence/destination marker; a
@@ -500,11 +496,15 @@ def _run_manifold_extract(args: argparse.Namespace) -> None:
     # tensor name (no ``_role-`` suffix).
     ns = getattr(args, "namespace", None) or "local"
     canonical = canonical_concept_name(raw, baseline)
-    tensor_name = tensor_filename(session.model_id, release=requested_release)
+    tensor_name = tensor_filename(args.model, release=requested_release)
     tensor_path = pathlib.Path(manifold_dir(ns, canonical)) / tensor_name
     if tensor_path.exists() and not args.force:
         print(f"already extracted at {tensor_path}")
         sys.exit(0)
+
+    _print_startup(args)
+    session = _make_session(args, load_probes=False)
+    _print_model_info(session)
 
     extract_kwargs: dict[str, Any] = {}
     if requested_release:
@@ -1048,7 +1048,7 @@ def _run_manifold_fit(args: argparse.Namespace) -> None:
     import json as _json
     from saklas.io.atomic import write_json_atomic
     from saklas.io.manifolds import (
-        ManifoldFolder, ManifoldFormatError, sanitize_hyperparams,
+        ManifoldFolder, ManifoldFormatError, ManifoldSidecar, sanitize_hyperparams,
         domain_label,
     )
 
@@ -1088,6 +1088,7 @@ def _run_manifold_fit(args: argparse.Namespace) -> None:
     )
 
     new_fit_mode = mf.fit_mode
+    metadata_changed = False
     if override_supplied:
         if not mf.is_discover:
             # Mirror the server's 400: hyperparam overrides are discover-only.
@@ -1144,9 +1145,33 @@ def _run_manifold_fit(args: argparse.Namespace) -> None:
             data["nodes"] = [{"label": label} for label in mf.node_labels]
             data.pop("domain", None)
             write_json_atomic(folder / "manifold.json", data)
+            metadata_changed = True
+
+    if metadata_changed:
+        mf = ManifoldFolder.load(folder)
+
+    # Raw fits can prove a no-op entirely from the folder sidecar before loading
+    # a multi-GB model.  SAE revisions are resolved by the backend, so retain the
+    # in-pipeline revision check for those variants.
+    if not bool(getattr(args, "force", False)) and getattr(args, "sae", None) is None:
+        from saklas.io.paths import tensor_filename
+
+        tensor_path = folder / tensor_filename(args.model)
+        sidecar_path = tensor_path.with_suffix(".json")
+        if tensor_path.exists() and sidecar_path.exists():
+            try:
+                sidecar = ManifoldSidecar.load(sidecar_path)
+            except (
+                OSError, _json.JSONDecodeError, ManifoldFormatError,
+                KeyError, TypeError, ValueError,
+            ):
+                sidecar = None
+            if sidecar is not None and sidecar.nodes_sha256 == mf.nodes_sha256():
+                print(f"already fitted at {tensor_path}")
+                return
 
     _print_startup(args)
-    session = _make_session(args)
+    session = _make_session(args, load_probes=False)
     _print_model_info(session)
     try:
         manifold = session.fit(
@@ -2343,8 +2368,20 @@ def _lens_fit_source_preflight_matches(
         return False
     if isinstance(requested_layers, list):
         return set(source_layers) >= set(requested_layers)
+    raw_count = sidecar.get("model_layer_count")
+    if not isinstance(raw_count, int) or raw_count < 2:
+        return False
+    final_idx = raw_count - 1
     if requested_layers is None or requested_layers == "all":
-        return source_layers == list(range(source_layers[-1] + 1))
+        return set(source_layers) >= set(range(final_idx))
+    if requested_layers in {"workspace", "band"}:
+        expected = {
+            layer for layer in range(final_idx)
+            if 0.40 <= layer / max(raw_count - 1, 1) <= 0.90
+        }
+        if not expected:
+            expected = set(range(final_idx))
+        return set(source_layers) >= expected
     return False
 
 

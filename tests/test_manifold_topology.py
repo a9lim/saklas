@@ -565,6 +565,25 @@ def test_select_topology_deterministic() -> None:
                {c.name: c.score for c in b.candidates}
 
 
+def test_select_topology_reuses_laplacian_eigensystem(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import saklas.core.manifold as manifold_mod
+
+    calls = 0
+    real = manifold_mod._laplacian_eigen
+
+    def _counted(*args: object, **kwargs: object):
+        nonlocal calls
+        calls += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(manifold_mod, "_laplacian_eigen", _counted)
+    choice = _choose(_circle(40))
+    assert choice.winner_name == "torus-T1"
+    assert calls == 1
+
+
 def test_select_torus_t2_coarseness_floor() -> None:
     """T2 is reliably detected at >= 7 points per loop (the coarseness floor).
 

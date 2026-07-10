@@ -9,6 +9,13 @@ import argparse
 # Shared helpers
 # ---------------------------------------------------------------------------
 
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
 def _add_common_args(p: argparse.ArgumentParser) -> None:
     """Model-loading args shared between `tui` and `serve`."""
     p.add_argument(
@@ -893,25 +900,25 @@ def _build_lens_fit(p: argparse.ArgumentParser) -> None:
              "via the `datasets` library (pip install 'saklas[hf]').",
     )
     p.add_argument(
-        "--prompts", type=int, default=100, metavar="N",
+        "--prompts", type=_positive_int, default=100, metavar="N",
         help="Number of corpus documents to average over (default 100 — "
              "quality saturates quickly; the paper used 1000)",
     )
     p.add_argument(
-        "--seq-len", type=int, default=None, metavar="T",
+        "--seq-len", type=_positive_int, default=None, metavar="T",
         help="Truncate each document to this many tokens (default 128)",
     )
     p.add_argument(
-        "--dim-batch", type=int, default=None, metavar="K",
+        "--dim-batch", type=_positive_int, default=None, metavar="K",
         help="Output dims per backward pass (default 8). Total backward work "
              "is K-invariant — the knob trades memory for per-pass overhead "
              "and barely moves wall time; halves automatically on OOM.",
     )
     p.add_argument(
-        "--checkpoint-every", type=int, default=None, metavar="N",
-        help="Write a resumable partial checkpoint every N usable prompts "
-             "(default 25). Checkpoints store only the new shard; the full "
-             "artifact is rewritten once at finalization.",
+        "--checkpoint-every", type=_positive_int, default=None, metavar="N",
+        help="Write a self-contained resumable checkpoint every N usable "
+             "prompts (default 25); the full artifact is written durably once "
+             "at finalization.",
     )
     p.add_argument(
         "--layers", default=None, metavar="L1,L2,...|workspace",

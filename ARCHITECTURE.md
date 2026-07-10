@@ -158,6 +158,8 @@ vector; an N-node fit is a manifold. The session wraps it: `extract` /
 `core/vectors.py` owns the low-level capture. Statements are captured in
 **right-padded batches** (`_encode_and_capture_all_batch`, `_CAPTURE_BATCH`
 pairs per forward; `_encode_and_capture_all` is the single-pair sibling);
+rendering, special-token walkback, and padding remain on CPU, then the complete
+ids/mask batch crosses to the accelerator once (no per-row H2D/D2H round-trip);
 `_capture_all_hidden_states` hooks every layer at once and pools each row at its
 last-content index *inside the hook* (per-row gather), so only `(B, D)` per layer
 is retained, never `(B, T, D)`, and the MPS allocator flush is amortized per
@@ -175,8 +177,10 @@ is wrapped as an assistant turn so the capture happens in the model's actual
 generation regime; a `role=` substitutes the assistant-role label
 (`core/role_templates.py`) for persona/role-baselined fits.
 `encode_and_capture_stack` is the full-`[T,D]` companion for the monitor.
-`compute_node_centroid` (`core/manifold.py`) pools a node's corpus into
-one fp32 mean per layer.
+`compute_node_centroid` (`core/manifold.py`) pools one node's corpus. The fit
+pipeline instead uses `compute_manifold_node_stats`: a fit-wide stream fills
+batches across node boundaries, adapts batch size after OOM, and can retain raw
+curved-fit rows so the sigma covariance does not require a second model pass.
 
 ### 3.2 A steering vector as a 2-node fit
 
@@ -333,10 +337,13 @@ mu_coords, ev_ratio)`, where `mu_coords = (centroids − μ)·basisᵀ` is the
 n_components)` builds the flat frame (μ-centered basis, neutral anchor, real
 `node_coords`, sign orientation). `fit_layer_subspace` adds the RBF surface for
 the curved path: it normalizes the embedded domain coords to the unit box and
-fits `fit_rbf_interpolant` — a dense symmetric-*indefinite* saddle system solved
-with `torch.linalg.solve` (never Cholesky; node counts are tiny, scipy is not
-pulled in). At n=1 over an open axis the `r³` polyharmonic spline reproduces the
-natural cubic spline exactly.
+fits the exact or penalized interpolant. `prepare_rbf_fit_plan` builds the
+layout-only kernel/polynomial blocks, QR/eigensystem, λ grid, and fixed-λ LU once;
+every activation layer and the sigma field reuse it. Centered `Σ⁻¹X` rows and
+Grams are likewise computed once per layer and shared by discovery, topology,
+Fisher PCA, and neutral-layout anchoring. The dense saddle is symmetric-
+*indefinite* (never Cholesky; scipy is not pulled in). At n=1 over an open axis
+the `r³` polyharmonic spline reproduces the natural cubic spline exactly.
 
 The per-tensor bakes:
 
@@ -893,10 +900,13 @@ fitted block's input under `torch.enable_grad()` and reads per-layer grads with
 `torch.autograd.grad`; everything else stays `inference_mode`). The default fit
 uses a single unreplicated prompt forward plus batched VJPs
 (`is_grads_batched=True`) for `ceil(d_model/dim_batch)` output-dim blocks, with
-an env-overridable replicated-prompt fallback (`SAKLAS_JLENS_VJP`). MPS uses small
-row stripes instead of full per-layer `[d_model,d_model]` device buffers, and
-checkpoints are partial shards (`jlens.partial.*`) merged into the full fp16
-artifact only at durable finalization. The artifact (`io/lens.py`,
+an env-overridable replicated-prompt fallback (`SAKLAS_JLENS_VJP`). CUDA reuses
+pinned host matrices and synchronizes once per prompt; MPS uses small row stripes
+plus reusable host matrices instead of full per-layer `[d_model,d_model]` device
+buffers. Self-contained checkpoints (`jlens.partial.*`) are written one layer at
+a time directly from raw accumulator sums, avoiding a second full fp32 lens and
+supporting repeated interruption or missing-layer top-up resume. The full fp16
+artifact is written only at durable finalization. The artifact (`io/lens.py`,
 `models/<safe_id>/jlens.safetensors`, fp16) then supports four
 consumers with zero hot-path cost when unused:
 

@@ -381,6 +381,35 @@ class TestLayerMeansLazy:
         assert out2 is built
         assert len(calls) == 1
 
+    def test_whitener_derives_means_from_single_neutral_load(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Whitener bootstrap shares one neutral-cache read with mean derivation."""
+        from saklas.core.session import SaklasSession
+        from saklas.io import alignment as alignment_mod
+
+        s = _Stub({"a": _profile_a()})
+        s._model = object()  # pyright: ignore[reportAttributeAccessIssue]
+        s._tokenizer = object()  # pyright: ignore[reportAttributeAccessIssue]
+        s._layers = []  # pyright: ignore[reportAttributeAccessIssue]
+        s._model_info = {"model_id": "test/model"}
+        s._layer_means = {}
+        calls: list[str] = []
+        acts = {0: torch.tensor([[1.0, 2.0], [3.0, 6.0], [5.0, 10.0]])}
+
+        def _load(*args: Any, **kwargs: Any) -> dict[int, torch.Tensor]:
+            calls.append(kwargs["model_id"])
+            return acts
+
+        monkeypatch.setattr(
+            alignment_mod, "load_or_compute_neutral_activations", _load,
+        )
+        whitener = SaklasSession._build_whitener_from_cache_or_compute(s)
+
+        assert whitener is not None
+        assert calls == ["test/model"]
+        assert torch.equal(s._layer_means[0], acts[0].mean(dim=0))
+
 
 class TestComputeDlsAxesBipolarGuard:
     """The folded-vector (bipolar, 2-node) face of ``compute_dls_axes``:

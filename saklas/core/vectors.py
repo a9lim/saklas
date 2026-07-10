@@ -221,6 +221,7 @@ def _encode_and_capture_all(
         tokenizer, prompt, response, device,
         role=role, model_type=model_type, system_msg=system_msg,
     )
+    ids = ids.to(device)
     hidden_per_layer = _capture_all_hidden_states(
         model, layers, ids, pool_index=content_end,
         layer_indices=layer_indices,
@@ -240,6 +241,7 @@ def _encode_and_capture_all_batch(
     device: torch.device,
     *,
     role: str | None = None,
+    roles: Sequence[str | None] | None = None,
     model_type: str | None = None,
     system_msg: str = _LENGTH_DIRECTIVE,
     layer_indices: Sequence[int] | None = None,
@@ -270,34 +272,48 @@ def _encode_and_capture_all_batch(
             "batched capture needs len(prompts) == len(responses) "
             f"({len(prompts)} != {len(responses)})"
         )
+    if roles is not None and len(roles) != len(prompts):
+        raise ValueError(
+            "batched capture needs len(roles) == len(prompts) "
+            f"({len(roles)} != {len(prompts)})"
+        )
+    if roles is not None and role is not None:
+        raise ValueError("batched capture accepts role= or roles=, not both")
+    row_roles = roles if roles is not None else [role] * len(prompts)
     rendered = [
         _render_and_tokenize_for_capture(
             tokenizer, prompt, response, device,
-            role=role, model_type=model_type, system_msg=system_msg,
+            role=row_role, model_type=model_type, system_msg=system_msg,
         )
-        for prompt, response in zip(prompts, responses, strict=True)
+        for prompt, response, row_role in zip(
+            prompts, responses, row_roles, strict=True,
+        )
     ]
-    seqs = [ids[0] for ids, _ in rendered]              # each (L_i,) on device
+    # Keep the whole render/tokenize/pool-index front half on CPU.  Moving every
+    # row to the accelerator and immediately calling ``tolist()`` to find its
+    # content end forced one H2D + blocking D2H round-trip per corpus item before
+    # the actual batched forward.  Padding on CPU also avoids a Python loop of
+    # tiny device slice writes; the finished batch crosses the boundary once.
+    seqs = [ids[0] for ids, _ in rendered]              # each (L_i,) on CPU
     ends = [content_end for _, content_end in rendered]
     lengths = [int(s.shape[0]) for s in seqs]
-    batch = len(seqs)
     max_len = max(lengths)
 
     pad_id = getattr(tokenizer, "pad_token_id", None)
     if pad_id is None:
         pad_id = getattr(tokenizer, "eos_token_id", None) or 0
-    input_ids = torch.full(
-        (batch, max_len), int(pad_id), dtype=seqs[0].dtype, device=device,
+    input_ids_cpu = torch.nn.utils.rnn.pad_sequence(
+        seqs, batch_first=True, padding_value=int(pad_id),
     )
-    for i, seq in enumerate(seqs):
-        input_ids[i, : lengths[i]] = seq                # right-pad
+    input_ids = input_ids_cpu.to(device)
     # An attention mask is only needed when padding is actually present; a
     # ragged chunk masks the pads, a uniform/B=1 chunk runs full attention
     # (matching the single-pair path exactly).
     if min(lengths) != max_len:
-        attn = torch.zeros((batch, max_len), dtype=torch.long, device=device)
-        for i, length in enumerate(lengths):
-            attn[i, :length] = 1
+        lengths_cpu = torch.tensor(lengths, dtype=torch.long)
+        attn = (
+            torch.arange(max_len).unsqueeze(0) < lengths_cpu.unsqueeze(1)
+        ).to(dtype=torch.long, device=device)
     else:
         attn = None
     pool_index = torch.tensor(ends, dtype=torch.long, device=device)
@@ -331,7 +347,7 @@ def _render_and_tokenize_for_capture(
     ``role`` (when set) substitutes a custom assistant-role label via
     :func:`saklas.core.role_templates.apply_with_role` for the persona-baselined
     fit; ``role=None`` is the swap-back default.  Returns ``(ids [1, T] on
-    device, content_end)`` where ``content_end`` is the response's last
+    CPU, content_end)`` where ``content_end`` is the response's last
     non-special token — the canonical pooling position.
     """
     history: list[dict[str, str]] = (
@@ -380,14 +396,13 @@ def _render_and_tokenize_for_capture(
         if bos_id is None:
             bos_id = tokenizer.eos_token_id or 0
         ids = torch.tensor([[bos_id]])
-    ids = ids.to(device)
-
     # Last non-special token — chat templates append trailing markers (Llama's
     # <|eot_id|>, Gemma's <end_of_turn>, Qwen's <|im_end|>) whose hidden states
     # are disconnected from content.  ``last_content_index`` is the canonical
     # walkback (skips ``all_special_ids`` + ``added_tokens_encoder``), shared by
     # every single-state readout so the pooling position is defined once.
     content_end = last_content_index(ids[0].tolist(), tokenizer)
+    del device  # retained in the private signature for compatibility callers
     return ids, content_end
 
 

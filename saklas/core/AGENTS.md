@@ -53,20 +53,26 @@ the multi-backward loop would corrupt the rows — which also stops the graph wa
 at the shallowest requested source, so a `--layers`-restricted fit never
 backprops below its lowest layer. On CUDA/CPU, row blocks write into reused
 per-layer row buffers and fold once per prompt into the CPU fp32 accumulator,
-all-or-nothing on success. On MPS, full `[d_model,d_model]×layers` row buffers are
-skipped; small `_MPS_ROW_STRIPE` buffers flush after zero-row checks to a local
-CPU prompt buffer, avoiding the unified-memory cliff while preserving all-or-
-nothing retries. A fully unsynced MPS loop can still let the CPU enqueue too far
+all-or-nothing on success. CUDA copies completed device matrices into reusable
+pinned host buffers and synchronizes once per prompt. On MPS, full
+`[d_model,d_model]×layers` row buffers are skipped; small `_MPS_ROW_STRIPE`
+buffers flush after zero-row checks to a reusable CPU prompt buffer, avoiding the
+unified-memory cliff while preserving all-or-nothing retries. A fully unsynced
+MPS loop can still let the CPU enqueue too far
 ahead, so the pass loop drains the queue every `_MPS_SYNC_EVERY_PASSES` (4), and
 zero rows raise with "out of memory" wording so the dim-batch-halving retry catches
 them. After an OOM, `dim_batch` can grow back toward the requested width after a
 few successful prompts. The fit is compute-bound; `source_layers` restriction is
 the one real wall-time lever (1.73× for the 40–90% band).
-`checkpoint_cb` fires every `DEFAULT_CHECKPOINT_EVERY` (25) prompts for
-resumable fits; session checkpoints store only the new partial shard, while the
-full lens is merged/written durably once at finalization. `JacobianLens.merge` is
-the n_prompts-weighted shard combiner; `JacobianLens.union_layers` combines
-same-corpus layer shards.
+`checkpoint_accumulator_cb` fires every `DEFAULT_CHECKPOINT_EVERY` (25) prompts
+for allocation-light resumable fits: IO normalizes live sums and merges any
+prefix one layer at a time while converting to fp16, so checkpointing does not
+materialize another complete fp32 lens. Checkpoints are self-contained
+(`base_n_prompts=0`) and survive repeated interruptions even beside an older
+full artifact; finalization writes the full artifact durably once.
+`checkpoint_cb` remains the compatibility surface. `JacobianLens.merge` is the
+non-mutating n_prompts-weighted combiner; `merge_into` recycles a caller-owned
+tail; `union_layers` combines same-corpus layer shards.
 
 `JacobianLens` holds the fp32 matrices: `transport(h, layer)` maps a residual
 into the final basis; `token_direction(v, unembed)` is `W_U[v] @ J_l` per layer
@@ -110,9 +116,13 @@ Capture runs in **right-padded batches** — `_encode_and_capture_all_batch(mode
 tokenizer, prompts, responses, layers, device, *, role=, model_type=,
 system_msg=)` renders + tokenizes the chunk, right-pads to a common length
 (attention-masked; pool indices unchanged since real tokens stay left-aligned),
-and runs one `_capture_all_hidden_states` forward that pools each row at its
+then transfers the finished ids/mask once and runs one
+`_capture_all_hidden_states` forward that pools each row at its
 last-content index *inside the hook* (per-row gather → `(B, D)` per layer, never
-`(B, T, D)`). `compute_node_centroid` / `compute_neutral_activations` chunk by
+`(B, T, D)`). Rendering, special-token walkback, and padding stay on CPU—there
+is no per-row H2D followed by a blocking `.tolist()` D2H. `role=` is uniform;
+`roles=` carries mixed per-row substitutions for fit-wide batches.
+`compute_node_centroid` / `compute_neutral_activations` chunk by
 `_CAPTURE_BATCH` and amortize the MPS `empty_cache` per chunk.
 `_encode_and_capture_all` is the single-pair sibling. `_capture_all_hidden_states`
 hooks every layer at once and accepts an `int` (single) or `(B,)` tensor (per-row)
@@ -181,9 +191,11 @@ a 2-node `pca` manifold). Dependencies via the `ModelHandle` protocol (`model` /
 `generate_responses`) + an `EventBus` for `ManifoldExtracted`; `SaklasSession`
 satisfies it implicitly. Cache-hit on the sidecar `nodes_sha256` (folds in corpus
 + `{domain, node_coords}` authored / `{fit_mode, hyperparams}` discover) **and**
-`sae_revision`. Else reads `_load_baseline_prompts()` and pools per-node
-conversational centroids (`compute_node_centroid(..., responses, baseline_prompts,
-role=node_role, model_type=)`), threading the folder's `node_kinds` /
+`sae_revision`. Else reads `_load_baseline_prompts()` and pools the complete
+roster through `compute_manifold_node_stats`: one row stream crosses node
+boundaries so short template nodes fill shared forward batches; OOM halves the
+active batch and a clean run grows it back. Raw curved fits retain those fp32
+rows for later covariance instead of capturing the corpus twice. It threads the folder's `node_kinds` /
 `node_roles` into the `Manifold` + sidecar metadata, then dispatches on
 `fit_mode`:
 
@@ -240,7 +252,11 @@ signal-by-layer profile. Diagnostic only (nothing runtime branches on it; absent
 empty dict), surfaced by `manifold show`; computed for every K≥2 fit (authored too),
 distinct from `mahalanobis_share` (the same whitened spread restricted to the
 steerable subspace). Whitener resolution is deferred past the cache-hit return
-and gated all-or-nothing on `covers_all`. `min_nodes(k) = 2k+1` for curved; a flat
+and gated all-or-nothing on `covers_all`. Each layer's centered `Σ⁻¹X` and Gram
+are computed once and reused by discovery, topology scoring, the Fisher basis,
+and neutral-layout anchoring. Curved fits share one layout-only `RbfFitPlan`
+(kernel/polynomial blocks, QR/eigensystem, λ grid, fixed-λ LU) across every layer
+and the sigma field. `min_nodes(k) = 2k+1` for curved; a flat
 `pca` fit needs only `k+1` (so K=2/k=1 is a steering vector). Emits
 `ManifoldExtracted`. (Note: `extract.py`'s old concept `ExtractionPipeline` and
 the `_capture_diffs_for_pairs` DiM apparatus are gone; the `discover-pca` 2-node
@@ -304,7 +320,9 @@ scatter, never anchor-center it. `fit_affine_subspace` returns `(subspace,
 mu_coords, ev_ratio)` and neutral-anchors the frame (`mean = P_basis(neutral)`,
 real `node_coords = (centroids − neutral)·basisᵀ`); `orient_to` fixes the sign.
 `subspace_share(mu_coords, basis, whitener, layer)` is the μ-centered (anchor-
-independent) per-layer budget weight (`DEFAULT_N_COMPONENTS = 64`).
+independent) per-layer budget weight (`DEFAULT_N_COMPONENTS = 64`). Fit callers
+can pass a precomputed Gram and `Σ⁻¹X`; Fisher directions then use
+`Aᵀ(Σ⁻¹X)` without another Woodbury application.
 
 `Manifold` — domain + per-layer `LayerSubspace`s + `node_labels`/`node_coords`/
 `node_roles`/`node_kinds` + the bakes `mahalanobis_share`/`origin` +
@@ -375,13 +393,18 @@ GCV-selects λ (`_gcv_select_lambda` → `_rbf_smoother_matrix` hat `S_λ`, GCV
 bit-for-bit; a float is a fixed λ. The fitted weight shapes are unchanged so
 `eval_rbf` (hot path) is untouched — only the coefficients shrink. `fit_layer_subspace`
 takes `smoothing=` (curved discover passes it; authored stays exact) and surfaces
-the chosen λ/edf via the `rbf_info` out-dict. CPU/fp32 (the saddle is MPS-unsafe).
+the chosen λ/edf via the `rbf_info` out-dict. `prepare_rbf_fit_plan` factors the
+node-layout-only work once per manifold; every layer and `fit_sigma_field` reuse
+it while retaining non-aliased persistent tensors. CPU/fp32 (the saddle is
+MPS-unsafe).
 
 **Fuzzy-manifold σ-field (curved only).** Optional per-layer *tube thickness*:
 the surface stops being a zero-thickness wire and carries a within-node off-surface
-spread `σ(z)`. `compute_node_reduced_covariance` (a **second** fit-time capture
-pass — needs the just-fitted basis, so it can't fold into centroid pooling)
-accumulates each node's reduced `(R,R)` within-node covariance; `fit_sigma_field`
+spread `σ(z)`. Raw curved fits retain activation rows from the shared centroid
+pass; `compute_node_reduced_covariance_from_rows` projects them after the basis
+exists, avoiding a second model pass while still accumulating each node's
+reduced `(R,R)` covariance. `compute_node_reduced_covariance` remains for callers
+without retained rows; `fit_sigma_field`
 reduces it to one off-surface scalar per node (`_off_surface_var` — the
 normal-complement trace via the surface tangent `_reduced_tangent`) and fits a
 **separate** `log σ` RBF over the same normalized `node_params`, stored on

@@ -10,6 +10,7 @@ import torch
 
 from saklas.core.steering_composer import SteeringComposer
 from saklas.core.steering_expr import format_expr, parse_expr
+from saklas.cli.runners import _lens_fit_source_preflight_matches
 from saklas.io.manifold_folder import ManifoldFormatError
 from saklas.io.manifold_authoring import create_discover_manifold_folder
 from tests.test_jlens_session import _PROMPTS, _StubSession
@@ -213,3 +214,21 @@ def test_manifold_authoring_rejects_jlens_namespace() -> None:
             node_corpora={"a": ["x"], "b": ["y"]},
             fit_mode="pca",
         )
+
+
+def test_lens_preflight_rejects_contiguous_prefix_for_all_layers() -> None:
+    sidecar: dict[str, object] = {
+        "source_layers": list(range(5)),
+        "model_layer_count": 12,
+    }
+    assert not _lens_fit_source_preflight_matches(sidecar, "all")
+
+
+def test_lens_preflight_resolves_workspace_from_model_depth() -> None:
+    sidecar: dict[str, object] = {
+        "source_layers": [4, 5, 6, 7, 8, 9],
+        "model_layer_count": 11,
+    }
+    assert _lens_fit_source_preflight_matches(sidecar, "workspace")
+    sidecar["source_layers"] = [4, 5, 6]
+    assert not _lens_fit_source_preflight_matches(sidecar, "workspace")
