@@ -118,19 +118,43 @@ webui/src/
                               # there); every specimen is the real component
                               # reading the real tokens
   panels/
-    WorkspaceRail.svelte      # left rail: category fly-outs
-    InspectorPanel.svelte     # right rack: CAA / J-LENS tab strip; CAA tab = STEER + PROBE racks splitting the column (both render a subspace group then a manifold group), J-LENS tab = JLensPanel
+    WorkspaceRail.svelte      # left rail: ⌘K button + category fly-outs (registry
+                              # lives in lib/commands.ts, shared with the palette)
+    CommandPalette.svelte     # ⌘K palette — instrument-tab jumps + every rail tool
+                              # + pages; state in lib/stores/palette.svelte.ts
+    RecipeBar.svelte          # persistent cross-pillar expression bar atop the
+                              # inspector: every racked term as a pillar-colored
+                              # chip (click → jump to its tab, × → remove, ⧉ →
+                              # copy the canonical expression)
+    SaePanel.svelte           # SAE pillar tab — designed placeholder (runtime
+                              # specced + deferred, docs/plans/sae-pillar.md);
+                              # gates on a future SessionInfo.sae_loaded flag
+    InspectorPanel.svelte     # right rack: THE INSTRUMENT STACK — RecipeBar +
+                              # four pillar tabs (subspace/manifold/sae/lens via
+                              # ui/SegmentedTabs). subspace + manifold tabs each
+                              # render SteeringRack+ProbeRack filtered by a
+                              # family prop (the tab IS the group; the old CAA
+                              # two-group split is gone), sae = SaePanel,
+                              # lens = JLensPanel. InspectorTab union is the four
+                              # pillar names (the pre-4.2 "probes"/"jlens" values
+                              # are gone)
     JLensPanel.svelte         # J-LENS tab: STEER cards (mode:"jlens" rack entries → "α jlens/word" terms, per-card α default 0.3) + ONE merged PROBE section — pinned jlens/<word> probe cards (■ glyph unpins) above the unpinned live top-k aggregate cards (□ glyph pins; strength-history sparkline off lensState.aggHistory), BOTH the same card shape: strength bar (the one channel — mean band probability, the gate channel) + per-layer strength strip (p_l cells, color normalized to the card's own max). One strength/name/depth sort, live-lens toggle right of the PROBE title → apiLens.setLive({top_k: 8}); live off ⇒ pinned cards settle to the end-of-gen aggregate. The card list scrolls under an anchored header + add-form footer (the CAA racks' fixed-chrome shape); STEER sizes to content with its own capped card scroll. Every probe-family card (CAA ProbeCard, JLensProbeCard, JLensTokenCard) puts the @com ±spread depth chip right of the name and a sparkline top right — one statline grammar across both tabs
     WorkbenchCard.svelte      # active-workbench card (model + device); bottom of threads column
     StatusFooter.svelte       # gen progress · t/s · elapsed · ppl + pending-queue count badge; mounted inside Chat above the input row
     PendingBubbles.svelte     # ghosted bubbles for queued sends/commits/mutations + per-item × cancel; mounted between StatusFooter and the input row
     Chat.svelte               # thinking-collapsible, probe-tinted tokens, inline actions (clear/save/load/transcript), status footer, pending bubbles
     SamplingStrip.svelte      # T / P / K / max / pres / freq / seed / user-as + reply-as role boxes / thinking / alts + advanced/system-prompt buttons; foot of the threads column, below WorkbenchCard
-    SteeringRack.svelte       # subspace group (+ shared "subspace along" master) then manifold group of steer cards;
-                              # footer "+ subspace steer" (white) / "+ manifold steer" (purple), shown empty + populated (no teaching copy)
-    ProbeRack.svelte          # subspace group then manifold group of probe cards; header live toggle
-                              # (probesLiveState → apiProbes.setLive — the CAA per-token scoring switch);
-                              # footer "+ subspace probe" / "+ manifold probe"
+    SteeringRack.svelte       # STEER section of one instrument tab — takes a
+                              # ``family`` prop ("subspace" | "manifold") and renders
+                              # only that family's cards (+ the shared "subspace
+                              # along" master on the subspace tab); footer keeps the
+                              # family's single "+ … steer" launcher
+    ProbeRack.svelte          # PROBE section of one instrument tab — same ``family``
+                              # prop (subspace ⇔ info.is_affine); header live toggle
+                              # (probesLiveState → apiProbes.setLive — the ONE
+                              # monitor per-token scoring switch, rendered in both
+                              # tabs driving the same state); footer keeps the
+                              # family's single "+ … probe" launcher
     rack/RackCard.svelte      # shared card chrome: statline on top, controls/meters stacked below
     rack/SteerCard.svelte     # unified steer card — branches on entry.mode (snap-to-node + XYPad both):
                               #   subspace → position only (magnitude = shared subspace-along master)

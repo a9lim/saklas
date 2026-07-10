@@ -93,7 +93,7 @@ export function serializeExpression(
  *  relative weight between them lives in how far each position sits from
  *  neutral.  ``<pos>`` is the label form (``personas%hacker``) when
  *  ``entry.label`` is set, else the comma-joined coord list. */
-function formatSubspaceTerm(
+export function formatSubspaceTerm(
   name: string,
   entry: SubspaceSteerEntry,
   subspaceAlong: number,
@@ -123,7 +123,7 @@ function formatTriggerSuffix(trigger: Trigger): string {
  *  plus an optional ``@trigger``.  The rack key is the full atom (the
  *  engine resolves it through ``register_jlens_direction``); per-chip
  *  ``alpha`` because lens atoms run hotter than concept vectors. */
-function formatJLensTerm(name: string, entry: JLensSteerEntry): string {
+export function formatJLensTerm(name: string, entry: JLensSteerEntry): string {
   return `${formatCoeff(entry.alpha)} ${name}${formatTriggerSuffix(entry.trigger)}`;
 }
 
@@ -132,7 +132,7 @@ function formatJLensTerm(name: string, entry: JLensSteerEntry): string {
  *  Coefficient is the per-card blend fraction (``-`` rides the joiner).
  *  ``<position>`` is the label form (``emotions%happy``) when ``entry.label`` is
  *  set; otherwise the comma-joined coord list (``emotions%0.3,0.8``). */
-function formatManifoldTerm(name: string, entry: ManifoldSteerEntry): string {
+export function formatManifoldTerm(name: string, entry: ManifoldSteerEntry): string {
   const position = entry.label
     ? entry.label
     : entry.coords.map((c) => formatCoeff(c)).join(",");

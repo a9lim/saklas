@@ -10,7 +10,13 @@
   import InspectorPanel from "./panels/InspectorPanel.svelte";
   import Chat from "./panels/Chat.svelte";
   import LoomSidebar from "./panels/loom/LoomSidebar.svelte";
+  import CommandPalette from "./panels/CommandPalette.svelte";
   import Toaster from "./lib/Toaster.svelte";
+  import {
+    paletteState,
+    closePalette,
+    togglePalette,
+  } from "./lib/stores/palette.svelte";
 
   import * as Drawers from "./drawers";
 
@@ -86,6 +92,14 @@
     // for the n-way regen flow where a user might want to back out of
     // a follow-up modal without killing the stream.
     if (ev.key === "Escape") {
+      // Palette overlays everything — its own input handler closes it when
+      // focused; this catches Esc after focus wandered (backdrop click-arm,
+      // devtools, etc.).
+      if (paletteState.open) {
+        closePalette();
+        ev.preventDefault();
+        return;
+      }
       if (loomUiState.modalRequest.kind !== null) {
         return;
       }
@@ -101,8 +115,16 @@
       }
     }
 
-    if (loomTree.unavailable) return;
     const mod = ev.ctrlKey || ev.metaKey;
+    // ⌘K — the command palette; works everywhere, including pre-boot and
+    // with the loom unavailable (it's pure navigation).
+    if (mod && !ev.shiftKey && ev.key.toLowerCase() === "k") {
+      ev.preventDefault();
+      togglePalette();
+      return;
+    }
+
+    if (loomTree.unavailable) return;
     if (!mod) return;
     // Shift+ctrl combos fall through to the browser; the loom shortcuts
     // use bare Cmd/Ctrl+key.
@@ -278,6 +300,7 @@
     </main>
 
     <Toaster />
+    <CommandPalette />
   </div>
 {/if}
 
@@ -349,29 +372,36 @@
     overflow: hidden;
   }
 
-  /* Drawer host — slides in from the right over the rack zone.  Backdrop
-   * also covers the chat zone so the focus is unambiguous. */
+  /* Sheet host — analysis tools float in from the right as a rounded
+   * sheet inset from the frame edges (v2: no full-height wall).  Backdrop
+   * blurs the bench underneath so the live data reads as "behind", not
+   * "gone". */
   .drawer-backdrop {
     position: absolute;
     inset: 0;
-    background: rgba(1, 4, 9, 0.55);
+    background: rgba(2, 3, 8, 0.5);
+    backdrop-filter: blur(2px);
     z-index: var(--z-drawer);
     border: 0;
     cursor: pointer;
   }
   .drawer {
     position: absolute;
-    top: 0;
-    right: 0;
-    bottom: 0;
+    top: var(--space-4);
+    right: var(--space-4);
+    bottom: var(--space-4);
     width: min(980px, 78%);
     background: var(--bg-alt);
-    border-left: 1px solid var(--border);
+    border: 1px solid var(--glass-line);
+    border-radius: var(--radius-lg);
     z-index: calc(var(--z-drawer) + 1);
     display: flex;
     flex-direction: column;
-    box-shadow: var(--shadow-overlay);
-    animation: drawer-in var(--dur) var(--ease-out);
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.04),
+      var(--shadow-overlay);
+    overflow: hidden;
+    animation: drawer-in var(--dur-slow) var(--ease-out);
   }
   /* Forms / pickers — sized to their content rather than the wide
    * analysis panel. */
@@ -380,10 +410,12 @@
   }
   @keyframes drawer-in {
     from {
-      transform: translateX(100%);
+      transform: translateX(28px);
+      opacity: 0;
     }
     to {
       transform: translateX(0);
+      opacity: 1;
     }
   }
   .drawer-header {

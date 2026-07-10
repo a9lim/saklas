@@ -1,16 +1,11 @@
 <script lang="ts">
-  // Probe rack — two harmonised groups split on geometry, not artifact
-  // type:
-  //
-  //   subspace (flat) — probeRack entries where info.is_affine (a 2-node
-  //     concept axis or a higher-rank flat fan like personas).
-  //   manifold (curved) — the rest (e.g. a curved emotions probe).
-  //
-  // Every row wears the same RackCard chrome; the family is signalled only
-  // by accent colour + marker glyph.  The sort dropdown (name / value /
-  // change) orders within each group.  Light group sub-headers; an empty
-  // group hides.  Footer keeps the + subspace probe / + manifold probe
-  // entry points (white / purple), opening the shared drawer in probe mode.
+  // Probe rack — the PROBE section of one instrument tab.  The geometry
+  // family arrives as a prop (the tab IS the group): subspace shows the
+  // is_affine entries (a 2-node concept axis or a higher-rank flat fan
+  // like personas), manifold the curved rest (e.g. a curved emotions
+  // probe).  Every row wears the same RackCard chrome; the pillar hue
+  // rides the card accent.  The sort dropdown (name / value / change)
+  // orders the rows; the footer keeps the family's + launcher.
   //
   // Transcript highlight / compare-two controls live in Chat.svelte —
   // highlighting is about reading the transcript, so that is their one
@@ -28,6 +23,13 @@
   } from "../lib/stores.svelte";
   import type { ProbeSortMode } from "../lib/types";
 
+  // The geometry family comes in as a prop since the four-pillar
+  // restructure — the tab IS the group, so the rack shows one family:
+  // subspace ⇔ info.is_affine, manifold ⇔ curved.  The live toggle is the
+  // ONE monitor per-token scoring switch (it spans both families; it
+  // renders in both tabs' headers driving the same state).
+  let { family }: { family: "subspace" | "manifold" } = $props();
+
   const sortMode = $derived(probeRack.sortMode);
   const liveOn = $derived(probesLiveState.enabled);
 
@@ -36,24 +38,17 @@
   }
 
   // activeProbeNames() reads probeRack.active + entries + sortMode, all
-  // $state-tracked, so this $derived re-runs on any of those changes.  We
-  // then split it into the two families, preserving the sort order within
-  // each.  ``jlens/`` token probes are excluded — they render as pinned
-  // chips in the J-LENS tab, not as rack rows here.
-  const sorted = $derived(
-    activeProbeNames().filter((n) => !n.startsWith("jlens/")),
+  // $state-tracked, so this $derived re-runs on any of those changes.
+  // ``jlens/`` token probes are excluded — they render as pinned chips in
+  // the lens tab, not as rack rows here.
+  const probes = $derived.by(() =>
+    activeProbeNames().filter(
+      (n) =>
+        !n.startsWith("jlens/") &&
+        probeRack.entries.get(n)?.info.is_affine === (family === "subspace"),
+    ),
   );
-
-  const subspaceProbes = $derived.by(() =>
-    sorted.filter((n) => probeRack.entries.get(n)?.info.is_affine === true),
-  );
-  const manifoldProbes = $derived.by(() =>
-    sorted.filter((n) => probeRack.entries.get(n)?.info.is_affine === false),
-  );
-
-  const subspaceCount = $derived(subspaceProbes.length);
-  const manifoldCount = $derived(manifoldProbes.length);
-  const count = $derived(subspaceCount + manifoldCount);
+  const count = $derived(probes.length);
 
   const SORT_OPTIONS: { value: ProbeSortMode; label: string }[] = [
     { value: "name", label: "name" },
@@ -117,53 +112,41 @@
           This server doesn't expose the read-side probe routes.
         </p>
       </div>
-    {:else if count > 0}
-      {#if subspaceCount > 0}
-        <h3 class="group-header subspace">subspace</h3>
-        {#each subspaceProbes as name (name)}
-          {@const entry = probeRack.entries.get(name)}
-          {#if entry}
-            <div role="listitem">
-              <ProbeCard {name} {entry} />
-            </div>
-          {/if}
-        {/each}
-      {/if}
-      {#if manifoldCount > 0}
-        <h3 class="group-header manifold">manifold</h3>
-        {#each manifoldProbes as name (name)}
-          {@const entry = probeRack.entries.get(name)}
-          {#if entry}
-            <div role="listitem">
-              <ProbeCard {name} {entry} />
-            </div>
-          {/if}
-        {/each}
-      {/if}
+    {:else}
+      {#each probes as name (name)}
+        {@const entry = probeRack.entries.get(name)}
+        {#if entry}
+          <div role="listitem">
+            <ProbeCard {name} {entry} />
+          </div>
+        {/if}
+      {/each}
     {/if}
   </div>
 
-  <!-- Launchers stay reachable in both empty + populated states (hidden
-       only when the server lacks the probe routes).  Two family entry
-       points — white subspace vs purple manifold. -->
+  <!-- The family's launcher stays reachable in both empty + populated
+       states (hidden only when the server lacks the probe routes). -->
   {#if !probeRack.unavailable}
     <div class="actions">
-      <button
-        type="button"
-        class="add add-subspace"
-        onclick={onAddSubspaceProbe}
-        title="Attach a flat subspace as a read-side probe"
-      >
-        + subspace probe
-      </button>
-      <button
-        type="button"
-        class="add add-manifold"
-        onclick={onAddManifoldProbe}
-        title="Attach a curved manifold as a read-side probe"
-      >
-        + manifold probe
-      </button>
+      {#if family === "subspace"}
+        <button
+          type="button"
+          class="add add-subspace"
+          onclick={onAddSubspaceProbe}
+          title="Attach a flat subspace as a read-side probe"
+        >
+          + subspace probe
+        </button>
+      {:else}
+        <button
+          type="button"
+          class="add add-manifold"
+          onclick={onAddManifoldProbe}
+          title="Attach a curved manifold as a read-side probe"
+        >
+          + manifold probe
+        </button>
+      {/if}
     </div>
   {/if}
 </section>
@@ -266,26 +249,6 @@
   .strips.is-empty {
     align-items: center;
     justify-content: center;
-  }
-
-  /* Light group sub-headers — mirror SteeringRack so the steer / probe
-   * racks read as one family. */
-  .group-header {
-    margin: 0;
-    padding: var(--space-1) 0 0;
-    font-size: var(--text-2xs);
-    font-weight: var(--weight-normal);
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    color: var(--fg-muted);
-  }
-  .group-header.subspace {
-    border-left: 2px solid var(--accent);
-    padding-left: var(--space-2);
-  }
-  .group-header.manifold {
-    border-left: 2px solid var(--accent-purple);
-    padding-left: var(--space-2);
   }
 
   /* "Probe routes unavailable" notice — the one remaining empty state

@@ -179,12 +179,19 @@ export async function setLiveProbes(enabled: boolean): Promise<void> {
   }
 }
 
-/** Inspector-column mode: the CAA racks vs the J-lens surface.
- *  Both tabs are views over the ONE steering expression / probe roster —
- *  the split is presentational (each tab shows its own term/probe family). */
-export type InspectorTab = "probes" | "jlens";
+/** Inspector-column mode — the four instrument pillars.  All four tabs are
+ *  views over the ONE steering expression / probe roster; the split is
+ *  presentational (each tab shows its own term/probe family):
+ *    subspace — flat/affine fits (concept axes, personas)
+ *    manifold — curved fits (emotions, months)
+ *    sae      — feature space (runtime specced + deferred; the tab ships
+ *               gated — docs/plans/sae-pillar.md)
+ *    lens     — the Jacobian-lens surface (JLensPanel) */
+export type InspectorTab = "subspace" | "manifold" | "sae" | "lens";
 
-export const inspectorState: { tab: InspectorTab } = $state({ tab: "probes" });
+export const inspectorState: { tab: InspectorTab } = $state({
+  tab: "subspace",
+});
 
 export function setInspectorTab(tab: InspectorTab): void {
   inspectorState.tab = tab;

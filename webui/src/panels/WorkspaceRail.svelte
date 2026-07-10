@@ -11,67 +11,16 @@
 
   import { onMount } from "svelte";
   import { openDrawer } from "../lib/stores.svelte";
+  import { togglePalette } from "../lib/stores/palette.svelte";
+  import {
+    RAIL_CATEGORIES,
+    type RailCategory as Category,
+  } from "../lib/commands";
   import type { DrawerName } from "../lib/types";
 
-  interface Tool {
-    label: string;
-    drawer: DrawerName;
-  }
-  interface Category {
-    key: string;
-    label: string;
-    /** SVG path data for the 24×24 rail glyph. */
-    icon: string;
-    tools: Tool[];
-  }
-
-  const CATEGORIES: Category[] = [
-    {
-      // The single steering-authoring surface.  Concepts are manifolds
-      // now — a flat (2-node / personas) fit is just a pca manifold — so
-      // there's no separate "subspaces" category and no standalone vector
-      // build/merge form; flat authoring folds into the manifold builder's
-      // pca path.  The catalog is the shared RackDrawer (family-split),
-      // reached from the rack "+" buttons.
-      key: "manifolds",
-      label: "Steering manifolds",
-      // Undulating spline curve — reads as "manifold" and is visually
-      // distinct from analysis' line graph.
-      icon: "M3 17c4-8 6-8 9-4s2 8 9 0",
-      // build authors a fit (pca → flat, spectral/authored → curved);
-      // merge unions discover node corpora; packs + templates are shared
-      // lifecycle surfaces.
-      tools: [
-        { label: "build manifold…", drawer: "manifold_builder" },
-        { label: "merge manifolds…", drawer: "manifold_merge" },
-        { label: "packs…", drawer: "manifold_pack" },
-        { label: "templates…", drawer: "template_lab" },
-      ],
-    },
-    {
-      key: "analysis",
-      label: "Analysis",
-      icon: "M4 18l5-12 4 8 3-5 4 9",
-      tools: [
-        { label: "correlation matrix…", drawer: "correlation" },
-        { label: "pairwise compare…", drawer: "compare" },
-        { label: "layer norms…", drawer: "layer_norms" },
-        { label: "activation atlas…", drawer: "activation_atlas" },
-        { label: "experiment lab…", drawer: "experiment_lab" },
-        { label: "recipe builder…", drawer: "recipe_builder" },
-      ],
-    },
-    {
-      key: "session",
-      label: "Session & model",
-      icon: "M5 21v-6M5 11V3M12 21v-9M12 8V3M19 21v-4M19 13V3M2 15h6M9 8h6M16 13h6",
-      tools: [
-        { label: "model health…", drawer: "health" },
-        { label: "session / auth…", drawer: "session_admin" },
-        { label: "help / shortcuts…", drawer: "help" },
-      ],
-    },
-  ];
+  // The registry lives in lib/commands.ts — one source of truth shared
+  // with the ⌘K palette; the rail is the mouse path over the same tools.
+  const CATEGORIES = RAIL_CATEGORIES;
 
   // Which category fly-out is open, and where to anchor it.
   let openKey: string | null = $state(null);
@@ -122,6 +71,19 @@
 
 <nav class="rail" aria-label="saklas workspace rail">
   <div class="items">
+    <button
+      type="button"
+      class="rail-btn"
+      title="Command palette (⌘K)"
+      aria-label="Open command palette"
+      onclick={togglePalette}
+    >
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <circle cx="11" cy="11" r="7"></circle>
+        <path d="M21 21l-4.35-4.35"></path>
+      </svg>
+      <span>⌘K</span>
+    </button>
     {#each CATEGORIES as cat (cat.key)}
       <button
         type="button"

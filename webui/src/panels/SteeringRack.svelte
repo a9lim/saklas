@@ -1,17 +1,16 @@
 <script lang="ts">
-  // The steering rack — one unified steerRack, two harmonised groups split
-  // on geometry, the entry's own ``mode``:
+  // The steering rack — the STEER section of one instrument tab.  Since the
+  // four-pillar restructure the geometry family comes in as a prop (the tab
+  // IS the group), so the rack renders exactly one family's terms:
   //
   //   subspace (flat)   — a 2-node bipolar axis through the rank-8 personas
   //     fan.  Shares one rack-level "subspace along" master (the merged
   //     affine subspace slides once), so the cards carry no per-card along.
-  //   manifold (curved) — curved fits (e.g. emotions), each its own injection with
-  //     a per-card along + onto.
+  //   manifold (curved) — curved fits (e.g. emotions), each its own injection
+  //     with a per-card along + onto.
   //
-  // Every row is one SteerCard wearing the same RackCard chrome; the family
-  // is signalled only by accent colour + marker glyph.  Light group
-  // sub-headers; an empty group hides.  Footer keeps the + add steering /
-  // + add manifold entry points and their drawer targets.
+  // Every row is one SteerCard wearing the same RackCard chrome; the pillar
+  // hue rides the card accent.  Footer keeps the family's + launcher.
 
   import SteerCard from "./rack/SteerCard.svelte";
   import Slider from "../lib/Slider.svelte";
@@ -21,22 +20,18 @@
     openDrawer,
   } from "../lib/stores.svelte";
 
+  let { family }: { family: "subspace" | "manifold" } = $props();
+
   // Alphabetized for stable order — Map iteration tracks insertion which
   // makes the rack jump around.
-  const subspaceTerms = $derived.by(() => {
-    const arr = [...steerRack.entries.entries()].filter(([, e]) => e.mode === "subspace");
+  const terms = $derived.by(() => {
+    const arr = [...steerRack.entries.entries()].filter(
+      ([, e]) => e.mode === family,
+    );
     arr.sort((a, b) => a[0].localeCompare(b[0]));
     return arr;
   });
-  const curvedTerms = $derived.by(() => {
-    const arr = [...steerRack.entries.entries()].filter(([, e]) => e.mode === "manifold");
-    arr.sort((a, b) => a[0].localeCompare(b[0]));
-    return arr;
-  });
-
-  const subspaceCount = $derived(subspaceTerms.length);
-  const manifoldCount = $derived(curvedTerms.length);
-  const count = $derived(subspaceCount + manifoldCount);
+  const count = $derived(terms.length);
 
   function onAlongInput(v: number): void {
     if (Number.isFinite(v)) setSubspaceAlong(v);
@@ -55,8 +50,7 @@
 
   {#if count > 0}
     <div class="strips">
-      {#if subspaceCount > 0}
-        <h3 class="group-header subspace">subspace</h3>
+      {#if family === "subspace"}
         <!-- Shared "subspace along" master — the single slide magnitude every
              flat term serializes with (the merged affine subspace slides
              once).  Per-term relative weight lives in each card's position. -->
@@ -75,38 +69,35 @@
           />
           <span class="along-val">{steerRack.subspaceAlong.toFixed(2)}</span>
         </div>
-        {#each subspaceTerms as [name, entry] (name)}
-          <SteerCard {name} {entry} />
-        {/each}
       {/if}
-      {#if manifoldCount > 0}
-        <h3 class="group-header manifold">manifold</h3>
-        {#each curvedTerms as [name, entry] (name)}
-          <SteerCard {name} {entry} />
-        {/each}
-      {/if}
+      {#each terms as [name, entry] (name)}
+        <SteerCard {name} {entry} />
+      {/each}
     </div>
   {/if}
 
-  <!-- Launchers stay reachable in both empty + populated states — the two
-       family entry points, white subspace vs purple manifold. -->
+  <!-- The family's launcher stays reachable in both empty + populated
+       states — the tab is the group, so there is exactly one. -->
   <div class="actions" class:empty={count === 0}>
-    <button
-      type="button"
-      class="add-subspace"
-      onclick={() => openDrawer("subspace")}
-      title="Browse flat subspaces — concept axes and personas"
-    >
-      + subspace steer
-    </button>
-    <button
-      type="button"
-      class="add-manifold"
-      onclick={() => openDrawer("manifolds")}
-      title="Browse curved steering manifolds"
-    >
-      + manifold steer
-    </button>
+    {#if family === "subspace"}
+      <button
+        type="button"
+        class="add-subspace"
+        onclick={() => openDrawer("subspace")}
+        title="Browse flat subspaces — concept axes and personas"
+      >
+        + subspace steer
+      </button>
+    {:else}
+      <button
+        type="button"
+        class="add-manifold"
+        onclick={() => openDrawer("manifolds")}
+        title="Browse curved steering manifolds"
+      >
+        + manifold steer
+      </button>
+    {/if}
   </div>
 </section>
 
@@ -169,28 +160,7 @@
     overflow-y: auto;
     padding-right: var(--space-1);
   }
-  /* Light group sub-headers — name the geometry family without competing
-   * with the section title.  Accent-coded to match the cards' left
-   * stripe so the eye links header → rows. */
-  .group-header {
-    margin: 0;
-    padding: var(--space-1) 0 0;
-    font-size: var(--text-2xs);
-    font-weight: var(--weight-normal);
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    color: var(--fg-muted);
-  }
-  .group-header.subspace {
-    border-left: 2px solid var(--accent);
-    padding-left: var(--space-2);
-  }
-  .group-header.manifold {
-    border-left: 2px solid var(--accent-purple);
-    padding-left: var(--space-2);
-  }
-
-  /* Shared subspace-along master — sits between the subspace header and its
+  /* Shared subspace-along master — sits between the section header and its
    * cards, reading as a group-level control rather than a per-card one. */
   .along-master {
     display: grid;
