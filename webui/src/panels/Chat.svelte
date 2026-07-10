@@ -10,9 +10,19 @@
   // scroll bookkeeping, per-turn collapse state).  The WS lifecycle and
   // gen-status accounting belongs to the store.
   //
-  // Mirrors saklas/tui/chat_panel.py for the visual rhythm: leading
-  // whitespace strip after </think>, role-coloured left borders, plain
-  // text fall-through when no probe is selected.
+  // Turn surface follows the CAST MODEL (docs/plans/dynamic-roles.md):
+  // every speaker gets one neutral glass card — roles aren't a "space",
+  // so they carry no hue — with identity in the role chip (glyph letter +
+  // label, arbitrary strings first-class) and provenance as the ppl badge
+  // generated turns carry. System turns render as stage directions (a
+  // note about the scene, not a speaker). The ``speaking as`` chips in
+  // the composer are the promoted SamplingStrip role boxes — same client
+  // state, same wire block.
+  //
+  // Mirrors saklas/tui/chat_panel.py for the token rhythm: leading
+  // whitespace strip after </think>, plain text fall-through when no
+  // probe is selected. (The TUI still draws role-coloured borders — its
+  // cast-model parity pass is deferred.)
 
   import { onMount, untrack } from "svelte";
   import { SvelteMap } from "svelte/reactivity";
@@ -55,6 +65,9 @@
     genUiMode,
     setGenUiMode,
     roleDisplayLabel,
+    roleGlyphLetter,
+    samplingState,
+    sessionState,
     highlightScale,
   } from "../lib/stores.svelte";
   import type { AutoRegenMode } from "../lib/stores.svelte";
@@ -75,6 +88,35 @@
 
   let input = $state("");
   let textareaRef: HTMLTextAreaElement | null = $state(null);
+
+  // ---------------------------------------------------------- cast row --
+  //
+  // The ``speaking as`` / ``reply as`` chips — the SamplingStrip role
+  // boxes promoted into the composer (the visible step toward the cast
+  // model).  Same client state (``samplingState.user_role`` /
+  // ``assistant_role``), same wire block, same support gates: base /
+  // completion models and label-free families (Mistral / talkie) can't
+  // relabel turns, raw mode has no roles.
+  const CAST_SLUG_RE = /^[a-z0-9._-]+$/;
+  const castReady = $derived(sessionState.info !== null);
+  const castUserSupported = $derived(
+    !(sessionState.info?.is_base_model ?? false) &&
+      !effectiveRawMode() &&
+      (sessionState.info?.user_role_supported ?? false),
+  );
+  const castAsstSupported = $derived(
+    !(sessionState.info?.is_base_model ?? false) &&
+      !effectiveRawMode() &&
+      (sessionState.info?.role_substitution_supported ?? false),
+  );
+  const castUserValid = $derived(
+    samplingState.user_role.trim() === "" ||
+      CAST_SLUG_RE.test(samplingState.user_role.trim()),
+  );
+  const castAsstValid = $derived(
+    samplingState.assistant_role.trim() === "" ||
+      CAST_SLUG_RE.test(samplingState.assistant_role.trim()),
+  );
 
   /** Auto-grow the textarea between 1 and 6 rows (≈ 132px at 13px line-h).
    *  With ``box-sizing: border-box`` set in CSS, ``el.scrollHeight``
@@ -1028,8 +1070,14 @@
               {:else if turn.abPair}
                 {@render bubble(turn.abPair, turnIdx, true)}
               {:else}
-                <div class="msg assistant placeholder" aria-hidden="true">
-                  <span class="role">{roleDisplayLabel("assistant")} (alt)</span>
+                <div class="msg placeholder" aria-hidden="true">
+                  <div class="who">
+                    <span class="role-chip">
+                      <b>{roleGlyphLetter("assistant")}</b>
+                      {roleDisplayLabel("assistant")}
+                    </span>
+                    <span class="who-meta">(alt)</span>
+                  </div>
                   <span class="placeholder-text">— pending —</span>
                 </div>
               {/if}
@@ -1047,6 +1095,43 @@
   <StatusFooter />
 
   <PendingBubbles />
+
+  <div class="cast-row" aria-label="Speaking roles">
+    <label
+      class="cast"
+      title={castUserSupported
+        ? "the label your turns speak under — stamped on each sent turn, immutable afterward"
+        : "role substitution unavailable for this model / mode"}
+    >
+      <span class="cast-label">speaking as</span>
+      <input
+        class="cast-input"
+        class:invalid={!castUserValid}
+        bind:value={samplingState.user_role}
+        disabled={!castReady || !castUserSupported}
+        placeholder="user"
+        spellcheck="false"
+        aria-label="user role label"
+      />
+    </label>
+    <label
+      class="cast"
+      title={castAsstSupported
+        ? "the persona the model replies as — stamped on each generated turn"
+        : "role substitution unavailable for this model / mode"}
+    >
+      <span class="cast-label">reply as</span>
+      <input
+        class="cast-input"
+        class:invalid={!castAsstValid}
+        bind:value={samplingState.assistant_role}
+        disabled={!castReady || !castAsstSupported}
+        placeholder={roleDisplayLabel("assistant")}
+        spellcheck="false"
+        aria-label="assistant role label"
+      />
+    </label>
+  </div>
 
   <form class="input-row" onsubmit={(ev) => { ev.preventDefault(); doSend(modHeld); }}>
     <textarea
@@ -1088,13 +1173,31 @@
 </div>
 
 {#snippet bubble(turn: ChatTurn, turnIdx: number, isShadow: boolean)}
+  {#if turn.role === "system"}
+    <!-- Stage direction — a note about the scene, not a speaker. -->
+    <div
+      class="stage"
+      class:shadow={isShadow}
+      title="system prompt — stage direction"
+    >{turn.text}</div>
+  {:else}
   <div
-    class="msg {turn.role}"
+    class="msg"
     class:shadow={isShadow}
   >
-    <span class="role">
-      {roleDisplayLabel(turn.role, turn.roleLabel)}{#if isShadow && !pinnedActive} (unsteered){/if}
-    </span>
+    <div class="who">
+      <span class="role-chip" title="{turn.role}{turn.roleLabel ? ` as ${turn.roleLabel}` : ''}">
+        <b>{roleGlyphLetter(turn.role, turn.roleLabel)}</b>
+        {roleDisplayLabel(turn.role, turn.roleLabel)}
+      </span>
+      {#if isShadow && !pinnedActive}<span class="who-meta">(unsteered)</span>{/if}
+      {#if turn.role === "assistant" && turn.meanLogprob != null && Number.isFinite(turn.meanLogprob)}
+        <span
+          class="prov"
+          title="perplexity of this generation (provenance: model-authored)"
+        >ppl {Math.exp(-turn.meanLogprob).toFixed(1)}</span>
+      {/if}
+    </div>
 
     {#if turn.role === "assistant"}
       {#if (turn.thinkingTokens?.length ?? 0) > 0 || turn.thinking}
@@ -1165,6 +1268,7 @@
       <div class="response-body"><span class="plain">{turn.text}</span></div>
     {/if}
   </div>
+  {/if}
 {/snippet}
 
 <style>
@@ -1344,44 +1448,89 @@
     color: var(--accent-red);
     border-color: var(--accent-red);
   }
-  .ab-col.ab-shadow .msg.assistant {
-    border-left-color: var(--accent-purple);
-  }
-
+  /* The cast model: every speaker wears ONE neutral glass card — role
+   * identity lives in the chip, provenance in the ppl badge, and hue
+   * stays reserved for spaces and states.  The A/B shadow column keeps a
+   * violet-tinted hairline (comparison is a manifold-family read). */
   .msg {
-    border-left: 2px solid var(--border);
-    padding: var(--space-1) var(--space-4);
+    border: 1px solid var(--glass-line);
+    border-radius: var(--radius-lg);
+    background: var(--glass);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
+    padding: var(--space-3) var(--space-5);
     display: flex;
     flex-direction: column;
     gap: var(--space-2);
     min-width: 0;
     word-break: break-word;
   }
-  .msg .role {
+  .msg.shadow {
+    border-color: color-mix(in srgb, var(--accent-purple) 26%, var(--glass-line));
+  }
+
+  .who {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    min-width: 0;
+  }
+  .role-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-3);
+    font-family: var(--font-mono);
+    font-size: var(--text-2xs);
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--fg-dim);
+    padding: 2px 9px 2px 3px;
+    border-radius: var(--radius-pill);
+    border: 1px solid var(--glass-line);
+    background: var(--glass-strong);
+    max-width: 40%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .role-chip b {
+    font-weight: var(--weight-bold);
+    width: 15px;
+    height: 15px;
+    border-radius: 50%;
+    background: rgba(255, 255, 255, 0.09);
+    color: var(--fg);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 9px;
+    flex: none;
+  }
+  .who-meta {
     color: var(--fg-muted);
     font-size: var(--text-xs);
-    text-transform: lowercase;
-    letter-spacing: 0;
   }
-  .msg.user {
-    border-left-color: var(--accent-blue);
+  .prov {
+    margin-left: auto;
+    color: var(--fg-muted);
+    font-size: var(--text-2xs);
+    font-variant-numeric: tabular-nums;
+    flex: none;
   }
-  .msg.user .role {
-    color: var(--accent-blue);
+
+  /* Stage direction — the system prompt as a note about the scene. */
+  .stage {
+    font-style: italic;
+    color: var(--fg-subtle);
+    font-size: var(--text-sm);
+    line-height: 1.5;
+    padding: var(--space-1) var(--space-5);
+    white-space: pre-wrap;
+    word-break: break-word;
   }
-  .msg.assistant {
-    border-left-color: var(--accent-green);
+  .stage.shadow {
+    opacity: 0.7;
   }
-  .msg.assistant .role {
-    color: var(--accent-green);
-  }
-  .msg.system {
-    border-left-color: var(--accent-red);
-    color: var(--accent-error);
-  }
-  .msg.system .role {
-    color: var(--accent-red);
-  }
+
   .msg.placeholder {
     color: var(--fg-muted);
     font-style: italic;
@@ -1454,6 +1603,51 @@
   }
   .tok:hover {
     outline: 1px solid var(--fg-muted);
+  }
+
+  /* Cast row — compact chip-inputs above the composer.  Quiet until
+   * hovered/filled; disabled (unsupported family / raw mode) reads as
+   * plain dim text. */
+  .cast-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-5);
+    padding: 0 var(--space-1);
+  }
+  .cast {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
+  }
+  .cast-label {
+    font-family: var(--font-mono);
+    font-size: var(--text-2xs);
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--fg-muted);
+  }
+  .cast-input {
+    width: 9em;
+    background: var(--glass-strong);
+    color: var(--fg-dim);
+    border: 1px solid var(--glass-line);
+    border-radius: var(--radius-pill);
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    padding: 2px var(--space-4);
+    transition: border-color var(--dur-fast) var(--ease-out);
+  }
+  .cast-input:focus-visible {
+    outline: none;
+    border-color: var(--accent-glow);
+    color: var(--fg);
+  }
+  .cast-input.invalid {
+    border-color: var(--accent-red);
+  }
+  .cast-input:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
   }
 
   .input-row {

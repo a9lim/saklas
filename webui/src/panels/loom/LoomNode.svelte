@@ -140,10 +140,14 @@
   }
   .node.focused {
     background: var(--accent-subtle);
+    outline: 1px solid var(--accent-glow);
+    outline-offset: -1px;
   }
   .node.active {
     font-weight: var(--weight-medium);
     color: var(--fg);
+    background: var(--glass);
+    border-radius: var(--radius-sm);
     border-left-color: var(--accent-green);
   }
   .node.dead {
@@ -153,31 +157,32 @@
     opacity: 0.6;
   }
   .node.streaming {
-    background: rgba(126, 231, 135, 0.08);
+    background: color-mix(in srgb, var(--live) 8%, transparent);
+    box-shadow: var(--glow-live);
   }
+  /* Role hue lives on the left stripe; the glyph itself stays neutral
+     (the cast model — roles carry no hue), matching Chat's .role-chip b. */
   .node.user {
     border-left-color: var(--accent-blue);
-  }
-  .node.user .glyph {
-    color: var(--accent-blue);
   }
   .node.assistant {
     border-left-color: var(--accent-green);
   }
-  .node.assistant .glyph {
-    color: var(--accent-green);
-  }
   .node.system {
     border-left-color: var(--fg-muted);
   }
-  .node.system .glyph {
-    color: var(--fg-muted);
-  }
   .glyph {
     font-weight: var(--weight-bold);
-    width: 1ch;
-    text-align: center;
-    font-size: var(--text-xs);
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: rgba(255, 255, 255, 0.09);
+    color: var(--fg);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 9px;
+    flex: none;
     text-transform: uppercase;
   }
   .preview {
@@ -187,19 +192,23 @@
     min-width: 0;
   }
   .star {
-    color: var(--accent-yellow);
+    color: var(--fg-dim);
     font-size: var(--text-xs);
   }
   /* Steering-delta chip — trailing, truncated so a long delta can't
-   * blow out the row or collide with the preview text.  No own
-   * background: the chip inherits whatever the node row paints
-   * (transparent / hover / selected / streaming), so it always blends
-   * into the row's highlight state. */
+   * blow out the row or collide with the preview text.  This is where
+   * the edge label actually renders (LoomEdge only fetches/caches it),
+   * so it wears the "edge label chip" look: a glass-strong pill with a
+   * hairline, mono 2xs. */
   .steer {
-    color: var(--accent-yellow);
-    font-size: var(--text-xs);
+    color: var(--fg-dim);
+    font-family: var(--font-mono);
+    font-size: var(--text-2xs);
     font-variant-numeric: tabular-nums;
-    padding: 0 var(--space-2);
+    padding: 1px 6px;
+    border-radius: var(--radius-sm);
+    background: var(--glass-strong);
+    border: 1px solid var(--glass-line);
     max-width: 11ch;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -225,7 +234,7 @@
      them; subdued color so the badge reads as metadata, not content.
      Like .steer, no own background — inherits the row's highlight. */
   .weight {
-    color: var(--fg-dim);
+    color: var(--fg-muted);
     font-size: var(--text-xs);
     font-variant-numeric: tabular-nums;
     padding: 0 var(--space-2);

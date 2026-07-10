@@ -100,7 +100,9 @@
   }
   .line {
     width: 1px;
-    background: var(--border);
+    /* Surprise-weighted stroke lives in logit space → lens blue; the
+     * JS lineStyle still supplies the width/opacity surprise mapping. */
+    background: var(--pillar-lens);
     height: 100%;
   }
   .edge.active .line {

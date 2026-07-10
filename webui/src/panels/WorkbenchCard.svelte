@@ -39,10 +39,15 @@
   .sub {
     margin: 0;
     flex: 0 0 auto;
+    padding: 1px 7px;
+    border-radius: var(--radius-pill);
+    background: var(--glass-strong);
+    border: 1px solid var(--glass-line);
     color: var(--fg-muted);
-    font-size: var(--text-xs);
+    font-family: var(--font-mono);
+    font-size: var(--text-2xs);
     text-transform: uppercase;
-    letter-spacing: 0;
+    letter-spacing: 0.08em;
     white-space: nowrap;
   }
 

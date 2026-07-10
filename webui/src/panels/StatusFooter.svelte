@@ -108,13 +108,28 @@
     color: var(--fg-dim);
     font-size: var(--text-sm);
     font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
     min-height: 22px;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
   }
   .dot.live {
-    color: var(--accent-green);
+    color: var(--live);
+    border-radius: 50%;
+    animation: dot-pulse 1.6s var(--ease-in-out) infinite;
+  }
+  /* Reduced-motion is handled by the global kill switch in global.css. */
+  @keyframes dot-pulse {
+    0% {
+      box-shadow: 0 0 0 0 color-mix(in srgb, var(--live) 40%, transparent);
+    }
+    70% {
+      box-shadow: 0 0 0 6px transparent;
+    }
+    100% {
+      box-shadow: 0 0 0 0 transparent;
+    }
   }
   .dot.done {
     color: var(--fg-muted);
@@ -138,11 +153,11 @@
    * above the composer. */
   .pending-badge {
     margin-left: auto;
-    background: rgba(242, 184, 75, 0.12);
-    color: var(--accent-amber);
-    border: 1px solid var(--border);
+    background: var(--glass-strong);
+    color: var(--fg-dim);
+    border: 1px solid var(--glass-line);
     padding: var(--space-1) var(--space-4);
-    border-radius: var(--radius);
+    border-radius: var(--radius-pill);
     font-size: var(--text-sm);
     font-family: var(--font-ui);
   }

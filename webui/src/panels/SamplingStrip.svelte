@@ -19,7 +19,6 @@
     setSampling,
     patchSessionDefaults,
     openDrawer,
-    effectiveRawMode,
   } from "../lib/stores.svelte";
   import Slider from "../lib/Slider.svelte";
   import NumberInput from "../lib/NumberInput.svelte";
@@ -71,31 +70,8 @@
     sessionState.info?.thinking_is_optional ?? true,
   );
 
-  /** Per-message role boxes gate on family support + chat mode.  Base /
-   *  completion models (no chat template) and label-free families (Mistral
-   *  / talkie) can't relabel turns; raw mode has no roles either. */
-  const rawMode = $derived(effectiveRawMode());
-  const isBaseModel = $derived(sessionState.info?.is_base_model ?? false);
-  const userRoleSupported = $derived(
-    !isBaseModel &&
-      !rawMode &&
-      (sessionState.info?.user_role_supported ?? false),
-  );
-  const assistantRoleSupported = $derived(
-    !isBaseModel &&
-      !rawMode &&
-      (sessionState.info?.role_substitution_supported ?? false),
-  );
-
-  const ROLE_SLUG_RE = /^[a-z0-9._-]+$/;
-  const userRoleValid = $derived(
-    samplingState.user_role.trim() === "" ||
-      ROLE_SLUG_RE.test(samplingState.user_role.trim()),
-  );
-  const assistantRoleValid = $derived(
-    samplingState.assistant_role.trim() === "" ||
-      ROLE_SLUG_RE.test(samplingState.assistant_role.trim()),
-  );
+  // (The per-message role boxes moved to the composer's cast row —
+  // Chat.svelte ``speaking as`` / ``reply as`` chips, same client state.)
 
   /** Tri-state for the title attribute and disabled gate. */
   const thinkingForced = $derived(
@@ -303,48 +279,7 @@
     </label>
   </div>
 
-  <!-- Row 3: per-message role labels (roleplay scaffold).  Whatever's in
-       the box rides the next send and is stamped onto that turn —
-       immutable afterward.  Empty = standard role label. -->
-  <div class="row roles">
-    <div
-      class="control role"
-      title={userRoleSupported
-        ? "user-turn role label — sent with each message, stamped on that turn"
-        : "user-role substitution unavailable for this model / mode"}
-    >
-      <span class="label">user role</span>
-      <input
-        type="text"
-        class="role-input"
-        class:invalid={!userRoleValid}
-        bind:value={samplingState.user_role}
-        disabled={!ready || !userRoleSupported}
-        placeholder="—"
-        spellcheck="false"
-        aria-label="user role label"
-      />
-    </div>
-
-    <div
-      class="control role"
-      title={assistantRoleSupported
-        ? "assistant-turn role label — the persona the model generates the reply under"
-        : "assistant-role substitution unavailable for this model / mode"}
-    >
-      <span class="label">asst role</span>
-      <input
-        type="text"
-        class="role-input"
-        class:invalid={!assistantRoleValid}
-        bind:value={samplingState.assistant_role}
-        disabled={!ready || !assistantRoleSupported}
-        placeholder="—"
-        spellcheck="false"
-        aria-label="assistant role label"
-      />
-    </div>
-  </div>
+  <!-- (Per-message role labels moved to the composer's cast row.) -->
 
   <!-- Row 4: max tokens, alts (top-K capture), seed -->
   <div class="row">
@@ -483,15 +418,6 @@
   .row.actions > * {
     flex: 0 0 auto;
   }
-  /* Role labels are longer than the 3em label gutter the other rows
-   * reserve, so they'd otherwise start at the column's left edge instead
-   * of where the sliders / number boxes begin.  Indent each role control
-   * by one gutter so "USER ROLE" lines up with the slider's left edge;
-   * the box shortens from the left to match. */
-  .row.roles .control {
-    padding-left: calc(3em + var(--space-2));
-  }
-
   .control {
     display: flex;
     align-items: center;
@@ -563,35 +489,5 @@
     border-color: var(--border);
     cursor: not-allowed;
   }
-  /* Per-message role inputs — text boxes matched to the themed
-     NumberInput cells (``.sk-number-input``) so height / background /
-     border / type read identically across the strip.  They fill their
-     grown control like the numeric cells do. */
-  .role-input {
-    box-sizing: border-box;
-    flex: 1 1 0;
-    min-width: 0;
-    background: var(--bg-elev);
-    color: var(--fg);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    padding: var(--space-2) var(--space-3);
-    font: inherit;
-    font-family: var(--font-mono);
-    font-size: var(--text-sm);
-  }
-  .role-input::placeholder {
-    color: var(--fg-dim);
-  }
-  .role-input:focus-visible {
-    outline: none;
-    border-color: var(--accent);
-  }
-  .role-input:disabled {
-    color: var(--fg-muted);
-    cursor: not-allowed;
-  }
-  .role-input.invalid {
-    border-color: var(--accent-error);
-  }
+  /* (Role-input styles moved to Chat.svelte's cast row.) */
 </style>
