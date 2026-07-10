@@ -421,8 +421,8 @@
 
 <style>
   /* Fixed-chrome column, matching the CAA rack-grid: STEER sizes to its
-     content, PROBE takes the rest and scrolls internally so the header +
-     add form stay visible (the ProbeRack header/strips/actions shape). */
+     content up to half the inspector, PROBE takes the rest and scrolls
+     internally so the header + add form stay visible. */
   .jlens {
     display: flex;
     flex-direction: column;
@@ -446,12 +446,14 @@
   .section.steer {
     flex: 0 1 auto;
     min-height: 0;
+    max-height: 50%;
+    overflow: hidden;
   }
-  /* A pathological steer-card pile scrolls inside its own list rather
-     than eating the probe section's share of the column. */
+  /* A populated steer-card pile scrolls inside its own half-column cap
+     rather than eating the probe section's share of the inspector. */
   .steer-cards {
     overflow-y: auto;
-    max-height: 30vh;
+    min-height: 0;
   }
   .section.probe {
     flex: 1 1 0;
@@ -603,9 +605,9 @@
     outline-offset: -1px;
   }
   .add-btn {
-    background: transparent;
-    color: var(--fg-muted);
-    border: 1px solid var(--border);
+    background: color-mix(in srgb, var(--accent-blue) 10%, transparent);
+    color: var(--accent-blue);
+    border: 1px solid var(--accent-blue);
     border-radius: var(--radius);
     font-size: var(--text-sm);
     padding: 1px var(--space-3);
@@ -613,8 +615,7 @@
     flex: 0 0 auto;
   }
   .add-btn:hover:not(:disabled) {
-    color: var(--fg);
-    border-color: var(--fg-muted);
+    background: color-mix(in srgb, var(--accent-blue) 18%, transparent);
   }
   .add-btn:disabled {
     opacity: 0.5;

@@ -86,11 +86,12 @@
     border-bottom-color: var(--accent);
   }
 
-  /* Two equal flat rack sections, divided only by SteeringRack's
-   * border-bottom hairline — no gap, no nested boxes. */
+  /* STEER grows with its contents until it reaches half the inspector;
+   * PROBE owns everything left over.  fit-content keeps the empty steer
+   * rack compact while its own strips scroll once the cap is reached. */
   .rack-grid {
     display: grid;
-    grid-template-rows: minmax(0, 1fr) minmax(0, 1fr);
+    grid-template-rows: fit-content(50%) minmax(0, 1fr);
     height: 100%;
     max-height: 100%;
     min-height: 0;

@@ -53,8 +53,8 @@
     </span>
   </header>
 
-  <div class="strips" class:is-empty={count === 0}>
-    {#if count > 0}
+  {#if count > 0}
+    <div class="strips">
       {#if subspaceCount > 0}
         <h3 class="group-header subspace">subspace</h3>
         <!-- Shared "subspace along" master — the single slide magnitude every
@@ -85,12 +85,12 @@
           <SteerCard {name} {entry} />
         {/each}
       {/if}
-    {/if}
-  </div>
+    </div>
+  {/if}
 
   <!-- Launchers stay reachable in both empty + populated states — the two
        family entry points, white subspace vs purple manifold. -->
-  <div class="actions">
+  <div class="actions" class:empty={count === 0}>
     <button
       type="button"
       class="add-subspace"
@@ -161,17 +161,14 @@
     display: flex;
     flex-direction: column;
     gap: var(--space-2);
-    flex: 1 1 0;
+    /* Size from the current cards so the rack starts compact, then shrink
+     * into its own scroller when InspectorPanel's half-height cap lands. */
+    flex: 0 1 auto;
     min-height: 2.4rem;
     max-height: 100%;
     overflow-y: auto;
     padding-right: var(--space-1);
   }
-  .strips.is-empty {
-    align-items: center;
-    justify-content: center;
-  }
-
   /* Light group sub-headers — name the geometry family without competing
    * with the section title.  Accent-coded to match the cards' left
    * stripe so the eye links header → rows. */
@@ -226,18 +223,24 @@
     display: flex;
     gap: var(--space-2);
   }
+  /* With no card list between header and launchers, the header hairline is
+   * the sole divider — the same empty STEER treatment as J-LENS. */
+  .actions.empty {
+    border-top: 0;
+    padding-top: 0;
+  }
   /* The two family launchers — white subspace vs purple manifold so they
    * read as the two card families. */
   .add-subspace,
   .add-manifold {
     flex: 1 1 0;
     border: 1px solid var(--border);
-    min-height: 2.1rem;
-    padding: var(--space-4) var(--space-5);
+    padding: 2px var(--space-5);
     border-radius: var(--radius);
     font: inherit;
     font-family: var(--font-mono);
     font-size: var(--text-sm);
+    line-height: normal;
     cursor: pointer;
     transition: background var(--dur) var(--ease-out);
   }

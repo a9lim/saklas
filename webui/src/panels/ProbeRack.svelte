@@ -319,10 +319,10 @@
   .add {
     flex: 1 1 0;
     border: 1px solid var(--border);
-    padding: var(--space-3) var(--space-5);
+    padding: 2px var(--space-5);
     border-radius: var(--radius);
     font-size: var(--text-sm);
-    line-height: 1.3;
+    line-height: normal;
     cursor: pointer;
     transition: background var(--dur) var(--ease-out);
   }
