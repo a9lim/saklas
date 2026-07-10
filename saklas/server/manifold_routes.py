@@ -201,6 +201,8 @@ class FitManifoldRequest(BaseModel):
 
     sae: str | None = None
     sae_revision: str | None = None
+    layers: list[int] | Literal["workspace", "all"] | None = None
+    force: bool = False
     # Discover-mode override fields — ignored when the folder is authored.
     fit_mode: Literal["pca", "spectral", "auto"] | None = None
     hyperparams: dict[str, Any] | None = None
@@ -945,7 +947,18 @@ def register_manifold_routes(app: FastAPI) -> None:
             data = json.loads((folder / "manifold.json").read_text())
             data["fit_mode"] = new_fit_mode
             data["hyperparams"] = new_hp
-            data["nodes"] = [{"label": label} for label in pre_mf.node_labels]
+            data["nodes"] = [
+                {
+                    "label": label,
+                    **({"role": pre_mf.node_roles[idx]}
+                       if idx < len(pre_mf.node_roles)
+                       and pre_mf.node_roles[idx] is not None else {}),
+                    **({"kind": pre_mf.node_kinds[idx]}
+                       if idx < len(pre_mf.node_kinds)
+                       and pre_mf.node_kinds[idx] is not None else {}),
+                }
+                for idx, label in enumerate(pre_mf.node_labels)
+            ]
             data.pop("domain", None)
             # Staged write — a crash mid-rewrite would corrupt the
             # manifest and 400 every subsequent route call.  Same
@@ -962,6 +975,8 @@ def register_manifold_routes(app: FastAPI) -> None:
             _apply_fit_overrides()
             manifold = session.fit(
                 folder, sae=req.sae, sae_revision=req.sae_revision,
+                layers=req.layers,
+                force=req.force,
                 on_progress=on_progress,
             )
             _evict_manifold(session, namespace, name)

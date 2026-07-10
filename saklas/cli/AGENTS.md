@@ -158,7 +158,8 @@ category list through verbatim (tagged concepts only, no multi-node sweep).
   assistant-role substitution → a persona manifold.
 - `manifold fit`: positional `target` (a manifold name *or* a folder path;
   `_run_manifold_fit` resolves it and reads `fit_mode`), `-m/--model`, `-f/--force`,
-  `--sae RELEASE`, `--sae-revision REV`, plus the discover hyperparams
+  `--sae RELEASE`, `--sae-revision REV`, `--layers L1,L2,...|workspace|all`
+  (default all; subset artifacts contain only those injection layers), plus the discover hyperparams
   `--method pca|spectral|auto`, `--max-dim N`, `--min-dim N`, `--var-threshold T`,
   `--k-nn K`, `--bandwidth SIGMA`, `--max-subspace-dim R`, `--smoothing auto|0|LAMBDA`,
   `--persistence-frac F`. `-f/--force` bypasses the per-model tensor cache and
@@ -170,9 +171,10 @@ category list through verbatim (tagged concepts only, no multi-node sweep).
   authored folder runs `ManifoldExtractionPipeline` directly; a discover folder
   (`pca`/`spectral`/`auto`) has any supplied hyperparam written into
   `manifold.json` atomically *before* the fit. Supplying a discover hyperparam
-  against an authored folder is an error. For a raw unchanged fit, the runner
-  checks the tensor sidecar's `nodes_sha256` before model load and exits there;
-  actual fit sessions also use `probes=[]` so artifact training does not eagerly
+  against an authored folder is an error. Cache validation happens after model
+  load so the sidecar can be checked against the actually loaded weight
+  fingerprint (a mutable model id alone cannot prove a hit); actual fit sessions
+  use `probes=[]` so artifact training does not eagerly
   bootstrap the unrelated probe roster.
   `--method auto` defers flat-vs-curved + periodic-axis selection to
   `select_topology` per-model. `--max-subspace-dim` caps the per-layer RBF subspace
@@ -226,19 +228,25 @@ category list through verbatim (tagged concepts only, no multi-node sweep).
 - `config show`/`validate` — flags as in `config_file`.
 - `lens fit`: positional `model`, `--corpus FILE`, `--prompts N` (100),
   `--seq-len T` (128), `--dim-batch K` (8; total backward work is K-invariant,
-  so the knob trades memory for per-pass overhead — halves automatically on
-  OOM, then can grow back after clean prompts), `--checkpoint-every N` (25,
+  so the knob trades memory for per-pass overhead), `--prompt-batch B`
+  (consecutive ragged prompts per graph; CPU/CUDA default 4, MPS 1; both widths
+  halve independently on OOM and stay below a proven ceiling),
+  `--checkpoint-every N` (25,
   writes a self-contained checkpoint directly from the live accumulator; the
   full artifact is written durably once at finalization),
   `--layers L1,L2,...|workspace` (restrict source layers — skips
   all forward-graph and backward work below the lowest one, the one real
   wall-time lever; `sample` is rejected for fitting because it still includes
   layer 0 and is artifact-size/debug only), `-f/--force` (restart from zero
-  instead of resuming), `-d`, `-q`. All four numeric fit flags are positive-only.
-  A same-raw-corpus no-op can return from sidecar metadata before model load;
-  `model_layer_count` makes the `all` and `workspace` proof exact. A superset
-  stored lens satisfies narrower layer requests without refit, and missing layers
-  are fitted as a checkpointed/resumable top-up.
+  instead of resuming), `-d`, `-q`. All five numeric fit flags are positive-only.
+  An exact metadata-only no-op can run before corpus streaming/model load when
+  the sidecar's immutable model-source identity, pinned default-dataset revision
+  (or custom raw-corpus hash), layer coverage, and tensor digest all match;
+  otherwise loaded token IDs + live weights decide. A superset stored lens satisfies
+  narrower layer requests without refit, and missing layers
+  are fitted as a checkpointed/resumable top-up. A normal 100→1000 corpus
+  extension resumes when the saved token-id hash matches the new prefix; model
+  fingerprint mismatch forces a clean fit.
 - `lens show`: positional `model`, `-j`.
 - `lens top`: positionals `model` + `prompt` (raw text, no chat template),
   `-k/--top-k` (8), `--layers L1,L2,...` (default: 9 evenly spaced fitted

@@ -17,15 +17,75 @@ pipeline itself does not touch generation state.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import math
+import os
 import pathlib
+import time
+from collections.abc import Sequence
+from contextlib import nullcontext
 from typing import Any, Callable, Protocol, runtime_checkable
 
 import torch
+from safetensors.torch import load_file, save_file
 
 from saklas.core.events import EventBus, ManifoldExtracted
+from saklas.core.model import loaded_model_fingerprint, workspace_layer_indices
 from saklas.core.sae import SaeBackend
-from saklas.io.paths import tensor_filename
+from saklas.io.paths import model_dir, tensor_filename
+
+
+def _tensor_sha256(tensor: torch.Tensor) -> str:
+    """Exact original-bit digest without materializing the whole payload."""
+    digest = hashlib.sha256()
+    flat = tensor.detach().reshape(-1)
+    digest.update(str(tensor.dtype).encode("utf-8"))
+    digest.update(repr(tuple(int(dim) for dim in tensor.shape)).encode("utf-8"))
+    for start in range(0, flat.numel(), 1_048_576):
+        chunk = flat[start:start + 1_048_576].to(device="cpu").contiguous()
+        digest.update(chunk.view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
+
+
+def _prune_manifold_capture_cache(
+    folder: pathlib.Path, *, keep_stem: str,
+) -> None:
+    """Bound persistent capture-cache disk use, oldest corpus groups first."""
+    try:
+        limit_gb = float(os.environ.get("SAKLAS_MANIFOLD_CAPTURE_CACHE_GB", "8"))
+    except ValueError:
+        limit_gb = 8.0
+    if limit_gb <= 0.0:
+        return
+    limit = int(limit_gb * 1024**3)
+    groups: dict[str, list[pathlib.Path]] = {}
+    for path in folder.iterdir():
+        if not path.is_file():
+            continue
+        stem = path.name.split(".", 1)[0]
+        if len(stem) == 64:
+            groups.setdefault(stem, []).append(path)
+    sizes = {
+        stem: sum(path.stat().st_size for path in paths)
+        for stem, paths in groups.items()
+    }
+    total = sum(sizes.values())
+    if total <= limit:
+        return
+    oldest = sorted(
+        (stem for stem in groups if stem != keep_stem),
+        key=lambda stem: min(path.stat().st_mtime_ns for path in groups[stem]),
+    )
+    for stem in oldest:
+        for path in groups[stem]:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+        total -= sizes[stem]
+        if total <= limit:
+            break
 
 
 # ----------------------------------------------------------------------
@@ -153,6 +213,7 @@ class ManifoldExtractionPipeline:
         *,
         sae: str | SaeBackend | None = None,
         sae_revision: str | None = None,
+        layer_indices: "Sequence[int] | str | None" = None,
         force: bool = False,
         on_progress: Callable[[str], None] | None = None,
     ):
@@ -177,10 +238,10 @@ class ManifoldExtractionPipeline:
         the corpus is unchanged.
         """
         from saklas.core.manifold import (
+            DEFAULT_N_COMPONENTS,
             CustomDomain,
             Manifold,
             compute_manifold_node_stats,
-            compute_node_reduced_covariance,
             compute_node_reduced_covariance_from_rows,
             discover_coords,
             domain_from_spec,
@@ -205,24 +266,60 @@ class ManifoldExtractionPipeline:
             if on_progress:
                 on_progress(msg)
 
-        mf = ManifoldFolder.load(pathlib.Path(folder))
+        if sae_revision is not None and sae is None:
+            raise ValueError("sae_revision requires an SAE release")
+        fit_started = time.perf_counter()
+        mf = ManifoldFolder.load(
+            pathlib.Path(folder), verify_manifest=False,
+        )
         nodes_sha = mf.nodes_sha256()
+        model = self._handle.model
+        layers = self._handle.layers
+        n_layers = len(layers)
+        if layer_indices is None or layer_indices == "all":
+            requested_fit_layers = list(range(n_layers))
+        elif layer_indices == "workspace":
+            requested_fit_layers = workspace_layer_indices(
+                range(n_layers), n_layers,
+            )
+        elif isinstance(layer_indices, str):
+            try:
+                requested_fit_layers = sorted({
+                    int(part.strip()) for part in layer_indices.split(",")
+                    if part.strip()
+                })
+            except ValueError as exc:
+                raise ValueError(
+                    "layer_indices must be 'all', 'workspace', or a "
+                    "comma-separated integer list"
+                ) from exc
+        else:
+            requested_fit_layers = sorted({int(idx) for idx in layer_indices})
+        if not requested_fit_layers:
+            raise ValueError("layer_indices must name at least one layer")
+        if any(idx < 0 or idx >= n_layers for idx in requested_fit_layers):
+            raise ValueError(
+                f"layer_indices must lie in [0, {n_layers}); got "
+                f"{requested_fit_layers}"
+            )
+        base_model = getattr(model, "_orig_mod", model)
+        config = getattr(base_model, "config", getattr(model, "config", None))
+        model_fingerprint = loaded_model_fingerprint(
+            model, self._handle.model_id,
+        )
 
-        # Resolve the SAE backend once (lazy import — non-SAE callers
-        # never touch the SAE layer).
+        # Resolve the requested variant name before touching SAELens.  A fitted
+        # tensor is self-contained model-space data, so a valid cache hit must
+        # not import the optional backend, consult its registry, or load any SAE
+        # weights.  Unpinned string requests accept the revision recorded in the
+        # cached sidecar; explicit revisions remain exact.
         sae_backend: SaeBackend | None
         sae_release: str | None
         if sae is None:
             sae_backend = None
             sae_release = None
         elif isinstance(sae, str):
-            from saklas.core.sae import load_sae_backend
-            sae_backend = load_sae_backend(
-                sae,
-                revision=sae_revision,
-                model_id=self._handle.model_id,
-                device=self._handle.device,
-            )
+            sae_backend = None
             sae_release = sae
         else:
             sae_backend = sae
@@ -232,49 +329,14 @@ class ManifoldExtractionPipeline:
             self._handle.model_id, release=sae_release,
         )
 
-        # Cache hit: tensor present + every fit-affecting input unchanged.
-        # ``nodes_sha256`` folds in the corpus, plus either the domain
-        # spec + node coords (authored) or the fit_mode + hyperparams
-        # (discover); ``sae_revision`` is the SAE the centroids are
-        # reconstructed through and does not ride the filename, so it is
-        # checked here or a stale tensor is served.
-        sidecar_path = tensor_path.with_suffix(".json")
-        cached_revision = (
-            sae_backend.revision if sae_backend is not None else None
-        )
-        if not force and tensor_path.exists() and sidecar_path.exists():
-            try:
-                sc = ManifoldSidecar.load(sidecar_path)
-            except (KeyError, ValueError):
-                sc = None
-            if (
-                sc is not None
-                and sc.nodes_sha256 == nodes_sha
-                and sc.sae_revision == cached_revision
-            ):
-                _progress(f"Loaded cached manifold '{mf.name}'.")
-                manifold = load_manifold(tensor_path)
-                self._events.emit(ManifoldExtracted(
-                    name=mf.name, manifold=manifold,
-                    metadata=dict(manifold.metadata),
-                ))
-                return manifold
-
-        # Parse/validate node JSON only after a cache miss.  ``nodes_sha256``
-        # already read the raw bytes needed for staleness; a hit should not pay a
-        # second JSON pass over a large roster.
+        # Compute the token-exact capture identity before accepting the final
+        # tensor cache.  Source-text hashes alone miss baseline-prompt edits and
+        # tokenizer/chat-template changes; both alter the actual residuals even
+        # when the authored node files are byte-identical.
         node_groups = mf.node_groups()
-        model = self._handle.model
         tokenizer = self._handle.tokenizer
-        layers = self._handle.layers
         device = self._handle.device
-        n_layers = len(layers)
         K = len(node_groups)
-
-        # ``model_type`` is the family-key for the role-header registry —
-        # only needed when any node carries a custom ``role``.  We resolve
-        # it once up front and pass it on each centroid call regardless;
-        # ``_encode_and_capture_all`` only consults it when ``role`` is set.
         model_type = getattr(getattr(model, "config", None), "model_type", None)
         node_roles = mf._roles_padded()
         node_kinds = mf._kinds_padded()
@@ -286,15 +348,143 @@ class ManifoldExtractionPipeline:
                 f"config has no 'model_type' — cannot resolve the role-header "
                 f"registry entry"
             )
+        from saklas.core.vectors import _load_baseline_prompts
+        if mf.template_ref is not None:
+            from saklas.io.templates import resolve_template
+
+            tmpl = resolve_template(mf.template_ref)
+            baseline_prompts = [ctx.messages() for ctx in tmpl.contexts]
+        else:
+            baseline_prompts = _load_baseline_prompts()
+        prepared_rows: list[tuple[torch.Tensor, int]] | None = None
+        capture_sha: str | None = None
+        if callable(tokenizer):
+            from saklas.core.vectors import _prepare_capture_batch
+
+            flat_prompts: list[str | list[dict[str, str]]] = []
+            flat_responses: list[str] = []
+            flat_roles: list[str | None] = []
+            k_prompts = len(baseline_prompts)
+            for (_label, responses), role in zip(
+                node_groups, node_roles, strict=True,
+            ):
+                for row_idx, response in enumerate(responses):
+                    flat_prompts.append(baseline_prompts[row_idx % k_prompts])
+                    flat_responses.append(response)
+                    flat_roles.append(role)
+            prepared_rows = _prepare_capture_batch(
+                tokenizer, flat_prompts, flat_responses, device,
+                roles=flat_roles, model_type=model_type,
+            )
+            capture_model_fingerprint = {
+                "model_id": self._handle.model_id,
+                "model_class": (
+                    f"{type(base_model).__module__}.{type(base_model).__qualname__}"
+                ),
+                "commit": getattr(config, "_commit_hash", None),
+                "name_or_path": getattr(config, "_name_or_path", None),
+                "model_type": getattr(config, "model_type", None),
+                "capture_version": 3,
+                "fingerprint": model_fingerprint,
+            }
+            capture_hash = hashlib.sha256(json.dumps(
+                capture_model_fingerprint, sort_keys=True, separators=(",", ":"),
+            ).encode("utf-8"))
+            capture_hash.update(json.dumps(
+                {"node_sizes": [len(responses) for _label, responses in node_groups]},
+                sort_keys=True, separators=(",", ":"),
+            ).encode("utf-8"))
+            for ids, content_end in prepared_rows:
+                capture_hash.update(
+                    repr((ids[0].tolist(), int(content_end))).encode("utf-8")
+                )
+            capture_sha = capture_hash.hexdigest()
+
+        # Cache hit: tensor present + every fit-affecting input unchanged.
+        # ``nodes_sha256`` folds in the corpus, plus either the domain
+        # spec + node coords (authored) or the fit_mode + hyperparams
+        # (discover); ``sae_revision`` is the SAE the centroids are
+        # reconstructed through and does not ride the filename, so it is
+        # checked here or a stale tensor is served.
+        sidecar_path = tensor_path.with_suffix(".json")
+        target_integrity_ok = (
+            not mf.files and not tensor_path.exists() and not sidecar_path.exists()
+        )
+        expected_target_files = {
+            name: mf.files[name]
+            for name in (tensor_path.name, sidecar_path.name)
+            if name in mf.files
+        }
+        if len(expected_target_files) == 2:
+            from saklas.io.packs import verify_integrity
+
+            target_integrity_ok, _bad = verify_integrity(
+                pathlib.Path(folder), expected_target_files,
+            )
+        cached_revision = (
+            sae_revision if isinstance(sae, str)
+            else sae_backend.revision if sae_backend is not None
+            else None
+        )
+        if (
+            not force and target_integrity_ok
+            and tensor_path.exists() and sidecar_path.exists()
+        ):
+            try:
+                sc = ManifoldSidecar.load(sidecar_path)
+            except (KeyError, ValueError):
+                sc = None
+            if (
+                sc is not None
+                and sc.nodes_sha256 == nodes_sha
+                and sc.sae_release == sae_release
+                and (
+                    sc.sae_revision == cached_revision
+                    if cached_revision is not None or sae_release is None
+                    else True
+                )
+                and sc.model_fingerprint == model_fingerprint
+                and sc.capture_sha256 == capture_sha
+                and (
+                    sc.fitted_layers == requested_fit_layers
+                    if sae_release is None or layer_indices is not None
+                    else sc.sae_full_coverage
+                )
+            ):
+                _progress(f"Loaded cached manifold '{mf.name}'.")
+                manifold = load_manifold(tensor_path)
+                self._events.emit(ManifoldExtracted(
+                    name=mf.name, manifold=manifold,
+                    metadata=dict(manifold.metadata),
+                ))
+                return manifold
+
+        if isinstance(sae, str):
+            from saklas.core.sae import load_sae_backend
+
+            sae_backend = load_sae_backend(
+                sae,
+                revision=sae_revision,
+                model_id=self._handle.model_id,
+                device=self._handle.device,
+            )
 
         # SAE coverage — fail-fast.  Validate the fit-layer set here, before
         # the expensive per-node centroid pooling, so an SAE release that
         # covers none of the model's layers errors immediately instead of
         # after K node passes.
         if sae_backend is not None:
-            fit_layers = sorted(
-                set(sae_backend.layers) & set(range(n_layers))
-            )
+            covered = set(sae_backend.layers) & set(range(n_layers))
+            if layer_indices is not None:
+                missing = sorted(set(requested_fit_layers) - covered)
+                if missing:
+                    raise SaeCoverageError(
+                        f"SAE release {sae_backend.release!r} does not cover "
+                        f"requested layers {missing}"
+                    )
+                fit_layers = requested_fit_layers
+            else:
+                fit_layers = sorted(covered)
             if not fit_layers:
                 raise SaeCoverageError(
                     f"SAE release {sae_backend.release!r} covers no layers "
@@ -302,7 +492,7 @@ class ManifoldExtractionPipeline:
                 )
             feature_space = f"sae-{sae_backend.release}"
         else:
-            fit_layers = list(range(n_layers))
+            fit_layers = requested_fit_layers
             feature_space = "raw"
 
         # 1. Per-node centroids (one forward pass per response) — shared
@@ -313,39 +503,262 @@ class ManifoldExtractionPipeline:
         #    ``compute_node_centroid`` only when set (persona-baselined fit);
         #    a ``None`` role pools under the standard assistant (swap-back)
         #    baseline.
-        from saklas.core.vectors import _load_baseline_prompts
-        # Templated manifolds carry their own elicitation prefixes — the
-        # referenced template's **multi-turn contexts** — pooled 1:1 against each
-        # node's slot-filled assistant responses (corpus length == #contexts, so
-        # ``response[i]`` rides ``contexts[i]``'s history). This renders the real
-        # conversation prefix (``[..., user: "what day is it?", assistant: "today
-        # is monday"]``) rather than gluing the day statement onto an unrelated
-        # global baseline prompt. A non-templated discover/A2 folder uses the
-        # shared globals.
-        if mf.template_ref is not None:
-            from saklas.io.templates import resolve_template
-            tmpl = resolve_template(mf.template_ref)
-            baseline_prompts = [ctx.messages() for ctx in tmpl.contexts]
-        else:
-            baseline_prompts = _load_baseline_prompts()
-        # Curved raw authored/spectral fits need within-node reduced covariance
+        # Curved raw fits need within-node reduced covariance
         # after the basis exists to fit the fuzzy sigma field.  Retain the
-        # first-pass per-response rows for those known-curved modes so the sigma
-        # pass can avoid a second model capture.  Auto topology is intentionally
-        # left on the streaming-centroid path until it resolves; otherwise a
-        # flat auto/persona fit could retain a very large row stack needlessly.
+        # first-pass per-response rows in a temporary mmap-backed layer-major
+        # spool.  Auto participates too: a resolved-flat fit deletes the spool,
+        # while auto-curved avoids repeating every model forward.  The spool
+        # keeps source dtype, so speculative auto retention costs bounded RSS
+        # and half the disk traffic for fp16/bf16 models.
         retain_node_rows = (
-            sae_backend is None and mf.fit_mode in {"authored", "spectral"}
+            sae_backend is None and mf.fit_mode in {"authored", "spectral", "auto"}
         )
-        _progress(
-            f"Pooling {len(node_groups)} nodes in fit-wide batches "
-            f"({sum(len(responses) for _, responses in node_groups)} responses)..."
+        # Capture identity is deliberately narrower than ``nodes_sha``: geometry
+        # and fit hyperparameters do not change residual activations. Hash the
+        # actual rendered token rows + pool positions, node partition, and a
+        # loaded-model fingerprint so ordinary geometry/smoothing/layer-scope
+        # refits can reuse or top up capture without trusting raw source text or
+        # tokenizer identity.
+        capture_dir = model_dir(self._handle.model_id) / "manifold_capture"
+        cache_stem = (
+            capture_sha if capture_sha is not None else None
         )
-        per_node, retained_rows = compute_manifold_node_stats(
-            model, tokenizer, layers, device, node_groups, baseline_prompts,
-            roles=node_roles, model_type=model_type,
-            layer_indices=fit_layers, retain_rows=retain_node_rows,
+        centroid_cache = (
+            capture_dir / f"{cache_stem}.centroids.safetensors"
+            if cache_stem is not None else None
         )
+        row_cache = (
+            capture_dir / f"{cache_stem}.rows.safetensors"
+            if cache_stem is not None else None
+        )
+        cache_meta = (
+            capture_dir / f"{cache_stem}.json"
+            if cache_stem is not None else None
+        )
+        node_sizes = [len(responses) for _label, responses in node_groups]
+        stacks_cached: dict[int, torch.Tensor] = {}
+        cached_rows = None
+        centroid_layers: set[int] = set()
+        row_layers: set[int] = set()
+        cached_row_shapes: dict[str, object] = {}
+        cached_row_dtypes: dict[str, object] = {}
+        cached_row_digests: dict[str, object] = {}
+        if (
+            not force and cache_meta is not None and cache_meta.exists()
+            and centroid_cache is not None and centroid_cache.exists()
+        ):
+            try:
+                from saklas.core.manifold import ActivationRowStore
+                from saklas.io.packs import verify_integrity
+
+                with open(cache_meta) as handle:
+                    meta = json.load(handle)
+                if (
+                    int(meta.get("format_version", 0)) != 2
+                    or meta.get("capture_sha256") != capture_sha
+                    or [int(size) for size in meta.get("node_sizes", [])]
+                    != node_sizes
+                ):
+                    raise ValueError("capture cache metadata identity mismatch")
+                cache_files = dict(meta.get("files", {}))
+                ok, _bad = verify_integrity(capture_dir, cache_files)
+                if not ok:
+                    raise ValueError("capture cache payload digest mismatch")
+                cached = load_file(str(centroid_cache), device="cpu")
+                stacks_cached = {
+                    int(key.split("_", 1)[1]): value.to(torch.float32)
+                    for key, value in cached.items() if key.startswith("layer_")
+                }
+                centroid_layers = {
+                    int(idx) for idx in meta.get("centroid_layers", [])
+                }
+                row_layers = {int(idx) for idx in meta.get("row_layers", [])}
+                if centroid_cache.name not in cache_files:
+                    raise ValueError("capture cache metadata omits payload digest")
+                cached_row_shapes = dict(meta.get("row_shapes", {}))
+                cached_row_dtypes = dict(meta.get("row_dtypes", {}))
+                cached_row_digests = dict(meta.get("row_tensor_sha256", {}))
+                if set(stacks_cached) != centroid_layers or any(
+                    value.ndim != 2 or int(value.shape[0]) != K
+                    or not bool(torch.isfinite(value).all())
+                    for value in stacks_cached.values()
+                ):
+                    raise ValueError("centroid cache shape/finite check failed")
+                expected_centroid_shapes = dict(meta.get("centroid_shapes", {}))
+                if any(
+                    expected_centroid_shapes.get(str(idx))
+                    != list(stacks_cached[idx].shape)
+                    for idx in centroid_layers
+                ):
+                    raise ValueError("centroid cache metadata shape mismatch")
+                if not row_layers <= centroid_layers:
+                    raise ValueError("row-cache layers exceed centroid coverage")
+                if row_layers and retain_node_rows:
+                    if row_cache is None or not row_cache.exists():
+                        raise ValueError("capture metadata names a missing row cache")
+                    selected_row_layers = sorted(row_layers & set(fit_layers))
+                    if selected_row_layers:
+                        cached_rows = ActivationRowStore.load(
+                            row_cache, node_sizes, layer_indices=selected_row_layers,
+                        )
+                        if any(
+                            cached_row_shapes.get(str(idx))
+                            != list(cached_rows.flat_rows(idx).shape)
+                            or cached_row_dtypes.get(str(idx))
+                            != str(cached_rows.flat_rows(idx).dtype)
+                            or cached_row_digests.get(str(idx))
+                            != _tensor_sha256(cached_rows.flat_rows(idx))
+                            for idx in selected_row_layers
+                        ):
+                            raise ValueError("row cache metadata shape/dtype mismatch")
+            except (
+                OSError, RuntimeError, ValueError, KeyError,
+                json.JSONDecodeError, TypeError,
+            ):
+                stacks_cached = {}
+                centroid_layers = set()
+                row_layers = set()
+                cached_row_shapes = {}
+                cached_row_dtypes = {}
+                cached_row_digests = {}
+                if cached_rows is not None:
+                    cached_rows.close()
+                    cached_rows = None
+
+        needed_layers = set(fit_layers) - centroid_layers
+        if retain_node_rows:
+            needed_layers |= set(fit_layers) - row_layers
+        capture_layers = sorted(needed_layers)
+        new_rows = None
+        if capture_layers:
+            capture_started = time.perf_counter()
+            _progress(
+                f"Pooling {len(node_groups)} nodes in fit-wide batches "
+                f"({sum(node_sizes)} responses, layers {capture_layers})..."
+            )
+            from saklas.core.vectors import _ReusablePooledCapture
+
+            # Protocol-only test/dummy handles can expose opaque layer
+            # sentinels while monkeypatching the encoder seam.  Production HF
+            # blocks are Modules; only they can host the fit-scoped reusable
+            # hooks.  The null context preserves that explicit encoder seam.
+            reusable = all(
+                hasattr(layers[idx], "register_forward_hook")
+                for idx in capture_layers
+            )
+            capture_scope = (
+                _ReusablePooledCapture(model, layers, capture_layers)
+                if reusable else nullcontext(None)
+            )
+            with capture_scope as capture_context:
+                newly_captured, new_rows = compute_manifold_node_stats(
+                    model, tokenizer, layers, device, node_groups, baseline_prompts,
+                    roles=node_roles, model_type=model_type,
+                    layer_indices=capture_layers, retain_rows=retain_node_rows,
+                    prepared_rows=prepared_rows,
+                    capture_context=capture_context,
+                )
+            for idx in capture_layers:
+                stacks_cached[idx] = torch.stack([
+                    newly_captured[node_idx][idx] for node_idx in range(K)
+                ]).to(torch.float32).contiguous()
+            centroid_layers.update(capture_layers)
+            capture_elapsed = time.perf_counter() - capture_started
+            _progress(
+                f"Captured {sum(node_sizes)} rows across "
+                f"{len(capture_layers)} layers in "
+                f"{capture_elapsed:.1f}s."
+            )
+        elif fit_layers:
+            _progress("Reusing token-exact manifold activation capture cache...")
+
+        retained_rows = None
+        if retain_node_rows:
+            from saklas.core.manifold import ActivationRowStore
+
+            if cached_rows is not None and new_rows is None:
+                retained_rows = cached_rows
+                cached_rows = None
+            elif new_rows is not None and cached_rows is None:
+                retained_rows = new_rows
+                new_rows = None
+                row_layers.update(capture_layers)
+            else:
+                assert cached_rows is not None and new_rows is not None
+                retained_rows = ActivationRowStore(node_sizes)
+                flat_indices = torch.arange(sum(node_sizes), dtype=torch.long)
+                for store in (cached_rows, new_rows):
+                    for idx in store.layer_indices:
+                        retained_rows.write(
+                            idx, flat_indices, store.flat_rows(idx),
+                        )
+                row_layers = set(retained_rows.layer_indices)
+                cached_rows.close()
+                new_rows.close()
+                cached_rows = None
+                new_rows = None
+
+        per_node = [
+            {idx: stacks_cached[idx][node_idx] for idx in fit_layers}
+            for node_idx in range(K)
+        ]
+
+        if capture_layers and centroid_cache is not None and cache_meta is not None:
+            from saklas.io.atomic import write_json_atomic
+            from saklas.io.packs import hash_file
+
+            try:
+                capture_dir.mkdir(parents=True, exist_ok=True)
+                tmp = centroid_cache.with_suffix(centroid_cache.suffix + ".tmp")
+                save_file({
+                    f"layer_{idx}": stacks_cached[idx]
+                    for idx in sorted(centroid_layers)
+                }, str(tmp))
+                os.replace(tmp, centroid_cache)
+                if retained_rows is not None and row_cache is not None:
+                    retained_rows.persist(row_cache)
+                    row_layers = set(retained_rows.layer_indices)
+                elif not row_layers and row_cache is not None and row_cache.exists():
+                    row_cache.unlink()
+                files = {centroid_cache.name: hash_file(centroid_cache)}
+                row_digests = (
+                    {
+                        str(idx): _tensor_sha256(retained_rows.flat_rows(idx))
+                        for idx in retained_rows.layer_indices
+                    } if retained_rows is not None else cached_row_digests
+                )
+                write_json_atomic(cache_meta, {
+                    "format_version": 2,
+                    "capture_sha256": capture_sha,
+                    "node_sizes": node_sizes,
+                    "centroid_layers": sorted(centroid_layers),
+                    "row_layers": sorted(row_layers),
+                    "centroid_shapes": {
+                        str(idx): list(stacks_cached[idx].shape)
+                        for idx in sorted(centroid_layers)
+                    },
+                    "row_shapes": (
+                        {
+                            str(idx): list(retained_rows.flat_rows(idx).shape)
+                            for idx in retained_rows.layer_indices
+                        } if retained_rows is not None else cached_row_shapes
+                    ),
+                    "row_dtypes": (
+                        {
+                            str(idx): str(retained_rows.flat_rows(idx).dtype)
+                            for idx in retained_rows.layer_indices
+                        } if retained_rows is not None else cached_row_dtypes
+                    ),
+                    "row_tensor_sha256": row_digests,
+                    "files": files,
+                })
+                assert cache_stem is not None
+                _prune_manifold_capture_cache(capture_dir, keep_stem=cache_stem)
+            except (OSError, RuntimeError, ValueError) as exc:
+                # The fit result is already in memory and remains valid. A cache
+                # write/prune failure must not turn successful model work into a
+                # failed fit; next run simply captures again.
+                _progress(f"Activation capture cache write skipped: {exc}")
 
         # 1b. Monopolar (concept-vs-neutral).  A 1-node ``pca`` folder has no
         #     second pole to span an affine subspace, so it can only mean one
@@ -414,6 +827,9 @@ class ManifoldExtractionPipeline:
                     else "manifold_monopolar"
                 ),
                 "nodes_sha256": nodes_sha,
+                "model_fingerprint": model_fingerprint,
+                "capture_sha256": capture_sha,
+                "fitted_layers": list(fit_layers),
                 "monopolar": True,
                 # The fold keeps the raw δ̂ basis (``concept − ν`` cancels
                 # common-mode like DiM by differencing), so the subspace is
@@ -426,6 +842,10 @@ class ManifoldExtractionPipeline:
             if sae_backend is not None:
                 metadata["sae_release"] = sae_backend.release
                 metadata["sae_revision"] = sae_backend.revision
+                metadata["sae_ids_by_layer"] = dict(
+                    getattr(sae_backend, "sae_ids_by_layer", {})
+                )
+                metadata["sae_full_coverage"] = layer_indices is None
             if any_role:
                 metadata["node_roles"] = list(node_roles)
             if any_kind:
@@ -436,6 +856,9 @@ class ManifoldExtractionPipeline:
             self._events.emit(ManifoldExtracted(
                 name=mf.name, manifold=manifold, metadata=metadata,
             ))
+            _progress(
+                f"Fit complete in {time.perf_counter() - fit_started:.1f}s."
+            )
             return manifold
 
         # 2. Resolve the Mahalanobis whitener once.  It is mandatory for an
@@ -533,6 +956,8 @@ class ManifoldExtractionPipeline:
         # branches on: it equals ``mf.fit_mode`` for authored / pca / spectral,
         # and the topology ``select_topology`` picks for ``fit_mode="auto"``.
         effective_fit_mode = mf.fit_mode
+        auto_rbf_plan = None
+        auto_fisher_bases: dict[int, torch.Tensor] = {}
         if mf.fit_mode == "authored":
             domain = domain_from_spec(mf.domain)
             node_coords = torch.tensor(mf.node_coords, dtype=torch.float32)
@@ -563,8 +988,13 @@ class ManifoldExtractionPipeline:
                 max_dim=int(st_hyper.get("max_dim", 8)),
                 smoothing=st_hyper.get("smoothing", "auto"),
                 persistence_frac=float(st_hyper.get("persistence_frac", 0.5)),
+                score_dim=int(
+                    st_hyper.get("max_subspace_dim", DEFAULT_N_COMPONENTS)
+                ),
             )
             effective_fit_mode = choice.fit_mode
+            auto_rbf_plan = choice.rbf_plan
+            auto_fisher_bases = choice.fisher_bases
             domain = choice.domain
             node_coords = choice.coords
             node_params = domain.embed(node_coords)
@@ -720,7 +1150,7 @@ class ManifoldExtractionPipeline:
         )
         layer_subs = {}
         mahalanobis_share: dict[int, float] = {}
-        rbf_plan = None
+        rbf_plan = auto_rbf_plan
         # Per-layer penalized-RBF provenance (curved + ``smoothing`` only):
         # ``{layer: {"lambda", "edf", "gcv"}}`` from the GCV select, for the
         # sidecar + inspector.  Empty for exact / flat fits.
@@ -778,7 +1208,9 @@ class ManifoldExtractionPipeline:
                     whitener=maha_whitener, layer=idx,
                     whitened_gram=layer_grams[idx],
                     whitened_rows=whitened_rows[idx],
-                    orient_to=0, **affine_kwargs,
+                    orient_to=0,
+                    basis_override=auto_fisher_bases.get(idx),
+                    **affine_kwargs,
                 )
                 raw_fits[idx] = (sub, mu_coords)
             # Per-axis DLS straddle over all fit layers at once (flat → DLS;
@@ -801,9 +1233,10 @@ class ManifoldExtractionPipeline:
             # CURVED (authored / spectral): RBF surface fit, neutral-anchored.
             # ``curved_smoothing`` is ``None`` for authored (exact-interpolation
             # contract) and the GCV / fixed-λ selector for ``spectral``.
-            rbf_plan = prepare_rbf_fit_plan(
-                node_params, smoothing=curved_smoothing,
-            )
+            if rbf_plan is None:
+                rbf_plan = prepare_rbf_fit_plan(
+                    node_params, smoothing=curved_smoothing,
+                )
             for idx in fit_layers:
                 stacked = stacks[idx]
                 # ``neutral_mean`` neutral-anchors the frame; ``maha_whitener``
@@ -818,6 +1251,7 @@ class ManifoldExtractionPipeline:
                     smoothing=curved_smoothing,
                     rbf_info=_rbf_info,
                     rbf_plan=rbf_plan,
+                    basis_override=auto_fisher_bases.get(idx),
                     **fit_kwargs,
                 )
                 layer_subs[idx] = sub
@@ -869,11 +1303,14 @@ class ManifoldExtractionPipeline:
                 node_coords = (node_coords - neutral_coords).contiguous()
                 node_params = domain.embed(node_coords)
 
-        # 4b. Fuzzy-manifold σ-field (curved + raw only).  A **second** fit-time
-        #     capture pass accumulates each node's within-node reduced ``(R, R)``
-        #     covariance (``compute_node_reduced_covariance`` — needs the
-        #     just-fitted per-layer basis; known-curved modes retained the first
-        #     capture's rows, while auto-curved falls back to a second pass), then
+        if effective_fit_mode == "pca" and retained_rows is not None:
+            retained_rows.close()
+            retained_rows = None
+
+        # 4b. Fuzzy-manifold σ-field (curved + raw only).  The source-dtype
+        #     activation-row spool retained from the first capture accumulates
+        #     each node's within-node reduced ``(R, R)`` covariance after the
+        #     basis exists, then
         #     ``fit_sigma_field`` reduces it to one off-surface ``σ`` per node and
         #     fits a ``log σ`` RBF onto each ``LayerSubspace`` (mutated in place).
         #     This gives the surface a *tube thickness* that soft-``onto`` steers
@@ -883,29 +1320,21 @@ class ManifoldExtractionPipeline:
         #     is vacuous) — both leave ``σ`` absent ⇒ exact zero-thickness legacy.
         sigma_field_per_layer: dict[int, dict[str, float]] = {}
         if effective_fit_mode != "pca" and sae_backend is None and layer_subs:
-            covariance_source = (
-                "retained activation rows" if retained_rows is not None
-                else "second capture pass"
-            )
+            if retained_rows is None:
+                raise RuntimeError(
+                    "curved raw manifold fit lost its retained activation-row "
+                    "spool before the sigma-field pass"
+                )
             _progress(
                 f"Fitting within-node σ-field across {len(layer_subs)} layers "
-                f"({K} nodes, {covariance_source})..."
+                f"({K} nodes, retained activation rows)..."
             )
-            if retained_rows is not None:
-                node_covs = [
-                    compute_node_reduced_covariance_from_rows(rows, layer_subs)
-                    for rows in retained_rows
-                ]
-            else:
-                node_covs = []
-                for (label, responses), role in zip(
-                    node_groups, node_roles, strict=True,
-                ):
-                    node_covs.append(compute_node_reduced_covariance(
-                        model, tokenizer, layers, device, responses,
-                        baseline_prompts, layer_subs,
-                        role=role, model_type=model_type,
-                    ))
+            node_covs = [
+                compute_node_reduced_covariance_from_rows(rows, layer_subs)
+                for rows in retained_rows
+            ]
+            retained_rows.close()
+            retained_rows = None
             sigma_field_per_layer = fit_sigma_field(
                 layer_subs, domain, node_coords, node_covs,
                 smoothing=(
@@ -954,6 +1383,9 @@ class ManifoldExtractionPipeline:
         metadata: dict[str, Any] = {
             "method": method,
             "nodes_sha256": nodes_sha,
+            "model_fingerprint": model_fingerprint,
+            "capture_sha256": capture_sha,
+            "fitted_layers": list(fit_layers),
             # Provenance only (nothing branches on these at load).  The
             # whitener is mandatory for an activation-space fit, so both the
             # per-layer share weighting and the PCA *subspace selection* are
@@ -987,6 +1419,10 @@ class ManifoldExtractionPipeline:
         if sae_backend is not None:
             metadata["sae_release"] = sae_backend.release
             metadata["sae_revision"] = sae_backend.revision
+            metadata["sae_ids_by_layer"] = dict(
+                getattr(sae_backend, "sae_ids_by_layer", {})
+            )
+            metadata["sae_full_coverage"] = layer_indices is None
         if any_role:
             # Per-node roles ride into the sidecar so `manifold
             # show` and the inspector surfaces can report "this node was
@@ -1006,4 +1442,5 @@ class ManifoldExtractionPipeline:
         self._events.emit(ManifoldExtracted(
             name=mf.name, manifold=manifold, metadata=metadata,
         ))
+        _progress(f"Fit complete in {time.perf_counter() - fit_started:.1f}s.")
         return manifold

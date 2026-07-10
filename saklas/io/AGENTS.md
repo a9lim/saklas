@@ -329,8 +329,8 @@ Euclidean transfer). The fitted map round-trips under the *target* model dir
 
 The per-model Jacobian-lens artifact — `models/<safe_model_id>/jlens.
 {safetensors,json}`, peer to the neutral-activation cache and shaped like it
-(`layer_<idx>` tensor keys + atomic JSON sidecar). `LENS_FORMAT_VERSION = 1`;
-a wrong version, non-finite tensors, or a corrupt sidecar all log a warning and
+(`layer_<idx>` tensor keys + atomic JSON sidecar). `LENS_FORMAT_VERSION = 2`;
+a wrong version, missing/mismatched payload digest, non-finite tensors, or a corrupt sidecar all log a warning and
 read as "no lens" (`load_lens → None`) rather than crash — the caller decides
 whether to error (`LensNotFittedError` with the `lens fit` hint) or re-fit.
 Storage is **fp16** (deliberately unlike the neutral cache's fp32 invariant:
@@ -338,7 +338,8 @@ J entries are O(1) so range is no constraint, and nothing here feeds a
 covariance inversion), promoted to fp32 on load. The sidecar records `method`,
 `n_prompts`, `d_model`, `source_layers`, the corpus spec + token-id sha256 (the
 resume/staleness key), optional raw-corpus sha/count metadata for model-load-free
-no-op checks, `seq_len`, `dim_batch`, `skip_first_positions`, and the model's
+no-op checks, `seq_len`, `dim_batch`, `skip_first_positions`, exact model
+source/live-weight identities, tensor sha256, and the model's
 layer count (needed to prove `all`/`workspace` coverage without loading it).
 Loading uses `safe_open` one layer at a time, so fp16 source storage is released
 as the fp32 lens is materialized rather than coexisting as a full mapping. Resumable

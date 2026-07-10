@@ -125,6 +125,7 @@ def test_sae_lens_backend_encodes_and_decodes(monkeypatch: pytest.MonkeyPatch):
     import types
 
     fake_sae_lens = types.ModuleType("sae_lens")
+    seen_revisions: list[str | None] = []
 
     class FakeSAE:
         def __init__(self, d_in: Any, d_sae: Any, hook_layer: Any) -> None:
@@ -142,7 +143,11 @@ def test_sae_lens_backend_encodes_and_decodes(monkeypatch: pytest.MonkeyPatch):
             return f @ self.W_dec
 
         @classmethod
-        def from_pretrained(cls, release: Any, sae_id: Any, device: Any = None) -> Any:
+        def from_pretrained(
+            cls, release: Any, sae_id: Any, device: Any = None,
+            revision: str | None = None,
+        ) -> Any:
+            seen_revisions.append(revision)
             hook_layer = int(sae_id.split("_")[1])
             return (
                 cls(d_in=4, d_sae=4, hook_layer=hook_layer),
@@ -163,12 +168,26 @@ def test_sae_lens_backend_encodes_and_decodes(monkeypatch: pytest.MonkeyPatch):
     backend = load_sae_backend("mock-canonical", model_id="test-model", device="cpu")
     assert backend.layers == frozenset({2, 5, 8})
     assert backend.release == "mock-canonical"
+    # Registry resolution is cheap; weights stay cold until a covered layer is
+    # actually visited, and only the current layer remains resident.
+    assert backend._active_sae is None
 
     h = torch.randn(3, 4)
     f = backend.encode_layer(5, h)
     assert f.shape == (3, 4)
+    sae5 = backend._active_sae
     v = backend.decode_layer(5, torch.randn(4))
     assert v.shape == (4,)
+    assert backend._active_sae is sae5
+    backend.encode_layer(8, h)
+    assert backend._active_layer == 8
+    assert backend._active_sae is not sae5
+    pinned = load_sae_backend(
+        "mock-canonical", revision="commit-123",
+        model_id="test-model", device="cpu",
+    )
+    pinned.encode_layer(2, h)
+    assert seen_revisions[-1] == "commit-123"
 
 
 def test_sae_lens_backend_missing_dep_raises(monkeypatch: pytest.MonkeyPatch):
@@ -276,5 +295,3 @@ def test_sae_lens_backend_canonical_layer_map_warns_on_multiple(monkeypatch: pyt
 # because they share the ``_encode_and_capture_all`` mock infrastructure).
 # Replaces the v2.0–v2.1 ``drop_edges`` test family — edge-drop is gone in
 # v2.1, layer selection is now data-driven via :func:`compute_dls_axes`.
-
-

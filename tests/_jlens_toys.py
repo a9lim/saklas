@@ -48,6 +48,11 @@ class ToyCausalLM(nn.Module):
         super().__init__()
         self.model = ToyDecoder(n_layers)
         self.lm_head = nn.Linear(TOY_D, TOY_VOCAB, bias=False)
+        with torch.no_grad():
+            gen = torch.Generator().manual_seed(101)
+            self.lm_head.weight.copy_(
+                torch.randn(TOY_VOCAB, TOY_D, generator=gen)
+            )
         self.config = SimpleNamespace(model_type="llama")
 
     def get_output_embeddings(self) -> nn.Module:

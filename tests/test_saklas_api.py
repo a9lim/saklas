@@ -1176,12 +1176,15 @@ class TestManifoldRoutes:
         session.fit.return_value = _MM(
             layers={0: 1, 1: 1, 2: 1}, feature_space="raw",
         )
-        resp = client.post("/saklas/v1/manifolds/local/mood/fit", json={})
+        resp = client.post(
+            "/saklas/v1/manifolds/local/mood/fit", json={"layers": [1, 2]},
+        )
         assert resp.status_code == 200
         body = resp.json()
         assert body["done"] is True
         assert body["layers_fitted"] == 3
         assert body["feature_space"] == "raw"
+        assert session.fit.call_args.kwargs["layers"] == [1, 2]
 
 
 # ---- templates (standalone artifact + scorer) ----------------------------

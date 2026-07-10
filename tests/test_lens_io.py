@@ -157,11 +157,10 @@ def test_save_lens_preserves_existing_tensor_on_failed_replace(
     ts_path, _ = lens_paths(_MODEL)
     before = ts_path.read_bytes()
 
-    def _fail_save(_tensors: object, path: str) -> None:
-        Path(path).write_bytes(b"partial")
+    def _fail_save(_fd: int) -> None:
         raise RuntimeError("simulated save failure")
 
-    monkeypatch.setattr("saklas.io.lens.save_file", _fail_save)
+    monkeypatch.setattr("saklas.io.lens.os.fsync", _fail_save)
     with pytest.raises(RuntimeError, match="simulated"):
         _save(_lens(n_prompts=9))
     assert ts_path.read_bytes() == before
@@ -190,6 +189,15 @@ def test_load_non_finite_returns_none() -> None:
     lens = _lens()
     lens.jacobians[1][0, 0] = float("inf")
     _save(lens)
+    assert load_lens(_MODEL) is None
+
+
+def test_load_rejects_same_shape_finite_payload_corruption() -> None:
+    _save(_lens())
+    ts_path, _ = lens_paths(_MODEL)
+    payload = bytearray(ts_path.read_bytes())
+    payload[-1] ^= 1
+    ts_path.write_bytes(payload)
     assert load_lens(_MODEL) is None
 
 

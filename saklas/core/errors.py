@@ -31,6 +31,15 @@ class SaklasError(Exception):
         return (500, str(self) or self.__class__.__name__)
 
 
+def is_out_of_memory_error(exc: BaseException) -> bool:
+    """Recognize accelerator and CPU allocator OOM spellings."""
+    message = str(exc).lower()
+    return any(
+        needle in message
+        for needle in ("out of memory", "can't allocate memory", "cannot allocate memory")
+    )
+
+
 class SaeBackendImportError(ImportError, SaklasError):
     """Raised when sae_lens is required but not installed."""
 

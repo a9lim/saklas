@@ -1181,6 +1181,13 @@ class TestLensTokenReadout:
         resp = client.get("/saklas/v1/sessions/default")
         assert resp.json()["jlens_fitted"] is True
 
+        _, sidecar_path = lens_paths("test/model")
+        sidecar = json.loads(sidecar_path.read_text())
+        sidecar["format_version"] = 1
+        sidecar_path.write_text(json.dumps(sidecar))
+        resp = client.get("/saklas/v1/sessions/default")
+        assert resp.json()["jlens_fitted"] is False
+
 
 # ---------------------------------------------------------------------------
 # Live workspace readout (lens/live toggle + WS token frame)

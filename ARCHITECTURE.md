@@ -179,8 +179,17 @@ generation regime; a `role=` substitutes the assistant-role label
 `encode_and_capture_stack` is the full-`[T,D]` companion for the monitor.
 `compute_node_centroid` (`core/manifold.py`) pools one node's corpus. The fit
 pipeline instead uses `compute_manifold_node_stats`: a fit-wide stream fills
-batches across node boundaries, adapts batch size after OOM, and can retain raw
-curved-fit rows so the sigma covariance does not require a second model pass.
+batches across node boundaries, tokenizes once, buckets by length, grows clean
+batches up to 64, and adapts down after OOM. Capture terminates after the last
+selected transformer layer, skipping unused upper blocks / final norm / LM head.
+Centroid-only fits reduce by node before transfer. Raw curved fits write
+source-dtype rows to a layer-major mmap spool so sigma covariance needs neither a
+second model pass nor a resident fp32 roster; token-exact per-model centroid/row
+caches include baseline/tokenizer-render identity, node boundaries, centroid
+digests + exact per-layer row digests, map only requested row layers, union
+layer coverage for subset/top-up reuse, and prune oldest groups past a configurable disk bound;
+geometry-only refits skip capture entirely. Fitted tensors carry the
+loaded-model fingerprint and selected layer set in their cache identity.
 
 ### 3.2 A steering vector as a 2-node fit
 
@@ -446,7 +455,9 @@ axis is `δ̂`.
 `--sae <release>` reconstructs each centroid (encode → decode) through the SAE
 before the fit — a denoised, sparse-feature-supported centroid — and restricts the
 fit to the SAE's covered layers. The fit happens in *model* space, so the hook
-never touches the SAE. `core/sae.py` wraps SAELens (`load_sae_backend`); coverage
+never touches the SAE. `core/sae.py` wraps SAELens (`load_sae_backend`); registry
+resolution is eager, weights load lazily with only one layer resident, and a valid
+fitted tensor cache hit does not import/load SAELens. Coverage
 is fail-fast (`SaeCoverageError` before the pooling loop). The SAE branch still
 whitens with the residual-stream whitener (the centroids are decoded back to model
 space before the fit).
@@ -898,15 +909,21 @@ et al., Transformer Circuits 2026). `core/jlens.py` fits
 backward passes in saklas (the estimator seeds an autograd leaf at the first
 fitted block's input under `torch.enable_grad()` and reads per-layer grads with
 `torch.autograd.grad`; everything else stays `inference_mode`). The default fit
-uses a single unreplicated prompt forward plus batched VJPs
-(`is_grads_batched=True`) for `ceil(d_model/dim_batch)` output-dim blocks, with
-an env-overridable replicated-prompt fallback (`SAKLAS_JLENS_VJP`). CUDA reuses
-pinned host matrices and synchronizes once per prompt; MPS uses small row stripes
-plus reusable host matrices instead of full per-layer `[d_model,d_model]` device
-buffers. Self-contained checkpoints (`jlens.partial.*`) are written one layer at
+uses exact ragged prompt microbatches (CPU/CUDA default 4, MPS 1) plus batched
+VJPs (`is_grads_batched=True`) for `ceil(d_model/dim_batch)` output-dim blocks,
+with an exact scalar fallback and env-overridable replicated reference mode
+(`SAKLAS_JLENS_VJP`). A final-block hook stops before norm + LM head. Every
+backend transfers bounded row stripes directly into the CPU accumulator; an OOM
+rebuilds the graph at the first uncommitted row. Self-contained checkpoints
+(`jlens.partial.*`) are written one layer at
 a time directly from raw accumulator sums, avoiding a second full fp32 lens and
-supporting repeated interruption or missing-layer top-up resume. The full fp16
-artifact is written only at durable finalization. The artifact (`io/lens.py`,
+supporting repeated interruption or missing-layer top-up resume. The streamed
+safetensors writer never retains a complete fp16 mapping. Normal corpus extension
+resumes from an exact token-id prefix; the default dataset is commit-pinned;
+exact source/live-model fingerprints invalidate mutable revisions. The full fp16
+artifact is written only at durable finalization, with a streaming payload digest
+verified on final and checkpoint loads.
+The artifact (`io/lens.py`,
 `models/<safe_id>/jlens.safetensors`, fp16) then supports four
 consumers with zero hot-path cost when unused:
 

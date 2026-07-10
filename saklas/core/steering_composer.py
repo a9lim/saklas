@@ -196,7 +196,23 @@ class SteeringComposer:
                 f"ambiguous manifold '{name}': matches {qualified}. "
                 f"Qualify it with a namespace."
             )
-        manifold = load_manifold(matches[0][1])
+        tensor_path = matches[0][1]
+        sidecar_path = tensor_path.with_suffix(".json")
+        if sidecar_path.exists():
+            from saklas.core.model import loaded_model_fingerprint
+            from saklas.io.manifolds import ManifoldSidecar
+
+            sidecar = ManifoldSidecar.load(sidecar_path)
+            if (
+                sidecar.model_fingerprint != loaded_model_fingerprint(
+                    self._session._model, model_id,
+                )
+            ):
+                raise ManifoldNotRegisteredError(
+                    f"manifold '{key}' was fitted for different loaded weights "
+                    f"under {model_id}; run `saklas manifold fit` again"
+                )
+        manifold = load_manifold(tensor_path)
         manifolds[key] = manifold.to(
             device=self._session._device, dtype=torch.float32,
         )

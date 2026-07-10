@@ -56,7 +56,7 @@ saklas serve <model_id> [--no-web] [--steer/-S EXPR]
 saklas manifold extract <concept>|<pos> <neg> [-m MODEL] [--sae RELEASE] [--role SLUG] [--namespace NS] [-f]
 saklas manifold generate <name> --concepts C... [--kind abstract|concrete|custom] [--system TEMPLATE] [--samples-per-prompt K] [--seed S]
 saklas manifold from-template <template> [--name MANIFOLD] [--fit-mode auto|pca|spectral] [--max-dim N] [--var-threshold T] [--description TEXT] [-f]   # derive a discover manifold from a standalone template
-saklas manifold fit <name>|<folder> [-m MODEL] [--sae REL] [--method pca|spectral|auto] [--max-dim N] [--min-dim N] [--var-threshold T] [--k-nn K] [--bandwidth SIGMA] [--max-subspace-dim R] [--smoothing auto|0|LAMBDA] [--persistence-frac F]  # authored or discover-mode (hyperparams apply only to discover folders; --smoothing curved only, --persistence-frac auto only)
+saklas manifold fit <name>|<folder> [-m MODEL] [--sae REL] [--layers L1,L2|workspace|all] [--method pca|spectral|auto] [--max-dim N] [--min-dim N] [--var-threshold T] [--k-nn K] [--bandwidth SIGMA] [--max-subspace-dim R] [--smoothing auto|0|LAMBDA] [--persistence-frac F]  # authored or discover-mode (hyperparams apply only to discover folders; --smoothing curved only, --persistence-frac auto only)
 saklas manifold bake <name> <expression> [-m]    # shared grammar: "0.3 ns/a + 0.5 ns/b|ns/c"
 saklas manifold merge <name> <src...> [-f]           # union discover-mode node corpora
 saklas manifold transfer <name> --from SRC --to TGT [-f]   # cross-model Procrustes
@@ -76,7 +76,7 @@ saklas experiment naturalness <model> "<prompt>" --manifold F -S EXPR  # behavio
 saklas template create <name> --slot TOKEN --values V... --contexts FILE [--description TEXT] [-f]
 saklas template ls [-j] | show <name> [-j] | rm <name> [-y]
 saklas template score <name> -m MODEL [-S EXPR] [--by sum|mean] [-j]   # restricted-choice value distribution
-saklas lens fit <model> [--corpus FILE] [--prompts N] [--seq-len T] [--dim-batch K] [-f]   # per-model Jacobian lens (backward passes; resumes by default)
+saklas lens fit <model> [--corpus FILE] [--prompts N] [--seq-len T] [--dim-batch K] [--prompt-batch B] [-f]   # per-model Jacobian lens (backward passes; resumes by default)
 saklas lens show <model> [-j] | rm <model> [-y]
 saklas lens top <model> "<prompt>" [-k K] [--layers L1,L2] [--position P] [-j]   # workspace readout on a raw prompt
 saklas lens decompose <selector> -m MODEL [-k K] [--layers L1,L2] [-j]   # J-space share + tokens of a direction
@@ -280,23 +280,28 @@ The third artifact family, **per-model** rather than per-concept (Gurnee et al.,
 Transformer Circuits 2026). The lens is one matrix per source layer,
 `J_l = E[∂h_final/∂h_l]` — the average first-order effect of a layer's residual
 on the final-layer residual over positions and a web-text corpus — stored at
-`models/<safe_model_id>/jlens.{safetensors,json}` (fp16, `LENS_FORMAT_VERSION = 1`,
-sidecar records the corpus spec + sha256). `lens fit` runs the estimator
-(`core/jlens.py::fit_jacobian_lens` — one forward per prompt with the prompt
-replicated `dim_batch`× and the graph retained, then `ceil(d_model/dim_batch)`
-backwards with one-hot cotangents at every valid target position; the **only**
+`models/<safe_model_id>/jlens.{safetensors,json}` (fp16, `LENS_FORMAT_VERSION = 2`,
+sidecar records the immutable corpus spec + token-id sha256, exact source/live
+model identities, and tensor payload sha256).
+`lens fit` runs the estimator (`core/jlens.py::fit_jacobian_lens` — consecutive
+ragged prompts share one graph, then batched VJPs recover `dim_batch` output rows
+per backward without replicating the forward; unsupported batched VJPs fall back
+to exact scalar VJPs; the **only**
 backward passes in saklas — everything else runs under `inference_mode`, so the
 fit seeds a grad leaf at the lowest source block's input via a pre-hook and
 reads per-layer grads from `torch.autograd.grad(final, sources)`, never
-`retain_grad`). Row blocks accumulate in on-device buffers with one host fold
-per prompt — never per pass — and on MPS the pass loop drains the command
+`retain_grad`). The final-block hook stops the forward before final norm + LM
+head. Row blocks transfer through bounded stripes directly into the CPU
+accumulator; an OOM resumes at the first uncommitted row. On MPS the pass loop drains the command
 queue every few passes (`_MPS_SYNC_EVERY_PASSES`): Metal reports queue
 exhaustion as an *asynchronous* command-buffer error that silently zeroes the
 work rather than raising, so a fully unsynced loop corrupts the fit (a
-zero-row fold guard converts any escape into the dim_batch-halving retry).
+zero-row fold guard catches any escape).
 `--layers` restricts the fit to a source band and skips all forward *and*
 backward graph work below it. Fits resume by default (corpus-hash +
-source-layer match + checkpoint every 25 prompts); `-f` restarts.
+source-layer + token-id corpus + loaded-model fingerprint match + checkpoint
+every 25 prompts); the default FineWeb-Edu stream pins its Hub dataset commit,
+ordinary corpus extension resumes from a matching token-id prefix; `-f` restarts.
 
 Three read surfaces, one write surface:
 
@@ -584,11 +589,17 @@ webui builder (`io.manifold_authoring.create_manifold_folder` /
 `POST .../fit` all run `ManifoldExtractionPipeline`: pool each node's centroid,
 embed coords through the domain (or derive them for discover mode), fit a per-layer
 subspace (flat `fit_affine_subspace` for `fit_mode=pca`, curved
-`fit_layer_subspace` for authored/spectral — whitened/Fisher PCA basis when the
-whitener covers all fit layers, ordinary PCA otherwise), bake the per-layer
+`fit_layer_subspace` for authored/spectral — Mahalanobis/Fisher PCA; the whitener
+must cover every selected layer), bake the per-layer
 Mahalanobis share, write the per-model tensor. `--sae <release>` reconstructs each
-centroid through the SAE before the fit; the fitted subspace is always model-space
-so the hook never touches the SAE. `min_nodes(n) = 2n+1` for a curved fit (a flat
+centroid through the SAE before the fit; SAE weights load one layer at a time and
+the fitted subspace is always model-space, so the hook never touches the SAE.
+Capture is tokenized/length-bucketed once, terminates at the last requested
+transformer block, and writes curved-fit rows to a source-dtype layer-major spool;
+geometry-only refits reuse a digested, size-bounded token-exact per-model
+activation cache whose layer coverage can be sliced/topped up. `--layers`
+can restrict the artifact to explicit indices or the workspace band.
+`min_nodes(n) = 2n+1` for a curved fit (a flat
 `pca` fit needs only `k+1`); authored nodes must be *poised* (affinely span the
 embedding).
 

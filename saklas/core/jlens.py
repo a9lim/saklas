@@ -10,16 +10,17 @@ vocab id v at layer l is ``W_U[v] @ J_l`` — a per-layer d-vector with the same
 shape contract as any saklas steering direction, which is what lets a
 ``jlens/<word>`` term ride the ordinary profile registry.
 
-Estimator (reference: github.com/anthropics/jacobian-lens, followed exactly):
-one forward per prompt with the prompt replicated ``dim_batch``× along the
-batch axis and the graph retained, then ``ceil(d_model/dim_batch)`` backward
-passes. Batch element ``b`` of pass ``p`` carries a one-hot cotangent at
-output dim ``p·dim_batch + b`` injected at every valid target position, so
-the gradient at source position ``t`` is ``Σ_{t'≥t} ∂h_final[t']/∂h_l[t]``;
-the mean over source positions gives ``dim_batch`` rows of every layer's
-``J_l`` per backward. The first ``SKIP_FIRST_POSITIONS`` positions (attention
-sinks) and the final position are excluded from both cotangents and the
-source mean.
+Estimator (reference: github.com/anthropics/jacobian-lens): consecutive prompts
+share one right-padded autograd graph, then batched VJPs recover
+``dim_batch`` output rows per backward without replicating the forward graph.
+For output dimension ``r``, the cotangent is injected at every valid target
+position, so the gradient at source position ``t`` is
+``Σ_{t'≥t} ∂h_final[t',r]/∂h_l[t]``; source positions are averaged within
+each prompt and prompt Jacobians are then summed, preserving exact equal-prompt
+weighting even for ragged lengths. The first ``SKIP_FIRST_POSITIONS`` positions
+(attention sinks) and the final position are excluded from both cotangents and
+the source mean. Backends without batched-VJP coverage fall back to exact
+unreplicated scalar VJPs; replicated VJPs remain an explicit reference mode.
 
 This is the ONLY module in saklas that runs backward passes. The fit builds
 its own autograd-enabled forward (``torch.enable_grad()`` + a grad-seeding
@@ -29,15 +30,14 @@ autograd. Per-layer grads come from ``torch.autograd.grad(final, sources)``
 — NOT ``backward()`` + ``retain_grad()`` (``.grad`` accumulates across the
 multi-backward loop and would corrupt the one-hot-cotangent rows) — which
 also stops the graph walk at the shallowest requested source layer, so a
-band-restricted fit never backprops below its lowest source. Each pass
-writes its row block into a per-layer ON-DEVICE fp32 buffer; the only
-device→host transfer is one fold per prompt into the CPU fp32 cross-prompt
-accumulator (a per-pass ``.cpu()`` is a blocking sync per source layer —
-worth ~6% on MPS). The sync budget is bounded from BOTH sides: a fully
-unsynced pass loop lets the CPU enqueue arbitrarily far ahead of the device,
-and Metal reports the resulting queue exhaustion asynchronously — no Python
-exception, the work silently never runs, the fold reads zeros — hence the
-periodic drain (``_MPS_SYNC_EVERY_PASSES``) plus the zero-row fold guard.
+band-restricted fit never backprops below its lowest source. A terminal-layer
+hook captures the target residual and aborts the rest of the forward before
+the final norm and full-vocabulary head. Row blocks are staged in bounded
+per-layer stripes, validated after transfer, and committed directly into the
+CPU fp32 cross-prompt accumulator. If a later VJP OOMs, the graph is rebuilt at
+the first uncommitted row instead of discarding earlier work. The MPS sync
+budget is bounded from both sides: a fully unsynced loop can exhaust Metal's
+asynchronous command queue, so periodic drains plus the zero-row guard remain.
 The fit is compute-bound (each prompt ≈ ``d_model × 2`` forward-equivalents
 of backward, dim_batch-invariant); restricting ``source_layers`` is the one
 lever that removes work. Entries are O(1), so fp16 storage downstream is
@@ -47,15 +47,15 @@ safe.
 from __future__ import annotations
 
 import logging
-import math
 import os
+import time
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 import torch
 from torch import nn
 
-from saklas.core.errors import SaklasError
+from saklas.core.errors import SaklasError, is_out_of_memory_error
 
 log = logging.getLogger(__name__)
 
@@ -69,6 +69,11 @@ DEFAULT_SEQ_LEN = 128
 #: gemma-3-4b, 8 is the sweet spot (93.6s/prompt vs 96.9s at 32, 102.5s at
 #: 64, identical output). Halves automatically on OOM.
 DEFAULT_DIM_BATCH = 8
+# Consecutive corpus prompts per autograd graph on CPU/CUDA.  Their Jacobians
+# remain equal-prompt weighted (not equal-token weighted); MPS defaults to one
+# until real-device measurements justify the larger graph there.  OOM backoff
+# reduces this independently of ``dim_batch``.
+DEFAULT_PROMPT_BATCH = 4
 #: Checkpoint cadence (prompts) for resumable fits.
 DEFAULT_CHECKPOINT_EVERY = 25
 #: Backward passes between queue drains on MPS. Metal reports command-queue
@@ -78,14 +83,10 @@ DEFAULT_CHECKPOINT_EVERY = 25
 #: A bounded drain every few passes caps the in-flight transients; the
 #: all-zero fold guard below catches whatever still slips through.
 _MPS_SYNC_EVERY_PASSES = 4
-#: MPS unified memory is most fragile when every fitted layer owns a full
-#: ``[d_model, d_model]`` fp32 device buffer.  Keep a small per-layer stripe on
-#: device, validate it, then fold into a local CPU prompt buffer.
-_MPS_ROW_STRIPE = 256
-#: After an OOM halves ``dim_batch``, try the original width again only after a
-#: few successful prompts.  One unusually long prompt should not punish the
-#: remainder of the corpus forever.
-_DIM_BATCH_GROW_AFTER_PROMPTS = 4
+#: A complete fp32 lens per staging tier is a multi-GiB cliff. Keep only this
+#: many output rows per layer on device + host, validate/commit the stripe, and
+#: resume from the first uncommitted row after an OOM.
+_ROW_STRIPE = 256
 
 
 class JacobianLensError(RuntimeError, SaklasError):
@@ -640,15 +641,31 @@ def _output_tensor(output: Any) -> torch.Tensor:
 
 
 class _BatchedVjpUnavailable(RuntimeError):
-    """Internal signal: retry the current prompt with replicated VJPs."""
+    """Internal signal: retry the current prompt with scalar VJPs."""
+
+    def __init__(self, committed_until: int) -> None:
+        super().__init__("batched VJP unavailable")
+        self.committed_until = committed_until
+
+
+class _FitForwardComplete(BaseException):
+    """Private control flow: final residual captured; skip norm + LM head."""
+
+
+class _PromptRowsCommitted(RuntimeError):
+    """OOM after durable-in-accumulator rows; resume at ``committed_until``."""
+
+    def __init__(self, committed_until: int, message: str) -> None:
+        super().__init__(message)
+        self.committed_until = committed_until
 
 
 def _resolve_vjp_mode(mode: str) -> str:
     env = os.environ.get("SAKLAS_JLENS_VJP")
     raw = (env or mode).strip().lower()
-    if raw not in {"auto", "batched", "replicated"}:
+    if raw not in {"auto", "batched", "scalar", "replicated"}:
         raise ValueError(
-            "vjp_mode must be 'auto', 'batched', or 'replicated' "
+            "vjp_mode must be 'auto', 'batched', 'scalar', or 'replicated' "
             f"(got {mode!r})"
         )
     return raw
@@ -656,7 +673,7 @@ def _resolve_vjp_mode(mode: str) -> str:
 
 def _looks_like_batched_vjp_unsupported(exc: RuntimeError) -> bool:
     msg = str(exc).lower()
-    if "out of memory" in msg:
+    if is_out_of_memory_error(exc):
         return False
     return any(
         needle in msg
@@ -693,6 +710,8 @@ def _install_fit_hooks(
     def make_capture(idx: int) -> Callable[..., None]:
         def hook(_module: nn.Module, _args: tuple[Any, ...], output: Any) -> None:
             captured[idx] = _output_tensor(output)
+            if idx == final_idx:
+                raise _FitForwardComplete()
 
         return hook
 
@@ -718,6 +737,7 @@ def fit_jacobian_lens(
     *,
     source_layers: Sequence[int] | None = None,
     dim_batch: int = DEFAULT_DIM_BATCH,
+    prompt_batch: int | None = None,
     max_seq_len: int = DEFAULT_SEQ_LEN,
     skip_first: int = SKIP_FIRST_POSITIONS,
     checkpoint_every: int = DEFAULT_CHECKPOINT_EVERY,
@@ -726,13 +746,14 @@ def fit_jacobian_lens(
         Callable[[Mapping[int, torch.Tensor], int, int], None] | None
     ) = None,
     on_progress: Callable[[str], None] | None = None,
+    progress_base: int = 0,
     input_id_rows: Sequence[Sequence[int]] | None = None,
     vjp_mode: str = "auto",
 ) -> JacobianLens:
     """Fit ``J_l`` for every source layer over ``prompts``.
 
-    One forward + ``ceil(d_model/dim_batch)`` backwards per prompt (see module
-    docstring for the estimator). ``checkpoint_cb`` receives the partial lens
+    One graph per prompt microbatch + ``ceil(d_model/dim_batch)`` backwards
+    (see the module docstring for the estimator). ``checkpoint_cb`` receives the partial lens
     every ``checkpoint_every`` prompts — the io layer uses it for resumable
     fits (callers merging with a prior shard do so outside this function).
     ``checkpoint_accumulator_cb`` is the allocation-light persistence seam: it
@@ -746,10 +767,11 @@ def fit_jacobian_lens(
     instead of tokenizing the corpus a second time.  ``vjp_mode="batched"``
     computes each output-dim block with ``is_grads_batched=True`` from a single
     prompt forward instead of replicating the forward graph; ``"auto"`` tries
-    that path first and falls back to the reference replicated estimator if the
-    backend lacks vmap coverage.  ``dim_batch`` halves automatically on device
-    OOM and cautiously grows back toward the requested value after successful
-    prompts.
+    that path first and falls back to exact scalar VJPs if the backend lacks
+    vmap coverage. ``prompt_batch`` controls consecutive ragged prompts per
+    graph (CPU/CUDA default 4, MPS default 1); both prompt and output-dimension
+    batch widths back off independently on device OOM and stay below a proven
+    failure ceiling for the rest of the fit.
 
     Raises :class:`JacobianLensError` when no prompt in the corpus is long
     enough (each needs > ``skip_first + 1`` tokens).
@@ -757,10 +779,14 @@ def fit_jacobian_lens(
     device = next(model.parameters()).device
     if dim_batch <= 0:
         raise ValueError("dim_batch must be > 0")
+    if prompt_batch is not None and prompt_batch <= 0:
+        raise ValueError("prompt_batch must be > 0")
     if max_seq_len <= 0:
         raise ValueError("max_seq_len must be > 0")
     if checkpoint_every <= 0:
         raise ValueError("checkpoint_every must be > 0")
+    if progress_base < 0:
+        raise ValueError("progress_base must be >= 0")
     n_layers = len(layer_modules)
     final_idx = n_layers - 1
     sources = (
@@ -786,16 +812,44 @@ def fit_jacobian_lens(
     state: dict[str, Any] = {
         "acc": None,
         "d_model": 0,
-        "dev_rows": None,
         "stripe_rows": None,
-        "host_rows": None,
+        "host_stripes": None,
         "vjp_mode": "batched" if requested_vjp_mode == "auto" else requested_vjp_mode,
         "requested_vjp_mode": requested_vjp_mode,
     }
+    # Prepare once. Session orchestration normally supplies token IDs it already
+    # hashed for resume; direct callers get the same one-time tokenization here.
+    prepared_rows: list[tuple[int, torch.Tensor]] = []
+    for prompt_idx, prompt in enumerate(prompts):
+        if input_id_rows is None:
+            ids_cpu = tokenizer(prompt, return_tensors="pt")["input_ids"][
+                0, :max_seq_len
+            ].to(dtype=torch.long, device="cpu")
+        else:
+            row = [int(tok) for tok in input_id_rows[prompt_idx]][:max_seq_len]
+            ids_cpu = torch.tensor(row, dtype=torch.long)
+        if int(ids_cpu.numel()) < skip_first + 2:
+            log.warning(
+                "jlens: skipping prompt %d — %d tokens, need > %d",
+                prompt_idx, int(ids_cpu.numel()), skip_first + 1,
+            )
+            continue
+        prepared_rows.append((prompt_idx, ids_cpu))
+
     n_done = 0
-    target_dim_batch = int(dim_batch)
+    fit_started = time.perf_counter()
     active_dim_batch = int(dim_batch)
-    successes_since_resize = 0
+    target_prompt_batch = int(
+        1 if requested_vjp_mode in {"scalar", "replicated"}
+        else (
+            prompt_batch
+            if prompt_batch is not None
+            else (1 if device.type == "mps" else DEFAULT_PROMPT_BATCH)
+        )
+    )
+    active_prompt_batch = target_prompt_batch
+    prompt_bad_ceiling: int | None = None
+    cursor = 0
 
     def _partial() -> JacobianLens:
         acc = state["acc"]
@@ -809,64 +863,159 @@ def fit_jacobian_lens(
     captured, handles = _install_fit_hooks(layer_modules, sources, final_idx)
     try:
         with torch.enable_grad():
-            for prompt_idx, prompt in enumerate(prompts):
-                if input_id_rows is None:
-                    ids = tokenizer(prompt, return_tensors="pt")["input_ids"][
-                        :, :max_seq_len
-                    ]
-                else:
-                    row = [int(tok) for tok in input_id_rows[prompt_idx]][:max_seq_len]
-                    ids = torch.tensor([row], dtype=torch.long)
-                seq_len = ids.shape[1]
-                if seq_len < skip_first + 2:
-                    log.warning(
-                        "jlens: skipping prompt %d — %d tokens, need > %d",
-                        prompt_idx, seq_len, skip_first + 1,
-                    )
-                    continue
-                ids = ids.to(device)
+            while cursor < len(prepared_rows):
+                # Never cross a checkpoint boundary: every persisted count is a
+                # prefix address into the corpus, even with prompt microbatches.
+                until_checkpoint = checkpoint_every - (n_done % checkpoint_every)
+                width = min(
+                    active_prompt_batch, until_checkpoint,
+                    len(prepared_rows) - cursor,
+                )
+                chunk = prepared_rows[cursor : cursor + width]
+                lengths_cpu = torch.tensor(
+                    [int(row.numel()) for _idx, row in chunk], dtype=torch.long,
+                )
+                pad_id = getattr(tokenizer, "pad_token_id", None)
+                if pad_id is None:
+                    pad_id = getattr(tokenizer, "eos_token_id", None) or 0
+                ids_cpu = torch.nn.utils.rnn.pad_sequence(
+                    [row for _idx, row in chunk], batch_first=True,
+                    padding_value=int(pad_id),
+                )
+                ids = ids_cpu.to(device)
+                lengths = lengths_cpu.to(device)
+                max_len = int(ids.shape[1])
+                attention_mask = (
+                    (
+                        torch.arange(max_len, device=device).unsqueeze(0)
+                        < lengths.unsqueeze(1)
+                    ).to(torch.long)
+                    if bool((lengths_cpu != max_len).any()) else None
+                )
                 batch = max(1, min(active_dim_batch, state["d_model"] or active_dim_batch))
+                committed_row = 0
+                restart_with_smaller_prompts = False
                 while True:
                     retry_batch: int | None = None
                     try:
                         _accumulate_prompt_jacobian(
                             model, ids, layer_modules, sources, final_idx, state,
                             captured=captured, batch=batch, skip_first=skip_first,
+                            attention_mask=attention_mask, lengths=lengths,
+                            row_start=committed_row,
                         )
                         break
-                    except _BatchedVjpUnavailable:
+                    except _BatchedVjpUnavailable as exc:
                         assert requested_vjp_mode == "auto"
-                        state["vjp_mode"] = "replicated"
+                        state["vjp_mode"] = "scalar"
+                        target_prompt_batch = 1
+                        active_prompt_batch = 1
                         log.warning(
                             "jlens: batched VJP is unavailable on this backend — "
-                            "falling back to replicated-prompt VJPs"
+                            "falling back to unreplicated scalar VJPs"
+                        )
+                        if exc.committed_until > committed_row:
+                            # A backend normally reports missing vmap coverage
+                            # on the first VJP. If it fails late, some rows of
+                            # this prompt batch may already be in the corpus
+                            # accumulator. Restart this suffix fit from zero in
+                            # scalar mode rather than double-counting them.
+                            for accumulator in state["acc"].values():
+                                accumulator.zero_()
+                            n_done = 0
+                            cursor = 0
+                            committed_row = 0
+                            restart_with_smaller_prompts = True
+                            log.warning(
+                                "jlens: batched VJP failed after committed "
+                                "rows; restarting the current fit shard in "
+                                "scalar mode"
+                            )
+                            break
+                        if width > 1:
+                            restart_with_smaller_prompts = True
+                            break
+                        continue
+                    except _PromptRowsCommitted as exc:
+                        committed_row = exc.committed_until
+                        if batch <= 1:
+                            if width <= 1:
+                                raise
+                            # The smallest row stripe still cannot fit the
+                            # multi-prompt graph.  Some rows are already folded
+                            # into the shard accumulator, so restart this shard
+                            # at a narrower prompt width rather than double
+                            # count them or escape without trying B=1.
+                            for accumulator in state["acc"].values():
+                                accumulator.zero_()
+                            n_done = 0
+                            cursor = 0
+                            committed_row = 0
+                            prompt_bad_ceiling = (
+                                width if prompt_bad_ceiling is None
+                                else min(prompt_bad_ceiling, width)
+                            )
+                            active_prompt_batch = max(1, width // 2)
+                            restart_with_smaller_prompts = True
+                            _empty_device_cache(device)
+                            log.warning(
+                                "jlens: OOM after committed rows at "
+                                "dim_batch=1 — restarting the fit shard with "
+                                "prompt_batch=%d", active_prompt_batch,
+                            )
+                            break
+                        batch = max(1, batch // 2)
+                        active_dim_batch = batch
+                        _empty_device_cache(device)
+                        log.warning(
+                            "jlens: OOM after row %d — resuming prompt batch "
+                            "with dim_batch=%d",
+                            committed_row, batch,
                         )
                         continue
                     except RuntimeError as exc:  # OOM → halve dim_batch and retry
-                        msg = str(exc).lower()
-                        if "out of memory" not in msg or batch <= 1:
+                        if not is_out_of_memory_error(exc):
+                            raise
+                        if width > 1:
+                            prompt_bad_ceiling = (
+                                width if prompt_bad_ceiling is None
+                                else min(prompt_bad_ceiling, width)
+                            )
+                            active_prompt_batch = max(1, width // 2)
+                            restart_with_smaller_prompts = True
+                            _empty_device_cache(device)
+                            log.warning(
+                                "jlens: OOM — retrying with prompt_batch=%d",
+                                active_prompt_batch,
+                            )
+                            break
+                        if batch <= 1:
                             raise
                         retry_batch = max(1, batch // 2)
                     assert retry_batch is not None
                     batch = retry_batch
                     active_dim_batch = batch
-                    successes_since_resize = 0
                     _empty_device_cache(device)
                     log.warning("jlens: OOM — retrying prompt with dim_batch=%d", batch)
-                n_done += 1
-                successes_since_resize += 1
+                if restart_with_smaller_prompts:
+                    continue
+                n_done += width
+                cursor += width
                 if on_progress is not None:
                     mode = str(state["vjp_mode"])
+                    elapsed = max(time.perf_counter() - fit_started, 1e-9)
                     on_progress(
-                        f"prompt {n_done}/{len(prompts)} "
-                        f"(dim_batch={batch}, vjp={mode})"
+                        f"prompt {progress_base + n_done}/"
+                        f"{progress_base + len(prepared_rows)} "
+                        f"(prompt_batch={width}, dim_batch="
+                        f"{state.get('effective_dim_batch', batch)}, vjp={mode}, "
+                        f"elapsed={elapsed:.1f}s, rate={n_done / elapsed:.3f}/s)"
                     )
-                if (
-                    active_dim_batch < target_dim_batch
-                    and successes_since_resize >= _DIM_BATCH_GROW_AFTER_PROMPTS
-                ):
-                    active_dim_batch = min(target_dim_batch, active_dim_batch * 2)
-                    successes_since_resize = 0
+                # Do not oscillate back into a width already proven bad during
+                # this run. The dim-batch work is nearly width-invariant, so its
+                # reduced value likewise stays put after an OOM.
+                if prompt_bad_ceiling is None:
+                    active_prompt_batch = target_prompt_batch
                 if n_done % checkpoint_every == 0:
                     if checkpoint_accumulator_cb is not None:
                         checkpoint_accumulator_cb(
@@ -909,86 +1058,102 @@ def _accumulate_prompt_jacobian(
     captured: dict[int, torch.Tensor],
     batch: int,
     skip_first: int,
+    attention_mask: torch.Tensor | None = None,
+    lengths: torch.Tensor | None = None,
+    row_start: int = 0,
 ) -> None:
-    """Run one prompt's forward + backward sweep, adding into ``state``.
+    """Run one prompt microbatch's exact VJP sweep into bounded row stripes.
 
-    The fold into ``state["acc"]`` happens once at the end, all-or-nothing,
-    so a mid-prompt OOM retry never double-counts. Row blocks land in the
-    reused per-layer device buffers (``state["dev_rows"]``) — each
-    ``(pass, layer)`` writes a disjoint block, and the device→host transfer
-    happens once per prompt, off the backward critical path.
+    Fully transferred/validated stripes are added directly to the persistent
+    CPU accumulator. If a later VJP OOMs, ``_PromptRowsCommitted`` carries the
+    first unfinished output row; the caller rebuilds the graph and continues
+    there, so neither the completed backward work nor a full lens-sized staging
+    matrix is needed.
     """
-    seq_len = ids.shape[1]
+    prompt_count, seq_len = ids.shape
     del layer_modules
     device = ids.device
-    valid = torch.arange(skip_first, seq_len - 1, device=device)
+    committed_until = int(row_start)
+    if lengths is None:
+        lengths = torch.full(
+            (prompt_count,), seq_len, dtype=torch.long, device=device,
+        )
+    positions = torch.arange(seq_len, device=device).unsqueeze(0)
+    valid_mask = (
+        (positions >= skip_first)
+        & (positions < (lengths.to(device=device).unsqueeze(1) - 1))
+    )
     captured.clear()
     try:
         vjp_mode = str(state["vjp_mode"])
-        forward_batch = 1 if vjp_mode == "batched" else batch
-        replicated = ids.expand(forward_batch, -1)
+        if vjp_mode != "batched" and prompt_count != 1:
+            raise ValueError(f"{vjp_mode} VJP requires prompt_batch=1")
+        if vjp_mode == "scalar":
+            batch = 1
+        if vjp_mode == "replicated":
+            batch = min(batch, _ROW_STRIPE)
+        forward_batch = prompt_count if vjp_mode in {"batched", "scalar"} else batch
+        replicated = (
+            ids if vjp_mode in {"batched", "scalar"}
+            else ids.expand(forward_batch, -1)
+        )
+        replicated_mask = (
+            attention_mask
+            if vjp_mode in {"batched", "scalar"} or attention_mask is None
+            else attention_mask.expand(forward_batch, -1)
+        )
         try:
-            model(input_ids=replicated, use_cache=False)
+            try:
+                model(
+                    input_ids=replicated, attention_mask=replicated_mask,
+                    use_cache=False,
+                )
+            except _FitForwardComplete:
+                pass
         except TypeError:  # toy/CPU-test models without a use_cache kwarg
-            model(input_ids=replicated)
+            try:
+                model(input_ids=replicated)
+            except _FitForwardComplete:
+                pass
         final = captured[final_idx]
         d_model = final.shape[-1]
+        batch = min(batch, d_model)
+        batch = min(batch, _ROW_STRIPE)
+        state["effective_dim_batch"] = batch
+        if not 0 <= row_start < d_model:
+            if row_start == d_model:
+                return
+            raise ValueError(f"row_start must lie in [0, {d_model}], got {row_start}")
         if state["acc"] is None:
             state["acc"] = {
                 l: torch.zeros(d_model, d_model, dtype=torch.float32) for l in sources
             }
             state["d_model"] = d_model
-        if state["dev_rows"] is None and device.type == "mps":
-            state["dev_rows"] = {
-                l: torch.empty(0, dtype=torch.float32, device=device) for l in sources
-            }
-        elif state["dev_rows"] is None:
-            try:
-                state["dev_rows"] = {
-                    l: torch.zeros(d_model, d_model, dtype=torch.float32, device=device)
-                    for l in sources
-                }
-            except RuntimeError as exc:  # device too tight for the buffers
-                if "out of memory" not in str(exc).lower():
-                    raise
-                state["dev_rows"] = {
-                    l: torch.zeros(d_model, d_model, dtype=torch.float32)
-                    for l in sources
-                }
-                log.warning(
-                    "jlens: device row buffers do not fit — accumulating on "
-                    "CPU (per-pass sync transfers; the fit will be slower)"
-                )
-        dev_rows: dict[int, torch.Tensor] = state["dev_rows"]
-        on_device = next(iter(dev_rows.values())).device == device
-        use_striped_rows = device.type == "mps" and on_device
-        if use_striped_rows and state["stripe_rows"] is None:
-            stripe = min(_MPS_ROW_STRIPE, d_model)
+        stripe_capacity = min(_ROW_STRIPE, d_model)
+        if device.type != "cpu" and state["stripe_rows"] is None:
             state["stripe_rows"] = {
-                l: torch.empty(stripe, d_model, dtype=torch.float32, device=device)
+                l: torch.empty(
+                    stripe_capacity, d_model, dtype=torch.float32, device=device,
+                )
                 for l in sources
             }
-        if state["host_rows"] is None and (
-            device.type == "mps" or (device.type == "cuda" and on_device)
-        ):
+        if device.type != "cpu" and state["host_stripes"] is None:
             try:
-                state["host_rows"] = {
+                state["host_stripes"] = {
                     l: torch.empty(
-                        d_model, d_model, dtype=torch.float32,
+                        stripe_capacity, d_model, dtype=torch.float32,
                         pin_memory=device.type == "cuda",
                     )
                     for l in sources
                 }
             except RuntimeError:
-                # Pinned host allocation can itself fail under system pressure;
-                # an ordinary reusable buffer still avoids per-prompt churn.
-                state["host_rows"] = {
-                    l: torch.empty(d_model, d_model, dtype=torch.float32)
+                state["host_stripes"] = {
+                    l: torch.empty(stripe_capacity, d_model, dtype=torch.float32)
                     for l in sources
                 }
-        host_rows: dict[int, torch.Tensor] | None = state["host_rows"]
         stripe_rows: dict[int, torch.Tensor] | None = state["stripe_rows"]
-        stripe_start = 0
+        host_stripes: dict[int, torch.Tensor] | None = state["host_stripes"]
+        stripe_start = int(row_start)
         source_tensors: list[torch.Tensor] = []
         for l in sources:
             if not captured[l].requires_grad:
@@ -999,35 +1164,50 @@ def _accumulate_prompt_jacobian(
             source_tensors.append(captured[l])
 
         def flush_stripe(end: int) -> None:
-            nonlocal stripe_start
-            if not use_striped_rows or end <= stripe_start:
+            nonlocal stripe_start, committed_until
+            if device.type == "cpu" or end <= stripe_start:
                 return
-            assert host_rows is not None and stripe_rows is not None
+            assert host_stripes is not None and stripe_rows is not None
             n = end - stripe_start
             for layer in sources:
-                rows = host_rows[layer][stripe_start:end]
-                rows.copy_(stripe_rows[layer][:n])
+                host_stripes[layer][:n].copy_(
+                    stripe_rows[layer][:n], non_blocking=device.type == "cuda",
+                )
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            elif device.type == "mps":
+                torch.mps.synchronize()
+            # Validate every layer before committing any: a failed asynchronous
+            # transfer must not leave a partially counted stripe.
+            for layer in sources:
+                rows = host_stripes[layer][:n]
                 if bool((rows.abs().sum(dim=1) == 0).any()):
                     raise JacobianLensError(
                         f"layer {layer} came back with zero rows from the device — "
                         "likely an asynchronous out of memory on the command "
                         "queue; retrying at a smaller dim_batch"
                     )
+            for layer in sources:
+                state["acc"][layer][stripe_start:end].add_(
+                    host_stripes[layer][:n]
+                )
+            committed_until = end
             stripe_start = end
 
-        n_passes = math.ceil(d_model / batch)
         cot = None
         prev_dims: torch.Tensor | None = None
         batch_rows = torch.arange(batch, device=device)
         batched_outputs = (
-            final[0, valid].sum(dim=0) if vjp_mode == "batched" else None
+            (final * valid_mask.unsqueeze(-1)).sum(dim=(0, 1))
+            if vjp_mode in {"batched", "scalar"} else None
         )
         batched_eye = (
             torch.eye(batch, dtype=final.dtype, device=device)
             if vjp_mode == "batched" else None
         )
-        for p in range(n_passes):
-            dim_start = p * batch
+        dim_start = int(row_start)
+        pass_idx = 0
+        while dim_start < d_model:
             n_dims = min(batch, d_model - dim_start)
             dims = dim_start + batch_rows[:n_dims]
             # grad(final, sources) rather than backward(): the grads return
@@ -1035,9 +1215,9 @@ def _accumulate_prompt_jacobian(
             # requested layer instead of descending to the seed leaf.
             try:
                 grads = _grad_row_block(
-                    final, source_tensors, valid, dims,
+                    final, source_tensors, valid_mask, dims,
                     mode=vjp_mode,
-                    retain_graph=p < n_passes - 1,
+                    retain_graph=dim_start + n_dims < d_model,
                     cotangent=cot,
                     prev_dims=prev_dims,
                     batched_outputs=batched_outputs,
@@ -1049,7 +1229,7 @@ def _accumulate_prompt_jacobian(
                     and vjp_mode == "batched"
                     and _looks_like_batched_vjp_unsupported(exc)
                 ):
-                    raise _BatchedVjpUnavailable() from exc
+                    raise _BatchedVjpUnavailable(committed_until) from exc
                 raise
             if vjp_mode == "replicated":
                 if cot is None:
@@ -1057,41 +1237,32 @@ def _accumulate_prompt_jacobian(
                 prev_dims = dims
             write_end = dim_start + n_dims
             stripe_offset = 0
-            if use_striped_rows:
+            if device.type != "cpu":
                 assert stripe_rows is not None
-                if write_end - stripe_start > stripe_rows[sources[0]].shape[0]:
+                if write_end - stripe_start > stripe_capacity:
                     flush_stripe(dim_start)
                 stripe_offset = dim_start - stripe_start
             for l, g in zip(sources, grads):
                 block = _source_grad_block(
                     g, mode=vjp_mode, n_dims=n_dims,
-                    skip_first=skip_first, seq_len=seq_len,
+                    valid_mask=valid_mask,
                 )
-                if use_striped_rows:
+                if device.type != "cpu":
                     assert stripe_rows is not None
                     stripe_rows[l][stripe_offset : stripe_offset + n_dims] = block
                 else:
-                    dev_rows[l][dim_start : write_end] = (
-                        block if on_device else block.cpu()
-                    )
-            if device.type == "mps" and (p + 1) % _MPS_SYNC_EVERY_PASSES == 0:
+                    state["acc"][l][dim_start:write_end].add_(block)
+            if device.type == "cpu":
+                committed_until = write_end
+            pass_idx += 1
+            if device.type == "mps" and pass_idx % _MPS_SYNC_EVERY_PASSES == 0:
                 torch.mps.synchronize()
+            dim_start = write_end
         flush_stripe(d_model)
-        # Two-phase fold: transfer everything first, then add — a transfer
-        # failure mid-fold must not leave some layers already accumulated
-        # (the OOM retry would double-count them).
-        if use_striped_rows:
-            assert host_rows is not None
-        elif device.type == "cuda" and on_device:
-            assert host_rows is not None
-            for l in sources:
-                host_rows[l].copy_(dev_rows[l], non_blocking=True)
-            torch.cuda.synchronize()
-        else:
-            host_rows = dev_rows
-        assert host_rows is not None
-        for l in sources:
-            state["acc"][l] += host_rows[l]
+    except RuntimeError as exc:
+        if is_out_of_memory_error(exc) and committed_until > row_start:
+            raise _PromptRowsCommitted(committed_until, str(exc)) from exc
+        raise
     finally:
         captured.clear()
 
@@ -1099,7 +1270,7 @@ def _accumulate_prompt_jacobian(
 def _grad_row_block(
     final: torch.Tensor,
     source_tensors: Sequence[torch.Tensor],
-    valid: torch.Tensor,
+    valid_mask: torch.Tensor,
     dims: torch.Tensor,
     *,
     mode: str,
@@ -1117,9 +1288,16 @@ def _grad_row_block(
             outputs, source_tensors, grad_outputs=eye,
             retain_graph=retain_graph, is_grads_batched=True,
         )
+    if mode == "scalar":
+        assert batched_outputs is not None and dims.numel() == 1
+        return torch.autograd.grad(
+            batched_outputs[dims[0]], source_tensors,
+            retain_graph=retain_graph,
+        )
 
     if cotangent is None:
         cotangent = torch.zeros_like(final)
+    valid = valid_mask[0].nonzero(as_tuple=False).reshape(-1)
     rows = torch.arange(dims.numel(), device=final.device).unsqueeze(1)
     if prev_dims is not None:
         prev_rows = torch.arange(prev_dims.numel(), device=final.device).unsqueeze(1)
@@ -1136,18 +1314,22 @@ def _source_grad_block(
     *,
     mode: str,
     n_dims: int,
-    skip_first: int,
-    seq_len: int,
+    valid_mask: torch.Tensor,
 ) -> torch.Tensor:
     if mode == "batched":
-        # [n_dims, 1, T, D] from batched VJP.
-        return grad[:n_dims, 0, skip_first : seq_len - 1].mean(
-            dim=1, dtype=torch.float32,
+        # [n_dims, B, T, D] from batched VJP. Preserve the estimator's
+        # equal-prompt weighting: mean source positions *within* each prompt,
+        # then sum prompt Jacobians into the raw corpus accumulator.
+        mask = valid_mask.to(dtype=torch.float32).unsqueeze(0).unsqueeze(-1)
+        counts = valid_mask.sum(dim=1).clamp_min(1).to(torch.float32)
+        per_prompt = (
+            (grad[:n_dims].to(torch.float32) * mask).sum(dim=2)
+            / counts.reshape(1, -1, 1)
         )
+        return per_prompt.sum(dim=1)
     # [replicated_batch, T, D] from the reference replicated-prompt path.
-    return grad[:n_dims, skip_first : seq_len - 1].mean(
-        dim=1, dtype=torch.float32,
-    )
+    valid = valid_mask[0].nonzero(as_tuple=False).reshape(-1)
+    return grad[:n_dims, valid].mean(dim=1, dtype=torch.float32)
 
 
 def _empty_device_cache(device: torch.device) -> None:

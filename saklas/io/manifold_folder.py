@@ -311,6 +311,11 @@ class ManifoldSidecar:
     nodes_sha256: Optional[str] = None
     sae_release: Optional[str] = None
     sae_revision: Optional[str] = None
+    sae_ids_by_layer: dict[str, str] = field(default_factory=dict)
+    sae_full_coverage: bool = False
+    model_fingerprint: Optional[str] = None
+    capture_sha256: Optional[str] = None
+    fitted_layers: list[int] = field(default_factory=list)
     # Discover-mode-only fields.  ``None`` on authored fits.
     fit_mode: str = "authored"
     hyperparams: dict[str, Any] = field(default_factory=dict)
@@ -361,6 +366,11 @@ class ManifoldSidecar:
             nodes_sha256=data.get("nodes_sha256"),
             sae_release=data.get("sae_release"),
             sae_revision=data.get("sae_revision"),
+            sae_ids_by_layer=dict(data.get("sae_ids_by_layer", {})),
+            sae_full_coverage=bool(data.get("sae_full_coverage", False)),
+            model_fingerprint=data.get("model_fingerprint"),
+            capture_sha256=data.get("capture_sha256"),
+            fitted_layers=sorted(int(idx) for idx in data.get("fitted_layers", [])),
             fit_mode=data.get("fit_mode", "authored"),
             hyperparams=dict(data.get("hyperparams", {})),
             diagnostics=dict(data.get("diagnostics", {})),
@@ -461,7 +471,17 @@ class ManifoldFolder:
         return self.fit_mode in _FIT_MODES_DISCOVER
 
     @classmethod
-    def load(cls, folder: Path) -> "ManifoldFolder":
+    def load(
+        cls, folder: Path, *, verify_manifest: bool = True,
+    ) -> "ManifoldFolder":
+        """Parse a manifold folder.
+
+        Lifecycle/install/publish callers keep the default full integrity walk.
+        Fit callers may set ``verify_manifest=False``: they hash the live corpus
+        into ``nodes_sha256`` and validate only the requested fitted tensor, so
+        re-fitting model B does not reread every historical model/SAE payload.
+        Structural checks and tensor/sidecar pairing still run either way.
+        """
         folder = Path(folder)
         meta_path = folder / "manifold.json"
         if not meta_path.exists():
@@ -669,7 +689,7 @@ class ManifoldFolder:
             )
         # Verify only a populated manifest — a freshly hand-authored
         # manifold has no hashes yet; `fit` back-fills them.
-        if files:
+        if files and verify_manifest:
             ok, bad = verify_integrity(folder, files)
             if not ok:
                 raise ManifoldFormatError(
@@ -814,6 +834,11 @@ class ManifoldFolder:
                 "node_labels": list(self.node_labels),
             }))
             return h.hexdigest()
+        # Labels are part of the fitted artifact (steering-by-label, nearest
+        # reads, roles/kinds alignment).  Node filenames are index-based, so a
+        # rename can leave every corpus byte unchanged unless labels themselves
+        # participate in the staleness key.
+        h.update(_canonical_json(list(self.node_labels)))
         for idx in range(len(self.node_labels)):
             h.update(self.node_path(idx).read_bytes())
         if self.fit_mode == "authored":

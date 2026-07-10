@@ -82,6 +82,7 @@ class LensFitRequest(BaseModel):
 
     prompts: int = Field(default=100, ge=1, le=5000)
     seq_len: int | None = Field(default=None, ge=32, le=4096)
+    prompt_batch: int | None = Field(default=None, ge=1, le=64)
     layers: str = "workspace"
     force: bool = False
 
@@ -302,6 +303,7 @@ def register_lens_routes(app: FastAPI) -> None:
                 corpus_spec=spec,
                 source_layers=source_layers,
                 seq_len=body.seq_len,
+                prompt_batch=body.prompt_batch,
                 force=body.force,
                 on_progress=on_progress,
             )

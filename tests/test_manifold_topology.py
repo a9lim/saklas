@@ -15,6 +15,7 @@ the full selector through a synthetic whitener + per-layer consensus Gram.
 from __future__ import annotations
 
 import math
+from typing import Any
 
 import pytest
 import torch
@@ -573,7 +574,7 @@ def test_select_topology_reuses_laplacian_eigensystem(
     calls = 0
     real = manifold_mod._laplacian_eigen
 
-    def _counted(*args: object, **kwargs: object):
+    def _counted(*args: Any, **kwargs: Any):
         nonlocal calls
         calls += 1
         return real(*args, **kwargs)

@@ -358,6 +358,19 @@ def _run_tui(args: argparse.Namespace) -> None:
 
 
 @_saklas_error_exit
+def _enable_serve_live_lens_if_compatible(session: Any) -> bool:
+    """Apply serve's default-live policy only to a loadable lens artifact."""
+    if not session.has_compatible_jlens():
+        return False
+    try:
+        layers = session.enable_live_lens(top_k=8)
+        print(f"Live J-lens readout: on ({len(layers)} workspace-band layers)")
+        return True
+    except Exception as e:  # noqa: BLE001 — never block serve startup
+        print(f"Live J-lens readout: enable failed ({e})", file=sys.stderr)
+        return False
+
+
 def _run_serve(args: argparse.Namespace) -> None:
     try:
         import fastapi  # noqa: F401
@@ -419,13 +432,7 @@ def _run_serve(args: argparse.Namespace) -> None:
     # the dashboard's J-LENS tab is hot on first load (the toggle still
     # turns it off per session).  Serve-side policy only — the library and
     # TUI stay opt-in.  ``top_k=8`` matches the dashboard's readout width.
-    from saklas.io.lens import load_lens_sidecar
-    if load_lens_sidecar(session.model_id) is not None:
-        try:
-            layers = session.enable_live_lens(top_k=8)
-            print(f"Live J-lens readout: on ({len(layers)} workspace-band layers)")
-        except Exception as e:  # noqa: BLE001 — never block serve startup
-            print(f"Live J-lens readout: enable failed ({e})", file=sys.stderr)
+    _enable_serve_live_lens_if_compatible(session)
 
     print(f"\nServing on http://{args.host}:{args.port}")
     print(f"OpenAI-compatible:  http://{args.host}:{args.port}/v1")
@@ -461,7 +468,6 @@ def _require_model(args: argparse.Namespace) -> None:
 def _run_manifold_extract(args: argparse.Namespace) -> None:
     _require_model(args)
     import pathlib
-    from saklas.core.session import canonical_concept_name
     from saklas.io.paths import manifold_dir, tensor_filename
 
     if len(args.concept) == 1:
@@ -479,6 +485,9 @@ def _run_manifold_extract(args: argparse.Namespace) -> None:
         sys.exit(2)
 
     requested_release = getattr(args, "sae", None)
+    if getattr(args, "sae_revision", None) and not requested_release:
+        print("extract: --sae-revision requires --sae", file=sys.stderr)
+        sys.exit(2)
     requested_role = getattr(args, "role", None)
     if requested_release and requested_role:
         print(
@@ -489,19 +498,13 @@ def _run_manifold_extract(args: argparse.Namespace) -> None:
         )
         sys.exit(2)
 
-    # A steering vector is a 2-node ``pca`` manifold (4.0); it lives under
-    # ``manifolds/<ns>/<canonical>/``.  The per-model fitted tensor (raw or
-    # ``_sae-<release>``) inside it is the existence/destination marker; a
-    # role-augmented fit bakes into the node corpora and writes the canonical
-    # tensor name (no ``_role-`` suffix).
+    # A steering vector is a 2-node ``pca`` manifold (4.0); a role-augmented
+    # fit bakes into its node corpora and writes the canonical tensor name (no
+    # ``_role-`` suffix). Cache validation belongs to the loaded session/pipeline
+    # because bare file existence cannot prove sidecar integrity, corpus/role/SAE
+    # identity, or the loaded model fingerprint.
     ns = getattr(args, "namespace", None) or "local"
-    canonical = canonical_concept_name(raw, baseline)
     tensor_name = tensor_filename(args.model, release=requested_release)
-    tensor_path = pathlib.Path(manifold_dir(ns, canonical)) / tensor_name
-    if tensor_path.exists() and not args.force:
-        print(f"already extracted at {tensor_path}")
-        sys.exit(0)
-
     _print_startup(args)
     session = _make_session(args, load_probes=False)
     _print_model_info(session)
@@ -1048,11 +1051,14 @@ def _run_manifold_fit(args: argparse.Namespace) -> None:
     import json as _json
     from saklas.io.atomic import write_json_atomic
     from saklas.io.manifolds import (
-        ManifoldFolder, ManifoldFormatError, ManifoldSidecar, sanitize_hyperparams,
+        ManifoldFolder, ManifoldFormatError, sanitize_hyperparams,
         domain_label,
     )
 
     _require_model(args)
+    if getattr(args, "sae_revision", None) and not getattr(args, "sae", None):
+        print("manifold fit: --sae-revision requires --sae", file=sys.stderr)
+        sys.exit(2)
 
     # Resolve ``target`` to a folder.  A path that exists on disk (or that
     # carries a ``manifold.json``) is taken as an authored-folder path —
@@ -1073,7 +1079,7 @@ def _run_manifold_fit(args: argparse.Namespace) -> None:
 
     # Load the folder to learn its fit_mode before paying for a model load.
     try:
-        mf = ManifoldFolder.load(folder)
+        mf = ManifoldFolder.load(folder, verify_manifest=False)
     except ManifoldFormatError as e:
         print(f"manifold fit: {e}", file=sys.stderr)
         sys.exit(2)
@@ -1083,7 +1089,8 @@ def _run_manifold_fit(args: argparse.Namespace) -> None:
         getattr(args, attr, None) is not None
         for attr in (
             "method", "max_dim", "min_dim", "var_threshold", "k_nn",
-            "bandwidth", "max_subspace_dim",
+            "bandwidth", "max_subspace_dim", "smoothing",
+            "persistence_frac",
         )
     )
 
@@ -1142,33 +1149,24 @@ def _run_manifold_fit(args: argparse.Namespace) -> None:
             # Re-author the nodes list in case fit_mode changed and it
             # accidentally carries authored shape.  Discover nodes are
             # label-only.
-            data["nodes"] = [{"label": label} for label in mf.node_labels]
+            data["nodes"] = [
+                {
+                    "label": label,
+                    **({"role": mf.node_roles[idx]}
+                       if idx < len(mf.node_roles)
+                       and mf.node_roles[idx] is not None else {}),
+                    **({"kind": mf.node_kinds[idx]}
+                       if idx < len(mf.node_kinds)
+                       and mf.node_kinds[idx] is not None else {}),
+                }
+                for idx, label in enumerate(mf.node_labels)
+            ]
             data.pop("domain", None)
             write_json_atomic(folder / "manifold.json", data)
             metadata_changed = True
 
     if metadata_changed:
-        mf = ManifoldFolder.load(folder)
-
-    # Raw fits can prove a no-op entirely from the folder sidecar before loading
-    # a multi-GB model.  SAE revisions are resolved by the backend, so retain the
-    # in-pipeline revision check for those variants.
-    if not bool(getattr(args, "force", False)) and getattr(args, "sae", None) is None:
-        from saklas.io.paths import tensor_filename
-
-        tensor_path = folder / tensor_filename(args.model)
-        sidecar_path = tensor_path.with_suffix(".json")
-        if tensor_path.exists() and sidecar_path.exists():
-            try:
-                sidecar = ManifoldSidecar.load(sidecar_path)
-            except (
-                OSError, _json.JSONDecodeError, ManifoldFormatError,
-                KeyError, TypeError, ValueError,
-            ):
-                sidecar = None
-            if sidecar is not None and sidecar.nodes_sha256 == mf.nodes_sha256():
-                print(f"already fitted at {tensor_path}")
-                return
+        mf = ManifoldFolder.load(folder, verify_manifest=False)
 
     _print_startup(args)
     session = _make_session(args, load_probes=False)
@@ -1178,6 +1176,7 @@ def _run_manifold_fit(args: argparse.Namespace) -> None:
             folder,
             sae=getattr(args, "sae", None),
             sae_revision=getattr(args, "sae_revision", None),
+            layers=getattr(args, "layers", None),
             force=bool(getattr(args, "force", False)),
             on_progress=lambda m: print(f"  {m}"),
         )
@@ -2375,45 +2374,75 @@ def _lens_fit_source_preflight_matches(
     if requested_layers is None or requested_layers == "all":
         return set(source_layers) >= set(range(final_idx))
     if requested_layers in {"workspace", "band"}:
-        expected = {
-            layer for layer in range(final_idx)
-            if 0.40 <= layer / max(raw_count - 1, 1) <= 0.90
-        }
-        if not expected:
-            expected = set(range(final_idx))
+        from saklas.core.model import workspace_layer_indices
+
+        expected = set(workspace_layer_indices(range(final_idx), raw_count))
         return set(source_layers) >= expected
     return False
 
 
 def _try_lens_fit_noop_preflight(
     args: argparse.Namespace,
-    docs: list[str],
     requested_layers: "list[int] | str | None",
+    *,
+    docs: list[str] | None = None,
 ) -> bool:
-    """Return True after printing the no-op result without loading the model."""
+    """Prove an existing fit is exact without loading model weights."""
     import hashlib
 
     from saklas.core.jlens import DEFAULT_SEQ_LEN
-    from saklas.io.lens import lens_paths, load_lens_sidecar
+    from saklas.core.model import model_source_fingerprint
+    from saklas.io.lens import (
+        lens_paths,
+        load_lens_sidecar,
+        resolved_default_lens_corpus_spec,
+    )
 
     if args.force:
         return False
     sidecar = load_lens_sidecar(args.model)
     if sidecar is None:
         return False
-    seq_len = args.seq_len or DEFAULT_SEQ_LEN
-    raw_sha = hashlib.sha256(repr(docs).encode("utf-8")).hexdigest()
-    usable_count = int(sidecar.get("usable_prompt_count", -1))
+    source_fp = model_source_fingerprint(
+        args.model, quantize=args.quantize, device=args.device,
+    )
     if (
-        sidecar.get("raw_corpus_sha256") != raw_sha
-        or sidecar.get("raw_prompt_count") != len(docs)
-        or sidecar.get("seq_len") != seq_len
-        or int(sidecar.get("n_prompts", -1)) < usable_count
-        or usable_count < 0
+        source_fp is None
+        or sidecar.get("model_source_fingerprint") != source_fp
+        or sidecar.get("seq_len") != (args.seq_len or DEFAULT_SEQ_LEN)
         or not _lens_fit_source_preflight_matches(sidecar, requested_layers)
     ):
         return False
+    if docs is not None:
+        raw_sha = hashlib.sha256(repr(docs).encode("utf-8")).hexdigest()
+        if (
+            sidecar.get("raw_corpus_sha256") != raw_sha
+            or sidecar.get("raw_prompt_count") != len(docs)
+        ):
+            return False
+    else:
+        if args.corpus is not None:
+            return False
+        try:
+            _revision, expected_spec = resolved_default_lens_corpus_spec()
+        except Exception:
+            return False
+        if (
+            sidecar.get("corpus_spec") != expected_spec
+            or sidecar.get("raw_prompt_count") != int(args.prompts)
+        ):
+            return False
+    usable_count = int(sidecar.get("usable_prompt_count", -1))
+    if usable_count < 0 or int(sidecar.get("n_prompts", -1)) < usable_count:
+        return False
     ts_path, _ = lens_paths(args.model)
+    from saklas.io.packs import hash_file
+
+    if (
+        not ts_path.exists()
+        or sidecar.get("tensor_sha256") != hash_file(ts_path)
+    ):
+        return False
     size_mb = ts_path.stat().st_size / 1024**2 if ts_path.exists() else 0.0
     source_layers = [int(layer) for layer in sidecar["source_layers"]]
     print(
@@ -2421,7 +2450,7 @@ def _try_lens_fit_noop_preflight(
         f"{sidecar.get('n_prompts', usable_count)} prompts, "
         f"d_model={sidecar.get('d_model', '?')}"
     )
-    print("Already fitted for this corpus — nothing to do.")
+    print("Already fitted for this corpus and exact model source — nothing to do.")
     print(f"Artifact: {ts_path} ({size_mb:.0f} MB)")
     return True
 
@@ -2430,7 +2459,6 @@ def _run_lens_fit(args: argparse.Namespace) -> None:
     from saklas.core.session import SaklasSession
     from saklas.io.lens import lens_paths
 
-    docs, spec = _load_lens_corpus(args)
     requested_layers = _parse_layer_list(getattr(args, "layers", None))
     if requested_layers == "sample":
         print(
@@ -2439,7 +2467,14 @@ def _run_lens_fit(args: argparse.Namespace) -> None:
             file=sys.stderr,
         )
         sys.exit(2)
-    if _try_lens_fit_noop_preflight(args, docs, requested_layers):
+    if args.corpus is None and _try_lens_fit_noop_preflight(
+        args, requested_layers,
+    ):
+        return
+    docs, spec = _load_lens_corpus(args)
+    if args.corpus is not None and _try_lens_fit_noop_preflight(
+        args, requested_layers, docs=docs,
+    ):
         return
     _print_startup(args)
     with SaklasSession.from_pretrained(
@@ -2453,6 +2488,7 @@ def _run_lens_fit(args: argparse.Namespace) -> None:
             corpus_spec=spec,
             source_layers=requested_layers,
             dim_batch=args.dim_batch,
+            prompt_batch=args.prompt_batch,
             seq_len=args.seq_len,
             force=args.force,
             checkpoint_every=args.checkpoint_every,

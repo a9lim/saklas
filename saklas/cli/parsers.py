@@ -260,7 +260,9 @@ def _build_vector_extract(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument(
         "--sae-revision", dest="sae_revision", default=None, metavar="REV",
-        help="Pin a specific HF revision for the SAE release",
+        help="Pin a specific HF revision when the installed SAELens loader "
+             "supports revision= (otherwise errors rather than stamping an "
+             "unhonored pin)",
     )
     p.add_argument(
         "--role", default=None, metavar="SLUG",
@@ -346,6 +348,11 @@ def _build_manifold_fit(fit: argparse.ArgumentParser) -> None:
     )
     fit.add_argument("-m", "--model", default=None, metavar="MODEL_ID")
     fit.add_argument("-f", "--force", action="store_true")
+    fit.add_argument(
+        "--layers", default=None, metavar="L1,L2,...|workspace|all",
+        help="Fit only selected transformer layers (default: all; workspace "
+             "uses the 40–90%% depth band)",
+    )
     fit.add_argument(
         "--sae", default=None, metavar="RELEASE",
         help="Fit in an SAELens SAE feature space (requires `.[sae]`); "
@@ -913,6 +920,12 @@ def _build_lens_fit(p: argparse.ArgumentParser) -> None:
         help="Output dims per backward pass (default 8). Total backward work "
              "is K-invariant — the knob trades memory for per-pass overhead "
              "and barely moves wall time; halves automatically on OOM.",
+    )
+    p.add_argument(
+        "--prompt-batch", type=_positive_int, default=None, metavar="B",
+        help="Corpus prompts per autograd graph (default: 4 on CPU/CUDA, 1 on "
+             "MPS). Preserves equal-prompt estimator weighting; backs off "
+             "independently on OOM.",
     )
     p.add_argument(
         "--checkpoint-every", type=_positive_int, default=None, metavar="N",

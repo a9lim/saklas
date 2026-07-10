@@ -117,6 +117,33 @@ def test_batched_vjp_uses_single_prompt_forward_and_expected_grad_calls(
     assert grad_calls == math.ceil(_D / 4)
 
 
+def test_fit_stops_before_final_norm_and_lm_head(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The target-layer hook should terminate the forward at the residual."""
+    model = _frozen_model(n_layers=3)
+    tokenizer = _CharTokenizer()
+    calls = {"norm": 0, "head": 0}
+    real_norm = model.model.norm.forward
+    real_head = model.lm_head.forward
+
+    def counted_norm(*args: Any, **kwargs: Any) -> Any:
+        calls["norm"] += 1
+        return real_norm(*args, **kwargs)
+
+    def counted_head(*args: Any, **kwargs: Any) -> Any:
+        calls["head"] += 1
+        return real_head(*args, **kwargs)
+
+    monkeypatch.setattr(model.model.norm, "forward", counted_norm)
+    monkeypatch.setattr(model.lm_head, "forward", counted_head)
+    fit_jacobian_lens(
+        model, tokenizer, ["the quick brown fox js"], _layers(model),
+        dim_batch=3,
+    )
+    assert calls == {"norm": 0, "head": 0}
+
+
 def test_restricted_source_layers_match_exact_jacobian() -> None:
     """A band-restricted fit seeds at its lowest source layer (blocks below
     run graph-free) — the estimate must be unchanged by the truncation."""
@@ -153,6 +180,30 @@ def test_replicated_vjp_mode_matches_exact_jacobian() -> None:
         assert torch.allclose(lens.jacobians[source], exact, atol=1e-5)
 
 
+def test_scalar_vjp_mode_matches_exact_jacobian_without_replication() -> None:
+    model = _frozen_model(n_layers=3)
+    tokenizer = _CharTokenizer()
+    prompt = "the quick brown fox js"
+    seen_batches: list[int] = []
+    real_forward = model.forward
+
+    def counted_forward(input_ids: torch.Tensor, **kwargs: Any) -> Any:
+        seen_batches.append(int(input_ids.shape[0]))
+        return real_forward(input_ids=input_ids, **kwargs)
+
+    model.forward = counted_forward  # type: ignore[method-assign]
+    lens = fit_jacobian_lens(
+        model, tokenizer, [prompt], _layers(model),
+        dim_batch=4, skip_first=16, vjp_mode="scalar",
+    )
+
+    ids = tokenizer(prompt)["input_ids"]
+    for source in (0, 1):
+        exact = _exact_jacobian(model, ids, source, skip_first=16)
+        assert torch.allclose(lens.jacobians[source], exact, atol=1e-5)
+    assert seen_batches and set(seen_batches) == {1}
+
+
 def test_fit_averages_over_prompts_and_merge_agrees() -> None:
     model = _frozen_model(n_layers=2)
     tokenizer = _CharTokenizer()
@@ -167,6 +218,138 @@ def test_fit_averages_over_prompts_and_merge_agrees() -> None:
     assert joint.n_prompts == merged.n_prompts == 2
     for layer in joint.source_layers:
         assert torch.allclose(joint.jacobians[layer], merged.jacobians[layer], atol=1e-6)
+
+
+def test_ragged_prompt_microbatch_matches_single_prompt_graphs() -> None:
+    model = _frozen_model(n_layers=2)
+    tokenizer = _CharTokenizer()
+    prompts = [
+        "short but still comfortably usable",
+        "a substantially longer second prompt for padding coverage........",
+        "medium prompt with another length....",
+    ]
+    batched = fit_jacobian_lens(
+        model, tokenizer, prompts, _layers(model), dim_batch=3, prompt_batch=3,
+    )
+    singles = fit_jacobian_lens(
+        model, tokenizer, prompts, _layers(model), dim_batch=3, prompt_batch=1,
+    )
+    for layer in batched.source_layers:
+        assert torch.allclose(
+            batched.jacobians[layer], singles.jacobians[layer], atol=1e-6,
+        )
+
+
+def test_oom_after_committed_rows_resumes_without_double_counting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import saklas.core.jlens as jlens_module
+
+    model = _frozen_model(n_layers=2)
+    tokenizer = _CharTokenizer()
+    prompts = ["a prompt that is long enough."]
+    expected = fit_jacobian_lens(
+        model, tokenizer, prompts, _layers(model), dim_batch=3,
+    )
+    real_block = jlens_module._grad_row_block
+    calls = 0
+    injected = False
+
+    def flaky_block(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls, injected
+        calls += 1
+        if calls == 2 and not injected:
+            injected = True
+            raise RuntimeError("synthetic out of memory")
+        return real_block(*args, **kwargs)
+
+    monkeypatch.setattr(jlens_module, "_grad_row_block", flaky_block)
+    resumed = fit_jacobian_lens(
+        model, tokenizer, prompts, _layers(model), dim_batch=3,
+    )
+    assert injected
+    for layer in expected.source_layers:
+        assert torch.allclose(
+            resumed.jacobians[layer], expected.jacobians[layer], atol=1e-6,
+        )
+
+
+def test_committed_row_oom_at_dim_one_restarts_with_smaller_prompt_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import saklas.core.jlens as jlens_module
+
+    model = _frozen_model(n_layers=2)
+    tokenizer = _CharTokenizer()
+    prompts = [
+        "a first prompt that is long enough.",
+        "a second prompt that is long enough.",
+    ]
+    expected = fit_jacobian_lens(
+        model, tokenizer, prompts, _layers(model),
+        dim_batch=1, prompt_batch=1,
+    )
+    real_block = jlens_module._grad_row_block
+    calls = 0
+
+    def _oom_once(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("DefaultCPUAllocator: can't allocate memory")
+        return real_block(*args, **kwargs)
+
+    monkeypatch.setattr(jlens_module, "_grad_row_block", _oom_once)
+    resumed = fit_jacobian_lens(
+        model, tokenizer, prompts, _layers(model),
+        dim_batch=1, prompt_batch=2,
+    )
+    for layer in expected.source_layers:
+        assert torch.allclose(
+            resumed.jacobians[layer], expected.jacobians[layer], atol=1e-6,
+        )
+
+
+@pytest.mark.parametrize("fail_call", [1, 3])
+def test_auto_scalar_fallback_stays_single_prompt_and_never_double_counts(
+    monkeypatch: pytest.MonkeyPatch, fail_call: int,
+) -> None:
+    import saklas.core.jlens as jlens_module
+
+    model = _frozen_model(n_layers=2)
+    tokenizer = _CharTokenizer()
+    prompts = [
+        "a first prompt that is long enough.",
+        "a second prompt that is also long enough..",
+        "a third prompt for fallback continuation...",
+    ]
+    expected = fit_jacobian_lens(
+        model, tokenizer, prompts, _layers(model),
+        dim_batch=2, prompt_batch=3, vjp_mode="batched",
+    )
+    real_block = jlens_module._grad_row_block
+    calls = 0
+    injected = False
+
+    def unsupported_once(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls, injected
+        calls += 1
+        if calls == fail_call and not injected:
+            injected = True
+            raise RuntimeError("vmap batching rule not implemented")
+        return real_block(*args, **kwargs)
+
+    monkeypatch.setattr(jlens_module, "_grad_row_block", unsupported_once)
+    fallback = fit_jacobian_lens(
+        model, tokenizer, prompts, _layers(model),
+        dim_batch=2, prompt_batch=3, vjp_mode="auto",
+    )
+    assert injected
+    assert fallback.n_prompts == len(prompts)
+    for layer in expected.source_layers:
+        assert torch.allclose(
+            fallback.jacobians[layer], expected.jacobians[layer], atol=1e-6,
+        )
 
 
 def test_select_and_union_layers() -> None:

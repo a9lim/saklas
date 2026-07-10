@@ -136,9 +136,14 @@ def session_info(
         assistant_role_ok = user_role_ok = False
         default_assistant_role = default_user_role = None
     try:
-        from saklas.io.lens import load_lens_sidecar
+        checker = getattr(type(session), "has_compatible_jlens", None)
+        if callable(checker):
+            jlens_fitted = bool(checker(session))
+        else:
+            from saklas.io.lens import load_lens_sidecar
 
-        jlens_fitted = load_lens_sidecar(session.model_id) is not None
+            # Protocol/test doubles have no loaded model to fingerprint.
+            jlens_fitted = load_lens_sidecar(session.model_id) is not None
     except Exception:
         jlens_fitted = False
     return {

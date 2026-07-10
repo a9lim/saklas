@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+from types import SimpleNamespace
 
 import pytest
 
@@ -227,18 +228,20 @@ def test_yaml_compile_invalid_type_errors(monkeypatch: pytest.MonkeyPatch, tmp_p
 # Runners
 # ---------------------------------------------------------------------------
 
-def test_run_extract_cache_hit_prints_already_extracted(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+def test_run_extract_corrupt_tensor_does_not_short_circuit(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
 
     from saklas.io.paths import manifold_dir, tensor_filename
     model_id = "fake/model"
     # A steering vector is a 2-node pca manifold (4.0); extract lands it under
     # ``manifolds/<ns>/<canonical>/``.  A present per-model tensor is the
-    # cache-hit marker the runner checks (no manifold load needed).
+    # A bare corrupt tensor must not be treated as a validated cache hit.
     folder = manifold_dir("local", "happy.sad")
     folder.mkdir(parents=True, exist_ok=True)
     tensor = folder / tensor_filename(model_id)
     tensor.write_bytes(b"")
+
+    called = {"extract": 0}
 
     class FakeSession:
         def __init__(self, **kw: Any) -> None:
@@ -248,18 +251,105 @@ def test_run_extract_cache_hit_prints_already_extracted(monkeypatch: pytest.Monk
             self.probes = {}
 
         def extract(self, *a: Any, **kw: Any) -> Any:
-            raise AssertionError("extract() must not be called on cache hit")
+            called["extract"] += 1
+            return "happy.sad", object()
 
-    monkeypatch.setattr(cli_runners, "_make_session", lambda args: FakeSession())
+    monkeypatch.setattr(
+        cli_runners, "_make_session", lambda args, **_kwargs: FakeSession(),
+    )
     monkeypatch.setattr(cli_runners, "_print_model_info", lambda s: None)
     monkeypatch.setattr(cli_runners, "_print_startup", lambda args: None)
 
-    with pytest.raises(SystemExit) as excinfo:
-        cli.main(["manifold", "extract", "happy.sad", "-m", model_id])
-    assert excinfo.value.code == 0
+    cli.main(["manifold", "extract", "happy.sad", "-m", model_id])
+    assert called["extract"] == 1
     out = capsys.readouterr().out
-    assert "already extracted at" in out
-    assert str(tensor) in out
+    assert "extracted happy.sad" in out
+
+
+@pytest.mark.parametrize(
+    "argv,runner",
+    [
+        (
+            ["manifold", "extract", "happy", "-m", "fake/model",
+             "--sae-revision", "rev"],
+            cli_runners._run_manifold_extract,
+        ),
+        (
+            ["manifold", "fit", "missing", "-m", "fake/model",
+             "--sae-revision", "rev"],
+            cli_runners._run_manifold_fit,
+        ),
+    ],
+)
+def test_sae_revision_without_release_fails_before_model_load(
+    argv: list[str], runner: Any, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args = cli.parse_args(argv)
+    monkeypatch.setattr(
+        cli_runners, "_make_session",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("invalid flags loaded the model"),
+        ),
+    )
+    with pytest.raises(SystemExit) as exc:
+        runner(args)
+    assert exc.value.code == 2
+
+
+def test_fit_smoothing_override_preserves_node_role_and_kind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from saklas.core.manifold import CustomDomain
+    from saklas.io.manifold_authoring import create_discover_manifold_folder
+    from saklas.io.manifolds import ManifoldFolder
+
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    folder = create_discover_manifold_folder(
+        "local", "roles", "", fit_mode="auto",
+        node_corpora={"pirate": ["arrr"], "scholar": ["indeed"]},
+        node_roles={"pirate": "pirate", "scholar": "scholar"},
+        node_kinds={"pirate": "concrete", "scholar": "abstract"},
+    )
+    fake_manifold = SimpleNamespace(
+        name="roles", layers={0: object()}, node_labels=["pirate", "scholar"],
+        domain=CustomDomain(1), feature_space="raw",
+    )
+
+    class _FakeSession:
+        model_info = {}
+
+        def fit(self, *_args: Any, **_kwargs: Any) -> Any:
+            return fake_manifold
+
+    monkeypatch.setattr(
+        cli_runners, "_make_session", lambda *_args, **_kwargs: _FakeSession(),
+    )
+    monkeypatch.setattr(cli_runners, "_print_startup", lambda _args: None)
+    monkeypatch.setattr(cli_runners, "_print_model_info", lambda _session: None)
+    args = cli.parse_args([
+        "manifold", "fit", str(folder), "-m", "fake/model",
+        "--smoothing", "0.25",
+    ])
+    cli_runners._run_manifold_fit(args)
+    updated = ManifoldFolder.load(folder, verify_manifest=False)
+    assert updated.hyperparams["smoothing"] == 0.25
+    assert updated.node_roles == ["pirate", "scholar"]
+    assert updated.node_kinds == ["concrete", "abstract"]
+
+
+def test_serve_stale_lens_gate_uses_weight_compatibility() -> None:
+    class _Session:
+        enabled = False
+
+        def has_compatible_jlens(self) -> bool:
+            return False
+
+        def enable_live_lens(self, **_kwargs: Any) -> None:
+            self.enabled = True
+
+    session = _Session()
+    assert not cli_runners._enable_serve_live_lens_if_compatible(session)
+    assert not session.enabled
 
 
 def test_run_tui_registers_config_vectors(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):

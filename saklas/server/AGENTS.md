@@ -199,12 +199,15 @@ per-model sidecar/tensor via `_resolve_intrinsic_dim` + a `load_manifold` read.
   in-flight fit). Existing tensors go stale, not deleted.
 - `DELETE /manifolds/{ns}/{name}` — `remove_manifold_folder` (single source of truth
   shared with CLI `pack rm`) under `session.lock`; 409 when a fit holds the
-  gen-lock, 404 pre-lock. Response `{namespace, name, source, removed,
+  gen-lock, 404 pre-lock; referenced activation-capture groups are removed too. Response `{namespace, name, source, removed,
   rematerializes_on_restart}`.
 - `POST /manifolds/{ns}/{name}/fit` — `session.fit` under the lock; SSE
   / JSON. Discover folders accept `fit_mode` / `hyperparams` overrides, written
   atomically into `manifold.json` (after `sanitize_hyperparams`) *before* the fit;
-  authored folders reject them with 400. Poisedness `ValueError` →
+  authored folders reject them with 400. `force=true` bypasses tensor/capture
+  hits. `layers` optionally names explicit
+  transformer indices or `"workspace"`/`"all"`; the fitted tensor sidecar pins
+  that layer set. Poisedness `ValueError` →
   `code: "PoisednessError"`; `ConcurrentExtractionError` → 409. Steering a fitted
   manifold needs no route — a `%` term loads it lazily on scope entry.
 
@@ -354,8 +357,8 @@ a flat-buffer node (raw-ness isn't stamped server-side, the client's render
 mode supplies it). Errors: `LensNotFittedError`/`UnknownNodeError` → 404,
 `InvalidNodeOperationError`/bad `layers`/`top_k` → 400, other `SaklasError`s →
 their `user_message()` status. Discovery rides
-the session-info `jlens_fitted` field (a `lens_paths` existence check — never
-the ~GB lazy artifact load).
+the session-info `jlens_fitted` field (v2 sidecar + live-weight compatibility,
+never the ~GB lazy artifact load).
 
 `POST /sessions/{id}/lens/live` body `{enabled, layers?, top_k?=5}` — toggle
 the **live** workspace readout (`session.enable_live_lens` /
@@ -368,15 +371,15 @@ carries the per-step matrix as `lens_readout` (see ws_stream below) and
 session info reports the layer list as `live_lens_layers` (`null` while off —
 the dashboard's WORKSPACE-panel rehydration read). Errors:
 `LensNotFittedError` → 404, bad `layers` → 400, `top_k` outside `[1, 50]` →
-400. `saklas serve` auto-enables the live lens at startup when the artifact
-exists (`_run_serve`, `top_k=8`), so the dashboard opens hot; the toggle
+400. `saklas serve` auto-enables the live lens at startup only when the artifact
+matches the loaded weights (`_run_serve`, `top_k=8`), so the dashboard opens hot; the toggle
 still disables per session.
 
-`POST /sessions/{id}/lens/fit` body `{prompts?=100, seq_len?, layers?=
-"workspace", force?=false}` — kick off the **background lens fit** (the
+`POST /sessions/{id}/lens/fit` body `{prompts?=100, seq_len?, prompt_batch?,
+layers?="workspace", force?=false}` — kick off the **background lens fit** (the
 dashboard's "fit j-lens" button; the former CLI-only policy). 202 + the
 initial status; one fit at a time (409 while running); `layers="sample"`
-rejected (not fittable). The job streams the default fineweb-edu corpus
+rejected (not fittable). The job resolves an immutable Hub revision, then streams the default fineweb-edu corpus
 (`io.lens.stream_default_lens_corpus` — needs the optional `datasets` dep,
 else a clean typed error), runs `session.fit_jlens` (resume-by-default,
 checkpointed) in a worker thread, and auto-enables the full-band live lens

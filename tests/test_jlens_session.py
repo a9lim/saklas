@@ -8,14 +8,17 @@ established ``__new__``-stub pattern) so ``fit_jlens`` / ``jlens_readout`` /
 from __future__ import annotations
 
 import hashlib
+import json
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 import torch
 
 from saklas.core.jlens import LensNotFittedError, MultiTokenWordError
+from saklas.core.model import loaded_model_fingerprint, model_source_fingerprint
 from saklas.core.loom import (
     InvalidNodeOperationError,
     LoomTree,
@@ -28,7 +31,6 @@ from saklas.io.lens import (
     lens_paths,
     load_lens,
     load_lens_checkpoint,
-    save_lens,
     save_lens_checkpoint,
 )
 from tests._jlens_toys import CharTokenizer, frozen_toy
@@ -126,6 +128,16 @@ def test_fit_jlens_persists_and_property_loads() -> None:
     assert fresh.jlens.n_prompts == len(_PROMPTS)
 
 
+def test_jlens_property_rejects_legacy_sidecar_without_weight_identity() -> None:
+    fitted = _StubSession()
+    fitted.fit_jlens(_PROMPTS)
+    _, sidecar_path = lens_paths(_MODEL_ID)
+    sidecar = json.loads(sidecar_path.read_text())
+    sidecar.pop("model_fingerprint")
+    sidecar_path.write_text(json.dumps(sidecar))
+    assert _StubSession().jlens is None
+
+
 def test_fit_jlens_already_done_short_circuits() -> None:
     s = _StubSession()
     first = s.fit_jlens(_PROMPTS)
@@ -139,7 +151,7 @@ def test_fit_jlens_already_done_short_circuits() -> None:
         )
 
 
-def test_fit_jlens_raw_sidecar_noop_skips_tokenization() -> None:
+def test_fit_jlens_noop_revalidates_token_ids_before_loading_tensor() -> None:
     s = _StubSession()
     s._tokenizer = _CountingTokenizer()
     s.fit_jlens(_PROMPTS)
@@ -148,32 +160,46 @@ def test_fit_jlens_raw_sidecar_noop_skips_tokenization() -> None:
     again = s.fit_jlens(_PROMPTS, source_layers=[1])
 
     assert again.source_layers == [1]
-    assert s._tokenizer.calls == 0
+    assert s._tokenizer.calls == len(_PROMPTS)
+
+
+def test_fit_jlens_changed_tokenizer_invalidates_cache() -> None:
+    s = _StubSession()
+    s.fit_jlens(_PROMPTS)
+    original = load_lens(_MODEL_ID)
+    assert original is not None
+
+    class _ShiftedTokenizer(CharTokenizer):
+        def __call__(
+            self, text: str, return_tensors: str = "pt",
+        ) -> dict[str, torch.Tensor]:
+            result = super().__call__(text, return_tensors=return_tensors)
+            result["input_ids"] = (result["input_ids"] + 1) % 13
+            return result
+
+    s._tokenizer = _ShiftedTokenizer()
+    s._jlens = None
+    s.fit_jlens(_PROMPTS)
+    changed = load_lens(_MODEL_ID)
+    assert changed is not None
+    assert changed[1]["corpus_sha256"] != original[1]["corpus_sha256"]
 
 
 def test_fit_jlens_resumes_from_partial_and_matches_full_fit() -> None:
     s = _StubSession()
     full = s.fit_jlens(_PROMPTS, force=True)
 
-    # Simulate an interrupted fit: a checkpoint covering the first 2 prompts.
+    # A normal smaller-corpus artifact carries the hash of that actual prefix.
+    # Extending 2 -> N must recognize it without the old test-only trick of
+    # stamping the prefix tensor with the future full-corpus hash.
     partial = _StubSession()
-    head = partial.fit_jlens(_PROMPTS[:2], force=True)
-    consumed = [
-        [int(tok) for tok in partial._tokenizer(p, return_tensors="pt")["input_ids"][0].tolist()]
-        for p in _PROMPTS
-    ]
-    corpus_sha = hashlib.sha256(repr(consumed).encode("utf-8")).hexdigest()
-    save_lens(
-        head, _MODEL_ID,
-        corpus_spec="test", corpus_sha256=corpus_sha,
-        corpus_hash_kind="token_ids_v1",
-        seq_len=128, dim_batch=8, skip_first=16,
-    )
+    partial.fit_jlens(_PROMPTS[:2], force=True)
 
     resumed_session = _StubSession()
     messages: list[str] = []
     resumed = resumed_session.fit_jlens(_PROMPTS, on_progress=messages.append)
     assert any("resuming from 2 prompts" in m for m in messages)
+    assert any("prompt 4/4" in m for m in messages)
     assert resumed.n_prompts == len(_PROMPTS)
     # the resume base round-trips through the fp16 artifact — half-precision
     # tolerance against the pure-fp32 from-scratch fit
@@ -181,6 +207,118 @@ def test_fit_jlens_resumes_from_partial_and_matches_full_fit() -> None:
         assert torch.allclose(
             resumed.jacobians[layer], full.jacobians[layer], atol=2e-3,
         ), f"layer {layer}: resumed fit diverges from the from-scratch fit"
+
+
+def test_fit_jlens_changed_prefix_restarts_from_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import saklas.core.jlens as jlens_module
+
+    _StubSession().fit_jlens(_PROMPTS[:2], force=True)
+    changed = ["a changed first prompt that is long enough", *_PROMPTS[1:]]
+    real_fit = jlens_module.fit_jacobian_lens
+    fitted_widths: list[int] = []
+
+    def counted_fit(*args: Any, **kwargs: Any) -> Any:
+        fitted_widths.append(len(args[2]))
+        return real_fit(*args, **kwargs)
+
+    monkeypatch.setattr(jlens_module, "fit_jacobian_lens", counted_fit)
+    result = _StubSession().fit_jlens(changed)
+    assert result.n_prompts == len(changed)
+    assert fitted_widths == [len(changed)]
+
+
+def test_fit_jlens_loaded_weight_change_invalidates_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import saklas.core.jlens as jlens_module
+
+    first = _StubSession()
+    first.fit_jlens(_PROMPTS)
+    changed = _StubSession()
+    changed_model: Any = changed._model
+    with torch.no_grad():
+        changed_model.model.layers[0].w1.data.reshape(-1)[1] += 0.125
+    real_fit = jlens_module.fit_jacobian_lens
+    fitted_widths: list[int] = []
+
+    def counted_fit(*args: Any, **kwargs: Any) -> Any:
+        fitted_widths.append(len(args[2]))
+        return real_fit(*args, **kwargs)
+
+    monkeypatch.setattr(jlens_module, "fit_jacobian_lens", counted_fit)
+    changed.fit_jlens(_PROMPTS)
+    assert fitted_widths == [len(_PROMPTS)]
+
+
+def test_loaded_model_fingerprint_hashes_buffers_and_original_dtype_bits() -> None:
+    class _Stateful(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(
+                torch.tensor([1.0], dtype=torch.float64),
+            )
+            self.register_buffer("scale", torch.tensor([2], dtype=torch.int64))
+            self.config = SimpleNamespace(
+                model_type="toy", _commit_hash="same-claimed-commit",
+                _name_or_path="toy",
+            )
+
+    base = _Stateful()
+    weight_changed = _Stateful()
+    weight_changed.weight.data[0] = torch.nextafter(
+        weight_changed.weight.data[0], torch.tensor(2.0, dtype=torch.float64),
+    )
+    buffer_changed = _Stateful()
+    buffer_scale: Any = buffer_changed.scale
+    buffer_scale[0] = 3
+    fp = loaded_model_fingerprint(base, "toy")
+    assert loaded_model_fingerprint(weight_changed, "toy") != fp
+    assert loaded_model_fingerprint(buffer_changed, "toy") != fp
+
+
+def test_local_source_fingerprint_includes_remote_code_and_tokenizer_files(
+    tmp_path: Path,
+) -> None:
+    model_dir = tmp_path / "local-model"
+    model_dir.mkdir()
+    (model_dir / "model.safetensors").write_bytes(b"weights")
+    (model_dir / "config.json").write_text("{}")
+    code = model_dir / "modeling_custom.py"
+    vocab = model_dir / "vocab.json"
+    code.write_text("VALUE = 1\n")
+    vocab.write_text('{"a": 0}')
+    config = SimpleNamespace(
+        model_type="custom", _commit_hash=None,
+        _name_or_path=str(model_dir),
+    )
+    first = model_source_fingerprint(
+        str(model_dir), config=config, device="cpu",
+        parameter_dtype=torch.float32,
+    )
+    assert first is not None
+    code.write_text("VALUE = 2\n")
+    second = model_source_fingerprint(
+        str(model_dir), config=config, device="cpu",
+        parameter_dtype=torch.float32,
+    )
+    assert second != first
+    vocab.write_text('{"b": 0}')
+    third = model_source_fingerprint(
+        str(model_dir), config=config, device="cpu",
+        parameter_dtype=torch.float32,
+    )
+    assert third != second
+
+
+def test_jlens_property_rejects_changed_loaded_weights() -> None:
+    _StubSession().fit_jlens(_PROMPTS)
+    changed = _StubSession()
+    changed_model: Any = changed._model
+    with torch.no_grad():
+        changed_model.model.layers[0].w1.data.reshape(-1)[1] += 0.125
+    assert changed.jlens is None
 
 
 def test_fit_jlens_resumes_from_checkpoint_without_full_artifact() -> None:
@@ -205,6 +343,9 @@ def test_fit_jlens_resumes_from_checkpoint_without_full_artifact() -> None:
         seq_len=128,
         dim_batch=8,
         skip_first=16,
+        model_fingerprint=loaded_model_fingerprint(
+            head_session._model, _MODEL_ID,
+        ),
     )
 
     messages: list[str] = []
@@ -244,6 +385,9 @@ def test_fit_jlens_checkpoint_survives_two_interruptions(
         seq_len=128,
         dim_batch=8,
         skip_first=16,
+        model_fingerprint=loaded_model_fingerprint(
+            head_session._model, _MODEL_ID,
+        ),
     )
 
     real_fit = jlens_mod.fit_jacobian_lens

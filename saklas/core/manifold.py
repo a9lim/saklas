@@ -41,15 +41,19 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
+import tempfile
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Sequence, cast
 
 import torch
+from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 
-from saklas.core.errors import SaklasError
+from saklas.core.errors import SaklasError, is_out_of_memory_error
 
 if TYPE_CHECKING:
     from saklas.core.mahalanobis import LayerWhitener
@@ -1437,6 +1441,7 @@ def fit_affine_subspace(
     whitened_gram: torch.Tensor | None = None,
     whitened_rows: torch.Tensor | None = None,
     orient_to: int | None = 0,
+    basis_override: torch.Tensor | None = None,
 ) -> tuple[LayerSubspace, torch.Tensor, float]:
     """Fit a flat (affine, no-RBF) subspace from per-node centroids (§5).
 
@@ -1480,10 +1485,16 @@ def fit_affine_subspace(
         raise ValueError(f"an affine subspace needs >= 2 nodes, got {K}")
     mu = centroids.mean(dim=0)
     X = centroids - mu  # (K, D) μ-centered
-    basis, ev_ratio = _pca_basis(
-        X, n_components=n_components, whitener=whitener, layer=layer,
-        whitened_gram=whitened_gram, whitened_rows=whitened_rows,
-    )
+    if basis_override is None:
+        basis, ev_ratio = _pca_basis(
+            X, n_components=n_components, whitener=whitener, layer=layer,
+            whitened_gram=whitened_gram, whitened_rows=whitened_rows,
+        )
+    else:
+        basis = basis_override[: min(n_components, basis_override.shape[0])].to(
+            device="cpu", dtype=torch.float32,
+        ).contiguous()
+        ev_ratio = 1.0  # diagnostic is unused by planned pipeline callers
     if orient_to is not None:
         proj = basis @ (centroids[orient_to] - mu)      # (R,)
         signs = torch.where(proj < 0, -1.0, 1.0)        # flip rows facing away
@@ -1545,6 +1556,7 @@ def fit_layer_subspace(
     smoothing: float | str | None = None,
     rbf_info: dict[str, float] | None = None,
     rbf_plan: RbfFitPlan | None = None,
+    basis_override: torch.Tensor | None = None,
 ) -> tuple[LayerSubspace, float]:
     """Fit a PCA subspace + RBF interpolant for one layer (curved).
 
@@ -1615,10 +1627,16 @@ def fit_layer_subspace(
     # ``fit_affine_subspace`` via ``_pca_basis`` so both pick the subspace
     # identically; only what's built on top (RBF surface vs. analytic affine)
     # differs.
-    basis, ev_ratio = _pca_basis(
-        X, n_components=n_components, whitener=whitener, layer=layer,
-        whitened_gram=whitened_gram, whitened_rows=whitened_rows,
-    )
+    if basis_override is None:
+        basis, ev_ratio = _pca_basis(
+            X, n_components=n_components, whitener=whitener, layer=layer,
+            whitened_gram=whitened_gram, whitened_rows=whitened_rows,
+        )
+    else:
+        basis = basis_override[: min(n_components, basis_override.shape[0])].to(
+            device="cpu", dtype=torch.float32,
+        ).contiguous()
+        ev_ratio = 1.0  # diagnostic is unused by planned pipeline callers
     # Neutral-anchor the frame (§5): ``mean = P_basis(anchor)`` and the RBF
     # interpolates **anchor-relative** reduced coords, so neutral lands at
     # reduced-coord 0 and ``eval_at(node_i) = P_basis(centroid_i)`` (the
@@ -3185,6 +3203,11 @@ class TopologyChoice:
     # when unavailable.  Lets an ``auto`` fit emit a diagnostics block so the
     # inspector renders the same bars a pinned ``pca``/``spectral`` fit does.
     diagnostics: "object | None" = None
+    # Curved winner's already-normalized, factorized layout plan.  Auto-mode
+    # spends this work while scoring the candidate; the final per-layer fit can
+    # reuse it instead of repeating QR/eigh/LU over the same node geometry.
+    rbf_plan: "RbfFitPlan | None" = None
+    fisher_bases: "dict[int, torch.Tensor]" = field(default_factory=dict)
 
 
 def _gcv_value(rss: float, edf: float, K: int) -> float:
@@ -3227,6 +3250,7 @@ def _rbf_gcv_score(
     targets: dict[int, torch.Tensor],
     *,
     smoothing: float | str,
+    plan: RbfFitPlan | None = None,
 ) -> float:
     """Summed GCV of the penalized RBF surface over a layout.
 
@@ -3243,7 +3267,7 @@ def _rbf_gcv_score(
     hi = node_params.max(dim=0).values
     norm = (node_params - lo) / (hi - lo).clamp(min=1e-9)
     K = norm.shape[0]
-    plan = prepare_rbf_fit_plan(norm, smoothing=smoothing)
+    plan = plan or prepare_rbf_fit_plan(norm, smoothing=smoothing)
     E, Q = plan.E, plan.Q
     total = 0.0
     for y in targets.values():
@@ -3794,6 +3818,7 @@ def select_topology(
     # predicts the *same* y in the *same* metric, so the comparison isolates
     # the coordinate geometry + surface, not the basis (common-mode).
     targets: dict[int, torch.Tensor] = {}
+    fisher_bases: dict[int, torch.Tensor] = {}
     for L in fit_layers:
         X = stacks[L].to(torch.float32)
         X = X - X.mean(dim=0, keepdim=True)
@@ -3804,6 +3829,7 @@ def select_topology(
                 whitened_rows.get(L) if whitened_rows is not None else None
             ),
         )
+        fisher_bases[L] = basis
         targets[L] = (X @ basis.transpose(0, 1)).contiguous()      # (K, R)
 
     candidates: list[TopologyCandidate] = []
@@ -3816,7 +3842,7 @@ def select_topology(
 
     # (a) Curved Euclidean (spectral) — may fail on a tiny / disconnected heap.
     gcv_curved = math.inf
-    curved: tuple[torch.Tensor, ManifoldDomain] | None = None
+    curved: tuple[torch.Tensor, ManifoldDomain, RbfFitPlan] | None = None
     spec_diag: object | None = None
     spectral_eigen: tuple[torch.Tensor, torch.Tensor, int, float] | None = None
     try:
@@ -3845,17 +3871,23 @@ def select_topology(
         k_spec = int(coords_spec.shape[1])
         if (2 * k_spec + 1) > K:
             raise ValueError(f"poisedness floor 2n+1={2 * k_spec + 1} exceeds K={K}")
+        spec_plan = prepare_rbf_fit_plan(
+            coords_spec.to(torch.float32), smoothing=smoothing,
+        )
         gcv_curved = _rbf_gcv_score(
             coords_spec.to(torch.float32), targets, smoothing=smoothing,
+            plan=spec_plan,
         )
-        curved = (coords_spec, CustomDomain(k_spec))
+        curved = (coords_spec, CustomDomain(k_spec), spec_plan)
         candidates.append(TopologyCandidate("spectral", "spectral", k_spec, gcv_curved, True))
     except (ValueError, RuntimeError) as e:  # _LinAlgError ⊂ RuntimeError
         candidates.append(TopologyCandidate("spectral", "spectral", 0, math.inf, False, str(e)))
 
     # (b) Periodic (circle / torus) detection — persistent homology counts the
     # loops (ellipse/noise-robust), spectral eigenpairs coordinate them.
-    periodic: tuple[torch.Tensor, ManifoldDomain, float] | None = None
+    periodic: tuple[
+        torch.Tensor, ManifoldDomain, float, RbfFitPlan,
+    ] | None = None
     try:
         if spectral_eigen is None:
             spectral_eigen = _laplacian_eigen(
@@ -3882,15 +3914,19 @@ def select_topology(
                     for i in range(d)
                 ]
                 p_domain = BoxDomain(axes)
+                p_params = p_domain.embed(p_coords).to(torch.float32)
+                periodic_plan = prepare_rbf_fit_plan(
+                    p_params, smoothing=smoothing,
+                )
                 gcv_p = _rbf_gcv_score(
-                    p_domain.embed(p_coords).to(torch.float32),
-                    targets, smoothing=smoothing,
+                    p_params, targets, smoothing=smoothing,
+                    plan=periodic_plan,
                 )
                 note = f"H1 persistent loops = {n_loops}"
                 candidates.append(TopologyCandidate(
                     f"torus-T{d}", "spectral", d, gcv_p, True, note,
                 ))
-                periodic = (p_coords, p_domain, gcv_p)
+                periodic = (p_coords, p_domain, gcv_p, periodic_plan)
     except (ValueError, RuntimeError):
         pass  # no clean eigenmap ⇒ no periodic candidate
 
@@ -3905,7 +3941,7 @@ def select_topology(
     # guarded only against a degenerate (non-finite) periodic fit.  Absent a
     # circle, the lower-GCV of flat vs curved wins.
     if periodic is not None and math.isfinite(periodic[2]):
-        p_coords, p_domain, _gcv_p = periodic
+        p_coords, p_domain, _gcv_p, winner_plan = periodic
         win_name = f"torus-T{int(p_coords.shape[1])}"
         win_mode, win_coords, win_domain = "spectral", p_coords, p_domain
         win_diag = spec_diag  # periodic rides the spectral eigenpairs
@@ -3913,10 +3949,12 @@ def select_topology(
         win_name = "spectral"
         win_mode, win_coords, win_domain = "spectral", curved[0], curved[1]
         win_diag = spec_diag
+        winner_plan = curved[2]
     else:
         win_name = "flat-pca"
         win_mode, win_coords, win_domain = "pca", coords_flat, CustomDomain(k_flat)
         win_diag = pca_diag
+        winner_plan = None
 
     candidates.sort(key=lambda c: (not c.viable, c.score))
     return TopologyChoice(
@@ -3926,6 +3964,8 @@ def select_topology(
         domain=win_domain,
         candidates=tuple(candidates),
         diagnostics=win_diag,
+        rbf_plan=winner_plan,
+        fisher_bases=fisher_bases,
     )
 
 
@@ -4081,6 +4121,136 @@ def compute_node_activation_rows(
     return rows_by_layer
 
 
+class ActivationRowStore:
+    """Temporary layer-major pooled-row spool for curved manifold fitting.
+
+    A curved fit needs per-response rows only after the centroid-derived basis
+    exists.  Keeping ``nodes × responses × layers × d_model`` in resident fp32
+    is a multi-GiB cliff, while dropping it makes auto-curved fitting repeat the
+    complete model pass.  This store writes one mmap-backed tensor per layer in
+    the model output dtype, indexed by the original flat corpus row.  fp16/bf16
+    storage is lossless relative to the source residual; fp32 promotion happens
+    only when covariance math consumes a node slice.
+    """
+
+    def __init__(self, node_sizes: Sequence[int]) -> None:
+        self.node_sizes = [int(size) for size in node_sizes]
+        self.offsets: list[int] = []
+        offset = 0
+        for size in self.node_sizes:
+            self.offsets.append(offset)
+            offset += size
+        self.total_rows = offset
+        self._tmp: tempfile.TemporaryDirectory[str] | None = (
+            tempfile.TemporaryDirectory(prefix="saklas-manifold-rows-")
+        )
+        self._layers: dict[int, torch.Tensor] = {}
+        self._closed = False
+
+    @classmethod
+    def load(
+        cls, path: Path, node_sizes: Sequence[int], *,
+        layer_indices: Sequence[int] | None = None,
+    ) -> "ActivationRowStore":
+        store = cls.__new__(cls)
+        store.node_sizes = [int(size) for size in node_sizes]
+        store.offsets = []
+        offset = 0
+        for size in store.node_sizes:
+            store.offsets.append(offset)
+            offset += size
+        store.total_rows = offset
+        selected = (
+            None if layer_indices is None
+            else {int(idx) for idx in layer_indices}
+        )
+        store._layers = {}
+        with safe_open(str(path), framework="pt", device="cpu") as tensors:
+            for key in tensors.keys():
+                if not key.startswith("layer_"):
+                    continue
+                idx = int(key.split("_", 1)[1])
+                if selected is None or idx in selected:
+                    store._layers[idx] = tensors.get_tensor(key)
+        if not store._layers or any(
+            rows.ndim != 2 or int(rows.shape[0]) != store.total_rows
+            for rows in store._layers.values()
+        ):
+            raise ValueError(f"invalid activation-row cache at {path}")
+        if selected is not None and set(store._layers) != selected:
+            raise ValueError(
+                f"activation-row cache at {path} has layers "
+                f"{sorted(store._layers)}, need {sorted(selected)}"
+            )
+        store._tmp = None
+        store._closed = False
+        return store
+
+    def _layer(self, idx: int, *, dim: int, dtype: torch.dtype) -> torch.Tensor:
+        existing = self._layers.get(idx)
+        if existing is not None:
+            if existing.shape != (self.total_rows, dim) or existing.dtype != dtype:
+                raise ValueError(f"activation-row shape/dtype changed at layer {idx}")
+            return existing
+        if self._closed:
+            raise RuntimeError("activation-row store is closed")
+        assert self._tmp is not None
+        path = Path(self._tmp.name) / f"layer_{idx}.bin"
+        rows = torch.from_file(
+            str(path), shared=True, size=self.total_rows * dim, dtype=dtype,
+        ).reshape(self.total_rows, dim)
+        self._layers[idx] = rows
+        return rows
+
+    def write(
+        self, idx: int, flat_indices: torch.Tensor, rows: torch.Tensor,
+    ) -> None:
+        host = rows.detach().to(device="cpu")
+        target = self._layer(idx, dim=int(host.shape[1]), dtype=host.dtype)
+        target.index_copy_(0, flat_indices.to(dtype=torch.long, device="cpu"), host)
+
+    def node_rows(self, node_idx: int) -> dict[int, torch.Tensor]:
+        start = self.offsets[node_idx]
+        end = start + self.node_sizes[node_idx]
+        return {idx: rows[start:end] for idx, rows in self._layers.items()}
+
+    @property
+    def layer_indices(self) -> list[int]:
+        return sorted(self._layers)
+
+    def flat_rows(self, idx: int) -> torch.Tensor:
+        return self._layers[idx]
+
+    def persist(self, path: Path) -> None:
+        if self._closed:
+            raise RuntimeError("activation-row store is closed")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        save_file(
+            {f"layer_{idx}": rows.contiguous() for idx, rows in self._layers.items()},
+            str(tmp),
+        )
+        os.replace(tmp, path)
+
+    def __iter__(self) -> Iterator[dict[int, torch.Tensor]]:
+        for node_idx in range(len(self.node_sizes)):
+            yield self.node_rows(node_idx)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._layers.clear()
+        if self._tmp is not None:
+            self._tmp.cleanup()
+        self._closed = True
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
 def compute_manifold_node_stats(
     model: torch.nn.Module,
     tokenizer: object,
@@ -4093,16 +4263,24 @@ def compute_manifold_node_stats(
     model_type: str | None = None,
     layer_indices: Sequence[int] | None = None,
     retain_rows: bool = False,
-) -> tuple[list[dict[int, torch.Tensor]], list[dict[int, torch.Tensor]] | None]:
+    prepared_rows: "Sequence[tuple[torch.Tensor, int]] | None" = None,
+    capture_context: "Any | None" = None,
+) -> tuple[list[dict[int, torch.Tensor]], ActivationRowStore | None]:
     """Fit-wide batched capture for all manifold nodes.
 
     Rows carry their node/within-node indices through one stream, so short
     template corpora share batches across node boundaries instead of paying one
     underfilled model forward per node.  Standard 48-response nodes retain the
     same chunking, while OOM backoff halves the active batch and cautiously grows
-    it again.  Returns per-node centroids plus optional retained fp32 rows.
+    it again. Returns per-node fp32 centroids plus optional retained rows in the
+    capture source dtype.
     """
-    from saklas.core.vectors import _CAPTURE_BATCH, _encode_and_capture_all_batch
+    from saklas.core.vectors import (
+        _CAPTURE_BATCH,
+        _CAPTURE_BATCH_MAX,
+        _encode_and_capture_all_batch,
+        _prepare_capture_batch,
+    )
 
     if not prompts:
         raise ValueError("conversational capture needs at least one baseline prompt")
@@ -4132,16 +4310,38 @@ def compute_manifold_node_stats(
         )
 
     sums: dict[int, torch.Tensor] = {}
-    retained: list[dict[int, torch.Tensor]] | None = (
-        [dict() for _ in node_groups] if retain_rows else None
+    retained = ActivationRowStore(node_sizes) if retain_rows else None
+    # Render/tokenize once, then group similar lengths so right-padding does not
+    # make every row pay the longest response's quadratic attention cost.  Tiny
+    # CPU test tokenizers are intentionally non-callable and keep the legacy
+    # seam; production HF tokenizers always take the prepared path.
+    prepared: list[tuple[torch.Tensor, int]] | None = (
+        list(prepared_rows) if prepared_rows is not None else None
+    )
+    if prepared is not None and len(prepared) != len(flat):
+        raise ValueError("prepared_rows must align with the flattened manifold corpus")
+    if prepared is None and callable(tokenizer):
+        prepared = _prepare_capture_batch(
+            tokenizer,
+            [row[2] for row in flat],
+            [row[3] for row in flat],
+            device,
+            roles=[row[4] for row in flat],
+            model_type=model_type,
+        )
+    order = (
+        sorted(range(len(flat)), key=lambda i: int(prepared[i][0].shape[1]))
+        if prepared is not None else list(range(len(flat)))
     )
     active_batch = _CAPTURE_BATCH
+    bad_batch_ceiling: int | None = None
     successes = 0
     start = 0
     is_mps = getattr(device, "type", None) == "mps"
-    while start < len(flat):
-        end = min(start + active_batch, len(flat))
-        chunk = flat[start:end]
+    while start < len(order):
+        end = min(start + active_batch, len(order))
+        chunk_indices = order[start:end]
+        chunk = [flat[i] for i in chunk_indices]
         try:
             per_layer = _encode_and_capture_all_batch(
                 model, tokenizer,
@@ -4151,10 +4351,20 @@ def compute_manifold_node_stats(
                 roles=[row[4] for row in chunk],
                 model_type=model_type,
                 layer_indices=capture_layers,
+                rendered=(
+                    [prepared[i] for i in chunk_indices]
+                    if prepared is not None else None
+                ),
+                promote_pooled=not retain_rows,
+                capture_context=capture_context,
             )
         except RuntimeError as exc:
-            if "out of memory" not in str(exc).lower() or active_batch <= 1:
+            if not is_out_of_memory_error(exc) or active_batch <= 1:
                 raise
+            bad_batch_ceiling = (
+                active_batch if bad_batch_ceiling is None
+                else min(bad_batch_ceiling, active_batch)
+            )
             active_batch = max(1, active_batch // 2)
             successes = 0
             if is_mps:
@@ -4163,26 +4373,45 @@ def compute_manifold_node_stats(
                 torch.cuda.empty_cache()
             continue
 
+        node_ids_cpu = torch.tensor([row[0] for row in chunk], dtype=torch.long)
+        flat_indices_cpu = torch.tensor(chunk_indices, dtype=torch.long)
         for idx in capture_layers:
-            host = per_layer[idx].detach().to("cpu", torch.float32)
+            captured = per_layer[idx].detach()
             if idx not in sums:
                 sums[idx] = torch.zeros(
-                    len(node_groups), host.shape[1], dtype=torch.float32,
+                    len(node_groups), captured.shape[1], dtype=torch.float32,
                 )
-                if retained is not None:
-                    for node_idx, size in enumerate(node_sizes):
-                        retained[node_idx][idx] = torch.empty(
-                            size, host.shape[1], dtype=torch.float32,
-                        )
-            for batch_idx, (node_idx, row_idx, *_rest) in enumerate(chunk):
-                sums[idx][node_idx].add_(host[batch_idx])
-                if retained is not None:
-                    retained[node_idx][idx][row_idx].copy_(host[batch_idx])
+            if retained is not None:
+                # Raw rows must cross the boundary for the later sigma fit, but
+                # stay in source dtype in the mmap.  Accumulate their promoted
+                # host values while they are already present.
+                host = captured.to(device="cpu")
+                retained.write(idx, flat_indices_cpu, host)
+                for batch_idx, node_idx in enumerate(node_ids_cpu.tolist()):
+                    sums[idx][node_idx].add_(host[batch_idx].to(torch.float32))
+            else:
+                # Centroid-only fits need one partial sum per node, not every
+                # response row.  Reduce on-device in fp32 and transfer U×D
+                # (usually 1×D) instead of B×D.
+                node_ids = node_ids_cpu.to(captured.device)
+                unique, inverse = torch.unique(
+                    node_ids, sorted=True, return_inverse=True,
+                )
+                partial = torch.zeros(
+                    unique.numel(), captured.shape[1],
+                    dtype=torch.float32, device=captured.device,
+                )
+                partial.index_add_(0, inverse, captured.to(torch.float32))
+                sums[idx].index_add_(
+                    0, unique.to(device="cpu"), partial.to(device="cpu"),
+                )
         del per_layer
         start = end
         successes += 1
-        if active_batch < _CAPTURE_BATCH and successes >= 4:
-            active_batch = min(_CAPTURE_BATCH, active_batch * 2)
+        if active_batch < _CAPTURE_BATCH_MAX and successes >= 4:
+            candidate = min(_CAPTURE_BATCH_MAX, active_batch * 2)
+            if bad_batch_ceiling is None or candidate < bad_batch_ceiling:
+                active_batch = candidate
             successes = 0
         if is_mps:
             torch.mps.empty_cache()
@@ -4533,6 +4762,8 @@ def save_manifold(
         }
     for key in (
         "nodes_sha256", "sae_release", "sae_revision", "sae_ids_by_layer",
+        "sae_full_coverage",
+        "model_fingerprint", "capture_sha256", "fitted_layers",
         # Share-weighting metric ("mahalanobis" / "euclidean") — the
         # manifold analogue of the vector sidecar's ``bake`` field.
         "share_metric",

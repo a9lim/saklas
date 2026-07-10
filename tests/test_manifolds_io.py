@@ -296,6 +296,24 @@ def test_nodes_sha256_stable_and_sensitive(tmp_path: Path):
     assert h1 != h2
 
 
+def test_fit_parse_can_skip_historical_manifest_hashing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    folder = _author_manifold(tmp_path)
+    _add_dummy_tensor(folder)
+    mf = ManifoldFolder.load(folder)
+    mf.write_metadata()
+
+    import saklas.io.manifold_folder as folder_module
+
+    def _must_not_verify(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("fit-specific parse hashed the full manifest")
+
+    monkeypatch.setattr(folder_module, "verify_integrity", _must_not_verify)
+    loaded = ManifoldFolder.load(folder, verify_manifest=False)
+    assert loaded.name == mf.name
+
+
 def test_nodes_sha256_sensitive_to_coords(tmp_path: Path):
     # Moving a node's authoring coordinate must invalidate the hash even
     # when the corpus is untouched — the fit depends on the geometry.
@@ -1071,10 +1089,23 @@ def test_clear_manifold_tensors_removes_tensors_keeps_corpus(
     folder, _ = create_manifold_folder(
         "local", "mood", "", domain, _author_nodes(["a", "b", "c"]),
     )
-    _fake_fit_tensor(folder, "google/gemma-3-4b-it")
+    fitted = _fake_fit_tensor(folder, "google/gemma-3-4b-it")
+    capture_sha = "c" * 64
+    sidecar_path = fitted.with_suffix(".json")
+    sidecar = json.loads(sidecar_path.read_text())
+    sidecar["capture_sha256"] = capture_sha
+    sidecar_path.write_text(json.dumps(sidecar))
+    ManifoldFolder.load(folder, verify_manifest=False).write_metadata()
+    from saklas.io.paths import model_dir
+
+    capture_dir = model_dir("google/gemma-3-4b-it") / "manifold_capture"
+    capture_dir.mkdir(parents=True)
+    capture_file = capture_dir / f"{capture_sha}.centroids.safetensors"
+    capture_file.write_bytes(b"cached")
     n = clear_manifold_tensors("local", "mood")
     assert n == 2  # tensor + sidecar
     assert not list(folder.glob("*.safetensors"))
+    assert not capture_file.exists()
     # Corpus + manifest survive.
     assert (folder / "manifold.json").exists()
     assert (folder / "nodes").is_dir()
@@ -1142,6 +1173,32 @@ def test_remove_manifold_folder_local(tmp_path: Path, monkeypatch: pytest.Monkey
     assert result["removed"] is True
     assert result["source"] == "local"
     assert result["rematerializes_on_restart"] is False
+
+
+def test_remove_manifold_folder_removes_referenced_capture_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    domain = {"type": "box", "axes": [
+        {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]}
+    folder, _ = create_manifold_folder(
+        "local", "mood", "", domain, _author_nodes(["a", "b", "c"]),
+    )
+    fitted = _fake_fit_tensor(folder, "google/gemma-3-4b-it")
+    capture_sha = "d" * 64
+    sidecar_path = fitted.with_suffix(".json")
+    sidecar = json.loads(sidecar_path.read_text())
+    sidecar["capture_sha256"] = capture_sha
+    sidecar_path.write_text(json.dumps(sidecar))
+    ManifoldFolder.load(folder, verify_manifest=False).write_metadata()
+    from saklas.io.paths import model_dir
+
+    capture_dir = model_dir("google/gemma-3-4b-it") / "manifold_capture"
+    capture_dir.mkdir(parents=True)
+    capture_file = capture_dir / f"{capture_sha}.rows.safetensors"
+    capture_file.write_bytes(b"cached")
+    remove_manifold_folder("local", "mood")
+    assert not capture_file.exists()
 
 
 def test_remove_manifold_folder_bundled_namespace_rematerializes(

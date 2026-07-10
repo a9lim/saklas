@@ -146,8 +146,28 @@ def clear_manifold_tensors(
             f"`manifold rm {namespace}/{name}` to delete it"
         )
     files = _manifold_tensor_files(folder, variant=variant, model_scope=model_scope)
+    capture_groups: set[tuple[str, str]] = set()
+    from saklas.io.paths import parse_tensor_filename
+
+    for sidecar_path in (path for path in files if path.suffix == ".json"):
+        try:
+            with open(sidecar_path) as handle:
+                sidecar = json.load(handle)
+            capture_sha = sidecar.get("capture_sha256")
+            parsed = parse_tensor_filename(sidecar_path.with_suffix(".safetensors").name)
+            if isinstance(capture_sha, str) and len(capture_sha) == 64 and parsed:
+                capture_groups.add((parsed[0], capture_sha))
+        except (OSError, json.JSONDecodeError, TypeError):
+            pass
     for f in files:
         f.unlink()
+    if capture_groups:
+        from saklas.io.paths import models_dir
+
+        for safe_model, capture_sha in capture_groups:
+            cache_dir = models_dir() / safe_model / "manifold_capture"
+            for cached in cache_dir.glob(f"{capture_sha}.*"):
+                cached.unlink()
     if files:
         # ``write_metadata`` defaults to re-hashing the now-smaller
         # on-disk tensor set via ``hash_manifold_files``.
@@ -178,7 +198,31 @@ def remove_manifold_folder(namespace: str, name: str) -> dict[str, Any]:
     except ManifoldFormatError:
         source = "bundled" if namespace == "default" else "local"
     rematerializes = namespace == "default" or source == "bundled"
+    capture_groups: set[tuple[str, str]] = set()
+    from saklas.io.paths import parse_tensor_filename
+
+    for sidecar_path in folder.glob("*.json"):
+        if sidecar_path.name == "manifold.json":
+            continue
+        try:
+            with open(sidecar_path) as handle:
+                sidecar = json.load(handle)
+            capture_sha = sidecar.get("capture_sha256")
+            parsed = parse_tensor_filename(
+                sidecar_path.with_suffix(".safetensors").name,
+            )
+            if isinstance(capture_sha, str) and len(capture_sha) == 64 and parsed:
+                capture_groups.add((parsed[0], capture_sha))
+        except (OSError, json.JSONDecodeError, TypeError):
+            pass
     shutil.rmtree(folder)
+    if capture_groups:
+        from saklas.io.paths import models_dir
+
+        for safe_model, capture_sha in capture_groups:
+            cache_dir = models_dir() / safe_model / "manifold_capture"
+            for cached in cache_dir.glob(f"{capture_sha}.*"):
+                cached.unlink()
     return {
         "namespace": namespace,
         "name": name,

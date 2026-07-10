@@ -12,24 +12,25 @@ no constraint and fp16's extra mantissa bits beat bf16; this deliberately
 differs from the neutral cache's fp32 invariant, which exists because that
 cache feeds a covariance inversion). Promoted to fp32 on load.
 
-The sidecar records the corpus spec + sha256 so a re-fit against a different
-corpus reads as stale, and ``n_prompts`` so an interrupted fit can resume
+The sidecar records the token-id corpus sha256 + loaded-model fingerprint so a
+different corpus or mutable model revision reads as stale, and ``n_prompts`` so an interrupted fit can resume
 (load → fit the remaining prompts → ``JacobianLens.merge`` → save).
 """
 
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
+import struct
 from contextlib import suppress
 from pathlib import Path
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any
 
 import torch
 from safetensors import safe_open
-from safetensors.torch import save_file
 
 from saklas.core.jlens import JacobianLens
 from saklas.io.atomic import write_json_atomic
@@ -37,7 +38,7 @@ from saklas.io.paths import model_dir
 
 log = logging.getLogger(__name__)
 
-LENS_FORMAT_VERSION = 1
+LENS_FORMAT_VERSION = 2
 _LENS_NAME = "jlens"
 _LENS_CHECKPOINT_NAME = "jlens.partial"
 _LENS_METHOD = "jlens_cotangent_sum"
@@ -118,6 +119,8 @@ def save_lens(
     raw_prompt_count: int | None = None,
     usable_prompt_count: int | None = None,
     model_layer_count: int | None = None,
+    model_fingerprint: str | None = None,
+    model_source_fingerprint: str | None = None,
 ) -> Path:
     """Persist a fitted lens (fp16 tensors + atomic JSON sidecar)."""
     ts_path, sc_path = lens_paths(model_id)
@@ -134,6 +137,8 @@ def save_lens(
         raw_prompt_count=raw_prompt_count,
         usable_prompt_count=usable_prompt_count,
         model_layer_count=model_layer_count,
+        model_fingerprint=model_fingerprint,
+        model_source_fingerprint=model_source_fingerprint,
     )
     return ts_path
 
@@ -153,6 +158,8 @@ def save_lens_checkpoint(
     raw_prompt_count: int | None = None,
     usable_prompt_count: int | None = None,
     model_layer_count: int | None = None,
+    model_fingerprint: str | None = None,
+    model_source_fingerprint: str | None = None,
 ) -> Path:
     """Persist a resumable partial shard without rewriting the full lens."""
     ts_path, sc_path = lens_checkpoint_paths(model_id)
@@ -169,6 +176,8 @@ def save_lens_checkpoint(
         raw_prompt_count=raw_prompt_count,
         usable_prompt_count=usable_prompt_count,
         model_layer_count=model_layer_count,
+        model_fingerprint=model_fingerprint,
+        model_source_fingerprint=model_source_fingerprint,
         extra_sidecar={
             "checkpoint": True,
             "base_n_prompts": int(base_n_prompts),
@@ -195,6 +204,8 @@ def save_lens_checkpoint_accumulator(
     raw_prompt_count: int | None = None,
     usable_prompt_count: int | None = None,
     model_layer_count: int | None = None,
+    model_fingerprint: str | None = None,
+    model_source_fingerprint: str | None = None,
 ) -> Path:
     """Write a self-contained checkpoint directly from raw estimator sums.
 
@@ -219,6 +230,8 @@ def save_lens_checkpoint_accumulator(
         raw_prompt_count=raw_prompt_count,
         usable_prompt_count=usable_prompt_count,
         model_layer_count=model_layer_count,
+        model_fingerprint=model_fingerprint,
+        model_source_fingerprint=model_source_fingerprint,
         raw_sum_count=int(n_prompts),
         average_base=base,
         extra_sidecar={
@@ -246,6 +259,8 @@ def _save_lens_at(
     raw_prompt_count: int | None = None,
     usable_prompt_count: int | None = None,
     model_layer_count: int | None = None,
+    model_fingerprint: str | None = None,
+    model_source_fingerprint: str | None = None,
     extra_sidecar: dict[str, Any] | None = None,
 ) -> None:
     _save_lens_components(
@@ -261,6 +276,8 @@ def _save_lens_at(
         raw_prompt_count=raw_prompt_count,
         usable_prompt_count=usable_prompt_count,
         model_layer_count=model_layer_count,
+        model_fingerprint=model_fingerprint,
+        model_source_fingerprint=model_source_fingerprint,
         extra_sidecar=extra_sidecar,
     )
 
@@ -283,23 +300,32 @@ def _save_lens_components(
     raw_prompt_count: int | None = None,
     usable_prompt_count: int | None = None,
     model_layer_count: int | None = None,
+    model_fingerprint: str | None = None,
+    model_source_fingerprint: str | None = None,
     raw_sum_count: int | None = None,
     average_base: JacobianLens | None = None,
     extra_sidecar: dict[str, Any] | None = None,
 ) -> None:
     ts_path.parent.mkdir(parents=True, exist_ok=True)
-    tensors: dict[str, torch.Tensor] = {}
-    for idx, J in jacobians.items():
-        value = J
+    layer_ids = sorted(int(idx) for idx in jacobians)
+
+    def _rows(idx: int, start: int, end: int) -> torch.Tensor:
+        value = jacobians[idx][start:end].to(device="cpu", dtype=torch.float32)
         if raw_sum_count is not None:
-            value = J.clone()
+            # Stripe-local arithmetic: checkpointing never clones a complete
+            # fp32 layer or keeps a complete fp16 artifact mapping alive.
+            value = value.clone()
             if average_base is not None:
                 value.add_(
-                    average_base.jacobians[idx], alpha=average_base.n_prompts,
+                    average_base.jacobians[idx][start:end],
+                    alpha=average_base.n_prompts,
                 )
             value.mul_(1.0 / max(int(n_prompts), 1))
-        tensors[f"layer_{idx}"] = value.contiguous().to(torch.float16).cpu()
-    _save_safetensors_atomic(ts_path, tensors, durable=durable)
+        return value.to(torch.float16).contiguous()
+
+    tensor_sha256 = _save_fp16_square_safetensors_atomic(
+        ts_path, layer_ids, d_model, _rows, durable=durable,
+    )
     sidecar: dict[str, Any] = {
         "format_version": LENS_FORMAT_VERSION,
         "method": _LENS_METHOD,
@@ -313,6 +339,7 @@ def _save_lens_components(
         "seq_len": seq_len,
         "dim_batch": dim_batch,
         "skip_first_positions": skip_first,
+        "tensor_sha256": tensor_sha256,
     }
     if raw_corpus_sha256 is not None:
         sidecar["raw_corpus_sha256"] = raw_corpus_sha256
@@ -322,32 +349,90 @@ def _save_lens_components(
         sidecar["usable_prompt_count"] = int(usable_prompt_count)
     if model_layer_count is not None:
         sidecar["model_layer_count"] = int(model_layer_count)
+    if model_fingerprint is not None:
+        sidecar["model_fingerprint"] = model_fingerprint
+    if model_source_fingerprint is not None:
+        sidecar["model_source_fingerprint"] = model_source_fingerprint
     if extra_sidecar:
         sidecar.update(extra_sidecar)
     write_json_atomic(sc_path, sidecar)
 
 
-def _save_safetensors_atomic(
-    path: Path, tensors: dict[str, torch.Tensor], *, durable: bool = True,
-) -> None:
-    """Atomically replace a safetensors artifact, preserving the prior file on error."""
+def _save_fp16_square_safetensors_atomic(
+    path: Path,
+    layers: list[int],
+    d_model: int,
+    rows: Callable[[int, int, int], torch.Tensor],
+    *,
+    durable: bool = True,
+) -> str:
+    """Stream square fp16 layer tensors into one atomic safetensors file.
+
+    ``safetensors.torch.save_file`` requires a complete tensor mapping, which
+    made checkpoint RSS include every fp16 layer alongside the fp32 estimator.
+    The wire format is deliberately simple: an 8-byte little-endian JSON-header
+    length, a space-padded JSON header, then contiguous tensor payloads.  Writing
+    256-row fp16 stripes preserves the public monolithic artifact without the
+    complete in-memory snapshot.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp") if path.suffix else path.with_name(
         path.name + ".tmp"
     )
+    prefix, raw_header = _lens_safetensors_header(layers, d_model)
+    digest = hashlib.sha256()
     try:
-        save_file(tensors, str(tmp))
-        if durable:
-            fd = os.open(tmp, os.O_RDONLY)
-            try:
-                os.fsync(fd)
-            finally:
-                os.close(fd)
+        with open(tmp, "wb", buffering=0) as f:
+            f.write(prefix)
+            digest.update(prefix)
+            f.write(raw_header)
+            digest.update(raw_header)
+            for layer in sorted(layers):
+                for start in range(0, d_model, 256):
+                    block = rows(layer, start, min(start + 256, d_model))
+                    expected = (min(start + 256, d_model) - start, d_model)
+                    if block.dtype != torch.float16 or tuple(block.shape) != expected:
+                        raise ValueError(
+                            f"streamed layer {layer} rows have "
+                            f"{tuple(block.shape)} {block.dtype}; expected "
+                            f"{expected} float16"
+                        )
+                    # ``tobytes`` is bounded to one row stripe (never a complete
+                    # layer/artifact), keeping the writer portable across file
+                    # implementations while preserving the low peak.
+                    payload = block.numpy().tobytes(order="C")
+                    f.write(payload)
+                    digest.update(payload)
+            if durable:
+                os.fsync(f.fileno())
     except BaseException:
         with suppress(FileNotFoundError):
             tmp.unlink()
         raise
     os.replace(tmp, path)
+    return digest.hexdigest()
+
+
+def _lens_safetensors_header(
+    layers: list[int], d_model: int,
+) -> tuple[bytes, bytes]:
+    """Canonical writer header bytes, shared by save and load-time digest."""
+    bytes_per_layer = int(d_model) * int(d_model) * 2
+    offset = 0
+    header: dict[str, dict[str, object]] = {}
+    for layer in sorted(layers):
+        header[f"layer_{layer}"] = {
+            "dtype": "F16",
+            "shape": [int(d_model), int(d_model)],
+            "data_offsets": [offset, offset + bytes_per_layer],
+        }
+        offset += bytes_per_layer
+    raw_header = json.dumps(
+        header, separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8")
+    padded_len = (len(raw_header) + 7) // 8 * 8
+    raw_header += b" " * (padded_len - len(raw_header))
+    return struct.pack("<Q", padded_len), raw_header
 
 
 def load_lens(model_id: str) -> tuple[JacobianLens, dict[str, Any]] | None:
@@ -383,6 +468,16 @@ def _load_lens_at(
     try:
         d_model = int(sidecar["d_model"])
         source_layers = [int(layer) for layer in sidecar["source_layers"]]
+        expected_digest = sidecar.get("tensor_sha256")
+        if not isinstance(expected_digest, str) or len(expected_digest) != 64:
+            log.warning(
+                "%s for %s has no tensor digest; ignoring — re-fit with "
+                "`saklas lens fit`", label, model_id,
+            )
+            return None
+        prefix, raw_header = _lens_safetensors_header(source_layers, d_model)
+        digest = hashlib.sha256(prefix)
+        digest.update(raw_header)
         jacobians: dict[int, torch.Tensor] = {}
         with safe_open(str(ts_path), framework="pt", device="cpu") as tensors:
             tensor_layers = sorted(
@@ -399,14 +494,22 @@ def _load_lens_at(
             # complete fp16 mapping alive while also materializing the complete
             # fp32 lens, producing a needless ~1.5x artifact peak on resume.
             for layer in tensor_layers:
-                J = tensors.get_tensor(f"layer_{layer}").to(torch.float32)
-                if J.ndim != 2 or tuple(J.shape) != (d_model, d_model):
+                raw = tensors.get_tensor(f"layer_{layer}")
+                if (
+                    raw.dtype != torch.float16 or raw.ndim != 2
+                    or tuple(raw.shape) != (d_model, d_model)
+                ):
                     log.warning(
                         "%s for %s layer %d has shape %s (need %dx%d); "
                         "ignoring — re-fit with `saklas lens fit`",
-                        label, model_id, layer, tuple(J.shape), d_model, d_model,
+                        label, model_id, layer, tuple(raw.shape), d_model, d_model,
                     )
                     return None
+                for start in range(0, d_model, 256):
+                    digest.update(
+                        raw[start:start + 256].contiguous().numpy().tobytes(order="C")
+                    )
+                J = raw.to(torch.float32)
                 if not bool(torch.isfinite(J).all()):
                     log.warning(
                         "%s for %s contains non-finite values; ignoring — "
@@ -414,6 +517,12 @@ def _load_lens_at(
                     )
                     return None
                 jacobians[layer] = J
+        if digest.hexdigest() != expected_digest:
+            log.warning(
+                "%s for %s failed tensor digest validation; ignoring — "
+                "re-fit with `saklas lens fit`", label, model_id,
+            )
+            return None
         lens = JacobianLens(
             jacobians,
             n_prompts=int(sidecar.get("n_prompts", 0)),
@@ -455,6 +564,26 @@ DEFAULT_LENS_CORPUS = ("HuggingFaceFW/fineweb-edu", "sample-10BT")
 LENS_DOC_CHARS = 4000
 
 
+def resolved_default_lens_corpus_spec() -> tuple[str, str]:
+    """Return the default dataset's immutable Hub revision and corpus spec."""
+    from saklas.core.jlens import JacobianLensError
+
+    repo, config = DEFAULT_LENS_CORPUS
+    try:
+        from huggingface_hub import HfApi
+
+        revision = HfApi().dataset_info(repo).sha
+    except Exception as exc:
+        raise JacobianLensError(
+            f"could not resolve an immutable revision for {repo}: {exc}"
+        ) from exc
+    if not revision:
+        raise JacobianLensError(
+            f"Hugging Face returned no immutable dataset revision for {repo}"
+        )
+    return str(revision), f"hf:{repo}/{config}@{revision}"
+
+
 def stream_default_lens_corpus(n: int) -> tuple[list[str], str]:
     """Stream ``n`` documents from the default web-text corpus.
 
@@ -474,7 +603,10 @@ def stream_default_lens_corpus(n: int) -> tuple[list[str], str]:
             "file (one document per line)"
         ) from e
     repo, config = DEFAULT_LENS_CORPUS
-    stream = load_dataset(repo, name=config, split="train", streaming=True)
+    revision, corpus_spec = resolved_default_lens_corpus_spec()
+    stream = load_dataset(
+        repo, name=config, split="train", streaming=True, revision=revision,
+    )
     docs: list[str] = []
     for row in stream:
         text = str(row.get("text", "")).strip()
@@ -482,4 +614,4 @@ def stream_default_lens_corpus(n: int) -> tuple[list[str], str]:
             docs.append(text[:LENS_DOC_CHARS])
         if len(docs) >= n:
             break
-    return docs, f"hf:{repo}/{config}"
+    return docs, corpus_spec

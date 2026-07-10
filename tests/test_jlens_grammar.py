@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import argparse
+import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -10,7 +12,10 @@ import torch
 
 from saklas.core.steering_composer import SteeringComposer
 from saklas.core.steering_expr import format_expr, parse_expr
-from saklas.cli.runners import _lens_fit_source_preflight_matches
+from saklas.cli.runners import (
+    _lens_fit_source_preflight_matches,
+    _try_lens_fit_noop_preflight,
+)
 from saklas.io.manifold_folder import ManifoldFormatError
 from saklas.io.manifold_authoring import create_discover_manifold_folder
 from tests.test_jlens_session import _PROMPTS, _StubSession
@@ -232,3 +237,81 @@ def test_lens_preflight_resolves_workspace_from_model_depth() -> None:
     assert _lens_fit_source_preflight_matches(sidecar, "workspace")
     sidecar["source_layers"] = [4, 5, 6]
     assert not _lens_fit_source_preflight_matches(sidecar, "workspace")
+
+
+def test_lens_noop_preflight_requires_exact_model_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from saklas.io.lens import lens_paths
+
+    expected_spec = "hf:repo/config@dataset-rev-a"
+    tensor_path, _ = lens_paths("toy/model")
+    tensor_path.parent.mkdir(parents=True, exist_ok=True)
+    tensor_path.write_bytes(b"lens")
+    sidecar: dict[str, object] = {
+        "source_layers": [0],
+        "model_layer_count": 2,
+        "model_source_fingerprint": "source-a",
+        "tensor_sha256": hashlib.sha256(b"lens").hexdigest(),
+        "seq_len": 128,
+        "corpus_spec": expected_spec,
+        "raw_prompt_count": 100,
+        "usable_prompt_count": 100,
+        "n_prompts": 100,
+        "d_model": 6,
+    }
+    monkeypatch.setattr(
+        "saklas.io.lens.load_lens_sidecar", lambda _model: sidecar,
+    )
+    monkeypatch.setattr(
+        "saklas.core.model.model_source_fingerprint",
+        lambda *_args, **_kwargs: "source-a",
+    )
+    monkeypatch.setattr(
+        "saklas.io.lens.resolved_default_lens_corpus_spec",
+        lambda: ("dataset-rev-a", expected_spec),
+    )
+    args = argparse.Namespace(
+        force=False, model="toy/model", quantize=None, device="cpu",
+        seq_len=None, corpus=None, prompts=100,
+    )
+    assert _try_lens_fit_noop_preflight(args, [0])
+    tensor_path.write_bytes(b"corrupt")
+    assert not _try_lens_fit_noop_preflight(args, [0])
+    tensor_path.write_bytes(b"lens")
+    sidecar["model_source_fingerprint"] = "source-b"
+    assert not _try_lens_fit_noop_preflight(args, [0])
+
+
+def test_lens_noop_preflight_rejects_changed_default_dataset_revision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from saklas.io.lens import lens_paths
+
+    tensor_path, _ = lens_paths("toy/model")
+    tensor_path.parent.mkdir(parents=True, exist_ok=True)
+    tensor_path.write_bytes(b"lens")
+    sidecar = {
+        "source_layers": [0], "model_layer_count": 2,
+        "model_source_fingerprint": "source-a",
+        "tensor_sha256": hashlib.sha256(b"lens").hexdigest(),
+        "seq_len": 128, "corpus_spec": "hf:repo/config@old",
+        "raw_prompt_count": 100, "usable_prompt_count": 100,
+        "n_prompts": 100, "d_model": 6,
+    }
+    monkeypatch.setattr(
+        "saklas.io.lens.load_lens_sidecar", lambda _model: sidecar,
+    )
+    monkeypatch.setattr(
+        "saklas.core.model.model_source_fingerprint",
+        lambda *_args, **_kwargs: "source-a",
+    )
+    monkeypatch.setattr(
+        "saklas.io.lens.resolved_default_lens_corpus_spec",
+        lambda: ("new", "hf:repo/config@new"),
+    )
+    args = argparse.Namespace(
+        force=False, model="toy/model", quantize=None, device="cpu",
+        seq_len=None, corpus=None, prompts=100,
+    )
+    assert not _try_lens_fit_noop_preflight(args, [0])

@@ -78,22 +78,33 @@ class MockSaeBackend:
 class SaeLensBackend:
     """SAELens-backed concrete ``SaeBackend``.
 
-    Per-layer SAE modules are held in a dict keyed by layer index. The
-    registry-level resolution of `release → per-layer sae_ids` is performed
-    once at load time (see :func:`load_sae_backend`); this class just
-    dispatches encode/decode to the right per-layer module.
+    Registry resolution is eager and weight loading is lazy.  Manifold fitting
+    visits one layer at a time, so retaining every SAE in a release can consume
+    many times the base model's memory for no benefit.  This adapter keeps only
+    the most recently used layer resident; an encode/decode pair for the same
+    layer shares that module, then the next layer replaces it.
     """
     release: str
     revision: str | None
     layers: frozenset[int]
-    _saes_by_layer: dict[int, Any] = field(repr=False)
+    _loader: Callable[[int], Any] = field(repr=False)
     sae_ids_by_layer: dict[str, str] = field(default_factory=dict)
+    _active_layer: int | None = field(default=None, init=False, repr=False)
+    _active_sae: Any | None = field(default=None, init=False, repr=False)
+
+    def _sae(self, idx: int) -> Any:
+        if idx not in self.layers:
+            raise KeyError(f"SAE release {self.release!r} does not cover layer {idx}")
+        if self._active_layer != idx or self._active_sae is None:
+            self._active_sae = self._loader(idx)
+            self._active_layer = idx
+        return self._active_sae
 
     def encode_layer(self, idx: int, h: torch.Tensor) -> torch.Tensor:
-        return self._saes_by_layer[idx].encode(h)
+        return self._sae(idx).encode(h)
 
     def decode_layer(self, idx: int, f: torch.Tensor) -> torch.Tensor:
-        return self._saes_by_layer[idx].decode(f)
+        return self._sae(idx).decode(f)
 
 
 def load_sae_backend(
@@ -104,7 +115,7 @@ def load_sae_backend(
     device: str | torch.device,
     dtype: torch.dtype | None = None,
 ) -> SaeLensBackend:
-    """Resolve a SAELens release to a fully-populated :class:`SaeLensBackend`.
+    """Resolve a SAELens release to a lazy :class:`SaeLensBackend`.
 
     Raises:
         SaeBackendImportError: ``sae_lens`` not installed.
@@ -159,32 +170,63 @@ def load_sae_backend(
             f"SAE release '{release}' has no saes_map in the registry"
         )
 
-    layers: set[int] = set()
-    saes_by_layer: dict[int, Any] = {}
-    ids_by_layer: dict[str, str] = {}
-    for sae_id, hook_layer in _canonical_layer_map(saes_map).items():
+    ids_by_layer_int = {
+        int(hook_layer): sae_id
+        for sae_id, hook_layer in _canonical_layer_map(saes_map).items()
+    }
+    ids_by_layer = {
+        str(layer_idx): sae_id
+        for layer_idx, sae_id in ids_by_layer_int.items()
+    }
+    import inspect
+
+    loader = sae_lens.SAE.from_pretrained  # pyright: ignore[reportAttributeAccessIssue]  # optional dep
+    supports_revision = "revision" in inspect.signature(loader).parameters
+    if revision is not None and not supports_revision:
+        raise ValueError(
+            f"SAELens {getattr(sae_lens, '__version__', 'installed')} "
+            f"cannot pin revision {revision!r}: SAE.from_pretrained exposes "
+            "no revision parameter. Upgrade SAELens or omit --sae-revision; "
+            "saklas will not stamp an unhonored pin."
+        )
+
+    def _load_layer(layer_idx: int) -> Any:
+        from saklas.core.errors import SaeCoverageError
+
+        sae_id = ids_by_layer_int[layer_idx]
+        load_kwargs: dict[str, Any] = {
+            "release": release,
+            "sae_id": sae_id,
+            "device": str(device),
+        }
+        if revision is not None:
+            assert supports_revision
+            load_kwargs["revision"] = revision
         sae, cfg_dict, _sparsity = sae_lens.SAE.from_pretrained(  # pyright: ignore[reportAttributeAccessIssue]  # sae_lens optional dep; no stubs
-            release=release,
-            sae_id=sae_id,
-            device=str(device),
+            **load_kwargs,
         )
         cfg_dict_any: Any = cfg_dict  # sae_lens SAEConfig has no stubs; treat as Any
-        # Prefer the cfg's hook_layer if the registry and cfg disagree.
-        layer_idx = int(cfg_dict_any.get("hook_layer", hook_layer))
-        layers.add(layer_idx)
-        saes_by_layer[layer_idx] = sae
-        ids_by_layer[str(layer_idx)] = sae_id
-
-    if dtype is not None:
-        for sae in saes_by_layer.values():
+        loaded_layer = int(
+            cfg_dict_any.get("hook_layer", layer_idx)
+            if hasattr(cfg_dict_any, "get")
+            else getattr(cfg_dict_any, "hook_layer", layer_idx)
+        )
+        if loaded_layer != layer_idx:
+            raise SaeCoverageError(
+                f"SAE registry maps {sae_id!r} to layer {layer_idx}, but its "
+                f"loaded config reports layer {loaded_layer}"
+            )
+        if dtype is not None:
             if hasattr(sae, "to"):
-                sae.to(dtype=dtype)
+                sae_any: Any = sae
+                sae_any.to(dtype=dtype)
+        return sae
 
     return SaeLensBackend(
         release=release,
         revision=revision,
-        layers=frozenset(layers),
-        _saes_by_layer=saes_by_layer,
+        layers=frozenset(ids_by_layer_int),
+        _loader=_load_layer,
         sae_ids_by_layer=ids_by_layer,
     )
 

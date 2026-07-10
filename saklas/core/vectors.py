@@ -20,6 +20,107 @@ import torch
 # chunk's attention working set (``B · heads · T²``) stays comfortable on a single
 # 24 GB GPU at the A2 response cap; raise it on a roomier device for fewer forwards.
 _CAPTURE_BATCH = 16
+# Roomy accelerators should not be permanently capped at the conservative
+# starting width.  Fit-wide capture grows toward this ceiling after clean
+# batches and backs off on OOM; length bucketing keeps the larger batches from
+# turning one long response into quadratic padding work for every neighbour.
+_CAPTURE_BATCH_MAX = 64
+
+
+class _CaptureComplete(BaseException):
+    """Private non-error control flow: the last requested block has fired.
+
+    Causal-LM wrappers run final norm + the full vocabulary head after the
+    transformer stack.  Fitting consumes only residual-stream activations, so
+    the terminal capture hook aborts the wrapper before that unused projection.
+    ``BaseException`` keeps broad ``except Exception`` blocks inside model
+    wrappers from accidentally swallowing the sentinel.
+    """
+
+
+class _ReusablePooledCapture:
+    """Fit-scoped layer hooks reused across many pooled batch forwards."""
+
+    def __init__(
+        self, model: torch.nn.Module, layers: torch.nn.ModuleList,
+        layer_indices: Sequence[int],
+    ) -> None:
+        self.model = model
+        self.layers = layers
+        self.layer_indices = [int(idx) for idx in layer_indices]
+        if not self.layer_indices:
+            raise ValueError("layer_indices must select at least one layer")
+        self.terminal_layer = max(self.layer_indices)
+        self.captured: dict[int, torch.Tensor] = {}
+        self._rows: torch.Tensor | None = None
+        self._positions: torch.Tensor | None = None
+        self._promote = True
+        self._handles: list[Any] = []
+
+        def make_hook(idx: int):
+            def hook(_module: torch.nn.Module, _input: Any, output: Any) -> None:
+                h = output if isinstance(output, torch.Tensor) else output[0]
+                assert self._rows is not None and self._positions is not None
+                positions = self._positions.clamp(max=h.shape[1] - 1)
+                pooled = h[self._rows, positions, :].detach()
+                self.captured[idx] = (
+                    pooled.to(torch.float32)
+                    if self._promote and pooled.dtype != torch.float32
+                    else pooled
+                )
+                if idx == self.terminal_layer:
+                    raise _CaptureComplete()
+
+            return hook
+
+        try:
+            for idx in self.layer_indices:
+                self._handles.append(
+                    layers[idx].register_forward_hook(make_hook(idx)),
+                )
+        except BaseException:
+            self.close()
+            raise
+
+    def capture(
+        self, input_ids: torch.Tensor, *,
+        attention_mask: torch.Tensor | None,
+        pool_index: torch.Tensor,
+        promote_pooled: bool,
+    ) -> dict[int, torch.Tensor]:
+        self.captured = {}
+        self._rows = torch.arange(input_ids.shape[0], device=input_ids.device)
+        self._positions = pool_index.to(input_ids.device)
+        self._promote = promote_pooled
+        try:
+            with torch.inference_mode():
+                try:
+                    if attention_mask is not None:
+                        self.model(
+                            input_ids=input_ids, attention_mask=attention_mask,
+                            use_cache=False,
+                        )
+                    else:
+                        self.model(input_ids=input_ids, use_cache=False)
+                except _CaptureComplete:
+                    pass
+            if input_ids.device.type == "mps":
+                torch.mps.synchronize()
+            return self.captured
+        finally:
+            self._rows = None
+            self._positions = None
+
+    def close(self) -> None:
+        for handle in self._handles:
+            handle.remove()
+        self._handles = []
+
+    def __enter__(self) -> "_ReusablePooledCapture":
+        return self
+
+    def __exit__(self, *_args: Any) -> None:
+        self.close()
 
 
 def _capture_all_hidden_states(
@@ -30,6 +131,8 @@ def _capture_all_hidden_states(
     attention_mask: torch.Tensor | None = None,
     pool_index: "int | torch.Tensor | None" = None,
     layer_indices: Sequence[int] | None = None,
+    promote_pooled: bool = True,
+    capture_context: _ReusablePooledCapture | None = None,
 ):
     """Run one forward pass capturing hidden states at selected layers.
 
@@ -49,12 +152,31 @@ def _capture_all_hidden_states(
     ``layer_indices`` narrows hook registration to a subset; ``None`` captures
     every layer. Returns a dict mapping layer index to the retained tensor.
     """
+    if capture_context is not None:
+        if not isinstance(pool_index, torch.Tensor):
+            raise ValueError("reusable capture requires a per-row pool_index tensor")
+        requested = (
+            list(range(len(layers)))
+            if layer_indices is None else [int(idx) for idx in layer_indices]
+        )
+        if requested != capture_context.layer_indices:
+            raise ValueError(
+                "reusable capture layer selection does not match this forward"
+            )
+        return capture_context.capture(
+            input_ids, attention_mask=attention_mask, pool_index=pool_index,
+            promote_pooled=promote_pooled,
+        )
+
     captured_hidden: dict[int, torch.Tensor] = {}
     capture_layers = (
         list(range(len(layers)))
         if layer_indices is None
         else [int(idx) for idx in layer_indices]
     )
+    if not capture_layers:
+        raise ValueError("layer_indices must select at least one layer")
+    terminal_layer = max(capture_layers)
     per_row = isinstance(pool_index, torch.Tensor)
     # Precompute the gather index tensors once (not per layer/hook fire); both
     # are set iff ``per_row`` (the assert in the hook narrows them back).
@@ -81,18 +203,22 @@ def _capture_all_hidden_states(
                 pooled = h[_rows, pos, :].detach()
                 captured_hidden[idx] = (
                     pooled.to(torch.float32)
-                    if pooled.dtype != torch.float32
+                    if promote_pooled and pooled.dtype != torch.float32
                     else pooled
                 )
+                if idx == terminal_layer:
+                    raise _CaptureComplete()
                 return
             if pool_index is not None:
                 pos = min(max(int(pool_index), 0), h.shape[1] - 1)
                 pooled = h[0, pos, :].detach()
                 captured_hidden[idx] = (
                     pooled.to(torch.float32)
-                    if pooled.dtype != torch.float32
+                    if promote_pooled and pooled.dtype != torch.float32
                     else pooled.clone()
                 )
+                if idx == terminal_layer:
+                    raise _CaptureComplete()
                 return
             # No .clone() — with use_cache=False and inference_mode() the
             # residual-stream tensors are fresh allocations at each layer
@@ -100,6 +226,8 @@ def _capture_all_hidden_states(
             # the autograd graph reference so the rest of the forward pass
             # can't invalidate the data.
             captured_hidden[idx] = h.detach()
+            if idx == terminal_layer:
+                raise _CaptureComplete()
         return _hook
 
     handles = [
@@ -108,14 +236,17 @@ def _capture_all_hidden_states(
     ]
     try:
         with torch.inference_mode():
-            if attention_mask is not None:
-                model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    use_cache=False,
-                )
-            else:
-                model(input_ids=input_ids, use_cache=False)
+            try:
+                if attention_mask is not None:
+                    model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        use_cache=False,
+                    )
+                else:
+                    model(input_ids=input_ids, use_cache=False)
+            except _CaptureComplete:
+                pass
         # Single sync after the full forward pass — lazy backends (MPS)
         # may not have materialised tensor data yet.
         if input_ids.device.type == "mps":
@@ -245,6 +376,9 @@ def _encode_and_capture_all_batch(
     model_type: str | None = None,
     system_msg: str = _LENGTH_DIRECTIVE,
     layer_indices: Sequence[int] | None = None,
+    rendered: "Sequence[tuple[torch.Tensor, int]] | None" = None,
+    promote_pooled: bool = True,
+    capture_context: _ReusablePooledCapture | None = None,
 ) -> dict[int, torch.Tensor]:
     """Batched conversational capture — one forward over a chunk of pairs.
 
@@ -279,23 +413,26 @@ def _encode_and_capture_all_batch(
         )
     if roles is not None and role is not None:
         raise ValueError("batched capture accepts role= or roles=, not both")
-    row_roles = roles if roles is not None else [role] * len(prompts)
-    rendered = [
-        _render_and_tokenize_for_capture(
-            tokenizer, prompt, response, device,
-            role=row_role, model_type=model_type, system_msg=system_msg,
+    if rendered is None:
+        rendered_rows = _prepare_capture_batch(
+            tokenizer, prompts, responses, device,
+            role=role, roles=roles, model_type=model_type,
+            system_msg=system_msg,
         )
-        for prompt, response, row_role in zip(
-            prompts, responses, row_roles, strict=True,
-        )
-    ]
+    else:
+        if len(rendered) != len(prompts):
+            raise ValueError(
+                "rendered capture rows must align with prompts "
+                f"({len(rendered)} != {len(prompts)})"
+            )
+        rendered_rows = list(rendered)
     # Keep the whole render/tokenize/pool-index front half on CPU.  Moving every
     # row to the accelerator and immediately calling ``tolist()`` to find its
     # content end forced one H2D + blocking D2H round-trip per corpus item before
     # the actual batched forward.  Padding on CPU also avoids a Python loop of
     # tiny device slice writes; the finished batch crosses the boundary once.
-    seqs = [ids[0] for ids, _ in rendered]              # each (L_i,) on CPU
-    ends = [content_end for _, content_end in rendered]
+    seqs = [ids[0] for ids, _ in rendered_rows]          # each (L_i,) on CPU
+    ends = [content_end for _, content_end in rendered_rows]
     lengths = [int(s.shape[0]) for s in seqs]
     max_len = max(lengths)
 
@@ -321,7 +458,45 @@ def _encode_and_capture_all_batch(
         model, layers, input_ids,
         attention_mask=attn, pool_index=pool_index,
         layer_indices=layer_indices,
+        promote_pooled=promote_pooled,
+        capture_context=capture_context,
     )
+
+
+def _prepare_capture_batch(
+    tokenizer: Any,
+    prompts: "Sequence[str | list[dict[str, str]]]",
+    responses: Sequence[str],
+    device: torch.device,
+    *,
+    role: str | None = None,
+    roles: Sequence[str | None] | None = None,
+    model_type: str | None = None,
+    system_msg: str = _LENGTH_DIRECTIVE,
+) -> list[tuple[torch.Tensor, int]]:
+    """Render/tokenize capture rows once for reuse across packing and retries."""
+    if len(prompts) != len(responses):
+        raise ValueError(
+            "capture preparation needs len(prompts) == len(responses) "
+            f"({len(prompts)} != {len(responses)})"
+        )
+    if roles is not None and len(roles) != len(prompts):
+        raise ValueError(
+            "capture preparation needs len(roles) == len(prompts) "
+            f"({len(roles)} != {len(prompts)})"
+        )
+    if roles is not None and role is not None:
+        raise ValueError("capture preparation accepts role= or roles=, not both")
+    row_roles = roles if roles is not None else [role] * len(prompts)
+    return [
+        _render_and_tokenize_for_capture(
+            tokenizer, prompt, response, device,
+            role=row_role, model_type=model_type, system_msg=system_msg,
+        )
+        for prompt, response, row_role in zip(
+            prompts, responses, row_roles, strict=True,
+        )
+    ]
 
 
 def _render_and_tokenize_for_capture(

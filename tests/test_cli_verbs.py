@@ -116,6 +116,13 @@ def test_manifold_fit_parses() -> None:
     assert args.target == "/tmp/folder"
 
 
+def test_manifold_fit_layers_parse() -> None:
+    args = cli.parse_args([
+        "manifold", "fit", "mood", "-m", "m/x", "--layers", "4,8,12",
+    ])
+    assert args.layers == "4,8,12"
+
+
 def test_manifold_fit_discover_hyperparams_parse() -> None:
     # discover folded into fit — the hyperparam flags ride the one verb.
     args = cli.parse_args([
@@ -211,13 +218,15 @@ def test_vector_alias_removed() -> None:
 
 def test_lens_fit_parses() -> None:
     args = cli.parse_args([
-        "lens", "fit", "m/x", "--prompts", "50", "--dim-batch", "32", "-f",
+        "lens", "fit", "m/x", "--prompts", "50", "--dim-batch", "32",
+        "--prompt-batch", "4", "-f",
     ])
     assert args.command == "lens"
     assert args.lens_cmd == "fit"
     assert args.model == "m/x"
     assert args.prompts == 50
     assert args.dim_batch == 32
+    assert args.prompt_batch == 4
     assert args.force is True
 
 

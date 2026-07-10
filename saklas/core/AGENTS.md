@@ -41,28 +41,27 @@ and a text corpus. `fit_jacobian_lens(model, tokenizer, prompts, layer_modules,
 exists at all, so the fit runs under `torch.enable_grad()` with a
 `register_forward_pre_hook` on the first block that returns a
 `requires_grad_(True)` clone of its input (reuses `get_layers`, zero per-arch
-wiring). Per prompt: one forward (batched VJP path) and
-`ceil(d_model/dim_batch)` backwards. Each backward selects one block of output
+wiring). Consecutive ragged prompts share one right-padded graph (`prompt_batch`,
+CPU/CUDA default 4, MPS 1) and `ceil(d_model/dim_batch)` backwards. Each backward selects one block of output
 dims, sums those dims over the valid target positions, and calls
 `torch.autograd.grad(..., is_grads_batched=True)` so `dim_batch` VJPs come from a
-single unreplicated prompt graph. `SAKLAS_JLENS_VJP=replicated` restores the
-reference replicated-prompt estimator, and `auto` falls back to that path when a
-backend lacks vmap coverage. Grads come from `torch.autograd.grad(final,
+single unreplicated graph while preserving equal-prompt weighting.
+`SAKLAS_JLENS_VJP=replicated` restores the reference replicated-prompt estimator,
+and `auto` falls back to exact unreplicated scalar VJPs when a backend lacks vmap
+coverage. Grads come from `torch.autograd.grad(final,
 sources)` — NOT `backward()` + `retain_grad()`, whose `.grad` accumulation across
 the multi-backward loop would corrupt the rows — which also stops the graph walk
 at the shallowest requested source, so a `--layers`-restricted fit never
-backprops below its lowest layer. On CUDA/CPU, row blocks write into reused
-per-layer row buffers and fold once per prompt into the CPU fp32 accumulator,
-all-or-nothing on success. CUDA copies completed device matrices into reusable
-pinned host buffers and synchronizes once per prompt. On MPS, full
-`[d_model,d_model]×layers` row buffers are skipped; small `_MPS_ROW_STRIPE`
-buffers flush after zero-row checks to a reusable CPU prompt buffer, avoiding the
-unified-memory cliff while preserving all-or-nothing retries. A fully unsynced
+backprops below its lowest layer. A terminal hook stops the forward after the
+final transformer residual, before final norm / LM head. Every backend uses
+bounded `_ROW_STRIPE` device + host buffers that validate and commit directly
+into the persistent CPU accumulator; if a later VJP OOMs the graph is rebuilt at
+the first uncommitted row. A fully unsynced
 MPS loop can still let the CPU enqueue too far
 ahead, so the pass loop drains the queue every `_MPS_SYNC_EVERY_PASSES` (4), and
-zero rows raise with "out of memory" wording so the dim-batch-halving retry catches
-them. After an OOM, `dim_batch` can grow back toward the requested width after a
-few successful prompts. The fit is compute-bound; `source_layers` restriction is
+zero rows raise before a stripe is committed. Prompt/dimension widths halve
+independently on OOM and stay below the proven failure ceiling. The fit is
+compute-bound; `source_layers` restriction is
 the one real wall-time lever (1.73× for the 40–90% band).
 `checkpoint_accumulator_cb` fires every `DEFAULT_CHECKPOINT_EVERY` (25) prompts
 for allocation-light resumable fits: IO normalizes live sums and merges any
@@ -124,6 +123,9 @@ is no per-row H2D followed by a blocking `.tolist()` D2H. `role=` is uniform;
 `roles=` carries mixed per-row substitutions for fit-wide batches.
 `compute_node_centroid` / `compute_neutral_activations` chunk by
 `_CAPTURE_BATCH` and amortize the MPS `empty_cache` per chunk.
+Fit-wide manifold capture tokenizes once, sorts rows by token length, grows clean
+batches up to `_CAPTURE_BATCH_MAX`, and stops the model after the last selected
+layer so unused upper blocks, final norm, and LM head never run.
 `_encode_and_capture_all` is the single-pair sibling. `_capture_all_hidden_states`
 hooks every layer at once and accepts an `int` (single) or `(B,)` tensor (per-row)
 `pool_index`. Capture is **conversational** (4.0 / A2): a corpus item is an
@@ -189,15 +191,31 @@ pipeline (concept extraction and manifold fitting are the same thing — a vecto
 a 2-node `pca` manifold). Dependencies via the `ModelHandle` protocol (`model` /
 `tokenizer` / `layers` / `device` / `model_id` / `_run_generator` /
 `generate_responses`) + an `EventBus` for `ManifoldExtracted`; `SaklasSession`
-satisfies it implicitly. Cache-hit on the sidecar `nodes_sha256` (folds in corpus
-+ `{domain, node_coords}` authored / `{fit_mode, hyperparams}` discover) **and**
-`sae_revision`. Else reads `_load_baseline_prompts()` and pools the complete
+satisfies it implicitly. Cache-hit on the sidecar `nodes_sha256` (folds in labels, corpus
++ `{domain, node_coords}` authored / `{fit_mode, hyperparams}` discover),
+`sae_revision`, token-exact capture identity (baseline prompts + tokenizer
+render included), loaded-model fingerprint, and fitted-layer set. Else pools the complete
 roster through `compute_manifold_node_stats`: one row stream crosses node
 boundaries so short template nodes fill shared forward batches; OOM halves the
-active batch and a clean run grows it back. Raw curved fits retain those fp32
-rows for later covariance instead of capturing the corpus twice. It threads the folder's `node_kinds` /
+active batch and a clean run grows it back. Centroid-only fits reduce by node on
+device before transfer; raw curved fits retain source-dtype rows in a layer-major
+mmap spool for later covariance instead of capturing the corpus twice or holding
+the whole roster in fp32 RAM. A token-exact per-model capture cache lets domain,
+topology, and smoothing refits skip model forwards; its identity includes node
+boundaries, and its digest metadata validates centroid payloads plus exact
+per-layer row tensors; subset fits map/hash only requested row layers. Layer
+coverage is unioned/topped up, so full→subset needs no forward and overlapping
+subsets capture only missing layers. Cache groups prune oldest-first past 8 GiB
+(`SAKLAS_MANIFOLD_CAPTURE_CACHE_GB`) and `pack clear` / `pack rm` remove referenced
+group. `layer_indices` accepts an explicit set or the canonical 40–90% workspace
+band. It threads the folder's `node_kinds` /
 `node_roles` into the `Manifold` + sidecar metadata, then dispatches on
 `fit_mode`:
+
+Fit uses `ManifoldFolder.load(..., verify_manifest=False)`: it hashes the live
+corpus into the capture/final identities and validates the requested tensor, but
+does not reread every historical model/SAE payload. Lifecycle/install/publish
+loads retain full manifest verification.
 
 - **`pca`** (flat / discover; the 2-node-vector case): derive per-model coords
   (`discover_coords` over the layer-agnostic consensus Gram — `mean_L` of each
@@ -238,7 +256,9 @@ rows for later covariance instead of capturing the corpus twice. It threads the 
   `BoxDomain` axes via persistent homology. The chosen `effective_fit_mode`
   drives the same flat/curved per-layer fit below; the resolved mode + the ranked
   topology candidates land in the sidecar (`resolved_fit_mode`,
-  `topology_winner`, `topology_candidates`). Sphere is authored-only.
+  `topology_winner`, `topology_candidates`). A curved winner carries the
+  already-factorized `RbfFitPlan` from scoring into the final layer fit instead
+  of repeating layout QR/eigh/LU. Sphere is authored-only.
 
 `--sae` reconstructs each centroid through the SAE before the fit (fail-fast
 `SaeCoverageError`); the fitted subspace is model-space regardless. Bakes
@@ -269,7 +289,11 @@ SAE backend. `SaeBackend` (runtime-checkable Protocol): `encode_layer`/
 `SaeLensBackend` the concrete adapter. `load_sae_backend(release, *, revision,
 model_id, device, dtype)` queries SAELens, validates base-model compatibility,
 resolves per-layer sae_ids (`_canonical_layer_map` narrowest-width), gates
-`sae_lens` imports so the module loads without `[sae]`. Errors:
+`sae_lens` imports so the module loads without `[sae]`. Registry resolution is
+eager but weights are lazy with a one-layer resident cache; a valid fitted-tensor
+hit does not import SAELens at all. An explicit `revision` is passed only when
+the installed loader exposes `revision=`; otherwise loading raises instead of
+stamping a pin it did not honor. Errors:
 `SaeBackendImportError`, `SaeReleaseNotFoundError` (difflib suggestions).
 
 ## mahalanobis.py
@@ -901,8 +925,9 @@ events: `GenerationStarted`/`SteeringApplied`/
 `SteeringCleared`/`ProbeScored`/`GenerationFinished` + `VectorExtracted`/
 `ManifoldExtracted`; threaded subscribers hop via `loop.call_soon_threadsafe`.
 
-**Jacobian-lens surface.** `session.jlens` lazy-loads the per-model artifact
-(`io/lens.py`, like `whitener`); `fit_jlens(prompts, …)` pre-filters too-short
+**Jacobian-lens surface.** `session.jlens` validates v2 sidecar/live-weight
+identity before loading, then verifies the payload digest while promoting each
+layer (`io/lens.py`, like `whitener`); `fit_jlens(prompts, …)` pre-filters too-short
 prompts (so the saved `n_prompts` counts consumed prompts exactly — what makes
 resume slicing sound), hashes the filtered corpus, resumes a matching partial
 fit by default (`force=True` restarts), checkpoints via the io layer, and gates

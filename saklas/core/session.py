@@ -47,7 +47,13 @@ from saklas.core.loom import (
     MutationDuringGenerationError,
     derive_seed_schedule,
 )
-from saklas.core.model import load_model, get_layers, get_model_info
+from saklas.core.model import (
+    get_layers,
+    get_model_info,
+    load_model,
+    loaded_model_fingerprint,
+    workspace_layer_indices,
+)
 from saklas.core.monitor import Monitor
 from saklas.io.probes_bootstrap import bootstrap_layer_means
 from saklas.core.profile import Profile, load_profile as _load_profile
@@ -1756,13 +1762,37 @@ class SaklasSession:
         :class:`saklas.core.jlens.JacobianLens`.
         """
         if self._jlens is None:
-            from saklas.io.lens import load_lens
+            from saklas.io.lens import load_lens, load_lens_sidecar
 
-            loaded = load_lens(self.model_id)
-            if loaded is not None:
-                self._jlens = loaded[0]
-                self._jlens_device_cache = {}
+            sidecar = load_lens_sidecar(self.model_id)
+            if sidecar is not None:
+                fitted_fingerprint = sidecar.get("model_fingerprint")
+                if fitted_fingerprint != loaded_model_fingerprint(
+                    self._model, self.model_id,
+                ):
+                    _log.warning(
+                        "ignoring stale Jacobian lens for %s: loaded-model "
+                        "fingerprint is missing or changed; re-fit with "
+                        "`saklas lens fit`",
+                        self.model_id,
+                    )
+                else:
+                    loaded = load_lens(self.model_id)
+                    if loaded is not None:
+                        self._jlens = loaded[0]
+                        self._jlens_device_cache = {}
         return self._jlens
+
+    def has_compatible_jlens(self) -> bool:
+        """Whether lens metadata matches the currently loaded weights."""
+        from saklas.io.lens import load_lens_sidecar
+
+        sidecar = load_lens_sidecar(self.model_id)
+        return bool(
+            sidecar is not None
+            and sidecar.get("model_fingerprint")
+            == loaded_model_fingerprint(self._model, self.model_id)
+        )
 
     def _require_jlens(self) -> "Any":
         from saklas.core.jlens import LensNotFittedError
@@ -1782,6 +1812,7 @@ class SaklasSession:
         corpus_spec: str = "custom",
         source_layers: "Sequence[int] | str | None" = None,
         dim_batch: int | None = None,
+        prompt_batch: int | None = None,
         seq_len: int | None = None,
         force: bool = False,
         checkpoint_every: int | None = None,
@@ -1792,11 +1823,13 @@ class SaklasSession:
         Prompts too short for the estimator (≤ ``SKIP_FIRST_POSITIONS + 1``
         tokens) are dropped up front so the saved ``n_prompts`` counts
         consumed prompts exactly — that is what makes resume slicing sound.
-        Resume-by-default: when a saved lens matches this corpus (sha256 of
-        the filtered prompts) and covers fewer prompts than requested, only
-        the remainder is fitted and merged in; ``force=True`` restarts from
-        zero. Checkpoints every ``DEFAULT_CHECKPOINT_EVERY`` prompts, so an
-        interrupted fit resumes from the last checkpoint.
+        Resume-by-default: when a saved lens matches the filtered token-id
+        corpus (or an exact prefix of it), the loaded-model fingerprint, and
+        sequence policy, only the remainder is fitted and merged in;
+        ``force=True`` restarts from zero. Checkpoints every
+        ``DEFAULT_CHECKPOINT_EVERY`` prompts, so an interrupted fit resumes from
+        the last checkpoint. ``prompt_batch`` controls consecutive ragged
+        prompts per autograd graph independently of the output ``dim_batch``.
 
         Gated against generation: the fit runs forward *and backward* passes
         through the model (the only backward passes in saklas).
@@ -1824,6 +1857,8 @@ class SaklasSession:
         checkpoint_every = checkpoint_every or DEFAULT_CHECKPOINT_EVERY
         if dim_batch <= 0:
             raise ValueError("dim_batch must be > 0")
+        if prompt_batch is not None and prompt_batch <= 0:
+            raise ValueError("prompt_batch must be > 0")
         if seq_len <= 0:
             raise ValueError("seq_len must be > 0")
         if checkpoint_every <= 0:
@@ -1838,36 +1873,18 @@ class SaklasSession:
         ):
             fit_model = getattr(self._model, "_orig_mod", self._model)
             fit_layers = list(get_layers(fit_model))
+            model_fingerprint = loaded_model_fingerprint(
+                fit_model, self.model_id,
+            )
+            model_source_fp = getattr(
+                fit_model, "_saklas_source_fingerprint", None,
+            )
             expected_sources = self._resolve_jlens_source_layers(
                 source_layers, n_layers=len(fit_layers),
             )
             expected_set = set(expected_sources)
             if force:
                 remove_lens_checkpoint(self.model_id)
-            else:
-                sidecar = load_lens_sidecar(self.model_id)
-                if (
-                    sidecar is not None
-                    and sidecar.get("raw_corpus_sha256") == raw_corpus_sha
-                    and sidecar.get("raw_prompt_count") == raw_prompt_count
-                    and sidecar.get("seq_len") == seq_len
-                    and set(int(l) for l in sidecar.get("source_layers", []))
-                    >= expected_set
-                ):
-                    usable_count = int(sidecar.get("usable_prompt_count", -1))
-                    existing = load_lens(self.model_id)
-                    if existing is not None:
-                        lens, _ = existing
-                        if usable_count >= 0 and lens.n_prompts >= usable_count:
-                            if on_progress is not None:
-                                on_progress(
-                                    f"lens already fitted on {lens.n_prompts} "
-                                    "prompts — nothing to do"
-                                )
-                            selected = lens.select_layers(expected_sources)
-                            self._jlens = selected
-                            self._jlens_device_cache = {}
-                            return selected
 
             usable: list[str] = []
             consumed_ids: list[list[int]] = []
@@ -1898,19 +1915,34 @@ class SaklasSession:
             corpus_sha = hashlib.sha256(
                 repr(consumed_ids).encode("utf-8")
             ).hexdigest()
+
+            def _token_rows_sha(rows: "Sequence[Sequence[int]]") -> str:
+                return hashlib.sha256(repr(list(rows)).encode("utf-8")).hexdigest()
+
             corpus_hash_kind = "token_ids_v1"
             base: Any = None
             if not force:
                 sidecar = load_lens_sidecar(self.model_id)
                 if (
                     sidecar is not None
-                    and sidecar.get("corpus_sha256") == corpus_sha
                     and sidecar.get("corpus_hash_kind") == corpus_hash_kind
                     and sidecar.get("seq_len") == seq_len
+                    and sidecar.get("model_fingerprint") == model_fingerprint
                 ):
                     existing = load_lens(self.model_id)
                 else:
                     existing = None
+                if existing is not None:
+                    lens, sidecar = existing
+                    saved_n = int(lens.n_prompts)
+                    saved_sha = sidecar.get("corpus_sha256")
+                    corpus_matches = saved_sha == corpus_sha
+                    prefix_matches = (
+                        0 < saved_n <= len(consumed_ids)
+                        and saved_sha == _token_rows_sha(consumed_ids[:saved_n])
+                    )
+                    if not (corpus_matches or prefix_matches):
+                        existing = None
                 if existing is not None:
                     lens, sidecar = existing
                     existing_set = set(lens.source_layers)
@@ -1940,6 +1972,8 @@ class SaklasSession:
                                 and topup_sidecar.get("corpus_hash_kind")
                                 == corpus_hash_kind
                                 and topup_sidecar.get("seq_len") == seq_len
+                                and topup_sidecar.get("model_fingerprint")
+                                == model_fingerprint
                                 and int(topup_sidecar.get("base_n_prompts", -1)) == 0
                                 and partial.source_layers == missing_sources
                             ):
@@ -1974,6 +2008,8 @@ class SaklasSession:
                                 raw_prompt_count=raw_prompt_count,
                                 usable_prompt_count=len(consumed_ids),
                                 model_layer_count=len(fit_layers),
+                                model_fingerprint=model_fingerprint,
+                                model_source_fingerprint=model_source_fp,
                             )
 
                         if topup_prompts:
@@ -1981,11 +2017,13 @@ class SaklasSession:
                                 fit_model, self._tokenizer, topup_prompts,
                                 fit_layers, source_layers=missing_sources,
                                 dim_batch=dim_batch, max_seq_len=seq_len,
+                                prompt_batch=prompt_batch,
                                 checkpoint_accumulator_cb=(
                                     _save_topup_accumulator
                                 ),
                                 checkpoint_every=checkpoint_every,
                                 on_progress=on_progress,
+                                progress_base=topup_offset,
                                 input_id_rows=topup_ids,
                             )
                             missing = (
@@ -2009,6 +2047,8 @@ class SaklasSession:
                             raw_prompt_count=raw_prompt_count,
                             usable_prompt_count=len(consumed_ids),
                             model_layer_count=len(fit_layers),
+                            model_fingerprint=model_fingerprint,
+                            model_source_fingerprint=model_source_fp,
                         )
                         remove_lens_checkpoint(self.model_id)
                         selected = merged.select_layers(expected_sources)
@@ -2026,6 +2066,8 @@ class SaklasSession:
                         ckpt_sidecar.get("corpus_sha256") == corpus_sha
                         and ckpt_sidecar.get("corpus_hash_kind") == corpus_hash_kind
                         and ckpt_sidecar.get("seq_len") == seq_len
+                        and ckpt_sidecar.get("model_fingerprint")
+                        == model_fingerprint
                         and [int(l) for l in ckpt_sidecar.get("source_layers", [])]
                         == expected_sources
                     )
@@ -2077,6 +2119,8 @@ class SaklasSession:
                     raw_prompt_count=raw_prompt_count,
                     usable_prompt_count=len(consumed_ids) + prompt_base,
                     model_layer_count=len(fit_layers),
+                    model_fingerprint=model_fingerprint,
+                    model_source_fingerprint=model_source_fp,
                 )
                 remove_lens_checkpoint(self.model_id)
                 return lens
@@ -2099,6 +2143,8 @@ class SaklasSession:
                     raw_prompt_count=raw_prompt_count,
                     usable_prompt_count=len(consumed_ids) + prompt_base,
                     model_layer_count=len(fit_layers),
+                    model_fingerprint=model_fingerprint,
+                    model_source_fingerprint=model_source_fp,
                 )
 
             if base is not None and not usable:
@@ -2110,10 +2156,12 @@ class SaklasSession:
             fitted = fit_jacobian_lens(
                 fit_model, self._tokenizer, usable, fit_layers,
                 source_layers=expected_sources, dim_batch=dim_batch,
+                prompt_batch=prompt_batch,
                 max_seq_len=seq_len,
                 checkpoint_accumulator_cb=_save_checkpoint_accumulator,
                 checkpoint_every=checkpoint_every,
                 on_progress=on_progress,
+                progress_base=prompt_base,
                 input_id_rows=consumed_ids,
             )
             merged = (
@@ -2159,11 +2207,7 @@ class SaklasSession:
         if isinstance(source_layers, str):
             mode = source_layers.lower()
             if mode in {"workspace", "band"}:
-                band = [
-                    l for l in range(final_idx)
-                    if 0.40 <= l / max(n_layers - 1, 1) <= 0.90
-                ]
-                return band or list(range(final_idx))
+                return workspace_layer_indices(range(final_idx), n_layers)
             if mode == "sample":
                 all_sources = list(range(final_idx))
                 if len(all_sources) <= 9:
@@ -2705,10 +2749,7 @@ class SaklasSession:
         workspace range. Falls back to every fitted layer for models too
         shallow to have a band (the CPU-test toys)."""
         n = len(self._layers)
-        band = [
-            l for l in lens.source_layers if 0.40 <= l / max(n - 1, 1) <= 0.90
-        ]
-        return band or list(lens.source_layers)
+        return workspace_layer_indices(list(lens.source_layers), n)
 
     def _live_lens_readout_step(
         self,
@@ -3405,6 +3446,7 @@ class SaklasSession:
         *,
         sae: str | None = None,
         sae_revision: str | None = None,
+        layers: "Sequence[int] | str | None" = None,
         force: bool = False,
         on_progress: Callable[[str], None] | None = None,
     ) -> Manifold:
@@ -3417,6 +3459,8 @@ class SaklasSession:
         Gated against generation like :meth:`extract`: manifold fitting runs
         forward passes through the model.  ``force=True`` bypasses the per-model
         tensor cache and re-pools/re-fits unconditionally (CLI ``-f/--force``).
+        ``layers`` optionally restricts fitting to explicit transformer indices
+        or the 40–90% ``"workspace"`` band.
         """
         with self._model_exclusive(
             "session.fit called while another model use is in flight",
@@ -3427,7 +3471,7 @@ class SaklasSession:
                 pipe = ManifoldExtractionPipeline(self, self.events)
                 return pipe.fit(
                     folder, sae=sae, sae_revision=sae_revision,
-                    force=force, on_progress=on_progress,
+                    layer_indices=layers, force=force, on_progress=on_progress,
                 )
             finally:
                 # A re-fit changes the folded directions any probe reads from.
