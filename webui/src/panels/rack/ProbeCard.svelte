@@ -198,7 +198,7 @@
   }
 </script>
 
-<RackCard {accent} disabled={false}>
+<RackCard {accent} disabled={false} active={isHighlight}>
   {#snippet statline()}
     <!-- Identity cluster — clicking it toggles the highlight selection. -->
     <div
@@ -233,8 +233,14 @@
     <span class="spacer"></span>
 
     <!-- Curved (fraction) probes are [0,1]-bounded → cap the sparkline at 1;
-         flat (signed) probes auto-scale. -->
-    <Sparkline points={sparkline} width={56} height={14} cap={affine ? undefined : 1} />
+         flat (signed) probes auto-scale.  Trace wears the pillar hue. -->
+    <Sparkline
+      points={sparkline}
+      width={56}
+      height={14}
+      cap={affine ? undefined : 1}
+      color="var(--card-accent)"
+    />
 
     <button
       type="button"

@@ -108,7 +108,7 @@
 
     <span class="spacer"></span>
 
-    <Sparkline points={series} width={56} height={14} />
+    <Sparkline points={series} width={56} height={14} color="var(--card-accent)" />
   {/snippet}
 
   {#snippet body()}
@@ -179,6 +179,7 @@
     line-height: 1;
     flex: 0 0 auto;
     cursor: pointer;
+    transition: color var(--dur-fast) var(--ease-out);
   }
   .pin-glyph:hover:not(:disabled) {
     color: var(--card-accent);

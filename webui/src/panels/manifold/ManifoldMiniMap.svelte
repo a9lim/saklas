@@ -203,8 +203,8 @@
     display: block;
     width: var(--map-size);
     height: var(--map-size);
-    background: var(--bg-deep);
-    border: 1px solid var(--border);
+    background: var(--glass-strong);
+    border: 1px solid var(--glass-line);
     border-radius: var(--radius);
   }
   .grid {
@@ -212,35 +212,37 @@
     stroke-width: 1;
   }
   .trajectory {
-    /* Same purple as the steering rack so the manifold-tinted family
-     * holds across panels.  Translucent + thin so the path reads as
-     * historical context, not a foreground feature. */
-    stroke: var(--accent-purple);
+    /* Green live/probe hue: the per-token path is a streaming quantity.
+     * Translucent + thin so the path reads as historical context, not a
+     * foreground feature. */
+    stroke: var(--accent-green);
     stroke-width: 1.5;
-    stroke-opacity: 0.45;
+    stroke-opacity: 0.55;
     stroke-linecap: round;
     stroke-linejoin: round;
   }
   .node circle {
-    fill: var(--fg-muted);
+    fill: var(--fg-subtle);
     stroke: var(--bg-deep);
     stroke-width: 1;
   }
   .node text {
-    fill: var(--fg-dim);
+    fill: var(--fg-muted);
     font-size: var(--text-2xs);
     font-family: var(--font-ui);
   }
   .cursor {
-    fill: var(--accent-purple);
+    /* Live head of the green trajectory — follows the path's hue so the
+     * moving cursor doesn't clash with the line it caps. */
+    fill: var(--accent-green);
     fill-opacity: 0.7;
     stroke: var(--bg-deep);
     stroke-width: 1;
   }
   .settled {
-    fill: var(--accent-purple);
-    stroke: var(--accent);
-    stroke-width: 1.5;
+    fill: var(--accent-green);
+    stroke: var(--accent-light);
+    stroke-width: 1;
   }
   .axes {
     display: flex;

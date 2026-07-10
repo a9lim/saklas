@@ -22,6 +22,10 @@
     /** Dim + de-emphasise the card (a disabled steer term).  Probe cards
      *  pass ``false`` — a probe is always "on". */
     disabled?: boolean;
+    /** Alive right now — hue ring + faint glow (the highlight-selected
+     *  probe, a gate that just fired).  Glow marks what is alive; the
+     *  resting card stays calm. */
+    active?: boolean;
     /** Top identity line: marker glyph · name · status chips · actions.
      *  One row; the card owns its glyph + chips. */
     statline: Snippet;
@@ -33,31 +37,52 @@
   let {
     accent = "--accent",
     disabled = false,
+    active = false,
     statline,
     body,
   }: Props = $props();
 </script>
 
-<div class="card" class:disabled style:--card-accent="var({accent})" role="group">
+<div
+  class="card"
+  class:disabled
+  class:active
+  style:--card-accent="var({accent})"
+  role="group"
+>
   <div class="statline">{@render statline()}</div>
   <div class="body">{@render body()}</div>
 </div>
 
 <style>
+  /* The dense variant of the v2 glass material (lib/ui/GlassCard is the
+   * roomy one) — translucent fill lit from above, accent-tinted hairline.
+   * No backdrop blur: rack cards sit on the opaque panel, so blur would
+   * cost compositing for nothing. */
   .card {
     display: flex;
     flex-direction: column;
     gap: var(--space-2);
-    padding: var(--space-2) var(--space-3);
-    border: 1px solid var(--border);
-    /* The colour accent — flat vs curved family at a glance. */
-    border-left: 2px solid var(--card-accent);
-    border-radius: var(--radius);
-    background: var(--bg-alt);
+    padding: var(--space-3) var(--space-4);
+    border: 1px solid color-mix(in srgb, var(--card-accent) 14%, var(--glass-line));
+    border-radius: var(--radius-lg);
+    background: var(--glass);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
     font-size: var(--text-sm);
     transition:
       border-color var(--dur) var(--ease-out),
+      box-shadow var(--dur) var(--ease-out),
       opacity var(--dur) var(--ease-out);
+  }
+  .card:hover {
+    border-color: color-mix(in srgb, var(--card-accent) 26%, var(--glass-line));
+  }
+  .card.active {
+    border-color: color-mix(in srgb, var(--card-accent) 40%, transparent);
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.04),
+      0 0 0 1px color-mix(in srgb, var(--card-accent) 18%, transparent),
+      0 0 18px color-mix(in srgb, var(--card-accent) 7%, transparent);
   }
   .card.disabled {
     opacity: 0.5;

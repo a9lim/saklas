@@ -115,7 +115,7 @@
 
     <span class="spacer"></span>
 
-    <Sparkline points={sparkline} width={56} height={14} />
+    <Sparkline points={sparkline} width={56} height={14} color="var(--card-accent)" />
   {/snippet}
 
   {#snippet body()}
@@ -167,7 +167,10 @@
     line-height: 1;
     flex: 0 0 auto;
     cursor: pointer;
+    transition: color var(--dur-fast) var(--ease-out);
   }
+  /* Unpin is a detach — keep the red destructive-action hover (mirrors
+     the CAA card's ✕), just add the dur-fast transition. */
   .pin-glyph:hover:not(:disabled) {
     color: var(--accent-red);
   }
