@@ -321,7 +321,8 @@
     font-size: var(--text-sm);
     text-align: left;
     cursor: pointer;
-    transition: background var(--dur-fast) var(--ease-out);
+    transition: background var(--dur-fast) var(--ease-out),
+      border-color var(--dur-fast) var(--ease-out);
   }
   .sk-select-trigger:hover:not(:disabled) {
     background: var(--surface-hi);
@@ -392,11 +393,12 @@
     text-overflow: ellipsis;
   }
   .sk-select-opt.is-highlight:not(.is-disabled) {
-    background: var(--accent-subtle);
+    background: var(--bg-hover);
     color: var(--fg);
   }
   .sk-select-opt.is-active {
-    color: var(--accent);
+    background: var(--accent-subtle);
+    color: var(--fg);
   }
   .sk-select-opt.is-active.is-highlight {
     background: var(--accent-glow);

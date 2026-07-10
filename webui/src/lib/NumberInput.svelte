@@ -174,12 +174,13 @@
     background: var(--bg-elev);
     color: var(--fg);
     border: 1px solid var(--border);
-    border-radius: var(--radius);
+    border-radius: var(--radius-sm);
     font: inherit;
     font-family: var(--font-mono);
     font-size: var(--text-sm);
     -moz-appearance: textfield;
     appearance: textfield;
+    transition: border-color var(--dur-fast) var(--ease-out);
   }
   .sk-number-input::-webkit-outer-spin-button,
   .sk-number-input::-webkit-inner-spin-button {
@@ -189,6 +190,7 @@
   .sk-number-input:focus-visible {
     outline: 2px solid var(--accent-glow);
     outline-offset: 1px;
+    border-color: var(--accent-glow);
   }
   .sk-number-input:disabled {
     opacity: 0.5;
@@ -228,7 +230,7 @@
       color var(--dur-fast) var(--ease-out);
   }
   .sk-number-step:hover {
-    background: var(--accent-subtle);
+    background: var(--bg-hover);
     color: var(--accent);
   }
   .sk-number-step:active {

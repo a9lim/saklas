@@ -85,7 +85,7 @@
     padding: 0;
     background: var(--bg-elev);
     border: 1px solid var(--border);
-    border-radius: var(--radius);
+    border-radius: var(--radius-sm);
     cursor: pointer;
     transition: background var(--dur-fast) var(--ease-out),
       border-color var(--dur-fast) var(--ease-out);
@@ -98,11 +98,13 @@
     outline-offset: 2px;
   }
   .sk-checkbox.is-checked {
-    background: var(--accent);
+    background: linear-gradient(180deg, rgba(255, 255, 255, 0.18), transparent 55%),
+      var(--accent);
     border-color: var(--accent);
   }
   .sk-checkbox.is-checked:hover:not(.is-disabled) {
-    background: var(--accent-light);
+    background: linear-gradient(180deg, rgba(255, 255, 255, 0.18), transparent 55%),
+      var(--accent-light);
     border-color: var(--accent-light);
   }
   .sk-checkbox.is-disabled {

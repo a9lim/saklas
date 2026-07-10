@@ -721,8 +721,12 @@
   /** Build the inline-style object for one token's background.  Compare-
    * two needs both probes set; if only one of the two is configured we
    * gracefully fall back to single-probe rendering.  ``SURPRISE_TARGET``
-   * works in either slot — the resulting score feeds the same
-   * ``scoreToRgb`` ramp (positive half by construction). */
+   * works in either slot — it reads in the logit-space blue ramp
+   * (distinct from any probe's signed green/red), per-slot. */
+  function hueFor(target: string | null): "signed" | "surprise" {
+    return target === SURPRISE_TARGET ? "surprise" : "signed";
+  }
+
   function tokenStyle(
     t: TokenScore,
   ): { backgroundColor?: string; backgroundImage?: string } {
@@ -731,13 +735,14 @@
     const aScore = pickScore(t, a);
     const scaleA = highlightScale(a);
     if (highlightState.compareTwo && highlightState.compareTarget) {
-      const bScore = pickScore(t, highlightState.compareTarget);
-      const scaleB = highlightScale(highlightState.compareTarget);
+      const b = highlightState.compareTarget;
+      const bScore = pickScore(t, b);
+      const scaleB = highlightScale(b);
       return highlightState.smoothBlend
-        ? twoBlendStyle(aScore, bScore, scaleA, scaleB)
-        : twoStripeStyle(aScore, bScore, scaleA, scaleB);
+        ? twoBlendStyle(aScore, bScore, scaleA, scaleB, hueFor(a), hueFor(b))
+        : twoStripeStyle(aScore, bScore, scaleA, scaleB, hueFor(a), hueFor(b));
     }
-    const bg = scoreToRgb(aScore, scaleA);
+    const bg = scoreToRgb(aScore, scaleA, hueFor(a));
     return bg === "transparent" ? {} : { backgroundColor: bg };
   }
 

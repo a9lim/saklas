@@ -1,102 +1,139 @@
-/* Centralized design tokens — saklas webui.
+/* Design tokens v2 — the Observatory+ system.
  *
- * One flat, dark theme.  After the 2026-05 consolidation the rules are:
- *   - surfaces separate by background SHADE, not by outline
- *   - exactly one border: a faint uniform hairline (--border)
- *   - one corner radius (--radius, 2px) — sharp, matches a9l.im
- *   - type comes from the --text-* scale; spacing from --space-*
- *   - weight comes from --weight-*
- *   - the yellow --accent is the only chrome hue — selection, focus,
- *     primary actions.  Blue / green / amber / red / purple are reserved
- *     for state + data, never decoration.  --accent-yellow keeps its
- *     state-colour identity and happens to coincide with --accent.
- *   - no texture: no film grain, no glass blur — flat opaque surfaces
+ * Spec: the locked direction board (2026-07-10) + docs/plans/webui-overhaul.md
+ * UX principles (dark-only, density stays visible). Supersedes the a9l.im
+ * mirror palette.
  *
- * Colour values mirror a9l.im's dark palette (shared-tokens.js dark
- * block).  When the site palette changes, propagate: shared-tokens.js
- * dark block → these vars.
+ * The rules:
+ *   - HUE ANSWERS "WHICH SPACE AM I LOOKING AT?" — chrome is achromatic;
+ *     every colored thing is colored by the space it lives in:
+ *       subspace = white · manifold = violet · sae = gold · lens/surprise =
+ *       blue (logit-space family) · live/probe+ = green · error/probe− = red.
+ *     Warm hue belongs to SAE alone. Roles carry no hue (the cast model).
+ *   - Gradients are MATERIAL, not data: surfaces/washes/rings may glow;
+ *     data marks gradient across the encoding axis, never along it
+ *     (along-axis only where the gradient IS the data: depth, time).
+ *   - Glow is reserved for what is alive right now (streaming, moving
+ *     probes, firing gates) — the room stays calm.
+ *   - Elevation = translucency + light (inset top-light, shadow), no longer
+ *     shade steps alone. Legacy --bg-* names stay mapped to opaque
+ *     composites so pre-v2 components keep working mid-migration.
  */
 
 :root {
   /* ---- Geometry ---------------------------------------------------- */
-  --radius: 2px;
+  --radius-sm: 5px;         /* chips, ticks, small controls */
+  --radius: 8px;            /* controls, inputs, tabs */
+  --radius-lg: 12px;        /* cards, sheets, panels */
   --radius-pill: 999px;
 
-  /* ---- Surfaces — a flat elevation ladder, deepest → highest -------
-   * Mid-tiers track a9l.im's dark canvas/panelSolid/elevated; the rail
-   * floor and modal ceiling extrapolate one notch in each direction. */
-  --bg-deep: #04050a;       /* rail — the floor */
-  --bg: #06070b;            /* app canvas — a9l.im dark.canvas */
-  --bg-alt: #0e0f14;        /* panel tier — a9l.im dark.panelSolid */
-  --surface: #0e0f14;       /* alias of --bg-alt; panels, cards */
-  --bg-elev: #191a1f;       /* elevated — a9l.im dark.elevated */
-  --surface-strong: #191a1f;/* alias of --bg-elev */
-  --surface-hi: #232430;    /* highest: modals, popovers, menus */
+  /* ---- Surfaces -----------------------------------------------------
+   * Ground carries a faint blue-violet ambient (set in global.css).
+   * Opaque ladder = legacy names, recomposited in the new palette.
+   * Glass tier = the v2 card material (translucent + blur + top-light). */
+  --bg-deep: #05060b;       /* rail — the floor */
+  --bg: #07080e;            /* app canvas */
+  --bg-alt: #0e1018;        /* panel tier (opaque composite of glass-on-bg) */
+  --surface: #0e1018;       /* alias of --bg-alt */
+  --bg-elev: #171a26;       /* elevated */
+  --surface-strong: #171a26;/* alias of --bg-elev */
+  --surface-hi: #1f2333;    /* highest: modals, popovers, menus */
+
+  --glass: rgba(255, 255, 255, 0.035);        /* v2 card fill */
+  --glass-strong: rgba(255, 255, 255, 0.06);  /* v2 raised fill / wells */
+  --glass-line: rgba(233, 236, 248, 0.085);   /* v2 card hairline */
+  --blur-glass: 6px;
 
   /* Translucent wash laid over any surface tier on hover. */
-  --bg-hover: rgba(244, 245, 249, 0.05);
+  --bg-hover: rgba(237, 239, 247, 0.05);
   /* The 1px seam between layout zones. */
-  --grid-line: #04050a;
+  --grid-line: #05060b;
 
   /* ---- Text ladder ------------------------------------------------- */
-  --fg: #f4f5f9;            /* primary */
-  --fg-strong: #d8dbe0;     /* slightly recessed body */
-  --fg-dim: #bfc1c6;        /* secondary */
-  --fg-subtle: #a7aab1;     /* tertiary */
-  --fg-muted: #8f929b;      /* labels, hints, disabled */
-  --text-on-accent: #06070b;/* dark canvas — sits on white --accent */
+  --fg: #edeff7;            /* primary */
+  --fg-strong: #d3d7e4;     /* slightly recessed body */
+  --fg-dim: #a3a8bd;        /* secondary */
+  --fg-subtle: #8a90a6;     /* tertiary */
+  --fg-muted: #6b7088;      /* labels, hints, disabled */
+  --text-on-accent: #07080e;/* dark canvas — sits on white --accent */
 
   /* ---- The one border --------------------------------------------- */
-  --border: rgba(244, 245, 249, 0.09);
+  --border: rgba(233, 236, 248, 0.09);
 
-  /* ---- Accent + semantic colours ----------------------------------
-   * --accent (white) is the only chrome hue — selection, focus,
-   * primary actions.  All five colour channels (blue / green / amber
-   * / red / yellow / purple) are state-only: text / fills / data /
-   * left-edge status bars, never resting box outlines.  Chrome reads
-   * as a monochrome lift; hue is reserved for meaning.
-   *
-   * --accent-subtle / --accent-glow alphas are tuned for white-on-
-   * dark: the 0.12 / 0.30 weights that work for a saturated hue
-   * over-saturate as a grey wash, so they drop to 0.08 / 0.18 —
-   * brighter than --bg-hover (0.05) but recognizably accent-pitched. */
-  --accent: #f4f5f9;
-  --accent-blue: #488acb;
+  /* ---- Pillar hues --------------------------------------------------
+   * The four instruments. -hi is the gradient partner (lit stop); the
+   * prebuilt --fill-* sheens run top-light → base (perpendicular to a
+   * horizontal bar's value axis — see gradient policy). Subspace shares
+   * white with chrome deliberately: against colored siblings, white
+   * reads as a hue; its active state leans on ring width, not hue. */
+  --pillar-subspace: #edeff7;
+  --pillar-subspace-hi: #ffffff;
+  --pillar-manifold: #a78bfa;
+  --pillar-manifold-hi: #c4b5fd;
+  --pillar-sae: #f2c94c;
+  --pillar-sae-hi: #f7dc85;
+  --pillar-lens: #6ba6f8;
+  --pillar-lens-hi: #8fc0ff;
+
+  --fill-subspace: linear-gradient(180deg, var(--pillar-subspace-hi), var(--pillar-subspace));
+  --fill-manifold: linear-gradient(180deg, var(--pillar-manifold-hi), var(--pillar-manifold));
+  --fill-sae: linear-gradient(180deg, var(--pillar-sae-hi), var(--pillar-sae));
+  --fill-lens: linear-gradient(180deg, var(--pillar-lens-hi), var(--pillar-lens));
+
+  /* ---- Accent + state ----------------------------------------------
+   * --accent (white) is the chrome hue — selection, focus, primary
+   * actions — and doubles as the subspace pillar. State hues map onto
+   * the ontology: green = live/streaming/probe+, red = error/stop/
+   * probe−, blue = logit space, violet = curved geometry, gold = SAE.
+   * Legacy amber/yellow demote to quiet desaturated bronzes (warn +
+   * pending chrome) so the only saturated warm on screen is SAE gold;
+   * their consumers get rebuilt treatments in later phases. */
+  --accent: #edeff7;
   --accent-light: #ffffff;
-  --accent-amber: #ca6800;
-  --accent-green: #009f68;
-  --accent-red: #da534f;
-  --accent-yellow: #998700;
-  --accent-error: #da534f;
-  --accent-purple: #9769dc;
-  --accent-subtle: rgba(244, 245, 249, 0.08);  /* accent fill wash */
-  --accent-glow: rgba(244, 245, 249, 0.18);    /* focus ring + accent hover */
+  --accent-blue: var(--pillar-lens);
+  --accent-purple: var(--pillar-manifold);
+  --accent-green: #34d399;
+  --accent-red: #e5544f;
+  --accent-error: #e5544f;
+  --accent-amber: #b08b52;   /* demoted: pending/edit chrome, anchor rings */
+  --accent-yellow: #c2a44f;  /* demoted: warn chips */
+  --accent-subtle: rgba(237, 239, 247, 0.08);  /* accent fill wash */
+  --accent-glow: rgba(237, 239, 247, 0.18);    /* focus ring + accent hover */
 
-  /* Highlight palette — driven by tokens.ts ``scoreToRgb`` at runtime,
-   * kept here as named handles for future skin overrides. */
-  --highlight-pos: #00ff00;
-  --highlight-neg: #ff0000;
-  /* Default saturation cutoff: score / scale clamps to [-1, 1] before
-   * mapping to RGB.  ``scale`` defaults to this for the [-1, 1] cosine
-   * grids; probe surfaces pass a per-probe node-coordinate extent. */
+  --live: var(--accent-green);
+  --glow-live: 0 0 12px rgba(52, 211, 153, 0.4);
+
+  /* ---- Highlight ramps ----------------------------------------------
+   * Runtime mapping lives in tokens.ts. Constant-hue alpha ramps:
+   * tint strength = opacity, hue = meaning, text contrast stays put.
+   * Probe ramp poles are OKLCH-matched (green ↔ red); surprise reads
+   * in logit-space blue (it is a vocabulary-distribution quantity —
+   * same family as the lens). */
+  --highlight-pos: #34d399;
+  --highlight-neg: #e5544f;
+  --highlight-surprise: #6ba6f8;
   --highlight-sat: 0.5;
 
-  /* ---- One overlay shadow — drawers, modals, popovers, toasts ------ */
-  --shadow-overlay: 0 8px 32px rgba(0, 0, 0, 0.55);
+  /* ---- Elevation ----------------------------------------------------
+   * Cards are lit from above (inset top-light) and cast down. Overlay
+   * shadow is for sheets/modals/popovers/toasts. */
+  --shadow-card: inset 0 1px 0 rgba(255, 255, 255, 0.05),
+    0 8px 24px rgba(0, 0, 0, 0.35);
+  --shadow-overlay: 0 12px 40px rgba(0, 0, 0, 0.5);
 
-  /* ---- Type scale — px, base is 13px ------------------------------- */
-  --text-2xs: 9px;          /* layer ticks, micro-labels */
-  --text-xs: 10px;          /* fine print, sparkline captions */
-  --text-sm: 11px;          /* secondary labels, hints, chips */
-  --text: 13px;             /* base — body, controls */
+  /* ---- Type scale — px, base 13.5px --------------------------------- */
+  --text-2xs: 9.5px;        /* layer ticks, micro-labels */
+  --text-xs: 10.5px;        /* fine print, tracked-caps eyebrows */
+  --text-sm: 11.5px;        /* secondary labels, hints, chips */
+  --text: 13.5px;           /* base — body, controls */
   --text-md: 15px;          /* emphasised rows, section titles */
   --text-lg: 18px;          /* drawer / panel headings */
-  --text-xl: 22px;          /* big numbers, boot heading */
+  --text-xl: 24px;          /* big numbers, boot heading */
 
-  /* ---- Weight ------------------------------------------------------ */
-  --weight-normal: 400;
-  --weight-medium: 600;
-  --weight-bold: 700;
+  /* ---- Weight (Recursive wght axis, 300–1000) ----------------------- */
+  --weight-normal: 420;
+  --weight-medium: 560;
+  --weight-bold: 680;
 
   /* ---- Spacing scale ----------------------------------------------- */
   --space-1: 2px;
@@ -111,17 +148,26 @@
   --row-gap: var(--space-3);
   --panel-pad: var(--space-4);
 
-  /* ---- Motion — ported from a9l.im/shared-base.css ----------------- */
+  /* ---- Motion --------------------------------------------------------
+   * --ease-spring overshoots (bars, sliders, chips landing); pair with
+   * --dur-slow+. CSS springs approximate; JS motion uses svelte/motion. */
   --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
   --ease-in-out: cubic-bezier(0.4, 0, 0.2, 1);
   --ease-smooth: cubic-bezier(0.25, 0.46, 0.45, 0.94);
+  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
   --dur-fast: 0.12s;
   --dur: 0.2s;
   --dur-slow: 0.3s;
+  --dur-slower: 0.45s;
 
-  /* ---- Fonts ------------------------------------------------------- */
-  --font-ui: "Recursive", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-  --font-mono: "Recursive", "SF Mono", Menlo, Consolas, monospace;
+  /* ---- Fonts ---------------------------------------------------------
+   * One variable file, two families (axes pinned in fonts.css):
+   * chrome speaks sans, data speaks mono. Every value/expression/token
+   * stream should sit in --font-mono; everything else inherits sans. */
+  --font-ui: "Recursive Sans", -apple-system, "SF Pro Text", system-ui,
+    "Segoe UI", sans-serif;
+  --font-mono: "Recursive Mono", ui-monospace, "SF Mono", Menlo, Consolas,
+    monospace;
 
   /* ---- TUI-ported geometry knobs — 24 mirrors BAR_WIDTH ------------ */
   --bar-width: 24;
@@ -131,4 +177,14 @@
   /* ---- Z-layers ---------------------------------------------------- */
   --z-drawer: 50;
   --z-modal: 100;
+
+  /* ---- Compatibility aliases ----------------------------------------
+   * Names referenced by components that predate the token system (they
+   * carried inline hex fallbacks); defined here so they resolve through
+   * the palette instead. Census 2026-07-10: --muted/--danger/--input-bg
+   * (TemplateLabDrawer), --err-bg (LoomSidebar). */
+  --muted: var(--fg-muted);
+  --danger: var(--accent-red);
+  --input-bg: var(--bg-elev);
+  --err-bg: rgba(229, 84, 79, 0.08);
 }

@@ -78,7 +78,8 @@
     background: var(--accent);
     border: 1px solid var(--bg-deep);
     cursor: pointer;
-    transition: transform var(--dur-fast) var(--ease-out);
+    transition: transform var(--dur-fast) var(--ease-out),
+      box-shadow var(--dur-fast) var(--ease-out);
   }
   .sk-slider::-moz-range-thumb {
     width: 12px;
@@ -87,9 +88,17 @@
     background: var(--accent);
     border: 1px solid var(--bg-deep);
     cursor: pointer;
+    transition: transform var(--dur-fast) var(--ease-out),
+      box-shadow var(--dur-fast) var(--ease-out);
   }
-  .sk-slider:hover:not(:disabled)::-webkit-slider-thumb {
+  .sk-slider:hover:not(:disabled)::-webkit-slider-thumb,
+  .sk-slider:active:not(:disabled)::-webkit-slider-thumb {
     transform: scale(1.15);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 25%, transparent);
+  }
+  .sk-slider:hover:not(:disabled)::-moz-range-thumb,
+  .sk-slider:active:not(:disabled)::-moz-range-thumb {
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 25%, transparent);
   }
   .sk-slider:disabled::-webkit-slider-thumb {
     background: var(--fg-muted);
@@ -98,7 +107,7 @@
     background: var(--fg-muted);
   }
   .sk-slider:focus-visible {
-    outline: 2px solid var(--accent-glow);
+    outline: 2px solid color-mix(in srgb, var(--accent) 45%, transparent);
     outline-offset: 3px;
   }
 </style>

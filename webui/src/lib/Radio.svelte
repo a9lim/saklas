@@ -116,6 +116,8 @@
     border-radius: 50%;
     background: var(--accent);
     pointer-events: none;
+    transition: background var(--dur-fast) var(--ease-out),
+      transform var(--dur-fast) var(--ease-out);
   }
 
   .sk-radio-label {

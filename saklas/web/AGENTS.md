@@ -101,7 +101,22 @@ webui/src/
       AdvancedSection.svelte  # collapsible "Advanced options" wrapper around Disclosure
       ValidationBlock.svelte  # "not ready to <verb>:" + bulleted reasons
     Toaster.svelte            # toast host (bottom-right, TTL-dismissed)
-    style/{tokens.css,global.css}
+    style/{fonts.css,tokens.css,global.css}
+                              # fonts.css: Recursive VF self-hosted (src/assets/
+                              # fonts/), ONE woff2 exposed as TWO families —
+                              # "Recursive Sans" (MONO 0, CASL .35) for chrome,
+                              # "Recursive Mono" (MONO 1) for data — axes pinned
+                              # per-family in @font-face, so a font-family switch
+                              # alone flips the voice
+    ui/                       # v2 primitives (Observatory+ redesign, 2026-07-10):
+      Button.svelte           # solid / ghost / danger; ``accent`` retints to a pillar hue
+      Chip.svelte             # mono capsule, hue wash; recipe terms, badges, tags
+      SegmentedTabs.svelte    # pillar tab strip (hue dot + glass active)
+      GlassCard.svelte        # the v2 card material; exposes --card-accent like RackCard
+  styleguide/StyleGuide.svelte # living design-system page at /styleguide —
+                              # main.ts routes on pathname (no App bootstrap/WS
+                              # there); every specimen is the real component
+                              # reading the real tokens
   panels/
     WorkspaceRail.svelte      # left rail: category fly-outs
     InspectorPanel.svelte     # right rack: CAA / J-LENS tab strip; CAA tab = STEER + PROBE racks splitting the column (both render a subspace group then a manifold group), J-LENS tab = JLensPanel
@@ -199,7 +214,7 @@ The server loom tree is authoritative. The browser keeps a first-paint cache of 
 
 ## Per-token highlighting
 
-Highlighting lives on the chat token spans, driven by a single highlight-probe dropdown in the chat header with an optional two-stripe compare-two mode. It tints **live** as tokens stream: the WS `token` event's `scores` aggregate feeds the same `scoreToRgb` ramp the post-generation pass uses, so streaming and finalized tints match (and match the TUI). Clicking any token opens the `token_drilldown` drawer regardless of whether a highlight probe is selected — three tabs: **probes** (the per-layer × per-probe heatmap), **logits** (ranked top-K alts + logit fork), and **j-lens** (the workspace readout — an aggregate chip row first (`token@com` chips off the response's `aggregate` block), then the per-layer matrix: rows are lens layers ascending with the 40–90% band marked in blue and off-band rows dimmed, cells the top-K tokens tinted by probability via `color-mix`, the produced token outlined where it appears; an `apply recipe steering` checkbox flips to the unsteered counterfactual, responses cached per `(node, raw_index, steered)` for the drawer's life). The j-lens tab needs `sessionState.info.jlens_fitted` and a `token.rawIndex` (same in-session constraint as forking); data comes from `apiLens.tokenReadout` on demand — nothing lens-shaped is stored per token at generation time. A **token scrubber** in the drawer header (`◀ N / M ▶`, or `←`/`→` anywhere in the drawer outside a focusable field) walks the *inspected* position along the turn's token list — every tab follows (probes/logits read stream-captured data instantly, j-lens refetches per position against its cache), while the tab/branch reset effects key off the *clicked* index (`paramTokenIdx`), so scrubbing never kicks the user off their tab; a fresh token click (params identity change) snaps the scrub back, and an `↩ clicked` header button does the same explicitly.
+Highlighting lives on the chat token spans, driven by a single highlight-probe dropdown in the chat header with an optional two-stripe compare-two mode. It tints **live** as tokens stream: the WS `token` event's `scores` aggregate feeds the same `scoreToRgb` ramp the post-generation pass uses, so streaming and finalized tints match. (v2 ramp note: `scoreToRgb` now emits **constant-hue alpha ramps** — tint strength = opacity, hue = meaning — with a `TintHue` third param: `signed` (green/red probe poles) vs `surprise` (logit-space blue, sharing the J-lens hue family; pre-v2 surprise reused the positive green band and was indistinguishable from a probe reading). The TUI still runs the old opaque ramp — a parity pass is deliberately deferred.) Clicking any token opens the `token_drilldown` drawer regardless of whether a highlight probe is selected — three tabs: **probes** (the per-layer × per-probe heatmap), **logits** (ranked top-K alts + logit fork), and **j-lens** (the workspace readout — an aggregate chip row first (`token@com` chips off the response's `aggregate` block), then the per-layer matrix: rows are lens layers ascending with the 40–90% band marked in blue and off-band rows dimmed, cells the top-K tokens tinted by probability via `color-mix`, the produced token outlined where it appears; an `apply recipe steering` checkbox flips to the unsteered counterfactual, responses cached per `(node, raw_index, steered)` for the drawer's life). The j-lens tab needs `sessionState.info.jlens_fitted` and a `token.rawIndex` (same in-session constraint as forking); data comes from `apiLens.tokenReadout` on demand — nothing lens-shaped is stored per token at generation time. A **token scrubber** in the drawer header (`◀ N / M ▶`, or `←`/`→` anywhere in the drawer outside a focusable field) walks the *inspected* position along the turn's token list — every tab follows (probes/logits read stream-captured data instantly, j-lens refetches per position against its cache), while the tab/branch reset effects key off the *clicked* index (`paramTokenIdx`), so scrubbing never kicks the user off their tab; a fresh token click (params identity change) snaps the scrub back, and an `↩ clicked` header button does the same explicitly.
 
 ## Toasts
 

@@ -265,7 +265,11 @@
   }
 
   function tintStyle(t: TokenScore): string {
-    const bg = scoreToRgb(tokenScore(t), highlightScale(highlightState.target));
+    const bg = scoreToRgb(
+      tokenScore(t),
+      highlightScale(highlightState.target),
+      highlightState.target === SURPRISE_TARGET ? "surprise" : "signed",
+    );
     return bg === "transparent" ? "" : `background-color: ${bg}`;
   }
 

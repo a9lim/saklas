@@ -5,12 +5,18 @@ body {
   margin: 0;
   padding: 0;
   height: 100%;
-  background: var(--bg);
+  /* The Observatory ambient: a faint blue-violet field high off-canvas
+   * plus a violet breath at the lower corner. Material, not data —
+   * everything readable sits on panels above it. */
+  background:
+    radial-gradient(1200px 560px at 72% -12%, rgba(103, 116, 190, 0.09), transparent 60%),
+    radial-gradient(900px 480px at 6% 108%, rgba(167, 139, 250, 0.05), transparent 65%),
+    var(--bg);
   color: var(--fg);
   font-family: var(--font-ui);
   font-size: var(--text);
+  font-weight: var(--weight-normal);
   letter-spacing: 0;
-  font-variation-settings: "MONO" 0, "CASL" 0;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
@@ -32,15 +38,22 @@ button {
   letter-spacing: 0;
 }
 
+/* Data speaks mono — the family switch alone flips the MONO axis (pinned
+ * per-family in fonts.css), so no font-variation-settings needed here. */
 code,
 pre {
   font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+::selection {
+  background: rgba(237, 239, 247, 0.22);
 }
 
 :focus-visible {
   outline: 2px solid var(--accent-glow);
   outline-offset: 2px;
-  border-radius: var(--radius);
+  border-radius: var(--radius-sm);
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -58,11 +71,11 @@ pre {
   height: 8px;
 }
 ::-webkit-scrollbar-track {
-  background: var(--bg-alt);
+  background: transparent;
 }
 ::-webkit-scrollbar-thumb {
   background: var(--border);
-  border-radius: var(--radius);
+  border-radius: var(--radius-pill);
 }
 ::-webkit-scrollbar-thumb:hover {
   background: var(--fg-muted);
