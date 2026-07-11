@@ -905,6 +905,11 @@ class SteeringComposer:
         # J-lens token probes referenced by active gates score on the lens
         # path (readout-channel strength), not through the Monitor —
         # detected once per generation here, merged into every return below.
+        monitor_gate_keys = (
+            self.gated_probe_keys()
+            if hasattr(monitor, "probe_names")
+            else set()
+        )
         lens_gate_keys = self.gated_lens_probe_keys()
         sae_gate_keys = self.gated_sae_probe_keys()
         has_lens_gates = bool(lens_gate_keys)
@@ -920,7 +925,12 @@ class SteeringComposer:
             # whole roster.  Both reuse the latest appended row.
             state = getattr(session, "_capture_state", None) or CaptureState()
             gating_subset = state.gating_subset
-            gate_keys = state.gating_keys
+            gate_keys = state.gating_keys or monitor_gate_keys
+            if (
+                not gate_keys
+                and (has_lens_gates or has_sae_gates)
+            ):
+                return {}
             if gating_subset and incremental_gate_scores:
                 return incremental_gate_scores[-1]
             if state.incremental and incremental_readings:

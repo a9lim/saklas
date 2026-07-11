@@ -875,6 +875,123 @@ def test_gating_callback_backfills_exact_keys_hidden_by_top_n() -> None:
     assert monitor.requested == {"toy@hidden"}
 
 
+@pytest.mark.parametrize(
+    ("expr", "registry_attr", "score_attr", "expected"),
+    [
+        (
+            "0.3 jlens/g@when:jlens/g>0.4",
+            "_lens_probes",
+            "_score_lens_gate_scalars",
+            {"jlens/g": 0.7},
+        ),
+        (
+            "0.3 sae/2@when:sae/2>0.4",
+            "_sae_probes",
+            "_score_sae_gate_scalars",
+            {"sae/2": 0.8},
+        ),
+    ],
+)
+def test_readout_only_gates_skip_monitor_probe_scoring(
+    expr: str,
+    registry_attr: str,
+    score_attr: str,
+    expected: dict[str, float],
+) -> None:
+    from saklas.core.steering_composer import SteeringComposer
+    from saklas.core.steering_expr import parse_expr
+
+    class Capture:
+        def latest_per_layer(self) -> dict[int, torch.Tensor]:
+            raise AssertionError("monitor path should not inspect captures")
+
+    class Monitor:
+        probe_names = ("toy",)
+
+        def flat_scalars(self, _readings: Any) -> dict[str, float]:
+            raise AssertionError("readout-only gates should skip monitor scalars")
+
+        def score_gate_scalars(self, *_args: Any, **_kwargs: Any) -> dict[str, float]:
+            raise AssertionError("readout-only gates should skip monitor gates")
+
+        def score_single_token(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            raise AssertionError("readout-only gates should skip monitor probes")
+
+    session: Any = SimpleNamespace(
+        _capture=Capture(),
+        _monitor=Monitor(),
+        _capture_state=CaptureState(),
+        _incremental_readings=[],
+        _incremental_gate_scores=[],
+        _lens_probes={},
+        _sae_probes={},
+    )
+    setattr(session, registry_attr, {next(iter(expected)): {}})
+    setattr(session, score_attr, lambda _keys: dict(expected))
+    other_score_attr = (
+        "_score_sae_gate_scalars"
+        if score_attr == "_score_lens_gate_scalars"
+        else "_score_lens_gate_scalars"
+    )
+    setattr(session, other_score_attr, lambda _keys: {})
+    composer = SteeringComposer(session)
+    composer._stack.append(cast(Any, dict(parse_expr(expr).alphas)))
+
+    assert composer.build_gating_score_callback()() == expected
+
+
+def test_mixed_monitor_and_lens_gates_score_only_monitor_gate_keys() -> None:
+    from saklas.core.steering_composer import SteeringComposer
+    from saklas.core.steering_expr import parse_expr
+
+    class Capture:
+        def latest_per_layer(self) -> dict[int, torch.Tensor]:
+            return {0: torch.ones(4)}
+
+    class Monitor:
+        probe_names = ("toy", "other")
+
+        def __init__(self) -> None:
+            self.requested: set[str] | None = None
+
+        def score_gate_scalars(
+            self,
+            _latest: dict[int, torch.Tensor],
+            gate_keys: set[str],
+            *,
+            probe_names: set[str] | None = None,
+        ) -> dict[str, float]:
+            assert probe_names is None
+            self.requested = set(gate_keys)
+            return {"toy": 0.2}
+
+        def score_single_token(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            raise AssertionError("exact monitor gate keys should avoid full scoring")
+
+    monitor = Monitor()
+    session: Any = SimpleNamespace(
+        _capture=Capture(),
+        _monitor=monitor,
+        _capture_state=CaptureState(),
+        _incremental_readings=[],
+        _incremental_gate_scores=[],
+        _lens_probes={"jlens/g": {}},
+        _sae_probes={},
+        _score_lens_gate_scalars=lambda _keys: {"jlens/g": 0.7},
+        _score_sae_gate_scalars=lambda _keys: {},
+    )
+    composer = SteeringComposer(session)
+    steering = parse_expr(
+        "0.3 toy@when:toy>0.1 + 0.2 jlens/g@when:jlens/g>0.4",
+    )
+    composer._stack.append(cast(Any, dict(steering.alphas)))
+
+    scores = composer.build_gating_score_callback()()
+
+    assert scores == {"toy": 0.2, "jlens/g": 0.7}
+    assert monitor.requested == {"toy"}
+
+
 def test_stateless_zero_token_probe_result_does_not_use_history() -> None:
     """A stateless empty generation has no current-run probe aggregate."""
 
