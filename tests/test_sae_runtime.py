@@ -114,6 +114,33 @@ def test_live_sae_readout_and_probe_share_one_encoder_result() -> None:
     assert reading.coords_per_layer == {1: (0.5,)}
 
 
+def test_live_sae_readout_seeds_topk_raw_values_for_pinned_probes() -> None:
+    session = _session()
+    session._sae_probes["sae/2"] = {
+        "feature_id": 2, "layer": 1, "label": "feature two", "max_act": 10.0,
+    }
+    session.enable_live_sae(top_k=3)
+    seen_raw: dict[int, float] = {}
+    original = session._sae_probe_values
+
+    def spy_probe_values(
+        activations: torch.Tensor,
+        *,
+        only: set[str] | None = None,
+        raw_by_fid: dict[int, float] | None = None,
+    ) -> list[tuple[str, int, float, float]]:
+        seen_raw.update(raw_by_fid or {})
+        return original(
+            activations, only=only, raw_by_fid=raw_by_fid,
+        )
+
+    session._sae_probe_values = spy_probe_values  # type: ignore[method-assign]
+
+    session._live_sae_readout_step()
+
+    assert seen_raw[2] == pytest.approx(5.0)
+
+
 def test_sae_probe_without_metadata_reads_raw_activation() -> None:
     session = _session()
     session._sae_probes["sae/1"] = {
@@ -133,8 +160,36 @@ def test_sae_gate_scalar_stashes_activations_for_live_step() -> None:
     scalars = session._score_sae_gate_scalars()
     assert scalars["sae/1"] == pytest.approx(3.0)
     assert scalars["sae/1[0]"] == pytest.approx(3.0)
+    assert scalars["sae/1:fraction"] == pytest.approx(0.0)
+    assert scalars["sae/1:membership"] == pytest.approx(1.0)
     assert session._sae_step_stash is not None
     assert session._sae_step_stash["fresh"] is True
+
+
+def test_sae_gate_scalar_and_live_step_share_one_encoder_result() -> None:
+    session = _session()
+    session._sae_probes["sae/2"] = {
+        "feature_id": 2, "layer": 1, "label": "feature two", "max_act": 10.0,
+    }
+    session.enable_live_sae(top_k=3)
+    calls = 0
+    original = session._encode_sae_hidden
+
+    def counting_encode(hidden: torch.Tensor) -> torch.Tensor:
+        nonlocal calls
+        calls += 1
+        return original(hidden)
+
+    session._encode_sae_hidden = counting_encode  # type: ignore[method-assign]
+
+    scalars = session._score_sae_gate_scalars({"sae/2"})
+    readout = session._live_sae_readout_step()
+
+    assert calls == 1
+    assert scalars["sae/2"] == pytest.approx(0.5)
+    assert readout is not None
+    assert session._last_sae_step_readings is not None
+    assert session._last_sae_step_readings["sae/2"].coords == pytest.approx((0.5,))
 
 
 def test_sae_gate_scalar_is_normalized_when_metadata_known() -> None:

@@ -3393,6 +3393,7 @@ class SaklasSession:
         self, hidden: dict[int, torch.Tensor] | None = None,
         *, activations: torch.Tensor | None = None,
         only: "set[str] | None" = None,
+        raw_by_fid: Mapping[int, float] | None = None,
     ) -> dict[str, "ProbeReading"]:
         if not self._sae_probes:
             return {}
@@ -3402,25 +3403,68 @@ class SaklasSession:
                 return {}
             activations = self._encode_sae_hidden(hidden[layer])
         assert activations is not None
+        out: dict[str, ProbeReading] = {}
+        for name, _fid, _raw_value, value in self._sae_probe_values(
+            activations, only=only, raw_by_fid=raw_by_fid,
+        ):
+            out[name] = ProbeReading(
+                fraction=0.0, nearest=[], coords=(value,), residual=0.0,
+                coords_per_layer={layer: (value,)},
+                depth_com=(layer / max(len(self._layers) - 1, 1),),
+                depth_spread=(0.0,),
+            )
+        return out
+
+    def _sae_probe_values(
+        self,
+        activations: torch.Tensor,
+        *,
+        only: "set[str] | None" = None,
+        raw_by_fid: Mapping[int, float] | None = None,
+    ) -> list[tuple[str, int, float, float]]:
+        """Pinned SAE probe values as ``(name, fid, raw, normalized)``.
+
+        ``raw_by_fid`` is a per-forward cache from a caller that has already
+        transferred selected feature activations (currently the live top-k
+        readout). Normalization always reads the current probe metadata, so a
+        Neuronpedia maxActApprox refresh changes the unit immediately.
+        """
         names = [
             name for name in self._sae_probes
             if only is None or name in only
         ]
         if not names:
-            return {}
+            return []
         fids = [int(self._sae_probes[name]["feature_id"]) for name in names]
-        fid_tensor = torch.tensor(
-            fids, device=activations.device, dtype=torch.long,
-        )
-        # One host transfer for every pinned SAE probe value.  The previous
-        # per-probe ``float(activations[fid])`` scalarized one device tensor per
-        # feature, which is exactly the kind of repeated sync the live generation
-        # path tries to avoid.
-        raw_values = activations.index_select(0, fid_tensor).detach().to("cpu").tolist()
-        out: dict[str, ProbeReading] = {}
-        for name, fid, raw_value in zip(names, fids, raw_values, strict=True):
+        raw_values_by_fid: dict[int, float] = {
+            int(fid): float(value)
+            for fid, value in (raw_by_fid or {}).items()
+        }
+        missing_fids = [
+            fid for fid in fids
+            if fid not in raw_values_by_fid
+        ]
+        if missing_fids:
+            fid_tensor = torch.tensor(
+                missing_fids, device=activations.device, dtype=torch.long,
+            )
+            # One host transfer for every not-already-read pinned SAE probe
+            # value.  Live readout top-k rows seed ``raw_by_fid`` first, so
+            # pinned cards that came from the visible top-k avoid a second
+            # selected-feature gather + CPU transfer.
+            raw_values = (
+                activations.index_select(0, fid_tensor)
+                .detach()
+                .to("cpu")
+                .tolist()
+            )
+            for fid, raw_value in zip(missing_fids, raw_values, strict=True):
+                raw_values_by_fid[int(fid)] = float(raw_value)
+        out: list[tuple[str, int, float, float]] = []
+        for name, fid in zip(names, fids, strict=True):
             spec = self._sae_probes[name]
-            value = float(raw_value)
+            raw_value = float(raw_values_by_fid[fid])
+            value = raw_value
             # The ONE channel is normalized strength — ``activation /
             # maxActApprox`` ∈ ~[0,1], apples-to-apples across features like
             # the lens probes' mean band probability. Raw activation only
@@ -3430,12 +3474,7 @@ class SaklasSession:
                 max_act = self._sae_max_act(fid)
             if max_act is not None:
                 value = value / float(max_act)
-            out[name] = ProbeReading(
-                fraction=0.0, nearest=[], coords=(value,), residual=0.0,
-                coords_per_layer={layer: (value,)},
-                depth_com=(layer / max(len(self._layers) - 1, 1),),
-                depth_spread=(0.0,),
-            )
+            out.append((name, fid, raw_value, value))
         return out
 
     def _score_sae_gate_scalars(
@@ -3444,11 +3483,6 @@ class SaklasSession:
         if not self._sae_probes:
             return {}
         _backend, layer, _width = self._require_sae()
-        latest = self._capture.latest_per_layer()
-        if layer not in latest:
-            return {}
-        acts = self._encode_sae_hidden(latest[layer])
-        self._sae_step_stash = {"activations": acts, "fresh": True}
         only = None
         if gate_keys:
             only = {
@@ -3456,9 +3490,22 @@ class SaklasSession:
                 for key in gate_keys
                 if key.split("[", 1)[0] in self._sae_probes
             }
-        return Monitor.flat_scalars(
-            self._score_sae_probes(activations=acts, only=only)
-        )
+            if not only:
+                return {}
+        latest = self._capture.latest_per_layer()
+        if layer not in latest:
+            return {}
+        acts = self._encode_sae_hidden(latest[layer])
+        self._sae_step_stash = {"activations": acts, "fresh": True}
+        scalars: dict[str, float] = {}
+        for name, _fid, _raw_value, value in self._sae_probe_values(
+            acts, only=only,
+        ):
+            scalars[name] = value
+            scalars[f"{name}[0]"] = value
+            scalars[f"{name}:fraction"] = 0.0
+            scalars[f"{name}:membership"] = 1.0
+        return scalars
 
     def _live_sae_readout_step(
         self,
@@ -3476,16 +3523,20 @@ class SaklasSession:
             acts = stash["activations"]
         else:
             acts = self._encode_sae_hidden(buckets[layer][-1])
+        k = min(int(state["top_k"]), int(acts.numel()))
+        values, indices = torch.topk(acts, k=k)
+        value_list = [float(v) for v in values.detach().to("cpu").tolist()]
+        id_list = [int(i) for i in indices.detach().to("cpu").tolist()]
+        raw_by_fid = {
+            fid: value for fid, value in zip(id_list, value_list, strict=True)
+        }
         if self._sae_probes:
             self._last_sae_step_readings = self._score_sae_probes(
                 activations=acts,
+                raw_by_fid=raw_by_fid,
             )
         else:
             self._last_sae_step_readings = None
-        k = min(int(state["top_k"]), int(acts.numel()))
-        values, indices = torch.topk(acts, k=k)
-        vals = values.detach().to("cpu")
-        ids = indices.detach().to("cpu")
         # Rows carry ``max_act`` (cached-only — the decode loop never fetches)
         # so clients can render the normalized 0..1 strength beside the raw
         # activation; ``None`` until the metadata backfill lands.
@@ -3496,7 +3547,7 @@ class SaklasSession:
                 self._sae_label(int(idx)),
                 self._sae_max_act(int(idx)),
             )
-            for value, idx in zip(vals, ids)
+            for value, idx in zip(value_list, id_list, strict=True)
         ]
 
     def _score_sae_probes_aggregate(
