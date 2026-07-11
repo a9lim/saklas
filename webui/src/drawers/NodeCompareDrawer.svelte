@@ -740,7 +740,6 @@
     justify-content: space-between;
     gap: var(--space-5);
     padding: var(--space-5) var(--space-6);
-    border-bottom: 1px solid var(--glass-line);
   }
   .title {
     display: flex;
@@ -767,9 +766,9 @@
     white-space: nowrap;
   }
   .close {
-    background: transparent;
+    background: var(--glass);
     color: var(--fg-muted);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: 50%;
     width: 26px;
     height: 26px;
@@ -783,23 +782,20 @@
     flex: none;
     transition:
       color var(--dur-fast) var(--ease-out),
-      background var(--dur-fast) var(--ease-out),
-      border-color var(--dur-fast) var(--ease-out);
+      background var(--dur-fast) var(--ease-out);
   }
   .close:hover {
     color: var(--fg);
-    background: var(--bg-hover);
-    border-color: var(--fg-muted);
+    background: var(--glass-strong);
   }
 
-  /* Toolbar — the layout / sort-by controls, in their own bordered row
-   * (same pattern as the token-drilldown toolbar). */
+  /* Toolbar — the layout / sort-by controls, in their own row (same
+   * pattern as the token-drilldown toolbar). */
   .toolbar {
     display: flex;
     align-items: center;
     gap: var(--space-5);
     padding: var(--space-3) var(--space-6);
-    border-bottom: 1px solid var(--glass-line);
   }
   .header-ctl {
     display: inline-flex;
@@ -842,7 +838,6 @@
   }
   .col {
     background: var(--bg);
-    border: 1px solid var(--glass-line);
     border-radius: var(--radius);
     padding: var(--space-3) var(--space-4);
   }
@@ -877,7 +872,7 @@
    * readings table for one A-vs-B pair. */
   .diff-block {
     background: var(--glass);
-    border: 1px solid var(--glass-line);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
     border-radius: var(--radius-lg);
     padding: var(--space-4);
     display: flex;
@@ -903,7 +898,6 @@
     font-family: var(--font-mono);
     font-size: var(--text-xs);
     background: var(--glass-strong);
-    border: 1px solid var(--glass-line);
     padding: var(--space-1) var(--space-3);
     border-radius: var(--radius-sm);
   }
@@ -920,7 +914,6 @@
   /* Data well — the per-branch text pane. */
   .text-pane {
     background: var(--bg);
-    border: 1px solid var(--glass-line);
     border-radius: var(--radius);
     padding: var(--space-2) var(--space-3);
     min-height: 5em;
@@ -965,7 +958,6 @@
   /* Data well — the unified diff pane. */
   .unified-body {
     background: var(--bg);
-    border: 1px solid var(--glass-line);
     border-radius: var(--radius);
     padding: var(--space-3) var(--space-4);
     line-height: 1.5;
@@ -996,7 +988,7 @@
     flex-direction: column;
     gap: var(--space-2);
     background: var(--glass);
-    border: 1px solid var(--glass-line);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
     border-radius: var(--radius-lg);
     padding: var(--space-3) var(--space-4);
     margin: 0;
@@ -1029,7 +1021,6 @@
   .ss-table th,
   .ss-table td {
     padding: var(--space-2) var(--space-3);
-    border-bottom: 1px solid var(--glass-line);
     text-align: left;
   }
   .ss-table thead th {
@@ -1107,13 +1098,11 @@
     font-variant-numeric: tabular-nums;
     font-size: var(--text-xs);
     background: var(--bg);
-    border: 1px solid color-mix(in srgb, var(--pillar-lens) 14%, var(--glass-line));
     border-radius: var(--radius);
   }
   .lp-table th,
   .lp-table td {
     padding: var(--space-1) var(--space-3);
-    border-bottom: 1px solid var(--glass-line);
     text-align: left;
   }
   .lp-table thead th {
@@ -1233,6 +1222,5 @@
     justify-content: flex-end;
     gap: var(--space-3);
     padding: var(--space-3) var(--space-6);
-    border-top: 1px solid var(--glass-line);
   }
 </style>

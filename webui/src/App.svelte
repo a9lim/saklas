@@ -6,7 +6,6 @@
 
   import { onMount } from "svelte";
 
-  import WorkspaceRail from "./panels/WorkspaceRail.svelte";
   import InspectorPanel from "./panels/InspectorPanel.svelte";
   import Chat from "./panels/Chat.svelte";
   import LoomSidebar from "./panels/loom/LoomSidebar.svelte";
@@ -191,10 +190,6 @@
 {:else}
   <div class="shell" class:loading={bootStatus === "loading"}>
     <main class="layout">
-      <section class="rail-zone" aria-label="Workspace navigation">
-        <WorkspaceRail />
-      </section>
-
       <section class="loom-zone" aria-label="Threads">
         <LoomSidebar />
       </section>
@@ -321,15 +316,14 @@
      * without us blocking the entire frame. */
     opacity: 0.85;
   }
-  /* Four permanent columns: rail · threads · chat · rack.  The threads
-   * (loom) column is 376px, the rack column 432px; min-width 1280px
-   * keeps the chat column usable (1280 − 56 − 376 − 432 ≈ 416px floor).
-   * Rail is 56px (not 48px) so the longest category label ("ANALYSIS")
-   * fits without clipping at the rail's right edge; threads gave back
-   * the same 8px so the chat floor is unchanged. */
+  /* Three permanent columns: threads · chat · rack.  The threads (loom)
+   * column is 376px, the rack column 432px; min-width 1280px keeps the
+   * chat column usable (1280 − 376 − 432 ≈ 472px floor).  The former
+   * 56px workspace rail is gone — every tool it launched lives in the
+   * ⌘K command palette, hinted from the chat header. */
   .layout {
     display: grid;
-    grid-template-columns: 56px 376px minmax(0, 1fr) 432px;
+    grid-template-columns: 376px minmax(0, 1fr) 432px;
     grid-template-rows: 1fr;
     min-height: 0; /* let children scroll inside */
     position: relative; /* drawer sits over rack-zone via absolute pos */
@@ -340,11 +334,6 @@
      * overflow by ~640px, the body scrolls during the 160ms animation,
      * and the chat/rack content visibly shifts left then snaps back. */
     overflow: hidden;
-  }
-  .rail-zone {
-    background: var(--bg-deep);
-    overflow: hidden;
-    min-height: 0;
   }
   .loom-zone {
     background: var(--bg-alt);
@@ -423,7 +412,6 @@
     align-items: center;
     justify-content: space-between;
     padding: var(--space-3) var(--space-6);
-    border-bottom: 1px solid var(--border);
   }
   .drawer-title {
     color: var(--accent);
@@ -495,7 +483,7 @@
     margin-top: var(--space-5);
     background: var(--bg-elev);
     color: var(--accent);
-    border: 1px solid var(--border);
+    border: 0;
     padding: var(--space-3) var(--space-6);
     border-radius: var(--radius);
     font-size: var(--text-sm);

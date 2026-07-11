@@ -28,11 +28,13 @@
 </div>
 
 <style>
+  /* Borderless: fill + top-light + drop carry the card; the border slot
+   * exists only so the active state ring can fade in without reflow. */
   .sk-card {
     --card-accent: var(--accent);
     border-radius: var(--radius-lg);
     background: var(--glass);
-    border: 1px solid var(--glass-line);
+    border: 1px solid transparent;
     box-shadow: var(--shadow-card);
     backdrop-filter: blur(var(--blur-glass));
     padding: var(--space-5) var(--space-6);

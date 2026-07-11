@@ -1,7 +1,7 @@
 <script lang="ts">
   // v2 button — the one button. Three variants on one skeleton:
   //   solid  — accent-filled, dark text; the primary action of a surface
-  //   ghost  — hairline + wash on hover; the default workhorse
+  //   ghost  — borderless glass fill + wash on hover; the default workhorse
   //   danger — red ghost; destructive affordances
   //
   // ``accent`` retints a button to a pillar hue (pass the CSS color) —
@@ -96,24 +96,25 @@
     filter: brightness(1.08);
   }
 
+  /* Borderless doctrine: the control floats UP on a glass fill — shape
+   * without an outline. Hover deepens the wash toward the accent. */
   .ghost {
-    background: transparent;
+    background: var(--glass);
     color: var(--fg-dim);
-    border-color: var(--border);
+    border-color: transparent;
   }
   .ghost:hover:not(:disabled) {
-    background: color-mix(in srgb, var(--btn-accent) 9%, transparent);
-    border-color: color-mix(in srgb, var(--btn-accent) 30%, transparent);
+    background: color-mix(in srgb, var(--btn-accent) 10%, var(--glass));
     color: var(--fg);
   }
 
   .danger {
-    background: transparent;
+    background: color-mix(in srgb, var(--accent-red) 7%, var(--glass));
     color: var(--accent-red);
-    border-color: color-mix(in srgb, var(--accent-red) 35%, transparent);
+    border-color: transparent;
   }
   .danger:hover:not(:disabled) {
-    background: color-mix(in srgb, var(--accent-red) 12%, transparent);
+    background: color-mix(in srgb, var(--accent-red) 14%, var(--glass));
   }
 
   .sk-btn:focus-visible {

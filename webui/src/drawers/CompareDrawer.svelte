@@ -248,7 +248,6 @@
     justify-content: space-between;
     gap: var(--space-5);
     padding: var(--space-5) var(--space-6);
-    border-bottom: 1px solid var(--glass-line);
   }
   .title {
     display: flex;
@@ -285,9 +284,9 @@
     white-space: nowrap;
   }
   .close {
-    background: transparent;
+    background: var(--glass);
     color: var(--fg-muted);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: 50%;
     width: 26px;
     height: 26px;
@@ -301,13 +300,11 @@
     flex: none;
     transition:
       color var(--dur-fast) var(--ease-out),
-      background var(--dur-fast) var(--ease-out),
-      border-color var(--dur-fast) var(--ease-out);
+      background var(--dur-fast) var(--ease-out);
   }
   .close:hover {
     color: var(--fg);
-    background: var(--bg-hover);
-    border-color: var(--fg-muted);
+    background: var(--glass-strong);
   }
 
   .picker-row {
@@ -315,7 +312,6 @@
     align-items: center;
     gap: var(--space-5);
     padding: var(--space-4) var(--space-6);
-    border-bottom: 1px solid var(--glass-line);
   }
   .picker {
     display: flex;
@@ -352,7 +348,6 @@
   .grid-scroll {
     overflow: auto;
     max-height: 100%;
-    border: 1px solid var(--glass-line);
     border-radius: var(--radius);
     background: var(--bg);
   }
@@ -372,7 +367,7 @@
     position: sticky;
     top: 0;
     z-index: 2;
-    border-bottom: 1px solid var(--glass-line);
+    box-shadow: var(--shadow-sticky);
   }
   .grid .row-label {
     position: sticky;
@@ -382,7 +377,7 @@
     padding: 0 var(--space-3) 0 var(--space-2);
     color: var(--fg-dim);
     font-size: var(--text-xs);
-    border-right: 1px solid var(--glass-line);
+    box-shadow: 2px 0 8px rgba(0, 0, 0, 0.45);
     white-space: nowrap;
   }
   .grid .corner {
@@ -394,8 +389,7 @@
     font-size: var(--text-xs);
     text-align: left;
     padding: var(--space-1) var(--space-3);
-    border-right: 1px solid var(--glass-line);
-    border-bottom: 1px solid var(--glass-line);
+    box-shadow: var(--shadow-sticky), 2px 0 8px rgba(0, 0, 0, 0.45);
     white-space: nowrap;
   }
   .corner .axis-a,
@@ -426,7 +420,6 @@
   }
 
   .drawer-footer {
-    border-top: 1px solid var(--glass-line);
     padding: var(--space-3) var(--space-6);
     color: var(--fg-muted);
     font-size: var(--text-xs);

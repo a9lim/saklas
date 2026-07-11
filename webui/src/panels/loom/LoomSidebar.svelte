@@ -1288,20 +1288,20 @@
     overflow: hidden;
   }
 
-  /* Section bars are now flat — a border-bottom acts as the separator,
-   * no fill — matching the right-rack's section style. */
+  /* Section bars are borderless — typography + their own padding carry
+   * the divide between them. */
   .filter-bar {
     display: flex;
     gap: var(--space-2);
     align-items: center;
     padding: var(--space-2) var(--space-3);
-    border-bottom: 1px solid var(--border);
   }
   .filter-input {
     flex: 1 1 auto;
-    background: var(--bg-alt);
+    /* Recessed input well — the accent focus ring is the only border. */
+    background: var(--input-well);
     color: var(--fg-strong);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     padding: var(--space-2) var(--space-3);
     font: inherit;
     font-family: var(--font-mono);
@@ -1325,10 +1325,8 @@
   /* Logit-pass: help affordance, help popover, weight-mode picker. */
   .help-btn.on {
     color: var(--accent);
-    border-color: var(--accent);
   }
   .filter-help {
-    border-bottom: 1px solid var(--border);
     padding: var(--space-3) var(--space-4);
     color: var(--fg-dim);
     font-size: var(--text-xs);
@@ -1360,7 +1358,6 @@
     gap: var(--space-3);
     align-items: center;
     padding: var(--space-2) var(--space-3);
-    border-bottom: 1px solid var(--border);
     font-size: var(--text-xs);
     color: var(--fg-dim);
   }
@@ -1374,14 +1371,13 @@
     align-items: center;
     gap: var(--space-3);
     padding: var(--space-2) var(--space-3);
-    border-bottom: 1px solid var(--border);
     color: var(--accent);
     font-size: var(--text-xs);
   }
   .action-btn {
-    background: transparent;
+    background: var(--glass);
     color: var(--fg-strong);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     padding: var(--space-1) var(--space-4);
     font: inherit;
     font-family: var(--font-mono);
@@ -1389,12 +1385,11 @@
     cursor: pointer;
   }
   .action-btn:hover:not(:disabled) {
-    background: var(--bg-elev);
-    border-color: var(--accent);
+    background: var(--glass-strong);
+    color: var(--accent);
   }
   .action-btn:disabled {
     color: var(--fg-muted);
-    border-color: var(--border);
     cursor: not-allowed;
   }
 
@@ -1404,7 +1399,6 @@
     align-items: center;
     gap: var(--space-2);
     padding: var(--space-2) var(--space-3);
-    border-bottom: 1px solid var(--border);
   }
   .title {
     color: var(--accent);
@@ -1491,13 +1485,17 @@
   }
   .empty button {
     align-self: flex-start;
-    background: transparent;
-    border: 1px solid var(--border);
+    background: color-mix(in srgb, var(--accent-red) 7%, var(--glass));
+    border: 1px solid transparent;
+    border-radius: var(--radius);
     color: var(--accent-red);
     padding: var(--space-1) var(--space-4);
     cursor: pointer;
     font: inherit;
     font-family: var(--font-mono);
+  }
+  .empty button:hover {
+    background: color-mix(in srgb, var(--accent-red) 14%, var(--glass));
   }
 
   .hint {
@@ -1589,7 +1587,6 @@
     align-items: center;
     justify-content: space-between;
     padding: var(--space-4) var(--space-5);
-    border-bottom: 1px solid var(--border);
     color: var(--accent);
     text-transform: lowercase;
     letter-spacing: 0;
@@ -1607,9 +1604,9 @@
   }
   .modal-body input,
   .modal-body textarea {
-    background: var(--bg-deep);
+    background: var(--input-well);
     color: var(--fg);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     padding: var(--space-3) var(--space-4);
     font: inherit;
     font-family: var(--font-mono);
@@ -1634,11 +1631,11 @@
     justify-content: flex-end;
     gap: var(--space-3);
     padding: var(--space-4) var(--space-5);
-    border-top: 1px solid var(--border);
   }
   .modal-footer button {
-    background: transparent;
-    border: 1px solid var(--border);
+    background: var(--glass);
+    border: 1px solid transparent;
+    border-radius: var(--radius);
     color: var(--fg-strong);
     padding: var(--space-3) var(--space-5);
     cursor: pointer;
@@ -1646,20 +1643,20 @@
     font-family: var(--font-mono);
   }
   .modal-footer .primary {
-    border-color: var(--accent-green);
+    background: color-mix(in srgb, var(--accent-green) 12%, var(--glass));
     color: var(--accent-green);
   }
   .modal-footer .primary:hover {
-    background: rgba(126, 231, 135, 0.12);
+    background: color-mix(in srgb, var(--accent-green) 20%, var(--glass));
   }
   .modal-footer .danger {
-    border-color: var(--accent-red);
+    background: color-mix(in srgb, var(--accent-red) 12%, var(--glass));
     color: var(--accent-red);
   }
   .modal-footer .danger:hover {
-    background: rgba(248, 81, 73, 0.12);
+    background: color-mix(in srgb, var(--accent-red) 20%, var(--glass));
   }
   .modal-footer .cancel:hover {
-    border-color: var(--fg-muted);
+    background: var(--glass-strong);
   }
 </style>

@@ -100,13 +100,13 @@
 
 <style>
   .drawer-shell { display: flex; flex-direction: column; min-height: 0; background: transparent; }
-  .header { display: flex; justify-content: space-between; gap: var(--space-6); padding: var(--space-5) var(--space-6); border-bottom: 1px solid var(--glass-line); background: var(--surface); }
+  .header { display: flex; justify-content: space-between; gap: var(--space-6); padding: var(--space-5) var(--space-6); background: var(--surface); }
   .title { color: var(--accent); letter-spacing: 0; font-size: var(--text-md); font-weight: var(--weight-medium); }
   .header p, .hint, .panel p { margin: var(--space-1) 0 0; color: var(--fg-muted); line-height: 1.45; }
   .close {
-    background: transparent;
+    background: var(--glass);
     color: var(--fg-muted);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: 50%;
     width: 26px;
     height: 26px;
@@ -120,28 +120,31 @@
     flex: none;
     transition:
       color var(--dur-fast) var(--ease-out),
-      background var(--dur-fast) var(--ease-out),
-      border-color var(--dur-fast) var(--ease-out);
+      background var(--dur-fast) var(--ease-out);
   }
   .close:hover:not(:disabled) {
     color: var(--fg);
-    background: var(--bg-hover);
-    border-color: var(--fg-muted);
+    background: var(--glass-strong);
   }
   .body { display: grid; gap: var(--space-5); padding: var(--space-6); overflow: auto; }
-  .panel { border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); padding: var(--space-6); }
+  .panel {
+    border-radius: var(--radius);
+    background: var(--glass);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
+    padding: var(--space-6);
+  }
   h3 { margin: 0 0 var(--space-4); color: var(--fg); font-size: var(--text-sm); letter-spacing: 0; }
   .key-row { display: grid; grid-template-columns: 1fr auto auto; gap: var(--space-3); }
-  input { border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-deep); color: var(--fg); padding: var(--space-4); font-family: var(--font-mono); }
-  button { border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-elev); color: var(--fg); padding: var(--space-3) var(--space-5); }
-  button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  input { border: 1px solid transparent; border-radius: var(--radius); background: var(--input-well); color: var(--fg); padding: var(--space-4); font-family: var(--font-mono); }
+  button { border: 1px solid transparent; border-radius: var(--radius); background: var(--glass); color: var(--fg); padding: var(--space-3) var(--space-5); }
+  button:hover:not(:disabled) { background: var(--glass-strong); color: var(--accent); }
   .section-head { display: flex; align-items: center; justify-content: space-between; gap: var(--space-6); }
   .sessions { display: grid; gap: var(--space-3); }
-  article { display: grid; gap: var(--space-2); border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-elev); padding: var(--space-4); }
+  article { display: grid; gap: var(--space-2); border: 1px solid transparent; border-radius: var(--radius); background: var(--bg-elev); padding: var(--space-4); }
   article.active { border-color: var(--accent); background: var(--accent-subtle); }
   strong { color: var(--accent); }
   code { color: var(--accent-amber); font-family: var(--font-mono); }
   article span { color: var(--fg-muted); }
   .error { color: var(--accent-red); }
-  .empty { color: var(--fg-muted); border: 1px solid var(--border); border-radius: var(--radius); padding: var(--space-6); text-align: center; }
+  .empty { color: var(--fg-muted); background: var(--bg); border-radius: var(--radius); padding: var(--space-6); text-align: center; }
 </style>

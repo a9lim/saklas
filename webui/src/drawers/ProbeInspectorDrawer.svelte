@@ -325,7 +325,6 @@
     justify-content: space-between;
     gap: var(--space-5);
     padding: var(--space-5) var(--space-6);
-    border-bottom: 1px solid var(--glass-line);
   }
   .title {
     display: flex;
@@ -374,9 +373,9 @@
     font-size: var(--text-xs);
   }
   .close {
-    background: transparent;
+    background: var(--glass);
     color: var(--fg-muted);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: 50%;
     width: 26px;
     height: 26px;
@@ -390,13 +389,11 @@
     flex: none;
     transition:
       color var(--dur-fast) var(--ease-out),
-      background var(--dur-fast) var(--ease-out),
-      border-color var(--dur-fast) var(--ease-out);
+      background var(--dur-fast) var(--ease-out);
   }
   .close:hover {
     color: var(--fg);
-    background: var(--bg-hover);
-    border-color: var(--fg-muted);
+    background: var(--glass-strong);
   }
 
   .body {
@@ -435,12 +432,11 @@
     position: relative;
     flex: 1 1 auto;
     min-height: 0;
-    border: 1px solid color-mix(in srgb, var(--family) 14%, var(--glass-line));
     border-radius: var(--radius-lg);
     background:
       radial-gradient(
         90% 75% at 50% 42%,
-        color-mix(in srgb, var(--family) 5%, transparent),
+        color-mix(in srgb, var(--family) 8%, transparent),
         transparent 72%
       ),
       var(--bg-deep);
@@ -473,7 +469,7 @@
     font-size: var(--text-xs);
     font-variant-numeric: tabular-nums;
     background: var(--glass);
-    border: 1px solid var(--glass-line);
+    border: 1px solid transparent;
     border-radius: var(--radius-pill);
     padding: 1px var(--space-4);
     pointer-events: none;
@@ -568,7 +564,6 @@
   }
 
   .drawer-footer {
-    border-top: 1px solid var(--glass-line);
     padding: var(--space-3) var(--space-6);
     color: var(--fg-muted);
     font-size: var(--text-xs);

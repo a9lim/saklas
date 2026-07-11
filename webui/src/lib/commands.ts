@@ -1,7 +1,8 @@
-// The shared tool registry — one source of truth for the workspace rail's
-// category fly-outs AND the ⌘K command palette.  The rail renders the
-// categories as icon fly-outs; the palette flattens them and adds its own
-// navigation entries (instrument tabs, pages).
+// The tool registry behind the ⌘K command palette — the one launcher for
+// every analysis/session tool.  (The former workspace rail rendered these
+// categories as icon fly-outs; the rail is gone, and the palette flattens
+// them and adds its own navigation entries: instrument tabs, pages.  The
+// Rail* names and per-category icons keep the registry shape.)
 
 import type { DrawerName } from "./types";
 import type { InspectorTab } from "./stores.svelte";
@@ -16,7 +17,8 @@ export interface RailTool {
 export interface RailCategory {
   key: string;
   label: string;
-  /** SVG path data for the 24×24 rail glyph. */
+  /** SVG path data for a 24×24 category glyph (currently unrendered —
+   *  kept for a future launcher surface). */
   icon: string;
   tools: RailTool[];
 }
@@ -124,7 +126,7 @@ export interface PaletteCommand {
 }
 
 /** The flattened palette index: instrument-tab jumps first (the four
- *  pillars are the primary navigation), then every rail tool, then pages. */
+ *  pillars are the primary navigation), then every registry tool, then pages. */
 export function paletteCommands(): PaletteCommand[] {
   const cmds: PaletteCommand[] = [
     {

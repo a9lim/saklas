@@ -160,7 +160,6 @@
     align-items: center;
     justify-content: space-between;
     padding: var(--space-5) var(--space-6);
-    border-bottom: 1px solid var(--glass-line);
   }
   .title {
     color: var(--accent);
@@ -170,9 +169,9 @@
     font-weight: var(--weight-medium);
   }
   .close {
-    background: transparent;
+    background: var(--glass);
     color: var(--fg-muted);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: 50%;
     width: 26px;
     height: 26px;
@@ -186,13 +185,11 @@
     flex: none;
     transition:
       color var(--dur-fast) var(--ease-out),
-      background var(--dur-fast) var(--ease-out),
-      border-color var(--dur-fast) var(--ease-out);
+      background var(--dur-fast) var(--ease-out);
   }
   .close:hover {
     color: var(--fg);
-    background: var(--bg-hover);
-    border-color: var(--fg-muted);
+    background: var(--glass-strong);
   }
   .body {
     flex: 1 1 auto;
@@ -220,9 +217,9 @@
     text-transform: lowercase;
   }
   .input {
-    background: var(--bg-deep);
+    background: var(--input-well);
     color: var(--fg);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     padding: var(--space-3) var(--space-3);
     font: inherit;
     font-family: var(--font-mono);
@@ -239,7 +236,6 @@
   }
   .preview {
     background: var(--bg-deep);
-    border: 1px solid var(--border);
     padding: var(--space-3) var(--space-4);
     margin: 0;
     color: var(--fg-dim);
@@ -259,30 +255,28 @@
     justify-content: flex-end;
     gap: var(--space-3);
     padding: var(--space-3) var(--space-6);
-    border-top: 1px solid var(--glass-line);
     color: var(--fg-muted);
   }
   .btn {
-    background: var(--bg-alt);
+    background: var(--glass);
     color: var(--fg-strong);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     padding: var(--space-3) var(--space-5);
     font: inherit;
     font-family: var(--font-mono);
     cursor: pointer;
   }
   .btn:hover:not(:disabled) {
-    background: var(--bg-elev);
-    border-color: var(--fg-muted);
+    background: var(--glass-strong);
   }
   .btn.primary {
     background: var(--accent);
     color: var(--text-on-accent);
-    border-color: var(--accent);
+    border-color: transparent;
   }
   .btn.primary:hover:not(:disabled) {
     background: var(--accent-light);
-    border-color: var(--accent-light);
+    border-color: transparent;
   }
   .btn.primary:disabled {
     background: var(--bg-elev);

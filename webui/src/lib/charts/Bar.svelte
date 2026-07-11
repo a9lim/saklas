@@ -112,6 +112,10 @@
   .bar {
     display: inline-block;
     vertical-align: middle;
+    /* Rounded ends via CSS clip on the element box — an SVG rect ``rx``
+     * would distort under preserveAspectRatio="none", this doesn't. */
+    border-radius: 2px;
+    overflow: hidden;
   }
   .track {
     fill: var(--bg-elev);

@@ -98,13 +98,13 @@
 <style>
   /* Embedded in the chat column, directly above the input row — a thin
    * status line.  Horizontal padding is zero so it aligns with the log
-   * and input box; the hairline above separates it from the log. */
+   * and input box; borderless — the gap above already separates it from
+   * the log. */
   .status-footer {
     display: flex;
     align-items: center;
     gap: var(--space-3);
     padding: var(--space-2) 0;
-    border-top: 1px solid var(--border);
     color: var(--fg-dim);
     font-size: var(--text-sm);
     font-family: var(--font-mono);
@@ -155,7 +155,7 @@
     margin-left: auto;
     background: var(--glass-strong);
     color: var(--fg-dim);
-    border: 1px solid var(--glass-line);
+    border: 1px solid transparent;
     padding: var(--space-1) var(--space-4);
     border-radius: var(--radius-pill);
     font-size: var(--text-sm);

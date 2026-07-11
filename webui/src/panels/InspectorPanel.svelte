@@ -105,7 +105,6 @@
   }
   .tabs {
     padding: var(--space-4) var(--space-4) var(--space-3);
-    border-bottom: 1px solid var(--border);
   }
 
   /* STEER grows with its contents until it reaches half the inspector;

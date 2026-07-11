@@ -406,7 +406,6 @@
     justify-content: space-between;
     gap: var(--space-5);
     padding: var(--space-5) var(--space-6);
-    border-bottom: 1px solid var(--glass-line);
   }
   .title {
     display: flex;
@@ -422,9 +421,9 @@
     letter-spacing: 0.08em;
   }
   .close {
-    background: transparent;
+    background: var(--glass);
     color: var(--fg-muted);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: 50%;
     width: 26px;
     height: 26px;
@@ -438,18 +437,15 @@
     flex: none;
     transition:
       color var(--dur-fast) var(--ease-out),
-      background var(--dur-fast) var(--ease-out),
-      border-color var(--dur-fast) var(--ease-out);
+      background var(--dur-fast) var(--ease-out);
   }
   .close:hover {
     color: var(--fg);
-    background: var(--bg-hover);
-    border-color: var(--fg-muted);
+    background: var(--glass-strong);
   }
 
   .toolbar {
     padding: var(--space-3) var(--space-6);
-    border-bottom: 1px solid var(--glass-line);
   }
 
   .body {
@@ -478,9 +474,9 @@
   input,
   select,
   textarea {
-    background: var(--bg-elev);
+    background: var(--input-well);
     color: var(--fg);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: var(--radius);
     padding: var(--space-3) var(--space-4);
     font: inherit;
@@ -499,7 +495,6 @@
 
   /* Data well — the per-context restricted-choice distribution. */
   .ctx-card {
-    border: 1px solid var(--glass-line);
     border-radius: var(--radius);
     background: var(--bg);
     padding: var(--space-4);
@@ -540,9 +535,9 @@
 
   .form { display: flex; flex-direction: column; gap: var(--space-4); }
   .contexts {
-    border: 1px solid var(--glass-line);
     border-radius: var(--radius);
     background: var(--glass);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
     padding: var(--space-4);
     margin: 0;
   }
@@ -555,10 +550,8 @@
     padding: 0 var(--space-2);
   }
   .ctx-build {
-    border-top: 1px solid var(--glass-line);
     padding: var(--space-4) 0;
   }
-  .ctx-build:first-of-type { border-top: none; }
   .ctx-build-head {
     display: flex;
     justify-content: space-between;
@@ -578,8 +571,8 @@
   /* Icon-ish micro-buttons — dense-row pills, styled like the reference
    * .scrub-btn rather than the full Button component. */
   .mini {
-    background: transparent;
-    border: 1px solid var(--border);
+    background: var(--glass);
+    border: 1px solid transparent;
     color: var(--fg-muted);
     border-radius: var(--radius-pill);
     padding: var(--space-2) var(--space-4);
@@ -589,13 +582,11 @@
     line-height: 1;
     transition:
       color var(--dur-fast) var(--ease-out),
-      background var(--dur-fast) var(--ease-out),
-      border-color var(--dur-fast) var(--ease-out);
+      background var(--dur-fast) var(--ease-out);
   }
   .mini:hover {
     color: var(--fg);
-    background: var(--bg-hover);
-    border-color: var(--fg-muted);
+    background: var(--glass-strong);
   }
   .mini.add { margin-top: var(--space-3); }
   .errs {
@@ -607,7 +598,6 @@
   .foot { display: flex; justify-content: flex-end; gap: var(--space-3); }
 
   .catalog {
-    border-top: 1px solid var(--glass-line);
     padding-top: var(--space-4);
   }
   .catalog-head {
@@ -625,9 +615,7 @@
     gap: var(--space-3);
     padding: var(--space-2) 0;
     font-size: var(--text-sm);
-    border-bottom: 1px solid var(--glass-line);
   }
-  .cat-row:last-child { border-bottom: none; }
   .cat-name { font-family: var(--font-mono); color: var(--fg); }
   .cat-sub {
     color: var(--fg-muted);

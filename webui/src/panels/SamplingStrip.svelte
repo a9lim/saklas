@@ -384,8 +384,6 @@
     flex-direction: column;
     gap: var(--space-4);
     padding: var(--space-3) var(--space-5);
-    border-top: 1px solid var(--border);
-    border-bottom: 1px solid var(--border);
     font-family: var(--font-mono);
     font-size: var(--text-sm);
     color: var(--fg-strong);
@@ -470,9 +468,9 @@
   }
 
   .sys-btn {
-    background: transparent;
+    background: var(--glass);
     color: var(--fg-strong);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: var(--radius);
     padding: var(--space-1) var(--space-4);
     font-family: var(--font-mono);
@@ -480,13 +478,11 @@
     line-height: 1.3;
   }
   .sys-btn:hover:not(:disabled) {
-    background: var(--bg-elev);
-    border-color: var(--fg-muted);
+    background: var(--glass-strong);
     color: var(--accent);
   }
   .sys-btn:disabled {
     color: var(--fg-muted);
-    border-color: var(--border);
     cursor: not-allowed;
   }
   /* (Role-input styles moved to Chat.svelte's cast row.) */

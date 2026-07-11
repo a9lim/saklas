@@ -831,7 +831,6 @@
     justify-content: space-between;
     gap: var(--space-5);
     padding: var(--space-5) var(--space-6);
-    border-bottom: 1px solid var(--glass-line);
   }
   .title {
     display: flex;
@@ -858,7 +857,6 @@
     font-family: var(--font-mono);
     font-size: var(--text-md);
     background: var(--glass-strong);
-    border: 1px solid var(--glass-line);
     border-radius: var(--radius-sm);
     padding: var(--space-1) var(--space-3);
     word-break: break-all;
@@ -878,9 +876,9 @@
     gap: var(--space-2);
   }
   .scrub-btn {
-    background: transparent;
+    background: var(--glass);
     color: var(--fg-muted);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: var(--radius-pill);
     font: inherit;
     font-size: var(--text-2xs);
@@ -889,13 +887,11 @@
     cursor: pointer;
     transition:
       color var(--dur-fast) var(--ease-out),
-      background var(--dur-fast) var(--ease-out),
-      border-color var(--dur-fast) var(--ease-out);
+      background var(--dur-fast) var(--ease-out);
   }
   .scrub-btn:hover:not(:disabled) {
     color: var(--fg);
-    background: var(--bg-hover);
-    border-color: var(--fg-muted);
+    background: var(--glass-strong);
   }
   .scrub-btn:disabled {
     color: var(--fg-muted);
@@ -914,9 +910,9 @@
     font-size: var(--text-xs);
   }
   .close {
-    background: transparent;
+    background: var(--glass);
     color: var(--fg-muted);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: 50%;
     width: 26px;
     height: 26px;
@@ -930,13 +926,11 @@
     flex: none;
     transition:
       color var(--dur-fast) var(--ease-out),
-      background var(--dur-fast) var(--ease-out),
-      border-color var(--dur-fast) var(--ease-out);
+      background var(--dur-fast) var(--ease-out);
   }
   .close:hover {
     color: var(--fg);
-    background: var(--bg-hover);
-    border-color: var(--fg-muted);
+    background: var(--glass-strong);
   }
 
   /* Toolbar — view tabs left, branch toggle right (when A/B). */
@@ -946,7 +940,6 @@
     justify-content: space-between;
     gap: var(--space-5);
     padding: var(--space-3) var(--space-6);
-    border-bottom: 1px solid var(--glass-line);
   }
 
   .body {
@@ -975,7 +968,6 @@
   .grid-scroll {
     overflow: auto;
     max-height: 100%;
-    border: 1px solid var(--glass-line);
     border-radius: var(--radius);
     background: var(--bg);
   }
@@ -996,7 +988,7 @@
     position: sticky;
     top: 0;
     z-index: 2;
-    border-bottom: 1px solid var(--glass-line);
+    box-shadow: var(--shadow-sticky);
   }
   .grid .row-label {
     position: sticky;
@@ -1007,7 +999,7 @@
     color: var(--fg-dim);
     font-size: var(--text-xs);
     font-weight: var(--weight-normal);
-    border-right: 1px solid var(--glass-line);
+    box-shadow: 2px 0 8px rgba(0, 0, 0, 0.45);
     white-space: nowrap;
   }
   .grid .corner {
@@ -1020,8 +1012,7 @@
     font-weight: var(--weight-normal);
     text-align: left;
     padding: var(--space-1) var(--space-3);
-    border-right: 1px solid var(--glass-line);
-    border-bottom: 1px solid var(--glass-line);
+    box-shadow: var(--shadow-sticky), 2px 0 8px rgba(0, 0, 0, 0.45);
   }
   .grid .col-label {
     color: var(--fg-dim);
@@ -1067,7 +1058,6 @@
     color: var(--fg);
     font-family: var(--font-mono);
     background: var(--glass-strong);
-    border: 1px solid var(--glass-line);
     border-radius: var(--radius-sm);
     padding: 0 var(--space-2);
   }
@@ -1081,12 +1071,8 @@
   .logits-table th,
   .logits-table td {
     padding: var(--space-2) var(--space-4);
-    border-bottom: 1px solid var(--glass-line);
     text-align: left;
     background: var(--bg);
-  }
-  .logits-table tbody tr:last-child td {
-    border-bottom: 0;
   }
   .logits-table thead th {
     position: sticky;
@@ -1098,6 +1084,7 @@
     font-size: var(--text-xs);
     text-transform: uppercase;
     letter-spacing: 0.06em;
+    box-shadow: var(--shadow-sticky);
   }
   .logits-table td {
     font-family: var(--font-mono);
@@ -1145,8 +1132,8 @@
     gap: var(--space-2);
     font-family: var(--font-mono);
     font-size: var(--text-sm);
-    background: var(--glass);
-    border: 1px solid color-mix(in srgb, var(--pillar-lens) 22%, var(--glass-line));
+    background: color-mix(in srgb, var(--pillar-lens) 16%, var(--glass));
+    border: 1px solid transparent;
     border-radius: var(--radius-pill);
     padding: 1px var(--space-4);
   }
@@ -1170,7 +1157,6 @@
   .lens-table th,
   .lens-table td {
     padding: var(--space-1) var(--space-3);
-    border-bottom: 1px solid var(--glass-line);
     text-align: left;
     background: var(--bg);
   }
@@ -1184,12 +1170,13 @@
     font-size: var(--text-xs);
     text-transform: uppercase;
     letter-spacing: 0.06em;
+    box-shadow: var(--shadow-sticky);
   }
   .lens-table .corner {
     position: sticky;
     left: 0;
     z-index: 3;
-    border-right: 1px solid var(--glass-line);
+    box-shadow: var(--shadow-sticky), 2px 0 8px rgba(0, 0, 0, 0.45);
   }
   .lens-table .row-label {
     position: sticky;
@@ -1200,7 +1187,7 @@
     font-family: var(--font-mono);
     font-weight: var(--weight-normal);
     font-size: var(--text-xs);
-    border-right: 1px solid var(--glass-line);
+    box-shadow: 2px 0 8px rgba(0, 0, 0, 0.45);
     white-space: nowrap;
   }
   .lens-table .row-label.band {
@@ -1243,7 +1230,6 @@
   }
 
   .drawer-footer {
-    border-top: 1px solid var(--glass-line);
     padding: var(--space-3) var(--space-6);
     color: var(--fg-muted);
     font-size: var(--text-xs);

@@ -230,7 +230,6 @@ variant   := raw | sae | sae-<release>
     align-items: center;
     justify-content: space-between;
     padding: var(--space-5) var(--space-6);
-    border-bottom: 1px solid var(--glass-line);
   }
   .title {
     color: var(--accent);
@@ -240,9 +239,9 @@ variant   := raw | sae | sae-<release>
     font-weight: var(--weight-medium);
   }
   .close {
-    background: transparent;
+    background: var(--glass);
     color: var(--fg-muted);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: 50%;
     width: 26px;
     height: 26px;
@@ -256,13 +255,11 @@ variant   := raw | sae | sae-<release>
     flex: none;
     transition:
       color var(--dur-fast) var(--ease-out),
-      background var(--dur-fast) var(--ease-out),
-      border-color var(--dur-fast) var(--ease-out);
+      background var(--dur-fast) var(--ease-out);
   }
   .close:hover {
     color: var(--fg);
-    background: var(--bg-hover);
-    border-color: var(--fg-muted);
+    background: var(--glass-strong);
   }
   .body {
     flex: 1 1 auto;
@@ -289,7 +286,6 @@ variant   := raw | sae | sae-<release>
   .kb td {
     padding: var(--space-2) var(--space-3);
     vertical-align: top;
-    border-bottom: 1px solid var(--border);
   }
   .kb td:first-child {
     color: var(--fg-dim);
@@ -298,7 +294,6 @@ variant   := raw | sae | sae-<release>
   }
   kbd {
     background: var(--bg-elev);
-    border: 1px solid var(--border);
     color: var(--fg-strong);
     padding: 0 var(--space-2);
     border-radius: var(--radius);
@@ -311,7 +306,6 @@ variant   := raw | sae | sae-<release>
   }
   .grammar {
     background: var(--bg-deep);
-    border: 1px solid var(--border);
     padding: var(--space-3) var(--space-4);
     margin: var(--space-3) 0;
     color: var(--fg-strong);
@@ -339,13 +333,12 @@ variant   := raw | sae | sae-<release>
     justify-content: flex-end;
     gap: var(--space-3);
     padding: var(--space-3) var(--space-6);
-    border-top: 1px solid var(--glass-line);
     color: var(--fg-muted);
   }
   .btn {
-    background: var(--bg-alt);
+    background: var(--glass);
     color: var(--fg-strong);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     padding: var(--space-3) var(--space-5);
     font: inherit;
     font-family: var(--font-mono);
@@ -354,10 +347,10 @@ variant   := raw | sae | sae-<release>
   .btn.primary {
     background: var(--accent);
     color: var(--text-on-accent);
-    border-color: var(--accent);
+    border-color: transparent;
   }
   .btn.primary:hover {
     background: var(--accent-light);
-    border-color: var(--accent-light);
+    border-color: transparent;
   }
 </style>

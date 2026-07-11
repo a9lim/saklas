@@ -53,15 +53,14 @@
 
 <style>
   /* Stacks vertically directly above the input row.  Hidden when empty
-   * — Svelte's conditional render takes care of that, no class needed. */
+   * — Svelte's conditional render takes care of that, no class needed.
+   * Borderless — the dashed border belongs to each ghost bubble (its
+   * "not yet real" identity), not to the strip's own container. */
   .pending-strip {
     display: flex;
     flex-direction: column;
     gap: var(--space-1);
     padding: var(--space-1) 0;
-    border-top: 1px dashed var(--border);
-    /* No bottom border — the input row's existing top edge picks up
-     * the visual baseline. */
   }
   .bubble {
     display: flex;

@@ -329,7 +329,6 @@
     justify-content: space-between;
     gap: var(--space-5);
     padding: var(--space-5) var(--space-6);
-    border-bottom: 1px solid var(--glass-line);
   }
   .title {
     display: flex;
@@ -355,9 +354,9 @@
     font-size: var(--text-sm);
   }
   .close {
-    background: transparent;
+    background: var(--glass);
     color: var(--fg-muted);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: 50%;
     width: 26px;
     height: 26px;
@@ -371,13 +370,11 @@
     flex: none;
     transition:
       color var(--dur-fast) var(--ease-out),
-      background var(--dur-fast) var(--ease-out),
-      border-color var(--dur-fast) var(--ease-out);
+      background var(--dur-fast) var(--ease-out);
   }
   .close:hover {
     color: var(--fg);
-    background: var(--bg-hover);
-    border-color: var(--fg-muted);
+    background: var(--glass-strong);
   }
 
   .body {
@@ -389,9 +386,9 @@
   }
   .setup,
   .results {
-    border: 1px solid var(--glass-line);
     border-radius: var(--radius-lg);
     background: var(--glass);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
     padding: var(--space-5);
     min-width: 0;
   }
@@ -405,9 +402,9 @@
   input,
   textarea {
     width: 100%;
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: var(--radius);
-    background: var(--bg-elev);
+    background: var(--input-well);
     color: var(--fg);
     padding: var(--space-4);
     font-family: var(--font-mono);
@@ -440,7 +437,7 @@
     color: var(--fg-dim);
     font-family: var(--font-mono);
     background: var(--glass-strong);
-    border: 1px solid var(--glass-line);
+    border: 1px solid transparent;
     border-radius: var(--radius-sm);
     padding: var(--space-1) var(--space-3);
   }
@@ -449,7 +446,6 @@
    * OPAQUE (they occlude scrolled cells). */
   .heatmap-wrap {
     overflow: auto;
-    border: 1px solid var(--glass-line);
     border-radius: var(--radius);
     background: var(--bg);
   }
@@ -463,7 +459,6 @@
     background: var(--bg);
   }
   th, td {
-    border: 1px solid var(--glass-line);
     padding: 0;
   }
   td button {
@@ -495,7 +490,7 @@
     grid-template-columns: auto 1fr auto;
     gap: var(--space-4);
     align-items: center;
-    border: 1px solid var(--glass-line);
+    border: 1px solid transparent;
     border-radius: var(--radius);
     background: var(--bg-elev);
     color: var(--fg-strong);
@@ -503,9 +498,9 @@
     text-align: left;
     font-family: var(--font-mono);
     cursor: pointer;
-    transition: border-color var(--dur-fast) var(--ease-out);
+    transition: background var(--dur-fast) var(--ease-out);
   }
-  .run-list button:hover { border-color: var(--fg-muted); background: var(--bg-hover); }
+  .run-list button:hover { background: var(--bg-hover); }
   .idx { color: var(--fg); font-family: var(--font-mono); }
   .empty {
     display: grid;
@@ -514,7 +509,7 @@
     color: var(--fg-muted);
     text-align: center;
     line-height: 1.5;
-    border: 1px solid var(--glass-line);
+    background: var(--bg);
     border-radius: var(--radius);
     padding: var(--space-8);
   }

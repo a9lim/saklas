@@ -286,7 +286,6 @@
     align-items: center;
     justify-content: space-between;
     padding: var(--space-5) var(--space-6);
-    border-bottom: 1px solid var(--glass-line);
   }
   .title {
     color: var(--accent);
@@ -295,9 +294,9 @@
     font-weight: var(--weight-medium);
   }
   .close {
-    background: transparent;
+    background: var(--glass);
     color: var(--fg-muted);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: 50%;
     width: 26px;
     height: 26px;
@@ -311,19 +310,16 @@
     flex: none;
     transition:
       color var(--dur-fast) var(--ease-out),
-      background var(--dur-fast) var(--ease-out),
-      border-color var(--dur-fast) var(--ease-out);
+      background var(--dur-fast) var(--ease-out);
   }
   .close:hover {
     color: var(--fg);
-    background: var(--bg-hover);
-    border-color: var(--fg-muted);
+    background: var(--glass-strong);
   }
 
   .tabs {
     display: flex;
     gap: 0;
-    border-bottom: 1px solid var(--glass-line);
     padding: 0 var(--space-5);
   }
   .tabs button {
@@ -375,9 +371,9 @@
     border: 0;
   }
   .search input[type="search"] {
-    background: var(--bg-deep);
+    background: var(--input-well);
     color: var(--fg);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: var(--radius);
     padding: var(--space-2) var(--space-3);
     font: inherit;
@@ -425,12 +421,12 @@
     align-items: center;
     gap: var(--space-3);
     background: var(--bg-deep);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: var(--radius);
     padding: var(--space-3) var(--space-4);
-    transition: border-color var(--dur) var(--ease-out);
+    transition: background var(--dur) var(--ease-out);
   }
-  .row:hover { border-color: var(--accent-purple); }
+  .row:hover { background: color-mix(in srgb, var(--accent-purple) 8%, var(--bg-deep)); }
   .meta {
     display: flex;
     flex-direction: column;
@@ -457,7 +453,7 @@
     text-transform: uppercase;
     font-size: var(--text-2xs);
     letter-spacing: 0.04em;
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     color: var(--accent-purple);
     background: color-mix(in srgb, var(--accent-purple) 12%, transparent);
   }
@@ -487,9 +483,9 @@
     gap: var(--space-2);
   }
   .act {
-    background: transparent;
+    background: var(--glass);
     color: var(--accent-purple);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: var(--radius);
     padding: var(--space-2) var(--space-3);
     font: inherit;
@@ -498,12 +494,10 @@
     cursor: pointer;
     transition:
       background var(--dur) var(--ease-out),
-      border-color var(--dur) var(--ease-out),
       color var(--dur) var(--ease-out);
   }
   .act:hover:not(:disabled) {
     background: rgba(167, 139, 250, 0.12);
-    border-color: var(--accent-purple);
   }
   .act:disabled {
     opacity: 0.45;

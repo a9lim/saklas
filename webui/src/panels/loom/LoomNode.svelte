@@ -122,7 +122,6 @@
     align-items: center;
     gap: var(--space-3);
     padding: var(--space-1) var(--space-3);
-    border-left: 2px solid transparent;
     border-radius: var(--radius);
     cursor: pointer;
     font: inherit;
@@ -148,7 +147,6 @@
     color: var(--fg);
     background: var(--glass);
     border-radius: var(--radius-sm);
-    border-left-color: var(--accent-green);
   }
   .node.dead {
     opacity: 0.3;
@@ -160,17 +158,9 @@
     background: color-mix(in srgb, var(--live) 8%, transparent);
     box-shadow: var(--glow-live);
   }
-  /* Role hue lives on the left stripe; the glyph itself stays neutral
-     (the cast model — roles carry no hue), matching Chat's .role-chip b. */
-  .node.user {
-    border-left-color: var(--accent-blue);
-  }
-  .node.assistant {
-    border-left-color: var(--accent-green);
-  }
-  .node.system {
-    border-left-color: var(--fg-muted);
-  }
+  /* No stripes at all (cast model: roles carry no hue — identity is the
+     glyph letter alone; the active path reads from the glass fill +
+     weight, and the streaming node from its live glow). */
   .glyph {
     font-weight: var(--weight-bold);
     width: 14px;
@@ -198,8 +188,8 @@
   /* Steering-delta chip — trailing, truncated so a long delta can't
    * blow out the row or collide with the preview text.  This is where
    * the edge label actually renders (LoomEdge only fetches/caches it),
-   * so it wears the "edge label chip" look: a glass-strong pill with a
-   * hairline, mono 2xs. */
+   * so it wears the "edge label chip" look: a borderless glass-strong
+   * pill, mono 2xs. */
   .steer {
     color: var(--fg-dim);
     font-family: var(--font-mono);
@@ -208,7 +198,6 @@
     padding: 1px 6px;
     border-radius: var(--radius-sm);
     background: var(--glass-strong);
-    border: 1px solid var(--glass-line);
     max-width: 11ch;
     overflow: hidden;
     text-overflow: ellipsis;

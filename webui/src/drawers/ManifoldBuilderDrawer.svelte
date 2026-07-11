@@ -1485,7 +1485,6 @@
     align-items: center;
     justify-content: space-between;
     padding: var(--space-5) var(--space-6);
-    border-bottom: 1px solid var(--glass-line);
   }
   .title {
     color: var(--accent);
@@ -1494,9 +1493,9 @@
     font-weight: var(--weight-medium);
   }
   .close {
-    background: transparent;
+    background: var(--glass);
     color: var(--fg-muted);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: 50%;
     width: 26px;
     height: 26px;
@@ -1510,13 +1509,11 @@
     flex: none;
     transition:
       color var(--dur-fast) var(--ease-out),
-      background var(--dur-fast) var(--ease-out),
-      border-color var(--dur-fast) var(--ease-out);
+      background var(--dur-fast) var(--ease-out);
   }
   .close:hover {
     color: var(--fg);
-    background: var(--bg-hover);
-    border-color: var(--fg-muted);
+    background: var(--glass-strong);
   }
   .body {
     flex: 1 1 auto;
@@ -1559,9 +1556,9 @@
     margin-left: var(--space-2);
   }
   .input {
-    background: var(--bg-deep);
+    background: var(--input-well);
     color: var(--fg);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: var(--radius);
     padding: var(--space-2) var(--space-3);
     font: inherit;
@@ -1577,7 +1574,6 @@
   }
 
   .step {
-    border-top: 1px solid var(--border);
     padding-top: var(--space-3);
     display: flex;
     flex-direction: column;
@@ -1598,9 +1594,9 @@
     gap: var(--space-2);
   }
   .kind-btn {
-    background: transparent;
+    background: var(--glass);
     color: var(--fg-dim);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: var(--radius);
     padding: var(--space-2) var(--space-4);
     font: inherit;
@@ -1609,15 +1605,14 @@
     cursor: pointer;
     transition:
       background var(--dur) var(--ease-out),
-      border-color var(--dur) var(--ease-out),
       color var(--dur) var(--ease-out);
   }
   .kind-btn:hover {
     color: var(--fg-strong);
+    background: var(--glass-strong);
   }
   .kind-btn.active {
     color: var(--accent);
-    border-color: var(--accent);
     background: var(--accent-subtle);
   }
 
@@ -1631,8 +1626,9 @@
     grid-template-columns: 1.4fr 1fr 1fr auto;
     align-items: end;
     gap: var(--space-2);
-    border: 1px solid var(--border);
     border-radius: var(--radius);
+    background: var(--glass);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
     padding: var(--space-3);
   }
   .axis-field {
@@ -1684,7 +1680,6 @@
     gap: var(--space-2);
   }
   .node-card {
-    border: 1px solid var(--border);
     border-radius: var(--radius);
     padding: var(--space-3);
     display: flex;
@@ -1745,9 +1740,9 @@
   .node-statements {
     width: 100%;
     box-sizing: border-box;
-    background: var(--bg-elev);
+    background: var(--input-well);
     color: var(--fg);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: var(--radius);
     padding: var(--space-2) var(--space-3);
     font-family: var(--font-mono);
@@ -1762,7 +1757,7 @@
   .add-node {
     background: var(--accent-subtle);
     color: var(--accent);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: var(--radius);
     padding: var(--space-2) var(--space-4);
     font: inherit;
@@ -1807,7 +1802,7 @@
   .add-pair-btn {
     background: var(--accent-subtle);
     color: var(--accent);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: var(--radius);
     padding: var(--space-2) var(--space-4);
     font: inherit;
@@ -1823,7 +1818,7 @@
   .save-btn {
     background: var(--accent);
     color: var(--text-on-accent);
-    border: 1px solid var(--accent);
+    border: 1px solid transparent;
     border-radius: var(--radius);
     padding: var(--space-3) var(--space-5);
     font: inherit;
@@ -1837,7 +1832,6 @@
   .save-btn:disabled {
     background: var(--bg-elev);
     color: var(--fg-muted);
-    border-color: var(--border);
     cursor: not-allowed;
   }
 

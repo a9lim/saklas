@@ -18,6 +18,15 @@
  *   - Elevation = translucency + light (inset top-light, shadow), no longer
  *     shade steps alone. Legacy --bg-* names stay mapped to opaque
  *     composites so pre-v2 components keep working mid-migration.
+ *   - BORDERLESS BY DEFAULT (Phase 6): separation comes from space, then
+ *     fill contrast (the surface ladder), then light (top-light, shadow,
+ *     scroll-shadow) — a hairline is the LAST resort, reserved for
+ *     meaning: focus rings, active/selected state rings, the outer edge
+ *     of a floating surface (sheet / palette / popover / toast), and
+ *     control glyphs that ARE boxes (checkbox, radio). Controls float UP
+ *     on glass fills; inputs recess DOWN to the well tone with a ring on
+ *     focus only. Sticky table headers separate with --shadow-sticky,
+ *     never a rule. Nothing else carries a resting border.
  */
 
 :root {
@@ -31,18 +40,22 @@
    * Ground carries a faint blue-violet ambient (set in global.css).
    * Opaque ladder = legacy names, recomposited in the new palette.
    * Glass tier = the v2 card material (translucent + blur + top-light). */
-  --bg-deep: #05060b;       /* rail — the floor */
+  /* Borderless leans on this ladder — the steps are a touch wider than
+   * v2.0 so fill contrast alone separates tiers on mediocre panels. */
+  --bg-deep: #04050a;       /* rail — the floor; also the well tone */
   --bg: #07080e;            /* app canvas */
-  --bg-alt: #0e1018;        /* panel tier (opaque composite of glass-on-bg) */
-  --surface: #0e1018;       /* alias of --bg-alt */
-  --bg-elev: #171a26;       /* elevated */
-  --surface-strong: #171a26;/* alias of --bg-elev */
-  --surface-hi: #1f2333;    /* highest: modals, popovers, menus */
+  --bg-alt: #10121c;        /* panel tier (opaque composite of glass-on-bg) */
+  --surface: #10121c;       /* alias of --bg-alt */
+  --bg-elev: #1a1d2b;       /* elevated */
+  --surface-strong: #1a1d2b;/* alias of --bg-elev */
+  --surface-hi: #222639;    /* highest: modals, popovers, menus */
 
-  --glass: rgba(255, 255, 255, 0.035);        /* v2 card fill */
-  --glass-strong: rgba(255, 255, 255, 0.06);  /* v2 raised fill / wells */
-  --glass-line: rgba(233, 236, 248, 0.085);   /* v2 card hairline */
+  --glass: rgba(255, 255, 255, 0.045);        /* v2 card fill */
+  --glass-strong: rgba(255, 255, 255, 0.075); /* v2 raised fill / wells */
+  --glass-line: rgba(233, 236, 248, 0.085);   /* hairline — floating edges + state rings ONLY */
   --blur-glass: 6px;
+  /* Recessed input fill — "type here" reads as a well, not an outline. */
+  --input-well: rgba(2, 3, 8, 0.45);
 
   /* Translucent wash laid over any surface tier on hover. */
   --bg-hover: rgba(237, 239, 247, 0.05);
@@ -116,10 +129,13 @@
 
   /* ---- Elevation ----------------------------------------------------
    * Cards are lit from above (inset top-light) and cast down. Overlay
-   * shadow is for sheets/modals/popovers/toasts. */
+   * shadow is for sheets/modals/popovers/toasts. --shadow-sticky is the
+   * borderless replacement for a sticky table header's bottom rule —
+   * elevation that only reads once content scrolls underneath. */
   --shadow-card: inset 0 1px 0 rgba(255, 255, 255, 0.05),
     0 8px 24px rgba(0, 0, 0, 0.35);
   --shadow-overlay: 0 12px 40px rgba(0, 0, 0, 0.5);
+  --shadow-sticky: 0 2px 8px rgba(0, 0, 0, 0.45);
 
   /* ---- Type scale — px, base 13.5px --------------------------------- */
   --text-2xs: 9.5px;        /* layer ticks, micro-labels */
@@ -185,6 +201,6 @@
    * (TemplateLabDrawer), --err-bg (LoomSidebar). */
   --muted: var(--fg-muted);
   --danger: var(--accent-red);
-  --input-bg: var(--bg-elev);
+  --input-bg: var(--input-well);
   --err-bg: rgba(229, 84, 79, 0.08);
 }

@@ -487,7 +487,6 @@
     display: flex;
     align-items: baseline;
     gap: 16px;
-    border-bottom: 1px solid var(--border);
     padding-bottom: 10px;
     margin-bottom: 22px;
   }
@@ -533,7 +532,7 @@
     gap: 16px;
     align-items: center;
     background: var(--glass);
-    border: 1px solid var(--glass-line);
+    border: 1px solid transparent;
     border-radius: var(--radius);
     padding: 10px 14px;
   }
@@ -541,7 +540,7 @@
     width: 40px;
     height: 24px;
     border-radius: var(--radius-sm);
-    border: 1px solid rgba(255, 255, 255, 0.12);
+    border: 1px solid transparent;
   }
   .onto-name {
     font-family: var(--font-mono);
@@ -571,7 +570,7 @@
     gap: 16px;
     align-items: baseline;
     background: var(--glass);
-    border: 1px solid var(--glass-line);
+    border: 1px solid transparent;
     border-radius: var(--radius);
     padding: 12px 14px;
   }
@@ -604,6 +603,10 @@
     gap: 8px;
     margin-bottom: 14px;
   }
+  /* Kept bordered by design: this demonstrates the --bg/--bg-deep surface
+   * tokens themselves, one of which matches the page's own canvas — the
+   * hairline is the only thing that makes that swatch legible as a tile
+   * rather than invisible against the page. */
   .tile {
     flex: 1;
     height: 64px;
@@ -629,16 +632,13 @@
     color: var(--fg-dim);
   }
 
-  /* spec rows */
+  /* spec rows — borderless; padding alone carries the rhythm between
+   * static documentation rows (no hover wash needed here). */
   .spec-row {
     display: flex;
     align-items: center;
     gap: 18px;
     padding: 12px 0;
-    border-bottom: 1px solid var(--border);
-  }
-  .spec-row:last-child {
-    border-bottom: none;
   }
   .spec-label {
     font-family: var(--font-mono);
@@ -668,7 +668,7 @@
   /* ramps */
   .ramp-play {
     background: var(--glass);
-    border: 1px solid var(--glass-line);
+    border: 1px solid transparent;
     border-radius: var(--radius-lg);
     padding: 18px 20px;
   }
@@ -844,7 +844,6 @@
 
   footer {
     margin-top: 64px;
-    border-top: 1px solid var(--border);
     padding-top: 16px;
   }
   footer .mono {

@@ -474,8 +474,9 @@
     position: relative;
     overflow-y: auto;
     min-height: 0;
-    background: var(--bg-alt);
-    border: 1px solid var(--border);
+    /* Recessed input well — this is the editable completion surface. */
+    background: var(--input-well);
+    border: 1px solid transparent;
     border-radius: var(--radius);
   }
   /* The tinted read-only mirror and the textarea share identical
@@ -557,7 +558,7 @@
     gap: var(--space-1);
     padding: var(--space-1);
     background: var(--bg-elev);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: var(--radius);
   }
   .mode-toggle button {
@@ -626,9 +627,9 @@
     margin-right: auto;
   }
   .act {
-    background: var(--bg-alt);
+    background: var(--glass);
     color: var(--fg-strong);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     padding: var(--space-2) var(--space-5);
     cursor: pointer;
     font: inherit;
@@ -636,8 +637,7 @@
     border-radius: var(--radius);
   }
   .act:hover:not(:disabled) {
-    background: var(--bg-elev);
-    border-color: var(--fg-muted);
+    background: var(--glass-strong);
   }
   .act:disabled {
     color: var(--fg-muted);

@@ -219,7 +219,6 @@
     justify-content: space-between;
     gap: var(--space-5);
     padding: var(--space-5) var(--space-6);
-    border-bottom: 1px solid var(--glass-line);
   }
   .title {
     display: flex;
@@ -255,9 +254,9 @@
     white-space: nowrap;
   }
   .close {
-    background: transparent;
+    background: var(--glass);
     color: var(--fg-muted);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: 50%;
     width: 26px;
     height: 26px;
@@ -271,13 +270,11 @@
     flex: none;
     transition:
       color var(--dur-fast) var(--ease-out),
-      background var(--dur-fast) var(--ease-out),
-      border-color var(--dur-fast) var(--ease-out);
+      background var(--dur-fast) var(--ease-out);
   }
   .close:hover {
     color: var(--fg);
-    background: var(--bg-hover);
-    border-color: var(--fg-muted);
+    background: var(--glass-strong);
   }
 
   .toolbar {
@@ -285,7 +282,6 @@
     align-items: center;
     gap: var(--space-5);
     padding: var(--space-3) var(--space-6);
-    border-bottom: 1px solid var(--glass-line);
   }
   .picker {
     display: flex;
@@ -309,22 +305,22 @@
     font-size: var(--text-2xs);
     text-transform: lowercase;
     background: var(--glass);
-    border: 1px solid var(--glass-line);
+    border: 1px solid transparent;
     border-radius: var(--radius-pill);
     padding: 1px var(--space-4);
     color: var(--fg-dim);
   }
   .stoplight.solid {
     color: var(--accent-green);
-    border-color: color-mix(in srgb, var(--accent-green) 35%, var(--glass-line));
+    background: color-mix(in srgb, var(--accent-green) 16%, var(--glass));
   }
   .stoplight.shaky {
     color: var(--accent-yellow);
-    border-color: color-mix(in srgb, var(--accent-yellow) 35%, var(--glass-line));
+    background: color-mix(in srgb, var(--accent-yellow) 16%, var(--glass));
   }
   .stoplight.poor {
     color: var(--accent-red);
-    border-color: color-mix(in srgb, var(--accent-red) 35%, var(--glass-line));
+    background: color-mix(in srgb, var(--accent-red) 16%, var(--glass));
   }
 
   .body {
@@ -371,7 +367,6 @@
   }
 
   .drawer-footer {
-    border-top: 1px solid var(--glass-line);
     padding: var(--space-3) var(--space-6);
     color: var(--fg-muted);
     font-size: var(--text-xs);

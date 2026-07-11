@@ -251,7 +251,6 @@
     align-items: center;
     justify-content: space-between;
     padding: var(--space-5) var(--space-6);
-    border-bottom: 1px solid var(--glass-line);
   }
   .title {
     color: var(--accent);
@@ -260,9 +259,9 @@
     font-weight: var(--weight-medium);
   }
   .close {
-    background: transparent;
+    background: var(--glass);
     color: var(--fg-muted);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: 50%;
     width: 26px;
     height: 26px;
@@ -276,13 +275,11 @@
     flex: none;
     transition:
       color var(--dur-fast) var(--ease-out),
-      background var(--dur-fast) var(--ease-out),
-      border-color var(--dur-fast) var(--ease-out);
+      background var(--dur-fast) var(--ease-out);
   }
   .close:hover {
     color: var(--fg);
-    background: var(--bg-hover);
-    border-color: var(--fg-muted);
+    background: var(--glass-strong);
   }
   .body {
     flex: 1 1 auto;
@@ -321,7 +318,6 @@
     gap: var(--space-4);
   }
   .sources {
-    border: 1px solid var(--border);
     border-radius: var(--radius);
     background: var(--bg-deep);
     padding: var(--space-3) var(--space-4);
@@ -382,9 +378,9 @@
   }
   input[type="text"],
   select {
-    background: var(--bg-deep);
+    background: var(--input-well);
     color: var(--fg);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: var(--radius);
     padding: var(--space-3) var(--space-4);
     font-family: var(--font-mono);
@@ -406,7 +402,6 @@
   /* Footer: cancel (secondary) + primary submit pinned to the bottom.
    * Only the primary accent goes purple. */
   .foot {
-    border-top: 1px solid var(--glass-line);
     padding-top: var(--space-3);
     margin-top: auto;
     display: flex;
@@ -416,7 +411,7 @@
   .primary {
     background: var(--accent-purple);
     color: var(--text-on-accent);
-    border: 1px solid var(--accent-purple);
+    border: 1px solid transparent;
     padding: var(--space-2) var(--space-5);
     border-radius: var(--radius);
     font-family: var(--font-mono);
@@ -434,8 +429,8 @@
     cursor: not-allowed;
   }
   .secondary {
-    background: transparent;
-    border: 1px solid var(--border);
+    background: var(--glass);
+    border: 1px solid transparent;
     color: var(--fg-dim);
     padding: var(--space-2) var(--space-5);
     border-radius: var(--radius);
@@ -444,7 +439,7 @@
     cursor: pointer;
   }
   .secondary:hover {
-    border-color: var(--fg);
+    background: var(--glass-strong);
     color: var(--fg);
   }
   .spinner {

@@ -59,8 +59,10 @@
     width: 100%;
     height: 4px;
     margin: 0;
-    background: var(--bg-elev);
-    border: 1px solid var(--border);
+    /* Borderless: the track is a recessed groove — fill only.  The thumb
+     * keeps its --bg-deep cutout ring (a glyph stroke, not chrome). */
+    background: var(--input-well);
+    border: 0;
     border-radius: var(--radius-pill);
     cursor: pointer;
   }

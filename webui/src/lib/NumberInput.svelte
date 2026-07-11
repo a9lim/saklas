@@ -171,9 +171,10 @@
     width: 100%;
     padding: var(--space-2) var(--space-3);
     padding-right: var(--space-6); /* room for the steppers */
-    background: var(--bg-elev);
+    /* Borderless input: recessed well fill; ring on focus only. */
+    background: var(--input-well);
     color: var(--fg);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: var(--radius-sm);
     font: inherit;
     font-family: var(--font-mono);
@@ -214,7 +215,6 @@
   .sk-number:focus-within .sk-number-steppers {
     opacity: 1;
     pointer-events: auto;
-    border-left-color: var(--border);
   }
 
   .sk-number-step {

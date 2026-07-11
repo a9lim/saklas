@@ -103,16 +103,15 @@
 
 <style>
   /* A flat section of the inspector panel — no border box, no own
-   * background; the only chrome is the border-bottom hairline dividing
-   * it from the probe section below.  Fixed chrome + one scrollable
-   * middle. */
+   * background; borderless — the STEER/PROBE title typography and each
+   * section's own padding carry the divide from the probe section below.
+   * Fixed chrome + one scrollable middle. */
   .rack {
     display: flex;
     flex-direction: column;
     gap: var(--space-3);
     padding: var(--space-5);
     background: transparent;
-    border-bottom: 1px solid var(--border);
     height: 100%;
     min-height: 0;
     max-height: 100%;
@@ -124,7 +123,6 @@
     align-items: baseline;
     justify-content: space-between;
     gap: var(--space-3);
-    border-bottom: 1px solid var(--border);
     padding-bottom: var(--space-3);
   }
   .header-text {
@@ -182,21 +180,19 @@
     text-align: right;
   }
 
-  /* Anchored at the bottom of the rack.  Border-top mirrors the probe
-   * rack's actions row for visual symmetry.  Shown in both empty and
-   * populated states — the two family launchers are the only first-run
-   * affordance (no teaching copy). */
+  /* Anchored at the bottom of the rack.  Borderless — the padding-top
+   * mirrors the probe rack's actions row for visual symmetry.  Shown in
+   * both empty and populated states — the two family launchers are the
+   * only first-run affordance (no teaching copy). */
   .actions {
     flex: 0 0 auto;
-    border-top: 1px solid var(--border);
     padding-top: var(--space-4);
     display: flex;
     gap: var(--space-2);
   }
-  /* With no card list between header and launchers, the header hairline is
-   * the sole divider — the same empty STEER treatment as J-LENS. */
+  /* With no card list between header and launchers, the tighter gap is
+   * the same empty STEER treatment as J-LENS. */
   .actions.empty {
-    border-top: 0;
     padding-top: 0;
   }
   /* The two family launchers — white subspace vs purple manifold so they
@@ -204,7 +200,7 @@
   .add-subspace,
   .add-manifold {
     flex: 1 1 0;
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     padding: 2px var(--space-5);
     border-radius: var(--radius);
     font: inherit;

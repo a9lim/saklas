@@ -312,9 +312,11 @@
     width: 100%;
     gap: var(--space-2);
     padding: var(--space-2) var(--space-3);
-    background: var(--bg-elev);
+    /* Borderless input: recessed well fill is the "pick here" affordance;
+     * the ring appears on focus only. */
+    background: var(--input-well);
     color: var(--fg);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: var(--radius);
     font: inherit;
     font-family: var(--font-mono);

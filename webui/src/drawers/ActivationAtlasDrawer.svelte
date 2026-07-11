@@ -307,7 +307,6 @@
     justify-content: space-between;
     gap: var(--space-5);
     padding: var(--space-5) var(--space-6);
-    border-bottom: 1px solid var(--glass-line);
   }
   .title {
     display: flex;
@@ -334,9 +333,9 @@
     white-space: nowrap;
   }
   .close {
-    background: transparent;
+    background: var(--glass);
     color: var(--fg-muted);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: 50%;
     width: 26px;
     height: 26px;
@@ -350,23 +349,20 @@
     flex: none;
     transition:
       color var(--dur-fast) var(--ease-out),
-      background var(--dur-fast) var(--ease-out),
-      border-color var(--dur-fast) var(--ease-out);
+      background var(--dur-fast) var(--ease-out);
   }
   .close:hover {
     color: var(--fg);
-    background: var(--bg-hover);
-    border-color: var(--fg-muted);
+    background: var(--glass-strong);
   }
 
-  /* Summary strip — flat row, no card backgrounds; same border-bottom
-   * pattern as the loom side bar headers (single hairline separator). */
+  /* Summary strip — flat row, no card backgrounds; spacing carries the
+   * separation from the header above. */
   .summary {
     display: grid;
     grid-template-columns: repeat(4, minmax(0, 1fr));
     gap: var(--space-5);
     padding: var(--space-3) var(--space-6);
-    border-bottom: 1px solid var(--glass-line);
   }
   .stat {
     display: flex;
@@ -398,10 +394,6 @@
   }
   .section {
     padding: var(--space-5) var(--space-6);
-    border-bottom: 1px solid var(--glass-line);
-  }
-  .section:last-child {
-    border-bottom: 0;
   }
   .section-head {
     display: flex;
@@ -445,9 +437,9 @@
   .chip {
     position: relative;
     max-width: 11rem;
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: var(--radius);
-    background: transparent;
+    background: var(--glass);
     color: var(--fg);
     padding: var(--space-2) var(--space-3);
     overflow: hidden;
@@ -460,7 +452,7 @@
       border-color var(--dur-fast) var(--ease-out);
   }
   .chip:hover {
-    background: var(--bg-hover);
+    background: var(--glass-strong);
   }
   .chip.selected {
     border-color: var(--accent);
@@ -482,12 +474,11 @@
   }
 
   /* Heatmap grid — same well chrome as CorrelationDrawer so the two
-   * surfaces read identically (sticky headers, rotated col labels,
-   * hairline glass borders, opaque sticky cells). */
+   * surfaces read identically (sticky headers with --shadow-sticky,
+   * rotated col labels, opaque sticky cells). */
   .grid-scroll {
     overflow: auto;
     max-height: 32rem;
-    border: 1px solid var(--glass-line);
     border-radius: var(--radius);
     background: var(--bg);
   }
@@ -507,7 +498,7 @@
     position: sticky;
     top: 0;
     z-index: 2;
-    border-bottom: 1px solid var(--glass-line);
+    box-shadow: var(--shadow-sticky);
   }
   .grid .row-label {
     position: sticky;
@@ -517,7 +508,7 @@
     padding: 0 var(--space-3) 0 var(--space-2);
     color: var(--fg-dim);
     font-size: var(--text-xs);
-    border-right: 1px solid var(--glass-line);
+    box-shadow: 2px 0 8px rgba(0, 0, 0, 0.45);
     white-space: nowrap;
   }
   .grid .corner {
@@ -529,8 +520,7 @@
     font-size: var(--text-xs);
     text-align: left;
     padding: var(--space-1) var(--space-3);
-    border-right: 1px solid var(--glass-line);
-    border-bottom: 1px solid var(--glass-line);
+    box-shadow: var(--shadow-sticky), 2px 0 8px rgba(0, 0, 0, 0.45);
   }
   .grid .col-label {
     color: var(--fg-dim);
@@ -568,11 +558,7 @@
     gap: var(--space-4);
     align-items: center;
     padding: var(--space-2) var(--space-3);
-    border-bottom: 1px solid var(--glass-line);
     font-size: var(--text-xs);
-  }
-  .alt-row:last-child {
-    border-bottom: 0;
   }
   .alt-id {
     color: var(--fg-muted);
@@ -588,7 +574,6 @@
   }
 
   .drawer-footer {
-    border-top: 1px solid var(--glass-line);
     padding: var(--space-3) var(--space-6);
     color: var(--fg-muted);
     font-size: var(--text-xs);

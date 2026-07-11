@@ -112,7 +112,6 @@
     justify-content: space-between;
     gap: var(--space-6);
     padding: var(--space-5) var(--space-6);
-    border-bottom: 1px solid var(--glass-line);
     background: var(--surface);
   }
   .title {
@@ -126,9 +125,9 @@
     color: var(--fg-muted);
   }
   .close {
-    background: transparent;
+    background: var(--glass);
     color: var(--fg-muted);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: 50%;
     width: 26px;
     height: 26px;
@@ -142,13 +141,11 @@
     flex: none;
     transition:
       color var(--dur-fast) var(--ease-out),
-      background var(--dur-fast) var(--ease-out),
-      border-color var(--dur-fast) var(--ease-out);
+      background var(--dur-fast) var(--ease-out);
   }
   .close:hover {
     color: var(--fg);
-    background: var(--bg-hover);
-    border-color: var(--fg-muted);
+    background: var(--glass-strong);
   }
   .body {
     display: grid;
@@ -157,9 +154,9 @@
     overflow: auto;
   }
   .panel {
-    border: 1px solid var(--border);
     border-radius: var(--radius);
-    background: var(--surface);
+    background: var(--glass);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
     padding: var(--space-6);
   }
   h3 {
@@ -170,9 +167,9 @@
   }
   textarea {
     width: 100%;
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: var(--radius);
-    background: var(--bg-deep);
+    background: var(--input-well);
     color: var(--fg);
     padding: var(--space-4);
     font-family: var(--font-mono);
@@ -199,7 +196,6 @@
   .mode-row {
     display: flex;
     gap: var(--space-1);
-    border: 1px solid var(--border);
     border-radius: var(--radius);
     padding: var(--space-1);
     margin-bottom: var(--space-3);

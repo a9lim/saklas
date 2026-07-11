@@ -134,7 +134,7 @@
     padding: var(--space-3) var(--space-4);
     margin: var(--space-4) var(--space-4) 0;
     border-radius: var(--radius);
-    border: 1px solid var(--glass-line);
+    border: 1px solid transparent;
     background: linear-gradient(
       100deg,
       var(--glass),

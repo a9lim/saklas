@@ -846,7 +846,6 @@
     align-items: center;
     justify-content: space-between;
     padding: var(--space-5) var(--space-6);
-    border-bottom: 1px solid var(--glass-line);
   }
   /* Family accent drives the header title colour (and every accented rule
    * below via ``--family-accent``) — white subspace vs purple manifold. */
@@ -857,9 +856,9 @@
     font-weight: var(--weight-medium);
   }
   .close {
-    background: transparent;
+    background: var(--glass);
     color: var(--fg-muted);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: 50%;
     width: 26px;
     height: 26px;
@@ -873,13 +872,11 @@
     flex: none;
     transition:
       color var(--dur-fast) var(--ease-out),
-      background var(--dur-fast) var(--ease-out),
-      border-color var(--dur-fast) var(--ease-out);
+      background var(--dur-fast) var(--ease-out);
   }
   .close:hover {
     color: var(--fg);
-    background: var(--bg-hover);
-    border-color: var(--fg-muted);
+    background: var(--glass-strong);
   }
   .body {
     flex: 1 1 auto;
@@ -983,7 +980,6 @@
     text-align: left;
     background: transparent;
     border: 0;
-    border-bottom: 1px solid var(--border);
     padding: var(--space-3) var(--space-1) var(--space-2);
     color: var(--fg-muted);
     cursor: pointer;
@@ -1025,13 +1021,13 @@
     flex-direction: column;
     gap: var(--space-2);
     background: var(--bg-deep);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: var(--radius);
     padding: var(--space-3) var(--space-4);
-    transition: border-color var(--dur) var(--ease-out);
+    transition: background var(--dur) var(--ease-out);
   }
   .row:hover {
-    border-color: var(--family-accent);
+    background: color-mix(in srgb, var(--family-accent) 8%, var(--bg-deep));
   }
   .row-line {
     display: grid;
@@ -1047,13 +1043,12 @@
     text-transform: uppercase;
     font-size: var(--text-2xs);
     letter-spacing: 0.04em;
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     color: var(--family-accent);
-    background: color-mix(in srgb, var(--family-accent) 12%, transparent);
+    background: color-mix(in srgb, var(--family-accent) 16%, transparent);
   }
   .inspect-body {
     padding-top: var(--space-2);
-    border-top: 1px solid var(--border);
   }
   .inspect-body .error {
     color: var(--accent-error);
@@ -1066,7 +1061,7 @@
   }
   .act.inspect:hover:not(:disabled) {
     color: var(--family-accent);
-    border-color: var(--family-accent);
+    background: color-mix(in srgb, var(--family-accent) 12%, var(--glass));
   }
   .meta {
     display: flex;
@@ -1096,9 +1091,9 @@
     gap: var(--space-2);
   }
   .act {
-    background: transparent;
+    background: var(--glass);
     color: var(--fg-dim);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: var(--radius);
     padding: var(--space-2) var(--space-3);
     font: inherit;
@@ -1107,12 +1102,11 @@
     cursor: pointer;
     transition:
       background var(--dur) var(--ease-out),
-      border-color var(--dur) var(--ease-out),
       color var(--dur) var(--ease-out);
   }
   .act:hover:not(:disabled) {
     color: var(--fg-strong);
-    border-color: var(--fg-muted);
+    background: var(--glass-strong);
   }
   .act:disabled {
     opacity: 0.45;
@@ -1128,19 +1122,17 @@
   }
   .act.steer:hover:not(:disabled),
   .act.probe:hover:not(:disabled) {
-    background: color-mix(in srgb, var(--family-accent) 12%, transparent);
-    border-color: var(--family-accent);
+    background: color-mix(in srgb, var(--family-accent) 12%, var(--glass));
   }
   .act.fit {
     color: var(--family-accent);
   }
   .act.fit:hover:not(:disabled) {
-    background: color-mix(in srgb, var(--family-accent) 12%, transparent);
-    border-color: var(--family-accent);
+    background: color-mix(in srgb, var(--family-accent) 12%, var(--glass));
   }
   .act.del:hover:not(:disabled) {
     color: var(--accent-red);
-    border-color: var(--accent-red);
+    background: color-mix(in srgb, var(--accent-red) 12%, var(--glass));
   }
   .act.del.confirm {
     color: var(--accent-red);
@@ -1151,7 +1143,6 @@
   /* Custom-attach disclosure — collapsed by default so it doesn't compete
    * with the catalog rows. */
   .custom-attach {
-    border: 1px solid var(--border);
     border-radius: var(--radius);
     background: var(--bg-deep);
   }
@@ -1173,7 +1164,6 @@
     flex-direction: column;
     gap: var(--space-2);
     padding: var(--space-3) var(--space-4) var(--space-4);
-    border-top: 1px solid var(--border);
   }
   .attach-form .row-label {
     display: flex;
@@ -1192,9 +1182,9 @@
   .text-input {
     flex: 1 1 0;
     min-width: 0;
-    background: var(--bg-deep);
+    background: var(--input-well);
     color: var(--fg);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: var(--radius);
     padding: var(--space-2) var(--space-3);
     font: inherit;
@@ -1225,9 +1215,9 @@
   .search {
     flex: 1 1 auto;
     min-width: 0;
-    background: var(--bg-deep);
+    background: var(--input-well);
     color: var(--fg);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: var(--radius);
     padding: var(--space-3) var(--space-4);
     font-family: var(--font-mono);
@@ -1240,8 +1230,8 @@
   }
   .refresh {
     flex: 0 0 auto;
-    background: transparent;
-    border: 1px solid var(--border);
+    background: var(--glass);
+    border: 1px solid transparent;
     color: var(--fg-dim);
     padding: 0 var(--space-4);
     border-radius: var(--radius);
@@ -1250,10 +1240,10 @@
     cursor: pointer;
     transition:
       color var(--dur) var(--ease-out),
-      border-color var(--dur) var(--ease-out);
+      background var(--dur) var(--ease-out);
   }
   .refresh:hover:not(:disabled) {
-    border-color: var(--fg-muted);
+    background: var(--glass-strong);
     color: var(--fg);
   }
   .refresh:disabled {
@@ -1264,7 +1254,6 @@
   /* ---- per-row node list ---- */
   .nodes-block {
     padding-top: var(--space-2);
-    border-top: 1px solid var(--border);
   }
   .nodes-toggle {
     display: inline-flex;
@@ -1306,9 +1295,9 @@
     display: inline-flex;
     align-items: center;
     gap: var(--space-2);
-    background: var(--bg-alt);
+    background: var(--glass);
     color: var(--fg);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: var(--radius);
     padding: var(--space-1) var(--space-3);
     font: inherit;
@@ -1317,13 +1306,11 @@
     cursor: pointer;
     transition:
       background var(--dur) var(--ease-out),
-      border-color var(--dur) var(--ease-out),
       color var(--dur) var(--ease-out);
   }
   .node-chip:hover:not(:disabled) {
     color: var(--family-accent);
-    border-color: var(--family-accent);
-    background: color-mix(in srgb, var(--family-accent) 12%, transparent);
+    background: color-mix(in srgb, var(--family-accent) 16%, var(--glass));
   }
   .node-chip:disabled {
     opacity: 0.5;

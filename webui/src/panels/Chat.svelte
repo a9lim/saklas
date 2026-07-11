@@ -71,6 +71,7 @@
     highlightScale,
   } from "../lib/stores.svelte";
   import type { AutoRegenMode } from "../lib/stores.svelte";
+  import { togglePalette } from "../lib/stores/palette.svelte";
   import type { ChatTurn, TokenScore } from "../lib/types";
   import {
     scoreToRgb,
@@ -989,6 +990,16 @@
          load moved up to the threads-column header (they act on the
          whole tree, not on the active chat path). -->
     <div class="header-actions">
+      <!-- The workspace rail is gone — the palette is the tool launcher,
+           and this chip is its one persistent visible hint. -->
+      <button
+        type="button"
+        class="hbtn kbd-hint"
+        onclick={togglePalette}
+        title="Command palette — every tool lives here"
+      >
+        ⌘K
+      </button>
       <button type="button" class="hbtn" onclick={openTranscript}>
         transcript
       </button>
@@ -1289,7 +1300,6 @@
     gap: var(--space-4);
     flex-wrap: wrap;
     padding-bottom: var(--space-2);
-    border-bottom: 1px solid var(--border);
     color: var(--fg-dim);
     font-size: var(--text-sm);
   }
@@ -1318,7 +1328,7 @@
   .mode-badge {
     background: var(--accent-subtle);
     color: var(--accent);
-    border: 1px solid var(--border);
+    border: 0;
     border-radius: var(--radius);
     padding: var(--space-1) var(--space-3);
     font: inherit;
@@ -1345,9 +1355,10 @@
     flex-wrap: wrap;
     margin-left: auto;
   }
+  /* Borderless workhorse — glass fill is the shape, hover lifts it. */
   .hbtn {
-    background: transparent;
-    border: 1px solid var(--border);
+    background: var(--glass);
+    border: 0;
     border-radius: var(--radius);
     color: var(--fg-dim);
     padding: var(--space-1) var(--space-4);
@@ -1357,23 +1368,26 @@
     cursor: pointer;
     transition:
       background var(--dur) var(--ease-out),
-      border-color var(--dur) var(--ease-out),
       color var(--dur) var(--ease-out);
   }
   .hbtn:hover:not(:disabled) {
-    background: var(--bg-elev);
-    border-color: var(--accent);
+    background: var(--glass-strong);
     color: var(--accent);
   }
   .hbtn:disabled {
     color: var(--fg-muted);
-    border-color: var(--border);
     cursor: not-allowed;
   }
+  /* The palette hint reads as a key, not a word — slightly tighter. */
+  .kbd-hint {
+    font-size: var(--text-xs);
+    letter-spacing: 0.06em;
+    padding: var(--space-1) var(--space-3);
+  }
   .ctl-input {
-    background: var(--bg-deep);
+    background: var(--input-well);
     color: var(--fg);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: var(--radius);
     padding: var(--space-1) var(--space-3);
     font: inherit;
@@ -1420,7 +1434,6 @@
     gap: var(--space-2);
     padding: var(--space-2) var(--space-3);
     background: rgba(167, 139, 250, 0.10);
-    border: 1px solid var(--border);
     border-radius: var(--radius);
     color: var(--accent-purple);
     font-size: var(--text-xs);
@@ -1435,9 +1448,10 @@
     flex: 1 1 auto;
   }
   .pin-unpin {
-    background: transparent;
+    background: var(--glass);
     color: var(--fg-dim);
-    border: 1px solid var(--border);
+    border: 0;
+    border-radius: var(--radius-sm);
     padding: var(--space-1) var(--space-2);
     font: inherit;
     font-family: var(--font-mono);
@@ -1446,14 +1460,16 @@
   }
   .pin-unpin:hover {
     color: var(--accent-red);
-    border-color: var(--accent-red);
+    background: color-mix(in srgb, var(--accent-red) 12%, transparent);
   }
   /* The cast model: every speaker wears ONE neutral glass card — role
    * identity lives in the chip, provenance in the ppl badge, and hue
-   * stays reserved for spaces and states.  The A/B shadow column keeps a
-   * violet-tinted hairline (comparison is a manifold-family read). */
+   * stays reserved for spaces and states.  Borderless: the glass fill +
+   * top-light are the card; the border slot exists only so the A/B
+   * shadow column can wear its violet-tinted hairline (a comparison
+   * marker — state, not chrome). */
   .msg {
-    border: 1px solid var(--glass-line);
+    border: 1px solid transparent;
     border-radius: var(--radius-lg);
     background: var(--glass);
     box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
@@ -1465,7 +1481,7 @@
     word-break: break-word;
   }
   .msg.shadow {
-    border-color: color-mix(in srgb, var(--accent-purple) 26%, var(--glass-line));
+    border-color: color-mix(in srgb, var(--accent-purple) 26%, transparent);
   }
 
   .who {
@@ -1485,7 +1501,6 @@
     color: var(--fg-dim);
     padding: 2px 9px 2px 3px;
     border-radius: var(--radius-pill);
-    border: 1px solid var(--glass-line);
     background: var(--glass-strong);
     max-width: 40%;
     overflow: hidden;
@@ -1551,10 +1566,9 @@
   }
 
   /* Thinking-collapsible block — visible-only header when collapsed,
-   * with the body indented when expanded. */
+   * with the body indented when expanded.  Borderless: the caret + the
+   * italic dim body delimit it; no rules. */
   .thinking-block {
-    border-top: 1px solid var(--border);
-    border-bottom: 1px solid var(--border);
     margin-bottom: var(--space-1);
   }
   .thinking-toggle {
@@ -1630,7 +1644,7 @@
     width: 9em;
     background: var(--glass-strong);
     color: var(--fg-dim);
-    border: 1px solid var(--glass-line);
+    border: 1px solid transparent;
     border-radius: var(--radius-pill);
     font-family: var(--font-mono);
     font-size: var(--text-xs);
@@ -1659,9 +1673,11 @@
   }
   .input {
     flex: 1 1 auto;
-    background: var(--bg-alt);
+    /* Borderless input: recessed well fill; the accent ring on focus. */
+    background: var(--input-well);
     color: var(--fg);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
+    border-radius: var(--radius);
     padding: var(--space-2) var(--space-4);
     font: inherit;
     font-family: var(--font-mono);
@@ -1696,21 +1712,21 @@
     align-items: center;
   }
   .input-actions button {
-    background: var(--bg-alt);
+    background: var(--glass);
     color: var(--fg-strong);
-    border: 1px solid var(--border);
+    border: 0;
+    border-radius: var(--radius);
     padding: var(--space-2) var(--space-5);
     cursor: pointer;
     font: inherit;
     font-family: var(--font-mono);
+    transition: background var(--dur-fast) var(--ease-out);
   }
   .input-actions button:hover:not(:disabled) {
-    background: var(--bg-elev);
-    border-color: var(--fg-muted);
+    background: var(--glass-strong);
   }
   .input-actions button:disabled {
     color: var(--fg-muted);
-    border-color: var(--border);
     cursor: not-allowed;
   }
   .input-actions .send {

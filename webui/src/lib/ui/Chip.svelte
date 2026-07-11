@@ -69,15 +69,16 @@
     padding: 3px 9px;
     border-radius: var(--radius-sm);
     color: var(--chip-c);
+    /* Borderless: the hue wash IS the chip — a touch deeper than the old
+     * outlined version so the shape holds without its hairline. */
     background: linear-gradient(
       120deg,
-      color-mix(in srgb, var(--chip-c) 16%, transparent),
-      color-mix(in srgb, var(--chip-c) 8%, transparent)
+      color-mix(in srgb, var(--chip-c) 20%, transparent),
+      color-mix(in srgb, var(--chip-c) 10%, transparent)
     );
-    border: 1px solid color-mix(in srgb, var(--chip-c) 30%, transparent);
+    border: 1px solid transparent;
     white-space: nowrap;
     transition:
-      border-color var(--dur-fast) var(--ease-out),
       background var(--dur-fast) var(--ease-out),
       opacity var(--dur-fast) var(--ease-out);
   }
@@ -88,7 +89,11 @@
     cursor: pointer;
   }
   .sk-chip.clickable:hover {
-    border-color: color-mix(in srgb, var(--chip-c) 55%, transparent);
+    background: linear-gradient(
+      120deg,
+      color-mix(in srgb, var(--chip-c) 28%, transparent),
+      color-mix(in srgb, var(--chip-c) 14%, transparent)
+    );
   }
   .sk-chip:focus-visible {
     outline: 2px solid color-mix(in srgb, var(--chip-c) 45%, transparent);

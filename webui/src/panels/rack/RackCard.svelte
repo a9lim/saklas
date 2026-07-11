@@ -56,26 +56,30 @@
 
 <style>
   /* The dense variant of the v2 glass material (lib/ui/GlassCard is the
-   * roomy one) — translucent fill lit from above, accent-tinted hairline.
-   * No backdrop blur: rack cards sit on the opaque panel, so blur would
-   * cost compositing for nothing. */
+   * roomy one) — translucent fill lit from above. Borderless: the fill +
+   * top-light carry the card, the family accent lives in the glyph/text,
+   * and the border slot exists only for the active ring (state, not
+   * chrome). Hover lifts the fill instead of drawing a line. No backdrop
+   * blur: rack cards sit on the opaque panel, so blur would cost
+   * compositing for nothing. */
   .card {
     display: flex;
     flex-direction: column;
     gap: var(--space-2);
     padding: var(--space-3) var(--space-4);
-    border: 1px solid color-mix(in srgb, var(--card-accent) 14%, var(--glass-line));
+    border: 1px solid transparent;
     border-radius: var(--radius-lg);
     background: var(--glass);
     box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
     font-size: var(--text-sm);
     transition:
       border-color var(--dur) var(--ease-out),
+      background var(--dur) var(--ease-out),
       box-shadow var(--dur) var(--ease-out),
       opacity var(--dur) var(--ease-out);
   }
   .card:hover {
-    border-color: color-mix(in srgb, var(--card-accent) 26%, var(--glass-line));
+    background: var(--glass-strong);
   }
   .card.active {
     border-color: color-mix(in srgb, var(--card-accent) 40%, transparent);

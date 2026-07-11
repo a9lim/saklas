@@ -158,7 +158,6 @@
     justify-content: space-between;
     gap: var(--space-5);
     padding: var(--space-5) var(--space-6);
-    border-bottom: 1px solid var(--glass-line);
   }
   .title {
     display: flex;
@@ -189,9 +188,9 @@
     line-height: 1.5;
   }
   .close {
-    background: transparent;
+    background: var(--glass);
     color: var(--fg-muted);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: 50%;
     width: 26px;
     height: 26px;
@@ -205,13 +204,11 @@
     flex: none;
     transition:
       color var(--dur-fast) var(--ease-out),
-      background var(--dur-fast) var(--ease-out),
-      border-color var(--dur-fast) var(--ease-out);
+      background var(--dur-fast) var(--ease-out);
   }
   .close:hover {
     color: var(--fg);
-    background: var(--bg-hover);
-    border-color: var(--fg-muted);
+    background: var(--glass-strong);
   }
   .body {
     display: grid;
@@ -221,7 +218,6 @@
   }
   /* Data wells — recessed stat/summary containers. */
   .hero, .tile, .panel {
-    border: 1px solid var(--glass-line);
     border-radius: var(--radius);
     background: var(--bg);
     padding: var(--space-6);
@@ -272,7 +268,7 @@
     gap: var(--space-3);
   }
   .checks div {
-    border: 1px solid var(--glass-line);
+    border: 1px solid transparent;
     border-radius: var(--radius);
     padding: var(--space-4);
     color: var(--fg-muted);
@@ -298,7 +294,6 @@
   .good { color: var(--accent-green); margin: 0; line-height: 1.5; }
   .error {
     color: var(--accent-error);
-    border: 1px solid color-mix(in srgb, var(--accent-red) 35%, transparent);
     background: color-mix(in srgb, var(--accent-red) 8%, transparent);
     border-radius: var(--radius);
     padding: var(--space-5);

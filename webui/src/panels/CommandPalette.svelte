@@ -194,7 +194,6 @@
     align-items: center;
     gap: var(--space-4);
     padding: var(--space-5) var(--space-6);
-    border-bottom: 1px solid var(--border);
   }
   .glass-icon {
     width: 15px;

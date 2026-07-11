@@ -154,8 +154,9 @@
 <style>
   /* A flat section of the inspector panel — no border box, no own
    * background; it reads as the lower half of one flat panel, divided
-   * from the steering section above by that section's border-bottom.
-   * Fixed chrome + one scrollable middle, matching SteeringRack. */
+   * from the steering section above by typography + padding alone
+   * (borderless — see SteeringRack). Fixed chrome + one scrollable
+   * middle, matching SteeringRack. */
   .rack {
     display: flex;
     flex-direction: column;
@@ -172,7 +173,6 @@
     display: flex;
     align-items: baseline;
     justify-content: space-between;
-    border-bottom: 1px solid var(--border);
     padding-bottom: var(--space-3);
   }
   .header-text {
@@ -196,23 +196,25 @@
     flex: 0 0 auto;
   }
   /* Live toggle — same chrome as the J-LENS PROBE section's, so the two
-   * tabs' headers read as siblings. */
+   * tabs' headers read as siblings.  Borderless: a glass fill floats the
+   * control, and "on" lifts to an accent-tinted fill (mirrors
+   * SegmentedTabs' active-tab treatment) rather than a border ring. */
   .toggle {
     font-size: var(--text-sm);
     color: var(--fg-muted);
-    background: transparent;
-    border: 1px solid var(--border);
+    background: var(--glass);
+    border: 1px solid transparent;
     border-radius: 3px;
     padding: 1px var(--space-3);
     cursor: pointer;
   }
   .toggle:hover:not(:disabled) {
     color: var(--fg);
-    border-color: var(--fg-muted);
+    background: var(--glass-strong);
   }
   .toggle.on {
     color: var(--accent);
-    border-color: var(--accent);
+    background: var(--accent-subtle);
   }
   .toggle:disabled {
     opacity: 0.5;
@@ -269,19 +271,18 @@
     max-width: 32ch;
   }
 
-  /* Anchored at the bottom — same border-top + padding as SteeringRack
-   * so the two racks read as visual siblings.  Shown in both empty and
-   * populated states. */
+  /* Anchored at the bottom — same padding as SteeringRack so the two
+   * racks read as visual siblings.  Shown in both empty and populated
+   * states. */
   .actions {
     flex: 0 0 auto;
     display: flex;
     gap: var(--space-2);
-    border-top: 1px solid var(--border);
     padding-top: var(--space-3);
   }
   .add {
     flex: 1 1 0;
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     padding: 2px var(--space-5);
     border-radius: var(--radius);
     font-size: var(--text-sm);

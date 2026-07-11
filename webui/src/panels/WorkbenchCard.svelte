@@ -22,7 +22,7 @@
   .workbench {
     /* margin-top:auto pins the card to the column floor even when the
      * tree above it is short (empty / error states don't flex-grow).
-     * Flat — border-top is the separator, no own fill.  Model id and
+     * Borderless — the gap above carries the separation.  Model id and
      * device/dtype sit on one baseline row (model left, device right)
      * rather than stacked. */
     margin-top: auto;
@@ -33,7 +33,6 @@
     justify-content: space-between;
     gap: var(--space-4);
     padding: var(--space-3) var(--space-4);
-    border-top: 1px solid var(--border);
   }
 
   .sub {
@@ -42,7 +41,7 @@
     padding: 1px 7px;
     border-radius: var(--radius-pill);
     background: var(--glass-strong);
-    border: 1px solid var(--glass-line);
+    border: 1px solid transparent;
     color: var(--fg-muted);
     font-family: var(--font-mono);
     font-size: var(--text-2xs);

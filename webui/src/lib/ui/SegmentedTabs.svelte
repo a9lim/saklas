@@ -90,12 +90,11 @@
     cursor: not-allowed;
   }
 
-  /* Active: lifted onto glass, lit from above, hairline tinted toward
-   * the item hue. Subspace (white) reads via ring alone — by design. */
+  /* Active: lifted onto glass tinted toward the item hue, lit from above
+   * — borderless; the fill wash carries the selection, the dot the hue. */
   .tab.on {
     color: var(--fg);
-    background: var(--glass);
-    border-color: color-mix(in srgb, var(--tab-c) 30%, var(--glass-line));
+    background: color-mix(in srgb, var(--tab-c) 9%, var(--glass));
     box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
   }
 

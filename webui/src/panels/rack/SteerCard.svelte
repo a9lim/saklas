@@ -276,7 +276,8 @@
     flex: 0 0 auto;
     color: var(--accent-yellow);
     font-size: var(--text-2xs);
-    border: 1px solid var(--accent-yellow);
+    background: color-mix(in srgb, var(--accent-yellow) 15%, transparent);
+    border: 1px solid transparent;
     border-radius: var(--radius);
     padding: 0 var(--space-2);
   }
@@ -287,21 +288,19 @@
   }
 
   .trigger-pill {
-    background: transparent;
+    background: var(--glass);
     color: var(--fg-strong);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     padding: var(--space-1) var(--space-3);
     border-radius: var(--radius);
     font-size: var(--text-xs);
     line-height: 1.2;
     flex: 0 0 auto;
     cursor: pointer;
-    transition: background var(--dur) var(--ease-out),
-      border-color var(--dur) var(--ease-out);
+    transition: background var(--dur) var(--ease-out);
   }
   .trigger-pill:hover {
-    background: var(--bg-elev);
-    border-color: var(--fg-muted);
+    background: var(--glass-strong);
   }
 
   .icon {
