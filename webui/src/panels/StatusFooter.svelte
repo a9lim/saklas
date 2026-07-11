@@ -55,6 +55,12 @@
   // least started.  "Active" is the obvious signal, but a finished gen
   // with startedAt set should also keep its trailing stats visible.
   const hasRun = $derived(genStatus.startedAt !== null);
+  const finishLabel = $derived.by(() => {
+    if (!genStatus.finishReason || genStatus.finishReason === "stop") return null;
+    if (genStatus.finishReason === "length") return "token limit";
+    if (genStatus.finishReason === "cancelled") return "stopped";
+    return genStatus.finishReason;
+  });
 </script>
 
 <footer class="status-footer" aria-label="Generation status">
@@ -63,17 +69,21 @@
     <span class="text">idle</span>
   {:else}
     <span class="dot {genStatus.active ? 'live' : 'done'}" aria-hidden="true">●</span>
-    <span class="text">gen {genStatus.tokensSoFar}/{genStatus.maxTokens || "?"}</span>
-    <span class="sep" aria-hidden="true">·</span>
-    <span class="bar-wrap" aria-label="progress">
-      <Bar
-        value={genStatus.tokensSoFar}
-        max={genStatus.maxTokens || Math.max(genStatus.tokensSoFar, 1)}
-        width={120}
-        height={6}
-        color={genStatus.active ? "var(--accent-green)" : "var(--fg-muted)"}
-      />
-    </span>
+    {#if genStatus.active}
+      <span class="text">gen {genStatus.tokensSoFar}/{genStatus.maxTokens || "?"}</span>
+      <span class="sep" aria-hidden="true">·</span>
+      <span class="bar-wrap" aria-label="progress">
+        <Bar
+          value={genStatus.tokensSoFar}
+          max={genStatus.maxTokens || Math.max(genStatus.tokensSoFar, 1)}
+          width={120}
+          height={6}
+          color="var(--accent-green)"
+        />
+      </span>
+    {:else}
+      <span class="text done-label">done · {genStatus.tokensSoFar} tokens</span>
+    {/if}
     <span class="sep" aria-hidden="true">·</span>
     <span class="text">{tokPerSec.toFixed(1)} t/s</span>
     <span class="sep" aria-hidden="true">·</span>
@@ -82,9 +92,9 @@
       <span class="sep" aria-hidden="true">·</span>
       <span class="text">ppl {ppl.toFixed(2)}</span>
     {/if}
-    {#if !genStatus.active && genStatus.finishReason}
+    {#if !genStatus.active && finishLabel}
       <span class="sep" aria-hidden="true">·</span>
-      <span class="text muted">{genStatus.finishReason}</span>
+      <span class="text muted">{finishLabel}</span>
     {/if}
   {/if}
 
@@ -142,6 +152,9 @@
   }
   .text.muted {
     color: var(--fg-muted);
+  }
+  .done-label {
+    color: var(--fg-strong);
   }
   .bar-wrap {
     display: inline-flex;

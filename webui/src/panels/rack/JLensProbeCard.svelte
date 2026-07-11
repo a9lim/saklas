@@ -22,6 +22,7 @@
   import { detachProbe } from "../../lib/stores.svelte";
   import { pushToast } from "../../lib/stores/toasts.svelte";
   import RackCard from "./RackCard.svelte";
+  import ProbePinButton from "./ProbePinButton.svelte";
 
   interface Props {
     name: string;
@@ -92,15 +93,14 @@
 
 <RackCard accent="--accent-blue" disabled={false}>
   {#snippet statline()}
-    <button
-      type="button"
-      class="pin-glyph"
+    <ProbePinButton
+      shape="square"
+      pinned={true}
       disabled={unpinBusy}
       onclick={() => void onUnpin()}
       title="Pinned (click to unpin)"
-      aria-label="Unpin probe {name}"
-      aria-pressed="true"
-    >■</button>
+      ariaLabel={`Unpin probe ${name}`}
+    />
 
     <span class="name" title="probe {name} — readout strength over the workspace band">
       {word}
@@ -158,26 +158,6 @@
 
 <style>
   /* ----- statline (mirrors JLensTokenCard) ----- */
-  .pin-glyph {
-    background: transparent;
-    border: 0;
-    padding: 0 var(--space-1);
-    color: var(--card-accent);
-    font-size: var(--text);
-    line-height: 1;
-    flex: 0 0 auto;
-    cursor: pointer;
-    transition: color var(--dur-fast) var(--ease-out);
-  }
-  /* Unpin is a detach — keep the red destructive-action hover (mirrors
-     the CAA card's ✕), just add the dur-fast transition. */
-  .pin-glyph:hover:not(:disabled) {
-    color: var(--accent-red);
-  }
-  .pin-glyph:disabled {
-    cursor: default;
-    opacity: 0.5;
-  }
   .name {
     color: var(--fg-strong);
     font-family: var(--font-mono);

@@ -99,7 +99,7 @@
     border-color: var(--accent-glow);
   }
   .sk-radio:focus-visible {
-    outline: 2px solid var(--accent-glow);
+    outline: 2px solid var(--focus-ring);
     outline-offset: 2px;
   }
   .sk-radio.is-selected {

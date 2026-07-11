@@ -67,7 +67,7 @@
   --fg-strong: #d3d7e4;     /* slightly recessed body */
   --fg-dim: #a3a8bd;        /* secondary */
   --fg-subtle: #8a90a6;     /* tertiary */
-  --fg-muted: #6b7088;      /* labels, hints, disabled */
+  --fg-muted: #858ba3;      /* labels/hints: >=4.9:1 on elevated cards */
   --text-on-accent: #07080e;/* dark canvas — sits on white --accent */
 
   /* ---- The one border --------------------------------------------- */
@@ -112,6 +112,7 @@
   --accent-yellow: #c2a44f;  /* demoted: warn chips */
   --accent-subtle: rgba(237, 239, 247, 0.08);  /* accent fill wash */
   --accent-glow: rgba(237, 239, 247, 0.18);    /* focus ring + accent hover */
+  --focus-ring: #a3a8bd;                       /* visible keyboard focus */
 
   --live: var(--accent-green);
   --glow-live: 0 0 12px rgba(52, 211, 153, 0.4);
@@ -138,10 +139,10 @@
   --shadow-sticky: 0 2px 8px rgba(0, 0, 0, 0.45);
 
   /* ---- Type scale — px, base 13.5px --------------------------------- */
-  --text-2xs: 9.5px;        /* layer ticks, micro-labels */
-  --text-xs: 10.5px;        /* fine print, tracked-caps eyebrows */
-  --text-sm: 11.5px;        /* secondary labels, hints, chips */
-  --text: 13.5px;           /* base — body, controls */
+  --text-2xs: 10px;         /* layer ticks, micro-labels */
+  --text-xs: 11px;          /* fine print, tracked-caps eyebrows */
+  --text-sm: 12px;          /* secondary labels, hints, chips */
+  --text: 14px;             /* base — body, controls */
   --text-md: 15px;          /* emphasised rows, section titles */
   --text-lg: 18px;          /* drawer / panel headings */
   --text-xl: 24px;          /* big numbers, boot heading */

@@ -3282,7 +3282,11 @@ class SaklasSession:
             raise ValueError(
                 f"SAE encoder returned {acts.numel()} features; expected {width}"
             )
-        return acts
+        # SAE reads are diagnostics, probes, and steering metadata; none is a
+        # training surface.  Some third-party backends return grad-tracked
+        # activations even during an otherwise inference-only session, which
+        # retains an unnecessary graph and warns when probe values are scalarized.
+        return acts.detach()
 
     def _score_sae_probes(
         self, hidden: dict[int, torch.Tensor] | None = None,

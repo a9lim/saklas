@@ -22,6 +22,7 @@
 
   import SaeProbeCard from "./rack/SaeProbeCard.svelte";
   import SaeSteerCard from "./rack/SaeSteerCard.svelte";
+  import RackSectionHeader from "./rack/RackSectionHeader.svelte";
   import { apiSae } from "../lib/api";
   import {
     activeProbeNames,
@@ -30,12 +31,15 @@
     loadSae,
     probeRack,
     saeState,
+    seedProbeDisplay,
     sessionState,
     setLiveSae,
+    setSaeSortMode,
     steerRack,
   } from "../lib/stores.svelte";
   import { pushToast } from "../lib/stores/toasts.svelte";
   import type { SaeSteerEntry } from "../lib/types";
+  import type { SaeSortMode } from "../lib/stores.svelte";
 
   const loaded = $derived(sessionState.info?.sae_loaded === true);
   const info = $derived(sessionState.info?.sae_info ?? null);
@@ -63,12 +67,12 @@
   });
 
   // ---------- PROBE: pinned probe cards + unpinned discovery cards ----------
-  const pinned = $derived.by(() => activeProbeNames()
+  const pinnedBase = $derived.by(() => activeProbeNames()
     .filter((name) => name.startsWith("sae/"))
     .map((name) => ({ name, entry: probeRack.entries.get(name) }))
     .filter((row) => row.entry !== undefined));
 
-  const discovery = $derived.by(() => saeState.readout
+  const discoveryBase = $derived.by(() => saeState.readout
     .filter((row) => !probeRack.active.includes(`sae/${row.id}`))
     .map((row) => {
       // Metadata merges from the row's server-cached values and the
@@ -87,17 +91,70 @@
    *  the absolute 0..1 strength scale instead. */
   const fallbackScale = $derived.by(() => {
     let max = 0;
-    for (const row of pinned) {
+    for (const row of pinnedBase) {
       const entry = row.entry!;
       if (entry.info.max_act != null) continue;
       const reading = entry.aggregate ?? entry.reading;
       max = Math.max(max, reading?.coords?.[0] ?? entry.current ?? 0);
     }
-    for (const feature of discovery) {
+    for (const feature of discoveryBase) {
       if (feature.max_act != null) continue;
       max = Math.max(max, feature.activation);
     }
     return Math.max(max, 1);
+  });
+
+  const SORT_OPTIONS: { value: SaeSortMode; label: string }[] = [
+    { value: "strength", label: "strength" },
+    { value: "name", label: "name" },
+  ];
+
+  function visibleStrength(value: number, maxAct: number | null): number {
+    return maxAct != null && maxAct > 0 ? value / maxAct : value / fallbackScale;
+  }
+
+  const pinned = $derived.by(() => {
+    const rows = [...pinnedBase];
+    if (saeState.sortMode === "name") {
+      rows.sort((a, b) => {
+        const aid = Number(a.name.slice(4));
+        const bid = Number(b.name.slice(4));
+        const an = a.entry?.info.label || String(aid);
+        const bn = b.entry?.info.label || String(bid);
+        return an.localeCompare(bn, undefined, { numeric: true });
+      });
+    } else {
+      rows.sort((a, b) => {
+        const ae = a.entry!;
+        const be = b.entry!;
+        const av = ae.aggregate?.coords?.[0] ?? ae.reading?.coords?.[0] ?? ae.current;
+        const bv = be.aggregate?.coords?.[0] ?? be.reading?.coords?.[0] ?? be.current;
+        // Pinned values with max_act are already normalized by the server.
+        const as = ae.info.max_act != null ? av : av / fallbackScale;
+        const bs = be.info.max_act != null ? bv : bv / fallbackScale;
+        return bs - as;
+      });
+    }
+    return rows;
+  });
+
+  const discovery = $derived.by(() => {
+    const rows = [...discoveryBase];
+    if (saeState.sortMode === "name") {
+      rows.sort((a, b) =>
+        (a.label || String(a.id)).localeCompare(
+          b.label || String(b.id),
+          undefined,
+          { numeric: true },
+        ),
+      );
+    } else {
+      rows.sort((a, b) =>
+        visibleStrength(b.activation, b.max_act ?? null) -
+        visibleStrength(a.activation, a.max_act ?? null),
+      );
+    }
+    return rows;
   });
 
   let steerInput = $state("");
@@ -136,7 +193,26 @@
     featureBusy = true;
     try {
       await apiSae.validateFeature(id);
-      await attachProbe(`sae/${id}`);
+      const live = discoveryBase.find((row) => row.id === id);
+      const meta = saeState.meta.get(id);
+      const preAttachMaxAct = live?.max_act ?? meta?.max_act ?? null;
+      const attached = await attachProbe(`sae/${id}`);
+      if (live) {
+        // Attachment may discover Neuronpedia metadata that the live row
+        // did not have yet. Seed in the unit the attached probe declares,
+        // not the stale pre-attach unit.
+        const maxAct = attached.max_act ?? preAttachMaxAct;
+        const value = maxAct != null && maxAct > 0
+          ? live.activation / maxAct
+          : live.activation;
+        const series = saeState.history.get(id) ?? [];
+        seedProbeDisplay(`sae/${id}`, {
+          current: value,
+          sparkline: maxAct != null && maxAct > 0
+            ? series.map((v) => v / maxAct)
+            : series,
+        });
+      }
     } catch (error) {
       pushToast(error instanceof Error ? error.message : String(error), { kind: "error" });
     } finally {
@@ -165,11 +241,7 @@
 <div class="sae" aria-label="Sparse-autoencoder inspector">
   {#if !loaded}
     <section class="section">
-      <header class="header">
-        <div class="header-text">
-          <span class="title">SAE</span>
-        </div>
-      </header>
+      <RackSectionHeader title="SAE" />
       <p class="hint">
         no resident SAE in this session — feature atoms, probes, and the
         live discovery readout all need one loaded SAELens release
@@ -210,12 +282,10 @@
 
     <!-- STEER — decoder-row atom cards in the shared steering expression. -->
     <section class="section steer">
-      <header class="header">
-        <div class="header-text">
-          <span class="title">STEER</span>
-        </div>
-        <span class="count">{steerCards.length} term{steerCards.length === 1 ? "" : "s"}</span>
-      </header>
+      <RackSectionHeader
+        title="STEER"
+        count={`${steerCards.length} term${steerCards.length === 1 ? "" : "s"}`}
+      />
 
       {#if steerCards.length > 0}
         <div class="cards steer-cards" role="list">
@@ -249,24 +319,20 @@
          card list owns the scroll; header + add form stay anchored (the
          other pillars' fixed-chrome / scrollable-middle shape). -->
     <section class="section probe">
-      <header class="header">
-        <div class="header-text">
-          <span class="title">PROBE</span>
-          <button
-            type="button"
-            class="toggle"
-            class:on={saeState.live}
-            disabled={saeState.busy}
-            onclick={() => void setLiveSae(!saeState.live)}
-            title={saeState.live
-              ? "Stop the per-step feature readout (pinned probes settle to the end-of-gen activation)"
-              : "Stream the SAE feature readout live during generation (pinned probes + discovery top-k)"}
-          >
-            {saeState.live ? "live: on" : "live: off"}
-          </button>
-          <span class="count">{pinned.length} pinned</span>
-        </div>
-      </header>
+      <RackSectionHeader
+        title="PROBE"
+        count={`${pinned.length} pinned`}
+        live={saeState.live}
+        liveBusy={saeState.busy}
+        liveTitle={saeState.live
+          ? "Stop the per-step feature readout (pinned probes settle to the end-of-gen activation)"
+          : "Stream the SAE feature readout live during generation (pinned probes + discovery top-k)"}
+        onLiveToggle={() => void setLiveSae(!saeState.live)}
+        sortValue={saeState.sortMode}
+        sortOptions={SORT_OPTIONS}
+        sortAriaLabel="Sort SAE probe features by"
+        onSortChange={setSaeSortMode}
+      />
 
       <div class="scroll">
         {#if pinned.length > 0}
@@ -409,7 +475,7 @@
   .scroll {
     display: flex;
     flex-direction: column;
-    gap: var(--space-3);
+    gap: var(--space-2);
     flex: 1 1 0;
     min-height: 2.4rem;
     overflow-y: auto;
@@ -420,32 +486,6 @@
   .add-form.anchored {
     flex: 0 0 auto;
     padding-top: var(--space-3);
-  }
-
-  /* Rack-style section header — borderless, matching ProbeRack /
-     SteeringRack so the four tabs read as siblings. */
-  .header {
-    display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    padding-bottom: var(--space-3);
-  }
-  .header-text {
-    display: flex;
-    align-items: baseline;
-    gap: var(--space-3);
-    min-width: 0;
-  }
-  .title {
-    font-weight: var(--weight-bold);
-    color: var(--accent);
-    font-size: var(--text-sm);
-    text-transform: uppercase;
-  }
-  .count {
-    color: var(--fg-muted);
-    font-size: var(--text-sm);
-    flex: 0 0 auto;
   }
 
   .hint {
@@ -484,7 +524,7 @@
     transition: border-color var(--dur-fast) var(--ease-out);
   }
   .add-input:focus-visible {
-    outline: 2px solid var(--accent-glow);
+    outline: 2px solid var(--focus-ring);
     outline-offset: 1px;
     border-color: var(--accent-glow);
   }
@@ -508,26 +548,4 @@
     cursor: default;
   }
 
-  /* ----- live toggle — ProbeRack's glass treatment ----- */
-  .toggle {
-    font-size: var(--text-sm);
-    color: var(--fg-muted);
-    background: var(--glass);
-    border: 1px solid transparent;
-    border-radius: 3px;
-    padding: 1px var(--space-3);
-    cursor: pointer;
-  }
-  .toggle:hover:not(:disabled) {
-    color: var(--fg);
-    background: var(--glass-strong);
-  }
-  .toggle.on {
-    color: var(--accent);
-    background: var(--accent-subtle);
-  }
-  .toggle:disabled {
-    opacity: 0.5;
-    cursor: default;
-  }
 </style>

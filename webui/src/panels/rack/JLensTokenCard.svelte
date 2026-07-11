@@ -21,6 +21,7 @@
   import HeatmapCell from "../../lib/charts/HeatmapCell.svelte";
   import Sparkline from "../../lib/charts/Sparkline.svelte";
   import RackCard from "./RackCard.svelte";
+  import ProbePinButton from "./ProbePinButton.svelte";
 
   interface Props {
     /** Raw vocabulary token text (untrimmed). */
@@ -82,20 +83,16 @@
 
 <RackCard accent="--accent-blue" disabled={false}>
   {#snippet statline()}
-    <button
-      type="button"
-      class="pin-glyph"
-      class:pinned
+    <ProbePinButton
+      shape="square"
+      {pinned}
       disabled={pinned || busy || !pinnable}
       onclick={() => onpin(display)}
       title={pinned
         ? `jlens/${display} is already pinned`
         : `Pin jlens/${display} as a token probe`}
-      aria-label="Pin {display} as a J-lens probe"
-      aria-pressed={pinned}
-    >
-      {pinned ? "■" : "□"}
-    </button>
+      ariaLabel={`Pin ${display} as a J-lens probe`}
+    />
 
     <span class="name" title={`"${token}" — aggregate workspace token`}>
       {display}
@@ -168,29 +165,6 @@
     font-variant-numeric: tabular-nums;
     flex: 0 0 auto;
   }
-  /* Pin glyph — the steer cards' ■/□ square, left of the name.  Muted
-   * until hover (pinning is an action, not a state, on unpinned cards). */
-  .pin-glyph {
-    background: transparent;
-    border: 0;
-    padding: 0 var(--space-1);
-    color: var(--fg-muted);
-    font-size: var(--text);
-    line-height: 1;
-    flex: 0 0 auto;
-    cursor: pointer;
-    transition: color var(--dur-fast) var(--ease-out);
-  }
-  .pin-glyph:hover:not(:disabled) {
-    color: var(--card-accent);
-  }
-  .pin-glyph.pinned {
-    color: var(--card-accent);
-  }
-  .pin-glyph:disabled {
-    cursor: default;
-  }
-
   /* ----- body: strength row — ProbeCard's EXACT four-column grid
      (label · bar · nearest-or-empty · value), so the bar column aligns
      pixel-for-pixel with the CAA cards across the tab switch. ----- */

@@ -13,6 +13,7 @@
   // hue rides the card accent.  Footer keeps the family's + launcher.
 
   import SteerCard from "./rack/SteerCard.svelte";
+  import RackSectionHeader from "./rack/RackSectionHeader.svelte";
   import Slider from "../lib/Slider.svelte";
   import {
     steerRack,
@@ -39,14 +40,10 @@
 </script>
 
 <section class="rack" aria-label="Steering rack">
-  <header class="header">
-    <div class="header-text">
-      <span class="title">STEER</span>
-    </div>
-    <span class="count" aria-live="polite">
-      {count} term{count === 1 ? "" : "s"}
-    </span>
-  </header>
+  <RackSectionHeader
+    title="STEER"
+    count={`${count} term${count === 1 ? "" : "s"}`}
+  />
 
   {#if count > 0}
     <div class="strips">
@@ -116,32 +113,6 @@
     min-height: 0;
     max-height: 100%;
     overflow: hidden;
-  }
-
-  .header {
-    display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    gap: var(--space-3);
-    padding-bottom: var(--space-3);
-  }
-  .header-text {
-    display: flex;
-    align-items: baseline;
-    gap: var(--space-3);
-    min-width: 0;
-  }
-  .title {
-    font-weight: var(--weight-bold);
-    color: var(--accent);
-    letter-spacing: 0;
-    font-size: var(--text-sm);
-    text-transform: uppercase;
-  }
-  .count {
-    color: var(--fg-muted);
-    font-size: var(--text-sm);
-    flex: 0 0 auto;
   }
 
   /* Strips own the scroll — overflow at the rack level would push the

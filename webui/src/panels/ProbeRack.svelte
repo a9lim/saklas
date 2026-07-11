@@ -12,7 +12,7 @@
   // home.
 
   import ProbeCard from "./rack/ProbeCard.svelte";
-  import Select from "../lib/Select.svelte";
+  import RackSectionHeader from "./rack/RackSectionHeader.svelte";
   import {
     activeProbeNames,
     openDrawer,
@@ -74,37 +74,20 @@
 </script>
 
 <section class="rack" aria-label="Probe rack">
-  <header class="header">
-    <div class="header-text">
-      <span class="title">PROBE</span>
-      <button
-        type="button"
-        class="toggle"
-        class:on={liveOn}
-        disabled={probesLiveState.busy}
-        onclick={onToggleLive}
-        title={liveOn
-          ? "Stop live per-token probe scoring (probes settle to the end-of-gen aggregate; gates still fire)"
-          : "Score probes live every token (per-token stream, loom rows, trait events)"}
-      >
-        {liveOn ? "live: on" : "live: off"}
-      </button>
-      <span class="count" aria-live="polite">
-        {count} attached
-      </span>
-    </div>
-    <label class="sort">
-      <span class="sort-label">sort</span>
-      <span class="sort-select">
-        <Select
-          value={sortMode}
-          options={SORT_OPTIONS}
-          onchange={onSortChange}
-          ariaLabel="Sort probes by"
-        />
-      </span>
-    </label>
-  </header>
+  <RackSectionHeader
+    title="PROBE"
+    count={`${count} attached`}
+    live={liveOn}
+    liveBusy={probesLiveState.busy}
+    liveTitle={liveOn
+      ? "Stop live per-token probe scoring (probes settle to the end-of-gen aggregate; gates still fire)"
+      : "Score probes live every token (per-token stream, loom rows, trait events)"}
+    onLiveToggle={onToggleLive}
+    sortValue={sortMode}
+    sortOptions={SORT_OPTIONS}
+    sortAriaLabel="Sort probes by"
+    onSortChange={onSortChange}
+  />
 
   <div class="strips" class:is-empty={count === 0} role="list">
     {#if probeRack.unavailable}
@@ -168,72 +151,6 @@
     max-height: 100%;
     min-height: 0;
     overflow: hidden;
-  }
-
-  .header {
-    display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    padding-bottom: var(--space-3);
-  }
-  .header-text {
-    display: flex;
-    align-items: baseline;
-    gap: var(--space-3);
-    min-width: 0;
-  }
-  /* Match SteeringRack's title — bold accent so the two racks look like
-   * siblings, not strangers. */
-  .title {
-    font-weight: var(--weight-bold);
-    color: var(--accent);
-    font-size: var(--text-sm);
-    letter-spacing: 0;
-    text-transform: uppercase;
-  }
-  .count {
-    color: var(--fg-muted);
-    font-size: var(--text-sm);
-    flex: 0 0 auto;
-  }
-  /* Live toggle — same chrome as the J-LENS PROBE section's, so the two
-   * tabs' headers read as siblings.  Borderless: a glass fill floats the
-   * control, and "on" lifts to an accent-tinted fill (mirrors
-   * SegmentedTabs' active-tab treatment) rather than a border ring. */
-  .toggle {
-    font-size: var(--text-sm);
-    color: var(--fg-muted);
-    background: var(--glass);
-    border: 1px solid transparent;
-    border-radius: 3px;
-    padding: 1px var(--space-3);
-    cursor: pointer;
-  }
-  .toggle:hover:not(:disabled) {
-    color: var(--fg);
-    background: var(--glass-strong);
-  }
-  .toggle.on {
-    color: var(--accent);
-    background: var(--accent-subtle);
-  }
-  .toggle:disabled {
-    opacity: 0.5;
-    cursor: default;
-  }
-  .sort {
-    display: inline-flex;
-    align-items: center;
-    gap: var(--space-3);
-  }
-  .sort-label {
-    color: var(--fg-muted);
-    font-size: var(--text-sm);
-  }
-  /* Layout host for the themed Select. */
-  .sort-select {
-    display: inline-flex;
-    min-width: 8em;
   }
 
   /* Strips own the scroll inside the rack — with many auto-loaded probes

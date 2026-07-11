@@ -17,6 +17,7 @@
     setJLensTrigger,
   } from "../../lib/stores.svelte";
   import RackCard from "./RackCard.svelte";
+  import RackMarker from "./RackMarker.svelte";
   import { TRIGGER_LABEL, TRIGGER_WORD, nextTrigger } from "./triggers";
 
   interface Props {
@@ -27,8 +28,6 @@
   let { name, entry }: Props = $props();
 
   const word = $derived(name.slice("jlens/".length));
-  const enableGlyph = $derived(entry.enabled ? "■" : "□");
-
   function cycleTrigger(): void {
     setJLensTrigger(name, nextTrigger(entry.trigger));
   }
@@ -45,7 +44,7 @@
       aria-pressed={entry.enabled}
       aria-label="Toggle steering for {name}"
     >
-      {enableGlyph}
+      <RackMarker shape="square" filled={entry.enabled} />
     </button>
 
     <span class="name" class:struck={!entry.enabled} title="j-lens token atom {name}">
@@ -95,13 +94,17 @@
 <style>
   /* ----- statline pieces (mirrors SteerCard) ----- */
   .enable {
+    display: inline-grid;
+    place-items: center;
+    inline-size: 24px;
+    block-size: 24px;
+    margin: 0 -3px;
     background: transparent;
     border: 0;
-    padding: 0 var(--space-1);
+    border-radius: var(--radius-sm);
+    padding: 0;
     color: var(--card-accent);
-    font-size: var(--text);
-    line-height: 1;
-    flex: 0 0 auto;
+    flex: 0 0 24px;
     cursor: pointer;
   }
   .enable.off {

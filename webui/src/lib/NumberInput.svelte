@@ -106,6 +106,22 @@
     emitChange(v);
   }
 
+  function handleKeydown(ev: KeyboardEvent): void {
+    onkeydown?.(ev);
+    if (ev.defaultPrevented || ev.key !== "Enter") return;
+    // Native number inputs do not consistently emit ``change`` on Enter
+    // (Chrome waits for blur), despite Enter being the explicit commit
+    // gesture promised by this component. Commit the current draft here so
+    // keyboard-only users and form-adjacent controls apply immediately.
+    const raw = inputEl?.value ?? "";
+    if (raw === "") {
+      emitChange(allowEmpty ? null : 0);
+      return;
+    }
+    const v = Number(raw);
+    if (Number.isFinite(v)) emitChange(v);
+  }
+
   function nudge(direction: 1 | -1): void {
     if (disabled) return;
     const base = value ?? 0;
@@ -136,7 +152,7 @@
     aria-label={ariaLabel}
     oninput={onInput}
     onchange={onChange}
-    {onkeydown}
+    onkeydown={handleKeydown}
   />
   {#if !disabled}
     <span class="sk-number-steppers" aria-hidden="true">
@@ -189,7 +205,7 @@
     margin: 0;
   }
   .sk-number-input:focus-visible {
-    outline: 2px solid var(--accent-glow);
+    outline: 2px solid var(--focus-ring);
     outline-offset: 1px;
     border-color: var(--accent-glow);
   }

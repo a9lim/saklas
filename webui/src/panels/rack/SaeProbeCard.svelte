@@ -19,6 +19,7 @@
   import { detachProbe } from "../../lib/stores.svelte";
   import { pushToast } from "../../lib/stores/toasts.svelte";
   import RackCard from "./RackCard.svelte";
+  import ProbePinButton from "./ProbePinButton.svelte";
 
   interface Props {
     /** Feature index into the resident SAE's dictionary. */
@@ -100,25 +101,23 @@
 <RackCard accent="--pillar-sae" disabled={false}>
   {#snippet statline()}
     {#if pinned}
-      <button
-        type="button"
-        class="pin-glyph"
+      <ProbePinButton
+        shape="triangle"
+        pinned={true}
         disabled={unpinBusy}
         onclick={() => void onUnpin()}
         title="Pinned (click to unpin)"
-        aria-label="Unpin probe {name}"
-        aria-pressed="true"
-      >▲</button>
+        ariaLabel={`Unpin probe ${name}`}
+      />
     {:else}
-      <button
-        type="button"
-        class="pin-glyph unpinned"
+      <ProbePinButton
+        shape="triangle"
+        pinned={false}
         disabled={busy}
         onclick={() => onpin?.(id)}
         title="Pin as a persistent, gate-able probe"
-        aria-label="Pin probe {name}"
-        aria-pressed="false"
-      >△</button>
+        ariaLabel={`Pin probe ${name}`}
+      />
     {/if}
 
     <span class="name" title="probe {name} — feature activation on the resident SAE">
@@ -171,29 +170,6 @@
 
 <style>
   /* ----- statline (mirrors JLensProbeCard / JLensTokenCard) ----- */
-  .pin-glyph {
-    background: transparent;
-    border: 0;
-    padding: 0 var(--space-1);
-    color: var(--card-accent);
-    font-size: var(--text);
-    line-height: 1;
-    flex: 0 0 auto;
-    cursor: pointer;
-    transition: color var(--dur-fast) var(--ease-out);
-  }
-  /* Unpin is a detach — keep the red destructive-action hover (mirrors
-     the steer card's ✕). */
-  .pin-glyph:hover:not(:disabled) {
-    color: var(--accent-red);
-  }
-  .pin-glyph.unpinned:hover:not(:disabled) {
-    color: var(--fg-strong);
-  }
-  .pin-glyph:disabled {
-    cursor: default;
-    opacity: 0.5;
-  }
   .name {
     color: var(--fg-strong);
     font-family: var(--font-mono);

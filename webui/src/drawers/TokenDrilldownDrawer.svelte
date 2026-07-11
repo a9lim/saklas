@@ -568,7 +568,7 @@
           No per-layer scores captured for this token (probes not loaded?).
         </div>
       {:else}
-        <div class="grid-scroll">
+        <div class="grid-scroll probe-grid">
           <table class="grid" style="--cell: {CELL_SIZE}px;">
             <thead>
               <tr>
@@ -1032,6 +1032,14 @@
     max-height: 100%;
     border-radius: var(--radius);
     background: var(--bg);
+  }
+  /* A narrow probe roster should not paint a full-drawer black well around
+     a five-column heatmap. Hug the matrix and center it; once the roster is
+     wider than the drawer, the same wrapper becomes the horizontal scroller. */
+  .probe-grid {
+    width: max-content;
+    max-width: 100%;
+    margin-inline: auto;
   }
   .grid {
     border-collapse: separate;

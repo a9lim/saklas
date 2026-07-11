@@ -77,6 +77,12 @@ def test_select_runtime_layer_prefers_workspace_near_65_percent() -> None:
         select_runtime_layer({1, 8}, 24, requested=9)
 
 
+def test_sae_encoder_readout_is_detached_from_autograd() -> None:
+    session = _session()
+    acts = session._encode_sae_hidden(torch.ones(4, requires_grad=True))
+    assert not acts.requires_grad
+
+
 def test_sae_feature_validation_and_decoder_row_registration() -> None:
     session = _session()
     assert session.validate_sae_feature(2) == {

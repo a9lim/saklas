@@ -182,6 +182,9 @@ export interface SaeState {
   meta: Map<number, { label: string | null; max_act: number | null }>;
   /** Resident release the discovery state belongs to (reset key). */
   release: string | null;
+  /** Presentation order shared across tab switches, mirroring the lens
+   *  workspace sorter. */
+  sortMode: SaeSortMode;
   busy: boolean;
   loading: boolean;
   loadMessage: string | null;
@@ -194,11 +197,18 @@ export const saeState: SaeState = $state({
   history: new SvelteMap<number, number[]>(),
   meta: new SvelteMap<number, { label: string | null; max_act: number | null }>(),
   release: null,
+  sortMode: "strength",
   busy: false,
   loading: false,
   loadMessage: null,
   loadError: null,
 });
+
+export type SaeSortMode = "strength" | "name";
+
+export function setSaeSortMode(mode: SaeSortMode): void {
+  saeState.sortMode = mode;
+}
 
 /** Ids already sent to the metadata backfill this session — a miss on
  *  Neuronpedia stays a miss, so don't re-ask every generation.  Not
@@ -1261,6 +1271,33 @@ export async function attachProbe(
     highlightState.target = info.name;
   }
   return info;
+}
+
+/** Preserve a discovery card's visible reading when it becomes a pinned
+ * probe. Attaching is server-authoritative but the first real probe event
+ * arrives on the next generation; without this bridge, pinning a live card
+ * made it flash to 0 and lose its sparkline/layer context. */
+export function seedProbeDisplay(
+  name: string,
+  seed: {
+    current: number;
+    sparkline?: number[];
+    perLayer?: Record<string, number>;
+    reading?: ProbeReadingJSON | null;
+    aggregate?: ProbeReadingJSON | null;
+  },
+): void {
+  const prev = probeRack.entries.get(name);
+  if (!prev) return;
+  probeRack.entries.set(name, {
+    ...prev,
+    current: seed.current,
+    previous: seed.current,
+    sparkline: seed.sparkline ? [...seed.sparkline] : prev.sparkline,
+    perLayer: seed.perLayer ? { ...seed.perLayer } : prev.perLayer,
+    reading: seed.reading === undefined ? prev.reading : seed.reading,
+    aggregate: seed.aggregate === undefined ? prev.aggregate : seed.aggregate,
+  });
 }
 
 /** Detach a probe by registered name. */

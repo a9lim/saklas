@@ -139,7 +139,7 @@
   }
   .node.focused {
     background: var(--accent-subtle);
-    outline: 1px solid var(--accent-glow);
+    outline: 2px solid var(--focus-ring);
     outline-offset: -1px;
   }
   .node.active {

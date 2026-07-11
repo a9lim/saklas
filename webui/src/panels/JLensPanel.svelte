@@ -28,7 +28,7 @@
   // auto-enables when the artifact lands.  Every section needs the artifact.
 
   import Bar from "../lib/charts/Bar.svelte";
-  import Select from "../lib/Select.svelte";
+  import RackSectionHeader from "./rack/RackSectionHeader.svelte";
   import JLensProbeCard from "./rack/JLensProbeCard.svelte";
   import JLensSteerCard from "./rack/JLensSteerCard.svelte";
   import JLensTokenCard from "./rack/JLensTokenCard.svelte";
@@ -41,6 +41,7 @@
     lensFitState,
     lensState,
     probeRack,
+    seedProbeDisplay,
     sessionState,
     setLensWorkspaceSortMode,
     setLiveLens,
@@ -201,7 +202,44 @@
     try {
       const validated = await apiLens.validateToken(bare);
       const validatedSelector = `jlens/${validated.word}`;
+      const live = lensState.aggregate?.find(
+        ([token]) => token.trim() === validated.word,
+      );
       await attachProbe(validatedSelector);
+      if (live) {
+        const [token, strength, com, spread] = live;
+        const perLayer: Record<string, number> = {};
+        const coordsPerLayer: Record<string, number[]> = {};
+        for (const layer of lensState.layers ?? []) {
+          const pairs = lensState.readout?.[String(layer)] ?? [];
+          const hit = pairs.find(([text]) => text === token) ??
+            pairs.find(([text]) => text.trim() === validated.word);
+          const value = hit?.[1] ?? 0;
+          perLayer[String(layer)] = value;
+          coordsPerLayer[String(layer)] = [value];
+        }
+        const reading = {
+          fraction: 0,
+          nearest: [] as [string, number][],
+          coords: [strength],
+          residual: 0,
+          fraction_per_layer: {},
+          coords_per_layer: coordsPerLayer,
+          residual_per_layer: {},
+          depth_com: [com],
+          depth_spread: [spread],
+        };
+        const series = lensState.aggHistory.map(
+          (frame) => frame.find(([text]) => text === token)?.[1] ?? 0,
+        );
+        seedProbeDisplay(validatedSelector, {
+          current: strength,
+          sparkline: series,
+          perLayer,
+          reading,
+          aggregate: reading,
+        });
+      }
       pushToast(`pinned ${validatedSelector}`, { kind: "info" });
       return true;
     } catch (e) {
@@ -230,11 +268,7 @@
 <div class="jlens" aria-label="Jacobian-lens inspector">
   {#if !fitted}
     <section class="section">
-      <header class="header">
-        <div class="header-text">
-          <span class="title">J-LENS</span>
-        </div>
-      </header>
+      <RackSectionHeader title="J-LENS" />
       {#if lensFitState.running}
         <div class="fit-progress" aria-label="Lens fit progress">
           <div class="fit-line">
@@ -285,12 +319,10 @@
   {:else}
     <!-- STEER — token-atom cards in the shared steering expression. -->
     <section class="section steer">
-      <header class="header">
-        <div class="header-text">
-          <span class="title">STEER</span>
-        </div>
-        <span class="count">{steerCards.length} term{steerCards.length === 1 ? "" : "s"}</span>
-      </header>
+      <RackSectionHeader
+        title="STEER"
+        count={`${steerCards.length} term${steerCards.length === 1 ? "" : "s"}`}
+      />
 
       {#if steerCards.length > 0}
         <div class="cards steer-cards" role="list">
@@ -325,35 +357,20 @@
          The card list owns the scroll; header + add form stay anchored
          (the CAA racks' fixed-chrome / scrollable-middle shape). -->
     <section class="section probe">
-      <header class="header">
-        <div class="header-text">
-          <span class="title">PROBE</span>
-          <button
-            type="button"
-            class="toggle"
-            class:on={liveOn}
-            disabled={lensState.busy}
-            onclick={onToggleLive}
-            title={liveOn
-              ? "Stop the per-step lens readout (pinned probes settle to the end-of-gen aggregate)"
-              : "Stream the J-lens readout live during generation (pinned probes + workspace top-k)"}
-          >
-            {liveOn ? "live: on" : "live: off"}
-          </button>
-          <span class="count">{pinnedCards.length} pinned</span>
-        </div>
-        <label class="sort">
-          <span class="sort-label">sort</span>
-          <span class="sort-select">
-            <Select
-              value={lensState.workspaceSortMode}
-              options={SORT_OPTIONS}
-              onchange={setLensWorkspaceSortMode}
-              ariaLabel="Sort J-lens probe tokens by"
-            />
-          </span>
-        </label>
-      </header>
+      <RackSectionHeader
+        title="PROBE"
+        count={`${pinnedCards.length} pinned`}
+        live={liveOn}
+        liveBusy={lensState.busy}
+        liveTitle={liveOn
+          ? "Stop the per-step lens readout (pinned probes settle to the end-of-gen aggregate)"
+          : "Stream the J-lens readout live during generation (pinned probes + workspace top-k)"}
+        onLiveToggle={onToggleLive}
+        sortValue={lensState.workspaceSortMode}
+        sortOptions={SORT_OPTIONS}
+        sortAriaLabel="Sort J-lens probe tokens by"
+        onSortChange={setLensWorkspaceSortMode}
+      />
 
       <div class="scroll">
         {#if pinnedCards.length > 0}
@@ -461,7 +478,7 @@
   .scroll {
     display: flex;
     flex-direction: column;
-    gap: var(--space-3);
+    gap: var(--space-2);
     flex: 1 1 0;
     min-height: 2.4rem;
     overflow-y: auto;
@@ -472,44 +489,6 @@
   .add-form.anchored {
     flex: 0 0 auto;
     padding-top: var(--space-3);
-  }
-
-  /* Rack-style section header — borderless, matching ProbeRack /
-     SteeringRack so the tabs read as siblings. */
-  .header {
-    display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    padding-bottom: var(--space-3);
-  }
-  .header-text {
-    display: flex;
-    align-items: baseline;
-    gap: var(--space-3);
-    min-width: 0;
-  }
-  .title {
-    font-weight: var(--weight-bold);
-    color: var(--accent);
-    font-size: var(--text-sm);
-    text-transform: uppercase;
-  }
-  .count {
-    color: var(--fg-muted);
-    font-size: var(--text-sm);
-  }
-  .sort {
-    display: inline-flex;
-    align-items: center;
-    gap: var(--space-3);
-  }
-  .sort-label {
-    color: var(--fg-muted);
-    font-size: var(--text-sm);
-  }
-  .sort-select {
-    display: inline-flex;
-    min-width: 8em;
   }
 
   .hint {
@@ -598,7 +577,7 @@
     transition: border-color var(--dur-fast) var(--ease-out);
   }
   .add-input:focus-visible {
-    outline: 2px solid var(--accent-glow);
+    outline: 2px solid var(--focus-ring);
     outline-offset: 1px;
     border-color: var(--accent-glow);
   }
@@ -620,26 +599,4 @@
     cursor: default;
   }
 
-  /* ----- workspace live toggle — ProbeRack's glass treatment ----- */
-  .toggle {
-    font-size: var(--text-sm);
-    color: var(--fg-muted);
-    background: var(--glass);
-    border: 1px solid transparent;
-    border-radius: 3px;
-    padding: 1px var(--space-3);
-    cursor: pointer;
-  }
-  .toggle:hover:not(:disabled) {
-    color: var(--fg);
-    background: var(--glass-strong);
-  }
-  .toggle.on {
-    color: var(--accent);
-    background: var(--accent-subtle);
-  }
-  .toggle:disabled {
-    opacity: 0.5;
-    cursor: default;
-  }
 </style>

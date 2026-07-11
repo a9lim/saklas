@@ -39,6 +39,7 @@
   import Select from "../../lib/Select.svelte";
   import XYPad from "../manifold/XYPad.svelte";
   import RackCard from "./RackCard.svelte";
+  import RackMarker from "./RackMarker.svelte";
   import { TRIGGER_LABEL, TRIGGER_WORD, nextTrigger } from "./triggers";
 
   interface Props {
@@ -60,9 +61,6 @@
 
   const subspace = $derived(entry.mode === "subspace");
   const accent = $derived(subspace ? "--accent" : "--accent-purple");
-  const enableGlyph = $derived(
-    subspace ? (entry.enabled ? "●" : "○") : (entry.enabled ? "◆" : "◇"),
-  );
 
   /** Display name — bare name with the namespace prefix stripped
    *  (``default/personas`` → ``personas``).  Full name stays in the tooltip. */
@@ -140,7 +138,10 @@
       aria-pressed={entry.enabled}
       aria-label="Toggle steering for {name}"
     >
-      {enableGlyph}
+      <RackMarker
+        shape={subspace ? "circle" : "diamond"}
+        filled={entry.enabled}
+      />
     </button>
 
     <span class="name" class:struck={!entry.enabled} title={subspace ? `subspace ${name}` : `manifold ${name}`}>
@@ -245,13 +246,17 @@
 <style>
   /* ----- statline pieces ----- */
   .enable {
+    display: inline-grid;
+    place-items: center;
+    inline-size: 24px;
+    block-size: 24px;
+    margin: 0 -3px;
     background: transparent;
     border: 0;
-    padding: 0 var(--space-1);
+    border-radius: var(--radius-sm);
+    padding: 0;
     color: var(--card-accent);
-    font-size: var(--text);
-    line-height: 1;
-    flex: 0 0 auto;
+    flex: 0 0 24px;
     cursor: pointer;
   }
   .enable.off {

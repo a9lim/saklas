@@ -131,7 +131,8 @@ webui/src/
                               # loaded: identity strip (release · L · width) +
                               # decoder-row STEER cards + pinned/live-discovery
                               # feature PROBE cards (▲ unpins / △ pins — same
-                              # merged-PROBE shape as the lens tab), cards in
+                              # merged-PROBE shape and strength/name sort as the
+                              # lens tab), cards in
                               # rack/{SaeSteerCard,SaeProbeCard} (gold, ▲/△).
                               # Cards read normalized strength — activation /
                               # Neuronpedia maxActApprox, absolute 0..1 bar
@@ -175,6 +176,9 @@ webui/src/
                               # tabs driving the same state); footer keeps the
                               # family's single "+ … probe" launcher
     rack/RackCard.svelte      # shared card chrome: statline on top, controls/meters stacked below
+    rack/RackSectionHeader.svelte # shared STEER/PROBE title + live/count/sort row across all pillars
+    rack/RackMarker.svelte    # optically matched 18 px family markers: ●/◆/■/▲
+    rack/ProbePinButton.svelte # shared 24 px pin/unpin action for every probe family
     rack/SteerCard.svelte     # unified steer card — branches on entry.mode (snap-to-node + XYPad both):
                               #   subspace → position only (magnitude = shared subspace-along master)
                               #   manifold → position + per-card along / onto

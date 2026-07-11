@@ -68,12 +68,16 @@
     currentIndex >= 0 ? options[currentIndex].label : "",
   );
 
-  function commit(idx: number): void {
+  async function commit(idx: number): Promise<void> {
     const opt = options[idx];
     if (!opt || opt.disabled) return;
     value = opt.value;
     onchange?.(opt.value);
     open = false;
+    // Let the popover leave the DOM before restoring focus. Restoring it
+    // synchronously can race the same pointer click and immediately reopen
+    // the trigger in Chromium.
+    await tick();
     trigger?.focus();
   }
 
@@ -200,7 +204,7 @@
       case "Enter":
       case " ":
         ev.preventDefault();
-        if (highlight >= 0) commit(highlight);
+        if (highlight >= 0) void commit(highlight);
         break;
       case "Escape":
       case "Tab":
@@ -288,7 +292,11 @@
           aria-selected={i === currentIndex}
           aria-disabled={!!opt.disabled}
           onmouseenter={() => (opt.disabled ? null : (highlight = i))}
-          onclick={() => commit(i)}
+          onclick={(ev) => {
+            ev.preventDefault();
+            ev.stopPropagation();
+            void commit(i);
+          }}
           onkeydown={onListKeydown}
         >
           {opt.label}
@@ -330,7 +338,7 @@
     background: var(--surface-hi);
   }
   .sk-select-trigger:focus-visible {
-    outline: 2px solid var(--accent-glow);
+    outline: 2px solid var(--focus-ring);
     outline-offset: 1px;
   }
   .sk-select.is-open .sk-select-trigger {

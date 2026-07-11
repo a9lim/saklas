@@ -35,6 +35,7 @@
   import { pushToast } from "../../lib/stores/toasts.svelte";
   import { polesOf } from "../../lib/concepts";
   import RackCard from "./RackCard.svelte";
+  import RackMarker from "./RackMarker.svelte";
 
   interface Props {
     name: string;
@@ -87,12 +88,6 @@
   const isHighlight = $derived(
     highlightState.target !== null &&
       parseProbeTarget(highlightState.target).base === name,
-  );
-
-  /** Highlight-select glyph — family marker (●/◆) filled when this probe is
-   *  the highlight target, hollow (○/◇) when not. */
-  const selectGlyph = $derived(
-    affine ? (isHighlight ? "●" : "○") : (isHighlight ? "◆" : "◇"),
   );
 
   /** Display name — bare manifold name, namespace prefix stripped; full
@@ -219,7 +214,10 @@
         title={isHighlight
           ? "Selected (click to deselect)"
           : "Click to select for highlighting"}
-      >{selectGlyph}</span>
+      ><RackMarker
+          shape={affine ? "circle" : "diamond"}
+          filled={isHighlight}
+        /></span>
       <span class="name" title="probe {name}">{displayName}</span>
     </div>
 
@@ -364,7 +362,7 @@
   .select-cluster {
     display: flex;
     align-items: center;
-    gap: var(--space-2);
+    gap: var(--space-3);
     min-width: 0;
     cursor: pointer;
     user-select: none;
@@ -378,11 +376,13 @@
     outline-offset: -1px;
   }
   .select-glyph {
+    display: inline-grid;
+    place-items: center;
+    inline-size: 24px;
+    block-size: 24px;
+    margin: 0 -3px;
     color: var(--fg-muted);
-    font-size: var(--text);
-    line-height: 1;
-    padding: 0 var(--space-1);
-    flex: 0 0 auto;
+    flex: 0 0 24px;
   }
   .select-glyph.selected {
     color: var(--card-accent);
