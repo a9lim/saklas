@@ -39,6 +39,12 @@ from saklas.core.generation import (
     supports_thinking,
 )
 from saklas.core.hooks import HiddenCapture, SteeringManager
+from saklas.core.scene import (
+    SceneGrammarError,
+    TurnGrammar,
+    extract_turn_grammar,
+    validate_turn_grammar,
+)
 from saklas.core.loom import (
     InvalidNodeOperationError,
     LoomMutated,
@@ -215,6 +221,7 @@ class _SerialGenerationJob:
     parent_node_id: str | None = None
     recipe_override: Any = None
     grid: dict[str, Any] | None = None
+    gen_seat: str = "assistant"
 
 
 class _SessionStopCriteria(StoppingCriteria):
@@ -263,6 +270,7 @@ def _run_serial_generation_jobs(
             on_token=job.on_token,
             parent_node_id=job.parent_node_id,
             recipe_override=job.recipe_override,
+            gen_seat=job.gen_seat,
         )
         row = dict(job.grid or {})
         results.append(result)
@@ -1066,6 +1074,14 @@ class SaklasSession:
         # input so the assistant turn opens with ``<role>`` instead of
         # ``assistant``.
         self._active_role: str | None = None
+
+        # Scene grammar (the cast model's stitcher): lazily autopsied +
+        # round-trip-validated against the live chat template on first
+        # access.  ``None`` after resolution = scene mode unavailable
+        # (base model, label-free family, or validation failure) — every
+        # render falls back to the legacy chat-template paths.
+        self._scene_grammar: TurnGrammar | None = None
+        self._scene_grammar_resolved: bool = False
 
         # Synchronous event bus.  Emits on extraction, steering enter/exit,
         # probe scoring, generation start/finish.  Subscribers run on the
@@ -2586,10 +2602,10 @@ class SaklasSession:
                 f"(fitted: {lens.source_layers[0]}..{lens.source_layers[-1]})"
             )
         node = self.tree.get(node_id)
-        if node.role != "assistant":
+        if node.role not in ("assistant", "user"):
             raise InvalidNodeOperationError(
-                f"jlens_token_readout: {node_id!r} is a {node.role} node, "
-                f"not an assistant node with a decode record"
+                f"jlens_token_readout: {node_id!r} is a {node.role} node — "
+                f"only a turn with a decode record can be read out"
             )
         raw_ids = node.raw_token_ids
         if not raw_ids:
@@ -2601,14 +2617,6 @@ class SaklasSession:
             raise InvalidNodeOperationError(
                 f"jlens_token_readout: raw_index {raw_index} out of range "
                 f"[0, {len(raw_ids)}) for {node_id!r}"
-            )
-        user_node = (
-            self.tree.nodes.get(node.parent_id) if node.parent_id else None
-        )
-        if not raw and (user_node is None or user_node.role != "user"):
-            raise InvalidNodeOperationError(
-                f"jlens_token_readout: {node_id!r} has no user parent to "
-                f"rebuild the prompt from (raw-mode node? pass raw=true)"
             )
 
         recipe = node.recipe
@@ -2635,13 +2643,23 @@ class SaklasSession:
                     "", raw=True, parent_node_id=node.parent_id,
                 )
             else:
-                assert user_node is not None  # narrowed above
+                # Continue-mode rebuild: the history walk to
+                # ``node.parent_id`` already carries every prior turn with
+                # its stamped label (the parent included), so the render is
+                # byte-identical to the one that produced the node — and
+                # seat-general, no user-parent assumption (a cast-model
+                # node may hang under any turn).
                 prompt_ids = self._prepare_input(
-                    user_node.text,
+                    None,
                     thinking=use_thinking,
-                    parent_node_id=user_node.parent_id,
-                    user_role=user_node.role_label,
-                    assistant_role=node.role_label,
+                    parent_node_id=node.parent_id,
+                    user_role=(
+                        node.role_label if node.role == "user" else None
+                    ),
+                    assistant_role=(
+                        node.role_label if node.role == "assistant" else None
+                    ),
+                    gen_seat=node.role,
                 )
             if raw_index > 0:
                 prefix = torch.tensor(
@@ -3244,9 +3262,10 @@ class SaklasSession:
         if not 1 <= top_k <= min(width, 100):
             raise ValueError(f"top_k must be in [1, {min(width, 100)}]")
         node = self.tree.get(node_id)
-        if node.role != "assistant":
+        if node.role not in ("assistant", "user"):
             raise InvalidNodeOperationError(
-                f"sae_token_readout: {node_id!r} is not an assistant node"
+                f"sae_token_readout: {node_id!r} is a {node.role} node — "
+                f"only a turn with a decode record can be read out"
             )
         raw_ids = node.raw_token_ids
         if not raw_ids:
@@ -3257,12 +3276,6 @@ class SaklasSession:
             raise InvalidNodeOperationError(
                 f"sae_token_readout: raw_index {raw_index} out of range "
                 f"[0, {len(raw_ids)})"
-            )
-        user_node = self.tree.nodes.get(node.parent_id) if node.parent_id else None
-        if not raw and (user_node is None or user_node.role != "user"):
-            raise InvalidNodeOperationError(
-                "sae_token_readout: assistant has no user parent; pass raw=true "
-                "for a raw-mode node"
             )
         recipe = node.recipe
         steering_expr = (
@@ -3281,13 +3294,19 @@ class SaklasSession:
                     "", raw=True, parent_node_id=node.parent_id,
                 )
             else:
-                assert user_node is not None
+                # Continue-mode rebuild — seat-general, mirrors
+                # ``jlens_token_readout``.
                 prompt_ids = self._prepare_input(
-                    user_node.text,
+                    None,
                     thinking=use_thinking,
-                    parent_node_id=user_node.parent_id,
-                    user_role=user_node.role_label,
-                    assistant_role=node.role_label,
+                    parent_node_id=node.parent_id,
+                    user_role=(
+                        node.role_label if node.role == "user" else None
+                    ),
+                    assistant_role=(
+                        node.role_label if node.role == "assistant" else None
+                    ),
+                    gen_seat=node.role,
                 )
             if raw_index > 0:
                 prefix = torch.tensor(
@@ -3425,6 +3444,7 @@ class SaklasSession:
             self._tokenizer, messages, system_prompt=None,
             thinking=False,
             gen_role=role, model_type=model_type_for_role,
+            scene=self.scene_grammar,
         ).to(self._device)
         attention_mask = torch.ones_like(input_ids)
         with torch.inference_mode():
@@ -3496,6 +3516,7 @@ class SaklasSession:
                 self._tokenizer, messages, system_prompt=None,
                 thinking=False,
                 gen_role=role, model_type=model_type_for_role,
+                scene=self.scene_grammar,
             )
             seqs.append(ids[0])
 
@@ -5608,12 +5629,14 @@ class SaklasSession:
         if parent_node_id is not None:
             parent = self.tree.nodes.get(parent_node_id)
             if parent is not None:
-                if parent.role == "assistant" and parent.recipe is not None:
+                # A recipe marks a *generated* node whatever its seat (the
+                # cast model: provenance, not role).
+                if parent.recipe is not None:
                     anchor = parent.recipe
                 else:
                     for nid in self.tree.ancestors_of(parent_node_id):
                         anc = self.tree.nodes.get(nid)
-                        if anc is not None and anc.role == "assistant" and anc.recipe is not None:
+                        if anc is not None and anc.recipe is not None:
                             anchor = anc.recipe
                             break
         return anchor if anchor is not None else Recipe()
@@ -5656,32 +5679,31 @@ class SaklasSession:
 
         overlaid = anchor.overlay(override)
 
-        # Resolve which node to anchor the regen under.  If the caller
-        # passed an assistant node, regen siblings under its user-parent;
-        # if a user node, siblings under it directly.
-        anchor_user_id = parent.parent_id if parent.role == "assistant" else parent_node_id
-
-        # Reuse the existing user-turn text for sibling spawning.  When
-        # the anchor is a user turn we feed the user-turn text to
-        # ``generate`` and let ``add_user_turn``'s dedup land it on the
-        # same parent.
-        anchor_node = self.tree.nodes.get(anchor_user_id) if anchor_user_id else None
-        if anchor_node is None or anchor_node.role != "user":
+        # Resolve where the regen anchors (continue-mode: no text resend,
+        # the history walk carries every turn).  A generated node regens
+        # as a sibling under its parent, same seat; a committed turn gets
+        # a fresh assistant-seat reply generated under it.
+        if parent.recipe is not None or parent.role == "assistant":
+            anchor_parent = parent.parent_id
+            seat = parent.role
+        else:
+            anchor_parent = parent_node_id
+            seat = "assistant"
+        if anchor_parent is None:
             raise InvalidNodeOperationError(
                 f"regen_with_modifier: cannot anchor sibling under "
-                f"{parent_node_id!r} — expected user/assistant pair, "
-                f"got {parent.role}"
+                f"{parent_node_id!r} — the node has no parent"
             )
-        user_text = anchor_node.text
 
         sampling = overlaid.sampling
         return self.generate(
-            user_text,
+            None,
             steering=overlaid.steering,
             sampling=sampling,
             thinking=overlaid.thinking,
-            parent_node_id=anchor_node.parent_id,
+            parent_node_id=anchor_parent,
             n=n,
+            gen_seat=seat,
         )
 
     def fork_from_token(
@@ -5704,19 +5726,20 @@ class SaklasSession:
         point; the divergence downstream is purely the model reacting to
         the swapped token.
 
-        Lands as a sibling assistant node under the same user turn (the
-        dedup path :meth:`regen_with_modifier` uses).  Raises
+        Lands as a sibling under the same parent turn, occupying the same
+        seat as the source node (a user-seat generated node forks into
+        user-seat siblings — the cast model).  Raises
         :class:`InvalidNodeOperationError` when the node isn't a forkable
-        assistant — wrong role, no ``raw_token_ids`` (legacy or
+        turn — wrong role, no ``raw_token_ids`` (legacy or
         transcript-loaded node), or ``raw_index`` out of range.
         """
         from dataclasses import replace as _replace
 
         node = self.tree.get(node_id)
-        if node.role != "assistant":
+        if node.role not in ("assistant", "user"):
             raise InvalidNodeOperationError(
                 f"fork_from_token: {node_id!r} is a {node.role} node, "
-                f"not a forkable assistant"
+                f"not a forkable turn"
             )
         raw = node.raw_token_ids
         if not raw:
@@ -5729,16 +5752,12 @@ class SaklasSession:
                 f"fork_from_token: raw_index {raw_index} out of range "
                 f"[0, {len(raw)}) for {node_id!r}"
             )
-        forced_prefix = [int(t) for t in raw[:raw_index]] + [int(alt_token_id)]
-
-        user_node = (
-            self.tree.nodes.get(node.parent_id) if node.parent_id else None
-        )
-        if user_node is None or user_node.role != "user":
+        if node.parent_id is None:
             raise InvalidNodeOperationError(
-                f"fork_from_token: {node_id!r} has no user parent to "
-                f"anchor the forked sibling under"
+                f"fork_from_token: {node_id!r} has no parent to anchor "
+                f"the forked sibling under"
             )
+        forced_prefix = [int(t) for t in raw[:raw_index]] + [int(alt_token_id)]
 
         recipe = node.recipe
         base_sampling = (
@@ -5754,15 +5773,25 @@ class SaklasSession:
         fork_sampling = _replace(
             base_sampling, max_tokens=len(forced_prefix) + base_max,
         )
+        # The sibling inherits the source node's label on its own seat —
+        # the tree's stamped label wins over whatever the recipe's
+        # sampling boxes held.
+        if node.role == "user":
+            fork_sampling = _replace(fork_sampling, user_role=node.role_label)
+        else:
+            fork_sampling = _replace(
+                fork_sampling, assistant_role=node.role_label,
+            )
 
         return self._generate_core(
-            user_node.text,
+            None,
             steering=recipe.steering if recipe is not None else None,
             sampling=fork_sampling,
             thinking=recipe.thinking if recipe is not None else None,
             on_token=on_token,
-            parent_node_id=user_node.parent_id,
+            parent_node_id=node.parent_id,
             forced_prefix=forced_prefix,
+            gen_seat=node.role,
         )
 
     def prefill_assistant(
@@ -6138,6 +6167,7 @@ class SaklasSession:
                 self.config.system_prompt,
                 thinking=False,
                 add_generation_prompt=False,
+                scene=self.scene_grammar,
             ).to(self._device)
 
         prefix_len = int(prefix_ids.shape[1])
@@ -6316,6 +6346,58 @@ class SaklasSession:
 
     # -- Generation helpers --
 
+    def _resolved_model_type(self) -> str | None:
+        """``model_type`` with the multimodal ``text_config`` unwrap."""
+        model_cfg = getattr(self._model, "config", None)
+        text_cfg = (
+            getattr(model_cfg, "text_config", None)
+            if model_cfg is not None else None
+        )
+        model_type = (
+            getattr(text_cfg, "model_type", None)
+            if text_cfg is not None else None
+        )
+        if model_type is None and model_cfg is not None:
+            model_type = getattr(model_cfg, "model_type", None)
+        return model_type
+
+    @property
+    def scene_grammar(self) -> TurnGrammar | None:
+        """The validated turn grammar for the loaded chat template, or None.
+
+        Lazily runs the template autopsy + byte-exact round-trip validation
+        (``core/scene.py``) once per session.  A passing grammar makes the
+        stitcher the render authority — arbitrary seat sequences, per-turn
+        cast labels, generation prompts on either seat — with renders
+        bit-identical to ``apply_chat_template`` on standard alternating
+        conversations.  ``None`` = scene mode unavailable (base model,
+        label-free family like mistral, or a template shape that defeated
+        the autopsy); rendering falls back to the legacy paths and a
+        one-time warning names the reason.
+        """
+        if not getattr(self, "_scene_grammar_resolved", False):
+            self._scene_grammar_resolved = True
+            self._scene_grammar = None
+            template = getattr(self._tokenizer, "chat_template", None)
+            if template:
+                think = (
+                    ("<think>", "</think>") if "<think>" in template else None
+                )
+                try:
+                    grammar = extract_turn_grammar(
+                        self._tokenizer,
+                        self._resolved_model_type() or "",
+                        think_delimiters=think,
+                    )
+                    validate_turn_grammar(grammar, self._tokenizer)
+                    self._scene_grammar = grammar
+                except SceneGrammarError as e:
+                    _log.warning(
+                        "scene mode unavailable for this model (%s); "
+                        "rendering falls back to the chat template", e,
+                    )
+        return self._scene_grammar
+
     def _prepare_input(
         self, input: Any, raw: bool = False, thinking: bool = False,
         stateless: bool = False,
@@ -6323,20 +6405,22 @@ class SaklasSession:
         user_role: str | None = None,
         assistant_role: str | None = None,
         to_device: bool = True,
+        gen_seat: str = "assistant",
     ) -> torch.Tensor:
-        if raw and isinstance(input, str):
+        if raw and (isinstance(input, str) or input is None):
             # Flat (base-model / completion) path: no chat template, no
             # role markers.  The model sees the active-path text verbatim
             # — every node along the loom path concatenated — plus this
             # call's own ``input``.  ``stateless`` skips the tree walk so
-            # the buffer is purely ``input``.
+            # the buffer is purely ``input``.  ``input=None`` is a bare
+            # continuation (no new span).
             prefix = "" if stateless else self.tree.flat_text(parent_node_id)
             encoded = self._tokenizer.encode(
-                prefix + input, return_tensors="pt",
+                prefix + (input or ""), return_tensors="pt",
             )
             ids = cast(torch.Tensor, encoded)  # return_tensors="pt" gives Tensor, not list[int]
             return ids.to(self._device) if to_device else ids
-        if isinstance(input, str):
+        if isinstance(input, str) or input is None:
             if stateless:
                 prior: list[dict[str, Any]] = []
             else:
@@ -6348,43 +6432,46 @@ class SaklasSession:
                 # turns render with the roles they were *sent* with.
                 prior = self.tree.messages_for(parent_node_id, with_labels=True)
             # The new user turn carries this send's user-role label.
-            messages = prior + [
-                {"role": "user", "content": input, "label": user_role}
-            ]
+            # ``input=None`` is a continue: no new turn, the generation
+            # prompt opens directly after the existing history (the a/a and
+            # u-continue shapes of the cast model).
+            if input is None:
+                messages = prior
+            else:
+                messages = prior + [
+                    {"role": "user", "content": input, "label": user_role}
+                ]
         elif isinstance(input, list):
             messages = list(input)
         else:
             raise TypeError(f"Unsupported input type: {type(input)}")
-        # Generation-prompt assistant label: a role-augmented steering scope
-        # (``_active_role``, transient, set by ``_SteeringContext`` for
+        # Generation-prompt label.  Assistant seat: a role-augmented steering
+        # scope (``_active_role``, transient, set by ``_SteeringContext`` for
         # ``:role-<slug>`` vectors / persona manifolds) wins so steer
         # baseline matches extract baseline; otherwise this send's
-        # ``assistant_role`` box drives the to-be-generated turn.  Prior
-        # turns' labels ride on the messages themselves (above).
+        # ``assistant_role`` box drives the to-be-generated turn.  User
+        # seat: the ``user_role`` box labels the turn being generated (the
+        # elicitation-baseline contract is an assistant-seat construct, so
+        # ``_active_role`` doesn't apply there).  Prior turns' labels ride
+        # on the messages themselves (above).
         steer_role = getattr(self, "_active_role", None)
-        gen_role = steer_role if steer_role is not None else assistant_role
+        if gen_seat == "assistant":
+            gen_role = steer_role if steer_role is not None else assistant_role
+        else:
+            gen_role = user_role
         model_type_for_role: str | None = None
         any_label = gen_role is not None or any(
             isinstance(m, dict) and m.get("label") for m in messages
         )
         if any_label:
-            model_cfg = getattr(self._model, "config", None)
-            text_cfg = (
-                getattr(model_cfg, "text_config", None)
-                if model_cfg is not None else None
-            )
-            model_type_for_role = (
-                getattr(text_cfg, "model_type", None)
-                if text_cfg is not None
-                else None
-            )
-            if model_type_for_role is None and model_cfg is not None:
-                model_type_for_role = getattr(model_cfg, "model_type", None)
+            model_type_for_role = self._resolved_model_type()
         ids = build_chat_input(
             self._tokenizer, messages, self.config.system_prompt,
             thinking=thinking,
             gen_role=gen_role,
             model_type=model_type_for_role,
+            scene=self.scene_grammar,
+            gen_seat=gen_seat,
         )
         return ids.to(self._device) if to_device else ids
 
@@ -6497,7 +6584,8 @@ class SaklasSession:
     def _generation_preamble(self, input: Any, raw: bool, thinking: bool, stateless: bool = False,
                              parent_node_id: str | None = None,
                              user_role: str | None = None,
-                             assistant_role: str | None = None):
+                             assistant_role: str | None = None,
+                             gen_seat: str = "assistant"):
         """Shared input prep + gen-state reset.
 
         Steering is NOT installed here — the caller is expected to hold a
@@ -6514,6 +6602,7 @@ class SaklasSession:
             input, raw=raw, thinking=use_thinking, stateless=stateless,
             parent_node_id=parent_node_id,
             user_role=user_role, assistant_role=assistant_role,
+            gen_seat=gen_seat,
         )
         self._gen_state.reset()
         return input_ids, use_thinking, int(input_ids.shape[1])
@@ -6674,8 +6763,15 @@ class SaklasSession:
         sampling: SamplingConfig | None,
         steering_obj: Steering | None,
         use_thinking_req: bool,
+        gen_seat: str = "assistant",
     ) -> str | None:
-        """Create the loom user/assistant nodes for a stateful generation."""
+        """Create the loom nodes for a stateful generation.
+
+        ``gen_seat`` is the seat the generated node occupies (the cast
+        model: "generated" is provenance, not a seat).  An explicit
+        non-assistant seat implies scene mode, where seating is free — the
+        user-under-user guard is skipped.
+        """
         if stateless:
             return None
 
@@ -6702,10 +6798,13 @@ class SaklasSession:
             else:
                 user_node_id = parent_node_id or self.tree.active_node_id
         elif isinstance(input, str):
-            self._check_user_send_target(parent_node_id)
+            if gen_seat == "assistant":
+                self._check_user_send_target(parent_node_id)
             user_node_id = self.tree.add_user_turn(
                 input, parent_id=parent_node_id, role_label=user_role)
         else:
+            # ``input=None`` (continue — no new committed turn) or a raw
+            # messages list: anchor directly on the parent.
             user_node_id = parent_node_id or self.tree.active_node_id
 
         self._active_gen_reservation = user_node_id
@@ -6718,8 +6817,11 @@ class SaklasSession:
             probes=list(self._monitor.probe_names),
         )
         recipe = recipe._fill_probe_hashes(self)
+        # The generated node's label follows its seat (user-seat gens are
+        # labeled by the ``user_role`` box, assistant-seat by ``assistant_role``).
+        gen_label = user_role if gen_seat == "user" else assistant_role
         return self.tree.begin_assistant(
-            user_node_id, recipe=recipe, role_label=assistant_role)
+            user_node_id, recipe=recipe, role_label=gen_label, seat=gen_seat)
 
     def _run_generation_loop(
         self,
@@ -6876,6 +6978,7 @@ class SaklasSession:
         parent_node_id: str | None = None,
         recipe_override: "Recipe | str | None" = None,
         forced_prefix: list[int] | None = None,
+        gen_seat: str = "assistant",
     ) -> GenerationResult:
         """Shared generation implementation.
 
@@ -7159,7 +7262,7 @@ class SaklasSession:
             chat_history_anchor = parent_node_id
             if (
                 not stateless
-                and isinstance(input, str)
+                and (isinstance(input, str) or input is None)
                 and chat_history_anchor is None
             ):
                 chat_history_anchor = self.tree.active_node_id
@@ -7172,6 +7275,7 @@ class SaklasSession:
                 sampling=sampling,
                 steering_obj=steering_obj,
                 use_thinking_req=use_thinking_req,
+                gen_seat=gen_seat,
             )
 
             if steering_cm is not None:
@@ -7183,6 +7287,7 @@ class SaklasSession:
                 assistant_role=(
                     sampling.assistant_role if sampling is not None else None
                 ),
+                gen_seat=gen_seat,
             )
             # Refresh snapshot now that steering is pushed (first-scope case).
             vector_snapshot = self._snapshot_steering_alphas()
@@ -7403,6 +7508,7 @@ class SaklasSession:
         parent_node_id: str | None = None,
         n: int = 1,
         recipe_override: "Recipe | str | None" = None,
+        gen_seat: str = "assistant",
     ) -> RunSet:
         """Run one or more sibling generations and return a ``RunSet``."""
         if n < 1:
@@ -7418,11 +7524,14 @@ class SaklasSession:
                 on_token=on_token,
                 parent_node_id=parent_node_id,
                 recipe_override=recipe_override,
+                gen_seat=gen_seat,
             )
             node_id = self.tree.active_node_id if not stateless else None
             return RunSet([result], node_ids=[node_id], kind="generation")
 
-        fast_fan = self._generate_fan_fast(
+        # The batched fast fan renders through its own prefix path — route
+        # non-assistant seats through the serial runner instead.
+        fast_fan = None if gen_seat != "assistant" else self._generate_fan_fast(
             input,
             steering=steering,
             sampling=sampling,
@@ -7457,6 +7566,7 @@ class SaklasSession:
                 on_token=on_token,
                 parent_node_id=parent_node_id,
                 recipe_override=recipe_override,
+                gen_seat=gen_seat,
             ))
         return _run_serial_generation_jobs(
             self,
@@ -7524,6 +7634,7 @@ class SaklasSession:
         parent_node_id: str | None = None,
         n: int = 1,
         recipe_override: "Recipe | str | None" = None,
+        gen_seat: str = "assistant",
     ) -> RunSet:
         """Blocking generation.
 
@@ -7555,6 +7666,16 @@ class SaklasSession:
                 ``n`` times under deterministically-derived per-sibling
                 seeds (see :func:`~saklas.core.loom.derive_seed_schedule`)
                 and returns a multi-result ``RunSet`` in sibling order.
+            gen_seat: which seat the generated turn occupies (the cast
+                model).  ``"assistant"`` (default) is the classic flow;
+                ``"user"`` renders the generation prompt as a user-seat
+                header (labeled by ``sampling.user_role``) and the new
+                node lands with ``role="user"`` + a stamped recipe —
+                generated is provenance, not a seat.  A non-assistant
+                seat needs a validated scene grammar
+                (:attr:`scene_grammar`).  ``input=None`` skips the
+                committed turn entirely — the model continues from the
+                current leaf (the a/a and u/u shapes).
 
         Returns:
             :class:`RunSet` in every case.  It is list-like for fan-out
@@ -7571,6 +7692,7 @@ class SaklasSession:
             parent_node_id=parent_node_id,
             n=n,
             recipe_override=recipe_override,
+            gen_seat=gen_seat,
         )
 
     # -- Generation: streaming --
@@ -7587,6 +7709,7 @@ class SaklasSession:
         parent_node_id: str | None = None,
         recipe_override: "Recipe | str | None" = None,
         live_scores: bool = True,
+        gen_seat: str = "assistant",
     ) -> Iterator[TokenEvent]:
         """Streaming generation.  See :meth:`generate` for kwargs.
 
@@ -7658,6 +7781,7 @@ class SaklasSession:
                     on_token=_push,
                     parent_node_id=parent_node_id,
                     recipe_override=recipe_override,
+                    gen_seat=gen_seat,
                 )
                 result_holder.append(result)
             except BaseException as e:

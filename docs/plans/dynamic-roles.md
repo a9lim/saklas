@@ -1,9 +1,17 @@
 # Dynamic roles — the cast model
 
-*Status: **visual + composer unification ships in the UI redesign; engine work
-sketched here, deferred** (2026-07-10). Companion to `docs/plans/sae-pillar.md`
-in spirit: the redesign builds the surface so the engine work lands without
-re-layout.*
+*Status: **phases 1–2 landed** (2026-07-10): `core/scene.py` (autopsy +
+stitcher + validation, live-validated on 11 real templates) and the engine
+wiring (`scene_grammar` on the session, `build_chat_input` through the
+stitcher, `gen_seat` through generate/stream/fork/regen/readouts, loom seat
+param, WS `generate_seat`, base-model branch → `render_scene_raw`).
+Live-verified on gemma-3-4b: user-seat generation, a/a sequences, cast
+labels (an unsteered `deer` header alone produced in-character output).
+Remaining: composer/loom UI (seat toggle, seat-swap branch, thinking-input
+warning), transcript v2, then phase 3 (cast registry + recipes). The UI
+groundwork (neutral turn treatment, stage-direction system turns, composer
+`speaking as` chips) shipped with the redesign. Companion to
+`docs/plans/sae-pillar.md` in spirit.*
 
 ## Vision (a9)
 
@@ -13,91 +21,126 @@ The chat-app framing (blue human, green machine, two fixed seats) dissolves
 into a loom-native one: a transcript is a *script*, turns are lines spoken by
 cast members, and who typed a line is provenance, not identity.
 
-## What already exists
+Two ambition-setting requirements (2026-07-10):
 
-Closer than it looks. Today's engine is a **two-seat theater with swappable
-nameplates**:
-
-- `role_label` is stamped per-node at generation/commit time (the SamplingStrip
-  `user as` / `reply as` boxes ride the WS `sampling` block), immutable per
-  turn, rendered via `roleDisplayLabel`/`roleGlyphLetter`.
-- The human can author either seat: `commit_role="user"` / `"assistant"`, plus
-  answer-prefill for seeding the assistant seat.
-- Role-label substitution at render time (`ROLE_HEADERS`) works on
-  qwen/gemma/llama/glm/gpt_oss/talkie; mistral3/ministral3 raise
-  `RoleSubstitutionUnsupportedError` (positional `[INST]`, no label in the
-  rendered string).
-- Raw mode is the degenerate case already in hand: one flat buffer, no roles.
+- **Arbitrary seat sequences.** Turns may occupy seats in any order —
+  a/a/u/a/u/u/a/u — not just the alternation chat templates enforce.
+- **Seat-swap forks.** A conversation u/a/u/a can be forked into u/a/a/u:
+  same text, different seat assignment. (Research crown jewel: a controlled
+  experiment on the assistant seat's post-trained identity prior — identical
+  text, one seat bit flipped, diff the persona/emotion probe trajectories.)
 
 ## The cast model
 
-A turn is `(label, seat, provenance)`:
+A turn is `(seat, label, provenance)`:
 
-- **label** — arbitrary slug, what the reader sees ("deer", "pirate", "user").
-- **seat** — the *structural* role the chat template renders (user-side /
-  assistant-side / system). An implementation detail of templated models, not
-  an identity.
+- **seat** — the *structural* role rendered into the token stream. Stays
+  **binary** (user-side / assistant-side, plus system as stage direction) —
+  two seats is what the models' templates know how to emit. All the freedom
+  lives in sequence, label, and provenance.
+- **label** — arbitrary slug, what the reader (and the model) sees ("deer",
+  "pirate", "user").
 - **provenance** — committed (human-typed) vs generated (model-authored).
-  Research-relevant (which text did the model write?) but visually subtle.
+  Kept **derived** (recipe presence + `forced_prefix` for mixed prefill
+  nodes), not a stored field.
 
-Today label is bound to seat ("user as" labels the user seat). The vision
-decouples them.
+`LoomNode` already carries `(role=seat, role_label=label)`; the engine change
+is in *rendering* and in decoupling "generated" from `role == "assistant"`.
 
-## Gaps, ordered by cost
+## The scene renderer (template autopsy + stitcher)
 
-1. **Model speaks the user seat** (small). A `generate_role: "user"` on the WS
-   `generate` frame: render the prompt so it ends with a user-seat header
-   (carrying its label) and decode. Alternation stays satisfied — it's still
-   turn-by-turn. New node = seat `user`, provenance `generated`. Mostly prompt
-   render + node bookkeeping.
-2. **N-party cast (>2 speakers)** (the real project). Chat templates enforce
-   two-seat alternation (gemma's template raises on non-alternating roles), so
-   a genuine three-way scene can't render through `apply_chat_template`.
-   Options: (a) map the cast onto alternating seats when the speaking order
-   happens to alternate; (b) raw-mode-style rendering with role-marker text —
-   the flat buffer generalized from one voice to N; (c) per-family header
-   synthesis (hand-render `<start_of_turn>{label}` sequences), which is
-   `ROLE_HEADERS`' logic promoted from substitution to construction. (c) is
-   the likely winner on families with string role labels; (b) is the universal
-   fallback and base-model path. Needs a support matrix like `ROLE_HEADERS`.
-3. **Cast manager UI** (additive once 1–2 exist). Named cast members, per-turn
-   speaker picker, loom filter/diff/transcript awareness of labels (transcript
-   YAML already carries `role_label`; N-party export needs a seatless schema
-   rev).
+Arbitrary seat sequences force **construction** over substitution: gemma and
+mistral templates hard-raise on non-alternating roles, so `apply_chat_template`
+cannot be the renderer and there is nothing to splice into. But hand-maintaining
+a per-family turn grammar drifts against live templates. The resolution:
 
-## The saklas-native frontier: cast member = (label, recipe)
+**Template autopsy** — render small sentinel-content probe conversations
+through the *real* chat template once per model, locate the sentinels, and
+mechanically extract the segments: prelude (BOS + default-system handling),
+per-seat turn wrappers (open/label-site/close), the system block shape (real
+turn vs gemma-style fold into the first turn), and the generation-prompt
+appendix (including thinking-scaffold variants).
 
-Speculation, but the exciting kind: a cast member could carry a **steering
-recipe** alongside its label — "pirate" speaks under `0.6 personas%pirate`,
-"deer" under its own expression, swapped automatically as the speaker changes
-(the per-turn analogue of what `nearest_node_role` already does for persona
-manifolds at steer time, and of the recipe_override the A/B shadow path uses
-per-generation). The roleplay scaffold and the steering rack meet: a scene
-becomes a set of (voice, position-on-the-manifold) pairs. If this lands, the
-cast manager is not a chat feature — it's a steering surface.
+**Stitcher** — a scene renders as pure concatenation: for each turn,
+`open(seat, label) + [thinking] + content + close(seat)`, plus a trailing
+generation header for whichever seat speaks next. Labels are placed in headers
+we construct — no occurrence-matching, so the `_splice_occurrences` collision
+class (a label equal to the other seat's standard label corrupting the splice)
+is structurally impossible on this path.
 
-## What the redesign ships now (pure UI, no engine change)
+**Round-trip validation** — stitch a canonical alternating conversation and
+byte-compare against the template's own render. Pass → the family gets scene
+mode; fail → raw-marker fallback + a drift warning (same philosophy as
+`RoleTemplateDriftError`). The support matrix is a runtime verdict, not a
+maintained table.
 
-- **One neutral treatment for every turn.** Color encodes nothing about role
-  (under the redesign's hue ontology, roles aren't a "space", so they carry no
-  hue). Identity lives in the role chip: glyph letter + label, arbitrary
-  strings first-class.
-- **System turns render as stage directions** — full-width, italic, dim; not a
-  speaker, a note about the scene.
-- **`speaking as` promoted into the composer** — the seat labels move from the
-  SamplingStrip boxes to a first-class chip beside the input (same
-  `user_role`/`assistant_role` client state, same wire block). This is the
-  visible step toward the cast model.
-- **Provenance stays subtle** — generated turns carry their existing
-  mean-logprob/ppl badge; committed turns simply lack it. No color.
+**The stitcher owns all rendering** (a9 ruling). Extraction renders through
+it too: the round-trip check guarantees bit-identity with `apply_chat_template`
+on standard alternating conversations — exactly what extraction renders — so
+no fitted manifold's baseline shifts. On validation-fail families extraction
+falls back to the template directly (it never needs non-alternating
+sequences). The validator is load-bearing, not advisory.
 
-## Open questions
+Both original gaps collapse into this one artifact: "model speaks the user
+seat" = choose the trailing gen header's seat; "N-party cast" = labels are
+free per turn.
 
-1. Does a recipe bind to the *role* (every pirate line steers alike) or the
-   *turn* (a role can drift scene-to-scene)? Role-level default with per-turn
-   override is the likely shape.
-2. Loom semantics for seatless N-party trees — sibling sort, diff alignment,
-   and the filter grammar all currently assume the two-seat rhythm somewhere.
-3. Transcript schema rev for N-party (current YAML is role+role_label pairs).
-4. Per-family support matrix for header synthesis; mistral-family fallback is
-   raw-marker rendering or nothing.
+## Conventions (ruled 2026-07-10)
+
+1. **System content when turn 1 isn't user-seat.** Families with a real
+   system turn render it normally; fold families (gemma) prepend into the
+   first turn *whatever its seat*. Deterministic, documented, invented.
+2. **Per-seat stop tokens.** The autopsy's per-seat close segments supply
+   them (gpt-oss ends user turns `<|end|>` vs assistant `<|return|>`;
+   gemma/qwen/llama share terminators). Generating into a seat stops on that
+   seat's terminator. Asymmetric but correct.
+3. **Thinking is a per-turn optional input on any seat.** The human can
+   commit their own thinking block; rendered via the family think delimiters
+   when they exist, error otherwise. History policy: **follow the family
+   template's convention uniformly** — if the template strips thinking from
+   prior turns, the stitcher strips it every turn, committed or generated
+   alike (no provenance split). The composer warns before submit that a
+   thinking block lasts one turn on strip families (phase-2 UI).
+4. **One render authority.** The stitcher owns all rendering; the splice path
+   (`apply_with_role` / `apply_with_per_turn_roles`) retires once wired.
+
+## Fork-and-swap
+
+`LoomTree.branch` already accepts `role=` — a seat-swap fork is a branch
+whose node copies keep text and flip `role`. Downstream invalidation follows
+the existing `edit` contract (cached `raw_token_ids` were produced under the
+old header; the swapped branch re-renders at next generation). Missing pieces
+are render support (the stitcher) and UI.
+
+## Phasing
+
+1. **Scene renderer** *(in progress)* — `core/scene.py`: autopsy + stitcher +
+   round-trip validation + raw-marker fallback (mistral, base models).
+   Arbitrary `(seat, label, thinking)` sequences, per-seat trailing gen
+   headers, per-seat stop segments.
+2. **Seat plumbing** — `generate_seat` on the WS generate frame (commit
+   already covers both seats via `commit_role`); the consumer sweep
+   decoupling "generated" from `role == "assistant"` (`regenerate` step
+   logic, ppl badge, `joint_logprobs`, `jlens_token_readout`); seat-swap
+   branch in the loom UI; transcript schema v2 (`speaker:` + `cast:` block,
+   v1 import shim); wire `_prepare_input` through the stitcher.
+3. **Cast registry + recipes** — `cast: dict[slug, CastMember]` on
+   `LoomTree` (serialized in tree save + transcript); composer picker over
+   cast members; per-speaker steering recipe composed at generation
+   (role-level default, per-turn `Recipe.overlay` override; label agreement
+   with `_active_role` warns on mismatch, `RoleBaselineMismatchWarning`
+   pattern). A cast member is `(label, recipe)` — the cast manager is a
+   steering surface, not a chat feature.
+4. **Research** — seat-swap probe diffs, per-speaker steered scenes,
+   `nearest_node_role` interplay, seat effects through the J-lens.
+
+## Deferred / open
+
+- Mid-scene stage directions (system turns at arbitrary positions) — v1
+  allows leading system only; fold families have no mid-scene shape.
+- Thinking *generation* into non-assistant seats (scaffold prefill) — v1
+  renders committed thinking only.
+- OpenAI-compat export of non-alternating paths (`/v1/chat/completions`
+  tolerates arbitrary role sequences; the native API is the home surface).
+- Loom sibling-sort/diff/filter assumptions about the two-seat rhythm —
+  audited in phase 2.

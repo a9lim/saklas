@@ -47,6 +47,13 @@ class WSGenerateMessage(BaseModel):
     prefill_text: str | None = None
     commit_role: Literal["user", "assistant"] | None = None
     commit_text: str | None = None
+    # Cast model: which seat the generated turn occupies.  ``"user"``
+    # renders the generation prompt as a user-seat header and lands the
+    # node with ``role="user"`` + a stamped recipe (generated is
+    # provenance, not a seat).  ``None`` = assistant (the classic flow).
+    # Pair with ``input: null`` for a continue — no committed turn, the
+    # model speaks next from the current leaf (a/a and u/u sequences).
+    generate_seat: Literal["user", "assistant"] | None = None
 
 
 def build_sampling(body: WSSamplingParams | None) -> SamplingConfig | None:

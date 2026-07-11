@@ -760,6 +760,40 @@ probes viability + caches keyed by underlying module id / device / dtype;
 `make_static_cache` sizes to `prompt_len + max_new_tokens + offset`; `warn_once`
 logs the fallback reason.
 
+## scene.py
+
+The cast-model turn stitcher (`docs/plans/dynamic-roles.md`): **template
+autopsy** renders sentinel-content probes through the live chat template and
+slices out a `TurnGrammar` — prelude, per-seat `SeatWrapper`s (open/label
+site/close), system shape (real turn vs gemma-style fold, or unsupported —
+gemma-2), generation appendices (`gen_extra` under `enable_thinking=False`,
+`gen_extra_thinking` under True; `None` = thinking-mode stitching
+unsupported), content/system trim flags (probed with padded sentinels —
+gemma/llama/qwen3.5 `| trim` content; trim applies to turn *text* before
+thinking/fold composition), `last_assistant_special` (qwen3 inserts an empty
+think scaffold into the final assistant turn of a *closed* render — that
+shape falls back to the template), think delimiters + the empirically-probed
+`strips_history_thinking` (strip families render a turn's committed thinking
+only while it is the last turn before the gen header — "lasts one turn", a9
+convention 3). `render_scene(grammar, turns, *, system, gen_seat, gen_label,
+gen_thinking)` stitches arbitrary `(seat, label, text, thinking)` sequences —
+alternation NOT required, labels placed in *constructed* headers (the
+`_splice_occurrences` label-collision class is structurally impossible) —
+plus a trailing generation header on either seat. `validate_turn_grammar` is
+the **load-bearing gate**: byte-exact round-trip against the template's own
+render (plain / gen / padded / system / closed-on-assistant / thinking-gen
+cases); a passing family's alternating renders are bit-identical through the
+stitcher (extraction baseline contract), a failing family falls back with a
+warning (`SceneGrammarError`). `render_scene_raw` is the marker-mode
+fallback (base models, mistral) — also the `build_chat_input` base-model
+branch. `SaklasSession.scene_grammar` is the lazy per-session
+autopsy+validation (None = fallback); `build_chat_input(scene=, gen_seat=)`
+routes through the stitcher when a grammar is present, byte-identical on
+every legacy render, and is the only path that can open a user-seat
+generation prompt. Live-validated on 11 real templates (gemma-2/3/4,
+llama-3.2, qwen2.5/3/3.5, talkie; GLM-4.7-Flash falls back — braids think
+markers into turn structure).
+
 ## generation.py
 
 Token-by-token decode + KV cache under `torch.inference_mode()`. Models that

@@ -46,6 +46,7 @@ class _SweepStub:
         parent_node_id: Any = None,
         on_token: Any = None,
         recipe_override: Any = None,
+        gen_seat: str = "assistant",
     ) -> GenerationResult:
         # Echo the call args for assertions.
         self.calls.append({

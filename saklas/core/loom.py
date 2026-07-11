@@ -38,7 +38,7 @@ from contextlib import suppress
 import threading
 import time
 from dataclasses import dataclass, field, fields
-from typing import Any, Callable, Iterator, Literal
+from typing import Any, Callable, Iterator, Literal, cast
 
 from saklas.core.errors import SaklasError
 from saklas.core.sampling import SamplingConfig
@@ -804,16 +804,25 @@ class LoomTree:
         recipe: Recipe | None = None,
         *,
         role_label: str | None = None,
+        seat: str = "assistant",
     ) -> str:
-        """Create an empty assistant node under ``parent_id``.
+        """Create an empty generated node under ``parent_id``.
 
         Returns the new node id.  The session calls this in the gen
         preamble; subsequent ``append_token`` / ``finalize_assistant``
         calls populate the node as the generation streams.
 
         ``role_label`` stamps the per-turn role-substitution label the
-        model is generating under (the roleplay scaffold).
+        model is generating under (the roleplay scaffold).  ``seat`` is
+        the structural role the node occupies (the cast model: the model
+        can generate into the user seat too — "generated" is provenance,
+        carried by the recipe, not a role).
         """
+        if seat not in ("user", "assistant"):
+            raise InvalidNodeOperationError(
+                f"begin_assistant: seat must be 'user' or 'assistant', "
+                f"got {seat!r}"
+            )
         with self._lock:
             if parent_id not in self.nodes:
                 raise UnknownNodeError(parent_id)
@@ -821,7 +830,7 @@ class LoomTree:
             node = LoomNode(
                 id=_ulid(),
                 parent_id=parent_id,
-                role="assistant",
+                role=cast(Role, seat),
                 recipe=recipe,
                 role_label=role_label,
                 tokens=[],

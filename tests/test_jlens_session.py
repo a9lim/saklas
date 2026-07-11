@@ -860,11 +860,13 @@ class _TreeStubSession(_StubSession):
         user_role: str | None = None,
         assistant_role: str | None = None,
         to_device: bool = True,
+        gen_seat: str = "assistant",
     ) -> torch.Tensor:
         self.prepare_calls.append({
             "input": input, "raw": raw, "thinking": thinking,
             "parent_node_id": parent_node_id,
             "user_role": user_role, "assistant_role": assistant_role,
+            "gen_seat": gen_seat,
         })
         return torch.tensor(
             [self._tokenizer.encode(_PROMPT_RENDER)], dtype=torch.long,
@@ -935,9 +937,14 @@ def test_jlens_token_readout_shape_and_position() -> None:
         assert 0.0 <= strength <= 1.0
         assert com == pytest.approx(1 / (3 - 1), abs=1e-6)
         assert spread == pytest.approx(0.0, abs=1e-6)
-    # user_role/assistant_role of the replayed render come off the nodes
-    assert s.prepare_calls[0]["input"] == "a user turn"
+    # Continue-mode rebuild (cast model): no text resend — the history walk
+    # to the node's parent carries the user turn; the gen header opens the
+    # node's own seat.
+    assert s.prepare_calls[0]["input"] is None
     assert s.prepare_calls[0]["raw"] is False
+    assert s.prepare_calls[0]["gen_seat"] == "assistant"
+    node = s.tree.get(node_id)
+    assert s.prepare_calls[0]["parent_node_id"] == node.parent_id
 
 
 def test_jlens_token_readout_index_zero_reads_prompt_only() -> None:
@@ -1004,8 +1011,15 @@ def test_jlens_token_readout_errors() -> None:
     assert user_id is not None
     with pytest.raises(UnknownNodeError):
         s.jlens_token_readout("nope", 0)
-    with pytest.raises(InvalidNodeOperationError, match="not an assistant"):
+    # A committed user turn is a valid *shape* under the cast model (user-
+    # seat generated nodes are forkable/readable) — but this one has no
+    # decode record, so it fails on that instead of its role.
+    with pytest.raises(InvalidNodeOperationError, match="no raw token record"):
         s.jlens_token_readout(user_id, 0)
+    # The system root stays out of bounds — not a turn at all.
+    assert s.tree.root_id is not None
+    with pytest.raises(InvalidNodeOperationError, match="only a turn"):
+        s.jlens_token_readout(s.tree.root_id, 0)
     with pytest.raises(InvalidNodeOperationError, match="out of range"):
         s.jlens_token_readout(node_id, 3)
     with pytest.raises(InvalidNodeOperationError, match="out of range"):

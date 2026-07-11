@@ -313,11 +313,14 @@ class _MockTree:
 
         # parent (user node) and two assistant children with different
         # assistant text.  The base-model fallback in build_chat_input
-        # serializes as ``"Role: content\nRole: content\nAssistant:"``.
+        # serializes via ``render_scene_raw`` ("Role: content" lines).
+        # The shared "end" tail gives the byte-offset walker a genuinely
+        # aligned position after the a/b divergence (the closed render
+        # carries no trailing generation header to align on).
         root = LoomNode(id="root", parent_id=None, role="system", text="")
         user = LoomNode(id="u1", parent_id="root", role="user", text="ask")
-        a1 = LoomNode(id="a1", parent_id="u1", role="assistant", text="hello a")
-        a2 = LoomNode(id="a2", parent_id="u1", role="assistant", text="hello b")
+        a1 = LoomNode(id="a1", parent_id="u1", role="assistant", text="hello a end")
+        a2 = LoomNode(id="a2", parent_id="u1", role="assistant", text="hello b end")
         self.nodes = {"root": root, "u1": user, "a1": a1, "a2": a2}
 
     def messages_for(self, leaf_id: str, *, include_system: bool = False):
@@ -351,7 +354,7 @@ class _MockSession:
         self.tokenizer = _MockTokenizer()
         # Build a vocabulary that covers the strings we'll feed.  The
         # decode path needs every id to round-trip.
-        for word in ("User:", "ask", "Assistant:", "hello", "a", "b"):
+        for word in ("User:", "ask", "Assistant:", "hello", "a", "b", "end"):
             self.tokenizer._intern(word)
         self._model = _MockModel(vocab=len(self.tokenizer._vocab) + 16)
         self.model = self._model

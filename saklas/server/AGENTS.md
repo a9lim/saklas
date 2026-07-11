@@ -407,7 +407,14 @@ across generations; multiple clients supported. Events: `start`
 
 Bidirectional WebSocket; only `session_id == "default"` is reachable (HF ids contain
 `/`). Client → server: `{type: "stop"}`, or `{type: "generate", input, steering,
-sampling, thinking, stateless, raw, parent_node_id?, n?, recipe_override?}`. The
+sampling, thinking, stateless, raw, parent_node_id?, n?, recipe_override?,
+generate_seat?}`. `generate_seat` (`"user"|"assistant"`, default assistant) is
+the cast model's seat selector: `"user"` renders the generation prompt as a
+user-seat header (labeled by `sampling.user_role`) and lands the node with
+`role="user"` + a stamped recipe — generated is provenance, not a seat; needs
+the session's validated scene grammar (`SceneRenderError` 400 otherwise).
+`input: null` is a continue — no committed turn, the model speaks next from
+`parent_node_id` (or the active leaf), enabling a/a and u/u sequences. The
 `sampling` block (`WSSamplingParams` → `build_sampling` → `SamplingConfig`) carries
 `user_role`/`assistant_role` (the per-message role-substitution labels, stamped
 onto the produced loom nodes and rendered faithfully per-turn), plus `return_top_k`

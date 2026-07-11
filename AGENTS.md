@@ -815,6 +815,16 @@ with SaklasSession.from_pretrained("google/gemma-3-4b-it", device="auto") as ses
 Key contracts:
 - `generate` / `generate_stream` / `session.steering()` accept `str | Steering |
   None` only — dicts raise `TypeError`. A string is a steering expression.
+- **Cast model** (`core/scene.py`, `docs/plans/dynamic-roles.md`): rendering
+  goes through the per-session **scene grammar** (template autopsy +
+  byte-exact round-trip validation; `session.scene_grammar`, None = legacy
+  fallback). `generate(..., gen_seat="user")` has the model speak the user
+  seat (node lands `role="user"` with a recipe — generated is provenance,
+  not a seat); `generate(None, ...)` continues from the current leaf with no
+  committed turn (a/a, u/u sequences); per-turn `role_label`s are cast
+  labels. Seats stay binary; arbitrary seat *sequences* and labels are free
+  on validated families (gemma-2/3/4, llama, qwen, talkie), raw-marker
+  fallback otherwise. WS: `generate_seat` on the generate frame.
 - `generate`, `generate_batch`, `generate_sweep` always return `RunSet` — list-like,
   carrying `node_ids`/`grid`, with `.first` (the underlying `GenerationResult`) and
   common attributes delegating to it. `session.last_result` is the `GenerationResult`.
