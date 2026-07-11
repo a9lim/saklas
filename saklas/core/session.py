@@ -2895,36 +2895,98 @@ class SaklasSession:
             return None
         # ``getattr`` — test stubs bind these methods without instance state.
         stash = getattr(self, "_lens_step_stash", None)
-        if (
-            stash is not None
-            and stash.get("fresh")
-            and stash.get("layers") == tuple(layers_present)
-        ):
-            # The gate callback already computed this forward's band logits
-            # (score_callback runs before the token tap) — reuse them.
-            stash["fresh"] = False
-            logits = stash["logits"]
-        else:
-            J_stack: torch.Tensor = state["J_stack"]
-            rows = torch.tensor(
-                transport_rows, device=J_stack.device, dtype=torch.long,
+        logits: torch.Tensor | None = None
+        probabilities: torch.Tensor | None = None
+        cached_logits: dict[int, torch.Tensor] = {}
+        cached_probs: dict[int, torch.Tensor] = {}
+        if stash is not None and stash.get("fresh"):
+            stash_layers = tuple(int(layer) for layer in (stash.get("layers") or ()))
+            if stash_layers == tuple(layers_present):
+                # The common gate+live path: exact row-set match.  Keep the
+                # existing zero-copy reuse of the full matrix rather than
+                # restacking full-vocab rows.
+                stash["fresh"] = False
+                logits = stash["logits"]
+                probabilities = stash.get("probabilities")
+            else:
+                # The gate callback may already have computed this forward's
+                # band logits before the token tap.  Reuse any overlapping rows
+                # rather than requiring the live display layer set to match
+                # exactly: an explicit live-lens display can cover a superset of
+                # the gated probe band without recomputing those rows.  Softmax
+                # calibration is per-layer, so cached probability rows compose
+                # exactly with newly computed rows.
+                for row, layer in enumerate(stash_layers):
+                    if layer in layers_present:
+                        cached_logits[int(layer)] = stash["logits"][row]
+                        probs = stash.get("probabilities")
+                        if probs is not None:
+                            cached_probs[int(layer)] = probs[row]
+                if cached_logits:
+                    stash["fresh"] = False
+        computed_logits: dict[int, torch.Tensor] = {}
+        if logits is None:
+            missing = [
+                (layer, hidden, transport_row)
+                for layer, hidden, transport_row in zip(
+                    layers_present, hidden_rows, transport_rows, strict=True,
+                )
+                if layer not in cached_logits
+            ]
+            if missing:
+                J_stack: torch.Tensor = state["J_stack"]
+                rows = torch.tensor(
+                    [row for _layer, _hidden, row in missing],
+                    device=J_stack.device,
+                    dtype=torch.long,
+                )
+                J = J_stack.index_select(0, rows)
+                H = torch.stack(
+                    [hidden for _layer, hidden, _row in missing], dim=0,
+                ).to(J.device)
+                transported = torch.bmm(J, H.unsqueeze(-1)).squeeze(-1)
+                normed = state["norm"](transported)
+                computed = normed.to(unembed.dtype) @ unembed.T
+                computed_logits = {
+                    layer: computed[row]
+                    for row, (layer, _hidden, _transport) in enumerate(missing)
+                }
+            logits = torch.stack(
+                [
+                    cached_logits[layer]
+                    if layer in cached_logits else computed_logits[layer]
+                    for layer in layers_present
+                ],
+                dim=0,
             )
-            J = J_stack.index_select(0, rows)
-            H = torch.stack(hidden_rows, dim=0).to(J.device)
-            transported = torch.bmm(J, H.unsqueeze(-1)).squeeze(-1)
-            normed = state["norm"](transported)
-            logits = normed.to(unembed.dtype) @ unembed.T
         from saklas.core.jlens import readout_probabilities
 
-        probabilities = (
-            stash.get("probabilities")
-            if stash is not None and logits is stash.get("logits")
-            else None
-        )
         if probabilities is None:
-            # One full-vocabulary normalization serves pinned probes,
-            # per-layer cards, and the aggregate.
-            probabilities = readout_probabilities(logits)
+            if not cached_probs and not computed_logits:
+                probabilities = readout_probabilities(logits)
+            else:
+                probability_rows: dict[int, torch.Tensor] = dict(cached_probs)
+                uncached_prob_layers = [
+                    layer for layer in layers_present
+                    if layer not in probability_rows
+                ]
+                if uncached_prob_layers:
+                    uncached_logits = torch.stack(
+                        [
+                            computed_logits[layer]
+                            if layer in computed_logits else cached_logits[layer]
+                            for layer in uncached_prob_layers
+                        ],
+                        dim=0,
+                    )
+                    uncached_probs = readout_probabilities(uncached_logits)
+                    probability_rows.update({
+                        layer: uncached_probs[row]
+                        for row, layer in enumerate(uncached_prob_layers)
+                    })
+                probabilities = torch.stack(
+                    [probability_rows[layer] for layer in layers_present], dim=0,
+                )
         # Pinned lens probes ride the same calibrated matrix — per-step
         # readout-channel readings for the payload merge.
         if getattr(self, "_lens_probes", None):
@@ -3303,6 +3365,7 @@ class SaklasSession:
     def _score_sae_probes(
         self, hidden: dict[int, torch.Tensor] | None = None,
         *, activations: torch.Tensor | None = None,
+        only: "set[str] | None" = None,
     ) -> dict[str, "ProbeReading"]:
         if not self._sae_probes:
             return {}
@@ -3312,17 +3375,34 @@ class SaklasSession:
                 return {}
             activations = self._encode_sae_hidden(hidden[layer])
         assert activations is not None
+        names = [
+            name for name in self._sae_probes
+            if only is None or name in only
+        ]
+        if not names:
+            return {}
+        fids = [int(self._sae_probes[name]["feature_id"]) for name in names]
+        fid_tensor = torch.tensor(
+            fids, device=activations.device, dtype=torch.long,
+        )
+        # One host transfer for every pinned SAE probe value.  The previous
+        # per-probe ``float(activations[fid])`` scalarized one device tensor per
+        # feature, which is exactly the kind of repeated sync the live generation
+        # path tries to avoid.
+        raw_values = activations.index_select(0, fid_tensor).detach().to("cpu").tolist()
         out: dict[str, ProbeReading] = {}
-        for name, spec in self._sae_probes.items():
-            fid = int(spec["feature_id"])
-            value = float(activations[fid])
+        for name, fid, raw_value in zip(names, fids, raw_values, strict=True):
+            spec = self._sae_probes[name]
+            value = float(raw_value)
             # The ONE channel is normalized strength — ``activation /
             # maxActApprox`` ∈ ~[0,1], apples-to-apples across features like
             # the lens probes' mean band probability. Raw activation only
             # when no metadata exists (offline / not on Neuronpedia).
-            max_act = self._sae_max_act(fid)
+            max_act = spec.get("max_act")
+            if not (isinstance(max_act, (int, float)) and float(max_act) > 0):
+                max_act = self._sae_max_act(fid)
             if max_act is not None:
-                value = value / max_act
+                value = value / float(max_act)
             out[name] = ProbeReading(
                 fraction=0.0, nearest=[], coords=(value,), residual=0.0,
                 coords_per_layer={layer: (value,)},
@@ -3331,7 +3411,9 @@ class SaklasSession:
             )
         return out
 
-    def _score_sae_gate_scalars(self) -> dict[str, float]:
+    def _score_sae_gate_scalars(
+        self, gate_keys: "set[str] | None" = None,
+    ) -> dict[str, float]:
         if not self._sae_probes:
             return {}
         _backend, layer, _width = self._require_sae()
@@ -3340,8 +3422,15 @@ class SaklasSession:
             return {}
         acts = self._encode_sae_hidden(latest[layer])
         self._sae_step_stash = {"activations": acts, "fresh": True}
+        only = None
+        if gate_keys:
+            only = {
+                key.split("[", 1)[0]
+                for key in gate_keys
+                if key.split("[", 1)[0] in self._sae_probes
+            }
         return Monitor.flat_scalars(
-            self._score_sae_probes(activations=acts)
+            self._score_sae_probes(activations=acts, only=only)
         )
 
     def _live_sae_readout_step(
@@ -5443,6 +5532,7 @@ class SaklasSession:
         logits: torch.Tensor | None = None,
         probabilities: torch.Tensor | None = None,
         layers: "Sequence[int] | None" = None,
+        only: "set[str] | None" = None,
     ) -> dict[str, "ProbeReading"]:
         """Score every attached lens probe from hidden slices (or reuse
         precomputed lens ``logits`` rows aligned with ``layers``).
@@ -5488,7 +5578,12 @@ class SaklasSession:
                 if probabilities is not None:
                     probabilities = probabilities[keep]
             layers = [layers[i] for i in keep]
-        names = list(self._lens_probes)
+        names = [
+            name for name in self._lens_probes
+            if only is None or name in only
+        ]
+        if not names:
+            return {}
         token_ids = [self._lens_probes[n]["token_id"] for n in names]
         if probabilities is None:
             assert logits is not None
@@ -5514,7 +5609,9 @@ class SaklasSession:
             )
         return out
 
-    def _score_lens_gate_scalars(self) -> dict[str, float]:
+    def _score_lens_gate_scalars(
+        self, gate_keys: "set[str] | None" = None,
+    ) -> dict[str, float]:
         """Per-forward lens-probe gate scalars from the latest capture slices.
 
         Called from the gating score callback (once per decode forward, before
@@ -5548,8 +5645,15 @@ class SaklasSession:
             "probabilities": probabilities,
             "fresh": True,
         }
+        only = None
+        if gate_keys:
+            only = {
+                key.split("[", 1)[0]
+                for key in gate_keys
+                if key.split("[", 1)[0] in self._lens_probes
+            }
         readings = self._score_lens_probes(
-            {}, probabilities=probabilities, layers=layers,
+            {}, probabilities=probabilities, layers=layers, only=only,
         )
         return Monitor.flat_scalars(readings)
 

@@ -828,6 +828,35 @@ def test_live_lens_step_normalizes_once_across_all_consumers(
     assert calls == 1
 
 
+def test_live_lens_reuses_gated_subset_rows_for_wider_display() -> None:
+    s = _StubSession()
+    s.fit_jlens(_PROMPTS)
+    s.enable_live_lens(layers=[0, 1], top_k=3)
+    s._add_lens_probe("jlens/g", as_name=None)
+    s._capture = _FakeCapture({
+        0: torch.randn(6, generator=torch.Generator().manual_seed(0)),
+        1: torch.randn(6, generator=torch.Generator().manual_seed(1)),
+    })
+
+    assert s._score_lens_gate_scalars({"jlens/g"})
+    assert s._lens_step_stash is not None
+    assert s._lens_step_stash["layers"] == (1,)
+    # Poison the live transport row for the gated layer after the gate callback.
+    # The display still covers both live layers, but layer 1 should ride the
+    # cached gate logits/probabilities instead of recomputing from this row.
+    assert s._live_lens is not None
+    row = s._live_lens["layer_rows"][1]
+    s._live_lens["J_stack"][row].fill_(float("nan"))
+
+    step = SaklasSession._live_lens_readout_step(s)  # type: ignore[arg-type]
+
+    assert step is not None
+    per_layer, aggregate = step
+    assert set(per_layer) == {0, 1}
+    assert all(torch.isfinite(torch.tensor(score)) for _tok, score in per_layer[1])
+    assert all(torch.isfinite(torch.tensor(row[1])) for row in aggregate)
+
+
 def test_live_lens_readout_step_none_when_off() -> None:
     s = _StubSession()
     assert SaklasSession._live_lens_readout_step(s) is None  # type: ignore[arg-type]

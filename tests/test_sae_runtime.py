@@ -146,6 +146,22 @@ def test_sae_gate_scalar_is_normalized_when_metadata_known() -> None:
     assert scalars["sae/2"] == pytest.approx(0.5)
 
 
+def test_sae_gate_scalar_scores_only_referenced_probe() -> None:
+    session = _session()
+    session._sae_probes["sae/1"] = {
+        "feature_id": 1, "layer": 1, "label": None, "max_act": None,
+    }
+    session._sae_probes["sae/2"] = {
+        "feature_id": 2, "layer": 1, "label": "feature two", "max_act": 10.0,
+    }
+
+    scalars = session._score_sae_gate_scalars({"sae/1"})
+
+    assert scalars["sae/1"] == pytest.approx(3.0)
+    assert scalars["sae/1[0]"] == pytest.approx(3.0)
+    assert "sae/2" not in scalars
+
+
 def test_composer_detects_attached_sae_gate() -> None:
     stub = SimpleNamespace(
         _sae_probes={"sae/2": {"feature_id": 2}},

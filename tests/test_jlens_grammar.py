@@ -209,6 +209,35 @@ def test_gated_lens_probe_keys_and_gate_scalars() -> None:
     assert composer.gated_lens_probe_keys() == {"jlens/g"}
 
 
+def test_lens_gate_scalar_scores_only_referenced_probe() -> None:
+    from saklas.core.session import SaklasSession
+
+    session = _StubSession()
+    session.fit_jlens(_PROMPTS)
+    SaklasSession.add_probe(session, "jlens/g")  # type: ignore[arg-type]
+    SaklasSession.add_probe(session, "jlens/a")  # type: ignore[arg-type]
+
+    class _FlatCapture:
+        def __init__(self, latest: dict[int, torch.Tensor]) -> None:
+            self._latest = latest
+
+        def latest_per_layer(self) -> dict[int, torch.Tensor]:
+            return self._latest
+
+    layers = [int(l) for l in session._jlens_workspace_band(session.jlens)]
+    d_model = next(iter(session.jlens.jacobians.values())).shape[0]
+    session._capture = _FlatCapture(
+        {l: torch.randn(d_model, generator=torch.Generator().manual_seed(l + 10))
+         for l in layers}
+    )
+
+    scalars = session._score_lens_gate_scalars({"jlens/g"})
+
+    assert "jlens/g" in scalars
+    assert "jlens/g[0]" in scalars
+    assert "jlens/a" not in scalars
+
+
 # -------------------------------------------------------------- ns reservation
 
 

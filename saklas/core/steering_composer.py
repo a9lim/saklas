@@ -905,8 +905,10 @@ class SteeringComposer:
         # J-lens token probes referenced by active gates score on the lens
         # path (readout-channel strength), not through the Monitor —
         # detected once per generation here, merged into every return below.
-        has_lens_gates = bool(self.gated_lens_probe_keys())
-        has_sae_gates = bool(self.gated_sae_probe_keys())
+        lens_gate_keys = self.gated_lens_probe_keys()
+        sae_gate_keys = self.gated_sae_probe_keys()
+        has_lens_gates = bool(lens_gate_keys)
+        has_sae_gates = bool(sae_gate_keys)
 
         def _monitor_scalars() -> dict[str, float]:
             incremental_readings = getattr(session, "_incremental_readings", [])
@@ -961,11 +963,11 @@ class SteeringComposer:
             if has_lens_gates:
                 # Once per forward: band lens logits → strength
                 # scalars (also stashed for the display step to reuse).
-                lens_scalars = session._score_lens_gate_scalars()
+                lens_scalars = session._score_lens_gate_scalars(lens_gate_keys)
                 if lens_scalars:
                     out = {**out, **lens_scalars}
             if has_sae_gates:
-                sae_scalars = session._score_sae_gate_scalars()
+                sae_scalars = session._score_sae_gate_scalars(sae_gate_keys)
                 if sae_scalars:
                     out = {**out, **sae_scalars}
             return out
