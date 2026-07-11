@@ -449,9 +449,12 @@ def test_generate_stream_live_readouts_false_suppresses_readout_flags() -> None:
     assert events[0].sae_readout is None
 
 
-def test_token_tap_skips_unconsumed_live_readout_helpers_and_empty_payload() -> None:
+def test_token_tap_skips_unconsumed_live_readout_helpers_and_empty_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     import threading
 
+    import saklas.core.token_payloads as token_payloads
     from saklas.core.triggers import TriggerContext
 
     session: Any = SaklasSession.__new__(SaklasSession)
@@ -529,6 +532,16 @@ def test_token_tap_skips_unconsumed_live_readout_helpers_and_empty_payload() -> 
     session._last_token_probe_payload = {"stale": True}
     observed_payloads: list[Any] = []
     seen_tokens: list[str] = []
+    payload_builder_calls = 0
+
+    def _fail_empty_payload_build(**_kwargs: Any) -> Any:
+        nonlocal payload_builder_calls
+        payload_builder_calls += 1
+        raise AssertionError("text-only token tap should not build empty payload")
+
+    monkeypatch.setattr(
+        token_payloads, "build_token_probe_payload", _fail_empty_payload_build,
+    )
 
     def _run_generation_loop(
         _input_ids: Any,
@@ -573,6 +586,7 @@ def test_token_tap_skips_unconsumed_live_readout_helpers_and_empty_payload() -> 
     assert result.text == "x"
     assert seen_tokens == ["x"]
     assert observed_payloads == [None]
+    assert payload_builder_calls == 0
 
 
 def test_finalize_incremental_probe_path_does_not_stack_capture() -> None:

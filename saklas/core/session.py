@@ -7674,7 +7674,10 @@ class SaklasSession:
                 and sampling.persist_subspace_coords
             )
             self._monitor.set_subspace_coords(_persists_subspace_coords)
-            from saklas.core.token_payloads import build_token_probe_payload
+            from saklas.core.token_payloads import (
+                TokenProbePayload,
+                build_token_probe_payload,
+            )
 
             def _token_tap(text: str, is_thinking: bool, tid: int | None, lp: float | None, top_alts: Any, perplexity: float | None) -> None:
                 nonlocal mean_logprob_sum, mean_logprob_count
@@ -7694,15 +7697,19 @@ class SaklasSession:
                         or _persists_subspace_coords
                     )
                 )
-                payload = build_token_probe_payload(
-                    monitor=self._monitor,
-                    capture=self._capture,
-                    capture_state=self._capture_state,
-                    incremental_readings=self._incremental_readings,
-                    needs_scores=needs_scores,
-                    wants_live_token_scores=_wants_live_token_scores,
-                    persists_layer_scores=_persists_layer_scores,
-                    assistant_node_id=assistant_node_id,
+                payload = (
+                    build_token_probe_payload(
+                        monitor=self._monitor,
+                        capture=self._capture,
+                        capture_state=self._capture_state,
+                        incremental_readings=self._incremental_readings,
+                        needs_scores=needs_scores,
+                        wants_live_token_scores=_wants_live_token_scores,
+                        persists_layer_scores=_persists_layer_scores,
+                        assistant_node_id=assistant_node_id,
+                    )
+                    if needs_scores
+                    else None
                 )
                 # Live workspace readout (None when off): the step's top-k
                 # lens tokens per selected layer + the layer-aggregated
@@ -7722,6 +7729,8 @@ class SaklasSession:
                 # into every populated probe channel so the loom row, trait
                 # stream, and WS frames carry them uniformly.
                 if lens_step is not None and self._last_lens_step_readings:
+                    if payload is None:
+                        payload = TokenProbePayload()
                     payload.merge_readings(
                         self._last_lens_step_readings,
                         per_layer=(
@@ -7731,6 +7740,8 @@ class SaklasSession:
                         live=_wants_live_token_scores,
                     )
                 if sae_step is not None and self._last_sae_step_readings:
+                    if payload is None:
+                        payload = TokenProbePayload()
                     payload.merge_readings(
                         self._last_sae_step_readings,
                         per_layer=(
@@ -7739,21 +7750,30 @@ class SaklasSession:
                         ),
                         live=_wants_live_token_scores,
                     )
-                scores = payload.scores
-                per_layer_payload = payload.per_layer_scores
+                scores = payload.scores if payload is not None else None
+                per_layer_payload = (
+                    payload.per_layer_scores if payload is not None else None
+                )
                 lens_payload = lens_step[0] if lens_step is not None else None
                 lens_aggregate_payload = (
                     lens_step[1] if lens_step is not None else None
                 )
                 if (
-                    payload.scores
-                    or payload.readings
-                    or payload.per_layer_scores
-                    or payload.probe_readings
-                    or lens_payload
+                    lens_payload
                     or lens_aggregate_payload
                     or sae_step
+                    or (
+                        payload is not None
+                        and (
+                            payload.scores
+                            or payload.readings
+                            or payload.per_layer_scores
+                            or payload.probe_readings
+                        )
+                    )
                 ):
+                    if payload is None:
+                        payload = TokenProbePayload()
                     self._last_token_probe_payload = payload.to_token_payload(
                         lens=lens_payload,
                         lens_aggregate=lens_aggregate_payload,
