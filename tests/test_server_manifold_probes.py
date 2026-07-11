@@ -564,6 +564,7 @@ class TestOpenAIProbeExtension:
 
         def _mock_stream(*args: Any, **kwargs: Any) -> Any:
             assert kwargs.get("live_scores") is False
+            assert kwargs.get("live_readouts") is False
             yield TokenEvent(
                 text="Hi", token_id=1, index=0,
             )
@@ -657,6 +658,7 @@ class TestOllamaProbeExtension:
 
         def _mock_stream(*args: Any, **kwargs: Any) -> Any:
             assert kwargs.get("live_scores") is False
+            assert kwargs.get("live_readouts") is False
             yield TokenEvent(
                 text="Hi", token_id=1, index=0,
             )

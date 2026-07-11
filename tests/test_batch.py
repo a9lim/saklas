@@ -202,6 +202,9 @@ def _fast_batch_session():
         zero_compiled_offsets=lambda: None,
     )
     s._live_lens = None
+    s._lens_probes = {}
+    s._sae_probes = {}
+    s._sae_layer = None
     s._trait_queues = []
     s._active_gen_reservation = None
     s._last_token_probe_payload = None
@@ -226,9 +229,10 @@ def _fast_batch_session():
         user_role: str | None = None,
         assistant_role: str | None = None,
         to_device: bool = True,
+        gen_seat: str = "assistant",
     ):
         del raw, thinking, stateless, parent_node_id
-        del user_role, assistant_role, to_device
+        del user_role, assistant_role, to_device, gen_seat
         mapping = {
             "alpha": [1, 2],
             "beta": [3, 4, 5],
@@ -417,6 +421,71 @@ class TestGenerateBatch:
             (100.0,),
         ]
         assert cast(Any, s._monitor).scored == [2.0, 30.0, 100.0]
+
+    def test_sae_readout_probe_batch_fast_path_scores_per_row_aggregate(self) -> None:
+        from saklas.core.sae import MockSaeBackend
+
+        s, model = _probe_fast_batch_session()
+        cast(Any, s)._monitor = SimpleNamespace(probe_names=[])
+        s._sae_backend = MockSaeBackend(layers=frozenset({0}), d_model=1, d_feature=1)
+        s._sae_layer = 0
+        s._sae_width = 1
+        s._sae_feature_meta = {}
+        s._sae_probes = {
+            "sae/0": {
+                "feature_id": 0,
+                "layer": 0,
+                "label": None,
+                "max_act": None,
+            },
+        }
+
+        def _fail_generate_core(*args: Any, **kwargs: Any) -> GenerationResult:
+            raise AssertionError("serial generation path should not run")
+
+        s._generate_core = _fail_generate_core
+
+        runset = s.generate_batch(["alpha", "beta", "gamma"], thinking=False)
+
+        assert len(model.calls) == 1
+        assert [r.probe_readings["sae/0"].coords for r in runset] == [
+            (2.0,),
+            (30.0,),
+            (100.0,),
+        ]
+        assert [r.readings for r in runset] == [{}, {}, {}]
+
+    def test_lens_readout_probe_batch_fast_path_scores_per_row_aggregate(self) -> None:
+        s, model = _probe_fast_batch_session()
+        s_any = cast(Any, s)
+        s_any._monitor = SimpleNamespace(probe_names=[])
+        s_any._lens_probes = {"jlens/g": {"token_id": 1, "layers": [0]}}
+        s_any._lens_probe_layers = lambda: {0}
+
+        def _score_lens_probes(
+            hidden: dict[int, Any],
+            **kwargs: Any,
+        ) -> dict[str, ProbeReading]:
+            del kwargs
+            value = float(hidden[0].reshape(-1)[0])
+            return {"jlens/g": ProbeReading(0.0, [], coords=(value,))}
+
+        s_any._score_lens_probes = _score_lens_probes
+
+        def _fail_generate_core(*args: Any, **kwargs: Any) -> GenerationResult:
+            raise AssertionError("serial generation path should not run")
+
+        s._generate_core = _fail_generate_core
+
+        runset = s.generate_batch(["alpha", "beta", "gamma"], thinking=False)
+
+        assert len(model.calls) == 1
+        assert [r.probe_readings["jlens/g"].coords for r in runset] == [
+            (2.0,),
+            (30.0,),
+            (100.0,),
+        ]
+        assert [r.readings for r in runset] == [{}, {}, {}]
 
     def test_deterministic_fan_uses_batched_generation(self) -> None:
         s, model = _fast_batch_session()

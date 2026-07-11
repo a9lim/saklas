@@ -669,7 +669,7 @@ def _register_routes(app: FastAPI) -> None:
                 return {"delta": d}
 
             stream_iter = session.generate_stream(
-                messages, live_scores=False, **gen_kwargs,
+                messages, live_scores=False, live_readouts=False, **gen_kwargs,
             )
             include_usage = bool(req.stream_options and req.stream_options.include_usage)
             return StreamingResponse(
@@ -722,7 +722,8 @@ def _register_routes(app: FastAPI) -> None:
 
         if req.stream:
             stream_iter = session.generate_stream(
-                req.prompt, raw=True, live_scores=False, **gen_kwargs,
+                req.prompt, raw=True, live_scores=False, live_readouts=False,
+                **gen_kwargs,
             )
             include_usage = bool(req.stream_options and req.stream_options.include_usage)
             return StreamingResponse(

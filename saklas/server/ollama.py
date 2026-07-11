@@ -664,7 +664,8 @@ def register_ollama_routes(app: FastAPI) -> None:
             stream_iter = None
             try:
                 stream_iter = session.generate_stream(
-                    input_payload, raw=raw, live_scores=False, **gen_kwargs,
+                    input_payload, raw=raw, live_scores=False,
+                    live_readouts=False, **gen_kwargs,
                 )
                 for event in stream_iter:
                     # Bail out if the client has hung up — close the inner

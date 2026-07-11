@@ -4825,6 +4825,8 @@ class SaklasSession:
         self, *, widen: bool = False, need_per_token: bool = True,
         gating_only_probes: set[str] | None = None,
         gating_probe_keys: set[str] | None = None,
+        lens_gating_probe_keys: set[str] | None = None,
+        sae_gating_probe_keys: set[str] | None = None,
         lean_per_token: bool = False,
         final_probe_aggregate: bool = True,
         live_lens_active: bool = True,
@@ -4869,6 +4871,13 @@ class SaklasSession:
         lens_probes = getattr(self, "_lens_probes", None) or {}
         live_sae = getattr(self, "_live_sae", None) if live_sae_active else None
         sae_probes = getattr(self, "_sae_probes", None) or {}
+        lens_gate_probe_names = {
+            key.split("[", 1)[0]
+            for key in (lens_gating_probe_keys or set())
+            if key.split("[", 1)[0] in lens_probes
+        }
+        has_lens_gate = bool(lens_gate_probe_names)
+        has_sae_gate = bool(sae_gating_probe_keys)
         # Per-generation reset of the per-forward lens stash + display row.
         self._lens_step_stash = None
         self._last_lens_step_readings = None
@@ -4893,14 +4902,21 @@ class SaklasSession:
                 # The live workspace readout consumes the same latest-slice
                 # buffers the monitor does — its layers join the capture set.
                 union = union | set(live_lens["layers"])
-            if lens_probes:
-                # Pinned lens probes read their band layers: per-forward for
-                # gates (live or not), and the tail ring pools the finalize
-                # aggregate from the same slices.
+            if lens_probes and final_probe_aggregate:
+                # Final pinned lens-probe aggregates read their full band.
                 union = union | self._lens_probe_layers()
+            elif has_lens_gate:
+                # Gate-only lens probes need per-step latest slices, but
+                # dormant pinned probes should not keep capture alive when the
+                # caller explicitly disabled final probe readings.
+                union = union | self._lens_probe_layers(lens_gate_probe_names)
             if live_sae is not None:
                 union.add(int(live_sae["layer"]))
-            if sae_probes and self._sae_layer is not None:
+            if (
+                sae_probes
+                and self._sae_layer is not None
+                and (final_probe_aggregate or has_sae_gate)
+            ):
                 union.add(int(self._sae_layer))
             if not union:
                 # No probes ⇒ the degenerate FULL (capture-disabled) state.
@@ -5031,11 +5047,20 @@ class SaklasSession:
                     self._monitor.score_single_token(latest) if latest else {}
                 )
 
-            if lens_probes or sae_probes:
+            if (
+                (lens_probes and (final_probe_aggregate or has_lens_gate))
+                or (sae_probes and (final_probe_aggregate or has_sae_gate))
+            ):
                 # Lens probes pool their finalize aggregate from the tail
                 # ring; ``set_incremental``'s length-1 buffers can't walk back
                 # past trailing specials, so arm the ring alongside the sink.
-                self._capture.set_tail_with_sink(_AGG_TAIL_DEPTH, _score_step)
+                # When final probe aggregates are disabled, pinned J-lens/SAE
+                # probes still need the latest slice for gates/live consumers,
+                # but do not need the 8-deep EOS walk-back ring.
+                self._capture.set_tail_with_sink(
+                    _AGG_TAIL_DEPTH if final_probe_aggregate else 1,
+                    _score_step,
+                )
             else:
                 self._capture.set_incremental(_score_step)
             self._capture_state.mode = CaptureMode.INCREMENTAL
@@ -5053,15 +5078,22 @@ class SaklasSession:
             self._capture_state.mode = CaptureMode.AGGREGATE_ONLY
             self._monitor.enable_curved_warm(False)
         elif not widen and (
-            live_lens is not None or lens_probes or live_sae is not None or sae_probes
+            live_lens is not None
+            or (lens_probes and (final_probe_aggregate or has_lens_gate))
+            or live_sae is not None
+            or (sae_probes and (final_probe_aggregate or has_sae_gate))
         ):
-            # Lens-only capture (live lens on and/or lens probes pinned, no
-            # monitor probes): a bounded tail ring keeps the reader's latest
-            # slice fresh without FULL retention growing over the generation.
-            # No step sink — the lens display reader runs at the token tap,
-            # lens gates score from ``latest_per_layer`` in the gate
-            # callback, and the lens finalize aggregate pools from the ring.
-            self._capture.set_aggregate_tail(_AGG_TAIL_DEPTH)
+            # Lens/SAE-only capture (live readout on and/or readout probes
+            # pinned, no monitor probes): a bounded tail ring keeps the
+            # reader's latest slice fresh without FULL retention growing over
+            # the generation. No step sink — live display runs at the token tap,
+            # gates score from ``latest_per_layer`` in the gate callback, and
+            # final aggregates pool from the ring only when requested. If final
+            # readings are disabled, keep a length-1 latest buffer instead of
+            # cloning/popping the 8-deep EOS walk-back tail every token.
+            self._capture.set_aggregate_tail(
+                _AGG_TAIL_DEPTH if final_probe_aggregate else 1
+            )
             self._monitor.enable_curved_warm(False)
         else:
             # FULL retention (the ``CaptureState`` default): return_hidden full
@@ -5514,10 +5546,13 @@ class SaklasSession:
         """Names of the attached J-lens token probes (readout channel)."""
         return list(self._lens_probes)
 
-    def _lens_probe_layers(self) -> set[int]:
+    def _lens_probe_layers(self, names: set[str] | None = None) -> set[int]:
         """Union of the attached lens probes' band layers."""
         out: set[int] = set()
-        for spec in self._lens_probes.values():
+        probes = self._lens_probes
+        if names is not None:
+            probes = {name: probes[name] for name in names if name in probes}
+        for spec in probes.values():
             out.update(spec["layers"])
         return out
 
@@ -7793,6 +7828,16 @@ class SaklasSession:
                 if _needs_gating
                 else None
             )
+            lens_gating_probe_keys: set[str] | None = (
+                composer.gated_lens_probe_keys()
+                if _needs_gating
+                else None
+            )
+            sae_gating_probe_keys: set[str] | None = (
+                composer.gated_sae_probe_keys()
+                if _needs_gating
+                else None
+            )
             # J-lens token probes gate on the lens path (the gating score
             # callback computes their scalars from the latest capture slices),
             # so a lens-only gate doesn't force per-token MONITOR scoring —
@@ -7837,6 +7882,8 @@ class SaklasSession:
                     widen=want_hidden, need_per_token=need_per_token,
                     gating_only_probes=gating_only_probes,
                     gating_probe_keys=gating_probe_keys,
+                    lens_gating_probe_keys=lens_gating_probe_keys,
+                    sae_gating_probe_keys=sae_gating_probe_keys,
                     lean_per_token=lean_per_token,
                     final_probe_aggregate=return_probe_readings,
                     live_lens_active=_has_lens_consumer,
@@ -8183,6 +8230,7 @@ class SaklasSession:
         parent_node_id: str | None = None,
         recipe_override: "Recipe | str | None" = None,
         live_scores: bool = True,
+        live_readouts: bool = True,
         gen_seat: str = "assistant",
     ) -> Iterator[TokenEvent]:
         """Streaming generation.  See :meth:`generate` for kwargs.
@@ -8202,6 +8250,9 @@ class SaklasSession:
         ``live_scores=False`` skips inline per-token probe scoring for this
         stream. Final aggregate/per-token readings are still computed during
         generation finalization from the captured hidden states.
+
+        ``live_readouts=False`` skips live J-LENS/SAE token readouts for
+        stream formats that never serialize those richer cards.
         """
         q: queue.SimpleQueue[Any] = queue.SimpleQueue()
         done = object()
@@ -8216,7 +8267,9 @@ class SaklasSession:
             # land in the payload's merged ``readings`` — a lens-only roster
             # still carries per-token readings while the live lens is on.
             if live_scores and (
-                self._monitor.probe_names or getattr(self, "_lens_probes", None)
+                self._monitor.probe_names
+                or getattr(self, "_lens_probes", None)
+                or getattr(self, "_sae_probes", None)
             ):
                 raw_readings = payload.get("readings")
                 if isinstance(raw_readings, dict) and raw_readings:
@@ -8232,16 +8285,18 @@ class SaklasSession:
                 text=text, token_id=tid if tid is not None else -1, index=idx_counter[0],
                 thinking=is_thinking, logprob=lp, top_alts=top_alts,
                 probe_readings=probe_readings, perplexity=perplexity,
-                lens_readout=payload.get("lens"),
-                lens_aggregate=payload.get("lens_aggregate"),
-                sae_readout=payload.get("sae"),
+                lens_readout=payload.get("lens") if live_readouts else None,
+                lens_aggregate=(
+                    payload.get("lens_aggregate") if live_readouts else None
+                ),
+                sae_readout=payload.get("sae") if live_readouts else None,
             )
             idx_counter[0] += 1
             q.put(event)
         _push_flags: Any = _push
         _push_flags._saklas_wants_live_scores = bool(live_scores)
-        _push_flags._saklas_wants_lens_readout = True
-        _push_flags._saklas_wants_sae_readout = True
+        _push_flags._saklas_wants_lens_readout = bool(live_readouts)
+        _push_flags._saklas_wants_sae_readout = bool(live_readouts)
 
         def _worker():
             try:
@@ -8330,12 +8385,24 @@ class SaklasSession:
             return None
         if getattr(self, "_trait_queues", None):
             return None
-        has_probes = bool(getattr(getattr(self, "_monitor", None), "probe_names", []))
-        if has_probes and not (
+        has_monitor_probes = bool(
+            getattr(getattr(self, "_monitor", None), "probe_names", [])
+        )
+        has_lens_probes = bool(getattr(self, "_lens_probes", None))
+        has_sae_probes = bool(getattr(self, "_sae_probes", None))
+        has_probe_aggregates = has_monitor_probes or has_lens_probes or has_sae_probes
+        if has_probe_aggregates and not (
             hasattr(self, "_layers")
             and hasattr(self, "_capture")
-            and callable(getattr(self._monitor, "probe_layers", None))
         ):
+            return None
+        if has_monitor_probes and not callable(
+            getattr(self._monitor, "probe_layers", None)
+        ):
+            return None
+        if has_lens_probes and not callable(getattr(self, "_lens_probe_layers", None)):
+            return None
+        if has_sae_probes and getattr(self, "_sae_layer", None) is None:
             return None
 
         (
@@ -8408,6 +8475,7 @@ class SaklasSession:
         finish_reason: str,
         applied_steering: str | None,
         probe_readings: dict[str, ProbeReading],
+        reading_probe_readings: dict[str, ProbeReading] | None = None,
     ) -> GenerationResult:
         """Build a stateless batch result with pre-scored probe aggregates."""
         token_count = len(generated_ids)
@@ -8416,7 +8484,11 @@ class SaklasSession:
         )
         decoded = self._tokenizer.decode(generated_ids, skip_special_tokens=True)
         text = decoded if isinstance(decoded, str) else decoded[0]
-        readings = self._stateless_readings_from_probe_aggregate(probe_readings)
+        readings = self._stateless_readings_from_probe_aggregate(
+            probe_readings
+            if reading_probe_readings is None
+            else reading_probe_readings
+        )
         result = GenerationResult(
             text=text,
             tokens=list(generated_ids),
@@ -8447,19 +8519,45 @@ class SaklasSession:
         row_index: int,
         generated_ids: list[int],
         probe_names: list[str],
+        pooled: dict[int, torch.Tensor] | None = None,
     ) -> dict[str, ProbeReading]:
         """Score the final aggregate probe reading for one batched row."""
         empty = self._empty_readings(probe_names)
         if not generated_ids:
             return empty
-        from saklas.core.vectors import last_content_index
-        agg_fwd = last_content_index(generated_ids, self._tokenizer)
-        pooled = self._capture.batch_tail_slice_at(row_index, agg_fwd)
+        if pooled is None:
+            pooled = self._batch_pooled_aggregate_for_row(row_index, generated_ids)
         if not pooled:
             return empty
         self._monitor.enable_curved_warm(False)
         agg_vals = self._monitor.score_aggregate(pooled)
         return {name: agg_vals.get(name, empty[name]) for name in probe_names}
+
+    def _batch_pooled_aggregate_for_row(
+        self,
+        row_index: int,
+        generated_ids: list[int],
+    ) -> dict[int, torch.Tensor]:
+        """Shared final-token pooled slice for one batched generation row."""
+        if not generated_ids:
+            return {}
+        from saklas.core.vectors import last_content_index
+        agg_fwd = last_content_index(generated_ids, self._tokenizer)
+        return self._capture.batch_tail_slice_at(row_index, agg_fwd)
+
+    def _batch_readout_probe_aggregate_for_row(
+        self,
+        pooled: dict[int, torch.Tensor],
+    ) -> dict[str, ProbeReading]:
+        """Pinned J-lens/SAE readout probe aggregates from a batched tail slice."""
+        if not pooled:
+            return {}
+        out: dict[str, ProbeReading] = {}
+        if getattr(self, "_lens_probes", None):
+            out.update(self._score_lens_probes(pooled))
+        if getattr(self, "_sae_probes", None):
+            out.update(self._score_sae_probes(pooled))
+        return out
 
     def _batch_fast_runtime_available(self) -> bool:
         """Return True when a real session has the pieces the fast path uses."""
@@ -8646,8 +8744,20 @@ class SaklasSession:
                 pad_id=pad_id,
             )
             probe_names = list(getattr(self._monitor, "probe_names", []))
-            if probe_names:
-                layer_idxs = sorted(self._monitor.probe_layers())
+            has_lens_probes = bool(getattr(self, "_lens_probes", None))
+            has_sae_probes = bool(getattr(self, "_sae_probes", None))
+            capture_probe_aggregates = bool(
+                probe_names or has_lens_probes or has_sae_probes
+            )
+            if capture_probe_aggregates:
+                layer_set: set[int] = set()
+                if probe_names:
+                    layer_set.update(int(layer) for layer in self._monitor.probe_layers())
+                if has_lens_probes:
+                    layer_set.update(int(layer) for layer in self._lens_probe_layers())
+                if has_sae_probes and self._sae_layer is not None:
+                    layer_set.add(int(self._sae_layer))
+                layer_idxs = sorted(layer_set)
                 self._capture.clear()
                 if layer_idxs:
                     self._capture.attach_batch_tail(
@@ -8656,7 +8766,8 @@ class SaklasSession:
                         depth=_AGG_TAIL_DEPTH,
                     )
                 self._capture_state = CaptureState(mode=CaptureMode.AGGREGATE_ONLY)
-                self._monitor.enable_curved_warm(False)
+                if probe_names:
+                    self._monitor.enable_curved_warm(False)
             self._gen_state.reset()
             self._steering.ctx.reset()
             self._steering.reset_manifold_feet()
@@ -8688,7 +8799,7 @@ class SaklasSession:
             with torch.inference_mode():
                 generated = model.generate(**generate_kwargs)
             elapsed = time.monotonic() - start
-            if probe_names:
+            if capture_probe_aggregates:
                 self._end_capture()
             sequences = getattr(generated, "sequences", generated)
             if not isinstance(sequences, torch.Tensor) or sequences.ndim != 2:
@@ -8718,12 +8829,26 @@ class SaklasSession:
                 self._gen_state.response_text = None
                 self._gen_state.response_aggregate_index = None
                 self._gen_state.finish_reason = finish_reason
-                if probe_names:
-                    probe_readings = self._batch_probe_aggregate_for_row(
-                        idx,
-                        generated_ids,
-                        probe_names,
+                if capture_probe_aggregates:
+                    pooled = self._batch_pooled_aggregate_for_row(idx, generated_ids)
+                    probe_readings: dict[str, ProbeReading] = (
+                        self._batch_probe_aggregate_for_row(
+                            idx,
+                            generated_ids,
+                            probe_names,
+                            pooled=pooled,
+                        )
+                        if probe_names
+                        else {}
                     )
+                    probe_readings.update(
+                        self._batch_readout_probe_aggregate_for_row(pooled)
+                    )
+                    monitor_readings = {
+                        name: probe_readings[name]
+                        for name in probe_names
+                        if name in probe_readings
+                    }
                     result = self._finalize_batch_probe_result(
                         generated_ids=generated_ids,
                         elapsed=elapsed,
@@ -8732,6 +8857,7 @@ class SaklasSession:
                         finish_reason=finish_reason,
                         applied_steering=applied_steering,
                         probe_readings=probe_readings,
+                        reading_probe_readings=monitor_readings,
                     )
                 else:
                     result = self._finalize_generation(

@@ -338,6 +338,28 @@ class TestCompletions:
         call_kwargs = session.generate.call_args[1]
         assert call_kwargs["raw"] is True
 
+    def test_streaming_disables_unserialized_live_readouts(
+        self,
+        session_and_client: Any,
+    ) -> None:
+        session, client = session_and_client
+        session.last_result = GenerationResult(
+            text="42", tokens=[1], token_count=1,
+            tok_per_sec=5.0, elapsed=0.2,
+        )
+        session.generate_stream.return_value = iter([
+            TokenEvent(text="42", token_id=1, index=0),
+        ])
+
+        resp = client.post("/v1/completions", json={
+            "prompt": "The answer is",
+            "stream": True,
+        })
+
+        assert resp.status_code == 200
+        call_kwargs = session.generate_stream.call_args.kwargs
+        assert call_kwargs["live_scores"] is False
+        assert call_kwargs["live_readouts"] is False
 
 
 # ---------------------------------------------------------------------------

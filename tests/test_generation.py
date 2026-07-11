@@ -407,6 +407,48 @@ def test_generate_stream_exposes_current_result() -> None:
     assert stream.result is result
 
 
+def test_generate_stream_live_readouts_false_suppresses_readout_flags() -> None:
+    result = GenerationResult(
+        text="ok", tokens=[7], token_count=1, tok_per_sec=1.0, elapsed=1.0,
+    )
+    reading = ProbeReading(0.0, [], coords=(0.7,))
+    flags: dict[str, bool] = {}
+
+    session: Any = SaklasSession.__new__(SaklasSession)
+
+    def _fake_generate_core(*_args: Any, **kwargs: Any) -> GenerationResult:
+        on_token = kwargs["on_token"]
+        flags["lens"] = bool(getattr(on_token, "_saklas_wants_lens_readout"))
+        flags["sae"] = bool(getattr(on_token, "_saklas_wants_sae_readout"))
+        session._last_token_probe_payload = {
+            "readings": {"sae/0": reading},
+            "lens": {1: [("tok", 0.5)]},
+            "lens_aggregate": [("tok", 0.5, 0.5, 0.0)],
+            "sae": [(0, 1.0, None, None)],
+        }
+        on_token("ok", False, 7, None, None, None)
+        return result
+
+    session._gen_state = GenerationState()
+    session._monitor = SimpleNamespace(
+        probe_names=[],
+        update_live=lambda _readings: None,
+    )
+    session._sae_probes = {"sae/0": {"feature_id": 0}}
+    session._last_token_probe_payload = {}
+    session._generate_core = _fake_generate_core
+
+    events = list(session.generate_stream(
+        "prompt", live_scores=True, live_readouts=False,
+    ))
+
+    assert flags == {"lens": False, "sae": False}
+    assert events[0].probe_readings == {"sae/0": reading}
+    assert events[0].lens_readout is None
+    assert events[0].lens_aggregate is None
+    assert events[0].sae_readout is None
+
+
 def test_finalize_incremental_probe_path_does_not_stack_capture() -> None:
     reading0 = ProbeReading(
         fraction=0.2,
@@ -748,6 +790,8 @@ def test_return_probe_readings_false_skips_probe_finalization() -> None:
     session._gen_state = state
     session._tokenizer = _StopTokenizer()
     session._monitor = Monitor()
+    session._lens_probes = {"jlens/x": {}}
+    session._sae_probes = {"sae/0": {}}
     session._capture = Capture()
     session._capture_state = CaptureState(mode=CaptureMode.FULL)
     session._last_per_token_scores = None
@@ -756,6 +800,12 @@ def test_return_probe_readings_false_skips_probe_finalization() -> None:
     session.build_readings = lambda: {
         "toy": SimpleNamespace(mean=(42.0,), to_dict=lambda: {})
     }
+    session._score_lens_probes_aggregate = lambda _ids: (
+        (_ for _ in ()).throw(AssertionError("lens finalization disabled"))
+    )
+    session._score_sae_probes_aggregate = lambda _ids: (
+        (_ for _ in ()).throw(AssertionError("sae finalization disabled"))
+    )
 
     result = SaklasSession._finalize_generation(
         session,
@@ -769,6 +819,283 @@ def test_return_probe_readings_false_skips_probe_finalization() -> None:
 
     assert result.readings == {}
     assert result.probe_readings == {}
+
+
+def test_lens_only_without_final_probe_aggregate_keeps_latest_tail() -> None:
+    class Capture:
+        def __init__(self) -> None:
+            self.attached: list[int] | None = None
+            self.aggregate_depth: int | None = None
+
+        def clear(self) -> None:
+            pass
+
+        def attach(self, _layers: Any, layer_idxs: list[int]) -> None:
+            self.attached = list(layer_idxs)
+
+        def set_aggregate_tail(self, depth: int) -> None:
+            self.aggregate_depth = depth
+
+    class Monitor:
+        probe_names: list[str] = []
+
+        def probe_layers(self, _names: set[str] | None = None) -> set[int]:
+            return set()
+
+        def enable_curved_warm(self, _enabled: bool) -> None:
+            pass
+
+    capture = Capture()
+    session: Any = SaklasSession.__new__(SaklasSession)
+    session._layers = [object()] * 8
+    session._monitor = Monitor()
+    session._capture = capture
+    session._capture_buffers = {}
+    session._compiled_clean_eligible = False
+    session._steering_uses_compiled_offsets = False
+    session._live_lens = {"layers": [2, 4]}
+    session._lens_probes = {}
+    session._live_sae = None
+    session._sae_probes = {}
+    session._steering = SimpleNamespace(all_fast_path=lambda: True)
+
+    SaklasSession._begin_capture(
+        session,
+        need_per_token=False,
+        final_probe_aggregate=False,
+    )
+
+    assert capture.attached == [2, 4]
+    assert capture.aggregate_depth == 1
+
+
+def test_dormant_lens_probe_without_final_aggregate_does_not_attach_capture() -> None:
+    class Capture:
+        def __init__(self) -> None:
+            self.attached: list[int] | None = None
+
+        def clear(self) -> None:
+            pass
+
+        def attach(self, _layers: Any, layer_idxs: list[int]) -> None:
+            self.attached = list(layer_idxs)
+
+    class Monitor:
+        probe_names: list[str] = []
+
+        def probe_layers(self, _names: set[str] | None = None) -> set[int]:
+            return set()
+
+    capture = Capture()
+    session: Any = SaklasSession.__new__(SaklasSession)
+    session._layers = [object()] * 8
+    session._monitor = Monitor()
+    session._capture = capture
+    session._live_lens = None
+    session._lens_probes = {"jlens/g": {"layers": [3]}}
+    session._live_sae = None
+    session._sae_probes = {}
+
+    attached = SaklasSession._begin_capture(
+        session,
+        need_per_token=False,
+        final_probe_aggregate=False,
+    )
+
+    assert attached is False
+    assert capture.attached is None
+    assert session._capture_state.final_probe_aggregate is False
+
+
+def test_lens_gate_without_final_aggregate_attaches_gated_probe_layers() -> None:
+    class Capture:
+        def __init__(self) -> None:
+            self.attached: list[int] | None = None
+            self.aggregate_depth: int | None = None
+
+        def clear(self) -> None:
+            pass
+
+        def attach(self, _layers: Any, layer_idxs: list[int]) -> None:
+            self.attached = list(layer_idxs)
+
+        def set_aggregate_tail(self, depth: int) -> None:
+            self.aggregate_depth = depth
+
+    class Monitor:
+        probe_names: list[str] = []
+
+        def probe_layers(self, _names: set[str] | None = None) -> set[int]:
+            return set()
+
+        def enable_curved_warm(self, _enabled: bool) -> None:
+            pass
+
+    capture = Capture()
+    session: Any = SaklasSession.__new__(SaklasSession)
+    session._layers = [object()] * 8
+    session._monitor = Monitor()
+    session._capture = capture
+    session._capture_buffers = {}
+    session._compiled_clean_eligible = False
+    session._steering_uses_compiled_offsets = False
+    session._live_lens = None
+    session._lens_probes = {
+        "jlens/g": {"layers": [3]},
+        "jlens/h": {"layers": [6]},
+    }
+    session._live_sae = None
+    session._sae_probes = {}
+    session._steering = SimpleNamespace(all_fast_path=lambda: True)
+
+    attached = SaklasSession._begin_capture(
+        session,
+        need_per_token=False,
+        final_probe_aggregate=False,
+        lens_gating_probe_keys={"jlens/g"},
+    )
+
+    assert attached is True
+    assert capture.attached == [3]
+    assert capture.aggregate_depth == 1
+
+
+def test_sae_only_without_final_probe_aggregate_keeps_latest_tail() -> None:
+    class Capture:
+        def __init__(self) -> None:
+            self.attached: list[int] | None = None
+            self.aggregate_depth: int | None = None
+
+        def clear(self) -> None:
+            pass
+
+        def attach(self, _layers: Any, layer_idxs: list[int]) -> None:
+            self.attached = list(layer_idxs)
+
+        def set_aggregate_tail(self, depth: int) -> None:
+            self.aggregate_depth = depth
+
+    class Monitor:
+        probe_names: list[str] = []
+
+        def probe_layers(self, _names: set[str] | None = None) -> set[int]:
+            return set()
+
+        def enable_curved_warm(self, _enabled: bool) -> None:
+            pass
+
+    capture = Capture()
+    session: Any = SaklasSession.__new__(SaklasSession)
+    session._layers = [object()] * 8
+    session._monitor = Monitor()
+    session._capture = capture
+    session._capture_buffers = {}
+    session._compiled_clean_eligible = False
+    session._steering_uses_compiled_offsets = False
+    session._live_lens = None
+    session._lens_probes = {}
+    session._live_sae = {"layer": 5, "top_k": 8}
+    session._sae_probes = {}
+    session._steering = SimpleNamespace(all_fast_path=lambda: True)
+
+    SaklasSession._begin_capture(
+        session,
+        need_per_token=False,
+        final_probe_aggregate=False,
+    )
+
+    assert capture.attached == [5]
+    assert capture.aggregate_depth == 1
+
+
+def test_dormant_sae_probe_without_final_aggregate_does_not_attach_capture() -> None:
+    class Capture:
+        def __init__(self) -> None:
+            self.attached: list[int] | None = None
+
+        def clear(self) -> None:
+            pass
+
+        def attach(self, _layers: Any, layer_idxs: list[int]) -> None:
+            self.attached = list(layer_idxs)
+
+    class Monitor:
+        probe_names: list[str] = []
+
+        def probe_layers(self, _names: set[str] | None = None) -> set[int]:
+            return set()
+
+    capture = Capture()
+    session: Any = SaklasSession.__new__(SaklasSession)
+    session._layers = [object()] * 8
+    session._monitor = Monitor()
+    session._capture = capture
+    session._live_lens = None
+    session._lens_probes = {}
+    session._live_sae = None
+    session._sae_probes = {"sae/0": {"feature_id": 0}}
+    session._sae_layer = 5
+
+    attached = SaklasSession._begin_capture(
+        session,
+        need_per_token=False,
+        final_probe_aggregate=False,
+    )
+
+    assert attached is False
+    assert capture.attached is None
+    assert session._capture_state.final_probe_aggregate is False
+
+
+def test_sae_gate_without_final_aggregate_attaches_sae_layer() -> None:
+    class Capture:
+        def __init__(self) -> None:
+            self.attached: list[int] | None = None
+            self.aggregate_depth: int | None = None
+
+        def clear(self) -> None:
+            pass
+
+        def attach(self, _layers: Any, layer_idxs: list[int]) -> None:
+            self.attached = list(layer_idxs)
+
+        def set_aggregate_tail(self, depth: int) -> None:
+            self.aggregate_depth = depth
+
+    class Monitor:
+        probe_names: list[str] = []
+
+        def probe_layers(self, _names: set[str] | None = None) -> set[int]:
+            return set()
+
+        def enable_curved_warm(self, _enabled: bool) -> None:
+            pass
+
+    capture = Capture()
+    session: Any = SaklasSession.__new__(SaklasSession)
+    session._layers = [object()] * 8
+    session._monitor = Monitor()
+    session._capture = capture
+    session._capture_buffers = {}
+    session._compiled_clean_eligible = False
+    session._steering_uses_compiled_offsets = False
+    session._live_lens = None
+    session._lens_probes = {}
+    session._live_sae = None
+    session._sae_probes = {"sae/0": {"feature_id": 0}}
+    session._sae_layer = 5
+    session._steering = SimpleNamespace(all_fast_path=lambda: True)
+
+    attached = SaklasSession._begin_capture(
+        session,
+        need_per_token=False,
+        final_probe_aggregate=False,
+        sae_gating_probe_keys={"sae/0"},
+    )
+
+    assert attached is True
+    assert capture.attached == [5]
+    assert capture.aggregate_depth == 1
 
 
 def test_gate_only_without_final_probe_aggregate_narrows_capture_layers() -> None:
