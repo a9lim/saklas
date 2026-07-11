@@ -59,6 +59,50 @@ def finalize_generation(
     ):
         captured_stack = session._capture.stacked()
 
+    aggregate_index_computed = False
+    aggregate_index: int | None = None
+    aggregate_tail_computed = False
+    aggregate_tail: dict[int, torch.Tensor] = {}
+    aggregate_stack_computed = False
+    aggregate_stack: dict[int, torch.Tensor] = {}
+
+    def _aggregate_index() -> int | None:
+        nonlocal aggregate_index_computed, aggregate_index
+        if not aggregate_index_computed:
+            aggregate_index = session._aggregate_forward_index(generated_ids)
+            aggregate_index_computed = True
+        return aggregate_index
+
+    def _aggregate_tail_slice() -> dict[int, torch.Tensor]:
+        nonlocal aggregate_tail_computed, aggregate_tail
+        if aggregate_tail_computed:
+            return aggregate_tail
+        aggregate_tail_computed = True
+        agg_fwd = _aggregate_index()
+        aggregate_tail = (
+            session._capture.tail_slice_at(agg_fwd)
+            if agg_fwd is not None else {}
+        )
+        return aggregate_tail
+
+    def _aggregate_pooled_slice() -> dict[int, torch.Tensor]:
+        nonlocal aggregate_stack_computed, aggregate_stack
+        tail = _aggregate_tail_slice()
+        if tail:
+            return tail
+        agg_fwd = _aggregate_index()
+        if agg_fwd is None:
+            return {}
+        if not aggregate_stack_computed:
+            stack = captured_stack or session._capture.stacked()
+            aggregate_stack = {
+                layer: rows[agg_fwd]
+                for layer, rows in stack.items()
+                if rows.shape[0] > agg_fwd
+            }
+            aggregate_stack_computed = True
+        return aggregate_stack
+
     agg_vals: dict[str, ProbeReading] = {}
     if return_probe_readings and session._monitor.probe_names and generated_ids:
         if capture_mode_name == "INCREMENTAL":
@@ -67,11 +111,15 @@ def finalize_generation(
             )
         elif capture_mode_name == "LEAN_INCREMENTAL":
             agg_vals, per_token = session._score_lean_incremental(
-                generated_ids, accumulate=not stateless,
+                generated_ids,
+                accumulate=not stateless,
+                pooled=_aggregate_tail_slice(),
             )
         elif session._capture_state.aggregate_only:
             agg_vals = session._score_aggregate_only(
-                generated_ids, accumulate=not stateless,
+                generated_ids,
+                accumulate=not stateless,
+                pooled=_aggregate_tail_slice(),
             )
             per_token = {}
         else:
@@ -126,7 +174,10 @@ def finalize_generation(
         and getattr(session, "_lens_probes", None)
     ):
         manifold_aggregates.update(
-            session._score_lens_probes_aggregate(generated_ids)
+            session._score_lens_probes_aggregate(
+                generated_ids,
+                pooled=_aggregate_pooled_slice(),
+            )
         )
     if (
         return_probe_readings
@@ -134,7 +185,10 @@ def finalize_generation(
         and getattr(session, "_sae_probes", None)
     ):
         manifold_aggregates.update(
-            session._score_sae_probes_aggregate(generated_ids)
+            session._score_sae_probes_aggregate(
+                generated_ids,
+                pooled=_aggregate_pooled_slice(),
+            )
         )
 
     result = GenerationResult(

@@ -3660,21 +3660,25 @@ class SaklasSession:
         ]
 
     def _score_sae_probes_aggregate(
-        self, generated_ids: list[int],
+        self,
+        generated_ids: list[int],
+        *,
+        pooled: dict[int, torch.Tensor] | None = None,
     ) -> dict[str, "ProbeReading"]:
         if not self._sae_probes or not generated_ids:
             return {}
-        agg_fwd = self._aggregate_forward_index(generated_ids)
-        if agg_fwd is None:
-            return {}
-        pooled = self._capture.tail_slice_at(agg_fwd)
-        if not pooled:
-            stacked = self._capture.stacked()
-            pooled = {
-                layer: rows[agg_fwd]
-                for layer, rows in stacked.items()
-                if rows.shape[0] > agg_fwd
-            }
+        if pooled is None:
+            agg_fwd = self._aggregate_forward_index(generated_ids)
+            if agg_fwd is None:
+                return {}
+            pooled = self._capture.tail_slice_at(agg_fwd)
+            if not pooled:
+                stacked = self._capture.stacked()
+                pooled = {
+                    layer: rows[agg_fwd]
+                    for layer, rows in stacked.items()
+                    if rows.shape[0] > agg_fwd
+                }
         return self._score_sae_probes(pooled) if pooled else {}
 
     def sae_token_readout(
@@ -5437,7 +5441,11 @@ class SaklasSession:
         return agg_vals, per_token
 
     def _score_aggregate_only(
-        self, generated_ids: list[int], *, accumulate: bool = True,
+        self,
+        generated_ids: list[int],
+        *,
+        accumulate: bool = True,
+        pooled: dict[int, torch.Tensor] | None = None,
     ) -> dict[str, "ProbeReading"]:
         """Score *only* the end-of-gen aggregate from the bounded tail ring.
 
@@ -5454,10 +5462,11 @@ class SaklasSession:
         empty = self._empty_readings(names)
         if not generated_ids:
             return empty
-        agg_fwd = self._aggregate_forward_index(generated_ids)
-        if agg_fwd is None:
-            return empty
-        pooled = self._capture.tail_slice_at(agg_fwd)
+        if pooled is None:
+            agg_fwd = self._aggregate_forward_index(generated_ids)
+            if agg_fwd is None:
+                return empty
+            pooled = self._capture.tail_slice_at(agg_fwd)
         if not pooled:
             return empty
         # One-shot pooled read over the full roster — keep curved probes on the
@@ -5474,7 +5483,11 @@ class SaklasSession:
         return agg_vals
 
     def _score_lean_incremental(
-        self, generated_ids: list[int], *, accumulate: bool = True,
+        self,
+        generated_ids: list[int],
+        *,
+        accumulate: bool = True,
+        pooled: dict[int, torch.Tensor] | None = None,
     ) -> tuple[dict[str, "ProbeReading"], dict[str, list[float]]]:
         """Lean per-token coord stream + full aggregate from the tail ring (FIX F2).
 
@@ -5491,7 +5504,7 @@ class SaklasSession:
         rows = self._incremental_readings[:n]
         per_token = self._extract_coord_stream(rows, n, names)
         agg_vals = self._score_aggregate_only(
-            generated_ids, accumulate=accumulate,
+            generated_ids, accumulate=accumulate, pooled=pooled,
         )
         return agg_vals, per_token
 
@@ -5946,7 +5959,10 @@ class SaklasSession:
         })
 
     def _score_lens_probes_aggregate(
-        self, generated_ids: list[int],
+        self,
+        generated_ids: list[int],
+        *,
+        pooled: dict[int, torch.Tensor] | None = None,
     ) -> dict[str, "ProbeReading"]:
         """End-of-gen lens-probe aggregate pooled at the last content token.
 
@@ -5956,17 +5972,18 @@ class SaklasSession:
         """
         if not self._lens_probes or not generated_ids:
             return {}
-        agg_fwd = self._aggregate_forward_index(generated_ids)
-        if agg_fwd is None:
-            return {}
-        pooled = self._capture.tail_slice_at(agg_fwd)
-        if not pooled:
-            stacked = self._capture.stacked()
-            pooled = {
-                l: t[agg_fwd]
-                for l, t in stacked.items()
-                if t.shape[0] > agg_fwd
-            }
+        if pooled is None:
+            agg_fwd = self._aggregate_forward_index(generated_ids)
+            if agg_fwd is None:
+                return {}
+            pooled = self._capture.tail_slice_at(agg_fwd)
+            if not pooled:
+                stacked = self._capture.stacked()
+                pooled = {
+                    l: t[agg_fwd]
+                    for l, t in stacked.items()
+                    if t.shape[0] > agg_fwd
+                }
         if not pooled:
             return {}
         return self._score_lens_probes(pooled)
@@ -7832,6 +7849,8 @@ class SaklasSession:
                 build_token_probe_payload,
             )
 
+            _has_monitor_probes = bool(self._monitor.probe_names)
+
             def _token_tap(text: str, is_thinking: bool, tid: int | None, lp: float | None, top_alts: Any, perplexity: float | None) -> None:
                 nonlocal mean_logprob_sum, mean_logprob_count
                 self._last_token_probe_payload = None
@@ -7842,7 +7861,7 @@ class SaklasSession:
                     mean_logprob_count += 1
                 needs_scores = bool(
                     _live_scores_on
-                    and self._monitor.probe_names
+                    and _has_monitor_probes
                     and (
                         assistant_node_id is not None
                         or _has_trait_consumer
@@ -7964,7 +7983,7 @@ class SaklasSession:
                 if on_token is not None:
                     on_token(text, is_thinking, tid, lp, top_alts, perplexity)
                 # Inline per-token scoring for live SSE trait subscribers.
-                if self._trait_queues and self._monitor.probe_names and scores:
+                if self._trait_queues and _has_monitor_probes and scores:
                     event = ("token", trait_token_counter[0], text, is_thinking, scores)
                     trait_token_counter[0] += 1
                     with self._trait_lock:
@@ -7986,7 +8005,7 @@ class SaklasSession:
             _has_trait_consumer = bool(
                 _live_scores_on
                 and self._trait_queues
-                and self._monitor.probe_names
+                and _has_monitor_probes
             )
             # The tap also writes per-token ``probes`` / ``per_layer_scores``
             # onto the loom row when probes are loaded and the gen is loom-
@@ -7996,7 +8015,7 @@ class SaklasSession:
                 _live_scores_on
                 and return_probe_readings
                 and not stateless
-                and self._monitor.probe_names
+                and _has_monitor_probes
             )
             _need_tap = (
                 on_token is not None
@@ -8044,12 +8063,6 @@ class SaklasSession:
             if steering_obj is not None and steering_obj.alphas:
                 steering_cm = self.steering(steering_obj)
 
-            vector_snapshot: dict[str, float] = (
-                self._snapshot_steering_alphas()
-                if self._steering_stack or steering_cm is not None
-                else {}
-            )
-
             # Snapshot the chat-history anchor BEFORE _start_loom_assistant
             # mutates the tree.  Otherwise the new (empty) assistant node it
             # creates becomes the active leaf, and ``messages_for(None)`` later
@@ -8091,7 +8104,7 @@ class SaklasSession:
                 gen_seat=gen_seat,
             )
             # Refresh snapshot now that steering is pushed (first-scope case).
-            vector_snapshot = self._snapshot_steering_alphas()
+            vector_snapshot: dict[str, float] = self._snapshot_steering_alphas()
 
             want_hidden = bool(sampling and sampling.return_hidden)
             # Per-token scoring is only needed when something consumes a
@@ -8160,7 +8173,7 @@ class SaklasSession:
                 and not want_hidden
                 and not _needs_monitor_gating
                 and not _full_reading_consumer
-                and self._monitor.probe_names
+                and _has_monitor_probes
             )
             self._live_lens_active_for_generation = _has_lens_consumer
             self._live_sae_active_for_generation = _has_sae_consumer

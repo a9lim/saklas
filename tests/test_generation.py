@@ -829,6 +829,93 @@ def test_finalize_gating_subset_probe_path() -> None:
     assert monitor._agg_calls == 1
 
 
+def test_finalize_reuses_one_aggregate_pool_for_monitor_lens_and_sae() -> None:
+    pooled = {1: torch.ones(4)}
+
+    class Capture:
+        def __init__(self) -> None:
+            self.tail_calls: list[int] = []
+
+        def tail_slice_at(self, idx: int) -> dict[int, torch.Tensor]:
+            self.tail_calls.append(idx)
+            return pooled
+
+        def stacked(self) -> dict[int, torch.Tensor]:
+            raise AssertionError("shared aggregate pool should avoid stacked fallback")
+
+    class Monitor:
+        probe_names = ["toy"]
+
+    capture = Capture()
+    monitor_reading = ProbeReading(0.0, [], coords=(0.1,))
+    lens_reading = ProbeReading(0.0, [], coords=(0.2,))
+    sae_reading = ProbeReading(0.0, [], coords=(0.3,))
+    expected_pooled = pooled
+    seen: list[tuple[str, bool]] = []
+
+    def score_aggregate_only(
+        _generated_ids: list[int],
+        *,
+        accumulate: bool = True,
+        pooled: dict[int, torch.Tensor] | None = None,
+    ) -> dict[str, ProbeReading]:
+        del accumulate
+        seen.append(("monitor", pooled is expected_pooled))
+        return {"toy": monitor_reading}
+
+    def score_lens(
+        _generated_ids: list[int],
+        *,
+        pooled: dict[int, torch.Tensor] | None = None,
+    ) -> dict[str, ProbeReading]:
+        seen.append(("lens", pooled is expected_pooled))
+        return {"jlens/g": lens_reading}
+
+    def score_sae(
+        _generated_ids: list[int],
+        *,
+        pooled: dict[int, torch.Tensor] | None = None,
+    ) -> dict[str, ProbeReading]:
+        seen.append(("sae", pooled is expected_pooled))
+        return {"sae/0": sae_reading}
+
+    state = GenerationState()
+    state.finish_reason = "length"
+
+    session: Any = SaklasSession.__new__(SaklasSession)
+    session._gen_state = state
+    session._tokenizer = _StopTokenizer()
+    session._monitor = Monitor()
+    session._capture = capture
+    session._capture_state = CaptureState(mode=CaptureMode.AGGREGATE_ONLY)
+    session._lens_probes = {"jlens/g": {}}
+    session._sae_probes = {"sae/0": {}}
+    session._aggregate_forward_index = lambda _ids: 1
+    session._score_aggregate_only = score_aggregate_only
+    session._score_lens_probes_aggregate = score_lens
+    session._score_sae_probes_aggregate = score_sae
+    session._last_result = None
+    session._last_per_token_scores = None
+    session.events = SimpleNamespace(emit=lambda _event: None)
+
+    result = SaklasSession._finalize_generation(
+        session,
+        "prompt",
+        [0, 1],
+        elapsed=1.0,
+        vector_snapshot={},
+        stateless=True,
+    )
+
+    assert capture.tail_calls == [1]
+    assert seen == [("monitor", True), ("lens", True), ("sae", True)]
+    assert result.probe_readings == {
+        "toy": monitor_reading,
+        "jlens/g": lens_reading,
+        "sae/0": sae_reading,
+    }
+
+
 def test_gating_callback_backfills_exact_keys_hidden_by_top_n() -> None:
     """Full per-token readings can truncate label channels; gates still need the
     exact requested scalar keys."""
