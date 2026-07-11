@@ -422,6 +422,28 @@ class TestGenerateBatch:
         ]
         assert cast(Any, s._monitor).scored == [2.0, 30.0, 100.0]
 
+    def test_probe_batch_fast_path_honors_return_probe_readings_false(self) -> None:
+        from saklas.core.sampling import SamplingConfig
+
+        s, model = _probe_fast_batch_session()
+
+        def _fail_generate_core(*args: Any, **kwargs: Any) -> GenerationResult:
+            raise AssertionError("serial generation path should not run")
+
+        s._generate_core = _fail_generate_core
+
+        runset = s.generate_batch(
+            ["alpha", "beta", "gamma"],
+            sampling=SamplingConfig(return_probe_readings=False),
+            thinking=False,
+        )
+
+        assert len(model.calls) == 1
+        assert [r.tokens for r in runset] == [[10, 11], [12, 13, 14], [15]]
+        assert [r.readings for r in runset] == [{}, {}, {}]
+        assert [r.probe_readings for r in runset] == [{}, {}, {}]
+        assert cast(Any, s._monitor).scored == []
+
     def test_sae_readout_probe_batch_fast_path_scores_per_row_aggregate(self) -> None:
         from saklas.core.sae import MockSaeBackend
 
@@ -455,6 +477,36 @@ class TestGenerateBatch:
         ]
         assert [r.readings for r in runset] == [{}, {}, {}]
 
+    def test_sae_readout_probe_batch_fast_path_honors_return_probe_readings_false(self) -> None:
+        from saklas.core.sampling import SamplingConfig
+
+        s, model = _probe_fast_batch_session()
+        cast(Any, s)._monitor = SimpleNamespace(probe_names=[])
+        s._sae_layer = 0
+        s._sae_probes = {
+            "sae/0": {
+                "feature_id": 0,
+                "layer": 0,
+                "label": None,
+                "max_act": None,
+            },
+        }
+
+        def _fail_generate_core(*args: Any, **kwargs: Any) -> GenerationResult:
+            raise AssertionError("serial generation path should not run")
+
+        s._generate_core = _fail_generate_core
+
+        runset = s.generate_batch(
+            ["alpha", "beta", "gamma"],
+            sampling=SamplingConfig(return_probe_readings=False),
+            thinking=False,
+        )
+
+        assert len(model.calls) == 1
+        assert [r.readings for r in runset] == [{}, {}, {}]
+        assert [r.probe_readings for r in runset] == [{}, {}, {}]
+
     def test_lens_readout_probe_batch_fast_path_scores_per_row_aggregate(self) -> None:
         s, model = _probe_fast_batch_session()
         s_any = cast(Any, s)
@@ -487,6 +539,35 @@ class TestGenerateBatch:
         ]
         assert [r.readings for r in runset] == [{}, {}, {}]
 
+    def test_lens_readout_probe_batch_fast_path_honors_return_probe_readings_false(self) -> None:
+        from saklas.core.sampling import SamplingConfig
+
+        s, model = _probe_fast_batch_session()
+        s_any = cast(Any, s)
+        s_any._monitor = SimpleNamespace(probe_names=[])
+        s_any._lens_probes = {"jlens/g": {"token_id": 1, "layers": [0]}}
+        s_any._lens_probe_layers = lambda: {0}
+
+        def _score_lens_probes(*_args: Any, **_kwargs: Any) -> dict[str, ProbeReading]:
+            raise AssertionError("return_probe_readings=False should skip lens probes")
+
+        s_any._score_lens_probes = _score_lens_probes
+
+        def _fail_generate_core(*args: Any, **kwargs: Any) -> GenerationResult:
+            raise AssertionError("serial generation path should not run")
+
+        s._generate_core = _fail_generate_core
+
+        runset = s.generate_batch(
+            ["alpha", "beta", "gamma"],
+            sampling=SamplingConfig(return_probe_readings=False),
+            thinking=False,
+        )
+
+        assert len(model.calls) == 1
+        assert [r.readings for r in runset] == [{}, {}, {}]
+        assert [r.probe_readings for r in runset] == [{}, {}, {}]
+
     def test_deterministic_fan_uses_batched_generation(self) -> None:
         s, model = _fast_batch_session()
 
@@ -503,6 +584,30 @@ class TestGenerateBatch:
         assert runset.grid == [{}, {}, {}]
         assert runset.node_ids == [None, None, None]
         assert [r.tokens for r in runset] == [[10, 11], [12, 13, 14], [15]]
+
+    def test_deterministic_fan_honors_return_probe_readings_false(self) -> None:
+        from saklas.core.sampling import SamplingConfig
+
+        s, model = _probe_fast_batch_session()
+
+        def _fail_generate_core(*args: Any, **kwargs: Any) -> GenerationResult:
+            raise AssertionError("serial generation path should not run")
+
+        s._generate_core = _fail_generate_core
+
+        runset = s.generate(
+            "alpha",
+            n=3,
+            stateless=True,
+            sampling=SamplingConfig(return_probe_readings=False),
+            thinking=False,
+        )
+
+        assert len(model.calls) == 1
+        assert runset.kind == "fan"
+        assert [r.readings for r in runset] == [{}, {}, {}]
+        assert [r.probe_readings for r in runset] == [{}, {}, {}]
+        assert cast(Any, s._monitor).scored == []
 
     def test_deterministic_fan_with_seed_uses_batched_generation(self) -> None:
         from saklas.core.sampling import SamplingConfig

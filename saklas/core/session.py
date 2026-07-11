@@ -8533,11 +8533,19 @@ class SaklasSession:
             return None
         if getattr(self, "_trait_queues", None):
             return None
-        has_monitor_probes = bool(
-            getattr(getattr(self, "_monitor", None), "probe_names", [])
+        return_probe_readings = bool(
+            sampling is None or sampling.return_probe_readings
         )
-        has_lens_probes = bool(getattr(self, "_lens_probes", None))
-        has_sae_probes = bool(getattr(self, "_sae_probes", None))
+        has_monitor_probes = bool(
+            return_probe_readings
+            and getattr(getattr(self, "_monitor", None), "probe_names", [])
+        )
+        has_lens_probes = bool(return_probe_readings and getattr(
+            self, "_lens_probes", None,
+        ))
+        has_sae_probes = bool(return_probe_readings and getattr(
+            self, "_sae_probes", None,
+        ))
         has_probe_aggregates = has_monitor_probes or has_lens_probes or has_sae_probes
         if has_probe_aggregates and not (
             hasattr(self, "_layers")
@@ -8891,9 +8899,19 @@ class SaklasSession:
                 raw=raw,
                 pad_id=pad_id,
             )
-            probe_names = list(getattr(self._monitor, "probe_names", []))
-            has_lens_probes = bool(getattr(self, "_lens_probes", None))
-            has_sae_probes = bool(getattr(self, "_sae_probes", None))
+            return_probe_readings = bool(
+                sampling is None or sampling.return_probe_readings
+            )
+            probe_names = (
+                list(getattr(self._monitor, "probe_names", []))
+                if return_probe_readings else []
+            )
+            has_lens_probes = bool(return_probe_readings and getattr(
+                self, "_lens_probes", None,
+            ))
+            has_sae_probes = bool(return_probe_readings and getattr(
+                self, "_sae_probes", None,
+            ))
             capture_probe_aggregates = bool(
                 probe_names or has_lens_probes or has_sae_probes
             )
@@ -9018,6 +9036,7 @@ class SaklasSession:
                         logprobs_list=None,
                         applied_steering=applied_steering,
                         return_hidden=False,
+                        return_probe_readings=return_probe_readings,
                         assistant_node_id=None,
                     )
                 results.append(result)
