@@ -1272,7 +1272,10 @@ class SaklasSession:
         self._sae_backend: Any = None
         self._sae_layer: int | None = None
         self._sae_width: int | None = None
-        self._sae_labels: dict[str, str] = {}
+        # Per-feature Neuronpedia metadata: ``{str(id): {label, max_act}}``.
+        # ``max_act`` (maxActApprox — the corpus-max activation) normalizes the
+        # readout channel to a 0..1 strength; entries are lazily fetched.
+        self._sae_feature_meta: dict[str, dict[str, Any]] = {}
         self._live_sae: dict[str, Any] | None = None
         self._sae_probes: dict[str, dict[str, Any]] = {}
         self._sae_step_stash: dict[str, Any] | None = None
@@ -2957,7 +2960,7 @@ class SaklasSession:
             select_runtime_layer,
             validate_residual_width,
         )
-        from saklas.io.sae import load_sae_labels, save_sae_metadata
+        from saklas.io.sae import load_sae_feature_meta, save_sae_metadata
 
         release = release.strip()
         if not release:
@@ -2982,7 +2985,7 @@ class SaklasSession:
             self._sae_backend = backend
             self._sae_layer = selected
             self._sae_width = width
-            self._sae_labels = load_sae_labels(self.model_id, release)
+            self._sae_feature_meta = load_sae_feature_meta(self.model_id, release)
             self._live_sae = None
             self._sae_step_stash = None
             self._last_sae_step_readings = None
@@ -3016,7 +3019,7 @@ class SaklasSession:
             self._sae_backend = None
             self._sae_layer = None
             self._sae_width = None
-            self._sae_labels = {}
+            self._sae_feature_meta = {}
             self._live_sae = None
             self._sae_step_stash = None
             self._last_sae_step_readings = None
@@ -3071,16 +3074,39 @@ class SaklasSession:
             raise SaeFeatureError(
                 f"SAE feature {idx} out of range [0, {width}) for layer {layer}"
             )
-        label = self._sae_labels.get(str(idx))
-        if label is None:
-            label = self._fetch_sae_label(idx)
-        return {"id": idx, "label": label, "layer": layer}
+        meta = self._sae_feature_meta.get(str(idx))
+        if meta is None or (meta.get("max_act") is None and not meta.get("checked")):
+            meta = self._fetch_sae_feature_meta(idx) or meta or {}
+        return {
+            "id": idx,
+            "label": meta.get("label"),
+            "layer": layer,
+            "max_act": meta.get("max_act"),
+        }
 
-    def _fetch_sae_label(self, feature_id: int) -> str | None:
-        """Best-effort lazy Neuronpedia label lookup for an explicit id.
+    def _sae_label(self, feature_id: int) -> str | None:
+        entry = self._sae_feature_meta.get(str(feature_id))
+        label = entry.get("label") if entry else None
+        return label if isinstance(label, str) and label else None
 
-        Live/top-k readout never calls this method; discovery remains entirely
-        local and renders a bare id until the user validates/pins that feature.
+    def _sae_max_act(self, feature_id: int) -> float | None:
+        """The feature's Neuronpedia ``maxActApprox`` — the strength unit.
+
+        ``None`` when metadata is missing (offline / not on Neuronpedia), in
+        which case every readout surface for the feature stays raw.
+        """
+        entry = self._sae_feature_meta.get(str(feature_id))
+        max_act = entry.get("max_act") if entry else None
+        if isinstance(max_act, (int, float)) and float(max_act) > 0:
+            return float(max_act)
+        return None
+
+    def _fetch_neuronpedia_feature(self, feature_id: int) -> dict[str, Any] | None:
+        """One raw Neuronpedia feature fetch → ``{label, max_act, checked}``.
+
+        ``None`` on any transport failure (retry next time); a successful
+        response always yields an entry — ``checked`` marks "we asked", so a
+        feature with no Neuronpedia data isn't re-fetched on every validate.
         """
         info = self.sae_info or {}
         neuronpedia_id = info.get("neuronpedia_id")
@@ -3089,7 +3115,6 @@ class SaklasSession:
         import json
         from urllib.parse import quote
         from huggingface_hub import get_session
-        from saklas.io.sae import save_sae_labels
 
         model, source = neuronpedia_id.split("/", 1)
         url = (
@@ -3100,28 +3125,118 @@ class SaklasSession:
             response = get_session().get(
                 url,
                 timeout=2.0,
-                headers={"User-Agent": "saklas-sae-labels/1"},
+                headers={"User-Agent": "saklas-sae-meta/1"},
             )
             response.raise_for_status()
             payload = json.loads(response.content)
-            explanations = payload.get("explanations", [])
-            label = None
-            for row in explanations:
-                if not isinstance(row, dict):
-                    continue
-                description = row.get("description")
-                if isinstance(description, str) and description.strip():
-                    label = description
-                    break
         except Exception:
             return None
-        if not isinstance(label, str):
+        if not isinstance(payload, dict):
             return None
-        label = label.strip()
-        self._sae_labels[str(feature_id)] = label
+        label = None
+        for row in payload.get("explanations", []) or []:
+            if not isinstance(row, dict):
+                continue
+            description = row.get("description")
+            if isinstance(description, str) and description.strip():
+                label = description.strip()
+                break
+        max_act = payload.get("maxActApprox")
+        if not (isinstance(max_act, (int, float)) and float(max_act) > 0):
+            max_act = None
+        return {
+            "label": label,
+            "max_act": float(max_act) if max_act else None,
+            "checked": True,
+        }
+
+    def _fetch_sae_feature_meta(self, feature_id: int) -> dict[str, Any] | None:
+        """Best-effort lazy Neuronpedia metadata lookup for an explicit id.
+
+        Fetches the display label and ``maxActApprox`` together. Live/top-k
+        readout never calls this method; discovery remains entirely local and
+        renders raw activations until metadata is cached (the dashboard
+        backfills via :meth:`fetch_sae_feature_meta` between generations).
+        """
+        entry = self._fetch_neuronpedia_feature(feature_id)
+        if entry is None:
+            return None
+        from saklas.io.sae import save_sae_feature_meta
+
+        self._sae_feature_meta[str(feature_id)] = entry
         backend, _layer, _width = self._require_sae()
-        save_sae_labels(self.model_id, backend.release, self._sae_labels)
-        return label
+        save_sae_feature_meta(
+            self.model_id, backend.release, self._sae_feature_meta,
+        )
+        return entry
+
+    def fetch_sae_feature_meta(
+        self, feature_ids: "Sequence[int]",
+    ) -> dict[str, dict[str, Any]]:
+        """Fetch-and-cache Neuronpedia metadata for a set of feature ids.
+
+        The dashboard's discovery backfill: called between generations with
+        the ids the live top-k surfaced, never from the decode loop. Cached
+        ids skip the network; misses fetch on a small thread pool with the
+        single-id path's timeout. Returns ``{str(id): {label, max_act}}`` for
+        every requested id with metadata afterwards (out-of-range ids are
+        silently dropped — the top-k can't produce one, so there is nothing
+        to report).
+        """
+        backend, _layer, width = self._require_sae()
+        seen: set[int] = set()
+        wanted: list[int] = []
+        for raw in feature_ids:
+            idx = int(raw)
+            if not 0 <= idx < width or idx in seen:
+                continue
+            seen.add(idx)
+            entry = self._sae_feature_meta.get(str(idx))
+            if entry is None or (
+                entry.get("max_act") is None and not entry.get("checked")
+            ):
+                wanted.append(idx)
+        if wanted:
+            from concurrent.futures import ThreadPoolExecutor
+
+            with ThreadPoolExecutor(max_workers=min(8, len(wanted))) as pool:
+                rows = list(pool.map(self._fetch_neuronpedia_feature, wanted))
+            fetched = {
+                str(idx): entry
+                for idx, entry in zip(wanted, rows)
+                if entry is not None
+            }
+            if fetched:
+                from saklas.io.sae import save_sae_feature_meta
+
+                self._sae_feature_meta.update(fetched)
+                save_sae_feature_meta(
+                    self.model_id, backend.release, self._sae_feature_meta,
+                )
+                self._refresh_sae_probe_meta(fetched)
+        return {
+            str(idx): {
+                "label": entry.get("label"),
+                "max_act": entry.get("max_act"),
+            }
+            for idx in sorted(seen)
+            if (entry := self._sae_feature_meta.get(str(idx))) is not None
+        }
+
+    def _refresh_sae_probe_meta(self, fetched: dict[str, dict[str, Any]]) -> None:
+        """Reflect newly fetched metadata onto attached feature probes.
+
+        A pinned probe's spec carries label/max_act for the probe listing, and
+        ``max_act`` is part of the readout-channel identity (it sets the
+        strength unit), so the probe-hash cache entry is invalidated too.
+        """
+        for name, spec in self._sae_probes.items():
+            entry = fetched.get(str(spec.get("feature_id")))
+            if entry is None:
+                continue
+            spec["label"] = entry.get("label")
+            spec["max_act"] = entry.get("max_act")
+            self._probe_hash_cache.pop(name, None)
 
     def register_sae_direction(self, feature_id: int | str) -> str:
         """Register ``W_dec[id]`` at the resident hook layer as a profile."""
@@ -3183,7 +3298,15 @@ class SaklasSession:
         assert activations is not None
         out: dict[str, ProbeReading] = {}
         for name, spec in self._sae_probes.items():
-            value = float(activations[int(spec["feature_id"])])
+            fid = int(spec["feature_id"])
+            value = float(activations[fid])
+            # The ONE channel is normalized strength — ``activation /
+            # maxActApprox`` ∈ ~[0,1], apples-to-apples across features like
+            # the lens probes' mean band probability. Raw activation only
+            # when no metadata exists (offline / not on Neuronpedia).
+            max_act = self._sae_max_act(fid)
+            if max_act is not None:
+                value = value / max_act
             out[name] = ProbeReading(
                 fraction=0.0, nearest=[], coords=(value,), residual=0.0,
                 coords_per_layer={layer: (value,)},
@@ -3207,7 +3330,7 @@ class SaklasSession:
 
     def _live_sae_readout_step(
         self,
-    ) -> list[tuple[int, float, str | None]] | None:
+    ) -> list[tuple[int, float, str | None, float | None]] | None:
         state = self._live_sae
         if state is None or not getattr(self, "_live_sae_active_for_generation", True):
             return None
@@ -3231,8 +3354,16 @@ class SaklasSession:
         values, indices = torch.topk(acts, k=k)
         vals = values.detach().to("cpu")
         ids = indices.detach().to("cpu")
+        # Rows carry ``max_act`` (cached-only — the decode loop never fetches)
+        # so clients can render the normalized 0..1 strength beside the raw
+        # activation; ``None`` until the metadata backfill lands.
         return [
-            (int(idx), float(value), self._sae_labels.get(str(int(idx))))
+            (
+                int(idx),
+                float(value),
+                self._sae_label(int(idx)),
+                self._sae_max_act(int(idx)),
+            )
             for value, idx in zip(vals, ids)
         ]
 
@@ -3339,7 +3470,8 @@ class SaklasSession:
                     {
                         "id": int(idx),
                         "activation": float(value),
-                        "label": self._sae_labels.get(str(int(idx))),
+                        "label": self._sae_label(int(idx)),
+                        "max_act": self._sae_max_act(int(idx)),
                     }
                     for value, idx in zip(values.cpu(), indices.cpu())
                 ]
@@ -5251,6 +5383,7 @@ class SaklasSession:
                 "feature_id": idx,
                 "layer": int(validated["layer"]),
                 "label": validated.get("label"),
+                "max_act": validated.get("max_act"),
             }
         self._invalidate_prefix_cache()
         self._probe_hash_cache.pop(name, None)
@@ -5522,12 +5655,17 @@ class SaklasSession:
             return digest
         sae_spec = self._sae_probes.get(name)
         if sae_spec is not None:
+            # v2: the channel is normalized strength (activation /
+            # maxActApprox) when metadata exists, raw activation otherwise —
+            # ``max_act`` is therefore part of the channel identity (it sets
+            # the unit), so drift detection catches a unit change.
             import hashlib
             info = self.sae_info or {}
             digest = hashlib.sha256(repr((
-                "sae-readout-v1", self.model_id, info.get("fingerprint"),
+                "sae-readout-v2", self.model_id, info.get("fingerprint"),
                 info.get("release"), sae_spec["layer"],
                 sae_spec["feature_id"],
+                self._sae_max_act(int(sae_spec["feature_id"])),
             )).encode("utf-8")).hexdigest()
             self._probe_hash_cache[name] = digest
             return digest

@@ -6,9 +6,13 @@
   // the card persistent:
   //
   //   statline : ▲ (pinned, click to unpin) / △ (unpinned, click to pin) ·
-  //              id · label · L<layer> · activation-history sparkline
-  //   body     : the activation bar (scaled to the card's own history max —
-  //              SAE activations carry no absolute 0→1 scale)
+  //              id · label · L<layer> · history sparkline
+  //   body     : the strength bar — ``activation / maxActApprox``, the
+  //              normalized 0..1 unit every SAE surface reads (the lens
+  //              cards' absolute-scale convention).  Features without
+  //              Neuronpedia metadata fall back to the raw activation on
+  //              the panel-shared scale, so bars and numbers always rank
+  //              identically across visible cards.
 
   import Bar from "../../lib/charts/Bar.svelte";
   import Sparkline from "../../lib/charts/Sparkline.svelte";
@@ -23,9 +27,22 @@
     label?: string | null;
     /** The resident SAE's hook layer — identity context, not a per-card fit. */
     layer: number | null;
-    /** Latest activation (live step, or the settled end-of-gen aggregate). */
+    /** Latest reading (live step, or the settled end-of-gen aggregate).
+     *  Raw activation for discovery cards; a pinned card's probe channel,
+     *  which is already strength when the probe has ``max_act``
+     *  (``valueIsStrength``). */
     value: number;
-    /** Recent activation history driving the sparkline + the bar scale. */
+    /** Neuronpedia ``maxActApprox`` — the strength unit; null = no
+     *  metadata (bar falls back to the raw panel scale). */
+    maxAct?: number | null;
+    /** True when ``value`` (and ``series``) are already normalized
+     *  server-side (pinned probes with metadata). */
+    valueIsStrength?: boolean;
+    /** Panel-shared raw scale for metadata-less cards — the max raw
+     *  reading across visible cards, so their bars stay comparable. */
+    fallbackScale?: number;
+    /** Recent reading history driving the sparkline (same unit as
+     *  ``value``; the sparkline is shape-only, so the unit cancels). */
     series: number[];
     pinned: boolean;
     /** Disables the pin glyph while the panel validates another feature. */
@@ -39,6 +56,9 @@
     label = null,
     layer,
     value,
+    maxAct = null,
+    valueIsStrength = false,
+    fallbackScale = 1,
     series,
     pinned,
     busy = false,
@@ -46,7 +66,16 @@
   }: Props = $props();
 
   const name = $derived(`sae/${id}`);
-  const scale = $derived(Math.max(...series, value, 1));
+  /** Normalized 0..1 strength when the unit is known; null keeps raw. */
+  const strength = $derived(
+    maxAct != null && maxAct > 0
+      ? (valueIsStrength ? value : value / maxAct)
+      : null,
+  );
+  /** Raw activation view (reconstructed for a normalized pinned card). */
+  const rawValue = $derived(
+    valueIsStrength && maxAct != null ? value * maxAct : value,
+  );
 
   let unpinBusy = $state(false);
 
@@ -106,19 +135,37 @@
   {/snippet}
 
   {#snippet body()}
-    <!-- Activation: the card's own history max sets the scale (the
-         @when:sae/<id> gate channel reads the same raw activation). -->
-    <div class="reading">
-      <span
-        class="row-label"
-        title="activation — the feature's raw activation this step; the @when:sae/{id} gate channel"
-      >activation</span>
-      <div class="bar-cell" aria-hidden="true">
-        <Bar value={Math.max(value, 0)} max={scale} width={160} height={8} color="var(--card-accent)" />
+    {#if strength !== null}
+      <!-- Strength: activation / maxActApprox — absolute 0..1 scale, the
+           same convention as the lens cards; the @when:sae/<id> gate
+           channel reads this unit. -->
+      <div class="reading">
+        <span
+          class="row-label"
+          title="strength — activation ({rawValue.toFixed(1)}) / Neuronpedia max activation (~{maxAct?.toFixed(1)}); the @when:sae/{id} gate channel"
+        >strength</span>
+        <div class="bar-cell" aria-hidden="true">
+          <Bar value={Math.max(strength, 0)} max={1} width={160} height={8} color="var(--card-accent)" />
+        </div>
+        <span class="filler" aria-hidden="true"></span>
+        <span class="value">{strength.toFixed(2)}</span>
       </div>
-      <span class="filler" aria-hidden="true"></span>
-      <span class="value">{value.toFixed(2)}</span>
-    </div>
+    {:else}
+      <!-- No Neuronpedia metadata (offline / unlisted feature): raw
+           activation on the panel-shared scale, so bars still rank
+           consistently with the numbers across cards. -->
+      <div class="reading">
+        <span
+          class="row-label"
+          title="activation — raw feature activation (no Neuronpedia max yet; bar scaled to the largest visible reading); the @when:sae/{id} gate channel"
+        >activation</span>
+        <div class="bar-cell" aria-hidden="true">
+          <Bar value={Math.max(rawValue, 0)} max={Math.max(fallbackScale, 1)} width={160} height={8} color="var(--card-accent)" />
+        </div>
+        <span class="filler" aria-hidden="true"></span>
+        <span class="value">{rawValue.toFixed(2)}</span>
+      </div>
+    {/if}
   {/snippet}
 </RackCard>
 

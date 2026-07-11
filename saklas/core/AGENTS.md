@@ -296,7 +296,10 @@ SAE backend. `SaeBackend` (runtime-checkable Protocol): `encode_layer`/
 `layers`. `MockSaeBackend` for CPU tests;
 `SaeLensBackend` the concrete adapter. `load_sae_backend(release, *, revision,
 model_id, device, dtype)` queries SAELens, validates base-model compatibility,
-resolves per-layer sae_ids (`_canonical_layer_map` narrowest-width), gates
+resolves per-layer sae_ids (`_canonical_layer_map` — Neuronpedia-hosted first,
+then narrowest width, then smallest L0: hosting supplies the label +
+`maxActApprox` metadata channel, so an unhosted pick would silently lose
+normalization), gates
 `sae_lens` imports so the module loads without `[sae]`. Registry resolution is
 eager but weights are lazy with a one-layer resident cache; a valid fitted-tensor
 hit does not import SAELens at all. An explicit `revision` is passed only when
@@ -307,7 +310,18 @@ The live runtime keeps one selected encoder/decoder layer resident;
 `select_runtime_layer` chooses nearest 65% model depth (workspace preferred),
 and `list_sae_releases` discovers compatible registry rows without weights.
 `sae/<id>` steering reads `W_dec[id]`; feature probes read the encoder channel
-outside the `Monitor`. The capture surface is the transformer-block output, so
+outside the `Monitor`. The probe/gate channel is **normalized strength** —
+`activation / maxActApprox` ∈ ~[0,1], the Neuronpedia corpus-max unit, so
+features read apples-to-apples like the lens probes' mean band probability;
+raw activation only when no metadata is cached (offline / unlisted feature).
+Metadata (`{label, max_act}` per feature, `session._sae_feature_meta`) is
+fetched lazily from Neuronpedia — at validate/pin time
+(`_fetch_sae_feature_meta`) and via the batch backfill
+`fetch_sae_feature_meta(ids)` (the dashboard calls it between generations
+with the ids the live top-k surfaced; a fetch never runs in the decode
+loop) — and persisted through `io/sae.py::save_sae_feature_meta`. Live
+top-k rows and `sae_token_readout` features carry `max_act` beside the raw
+activation so clients render both units. The capture surface is the transformer-block output, so
 only residual-post/block-output SAEs are valid: discovery omits explicitly named
 attention/MLP/transcoder families, and loaded hook metadata plus decoder width are
 validated before a release becomes resident.

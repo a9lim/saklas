@@ -40,6 +40,7 @@ import type {
   ProbeRequest,
   RemoteManifoldInfo,
   ScoreTemplateResponse,
+  SaeFeatureMetaResponse,
   SaeLoadStatusJSON,
   SaeTokenReadoutJSON,
   SessionInfo,
@@ -91,6 +92,7 @@ export type {
   ProbeRequest,
   RemoteManifoldInfo,
   ScoreTemplateResponse,
+  SaeFeatureMetaResponse,
   SaeLoadStatusJSON,
   SaeTokenReadoutJSON,
   SessionInfo,
@@ -924,10 +926,22 @@ export const apiSae = {
   validateFeature(
     featureId: number,
     id: string = SESSION,
-  ): Promise<{ id: number; label?: string | null; layer: number }> {
+  ): Promise<{
+    id: number; label?: string | null; layer: number;
+    max_act?: number | null;
+  }> {
     return request(
       `${SESSION_BASE(id)}/sae/feature/validate`,
       jsonBody({ id: featureId }),
+    );
+  },
+  featuresMetadata(
+    ids: number[],
+    id: string = SESSION,
+  ): Promise<SaeFeatureMetaResponse> {
+    return request(
+      `${SESSION_BASE(id)}/sae/features/metadata`,
+      jsonBody({ ids }),
     );
   },
   tokenReadout(

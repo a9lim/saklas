@@ -104,13 +104,21 @@ def build_token_event(
 
         sae = payload.get("sae") if isinstance(payload, dict) else None
         if sae:
+            # ``max_act`` is the cached Neuronpedia maxActApprox (the strength
+            # unit — clients render ``activation / max_act`` as the normalized
+            # 0..1 strength); ``None`` until the metadata backfill lands.
             event["sae_readout"] = [
                 {
-                    "id": int(feature_id),
-                    "activation": float(activation),
-                    "label": label,
+                    "id": int(row[0]),
+                    "activation": float(row[1]),
+                    "label": row[2],
+                    "max_act": (
+                        float(row[3])
+                        if len(row) > 3 and row[3] is not None
+                        else None
+                    ),
                 }
-                for feature_id, activation, label in sae
+                for row in sae
             ]
 
     return event

@@ -366,6 +366,34 @@ def test_canonical_layer_map_sorts_width_and_l0_numerically() -> None:
     }
 
 
+def test_canonical_layer_map_prefers_neuronpedia_hosted() -> None:
+    # Neuronpedia typically hosts one L0 variant per layer/width, and hosting
+    # is where feature labels + the maxActApprox strength unit come from — a
+    # hosted SAE beats a narrower/sparser unhosted one.
+    from saklas.core.sae import _canonical_layer_map
+
+    saes_map = {
+        "layer_0_width_131k_l0_small": 0,
+        "layer_0_width_16k_l0_big": 0,
+        "layer_0_width_16k_l0_medium": 0,
+        "layer_0_width_16k_l0_small": 0,
+        "layer_1_width_16k_l0_small": 1,
+    }
+    with pytest.warns(UserWarning, match="multiple SAEs"):
+        chosen = _canonical_layer_map(saes_map, neuronpedia_ids={
+            "layer_0_width_16k_l0_medium": "model/0-res-16k",
+            "layer_1_width_16k_l0_small": "model/1-res-16k",
+        })
+    assert chosen == {
+        "layer_0_width_16k_l0_medium": 0,
+        "layer_1_width_16k_l0_small": 1,
+    }
+    # No hosting information at all → the width/L0 order is unchanged.
+    with pytest.warns(UserWarning, match="multiple SAEs"):
+        unhosted = _canonical_layer_map(saes_map)
+    assert unhosted["layer_0_width_16k_l0_small"] == 0
+
+
 # --- DLS tests (raw PCA path; co-located with the SAE extract tests above
 # because they share the ``_encode_and_capture_all`` mock infrastructure).
 # Replaces the v2.0–v2.1 ``drop_edges`` test family — edge-drop is gone in

@@ -302,7 +302,14 @@ def list_sae_releases(model_id: str) -> list[dict[str, Any]]:
         hook_kind = _release_hook_kind(str(release))
         if hook_kind in {"attention", "mlp", "transcoder"}:
             continue
-        layer_map = _canonical_layer_map(value("saes_map", {}), warn=False)
+        neuronpedia_raw = value("neuronpedia_id")
+        layer_map = _canonical_layer_map(
+            value("saes_map", {}),
+            warn=False,
+            neuronpedia_ids=(
+                neuronpedia_raw if isinstance(neuronpedia_raw, Mapping) else None
+            ),
+        )
         rows.append({
             "release": str(release),
             "model": str(release_model) if release_model else None,
@@ -484,16 +491,21 @@ def load_sae_backend(
             f"SAE release '{release}' has no saes_map in the registry"
         )
 
+    neuronpedia_raw = _entry_value("neuronpedia_id")
     ids_by_layer_int = {
         int(hook_layer): sae_id
-        for sae_id, hook_layer in _canonical_layer_map(saes_map).items()
+        for sae_id, hook_layer in _canonical_layer_map(
+            saes_map,
+            neuronpedia_ids=(
+                neuronpedia_raw if isinstance(neuronpedia_raw, Mapping) else None
+            ),
+        ).items()
     }
     ids_by_layer = {
         str(layer_idx): sae_id
         for layer_idx, sae_id in ids_by_layer_int.items()
     }
     repo_id = _entry_value("repo_id")
-    neuronpedia_raw = _entry_value("neuronpedia_id")
     neuronpedia_by_layer: dict[str, str] = {}
     if isinstance(neuronpedia_raw, Mapping):
         for layer_idx, sae_id in ids_by_layer_int.items():
@@ -654,22 +666,30 @@ def _canonical_layer_map(
     saes_map: dict[str, Any],
     *,
     warn: bool = True,
+    neuronpedia_ids: Mapping[str, Any] | None = None,
 ) -> dict[str, int]:
-    """Pick one SAE per layer: narrowest width, then sparsest L0.
+    """Pick one SAE per layer: Neuronpedia-hosted, narrowest width, sparsest L0.
 
     SAELens releases that ship multiple SAEs per layer (different widths, L0s)
     expose all of them via ``saes_map``. Canonical sub-releases (e.g.
     ``gemma-scope-2b-pt-res-canonical``) already commit to one per layer;
-    other releases surface multiple. We bucket by ``hook_layer``, pick the
-    numerically narrowest width per bucket, then the numerically smallest
-    average-L0 (or ``small`` / ``medium`` / ``big`` in that order), and warn
-    when we had to choose — so users can override by picking a different
-    release.  The final id tie-break makes registry ordering irrelevant.
+    other releases surface multiple. We bucket by ``hook_layer``, prefer a
+    Neuronpedia-hosted SAE (typically one L0 per layer/width is hosted, and
+    hosting is where feature labels + the ``maxActApprox`` strength unit come
+    from — an unhosted pick silently loses the whole metadata channel), then
+    pick the numerically narrowest width per bucket, then the numerically
+    smallest average-L0 (or ``small`` / ``medium`` / ``big`` in that order),
+    and warn when we had to choose — so users can override by picking a
+    different release.  The final id tie-break makes registry ordering
+    irrelevant.
     """
     import re
     import warnings
 
-    def _candidate_rank(sae_id: str) -> tuple[int, int, str]:
+    def _candidate_rank(sae_id: str) -> tuple[int, int, int, str]:
+        hosted = bool(
+            neuronpedia_ids is not None and neuronpedia_ids.get(sae_id)
+        )
         width_match = re.search(
             r"(?:^|[/_.-])width[_-]?(\d+)([km])?(?:$|[/_.-])",
             sae_id,
@@ -696,7 +716,7 @@ def _canonical_layer_map(
                 if not raw_l0.isdigit()
                 else int(raw_l0)
             )
-        return width, l0, sae_id
+        return (0 if hosted else 1), width, l0, sae_id
 
     buckets: dict[int, list[tuple[str, int]]] = {}
     for sae_id, hook_layer in saes_map.items():

@@ -132,7 +132,15 @@ webui/src/
                               # decoder-row STEER cards + pinned/live-discovery
                               # feature PROBE cards (▲ unpins / △ pins — same
                               # merged-PROBE shape as the lens tab), cards in
-                              # rack/{SaeSteerCard,SaeProbeCard} (gold, ▲/△)
+                              # rack/{SaeSteerCard,SaeProbeCard} (gold, ▲/△).
+                              # Cards read normalized strength — activation /
+                              # Neuronpedia maxActApprox, absolute 0..1 bar
+                              # like the lens cards (saeState.meta, fed by
+                              # token-frame max_act + the between-generation
+                              # POST sae/features/metadata backfill in
+                              # backfillSaeMeta); metadata-less features fall
+                              # back to raw activation on a panel-shared
+                              # scale so bars always rank with the numbers
     InspectorPanel.svelte     # right rack: THE INSTRUMENT STACK — RecipeBar +
                               # four pillar tabs (subspace/manifold/sae/lens via
                               # ui/SegmentedTabs). subspace + manifold tabs each

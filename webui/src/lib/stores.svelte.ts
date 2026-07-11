@@ -41,6 +41,7 @@ import type {
   ChatTurn,
   GenStatus,
   JLensSteerEntry,
+  SaeFeatureJSON,
   SaeSteerEntry,
   ManifoldSteerEntry,
   PendingAction,
@@ -102,6 +103,16 @@ export async function refreshSession(): Promise<void> {
     // the server disagrees).  Older servers omit the fields.
     lensState.layers = info.live_lens_layers ?? null;
     saeState.live = info.live_sae ?? false;
+    // Feature ids (and their metadata) belong to the resident release —
+    // reset the discovery/metadata state when it changes.
+    const release = info.sae_info?.release ?? null;
+    if (release !== saeState.release) {
+      saeState.release = release;
+      saeState.readout = [];
+      saeState.history.clear();
+      saeState.meta.clear();
+      _saeMetaRequested.clear();
+    }
     probesLiveState.enabled = info.live_probe_scores ?? true;
   } catch (e) {
     sessionState.error = e instanceof Error ? e.message : String(e);
@@ -158,8 +169,19 @@ export function setLensWorkspaceSortMode(mode: LensWorkspaceSortMode): void {
 
 export interface SaeState {
   live: boolean;
-  readout: { id: number; activation: number; label?: string | null }[];
+  readout: SaeFeatureJSON[];
+  /** Raw activation history per feature id (drives the sparklines; the
+   *  bars derive their scale from ``meta`` instead). */
   history: Map<number, number[]>;
+  /** Session-side Neuronpedia metadata per feature id — merged from the
+   *  token frames' cached values and the between-generation backfill.
+   *  ``max_act`` is the strength unit: bars render
+   *  ``activation / max_act`` on the absolute 0..1 scale (the lens-card
+   *  convention); features without it fall back to the panel-shared raw
+   *  scale. */
+  meta: Map<number, { label: string | null; max_act: number | null }>;
+  /** Resident release the discovery state belongs to (reset key). */
+  release: string | null;
   busy: boolean;
   loading: boolean;
   loadMessage: string | null;
@@ -170,11 +192,47 @@ export const saeState: SaeState = $state({
   live: false,
   readout: [],
   history: new SvelteMap<number, number[]>(),
+  meta: new SvelteMap<number, { label: string | null; max_act: number | null }>(),
+  release: null,
   busy: false,
   loading: false,
   loadMessage: null,
   loadError: null,
 });
+
+/** Ids already sent to the metadata backfill this session — a miss on
+ *  Neuronpedia stays a miss, so don't re-ask every generation.  Not
+ *  reactive state (never rendered). */
+const _saeMetaRequested = new Set<number>();
+
+/** Between-generation discovery backfill: fetch-and-cache Neuronpedia
+ *  metadata (label + maxActApprox) for every feature the live top-k
+ *  surfaced that has none yet.  Fire-and-forget from the ``done``
+ *  handler — never per token. */
+export async function backfillSaeMeta(): Promise<void> {
+  if (!sessionState.info?.sae_loaded) return;
+  const wanted: number[] = [];
+  for (const id of saeState.history.keys()) {
+    if (saeState.meta.get(id)?.max_act != null) continue;
+    if (_saeMetaRequested.has(id)) continue;
+    wanted.push(id);
+    if (wanted.length >= 64) break;
+  }
+  if (wanted.length === 0) return;
+  for (const id of wanted) _saeMetaRequested.add(id);
+  try {
+    const out = await apiSae.featuresMetadata(wanted);
+    for (const [key, entry] of Object.entries(out.features)) {
+      saeState.meta.set(Number(key), {
+        label: entry.label ?? null,
+        max_act: entry.max_act ?? null,
+      });
+    }
+  } catch {
+    // Best-effort — allow a retry on the next generation.
+    for (const id of wanted) _saeMetaRequested.delete(id);
+  }
+}
 
 export async function setLiveSae(enabled: boolean): Promise<void> {
   if (saeState.busy) return;
@@ -2679,6 +2737,14 @@ function handleWsMessage(msg: WSServerMessage): void {
             const prior = saeState.history.get(feature.id) ?? [];
             const next = [...prior, feature.activation].slice(-MAX_SPARKLINE);
             saeState.history.set(feature.id, next);
+            // Server-cached metadata rides each row; the backfill fills
+            // the gaps between generations.
+            if (feature.max_act != null || feature.label != null) {
+              saeState.meta.set(feature.id, {
+                label: feature.label ?? null,
+                max_act: feature.max_act ?? null,
+              });
+            }
           }
         }
       }
@@ -2773,6 +2839,10 @@ function handleWsMessage(msg: WSServerMessage): void {
       snapshotProbeBaseline();
       void refreshCorrelation();
       void drainNextPendingAction();
+      // SAE discovery backfill — fetch Neuronpedia metadata (label +
+      // maxActApprox) for features the live top-k surfaced this
+      // generation.  Between generations only, never per token.
+      void backfillSaeMeta();
 
       // v2.3: the legacy standalone A/B toggle is gone — auto-regen with
       // ``mode === "unsteered"`` *is* the A/B shadow.  Branch on the

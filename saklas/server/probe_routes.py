@@ -134,6 +134,9 @@ def _sae_probe_info(name: str, spec: dict[str, Any]) -> dict[str, Any]:
         "sae": True,
         "feature_id": feature_id,
         "label": label,
+        # The strength unit — coords are ``activation / max_act`` when set,
+        # raw activation when null (no Neuronpedia metadata).
+        "max_act": spec.get("max_act"),
     }
 
 

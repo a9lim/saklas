@@ -210,6 +210,18 @@ export interface SaeFeatureJSON {
   id: number;
   activation: number;
   label?: string | null;
+  /** Cached Neuronpedia ``maxActApprox`` — the strength unit.  Render
+   *  ``activation / max_act`` as the normalized 0..1 strength; ``null``
+   *  until the metadata backfill lands (then bars fall back to the
+   *  panel-shared raw scale). */
+  max_act?: number | null;
+}
+
+/** ``POST .../sae/features/metadata`` — the discovery backfill.  Fetches
+ *  and caches Neuronpedia metadata for up to 64 feature ids; ids without
+ *  metadata after the fetch are absent from the response. */
+export interface SaeFeatureMetaResponse {
+  features: Record<string, { label: string | null; max_act: number | null }>;
 }
 
 export interface SaeLoadStatusJSON {
@@ -764,6 +776,10 @@ export interface ProbeInfo {
   sae?: boolean;
   feature_id?: number | null;
   label?: string | null;
+  /** SAE probes only — the strength unit.  Coords (and so sparklines /
+   *  gate scalars) are ``activation / max_act`` when set, raw activation
+   *  when null (no Neuronpedia metadata). */
+  max_act?: number | null;
 }
 
 export interface ProbeListResponse {
@@ -1067,8 +1083,10 @@ export interface WSTokenEvent {
    *  (mean band probability + probability-mass-weighted depth center of
    *  mass).  Present under the same conditions as ``lens_readout``. */
   lens_aggregate?: [string, number, number, number][];
-  /** Resident SAE top-k feature activations for this decode step. */
-  sae_readout?: { id: number; activation: number; label?: string | null }[];
+  /** Resident SAE top-k feature activations for this decode step.  Rows
+   *  carry the raw activation plus the cached ``max_act`` strength unit
+   *  (see :type:`SaeFeatureJSON`). */
+  sae_readout?: SaeFeatureJSON[];
 }
 
 export interface WSDoneResultPerToken {

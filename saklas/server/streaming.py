@@ -41,6 +41,14 @@ def probe_reading_aggregate(
         attached = set(session.monitor.probe_names)
     except Exception:
         attached = set(readings.keys())
+    # Pinned J-lens token probes and SAE feature probes live on their own
+    # session registries (readout channels, not Monitor probes) but land in
+    # ``result.probe_readings`` all the same — without this union the
+    # attached-filter silently dropped their end-of-gen aggregates from every
+    # streaming done frame.
+    for roster in ("lens_probe_names", "sae_probe_names"):
+        with suppress(Exception):
+            attached.update(getattr(session, roster, None) or [])
     out: dict[str, Any] = {}
     for name, agg in readings.items():
         if name not in attached:

@@ -26,7 +26,12 @@ those registrars import):
 - `lens_routes.register_lens_routes` — `/sessions/{id}/lens/*` (token readout +
   the live-lens toggle)
 - `sae_routes.register_sae_routes` — `/sessions/{id}/sae/*` (release discovery,
-  background load, live toggle, feature validation, token readout)
+  background load, live toggle, feature validation, token readout, and
+  `POST .../sae/features/metadata` — the Neuronpedia metadata backfill:
+  `{ids: [...]}` (≤64) → `session.fetch_sae_feature_meta` in a worker thread,
+  no session lock (network + disk cache only, like validation); the dashboard
+  calls it between generations so discovery cards gain labels + the
+  `max_act` strength unit)
 - `ws_stream.register_ws_stream` — the `WS /sessions/{id}/stream` co-stream engine
 
 `server/sse.py`, `server/streaming.py`, and `server/ws_events.py` are the shared
@@ -466,7 +471,10 @@ inline off `session._capture._per_layer`, and `lens_readout`
 `_on_token` stamps `_saklas_wants_lens_readout` so the engine computes the
 step readout, and `build_token_event` copies the token tap's `lens` /
 `lens_aggregate` slots onto
-the frame), `done` (`result` with `text`, `tokens`,
+the frame; likewise `sae_readout`
+`[{id, activation, label, max_act}]` while the live SAE readout is on —
+`max_act` is the cached Neuronpedia maxActApprox strength unit, `null`
+until the metadata backfill lands), `done` (`result` with `text`, `tokens`,
 `finish_reason`, `usage`, `per_token_probes`, `mean_logprob`, `mean_surprise`,
 `probe_readings` aggregate), `error` (validation errors keep the connection open;
 other failures close 1011).

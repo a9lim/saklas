@@ -28,6 +28,10 @@ class SaeFeatureRequest(BaseModel):
     id: int = Field(ge=0)
 
 
+class SaeFeatureMetaRequest(BaseModel):
+    ids: list[int] = Field(min_length=1, max_length=64)
+
+
 def register_sae_routes(app: FastAPI) -> None:
     session = app.state.session
     app.state.sae_load = {
@@ -137,6 +141,27 @@ def register_sae_routes(app: FastAPI) -> None:
         except SaklasError as exc:
             status, message = exc.user_message()
             raise HTTPException(status, message) from exc
+
+    @app.post("/saklas/v1/sessions/{session_id}/sae/features/metadata")
+    async def sae_features_metadata(session_id: str, body: SaeFeatureMetaRequest):
+        """Fetch-and-cache Neuronpedia metadata (label + maxActApprox).
+
+        The dashboard's discovery backfill — called between generations with
+        the ids the live top-k surfaced. Network + disk-cache only (no model
+        use), so it deliberately does not take the session lock, mirroring
+        feature validation.
+        """
+        resolve_session_id(session, session_id)
+        if any(feature_id < 0 for feature_id in body.ids):
+            raise HTTPException(400, "feature ids must be non-negative")
+        try:
+            features = await asyncio.to_thread(
+                session.fetch_sae_feature_meta, body.ids,
+            )
+        except SaklasError as exc:
+            status, message = exc.user_message()
+            raise HTTPException(status, message) from exc
+        return {"features": features}
 
     @app.get("/saklas/v1/sessions/{session_id}/sae/token-readout")
     async def sae_token_readout(

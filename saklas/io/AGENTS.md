@@ -20,8 +20,12 @@ barrier). `vectors_dir` / `concept_dir` survive only for the legacy-port scan �
 current writer targets them.
 
 `sae.py` owns the small live-runtime metadata cache under
-`models/<safe>/sae/`: one release/layer identity sidecar and optional lazily
-fetched Neuronpedia labels. SAE weights remain in the Hugging Face cache.
+`models/<safe>/sae/`: one release/layer identity sidecar plus the lazily
+fetched per-feature Neuronpedia metadata (`<release>-features.json` —
+`{id: {label, max_act}}`, where `max_act` is `maxActApprox`, the strength
+unit that normalizes the readout channel to 0..1; a legacy labels-only
+`-labels.json` still reads through). SAE weights remain in the Hugging Face
+cache.
 
 Owns the tensor-filename variant scheme. A manifold folder can hold several
 fitted tensors per model, distinguished by filename suffix — exactly one *kind*

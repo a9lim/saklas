@@ -135,12 +135,41 @@ class TestSaeRoutes:
         }
         session.enable_live_sae.assert_called_once_with(top_k=12)
 
+    def test_features_metadata_backfill(self, session_and_client: Any) -> None:
+        session, client = session_and_client
+        session.fetch_sae_feature_meta.return_value = {
+            "42": {"label": "fruit", "max_act": 121.11},
+        }
+        resp = client.post(
+            "/saklas/v1/sessions/default/sae/features/metadata",
+            json={"ids": [42, 42, 7]},
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "features": {"42": {"label": "fruit", "max_act": 121.11}},
+        }
+        session.fetch_sae_feature_meta.assert_called_once_with([42, 42, 7])
+
+    def test_features_metadata_rejects_oversized_batch(
+        self, session_and_client: Any,
+    ) -> None:
+        _session_obj, client = session_and_client
+        resp = client.post(
+            "/saklas/v1/sessions/default/sae/features/metadata",
+            json={"ids": list(range(65))},
+        )
+        # RequestValidationError maps to 400 app-wide (the OpenAI shape).
+        assert resp.status_code == 400
+
     def test_token_readout(self, session_and_client: Any) -> None:
         session, client = session_and_client
         session.sae_token_readout.return_value = {
             "node_id": "n1", "raw_index": 2, "token_id": 7,
             "token_text": "x", "steering": None, "layer": 14,
-            "features": [{"id": 42, "activation": 3.5, "label": "fruit"}],
+            "features": [{
+                "id": 42, "activation": 3.5, "label": "fruit",
+                "max_act": 121.11,
+            }],
         }
         resp = client.get(
             "/saklas/v1/sessions/default/sae/token-readout",
@@ -1486,6 +1515,32 @@ class TestWSTokenEventLens:
             {"readings": None, "lens": None, "lens_aggregate": None}
         )
         assert "lens_aggregate" not in event
+
+    def test_sae_readout_rides_token_frame(self) -> None:
+        event = self._event(
+            {
+                "readings": None,
+                "lens": None,
+                "sae": [
+                    (362, 3216.0, "code blocks", 4000.0),
+                    (148, 1832.0, None, None),
+                ],
+            }
+        )
+        # Rows carry the raw activation AND the cached maxActApprox (the
+        # strength unit) — clients render activation / max_act as the
+        # normalized 0..1 strength; null until the metadata backfill lands.
+        assert event["sae_readout"] == [
+            {
+                "id": 362, "activation": 3216.0, "label": "code blocks",
+                "max_act": 4000.0,
+            },
+            {"id": 148, "activation": 1832.0, "label": None, "max_act": None},
+        ]
+
+    def test_sae_readout_absent_when_off(self) -> None:
+        event = self._event({"readings": None, "lens": None, "sae": None})
+        assert "sae_readout" not in event
 
 
 class TestProbesLiveToggle:

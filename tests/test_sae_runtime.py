@@ -43,7 +43,9 @@ def _session() -> SaklasSession:
     )
     session._sae_layer = 1
     session._sae_width = 4
-    session._sae_labels = {"2": "feature two"}
+    session._sae_feature_meta = {
+        "2": {"label": "feature two", "max_act": 10.0, "checked": True},
+    }
     session._live_sae = None
     session._sae_probes = {}
     session._sae_step_stash = None
@@ -78,7 +80,7 @@ def test_select_runtime_layer_prefers_workspace_near_65_percent() -> None:
 def test_sae_feature_validation_and_decoder_row_registration() -> None:
     session = _session()
     assert session.validate_sae_feature(2) == {
-        "id": 2, "label": "feature two", "layer": 1,
+        "id": 2, "label": "feature two", "layer": 1, "max_act": 10.0,
     }
     name = session.register_sae_direction(2)
     assert name == "sae/2"
@@ -90,30 +92,52 @@ def test_sae_feature_validation_and_decoder_row_registration() -> None:
 def test_live_sae_readout_and_probe_share_one_encoder_result() -> None:
     session = _session()
     session._sae_probes["sae/2"] = {
-        "feature_id": 2, "layer": 1, "label": "feature two",
+        "feature_id": 2, "layer": 1, "label": "feature two", "max_act": 10.0,
     }
     assert session.enable_live_sae(top_k=3) == {"layer": 1, "top_k": 3}
     readout = session._live_sae_readout_step()
     assert readout == [
-        (2, 5.0, "feature two"),
-        (1, 3.0, None),
-        (3, 1.0, None),
+        (2, 5.0, "feature two", 10.0),
+        (1, 3.0, None, None),
+        (3, 1.0, None, None),
     ]
+    # The probe channel is normalized strength — activation / maxActApprox —
+    # while the readout row keeps the raw activation beside the unit.
     reading = session._last_sae_step_readings["sae/2"]  # type: ignore[index]
-    assert reading.coords == (5.0,)
-    assert reading.coords_per_layer == {1: (5.0,)}
+    assert reading.coords == (0.5,)
+    assert reading.coords_per_layer == {1: (0.5,)}
+
+
+def test_sae_probe_without_metadata_reads_raw_activation() -> None:
+    session = _session()
+    session._sae_probes["sae/1"] = {
+        "feature_id": 1, "layer": 1, "label": None, "max_act": None,
+    }
+    session.enable_live_sae(top_k=1)
+    session._live_sae_readout_step()
+    reading = session._last_sae_step_readings["sae/1"]  # type: ignore[index]
+    assert reading.coords == (3.0,)
 
 
 def test_sae_gate_scalar_stashes_activations_for_live_step() -> None:
     session = _session()
     session._sae_probes["sae/1"] = {
-        "feature_id": 1, "layer": 1, "label": None,
+        "feature_id": 1, "layer": 1, "label": None, "max_act": None,
     }
     scalars = session._score_sae_gate_scalars()
     assert scalars["sae/1"] == pytest.approx(3.0)
     assert scalars["sae/1[0]"] == pytest.approx(3.0)
     assert session._sae_step_stash is not None
     assert session._sae_step_stash["fresh"] is True
+
+
+def test_sae_gate_scalar_is_normalized_when_metadata_known() -> None:
+    session = _session()
+    session._sae_probes["sae/2"] = {
+        "feature_id": 2, "layer": 1, "label": "feature two", "max_act": 10.0,
+    }
+    scalars = session._score_sae_gate_scalars()
+    assert scalars["sae/2"] == pytest.approx(0.5)
 
 
 def test_composer_detects_attached_sae_gate() -> None:
@@ -158,3 +182,98 @@ def test_sae_runtime_metadata_roundtrip(
         "layer": 14,
         "width": 16_384,
     }
+
+
+def test_sae_feature_meta_roundtrip_and_legacy_labels_fallback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    from saklas.io.atomic import write_json_atomic
+    from saklas.io.sae import (
+        load_sae_feature_meta,
+        sae_labels_path,
+        save_sae_feature_meta,
+    )
+
+    # Legacy labels-only cache (pre-normalization sessions) reads through.
+    write_json_atomic(sae_labels_path("org/model", "rel"), {
+        "format_version": 1,
+        "model_id": "org/model",
+        "release": "rel",
+        "labels": {"7": "days of the week", "8": "  "},
+    })
+    assert load_sae_feature_meta("org/model", "rel") == {
+        "7": {"label": "days of the week", "max_act": None},
+    }
+
+    # The features file wins once written; junk entries are dropped.
+    save_sae_feature_meta("org/model", "rel", cast("dict[str, dict[str, Any]]", {
+        "7": {"label": "days of the week", "max_act": 121.11, "checked": True},
+        "9": {"label": None, "max_act": -3.0},
+        "10": "junk",
+    }))
+    meta = load_sae_feature_meta("org/model", "rel")
+    assert meta["7"] == {"label": "days of the week", "max_act": 121.11}
+    assert meta["9"] == {"label": None, "max_act": None}
+    assert "10" not in meta
+
+
+def test_stream_aggregate_keeps_lens_and_sae_probe_readings() -> None:
+    # ``probe_reading_aggregate`` filters result readings to attached probes;
+    # lens/SAE probes live on their own session registries (readout channels,
+    # not the Monitor), so the filter must union all three rosters — it used
+    # to drop their end-of-gen aggregates from every streaming done frame.
+    from saklas.core.results import ProbeReading
+    from saklas.server.streaming import probe_reading_aggregate
+
+    readings = {
+        "confident.uncertain": ProbeReading(0.1, [], coords=(0.3,)),
+        "jlens/fake": ProbeReading(0.0, [], coords=(0.02,)),
+        "sae/548": ProbeReading(0.0, [], coords=(0.84,)),
+        "sae/999": ProbeReading(0.0, [], coords=(0.5,)),  # detached — dropped
+    }
+    session = SimpleNamespace(
+        monitor=SimpleNamespace(probe_names=("confident.uncertain",)),
+        lens_probe_names=["jlens/fake"],
+        sae_probe_names=["sae/548"],
+    )
+    result = SimpleNamespace(probe_readings=readings)
+    out = probe_reading_aggregate(session, result)  # type: ignore[arg-type]
+    assert set(out) == {"confident.uncertain", "jlens/fake", "sae/548"}
+    assert out["sae/548"]["coords"] == [0.84]
+
+
+def test_fetch_sae_feature_meta_batch_caches_and_updates_probes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    session = _session()
+    session._model_info = {"model_id": "org/model"}
+    session._sae_probes["sae/1"] = {
+        "feature_id": 1, "layer": 1, "label": None, "max_act": None,
+    }
+    session._probe_hash_cache["sae/1"] = "stale"
+    fetched: list[int] = []
+
+    def fake_fetch(idx: int) -> dict[str, object] | None:
+        fetched.append(idx)
+        if idx == 3:
+            return None  # network miss — retryable, not cached
+        return {"label": f"feature {idx}", "max_act": 4.0, "checked": True}
+
+    session._fetch_neuronpedia_feature = fake_fetch  # type: ignore[method-assign]
+    out = session.fetch_sae_feature_meta([1, 1, 2, 3, 99])
+    # id 2 was already cached (max_act present) — no refetch; 99 is out of
+    # range; 3 failed and stays absent so a later call retries it.
+    assert sorted(fetched) == [1, 3]
+    assert out["1"] == {"label": "feature 1", "max_act": 4.0}
+    assert out["2"] == {"label": "feature two", "max_act": 10.0}
+    assert "3" not in out and "99" not in out
+    # The attached probe's spec + hash cache reflect the new unit.
+    assert session._sae_probes["sae/1"]["max_act"] == 4.0
+    assert "sae/1" not in session._probe_hash_cache
+    # Persisted — a fresh load sees the merged cache.
+    from saklas.io.sae import load_sae_feature_meta
+
+    on_disk = load_sae_feature_meta("org/model", "mock-release")
+    assert on_disk["1"]["max_act"] == 4.0

@@ -1,9 +1,11 @@
 """Small local metadata cache for a session-resident SAE release.
 
 Weights remain in the normal Hugging Face cache owned by SAELens.  Saklas only
-persists the resolved release/layer identity and optional display labels under
-``models/<safe>/sae`` so a UI can describe the last successful load without
-copying model-sized tensors into a second cache.
+persists the resolved release/layer identity and optional per-feature metadata
+(Neuronpedia display labels + ``maxActApprox``, the corpus-max activation that
+normalizes the readout channel to a 0..1 strength) under ``models/<safe>/sae``
+so a UI can describe the last successful load without copying model-sized
+tensors into a second cache.
 """
 from __future__ import annotations
 
@@ -32,7 +34,12 @@ def sae_metadata_path(model_id: str, release: str) -> Path:
 
 
 def sae_labels_path(model_id: str, release: str) -> Path:
+    """Legacy per-feature label cache (read-only fallback; no writer)."""
     return sae_runtime_dir(model_id) / f"{safe_release_id(release)}-labels.json"
+
+
+def sae_features_path(model_id: str, release: str) -> Path:
+    return sae_runtime_dir(model_id) / f"{safe_release_id(release)}-features.json"
 
 
 def save_sae_metadata(model_id: str, release: str, payload: dict[str, Any]) -> Path:
@@ -66,32 +73,68 @@ def load_sae_metadata(model_id: str, release: str) -> dict[str, Any] | None:
     return payload
 
 
-def load_sae_labels(model_id: str, release: str) -> dict[str, str]:
+def _coerce_feature_entry(value: Any) -> dict[str, Any] | None:
+    """Normalize one cached feature row to ``{label, max_act}``."""
+    if not isinstance(value, dict):
+        return None
+    label = value.get("label")
+    if not (isinstance(label, str) and label.strip()):
+        label = None
+    max_act = value.get("max_act")
+    if not (isinstance(max_act, (int, float)) and float(max_act) > 0):
+        max_act = None
+    return {"label": label, "max_act": float(max_act) if max_act else None}
+
+
+def load_sae_feature_meta(model_id: str, release: str) -> dict[str, dict[str, Any]]:
+    """Per-feature metadata cache: ``{feature_id: {label, max_act}}``.
+
+    Falls back to the legacy labels-only file (pre-normalization sessions)
+    so cached Neuronpedia labels survive the format change.
+    """
     import json
 
-    path = sae_labels_path(model_id, release)
-    if not path.exists():
+    path = sae_features_path(model_id, release)
+    if path.exists():
+        try:
+            payload = json.loads(path.read_text())
+        except (OSError, ValueError):
+            return {}
+        features = payload.get("features") if isinstance(payload, dict) else None
+        if not isinstance(features, dict):
+            return {}
+        out: dict[str, dict[str, Any]] = {}
+        for key, value in features.items():
+            entry = _coerce_feature_entry(value)
+            if entry is not None:
+                out[str(key)] = entry
+        return out
+    # Legacy fallback — a labels-only cache written before max_act existed.
+    legacy = sae_labels_path(model_id, release)
+    if not legacy.exists():
         return {}
     try:
-        payload = json.loads(path.read_text())
+        payload = json.loads(legacy.read_text())
     except (OSError, ValueError):
         return {}
     labels = payload.get("labels", payload) if isinstance(payload, dict) else {}
     if not isinstance(labels, dict):
         return {}
     return {
-        str(key): str(value)
+        str(key): {"label": str(value), "max_act": None}
         for key, value in labels.items()
         if isinstance(value, str) and value.strip()
     }
 
 
-def save_sae_labels(model_id: str, release: str, labels: dict[str, str]) -> Path:
-    path = sae_labels_path(model_id, release)
+def save_sae_feature_meta(
+    model_id: str, release: str, features: dict[str, dict[str, Any]],
+) -> Path:
+    path = sae_features_path(model_id, release)
     write_json_atomic(path, {
         "format_version": SAE_RUNTIME_FORMAT_VERSION,
         "model_id": model_id,
         "release": release,
-        "labels": labels,
+        "features": features,
     })
     return path

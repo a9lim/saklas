@@ -68,9 +68,37 @@
     .map((name) => ({ name, entry: probeRack.entries.get(name) }))
     .filter((row) => row.entry !== undefined));
 
-  const discovery = $derived(saeState.readout.filter(
-    (row) => !probeRack.active.includes(`sae/${row.id}`),
-  ));
+  const discovery = $derived.by(() => saeState.readout
+    .filter((row) => !probeRack.active.includes(`sae/${row.id}`))
+    .map((row) => {
+      // Metadata merges from the row's server-cached values and the
+      // between-generation backfill (saeState.meta).
+      const meta = saeState.meta.get(row.id);
+      return {
+        ...row,
+        label: row.label ?? meta?.label ?? null,
+        max_act: row.max_act ?? meta?.max_act ?? null,
+      };
+    }));
+
+  /** Panel-shared raw scale for metadata-less cards: the max raw reading
+   *  across the visible cards that lack a maxActApprox unit, so their
+   *  bars and numbers rank identically.  Cards WITH the unit render on
+   *  the absolute 0..1 strength scale instead. */
+  const fallbackScale = $derived.by(() => {
+    let max = 0;
+    for (const row of pinned) {
+      const entry = row.entry!;
+      if (entry.info.max_act != null) continue;
+      const reading = entry.aggregate ?? entry.reading;
+      max = Math.max(max, reading?.coords?.[0] ?? entry.current ?? 0);
+    }
+    for (const feature of discovery) {
+      if (feature.max_act != null) continue;
+      max = Math.max(max, feature.activation);
+    }
+    return Math.max(max, 1);
+  });
 
   let steerInput = $state("");
   let probeInput = $state("");
@@ -247,11 +275,16 @@
               {@const entry = row.entry!}
               {@const reading = entry.aggregate ?? entry.reading}
               <div role="listitem">
+                <!-- A pinned probe's channel (coords, sparkline, gates) is
+                     already normalized server-side when max_act is set. -->
                 <SaeProbeCard
                   id={Number(row.name.slice(4))}
                   label={entry.info.label}
                   layer={info?.layer ?? null}
                   value={reading?.coords?.[0] ?? entry.current ?? 0}
+                  maxAct={entry.info.max_act ?? null}
+                  valueIsStrength={entry.info.max_act != null}
+                  {fallbackScale}
                   series={entry.sparkline}
                   pinned={true}
                 />
@@ -270,6 +303,8 @@
                     label={feature.label}
                     layer={info?.layer ?? null}
                     value={feature.activation}
+                    maxAct={feature.max_act}
+                    {fallbackScale}
                     series={saeState.history.get(feature.id) ?? []}
                     pinned={false}
                     busy={featureBusy}

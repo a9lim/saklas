@@ -826,10 +826,19 @@
         <div class="tab-summary">resident SAE · L{saeData.layer} · produced <code>{JSON.stringify(saeData.token_text)}</code></div>
         <div class="grid-scroll">
           <table class="logits-table">
-            <thead><tr><th class="num">rank</th><th class="tok">feature</th><th class="tok">label</th><th class="num">activation</th></tr></thead>
+            <!-- strength = activation / Neuronpedia maxActApprox — the
+                 normalized 0..1 unit the probe cards + gates read; "—"
+                 when no metadata is cached for the feature. -->
+            <thead><tr><th class="num">rank</th><th class="tok">feature</th><th class="tok">label</th><th class="num">strength</th><th class="num">activation</th></tr></thead>
             <tbody>
               {#each saeData.features as feature, index (feature.id)}
-                <tr><td class="num">{index + 1}</td><td class="tok"><code>sae/{feature.id}</code></td><td class="tok">{feature.label ?? "—"}</td><td class="num">{feature.activation.toFixed(3)}</td></tr>
+                <tr>
+                  <td class="num">{index + 1}</td>
+                  <td class="tok"><code>sae/{feature.id}</code></td>
+                  <td class="tok">{feature.label ?? "—"}</td>
+                  <td class="num">{feature.max_act != null && feature.max_act > 0 ? (feature.activation / feature.max_act).toFixed(2) : "—"}</td>
+                  <td class="num">{feature.activation.toFixed(3)}</td>
+                </tr>
               {/each}
             </tbody>
           </table>

@@ -160,7 +160,8 @@ probe_atom  := [ns "/"] NAME ["." NAME] ["[" INT "]"]  # vector probe (e.g. conf
                                                    # jlens/fake); optional coord axis (personas[3])
              | [ns "/"] NAME ":" "fraction"        # manifold subspace fraction
              | [ns "/"] NAME "@" NAME              # manifold label similarity
-             | "sae" "/" INT                       # resident SAE feature activation
+             | "sae" "/" INT                       # resident SAE feature strength (activation /
+                                                   # Neuronpedia maxActApprox when cached; raw otherwise)
 ```
 
 `+`/`-` add terms, `*` attaches a coefficient (omit → 0.5), `~` projects onto a
