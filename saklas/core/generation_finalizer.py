@@ -159,6 +159,24 @@ def finalize_generation(
 
     if not stateless and assistant_node_id is not None:
         session._stamp_raw_indices(assistant_node_id)
+        # Decoded thinking-channel text, joined from the streamed token
+        # rows — stamped so history re-renders can carry the block
+        # through the family's think delimiters (the stitcher applies
+        # the family's history policy; strip families render it only
+        # while the turn is last).  Stamped ONLY when the scene grammar
+        # can actually re-render it (``think_open`` set): on a family
+        # whose thinking isn't delimiter-shaped (gpt-oss channels) or
+        # that fell back to template rendering, a stamped block would
+        # make every later render of this path raise.
+        thinking_text: str | None = None
+        grammar = getattr(session, "scene_grammar", None)
+        if grammar is not None and grammar.think_open is not None:
+            node = session.tree.nodes.get(assistant_node_id)
+            if node is not None and node.thinking_tokens:
+                joined = "".join(
+                    str(t.get("text", "")) for t in node.thinking_tokens
+                )
+                thinking_text = joined or None
         session.tree.finalize_assistant(
             assistant_node_id,
             text=text,
@@ -171,6 +189,7 @@ def finalize_generation(
             mean_logprob=mean_logprob,
             mean_surprise=mean_surprise,
             raw_token_ids=generated_ids,
+            thinking_text=thinking_text,
         )
 
     return result

@@ -56,6 +56,11 @@ export const RAIL_CATEGORIES: RailCategory[] = [
         drawer: "template_lab",
         keywords: "score completion slot restricted choice",
       },
+      {
+        label: "cast…",
+        drawer: "cast",
+        keywords: "roster member speaker label recipe seat role",
+      },
     ],
   },
   {

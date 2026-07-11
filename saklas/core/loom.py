@@ -334,6 +334,39 @@ class Recipe:
         )
 
 
+@dataclass(frozen=True)
+class CastMember:
+    """One member of the tree's cast roster (phase 3 of the cast model).
+
+    The roster maps a cast *label* (the header label a turn is rendered
+    with — ``"deer"``, ``"captain"``) to the member's standing steering
+    :class:`Recipe`.  At generation time the session composes the
+    member's recipe as the *weakest* tier: explicit per-call kwargs and
+    regen overrides both win over it, field-for-field, with
+    :meth:`Recipe.overlay` semantics.  The cast manager is a steering
+    surface, not a chat feature — a member without a recipe is just a
+    named label.
+    """
+
+    recipe: Recipe | None = None
+    notes: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        if self.recipe is not None:
+            out["recipe"] = self.recipe.to_dict()
+        if self.notes:
+            out["notes"] = self.notes
+        return out
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "CastMember":
+        recipe = None
+        if data.get("recipe") is not None:
+            recipe = Recipe.from_dict(data["recipe"])
+        return cls(recipe=recipe, notes=str(data.get("notes", "")))
+
+
 Role = Literal["user", "assistant", "system"]
 
 
@@ -363,6 +396,14 @@ class LoomNode:
     # glyph display matches.  Distinct from the steering-driven
     # ``_active_role`` (transient, never persisted here).
     role_label: str | None = None
+    # Verbatim thinking text for the turn — a committed thinking block
+    # the human typed (any seat), or the decoded thinking channel of a
+    # generated node (stamped at finalize).  Rendered through the family
+    # think delimiters by the scene stitcher, which applies the family's
+    # history policy (strip families render it only while the turn is
+    # last).  Plain text-scale string, so it lives in the main tree
+    # JSON, not the token sidecar.
+    thinking_text: str | None = None
     tokens: list[TokenScoreDict] | None = None
     thinking_tokens: list[TokenScoreDict] | None = None
     recipe: Recipe | None = None
@@ -401,6 +442,7 @@ class LoomNode:
             "role": self.role,
             "text": self.text,
             "role_label": self.role_label,
+            "thinking_text": self.thinking_text,
             "aggregate_readings": dict(self.aggregate_readings),
             "applied_steering": self.applied_steering,
             "finish_reason": self.finish_reason,
@@ -431,6 +473,7 @@ class LoomNode:
             role=data["role"],
             text=data.get("text", ""),
             role_label=data.get("role_label"),
+            thinking_text=data.get("thinking_text"),
             tokens=data.get("tokens"),
             thinking_tokens=data.get("thinking_tokens"),
             recipe=recipe,
@@ -459,7 +502,8 @@ class LoomMutated:
 
     ``op`` is one of ``"edit"``, ``"branch"``, ``"navigate"``, ``"delete"``,
     ``"star"``, ``"note"``, ``"reset"``, ``"add_user"``, ``"begin_assistant"``,
-    ``"finalize_assistant"``.
+    ``"finalize_assistant"``, ``"cast"`` (roster change — no node ids;
+    clients refetch the roster).
 
     Delta payload fields carry ids only at the engine level — the
     server WS layer (:mod:`saklas.server.saklas_api`'s
@@ -586,6 +630,9 @@ class LoomTree:
         self.nodes: dict[str, LoomNode] = {}
         self.children_of: dict[str, list[str]] = {}
         self.rev: int = 0
+        # Cast roster (phase 3): label → CastMember.  Tree-scoped, rides
+        # ``to_dict``/``save`` so a saved conversation carries its cast.
+        self.cast: dict[str, CastMember] = {}
 
         # Synthetic root: role="system", text empty, no parent.  First user
         # turn is its child.  This keeps the tree structure uniform (every
@@ -682,9 +729,12 @@ class LoomTree:
 
         ``with_labels`` adds each node's per-turn ``role_label`` under a
         ``"label"`` key (the roleplay scaffold) so the chat-render path can
-        splice each turn with its own role.  Off by default to keep the
-        canonical ``{role, content}`` shape transcript / server / OpenAI
-        consumers expect.
+        splice each turn with its own role, plus — when present — the
+        node's ``thinking_text`` under ``"thinking"`` (the scene stitcher
+        renders it through the family think delimiters, applying the
+        family's history policy).  Off by default to keep the canonical
+        ``{role, content}`` shape transcript / server / OpenAI consumers
+        expect.
         """
         target = leaf_id if leaf_id is not None else self.active_node_id
         path = self.path_to(target)
@@ -695,6 +745,8 @@ class LoomTree:
             msg: dict[str, str] = {"role": node.role, "content": node.text}
             if with_labels:
                 msg["label"] = node.role_label  # pyright: ignore[reportArgumentType]  # role_label is str | None; with_labels callers expect nullable label
+                if node.thinking_text is not None:
+                    msg["thinking"] = node.thinking_text
             out.append(msg)
         return out
 
@@ -757,6 +809,7 @@ class LoomTree:
         *,
         dedup_existing: bool = True,
         role_label: str | None = None,
+        thinking_text: str | None = None,
     ) -> str:
         """Add a user turn under ``parent_id`` (default: the active node).
 
@@ -767,7 +820,9 @@ class LoomTree:
 
         ``role_label`` stamps the per-turn role-substitution label (the
         roleplay scaffold) onto a freshly-created node; a dedup hit keeps
-        the existing node's label unchanged.
+        the existing node's label unchanged.  ``thinking_text`` is an
+        optional committed thinking block (rendered through the family
+        think delimiters by the scene stitcher).
         """
         with self._lock:
             parent = parent_id if parent_id is not None else self.active_node_id
@@ -787,7 +842,7 @@ class LoomTree:
                         return sib.id
             node = LoomNode(
                 id=_ulid(), parent_id=parent, role="user", text=text,
-                role_label=role_label,
+                role_label=role_label, thinking_text=thinking_text,
             )
             self._add_child(parent, node)
             self.active_node_id = node.id
@@ -883,8 +938,13 @@ class LoomTree:
         mean_logprob: float | None = None,
         mean_surprise: float | None = None,
         raw_token_ids: list[int] | None = None,
+        thinking_text: str | None = None,
     ) -> None:
         """Mark an in-flight assistant node as complete.
+
+        ``thinking_text`` is the decoded thinking-channel text of a
+        generated node (or the authored block on a committed one);
+        ``None`` leaves the node's prior value untouched.
 
         ``mean_logprob`` / ``mean_surprise`` are the per-turn rollups
         computed in :meth:`SaklasSession._generate_core` from the engine's
@@ -910,6 +970,8 @@ class LoomTree:
             node.mean_surprise = mean_surprise
             if raw_token_ids is not None:
                 node.raw_token_ids = list(raw_token_ids)
+            if thinking_text is not None:
+                node.thinking_text = thinking_text
             self.rev += 1
             self._emit(LoomMutated(
                 op="finalize_assistant", rev=self.rev,
@@ -1087,6 +1149,37 @@ class LoomTree:
             ))
 
     # ------------------------------------------------------------------
+    # Cast roster (phase 3)
+    # ------------------------------------------------------------------
+
+    def set_cast_member(self, label: str, member: CastMember) -> None:
+        """Create or replace the cast member under ``label``.
+
+        Roster ops are decoration-tier — always free under in-flight
+        generation (they touch no node).  The label must be a legal
+        role slug (it is rendered into turn headers); validation mirrors
+        the per-turn ``role_label`` rules.
+        """
+        from saklas.core.role_templates import _validate_role
+
+        _validate_role(label)
+        with self._lock:
+            if self.cast.get(label) == member:
+                return
+            self.cast[label] = member
+            self.rev += 1
+            self._emit(LoomMutated(op="cast", rev=self.rev))
+
+    def remove_cast_member(self, label: str) -> None:
+        """Drop the cast member under ``label`` (no-op when absent)."""
+        with self._lock:
+            if label not in self.cast:
+                return
+            del self.cast[label]
+            self.rev += 1
+            self._emit(LoomMutated(op="cast", rev=self.rev))
+
+    # ------------------------------------------------------------------
     # Engine-level workflows: clear (reset), rewind
     # ------------------------------------------------------------------
 
@@ -1181,7 +1274,7 @@ class LoomTree:
             # schema number hasn't moved — same pattern packs use.  Imported
             # lazily so a circular at module-load time stays impossible.
             from saklas import __version__ as _saklas_version
-            return {
+            out: dict[str, Any] = {
                 "tree_format": TREE_FORMAT_VERSION,
                 "saklas_version": _saklas_version,
                 "model_id": self.model_id,
@@ -1196,6 +1289,14 @@ class LoomTree:
                 ],
                 "children_of": {k: list(v) for k, v in self.children_of.items()},
             }
+            # Additive optional key (still tree_format 1): older loaders
+            # ignore it, an empty roster keeps the payload byte-identical
+            # to pre-cast builds.
+            if self.cast:
+                out["cast"] = {
+                    label: m.to_dict() for label, m in self.cast.items()
+                }
+            return out
 
     @classmethod
     def from_dict(
@@ -1231,6 +1332,10 @@ class LoomTree:
             tree.children_of.setdefault(nid, [])
         tree.root_id = data["root_id"]
         tree.active_node_id = data.get("active_node_id", tree.root_id)
+        tree.cast = {
+            str(label): CastMember.from_dict(dict(raw))
+            for label, raw in (data.get("cast") or {}).items()
+        }
         return tree
 
     def save(self, path: Any) -> None:

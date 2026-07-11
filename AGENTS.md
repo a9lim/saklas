@@ -825,6 +825,28 @@ Key contracts:
   labels. Seats stay binary; arbitrary seat *sequences* and labels are free
   on validated families (gemma-2/3/4, llama, qwen, talkie), raw-marker
   fallback otherwise. WS: `generate_seat` on the generate frame.
+  **Cast roster** (phase 3): `LoomTree.cast` maps label → `CastMember`
+  (`recipe` + `notes`; `session.set_cast_member(label, steering=…)`
+  validates the expression at authoring time). At generation the gen
+  label's member recipe is the *weakest* tier — fills only unset call
+  kwargs (`steering=""` = explicit unsteered; sampling merges field-wise
+  via `merged_with`; regen overrides still win) — and the effective
+  values are what land on the node's Recipe. Rides tree save (additive
+  `cast` key, still `tree_format` 1) and transcript v2. A steering scope
+  whose role baseline differs from the send's `assistant_role` warns
+  (`RoleBaselineMismatchWarning`; the steering role still wins).
+  **Committed thinking**: `LoomNode.thinking_text` (commits via
+  `append_*_turn(thinking=…)` / WS `commit_thinking`; generated nodes
+  stamped at finalize when the family's think delimiters can re-render
+  it) rides `messages_for(with_labels=True)` as a `"thinking"` key and
+  renders through the stitcher under the family history policy; commit
+  is refused up front (`SceneThinkingUnsupportedError`) on families
+  that can't carry it. Generating into a non-assistant seat appends the
+  seat's close segment as a stop string when it differs from the
+  assistant's (convention 2; shared-terminator families add nothing).
+  Transcript schema is **v2** (`speaker:`/`thinking:` per turn + `cast:`
+  block; v1 files still load; import re-attaches recipe-bearing turns
+  as generated nodes in their recorded seat).
 - `generate`, `generate_batch`, `generate_sweep` always return `RunSet` — list-like,
   carrying `node_ids`/`grid`, with `.first` (the underlying `GenerationResult`) and
   common attributes delegating to it. `session.last_result` is the `GenerationResult`.

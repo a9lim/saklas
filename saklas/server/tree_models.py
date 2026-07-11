@@ -34,6 +34,17 @@ class TreeNoteRequest(BaseModel):
     text: str
 
 
+class CastMemberRequest(BaseModel):
+    """Create/replace a cast member — a named label plus its standing
+    recipe fragment.  All fields optional; a bare body authors a plain
+    named label."""
+
+    steering: str | None = None
+    thinking: bool | None = None
+    seed: int | None = None
+    notes: str = ""
+
+
 class TreeTranscriptRequest(BaseModel):
     node_id: str | None = None
 

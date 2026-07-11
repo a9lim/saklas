@@ -46,6 +46,7 @@ from saklas.core.scene import (
     validate_turn_grammar,
 )
 from saklas.core.loom import (
+    CastMember,
     InvalidNodeOperationError,
     LoomMutated,
     LoomTree,
@@ -5862,6 +5863,26 @@ class SaklasSession:
 
     # -- Authored turns (no-generation commits) --
 
+    def _check_thinking_commit(self, thinking: str | None) -> None:
+        """Refuse a committed thinking block the renderer can't carry.
+
+        Committed thinking renders through the scene stitcher's family
+        think delimiters — a family without them (gemma), a channel-
+        thinking family (gpt-oss), or a template-fallback family (GLM)
+        would raise at the *next* render, long after the commit.  Fail
+        at commit time instead, with the same error the renderer uses.
+        """
+        if thinking is None:
+            return
+        from saklas.core.scene import SceneThinkingUnsupportedError
+
+        grammar = self.scene_grammar
+        if grammar is None or grammar.think_open is None:
+            raise SceneThinkingUnsupportedError(
+                "this model family has no scene-mode think delimiters — "
+                "a committed thinking block could not be rendered"
+            )
+
     def append_user_turn(
         self,
         parent_node_id: str | None,
@@ -5869,6 +5890,7 @@ class SaklasSession:
         *,
         allow_any_parent: bool = False,
         role_label: str | None = None,
+        thinking: str | None = None,
     ) -> str:
         """Land a user turn under ``parent_node_id`` without generating.
 
@@ -5899,10 +5921,18 @@ class SaklasSession:
             raise InvalidNodeOperationError(
                 "append_user_turn: text must be non-empty"
             )
-        if not allow_any_parent:
+        if thinking is not None:
+            self._check_thinking_commit(thinking)
+        # Scene mode lifts the user-under-user guard for commits: the
+        # stitcher renders arbitrary seat sequences (u/u is a legal
+        # scene shape), so the guard would refuse a renderable tree.
+        # The generation-path guard (fresh user *send* from a user
+        # node) is unchanged — send semantics stay conservative.
+        if not allow_any_parent and self.scene_grammar is None:
             self._check_user_send_target(parent_node_id)
         return self.tree.add_user_turn(
-            text, parent_id=parent_node_id, role_label=role_label)
+            text, parent_id=parent_node_id, role_label=role_label,
+            thinking_text=thinking)
 
     def append_assistant_turn(
         self,
@@ -5910,6 +5940,7 @@ class SaklasSession:
         text: str,
         *,
         role_label: str | None = None,
+        thinking: str | None = None,
     ) -> str:
         """Land a user-authored assistant turn under ``user_node_id``.
 
@@ -5924,20 +5955,29 @@ class SaklasSession:
         already carry.
 
         Raises :class:`InvalidNodeOperationError` when ``user_node_id``
-        isn't a user node, when ``text`` is empty, or when it tokenizes
-        to an empty sequence.  Returns the new assistant node id; the
-        loom's active node advances to it.
+        isn't a user node on a legacy-render family (scene mode frees
+        the seating — the parameter name is historic), when ``text`` is
+        empty, or when it tokenizes to an empty sequence.  Returns the
+        new assistant node id; the loom's active node advances to it.
         """
         if text == "":
             raise InvalidNodeOperationError(
                 "append_assistant_turn: text must be non-empty"
             )
+        if thinking is not None:
+            self._check_thinking_commit(thinking)
         node = self.tree.get(user_node_id)
-        if node.role != "user":
+        # Scene mode lifts the user-parent requirement: the stitcher
+        # renders arbitrary seat sequences, so an authored assistant
+        # turn may hang under any node (a/a, assistant-first shapes).
+        # Legacy-render families keep the strict guard — their
+        # templates can't render the freed shapes.
+        if node.role != "user" and self.scene_grammar is None:
             raise InvalidNodeOperationError(
                 f"append_assistant_turn: {user_node_id!r} is a "
                 f"{node.role} node, not a user node — an authored "
-                f"assistant turn hangs off a user turn"
+                f"assistant turn hangs off a user turn (free seating "
+                f"requires scene mode)"
             )
         raw_token_ids = list(
             self._tokenizer.encode(text, add_special_tokens=False)
@@ -5965,8 +6005,57 @@ class SaklasSession:
             applied_steering=None,
             finish_reason="stop",
             raw_token_ids=raw_token_ids,
+            thinking_text=thinking,
         )
         return new_id
+
+    # -- Cast roster (phase 3) --
+
+    def set_cast_member(
+        self,
+        label: str,
+        *,
+        steering: str | None = None,
+        sampling: SamplingConfig | None = None,
+        thinking: bool | None = None,
+        seed: int | None = None,
+        notes: str = "",
+    ) -> "CastMember":
+        """Create or replace the cast member under ``label``.
+
+        Convenience over :meth:`LoomTree.set_cast_member` that builds the
+        member's :class:`Recipe` from parts and validates the steering
+        expression *now* (``parse_expr``) so a typo surfaces at authoring
+        time, not on the member's first generation.  A member whose
+        fields are all unset is a bare named label — legal, it just
+        contributes no defaults.
+        """
+        if steering:
+            from saklas.core.steering_expr import parse_expr
+            parse_expr(steering)  # raises SteeringExprError on bad syntax
+        recipe: Recipe | None = None
+        if (
+            steering is not None
+            or sampling is not None
+            or thinking is not None
+            or seed is not None
+        ):
+            recipe = Recipe(
+                steering=steering, sampling=sampling,
+                thinking=thinking, seed=seed,
+            )
+        member = CastMember(recipe=recipe, notes=notes)
+        self.tree.set_cast_member(label, member)
+        return member
+
+    def remove_cast_member(self, label: str) -> None:
+        """Drop the cast member under ``label`` (no-op when absent)."""
+        self.tree.remove_cast_member(label)
+
+    @property
+    def cast(self) -> "dict[str, CastMember]":
+        """Read view of the tree's cast roster (label → member)."""
+        return dict(self.tree.cast)
 
     # -- History / loom tree --
 
@@ -6457,6 +6546,24 @@ class SaklasSession:
         steer_role = getattr(self, "_active_role", None)
         if gen_seat == "assistant":
             gen_role = steer_role if steer_role is not None else assistant_role
+            if (
+                steer_role is not None
+                and assistant_role is not None
+                and steer_role != assistant_role
+            ):
+                # The steering scope's role baseline wins over the send's
+                # label (extract baseline = steer baseline), but the caller
+                # asked for a different header — say so rather than
+                # silently rendering a turn they didn't label.
+                import warnings as _warnings
+                from saklas.core.errors import RoleBaselineMismatchWarning
+                _warnings.warn(
+                    f"steering scope implies role {steer_role!r} but this "
+                    f"send labels the generated turn {assistant_role!r}; "
+                    f"the steering role wins for the generation header",
+                    RoleBaselineMismatchWarning,
+                    stacklevel=2,
+                )
         else:
             gen_role = user_role
         model_type_for_role: str | None = None
@@ -6634,6 +6741,86 @@ class SaklasSession:
         return _replace(self.config, **overrides)
 
     # -- Generation: core --
+
+    def _seat_stop_augmentation(
+        self,
+        stop_list: list[str] | None,
+        *,
+        gen_seat: str,
+        raw: bool,
+    ) -> list[str] | None:
+        """Add the gen seat's close segment as a stop string when needed.
+
+        Convention 2 (the cast model): generating into a seat stops on
+        that seat's terminator.  On every validated family the two seats
+        share a terminator, which the engine's EOS-id union already
+        catches — so the assistant path (and any shared-close family)
+        adds nothing and keeps its zero-cost no-stop-list fast path.
+        Only a non-assistant-seat gen on a family whose seat closes
+        *differ* (gpt-oss: user ``<|end|>`` vs assistant ``<|return|>``)
+        gains a stop string, guaranteeing the stop even where the
+        seat's terminator escapes the EOS union.  Raw / flat mode has
+        no seat closes.
+        """
+        if raw or gen_seat == "assistant":
+            return stop_list
+        grammar = self.scene_grammar
+        if grammar is None:
+            return stop_list
+        close = grammar.seat(gen_seat).close.strip()
+        if not close or close == grammar.assistant.close.strip():
+            return stop_list
+        out = list(stop_list) if stop_list else []
+        if close not in out:
+            out.append(close)
+        return out
+
+    def _apply_cast_defaults(
+        self,
+        steering: "str | Steering | None",
+        sampling: SamplingConfig | None,
+        thinking: bool | None,
+        *,
+        raw: bool,
+        gen_seat: str,
+    ) -> tuple["str | Steering | None", SamplingConfig | None, bool | None]:
+        """Fill unset per-call kwargs from the gen label's cast recipe.
+
+        The cast roster (phase 3) is the *weakest* tier: the member's
+        recipe fills only fields the call left unset (``steering=None``
+        means "unset" here; pass ``""`` for an explicit unsteered
+        override), sampling merges field-wise with the call's
+        non-default fields winning, and the member's seed applies only
+        when the call's sampling doesn't pin one.  The label must ride
+        the call's sampling box (``user_role`` for a user-seat gen,
+        ``assistant_role`` otherwise) — a bare continuation of a cast
+        turn doesn't re-trigger the recipe.  Raw / flat mode renders no
+        labels, so the roster doesn't apply there.
+        """
+        cast_label: str | None = None
+        if not raw and sampling is not None:
+            cast_label = (
+                sampling.user_role if gen_seat == "user"
+                else sampling.assistant_role
+            )
+        member = self.tree.cast.get(cast_label) if cast_label else None
+        if member is None or member.recipe is None:
+            return steering, sampling, thinking
+        base = member.recipe
+        if steering is None and base.steering is not None:
+            steering = base.steering
+        if thinking is None and base.thinking is not None:
+            thinking = base.thinking
+        if base.sampling is not None:
+            sampling = base.sampling.merged_with(sampling)
+        if base.seed is not None and (
+            sampling is None or sampling.seed is None
+        ):
+            from dataclasses import replace as _replace
+            sampling = _replace(
+                sampling or SamplingConfig(), seed=base.seed,
+            )
+        return steering, sampling, thinking
 
     def _resolve_recipe_override(
         self,
@@ -6997,6 +7184,13 @@ class SaklasSession:
         steering_cm = None
         try:
 
+            # Cast roster (phase 3): the gen label's standing recipe is
+            # the weakest tier; the regen override below still composes
+            # on top of the result.
+            steering, sampling, thinking = self._apply_cast_defaults(
+                steering, sampling, thinking, raw=raw, gen_seat=gen_seat,
+            )
+
             # v2.3 phase 5: apply recipe override (auto-regen / manual mode)
             # before constructing the Steering object so the overlay wins
             # over the per-call kwargs.
@@ -7021,6 +7215,9 @@ class SaklasSession:
                 frequency_penalty,
                 logprobs_list,
             ) = self._prepare_generation_call(steering, sampling, thinking)
+            stop_list = self._seat_stop_augmentation(
+                stop_list, gen_seat=gen_seat, raw=raw,
+            )
             return_probe_readings = bool(
                 sampling is None or sampling.return_probe_readings
             )

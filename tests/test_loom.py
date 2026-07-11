@@ -589,6 +589,9 @@ def _bind_commit_methods(tree: LoomTree, tokenizer: Any):
             # stub so the lookup chain resolves.
             "_check_user_send_target":
                 SaklasSession._check_user_send_target,
+            # Real sessions always expose ``scene_grammar``; None keeps
+            # the legacy commit-seating guards active for these tests.
+            "scene_grammar": None,
         },
     )()
     return (
@@ -1022,3 +1025,92 @@ def test_messages_for_with_labels():
     # Default shape stays {role, content} — no label key.
     plain = t.messages_for()
     assert "label" not in plain[0]
+
+
+# ---------------------------------------------------------------------------
+# Cast roster (phase 3)
+# ---------------------------------------------------------------------------
+
+
+def test_cast_member_round_trip():
+    from saklas import CastMember
+
+    full = CastMember(
+        recipe=Recipe(steering="0.5 personas%pirate", thinking=False),
+        notes="the ship's captain",
+    )
+    d = full.to_dict()
+    back = CastMember.from_dict(d)
+    assert back == full
+    # A bare named label serializes to an empty dict and round-trips.
+    bare = CastMember()
+    assert bare.to_dict() == {}
+    assert CastMember.from_dict({}) == bare
+
+
+def test_cast_roster_crud_and_events():
+    from saklas import CastMember, EventBus
+
+    bus = EventBus()
+    seen: list[LoomMutated] = []
+    bus.subscribe(lambda e: seen.append(e) if isinstance(e, LoomMutated) else None)
+    t = LoomTree(events=bus)
+    member = CastMember(recipe=Recipe(steering="0.3 honest"))
+    t.set_cast_member("deer", member)
+    assert t.cast["deer"] == member
+    assert seen and seen[-1].op == "cast"
+    rev_after_set = t.rev
+
+    # Idempotent set: same member → no rev bump, no event.
+    seen.clear()
+    t.set_cast_member("deer", CastMember(recipe=Recipe(steering="0.3 honest")))
+    assert t.rev == rev_after_set
+    assert not seen
+
+    # Replace with a different member bumps.
+    t.set_cast_member("deer", CastMember(recipe=Recipe(steering="0.9 honest")))
+    assert t.rev == rev_after_set + 1
+    assert seen[-1].op == "cast"
+
+    t.remove_cast_member("deer")
+    assert "deer" not in t.cast
+    assert seen[-1].op == "cast"
+    rev_after_remove = t.rev
+
+    # Removing an absent member is a no-op.
+    seen.clear()
+    t.remove_cast_member("deer")
+    assert t.rev == rev_after_remove
+    assert not seen
+
+
+def test_cast_label_validated():
+    from saklas import CastMember
+    from saklas.core.role_templates import InvalidRoleError
+
+    t = LoomTree()
+    with pytest.raises(InvalidRoleError):
+        t.set_cast_member("Not A Slug", CastMember())
+    with pytest.raises(InvalidRoleError):
+        t.set_cast_member("", CastMember())
+
+
+def test_cast_rides_save_load(tmp_path: Path):
+    from saklas import CastMember
+
+    t = _seed_tree()
+    # Empty roster: no "cast" key — pre-cast payloads stay byte-identical.
+    path = tmp_path / "tree.json"
+    t.save(path)
+    assert "cast" not in json.loads(path.read_text())
+
+    t.set_cast_member(
+        "deer", CastMember(recipe=Recipe(steering="0.5 skittish"))
+    )
+    t.set_cast_member("narrator", CastMember(notes="stage voice"))
+    t.save(path)
+    raw = json.loads(path.read_text())
+    assert set(raw["cast"]) == {"deer", "narrator"}
+
+    t2 = LoomTree.load(path)
+    assert t2.cast == t.cast

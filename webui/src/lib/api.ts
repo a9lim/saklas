@@ -7,6 +7,7 @@
 // page injects a key after load, call ``setApiKey()`` to refresh it.
 
 import type {
+  CastMemberJSON,
   CorrelationData,
   CreateDiscoverManifoldRequest,
   CreateManifoldRequest,
@@ -662,6 +663,7 @@ export const apiTree = {
     node_id: string,
     text: string,
     id: string = SESSION,
+    role?: "user" | "assistant" | null,
   ): Promise<{
     node_id: string;
     node: LoomNodeJSON;
@@ -674,7 +676,32 @@ export const apiTree = {
   }> {
     return request(
       `${SESSION_BASE(id)}/tree/branch`,
-      jsonBody({ node_id, text }),
+      jsonBody(role ? { node_id, text, role } : { node_id, text }),
+    );
+  },
+  /** Cast roster (phase 3): label → member. */
+  cast(id: string = SESSION): Promise<{ cast: Record<string, CastMemberJSON> }> {
+    return request(`${SESSION_BASE(id)}/tree/cast`);
+  },
+  castPut(
+    label: string,
+    body: {
+      steering?: string | null;
+      thinking?: boolean | null;
+      seed?: number | null;
+      notes?: string;
+    },
+    id: string = SESSION,
+  ): Promise<{ label: string; member: CastMemberJSON }> {
+    return request(
+      `${SESSION_BASE(id)}/tree/cast/${encodeURIComponent(label)}`,
+      { ...jsonBody(body), method: "PUT" },
+    );
+  },
+  castDelete(label: string, id: string = SESSION): Promise<void> {
+    return request<void>(
+      `${SESSION_BASE(id)}/tree/cast/${encodeURIComponent(label)}`,
+      { method: "DELETE" },
     );
   },
   delete(

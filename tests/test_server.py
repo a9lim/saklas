@@ -916,7 +916,11 @@ class TestNativeSteeringField:
         })
         assert resp.status_code == 200
         kw = session.generate.call_args[1]
-        assert kw["steering"] is None
+        # An explicit clear arrives as an *empty* Steering, not None —
+        # None means "unset" engine-side, and the cast roster would fill
+        # unset steering with the gen label's standing recipe.
+        assert kw["steering"] is not None
+        assert kw["steering"].alphas == {}
 
     def test_thinking_field_default_is_none_auto(self, session_and_client: Any) -> None:
         session, client = session_and_client

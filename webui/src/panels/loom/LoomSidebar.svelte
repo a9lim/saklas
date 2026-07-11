@@ -35,6 +35,8 @@
     loomNavigate,
     loomEdit,
     loomBranch,
+    loomSwapSeat,
+    sessionState,
     loomDelete,
     loomStar,
     loomNote,
@@ -756,6 +758,17 @@
     const node = loomTree.nodes.get(nid);
     await openModal("branch", nid, node?.text ?? "");
   }
+  async function menuSwapSeat(): Promise<void> {
+    // Seat-swap branch (the cast model): a sibling with the same text
+    // and the seat flipped — identical bytes, one seat bit different,
+    // the controlled experiment on the seat prior.  No modal: the text
+    // is by definition unchanged.
+    const nid = menu.nodeId;
+    closeMenu();
+    if (!nid) return;
+    const newId = await loomSwapSeat(nid);
+    if (newId) await loomNavigate(newId);
+  }
   async function menuNavigate(): Promise<void> {
     const nid = menu.nodeId;
     closeMenu();
@@ -1106,6 +1119,14 @@
     <button type="button" role="menuitem" onclick={menuRegenWithMode}>regen N with mode…</button>
     <button type="button" role="menuitem" onclick={menuEdit}>edit…</button>
     <button type="button" role="menuitem" onclick={menuBranch}>branch…</button>
+    {#if (sessionState.info?.scene_mode ?? false) && (menuNode?.role === "user" || menuNode?.role === "assistant")}
+      <button
+        type="button"
+        role="menuitem"
+        title="branch a sibling with the same text and the seat flipped"
+        onclick={menuSwapSeat}
+      >swap seat ⇄ branch</button>
+    {/if}
     <button type="button" role="menuitem" onclick={menuNavigate}>navigate</button>
     <hr />
     <button type="button" role="menuitem" onclick={menuStar}>

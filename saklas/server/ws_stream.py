@@ -133,6 +133,16 @@ def register_ws_stream(app: FastAPI) -> None:
                 ],
                 "active_node_id": event.active_node_id,
             }
+            if event.op == "cast":
+                # Roster ops carry no node ids — inline the full roster
+                # (small) so clients reconcile without a refetch.
+                try:
+                    mutated_payload["cast"] = {
+                        label: member.to_dict()
+                        for label, member in session.tree.cast.items()
+                    }
+                except Exception:
+                    mutated_payload["cast"] = {}
             _queue_tree_event(mutated_payload)
             # ``begin_assistant`` and ``branch`` both materialize a new
             # node — surface a separate ``node_created`` event with the
@@ -446,6 +456,9 @@ async def _ws_handle_generate(
                 })
                 return
             try:
+                commit_thinking = (
+                    None if msg.raw else (msg.commit_thinking or None)
+                )
                 if msg.commit_role == "user":
                     # ``raw`` flags a flat (base-model) commit — the
                     # authored span may hang under a node of any role,
@@ -456,6 +469,7 @@ async def _ws_handle_generate(
                         commit_text,
                         allow_any_parent=msg.raw,
                         role_label=None if msg.raw else commit_user_role,
+                        thinking=commit_thinking,
                     )
                 else:
                     # ``parent_node_id`` is non-None here (validated above
@@ -466,6 +480,7 @@ async def _ws_handle_generate(
                         parent_node_id,
                         commit_text,
                         role_label=None if msg.raw else commit_asst_role,
+                        thinking=commit_thinking,
                     )
             except SaklasError as e:
                 status, message = e.user_message()

@@ -209,6 +209,43 @@ class TestSessions:
         assert body["default_assistant_role"] == "model"
         assert body["default_user_role"] == "user"
 
+    def test_session_info_exposes_scene_capabilities(
+        self, session_and_client: Any,
+    ) -> None:
+        """The composer's seat toggle / thinking box / one-turn warning
+        gate on these three flags — keep them on the wire.  A stub
+        session (no real scene grammar) reads as scene mode off."""
+        session, client = session_and_client
+        with patch("saklas.server.session_models.supports_thinking", return_value=False):
+            resp = client.get("/saklas/v1/sessions/default")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["scene_mode"] is False
+        assert body["thinking_input_supported"] is False
+        assert body["strips_history_thinking"] is False
+
+        # A think-capable strip-family grammar flips all three.
+        from saklas.core.scene import SeatWrapper, TurnGrammar
+
+        session.scene_grammar = TurnGrammar(
+            model_type="qwen3",
+            prelude="",
+            user=SeatWrapper("<t>", "\n", "<end>", "user"),
+            assistant=SeatWrapper("<t>", "\n", "<end>", "assistant"),
+            system=None,
+            system_fold_sep=None,
+            gen_extra="",
+            think_open="<think>",
+            think_close="</think>",
+            strips_history_thinking=True,
+        )
+        with patch("saklas.server.session_models.supports_thinking", return_value=False):
+            resp = client.get("/saklas/v1/sessions/default")
+        body = resp.json()
+        assert body["scene_mode"] is True
+        assert body["thinking_input_supported"] is True
+        assert body["strips_history_thinking"] is True
+
     def test_clear(self, session_and_client: Any) -> None:
         session, client = session_and_client
         resp = client.post("/saklas/v1/sessions/default/clear")

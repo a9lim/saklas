@@ -1072,15 +1072,25 @@ policy; library + TUI stay opt-in).
 `LoomTree` — the engine-side conversation tree. Nodes are turns, children are
 alternative continuations, the active path is the model's context.
 `messages_for(leaf)` renders the path as v2 chat messages (`with_labels=True` adds
-each node's `role_label`); `flat_text(leaf)` is the base-model analogue (one
+each node's `role_label` plus, when set, `thinking_text` under a `"thinking"`
+key for the scene stitcher); `flat_text(leaf)` is the base-model analogue (one
 continuous string, no roles). Node ids are 26-char ULIDs. Primitives: edit,
 branch, navigate, delete_subtree, `regenerate`. `Recipe` is the per-node
 reproducibility receipt (steering expression, sampling, thinking, seed, probe set
 + per-probe sha256); `Recipe.overlay`/`invert_steering`/`compose_modifier` back
-the auto-regen modes. Per-node token blobs live in memory during streaming;
-`to_dict` omits them, `save` writes a gzip sidecar. Mutators raise
-`MutationDuringGenerationError` (409) on conflict; `UnknownNodeError` (404) /
-`InvalidNodeOperationError` (400) otherwise.
+the auto-regen modes. `LoomNode.thinking_text` is the turn's verbatim thinking
+block (committed or decoded-at-finalize), plain-string, main-JSON persisted.
+**Cast roster** (phase 3): `tree.cast: dict[label, CastMember]` —
+`set_cast_member`/`remove_cast_member` are decoration-tier (no conflict check),
+validate the label as a role slug, emit `LoomMutated(op="cast")` (no node ids —
+clients refetch the roster), and ride `to_dict`/`save` as an additive `cast`
+key (`tree_format` stays 1; empty roster emits nothing, so pre-cast payloads
+are byte-identical). Composition at generation is the session's
+`_apply_cast_defaults` — the weakest tier, before regen overrides. Per-node
+token blobs live in memory during streaming; `to_dict` omits them, `save`
+writes a gzip sidecar. Mutators raise `MutationDuringGenerationError` (409) on
+conflict; `UnknownNodeError` (404) / `InvalidNodeOperationError` (400)
+otherwise.
 
 ## tree_filter.py
 
@@ -1099,12 +1109,17 @@ b − a`, sorted by `abs(delta)`), `per_token_diff` (byte-offset alignment),
 
 ## transcript.py
 
-Transcript export/import for loom paths. `SAKLAS_TRANSCRIPT_VERSION = 1`;
-`to_yaml`/`from_yaml`. Import modes: **default** (new top-level branch), **here**
-(child of active), **merge** (attach the non-matching tail at the deepest matching
-prefix). Guards: model mismatch refuses `--merge` (`TranscriptModelMismatch`),
-system-prompt mismatch banners, probe-hash drift warns / raises
-`TranscriptProbeDriftError` under `--strict`.
+Transcript export/import for loom paths. `SAKLAS_TRANSCRIPT_VERSION = 2`
+(the cast model: per-turn `speaker:` = `role_label`, `thinking:` =
+`thinking_text`, top-level `cast:` block; v1 files still load — the fields
+default empty). `to_yaml`/`from_yaml`. Import modes: **default** (new top-level
+branch), **here** (child of active), **merge** (attach the non-matching tail at
+the deepest matching prefix). Import re-attaches a recipe-bearing turn as a
+*generated* node in its recorded seat (`begin_assistant(seat=turn.role)`) and
+merges the cast block into the tree roster (session's member wins on conflict,
+`cast_conflict` guard note). Guards: model mismatch refuses `--merge`
+(`TranscriptModelMismatch`), system-prompt mismatch banners, probe-hash drift
+warns / raises `TranscriptProbeDriftError` under `--strict`.
 
 ## joint_logprobs.py
 

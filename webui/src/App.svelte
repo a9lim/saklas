@@ -276,6 +276,8 @@
             <Drawers.Transcript params={drawerState.params} />
           {:else if drawerState.open === "template_lab"}
             <Drawers.TemplateLab params={drawerState.params} />
+          {:else if drawerState.open === "cast"}
+            <Drawers.Cast params={drawerState.params} />
           {:else}
             <header class="drawer-header">
               <span class="drawer-title">{drawerState.open}</span>

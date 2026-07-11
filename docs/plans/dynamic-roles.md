@@ -1,17 +1,28 @@
 # Dynamic roles — the cast model
 
-*Status: **phases 1–2 landed** (2026-07-10): `core/scene.py` (autopsy +
-stitcher + validation, live-validated on 11 real templates) and the engine
-wiring (`scene_grammar` on the session, `build_chat_input` through the
-stitcher, `gen_seat` through generate/stream/fork/regen/readouts, loom seat
-param, WS `generate_seat`, base-model branch → `render_scene_raw`).
-Live-verified on gemma-3-4b: user-seat generation, a/a sequences, cast
-labels (an unsteered `deer` header alone produced in-character output).
-Remaining: composer/loom UI (seat toggle, seat-swap branch, thinking-input
-warning), transcript v2, then phase 3 (cast registry + recipes). The UI
-groundwork (neutral turn treatment, stage-direction system turns, composer
-`speaking as` chips) shipped with the redesign. Companion to
-`docs/plans/sae-pillar.md` in spirit.*
+*Status: **phases 1–3 landed** (2026-07-10/11). Phases 1–2: `core/scene.py`
+(autopsy + stitcher + validation, live-validated on 11 real templates) and
+the engine wiring (`scene_grammar` on the session, `build_chat_input`
+through the stitcher, `gen_seat` through generate/stream/fork/regen/
+readouts, loom seat param, WS `generate_seat`, base-model branch →
+`render_scene_raw`). Phase 3 + the full UI slice: **cast registry**
+(`LoomTree.cast` label → `CastMember(recipe, notes)`; weakest-tier
+composition in `_apply_cast_defaults` — explicit kwargs, `steering: ""`
+clears, regen overrides all win; rides tree save + `op="cast"` frames +
+REST CRUD), **transcript v2** (`speaker:`/`thinking:` per turn + `cast:`
+block, v1 shim, seat-general import), **committed thinking**
+(`LoomNode.thinking_text` end-to-end with commit-time capability gate),
+**per-seat stop segments** (non-assistant seats add the seat close as a
+stop string when it differs from the assistant's), **freed commit seating**
+under scene mode, and the webui: composer seat toggle + empty-send
+continue, `+ thinking` disclosure with the one-turn warning, `cast…`
+manager sheet, loom `swap seat ⇄ branch`. Session info carries
+`scene_mode`/`thinking_input_supported`/`strips_history_thinking`.
+Live-verified on gemma-3-4b end-to-end (cast fill + explicit clear +
+user-seat continue + seat-swap + thinking 400 + all UI affordances).
+Remaining: per-turn `Recipe.overlay` UI for member-level per-turn
+overrides, phase 4 research (seat-swap probe diffs), TUI parity.
+Companion to `docs/plans/sae-pillar.md` in spirit.*
 
 ## Vision (a9)
 

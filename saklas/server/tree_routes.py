@@ -13,6 +13,7 @@ from fastapi.responses import Response
 from saklas.server.app import acquire_session_lock
 from saklas.server.native_common import resolve_session_id
 from saklas.server.tree_models import (
+    CastMemberRequest,
     JointLogprobsRequest,
     TreeBranchRequest,
     TreeDiffRequest,
@@ -134,6 +135,49 @@ def register_tree_routes(app: FastAPI) -> None:
         resolve_session_id(session, session_id)
         session.tree.annotate(req.node_id, req.text)
         return node_json(session, req.node_id)
+
+    @app.get("/saklas/v1/sessions/{session_id}/tree/cast")
+    def tree_cast(session_id: str):
+        """The tree's cast roster: label → member (recipe + notes).
+
+        Also rides the full-tree GET (``cast`` key when non-empty) and
+        the ``op="cast"`` ``tree_mutated`` frame — this endpoint is the
+        cheap standalone read.
+        """
+        resolve_session_id(session, session_id)
+        return {
+            "cast": {
+                label: member.to_dict()
+                for label, member in session.tree.cast.items()
+            }
+        }
+
+    @app.put("/saklas/v1/sessions/{session_id}/tree/cast/{label}")
+    async def tree_cast_put(session_id: str, label: str, req: CastMemberRequest):
+        """Create or replace the cast member under ``label``.
+
+        Validates the label as a role slug and the steering expression's
+        syntax up front (400 via ``SaklasError.user_message`` on either).
+        Decoration-tier — never a concurrency conflict.
+        """
+        resolve_session_id(session, session_id)
+        member = session.set_cast_member(
+            label,
+            steering=req.steering,
+            thinking=req.thinking,
+            seed=req.seed,
+            notes=req.notes,
+        )
+        return {"label": label, "member": member.to_dict()}
+
+    @app.delete(
+        "/saklas/v1/sessions/{session_id}/tree/cast/{label}", status_code=204,
+    )
+    async def tree_cast_delete(session_id: str, label: str):
+        """Drop the cast member under ``label`` (no-op when absent)."""
+        resolve_session_id(session, session_id)
+        session.remove_cast_member(label)
+        return None
 
     @app.post("/saklas/v1/sessions/{session_id}/tree/reset", status_code=204)
     async def tree_reset(session_id: str):

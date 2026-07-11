@@ -642,7 +642,10 @@ def _chat_input_cache_key(
     return (
         id(tokenizer),
         system_prompt,
-        tuple((m["role"], m["content"], m.get("label")) for m in chat),
+        tuple(
+            (m["role"], m["content"], m.get("label"), m.get("thinking"))
+            for m in chat
+        ),
         thinking,
         add_generation_prompt,
         gen_role,
@@ -684,6 +687,7 @@ def _try_scene_render(
             seat=cast("Seat", m["role"]),
             text=str(m.get("content", "")),
             label=m.get("label"),
+            thinking=m.get("thinking"),
         )
         for m in turn_msgs
     ]

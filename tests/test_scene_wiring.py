@@ -18,9 +18,10 @@ from saklas.core.loom import InvalidNodeOperationError, LoomTree
 from saklas.core.generation import build_chat_input as _real_build_chat_input
 from saklas.core.scene import (
     SceneRenderError,
+    SceneTurn,
+    TurnGrammar,
     extract_turn_grammar,
     render_scene,
-    SceneTurn,
     validate_turn_grammar,
 )
 from tests.test_role_templates import FakeTokenizer, QWEN_TEMPLATE
@@ -218,3 +219,224 @@ def test_ws_generate_message_rejects_bad_seat():
 
     with pytest.raises(ValidationError):
         WSGenerateMessage(type="generate", generate_seat="narrator")  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# Per-seat stop segments (convention 2)
+# ---------------------------------------------------------------------------
+
+
+def _grammar_with_closes(user_close: str, assistant_close: str) -> "TurnGrammar":
+    from saklas.core.scene import SeatWrapper, TurnGrammar
+
+    return TurnGrammar(
+        model_type="fake",
+        prelude="<bos>",
+        user=SeatWrapper("<t>", "\n", user_close, "user"),
+        assistant=SeatWrapper("<t>", "\n", assistant_close, "assistant"),
+        system=None,
+        system_fold_sep=None,
+        gen_extra="",
+    )
+
+
+class _StopStub:
+    def __init__(self, grammar: "TurnGrammar | None") -> None:
+        self.scene_grammar = grammar
+
+
+def _augment(
+    grammar: "TurnGrammar | None",
+    stop_list: list[str] | None,
+    *,
+    gen_seat: str = "user",
+    raw: bool = False,
+) -> list[str] | None:
+    from typing import cast as _cast
+
+    from saklas.core.session import SaklasSession
+
+    return SaklasSession._seat_stop_augmentation(
+        _cast(SaklasSession, _StopStub(grammar)), stop_list,
+        gen_seat=gen_seat, raw=raw,
+    )
+
+
+def test_seat_stop_added_when_closes_differ():
+    g = _grammar_with_closes("<|end|>\n", "<|return|>")
+    assert _augment(g, None) == ["<|end|>"]
+    # Composes with caller stops, no duplicates.
+    assert _augment(g, ["xyz"]) == ["xyz", "<|end|>"]
+    assert _augment(g, ["<|end|>"]) == ["<|end|>"]
+
+
+def test_seat_stop_skipped_on_shared_close():
+    g = _grammar_with_closes("<end_of_turn>\n", "<end_of_turn>\n")
+    # Shared terminator → the EOS union covers it → no stop list at all
+    # (None in, None out keeps the no-stop fast path).
+    assert _augment(g, None) is None
+
+
+def test_seat_stop_skipped_for_assistant_raw_and_no_grammar():
+    g = _grammar_with_closes("<|end|>", "<|return|>")
+    assert _augment(g, None, gen_seat="assistant") is None
+    assert _augment(g, None, raw=True) is None
+    assert _augment(None, None) is None
+
+
+# ---------------------------------------------------------------------------
+# Committed thinking: message-dict flow, cache key, loom storage, commit gate
+# ---------------------------------------------------------------------------
+
+
+def test_message_thinking_flows_through_build_chat_input():
+    """A ``"thinking"`` key on a chat message reaches the stitcher, and
+    renders that differ only in thinking never collide in the cache."""
+    from tests.test_scene import QWEN_STRIP_TEMPLATE
+
+    tok = _tok(QWEN_STRIP_TEMPLATE)
+    grammar = extract_turn_grammar(
+        tok, "qwen3", think_delimiters=("<think>", "</think>"),
+    )
+    base = [
+        {"role": "user", "content": "q"},
+        {"role": "user", "content": "hm"},
+    ]
+    thought = [
+        {"role": "user", "content": "q"},
+        {"role": "user", "content": "hm", "thinking": "let me think"},
+    ]
+    plain_ids = _ids(build_chat_input(tok, base, scene=grammar))
+    think_ids = _ids(build_chat_input(tok, thought, scene=grammar))
+    assert plain_ids != think_ids
+    # The stitcher's own render of the same turns carries the block.
+    expected_text = render_scene(
+        grammar,
+        [
+            SceneTurn(seat="user", text="q"),
+            SceneTurn(seat="user", text="hm", thinking="let me think"),
+        ],
+        gen_seat="assistant",
+    )
+    assert "<think>let me think</think>" in expected_text
+    # Second call with identical inputs hits the cache and stays stable.
+    assert _ids(build_chat_input(tok, thought, scene=grammar)) == think_ids
+
+
+def test_loom_thinking_text_round_trips():
+    tree = LoomTree()
+    u = tree.add_user_turn("hm", thinking_text="let me think")
+    assert tree.nodes[u].thinking_text == "let me think"
+    # messages_for carries it only in the labeled (cast-render) shape.
+    labeled = tree.messages_for(with_labels=True)
+    assert labeled[0]["thinking"] == "let me think"
+    plain = tree.messages_for()
+    assert "thinking" not in plain[0]
+    # finalize_assistant stamps it on generated/authored turns.
+    a = tree.begin_assistant(u)
+    tree.finalize_assistant(a, text="ok", thinking_text="planned")
+    assert tree.nodes[a].thinking_text == "planned"
+    # Serialization carries the field.
+    d = tree.nodes[u].to_dict()
+    assert d["thinking_text"] == "let me think"
+
+
+def test_commit_thinking_gate():
+    """Committed thinking is refused at commit time when the family
+    can't render it (no grammar / no think delimiters)."""
+    from typing import cast as _cast
+
+    from saklas.core.scene import SceneThinkingUnsupportedError
+    from saklas.core.session import SaklasSession
+    from tests.test_scene import QWEN_STRIP_TEMPLATE
+
+    class _CommitStub:
+        # The real gate, borrowed the way test_loom's
+        # _bind_commit_methods borrows session methods.
+        _check_thinking_commit = SaklasSession._check_thinking_commit
+
+        def __init__(self, grammar: Any) -> None:
+            self.scene_grammar = grammar
+            self.tree = LoomTree()
+
+        def _check_user_send_target(self, parent_node_id: Any) -> None:
+            return None
+
+    def commit(stub: Any, thinking: str | None) -> str:
+        return SaklasSession.append_user_turn(
+            _cast(SaklasSession, stub), None, "hm", thinking=thinking,
+        )
+
+    # No grammar at all (fallback family).
+    with pytest.raises(SceneThinkingUnsupportedError):
+        commit(_CommitStub(None), "let me think")
+
+    # Grammar without think delimiters (gemma-shaped).
+    tok = _tok(GEMMA_STRICT_TEMPLATE)
+    no_think = extract_turn_grammar(tok, "gemma3")
+    with pytest.raises(SceneThinkingUnsupportedError):
+        commit(_CommitStub(no_think), "let me think")
+
+    # Think-capable grammar: commit lands with the block stored.
+    tok2 = _tok(QWEN_STRIP_TEMPLATE)
+    think_ok = extract_turn_grammar(
+        tok2, "qwen3", think_delimiters=("<think>", "</think>"),
+    )
+    stub = _CommitStub(think_ok)
+    node_id = commit(stub, "let me think")
+    assert stub.tree.nodes[node_id].thinking_text == "let me think"
+    # thinking=None never consults the grammar (stub with grammar=None).
+    none_stub = _CommitStub(None)
+    nid = commit(none_stub, None)
+    assert none_stub.tree.nodes[nid].thinking_text is None
+
+
+def test_commit_seating_frees_under_scene_mode():
+    """Scene mode lifts the commit-parent guards (u/u and a/a authored
+    shapes are renderable); legacy families keep them."""
+    from typing import cast as _cast
+
+    from saklas.core.session import SaklasSession
+    from tests.test_scene import QWEN_STRIP_TEMPLATE
+
+    class _WordTok:
+        def encode(self, text: str, **_: Any) -> list[int]:
+            return [3000 + i for i, _w in enumerate(text.split())]
+
+    class _SeatStub:
+        _check_thinking_commit = SaklasSession._check_thinking_commit
+        _check_user_send_target = SaklasSession._check_user_send_target
+
+        def __init__(self, grammar: Any) -> None:
+            self.scene_grammar = grammar
+            self.tree = LoomTree()
+            self._tokenizer = _WordTok()
+
+    def as_sess(stub: Any) -> SaklasSession:
+        return _cast(SaklasSession, stub)
+
+    tok = _tok(QWEN_STRIP_TEMPLATE)
+    grammar = extract_turn_grammar(tok, "qwen3")
+
+    # Scene mode: user under user, assistant under assistant, assistant
+    # under root all land.
+    stub = _SeatStub(grammar)
+    u1 = SaklasSession.append_user_turn(as_sess(stub), None, "one")
+    u2 = SaklasSession.append_user_turn(as_sess(stub), u1, "two")
+    assert stub.tree.nodes[u2].parent_id == u1
+    a1 = SaklasSession.append_assistant_turn(as_sess(stub), u2, "three")
+    a2 = SaklasSession.append_assistant_turn(as_sess(stub), a1, "four")
+    assert stub.tree.nodes[a2].parent_id == a1
+    root_a = SaklasSession.append_assistant_turn(
+        as_sess(stub), stub.tree.root_id, "first",
+    )
+    assert stub.tree.nodes[root_a].role == "assistant"
+
+    # Legacy (no grammar): both guards still hold.
+    legacy = _SeatStub(None)
+    lu = SaklasSession.append_user_turn(as_sess(legacy), None, "one")
+    with pytest.raises(InvalidNodeOperationError):
+        SaklasSession.append_user_turn(as_sess(legacy), lu, "two")
+    la = SaklasSession.append_assistant_turn(as_sess(legacy), lu, "reply")
+    with pytest.raises(InvalidNodeOperationError):
+        SaklasSession.append_assistant_turn(as_sess(legacy), la, "again")

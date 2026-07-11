@@ -47,6 +47,10 @@ class WSGenerateMessage(BaseModel):
     prefill_text: str | None = None
     commit_role: Literal["user", "assistant"] | None = None
     commit_text: str | None = None
+    # Optional committed thinking block riding a commit (any seat) —
+    # rendered through the family think delimiters by the scene
+    # stitcher; rejected with 400 when the family can't carry it.
+    commit_thinking: str | None = None
     # Cast model: which seat the generated turn occupies.  ``"user"``
     # renders the generation prompt as a user-seat header and lands the
     # node with ``role="user"`` + a stamped recipe (generated is

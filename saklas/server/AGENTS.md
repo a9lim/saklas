@@ -144,6 +144,11 @@ body + any typed safe-message formatter.
   `live_lens_layers` (the live workspace readout's resolved layer list, `null`
   while off; coerced so stub sessions read as off), and `live_probe_scores`
   (the CAA live toggle; coerced so stub sessions read as the default-on).
+  Scene-grammar capabilities (the cast model; `_scene_capabilities`, coerced
+  so stubs read all-off): `scene_mode` (validated grammar present — gates the
+  seat toggle + free commit seating), `thinking_input_supported` (family think
+  delimiters — gates the committed-thinking box), `strips_history_thinking`
+  (drives the composer's "lasts one turn" warning).
 - `GET/PATCH/DELETE /saklas/v1/sessions/{id}` — info / update defaults / no-op 204.
 - `POST /saklas/v1/sessions/{id}/{clear,rewind}`.
 
@@ -327,6 +332,14 @@ fully cover lands as `null`. Default covers everything; `names` restricts.
 delete / star / note / reset mutations, plus `edge_label`, `filter`, branch `diff`,
 `joint_logprobs`, and `transcript` / `transcript/load`. Mutations run the tree's
 conflict checks (409 when they would corrupt an in-flight generation).
+Cast roster (phase 3): `GET .../tree/cast` (label → member), `PUT
+.../tree/cast/{label}` body `{steering?, thinking?, seed?, notes?}` (label-slug
++ expression syntax validated up front, 400 on either), `DELETE
+.../tree/cast/{label}` (204, absent = no-op). Roster ops are decoration-tier
+(never 409); the roster also rides the full-tree GET (`cast` key when
+non-empty) and the `op="cast"` `tree_mutated` frame. `tree/branch` takes an
+optional `role` override — with the engine's scene mode this is the seat-swap
+branch primitive.
 
 ### experiment_routes.py
 
@@ -428,10 +441,16 @@ modes:
 - **Answer-prefill** (`prefill_node_id`/`prefill_text`) → `session.prefill_assistant`:
   the seeded assistant reply lands as a sibling under a user node. `thinking` forced
   off.
-- **Commit (no-generation send)** (`commit_role`/`commit_text`) →
-  `session.append_user_turn` / `append_assistant_turn`. `raw=true` lifts the
-  user-under-user guard. Emits one `started` (node_id=null) + one `done` carrying the
-  new node under `result.{kind="commit", role, text, node_id}`. No token frames.
+- **Commit (no-generation send)** (`commit_role`/`commit_text`, optional
+  `commit_thinking`) → `session.append_user_turn` / `append_assistant_turn`.
+  `raw=true` lifts the user-under-user guard (scene mode lifts both commit-parent
+  guards engine-side — u/u and a/a authored shapes land on validated families).
+  `commit_thinking` is a committed thinking block stored on
+  `LoomNode.thinking_text` and rendered through the family think delimiters
+  (400 `SceneThinkingUnsupportedError` when the family can't carry it;
+  suppressed in raw mode). Emits one `started` (node_id=null) + one `done`
+  carrying the new node under `result.{kind="commit", role, text, node_id}`.
+  No token frames.
 - **Recipe override** — a built-in mode string (`unsteered`/`inverted`/`reseed`/
   `cool`/`hot`) or a partial-recipe expression (`seed=42, temperature=1.5`).
 
@@ -451,6 +470,10 @@ the frame), `done` (`result` with `text`, `tokens`,
 `finish_reason`, `usage`, `per_token_probes`, `mean_logprob`, `mean_surprise`,
 `probe_readings` aggregate), `error` (validation errors keep the connection open;
 other failures close 1011).
+
+A roster mutation (`LoomMutated(op="cast")`) forwards as a `tree_mutated`
+frame with empty `added`/`updated` plus a `cast` key inlining the full roster
+(`{label: {recipe?, notes?}}`), so clients reconcile without a refetch.
 
 Concurrency: one perpetual reader task owns `receive_json()` and feeds a shared
 `incoming` queue; `tree_mutated`/`node_created` ride a connection-level

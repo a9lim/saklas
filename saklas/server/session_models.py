@@ -118,6 +118,35 @@ def _sae_info(session: SaklasSession) -> dict[str, Any] | None:
     return dict(info) if isinstance(info, dict) else None
 
 
+def _scene_capabilities(session: SaklasSession) -> dict[str, bool]:
+    """Scene-grammar capability flags, defensively coerced.
+
+    Reading ``session.scene_grammar`` runs the lazy autopsy once on a
+    real session; a stub (MagicMock in tests) or a fallback family
+    reads as scene mode off.  ``thinking_input_supported`` gates the
+    composer's committed-thinking box; ``strips_history_thinking``
+    drives its "lasts one turn" pre-submit warning.
+    """
+    from saklas.core.scene import TurnGrammar
+
+    try:
+        grammar = getattr(session, "scene_grammar", None)
+    except Exception:
+        grammar = None
+    if not isinstance(grammar, TurnGrammar):
+        # MagicMock stubs and legacy sessions both read as scene off.
+        grammar = None
+    return {
+        "scene_mode": grammar is not None,
+        "thinking_input_supported": bool(
+            grammar is not None and isinstance(grammar.think_open, str)
+        ),
+        "strips_history_thinking": bool(
+            grammar is not None and grammar.strips_history_thinking is True
+        ),
+    }
+
+
 def session_info(
     session: SaklasSession, default_steering: Steering | None,
 ) -> dict[str, Any]:
@@ -184,6 +213,11 @@ def session_info(
         "user_role_supported": user_role_ok,
         "default_assistant_role": default_assistant_role,
         "default_user_role": default_user_role,
+        # Scene-grammar capabilities (the cast model): scene_mode gates
+        # the seat toggle + free commit seating, thinking_input_supported
+        # the committed-thinking box, strips_history_thinking its
+        # "lasts one turn" pre-submit warning.
+        **_scene_capabilities(session),
     }
 
 

@@ -37,6 +37,7 @@ import type {
   WSServerMessage,
 } from "./api";
 import type {
+  CastMemberJSON,
   ChatTurn,
   GenStatus,
   JLensSteerEntry,
@@ -1390,6 +1391,13 @@ export const loomTree: LoomTreeState = $state({
   error: null,
 });
 
+/** Cast roster (phase 3): label → member (standing recipe + notes).
+ *  Hydrated from the full-tree GET (``cast`` key) and reconciled from
+ *  ``op="cast"`` ``tree_mutated`` frames (roster inlined — no refetch). */
+export const castState: { roster: Record<string, CastMemberJSON> } = $state({
+  roster: {},
+});
+
 /** Walk from root to ``active_node_id`` and produce the ordered list of
  *  node ids on the active path.  O(depth + active-children-per-step).
  *  Returns [] when the tree isn't loaded. */
@@ -1460,6 +1468,12 @@ function nodeToTurn(n: LoomNodeJSON): ChatTurn {
       s.thinking = true;
       return s;
     });
+    turn.thinking = true;
+  } else if (n.thinking_text) {
+    // Committed thinking block (no token rows — the human typed it):
+    // one synthesized row renders it through the same collapsible the
+    // streamed thinking channel uses.
+    turn.thinkingTokens = [{ text: n.thinking_text, thinking: true }];
     turn.thinking = true;
   }
   return turn;
@@ -1636,6 +1650,7 @@ function applyTreeSnapshot(snap: LoomTreeJSON): void {
   for (const [pid, ids] of Object.entries(snap.children_of)) {
     loomTree.children_of.set(pid, [...ids]);
   }
+  castState.roster = snap.cast ?? {};
   recomputeActivePath();
   syncChatLogFromTree();
 }
@@ -1770,15 +1785,27 @@ export async function loomEdit(node_id: string, text: string): Promise<void> {
 export async function loomBranch(
   node_id: string,
   text: string,
+  role?: "user" | "assistant" | null,
 ): Promise<string | null> {
   try {
-    const r = await apiTree.branch(node_id, text);
+    const r = await apiTree.branch(node_id, text, undefined, role);
     await refreshLoomTree();
     return r.node_id;
   } catch (e) {
     _captureLoomError("branch", e);
     return null;
   }
+}
+
+/** Seat-swap branch: a sibling with the same text and the seat flipped
+ *  (the cast model's controlled experiment on the seat prior).  The
+ *  swapped copy re-renders under the flipped header at the next
+ *  generation; downstream nodes are NOT copied (same contract as edit). */
+export async function loomSwapSeat(node_id: string): Promise<string | null> {
+  const node = loomTree.nodes.get(node_id);
+  if (!node || (node.role !== "user" && node.role !== "assistant")) return null;
+  const flipped = node.role === "user" ? "assistant" : "user";
+  return loomBranch(node_id, node.text, flipped);
 }
 
 export async function loomDelete(node_id: string): Promise<void> {
@@ -2452,6 +2479,10 @@ function adoptStreamingNode(nodeId: string | null | undefined): void {
 function handleWsMessage(msg: WSServerMessage): void {
   switch (msg.type) {
     case "tree_mutated": {
+      // Roster mutation: the frame inlines the full cast (no node ids).
+      if (msg.op === "cast" && msg.cast) {
+        castState.roster = msg.cast;
+      }
       // Apply the delta; on rev gap, full re-fetch.
       const ok = applyTreeDelta(msg);
       if (!ok) void refreshLoomTree();
@@ -2837,6 +2868,11 @@ function handleWsMessage(msg: WSServerMessage): void {
 export interface SendGenerateOpts {
   stateless?: boolean;
   raw?: boolean;
+  /** Cast model: which seat the generated turn occupies.  Absent /
+   *  "assistant" = the classic flow; "user" needs scene mode server-side.
+   *  Callers pass it explicitly (the composer reads its seat toggle) —
+   *  the send primitive never defaults off ambient UI state. */
+  generate_seat?: "user" | "assistant";
   /** Override the rack-derived steering with an explicit string.  Pass
    * ``""`` for unsteered (A/B mode); ``null``/``undefined`` to use the
    * rack. */
@@ -2964,6 +3000,9 @@ async function sendGenerateNow(
     ...(opts.recipe_override !== undefined
       ? { recipe_override: opts.recipe_override }
       : {}),
+    ...(opts.generate_seat !== undefined && opts.generate_seat !== "assistant"
+      ? { generate_seat: opts.generate_seat }
+      : {}),
   };
   const send = () => sock.send(JSON.stringify(payload));
   if (sock.readyState === WebSocket.OPEN) send();
@@ -3089,6 +3128,7 @@ function buildCommitPending(
   parentNodeId: string | null | "active@drain",
   text: string,
   raw: boolean = false,
+  thinking: string | null = null,
 ): PendingAction {
   return {
     id: `pa-${_pendingCounter++}`,
@@ -3102,11 +3142,11 @@ function buildCommitPending(
       const parent = parentNodeId === "active@drain"
         ? loomTree.active_node_id
         : parentNodeId;
-      return sendCommitNow(role, parent, text, raw);
+      return sendCommitNow(role, parent, text, raw, thinking);
     },
     awaitsGen: true,
     rebuild: (newText: string) =>
-      buildCommitPending(role, parentNodeId, newText, raw),
+      buildCommitPending(role, parentNodeId, newText, raw, thinking),
     createdAt: Date.now(),
     endsOnUserNode: role === "user",
   };
@@ -3127,10 +3167,18 @@ export async function sendCommit(
   role: "user" | "assistant",
   parentNodeId: string | null | "active@drain",
   text: string,
-  opts: { replaceSlot?: number | null; raw?: boolean } = {},
+  opts: {
+    replaceSlot?: number | null;
+    raw?: boolean;
+    /** Committed thinking block riding this turn (rendered through the
+     *  family think delimiters; 400 when the family can't carry it). */
+    thinking?: string | null;
+  } = {},
 ): Promise<void> {
   if (isPendingBusy()) {
-    const item = buildCommitPending(role, parentNodeId, text, opts.raw ?? false);
+    const item = buildCommitPending(
+      role, parentNodeId, text, opts.raw ?? false, opts.thinking ?? null,
+    );
     enqueuePending(
       {
         label: item.label,
@@ -3150,7 +3198,9 @@ export async function sendCommit(
   const resolved = parentNodeId === "active@drain"
     ? loomTree.active_node_id
     : parentNodeId;
-  return sendCommitNow(role, resolved, text, opts.raw ?? false);
+  return sendCommitNow(
+    role, resolved, text, opts.raw ?? false, opts.thinking ?? null,
+  );
 }
 
 async function sendCommitNow(
@@ -3158,6 +3208,7 @@ async function sendCommitNow(
   parentNodeId: string | null,
   text: string,
   raw: boolean = false,
+  thinking: string | null = null,
 ): Promise<void> {
   const sock = await ensureWebSocket();
   // Per-message role labels ride the commit too (roleplay scaffold), so an
@@ -3170,6 +3221,7 @@ async function sendCommitNow(
     commit_role: role,
     commit_text: text,
     parent_node_id: parentNodeId,
+    ...(thinking ? { commit_thinking: thinking } : {}),
     ...(commitSampling ? { sampling: commitSampling } : {}),
     // ``raw`` lifts the user-under-user guard server-side — a flat
     // (base-model) commit's authored span may hang under any role.

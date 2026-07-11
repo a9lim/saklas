@@ -373,3 +373,115 @@ def test_cli_verb_registered():
     assert ns.path == "/tmp/x.yaml"
     assert "experiment" in _COMMAND_RUNNERS
     assert "transcript" not in _COMMAND_RUNNERS
+
+
+# ---------------------------------------------------------------------------
+# v2 — the cast model (speaker, cast block, seat-general import)
+# ---------------------------------------------------------------------------
+
+
+def test_v2_round_trip_speaker_and_cast(tmp_path: Path):
+    from saklas import CastMember
+
+    t = Transcript(
+        model_id="m",
+        system_prompt=None,
+        probes=[],
+        turns=[
+            TranscriptTurn(role="user", text="hi", speaker="captain"),
+            TranscriptTurn(
+                role="assistant", text="rustle", speaker="deer",
+                recipe=Recipe(steering="0.5 skittish"),
+            ),
+            # A generated *user-seat* turn — provenance rides the recipe.
+            TranscriptTurn(
+                role="user", text="who's there?", speaker="captain",
+                recipe=Recipe(steering="0.2 formal"),
+            ),
+        ],
+        cast={
+            "deer": CastMember(recipe=Recipe(steering="0.5 skittish")),
+            "captain": CastMember(notes="the human's usual mask"),
+        },
+    )
+    out = tmp_path / "v2.yaml"
+    t.save(out)
+    t2 = Transcript.load(out)
+    assert t2.turns[0].speaker == "captain"
+    assert t2.turns[2].recipe is not None
+    assert t2.cast == t.cast
+
+
+def test_v1_files_still_load():
+    yaml_text = (
+        "saklas_transcript: 1\n"
+        "model_id: m\n"
+        "system_prompt: null\n"
+        "probes: []\n"
+        "turns:\n"
+        "- role: user\n"
+        "  text: hi\n"
+        "- role: assistant\n"
+        "  text: hello\n"
+    )
+    t = Transcript.from_yaml(yaml_text)
+    assert [x.speaker for x in t.turns] == [None, None]
+    assert t.cast == {}
+
+
+def test_import_reattaches_generated_user_seat_turn():
+    sess = _StubSession()
+    t = Transcript(
+        model_id="m1", system_prompt=None, probes=[],
+        turns=[
+            TranscriptTurn(role="user", text="hi", speaker="captain"),
+            TranscriptTurn(
+                role="user", text="hello?", speaker="captain",
+                recipe=Recipe(steering="0.2 formal"),
+            ),
+            TranscriptTurn(
+                role="assistant", text="a reply",
+                recipe=Recipe(),
+            ),
+        ],
+    )
+    leaf = t.import_into(sess, mode="default")
+    chain = list(sess.tree.path_to(leaf))
+    committed, generated_user, generated_asst = chain[-3], chain[-2], chain[-1]
+    assert committed.role == "user" and committed.recipe is None
+    assert committed.role_label == "captain"
+    # The generated user-seat turn keeps its seat AND its provenance.
+    assert generated_user.role == "user"
+    assert generated_user.recipe is not None
+    assert generated_user.recipe.steering == "0.2 formal"
+    assert generated_user.role_label == "captain"
+    assert generated_asst.role == "assistant"
+
+
+def test_import_merges_cast_and_flags_conflicts():
+    from saklas import CastMember
+
+    sess = _StubSession()
+    sess.tree.set_cast_member(
+        "deer", CastMember(recipe=Recipe(steering="0.9 bold")),
+    )
+    t = Transcript(
+        model_id="m1", system_prompt=None, probes=[],
+        turns=[TranscriptTurn(role="user", text="hi")],
+        cast={
+            "deer": CastMember(recipe=Recipe(steering="0.5 skittish")),
+            "narrator": CastMember(notes="stage voice"),
+        },
+    )
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        leaf = t.import_into(sess, mode="default")
+    # Missing member lands; conflicting one keeps the session's version.
+    assert "narrator" in sess.tree.cast
+    assert sess.tree.cast["deer"].recipe is not None
+    assert sess.tree.cast["deer"].recipe.steering == "0.9 bold"
+    assert any("cast differs" in str(w.message) for w in caught)
+    # Single-turn transcript: the leaf IS the first imported node, which
+    # carries the guard notes.
+    imported_node = sess.tree.path_to(leaf)[-1]
+    assert "cast_conflict" in imported_node.notes

@@ -118,7 +118,11 @@ def merge_steering(
     if req_steering is not None:
         merged_alphas.update(req_steering.alphas)
     if not merged_alphas and thinking is None:
-        return None
+        # An explicit clear must reach the session as an *empty*
+        # Steering, not None — None means "unset" there, and the cast
+        # roster fills unset steering with the gen label's standing
+        # recipe.  ``steering: ""`` is the escape hatch that must win.
+        return Steering(alphas={}) if explicit_clear else None
     return Steering(alphas=merged_alphas, thinking=thinking)
 
 

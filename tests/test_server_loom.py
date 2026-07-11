@@ -258,7 +258,7 @@ class _StubSession:
 
     # ----- commit entry points (Ctrl+Enter on either surface) ----------
     def append_user_turn(
-        self, parent_node_id: Any, text: Any, *, allow_any_parent: bool = False, role_label: Any = None
+        self, parent_node_id: Any, text: Any, *, allow_any_parent: bool = False, role_label: Any = None, thinking: Any = None
     ):
         """Stub commit-user.
 
@@ -290,9 +290,10 @@ class _StubSession:
                 f"waiting for an assistant."
             )
         return self.tree.add_user_turn(
-            text, parent_id=parent_node_id, role_label=role_label)
+            text, parent_id=parent_node_id, role_label=role_label,
+            thinking_text=thinking)
 
-    def append_assistant_turn(self, user_node_id: Any, text: Any, *, role_label: Any = None):
+    def append_assistant_turn(self, user_node_id: Any, text: Any, *, role_label: Any = None, thinking: Any = None):
         """Stub commit-assistant.
 
         Mirrors ``SaklasSession.append_assistant_turn``: refuses non-user
@@ -330,8 +331,19 @@ class _StubSession:
             applied_steering=None,
             finish_reason="stop",
             raw_token_ids=raw_token_ids,
+            thinking_text=thinking,
         )
         return new_id
+
+    # Cast roster passthroughs — the real session methods only touch
+    # ``self.tree``, so borrow them wholesale (same trick the loom
+    # tests use for the commit methods).
+    def set_cast_member(self, label: Any, **kwargs: Any):
+        from saklas.core.session import SaklasSession
+        return SaklasSession.set_cast_member(self, label, **kwargs)  # type: ignore[arg-type]
+
+    def remove_cast_member(self, label: Any) -> None:
+        self.tree.remove_cast_member(label)
 
 
 @pytest.fixture
@@ -661,7 +673,7 @@ class TestTranscript:
         # to_yaml uses pyyaml's safe_dump; safe-scalar strings like
         # ``test/model`` and ``hello`` come back unquoted (valid YAML).  We
         # check substrings rather than exact quoting form.
-        assert "saklas_transcript: 1" in text
+        assert "saklas_transcript: 2" in text
         assert "model_id:" in text and "test/model" in text
         # Probes block exists (empty in this stub)
         assert "probes:" in text
@@ -673,7 +685,7 @@ class TestTranscript:
         # Round-trip via the YAML loader to confirm structural shape.
         import yaml
         parsed = yaml.safe_load(text)
-        assert parsed["saklas_transcript"] == 1
+        assert parsed["saklas_transcript"] == 2
         assert parsed["model_id"] == "test/model"
         assert len(parsed["turns"]) == 2
         assert parsed["turns"][0]["role"] == "user"
@@ -1067,3 +1079,67 @@ class TestCommit:
         assert assistant.raw_token_ids  # tokenized by the stub
         assert session.tree.nodes[new_id].parent_id == uid
         assert session.tree.rev > rev_before
+
+
+class TestCast:
+    def test_cast_crud_round_trip(self, session_and_client):
+        session, client = session_and_client
+        # PUT creates.
+        resp = client.put(
+            "/saklas/v1/sessions/default/tree/cast/deer",
+            json={"steering": "0.5 formal.casual", "notes": "skittish"},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["label"] == "deer"
+        assert body["member"]["recipe"]["steering"] == "0.5 formal.casual"
+        # GET reads the roster.
+        resp = client.get("/saklas/v1/sessions/default/tree/cast")
+        assert resp.status_code == 200
+        assert "deer" in resp.json()["cast"]
+        # The full-tree GET carries the roster too.
+        resp = client.get("/saklas/v1/sessions/default/tree")
+        assert resp.json()["cast"]["deer"]["notes"] == "skittish"
+        # DELETE removes; absent delete is still 204.
+        assert client.delete(
+            "/saklas/v1/sessions/default/tree/cast/deer"
+        ).status_code == 204
+        assert "deer" not in session.tree.cast
+        assert client.delete(
+            "/saklas/v1/sessions/default/tree/cast/deer"
+        ).status_code == 204
+
+    def test_cast_put_validates(self, session_and_client):
+        _session, client = session_and_client
+        # Bad label (uppercase/space) -> 400 via SaklasError mapping.
+        resp = client.put(
+            "/saklas/v1/sessions/default/tree/cast/Not%20A%20Slug",
+            json={},
+        )
+        assert resp.status_code == 400
+        # Bad steering expression -> 400 at authoring time.
+        resp = client.put(
+            "/saklas/v1/sessions/default/tree/cast/deer",
+            json={"steering": "0.5 !!nope!!"},
+        )
+        assert resp.status_code == 400
+
+    def test_cast_mutation_emits_ws_frame_with_roster(self, session_and_client):
+        session, client = session_and_client
+        u1 = session.tree.add_user_turn("hello")
+        del u1
+        with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
+            resp = client.put(
+                "/saklas/v1/sessions/default/tree/cast/deer",
+                json={"steering": "0.5 formal.casual"},
+            )
+            assert resp.status_code == 200
+            frame = None
+            for _ in range(10):
+                msg = ws.receive_json()
+                if msg.get("type") == "tree_mutated" and msg.get("op") == "cast":
+                    frame = msg
+                    break
+            assert frame is not None, "op=cast tree_mutated frame should arrive"
+            assert frame["cast"]["deer"]["recipe"]["steering"] == "0.5 formal.casual"
+            assert frame["added"] == [] and frame["updated"] == []

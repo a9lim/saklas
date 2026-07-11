@@ -119,6 +119,16 @@ export interface SessionInfo {
   /** The family's *standard* user-role label (``user`` everywhere today),
    *  or ``null``/``undefined`` when unsupported.  Seeds the user-role box. */
   default_user_role?: string | null;
+  /** True iff the session's validated scene grammar is active (the cast
+   *  model's stitcher renders — arbitrary seat sequences, seat toggle,
+   *  free commit seating).  Older servers omit it (reads as off). */
+  scene_mode?: boolean;
+  /** True iff a committed thinking block can be rendered (scene mode +
+   *  family think delimiters).  Gates the composer's thinking box. */
+  thinking_input_supported?: boolean;
+  /** True when the family template strips history thinking — a committed
+   *  thinking block lasts one turn.  Drives the composer warning. */
+  strips_history_thinking?: boolean;
 }
 
 // -------------------------------------------------- jacobian lens --
@@ -973,6 +983,15 @@ export interface WSGenerateRequest {
    *  together. */
   commit_role?: "user" | "assistant" | null;
   commit_text?: string | null;
+  /** Optional committed thinking block riding a commit (any seat) —
+   *  stored on the node's ``thinking_text`` and rendered through the
+   *  family think delimiters (400 when the family can't carry it). */
+  commit_thinking?: string | null;
+  /** Cast model: which seat the generated turn occupies.  ``"user"``
+   *  renders the generation prompt as a user-seat header (labeled by
+   *  ``sampling.user_role``) and lands the node with ``role="user"`` +
+   *  a stamped recipe.  Absent/null = assistant.  Needs scene mode. */
+  generate_seat?: "user" | "assistant" | null;
 }
 
 export interface WSStopRequest {
@@ -1131,6 +1150,11 @@ export interface LoomNodeJSON {
    *  for the standard role.  Drives the bubble heading + loom glyph.
    *  Older servers omit this; treat undefined as null. */
   role_label?: string | null;
+  /** The turn's verbatim thinking block — committed by the human, or the
+   *  decoded thinking channel of a generated node (stamped at finalize).
+   *  Strip families re-render it for one turn only.  Older servers omit
+   *  it. */
+  thinking_text?: string | null;
   /** Assistant nodes only.  Mirrors saklas.core.loom.Recipe. */
   recipe?: {
     steering?: string | null;
@@ -1186,6 +1210,20 @@ export interface LoomTreeJSON {
   model_id?: string | null;
   session_id?: string | null;
   name?: string | null;
+  /** Cast roster (phase 3): label → member.  Absent when empty. */
+  cast?: Record<string, CastMemberJSON>;
+}
+
+/** One cast-roster member — a named label plus its standing recipe
+ *  fragment (the weakest steering tier at generation).  Mirrors
+ *  ``saklas.core.loom.CastMember``. */
+export interface CastMemberJSON {
+  recipe?: {
+    steering?: string | null;
+    thinking?: boolean | null;
+    seed?: number | null;
+  } | null;
+  notes?: string;
 }
 
 /** Phase-5 cross-branch diff response (server side: NodeDiff +
@@ -1330,12 +1368,16 @@ export interface WSTreeMutatedEvent {
     | "begin_assistant"
     | "add_user"
     | "finalize"
+    | "cast"
     | string;
   added?: LoomNodeJSON[];
   removed?: string[];
   updated?: LoomNodeJSON[];
   active_node_id?: string | null;
   rev: number;
+  /** ``op="cast"`` only: the full roster inlined (label → member) so
+   *  clients reconcile without a refetch. */
+  cast?: Record<string, CastMemberJSON>;
 }
 
 /** Fired at the start of each branch in an n-way generate so the client
@@ -1711,7 +1753,11 @@ export type DrawerName =
    *  + multi-turn contexts) and score the restricted-choice value
    *  distribution (steering-aware before/after). Reached from the workspace
    *  rail's "manifolds → templates…" entry. */
-  | "template_lab";
+  | "template_lab"
+  /** Cast manager (phase 3) — the tree's roster of named labels with
+   *  standing steering recipes.  Reached from the composer cast row's
+   *  "cast…" launcher.  A steering surface, not a chat feature. */
+  | "cast";
 
 export interface DrawerState {
   open: DrawerName | null;

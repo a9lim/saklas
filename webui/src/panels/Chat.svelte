@@ -68,6 +68,7 @@
     roleGlyphLetter,
     samplingState,
     sessionState,
+    castState,
     highlightScale,
   } from "../lib/stores.svelte";
   import type { AutoRegenMode } from "../lib/stores.svelte";
@@ -185,6 +186,43 @@
     return predicted === null ? liveOnUserNode : predicted;
   });
 
+  // ---------------------------------------------------------- cast seats --
+  //
+  // Scene mode (the validated stitcher grammar) frees the seat the model
+  // generates into: the seat toggle picks it, and an empty send becomes
+  // an explicit *continue* (``input: null`` — no committed turn, the
+  // model speaks next from the leaf: the a/a and u-continue shapes).
+  // Continue is deliberately NOT offered on a user-node leaf with the
+  // assistant seat — that shape is regen, which lives on the loom
+  // sidebar, not the input bar.
+  const sceneMode = $derived(sessionState.info?.scene_mode ?? false);
+  let genSeat = $state<"assistant" | "user">("assistant");
+  $effect(() => {
+    // Fallback families have no seat freedom — snap the toggle back.
+    if (!sceneMode && genSeat !== "assistant") genSeat = "assistant";
+  });
+  const userSeatActive = $derived(sceneMode && genSeat === "user");
+  const canContinue = $derived(
+    sceneMode &&
+      !genStatus.active &&
+      input.trim() === "" &&
+      loomTree.rev > 0 &&
+      (userSeatActive || !onUserNode),
+  );
+
+  // Committed-thinking input: a block the next *commit* (⌃⏎) carries,
+  // rendered through the family think delimiters.  Strip families keep
+  // it for one turn only — the warning under the box says so before
+  // submit (a9 convention 3).
+  const thinkingInputSupported = $derived(
+    sessionState.info?.thinking_input_supported ?? false,
+  );
+  const stripsHistoryThinking = $derived(
+    sessionState.info?.strips_history_thinking ?? false,
+  );
+  let thinkingOpen = $state(false);
+  let thinkingDraft = $state("");
+
   // --- Commit modifier (Ctrl / Cmd / Option) ----------------------------
   // Any of Ctrl, Cmd (⌘), or Option (⌥) held flips the input into
   // "commit" mode: the typed text lands as the next turn but no
@@ -213,16 +251,24 @@
       ? (onUserNode
           ? "commit assistant…  ⌃⏎ send · ⇧⏎ newline"
           : "commit user…  ⌃⏎ send · ⇧⏎ newline")
-      : (onUserNode
-          ? "prefill reply…  ⏎ send · ⌃⏎ commit · ⇧⏎ newline"
-          : "message…  ⏎ send · ⌃⏎ commit · ⇧⏎ newline"),
+      : userSeatActive
+        ? "speak the user seat…  ⏎ send (empty = continue) · ⇧⏎ newline"
+        : (onUserNode
+            ? "prefill reply…  ⏎ send · ⌃⏎ commit · ⇧⏎ newline"
+            : "message…  ⏎ send · ⌃⏎ commit · ⇧⏎ newline"),
   );
   /** Send-button caption tracks the role-aware action; any held commit
-   *  modifier overrides both prefill and send with a "commit" register. */
+   *  modifier overrides both prefill and send with a "commit" register.
+   *  In scene mode an empty draft reads "continue" — the explicit
+   *  ``input: null`` no-committed-turn generation. */
   const sendLabel = $derived(
     commitMode
       ? (onUserNode ? "commit assistant" : "commit user")
-      : (onUserNode ? "prefill" : "send"),
+      : userSeatActive
+        ? (input.trim() ? "send ⇢ user" : "continue ⇢ user")
+        : canContinue && !input.trim()
+          ? "continue"
+          : (onUserNode ? "prefill" : "send"),
   );
 
   /** Shared commit dispatch — used by both Ctrl/Cmd/Option+Enter and a
@@ -254,11 +300,18 @@
     const parent = isPendingBusy()
       ? ("active@drain" as const)
       : activeNodeId;
+    // A drafted thinking block rides this commit (the only surface that
+    // carries one) and is consumed by it — one block, one turn.
+    const thinking = thinkingDraft.trim() !== "" ? thinkingDraft : null;
+    if (thinking !== null) {
+      thinkingDraft = "";
+      thinkingOpen = false;
+    }
     if (onUserNode) {
       if (!parent) return true;
       pushInputHistory(text);
       input = "";
-      void sendCommit("assistant", parent, text, { replaceSlot });
+      void sendCommit("assistant", parent, text, { replaceSlot, thinking });
     } else {
       // Active node is root/assistant.  Pass it as the parent so the
       // server anchors the new user node under it (active-node fall-
@@ -266,7 +319,7 @@
       // mid-flight active-node swap).
       pushInputHistory(text);
       input = "";
-      void sendCommit("user", parent, text, { replaceSlot });
+      void sendCommit("user", parent, text, { replaceSlot, thinking });
     }
     scrolledUp = false;
     queueScrollToBottom();
@@ -279,6 +332,45 @@
     // running a decode.  tryCommit always consumes the action when
     // commit is true — empty input no-ops silently.
     if (commit && tryCommit()) return;
+    // User-seat path (scene mode): the model speaks the user seat.
+    // Text commits as a user turn first (the engine's input-string
+    // contract), so this covers u/u; empty is the explicit continue.
+    // Bypasses prefill mode entirely — prefill seeds an assistant
+    // reply, which isn't what this seat means.
+    if (userSeatActive) {
+      const text = input.trim();
+      const replaceSlot = consumePulledSlot();
+      if (!text) {
+        if (replaceSlot !== null) {
+          cancelPendingAction(pendingActions.queue[replaceSlot]?.id ?? "");
+          return;
+        }
+        if (!canContinue) return;
+        void sendGenerate(null, { generate_seat: "user" });
+      } else {
+        pushInputHistory(text);
+        input = "";
+        void sendGenerate(text, { replaceSlot, generate_seat: "user" });
+      }
+      scrolledUp = false;
+      queueScrollToBottom();
+      queueMicrotask(autosize);
+      return;
+    }
+    // Empty-draft continue (scene mode, assistant seat): generate with
+    // no committed turn from the current leaf — the a/a shape.  Only
+    // offered off user-node leaves (that shape is regen — sidebar).
+    if (!input.trim() && canContinue && !onUserNode) {
+      const replaceSlot = consumePulledSlot();
+      if (replaceSlot !== null) {
+        cancelPendingAction(pendingActions.queue[replaceSlot]?.id ?? "");
+        return;
+      }
+      void sendGenerate(null, {});
+      scrolledUp = false;
+      queueScrollToBottom();
+      return;
+    }
     // Role-aware branch: on a user node the input seeds the assistant
     // reply rather than appending a new user turn.
     if (onUserNode && (activeNodeId || isPendingBusy())) {
@@ -1140,9 +1232,76 @@
         placeholder={roleDisplayLabel("assistant")}
         spellcheck="false"
         aria-label="assistant role label"
+        list="cast-roster-labels"
       />
     </label>
+    {#if sceneMode}
+      <div
+        class="seat-toggle"
+        role="radiogroup"
+        aria-label="generation seat"
+        title="which seat the model speaks next — user-seat generation and empty-send continue need scene mode"
+      >
+        <span class="cast-label">speak seat</span>
+        <button
+          type="button"
+          class="seat"
+          class:active={genSeat === "assistant"}
+          aria-pressed={genSeat === "assistant"}
+          onclick={() => (genSeat = "assistant")}
+        >assistant</button>
+        <button
+          type="button"
+          class="seat"
+          class:active={genSeat === "user"}
+          aria-pressed={genSeat === "user"}
+          onclick={() => (genSeat = "user")}
+        >user</button>
+      </div>
+    {/if}
+    <button
+      type="button"
+      class="cast-manage"
+      title="cast manager — named labels with standing steering recipes"
+      onclick={() => openDrawer("cast")}
+    >cast…</button>
+    <datalist id="cast-roster-labels">
+      {#each Object.keys(castState.roster) as slug (slug)}
+        <option value={slug}></option>
+      {/each}
+    </datalist>
   </div>
+
+  {#if thinkingInputSupported}
+    <div class="thinking-row">
+      <button
+        type="button"
+        class="thinking-toggle"
+        class:open={thinkingOpen}
+        class:drafted={thinkingDraft.trim() !== ""}
+        onclick={() => (thinkingOpen = !thinkingOpen)}
+        title="author a thinking block for the next committed turn (⌃⏎)"
+      >{thinkingOpen ? "− thinking" : "+ thinking"}</button>
+      {#if thinkingOpen}
+        <div class="thinking-box">
+          <textarea
+            class="thinking-input"
+            bind:value={thinkingDraft}
+            placeholder="thinking for the next committed turn (⌃⏎)…"
+            rows="2"
+            spellcheck="false"
+            aria-label="committed thinking block"
+          ></textarea>
+          {#if stripsHistoryThinking}
+            <p class="thinking-warn" role="note">
+              this family strips history thinking — the block renders for
+              one turn, then drops from the context.
+            </p>
+          {/if}
+        </div>
+      {/if}
+    </div>
+  {/if}
 
   <form class="input-row" onsubmit={(ev) => { ev.preventDefault(); doSend(modHeld); }}>
     <textarea
@@ -1159,10 +1318,14 @@
       <button
         type="submit"
         class="send"
-        disabled={!input.trim()}
-        title={onUserNode
-          ? "⏎ prefill reply · ⌃-click commit assistant · ⇧⏎ newline"
-          : "⏎ send · ⌃-click commit user · ⇧⏎ newline"}
+        disabled={!input.trim() && !canContinue}
+        title={userSeatActive
+          ? "⏎ speak the user seat (empty = continue) · ⇧⏎ newline"
+          : onUserNode
+            ? "⏎ prefill reply · ⌃-click commit assistant · ⇧⏎ newline"
+            : canContinue && !input.trim()
+              ? "⏎ continue — the model speaks next with no committed turn"
+              : "⏎ send · ⌃-click commit user · ⇧⏎ newline"}
       >{sendLabel}</button>
       <button
         type="button"
@@ -1662,6 +1825,101 @@
   .cast-input:disabled {
     opacity: 0.4;
     cursor: not-allowed;
+  }
+  .seat-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
+  }
+  .seat {
+    background: var(--glass);
+    color: var(--fg-muted);
+    border: 1px solid transparent;
+    border-radius: var(--radius-pill);
+    font-family: var(--font-mono);
+    font-size: var(--text-2xs);
+    padding: 2px var(--space-3);
+    cursor: pointer;
+    transition:
+      background var(--dur-fast) var(--ease-out),
+      color var(--dur-fast) var(--ease-out);
+  }
+  .seat:hover {
+    color: var(--fg);
+  }
+  .seat.active {
+    background: var(--glass-strong);
+    color: var(--fg-strong);
+  }
+  .cast-manage {
+    margin-left: auto;
+    background: none;
+    border: none;
+    color: var(--fg-muted);
+    font-family: var(--font-mono);
+    font-size: var(--text-2xs);
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    cursor: pointer;
+    padding: 2px var(--space-2);
+    transition: color var(--dur-fast) var(--ease-out);
+  }
+  .cast-manage:hover {
+    color: var(--fg);
+  }
+
+  .thinking-row {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    padding: 0 var(--space-1);
+  }
+  .thinking-toggle {
+    align-self: flex-start;
+    background: none;
+    border: none;
+    color: var(--fg-muted);
+    font-family: var(--font-mono);
+    font-size: var(--text-2xs);
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    cursor: pointer;
+    padding: 0 var(--space-1);
+    transition: color var(--dur-fast) var(--ease-out);
+  }
+  .thinking-toggle:hover,
+  .thinking-toggle.open {
+    color: var(--fg);
+  }
+  .thinking-toggle.drafted {
+    color: var(--fg-strong);
+  }
+  .thinking-box {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+  .thinking-input {
+    background: var(--input-well);
+    color: var(--fg-dim);
+    border: 1px solid transparent;
+    border-radius: var(--radius);
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    padding: var(--space-2) var(--space-3);
+    resize: vertical;
+    min-height: 44px;
+  }
+  .thinking-input:focus-visible {
+    outline: none;
+    border-color: var(--accent-glow);
+    color: var(--fg);
+  }
+  .thinking-warn {
+    margin: 0;
+    color: var(--fg-muted);
+    font-size: var(--text-xs);
+    font-style: italic;
   }
 
   .input-row {
