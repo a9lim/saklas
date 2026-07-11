@@ -45,23 +45,52 @@ def build_token_event(
         if emap:
             event["raw_index"] = int(emap[-1][0])
 
+    payload = None
     with suppress(Exception):
-        node = session.tree.nodes.get(node_id) if node_id else None
-        rows = (
-            node.thinking_tokens if is_thinking else node.tokens
-        ) if node is not None else None
-        last = rows[-1] if rows else None
+        raw_payload = getattr(session, "_last_token_probe_payload", None)
+        if isinstance(raw_payload, dict):
+            payload = raw_payload
+
+    scores_blob = payload.get("scores") if payload is not None else None
+    if scores_blob:
+        # Match the loom-row fallback's wire unit: the session rounds the
+        # appended ``probes`` row to six decimals.  Prefer this already-shaped
+        # token payload so the WS path does not re-read the just-appended tree
+        # row every token.
+        event["scores"] = {
+            name: round(float(value), 6)
+            for name, value in scores_blob.items()
+        }
+    per_layer_blob = (
+        payload.get("per_layer_scores") if payload is not None else None
+    )
+    if per_layer_blob:
+        event["per_layer_scores"] = per_layer_blob
+
+    with suppress(Exception):
+        if "scores" not in event or "per_layer_scores" not in event:
+            node = session.tree.nodes.get(node_id) if node_id else None
+            rows = (
+                node.thinking_tokens if is_thinking else node.tokens
+            ) if node is not None else None
+            last = rows[-1] if rows else None
+        else:
+            last = None
         if last is not None:
             # ``probes`` is the per-probe coordinate axis-0 float the session
             # already collapsed from each reading; ``per_layer_scores`` is the
             # per-layer coordinate map.  Both keep their existing wire shapes
             # ({name: float} / {layer: {name: float}}) for the un-updated webui.
-            probes_blob = last.get("probes")
+            probes_blob = last.get("probes") if "scores" not in event else None
             if probes_blob:
                 event["scores"] = probes_blob
-            per_layer_blob = last.get("per_layer_scores")
-            if per_layer_blob:
-                event["per_layer_scores"] = per_layer_blob
+            fallback_per_layer_blob = (
+                last.get("per_layer_scores")
+                if "per_layer_scores" not in event
+                else None
+            )
+            if fallback_per_layer_blob:
+                event["per_layer_scores"] = fallback_per_layer_blob
 
     # Rich channel: the full per-probe reading (coords + fraction + nearest)
     # for the latest token.  ``readings`` and ``probe_readings`` in the payload
@@ -69,9 +98,8 @@ def build_token_event(
     # of live probe scoring, so event shaping never reaches into private capture
     # buffers or re-scores the token on the WebSocket path.
     with suppress(Exception):
-        payload = getattr(session, "_last_token_probe_payload", None)
         readings = None
-        if isinstance(payload, dict):
+        if payload is not None:
             readings = payload.get("readings") or payload.get("probe_readings")
         if readings:
             event["probe_readings"] = {
@@ -83,8 +111,7 @@ def build_token_event(
     # probe readings.  String layer keys to match ``per_layer_scores``' wire
     # shape; ``[token, score]`` pairs serialize as 2-arrays.
     with suppress(Exception):
-        payload = getattr(session, "_last_token_probe_payload", None)
-        lens = payload.get("lens") if isinstance(payload, dict) else None
+        lens = payload.get("lens") if payload is not None else None
         if lens:
             event["lens_readout"] = {
                 str(layer): [[tok, float(score)] for tok, score in pairs]
@@ -94,7 +121,7 @@ def build_token_event(
         # strength, com, spread]`` 4-arrays, strength-descending (mean
         # band probability + probability-mass-weighted depth center of mass).
         agg = (
-            payload.get("lens_aggregate") if isinstance(payload, dict) else None
+            payload.get("lens_aggregate") if payload is not None else None
         )
         if agg:
             event["lens_aggregate"] = [
@@ -102,7 +129,7 @@ def build_token_event(
                 for tok, s, com, spread in agg
             ]
 
-        sae = payload.get("sae") if isinstance(payload, dict) else None
+        sae = payload.get("sae") if payload is not None else None
         if sae:
             # ``max_act`` is the cached Neuronpedia maxActApprox (the strength
             # unit — clients render ``activation / max_act`` as the normalized

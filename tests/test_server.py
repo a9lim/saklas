@@ -1493,6 +1493,73 @@ class TestWSTokenEventLens:
             top_alts=None,
         )
 
+    def test_scores_prefer_token_payload_without_tree_lookup(self) -> None:
+        from types import SimpleNamespace
+
+        from saklas.server.ws_events import build_token_event
+
+        class ExplodingTree:
+            @property
+            def active_node_id(self) -> str:
+                raise AssertionError("payload path should not read active node")
+
+            @property
+            def nodes(self) -> Any:
+                raise AssertionError("payload path should not read tree rows")
+
+        session = SimpleNamespace(
+            _last_token_probe_payload={
+                "scores": {"calm": 0.4242429},
+                "per_layer_scores": {"5": {"calm": 0.38}},
+            },
+            tree=ExplodingTree(),
+            generation_state=SimpleNamespace(emit_map=[]),
+        )
+
+        event = build_token_event(
+            session,
+            ["node-1"],
+            text=" x",
+            is_thinking=False,
+            tid=5,
+            lp=None,
+            top_alts=None,
+        )
+
+        assert event["scores"] == {"calm": 0.424243}
+        assert event["per_layer_scores"] == {"5": {"calm": 0.38}}
+
+    def test_scores_fall_back_to_tree_row_without_payload_blobs(self) -> None:
+        from types import SimpleNamespace
+
+        from saklas.server.ws_events import build_token_event
+
+        node = SimpleNamespace(
+            tokens=[{
+                "probes": {"calm": 0.42},
+                "per_layer_scores": {"5": {"calm": 0.38}},
+            }],
+            thinking_tokens=[],
+        )
+        session = SimpleNamespace(
+            _last_token_probe_payload={"readings": None},
+            tree=SimpleNamespace(nodes={"node-1": node}),
+            generation_state=SimpleNamespace(emit_map=[]),
+        )
+
+        event = build_token_event(
+            session,
+            ["node-1"],
+            text=" x",
+            is_thinking=False,
+            tid=5,
+            lp=None,
+            top_alts=None,
+        )
+
+        assert event["scores"] == {"calm": 0.42}
+        assert event["per_layer_scores"] == {"5": {"calm": 0.38}}
+
     def test_lens_readout_rides_token_frame(self) -> None:
         event = self._event(
             {

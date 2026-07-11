@@ -12,7 +12,7 @@ import json
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 import torch
@@ -799,6 +799,26 @@ def test_live_lens_readout_step_reads_latest_slices() -> None:
         assert spread >= 0.0
 
 
+def test_jlens_row_selector_avoids_copy_for_identity_and_contiguous_rows() -> None:
+    tensor = torch.arange(24, dtype=torch.float32).reshape(4, 6)
+
+    identity = SaklasSession._select_tensor_rows(tensor, [0, 1, 2, 3])
+    contiguous = SaklasSession._select_tensor_rows(tensor, [1, 2])
+    gathered = SaklasSession._select_tensor_rows(tensor, [0, 2])
+
+    assert identity is tensor
+    assert contiguous.tolist() == tensor[1:3].tolist()
+    assert (
+        contiguous.untyped_storage().data_ptr()
+        == tensor.untyped_storage().data_ptr()
+    )
+    assert gathered.tolist() == tensor[[0, 2]].tolist()
+    assert (
+        gathered.untyped_storage().data_ptr()
+        != tensor.untyped_storage().data_ptr()
+    )
+
+
 def test_live_lens_step_normalizes_once_across_all_consumers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -826,6 +846,34 @@ def test_live_lens_step_normalizes_once_across_all_consumers(
     assert s._score_lens_gate_scalars()
     assert SaklasSession._live_lens_readout_step(s) is not None  # type: ignore[arg-type]
     assert calls == 1
+
+
+def test_live_lens_exact_stash_reuse_skips_hidden_cast() -> None:
+    class BombHidden:
+        def to(self, *_args: Any, **_kwargs: Any) -> Any:
+            raise AssertionError("exact stash reuse should not cast hidden rows")
+
+    s = _StubSession()
+    s.fit_jlens(_PROMPTS)
+    s.enable_live_lens(layers=[1], top_k=3)
+    s._capture = _FakeCapture({1: cast(Any, BombHidden())})
+    assert s._live_lens is not None
+    vocab = int(s._model.lm_head.weight.shape[0])
+    logits = torch.randn(1, vocab, generator=torch.Generator().manual_seed(7))
+    import saklas.core.jlens as jlens_module
+
+    probabilities = jlens_module.readout_probabilities(logits)
+    s._lens_step_stash = {
+        "fresh": True,
+        "layers": (1,),
+        "logits": logits,
+        "probabilities": probabilities,
+    }
+
+    step = SaklasSession._live_lens_readout_step(s)  # type: ignore[arg-type]
+
+    assert step is not None
+    assert s._lens_step_stash["fresh"] is False
 
 
 def test_live_lens_reuses_gated_subset_rows_for_wider_display() -> None:

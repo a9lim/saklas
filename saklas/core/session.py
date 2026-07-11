@@ -2351,6 +2351,25 @@ class SaklasSession:
         denom = max(len(self._layers) - 1, 1)
         return [layer / denom for layer in layers]
 
+    @staticmethod
+    def _select_tensor_rows(
+        tensor: torch.Tensor,
+        rows: "Sequence[int]",
+    ) -> torch.Tensor:
+        """Select rows without copying when the request is identity/contiguous."""
+        row_list = [int(row) for row in rows]
+        if not row_list:
+            return tensor[:0]
+        if row_list == list(range(int(tensor.shape[0]))):
+            return tensor
+        start = row_list[0]
+        if row_list == list(range(start, start + len(row_list))):
+            return tensor[start:start + len(row_list)]
+        return tensor.index_select(
+            0,
+            torch.tensor(row_list, device=tensor.device, dtype=torch.long),
+        )
+
     def _jlens_logits_rows(
         self,
         lens: "Any",
@@ -2367,13 +2386,9 @@ class SaklasSession:
         unique_layers = sorted({layer for layer, _ in rows})
         J_unique = self._jlens_transport_stack(lens, unique_layers, device)
         layer_to_row = {layer: idx for idx, layer in enumerate(unique_layers)}
-        J_rows = J_unique.index_select(
-            0,
-            torch.tensor(
-                [layer_to_row[layer] for layer, _ in rows],
-                device=device,
-                dtype=torch.long,
-            ),
+        J_rows = SaklasSession._select_tensor_rows(
+            J_unique,
+            [layer_to_row[layer] for layer, _ in rows],
         )
         H = torch.stack([
             hidden.detach().to(torch.float32) for _, hidden in rows
@@ -2384,7 +2399,7 @@ class SaklasSession:
 
     def _jlens_aggregate_rows(
         self,
-        logits: torch.Tensor,
+        logits: torch.Tensor | None,
         layers: "Sequence[int]",
         *,
         top_k: int,
@@ -2399,6 +2414,8 @@ class SaklasSession:
         )
 
         if probabilities is None:
+            if logits is None:
+                raise ValueError("logits are required when probabilities are absent")
             rows = aggregate_readout(
                 logits.float(), self._jlens_depths(layers), top_k=top_k,
             )
@@ -2889,7 +2906,10 @@ class SaklasSession:
             if not bucket:
                 continue
             layers_present.append(layer)
-            hidden_rows.append(bucket[-1].to(torch.float32))
+            # Keep the raw bucket reference until after stash reuse is resolved:
+            # an exact gate+live cache hit never needs these hidden rows, so it
+            # should not pay a dtype/device conversion just to discard them.
+            hidden_rows.append(bucket[-1])
             transport_rows.append(layer_rows[layer])
         if not layers_present:
             return None
@@ -2935,30 +2955,36 @@ class SaklasSession:
             ]
             if missing:
                 J_stack: torch.Tensor = state["J_stack"]
-                rows = torch.tensor(
+                J = SaklasSession._select_tensor_rows(
+                    J_stack,
                     [row for _layer, _hidden, row in missing],
-                    device=J_stack.device,
-                    dtype=torch.long,
                 )
-                J = J_stack.index_select(0, rows)
                 H = torch.stack(
-                    [hidden for _layer, hidden, _row in missing], dim=0,
+                    [
+                        hidden.to(torch.float32)
+                        for _layer, hidden, _row in missing
+                    ],
+                    dim=0,
                 ).to(J.device)
                 transported = torch.bmm(J, H.unsqueeze(-1)).squeeze(-1)
                 normed = state["norm"](transported)
                 computed = normed.to(unembed.dtype) @ unembed.T
-                computed_logits = {
-                    layer: computed[row]
-                    for row, (layer, _hidden, _transport) in enumerate(missing)
-                }
-            logits = torch.stack(
-                [
-                    cached_logits[layer]
-                    if layer in cached_logits else computed_logits[layer]
-                    for layer in layers_present
-                ],
-                dim=0,
-            )
+                if not cached_logits and len(missing) == len(layers_present):
+                    logits = computed
+                else:
+                    computed_logits = {
+                        layer: computed[row]
+                        for row, (layer, _hidden, _transport) in enumerate(missing)
+                    }
+            if logits is None:
+                logits = torch.stack(
+                    [
+                        cached_logits[layer]
+                        if layer in cached_logits else computed_logits[layer]
+                        for layer in layers_present
+                    ],
+                    dim=0,
+                )
         from saklas.core.jlens import readout_probabilities
 
         if probabilities is None:
@@ -3012,11 +3038,12 @@ class SaklasSession:
         agg_sel = [
             row for row, layer in enumerate(layers_present) if layer in agg_keep
         ] or list(range(len(layers_present)))
+        agg_probabilities = SaklasSession._select_tensor_rows(probabilities, agg_sel)
         agg = self._jlens_aggregate_rows(
-            logits[agg_sel],
+            None,
             [layers_present[row] for row in agg_sel],
             top_k=state["top_k"],
-            probabilities=probabilities[agg_sel],
+            probabilities=agg_probabilities,
         )
         return out, agg
 
