@@ -40,6 +40,8 @@ class _ProbeGateScalarPlan:
     membership_key: str | None = None
     dist_requests: tuple[tuple[str, int], ...] = ()
     assign_requests: tuple[tuple[str, int], ...] = ()
+    dist_index: torch.Tensor | None = None
+    assign_index: torch.Tensor | None = None
 
 
 def _depth_stats(
@@ -827,20 +829,42 @@ class Monitor:
         if not (need_coords or need_fraction or need_membership or need_dist):
             return None
         label_to_idx = self._gate_scalar_label_index(probe)
+        dist_requests = tuple(
+            (key, label_to_idx[label])
+            for label, key in dist_labels.items()
+            if label in label_to_idx
+        )
+        assign_requests = tuple(
+            (key, label_to_idx[label])
+            for label, key in assign_labels.items()
+            if label in label_to_idx
+        )
+        plan_device = (
+            next(iter(probe.whitened.values())).node_white_aug.device
+            if probe.whitened else torch.device("cpu")
+        )
         return _ProbeGateScalarPlan(
             probe_name=name,
             coord_axes=tuple(sorted(coord_axes.items())),
             fraction_key=fraction_key,
             membership_key=membership_key,
-            dist_requests=tuple(
-                (key, label_to_idx[label])
-                for label, key in dist_labels.items()
-                if label in label_to_idx
+            dist_requests=dist_requests,
+            assign_requests=assign_requests,
+            dist_index=(
+                torch.tensor(
+                    [idx for _key, idx in dist_requests],
+                    device=plan_device,
+                    dtype=torch.long,
+                )
+                if dist_requests else None
             ),
-            assign_requests=tuple(
-                (key, label_to_idx[label])
-                for label, key in assign_labels.items()
-                if label in label_to_idx
+            assign_index=(
+                torch.tensor(
+                    [idx for _key, idx in assign_requests],
+                    device=plan_device,
+                    dtype=torch.long,
+                )
+                if assign_requests else None
             ),
         )
 
@@ -1022,10 +1046,10 @@ class Monitor:
             slots.append(("scalar", membership_key))
 
         if need_nearest and dist_requests and dist_acc_t is not None:
-            idx_t = torch.tensor(
-                [idx for _key, idx in dist_requests],
-                device=dist_acc_t.device,
-                dtype=torch.long,
+            idx_t = (
+                plan.dist_index.to(device=dist_acc_t.device, dtype=torch.long)
+                if plan.dist_index is not None
+                else torch.empty(0, device=dist_acc_t.device, dtype=torch.long)
             )
             parts.append(dist_acc_t.index_select(0, idx_t) / probe.label_scale)
             slots.append(("nearest_exact", [key for key, _idx in dist_requests]))
@@ -1045,10 +1069,10 @@ class Monitor:
                     + lvb
                 )
                 probs = torch.softmax(logits, dim=0)
-                idx_t = torch.tensor(
-                    [idx for _key, idx in assign_requests],
-                    device=probs.device,
-                    dtype=torch.long,
+                idx_t = (
+                    plan.assign_index.to(device=probs.device, dtype=torch.long)
+                    if plan.assign_index is not None
+                    else torch.empty(0, device=probs.device, dtype=torch.long)
                 )
                 parts.append(probs.index_select(0, idx_t))
                 slots.append(("assignment_exact", [key for key, _idx in assign_requests]))

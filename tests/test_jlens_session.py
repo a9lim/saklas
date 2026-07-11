@@ -46,11 +46,14 @@ class _StubSession:
     _resolve_jlens_layers = SaklasSession._resolve_jlens_layers
     _resolve_jlens_source_layers = SaklasSession._resolve_jlens_source_layers
     _jlens_transport_stack = SaklasSession._jlens_transport_stack
+    _jlens_readout_modules = SaklasSession._jlens_readout_modules
     _jlens_topk_rows = SaklasSession._jlens_topk_rows
     _jlens_logits_rows = SaklasSession._jlens_logits_rows
     _jlens_aggregate_rows = SaklasSession._jlens_aggregate_rows
     _jlens_decode_id = SaklasSession._jlens_decode_id
     _jlens_depths = SaklasSession._jlens_depths
+    _jlens_depth_tensor = SaklasSession._jlens_depth_tensor
+    _readout_long_tensor = SaklasSession._readout_long_tensor
     register_jlens_direction = SaklasSession.register_jlens_direction
     enable_live_lens = SaklasSession.enable_live_lens
     disable_live_lens = SaklasSession.disable_live_lens
@@ -75,6 +78,10 @@ class _StubSession:
         self._probe_hash_cache: dict[str, str] = {}
         self._lens_step_stash: Any = None
         self._last_lens_step_readings: Any = None
+        self._jlens_readout_module_cache: Any = None
+        self._jlens_depths_cache: dict[Any, list[float]] = {}
+        self._jlens_depth_tensor_cache: dict[Any, torch.Tensor] = {}
+        self._readout_long_tensor_cache: dict[Any, torch.Tensor] = {}
         self._monitor: Any = None
         self.model_id = _MODEL_ID
 
@@ -830,22 +837,70 @@ def test_live_lens_step_normalizes_once_across_all_consumers(
     s._add_lens_probe("jlens/g", as_name=None)
     s._capture = _FakeCapture({1: torch.randn(6)})
     calls = 0
+    stat_calls = 0
     original = jlens_module.readout_probabilities
+    original_stats = jlens_module.token_readout_stats_from_probabilities
 
     def counting_probabilities(logits: torch.Tensor) -> torch.Tensor:
         nonlocal calls
         calls += 1
         return original(logits)
 
+    def counting_stats(*args: Any, **kwargs: Any) -> Any:
+        nonlocal stat_calls
+        stat_calls += 1
+        return original_stats(*args, **kwargs)
+
     monkeypatch.setattr(
         jlens_module, "readout_probabilities", counting_probabilities,
+    )
+    monkeypatch.setattr(
+        jlens_module,
+        "token_readout_stats_from_probabilities",
+        counting_stats,
     )
 
     # A gated pinned probe calibrates before the token tap and stashes the
     # matrix. Cards, pinned readings, and aggregate must all reuse it.
-    assert s._score_lens_gate_scalars()
+    scalars = s._score_lens_gate_scalars()
+    assert scalars
     assert SaklasSession._live_lens_readout_step(s) is not None  # type: ignore[arg-type]
     assert calls == 1
+    assert stat_calls == 1
+    assert s._last_lens_step_readings is not None
+    assert s._last_lens_step_readings["jlens/g"].coords[0] == pytest.approx(
+        scalars["jlens/g"],
+    )
+
+
+def test_live_lens_readout_reuses_depth_and_token_selector_tensors() -> None:
+    s = _StubSession()
+    s.fit_jlens(_PROMPTS)
+    s.enable_live_lens(layers=[0, 1], top_k=3)
+    s._add_lens_probe("jlens/g", as_name=None)
+    s._capture = _FakeCapture({
+        0: torch.randn(6, generator=torch.Generator().manual_seed(20)),
+        1: torch.randn(6, generator=torch.Generator().manual_seed(21)),
+    })
+
+    assert s._score_lens_gate_scalars({"jlens/g"})
+    first_depth_ids = {
+        key: id(value) for key, value in s._jlens_depth_tensor_cache.items()
+    }
+    first_selector_ids = {
+        key: id(value) for key, value in s._readout_long_tensor_cache.items()
+    }
+    assert first_depth_ids
+    assert first_selector_ids
+
+    assert s._score_lens_gate_scalars({"jlens/g"})
+
+    assert {
+        key: id(value) for key, value in s._jlens_depth_tensor_cache.items()
+    } == first_depth_ids
+    assert {
+        key: id(value) for key, value in s._readout_long_tensor_cache.items()
+    } == first_selector_ids
 
 
 def test_live_lens_exact_stash_reuse_skips_hidden_cast() -> None:

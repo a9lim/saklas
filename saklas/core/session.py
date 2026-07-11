@@ -1252,6 +1252,16 @@ class SaklasSession:
         self._whitener: Any = None
         self._jlens: Any = None  # lazy per-model Jacobian lens (io/lens.py)
         self._jlens_device_cache: dict[tuple[int, str, tuple[int, ...]], torch.Tensor] = {}
+        self._jlens_readout_module_cache: (
+            tuple[torch.Tensor, torch.nn.Module] | None
+        ) = None
+        self._jlens_depths_cache: dict[tuple[int, ...], list[float]] = {}
+        self._jlens_depth_tensor_cache: dict[
+            tuple[str, tuple[int, ...]], torch.Tensor
+        ] = {}
+        self._readout_long_tensor_cache: dict[
+            tuple[str, tuple[int, ...]], torch.Tensor
+        ] = {}
         self._jlens_decode_cache: dict[int, str] = {}
         # Live workspace readout (enable_live_lens): device-resident J_l
         # subset + settings, or None when off.
@@ -2330,6 +2340,17 @@ class SaklasSession:
         cache[key] = stack
         return stack
 
+    def _jlens_readout_modules(self) -> tuple[torch.Tensor, torch.nn.Module]:
+        """Final unembedding + norm modules for J-lens readout logits."""
+        cached = getattr(self, "_jlens_readout_module_cache", None)
+        if cached is not None:
+            return cached
+        from saklas.core.model import get_final_norm, get_unembedding
+
+        modules = (get_unembedding(self._model), get_final_norm(self._model))
+        self._jlens_readout_module_cache = modules
+        return modules
+
     def _jlens_decode_id(self, token_id: int) -> str:
         """Cache-backed single-token decode shared by every lens readout."""
         decode_cache = cast(
@@ -2348,8 +2369,59 @@ class SaklasSession:
         """Normalized layer depths (``layer / (n_layers − 1)``, 0 = first
         block, 1 = last) — the depth axis of the aggregate readout's
         center-of-mass statistic."""
+        layer_tuple = tuple(int(layer) for layer in layers)
+        cache = getattr(self, "_jlens_depths_cache", None)
+        if cache is None:
+            cache = {}
+            self._jlens_depths_cache = cache
+        cached = cache.get(layer_tuple)
+        if cached is not None:
+            return cached
         denom = max(len(self._layers) - 1, 1)
-        return [layer / denom for layer in layers]
+        depths = [layer / denom for layer in layer_tuple]
+        cache[layer_tuple] = depths
+        return depths
+
+    def _jlens_depth_tensor(
+        self,
+        layers: "Sequence[int]",
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Device depth column for a fixed layer set, cached across decode steps."""
+        cache = getattr(self, "_jlens_depth_tensor_cache", None)
+        if cache is None:
+            cache = {}
+            self._jlens_depth_tensor_cache = cache
+        layer_tuple = tuple(int(layer) for layer in layers)
+        key = (str(device), layer_tuple)
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
+        depths = self._jlens_depths(layer_tuple)
+        tensor = torch.tensor(
+            depths, dtype=torch.float32, device=device,
+        ).reshape(len(depths), 1)
+        cache[key] = tensor
+        return tensor
+
+    def _readout_long_tensor(
+        self,
+        values: "Sequence[int]",
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Device long selector tensor cached by value tuple and device."""
+        cache = getattr(self, "_readout_long_tensor_cache", None)
+        if cache is None:
+            cache = {}
+            self._readout_long_tensor_cache = cache
+        value_tuple = tuple(int(value) for value in values)
+        key = (str(device), value_tuple)
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
+        tensor = torch.tensor(value_tuple, dtype=torch.long, device=device)
+        cache[key] = tensor
+        return tensor
 
     @staticmethod
     def _select_tensor_rows(
@@ -2379,9 +2451,7 @@ class SaklasSession:
         ``(layer, hidden_row)`` pairs — the shared front half of the
         per-layer top-k and the layer-aggregated readout (one bmm + one
         unembed matvec serves both)."""
-        from saklas.core.model import get_final_norm, get_unembedding
-
-        unembed = get_unembedding(self._model)
+        unembed, final_norm = self._jlens_readout_modules()
         device = unembed.device
         unique_layers = sorted({layer for layer, _ in rows})
         J_unique = self._jlens_transport_stack(lens, unique_layers, device)
@@ -2394,7 +2464,7 @@ class SaklasSession:
             hidden.detach().to(torch.float32) for _, hidden in rows
         ]).to(device)
         transported = torch.bmm(J_rows, H.unsqueeze(-1)).squeeze(-1)
-        normed = get_final_norm(self._model)(transported)
+        normed = final_norm(transported)
         return normed.to(unembed.dtype) @ unembed.T
 
     def _jlens_aggregate_rows(
@@ -2416,12 +2486,20 @@ class SaklasSession:
         if probabilities is None:
             if logits is None:
                 raise ValueError("logits are required when probabilities are absent")
+            depth_tensor = self._jlens_depth_tensor(layers, logits.device)
             rows = aggregate_readout(
-                logits.float(), self._jlens_depths(layers), top_k=top_k,
+                logits.float(),
+                self._jlens_depths(layers),
+                top_k=top_k,
+                depth_tensor=depth_tensor,
             )
         else:
+            depth_tensor = self._jlens_depth_tensor(layers, probabilities.device)
             rows = aggregate_readout_from_probabilities(
-                probabilities, self._jlens_depths(layers), top_k=top_k,
+                probabilities,
+                self._jlens_depths(layers),
+                top_k=top_k,
+                depth_tensor=depth_tensor,
             )
         return [
             (self._jlens_decode_id(token_id), strength, com, spread)
@@ -3014,11 +3092,29 @@ class SaklasSession:
                     [probability_rows[layer] for layer in layers_present], dim=0,
                 )
         # Pinned lens probes ride the same calibrated matrix — per-step
-        # readout-channel readings for the payload merge.
+        # readout-channel readings for the payload merge.  A gate callback
+        # may already have computed the same readings from these exact rows;
+        # reuse them to avoid a second selected-token host sync on the
+        # pinned+gated+live path.
         if getattr(self, "_lens_probes", None):
-            self._last_lens_step_readings = self._score_lens_probes(
-                {}, probabilities=probabilities, layers=list(layers_present),
-            )
+            readings_reused = False
+            if stash is not None and stash.get("readings_fresh"):
+                reading_layers = tuple(
+                    int(layer) for layer in (stash.get("readings_layers") or ())
+                )
+                if reading_layers == tuple(layers_present):
+                    self._last_lens_step_readings = cast(
+                        "dict[str, ProbeReading]",
+                        stash.get("readings") or {},
+                    )
+                    stash["readings_fresh"] = False
+                    readings_reused = True
+                elif reading_layers:
+                    stash["readings_fresh"] = False
+            if not readings_reused:
+                self._last_lens_step_readings = self._score_lens_probes(
+                    {}, probabilities=probabilities, layers=list(layers_present),
+                )
         else:
             self._last_lens_step_readings = None
         # Display scores are per-layer softmax probabilities — the one
@@ -3026,8 +3122,8 @@ class SaklasSession:
         # the top-k selection is unchanged from the raw-logit ranking).
         vals, idxs = probabilities.topk(state["top_k"], dim=-1)
         # one batched host transfer for the per-layer block
-        all_vals = vals.cpu()
-        all_idxs = idxs.cpu()
+        all_vals = vals.detach().to("cpu").tolist()
+        all_idxs = idxs.detach().to("cpu").tolist()
         out: dict[int, list[tuple[str, float]]] = {}
         for row, layer in enumerate(layers_present):
             pairs: list[tuple[str, float]] = []
@@ -3445,9 +3541,7 @@ class SaklasSession:
             if fid not in raw_values_by_fid
         ]
         if missing_fids:
-            fid_tensor = torch.tensor(
-                missing_fids, device=activations.device, dtype=torch.long,
-            )
+            fid_tensor = self._readout_long_tensor(missing_fids, activations.device)
             # One host transfer for every not-already-read pinned SAE probe
             # value.  Live readout top-k rows seed ``raw_by_fid`` first, so
             # pinned cards that came from the visible top-k avoid a second
@@ -3496,11 +3590,19 @@ class SaklasSession:
         if layer not in latest:
             return {}
         acts = self._encode_sae_hidden(latest[layer])
-        self._sae_step_stash = {"activations": acts, "fresh": True}
         scalars: dict[str, float] = {}
-        for name, _fid, _raw_value, value in self._sae_probe_values(
+        values = self._sae_probe_values(
             acts, only=only,
-        ):
+        )
+        self._sae_step_stash = {
+            "activations": acts,
+            "fresh": True,
+            "raw_by_fid": {
+                int(fid): float(raw_value)
+                for _name, fid, raw_value, _value in values
+            },
+        }
+        for name, _fid, _raw_value, value in values:
             scalars[name] = value
             scalars[f"{name}[0]"] = value
             scalars[f"{name}:fraction"] = 0.0
@@ -3518,18 +3620,25 @@ class SaklasSession:
         if not buckets.get(layer):
             return None
         stash = self._sae_step_stash
+        stashed_raw_by_fid: dict[int, float] = {}
         if stash is not None and stash.get("fresh"):
             stash["fresh"] = False
             acts = stash["activations"]
+            stashed_raw_by_fid = {
+                int(fid): float(value)
+                for fid, value in (stash.get("raw_by_fid") or {}).items()
+            }
         else:
             acts = self._encode_sae_hidden(buckets[layer][-1])
         k = min(int(state["top_k"]), int(acts.numel()))
         values, indices = torch.topk(acts, k=k)
-        value_list = [float(v) for v in values.detach().to("cpu").tolist()]
-        id_list = [int(i) for i in indices.detach().to("cpu").tolist()]
+        value_list = values.detach().to("cpu").tolist()
+        id_list = indices.detach().to("cpu").tolist()
         raw_by_fid = {
             fid: value for fid, value in zip(id_list, value_list, strict=True)
         }
+        if stashed_raw_by_fid:
+            raw_by_fid = {**stashed_raw_by_fid, **raw_by_fid}
         if self._sae_probes:
             self._last_sae_step_readings = self._score_sae_probes(
                 activations=acts,
@@ -4975,7 +5084,9 @@ class SaklasSession:
                 if gate_only_no_final and gating_only_probes is not None
                 else None
             )
-            union: set[int] = self._monitor.probe_layers(gate_probe_names)
+            union: set[int] = set()
+            if self._monitor.probe_names and (need_per_token or final_probe_aggregate):
+                union.update(self._monitor.probe_layers(gate_probe_names))
             if live_lens is not None:
                 # The live workspace readout consumes the same latest-slice
                 # buffers the monitor does — its layers join the capture set.
@@ -5707,14 +5818,29 @@ class SaklasSession:
         if not names:
             return {}
         token_ids = [self._lens_probes[n]["token_id"] for n in names]
+        prob_device = (
+            probabilities.device
+            if probabilities is not None
+            else cast(torch.Tensor, logits).device
+        )
+        token_ids_tensor = self._readout_long_tensor(token_ids, prob_device)
+        depth_tensor = self._jlens_depth_tensor(layers, prob_device)
         if probabilities is None:
             assert logits is not None
             stats = token_readout_stats(
-                logits, self._jlens_depths(layers), token_ids,
+                logits,
+                self._jlens_depths(layers),
+                token_ids,
+                token_ids_tensor=token_ids_tensor,
+                depth_tensor=depth_tensor,
             )
         else:
             stats = token_readout_stats_from_probabilities(
-                probabilities, self._jlens_depths(layers), token_ids,
+                probabilities,
+                self._jlens_depths(layers),
+                token_ids,
+                token_ids_tensor=token_ids_tensor,
+                depth_tensor=depth_tensor,
             )
         out: dict[str, ProbeReading] = {}
         for name, (strength, com, spread, per_layer) in zip(names, stats):
@@ -5762,7 +5888,16 @@ class SaklasSession:
             }
             if not only:
                 return {}
-        band = self._lens_probe_layers(only)
+        live_display_needs_full_probs = bool(
+            getattr(self, "_live_lens", None) is not None
+            and getattr(self, "_live_lens_active_for_generation", True)
+        )
+        # When the token tap will immediately need every pinned probe reading
+        # for the live payload, compute that superset once in the gate
+        # callback and let the display reuse it.  Gate-only calls stay on the
+        # narrower requested subset.
+        probe_read_only = None if live_display_needs_full_probs else only
+        band = self._lens_probe_layers(probe_read_only)
         layers = sorted(l for l in band if l in latest)
         if not layers:
             return {}
@@ -5771,20 +5906,17 @@ class SaklasSession:
             lens, [(l, latest[l]) for l in layers],
         )
         probabilities = None
-        live_display_needs_full_probs = bool(
-            getattr(self, "_live_lens", None) is not None
-            and getattr(self, "_live_lens_active_for_generation", True)
-        )
         if live_display_needs_full_probs:
             from saklas.core.jlens import readout_probabilities
 
             probabilities = readout_probabilities(logits)
-            self._lens_step_stash = {
+            live_stash: dict[str, Any] = {
                 "layers": tuple(layers),
                 "logits": logits,
                 "probabilities": probabilities,
                 "fresh": True,
             }
+            self._lens_step_stash = live_stash
         else:
             self._lens_step_stash = {
                 "layers": tuple(layers),
@@ -5793,13 +5925,25 @@ class SaklasSession:
             }
         if probabilities is not None:
             readings = self._score_lens_probes(
-                {}, probabilities=probabilities, layers=layers, only=only,
+                {},
+                probabilities=probabilities,
+                layers=layers,
+                only=probe_read_only,
             )
+            live_stash = cast("dict[str, Any]", self._lens_step_stash)
+            live_stash["readings"] = readings
+            live_stash["readings_layers"] = tuple(layers)
+            live_stash["readings_fresh"] = True
+            self._last_lens_step_readings = readings
         else:
             readings = self._score_lens_probes(
-                {}, logits=logits, layers=layers, only=only,
+                {}, logits=logits, layers=layers, only=probe_read_only,
             )
-        return Monitor.flat_scalars(readings)
+        if only is None:
+            return Monitor.flat_scalars(readings)
+        return Monitor.flat_scalars({
+            name: reading for name, reading in readings.items() if name in only
+        })
 
     def _score_lens_probes_aggregate(
         self, generated_ids: list[int],

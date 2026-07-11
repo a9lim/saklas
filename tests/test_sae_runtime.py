@@ -192,6 +192,64 @@ def test_sae_gate_scalar_and_live_step_share_one_encoder_result() -> None:
     assert session._last_sae_step_readings["sae/2"].coords == pytest.approx((0.5,))
 
 
+def test_sae_gate_raw_values_seed_live_probe_reads_outside_topk() -> None:
+    session = _session()
+    session._sae_probes["sae/0"] = {
+        "feature_id": 0, "layer": 1, "label": None, "max_act": None,
+    }
+    session.enable_live_sae(top_k=1)  # feature 2 wins; gated feature 0 is outside top-k.
+    seen_raw: dict[int, float] = {}
+    original = session._sae_probe_values
+
+    def spy_probe_values(
+        activations: torch.Tensor,
+        *,
+        only: set[str] | None = None,
+        raw_by_fid: dict[int, float] | None = None,
+    ) -> list[tuple[str, int, float, float]]:
+        del only
+        seen_raw.update(raw_by_fid or {})
+        return original(activations, raw_by_fid=raw_by_fid)
+
+    session._sae_probe_values = spy_probe_values  # type: ignore[method-assign]
+
+    scalars = session._score_sae_gate_scalars({"sae/0"})
+    readout = session._live_sae_readout_step()
+
+    assert scalars["sae/0"] == pytest.approx(0.2)
+    assert readout is not None
+    assert seen_raw[0] == pytest.approx(0.2)
+    assert session._last_sae_step_readings is not None
+    assert session._last_sae_step_readings["sae/0"].coords == pytest.approx((0.2,))
+
+
+def test_sae_probe_values_reuse_feature_selector_tensor() -> None:
+    session = _session()
+    session._sae_probes["sae/1"] = {
+        "feature_id": 1, "layer": 1, "label": None, "max_act": None,
+    }
+    session._sae_probes["sae/2"] = {
+        "feature_id": 2, "layer": 1, "label": "feature two", "max_act": 10.0,
+    }
+    latest = session._capture.latest_per_layer()
+    acts = session._encode_sae_hidden(latest[1])
+
+    first = session._score_sae_probes(activations=acts)
+    first_ids = {
+        key: id(value)
+        for key, value in session._readout_long_tensor_cache.items()
+    }
+    second = session._score_sae_probes(activations=acts)
+
+    assert first["sae/1"].coords == second["sae/1"].coords
+    assert first["sae/2"].coords == second["sae/2"].coords
+    assert first_ids
+    assert {
+        key: id(value)
+        for key, value in session._readout_long_tensor_cache.items()
+    } == first_ids
+
+
 def test_sae_gate_scalar_is_normalized_when_metadata_known() -> None:
     session = _session()
     session._sae_probes["sae/2"] = {

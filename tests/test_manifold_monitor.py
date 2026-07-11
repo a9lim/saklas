@@ -577,6 +577,8 @@ def test_planned_gate_scalars_match_public_and_full_reading():
     full = mon.flat_scalars(mon.score_single_token(hidden))
 
     assert len(plan) == 1
+    assert plan[0].dist_index is not None
+    assert plan[0].assign_index is not None
     assert "curve@missing" not in planned
     assert "curve~missing" not in planned
     assert planned == pytest.approx(public)

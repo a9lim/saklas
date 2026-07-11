@@ -1355,6 +1355,101 @@ def test_sae_gate_without_final_aggregate_attaches_sae_layer() -> None:
     assert capture.aggregate_depth == 1
 
 
+def test_monitor_probe_without_final_aggregate_and_no_per_token_skips_capture() -> None:
+    class Capture:
+        def __init__(self) -> None:
+            self.attached: list[int] | None = None
+
+        def attach(self, *_args: Any, **_kwargs: Any) -> None:
+            raise AssertionError("dormant monitor probes should not attach capture")
+
+    class Monitor:
+        probe_names = ["monitor"]
+
+        def probe_layers(self, _names: set[str] | None = None) -> set[int]:
+            raise AssertionError("dormant monitor probes should not widen capture")
+
+    capture = Capture()
+    session: Any = SaklasSession.__new__(SaklasSession)
+    session._layers = [object()] * 8
+    session._monitor = Monitor()
+    session._capture = capture
+    session._live_lens = None
+    session._lens_probes = {}
+    session._live_sae = None
+    session._sae_probes = {}
+    session._sae_layer = None
+
+    attached = SaklasSession._begin_capture(
+        session,
+        need_per_token=False,
+        final_probe_aggregate=False,
+    )
+
+    assert attached is False
+    assert capture.attached is None
+    assert session._capture_state.final_probe_aggregate is False
+
+
+def test_monitor_probe_final_aggregate_still_attaches_capture() -> None:
+    class Capture:
+        def __init__(self) -> None:
+            self.attached: list[int] | None = None
+            self.aggregate_depth: int | None = None
+
+        def clear(self) -> None:
+            pass
+
+        def attach(self, _layers: Any, layer_idxs: list[int]) -> None:
+            self.attached = list(layer_idxs)
+
+        def set_aggregate_tail(self, depth: int) -> None:
+            self.aggregate_depth = depth
+
+    class Monitor:
+        probe_names = ["monitor"]
+
+        def __init__(self) -> None:
+            self.layer_query: set[str] | None = None
+            self.warm_enabled: bool | None = None
+
+        def probe_layers(self, names: set[str] | None = None) -> set[int]:
+            self.layer_query = names
+            return {2, 4}
+
+        def enable_curved_warm(self, enabled: bool) -> None:
+            self.warm_enabled = enabled
+
+    capture = Capture()
+    monitor = Monitor()
+    session: Any = SaklasSession.__new__(SaklasSession)
+    session._layers = [object()] * 8
+    session._monitor = monitor
+    session._capture = capture
+    session._capture_buffers = {}
+    session._compiled_clean_eligible = False
+    session._steering_uses_compiled_offsets = False
+    session._live_lens = None
+    session._lens_probes = {}
+    session._live_sae = None
+    session._sae_probes = {}
+    session._sae_layer = None
+    session._steering = SimpleNamespace(all_fast_path=lambda: True)
+
+    attached = SaklasSession._begin_capture(
+        session,
+        need_per_token=False,
+        final_probe_aggregate=True,
+    )
+
+    assert attached is True
+    assert monitor.layer_query is None
+    assert capture.attached == [2, 4]
+    assert capture.aggregate_depth is not None and capture.aggregate_depth > 1
+    assert session._capture_state.mode is CaptureMode.AGGREGATE_ONLY
+    assert monitor.warm_enabled is False
+
+
 def test_gate_only_without_final_probe_aggregate_narrows_capture_layers() -> None:
     class Capture:
         def __init__(self) -> None:
