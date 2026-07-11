@@ -6,7 +6,7 @@
   // uniformly and branches only on *presentation*.
   //
   //   statline : ●/◆ attached marker (click to detach) · name · @com
-  //              ±spread · sparkline · highlight · inspect
+  //              ±spread · inspect · highlight · sparkline
   //   body     : the subspaceness row (white 0→1 bar segmented into
   //                intrinsic-dim notches · nearest node · fraction), then
   //                one signed bar per coordinate axis (poles on a rank-1
@@ -209,15 +209,13 @@
 
     <span class="spacer"></span>
 
-    <!-- Curved (fraction) probes are [0,1]-bounded → cap the sparkline at 1;
-         flat (signed) probes auto-scale.  Trace wears the pillar hue. -->
-    <Sparkline
-      points={sparkline}
-      width={56}
-      height={14}
-      cap={affine ? undefined : 1}
-      color="var(--card-accent)"
-    />
+    <button
+      type="button"
+      class="icon inspect"
+      aria-label="Inspect probe {name}"
+      title="Open probe inspector"
+      onclick={onInspect}
+    >ⓘ</button>
 
     <button
       type="button"
@@ -231,13 +229,15 @@
       onclick={toggleHighlight}
     >{isHighlight ? "highlighted" : "highlight"}</button>
 
-    <button
-      type="button"
-      class="icon inspect"
-      aria-label="Inspect probe {name}"
-      title="Open probe inspector"
-      onclick={onInspect}
-    >ⓘ</button>
+    <!-- Curved (fraction) probes are [0,1]-bounded → cap the sparkline at 1;
+         flat (signed) probes auto-scale.  Trace wears the pillar hue. -->
+    <Sparkline
+      points={sparkline}
+      width={56}
+      height={14}
+      cap={affine ? undefined : 1}
+      color="var(--card-accent)"
+    />
 
   {/snippet}
 
