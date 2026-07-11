@@ -9,12 +9,12 @@
   // either turn.tokens[tokenIdx] (response stream, default) or
   // turn.thinkingTokens[tokenIdx] when isThinking is true.
   //
-  // Layout: header with the token text + coordinates, body grid with
-  // sortable layer (rows ascending) × probe (cols A-Z) cells.  Each cell
-  // is a HeatmapCell tinted via tokens.scoreToRgb so highlight saturation
-  // matches the chat tokens themselves.  Sticky labels keep orientation
-  // when the grid scrolls.  A/B mode adds a steered/unsteered toggle when
-  // turn.abPair exists.
+  // Layout: header with the token text + coordinates + position scrubber,
+  // a toolbar with the view tabs (probes / logits / j-lens; only the lens
+  // carries a hue dot — it is the one pillar-owned surface here) and the
+  // steered/unsteered branch toggle, then the per-tab body.  Heatmap cells
+  // tint via tokens.scoreToRgb so highlight saturation matches the chat
+  // tokens themselves; the j-lens matrix tints in the lens family blue.
 
   import {
     drawerState,
@@ -31,10 +31,11 @@
   import type {
     ChatTurn,
     LensTokenReadoutJSON,
-    TokenAltJSON,
     TokenScore,
   } from "../lib/types";
   import HeatmapCell from "../lib/charts/HeatmapCell.svelte";
+  import SegmentedTabs from "../lib/ui/SegmentedTabs.svelte";
+  import Button from "../lib/ui/Button.svelte";
 
   interface DrawerParams {
     turnIdx: number;
@@ -84,6 +85,11 @@
   let branch: Branch = $state<Branch>("primary");
   let branchingRank: number | null = $state(null);
   let branchError: string | null = $state(null);
+
+  const BRANCH_ITEMS: Array<{ value: Branch; label: string; title: string }> = [
+    { value: "primary", label: "steered", title: "The steered (primary) turn" },
+    { value: "shadow", label: "unsteered", title: "The unsteered A/B shadow turn" },
+  ];
 
   /** Reset the branch when the click target changes — opening the drawer
    * on a new token should always start on the primary side. */
@@ -193,6 +199,17 @@
 
   type Tab = "probes" | "logits" | "lens";
   let tab: Tab = $state<Tab>("probes");
+
+  const TAB_ITEMS: Array<{ value: Tab; label: string; color?: string; title: string }> = [
+    { value: "probes", label: "probes", title: "Per-layer × per-probe readings" },
+    { value: "logits", label: "logits", title: "Ranked top-K alternatives at this position" },
+    {
+      value: "lens",
+      label: "j-lens",
+      color: "var(--pillar-lens)",
+      title: "Workspace readout — what each layer was disposed to say",
+    },
+  ];
 
   /** Reset to probes tab when the CLICK target changes (scrubbing keeps
    *  the tab).  Drilldown stays on whatever tab the user had open within
@@ -386,7 +403,7 @@
   function lensCellStyle(logprob: number): string {
     const p = Math.min(1, Math.exp(logprob));
     const pct = Math.round(p * 60);
-    return `background: color-mix(in srgb, var(--accent-blue) ${pct}%, transparent);`;
+    return `background: color-mix(in srgb, var(--pillar-lens) ${pct}%, transparent);`;
   }
 
   function lensCellTitle(layer: number, t: { token: string; logprob: number }): string {
@@ -458,11 +475,13 @@
 >
   <header class="drawer-header">
     <div class="title">
+      <span class="eyebrow">token drilldown</span>
       {#if token}
-        <span class="label">token</span>
-        <code class="tok-text">{JSON.stringify(token.text)}</code>
-        <span class="coord">
-          turn {turnIdx} · {isThinking ? "thinking" : "response"} token
+        <div class="name-row">
+          <code class="tok-text">{JSON.stringify(token.text)}</code>
+          <span class="coord">
+            turn {turnIdx} · {isThinking ? "thinking" : "response"}
+          </span>
           <span class="scrub" title="Walk the inspected token along this turn (← / →); every tab follows">
             <button
               type="button"
@@ -479,19 +498,20 @@
               onclick={() => scrubTo(tokenIdx + 1)}
               aria-label="Next token"
             >▶</button>
+            {#if scrubTokenIdx !== null}
+              <button
+                type="button"
+                class="scrub-btn scrub-home"
+                onclick={() => (scrubTokenIdx = null)}
+                title="Snap back to the clicked token"
+              >↩ clicked</button>
+            {/if}
           </span>
-          {#if scrubTokenIdx !== null}
-            <button
-              type="button"
-              class="scrub-btn scrub-home"
-              onclick={() => (scrubTokenIdx = null)}
-              title="Snap back to the clicked token"
-            >↩ clicked</button>
-          {/if}
-        </span>
+        </div>
       {:else}
-        <span class="label">token</span>
-        <span class="coord">no token at ({turnIdx}, {tokenIdx})</span>
+        <div class="name-row">
+          <span class="coord">no token at ({turnIdx}, {tokenIdx})</span>
+        </div>
       {/if}
     </div>
     <button type="button" class="close" onclick={onClose} aria-label="Close drawer">
@@ -499,50 +519,14 @@
     </button>
   </header>
 
-  {#if hasAbPair}
-    <div class="branch-toggle" role="tablist" aria-label="Select branch">
-      <button
-        type="button"
-        role="tab"
-        aria-selected={branch === "primary"}
-        class:active={branch === "primary"}
-        onclick={() => (branch = "primary")}
-      >steered</button>
-      <button
-        type="button"
-        role="tab"
-        aria-selected={branch === "shadow"}
-        class:active={branch === "shadow"}
-        onclick={() => (branch = "shadow")}
-      >unsteered</button>
-    </div>
-  {/if}
-
-  <!-- View tabs: per-layer × per-probe heatmap (existing) vs. ranked
-       top-K alts (logit-pass).  Tabs always render so users see the
-       second view exists even when alts capture is off. -->
-  <div class="tab-strip" role="tablist" aria-label="Drilldown view">
-    <button
-      type="button"
-      role="tab"
-      aria-selected={tab === "probes"}
-      class:active={tab === "probes"}
-      onclick={() => (tab = "probes")}
-    >probes (per-layer)</button>
-    <button
-      type="button"
-      role="tab"
-      aria-selected={tab === "logits"}
-      class:active={tab === "logits"}
-      onclick={() => (tab = "logits")}
-    >logits</button>
-    <button
-      type="button"
-      role="tab"
-      aria-selected={tab === "lens"}
-      class:active={tab === "lens"}
-      onclick={() => (tab = "lens")}
-    >j-lens</button>
+  <!-- View tabs (probes / logits / j-lens) + the steered/unsteered branch
+       toggle when this turn has an A/B pair.  Tabs always render so users
+       see the other views exist even when their capture is off. -->
+  <div class="toolbar">
+    <SegmentedTabs items={TAB_ITEMS} bind:value={tab} />
+    {#if hasAbPair}
+      <SegmentedTabs items={BRANCH_ITEMS} bind:value={branch} />
+    {/if}
   </div>
 
   <div class="body">
@@ -596,9 +580,9 @@
       <!-- Logits tab.  Three states: ranked rows present, alts captured
            but empty (degenerate / stop token), nothing captured at all. -->
       {#if rankRows.length > 0}
-        <div class="logits-summary">
+        <div class="tab-summary">
           <div>
-            chosen: <code class="tok-text">{JSON.stringify(token.text)}</code>
+            chosen: <code class="tok-inline">{JSON.stringify(token.text)}</code>
             <span class="kv">
               logprob = <strong>{fmtLogprob(token.logprob)}</strong>
             </span>
@@ -636,15 +620,14 @@
                   <td class="num">{fmtProb(row.p)}</td>
                   <td class="num">{fmtDelta(row.delta, row.rank)}</td>
                   <td class="num">
-                    <button
-                      type="button"
-                      class="mini"
+                    <Button
+                      size="sm"
                       disabled={row.chosen || branchingRank !== null}
                       onclick={() => branchFromAlt(row)}
                       title="Fork a sibling branch: swap in this token and resample the continuation"
                     >
                       {branchingRank === row.rank ? "…" : "fork"}
-                    </button>
+                    </Button>
                   </td>
                 </tr>
               {/each}
@@ -662,16 +645,14 @@
             alternatives were requested for this generation.
           </p>
           <p>
-            <button
-              type="button"
-              class="link-btn"
+            <Button
               onclick={enableAlts}
               disabled={samplingState.return_top_k > 0}
             >
               {samplingState.return_top_k > 0
                 ? "alts on (effective next gen)"
                 : "enable alts (next generation)"}
-            </button>
+            </Button>
           </p>
         </div>
       {:else}
@@ -682,16 +663,14 @@
             live for the run.
           </p>
           <p>
-            <button
-              type="button"
-              class="link-btn"
+            <Button
               onclick={enableAlts}
               disabled={samplingState.return_top_k > 0}
             >
               {samplingState.return_top_k > 0
                 ? "alts on (effective next gen)"
                 : "enable alts (next generation)"}
-            </button>
+            </Button>
           </p>
         </div>
       {/if}
@@ -733,9 +712,9 @@
           <p>Workspace readout failed: {lensError}</p>
         </div>
       {:else if lensData}
-        <div class="logits-summary">
+        <div class="tab-summary">
           <div>
-            produced: <code class="tok-text">{JSON.stringify(lensData.token_text)}</code>
+            produced: <code class="tok-inline">{JSON.stringify(lensData.token_text)}</code>
             {#if lensData.steering !== null}
               <span class="kv steer-chip" title="The replay ran under the node's recipe steering">
                 steered: <code>{lensData.steering}</code>
@@ -832,44 +811,56 @@
 </aside>
 
 <style>
+  /* v2 sheet interior — the host paints the sheet surface (glass hairline,
+   * radius, --bg-alt fill), so the root is transparent; chrome speaks sans
+   * and every value/token/expression sits in mono. */
   .drawer {
     display: flex;
     flex-direction: column;
     height: 100%;
     min-height: 0;
-    background: var(--bg);
+    background: transparent;
     color: var(--fg);
-    font-family: var(--font-mono);
+    font-family: var(--font-ui);
     font-size: var(--text);
-    border-left: 1px solid var(--border);
   }
 
   .drawer-header {
     display: flex;
     align-items: flex-start;
     justify-content: space-between;
-    gap: var(--space-4);
-    padding: var(--space-4) var(--space-4);
-    border-bottom: 1px solid var(--border);
+    gap: var(--space-5);
+    padding: var(--space-5) var(--space-6);
+    border-bottom: 1px solid var(--glass-line);
   }
   .title {
     display: flex;
     flex-direction: column;
-    gap: var(--space-1);
+    gap: var(--space-2);
     min-width: 0;
   }
-  .label {
+  .eyebrow {
     color: var(--fg-muted);
     font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
     text-transform: uppercase;
-    letter-spacing: 0;
+    letter-spacing: 0.08em;
+  }
+  .name-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-4);
+    min-width: 0;
+    flex-wrap: wrap;
   }
   .tok-text {
-    color: var(--fg-strong);
+    color: var(--fg);
     font-family: var(--font-mono);
-    background: var(--bg-alt);
-    padding: var(--space-1) var(--space-2);
-    border: 1px solid var(--border);
+    font-size: var(--text-md);
+    background: var(--glass-strong);
+    border: 1px solid var(--glass-line);
+    border-radius: var(--radius-sm);
+    padding: var(--space-1) var(--space-3);
     word-break: break-all;
     max-width: 28ch;
     overflow: hidden;
@@ -877,150 +868,135 @@
     white-space: nowrap;
   }
   .coord {
-    color: var(--fg-dim);
+    color: var(--fg-subtle);
     font-size: var(--text-sm);
+    white-space: nowrap;
   }
   .scrub {
     display: inline-flex;
     align-items: center;
-    gap: var(--space-1);
-    margin-left: var(--space-1);
+    gap: var(--space-2);
   }
   .scrub-btn {
     background: transparent;
     color: var(--fg-muted);
     border: 1px solid var(--border);
+    border-radius: var(--radius-pill);
     font: inherit;
-    font-family: var(--font-mono);
-    font-size: var(--text-xs);
-    line-height: 1.2;
-    padding: 0 var(--space-2);
+    font-size: var(--text-2xs);
+    line-height: 1;
+    padding: var(--space-2) var(--space-4);
     cursor: pointer;
+    transition:
+      color var(--dur-fast) var(--ease-out),
+      background var(--dur-fast) var(--ease-out),
+      border-color var(--dur-fast) var(--ease-out);
   }
   .scrub-btn:hover:not(:disabled) {
-    color: var(--fg-strong);
+    color: var(--fg);
+    background: var(--bg-hover);
     border-color: var(--fg-muted);
   }
   .scrub-btn:disabled {
-    color: var(--border);
+    color: var(--fg-muted);
+    opacity: 0.35;
     cursor: default;
   }
   .scrub-pos {
     color: var(--fg-dim);
+    font-family: var(--font-mono);
     font-size: var(--text-xs);
     font-variant-numeric: tabular-nums;
     white-space: nowrap;
   }
   .scrub-home {
     color: var(--accent);
-    margin-left: var(--space-2);
+    font-size: var(--text-xs);
   }
   .close {
     background: transparent;
     color: var(--fg-muted);
     border: 1px solid var(--border);
-    padding: 0 var(--space-3);
+    border-radius: 50%;
+    width: 26px;
+    height: 26px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
     font: inherit;
     font-size: var(--text-md);
+    line-height: 1;
     cursor: pointer;
-    line-height: 1.4;
+    flex: none;
+    transition:
+      color var(--dur-fast) var(--ease-out),
+      background var(--dur-fast) var(--ease-out),
+      border-color var(--dur-fast) var(--ease-out);
   }
   .close:hover {
-    color: var(--fg-strong);
+    color: var(--fg);
+    background: var(--bg-hover);
     border-color: var(--fg-muted);
   }
 
-  .branch-toggle {
+  /* Toolbar — view tabs left, branch toggle right (when A/B). */
+  .toolbar {
     display: flex;
-    gap: var(--space-2);
-    padding: var(--space-2) var(--space-4);
-    border-bottom: 1px solid var(--border);
-  }
-  .branch-toggle button {
-    background: transparent;
-    color: var(--fg-dim);
-    border: 1px solid var(--border);
-    padding: var(--space-1) var(--space-4);
-    cursor: pointer;
-    font: inherit;
-    font-family: var(--font-mono);
-    text-transform: lowercase;
-  }
-  .branch-toggle button:hover {
-    color: var(--fg-strong);
-    border-color: var(--fg-muted);
-  }
-  .branch-toggle button.active {
-    color: var(--accent);
-    border-color: var(--accent);
-    background: var(--accent-subtle);
-  }
-
-  /* View tab strip — same shape as the branch toggle but lives on its
-     own row so the two stacks read independently when both are visible
-     (steered/unsteered split + probes/logits split). */
-  .tab-strip {
-    display: flex;
-    gap: var(--space-2);
-    padding: var(--space-2) var(--space-4);
-    border-bottom: 1px solid var(--border);
-  }
-  .tab-strip button {
-    background: transparent;
-    color: var(--fg-dim);
-    border: 1px solid var(--border);
-    padding: var(--space-1) var(--space-4);
-    cursor: pointer;
-    font: inherit;
-    font-family: var(--font-mono);
-    text-transform: lowercase;
-  }
-  .tab-strip button:hover {
-    color: var(--fg-strong);
-    border-color: var(--fg-muted);
-  }
-  .tab-strip button.active {
-    color: var(--accent);
-    border-color: var(--accent);
-    background: var(--accent-subtle);
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-5);
+    padding: var(--space-3) var(--space-6);
+    border-bottom: 1px solid var(--glass-line);
   }
 
   .body {
     flex: 1 1 auto;
     overflow: auto;
     min-height: 0;
-    padding: var(--space-4) var(--space-4);
+    padding: var(--space-5) var(--space-6);
   }
   .empty {
     color: var(--fg-muted);
-    font-style: italic;
-    padding: var(--space-5) 0;
-    line-height: 1.4;
+    padding: var(--space-6) 0;
+    line-height: 1.5;
+    max-width: 62ch;
+  }
+  .empty code {
+    font-family: var(--font-mono);
+    color: var(--fg-dim);
+  }
+  .empty strong {
+    color: var(--fg-strong);
   }
 
+  /* Data wells — tables recess into a deeper glass window.  Sticky
+   * label cells must stay OPAQUE (they occlude scrolled cells), so they
+   * paint the well tone rather than glass. */
   .grid-scroll {
     overflow: auto;
     max-height: 100%;
-    border: 1px solid var(--border);
-    background: var(--bg-alt);
+    border: 1px solid var(--glass-line);
+    border-radius: var(--radius);
+    background: var(--bg);
   }
   .grid {
     border-collapse: separate;
     border-spacing: 0;
+    font-family: var(--font-mono);
     font-variant-numeric: tabular-nums;
   }
   .grid th,
   .grid td {
     padding: 0;
     margin: 0;
-    background: var(--bg-alt);
+    background: var(--bg);
   }
   /* Sticky row + column labels so orientation survives long scrolls. */
   .grid thead th {
     position: sticky;
     top: 0;
     z-index: 2;
-    border-bottom: 1px solid var(--border);
+    border-bottom: 1px solid var(--glass-line);
   }
   .grid .row-label {
     position: sticky;
@@ -1030,7 +1006,8 @@
     padding: 0 var(--space-3) 0 var(--space-2);
     color: var(--fg-dim);
     font-size: var(--text-xs);
-    border-right: 1px solid var(--border);
+    font-weight: var(--weight-normal);
+    border-right: 1px solid var(--glass-line);
     white-space: nowrap;
   }
   .grid .corner {
@@ -1040,14 +1017,16 @@
     z-index: 3;
     color: var(--fg-muted);
     font-size: var(--text-xs);
+    font-weight: var(--weight-normal);
     text-align: left;
     padding: var(--space-1) var(--space-3);
-    border-right: 1px solid var(--border);
-    border-bottom: 1px solid var(--border);
+    border-right: 1px solid var(--glass-line);
+    border-bottom: 1px solid var(--glass-line);
   }
   .grid .col-label {
     color: var(--fg-dim);
     font-size: var(--text-xs);
+    font-weight: var(--weight-normal);
     padding: 0;
     /* Rotate compact column labels so they fit narrow cells.  Wrap the
      * inner span so the rotation pivots around the cell box, not the
@@ -1070,18 +1049,27 @@
   }
 
   /* Logits tab — chosen-row summary line and the ranked alts table. */
-  .logits-summary {
+  .tab-summary {
     padding: 0 0 var(--space-4) 0;
     color: var(--fg);
     font-size: var(--text-sm);
     line-height: 1.6;
   }
-  .logits-summary .kv {
+  .tab-summary .kv {
     color: var(--fg-dim);
     margin-left: var(--space-4);
   }
-  .logits-summary strong {
+  .tab-summary strong {
     color: var(--fg-strong);
+    font-family: var(--font-mono);
+  }
+  .tok-inline {
+    color: var(--fg);
+    font-family: var(--font-mono);
+    background: var(--glass-strong);
+    border: 1px solid var(--glass-line);
+    border-radius: var(--radius-sm);
+    padding: 0 var(--space-2);
   }
   .logits-table {
     width: 100%;
@@ -1093,20 +1081,26 @@
   .logits-table th,
   .logits-table td {
     padding: var(--space-2) var(--space-4);
-    border-bottom: 1px solid var(--border);
+    border-bottom: 1px solid var(--glass-line);
     text-align: left;
-    background: var(--bg-alt);
+    background: var(--bg);
+  }
+  .logits-table tbody tr:last-child td {
+    border-bottom: 0;
   }
   .logits-table thead th {
     position: sticky;
     top: 0;
     z-index: 1;
     color: var(--fg-muted);
-    font-weight: var(--weight-normal);
+    font-family: var(--font-ui);
+    font-weight: var(--weight-medium);
     font-size: var(--text-xs);
     text-transform: uppercase;
-    letter-spacing: 0;
-    border-bottom: 1px solid var(--border);
+    letter-spacing: 0.06em;
+  }
+  .logits-table td {
+    font-family: var(--font-mono);
   }
   .logits-table td.num,
   .logits-table th.num {
@@ -1119,10 +1113,13 @@
     background: transparent;
     word-break: break-all;
   }
-  /* Chosen row gets a soft tint + a heavier color so it reads at a
-     glance.  Reuses the same accent rationale as the branch toggle's
-     active state. */
-  .logits-table tr.chosen td {
+  .logits-table tbody tr:hover td {
+    background: color-mix(in srgb, var(--bg-hover) 60%, var(--bg));
+  }
+  /* Chosen row gets a soft accent wash + a heavier color so it reads at
+     a glance. */
+  .logits-table tr.chosen td,
+  .logits-table tbody tr.chosen:hover td {
     background: var(--accent-subtle);
     color: var(--fg-strong);
   }
@@ -1132,35 +1129,38 @@
     flex-wrap: wrap;
     align-items: baseline;
     gap: var(--space-2);
-    margin-bottom: var(--space-3);
+    margin-bottom: var(--space-4);
   }
   .lens-agg-label {
     color: var(--fg-muted);
     font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
     text-transform: uppercase;
+    letter-spacing: 0.08em;
     margin-right: var(--space-2);
   }
   .lens-agg-chip {
     display: inline-flex;
     align-items: baseline;
-    gap: var(--space-1);
+    gap: var(--space-2);
     font-family: var(--font-mono);
     font-size: var(--text-sm);
-    border: 1px solid var(--border);
-    border-radius: 999px;
-    padding: 0 var(--space-3);
+    background: var(--glass);
+    border: 1px solid color-mix(in srgb, var(--pillar-lens) 22%, var(--glass-line));
+    border-radius: var(--radius-pill);
+    padding: 1px var(--space-4);
   }
   .lens-agg-tok {
-    color: var(--accent);
+    color: var(--pillar-lens);
   }
   .lens-agg-com {
     color: var(--fg-muted);
     font-size: var(--text-2xs);
     font-variant-numeric: tabular-nums;
   }
-  /* J-lens tab — the workspace readout matrix.  Same table chrome as the
-     logits table; cells carry an inline probability tint, so the static
-     styles stay layout-only. */
+  /* J-lens tab — the workspace readout matrix.  Same well chrome as the
+     logits table; cells carry an inline probability tint in the lens
+     family blue, so the static styles stay layout-only. */
   .lens-table {
     border-collapse: separate;
     border-spacing: 0;
@@ -1170,24 +1170,26 @@
   .lens-table th,
   .lens-table td {
     padding: var(--space-1) var(--space-3);
-    border-bottom: 1px solid var(--border);
+    border-bottom: 1px solid var(--glass-line);
     text-align: left;
-    background: var(--bg-alt);
+    background: var(--bg);
   }
   .lens-table thead th {
     position: sticky;
     top: 0;
     z-index: 2;
     color: var(--fg-muted);
-    font-weight: var(--weight-normal);
+    font-family: var(--font-ui);
+    font-weight: var(--weight-medium);
     font-size: var(--text-xs);
     text-transform: uppercase;
+    letter-spacing: 0.06em;
   }
   .lens-table .corner {
     position: sticky;
     left: 0;
     z-index: 3;
-    border-right: 1px solid var(--border);
+    border-right: 1px solid var(--glass-line);
   }
   .lens-table .row-label {
     position: sticky;
@@ -1195,12 +1197,14 @@
     z-index: 1;
     text-align: right;
     color: var(--fg-dim);
+    font-family: var(--font-mono);
+    font-weight: var(--weight-normal);
     font-size: var(--text-xs);
-    border-right: 1px solid var(--border);
+    border-right: 1px solid var(--glass-line);
     white-space: nowrap;
   }
   .lens-table .row-label.band {
-    color: var(--accent-blue);
+    color: var(--pillar-lens);
   }
   .lens-table tr.off-band td {
     opacity: 0.55;
@@ -1220,6 +1224,7 @@
   .steer-chip code {
     color: var(--fg-strong);
     background: transparent;
+    font-family: var(--font-mono);
   }
   .steer-toggle {
     cursor: pointer;
@@ -1231,54 +1236,19 @@
     margin-right: var(--space-1);
   }
 
-  .mini {
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    background: var(--bg-elev);
-    color: var(--accent);
-    font: inherit;
-    font-family: var(--font-mono);
-    font-size: var(--text-xs);
-    padding: var(--space-1) var(--space-3);
-  }
-  .mini:hover:not(:disabled) {
-    border-color: var(--accent);
-    color: var(--fg);
-  }
-  .mini:disabled {
-    color: var(--fg-muted);
-    cursor: not-allowed;
-  }
   .branch-error {
     color: var(--accent-error);
     font-size: var(--text-sm);
     margin: var(--space-4) 0 0;
   }
-  .link-btn {
-    background: transparent;
-    border: 1px solid var(--border);
-    color: var(--accent);
-    font: inherit;
-    font-family: var(--font-mono);
-    cursor: pointer;
-    padding: var(--space-1) var(--space-4);
-  }
-  .link-btn:hover:not(:disabled) {
-    color: var(--fg-strong);
-    border-color: var(--accent);
-  }
-  .link-btn:disabled {
-    color: var(--fg-muted);
-    cursor: default;
-  }
 
   .drawer-footer {
-    border-top: 1px solid var(--border);
-    padding: var(--space-2) var(--space-4);
+    border-top: 1px solid var(--glass-line);
+    padding: var(--space-3) var(--space-6);
     color: var(--fg-muted);
     font-size: var(--text-xs);
   }
   .hint {
-    line-height: 1.4;
+    line-height: 1.5;
   }
 </style>

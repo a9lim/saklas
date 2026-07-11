@@ -171,11 +171,36 @@
 </section>
 
 <style>
-  .drawer-shell { display: flex; flex-direction: column; min-height: 0; background: var(--bg-alt); }
-  .header { display: flex; justify-content: space-between; gap: var(--space-6); padding: var(--space-6) var(--space-6); border-bottom: 1px solid var(--border); background: var(--surface); }
-  .title { color: var(--accent); text-transform: uppercase; letter-spacing: 0; font-size: var(--text-xs); font-weight: var(--weight-bold); }
+  .drawer-shell { display: flex; flex-direction: column; min-height: 0; background: transparent; }
+  .header { display: flex; justify-content: space-between; gap: var(--space-6); padding: var(--space-5) var(--space-6); border-bottom: 1px solid var(--glass-line); background: var(--surface); }
+  .title { color: var(--accent); letter-spacing: 0; font-size: var(--text-md); font-weight: var(--weight-medium); }
   .header p { margin: var(--space-2) 0 0; color: var(--fg-muted); }
-  .close, .remove { background: transparent; border: 0; color: var(--fg-muted); font-size: var(--text-md); }
+  .remove { background: transparent; border: 0; color: var(--fg-muted); font-size: var(--text-md); }
+  .close {
+    background: transparent;
+    color: var(--fg-muted);
+    border: 1px solid var(--border);
+    border-radius: 50%;
+    width: 26px;
+    height: 26px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font: inherit;
+    font-size: var(--text-md);
+    line-height: 1;
+    cursor: pointer;
+    flex: none;
+    transition:
+      color var(--dur-fast) var(--ease-out),
+      background var(--dur-fast) var(--ease-out),
+      border-color var(--dur-fast) var(--ease-out);
+  }
+  .close:hover {
+    color: var(--fg);
+    background: var(--bg-hover);
+    border-color: var(--fg-muted);
+  }
   .body { display: grid; gap: var(--space-5); padding: var(--space-6); overflow: auto; }
   .expression-card, .add-card, .along-card, .term { border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); padding: var(--space-6); }
   .expression-card { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: var(--space-5); align-items: center; }

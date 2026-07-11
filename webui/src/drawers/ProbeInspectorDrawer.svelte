@@ -12,11 +12,16 @@
   // state point + a fading trajectory trail ride the probe's per-token
   // ``subspace_coords_per_layer`` (gated on by ``persist_subspace_coords`` while
   // this drawer is open), stored across all layers so scrubbing is a pure read.
+  //
+  // v2 sheet interior: the drawer host paints the sheet (glass hairline,
+  // radius, --bg-alt fill) so the root here is transparent.  The probe's
+  // FAMILY hue (flat = subspace white, curved = manifold violet — the same
+  // is_affine split the racks use) accents the header dot, the active layer
+  // row, the share bars, and the plot's node centroids via ``--geom-node``.
 
   import { closeDrawer, drawerState, probeRack } from "../lib/stores.svelte";
   import { apiProbes, ApiError } from "../lib/api";
   import Bar from "../lib/charts/Bar.svelte";
-  import Select from "../lib/Select.svelte";
   import {
     renderProbeGeometry,
     orbitDrag,
@@ -43,6 +48,13 @@
 
   let canvasEl = $state<HTMLCanvasElement | null>(null);
   let rafId = 0;
+
+  /** Family hue — the rack's flat/curved split (hue = which space). */
+  const familyHue = $derived(
+    geom?.is_affine === false
+      ? "var(--pillar-manifold)"
+      : "var(--pillar-subspace)",
+  );
 
   // --- load geometry on probe change ---
   async function load(name: string): Promise<void> {
@@ -84,7 +96,7 @@
     void load(probeName);
   });
 
-  // sorted layer list (ascending) for the picker + the share bars
+  // sorted layer list (ascending) for the share strip
   const layerList = $derived.by<ProbeLayerGeometry[]>(() =>
     geom ? Object.values(geom.layers).sort((a, b) => a.layer - b.layer) : [],
   );
@@ -192,9 +204,9 @@
 
   const rankLabel = $derived.by(() => {
     const r = activeGeom?.rank ?? 0;
-    if (r <= 1) return "line (rank 1)";
-    if (r === 2) return "2D scatter (rank 2)";
-    return `3D PCA scatter (rank ${r})`;
+    if (r <= 1) return "line · rank 1";
+    if (r === 2) return "2D scatter · rank 2";
+    return `3D PCA scatter · rank ${r}`;
   });
   const intrinsicLabel = $derived(
     activeGeom ? `intrinsic dim ${activeGeom.intrinsic_dim}` : "",
@@ -203,18 +215,26 @@
 
 <svelte:window onkeydown={onKeydown} />
 
-<aside class="drawer" aria-label="Probe inspector">
+<aside class="drawer" style:--family={familyHue} aria-label="Probe inspector">
   <header class="drawer-header">
     <div class="title">
-      <span class="label">probe inspector</span>
-      <span class="coord" title={probeName}>
+      <span class="eyebrow">probe geometry</span>
+      <div class="name-row">
         {#if probeName}
-          {displayName}
-          {#if geom}· {rankLabel} · {intrinsicLabel}{/if}
+          <span class="family-dot" aria-hidden="true"></span>
+          <code class="name" title={probeName}>{displayName}</code>
+          {#if geom}
+            <span class="meta">{rankLabel} · {intrinsicLabel}</span>
+            {#if !geom.rank_uniform}
+              <span class="warn" title="this flat fit kept a different rank per layer">
+                rank varies by layer
+              </span>
+            {/if}
+          {/if}
         {:else}
-          no probe
+          <span class="meta">no probe</span>
         {/if}
-      </span>
+      </div>
     </div>
     <button type="button" class="close" onclick={onClose} aria-label="Close drawer">×</button>
   </header>
@@ -228,29 +248,9 @@
   {:else if !geom || layerList.length === 0}
     <div class="body"><div class="empty">no fitted geometry for {displayName}</div></div>
   {:else}
-    <div class="picker-row">
-      <label class="picker">
-        <span class="picker-label">layer</span>
-        <Select
-          value={selectedLayer ?? layerList[0].layer}
-          options={layerList.map((l) => ({
-            value: l.layer,
-            label: `L${l.layer} · sh ${l.mahalanobis_share.toFixed(2)}`,
-          }))}
-          onchange={(v) => (selectedLayer = v)}
-          ariaLabel="Layer"
-        />
-      </label>
-      {#if !geom.rank_uniform}
-        <span class="warn" title="this flat fit kept a different rank per layer">
-          rank varies by layer
-        </span>
-      {/if}
-    </div>
-
     <div class="body">
       <div class="bars-col">
-        <div class="section-label">per-layer ‖share‖<span class="dim"> · click to scrub</span></div>
+        <div class="section-label">layers · ‖share‖<span class="dim"> · click to scrub</span></div>
         <div class="bars">
           {#each layerList as l (l.layer)}
             <button
@@ -260,7 +260,13 @@
               onclick={() => (selectedLayer = l.layer)}
             >
               <span class="lyr">L{l.layer}</span>
-              <Bar value={l.mahalanobis_share} max={maxShare || 1} width={200} height={8} />
+              <Bar
+                value={l.mahalanobis_share}
+                max={maxShare || 1}
+                width={200}
+                height={8}
+                color="var(--family)"
+              />
               <span class="val">{l.mahalanobis_share.toFixed(3)}</span>
             </button>
           {/each}
@@ -277,6 +283,7 @@
             onpointerup={onPointerUp}
             onwheel={onWheel}
           ></canvas>
+          <span class="layer-chip">L{selectedLayer}</span>
           {#if canOrbit}
             <span class="orbit-hint">drag to orbit · scroll to zoom</span>
           {/if}
@@ -293,98 +300,113 @@
   <footer class="drawer-footer">
     <span class="hint">
       Whitened-frame geometry — node centroids, neutral anchor, and the manifold
-      overlay in the same Mahalanobis metric the reads use.  The bright dot is
+      overlay in the same Mahalanobis metric the reads use.  The glowing dot is
       the current hidden state; the fading trail is the last tokens.
     </span>
   </footer>
 </aside>
 
 <style>
+  /* v2 sheet interior — the host paints the sheet surface, so the root
+   * stays transparent and chrome speaks sans (data stays mono). */
   .drawer {
     display: flex;
     flex-direction: column;
     height: 100%;
     min-height: 0;
-    background: var(--bg);
+    background: transparent;
     color: var(--fg);
-    font-family: var(--font-mono);
+    font-family: var(--font-ui);
     font-size: var(--text);
-    border-left: 1px solid var(--border);
   }
   .drawer-header {
     display: flex;
     align-items: flex-start;
     justify-content: space-between;
-    gap: var(--space-4);
-    padding: var(--space-4);
-    border-bottom: 1px solid var(--border);
+    gap: var(--space-5);
+    padding: var(--space-5) var(--space-6);
+    border-bottom: 1px solid var(--glass-line);
   }
   .title {
     display: flex;
     flex-direction: column;
-    gap: var(--space-1);
+    gap: var(--space-2);
     min-width: 0;
   }
-  .label {
+  .eyebrow {
     color: var(--fg-muted);
     font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
     text-transform: uppercase;
+    letter-spacing: 0.08em;
   }
-  .coord {
-    color: var(--fg-dim);
-    font-size: var(--text-sm);
+  .name-row {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-3);
+    min-width: 0;
+  }
+  .family-dot {
+    align-self: center;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--family);
+    box-shadow: 0 0 6px color-mix(in srgb, var(--family) 45%, transparent);
+    flex: none;
+  }
+  .name {
+    color: var(--fg);
+    font-family: var(--font-mono);
+    font-size: var(--text-md);
+    font-weight: var(--weight-medium);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  .meta {
+    color: var(--fg-subtle);
+    font-size: var(--text-sm);
+    white-space: nowrap;
+  }
+  .warn {
+    color: var(--accent-yellow);
+    font-size: var(--text-xs);
   }
   .close {
     background: transparent;
     color: var(--fg-muted);
     border: 1px solid var(--border);
-    padding: 0 var(--space-3);
+    border-radius: 50%;
+    width: 26px;
+    height: 26px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
     font: inherit;
     font-size: var(--text-md);
+    line-height: 1;
     cursor: pointer;
-    line-height: 1.4;
+    flex: none;
+    transition:
+      color var(--dur-fast) var(--ease-out),
+      background var(--dur-fast) var(--ease-out),
+      border-color var(--dur-fast) var(--ease-out);
   }
   .close:hover {
-    color: var(--fg-strong);
+    color: var(--fg);
+    background: var(--bg-hover);
     border-color: var(--fg-muted);
-  }
-
-  .picker-row {
-    display: flex;
-    align-items: center;
-    gap: var(--space-4);
-    padding: var(--space-3) var(--space-4);
-    border-bottom: 1px solid var(--border);
-  }
-  .picker {
-    display: flex;
-    align-items: center;
-    gap: var(--space-3);
-    flex: 1 1 auto;
-  }
-  .picker-label {
-    color: var(--fg-muted);
-    font-size: var(--text-sm);
-  }
-  .picker :global(.sk-select) {
-    flex: 1 1 auto;
-  }
-  .warn {
-    color: var(--accent-yellow);
-    font-size: var(--text-xs);
   }
 
   .body {
     flex: 1 1 auto;
     overflow: hidden;
     min-height: 0;
-    padding: var(--space-4);
+    padding: var(--space-5) var(--space-6);
     display: flex;
     flex-direction: row;
-    gap: var(--space-4);
+    gap: var(--space-6);
   }
   .bars-col {
     flex: 0 0 auto;
@@ -401,21 +423,32 @@
   }
   .empty {
     color: var(--fg-muted);
-    font-style: italic;
-    padding: var(--space-5) 0;
+    padding: var(--space-6) 0;
   }
   .empty.err {
     color: var(--accent-error);
-    font-style: normal;
   }
 
+  /* The plot well — a deep glass window with a faint family-tinted
+   * ambient (material, not data) so the geometry reads as suspended. */
   .plot-wrap {
     position: relative;
     flex: 1 1 auto;
     min-height: 0;
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    background: var(--bg-deep);
+    border: 1px solid color-mix(in srgb, var(--family) 14%, var(--glass-line));
+    border-radius: var(--radius-lg);
+    background:
+      radial-gradient(
+        90% 75% at 50% 42%,
+        color-mix(in srgb, var(--family) 5%, transparent),
+        transparent 72%
+      ),
+      var(--bg-deep);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+    overflow: hidden;
+    /* Palette hooks read by the canvas renderer (hue ontology). */
+    --geom-node: var(--family);
+    --geom-neutral: var(--fg-subtle);
   }
   .plot-wrap.orbit .plot {
     cursor: grab;
@@ -431,6 +464,20 @@
     width: 100%;
     height: 100%;
   }
+  .layer-chip {
+    position: absolute;
+    top: var(--space-3);
+    left: var(--space-4);
+    color: color-mix(in srgb, var(--family) 80%, var(--fg));
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    font-variant-numeric: tabular-nums;
+    background: var(--glass);
+    border: 1px solid var(--glass-line);
+    border-radius: var(--radius-pill);
+    padding: 1px var(--space-4);
+    pointer-events: none;
+  }
   .orbit-hint,
   .live-hint,
   .trail-hint {
@@ -440,37 +487,43 @@
     pointer-events: none;
   }
   .orbit-hint {
-    top: var(--space-2);
-    right: var(--space-3);
+    top: var(--space-3);
+    right: var(--space-4);
   }
   .live-hint {
-    bottom: var(--space-2);
+    bottom: var(--space-3);
     left: 0;
     right: 0;
     text-align: center;
     font-style: italic;
   }
   .trail-hint {
-    bottom: var(--space-2);
-    left: var(--space-3);
+    bottom: var(--space-3);
+    left: var(--space-4);
     color: var(--accent-green);
+    font-family: var(--font-mono);
     font-variant-numeric: tabular-nums;
   }
 
   .section-label {
     color: var(--fg-muted);
     font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
     text-transform: uppercase;
-    margin-bottom: var(--space-2);
+    letter-spacing: 0.08em;
+    margin-bottom: var(--space-3);
   }
   .section-label .dim {
-    color: var(--fg-dim);
+    color: var(--fg-subtle);
     text-transform: none;
+    letter-spacing: 0;
+    font-weight: var(--weight-normal);
   }
   .bars {
     display: flex;
     flex-direction: column;
     gap: 1px;
+    font-family: var(--font-mono);
     font-size: var(--text-xs);
   }
   .row {
@@ -478,22 +531,26 @@
     align-items: center;
     gap: var(--space-4);
     background: transparent;
-    border: 0;
+    border: 1px solid transparent;
     border-radius: var(--radius);
-    padding: var(--space-1) var(--space-2);
+    padding: var(--space-1) var(--space-3);
     cursor: pointer;
     text-align: left;
     color: inherit;
     font: inherit;
+    transition:
+      background var(--dur-fast) var(--ease-out),
+      border-color var(--dur-fast) var(--ease-out);
   }
   .row:hover {
-    background: var(--bg-elev);
+    background: var(--bg-hover);
   }
   .row.active {
-    background: var(--bg-elev);
+    background: var(--glass-strong);
+    border-color: color-mix(in srgb, var(--family) 25%, var(--glass-line));
   }
   .row.active .lyr {
-    color: var(--accent-purple);
+    color: color-mix(in srgb, var(--family) 85%, var(--fg));
   }
   .lyr {
     color: var(--fg-muted);
@@ -511,12 +568,12 @@
   }
 
   .drawer-footer {
-    border-top: 1px solid var(--border);
-    padding: var(--space-2) var(--space-4);
+    border-top: 1px solid var(--glass-line);
+    padding: var(--space-3) var(--space-6);
     color: var(--fg-muted);
     font-size: var(--text-xs);
   }
   .hint {
-    line-height: 1.4;
+    line-height: 1.5;
   }
 </style>

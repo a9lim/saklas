@@ -131,21 +131,24 @@
 <aside class="drawer" aria-label="Layer norms">
   <header class="drawer-header">
     <div class="title">
-      <span class="label">layer norms</span>
-      <span class="coord">
-        {#if data}
-          {data.total_layers} layers · model {data.model}
-        {:else if names.length === 0}
-          no vectors or probes registered
+      <span class="eyebrow">layer norms</span>
+      <div class="name-row">
+        {#if selected}
+          <code class="name" title={selected}>{selected}</code>
+          {#if data}
+            <span class="meta">{data.total_layers} layers · model {data.model}</span>
+          {/if}
         {:else}
-          pick a name
+          <span class="meta">
+            {names.length === 0 ? "no vectors or probes registered" : "pick a name"}
+          </span>
         {/if}
-      </span>
+      </div>
     </div>
     <button type="button" class="close" onclick={onClose} aria-label="Close drawer">×</button>
   </header>
 
-  <div class="picker-row">
+  <div class="toolbar">
     <label class="picker">
       <span class="picker-label">name</span>
       <Select
@@ -196,63 +199,93 @@
 </aside>
 
 <style>
+  /* v2 sheet interior — the host paints the sheet surface (glass hairline,
+   * radius, --bg-alt fill), so the root is transparent; chrome speaks sans
+   * and every value/identifier sits in mono. */
   .drawer {
     display: flex;
     flex-direction: column;
     height: 100%;
     min-height: 0;
-    background: var(--bg);
+    background: transparent;
     color: var(--fg);
-    font-family: var(--font-mono);
+    font-family: var(--font-ui);
     font-size: var(--text);
-    border-left: 1px solid var(--border);
   }
 
   .drawer-header {
     display: flex;
     align-items: flex-start;
     justify-content: space-between;
-    gap: var(--space-4);
-    padding: var(--space-4) var(--space-4);
-    border-bottom: 1px solid var(--border);
+    gap: var(--space-5);
+    padding: var(--space-5) var(--space-6);
+    border-bottom: 1px solid var(--glass-line);
   }
   .title {
     display: flex;
     flex-direction: column;
-    gap: var(--space-1);
+    gap: var(--space-2);
     min-width: 0;
   }
-  .label {
+  .eyebrow {
     color: var(--fg-muted);
     font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
     text-transform: uppercase;
-    letter-spacing: 0;
+    letter-spacing: 0.08em;
   }
-  .coord {
-    color: var(--fg-dim);
+  .name-row {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-3);
+    min-width: 0;
+  }
+  .name {
+    color: var(--fg);
+    font-family: var(--font-mono);
+    font-size: var(--text-md);
+    font-weight: var(--weight-medium);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .meta {
+    color: var(--fg-subtle);
     font-size: var(--text-sm);
+    white-space: nowrap;
   }
   .close {
     background: transparent;
     color: var(--fg-muted);
     border: 1px solid var(--border);
-    padding: 0 var(--space-3);
+    border-radius: 50%;
+    width: 26px;
+    height: 26px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
     font: inherit;
     font-size: var(--text-md);
+    line-height: 1;
     cursor: pointer;
-    line-height: 1.4;
+    flex: none;
+    transition:
+      color var(--dur-fast) var(--ease-out),
+      background var(--dur-fast) var(--ease-out),
+      border-color var(--dur-fast) var(--ease-out);
   }
   .close:hover {
-    color: var(--fg-strong);
+    color: var(--fg);
+    background: var(--bg-hover);
     border-color: var(--fg-muted);
   }
 
-  .picker-row {
+  .toolbar {
     display: flex;
     align-items: center;
-    gap: var(--space-4);
-    padding: var(--space-3) var(--space-4);
-    border-bottom: 1px solid var(--border);
+    gap: var(--space-5);
+    padding: var(--space-3) var(--space-6);
+    border-bottom: 1px solid var(--glass-line);
   }
   .picker {
     display: flex;
@@ -262,55 +295,59 @@
   }
   .picker-label {
     color: var(--fg-muted);
-    font-size: var(--text-sm);
+    font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
   }
   /* Themed Select fills its picker host; Select owns its own chrome. */
   .picker :global(.sk-select) {
     flex: 1 1 auto;
   }
   .stoplight {
-    font-size: var(--text-xs);
+    font-family: var(--font-mono);
+    font-size: var(--text-2xs);
     text-transform: lowercase;
-    letter-spacing: 0;
-    padding: var(--space-1) var(--space-3);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
+    background: var(--glass);
+    border: 1px solid var(--glass-line);
+    border-radius: var(--radius-pill);
+    padding: 1px var(--space-4);
     color: var(--fg-dim);
   }
   .stoplight.solid {
     color: var(--accent-green);
-    border-color: var(--accent-green);
+    border-color: color-mix(in srgb, var(--accent-green) 35%, var(--glass-line));
   }
   .stoplight.shaky {
     color: var(--accent-yellow);
-    border-color: var(--accent-yellow);
+    border-color: color-mix(in srgb, var(--accent-yellow) 35%, var(--glass-line));
   }
   .stoplight.poor {
     color: var(--accent-red);
-    border-color: var(--accent-red);
+    border-color: color-mix(in srgb, var(--accent-red) 35%, var(--glass-line));
   }
 
   .body {
     flex: 1 1 auto;
     overflow: auto;
     min-height: 0;
-    padding: var(--space-4) var(--space-4);
+    padding: var(--space-5) var(--space-6);
   }
   .empty {
     color: var(--fg-muted);
-    font-style: italic;
-    padding: var(--space-5) 0;
-    line-height: 1.4;
+    padding: var(--space-6) 0;
+    line-height: 1.5;
+    max-width: 62ch;
   }
   .empty.err {
     color: var(--accent-error);
-    font-style: normal;
   }
 
   .bars {
     display: flex;
     flex-direction: column;
     gap: 1px;
+    font-family: var(--font-mono);
     font-size: var(--text-xs);
   }
   .row {
@@ -334,12 +371,12 @@
   }
 
   .drawer-footer {
-    border-top: 1px solid var(--border);
-    padding: var(--space-2) var(--space-4);
+    border-top: 1px solid var(--glass-line);
+    padding: var(--space-3) var(--space-6);
     color: var(--fg-muted);
     font-size: var(--text-xs);
   }
   .hint {
-    line-height: 1.4;
+    line-height: 1.5;
   }
 </style>

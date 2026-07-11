@@ -19,6 +19,7 @@
     loomTree,
   } from "../lib/stores.svelte";
   import Select from "../lib/Select.svelte";
+  import Button from "../lib/ui/Button.svelte";
   import type {
     DiffReadingDeltaJSON,
     DiffTextSpanJSON,
@@ -227,8 +228,10 @@
   }
 
   function spanColor(state: DiffTextSpanJSON["state"]): string {
-    if (state === "insert") return "rgba(126, 231, 135, 0.18)";
-    if (state === "delete") return "rgba(248, 81, 73, 0.18)";
+    if (state === "insert")
+      return "color-mix(in srgb, var(--accent-green) 18%, transparent)";
+    if (state === "delete")
+      return "color-mix(in srgb, var(--accent-red) 18%, transparent)";
     return "transparent";
   }
 
@@ -384,34 +387,45 @@
 
 <section class="drawer-shell" aria-label="Cross-branch diff drawer">
   <header class="header">
-    <span class="title">compare branches</span>
-    <div class="header-controls">
-      <label class="header-ctl">
-        <span>layout</span>
-        <Select
-          bind:value={layout}
-          options={[
-            { value: "side-by-side", label: "side-by-side" },
-            { value: "unified", label: "unified" },
-          ]}
-          ariaLabel="Layout"
-        />
-      </label>
-      <label class="header-ctl">
-        <span>sort by</span>
-        <Select
-          bind:value={sortBy}
-          options={[
-            { value: "magnitude", label: "|Δ| desc" },
-            { value: "name", label: "name" },
-          ]}
-          ariaLabel="Sort readings by"
-        />
-      </label>
+    <div class="title">
+      <span class="eyebrow">compare branches</span>
+      <div class="name-row">
+        <span class="meta">
+          {#if ids.length >= 2}
+            {ids.length} node{ids.length > 2 ? "s" : ""} selected
+          {:else}
+            select nodes to compare
+          {/if}
+        </span>
+      </div>
     </div>
-    <button type="button" class="close" aria-label="Close" onclick={closeDrawer}
-      >✕</button>
+    <button type="button" class="close" aria-label="Close drawer" onclick={closeDrawer}>×</button>
   </header>
+
+  <div class="toolbar">
+    <label class="header-ctl">
+      <span>layout</span>
+      <Select
+        bind:value={layout}
+        options={[
+          { value: "side-by-side", label: "side-by-side" },
+          { value: "unified", label: "unified" },
+        ]}
+        ariaLabel="Layout"
+      />
+    </label>
+    <label class="header-ctl">
+      <span>sort by</span>
+      <Select
+        bind:value={sortBy}
+        options={[
+          { value: "magnitude", label: "|Δ| desc" },
+          { value: "name", label: "name" },
+        ]}
+        ariaLabel="Sort readings by"
+      />
+    </label>
+  </div>
 
   <div class="body">
     {#if ids.length < 2}
@@ -702,76 +716,117 @@
   </div>
 
   <footer class="footer">
-    <button type="button" class="btn" onclick={closeDrawer}>close</button>
+    <Button variant="ghost" size="sm" onclick={closeDrawer}>close</Button>
   </footer>
 </section>
 
 <style>
+  /* v2 sheet interior — the host paints the sheet surface, so the root
+   * stays transparent and chrome speaks sans (identifiers/values/
+   * expressions stay mono, applied locally below). */
   .drawer-shell {
     display: flex;
     flex-direction: column;
     height: 100%;
     min-height: 0;
+    background: transparent;
     color: var(--fg);
-    font-family: var(--font-mono);
+    font-family: var(--font-ui);
     font-size: var(--text);
   }
   .header {
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     justify-content: space-between;
-    gap: var(--space-4);
+    gap: var(--space-5);
     padding: var(--space-5) var(--space-6);
-    border-bottom: 1px solid var(--border);
+    border-bottom: 1px solid var(--glass-line);
   }
   .title {
-    color: var(--accent);
-    text-transform: lowercase;
-    letter-spacing: 0;
-    flex: 0 0 auto;
-  }
-  .header-controls {
     display: flex;
-    gap: var(--space-4);
-    flex: 1 1 auto;
-    justify-content: center;
+    flex-direction: column;
+    gap: var(--space-2);
+    min-width: 0;
+  }
+  .eyebrow {
     color: var(--fg-muted);
+    font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+  .name-row {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-3);
+    min-width: 0;
+  }
+  .meta {
+    color: var(--fg-subtle);
     font-size: var(--text-sm);
+    white-space: nowrap;
+  }
+  .close {
+    background: transparent;
+    color: var(--fg-muted);
+    border: 1px solid var(--border);
+    border-radius: 50%;
+    width: 26px;
+    height: 26px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font: inherit;
+    font-size: var(--text-md);
+    line-height: 1;
+    cursor: pointer;
+    flex: none;
+    transition:
+      color var(--dur-fast) var(--ease-out),
+      background var(--dur-fast) var(--ease-out),
+      border-color var(--dur-fast) var(--ease-out);
+  }
+  .close:hover {
+    color: var(--fg);
+    background: var(--bg-hover);
+    border-color: var(--fg-muted);
+  }
+
+  /* Toolbar — the layout / sort-by controls, in their own bordered row
+   * (same pattern as the token-drilldown toolbar). */
+  .toolbar {
+    display: flex;
+    align-items: center;
+    gap: var(--space-5);
+    padding: var(--space-3) var(--space-6);
+    border-bottom: 1px solid var(--glass-line);
   }
   .header-ctl {
     display: inline-flex;
     align-items: center;
     gap: var(--space-2);
+    color: var(--fg-muted);
+    font-size: var(--text-sm);
   }
   /* Themed Select owns its own chrome. */
   .header-ctl :global(.sk-select) {
     min-width: 9em;
   }
-  .close {
-    background: transparent;
-    border: 0;
-    color: var(--fg-dim);
-    cursor: pointer;
-    padding: var(--space-2) var(--space-2);
-    font-size: var(--text);
-    line-height: 1;
-  }
-  .close:hover {
-    color: var(--accent-red);
-  }
 
   .body {
     flex: 1 1 auto;
     overflow-y: auto;
-    padding: var(--space-6);
+    padding: var(--space-5) var(--space-6);
     display: flex;
     flex-direction: column;
-    gap: var(--space-3);
+    gap: var(--space-4);
     min-height: 0;
   }
   .empty {
     color: var(--fg-muted);
     font-size: var(--text-sm);
+    line-height: 1.5;
+    max-width: 62ch;
     margin: 0;
   }
   .error {
@@ -786,8 +841,9 @@
     gap: var(--space-4);
   }
   .col {
-    background: var(--bg-deep);
-    border: 1px solid var(--border);
+    background: var(--bg);
+    border: 1px solid var(--glass-line);
+    border-radius: var(--radius);
     padding: var(--space-3) var(--space-4);
   }
   .col-header {
@@ -798,7 +854,8 @@
     margin-bottom: var(--space-2);
   }
   .col-id {
-    color: var(--accent-yellow);
+    font-family: var(--font-mono);
+    color: var(--fg-dim);
   }
   .col-tag {
     color: var(--accent);
@@ -816,10 +873,13 @@
     -webkit-box-orient: vertical;
   }
 
+  /* Nested section card — aggregates the text diff + cross-eval table +
+   * readings table for one A-vs-B pair. */
   .diff-block {
-    background: var(--bg-deep);
-    border: 1px solid var(--border);
-    padding: var(--space-4) var(--space-4);
+    background: var(--glass);
+    border: 1px solid var(--glass-line);
+    border-radius: var(--radius-lg);
+    padding: var(--space-4);
     display: flex;
     flex-direction: column;
     gap: var(--space-4);
@@ -832,15 +892,20 @@
     flex-wrap: wrap;
   }
   .diff-title {
-    color: var(--accent);
-    font-size: var(--text-sm);
+    color: var(--fg-muted);
+    font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
   }
   .recipe-delta {
-    color: var(--accent-yellow);
+    color: var(--fg-dim);
+    font-family: var(--font-mono);
     font-size: var(--text-xs);
-    background: var(--bg-elev);
-    padding: var(--space-1) var(--space-2);
-    border-radius: var(--radius);
+    background: var(--glass-strong);
+    border: 1px solid var(--glass-line);
+    padding: var(--space-1) var(--space-3);
+    border-radius: var(--radius-sm);
   }
 
   .text-grid {
@@ -852,19 +917,22 @@
   .columns.unified > .col {
     grid-template-columns: 1fr;
   }
+  /* Data well — the per-branch text pane. */
   .text-pane {
-    background: var(--bg-alt);
-    border: 1px solid var(--border);
+    background: var(--bg);
+    border: 1px solid var(--glass-line);
+    border-radius: var(--radius);
     padding: var(--space-2) var(--space-3);
     min-height: 5em;
     max-height: 30em;
     overflow-y: auto;
   }
   .pane-label {
-    color: var(--accent);
+    color: var(--fg-muted);
     font-size: var(--text-xs);
-    text-transform: lowercase;
-    letter-spacing: 0;
+    font-weight: var(--weight-medium);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
     display: block;
     margin-bottom: var(--space-1);
   }
@@ -879,19 +947,26 @@
     cursor: default;
     transition: background-color var(--dur-fast) var(--ease-out);
   }
+  /* Cross-pane hover alignment: no space to signal here (this is text
+   * correspondence, not a pillar), so anchor vs target read via fill
+   * weight and outline rather than hue. */
   .tok:hover {
-    background: rgba(72, 138, 203, 0.1);
+    background: color-mix(in srgb, var(--fg) 8%, transparent);
   }
   .tok.highlight-anchor {
-    background: rgba(72, 138, 203, 0.22);
+    background: color-mix(in srgb, var(--fg) 16%, transparent);
   }
   .tok.highlight-target {
-    background: rgba(210, 153, 34, 0.28);
+    background: transparent;
+    outline: 1px solid var(--fg-muted);
+    outline-offset: -1px;
   }
 
+  /* Data well — the unified diff pane. */
   .unified-body {
-    background: var(--bg-alt);
-    border: 1px solid var(--border);
+    background: var(--bg);
+    border: 1px solid var(--glass-line);
+    border-radius: var(--radius);
     padding: var(--space-3) var(--space-4);
     line-height: 1.5;
     font-size: var(--text-sm);
@@ -920,8 +995,9 @@
     display: flex;
     flex-direction: column;
     gap: var(--space-2);
-    background: var(--bg-alt);
-    border: 1px solid var(--border);
+    background: var(--glass);
+    border: 1px solid var(--glass-line);
+    border-radius: var(--radius-lg);
     padding: var(--space-3) var(--space-4);
     margin: 0;
   }
@@ -932,10 +1008,11 @@
     gap: var(--space-4);
   }
   .ss-label {
-    color: var(--accent);
-    text-transform: lowercase;
-    letter-spacing: 0;
+    color: var(--fg-muted);
     font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
   }
   .ss-foot {
     color: var(--fg-muted);
@@ -945,20 +1022,22 @@
     width: 100%;
     border-collapse: separate;
     border-spacing: 0;
+    font-family: var(--font-mono);
     font-size: var(--text-xs);
     font-variant-numeric: tabular-nums;
   }
   .ss-table th,
   .ss-table td {
     padding: var(--space-2) var(--space-3);
-    border-bottom: 1px solid var(--border);
+    border-bottom: 1px solid var(--glass-line);
     text-align: left;
   }
   .ss-table thead th {
     color: var(--fg-muted);
+    font-family: var(--font-ui);
     text-transform: uppercase;
-    letter-spacing: 0;
-    font-weight: var(--weight-normal);
+    letter-spacing: 0.06em;
+    font-weight: var(--weight-medium);
   }
   .ss-table td.ss-num,
   .ss-table th.ss-num {
@@ -973,24 +1052,27 @@
   }
   .ss-table td.ss-preview {
     color: var(--fg);
+    font-family: var(--font-ui);
     max-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  /* Anchor row inherits the blue from .tok.highlight-anchor / .msg.user
-   * so the "this is the baseline" cue reads consistently with the rest
-   * of the anchor=blue scheme — independent of --accent-subtle's chrome
-   * hue. */
+  /* Anchor row reads as a plain neutral wash — text-diff hover/cross-
+   * highlight is achromatic (no pillar owns "which node is the anchor"),
+   * so this stays consistent with .tok.highlight-anchor above rather
+   * than borrowing a hue. */
   .ss-table tr.anchor td {
-    background: rgba(72, 138, 203, 0.12);
+    background: color-mix(in srgb, var(--fg) 6%, transparent);
   }
   .ss-table tr.anchor td.ss-tag {
-    color: var(--accent-blue);
+    color: var(--fg-strong);
     font-weight: var(--weight-medium);
   }
 
-  /* Logit-pass Phase 5: cross-evaluation table. */
+  /* Logit-pass Phase 5: cross-evaluation table.  Vocabulary-distribution
+   * quantities (logprobs, KL, rank flips) are logit-space — the lens
+   * pillar hue marks this block as that same family. */
   .joint-table {
     display: flex;
     flex-direction: column;
@@ -1004,10 +1086,11 @@
     gap: var(--space-4);
   }
   .joint-label {
-    color: var(--fg-muted);
+    color: var(--pillar-lens);
     font-size: var(--text-xs);
-    text-transform: lowercase;
-    letter-spacing: 0;
+    font-weight: var(--weight-medium);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
   }
   .joint-summary {
     color: var(--fg-dim);
@@ -1020,23 +1103,26 @@
     width: 100%;
     border-collapse: separate;
     border-spacing: 0;
+    font-family: var(--font-mono);
     font-variant-numeric: tabular-nums;
     font-size: var(--text-xs);
-    background: var(--bg-alt);
-    border: 1px solid var(--border);
+    background: var(--bg);
+    border: 1px solid color-mix(in srgb, var(--pillar-lens) 14%, var(--glass-line));
+    border-radius: var(--radius);
   }
   .lp-table th,
   .lp-table td {
     padding: var(--space-1) var(--space-3);
-    border-bottom: 1px solid var(--border);
+    border-bottom: 1px solid var(--glass-line);
     text-align: left;
   }
   .lp-table thead th {
     color: var(--fg-muted);
-    font-weight: var(--weight-normal);
+    font-family: var(--font-ui);
+    font-weight: var(--weight-medium);
     text-transform: uppercase;
-    letter-spacing: 0;
-    background: var(--bg-deep);
+    letter-spacing: 0.06em;
+    background: var(--bg);
   }
   .lp-table td.lp-num,
   .lp-table th.lp-num {
@@ -1059,18 +1145,18 @@
     background: transparent;
     word-break: break-all;
   }
-  /* Rank-1 flips read as the highest-signal rows — give them a soft
-     yellow tint, mirroring the readings table's top-delta affordance. */
+  /* Rank-1 flips are the highest-signal rows in this logit-space table —
+   * tint them in the lens family rather than the old amber. */
   .lp-table tr.rank-flip td {
-    background: rgba(240, 200, 88, 0.10);
+    background: color-mix(in srgb, var(--pillar-lens) 10%, transparent);
   }
   .lp-table tr.rank-flip .lp-flag {
-    color: var(--accent-yellow);
+    color: var(--pillar-lens);
   }
   .joint-foot {
     color: var(--fg-muted);
     font-size: var(--text-xs);
-    line-height: 1.4;
+    line-height: 1.5;
     margin: 0;
   }
 
@@ -1082,8 +1168,9 @@
   .readings-label {
     color: var(--fg-muted);
     font-size: var(--text-xs);
-    text-transform: lowercase;
-    letter-spacing: 0;
+    font-weight: var(--weight-medium);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
   }
   .readings-grid {
     display: flex;
@@ -1096,9 +1183,12 @@
     align-items: center;
     gap: var(--space-2);
     font-size: var(--text-sm);
+    font-family: var(--font-mono);
   }
+  /* Top-5-by-magnitude marker: an emphasis wash, not a hue — the sign
+   * itself already reads green(+)/red(−) via .r-delta / .r-bar-fill. */
   .reading-row.top-delta .r-name {
-    color: var(--accent-yellow);
+    color: var(--fg-strong);
     font-weight: var(--weight-medium);
   }
   .r-name {
@@ -1142,20 +1232,7 @@
     display: flex;
     justify-content: flex-end;
     gap: var(--space-3);
-    padding: var(--space-5) var(--space-6);
-    border-top: 1px solid var(--border);
-  }
-  .btn {
-    background: var(--bg-alt);
-    color: var(--fg-strong);
-    border: 1px solid var(--border);
-    padding: var(--space-2) var(--space-5);
-    font: inherit;
-    font-family: var(--font-mono);
-    cursor: pointer;
-  }
-  .btn:hover {
-    background: var(--bg-elev);
-    border-color: var(--fg-muted);
+    padding: var(--space-3) var(--space-6);
+    border-top: 1px solid var(--glass-line);
   }
 </style>

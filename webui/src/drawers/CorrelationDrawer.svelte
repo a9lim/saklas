@@ -16,6 +16,7 @@
 
   import { closeDrawer, refreshCorrelation, steerRack } from "../lib/stores.svelte";
   import HeatmapCell from "../lib/charts/HeatmapCell.svelte";
+  import Button from "../lib/ui/Button.svelte";
 
   // Drawer host forwards { params } — unused here, but the prop must
   // exist so the host's switch can pass it uniformly.
@@ -76,20 +77,21 @@
 <aside class="drawer" aria-label="Correlation matrix">
   <header class="drawer-header">
     <div class="title">
-      <span class="label">correlation</span>
-      <span class="coord">
-        {names.length} {names.length === 1 ? "name" : "names"}
-        {#if names.length > 0} · vectors + probes{/if}
-      </span>
+      <span class="eyebrow">correlation matrix</span>
+      <div class="name-row">
+        <span class="meta">
+          {names.length} {names.length === 1 ? "name" : "names"}
+          {#if names.length > 0} · vectors + probes{/if}
+        </span>
+      </div>
     </div>
     <div class="actions">
-      <button
-        type="button"
-        class="refresh"
+      <Button
+        size="sm"
         onclick={() => void reload()}
         disabled={loading}
         title="Re-fetch the correlation matrix"
-      >{loading ? "…" : "refresh"}</button>
+      >{loading ? "…" : "refresh"}</Button>
       <button type="button" class="close" onclick={onClose} aria-label="Close drawer">
         ×
       </button>
@@ -147,77 +149,81 @@
 </aside>
 
 <style>
+  /* v2 sheet interior — the host paints the sheet surface (glass hairline,
+   * radius, --bg-alt fill), so the root is transparent; chrome speaks sans
+   * and every value/identifier/expression sits in mono. */
   .drawer {
     display: flex;
     flex-direction: column;
     height: 100%;
     min-height: 0;
-    background: var(--bg);
+    background: transparent;
     color: var(--fg);
-    font-family: var(--font-mono);
+    font-family: var(--font-ui);
     font-size: var(--text);
-    border-left: 1px solid var(--border);
   }
 
   .drawer-header {
     display: flex;
     align-items: flex-start;
     justify-content: space-between;
-    gap: var(--space-4);
-    padding: var(--space-4) var(--space-4);
-    border-bottom: 1px solid var(--border);
+    gap: var(--space-5);
+    padding: var(--space-5) var(--space-6);
+    border-bottom: 1px solid var(--glass-line);
   }
   .title {
     display: flex;
     flex-direction: column;
-    gap: var(--space-1);
+    gap: var(--space-2);
     min-width: 0;
   }
-  .label {
+  .eyebrow {
     color: var(--fg-muted);
     font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
     text-transform: uppercase;
-    letter-spacing: 0;
+    letter-spacing: 0.08em;
   }
-  .coord {
-    color: var(--fg-dim);
+  .name-row {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-3);
+    min-width: 0;
+  }
+  .meta {
+    color: var(--fg-subtle);
     font-size: var(--text-sm);
+    white-space: nowrap;
   }
   .actions {
     display: flex;
-    gap: var(--space-2);
+    gap: var(--space-3);
     align-items: center;
-  }
-  .refresh {
-    background: transparent;
-    color: var(--fg-strong);
-    border: 1px solid var(--border);
-    padding: var(--space-1) var(--space-4);
-    font: inherit;
-    font-size: var(--text-sm);
-    text-transform: lowercase;
-    cursor: pointer;
-  }
-  .refresh:hover:not(:disabled) {
-    background: var(--bg-elev);
-    border-color: var(--fg-muted);
-  }
-  .refresh:disabled {
-    color: var(--fg-muted);
-    cursor: not-allowed;
+    flex: none;
   }
   .close {
     background: transparent;
     color: var(--fg-muted);
     border: 1px solid var(--border);
-    padding: 0 var(--space-3);
+    border-radius: 50%;
+    width: 26px;
+    height: 26px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
     font: inherit;
     font-size: var(--text-md);
+    line-height: 1;
     cursor: pointer;
-    line-height: 1.4;
+    flex: none;
+    transition:
+      color var(--dur-fast) var(--ease-out),
+      background var(--dur-fast) var(--ease-out),
+      border-color var(--dur-fast) var(--ease-out);
   }
   .close:hover {
-    color: var(--fg-strong);
+    color: var(--fg);
+    background: var(--bg-hover);
     border-color: var(--fg-muted);
   }
 
@@ -225,41 +231,45 @@
     flex: 1 1 auto;
     overflow: auto;
     min-height: 0;
-    padding: var(--space-4) var(--space-4);
+    padding: var(--space-5) var(--space-6);
   }
   .empty {
     color: var(--fg-muted);
-    font-style: italic;
-    padding: var(--space-5) 0;
-    line-height: 1.4;
+    padding: var(--space-6) 0;
+    line-height: 1.5;
+    max-width: 62ch;
   }
   .empty.err {
     color: var(--accent-error);
-    font-style: normal;
   }
 
+  /* Data well — recessed matrix.  Every column/row label here IS an
+   * identifier (vector/probe name), not a category header, so the whole
+   * grid speaks mono (matches the probes tab in TokenDrilldownDrawer). */
   .grid-scroll {
     overflow: auto;
     max-height: 100%;
-    border: 1px solid var(--border);
-    background: var(--bg-alt);
+    border: 1px solid var(--glass-line);
+    border-radius: var(--radius);
+    background: var(--bg);
   }
   .grid {
     border-collapse: separate;
     border-spacing: 0;
+    font-family: var(--font-mono);
     font-variant-numeric: tabular-nums;
   }
   .grid th,
   .grid td {
     padding: 0;
     margin: 0;
-    background: var(--bg-alt);
+    background: var(--bg);
   }
   .grid thead th {
     position: sticky;
     top: 0;
     z-index: 2;
-    border-bottom: 1px solid var(--border);
+    border-bottom: 1px solid var(--glass-line);
   }
   .grid .row-label {
     position: sticky;
@@ -269,7 +279,7 @@
     padding: 0 var(--space-3) 0 var(--space-2);
     color: var(--fg-dim);
     font-size: var(--text-xs);
-    border-right: 1px solid var(--border);
+    border-right: 1px solid var(--glass-line);
     white-space: nowrap;
   }
   .grid .corner {
@@ -281,8 +291,8 @@
     font-size: var(--text-xs);
     text-align: left;
     padding: var(--space-1) var(--space-3);
-    border-right: 1px solid var(--border);
-    border-bottom: 1px solid var(--border);
+    border-right: 1px solid var(--glass-line);
+    border-bottom: 1px solid var(--glass-line);
   }
   .grid .col-label {
     color: var(--fg-dim);
@@ -306,12 +316,12 @@
   }
 
   .drawer-footer {
-    border-top: 1px solid var(--border);
-    padding: var(--space-2) var(--space-4);
+    border-top: 1px solid var(--glass-line);
+    padding: var(--space-3) var(--space-6);
     color: var(--fg-muted);
     font-size: var(--text-xs);
   }
   .hint {
-    line-height: 1.4;
+    line-height: 1.5;
   }
 </style>

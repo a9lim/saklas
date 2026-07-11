@@ -14,6 +14,7 @@
     steerRack,
     vectorsState,
   } from "../lib/stores.svelte";
+  import Button from "../lib/ui/Button.svelte";
 
   let _drawerProps: { params?: unknown } = $props();
   $effect(() => {
@@ -56,10 +57,12 @@
 </script>
 
 <section class="drawer-shell" aria-label="Health drawer">
-  <header class="header">
-    <div>
-      <span class="title">model health</span>
-      <p>runtime readiness, tree state, vectors, probes, and UI coverage</p>
+  <header class="drawer-header">
+    <div class="title">
+      <span class="eyebrow">model health</span>
+      <div class="name-row">
+        <span class="meta">runtime readiness, tree state, vectors, probes, and UI coverage</span>
+      </div>
     </div>
     <button type="button" class="close" aria-label="Close" onclick={closeDrawer}>×</button>
   </header>
@@ -70,9 +73,9 @@
         <h2>{sessionState.info?.model_id ?? "no model"}</h2>
         <p>{sessionState.info ? `${sessionState.info.device}/${sessionState.info.dtype}` : "session offline"}</p>
       </div>
-      <button type="button" disabled={busy} onclick={audit}>
+      <Button variant="solid" disabled={busy} onclick={audit}>
         {busy ? "auditing…" : "refresh audit"}
-      </button>
+      </Button>
     </section>
 
     {#if errorMsg}
@@ -137,27 +140,168 @@
 </section>
 
 <style>
-  .drawer-shell { display: flex; flex-direction: column; min-height: 0; background: var(--bg-alt); }
-  .header { display: flex; justify-content: space-between; gap: var(--space-6); padding: var(--space-6) var(--space-6); border-bottom: 1px solid var(--border); background: var(--surface); }
-  .title { color: var(--accent); text-transform: uppercase; letter-spacing: 0; font-size: var(--text-xs); font-weight: var(--weight-bold); }
-  .header p, .hero p, .tile p, .dim { margin: var(--space-1) 0 0; color: var(--fg-muted); }
-  .close { background: transparent; border: 0; color: var(--fg-muted); font-size: var(--text-md); }
-  .body { display: grid; gap: var(--space-5); padding: var(--space-6); overflow: auto; }
-  .hero, .tile, .panel { border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); padding: var(--space-6); }
-  .hero { display: flex; align-items: center; justify-content: space-between; gap: var(--space-6); }
-  h2, h3 { margin: 0; color: var(--fg); letter-spacing: 0; }
-  h2 { font-size: var(--text); }
-  h3 { font-size: var(--text-sm); margin-bottom: var(--space-5); }
-  button { border: 1px solid var(--accent); border-radius: var(--radius); background: var(--accent-subtle); color: var(--accent); padding: var(--space-5) var(--space-5); font-weight: var(--weight-bold); }
-  button:disabled { opacity: 0.55; cursor: wait; }
-  .grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--space-5); }
-  .tile span { color: var(--fg-muted); font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0; }
-  .tile strong { display: block; margin-top: var(--space-2); color: var(--accent); font-family: var(--font-mono); font-size: var(--text); }
-  .checks { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--space-3); }
-  .checks div { border: 1px solid var(--border); border-radius: var(--radius); padding: var(--space-4); color: var(--fg-muted); background: var(--bg-elev); }
-  .checks div.ok { color: var(--accent-green); border-color: var(--accent-green); background: rgba(126,231,135,0.07); }
-  ul { margin: 0; padding-left: var(--space-6); color: var(--accent-amber); }
+  /* v2 sheet interior — the host paints the sheet surface (glass hairline,
+   * radius, --bg-alt fill), so the root is transparent; chrome speaks sans
+   * and every value/identifier/number sits in mono. */
+  .drawer-shell {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    background: transparent;
+    color: var(--fg);
+    font-family: var(--font-ui);
+    font-size: var(--text);
+  }
+  .drawer-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: var(--space-5);
+    padding: var(--space-5) var(--space-6);
+    border-bottom: 1px solid var(--glass-line);
+  }
+  .title {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    min-width: 0;
+  }
+  .eyebrow {
+    color: var(--fg-muted);
+    font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+  .name-row {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-3);
+    min-width: 0;
+  }
+  .meta {
+    color: var(--fg-subtle);
+    font-size: var(--text-sm);
+  }
+  .hero p, .tile p, .dim {
+    margin: var(--space-1) 0 0;
+    color: var(--fg-muted);
+    line-height: 1.5;
+  }
+  .close {
+    background: transparent;
+    color: var(--fg-muted);
+    border: 1px solid var(--border);
+    border-radius: 50%;
+    width: 26px;
+    height: 26px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font: inherit;
+    font-size: var(--text-md);
+    line-height: 1;
+    cursor: pointer;
+    flex: none;
+    transition:
+      color var(--dur-fast) var(--ease-out),
+      background var(--dur-fast) var(--ease-out),
+      border-color var(--dur-fast) var(--ease-out);
+  }
+  .close:hover {
+    color: var(--fg);
+    background: var(--bg-hover);
+    border-color: var(--fg-muted);
+  }
+  .body {
+    display: grid;
+    gap: var(--space-5);
+    padding: var(--space-5) var(--space-6);
+    overflow: auto;
+  }
+  /* Data wells — recessed stat/summary containers. */
+  .hero, .tile, .panel {
+    border: 1px solid var(--glass-line);
+    border-radius: var(--radius);
+    background: var(--bg);
+    padding: var(--space-6);
+  }
+  .hero {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-6);
+  }
+  h2, h3 { margin: 0; color: var(--fg); }
+  h2 {
+    font-family: var(--font-mono);
+    font-size: var(--text-md);
+    font-weight: var(--weight-medium);
+  }
+  h3 {
+    color: var(--fg-muted);
+    font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    margin-bottom: var(--space-5);
+  }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: var(--space-5);
+  }
+  .tile span {
+    color: var(--fg-muted);
+    font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+  .tile strong {
+    display: block;
+    margin-top: var(--space-2);
+    color: var(--fg);
+    font-family: var(--font-mono);
+    font-size: var(--text-md);
+    font-variant-numeric: tabular-nums;
+  }
+  .checks {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: var(--space-3);
+  }
+  .checks div {
+    border: 1px solid var(--glass-line);
+    border-radius: var(--radius);
+    padding: var(--space-4);
+    color: var(--fg-muted);
+    background: var(--bg-elev);
+    font-size: var(--text-sm);
+    transition:
+      color var(--dur-fast) var(--ease-out),
+      border-color var(--dur-fast) var(--ease-out),
+      background var(--dur-fast) var(--ease-out);
+  }
+  .checks div.ok {
+    color: var(--accent-green);
+    border-color: color-mix(in srgb, var(--accent-green) 35%, var(--glass-line));
+    background: color-mix(in srgb, var(--accent-green) 8%, var(--bg-elev));
+  }
+  ul {
+    margin: 0;
+    padding-left: var(--space-6);
+    color: var(--accent-yellow);
+    line-height: 1.5;
+  }
   li + li { margin-top: var(--space-2); }
-  .good { color: var(--accent-green); margin: 0; }
-  .error { color: var(--accent-red); border: 1px solid var(--accent-red); background: rgba(255,118,117,0.08); border-radius: var(--radius); padding: var(--space-5); }
+  .good { color: var(--accent-green); margin: 0; line-height: 1.5; }
+  .error {
+    color: var(--accent-error);
+    border: 1px solid color-mix(in srgb, var(--accent-red) 35%, transparent);
+    background: color-mix(in srgb, var(--accent-red) 8%, transparent);
+    border-radius: var(--radius);
+    padding: var(--space-5);
+    line-height: 1.5;
+  }
 </style>

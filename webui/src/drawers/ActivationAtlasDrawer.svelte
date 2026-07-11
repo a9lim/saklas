@@ -136,11 +136,13 @@
 <aside class="drawer" aria-label="Activation atlas">
   <header class="drawer-header">
     <div class="title">
-      <span class="label">activation atlas</span>
-      <span class="coord">
-        {tokens.length} {tokens.length === 1 ? "token" : "tokens"}
-        {#if selected} · T{selected.turn}:{selected.token}{/if}
-      </span>
+      <span class="eyebrow">activation atlas</span>
+      <div class="name-row">
+        <span class="meta">
+          {tokens.length} {tokens.length === 1 ? "token" : "tokens"}
+          {#if selected} · T{selected.turn}:{selected.token}{/if}
+        </span>
+      </div>
     </div>
     <button type="button" class="close" onclick={onClose} aria-label="Close drawer">
       ×
@@ -285,58 +287,75 @@
 </aside>
 
 <style>
-  /* Drawer chrome — same flat shape as CorrelationDrawer and
-   * LayerNormsDrawer (no inner card backgrounds, sections separated by
-   * border-bottom).  ``bg`` rather than ``bg-alt`` so the drawer sits
-   * one shade above the rack zone behind it, same as the others. */
+  /* v2 sheet interior — the host paints the sheet surface (glass hairline,
+   * radius, --bg-alt fill), so the root is transparent; chrome speaks sans
+   * and every value/identifier/expression sits in mono. */
   .drawer {
     display: flex;
     flex-direction: column;
     height: 100%;
     min-height: 0;
-    background: var(--bg);
+    background: transparent;
     color: var(--fg);
-    font-family: var(--font-mono);
+    font-family: var(--font-ui);
     font-size: var(--text);
-    border-left: 1px solid var(--border);
   }
 
   .drawer-header {
     display: flex;
     align-items: flex-start;
     justify-content: space-between;
-    gap: var(--space-4);
-    padding: var(--space-4) var(--space-4);
-    border-bottom: 1px solid var(--border);
+    gap: var(--space-5);
+    padding: var(--space-5) var(--space-6);
+    border-bottom: 1px solid var(--glass-line);
   }
   .title {
     display: flex;
     flex-direction: column;
-    gap: var(--space-1);
+    gap: var(--space-2);
     min-width: 0;
   }
-  .label {
+  .eyebrow {
     color: var(--fg-muted);
     font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
     text-transform: uppercase;
-    letter-spacing: 0;
+    letter-spacing: 0.08em;
   }
-  .coord {
-    color: var(--fg-dim);
+  .name-row {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-3);
+    min-width: 0;
+  }
+  .meta {
+    color: var(--fg-subtle);
     font-size: var(--text-sm);
+    white-space: nowrap;
   }
   .close {
     background: transparent;
     color: var(--fg-muted);
     border: 1px solid var(--border);
-    padding: 0 var(--space-3);
+    border-radius: 50%;
+    width: 26px;
+    height: 26px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
     font: inherit;
     font-size: var(--text-md);
+    line-height: 1;
     cursor: pointer;
-    line-height: 1.4;
+    flex: none;
+    transition:
+      color var(--dur-fast) var(--ease-out),
+      background var(--dur-fast) var(--ease-out),
+      border-color var(--dur-fast) var(--ease-out);
   }
   .close:hover {
-    color: var(--fg-strong);
+    color: var(--fg);
+    background: var(--bg-hover);
     border-color: var(--fg-muted);
   }
 
@@ -346,8 +365,8 @@
     display: grid;
     grid-template-columns: repeat(4, minmax(0, 1fr));
     gap: var(--space-5);
-    padding: var(--space-3) var(--space-4);
-    border-bottom: 1px solid var(--border);
+    padding: var(--space-3) var(--space-6);
+    border-bottom: 1px solid var(--glass-line);
   }
   .stat {
     display: flex;
@@ -358,11 +377,13 @@
   .stat-label {
     color: var(--fg-muted);
     font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
     text-transform: uppercase;
-    letter-spacing: 0;
+    letter-spacing: 0.06em;
   }
   .stat strong {
-    color: var(--fg-strong);
+    color: var(--fg);
+    font-family: var(--font-mono);
     font-weight: var(--weight-medium);
     overflow: hidden;
     text-overflow: ellipsis;
@@ -376,8 +397,8 @@
     min-height: 0;
   }
   .section {
-    padding: var(--space-4) var(--space-4);
-    border-bottom: 1px solid var(--border);
+    padding: var(--space-5) var(--space-6);
+    border-bottom: 1px solid var(--glass-line);
   }
   .section:last-child {
     border-bottom: 0;
@@ -393,20 +414,21 @@
     margin: 0;
     color: var(--fg-muted);
     font-size: var(--text-xs);
-    text-transform: uppercase;
-    letter-spacing: 0;
     font-weight: var(--weight-medium);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
   }
   .section-head span {
-    color: var(--fg-dim);
+    color: var(--fg-subtle);
     font-size: var(--text-xs);
   }
 
   .empty {
     color: var(--fg-muted);
-    font-style: italic;
-    padding: var(--space-5) 0;
-    line-height: 1.4;
+    padding: var(--space-6) 0;
+    line-height: 1.5;
+    max-width: 62ch;
+    margin: 0 auto;
     text-align: center;
   }
 
@@ -433,19 +455,24 @@
     font: inherit;
     font-family: var(--font-mono);
     font-size: var(--text-xs);
+    transition:
+      background var(--dur-fast) var(--ease-out),
+      border-color var(--dur-fast) var(--ease-out);
   }
   .chip:hover {
-    background: var(--bg-elev);
+    background: var(--bg-hover);
   }
   .chip.selected {
     border-color: var(--accent);
     background: var(--accent-subtle);
   }
+  /* Surprise spark — a vocabulary-distribution quantity, so it reads in
+   * logit-space blue (the lens family), not the demoted amber. */
   .spark {
     position: absolute;
     inset: auto auto 0 0;
     height: 2px;
-    background: var(--accent-amber);
+    background: var(--highlight-surprise);
     opacity: 0.8;
   }
   code {
@@ -454,31 +481,33 @@
     white-space: pre-wrap;
   }
 
-  /* Heatmap grid — copied verbatim from CorrelationDrawer so the two
+  /* Heatmap grid — same well chrome as CorrelationDrawer so the two
    * surfaces read identically (sticky headers, rotated col labels,
-   * hairline borders, no inner card fill). */
+   * hairline glass borders, opaque sticky cells). */
   .grid-scroll {
     overflow: auto;
     max-height: 32rem;
-    border: 1px solid var(--border);
-    background: var(--bg-alt);
+    border: 1px solid var(--glass-line);
+    border-radius: var(--radius);
+    background: var(--bg);
   }
   .grid {
     border-collapse: separate;
     border-spacing: 0;
+    font-family: var(--font-mono);
     font-variant-numeric: tabular-nums;
   }
   .grid th,
   .grid td {
     padding: 0;
     margin: 0;
-    background: var(--bg-alt);
+    background: var(--bg);
   }
   .grid thead th {
     position: sticky;
     top: 0;
     z-index: 2;
-    border-bottom: 1px solid var(--border);
+    border-bottom: 1px solid var(--glass-line);
   }
   .grid .row-label {
     position: sticky;
@@ -488,7 +517,7 @@
     padding: 0 var(--space-3) 0 var(--space-2);
     color: var(--fg-dim);
     font-size: var(--text-xs);
-    border-right: 1px solid var(--border);
+    border-right: 1px solid var(--glass-line);
     white-space: nowrap;
   }
   .grid .corner {
@@ -500,8 +529,8 @@
     font-size: var(--text-xs);
     text-align: left;
     padding: var(--space-1) var(--space-3);
-    border-right: 1px solid var(--border);
-    border-bottom: 1px solid var(--border);
+    border-right: 1px solid var(--glass-line);
+    border-bottom: 1px solid var(--glass-line);
   }
   .grid .col-label {
     color: var(--fg-dim);
@@ -524,8 +553,8 @@
     line-height: 0;
   }
 
-  /* Distribution lens — flat row list, same border-radius/hairline
-   * idiom as the loom-node chip / nav button. */
+  /* Distribution lens — flat row list, same hairline idiom as the loom-
+   * node chip / nav button. */
   .alts {
     display: flex;
     flex-direction: column;
@@ -539,7 +568,7 @@
     gap: var(--space-4);
     align-items: center;
     padding: var(--space-2) var(--space-3);
-    border-bottom: 1px solid var(--border);
+    border-bottom: 1px solid var(--glass-line);
     font-size: var(--text-xs);
   }
   .alt-row:last-child {
@@ -547,21 +576,24 @@
   }
   .alt-id {
     color: var(--fg-muted);
+    font-family: var(--font-mono);
     font-variant-numeric: tabular-nums;
   }
+  /* A vocabulary-distribution logprob — logit-space blue, same family as
+   * the lens, not the demoted amber. */
   .alt-logprob {
-    color: var(--accent-amber);
+    color: var(--pillar-lens);
     font-family: var(--font-mono);
     font-variant-numeric: tabular-nums;
   }
 
   .drawer-footer {
-    border-top: 1px solid var(--border);
-    padding: var(--space-2) var(--space-4);
+    border-top: 1px solid var(--glass-line);
+    padding: var(--space-3) var(--space-6);
     color: var(--fg-muted);
     font-size: var(--text-xs);
   }
   .hint {
-    line-height: 1.4;
+    line-height: 1.5;
   }
 </style>
