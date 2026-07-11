@@ -7634,8 +7634,16 @@ class SaklasSession:
                 # Live workspace readout (None when off): the step's top-k
                 # lens tokens per selected layer + the layer-aggregated
                 # chip list.
-                lens_step = self._live_lens_readout_step()
-                sae_step = self._live_sae_readout_step()
+                lens_step = (
+                    self._live_lens_readout_step()
+                    if _has_lens_consumer
+                    else None
+                )
+                sae_step = (
+                    self._live_sae_readout_step()
+                    if _has_sae_consumer
+                    else None
+                )
                 # Pinned lens probes tick on the same step (readings extracted
                 # from the display logits inside the readout step) — merge them
                 # into every populated probe channel so the loom row, trait
@@ -7660,13 +7668,24 @@ class SaklasSession:
                     )
                 scores = payload.scores
                 per_layer_payload = payload.per_layer_scores
-                self._last_token_probe_payload = payload.to_token_payload(
-                    lens=lens_step[0] if lens_step is not None else None,
-                    lens_aggregate=(
-                        lens_step[1] if lens_step is not None else None
-                    ),
-                    sae=sae_step,
+                lens_payload = lens_step[0] if lens_step is not None else None
+                lens_aggregate_payload = (
+                    lens_step[1] if lens_step is not None else None
                 )
+                if (
+                    payload.scores
+                    or payload.readings
+                    or payload.per_layer_scores
+                    or payload.probe_readings
+                    or lens_payload
+                    or lens_aggregate_payload
+                    or sae_step
+                ):
+                    self._last_token_probe_payload = payload.to_token_payload(
+                        lens=lens_payload,
+                        lens_aggregate=lens_aggregate_payload,
+                        sae=sae_step,
+                    )
                 if assistant_node_id is not None and tid is not None:
                     token_row: dict[str, Any] = {
                         "token_id": int(tid),

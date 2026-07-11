@@ -15,7 +15,7 @@ from saklas.core.generation import (
     generate_steered,
 )
 from saklas.core.results import GenerationResult, ProbeReading
-from saklas.core.session import CaptureMode, CaptureState, SaklasSession
+from saklas.core.session import CaptureMode, CaptureState, GenState, SaklasSession
 from saklas.core.steering import Steering
 
 
@@ -447,6 +447,132 @@ def test_generate_stream_live_readouts_false_suppresses_readout_flags() -> None:
     assert events[0].lens_readout is None
     assert events[0].lens_aggregate is None
     assert events[0].sae_readout is None
+
+
+def test_token_tap_skips_unconsumed_live_readout_helpers_and_empty_payload() -> None:
+    import threading
+
+    from saklas.core.triggers import TriggerContext
+
+    session: Any = SaklasSession.__new__(SaklasSession)
+    session._gen_lock = threading.Lock()
+    session._gen_phase = GenState.IDLE
+    session._gen_state = GenerationState()
+    session._apply_cast_defaults = (
+        lambda steering, sampling, thinking, **_kwargs: (
+            steering,
+            sampling,
+            thinking,
+        )
+    )
+    session._prepare_generation_call = lambda *_args: (
+        None,
+        False,
+        GenerationConfig(max_new_tokens=1, temperature=0.0, top_p=1.0, top_k=None),
+        None,
+        None,
+        None,
+        None,
+        0.0,
+        0.0,
+        None,
+    )
+    session._whitener = None
+    session._seat_stop_augmentation = lambda stop_list, **_kwargs: stop_list
+    session._monitor = SimpleNamespace(
+        probe_names=[],
+        set_subspace_coords=lambda _enabled: None,
+        begin_live=lambda: None,
+        end_live=lambda: None,
+    )
+    session._live_probe_scores = True
+    session._trait_queues = []
+    session._trait_lock = threading.Lock()
+    composer = SimpleNamespace(
+        _stack=[],
+        steering_needs_probe_gating=lambda: False,
+        gated_probe_keys=lambda: set(),
+        gated_lens_probe_keys=lambda: set(),
+        gated_sae_probe_keys=lambda: set(),
+        gated_probe_names=lambda: set(),
+    )
+    session._get_steering_composer = lambda: composer
+    session._start_loom_assistant = lambda *_args, **_kwargs: None
+    session._snapshot_steering_alphas = lambda: {}
+    session._generation_preamble = lambda *_args, **_kwargs: (
+        torch.tensor([[1]], dtype=torch.long),
+        False,
+        1,
+    )
+    session.events = SimpleNamespace(emit=lambda _event: None)
+    session._begin_capture = lambda **_kwargs: False
+    session._steering = SimpleNamespace(
+        ctx=TriggerContext(),
+        reset_manifold_feet=lambda: None,
+        has_compiled_offsets=lambda: False,
+        zero_compiled_offsets=lambda: None,
+    )
+    session._capture_state = CaptureState()
+    session._capture = SimpleNamespace(per_layer_buckets=lambda: {})
+    session._incremental_readings = []
+    session._incremental_gate_scores = []
+    session._live_lens = {"layers": [0]}
+    session._live_sae = {"layer": 0, "top_k": 3}
+    session._live_lens_readout_step = lambda: (
+        (_ for _ in ()).throw(AssertionError("lens readout not consumed"))
+    )
+    session._live_sae_readout_step = lambda: (
+        (_ for _ in ()).throw(AssertionError("sae readout not consumed"))
+    )
+    session._last_lens_step_readings = None
+    session._last_sae_step_readings = None
+    session._last_token_probe_payload = {"stale": True}
+    observed_payloads: list[Any] = []
+    seen_tokens: list[str] = []
+
+    def _run_generation_loop(
+        _input_ids: Any,
+        _gen_config: Any,
+        *,
+        effective_tap: Any,
+        **_kwargs: Any,
+    ) -> tuple[list[int], float]:
+        assert effective_tap is not None
+        effective_tap("x", False, 1, None, None, None)
+        observed_payloads.append(session._last_token_probe_payload)
+        return [1], 0.1
+
+    session._run_generation_loop = _run_generation_loop
+    session._finalize_generation = lambda *_args, **_kwargs: GenerationResult(
+        text="x",
+        tokens=[1],
+        token_count=1,
+        tok_per_sec=10.0,
+        elapsed=0.1,
+    )
+    session._end_capture = lambda: None
+    session._active_gen_reservation = None
+
+    def _on_token(
+        text: str,
+        _thinking: bool,
+        _tid: int | None,
+        _lp: float | None,
+        _top_alts: Any,
+        _perplexity: float | None,
+    ) -> None:
+        seen_tokens.append(text)
+
+    result = SaklasSession._generate_core(
+        session,
+        "prompt",
+        stateless=True,
+        on_token=_on_token,
+    )
+
+    assert result.text == "x"
+    assert seen_tokens == ["x"]
+    assert observed_payloads == [None]
 
 
 def test_finalize_incremental_probe_path_does_not_stack_capture() -> None:
