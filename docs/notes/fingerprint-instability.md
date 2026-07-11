@@ -1,8 +1,16 @@
-# BUG: `loaded_model_fingerprint` is unstable across identical loads
+# RESOLVED: `loaded_model_fingerprint` was unstable across identical loads
 
 *Filed 2026-07-10 during the UI-redesign Phase 3 verification. Owner: a9
 (future session). Two adjacent bugs found the same day are already fixed —
 see "context" below — this is the remaining open one.*
+
+Resolved 2026-07-10. Twelve clean MPS loads reproduced the reported split
+(8 produced `169717…`, 4 produced `7490c8…`). The config, trusted checkpoint
+fingerprint, parameter schema, and state signature were identical. Gemma-3
+registered the same four rotary buffers in two possible orders; the fingerprint
+treated `named_buffers()` traversal order as identity. Parameter and buffer rows
+are now sorted by name before both schema hashing and the exact-state fallback,
+with a registration-order regression test.
 
 ## Symptom
 

@@ -298,6 +298,26 @@ def test_loaded_model_fingerprint_hashes_buffers_and_original_dtype_bits() -> No
     assert loaded_model_fingerprint(buffer_changed, "toy") != fp
 
 
+def test_loaded_model_fingerprint_ignores_registration_order() -> None:
+    class _SameState(torch.nn.Module):
+        def __init__(self, buffer_names: tuple[str, ...]) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor([1.0]))
+            for name in buffer_names:
+                self.register_buffer(name, torch.tensor([ord(name[0])]))
+            self.config = SimpleNamespace(model_type="toy", _name_or_path="toy")
+
+    forward = _SameState(("alpha", "zeta"))
+    reversed_order = _SameState(("zeta", "alpha"))
+
+    assert [name for name, _ in forward.named_buffers()] != [
+        name for name, _ in reversed_order.named_buffers()
+    ]
+    assert loaded_model_fingerprint(forward, "toy") == loaded_model_fingerprint(
+        reversed_order, "toy",
+    )
+
+
 def test_loaded_model_fingerprint_memoizes_until_sanctioned_mutation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

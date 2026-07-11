@@ -223,13 +223,20 @@ def loaded_model_fingerprint(model: Any, model_id: str) -> str:
         cached = _MODEL_FINGERPRINT_CACHE.get(base)
     if cached is not None and cached[:2] == (state_signature, model_id):
         return cached[2]
+    # ``named_*`` follows module/registration order, which is not an identity
+    # property.  Some HF modules build equivalent buffer registries from sets
+    # (Gemma-3's shared rotary buffers are the live case), so two identical
+    # loads can expose the same names in a different order.  Canonicalize once
+    # and reuse that ordering for both the schema and the exact-state fallback.
+    named_parameters = sorted(base.named_parameters(), key=lambda item: item[0])
+    named_buffers = sorted(base.named_buffers(), key=lambda item: item[0])
     parameter_schema = [
         (name, tuple(int(dim) for dim in parameter.shape), str(parameter.dtype))
-        for name, parameter in base.named_parameters()
+        for name, parameter in named_parameters
     ]
     buffer_schema = [
         (name, tuple(int(dim) for dim in buffer.shape), str(buffer.dtype))
-        for name, buffer in base.named_buffers()
+        for name, buffer in named_buffers
     ]
     trusted_source = getattr(base, "_saklas_source_fingerprint", None)
     payload = {
@@ -254,7 +261,7 @@ def loaded_model_fingerprint(model: Any, model_id: str) -> str:
         # loaded it). Persistent reuse is safe only with an exact state hash.
         # Stream bounded chunks instead of cloning the whole model. Clean
         # saklas-owned loads use the exact immutable source fingerprint above.
-        tensors = list(base.named_parameters()) + list(base.named_buffers())
+        tensors = named_parameters + named_buffers
         for name, tensor in tensors:
             digest.update(name.encode("utf-8"))
             digest.update(str(tensor.dtype).encode("utf-8"))
