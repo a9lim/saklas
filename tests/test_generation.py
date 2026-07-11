@@ -1390,6 +1390,23 @@ def test_gate_only_without_final_probe_aggregate_narrows_capture_layers() -> Non
         def enable_curved_warm(self, _enabled: bool) -> None:
             pass
 
+        def plan_gate_scalars(
+            self,
+            gate_keys: set[str],
+            *,
+            probe_names: set[str] | None = None,
+        ) -> tuple[str, ...]:
+            assert gate_keys == {"gate@x"}
+            assert probe_names == {"gate"}
+            return ("plan",)
+
+        def score_planned_gate_scalars(
+            self,
+            _latest: dict[int, torch.Tensor],
+            _plan: tuple[str, ...],
+        ) -> dict[str, float]:
+            return {}
+
     capture = Capture()
     monitor = Monitor()
     session: Any = SaklasSession.__new__(SaklasSession)
@@ -1415,6 +1432,93 @@ def test_gate_only_without_final_probe_aggregate_narrows_capture_layers() -> Non
     assert capture.tail_with_sink is False
     assert session._capture_state.mode is CaptureMode.GATING_SUBSET
     assert session._capture_state.final_probe_aggregate is False
+
+
+def test_gate_only_capture_reuses_preplanned_gate_scalars() -> None:
+    plan = object()
+
+    class Capture:
+        def __init__(self) -> None:
+            self.sink: Any | None = None
+
+        def clear(self) -> None:
+            pass
+
+        def attach(self, _layers: Any, _layer_idxs: list[int]) -> None:
+            pass
+
+        def set_incremental(self, sink: Any) -> None:
+            self.sink = sink
+
+    class Monitor:
+        probe_names = ["gate"]
+
+        def __init__(self) -> None:
+            self.plan_calls: list[tuple[set[str], set[str] | None]] = []
+            self.score_plans: list[tuple[Any, ...]] = []
+
+        def probe_layers(self, names: set[str] | None = None) -> set[int]:
+            assert names == {"gate"}
+            return {2}
+
+        def reset_curved_feet(self) -> None:
+            pass
+
+        def enable_curved_warm(self, _enabled: bool) -> None:
+            pass
+
+        def plan_gate_scalars(
+            self,
+            gate_keys: set[str],
+            *,
+            probe_names: set[str] | None = None,
+        ) -> tuple[Any, ...]:
+            self.plan_calls.append((
+                set(gate_keys),
+                set(probe_names) if probe_names is not None else None,
+            ))
+            return (plan,)
+
+        def score_planned_gate_scalars(
+            self,
+            _latest: dict[int, torch.Tensor],
+            gate_plan: tuple[Any, ...],
+        ) -> dict[str, float]:
+            self.score_plans.append(gate_plan)
+            return {"gate": 0.25}
+
+        def score_gate_scalars(self, *_args: Any, **_kwargs: Any) -> dict[str, float]:
+            raise AssertionError("GATING_SUBSET should reuse the planned scalars")
+
+    capture = Capture()
+    monitor = Monitor()
+    session: Any = SaklasSession.__new__(SaklasSession)
+    session._layers = [object()] * 8
+    session._monitor = monitor
+    session._capture = capture
+    session._capture_buffers = {}
+    session._compiled_clean_eligible = False
+    session._steering_uses_compiled_offsets = False
+    session._live_lens = None
+    session._lens_probes = {}
+    session._live_sae = None
+    session._sae_probes = {}
+    session._sae_layer = None
+    session._steering = SimpleNamespace(all_fast_path=lambda: True)
+
+    SaklasSession._begin_capture(
+        session,
+        need_per_token=True,
+        gating_only_probes={"gate"},
+        gating_probe_keys={"gate"},
+        final_probe_aggregate=False,
+    )
+
+    assert monitor.plan_calls == [({"gate"}, {"gate"})]
+    assert capture.sink is not None
+    capture.sink({2: torch.ones(4)})
+    assert monitor.score_plans == [(plan,)]
+    assert session._incremental_gate_scores == [{"gate": 0.25}]
 
 
 def test_full_incremental_capture_deep_tail_only_for_readout_aggregate_layers() -> None:

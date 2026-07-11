@@ -114,6 +114,12 @@ class AttachedManifoldProbe:
     # ``NEUTRAL_LABEL not in manifold.node_labels`` so a real node named
     # ``neutral`` keeps sole ownership of the label.
     inject_neutral: bool = True
+    # Candidate order for exact ``@label`` / ``~label`` gate reads: corpus nodes
+    # followed by the synthetic neutral anchor when injected.  The mapping is
+    # built once at attach (duplicate corpus labels resolve to their last
+    # occurrence, matching the historic per-token dict comprehension).
+    candidate_labels: tuple[str, ...] = ()
+    label_to_candidate_idx: dict[str, int] = field(default_factory=dict)
     # Per-layer cache, indexed by layer index — same set of layers as
     # ``manifold.layers``.
     node_values_reduced: dict[int, torch.Tensor] = field(default_factory=dict)
@@ -477,12 +483,22 @@ def _attach_manifold_probe(
             idx: max(_MIN_SHARE_WEIGHT, w) / total
             for idx, w in share_weights_raw.items()
         }
+    inject_neutral = NEUTRAL_LABEL not in manifold.node_labels
+    candidate_labels = tuple(manifold.node_labels)
+    label_to_candidate_idx = {
+        label: idx for idx, label in enumerate(manifold.node_labels)
+    }
+    if inject_neutral:
+        label_to_candidate_idx[NEUTRAL_LABEL] = len(manifold.node_labels)
+        candidate_labels = (*candidate_labels, NEUTRAL_LABEL)
     probe = AttachedManifoldProbe(
         name=name,
         manifold=manifold,
         top_n=int(top_n),
         is_affine=_probe_is_affine_for_manifold(manifold),
-        inject_neutral=NEUTRAL_LABEL not in manifold.node_labels,
+        inject_neutral=inject_neutral,
+        candidate_labels=candidate_labels,
+        label_to_candidate_idx=label_to_candidate_idx,
         node_values_reduced=node_values_reduced,
         share_weights=share_weights,
     )

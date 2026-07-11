@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from collections import deque
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -27,6 +28,18 @@ _MAX_HISTORY = 8
 
 _EMPTY_STATS = {"count": 0, "sum": 0.0, "sum_sq": 0.0,
                 "min": float("inf"), "max": float("-inf")}
+
+
+@dataclass(frozen=True, slots=True)
+class _ProbeGateScalarPlan:
+    """Attach/generation-stable parse of the scalar channels a gate consumes."""
+
+    probe_name: str
+    coord_axes: tuple[tuple[int, str], ...] = ()
+    fraction_key: str | None = None
+    membership_key: str | None = None
+    dist_requests: tuple[tuple[str, int], ...] = ()
+    assign_requests: tuple[tuple[str, int], ...] = ()
 
 
 def _depth_stats(
@@ -750,21 +763,27 @@ class Monitor:
         # Preserve probe insertion order in the returned dict.
         return {name: out[name] for name in self._probes if name in out}
 
-    def _score_probe_gate_scalars(
+    @staticmethod
+    def _gate_scalar_label_index(
+        probe: "AttachedManifoldProbe",
+    ) -> dict[str, int]:
+        if probe.label_to_candidate_idx:
+            return probe.label_to_candidate_idx
+        # Compatibility fallback for direct-constructed probes in tests or
+        # external callers.  Attached production probes carry this map already.
+        label_to_idx = {
+            label: idx for idx, label in enumerate(probe.manifold.node_labels)
+        }
+        if probe.inject_neutral:
+            label_to_idx[NEUTRAL_LABEL] = len(probe.manifold.node_labels)
+        return label_to_idx
+
+    def _plan_probe_gate_scalars(
         self,
         probe: "AttachedManifoldProbe",
-        hidden_per_layer: dict[int, torch.Tensor],
         gate_keys: set[str],
-        sih_cache: dict[int, torch.Tensor] | None = None,
-    ) -> dict[str, float]:
-        """Score only the exact scalar channels a probe gate consumes.
-
-        This is intentionally narrower than :meth:`_score_probe_full`: it is used
-        only by the gate-only decode path, where no UI/API consumer needs a full
-        :class:`ProbeReading`. Curved ``:fraction`` and ``@label`` / ``~label``
-        gates can skip the nearest-foot solve entirely; coord and membership
-        gates still run the geometry they semantically require.
-        """
+    ) -> _ProbeGateScalarPlan | None:
+        """Parse one probe's requested gate scalar keys once per generation."""
         name = probe.name
         suffixes = {
             key[len(name):]: key for key in gate_keys
@@ -775,7 +794,7 @@ class Monitor:
             or key.startswith(f"{name}~")
         }
         if not suffixes:
-            return {}
+            return None
 
         coord_axes: dict[int, str] = {}
         if "" in suffixes:
@@ -806,7 +825,89 @@ class Monitor:
         need_assignment = bool(assign_labels)
         need_dist = bool(need_nearest or need_assignment)
         if not (need_coords or need_fraction or need_membership or need_dist):
+            return None
+        label_to_idx = self._gate_scalar_label_index(probe)
+        return _ProbeGateScalarPlan(
+            probe_name=name,
+            coord_axes=tuple(sorted(coord_axes.items())),
+            fraction_key=fraction_key,
+            membership_key=membership_key,
+            dist_requests=tuple(
+                (key, label_to_idx[label])
+                for label, key in dist_labels.items()
+                if label in label_to_idx
+            ),
+            assign_requests=tuple(
+                (key, label_to_idx[label])
+                for label, key in assign_labels.items()
+                if label in label_to_idx
+            ),
+        )
+
+    def plan_gate_scalars(
+        self,
+        gate_keys: set[str],
+        *,
+        probe_names: set[str] | None = None,
+    ) -> tuple[_ProbeGateScalarPlan, ...]:
+        """Pre-parse exact monitor gate scalar keys for the decode hot path."""
+        if not gate_keys or not self._probes:
+            return ()
+        names = (
+            set(probe_names)
+            if probe_names is not None
+            else {re.split(r"[\[:@~]", k, maxsplit=1)[0] for k in gate_keys}
+        )
+        plans: list[_ProbeGateScalarPlan] = []
+        for name, probe in self._probes.items():
+            if name not in names:
+                continue
+            plan = self._plan_probe_gate_scalars(probe, gate_keys)
+            if plan is not None:
+                plans.append(plan)
+        return tuple(plans)
+
+    def _score_probe_gate_scalars(
+        self,
+        probe: "AttachedManifoldProbe",
+        hidden_per_layer: dict[int, torch.Tensor],
+        gate_keys: set[str],
+        sih_cache: dict[int, torch.Tensor] | None = None,
+    ) -> dict[str, float]:
+        """Score only the exact scalar channels a probe gate consumes."""
+        plan = self._plan_probe_gate_scalars(probe, gate_keys)
+        if plan is None:
             return {}
+        return self._score_planned_probe_gate_scalars(
+            probe, hidden_per_layer, plan, sih_cache,
+        )
+
+    def _score_planned_probe_gate_scalars(
+        self,
+        probe: "AttachedManifoldProbe",
+        hidden_per_layer: dict[int, torch.Tensor],
+        plan: _ProbeGateScalarPlan,
+        sih_cache: dict[int, torch.Tensor] | None = None,
+    ) -> dict[str, float]:
+        """Score a planned probe gate scalar map.
+
+        This is intentionally narrower than :meth:`_score_probe_full`: it is used
+        only by the gate-only decode path, where no UI/API consumer needs a full
+        :class:`ProbeReading`. Curved ``:fraction`` and ``@label`` / ``~label``
+        gates can skip the nearest-foot solve entirely; coord and membership
+        gates still run the geometry they semantically require.
+        """
+        coord_axes = plan.coord_axes
+        fraction_key = plan.fraction_key
+        membership_key = plan.membership_key
+        dist_requests = plan.dist_requests
+        assign_requests = plan.assign_requests
+        need_coords = bool(coord_axes)
+        need_fraction = fraction_key is not None
+        need_membership = membership_key is not None
+        need_nearest = bool(dist_requests)
+        need_assignment = bool(assign_requests)
+        need_dist = bool(need_nearest or need_assignment)
 
         manifold = probe.manifold
         sw = probe.share_weights
@@ -820,8 +921,6 @@ class Monitor:
         else:
             w_shared = {idx: sw.get(idx, 0.0) / total_w for idx in shared}
 
-        K = probe.node_values_reduced[shared[0]].shape[0]
-        inject_neutral = probe.inject_neutral
         n_dim = manifold.domain.intrinsic_dim
         frac_mean_t: torch.Tensor | None = None
         coords_mean_t: torch.Tensor | None = None
@@ -907,20 +1006,6 @@ class Monitor:
                         else mem_mean_t + w * mem_t
                     )
 
-        label_to_idx = {label: idx for idx, label in enumerate(manifold.node_labels)}
-        if inject_neutral:
-            label_to_idx[NEUTRAL_LABEL] = K
-        dist_requests = [
-            (key, label_to_idx[label])
-            for label, key in dist_labels.items()
-            if label in label_to_idx
-        ]
-        assign_requests = [
-            (key, label_to_idx[label])
-            for label, key in assign_labels.items()
-            if label in label_to_idx
-        ]
-
         out: dict[str, float] = {}
         parts: list[torch.Tensor] = []
         slots: list[tuple[str, Any]] = []
@@ -928,7 +1013,7 @@ class Monitor:
             parts.append(frac_mean_t.reshape(1))
             slots.append(("scalar", fraction_key))
         if need_coords and coords_mean_t is not None:
-            for axis, key in sorted(coord_axes.items()):
+            for axis, key in coord_axes:
                 if axis < int(coords_mean_t.numel()):
                     parts.append(coords_mean_t[axis].reshape(1))
                     slots.append(("scalar", key))
@@ -990,6 +1075,27 @@ class Monitor:
                     out[key] = float(prob)
         return out
 
+    def score_planned_gate_scalars(
+        self,
+        hidden_per_layer: dict[int, torch.Tensor],
+        plan: tuple[_ProbeGateScalarPlan, ...],
+    ) -> dict[str, float]:
+        """Score a pre-parsed gate scalar plan without rebuilding key maps."""
+        if not hidden_per_layer or not self._probes or not plan:
+            return {}
+        sih_cache: dict[int, torch.Tensor] = {}
+        out: dict[str, float] = {}
+        for item in plan:
+            probe = self._probes.get(item.probe_name)
+            if probe is None:
+                continue
+            out.update(
+                self._score_planned_probe_gate_scalars(
+                    probe, hidden_per_layer, item, sih_cache,
+                )
+            )
+        return out
+
     def score_gate_scalars(
         self,
         hidden_per_layer: dict[int, torch.Tensor],
@@ -1000,30 +1106,12 @@ class Monitor:
         """Return exact gate scalar keys without building full readings."""
         if not hidden_per_layer or not self._probes or not gate_keys:
             return {}
-        # Only the probes a gate key actually references do any work (FIX F3):
-        # derive their names once (the prefix before the first ``[`` / ``:`` /
-        # ``@`` / ``~`` channel marker — ``NAME_REGEX`` forbids those in a name)
-        # and dispatch ``_score_probe_gate_scalars`` for those alone, instead of
-        # running it (and its per-probe suffix-dict build) for every probe in the
-        # roster every token.  The generation hot path can pass the composer-owned
-        # probe subset directly, avoiding this parse work on every decode step.
-        names = (
-            set(probe_names)
-            if probe_names is not None
-            else {re.split(r"[\[:@~]", k, maxsplit=1)[0] for k in gate_keys}
-        )
-        sih_cache: dict[int, torch.Tensor] = {}
-        out: dict[str, float] = {}
-        for name in names:
-            probe = self._probes.get(name)
-            if probe is None:
-                continue
-            out.update(
-                self._score_probe_gate_scalars(
-                    probe, hidden_per_layer, gate_keys, sih_cache,
-                )
-            )
-        return out
+        # Only the probes a gate key actually references do any work (FIX F3).
+        # Compatibility callers build a one-shot plan; generation's
+        # GATING_SUBSET hot path builds this once per generation and calls
+        # ``score_planned_gate_scalars`` each token.
+        plan = self.plan_gate_scalars(gate_keys, probe_names=probe_names)
+        return self.score_planned_gate_scalars(hidden_per_layer, plan)
 
     def _subspace_coords_for(
         self,

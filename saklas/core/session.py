@@ -5059,6 +5059,9 @@ class SaklasSession:
         if not widen and self._monitor.probe_names and need_per_token and gating_subset:
             subset = set(gating_subset)
             gate_keys = set(gating_probe_keys or ())
+            gate_plan = self._monitor.plan_gate_scalars(
+                gate_keys, probe_names=subset,
+            )
 
             def _score_step_subset(latest: dict[int, torch.Tensor]) -> None:
                 # Score ONLY the exact gate scalar keys each token (the gate's
@@ -5066,10 +5069,8 @@ class SaklasSession:
                 # aligned with decode forwards.  The full roster is pooled once at
                 # finalize from the tail ring (``_score_aggregate_only``).
                 self._incremental_gate_scores.append(
-                    self._monitor.score_gate_scalars(
-                        latest, gate_keys, probe_names=subset,
-                    )
-                    if latest and gate_keys else {}
+                    self._monitor.score_planned_gate_scalars(latest, gate_plan)
+                    if latest and gate_plan else {}
                 )
 
             if final_probe_aggregate:

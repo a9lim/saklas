@@ -555,6 +555,38 @@ def test_gate_scalar_fraction_label_assignment_skip_curved_foot(
     assert scalars["curve~c"] == pytest.approx(full["curve~c"])
 
 
+def test_planned_gate_scalars_match_public_and_full_reading():
+    m = _curved_toy(dim=8)
+    _attach_const_sigma(m, 0.3)
+    mon = _iso_monitor(m)
+    mon.add_probe("curve", m, top_n=5)
+    hidden = {L: _node_world(m, L)[2] for L in m.layers}
+    keys = {
+        "curve",
+        "curve:fraction",
+        "curve@c",
+        "curve~c",
+        "curve:membership",
+        "curve@missing",
+        "curve~missing",
+    }
+
+    plan = mon.plan_gate_scalars(keys)
+    planned = mon.score_planned_gate_scalars(hidden, plan)
+    public = mon.score_gate_scalars(hidden, keys)
+    full = mon.flat_scalars(mon.score_single_token(hidden))
+
+    assert len(plan) == 1
+    assert "curve@missing" not in planned
+    assert "curve~missing" not in planned
+    assert planned == pytest.approx(public)
+    for key in keys - {"curve@missing", "curve~missing"}:
+        assert planned[key] == pytest.approx(full[key])
+    axis_plan = mon.plan_gate_scalars({"curve[0]"})
+    axis_planned = mon.score_planned_gate_scalars(hidden, axis_plan)
+    assert axis_planned["curve[0]"] == pytest.approx(full["curve[0]"])
+
+
 def test_gate_scalar_requested_labels_ignore_probe_top_n():
     m = _toy_manifold()
     mon = _iso_monitor(m)
@@ -571,6 +603,55 @@ def test_gate_scalar_requested_labels_ignore_probe_top_n():
     assert scalars["toy@a"] < 0.0
     assert "toy~a" in scalars
     assert 0.0 <= scalars["toy~a"] <= 1.0
+
+
+def test_gate_label_plan_uses_attached_candidate_metadata():
+    rc = torch.tensor([[1.0, 1.0], [2.0, -1.0], [-1.0, 2.0]])
+    m = _flat_manifold(reduced_coords=rc, labels=["a", "b", "c"])
+    mon = _iso_monitor(m)
+    mon.add_probe("tri", m)
+    probe = mon.attached_probes()["tri"]
+
+    assert probe.candidate_labels == ("a", "b", "c", NEUTRAL_LABEL)
+    assert probe.label_to_candidate_idx == {
+        "a": 0,
+        "b": 1,
+        "c": 2,
+        NEUTRAL_LABEL: 3,
+    }
+    neutral_scalars = mon.score_gate_scalars(
+        {L: sub.mean for L, sub in m.layers.items()},
+        {"tri@neutral", "tri~neutral"},
+    )
+    assert neutral_scalars["tri@neutral"] == pytest.approx(0.0, abs=1e-3)
+    assert 0.0 <= neutral_scalars["tri~neutral"] <= 1.0
+
+    real_neutral = _flat_manifold(
+        reduced_coords=rc,
+        labels=["a", NEUTRAL_LABEL, "c"],
+    )
+    mon2 = _iso_monitor(real_neutral)
+    mon2.add_probe("tri", real_neutral)
+    probe2 = mon2.attached_probes()["tri"]
+    assert probe2.inject_neutral is False
+    assert probe2.candidate_labels == ("a", NEUTRAL_LABEL, "c")
+    assert probe2.label_to_candidate_idx[NEUTRAL_LABEL] == 1
+
+
+def test_gate_label_plan_duplicate_labels_resolve_last_occurrence():
+    rc = torch.tensor([[0.0], [1.0], [2.0]])
+    m = _flat_manifold(reduced_coords=rc, labels=["dup", "other", "dup"])
+    mon = _iso_monitor(m)
+    mon.add_probe("dup_probe", m, top_n=-1)
+
+    probe = mon.attached_probes()["dup_probe"]
+    assert probe.label_to_candidate_idx["dup"] == 2
+    scalars = mon.score_gate_scalars(
+        _flat_node_hidden(m, 2),
+        {"dup_probe@dup", "dup_probe~dup"},
+    )
+    assert scalars["dup_probe@dup"] == pytest.approx(0.0, abs=1e-3)
+    assert 0.0 <= scalars["dup_probe~dup"] <= 1.0
 
 
 def test_membership_high_on_surface_low_off_tube():
