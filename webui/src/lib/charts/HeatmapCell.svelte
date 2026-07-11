@@ -4,14 +4,14 @@
   //
   // Used by the Correlation matrix (cosine similarity per probe pair)
   // and by the click-token drilldown drawer (per-layer × per-probe
-  // grid for a single token).  The score-to-RGB mapping is centralized
-  // in tokens.ts::scoreToRgb so highlight tints stay consistent across
-  // surfaces.  Cosine grids leave ``scale`` at its ``HIGHLIGHT_SAT``
-  // default ([-1, 1] data); probe-coordinate grids pass a per-probe
-  // node-coordinate extent so the cells aren't pinned full from coords
-  // that run well past ±1.
+  // grid for a single token). Unlike translucent token highlighting,
+  // matrix cells composite the same green/red ontology into a visible
+  // neutral base: weak and zero readings must remain legible as data marks.
+  // Cosine grids leave ``scale`` at its ``HIGHLIGHT_SAT`` default ([-1, 1]
+  // data); probe-coordinate grids pass a per-probe node-coordinate extent
+  // so the cells aren't pinned full from coords that run well past ±1.
 
-  import { scoreToRgb, HIGHLIGHT_SAT } from "../tokens";
+  import { HIGHLIGHT_SAT } from "../tokens";
 
   interface Props {
     /** Heatmap value.  Read against ``scale`` (full color at ``±scale``);
@@ -43,9 +43,21 @@
   const isNull = $derived(
     value === null || value === undefined || !Number.isFinite(value),
   );
-  const bg = $derived(
-    isNull ? "var(--bg-alt)" : scoreToRgb(value as number, scale),
-  );
+  const bg = $derived.by(() => {
+    if (isNull) return "var(--layer-cell-empty)";
+    const numeric = value as number;
+    const safeScale = Number.isFinite(scale) && scale > 1e-6 ? scale : HIGHLIGHT_SAT;
+    const t = Math.max(-1, Math.min(1, numeric / safeScale));
+    if (Math.abs(t) < 1e-9) return "var(--layer-cell-neutral)";
+
+    // Heatmap cells are data marks, not translucent token highlights. Blend
+    // into a visible neutral cell so weak readings still register and the
+    // ramp remains legible on mediocre displays. Full-scale readings stop at
+    // 62% hue to retain contrast with white numeric labels.
+    const hue = t > 0 ? "var(--highlight-pos)" : "var(--highlight-neg)";
+    const mix = 18 + Math.abs(t) * 44;
+    return `color-mix(in srgb, var(--layer-cell-neutral) ${100 - mix}%, ${hue} ${mix}%)`;
+  });
   const tip = $derived(
     title ?? (isNull ? "—" : (value as number).toFixed(3)),
   );
@@ -72,9 +84,9 @@
     cursor: help;
     font-size: var(--text-2xs);
     color: var(--fg);
-    /* Slight border so adjacent cells don't visually merge into one
-     * bigger color block — kept hairline so the color dominates. */
-    border: 1px solid var(--bg);
+    box-sizing: border-box;
+    border: 0;
+    border-radius: 2px;
   }
   .t {
     font-variant-numeric: tabular-nums;

@@ -55,6 +55,7 @@
   let trigger: HTMLButtonElement | null = $state(null);
   let listbox: HTMLUListElement | null = $state(null);
   let flipUp = $state(false);
+  const uid = $props.id();
 
   // Typeahead buffer — alphanum chars within 600 ms accumulate; idle
   // flushes the buffer.
@@ -207,9 +208,14 @@
         if (highlight >= 0) void commit(highlight);
         break;
       case "Escape":
-      case "Tab":
         ev.preventDefault();
         closePopover(true);
+        break;
+      case "Tab":
+        // Keep native tab order: let the browser move past the listbox,
+        // then remove the popover. Preventing Tab here trapped keyboard
+        // users on the trigger for one extra keystroke.
+        setTimeout(() => closePopover(false), 0);
         break;
       default:
         handleTypeahead(ev.key);
@@ -277,13 +283,13 @@
       tabindex="-1"
       aria-label={ariaLabel}
       aria-activedescendant={highlight >= 0
-        ? `sk-select-opt-${highlight}`
+        ? `${uid}-opt-${highlight}`
         : undefined}
       onkeydown={onListKeydown}
     >
       {#each options as opt, i (i)}
         <li
-          id="sk-select-opt-{i}"
+          id={`${uid}-opt-${i}`}
           role="option"
           class="sk-select-opt"
           class:is-highlight={i === highlight}
@@ -311,6 +317,8 @@
     position: relative;
     display: inline-block;
     width: 100%;
+    min-width: 0;
+    max-width: 100%;
   }
 
   .sk-select-trigger {
@@ -318,6 +326,9 @@
     align-items: center;
     justify-content: space-between;
     width: 100%;
+    min-width: 0;
+    max-width: 100%;
+    box-sizing: border-box;
     gap: var(--space-2);
     padding: var(--space-2) var(--space-3);
     /* Borderless input: recessed well fill is the "pick here" affordance;

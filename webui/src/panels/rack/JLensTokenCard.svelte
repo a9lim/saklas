@@ -18,10 +18,10 @@
   // ranking lives in the token drilldown's j-lens tab).
 
   import Bar from "../../lib/charts/Bar.svelte";
-  import HeatmapCell from "../../lib/charts/HeatmapCell.svelte";
   import Sparkline from "../../lib/charts/Sparkline.svelte";
   import RackCard from "./RackCard.svelte";
   import ProbePinButton from "./ProbePinButton.svelte";
+  import LayerStrip from "./LayerStrip.svelte";
 
   interface Props {
     /** Raw vocabulary token text (untrimmed). */
@@ -78,7 +78,13 @@
     return `L${cell.layer} · p ${cell.p.toPrecision(3)}`;
   }
 
-  const CELL_SIZE = 14;
+  const layerCells = $derived(
+    cells.map((cell) => ({
+      layer: cell.layer,
+      value: cell.p,
+      title: cellTooltip(cell),
+    })),
+  );
 </script>
 
 <RackCard accent="--accent-blue" disabled={false}>
@@ -123,24 +129,12 @@
     </div>
 
     <!-- Per-layer strength strip with L endcaps. -->
-    <div class="layers" aria-label="Per-layer strength for {display}">
-      {#if cells.length === 0}
-        <div class="layers-status">no layer data</div>
-      {:else}
-        <span class="endcap" aria-hidden="true">L{cells[0].layer}</span>
-        <div class="cells">
-          {#each cells as cell (cell.layer)}
-            <HeatmapCell
-              value={cell.p}
-              scale={cellScale}
-              size={CELL_SIZE}
-              title={cellTooltip(cell)}
-            />
-          {/each}
-        </div>
-        <span class="endcap" aria-hidden="true">L{cells[cells.length - 1].layer}</span>
-      {/if}
-    </div>
+    <LayerStrip
+      cells={layerCells}
+      scale={cellScale}
+      ariaLabel={`Per-layer strength for ${display}`}
+      emptyMessage="no layer data"
+    />
   {/snippet}
 </RackCard>
 
@@ -205,30 +199,4 @@
     flex: 0 0 auto;
   }
 
-  /* ----- body: per-layer strip (mirrors ProbeCard) ----- */
-  .layers {
-    display: flex;
-    align-items: center;
-    gap: var(--space-3);
-    overflow-x: auto;
-    white-space: nowrap;
-    padding-top: var(--space-3);
-    padding-bottom: var(--space-2);
-  }
-  .layers-status {
-    color: var(--fg-muted);
-    font-size: var(--text-sm);
-    padding: var(--space-1) 0;
-  }
-  .cells {
-    display: flex;
-    gap: 0;
-    flex: 0 0 auto;
-  }
-  .endcap {
-    color: var(--fg-dim);
-    font-size: var(--text-xs);
-    font-variant-numeric: tabular-nums;
-    flex: 0 0 auto;
-  }
 </style>

@@ -309,6 +309,8 @@
   }
 
   .icon {
+    min-width: 24px;
+    min-height: 24px;
     background: transparent;
     border: 0;
     color: var(--fg-muted);
@@ -334,6 +336,7 @@
     display: flex;
     align-items: center;
     gap: var(--space-2);
+    min-width: 0;
     color: var(--fg-strong);
     font-size: var(--text-xs);
   }
@@ -344,10 +347,12 @@
   .ctl-select {
     flex: 1 1 auto;
     display: inline-flex;
+    min-width: 0;
+    max-width: 100%;
   }
   .along-row {
     display: grid;
-    grid-template-columns: minmax(3em, auto) 1fr 3em;
+    grid-template-columns: minmax(3em, auto) minmax(0, 1fr) 3em;
     align-items: center;
     gap: var(--space-2);
   }

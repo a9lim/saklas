@@ -118,7 +118,9 @@
     overflow: hidden;
   }
   .track {
-    fill: var(--bg-elev);
+    /* The track is a data mark, not card chrome. Keep it above 3:1 against
+     * the rack-card composite so an empty or weak bar is still legible. */
+    fill: var(--data-track);
   }
   .fill {
     /* Animate both x and width together — the bipolar bar encodes

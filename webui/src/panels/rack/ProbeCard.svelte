@@ -23,7 +23,6 @@
   import type { ProbeRackEntry } from "../../lib/types";
   import Bar from "../../lib/charts/Bar.svelte";
   import Sparkline from "../../lib/charts/Sparkline.svelte";
-  import HeatmapCell from "../../lib/charts/HeatmapCell.svelte";
   import { nodeCoordExtent, parseProbeTarget } from "../../lib/tokens";
   import ManifoldMiniMap from "../manifold/ManifoldMiniMap.svelte";
   import {
@@ -36,6 +35,7 @@
   import { polesOf } from "../../lib/concepts";
   import RackCard from "./RackCard.svelte";
   import RackMarker from "./RackMarker.svelte";
+  import LayerStrip from "./LayerStrip.svelte";
 
   interface Props {
     name: string;
@@ -129,11 +129,6 @@
       : [],
   );
 
-  // 14px reads cleanly on a 28-layer Gemma without horizontal scroll on a
-  // 1280px viewport, and stays usable on 60+ layer models when the strip
-  // wraps inside its own scroll container.
-  const CELL_SIZE = 14;
-
   function cellTooltip(layer: string): string {
     const v = entry.perLayer?.[layer];
     if (typeof v !== "number" || !Number.isFinite(v)) {
@@ -143,6 +138,14 @@
     const sign = affine && v >= 0 ? "+" : "";
     return `L${layer} · ${sign}${v.toFixed(3)}`;
   }
+
+  const layerCells = $derived(
+    layerKeys.map((layer) => ({
+      layer: Number(layer),
+      value: entry.perLayer?.[layer],
+      title: cellTooltip(layer),
+    })),
+  );
 
   function fmtFraction(v: number): string {
     return Number.isFinite(v) ? v.toFixed(2) : "0.00";
@@ -324,26 +327,11 @@
     {/if}
 
     <!-- Per-layer heatmap strip with L0 / Ln endcaps. -->
-    <div class="layers" aria-label="Per-layer readings for {name}">
-      {#if layerKeys.length === 0}
-        <div class="layers-status">no data yet, generate a token first</div>
-      {:else}
-        <span class="endcap" aria-hidden="true">L{Number(layerKeys[0])}</span>
-        <div class="cells">
-          {#each layerKeys as layer (layer)}
-            <HeatmapCell
-              value={entry.perLayer?.[layer]}
-              scale={axisScale}
-              size={CELL_SIZE}
-              title={cellTooltip(layer)}
-            />
-          {/each}
-        </div>
-        <span class="endcap" aria-hidden="true">
-          L{Number(layerKeys[layerKeys.length - 1])}
-        </span>
-      {/if}
-    </div>
+    <LayerStrip
+      cells={layerCells}
+      scale={axisScale}
+      ariaLabel={`Per-layer readings for ${name}`}
+    />
 
     {#if showMiniMap}
       <div class="map-wrap">
@@ -407,6 +395,8 @@
     min-width: 0;
   }
   .icon {
+    min-width: 24px;
+    min-height: 24px;
     background: transparent;
     border: 0;
     color: var(--fg-muted);
@@ -540,38 +530,6 @@
     font-variant-numeric: tabular-nums;
   }
   .meta-item {
-    flex: 0 0 auto;
-  }
-
-  /* ----- body: per-layer heatmap ----- */
-  .layers {
-    display: flex;
-    align-items: center;
-    gap: var(--space-3);
-    overflow-x: auto;
-    white-space: nowrap;
-    /* Symmetric breathing room around the cells, matched to a bar's ~8px of
-       vertical whitespace (an 8px bar centred in a 24px row).  The values are
-       asymmetric to land symmetric whitespace: the body gap already adds 2px
-       above the strip and the card's 4px bottom padding sits below it, so
-       6px top + 4px bottom → 8px clear above and below the cells. */
-    padding-top: var(--space-3);
-    padding-bottom: var(--space-2);
-  }
-  .layers-status {
-    color: var(--fg-muted);
-    font-size: var(--text-sm);
-    padding: var(--space-1) 0;
-  }
-  .cells {
-    display: flex;
-    gap: 0;
-    flex: 0 0 auto;
-  }
-  .endcap {
-    color: var(--fg-dim);
-    font-size: var(--text-xs);
-    font-variant-numeric: tabular-nums;
     flex: 0 0 auto;
   }
 

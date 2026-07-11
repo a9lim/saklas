@@ -101,7 +101,7 @@
     flex: 0 0 auto;
   }
   .toggle {
-    min-height: 22px;
+    min-height: 24px;
     padding: 1px var(--space-3);
     color: var(--fg-muted);
     background: var(--glass);

@@ -100,6 +100,7 @@
     height: 100%;
     max-height: 100%;
     min-height: 0;
+    min-width: 0;
     overflow: hidden;
     background: var(--bg-alt);
   }
@@ -116,6 +117,7 @@
     height: 100%;
     max-height: 100%;
     min-height: 0;
+    min-width: 0;
     overflow: hidden;
   }
 </style>

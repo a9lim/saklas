@@ -582,6 +582,7 @@
     border-color: var(--accent-glow);
   }
   .add-btn {
+    min-height: 24px;
     background: color-mix(in srgb, var(--accent-blue) 10%, transparent);
     color: var(--accent-blue);
     border: 1px solid transparent;

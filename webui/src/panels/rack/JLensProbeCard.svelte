@@ -17,12 +17,12 @@
 
   import type { ProbeRackEntry } from "../../lib/types";
   import Bar from "../../lib/charts/Bar.svelte";
-  import HeatmapCell from "../../lib/charts/HeatmapCell.svelte";
   import Sparkline from "../../lib/charts/Sparkline.svelte";
   import { detachProbe } from "../../lib/stores.svelte";
   import { pushToast } from "../../lib/stores/toasts.svelte";
   import RackCard from "./RackCard.svelte";
   import ProbePinButton from "./ProbePinButton.svelte";
+  import LayerStrip from "./LayerStrip.svelte";
 
   interface Props {
     name: string;
@@ -57,8 +57,6 @@
     Math.max(...layerKeys.map((l) => entry.perLayer?.[l] ?? 0), 1e-12),
   );
 
-  const CELL_SIZE = 14;
-
   function cellTooltip(layer: string): string {
     const v = entry.perLayer?.[layer];
     if (typeof v !== "number" || !Number.isFinite(v)) {
@@ -66,6 +64,14 @@
     }
     return `L${layer} · p ${v.toPrecision(3)}`;
   }
+
+  const layerCells = $derived(
+    layerKeys.map((layer) => ({
+      layer: Number(layer),
+      value: entry.perLayer?.[layer],
+      title: cellTooltip(layer),
+    })),
+  );
 
   function fmtCoord(v: number): string {
     return Number.isFinite(v) ? v.toFixed(2) : "0.00";
@@ -133,26 +139,11 @@
     </div>
 
     <!-- Per-layer strength strip with L endcaps. -->
-    <div class="layers" aria-label="Per-layer strength for {name}">
-      {#if layerKeys.length === 0}
-        <div class="layers-status">no data yet, generate a token first</div>
-      {:else}
-        <span class="endcap" aria-hidden="true">L{Number(layerKeys[0])}</span>
-        <div class="cells">
-          {#each layerKeys as layer (layer)}
-            <HeatmapCell
-              value={entry.perLayer?.[layer]}
-              scale={cellScale}
-              size={CELL_SIZE}
-              title={cellTooltip(layer)}
-            />
-          {/each}
-        </div>
-        <span class="endcap" aria-hidden="true">
-          L{Number(layerKeys[layerKeys.length - 1])}
-        </span>
-      {/if}
-    </div>
+    <LayerStrip
+      cells={layerCells}
+      scale={cellScale}
+      ariaLabel={`Per-layer strength for ${name}`}
+    />
   {/snippet}
 </RackCard>
 
@@ -218,30 +209,4 @@
     flex: 0 0 auto;
   }
 
-  /* ----- body: per-layer strip (mirrors ProbeCard) ----- */
-  .layers {
-    display: flex;
-    align-items: center;
-    gap: var(--space-3);
-    overflow-x: auto;
-    white-space: nowrap;
-    padding-top: var(--space-3);
-    padding-bottom: var(--space-2);
-  }
-  .layers-status {
-    color: var(--fg-muted);
-    font-size: var(--text-sm);
-    padding: var(--space-1) 0;
-  }
-  .cells {
-    display: flex;
-    gap: 0;
-    flex: 0 0 auto;
-  }
-  .endcap {
-    color: var(--fg-dim);
-    font-size: var(--text-xs);
-    font-variant-numeric: tabular-nums;
-    flex: 0 0 auto;
-  }
 </style>

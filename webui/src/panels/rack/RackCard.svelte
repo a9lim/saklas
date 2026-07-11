@@ -65,6 +65,8 @@
   .card {
     display: flex;
     flex-direction: column;
+    min-width: 0;
+    max-width: 100%;
     gap: var(--space-2);
     padding: var(--space-3) var(--space-4);
     border: 1px solid transparent;
@@ -99,6 +101,7 @@
     align-items: center;
     gap: var(--space-3);
     min-height: 24px;
+    min-width: 0;
   }
 
   /* BODY — controls / meters stack vertically beneath the statline. */
@@ -106,5 +109,6 @@
     display: flex;
     flex-direction: column;
     gap: var(--space-1);
+    min-width: 0;
   }
 </style>

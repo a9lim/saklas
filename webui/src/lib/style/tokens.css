@@ -128,6 +128,16 @@
   --highlight-surprise: #6ba6f8;
   --highlight-sat: 0.5;
 
+  /* Layer heatmaps are solid data marks, not translucent token washes.
+   * A visible neutral zero keeps weak readings legible; empty is distinct
+   * without falling all the way to black. Cells themselves stay borderless. */
+  /* >=3:1 against the rack-card composite: the layer marks remain
+   * readable on ordinary/low-contrast displays without reintroducing the
+   * black grid the shared LayerStrip removed. */
+  --data-track: #616a82;
+  --layer-cell-neutral: #707991;
+  --layer-cell-empty: #616a82;
+
   /* ---- Elevation ----------------------------------------------------
    * Cards are lit from above (inset top-light) and cast down. Overlay
    * shadow is for sheets/modals/popovers/toasts. --shadow-sticky is the

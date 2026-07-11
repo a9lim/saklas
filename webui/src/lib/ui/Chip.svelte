@@ -62,6 +62,8 @@
     --chip-c: var(--accent);
     display: inline-flex;
     align-items: center;
+    min-width: 0;
+    max-width: 100%;
     gap: var(--space-2);
     font-family: var(--font-mono);
     font-size: var(--text-sm);
@@ -104,9 +106,13 @@
     display: inline-flex;
     align-items: center;
     gap: var(--space-2);
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   .x {
+    flex: none;
     background: none;
     border: none;
     padding: 0 0 0 2px;

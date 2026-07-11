@@ -22,6 +22,7 @@
   import Chip from "../lib/ui/Chip.svelte";
   import SegmentedTabs from "../lib/ui/SegmentedTabs.svelte";
   import GlassCard from "../lib/ui/GlassCard.svelte";
+  import LayerStrip from "../panels/rack/LayerStrip.svelte";
   import { scoreToRgb, type TintHue } from "../lib/tokens";
 
   // ---- the hue ontology, as data --------------------------------------
@@ -98,6 +99,11 @@
   const current = $derived(stream[stream.length - 1] ?? 0);
 
   const LAYER_STRIP = [4, 8, 14, 22, 40, 66, 88, 74, 52, 61, 38, 20, 12, 6];
+  const STYLE_LAYER_CELLS = LAYER_STRIP.map((value, layer) => ({
+    layer,
+    value,
+    title: `L${layer} · ${value}%`,
+  }));
 
   // Tint playground: one slider score, both ramps, over a sample line.
   let tintScore = $state(0.55);
@@ -397,11 +403,11 @@
               <span class="k">nearest</span>
               <span class="v-dim">wistful · d 0.8 spacings</span>
             </div>
-            <div class="layer-strip" title="per-layer share — gradient along depth IS the data">
-              {#each LAYER_STRIP as v, i (i)}
-                <i style:background="color-mix(in srgb, {pillarColor} {v}%, var(--glass-strong))"></i>
-              {/each}
-            </div>
+            <LayerStrip
+              cells={STYLE_LAYER_CELLS}
+              scale={100}
+              ariaLabel="Per-layer share specimen"
+            />
           </div>
         </GlassCard>
       </div>
@@ -798,17 +804,6 @@
     color: var(--fg-dim);
     font-size: var(--text-sm);
   }
-  .layer-strip {
-    display: flex;
-    gap: 2px;
-    margin-top: 9px;
-  }
-  .layer-strip i {
-    flex: 1;
-    height: 9px;
-    border-radius: 2px;
-  }
-
   /* motion */
   .live-dot {
     width: 8px;

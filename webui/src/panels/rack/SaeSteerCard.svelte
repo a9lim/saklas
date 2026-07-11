@@ -145,6 +145,8 @@
   }
 
   .icon {
+    min-width: 24px;
+    min-height: 24px;
     background: transparent;
     border: 0;
     color: var(--fg-muted);
@@ -168,9 +170,10 @@
   /* ----- body: α row (the manifold card's along-row shape) ----- */
   .alpha-row {
     display: grid;
-    grid-template-columns: minmax(3em, auto) 1fr 3em;
+    grid-template-columns: minmax(3em, auto) minmax(0, 1fr) 3em;
     align-items: center;
     gap: var(--space-2);
+    min-width: 0;
   }
   .alpha-label {
     color: var(--fg-muted);

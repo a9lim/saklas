@@ -179,6 +179,7 @@ webui/src/
     rack/RackSectionHeader.svelte # shared STEER/PROBE title + live/count/sort row across all pillars
     rack/RackMarker.svelte    # optically matched 18 px family markers: ●/◆/■/▲
     rack/ProbePinButton.svelte # shared 24 px pin/unpin action for every probe family
+    rack/LayerStrip.svelte    # shared borderless, high-contrast per-layer cells + endcaps
     rack/SteerCard.svelte     # unified steer card — branches on entry.mode (snap-to-node + XYPad both):
                               #   subspace → position only (magnitude = shared subspace-along master)
                               #   manifold → position + per-card along / onto
@@ -228,6 +229,18 @@ Flat-vector authoring forms were removed (the former `ExtractDrawer` *build vect
 The custom-nodes tab grows an `auto-domain (let the fitter derive coords from corpora)` checkbox at the top. **Unchecked** (default) is the historical authored flow — box/sphere domain picker → per-node coord inputs → `POST /manifolds`. **Checked** hides the domain picker + the per-node coord inputs and exposes a `pca` / `spectral` fit-method radio (same hyperparams as the auto-generated tab, exposed via `AdvancedSection`); Save posts to `POST /manifolds/discover` with `{name, namespace, description, fit_mode, nodes: [{label, statements, role?}], hyperparams}` and the fitter derives node coordinates per-model. Reuses the same `discoverFitMode` / `discoverMaxDim` / `discoverVarThreshold` / `discoverKNN` / `discoverBandwidth` state slots as the auto-generated tab. The submit label changes to `build manifold (auto-domain <fit_mode>) → return to list` so the routing is visible.
 
 `SteerCard`'s `XYPad` per-axis bounds for non-box (sphere / custom) domains are symmetric `[-R, R]` where `R = max(1, ceil(max|v|))` over each axis's `manifold.node_coords` column (clean whole-number ceiling over the per-axis max magnitude). 0 sits at the visual center, so the pad's crosshair gridlines + the slider midpoint align with the (0, 0, ...) **neutral** origin (the flat `node_coords` layout is neutral-centered at fit time, so the node centroid sits off-center and a persona node lands wherever its displacement from neutral falls — e.g. `c0 = -10` at the left endpoint with `R = 10`). Falls back to `[-1, 1]` when no fitted coords are on the wire (the unfitted-manifold pre-fit state). The store side: `setSubspaceLabel` / `setManifoldLabel(name, label|null)` toggle label-form, `formatSubspaceTerm` / `formatManifoldTerm` emit `<m>%<label>` when `label` is set otherwise the comma-joined coord list, and `lib/expression.ts`'s parser produces a `ManifoldTerm.label` (string) or `ManifoldTerm.coords` (number[]) that rides into the rack entry. Each snap-to-node option shows the node's optional `role` tag (`pirate [role=pirate]`) when set, surfacing persona manifolds.
+
+Rack layer views are one `rack/LayerStrip.svelte` across CAA and pinned/live
+J-LENS cards. Its `HeatmapCell` data marks have no outlines: a one-pixel gap
+separates layers, the neutral/empty bases and shared `Bar` track remain at least
+3:1 against the rack-card composite, and signed green/red hue is blended into
+that base. The style guide renders the same component. `Select.svelte`,
+`RackCard`, `SteerCard`, and `XYPad` all carry explicit `min-width: 0` shrink
+boundaries, so switching a snapped position to `(free position)` cannot expand
+the rack or clip past the inspector edge. Each `Select` instance owns unique
+option ids and lets Tab follow native focus order. App drawers are modal dialogs:
+the bench is inert while one is open, focus is trapped inside and restored to
+the launcher on close.
 
 `ManifoldBuilderDrawer`'s custom-nodes tab grows a per-node `role` input alongside coords (validated client-side against the same `[a-z0-9._-]+` slug regex the engine uses); the auto-generated tab grows a "persona manifold (use each concept slug as that node's role)" checkbox inside `AdvancedSection` that sets `GenerateManifoldRequest.role_per_node`. `RackDrawer` rows carry a `persona` `fit-badge` when any node in `node_roles` is non-null, parallel to the `pca` / `spectral` badges.
 

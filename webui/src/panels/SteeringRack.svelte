@@ -133,9 +133,10 @@
    * cards, reading as a group-level control rather than a per-card one. */
   .along-master {
     display: grid;
-    grid-template-columns: minmax(3em, auto) 1fr 3em;
+    grid-template-columns: minmax(3em, auto) minmax(0, 1fr) 3em;
     align-items: center;
     gap: var(--space-2);
+    min-width: 0;
     padding: var(--space-1) var(--space-2) var(--space-2);
     border-left: 2px solid var(--accent);
   }

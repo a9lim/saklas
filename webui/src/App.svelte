@@ -4,7 +4,7 @@
   // chat/canvas, right-side inspector, and a wide drawer host for deep
   // tools.
 
-  import { onMount } from "svelte";
+  import { onMount, tick } from "svelte";
 
   import InspectorPanel from "./panels/InspectorPanel.svelte";
   import Chat from "./panels/Chat.svelte";
@@ -48,6 +48,45 @@
   type BootStatus = "loading" | "ready" | "failed";
   let bootStatus: BootStatus = $state("loading");
   let bootError: string | null = $state(null);
+  let drawerEl: HTMLElement | null = $state(null);
+
+  const FOCUSABLE = [
+    "button:not([disabled])",
+    "[href]",
+    "input:not([disabled])",
+    "select:not([disabled])",
+    "textarea:not([disabled])",
+    '[tabindex]:not([tabindex="-1"])',
+  ].join(",");
+
+  $effect(() => {
+    if (drawerState.open === null) return;
+    void tick().then(() => {
+      const first = drawerEl?.querySelector<HTMLElement>(FOCUSABLE);
+      (first ?? drawerEl)?.focus();
+    });
+  });
+
+  function onDrawerKeydown(ev: KeyboardEvent): void {
+    if (ev.key !== "Tab" || !drawerEl) return;
+    const focusable = [...drawerEl.querySelectorAll<HTMLElement>(FOCUSABLE)].filter(
+      (el) => el.offsetParent !== null,
+    );
+    if (focusable.length === 0) {
+      ev.preventDefault();
+      drawerEl.focus();
+      return;
+    }
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (ev.shiftKey && (document.activeElement === first || document.activeElement === drawerEl)) {
+      ev.preventDefault();
+      last.focus();
+    } else if (!ev.shiftKey && document.activeElement === last) {
+      ev.preventDefault();
+      first.focus();
+    }
+  }
 
   async function runBootstrap(): Promise<void> {
     bootStatus = "loading";
@@ -190,15 +229,15 @@
 {:else}
   <div class="shell" class:loading={bootStatus === "loading"}>
     <main class="layout">
-      <section class="loom-zone" aria-label="Threads">
+      <section class="loom-zone" aria-label="Threads" inert={drawerState.open !== null}>
         <LoomSidebar />
       </section>
 
-      <section class="chat-zone" aria-label="Chat">
+      <section class="chat-zone" aria-label="Chat" inert={drawerState.open !== null}>
         <Chat />
       </section>
 
-      <section class="rack-zone" aria-label="Control rack">
+      <section class="rack-zone" aria-label="Control rack" inert={drawerState.open !== null}>
         <InspectorPanel />
       </section>
 
@@ -213,10 +252,15 @@
             if (ev.key === "Enter" || ev.key === " ") closeDrawer();
           }}
         ></div>
-        <aside
+        <div
+          bind:this={drawerEl}
           class="drawer"
           class:narrow={NARROW_DRAWERS.has(drawerState.open)}
+          role="dialog"
+          aria-modal="true"
           aria-label="{drawerState.open} drawer"
+          tabindex="-1"
+          onkeydown={onDrawerKeydown}
         >
           {#if drawerState.open === "subspace"}
             <Drawers.RackDrawer
@@ -292,7 +336,7 @@
               <p class="stub">unknown drawer: {drawerState.open}</p>
             </div>
           {/if}
-        </aside>
+        </div>
       {/if}
     </main>
 
