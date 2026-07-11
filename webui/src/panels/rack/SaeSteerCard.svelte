@@ -1,46 +1,44 @@
 <script lang="ts">
-  // J-lens steer card — one racked ``α jlens/<word>`` token atom, wearing
-  // the same RackCard chrome as the concept steer cards.  J-lens family:
-  // blue accent, ■/□ marker.
+  // SAE steer card — one racked ``α sae/<id>`` decoder-row atom, wearing
+  // the same RackCard chrome as the concept and lens steer cards.  SAE
+  // family: gold accent, ▲/△ marker.
   //
-  //   statline : ■/□ enable toggle · word · trigger pill · ✕
-  //   body     : one α slider row (per-card, NOT the shared subspace
-  //              along — lens atoms run hotter than concept vectors, so
-  //              each token needs its own dial; ≈0.3 is the sweet spot)
+  //   statline : ▲/△ enable toggle · feature id · trigger pill · ✕
+  //   body     : one α slider row (per-card, like the lens atoms)
 
-  import type { JLensSteerEntry } from "../../lib/types";
+  import type { SaeSteerEntry } from "../../lib/types";
   import Slider from "../../lib/Slider.svelte";
   import {
-    removeJLensFromRack,
-    setJLensAlpha,
-    setJLensEnabled,
-    setJLensTrigger,
+    removeSaeFromRack,
+    setSaeAlpha,
+    setSaeEnabled,
+    setSaeTrigger,
   } from "../../lib/stores.svelte";
   import RackCard from "./RackCard.svelte";
   import { TRIGGER_LABEL, TRIGGER_WORD, nextTrigger } from "./triggers";
 
   interface Props {
     name: string;
-    entry: JLensSteerEntry;
+    entry: SaeSteerEntry;
   }
 
   let { name, entry }: Props = $props();
 
-  const word = $derived(name.slice("jlens/".length));
-  const enableGlyph = $derived(entry.enabled ? "■" : "□");
+  const id = $derived(name.slice("sae/".length));
+  const enableGlyph = $derived(entry.enabled ? "▲" : "△");
 
   function cycleTrigger(): void {
-    setJLensTrigger(name, nextTrigger(entry.trigger));
+    setSaeTrigger(name, nextTrigger(entry.trigger));
   }
 </script>
 
-<RackCard accent="--accent-blue" disabled={!entry.enabled}>
+<RackCard accent="--pillar-sae" disabled={!entry.enabled}>
   {#snippet statline()}
     <button
       type="button"
       class="enable"
       class:off={!entry.enabled}
-      onclick={() => setJLensEnabled(name, !entry.enabled)}
+      onclick={() => setSaeEnabled(name, !entry.enabled)}
       title={entry.enabled ? "Enabled (click to disable)" : "Disabled (click to enable)"}
       aria-pressed={entry.enabled}
       aria-label="Toggle steering for {name}"
@@ -48,8 +46,8 @@
       {enableGlyph}
     </button>
 
-    <span class="name" class:struck={!entry.enabled} title="j-lens token atom {name}">
-      {word}
+    <span class="name" class:struck={!entry.enabled} title="SAE decoder-row atom {name}">
+      {id}
     </span>
 
     <span class="spacer"></span>
@@ -67,7 +65,7 @@
     <button
       type="button"
       class="icon remove"
-      onclick={() => removeJLensFromRack(name)}
+      onclick={() => removeSaeFromRack(name)}
       aria-label="remove {name}"
       title="remove {name}"
     >
@@ -84,8 +82,8 @@
         max={1}
         step={0.05}
         ariaLabel="alpha for {name}"
-        title="α — push coefficient (lens atoms run hot; ≈0.3 is the sweet spot, ≥0.5 over-steers)"
-        oninput={(v) => Number.isFinite(v) && setJLensAlpha(name, v)}
+        title="α — push coefficient along the feature's decoder row"
+        oninput={(v) => Number.isFinite(v) && setSaeAlpha(name, v)}
       />
       <span class="alpha-val" title="push coefficient">{entry.alpha.toFixed(2)}</span>
     </div>
@@ -93,7 +91,7 @@
 </RackCard>
 
 <style>
-  /* ----- statline pieces (mirrors SteerCard) ----- */
+  /* ----- statline pieces (mirrors SteerCard / JLensSteerCard) ----- */
   .enable {
     background: transparent;
     border: 0;

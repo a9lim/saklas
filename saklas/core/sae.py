@@ -307,6 +307,17 @@ def list_sae_releases(model_id: str) -> list[dict[str, Any]]:
     return rows
 
 
+def sae_device_str(device: str | torch.device) -> str:
+    """Device string for the SAELens loader.
+
+    safetensors (and SAELens's own device plumbing) reject the indexed MPS
+    form a live model reports (``str(model.device) == "mps:0"``); MPS has
+    exactly one device, so the bare form is equivalent.
+    """
+    text = str(device)
+    return "mps" if text.startswith("mps") else text
+
+
 def load_sae_backend(
     release: str,
     *,
@@ -499,7 +510,7 @@ def load_sae_backend(
         load_kwargs: dict[str, Any] = {
             "release": release,
             "sae_id": sae_id,
-            "device": str(device),
+            "device": sae_device_str(device),
         }
         if dtype is not None and "dtype" in inspect.signature(loader).parameters:
             load_kwargs["dtype"] = str(dtype).removeprefix("torch.")

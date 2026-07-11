@@ -8,7 +8,7 @@ from typing import Any, cast
 import pytest
 import torch
 
-from saklas.core.sae import MockSaeBackend, select_runtime_layer
+from saklas.core.sae import MockSaeBackend, sae_device_str, select_runtime_layer
 from saklas.core.session import SaklasSession
 from saklas.core.steering_composer import SteeringComposer
 from saklas.core.steering_expr import parse_expr
@@ -56,6 +56,16 @@ def _session() -> SaklasSession:
     session._invalidate_prefix_cache = lambda: None  # type: ignore[method-assign]
     session._invalidate_analytics_cache = lambda: None  # type: ignore[method-assign]
     return cast(SaklasSession, session)
+
+
+def test_sae_device_str_strips_mps_index() -> None:
+    # safetensors rejects the indexed MPS form a live model reports
+    # ("device mps:0 is invalid"); CUDA indices must survive.
+    assert sae_device_str(torch.device("mps", 0)) == "mps"
+    assert sae_device_str("mps:0") == "mps"
+    assert sae_device_str("mps") == "mps"
+    assert sae_device_str("cuda:1") == "cuda:1"
+    assert sae_device_str("cpu") == "cpu"
 
 
 def test_select_runtime_layer_prefers_workspace_near_65_percent() -> None:

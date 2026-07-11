@@ -432,16 +432,13 @@
     overflow: hidden;
   }
 
-  /* Flat sections divided by hairlines, matching the rack chrome. */
+  /* Flat borderless sections — typography + padding carry the divide,
+     matching the rack chrome. */
   .section {
     display: flex;
     flex-direction: column;
     gap: var(--space-3);
     padding: var(--space-5);
-    border-bottom: 1px solid var(--border);
-  }
-  .section:last-child {
-    border-bottom: 0;
   }
   .section.steer {
     flex: 0 1 auto;
@@ -470,21 +467,19 @@
     overflow-y: auto;
     padding-right: var(--space-1);
   }
-  /* Anchored footer — same border-top treatment as the CAA racks'
-     actions row. */
+  /* Anchored footer — borderless, same padding treatment as the CAA
+     racks' actions row. */
   .add-form.anchored {
     flex: 0 0 auto;
-    border-top: 1px solid var(--border);
     padding-top: var(--space-3);
   }
 
-  /* Rack-style section header — underlined, matching ProbeRack /
-     SteeringRack so the two tabs read as siblings. */
+  /* Rack-style section header — borderless, matching ProbeRack /
+     SteeringRack so the tabs read as siblings. */
   .header {
     display: flex;
     align-items: baseline;
     justify-content: space-between;
-    border-bottom: 1px solid var(--border);
     padding-bottom: var(--space-3);
   }
   .header-text {
@@ -532,7 +527,7 @@
     align-self: flex-start;
     background: color-mix(in srgb, var(--accent-blue) 10%, transparent);
     color: var(--accent-blue);
-    border: 1px solid var(--accent-blue);
+    border: 1px solid transparent;
     border-radius: var(--radius);
     font-size: var(--text-sm);
     padding: var(--space-2) var(--space-5);
@@ -592,22 +587,25 @@
   .add-input {
     flex: 1 1 auto;
     min-width: 0;
-    background: var(--bg);
+    /* Borderless input: recessed well fill; ring on focus only. */
+    background: var(--input-well);
     color: var(--fg);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: var(--radius);
     font-family: var(--font-mono);
     font-size: var(--text-sm);
     padding: 2px var(--space-3);
+    transition: border-color var(--dur-fast) var(--ease-out);
   }
   .add-input:focus-visible {
-    outline: 1px solid var(--accent);
-    outline-offset: -1px;
+    outline: 2px solid var(--accent-glow);
+    outline-offset: 1px;
+    border-color: var(--accent-glow);
   }
   .add-btn {
     background: color-mix(in srgb, var(--accent-blue) 10%, transparent);
     color: var(--accent-blue);
-    border: 1px solid var(--accent-blue);
+    border: 1px solid transparent;
     border-radius: var(--radius);
     font-size: var(--text-sm);
     padding: 1px var(--space-3);
@@ -622,23 +620,23 @@
     cursor: default;
   }
 
-  /* ----- workspace live toggle ----- */
+  /* ----- workspace live toggle — ProbeRack's glass treatment ----- */
   .toggle {
     font-size: var(--text-sm);
     color: var(--fg-muted);
-    background: transparent;
-    border: 1px solid var(--border);
+    background: var(--glass);
+    border: 1px solid transparent;
     border-radius: 3px;
     padding: 1px var(--space-3);
     cursor: pointer;
   }
   .toggle:hover:not(:disabled) {
     color: var(--fg);
-    border-color: var(--fg-muted);
+    background: var(--glass-strong);
   }
   .toggle.on {
     color: var(--accent);
-    border-color: var(--accent);
+    background: var(--accent-subtle);
   }
   .toggle:disabled {
     opacity: 0.5;
