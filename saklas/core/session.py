@@ -5650,7 +5650,7 @@ class SaklasSession:
         if probabilities is None:
             assert logits is not None
             stats = token_readout_stats(
-                logits.float(), self._jlens_depths(layers), token_ids,
+                logits, self._jlens_depths(layers), token_ids,
             )
         else:
             stats = token_readout_stats_from_probabilities(
@@ -5677,11 +5677,13 @@ class SaklasSession:
         """Per-forward lens-probe gate scalars from the latest capture slices.
 
         Called from the gating score callback (once per decode forward, before
-        the token tap).  Computes the band lens logits, stashes them for the
-        display step to reuse (``_lens_step_stash``), and flattens the
+        the token tap).  Computes the referenced band lens logits, stashes them
+        for the display step to reuse (``_lens_step_stash``), and flattens the
         synthesized readings through :meth:`Monitor.flat_scalars` so the gate
         key space is uniform (``jlens/<word>`` = strength, the mean band
-        probability).  Empty when nothing is capturable yet.
+        probability). Gate-only calls score exact selected-token softmax
+        columns; live display calls still calibrate the full matrix once for
+        downstream card/aggregate reuse. Empty when nothing is capturable yet.
         """
         if not self._lens_probes:
             return {}
@@ -5691,22 +5693,6 @@ class SaklasSession:
         latest = self._capture.latest_per_layer()
         if not latest:
             return {}
-        band = self._lens_probe_layers()
-        layers = sorted(l for l in band if l in latest)
-        if not layers:
-            return {}
-        from saklas.core.jlens import readout_probabilities
-
-        logits = self._jlens_logits_rows(
-            lens, [(l, latest[l]) for l in layers],
-        )
-        probabilities = readout_probabilities(logits)
-        self._lens_step_stash = {
-            "layers": tuple(layers),
-            "logits": logits,
-            "probabilities": probabilities,
-            "fresh": True,
-        }
         only = None
         if gate_keys:
             only = {
@@ -5714,9 +5700,45 @@ class SaklasSession:
                 for key in gate_keys
                 if key.split("[", 1)[0] in self._lens_probes
             }
-        readings = self._score_lens_probes(
-            {}, probabilities=probabilities, layers=layers, only=only,
+            if not only:
+                return {}
+        band = self._lens_probe_layers(only)
+        layers = sorted(l for l in band if l in latest)
+        if not layers:
+            return {}
+
+        logits = self._jlens_logits_rows(
+            lens, [(l, latest[l]) for l in layers],
         )
+        probabilities = None
+        live_display_needs_full_probs = bool(
+            getattr(self, "_live_lens", None) is not None
+            and getattr(self, "_live_lens_active_for_generation", True)
+        )
+        if live_display_needs_full_probs:
+            from saklas.core.jlens import readout_probabilities
+
+            probabilities = readout_probabilities(logits)
+            self._lens_step_stash = {
+                "layers": tuple(layers),
+                "logits": logits,
+                "probabilities": probabilities,
+                "fresh": True,
+            }
+        else:
+            self._lens_step_stash = {
+                "layers": tuple(layers),
+                "logits": logits,
+                "fresh": True,
+            }
+        if probabilities is not None:
+            readings = self._score_lens_probes(
+                {}, probabilities=probabilities, layers=layers, only=only,
+            )
+        else:
+            readings = self._score_lens_probes(
+                {}, logits=logits, layers=layers, only=only,
+            )
         return Monitor.flat_scalars(readings)
 
     def _score_lens_probes_aggregate(

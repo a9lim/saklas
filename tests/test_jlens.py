@@ -25,6 +25,8 @@ from saklas.core.jlens import (
     readout_probabilities,
     resolve_word_token,
     topk_logprobs,
+    token_readout_stats,
+    token_readout_stats_from_probabilities,
 )
 from saklas.core.model import get_final_norm, get_unembedding
 from tests._jlens_toys import TOY_D as _D
@@ -584,6 +586,35 @@ def test_aggregate_readout_reuses_calibrated_probabilities_exactly() -> None:
         readout_probabilities(logits), depths, top_k=4,
     )
     assert got == expected
+
+
+def test_token_readout_stats_uses_exact_columns_without_full_probabilities(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import saklas.core.jlens as jlens_module
+
+    logits = torch.randn(
+        4, _VOCAB, generator=torch.Generator().manual_seed(616),
+    )
+    depths = [0.41, 0.52, 0.63, 0.74]
+    token_ids = [1, 4, 1]
+    expected = token_readout_stats_from_probabilities(
+        readout_probabilities(logits), depths, token_ids,
+    )
+
+    def _fail_full_probabilities(_logits: torch.Tensor) -> torch.Tensor:
+        raise AssertionError("fixed-token stats should not full-softmax")
+
+    monkeypatch.setattr(
+        jlens_module, "readout_probabilities", _fail_full_probabilities,
+    )
+
+    got = token_readout_stats(logits, depths, token_ids)
+
+    assert len(got) == len(expected)
+    for got_row, expected_row in zip(got, expected):
+        assert got_row[:3] == pytest.approx(expected_row[:3])
+        assert got_row[3] == pytest.approx(expected_row[3])
 
 
 def test_aggregate_readout_com_tracks_where_a_token_leads() -> None:

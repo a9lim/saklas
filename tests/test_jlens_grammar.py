@@ -209,13 +209,18 @@ def test_gated_lens_probe_keys_and_gate_scalars() -> None:
     assert composer.gated_lens_probe_keys() == {"jlens/g"}
 
 
-def test_lens_gate_scalar_scores_only_referenced_probe() -> None:
+def test_lens_gate_scalar_scores_only_referenced_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import saklas.core.jlens as jlens_module
     from saklas.core.session import SaklasSession
 
     session = _StubSession()
     session.fit_jlens(_PROMPTS)
     SaklasSession.add_probe(session, "jlens/g")  # type: ignore[arg-type]
     SaklasSession.add_probe(session, "jlens/a")  # type: ignore[arg-type]
+    session.enable_live_lens(layers=[1], top_k=3)
+    setattr(session, "_live_lens_active_for_generation", False)
 
     class _FlatCapture:
         def __init__(self, latest: dict[int, torch.Tensor]) -> None:
@@ -231,11 +236,20 @@ def test_lens_gate_scalar_scores_only_referenced_probe() -> None:
          for l in layers}
     )
 
+    def _fail_full_probabilities(_logits: torch.Tensor) -> torch.Tensor:
+        raise AssertionError("gate-only lens scalar scoring should be column-only")
+
+    monkeypatch.setattr(
+        jlens_module, "readout_probabilities", _fail_full_probabilities,
+    )
+
     scalars = session._score_lens_gate_scalars({"jlens/g"})
 
     assert "jlens/g" in scalars
     assert "jlens/g[0]" in scalars
     assert "jlens/a" not in scalars
+    assert session._lens_step_stash is not None
+    assert "probabilities" not in session._lens_step_stash
 
 
 # -------------------------------------------------------------- ns reservation

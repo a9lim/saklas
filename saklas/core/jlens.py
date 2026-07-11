@@ -505,11 +505,53 @@ def token_readout_stats_from_probabilities(
         device=probabilities.device,
     )
     p = probabilities.index_select(-1, ids)                    # [L, K]
+    return _token_readout_stats_from_probability_columns(p, depths)
+
+
+def _token_probability_columns_from_logits(
+    logits: torch.Tensor,
+    token_ids: "Sequence[int]",
+) -> torch.Tensor:
+    """Exact softmax probabilities for selected token ids only.
+
+    The denominator remains the full-vocabulary logsumexp for each layer; only
+    the returned probability columns are narrowed. This preserves gate/display
+    thresholds while avoiding a full ``[layers, vocab]`` probability matrix for
+    fixed-token probes.
+    """
+    ids = torch.tensor(
+        [int(v) for v in token_ids],
+        dtype=torch.long,
+        device=logits.device,
+    )
+    logits_f = logits.float()
+    selected = logits_f.index_select(-1, ids)                  # [L, K]
+    log_z = logits_f.logsumexp(dim=-1, keepdim=True)           # [L, 1]
+    return (selected - log_z).exp()
+
+
+def _token_readout_stats_from_probability_columns(
+    p: torch.Tensor,
+    depths: "Sequence[float]",
+) -> list[tuple[float, float, float, list[float]]]:
+    """Shared stats body for selected token probability columns ``[L, K]``."""
+    if p.ndim != 2 or p.shape[0] == 0:
+        raise ValueError(
+            "token readout stats expect [layers, tokens] probabilities, "
+            f"got shape {tuple(p.shape)}"
+        )
+    if len(depths) != p.shape[0]:
+        raise ValueError(
+            f"token readout stats: {p.shape[0]} probability rows but "
+            f"{len(depths)} depths"
+        )
+    if p.shape[1] == 0:
+        return []
     strength = p.mean(dim=0)                                    # [K]
     d = torch.tensor(
         [float(x) for x in depths],
         dtype=torch.float32,
-        device=probabilities.device,
+        device=p.device,
     ).unsqueeze(-1)                                             # [L, 1]
     mass = p.sum(dim=0).clamp_min(1e-12)                        # [K]
     com = (p * d).sum(dim=0) / mass                             # [K]
@@ -519,9 +561,9 @@ def token_readout_stats_from_probabilities(
     host = torch.cat(
         [torch.stack([strength, com, spread]), p], dim=0,
     ).cpu()                                                     # [3+L, K]
-    n_layers = int(probabilities.shape[0])
+    n_layers = int(p.shape[0])
     out: list[tuple[float, float, float, list[float]]] = []
-    for j in range(len(token_ids)):
+    for j in range(int(p.shape[1])):
         per_layer = [float(host[3 + l, j]) for l in range(n_layers)]
         out.append(
             (
@@ -570,8 +612,9 @@ def token_readout_stats(
         )
     if not token_ids:
         return []
-    return token_readout_stats_from_probabilities(
-        readout_probabilities(logits), depths, token_ids,
+    return _token_readout_stats_from_probability_columns(
+        _token_probability_columns_from_logits(logits, token_ids),
+        depths,
     )
 
 
