@@ -307,7 +307,10 @@ The live runtime keeps one selected encoder/decoder layer resident;
 `select_runtime_layer` chooses nearest 65% model depth (workspace preferred),
 and `list_sae_releases` discovers compatible registry rows without weights.
 `sae/<id>` steering reads `W_dec[id]`; feature probes read the encoder channel
-outside the `Monitor`.
+outside the `Monitor`. The capture surface is the transformer-block output, so
+only residual-post/block-output SAEs are valid: discovery omits explicitly named
+attention/MLP/transcoder families, and loaded hook metadata plus decoder width are
+validated before a release becomes resident.
 
 ## mahalanobis.py
 

@@ -271,7 +271,11 @@ def select_runtime_layer(
 def list_sae_releases(model_id: str) -> list[dict[str, Any]]:
     """Return SAELens registry suggestions compatible with ``model_id``.
 
-    Metadata-only: no SAE weights are loaded and no model forward runs.
+    Metadata-only: no SAE weights are loaded and no model forward runs. Saklas
+    captures transformer-block outputs, so registry families that explicitly
+    target attention/MLP internals or transcoders are not live-runtime
+    compatible and are omitted. Unknown naming schemes remain discoverable and
+    are validated from their loaded SAE metadata before becoming resident.
     """
     from saklas.core.errors import SaeBackendImportError
 
@@ -295,6 +299,9 @@ def list_sae_releases(model_id: str) -> list[dict[str, Any]]:
         release_model = value("model") or value("model_name")
         if release_model and model_id and not _model_names_match(str(release_model), model_id):
             continue
+        hook_kind = _release_hook_kind(str(release))
+        if hook_kind in {"attention", "mlp", "transcoder"}:
+            continue
         layer_map = _canonical_layer_map(value("saes_map", {}), warn=False)
         rows.append({
             "release": str(release),
@@ -305,6 +312,89 @@ def list_sae_releases(model_id: str) -> list[dict[str, Any]]:
         })
     rows.sort(key=lambda row: row["release"])
     return rows
+
+
+def _release_hook_kind(release: str) -> str | None:
+    """Infer explicit SAELens hook families from conventional release names.
+
+    This is only a metadata-time filter for the release picker. The loaded SAE
+    remains authoritative and is checked by :func:`_validate_residual_hook`.
+    """
+    import re
+
+    tokens = set(filter(None, re.split(r"[^a-z0-9]+", release.lower())))
+    if "transcoder" in tokens or "transcoders" in tokens:
+        return "transcoder"
+    if "att" in tokens or "attn" in tokens or "attention" in tokens:
+        return "attention"
+    if "mlp" in tokens:
+        return "mlp"
+    if "res" in tokens or "resid" in tokens or "residual" in tokens:
+        return "residual"
+    return None
+
+
+def _metadata_value(metadata: Any, name: str) -> Any:
+    if metadata is None:
+        return None
+    if hasattr(metadata, "get"):
+        return metadata.get(name)
+    return getattr(metadata, name, None)
+
+
+def _validate_residual_hook(sae: Any, release: str, layer_idx: int) -> None:
+    """Reject a loaded SAE trained anywhere other than block residual-post.
+
+    Saklas's capture layer is the transformer block output. Feeding that tensor
+    to an attention/MLP SAE can either fail on width (the common case) or,
+    worse, silently produce meaningless activations when widths happen to agree.
+    """
+    from saklas.core.errors import SaeCoverageError
+
+    cfg: Any = getattr(sae, "cfg", None)
+    metadata = (
+        cfg.get("metadata")
+        if hasattr(cfg, "get")
+        else getattr(cfg, "metadata", None)
+    )
+    hook_name = (
+        _metadata_value(metadata, "hook_name")
+        or _metadata_value(metadata, "hf_hook_name")
+        or (
+            cfg.get("hook_name")
+            if hasattr(cfg, "get")
+            else getattr(cfg, "hook_name", None)
+        )
+    )
+    if not isinstance(hook_name, str) or not hook_name:
+        return
+    normalized = hook_name.lower()
+    is_residual_post = (
+        normalized.endswith(".hook_resid_post")
+        or normalized.endswith(f"layers.{layer_idx}.output")
+    )
+    if not is_residual_post:
+        raise SaeCoverageError(
+            f"SAE release {release!r} targets {hook_name!r}, but saklas SAE "
+            "capture requires a residual-post/block-output release (for "
+            "Gemma Scope, choose the corresponding '-res' release)"
+        )
+
+
+def validate_residual_width(
+    backend: SaeBackend, layer: int, model_width: int,
+) -> None:
+    """Ensure one SAE decoder row lives in the model residual stream."""
+    from saklas.core.errors import SaeCoverageError
+
+    direction = backend.feature_direction(layer, 0)
+    sae_width = int(direction.numel())
+    if sae_width != int(model_width):
+        raise SaeCoverageError(
+            f"SAE release {backend.release!r} at layer {layer} has activation "
+            f"width {sae_width}, but the model residual stream has width "
+            f"{model_width}; choose a residual-post/block-output SAE release"
+        )
 
 
 def sae_device_str(device: str | torch.device) -> str:
@@ -538,6 +628,7 @@ def load_sae_backend(
                 f"SAE registry maps {sae_id!r} to layer {layer_idx}, but its "
                 f"loaded config reports layer {loaded_layer}"
             )
+        _validate_residual_hook(sae, release, layer_idx)
         if dtype is not None:
             if hasattr(sae, "to"):
                 sae_any: Any = sae

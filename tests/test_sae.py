@@ -202,6 +202,50 @@ def test_installed_sae_lens_registry_api_resolves_without_loading_weights() -> N
     assert backend._active_sae is None
 
 
+def test_release_discovery_omits_known_non_residual_families(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sys
+    import types
+
+    fake = types.ModuleType("sae_lens")
+    fake.get_pretrained_saes_directory = lambda: {  # pyright: ignore[reportAttributeAccessIssue]
+        "scope-res": {"saes_map": {"layer_1": 1}, "model": "m"},
+        "scope-att": {"saes_map": {"layer_1": 1}, "model": "m"},
+        "scope-mlp": {"saes_map": {"layer_1": 1}, "model": "m"},
+        "scope-transcoders": {"saes_map": {"layer_1": 1}, "model": "m"},
+        "custom": {"saes_map": {"layer_1": 1}, "model": "m"},
+    }
+    monkeypatch.setitem(sys.modules, "sae_lens", fake)
+
+    from saklas.core.sae import list_sae_releases
+
+    assert [row["release"] for row in list_sae_releases("m")] == [
+        "custom", "scope-res",
+    ]
+
+
+def test_loaded_attention_hook_is_rejected_before_use() -> None:
+    import types
+    from saklas.core.errors import SaeCoverageError
+    from saklas.core.sae import _validate_residual_hook
+
+    sae = types.SimpleNamespace(cfg=types.SimpleNamespace(
+        metadata={"hook_name": "blocks.22.attn.hook_z"},
+    ))
+    with pytest.raises(SaeCoverageError, match="choose the corresponding '-res'"):
+        _validate_residual_hook(sae, "scope-att", 22)
+
+
+def test_residual_width_must_match_model_hidden_size() -> None:
+    from saklas.core.errors import SaeCoverageError
+    from saklas.core.sae import MockSaeBackend, validate_residual_width
+
+    backend = MockSaeBackend(layers=frozenset({2}), d_model=3)
+    with pytest.raises(SaeCoverageError, match="model residual stream has width 4"):
+        validate_residual_width(backend, 2, 4)
+
+
 def test_sae_lens_backend_missing_dep_raises(monkeypatch: pytest.MonkeyPatch):
     """When sae_lens isn't installed, load_sae_backend raises SaeBackendImportError."""
     import sys

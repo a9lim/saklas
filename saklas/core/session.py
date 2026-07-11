@@ -2952,7 +2952,11 @@ class SaklasSession:
         weights are made resident here. The deterministic default is the
         covered layer nearest 65% model depth, preferring the workspace band.
         """
-        from saklas.core.sae import load_sae_backend, select_runtime_layer
+        from saklas.core.sae import (
+            load_sae_backend,
+            select_runtime_layer,
+            validate_residual_width,
+        )
         from saklas.io.sae import load_sae_labels, save_sae_metadata
 
         release = release.strip()
@@ -2972,6 +2976,9 @@ class SaklasSession:
             width = int(backend.feature_count(selected))  # materialize weights
             if width <= 0:
                 raise ValueError(f"SAE release {release!r} has no features")
+            validate_residual_width(
+                backend, selected, int(self._model_info["hidden_dim"]),
+            )
             self._sae_backend = backend
             self._sae_layer = selected
             self._sae_width = width
