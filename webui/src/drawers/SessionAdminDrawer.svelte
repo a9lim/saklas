@@ -42,7 +42,7 @@
       <span class="title">session & auth</span>
       <p>bearer key, session list, and multi-session readiness</p>
     </div>
-    <button type="button" class="close" aria-label="Close" onclick={closeDrawer}>×</button>
+    <button type="button" class="close" aria-label="Close" onclick={closeDrawer}>✕</button>
   </header>
 
   <div class="body">

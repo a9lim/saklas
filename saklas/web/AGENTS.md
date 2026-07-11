@@ -180,6 +180,7 @@ webui/src/
     rack/RackMarker.svelte    # optically matched 18 px family markers: ●/◆/■/▲
     rack/ProbePinButton.svelte # shared 24 px pin/unpin action for every probe family
     rack/LayerStrip.svelte    # shared borderless, high-contrast per-layer cells + endcaps
+    rack/ProbeReadingRow.svelte # canonical four-column label/bar/context/value meter grid
     rack/SteerCard.svelte     # unified steer card — branches on entry.mode (snap-to-node + XYPad both):
                               #   subspace → position only (magnitude = shared subspace-along master)
                               #   manifold → position + per-card along / onto
@@ -232,15 +233,31 @@ The custom-nodes tab grows an `auto-domain (let the fitter derive coords from co
 
 Rack layer views are one `rack/LayerStrip.svelte` across CAA and pinned/live
 J-LENS cards. Its `HeatmapCell` data marks have no outlines: a one-pixel gap
-separates layers, the neutral/empty bases and shared `Bar` track remain at least
-3:1 against the rack-card composite, and signed green/red hue is blended into
-that base. The style guide renders the same component. `Select.svelte`,
-`RackCard`, `SteerCard`, and `XYPad` all carry explicit `min-width: 0` shrink
-boundaries, so switching a snapped position to `(free position)` cannot expand
-the rack or clip past the inspector edge. Each `Select` instance owns unique
-option ids and lets Tab follow native focus order. App drawers are modal dialogs:
-the bench is inert while one is open, focus is trapped inside and restored to
-the launcher on close.
+separates layers, neutral stays visible against the card, and the full-scale
+green/red/J-LENS-blue endpoints stay at least 3:1 from neutral as well as the
+card. The same cells in matrix drawers use one-pixel physical table spacing so
+borderless neighbors never merge. A focused strip is an arrow-key layer scrubber
+with a visible exact-value readout; the style guide renders the real component.
+Every probe meter uses `rack/ProbeReadingRow.svelte`, which owns the exact shared
+four-column grid across CAA, J-LENS, and SAE cards. `Select.svelte`, `RackCard`,
+`SteerCard`, and `XYPad` all carry explicit `min-width: 0` shrink boundaries, so
+switching a snapped position to `(free position)` cannot expand the rack or clip
+past the inspector edge. Each `Select` instance owns unique option ids, lets Tab
+follow native focus order, and places its listbox in the browser top layer with
+viewport-clamped fixed coordinates so rack scrollers cannot crop it. App drawers
+and the command palette are modal dialogs: the bench is inert while one is open,
+focus is trapped inside and restored to the launcher on close. Global
+`:focus-visible` owns one opaque `--focus-ring` that local dense-field styles
+cannot suppress. Shared pointer controls have a 24 px minimum target.
+
+The leading marker on every PROBE card means the same thing: persistence. It
+pins/unpins J-LENS/SAE discovery cards and detaches an attached CAA/manifold
+probe; transcript highlighting is a separate labelled action on CAA/manifold
+cards. Disabled steer cards keep readable text and the re-enable action at full
+contrast, using the hollow marker, struck name, and quieter surface instead of
+whole-card opacity. Starting a background J-LENS fit is a two-step confirmation,
+and a running fit exposes the server's cooperative cancel route while preserving
+its resumable checkpoint.
 
 `ManifoldBuilderDrawer`'s custom-nodes tab grows a per-node `role` input alongside coords (validated client-side against the same `[a-z0-9._-]+` slug regex the engine uses); the auto-generated tab grows a "persona manifold (use each concept slug as that node's role)" checkbox inside `AdvancedSection` that sets `GenerateManifoldRequest.role_per_node`. `RackDrawer` rows carry a `persona` `fit-badge` when any node in `node_roles` is non-null, parallel to the `pca` / `spectral` badges.
 

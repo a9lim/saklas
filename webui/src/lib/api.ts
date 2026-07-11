@@ -897,6 +897,11 @@ export const apiLens = {
   fitStatus(id: string = SESSION): Promise<LensFitStatusJSON> {
     return request(`${SESSION_BASE(id)}/lens/fit`);
   },
+
+  /** Request cooperative cancellation at the next prompt boundary. */
+  cancelFit(id: string = SESSION): Promise<LensFitStatusJSON> {
+    return request(`${SESSION_BASE(id)}/lens/fit`, { method: "DELETE" });
+  },
 };
 
 // ================================================= sparse autoencoder ==

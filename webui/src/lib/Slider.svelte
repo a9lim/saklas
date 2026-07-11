@@ -57,14 +57,26 @@
     -webkit-appearance: none;
     appearance: none;
     width: 100%;
-    height: 4px;
+    height: 24px;
     margin: 0;
     /* Borderless: the track is a recessed groove — fill only.  The thumb
      * keeps its --bg-deep cutout ring (a glyph stroke, not chrome). */
-    background: var(--input-well);
+    background: transparent;
     border: 0;
     border-radius: var(--radius-pill);
     cursor: pointer;
+  }
+  .sk-slider::-webkit-slider-runnable-track {
+    height: 4px;
+    background: var(--input-well);
+    border: 0;
+    border-radius: var(--radius-pill);
+  }
+  .sk-slider::-moz-range-track {
+    height: 4px;
+    background: var(--input-well);
+    border: 0;
+    border-radius: var(--radius-pill);
   }
   .sk-slider:disabled {
     cursor: not-allowed;
@@ -76,6 +88,7 @@
     appearance: none;
     width: 12px;
     height: 12px;
+    margin-top: -4px;
     border-radius: 50%;
     background: var(--accent);
     border: 1px solid var(--bg-deep);
@@ -109,7 +122,7 @@
     background: var(--fg-muted);
   }
   .sk-slider:focus-visible {
-    outline: 2px solid color-mix(in srgb, var(--accent) 45%, transparent);
-    outline-offset: 3px;
+    outline: 2px solid var(--focus-ring);
+    outline-offset: 0;
   }
 </style>

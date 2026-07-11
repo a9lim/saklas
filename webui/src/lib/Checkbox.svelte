@@ -59,9 +59,9 @@
     onclick={toggle}
     onkeydown={onKeydown}
   >
-    {#if checked}
-      <span class="sk-checkbox-glyph" aria-hidden="true">✓</span>
-    {/if}
+    <span class="sk-checkbox-box" aria-hidden="true">
+      {#if checked}<span class="sk-checkbox-glyph">✓</span>{/if}
+    </span>
   </button>
   {#if label}
     <span class="sk-checkbox-label" class:is-disabled={disabled}>{label}</span>
@@ -80,29 +80,42 @@
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    width: 14px;
-    height: 14px;
+    width: 24px;
+    height: 24px;
     padding: 0;
-    background: var(--bg-elev);
-    border: 1px solid var(--border);
+    background: transparent;
+    border: 0;
     border-radius: var(--radius-sm);
     cursor: pointer;
     transition: background var(--dur-fast) var(--ease-out),
       border-color var(--dur-fast) var(--ease-out);
   }
-  .sk-checkbox:hover:not(.is-disabled) {
+  .sk-checkbox-box {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 14px;
+    height: 14px;
+    box-sizing: border-box;
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    transition: background var(--dur-fast) var(--ease-out),
+      border-color var(--dur-fast) var(--ease-out);
+  }
+  .sk-checkbox:hover:not(.is-disabled) .sk-checkbox-box {
     border-color: var(--accent-glow);
   }
   .sk-checkbox:focus-visible {
     outline: 2px solid var(--focus-ring);
     outline-offset: 2px;
   }
-  .sk-checkbox.is-checked {
+  .sk-checkbox.is-checked .sk-checkbox-box {
     background: linear-gradient(180deg, rgba(255, 255, 255, 0.18), transparent 55%),
       var(--accent);
     border-color: var(--accent);
   }
-  .sk-checkbox.is-checked:hover:not(.is-disabled) {
+  .sk-checkbox.is-checked:hover:not(.is-disabled) .sk-checkbox-box {
     background: linear-gradient(180deg, rgba(255, 255, 255, 0.18), transparent 55%),
       var(--accent-light);
     border-color: var(--accent-light);

@@ -1743,14 +1743,26 @@ class SaklasSession:
                 phase_msg="whitener requested while generation is in flight",
             ):
                 SaklasSession._assert_unsteered_artifact_operation(self)
-                if self._whitener is None:
-                    self._whitener = self._build_whitener_from_cache_or_compute()
-                    # Keep the trait monitor's read metric in lock-step with the
-                    # session whitener when it is built lazily.
-                    monitor = getattr(self, "_monitor", None)
-                    if monitor is not None and self._whitener is not None:
-                        monitor.set_whitener(self._whitener)
+                self._install_whitener_if_missing()
         return self._whitener
+
+    def _install_whitener_if_missing(self) -> None:
+        """Build and publish the lazy whitener while model use is exclusive.
+
+        The public :attr:`whitener` property acquires that exclusivity itself.
+        Generation already owns ``_gen_lock`` before it enters PREAMBLE, so its
+        steering preflight calls this helper directly: re-entering the public
+        property there would correctly see a non-idle generation phase and
+        reject the request even though the current generation is the lock owner.
+        """
+        if self._whitener is not None:
+            return
+        self._whitener = self._build_whitener_from_cache_or_compute()
+        # Keep the trait monitor's read metric in lock-step with the session
+        # whitener when it is built lazily.
+        monitor = getattr(self, "_monitor", None)
+        if monitor is not None and self._whitener is not None:
+            monitor.set_whitener(self._whitener)
 
     def _build_whitener_from_cache_or_compute(self) -> "Any":
         """Compute or load the per-model whitener.
@@ -7364,6 +7376,18 @@ class SaklasSession:
                 frequency_penalty,
                 logprobs_list,
             ) = self._prepare_generation_call(steering, sampling, thinking)
+            # Steering synthesis is Mahalanobis-normalized and therefore needs
+            # the session whitener.  On a cold ``probes=[]`` session it may not
+            # exist yet.  Prime it here while this generation already owns the
+            # model lock but before the steering scope is entered; asking the
+            # public lazy property from inside PREAMBLE would trip its deliberate
+            # generation-phase guard (the first-use J-LENS steering regression).
+            if (
+                steering_obj is not None
+                and steering_obj.alphas
+                and self._whitener is None
+            ):
+                self._install_whitener_if_missing()
             stop_list = self._seat_stop_augmentation(
                 stop_list, gen_seat=gen_seat, raw=raw,
             )

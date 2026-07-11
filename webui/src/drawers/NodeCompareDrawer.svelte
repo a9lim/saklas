@@ -399,7 +399,7 @@
         </span>
       </div>
     </div>
-    <button type="button" class="close" aria-label="Close drawer" onclick={closeDrawer}>×</button>
+    <button type="button" class="close" aria-label="Close drawer" onclick={closeDrawer}>✕</button>
   </header>
 
   <div class="toolbar">

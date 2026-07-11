@@ -64,9 +64,9 @@
     onclick={pick}
     onkeydown={onKeydown}
   >
-    {#if selected}
-      <span class="sk-radio-dot" aria-hidden="true"></span>
-    {/if}
+    <span class="sk-radio-box" aria-hidden="true">
+      {#if selected}<span class="sk-radio-dot"></span>{/if}
+    </span>
   </button>
   {#if label}
     <span class="sk-radio-label" class:is-disabled={disabled}>{label}</span>
@@ -85,24 +85,37 @@
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    width: 14px;
-    height: 14px;
+    width: 24px;
+    height: 24px;
     padding: 0;
-    background: var(--bg-elev);
-    border: 1px solid var(--border);
+    background: transparent;
+    border: 0;
     border-radius: 50%;
     cursor: pointer;
     transition: background var(--dur-fast) var(--ease-out),
       border-color var(--dur-fast) var(--ease-out);
   }
-  .sk-radio:hover:not(.is-disabled) {
+  .sk-radio-box {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 14px;
+    height: 14px;
+    box-sizing: border-box;
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 50%;
+    transition: background var(--dur-fast) var(--ease-out),
+      border-color var(--dur-fast) var(--ease-out);
+  }
+  .sk-radio:hover:not(.is-disabled) .sk-radio-box {
     border-color: var(--accent-glow);
   }
   .sk-radio:focus-visible {
     outline: 2px solid var(--focus-ring);
     outline-offset: 2px;
   }
-  .sk-radio.is-selected {
+  .sk-radio.is-selected .sk-radio-box {
     border-color: var(--accent);
   }
   .sk-radio.is-disabled {

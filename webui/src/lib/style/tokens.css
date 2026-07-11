@@ -135,8 +135,12 @@
    * readable on ordinary/low-contrast displays without reintroducing the
    * black grid the shared LayerStrip removed. */
   --data-track: #616a82;
-  --layer-cell-neutral: #707991;
-  --layer-cell-empty: #616a82;
+  --data-track-fill: #343a50;
+  --layer-cell-neutral: #616a82;
+  --layer-cell-empty: #343a50;
+  --layer-cell-positive: #6ee7b7;
+  --layer-cell-negative: #ffb1ad;
+  --layer-cell-lens: #aed3ff;
 
   /* ---- Elevation ----------------------------------------------------
    * Cards are lit from above (inset top-light) and cast down. Overlay

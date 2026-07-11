@@ -93,7 +93,7 @@
         title="Re-fetch the correlation matrix"
       >{loading ? "…" : "refresh"}</Button>
       <button type="button" class="close" onclick={onClose} aria-label="Close drawer">
-        ×
+        ✕
       </button>
     </div>
   </header>
@@ -251,7 +251,7 @@
   }
   .grid {
     border-collapse: separate;
-    border-spacing: 0;
+    border-spacing: 1px;
     font-family: var(--font-mono);
     font-variant-numeric: tabular-nums;
   }

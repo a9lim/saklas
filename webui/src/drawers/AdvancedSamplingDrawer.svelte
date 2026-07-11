@@ -46,7 +46,7 @@
       <span class="title">advanced sampling</span>
       <p>per-run controls for stop strings and logit bias</p>
     </div>
-    <button type="button" class="close" aria-label="Close" onclick={closeDrawer}>×</button>
+    <button type="button" class="close" aria-label="Close" onclick={closeDrawer}>✕</button>
   </header>
 
   <div class="body">

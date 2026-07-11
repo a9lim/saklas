@@ -198,7 +198,7 @@
         <span class="meta">run alpha grids as loom siblings, then inspect the response surface</span>
       </div>
     </div>
-    <button type="button" class="close" aria-label="Close drawer" onclick={closeDrawer}>×</button>
+    <button type="button" class="close" aria-label="Close drawer" onclick={closeDrawer}>✕</button>
   </header>
 
   <div class="body">

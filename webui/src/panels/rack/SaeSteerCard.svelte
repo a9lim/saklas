@@ -129,6 +129,7 @@
   }
 
   .trigger-pill {
+    min-height: 24px;
     background: var(--glass);
     color: var(--fg-strong);
     border: 1px solid transparent;

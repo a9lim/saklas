@@ -22,12 +22,19 @@
     onchange?: (value: T) => void;
     /** Stretch tabs to fill the row. */
     fill?: boolean;
+    /** Accessible name for the exclusive button group. */
+    ariaLabel?: string;
   }
 
   type T = $$Generic;
 
-  let { items, value = $bindable(), onchange, fill = false }: Props<T> =
-    $props();
+  let {
+    items,
+    value = $bindable(),
+    onchange,
+    fill = false,
+    ariaLabel = "View",
+  }: Props<T> = $props();
 
   function pick(v: T): void {
     if (v === value) return;
@@ -36,14 +43,13 @@
   }
 </script>
 
-<div class="sk-tabs" class:fill role="tablist">
+<div class="sk-tabs" class:fill role="group" aria-label={ariaLabel}>
   {#each items as item (item.value)}
     <button
       class="tab"
       class:on={item.value === value}
       style:--tab-c={item.color}
-      role="tab"
-      aria-selected={item.value === value}
+      aria-pressed={item.value === value}
       title={item.title}
       disabled={item.disabled}
       onclick={() => pick(item.value)}
@@ -110,7 +116,7 @@
   }
 
   .tab:focus-visible {
-    outline: 2px solid color-mix(in srgb, var(--tab-c) 45%, transparent);
+    outline: 2px solid var(--focus-ring);
     outline-offset: 2px;
   }
 </style>

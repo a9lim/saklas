@@ -121,6 +121,7 @@
           title={chip.enabled ? chip.text : `${chip.text} (disabled)`}
           onclick={() => setInspectorTab(chip.tab)}
           onremove={chip.remove}
+          removeLabel={`Remove ${chip.name} from steering recipe`}
         >
           {chip.text}
         </Chip>
@@ -177,7 +178,7 @@
     min-width: 0;
     /* Two chip rows before the bar scrolls — the expression stays
      * glanceable without eating the instrument column. */
-    max-height: 52px;
+    max-height: 60px;
     overflow-y: auto;
   }
   .copy {

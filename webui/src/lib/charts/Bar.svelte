@@ -106,6 +106,15 @@
       stroke-width="0.5"
     />
   {/if}
+  <!-- The high-contrast perimeter keeps the full scale visible while the
+       darker track interior stays distinct from every family fill. -->
+  <rect
+    x="0.5"
+    y="0.5"
+    width={Math.max(0, width - 1)}
+    height={Math.max(0, height - 1)}
+    class="track-outline"
+  />
 </svg>
 
 <style>
@@ -118,9 +127,14 @@
     overflow: hidden;
   }
   .track {
-    /* The track is a data mark, not card chrome. Keep it above 3:1 against
-     * the rack-card composite so an empty or weak bar is still legible. */
-    fill: var(--data-track);
+    fill: var(--data-track-fill);
+  }
+  .track-outline {
+    fill: none;
+    stroke: var(--data-track);
+    stroke-width: 1px;
+    vector-effect: non-scaling-stroke;
+    pointer-events: none;
   }
   .fill {
     /* Animate both x and width together — the bipolar bar encodes

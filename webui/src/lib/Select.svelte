@@ -13,8 +13,8 @@
   //     jump to first / last.
   //   * type any character → first-letter typeahead (alpha-num only),
   //     buffer flushes after 600ms idle.
-  //   * the popover flips above the trigger if the viewport would clip
-  //     it below.
+  //   * the listbox lives in the browser top layer, so scrollable racks
+  //     cannot clip it; fixed placement flips and clamps to the viewport.
   //
   // The component is generic over value type: ``T extends string |
   // number``.  Options are declarative via the ``options`` prop —
@@ -54,7 +54,7 @@
   let highlight = $state(-1);
   let trigger: HTMLButtonElement | null = $state(null);
   let listbox: HTMLUListElement | null = $state(null);
-  let flipUp = $state(false);
+  let popoverStyle = $state("");
   const uid = $props.id();
 
   // Typeahead buffer — alphanum chars within 600 ms accumulate; idle
@@ -74,12 +74,8 @@
     if (!opt || opt.disabled) return;
     value = opt.value;
     onchange?.(opt.value);
-    open = false;
-    // Let the popover leave the DOM before restoring focus. Restoring it
-    // synchronously can race the same pointer click and immediately reopen
-    // the trigger in Chromium.
+    closePopover(true);
     await tick();
-    trigger?.focus();
   }
 
   async function openPopover(): Promise<void> {
@@ -87,15 +83,26 @@
     open = true;
     highlight = currentIndex >= 0 ? currentIndex : firstEnabled(0, 1);
     await tick();
+    try {
+      listbox?.showPopover();
+    } catch {
+      // Fixed positioning still escapes ordinary scroll containers on
+      // browsers without the Popover API; the top layer is progressive.
+    }
     placeListbox();
     listbox?.focus();
   }
 
   function closePopover(restoreFocus: boolean): void {
     if (!open) return;
+    try {
+      listbox?.hidePopover();
+    } catch {
+      /* already closed or Popover API unavailable */
+    }
     open = false;
     typeBuffer = "";
-    if (restoreFocus) trigger?.focus();
+    if (restoreFocus) queueMicrotask(() => trigger?.focus());
   }
 
   function toggle(): void {
@@ -225,10 +232,24 @@
   function placeListbox(): void {
     if (!trigger || !listbox) return;
     const tr = trigger.getBoundingClientRect();
-    const below = window.innerHeight - tr.bottom;
-    const above = tr.top;
-    // Flip up if there's noticeably more room above and below is < 200px.
-    flipUp = below < 200 && above > below;
+    const gutter = 8;
+    const gap = 2;
+    const below = Math.max(0, window.innerHeight - tr.bottom - gutter - gap);
+    const above = Math.max(0, tr.top - gutter - gap);
+    const desired = Math.min(280, Math.max(40, listbox.scrollHeight));
+    const flipUp = below < Math.min(desired, 200) && above > below;
+    const available = flipUp ? above : below;
+    const maxHeight = Math.max(40, Math.min(280, available));
+    const renderedHeight = Math.min(desired, maxHeight);
+    const popoverWidth = Math.min(tr.width, window.innerWidth - gutter * 2);
+    const left = Math.max(
+      gutter,
+      Math.min(tr.left, window.innerWidth - popoverWidth - gutter),
+    );
+    const top = flipUp
+      ? Math.max(gutter, tr.top - renderedHeight - gap)
+      : Math.min(window.innerHeight - renderedHeight - gutter, tr.bottom + gap);
+    popoverStyle = `left:${left}px;top:${top}px;width:${popoverWidth}px;max-height:${maxHeight}px`;
   }
 
   function onDocumentMouseDown(ev: MouseEvent): void {
@@ -278,7 +299,8 @@
     <ul
       bind:this={listbox}
       class="sk-select-popover"
-      class:flip-up={flipUp}
+      popover="manual"
+      style={popoverStyle}
       role="listbox"
       tabindex="-1"
       aria-label={ariaLabel}
@@ -382,10 +404,8 @@
   }
 
   .sk-select-popover {
-    position: absolute;
-    left: 0;
-    right: 0;
-    top: calc(100% + 2px);
+    position: fixed;
+    inset: auto;
     margin: 0;
     padding: var(--space-1) 0;
     list-style: none;
@@ -393,17 +413,15 @@
     border: 1px solid var(--border);
     border-radius: var(--radius);
     box-shadow: var(--shadow-overlay);
-    max-height: 280px;
+    box-sizing: border-box;
     overflow-y: auto;
     z-index: var(--z-modal);
     outline: none;
   }
-  .sk-select-popover.flip-up {
-    top: auto;
-    bottom: calc(100% + 2px);
-  }
-
   .sk-select-opt {
+    display: flex;
+    align-items: center;
+    min-height: 24px;
     padding: var(--space-2) var(--space-3);
     color: var(--fg-strong);
     cursor: pointer;

@@ -16,6 +16,16 @@
   let selected = $state(0);
   let inputEl: HTMLInputElement | null = $state(null);
   let listEl: HTMLElement | null = $state(null);
+  let paletteEl: HTMLElement | null = $state(null);
+
+  const FOCUSABLE = [
+    "button:not([disabled]):not([tabindex='-1'])",
+    "[href]",
+    "input:not([disabled])",
+    "select:not([disabled])",
+    "textarea:not([disabled])",
+    '[tabindex]:not([tabindex="-1"])',
+  ].join(",");
 
   const filtered = $derived.by(() => {
     const q = query.trim().toLowerCase();
@@ -50,7 +60,13 @@
     closePalette();
     switch (cmd.action.kind) {
       case "drawer":
-        openDrawer(cmd.action.drawer);
+        // Palette focus restores to its launcher first; opening the drawer
+        // in the following microtask lets the drawer remember that same
+        // launcher and return there when it closes.
+        {
+          const drawer = cmd.action.drawer;
+          queueMicrotask(() => openDrawer(drawer));
+        }
         break;
       case "tab":
         setInspectorTab(cmd.action.tab);
@@ -85,6 +101,27 @@
     }
   }
 
+  function trapFocus(ev: KeyboardEvent): void {
+    if (ev.key !== "Tab" || !paletteEl) return;
+    const focusable = [...paletteEl.querySelectorAll<HTMLElement>(FOCUSABLE)].filter(
+      (el) => el.offsetParent !== null,
+    );
+    if (focusable.length === 0) {
+      ev.preventDefault();
+      paletteEl.focus();
+      return;
+    }
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (ev.shiftKey && (document.activeElement === first || document.activeElement === paletteEl)) {
+      ev.preventDefault();
+      last.focus();
+    } else if (!ev.shiftKey && document.activeElement === last) {
+      ev.preventDefault();
+      first.focus();
+    }
+  }
+
   const TAB_HUE: Record<string, string> = {
     subspace: "var(--pillar-subspace)",
     manifold: "var(--pillar-manifold)",
@@ -107,7 +144,15 @@
       if (ev.key === "Enter" || ev.key === " ") closePalette();
     }}
   ></div>
-  <div class="palette" role="dialog" aria-label="Command palette">
+  <div
+    bind:this={paletteEl}
+    class="palette"
+    role="dialog"
+    aria-modal="true"
+    aria-label="Command palette"
+    tabindex="-1"
+    onkeydown={trapFocus}
+  >
     <div class="input-row">
       <svg viewBox="0 0 24 24" aria-hidden="true" class="glass-icon">
         <circle cx="11" cy="11" r="7"></circle>
@@ -116,22 +161,36 @@
       <input
         bind:this={inputEl}
         bind:value={query}
+        role="combobox"
+        aria-autocomplete="list"
+        aria-controls="command-palette-listbox"
+        aria-expanded="true"
+        aria-activedescendant={filtered.length > 0
+          ? `command-palette-option-${selected}`
+          : undefined}
         placeholder="jump to an instrument, open a tool…"
         aria-label="Filter commands"
         onkeydown={onKey}
       />
       <kbd>esc</kbd>
     </div>
-    <div class="list" bind:this={listEl} role="listbox">
+    <div
+      id="command-palette-listbox"
+      class="list"
+      bind:this={listEl}
+      role="listbox"
+    >
       {#if filtered.length === 0}
         <p class="none">nothing matches "{query}"</p>
       {:else}
         {#each filtered as cmd, i (cmd.group + cmd.label)}
           {@const hue = hueFor(cmd)}
           <button
+            id={`command-palette-option-${i}`}
             type="button"
             class="row"
             role="option"
+            tabindex="-1"
             aria-selected={i === selected}
             data-selected={i === selected}
             onclick={() => run(cmd)}

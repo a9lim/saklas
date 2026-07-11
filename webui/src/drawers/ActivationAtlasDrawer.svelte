@@ -145,7 +145,7 @@
       </div>
     </div>
     <button type="button" class="close" onclick={onClose} aria-label="Close drawer">
-      ×
+      ✕
     </button>
   </header>
 
@@ -484,7 +484,7 @@
   }
   .grid {
     border-collapse: separate;
-    border-spacing: 0;
+    border-spacing: 1px;
     font-family: var(--font-mono);
     font-variant-numeric: tabular-nums;
   }

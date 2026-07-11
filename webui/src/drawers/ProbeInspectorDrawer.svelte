@@ -236,7 +236,7 @@
         {/if}
       </div>
     </div>
-    <button type="button" class="close" onclick={onClose} aria-label="Close drawer">×</button>
+    <button type="button" class="close" onclick={onClose} aria-label="Close drawer">✕</button>
   </header>
 
   {#if !probeName}

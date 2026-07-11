@@ -92,7 +92,7 @@
       <span class="title">recipe builder</span>
       <p>canonical expression, the shared subspace-along, and per-term triggers</p>
     </div>
-    <button type="button" class="close" aria-label="Close" onclick={closeDrawer}>×</button>
+    <button type="button" class="close" aria-label="Close" onclick={closeDrawer}>✕</button>
   </header>
 
   <div class="body">

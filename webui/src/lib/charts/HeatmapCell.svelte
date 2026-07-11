@@ -25,6 +25,12 @@
     /** Optional tooltip text override.  When omitted, the value is
      * formatted to 3 decimals. */
     title?: string;
+    /** Optional semantic hues. Signed probe cells use the green/red
+     * defaults; logit-space callers pass the J-LENS family blue. */
+    positiveColor?: string;
+    negativeColor?: string;
+    /** Keyboard-selected state supplied by a LayerStrip. */
+    active?: boolean;
     /** When true, render the numeric value inside the cell.  Useful
      * for the correlation matrix where the magnitude carries info; off
      * for fine-grained per-token grids where the cells are too small
@@ -37,27 +43,37 @@
     scale = HIGHLIGHT_SAT,
     size = 14,
     title,
+    positiveColor = "var(--layer-cell-positive)",
+    negativeColor = "var(--layer-cell-negative)",
+    active = false,
     showValue = false,
   }: Props = $props();
 
   const isNull = $derived(
     value === null || value === undefined || !Number.isFinite(value),
   );
+  const normalized = $derived.by(() => {
+    if (isNull) return 0;
+    const safeScale = Number.isFinite(scale) && scale > 1e-6 ? scale : HIGHLIGHT_SAT;
+    return Math.max(-1, Math.min(1, (value as number) / safeScale));
+  });
   const bg = $derived.by(() => {
     if (isNull) return "var(--layer-cell-empty)";
-    const numeric = value as number;
-    const safeScale = Number.isFinite(scale) && scale > 1e-6 ? scale : HIGHLIGHT_SAT;
-    const t = Math.max(-1, Math.min(1, numeric / safeScale));
+    const t = normalized;
     if (Math.abs(t) < 1e-9) return "var(--layer-cell-neutral)";
 
-    // Heatmap cells are data marks, not translucent token highlights. Blend
-    // into a visible neutral cell so weak readings still register and the
-    // ramp remains legible on mediocre displays. Full-scale readings stop at
-    // 62% hue to retain contrast with white numeric labels.
-    const hue = t > 0 ? "var(--highlight-pos)" : "var(--highlight-neg)";
-    const mix = 18 + Math.abs(t) * 44;
+    // The full-scale endpoints remain >3:1 from the neutral cell as well as
+    // from the card. Magnitude therefore changes lightness, not hue alone —
+    // important for low-contrast displays and color-vision differences.
+    const hue = t > 0 ? positiveColor : negativeColor;
+    const mix = 15 + Math.abs(t) * 85;
     return `color-mix(in srgb, var(--layer-cell-neutral) ${100 - mix}%, ${hue} ${mix}%)`;
   });
+  const textColor = $derived(
+    !isNull && Math.abs(normalized) >= 0.55
+      ? "var(--text-on-accent)"
+      : "var(--fg)",
+  );
   const tip = $derived(
     title ?? (isNull ? "—" : (value as number).toFixed(3)),
   );
@@ -66,7 +82,8 @@
 
 <div
   class="cell"
-  style="width: {size}px; height: {size}px; background: {bg};"
+  class:active
+  style="width: {size}px; height: {size}px; background: {bg}; color: {textColor};"
   title={tip}
   role="img"
   aria-label={tip}
@@ -87,6 +104,9 @@
     box-sizing: border-box;
     border: 0;
     border-radius: 2px;
+  }
+  .cell.active {
+    box-shadow: 0 0 0 2px var(--focus-ring);
   }
   .t {
     font-variant-numeric: tabular-nums;

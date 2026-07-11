@@ -91,7 +91,11 @@
       0 0 18px color-mix(in srgb, var(--card-accent) 7%, transparent);
   }
   .card.disabled {
-    opacity: 0.5;
+    /* Off is a reversible state, not unavailable content. Keep labels and
+     * the re-enable action at full contrast; the hollow marker, struck name,
+     * and quieter surface communicate state without dimming the whole card. */
+    background: color-mix(in srgb, var(--glass) 55%, transparent);
+    box-shadow: none;
   }
 
   /* STATLINE — the identity row.  Marker · name · status · actions share

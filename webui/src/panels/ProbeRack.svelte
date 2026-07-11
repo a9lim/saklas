@@ -199,6 +199,7 @@
     padding-top: var(--space-3);
   }
   .add {
+    min-height: 24px;
     flex: 1 1 0;
     border: 1px solid transparent;
     padding: 2px var(--space-5);

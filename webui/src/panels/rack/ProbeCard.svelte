@@ -5,8 +5,8 @@
   // (``_primaryScalar`` / ``_primaryPerLayer``), so this row reads those
   // uniformly and branches only on *presentation*.
   //
-  //   statline : ●/○ (flat) or ◆/◇ (curved) highlight-select · name
-  //              · @com ±spread · sparkline · ✕ detach
+  //   statline : ●/◆ attached marker (click to detach) · name · @com
+  //              ±spread · sparkline · highlight · inspect
   //   body     : the subspaceness row (white 0→1 bar segmented into
   //                intrinsic-dim notches · nearest node · fraction), then
   //                one signed bar per coordinate axis (poles on a rank-1
@@ -15,7 +15,7 @@
   //                and a 2-D box-domain mini-map.
   //
   // Family is signalled by accent (--accent flat / --accent-purple curved)
-  // and glyph.  The identity cluster toggles the transcript highlight for
+  // and glyph.  A dedicated action toggles the transcript highlight for
   // *every* family — the per-token score map is keyed by probe name
   // regardless of geometry, so curved probes are valid highlight targets
   // (the top-bar dropdown already lists them; this wires the click too).
@@ -34,8 +34,9 @@
   import { pushToast } from "../../lib/stores/toasts.svelte";
   import { polesOf } from "../../lib/concepts";
   import RackCard from "./RackCard.svelte";
-  import RackMarker from "./RackMarker.svelte";
+  import ProbePinButton from "./ProbePinButton.svelte";
   import LayerStrip from "./LayerStrip.svelte";
+  import ProbeReadingRow from "./ProbeReadingRow.svelte";
 
   interface Props {
     name: string;
@@ -159,30 +160,21 @@
 
   // ---------- highlight select / detach ----------
 
-  // Click the identity cluster toggles highlight: select if not selected,
-  // deselect (back to "off") if already selected.  Mirrors the TUI's
-  // /probe behavior — one click anchors the row, click again to unset.
+  // The leading marker now means persistence in every probe family. CAA's
+  // transcript-highlight selection is an explicit sibling action instead
+  // of overloading the same glyph used for J-LENS/SAE pinning.
   function toggleHighlight(): void {
     setHighlightTarget(isHighlight ? null : name);
-  }
-
-  function onRowKey(ev: KeyboardEvent): void {
-    if (ev.key === "Enter" || ev.key === " ") {
-      ev.preventDefault();
-      toggleHighlight();
-    }
   }
 
   // Open the per-probe inspector (whitened geometry plot + layer norms + live
   // trail).  Distinct gesture from the identity-cluster highlight toggle, so
   // ``stopPropagation`` keeps the two from colliding.
-  function onInspect(ev: MouseEvent): void {
-    ev.stopPropagation();
+  function onInspect(): void {
     openDrawer("probe_inspector", { name });
   }
 
-  async function onDetach(ev: MouseEvent): Promise<void> {
-    ev.stopPropagation();
+  async function onDetach(): Promise<void> {
     try {
       await detachProbe(name);
       pushToast(`detached probe ${name}`, { kind: "info" });
@@ -198,31 +190,15 @@
 
 <RackCard {accent} disabled={false} active={isHighlight}>
   {#snippet statline()}
-    <!-- Identity cluster — clicking it toggles the highlight selection. -->
-    <div
-      class="select-cluster"
-      role="button"
-      tabindex="0"
-      aria-pressed={isHighlight}
-      aria-label={isHighlight
-        ? `Deselect ${name} as highlight target`
-        : `Select ${name} as highlight target`}
-      onclick={toggleHighlight}
-      onkeydown={onRowKey}
-    >
-      <span
-        class="select-glyph"
-        class:selected={isHighlight}
-        aria-hidden="true"
-        title={isHighlight
-          ? "Selected (click to deselect)"
-          : "Click to select for highlighting"}
-      ><RackMarker
-          shape={affine ? "circle" : "diamond"}
-          filled={isHighlight}
-        /></span>
-      <span class="name" title="probe {name}">{displayName}</span>
-    </div>
+    <ProbePinButton
+      shape={affine ? "circle" : "diamond"}
+      pinned={true}
+      onclick={() => void onDetach()}
+      title="Attached (click to detach)"
+      ariaLabel={`Detach probe ${name}`}
+    />
+
+    <span class="name" title="probe {name}">{displayName}</span>
 
     {#if depthCom !== null}
       <span
@@ -245,75 +221,92 @@
 
     <button
       type="button"
+      class="highlight-action"
+      class:on={isHighlight}
+      aria-pressed={isHighlight}
+      aria-label={isHighlight
+        ? `Deselect ${name} as transcript highlight target`
+        : `Select ${name} as transcript highlight target`}
+      title="Use this probe to color transcript tokens"
+      onclick={toggleHighlight}
+    >{isHighlight ? "highlighted" : "highlight"}</button>
+
+    <button
+      type="button"
       class="icon inspect"
       aria-label="Inspect probe {name}"
       title="Open probe inspector"
       onclick={onInspect}
     >ⓘ</button>
 
-    <button
-      type="button"
-      class="icon remove"
-      aria-label="Detach probe {name}"
-      title="Detach probe"
-      onclick={onDetach}
-    >✕</button>
   {/snippet}
 
   {#snippet body()}
     <!-- Subspaceness row: white 0→1 bar · nearest node · fraction.  "How
          much of the centered activation lives in this probe's subspace" —
          the scale runs higher for higher-rank fits, which is expected. -->
-    <div class="reading reading-subspace">
-      <span
-        class="row-label"
-        title="subspaceness — share of the centered activation living in this probe's subspace (0–1)"
-      >subspace</span>
-      <div class="bar-cell" aria-hidden="true">
+    <ProbeReadingRow
+      ariaLabel={`Subspace fraction ${fmtFraction(fraction)}${topNearest ? `, nearest ${nearestLabel}` : ""}`}
+    >
+      {#snippet left()}
+        <span
+          class="row-label"
+          title="subspaceness — share of the centered activation living in this probe's subspace (0–1)"
+        >subspace</span>
+      {/snippet}
+      {#snippet bar()}
         <Bar value={fraction} max={1} width={160} height={8} color="var(--fg)" />
-      </div>
-      <span
-        class="nearest"
-        title={topNearest
-          ? `nearest node: ${nearestLabel} (distance ${fmtDistance(nearestDistance)})`
-          : "awaiting first token"}
-      >
-        {#if topNearest}
-          <span class="nearest-label">{nearestLabel}</span>
-          <span class="nearest-dist">d={fmtDistance(nearestDistance)}</span>
-        {:else}
-          <span class="nearest-empty">—</span>
-        {/if}
-      </span>
-      <span class="value">{fmtFraction(fraction)}</span>
-    </div>
+      {/snippet}
+      {#snippet middle()}
+        <span
+          class="nearest"
+          title={topNearest
+            ? `nearest node: ${nearestLabel} (distance ${fmtDistance(nearestDistance)})`
+            : "awaiting first token"}
+        >
+          {#if topNearest}
+            <span class="nearest-label">{nearestLabel}</span>
+            <span class="nearest-dist">d={fmtDistance(nearestDistance)}</span>
+          {:else}
+            <span class="nearest-empty">—</span>
+          {/if}
+        </span>
+      {/snippet}
+      {#snippet right()}<span class="value">{fmtFraction(fraction)}</span>{/snippet}
+    </ProbeReadingRow>
 
     <!-- One signed bar per coordinate axis.  A rank-1 concept axis carries
          pole labels (neg ◄─► pos); higher-rank fans and curved fits label
          axes c0…cR-1.  Each bar normalizes by its own node extent. -->
     {#each axes as ax (ax.i)}
-      <div class="reading reading-coord">
-        {#if showPoles}
-          <span class="pole neg" aria-hidden={monopolar}>
-            {#if !monopolar}{poles.negative}{/if}
-          </span>
-        {:else}
-          <span class="row-label axis">c{ax.i}</span>
-        {/if}
-        <div class="bar-cell" aria-hidden="true">
+      <ProbeReadingRow ariaLabel={`Coordinate ${ax.i}, ${ax.value.toFixed(2)}`}>
+        {#snippet left()}
+          {#if showPoles}
+            <span class="pole neg" aria-hidden={monopolar}>
+              {#if !monopolar}{poles.negative}{/if}
+            </span>
+          {:else}
+            <span class="row-label axis">c{ax.i}</span>
+          {/if}
+        {/snippet}
+        {#snippet bar()}
           <Bar value={ax.value} max={ax.scale} width={160} height={8} bipolar />
-        </div>
-        {#if showPoles}
-          <span class="pole pos" title={`positive pole (${poles.positive})`}>
-            {poles.positive}
+        {/snippet}
+        {#snippet middle()}
+          {#if showPoles}
+            <span class="pole pos" title={`positive pole (${poles.positive})`}>
+              {poles.positive}
+            </span>
+          {:else}
+            <span class="pole pos" aria-hidden="true"></span>
+          {/if}
+        {/snippet}
+        {#snippet right()}
+          <span class="value" class:pos={ax.value > 0} class:neg={ax.value < 0}>
+            {ax.value >= 0 ? "+" : ""}{ax.value.toFixed(2)}
           </span>
-        {:else}
-          <span class="pole pos" aria-hidden="true"></span>
-        {/if}
-        <span class="value" class:pos={ax.value > 0} class:neg={ax.value < 0}>
-          {ax.value >= 0 ? "+" : ""}{ax.value.toFixed(2)}
-        </span>
-      </div>
+        {/snippet}
+      </ProbeReadingRow>
     {/each}
 
     {#if !affine && residual !== null}
@@ -347,34 +340,6 @@
 
 <style>
   /* ----- statline ----- */
-  .select-cluster {
-    display: flex;
-    align-items: center;
-    gap: var(--space-3);
-    min-width: 0;
-    cursor: pointer;
-    user-select: none;
-    border-radius: var(--radius);
-  }
-  .select-cluster:hover {
-    background: var(--bg-elev);
-  }
-  .select-cluster:focus-visible {
-    outline: 1px solid var(--card-accent);
-    outline-offset: -1px;
-  }
-  .select-glyph {
-    display: inline-grid;
-    place-items: center;
-    inline-size: 24px;
-    block-size: 24px;
-    margin: 0 -3px;
-    color: var(--fg-muted);
-    flex: 0 0 24px;
-  }
-  .select-glyph.selected {
-    color: var(--card-accent);
-  }
   .name {
     color: var(--fg-strong);
     font-family: var(--font-mono);
@@ -413,35 +378,27 @@
     color: var(--fg-strong);
     background: var(--bg-elev);
   }
-  .remove:hover:not(:disabled) {
-    color: var(--accent-red);
-  }
   .inspect:hover:not(:disabled) {
     color: var(--accent-purple);
   }
-
-  /* ----- body: reading row ----- */
-  .reading {
-    display: grid;
-    align-items: center;
-    gap: var(--space-2);
-    min-width: 0;
-    /* Every reading row is two text lines tall — the subspaceness row's
-       stacked nearest (label / d=…) sets the height, and the single-line
-       coordinate rows reserve the same so the stack reads as one even
-       column rather than a tall first row over short ones.  13px + 11px =
-       the label + dist line boxes pinned below. */
+  .highlight-action {
     min-height: 24px;
+    padding: var(--space-1) var(--space-3);
+    color: var(--fg-muted);
+    background: var(--glass);
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
+    font-size: var(--text-xs);
+    flex: 0 0 auto;
   }
-  /* Every reading row shares the grid so the bars stack in one inset
-     column and the labels/values line up.  Subspaceness: "subspace" ·
-     white bar · nearest · fraction.  Coordinate: pole-or-cN · signed bar ·
-     pole-or-empty · value. */
-  .reading-subspace,
-  .reading-coord {
-    grid-template-columns: minmax(2.5em, 1fr) minmax(60px, 2.6fr) minmax(2.5em, 1fr) 3.5em;
+  .highlight-action:hover,
+  .highlight-action.on {
+    color: var(--card-accent);
+    background: color-mix(in srgb, var(--card-accent) 10%, var(--glass));
   }
-  /* Left-column axis caption — the subspaceness "subspace" tag and the
+
+  /* ----- body: ProbeReadingRow content -----
+     Left-column axis caption — the subspaceness "subspace" tag and the
      "c0…cR-1" coordinate labels.  Hugs the bar (right-aligned) like the
      neg pole it shares the slot with. */
   .row-label {
@@ -470,14 +427,6 @@
   .pole.pos {
     color: var(--fg-strong);
     text-align: left;
-  }
-  .bar-cell {
-    min-width: 0;
-  }
-  .bar-cell :global(.bar) {
-    width: 100%;
-    height: 8px;
-    display: block;
   }
   .nearest {
     display: inline-flex;

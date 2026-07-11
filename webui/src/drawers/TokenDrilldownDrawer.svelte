@@ -542,7 +542,7 @@
       {/if}
     </div>
     <button type="button" class="close" onclick={onClose} aria-label="Close drawer">
-      ×
+      ✕
     </button>
   </header>
 
@@ -550,9 +550,9 @@
        toggle when this turn has an A/B pair.  Tabs always render so users
        see the other views exist even when their capture is off. -->
   <div class="toolbar">
-    <SegmentedTabs items={TAB_ITEMS} bind:value={tab} />
+    <SegmentedTabs items={TAB_ITEMS} bind:value={tab} ariaLabel="Token detail view" />
     {#if hasAbPair}
-      <SegmentedTabs items={BRANCH_ITEMS} bind:value={branch} />
+      <SegmentedTabs items={BRANCH_ITEMS} bind:value={branch} ariaLabel="Token branch" />
     {/if}
   </div>
 
@@ -1043,7 +1043,7 @@
   }
   .grid {
     border-collapse: separate;
-    border-spacing: 0;
+    border-spacing: 1px;
     font-family: var(--font-mono);
     font-variant-numeric: tabular-nums;
   }

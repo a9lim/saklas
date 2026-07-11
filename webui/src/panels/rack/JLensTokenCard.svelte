@@ -22,6 +22,7 @@
   import RackCard from "./RackCard.svelte";
   import ProbePinButton from "./ProbePinButton.svelte";
   import LayerStrip from "./LayerStrip.svelte";
+  import ProbeReadingRow from "./ProbeReadingRow.svelte";
 
   interface Props {
     /** Raw vocabulary token text (untrimmed). */
@@ -116,17 +117,19 @@
 
   {#snippet body()}
     <!-- Strength: mean band probability, absolute 0→1. -->
-    <div class="reading">
-      <span
-        class="row-label"
-        title="strength — mean probability of this token across the workspace band (0–1)"
-      >strength</span>
-      <div class="bar-cell" aria-hidden="true">
+    <ProbeReadingRow ariaLabel={`Strength ${strength.toFixed(2)}`}>
+      {#snippet left()}
+        <span
+          class="row-label"
+          title="strength — mean probability of this token across the workspace band (0–1)"
+        >strength</span>
+      {/snippet}
+      {#snippet bar()}
         <Bar value={strength} max={1} width={160} height={8} color="var(--card-accent)" />
-      </div>
-      <span class="filler" aria-hidden="true"></span>
-      <span class="value">{strength.toFixed(2)}</span>
-    </div>
+      {/snippet}
+      {#snippet middle()}<span aria-hidden="true"></span>{/snippet}
+      {#snippet right()}<span class="value">{strength.toFixed(2)}</span>{/snippet}
+    </ProbeReadingRow>
 
     <!-- Per-layer strength strip with L endcaps. -->
     <LayerStrip
@@ -134,6 +137,7 @@
       scale={cellScale}
       ariaLabel={`Per-layer strength for ${display}`}
       emptyMessage="no layer data"
+      positiveColor="var(--layer-cell-lens)"
     />
   {/snippet}
 </RackCard>
@@ -159,20 +163,7 @@
     font-variant-numeric: tabular-nums;
     flex: 0 0 auto;
   }
-  /* ----- body: strength row — ProbeCard's EXACT four-column grid
-     (label · bar · nearest-or-empty · value), so the bar column aligns
-     pixel-for-pixel with the CAA cards across the tab switch. ----- */
-  .reading {
-    display: grid;
-    align-items: center;
-    gap: var(--space-2);
-    min-width: 0;
-    min-height: 24px;
-    grid-template-columns: minmax(2.5em, 1fr) minmax(60px, 2.6fr) minmax(2.5em, 1fr) 3.5em;
-  }
-  .filler {
-    min-width: 0;
-  }
+  /* ----- body: reading-row content; ProbeReadingRow owns geometry. ----- */
   .row-label {
     color: var(--fg-muted);
     font-family: var(--font-mono);
@@ -182,14 +173,6 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     min-width: 0;
-  }
-  .bar-cell {
-    min-width: 0;
-  }
-  .bar-cell :global(.bar) {
-    width: 100%;
-    height: 8px;
-    display: block;
   }
   .value {
     color: var(--fg-muted);

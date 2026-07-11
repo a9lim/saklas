@@ -20,6 +20,7 @@
   import { pushToast } from "../../lib/stores/toasts.svelte";
   import RackCard from "./RackCard.svelte";
   import ProbePinButton from "./ProbePinButton.svelte";
+  import ProbeReadingRow from "./ProbeReadingRow.svelte";
 
   interface Props {
     /** Feature index into the resident SAE's dictionary. */
@@ -138,32 +139,36 @@
       <!-- Strength: activation / maxActApprox — absolute 0..1 scale, the
            same convention as the lens cards; the @when:sae/<id> gate
            channel reads this unit. -->
-      <div class="reading">
-        <span
-          class="row-label"
-          title="strength — activation ({rawValue.toFixed(1)}) / Neuronpedia max activation (~{maxAct?.toFixed(1)}); the @when:sae/{id} gate channel"
-        >strength</span>
-        <div class="bar-cell" aria-hidden="true">
+      <ProbeReadingRow ariaLabel={`Strength ${strength.toFixed(2)}`}>
+        {#snippet left()}
+          <span
+            class="row-label"
+            title="strength — activation ({rawValue.toFixed(1)}) / Neuronpedia max activation (~{maxAct?.toFixed(1)}); the @when:sae/{id} gate channel"
+          >strength</span>
+        {/snippet}
+        {#snippet bar()}
           <Bar value={Math.max(strength, 0)} max={1} width={160} height={8} color="var(--card-accent)" />
-        </div>
-        <span class="filler" aria-hidden="true"></span>
-        <span class="value">{strength.toFixed(2)}</span>
-      </div>
+        {/snippet}
+        {#snippet middle()}<span aria-hidden="true"></span>{/snippet}
+        {#snippet right()}<span class="value">{strength.toFixed(2)}</span>{/snippet}
+      </ProbeReadingRow>
     {:else}
       <!-- No Neuronpedia metadata (offline / unlisted feature): raw
            activation on the panel-shared scale, so bars still rank
            consistently with the numbers across cards. -->
-      <div class="reading">
-        <span
-          class="row-label"
-          title="activation — raw feature activation (no Neuronpedia max yet; bar scaled to the largest visible reading); the @when:sae/{id} gate channel"
-        >activation</span>
-        <div class="bar-cell" aria-hidden="true">
+      <ProbeReadingRow ariaLabel={`Activation ${rawValue.toFixed(2)}`}>
+        {#snippet left()}
+          <span
+            class="row-label"
+            title="activation — raw feature activation (no Neuronpedia max yet; bar scaled to the largest visible reading); the @when:sae/{id} gate channel"
+          >activation</span>
+        {/snippet}
+        {#snippet bar()}
           <Bar value={Math.max(rawValue, 0)} max={Math.max(fallbackScale, 1)} width={160} height={8} color="var(--card-accent)" />
-        </div>
-        <span class="filler" aria-hidden="true"></span>
-        <span class="value">{rawValue.toFixed(2)}</span>
-      </div>
+        {/snippet}
+        {#snippet middle()}<span aria-hidden="true"></span>{/snippet}
+        {#snippet right()}<span class="value">{rawValue.toFixed(2)}</span>{/snippet}
+      </ProbeReadingRow>
     {/if}
   {/snippet}
 </RackCard>
@@ -190,21 +195,7 @@
     min-width: 0;
   }
 
-  /* ----- body: reading row — ProbeCard's EXACT four-column grid
-     (label · bar · nearest-or-empty · value), so the bar column aligns
-     pixel-for-pixel with the other pillars' cards across the tab
-     switch. ----- */
-  .reading {
-    display: grid;
-    align-items: center;
-    gap: var(--space-2);
-    min-width: 0;
-    min-height: 24px;
-    grid-template-columns: minmax(2.5em, 1fr) minmax(60px, 2.6fr) minmax(2.5em, 1fr) 3.5em;
-  }
-  .filler {
-    min-width: 0;
-  }
+  /* ----- body: reading-row content; ProbeReadingRow owns geometry. ----- */
   .row-label {
     color: var(--fg-muted);
     font-family: var(--font-mono);
@@ -214,14 +205,6 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     min-width: 0;
-  }
-  .bar-cell {
-    min-width: 0;
-  }
-  .bar-cell :global(.bar) {
-    width: 100%;
-    height: 8px;
-    display: block;
   }
   .value {
     color: var(--fg-muted);

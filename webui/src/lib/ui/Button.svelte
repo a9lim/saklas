@@ -77,6 +77,7 @@
     padding: 7px 14px;
   }
   .sm {
+    min-height: 24px;
     font-size: var(--text-xs);
     padding: 4px 10px;
     border-radius: var(--radius-sm);
@@ -118,8 +119,7 @@
   }
 
   .sk-btn:focus-visible {
-    outline: 2px solid
-      color-mix(in srgb, var(--btn-accent) 45%, transparent);
+    outline: 2px solid var(--focus-ring);
     outline-offset: 2px;
   }
 </style>

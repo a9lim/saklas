@@ -228,7 +228,7 @@
   </div>
 {:else}
   <div class="shell" class:loading={bootStatus === "loading"}>
-    <main class="layout">
+    <main class="layout" inert={paletteState.open}>
       <section class="loom-zone" aria-label="Threads" inert={drawerState.open !== null}>
         <LoomSidebar />
       </section>

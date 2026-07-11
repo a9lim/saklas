@@ -64,7 +64,7 @@
         <span class="meta">runtime readiness, tree state, vectors, probes, and UI coverage</span>
       </div>
     </div>
-    <button type="button" class="close" aria-label="Close" onclick={closeDrawer}>×</button>
+    <button type="button" class="close" aria-label="Close" onclick={closeDrawer}>✕</button>
   </header>
 
   <div class="body">

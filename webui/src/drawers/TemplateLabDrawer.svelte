@@ -218,11 +218,11 @@
     <div class="title">
       <span class="eyebrow">templates</span>
     </div>
-    <button type="button" class="close" aria-label="Close drawer" onclick={closeDrawer}>×</button>
+    <button type="button" class="close" aria-label="Close drawer" onclick={closeDrawer}>✕</button>
   </header>
 
   <div class="toolbar">
-    <SegmentedTabs items={TAB_ITEMS} bind:value={tab} />
+    <SegmentedTabs items={TAB_ITEMS} bind:value={tab} ariaLabel="Template lab view" />
   </div>
 
   <div class="body">

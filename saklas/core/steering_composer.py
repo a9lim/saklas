@@ -105,13 +105,19 @@ class SteeringComposer:
         from saklas.core.steering_expr import ProjectedTerm
         from saklas.core.vectors import project_profile
 
-        whitener = self._session.whitener
         profiles = self._session._profiles
 
         snapshots: dict[str, object] = {}
+        whitener = None
         for syn_key, val in steering.alphas.items():
             if not isinstance(val, ProjectedTerm):
                 continue
+            # Do not wake the lazy neutral-activation/whitener pipeline for an
+            # ordinary steering expression.  Plain vector/manifold terms are
+            # normalized later by ``compose_steering_entries``; only an actual
+            # projection needs the whitener at materialization time.
+            if whitener is None:
+                whitener = self._session.whitener
             base_tensors = self.ensure_profile_registered(
                 val.base, role="projection base",
             )

@@ -1472,12 +1472,18 @@
     min-width: 0;
   }
 
-  /* Phase 5 filter dim — distinct from the 30% dead-branch dim. */
-  .tree-row.filtered-out {
-    opacity: 0.5;
+  /* Filter non-matches stay navigable context.  Never fade the whole row:
+   * that compounds with dead-branch state and destroys text contrast. */
+  .tree-row.filtered-out :global(.node) {
+    color: var(--fg-muted);
+    background: transparent;
   }
-  .tree-row.filtered-out:hover {
-    opacity: 0.8;
+  .tree-row.filtered-out:hover :global(.node) {
+    color: var(--fg);
+    background: var(--bg-elev);
+  }
+  .tree-row.filtered-out :global(.edge) {
+    opacity: 0.35;
   }
   /* Multi-select highlight for cross-branch compare. */
   .tree-row.selected :global(.node) {

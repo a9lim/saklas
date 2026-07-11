@@ -106,6 +106,42 @@ def test_single_scope_push_pop():
     assert kinds == ["SteeringApplied", "SteeringCleared"]
 
 
+def test_plain_materialization_does_not_wake_whitener():
+    """Only ``~``/``|`` terms need the projection-time whitener read."""
+    from saklas.core.steering_composer import SteeringComposer
+
+    class _NoWhitener:
+        _profiles: dict[str, object] = {}
+
+        @property
+        def whitener(self) -> None:
+            raise AssertionError("plain steering touched the lazy whitener")
+
+    composer = SteeringComposer(_NoWhitener())  # type: ignore[arg-type]
+    assert composer.materialize_projections(
+        Steering(alphas={"plain": 0.2}),
+    ) == {}
+
+
+def test_generation_preamble_can_publish_lazy_whitener():
+    """The lock-owning generation preflight bypasses the public phase guard."""
+    from types import SimpleNamespace
+
+    sentinel = object()
+    installed: list[object] = []
+    session: Any = SaklasSession.__new__(SaklasSession)
+    session._whitener = None
+    session._monitor = SimpleNamespace(
+        set_whitener=lambda value: installed.append(value),
+    )
+    session._build_whitener_from_cache_or_compute = lambda: sentinel
+
+    session._install_whitener_if_missing()
+
+    assert session._whitener is sentinel
+    assert installed == [sentinel]
+
+
 def test_fit_refuses_active_steering_before_touching_artifacts(tmp_path: Path) -> None:
     s = _Stub({"a": None})
     with s.steering("0.3 a"):

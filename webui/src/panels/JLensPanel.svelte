@@ -37,6 +37,7 @@
     addJLensToRack,
     activeProbeNames,
     attachProbe,
+    cancelLensFit,
     checkLensFit,
     lensFitState,
     lensState,
@@ -54,6 +55,16 @@
 
   const fitted = $derived(sessionState.info?.jlens_fitted === true);
   const liveOn = $derived(lensState.layers !== null);
+  let fitConfirm = $state(false);
+
+  function requestFit(): void {
+    if (!fitConfirm) {
+      fitConfirm = true;
+      return;
+    }
+    fitConfirm = false;
+    void startLensFit();
+  }
 
   // Resume-visibility: a page reload mid-fit should pick the progress
   // polling back up (the fit runs server-side regardless of the client).
@@ -190,6 +201,57 @@
     return out;
   });
 
+  type WorkspaceCard =
+    | {
+        kind: "pinned";
+        key: string;
+        row: PinnedRow;
+        sortName: string;
+        strength: number;
+        com: number;
+      }
+    | {
+        kind: "aggregate";
+        key: string;
+        row: AggRow;
+        sortName: string;
+        strength: number;
+        com: number;
+      };
+
+  /** Pinned and discovered tokens are one visual roster. Persistence is an
+   *  action/state difference, not a hidden first sort key. */
+  const workspaceCards = $derived.by((): WorkspaceCard[] => {
+    const rows: WorkspaceCard[] = pinnedCards.map((row) => ({
+      kind: "pinned",
+      key: row.name,
+      row,
+      sortName: row.name.slice("jlens/".length),
+      strength: row.value,
+      com: row.com,
+    }));
+    if (liveOn) {
+      rows.push(...aggRows.map((row) => ({
+        kind: "aggregate" as const,
+        key: `aggregate:${row.token}`,
+        row,
+        sortName: row.token.trim(),
+        strength: row.strength,
+        com: row.com,
+      })));
+    }
+    if (lensState.workspaceSortMode === "name") {
+      rows.sort((a, b) => a.sortName.localeCompare(b.sortName) ||
+        b.strength - a.strength);
+    } else if (lensState.workspaceSortMode === "depth") {
+      rows.sort((a, b) => a.com - b.com || b.strength - a.strength);
+    } else {
+      rows.sort((a, b) => b.strength - a.strength ||
+        a.sortName.localeCompare(b.sortName));
+    }
+    return rows;
+  });
+
   let probeInput = $state("");
   let probeBusy = $state(false);
 
@@ -270,7 +332,12 @@
     <section class="section">
       <RackSectionHeader title="J-LENS" />
       {#if lensFitState.running}
-        <div class="fit-progress" aria-label="Lens fit progress">
+        <div
+          class="fit-progress"
+          role="status"
+          aria-live="polite"
+          aria-label="Lens fit progress"
+        >
           <div class="fit-line">
             <span class="fit-msg">{lensFitState.message ?? "fitting…"}</span>
             {#if lensFitState.promptsTotal > 0}
@@ -279,7 +346,14 @@
               </span>
             {/if}
           </div>
-          <div class="fit-bar" aria-hidden="true">
+          <div
+            class="fit-bar"
+            role="progressbar"
+            aria-label="J-lens prompts fitted"
+            aria-valuemin="0"
+            aria-valuemax={Math.max(lensFitState.promptsTotal, 1)}
+            aria-valuenow={lensFitState.promptsDone}
+          >
             <Bar
               value={lensFitState.promptsDone}
               max={Math.max(lensFitState.promptsTotal, 1)}
@@ -292,6 +366,14 @@
             the fit holds the model — generations error until it lands;
             an interrupted fit resumes from its last checkpoint
           </p>
+          <button
+            type="button"
+            class="fit-btn cancel"
+            disabled={lensFitState.cancelling}
+            onclick={() => void cancelLensFit()}
+          >
+            {lensFitState.cancelling ? "requesting cancel…" : "cancel fit"}
+          </button>
         </div>
       {:else}
         <p class="hint">
@@ -299,16 +381,23 @@
           token atoms, and token probes all need the per-model artifact
         </p>
         {#if lensFitState.error}
-          <p class="hint fit-error">last fit: {lensFitState.error}</p>
+          <p class="hint fit-error" role="alert">last fit: {lensFitState.error}</p>
         {/if}
         <button
           type="button"
           class="fit-btn"
-          onclick={() => void startLensFit()}
+          class:confirm={fitConfirm}
+          onclick={requestFit}
           title="Fit the Jacobian lens over the workspace band (~100 web-text prompts; hours of wall clock, checkpointed and resumable)"
         >
-          fit j-lens
+          {fitConfirm ? "confirm fit — model unavailable for hours" : "fit j-lens"}
         </button>
+        {#if fitConfirm}
+          <p class="hint fit-warning" role="alert">
+            This starts a checkpointed background fit and blocks generation.
+            Press confirm again to begin.
+          </p>
+        {/if}
         <p class="hint">
           ≈100 web-text prompts over the 40–90% workspace band —
           compute-bound (hours on Apple silicon), checkpointed every 25
@@ -373,11 +462,29 @@
       />
 
       <div class="scroll">
-        {#if pinnedCards.length > 0}
-          <div class="cards" role="list" aria-label="Pinned lens token probes">
-            {#each pinnedCards as row (row.name)}
+        {#if workspaceCards.length > 0}
+          <div class="cards" role="list" aria-label="J-lens probe tokens">
+            {#each workspaceCards as card (card.key)}
               <div role="listitem">
-                <JLensProbeCard name={row.name} entry={row.entry} />
+                {#if card.kind === "pinned"}
+                  <JLensProbeCard
+                    name={card.row.name}
+                    entry={card.row.entry}
+                  />
+                {:else}
+                  <JLensTokenCard
+                    token={card.row.token}
+                    strength={card.row.strength}
+                    com={card.row.com}
+                    spread={card.row.spread}
+                    series={card.row.series}
+                    layers={lensState.layers ?? []}
+                    readout={lensState.readout}
+                    pinned={false}
+                    busy={probeBusy}
+                    onpin={pinWord}
+                  />
+                {/if}
               </div>
             {/each}
           </div>
@@ -385,24 +492,6 @@
 
         {#if liveOn}
           {#if aggRows.length > 0}
-            <div class="cards" role="list" aria-label="Workspace aggregate tokens">
-              {#each aggRows as row (row.token)}
-                <div role="listitem">
-                  <JLensTokenCard
-                    token={row.token}
-                    strength={row.strength}
-                    com={row.com}
-                    spread={row.spread}
-                    series={row.series}
-                    layers={lensState.layers ?? []}
-                    readout={lensState.readout}
-                    pinned={false}
-                    busy={probeBusy}
-                    onpin={pinWord}
-                  />
-                </div>
-              {/each}
-            </div>
             <p class="hint drill-hint">
               click a transcript token for its full per-layer matrix
             </p>
@@ -512,12 +601,28 @@
     padding: var(--space-2) var(--space-5);
     cursor: pointer;
     transition: background var(--dur) var(--ease-out);
+    min-height: 24px;
   }
   .fit-btn:hover {
     background: color-mix(in srgb, var(--accent-blue) 18%, transparent);
   }
   .fit-error {
     color: var(--accent-red);
+  }
+  .fit-btn.confirm {
+    color: var(--accent-yellow);
+    background: color-mix(in srgb, var(--accent-yellow) 12%, transparent);
+  }
+  .fit-btn.cancel {
+    color: var(--accent-red);
+    background: color-mix(in srgb, var(--accent-red) 10%, transparent);
+  }
+  .fit-btn:disabled {
+    opacity: 0.55;
+    cursor: default;
+  }
+  .fit-warning {
+    color: var(--accent-yellow);
   }
   .fit-progress {
     display: flex;

@@ -380,6 +380,7 @@ export interface LensFitState {
   error: string | null;
   /** Poll-loop guard — one interval regardless of how many panels ask. */
   polling: boolean;
+  cancelling: boolean;
 }
 
 export const lensFitState: LensFitState = $state({
@@ -389,6 +390,7 @@ export const lensFitState: LensFitState = $state({
   message: null,
   error: null,
   polling: false,
+  cancelling: false,
 });
 
 const LENS_FIT_POLL_MS = 3000;
@@ -406,6 +408,7 @@ function _applyFitStatus(st: {
   lensFitState.promptsTotal = st.prompts_total;
   lensFitState.message = st.message;
   lensFitState.error = st.error;
+  if (!st.running) lensFitState.cancelling = false;
 }
 
 /** Poll the background lens fit until it settles.  On completion the
@@ -456,6 +459,22 @@ export async function startLensFit(): Promise<void> {
     return;
   }
   void pollLensFit();
+}
+
+/** Ask the background worker to stop at the next prompt boundary. The
+ * partial checkpoint remains resumable, matching server semantics. */
+export async function cancelLensFit(): Promise<void> {
+  if (!lensFitState.running || lensFitState.cancelling) return;
+  lensFitState.cancelling = true;
+  try {
+    const st = await apiLens.cancelFit();
+    _applyFitStatus(st);
+    pushToast("J-lens fit cancellation requested", { kind: "info" });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    pushToast(`lens fit cancel failed — ${msg}`, { kind: "error" });
+    lensFitState.cancelling = false;
+  }
 }
 
 /** Resume-visibility check for panel mount: if a fit is already running

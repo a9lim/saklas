@@ -70,6 +70,7 @@
       value={tab}
       onchange={(v) => setInspectorTab(v)}
       fill
+      ariaLabel="Inspector instrument"
     />
   </nav>
 

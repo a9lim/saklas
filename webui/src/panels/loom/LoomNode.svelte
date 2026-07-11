@@ -1,6 +1,6 @@
 <script lang="ts">
   // A single-node chip in the loom sidebar.  Role glyph, first ~40 chars of
-  // text, active-path bolded, dead branches dimmed, plus steering-delta edge
+  // text, active-path bolded, inactive branches subdued, plus steering-delta edge
   // labels, probe-aggregate ring decoration, star/note glyphs, and pin
   // affordances — the sidebar feeds all of these live (LoomSidebar's
   // ringFor / weightBadgeFor / steerLabelFor).
@@ -14,7 +14,7 @@
     onActivePath: boolean;
     /** Current focused node for sidebar keyboard nav (j/k/h/l). */
     focused: boolean;
-    /** Dead branch (not on active path) — render at reduced opacity. */
+    /** Dead branch (not on active path) — retain readable text, quiet the chrome. */
     dead: boolean;
     /** In-flight target — pulse the node so the user sees streaming. */
     streaming: boolean;
@@ -149,10 +149,16 @@
     border-radius: var(--radius-sm);
   }
   .node.dead {
-    opacity: 0.3;
+    color: var(--fg-muted);
+    background: transparent;
   }
   .node.dead:hover {
-    opacity: 0.6;
+    color: var(--fg);
+    background: var(--bg-elev);
+  }
+  .node.dead .glyph,
+  .node.dead .ring {
+    opacity: 0.55;
   }
   .node.streaming {
     background: color-mix(in srgb, var(--live) 8%, transparent);

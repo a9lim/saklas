@@ -157,6 +157,58 @@
     return rows;
   });
 
+  type VisibleProbeCard =
+    | {
+        kind: "pinned";
+        key: string;
+        name: string;
+        entry: NonNullable<(typeof pinnedBase)[number]["entry"]>;
+        sortName: string;
+        strength: number;
+      }
+    | {
+        kind: "discovery";
+        key: string;
+        feature: (typeof discoveryBase)[number];
+        sortName: string;
+        strength: number;
+      };
+
+  /** One visible list, one sort order. Pinning changes persistence/actions,
+   *  never a card's position outside the selected sort. */
+  const probeCards = $derived.by((): VisibleProbeCard[] => {
+    const rows: VisibleProbeCard[] = pinned.map((row) => {
+      const entry = row.entry!;
+      const value = entry.aggregate?.coords?.[0] ??
+        entry.reading?.coords?.[0] ?? entry.current;
+      const id = Number(row.name.slice(4));
+      return {
+        kind: "pinned",
+        key: row.name,
+        name: row.name,
+        entry,
+        sortName: entry.info.label || String(id),
+        strength: entry.info.max_act != null ? value : value / fallbackScale,
+      };
+    });
+    if (saeState.live) {
+      rows.push(...discovery.map((feature) => ({
+        kind: "discovery" as const,
+        key: `sae/${feature.id}`,
+        feature,
+        sortName: feature.label || String(feature.id),
+        strength: visibleStrength(feature.activation, feature.max_act ?? null),
+      })));
+    }
+    rows.sort(saeState.sortMode === "name"
+      ? (a, b) => a.sortName.localeCompare(
+          b.sortName, undefined, { numeric: true },
+        ) || b.strength - a.strength
+      : (a, b) => b.strength - a.strength ||
+          a.sortName.localeCompare(b.sortName, undefined, { numeric: true }));
+    return rows;
+  });
+
   let steerInput = $state("");
   let probeInput = $state("");
   let featureBusy = $state(false);
@@ -267,9 +319,15 @@
         the selected hook layer stays resident; weights use the normal
         Hugging Face cache
       </p>
-      {#if saeState.loadMessage}<p class="hint">{saeState.loadMessage}</p>{/if}
-      {#if saeState.loadError}<p class="hint load-error">{saeState.loadError}</p>{/if}
-      {#if discoverError}<p class="hint">registry suggestions unavailable: {discoverError}</p>{/if}
+      {#if saeState.loadMessage}
+        <p class="hint" role="status" aria-live="polite">{saeState.loadMessage}</p>
+      {/if}
+      {#if saeState.loadError}
+        <p class="hint load-error" role="alert">{saeState.loadError}</p>
+      {/if}
+      {#if discoverError}
+        <p class="hint" role="alert">registry suggestions unavailable: {discoverError}</p>
+      {/if}
     </section>
   {:else}
     <!-- Identity strip — which SAE is resident (release · hook layer ·
@@ -335,51 +393,46 @@
       />
 
       <div class="scroll">
-        {#if pinned.length > 0}
-          <div class="cards" role="list" aria-label="Pinned SAE feature probes">
-            {#each pinned as row (row.name)}
-              {@const entry = row.entry!}
-              {@const reading = entry.aggregate ?? entry.reading}
+        {#if probeCards.length > 0}
+          <div class="cards" role="list" aria-label="SAE feature probes">
+            {#each probeCards as row (row.key)}
               <div role="listitem">
-                <!-- A pinned probe's channel (coords, sparkline, gates) is
-                     already normalized server-side when max_act is set. -->
-                <SaeProbeCard
-                  id={Number(row.name.slice(4))}
-                  label={entry.info.label}
-                  layer={info?.layer ?? null}
-                  value={reading?.coords?.[0] ?? entry.current ?? 0}
-                  maxAct={entry.info.max_act ?? null}
-                  valueIsStrength={entry.info.max_act != null}
-                  {fallbackScale}
-                  series={entry.sparkline}
-                  pinned={true}
-                />
+                {#if row.kind === "pinned"}
+                  {@const reading = row.entry.aggregate ?? row.entry.reading}
+                  <!-- A pinned probe's channel (coords, sparkline, gates) is
+                       already normalized server-side when max_act is set. -->
+                  <SaeProbeCard
+                    id={Number(row.name.slice(4))}
+                    label={row.entry.info.label}
+                    layer={info?.layer ?? null}
+                    value={reading?.coords?.[0] ?? row.entry.current ?? 0}
+                    maxAct={row.entry.info.max_act ?? null}
+                    valueIsStrength={row.entry.info.max_act != null}
+                    {fallbackScale}
+                    series={row.entry.sparkline}
+                    pinned={true}
+                  />
+                {:else}
+                  <SaeProbeCard
+                    id={row.feature.id}
+                    label={row.feature.label}
+                    layer={info?.layer ?? null}
+                    value={row.feature.activation}
+                    maxAct={row.feature.max_act}
+                    {fallbackScale}
+                    series={saeState.history.get(row.feature.id) ?? []}
+                    pinned={false}
+                    busy={featureBusy}
+                    onpin={(id) => void pin(id)}
+                  />
+                {/if}
               </div>
             {/each}
           </div>
         {/if}
 
         {#if saeState.live}
-          {#if discovery.length > 0}
-            <div class="cards" role="list" aria-label="Discovered SAE features">
-              {#each discovery as feature (feature.id)}
-                <div role="listitem">
-                  <SaeProbeCard
-                    id={feature.id}
-                    label={feature.label}
-                    layer={info?.layer ?? null}
-                    value={feature.activation}
-                    maxAct={feature.max_act}
-                    {fallbackScale}
-                    series={saeState.history.get(feature.id) ?? []}
-                    pinned={false}
-                    busy={featureBusy}
-                    onpin={(id) => void pin(id)}
-                  />
-                </div>
-              {/each}
-            </div>
-          {:else}
+          {#if discovery.length === 0}
             <p class="hint">feature discovery streams on the next generation</p>
           {/if}
         {:else}

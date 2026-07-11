@@ -13,42 +13,47 @@
     children: Snippet;
     /** Hue — any CSS color; chrome white when unset. */
     color?: string;
-    /** Dimmed, e.g. a disabled term. */
+    /** Inactive term — readable, with a hollow/struck state treatment. */
     muted?: boolean;
     title?: string;
     onclick?: (ev: MouseEvent) => void;
     /** Grows a trailing × that fires independently of onclick. */
     onremove?: (ev: MouseEvent) => void;
+    /** Accessible name for the trailing remove action. */
+    removeLabel?: string;
   }
 
-  let { children, color, muted = false, title, onclick, onremove }: Props =
-    $props();
+  let {
+    children,
+    color,
+    muted = false,
+    title,
+    onclick,
+    onremove,
+    removeLabel = "Remove chip",
+  }: Props = $props();
 </script>
 
-<!-- svelte-ignore a11y_no_noninteractive_tabindex -->
-<!-- tabindex/role/keydown are all conditional on ``onclick`` — the span
-     is interactive exactly when it's focusable; static analysis can't
-     see the coupling. -->
 <span
   class="sk-chip"
   class:muted
   class:clickable={!!onclick}
   style:--chip-c={color}
   {title}
-  onclick={onclick}
-  onkeydown={onclick
-    ? (ev) => {
-        if (ev.key === "Enter" || ev.key === " ") onclick(ev as unknown as MouseEvent);
-      }
-    : undefined}
-  role={onclick ? "button" : undefined}
-  tabindex={onclick ? 0 : undefined}
+  role={onremove ? "group" : undefined}
 >
-  <span class="body">{@render children()}</span>
+  {#if onclick}
+    <button type="button" class="body body-button" onclick={onclick}>
+      {@render children()}
+    </button>
+  {:else}
+    <span class="body">{@render children()}</span>
+  {/if}
   {#if onremove}
     <button
       class="x"
-      aria-label="remove"
+      type="button"
+      aria-label={removeLabel}
       onclick={(ev) => {
         ev.stopPropagation();
         onremove(ev);
@@ -68,7 +73,7 @@
     font-family: var(--font-mono);
     font-size: var(--text-sm);
     line-height: 1;
-    padding: 3px 9px;
+    padding: 1px 3px 1px 9px;
     border-radius: var(--radius-sm);
     color: var(--chip-c);
     /* Borderless: the hue wash IS the chip — a touch deeper than the old
@@ -82,10 +87,16 @@
     white-space: nowrap;
     transition:
       background var(--dur-fast) var(--ease-out),
-      opacity var(--dur-fast) var(--ease-out);
+      border-color var(--dur-fast) var(--ease-out);
   }
   .sk-chip.muted {
-    opacity: 0.45;
+    background: color-mix(in srgb, var(--chip-c) 5%, transparent);
+    border-color: color-mix(in srgb, var(--chip-c) 32%, transparent);
+  }
+  .sk-chip.muted .body {
+    text-decoration: line-through;
+    text-decoration-color: color-mix(in srgb, var(--chip-c) 70%, transparent);
+    text-decoration-thickness: 1px;
   }
   .sk-chip.clickable {
     cursor: pointer;
@@ -97,11 +108,6 @@
       color-mix(in srgb, var(--chip-c) 14%, transparent)
     );
   }
-  .sk-chip:focus-visible {
-    outline: 2px solid color-mix(in srgb, var(--chip-c) 45%, transparent);
-    outline-offset: 2px;
-  }
-
   .body {
     display: inline-flex;
     align-items: center;
@@ -109,10 +115,28 @@
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
+    min-height: 24px;
+  }
+  .body-button {
+    background: none;
+    border: 0;
+    padding: 0;
+    margin: 0;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+  }
+  .body-button:focus-visible,
+  .x:focus-visible {
+    outline: 2px solid var(--focus-ring);
+    outline-offset: 2px;
   }
 
   .x {
     flex: none;
+    min-width: 24px;
+    min-height: 24px;
     background: none;
     border: none;
     padding: 0 0 0 2px;
