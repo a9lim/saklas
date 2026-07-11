@@ -841,10 +841,31 @@ def test_gating_callback_backfills_exact_keys_hidden_by_top_n() -> None:
 
     class Monitor:
         def __init__(self) -> None:
-            self.requested: set[str] | None = None
+            self.plan_calls: list[frozenset[str]] = []
+            self.score_calls: list[tuple[str, frozenset[str]]] = []
 
         def flat_scalars(self, _readings: Any) -> dict[str, float]:
             return {"toy@nearest": -0.1}
+
+        def plan_gate_scalars(
+            self,
+            gate_keys: set[str],
+            *,
+            probe_names: set[str] | None = None,
+        ) -> tuple[str, frozenset[str]]:
+            assert probe_names is None
+            planned = frozenset(gate_keys)
+            self.plan_calls.append(planned)
+            return ("planned", planned)
+
+        def score_planned_gate_scalars(
+            self,
+            _latest: dict[int, torch.Tensor],
+            plan: tuple[str, frozenset[str]],
+        ) -> dict[str, float]:
+            self.score_calls.append(plan)
+            assert plan == ("planned", frozenset({"toy@hidden"}))
+            return {"toy@hidden": -2.0}
 
         def score_gate_scalars(
             self,
@@ -853,9 +874,7 @@ def test_gating_callback_backfills_exact_keys_hidden_by_top_n() -> None:
             *,
             probe_names: set[str] | None = None,
         ) -> dict[str, float]:
-            assert probe_names is None
-            self.requested = set(gate_keys)
-            return {"toy@hidden": -2.0}
+            raise AssertionError("missing gate keys should use cached plans")
 
     monitor = Monitor()
     session: Any = SimpleNamespace(
@@ -869,10 +888,17 @@ def test_gating_callback_backfills_exact_keys_hidden_by_top_n() -> None:
         _incremental_gate_scores=[],
     )
 
-    scores = SteeringComposer(session).build_gating_score_callback()()
+    callback = SteeringComposer(session).build_gating_score_callback()
+    scores = callback()
+    scores_again = callback()
 
     assert scores == {"toy@nearest": -0.1, "toy@hidden": -2.0}
-    assert monitor.requested == {"toy@hidden"}
+    assert scores_again == scores
+    assert monitor.plan_calls == [frozenset({"toy@hidden"})]
+    assert monitor.score_calls == [
+        ("planned", frozenset({"toy@hidden"})),
+        ("planned", frozenset({"toy@hidden"})),
+    ]
 
 
 @pytest.mark.parametrize(

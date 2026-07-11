@@ -25,7 +25,7 @@ the extraction behavior- and API-preserving by construction.
 from __future__ import annotations
 
 import re
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 
@@ -914,6 +914,51 @@ class SteeringComposer:
         sae_gate_keys = self.gated_sae_probe_keys()
         has_lens_gates = bool(lens_gate_keys)
         has_sae_gates = bool(sae_gate_keys)
+        monitor_gate_plan_cache: dict[
+            tuple[frozenset[str], frozenset[str] | None],
+            Any,
+        ] = {}
+
+        def _score_monitor_gate_keys(
+            latest: dict[int, torch.Tensor],
+            gate_keys: set[str],
+            *,
+            probe_names: set[str] | None = None,
+        ) -> dict[str, float]:
+            if not gate_keys:
+                return {}
+            plan_gate_scalars = getattr(monitor, "plan_gate_scalars", None)
+            score_planned_gate_scalars = getattr(
+                monitor, "score_planned_gate_scalars", None,
+            )
+            if callable(plan_gate_scalars) and callable(score_planned_gate_scalars):
+                frozen_keys = frozenset(gate_keys)
+                frozen_probes = (
+                    frozenset(probe_names) if probe_names is not None else None
+                )
+                cache_key = (frozen_keys, frozen_probes)
+                plan = monitor_gate_plan_cache.get(cache_key)
+                if plan is None:
+                    plan = plan_gate_scalars(
+                        set(frozen_keys),
+                        probe_names=(
+                            set(frozen_probes)
+                            if frozen_probes is not None else None
+                        ),
+                    )
+                    monitor_gate_plan_cache[cache_key] = plan
+                return (
+                    cast(
+                        dict[str, float],
+                        score_planned_gate_scalars(latest, plan),
+                    )
+                    if plan else {}
+                )
+            return monitor.score_gate_scalars(
+                latest,
+                gate_keys,
+                probe_names=probe_names,
+            )
 
         def _monitor_scalars() -> dict[str, float]:
             incremental_readings = getattr(session, "_incremental_readings", [])
@@ -941,7 +986,7 @@ class SteeringComposer:
                         latest = capture.latest_per_layer()
                         if latest:
                             scalars.update(
-                                monitor.score_gate_scalars(
+                                _score_monitor_gate_keys(
                                     latest,
                                     missing,
                                     probe_names=gating_subset if gating_subset else None,
@@ -954,7 +999,7 @@ class SteeringComposer:
             if not latest:
                 return {}
             if gate_keys:
-                return monitor.score_gate_scalars(
+                return _score_monitor_gate_keys(
                     latest,
                     gate_keys,
                     probe_names=gating_subset if gating_subset else None,
