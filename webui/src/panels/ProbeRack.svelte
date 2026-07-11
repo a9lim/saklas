@@ -45,6 +45,7 @@
     activeProbeNames().filter(
       (n) =>
         !n.startsWith("jlens/") &&
+        !n.startsWith("sae/") &&
         probeRack.entries.get(n)?.info.is_affine === (family === "subspace"),
     ),
   );

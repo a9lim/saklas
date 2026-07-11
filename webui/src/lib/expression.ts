@@ -25,6 +25,7 @@
 
 import type {
   JLensSteerEntry,
+  SaeSteerEntry,
   ManifoldSteerEntry,
   SteerEntry,
   SubspaceSteerEntry,
@@ -68,6 +69,11 @@ export function serializeExpression(
   for (const [name, entry] of rack) {
     if (entry.enabled && entry.mode === "jlens") {
       parts.push(formatJLensTerm(name, entry));
+    }
+  }
+  for (const [name, entry] of rack) {
+    if (entry.enabled && entry.mode === "sae") {
+      parts.push(formatSaeTerm(name, entry));
     }
   }
   for (const [name, entry] of rack) {
@@ -124,6 +130,10 @@ function formatTriggerSuffix(trigger: Trigger): string {
  *  engine resolves it through ``register_jlens_direction``); per-chip
  *  ``alpha`` because lens atoms run hotter than concept vectors. */
 export function formatJLensTerm(name: string, entry: JLensSteerEntry): string {
+  return `${formatCoeff(entry.alpha)} ${name}${formatTriggerSuffix(entry.trigger)}`;
+}
+
+export function formatSaeTerm(name: string, entry: SaeSteerEntry): string {
   return `${formatCoeff(entry.alpha)} ${name}${formatTriggerSuffix(entry.trigger)}`;
 }
 

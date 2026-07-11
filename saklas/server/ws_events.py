@@ -102,4 +102,15 @@ def build_token_event(
                 for tok, s, com, spread in agg
             ]
 
+        sae = payload.get("sae") if isinstance(payload, dict) else None
+        if sae:
+            event["sae_readout"] = [
+                {
+                    "id": int(feature_id),
+                    "activation": float(activation),
+                    "label": label,
+                }
+                for feature_id, activation, label in sae
+            ]
+
     return event

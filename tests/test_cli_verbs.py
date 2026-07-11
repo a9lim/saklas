@@ -1,4 +1,4 @@
-"""The eight-verb root CLI.
+"""The nine-verb root CLI.
 
 ``manifold`` is the steering-vector / manifold *compute* surface
 (extract/generate/from-template/fit/bake/merge/transfer/compare/why); ``pack`` is
@@ -35,11 +35,23 @@ def _isolated_home(
 # Root verb set
 # ---------------------------------------------------------------------------
 
-def test_eight_top_level_verbs() -> None:
+def test_nine_top_level_verbs() -> None:
     assert set(_COMMAND_RUNNERS) == {
         "tui", "serve", "manifold", "pack", "config", "experiment", "template",
-        "lens",
+        "lens", "sae",
     }
+
+
+def test_sae_load_parses() -> None:
+    args = cli.parse_args([
+        "sae", "load", "gemma-scope", "-m", "m/x", "--layer", "14", "-j",
+    ])
+    assert args.command == "sae"
+    assert args.sae_cmd == "load"
+    assert args.release == "gemma-scope"
+    assert args.model == "m/x"
+    assert args.layer == 14
+    assert args.json_output is True
 
 
 def test_template_verb_parses() -> None:

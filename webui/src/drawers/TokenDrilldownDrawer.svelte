@@ -27,10 +27,11 @@
     effectiveRawMode,
     probeAxisScale,
   } from "../lib/stores.svelte";
-  import { ApiError, apiLens } from "../lib/api";
+  import { ApiError, apiLens, apiSae } from "../lib/api";
   import type {
     ChatTurn,
     LensTokenReadoutJSON,
+    SaeTokenReadoutJSON,
     TokenScore,
   } from "../lib/types";
   import HeatmapCell from "../lib/charts/HeatmapCell.svelte";
@@ -197,12 +198,18 @@
   // routes the user to the SamplingStrip ``alts`` toggle when capture
   // wasn't on.
 
-  type Tab = "probes" | "logits" | "lens";
+  type Tab = "probes" | "logits" | "lens" | "sae";
   let tab: Tab = $state<Tab>("probes");
 
   const TAB_ITEMS: Array<{ value: Tab; label: string; color?: string; title: string }> = [
     { value: "probes", label: "probes", title: "Per-layer × per-probe readings" },
     { value: "logits", label: "logits", title: "Ranked top-K alternatives at this position" },
+    {
+      value: "sae",
+      label: "sae",
+      color: "var(--pillar-sae)",
+      title: "Sparse feature activations at the resident SAE hook layer",
+    },
     {
       value: "lens",
       label: "j-lens",
@@ -344,6 +351,26 @@
   const lensCache = new Map<string, LensTokenReadoutJSON>();
 
   const jlensFitted = $derived(sessionState.info?.jlens_fitted === true);
+  const saeLoaded = $derived(sessionState.info?.sae_loaded === true);
+  let saeData = $state<SaeTokenReadoutJSON | null>(null);
+  let saeLoading = $state(false);
+  let saeError = $state<string | null>(null);
+  const saeCache = new Map<string, SaeTokenReadoutJSON>();
+
+  $effect(() => {
+    if (tab !== "sae" || !saeLoaded) return;
+    const nodeId = loomNodeId;
+    const rawIndex = token?.rawIndex;
+    if (!nodeId || rawIndex == null) return;
+    const key = `${nodeId}:${rawIndex}:${effectiveRawMode() ? 1 : 0}`;
+    const hit = saeCache.get(key);
+    if (hit) { saeData = hit; saeError = null; return; }
+    saeLoading = true; saeError = null; saeData = null;
+    apiSae.tokenReadout(nodeId, rawIndex, { raw: effectiveRawMode() })
+      .then((data) => { saeCache.set(key, data); saeData = data; })
+      .catch((error) => { saeError = error instanceof Error ? error.message : String(error); })
+      .finally(() => { saeLoading = false; });
+  });
 
   const lensKey = $derived.by<string | null>(() => {
     const nodeId = loomNodeId;
@@ -674,7 +701,7 @@
           </p>
         </div>
       {/if}
-    {:else}
+    {:else if tab === "lens"}
       <!-- J-lens tab.  The workspace readout matrix — rows are lens
            layers (ascending; workspace-band rows marked), cells the
            top-K vocabulary tokens each layer's residual was disposed to
@@ -786,6 +813,28 @@
           </table>
         </div>
       {/if}
+    {:else}
+      {#if !saeLoaded}
+        <div class="empty">No SAE is loaded for this session. Load one from the SAE inspector tab.</div>
+      {:else if token.rawIndex == null || !loomNodeId}
+        <div class="empty">This token has no in-session raw decode record for SAE replay.</div>
+      {:else if saeLoading}
+        <div class="empty">computing SAE readout (one prefix forward)…</div>
+      {:else if saeError}
+        <div class="empty">SAE readout failed: {saeError}</div>
+      {:else if saeData}
+        <div class="tab-summary">resident SAE · L{saeData.layer} · produced <code>{JSON.stringify(saeData.token_text)}</code></div>
+        <div class="grid-scroll">
+          <table class="logits-table">
+            <thead><tr><th class="num">rank</th><th class="tok">feature</th><th class="tok">label</th><th class="num">activation</th></tr></thead>
+            <tbody>
+              {#each saeData.features as feature, index (feature.id)}
+                <tr><td class="num">{index + 1}</td><td class="tok"><code>sae/{feature.id}</code></td><td class="tok">{feature.label ?? "—"}</td><td class="num">{feature.activation.toFixed(3)}</td></tr>
+              {/each}
+            </tbody>
+          </table>
+        </div>
+      {/if}
     {/if}
   </div>
 
@@ -799,12 +848,16 @@
         Logprob is the chosen-token natural-log probability under the
         post-temperature / post-top-p / post-top-k distribution the sampler
         drew from.
-      {:else}
+      {:else if tab === "lens"}
         Each row ranks softmax(W_U · norm(J_l·h)) at the forward that
         produced this token — what that layer's residual was disposed to
         make the model say. Cell tint = probability; blue row labels mark
         the 40–90% workspace band (early rows are noise, late rows converge
         on the raw logits). Highlighted cells match the produced token.
+      {:else}
+        Post-nonlinearity sparse-feature activations from the resident SAE's
+        hook layer. Values are comparable across tokens for one feature, not
+        calibrated across different features.
       {/if}
     </span>
   </footer>

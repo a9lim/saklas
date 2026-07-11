@@ -1,9 +1,10 @@
-# SAE pillar — live runtime sketch
+# SAE pillar — live runtime
 
-*Status: **specced, deferred** (2026-07-10). This documents the design so the
-UI redesign can build the fourth pillar tab against a stable contract; no
-engine code lands from this doc. Written to mirror the J-lens architecture,
-which is the proven template for a per-model read/steer/gate surface.*
+*Status: **implemented** (2026-07-10). The resident SAE runtime, integer
+`sae/<id>` grammar, decoder-row steering, encoder readout probes/gates,
+CLI/server/WS surfaces, token drilldown, and dashboard pillar now follow this
+contract. Written to mirror the J-lens architecture, which is the proven
+template for a per-model read/steer/gate surface.*
 
 *Epistemic marks: SAE mechanics are standard-result; the architecture here is
 synthesis (transplanting the jlens shape); every calibration claim is
@@ -14,10 +15,10 @@ speculation until a live pass.*
 The dashboard's mental model is four coequal instruments over one bench:
 **subspace probes, manifold probes, SAE features, Jacobian lens** — each with
 the same three verbs (observe / steer / gate), each lowering to the same
-unified injection kernel for the steer verb. Saklas today has SAE support only
-at fit time (`--sae <release>` reconstructs node centroids through the SAE
-before the manifold fit). This sketch adds the *live* runtime: a resident SAE,
-per-step feature readout, `sae/` steering atoms, feature probes and gates.
+unified injection kernel for the steer verb. Saklas has SAE support both at fit
+time (`--sae <release>` reconstructs node centroids through the SAE before the
+manifold fit) and at generation time through the resident runtime specified
+here: per-step feature readout, `sae/` steering atoms, feature probes, and gates.
 
 The J-lens is the template because it already solved the same problems:
 
@@ -42,6 +43,11 @@ The J-lens is the template because it already solved the same problems:
   is per-layer expensive where the lens is cheap-ish (fp16 J_l per layer vs
   d×F encoder/decoder pairs; a 16k-feature SAE on a 4b model is ~2×
   d_model×16k×2 bytes per layer).
+  As built, the CLI also takes `-m <model>` because its process has no existing
+  session. When no layer is explicit, v1 chooses the covered hook layer nearest
+  65% model depth (preferring the 40–90% workspace band). This makes the bare
+  `sae/<id>` namespace singular and deterministic while keeping one encoder /
+  decoder pair resident.
 - **Session integration.** The SAE never enters the forward hooks for capture;
   the live reader consumes the capture's latest residual slice post-forward at
   the token tap, exactly like the lens reader — zero new hooks, steering
@@ -138,12 +144,11 @@ session-info `sae_loaded` capability flag the way the J-LENS tab gates on
 
 ## Open questions
 
-1. **Multi-release / multi-layer residency** — v1 pins one release; is one
+1. **Multi-release / multi-layer residency** — v1 pins one release and one
    hook layer enough for the research loop, or do we want two (mid + late)?
    Memory budget on MPS is the constraint.
-2. **Activation reporting** — post-ReLU (gemma-scope JumpReLU: post-threshold)
-   is the natural readout; do we also want pre-activation for gates near
-   threshold?
+2. **Activation reporting** — v1 reports `SAE.encode` output (post-threshold /
+   post-nonlinearity). Do we also want pre-activation for gates near threshold?
 3. **Clamping kernel** — the encode-modify-decode steering mode (true feature
    clamp / feature amplification à la Anthropic's steering work) is a genuine
    second injection kernel. Defer until the subspace kernel story has fully

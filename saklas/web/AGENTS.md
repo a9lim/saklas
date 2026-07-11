@@ -127,9 +127,8 @@ webui/src/
                               # inspector: every racked term as a pillar-colored
                               # chip (click → jump to its tab, × → remove, ⧉ →
                               # copy the canonical expression)
-    SaePanel.svelte           # SAE pillar tab — designed placeholder (runtime
-                              # specced + deferred, docs/plans/sae-pillar.md);
-                              # gates on a future SessionInfo.sae_loaded flag
+    SaePanel.svelte           # resident SAE pillar — unload/load picker, decoder-row
+                              # STEER cards, pinned/live feature PROBE cards
     InspectorPanel.svelte     # right rack: THE INSTRUMENT STACK — RecipeBar +
                               # four pillar tabs (subspace/manifold/sae/lens via
                               # ui/SegmentedTabs). subspace + manifold tabs each

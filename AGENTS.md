@@ -80,13 +80,14 @@ saklas lens fit <model> [--corpus FILE] [--prompts N] [--seq-len T] [--dim-batch
 saklas lens show <model> [-j] | rm <model> [-y]
 saklas lens top <model> "<prompt>" [-k K] [--layers L1,L2] [--position P] [-j]   # workspace readout on a raw prompt
 saklas lens decompose <selector> -m MODEL [-k K] [--layers L1,L2] [-j]   # J-space share + tokens of a direction
+saklas sae load <release> -m MODEL [--layer L] [-j]       # cache + validate one resident SAE layer
 saklas config show [-c PATH ...] [--no-default] [-m MODEL]
 saklas config validate <file>
 pytest tests/                                   # all; GPU tests gated on CUDA/MPS
 ```
 
-The root parser has exactly eight verbs: `tui`, `serve`, `manifold`, `pack`,
-`experiment`, `config`, `template`, `lens`. There is no `vector` alias. `manifold`
+The root parser has exactly nine verbs: `tui`, `serve`, `manifold`, `pack`,
+`experiment`, `config`, `template`, `lens`, `sae`. There is no `vector` alias. `manifold`
 is the unified compute surface
 (extract/generate/from-template/fit/bake/merge/transfer/compare/why); `pack` owns
 lifecycle and distribution (ls/show/install/search/push/rm/clear/refresh/export
@@ -94,11 +95,12 @@ gguf), so install via `pack install` and export via `pack export gguf`; `templat
 owns the standalone templated-completion artifact (create/ls/show/score/rm — a slot
 + candidate values + multi-turn contexts, read by both the completion **scorer**
 and a `manifold from-template` fit); `lens` owns the per-model Jacobian-lens
-artifact (fit/show/top/decompose/rm — see "Jacobian lens" below). No `argv[0]`
+artifact (fit/show/top/decompose/rm — see "Jacobian lens" below); `sae` prepares
+the session-resident sparse-autoencoder runtime (`load`). No `argv[0]`
 peeking, no bare-TUI fallback —
 `saklas google/gemma-2-2b-it` is an argparse error. Bare `saklas` / `saklas
 manifold` / `saklas pack` / `saklas experiment` / `saklas config` / `saklas
-template` / `saklas lens` print help and exit 0.
+template` / `saklas lens` / `saklas sae` print help and exit 0.
 
 Every subcommand that takes `-c/--config` auto-loads `~/.saklas/config.yaml`
 first, then composes explicit `-c` files on top (later overrides earlier). The
@@ -150,7 +152,7 @@ term        := [coeff "*"?] ["!"] selector ["@" trigger]
 selector    := atom (("~" | "|") atom | "%" position)?
 position    := signed_num ("," signed_num)* | label
 label       := NAME                                # a manifold node label
-atom        := [ns "/"] NAME ["." NAME] [":" variant]
+atom        := [ns "/"] NAME ["." NAME] [":" variant] | "sae" "/" INT
 trigger     := preset | gate
 preset      := before | after | both | thinking | response | prompt | generated
 gate        := "when" ":" probe_atom op NUM        # op ∈ > >= < <=
@@ -158,6 +160,7 @@ probe_atom  := [ns "/"] NAME ["." NAME] ["[" INT "]"]  # vector probe (e.g. conf
                                                    # jlens/fake); optional coord axis (personas[3])
              | [ns "/"] NAME ":" "fraction"        # manifold subspace fraction
              | [ns "/"] NAME "@" NAME              # manifold label similarity
+             | "sae" "/" INT                       # resident SAE feature activation
 ```
 
 `+`/`-` add terms, `*` attaches a coefficient (omit → 0.5), `~` projects onto a

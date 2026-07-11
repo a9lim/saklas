@@ -431,6 +431,7 @@
   // role validation — concepts that pass ``slug()`` are already in
   // ``[a-z0-9._-]+``.
   let discoverRolePerNode = $state(false);
+  let discoverSaeRelease = $state("");
   let discoverProgress: string | null = $state(null);
   let alsoFit = $state(true);
 
@@ -562,6 +563,7 @@
             namespaceSlug,
             nameSlug,
             {
+              sae: discoverSaeRelease.trim() || null,
               fit_mode: discoverFitMode,
               hyperparams: buildDiscoverHyperparams(),
             },
@@ -1238,6 +1240,15 @@
       </section>
 
       <AdvancedSection bind:expanded={advancedDiscoverOpen}>
+        <label class="field">
+          <span class="label">SAE release (blank → raw activation space)</span>
+          <input
+            class="text-input"
+            bind:value={discoverSaeRelease}
+            placeholder="e.g. gemma-scope-2-4b-it-res"
+            spellcheck="false"
+          />
+        </label>
         <div class="grid2">
           <label class="field">
             <span class="label">max_dim</span>

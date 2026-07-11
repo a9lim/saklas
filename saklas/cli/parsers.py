@@ -139,6 +139,10 @@ _LENS_VERBS: list[tuple[str, str]] = [
     ("rm",        "Remove a model's fitted lens artifact"),
 ]
 
+_SAE_VERBS: list[tuple[str, str]] = [
+    ("load", "Download, validate, and cache a session SAE release"),
+]
+
 
 def _add_injection_args(p: argparse.ArgumentParser) -> None:
     """Steering / extraction options shared between ``tui`` and ``serve``.
@@ -1082,6 +1086,28 @@ def _build_lens_parser(parser: argparse.ArgumentParser) -> None:
         _LENS_BUILDERS[verb](child)
 
 
+def _build_sae_parser(parser: argparse.ArgumentParser) -> None:
+    """``saklas sae`` — sparse-autoencoder runtime preparation."""
+    sub = parser.add_subparsers(dest="sae_cmd", required=False, metavar="VERB")
+    load = sub.add_parser(
+        "load",
+        help=_SAE_VERBS[0][1],
+        description=(
+            "Resolve a SAELens release, download its selected hook-layer weights "
+            "through the normal Hugging Face cache, validate model compatibility, "
+            "and write saklas's small runtime metadata sidecar."
+        ),
+    )
+    load.add_argument("release", help="SAELens registry release name")
+    load.add_argument("-m", "--model", required=True,
+                      help="HuggingFace model ID or local path")
+    load.add_argument("--layer", type=int, default=None,
+                      help="Explicit covered hook layer (default: nearest 65%% depth)")
+    load.add_argument("-d", "--device", default="auto")
+    load.add_argument("-q", "--quantize", choices=["4bit", "8bit"], default=None)
+    load.add_argument("-j", "--json", dest="json_output", action="store_true")
+
+
 # --- config subtree ------------------------------------------------------
 
 def _build_config_parser(parser: argparse.ArgumentParser) -> None:
@@ -1308,5 +1334,12 @@ def _build_root_parser() -> argparse.ArgumentParser:
                     "verbalizable (J-space) component",
     )
     _build_lens_parser(lens)
+
+    sae = sub.add_parser(
+        "sae",
+        help="Sparse autoencoder runtime (load)",
+        description="Load and prepare a per-model sparse-autoencoder runtime",
+    )
+    _build_sae_parser(sae)
 
     return root

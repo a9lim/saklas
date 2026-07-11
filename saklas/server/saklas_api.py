@@ -179,6 +179,10 @@ def register_saklas_routes(app: FastAPI) -> None:
 
     register_lens_routes(app)
 
+    from saklas.server.sae_routes import register_sae_routes
+
+    register_sae_routes(app)
+
     from saklas.server.ws_stream import register_ws_stream
 
     register_ws_stream(app)

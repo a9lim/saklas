@@ -960,6 +960,37 @@ consumers with zero hot-path cost when unused:
   any direction against the dictionary `W_U J_l` (never materialized), the
   per-layer *verbalizable share* + contributing tokens.
 
+### 6.5 Sparse-autoencoder runtime (feature reads)
+
+`core/sae.py` now serves two paths from the same SAELens adapter. Fit-time
+`--sae` still reconstructs manifold node centroids through a lazily loaded SAE;
+the live runtime keeps one selected encoder/decoder pair resident on a session.
+The default hook layer is the release-covered layer nearest 65% model depth,
+preferring the 40–90% workspace band; `--layer` may select another covered
+layer. Weights remain in the Hugging Face cache. Saklas stores only a small
+identity sidecar and optional Neuronpedia labels under
+`models/<safe>/sae/<release>.json` / `-labels.json`.
+
+The runtime has the same three consumers as the J-lens, but is single-layer:
+
+- **readout**: `SAE.encode(h_L)` after the decode forward, followed by top-k;
+  the WebSocket `sae_readout` channel carries feature id, raw post-nonlinearity
+  activation, and an optional cached label. It reuses the existing capture tap
+  and adds no hook. `sae_token_readout` is the loom-prefix replay variant;
+- **steering atoms**: `sae/<id>` lazily registers decoder row `W_dec[id]` as a
+  one-layer ordinary profile. It lowers through the same affine synthesis and
+  `subspace_inject` path as every other vector. `!sae/<id>` is therefore the
+  existing directional mean-ablation, not an encode-clamp-decode operator;
+- **probes + gates**: `add_probe("sae/<id>")` lands in the session SAE-probe
+  registry, not the `Monitor`. Its single coordinate is the feature activation,
+  so `@when:sae/<id>>N` compares the SAE's own units. A gate forces one encode
+  per forward even with live discovery off and does not force monitor scoring.
+  The finalize aggregate pools the last content token from the capture tail.
+
+One encode is shared by live top-k, pinned probes, and SAE gate scalars on a
+step. Activation values are comparable over tokens for one feature, not across
+features; the dashboard scales each card against its own recent maximum.
+
 ---
 
 ## 7. Grammar (`core/steering_expr.py`)
@@ -974,10 +1005,11 @@ expr     := term (("+" | "-") term)*
 term     := [coeff "*"?] ["!"] selector ["@" trigger]
 selector := atom (("~" | "|") atom | "%" position)?
 position := signed_num ("," signed_num)* | label
-atom     := [ns "/"] NAME ["." NAME] [":" variant]
+atom     := [ns "/"] NAME ["." NAME] [":" variant] | "sae" "/" INT
 trigger  := preset | "when" ":" probe op NUM
 probe    := [ns "/"] NAME ["." NAME] ["[" INT "]"]   # vector probe (jlens/fake = readout strength), optional coord axis
           | [ns "/"] NAME ":" "fraction" | [ns "/"] NAME "@" NAME   # manifold channels
+          | "sae" "/" INT                                 # feature activation
 ```
 
 `+`/`−` add terms, `*` attaches a coefficient, `~` projects onto a direction
@@ -990,9 +1022,10 @@ resolves in `core/steering_expr`: first as a bipolar pole/name of a 2-node `pca`
 manifold (`resolve_pole`/`resolve_manifold_name`), then via
 `io.selectors.resolve_bare_name` (the manifold-label tier) as a multi-node manifold
 node label (synthesizing a label-form `ManifoldTerm`); cross-tier ambiguity raises.
-The `jlens` namespace is reserved: `jlens/<word>` parses as an ordinary `ns/name`
-atom but resolves at dispatch through the fitted Jacobian lens (§6.4), and no
-manifold may be authored under it. Term types (`ProjectedTerm`/`AblationTerm`/
+The `jlens` and `sae` namespaces are reserved. `jlens/<word>` resolves through
+the fitted Jacobian lens (§6.4); `sae/<id>` admits an integer RHS and resolves
+through the resident SAE (§6.5). No manifold may be authored under either.
+Term types (`ProjectedTerm`/`AblationTerm`/
 `ManifoldTerm` + plain tuples) survive as parse-time markers the dispatch
 synthesizer consumes.
 

@@ -10,7 +10,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, TypeVar
 
 from saklas.cli.parsers import (
-    _EXPERIMENT_VERBS, _LENS_VERBS, _MANIFOLD_VERBS, _PACK_VERBS, _TEMPLATE_VERBS,
+    _EXPERIMENT_VERBS, _LENS_VERBS, _MANIFOLD_VERBS, _PACK_VERBS, _SAE_VERBS,
+    _TEMPLATE_VERBS,
 )
 from saklas.core.errors import SaklasError
 from saklas.core.histogram import summarize_diagnostics
@@ -2753,6 +2754,42 @@ def _run_lens(args: argparse.Namespace) -> None:
     runner(args)
 
 
+def _run_sae_load(args: argparse.Namespace) -> None:
+    import json
+    from saklas.core.session import SaklasSession
+
+    _print_startup(args)
+    with SaklasSession.from_pretrained(
+        args.model, device=args.device, quantize=args.quantize, probes=[],
+    ) as session:
+        _print_model_info(session)
+        info = session.load_sae(args.release, layer=args.layer)
+    if args.json_output:
+        print(json.dumps({"model": args.model, **info}, indent=2))
+    else:
+        print(
+            f"Loaded SAE {info['release']} for {args.model}: "
+            f"L{info['layer']}, {info['width']} features"
+        )
+        print("Weights are cached by Hugging Face; saklas metadata is ready.")
+
+
+@_saklas_error_exit
+def _run_sae(args: argparse.Namespace) -> None:
+    cmd = getattr(args, "sae_cmd", None)
+    if cmd is None:
+        print("usage: saklas sae <verb> [...]")
+        print()
+        for verb, desc in _SAE_VERBS:
+            print(f"  {verb:<8}  {desc}")
+        sys.exit(0)
+    if cmd == "load":
+        _run_sae_load(args)
+        return
+    print(f"unknown sae verb {cmd!r}", file=sys.stderr)
+    sys.exit(2)
+
+
 @_saklas_error_exit
 def _run_experiment(args: argparse.Namespace) -> None:
     """Dispatch ``saklas experiment <verb>``."""
@@ -3073,4 +3110,5 @@ _COMMAND_RUNNERS = {
     "experiment": _run_experiment,
     "template":   _run_template,
     "lens":       _run_lens,
+    "sae":        _run_sae,
 }

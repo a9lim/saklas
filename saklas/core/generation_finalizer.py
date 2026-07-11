@@ -128,6 +128,14 @@ def finalize_generation(
         manifold_aggregates.update(
             session._score_lens_probes_aggregate(generated_ids)
         )
+    if (
+        return_probe_readings
+        and generated_ids
+        and getattr(session, "_sae_probes", None)
+    ):
+        manifold_aggregates.update(
+            session._score_sae_probes_aggregate(generated_ids)
+        )
 
     result = GenerationResult(
         text=text, tokens=list(generated_ids), token_count=token_count,

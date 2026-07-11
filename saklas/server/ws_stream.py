@@ -575,6 +575,7 @@ async def _ws_handle_generate(
             # ``generate_stream``'s ``_push_flags``), so an enabled lens
             # streams per-step top-k on the ``token`` frame's ``lens_readout``.
             _on_token_flags._saklas_wants_lens_readout = True
+            _on_token_flags._saklas_wants_sae_readout = True
 
             result_holder: list[GenerationResult | RunSet] = []
             error_holder: list[BaseException] = []

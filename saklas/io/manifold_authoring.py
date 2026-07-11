@@ -111,10 +111,10 @@ def iter_manifold_folders(
                 continue
 
 
-#: Namespaces no manifold may be authored under. ``jlens`` is the steering
-#: grammar's lazily-resolved Jacobian-lens tier (``jlens/<word>`` = a lens
-#: token direction) — a manifold folder there would shadow that resolution.
-RESERVED_NAMESPACES = frozenset({"jlens"})
+#: Namespaces no manifold may be authored under. ``jlens`` and ``sae`` are
+#: lazily-resolved per-model steering tiers; a manifold folder under either
+#: name would shadow that resolution.
+RESERVED_NAMESPACES = frozenset({"jlens", "sae"})
 
 
 def _validate_ns_name(namespace: str, name: str) -> None:

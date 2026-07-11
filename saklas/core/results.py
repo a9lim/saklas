@@ -370,6 +370,9 @@ class TokenEvent:
     # and its std (:func:`saklas.core.jlens.aggregate_readout`). ``None``
     # when the live lens is off.
     lens_aggregate: list[tuple[str, float, float, float]] | None = None
+    # Live SAE top-k at the resident hook layer: feature id, raw
+    # post-nonlinearity activation, optional cached display label.
+    sae_readout: list[tuple[int, float, str | None]] | None = None
 
     @property
     def scores(self) -> "dict[str, ProbeReading] | None":

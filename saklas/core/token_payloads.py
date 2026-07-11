@@ -20,7 +20,7 @@ class TokenProbePayload:
     probe_readings: dict[str, ProbeReading] | None = None
 
     def to_token_payload(
-        self, *, lens: Any = None, lens_aggregate: Any = None,
+        self, *, lens: Any = None, lens_aggregate: Any = None, sae: Any = None,
     ) -> dict[str, Any]:
         return {
             "scores": self.scores,
@@ -29,6 +29,7 @@ class TokenProbePayload:
             "probe_readings": self.probe_readings,
             "lens": lens,
             "lens_aggregate": lens_aggregate,
+            "sae": sae,
         }
 
     def merge_readings(

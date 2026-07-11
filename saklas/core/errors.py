@@ -68,6 +68,20 @@ class SaeCoverageError(ValueError, SaklasError):
         return (400, str(self) or self.__class__.__name__)
 
 
+class SaeNotLoadedError(RuntimeError, SaklasError):
+    """Raised when a live SAE surface is used without a resident release."""
+
+    def user_message(self) -> tuple[int, str]:
+        return (404, str(self) or self.__class__.__name__)
+
+
+class SaeFeatureError(ValueError, SaklasError):
+    """Raised when an SAE feature id is malformed or outside the resident width."""
+
+    def user_message(self) -> tuple[int, str]:
+        return (400, str(self) or self.__class__.__name__)
+
+
 class AmbiguousVariantError(ValueError, SaklasError):
     """Raised when a :sae selector matches more than one extracted release."""
 

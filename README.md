@@ -516,6 +516,27 @@ saklas serve google/gemma-3-4b-it -S "!jlens/fake"        # ablate a lens direct
 
 ---
 
+## Sparse autoencoders
+
+Install the optional SAELens adapter, then prepare a compatible release:
+
+```bash
+pip install 'saklas[sae]'
+saklas sae load gemma-scope-2-4b-it-res -m google/gemma-3-4b-it
+saklas serve google/gemma-3-4b-it
+```
+
+The dashboard SAE tab loads one release into the running session, streams its
+top feature activations, and pins features as probes. `0.3 sae/9143` steers on
+decoder row 9143; `!sae/9143` uses saklas's ordinary directional
+mean-ablation; `@when:sae/9143 > 3` gates on the raw post-nonlinearity encoder
+activation. V1 keeps one deterministic hook layer resident (nearest 65% depth,
+workspace band preferred); pass `--layer` to the CLI to preflight a different
+covered layer. Feature labels are fetched lazily from Neuronpedia when the
+selected SAELens registry entry provides an id, and reads remain offline-first.
+
+---
+
 ## Supported architectures
 
 **Tested**: Qwen, Gemma, Ministral, gpt-oss, Llama, GLM, Talkie.

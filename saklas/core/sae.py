@@ -85,6 +85,14 @@ class SaeBackend(Protocol):
         """
         ...
 
+    def feature_count(self, idx: int) -> int:
+        """Number of sparse features at ``idx``."""
+        ...
+
+    def feature_direction(self, idx: int, feature_id: int) -> torch.Tensor:
+        """Decoder row for one sparse feature, in model residual space."""
+        ...
+
 
 # --- test helper ----------------------------------------------------------
 
@@ -103,10 +111,18 @@ class MockSaeBackend:
     fingerprint: str | None = None
     encode_fn: Callable[[int, torch.Tensor], torch.Tensor] | None = None
     decode_fn: Callable[[int, torch.Tensor], torch.Tensor] | None = None
+    sae_ids_by_layer: dict[str, str] = field(default_factory=dict)
+    repo_id: str | None = None
+    neuronpedia_id: str | None = None
+    neuronpedia_ids_by_layer: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self):
         if self.d_feature is None:
             self.d_feature = self.d_model
+        if not self.sae_ids_by_layer:
+            self.sae_ids_by_layer = {
+                str(layer): f"mock-layer-{layer}" for layer in self.layers
+            }
         if (
             self.fingerprint is None
             and self.encode_fn is None
@@ -134,6 +150,20 @@ class MockSaeBackend:
             return self.decode_fn(idx, f)
         return f
 
+    def feature_count(self, idx: int) -> int:
+        if idx not in self.layers:
+            raise KeyError(idx)
+        assert self.d_feature is not None
+        return int(self.d_feature)
+
+    def feature_direction(self, idx: int, feature_id: int) -> torch.Tensor:
+        width = self.feature_count(idx)
+        if not 0 <= feature_id < width:
+            raise IndexError(feature_id)
+        one_hot = torch.zeros(width)
+        one_hot[feature_id] = 1
+        return self.decode_layer(idx, one_hot)
+
 
 # --- SAELens-backed concrete adapter --------------------------------------
 
@@ -153,6 +183,9 @@ class SaeLensBackend:
     layers: frozenset[int]
     _loader: Callable[[int], Any] = field(repr=False)
     sae_ids_by_layer: dict[str, str] = field(default_factory=dict)
+    repo_id: str | None = None
+    neuronpedia_id: str | None = None
+    neuronpedia_ids_by_layer: dict[str, str] = field(default_factory=dict)
     _active_layer: int | None = field(default=None, init=False, repr=False)
     _active_sae: Any | None = field(default=None, init=False, repr=False)
 
@@ -169,6 +202,109 @@ class SaeLensBackend:
 
     def decode_layer(self, idx: int, f: torch.Tensor) -> torch.Tensor:
         return self._sae(idx).decode(f)
+
+    def feature_count(self, idx: int) -> int:
+        sae = self._sae(idx)
+        cfg: Any = getattr(sae, "cfg", None)
+        width = (
+            cfg.get("d_sae")
+            if hasattr(cfg, "get")
+            else getattr(cfg, "d_sae", None)
+        )
+        if width is None:
+            w_dec: Any = getattr(sae, "W_dec", None)
+            if not isinstance(w_dec, torch.Tensor) or w_dec.ndim != 2:
+                raise ValueError(
+                    f"SAE release {self.release!r} does not expose d_sae/W_dec"
+                )
+            width = w_dec.shape[0]
+        return int(width)
+
+    def feature_direction(self, idx: int, feature_id: int) -> torch.Tensor:
+        sae = self._sae(idx)
+        width = self.feature_count(idx)
+        if not 0 <= feature_id < width:
+            raise IndexError(feature_id)
+        w_dec: Any = getattr(sae, "W_dec", None)
+        if isinstance(w_dec, torch.Tensor) and w_dec.ndim == 2:
+            return w_dec[feature_id]
+        # Compatibility fallback for an adapter that exposes only decode().
+        first = next(iter(sae.parameters()), None) if hasattr(sae, "parameters") else None
+        one_hot = torch.zeros(
+            width,
+            device=getattr(first, "device", None),
+            dtype=getattr(first, "dtype", None),
+        )
+        one_hot[feature_id] = 1
+        return sae.decode(one_hot)
+
+
+def select_runtime_layer(
+    available: frozenset[int] | set[int],
+    n_layers: int,
+    requested: int | None = None,
+) -> int:
+    """Choose the one resident SAE hook layer for the v1 live runtime.
+
+    Explicit selection wins.  Otherwise choose the available layer nearest
+    65% depth, preferring the model's 40–90% workspace band.  This is stable
+    across launches and keeps the unqualified ``sae/<id>`` grammar singular.
+    """
+    choices = sorted(int(layer) for layer in available)
+    if not choices:
+        from saklas.core.errors import SaeCoverageError
+        raise SaeCoverageError("SAE release covers no model layers")
+    if requested is not None:
+        if requested not in choices:
+            from saklas.core.errors import SaeCoverageError
+            raise SaeCoverageError(
+                f"SAE release does not cover layer {requested}; available: {choices}"
+            )
+        return requested
+    denom = max(n_layers - 1, 1)
+    band = [layer for layer in choices if 0.4 <= layer / denom <= 0.9]
+    pool = band or choices
+    target = 0.65 * denom
+    return min(pool, key=lambda layer: (abs(layer - target), layer))
+
+
+def list_sae_releases(model_id: str) -> list[dict[str, Any]]:
+    """Return SAELens registry suggestions compatible with ``model_id``.
+
+    Metadata-only: no SAE weights are loaded and no model forward runs.
+    """
+    from saklas.core.errors import SaeBackendImportError
+
+    try:
+        import sae_lens
+    except ImportError as exc:
+        raise SaeBackendImportError(
+            "SAE release discovery requires `sae_lens`; install saklas[sae]"
+        ) from exc
+    loader = getattr(sae_lens, "get_pretrained_saes_directory", None)
+    if loader is None:
+        from sae_lens.loading.pretrained_saes_directory import (  # pyright: ignore[reportMissingImports]
+            get_pretrained_saes_directory,
+        )
+        loader = get_pretrained_saes_directory
+    rows: list[dict[str, Any]] = []
+    for release, entry in loader().items():
+        def value(name: str, default: Any = None) -> Any:
+            return entry.get(name, default) if isinstance(entry, Mapping) else getattr(entry, name, default)
+
+        release_model = value("model") or value("model_name")
+        if release_model and model_id and not _model_names_match(str(release_model), model_id):
+            continue
+        layer_map = _canonical_layer_map(value("saes_map", {}), warn=False)
+        rows.append({
+            "release": str(release),
+            "model": str(release_model) if release_model else None,
+            "layers": sorted(set(int(layer) for layer in layer_map.values())),
+            "repo_id": value("repo_id"),
+            "neuronpedia": bool(value("neuronpedia_id")),
+        })
+    rows.sort(key=lambda row: row["release"])
+    return rows
 
 
 def load_sae_backend(
@@ -256,6 +392,17 @@ def load_sae_backend(
         for layer_idx, sae_id in ids_by_layer_int.items()
     }
     repo_id = _entry_value("repo_id")
+    neuronpedia_raw = _entry_value("neuronpedia_id")
+    neuronpedia_by_layer: dict[str, str] = {}
+    if isinstance(neuronpedia_raw, Mapping):
+        for layer_idx, sae_id in ids_by_layer_int.items():
+            value = neuronpedia_raw.get(sae_id)
+            if isinstance(value, str) and value:
+                neuronpedia_by_layer[str(layer_idx)] = value
+    elif isinstance(neuronpedia_raw, str) and neuronpedia_raw:
+        # Single-SAE releases occasionally expose one scalar id.
+        for layer_idx in ids_by_layer_int:
+            neuronpedia_by_layer[str(layer_idx)] = neuronpedia_raw
     resolved_commit: str | None = None
     if isinstance(repo_id, str) and repo_id:
         try:
@@ -393,10 +540,19 @@ def load_sae_backend(
         layers=frozenset(ids_by_layer_int),
         _loader=_load_layer,
         sae_ids_by_layer=ids_by_layer,
+        repo_id=repo_id if isinstance(repo_id, str) else None,
+        neuronpedia_id=(
+            next(iter(neuronpedia_by_layer.values()), None)
+        ),
+        neuronpedia_ids_by_layer=neuronpedia_by_layer,
     )
 
 
-def _canonical_layer_map(saes_map: dict[str, Any]) -> dict[str, int]:
+def _canonical_layer_map(
+    saes_map: dict[str, Any],
+    *,
+    warn: bool = True,
+) -> dict[str, int]:
     """Pick one SAE per layer: narrowest width, then sparsest L0.
 
     SAELens releases that ship multiple SAEs per layer (different widths, L0s)
@@ -470,7 +626,7 @@ def _canonical_layer_map(saes_map: dict[str, Any]) -> dict[str, int]:
         candidates.sort(key=lambda candidate: _candidate_rank(candidate[0]))
         chosen_id, chosen_layer = candidates[0]
         out[chosen_id] = chosen_layer
-        if len(candidates) > 1:
+        if warn and len(candidates) > 1:
             other_ids = [c[0] for c in candidates[1:]]
             warnings.warn(
                 f"SAE layer {layer_int}: multiple SAEs in registry; chose "

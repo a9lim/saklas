@@ -292,7 +292,8 @@ fit replaces them.)
 ## sae.py
 
 SAE backend. `SaeBackend` (runtime-checkable Protocol): `encode_layer`/
-`decode_layer`, `release`, `revision`, `layers`. `MockSaeBackend` for CPU tests;
+`decode_layer`/`feature_count`/`feature_direction`, `release`, `revision`,
+`layers`. `MockSaeBackend` for CPU tests;
 `SaeLensBackend` the concrete adapter. `load_sae_backend(release, *, revision,
 model_id, device, dtype)` queries SAELens, validates base-model compatibility,
 resolves per-layer sae_ids (`_canonical_layer_map` narrowest-width), gates
@@ -302,6 +303,11 @@ hit does not import SAELens at all. An explicit `revision` is passed only when
 the installed loader exposes `revision=`; otherwise loading raises instead of
 stamping a pin it did not honor. Errors:
 `SaeBackendImportError`, `SaeReleaseNotFoundError` (difflib suggestions).
+The live runtime keeps one selected encoder/decoder layer resident;
+`select_runtime_layer` chooses nearest 65% model depth (workspace preferred),
+and `list_sae_releases` discovers compatible registry rows without weights.
+`sae/<id>` steering reads `W_dec[id]`; feature probes read the encoder channel
+outside the `Monitor`.
 
 ## mahalanobis.py
 

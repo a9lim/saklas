@@ -113,6 +113,11 @@ def _live_lens_layers(session: SaklasSession) -> list[int] | None:
     return None
 
 
+def _sae_info(session: SaklasSession) -> dict[str, Any] | None:
+    info = getattr(session, "sae_info", None)
+    return dict(info) if isinstance(info, dict) else None
+
+
 def session_info(
     session: SaklasSession, default_steering: Steering | None,
 ) -> dict[str, Any]:
@@ -166,6 +171,10 @@ def session_info(
         # rehydrate its WORKSPACE panel toggle on reload.  Coerced so a
         # stub session (tests) reads as off rather than unserializable.
         "live_lens_layers": _live_lens_layers(session),
+        "sae_loaded": _sae_info(session) is not None,
+        "sae_info": _sae_info(session),
+        "live_sae": bool(getattr(session, "live_sae", False))
+        if isinstance(getattr(session, "live_sae", False), bool) else False,
         # CAA live toggle state (POST .../probes/live): whether per-token
         # monitor scoring feeds live consumers.  Coerced so a stub session
         # (tests) reads as the default-on.

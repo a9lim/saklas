@@ -115,6 +115,33 @@ def _lens_probe_specs(session: Any) -> dict[str, dict[str, Any]]:
     return dict(specs) if isinstance(specs, dict) else {}
 
 
+def _sae_probe_info(name: str, spec: dict[str, Any]) -> dict[str, Any]:
+    """Serialize one pinned SAE feature probe (encoder readout channel)."""
+    feature_id = int(spec.get("feature_id", -1))
+    label = spec.get("label")
+    return {
+        "name": name,
+        "manifold": "sae",
+        "top_n": 0,
+        "layers": [int(spec.get("layer", 0))],
+        "node_labels": [str(label) if label else str(feature_id)],
+        "node_count": 1,
+        "domain": {},
+        "intrinsic_dim": 1,
+        "feature_space": "sae-readout",
+        "is_affine": False,
+        "node_coords": None,
+        "sae": True,
+        "feature_id": feature_id,
+        "label": label,
+    }
+
+
+def _sae_probe_specs(session: Any) -> dict[str, dict[str, Any]]:
+    specs = getattr(session, "_sae_probes", None)
+    return dict(specs) if isinstance(specs, dict) else {}
+
+
 def register_probe_routes(app: FastAPI) -> None:
     """Mount the unified probe listing + attach / detach + live-toggle routes."""
     session = app.state.session
@@ -130,6 +157,10 @@ def register_probe_routes(app: FastAPI) -> None:
         rows.extend(
             _lens_probe_info(name, spec)
             for name, spec in _lens_probe_specs(session).items()
+        )
+        rows.extend(
+            _sae_probe_info(name, spec)
+            for name, spec in _sae_probe_specs(session).items()
         )
         return {"probes": rows}
 
@@ -195,6 +226,9 @@ def register_probe_routes(app: FastAPI) -> None:
         lens_specs = _lens_probe_specs(session)
         if registered in lens_specs:
             return _lens_probe_info(registered, lens_specs[registered])
+        sae_specs = _sae_probe_specs(session)
+        if registered in sae_specs:
+            return _sae_probe_info(registered, sae_specs[registered])
         attached = session.monitor.attached_probes()
         probe = attached.get(registered)
         if probe is None:
@@ -211,6 +245,7 @@ def register_probe_routes(app: FastAPI) -> None:
         if (
             name not in session.monitor.probe_names
             and name not in _lens_probe_specs(session)
+            and name not in _sae_probe_specs(session)
         ):
             raise HTTPException(404, f"probe '{name}' not attached")
         session.remove_probe(name)

@@ -96,6 +96,60 @@ class TestModels:
         assert resp.status_code == 404
 
 
+class TestSaeRoutes:
+    def test_session_info_carries_sae_runtime(self, session_and_client: Any) -> None:
+        session, client = session_and_client
+        session.sae_info = {
+            "release": "scope", "layer": 14, "width": 16_384,
+        }
+        session.live_sae = True
+        resp = client.get("/saklas/v1/sessions/default")
+        assert resp.status_code == 200
+        assert resp.json()["sae_loaded"] is True
+        assert resp.json()["sae_info"]["layer"] == 14
+        assert resp.json()["live_sae"] is True
+
+    def test_feature_validation(self, session_and_client: Any) -> None:
+        session, client = session_and_client
+        session.validate_sae_feature.return_value = {
+            "id": 42, "label": "fruit", "layer": 14,
+        }
+        resp = client.post(
+            "/saklas/v1/sessions/default/sae/feature/validate",
+            json={"id": 42},
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {"id": 42, "label": "fruit", "layer": 14}
+        session.validate_sae_feature.assert_called_once_with(42)
+
+    def test_live_toggle(self, session_and_client: Any) -> None:
+        session, client = session_and_client
+        session.enable_live_sae.return_value = {"layer": 14, "top_k": 12}
+        resp = client.post(
+            "/saklas/v1/sessions/default/sae/live",
+            json={"enabled": True, "top_k": 12},
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "enabled": True, "layer": 14, "top_k": 12,
+        }
+        session.enable_live_sae.assert_called_once_with(top_k=12)
+
+    def test_token_readout(self, session_and_client: Any) -> None:
+        session, client = session_and_client
+        session.sae_token_readout.return_value = {
+            "node_id": "n1", "raw_index": 2, "token_id": 7,
+            "token_text": "x", "steering": None, "layer": 14,
+            "features": [{"id": 42, "activation": 3.5, "label": "fruit"}],
+        }
+        resp = client.get(
+            "/saklas/v1/sessions/default/sae/token-readout",
+            params={"node_id": "n1", "raw_index": 2},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["features"][0]["id"] == 42
+
+
 # ---------------------------------------------------------------------------
 # Chat completions
 # ---------------------------------------------------------------------------

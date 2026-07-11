@@ -83,6 +83,20 @@ export interface SessionInfo {
    *  Rehydrates the WORKSPACE panel toggle across page reloads; older
    *  servers omit it (reads as off). */
   live_lens_layers?: number[] | null;
+  /** Resident SAE runtime capability and identity. */
+  sae_loaded?: boolean;
+  sae_info?: {
+    release: string;
+    revision?: string | null;
+    fingerprint?: string | null;
+    layer: number;
+    width: number;
+    sae_id?: string | null;
+    repo_id?: string | null;
+    neuronpedia_id?: string | null;
+  } | null;
+  /** True while per-token SAE discovery readout is enabled. */
+  live_sae?: boolean;
   /** CAA live toggle state (``POST .../probes/live``): whether per-token
    *  monitor scoring feeds live consumers.  Off ⇒ probes report only the
    *  end-of-gen aggregate (gates still force what they need).  Older
@@ -178,6 +192,34 @@ export interface LensFitStatusJSON {
   finished_at: number | null;
   /** Layers the post-fit auto-enable turned live, when it ran. */
   live_layers: number[] | null;
+}
+
+// ------------------------------------------------ sparse autoencoder --
+
+export interface SaeFeatureJSON {
+  id: number;
+  activation: number;
+  label?: string | null;
+}
+
+export interface SaeLoadStatusJSON {
+  running: boolean;
+  release: string | null;
+  message: string | null;
+  error: string | null;
+  started_at: number | null;
+  finished_at: number | null;
+  info: SessionInfo["sae_info"];
+}
+
+export interface SaeTokenReadoutJSON {
+  node_id: string;
+  raw_index: number;
+  token_id: number;
+  token_text: string;
+  steering: string | null;
+  layer: number;
+  features: SaeFeatureJSON[];
 }
 
 // ----------------------------------------------------- manifolds --
@@ -708,6 +750,10 @@ export interface ProbeInfo {
   word?: string;
   /** The lens probe's resolved single-token vocabulary id. */
   token_id?: number | null;
+  /** True for a pinned resident SAE feature probe. */
+  sae?: boolean;
+  feature_id?: number | null;
+  label?: string | null;
 }
 
 export interface ProbeListResponse {
@@ -1002,6 +1048,8 @@ export interface WSTokenEvent {
    *  (mean band probability + probability-mass-weighted depth center of
    *  mass).  Present under the same conditions as ``lens_readout``. */
   lens_aggregate?: [string, number, number, number][];
+  /** Resident SAE top-k feature activations for this decode step. */
+  sae_readout?: { id: number; activation: number; label?: string | null }[];
 }
 
 export interface WSDoneResultPerToken {
@@ -1468,9 +1516,21 @@ export interface JLensSteerEntry {
   enabled: boolean;
 }
 
+/** Resident SAE decoder-row steering term (``α sae/<id>``). */
+export interface SaeSteerEntry {
+  mode: "sae";
+  alpha: number;
+  trigger: Trigger;
+  enabled: boolean;
+}
+
 /** A racked steering term — subspace (flat), manifold (curved), or a
  *  J-lens token atom. */
-export type SteerEntry = SubspaceSteerEntry | ManifoldSteerEntry | JLensSteerEntry;
+export type SteerEntry =
+  | SubspaceSteerEntry
+  | ManifoldSteerEntry
+  | JLensSteerEntry
+  | SaeSteerEntry;
 
 // ----------------------------------------------------- extract pairs --
 

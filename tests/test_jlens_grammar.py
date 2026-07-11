@@ -212,10 +212,13 @@ def test_gated_lens_probe_keys_and_gate_scalars() -> None:
 # -------------------------------------------------------------- ns reservation
 
 
-def test_manifold_authoring_rejects_jlens_namespace() -> None:
+@pytest.mark.parametrize("namespace", ["jlens", "sae"])
+def test_manifold_authoring_rejects_reserved_runtime_namespace(
+    namespace: str,
+) -> None:
     with pytest.raises(ManifoldFormatError, match="reserved"):
         create_discover_manifold_folder(
-            "jlens", "fake", "should not exist",
+            namespace, "fake", "should not exist",
             node_corpora={"a": ["x"], "b": ["y"]},
             fit_mode="pca",
         )

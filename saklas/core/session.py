@@ -1249,6 +1249,17 @@ class SaklasSession:
         # them when the layer sets match.  Reset per generation.
         self._lens_step_stash: dict[str, Any] | None = None
         self._last_lens_step_readings: dict[str, "ProbeReading"] | None = None
+        # Live sparse-autoencoder runtime. One release + one hook layer is
+        # resident in v1; weights stay owned by SAELens/HF cache. Readout
+        # probes are session-local siblings of the J-lens probe registry.
+        self._sae_backend: Any = None
+        self._sae_layer: int | None = None
+        self._sae_width: int | None = None
+        self._sae_labels: dict[str, str] = {}
+        self._live_sae: dict[str, Any] | None = None
+        self._sae_probes: dict[str, dict[str, Any]] = {}
+        self._sae_step_stash: dict[str, Any] | None = None
+        self._last_sae_step_readings: dict[str, "ProbeReading"] | None = None
         # CAA live toggle: when False, per-token monitor scoring is disabled
         # for UI/trait/loom consumers (aggregate-only capture); probe gates
         # still force the per-token subset they need.
@@ -1471,6 +1482,10 @@ class SaklasSession:
         out.update(
             {name: {"lens": dict(spec)}
              for name, spec in self._lens_probes.items()}
+        )
+        out.update(
+            {name: {"sae": dict(spec)}
+             for name, spec in self._sae_probes.items()}
         )
         return out
 
@@ -2909,6 +2924,408 @@ class SaklasSession:
         )
         return out, agg
 
+    # -- Sparse-autoencoder runtime -------------------------------------
+
+    def load_sae(self, release: str, *, layer: int | None = None) -> dict[str, Any]:
+        """Load one SAELens release/layer as the session's resident SAE.
+
+        Release registry resolution stays eager while the selected layer's
+        weights are made resident here. The deterministic default is the
+        covered layer nearest 65% model depth, preferring the workspace band.
+        """
+        from saklas.core.sae import load_sae_backend, select_runtime_layer
+        from saklas.io.sae import load_sae_labels, save_sae_metadata
+
+        release = release.strip()
+        if not release:
+            raise ValueError("SAE release must not be empty")
+        with self._model_exclusive(
+            "load_sae called while another model operation is in flight; retry shortly"
+        ):
+            backend = load_sae_backend(
+                release, model_id=self.model_id, device=self._device,
+                dtype=self._dtype,
+            )
+            covered = frozenset(
+                idx for idx in backend.layers if 0 <= idx < len(self._layers)
+            )
+            selected = select_runtime_layer(covered, len(self._layers), layer)
+            width = int(backend.feature_count(selected))  # materialize weights
+            if width <= 0:
+                raise ValueError(f"SAE release {release!r} has no features")
+            self._sae_backend = backend
+            self._sae_layer = selected
+            self._sae_width = width
+            self._sae_labels = load_sae_labels(self.model_id, release)
+            self._live_sae = None
+            self._sae_step_stash = None
+            self._last_sae_step_readings = None
+            # Feature ids belong to the resident release; changing it evicts
+            # stale directions and pinned probes rather than silently reusing ids.
+            for name in [key for key in self._profiles if key.startswith("sae/")]:
+                del self._profiles[name]
+            for name in list(self._sae_probes):
+                self._probe_hash_cache.pop(name, None)
+            self._sae_probes.clear()
+            save_sae_metadata(self.model_id, release, {
+                "layer": selected,
+                "width": width,
+                "revision": backend.revision,
+                "fingerprint": backend.fingerprint,
+                "sae_id": backend.sae_ids_by_layer.get(str(selected)),
+                "repo_id": backend.repo_id,
+                "neuronpedia_id": backend.neuronpedia_ids_by_layer.get(
+                    str(selected)
+                ),
+            })
+        self._invalidate_prefix_cache()
+        self._invalidate_analytics_cache()
+        return self.sae_info or {}
+
+    def unload_sae(self) -> None:
+        """Release the resident SAE and every session-local feature handle."""
+        with self._model_exclusive(
+            "unload_sae called while another model operation is in flight; retry shortly"
+        ):
+            self._sae_backend = None
+            self._sae_layer = None
+            self._sae_width = None
+            self._sae_labels = {}
+            self._live_sae = None
+            self._sae_step_stash = None
+            self._last_sae_step_readings = None
+            for name in [key for key in self._profiles if key.startswith("sae/")]:
+                del self._profiles[name]
+            for name in list(self._sae_probes):
+                self._probe_hash_cache.pop(name, None)
+            self._sae_probes.clear()
+        self._invalidate_prefix_cache()
+        self._invalidate_analytics_cache()
+
+    @property
+    def sae_info(self) -> dict[str, Any] | None:
+        backend = getattr(self, "_sae_backend", None)
+        layer = getattr(self, "_sae_layer", None)
+        width = getattr(self, "_sae_width", None)
+        if backend is None or layer is None or width is None:
+            return None
+        return {
+            "release": backend.release,
+            "revision": backend.revision,
+            "fingerprint": backend.fingerprint,
+            "layer": int(layer),
+            "width": int(width),
+            "sae_id": backend.sae_ids_by_layer.get(str(layer)),
+            "repo_id": backend.repo_id,
+            "neuronpedia_id": backend.neuronpedia_ids_by_layer.get(str(layer)),
+        }
+
+    def _require_sae(self) -> tuple[Any, int, int]:
+        from saklas.core.errors import SaeNotLoadedError
+
+        backend = getattr(self, "_sae_backend", None)
+        layer = getattr(self, "_sae_layer", None)
+        width = getattr(self, "_sae_width", None)
+        if backend is None or layer is None or width is None:
+            raise SaeNotLoadedError(
+                "no SAE loaded for this session — load one with `saklas sae load` "
+                "or POST /saklas/v1/sessions/default/sae/load"
+            )
+        return backend, int(layer), int(width)
+
+    def validate_sae_feature(self, feature_id: int | str) -> dict[str, Any]:
+        from saklas.core.errors import SaeFeatureError
+
+        try:
+            idx = int(feature_id)
+        except (TypeError, ValueError) as exc:
+            raise SaeFeatureError(f"SAE feature id must be an integer: {feature_id!r}") from exc
+        _backend, layer, width = self._require_sae()
+        if not 0 <= idx < width:
+            raise SaeFeatureError(
+                f"SAE feature {idx} out of range [0, {width}) for layer {layer}"
+            )
+        label = self._sae_labels.get(str(idx))
+        if label is None:
+            label = self._fetch_sae_label(idx)
+        return {"id": idx, "label": label, "layer": layer}
+
+    def _fetch_sae_label(self, feature_id: int) -> str | None:
+        """Best-effort lazy Neuronpedia label lookup for an explicit id.
+
+        Live/top-k readout never calls this method; discovery remains entirely
+        local and renders a bare id until the user validates/pins that feature.
+        """
+        info = self.sae_info or {}
+        neuronpedia_id = info.get("neuronpedia_id")
+        if not isinstance(neuronpedia_id, str) or "/" not in neuronpedia_id:
+            return None
+        import json
+        from urllib.parse import quote
+        from huggingface_hub import get_session
+        from saklas.io.sae import save_sae_labels
+
+        model, source = neuronpedia_id.split("/", 1)
+        url = (
+            "https://www.neuronpedia.org/api/feature/"
+            f"{quote(model, safe='')}/{quote(source, safe='')}/{feature_id}"
+        )
+        try:
+            response = get_session().get(
+                url,
+                timeout=2.0,
+                headers={"User-Agent": "saklas-sae-labels/1"},
+            )
+            response.raise_for_status()
+            payload = json.loads(response.content)
+            explanations = payload.get("explanations", [])
+            label = None
+            for row in explanations:
+                if not isinstance(row, dict):
+                    continue
+                description = row.get("description")
+                if isinstance(description, str) and description.strip():
+                    label = description
+                    break
+        except Exception:
+            return None
+        if not isinstance(label, str):
+            return None
+        label = label.strip()
+        self._sae_labels[str(feature_id)] = label
+        backend, _layer, _width = self._require_sae()
+        save_sae_labels(self.model_id, backend.release, self._sae_labels)
+        return label
+
+    def register_sae_direction(self, feature_id: int | str) -> str:
+        """Register ``W_dec[id]`` at the resident hook layer as a profile."""
+        validated = self.validate_sae_feature(feature_id)
+        idx = int(validated["id"])
+        name = f"sae/{idx}"
+        if name in self._profiles:
+            return name
+        backend, layer, _width = self._require_sae()
+        direction = backend.feature_direction(layer, idx)
+        self._profiles[name] = {
+            layer: direction.detach().to(self._device, self._dtype)
+        }
+        self._invalidate_prefix_cache()
+        self._invalidate_analytics_cache()
+        return name
+
+    def enable_live_sae(self, *, top_k: int = 8) -> dict[str, Any]:
+        """Enable the one-matvec live feature readout at the resident layer."""
+        if not 1 <= int(top_k) <= 100:
+            raise ValueError("top_k must be in [1, 100]")
+        _backend, layer, _width = self._require_sae()
+        self._live_sae = {"layer": layer, "top_k": int(top_k)}
+        return {"layer": layer, "top_k": int(top_k)}
+
+    def disable_live_sae(self) -> None:
+        self._live_sae = None
+
+    @property
+    def live_sae(self) -> bool:
+        return self._live_sae is not None
+
+    def _encode_sae_hidden(self, hidden: torch.Tensor) -> torch.Tensor:
+        backend, layer, width = self._require_sae()
+        row = hidden
+        if row.ndim == 1:
+            row = row.unsqueeze(0)
+        acts = backend.encode_layer(layer, row)
+        if acts.ndim == 2 and acts.shape[0] == 1:
+            acts = acts[0]
+        acts = acts.reshape(-1)
+        if int(acts.numel()) != width:
+            raise ValueError(
+                f"SAE encoder returned {acts.numel()} features; expected {width}"
+            )
+        return acts
+
+    def _score_sae_probes(
+        self, hidden: dict[int, torch.Tensor] | None = None,
+        *, activations: torch.Tensor | None = None,
+    ) -> dict[str, "ProbeReading"]:
+        if not self._sae_probes:
+            return {}
+        _backend, layer, _width = self._require_sae()
+        if activations is None:
+            if hidden is None or layer not in hidden:
+                return {}
+            activations = self._encode_sae_hidden(hidden[layer])
+        assert activations is not None
+        out: dict[str, ProbeReading] = {}
+        for name, spec in self._sae_probes.items():
+            value = float(activations[int(spec["feature_id"])])
+            out[name] = ProbeReading(
+                fraction=0.0, nearest=[], coords=(value,), residual=0.0,
+                coords_per_layer={layer: (value,)},
+                depth_com=(layer / max(len(self._layers) - 1, 1),),
+                depth_spread=(0.0,),
+            )
+        return out
+
+    def _score_sae_gate_scalars(self) -> dict[str, float]:
+        if not self._sae_probes:
+            return {}
+        _backend, layer, _width = self._require_sae()
+        latest = self._capture.latest_per_layer()
+        if layer not in latest:
+            return {}
+        acts = self._encode_sae_hidden(latest[layer])
+        self._sae_step_stash = {"activations": acts, "fresh": True}
+        return Monitor.flat_scalars(
+            self._score_sae_probes(activations=acts)
+        )
+
+    def _live_sae_readout_step(
+        self,
+    ) -> list[tuple[int, float, str | None]] | None:
+        state = self._live_sae
+        if state is None or not getattr(self, "_live_sae_active_for_generation", True):
+            return None
+        layer = int(state["layer"])
+        buckets = self._capture.per_layer_buckets()
+        if not buckets.get(layer):
+            return None
+        stash = self._sae_step_stash
+        if stash is not None and stash.get("fresh"):
+            stash["fresh"] = False
+            acts = stash["activations"]
+        else:
+            acts = self._encode_sae_hidden(buckets[layer][-1])
+        if self._sae_probes:
+            self._last_sae_step_readings = self._score_sae_probes(
+                activations=acts,
+            )
+        else:
+            self._last_sae_step_readings = None
+        k = min(int(state["top_k"]), int(acts.numel()))
+        values, indices = torch.topk(acts, k=k)
+        vals = values.detach().to("cpu")
+        ids = indices.detach().to("cpu")
+        return [
+            (int(idx), float(value), self._sae_labels.get(str(int(idx))))
+            for value, idx in zip(vals, ids)
+        ]
+
+    def _score_sae_probes_aggregate(
+        self, generated_ids: list[int],
+    ) -> dict[str, "ProbeReading"]:
+        if not self._sae_probes or not generated_ids:
+            return {}
+        agg_fwd = self._aggregate_forward_index(generated_ids)
+        if agg_fwd is None:
+            return {}
+        pooled = self._capture.tail_slice_at(agg_fwd)
+        if not pooled:
+            stacked = self._capture.stacked()
+            pooled = {
+                layer: rows[agg_fwd]
+                for layer, rows in stacked.items()
+                if rows.shape[0] > agg_fwd
+            }
+        return self._score_sae_probes(pooled) if pooled else {}
+
+    def sae_token_readout(
+        self,
+        node_id: str,
+        raw_index: int,
+        *,
+        top_k: int = 8,
+        apply_steering: bool = True,
+        raw: bool = False,
+    ) -> dict[str, Any]:
+        """SAE feature readout at the forward that produced a loom token."""
+        from saklas.core.vectors import _capture_all_hidden_states
+
+        _backend, layer, width = self._require_sae()
+        if not 1 <= top_k <= min(width, 100):
+            raise ValueError(f"top_k must be in [1, {min(width, 100)}]")
+        node = self.tree.get(node_id)
+        if node.role != "assistant":
+            raise InvalidNodeOperationError(
+                f"sae_token_readout: {node_id!r} is not an assistant node"
+            )
+        raw_ids = node.raw_token_ids
+        if not raw_ids:
+            raise InvalidNodeOperationError(
+                f"sae_token_readout: {node_id!r} has no raw token record"
+            )
+        if not 0 <= raw_index < len(raw_ids):
+            raise InvalidNodeOperationError(
+                f"sae_token_readout: raw_index {raw_index} out of range "
+                f"[0, {len(raw_ids)})"
+            )
+        user_node = self.tree.nodes.get(node.parent_id) if node.parent_id else None
+        if not raw and (user_node is None or user_node.role != "user"):
+            raise InvalidNodeOperationError(
+                "sae_token_readout: assistant has no user parent; pass raw=true "
+                "for a raw-mode node"
+            )
+        recipe = node.recipe
+        steering_expr = (
+            recipe.steering if (apply_steering and recipe is not None) else None
+        )
+        scope = self.steering(steering_expr) if steering_expr else nullcontext()
+        with scope:
+            thinking_req = recipe.thinking if recipe is not None else None
+            use_thinking = (
+                supports_thinking(self._tokenizer)
+                if thinking_req is None
+                else bool(thinking_req) and supports_thinking(self._tokenizer)
+            )
+            if raw:
+                prompt_ids = self._prepare_input(
+                    "", raw=True, parent_node_id=node.parent_id,
+                )
+            else:
+                assert user_node is not None
+                prompt_ids = self._prepare_input(
+                    user_node.text,
+                    thinking=use_thinking,
+                    parent_node_id=user_node.parent_id,
+                    user_role=user_node.role_label,
+                    assistant_role=node.role_label,
+                )
+            if raw_index > 0:
+                prefix = torch.tensor(
+                    [[int(token) for token in raw_ids[:raw_index]]],
+                    dtype=prompt_ids.dtype,
+                    device=prompt_ids.device,
+                )
+                ids = torch.cat([prompt_ids, prefix], dim=1)
+            else:
+                ids = prompt_ids
+            with self._model_exclusive(
+                "session.sae_token_readout called while another model use is in flight",
+                phase_msg="session.sae_token_readout called while a generation is in flight",
+            ):
+                hidden = _capture_all_hidden_states(
+                    self._model, self._layers, ids,
+                    layer_indices=[layer], pool_index=ids.shape[1] - 1,
+                )
+                acts = self._encode_sae_hidden(hidden[layer])
+                values, indices = torch.topk(acts, k=top_k)
+                features = [
+                    {
+                        "id": int(idx),
+                        "activation": float(value),
+                        "label": self._sae_labels.get(str(int(idx))),
+                    }
+                    for value, idx in zip(values.cpu(), indices.cpu())
+                ]
+        return {
+            "node_id": node_id,
+            "raw_index": int(raw_index),
+            "token_id": int(raw_ids[raw_index]),
+            "token_text": str(self._tokenizer.decode([int(raw_ids[raw_index])])),
+            "steering": steering_expr,
+            "layer": layer,
+            "features": features,
+        }
+
     def jspace_decompose(
         self,
         selector: str,
@@ -4145,6 +4562,7 @@ class SaklasSession:
         lean_per_token: bool = False,
         final_probe_aggregate: bool = True,
         live_lens_active: bool = True,
+        live_sae_active: bool = True,
     ) -> bool:
         """Attach hidden-state capture. Returns True if attached.
 
@@ -4183,9 +4601,13 @@ class SaklasSession:
         # stubs carry class attributes only, not instance state.
         live_lens = getattr(self, "_live_lens", None) if live_lens_active else None
         lens_probes = getattr(self, "_lens_probes", None) or {}
+        live_sae = getattr(self, "_live_sae", None) if live_sae_active else None
+        sae_probes = getattr(self, "_sae_probes", None) or {}
         # Per-generation reset of the per-forward lens stash + display row.
         self._lens_step_stash = None
         self._last_lens_step_readings = None
+        self._sae_step_stash = None
+        self._last_sae_step_readings = None
         if widen:
             layer_idxs = list(range(len(self._layers)))
         else:
@@ -4210,6 +4632,10 @@ class SaklasSession:
                 # gates (live or not), and the tail ring pools the finalize
                 # aggregate from the same slices.
                 union = union | self._lens_probe_layers()
+            if live_sae is not None:
+                union.add(int(live_sae["layer"]))
+            if sae_probes and self._sae_layer is not None:
+                union.add(int(self._sae_layer))
             if not union:
                 # No probes ⇒ the degenerate FULL (capture-disabled) state.
                 self._capture_state = CaptureState(
@@ -4339,7 +4765,7 @@ class SaklasSession:
                     self._monitor.score_single_token(latest) if latest else {}
                 )
 
-            if lens_probes:
+            if lens_probes or sae_probes:
                 # Lens probes pool their finalize aggregate from the tail
                 # ring; ``set_incremental``'s length-1 buffers can't walk back
                 # past trailing specials, so arm the ring alongside the sink.
@@ -4360,7 +4786,9 @@ class SaklasSession:
             self._capture.set_aggregate_tail(_AGG_TAIL_DEPTH)
             self._capture_state.mode = CaptureMode.AGGREGATE_ONLY
             self._monitor.enable_curved_warm(False)
-        elif not widen and (live_lens is not None or lens_probes):
+        elif not widen and (
+            live_lens is not None or lens_probes or live_sae is not None or sae_probes
+        ):
             # Lens-only capture (live lens on and/or lens probes pinned, no
             # monitor probes): a bounded tail ring keeps the reader's latest
             # slice fresh without FULL retention growing over the generation.
@@ -4714,6 +5142,8 @@ class SaklasSession:
         # (no whitener requirement — the softmax is the calibration).
         if selector.startswith("jlens/"):
             return self._add_lens_probe(selector, as_name=as_name)
+        if selector.startswith("sae/"):
+            return self._add_sae_probe(selector, as_name=as_name)
         name = as_name if as_name is not None else selector
         # Probe attach loads the manifold onto the model device and builds
         # device-resident whitened factors — GPU work that must not run
@@ -4779,12 +5209,33 @@ class SaklasSession:
         self._invalidate_analytics_cache()
         return name
 
+    def _add_sae_probe(self, selector: str, *, as_name: str | None) -> str:
+        """Attach a resident SAE feature as a one-channel readout probe."""
+        raw_id = selector.split("/", 1)[1]
+        validated = self.validate_sae_feature(raw_id)
+        idx = int(validated["id"])
+        name = as_name if as_name is not None else f"sae/{idx}"
+        with self._model_exclusive(
+            "add_probe called while another model operation is in flight; retry shortly"
+        ):
+            self._sae_probes[name] = {
+                "feature_id": idx,
+                "layer": int(validated["layer"]),
+                "label": validated.get("label"),
+            }
+        self._invalidate_prefix_cache()
+        self._probe_hash_cache.pop(name, None)
+        self._invalidate_analytics_cache()
+        return name
+
     def remove_probe(self, name: str) -> None:
         """Detach a previously-attached probe (any shape)."""
         # ``getattr`` — spec'd mock stubs carry class attributes only.
         lens_probes = getattr(self, "_lens_probes", None)
         if lens_probes and name in lens_probes:
             del lens_probes[name]
+        elif getattr(self, "_sae_probes", None) and name in self._sae_probes:
+            del self._sae_probes[name]
         else:
             self._monitor.remove_probe(name)
         self._invalidate_prefix_cache()
@@ -4802,6 +5253,10 @@ class SaklasSession:
         for spec in self._lens_probes.values():
             out.update(spec["layers"])
         return out
+
+    @property
+    def sae_probe_names(self) -> list[str]:
+        return list(self._sae_probes)
 
     def _score_lens_probes(
         self,
@@ -5036,6 +5491,17 @@ class SaklasSession:
             ).hexdigest()
             self._probe_hash_cache[name] = digest
             return digest
+        sae_spec = self._sae_probes.get(name)
+        if sae_spec is not None:
+            import hashlib
+            info = self.sae_info or {}
+            digest = hashlib.sha256(repr((
+                "sae-readout-v1", self.model_id, info.get("fingerprint"),
+                info.get("release"), sae_spec["layer"],
+                sae_spec["feature_id"],
+            )).encode("utf-8")).hexdigest()
+            self._probe_hash_cache[name] = digest
+            return digest
         manifold = self._monitor.manifolds.get(name)
         if manifold is None:
             return None
@@ -5082,7 +5548,9 @@ class SaklasSession:
     def probe_hashes(self) -> dict[str, str]:
         """Return ``{probe_name: sha256_hex}`` for every registered probe."""
         out: dict[str, str] = {}
-        for name in (*self._monitor.probe_names, *self._lens_probes):
+        for name in (
+            *self._monitor.probe_names, *self._lens_probes, *self._sae_probes,
+        ):
             d = self._probe_hash(name)
             if d is not None:
                 out[name] = d
@@ -6528,6 +6996,7 @@ class SaklasSession:
                 # lens tokens per selected layer + the layer-aggregated
                 # chip list.
                 lens_step = self._live_lens_readout_step()
+                sae_step = self._live_sae_readout_step()
                 # Pinned lens probes tick on the same step (readings extracted
                 # from the display logits inside the readout step) — merge them
                 # into every populated probe channel so the loom row, trait
@@ -6541,6 +7010,15 @@ class SaklasSession:
                         ),
                         live=_wants_live_token_scores,
                     )
+                if sae_step is not None and self._last_sae_step_readings:
+                    payload.merge_readings(
+                        self._last_sae_step_readings,
+                        per_layer=(
+                            assistant_node_id is not None
+                            and _persists_layer_scores
+                        ),
+                        live=_wants_live_token_scores,
+                    )
                 scores = payload.scores
                 per_layer_payload = payload.per_layer_scores
                 self._last_token_probe_payload = payload.to_token_payload(
@@ -6548,6 +7026,7 @@ class SaklasSession:
                     lens_aggregate=(
                         lens_step[1] if lens_step is not None else None
                     ),
+                    sae=sae_step,
                 )
                 if assistant_node_id is not None and tid is not None:
                     token_row: dict[str, Any] = {
@@ -6626,6 +7105,11 @@ class SaklasSession:
                 getattr(self, "_live_lens", None) is not None
                 and on_token is not None
                 and getattr(on_token, "_saklas_wants_lens_readout", False)
+            )
+            _has_sae_consumer = bool(
+                getattr(self, "_live_sae", None) is not None
+                and on_token is not None
+                and getattr(on_token, "_saklas_wants_sae_readout", False)
             )
             _effective_tap = _token_tap if _need_tap else None
             _tap_has_text_consumer = bool(
@@ -6763,6 +7247,7 @@ class SaklasSession:
                 and self._monitor.probe_names
             )
             self._live_lens_active_for_generation = _has_lens_consumer
+            self._live_sae_active_for_generation = _has_sae_consumer
             self.events.emit(GenerationStarted(input=input, stateless=stateless))
             try:
                 # Capture attach + monitor live + ctx.reset live INSIDE the
@@ -6776,6 +7261,7 @@ class SaklasSession:
                     lean_per_token=lean_per_token,
                     final_probe_aggregate=return_probe_readings,
                     live_lens_active=_has_lens_consumer,
+                    live_sae_active=_has_sae_consumer,
                 )
                 self._monitor.begin_live()
                 # Reset the steering manager's TriggerContext for this gen;
@@ -6885,6 +7371,7 @@ class SaklasSession:
             self._active_gen_reservation = None
             self._last_token_probe_payload = None
             self._live_lens_active_for_generation = True
+            self._live_sae_active_for_generation = True
             # Reset capture state to the default (FULL, non-persistent) so the
             # next gen starts clean (finalize has already consumed the rows by
             # now). Belt-and-suspenders: ``_begin_capture`` resets it at gen start
@@ -7150,12 +7637,14 @@ class SaklasSession:
                 probe_readings=probe_readings, perplexity=perplexity,
                 lens_readout=payload.get("lens"),
                 lens_aggregate=payload.get("lens_aggregate"),
+                sae_readout=payload.get("sae"),
             )
             idx_counter[0] += 1
             q.put(event)
         _push_flags: Any = _push
         _push_flags._saklas_wants_live_scores = bool(live_scores)
         _push_flags._saklas_wants_lens_readout = True
+        _push_flags._saklas_wants_sae_readout = True
 
         def _worker():
             try:

@@ -14,6 +14,7 @@
     removeSubspaceFromRack,
     removeManifoldFromRack,
     removeJLensFromRack,
+    removeSaeFromRack,
   } from "../lib/stores.svelte";
   import type { InspectorTab } from "../lib/stores.svelte";
   import {
@@ -21,6 +22,7 @@
     formatSubspaceTerm,
     formatManifoldTerm,
     formatJLensTerm,
+    formatSaeTerm,
   } from "../lib/expression";
   import type { SteerEntry } from "../lib/types";
   import { pushToast } from "../lib/stores/toasts.svelte";
@@ -67,6 +69,16 @@
           order: 1,
           enabled: entry.enabled,
           remove: () => removeJLensFromRack(name),
+        };
+      case "sae":
+        return {
+          name,
+          text: formatSaeTerm(name, entry),
+          color: "var(--pillar-sae)",
+          tab: "sae",
+          order: 1,
+          enabled: entry.enabled,
+          remove: () => removeSaeFromRack(name),
         };
     }
   }

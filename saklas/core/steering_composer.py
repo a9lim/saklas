@@ -436,6 +436,15 @@ class SteeringComposer:
             )
             return profiles[registered]
 
+        # (1c) Reserved SAE namespace: ``sae/<integer>`` is the resident
+        # release's decoder row at its hook layer. It is a steering-only
+        # profile; feature probes use the encoder readout channel instead.
+        if canonical.startswith("sae/") and variant == "raw":
+            registered = self._session.register_sae_direction(
+                canonical.split("/", 1)[1]
+            )
+            return profiles[registered]
+
         # (2) Manifold first — native or previously ported.
         folded = self.try_fold_manifold(name)
         if folded is not None:
@@ -782,6 +791,25 @@ class SteeringComposer:
                 out.add(gate.probe)
         return out
 
+    def gated_sae_probe_keys(self) -> set[str]:
+        """Exact gate scalar keys referencing attached SAE feature probes."""
+        attached = set(getattr(self._session, "_sae_probes", None) or ())
+        if not attached:
+            return set()
+        out: set[str] = set()
+        for entry in self.flatten_steering_stack().values():
+            if isinstance(entry, (AblationTerm, ManifoldTerm)):
+                trig = entry.trigger
+            else:
+                _alpha, trig = entry
+            gate = trig.gate
+            if gate is None:
+                continue
+            name = re.split(r"[\[:@~]", gate.probe, maxsplit=1)[0]
+            if name in attached:
+                out.add(gate.probe)
+        return out
+
     def steering_active_in_prefill(self) -> bool:
         """Return True iff any active steering term fires during prompt prefill.
 
@@ -872,6 +900,7 @@ class SteeringComposer:
         # path (readout-channel strength), not through the Monitor —
         # detected once per generation here, merged into every return below.
         has_lens_gates = bool(self.gated_lens_probe_keys())
+        has_sae_gates = bool(self.gated_sae_probe_keys())
 
         def _monitor_scalars() -> dict[str, float]:
             incremental_readings = getattr(session, "_incremental_readings", [])
@@ -929,6 +958,10 @@ class SteeringComposer:
                 lens_scalars = session._score_lens_gate_scalars()
                 if lens_scalars:
                     out = {**out, **lens_scalars}
+            if has_sae_gates:
+                sae_scalars = session._score_sae_gate_scalars()
+                if sae_scalars:
+                    out = {**out, **sae_scalars}
             return out
 
         return _score

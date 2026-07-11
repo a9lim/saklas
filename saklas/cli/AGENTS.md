@@ -1,7 +1,7 @@
 # cli/
 
-Eight-verb root parser
-(`tui`/`serve`/`manifold`/`pack`/`experiment`/`config`/`template`/`lens`).
+Nine-verb root parser
+(`tui`/`serve`/`manifold`/`pack`/`experiment`/`config`/`template`/`lens`/`sae`).
 `manifold` is the
 unified compute surface (extract/generate/from-template/fit/bake/merge/transfer/
 compare/why); `pack` is the lifecycle/distribution verb (ls/show/install/search/

@@ -39,6 +39,8 @@ import type {
   ProbeRequest,
   RemoteManifoldInfo,
   ScoreTemplateResponse,
+  SaeLoadStatusJSON,
+  SaeTokenReadoutJSON,
   SessionInfo,
   TemplateDetail,
   TemplateSummary,
@@ -88,6 +90,8 @@ export type {
   ProbeRequest,
   RemoteManifoldInfo,
   ScoreTemplateResponse,
+  SaeLoadStatusJSON,
+  SaeTokenReadoutJSON,
   SessionInfo,
   TemplateDetail,
   TemplateSummary,
@@ -863,6 +867,56 @@ export const apiLens = {
   /** Poll the background lens fit's progress / error / completion. */
   fitStatus(id: string = SESSION): Promise<LensFitStatusJSON> {
     return request(`${SESSION_BASE(id)}/lens/fit`);
+  },
+};
+
+// ================================================= sparse autoencoder ==
+
+export const apiSae = {
+  releases(id: string = SESSION): Promise<{ releases: {
+    release: string; model?: string | null; layers: number[];
+    repo_id?: string | null; neuronpedia?: boolean;
+  }[] }> {
+    return request(`${SESSION_BASE(id)}/sae/releases`);
+  },
+  load(
+    body: { release: string; layer?: number | null },
+    id: string = SESSION,
+  ): Promise<SaeLoadStatusJSON> {
+    return request(`${SESSION_BASE(id)}/sae/load`, jsonBody(body));
+  },
+  loadStatus(id: string = SESSION): Promise<SaeLoadStatusJSON> {
+    return request(`${SESSION_BASE(id)}/sae/load`);
+  },
+  setLive(
+    body: { enabled: boolean; top_k?: number },
+    id: string = SESSION,
+  ): Promise<{ enabled: boolean; layer: number | null; top_k: number }> {
+    return request(`${SESSION_BASE(id)}/sae/live`, jsonBody(body));
+  },
+  validateFeature(
+    featureId: number,
+    id: string = SESSION,
+  ): Promise<{ id: number; label?: string | null; layer: number }> {
+    return request(
+      `${SESSION_BASE(id)}/sae/feature/validate`,
+      jsonBody({ id: featureId }),
+    );
+  },
+  tokenReadout(
+    nodeId: string,
+    rawIndex: number,
+    opts: { topK?: number; steered?: boolean; raw?: boolean } = {},
+    id: string = SESSION,
+  ): Promise<SaeTokenReadoutJSON> {
+    const params = new URLSearchParams({
+      node_id: nodeId,
+      raw_index: String(rawIndex),
+      top_k: String(opts.topK ?? 8),
+      steered: String(opts.steered ?? true),
+      raw: String(opts.raw ?? false),
+    });
+    return request(`${SESSION_BASE(id)}/sae/token-readout?${params}`);
   },
 };
 

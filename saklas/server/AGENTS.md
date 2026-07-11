@@ -25,6 +25,8 @@ those registrars import):
 - `traits_routes.register_traits_routes` — `/sessions/{id}/traits/stream` (SSE)
 - `lens_routes.register_lens_routes` — `/sessions/{id}/lens/*` (token readout +
   the live-lens toggle)
+- `sae_routes.register_sae_routes` — `/sessions/{id}/sae/*` (release discovery,
+  background load, live toggle, feature validation, token readout)
 - `ws_stream.register_ws_stream` — the `WS /sessions/{id}/stream` co-stream engine
 
 `server/sse.py`, `server/streaming.py`, and `server/ws_events.py` are the shared

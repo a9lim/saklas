@@ -21,6 +21,7 @@ import {
   apiProbes,
   apiManifolds,
   apiLens,
+  apiSae,
   apiTree,
   ApiError,
   connectWs,
@@ -39,6 +40,7 @@ import type {
   ChatTurn,
   GenStatus,
   JLensSteerEntry,
+  SaeSteerEntry,
   ManifoldSteerEntry,
   PendingAction,
   ProbeInfo,
@@ -98,6 +100,7 @@ export async function refreshSession(): Promise<void> {
     // session-side, so a page reload must not read as "off"/"on" while
     // the server disagrees).  Older servers omit the fields.
     lensState.layers = info.live_lens_layers ?? null;
+    saeState.live = info.live_sae ?? false;
     probesLiveState.enabled = info.live_probe_scores ?? true;
   } catch (e) {
     sessionState.error = e instanceof Error ? e.message : String(e);
@@ -150,6 +153,81 @@ export function setLensWorkspaceSortMode(mode: LensWorkspaceSortMode): void {
   lensState.workspaceSortMode = mode;
 }
 
+// ========================================================= live SAE ====
+
+export interface SaeState {
+  live: boolean;
+  readout: { id: number; activation: number; label?: string | null }[];
+  history: Map<number, number[]>;
+  busy: boolean;
+  loading: boolean;
+  loadMessage: string | null;
+  loadError: string | null;
+}
+
+export const saeState: SaeState = $state({
+  live: false,
+  readout: [],
+  history: new SvelteMap<number, number[]>(),
+  busy: false,
+  loading: false,
+  loadMessage: null,
+  loadError: null,
+});
+
+export async function setLiveSae(enabled: boolean): Promise<void> {
+  if (saeState.busy) return;
+  saeState.busy = true;
+  try {
+    const out = await apiSae.setLive({ enabled, top_k: 12 });
+    saeState.live = out.enabled;
+    if (!out.enabled) {
+      saeState.readout = [];
+      saeState.history.clear();
+    }
+  } catch (e) {
+    pushToast(
+      `live SAE ${enabled ? "enable" : "disable"} failed: ` +
+        (e instanceof Error ? e.message : String(e)),
+      { kind: "error" },
+    );
+  } finally {
+    saeState.busy = false;
+  }
+}
+
+async function pollSaeLoad(): Promise<void> {
+  for (;;) {
+    const status = await apiSae.loadStatus();
+    saeState.loading = status.running;
+    saeState.loadMessage = status.message;
+    saeState.loadError = status.error;
+    if (!status.running) {
+      await refreshSession();
+      if (!status.error && status.finished_at !== null) {
+        pushToast("SAE loaded", { kind: "info" });
+      }
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+}
+
+export async function loadSae(release: string): Promise<void> {
+  if (saeState.loading || !release.trim()) return;
+  try {
+    const status = await apiSae.load({ release: release.trim() });
+    saeState.loading = status.running;
+    saeState.loadMessage = status.message;
+    saeState.loadError = status.error;
+    await pollSaeLoad();
+  } catch (e) {
+    saeState.loading = false;
+    saeState.loadError = e instanceof Error ? e.message : String(e);
+    pushToast(`SAE load failed — ${saeState.loadError}`, { kind: "error" });
+  }
+}
+
 // ================================================== CAA live toggle ====
 
 /** CAA PROBE-section live toggle — whether per-token monitor scoring
@@ -184,8 +262,7 @@ export async function setLiveProbes(enabled: boolean): Promise<void> {
  *  presentational (each tab shows its own term/probe family):
  *    subspace — flat/affine fits (concept axes, personas)
  *    manifold — curved fits (emotions, months)
- *    sae      — feature space (runtime specced + deferred; the tab ships
- *               gated — docs/plans/sae-pillar.md)
+ *    sae      — resident sparse-autoencoder feature space
  *    lens     — the Jacobian-lens surface (JLensPanel) */
 export type InspectorTab = "subspace" | "manifold" | "sae" | "lens";
 
@@ -808,6 +885,51 @@ export function setJLensTrigger(name: string, trigger: Trigger): void {
   });
 }
 
+// -------------------------------------------------------- SAE mutators
+
+export const SAE_DEFAULT_ALPHA = 0.3;
+
+function mutateSae(
+  name: string,
+  fn: (entry: SaeSteerEntry) => SaeSteerEntry,
+): void {
+  const entry = steerRack.entries.get(name);
+  if (entry?.mode === "sae") steerRack.entries.set(name, fn(entry));
+}
+
+export function addSaeToRack(featureId: number): void {
+  const name = `sae/${featureId}`;
+  if (steerRack.entries.has(name)) return;
+  steerRack.entries.set(name, {
+    mode: "sae",
+    alpha: SAE_DEFAULT_ALPHA,
+    trigger: "BOTH",
+    enabled: true,
+  });
+}
+
+export function removeSaeFromRack(name: string): void {
+  steerRack.entries.delete(name);
+}
+
+export function setSaeAlpha(name: string, alpha: number): void {
+  enqueueOrApply(`SAE alpha ${name} ${alpha.toFixed(3)}`, () => {
+    mutateSae(name, (entry) => ({ ...entry, alpha }));
+  });
+}
+
+export function setSaeEnabled(name: string, enabled: boolean): void {
+  enqueueOrApply(`${enabled ? "enable" : "disable"} ${name}`, () => {
+    mutateSae(name, (entry) => ({ ...entry, enabled }));
+  });
+}
+
+export function setSaeTrigger(name: string, trigger: Trigger): void {
+  enqueueOrApply(`SAE trigger ${name} ${trigger}`, () => {
+    mutateSae(name, (entry) => ({ ...entry, trigger }));
+  });
+}
+
 export function setManifoldBlend(name: string, blend: number): void {
   enqueueOrApply(`manifold blend ${name} ${blend.toFixed(3)}`, () => {
     mutateManifold(name, (e) => ({ ...e, blend }));
@@ -916,7 +1038,7 @@ export const probeRack: ProbeRackState = $state({
  *  (axis 0 — mean band probability) for a J-lens token probe, the [0,1]
  *  subspace fraction for a curved (manifold) probe. */
 function _primaryScalar(info: ProbeInfo, reading: ProbeReadingJSON): number {
-  if (info.is_affine || info.lens) {
+  if (info.is_affine || info.lens || info.sae) {
     return reading.coords.length > 0 ? reading.coords[0] : 0;
   }
   return reading.fraction;
@@ -930,7 +1052,7 @@ function _primaryPerLayer(
   info: ProbeInfo,
   reading: ProbeReadingJSON,
 ): Record<string, number> {
-  if (!info.is_affine && !info.lens) return reading.fraction_per_layer ?? {};
+  if (!info.is_affine && !info.lens && !info.sae) return reading.fraction_per_layer ?? {};
   const out: Record<string, number> = {};
   for (const [layer, c] of Object.entries(reading.coords_per_layer ?? {})) {
     out[layer] = Array.isArray(c) && c.length > 0 ? c[0] : 0;
@@ -2519,6 +2641,14 @@ function handleWsMessage(msg: WSServerMessage): void {
           hist.push(frame);
           if (hist.length > MAX_SPARKLINE) hist.shift();
           lensState.aggHistory = hist;
+        }
+        if (msg.sae_readout) {
+          saeState.readout = msg.sae_readout;
+          for (const feature of msg.sae_readout) {
+            const prior = saeState.history.get(feature.id) ?? [];
+            const next = [...prior, feature.activation].slice(-MAX_SPARKLINE);
+            saeState.history.set(feature.id, next);
+          }
         }
       }
       return;
