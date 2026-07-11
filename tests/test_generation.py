@@ -1417,6 +1417,71 @@ def test_gate_only_without_final_probe_aggregate_narrows_capture_layers() -> Non
     assert session._capture_state.final_probe_aggregate is False
 
 
+def test_full_incremental_capture_deep_tail_only_for_readout_aggregate_layers() -> None:
+    class Capture:
+        def __init__(self) -> None:
+            self.attached: list[int] | None = None
+            self.tail_depth: int | None = None
+            self.tail_layers: set[int] | None = None
+
+        def clear(self) -> None:
+            pass
+
+        def attach(self, _layers: Any, layer_idxs: list[int]) -> None:
+            self.attached = list(layer_idxs)
+
+        def set_tail_with_sink(
+            self,
+            depth: int,
+            _sink: Any,
+            *,
+            tail_layers: set[int] | None = None,
+        ) -> None:
+            self.tail_depth = depth
+            self.tail_layers = set(tail_layers or set())
+
+    class Monitor:
+        probe_names = ["monitor"]
+
+        def probe_layers(self, names: set[str] | None = None) -> set[int]:
+            assert names is None
+            return {0, 1}
+
+        def reset_curved_feet(self) -> None:
+            pass
+
+        def enable_curved_warm(self, _enabled: bool) -> None:
+            pass
+
+    capture = Capture()
+    session: Any = SaklasSession.__new__(SaklasSession)
+    session._layers = [object()] * 8
+    session._monitor = Monitor()
+    session._capture = capture
+    session._capture_buffers = {}
+    session._compiled_clean_eligible = False
+    session._steering_uses_compiled_offsets = False
+    session._live_lens = None
+    session._lens_probes = {"jlens/g": {"layers": {3}}}
+    session._lens_probe_layers = lambda _names=None: {3}
+    session._live_sae = None
+    session._sae_probes = {"sae/5": {"feature_id": 5}}
+    session._sae_layer = 5
+    session._steering = SimpleNamespace(all_fast_path=lambda: True)
+
+    attached = SaklasSession._begin_capture(
+        session,
+        need_per_token=True,
+        final_probe_aggregate=True,
+    )
+
+    assert attached is True
+    assert capture.attached == [0, 1, 3, 5]
+    assert capture.tail_depth is not None and capture.tail_depth > 1
+    assert capture.tail_layers == {3, 5}
+    assert session._capture_state.mode is CaptureMode.INCREMENTAL
+
+
 def test_penalty_state_applies_sparse_counts_on_device():
     logits = torch.zeros(1, 8)
     state = _PenaltyState(max_tokens=4, device=logits.device, dtype=torch.float32)

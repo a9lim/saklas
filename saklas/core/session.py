@@ -5135,9 +5135,17 @@ class SaklasSession:
                 # When final probe aggregates are disabled, pinned J-lens/SAE
                 # probes still need the latest slice for gates/live consumers,
                 # but do not need the 8-deep EOS walk-back ring.
+                readout_tail_layers: set[int] | None = None
+                if final_probe_aggregate:
+                    readout_tail_layers = set()
+                    if lens_probes:
+                        readout_tail_layers.update(self._lens_probe_layers())
+                    if sae_probes and self._sae_layer is not None:
+                        readout_tail_layers.add(int(self._sae_layer))
                 self._capture.set_tail_with_sink(
                     _AGG_TAIL_DEPTH if final_probe_aggregate else 1,
                     _score_step,
+                    tail_layers=readout_tail_layers or None,
                 )
             else:
                 self._capture.set_incremental(_score_step)

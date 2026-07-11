@@ -113,6 +113,58 @@ def test_persistent_ingest_matches_transient_tail_ring():
             )
 
 
+def test_persistent_ingest_matches_transient_selective_tail_with_sink():
+    """Selective deep-tail layers must match on transient and persistent paths."""
+    n = 7
+    rows_t: list[dict[int, torch.Tensor]] = []
+    rows_p: list[dict[int, torch.Tensor]] = []
+
+    stack_t, clock_t = _toy_stack()
+    cap_t = HiddenCapture()
+    cap_t.attach(stack_t, list(_LAYERS))
+    cap_t.set_tail_with_sink(
+        3,
+        lambda latest: rows_t.append({
+            k: v.clone() for k, v in latest.items()
+        }),
+        tail_layers={2},
+    )
+    _drive(stack_t, clock_t, n, after=cap_t.fire_step_sink)
+
+    stack_p, clock_p = _toy_stack()
+    buffers, handles = install_persistent_capture_hooks(
+        stack_p, _D, torch.device("cpu"), torch.float32,
+    )
+    cap_p = HiddenCapture()
+    cap_p.attach_persistent(list(_LAYERS), buffers)
+    cap_p.set_tail_with_sink(
+        3,
+        lambda latest: rows_p.append({
+            k: v.clone() for k, v in latest.items()
+        }),
+        tail_layers={2},
+    )
+    try:
+        _drive(stack_p, clock_p, n, after=cap_p.ingest_persistent)
+    finally:
+        for h in handles:
+            h.remove()
+
+    assert [len(cap_t._per_layer[layer]) for layer in _LAYERS] == [1, 1, 3]
+    assert [len(cap_p._per_layer[layer]) for layer in _LAYERS] == [1, 1, 3]
+    assert len(rows_t) == len(rows_p) == n
+    for row_t, row_p in zip(rows_t, rows_p):
+        assert set(row_t) == set(row_p) == set(_LAYERS)
+        for layer in _LAYERS:
+            assert torch.equal(row_t[layer], row_p[layer])
+
+    for k in range(n):
+        slc_t = cap_t.tail_slice_at(k)
+        slc_p = cap_p.tail_slice_at(k)
+        assert set(slc_t) == set(slc_p) == {2}
+        assert torch.equal(slc_t[2], slc_p[2])
+
+
 def test_persistent_ingest_matches_transient_incremental_and_sink():
     """Length-1 incremental parity + step-sink rows fire identically."""
     n = 6

@@ -1085,6 +1085,43 @@ def test_aggregate_tail_clamps_when_walkback_exceeds_depth():
     assert set(pooled) == {0, 1}
 
 
+def test_tail_with_sink_can_keep_deep_tail_on_selected_layers_only():
+    import torch.nn as nn
+
+    from saklas.core.hooks import HiddenCapture
+
+    class _Pass(nn.Module):
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return x
+
+    layers = nn.ModuleList([_Pass(), _Pass(), _Pass()])
+    cap = HiddenCapture()
+    rows: list[dict[int, torch.Tensor]] = []
+    cap.attach(layers, [0, 1, 2])
+    cap.set_tail_with_sink(
+        3,
+        lambda latest: rows.append({
+            layer: row.clone() for layer, row in latest.items()
+        }),
+        tail_layers={2},
+    )
+
+    for step in range(5):
+        for layer in range(3):
+            value = torch.full((1, 1, 4), float(layer * 100 + step))
+            layers[layer](value)
+        cap.fire_step_sink()
+
+    assert [len(cap._per_layer[layer]) for layer in range(3)] == [1, 1, 3]
+    assert set(cap.latest_per_layer()) == {0, 1, 2}
+    assert len(rows) == 5
+    assert all(set(row) == {0, 1, 2} for row in rows)
+
+    pooled = cap.tail_slice_at(2)
+    assert set(pooled) == {2}
+    assert pooled[2][0].item() == pytest.approx(202.0)
+
+
 # ===== probe-inspector live-point subspace coords (gated stamping) =========
 
 def test_subspace_coords_gated_off_by_default():

@@ -85,6 +85,7 @@ class HiddenCapture:
         # per forward at the max layer) so ``tail_slice_at`` can map a
         # generated-token index to its ring slot.
         self._tail_depth: int = 1
+        self._tail_layers: frozenset[int] | None = None
         self._forward_count: int = 0
         # Persistent compile-clean capture source: when capture rides the
         # always-on pre-compile capture hooks (``install_persistent_capture_hooks``)
@@ -115,6 +116,7 @@ class HiddenCapture:
         self._step_sink = None
         self._max_layer = None
         self._tail_depth = 1
+        self._tail_layers = None
         self._forward_count = 0
         self._persistent_buffers = {}
         for idx in layer_indices:
@@ -125,7 +127,14 @@ class HiddenCapture:
                     h = output if isinstance(output, torch.Tensor) else output[0]
                     src = h[0, -1, :].detach()
                     if self._incremental:
-                        if self._tail_depth <= 1:
+                        keep_deep_tail = (
+                            self._tail_depth > 1
+                            and (
+                                self._tail_layers is None
+                                or layer_idx in self._tail_layers
+                            )
+                        )
+                        if not keep_deep_tail:
                             # Overwrite into a single preallocated (D,) buffer per
                             # layer — ``copy_`` the latest slice in instead of
                             # allocating a fresh clone every step, so the per-token
@@ -222,6 +231,7 @@ class HiddenCapture:
         """
         self._incremental = True
         self._tail_depth = 1
+        self._tail_layers = None
         self._step_sink = step_sink
         self._max_layer = max(self._per_layer) if self._per_layer else None
 
@@ -238,10 +248,15 @@ class HiddenCapture:
         self._incremental = True
         self._step_sink = None
         self._tail_depth = max(1, int(depth))
+        self._tail_layers = None
         self._max_layer = max(self._per_layer) if self._per_layer else None
 
     def set_tail_with_sink(
-        self, depth: int, step_sink: Callable[[dict[int, torch.Tensor]], None],
+        self,
+        depth: int,
+        step_sink: Callable[[dict[int, torch.Tensor]], None],
+        *,
+        tail_layers: set[int] | frozenset[int] | None = None,
     ) -> None:
         """Bounded-tail ring PLUS a per-token step sink (gating-subset / lean).
 
@@ -253,9 +268,17 @@ class HiddenCapture:
         :meth:`attach`'s ``_hook``).  Used by the GATING_SUBSET (gated-subset
         scalar scoring) and LEAN_INCREMENTAL (``coords_only`` per-token scoring)
         capture modes, both of which still pool the FULL roster once at finalize
-        from the retained ring.
+        from the retained ring. ``tail_layers`` optionally restricts the deep
+        ring to layers a final readout aggregate can consume; other layers stay
+        length-1 latest-slice buffers and are omitted from
+        :meth:`tail_slice_at`.
         """
         self.set_aggregate_tail(depth)
+        self._tail_layers = (
+            frozenset(int(layer) for layer in tail_layers)
+            if tail_layers is not None
+            else None
+        )
         self._step_sink = step_sink
 
     def attach_persistent(
@@ -280,6 +303,7 @@ class HiddenCapture:
         self._step_sink = None
         self._max_layer = None
         self._tail_depth = 1
+        self._tail_layers = None
         self._forward_count = 0
         self._persistent_buffers = {
             idx: buffers[idx] for idx in layer_indices if idx in buffers
@@ -306,7 +330,14 @@ class HiddenCapture:
             if src is None:
                 continue
             if self._incremental:
-                if self._tail_depth <= 1:
+                keep_deep_tail = (
+                    self._tail_depth > 1
+                    and (
+                        self._tail_layers is None
+                        or idx in self._tail_layers
+                    )
+                )
+                if not keep_deep_tail:
                     # Length-1 overwrite: clone once, then ``copy_`` the latest
                     # persistent slice in each step (zero steady-state allocation,
                     # bucket stays length-1 so ``[-1]`` reads the latest).
@@ -344,6 +375,7 @@ class HiddenCapture:
         self._step_sink = None
         self._max_layer = None
         self._tail_depth = 1
+        self._tail_layers = None
         self._forward_count = 0
         self._batch_forward_count = 0
         self._persistent_buffers = {}
@@ -363,6 +395,8 @@ class HiddenCapture:
         F = self._forward_count
         for idx, bucket in self._per_layer.items():
             if not bucket:
+                continue
+            if self._tail_layers is not None and idx not in self._tail_layers:
                 continue
             start = F - len(bucket)            # forward index of bucket[0]
             pos = forward_index - start
