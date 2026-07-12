@@ -50,7 +50,7 @@ def register_sae_routes(app: FastAPI) -> None:
 
     @app.get("/saklas/v1/sessions/{session_id}/sae/releases")
     async def sae_releases(session_id: str):
-        resolve_session_id(session, session_id)
+        resolve_session_id(session_id)
         from saklas.core.sae import list_sae_releases
 
         try:
@@ -62,7 +62,7 @@ def register_sae_routes(app: FastAPI) -> None:
 
     @app.post("/saklas/v1/sessions/{session_id}/sae/load", status_code=202)
     async def sae_load(session_id: str, body: SaeLoadRequest):
-        resolve_session_id(session, session_id)
+        resolve_session_id(session_id)
         if app.state.sae_load["running"]:
             raise HTTPException(409, "an SAE load is already running")
         state = app.state.sae_load
@@ -105,12 +105,12 @@ def register_sae_routes(app: FastAPI) -> None:
 
     @app.get("/saklas/v1/sessions/{session_id}/sae/load")
     def sae_load_status(session_id: str):
-        resolve_session_id(session, session_id)
+        resolve_session_id(session_id)
         return _status()
 
     @app.delete("/saklas/v1/sessions/{session_id}/sae/load")
     async def sae_unload(session_id: str):
-        resolve_session_id(session, session_id)
+        resolve_session_id(session_id)
         async with acquire_session_lock(session) as acquired:
             if not acquired:
                 raise HTTPException(503, "session locked")
@@ -119,7 +119,7 @@ def register_sae_routes(app: FastAPI) -> None:
 
     @app.post("/saklas/v1/sessions/{session_id}/sae/live")
     async def sae_live(session_id: str, body: SaeLiveRequest):
-        resolve_session_id(session, session_id)
+        resolve_session_id(session_id)
         async with acquire_session_lock(session) as acquired:
             if not acquired:
                 raise HTTPException(503, "session locked")
@@ -135,7 +135,7 @@ def register_sae_routes(app: FastAPI) -> None:
 
     @app.post("/saklas/v1/sessions/{session_id}/sae/feature/validate")
     def sae_feature_validate(session_id: str, body: SaeFeatureRequest):
-        resolve_session_id(session, session_id)
+        resolve_session_id(session_id)
         try:
             return session.validate_sae_feature(body.id)
         except SaklasError as exc:
@@ -151,7 +151,7 @@ def register_sae_routes(app: FastAPI) -> None:
         use), so it deliberately does not take the session lock, mirroring
         feature validation.
         """
-        resolve_session_id(session, session_id)
+        resolve_session_id(session_id)
         if any(feature_id < 0 for feature_id in body.ids):
             raise HTTPException(400, "feature ids must be non-negative")
         try:
@@ -172,7 +172,7 @@ def register_sae_routes(app: FastAPI) -> None:
         steered: bool = True,
         raw: bool = False,
     ):
-        resolve_session_id(session, session_id)
+        resolve_session_id(session_id)
         async with acquire_session_lock(session) as acquired:
             if not acquired:
                 raise HTTPException(503, "session locked")

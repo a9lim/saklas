@@ -41,7 +41,7 @@ def register_tree_routes(app: FastAPI) -> None:
         their state from this on bootstrap and reconcile via the WS
         ``tree_mutated`` delta stream after.
         """
-        resolve_session_id(session, session_id)
+        resolve_session_id(session_id)
         return tree_to_json(session)
 
     @app.get("/saklas/v1/sessions/{session_id}/tree/active")
@@ -52,7 +52,7 @@ def register_tree_routes(app: FastAPI) -> None:
         currently-rendered conversation. The node-id list is parallel to
         ``messages`` so a click on message ``i`` maps to ``node_ids[i]``.
         """
-        resolve_session_id(session, session_id)
+        resolve_session_id(session_id)
         return active_path_json(session)
 
     @app.post("/saklas/v1/sessions/{session_id}/tree/navigate")
@@ -63,7 +63,7 @@ def register_tree_routes(app: FastAPI) -> None:
         invariant in the plan): the gen continues attached to its
         original target, the user simply sees a different active path.
         """
-        resolve_session_id(session, session_id)
+        resolve_session_id(session_id)
         session.tree.navigate(req.node_id)
         return active_path_json(session)
 
@@ -75,7 +75,7 @@ def register_tree_routes(app: FastAPI) -> None:
         generation (mapped via ``SaklasError.user_message``); 404 on
         unknown id; 400 on root-edit or other invalid ops.
         """
-        resolve_session_id(session, session_id)
+        resolve_session_id(session_id)
         session.tree.edit(req.node_id, req.text)
         return node_json(session, req.node_id)
 
@@ -89,7 +89,7 @@ def register_tree_routes(app: FastAPI) -> None:
         the new node and (if it became active) re-render the chat
         without a follow-up fetch.
         """
-        resolve_session_id(session, session_id)
+        resolve_session_id(session_id)
         # Cast role through the Literal-narrowing layer the tree owns.
         role_arg = req.role
         new_id = session.tree.branch(
@@ -112,7 +112,7 @@ def register_tree_routes(app: FastAPI) -> None:
         the new ``active_node_id`` on the mutation event.  Returns
         ``{removed: <count>}``.
         """
-        resolve_session_id(session, session_id)
+        resolve_session_id(session_id)
         removed = session.tree.delete_subtree(node_id)
         return {"removed": removed}
 
@@ -122,7 +122,7 @@ def register_tree_routes(app: FastAPI) -> None:
 
         Decoration-only; never raises a concurrency conflict.
         """
-        resolve_session_id(session, session_id)
+        resolve_session_id(session_id)
         session.tree.star(req.node_id, req.on)
         return node_json(session, req.node_id)
 
@@ -132,7 +132,7 @@ def register_tree_routes(app: FastAPI) -> None:
 
         Decoration-only; never raises a concurrency conflict.
         """
-        resolve_session_id(session, session_id)
+        resolve_session_id(session_id)
         session.tree.annotate(req.node_id, req.text)
         return node_json(session, req.node_id)
 
@@ -144,7 +144,7 @@ def register_tree_routes(app: FastAPI) -> None:
         the ``op="cast"`` ``tree_mutated`` frame — this endpoint is the
         cheap standalone read.
         """
-        resolve_session_id(session, session_id)
+        resolve_session_id(session_id)
         return {
             "cast": {
                 label: member.to_dict()
@@ -160,7 +160,7 @@ def register_tree_routes(app: FastAPI) -> None:
         syntax up front (400 via ``SaklasError.user_message`` on either).
         Decoration-tier — never a concurrency conflict.
         """
-        resolve_session_id(session, session_id)
+        resolve_session_id(session_id)
         member = session.set_cast_member(
             label,
             steering=req.steering,
@@ -175,7 +175,7 @@ def register_tree_routes(app: FastAPI) -> None:
     )
     async def tree_cast_delete(session_id: str, label: str):
         """Drop the cast member under ``label`` (no-op when absent)."""
-        resolve_session_id(session, session_id)
+        resolve_session_id(session_id)
         session.remove_cast_member(label)
         return None
 
@@ -188,7 +188,7 @@ def register_tree_routes(app: FastAPI) -> None:
         race the gen path because the gen path owns the streaming target
         in the tree itself).
         """
-        resolve_session_id(session, session_id)
+        resolve_session_id(session_id)
         async with acquire_session_lock(session) as acquired:
             if not acquired:
                 raise HTTPException(503, "session locked")
@@ -206,7 +206,7 @@ def register_tree_routes(app: FastAPI) -> None:
         """
         from saklas.core.transcript import Transcript
 
-        resolve_session_id(session, session_id)
+        resolve_session_id(session_id)
         leaf = req.node_id if req.node_id is not None else session.tree.active_node_id
         # Validate the id before touching the renderer so the 404 lands
         # cleanly through the existing ``SaklasError`` handler.
@@ -236,7 +236,7 @@ def register_tree_routes(app: FastAPI) -> None:
             TranscriptFormatError,
         )
 
-        resolve_session_id(session, session_id)
+        resolve_session_id(session_id)
         mode = req.mode or "default"
         if mode not in ("default", "here", "merge"):
             raise HTTPException(
@@ -292,7 +292,7 @@ def register_tree_routes(app: FastAPI) -> None:
         """
         from saklas.core.loom_diff import steering_delta
 
-        resolve_session_id(session, session_id)
+        resolve_session_id(session_id)
         parent = session.tree.get(parent_id)
         child = session.tree.get(child_id)
         parent_expr = parent.applied_steering
@@ -314,7 +314,7 @@ def register_tree_routes(app: FastAPI) -> None:
         """
         from saklas.core.tree_filter import FilterParseError
 
-        resolve_session_id(session, session_id)
+        resolve_session_id(session_id)
         text = (expr or "").strip()
         if not text:
             return {"expr": "", "matching_node_ids": []}
@@ -337,7 +337,7 @@ def register_tree_routes(app: FastAPI) -> None:
         """
         from saklas.core.loom_diff import per_token_diff, steering_delta
 
-        resolve_session_id(session, session_id)
+        resolve_session_id(session_id)
         diff = session.diff_nodes(req.a_id, req.b_id)
         a_node = session.tree.get(req.a_id)
         b_node = session.tree.get(req.b_id)
@@ -455,7 +455,7 @@ def register_tree_routes(app: FastAPI) -> None:
             reorient_for_request,
         )
 
-        resolve_session_id(session, session_id)
+        resolve_session_id(session_id)
         if req.a_id == req.b_id:
             raise HTTPException(400, "a_id and b_id must differ")
         if req.a_id not in session.tree.nodes:

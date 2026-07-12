@@ -22,7 +22,7 @@ def register_traits_routes(app: FastAPI) -> None:
     @app.get("/saklas/v1/sessions/{session_id}/traits/stream")
     async def traits_stream(session_id: str, request: Request):
         """SSE endpoint streaming per-token probe scores during generation."""
-        resolve_session_id(session, session_id)
+        resolve_session_id(session_id)
 
         loop = asyncio.get_running_loop()
         trait_queue: asyncio.Queue[Any] = asyncio.Queue()

@@ -4,27 +4,12 @@ from __future__ import annotations
 
 from fastapi import HTTPException
 
-from saklas.core.session import SaklasSession
-from saklas.io.paths import safe_model_id
-
-
 SINGLE_SESSION_ID = "default"
 
 
-def session_aliases(session: SaklasSession) -> list[str]:
-    aliases = [SINGLE_SESSION_ID]
-    model_id = str(session.model_id)
-    if model_id not in aliases:
-        aliases.append(model_id)
-    safe_id = safe_model_id(model_id)
-    if safe_id not in aliases:
-        aliases.append(safe_id)
-    return aliases
-
-
-def resolve_session_id(session: SaklasSession, session_id: str) -> None:
+def resolve_session_id(session_id: str) -> None:
     """Raise 404 if ``session_id`` doesn't map to the single live session."""
-    if session_id in session_aliases(session):
+    if session_id == SINGLE_SESSION_ID:
         return
     raise HTTPException(
         status_code=404,

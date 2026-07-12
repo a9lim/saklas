@@ -149,14 +149,15 @@ class TestSessions:
             resp = client.get("/saklas/v1/sessions/default")
         assert resp.status_code == 200
         data = resp.json()
-        assert "test__model" in data["aliases"]
+        assert "aliases" not in data
 
-    def test_get_by_safe_model_alias(self, session_and_client: Any) -> None:
+    def test_safe_model_id_is_not_a_session_alias(
+        self, session_and_client: Any,
+    ) -> None:
         _, client = session_and_client
         with patch("saklas.server.session_models.supports_thinking", return_value=False):
             resp = client.get("/saklas/v1/sessions/test__model")
-        assert resp.status_code == 200
-        assert resp.json()["model_id"] == "test/model"
+        assert resp.status_code == 404
 
     def test_get_not_found(self, session_and_client: Any) -> None:
         _, client = session_and_client

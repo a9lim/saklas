@@ -120,8 +120,7 @@ bodies and serializers live beside their route groups:
 - `experiment_models.py` — experiment request bodies.
 
 URL paths carry `{session_id}` for a multi-session shape, but the impl is
-single-session: the one session has id `"default"`, and the loaded model id also
-resolves to it; everything else 404s.
+single-session: the one session has exactly id `"default"`; everything else 404s.
 
 **SSE error-frame scrubbing (info-disclosure discipline).** Long-running SSE
 workers (`/extract`, manifold `generate` / `fit`) must NOT surface raw `str(e)`

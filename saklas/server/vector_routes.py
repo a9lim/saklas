@@ -36,7 +36,7 @@ def register_vector_routes(app: FastAPI) -> None:
 
     @app.get("/saklas/v1/sessions/{session_id}/vectors")
     def list_vectors(session_id: str):
-        resolve_session_id(session, session_id)
+        resolve_session_id(session_id)
         return {
             "vectors": [
                 profile_to_json(name, profile)
@@ -86,7 +86,7 @@ def register_vector_routes(app: FastAPI) -> None:
         wins the routing match — Starlette matches in registration order
         and ``pairwise`` would otherwise be swallowed by ``{name}``.
         """
-        resolve_session_id(session, session_id)
+        resolve_session_id(session_id)
 
         # CPU snapshots only (cached, built once under the exclusive-GPU lock)
         # so this endpoint never issues an MPS->CPU copy on its threadpool
@@ -201,7 +201,7 @@ def register_vector_routes(app: FastAPI) -> None:
 
     @app.get("/saklas/v1/sessions/{session_id}/vectors/{name}")
     def get_vector(session_id: str, name: str):
-        resolve_session_id(session, session_id)
+        resolve_session_id(session_id)
         vectors = session.vectors
         if name not in vectors:
             raise HTTPException(404, f"vector '{name}' not found")
@@ -227,7 +227,7 @@ def register_vector_routes(app: FastAPI) -> None:
         server-side so the client doesn't have to ship full per-layer
         tensors over the wire.
         """
-        resolve_session_id(session, session_id)
+        resolve_session_id(session_id)
 
         # Read-side pool of **CPU snapshots**, one per direction (a steering
         # vector wins a same-named probe, matching the historical dedup).
@@ -336,7 +336,7 @@ def register_vector_routes(app: FastAPI) -> None:
 
     @app.delete("/saklas/v1/sessions/{session_id}/vectors/{name}", status_code=204)
     def delete_vector(session_id: str, name: str):
-        resolve_session_id(session, session_id)
+        resolve_session_id(session_id)
         if name not in session.vectors:
             raise HTTPException(404, f"vector '{name}' not found")
         session.unsteer(name)
@@ -353,7 +353,7 @@ def register_vector_routes(app: FastAPI) -> None:
 
     @app.post("/saklas/v1/sessions/{session_id}/extract")
     async def extract_vector(session_id: str, req: ExtractRequest, request: Request):
-        resolve_session_id(session, session_id)
+        resolve_session_id(session_id)
 
         def _run(on_progress: ProgressCallback) -> tuple[str, Any]:
             return session.extract(
@@ -410,7 +410,7 @@ def register_vector_routes(app: FastAPI) -> None:
         from saklas.core.manifold import load_manifold
         from saklas.core.vectors import folded_vector_directions
         from saklas.server.manifold_routes import _refuse_if_busy
-        resolve_session_id(session, session_id)
+        resolve_session_id(session_id)
 
         async with acquire_session_lock(session) as acquired:
             if not acquired:
@@ -461,7 +461,7 @@ def register_vector_routes(app: FastAPI) -> None:
             summarize_diagnostics,
         )
 
-        resolve_session_id(session, session_id)
+        resolve_session_id(session_id)
         # Probes and steering vectors share the per-layer ``dict[int,
         # Tensor]`` direction shape but live in different registries —
         # session.vectors holds steering profiles; a vector probe lives as a

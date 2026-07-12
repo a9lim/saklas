@@ -146,7 +146,7 @@ def register_lens_routes(app: FastAPI) -> None:
         engine boundaries, so this is an early UX check rather than a bypass
         of the core invariant.
         """
-        resolve_session_id(session, session_id)
+        resolve_session_id(session_id)
         word = body.word.strip()
         if not word:
             raise HTTPException(400, "word must not be empty")
@@ -176,7 +176,7 @@ def register_lens_routes(app: FastAPI) -> None:
         the node.  ``layers`` restricts the readout (csv or workspace/sample/all);
         default is the fitted workspace band.
         """
-        resolve_session_id(session, session_id)
+        resolve_session_id(session_id)
         req_layers = _parse_layers(layers) or "workspace"
         if not 1 <= top_k <= 50:
             raise HTTPException(400, "top_k must be in [1, 50]")
@@ -246,7 +246,7 @@ def register_lens_routes(app: FastAPI) -> None:
         generations started after the call — the toggle waits on the
         session lock, so it never races an in-flight stream.
         """
-        resolve_session_id(session, session_id)
+        resolve_session_id(session_id)
         if not 1 <= body.top_k <= 50:
             raise HTTPException(400, "top_k must be in [1, 50]")
         async with acquire_session_lock(session) as acquired:
@@ -353,7 +353,7 @@ def register_lens_routes(app: FastAPI) -> None:
         attempted while it runs fail with the ordinary busy error.  A
         matching interrupted fit resumes from its last checkpoint.
         """
-        resolve_session_id(session, session_id)
+        resolve_session_id(session_id)
         body = body or LensFitRequest()
         source_layers = _parse_layers(body.layers) or "workspace"
         if source_layers == "sample":
@@ -384,13 +384,13 @@ def register_lens_routes(app: FastAPI) -> None:
     @app.get("/saklas/v1/sessions/{session_id}/lens/fit")
     async def lens_fit_status(session_id: str):
         """Poll the background lens fit (progress / error / completion)."""
-        resolve_session_id(session, session_id)
+        resolve_session_id(session_id)
         return _fit_status_payload()
 
     @app.delete("/saklas/v1/sessions/{session_id}/lens/fit", status_code=202)
     async def lens_fit_cancel(session_id: str):
         """Request cooperative cancellation at the next prompt boundary."""
-        resolve_session_id(session, session_id)
+        resolve_session_id(session_id)
         st = app.state.lens_fit
         event = app.state.lens_fit_cancel
         if not st["running"] or event is None:

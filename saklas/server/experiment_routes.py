@@ -19,7 +19,7 @@ def register_experiment_routes(app: FastAPI) -> None:
     @app.post("/saklas/v1/sessions/{session_id}/experiments/fan")
     async def run_experiment_fan(session_id: str, req: ExperimentFanRequest):
         """Run an alpha grid as loom siblings and return a RunSet summary."""
-        resolve_session_id(session, session_id)
+        resolve_session_id(session_id)
 
         if not req.grid:
             raise HTTPException(400, "grid must be non-empty")

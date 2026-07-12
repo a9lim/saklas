@@ -10,7 +10,6 @@ from pydantic import BaseModel
 from saklas.core.generation import supports_thinking, thinking_is_optional
 from saklas.core.session import SaklasSession
 from saklas.core.steering import Steering
-from saklas.server.native_common import session_aliases
 
 
 class CreateSessionRequest(BaseModel):
@@ -182,7 +181,6 @@ def session_info(
         jlens_fitted = False
     return {
         "id": "default",
-        "aliases": session_aliases(session),
         "model_id": session.model_id,
         "device": device,
         "dtype": dtype,

@@ -151,7 +151,7 @@ def register_probe_routes(app: FastAPI) -> None:
 
     @app.get("/saklas/v1/sessions/{session_id}/probes")
     def list_probes(session_id: str):
-        resolve_session_id(session, session_id)
+        resolve_session_id(session_id)
         try:
             attached = session.monitor.attached_probes()
         except Exception:
@@ -179,7 +179,7 @@ def register_probe_routes(app: FastAPI) -> None:
         """
         from saklas.server.app import acquire_session_lock
 
-        resolve_session_id(session, session_id)
+        resolve_session_id(session_id)
         async with acquire_session_lock(session) as acquired:
             if not acquired:
                 raise HTTPException(503, "session locked")
@@ -188,7 +188,7 @@ def register_probe_routes(app: FastAPI) -> None:
 
     @app.get("/saklas/v1/sessions/{session_id}/probes/defaults")
     def list_default_probes(session_id: str):
-        resolve_session_id(session, session_id)
+        resolve_session_id(session_id)
         return {"defaults": load_default_manifolds()}
 
     @app.get("/saklas/v1/sessions/{session_id}/probes/{name:path}/geometry")
@@ -201,7 +201,7 @@ def register_probe_routes(app: FastAPI) -> None:
         ``subspace_coords_per_layer``) overlays directly.  ``defaults`` is
         registered before this greedy ``{name:path}`` route so it still resolves.
         """
-        resolve_session_id(session, session_id)
+        resolve_session_id(session_id)
         try:
             return session.monitor.probe_geometry(name)
         except KeyError as e:
@@ -209,7 +209,7 @@ def register_probe_routes(app: FastAPI) -> None:
 
     @app.post("/saklas/v1/sessions/{session_id}/probes", status_code=201)
     def add_probe(session_id: str, req: ProbeRequest):
-        resolve_session_id(session, session_id)
+        resolve_session_id(session_id)
         if not req.selector or not req.selector.strip():
             raise HTTPException(400, "selector must not be empty")
         top_n = req.top_n if req.top_n and req.top_n > 0 else 3
@@ -244,7 +244,7 @@ def register_probe_routes(app: FastAPI) -> None:
         "/saklas/v1/sessions/{session_id}/probes/{name:path}", status_code=204,
     )
     def remove_probe(session_id: str, name: str):
-        resolve_session_id(session, session_id)
+        resolve_session_id(session_id)
         if (
             name not in session.monitor.probe_names
             and name not in _lens_probe_specs(session)

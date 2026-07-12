@@ -44,7 +44,6 @@ export interface SamplingFields {
 
 export interface SessionInfo {
   id: string;
-  aliases?: string[];
   model_id: string;
   device: string;
   dtype: string;
