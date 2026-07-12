@@ -45,6 +45,38 @@ class _StopTokenizer:
         return "".join(pieces)
 
 
+def _complete_finalizer_session(session: Any) -> None:
+    """Install the current finalizer collaborator roster on a narrow stub."""
+    if not hasattr(session, "_lens_probes"):
+        session._lens_probes = {}
+    if not hasattr(session, "_sae_probes"):
+        session._sae_probes = {}
+    session._scene_grammar = None
+    session._scene_grammar_resolved = True
+
+
+class _CurrentSessionStub(SaklasSession):
+    """Narrow current-shape session whose lens is supplied in memory."""
+
+    @property
+    def jlens(self) -> Any:
+        return self._jlens
+
+
+def _complete_capture_session(session: Any) -> None:
+    """Install the current capture collaborator roster on a narrow stub."""
+    if not hasattr(session, "_lens_probes"):
+        session._lens_probes = {}
+    if not hasattr(session, "_sae_probes"):
+        session._sae_probes = {}
+    if not hasattr(session, "_live_sae"):
+        session._live_sae = None
+    session._jlens = (
+        object() if session._live_lens is not None or session._lens_probes else None
+    )
+    session._jlens_identity = None
+
+
 class _EchoTokenizer:
     """Minimal tokenizer: encodes text to a tensor of its char codes."""
 
@@ -62,7 +94,7 @@ def _decode_echo(ids: torch.Tensor) -> str:
 
 
 def test_prepare_generation_uses_session_thinking_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    session: Any = SaklasSession.__new__(SaklasSession)
+    session: Any = _CurrentSessionStub.__new__(_CurrentSessionStub)
     session._profiles = {}
     session._tokenizer = object()
     session._default_return_top_k = 0
@@ -95,7 +127,7 @@ def test_prepare_input_raw_feeds_flat_active_path():
     a1 = tree.begin_assistant(u1)
     tree.finalize_assistant(a1, text="time")
 
-    session: Any = SaklasSession.__new__(SaklasSession)
+    session: Any = _CurrentSessionStub.__new__(_CurrentSessionStub)
     session._tokenizer = _EchoTokenizer()
     session._device = torch.device("cpu")
     session.tree = tree
@@ -187,7 +219,7 @@ def test_stop_sequence_trimmed_text_is_final_result_text():
     assert state.response_text == "Hello"
     assert state.response_aggregate_index == 0
 
-    session: Any = SaklasSession.__new__(SaklasSession)
+    session: Any = _CurrentSessionStub.__new__(_CurrentSessionStub)
     session._gen_state = state
     session._tokenizer = tokenizer
     session._monitor = SimpleNamespace(probe_names=[])
@@ -197,6 +229,7 @@ def test_stop_sequence_trimmed_text_is_final_result_text():
     session._last_result = None
     session.build_readings = lambda: {}
 
+    _complete_finalizer_session(session)
     result = SaklasSession._finalize_generation(
         session,
         generated_ids,
@@ -256,7 +289,7 @@ def test_stop_sequence_probe_aggregate_uses_visible_endpoint():
 
         probe_names = ["toy"]
 
-    session: Any = SaklasSession.__new__(SaklasSession)
+    session: Any = _CurrentSessionStub.__new__(_CurrentSessionStub)
     session._gen_state = state
     session._tokenizer = tokenizer
     session._monitor = Monitor()
@@ -268,6 +301,7 @@ def test_stop_sequence_probe_aggregate_uses_visible_endpoint():
     session.events = SimpleNamespace(emit=lambda _event: None)
     session.build_readings = lambda: {}
 
+    _complete_finalizer_session(session)
     result = SaklasSession._finalize_generation(
         session,
         generated_ids,
@@ -359,7 +393,7 @@ def test_finalize_reuses_scored_probe_aggregate() -> None:
     state = GenerationState()
     state.finish_reason = "length"
 
-    session: Any = SaklasSession.__new__(SaklasSession)
+    session: Any = _CurrentSessionStub.__new__(_CurrentSessionStub)
     session._gen_state = state
     session._tokenizer = _StopTokenizer()
     session._monitor = Monitor()
@@ -370,6 +404,7 @@ def test_finalize_reuses_scored_probe_aggregate() -> None:
     session.events = SimpleNamespace(emit=lambda _event: None)
     session.build_readings = lambda: {}
 
+    _complete_finalizer_session(session)
     result = SaklasSession._finalize_generation(
         session,
         [0, 1],
@@ -392,7 +427,7 @@ def test_generate_stream_exposes_current_result() -> None:
         kwargs["on_token"]("ok", False, 7, None, None, None)
         return result
 
-    session: Any = SaklasSession.__new__(SaklasSession)
+    session: Any = _CurrentSessionStub.__new__(_CurrentSessionStub)
     session._gen_state = GenerationState()
     session._monitor = SimpleNamespace(probe_names=[])
     session._last_token_probe_payload = {}
@@ -411,7 +446,7 @@ def test_generate_stream_live_readouts_false_suppresses_readout_flags() -> None:
     reading = ProbeReading(0.0, [], coords=(0.7,))
     flags: dict[str, bool] = {}
 
-    session: Any = SaklasSession.__new__(SaklasSession)
+    session: Any = _CurrentSessionStub.__new__(_CurrentSessionStub)
 
     def _fake_generate_core(*_args: Any, **kwargs: Any) -> GenerationResult:
         on_token = kwargs["on_token"]
@@ -454,7 +489,7 @@ def test_token_tap_skips_unconsumed_live_readout_helpers_and_empty_payload(
     import saklas.core.token_payloads as token_payloads
     from saklas.core.triggers import TriggerContext
 
-    session: Any = SaklasSession.__new__(SaklasSession)
+    session: Any = _CurrentSessionStub.__new__(_CurrentSessionStub)
     session._gen_lock = threading.Lock()
     session._gen_phase = GenState.IDLE
     session._gen_state = GenerationState()
@@ -615,7 +650,7 @@ def test_finalize_incremental_probe_path_does_not_stack_capture() -> None:
     state = GenerationState()
     state.finish_reason = "length"
 
-    session: Any = SaklasSession.__new__(SaklasSession)
+    session: Any = _CurrentSessionStub.__new__(_CurrentSessionStub)
     session._gen_state = state
     session._tokenizer = _StopTokenizer()
     session._monitor = Monitor()
@@ -630,6 +665,7 @@ def test_finalize_incremental_probe_path_does_not_stack_capture() -> None:
     session.events = SimpleNamespace(emit=lambda _event: None)
     session.build_readings = lambda: {}
 
+    _complete_finalizer_session(session)
     result = SaklasSession._finalize_generation(
         session,
         [0, 1],
@@ -710,7 +746,7 @@ def test_finalize_lean_incremental_probe_path() -> None:
     state = GenerationState()
     state.finish_reason = "length"
 
-    session: Any = SaklasSession.__new__(SaklasSession)
+    session: Any = _CurrentSessionStub.__new__(_CurrentSessionStub)
     session._gen_state = state
     session._tokenizer = _StopTokenizer()
     session._monitor = monitor
@@ -725,6 +761,7 @@ def test_finalize_lean_incremental_probe_path() -> None:
     session.events = SimpleNamespace(emit=lambda _event: None)
     session.build_readings = lambda: {}
 
+    _complete_finalizer_session(session)
     result = SaklasSession._finalize_generation(
         session,
         [0, 1],
@@ -791,7 +828,7 @@ def test_finalize_gating_subset_probe_path() -> None:
     state = GenerationState()
     state.finish_reason = "length"
 
-    session: Any = SaklasSession.__new__(SaklasSession)
+    session: Any = _CurrentSessionStub.__new__(_CurrentSessionStub)
     session._gen_state = state
     session._tokenizer = _StopTokenizer()
     session._monitor = monitor
@@ -808,6 +845,7 @@ def test_finalize_gating_subset_probe_path() -> None:
     session.events = SimpleNamespace(emit=lambda _event: None)
     session.build_readings = lambda: {}
 
+    _complete_finalizer_session(session)
     result = SaklasSession._finalize_generation(
         session,
         [0, 1],
@@ -878,7 +916,7 @@ def test_finalize_reuses_one_aggregate_pool_for_monitor_lens_and_sae() -> None:
     state = GenerationState()
     state.finish_reason = "length"
 
-    session: Any = SaklasSession.__new__(SaklasSession)
+    session: Any = _CurrentSessionStub.__new__(_CurrentSessionStub)
     session._gen_state = state
     session._tokenizer = _StopTokenizer()
     session._monitor = Monitor()
@@ -894,6 +932,7 @@ def test_finalize_reuses_one_aggregate_pool_for_monitor_lens_and_sae() -> None:
     session._last_per_token_scores = None
     session.events = SimpleNamespace(emit=lambda _event: None)
 
+    _complete_finalizer_session(session)
     result = SaklasSession._finalize_generation(
         session,
         [0, 1],
@@ -1122,7 +1161,7 @@ def test_stateless_zero_token_probe_result_does_not_use_history() -> None:
     state = GenerationState()
     state.finish_reason = "length"
 
-    session: Any = SaklasSession.__new__(SaklasSession)
+    session: Any = _CurrentSessionStub.__new__(_CurrentSessionStub)
     session._gen_state = state
     session._tokenizer = _StopTokenizer()
     session._monitor = Monitor()
@@ -1135,6 +1174,7 @@ def test_stateless_zero_token_probe_result_does_not_use_history() -> None:
         "toy": SimpleNamespace(mean=(42.0,), to_dict=lambda: {})
     }
 
+    _complete_finalizer_session(session)
     result = SaklasSession._finalize_generation(
         session,
         [],
@@ -1158,7 +1198,7 @@ def test_return_probe_readings_false_skips_probe_finalization() -> None:
     state = GenerationState()
     state.finish_reason = "length"
 
-    session: Any = SaklasSession.__new__(SaklasSession)
+    session: Any = _CurrentSessionStub.__new__(_CurrentSessionStub)
     session._gen_state = state
     session._tokenizer = _StopTokenizer()
     session._monitor = Monitor()
@@ -1179,6 +1219,7 @@ def test_return_probe_readings_false_skips_probe_finalization() -> None:
         (_ for _ in ()).throw(AssertionError("sae finalization disabled"))
     )
 
+    _complete_finalizer_session(session)
     result = SaklasSession._finalize_generation(
         session,
         [0],
@@ -1216,7 +1257,7 @@ def test_lens_only_without_final_probe_aggregate_keeps_latest_tail() -> None:
             pass
 
     capture = Capture()
-    session: Any = SaklasSession.__new__(SaklasSession)
+    session: Any = _CurrentSessionStub.__new__(_CurrentSessionStub)
     session._layers = [object()] * 8
     session._monitor = Monitor()
     session._capture = capture
@@ -1229,6 +1270,7 @@ def test_lens_only_without_final_probe_aggregate_keeps_latest_tail() -> None:
     session._sae_probes = {}
     session._steering = SimpleNamespace(all_fast_path=lambda: True)
 
+    _complete_capture_session(session)
     SaklasSession._begin_capture(
         session,
         need_per_token=False,
@@ -1257,7 +1299,7 @@ def test_dormant_lens_probe_without_final_aggregate_does_not_attach_capture() ->
             return set()
 
     capture = Capture()
-    session: Any = SaklasSession.__new__(SaklasSession)
+    session: Any = _CurrentSessionStub.__new__(_CurrentSessionStub)
     session._layers = [object()] * 8
     session._monitor = Monitor()
     session._capture = capture
@@ -1266,6 +1308,7 @@ def test_dormant_lens_probe_without_final_aggregate_does_not_attach_capture() ->
     session._live_sae = None
     session._sae_probes = {}
 
+    _complete_capture_session(session)
     attached = SaklasSession._begin_capture(
         session,
         need_per_token=False,
@@ -1302,7 +1345,7 @@ def test_lens_gate_without_final_aggregate_attaches_gated_probe_layers() -> None
             pass
 
     capture = Capture()
-    session: Any = SaklasSession.__new__(SaklasSession)
+    session: Any = _CurrentSessionStub.__new__(_CurrentSessionStub)
     session._layers = [object()] * 8
     session._monitor = Monitor()
     session._capture = capture
@@ -1318,6 +1361,7 @@ def test_lens_gate_without_final_aggregate_attaches_gated_probe_layers() -> None
     session._sae_probes = {}
     session._steering = SimpleNamespace(all_fast_path=lambda: True)
 
+    _complete_capture_session(session)
     attached = SaklasSession._begin_capture(
         session,
         need_per_token=False,
@@ -1355,7 +1399,7 @@ def test_sae_only_without_final_probe_aggregate_keeps_latest_tail() -> None:
             pass
 
     capture = Capture()
-    session: Any = SaklasSession.__new__(SaklasSession)
+    session: Any = _CurrentSessionStub.__new__(_CurrentSessionStub)
     session._layers = [object()] * 8
     session._monitor = Monitor()
     session._capture = capture
@@ -1368,6 +1412,7 @@ def test_sae_only_without_final_probe_aggregate_keeps_latest_tail() -> None:
     session._sae_probes = {}
     session._steering = SimpleNamespace(all_fast_path=lambda: True)
 
+    _complete_capture_session(session)
     SaklasSession._begin_capture(
         session,
         need_per_token=False,
@@ -1396,7 +1441,7 @@ def test_dormant_sae_probe_without_final_aggregate_does_not_attach_capture() -> 
             return set()
 
     capture = Capture()
-    session: Any = SaklasSession.__new__(SaklasSession)
+    session: Any = _CurrentSessionStub.__new__(_CurrentSessionStub)
     session._layers = [object()] * 8
     session._monitor = Monitor()
     session._capture = capture
@@ -1406,6 +1451,7 @@ def test_dormant_sae_probe_without_final_aggregate_does_not_attach_capture() -> 
     session._sae_probes = {"sae/0": {"feature_id": 0}}
     session._sae_layer = 5
 
+    _complete_capture_session(session)
     attached = SaklasSession._begin_capture(
         session,
         need_per_token=False,
@@ -1442,7 +1488,7 @@ def test_sae_gate_without_final_aggregate_attaches_sae_layer() -> None:
             pass
 
     capture = Capture()
-    session: Any = SaklasSession.__new__(SaklasSession)
+    session: Any = _CurrentSessionStub.__new__(_CurrentSessionStub)
     session._layers = [object()] * 8
     session._monitor = Monitor()
     session._capture = capture
@@ -1456,6 +1502,7 @@ def test_sae_gate_without_final_aggregate_attaches_sae_layer() -> None:
     session._sae_layer = 5
     session._steering = SimpleNamespace(all_fast_path=lambda: True)
 
+    _complete_capture_session(session)
     attached = SaklasSession._begin_capture(
         session,
         need_per_token=False,
@@ -1483,7 +1530,7 @@ def test_monitor_probe_without_final_aggregate_and_no_per_token_skips_capture() 
             raise AssertionError("dormant monitor probes should not widen capture")
 
     capture = Capture()
-    session: Any = SaklasSession.__new__(SaklasSession)
+    session: Any = _CurrentSessionStub.__new__(_CurrentSessionStub)
     session._layers = [object()] * 8
     session._monitor = Monitor()
     session._capture = capture
@@ -1493,6 +1540,7 @@ def test_monitor_probe_without_final_aggregate_and_no_per_token_skips_capture() 
     session._sae_probes = {}
     session._sae_layer = None
 
+    _complete_capture_session(session)
     attached = SaklasSession._begin_capture(
         session,
         need_per_token=False,
@@ -1535,7 +1583,7 @@ def test_monitor_probe_final_aggregate_still_attaches_capture() -> None:
 
     capture = Capture()
     monitor = Monitor()
-    session: Any = SaklasSession.__new__(SaklasSession)
+    session: Any = _CurrentSessionStub.__new__(_CurrentSessionStub)
     session._layers = [object()] * 8
     session._monitor = monitor
     session._capture = capture
@@ -1549,6 +1597,7 @@ def test_monitor_probe_final_aggregate_still_attaches_capture() -> None:
     session._sae_layer = None
     session._steering = SimpleNamespace(all_fast_path=lambda: True)
 
+    _complete_capture_session(session)
     attached = SaklasSession._begin_capture(
         session,
         need_per_token=False,
@@ -1617,7 +1666,7 @@ def test_gate_only_without_final_probe_aggregate_narrows_capture_layers() -> Non
 
     capture = Capture()
     monitor = Monitor()
-    session: Any = SaklasSession.__new__(SaklasSession)
+    session: Any = _CurrentSessionStub.__new__(_CurrentSessionStub)
     session._layers = [object()] * 8
     session._monitor = monitor
     session._capture = capture
@@ -1626,6 +1675,7 @@ def test_gate_only_without_final_probe_aggregate_narrows_capture_layers() -> Non
     session._steering_uses_compiled_offsets = False
     session._live_lens = None
 
+    _complete_capture_session(session)
     SaklasSession._begin_capture(
         session,
         need_per_token=True,
@@ -1700,7 +1750,7 @@ def test_gate_only_capture_reuses_preplanned_gate_scalars() -> None:
 
     capture = Capture()
     monitor = Monitor()
-    session: Any = SaklasSession.__new__(SaklasSession)
+    session: Any = _CurrentSessionStub.__new__(_CurrentSessionStub)
     session._layers = [object()] * 8
     session._monitor = monitor
     session._capture = capture
@@ -1714,6 +1764,7 @@ def test_gate_only_capture_reuses_preplanned_gate_scalars() -> None:
     session._sae_layer = None
     session._steering = SimpleNamespace(all_fast_path=lambda: True)
 
+    _complete_capture_session(session)
     SaklasSession._begin_capture(
         session,
         need_per_token=True,
@@ -1766,7 +1817,7 @@ def test_full_incremental_capture_deep_tail_only_for_readout_aggregate_layers() 
             pass
 
     capture = Capture()
-    session: Any = SaklasSession.__new__(SaklasSession)
+    session: Any = _CurrentSessionStub.__new__(_CurrentSessionStub)
     session._layers = [object()] * 8
     session._monitor = Monitor()
     session._capture = capture
@@ -1781,6 +1832,7 @@ def test_full_incremental_capture_deep_tail_only_for_readout_aggregate_layers() 
     session._sae_layer = 5
     session._steering = SimpleNamespace(all_fast_path=lambda: True)
 
+    _complete_capture_session(session)
     attached = SaklasSession._begin_capture(
         session,
         need_per_token=True,

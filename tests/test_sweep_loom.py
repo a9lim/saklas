@@ -71,6 +71,10 @@ class _SweepStub:
             applied_steering=str(steering) if steering else None,
         )
 
+    def _generate_sweep_fast(self, *_args: Any, **_kwargs: Any) -> None:
+        """This current-shape stub deliberately declines the batch fast path."""
+        return None
+
 
 def test_sweep_lands_siblings_under_user_turn():
     from saklas.core.session import SaklasSession

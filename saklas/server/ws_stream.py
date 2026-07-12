@@ -81,9 +81,7 @@ def register_ws_stream(app: FastAPI) -> None:
         reader_task = asyncio.create_task(_reader())
 
         # Loom: subscribe to ``LoomMutated`` for the connection's
-        # lifetime and forward as ``tree_mutated`` frames.  Also tag
-        # ``begin_assistant`` events into ``node_created`` so the client
-        # can pre-allocate render slots before token frames arrive.  Held
+        # lifetime and forward exact ``tree_mutated`` frames. Held
         # in a queue + forwarder task so the EventBus callback (which
         # runs on the gen thread) never touches the WS directly.
         loop = asyncio.get_running_loop()
@@ -140,25 +138,6 @@ def register_ws_stream(app: FastAPI) -> None:
                 except Exception:
                     mutated_payload["cast"] = {}
             _queue_tree_event(mutated_payload)
-            # ``begin_assistant`` and ``branch`` both materialize a new
-            # node — surface a separate ``node_created`` event with the
-            # parent + role so the client can allocate a render slot
-            # without waiting for the assistant text to start streaming.
-            if event.op in ("begin_assistant", "branch", "add_user"):
-                for nid in event.added:
-                    try:
-                        node = session.tree.get(nid)
-                    except Exception:
-                        continue
-                    node_payload = {
-                        "type": "node_created",
-                        "node_id": nid,
-                        "parent_id": node.parent_id,
-                        "role": node.role,
-                        "rev": event.rev,
-                    }
-                    _queue_tree_event(node_payload)
-
         loom_unsub = session.events.subscribe(_on_loom_event)
 
         async def _tree_forwarder():
@@ -291,7 +270,7 @@ async def _ws_handle_generate(
     (per decision 7 in the plan — N-way gen is serial in v1).  Each
     sibling produces its own ``started`` / token-stream / ``done``
     triplet, all tagged with the assistant node id.  ``tree_mutated``
-    and ``node_created`` events ride the connection-level subscription
+    events ride the connection-level subscription
     in ``session_stream``; this handler only emits the per-sibling
     ``started`` / ``token`` / ``done`` frames.
     """
@@ -746,17 +725,18 @@ async def _ws_handle_generate(
                 # rather than continuing with stale state.
                 return
 
-            result = result_holder[0] if result_holder else None
+            if not result_holder:
+                raise RuntimeError("generation completed without a result")
+            result = result_holder[0]
             result_json = result_to_json(result)
-            if result is not None:
-                # The settled per-probe aggregate rides the ``done`` event in
-                # the same rich shape as each token frame.  Shared with the
-                # SSE / NDJSON finalization via ``probe_reading_aggregate``
-                # (result-parameterized so each n>1 sibling scores its own
-                # result).
-                mf_readings = probe_reading_aggregate(session, result)
-                if mf_readings:
-                    result_json["probe_readings"] = mf_readings
+            # The settled per-probe aggregate rides the ``done`` event in
+            # the same rich shape as each token frame.  Shared with the
+            # SSE / NDJSON finalization via ``probe_reading_aggregate``
+            # (result-parameterized so each n>1 sibling scores its own
+            # result).
+            mf_readings = probe_reading_aggregate(session, result)
+            if mf_readings:
+                result_json["probe_readings"] = mf_readings
             # Phase 1 logit pass: stamp the per-turn logprob rollup on the
             # ``done`` event so subscribers (loom sidebar's sort-by-surprise,
             # webui chat-header summary) don't need to re-fetch the node.
@@ -768,16 +748,9 @@ async def _ws_handle_generate(
             mean_surprise_out: float | None = None
             finalized_node_id = current_node_holder[0]
             if finalized_node_id is not None:
-                try:
-                    node = session.tree.nodes.get(finalized_node_id)
-                    if node is not None:
-                        mean_logprob_out = node.mean_logprob
-                        mean_surprise_out = node.mean_surprise
-                except Exception:
-                    # Defensive: tree access during shutdown / mocked
-                    # session edge cases. Default-None values keep the
-                    # wire payload well-formed.
-                    pass
+                node = session.tree.get(finalized_node_id)
+                mean_logprob_out = node.mean_logprob
+                mean_surprise_out = node.mean_surprise
             result_json["mean_logprob"] = mean_logprob_out
             result_json["mean_surprise"] = mean_surprise_out
             await send_json({

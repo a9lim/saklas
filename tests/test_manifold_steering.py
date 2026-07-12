@@ -74,7 +74,7 @@ def _manifold(layers: Sequence[int] = (0, 1)) -> Manifold:
     domain = BoxDomain([BoxAxis("t", periodic=True, period=1.0)])
     node_coords = torch.tensor([[i / 6] for i in range(6)])
     node_params = domain.embed(node_coords)
-    return Manifold(
+    manifold = Manifold(
         name="mood",
         domain=domain,
         node_labels=[f"n{i}" for i in range(6)],
@@ -85,6 +85,7 @@ def _manifold(layers: Sequence[int] = (0, 1)) -> Manifold:
         },
         feature_space="raw",
     )
+    return _stamp_current_geometry(manifold)
 
 
 def _manifold_open(layers: Sequence[int] = (0, 1)) -> Manifold:
@@ -97,7 +98,7 @@ def _manifold_open(layers: Sequence[int] = (0, 1)) -> Manifold:
     domain = BoxDomain([BoxAxis("t", periodic=False, lo=0.0, hi=1.0)])
     node_coords = torch.tensor([[i / 6] for i in range(6)])
     node_params = domain.embed(node_coords)
-    return Manifold(
+    manifold = Manifold(
         name="mood_open",
         domain=domain,
         node_labels=[f"n{i}" for i in range(6)],
@@ -108,6 +109,7 @@ def _manifold_open(layers: Sequence[int] = (0, 1)) -> Manifold:
         },
         feature_space="raw",
     )
+    return _stamp_current_geometry(manifold)
 
 
 def _manifold2d(layers: Sequence[int] = (0,)) -> Manifold:
@@ -121,7 +123,7 @@ def _manifold2d(layers: Sequence[int] = (0,)) -> Manifold:
     )
     node_params = domain.embed(coords)
     torch.manual_seed(7)
-    return Manifold(
+    manifold = Manifold(
         name="disk",
         domain=domain,
         node_labels=[f"n{i}" for i in range(9)],
@@ -132,6 +134,29 @@ def _manifold2d(layers: Sequence[int] = (0,)) -> Manifold:
         },
         feature_space="raw",
     )
+    return _stamp_current_geometry(manifold)
+
+
+def _stamp_current_geometry(manifold: Manifold) -> Manifold:
+    """Give a synthetic fitted manifold the bakes current artifacts require."""
+    manifold.mahalanobis_share = _euclidean_shares(manifold)
+    manifold.origin = {
+        layer: torch.zeros(manifold.domain.intrinsic_dim)
+        for layer in manifold.layers
+    }
+    manifold.node_roles = [None] * len(manifold.node_labels)
+    manifold.node_kinds = [None] * len(manifold.node_labels)
+    for sub in manifold.layers.values():
+        if sub.is_affine or sub.node_params is None:
+            continue
+        sub.sigma_rbf_weights = torch.zeros(
+            (sub.node_params.shape[0], 1), dtype=sub.basis.dtype,
+        )
+        sub.sigma_poly_coeffs = torch.zeros(
+            (sub.node_params.shape[1] + 1, 1), dtype=sub.basis.dtype,
+        )
+        sub.sigma_poly_coeffs[0, 0] = -20.0
+    return manifold
 
 
 def _model_layers(n: int) -> nn.ModuleList:
@@ -448,7 +473,7 @@ def test_manager_share_weighting_weights_by_centroid_spread():
     domain = BoxDomain([BoxAxis("t", periodic=False, lo=0.0, hi=1.0)])
     node_coords = torch.tensor([[i / 6] for i in range(6)])
     node_params = domain.embed(node_coords)
-    manifold = Manifold(
+    manifold = _stamp_current_geometry(Manifold(
         name="mood",
         domain=domain,
         node_labels=[f"n{i}" for i in range(6)],
@@ -458,7 +483,7 @@ def test_manager_share_weighting_weights_by_centroid_spread():
             1: fit_layer_subspace_only(_circle(6, _DIM, scale=2.0), node_params),
         },
         feature_space="raw",
-    )
+    ))
     user_along = 0.15
     mgr = SteeringManager()
     mgr.add_manifold("mood", manifold, position=(0.5,), along=user_along, onto=0.0)
@@ -529,20 +554,18 @@ def test_manifold_shares_use_baked_when_full_coverage():
     assert shares != pytest.approx(_euclidean_shares(manifold))
 
 
-def test_manifold_shares_fall_back_to_euclidean_when_no_baked():
+def test_manifold_shares_reject_missing_bake():
     manifold = _manifold(layers=(0, 1))
-    assert manifold.mahalanobis_share == {}
-    assert _manifold_layer_shares(manifold) == pytest.approx(
-        _euclidean_shares(manifold)
-    )
+    manifold.mahalanobis_share = {}
+    with pytest.raises(ValueError, match="non-canonical Mahalanobis shares"):
+        _manifold_layer_shares(manifold)
 
 
-def test_manifold_shares_fall_back_when_partial_baked_coverage():
+def test_manifold_shares_reject_partial_baked_coverage():
     manifold = _manifold(layers=(0, 1))
-    manifold.mahalanobis_share = {0: 1.0}  # layer 1 missing → partial
-    assert _manifold_layer_shares(manifold) == pytest.approx(
-        _euclidean_shares(manifold)
-    )
+    manifold.mahalanobis_share = {0: 1.0}
+    with pytest.raises(ValueError, match="missing=\\[1\\]"):
+        _manifold_layer_shares(manifold)
 
 
 def test_manager_rejects_overlapping_manifolds():

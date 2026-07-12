@@ -1112,13 +1112,13 @@ rebake). `transfer_manifold` (`io/manifold_lifecycle.py`, with the pure-tensor c
 `core/manifold.py::transfer_manifold_subspaces`) maps a fitted manifold's points
 and mean through `A_L` while basis directions use `M_L`, then QR-orthonormalizes
 the mapped basis and transforms every affine/RBF reduced coefficient by the exact
-companion map. A collapsed span is rejected; a curved scalar sigma field is
-cleared when transfer makes its thickness anisotropic. It re-bakes the
+companion map. A collapsed span is rejected; curved transfer is rejected when
+the companion map would make its scalar tube thickness anisotropic. It re-bakes the
 Mahalanobis **share** in target space (same whitener
-requirement; no lever — it's gone), clears `origin` (per-layer foot of the
-*source* neutral), and writes the
+requirement; no lever — it's gone), transforms each curved neutral-foot
+`origin` through the same companion map, and writes the
 `_from-<safe_src>` variant. Since a vector is a 2-node `pca` manifold, `manifold
-transfer` routes to this one transfer path. Alignment cache v4 stores each
+transfer` routes to this one transfer path. Alignment cache v5 stores each
 layer's linear map as two rank-sized factors plus translation in an immutable
 shard under the *target* model dir. The atomic pointer's identity and every
 declared header are checked before selective payload materialization; selected

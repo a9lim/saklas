@@ -1433,6 +1433,10 @@ export const chatLog: ChatLogState = $state({
 // projection of its active path; token deltas enrich that projection.
 
 export interface LoomTreeState {
+  tree_format: number | null;
+  saklas_version: string | null;
+  session_id: string | null;
+  name: string | null;
   root_id: string | null;
   active_node_id: string | null;
   /** Per-node cache.  SvelteMap so ``set``/``delete`` trigger reactivity
@@ -1443,7 +1447,7 @@ export interface LoomTreeState {
   /** Monotonic revision cursor.  0 means no tree has been fetched yet. */
   rev: number;
   /** Pending in-flight gen target id (when known).  Reflects the
-   *  ``started`` / ``node_created`` event's ``node_id`` field; null
+   *  ``started`` / ``tree_mutated`` event node identity; null
    *  between gens. */
   pendingNodeId: string | null;
   /** Cached active path as an ordered list of node ids.  Recomputed on
@@ -1457,6 +1461,10 @@ export interface LoomTreeState {
 }
 
 export const loomTree: LoomTreeState = $state({
+  tree_format: null,
+  saklas_version: null,
+  session_id: null,
+  name: null,
   root_id: null,
   active_node_id: null,
   nodes: new SvelteMap(),
@@ -1504,7 +1512,7 @@ function recomputeActivePath(): void {
  *  / fork affordances behave the same way. */
 function tokenRowToScore(row: NonNullable<LoomNodeJSON["tokens"]>[number]): TokenScore {
   const out: TokenScore = {
-    text: row.text ?? "",
+    text: row.text,
     thinking: false,
   };
   if (row.token_id !== undefined) out.tokenId = row.token_id;
@@ -1525,8 +1533,8 @@ function tokenRowToScore(row: NonNullable<LoomNodeJSON["tokens"]>[number]): Toke
 function nodeToTurn(n: LoomNodeJSON): ChatTurn {
   const turn: ChatTurn = {
     role: n.role,
-    text: n.text ?? "",
-    roleLabel: n.role_label ?? null,
+    text: n.text,
+    roleLabel: n.role_label,
     nodeId: n.id,
     appliedSteering: n.applied_steering ?? null,
     aggregateReadings: n.aggregate_readings ?? undefined,
@@ -1555,23 +1563,6 @@ function nodeToTurn(n: LoomNodeJSON): ChatTurn {
   }
   return turn;
 }
-
-/** Per-node cache of streamed per-token score data.
- *
- *  The loom tree (``LoomNodeJSON``) carries no per-token probe scores —
- *  only aggregate readings.  ``syncChatLogFromTree`` rebuilds
- *  ``chatLog.turns`` from the tree on every navigation, so without this
- *  cache the inline highlight tint vanishes the moment you navigate away
- *  from a branch and back (the rebuilt turn has no ``tokens``).
- *
- *  Keyed by node id (ULIDs are unique per node, so a regenerated node
- *  never collides with a cached predecessor).  Plain Map — it holds the
- *  same token-array references the turns already use, no reactivity
- *  needed. */
-const tokenScoreCache = new Map<
-  string,
-  { tokens?: TokenScore[]; thinkingTokens?: TokenScore[] }
->();
 
 function attachChild(parentId: string | null, childId: string): void {
   if (parentId === null) return;
@@ -1610,21 +1601,6 @@ function syncChatLogFromTree(): void {
     chatLog.pendingIndex = null;
     return;
   }
-  // Harvest per-token score data from the turns we're about to drop, so
-  // navigating away from a branch and back can restore the inline
-  // highlight (the tree itself carries no per-token scores).
-  for (const t of chatLog.turns) {
-    if (
-      t.nodeId &&
-      ((t.tokens?.length ?? 0) > 0 || (t.thinkingTokens?.length ?? 0) > 0)
-    ) {
-      tokenScoreCache.set(t.nodeId, {
-        tokens: t.tokens,
-        thinkingTokens: t.thinkingTokens,
-      });
-    }
-  }
-
   const out: ChatTurn[] = [];
   let pendingIdx: number | null = null;
   for (const nid of path) {
@@ -1635,20 +1611,16 @@ function syncChatLogFromTree(): void {
     if (node.parent_id === null && node.role === "system" && !node.text) continue;
     // Try to keep the existing turn object if it already represents this
     // node (token-stream preservation for the live target).
-    const prevByNode = chatLog.turns.find((t) => t.nodeId === nid);
-    const prev = prevByNode ?? chatLog.turns[out.length];
+    const prev = chatLog.turns.find((t) => t.nodeId === nid);
     let turn: ChatTurn;
     if (
       prev &&
       prev.role === node.role &&
-      (prev.nodeId === nid ||
-        // Same text or live-stream-of-text on the active in-flight turn.
-        prev.text === node.text ||
-        (loomTree.pendingNodeId === nid && prev.role === "assistant"))
+      prev.nodeId === nid
     ) {
       // Mutate-in-place so the streaming token arrays survive.
       prev.nodeId = nid;
-      const nextText = node.text ?? "";
+      const nextText = node.text;
       if (
         !(
           loomTree.pendingNodeId === nid &&
@@ -1661,37 +1633,18 @@ function syncChatLogFromTree(): void {
       prev.appliedSteering = node.applied_steering ?? prev.appliedSteering ?? null;
       prev.aggregateReadings = node.aggregate_readings ?? prev.aggregateReadings;
       prev.finishReason = node.finish_reason ?? prev.finishReason;
-      // Restore per-token scores if this reused turn lost them
-      // (positional fallback from a different node, or first-paint
-      // hydration from a localStorage snapshot that pre-dates the
-      // per-token persistence).  Server-shipped node tokens win over
-      // the in-memory cache — they're authoritative and include the
-      // ``probes`` + ``per_layer_scores`` the cache may not have.
+      // Server-shipped node tokens are authoritative. Preserve the live
+      // arrays only until the finalized node snapshot carries them.
       if ((prev.tokens?.length ?? 0) === 0) {
         const fromNode = nodeToTurn(node);
         if (fromNode.tokens || fromNode.thinkingTokens) {
           prev.tokens = fromNode.tokens;
           prev.thinkingTokens = fromNode.thinkingTokens;
-        } else {
-          const cached = tokenScoreCache.get(nid);
-          if (cached) {
-            prev.tokens = cached.tokens;
-            prev.thinkingTokens = cached.thinkingTokens;
-          }
         }
       }
       turn = prev;
     } else {
       turn = nodeToTurn(node);
-      // Cache fallback for branch nav across nodes the server hasn't
-      // serialized with tokens (legacy / transcript-loaded).
-      if (!turn.tokens && !turn.thinkingTokens) {
-        const cached = tokenScoreCache.get(nid);
-        if (cached) {
-          turn.tokens = cached.tokens;
-          turn.thinkingTokens = cached.thinkingTokens;
-        }
-      }
     }
     if (loomTree.pendingNodeId === nid) pendingIdx = out.length;
     out.push(turn);
@@ -1702,10 +1655,14 @@ function syncChatLogFromTree(): void {
 
 /** Replace the in-memory tree with a current server snapshot. */
 function applyTreeSnapshot(snap: LoomTreeJSON): void {
+  loomTree.tree_format = snap.tree_format;
+  loomTree.saklas_version = snap.saklas_version;
+  loomTree.session_id = snap.session_id;
+  loomTree.name = snap.name;
   loomTree.root_id = snap.root_id;
   loomTree.active_node_id = snap.active_node_id;
   loomTree.rev = snap.rev;
-  loomTree.modelId = snap.model_id ?? loomTree.modelId;
+  loomTree.modelId = snap.model_id;
   loomTree.error = null;
   loomTree.nodes.clear();
   for (const n of snap.nodes) loomTree.nodes.set(n.id, n);
@@ -1713,7 +1670,7 @@ function applyTreeSnapshot(snap: LoomTreeJSON): void {
   for (const [pid, ids] of Object.entries(snap.children_of)) {
     loomTree.children_of.set(pid, [...ids]);
   }
-  castState.roster = snap.cast ?? {};
+  castState.roster = snap.cast;
   recomputeActivePath();
   syncChatLogFromTree();
 }
@@ -2496,25 +2453,15 @@ function _currentWriteTurn(): ChatTurn | null {
 
 /** Bind an in-flight token stream to a concrete loom assistant node.
  *
- * The server cannot always include the assistant node id on ``started``:
- * the node is created inside generation.  ``node_created`` and ``token``
- * events do carry it, so this reconciles the active path lazily and
- * ensures the next token has a writable ChatTurn. */
+ * The tree mutation that creates the node is ordered before its first token;
+ * this binds the stream to that already-authoritative node. */
 function adoptStreamingNode(nodeId: string | null | undefined): void {
   if (!nodeId || abState.processingAb || loomTree.rev <= 0) return;
   loomTree.pendingNodeId = nodeId;
   if (!loomTree.nodes.has(nodeId)) {
-    const active = loomTree.active_node_id;
-    const activeNode = active ? loomTree.nodes.get(active) : null;
-    const parentId =
-      activeNode?.role === "user" ? active : (activeNode?.parent_id ?? active ?? null);
-    loomTree.nodes.set(nodeId, {
-      id: nodeId,
-      parent_id: parentId,
-      role: "assistant",
-      text: "",
-    });
-    attachChild(parentId, nodeId);
+    loomTree.error = `Token arrived before authoritative node ${nodeId}`;
+    pushToast(loomTree.error, { kind: "error" });
+    return;
   }
   loomTree.active_node_id = nodeId;
   recomputeActivePath();
@@ -2543,32 +2490,6 @@ function handleWsMessage(msg: WSServerMessage): void {
       // Apply the delta; on rev gap, full re-fetch.
       const ok = applyTreeDelta(msg);
       if (!ok) void refreshLoomTree();
-      return;
-    }
-    case "node_created": {
-      // Pre-allocate the node so n-way regen render slots exist before
-      // token events tagged with this node_id arrive.  The full node body
-      // lands via a ``tree_mutated`` (added) event — which the server's
-      // forwarder actually enqueues *before* this ``node_created``.  So
-      // merge over any node already in hand rather than replacing it: a
-      // bare ``node_created`` payload omits ``role_label`` (among other
-      // fields), and ``upsertLoomNode`` is a full replace — a blind
-      // overwrite would wipe a custom role glyph back to the structural
-      // letter (U/A) until the next full-tree refetch (e.g. on click).
-      const existing = loomTree.nodes.get(msg.node_id);
-      upsertLoomNode({
-        ...existing,
-        id: msg.node_id,
-        parent_id: msg.parent_id,
-        role: msg.role,
-        text: existing?.text ?? "",
-      });
-      if (msg.role === "assistant" && genStatus.active && !abState.processingAb) {
-        adoptStreamingNode(msg.node_id);
-      } else if (loomTree.rev > 0 && loomTree.active_node_id === msg.node_id) {
-        recomputeActivePath();
-        syncChatLogFromTree();
-      }
       return;
     }
     case "started": {
@@ -2622,7 +2543,7 @@ function handleWsMessage(msg: WSServerMessage): void {
         }
       } else if (loomTree.rev > 0) {
         // Loom path with a lazily-created assistant node: wait for
-        // ``node_created`` or the first tagged ``token`` before allocating
+        // the authoritative tree mutation before allocating
         // the assistant turn.  Appending a legacy placeholder here creates
         // a duplicate local assistant and is the source of many branch /
         // highlight misroutes.
@@ -3050,7 +2971,7 @@ async function sendGenerateNow(
  *  recipe (steering / sampling / seed / thinking) and replays its raw
  *  decode sequence up to ``rawIndex``, forcing ``altTokenId`` there
  *  before sampling the continuation.  Streams in like any regen: the
- *  new sibling lands via the WS ``node_created`` / ``token`` / ``done``
+ *  new sibling lands via the WS ``tree_mutated`` / ``token`` / ``done``
  *  events and becomes the active branch. */
 export async function sendFork(
   nodeId: string,
@@ -3099,7 +3020,7 @@ function buildPrefillPending(
 /** Answer-prefill — seed an assistant reply under a user node.  The
  *  server tokenizes ``text`` into a forced decode prefix, emits it as
  *  the opening of the assistant turn, then samples the continuation.
- *  The prefilled sibling streams in via the WS ``node_created`` /
+ *  The prefilled sibling streams in via the WS ``tree_mutated`` /
  *  ``token`` / ``done`` events and becomes the active branch.  Steering
  *  and sampling ride from the current rack exactly like a normal
  *  ``sendGenerate``; ``thinking`` is forced off server-side (the text is
@@ -3194,7 +3115,7 @@ function buildCommitPending(
  *  null to fall through to the active node server-side); ``"assistant"``
  *  for ``append_assistant_turn`` (``parentNodeId`` is the user node the
  *  authored turn hangs off — required).  The server emits a single
- *  ``done`` event with the new node id; the loom's ``node_created`` /
+ *  ``done`` event with the new node id; the loom's ``tree_mutated`` /
  *  ``tree_mutated`` subscriptions land the node in the UI.  No token
  *  streaming, no steering, no sampling — just a tree mutation.
  *
@@ -3507,19 +3428,27 @@ function schedulePersist(): void {
     // server that consumes this cache) is consistent with the
     // authoritative wire format.
     let tree: LoomTreeJSON | null = null;
-    if (loomTree.rev > 0 && loomTree.root_id && loomTree.active_node_id) {
+    if (
+      loomTree.rev > 0 && loomTree.root_id && loomTree.active_node_id &&
+      loomTree.tree_format !== null && loomTree.saklas_version !== null
+    ) {
       const nodes: LoomNodeJSON[] = [];
       for (const [, n] of loomTree.nodes) nodes.push(n);
       const children_of: Record<string, string[]> = {};
       for (const [pid, ids] of loomTree.children_of)
         children_of[pid] = [...ids];
       tree = {
+        tree_format: loomTree.tree_format,
+        saklas_version: loomTree.saklas_version,
         root_id: loomTree.root_id,
         active_node_id: loomTree.active_node_id,
         rev: loomTree.rev,
         nodes,
         children_of,
-        model_id: loomTree.modelId ?? sessionState.info?.model_id,
+        model_id: loomTree.modelId ?? sessionState.info!.model_id,
+        session_id: loomTree.session_id,
+        name: loomTree.name,
+        cast: { ...castState.roster },
       };
     }
     const snapshot: PersistedSnapshot = {
@@ -3679,7 +3608,7 @@ export function fetchEdgeLabel(parentId: string, childId: string): void {
       edgeLabelCache.set(key, r.label);
     })
     .catch(() => {
-      // Server pre-phase-5 or transient failure — cache an empty
+      // Transient fetch failure — cache an empty
       // string so we don't retry every render.
       edgeLabelCache.set(key, "");
     })

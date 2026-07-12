@@ -8,14 +8,13 @@ both :mod:`saklas.io.manifold_authoring` and
 :mod:`saklas.io.manifold_lifecycle` import from here.
 
 A *manifold* is a set of labeled nodes — each node a small corpus of
-statements — placed at authoring coordinates on a :class:`ManifoldDomain`
+responses — placed at authoring coordinates on a :class:`ManifoldDomain`
 (an n-dimensional intrinsic manifold of some topology: a box/disk, a
 cylinder, a torus, a sphere, or an explicit immersion).  Fitting a
 manifold against a model produces a per-model RBF artifact (see
 :mod:`saklas.core.manifold`).  Manifolds live under their own root,
-``~/.saklas/manifolds/<ns>/<name>/``, parallel to the legacy ``vectors/``
-port root — a manifold carries N labeled nodes on a domain, not a single
-bipolar concept (the retired pack/concept folder shape).
+``~/.saklas/manifolds/<ns>/<name>/``. A manifold carries N labeled nodes on a
+domain; a two-node flat manifold is the bipolar-concept case.
 
 ```
 ~/.saklas/manifolds/<ns>/<name>/
@@ -266,7 +265,53 @@ def sanitize_hyperparams(
 # cross-model transfers persist the exact authoring-to-orthonormal-reduced
 # reparameterization.  Old readers would otherwise ignore that tensor and
 # silently move manifold world points, so this is a real format boundary.
-MANIFOLD_FORMAT_VERSION = 7
+MANIFOLD_FORMAT_VERSION = 8
+
+MANIFOLD_SIDECAR_FIELDS = {
+    "format_version", "name", "method", "saklas_version", "domain",
+    "node_count", "node_labels", "feature_space", "fit_mode", "hyperparams",
+    "diagnostics", "node_spread_per_layer", "mahalanobis_share_per_layer",
+    "origin_per_layer", "nodes_sha256", "sae_release", "sae_revision",
+    "sae_fingerprint", "sae_ids_by_layer", "sae_full_coverage",
+    "model_fingerprint", "capture_sha256", "fitted_layers",
+    "fit_policy_version", "share_metric", "subspace_metric",
+    "rbf_smoothing_per_layer", "sigma_field_per_layer", "resolved_fit_mode",
+    "topology_winner", "topology_candidates", "node_roles", "node_kinds",
+    "components", "bake_policy", "source_model_id",
+    "source_model_fingerprint", "transfer_quality_estimate",
+}
+
+
+def canonical_manifold_sidecar_payload(
+    *, name: str, method: str, saklas_version: str, domain: dict[str, Any],
+    node_labels: list[str], feature_space: str, fit_mode: str,
+    hyperparams: dict[str, Any] | None = None,
+    diagnostics: dict[str, Any] | None = None,
+    node_spread_per_layer: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the one exact current fitted-manifold sidecar shape."""
+    count = len(node_labels)
+    return {
+        "format_version": MANIFOLD_FORMAT_VERSION,
+        "name": name, "method": method, "saklas_version": saklas_version,
+        "domain": domain, "node_count": count, "node_labels": node_labels,
+        "feature_space": feature_space, "fit_mode": fit_mode,
+        "hyperparams": dict(hyperparams or {}),
+        "diagnostics": dict(diagnostics or {}),
+        "node_spread_per_layer": dict(node_spread_per_layer or {}),
+        "mahalanobis_share_per_layer": {}, "origin_per_layer": {},
+        "nodes_sha256": None, "sae_release": None, "sae_revision": None,
+        "sae_fingerprint": None, "sae_ids_by_layer": {},
+        "sae_full_coverage": False, "model_fingerprint": None,
+        "capture_sha256": None, "fitted_layers": [],
+        "fit_policy_version": None, "share_metric": None,
+        "subspace_metric": None, "rbf_smoothing_per_layer": {},
+        "sigma_field_per_layer": {}, "resolved_fit_mode": None,
+        "topology_winner": None, "topology_candidates": [],
+        "node_roles": [None] * count, "node_kinds": [None] * count,
+        "components": None, "bake_policy": None, "source_model_id": None,
+        "source_model_fingerprint": None, "transfer_quality_estimate": None,
+    }
 
 
 def _validate_node_role(name: str, label: str, role: Any) -> str | None:
@@ -462,24 +507,24 @@ class ManifoldSidecar:
             node_count=data["node_count"],
             node_labels=data["node_labels"],
             feature_space=data["feature_space"],
-            nodes_sha256=data.get("nodes_sha256"),
-            sae_release=data.get("sae_release"),
-            sae_revision=data.get("sae_revision"),
-            sae_fingerprint=data.get("sae_fingerprint"),
-            sae_ids_by_layer=dict(data.get("sae_ids_by_layer", {})),
-            sae_full_coverage=bool(data.get("sae_full_coverage", False)),
-            model_fingerprint=data.get("model_fingerprint"),
-            capture_sha256=data.get("capture_sha256"),
-            fitted_layers=sorted(int(idx) for idx in data.get("fitted_layers", [])),
-            fit_policy_version=data.get("fit_policy_version"),
+            nodes_sha256=data["nodes_sha256"],
+            sae_release=data["sae_release"],
+            sae_revision=data["sae_revision"],
+            sae_fingerprint=data["sae_fingerprint"],
+            sae_ids_by_layer=dict(data["sae_ids_by_layer"]),
+            sae_full_coverage=data["sae_full_coverage"],
+            model_fingerprint=data["model_fingerprint"],
+            capture_sha256=data["capture_sha256"],
+            fitted_layers=list(data["fitted_layers"]),
+            fit_policy_version=data["fit_policy_version"],
             fit_mode=data["fit_mode"],
-            hyperparams=dict(data.get("hyperparams", {})),
-            diagnostics=dict(data.get("diagnostics", {})),
-            node_spread_per_layer=dict(data.get("node_spread_per_layer", {})),
-            node_roles=list(data.get("node_roles", [])),
-            node_kinds=list(data.get("node_kinds", [])),
-            components=data.get("components"),
-            bake_policy=data.get("bake_policy"),
+            hyperparams=dict(data["hyperparams"]),
+            diagnostics=dict(data["diagnostics"]),
+            node_spread_per_layer=dict(data["node_spread_per_layer"]),
+            node_roles=list(data["node_roles"]),
+            node_kinds=list(data["node_kinds"]),
+            components=data["components"],
+            bake_policy=data["bake_policy"],
         )
 
 
@@ -499,24 +544,9 @@ def load_manifold_sidecar_data(path: Path) -> dict[str, Any]:
     validate_manifold_format_version(
         data.get("format_version"), location=f"manifold sidecar {path}",
     )
-    allowed = {
-        "format_version", "name", "method", "saklas_version", "domain",
-        "node_count", "node_labels", "feature_space", "fit_mode",
-        "hyperparams", "diagnostics", "node_spread_per_layer",
-        "mahalanobis_share_per_layer", "origin_per_layer", "nodes_sha256",
-        "sae_release", "sae_revision", "sae_fingerprint", "sae_ids_by_layer",
-        "sae_full_coverage", "model_fingerprint", "capture_sha256",
-        "fitted_layers", "fit_policy_version", "share_metric",
-        "subspace_metric", "rbf_smoothing_per_layer", "sigma_field_per_layer",
-        "resolved_fit_mode", "topology_winner", "topology_candidates",
-        "node_roles", "node_kinds", "components", "bake_policy",
-        "source_model_id", "source_model_fingerprint",
-        "transfer_quality_estimate",
-    }
-    unknown = set(data) - allowed
-    if unknown:
+    if set(data) != MANIFOLD_SIDECAR_FIELDS:
         raise ManifoldFormatError(
-            f"manifold sidecar {path} has unknown field(s): {sorted(unknown)}"
+            f"manifold sidecar {path} does not match the current exact schema"
         )
     required_types: dict[str, type] = {
         "name": str,
@@ -558,17 +588,22 @@ def load_manifold_sidecar_data(path: Path) -> dict[str, Any]:
         )
     for key in (
         "sae_ids_by_layer", "hyperparams", "diagnostics",
-        "node_spread_per_layer",
+        "node_spread_per_layer", "mahalanobis_share_per_layer",
+        "origin_per_layer", "rbf_smoothing_per_layer", "sigma_field_per_layer",
     ):
-        if key in data and not isinstance(data[key], dict):
+        if not isinstance(data[key], dict):
             raise ManifoldFormatError(
                 f"manifold sidecar {path} field {key!r} must be an object"
             )
-    for key in ("fitted_layers", "node_roles", "node_kinds"):
-        if key in data and not isinstance(data[key], list):
+    for key in ("fitted_layers", "node_roles", "node_kinds", "topology_candidates"):
+        if not isinstance(data[key], list):
             raise ManifoldFormatError(
                 f"manifold sidecar {path} field {key!r} must be an array"
             )
+    if len(data["node_roles"]) != len(labels) or len(data["node_kinds"]) != len(labels):
+        raise ManifoldFormatError(
+            f"manifold sidecar {path} node provenance does not match node_labels"
+        )
     return data
 
 

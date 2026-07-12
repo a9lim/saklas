@@ -725,7 +725,7 @@ def test_save_load_manifold_round_trip(tmp_path: Path, monkeypatch: pytest.Monke
     )
 
 
-def test_load_manifold_without_share_fields_defaults_empty(
+def test_load_manifold_with_empty_share_fields(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A fit with no whitener (no ``mahalanobis_share`` / ``share_metric``)
@@ -746,8 +746,8 @@ def test_load_manifold_without_share_fields_defaults_empty(
                                    "nodes_sha256": "abc"})
     loaded = load_manifold(path)
     assert loaded.mahalanobis_share == {}
-    assert "share_metric" not in loaded.metadata
-    assert "mahalanobis_share_per_layer" not in loaded.metadata
+    assert loaded.metadata["share_metric"] is None
+    assert loaded.metadata["mahalanobis_share_per_layer"] == {}
     # A manifold saved with ``origin=None`` round-trips with absence
     # preserved — no ``origin`` tensor written, loads back as ``None``.
     assert loaded.origin == {}

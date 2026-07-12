@@ -30,6 +30,16 @@ from saklas.core.errors import SaklasError
 
 log = logging.getLogger(__name__)
 
+_PROFILE_SIDECAR_FIELDS = {
+    "format_version", "method", "saklas_version", "statements_sha256",
+    "components", "bake", "sae_release", "sae_revision",
+    "sae_ids_by_layer", "source_model_id", "alignment_map_hash",
+    "transfer_quality_estimate", "diagnostics_by_layer",
+}
+_PROFILE_METADATA_FIELDS = _PROFILE_SIDECAR_FIELDS - {
+    "format_version", "saklas_version", "diagnostics_by_layer",
+} | {"diagnostics"}
+
 
 class ProfileError(ValueError, SaklasError):
     """Raised on invalid Profile operations (missing layer, empty, etc.)."""
@@ -64,6 +74,11 @@ def save_profile(
     method = metadata.get("method")
     if not isinstance(method, str) or not method:
         raise ProfileError("profile metadata requires a non-empty 'method' string")
+    unknown_metadata = set(metadata) - _PROFILE_METADATA_FIELDS
+    if unknown_metadata:
+        raise ProfileError(
+            f"profile metadata has unknown field(s): {sorted(unknown_metadata)}"
+        )
     if not profile:
         raise ProfileError("profile requires at least one layer tensor")
     for layer, tensor in profile.items():
@@ -93,35 +108,23 @@ def save_profile(
         "format_version": PROFILE_FORMAT_VERSION,
         "method": method,
         "saklas_version": _saklas_version,
+        "statements_sha256": metadata.get("statements_sha256"),
+        "components": metadata.get("components"),
+        "bake": metadata.get("bake"),
+        "sae_release": metadata.get("sae_release"),
+        "sae_revision": metadata.get("sae_revision"),
+        "sae_ids_by_layer": metadata.get("sae_ids_by_layer"),
+        "source_model_id": metadata.get("source_model_id"),
+        "alignment_map_hash": metadata.get("alignment_map_hash"),
+        "transfer_quality_estimate": metadata.get("transfer_quality_estimate"),
+        "diagnostics_by_layer": None,
     }
-    if "statements_sha256" in metadata:
-        sidecar["statements_sha256"] = metadata["statements_sha256"]
-    if "components" in metadata:
-        sidecar["components"] = metadata["components"]
-    # The optional bake method records which scoring metric drove share
-    # allocation. Loaders read this only for diagnostics; tensor magnitudes
-    # already carry the runtime weights.
-    if "bake" in metadata:
-        sidecar["bake"] = metadata["bake"]
-    # SAE provenance — present only when extraction used an SAE backend.
-    for key in ("sae_release", "sae_revision", "sae_ids_by_layer"):
-        if key in metadata:
-            sidecar[key] = metadata[key]
-    # Transfer provenance — present only on transferred profiles
-    # (method="procrustes_transfer").  ``alignment_map_hash`` pins the
-    # specific Procrustes fit; ``transfer_quality_estimate`` is the
-    # median per-layer R² across shared layers.
-    for key in (
-        "source_model_id",
-        "alignment_map_hash",
-        "transfer_quality_estimate",
-    ):
-        if key in metadata:
-            sidecar[key] = metadata[key]
     # Diagnostics: stringify layer keys so the JSON round-trips through
     # standard parsers (JSON object keys must be strings).  Reader inverts.
     diagnostics = metadata.get("diagnostics")
-    if diagnostics:
+    if diagnostics is not None:
+        if not isinstance(diagnostics, dict):
+            raise ProfileError("profile metadata 'diagnostics' must be an object")
         sidecar["diagnostics_by_layer"] = {
             str(layer): {k: float(v) for k, v in metrics.items()}
             for layer, metrics in diagnostics.items()
@@ -173,16 +176,9 @@ def load_profile(path: str | pathlib.Path) -> tuple[dict[int, torch.Tensor], dic
         raise ProfileError(
             f"profile sidecar {meta_path} requires a non-empty 'method' string"
         )
-    allowed = {
-        "format_version", "method", "saklas_version", "statements_sha256",
-        "components", "bake", "sae_release", "sae_revision",
-        "sae_ids_by_layer", "source_model_id", "alignment_map_hash",
-        "transfer_quality_estimate", "diagnostics_by_layer",
-    }
-    unknown = set(metadata) - allowed
-    if unknown:
+    if set(metadata) != _PROFILE_SIDECAR_FIELDS:
         raise ProfileError(
-            f"profile sidecar {meta_path} has unknown field(s): {sorted(unknown)}"
+            f"profile sidecar {meta_path} does not match the current exact schema"
         )
     if not isinstance(metadata.get("saklas_version"), str) or not metadata["saklas_version"]:
         raise ProfileError(
@@ -208,15 +204,17 @@ def load_profile(path: str | pathlib.Path) -> tuple[dict[int, torch.Tensor], dic
         "statements_sha256", "bake", "sae_release", "sae_revision",
         "source_model_id", "alignment_map_hash",
     }
-    for key in string_fields & metadata.keys():
-        if not isinstance(metadata[key], str) or not metadata[key]:
+    for key in string_fields:
+        if metadata[key] is not None and (
+            not isinstance(metadata[key], str) or not metadata[key]
+        ):
             raise ProfileError(f"profile sidecar {meta_path} field {key!r} must be str")
-    for key in {"components", "sae_ids_by_layer"} & metadata.keys():
-        if not isinstance(metadata[key], dict):
+    for key in {"components", "sae_ids_by_layer"}:
+        if metadata[key] is not None and not isinstance(metadata[key], dict):
             raise ProfileError(
                 f"profile sidecar {meta_path} field {key!r} must be an object"
             )
-    if "transfer_quality_estimate" in metadata and (
+    if metadata["transfer_quality_estimate"] is not None and (
         isinstance(metadata["transfer_quality_estimate"], bool)
         or not isinstance(metadata["transfer_quality_estimate"], (int, float))
         or not math.isfinite(float(metadata["transfer_quality_estimate"]))
@@ -227,7 +225,7 @@ def load_profile(path: str | pathlib.Path) -> tuple[dict[int, torch.Tensor], dic
 
     # Invert the layer-key stringification done at save time so diagnostics
     # are addressable by ``int`` consistently with the profile dict.
-    raw_diag = metadata.get("diagnostics_by_layer")
+    raw_diag = metadata["diagnostics_by_layer"]
     if raw_diag is not None:
         if not isinstance(raw_diag, dict):
             raise ProfileError(

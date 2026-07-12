@@ -6,7 +6,7 @@ must talk to the engine through its public API, never reach past it into a
 Reaching in couples a frontend to the engine's internal layout, so a private
 rename silently breaks it — exactly the migration this test guards against
 regressing.  Every former reach-in has a public accessor now (``monitor``,
-``manifolds``, ``profiles``, ``model_metadata``, ``generation_state``,
+``manifolds``, ``profiles``, ``model_info``, ``generation_state``,
 ``gen_lock``, ``joint_logprob_cache``, ``loom_conflict_check``,
 ``ensure_manifold_loaded``, ``ensure_profile_registered``); a fresh reach-in
 should use those instead of being added to the allowlist below.
@@ -129,7 +129,7 @@ def test_no_frontend_session_private_reach_ins() -> None:
         raise AssertionError(
             "frontend code reaches past the SaklasSession public API.\n"
             "Use the public accessor (monitor / manifolds / profiles / "
-            "model_metadata / generation_state / gen_lock / "
+            "model_info / generation_state / gen_lock / "
             "joint_logprob_cache / loom_conflict_check / "
             "ensure_manifold_loaded / ensure_profile_registered, …) at the "
             "call site, or — only if genuinely unavoidable — add the site to "

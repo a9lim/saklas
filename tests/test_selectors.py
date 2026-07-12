@@ -8,9 +8,9 @@ import json
 
 from saklas.io import selectors as sel
 from saklas.io.manifolds import (
-    MANIFOLD_FORMAT_VERSION,
     create_discover_manifold_folder,
 )
+from saklas.io.manifold_folder import canonical_manifold_sidecar_payload
 
 
 def test_parse_bare_name():
@@ -149,20 +149,11 @@ def _fake_fitted_tensor(folder: Path, filename: str) -> None:
     """
     (folder / filename).write_bytes(b"x")
     sidecar = Path(folder) / (Path(filename).stem + ".json")
-    sidecar.write_text(json.dumps({
-        "format_version": MANIFOLD_FORMAT_VERSION,
-        "name": folder.name,
-        "method": "manifold_pca",
-        "saklas_version": "0",
-        "domain": {"kind": "custom", "dim": 1},
-        "node_count": 2,
-        "node_labels": ["pos", "neg"],
-        "feature_space": "raw",
-        "fit_mode": "pca",
-        "hyperparams": {},
-        "diagnostics": {},
-        "node_spread_per_layer": {},
-    }))
+    sidecar.write_text(json.dumps(canonical_manifold_sidecar_payload(
+        name=folder.name, method="manifold_pca", saklas_version="0",
+        domain={"kind": "custom", "dim": 1}, node_labels=["pos", "neg"],
+        feature_space="raw", fit_mode="pca",
+    )))
 
 
 def test_resolve_model_matches_raw_and_sae_tensors(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

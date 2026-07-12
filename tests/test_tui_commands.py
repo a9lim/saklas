@@ -37,10 +37,11 @@ def _make_app():
     # reach-ins).  On a ``MagicMock`` the private backing name and the public
     # property are unrelated children, so configuring the public name is what
     # production sees.  ``profiles`` is the in-memory baked-direction registry;
-    # ``model_metadata`` the structured model-info object; ``device`` / ``layers``
+    # ``model_info`` is the canonical immutable model metadata snapshot;
+    # ``device`` / ``layers``
     # / ``tokenizer`` the engine handles.
     session.profiles = {}
-    session.model_metadata = {"model_id": "mock/mock", "model_type": "mock"}
+    session.model_info = {"model_id": "mock/mock", "model_type": "mock"}
     session.device = SimpleNamespace(type="cpu")
     session.layers = [0, 1, 2]
     # One unified monitor now.  ``manifolds`` maps probe-name → the attached

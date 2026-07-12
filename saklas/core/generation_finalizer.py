@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
 from saklas.core.events import ProbeScored
 from saklas.core.results import GenerationResult, ProbeReading
 
+if TYPE_CHECKING:
+    from saklas.core.session import SaklasSession
+
 
 def finalize_generation(
-    session: Any,
+    session: "SaklasSession",
     generated_ids: list[int],
     elapsed: float,
     vector_snapshot: dict[str, float],
@@ -41,7 +44,7 @@ def finalize_generation(
         text = decoded if isinstance(decoded, str) else decoded[0]
 
     capture_mode = session._capture_state.mode
-    capture_mode_name = getattr(capture_mode, "name", "")
+    capture_mode_name = capture_mode.name
     captured_stack: dict[int, torch.Tensor] = {}
     if (
         generated_ids
@@ -156,7 +159,7 @@ def finalize_generation(
     if (
         return_probe_readings
         and generated_ids
-        and getattr(session, "_lens_probes", None)
+        and session._lens_probes
     ):
         manifold_aggregates.update(
             session._score_lens_probes_aggregate(
@@ -167,7 +170,7 @@ def finalize_generation(
     if (
         return_probe_readings
         and generated_ids
-        and getattr(session, "_sae_probes", None)
+        and session._sae_probes
     ):
         manifold_aggregates.update(
             session._score_sae_probes_aggregate(
@@ -208,7 +211,7 @@ def finalize_generation(
         # that fell back to template rendering, a stamped block would
         # make every later render of this path raise.
         thinking_text: str | None = None
-        grammar = getattr(session, "scene_grammar", None)
+        grammar = session.scene_grammar
         if grammar is not None and grammar.think_open is not None:
             node = session.tree.nodes.get(assistant_node_id)
             if node is not None and node.thinking_tokens:

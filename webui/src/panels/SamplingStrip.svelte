@@ -63,7 +63,7 @@
   /** True iff the user can actually turn thinking off (the chat template
    *  has an ``enable_thinking`` switch).  Forced-thinking models leave
    *  the toggle locked and read-only so the user knows clicking it
-   *  is a no-op.  Older servers omit the field; default to ``true``
+   *  is a no-op.  The field is required by the current session contract
    *  so we don't lock controls against backends that pre-date the
    *  field. */
   const thinkingOptional = $derived(

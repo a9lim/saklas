@@ -26,10 +26,6 @@ if TYPE_CHECKING:
 
 _MAX_HISTORY = 8
 
-_EMPTY_STATS = {"count": 0, "sum": 0.0, "sum_sq": 0.0,
-                "min": float("inf"), "max": float("-inf")}
-
-
 @dataclass(frozen=True, slots=True)
 class _ProbeGateScalarPlan:
     """Attach/generation-stable parse of the scalar channels a gate consumes."""
@@ -127,15 +123,11 @@ class Monitor:
     no Euclidean readout (on real LMs the Euclidean metric is rogue-dominated,
     a wrong answer not a degraded one).
 
-    TUI-facing scalar helpers (``get_stats`` / ``get_sparkline`` /
+    TUI-facing scalar helpers (``get_sparkline`` /
     ``get_current_and_previous``) report coordinate **axis 0** so the
     untouched trait panel keeps working; the full per-axis + per-layer data
     flows through the :class:`ProbeReading` surface.
     """
-
-    @staticmethod
-    def _empty_stats() -> dict[str, Any]:
-        return dict(_EMPTY_STATS)
 
     def __init__(self, probe_manifolds: dict[str, "Manifold"] | None = None,
                  layer_means: dict[int, torch.Tensor] | None = None,
@@ -193,15 +185,11 @@ class Monitor:
         # guard is a bool + a device compare, not a per-token tuple alloc.
         self._flat_cache_dirty: bool = True
 
-        # Per-coordinate history + summary stats.  ``history`` holds the
-        # per-generation aggregate coordinate tuple; ``_stats`` is axis-0
-        # scalar stats (TUI compat). Rich result payloads use the pooled
-        # ``ProbeReading`` directly rather than synthesizing a second summary.
+        # Per-coordinate history. Rich result payloads use the pooled
+        # ``ProbeReading`` directly; scalar UI projections derive from this
+        # single history rather than maintaining a parallel summary model.
         self.history: dict[str, deque[tuple[float, ...]]] = {
             n: deque(maxlen=_MAX_HISTORY) for n in self._probes
-        }
-        self._stats: dict[str, dict[str, Any]] = {
-            n: self._empty_stats() for n in self._probes
         }
 
         # Aggregate path sets _pending_aggregate; per-token path sets _pending_per_token.
@@ -1668,25 +1656,12 @@ class Monitor:
     def _apply_accumulate(
         self, readings: dict[str, ProbeReading],
     ) -> None:
-        """Fold per-probe aggregate coords into monitor history and stats.
-
-        ``history`` stores recent full coordinate tuples; ``_stats`` keeps
-        lifetime axis-0 scalar accumulators for monitor diagnostics.
-        """
+        """Fold per-probe aggregate coordinates into monitor history."""
         for name, reading in readings.items():
             if name not in self.history:
                 continue
             coords = reading.coords or (0.0,)
             self.history[name].append(tuple(coords))
-            s = self._stats[name]
-            s["count"] += 1
-            v0 = coords[0]
-            s["sum"] += v0
-            s["sum_sq"] += v0 * v0
-            if v0 < s["min"]:
-                s["min"] = v0
-            if v0 > s["max"]:
-                s["max"] = v0
         self._pending_aggregate = True
 
     def accumulate_readings(
@@ -1989,9 +1964,6 @@ class Monitor:
                 previous[name] = 0.0
         return current, previous
 
-    def get_stats(self, name: str) -> dict[str, Any]:
-        return self._stats.get(name, self._empty_stats())
-
     def get_sparkline(self, name: str) -> str:
         blocks = " ▁▂▃▄▅▆▇█"
         # Axis-0 coordinate history (TUI compat).
@@ -2018,7 +1990,6 @@ class Monitor:
         self._invalidate_flat_cache()
         if is_new:
             self.history[name] = deque(maxlen=_MAX_HISTORY)
-            self._stats[name] = self._empty_stats()
 
     def remove_probe(self, name: str):
         self._probes.pop(name, None)
@@ -2026,8 +1997,6 @@ class Monitor:
         self._invalidate_flat_cache()
         if name in self.history:
             del self.history[name]
-        if name in self._stats:
-            del self._stats[name]
 
     def attached_probes(self) -> dict[str, "AttachedManifoldProbe"]:
         """Live attached-probe map (read-only view) — name → probe."""
@@ -2045,7 +2014,6 @@ class Monitor:
         """Drop every attached probe (TUI ``/unsteer``-style reset)."""
         self._probes.clear()
         self.history.clear()
-        self._stats.clear()
         self._whitener_factor_cache.clear()
         self._invalidate_flat_cache()
         self._pending_aggregate = False
@@ -2054,7 +2022,6 @@ class Monitor:
     def reset_history(self):
         for name in self._probes:
             self.history[name].clear()
-            self._stats[name] = self._empty_stats()
         self._pending_aggregate = False
         self._pending_per_token = False
 

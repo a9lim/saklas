@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import os
-from contextlib import suppress
 from typing import Any
 
 from saklas.core.errors import SaklasError
+from saklas.core.results import TokenEvent
 from saklas.core.sampling import SamplingConfig
 from saklas.core.steering import Steering
-from saklas.server.streaming import probe_reading_aggregate as _stream_aggregate
 
 
 class UnsupportedContentError(ValueError, SaklasError):
@@ -46,26 +45,12 @@ def flatten_content(content: Any) -> str:
     return str(content)
 
 
-def probe_reading_aggregate(
-    session: Any,
-    result: Any | None = None,
-) -> dict[str, Any]:
-    """Per-attached-probe aggregate dict from ``result`` or ``session.last_result``."""
-    if result is None:
-        result = getattr(session, "last_result", None)
-    return _stream_aggregate(session, result)
-
-
-def probe_token_readings(event: Any) -> dict[str, Any] | None:
+def probe_token_readings(event: TokenEvent) -> dict[str, Any] | None:
     """Serialize a token event's live probe readings, or ``None`` if absent."""
-    readings = getattr(event, "probe_readings", None)
+    readings = event.probe_readings
     if not readings:
         return None
-    out: dict[str, Any] = {}
-    for name, reading in readings.items():
-        with suppress(Exception):
-            out[name] = reading.to_dict()
-    return out or None
+    return {name: reading.to_dict() for name, reading in readings.items()}
 
 
 def parse_request_steering(

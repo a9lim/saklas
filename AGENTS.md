@@ -288,7 +288,7 @@ Transformer Circuits 2026). The lens is one matrix per source layer,
 `J_l = E[∂h_final/∂h_l]` — the average first-order effect of a layer's residual
 on the final-layer residual over positions and a web-text corpus — stored as
 immutable per-layer fp16 shards selected by
-`models/<safe_model_id>/jlens.json` (`LENS_FORMAT_VERSION = 4`, required exactly).
+`models/<safe_model_id>/jlens.json` (`LENS_FORMAT_VERSION = 5`, required exactly).
 The sidecar records the immutable corpus spec + token-id
 sha256, exact source/live model identities, and one payload sha256 per layer.
 `lens fit` runs the estimator (`core/jlens.py::fit_jacobian_lens` — consecutive

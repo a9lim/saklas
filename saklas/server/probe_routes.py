@@ -109,9 +109,8 @@ def _lens_probe_info(name: str, spec: dict[str, Any]) -> dict[str, Any]:
 
 
 def _lens_probe_specs(session: Any) -> dict[str, dict[str, Any]]:
-    """The session's pinned lens-probe registry, defensively coerced."""
-    specs = getattr(session, "_lens_probes", None)
-    return dict(specs) if isinstance(specs, dict) else {}
+    """Snapshot the session's pinned lens-probe registry."""
+    return session.lens_probe_specs
 
 
 def _sae_probe_info(name: str, spec: dict[str, Any]) -> dict[str, Any]:
@@ -140,8 +139,7 @@ def _sae_probe_info(name: str, spec: dict[str, Any]) -> dict[str, Any]:
 
 
 def _sae_probe_specs(session: Any) -> dict[str, dict[str, Any]]:
-    specs = getattr(session, "_sae_probes", None)
-    return dict(specs) if isinstance(specs, dict) else {}
+    return session.sae_probe_specs
 
 
 def register_probe_routes(app: FastAPI) -> None:
@@ -151,10 +149,7 @@ def register_probe_routes(app: FastAPI) -> None:
     @app.get("/saklas/v1/sessions/{session_id}/probes")
     def list_probes(session_id: str):
         resolve_session_id(session_id)
-        try:
-            attached = session.monitor.attached_probes()
-        except Exception:
-            attached = {}
+        attached = session.monitor.attached_probes()
         rows = [_probe_info(name, probe) for name, probe in attached.items()]
         rows.extend(
             _lens_probe_info(name, spec)

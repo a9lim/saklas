@@ -368,15 +368,6 @@ class TestTraitMonitorScoring:
             > monitor.history["test_probe"][1][0]
         )
 
-    def test_stats_accumulate(self):
-        monitor = self._make_monitor()
-        for _ in range(3):
-            h = torch.randn(16)
-            monitor.measure_from_hidden({0: h})
-        stats = monitor.get_stats("test_probe")
-        assert stats["count"] == 3
-        assert stats["min"] <= stats["max"]
-
     def test_sparkline_grows_with_history(self):
         monitor = self._make_monitor()
         for _ in range(4):

@@ -9,24 +9,21 @@ tensors into a second cache.
 """
 from __future__ import annotations
 
-import re
 from pathlib import Path
 from typing import Any
 
 from saklas.io.atomic import write_json_atomic
-from saklas.io.paths import model_dir
+from saklas.io.paths import encode_release_id, model_dir
 
 SAE_RUNTIME_FORMAT_VERSION = 3
 _RUNTIME_FIELDS = {
     "layer", "width", "revision", "fingerprint", "sae_id", "repo_id",
     "neuronpedia_id",
 }
-_UNSAFE = re.compile(r"[^a-z0-9._-]+")
 
 
 def safe_release_id(release: str) -> str:
-    slug = _UNSAFE.sub("_", release.lower()).strip("_")
-    return slug or "sae"
+    return encode_release_id(release)
 
 
 def sae_runtime_dir(model_id: str) -> Path:

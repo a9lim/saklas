@@ -1,5 +1,5 @@
 {
-  "format_version": 7,
+  "format_version": 8,
   "name": "emotions",
   "description": "Discover-mode AUTO-fit manifold over emotional state. Twenty first-person mood nodes spanning the Mehrabian-Russell PAD affect octants (pleasure x arousal x dominance; Mehrabian & Russell, 'An Approach to Environmental Psychology', 1974) — high/low pleasure (happy, grateful, relieved, hopeful, playful / sad, weary, distressed, humiliated, disgusted), high/low arousal (excited, alert, surprised / calm, bored), and the dominance contrast (dominant, triumphant, angry / submissive, fearful) — each answering the shared baseline prompts in character. fit_mode=auto resolves the geometry per-model: select_topology scores a flat affine subspace against a curved RBF surface by GCV and runs persistent-homology periodic detection, so the layout is the model's own emotional geometry (flat affect subspace or curved circumplex) rather than a declared circumplex. Capped at the 3 PAD affect dimensions. Renamed from 'pad': the artifact is the emotional-state manifold; the PAD octants are the spanning design, not the label.",
   "fit_mode": "auto",

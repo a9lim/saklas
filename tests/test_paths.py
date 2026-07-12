@@ -72,12 +72,15 @@ def test_safe_sae_suffix_raw():
 
 
 def test_safe_sae_suffix_release():
-    assert paths.safe_sae_suffix("gemma-scope-2b-pt-res-canonical") == "_sae-gemma-scope-2b-pt-res-canonical"
+    encoded = paths.encode_release_id("gemma-scope-2b-pt-res-canonical")
+    assert paths.safe_sae_suffix("gemma-scope-2b-pt-res-canonical") == f"_sae-{encoded}"
+    assert paths.decode_release_id(encoded) == "gemma-scope-2b-pt-res-canonical"
 
 
 def test_safe_sae_suffix_slugs_unsafe_chars():
-    # Slashes and upper-case get slugged to underscores / lowered.
-    assert paths.safe_sae_suffix("Org/Repo") == "_sae-org_repo"
+    # Distinct release identities remain distinct and reversible.
+    assert paths.safe_sae_suffix("Org/Repo") != paths.safe_sae_suffix("org_repo")
+    assert paths.decode_release_id(paths.encode_release_id("Org/Repo")) == "Org/Repo"
 
 
 def test_tensor_filename_roundtrip_raw():
@@ -89,11 +92,12 @@ def test_tensor_filename_roundtrip_raw():
 
 def test_tensor_filename_roundtrip_sae():
     name = paths.tensor_filename("google/gemma-2-2b-it", release="gemma-scope-2b-pt-res-canonical")
-    assert name == f"{GOOGLE_2B}_sae-gemma-scope-2b-pt-res-canonical.safetensors"
+    release = paths.encode_release_id("gemma-scope-2b-pt-res-canonical")
+    assert name == f"{GOOGLE_2B}_sae-{release}.safetensors"
     parsed = paths.parse_tensor_filename(name)
     # parse_tensor_filename returns the kind-prefixed variant slug so
     # callers can dispatch on prefix without re-detecting the kind.
-    assert parsed == (GOOGLE_2B, "sae-gemma-scope-2b-pt-res-canonical")
+    assert parsed == (GOOGLE_2B, f"sae-{release}")
 
 
 def test_tensor_filename_roundtrip_from_transferred(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -152,7 +156,7 @@ def test_sidecar_filename_partners_tensor():
     assert paths.sidecar_filename("google/gemma-2-2b-it", release=None) == f"{GOOGLE_2B}.json"
     assert paths.sidecar_filename(
         "google/gemma-2-2b-it", release="gemma-scope-2b-pt-res-canonical",
-    ) == f"{GOOGLE_2B}_sae-gemma-scope-2b-pt-res-canonical.json"
+    ) == f"{GOOGLE_2B}_sae-{paths.encode_release_id('gemma-scope-2b-pt-res-canonical')}.json"
     assert paths.sidecar_filename(
         "Qwen/Qwen2.5-7B-Instruct",
         transferred_from="google/gemma-3-4b-it",

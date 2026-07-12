@@ -905,12 +905,12 @@
     const lp = `logprob = ${t.logprob.toFixed(3)}`;
     const alts = t.topAlts;
     if (!alts || alts.length === 0) return lp;
-    // Look up the chosen token's rank within the captured alts.  Falls
-    // back to text equality when ``tokenId`` is missing (legacy shape).
+    // Look up the chosen token's rank by its current wire identity.
+    if (t.tokenId == null) return lp;
     let rank: number | null = null;
     for (let i = 0; i < alts.length; i++) {
       const a = alts[i];
-      if (t.tokenId != null ? a.id === t.tokenId : a.text === t.text) {
+      if (a.id === t.tokenId) {
         rank = i + 1;
         break;
       }

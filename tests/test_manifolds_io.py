@@ -140,6 +140,32 @@ def _sidecar_payload(
         "hyperparams": {},
         "diagnostics": {},
         "node_spread_per_layer": {},
+        "mahalanobis_share_per_layer": {},
+        "origin_per_layer": {},
+        "nodes_sha256": None,
+        "sae_release": None,
+        "sae_revision": None,
+        "sae_fingerprint": None,
+        "sae_ids_by_layer": {},
+        "sae_full_coverage": False,
+        "model_fingerprint": None,
+        "capture_sha256": None,
+        "fitted_layers": [],
+        "fit_policy_version": None,
+        "share_metric": None,
+        "subspace_metric": None,
+        "rbf_smoothing_per_layer": {},
+        "sigma_field_per_layer": {},
+        "resolved_fit_mode": None,
+        "topology_winner": None,
+        "topology_candidates": [],
+        "node_roles": [None] * len(node_labels),
+        "node_kinds": [None] * len(node_labels),
+        "components": None,
+        "bake_policy": None,
+        "source_model_id": None,
+        "source_model_fingerprint": None,
+        "transfer_quality_estimate": None,
     }
 
 
@@ -845,7 +871,7 @@ def test_sidecar_requires_current_identity_fields(tmp_path: Path) -> None:
     payload.pop("fit_mode")
     path.write_text(json.dumps(payload))
 
-    with pytest.raises(ManifoldFormatError, match="'fit_mode' must be str"):
+    with pytest.raises(ManifoldFormatError, match="exact schema"):
         ManifoldSidecar.load(path)
 
 
@@ -855,7 +881,7 @@ def test_sidecar_rejects_unknown_fields(tmp_path: Path) -> None:
     payload["legacy_diagnostics"] = {}
     path.write_text(json.dumps(payload))
 
-    with pytest.raises(ManifoldFormatError, match="unknown field"):
+    with pytest.raises(ManifoldFormatError, match="exact schema"):
         ManifoldSidecar.load(path)
 
 
@@ -2072,7 +2098,7 @@ def test_rectangular_affine_transfer_preserves_points_frame_and_steering(
     )
 
 
-def test_rectangular_curved_transfer_preserves_world_points_and_clears_sigma() -> None:
+def test_rectangular_curved_transfer_rejects_anisotropic_tube() -> None:
     import torch
     from dataclasses import replace
     from saklas.core.manifold import (
@@ -2098,6 +2124,8 @@ def test_rectangular_curved_transfer_preserves_world_points_and_clears_sigma() -
     source = Manifold(
         name="rect-curve", domain=domain, node_labels=["a", "b", "c"],
         node_coords=coords, layers={0: sub},
+        node_roles=[None, None, None], node_kinds=[None, None, None],
+        mahalanobis_share={0: 1.0}, origin={0: torch.zeros(sub.rank)},
     )
     dense = torch.tensor([
         [1.8, 0.0, 0.0, 0.0], [0.2, 0.7, 0.0, 0.0],
@@ -2105,22 +2133,12 @@ def test_rectangular_curved_transfer_preserves_world_points_and_clears_sigma() -
         [0.3, 0.0, 0.0, 0.0], [0.0, -0.2, 0.0, 0.0],
     ])
     alignment = LayerAlignment(dense, torch.eye(4), torch.arange(6).float() / 10)
-    target = transfer_manifold_subspaces(
-        source, {0: alignment}, whitener=_target_whitener(dim=6, layers=(0,)),
-        from_model="src", to_model="tgt",
-    )
-    for position in ([0.0], [0.25], [0.5], [0.8], [1.0]):
-        assert torch.allclose(
-            target.manifold_point(0, position),
-            alignment.apply_points(source.manifold_point(0, position)),
-            atol=2e-5,
+    with pytest.raises(ValueError, match="anisotropic tube transfer"):
+        transfer_manifold_subspaces(
+            source, {0: alignment},
+            whitener=_target_whitener(dim=6, layers=(0,)),
+            from_model="src", to_model="tgt",
         )
-    target_sub = target.layers[0]
-    assert torch.allclose(
-        target_sub.basis @ target_sub.basis.T,
-        torch.eye(target_sub.rank), atol=1e-5,
-    )
-    assert not target_sub.has_sigma
 
 
 def test_rectangular_transfer_rejects_collapsed_subspace_rank() -> None:
@@ -2197,9 +2215,10 @@ def _fit_real_manifold(folder: Path, model_id: str, *, dim: int = 6, seed: int =
     Returns the path of the written canonical tensor.
     """
     import torch
+    from dataclasses import replace
     from saklas.core.manifold import (
         MANIFOLD_FIT_POLICY_VERSION, BoxAxis, BoxDomain, Manifold,
-        fit_layer_subspace, save_manifold,
+        fit_layer_subspace, fit_rbf_interpolant, save_manifold,
     )
 
     g = torch.Generator().manual_seed(seed)
@@ -2207,10 +2226,21 @@ def _fit_real_manifold(folder: Path, model_id: str, *, dim: int = 6, seed: int =
     coords = torch.tensor([[0.0], [0.5], [1.0]])
     embedded = domain.embed(coords)
     layers = {}
+    origins = {}
     for layer in (4, 5, 6):
         centroids = torch.randn(3, dim, generator=g)
         sub, _ev_ratio = fit_layer_subspace(centroids, embedded)
+        assert sub.node_params is not None
+        sigma_rw, sigma_pc = fit_rbf_interpolant(
+            sub.node_params, torch.zeros(3, 1),
+        )
+        sub = replace(
+            sub,
+            sigma_rbf_weights=sigma_rw,
+            sigma_poly_coeffs=sigma_pc,
+        )
         layers[layer] = sub
+        origins[layer] = torch.zeros(sub.rank)
     man = Manifold(
         name=folder.name,
         domain=domain,
@@ -2221,6 +2251,7 @@ def _fit_real_manifold(folder: Path, model_id: str, *, dim: int = 6, seed: int =
         # is re-baked in target space (Σ is per-model; the source metric is
         # invalid in target space).
         mahalanobis_share={4: 1.0, 5: 2.0, 6: 3.0},
+        origin=origins,
     )
     from saklas.io.paths import tensor_filename
     out = folder / tensor_filename(model_id)

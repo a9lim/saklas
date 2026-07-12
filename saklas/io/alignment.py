@@ -52,9 +52,21 @@ from saklas.io.packs import hash_file
 log = logging.getLogger(__name__)
 
 _NEUTRAL_ACTS_NAME = "neutral_activations"
-_NEUTRAL_CACHE_FORMAT_VERSION = 3
+_NEUTRAL_CACHE_FORMAT_VERSION = 4
 _NEUTRAL_CAPTURE_VERSION = 1
-_ALIGNMENT_CACHE_FORMAT_VERSION = 4
+_ALIGNMENT_CACHE_FORMAT_VERSION = 5
+
+_NEUTRAL_SIDECAR_FIELDS = {
+    "method", "format_version", "capture_version", "capture_sha256",
+    "model_fingerprint", "model_source_fingerprint", "tensor_sha256",
+    "tensor_files", "layers", "tensor_schema", "n_prompts", "n_layers",
+}
+_ALIGNMENT_SIDECAR_FIELDS = {
+    "format_version", "method", "source_model_id", "target_model_id",
+    "shared_layers", "tensor_schema", "source_neutral_identity",
+    "target_neutral_identity", "tensor_files", "tensor_sha256",
+    "quality_per_layer",
+}
 
 
 @dataclass(frozen=True)
@@ -241,20 +253,37 @@ def _validate_neutral_cache_metadata_locked(
         raise FileNotFoundError(f"neutral activation cache missing for {model_id}")
     with open(sc_path) as handle:
         sidecar = json.load(handle)
-    version = sidecar.get("format_version")
+    if not isinstance(sidecar, dict) or set(sidecar) != _NEUTRAL_SIDECAR_FIELDS:
+        raise ValueError("neutral activation cache sidecar has a non-current schema")
+    version = sidecar["format_version"]
     if (
         not isinstance(version, int)
         or isinstance(version, bool)
         or version != _NEUTRAL_CACHE_FORMAT_VERSION
-        or sidecar.get("capture_version") != _NEUTRAL_CAPTURE_VERSION
+        or sidecar["capture_version"] != _NEUTRAL_CAPTURE_VERSION
+        or sidecar["method"] != "neutral_activations"
     ):
         raise ValueError("neutral activation cache identity mismatch")
-    layers = sidecar.get("layers")
-    schema = sidecar.get("tensor_schema")
-    if not isinstance(layers, list) or not isinstance(schema, dict):
+    layers = sidecar["layers"]
+    schema = sidecar["tensor_schema"]
+    if (
+        not isinstance(layers, list)
+        or not layers
+        or any(
+            isinstance(layer, bool) or not isinstance(layer, int) or layer < 0
+            for layer in layers
+        )
+        or layers != sorted(set(layers))
+        or not isinstance(schema, dict)
+        or set(schema) != {str(layer) for layer in layers}
+        or isinstance(sidecar["n_prompts"], bool)
+        or not isinstance(sidecar["n_prompts"], int)
+        or sidecar["n_prompts"] <= 0
+        or sidecar["n_layers"] != len(layers)
+    ):
         raise ValueError("neutral activation cache sidecar has no layer schema")
-    normalized_layers = sorted(int(layer) for layer in layers)
-    expected_n = int(sidecar.get("n_prompts", -1))
+    normalized_layers = layers
+    expected_n = sidecar["n_prompts"]
     paths = _neutral_shard_paths(ts_path, sidecar, normalized_layers)
     digests = sidecar.get("tensor_sha256")
     if not isinstance(digests, Mapping):
@@ -351,8 +380,15 @@ def neutral_cache_identity(sidecar: dict[str, Any]) -> dict[str, Any]:
         "capture_sha256", "tensor_sha256", "layers", "tensor_schema",
         "n_prompts",
     )
-    identity = {key: sidecar.get(key) for key in keys}
-    identity["tensor_files"] = sidecar.get("tensor_files")
+    required = {*keys, "tensor_files", "method"}
+    if (
+        not required <= set(sidecar)
+        or sidecar["format_version"] != _NEUTRAL_CACHE_FORMAT_VERSION
+        or sidecar["method"] != "neutral_activations"
+    ):
+        raise ValueError("neutral cache identity requires current validated metadata")
+    identity = {key: sidecar[key] for key in keys}
+    identity["tensor_files"] = sidecar["tensor_files"]
     return identity
 
 
@@ -523,6 +559,8 @@ def _load_or_compute_neutral_activations_with_metadata_locked(
             ),
             "n_layers": len(activations),
         }
+        if set(sidecar) != _NEUTRAL_SIDECAR_FIELDS:
+            raise AssertionError("neutral writer produced a non-canonical sidecar")
         try:
             # Persist every new directory entry before publishing the pointer.
             # A crash can therefore expose either the complete old generation
@@ -921,7 +959,9 @@ def save_alignment_map(
                 with open(sc_path) as handle:
                     current = json.load(handle)
                 if (
-                    current.get("format_version") == _ALIGNMENT_CACHE_FORMAT_VERSION
+                    isinstance(current, dict)
+                    and set(current) == _ALIGNMENT_SIDECAR_FIELDS
+                    and current.get("format_version") == _ALIGNMENT_CACHE_FORMAT_VERSION
                     and current.get("method") == "sharded_factorized_affine_alignment"
                     and current.get("source_model_id") == src_model_id
                     and current.get("target_model_id") == tgt_model_id
@@ -1009,14 +1049,16 @@ def save_alignment_map(
             "target_neutral_identity": target_identity,
             "tensor_files": tensor_files,
             "tensor_sha256": tensor_sha256,
+            "quality_per_layer": {},
         }
         if quality_per_layer:
             merged_quality.update({
                 str(layer): round(float(q), 6)
                 for layer, q in quality_per_layer.items()
             })
-        if merged_quality:
-            sidecar["quality_per_layer"] = merged_quality
+        sidecar["quality_per_layer"] = merged_quality
+        if set(sidecar) != _ALIGNMENT_SIDECAR_FIELDS:
+            raise AssertionError("alignment writer produced a non-canonical sidecar")
         try:
             fsync_directory(sc_path.parent)
             write_json_atomic(sc_path, sidecar)
@@ -1056,6 +1098,8 @@ def load_alignment_map(
         try:
             with open(sc_path) as f:
                 sidecar = json.load(f)
+            if not isinstance(sidecar, dict) or set(sidecar) != _ALIGNMENT_SIDECAR_FIELDS:
+                return None
             # Identity mismatch is the common stale-cache case.  Reject it before
             # hashing or materializing a potentially multi-GiB payload.
             if (
@@ -1067,11 +1111,22 @@ def load_alignment_map(
                 or sidecar.get("target_neutral_identity") != target_identity
             ):
                 return None
-            expected_layers = sidecar.get("shared_layers")
-            schema = sidecar.get("tensor_schema") or {}
-            if not isinstance(expected_layers, list) or not expected_layers:
+            expected_layers = sidecar["shared_layers"]
+            schema = sidecar["tensor_schema"]
+            if (
+                not isinstance(expected_layers, list)
+                or not expected_layers
+                or any(
+                    isinstance(layer, bool) or not isinstance(layer, int) or layer < 0
+                    for layer in expected_layers
+                )
+                or expected_layers != sorted(set(expected_layers))
+                or not isinstance(schema, dict)
+                or set(schema) != {str(layer) for layer in expected_layers}
+                or not isinstance(sidecar["quality_per_layer"], dict)
+            ):
                 return None
-            all_layers = sorted(int(layer) for layer in expected_layers)
+            all_layers = expected_layers
             paths = _alignment_shard_paths(anchor, sidecar, all_layers)
             digests = sidecar.get("tensor_sha256")
             if not isinstance(digests, Mapping):

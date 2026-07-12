@@ -25,7 +25,7 @@ from saklas.io.paths import ensure_within
 NAME_REGEX = re.compile(r"^[a-z][a-z0-9._-]{0,63}$")
 
 # Current profile-cache sidecar format version.
-PROFILE_FORMAT_VERSION = 4
+PROFILE_FORMAT_VERSION = 5
 
 
 def hash_file(path: Path) -> str:

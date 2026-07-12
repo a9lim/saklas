@@ -6,7 +6,7 @@ plus a generation stub — no model, no GPU.  This exercises:
 - REST routes under ``/saklas/v1/sessions/{id}/tree`` (CRUD, transcript)
 - Concurrency conflict 409 mapping when ``_active_gen_reservation`` is set
 - WS ``parent_node_id`` + ``n>1`` fan-out (siblings created, started/done
-  tagged with ``node_id``, ``node_created`` and ``tree_mutated`` events
+  tagged with ``node_id`` and complete ``tree_mutated`` events
   fire)
 
 Heavy generation paths are stubbed so the assertions stay focused on the
@@ -725,7 +725,6 @@ class TestWebSocketLoom:
             # Collect events until done.
             done = None
             seen_tree_mut = False
-            seen_node_created = False
             seen_node_id_on_token = None
             while True:
                 msg = ws.receive_json()
@@ -735,8 +734,6 @@ class TestWebSocketLoom:
                 elif t == "tree_mutated":
                     seen_tree_mut = True
                     assert msg["rev"] >= rev_before
-                elif t == "node_created":
-                    seen_node_created = True
                 elif t == "token":
                     seen_node_id_on_token = msg.get("node_id")
                 elif t == "done":
@@ -745,7 +742,6 @@ class TestWebSocketLoom:
 
         assert done is not None
         assert seen_tree_mut, "tree_mutated event should fire when tree mutates"
-        assert seen_node_created, "node_created event should fire on begin_assistant"
         assert seen_node_id_on_token is not None, "token frames should be tagged with node_id"
         # New user turn attached under u2 (not u1, which would have been
         # the active node before the request).  The assistant attaches
@@ -781,7 +777,6 @@ class TestWebSocketLoom:
                 "parent_node_id": root_id,
             })
             done_events = []
-            node_created_events = []
             seen_sibling_indices = set()
             while True:
                 msg = ws.receive_json()
@@ -789,8 +784,6 @@ class TestWebSocketLoom:
                 if t == "started":
                     seen_sibling_indices.add(msg["sibling_index"])
                     assert msg["sibling_count"] == 2
-                elif t == "node_created":
-                    node_created_events.append(msg)
                 elif t == "done":
                     done_events.append(msg)
                     if len(done_events) == 2:
@@ -809,10 +802,6 @@ class TestWebSocketLoom:
             if session.tree.get(nid).role == "assistant"
         ]
         assert len(assistant_ids) == 2
-        # node_created fires for every newly-created node (user + 2 assistants).
-        created_ids = {ev["node_id"] for ev in node_created_events}
-        for aid in assistant_ids:
-            assert aid in created_ids
         # done frames carry distinct node_ids matching the two assistants.
         done_node_ids = {ev["node_id"] for ev in done_events}
         assert done_node_ids == set(assistant_ids)

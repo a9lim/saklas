@@ -9,6 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from saklas.core.results import GenerationResult, RunSet, TokenEvent
+from tests._generation_stream import TestGenerationStream
 from saklas.core.session import ConcurrentGenerationError, VectorNotRegisteredError
 
 
@@ -44,6 +45,9 @@ def _mock_session():
     session.probes = {}
     session.tree = MagicMock()
     session.tree.messages_for.return_value = []
+    session.tree.active_node_id = "test-assistant"
+    session.tree.get.return_value.mean_logprob = None
+    session.tree.get.return_value.mean_surprise = None
     session.is_base_model = False
     session.has_compatible_jlens.return_value = False
     session.live_lens_layers = None
@@ -54,11 +58,14 @@ def _mock_session():
     session.joint_logprob_cache = {}
     session.lens_probe_names = []
     session.sae_probe_names = []
+    session.lens_probe_specs = {}
+    session.sae_probe_specs = {}
     session.token_probe_payload = {}
 
     # Gen state carries the real finish_reason after each generation.
     gen_state = MagicMock()
     gen_state.finish_reason = "stop"
+    gen_state.emit_map = []
     session.generation_state = gen_state
     session.last_result = None
     session.tokenizer = MagicMock()
@@ -249,11 +256,14 @@ class TestChatCompletions:
     def test_streaming(self, session_and_client: Any) -> None:
         session, client = session_and_client
 
-        def _mock_stream(*args: Any, **kwargs: Any) -> Any:
-            yield TokenEvent(text="Hello", token_id=1, index=0)
-            yield TokenEvent(text=" world", token_id=2, index=1)
-
-        session.generate_stream.return_value = _mock_stream()
+        result = GenerationResult(
+            text="Hello world", tokens=[1, 2], token_count=2,
+            tok_per_sec=5.0, elapsed=0.4, finish_reason="stop",
+        )
+        session.generate_stream.return_value = TestGenerationStream([
+            TokenEvent(text="Hello", token_id=1, index=0),
+            TokenEvent(text=" world", token_id=2, index=1),
+        ], result)
 
         resp = client.post("/v1/chat/completions", json={
             "messages": [{"role": "user", "content": "Hi"}],
@@ -278,12 +288,10 @@ class TestChatCompletions:
     def test_streaming_saklas_error_is_sent_in_band(self, session_and_client: Any) -> None:
         session, client = session_and_client
 
-        def _mock_stream(*args: Any, **kwargs: Any) -> Any:
-            if False:
-                yield TokenEvent(text="", token_id=0, index=0)
-            raise VectorNotRegisteredError("No vector registered for 'missing'")
-
-        session.generate_stream.return_value = _mock_stream()
+        session.generate_stream.return_value = TestGenerationStream(
+            [], None,
+            error=VectorNotRegisteredError("No vector registered for 'missing'"),
+        )
 
         resp = client.post("/v1/chat/completions", json={
             "messages": [{"role": "user", "content": "Hi"}],
@@ -367,9 +375,9 @@ class TestCompletions:
             text="42", tokens=[1], token_count=1,
             tok_per_sec=5.0, elapsed=0.2,
         )
-        session.generate_stream.return_value = iter([
+        session.generate_stream.return_value = TestGenerationStream([
             TokenEvent(text="42", token_id=1, index=0),
-        ])
+        ], session.last_result)
 
         resp = client.post("/v1/completions", json={
             "prompt": "The answer is",
@@ -623,15 +631,14 @@ class TestOllamaApi:
     def test_chat_streaming(self, session_and_client: Any) -> None:
         session, client = session_and_client
 
-        def _mock_stream(*args: Any, **kwargs: Any) -> Any:
-            yield TokenEvent(text="Hello", token_id=1, index=0)
-            yield TokenEvent(text=" world", token_id=2, index=1)
-
-        session.generate_stream.side_effect = _mock_stream
-        session.last_result = GenerationResult(
+        result = GenerationResult(
             text="Hello world", tokens=[1, 2], token_count=2, prompt_tokens=3,
             tok_per_sec=5.0, elapsed=0.4,
         )
+        session.generate_stream.return_value = TestGenerationStream([
+            TokenEvent(text="Hello", token_id=1, index=0),
+            TokenEvent(text=" world", token_id=2, index=1),
+        ], result)
 
         resp = client.post("/api/chat", json={
             "messages": [{"role": "user", "content": "Hi"}],
@@ -657,12 +664,10 @@ class TestOllamaApi:
     def test_chat_streaming_materialization_error_is_ndjson(self, session_and_client: Any) -> None:
         session, client = session_and_client
 
-        def _mock_stream(*args: Any, **kwargs: Any) -> Any:
-            if False:
-                yield TokenEvent(text="", token_id=0, index=0)
-            raise VectorNotRegisteredError("No vector registered for 'missing'")
-
-        session.generate_stream.return_value = _mock_stream()
+        session.generate_stream.return_value = TestGenerationStream(
+            [], None,
+            error=VectorNotRegisteredError("No vector registered for 'missing'"),
+        )
 
         resp = client.post("/api/chat", json={
             "messages": [{"role": "user", "content": "Hi"}],
@@ -1472,7 +1477,11 @@ class TestWSTokenEventLens:
 
         from saklas.server.ws_events import build_token_event
 
-        session = SimpleNamespace(token_probe_payload=payload or {})
+        session = SimpleNamespace(
+            token_probe_payload=payload or {},
+            tree=SimpleNamespace(active_node_id="node-1"),
+            generation_state=SimpleNamespace(emit_map=[]),
+        )
         return build_token_event(
             session,
             [None],
@@ -1668,7 +1677,7 @@ class TestLensProbeRoutes:
     def test_list_includes_lens_probes(self, session_and_client: Any) -> None:
         session, client = session_and_client
         session.monitor.attached_probes.return_value = {}
-        session._lens_probes = {"jlens/fake": dict(self._SPEC)}
+        session.lens_probe_specs = {"jlens/fake": dict(self._SPEC)}
         resp = client.get("/saklas/v1/sessions/default/probes")
         assert resp.status_code == 200
         (row,) = resp.json()["probes"]
@@ -1685,7 +1694,9 @@ class TestLensProbeRoutes:
         session, client = session_and_client
 
         def _attach(selector: str, **_kw: Any) -> str:
-            session._lens_probes = {selector: dict(TestLensProbeRoutes._SPEC)}
+            session.lens_probe_specs = {
+                selector: dict(TestLensProbeRoutes._SPEC),
+            }
             return selector
 
         session.add_probe.side_effect = _attach
@@ -1727,7 +1738,7 @@ class TestLensProbeRoutes:
     def test_detach_lens_probe(self, session_and_client: Any) -> None:
         session, client = session_and_client
         session.monitor.probe_names = []
-        session._lens_probes = {"jlens/fake": dict(self._SPEC)}
+        session.lens_probe_specs = {"jlens/fake": dict(self._SPEC)}
         resp = client.delete("/saklas/v1/sessions/default/probes/jlens%2Ffake")
         assert resp.status_code == 204
         session.remove_probe.assert_called_once_with("jlens/fake")
@@ -1735,6 +1746,6 @@ class TestLensProbeRoutes:
     def test_detach_unknown_404(self, session_and_client: Any) -> None:
         session, client = session_and_client
         session.monitor.probe_names = []
-        session._lens_probes = {}
+        session.lens_probe_specs = {}
         resp = client.delete("/saklas/v1/sessions/default/probes/jlens%2Ffake")
         assert resp.status_code == 404

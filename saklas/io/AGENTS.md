@@ -48,14 +48,14 @@ Shared artifact primitives only — the pack format/distribution surface is gone
 What remains: `NAME_REGEX = ^[a-z][a-z0-9._-]{0,63}$` (manifolds reuse it),
 `hash_file` / `verify_integrity` (the sha256 integrity
 helpers behind the neutral/layer-means/alignment caches and the manifold integrity
-manifest), and `PROFILE_FORMAT_VERSION = 4`, stamped onto the exact profile
+manifest), and `PROFILE_FORMAT_VERSION = 5`, stamped onto the exact profile
 sidecars `profile.save_profile` writes.
 
 ## manifolds.py
 
 The on-disk format for every concept + steering manifold —
-`~/.saklas/manifolds/<ns>/<name>/`. `MANIFOLD_FORMAT_VERSION = 7` (decoupled from
-the profile format); readers and writers require exactly v6.
+`~/.saklas/manifolds/<ns>/<name>/`. `MANIFOLD_FORMAT_VERSION = 8` (decoupled from
+the profile format); readers and writers require exactly v8.
 `min_nodes(n) = 2n+1`
 (the curved-fit poisedness floor). Five `fit_mode`s share the class, discriminated
 by `manifold.json::fit_mode`:
@@ -142,8 +142,8 @@ target whitener to the core compute (which maps points/means through `M_L x+b_L`
 but directions through `M_L`, QR-orthonormalizes the mapped basis, transforms
 the affine/RBF reduced coefficients exactly into the new frame, re-bakes the
 Mahalanobis **share** in target space — target whitener **required**, `WhitenerError`
-otherwise; no Euclidean rebake — clears a now-anisotropic scalar sigma field,
-and clears `origin`), then writes the
+otherwise; no Euclidean rebake — rejects a curved transfer whose tube would
+become anisotropic, and transforms `origin` into the target frame), then writes the
 `_from-<safe_src>` variant + patches the transfer-provenance sidecar. The core
 function raises a plain `ValueError` when the alignment covers no fitted layer; this
 function surfaces it as `ManifoldFormatError` (the `WhitenerError`, a `ValueError`
@@ -384,7 +384,7 @@ Cross-model probe alignment via per-layer Procrustes.
 (the neutral corpus × layers, **fp32** — the project-wide invariant; exact loaded
 model + rendered-token + layer-schema identity, payload-digest verified; self-heals
 legacy bf16/fp16/non-finite caches). These are what the Mahalanobis whitener builds its
-covariance from. Cache v3 is an atomic JSON pointer to one immutable fp32 shard
+covariance from. Cache v4 is an atomic JSON pointer to one immutable fp32 shard
 per layer; every shard and its directory entry are durable before pointer
 publication, and old generations are collected only after the new pointer is
 durable. Readers require the current v3 sharded pointer format.
@@ -423,7 +423,7 @@ magnitude to its *target* Mahalanobis norm. The target whitener is **required** 
 must cover the transferred layers (`WhitenerError` otherwise; Mahalanobis-only — no
 Euclidean transfer). The fitted map binds both validated neutral-cache identities,
 both model fingerprints, and its own payload digest under the *target* model dir
-(`models/<safe_tgt>/alignments/<safe_src>.json`, cache v4): one immutable
+(`models/<safe_tgt>/alignments/<safe_src>.json`, cache v5): one immutable
 factor shard per layer, atomically pointer-switched. Identity + all headers are
 preflighted before payload materialization; a requested layer subset reads and
 digest-validates only those shards, with digest computed from the same bytes fed
@@ -439,7 +439,7 @@ target write. Non-current cache generations miss and are replaced normally.
 The per-model Jacobian-lens artifact — an atomic `models/<safe_model_id>/
 jlens.json` pointer to immutable per-layer
 `jlens.layer-<L>.gen-<uuid>.safetensors` generations. Readers and writers require
-exactly `LENS_FORMAT_VERSION = 4`. Missing-layer top-ups carry forward unchanged shard pointers and write
+exactly `LENS_FORMAT_VERSION = 5`. Missing-layer top-ups carry forward unchanged shard pointers and write
 only the new matrices, after rehashing every reuse candidate; a corrupt reused
 shard is rewritten from the resident fp32 matrix while valid siblings stay put.
 a wrong version, missing/mismatched payload digest, non-finite tensors, or a corrupt sidecar all log a warning and

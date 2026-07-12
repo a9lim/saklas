@@ -1804,6 +1804,56 @@ class Manifold:
     def layer_indices(self) -> list[int]:
         return sorted(self.layers)
 
+    def validate_runtime_geometry(self) -> None:
+        """Require the complete fitted geometry consumed by live steering.
+
+        Persistence readers validate their wire schema; this closes the same
+        contract over programmatically constructed objects before they enter a
+        hot path.  Optionality remains structural only: affine layers have no
+        RBF or tube, and SAE-space curved fits deliberately have no raw-space
+        tube.  Missing bakes are never interpreted as an older representation.
+        """
+        if not self.layers:
+            raise ValueError(f"manifold {self.name!r} has no fitted layers")
+        if len(self.node_labels) != int(self.node_coords.shape[0]):
+            raise ValueError(
+                f"manifold {self.name!r} node labels and coordinates are misaligned"
+            )
+        for field_name, values in (
+            ("node_roles", self.node_roles),
+            ("node_kinds", self.node_kinds),
+        ):
+            if len(values) != len(self.node_labels):
+                raise ValueError(
+                    f"manifold {self.name!r} {field_name} must align exactly "
+                    "with node_labels"
+                )
+        layer_keys = set(self.layers)
+        if set(self.mahalanobis_share) != layer_keys:
+            raise ValueError(
+                f"manifold {self.name!r} Mahalanobis shares must cover exactly "
+                "its fitted layers"
+            )
+        curved = {idx: sub for idx, sub in self.layers.items() if not sub.is_affine}
+        if set(self.origin) != set(curved):
+            raise ValueError(
+                f"manifold {self.name!r} origins must cover exactly its curved layers"
+            )
+        for idx, sub in self.layers.items():
+            if sub.is_affine:
+                if sub.node_coords is None:
+                    raise ValueError(
+                        f"affine manifold {self.name!r} layer {idx} has no node coords"
+                    )
+                if sub.has_sigma:
+                    raise ValueError(
+                        f"affine manifold {self.name!r} layer {idx} carries a tube"
+                    )
+            elif self.feature_space == "raw" and not sub.has_sigma:
+                raise ValueError(
+                    f"raw curved manifold {self.name!r} layer {idx} has no sigma field"
+                )
+
     def to(self, *, device: torch.device, dtype: torch.dtype) -> "Manifold":
         """Return a copy with every layer tensor on ``device`` in ``dtype``."""
         return Manifold(
@@ -4949,7 +4999,9 @@ def save_manifold(
     on disk is the read-side affine marker ``load_manifold`` keys on, so a
     folded-vector artifact and a fitted manifold share one save/load path.
     """
-    from saklas.io.manifolds import MANIFOLD_FORMAT_VERSION
+    from saklas.io.manifold_folder import (
+        MANIFOLD_SIDECAR_FIELDS, canonical_manifold_sidecar_payload,
+    )
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -4999,20 +5051,20 @@ def save_manifold(
             )
     from saklas import __version__ as _saklas_version
 
-    sidecar: dict[str, object] = {
-        "format_version": MANIFOLD_FORMAT_VERSION,
-        "method": metadata.get("method", "manifold_pca"),
-        "saklas_version": _saklas_version,
-        "name": manifold.name,
-        "domain": manifold.domain.to_spec(),
-        "node_labels": list(manifold.node_labels),
-        "node_count": len(manifold.node_labels),
-        "feature_space": manifold.feature_space,
-        "fit_mode": metadata.get("fit_mode", "authored"),
-        "hyperparams": metadata.get("hyperparams", {}),
-        "diagnostics": metadata.get("diagnostics", {}),
-        "node_spread_per_layer": metadata.get("node_spread_per_layer", {}),
-    }
+    sidecar: dict[str, object] = canonical_manifold_sidecar_payload(
+        name=manifold.name,
+        method=str(metadata.get("method", "manifold_pca")),
+        saklas_version=_saklas_version,
+        domain=manifold.domain.to_spec(),
+        node_labels=list(manifold.node_labels),
+        feature_space=manifold.feature_space,
+        fit_mode=str(metadata.get("fit_mode", "authored")),
+        hyperparams=cast(dict[str, Any], metadata.get("hyperparams", {})),
+        diagnostics=cast(dict[str, Any], metadata.get("diagnostics", {})),
+        node_spread_per_layer=cast(
+            dict[str, Any], metadata.get("node_spread_per_layer", {}),
+        ),
+    )
     # Per-layer Mahalanobis share weight (whitened bake-score analogue).
     # Stored as ``{str(idx): float}`` like EV; absent when no whitener was
     # available at fit time, in which case the apply-time share weighting
@@ -5097,6 +5149,9 @@ def save_manifold(
     ):
         if key in metadata:
             sidecar[key] = metadata[key]
+
+    if set(sidecar) != MANIFOLD_SIDECAR_FIELDS:
+        raise ValueError("manifold writer produced a non-canonical sidecar")
 
     from saklas.io.manifold_folder import manifold_pair_lock
 
@@ -5311,9 +5366,8 @@ def _load_manifold_locked(
             poly_coeffs=parts["poly_coeffs"],
             coord_offset=parts["coord_offset"],
             coord_scale=parts["coord_scale"],
-            # Fuzzy-manifold σ-field — present only on curved fits run with the
-            # within-node spread pass; absent ⇒ ``None`` ⇒ zero-thickness wire
-            # (the exact legacy curved behavior).
+            # Fuzzy-manifold σ-field. Current raw curved fits require this
+            # pair; SAE-space curved fits deliberately omit the raw-space tube.
             sigma_rbf_weights=parts.get("sigma_rbf_weights"),
             sigma_poly_coeffs=parts.get("sigma_poly_coeffs"),
         )
@@ -5322,14 +5376,13 @@ def _load_manifold_locked(
     if node_coords is None:
         node_coords = torch.zeros(0, domain.intrinsic_dim)
 
-    maha_raw = sidecar.get("mahalanobis_share_per_layer") or {}
+    maha_raw = sidecar["mahalanobis_share_per_layer"]
     mahalanobis_share: dict[int, float] = {
         int(k): float(v) for k, v in maha_raw.items()
     }
 
-    # Per-layer origin ``O_L`` (authoring-coordinate foot of neutral).  Absent
-    # on a pre-origin fit → empty dict; the apply path seeds at ``zeros(n)``.
-    origin_raw = sidecar.get("origin_per_layer") or {}
+    # Per-layer origin ``O_L`` (authoring-coordinate foot of neutral).
+    origin_raw = sidecar["origin_per_layer"]
     origin: dict[int, torch.Tensor] = {
         int(k): torch.tensor([float(c) for c in v], dtype=torch.float32)
         for k, v in origin_raw.items()
@@ -5343,12 +5396,8 @@ def _load_manifold_locked(
         layers=layers,
         feature_space=sidecar["feature_space"],
         metadata=sidecar,
-        # ``node_roles`` is absent on non-role manifolds (every
-        # pre-Phase-A fit); the loaded list stays empty in that case.
-        node_roles=list(sidecar.get("node_roles", [])),
-        # ``node_kinds`` is absent on manifolds authored without the
-        # abstract/concrete distinction; the loaded list stays empty then.
-        node_kinds=list(sidecar.get("node_kinds", [])),
+        node_roles=list(sidecar["node_roles"]),
+        node_kinds=list(sidecar["node_kinds"]),
         mahalanobis_share=mahalanobis_share,
         origin=origin,
     )
@@ -5377,10 +5426,11 @@ def transfer_manifold_subspaces(
     translation); basis rows and direction profiles use only its linear factor.
     The mapped rows are QR-reparameterized to an orthonormal target frame and
     every affine/RBF reduced-coordinate coefficient is transformed by the exact
-    companion matrix, preserving world points.  A collapsed source span is
-    rejected.  A curved scalar sigma field is retained only when that companion
-    map is an isometry; otherwise transfer would make its thickness anisotropic,
-    so the scalar field is cleared.  Layers the alignment doesn't cover drop.
+    companion matrix, preserving world points. A collapsed source span is
+    rejected. Curved transfer requires that companion map to be an isometry:
+    a non-isometric map turns the scalar tube thickness anisotropic, which the
+    current manifold representation cannot encode. Layers the alignment doesn't
+    cover drop.
 
     **Target-metric share re-bake (mandatory).**  The source fit's per-layer
     Mahalanobis ``share`` is a per-model quantity (``Σ`` belongs to
@@ -5390,14 +5440,14 @@ def transfer_manifold_subspaces(
     :func:`subspace_share` (``sqrt(Σ_k coordsᵀ (B_tgt Σ_tgt⁻¹ B_tgtᵀ) coords)``
     — the same formula the fit pipeline bakes).  A missing or non-covering
     whitener raises :class:`~saklas.core.mahalanobis.WhitenerError`; there is no
-    Euclidean rebake.  ``origin`` (the per-layer foot of the *source* neutral
-    mean) is per-model too, so it is cleared — the apply path falls back to a
-    zero-coord seed per layer.
+    Euclidean rebake. For curved layers, the source neutral foot is transformed
+    through the same exact companion map, yielding the target-frame origin.
 
     Folder-level format guards (empty alignment, source fit missing) are the
     caller's concern; this function raises only :class:`~saklas.core.
     mahalanobis.WhitenerError` (missing / partial target whitener) and
-    ``ValueError`` when ``alignment`` covers none of the source's fitted layers.
+    ``ValueError`` for unrepresentable geometry or when ``alignment`` covers
+    none of the source's fitted layers.
     """
     from dataclasses import replace as _dc_replace
 
@@ -5407,6 +5457,7 @@ def transfer_manifold_subspaces(
     # ``(D_tgt, D_src)`` so ``mean_tgt = M_L @ mean_src`` and each basis row
     # transforms the same way → ``basis_tgt = basis_src @ M_L^T``.
     new_layers: dict[int, LayerSubspace] = {}
+    new_origin: dict[int, torch.Tensor] = {}
     for layer, sub in src.layers.items():
         M_L = alignment.get(layer)
         if M_L is None:
@@ -5484,17 +5535,28 @@ def transfer_manifold_subspaces(
                 sub.poly_coeffs.to(torch.float32) @ reduced_map
             ).to(dtype=sub.poly_coeffs.dtype)
             # A scalar isotropic tube thickness is invariant only under an
-            # isometry of this reduced frame.  A rectangular/non-isometric map
-            # makes the source sigma anisotropic; clearing it is honest whereas
-            # carrying the old scalar would fabricate target-model density.
+            # isometry of this reduced frame. The current representation has no
+            # anisotropic tube field, so reject an unrepresentable transfer.
             gram = reduced_map @ reduced_map.transpose(0, 1)
             isometric = torch.allclose(
                 gram, torch.eye(rank, dtype=gram.dtype, device=gram.device),
                 atol=1e-4, rtol=1e-4,
             )
             if not isometric:
-                kwargs["sigma_rbf_weights"] = None
-                kwargs["sigma_poly_coeffs"] = None
+                raise ValueError(
+                    f"alignment for layer {layer} is non-isometric in curved "
+                    "manifold coordinates; anisotropic tube transfer is not "
+                    "representable by the current scalar sigma field"
+                )
+            try:
+                source_origin = src.origin[layer]
+            except KeyError as exc:
+                raise ValueError(
+                    f"curved source manifold is missing origin for layer {layer}"
+                ) from exc
+            new_origin[layer] = (
+                source_origin.to(torch.float32) @ reduced_map
+            ).to(dtype=sub.basis.dtype)
         new_layers[layer] = _dc_replace(sub, **kwargs)
 
     if not new_layers:
@@ -5546,10 +5608,7 @@ def transfer_manifold_subspaces(
     return _dc_replace(
         src, layers=new_layers,
         mahalanobis_share=new_share,
-        # ``origin`` is the per-layer foot of the *source* model's neutral mean
-        # — a per-model quantity invalid in target space (same reason the share
-        # is cleared); the apply path falls back to a zero-coord seed per layer.
-        origin={},
+        origin=new_origin,
     )
 
 

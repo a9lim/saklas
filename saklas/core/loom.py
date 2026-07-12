@@ -880,11 +880,7 @@ class LoomTree:
 
     def _emit(self, event: LoomMutated) -> None:
         if self._events is not None:
-            # Event delivery must not break a mutation. ``EventBus`` itself
-            # swallows subscriber errors; this guard catches anything from a
-            # non-EventBus shim.
-            with suppress(Exception):
-                self._events.emit(event)
+            self._events.emit(event)
 
     def _add_child(self, parent_id: str, node: LoomNode) -> None:
         self.nodes[node.id] = node

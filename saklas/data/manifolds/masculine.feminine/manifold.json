@@ -1,5 +1,5 @@
 {
-  "format_version": 7,
+  "format_version": 8,
   "name": "masculine.feminine",
   "description": "Bipolar axis: masculine (+) vs feminine (-). Steer with negative alpha for the opposite pole.",
   "fit_mode": "pca",

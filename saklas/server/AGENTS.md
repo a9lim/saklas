@@ -462,7 +462,7 @@ modes:
 Fork / prefill / commit are mutually exclusive (400 on mix). `n>1` fans out N sibling
 assistant nodes on one shared user parent, generated serially with deterministic
 derived seeds. Server → client: `started` (node_id filled lazily by the first
-token), `node_created`, `tree_mutated`, `token` (per token — `logprob`/`top_alts`
+token), `tree_mutated`, `token` (per token — `logprob`/`top_alts`
 when captured, `scores`/`per_layer_scores` when probes are loaded, `probe_readings`
 `Record<name, {fraction, nearest}>` when any probe is attached, computed
 inline off `session._capture._per_layer`, and `lens_readout`
@@ -484,7 +484,7 @@ frame with empty `added`/`updated` plus a `cast` key inlining the full roster
 (`{label: {recipe?, notes?}}`), so clients reconcile without a refetch.
 
 Concurrency: one perpetual reader task owns `receive_json()` and feeds a shared
-`incoming` queue; `tree_mutated`/`node_created` ride a connection-level
+`incoming` queue; `tree_mutated` ride a connection-level
 `LoomMutated` subscription; all sends go through one `asyncio.Lock`. Per generate
 turn, `generate_stream` runs in a worker thread; `on_token` bridges to asyncio via
 `call_soon_threadsafe`; the handler races the token queue against `incoming` so an

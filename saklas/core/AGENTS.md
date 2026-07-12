@@ -515,11 +515,12 @@ alignment, *, whitener, from_model, to_model)` is the pure-tensor core of the
 cross-model affine transfer: maps points/means through `M_L x+b_L` and basis
 directions through `M_L`, QR-orthonormalizes the mapped rows, and transforms the
 affine/RBF reduced coefficients by the exact companion map. Rank collapse is
-rejected; a curved scalar sigma field is cleared when the companion map is not
-an isometry. It re-bakes the Mahalanobis
+rejected; a curved transfer is rejected when the companion map is not an
+isometry because the current scalar sigma field cannot encode an anisotropic
+tube. It re-bakes the Mahalanobis
 **share** in target space via `subspace_share` (target whitener **required** —
-`WhitenerError` on a missing / partial one, no Euclidean rebake), clears `origin`,
-and returns the transferred `Manifold`.
+`WhitenerError` on a missing / partial one, no Euclidean rebake), transforms
+`origin` through the same companion map, and returns the transferred `Manifold`.
 The folder read/write orchestration around it (load the source tensor, write the
 `_from-<safe_src>` variant, patch the sidecar) stays in
 `io/manifold_lifecycle.py::transfer_manifold`. Discover: `derive_pca_coords`

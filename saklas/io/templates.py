@@ -17,7 +17,7 @@ to hash beyond the JSON itself):
 
 ```json
 {
-  "format_version": 1,
+  "format_version": 2,
   "name": "weekday",
   "slot": "[DAY]",
   "values": ["Monday", "Tuesday", ...],
@@ -30,8 +30,7 @@ to hash beyond the JSON itself):
 }
 ```
 
-**Invariant** (carried from the embedded-block predecessor, generalized to
-multi-turn): the slot appears exactly once in each context's final ``assistant``
+**Invariant:** the slot appears exactly once in each context's final ``assistant``
 string and *never* in a history turn — history is shared common-mode across the
 values, so the slot lives only where the value is read.
 """
@@ -58,7 +57,7 @@ TEMPLATE_FORMAT_VERSION = 2
 
 # Node label discipline — mirrors ``io.manifolds._LABEL_REGEX`` (a templated
 # manifold's nodes are this template's slugged values, so the slug must be a
-# valid node label).  Defined here, not imported, so the migration's
+# valid node label). Defined here, not imported, so the
 # ``manifolds -> templates`` import direction stays acyclic.
 _LABEL_REGEX = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _VALID_ROLES = ("system", "user", "assistant")

@@ -1,5 +1,5 @@
 {
-  "format_version": 7,
+  "format_version": 8,
   "name": "personas",
   "description": "Persona archetypes for discover-mode AUTO-fit manifold steering. 107 nodes spanning everyday and pre-modern human roles, modern social subcultures, institutional and political identities, relational and psychological archetypes, creative and divine figures, fantastical creatures, nonhuman animals, inanimate objects, AI / synthetic personas, and the named harmful cluster. Lineage is Anthropic's Assistant Axis paper (arXiv 2601.10387) plus the Persona Selection Model framing; the 2026-05-31 recut data-pruned redundant / near-baseline nodes (whitened per-node centroid distances, cross-model consistent) and filled previously-empty semantic axes. fit_mode=auto resolves the geometry per-model (select_topology scores a flat affine subspace against a curved RBF surface by GCV, with persistent-homology periodic detection); the persona fan resolves flat — a low-dim affine subspace over the per-node centroids — on role-supporting model families.",
   "fit_mode": "auto",

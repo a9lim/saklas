@@ -42,6 +42,9 @@ def _mock_session():
     session.probes = {}
     session.tree = MagicMock()
     session.tree.messages_for.return_value = []
+    session.tree.active_node_id = "test-assistant"
+    session.tree.get.return_value.mean_logprob = None
+    session.tree.get.return_value.mean_surprise = None
     session.manifolds = {}
     session.is_base_model = False
     session.has_compatible_jlens.return_value = False
@@ -68,6 +71,7 @@ def _mock_session():
 
     gen_state = MagicMock()
     gen_state.finish_reason = "stop"
+    gen_state.emit_map = []
     session.generation_state = gen_state
 
     session.build_readings.return_value = {}
@@ -1009,7 +1013,6 @@ class TestScoreSingleToken:
         assert isinstance(scores["test_probe"].coords[0], float)
         # History should NOT have been updated.
         assert len(monitor.history["test_probe"]) == 0
-        assert monitor._stats["test_probe"]["count"] == 0
 
     def test_consistent_with_measure_from_hidden(self):
         import torch

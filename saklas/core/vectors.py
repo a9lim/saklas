@@ -953,6 +953,8 @@ def fold_directions_to_subspace(
         node_coords=node_coords,
         layers=layers,
         feature_space=feature_space,
+        node_roles=[None],
+        node_kinds=[None],
         mahalanobis_share=mahalanobis_share,
     )
     manifold.metadata["share_metric"] = (

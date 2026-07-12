@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from saklas.core.results import GenerationResult, RunSet
+from saklas.core.results import GenerationResult
 from saklas.core.sampling import SamplingConfig
 from saklas.server.native_common import NativeRequest
 
@@ -97,15 +97,13 @@ def build_input(
     return [message.model_dump() for message in body]
 
 
-def result_to_json(result: GenerationResult | RunSet | None) -> dict[str, Any]:
-    if result is None:
-        return {}
-    prompt_tokens = getattr(result, "prompt_tokens", 0) or 0
-    completion = getattr(result, "token_count", 0) or 0
+def result_to_json(result: GenerationResult) -> dict[str, Any]:
+    prompt_tokens = result.prompt_tokens
+    completion = result.token_count
     return {
-        "text": getattr(result, "text", ""),
+        "text": result.text,
         "tokens": completion,
-        "finish_reason": getattr(result, "finish_reason", "stop"),
+        "finish_reason": result.finish_reason,
         "usage": {
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion,

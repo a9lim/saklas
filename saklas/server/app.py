@@ -8,7 +8,7 @@ import os
 import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Iterator
+from typing import TYPE_CHECKING, Any, AsyncIterator, Callable
 
 if TYPE_CHECKING:
     from saklas.core.results import GenerationResult
@@ -22,7 +22,7 @@ from pydantic import BaseModel, model_validator
 from starlette.datastructures import Headers
 
 from saklas.core.errors import SaklasError
-from saklas.core.session import ConcurrentGenerationError, SaklasSession
+from saklas.core.session import ConcurrentGenerationError, GenerationStream, SaklasSession
 from saklas.core.steering import Steering
 from saklas.server.request_helpers import (
     UnsupportedContentError,
@@ -30,12 +30,12 @@ from saklas.server.request_helpers import (
     flatten_content as _flatten_content,
     merge_steering as _merge_steering,
     parse_request_steering as _parse_req_steering,
-    probe_reading_aggregate as _probe_reading_aggregate,
     probe_token_readings as _probe_token_readings,
     strict_model_enabled as _strict_model_enabled,
 )
 from saklas.server.streaming import (
     _usage_dict,
+    probe_reading_aggregate as _probe_reading_aggregate,
     stream_finalizer,
 )
 
@@ -376,7 +376,7 @@ def _render_logprobs_completions(result: GenerationResult, session: SaklasSessio
 
 async def _stream_generation(
     session: SaklasSession,
-    stream_iter: Iterator[Any], rid: str, model_id: str, object_type: str,
+    stream_iter: GenerationStream, rid: str, model_id: str, object_type: str,
     format_delta: Callable[[Any], dict[str, Any]], empty_delta: dict[str, Any],
     include_usage: bool = False, role_delta: bool = False,
     request: Request | None = None,
@@ -459,14 +459,9 @@ async def _stream_generation(
             # + join) on every exit — normal completion (no-op on an exhausted
             # generator), an in-band error, or an early client-disconnect
             # ``return`` — rather than leaving it to GC.
-            close = getattr(stream_iter, "close", None)
-            if callable(close):
-                close()
+            stream_iter.close()
 
-        last_result = (
-            getattr(stream_iter, "result", None)
-            or getattr(session, "last_result", None)
-        )
+        last_result = stream_iter.result
         finish_reason, usage, mf_agg = stream_finalizer(session, last_result)
         final_choice: dict[str, Any] = {
             "index": 0, **empty_delta, "finish_reason": finish_reason,

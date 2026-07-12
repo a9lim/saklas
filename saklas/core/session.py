@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from enum import Enum, IntEnum
 from types import TracebackType
 from collections.abc import Mapping, Sequence
-from typing import TYPE_CHECKING, Any, Callable, Iterator, Literal, cast, overload
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Literal, Protocol, cast, overload
 
 import torch
 from transformers import (
@@ -82,6 +82,19 @@ if TYPE_CHECKING:
 from saklas.core.triggers import Trigger
 
 _log = logging.getLogger(__name__)
+
+
+class GenerationStream(Protocol):
+    """Current streaming iterator contract returned by :meth:`generate_stream`."""
+
+    def __iter__(self) -> "GenerationStream": ...
+
+    def __next__(self) -> TokenEvent: ...
+
+    def close(self) -> None: ...
+
+    @property
+    def result(self) -> GenerationResult | None: ...
 
 # Hybrid linear-attention models (qwen3.6-27b, lfm2, etc.) carry a
 # recurrent state (``conv_states`` + ``recurrent_states``) per LA layer
@@ -1288,6 +1301,7 @@ class SaklasSession:
         # (score_callback runs before the token tap), the display step reuses
         # them when the layer sets match.  Reset per generation.
         self._lens_step_stash: dict[str, Any] | None = None
+        self._live_lens_active_for_generation: bool = True
         self._last_lens_step_readings: dict[str, "ProbeReading"] | None = None
         # Live sparse-autoencoder runtime. One release + one hook layer is
         # resident in v1; weights stay owned by SAELens/HF cache. Readout
@@ -1563,16 +1577,6 @@ class SaklasSession:
         in a :class:`Profile`); the live dict, mutating it mutates the
         registry."""
         return self._profiles
-
-    @property
-    def model_metadata(self) -> Any:
-        """The structured model-info object (id, arch, layer count, …).
-
-        Distinct from :attr:`model_info`, which returns a plain ``dict`` copy;
-        this is the live object the loader produced, consumed by panels that
-        want the typed fields.
-        """
-        return self._model_info
 
     @property
     def generation_state(self) -> GenerationState:
@@ -3408,7 +3412,7 @@ class SaklasSession:
         the live layers.
         """
         state = self._live_lens
-        if state is None or not getattr(self, "_live_lens_active_for_generation", True):
+        if state is None or not self._live_lens_active_for_generation:
             return None
         buckets = self._capture.per_layer_buckets()
         unembed = state["unembed"]
@@ -3428,8 +3432,7 @@ class SaklasSession:
             transport_rows.append(layer_rows[layer])
         if not layers_present:
             return None
-        # ``getattr`` — test stubs bind these methods without instance state.
-        stash = getattr(self, "_lens_step_stash", None)
+        stash = self._lens_step_stash
         logits: torch.Tensor | None = None
         probabilities: torch.Tensor | None = None
         cached_logits: dict[int, torch.Tensor] = {}
@@ -5546,13 +5549,11 @@ class SaklasSession:
         # Refresh an externally replaced/removed J-lens exactly once before
         # fixing this generation's capture layers.  Every token, gate, and
         # final aggregate below consumes the same resident generation even if
-        # another process switches ``jlens.json`` mid-decode.  Cold protocol
-        # stubs used by CPU tests do not carry ``_jlens_identity``; preserve
-        # their explicit live/probe fixtures without invoking disk/model code.
+        # another process switches ``jlens.json`` mid-decode.
         configured_live_lens = (
-            getattr(self, "_live_lens", None) if live_lens_active else None
+            self._live_lens if live_lens_active else None
         )
-        configured_lens_probes = getattr(self, "_lens_probes", None) or {}
+        configured_lens_probes = self._lens_probes
         configured_lens_gate_names = {
             key.split("[", 1)[0]
             for key in (lens_gating_probe_keys or set())
@@ -5570,20 +5571,13 @@ class SaklasSession:
         # boundary's disk refresh.
         self._generation_jlens = None
         self._generation_jlens_active = False
-        if needs_lens_snapshot and hasattr(self, "_jlens_identity"):
-            self._generation_jlens = self.jlens
-        else:
-            self._generation_jlens = (
-                getattr(self, "_jlens", None) if needs_lens_snapshot else None
-            )
+        self._generation_jlens = self.jlens if needs_lens_snapshot else None
         self._generation_jlens_active = needs_lens_snapshot
 
-        # ``getattr`` like ``_compiled_clean_eligible`` below — spec'd mock
-        # stubs carry class attributes only, not instance state.
-        live_lens = getattr(self, "_live_lens", None) if live_lens_active else None
-        lens_probes = getattr(self, "_lens_probes", None) or {}
-        live_sae = getattr(self, "_live_sae", None) if live_sae_active else None
-        sae_probes = getattr(self, "_sae_probes", None) or {}
+        live_lens = self._live_lens if live_lens_active else None
+        lens_probes = self._lens_probes
+        live_sae = self._live_sae if live_sae_active else None
+        sae_probes = self._sae_probes
         lens_gate_probe_names = {
             key.split("[", 1)[0]
             for key in (lens_gating_probe_keys or set())
@@ -6262,11 +6256,9 @@ class SaklasSession:
 
     def remove_probe(self, name: str) -> None:
         """Detach a previously-attached probe (any shape)."""
-        # ``getattr`` — spec'd mock stubs carry class attributes only.
-        lens_probes = getattr(self, "_lens_probes", None)
-        if lens_probes and name in lens_probes:
-            del lens_probes[name]
-        elif getattr(self, "_sae_probes", None) and name in self._sae_probes:
+        if name in self._lens_probes:
+            del self._lens_probes[name]
+        elif name in self._sae_probes:
             del self._sae_probes[name]
         else:
             self._monitor.remove_probe(name)
@@ -6278,6 +6270,11 @@ class SaklasSession:
     def lens_probe_names(self) -> list[str]:
         """Names of the attached J-lens token probes (readout channel)."""
         return list(self._lens_probes)
+
+    @property
+    def lens_probe_specs(self) -> dict[str, dict[str, Any]]:
+        """Snapshot of attached J-lens probe specifications."""
+        return {name: dict(spec) for name, spec in self._lens_probes.items()}
 
     def _lens_probe_layers(self, names: set[str] | None = None) -> set[int]:
         """Union of the attached lens probes' band layers."""
@@ -6292,6 +6289,11 @@ class SaklasSession:
     @property
     def sae_probe_names(self) -> list[str]:
         return list(self._sae_probes)
+
+    @property
+    def sae_probe_specs(self) -> dict[str, dict[str, Any]]:
+        """Snapshot of attached SAE probe specifications."""
+        return {name: dict(spec) for name, spec in self._sae_probes.items()}
 
     def _score_lens_probes(
         self,
@@ -9004,7 +9006,7 @@ class SaklasSession:
         live_scores: bool = True,
         live_readouts: bool = True,
         gen_seat: str = "assistant",
-    ) -> Iterator[TokenEvent]:
+    ) -> GenerationStream:
         """Streaming generation.  See :meth:`generate` for kwargs.
 
         Yields ``TokenEvent`` per token.  On iterator close (normal
@@ -10010,21 +10012,19 @@ class SaklasSession:
                 grid=alpha_values,
             ))
 
-        fast_sweep_fn = getattr(self, "_generate_sweep_fast", None)
-        if callable(fast_sweep_fn):
-            fast_sweep = fast_sweep_fn(
-                jobs,
-                stateless=stateless,
-                on_result=(
-                    (lambda idx, result, row: on_result(
-                        idx, result, cast(dict[str, float], row),
-                    ))
-                    if on_result is not None
-                    else None
-                ),
-            )
-            if fast_sweep is not None:
-                return cast(RunSet, fast_sweep)
+        fast_sweep = self._generate_sweep_fast(
+            jobs,
+            stateless=stateless,
+            on_result=(
+                (lambda idx, result, row: on_result(
+                    idx, result, cast(dict[str, float], row),
+                ))
+                if on_result is not None
+                else None
+            ),
+        )
+        if fast_sweep is not None:
+            return fast_sweep
 
         return _run_serial_generation_jobs(
             self,
@@ -10057,3 +10057,6 @@ class SaklasSession:
 
     def __exit__(self, *args: Any) -> None:
         self.close()
+    def __iter__(self) -> "GenerationStream": ...
+
+    def __next__(self) -> TokenEvent: ...

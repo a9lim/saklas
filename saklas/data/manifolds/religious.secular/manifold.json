@@ -1,5 +1,5 @@
 {
-  "format_version": 7,
+  "format_version": 8,
   "name": "religious.secular",
   "description": "Bipolar axis: religious (+) vs secular (-). Steer with negative alpha for the opposite pole.",
   "fit_mode": "pca",

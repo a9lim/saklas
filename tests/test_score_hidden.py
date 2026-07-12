@@ -118,7 +118,6 @@ def test_score_stack_accumulate_false_leaves_history_untouched():
         {0: torch.tensor([[1.0, 0.0, 0.0, 0.0]])}, accumulate=False,
     )
     assert list(m.history["x"]) == before
-    assert m._stats["x"]["count"] == 0
 
 
 def test_score_stack_accumulate_true_records_aggregate():
@@ -127,7 +126,7 @@ def test_score_stack_accumulate_true_records_aggregate():
         {0: (torch.tensor([[1.0, 0.0, 0.0, 0.0]]) + _MEANS0[0])},
         accumulate=True,
     )
-    assert m._stats["x"]["count"] == 1
+    assert len(m.history["x"]) == 1
     # Aligned token ⇒ coord ≈ +1 recorded (history stores the coord tuple).
     assert list(m.history["x"])[-1][0] == pytest.approx(1.0, abs=0.1)
 
@@ -283,7 +282,6 @@ def test_score_hidden_accumulate_false_does_not_mutate_history():
     before = list(s._monitor.history["x"])
     s.score_hidden({0: torch.tensor([1.0, 0.0, 0.0, 0.0]) + _MEANS0[0]})
     assert list(s._monitor.history["x"]) == before
-    assert s._monitor._stats["x"]["count"] == 0
 
 
 def test_score_hidden_accumulate_true_records():
@@ -291,7 +289,7 @@ def test_score_hidden_accumulate_true_records():
     s.score_hidden(
         {0: torch.tensor([1.0, 0.0, 0.0, 0.0]) + _MEANS0[0]}, accumulate=True,
     )
-    assert s._monitor._stats["x"]["count"] == 1
+    assert len(s._monitor.history["x"]) == 1
 
 
 # ============================================ Mahalanobis read metric ===

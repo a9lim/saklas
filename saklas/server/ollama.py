@@ -26,11 +26,10 @@ from saklas.server.request_helpers import (
     flatten_content,
     merge_steering,
     parse_request_steering,
-    probe_reading_aggregate,
     probe_token_readings,
     strict_model_enabled,
 )
-from saklas.server.streaming import stream_finalizer
+from saklas.server.streaming import probe_reading_aggregate, stream_finalizer
 
 import hashlib
 import json
@@ -738,15 +737,12 @@ def register_ollama_routes(app: FastAPI) -> None:
                 # (no-op on an exhausted generator), an in-band error, or
                 # an early client-disconnect ``return`` — rather than
                 # leaving it to GC.
-                close = getattr(stream_iter, "close", None)
-                if callable(close):
-                    close()
+                assert stream_iter is not None
+                stream_iter.close()
 
             elapsed_ns = time.monotonic_ns() - start_ns
-            result = (
-                getattr(stream_iter, "result", None)
-                or getattr(session, "last_result", None)
-            )
+            assert stream_iter is not None
+            result = stream_iter.result
             finish_reason, _usage, mf_agg = stream_finalizer(session, result)
             done_reason = _finish_to_done_reason(finish_reason)
             stats = _duration_stats(result, elapsed_ns) if result is not None else {

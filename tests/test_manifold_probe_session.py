@@ -72,7 +72,10 @@ def _toy_manifold(*, dim: int = 8, n_layers: int = 2) -> Manifold:
         node_labels=["a", "b", "c"],
         node_coords=coords,
         layers=layers,
+        node_roles=[None, None, None],
+        node_kinds=[None, None, None],
         mahalanobis_share=share,
+        origin={layer: torch.zeros(1) for layer in layers},
     )
 
 
@@ -109,6 +112,16 @@ def _stub_session() -> SaklasSession:
         set_incremental=lambda _sink: None,
     )
     session._capture_state = CaptureState()
+    session._jlens = None
+    session._jlens_identity = None
+    session._generation_jlens = None
+    session._generation_jlens_active = False
+    session._live_lens = None
+    session._lens_probes = {}
+    session._live_sae = None
+    session._sae_probes = {}
+    session._lens_step_stash = None
+    session._live_lens_active_for_generation = True
     session._incremental_readings = []
     session._incremental_gate_scores = []
     session._layers = []

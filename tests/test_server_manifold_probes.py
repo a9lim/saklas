@@ -37,6 +37,7 @@ from saklas.core.results import (
     RunSet,
     TokenEvent,
 )
+from tests._generation_stream import TestGenerationStream
 
 
 def _single_run(**kwargs: Any) -> RunSet:
@@ -118,8 +119,14 @@ def _mock_session():
 
     session.vectors = {}
     session.probes = {}
-    session.history = []
     session.manifolds = {}
+    session.tree = MagicMock()
+    session.tree.messages_for.return_value = []
+    session.tree.active_node_id = "test-assistant"
+    session.tree.get.return_value.mean_logprob = None
+    session.tree.get.return_value.mean_surprise = None
+    session.lens_probe_specs = {}
+    session.sae_probe_specs = {}
 
     # The unified monitor: one object, both ``probe_names`` (the wire/gate
     # surface) and ``attached_probes()`` (the serializer source).
@@ -143,6 +150,7 @@ def _mock_session():
 
     gen_state = MagicMock()
     gen_state.finish_reason = "stop"
+    gen_state.emit_map = []
     session.generation_state = gen_state
 
     session.build_readings.return_value = {}
@@ -570,12 +578,10 @@ class TestOpenAIProbeExtension:
         def _mock_stream(*args: Any, **kwargs: Any) -> Any:
             assert kwargs.get("live_scores") is False
             assert kwargs.get("live_readouts") is False
-            yield TokenEvent(
-                text="Hi", token_id=1, index=0,
-            )
-            yield TokenEvent(
-                text=" there", token_id=2, index=1,
-            )
+            return TestGenerationStream([
+                TokenEvent(text="Hi", token_id=1, index=0),
+                TokenEvent(text=" there", token_id=2, index=1),
+            ], result)
 
         session.generate_stream.side_effect = _mock_stream
 
@@ -664,9 +670,9 @@ class TestOllamaProbeExtension:
         def _mock_stream(*args: Any, **kwargs: Any) -> Any:
             assert kwargs.get("live_scores") is False
             assert kwargs.get("live_readouts") is False
-            yield TokenEvent(
-                text="Hi", token_id=1, index=0,
-            )
+            return TestGenerationStream([
+                TokenEvent(text="Hi", token_id=1, index=0),
+            ], result)
 
         session.generate_stream.side_effect = _mock_stream
 

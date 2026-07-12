@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from contextlib import suppress
 from typing import Any
 
 
@@ -19,11 +18,8 @@ def build_token_event(
     """Build one native WS ``token`` frame from the current engine state."""
     node_id = node_holder[0]
     if node_id is None:
-        with suppress(Exception):
-            candidate = session.tree.active_node_id
-            if isinstance(candidate, str):
-                node_id = candidate
-                node_holder[0] = candidate
+        node_id = session.tree.active_node_id
+        node_holder[0] = node_id
 
     event: dict[str, Any] = {
         "type": "token",
@@ -40,10 +36,9 @@ def build_token_event(
             for a in top_alts
         ]
 
-    with suppress(Exception):
-        emap = session.generation_state.emit_map
-        if emap:
-            event["raw_index"] = int(emap[-1][0])
+    emap = session.generation_state.emit_map
+    if emap:
+        event["raw_index"] = int(emap[-1][0])
 
     # The token tap owns this payload.  Do not reconstruct it from persisted
     # loom rows: doing so creates a second wire authority and masks tap bugs.
@@ -76,42 +71,39 @@ def build_token_event(
     # layer (``enable_live_lens``), stashed by the token tap alongside the
     # probe readings.  String layer keys to match ``per_layer_scores``' wire
     # shape; ``[token, score]`` pairs serialize as 2-arrays.
-    with suppress(Exception):
-        lens = payload.get("lens")
-        if lens:
-            event["lens_readout"] = {
-                str(layer): [[tok, float(score)] for tok, score in pairs]
-                for layer, pairs in lens.items()
-            }
+    lens = payload.get("lens")
+    if lens:
+        event["lens_readout"] = {
+            str(layer): [[tok, float(score)] for tok, score in pairs]
+            for layer, pairs in lens.items()
+        }
         # The layer-aggregated chip list riding the same step: ``[token,
         # strength, com, spread]`` 4-arrays, strength-descending (mean
         # band probability + probability-mass-weighted depth center of mass).
-        agg = (
-            payload.get("lens_aggregate")
-        )
-        if agg:
-            event["lens_aggregate"] = [
-                [tok, float(s), float(com), float(spread)]
-                for tok, s, com, spread in agg
-            ]
+    agg = payload.get("lens_aggregate")
+    if agg:
+        event["lens_aggregate"] = [
+            [tok, float(s), float(com), float(spread)]
+            for tok, s, com, spread in agg
+        ]
 
-        sae = payload.get("sae")
-        if sae:
-            # ``max_act`` is the cached Neuronpedia maxActApprox (the strength
-            # unit — clients render ``activation / max_act`` as the normalized
-            # 0..1 strength); ``None`` until the metadata backfill lands.
-            event["sae_readout"] = [
-                {
-                    "id": int(row[0]),
-                    "activation": float(row[1]),
-                    "label": row[2],
-                    "max_act": (
-                        float(row[3])
-                        if len(row) > 3 and row[3] is not None
-                        else None
-                    ),
-                }
-                for row in sae
-            ]
+    sae = payload.get("sae")
+    if sae:
+        # ``max_act`` is the cached Neuronpedia maxActApprox (the strength
+        # unit — clients render ``activation / max_act`` as the normalized
+        # 0..1 strength); ``None`` until the metadata backfill lands.
+        event["sae_readout"] = [
+            {
+                "id": int(row[0]),
+                "activation": float(row[1]),
+                "label": row[2],
+                "max_act": (
+                    float(row[3])
+                    if len(row) > 3 and row[3] is not None
+                    else None
+                ),
+            }
+            for row in sae
+        ]
 
     return event

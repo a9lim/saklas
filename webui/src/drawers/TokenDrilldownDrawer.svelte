@@ -243,8 +243,7 @@
 
   /** Build ranked rows from the token's ``top_alts``.  Server emits the
    *  list in descending-logprob order, so ``index + 1`` is the rank.
-   *  Chosen-row identification falls back to text equality when
-   *  ``token.tokenId`` is null (legacy / replayed shape). */
+   *  Chosen-row identification uses the token id carried by the current wire. */
   const rankRows = $derived.by<RankRow[]>(() => {
     const alts = token?.topAlts;
     if (!alts || alts.length === 0) return [];
@@ -256,10 +255,7 @@
       logprob: a.logprob,
       p: Math.exp(a.logprob),
       delta: a.logprob - lp0,
-      chosen:
-        token?.tokenId != null
-          ? a.id === token.tokenId
-          : a.text === token?.text,
+      chosen: token?.tokenId != null && a.id === token.tokenId,
     }));
   });
 
@@ -315,7 +311,7 @@
     if (token == null || token.rawIndex == null) {
       branchError =
         "this token has no raw-decode index; forking needs a node " +
-        "generated in this session (legacy / replayed turns can't fork)";
+        "generated with raw-decode capture in this session";
       return;
     }
     branchingRank = row.rank;
@@ -723,7 +719,7 @@
       {:else if token.rawIndex == null}
         <div class="empty">
           This token has no raw-decode index — the readout needs a node
-          generated in this session (legacy / replayed turns can't be
+          generated in this session (current uncaptured turns can't be
           re-read, same constraint as forking).
         </div>
       {:else if !loomNodeId}

@@ -387,7 +387,7 @@ class TestAlignmentCache:
         )
         assert loaded is not None
         restored, sidecar = loaded
-        assert sidecar["format_version"] == 4
+        assert sidecar["format_version"] == 5
         assert torch.equal(restored[3].left, alignment.left)
         assert torch.equal(restored[3].right, alignment.right)
         assert torch.equal(restored[3].offset, alignment.offset)

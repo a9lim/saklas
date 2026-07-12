@@ -977,9 +977,9 @@ export type WSClientMessage = WSGenerateRequest | WSStopRequest;
 export interface WSStartedEvent {
   type: "started";
   generation_id: string;
-  /** Loom: node id receiving this gen's tokens.  Optional for backward
-   * compat with the pre-phase-2 single-path server. */
-  node_id?: string | null;
+  node_id: string | null;
+  sibling_index: number;
+  sibling_count: number;
 }
 
 /** Logit-pass (v2.3): one alternative the model considered at this
@@ -1010,7 +1010,7 @@ export interface WSTokenEvent {
   /** Logit-pass: chosen-token logprob under the post-sampler distribution.
    *  Populated whenever the engine's log_softmax ran (any ``on_token``
    *  consumer or an explicit ``logprobs``/``return_top_k`` request).
-   *  Absent on legacy / replayed events. */
+   *  Absent on current uncaptured events. */
   logprob?: number | null;
   /** Logit-pass: top-K alternatives sorted by descending logprob.  Length
    *  matches ``SamplingConfig.return_top_k`` when populated, else absent.
@@ -1019,11 +1019,11 @@ export interface WSTokenEvent {
   top_alts?: TokenAltJSON[] | null;
   /** Logit-pass: raw decode-step index — the join key a logit fork slices
    *  ``raw_token_ids`` on.  Rides the ``token`` event directly; absent on
-   *  legacy / replayed events. */
+   *  current uncaptured events. */
   raw_index?: number | null;
   /** Loom: node id this token belongs to.  Routes the token to the right
    * sibling render during n-way regen.  Optional. */
-  node_id?: string | null;
+  node_id: string | null;
   /** Per-attached-probe reading for this token — every probe shape (a
    *  2-node concept axis is the rank-1 case).  Keys are probe names; values
    *  are the full ``ProbeReadingJSON``.  Omitted entirely when no probe is
@@ -1060,6 +1060,7 @@ export interface WSDoneResult {
    *  response span (thinking tokens excluded by construction).  Null when
    *  logprob capture wasn't live (replay / no on_token consumer). */
   mean_logprob?: number | null;
+  mean_surprise?: number | null;
   /** End-of-generation per-attached-probe aggregate — the same
    *  ``ProbeReadingJSON`` shape as the per-token stream (the aggregate is the
    *  reading pooled at the last-content token).  Keys are probe names.
@@ -1071,7 +1072,9 @@ export interface WSDoneEvent {
   type: "done";
   result: WSDoneResult;
   /** Loom: node id this gen finalised. */
-  node_id?: string | null;
+  node_id: string | null;
+  sibling_index: number;
+  sibling_count: number;
 }
 
 export interface WSErrorEvent {
@@ -1092,12 +1095,12 @@ export interface WSErrorEvent {
  *  legitimately omits some on certain paths (e.g. ``top_alts`` only when
  *  ``return_top_k > 0``; ``probes`` / ``per_layer_scores`` only when the
  *  monitor has probes loaded; ``raw_index`` is stamped at finalize and
- *  absent for legacy / transcript-loaded nodes). */
+ *  absent for transcript-imported nodes). */
 export interface LoomTokenRowJSON {
-  token_id?: number;
-  text?: string;
-  logprob?: number | null;
-  perplexity?: number | null;
+  token_id: number;
+  text: string;
+  logprob: number | null;
+  perplexity: number | null;
   top_alts?: { id: number; text: string; logprob: number }[];
   raw_index?: number | null;
   /** Per-token magnitude-weighted aggregate probe score
@@ -1118,48 +1121,48 @@ export interface LoomNodeJSON {
   /** Per-turn role-substitution label (roleplay scaffold) — the custom
    *  role this turn was *sent* with (e.g. "captain" / "pirate"), or null
    *  for the standard role.  Drives the bubble heading + loom glyph.
-   *  Older servers omit this; treat undefined as null. */
-  role_label?: string | null;
+   *  Null means the standard role. */
+  role_label: string | null;
   /** The turn's verbatim thinking block — committed by the human, or the
    *  decoded thinking channel of a generated node (stamped at finalize).
-   *  Strip families re-render it for one turn only.  Older servers omit
-   *  it. */
-  thinking_text?: string | null;
+   *  Strip families re-render it for one turn only. Null means no block. */
+  thinking_text: string | null;
   /** Assistant nodes only.  Mirrors saklas.core.loom.Recipe. */
-  recipe?: {
-    steering?: string | null;
-    sampling?: WSSampling | null;
-    thinking?: boolean | null;
-    seed?: number | null;
-    probes?: string[];
-    probe_hashes?: Record<string, string>;
+  recipe: {
+    steering: string | null;
+    sampling: WSSampling | null;
+    thinking: boolean | null;
+    seed: number | null;
+    probes: string[];
+    probe_hashes: Record<string, string>;
   } | null;
-  aggregate_readings?: Record<string, number>;
-  applied_steering?: string | null;
-  finish_reason?: string | null;
-  starred?: boolean;
-  notes?: string;
-  created_at?: number;
-  edited_at?: number | null;
-  edit_count?: number;
+  aggregate_readings: Record<string, number>;
+  applied_steering: string | null;
+  finish_reason: string | null;
+  starred: boolean;
+  notes: string;
+  created_at: number;
+  edited_at: number | null;
+  edit_count: number;
   /** Logit-pass: mean chosen-token logprob over the response span when
-   *  logprob capture was live; absent on legacy / replayed nodes.  Drives
+   *  logprob capture was live; absent on current uncaptured nodes.  Drives
    *  the loom sidebar's surprise edge-weighting and the
    *  ``sort:surprise`` / ``sort:confidence`` filter grammar. */
-  mean_logprob?: number | null;
+  mean_logprob: number | null;
+  mean_surprise: number | null;
   /** Per-token response-span rows captured during streaming.  Present
    *  when the server serializes the tree with ``include_tokens=True``
-   *  (the webui tree GET path).  Absent on legacy / transcript-loaded
+   *  (the webui tree GET path).  Absent on transcript-imported
    *  nodes that never streamed under the v2.4 token-row schema. */
-  tokens?: LoomTokenRowJSON[] | null;
+  tokens: LoomTokenRowJSON[] | null;
   /** Per-token thinking-span rows.  Same shape as ``tokens``; populated
    *  only when the engine emitted thinking content for the node. */
-  thinking_tokens?: LoomTokenRowJSON[] | null;
+  thinking_tokens: LoomTokenRowJSON[] | null;
   /** Raw decode-step ids the engine sampled, including suppressed
    *  delimiters and unmerged partial-UTF-8 bytes.  The forceable prefix
-   *  a logit fork replays from; ``null`` on legacy / transcript-loaded
+   *  a logit fork replays from; ``null`` on transcript-imported
    *  nodes, in which case the fork affordance falls back to disabled. */
-  raw_token_ids?: number[] | null;
+  raw_token_ids: number[] | null;
 }
 
 /** Full tree dump returned by GET /sessions/{id}/tree.
@@ -1169,7 +1172,8 @@ export interface LoomNodeJSON {
  *  child-id map.  Clients pivot the node list into a dict keyed by id
  *  for the in-memory cache. */
 export interface LoomTreeJSON {
-  tree_format?: number;
+  tree_format: number;
+  saklas_version: string;
   root_id: string;
   active_node_id: string;
   rev: number;
@@ -1177,11 +1181,11 @@ export interface LoomTreeJSON {
   /** parent_id → ordered list of child ids. */
   children_of: Record<string, string[]>;
   /** Optional model identifier the tree was generated against. */
-  model_id?: string | null;
-  session_id?: string | null;
-  name?: string | null;
+  model_id: string | null;
+  session_id: string | null;
+  name: string | null;
   /** Cast roster (phase 3): label → member.  Absent when empty. */
-  cast?: Record<string, CastMemberJSON>;
+  cast: Record<string, CastMemberJSON>;
 }
 
 /** One cast-roster member — a named label plus its standing recipe
@@ -1352,21 +1356,12 @@ export interface WSTreeMutatedEvent {
 
 /** Fired at the start of each branch in an n-way generate so the client
  * can allocate render slots before token events arrive. */
-export interface WSNodeCreatedEvent {
-  type: "node_created";
-  node_id: string;
-  parent_id: string | null;
-  role: "user" | "assistant" | "system";
-  rev: number;
-}
-
 export type WSServerMessage =
   | WSStartedEvent
   | WSTokenEvent
   | WSDoneEvent
   | WSErrorEvent
-  | WSTreeMutatedEvent
-  | WSNodeCreatedEvent;
+  | WSTreeMutatedEvent;
 
 // ----------------------------------------------------- chat / UI --
 
@@ -1403,7 +1398,7 @@ export interface TokenScore {
   topAlts?: TokenAltJSON[] | null;
   /** Raw decode-step index of this token in the backing node's
    *  ``raw_token_ids`` — the join key a logit fork slices on.  Absent on
-   *  legacy / transcript-loaded nodes (engine pre-dates raw-id capture),
+   *  transcript-imported nodes (engine pre-dates raw-id capture),
    *  in which case the token can't be forked. */
   rawIndex?: number | null;
 }
@@ -1440,7 +1435,7 @@ export interface ChatTurn {
   perplexity?: number;
   /** Logit-pass: per-turn mean chosen-token logprob (response span only,
    *  thinking excluded).  Populated from the WS ``done`` event; absent for
-   *  legacy / replayed turns. */
+   *  current uncaptured turns. */
   meanLogprob?: number | null;
 }
 

@@ -31,6 +31,29 @@ _VARIANT_SEPARATORS: tuple[tuple[str, str], ...] = (
 _UNSAFE_VARIANT_CHARS = re.compile(r"[^a-z0-9._-]+")
 
 
+def encode_release_id(release: str) -> str:
+    """Encode an SAE release as one reversible grammar-safe component."""
+    if not release:
+        raise ValueError("SAE release must not be empty")
+    encoded = base64.b32encode(release.encode("utf-8")).decode("ascii")
+    return "_z" + encoded.rstrip("=").lower()
+
+
+def decode_release_id(encoded: str) -> str:
+    """Reverse :func:`encode_release_id`, rejecting non-canonical input."""
+    if not encoded.startswith("_z"):
+        raise ValueError(f"invalid encoded SAE release {encoded!r}")
+    payload = encoded[2:].upper()
+    payload += "=" * (-len(payload) % 8)
+    try:
+        release = base64.b32decode(payload, casefold=False).decode("utf-8")
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise ValueError(f"invalid encoded SAE release {encoded!r}") from exc
+    if not release or encode_release_id(release) != encoded:
+        raise ValueError(f"invalid encoded SAE release {encoded!r}")
+    return release
+
+
 def _encode_tensor_component(value: str) -> str:
     """Escape reserved filename separators inside one model/variant slug."""
     value = value.replace("%", "%25")
@@ -159,10 +182,7 @@ def safe_sae_suffix(release: str | None) -> str:
     """Filename suffix for an SAE variant.  ``None``/``""`` = raw (no suffix)."""
     if not release:
         return ""
-    slug = _encode_tensor_component(
-        _UNSAFE_VARIANT_CHARS.sub("_", release.lower()),
-    )
-    return f"{_VARIANT_SEP_SAE}{slug}"
+    return f"{_VARIANT_SEP_SAE}{encode_release_id(release)}"
 
 
 def safe_from_suffix(source_safe_id: str | None) -> str:

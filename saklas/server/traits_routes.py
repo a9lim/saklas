@@ -35,11 +35,11 @@ def register_traits_routes(app: FastAPI) -> None:
             if isinstance(event, GenerationStarted):
                 _enqueue((
                     "start",
-                    getattr(event, "input", None),
-                    getattr(event, "stateless", False),
+                    event.input,
+                    event.stateless,
                 ))
             elif isinstance(event, GenerationFinished):
-                _enqueue(("done", getattr(event, "result", None)))
+                _enqueue(("done", event.result))
 
         unsub = session.events.subscribe(_on_event)
         session.register_trait_queue(loop, trait_queue)
@@ -91,20 +91,17 @@ def register_traits_routes(app: FastAPI) -> None:
                         aggregate: dict[str, float] = {}
                         probe_readings: dict[str, Any] = {}
                         if result is not None:
-                            mf_readings = getattr(
-                                result, "probe_readings", None,
-                            )
+                            mf_readings = result.probe_readings
                             if mf_readings:
                                 for name, agg in mf_readings.items():
                                     value = agg.coords[0] if agg.coords else 0.0
                                     aggregate[name] = round(float(value), 6)
-                                    with suppress(Exception):
-                                        probe_readings[name] = agg.to_dict()
+                                    probe_readings[name] = agg.to_dict()
                         payload = {
                             "type": "done",
                             "generation_id": generation_id,
                             "finish_reason": (
-                                getattr(result, "finish_reason", "stop")
+                                result.finish_reason
                                 if result
                                 else "stop"
                             ),

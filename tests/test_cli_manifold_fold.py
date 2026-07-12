@@ -81,7 +81,7 @@ def _seed_neutral_cache(model_id: str, *, n: int = 64, seed: int = 5) -> None:
         tensor_sha256[str(layer)] = hash_file(tensor_path)
     (md / "neutral_activations.json").write_text(json.dumps({
         "method": "neutral_activations",
-        "format_version": 3,
+        "format_version": 4,
         "capture_version": 1,
         "capture_sha256": "test-capture",
         "model_fingerprint": "test-fingerprint",

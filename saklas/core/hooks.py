@@ -11,10 +11,10 @@ from saklas.core.manifold import (
     BoxDomain,
     CustomDomain,
     LayerSubspace,
+    Manifold,
     ManifoldDomain,
     SynthesizedSubspace,
     _ortho_basis,
-    eval_rbf,
     subspace_inject,
 )
 from saklas.core.triggers import Trigger, TriggerContext
@@ -1113,7 +1113,7 @@ def _normalize_shares_mean1(raw: dict[int, float]) -> dict[int, float]:
     return {L: s / total * n_layers for L, s in raw.items()}
 
 
-def _manifold_layer_shares(manifold: Any) -> dict[int, float]:
+def _manifold_layer_shares(manifold: Manifold) -> dict[int, float]:
     # Prefer the whitened (Mahalanobis) per-layer share baked at fit time —
     # the subspace-restricted analogue of vector steering's ``‖d‖_M`` bake
     # score (see ``LayerWhitener.subspace_gram`` /
@@ -1126,38 +1126,17 @@ def _manifold_layer_shares(manifold: Any) -> dict[int, float]:
     # n_layers``, not 1) so ``eff_along_L = share_L · base_gain`` is a clean
     # per-layer slide fraction ≈ ``base`` on a typical layer and
     # n_layers-invariant — see ``_MANIFOLD_ONTO_GAIN``.
-    baked = getattr(manifold, "mahalanobis_share", None)
-    if baked and all(layer_idx in baked for layer_idx in manifold.layers):
-        layer_scores: dict[int, float] = {
-            layer_idx: float(baked[layer_idx]) for layer_idx in manifold.layers
-        }
-    else:
-        # Euclidean centroid-spread fallback: used only when no whitener was
-        # present at fit time (CPU test stubs without a neutral cache).
-        # Guard on ``is_affine`` first — ``rbf_params()`` raises on flat
-        # subspaces (documented in core/AGENTS.md), so we must never call it
-        # on concepts / personas / any pca-fit manifold (T1.5 fix).
-        layer_scores = {}
-        for layer_idx, sub in manifold.layers.items():
-            if sub.is_affine:
-                # Flat subspace: use the Euclidean norm of the per-layer
-                # real node coords (K, R) stored on every affine LayerSubspace.
-                # Falls back to 1.0 when node_coords is absent (degenerate stub).
-                nc = sub.node_coords
-                score = (
-                    float(torch.linalg.vector_norm(nc.to(torch.float32)).item())
-                    if nc is not None
-                    else 1.0
-                )
-            else:
-                # Curved subspace: eval the RBF at the fit nodes to get the
-                # (K, R) reduced coords and use their Frobenius norm as a spread.
-                _np, _rw, _pc = sub.rbf_params()
-                node_coords = eval_rbf(
-                    _np, _rw, _pc, _np,
-                )  # (K, R) — exact centered coords at the fit nodes
-                score = float(torch.linalg.vector_norm(node_coords).item())
-            layer_scores[layer_idx] = score
+    baked = manifold.mahalanobis_share
+    missing = set(manifold.layers) - set(baked)
+    extra = set(baked) - set(manifold.layers)
+    if missing or extra:
+        raise ValueError(
+            f"manifold {manifold.name!r} has non-canonical Mahalanobis shares "
+            f"(missing={sorted(missing)}, extra={sorted(extra)})"
+        )
+    layer_scores = {
+        layer_idx: float(baked[layer_idx]) for layer_idx in manifold.layers
+    }
     return _normalize_shares_mean1(layer_scores)
 
 
@@ -1232,7 +1211,7 @@ class SteeringManager:
     def add_manifold(
         self,
         name: str,
-        manifold: object,
+        manifold: Manifold,
         position: tuple[float, ...] | str,
         along: float,
         onto: float,
@@ -1262,21 +1241,10 @@ class SteeringManager:
         in-subspace residual.  The off-subspace residual is always kept
         verbatim (the old ``toward`` op is removed).
         """
-        resolve = getattr(manifold, "resolve_position", None)
-        if resolve is not None:
-            resolved = resolve(position)
-        elif isinstance(position, str):
-            # Defensive: a manifold-shaped object without
-            # ``resolve_position`` (e.g. a test double) can't resolve
-            # labels.  Raise rather than guess.
-            raise TypeError(
-                f"manifold {name!r} cannot resolve a label-form position "
-                f"({position!r}) — the manifold lacks resolve_position()"
-            )
-        else:
-            resolved = tuple(float(c) for c in position)
-        domain = getattr(manifold, "domain", None)
-        if domain is not None and len(resolved) != domain.intrinsic_dim:
+        manifold.validate_runtime_geometry()
+        resolved = manifold.resolve_position(position)
+        domain = manifold.domain
+        if len(resolved) != domain.intrinsic_dim:
             from saklas.core.errors import ManifoldArityError
             raise ManifoldArityError(
                 f"manifold {name!r} has a {domain.intrinsic_dim}-dimensional "
@@ -1411,11 +1379,10 @@ class SteeringManager:
             # Target is layer-independent (one authoring position); clamp it
             # into the domain once.  The cold-start origin seed ``O_L`` is
             # per-layer (each layer's neutral foot) — picked inside the loop.
-            n_dim = domain.intrinsic_dim
             target_coord = domain.clamp_position(
                 torch.tensor([float(c) for c in position], dtype=torch.float32)
             )
-            mfld_origins = getattr(manifold, "origin", None) or {}
+            mfld_origins = manifold.origin
 
             for layer_idx, sub in manifold.layers.items():
                 B_new = sub.basis.to(torch.float32)
@@ -1437,15 +1404,14 @@ class SteeringManager:
                 else:
                     curved_basis_by_layer[layer_idx] = B_new
                     curved_owner[layer_idx] = mname
-                # ``O_L`` (this layer's neutral foot) or ``zeros(n)`` when the
-                # layer baked no origin (CPU stub / pre-origin fit).
-                O_L = mfld_origins.get(layer_idx)
-                if O_L is None:
-                    origin_coord = torch.zeros(n_dim, dtype=torch.float32)
-                else:
-                    origin_coord = domain.clamp_position(
-                        O_L.reshape(-1).to(torch.float32)
+                if layer_idx not in mfld_origins:
+                    raise ValueError(
+                        f"curved manifold {manifold.name!r} has no neutral "
+                        f"origin for layer {layer_idx}"
                     )
+                origin_coord = domain.clamp_position(
+                    mfld_origins[layer_idx].reshape(-1).to(torch.float32)
+                )
                 manifold_by_layer.setdefault(layer_idx, []).append((
                     sub, domain, target_coord, origin_coord,
                     eff_along[layer_idx], eff_onto[layer_idx], 0.0, trigger,

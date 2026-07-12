@@ -499,7 +499,7 @@ class SaklasApp(App[None]):
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="main-area"):
-            yield LeftPanel(self._session.model_metadata, id="left-panel")
+            yield LeftPanel(self._session.model_info, id="left-panel")
             yield ChatPanel(id="chat-panel")
             yield TraitPanel(categories=self._probe_categories, id="trait-panel")
 
@@ -533,7 +533,7 @@ class SaklasApp(App[None]):
 
         loaded = (
             f"Model loaded: "
-            f"{self._session.model_metadata.get('model_id', 'unknown')}. "
+            f"{self._session.model_info.get('model_id', 'unknown')}. "
         )
         if self._is_base_model:
             loaded += (
@@ -2487,7 +2487,7 @@ class SaklasApp(App[None]):
         # The deserialized tree carries no event bus / conflict hook.
         loaded.attach_events(self._session.events)
         loaded.set_conflict_check(self._session.loom_conflict_check)
-        live_model = self._session.model_metadata.get("model_id")
+        live_model = self._session.model_info.get("model_id")
         if loaded.model_id is None:
             loaded.model_id = live_model
         elif live_model is not None and loaded.model_id != live_model:
@@ -2528,7 +2528,7 @@ class SaklasApp(App[None]):
 
     def _handle_model_info(self) -> None:
         chat = self._chat_panel
-        info = self._session.model_metadata
+        info = self._session.model_info
         lines = [
             f"Model: {info.get('model_id', 'unknown')}",
             f"Arch: {info.get('model_type', 'unknown')}  "

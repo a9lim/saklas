@@ -40,11 +40,21 @@ from saklas.io.paths import model_dir
 
 log = logging.getLogger(__name__)
 
-LENS_FORMAT_VERSION = 4
+LENS_FORMAT_VERSION = 5
 _LENS_NAME = "jlens"
 _LENS_CHECKPOINT_NAME = "jlens.partial"
 _LENS_METHOD = "jlens_cotangent_sum"
 LENS_CORPUS_PREPROCESS_VERSION = 1
+
+_LENS_SIDECAR_FIELDS = {
+    "format_version", "method", "n_prompts", "d_model", "source_layers",
+    "dtype", "corpus_spec", "corpus_sha256", "corpus_hash_kind", "seq_len",
+    "dim_batch", "skip_first_positions", "estimator_policy", "tensor_sha256",
+    "tensor_files", "raw_corpus_sha256", "raw_prompt_count",
+    "usable_prompt_count", "model_layer_count", "model_fingerprint",
+    "model_source_fingerprint", "checkpoint", "base_n_prompts",
+    "partial_n_prompts", "consumed_prefix_sha256",
+}
 
 
 @dataclass(frozen=True)
@@ -331,6 +341,8 @@ def _load_sidecar_at(
     try:
         with open(sc_path) as f:
             sidecar = json.load(f)
+        if not isinstance(sidecar, dict) or set(sidecar) != _LENS_SIDECAR_FIELDS:
+            raise ValueError("lens sidecar does not match the current exact schema")
         ts_path = _sidecar_tensor_path(tensor_anchor, sidecar)
         if not ts_path.exists():
             return None
@@ -352,23 +364,61 @@ def _load_sidecar_at(
                 "ignoring — re-fit with `saklas lens fit`", label, model_id,
             )
             return None
-        d_model = int(sidecar.get("d_model", 0) or 0)
-        source_layers_raw = sidecar.get("source_layers")
+        d_model = sidecar["d_model"]
+        source_layers_raw = sidecar["source_layers"]
         if (
-            d_model <= 0
+            isinstance(d_model, bool)
+            or not isinstance(d_model, int)
+            or d_model <= 0
             or not isinstance(source_layers_raw, list)
             or not source_layers_raw
+            or any(
+                isinstance(layer, bool) or not isinstance(layer, int) or layer < 0
+                for layer in source_layers_raw
+            )
+            or source_layers_raw != sorted(set(source_layers_raw))
+            or sidecar["method"] != _LENS_METHOD
+            or sidecar["dtype"] != "float16"
+            or any(
+                isinstance(sidecar[key], bool) or not isinstance(sidecar[key], int)
+                or sidecar[key] < 0
+                for key in ("n_prompts", "seq_len", "dim_batch", "skip_first_positions")
+            )
+            or not isinstance(sidecar["checkpoint"], bool)
         ):
             log.warning(
                 "%s for %s has invalid sidecar shape metadata; ignoring "
                 "— re-fit with `saklas lens fit`", label, model_id,
             )
             return None
-        # Normalize the layer values for metadata-only callers, matching
-        # ``JacobianLens.source_layers`` without touching the safetensors file.
-        sidecar = dict(sidecar)
-        sidecar["source_layers"] = sorted(int(layer) for layer in source_layers_raw)
-        sidecar["d_model"] = d_model
+        nullable_strings = (
+            "raw_corpus_sha256", "model_fingerprint",
+            "model_source_fingerprint", "consumed_prefix_sha256",
+        )
+        if any(
+            sidecar[key] is not None and not isinstance(sidecar[key], str)
+            for key in nullable_strings
+        ):
+            raise ValueError("lens sidecar has invalid nullable string metadata")
+        nullable_ints = (
+            "raw_prompt_count", "usable_prompt_count", "model_layer_count",
+            "base_n_prompts", "partial_n_prompts",
+        )
+        if any(
+            value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+            )
+            for value in (sidecar[key] for key in nullable_ints)
+        ):
+            raise ValueError("lens sidecar has invalid nullable integer metadata")
+        if sidecar["checkpoint"]:
+            if sidecar["base_n_prompts"] is None or sidecar["partial_n_prompts"] is None:
+                raise ValueError("lens checkpoint is missing progress metadata")
+        elif any(
+            sidecar[key] is not None
+            for key in ("base_n_prompts", "partial_n_prompts", "consumed_prefix_sha256")
+        ):
+            raise ValueError("final lens carries checkpoint-only metadata")
         expected_digests = sidecar.get("tensor_sha256")
         expected_keys = {str(layer) for layer in sidecar["source_layers"]}
         if (
@@ -695,21 +745,25 @@ def _save_lens_components(
         "estimator_policy": lens_estimator_policy(skip_first=skip_first),
         "tensor_sha256": tensor_sha256,
         "tensor_files": tensor_files,
+        "raw_corpus_sha256": raw_corpus_sha256,
+        "raw_prompt_count": None if raw_prompt_count is None else int(raw_prompt_count),
+        "usable_prompt_count": (
+            None if usable_prompt_count is None else int(usable_prompt_count)
+        ),
+        "model_layer_count": (
+            None if model_layer_count is None else int(model_layer_count)
+        ),
+        "model_fingerprint": model_fingerprint,
+        "model_source_fingerprint": model_source_fingerprint,
+        "checkpoint": False,
+        "base_n_prompts": None,
+        "partial_n_prompts": None,
+        "consumed_prefix_sha256": None,
     }
-    if raw_corpus_sha256 is not None:
-        sidecar["raw_corpus_sha256"] = raw_corpus_sha256
-    if raw_prompt_count is not None:
-        sidecar["raw_prompt_count"] = int(raw_prompt_count)
-    if usable_prompt_count is not None:
-        sidecar["usable_prompt_count"] = int(usable_prompt_count)
-    if model_layer_count is not None:
-        sidecar["model_layer_count"] = int(model_layer_count)
-    if model_fingerprint is not None:
-        sidecar["model_fingerprint"] = model_fingerprint
-    if model_source_fingerprint is not None:
-        sidecar["model_source_fingerprint"] = model_source_fingerprint
     if extra_sidecar:
         sidecar.update(extra_sidecar)
+    if set(sidecar) != _LENS_SIDECAR_FIELDS:
+        raise ValueError("lens writer produced a non-canonical sidecar")
     try:
         # Every immutable layer generation is complete before this one atomic
         # pointer switch. A sidecar failure leaves the prior pointer and tensor
@@ -926,8 +980,12 @@ def promote_lens_checkpoint(
         # The final pointer must follow both file and directory durability.
         fsync_directory(final_sc.parent)
         durable_sidecar = dict(sidecar)
-        for key in ("checkpoint", "base_n_prompts", "partial_n_prompts"):
-            durable_sidecar.pop(key, None)
+        durable_sidecar.update({
+            "checkpoint": False,
+            "base_n_prompts": None,
+            "partial_n_prompts": None,
+            "consumed_prefix_sha256": None,
+        })
         # Publish only the pointer. The immutable tensor stays referenced by the
         # checkpoint until this succeeds, so any sidecar failure preserves both
         # the prior durable lens and the complete resumable checkpoint.
