@@ -12,7 +12,6 @@ from saklas.core.results import GenerationResult, ProbeReading, ProbeReadings
 
 def finalize_generation(
     session: Any,
-    input: Any,
     generated_ids: list[int],
     elapsed: float,
     vector_snapshot: dict[str, float],
@@ -29,8 +28,6 @@ def finalize_generation(
     min_elapsed_for_rate: float = 1e-9,
 ) -> GenerationResult:
     """Decode, score probes, update session side effects, and build a result."""
-    del input  # kept in the public wrapper signature for compatibility
-
     token_count = len(generated_ids)
     tok_per_sec = token_count / elapsed if elapsed > min_elapsed_for_rate else 0.0
     response_ids = generated_ids[session._gen_state.thinking_end_idx:]

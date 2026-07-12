@@ -159,10 +159,7 @@ def test_allowlist_entries_are_still_present() -> None:
 # The four names that were promoted from underscore-private to public in T2.4.
 # Frontends must now import the public form; importing the old underscore name
 # from any module is a regression against the promotion.
-_PROMOTED_OLD_NAMES = frozenset([
-    "_manifold_is_affine",
-    "_export_gguf_manifold",
-])
+_PROMOTED_OLD_NAMES = frozenset(["_export_gguf_manifold"])
 
 # All cross-module import surfaces (cli/server/tui plus core helpers) must use
 # the promoted public names.

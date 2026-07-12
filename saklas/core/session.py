@@ -74,7 +74,7 @@ from saklas.core.results import (
 from saklas.core.sampling import SamplingConfig
 from saklas.core.steering import Steering
 from saklas.core.steering_expr import AblationTerm, ManifoldTerm, ProjectedTerm
-from saklas.core.manifold import Manifold, manifold_is_affine
+from saklas.core.manifold import Manifold
 
 if TYPE_CHECKING:
     from saklas.core.scoring import ChoiceScores
@@ -552,12 +552,6 @@ class ConcurrentExtractionError(RuntimeError, SaklasError):
 # through the stack, ``flatten_steering_stack``, ``push``/``pop``, and is
 # dispatched by type in ``SteeringComposer.compose_steering_entries``.
 SteeringStackEntry = tuple[float, Trigger] | AblationTerm | ManifoldTerm
-
-
-# Back-compat alias: the function was moved to core/manifold.py as the public
-# ``manifold_is_affine``.  Tests that monkeypatch ``session._manifold_is_affine``
-# and internal callers that reference it by its old name continue to resolve here.
-_manifold_is_affine = manifold_is_affine
 
 
 def _affine_manifold_push(
@@ -7801,7 +7795,7 @@ class SaklasSession:
         return readings
 
     def _finalize_generation(
-        self, input: Any, generated_ids: list[int], elapsed: float,
+        self, generated_ids: list[int], elapsed: float,
         vector_snapshot: dict[str, float], prompt_tokens: int = 0,
         stateless: bool = False,
         logprobs_list: list[tuple[int, float, list[Any]]] | None = None,
@@ -7817,7 +7811,7 @@ class SaklasSession:
         from saklas.core.generation_finalizer import finalize_generation
 
         return finalize_generation(
-            self, input, generated_ids, elapsed, vector_snapshot,
+            self, generated_ids, elapsed, vector_snapshot,
             prompt_tokens=prompt_tokens,
             stateless=stateless,
             logprobs_list=logprobs_list,
@@ -8859,7 +8853,7 @@ class SaklasSession:
                 _mean_logprob_out = mean_logprob_sum / mean_logprob_count
                 _mean_surprise_out = -_mean_logprob_out
             result = self._finalize_generation(
-                input, generated_ids, elapsed, vector_snapshot,
+                generated_ids, elapsed, vector_snapshot,
                 prompt_tokens=prompt_tokens, stateless=stateless,
                 logprobs_list=logprobs_list,
                 applied_steering=applied_steering,
@@ -9183,8 +9177,7 @@ class SaklasSession:
                     # into the running mean; ``TokenEvent.probe_readings`` carries
                     # the readings dict verbatim (the live-stream consumer reads
                     # ``fraction`` / ``nearest`` / ``coords`` off each).
-                    # ``TokenEvent.scores`` is a back-compat property alias for
-                    # ``probe_readings`` — no second field to populate.
+                    # The event carries the rich readings directly.
                     self._monitor.update_live(probe_readings)
             event = TokenEvent(
                 text=text, token_id=tid if tid is not None else -1, index=idx_counter[0],
@@ -9797,7 +9790,6 @@ class SaklasSession:
                     )
                 else:
                     result = self._finalize_generation(
-                        prompt,
                         generated_ids,
                         elapsed,
                         vector_snapshot,

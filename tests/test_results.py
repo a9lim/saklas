@@ -119,7 +119,7 @@ class TestTokenEvent:
         assert event.logprob is None
         assert event.top_alts is None
         assert event.finish_reason is None
-        assert event.scores is None
+        assert event.probe_readings is None
         assert event.perplexity is None
 
     def test_logprobs_carried_through(self):
@@ -143,9 +143,7 @@ class TestTokenEvent:
             text="x", token_id=0, index=0,
             probe_readings={"happy": happy, "sad": sad}, perplexity=12.7,
         )
-        # ``scores`` is now a back-compat property alias for ``probe_readings``.
         assert event.probe_readings == {"happy": happy, "sad": sad}
-        assert event.scores == {"happy": happy, "sad": sad}
         assert event.perplexity == 12.7
 
     def test_finish_reason_set(self):

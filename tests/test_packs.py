@@ -80,7 +80,7 @@ def test_verify_integrity_rejects_path_traversal(tmp_path: Path):
 
 def test_save_load_profile_roundtrip_slim_sidecar(tmp_path: Path):
     import torch
-    from saklas.core.vectors import save_profile, load_profile
+    from saklas.core.profile import load_profile, save_profile
     profile = {
         0: torch.randn(8),
         14: torch.randn(8),

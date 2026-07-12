@@ -262,8 +262,8 @@ monitor unification onto the session's single `Monitor`.
   (`{name, manifold, top_n, layers, node_labels, node_count, domain, intrinsic_dim,
   feature_space}`). `_probe_info` also emits `is_affine` (the flat/curved
   discriminator the client classifies subspace-vs-manifold on, via
-  `core.manifold.manifold_is_affine` — `core.session._manifold_is_affine` is a
-  back-compat alias — defensively guarded → `False` on any read failure) and
+  `core.manifold.manifold_is_affine` — defensively guarded → `False` on any read
+  failure) and
   `node_coords` (the per-node layout backing the client mini-map,
   `null` when the manifold has none materialized).
 - `GET /probes/defaults` returns the default roster.

@@ -50,8 +50,7 @@ What remains: `NAME_REGEX = ^[a-z][a-z0-9._-]{0,63}$` (manifolds reuse it),
 `hash_file` / `hash_folder_files` / `verify_integrity` (the sha256 integrity
 helpers behind the neutral/layer-means/alignment caches and the manifold integrity
 manifest), `PackFormatError`, and `PACK_FORMAT_VERSION = 3`, stamped onto the
-profile-cache sidecars `profile.save_profile` writes
-(`vectors.save_profile` remains a compatibility alias).
+profile-cache sidecars `profile.save_profile` writes.
 
 ## manifolds.py
 

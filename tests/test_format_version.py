@@ -9,7 +9,7 @@ import torch
 
 from saklas.io.packs import PACK_FORMAT_VERSION
 from saklas.core.profile import Profile, ProfileError
-from saklas.core.vectors import save_profile, load_profile
+from saklas.core.profile import load_profile, save_profile
 
 
 def test_save_profile_writes_format_version_in_sidecar(tmp_path: Path):

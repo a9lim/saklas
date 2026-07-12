@@ -1473,7 +1473,7 @@ class SaklasApp(App[None]):
                         # Optional 10th/11th slots: the live J-lens workspace
                         # readout (``/lens``) + its layer-aggregated chip
                         # list — None when the live lens is off.
-                        ("tok", event.text, event.thinking, event.scores,
+                        ("tok", event.text, event.thinking, event.probe_readings,
                          event.perplexity, event.logprob, widget, False,
                          event.probe_readings, event.lens_readout,
                          event.lens_aggregate),
@@ -2011,7 +2011,7 @@ class SaklasApp(App[None]):
                         widget.ensure_thinking_collapsed()
                         widget.append_token(token)
                     if scores is not None:
-                        # ``event.scores`` is the full per-probe ``ProbeReading``
+                        # ``event.probe_readings`` is the full per-probe reading
                         # dict now; the highlight markup wants a scalar per
                         # probe, so collapse to coordinate axis 0 (the same
                         # scalar the trait stream + ``@when`` gate channel use).
@@ -2965,7 +2965,7 @@ class SaklasApp(App[None]):
                 )
                 for event in stream:
                     self._ui_token_queue.put(
-                        ("tok", event.text, event.thinking, event.scores,
+                        ("tok", event.text, event.thinking, event.probe_readings,
                          event.perplexity, event.logprob, widget, True,
                          event.probe_readings),
                     )
@@ -3201,7 +3201,7 @@ class SaklasApp(App[None]):
                 )
                 for event in stream:
                     self._ui_token_queue.put(
-                        ("tok", event.text, event.thinking, event.scores,
+                        ("tok", event.text, event.thinking, event.probe_readings,
                          event.perplexity, event.logprob, widget, True,
                          event.probe_readings),
                     )

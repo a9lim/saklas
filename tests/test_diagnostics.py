@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from saklas.core import vectors as V
+from saklas.core import profile as V
 from saklas.core.profile import Profile
 
 

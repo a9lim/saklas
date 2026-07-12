@@ -243,11 +243,6 @@ def _probe_is_affine_for_manifold(manifold: "Manifold") -> bool:
     return True
 
 
-def _probe_is_affine(probe: "AttachedManifoldProbe") -> bool:
-    """Back-compat wrapper for tests / callers that ask about an attached probe."""
-    return probe.is_affine
-
-
 def _affine_coord_map(
     sub: Any, manifold: "Manifold", m_r_inv: torch.Tensor,
     X: torch.Tensor, K: torch.Tensor, lam: float,

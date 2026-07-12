@@ -337,18 +337,6 @@ class TokenEvent:
     # until metadata is fetched).
     sae_readout: list[tuple[int, float, str | None, float | None]] | None = None
 
-    @property
-    def scores(self) -> "dict[str, ProbeReading] | None":
-        """Back-compat alias for :attr:`probe_readings`.
-
-        The two fields were formerly kept distinct ("for the deferred
-        frontend rewire"); they always carried the same dict.  Collapsed to
-        one field (``probe_readings``) in 4.1; this property preserves the
-        old name for any reader that still accesses ``event.scores``.
-        """
-        return self.probe_readings
-
-
 class ResultCollector:
     """Accumulates GenerationResults with tags for batch export."""
 

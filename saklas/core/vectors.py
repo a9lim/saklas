@@ -6,7 +6,6 @@ import json
 import warnings
 from collections.abc import Sequence
 from importlib import resources as _resources
-from pathlib import Path
 from typing import Any, cast
 
 import torch
@@ -1017,24 +1016,6 @@ def folded_vector_directions(manifold: "Any") -> dict[int, torch.Tensor]:
         share = float(share_map.get(idx, 1.0))
         out[idx] = sub.basis.reshape(-1).to(torch.float32) * share
     return out
-
-
-def save_profile(
-    profile: dict[int, torch.Tensor],
-    path: str | Path,
-    metadata: dict[str, Any],
-) -> None:
-    """Compatibility alias for :func:`saklas.core.profile.save_profile`."""
-    from saklas.core.profile import save_profile as _save_profile
-
-    _save_profile(profile, path, metadata)
-
-
-def load_profile(path: str | Path) -> tuple[dict[int, torch.Tensor], dict[str, Any]]:
-    """Compatibility alias for :func:`saklas.core.profile.load_profile`."""
-    from saklas.core.profile import load_profile as _load_profile
-
-    return _load_profile(path)
 
 
 def project_profile(

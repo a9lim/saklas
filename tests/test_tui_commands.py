@@ -2119,7 +2119,7 @@ def test_manifold_probe_attach_routes_through_session(monkeypatch: pytest.Monkey
     captured = {}
 
     # A curved manifold stub — every layer reports ``is_affine = False`` so
-    # ``_manifold_is_affine`` routes it to the manifold (curved) section.
+    # ``manifold_is_affine`` routes it to the manifold (curved) section.
     manifold = SimpleNamespace(
         domain=SimpleNamespace(intrinsic_dim=1),
         node_labels=["a"], node_coords=None,

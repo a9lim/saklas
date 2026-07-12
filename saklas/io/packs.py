@@ -11,7 +11,7 @@ infrastructure several layers still share:
   integrity helpers (the neutral/layer-means/alignment caches + the manifold
   format's own integrity manifest build on these);
 - ``PACK_FORMAT_VERSION`` — the current profile-cache sidecar version written by
-  :func:`saklas.core.vectors.save_profile`.
+  :func:`saklas.core.profile.save_profile`.
 """
 from __future__ import annotations
 

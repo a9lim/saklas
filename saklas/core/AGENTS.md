@@ -223,8 +223,7 @@ merged affine subspace.
 
 `profile.save_profile`/`profile.load_profile` own the baked-profile wire format:
 a `dict[int, Tensor]` to `.safetensors` + a slim `.json` sidecar (stamped with
-`PACK_FORMAT_VERSION` from `io/packs.py`). `vectors.save_profile`/
-`vectors.load_profile` remain compatibility aliases for the per-model
+`PACK_FORMAT_VERSION` from `io/packs.py`) for the per-model
 `layer_means`/`neutral_activations`/alignment caches and folded-profile
 interchange. `project_profile(base, onto, operator, *, whitener=...)` is the
 per-layer `~`/`|` projection — closed-form LEACE, Mahalanobis-only: the whitener
@@ -451,8 +450,7 @@ normalization). `is_affine ⇔ node_params is None`. Flat layers carry `node_coo
 (K,R) — the real neutral-anchored per-layer node positions (steer-target source).
 `affine(mean, basis, node_coords=)`, `select_axes(kept)` (per-axis DLS prune),
 `eval_at`, `jacobian_at`, `rbf_params()` (raises on a flat subspace).
-`manifold_is_affine(manifold)` — public module-level predicate (promoted from
-`session._manifold_is_affine` in T2.4); `session.py` keeps a back-compat alias.
+`manifold_is_affine(manifold)` — public module-level flat/curved predicate.
 
 `_pca_basis(X, *, n_components, whitener, layer)` — μ-centered PCA: Euclidean SVD,
 or the whitened/Fisher generalized eigenproblem `(S_b, Σ)` via the Woodbury Σ⁻¹
@@ -970,9 +968,7 @@ does the HF load + layer-mean compute + probe bootstrap — there is no
 `_RESPONSE_MAX_TOKENS = 256` caps each in-character response (4.0 / A2
 elicitation). Module-level helper `_affine_manifold_push`
 (per-layer basis rows + node-coord targets for a flat manifold) backs the dispatch;
-`_manifold_is_affine` is a back-compat alias of the public `core.manifold.manifold_is_affine`
-(promoted there in T2.4 — `session.py` keeps the alias for `steering_composer` and legacy
-call sites).
+`core.manifold.manifold_is_affine` is the flat/curved predicate used across surfaces.
 Conversational-elicitation helpers `_KIND_TEMPLATES` / `_article` / `_system_for`
 (the per-kind system prompt — `custom` takes a caller-supplied template) /
 `_role_for` (the swapped assistant-role label: abstract → `someone_{slug}`,

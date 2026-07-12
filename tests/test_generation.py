@@ -199,7 +199,6 @@ def test_stop_sequence_trimmed_text_is_final_result_text():
 
     result = SaklasSession._finalize_generation(
         session,
-        "prompt",
         generated_ids,
         elapsed=1.0,
         vector_snapshot={},
@@ -269,7 +268,6 @@ def test_stop_sequence_probe_aggregate_uses_visible_endpoint():
 
     result = SaklasSession._finalize_generation(
         session,
-        "prompt",
         generated_ids,
         elapsed=1.0,
         vector_snapshot={},
@@ -373,7 +371,6 @@ def test_finalize_reuses_scored_probe_aggregate() -> None:
 
     result = SaklasSession._finalize_generation(
         session,
-        "prompt",
         [0, 1],
         elapsed=1.0,
         vector_snapshot={},
@@ -632,7 +629,6 @@ def test_finalize_incremental_probe_path_does_not_stack_capture() -> None:
 
     result = SaklasSession._finalize_generation(
         session,
-        "prompt",
         [0, 1],
         elapsed=1.0,
         vector_snapshot={},
@@ -729,7 +725,6 @@ def test_finalize_lean_incremental_probe_path() -> None:
 
     result = SaklasSession._finalize_generation(
         session,
-        "prompt",
         [0, 1],
         elapsed=1.0,
         vector_snapshot={},
@@ -813,7 +808,6 @@ def test_finalize_gating_subset_probe_path() -> None:
 
     result = SaklasSession._finalize_generation(
         session,
-        "prompt",
         [0, 1],
         elapsed=1.0,
         vector_snapshot={},
@@ -900,7 +894,6 @@ def test_finalize_reuses_one_aggregate_pool_for_monitor_lens_and_sae() -> None:
 
     result = SaklasSession._finalize_generation(
         session,
-        "prompt",
         [0, 1],
         elapsed=1.0,
         vector_snapshot={},
@@ -1133,7 +1126,6 @@ def test_stateless_zero_token_probe_result_does_not_use_history() -> None:
 
     result = SaklasSession._finalize_generation(
         session,
-        "prompt",
         [],
         elapsed=1.0,
         vector_snapshot={},
@@ -1179,7 +1171,6 @@ def test_return_probe_readings_false_skips_probe_finalization() -> None:
 
     result = SaklasSession._finalize_generation(
         session,
-        "prompt",
         [0],
         elapsed=1.0,
         vector_snapshot={},

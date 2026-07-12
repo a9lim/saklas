@@ -86,8 +86,8 @@ def test_read_rejects_empty(tmp_path: Path):
 
 
 def test_load_profile_dispatches_on_extension(tmp_path: Path):
-    """saklas.core.vectors.load_profile should route .gguf to the GGUF loader."""
-    from saklas.core.vectors import load_profile
+    """saklas.core.profile.load_profile should route .gguf to the GGUF loader."""
+    from saklas.core.profile import load_profile
     profile = {0: torch.randn(8), 5: torch.randn(8)}
     path = tmp_path / "dispatch.gguf"
     write_gguf_profile(profile, path, model_hint="llama")

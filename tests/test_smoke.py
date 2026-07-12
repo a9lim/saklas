@@ -221,7 +221,7 @@ class TestSteering:
 
 class TestSaveLoad:
     def test_roundtrip(self, happy_profile: Any) -> None:
-        from saklas.core.vectors import save_profile, load_profile
+        from saklas.core.profile import load_profile, save_profile
 
         with tempfile.TemporaryDirectory() as tmp:
             path = str(Path(tmp) / "test_profile.safetensors")
@@ -399,7 +399,7 @@ class TestAblationPerformance:
 
             # Vanilla baseline.
             t0 = time.perf_counter()
-            r_vanilla = session.generate(prompt)
+            r_vanilla = session.generate(prompt).first
             dt_vanilla = max(time.perf_counter() - t0, 0.1)
             tok_s_vanilla = max(len(r_vanilla.text.split()) / dt_vanilla, 1e-6)
 
@@ -411,7 +411,7 @@ class TestAblationPerformance:
             expr = f"0.3 {additive_name} + !{ablation_name}"
             t0 = time.perf_counter()
             with session.steering(expr):
-                r_combined = session.generate(prompt)
+                r_combined = session.generate(prompt).first
             dt_combined = max(time.perf_counter() - t0, 0.1)
             tok_s_combined = max(len(r_combined.text.split()) / dt_combined, 1e-6)
 
@@ -551,11 +551,11 @@ class TestDiscoverManifoldEndToEnd:
             with session.steering(
                 f"1.0 local/smoke_personas%{pos_a}@response",
             ):
-                r_a = session.generate(prompt, sampling=sampling)
+                r_a = session.generate(prompt, sampling=sampling).first
             with session.steering(
                 f"1.0 local/smoke_personas%{pos_b}@response",
             ):
-                r_b = session.generate(prompt, sampling=sampling)
+                r_b = session.generate(prompt, sampling=sampling).first
             assert r_a.text != r_b.text, (
                 f"steering at node {label_a!r} produced identical text "
                 f"to node {label_b!r} — the manifold hook isn't moving "
