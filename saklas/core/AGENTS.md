@@ -223,7 +223,7 @@ merged affine subspace.
 
 `profile.save_profile`/`profile.load_profile` own the baked-profile wire format:
 a `dict[int, Tensor]` to `.safetensors` + a slim `.json` sidecar (stamped with
-`PACK_FORMAT_VERSION` from `io/packs.py`) for the per-model
+the exact `PROFILE_FORMAT_VERSION` from `io/packs.py`) for the per-model
 `layer_means`/`neutral_activations`/alignment caches and folded-profile
 interchange. `project_profile(base, onto, operator, *, whitener=...)` is the
 per-layer `~`/`|` projection — closed-form LEACE, Mahalanobis-only: the whitener

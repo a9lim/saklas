@@ -45,18 +45,18 @@ suffix** — difference-of-means is the only vector extraction method.
 
 ## packs.py
 
-Shared pack-format *primitives* only — the format/distribution surface is gone.
+Shared artifact primitives only — the pack format/distribution surface is gone.
 What remains: `NAME_REGEX = ^[a-z][a-z0-9._-]{0,63}$` (manifolds reuse it),
-`hash_file` / `hash_folder_files` / `verify_integrity` (the sha256 integrity
+`hash_file` / `verify_integrity` (the sha256 integrity
 helpers behind the neutral/layer-means/alignment caches and the manifold integrity
-manifest), `PackFormatError`, and `PACK_FORMAT_VERSION = 3`, stamped onto the
-profile-cache sidecars `profile.save_profile` writes.
+manifest), and `PROFILE_FORMAT_VERSION = 3`, stamped onto the exact profile
+sidecars `profile.save_profile` writes.
 
 ## manifolds.py
 
 The on-disk format for every concept + steering manifold —
 `~/.saklas/manifolds/<ns>/<name>/`. `MANIFOLD_FORMAT_VERSION = 6` (decoupled from
-`PACK_FORMAT_VERSION`); readers and writers require exactly v6.
+the profile format); readers and writers require exactly v6.
 `min_nodes(n) = 2n+1`
 (the curved-fit poisedness floor). Five `fit_mode`s share the class, discriminated
 by `manifold.json::fit_mode`:

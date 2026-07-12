@@ -7,10 +7,10 @@ The 4.0 collapse retired the pack *format/distribution* surface
 infrastructure several layers still share:
 
 - ``NAME_REGEX`` — the artifact-name grammar (manifolds reuse it);
-- ``hash_file`` / ``hash_folder_files`` / ``verify_integrity`` — the sha256
+- ``hash_file`` / ``verify_integrity`` — the sha256
   integrity helpers (the neutral/layer-means/alignment caches + the manifold
   format's own integrity manifest build on these);
-- ``PACK_FORMAT_VERSION`` — the current profile-cache sidecar version written by
+- ``PROFILE_FORMAT_VERSION`` — the current profile sidecar version written by
   :func:`saklas.core.profile.save_profile`.
 """
 from __future__ import annotations
@@ -19,21 +19,13 @@ import hashlib
 import re
 from pathlib import Path
 
-from saklas.core.errors import SaklasError
 from saklas.io.paths import ensure_within
 
 
 NAME_REGEX = re.compile(r"^[a-z][a-z0-9._-]{0,63}$")
 
 # Current profile-cache sidecar format version.
-PACK_FORMAT_VERSION = 3
-
-
-class PackFormatError(ValueError, SaklasError):
-    """Raised when an artifact manifest or sidecar is malformed."""
-
-    def user_message(self) -> tuple[int, str]:
-        return (400, str(self) or self.__class__.__name__)
+PROFILE_FORMAT_VERSION = 3
 
 
 def hash_file(path: Path) -> str:
@@ -47,18 +39,6 @@ def hash_file(path: Path) -> str:
         for chunk in iter(lambda: f.read(65536), b""):
             h.update(chunk)
     return h.hexdigest()
-
-
-def hash_folder_files(folder: Path) -> dict[str, str]:
-    """Return ``{filename: sha256}`` for every file in ``folder`` except ``pack.json``.
-
-    Non-recursive — concept folders are flat.
-    """
-    out: dict[str, str] = {}
-    for entry in sorted(folder.iterdir()):
-        if entry.is_file() and entry.name != "pack.json":
-            out[entry.name] = hash_file(entry)
-    return out
 
 
 # In-process fingerprint cache keyed by absolute file path.

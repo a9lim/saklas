@@ -20,7 +20,6 @@ import json
 import logging
 import math
 import pathlib
-from contextlib import suppress
 from typing import Any, Iterable, Iterator, Literal, Mapping, overload
 
 import torch
@@ -61,6 +60,10 @@ def save_profile(
     Tensors are already baked (share pre-multiplied into magnitude) — the
     sidecar carries only method/saklas_version plus the optional fields above.
     """
+    method = metadata.get("method")
+    if not isinstance(method, str) or not method:
+        raise ProfileError("profile metadata requires a non-empty 'method' string")
+
     path = pathlib.Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -74,23 +77,20 @@ def save_profile(
     save_file(tensors, str(path))
 
     from saklas import __version__ as _saklas_version
-    from saklas.io.packs import PACK_FORMAT_VERSION
+    from saklas.io.packs import PROFILE_FORMAT_VERSION
 
     sidecar: dict[str, Any] = {
-        "format_version": PACK_FORMAT_VERSION,
-        "method": metadata.get("method", "unknown"),
+        "format_version": PROFILE_FORMAT_VERSION,
+        "method": method,
         "saklas_version": _saklas_version,
     }
     if "statements_sha256" in metadata:
         sidecar["statements_sha256"] = metadata["statements_sha256"]
     if "components" in metadata:
         sidecar["components"] = metadata["components"]
-    # v2.1: bake method records which scoring metric drove share allocation
-    # (``"euclidean"`` = legacy ``||m||_2 / r``; ``"mahalanobis"`` =
-    # ``||m||_M / r`` via per-layer activation covariance).  Loaders read
-    # this only for diagnostics; the runtime hook reads tensor magnitudes
-    # regardless of bake flavor.  Default ``"euclidean"`` is back-compat
-    # for tensors written before the bake field existed.
+    # The optional bake method records which scoring metric drove share
+    # allocation. Loaders read this only for diagnostics; tensor magnitudes
+    # already carry the runtime weights.
     if "bake" in metadata:
         sidecar["bake"] = metadata["bake"]
     # SAE provenance — present only when extraction used an SAE backend.
@@ -144,14 +144,24 @@ def load_profile(path: str | pathlib.Path) -> tuple[dict[int, torch.Tensor], dic
     with open(meta_path) as f:
         metadata = json.load(f)
 
-    from saklas.io.packs import PACK_FORMAT_VERSION
+    from saklas.io.packs import PROFILE_FORMAT_VERSION
 
-    fmt_ver = metadata.get("format_version", 1)
-    if not isinstance(fmt_ver, int) or fmt_ver < PACK_FORMAT_VERSION:
+    if not isinstance(metadata, dict):
+        raise ProfileError(f"profile sidecar {meta_path} must be a JSON object")
+    fmt_ver = metadata.get("format_version")
+    if (
+        not isinstance(fmt_ver, int)
+        or isinstance(fmt_ver, bool)
+        or fmt_ver != PROFILE_FORMAT_VERSION
+    ):
         raise ProfileError(
-            f"pack format is from saklas < 2.0 "
-            f"(sidecar {meta_path} format_version={fmt_ver!r}, "
-            f"need >= {PACK_FORMAT_VERSION}); regenerate it with current saklas"
+            f"profile sidecar {meta_path} has format_version={fmt_ver!r}; "
+            f"need exactly {PROFILE_FORMAT_VERSION}. Regenerate it with "
+            "the current saklas"
+        )
+    if not isinstance(metadata.get("method"), str) or not metadata["method"]:
+        raise ProfileError(
+            f"profile sidecar {meta_path} requires a non-empty 'method' string"
         )
 
     profile = {int(key.split("_", 1)[1]): tensor for key, tensor in tensors.items()}
@@ -159,14 +169,28 @@ def load_profile(path: str | pathlib.Path) -> tuple[dict[int, torch.Tensor], dic
     # Invert the layer-key stringification done at save time so diagnostics
     # are addressable by ``int`` consistently with the profile dict.
     raw_diag = metadata.get("diagnostics_by_layer")
-    if isinstance(raw_diag, dict) and raw_diag:
-        # Malformed diagnostics leave the raw dict in place; downstream readers
-        # can decide whether to fall back. The tensors themselves are still valid.
-        with suppress(TypeError, ValueError):
+    if raw_diag is not None:
+        if not isinstance(raw_diag, dict):
+            raise ProfileError(
+                f"profile sidecar {meta_path} diagnostics_by_layer must be an object"
+            )
+        try:
             metadata["diagnostics"] = {
-                int(layer): dict(metrics)
+                int(layer): {
+                    str(name): float(value)
+                    for name, value in metrics.items()
+                }
                 for layer, metrics in raw_diag.items()
+                if isinstance(metrics, dict)
             }
+        except (TypeError, ValueError) as exc:
+            raise ProfileError(
+                f"profile sidecar {meta_path} has malformed diagnostics_by_layer"
+            ) from exc
+        if len(metadata["diagnostics"]) != len(raw_diag):
+            raise ProfileError(
+                f"profile sidecar {meta_path} has malformed diagnostics_by_layer"
+            )
 
     return profile, metadata
 
@@ -303,11 +327,12 @@ class Profile:
 
         Metadata passed here overrides / augments the profile's own
         ``self.metadata``; the sidecar carries the current
-        ``PACK_FORMAT_VERSION``.
+        ``PROFILE_FORMAT_VERSION``.
         """
         merged: dict[str, Any] = dict(self._metadata)
         if metadata:
             merged.update(metadata)
+        merged.setdefault("method", "profile")
         save_profile(self._tensors, path, merged)
 
     @classmethod
@@ -315,8 +340,8 @@ class Profile:
         """Load from safetensors (+ sidecar) or gguf.
 
         Dispatches on file extension. Safetensors sidecars with a
-        ``format_version`` below ``PACK_FORMAT_VERSION`` raise
-        :class:`ProfileError` pointing at the migration script. GGUF
+        any ``format_version`` other than ``PROFILE_FORMAT_VERSION`` raise
+        :class:`ProfileError`. GGUF
         files carry metadata in-header and are exempt from the
         format_version gate.
         """

@@ -31,7 +31,6 @@ from saklas.io.hf_manifolds import ManifoldInstallConflict
 from saklas.io.gguf_io import GGUFNotInstalled
 from saklas.io.hf import HFError
 from saklas.io.merge import MergeError
-from saklas.io.packs import PackFormatError
 
 
 def test_base_default_status_and_message():
@@ -67,8 +66,6 @@ _OVERRIDES: list[tuple[type[SaklasError], int]] = [
     (AmbiguousSelectorError, 400),
     # cli/config_file.py
     (ConfigFileError, 400),
-    # io/packs.py
-    (PackFormatError, 400),
     # io/hf.py
     (HFError, 502),
     # io/hf_manifolds.py
@@ -187,7 +184,6 @@ def test_server_routes_user_message_status_codes():
         (AmbiguousSelectorError("'x' matches a/x and b/x"), 400),
         (HFError("network down"), 502),
         (ManifoldInstallConflict("already exists"), 409),
-        (PackFormatError("malformed"), 400),
     ]
 
     for exc, expected_status in cases:

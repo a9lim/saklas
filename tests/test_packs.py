@@ -21,14 +21,6 @@ def test_hash_file_sha256(tmp_path: Path):
     assert packs.hash_file(p) == "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
 
 
-def test_hash_folder_files_skips_pack_json(tmp_path: Path):
-    (tmp_path / "a.safetensors").write_bytes(b"a")
-    (tmp_path / "pack.json").write_bytes(b"{}")
-    out = packs.hash_folder_files(tmp_path)
-    assert set(out) == {"a.safetensors"}
-    assert out["a.safetensors"] == packs.hash_file(tmp_path / "a.safetensors")
-
-
 def test_verify_integrity_clean(tmp_path: Path):
     (tmp_path / "statements.json").write_bytes(b"data")
     files = {"statements.json": packs.hash_file(tmp_path / "statements.json")}
