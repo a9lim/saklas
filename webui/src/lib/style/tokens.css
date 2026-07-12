@@ -209,13 +209,6 @@
   --z-drawer: 50;
   --z-modal: 100;
 
-  /* ---- Compatibility aliases ----------------------------------------
-   * Names referenced by components that predate the token system (they
-   * carried inline hex fallbacks); defined here so they resolve through
-   * the palette instead. Census 2026-07-10: --muted/--danger/--input-bg
-   * (TemplateLabDrawer), --err-bg (LoomSidebar). */
-  --muted: var(--fg-muted);
-  --danger: var(--accent-red);
-  --input-bg: var(--input-well);
+  /* Loom conflict/error surface. */
   --err-bg: rgba(229, 84, 79, 0.08);
 }

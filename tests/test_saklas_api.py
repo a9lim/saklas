@@ -24,6 +24,8 @@ def _mock_session():
         "device": "cpu",
         "dtype": "torch.bfloat16",
     }
+    session.model = MagicMock()
+    session.model.config.model_type = "gemma2"
     session._device = "cpu"
     session._dtype = "torch.bfloat16"
     session._created_ts = 1_700_000_000
@@ -38,8 +40,20 @@ def _mock_session():
 
     session.vectors = {}
     session.probes = {}
-    session.history = []
+    session.tree = MagicMock()
+    session.tree.messages_for.return_value = []
     session.manifolds = {}
+    session.is_base_model = False
+    session.has_compatible_jlens.return_value = False
+    session.live_lens_layers = None
+    session.sae_info = None
+    session.live_sae = False
+    session.live_probe_scores = True
+    session.scene_grammar = None
+    session.joint_logprob_cache = {}
+    session.lens_probe_names = []
+    session.sae_probe_names = []
+    session.token_probe_payload = {}
 
     monitor = MagicMock()
     monitor.probe_names = []
@@ -263,7 +277,7 @@ class TestSessions:
 
     def test_rewind_empty(self, session_and_client: Any) -> None:
         session, client = session_and_client
-        session.history = []
+        session.tree.messages_for.return_value = []
         resp = client.post("/saklas/v1/sessions/default/rewind")
         assert resp.status_code == 400
 

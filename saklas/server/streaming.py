@@ -11,16 +11,15 @@ extension vs the native ``probe_readings`` block).
 
 from __future__ import annotations
 
-from contextlib import suppress
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from saklas.core.results import GenerationResult, RunSet
+    from saklas.core.results import GenerationResult
     from saklas.core.session import SaklasSession
 
 
 def probe_reading_aggregate(
-    session: "SaklasSession", result: "GenerationResult | RunSet | None",
+    session: "SaklasSession", result: "GenerationResult | None",
 ) -> dict[str, Any]:
     """Per-attached-probe ``ProbeReading.to_dict()`` from ``result``.
 
@@ -34,28 +33,22 @@ def probe_reading_aggregate(
     """
     if result is None:
         return {}
-    readings = getattr(result, "probe_readings", None) or {}
+    readings = result.probe_readings or {}
     if not readings:
         return {}
-    try:
-        attached = set(session.monitor.probe_names)
-    except Exception:
-        attached = set(readings.keys())
+    attached = set(session.monitor.probe_names)
     # Pinned J-lens token probes and SAE feature probes live on their own
     # session registries (readout channels, not Monitor probes) but land in
     # ``result.probe_readings`` all the same — without this union the
     # attached-filter silently dropped their end-of-gen aggregates from every
     # streaming done frame.
-    for roster in ("lens_probe_names", "sae_probe_names"):
-        with suppress(Exception):
-            attached.update(getattr(session, roster, None) or [])
-    out: dict[str, Any] = {}
-    for name, agg in readings.items():
-        if name not in attached:
-            continue
-        with suppress(Exception):
-            out[name] = agg.to_dict()
-    return out
+    attached.update(session.lens_probe_names)
+    attached.update(session.sae_probe_names)
+    return {
+        name: reading.to_dict()
+        for name, reading in readings.items()
+        if name in attached
+    }
 
 
 def _usage_dict(result: "GenerationResult") -> dict[str, int]:
@@ -65,7 +58,7 @@ def _usage_dict(result: "GenerationResult") -> dict[str, int]:
 
 
 def stream_finalizer(
-    session: "SaklasSession", result: "GenerationResult | RunSet | None",
+    session: "SaklasSession", result: "GenerationResult | None",
 ) -> tuple[str | None, dict[str, int] | None, dict[str, Any]]:
     """Derive the shared end-of-stream triple ``(finish_reason, usage, probe_agg)``.
 
@@ -78,8 +71,8 @@ def stream_finalizer(
     protocol formats these into its own wire shape.
     """
     if result is not None:
-        finish_reason = getattr(result, "finish_reason", None)
-        usage: dict[str, int] | None = _usage_dict(result)  # pyright: ignore[reportArgumentType]
+        finish_reason = result.finish_reason
+        usage: dict[str, int] | None = _usage_dict(result)
     else:
         finish_reason = session.generation_state.finish_reason
         usage = None

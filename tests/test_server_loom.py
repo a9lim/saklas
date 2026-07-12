@@ -78,7 +78,10 @@ class _StubSession:
         monitor = MagicMock()
         monitor.probe_names = []
         monitor.profiles = {}
-        self._monitor = monitor
+        self.monitor = monitor
+        self.lens_probe_names: list[str] = []
+        self.sae_probe_names: list[str] = []
+        self.token_probe_payload: dict[str, Any] = {}
         self._tokenizer = MagicMock()
         self._layers = []
         capture = MagicMock()
@@ -91,7 +94,7 @@ class _StubSession:
 
         gen_state = MagicMock()
         gen_state.finish_reason = "stop"
-        self._gen_state = gen_state
+        self.generation_state = gen_state
 
         self.lock = asyncio.Lock()
 
@@ -99,16 +102,8 @@ class _StubSession:
         self._trait_queues = []
         self._trait_lock = threading.Lock()
 
-        # History compat: surfaces still read `session.history` (used by
-        # the existing /rewind endpoint precondition).
         self._next_token_stream: list[str] = ["hi"]
         self._fail_next: bool = False
-
-    # ----- compat shims --------------------------------------------------
-
-    @property
-    def history(self):
-        return self.tree.messages_for()
 
     def clear_history(self) -> None:
         self.tree.reset()
@@ -117,6 +112,9 @@ class _StubSession:
         self.tree.rewind()
 
     def build_readings(self):  # pragma: no cover - unused by these tests
+        return {}
+
+    def probe_hashes(self) -> dict[str, str]:
         return {}
 
     def register_trait_queue(self, loop: Any, q: Any) -> None:

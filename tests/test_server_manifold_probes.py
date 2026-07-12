@@ -139,7 +139,7 @@ def _mock_session():
     # The WS token-frame builder consults this first; a real None lets the
     # inline ``_monitor`` / ``_capture`` scoring branch run (a bare
     # MagicMock would shadow it with a truthy child mock).
-    session._last_token_probe_payload = None
+    session.token_probe_payload = {}
 
     gen_state = MagicMock()
     gen_state.finish_reason = "stop"
@@ -698,7 +698,7 @@ class TestWebSocketProbeReadings:
     ``probe_readings`` on every ``token`` frame when probes are attached,
     and the final ``done`` event still carries the aggregate.  Manifold
     readings are supplied by the session token tap via
-    ``session._last_token_probe_payload``; the WS token-frame builder only
+    ``session.token_probe_payload``; the WS token-frame builder only
     serializes that payload.
 
     Regression for the Phase 3c bug where the webui mini-map cursor
@@ -750,11 +750,11 @@ class TestWebSocketProbeReadings:
             for i, tok in enumerate(tokens):
                 if on_token is not None:
                     if getattr(session.monitor, "probe_names", None):
-                        session._last_token_probe_payload = {
+                        session.token_probe_payload = {
                             "probe_readings": session.monitor.score_single_token({}),
                         }
                     else:
-                        session._last_token_probe_payload = None
+                        session.token_probe_payload = {}
                     on_token(tok, False, 1000 + i, None, None)
                 time.sleep(0.001)
             result = GenerationResult(
@@ -916,7 +916,10 @@ def _author_manifold_on_disk(
     folder = Path(home) / "manifolds" / namespace / name
     (folder / "nodes").mkdir(parents=True)
     coords = [[i / (k - 1)] for i in range(k)]
-    nodes = [{"label": lbl, "coords": coords[i]} for i, lbl in enumerate(labels)]
+    nodes = [
+        {"label": lbl, "coords": coords[i], "role": None, "kind": None}
+        for i, lbl in enumerate(labels)
+    ]
     for idx, node in enumerate(nodes):
         statements = [f"{node['label']} statement {i}" for i in range(3)]
         (folder / "nodes" / f"{idx:02d}_{node['label']}.json").write_text(
@@ -933,6 +936,9 @@ def _author_manifold_on_disk(
         },
         "nodes": nodes,
         "files": {},
+        "source": "local",
+        "tags": [],
+        "template_ref": None,
     }
     (folder / "manifold.json").write_text(_json.dumps(meta))
     return folder

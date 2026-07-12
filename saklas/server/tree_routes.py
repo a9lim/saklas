@@ -457,13 +457,7 @@ def register_tree_routes(app: FastAPI) -> None:
         if req.b_id not in session.tree.nodes:
             raise HTTPException(404, f"unknown node id: {req.b_id}")
 
-        # New sessions create this cache in SaklasSession; keep the lazy
-        # fallback for older test doubles and external session shims.
-        cache_obj: Any = getattr(session, "joint_logprob_cache", None)
-        if cache_obj is None:
-            cache_obj = {}
-            session.joint_logprob_cache = cache_obj
-        cache: dict[tuple[str, str], Any] = cache_obj
+        cache = session.joint_logprob_cache
 
         key = _cache_key(req.a_id, req.b_id)
         hit = cache.get(key)

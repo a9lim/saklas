@@ -26,19 +26,35 @@ def _mock_session():
         "hidden_dim": 2304,
         "vram_used_gb": 5.2,
         "param_count": 2_614_000_000,
+        "device": "cpu",
         "dtype": "torch.bfloat16",
     }
+    session.model = MagicMock()
+    session.model.config.model_type = "gemma2"
 
     session.config = MagicMock()
     session.config.temperature = 1.0
     session.config.top_p = 0.9
+    session.config.top_k = None
     session.config.max_new_tokens = 1024
     session.config.system_prompt = None
     session.config.thinking = None
 
     session.vectors = {}
     session.probes = {}
-    session.history = []
+    session.tree = MagicMock()
+    session.tree.messages_for.return_value = []
+    session.is_base_model = False
+    session.has_compatible_jlens.return_value = False
+    session.live_lens_layers = None
+    session.sae_info = None
+    session.live_sae = False
+    session.live_probe_scores = True
+    session.scene_grammar = None
+    session.joint_logprob_cache = {}
+    session.lens_probe_names = []
+    session.sae_probe_names = []
+    session.token_probe_payload = {}
 
     # Gen state carries the real finish_reason after each generation.
     gen_state = MagicMock()
@@ -1262,45 +1278,17 @@ class TestLensTokenReadout:
         assert resp.status_code == 404
 
     def test_session_info_carries_jlens_fitted(
-        self, session_and_client: Any, tmp_path: Any, monkeypatch: Any,
+        self, session_and_client: Any,
     ) -> None:
-        """``jlens_fitted`` validates metadata plus the tensor header."""
-        import torch
-
-        from saklas.core.jlens import JacobianLens
-        from saklas.io.lens import lens_paths, save_lens
-
-        _, client = session_and_client
-        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+        """``jlens_fitted`` comes from the live session compatibility check."""
+        session, client = session_and_client
         resp = client.get("/saklas/v1/sessions/default")
         assert resp.status_code == 200
         assert resp.json()["jlens_fitted"] is False
 
-        ts_path, _ = lens_paths("test/model")
-        ts_path.parent.mkdir(parents=True, exist_ok=True)
-        ts_path.write_bytes(b"\x00")
-        resp = client.get("/saklas/v1/sessions/default")
-        assert resp.json()["jlens_fitted"] is False
-
-        save_lens(
-            JacobianLens({0: torch.eye(2)}, n_prompts=1, d_model=2),
-            "test/model",
-            corpus_spec="test",
-            corpus_sha256="abc123",
-            seq_len=8,
-            dim_batch=1,
-            skip_first=16,
-        )
+        session.has_compatible_jlens.return_value = True
         resp = client.get("/saklas/v1/sessions/default")
         assert resp.json()["jlens_fitted"] is True
-
-        _, sidecar_path = lens_paths("test/model")
-        sidecar = json.loads(sidecar_path.read_text())
-        sidecar["format_version"] = 1
-        sidecar_path.write_text(json.dumps(sidecar))
-        resp = client.get("/saklas/v1/sessions/default")
-        assert resp.json()["jlens_fitted"] is False
-
 
 # ---------------------------------------------------------------------------
 # Background J-lens fit lifecycle
@@ -1464,10 +1452,8 @@ class TestLensLiveToggle:
     def test_session_info_carries_live_lens_layers(
         self, session_and_client: Any,
     ) -> None:
-        """Info reports the resolved layer list while on, null while off —
-        and coerces a stub session (bare MagicMock attribute) to off."""
+        """Info reports the live session's resolved layers while enabled."""
         session, client = session_and_client
-        # Bare mock attribute (not a real list) → reads as off.
         resp = client.get("/saklas/v1/sessions/default")
         assert resp.status_code == 200
         assert resp.json()["live_lens_layers"] is None
@@ -1486,7 +1472,7 @@ class TestWSTokenEventLens:
 
         from saklas.server.ws_events import build_token_event
 
-        session = SimpleNamespace(_last_token_probe_payload=payload)
+        session = SimpleNamespace(token_probe_payload=payload or {})
         return build_token_event(
             session,
             [None],
@@ -1512,7 +1498,7 @@ class TestWSTokenEventLens:
                 raise AssertionError("payload path should not read tree rows")
 
         session = SimpleNamespace(
-            _last_token_probe_payload={
+            token_probe_payload={
                 "scores": {"calm": 0.4242429},
                 "per_layer_scores": {"5": {"calm": 0.38}},
             },
@@ -1533,21 +1519,13 @@ class TestWSTokenEventLens:
         assert event["scores"] == {"calm": 0.424243}
         assert event["per_layer_scores"] == {"5": {"calm": 0.38}}
 
-    def test_scores_fall_back_to_tree_row_without_payload_blobs(self) -> None:
+    def test_scores_are_not_reconstructed_from_tree_rows(self) -> None:
         from types import SimpleNamespace
 
         from saklas.server.ws_events import build_token_event
 
-        node = SimpleNamespace(
-            tokens=[{
-                "probes": {"calm": 0.42},
-                "per_layer_scores": {"5": {"calm": 0.38}},
-            }],
-            thinking_tokens=[],
-        )
         session = SimpleNamespace(
-            _last_token_probe_payload={"readings": None},
-            tree=SimpleNamespace(nodes={"node-1": node}),
+            token_probe_payload={},
             generation_state=SimpleNamespace(emit_map=[]),
         )
 
@@ -1561,8 +1539,8 @@ class TestWSTokenEventLens:
             top_alts=None,
         )
 
-        assert event["scores"] == {"calm": 0.42}
-        assert event["per_layer_scores"] == {"5": {"calm": 0.38}}
+        assert "scores" not in event
+        assert "per_layer_scores" not in event
 
     def test_lens_readout_rides_token_frame(self) -> None:
         event = self._event(

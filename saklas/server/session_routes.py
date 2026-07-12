@@ -23,7 +23,9 @@ def register_session_routes(app: FastAPI) -> None:
 
     @app.get("/saklas/v1/sessions")
     def list_sessions():
-        return {"sessions": [session_info(session, app.state.default_steering)]}
+        return {"sessions": [session_info(
+            session, app.state.default_steering, app.state.created_ts,
+        )]}
 
     @app.post("/saklas/v1/sessions")
     def create_session(req: CreateSessionRequest):
@@ -34,12 +36,16 @@ def register_session_routes(app: FastAPI) -> None:
                 req.model,
                 session.model_id,
             )
-        return session_info(session, app.state.default_steering)
+        return session_info(
+            session, app.state.default_steering, app.state.created_ts,
+        )
 
     @app.get("/saklas/v1/sessions/{session_id}")
     def get_session(session_id: str):
         resolve_session_id(session_id)
-        return session_info(session, app.state.default_steering)
+        return session_info(
+            session, app.state.default_steering, app.state.created_ts,
+        )
 
     @app.delete("/saklas/v1/sessions/{session_id}", status_code=204)
     def delete_session(session_id: str):
@@ -72,7 +78,9 @@ def register_session_routes(app: FastAPI) -> None:
             else:
                 for key, value in overrides.items():
                     setattr(session.config, key, value)
-        return session_info(session, app.state.default_steering)
+        return session_info(
+            session, app.state.default_steering, app.state.created_ts,
+        )
 
     @app.post("/saklas/v1/sessions/{session_id}/clear", status_code=204)
     def clear_session(session_id: str):
@@ -83,7 +91,7 @@ def register_session_routes(app: FastAPI) -> None:
     @app.post("/saklas/v1/sessions/{session_id}/rewind", status_code=204)
     def rewind_session(session_id: str):
         resolve_session_id(session_id)
-        if not session.history:
+        if not session.tree.messages_for():
             raise HTTPException(400, "History is empty")
         session.rewind()
         return Response(status_code=204)

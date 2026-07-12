@@ -20,7 +20,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 from saklas.core.errors import SaklasError
 from saklas.core.loom import LoomMutated
-from saklas.core.results import GenerationResult, RunSet
+from saklas.core.results import GenerationResult
 from saklas.core.sampling import SamplingConfig
 from saklas.core.session import SaklasSession
 from saklas.core.steering import Steering
@@ -587,7 +587,7 @@ async def _ws_handle_generate(
             _on_token_flags._saklas_wants_lens_readout = True
             _on_token_flags._saklas_wants_sae_readout = True
 
-            result_holder: list[GenerationResult | RunSet] = []
+            result_holder: list[GenerationResult] = []
             error_holder: list[BaseException] = []
 
             # Recipe-override (phase 5): accept either a mode string or a
@@ -601,7 +601,7 @@ async def _ws_handle_generate(
             def _worker(
                 _sampling: SamplingConfig | None = per_sibling_sampling,
                 _on_token: Callable[..., Any] = _on_token,
-                _result_holder: list[GenerationResult | RunSet] = result_holder,
+                _result_holder: list[GenerationResult] = result_holder,
                 _error_holder: list[BaseException] = error_holder,
                 _token_queue: asyncio.Queue[Any] = token_queue,
                 _sentinel: object = _SENTINEL,
