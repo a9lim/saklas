@@ -22,6 +22,7 @@ from saklas.io.lens import (
     load_lens_checkpoint,
     load_lens_sidecar,
     remove_lens,
+    remove_lens_checkpoint,
     remove_subsumed_lens_checkpoint,
     promote_lens_checkpoint,
     save_lens,
@@ -639,6 +640,104 @@ def test_remove_lens_reaps_crash_left_streaming_temp() -> None:
     assert not orphan.exists()
 
 
+def test_checkpoint_pointer_unlink_is_durable_before_shard_gc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import saklas.io.lens as lens_io
+
+    save_lens_checkpoint(
+        _lens(n_layers=1), _MODEL, base_n_prompts=0,
+        corpus_spec="test-corpus", corpus_sha256="abc123",
+        seq_len=128, dim_batch=8, skip_first=16,
+    )
+    events: list[str] = []
+    real_unlink = Path.unlink
+    real_cleanup = lens_io._cleanup_unreferenced_generations
+
+    def record_unlink(path: Path, *args: Any, **kwargs: Any) -> None:
+        events.append("pointer" if path.suffix == ".json" else "shard")
+        real_unlink(path, *args, **kwargs)
+
+    def record_cleanup(path: Path) -> None:
+        events.append("gc")
+        real_cleanup(path)
+
+    monkeypatch.setattr(Path, "unlink", record_unlink)
+    monkeypatch.setattr(lens_io, "fsync_directory", lambda _path: events.append("barrier"))
+    monkeypatch.setattr(lens_io, "_cleanup_unreferenced_generations", record_cleanup)
+
+    assert remove_lens_checkpoint(_MODEL)
+    assert events[0:3] == ["pointer", "barrier", "gc"]
+    assert events.index("barrier") < events.index("shard")
+
+
+def test_subsumed_checkpoint_unlink_is_durable_before_shard_gc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import saklas.io.lens as lens_io
+
+    save_lens(
+        _lens(n_layers=2, n_prompts=7), _MODEL,
+        corpus_spec="same", corpus_sha256="same-sha",
+        corpus_hash_kind="token_ids_v1", seq_len=128, dim_batch=8,
+        skip_first=16, model_fingerprint="weights",
+    )
+    save_lens_checkpoint(
+        _lens(n_layers=1, n_prompts=2), _MODEL, base_n_prompts=0,
+        corpus_spec="same", corpus_sha256="same-sha",
+        corpus_hash_kind="token_ids_v1", seq_len=128, dim_batch=8,
+        skip_first=16, model_fingerprint="weights",
+    )
+    events: list[str] = []
+    real_unlink = Path.unlink
+    real_cleanup = lens_io._cleanup_unreferenced_generations
+
+    def record_unlink(path: Path, *args: Any, **kwargs: Any) -> None:
+        events.append("pointer" if path.suffix == ".json" else "shard")
+        real_unlink(path, *args, **kwargs)
+
+    def record_cleanup(path: Path) -> None:
+        events.append("gc")
+        real_cleanup(path)
+
+    monkeypatch.setattr(Path, "unlink", record_unlink)
+    monkeypatch.setattr(lens_io, "fsync_directory", lambda _path: events.append("barrier"))
+    monkeypatch.setattr(lens_io, "_cleanup_unreferenced_generations", record_cleanup)
+
+    assert remove_subsumed_lens_checkpoint(_MODEL)
+    pointer = events.index("pointer")
+    barrier = events.index("barrier", pointer + 1)
+    gc_event = events.index("gc")
+    assert pointer < barrier < gc_event < events.index("shard")
+
+
+def test_full_lens_pointer_unlinks_are_durable_before_shard_removal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import saklas.io.lens as lens_io
+
+    _save(_lens())
+    save_lens_checkpoint(
+        _lens(n_layers=1), _MODEL, base_n_prompts=0,
+        corpus_spec="test-corpus", corpus_sha256="abc123",
+        seq_len=128, dim_batch=8, skip_first=16,
+    )
+    events: list[str] = []
+    real_unlink = Path.unlink
+
+    def record_unlink(path: Path, *args: Any, **kwargs: Any) -> None:
+        events.append("pointer" if path.suffix == ".json" else "shard")
+        real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", record_unlink)
+    monkeypatch.setattr(lens_io, "fsync_directory", lambda _path: events.append("barrier"))
+
+    assert remove_lens(_MODEL)
+    first_barrier = events.index("barrier")
+    assert events[:first_barrier] == ["pointer", "pointer"]
+    assert first_barrier < events.index("shard")
+
+
 def test_payload_and_pointer_directory_barriers_precede_generation_gc(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -765,9 +864,14 @@ def test_legacy_checkpoint_promotion_directory_barrier_precedes_pointer(
         skip_first=16, model_fingerprint="weights",
     )
     _final_anchor, final_pointer = lens_io._lens_anchor_paths(_MODEL)
+    _checkpoint_anchor, checkpoint_pointer = lens_io._checkpoint_anchor_paths(
+        _MODEL,
+    )
     events: list[str] = []
     real_fsync = lens_io.os.fsync
     real_write = lens_io.write_json_atomic
+    real_unlink = Path.unlink
+    real_cleanup = lens_io._cleanup_unreferenced_generations
 
     def record_fsync(fd: int) -> None:
         events.append("file")
@@ -782,9 +886,22 @@ def test_legacy_checkpoint_promotion_directory_barrier_precedes_pointer(
             events.append("pointer")
         real_write(path, payload)
 
+    def record_unlink(path: Path, *args: Any, **kwargs: Any) -> None:
+        if path == checkpoint_pointer:
+            events.append("checkpoint-unlink")
+        real_unlink(path, *args, **kwargs)
+
+    def record_cleanup(path: Path) -> None:
+        events.append("gc")
+        real_cleanup(path)
+
     monkeypatch.setattr(lens_io.os, "fsync", record_fsync)
     monkeypatch.setattr(lens_io, "fsync_directory", record_dir)
     monkeypatch.setattr(lens_io, "write_json_atomic", record_pointer)
+    monkeypatch.setattr(Path, "unlink", record_unlink)
+    monkeypatch.setattr(
+        lens_io, "_cleanup_unreferenced_generations", record_cleanup,
+    )
 
     assert promote_lens_checkpoint(
         _MODEL, n_prompts=5, source_layers=[0, 1],
@@ -794,6 +911,9 @@ def test_legacy_checkpoint_promotion_directory_barrier_precedes_pointer(
     pointer_index = events.index("pointer")
     assert "file" in events[:pointer_index]
     assert events[pointer_index - 1] == "dir"
+    unlink_index = events.index("checkpoint-unlink")
+    assert events[unlink_index + 1] == "dir"
+    assert unlink_index < events.index("gc")
 
 
 def test_remove_unpublishes_before_best_effort_tensor_gc(

@@ -213,6 +213,15 @@ def _load_or_fit_transfer_alignment_locked(
         print(f"{label}: source and target have no requested shared layers", file=sys.stderr)
         sys.exit(1)
 
+    # A cold cache fill necessarily captures the model's full neutral roster,
+    # but a narrow transfer must not retain every layer from both models for
+    # the rest of the transaction. Rebinding here drops unrequested tensor
+    # owners as soon as shared coverage is known.
+    if src_seed_rows is not None:
+        src_seed_rows = {layer: src_seed_rows[layer] for layer in wanted}
+    if tgt_seed_rows is not None:
+        tgt_seed_rows = {layer: tgt_seed_rows[layer] for layer in wanted}
+
     cached = load_alignment_map(
         src_model, tgt_model,
         source_identity=src_identity, target_identity=tgt_identity,
@@ -223,6 +232,10 @@ def _load_or_fit_transfer_alignment_locked(
     if cached is not None:
         cached_M, cached_sidecar = cached
     complete_hit = not force and set(cached_M) >= wanted
+    if complete_hit:
+        # The cached map proves the source side; only the target rows are still
+        # needed to reconstruct the exact target metric.
+        src_seed_rows = None
 
     # Target rows are always needed for the exact target-metric re-bake, but
     # only for layers the source profile can actually transfer.
@@ -234,6 +247,7 @@ def _load_or_fit_transfer_alignment_locked(
         tgt_acts, tgt_sidecar = _load_or_capture_rows(tgt_model, wanted)
     else:
         tgt_acts, tgt_sidecar = tgt_loaded
+    tgt_seed_rows = None
     if neutral_cache_identity(tgt_sidecar) != expected_tgt_identity:
         # A cache writer raced the metadata preflight. Restart this directional
         # transaction under the outer alignment fit lock with the new identity.
@@ -265,6 +279,7 @@ def _load_or_fit_transfer_alignment_locked(
         src_acts, src_sidecar = _load_or_capture_rows(src_model, missing)
     else:
         src_acts, src_sidecar = src_loaded
+    src_seed_rows = None
     if neutral_cache_identity(src_sidecar) != src_identity:
         return _load_or_fit_transfer_alignment_locked(
             src_model, tgt_model, force=force, label=label,

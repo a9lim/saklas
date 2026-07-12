@@ -1443,6 +1443,134 @@ def test_shared_capture_survives_until_last_fitted_owner_is_removed(
     assert not capture_file.exists()
 
 
+def test_clear_reaps_capture_when_sidecar_is_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    domain = {"type": "box", "axes": [
+        {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]}
+    folder, _ = create_manifold_folder(
+        "local", "mood", "", domain, _author_nodes(["a", "b", "c"]),
+    )
+    fitted = _fake_fit_tensor(folder, "model/a")
+    fitted.with_suffix(".json").unlink()
+    from saklas.io.paths import model_dir
+
+    capture_sha = "1" * 64
+    capture_dir = model_dir("model/a") / "manifold_capture"
+    capture_dir.mkdir(parents=True)
+    capture_file = capture_dir / f"{capture_sha}.rows.layer_0.safetensors"
+    capture_file.write_bytes(b"orphan")
+
+    clear_manifold_tensors("local", "mood")
+    assert not capture_file.exists()
+
+
+def test_clear_reaps_capture_when_both_fitted_halves_are_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    domain = {"type": "box", "axes": [
+        {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]}
+    folder, _ = create_manifold_folder(
+        "local", "mood", "", domain, _author_nodes(["a", "b", "c"]),
+    )
+    fitted = _fake_fit_tensor(folder, "model/a")
+    fitted.unlink()
+    fitted.with_suffix(".json").unlink()
+    from saklas.io.paths import model_dir
+
+    capture_sha = "4" * 64
+    capture_dir = model_dir("model/a") / "manifold_capture"
+    capture_dir.mkdir(parents=True)
+    capture_file = capture_dir / f"{capture_sha}.rows.layer_0.safetensors"
+    capture_file.write_bytes(b"orphan")
+
+    assert clear_manifold_tensors("local", "mood") == 0
+    assert not capture_file.exists()
+
+
+def test_rm_reaps_capture_when_sidecar_is_corrupt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    domain = {"type": "box", "axes": [
+        {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]}
+    folder, _ = create_manifold_folder(
+        "local", "mood", "", domain, _author_nodes(["a", "b", "c"]),
+    )
+    fitted = _fake_fit_tensor(folder, "model/a")
+    fitted.with_suffix(".json").write_text("{")
+    from saklas.io.paths import model_dir
+
+    capture_sha = "2" * 64
+    capture_dir = model_dir("model/a") / "manifold_capture"
+    capture_dir.mkdir(parents=True)
+    capture_file = capture_dir / f"{capture_sha}.rows.layer_0.safetensors"
+    capture_file.write_bytes(b"orphan")
+
+    remove_manifold_folder("local", "mood")
+    assert not capture_file.exists()
+
+
+def test_rm_reaps_capture_when_both_fitted_halves_are_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    domain = {"type": "box", "axes": [
+        {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]}
+    folder, _ = create_manifold_folder(
+        "local", "mood", "", domain, _author_nodes(["a", "b", "c"]),
+    )
+    fitted = _fake_fit_tensor(folder, "model/a")
+    fitted.unlink()
+    fitted.with_suffix(".json").unlink()
+    from saklas.io.paths import model_dir
+
+    capture_sha = "5" * 64
+    capture_dir = model_dir("model/a") / "manifold_capture"
+    capture_dir.mkdir(parents=True)
+    capture_file = capture_dir / f"{capture_sha}.rows.layer_0.safetensors"
+    capture_file.write_bytes(b"orphan")
+
+    remove_manifold_folder("local", "mood")
+    assert not capture_file.exists()
+
+
+def test_corrupt_owner_cleanup_preserves_capture_with_readable_shared_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    domain = {"type": "box", "axes": [
+        {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]}
+    folders = [
+        create_manifold_folder(
+            "local", name, "", domain, _author_nodes(["a", "b", "c"]),
+        )[0]
+        for name in ("broken-owner", "live-owner")
+    ]
+    broken = _fake_fit_tensor(folders[0], "model/a")
+    broken.with_suffix(".json").write_text("{")
+    live = _fake_fit_tensor(folders[1], "model/a")
+    capture_sha = "3" * 64
+    live_sidecar = live.with_suffix(".json")
+    sidecar = json.loads(live_sidecar.read_text())
+    sidecar["capture_sha256"] = capture_sha
+    live_sidecar.write_text(json.dumps(sidecar))
+    ManifoldFolder.load(folders[1], verify_manifest=False).update_file_hashes(
+        live, live_sidecar,
+    )
+    from saklas.io.paths import model_dir
+
+    capture_dir = model_dir("model/a") / "manifold_capture"
+    capture_dir.mkdir(parents=True)
+    capture_file = capture_dir / f"{capture_sha}.rows.layer_0.safetensors"
+    capture_file.write_bytes(b"shared")
+
+    remove_manifold_folder("local", "broken-owner")
+    assert capture_file.exists()
+
+
 def test_clear_manifold_tensors_repairs_orphan_sidecar(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):

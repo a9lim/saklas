@@ -135,7 +135,8 @@ def _sidecar_tensor_path(anchor: Path, sidecar: Mapping[str, Any]) -> Path:
 
 
 def _sidecar_tensor_paths(
-    anchor: Path, sidecar: Mapping[str, Any], source_layers: list[int],
+    anchor: Path, sidecar: Mapping[str, Any], source_layers: list[int], *,
+    require_exact_keys: bool = True,
 ) -> dict[int, Path]:
     """Resolve every declared layer to its immutable tensor generation."""
     shard_files = sidecar.get("tensor_files")
@@ -154,7 +155,11 @@ def _sidecar_tensor_paths(
         ):
             raise ValueError(f"missing or invalid tensor shard for layer {layer}")
         out[layer] = anchor.parent / filename
-    if {str(layer) for layer in source_layers} != {str(key) for key in shard_files}:
+    if (
+        require_exact_keys
+        and {str(layer) for layer in source_layers}
+        != {str(key) for key in shard_files}
+    ):
         raise ValueError("tensor shard keys do not match source_layers")
     return out
 
@@ -881,7 +886,11 @@ def load_lens(model_id: str) -> tuple[JacobianLens, dict[str, Any]] | None:
 
 def _load_lens_verified(
     model_id: str,
-) -> tuple[JacobianLens, dict[str, Any], _LensPayloadProof] | None:
+    *,
+    requested_layers: set[int] | None = None,
+) -> tuple[
+    JacobianLens, dict[str, Any], _LensPayloadProof | None,
+] | None:
     """Load a durable lens plus a proof reusable under the fit transaction."""
     anchor, sc_path = _lens_anchor_paths(model_id)
     with lens_fit_lock(model_id), artifact_lock(anchor):
@@ -890,13 +899,21 @@ def _load_lens_verified(
         )
         loaded = _load_lens_at(
             model_id, anchor, sc_path, sidecar, label="jlens cache",
+            requested_layers=requested_layers,
         )
         if loaded is None:
             return None
         lens, verified_sidecar = loaded
         _cleanup_unreferenced_generations(anchor.parent)
-        return lens, verified_sidecar, _lens_payload_proof(
-            anchor, verified_sidecar,
+        durable_layers = {
+            int(layer) for layer in verified_sidecar["source_layers"]
+        }
+        fully_verified = (
+            requested_layers is None or requested_layers >= durable_layers
+        )
+        return lens, verified_sidecar, (
+            _lens_payload_proof(anchor, verified_sidecar)
+            if fully_verified else None
         )
 
 
@@ -982,6 +999,7 @@ def promote_lens_checkpoint(
         write_json_atomic(final_sc, durable_sidecar)
         fsync_directory(final_sc.parent)
         checkpoint_sc.unlink(missing_ok=True)
+        fsync_directory(final_sc.parent)
         _cleanup_unreferenced_generations(final_anchor.parent)
         fsync_directory(final_sc.parent)
         return True
@@ -994,15 +1012,28 @@ def _load_lens_at(
     sidecar: dict[str, Any] | None,
     *,
     label: str,
+    requested_layers: set[int] | None = None,
 ) -> tuple[JacobianLens, dict[str, Any]] | None:
     if sidecar is None:
         return None
     try:
         d_model = int(sidecar["d_model"])
-        source_layers = [int(layer) for layer in sidecar["source_layers"]]
+        durable_layers = [int(layer) for layer in sidecar["source_layers"]]
+        if (
+            requested_layers is not None
+            and requested_layers - set(durable_layers)
+        ):
+            raise ValueError("requested layers are absent from lens")
+        source_layers = (
+            durable_layers if requested_layers is None
+            else [layer for layer in durable_layers if layer in requested_layers]
+        )
+        if not source_layers:
+            raise ValueError("requested layers are absent from lens")
         jacobians: dict[int, torch.Tensor] = {}
         tensor_paths = _sidecar_tensor_paths(
             tensor_anchor, sidecar, source_layers,
+            require_exact_keys=(source_layers == durable_layers),
         )
         expected_digests = sidecar.get("tensor_sha256")
         sharded = isinstance(expected_digests, Mapping)
@@ -1164,7 +1195,12 @@ def remove_subsumed_lens_checkpoint(
         if not caller_verified_current and not lens_payloads_match(model_id, final):
             return False
         checkpoint_sc.unlink(missing_ok=True)
+        # The sidecar is the atomic pointer.  Make its removal durable before
+        # deleting any shard it could name, otherwise a crash can resurrect a
+        # checkpoint pointer whose payload has already been collected.
+        fsync_directory(final_anchor.parent)
         _cleanup_unreferenced_generations(final_anchor.parent)
+        fsync_directory(final_anchor.parent)
         return True
 
 
@@ -1175,7 +1211,9 @@ def remove_lens_checkpoint(model_id: str) -> bool:
         before = set(anchor.parent.glob("jlens*.safetensors"))
         removed = sc_path.exists()
         sc_path.unlink(missing_ok=True)
+        fsync_directory(anchor.parent)
         _cleanup_unreferenced_generations(anchor.parent)
+        fsync_directory(anchor.parent)
         after = set(anchor.parent.glob("jlens*.safetensors"))
         return removed or before != after
 
@@ -1205,6 +1243,7 @@ def remove_lens(model_id: str) -> bool:
         # best-effort tensor GC failure cannot expose a partially deleted lens.
         final_sc.unlink(missing_ok=True)
         checkpoint_sc.unlink(missing_ok=True)
+        fsync_directory(final_anchor.parent)
         for path in tensor_candidates:
             try:
                 path.unlink(missing_ok=True)

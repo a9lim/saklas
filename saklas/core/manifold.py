@@ -1593,6 +1593,7 @@ def fit_layer_subspace(
     rbf_info: dict[str, float] | None = None,
     rbf_plan: RbfFitPlan | None = None,
     basis_override: torch.Tensor | None = None,
+    fit_result: dict[str, torch.Tensor] | None = None,
 ) -> tuple[LayerSubspace, float]:
     """Fit a PCA subspace + RBF interpolant for one layer (curved).
 
@@ -1686,7 +1687,13 @@ def fit_layer_subspace(
     else:
         anchor = mu
     mean = (anchor @ basis.T) @ basis           # P_basis(anchor) (D,)
-    coords = (centroids - anchor) @ basis.T     # (K, R) anchor-relative RBF targets
+    # Project the μ-centered roster exactly once. This is the historical share
+    # computation order; anchor-relative RBF targets differ only by one reduced
+    # offset, so they do not need a second K×D by D×R product.
+    mu_coords = X @ basis.T
+    coords = mu_coords + ((mu - anchor) @ basis.T)
+    if fit_result is not None:
+        fit_result["mu_coords"] = mu_coords
 
     plan = rbf_plan or prepare_rbf_fit_plan(
         node_params, smoothing=smoothing,

@@ -675,6 +675,111 @@ def test_cold_alignment_reuses_loaded_target_neutrals_for_whitener(
     assert whitener.layers == {0}
 
 
+def test_cold_narrow_alignment_releases_full_seed_rosters_before_fit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    import gc
+    import weakref
+
+    import torch
+
+    import saklas.core.model as model_mod
+    import saklas.core.session as session_mod
+    import saklas.io.alignment as alignment_mod
+    from saklas.cli import runners
+
+    class _SessionContext:
+        def __init__(self, model_id: str) -> None:
+            self.model_id = model_id
+            self.model = object()
+            self.tokenizer = object()
+            self.layers = [object() for _ in range(10)]
+
+        def __enter__(self) -> "_SessionContext":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    monkeypatch.setattr(
+        session_mod.SaklasSession,
+        "from_pretrained",
+        staticmethod(lambda model_id, **_kwargs: _SessionContext(model_id)),
+    )
+    monkeypatch.setattr(model_mod, "model_source_fingerprint", lambda *_args: None)
+    monkeypatch.setattr(
+        alignment_mod, "validate_neutral_cache_metadata",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            FileNotFoundError("cold cache")
+        ),
+    )
+
+    unrequested_refs: list[weakref.ReferenceType[torch.Tensor]] = []
+
+    def capture(
+        _model: object, _tokenizer: object, _layers: object, *,
+        model_id: str, force: bool,
+    ) -> tuple[dict[int, torch.Tensor], dict[str, Any]]:
+        assert force is False
+        rows = {
+            layer: torch.tensor(
+                [[1.0 + layer, 0.0], [0.0, 1.0], [2.0, 1.0]],
+            )
+            for layer in range(10)
+        }
+        unrequested_refs.append(weakref.ref(rows[9]))
+        return rows, {
+            "format_version": 2,
+            "capture_version": 1,
+            "model_fingerprint": f"fp:{model_id}",
+            "model_source_fingerprint": f"source:{model_id}",
+            "capture_sha256": model_id,
+            "tensor_sha256": model_id,
+            "layers": list(range(10)),
+            "tensor_schema": {
+                str(layer): {
+                    "shape": [3, 2], "dtype": "torch.float32",
+                }
+                for layer in range(10)
+            },
+            "n_prompts": 3,
+        }
+
+    monkeypatch.setattr(
+        alignment_mod,
+        "_load_or_compute_neutral_activations_with_metadata_locked",
+        capture,
+    )
+    monkeypatch.setattr(alignment_mod, "load_alignment_map", lambda *_a, **_k: None)
+
+    def fit(
+        src: dict[int, torch.Tensor], tgt: dict[int, torch.Tensor], **kwargs: Any,
+    ) -> dict[int, torch.Tensor]:
+        gc.collect()
+        assert len(unrequested_refs) == 2
+        assert all(ref() is None for ref in unrequested_refs)
+        assert set(src) == set(tgt) == {5}
+        assert kwargs["requested_layers"] == {5}
+        return {5: torch.eye(2)}
+
+    monkeypatch.setattr(alignment_mod, "fit_alignment", fit)
+    monkeypatch.setattr(
+        alignment_mod, "alignment_quality", lambda *_args, **_kwargs: {5: 1.0},
+    )
+    monkeypatch.setattr(
+        alignment_mod, "save_alignment_map",
+        lambda *_args, **_kwargs: tmp_path / "alignment.safetensors",
+    )
+
+    result = runners._load_or_fit_transfer_alignment(
+        "src/model", "tgt/model", force=True, label="test transfer",
+        requested_layers=[5],
+    )
+
+    assert set(result[0]) == {5}
+    assert result[5].layers == {5}
+
+
 def test_cached_alignment_keeps_model_free_offline_whitener_path(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:

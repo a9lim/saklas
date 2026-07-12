@@ -18,7 +18,12 @@ from typing import Any, cast
 import pytest
 import torch
 
-from saklas.core.jlens import JacobianLens, LensNotFittedError, MultiTokenWordError
+from saklas.core.jlens import (
+    JacobianLens,
+    JacobianLensError,
+    LensNotFittedError,
+    MultiTokenWordError,
+)
 from saklas.core.model import loaded_model_fingerprint, model_source_fingerprint
 from saklas.core.loom import (
     InvalidNodeOperationError,
@@ -247,6 +252,138 @@ def test_subset_noop_keeps_full_durable_lens_resident() -> None:
     assert full.source_layers == [0, 1]
     assert s._jlens.source_layers == [0, 1]
     assert s.jlens.source_layers == [0, 1]
+
+
+def test_fresh_subset_noop_reads_only_requested_shard_and_preserves_disk_union(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import saklas.io.lens as lens_io
+
+    _StubSession().fit_jlens(_PROMPTS, source_layers=[0, 1], force=True)
+    payload_reads: list[str] = []
+    real_safe_open = lens_io.safe_open
+
+    class _TrackingSafeOpen:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self._opened = real_safe_open(*args, **kwargs)
+            self._tensors: Any = None
+
+        def __enter__(self) -> "_TrackingSafeOpen":
+            self._tensors = self._opened.__enter__()
+            return self
+
+        def __exit__(self, *args: Any) -> Any:
+            return self._opened.__exit__(*args)
+
+        def keys(self) -> Any:
+            return self._tensors.keys()
+
+        def get_slice(self, key: str) -> Any:
+            return self._tensors.get_slice(key)
+
+        def get_tensor(self, key: str) -> Any:
+            payload_reads.append(key)
+            return self._tensors.get_tensor(key)
+
+    monkeypatch.setattr(lens_io, "safe_open", _TrackingSafeOpen)
+    session = _StubSession()
+    selected = session.fit_jlens(_PROMPTS, source_layers=[1])
+
+    assert payload_reads == ["layer_1"]
+    assert selected.source_layers == [1]
+    monkeypatch.setattr(lens_io, "safe_open", real_safe_open)
+    durable = load_lens(_MODEL_ID)
+    assert durable is not None
+    assert durable[0].source_layers == [0, 1]
+    assert session.jlens.source_layers == [0, 1]
+
+
+def test_legacy_subset_noop_loads_full_monolith_and_preserves_resident_union() -> None:
+    import saklas.io.lens as lens_io
+
+    full = _StubSession().fit_jlens(
+        _PROMPTS, source_layers=[0, 1], force=True,
+    )
+    generation, sc_path = lens_paths(_MODEL_ID)
+    legacy = generation.parent / "jlens.safetensors"
+
+    def _rows(layer: int, start: int, end: int) -> torch.Tensor:
+        return full.jacobians[layer][start:end].to(torch.float16).contiguous()
+
+    digest = lens_io._save_fp16_square_safetensors_atomic(
+        legacy, full.source_layers, full.d_model, _rows,
+    )
+    sidecar = json.loads(sc_path.read_text())
+    sidecar["format_version"] = 3
+    sidecar.pop("tensor_files")
+    sidecar["tensor_sha256"] = digest
+    sc_path.write_text(json.dumps(sidecar))
+
+    session = _StubSession()
+    selected = session.fit_jlens(_PROMPTS, source_layers=[1])
+
+    assert selected.source_layers == [1]
+    assert session._jlens.source_layers == [0, 1]
+    assert session.jlens.source_layers == [0, 1]
+
+
+def test_fresh_partial_extension_rejects_before_payload_and_preserves_union(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import gc
+    import weakref
+
+    import saklas.io.lens as lens_io
+
+    writer = _StubSession()
+    writer.fit_jlens(_PROMPTS[:2], source_layers=[0, 1], force=True)
+    resident_ref = weakref.ref(writer._jlens)
+    del writer
+    gc.collect()
+    assert resident_ref() is None
+
+    payload_reads: list[str] = []
+    real_load = lens_io._load_lens_verified
+
+    def record_load(*args: Any, **kwargs: Any) -> Any:
+        payload_reads.append("load")
+        return real_load(*args, **kwargs)
+
+    monkeypatch.setattr(lens_io, "_load_lens_verified", record_load)
+    with pytest.raises(JacobianLensError, match="full durable layer set"):
+        _StubSession().fit_jlens(_PROMPTS, source_layers=[0])
+
+    assert payload_reads == []
+    monkeypatch.setattr(lens_io, "_load_lens_verified", real_load)
+    durable = load_lens(_MODEL_ID)
+    assert durable is not None
+    assert durable[0].source_layers == [0, 1]
+    assert durable[0].n_prompts == 2
+
+
+def test_overlapping_partial_extension_requires_explicit_replacement() -> None:
+    _StubSession(n_layers=4).fit_jlens(
+        _PROMPTS[:2], source_layers=[0, 1], force=True,
+    )
+
+    with pytest.raises(JacobianLensError, match="full durable layer set"):
+        _StubSession(n_layers=4).fit_jlens(
+            _PROMPTS, source_layers=[1, 2],
+        )
+
+    durable = load_lens(_MODEL_ID)
+    assert durable is not None
+    assert durable[0].source_layers == [0, 1]
+    assert durable[0].n_prompts == 2
+
+    replaced = _StubSession(n_layers=4).fit_jlens(
+        _PROMPTS, source_layers=[1, 2], force=True,
+    )
+    assert replaced.source_layers == [1, 2]
+    durable = load_lens(_MODEL_ID)
+    assert durable is not None
+    assert durable[0].source_layers == [1, 2]
+    assert durable[0].n_prompts == len(_PROMPTS)
 
 
 def test_exact_noop_reaps_checkpoint_left_after_final_publication() -> None:
@@ -1109,7 +1246,7 @@ def test_subset_resume_releases_unrequested_resident_matrices(
         return real_fit(*args, **kwargs)
 
     monkeypatch.setattr(jlens_mod, "fit_jacobian_lens", observe_release)
-    resumed = session.fit_jlens(_PROMPTS, source_layers=[0])
+    resumed = session.fit_jlens(_PROMPTS, source_layers=[0], force=True)
 
     assert released == [True]
     assert resumed.source_layers == [0]

@@ -815,6 +815,7 @@ def test_disjoint_layer_top_up_preserves_existing_row_cache(
     scopes: list[list[int]] = []
     persisted: list[str] = []
     real_save = extraction_module._save_safetensors_atomic
+    real_row_save = extraction_module._save_row_safetensors_atomic
 
     def _counting(*args: Any, **kwargs: Any) -> Any:
         scopes.append(list(kwargs["layer_indices"]))
@@ -824,8 +825,15 @@ def test_disjoint_layer_top_up_preserves_existing_row_cache(
         persisted.append(Path(path).name)
         return real_save(tensors, path, **kwargs)
 
+    def _tracked_row_save(key: str, tensor: torch.Tensor, path: Path) -> str:
+        persisted.append(Path(path).name)
+        return real_row_save(key, tensor, path)
+
     monkeypatch.setattr(V, "_encode_and_capture_all_batch", _counting)
     monkeypatch.setattr(extraction_module, "_save_safetensors_atomic", _tracked_save)
+    monkeypatch.setattr(
+        extraction_module, "_save_row_safetensors_atomic", _tracked_row_save,
+    )
     ManifoldExtractionPipeline(handle, EventBus()).fit(
         folder_b, layer_indices=[1],
     )
@@ -1200,6 +1208,94 @@ def test_row_cache_uses_layer_digests_without_container_rehash(
     }
     assert any(".centroids.layer_" in path.name for path in hashed)
     assert not any(".rows.layer_" in path.name for path in hashed)
+
+
+def test_cold_row_publication_traverses_each_payload_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from saklas.core import extraction as extraction_module
+    from saklas.io.paths import model_dir
+
+    real_chunks = extraction_module._iter_tensor_byte_chunks
+    traversals: list[int] = []
+
+    def _tracked(tensor: torch.Tensor, **kwargs: Any) -> Any:
+        traversals.append(id(tensor))
+        yield from real_chunks(tensor, **kwargs)
+
+    monkeypatch.setattr(extraction_module, "_iter_tensor_byte_chunks", _tracked)
+    monkeypatch.setattr(
+        extraction_module, "_tensor_sha256",
+        lambda _tensor: pytest.fail(
+            "row publication must not start a second tensor traversal"
+        ),
+    )
+    folder = _author_manifold(tmp_path)
+    ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder)
+
+    capture_dir = model_dir("stub-model") / "manifold_capture"
+    row_shards = list(capture_dir.glob("*.rows.layer_*.safetensors"))
+    assert len(row_shards) == _N_LAYERS
+    assert len(traversals) == len(row_shards)
+
+
+def test_deferred_row_publication_traverses_each_payload_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from safetensors.torch import load_file
+    from saklas.core import extraction as extraction_module
+    from saklas.core.manifold import ActivationRowStore
+
+    stem = "d" * 64
+    meta_path = tmp_path / f"{stem}.json"
+    meta_path.write_text(json.dumps({
+        "format_version": 4,
+        "capture_sha256": stem,
+        "node_sizes": [2],
+        "centroid_layers": [0],
+        "row_layers": [],
+        "centroid_files": {},
+        "row_files": {},
+        "centroid_shapes": {},
+        "row_shapes": {},
+        "row_dtypes": {},
+        "row_tensor_sha256": {},
+        "files": {},
+    }))
+    expected = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    store = ActivationRowStore([2])
+    store.write(0, torch.arange(2), expected)
+    real_chunks = extraction_module._iter_tensor_byte_chunks
+    traversals = 0
+
+    def _tracked(tensor: torch.Tensor, **kwargs: Any) -> Any:
+        nonlocal traversals
+        traversals += 1
+        yield from real_chunks(tensor, **kwargs)
+
+    monkeypatch.setattr(extraction_module, "_iter_tensor_byte_chunks", _tracked)
+    real_tensor_sha = extraction_module._tensor_sha256
+    monkeypatch.setattr(
+        extraction_module, "_tensor_sha256",
+        lambda _tensor: pytest.fail(
+            "row publication must not start a second tensor traversal"
+        ),
+    )
+    try:
+        extraction_module._publish_deferred_row_shards(
+            tmp_path, stem, meta_path, store, [2], set(), {}, {}, {}, {},
+        )
+    finally:
+        store.close()
+    monkeypatch.setattr(extraction_module, "_tensor_sha256", real_tensor_sha)
+
+    payload = json.loads(meta_path.read_text())
+    row_path = tmp_path / payload["row_files"]["0"]
+    assert traversals == 1
+    assert real_tensor_sha(expected) == (
+        payload["row_tensor_sha256"]["0"]
+    )
+    assert torch.equal(load_file(str(row_path))["layer_0"], expected)
 
 
 def test_selected_row_digest_tamper_recaptures_that_layer(

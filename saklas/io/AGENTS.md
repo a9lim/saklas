@@ -163,7 +163,9 @@ serializer shared by `pack show -j` + the HTTP summary route.
 `clear` / `rm` garbage-collect shared format-v4 per-layer capture shards only
 after the last fitted-sidecar owner disappears, under the same capture-stem lock
 used by fitting and only when no live PID lease is consuming mapped rows; stale
-crash leases are reaped lazily. Scoped clear increments only its model/variant
+crash leases are reaped lazily. They enumerate all cache stems for affected
+models, so corrupt or missing fitted sidecars cannot strand an orphaned group;
+a readable owner in any other manifold still preserves it. Scoped clear increments only its model/variant
 fit epoch, invalidating a paused matching fit without discarding unrelated target
 work; rm/recreate changes the folder artifact id. Fitted pairs use stable
 digest-named locks outside the removable folder; clear/rm/refresh acquire the
@@ -415,7 +417,10 @@ the same source layers and runs `fit_alignment`/quality/save without loading eit
 model. Existing factor pointers are carried forward and only missing requested
 layers are fitted/written; `-f` recomputes alignment/transfer output but does not
 recapture an exact neutral cache. A narrow transfer therefore does not digest,
-materialize, fit, or whiten unrelated layers.
+materialize, fit, or whiten unrelated layers. When a cold cache fill necessarily
+captures a full roster before requested coverage is known, the transfer runner
+immediately narrows both seed mappings and releases unrequested tensor owners;
+the complete roster remains only in the reusable durable cache.
 `fit_alignment(src, tgt, *, min_shared_layers=10, requested_layers=...,
 available_shared_layers=...) → {layer: LayerAlignment}`
 (row-space orthogonal Procrustes for matched dim, rectangular minimum-norm
@@ -460,7 +465,10 @@ no-op checks, `seq_len`, `dim_batch`, `skip_first_positions`, exact model
 source/live-weight identities, per-layer tensor filenames + sha256 values, and the model's
 layer count (needed to prove `all`/`workspace` coverage without loading it).
 Loading uses `safe_open` one shard at a time, so fp16 source storage is released
-as the fp32 lens is materialized rather than coexisting as a full mapping. Resumable
+as the fp32 lens is materialized rather than coexisting as a full mapping. The
+verified loader can materialize only requested v4 shards for a fresh same-corpus
+subset no-op; the durable pointer and its full layer union remain unchanged.
+Resumable
 checkpoints use the same generation-pointer scheme under `jlens.partial.json`:
 the estimator writes a self-contained averaged checkpoint directly from raw sums,
 merging a prior prefix one layer at a time during fp16 conversion. This avoids a
@@ -473,7 +481,8 @@ at its immutable tensor generations, without moving or rewriting them; a pointer
 failure therefore preserves both the prior full artifact and the checkpoint.
 Promotion accepts only v4 checkpoints whose every shard matches its declared
 digest; legacy v3 checkpoints fall back to ordinary v4 serialization. Removal
-unpublishes both pointer sidecars before best-effort shard garbage collection.
+unpublishes both pointer sidecars, fsyncs that directory state, and only then
+performs best-effort shard garbage collection.
 Because final publication and checkpoint unlink are separate crash points, exact
 no-op recovery removes a leftover checkpoint only after the validated final
 artifact proves it has matching fit semantics, covers its layers, and reaches at
@@ -481,9 +490,9 @@ least its effective base-plus-partial prompt progress; newer or different-corpus
 checkpoints remain resumable.
 Unreferenced generations and crash-left streamed `.safetensors.tmp` shards are
 collected at fit preflight/removal and only after pointer commit. The pointer's
-parent directory is fsynced before old shards or a promoted checkpoint pointer
-are unlinked, preventing a power-loss rollback to a pointer whose payload was
-already collected. A dedicated
+parent directory is fsynced after pointer publication before old shards are
+collected, and after pointer unlink before its shards are removed, preventing a
+power-loss rollback to a pointer whose payload was already collected. A dedicated
 per-model `jlens.fit` lock spans preflight, estimator/checkpoint work, final
 publication, and lifecycle removal across processes. Metadata-only
 final/checkpoint preflight rejects incompatible corpora/layers before matrix IO.

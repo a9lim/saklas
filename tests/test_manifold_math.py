@@ -558,6 +558,33 @@ def test_fit_layer_subspace_rejects_too_few_nodes():
         fit_layer_subspace(torch.randn(2, 8), torch.rand(2, 1))
 
 
+def test_fit_layer_subspace_returns_reusable_mu_centered_coords():
+    generator = torch.Generator().manual_seed(91)
+    centroids = 100_000.0 + torch.randn(7, 12, generator=generator)
+    neutral = -70_000.0 + torch.randn(12, generator=generator)
+    node_params = torch.linspace(0.0, 1.0, 7).reshape(-1, 1)
+    fit_result: dict[str, torch.Tensor] = {}
+
+    sub, _ = _fit_layer_subspace_with_ev(
+        centroids, node_params, neutral_mean=neutral, fit_result=fit_result,
+    )
+
+    expected = (
+        (centroids.float() - centroids.float().mean(dim=0))
+        @ sub.basis.float().T
+    )
+    assert torch.equal(fit_result["mu_coords"], expected)
+    expected_anchor_coords = (
+        (centroids.float() - neutral.float()) @ sub.basis.float().T
+    )
+    fitted_anchor_coords = eval_rbf(
+        sub.node_params, sub.rbf_weights, sub.poly_coeffs, sub.node_params,
+    )
+    assert torch.allclose(
+        fitted_anchor_coords, expected_anchor_coords, atol=0.1, rtol=1e-6,
+    )
+
+
 def test_fit_layer_subspace_returns_ev_ratio():
     """The new tuple-return shape carries an explained-variance ratio
     alongside the LayerSubspace.  EV ∈ [0, 1]: when the chosen R

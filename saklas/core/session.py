@@ -2091,7 +2091,12 @@ class SaklasSession:
             JacobianLensError,
             fit_jacobian_lens,
         )
-        from saklas.io.lens import load_lens, load_lens_sidecar, save_lens
+        from saklas.io.lens import (
+            LENS_FORMAT_VERSION,
+            load_lens,
+            load_lens_sidecar,
+            save_lens,
+        )
         from saklas.io.lens import (
             _load_lens_verified,
             load_lens_checkpoint,
@@ -2241,6 +2246,28 @@ class SaklasSession:
                         and saved_sha == _token_rows_sha(consumed_ids[:saved_n])
                     )
                     if corpus_matches or prefix_matches:
+                        durable_sources = {
+                            int(layer) for layer in sidecar.get("source_layers", [])
+                        }
+                        if (
+                            saved_n < len(usable)
+                            and bool(durable_sources - expected_set)
+                        ):
+                            # v4 has one corpus/progress identity shared by every
+                            # layer. Publishing only the requested extension would
+                            # silently discard the other durable layers; carrying
+                            # them forward would falsely claim they were averaged
+                            # over the longer corpus. Keep the proven superset
+                            # untouched unless replacement is explicit.
+                            raise JacobianLensError(
+                                "cannot extend only a subset of an existing "
+                                f"J-lens: durable layers {sorted(durable_sources)} "
+                                f"include unrequested layers "
+                                f"{sorted(durable_sources - expected_set)}. "
+                                "Request the full durable layer set to extend "
+                                "its corpus, or pass force=True to explicitly "
+                                "replace it with the requested subset."
+                            )
                         prefer_checkpoint = bool(
                             checkpoint_meta_matches
                             and checkpoint_base_n == 0
@@ -2280,14 +2307,34 @@ class SaklasSession:
                         ):
                             existing = (resident, sidecar)
                         else:
-                            verified_existing = _load_lens_verified(self.model_id)
+                            # A fresh same-corpus subset no-op needs only the
+                            # requested shards. Any path that will publish a
+                            # union or resume an accumulator still loads the
+                            # complete durable roster so preservation is exact.
+                            selective_layers = (
+                                expected_set
+                                if (
+                                    saved_n >= len(usable)
+                                    and durable_sources >= expected_set
+                                    and int(sidecar.get("format_version", 0))
+                                    == LENS_FORMAT_VERSION
+                                )
+                                else None
+                            )
+                            verified_existing = _load_lens_verified(
+                                self.model_id,
+                                requested_layers=selective_layers,
+                            )
                             if verified_existing is None:
                                 existing = None
                                 existing_reuse_proof = None
                             else:
                                 existing = verified_existing[:2]
                                 existing_reuse_proof = verified_existing[2]
-                            existing_payload_verified = existing is not None
+                            existing_payload_verified = bool(
+                                existing is not None
+                                and selective_layers is None
+                            )
                     else:
                         existing = None
                         existing_payload_verified = False
@@ -2315,9 +2362,21 @@ class SaklasSession:
                                 ),
                             )
                             selected = lens.select_layers(expected_sources)
-                            SaklasSession._adopt_fitted_jlens(
-                                self, lens, sidecar=sidecar,
-                            )
+                            durable_set = {
+                                int(layer)
+                                for layer in sidecar.get("source_layers", [])
+                            }
+                            if existing_set == durable_set:
+                                SaklasSession._adopt_fitted_jlens(
+                                    self, lens, sidecar=sidecar,
+                                )
+                            else:
+                                # A selective no-op is a return view, not the
+                                # complete artifact named by this sidecar. Do
+                                # not stamp it with the durable identity or a
+                                # later ``session.jlens`` access would mistake
+                                # the narrow view for the full disk union.
+                                SaklasSession._evict_resident_jlens(self)
                             return selected
                         missing_sources = sorted(expected_set - existing_set)
                         if on_progress is not None:
@@ -2542,6 +2601,8 @@ class SaklasSession:
             # subset accumulator. The selected `base` owns the only references
             # the estimator needs.
             existing = None
+            verified_existing = None
+            fallback = None
             ckpt = None
             partial = None
             lens = None

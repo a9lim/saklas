@@ -192,7 +192,8 @@ fitted-tensor cache remains the first fast path; after it misses, the mandatory
 Mahalanobis whitener is checked before this expensive capture begins. Format v4
 stores independently digested, immutable generation-named per-layer centroid
 and row shards: scoped fits verify/map only requested layers, disjoint top-ups
-write only missing shards, and legacy v3 monoliths are replaced on first use.
+write only missing shards, row publication computes its tensor-domain digest in
+the same bounded payload traversal, and legacy v3 monoliths are replaced on first use.
 Each generation fsyncs its payloads before a recovery journal and atomic pointer;
 the pointer directory is fsynced before superseded generations are collected.
 The prior pointer remains authoritative on failure, and a complete orphaned
@@ -964,14 +965,22 @@ interrupted shorter corpus can be extended without fabricating the future full
 hash or restarting. Sparse layer top-ups reuse the unchanged durable shard
 pointers and write only new matrices. A transaction-scoped verified-pointer
 proof avoids rehashing just-loaded reuse shards; unverified callers still hash.
+Fresh same-corpus subset no-ops materialize only their requested v4 shards and
+leave the full durable union published. Since v4 records one corpus progress for
+all layers, extending a strict subset of a durable superset is rejected before
+matrix load unless the caller requests the full union or explicitly forces
+replacement; carrying unrequested old-prefix layers would make that progress
+false. Missing-layer top-ups preserve the full unchanged union, while selected
+resume views release their source containers before estimator entry.
 The streamed
 safetensors writer never retains a complete fp16 mapping. Normal corpus extension
 resumes from an exact token-id prefix; the default dataset is commit-pinned;
 exact source/live-model fingerprints invalidate mutable revisions. A complete
 terminal checkpoint is fsynced and promoted at finalization instead of being
 rewritten or immediately rehashed; otherwise each fp16 layer shard is streamed once, with its payload
-digest verified on final and checkpoint loads. Pointer-directory fsync precedes
-old-generation GC/checkpoint unlink, and fit preflight reaps crash-left streamed
+digest verified on final and checkpoint loads. Pointer-directory fsync follows
+pointer unlink before checkpoint/full-artifact shard GC and follows pointer
+publication before old-generation GC; fit preflight reaps crash-left streamed
 temporaries. Exact no-op recovery removes a
 checkpoint left by a crash after final publication only when the final pointer
 provably subsumes its corpus, layers, estimator policy, and effective progress.
@@ -1124,7 +1133,9 @@ locks span cache recheck through publication (including both serial model
 loads), so two cold transfer commands do not repeat the same capture/fit work.
 The materializing neutral loader returns the sidecar validated in that same
 transaction, and cold alignment prep builds the target whitener directly from
-the already-resident target rows. The model-free preflight materializes the target
+the already-resident target rows. A cold fill publishes a complete neutral cache,
+then narrows both in-memory seed rosters as soon as requested shared coverage is
+known and releases unrequested tensor owners before Procrustes. The model-free preflight materializes the target
 neutral rows exactly once: an alignment hit builds the whitener from them, while
 an absent/corrupt alignment materializes the proven source rows too and fits,
 scores, and publishes Procrustes entirely offline. Neither outcome loads model

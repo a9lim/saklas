@@ -208,7 +208,10 @@ category list through verbatim (tagged concepts only, no multi-node sweep).
   acquired before model construction, so distinct concurrent alignments sharing
   a cold model do not duplicate that model load. `-f` recomputes the requested
   alignment factors and target transfer but reuses exact neutral caches; it does
-  not force the 90-prompt neutral capture. Transferred shares are re-baked in the
+  not force the 90-prompt neutral capture. A first cold capture still publishes
+  the complete reusable neutral artifact, but once shared coverage is known the
+  runner narrows both in-memory seed rosters to requested layers and releases
+  each full roster before Procrustes. Transferred shares are re-baked in the
   target Mahalanobis metric;
   **mandatory** — a missing/unusable target cache raises `WhitenerError` (the runner
   exits 1 with a regenerate-neutrals hint), there is no Euclidean rebake.
@@ -259,9 +262,13 @@ category list through verbatim (tagged concepts only, no multi-node sweep).
   otherwise loaded token IDs + live weights decide. That exact proof also reaps
   a crash-left checkpoint when the durable final artifact provably subsumes it.
   A superset stored lens satisfies
-  narrower layer requests without refit, and missing layers
-  are fitted as a checkpointed/resumable top-up. A normal 100→1000 corpus
-  extension resumes when the saved token-id hash matches the new prefix; model
+  narrower layer requests without refit (a fresh session reads only those
+  shards and leaves the durable union intact), and missing layers are fitted as
+  a checkpointed/resumable top-up while preserving the same-corpus union. A
+  normal 100→1000 corpus extension resumes when the saved token-id hash matches
+  the new prefix; extending only a strict subset of a v4 durable superset is
+  rejected because v4 has one progress field for all layers — request the full
+  durable set or use `-f` for explicit replacement. Model
   fingerprint mismatch forces a clean fit.
 - `lens show`: positional `model`, `-j`.
 - `lens top`: positionals `model` + `prompt` (raw text, no chat template),

@@ -102,9 +102,15 @@ recovery point until that pointer commit succeeds.
 non-mutating n_prompts-weighted combiner; `merge_into` recycles a caller-owned
 tail; `union_layers` combines same-corpus layer shards. Persisting a
 missing-layer union reuses the existing v4 shard pointers and serializes only
-the newly fitted layers. A superset durable artifact remains the session's full
-resident lens even when `fit_jlens(..., source_layers=...)` returns a narrower
-view. Exact no-op paths also reap a crash-left checkpoint only when the validated
+the newly fitted layers. A same-session superset remains the full resident lens
+when `fit_jlens(..., source_layers=...)` returns a narrower no-op view; a fresh
+subset no-op materializes only the requested shards and leaves the full durable
+union untouched. Because v4 has one corpus-progress identity for every layer, a
+prefix extension of a strict durable subset is rejected before payload load:
+the caller must request the full durable layer set or use `force=True` to
+explicitly replace it. Missing-layer top-ups load/preserve the full same-corpus
+union, while resume drops superseded containers before backward so only the
+selected accumulator owns its matrices. Exact no-op paths also reap a crash-left checkpoint only when the validated
 final pointer matches its semantics/layers and has reached at least its effective
 `base_n_prompts + n_prompts` progress.
 
@@ -261,7 +267,9 @@ freshly captured disjoint
 layer stores combine by view (ownership is transferred to the composite), so
 the sigma covariance pass does not copy the full row roster into a third mmap.
 Each row shard validates independently, so one damaged layer recaptures only
-itself; speculative auto-fit rows do not enter durable coverage until publish.
+itself; publication streams each row payload once while computing its exact
+tensor-domain digest, and speculative auto-fit rows do not enter durable coverage
+until publish.
 The shared per-model capture stem is protected by `artifact_lock`
 only across read/top-up/publish; the downstream topology/covariance fit retains a
 PID-backed process lease that prune/GC honors without holding the exclusive stem

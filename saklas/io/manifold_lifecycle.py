@@ -186,6 +186,35 @@ def _remove_unreferenced_capture_groups(
                 cached.unlink()
 
 
+def _capture_groups_for_models(safe_models: set[str]) -> set[tuple[str, str]]:
+    """Enumerate cache stems for models touched by a destructive operation.
+
+    This is deliberately independent of fitted sidecar readability.  Clear/rm
+    are repair surfaces, so an orphaned tensor or corrupt sidecar must not make
+    its content-addressed capture permanently undiscoverable.  Ownership is
+    still checked globally, under the existing stem lock, immediately before
+    deletion by :func:`_remove_unreferenced_capture_groups`.
+    """
+    from saklas.io.paths import models_dir
+
+    groups: set[tuple[str, str]] = set()
+    for safe_model in safe_models:
+        cache_dir = models_dir() / safe_model / "manifold_capture"
+        try:
+            cached_paths = list(cache_dir.iterdir())
+        except OSError:
+            continue
+        for cached in cached_paths:
+            stem = cached.name.split(".", 1)[0]
+            if len(stem) == 64:
+                try:
+                    int(stem, 16)
+                except ValueError:
+                    continue
+                groups.add((safe_model, stem))
+    return groups
+
+
 def clear_manifold_tensors(
     namespace: str, name: str, model_scope: Optional[str] = None, *, variant: str = "all",
 ) -> int:
@@ -244,9 +273,51 @@ def _clear_manifold_tensors_locked(
         )
     files = _manifold_tensor_files(folder, variant=variant, model_scope=model_scope)
     capture_groups: set[tuple[str, str]] = set()
-    from saklas.io.paths import parse_tensor_filename
+    affected_models: set[str] = set()
+    from saklas.io.paths import parse_tensor_filename, safe_model_id
+
+    target_safe = safe_model_id(model_scope) if model_scope is not None else None
+
+    def _selected_manifest_entry(filename: str) -> bool:
+        candidate = (
+            Path(filename).with_suffix(".safetensors").name
+            if filename.endswith(".json")
+            else filename
+        )
+        parsed = parse_tensor_filename(candidate)
+        if parsed is None:
+            return False
+        safe_model, parsed_variant = parsed
+        key = "raw" if parsed_variant is None else parsed_variant
+        return (
+            (target_safe is None or safe_model == target_safe)
+            and _manifold_tensor_variant_matches(key, variant)
+        )
+
+    manifest_files = manifest_data.get("files", {})
+    if not isinstance(manifest_files, dict):
+        raise ManifoldFormatError("manifold files manifest must be an object")
+    if target_safe is not None:
+        affected_models.add(target_safe)
+    for filename in manifest_files:
+        if not _selected_manifest_entry(filename):
+            continue
+        candidate = (
+            Path(filename).with_suffix(".safetensors").name
+            if filename.endswith(".json")
+            else filename
+        )
+        parsed = parse_tensor_filename(candidate)
+        if parsed is not None:
+            affected_models.add(parsed[0])
 
     with _locked_manifold_pairs(files):
+        for fitted_path in files:
+            parsed = parse_tensor_filename(
+                fitted_path.with_suffix(".safetensors").name,
+            )
+            if parsed is not None:
+                affected_models.add(parsed[0])
         for sidecar_path in (path for path in files if path.suffix == ".json"):
             try:
                 with open(sidecar_path) as handle:
@@ -264,29 +335,6 @@ def _clear_manifold_tensors_locked(
         # Repair only the selected manifest entries. Re-hashing every survivor
         # here would bless an unrelated corrupt model/variant while clearing
         # this one. Preserve untouched expected digests byte-for-byte.
-        from saklas.io.paths import safe_model_id
-
-        target_safe = safe_model_id(model_scope) if model_scope is not None else None
-
-        def _selected_manifest_entry(filename: str) -> bool:
-            candidate = (
-                Path(filename).with_suffix(".safetensors").name
-                if filename.endswith(".json")
-                else filename
-            )
-            parsed = parse_tensor_filename(candidate)
-            if parsed is None:
-                return False
-            safe_model, parsed_variant = parsed
-            key = "raw" if parsed_variant is None else parsed_variant
-            return (
-                (target_safe is None or safe_model == target_safe)
-                and _manifold_tensor_variant_matches(key, variant)
-            )
-
-        manifest_files = manifest_data.get("files", {})
-        if not isinstance(manifest_files, dict):
-            raise ManifoldFormatError("manifold files manifest must be an object")
         manifest_data["files"] = {
             name: digest
             for name, digest in manifest_files.items()
@@ -300,6 +348,7 @@ def _clear_manifold_tensors_locked(
         epochs[selector_key] = int(epochs.get(selector_key, 0)) + 1
         manifest_data["fit_epochs"] = epochs
         write_json_atomic(manifest_path, manifest_data)
+    capture_groups.update(_capture_groups_for_models(affected_models))
     _remove_unreferenced_capture_groups(capture_groups)
     return len(files)
 
@@ -329,18 +378,47 @@ def _remove_manifold_folder_locked(namespace: str, name: str) -> dict[str, Any]:
     folder = manifold_dir(namespace, name)
     if not (folder / "manifold.json").exists():
         raise ManifoldNotFoundError(f"manifold {namespace}/{name} not found at {folder}")
-    # Read the source tier before deleting (best-effort — a corrupt
-    # manifest just reports the namespace-implied tier).
+    # Read the source tier and stale fitted-file roster before deleting.
+    # The latter is the only surviving model hint after a crash or manual
+    # deletion removes both halves of a fitted pair.
+    raw_manifest: dict[str, Any] = {}
+    try:
+        with open(folder / "manifold.json") as handle:
+            candidate_manifest = json.load(handle)
+        if isinstance(candidate_manifest, dict):
+            raw_manifest = candidate_manifest
+    except (OSError, json.JSONDecodeError, TypeError):
+        pass
+    # Source is best-effort — a corrupt manifest reports the namespace tier.
     try:
         source = ManifoldFolder.load(folder, verify_manifest=False).source
     except ManifoldFormatError:
         source = "bundled" if namespace == "default" else "local"
     rematerializes = namespace == "default" or source == "bundled"
     capture_groups: set[tuple[str, str]] = set()
+    affected_models: set[str] = set()
     from saklas.io.paths import parse_tensor_filename
+
+    manifest_files = raw_manifest.get("files", {})
+    if isinstance(manifest_files, dict):
+        for filename in manifest_files:
+            candidate = (
+                Path(filename).with_suffix(".safetensors").name
+                if filename.endswith(".json")
+                else filename
+            )
+            parsed = parse_tensor_filename(candidate)
+            if parsed is not None:
+                affected_models.add(parsed[0])
 
     fitted_files = _manifold_tensor_files(folder)
     with _locked_manifold_pairs(fitted_files):
+        for fitted_path in fitted_files:
+            parsed = parse_tensor_filename(
+                fitted_path.with_suffix(".safetensors").name,
+            )
+            if parsed is not None:
+                affected_models.add(parsed[0])
         for sidecar_path in folder.glob("*.json"):
             if sidecar_path.name == "manifold.json":
                 continue
@@ -356,6 +434,7 @@ def _remove_manifold_folder_locked(namespace: str, name: str) -> dict[str, Any]:
             except (OSError, json.JSONDecodeError, TypeError):
                 pass
         shutil.rmtree(folder)
+    capture_groups.update(_capture_groups_for_models(affected_models))
     _remove_unreferenced_capture_groups(capture_groups)
     return {
         "namespace": namespace,

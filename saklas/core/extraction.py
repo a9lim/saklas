@@ -22,6 +22,7 @@ import json
 import math
 import os
 import pathlib
+import struct
 import tempfile
 import threading
 import time
@@ -196,6 +197,84 @@ def _tensor_sha256(tensor: torch.Tensor) -> str:
     return digest.hexdigest()
 
 
+_SAFETENSORS_DTYPE = {
+    torch.bool: "BOOL",
+    torch.uint8: "U8",
+    torch.int8: "I8",
+    torch.int16: "I16",
+    torch.int32: "I32",
+    torch.int64: "I64",
+    torch.float16: "F16",
+    torch.bfloat16: "BF16",
+    torch.float32: "F32",
+    torch.float64: "F64",
+}
+
+
+def _iter_tensor_byte_chunks(
+    tensor: torch.Tensor, *, chunk_bytes: int = 2_097_152,
+):
+    """Yield one contiguous tensor's original bytes with bounded host memory."""
+    if not tensor.is_contiguous():
+        raise ValueError("streamed safetensors publication requires a contiguous tensor")
+    byte_view = tensor.detach().reshape(-1).view(torch.uint8)
+    for start in range(0, byte_view.numel(), chunk_bytes):
+        chunk = byte_view[start:start + chunk_bytes].to(device="cpu").contiguous()
+        yield chunk.numpy().tobytes()
+
+
+def _save_row_safetensors_atomic(
+    key: str, tensor: torch.Tensor, path: pathlib.Path,
+) -> str:
+    """Stream one row shard once, publishing it and its tensor-domain digest.
+
+    Row shards can be multi-GiB.  Building the small safetensors header here lets
+    the same bounded traversal write the payload and update the exact digest,
+    instead of asking ``save_file`` to read it once and ``_tensor_sha256`` to
+    read it again.
+    """
+    dtype_name = _SAFETENSORS_DTYPE.get(tensor.dtype)
+    if dtype_name is None:
+        raise TypeError(f"unsupported row-cache dtype {tensor.dtype}")
+    if not tensor.is_contiguous():
+        raise ValueError("row-cache tensors must be contiguous")
+    shape = [int(dim) for dim in tensor.shape]
+    nbytes = int(tensor.numel() * tensor.element_size())
+    header = json.dumps(
+        {
+            key: {
+                "dtype": dtype_name,
+                "shape": shape,
+                "data_offsets": [0, nbytes],
+            },
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    header += b" " * ((8 - len(header) % 8) % 8)
+
+    digest = hashlib.sha256()
+    digest.update(str(tensor.dtype).encode("utf-8"))
+    digest.update(repr(tuple(shape)).encode("utf-8"))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent,
+    )
+    tmp = pathlib.Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(struct.pack("<Q", len(header)))
+            handle.write(header)
+            for payload in _iter_tensor_byte_chunks(tensor):
+                handle.write(payload)
+                digest.update(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+    return digest.hexdigest()
+
+
 def _row_tensor_matches_cache_metadata(
     path: pathlib.Path,
     layer: int,
@@ -260,7 +339,8 @@ def _save_safetensors_atomic(
     callers write every shard in one generation, then fsync the directory once
     before publishing that generation's recovery journal/pointer.  The optional
     digest path serializes in memory and hashes those exact bytes, avoiding a
-    second read of bounded centroid shards; large row shards stay streaming.
+    second read of bounded centroid shards; large row shards use the sibling
+    single-pass ``_save_row_safetensors_atomic`` path.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     if digest:
@@ -590,11 +670,13 @@ def _publish_deferred_row_shards(
                 capture_dir, cache_stem, idx, generation=generation,
             )
             rows = retained_rows.flat_rows(idx)
-            _save_safetensors_atomic({f"layer_{idx}": rows}, row_path)
+            row_digest = _save_row_safetensors_atomic(
+                f"layer_{idx}", rows, row_path,
+            )
             row_files[str(idx)] = row_path.name
             row_shapes[str(idx)] = list(rows.shape)
             row_dtypes[str(idx)] = str(rows.dtype)
-            row_digests[str(idx)] = _tensor_sha256(rows)
+            row_digests[str(idx)] = row_digest
         row_layers.update(newly_durable)
         durable = sorted(row_layers)
         payload["row_layers"] = durable
@@ -1724,11 +1806,13 @@ class ManifoldExtractionPipeline:
                             capture_dir, cache_stem, idx, generation=generation,
                         )
                         rows = retained_rows.flat_rows(idx)
-                        _save_safetensors_atomic({f"layer_{idx}": rows}, row_path)
+                        row_digest = _save_row_safetensors_atomic(
+                            f"layer_{idx}", rows, row_path,
+                        )
                         cached_row_files[str(idx)] = row_path.name
                         cached_row_shapes[str(idx)] = list(rows.shape)
                         cached_row_dtypes[str(idx)] = str(rows.dtype)
-                        cached_row_digests[str(idx)] = _tensor_sha256(rows)
+                        cached_row_digests[str(idx)] = row_digest
                     row_layers.update(captured_row_layers)
                 metadata_row_layers = (
                     sorted(row_layers) if persist_rows_now
@@ -1929,20 +2013,24 @@ class ManifoldExtractionPipeline:
         #     reuses ``layer_grams`` instead of recomputing them.
         whitened_rows: dict[int, torch.Tensor] = {}
         layer_grams: dict[int, torch.Tensor] = {}
+        centroid_means: dict[int, torch.Tensor] = {}
 
         def _whitened_geometry(
             idx: int,
-        ) -> tuple[torch.Tensor, torch.Tensor]:
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             # Keep the full K×D temporaries in a short-lived frame; otherwise
             # the final loop iteration remains bound after the roster clears.
-            xc = stacks[idx].to(torch.float32)
-            xc = xc - xc.mean(dim=0, keepdim=True)
+            raw = stacks[idx].to(torch.float32)
+            centroid_mean = raw.mean(dim=0, keepdim=True)
+            xc = raw - centroid_mean
             sinv_xc = maha_whitener.apply_inv(idx, xc).to(torch.float32)
             gram = xc @ sinv_xc.transpose(0, 1)
-            return sinv_xc, 0.5 * (gram + gram.transpose(0, 1))
+            return sinv_xc, 0.5 * (gram + gram.transpose(0, 1)), centroid_mean
 
         for idx in fit_layers:
-            whitened_rows[idx], layer_grams[idx] = _whitened_geometry(idx)
+            (
+                whitened_rows[idx], layer_grams[idx], centroid_means[idx],
+            ) = _whitened_geometry(idx)
         del _whitened_geometry
         node_spread_per_layer: dict[int, float] = {
             idx: float(layer_grams[idx].diagonal().sum()) for idx in fit_layers
@@ -2267,6 +2355,7 @@ class ManifoldExtractionPipeline:
                 # ``neutral_mean`` neutral-anchors the frame; ``maha_whitener``
                 # (mandatory, checked above) selects the whitened/Fisher basis.
                 _rbf_info: dict[str, float] = {}
+                fit_result: dict[str, torch.Tensor] = {}
                 sub, _ev_ratio = fit_layer_subspace(
                     stacks[idx], node_params,
                     whitener=maha_whitener, layer=idx,
@@ -2277,14 +2366,12 @@ class ManifoldExtractionPipeline:
                     rbf_info=_rbf_info,
                     rbf_plan=rbf_plan,
                     basis_override=auto_fisher_bases.get(idx),
+                    fit_result=fit_result,
                     **fit_kwargs,
                 )
                 # μ-centered share (NOT ``eval_rbf(node_params)`` — the surface
                 # is neutral-anchored, so its node values aren't μ-centered).
-                mu_centered = stacks[idx].to(torch.float32)
-                mu_centered = mu_centered - mu_centered.mean(dim=0)
-                mu_coords = mu_centered @ sub.basis.to(torch.float32).T  # (K, R)
-                _bake_share(idx, sub, mu_coords)
+                _bake_share(idx, sub, fit_result["mu_coords"])
                 return sub, _rbf_info
 
             for idx in fit_layers:
@@ -2332,11 +2419,7 @@ class ManifoldExtractionPipeline:
                     nu = _neutral_for(idx)
                     if nu is None:
                         return None
-                    xc = stacks[idx].to(torch.float32)
-                    xc = xc - xc.mean(dim=0, keepdim=True)
-                    mu_L = stacks[idx].to(torch.float32).mean(
-                        dim=0, keepdim=True,
-                    )
+                    mu_L = centroid_means[idx]
                     nu_c = (
                         nu.to(torch.float32).reshape(1, -1) - mu_L
                     )  # (1, D) ν − μ
@@ -2359,6 +2442,7 @@ class ManifoldExtractionPipeline:
         stacks.clear()
         whitened_rows.clear()
         layer_grams.clear()
+        centroid_means.clear()
 
         if effective_fit_mode == "pca" and retained_rows is not None:
             retained_rows.close()
