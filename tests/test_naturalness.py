@@ -184,7 +184,11 @@ def test_naturalness_preflight_does_not_hash_fitted_payloads(
 
     import saklas.cli.runners as runners
     from saklas.io import packs
-    from saklas.io.manifolds import ManifoldFolder, create_manifold_folder
+    from saklas.io.manifolds import (
+        MANIFOLD_FORMAT_VERSION,
+        ManifoldFolder,
+        create_manifold_folder,
+    )
 
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     domain = {"type": "box", "axes": [
@@ -198,7 +202,17 @@ def test_naturalness_preflight_does_not_hash_fitted_payloads(
     tensor = folder / "unrelated.safetensors"
     sidecar = folder / "unrelated.json"
     tensor.write_bytes(b"unrelated fitted payload")
-    sidecar.write_text(json.dumps({"domain": domain, "node_count": 3}))
+    sidecar.write_text(json.dumps({
+        "format_version": MANIFOLD_FORMAT_VERSION,
+        "name": "behavior",
+        "method": "manifold_pca",
+        "saklas_version": "0",
+        "domain": domain,
+        "node_count": 3,
+        "node_labels": ["a", "b", "c"],
+        "feature_space": "raw",
+        "fit_mode": "authored",
+    }))
     ManifoldFolder.load(folder, verify_manifest=False).update_file_hashes(
         tensor, sidecar,
     )

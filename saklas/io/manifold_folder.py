@@ -426,7 +426,7 @@ class ManifoldSidecar:
     # background-σ² units (comparable across layers).  A diagnostic readout
     # of "where does this concept live", distinct from the apply-time
     # ``mahalanobis_share`` (which restricts the same whitened spread to the
-    # steerable subspace).  Empty on fits that predate it.
+    # steerable subspace).  Empty when the current fit has no measurements.
     node_spread_per_layer: dict[str, Any] = field(default_factory=dict)
     # Merge provenance on a ``fit_mode="baked"`` manifold — the
     # ``{coord: {alpha, tensor_sha256}}`` map written by
@@ -451,29 +451,14 @@ class ManifoldSidecar:
 
     @classmethod
     def load(cls, path: Path) -> "ManifoldSidecar":
-        try:
-            with open(path) as f:
-                data = json.load(f)
-        except (json.JSONDecodeError, OSError) as exc:
-            raise ManifoldFormatError(
-                f"manifold sidecar {path} is unreadable: {exc}"
-            ) from exc
-        if not isinstance(data, dict):
-            raise ManifoldFormatError(
-                f"manifold sidecar {path} must be a JSON object"
-            )
-        domain = data.get("domain")
-        if not isinstance(domain, dict):
-            raise ManifoldFormatError(
-                f"manifold sidecar {path} has no 'domain' object"
-            )
+        data = load_manifold_sidecar_data(path)
         return cls(
-            method=data.get("method", "manifold_pca"),
-            saklas_version=data.get("saklas_version", "0"),
-            domain=domain,
-            node_count=int(data.get("node_count", 0)),
-            node_labels=list(data.get("node_labels", [])),
-            feature_space=data.get("feature_space", "raw"),
+            method=data["method"],
+            saklas_version=data["saklas_version"],
+            domain=data["domain"],
+            node_count=data["node_count"],
+            node_labels=data["node_labels"],
+            feature_space=data["feature_space"],
             nodes_sha256=data.get("nodes_sha256"),
             sae_release=data.get("sae_release"),
             sae_revision=data.get("sae_revision"),
@@ -484,7 +469,7 @@ class ManifoldSidecar:
             capture_sha256=data.get("capture_sha256"),
             fitted_layers=sorted(int(idx) for idx in data.get("fitted_layers", [])),
             fit_policy_version=data.get("fit_policy_version"),
-            fit_mode=data.get("fit_mode", "authored"),
+            fit_mode=data["fit_mode"],
             hyperparams=dict(data.get("hyperparams", {})),
             diagnostics=dict(data.get("diagnostics", {})),
             node_spread_per_layer=dict(data.get("node_spread_per_layer", {})),
@@ -493,6 +478,73 @@ class ManifoldSidecar:
             components=data.get("components"),
             bake_policy=data.get("bake_policy"),
         )
+
+
+def load_manifold_sidecar_data(path: Path) -> dict[str, Any]:
+    """Read and validate the exact current fitted-manifold sidecar shape."""
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError) as exc:
+        raise ManifoldFormatError(
+            f"manifold sidecar {path} is unreadable: {exc}"
+        ) from exc
+    if not isinstance(data, dict):
+        raise ManifoldFormatError(
+            f"manifold sidecar {path} must be a JSON object"
+        )
+    validate_manifold_format_version(
+        data.get("format_version"), location=f"manifold sidecar {path}",
+    )
+    required_types: dict[str, type] = {
+        "name": str,
+        "method": str,
+        "saklas_version": str,
+        "domain": dict,
+        "node_count": int,
+        "node_labels": list,
+        "feature_space": str,
+        "fit_mode": str,
+    }
+    for key, expected in required_types.items():
+        value = data.get(key)
+        if not isinstance(value, expected) or (
+            expected is int and isinstance(value, bool)
+        ):
+            raise ManifoldFormatError(
+                f"manifold sidecar {path} field {key!r} must be "
+                f"{expected.__name__}"
+            )
+    if data["fit_mode"] not in {
+        "authored", "pca", "spectral", "auto", "baked",
+    }:
+        raise ManifoldFormatError(
+            f"manifold sidecar {path} has invalid "
+            f"fit_mode={data['fit_mode']!r}"
+        )
+    labels = data["node_labels"]
+    if any(not isinstance(label, str) for label in labels):
+        raise ManifoldFormatError(
+            f"manifold sidecar {path} node_labels must contain only strings"
+        )
+    if data["node_count"] != len(labels):
+        raise ManifoldFormatError(
+            f"manifold sidecar {path} node_count does not match node_labels"
+        )
+    for key in (
+        "sae_ids_by_layer", "hyperparams", "diagnostics",
+        "node_spread_per_layer",
+    ):
+        if key in data and not isinstance(data[key], dict):
+            raise ManifoldFormatError(
+                f"manifold sidecar {path} field {key!r} must be an object"
+            )
+    for key in ("fitted_layers", "node_roles", "node_kinds"):
+        if key in data and not isinstance(data[key], list):
+            raise ManifoldFormatError(
+                f"manifold sidecar {path} field {key!r} must be an array"
+            )
+    return data
 
 
 @dataclass

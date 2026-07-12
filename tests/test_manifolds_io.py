@@ -106,6 +106,33 @@ def _author_manifold(
     return folder
 
 
+def _sidecar_payload(
+    *,
+    name: str = "mood",
+    labels: list[str] | None = None,
+    domain: dict[str, Any] | None = None,
+    fit_mode: str = "authored",
+) -> dict[str, Any]:
+    """Exact current fitted-sidecar payload for persistence unit tests."""
+    node_labels = labels or ["a", "b", "c"]
+    return {
+        "format_version": MANIFOLD_FORMAT_VERSION,
+        "name": name,
+        "method": "manifold_pca",
+        "saklas_version": "0",
+        "domain": domain or {
+            "type": "box",
+            "axes": [
+                {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0},
+            ],
+        },
+        "node_count": len(node_labels),
+        "node_labels": node_labels,
+        "feature_space": "raw",
+        "fit_mode": fit_mode,
+    }
+
+
 def test_min_nodes_per_dimension():
     assert min_nodes(1) == 3
     assert min_nodes(2) == 5
@@ -267,12 +294,12 @@ def test_missing_node_file_raises(tmp_path: Path):
 def _add_dummy_tensor(folder: Path) -> None:
     """Write a placeholder fitted tensor + sidecar (no model needed)."""
     (folder / "stub-model.safetensors").write_bytes(b"placeholder-tensor")
-    (folder / "stub-model.json").write_text(json.dumps({
-        "method": "manifold_pca", "saklas_version": "0",
-        "domain": {"type": "box", "axes": [
-            {"name": "t", "periodic": True, "period": 1.0}]},
-        "node_count": 4, "node_labels": [],
-    }))
+    (folder / "stub-model.json").write_text(json.dumps(_sidecar_payload(
+        labels=["calm", "uneasy", "afraid", "frantic"],
+        domain={"type": "box", "axes": [
+            {"name": "t", "periodic": True, "period": 1.0},
+        ]},
+    )))
 
 
 def test_integrity_check_catches_tampering(tmp_path: Path):
@@ -443,13 +470,9 @@ def test_update_file_hashes_merges_latest_manifest_from_stale_instances(
     first = ManifoldFolder.load(folder)
     second = ManifoldFolder.load(folder)
     paths: list[Path] = []
-    sidecar_payload = {
-        "method": "manifold_pca", "saklas_version": "0",
-        "domain": {"type": "box", "axes": [
-            {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0},
-        ]},
-        "node_count": 4, "node_labels": [],
-    }
+    sidecar_payload = _sidecar_payload(
+        labels=["calm", "uneasy", "afraid", "frantic"],
+    )
     for stem in ("model-a", "model-b"):
         tensor = folder / f"{stem}.safetensors"
         sidecar = folder / f"{stem}.json"
@@ -468,13 +491,9 @@ def test_update_file_hashes_does_not_launder_unrelated_untracked_pair(
     tmp_path: Path,
 ) -> None:
     folder = _author_manifold(tmp_path)
-    sidecar_payload = {
-        "method": "manifold_pca", "saklas_version": "0",
-        "domain": {"type": "box", "axes": [
-            {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0},
-        ]},
-        "node_count": 4, "node_labels": [],
-    }
+    sidecar_payload = _sidecar_payload(
+        labels=["calm", "uneasy", "afraid", "frantic"],
+    )
     stale_tensor = folder / "stale.safetensors"
     stale_sidecar = folder / "stale.json"
     stale_tensor.write_bytes(b"untrusted")
@@ -493,16 +512,18 @@ def test_update_file_hashes_does_not_launder_unrelated_untracked_pair(
 
 def test_manifold_sidecar_load(tmp_path: Path):
     path = tmp_path / "m.json"
-    path.write_text(json.dumps({
+    payload = _sidecar_payload(
+        labels=["a", "b", "c", "d"],
+        domain={"type": "sphere", "dim": 2},
+    )
+    payload.update({
         "method": "manifold_sae",
         "saklas_version": "3.1.0",
-        "domain": {"type": "sphere", "dim": 2},
-        "node_count": 4,
-        "node_labels": ["a", "b", "c", "d"],
         "feature_space": "sae-gemma",
         "nodes_sha256": "deadbeef",
         "sae_release": "gemma",
-    }))
+    })
+    path.write_text(json.dumps(payload))
     sc = ManifoldSidecar.load(path)
     assert sc.method == "manifold_sae"
     assert sc.domain == {"type": "sphere", "dim": 2}
@@ -510,22 +531,24 @@ def test_manifold_sidecar_load(tmp_path: Path):
     assert sc.feature_space == "sae-gemma"
     assert sc.nodes_sha256 == "deadbeef"
     assert sc.sae_release == "gemma"
-    # Absent diagnostic layer profile loads as an empty dict (back-compat).
+    # Optional diagnostics are empty when the current writer has none.
     assert sc.node_spread_per_layer == {}
 
 
 def test_manifold_sidecar_node_spread_round_trips(tmp_path: Path):
     """The per-layer signal profile (``node_spread_per_layer``) round-trips."""
     path = tmp_path / "m.json"
-    path.write_text(json.dumps({
+    payload = _sidecar_payload(
+        labels=["happy", "sad"],
+        domain={"type": "custom", "dim": 1},
+        fit_mode="pca",
+    )
+    payload.update({
         "method": "manifold_discover_pca",
         "saklas_version": "4.0.0",
-        "domain": {"type": "custom", "dim": 1},
-        "node_count": 2,
-        "node_labels": ["happy", "sad"],
-        "fit_mode": "pca",
         "node_spread_per_layer": {"5": 0.5, "12": 8.25, "20": 3.0},
-    }))
+    })
+    path.write_text(json.dumps(payload))
     sc = ManifoldSidecar.load(path)
     assert sc.node_spread_per_layer == {"5": 0.5, "12": 8.25, "20": 3.0}
     # The peak layer is the one with the largest whitened between-node spread.
@@ -787,6 +810,32 @@ def test_non_object_sidecar_raises_format_error(tmp_path: Path) -> None:
     path.write_text("[]")
 
     with pytest.raises(ManifoldFormatError, match="JSON object"):
+        ManifoldSidecar.load(path)
+
+
+@pytest.mark.parametrize("version", [None, MANIFOLD_FORMAT_VERSION + 1])
+def test_sidecar_requires_exact_current_format(
+    tmp_path: Path, version: int | None,
+) -> None:
+    path = tmp_path / "model.json"
+    payload = _sidecar_payload()
+    if version is None:
+        payload.pop("format_version")
+    else:
+        payload["format_version"] = version
+    path.write_text(json.dumps(payload))
+
+    with pytest.raises(ManifoldFormatError, match="need exactly"):
+        ManifoldSidecar.load(path)
+
+
+def test_sidecar_requires_current_identity_fields(tmp_path: Path) -> None:
+    path = tmp_path / "model.json"
+    payload = _sidecar_payload()
+    payload.pop("fit_mode")
+    path.write_text(json.dumps(payload))
+
+    with pytest.raises(ManifoldFormatError, match="'fit_mode' must be str"):
         ManifoldSidecar.load(path)
 
 
@@ -1319,12 +1368,7 @@ def _fake_fit_tensor(folder: Path, model_id: str, *, release: str | None = None)
     ts = folder / tensor_filename(model_id, release=release)
     sc = folder / sidecar_filename(model_id, release=release)
     ts.write_bytes(b"placeholder-tensor")
-    sc.write_text(json.dumps({
-        "method": "manifold_pca", "saklas_version": "0",
-        "domain": {"type": "box", "axes": [
-            {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]},
-        "node_count": 3, "node_labels": [],
-    }))
+    sc.write_text(json.dumps(_sidecar_payload(name=folder.name)))
     # Trust only this successful pair; metadata rewrites never scan-and-bless
     # unrelated fitted files.
     ManifoldFolder.load(folder, verify_manifest=False).update_file_hashes(ts, sc)

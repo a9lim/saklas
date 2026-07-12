@@ -5008,6 +5008,10 @@ def save_manifold(
         "node_labels": list(manifold.node_labels),
         "node_count": len(manifold.node_labels),
         "feature_space": manifold.feature_space,
+        "fit_mode": metadata.get("fit_mode", "authored"),
+        "hyperparams": metadata.get("hyperparams", {}),
+        "diagnostics": metadata.get("diagnostics", {}),
+        "node_spread_per_layer": metadata.get("node_spread_per_layer", {}),
     }
     # Per-layer Mahalanobis share weight (whitened bake-score analogue).
     # Stored as ``{str(idx): float}`` like EV; absent when no whitener was
@@ -5043,10 +5047,8 @@ def save_manifold(
         "subspace_metric",
         # Per-layer whitened between-node spread ``{str(L): tr(G_L)}`` — the
         # concept's signal-concentration profile across the stack (the
-        # consensus Gram's per-layer summand traces).  Diagnostic only; absent
-        # on fits that predate it (loads as an empty dict).  Surfaced by
-        # `manifold show`.
-        "node_spread_per_layer",
+        # consensus Gram's per-layer summand traces).  Diagnostic only;
+        # surfaced by `manifold show`.
         # Penalized-RBF provenance ``{str(L): {lambda, edf, gcv}}`` (curved
         # discover fits) and the fuzzy-manifold σ-field summary
         # ``{str(L): {sigma_mean, sigma_min, sigma_max, lambda}}`` (curved fits
@@ -5061,7 +5063,6 @@ def save_manifold(
         # bandwidth) for reproducibility; ``diagnostics`` carries the
         # per-method PCA variance bars or spectral spectrum for the
         # CLI / webui inspector.  All absent for authored fits.
-        "fit_mode", "hyperparams", "diagnostics",
         # Topology-selection provenance (``fit_mode="auto"`` only): the
         # geometry ``select_topology`` resolved to (``resolved_fit_mode`` ∈
         # pca/spectral + the winning ``topology_winner`` name) and the full
@@ -5173,7 +5174,10 @@ def _load_manifold_locked(
     path: str | Path, *, verify_manifest: bool = True,
 ) -> Manifold:
     """Read one fitted manifold while its tensor/sidecar pair lock is held."""
-    from saklas.io.manifold_folder import ManifoldFormatError
+    from saklas.io.manifold_folder import (
+        ManifoldFormatError,
+        load_manifold_sidecar_data,
+    )
 
     path = Path(path)
     manifest_path = path.parent / "manifold.json"
@@ -5230,23 +5234,13 @@ def _load_manifold_locked(
         verified_tensor_sha256 = str(expected[path.name])
     tensors = load_file(str(path))
     sidecar_path = path.with_suffix(".json")
-    try:
-        with open(sidecar_path) as f:
-            sidecar = json.load(f)
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ManifoldFormatError(
-            f"manifold sidecar is unreadable at {sidecar_path}: {exc}"
-        ) from exc
-    if not isinstance(sidecar, dict):
-        raise ManifoldFormatError(
-            f"manifold sidecar at {sidecar_path} must be a JSON object"
-        )
+    sidecar = load_manifold_sidecar_data(sidecar_path)
     if verified_tensor_sha256 is not None:
         sidecar["_tensor_sha256"] = verified_tensor_sha256
     if (
         verify_manifest
         and manifest_path.exists()
-        and sidecar.get("fit_mode", "authored") != "baked"
+        and sidecar["fit_mode"] != "baked"
     ):
         from saklas.io.manifold_folder import ManifoldFolder
 
@@ -5342,12 +5336,12 @@ def _load_manifold_locked(
     }
 
     return Manifold(
-        name=sidecar.get("name", path.parent.name),
+        name=sidecar["name"],
         domain=domain,
-        node_labels=list(sidecar.get("node_labels", [])),
+        node_labels=list(sidecar["node_labels"]),
         node_coords=node_coords,
         layers=layers,
-        feature_space=sidecar.get("feature_space", "raw"),
+        feature_space=sidecar["feature_space"],
         metadata=sidecar,
         # ``node_roles`` is absent on non-role manifolds (every
         # pre-Phase-A fit); the loaded list stays empty in that case.
