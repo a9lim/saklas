@@ -92,6 +92,6 @@ def test_compiled_explicit_no_probes_skips_persistent_capture_hooks(
         "fake/model", device="mps", compile=True, probes=[],
     )
 
-    assert isinstance(session._get_steering_composer(), SteeringComposer)
+    assert isinstance(session._steering_composer, SteeringComposer)
     assert calls == {"offset": 1, "capture": 0}
     assert session._capture_buffers == {}

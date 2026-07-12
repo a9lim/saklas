@@ -494,7 +494,7 @@ def test_token_tap_skips_unconsumed_live_readout_helpers_and_empty_payload(
         gated_sae_probe_keys=lambda: set(),
         gated_probe_names=lambda: set(),
     )
-    session._get_steering_composer = lambda: composer
+    session._steering_composer = composer
     session._start_loom_assistant = lambda *_args, **_kwargs: None
     session._snapshot_steering_alphas = lambda: {}
     session._generation_preamble = lambda *_args, **_kwargs: (

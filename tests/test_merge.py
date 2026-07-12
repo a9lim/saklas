@@ -14,6 +14,7 @@ from saklas.io.manifolds import (
 )
 from saklas.core.manifold import load_manifold
 from saklas.core.vectors import fold_directions_to_subspace, folded_vector_directions
+from saklas.io.paths import safe_model_id, tensor_filename
 
 
 # --------------------------------------------------------- expr parsing ---
@@ -27,7 +28,7 @@ def test_parse_expr_two_components(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
     _make_concept_with_tensors(tmp_path, "default", "happy", {"gemma": profile})
     _make_concept_with_tensors(tmp_path, "a9lim", "archaic", {"gemma": profile})
     shared = merge.shared_models("0.3 default/happy + 0.4 a9lim/archaic")
-    assert shared == ["gemma"]
+    assert shared == [safe_model_id("gemma")]
 
 
 def test_bare_component_rejected():
@@ -162,7 +163,7 @@ def test_shared_models_intersection(monkeypatch: pytest.MonkeyPatch, tmp_path: P
     _make_concept_with_tensors(tmp_path, "a9lim", "archaic",
                                 {"gemma": profile})
     shared = merge.shared_models("0.5 default/happy + 0.5 a9lim/archaic")
-    assert shared == ["gemma"]
+    assert shared == [safe_model_id("gemma")]
 
 
 def test_shared_models_empty_raises(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -198,8 +199,8 @@ def test_merge_resolves_each_component_model_once(
     )
 
     assert calls == [
-        ("default", "happy", "gemma"),
-        ("a9lim", "archaic", "gemma"),
+        ("default", "happy", safe_model_id("gemma")),
+        ("a9lim", "archaic", safe_model_id("gemma")),
     ]
 
 
@@ -210,21 +211,22 @@ def test_role_variant_uses_and_validates_canonical_tensor(
     folder = _make_concept_with_tensors(
         tmp_path, "default", "happy", {"gemma": {0: torch.tensor([1.0])}},
     )
-    sidecar_path = folder / "gemma.json"
+    tensor_path = folder / tensor_filename("gemma")
+    sidecar_path = tensor_path.with_suffix(".json")
     payload = __import__("json").loads(sidecar_path.read_text())
     payload["node_roles"] = ["pirate"] * int(payload["node_count"])
     sidecar_path.write_text(__import__("json").dumps(payload))
     ManifoldFolder.load(folder, verify_manifest=False).update_file_hashes(
-        folder / "gemma.safetensors", sidecar_path,
+        tensor_path, sidecar_path,
     )
 
-    assert merge.shared_models("default/happy:role-pirate") == ["gemma"]
+    assert merge.shared_models("default/happy:role-pirate") == [safe_model_id("gemma")]
     with pytest.raises(merge.MergeError, match="no shared models"):
         merge.shared_models("default/happy:raw")
     dst = merge.merge_into_manifold(
         "pirate_happy", "default/happy:role-pirate", model=None,
     )
-    assert (dst / "gemma.safetensors").is_file()
+    assert (dst / tensor_filename("gemma")).is_file()
 
 
 def test_transfer_variant_routes_concrete_tensor(
@@ -234,12 +236,11 @@ def test_transfer_variant_routes_concrete_tensor(
     folder = _make_concept_with_tensors(
         tmp_path, "default", "happy", {"src": {0: torch.tensor([1.0])}},
     )
-    from saklas.io.paths import tensor_filename
-
     target_tensor = folder / tensor_filename("target", transferred_from="src")
     target_sidecar = target_tensor.with_suffix(".json")
-    target_tensor.write_bytes((folder / "src.safetensors").read_bytes())
-    payload = __import__("json").loads((folder / "src.json").read_text())
+    source_tensor = folder / tensor_filename("src")
+    target_tensor.write_bytes(source_tensor.read_bytes())
+    payload = __import__("json").loads(source_tensor.with_suffix(".json").read_text())
     payload["source_model_id"] = "src"
     payload["model_fingerprint"] = "fp:target"
     target_sidecar.write_text(__import__("json").dumps(payload))
@@ -247,11 +248,12 @@ def test_transfer_variant_routes_concrete_tensor(
         target_tensor, target_sidecar,
     )
 
-    assert merge.shared_models("default/happy:from-src") == ["target"]
+    variant = f"from-{safe_model_id('src').lower()}"
+    assert merge.shared_models(f"default/happy:{variant}") == [safe_model_id("target")]
     dst = merge.merge_into_manifold(
-        "transferred_happy", "default/happy:from-src", model=None,
+        "transferred_happy", f"default/happy:{variant}", model=None,
     )
-    assert (dst / "target.safetensors").is_file()
+    assert (dst / tensor_filename("target")).is_file()
 
 
 def test_merge_into_manifold_single_model(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -273,8 +275,9 @@ def test_merge_into_manifold_single_model(monkeypatch: pytest.MonkeyPatch, tmp_p
     assert mf.fit_mode == "baked"
     assert mf.tags == ["merge"]
     assert mf.source == "local"
-    assert (dst / "gemma.safetensors").is_file()
-    sc = ManifoldSidecar.load(dst / "gemma.json")
+    tensor_path = dst / tensor_filename("gemma")
+    assert tensor_path.is_file()
+    sc = ManifoldSidecar.load(tensor_path.with_suffix(".json"))
     assert sc.method == "merge"
     assert sc.fit_mode == "baked"
     # merge always records component provenance; assert guards the Optional
@@ -283,7 +286,7 @@ def test_merge_into_manifold_single_model(monkeypatch: pytest.MonkeyPatch, tmp_p
     assert sc.components["0:default/happy"]["alpha"] == 0.5
     # The baked tensor folds back to the linear combination:
     # 0.5·[1,0] + 0.25·[0,2] = [0.5, 0.5].
-    folded = folded_vector_directions(load_manifold(dst / "gemma.safetensors"))
+    folded = folded_vector_directions(load_manifold(tensor_path))
     assert torch.allclose(folded[0].float(), torch.tensor([0.5, 0.5]), atol=1e-5)
 
 
@@ -331,7 +334,7 @@ def test_merge_retry_repairs_later_unproven_baked_pair(
 
     dst = merge.merge_into_manifold("bard", expression, model=None)
     loaded = ManifoldFolder.load(dst)
-    assert sorted(loaded.tensor_models()) == ["gemma", "qwen"]
+    assert sorted(loaded.tensor_models()) == sorted(map(safe_model_id, ("gemma", "qwen")))
 
 
 def test_merge_into_manifold_explicit_model(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -347,8 +350,8 @@ def test_merge_into_manifold_explicit_model(monkeypatch: pytest.MonkeyPatch, tmp
         model="google/gemma-2-2b-it",
         force=False,
     )
-    assert (dst / "google__gemma-2-2b-it.safetensors").is_file()
-    assert not (dst / "qwen.safetensors").is_file()
+    assert (dst / tensor_filename("google/gemma-2-2b-it")).is_file()
+    assert not (dst / tensor_filename("qwen")).is_file()
 
 
 def test_legacy_projected_bake_requires_rebake(
@@ -358,7 +361,8 @@ def test_legacy_projected_bake_requires_rebake(
     folder = _make_concept_with_tensors(
         tmp_path, "local", "legacy", {"gemma": {0: torch.tensor([1.0, 2.0])}},
     )
-    sidecar_path = folder / "gemma.json"
+    tensor_path = folder / tensor_filename("gemma")
+    sidecar_path = tensor_path.with_suffix(".json")
     sidecar = sidecar_path.read_text()
     payload = __import__("json").loads(sidecar)
     payload["method"] = "merge"
@@ -371,6 +375,6 @@ def test_legacy_projected_bake_requires_rebake(
     }
     sidecar_path.write_text(__import__("json").dumps(payload))
     mf = ManifoldFolder.load(folder, verify_manifest=False)
-    mf.update_file_hashes(sidecar_path, folder / "gemma.safetensors")
+    mf.update_file_hashes(sidecar_path, tensor_path)
     with pytest.raises(Exception, match="legacy projected bake"):
-        load_manifold(folder / "gemma.safetensors")
+        load_manifold(tensor_path)

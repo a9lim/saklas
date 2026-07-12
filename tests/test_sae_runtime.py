@@ -311,7 +311,7 @@ def test_sae_runtime_metadata_roundtrip(
     })
     assert path.exists()
     assert load_sae_metadata("org/model", "release/name") == {
-        "format_version": 1,
+        "format_version": 2,
         "model_id": "org/model",
         "release": "release/name",
         "layer": 14,
@@ -331,13 +331,49 @@ def test_sae_feature_meta_roundtrip(
     assert load_sae_feature_meta("org/model", "rel") == {}
     save_sae_feature_meta("org/model", "rel", cast("dict[str, dict[str, Any]]", {
         "7": {"label": "days of the week", "max_act": 121.11, "checked": True},
-        "9": {"label": None, "max_act": -3.0},
-        "10": "junk",
+        "9": {"label": None, "max_act": None},
     }))
     meta = load_sae_feature_meta("org/model", "rel")
     assert meta["7"] == {"label": "days of the week", "max_act": 121.11}
     assert meta["9"] == {"label": None, "max_act": None}
-    assert "10" not in meta
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda payload: payload.update(format_version=1),
+        lambda payload: payload.update(model_id="other/model"),
+        lambda payload: payload.update(release="other-release"),
+        lambda payload: payload.update(extra=True),
+        lambda payload: payload["features"]["7"].update(checked=True),
+        lambda payload: payload["features"].update({"8": {"label": None}}),
+    ],
+)
+def test_sae_feature_meta_rejects_non_current_shapes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mutation: Any,
+) -> None:
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    import json
+
+    from saklas.io.sae import (
+        SAE_RUNTIME_FORMAT_VERSION,
+        load_sae_feature_meta,
+        sae_features_path,
+    )
+
+    path = sae_features_path("org/model", "rel")
+    path.parent.mkdir(parents=True)
+    payload = {
+        "format_version": SAE_RUNTIME_FORMAT_VERSION,
+        "model_id": "org/model",
+        "release": "rel",
+        "features": {"7": {"label": "weekdays", "max_act": 3.0}},
+    }
+    mutation(payload)
+    path.write_text(json.dumps(payload))
+    assert load_sae_feature_meta("org/model", "rel") == {}
 
 
 def test_stream_aggregate_keeps_lens_and_sae_probe_readings() -> None:

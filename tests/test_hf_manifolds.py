@@ -89,6 +89,8 @@ def _write_manifest(folder: Path, payload: dict[str, Any]) -> Path:
 
 def test_fetch_manifold_info_box_domain(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """A box-domain authored manifold reports ``box(1d)`` + node count + tensors."""
+    from saklas.io.paths import safe_model_id, tensor_filename
+
     manifest = _write_manifest(tmp_path / "repo", {
         "format_version": 6,
         "name": "months",
@@ -99,7 +101,7 @@ def test_fetch_manifold_info_box_domain(tmp_path: Path, monkeypatch: pytest.Monk
         "nodes": [{"label": "january"}, {"label": "february"}],
         "tags": ["temporal"],
     })
-    api = _FakeApi(files=["manifold.json", "google__gemma-2-2b-it.safetensors",
+    api = _FakeApi(files=["manifold.json", tensor_filename("google/gemma-2-2b-it"),
                           "nodes/00_january.json"])
     monkeypatch.setattr(hfm, "_hf_hub_download", lambda coord, fn, **kw: str(manifest))
     monkeypatch.setattr(hfm, "_hf_api", lambda: api)
@@ -113,7 +115,7 @@ def test_fetch_manifold_info_box_domain(tmp_path: Path, monkeypatch: pytest.Monk
     assert info["domain_label"] == "box(1d)"
     assert info["tags"] == ["temporal"]
     # Only the .safetensors file becomes a tensor-stem entry.
-    assert info["tensor_models"] == ["google__gemma-2-2b-it"]
+    assert info["tensor_models"] == [safe_model_id("google/gemma-2-2b-it")]
 
 
 def test_fetch_manifold_info_sphere_and_custom_and_discover(
@@ -260,9 +262,11 @@ def test_search_manifolds_enriches_row_when_fields_missing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
     """A row missing description/tags triggers a fetch_manifold_info enrichment."""
+    from saklas.io.paths import safe_model_id, tensor_filename
+
     api = _FakeApi(
         models=[_FakeModel("alice/months", tags=None, desc="")],
-        files=["manifold.json", "google__gemma-2-2b-it.safetensors"],
+        files=["manifold.json", tensor_filename("google/gemma-2-2b-it")],
     )
     monkeypatch.setattr(hfm, "_hf_api", lambda: api)
 
@@ -282,7 +286,7 @@ def test_search_manifolds_enriches_row_when_fields_missing(
     assert row["description"] == "the year"
     assert row["domain_label"] == "box(1d)"
     assert row["node_count"] == 1
-    assert row["tensor_models"] == ["google__gemma-2-2b-it"]
+    assert row["tensor_models"] == [safe_model_id("google/gemma-2-2b-it")]
     assert row["tags"] == ["temporal"]
 
 

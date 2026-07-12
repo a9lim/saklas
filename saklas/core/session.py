@@ -548,7 +548,7 @@ class ConcurrentExtractionError(RuntimeError, SaklasError):
 # Internal steering-stack entry shape: additive entries are
 # ``(alpha, Trigger)`` tuples; ablation entries are ``AblationTerm``
 # values carrying their own coeff + trigger + target.  The union flows
-# through the stack, ``flatten_steering_stack``, ``push``/``pop``, and is
+# through the stack, ``flatten_stack``, ``push``/``pop``, and is
 # dispatched by type in ``SteeringComposer.compose_steering_entries``.
 SteeringStackEntry = tuple[float, Trigger] | AblationTerm | ManifoldTerm
 
@@ -627,7 +627,7 @@ def _affine_manifold_push(
 class _SteeringContext:
     """Context manager returned by SaklasSession.steering().
 
-    Pushes an entries dict onto ``session._steering_stack`` on ``__enter__``
+    Pushes an entries dict onto the session's steering composer on ``__enter__``
     and pops it on ``__exit__``.  Rebuilds hooks from the flattened stack
     head so nested scopes compose: inner entries overwrite outer entries
     for the duration of the inner scope, then the outer entry is restored.
@@ -986,7 +986,7 @@ class SaklasSession:
         # Vector registry: name -> profile. No alphas, no hooks.
         self._profiles: dict[str, dict[int, torch.Tensor]] = {}
         # Manifold registry: registry key -> loaded Manifold artifact,
-        # populated lazily by ``_ensure_manifold_loaded`` on scope entry.
+        # populated lazily by ``ensure_manifold_loaded`` on scope entry.
         self._manifolds: dict[str, Manifold] = {}
 
         # Phase 1 logit pass: session-level default for SamplingConfig
@@ -1044,12 +1044,8 @@ class SaklasSession:
                 self._static_cache_active = True
             elif sc_reason is not None:
                 warn_once(self._model, sc_reason)
-        # The LIFO steering stack + every push/pop-frequency steering method now
-        # live on the ``SteeringComposer`` collaborator (instantiated near the end
-        # of ``__init__``, once ``_monitor`` exists).  ``self._steering_stack`` is a
-        # settable property over ``_steering_composer._stack`` — see the property
-        # below; the composer is lazily created on first access so ``__new__`` test
-        # stubs that bypass ``__init__`` still resolve it.
+        # The LIFO steering stack and push/pop-frequency steering methods live
+        # on the eagerly initialized ``SteeringComposer`` collaborator.
 
         # Set by ``SteeringComposer.install_composed_steering`` when the current
         # steering lowers to the persistent compile-clean offset buffers
@@ -1570,37 +1566,6 @@ class SaklasSession:
         registry."""
         return self._profiles
 
-    def _get_steering_composer(self) -> "SteeringComposer":
-        """The steering collaborator, created lazily if absent.
-
-        Real sessions set ``_steering_composer`` in ``__init__``; ``__new__`` test
-        stubs that bypass it (and custom-``__init__`` stubs) get one built on first
-        touch so the ``_steering_stack`` property and the steering forwarders below
-        resolve without the caller wiring the collaborator by hand.
-        """
-        composer = self.__dict__.get("_steering_composer")
-        if composer is None:
-            from saklas.core.steering_composer import SteeringComposer
-            composer = SteeringComposer(self)
-            self._steering_composer = composer
-        return composer
-
-    @property
-    def _steering_stack(self) -> list[dict[str, SteeringStackEntry]]:
-        """The LIFO steering stack — owned by the :class:`SteeringComposer`.
-
-        A read/write view over ``_steering_composer._stack``.  Settable so the
-        existing test stubs (and any caller) can assign a fresh stack; the setter
-        routes the assignment into the composer.
-        """
-        return self._get_steering_composer()._stack
-
-    @_steering_stack.setter
-    def _steering_stack(
-        self, value: list[dict[str, SteeringStackEntry]],
-    ) -> None:
-        self._get_steering_composer()._stack = value
-
     @property
     def model_metadata(self) -> Any:
         """The structured model-info object (id, arch, layer count, …).
@@ -1651,10 +1616,9 @@ class SaklasSession:
     def ensure_manifold_loaded(self, key: str) -> None:
         """Load the manifold artifact for registry key ``key`` if absent.
 
-        Public wrapper over the lazy loader — ``key`` is the grammar's
-        ``[ns/]name[:variant]`` registry key.  See the private for the full
-        contract (raises :class:`ManifoldNotRegisteredError` on a miss)."""
-        self._ensure_manifold_loaded(key)
+        ``key`` is the grammar's ``[ns/]name[:variant]`` registry key.
+        Raises :class:`ManifoldNotRegisteredError` on a miss."""
+        self._steering_composer.ensure_manifold_loaded(key)
 
     def ensure_profile_registered(
         self, name: str, *, role: str = "vector",
@@ -1662,9 +1626,9 @@ class SaklasSession:
         """Resolve and register a steering direction for ``name``, returning
         its per-layer tensors.
 
-        Public wrapper over the manifold-first resolution chain (in-memory
-        bake → fitted 2-node ``pca`` manifold → ported legacy vector)."""
-        return self._ensure_profile_registered(name, role=role)
+        Uses the manifold-first resolution chain: in-memory bake, then a fitted
+        2-node ``pca`` manifold."""
+        return self._steering_composer.ensure_profile_registered(name, role=role)
 
     @property
     def gen_state(self) -> GenState:
@@ -4269,7 +4233,7 @@ class SaklasSession:
         from saklas.core.model import get_unembedding
 
         lens = self._require_jlens()
-        directions = self._ensure_profile_registered(selector)
+        directions = self.ensure_profile_registered(selector)
         unembed = get_unembedding(self._model)
         req = [
             l for l in self._resolve_jlens_layers(lens, layers)
@@ -4597,12 +4561,7 @@ class SaklasSession:
 
     def _assert_unsteered_artifact_operation(self) -> None:
         """Refuse persisted neutral/fit work under active steering hooks."""
-        try:
-            active = bool(self._steering_stack)
-        except (AttributeError, TypeError):
-            # Minimal protocol stubs may not carry the steering collaborator.
-            active = False
-        if active:
+        if self._steering_composer._stack:
             raise ConcurrentExtractionError(
                 "artifact-producing model operations cannot run inside an "
                 "active steering scope; exit session.steering() first"
@@ -5194,7 +5153,7 @@ class SaklasSession:
         # Must run before ``normalized_entries`` because the normalized
         # form flattens ``ProjectedTerm`` into ``(coeff, trigger)`` and
         # loses the ``base`` / ``onto`` / ``operator`` fields.
-        composer = self._get_steering_composer()
+        composer = self._steering_composer
         snapshots = composer.materialize_projections(steering_obj)
         raw_entries = steering_obj.normalized_entries()
         resolved: dict[str, SteeringStackEntry] = dict(
@@ -5256,12 +5215,11 @@ class SaklasSession:
                 continue
             target = val.target
             if target not in self._profiles:
-                # Resolve via the unified path (fold a fitted manifold, or
-                # port a legacy vectors/ folder on first touch).  A miss /
+                # Resolve via the unified fitted-manifold path. A miss or
                 # non-raw variant error surfaces at hook-install with the
                 # shared VectorNotRegisteredError shape.
                 with suppress(Exception):
-                    self._ensure_profile_registered(target, role="ablation")
+                    self.ensure_profile_registered(target, role="ablation")
             resolved[key] = val
         # Fold in manifold terms.  Like ablation, ``normalized_entries``
         # strips ``ManifoldTerm`` values, so walk ``alphas`` directly.
@@ -5274,7 +5232,7 @@ class SaklasSession:
         for key, val in steering_obj.alphas.items():
             if not isinstance(val, ManifoldTerm):
                 continue
-            self._ensure_manifold_loaded(val.manifold)
+            self.ensure_manifold_loaded(val.manifold)
             resolved[key] = val
             manifold_terms.append(val)
 
@@ -5293,7 +5251,7 @@ class SaklasSession:
         for term in manifold_terms:
             manifold = self._manifolds.get(term.manifold)
             if manifold is None:
-                # Should not happen — ``_ensure_manifold_loaded`` either
+                # Should not happen — ``ensure_manifold_loaded`` either
                 # populates ``self._manifolds`` or raises.  Defensive.
                 continue
             try:
@@ -5353,26 +5311,6 @@ class SaklasSession:
             active_role=active_role,
         )
 
-    def _ensure_manifold_loaded(self, key: str) -> None:
-        """Load the manifold artifact for registry key ``key`` if absent.
-
-        Compatibility wrapper over
-        :meth:`SteeringComposer.ensure_manifold_loaded`; production steering
-        code talks to the composer directly.
-        """
-        self._get_steering_composer().ensure_manifold_loaded(key)
-
-    def _ensure_profile_registered(
-        self, name: str, *, role: str = "vector",
-    ) -> dict[int, torch.Tensor]:
-        """Direction profile for ``name`` — registered tensor or folded manifold.
-
-        Compatibility wrapper over
-        :meth:`SteeringComposer.ensure_profile_registered`; public callers
-        should prefer :meth:`ensure_profile_registered`.
-        """
-        return self._get_steering_composer().ensure_profile_registered(name, role=role)
-
     def _bootstrap_manifold_probes(
         self, categories: list[str], *, include_fitted_defaults: bool = False,
     ) -> dict[str, "Manifold"]:
@@ -5418,10 +5356,10 @@ class SaklasSession:
                 key = f"default/{name}"
                 try:
                     try:
-                        self._get_steering_composer().ensure_manifold_loaded(key)
+                        self.ensure_manifold_loaded(key)
                     except ManifoldNotRegisteredError:
                         self.fit(manifold_dir("default", name))
-                        self._get_steering_composer().ensure_manifold_loaded(key)
+                        self.ensure_manifold_loaded(key)
                     probes[name] = self._manifolds[key]
                 except Exception as e:
                     _log.warning("manifold probe '%s' failed to fit/load: %s", name, e)
@@ -5459,7 +5397,7 @@ class SaklasSession:
                 )
                 continue
             try:
-                self._get_steering_composer().ensure_manifold_loaded(key)
+                self.ensure_manifold_loaded(key)
                 probes[key] = self._manifolds[key]
             except Exception as e:
                 _log.warning("manifold probe '%s' failed to load: %s", key, e)
@@ -5474,7 +5412,7 @@ class SaklasSession:
         Thin forwarder to :meth:`SteeringComposer.push`; ``_SteeringContext``
         calls it on the session, so it stays as a session method.
         """
-        self._get_steering_composer().push(entries)
+        self._steering_composer.push(entries)
 
     def _pop_steering(self) -> None:
         """Pop the top of the steering stack and rebuild hooks.
@@ -5482,24 +5420,22 @@ class SaklasSession:
         Thin forwarder to :meth:`SteeringComposer.pop`; ``_SteeringContext``
         calls it on the session, so it stays as a session method.
         """
-        self._get_steering_composer().pop()
+        self._steering_composer.pop()
 
     def _steering_needs_probe_gating(self) -> bool:
         """Return True iff any active steering trigger carries a
         :class:`~saklas.core.triggers.ProbeGate`.
 
-        Compatibility wrapper over
-        :meth:`SteeringComposer.steering_needs_probe_gating`; production
-        generation code talks to the composer directly.
+        Delegates the generation query to :class:`SteeringComposer`.
         """
-        return self._get_steering_composer().steering_needs_probe_gating()
+        return self._steering_composer.steering_needs_probe_gating()
 
     def _steering_active_in_prefill(self) -> bool:
         """Return True iff any active steering term fires during prompt prefill.
 
         Thin forwarder to :meth:`SteeringComposer.steering_active_in_prefill`.
         """
-        return self._get_steering_composer().steering_active_in_prefill()
+        return self._steering_composer.steering_active_in_prefill()
 
     def _steering_value_prefill_inactive(
         self, value: "str | Steering | None",
@@ -5508,7 +5444,7 @@ class SaklasSession:
 
         Thin forwarder to :meth:`SteeringComposer.steering_value_prefill_inactive`.
         """
-        return self._get_steering_composer().steering_value_prefill_inactive(value)
+        return self._steering_composer.steering_value_prefill_inactive(value)
 
     def _exit_internal_steering(self, steering_cm: Any, *, swallow: bool) -> None:
         """Pop ``_generate_core``'s internally-entered steering scope.
@@ -5545,20 +5481,16 @@ class SaklasSession:
         """Return a closure that scores latest captures into a
         ``dict[str, float]`` for ``generate_steered``'s ``score_callback``.
 
-        Compatibility wrapper over
-        :meth:`SteeringComposer.build_gating_score_callback`; production
-        generation code talks to the composer directly.
+        Delegates gate callback construction to :class:`SteeringComposer`.
         """
-        return self._get_steering_composer().build_gating_score_callback()
+        return self._steering_composer.build_gating_score_callback()
 
     def _rebuild_steering_hooks(self) -> None:
         """Tear down existing hooks and install from the flattened stack head.
 
-        Thin forwarder to :meth:`SteeringComposer.rebuild_hooks`; kept on the
-        session because test stubs override it (and the composer's push/pop reach
-        it through the session back-ref).
+        Thin forwarder used by the composer after stack mutations.
         """
-        self._get_steering_composer().rebuild_hooks()
+        self._steering_composer.rebuild_hooks()
 
     def _begin_capture(
         self, *, widen: bool = False, need_per_token: bool = True,
@@ -6613,7 +6545,7 @@ class SaklasSession:
         if profile is not None:
             return self._fold_profile_probe(selector, profile)
         try:
-            self._ensure_manifold_loaded(selector)
+            self.ensure_manifold_loaded(selector)
             return self._manifolds[selector]
         except ManifoldNotRegisteredError:
             pass
@@ -7389,7 +7321,7 @@ class SaklasSession:
             self._invalidate_prefix_cache()
             return 0
 
-        if self._steering_stack:
+        if self._steering_composer._stack:
             raise SaklasError(
                 "cache_prefix called inside an active session.steering() "
                 "scope; prefill must run with the neutral baseline so the "
@@ -8049,7 +7981,7 @@ class SaklasSession:
 
     def _snapshot_steering_alphas(self) -> dict[str, float]:
         """Flatten the active steering stack for result receipts."""
-        return self._get_steering_composer().snapshot_steering_alphas()
+        return self._steering_composer.snapshot_steering_alphas()
 
     def _start_loom_assistant(
         self,
@@ -8173,7 +8105,7 @@ class SaklasSession:
                 effective_input_ids = suffix_ids
 
         start = time.monotonic()
-        composer = self._get_steering_composer()
+        composer = self._steering_composer
         gating_callback = (
             composer.build_gating_score_callback()
             if composer.steering_needs_probe_gating()
@@ -8650,7 +8582,7 @@ class SaklasSession:
             # Otherwise (probes attached but only the aggregate wanted, e.g. a
             # stateless server gen) the capture skips per-token scoring entirely
             # and pools the aggregate once at finalize.
-            composer = self._get_steering_composer()
+            composer = self._steering_composer
             _needs_gating = composer.steering_needs_probe_gating()
             # The five UI / trait / loom / persist consumers each need a
             # per-token reading for the FULL roster.  When NONE of them is live
@@ -9558,7 +9490,7 @@ class SaklasSession:
                 steering_cm.__enter__()
             vector_snapshot: dict[str, float] = (
                 self._snapshot_steering_alphas()
-                if self._steering_stack or steering_cm is not None
+                if self._steering_composer._stack or steering_cm is not None
                 else {}
             )
             pad_id = self._batch_pad_token_id()

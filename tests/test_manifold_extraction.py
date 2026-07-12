@@ -23,6 +23,7 @@ from saklas.core.events import EventBus, ManifoldExtracted
 from saklas.core.extraction import ManifoldExtractionPipeline
 from saklas.core.sae import MockSaeBackend
 from saklas.io.manifolds import MANIFOLD_FORMAT_VERSION, ManifoldFolder
+from saklas.io.paths import sidecar_filename, tensor_filename
 from tests._whitener import synthetic_means, synthetic_whitener
 
 _LABELS = ["calm", "uneasy", "afraid", "frantic", "numb"]
@@ -649,15 +650,15 @@ def test_interrupted_pair_publish_is_retryable(
     )
     with pytest.raises(OSError, match="injected"):
         pipe.fit(folder)
-    assert not (folder / "stub-model.safetensors").exists()
-    assert (folder / "stub-model.json").exists()
+    assert not (folder / tensor_filename("stub-model")).exists()
+    assert (folder / sidecar_filename("stub-model")).exists()
 
     monkeypatch.setattr(
         manifold_module, "_replace_manifold_file", real_replace,
     )
     fitted = pipe.fit(folder)
     assert fitted.name == "mood"
-    assert (folder / "stub-model.safetensors").exists()
+    assert (folder / tensor_filename("stub-model")).exists()
 
 
 def test_interrupted_existing_pair_replacement_self_repairs(
@@ -1114,63 +1115,6 @@ def test_concurrent_deferred_row_topups_merge_latest_pointer(
     assert all((tmp_path / name).exists() for name in payload["row_files"].values())
 
 
-def test_v3_monolith_is_replaced_safely_by_v4_layer_shards(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from safetensors.torch import load_file, save_file
-    from saklas.io.packs import hash_file
-    from saklas.io.paths import model_dir
-
-    folder = _author_manifold(tmp_path)
-    pipe = ManifoldExtractionPipeline(_Handle(), EventBus())
-    pipe.fit(folder)
-    capture_dir = model_dir("stub-model") / "manifold_capture"
-    meta_path, = capture_dir.glob("*.json")
-    meta = json.loads(meta_path.read_text())
-    stem = meta_path.stem
-
-    centroid_tensors: dict[str, torch.Tensor] = {}
-    row_tensors: dict[str, torch.Tensor] = {}
-    for idx in meta["centroid_layers"]:
-        shard = capture_dir / meta["centroid_files"][str(idx)]
-        centroid_tensors.update(load_file(str(shard), device="cpu"))
-    for idx in meta["row_layers"]:
-        shard = capture_dir / meta["row_files"][str(idx)]
-        row_tensors.update(load_file(str(shard), device="cpu"))
-    centroid_monolith = capture_dir / f"{stem}.centroids.safetensors"
-    row_monolith = capture_dir / f"{stem}.rows.safetensors"
-    save_file(centroid_tensors, str(centroid_monolith))
-    save_file(row_tensors, str(row_monolith))
-    for shard in capture_dir.glob(f"{stem}.*.layer_*.safetensors"):
-        shard.unlink()
-    meta["format_version"] = 3
-    meta.pop("centroid_files")
-    meta.pop("row_files")
-    meta["files"] = {centroid_monolith.name: hash_file(centroid_monolith)}
-    meta_path.write_text(json.dumps(meta))
-
-    # Miss the fitted tensor while preserving the exact token capture identity.
-    manifest = json.loads((folder / "manifold.json").read_text())
-    manifest["nodes"][0]["coords"] = [0.125]
-    (folder / "manifold.json").write_text(json.dumps(manifest))
-    scopes: list[list[int]] = []
-
-    def _counting(*args: Any, **kwargs: Any) -> Any:
-        scopes.append(list(kwargs["layer_indices"]))
-        return _stub_encoder_batch(*args, **kwargs)
-
-    monkeypatch.setattr(V, "_encode_and_capture_all_batch", _counting)
-    pipe.fit(folder, layer_indices=[1])
-
-    migrated = json.loads(meta_path.read_text())
-    assert scopes == [[1]]
-    assert migrated["format_version"] == 4
-    assert migrated["centroid_layers"] == [1]
-    assert migrated["row_layers"] == [1]
-    assert not centroid_monolith.exists()
-    assert not row_monolith.exists()
-
-
 def test_row_cache_uses_layer_digests_without_container_rehash(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1406,11 +1350,13 @@ def test_fit_returns_node_roles_without_reload(tmp_path: Path) -> None:
 def test_fit_writes_tensor_and_manifest(tmp_path: Path) -> None:
     folder = _author_manifold(tmp_path)
     ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder)
-    assert (folder / "stub-model.safetensors").exists()
-    assert (folder / "stub-model.json").exists()
+    tensor_name = tensor_filename("stub-model")
+    sidecar_name = sidecar_filename("stub-model")
+    assert (folder / tensor_name).exists()
+    assert (folder / sidecar_name).exists()
     mf = ManifoldFolder.load(folder)
-    assert "stub-model.safetensors" in mf.files
-    assert "stub-model.json" in mf.files
+    assert tensor_name in mf.files
+    assert sidecar_name in mf.files
 
 
 def test_fit_emits_event(tmp_path: Path) -> None:
@@ -1898,7 +1844,7 @@ def test_fit_sae_variant(tmp_path: Path) -> None:
     )
     assert manifold.feature_space == "sae-mock-rel"
     assert sorted(manifold.layers) == list(range(_N_LAYERS))
-    assert (folder / "stub-model_sae-mock-rel.safetensors").exists()
+    assert (folder / tensor_filename("stub-model", release="mock-rel")).exists()
 
 
 def test_multi_node_sae_fit_releases_raw_centroid_layers_during_reconstruction(
@@ -2239,7 +2185,7 @@ def test_discover_pca_produces_affine_subspaces(tmp_path: Path) -> None:
         assert sub.node_coords.shape[1] == sub.rank   # (K, R)
     # subspace_metric is always "mahalanobis": the stub carries a covering
     # whitener and there is no Euclidean fit path.
-    sidecar = json.loads((folder / "stub-model.json").read_text())
+    sidecar = json.loads((folder / sidecar_filename("stub-model")).read_text())
     assert sidecar["subspace_metric"] == "mahalanobis"
 
 
@@ -2294,7 +2240,7 @@ def test_discover_records_fit_mode_and_diagnostics(tmp_path: Path) -> None:
     )
     ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder)
 
-    sidecar = json.loads((folder / "stub-model.json").read_text())
+    sidecar = json.loads((folder / sidecar_filename("stub-model")).read_text())
     assert sidecar["fit_mode"] == "pca"
     assert "diagnostics" in sidecar
     diag = sidecar["diagnostics"]
@@ -2355,7 +2301,8 @@ def test_discover_cache_invalidates_on_fit_mode_change(tmp_path: Path) -> None:
         hyperparams={"max_dim": 4},
     )
     ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder)
-    sidecar_pca = json.loads((folder / "stub-model.json").read_text())
+    sidecar_path = folder / sidecar_filename("stub-model")
+    sidecar_pca = json.loads(sidecar_path.read_text())
     assert sidecar_pca["fit_mode"] == "pca"
 
     data = json.loads((folder / "manifold.json").read_text())
@@ -2363,7 +2310,7 @@ def test_discover_cache_invalidates_on_fit_mode_change(tmp_path: Path) -> None:
     (folder / "manifold.json").write_text(json.dumps(data))
 
     ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder)
-    sidecar_spec = json.loads((folder / "stub-model.json").read_text())
+    sidecar_spec = json.loads(sidecar_path.read_text())
     assert sidecar_spec["fit_mode"] == "spectral"
 
 
@@ -2374,7 +2321,7 @@ def test_discover_round_trip_through_load_manifold(tmp_path: Path) -> None:
         tmp_path, fit_mode="pca", hyperparams={"max_dim": 4},
     )
     m1 = ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder)
-    m2 = load_manifold(folder / "stub-model.safetensors")
+    m2 = load_manifold(folder / tensor_filename("stub-model"))
     assert isinstance(m2.domain, CustomDomain)
     assert m2.domain.intrinsic_dim == m1.domain.intrinsic_dim
     assert m2.node_labels == m1.node_labels

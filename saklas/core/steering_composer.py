@@ -17,10 +17,8 @@ probe gate); it binds ``capture``/``monitor`` to locals before the inner ``def``
 reads the session's capture state through the back-ref exactly as the unextracted
 body did, so the per-token path gains no new indirection.
 
-The session keeps a thin forwarder for every method here, because
-:class:`_SteeringContext`, ``joint_logprobs.py``, and ~15 tests bind these names on
-the session (monkeypatch / ``__get__`` to a stub / direct call).  The forwarders make
-the extraction behavior- and API-preserving by construction.
+The session exposes the artifact loaders as its public registration API and keeps
+narrow context/generation forwarders where the session boundary is meaningful.
 """
 from __future__ import annotations
 
@@ -55,8 +53,7 @@ class SteeringComposer:
     Instantiated once per :class:`~saklas.core.session.SaklasSession` after the
     state it depends on exists (``_steering`` manager, ``_profiles`` /
     ``_manifolds`` / ``_layer_means``, and the ``_monitor``).  The session holds the
-    instance as ``_steering_composer`` and exposes ``_stack`` through a settable
-    ``session._steering_stack`` property.
+    instance as ``_steering_composer``. The stack has one owner: this collaborator.
     """
 
     def __init__(self, session: "SaklasSession") -> None:
@@ -378,8 +375,7 @@ class SteeringComposer:
             )
             if registry_key not in profiles:
                 try:
-                    # Unified resolution: fold a fitted manifold, or port a
-                    # legacy vectors/ folder on first touch.  May raise
+                    # Unified resolution folds the fitted manifold. May raise
                     # Ambiguous/UnknownVariantError — keep the user's original
                     # name in ``out`` so the error surfaces at hook-install
                     # with a clear message.
@@ -527,8 +523,7 @@ class SteeringComposer:
         with session._gen_lock:
             self._stack.append(dict(entries))
             try:
-                # Through the session forwarder so test stubs that override
-                # ``session._rebuild_steering_hooks`` take effect.
+                # Rebuild through the session boundary after the stack mutation.
                 session._rebuild_steering_hooks()
             except BaseException:
                 self._stack.pop()
@@ -573,8 +568,7 @@ class SteeringComposer:
             )
         with session._gen_lock:
             self._stack.pop()
-            # Through the session forwarder so test stubs that override
-            # ``session._rebuild_steering_hooks`` take effect.
+            # Rebuild through the session boundary after the stack mutation.
             session._rebuild_steering_hooks()
             # Symmetric with ``push``: the cached prefix is unsteered,
             # so only invalidate when what remains on the stack still steers the
@@ -595,7 +589,7 @@ class SteeringComposer:
         entries keyed under ``!<target>`` flatten to their ``(coeff,
         trigger)`` pair so subscribers see one uniform tuple shape.
         """
-        flat = self.flatten_steering_stack()
+        flat = self.flatten_stack()
         alphas_only: dict[str, float] = {}
         entries_out: dict[str, tuple[float, Trigger]] = {}
         for name, entry in flat.items():
@@ -609,7 +603,7 @@ class SteeringComposer:
             SteeringApplied(alphas=alphas_only, entries=entries_out)
         )
 
-    def flatten_steering_stack(self) -> dict[str, SteeringStackEntry]:
+    def flatten_stack(self) -> dict[str, SteeringStackEntry]:
         """Collapse the LIFO stack into a single entries dict (later wins)."""
         flat: dict[str, SteeringStackEntry] = {}
         for entry in self._stack:
@@ -625,7 +619,7 @@ class SteeringComposer:
         Cheap pre-flight check that lets ``_generate_core`` decide
         whether to wire the per-step score callback at all.
         """
-        flat = self.flatten_steering_stack()
+        flat = self.flatten_stack()
         for entry in flat.values():
             if isinstance(entry, (AblationTerm, ManifoldTerm)):
                 if entry.trigger.gate is not None:
@@ -653,7 +647,7 @@ class SteeringComposer:
         """
         attached = set(self._session._monitor.probe_names)
         out: set[str] = set()
-        for entry in self.flatten_steering_stack().values():
+        for entry in self.flatten_stack().values():
             if isinstance(entry, (AblationTerm, ManifoldTerm)):
                 trig = entry.trigger
             else:  # (alpha, Trigger)
@@ -672,7 +666,7 @@ class SteeringComposer:
         """Exact monitor scalar keys referenced by active probe gates."""
         attached = set(self._session._monitor.probe_names)
         out: set[str] = set()
-        for entry in self.flatten_steering_stack().values():
+        for entry in self.flatten_stack().values():
             if isinstance(entry, (AblationTerm, ManifoldTerm)):
                 trig = entry.trigger
             else:  # (alpha, Trigger)
@@ -698,7 +692,7 @@ class SteeringComposer:
         if not attached:
             return set()
         out: set[str] = set()
-        for entry in self.flatten_steering_stack().values():
+        for entry in self.flatten_stack().values():
             if isinstance(entry, (AblationTerm, ManifoldTerm)):
                 trig = entry.trigger
             else:  # (alpha, Trigger)
@@ -717,7 +711,7 @@ class SteeringComposer:
         if not attached:
             return set()
         out: set[str] = set()
-        for entry in self.flatten_steering_stack().values():
+        for entry in self.flatten_stack().values():
             if isinstance(entry, (AblationTerm, ManifoldTerm)):
                 trig = entry.trigger
             else:
@@ -743,7 +737,7 @@ class SteeringComposer:
         keys on, and the condition under which steering push/pop preserves the
         cache.  Mirrors :meth:`steering_needs_probe_gating`'s stack walk.
         """
-        flat = self.flatten_steering_stack()
+        flat = self.flatten_stack()
         for entry in flat.values():
             if isinstance(entry, (AblationTerm, ManifoldTerm)):
                 trig = entry.trigger
@@ -1119,7 +1113,7 @@ class SteeringComposer:
         ``SteeringManager.apply_to_model`` lowers them to per-layer
         ``subspace_inject`` groups.
         """
-        flat = self.flatten_steering_stack()
+        flat = self.flatten_stack()
         if not flat:
             self._session._steering.clear_all()
             return
@@ -1141,7 +1135,7 @@ class SteeringComposer:
         should inspect the live ``Steering.alphas`` dict directly.
         """
         snap: dict[str, float] = {}
-        for name, entry in self.flatten_steering_stack().items():
+        for name, entry in self.flatten_stack().items():
             if isinstance(entry, (AblationTerm, ManifoldTerm)):
                 snap[name] = entry.coeff
                 continue

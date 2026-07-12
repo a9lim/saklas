@@ -14,8 +14,8 @@ Every `~/.saklas/` path resolves through `saklas_home()` (honors `$SAKLAS_HOME`)
 Helpers: `manifolds_dir`, `manifold_dir(ns, name)`, `templates_dir`, `models_dir`, `model_dir(id)`,
 `neutral_statements_path`, `baseline_prompts_path` (user override for the shared A2
 baseline user prompts; falls back to bundled `saklas/data/baseline_prompts.json`),
-`safe_model_id` (ordinary Hub ids preserve `/` → `__`; ambiguous/local ids use
-a reversible `_z` base64url tier), `ensure_within(root, *parts)` (path-traversal
+`safe_model_id` (every model id uses one reversible `_z` base64url encoding),
+`ensure_within(root, *parts)` (path-traversal
 barrier).
 
 `sae.py` owns the small live-runtime metadata cache under
@@ -432,7 +432,7 @@ digest-validates only those shards, with digest computed from the same bytes fed
 to safetensors decode. Transfer preflight binds that selective layer roster to
 the source tensor + sidecar manifest digests; the final pair-locked publication
 revalidates the proof and rejects a concurrent source refit before source load or
-target write. Legacy v3 monoliths miss and are removed on replacement.
+target write. Non-current cache generations miss and are replaced normally.
 `transfer_manifold`
 (`manifolds.py`) is the manifold counterpart.
 

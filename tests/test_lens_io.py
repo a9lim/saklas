@@ -28,6 +28,7 @@ from saklas.io.lens import (
     save_lens,
     save_lens_checkpoint_accumulator,
 )
+from saklas.io.paths import safe_model_id
 
 _MODEL = "test-org/tiny-model"
 _D = 8
@@ -79,7 +80,7 @@ def _save_checkpoint(
 def test_paths_layout() -> None:
     ts, sc = lens_paths(_MODEL)
     assert ts.suffix == ".safetensors" and sc.suffix == ".json"
-    assert "test-org__tiny-model" in str(ts)
+    assert safe_model_id(_MODEL) in str(ts)
 
 
 def test_save_load_round_trip() -> None:

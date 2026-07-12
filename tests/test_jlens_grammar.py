@@ -74,7 +74,7 @@ def test_jlens_steering_atom_round_trips() -> None:
 # ---------------------------------------------------------- lazy resolution --
 
 
-def test_ensure_profile_registered_resolves_jlens_atom() -> None:
+def test_profile_registration_resolves_jlens_atom() -> None:
     session = _StubSession()
     session.fit_jlens(_PROMPTS)
     composer = SteeringComposer(session)  # type: ignore[arg-type]
@@ -86,7 +86,7 @@ def test_ensure_profile_registered_resolves_jlens_atom() -> None:
     assert all(isinstance(v, torch.Tensor) for v in dirs.values())
 
 
-def test_ensure_profile_registered_jlens_requires_fitted_lens() -> None:
+def test_profile_registration_jlens_requires_fitted_lens() -> None:
     from saklas.core.jlens import LensNotFittedError
 
     session = _StubSession()

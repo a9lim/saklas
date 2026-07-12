@@ -255,8 +255,7 @@ boundaries, and its digest metadata validates centroid payloads plus exact
 per-layer row tensors; subset fits map/hash only requested row layers and validate
 only requested centroid/row layers. Capture-cache format v4 persists immutable
 generation-named safetensors shards, one per layer, so a disjoint top-up writes
-only the new shards instead of copying/replacing a multi-GiB container; v3
-monoliths are safely recaptured and replaced on first use. Publication fsyncs
+only the new shards instead of copying/replacing a multi-GiB container. Publication fsyncs
 shard payloads and their directory entries, writes a recovery journal, atomically
 replaces and directory-fsyncs the authoritative JSON pointer, and only then
 garbage-collects superseded generations. A failed publication therefore
@@ -941,19 +940,12 @@ loaded-manifold registry (`_manifolds`), the unified `Monitor` (`_monitor`),
 `SteeringManager`, `HiddenCapture`, generation defaults (`session.config`), the loom
 tree, and a synchronous `events: EventBus`. Steering resolution + the LIFO steering
 stack live on a `SteeringComposer` collaborator (`core/steering_composer.py`),
-instantiated in `__init__` after `_monitor` (lazily rebuilt via
-`_get_steering_composer()` for `__new__` test stubs). The composer owns the stack
-(`_stack`); the session exposes a settable `_steering_stack` property over it, and
-owns projection materialization, pole alias resolution, profile/manifold loading,
-legacy vector port-on-detect, stack flattening, probe-gate predicates, steering
-lowering, and hook installation. The session keeps only narrow compatibility
-wrappers for `_push_steering`/`_pop_steering` (called by `_SteeringContext`),
-`_rebuild_steering_hooks`, `_ensure_manifold_loaded`, `_ensure_profile_registered`,
-`_steering_needs_probe_gating`, and `_build_gating_score_callback`; production
-generation and steering setup should call the composer directly when adding new
-code.
-`joint_logprobs.py` still uses the gating compatibility wrappers because it accepts
-session-like test doubles.
+instantiated exactly once in `__init__` after `_monitor`. The composer solely owns
+the stack (`_stack`), projection materialization, pole alias resolution, steering
+lowering, and hook installation. `ensure_manifold_loaded` and
+`ensure_profile_registered` are the session's single public artifact-registration
+API. The session keeps narrow `_push_steering`/`_pop_steering` context forwarders
+and generation helpers where the session boundary is meaningful.
 The composer reaches session state through `self._session` at push/pop frequency, off
 the per-token path; the one near-hot method, `build_gating_score_callback`, binds
 `capture`/`monitor` to locals and reads the session capture state through the back-ref

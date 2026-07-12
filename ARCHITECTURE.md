@@ -191,7 +191,7 @@ Mahalanobis whitener is checked before this expensive capture begins. Format v4
 stores independently digested, immutable generation-named per-layer centroid
 and row shards: scoped fits verify/map only requested layers, disjoint top-ups
 write only missing shards, row publication computes its tensor-domain digest in
-the same bounded payload traversal, and legacy v3 monoliths are replaced on first use.
+the same bounded payload traversal; non-current caches miss and are recaptured normally.
 Each generation fsyncs its payloads before a recovery journal and atomic pointer;
 the pointer directory is fsynced before superseded generations are collected.
 The prior pointer remains authoritative on failure, and a complete orphaned
@@ -541,10 +541,10 @@ composes the unified backend:
 | `c[,o] M%pos` (curved M)     | a separate two-op term via `add_manifold` (along=c, onto=o)  |
 
 **Resolving a direction (manifold-first).** A plain vector term resolves through
-`session._ensure_profile_registered`, in order: (1) an in-memory baked direction
+`session.ensure_profile_registered`, in order: (1) an in-memory baked direction
 already in `_profiles` (ad-hoc `extract`/`merge`/projection results); (2) a
 fitted 2-node `pca` manifold on disk — `_try_fold_manifold` loads it
-(`_ensure_manifold_loaded`) and folds via `folded_vector_directions`, memoizing the
+(`ensure_manifold_loaded`) and folds via `folded_vector_directions`, memoizing the
 result. Pre-manifold vector folders are not part of the current runtime format.
 
 **Folding to a push fragment.** `fold_directions_to_subspace(name, directions,
@@ -790,7 +790,7 @@ has room; tune α per target.
 
 `0.3 formal.casual`:
 
-1. `_ensure_profile_registered("formal.casual")` loads the 2-node `pca` manifold,
+1. `ensure_profile_registered("formal.casual")` loads the 2-node `pca` manifold,
    folds it (`folded_vector_directions` → `{L: δ̂_L·share_L}`), memoizes.
 2. `fold_directions_to_subspace` rebuilds a neutral-anchored `R=1` ray:
    `basis = δ̂_L`, `node_coords = [[‖d_L‖]]`, `share = ‖d_L‖_M`.

@@ -127,29 +127,9 @@ def baseline_prompts_path() -> Path:
 
 
 def safe_model_id(model_id: str) -> str:
-    """Bijectively flatten an HF/local model id for filesystem use.
-
-    Ordinary Hub ids retain the historical ``/ -> __`` spelling, including
-    single underscores in model names, so existing caches remain discoverable.
-    Ambiguous or filesystem-unsafe ids (literal ``__``, boundary underscores,
-    local paths, spaces, Unicode, punctuation) use a ``_z``-prefixed base64url
-    encoding. The two tiers are disjoint and fully reversible.
-    """
-    legacy_safe = bool(re.fullmatch(r"[A-Za-z0-9._/-]+", model_id))
-    components = model_id.split("/")
-    unambiguous = (
-        legacy_safe
-        and "__" not in model_id
-        and not model_id.startswith("_z")
-        and all(
-            component
-            and not component.startswith("_")
-            and not component.endswith("_")
-            for component in components
-        )
-    )
-    if unambiguous:
-        return model_id.replace("/", "__")
+    """Encode any HF or local model id as one reversible filename component."""
+    if not model_id:
+        raise ValueError("model id must not be empty")
     payload = base64.urlsafe_b64encode(model_id.encode("utf-8")).decode("ascii")
     return "_z" + payload.rstrip("=")
 
@@ -157,15 +137,18 @@ def safe_model_id(model_id: str) -> str:
 def unsafe_model_id(safe_id: str) -> str:
     """Reverse :func:`safe_model_id`, rejecting malformed escape sequences."""
     if not safe_id.startswith("_z"):
-        return safe_id.replace("__", "/")
+        raise ValueError(f"invalid safe model id {safe_id!r}")
     encoded = safe_id[2:]
     encoded += "=" * (-len(encoded) % 4)
     try:
-        return base64.b64decode(
+        model_id = base64.b64decode(
             encoded, altchars=b"-_", validate=True,
         ).decode("utf-8")
     except (ValueError, UnicodeDecodeError) as exc:
         raise ValueError(f"invalid encoded safe model id {safe_id!r}") from exc
+    if not model_id or safe_model_id(model_id) != safe_id:
+        raise ValueError(f"invalid encoded safe model id {safe_id!r}")
+    return model_id
 
 
 def model_dir(model_id: str) -> Path:

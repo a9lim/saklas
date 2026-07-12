@@ -4,6 +4,10 @@ import pytest
 
 from saklas.io import paths
 
+GOOGLE_2B = "_zZ29vZ2xlL2dlbW1hLTItMmItaXQ"
+GOOGLE_3_4B = "_zZ29vZ2xlL2dlbW1hLTMtNGItaXQ"
+QWEN_2_5 = "_zUXdlbi9Rd2VuMi41LTdCLUluc3RydWN0"
+
 
 def test_default_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.delenv("SAKLAS_HOME", raising=False)
@@ -25,15 +29,17 @@ def test_subdirs(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
 
 def test_model_dir_flattens_slashes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    assert paths.model_dir("google/gemma-2-2b-it") == tmp_path / "models" / "google__gemma-2-2b-it"
+    assert paths.model_dir("google/gemma-2-2b-it") == tmp_path / "models" / GOOGLE_2B
 
 
 def test_safe_model_id():
-    assert paths.safe_model_id("google/gemma-2-2b-it") == "google__gemma-2-2b-it"
-    assert paths.safe_model_id("Qwen/Qwen2.5-7B-Instruct") == "Qwen__Qwen2.5-7B-Instruct"
-    assert paths.safe_model_id("local-model") == "local-model"
-    # Single underscores keep the released cache spelling.
-    assert paths.safe_model_id("org/model_name") == "org__model_name"
+    assert paths.safe_model_id("google/gemma-2-2b-it") == GOOGLE_2B
+    assert paths.safe_model_id("Qwen/Qwen2.5-7B-Instruct") == QWEN_2_5
+    assert paths.safe_model_id("local-model") == "_zbG9jYWwtbW9kZWw"
+    assert paths.safe_model_id("org/model_name") == "_zb3JnL21vZGVsX25hbWU"
+    assert all(paths.safe_model_id(value).startswith("_z") for value in (
+        "org/model", "local-model", "org__model", "组织/模型",
+    ))
 
 
 @pytest.mark.parametrize(
@@ -49,6 +55,15 @@ def test_safe_model_id():
 )
 def test_safe_model_id_round_trips_every_supported_id(model_id: str) -> None:
     assert paths.unsafe_model_id(paths.safe_model_id(model_id)) == model_id
+
+
+@pytest.mark.parametrize("value", ["", "plain-model", "_z", "_zYQ==", "_z***"])
+def test_model_id_codec_rejects_non_current_or_noncanonical_values(value: str) -> None:
+    with pytest.raises(ValueError):
+        if value:
+            paths.unsafe_model_id(value)
+        else:
+            paths.safe_model_id(value)
 
 
 def test_safe_sae_suffix_raw():
@@ -67,18 +82,18 @@ def test_safe_sae_suffix_slugs_unsafe_chars():
 
 def test_tensor_filename_roundtrip_raw():
     name = paths.tensor_filename("google/gemma-2-2b-it", release=None)
-    assert name == "google__gemma-2-2b-it.safetensors"
+    assert name == f"{GOOGLE_2B}.safetensors"
     parsed = paths.parse_tensor_filename(name)
-    assert parsed == ("google__gemma-2-2b-it", None)
+    assert parsed == (GOOGLE_2B, None)
 
 
 def test_tensor_filename_roundtrip_sae():
     name = paths.tensor_filename("google/gemma-2-2b-it", release="gemma-scope-2b-pt-res-canonical")
-    assert name == "google__gemma-2-2b-it_sae-gemma-scope-2b-pt-res-canonical.safetensors"
+    assert name == f"{GOOGLE_2B}_sae-gemma-scope-2b-pt-res-canonical.safetensors"
     parsed = paths.parse_tensor_filename(name)
     # parse_tensor_filename returns the kind-prefixed variant slug so
     # callers can dispatch on prefix without re-detecting the kind.
-    assert parsed == ("google__gemma-2-2b-it", "sae-gemma-scope-2b-pt-res-canonical")
+    assert parsed == (GOOGLE_2B, "sae-gemma-scope-2b-pt-res-canonical")
 
 
 def test_tensor_filename_roundtrip_from_transferred(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -87,9 +102,9 @@ def test_tensor_filename_roundtrip_from_transferred(monkeypatch: pytest.MonkeyPa
         "Qwen/Qwen2.5-7B-Instruct",
         transferred_from="google/gemma-3-4b-it",
     )
-    assert name == "Qwen__Qwen2.5-7B-Instruct_from-google__gemma-3-4b-it.safetensors"
+    assert name == f"{QWEN_2_5}_from-{GOOGLE_3_4B.lower()}.safetensors"
     parsed = paths.parse_tensor_filename(name)
-    assert parsed == ("Qwen__Qwen2.5-7B-Instruct", "from-google__gemma-3-4b-it")
+    assert parsed == (QWEN_2_5, f"from-{GOOGLE_3_4B.lower()}")
 
 
 def test_tensor_filename_rejects_double_variant():
@@ -134,14 +149,14 @@ def test_safe_model_id_is_bijective_across_slash_and_literal_double_underscore()
 
 
 def test_sidecar_filename_partners_tensor():
-    assert paths.sidecar_filename("google/gemma-2-2b-it", release=None) == "google__gemma-2-2b-it.json"
+    assert paths.sidecar_filename("google/gemma-2-2b-it", release=None) == f"{GOOGLE_2B}.json"
     assert paths.sidecar_filename(
         "google/gemma-2-2b-it", release="gemma-scope-2b-pt-res-canonical",
-    ) == "google__gemma-2-2b-it_sae-gemma-scope-2b-pt-res-canonical.json"
+    ) == f"{GOOGLE_2B}_sae-gemma-scope-2b-pt-res-canonical.json"
     assert paths.sidecar_filename(
         "Qwen/Qwen2.5-7B-Instruct",
         transferred_from="google/gemma-3-4b-it",
-    ) == "Qwen__Qwen2.5-7B-Instruct_from-google__gemma-3-4b-it.json"
+    ) == f"{QWEN_2_5}_from-{GOOGLE_3_4B.lower()}.json"
 
 
 def test_safe_from_suffix_slugs_unsafe_chars():
@@ -149,7 +164,7 @@ def test_safe_from_suffix_slugs_unsafe_chars():
     # safe form), but the helper is defensively idempotent on slashes.
     assert paths.safe_from_suffix(None) == ""
     assert paths.safe_from_suffix("") == ""
-    assert paths.safe_from_suffix("google__gemma-3-4b-it") == "_from-google__gemma-3-4b-it"
+    assert paths.safe_from_suffix(GOOGLE_3_4B) == f"_from-{GOOGLE_3_4B.lower()}"
 
 
 def test_role_like_text_is_part_of_raw_model_id() -> None:

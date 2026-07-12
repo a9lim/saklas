@@ -478,14 +478,8 @@ def test_default_probe_preflight_skips_unrelated_variant_hashes(
         model_id = _MODEL
         _manifolds: dict[str, Manifold] = {}
 
-        def _get_steering_composer(self) -> object:
-            session = self
-
-            class Composer:
-                def ensure_manifold_loaded(self, key: str) -> None:
-                    session._manifolds[key] = load_manifold(raw)
-
-            return Composer()
+        def ensure_manifold_loaded(self, key: str) -> None:
+            self._manifolds[key] = load_manifold(raw)
 
     monkeypatch.setattr(packs, "hash_file", track_hash)
     monkeypatch.setattr(probes_module, "load_default_manifolds", lambda: {})

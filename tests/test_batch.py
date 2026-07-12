@@ -19,6 +19,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from saklas.core.results import GenerationResult, ProbeReading, RunSet
+from saklas.core.steering_composer import SteeringComposer
 
 if TYPE_CHECKING:
     from saklas.core.session import SaklasSession
@@ -216,8 +217,7 @@ def _fast_batch_session():
     s._last_result = None
     s._internal_steering_pop = False
     s._active_role = None
-    s._steering_stack = []
-    s.build_readings = lambda: {}
+    s._steering_composer = SteeringComposer(s)
 
     def _prepare_input(
         input: Any,
@@ -270,6 +270,7 @@ class TestGenerateBatch:
         from saklas.core.session import SaklasSession
 
         s = SaklasSession.__new__(SaklasSession)
+        s._steering_composer = SteeringComposer(s)
         return s
 
     def test_returns_results_in_prompt_order(self) -> None:
@@ -629,8 +630,9 @@ class TestGenerateBatch:
 class TestPrefixCacheEligibility:
     def _session(self):
         from saklas.core.session import SaklasSession
-
-        return SaklasSession.__new__(SaklasSession)
+        session = SaklasSession.__new__(SaklasSession)
+        session._steering_composer = SteeringComposer(session)
+        return session
 
     @pytest.mark.parametrize(
         "expr, expected_inactive",
@@ -666,17 +668,17 @@ class TestPrefixCacheEligibility:
         from saklas.core.triggers import Trigger
 
         s = self._session()
-        s._steering_stack = []
+        s._steering_composer._stack = []
         assert s._steering_active_in_prefill() is False
         # Response-phase entry (prompt=False) → prefill untouched.
-        s._steering_stack = [{"honest": (0.5, Trigger.GENERATED_ONLY)}]
+        s._steering_composer._stack = [{"honest": (0.5, Trigger.GENERATED_ONLY)}]
         assert s._steering_active_in_prefill() is False
         # Default BOTH entry → prefill steered.
-        s._steering_stack = [{"honest": (0.5, Trigger.BOTH)}]
+        s._steering_composer._stack = [{"honest": (0.5, Trigger.BOTH)}]
         assert s._steering_active_in_prefill() is True
         # A probe-gated trigger reports inactive during prefill.
         gated = Trigger.when("honest.deceptive", ">", 0.4)
-        s._steering_stack = [{"honest": (0.5, gated)}]
+        s._steering_composer._stack = [{"honest": (0.5, gated)}]
         assert s._steering_active_in_prefill() is False
 
     def test_batch_common_prefix_detection_keeps_scalar_walk_on_cpu(self) -> None:
@@ -831,7 +833,7 @@ class TestPrefixCacheEligibility:
         s._static_cache_active = True
         s._device = torch.device("cpu")
         s.config = GenerationConfig(max_new_tokens=4)
-        s._steering_stack = []
+        s._steering_composer._stack = []
         s._prefix_cache = None
         from saklas.core.session import GenState
         s._gen_phase = GenState.IDLE

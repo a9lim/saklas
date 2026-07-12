@@ -93,7 +93,7 @@ def test_session_jspace_decompose_on_registered_profile(_isolated_home: None) ->
     # register the direction for toy-vocab token 'g', then decompose it —
     # the decomposition should attribute it (near-)fully to that atom.
     name = session.register_jlens_direction("g")
-    session._ensure_profile_registered = lambda sel: session._profiles[sel]  # type: ignore[attr-defined]
+    session.ensure_profile_registered = lambda sel: session._profiles[sel]  # type: ignore[attr-defined]
     from saklas.core.session import SaklasSession
 
     out = SaklasSession.jspace_decompose(session, name, k=4)  # type: ignore[arg-type]

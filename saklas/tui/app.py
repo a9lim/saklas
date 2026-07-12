@@ -329,9 +329,8 @@ class SaklasApp(App[None]):
     # The steering/probe extraction state + handlers and the input-history
     # ring + pending queue live on two plain controllers composed onto this
     # App.  ``__init__`` wires them; the ``__new__``-bypassing test stubs (and
-    # any caller) get one built on first touch via these factories — the same
-    # lazy pattern ``SaklasSession._get_steering_composer`` uses — so the proxy
-    # properties below resolve before a full ``__init__`` has run.  Imported
+    # any caller) get one built on first touch via these factories, so the proxy
+    # properties below resolve before a full ``__init__`` has run. Imported
     # lazily to break the import cycle (both controllers reference this module).
 
     def _get_extraction_controller(self) -> "ExtractionController":

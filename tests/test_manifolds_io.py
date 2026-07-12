@@ -36,6 +36,7 @@ from saklas.io.manifolds import (
     transfer_manifold,
     update_manifold_folder,
 )
+from saklas.io.paths import safe_model_id, tensor_filename
 
 
 def _alignment(dense: torch.Tensor) -> LayerAlignment:
@@ -1681,7 +1682,7 @@ def test_clear_manifold_tensors_variant_filter(
     n = clear_manifold_tensors("local", "mood", variant="raw")
     assert n == 2
     remaining = sorted(p.name for p in folder.glob("*.safetensors"))
-    assert remaining == ["google__gemma-3-4b-it_sae-gemma-scope.safetensors"]
+    assert remaining == [tensor_filename("google/gemma-3-4b-it", release="gemma-scope")]
 
 
 def test_clear_manifold_tensors_model_scope(
@@ -1700,10 +1701,10 @@ def test_clear_manifold_tensors_model_scope(
     n = clear_manifold_tensors("local", "mood", "google/gemma-3-4b-it")
     assert n == 2
     remaining = sorted(p.name for p in folder.glob("*.safetensors"))
-    assert remaining == ["Qwen__Qwen3-4B.safetensors"]
+    assert remaining == [tensor_filename("Qwen/Qwen3-4B")]
     # The integrity manifest still references the surviving model's tensor.
     mf = ManifoldFolder.load(folder)
-    assert "Qwen__Qwen3-4B.safetensors" in mf.files
+    assert tensor_filename("Qwen/Qwen3-4B") in mf.files
 
 
 def test_clear_manifold_tensors_missing_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -1868,7 +1869,7 @@ def test_refresh_manifold_model_scope_clears_fit_no_repull(
     assert refresh_manifold("alice", "mood", model_scope="google/gemma-3-4b-it") == "scoped"
     # Only gemma's fit pair is gone; Qwen's survives.
     remaining = sorted(p.name for p in folder.glob("*.safetensors"))
-    assert remaining == ["Qwen__Qwen3-4B.safetensors"]
+    assert remaining == [tensor_filename("Qwen/Qwen3-4B")]
 
 
 def test_refresh_manifold_missing_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -2430,7 +2431,6 @@ def test_transfer_manifold_identity_alignment_preserves_geometry(
     # Filename uses the transfer variant suffix.
     from saklas.io.paths import tensor_filename
     assert out.name == tensor_filename(tgt_model, transferred_from=src_model)
-    assert out.name == "Qwen__Qwen2.5-7B-Instruct_from-google__gemma-3-4b-it.safetensors"
 
     tgt_man = load_manifold(out)
     assert sorted(tgt_man.layers) == sorted(src_man.layers)
@@ -2754,8 +2754,9 @@ def test_manifold_summary_authored(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     assert len(summ["node_coords"]) == 3
     assert summ["node_roles"] == [None, None, None]
     assert summ["hyperparams"] == {}
-    assert summ["fitted_models"] == ["google__gemma-3-4b-it"]
-    assert summ["tensor_variants"]["google__gemma-3-4b-it"] == ["raw"]
+    gemma_safe = safe_model_id("google/gemma-3-4b-it")
+    assert summ["fitted_models"] == [gemma_safe]
+    assert summ["tensor_variants"][gemma_safe] == ["raw"]
 
 
 def test_manifold_summary_discover_unfitted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -2803,9 +2804,10 @@ def test_manifold_summary_reports_transfer_variant(
         whitener=_target_whitener(),
     )
     summ = manifold_summary(folder)
-    assert "src__m" in summ["tensor_variants"]
-    assert summ["tensor_variants"]["src__m"] == ["raw"]
-    assert summ["tensor_variants"]["tgt__m"] == ["from-src__m"]
+    src_safe = safe_model_id("src/m")
+    tgt_safe = safe_model_id("tgt/m")
+    assert summ["tensor_variants"][src_safe] == ["raw"]
+    assert summ["tensor_variants"][tgt_safe] == [f"from-{src_safe.lower()}"]
 
 
 
@@ -3311,9 +3313,8 @@ def test_baked_publication_hashes_each_new_file_once(
         model_fingerprint="fp:test/model",
     )
 
-    assert [path.name for path in hashed] == [
-        "test__model.safetensors", "test__model.json",
-    ]
+    tensor = tensor_filename("test/model")
+    assert [path.name for path in hashed] == [tensor, Path(tensor).with_suffix(".json").name]
 
 
 def test_baked_first_publication_retry_repairs_unproven_pair(
@@ -3343,7 +3344,7 @@ def test_baked_first_publication_retry_repairs_unproven_pair(
         method="merge", model_fingerprint="fp:test/model",
     )
     loaded = ManifoldFolder.load(folder)
-    assert loaded.tensor_models() == ["test__model"]
+    assert loaded.tensor_models() == [safe_model_id("test/model")]
 
 
 def test_baked_force_replaces_manifestless_partial_folder(
@@ -3369,7 +3370,7 @@ def test_baked_force_replaces_manifestless_partial_folder(
         method="merge", model_fingerprint="fp:test/model", force=True,
     )
     assert not (created / "stale.safetensors").exists()
-    assert ManifoldFolder.load(created).tensor_models() == ["test__model"]
+    assert ManifoldFolder.load(created).tensor_models() == [safe_model_id("test/model")]
 
 
 def test_baked_manifold_clear_and_scoped_refresh_refused(

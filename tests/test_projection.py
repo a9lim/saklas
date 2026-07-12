@@ -23,6 +23,7 @@ from saklas.core.mahalanobis import WhitenerError
 from saklas.core.session import (
     SaklasSession, VectorNotRegisteredError,
 )
+from saklas.core.steering_composer import SteeringComposer
 from saklas.core.steering_expr import parse_expr
 from saklas.core.triggers import Trigger
 from saklas.core.vectors import project_profile
@@ -186,7 +187,6 @@ class _Stub(SaklasSession):
     def __init__(self, profiles: dict[str, Any]) -> None:
         import threading
         self._profiles = dict(profiles)
-        self._steering_stack = []
         # v2.2: _push_steering / _pop_steering acquire _gen_lock and
         # consult _gen_phase + _internal_steering_pop.
         self._gen_lock = threading.RLock()
@@ -197,6 +197,7 @@ class _Stub(SaklasSession):
         self.events = EventBus()
         self._rebuild_calls: list[dict[str, Any]] = []
         self._rebuild_entries: list[dict[str, Any]] = []
+        self._steering_composer = SteeringComposer(self)
         # Build a covering whitener over the union of profile layers/dim so
         # the projection materializer → ``project_profile`` has its mandatory
         # whitener.  ``None`` when there are no profiles (degenerate stub).
@@ -213,7 +214,7 @@ class _Stub(SaklasSession):
         return self._stub_whitener
 
     def _rebuild_steering_hooks(self) -> None:
-        flat = self._get_steering_composer().flatten_steering_stack()
+        flat = self._steering_composer.flatten_stack()
         for name in flat:
             if name not in self._profiles:
                 raise VectorNotRegisteredError(f"No vector registered for '{name}'")

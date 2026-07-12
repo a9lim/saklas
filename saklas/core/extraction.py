@@ -388,14 +388,11 @@ def _row_shard_path(
 def _capture_shard_name_matches(
     filename: object, stem: str, kind: str, layer: int,
 ) -> bool:
-    """Whether a pointer names the legacy or immutable-generation shard."""
+    """Whether a pointer names a current immutable-generation shard."""
     if not isinstance(filename, str) or pathlib.Path(filename).name != filename:
         return False
     suffix = f".{kind}.layer_{int(layer)}.safetensors"
-    return (
-        filename == f"{stem}{suffix}"
-        or (filename.startswith(f"{stem}.gen-") and filename.endswith(suffix))
-    )
+    return filename.startswith(f"{stem}.gen-") and filename.endswith(suffix)
 
 
 def _capture_pending_path(
@@ -1568,7 +1565,7 @@ class ManifoldExtractionPipeline:
                     meta = json.load(handle)
                 format_version = int(meta.get("format_version", 0))
                 if format_version != _CAPTURE_CACHE_FORMAT_VERSION:
-                    raise ValueError("legacy capture cache needs v4 reshaping")
+                    raise ValueError("capture cache format mismatch")
                 if (
                     meta.get("capture_sha256") != capture_sha
                     or [int(size) for size in meta.get("node_sizes", [])] != node_sizes

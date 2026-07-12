@@ -21,6 +21,7 @@ from saklas.core.session import (
     ConcurrentExtractionError, SaklasSession, VectorNotRegisteredError,
 )
 from saklas.core.steering import Steering
+from saklas.core.steering_composer import SteeringComposer
 from saklas.core.triggers import Trigger
 
 
@@ -39,7 +40,6 @@ class _Stub(SaklasSession):
     def __init__(self, profiles: dict) -> None:  # pyright: ignore[reportMissingTypeArgument]  # bare dict; stub doesn't constrain key/value types
         import threading
         self._profiles = dict(profiles)
-        self._steering_stack = []
         # Reentrant gen lock — _push_steering / _pop_steering acquire it
         # so out-of-band steering scope mutations don't race a mid-step
         # rebuild during generation (v2.2 fix).  Stub mode never runs
@@ -69,9 +69,10 @@ class _Stub(SaklasSession):
         # SteeringStackEntry is tuple[float, Trigger] | AblationTerm | ManifoldTerm;
         # use Any so the append below accepts the full union without type errors.
         self._rebuild_entries: list[dict[str, Any]] = []
+        self._steering_composer = SteeringComposer(self)
 
     def _rebuild_steering_hooks(self) -> None:
-        flat = self._get_steering_composer().flatten_steering_stack()
+        flat = self._steering_composer.flatten_stack()
         for name in flat:
             if name not in self._profiles:
                 raise VectorNotRegisteredError(f"No vector registered for '{name}'")
@@ -97,8 +98,8 @@ def test_single_scope_push_pop():
     events = []
     s.events.subscribe(events.append)
     with s.steering("0.5 angry.calm"):
-        assert s._steering_stack == [{"angry.calm": (0.5, Trigger.BOTH)}]
-    assert s._steering_stack == []
+        assert s._steering_composer._stack == [{"angry.calm": (0.5, Trigger.BOTH)}]
+    assert s._steering_composer._stack == []
     assert len(s._rebuild_calls) == 2
     assert s._rebuild_calls[0] == {"angry.calm": 0.5}
     assert s._rebuild_calls[1] == {}
@@ -171,7 +172,7 @@ def test_unknown_vector_raises_on_enter():
             pass
     # _push_steering rolls its entry back on rebuild failure, so the stack
     # is empty after a failed __enter__ and no SteeringApplied event fired.
-    assert s._steering_stack == []
+    assert s._steering_composer._stack == []
 
     events = []
     s2 = _Stub({"known": None})
@@ -179,7 +180,7 @@ def test_unknown_vector_raises_on_enter():
     with pytest.raises(VectorNotRegisteredError):
         with s2.steering("0.5 unknown"):
             pass
-    assert s2._steering_stack == []
+    assert s2._steering_composer._stack == []
     assert events == []
 
 
@@ -190,9 +191,9 @@ def test_failed_enter_under_outer_scope_preserves_outer():
         with pytest.raises(VectorNotRegisteredError):
             with s.steering("0.5 unknown"):
                 pass
-        assert s._steering_stack == [{"a": (0.3, Trigger.BOTH)}]
+        assert s._steering_composer._stack == [{"a": (0.3, Trigger.BOTH)}]
         assert s._rebuild_calls[-1] == {"a": 0.3}
-    assert s._steering_stack == []
+    assert s._steering_composer._stack == []
 
 
 def test_events_reflect_flattened_head():
@@ -215,15 +216,15 @@ def test_steering_with_global_trigger_preserved_in_stack():
     """Steering(trigger=...) default flows through to the stack entries."""
     s = _Stub({"a": None})
     with s.steering(Steering(alphas={"a": 0.3}, trigger=Trigger.AFTER_THINKING)):
-        assert s._steering_stack == [{"a": (0.3, Trigger.AFTER_THINKING)}]
-    assert s._steering_stack == []
+        assert s._steering_composer._stack == [{"a": (0.3, Trigger.AFTER_THINKING)}]
+    assert s._steering_composer._stack == []
 
 
 def test_steering_per_entry_trigger_preserved_in_stack():
     """Expression ``@after`` syntax attaches a per-entry trigger."""
     s = _Stub({"a": None, "b": None})
     with s.steering("0.3 a + 0.4 b@thinking"):
-        entries = s._steering_stack[0]
+        entries = s._steering_composer._stack[0]
         assert entries["a"] == (0.3, Trigger.BOTH)
         assert entries["b"] == (0.4, Trigger.THINKING_ONLY)
 
@@ -285,12 +286,8 @@ def test_pole_alias_resolves_to_manifold_term_with_trigger(
     assert term.trigger == Trigger.AFTER_THINKING
 
 
-# NOTE: ``test_autoload_cache_hit_registers_bundled_vector`` was deleted in
-# 4.0 — ``session._try_autoload_vector`` (the ``vectors/``-pack safetensors
-# scan) was removed.  Profile resolution now goes through
-# ``_ensure_profile_registered`` (folds a fitted manifold, or ports a legacy
-# ``vectors/`` folder on first touch); the manifold-fold path is covered by
-# the session GPU smoke suite, not this model-free stub file.
+# Fitted-manifold profile registration is covered by the artifact tests; this
+# model-free file focuses on stack and context semantics.
 
 
 # ---------------------------------------------------------------------------
@@ -336,7 +333,7 @@ class TestRoleUnanimity:
             assert s._active_role == "pirate"
             # Stack landed both entries — no parser rejection on the
             # unanimous-role path.
-            entries = s._steering_stack[0]
+            entries = s._steering_composer._stack[0]
             assert "honest.deceptive:role-pirate" in entries
             assert "angry.calm:role-pirate" in entries
         # Restored to no-role on scope exit.

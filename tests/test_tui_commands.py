@@ -783,11 +783,10 @@ def test_handle_extract_explicit_sae_suffix_in_concept(monkeypatch: pytest.Monke
 
 def test_handle_extract_bare_sae_uses_autoload(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     """Option C ``--sae <concept>``: no fresh extract — the unified profile
-    resolver (``_ensure_profile_registered``, fold a fitted manifold) picks
+    resolver (``ensure_profile_registered``, fold a fitted manifold) picks
     the unique SAE variant already on disk.
 
-    (4.0: the TUI calls ``_ensure_profile_registered`` rather than the removed
-    ``_try_autoload_vector``.)
+    The TUI calls the session's public registration API.
     """
     import torch
     from saklas.io import selectors as _sel
@@ -801,7 +800,7 @@ def test_handle_extract_bare_sae_uses_autoload(monkeypatch: pytest.MonkeyPatch, 
         raise AssertionError("session.extract must not run for bare --sae")
     app._session.extract = _fail_extract
 
-    # _ensure_profile_registered populates _profiles[<concept>:sae].
+    # ensure_profile_registered populates profiles[<concept>:sae].
     def _ensure(key: Any, **kw: Any) -> Any:
         assert key == "honest:sae"
         app._session.profiles["honest:sae"] = {0: torch.zeros(4)}

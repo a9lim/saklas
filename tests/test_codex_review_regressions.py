@@ -81,9 +81,7 @@ def test_extract_releases_lock_on_path_through_phase_gate():
 # ``test_autoload_allow_stale_env_var_escape_hatch`` were deleted in 4.0.
 # ``SaklasSession._try_autoload_vector`` (the ``vectors/``-pack safetensors
 # scan that re-checked ``statements_sha256``) was removed; profile resolution
-# now folds a fitted manifold via ``_ensure_profile_registered`` (the legacy
-# ``vectors/`` folder is only *ported* to a manifold on first touch, then
-# re-fit — there is no stale-tensor autoload path left to guard).
+# now folds a fitted manifold through ``ensure_profile_registered``.
 
 
 # ---------------------------------------------------------------------------

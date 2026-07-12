@@ -32,6 +32,7 @@ from saklas.core.loom import (
     UnknownNodeError,
 )
 from saklas.core.session import SaklasSession
+from saklas.core.steering_composer import SteeringComposer
 from saklas.io.lens import (
     lens_checkpoint_paths,
     lens_paths,
@@ -117,6 +118,7 @@ class _StubSession:
         self._readout_long_tensor_cache: dict[Any, torch.Tensor] = {}
         self._monitor: Any = None
         self.model_id = _MODEL_ID
+        self._steering_composer = SteeringComposer(self)  # type: ignore[arg-type]
 
     @contextmanager
     def _model_exclusive(self, msg: str, *, phase_msg: str | None = None):

@@ -289,12 +289,14 @@ class TestAlignmentCache:
     _TGT_ID = {"model_fingerprint": "tgt", "capture_sha256": "b" * 64}
 
     def test_cache_path_layout(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from saklas.io.paths import safe_model_id
+
         monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
         ts, sc = alignment_cache_path("google/gemma-3-4b-it", "Qwen/Qwen2.5-7B-Instruct")
         # Layout: under the *target* model's dir.
-        assert "Qwen__Qwen2.5-7B-Instruct" in str(ts)
+        assert safe_model_id("Qwen/Qwen2.5-7B-Instruct") in str(ts)
         assert "alignments" in str(ts)
-        assert "google__gemma-3-4b-it" in str(ts)
+        assert safe_model_id("google/gemma-3-4b-it") in str(ts)
         assert ts.suffix == ".safetensors"
         assert sc.suffix == ".json"
 

@@ -247,6 +247,7 @@ def _capture_push_staging(monkeypatch: pytest.MonkeyPatch):
 
 def test_push_manifold_dry_run_stages_corpus_and_card(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     from saklas.io import hf_manifolds as hfm
+    from saklas.io.paths import sidecar_filename, tensor_filename
     folder = _author_fake_manifold(tmp_path, monkeypatch)
     staged = _capture_push_staging(monkeypatch)
 
@@ -258,8 +259,8 @@ def test_push_manifold_dry_run_stages_corpus_and_card(tmp_path: Path, monkeypatc
     assert "nodes/00_calm.json" in staged
     assert "nodes/01_uneasy.json" in staged
     # Fitted tensor + sidecar staged.
-    assert "google__gemma-2-2b-it.safetensors" in staged
-    assert "google__gemma-2-2b-it.json" in staged
+    assert tensor_filename("google/gemma-2-2b-it") in staged
+    assert sidecar_filename("google/gemma-2-2b-it") in staged
     # README + gitattributes written.
     assert ".gitattributes" in staged
     card = staged["README.md"].decode()
@@ -295,6 +296,7 @@ def test_push_manifold_uploads_once(tmp_path: Path, monkeypatch: pytest.MonkeyPa
 def test_push_manifold_model_scope_and_variant_filter(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     from saklas.io import hf_manifolds as hfm
     from saklas.io.manifolds import ManifoldFolder
+    from saklas.io.paths import tensor_filename
 
     folder = _author_fake_manifold(tmp_path, monkeypatch)
     # Add a second model's tensor + an SAE variant for the first model.
@@ -312,15 +314,15 @@ def test_push_manifold_model_scope_and_variant_filter(tmp_path: Path, monkeypatc
         model_scope="google/gemma-2-2b-it", variant="raw", dry_run=True,
     )
     tensors = sorted(k for k in staged if k.endswith(".safetensors"))
-    assert tensors == ["google__gemma-2-2b-it.safetensors"]
+    assert tensors == [tensor_filename("google/gemma-2-2b-it")]
     # Corpus still present despite the tensor filter.
     assert "manifold.json" in staged
     assert "nodes/00_calm.json" in staged
     # Staged manifest re-hashed to match the filtered file set.
     staged_manifest = json.loads(staged["manifold.json"])
-    assert "google__gemma-2-2b-it.safetensors" in staged_manifest["files"]
-    assert "meta__llama-3-8b.safetensors" not in staged_manifest["files"]
-    assert "google__gemma-2-2b-it_sae-gemma-scope.safetensors" not in staged_manifest["files"]
+    assert tensor_filename("google/gemma-2-2b-it") in staged_manifest["files"]
+    assert tensor_filename("meta/llama-3-8b") not in staged_manifest["files"]
+    assert tensor_filename("google/gemma-2-2b-it", release="gemma-scope") not in staged_manifest["files"]
 
 
 def test_push_manifold_corpus_only_when_unfitted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

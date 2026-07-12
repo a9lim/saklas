@@ -17,6 +17,7 @@ from saklas.core.events import EventBus
 from saklas.core.hooks import SteeringManager
 from saklas.core.session import SaklasSession, VectorNotRegisteredError
 from saklas.core.steering import Steering
+from saklas.core.steering_composer import SteeringComposer
 from saklas.core.steering_expr import AblationTerm
 from saklas.core.triggers import Trigger
 
@@ -48,7 +49,7 @@ def _skeleton_session() -> SaklasSession:
     session._profiles = {}
     session._layer_means = {}
     session._steering = SteeringManager()
-    session._steering_stack = []
+    session._steering_composer = SteeringComposer(session)
     # v2.2: _push_steering / _pop_steering acquire _gen_lock; skeleton
     # mode never runs gen so the lock is uncontended, but the ``with
     # self._gen_lock:`` block needs the attribute to exist.

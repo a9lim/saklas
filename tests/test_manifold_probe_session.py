@@ -81,7 +81,7 @@ def _stub_session() -> SaklasSession:
 
     Only the surface the unified-probe wiring touches needs to be real:
     ``_monitor`` (one :class:`Monitor`), ``_capture._per_layer``,
-    ``_manifolds``, ``_profiles``, ``_ensure_manifold_loaded``,
+    ``_manifolds``, ``_profiles``, ``ensure_manifold_loaded``,
     ``_invalidate_prefix_cache``, ``_probe_hash_cache``, ``_layers``.
     Everything else stays as ``MagicMock`` defaults.
     """
@@ -121,36 +121,33 @@ def _stub_session() -> SaklasSession:
 
     # Bind the real unified-probe methods we want to exercise.  ``add_probe``
     # rides ``_resolve_probe_manifold`` (which consults ``_profiles`` then
-    # ``_ensure_manifold_loaded`` → ``_manifolds``), so bind that too; tests
-    # stub ``_ensure_manifold_loaded`` to populate ``_manifolds`` in place.
+    # ``ensure_manifold_loaded`` → ``_manifolds``), so bind that too; tests
+    # stub the public loader to populate ``_manifolds`` in place.
     session.add_probe = types.MethodType(SaklasSession.add_probe, session)
     session.remove_probe = types.MethodType(SaklasSession.remove_probe, session)
     session._resolve_probe_manifold = types.MethodType(
         SaklasSession._resolve_probe_manifold, session,
     )
     # The steering collaborator owns the gating-score-callback builder; wire a
-    # real one (the MagicMock spec would otherwise auto-mock the lazy accessor).
+    # real one explicitly.
     from saklas.core.steering_composer import SteeringComposer
     session._steering_composer = SteeringComposer(session)
-    session._get_steering_composer = types.MethodType(
-        SaklasSession._get_steering_composer, session,
-    )
     return session
 
 
 # ==================================================== add / remove probe ===
 
 def test_add_probe_registers_via_ensure_loaded():
-    """``add_probe`` rides ``_ensure_manifold_loaded`` and lands the
+    """``add_probe`` rides ``ensure_manifold_loaded`` and lands the
     artifact on the unified ``Monitor``."""
     session = _stub_session()
     m = _toy_manifold()
 
-    # ``_ensure_manifold_loaded`` is the resolution path; stub it to
+    # ``ensure_manifold_loaded`` is the resolution path; stub it to
     # populate ``_manifolds`` instead of hitting disk.
     def _fake_ensure(key: str):
         session._manifolds[key] = m
-    session._ensure_manifold_loaded = _fake_ensure
+    session.ensure_manifold_loaded = _fake_ensure
 
     name = session.add_probe("toy")
     assert name == "toy"
@@ -160,7 +157,7 @@ def test_add_probe_registers_via_ensure_loaded():
 def test_add_probe_as_name_override():
     session = _stub_session()
     m = _toy_manifold()
-    session._ensure_manifold_loaded = lambda key: session._manifolds.update(
+    session.ensure_manifold_loaded = lambda key: session._manifolds.update(
         {key: m},
     )
 
@@ -172,7 +169,7 @@ def test_add_probe_as_name_override():
 def test_remove_probe():
     session = _stub_session()
     m = _toy_manifold()
-    session._ensure_manifold_loaded = lambda key: session._manifolds.update(
+    session.ensure_manifold_loaded = lambda key: session._manifolds.update(
         {key: m},
     )
 
@@ -184,7 +181,7 @@ def test_remove_probe():
 def test_add_probe_invalidates_prefix_cache():
     session = _stub_session()
     m = _toy_manifold()
-    session._ensure_manifold_loaded = lambda key: session._manifolds.update(
+    session.ensure_manifold_loaded = lambda key: session._manifolds.update(
         {key: m},
     )
     session._prefix_cache = ("dummy",)  # pyright: ignore[reportAttributeAccessIssue]  # test stub: wrong-shaped sentinel to verify invalidation
@@ -199,7 +196,7 @@ def test_begin_capture_widens_to_manifold_layers():
     of every attached probe's fit layers."""
     session = _stub_session()
     m = _toy_manifold(n_layers=3)
-    session._ensure_manifold_loaded = lambda key: session._manifolds.update(
+    session.ensure_manifold_loaded = lambda key: session._manifolds.update(
         {key: m},
     )
     session.add_probe("toy")
@@ -307,7 +304,7 @@ def test_gating_callback_emits_probe_scalars():
     the rank-1 case of the same readout)."""
     session = _stub_session()
     m = _toy_manifold()
-    session._ensure_manifold_loaded = lambda key: session._manifolds.update(
+    session.ensure_manifold_loaded = lambda key: session._manifolds.update(
         {key: m},
     )
     session.add_probe("toy")
@@ -344,7 +341,7 @@ def test_gating_callback_emits_probe_scalars():
 def test_gating_callback_empty_capture_returns_empty():
     session = _stub_session()
     m = _toy_manifold()
-    session._ensure_manifold_loaded = lambda key: session._manifolds.update(
+    session.ensure_manifold_loaded = lambda key: session._manifolds.update(
         {key: m},
     )
     session.add_probe("toy")
