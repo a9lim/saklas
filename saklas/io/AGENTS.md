@@ -48,13 +48,13 @@ Shared artifact primitives only — the pack format/distribution surface is gone
 What remains: `NAME_REGEX = ^[a-z][a-z0-9._-]{0,63}$` (manifolds reuse it),
 `hash_file` / `verify_integrity` (the sha256 integrity
 helpers behind the neutral/layer-means/alignment caches and the manifold integrity
-manifest), and `PROFILE_FORMAT_VERSION = 3`, stamped onto the exact profile
+manifest), and `PROFILE_FORMAT_VERSION = 4`, stamped onto the exact profile
 sidecars `profile.save_profile` writes.
 
 ## manifolds.py
 
 The on-disk format for every concept + steering manifold —
-`~/.saklas/manifolds/<ns>/<name>/`. `MANIFOLD_FORMAT_VERSION = 6` (decoupled from
+`~/.saklas/manifolds/<ns>/<name>/`. `MANIFOLD_FORMAT_VERSION = 7` (decoupled from
 the profile format); readers and writers require exactly v6.
 `min_nodes(n) = 2n+1`
 (the curved-fit poisedness floor). Five `fit_mode`s share the class, discriminated
@@ -217,7 +217,7 @@ source of truth; the corpus is its materialization. There is **no embedded
 The standalone templated-completion artifact — `~/.saklas/templates/<ns>/<name>/
 template.json`, peer to a manifold. `TemplateFolder` = `{name, slot, values,
 contexts:[TemplateContext{turns:[{role,content}], assistant}]}`,
-`TEMPLATE_FORMAT_VERSION = 1`. Invariant (`_validate_body` / `_validate_context`):
+`TEMPLATE_FORMAT_VERSION = 2`. Invariant (`_validate_body` / `_validate_context`):
 the slot appears **exactly once** in each context's final `assistant` string and in
 no history turn; the last history turn must be `user` (the slotted assistant turn
 follows it). Derived views: `node_labels()` (slugged values), `node_corpora()`
@@ -307,10 +307,8 @@ direction (`folded_vector_directions`) and writes a llama.cpp control-vector GGU
 HF distribution for manifolds (`saklas-manifold` tag, `repo_type="model"` —
 safetensors is hub-native, `base_model` frontmatter gives reverse-link
 discoverability). `pull_manifold` uses the shared `staging.stage_verify_swap` and
-**rejects** a repo with no `manifold.json` (the geometry can't be inferred from a
-bare tensor dump) — but `_port_legacy_pack_dir` first salvages a legacy
-`saklas-pack` repo (`pack.json` + `statements.json`) into a 2-node `pca` manifold
-on install, so old vector packs still install. `push_manifold(..., variant="raw")`
+**rejects** a repo with no `manifold.json` (the geometry cannot be inferred from a
+bare tensor dump). `push_manifold(..., variant="raw")`
 always uploads the corpus (a manifold can't re-fit without it) and filters tensors;
 the model card (`_render_manifold_card`) carries `library_name: saklas`,
 `saklas-manifold` tags, deduped `base_model:`, `base_model_relation: adapter`.
@@ -489,7 +487,7 @@ publication, and lifecycle removal across processes. Metadata-only
 final/checkpoint preflight rejects incompatible corpora/layers before matrix IO.
 `lens_paths` /
 `lens_checkpoint_paths` / `save_lens` / `save_lens_checkpoint_accumulator` /
-`save_lens_checkpoint` (compatibility) / `load_lens` /
+`load_lens` /
 `load_lens_checkpoint_sidecar` / `load_lens_checkpoint` /
 `promote_lens_checkpoint` / `remove_subsumed_lens_checkpoint` / `remove_lens`;
 the fit itself lives in `core/jlens.py`.

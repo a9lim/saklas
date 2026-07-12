@@ -428,7 +428,7 @@ def _toy_template() -> Any:
     from saklas.io.templates import TemplateFolder
 
     return TemplateFolder.from_payload({
-        "format_version": 1,
+        "format_version": 2,
         "name": "weekday",
         "slot": "<DAY>",
         "values": ["Monday", "Friday"],
@@ -442,6 +442,9 @@ def _toy_template() -> Any:
                 "assistant": "Today is <DAY>!",
             },
         ],
+        "description": "",
+        "source": "local",
+        "tags": [],
     })
 
 

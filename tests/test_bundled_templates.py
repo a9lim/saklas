@@ -25,13 +25,16 @@ from saklas.io.templates import (
 )
 
 _DEMO = {
-    "format_version": 1,
+    "format_version": 2,
     "name": "demo",
     "slot": "[X]",
     "values": ["alpha", "beta"],
     "contexts": [
         {"turns": [{"role": "user", "content": "pick one"}], "assistant": "[X]"},
     ],
+    "description": "",
+    "source": "bundled",
+    "tags": [],
 }
 
 

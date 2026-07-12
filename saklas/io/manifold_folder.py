@@ -259,20 +259,20 @@ def sanitize_hyperparams(
     return dict(hyperparams)
 
 
-# Current manifold artifact format. v6 adds an optional per-layer
+# Current manifold artifact format. v7 makes manifest defaults and per-node
+# provenance explicit, yielding one canonical payload shape. v6 added an optional per-layer
 # ``affine_map`` tensor for flat fitted
 # subspaces.  Ordinary fits omit it (identity); rectangular/non-isometric
 # cross-model transfers persist the exact authoring-to-orthonormal-reduced
 # reparameterization.  Old readers would otherwise ignore that tensor and
 # silently move manifold world points, so this is a real format boundary.
-MANIFOLD_FORMAT_VERSION = 6
+MANIFOLD_FORMAT_VERSION = 7
 
 
 def _validate_node_role(name: str, label: str, role: Any) -> str | None:
     """Validate an optional per-node ``role`` field.
 
-    ``None`` / missing means "use the standard assistant baseline" (the
-    legacy shape, same as today).  A non-empty string must match
+    ``None`` means "use the standard assistant baseline". A non-empty string must match
     :data:`saklas.core.role_templates._ROLE_SLUG_RE`
     (``[a-z0-9._-]+``).  Family-unsupported (Mistral-3) is *not*
     checked here — the folder is model-agnostic; the check fires when
@@ -294,7 +294,7 @@ _NODE_KINDS = ("abstract", "concrete", "custom")
 def _validate_node_kind(name: str, label: str, kind: Any) -> str | None:
     """Validate an optional per-node ``kind`` field.
 
-    ``None`` / missing means "unspecified".  A non-empty value must be one of
+    ``None`` means "unspecified". A non-empty value must be one of
     :data:`_NODE_KINDS` (``"abstract"`` / ``"concrete"`` / ``"custom"``).
     Generation-time provenance only — it selects the system template and
     elicitation role label when authoring a node's conversational corpus
@@ -441,7 +441,7 @@ class ManifoldSidecar:
     # Per-node assistant-role substitution used at fit time, in
     # ``node_labels`` index order.  ``None`` for a given node (and an
     # empty list as a whole) = "standard assistant baseline" — the
-    # default, byte-identical to today's non-role manifolds.  The same
+    # default. The same
     # information rides ``ManifoldFolder.node_roles`` but the sidecar
     # carries an independent copy so a downstream consumer
     # (``manifold show``, the webui inspector) doesn't have to
@@ -622,23 +622,20 @@ class ManifoldFolder:
     # Per-node assistant-role substitution for role-augmented manifolds
     # (e.g. a persona manifold where each node is a persona).  Aligned
     # with ``node_labels`` index-by-index.  ``None`` for a given node =
-    # "use the standard assistant baseline" (the legacy shape, what every
-    # pre-role-differential manifold carries).  An all-``None`` list is
-    # semantically identical to today's behavior — the centroid pooling
+    # "use the standard assistant baseline". An all-``None`` list keeps the
+    # ordinary behavior — the centroid pooling
     # just goes through the default chat-template branch.
     node_roles: list[str | None] = field(default_factory=list)
     # Per-node conceptual ``kind`` — ``"abstract"`` (trait) or ``"concrete"``
     # (entity), aligned with ``node_labels`` index-by-index.  ``None`` =
     # unspecified.  Generation-time only (system template + elicitation role
-    # label); never consumed by the fit.  An all-``None`` list is byte-identical
-    # to a folder authored before the distinction existed.
+    # label); never consumed by the fit.
     node_kinds: list[str | None] = field(default_factory=list)
     # Category tags, mirroring :attr:`saklas.io.packs.PackMetadata.tags`.
     # Carried so category-grouped probe bootstrap
     # (``load_default_manifolds`` -> ``_bootstrap_manifold_probes``) keeps
     # working once a steering vector lives as a 2-node ``pca`` manifold.
-    # Optional/additive — the
-    # loader defaults ``[]``; a tagless manifold stays byte-identical.
+    # Always explicit in the manifest; empty means uncategorized.
     tags: list[str] = field(default_factory=list)
     # Reference to a standalone template artifact
     # (``saklas.io.templates.TemplateFolder``, ``<ns>/<name>`` or bare name).
@@ -648,8 +645,7 @@ class ManifoldFolder:
     # the fit can resolve the template's **multi-turn contexts** as the
     # per-manifold elicitation prefixes (the template analogue of the shared
     # baseline prompts). The template is the single authoring source; the corpus
-    # is its materialization. ``None`` for every non-templated manifold, which
-    # keeps the manifest byte-identical to the pre-template shape. The resolved
+    # is its materialization. ``None`` marks every non-templated manifold. The resolved
     # template's content hash folds into ``nodes_sha256`` (a context edit re-fits)
     # and the ref is preserved across re-fits by ``write_metadata``.
     template_ref: str | None = None
@@ -729,15 +725,16 @@ class ManifoldFolder:
                 f"manifold {name!r} has unknown field(s): {sorted(unknown)}"
             )
         for key, expected in (
-            ("description", str), ("files", dict),
+            ("description", str), ("files", dict), ("source", str),
+            ("tags", list),
         ):
             if not isinstance(data.get(key), expected):
                 raise ManifoldFormatError(
                     f"manifold {name!r} field {key!r} must be {expected.__name__}"
                 )
-        if "source" in data and not isinstance(data["source"], str):
+        if not data["source"]:
             raise ManifoldFormatError(
-                f"manifold {name!r} field 'source' must be str"
+                f"manifold {name!r} field 'source' must be non-empty"
             )
         if "artifact_id" in data and (
             not isinstance(data["artifact_id"], str) or not data["artifact_id"]
@@ -789,11 +786,11 @@ class ManifoldFolder:
                         f"manifold {name!r} node {entry!r} must be an "
                         f"object with 'label' and 'coords'"
                     )
-                unknown_node = set(entry) - {"label", "coords", "role", "kind"}
-                if unknown_node:
+                expected_node = {"label", "coords", "role", "kind"}
+                if set(entry) != expected_node:
                     raise ManifoldFormatError(
-                        f"manifold {name!r} node has unknown field(s): "
-                        f"{sorted(unknown_node)}"
+                        f"manifold {name!r} node fields must be "
+                        f"{sorted(expected_node)}"
                     )
                 label = entry.get("label")
                 if not isinstance(label, str) or not _LABEL_REGEX.match(label):
@@ -845,11 +842,11 @@ class ManifoldFolder:
                         f"baked manifold {name!r} node {entry!r} must be an "
                         f"object with 'label'"
                     )
-                unknown_node = set(entry) - {"label", "role", "kind"}
-                if unknown_node:
+                expected_node = {"label", "role", "kind"}
+                if set(entry) != expected_node:
                     raise ManifoldFormatError(
-                        f"baked manifold {name!r} node has unknown field(s): "
-                        f"{sorted(unknown_node)}"
+                        f"baked manifold {name!r} node fields must be "
+                        f"{sorted(expected_node)}"
                     )
                 label = entry.get("label")
                 if not isinstance(label, str) or not _LABEL_REGEX.match(label):
@@ -891,11 +888,11 @@ class ManifoldFolder:
                         f"discover manifold {name!r} node {entry!r} must "
                         f"be an object with 'label'"
                     )
-                unknown_node = set(entry) - {"label", "role", "kind"}
-                if unknown_node:
+                expected_node = {"label", "role", "kind"}
+                if set(entry) != expected_node:
                     raise ManifoldFormatError(
-                        f"discover manifold {name!r} node has unknown field(s): "
-                        f"{sorted(unknown_node)}"
+                        f"discover manifold {name!r} node fields must be "
+                        f"{sorted(expected_node)}"
                     )
                 label = entry.get("label")
                 if not isinstance(label, str) or not _LABEL_REGEX.match(label):
@@ -936,7 +933,7 @@ class ManifoldFolder:
                     f"tampered/missing {bad}"
                 )
 
-        raw_tags = data.get("tags", [])
+        raw_tags = data["tags"]
         if not isinstance(raw_tags, list) or not all(
             isinstance(t, str) for t in raw_tags
         ):
@@ -949,7 +946,11 @@ class ManifoldFolder:
         # authoring time and live in ``nodes/`` like any discover folder; this
         # ref lets the fit resolve the template's multi-turn contexts as the
         # elicitation prefixes. Only discover folders may carry it.
-        raw_template_ref = data.get("template_ref")
+        if "template_ref" not in data:
+            raise ManifoldFormatError(
+                f"manifold {name!r} needs explicit 'template_ref'"
+            )
+        raw_template_ref = data["template_ref"]
         template_ref: str | None = None
         if raw_template_ref is not None:
             if not isinstance(raw_template_ref, str) or not raw_template_ref:
@@ -974,7 +975,7 @@ class ManifoldFolder:
             files=files,
             fit_mode=fit_mode,
             hyperparams=hyperparams,
-            source=str(data.get("source", "local")),
+            source=data["source"],
             node_roles=node_roles,
             node_kinds=node_kinds,
             tags=[str(t) for t in raw_tags],
@@ -1062,8 +1063,7 @@ class ManifoldFolder:
         ``k_nn``, ``bandwidth`` for spectral) — changing any of those
         invalidates a cached fit.
 
-        The field name is unchanged for backward compat with v3
-        sidecars; the semantics naturally extends in the discover case.
+        The current hash covers the complete canonical fit input shape.
         """
         h = hashlib.sha256()
         if self.fit_mode == "baked":
@@ -1093,16 +1093,11 @@ class ManifoldFolder:
         # Per-node roles are inputs that determine the fit's geometry
         # (each node's centroid is pooled under its role's chat-template
         # substitution), so a role edit must invalidate a cached fit.
-        # All-``None`` (legacy / non-role) hashes to the same value
-        # whether the field is missing or explicit-None — same shape.
-        if any(r is not None for r in self.node_roles):
-            h.update(_canonical_json(self.node_roles))
+        h.update(_canonical_json(self.node_roles))
         # Per-node kind selects the generation system template + elicitation
         # role label, so it shapes the corpus a re-fit would pool — a kind edit
-        # must invalidate a cached fit.  All-``None`` hashes identically to a
-        # missing field (same legacy shape).
-        if any(k is not None for k in self.node_kinds):
-            h.update(_canonical_json(self.node_kinds))
+        # must invalidate a cached fit.
+        h.update(_canonical_json(self.node_kinds))
         # A templated manifold's elicitation prefixes are the referenced
         # template's multi-turn contexts (a fit input that the node corpus files
         # above don't capture — they're only the slotted assistant turns), so a
@@ -1184,33 +1179,13 @@ class ManifoldFolder:
                 "description": self.description,
                 "fit_mode": self.fit_mode,
                 "files": files,
+                "source": self.source or "local",
+                "tags": list(self.tags),
+                "template_ref": self.template_ref,
             }
             for key in ("artifact_id", "fit_epochs"):
                 if key in latest_payload:
                     payload[key] = latest_payload[key]
-        # Preserve provenance across re-fits, mirroring how a pack's
-        # ``source`` survives ``PackMetadata.write``.  Only the default
-        # ``"local"`` is omitted, so a hand-authored / generated folder
-        # stays byte-identical to the pre-source shape; an ``hf://`` or
-        # ``bundled`` tier is written so ``refresh_manifold`` can find it
-        # after a fit has rewritten the manifest.
-            if self.source and self.source != "local":
-                payload["source"] = self.source
-        # Category tags survive re-fit, written only when non-empty so a
-        # tagless manifold stays byte-identical to the pre-tags shape.
-            if self.tags:
-                payload["tags"] = list(self.tags)
-        # The template reference is fit-time provenance (its multi-turn contexts
-        # are the elicitation prefixes), so it must survive the post-fit manifest
-        # rewrite — written only when set, keeping non-templated manifests
-        # byte-identical.
-            if self.template_ref is not None:
-                payload["template_ref"] = self.template_ref
-        # Per-node ``role`` is written only when set — keeps the legacy
-        # shape (every node carries ``{label, coords}`` or ``{label}``
-        # only) byte-identical for non-role manifolds, and a stray
-        # ``role: null`` doesn't leak into the manifest for a node that
-        # opted out.
             if self.fit_mode == "authored":
                 payload["domain"] = self.domain
                 payload["nodes"] = [
@@ -1320,27 +1295,19 @@ def _node_payload_authored(
 ) -> dict[str, Any]:
     """Build one authored-mode node entry for ``manifold.json``.
 
-    ``role`` / ``kind`` are emitted only when set, so the legacy
-    ``{label, coords}`` shape stays byte-identical for plain manifolds.
+    ``role`` and ``kind`` are explicit, including ``None``.
     """
-    out: dict[str, Any] = {"label": label, "coords": [float(c) for c in coords]}
-    if role is not None:
-        out["role"] = role
-    if kind is not None:
-        out["kind"] = kind
-    return out
+    return {
+        "label": label, "coords": [float(c) for c in coords],
+        "role": role, "kind": kind,
+    }
 
 
 def _node_payload_discover(
     label: str, role: str | None, kind: str | None = None,
 ) -> dict[str, Any]:
     """Build one discover-mode node entry for ``manifold.json``."""
-    out: dict[str, Any] = {"label": label}
-    if role is not None:
-        out["role"] = role
-    if kind is not None:
-        out["kind"] = kind
-    return out
+    return {"label": label, "role": role, "kind": kind}
 
 
 def _warn_authoring_quality(

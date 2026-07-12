@@ -2,11 +2,10 @@
 
 The read-side counterpart to :mod:`saklas.io.hf`.  Manifold-folder
 artifacts (``manifold.json`` + ``nodes/*.json`` + per-model fitted
-``<safe_model>.safetensors``) ride the same HF *model*-repo convention
-packs do — safetensors is model-hub-native and ``base_model``
+``<safe_model>.safetensors``) ride an HF *model*-repo convention — safetensors is
+model-hub-native and ``base_model``
 frontmatter gives reverse-link discoverability.  The tagging convention
-diverges: a manifold repo carries ``saklas-manifold`` (parallel to
-``saklas-pack``) so the search query is unambiguous.
+uses the ``saklas-manifold`` tag so the search query is unambiguous.
 
 This module owns the pure-IO HF surface (pull + search + fetch_info).
 The folder format itself lives in :mod:`saklas.io.manifolds`; the

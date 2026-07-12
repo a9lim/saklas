@@ -307,15 +307,22 @@ def test_sae_runtime_metadata_roundtrip(
     from saklas.io.sae import load_sae_metadata, save_sae_metadata
 
     path = save_sae_metadata("org/model", "release/name", {
-        "layer": 14, "width": 16_384,
+        "layer": 14, "width": 16_384, "revision": "main",
+        "fingerprint": "abc", "sae_id": "layer_14", "repo_id": "org/sae",
+        "neuronpedia_id": None,
     })
     assert path.exists()
     assert load_sae_metadata("org/model", "release/name") == {
-        "format_version": 2,
+        "format_version": 3,
         "model_id": "org/model",
         "release": "release/name",
         "layer": 14,
         "width": 16_384,
+        "revision": "main",
+        "fingerprint": "abc",
+        "sae_id": "layer_14",
+        "repo_id": "org/sae",
+        "neuronpedia_id": None,
     }
 
 

@@ -169,10 +169,13 @@ def _author_manifold(
         "fit_mode": "authored",
         "domain": domain,
         "nodes": [
-            {"label": label, "coords": coords[i]}
+            {"label": label, "coords": coords[i], "role": None, "kind": None}
             for i, label in enumerate(labels)
         ],
         "files": {},
+        "source": "local",
+        "tags": [],
+        "template_ref": None,
     }))
     return folder
 
@@ -2135,8 +2138,14 @@ def _discover_folder(
         "description": f"discover-{fit_mode}",
         "fit_mode": fit_mode,
         "hyperparams": hyperparams or {},
-        "nodes": [{"label": label} for label in labels],
+        "nodes": [
+            {"label": label, "role": None, "kind": None}
+            for label in labels
+        ],
         "files": {},
+        "source": "local",
+        "tags": [],
+        "template_ref": None,
     }))
     return folder
 

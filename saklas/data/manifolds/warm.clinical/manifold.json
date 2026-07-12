@@ -1,5 +1,5 @@
 {
-  "format_version": 6,
+  "format_version": 7,
   "name": "warm.clinical",
   "description": "Bipolar axis: warm (+) vs clinical (-). Steer with negative alpha for the opposite pole.",
   "fit_mode": "pca",
@@ -10,15 +10,19 @@
   "nodes": [
     {
       "label": "warm",
-      "kind": "abstract"
+      "kind": "abstract",
+      "role": null
     },
     {
       "label": "clinical",
-      "kind": "abstract"
+      "kind": "abstract",
+      "role": null
     }
   ],
   "files": {},
   "tags": [
     "register"
-  ]
+  ],
+  "source": "bundled",
+  "template_ref": null
 }

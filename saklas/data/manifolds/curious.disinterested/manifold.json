@@ -1,5 +1,5 @@
 {
-  "format_version": 6,
+  "format_version": 7,
   "name": "curious.disinterested",
   "description": "Bipolar axis: curious (+) vs disinterested (-). Steer with negative alpha for the opposite pole.",
   "fit_mode": "pca",
@@ -10,15 +10,19 @@
   "nodes": [
     {
       "label": "curious",
-      "kind": "abstract"
+      "kind": "abstract",
+      "role": null
     },
     {
       "label": "disinterested",
-      "kind": "abstract"
+      "kind": "abstract",
+      "role": null
     }
   ],
   "files": {},
   "tags": [
     "epistemic"
-  ]
+  ],
+  "source": "bundled",
+  "template_ref": null
 }

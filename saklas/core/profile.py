@@ -1,7 +1,7 @@
 """Profile: the ergonomic wrapper around a baked steering-vector dict.
 
-Wire format stays identical to what :mod:`saklas.vectors` writes today —
-a safetensors file with one tensor per active layer plus a slim JSON
+The native wire format is a safetensors file with one fp32 vector per active
+layer plus an exact-version JSON
 sidecar (safetensors path) or a llama.cpp control-vector GGUF (gguf path).
 This class is purely the Python-level surface the rest of saklas uses so
 that callers stop passing bare ``dict[int, Tensor]`` around.
@@ -20,6 +20,7 @@ import json
 import logging
 import math
 import pathlib
+import re
 from typing import Any, Iterable, Iterator, Literal, Mapping, overload
 
 import torch
@@ -63,6 +64,15 @@ def save_profile(
     method = metadata.get("method")
     if not isinstance(method, str) or not method:
         raise ProfileError("profile metadata requires a non-empty 'method' string")
+    if not profile:
+        raise ProfileError("profile requires at least one layer tensor")
+    for layer, tensor in profile.items():
+        if isinstance(layer, bool) or not isinstance(layer, int) or layer < 0:
+            raise ProfileError(f"profile layer must be a non-negative int: {layer!r}")
+        if tensor.ndim != 1 or tensor.numel() == 0:
+            raise ProfileError(f"profile layer {layer} must be a non-empty rank-1 tensor")
+        if not bool(torch.isfinite(tensor).all().item()):
+            raise ProfileError(f"profile layer {layer} must contain only finite values")
 
     path = pathlib.Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -163,8 +173,57 @@ def load_profile(path: str | pathlib.Path) -> tuple[dict[int, torch.Tensor], dic
         raise ProfileError(
             f"profile sidecar {meta_path} requires a non-empty 'method' string"
         )
+    allowed = {
+        "format_version", "method", "saklas_version", "statements_sha256",
+        "components", "bake", "sae_release", "sae_revision",
+        "sae_ids_by_layer", "source_model_id", "alignment_map_hash",
+        "transfer_quality_estimate", "diagnostics_by_layer",
+    }
+    unknown = set(metadata) - allowed
+    if unknown:
+        raise ProfileError(
+            f"profile sidecar {meta_path} has unknown field(s): {sorted(unknown)}"
+        )
+    if not isinstance(metadata.get("saklas_version"), str) or not metadata["saklas_version"]:
+        raise ProfileError(
+            f"profile sidecar {meta_path} requires a non-empty 'saklas_version'"
+        )
 
-    profile = {int(key.split("_", 1)[1]): tensor for key, tensor in tensors.items()}
+    if not tensors:
+        raise ProfileError(f"profile tensor {path} has no layers")
+    profile: dict[int, torch.Tensor] = {}
+    for key, tensor in tensors.items():
+        if not re.fullmatch(r"layer_(0|[1-9][0-9]*)", key):
+            raise ProfileError(f"profile tensor {path} has invalid key {key!r}")
+        layer = int(key.removeprefix("layer_"))
+        if tensor.dtype != torch.float32 or tensor.ndim != 1 or tensor.numel() == 0:
+            raise ProfileError(
+                f"profile tensor {path} layer {layer} must be non-empty rank-1 fp32"
+            )
+        if not bool(torch.isfinite(tensor).all().item()):
+            raise ProfileError(f"profile tensor {path} layer {layer} is non-finite")
+        profile[layer] = tensor
+
+    string_fields = {
+        "statements_sha256", "bake", "sae_release", "sae_revision",
+        "source_model_id", "alignment_map_hash",
+    }
+    for key in string_fields & metadata.keys():
+        if not isinstance(metadata[key], str) or not metadata[key]:
+            raise ProfileError(f"profile sidecar {meta_path} field {key!r} must be str")
+    for key in {"components", "sae_ids_by_layer"} & metadata.keys():
+        if not isinstance(metadata[key], dict):
+            raise ProfileError(
+                f"profile sidecar {meta_path} field {key!r} must be an object"
+            )
+    if "transfer_quality_estimate" in metadata and (
+        isinstance(metadata["transfer_quality_estimate"], bool)
+        or not isinstance(metadata["transfer_quality_estimate"], (int, float))
+        or not math.isfinite(float(metadata["transfer_quality_estimate"]))
+    ):
+        raise ProfileError(
+            f"profile sidecar {meta_path} transfer_quality_estimate must be finite"
+        )
 
     # Invert the layer-key stringification done at save time so diagnostics
     # are addressable by ``int`` consistently with the profile dict.

@@ -102,16 +102,8 @@ def _apply_fit_overrides_locked(
     data["nodes"] = [
         {
             "label": label,
-            **(
-                {"role": mf.node_roles[idx]}
-                if idx < len(mf.node_roles) and mf.node_roles[idx] is not None
-                else {}
-            ),
-            **(
-                {"kind": mf.node_kinds[idx]}
-                if idx < len(mf.node_kinds) and mf.node_kinds[idx] is not None
-                else {}
-            ),
+            "role": mf.node_roles[idx],
+            "kind": mf.node_kinds[idx],
         }
         for idx, label in enumerate(mf.node_labels)
     ]

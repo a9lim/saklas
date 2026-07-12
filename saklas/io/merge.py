@@ -330,8 +330,9 @@ def _resumable_baked_merge(
         "fit_mode": payload.get("fit_mode"),
         "domain": payload.get("domain"),
         "nodes": payload.get("nodes"),
-        "tags": payload.get("tags", []),
-        "source": payload.get("source", "local"),
+        "tags": payload.get("tags"),
+        "source": payload.get("source"),
+        "template_ref": payload.get("template_ref"),
     }
     expected_identity = {
         "format_version": MANIFOLD_FORMAT_VERSION,
@@ -339,9 +340,13 @@ def _resumable_baked_merge(
         "description": description,
         "fit_mode": "baked",
         "domain": first_manifold.domain.to_spec(),
-        "nodes": [{"label": label} for label in first_manifold.node_labels],
+        "nodes": [
+            {"label": label, "role": None, "kind": None}
+            for label in first_manifold.node_labels
+        ],
         "tags": ["merge"],
         "source": "local",
+        "template_ref": None,
     }
     if identity != expected_identity:
         return False, set()
@@ -424,7 +429,7 @@ def _merge_into_manifold_locked(
     grammar, for example ``0.5 default/happy - 0.3 default/sad``.
 
     Each component resolves to a per-layer ``dict[int, Tensor]`` direction (a
-    fitted 2-node ``pca`` manifold folded down, or a legacy vector pack), the
+    fitted 2-node ``pca`` manifold folded down), the
     directions are linearly combined, and the result is folded to a one-pole
     ray (:func:`~saklas.core.vectors.fold_directions_to_subspace`) and frozen
     into the baked tensor.  Returns the manifold folder path.

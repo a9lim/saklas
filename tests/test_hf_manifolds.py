@@ -92,7 +92,7 @@ def test_fetch_manifold_info_box_domain(tmp_path: Path, monkeypatch: pytest.Monk
     from saklas.io.paths import safe_model_id, tensor_filename
 
     manifest = _write_manifest(tmp_path / "repo", {
-        "format_version": 6,
+        "format_version": MANIFOLD_FORMAT_VERSION,
         "name": "months",
         "description": "month ring",
         "fit_mode": "authored",
@@ -134,7 +134,7 @@ def test_fetch_manifold_info_sphere_and_custom_and_discover(
         ({"fit_mode": "pca"}, "discover-pca"),
     ]
     for i, (extra, expect) in enumerate(cases):
-        payload = {"format_version": 6, "name": f"m{i}", "nodes": []}
+        payload = {"format_version": MANIFOLD_FORMAT_VERSION, "name": f"m{i}", "nodes": []}
         payload.update(extra)
         manifest = _write_manifest(tmp_path / f"repo{i}", payload)
         monkeypatch.setattr(hfm, "_hf_hub_download", lambda c, fn, _m=manifest, **kw: str(_m))
@@ -191,7 +191,7 @@ def test_fetch_manifold_info_threads_revision(
 ):
     """A revision flows into both the download and the file-listing calls."""
     manifest = _write_manifest(tmp_path / "repo", {
-        "format_version": 6, "name": "m", "fit_mode": "pca", "nodes": [],
+        "format_version": MANIFOLD_FORMAT_VERSION, "name": "m", "fit_mode": "pca", "nodes": [],
     })
     api = _FakeApi(files=["manifold.json"])
     dl_kwargs: list[dict[str, Any]] = []
@@ -271,7 +271,7 @@ def test_search_manifolds_enriches_row_when_fields_missing(
     monkeypatch.setattr(hfm, "_hf_api", lambda: api)
 
     manifest = _write_manifest(tmp_path / "repo", {
-        "format_version": 6, "name": "months", "description": "the year",
+        "format_version": MANIFOLD_FORMAT_VERSION, "name": "months", "description": "the year",
         "fit_mode": "authored",
         "domain": {"type": "box", "axes": [
             {"name": "t", "periodic": True, "lo": 0.0, "hi": 12.0}]},

@@ -16,7 +16,11 @@ from typing import Any
 from saklas.io.atomic import write_json_atomic
 from saklas.io.paths import model_dir
 
-SAE_RUNTIME_FORMAT_VERSION = 2
+SAE_RUNTIME_FORMAT_VERSION = 3
+_RUNTIME_FIELDS = {
+    "layer", "width", "revision", "fingerprint", "sae_id", "repo_id",
+    "neuronpedia_id",
+}
 _UNSAFE = re.compile(r"[^a-z0-9._-]+")
 
 
@@ -38,14 +42,53 @@ def sae_features_path(model_id: str, release: str) -> Path:
 
 
 def save_sae_metadata(model_id: str, release: str, payload: dict[str, Any]) -> Path:
-    path = sae_metadata_path(model_id, release)
-    write_json_atomic(path, {
+    if set(payload) != _RUNTIME_FIELDS:
+        raise ValueError(
+            f"SAE runtime metadata fields must be {sorted(_RUNTIME_FIELDS)}"
+        )
+    if not _validate_runtime_payload({
+        **payload,
         "format_version": SAE_RUNTIME_FORMAT_VERSION,
         "model_id": model_id,
         "release": release,
+    }, model_id, release):
+        raise ValueError("invalid SAE runtime metadata values")
+    path = sae_metadata_path(model_id, release)
+    write_json_atomic(path, {
         **payload,
+        "format_version": SAE_RUNTIME_FORMAT_VERSION,
+        "model_id": model_id,
+        "release": release,
     })
     return path
+
+
+def _validate_runtime_payload(
+    payload: Any, model_id: str, release: str,
+) -> bool:
+    expected = {"format_version", "model_id", "release", *_RUNTIME_FIELDS}
+    if not isinstance(payload, dict) or set(payload) != expected:
+        return False
+    if (
+        payload["format_version"] != SAE_RUNTIME_FORMAT_VERSION
+        or payload["model_id"] != model_id
+        or payload["release"] != release
+        or isinstance(payload["layer"], bool)
+        or not isinstance(payload["layer"], int)
+        or payload["layer"] < 0
+        or isinstance(payload["width"], bool)
+        or not isinstance(payload["width"], int)
+        or payload["width"] <= 0
+        or not isinstance(payload["revision"], str)
+        or not payload["revision"]
+        or not isinstance(payload["fingerprint"], str)
+        or not payload["fingerprint"]
+    ):
+        return False
+    return all(
+        payload[key] is None or isinstance(payload[key], str)
+        for key in ("sae_id", "repo_id", "neuronpedia_id")
+    )
 
 
 def load_sae_metadata(model_id: str, release: str) -> dict[str, Any] | None:
@@ -58,12 +101,7 @@ def load_sae_metadata(model_id: str, release: str) -> dict[str, Any] | None:
         payload = json.loads(path.read_text())
     except (OSError, ValueError):
         return None
-    if (
-        not isinstance(payload, dict)
-        or payload.get("format_version") != SAE_RUNTIME_FORMAT_VERSION
-        or payload.get("model_id") != model_id
-        or payload.get("release") != release
-    ):
+    if not _validate_runtime_payload(payload, model_id, release):
         return None
     return payload
 

@@ -79,7 +79,7 @@ def _author_manifold(
     domain: dict[str, Any] | None = None,
     nodes: list[dict[str, Any]] | None = None,
 ) -> Path:
-    """Hand-author a v3 manifold folder; return its path."""
+    """Hand-author an exact current manifold folder; return its path."""
     if labels is None:
         labels = ["calm", "uneasy", "afraid", "frantic"]
     folder = root / name
@@ -89,6 +89,9 @@ def _author_manifold(
         spec["domain"] = domain
     if nodes is not None:
         spec["nodes"] = nodes
+    for node in spec["nodes"]:
+        node.setdefault("role", None)
+        node.setdefault("kind", None)
     for idx, node in enumerate(spec["nodes"]):
         statements = [f"{node['label']} statement {i}" for i in range(3)]
         (folder / "nodes" / f"{idx:02d}_{node['label']}.json").write_text(
@@ -102,6 +105,9 @@ def _author_manifold(
         "domain": spec["domain"],
         "nodes": spec["nodes"],
         "files": files if files is not None else {},
+        "source": "local",
+        "tags": [],
+        "template_ref": None,
     }
     (folder / "manifold.json").write_text(json.dumps(meta))
     return folder
@@ -864,7 +870,7 @@ def test_manifest_and_nodes_reject_unknown_fields(tmp_path: Path) -> None:
     del manifest["legacy_vectors"]
     manifest["nodes"][0]["statements"] = ["inline legacy corpus"]
     (folder / "manifold.json").write_text(json.dumps(manifest))
-    with pytest.raises(ManifoldFormatError, match="unknown field"):
+    with pytest.raises(ManifoldFormatError, match="fields must be"):
         ManifoldFolder.load(folder)
 
 
@@ -992,10 +998,11 @@ def test_discover_manifold_rejects_coords_on_nodes(tmp_path: Path):
         "description": "",
         "fit_mode": "pca",
         "hyperparams": {"max_dim": 4},
-        "nodes": [{"label": "a", "coords": [0.5]}],
+        "nodes": [{"label": "a", "coords": [0.5], "role": None, "kind": None}],
         "files": {},
+        "source": "local", "tags": [], "template_ref": None,
     }))
-    with pytest.raises(ManifoldFormatError, match="unknown field"):
+    with pytest.raises(ManifoldFormatError, match="fields must be"):
         ManifoldFolder.load(folder)
 
 
@@ -1993,7 +2000,7 @@ def test_force_authoring_reset_waits_for_stable_pair_lock(
     assert done.is_set()
     assert not fitted.exists()
     manifest = json.loads((folder / "manifold.json").read_text())
-    assert manifest["nodes"] == [{"label": "new"}]
+    assert manifest["nodes"] == [{"label": "new", "role": None, "kind": None}]
 
 
 # ============================================================ B6a: transfer ===
@@ -3024,7 +3031,7 @@ def test_plan_partial_rejected_by_load_but_resumable(tmp_path: Path):
         (lambda data: data.update({"legacy": True}), "unknown field"),
         (lambda data: data.pop("format_version"), "need exactly"),
         (lambda data: data.update({"name": "other"}), "not 'm'"),
-        (lambda data: data["nodes"][0].update({"coords": [0.0]}), "unknown field"),
+        (lambda data: data["nodes"][0].update({"coords": [0.0]}), "fields must be"),
     ],
 )
 def test_plan_resume_requires_exact_partial_manifest(
@@ -3116,8 +3123,12 @@ def test_bundled_refresh_ignores_local_fit_proofs(
         "description": "",
         "fit_mode": "pca",
         "hyperparams": {},
-        "nodes": [{"label": "pos"}, {"label": "neg"}],
+        "nodes": [
+            {"label": "pos", "role": None, "kind": None},
+            {"label": "neg", "role": None, "kind": None},
+        ],
         "files": {},
+        "source": "bundled", "tags": [], "template_ref": None,
     }
     (pkg / "manifold.json").write_text(json.dumps(bundled_manifest))
     (pkg / "nodes" / "00_pos.json").write_text('["a"]')
@@ -3412,11 +3423,12 @@ def test_baked_manifold_rejects_coords_on_node(tmp_path: Path):
         "description": "",
         "fit_mode": "baked",
         "domain": {"type": "custom", "embed_dim": 1},
-        "nodes": [{"label": "merged", "coords": [1.0]}],
+        "nodes": [{"label": "merged", "coords": [1.0], "role": None, "kind": None}],
         "files": {},
+        "source": "local", "tags": [], "template_ref": None,
     }
     (folder / "manifold.json").write_text(json.dumps(payload))
-    with pytest.raises(ManifoldFormatError, match="unknown field"):
+    with pytest.raises(ManifoldFormatError, match="fields must be"):
         ManifoldFolder.load(folder)
 
 
@@ -3430,8 +3442,9 @@ def test_baked_manifold_requires_tensor(tmp_path: Path):
         "description": "",
         "fit_mode": "baked",
         "domain": {"type": "custom", "embed_dim": 1},
-        "nodes": [{"label": "merged"}],
+        "nodes": [{"label": "merged", "role": None, "kind": None}],
         "files": {},
+        "source": "local", "tags": [], "template_ref": None,
     }
     (folder / "manifold.json").write_text(json.dumps(payload))
     with pytest.raises(ManifoldFormatError, match="no fitted tensor"):
@@ -3446,8 +3459,9 @@ def test_baked_manifold_requires_domain(tmp_path: Path):
         "name": "merged",
         "description": "",
         "fit_mode": "baked",
-        "nodes": [{"label": "merged"}],
+        "nodes": [{"label": "merged", "role": None, "kind": None}],
         "files": {},
+        "source": "local", "tags": [], "template_ref": None,
     }
     (folder / "manifold.json").write_text(json.dumps(payload))
     with pytest.raises(ManifoldFormatError, match="needs a 'domain'"):

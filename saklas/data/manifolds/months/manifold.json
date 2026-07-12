@@ -1,27 +1,120 @@
 {
-  "format_version": 6,
+  "format_version": 7,
   "name": "months",
   "description": "Authored periodic 1D-loop manifold over the twelve calendar months. Each month is a first-person node whose corpus is seasonal-embodiment responses to the shared baseline prompts — the model answers in character as the month (\"I am January…\"), letting its weather, light, daylight, and the feeling of its season color every reply, pooled in standard-assistant space (kind=custom). The geometry is authored, not discovered: a periodic BoxDomain axis places the months on a closed ring (January…December at coords 0…11, December wrapping back to January), so steering rides the cyclic calendar rather than a flat fan. This encodes known structure — the year is a cycle — that a per-model auto-fit scores as a worse GCV fit than a flat subspace; the corpus also carries a warm↔cold seasonal axis and a period-2 solstice/equinox 'extremeness' axis that lift the ring into a saddle.",
   "fit_mode": "authored",
   "domain": {
     "type": "box",
     "axes": [
-      {"name": "month", "periodic": true, "period": 12.0, "lo": 0.0, "hi": 12.0}
+      {
+        "name": "month",
+        "periodic": true,
+        "period": 12.0,
+        "lo": 0.0,
+        "hi": 12.0
+      }
     ]
   },
   "nodes": [
-    {"label": "january", "coords": [0.0], "kind": "custom"},
-    {"label": "february", "coords": [1.0], "kind": "custom"},
-    {"label": "march", "coords": [2.0], "kind": "custom"},
-    {"label": "april", "coords": [3.0], "kind": "custom"},
-    {"label": "may", "coords": [4.0], "kind": "custom"},
-    {"label": "june", "coords": [5.0], "kind": "custom"},
-    {"label": "july", "coords": [6.0], "kind": "custom"},
-    {"label": "august", "coords": [7.0], "kind": "custom"},
-    {"label": "september", "coords": [8.0], "kind": "custom"},
-    {"label": "october", "coords": [9.0], "kind": "custom"},
-    {"label": "november", "coords": [10.0], "kind": "custom"},
-    {"label": "december", "coords": [11.0], "kind": "custom"}
+    {
+      "label": "january",
+      "coords": [
+        0.0
+      ],
+      "kind": "custom",
+      "role": null
+    },
+    {
+      "label": "february",
+      "coords": [
+        1.0
+      ],
+      "kind": "custom",
+      "role": null
+    },
+    {
+      "label": "march",
+      "coords": [
+        2.0
+      ],
+      "kind": "custom",
+      "role": null
+    },
+    {
+      "label": "april",
+      "coords": [
+        3.0
+      ],
+      "kind": "custom",
+      "role": null
+    },
+    {
+      "label": "may",
+      "coords": [
+        4.0
+      ],
+      "kind": "custom",
+      "role": null
+    },
+    {
+      "label": "june",
+      "coords": [
+        5.0
+      ],
+      "kind": "custom",
+      "role": null
+    },
+    {
+      "label": "july",
+      "coords": [
+        6.0
+      ],
+      "kind": "custom",
+      "role": null
+    },
+    {
+      "label": "august",
+      "coords": [
+        7.0
+      ],
+      "kind": "custom",
+      "role": null
+    },
+    {
+      "label": "september",
+      "coords": [
+        8.0
+      ],
+      "kind": "custom",
+      "role": null
+    },
+    {
+      "label": "october",
+      "coords": [
+        9.0
+      ],
+      "kind": "custom",
+      "role": null
+    },
+    {
+      "label": "november",
+      "coords": [
+        10.0
+      ],
+      "kind": "custom",
+      "role": null
+    },
+    {
+      "label": "december",
+      "coords": [
+        11.0
+      ],
+      "kind": "custom",
+      "role": null
+    }
   ],
-  "files": {}
+  "files": {},
+  "source": "bundled",
+  "tags": [],
+  "template_ref": null
 }

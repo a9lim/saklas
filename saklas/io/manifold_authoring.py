@@ -276,6 +276,9 @@ def create_manifold_folder(
             for entry in nodes
         ],
         "files": {},
+        "source": "local",
+        "tags": [],
+        "template_ref": None,
     }
     write_json_atomic(folder / "manifold.json", payload)
 
@@ -522,9 +525,10 @@ def _create_discover_manifold_folder(
             for label in node_corpora
         ],
         "files": {},
+        "source": "local",
+        "tags": [],
+        "template_ref": template_ref,
     }
-    if template_ref is not None:
-        payload["template_ref"] = template_ref
     write_json_atomic(folder / "manifold.json", payload)
     return folder
 
@@ -588,11 +592,10 @@ def create_baked_manifold_folder(
         "domain": manifold.domain.to_spec(),
         "nodes": [_node_payload_discover(label, None) for label in labels],
         "files": {},
+        "source": source or "local",
+        "tags": [str(t) for t in (tags or [])],
+        "template_ref": None,
     }
-    if tags:
-        payload["tags"] = [str(t) for t in tags]
-    if source and source != "local":
-        payload["source"] = source
 
     folder = manifold_dir(namespace, name)
     manifest_path = folder / "manifold.json"
@@ -814,6 +817,9 @@ def init_discover_manifold_folder(
             for label in labels
         ],
         "files": {},
+        "source": "local",
+        "tags": [],
+        "template_ref": None,
     }
     write_json_atomic(folder / "manifold.json", payload)
     return folder
@@ -879,11 +885,10 @@ def _discover_manifest_payload(
             for label in labels
         ],
         "files": {},
+        "source": "local",
+        "tags": [str(t) for t in (tags or [])],
+        "template_ref": None,
     }
-    # Category tags ride manifold.json; written only when non-empty so a
-    # tagless manifold stays byte-identical to the pre-tags shape.
-    if tags:
-        payload["tags"] = [str(t) for t in tags]
     return payload
 
 
@@ -1030,15 +1035,15 @@ def plan_discover_generation(
         )
     for key, expected in (
         ("description", str), ("hyperparams", dict), ("nodes", list),
-        ("files", dict),
+        ("files", dict), ("source", str), ("tags", list),
     ):
         if not isinstance(data.get(key), expected):
             raise ManifoldFormatError(
                 f"manifold at {folder} field {key!r} must be {expected.__name__}"
             )
-    if "source" in data and not isinstance(data["source"], str):
+    if not data["source"]:
         raise ManifoldFormatError(
-            f"manifold at {folder} field 'source' must be str"
+            f"manifold at {folder} field 'source' must be non-empty"
         )
     if "artifact_id" in data and (
         not isinstance(data["artifact_id"], str) or not data["artifact_id"]
@@ -1050,18 +1055,16 @@ def plan_discover_generation(
         raise ManifoldFormatError(
             f"manifold at {folder} field 'fit_epochs' must be dict"
         )
-    if "tags" in data and (
-        not isinstance(data["tags"], list)
-        or not all(isinstance(tag, str) for tag in data["tags"])
-    ):
+    if not all(isinstance(tag, str) for tag in data["tags"]):
         raise ManifoldFormatError(
             f"manifold at {folder} field 'tags' must be a list of strings"
         )
-    if "template_ref" in data and (
-        not isinstance(data["template_ref"], str) or not data["template_ref"]
+    if "template_ref" not in data or (
+        data["template_ref"] is not None
+        and (not isinstance(data["template_ref"], str) or not data["template_ref"])
     ):
         raise ManifoldFormatError(
-            f"manifold at {folder} field 'template_ref' must be a non-empty str"
+            f"manifold at {folder} field 'template_ref' must be str or null"
         )
     existing_nodes = data["nodes"]
     if not existing_nodes:
@@ -1073,11 +1076,10 @@ def plan_discover_generation(
             raise ManifoldFormatError(
                 f"manifold at {folder} node {entry!r} must be an object"
             )
-        unknown_node = set(entry) - {"label", "role", "kind"}
-        if unknown_node:
+        expected_node = {"label", "role", "kind"}
+        if set(entry) != expected_node:
             raise ManifoldFormatError(
-                f"manifold at {folder} node has unknown field(s): "
-                f"{sorted(unknown_node)}"
+                f"manifold at {folder} node fields must be {sorted(expected_node)}"
             )
     existing_labels = _validate_discover_labels(
         name, [entry.get("label") for entry in existing_nodes],
@@ -1094,10 +1096,8 @@ def plan_discover_generation(
     }
     new_labels = [label for label in labels if label not in existing_labels]
     full_labels = existing_labels + new_labels
-    # Category tags refresh to the caller's value when supplied (None leaves
-    # whatever the folder already carries); written only when non-empty so a
-    # tagless manifold stays byte-identical to the pre-tags shape.
-    desired_tags = [str(t) for t in tags] if tags else None
+    # Category tags refresh to the caller's value when supplied; ``[]`` clears.
+    desired_tags = [str(t) for t in tags] if tags is not None else None
     if new_labels:
         # Add-nodes: append the new labels (validating their roles/kinds) and
         # rewrite manifold.json atomically.  Existing roles/kinds/hyperparams

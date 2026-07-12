@@ -1,5 +1,5 @@
 {
-  "format_version": 6,
+  "format_version": 7,
   "name": "sincere.manipulative",
   "description": "Bipolar axis: sincere (+) vs manipulative (-). Steer with negative alpha for the opposite pole.",
   "fit_mode": "pca",
@@ -10,15 +10,19 @@
   "nodes": [
     {
       "label": "sincere",
-      "kind": "abstract"
+      "kind": "abstract",
+      "role": null
     },
     {
       "label": "manipulative",
-      "kind": "abstract"
+      "kind": "abstract",
+      "role": null
     }
   ],
   "files": {},
   "tags": [
     "alignment"
-  ]
+  ],
+  "source": "bundled",
+  "template_ref": null
 }

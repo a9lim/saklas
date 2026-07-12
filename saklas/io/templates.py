@@ -54,7 +54,7 @@ from saklas.io.paths import ensure_within, templates_dir
 
 _LOG = logging.getLogger(__name__)
 
-TEMPLATE_FORMAT_VERSION = 1
+TEMPLATE_FORMAT_VERSION = 2
 
 # Node label discipline — mirrors ``io.manifolds._LABEL_REGEX`` (a templated
 # manifold's nodes are this template's slugged values, so the slug must be a
@@ -182,13 +182,10 @@ class TemplateFolder:
                 {"turns": [dict(t) for t in ctx.turns], "assistant": ctx.assistant}
                 for ctx in self.contexts
             ],
+            "description": self.description,
+            "source": self.source or "local",
+            "tags": list(self.tags),
         }
-        if self.description:
-            payload["description"] = self.description
-        if self.source and self.source != "local":
-            payload["source"] = self.source
-        if self.tags:
-            payload["tags"] = list(self.tags)
         return payload
 
     def sha256(self) -> str:
@@ -262,17 +259,23 @@ class TemplateFolder:
                 f"template 'name' {name!r} must match {NAME_REGEX.pattern}"
             )
         slot, values, contexts = _validate_body(name, data)
-        tags = data.get("tags", [])
+        required = {"description", "source", "tags"}
+        missing = required - set(data)
+        if missing:
+            raise TemplateFormatError(
+                f"template.json missing field(s): {sorted(missing)}"
+            )
+        tags = data["tags"]
         if not isinstance(tags, list) or not all(
             isinstance(t, str) for t in tags
         ):
             raise TemplateFormatError(f"template {name!r} 'tags' must be strings")
-        description = data.get("description", "")
+        description = data["description"]
         if not isinstance(description, str):
             raise TemplateFormatError(
                 f"template {name!r} 'description' must be a string"
             )
-        source = data.get("source", "local")
+        source = data["source"]
         if not isinstance(source, str) or not source:
             raise TemplateFormatError(
                 f"template {name!r} 'source' must be a non-empty string"
@@ -471,6 +474,7 @@ def create_template_folder(
             "values": values,
             "contexts": contexts,
             "description": description,
+            "source": "local",
             "tags": tags or [],
         },
     )

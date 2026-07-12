@@ -1,5 +1,5 @@
 {
-  "format_version": 6,
+  "format_version": 7,
   "name": "religious.secular",
   "description": "Bipolar axis: religious (+) vs secular (-). Steer with negative alpha for the opposite pole.",
   "fit_mode": "pca",
@@ -10,15 +10,19 @@
   "nodes": [
     {
       "label": "religious",
-      "kind": "abstract"
+      "kind": "abstract",
+      "role": null
     },
     {
       "label": "secular",
-      "kind": "abstract"
+      "kind": "abstract",
+      "role": null
     }
   ],
   "files": {},
   "tags": [
     "cultural"
-  ]
+  ],
+  "source": "bundled",
+  "template_ref": null
 }
