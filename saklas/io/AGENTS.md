@@ -436,9 +436,8 @@ target write. Legacy v3 monoliths miss and are removed on replacement.
 
 The per-model Jacobian-lens artifact — an atomic `models/<safe_model_id>/
 jlens.json` pointer to immutable per-layer
-`jlens.layer-<L>.gen-<uuid>.safetensors` generations. `LENS_FORMAT_VERSION = 4`;
-legacy fixed-name/monolithic v3 pairs load unchanged and migrate on their next
-write. Missing-layer top-ups carry forward unchanged shard pointers and write
+`jlens.layer-<L>.gen-<uuid>.safetensors` generations. Readers and writers require
+exactly `LENS_FORMAT_VERSION = 4`. Missing-layer top-ups carry forward unchanged shard pointers and write
 only the new matrices, after rehashing every reuse candidate; a corrupt reused
 shard is rewritten from the resident fp32 matrix while valid siblings stay put.
 a wrong version, missing/mismatched payload digest, non-finite tensors, or a corrupt sidecar all log a warning and
@@ -468,7 +467,7 @@ an already-complete terminal checkpoint by atomically pointing the durable sidec
 at its immutable tensor generations, without moving or rewriting them; a pointer-write
 failure therefore preserves both the prior full artifact and the checkpoint.
 Promotion accepts only v4 checkpoints whose every shard matches its declared
-digest; legacy v3 checkpoints fall back to ordinary v4 serialization. Removal
+digest. Removal
 unpublishes both pointer sidecars, fsyncs that directory state, and only then
 performs best-effort shard garbage collection.
 Because final publication and checkpoint unlink are separate crash points, exact

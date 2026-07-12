@@ -291,14 +291,17 @@ def test_lens_noop_preflight_requires_exact_model_source(
     from saklas.io.lens import lens_paths
 
     expected_spec = "hf:repo/config@dataset-rev-a"
-    tensor_path, _ = lens_paths("toy/model")
+    tensor_path, sidecar_path = lens_paths("toy/model")
     tensor_path.parent.mkdir(parents=True, exist_ok=True)
-    tensor_path.write_bytes(b"lens")
+    shard_path = sidecar_path.parent / "jlens.layer-0.gen-test.safetensors"
+    shard_path.write_bytes(b"lens")
     sidecar: dict[str, object] = {
+        "format_version": 4,
         "source_layers": [0],
         "model_layer_count": 2,
         "model_source_fingerprint": "source-a",
-        "tensor_sha256": hashlib.sha256(b"lens").hexdigest(),
+        "tensor_files": {"0": shard_path.name},
+        "tensor_sha256": {"0": hashlib.sha256(b"lens").hexdigest()},
         "seq_len": 128,
         "corpus_spec": expected_spec,
         "raw_prompt_count": 100,
@@ -322,9 +325,9 @@ def test_lens_noop_preflight_requires_exact_model_source(
         seq_len=None, corpus=None, prompts=100,
     )
     assert _try_lens_fit_noop_preflight(args, [0])
-    tensor_path.write_bytes(b"corrupt")
+    shard_path.write_bytes(b"corrupt")
     assert not _try_lens_fit_noop_preflight(args, [0])
-    tensor_path.write_bytes(b"lens")
+    shard_path.write_bytes(b"lens")
     sidecar["model_source_fingerprint"] = "source-b"
     assert not _try_lens_fit_noop_preflight(args, [0])
 

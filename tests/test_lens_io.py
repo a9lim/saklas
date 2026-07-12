@@ -26,7 +26,6 @@ from saklas.io.lens import (
     remove_subsumed_lens_checkpoint,
     promote_lens_checkpoint,
     save_lens,
-    save_lens_checkpoint,
     save_lens_checkpoint_accumulator,
 )
 
@@ -53,6 +52,27 @@ def _save(lens: JacobianLens) -> None:
         lens, _MODEL,
         corpus_spec="test-corpus", corpus_sha256="abc123",
         seq_len=128, dim_batch=8, skip_first=16,
+    )
+
+
+def _save_checkpoint(
+    partial: JacobianLens, model_id: str, *, base_n_prompts: int, **kwargs: Any,
+) -> Path:
+    """Publish a self-contained current checkpoint from estimator sums."""
+    base = (
+        JacobianLens(
+            dict(partial.jacobians), n_prompts=base_n_prompts,
+            d_model=partial.d_model,
+        )
+        if base_n_prompts else None
+    )
+    sums = {
+        layer: matrix * partial.n_prompts
+        for layer, matrix in partial.jacobians.items()
+    }
+    return save_lens_checkpoint_accumulator(
+        sums, partial.n_prompts, partial.d_model, model_id,
+        base=base, **kwargs,
     )
 
 
@@ -88,33 +108,6 @@ def test_save_load_round_trip() -> None:
         for layer, filename in sidecar["tensor_files"].items()
     )
     assert lens_paths(_MODEL)[0].name == sidecar["tensor_files"]["0"]
-
-
-def test_load_migrates_legacy_fixed_tensor_path() -> None:
-    import saklas.io.lens as lens_io
-
-    lens = _lens()
-    _save(lens)
-    generation, sc_path = lens_paths(_MODEL)
-    legacy = generation.parent / "jlens.safetensors"
-    layers = lens.source_layers
-
-    def _rows(layer: int, start: int, end: int) -> torch.Tensor:
-        return lens.jacobians[layer][start:end].to(torch.float16).contiguous()
-
-    digest = lens_io._save_fp16_square_safetensors_atomic(
-        legacy, layers, _D, _rows,
-    )
-    sidecar = json.loads(sc_path.read_text())
-    sidecar["format_version"] = 3
-    sidecar.pop("tensor_files")
-    sidecar["tensor_sha256"] = digest
-    sc_path.write_text(json.dumps(sidecar))
-
-    loaded = load_lens(_MODEL)
-
-    assert loaded is not None
-    assert lens_paths(_MODEL)[0] == legacy
 
 
 def test_missing_layer_topup_reuses_immutable_existing_shards() -> None:
@@ -249,7 +242,7 @@ def test_corrupt_reusable_shard_is_rewritten_while_valid_shard_is_kept() -> None
 
 def test_save_load_checkpoint_round_trip() -> None:
     partial = _lens(n_layers=2, n_prompts=5)
-    save_lens_checkpoint(
+    _save_checkpoint(
         partial, _MODEL,
         base_n_prompts=7,
         corpus_spec="test-corpus",
@@ -265,11 +258,11 @@ def test_save_load_checkpoint_round_trip() -> None:
     loaded = load_lens_checkpoint(_MODEL)
     assert loaded is not None
     got, sidecar = loaded
-    assert got.n_prompts == 5
+    assert got.n_prompts == 12
     assert got.source_layers == [0, 1]
     assert sidecar["checkpoint"] is True
-    assert sidecar["base_n_prompts"] == 7
-    assert sidecar["partial_n_prompts"] == 5
+    assert sidecar["base_n_prompts"] == 0
+    assert sidecar["partial_n_prompts"] == 12
     assert sidecar["raw_corpus_sha256"] == "raw456"
     assert sidecar["raw_prompt_count"] == 13
     assert sidecar["usable_prompt_count"] == 12
@@ -351,7 +344,7 @@ def test_checkpoint_promotion_sidecar_failure_preserves_both_artifacts(
         model_fingerprint="weights",
     )
     checkpoint = _lens(n_layers=2, n_prompts=5)
-    save_lens_checkpoint(
+    _save_checkpoint(
         checkpoint, _MODEL, base_n_prompts=0,
         corpus_spec="new", corpus_sha256="new-sha",
         corpus_hash_kind="token_ids_v1", seq_len=128, dim_batch=8,
@@ -386,7 +379,7 @@ def test_checkpoint_promotion_rejects_corrupt_shard_and_keeps_pointers() -> None
         seq_len=128, dim_batch=8, skip_first=16,
         model_fingerprint="weights",
     )
-    save_lens_checkpoint(
+    _save_checkpoint(
         _lens(n_layers=2, n_prompts=5), _MODEL, base_n_prompts=0,
         corpus_spec="new", corpus_sha256="new-sha",
         corpus_hash_kind="token_ids_v1", seq_len=128, dim_batch=8,
@@ -407,43 +400,6 @@ def test_checkpoint_promotion_rejects_corrupt_shard_and_keeps_pointers() -> None
     assert checkpoint_sc.exists() and checkpoint_ts.exists()
 
 
-def test_checkpoint_promotion_rejects_legacy_v3_without_destroying_it() -> None:
-    import saklas.io.lens as lens_io
-
-    checkpoint = _lens(n_layers=2, n_prompts=5)
-    save_lens_checkpoint(
-        checkpoint, _MODEL, base_n_prompts=0,
-        corpus_spec="new", corpus_sha256="new-sha",
-        corpus_hash_kind="token_ids_v1", seq_len=128, dim_batch=8,
-        skip_first=16, model_fingerprint="weights",
-    )
-    generation, checkpoint_sc = lens_checkpoint_paths(_MODEL)
-    legacy = generation.parent / "jlens.partial.safetensors"
-
-    def _rows(layer: int, start: int, end: int) -> torch.Tensor:
-        return checkpoint.jacobians[layer][start:end].to(
-            torch.float16,
-        ).contiguous()
-
-    digest = lens_io._save_fp16_square_safetensors_atomic(
-        legacy, checkpoint.source_layers, _D, _rows,
-    )
-    sidecar = json.loads(checkpoint_sc.read_text())
-    sidecar["format_version"] = 3
-    sidecar.pop("tensor_files")
-    sidecar["tensor_sha256"] = digest
-    checkpoint_sc.write_text(json.dumps(sidecar))
-
-    assert not promote_lens_checkpoint(
-        _MODEL, n_prompts=5, source_layers=[0, 1],
-        corpus_sha256="new-sha", corpus_hash_kind="token_ids_v1",
-        seq_len=128, d_model=_D, model_fingerprint="weights",
-    )
-    loaded = load_lens_checkpoint(_MODEL)
-    assert loaded is not None and loaded[0].n_prompts == 5
-    assert legacy.exists() and checkpoint_sc.exists()
-
-
 def test_subsumed_checkpoint_recovery_handles_base_progress_and_subset_layers() -> None:
     final = _lens(n_layers=3, n_prompts=7)
     save_lens(
@@ -456,7 +412,7 @@ def test_subsumed_checkpoint_recovery_handles_base_progress_and_subset_layers() 
     checkpoint = JacobianLens(
         {1: torch.eye(_D)}, n_prompts=2, d_model=_D,
     )
-    save_lens_checkpoint(
+    _save_checkpoint(
         checkpoint, _MODEL, base_n_prompts=3,
         corpus_spec="same", corpus_sha256="same-sha",
         corpus_hash_kind="token_ids_v1", seq_len=128, dim_batch=8,
@@ -476,7 +432,7 @@ def test_subsumed_checkpoint_recovery_preserves_farther_progress() -> None:
         corpus_hash_kind="token_ids_v1", seq_len=128, dim_batch=8,
         skip_first=16, model_fingerprint="weights",
     )
-    save_lens_checkpoint(
+    _save_checkpoint(
         _lens(n_layers=2, n_prompts=2), _MODEL, base_n_prompts=3,
         corpus_spec="same", corpus_sha256="same-sha",
         corpus_hash_kind="token_ids_v1", seq_len=128, dim_batch=8,
@@ -494,7 +450,7 @@ def test_subsumed_checkpoint_recovery_preserves_other_corpus() -> None:
         corpus_hash_kind="token_ids_v1", seq_len=128, dim_batch=8,
         skip_first=16, model_fingerprint="weights",
     )
-    save_lens_checkpoint(
+    _save_checkpoint(
         _lens(n_layers=1, n_prompts=2), _MODEL, base_n_prompts=0,
         corpus_spec="checkpoint", corpus_sha256="other-sha",
         corpus_hash_kind="token_ids_v1", seq_len=128, dim_batch=8,
@@ -512,7 +468,7 @@ def test_subsumed_checkpoint_recovery_preserves_recovery_point_if_final_corrupt(
         corpus_hash_kind="token_ids_v1", seq_len=128, dim_batch=8,
         skip_first=16, model_fingerprint="weights",
     )
-    save_lens_checkpoint(
+    _save_checkpoint(
         _lens(n_layers=1, n_prompts=2), _MODEL, base_n_prompts=0,
         corpus_spec="same", corpus_sha256="same-sha",
         corpus_hash_kind="token_ids_v1", seq_len=128, dim_batch=8,
@@ -613,7 +569,7 @@ def test_load_corrupt_sidecar_returns_none() -> None:
 
 def test_remove_lens() -> None:
     _save(_lens())
-    save_lens_checkpoint(
+    _save_checkpoint(
         _lens(n_layers=1), _MODEL,
         base_n_prompts=0,
         corpus_spec="test-corpus",
@@ -645,7 +601,7 @@ def test_checkpoint_pointer_unlink_is_durable_before_shard_gc(
 ) -> None:
     import saklas.io.lens as lens_io
 
-    save_lens_checkpoint(
+    _save_checkpoint(
         _lens(n_layers=1), _MODEL, base_n_prompts=0,
         corpus_spec="test-corpus", corpus_sha256="abc123",
         seq_len=128, dim_batch=8, skip_first=16,
@@ -682,7 +638,7 @@ def test_subsumed_checkpoint_unlink_is_durable_before_shard_gc(
         corpus_hash_kind="token_ids_v1", seq_len=128, dim_batch=8,
         skip_first=16, model_fingerprint="weights",
     )
-    save_lens_checkpoint(
+    _save_checkpoint(
         _lens(n_layers=1, n_prompts=2), _MODEL, base_n_prompts=0,
         corpus_spec="same", corpus_sha256="same-sha",
         corpus_hash_kind="token_ids_v1", seq_len=128, dim_batch=8,
@@ -717,7 +673,7 @@ def test_full_lens_pointer_unlinks_are_durable_before_shard_removal(
     import saklas.io.lens as lens_io
 
     _save(_lens())
-    save_lens_checkpoint(
+    _save_checkpoint(
         _lens(n_layers=1), _MODEL, base_n_prompts=0,
         corpus_spec="test-corpus", corpus_sha256="abc123",
         seq_len=128, dim_batch=8, skip_first=16,
@@ -793,7 +749,7 @@ def test_checkpoint_payload_is_durable_before_pointer_publication(
         lens_io, "_save_fp16_square_safetensors_atomic", record_payload,
     )
     monkeypatch.setattr(lens_io, "write_json_atomic", record_pointer)
-    save_lens_checkpoint(
+    _save_checkpoint(
         _lens(n_layers=2, n_prompts=2), _MODEL, base_n_prompts=0,
         corpus_spec="test-corpus", corpus_sha256="abc123", seq_len=128,
         dim_batch=8, skip_first=16,
@@ -851,13 +807,13 @@ def test_lens_generation_gc_fails_closed_on_transient_pointer_read(
     assert all((anchor.parent / name).exists() for name in live_files)
 
 
-def test_legacy_checkpoint_promotion_directory_barrier_precedes_pointer(
+def test_checkpoint_promotion_directory_barrier_precedes_pointer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import saklas.io.lens as lens_io
 
     checkpoint = _lens(n_layers=2, n_prompts=5)
-    save_lens_checkpoint(
+    _save_checkpoint(
         checkpoint, _MODEL, base_n_prompts=0,
         corpus_spec="new", corpus_sha256="new-sha",
         corpus_hash_kind="token_ids_v1", seq_len=128, dim_batch=8,

@@ -38,11 +38,26 @@ from saklas.io.lens import (
     load_lens,
     load_lens_checkpoint,
     remove_lens,
-    save_lens_checkpoint,
+    save_lens_checkpoint_accumulator,
 )
 from tests._jlens_toys import CharTokenizer, frozen_toy
 
 _MODEL_ID = "toy/jlens-model"
+
+
+def _save_checkpoint(
+    partial: JacobianLens, model_id: str, *, base_n_prompts: int, **kwargs: Any,
+) -> Path:
+    """Publish a self-contained current checkpoint from estimator sums."""
+    assert base_n_prompts == 0
+    sums = {
+        layer: matrix * partial.n_prompts
+        for layer, matrix in partial.jacobians.items()
+    }
+    return save_lens_checkpoint_accumulator(
+        sums, partial.n_prompts, partial.d_model, model_id,
+        base=None, **kwargs,
+    )
 
 
 class _StubSession:
@@ -298,35 +313,6 @@ def test_fresh_subset_noop_reads_only_requested_shard_and_preserves_disk_union(
     assert session.jlens.source_layers == [0, 1]
 
 
-def test_legacy_subset_noop_loads_full_monolith_and_preserves_resident_union() -> None:
-    import saklas.io.lens as lens_io
-
-    full = _StubSession().fit_jlens(
-        _PROMPTS, source_layers=[0, 1], force=True,
-    )
-    generation, sc_path = lens_paths(_MODEL_ID)
-    legacy = generation.parent / "jlens.safetensors"
-
-    def _rows(layer: int, start: int, end: int) -> torch.Tensor:
-        return full.jacobians[layer][start:end].to(torch.float16).contiguous()
-
-    digest = lens_io._save_fp16_square_safetensors_atomic(
-        legacy, full.source_layers, full.d_model, _rows,
-    )
-    sidecar = json.loads(sc_path.read_text())
-    sidecar["format_version"] = 3
-    sidecar.pop("tensor_files")
-    sidecar["tensor_sha256"] = digest
-    sc_path.write_text(json.dumps(sidecar))
-
-    session = _StubSession()
-    selected = session.fit_jlens(_PROMPTS, source_layers=[1])
-
-    assert selected.source_layers == [1]
-    assert session._jlens.source_layers == [0, 1]
-    assert session.jlens.source_layers == [0, 1]
-
-
 def test_fresh_partial_extension_rejects_before_payload_and_preserves_union(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -392,7 +378,7 @@ def test_exact_noop_reaps_checkpoint_left_after_final_publication() -> None:
     loaded = load_lens(_MODEL_ID)
     assert loaded is not None
     sidecar = loaded[1]
-    save_lens_checkpoint(
+    _save_checkpoint(
         full, _MODEL_ID, base_n_prompts=0,
         corpus_spec=str(sidecar["corpus_spec"]),
         corpus_sha256=str(sidecar["corpus_sha256"]),
@@ -416,7 +402,7 @@ def test_resident_noop_does_not_reap_checkpoint_when_final_payload_corrupt() -> 
     loaded = load_lens(_MODEL_ID)
     assert loaded is not None
     sidecar = loaded[1]
-    save_lens_checkpoint(
+    _save_checkpoint(
         full, _MODEL_ID, base_n_prompts=0,
         corpus_spec=str(sidecar["corpus_spec"]),
         corpus_sha256=str(sidecar["corpus_sha256"]),
@@ -652,7 +638,7 @@ def test_fresh_fit_does_not_promote_stale_incompatible_checkpoint() -> None:
         {layer: torch.full((6, 6), 99.0) for layer in (0, 1)},
         n_prompts=2, d_model=6,
     )
-    save_lens_checkpoint(
+    _save_checkpoint(
         stale, _MODEL_ID,
         base_n_prompts=0,
         corpus_spec="stale",
@@ -986,7 +972,7 @@ def test_fit_jlens_extends_real_prefix_checkpoint_without_full_artifact() -> Non
     prefix_sha = hashlib.sha256(
         repr(consumed_prefix).encode("utf-8")
     ).hexdigest()
-    save_lens_checkpoint(
+    _save_checkpoint(
         head, _MODEL_ID,
         base_n_prompts=0,
         corpus_spec="test",
@@ -1032,7 +1018,7 @@ def test_fit_jlens_checkpoint_survives_two_interruptions(
         for prompt in _PROMPTS
     ]
     corpus_sha = hashlib.sha256(repr(consumed).encode("utf-8")).hexdigest()
-    save_lens_checkpoint(
+    _save_checkpoint(
         head, _MODEL_ID,
         base_n_prompts=0,
         corpus_spec="test",
@@ -1102,7 +1088,7 @@ def test_corrupt_farther_checkpoint_falls_back_to_durable_prefix(
         {layer: tensor.clone() for layer, tensor in durable.jacobians.items()},
         n_prompts=3, d_model=durable.d_model,
     )
-    save_lens_checkpoint(
+    _save_checkpoint(
         farther, _MODEL_ID, base_n_prompts=0,
         corpus_spec="test", corpus_sha256=corpus_sha,
         corpus_hash_kind="token_ids_v1", seq_len=128, dim_batch=8,
@@ -1156,7 +1142,7 @@ def test_matching_checkpoint_evicts_incompatible_resident_before_load(
         )["input_ids"][0].tolist()]
         for prompt in changed
     ]
-    save_lens_checkpoint(
+    _save_checkpoint(
         checkpoint, _MODEL_ID, base_n_prompts=0,
         corpus_spec="test",
         corpus_sha256=hashlib.sha256(repr(consumed).encode("utf-8")).hexdigest(),

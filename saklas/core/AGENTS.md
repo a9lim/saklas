@@ -90,7 +90,7 @@ prefix after the failed payload is released. Cadence never fractures a healthy
 prompt microbatch. Checkpoint payload files and their directory entries are
 durable before the checkpoint pointer is published. When the terminal checkpoint
 is already the complete lens, finalization defensively re-fsyncs its immutable
-per-layer tensor generations for legacy compatibility and atomically repoints the durable sidecar instead
+per-layer tensor generations and atomically repoints the durable sidecar instead
 of converting/writing the same artifact again. Each checkpoint stamps the
 token-id hash of the prefix actually consumed, so a later corpus extension can
 resume honestly from that prefix. Successful loads/writes also yield an
