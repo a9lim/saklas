@@ -383,9 +383,10 @@ fit replaces them.)
 
 SAE backend. `SaeBackend` (runtime-checkable Protocol): `encode_layer`/
 `decode_layer`/`feature_count`/`feature_direction`, `release`, `revision`,
-`layers`. `MockSaeBackend` for CPU tests;
-`SaeLensBackend` the concrete adapter. `load_sae_backend(release, *, revision,
-model_id, device, dtype)` queries SAELens, validates base-model compatibility,
+`layers`. `MockSaeBackend` for CPU tests; `SaeLensBackend` adapts provider
+releases and `LocalSaeBackend` adapts Saklas-trained artifacts.
+`load_sae_backend(release, *, revision, model_id, device, dtype)` resolves
+`local:<name>` without importing SAELens; otherwise it queries SAELens, validates base-model compatibility,
 resolves per-layer sae_ids (`_canonical_layer_map` — Neuronpedia-hosted first,
 then narrowest width, then smallest L0: hosting supplies the label +
 `maxActApprox` metadata channel, so an unhosted pick would silently lose
@@ -398,7 +399,10 @@ stamping a pin it did not honor. Errors:
 `SaeBackendImportError`, `SaeReleaseNotFoundError` (difflib suggestions).
 The live runtime keeps one selected encoder/decoder layer resident;
 `select_runtime_layer` chooses nearest 65% model depth (workspace preferred),
-and `list_sae_releases` discovers compatible registry rows without weights.
+and `list_sae_releases` discovers both local artifacts and compatible registry
+rows without weights. `sae_training.py::train_residual_sae` trains a native
+one-layer ReLU SAE from block-output token activations under model inference
+mode; decoder rows are unit-normalized so L1 cannot be evaded by rescaling.
 `sae/<id>` steering reads `W_dec[id]`; feature probes read the encoder channel
 outside the `Monitor`. The probe/gate channel is **normalized strength** —
 `activation / maxActApprox` ∈ ~[0,1], the Neuronpedia corpus-max unit, so

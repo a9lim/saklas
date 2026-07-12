@@ -2650,27 +2650,114 @@ def _run_lens_fit(args: argparse.Namespace) -> None:
     print(f"Artifact: {sidecar_path} ({size_mb:.0f} MB across layer shards)")
 
 
+def _run_lens_fetch(args: argparse.Namespace) -> None:
+    import json as _json
+
+    from saklas.io.lens_sources import fetch_neuronpedia_lens
+
+    if args.source != "neuronpedia":
+        print("lens fetch: source must be neuronpedia", file=sys.stderr)
+        sys.exit(2)
+    if not args.json_output:
+        print(f"Fetching official Jacobian lens for {args.model} into Hugging Face cache...")
+    binding = fetch_neuronpedia_lens(
+        args.model,
+        repo_id=args.repo,
+        revision=args.revision,
+        force=args.force,
+    )
+    payload = binding.to_json()
+    if args.json_output:
+        print(_json.dumps(payload, indent=2))
+        return
+    print(
+        f"Fetched neuronpedia for {args.model}: {len(binding.source_layers)} layers, "
+        f"{binding.n_prompts} prompts"
+    )
+    print(f"  provider: {binding.repo_id}@{binding.repo_revision}")
+    print(f"  checkpoint: {binding.checkpoint}")
+    print("Provider payload remains in the Hugging Face cache; binding is active.")
+
+
+def _run_lens_ls(args: argparse.Namespace) -> None:
+    import json as _json
+
+    from saklas.io.lens_sources import list_lens_sources
+
+    rows = list_lens_sources(args.model)
+    if args.json_output:
+        print(_json.dumps(rows, indent=2))
+        return
+    if not rows:
+        print(f"No Jacobian-lens sources for {args.model}.")
+        return
+    for row in rows:
+        marker = "*" if row["active"] else " "
+        print(f"{marker} {row['source']}")
+
+
+def _run_lens_use(args: argparse.Namespace) -> None:
+    from saklas.io.lens_sources import use_lens_source
+
+    use_lens_source(args.model, args.source)
+    print(f"Active Jacobian lens for {args.model}: {args.source}")
+
+
 def _run_lens_show(args: argparse.Namespace) -> None:
     import json as _json
 
-    from saklas.io.lens import lens_artifact_size, lens_paths, load_lens_sidecar
+    from saklas.io.lens import (
+        lens_artifact_size,
+        lens_paths,
+        load_lens_sidecar,
+        load_local_lens_sidecar,
+    )
+    from saklas.io.lens_sources import (
+        load_active_lens_source,
+        load_external_lens_binding,
+        external_lens_sidecar,
+        lens_binding_path,
+    )
 
-    sidecar = load_lens_sidecar(args.model)
+    source = args.source
+    active = load_active_lens_source(args.model)
+    if source is None:
+        sidecar = load_lens_sidecar(args.model)
+        selected = active
+    elif source.startswith("local:"):
+        if source != "local:default":
+            print(f"no local lens source {source}", file=sys.stderr)
+            sys.exit(1)
+        sidecar = load_local_lens_sidecar(args.model)
+        selected = {"kind": "local", "name": "default"}
+    elif source == "neuronpedia":
+        binding = load_external_lens_binding(args.model)
+        sidecar = None if binding is None else external_lens_sidecar(binding)
+        selected = {"kind": "huggingface", "name": "neuronpedia"}
+    else:
+        print("lens show: source must be local:default or neuronpedia", file=sys.stderr)
+        sys.exit(2)
     if sidecar is None:
-        print(
-            f"no fitted lens for {args.model} — run "
-            f"`saklas lens fit {args.model}`",
-            file=sys.stderr,
-        )
+        print(f"no Jacobian lens for {args.model}", file=sys.stderr)
         sys.exit(1)
-    _ts_path, sidecar_path = lens_paths(args.model)
-    size_mb = lens_artifact_size(args.model, sidecar) / 1024**2
+    external = isinstance(sidecar.get("_source"), dict)
+    if external:
+        sidecar_path = lens_binding_path(args.model, "neuronpedia")
+        size_mb = None
+    else:
+        _ts_path, sidecar_path = lens_paths(args.model)
+        size_mb = lens_artifact_size(args.model, sidecar) / 1024**2
     source_layers = [int(layer) for layer in sidecar["source_layers"]]
     if getattr(args, "json_output", False):
         print(_json.dumps({
             "model": args.model,
             "path": str(sidecar_path),
-            "size_mb": round(size_mb, 1),
+            "size_mb": None if size_mb is None else round(size_mb, 1),
+            "active": bool(
+                active is not None and selected is not None
+                and active["kind"] == selected["kind"]
+                and active["name"] == selected["name"]
+            ),
             **sidecar,
         }, indent=2))
         return
@@ -2683,7 +2770,14 @@ def _run_lens_show(args: argparse.Namespace) -> None:
           f"(sha256 {str(sidecar.get('corpus_sha256', ''))[:12]}…)")
     print(f"  seq_len:  {sidecar.get('seq_len', '?')}, "
           f"skip_first: {sidecar.get('skip_first_positions', '?')}")
-    print(f"  artifact: {sidecar_path} ({size_mb:.0f} MB across layer shards)")
+    if external:
+        source_meta = sidecar["_source"]
+        print(f"  source:   {source_meta['provider']} ({source_meta['repo_id']}@{source_meta['repo_revision']})")
+        print(f"  binding:  {sidecar_path}")
+        print("  payload:  Hugging Face cache (provider-owned)")
+    else:
+        assert size_mb is not None
+        print(f"  artifact: {sidecar_path} ({size_mb:.0f} MB across layer shards)")
 
 
 def _lens_default_top_layers(source_layers: list[int], count: int = 9) -> list[int]:
@@ -2708,8 +2802,8 @@ def _run_lens_top(args: argparse.Namespace) -> None:
         lens = session.jlens
         if lens is None:
             print(
-                f"no fitted lens for {args.model} — run "
-                f"`saklas lens fit {args.model}`",
+                f"no lens for {args.model} — run `saklas lens fetch "
+                f"{args.model}` or `saklas lens fit {args.model}`",
                 file=sys.stderr,
             )
             sys.exit(1)
@@ -2807,24 +2901,62 @@ def _run_lens_decompose(args: argparse.Namespace) -> None:
 
 
 def _run_lens_rm(args: argparse.Namespace) -> None:
-    from saklas.io.lens import lens_paths, load_lens_sidecar, remove_lens
+    from saklas.io.lens import lens_paths, remove_lens
+    from saklas.io.lens_sources import (
+        lens_binding_path,
+        load_active_lens_source,
+        remove_external_lens_binding,
+    )
 
-    _ts_path, sidecar_path = lens_paths(args.model)
-    if load_lens_sidecar(args.model) is None:
-        print(f"no fitted lens for {args.model}", file=sys.stderr)
+    source = args.source
+    if source is None:
+        active = load_active_lens_source(args.model)
+        if active is None:
+            print(f"no lens source for {args.model}", file=sys.stderr)
+            sys.exit(1)
+        source = (
+            f"local:{active['name']}"
+            if active["kind"] == "local" else active["name"]
+        )
+    local = source.startswith("local:")
+    if local and source != "local:default":
+        print(f"no local lens source {source}", file=sys.stderr)
+        sys.exit(1)
+    if not local and source != "neuronpedia":
+        print("lens rm: source must be local:default or neuronpedia", file=sys.stderr)
+        sys.exit(2)
+    sidecar_path = (
+        lens_paths(args.model)[1]
+        if local else lens_binding_path(args.model, "neuronpedia")
+    )
+    if not sidecar_path.exists():
+        print(f"no lens source {source} for {args.model}", file=sys.stderr)
         sys.exit(1)
     if not args.yes:
-        answer = input(f"Remove {sidecar_path}? [y/N] ").strip().lower()
+        action = "Remove local artifact" if local else "Forget external binding"
+        answer = input(f"{action} {sidecar_path}? [y/N] ").strip().lower()
         if answer not in ("y", "yes"):
             print("Aborted.")
             return
-    remove_lens(args.model)
-    print(f"Removed lens artifact for {args.model}.")
+    removed = (
+        remove_lens(args.model)
+        if local else remove_external_lens_binding(args.model)
+    )
+    if not removed:
+        print(f"no lens source {source} for {args.model}", file=sys.stderr)
+        sys.exit(1)
+    if local:
+        print(f"Removed Saklas-owned lens {source} for {args.model}.")
+    else:
+        print("Forgot Neuronpedia binding; Hugging Face cache was not modified.")
 
 
 _LENS_RUNNERS = {
     "fit":       _run_lens_fit,
+    "fetch":     _run_lens_fetch,
+    "ls":        _run_lens_ls,
     "show":      _run_lens_show,
+    "use":       _run_lens_use,
     "top":       _run_lens_top,
     "decompose": _run_lens_decompose,
     "rm":        _run_lens_rm,
@@ -2851,24 +2983,232 @@ def _run_lens(args: argparse.Namespace) -> None:
     runner(args)
 
 
-def _run_sae_load(args: argparse.Namespace) -> None:
+def _load_sae_training_corpus(args: argparse.Namespace) -> tuple[list[str], str]:
+    import json as _json
+    import math
+    from pathlib import Path
+
+    target_docs = max(1, math.ceil(args.tokens / args.seq_len))
+    if args.corpus is not None:
+        path = Path(args.corpus)
+        if not path.exists():
+            print(f"sae train: corpus file not found: {path}", file=sys.stderr)
+            sys.exit(2)
+        docs: list[str] = []
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                if line.startswith("{"):
+                    try:
+                        payload = _json.loads(line)
+                        line = str(payload.get("text", "")) or line
+                    except _json.JSONDecodeError:
+                        pass
+                docs.append(line)
+                if len(docs) >= target_docs:
+                    break
+        if not docs:
+            print("sae train: corpus has no non-empty documents", file=sys.stderr)
+            sys.exit(2)
+        return docs, f"file:{path.name}"
+    from saklas.core.jlens import JacobianLensError
+    from saklas.io.lens import DEFAULT_LENS_CORPUS, stream_default_lens_corpus
+
+    repo, config = DEFAULT_LENS_CORPUS
+    print(f"Streaming {target_docs} documents from {repo} ({config})...")
+    try:
+        return stream_default_lens_corpus(target_docs)
+    except JacobianLensError as exc:
+        print(f"sae train: {exc}", file=sys.stderr)
+        sys.exit(2)
+
+
+def _run_sae_train(args: argparse.Namespace) -> None:
     import json
     from saklas.core.session import SaklasSession
 
+    if args.learning_rate <= 0 or args.l1 < 0 or args.dead_threshold < 0:
+        print("sae train: learning-rate must be > 0 and sparsity values >= 0", file=sys.stderr)
+        sys.exit(2)
+    docs, spec = _load_sae_training_corpus(args)
     _print_startup(args)
     with SaklasSession.from_pretrained(
         args.model, device=args.device, quantize=args.quantize, probes=[],
     ) as session:
         _print_model_info(session)
-        info = session.load_sae(args.release, layer=args.layer)
+        layer = args.layer
+        if layer is None:
+            layer = round(0.65 * max(len(session.layers) - 1, 0))
+        result = session.train_sae(
+            args.name, docs, layer=layer, corpus_spec=spec,
+            tokens=args.tokens, seq_len=args.seq_len, batch_size=args.batch_size,
+            d_sae=args.width, expansion=args.expansion,
+            learning_rate=args.learning_rate, l1_coefficient=args.l1,
+            dead_feature_threshold=args.dead_threshold, seed=args.seed,
+            force=args.force, on_progress=lambda message: print(f"  {message}"),
+        )
     if args.json_output:
-        print(json.dumps({"model": args.model, **info}, indent=2))
+        print(json.dumps(result, indent=2))
+        return
+    metrics = result["metrics"]
+    print(
+        f"Trained {result['source']} for {args.model}: L{layer}, "
+        f"{metrics['d_sae']} features, {metrics['tokens_trained']:,} tokens"
+    )
+    print(f"Artifact: {result['artifact']}")
+
+
+def _run_sae_fetch(args: argparse.Namespace) -> None:
+    import json
+    from saklas.core.session import SaklasSession
+
+    if not args.source.startswith("saelens:"):
+        print("sae fetch: source must be saelens:RELEASE", file=sys.stderr)
+        sys.exit(2)
+    release = args.source[len("saelens:"):]
+    if not release:
+        print("sae fetch: release must not be empty", file=sys.stderr)
+        sys.exit(2)
+    _print_startup(args)
+    with SaklasSession.from_pretrained(
+        args.model, device=args.device, quantize=args.quantize, probes=[],
+    ) as session:
+        _print_model_info(session)
+        info = session.load_sae(release, layer=args.layer)
+    if args.json_output:
+        print(json.dumps({"model": args.model, "source": args.source, **info}, indent=2))
     else:
         print(
-            f"Loaded SAE {info['release']} for {args.model}: "
+            f"Fetched {args.source} for {args.model}: "
             f"L{info['layer']}, {info['width']} features"
         )
-        print("Weights are cached by Hugging Face; saklas metadata is ready.")
+        print("Provider weights remain in the Hugging Face cache; binding is active.")
+
+
+def _run_sae_ls(args: argparse.Namespace) -> None:
+    import json
+    from saklas.io.sae import list_sae_sources
+
+    rows = list_sae_sources(args.model)
+    if args.json_output:
+        print(json.dumps(rows, indent=2))
+        return
+    if not rows:
+        print(f"No SAE sources for {args.model}.")
+        return
+    for row in rows:
+        marker = "*" if row["active"] else " "
+        print(f"{marker} {row['source']}  L{row['layer']}  {row['features']} features")
+
+
+def _resolve_active_sae_source(model: str, source: str | None) -> str | None:
+    if source is not None:
+        return source
+    from saklas.io.sae import load_active_sae_source
+
+    active = load_active_sae_source(model)
+    if active is None:
+        return None
+    return (
+        f"local:{active['name']}"
+        if active["kind"] == "local"
+        else f"saelens:{active['name']}"
+    )
+
+
+def _run_sae_show(args: argparse.Namespace) -> None:
+    import json
+    from saklas.io.sae import load_active_sae_source, load_sae_metadata
+    from saklas.io.sae_artifacts import load_local_sae_manifest
+
+    source = _resolve_active_sae_source(args.model, args.source)
+    if source is None:
+        print(f"no SAE source for {args.model}", file=sys.stderr)
+        sys.exit(1)
+    if source.startswith("local:"):
+        payload = load_local_sae_manifest(args.model, source[6:])
+    elif source.startswith("saelens:"):
+        payload = load_sae_metadata(args.model, source[len("saelens:"):])
+    else:
+        print("sae show: source must be local:NAME or saelens:RELEASE", file=sys.stderr)
+        sys.exit(2)
+    if payload is None:
+        print(f"no SAE source {source} for {args.model}", file=sys.stderr)
+        sys.exit(1)
+    active = load_active_sae_source(args.model)
+    out = {
+        "model": args.model,
+        "source": source,
+        "active": bool(
+            active is not None
+            and (
+                (source.startswith("local:") and active["kind"] == "local" and active["name"] == source[6:])
+                or (source.startswith("saelens:") and active["kind"] == "saelens" and active["name"] == source[len("saelens:"):])
+            )
+        ),
+        **payload,
+    }
+    if args.json_output:
+        print(json.dumps(out, indent=2))
+        return
+    print(f"SAE {source} for {args.model}{' (active)' if out['active'] else ''}")
+    print(f"  layer:    {payload['layer']}")
+    print(f"  features: {payload.get('d_sae', payload.get('width'))}")
+    if source.startswith("local:"):
+        print(f"  tokens:   {payload['tokens_trained']}")
+        print(f"  corpus:   {payload['corpus_spec']}")
+    else:
+        print(f"  revision: {payload['revision']}")
+        print("  payload:  Hugging Face cache (provider-owned)")
+
+
+def _run_sae_use(args: argparse.Namespace) -> None:
+    from saklas.io.sae import use_sae_source
+
+    use_sae_source(args.model, args.source)
+    print(f"Active SAE for {args.model}: {args.source}")
+
+
+def _run_sae_rm(args: argparse.Namespace) -> None:
+    from saklas.io.sae import remove_sae_binding
+    from saklas.io.sae_artifacts import remove_local_sae
+
+    source = _resolve_active_sae_source(args.model, args.source)
+    if source is None:
+        print(f"no SAE source for {args.model}", file=sys.stderr)
+        sys.exit(1)
+    if not args.yes:
+        action = "Remove local artifact" if source.startswith("local:") else "Forget external binding"
+        answer = input(f"{action} {source}? [y/N] ").strip().lower()
+        if answer not in {"y", "yes"}:
+            print("Aborted.")
+            return
+    if source.startswith("local:"):
+        removed = remove_local_sae(args.model, source[6:])
+    elif source.startswith("saelens:"):
+        removed = remove_sae_binding(args.model, source[len("saelens:"):])
+    else:
+        print("sae rm: source must be local:NAME or saelens:RELEASE", file=sys.stderr)
+        sys.exit(2)
+    if not removed:
+        print(f"no SAE source {source} for {args.model}", file=sys.stderr)
+        sys.exit(1)
+    if source.startswith("local:"):
+        print(f"Removed Saklas-owned SAE {source}.")
+    else:
+        print("Forgot SAELens binding; Hugging Face cache was not modified.")
+
+
+_SAE_RUNNERS = {
+    "train": _run_sae_train,
+    "fetch": _run_sae_fetch,
+    "ls": _run_sae_ls,
+    "show": _run_sae_show,
+    "use": _run_sae_use,
+    "rm": _run_sae_rm,
+}
 
 
 @_saklas_error_exit
@@ -2877,14 +3217,15 @@ def _run_sae(args: argparse.Namespace) -> None:
     if cmd is None:
         print("usage: saklas sae <verb> [...]")
         print()
+        width = max(len(verb) for verb, _ in _SAE_VERBS)
         for verb, desc in _SAE_VERBS:
-            print(f"  {verb:<8}  {desc}")
+            print(f"  {verb:<{width}}  {desc}")
         sys.exit(0)
-    if cmd == "load":
-        _run_sae_load(args)
-        return
-    print(f"unknown sae verb {cmd!r}", file=sys.stderr)
-    sys.exit(2)
+    runner = _SAE_RUNNERS.get(cmd)
+    if runner is None:
+        print(f"unknown sae verb {cmd!r}", file=sys.stderr)
+        sys.exit(2)
+    runner(args)
 
 
 @_saklas_error_exit

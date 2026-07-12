@@ -127,6 +127,14 @@ There is **one** artifact root: `manifolds/`.
     neutral_activations.layer-L.gen-*.safetensors # neutral corpus × one layer, fp32
     alignments/<safe_src>.json                     # atomic factorized-affine shard pointer
     alignments/<safe_src>.layer-L.gen-*.safetensors # one bounded factor shard per layer
+    jlens/active.json                              # active local/external source
+    jlens/local/default/manifest.json              # Saklas-fitted lens pointer
+    jlens/local/default/jlens.layer-L.gen-*.safetensors
+    jlens/bindings/neuronpedia.json                # pinned HF reference only
+    sae/active.json                                # active local/external source
+    sae/local/<name>/manifest.json                 # Saklas-trained SAE
+    sae/local/<name>/layer-L.gen-*.safetensors
+    sae/bindings/<release>.json                    # SAELens/HF reference only
 ```
 
 Tensor-filename variants (`io/paths.py`) are `raw` (canonical), `sae-<release>`,
@@ -979,8 +987,10 @@ publication before old-generation GC; fit preflight reaps crash-left streamed
 temporaries. Exact no-op recovery removes a
 checkpoint left by a crash after final publication only when the final pointer
 provably subsumes its corpus, layers, estimator policy, and effective progress.
-The artifact (`io/lens.py`,
-`models/<safe_id>/jlens.json` plus fp32 layer shards) then supports four
+The runtime source (`io/lens.py` + `io/lens_sources.py`) is either a
+Saklas-owned local fit under `models/<safe>/jlens/local/default/` or a pinned
+external binding whose provider payload remains in the Hugging Face cache.
+Both adapt to the same `JacobianLens` and support four
 consumers with zero hot-path cost when unused:
 
 - the **readout** `softmax(W_U · norm(J_l h))` (`session.jlens_readout`
@@ -1019,14 +1029,16 @@ consumers with zero hot-path cost when unused:
 
 ### 6.5 Sparse-autoencoder runtime (feature reads)
 
-`core/sae.py` now serves two paths from the same SAELens adapter. Fit-time
+`core/sae.py` serves a common backend protocol from two owners. Fit-time
 `--sae` still reconstructs manifold node centroids through a lazily loaded SAE;
 the live runtime keeps one selected encoder/decoder pair resident on a session.
 The default hook layer is the release-covered layer nearest 65% model depth,
 preferring the 40–90% workspace band; `--layer` may select another covered
-layer. Weights remain in the Hugging Face cache. Saklas stores only a small
-identity sidecar and optional Neuronpedia labels under
-`models/<safe>/sae/<release>.json` / `-labels.json`.
+layer. Published SAELens weights remain in the Hugging Face cache, with only a
+small binding and optional Neuronpedia labels under `sae/bindings/`. Native
+`sae train` fits a residual-post ReLU SAE over an arbitrary Saklas-supported HF
+model and stores its fp32 weights under `sae/local/<name>/`. `sae/active.json`
+selects either owner for later sessions; both lower to the same runtime backend.
 
 The runtime has the same three consumers as the J-lens, but is single-layer:
 

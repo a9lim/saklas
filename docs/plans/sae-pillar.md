@@ -24,7 +24,7 @@ The J-lens is the template because it already solved the same problems:
 
 | Concern            | J-lens answer                                   | SAE transplant                                     |
 | ------------------ | ----------------------------------------------- | -------------------------------------------------- |
-| Per-model artifact | `models/<safe>/jlens.json` + immutable layer shards | SAE weights (HF/sae-lens) + local metadata cache    |
+| Per-model artifact | local shards or pinned HF binding | local trained weights or pinned SAELens binding     |
 | Live readout       | `POST /lens/live`, WS `token.lens_readout`      | `POST /sae/live`, WS `token.sae_readout`            |
 | Steer atom         | `jlens/<word>` → `W_U[v] @ J_l` direction       | `sae/<id>` → decoder row `W_dec[i]`                 |
 | Probe/gate channel | readout channel, `coords = (strength,)`         | readout channel, `coords = (activation,)`           |
@@ -33,18 +33,20 @@ The J-lens is the template because it already solved the same problems:
 
 ## Runtime
 
-- **Loading.** `saklas sae load <release>` (CLI) / `POST
+- **Loading.** `saklas sae fetch <model> saelens:<release>` or `saklas sae use
+  <model> local:<name>` (CLI) / `POST
   /sessions/{id}/sae/load` (server; background job like `lens/fit`, polled).
   Resolve through the sae-lens registry (gemma-scope for the gemma family,
-  llama-scope etc.); cache weights under HF hub cache as usual, metadata under
-  `~/.saklas/models/<safe_model_id>/sae/<release>.json`. One release resident
+  llama-scope etc.); provider weights remain under the HF cache, with bindings
+  under `~/.saklas/models/<safe_model_id>/sae/bindings/`. Saklas-trained
+  weights live under `sae/local/<name>/`. One source is active and one release resident
   per session in v1 (multi-release is an open question below). The release
   pins a hook layer (or small set); we do NOT sweep all layers — SAE residency
   is per-layer expensive where the lens is cheap-ish (fp32 J_l per layer vs
   d×F encoder/decoder pairs; a 16k-feature SAE on a 4b model is ~2×
   d_model×16k×2 bytes per layer).
-  As built, the CLI also takes `-m <model>` because its process has no existing
-  session. When no layer is explicit, v1 chooses the covered hook layer nearest
+  The CLI is model-first, matching `saklas lens`. When no layer is explicit,
+  v1 chooses the covered hook layer nearest
   65% model depth (preferring the 40–90% workspace band). This makes the bare
   `sae/<id>` namespace singular and deterministic while keeping one encoder /
   decoder pair resident.
@@ -107,7 +109,8 @@ The J-lens is the template because it already solved the same problems:
 ## Labels
 
 Feature labels come from Neuronpedia (API or bulk export) when the release is
-covered: cached at `~/.saklas/models/<safe>/sae/<release>-labels.json`,
+covered: cached beside the external binding at
+`~/.saklas/models/<safe>/sae/bindings/<release>-features.json`,
 fetched lazily per feature id with offline-first behavior (no label ⇒ the id
 renders bare; never block a readout on a network call). The label is display
 metadata only — never part of the grammar.

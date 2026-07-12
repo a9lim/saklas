@@ -6,8 +6,9 @@ Nine-verb root parser
 unified compute surface (extract/generate/from-template/fit/bake/merge/transfer/
 compare/why); `pack` is the lifecycle/distribution verb (ls/show/install/search/
 push/rm/clear/refresh/export gguf); `template` owns the standalone
-templated-completion artifact (create/ls/show/score/rm); `lens` owns the
-per-model Jacobian-lens artifact (fit/show/top/decompose/rm). There is no
+templated-completion artifact (create/ls/show/score/rm); `lens` and `sae` own
+parallel model-first local/external source lifecycles (`fit` vs `train`, then
+fetch/ls/show/use/rm), with lens retaining top/decompose. There is no
 `vector` alias
 — install via `pack install` and export via `pack export gguf`. Split across:
 - `cli/main.py` — entry point, `parse_args`, `main`, `_COMMAND_RUNNERS` dispatch
@@ -63,17 +64,19 @@ with no subverb) prints help and exits 0, not argparse's exit 2.
   (`session.score_template`), steering-aware via `-S`. Bare names default to
   `local/` (`_split_manifold_ns_name`); `score`/`show`/`rm` resolve cross-namespace
   via `resolve_template`.
-- `lens` = the per-model Jacobian-lens artifact
-  (`fit`/`show`/`top`/`decompose`/`rm`) via `_LENS_VERBS`; `_run_lens`
+- `lens` = source-aware per-model Jacobian lenses
+  (`fit`/`fetch`/`ls`/`show`/`use`/`top`/`decompose`/`rm`) via `_LENS_VERBS`; `_run_lens`
   hand-dispatches (`@_saklas_error_exit`-wrapped, like `_run_experiment` — the
   lens error family carries `user_message()`). `fit`/`top`/`decompose` load a
-  model with `probes=[]` (no default probe bootstrap); `show`/`rm` are pure-IO
-  over `models/<safe_id>/jlens.*`. `fit` sources its corpus from `--corpus FILE`
+  model with `probes=[]` (no default probe bootstrap); lifecycle verbs are
+  model-first and source-aware. `fit` sources its corpus from `--corpus FILE`
   (one document per line, or JSONL with a `text` field) or streams the default
   fineweb-edu sample via the optional `datasets` dependency
   (`_load_lens_corpus`), and resumes a matching partial fit by default. The
   model is a **positional** on `fit`/`show`/`top`/`rm` (the artifact is
-  per-model); `decompose` takes a selector positional + required `-m`.
+  per-model); `fetch MODEL neuronpedia` leaves official bytes in the HF cache;
+  `use/show/rm MODEL [SOURCE]` address `local:default` or `neuronpedia`.
+  `decompose` takes a selector positional + required `-m`.
 
 ## Config loading
 
@@ -270,7 +273,8 @@ category list through verbatim (tagged concepts only, no multi-node sweep).
   rejected because v4 has one progress field for all layers — request the full
   durable set or use `-f` for explicit replacement. Model
   fingerprint mismatch forces a clean fit.
-- `lens show`: positional `model`, `-j`.
+- `lens fetch/ls/show/use/rm`: model-first lifecycle; external removal forgets
+  only the binding and never purges Hugging Face cache bytes.
 - `lens top`: positionals `model` + `prompt` (raw text, no chat template),
   `-k/--top-k` (8), `--layers L1,L2,...` (default: 9 evenly spaced fitted
   layers), `--position P` (repeatable, negative ok; default final position),
@@ -281,7 +285,11 @@ category list through verbatim (tagged concepts only, no multi-node sweep).
 - `lens decompose`: positional `selector`, `-m/--model` (required),
   `-k/--top-k` (16 — the sparsity budget), `--layers L1,L2,...`, `-d`, `-q`,
   `-j`.
-- `lens rm`: positional `model`, `-y/--yes`.
+- `sae train`: positionals `model name`; native residual-post ReLU fit over a
+  file or FineWeb-Edu with `--layer`, `--tokens`, `--seq-len`, `--batch-size`,
+  `--width`/`--expansion`, `--learning-rate`, `--l1`, `--dead-threshold`, seed,
+  and force controls. `sae fetch/ls/show/use/rm` mirrors lens argument order;
+  sources are `local:NAME` or `saelens:RELEASE`.
 
 ## Error handling
 

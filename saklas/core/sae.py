@@ -239,6 +239,95 @@ class SaeLensBackend:
         return sae.decode(one_hot)
 
 
+@dataclass
+class LocalSaeBackend:
+    """Lazy adapter for one Saklas-owned residual-post SAE artifact."""
+
+    release: str
+    revision: str | None
+    fingerprint: str | None
+    layers: frozenset[int]
+    model_fingerprint: str | None
+    _loader: Callable[[], dict[str, torch.Tensor]] = field(repr=False)
+    sae_ids_by_layer: dict[str, str] = field(default_factory=dict)
+    repo_id: str | None = None
+    neuronpedia_id: str | None = None
+    neuronpedia_ids_by_layer: dict[str, str] = field(default_factory=dict)
+    _weights: dict[str, torch.Tensor] | None = field(default=None, init=False, repr=False)
+
+    def _get(self, idx: int) -> dict[str, torch.Tensor]:
+        if idx not in self.layers:
+            raise KeyError(f"local SAE {self.release!r} does not cover layer {idx}")
+        if self._weights is None:
+            self._weights = self._loader()
+        return self._weights
+
+    def encode_layer(self, idx: int, h: torch.Tensor) -> torch.Tensor:
+        weights = self._get(idx)
+        centered = h.to(weights["W_enc"].dtype) - weights["b_dec"]
+        return torch.relu(centered @ weights["W_enc"] + weights["b_enc"])
+
+    def decode_layer(self, idx: int, f: torch.Tensor) -> torch.Tensor:
+        weights = self._get(idx)
+        return f.to(weights["W_dec"].dtype) @ weights["W_dec"] + weights["b_dec"]
+
+    def feature_count(self, idx: int) -> int:
+        return int(self._get(idx)["W_dec"].shape[0])
+
+    def feature_direction(self, idx: int, feature_id: int) -> torch.Tensor:
+        weights = self._get(idx)
+        width = int(weights["W_dec"].shape[0])
+        if not 0 <= feature_id < width:
+            raise IndexError(feature_id)
+        return weights["W_dec"][feature_id]
+
+
+def _load_local_sae_backend(
+    release: str,
+    *,
+    model_id: str,
+    device: str | torch.device,
+    dtype: torch.dtype | None,
+) -> LocalSaeBackend:
+    from saklas.core.errors import SaeReleaseNotFoundError
+    from saklas.io.sae_artifacts import (
+        load_local_sae_manifest,
+        load_local_sae_tensors,
+        normalize_local_sae_name,
+    )
+
+    name = normalize_local_sae_name(release)
+    manifest = load_local_sae_manifest(model_id, name)
+    if manifest is None:
+        raise SaeReleaseNotFoundError(
+            f"local SAE {name!r} was not trained for {model_id!r}"
+        )
+    layer = int(manifest["layer"])
+
+    def _load() -> dict[str, torch.Tensor]:
+        loaded = load_local_sae_tensors(model_id, name)
+        if loaded is None:
+            raise ValueError(f"local SAE {name!r} became unavailable or corrupt")
+        tensors, current = loaded
+        if current["tensor_sha256"] != manifest["tensor_sha256"]:
+            raise ValueError(f"local SAE {name!r} changed during load")
+        target_dtype = dtype or torch.float32
+        return {
+            key: value.to(device=sae_device_str(device), dtype=target_dtype)
+            for key, value in tensors.items()
+        }
+
+    return LocalSaeBackend(
+        release=manifest["release"],
+        revision=manifest["tensor_sha256"],
+        fingerprint=manifest["tensor_sha256"],
+        layers=frozenset({layer}),
+        model_fingerprint=manifest.get("model_fingerprint"),
+        _loader=_load,
+        sae_ids_by_layer={str(layer): f"local:{name}:layer-{layer}"},
+    )
+
+
 def select_runtime_layer(
     available: frozenset[int] | set[int],
     n_layers: int,
@@ -279,9 +368,24 @@ def list_sae_releases(model_id: str) -> list[dict[str, Any]]:
     """
     from saklas.core.errors import SaeBackendImportError
 
+    from saklas.io.sae_artifacts import list_local_saes
+
+    rows: list[dict[str, Any]] = [
+        {
+            "release": row["source"],
+            "model": model_id,
+            "layers": [row["layer"]],
+            "repo_id": None,
+            "neuronpedia": False,
+            "source": "local",
+        }
+        for row in list_local_saes(model_id)
+    ]
     try:
         import sae_lens
     except ImportError as exc:
+        if rows:
+            return rows
         raise SaeBackendImportError(
             "SAE release discovery requires `sae_lens`; install saklas[sae]"
         ) from exc
@@ -291,7 +395,6 @@ def list_sae_releases(model_id: str) -> list[dict[str, Any]]:
             get_pretrained_saes_directory,
         )
         loader = get_pretrained_saes_directory
-    rows: list[dict[str, Any]] = []
     for release, entry in loader().items():
         def value(name: str, default: Any = None) -> Any:
             return entry.get(name, default) if isinstance(entry, Mapping) else getattr(entry, name, default)
@@ -316,6 +419,7 @@ def list_sae_releases(model_id: str) -> list[dict[str, Any]]:
             "layers": sorted(set(int(layer) for layer in layer_map.values())),
             "repo_id": value("repo_id"),
             "neuronpedia": bool(value("neuronpedia_id")),
+            "source": "saelens",
         })
     rows.sort(key=lambda row: row["release"])
     return rows
@@ -422,14 +526,19 @@ def load_sae_backend(
     model_id: str,
     device: str | torch.device,
     dtype: torch.dtype | None = None,
-) -> SaeLensBackend:
-    """Resolve a SAELens release to a lazy :class:`SaeLensBackend`.
+) -> SaeLensBackend | LocalSaeBackend:
+    """Resolve a local artifact or SAELens release to a lazy backend.
 
     Raises:
         SaeBackendImportError: ``sae_lens`` not installed.
         SaeReleaseNotFoundError: release not in the SAELens registry.
         SaeModelMismatchError: release's base model != requested ``model_id``.
     """
+    if release.strip().startswith("local:"):
+        return _load_local_sae_backend(
+            release, model_id=model_id, device=device, dtype=dtype,
+        )
+
     from saklas.core.errors import (
         SaeBackendImportError,
         SaeReleaseNotFoundError,

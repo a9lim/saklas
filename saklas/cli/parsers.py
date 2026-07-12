@@ -148,17 +148,26 @@ _TEMPLATE_VERBS: list[tuple[str, str]] = [
 # (Gurnee et al. 2026): per-layer transport ``J_l = E[∂h_final/∂h_l]`` +
 # vocabulary readout.  ``fit`` loads a model and runs the only backward
 # passes in saklas; ``top``/``decompose`` load a model for one forward;
-# ``show``/``rm`` are pure-IO over ``models/<safe_id>/jlens.*``.
+# lifecycle verbs are source-aware: local payloads live under SAKLAS_HOME,
+# while external payloads remain in provider caches behind pinned bindings.
 _LENS_VERBS: list[tuple[str, str]] = [
     ("fit",       "Fit the model's Jacobian lens over a text corpus"),
-    ("show",      "Show the fitted lens artifact (layers, prompts, corpus)"),
+    ("fetch",     "Fetch an external lens into its provider cache"),
+    ("ls",        "List local and external lens sources for a model"),
+    ("show",      "Show the active or selected lens source"),
+    ("use",       "Select an already available lens source"),
     ("top",       "Lens readout on a prompt: top vocabulary tokens per layer"),
     ("decompose", "Split a steerable direction into its J-space component"),
-    ("rm",        "Remove a model's fitted lens artifact"),
+    ("rm",        "Remove a local lens or forget an external binding"),
 ]
 
 _SAE_VERBS: list[tuple[str, str]] = [
-    ("load", "Download, validate, and cache a session SAE release"),
+    ("train", "Train a local residual-post sparse autoencoder"),
+    ("fetch", "Fetch an external SAE into its provider cache"),
+    ("ls",    "List local and external SAE sources for a model"),
+    ("show",  "Show the active or selected SAE source"),
+    ("use",   "Select an already available SAE source"),
+    ("rm",    "Remove a local SAE or forget an external binding"),
 ]
 
 
@@ -968,8 +977,32 @@ def _build_lens_fit(p: argparse.ArgumentParser) -> None:
                    help="Quantization mode (default: bf16/fp16)")
 
 
+def _build_lens_fetch(p: argparse.ArgumentParser) -> None:
+    p.add_argument("model", help="HuggingFace model ID")
+    p.add_argument(
+        "source", nargs="?", default="neuronpedia",
+        help="External source (currently: neuronpedia)",
+    )
+    p.add_argument("--revision", default="main", help="Provider revision to resolve and pin")
+    p.add_argument("--repo", default="neuronpedia/jacobian-lens", metavar="REPO")
+    p.add_argument("-f", "--force", action="store_true", help="Refresh the binding")
+    p.add_argument("-j", "--json", dest="json_output", action="store_true")
+
+
+def _build_lens_ls(p: argparse.ArgumentParser) -> None:
+    p.add_argument("model", help="Model ID whose lens sources to list")
+    p.add_argument("-j", "--json", dest="json_output", action="store_true")
+
+
+def _build_lens_use(p: argparse.ArgumentParser) -> None:
+    p.add_argument("model", help="Model ID whose active lens to change")
+    p.add_argument("source", help="local:NAME or neuronpedia")
+
+
 def _build_lens_show(p: argparse.ArgumentParser) -> None:
     p.add_argument("model", help="Model ID whose lens artifact to inspect")
+    p.add_argument("source", nargs="?", default=None,
+                   help="Source to inspect (default: active)")
     p.add_argument("-j", "--json", dest="json_output", action="store_true", help="JSON output")
 
 
@@ -1024,6 +1057,8 @@ def _build_lens_decompose(p: argparse.ArgumentParser) -> None:
 
 def _build_lens_rm(p: argparse.ArgumentParser) -> None:
     p.add_argument("model", help="Model ID whose lens artifact to remove")
+    p.add_argument("source", nargs="?", default=None,
+                   help="local:NAME or neuronpedia (default: active)")
     p.add_argument("-y", "--yes", action="store_true", help="Skip confirmation")
 
 
@@ -1033,13 +1068,20 @@ _LENS_DESCRIPTIONS: dict[str, str] = {
         "first-order effect of each layer's residual on the final-layer "
         "residual over a web-text corpus. One forward + ceil(d_model/dim_batch) "
         "backward passes per document — the only backward passes in saklas. "
-        "The artifact lands under ~/.saklas/models/<model>/ as an atomic "
-        "jlens.json pointer plus fp32 per-layer shards (~1-3 GB total) "
+        "The artifact lands under ~/.saklas/models/<model>/jlens/local/default "
+        "as an atomic manifest plus fp32 per-layer shards (~1-3 GB total) "
         "and backs `lens top`, `lens decompose`, the "
         "jlens/<word> steering atoms, and @when:jlens/<word> gates. "
         "Interrupted fits checkpoint and resume by default."
     ),
-    "show": "Print a fitted lens artifact's sidecar (layers, prompts, corpus, size).",
+    "fetch": (
+        "Fetch an official external Jacobian lens into its provider-owned "
+        "cache, pin the repository and base-model revisions, and write only a "
+        "small Saklas binding. No provider payload is copied into SAKLAS_HOME."
+    ),
+    "ls": "List Saklas-owned local lenses and external cache bindings.",
+    "show": "Print a lens source's layers, prompts, corpus, provenance, and size.",
+    "use": "Select a fetched/fitted source without downloading or copying it.",
     "top": (
         "Run one forward pass on a raw prompt and decode selected layers' "
         "residuals through the lens: softmax(W_U · norm(J_l h)) — the tokens "
@@ -1053,12 +1095,15 @@ _LENS_DESCRIPTIONS: dict[str, str] = {
         "concept vectors typically carry only ~6-15% of their variance in the "
         "workspace) and the contributing tokens."
     ),
-    "rm": "Delete a model's fitted lens artifact (jlens.json + layer shards).",
+    "rm": "Delete a local lens or forget an external binding without touching its provider cache.",
 }
 
 _LENS_BUILDERS = {
     "fit":       _build_lens_fit,
+    "fetch":     _build_lens_fetch,
+    "ls":        _build_lens_ls,
     "show":      _build_lens_show,
+    "use":       _build_lens_use,
     "top":       _build_lens_top,
     "decompose": _build_lens_decompose,
     "rm":        _build_lens_rm,
@@ -1110,25 +1155,47 @@ def _build_lens_parser(parser: argparse.ArgumentParser) -> None:
 
 
 def _build_sae_parser(parser: argparse.ArgumentParser) -> None:
-    """``saklas sae`` — sparse-autoencoder runtime preparation."""
+    """``saklas sae`` — local/external sparse-autoencoder sources."""
     sub = parser.add_subparsers(dest="sae_cmd", required=False, metavar="VERB")
-    load = sub.add_parser(
-        "load",
-        help=_SAE_VERBS[0][1],
-        description=(
-            "Resolve a SAELens release, download its selected hook-layer weights "
-            "through the normal Hugging Face cache, validate model compatibility, "
-            "and write saklas's small runtime metadata sidecar."
-        ),
-    )
-    load.add_argument("release", help="SAELens registry release name")
-    load.add_argument("-m", "--model", required=True,
-                      help="HuggingFace model ID or local path")
-    load.add_argument("--layer", type=_nonnegative_int, default=None,
-                      help="Explicit covered hook layer (default: nearest 65%% depth)")
-    load.add_argument("-d", "--device", default="auto")
-    load.add_argument("-q", "--quantize", choices=["4bit", "8bit"], default=None)
-    load.add_argument("-j", "--json", dest="json_output", action="store_true")
+    for verb, desc in _SAE_VERBS:
+        child = sub.add_parser(verb, help=desc)
+        child.add_argument("model", help="HuggingFace model ID or local path")
+        if verb == "train":
+            child.add_argument("name", help="Local SAE name")
+            child.add_argument("--corpus", default=None, metavar="FILE",
+                               help="One text document per line; default: FineWeb-Edu")
+            child.add_argument("--layer", type=_nonnegative_int, default=None,
+                               help="Residual-post layer (default: nearest 65%% depth)")
+            child.add_argument("--tokens", type=_positive_int, default=1_000_000, metavar="N")
+            child.add_argument("--seq-len", type=_positive_int, default=128, metavar="T")
+            child.add_argument("--batch-size", type=_positive_int, default=8, metavar="B")
+            child.add_argument("--width", type=_positive_int, default=None, metavar="N")
+            child.add_argument("--expansion", type=_positive_int, default=8, metavar="K")
+            child.add_argument("--learning-rate", type=float, default=3e-4, metavar="LR")
+            child.add_argument("--l1", type=float, default=1e-3, metavar="LAMBDA")
+            child.add_argument("--dead-threshold", type=float, default=1e-6, metavar="T")
+            child.add_argument("--seed", type=int, default=0)
+            child.add_argument("-f", "--force", action="store_true")
+            child.add_argument("-d", "--device", default="auto")
+            child.add_argument("-q", "--quantize", choices=["4bit", "8bit"], default=None)
+            child.add_argument("-j", "--json", dest="json_output", action="store_true")
+        elif verb == "fetch":
+            child.add_argument("source", help="saelens:RELEASE")
+            child.add_argument("--layer", type=_nonnegative_int, default=None,
+                               help="Explicit covered hook layer (default: nearest 65%% depth)")
+            child.add_argument("-d", "--device", default="auto")
+            child.add_argument("-q", "--quantize", choices=["4bit", "8bit"], default=None)
+            child.add_argument("-j", "--json", dest="json_output", action="store_true")
+        elif verb in {"show", "rm"}:
+            child.add_argument("source", nargs="?", default=None,
+                               help="local:NAME or saelens:RELEASE (default: active)")
+            child.add_argument("-j", "--json", dest="json_output", action="store_true")
+            if verb == "rm":
+                child.add_argument("-y", "--yes", action="store_true")
+        elif verb == "use":
+            child.add_argument("source", help="local:NAME or saelens:RELEASE")
+        else:  # ls
+            child.add_argument("-j", "--json", dest="json_output", action="store_true")
 
 
 # --- config subtree ------------------------------------------------------
@@ -1350,7 +1417,7 @@ def _build_root_parser() -> argparse.ArgumentParser:
 
     lens = sub.add_parser(
         "lens",
-        help="Jacobian lens (fit/show/top/decompose/rm)",
+        help="Jacobian lens (fit/fetch/ls/show/use/top/decompose/rm)",
         description="Per-model Jacobian lens: fit the residual→output "
                     "transport, read out what intermediate activations are "
                     "disposed to say, and split directions into their "
@@ -1360,8 +1427,8 @@ def _build_root_parser() -> argparse.ArgumentParser:
 
     sae = sub.add_parser(
         "sae",
-        help="Sparse autoencoder runtime (load)",
-        description="Load and prepare a per-model sparse-autoencoder runtime",
+        help="Sparse autoencoders (train/fetch/ls/show/use/rm)",
+        description="Train, fetch, select, and inspect per-model sparse-autoencoder sources",
     )
     _build_sae_parser(sae)
 

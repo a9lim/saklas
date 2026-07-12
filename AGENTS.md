@@ -77,10 +77,11 @@ saklas template create <name> --slot TOKEN --values V... --contexts FILE [--desc
 saklas template ls [-j] | show <name> [-j] | rm <name> [-y]
 saklas template score <name> -m MODEL [-S EXPR] [--by sum|mean] [-j]   # restricted-choice value distribution
 saklas lens fit <model> [--corpus FILE] [--prompts N] [--seq-len T] [--dim-batch K] [--prompt-batch B] [-f]   # per-model Jacobian lens (backward passes; resumes by default)
-saklas lens show <model> [-j] | rm <model> [-y]
+saklas lens fetch <model> [neuronpedia] | ls <model> | show <model> [source] | use <model> <source> | rm <model> [source] [-y]
 saklas lens top <model> "<prompt>" [-k K] [--layers L1,L2] [--position P] [-j]   # workspace readout on a raw prompt
 saklas lens decompose <selector> -m MODEL [-k K] [--layers L1,L2] [-j]   # J-space share + tokens of a direction
-saklas sae load <release> -m MODEL [--layer L] [-j]       # cache + validate one resident SAE layer
+saklas sae train <model> <name> [--corpus FILE] [--layer L] [--tokens N] [-f]
+saklas sae fetch <model> saelens:<release> [--layer L] | ls <model> | show <model> [source] | use <model> <source> | rm <model> [source] [-y]
 saklas config show [-c PATH ...] [--no-default] [-m MODEL]
 saklas config validate <file>
 pytest tests/                                   # all; GPU tests gated on CUDA/MPS
@@ -94,9 +95,11 @@ lifecycle and distribution (ls/show/install/search/push/rm/clear/refresh/export
 gguf), so install via `pack install` and export via `pack export gguf`; `template`
 owns the standalone templated-completion artifact (create/ls/show/score/rm — a slot
 + candidate values + multi-turn contexts, read by both the completion **scorer**
-and a `manifold from-template` fit); `lens` owns the per-model Jacobian-lens
-artifact (fit/show/top/decompose/rm — see "Jacobian lens" below); `sae` prepares
-the session-resident sparse-autoencoder runtime (`load`). No `argv[0]`
+and a `manifold from-template` fit); `lens` owns local fitting plus source-aware
+lifecycle/readout (fit/fetch/ls/show/use/top/decompose/rm — see "Jacobian lens"
+below); `sae` owns the parallel local/external lifecycle
+(train/fetch/ls/show/use/rm). Both keep provider-owned payloads in provider
+caches and store only pinned bindings locally. No `argv[0]`
 peeking, no bare-TUI fallback —
 `saklas google/gemma-2-2b-it` is an argparse error. Bare `saklas` / `saklas
 manifold` / `saklas pack` / `saklas experiment` / `saklas config` / `saklas
@@ -288,7 +291,10 @@ Transformer Circuits 2026). The lens is one matrix per source layer,
 `J_l = E[∂h_final/∂h_l]` — the average first-order effect of a layer's residual
 on the final-layer residual over positions and a web-text corpus — stored as
 immutable per-layer fp32 shards selected by
-`models/<safe_model_id>/jlens.json` (`LENS_FORMAT_VERSION = 6`, required exactly).
+Saklas-fitted lenses use `models/<safe_model_id>/jlens/local/default/manifest.json`
+(`LENS_FORMAT_VERSION = 6`, required exactly). Official Neuronpedia lenses stay
+in the Hugging Face cache behind a commit-pinned
+`jlens/bindings/neuronpedia.json`; `jlens/active.json` selects the runtime source.
 The sidecar records the immutable corpus spec + token-id
 sha256, exact source/live model identities, and one payload sha256 per layer.
 `lens fit` runs the estimator (`core/jlens.py::fit_jacobian_lens` — consecutive
@@ -317,7 +323,7 @@ checkpoint is promoted durably rather than rewriting the full lens. Exact no-op
 recovery reaps a crash-left checkpoint only when the validated final artifact
 provably subsumes its semantics, layers, and effective prompt progress.
 
-Three read surfaces, one write surface:
+Three read surfaces over either source, plus local fit and external fetch:
 
 - **Readout** — `lens top` / `session.jlens_readout`: `softmax(W_U · norm(J_l h))`
   ranks the vocabulary by what an intermediate activation is disposed to make the

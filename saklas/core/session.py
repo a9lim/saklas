@@ -1,6 +1,7 @@
 """SaklasSession — unified backend for saklas's programmatic API and TUI."""
 from __future__ import annotations
 import asyncio
+import json
 import logging
 import queue
 import re
@@ -766,6 +767,47 @@ def _jlens_sidecar_identity(sidecar: "Mapping[str, Any] | None") -> tuple[Any, .
         tuple(int(layer) for layer in sidecar.get("source_layers", [])),
         int(sidecar.get("seq_len", 0)),
         sidecar.get("estimator_policy"),
+        json.dumps(sidecar.get("_source"), sort_keys=True, default=str),
+    )
+
+
+def _jlens_matches_loaded_model(
+    sidecar: "Mapping[str, Any] | None", model: Any, model_id: str,
+) -> bool:
+    """Validate local exact-weight or external immutable-checkpoint identity."""
+    if sidecar is None:
+        return False
+    fitted_fingerprint = sidecar.get("model_fingerprint")
+    if isinstance(fitted_fingerprint, str) and fitted_fingerprint:
+        return fitted_fingerprint == loaded_model_fingerprint(model, model_id)
+    source = sidecar.get("_source")
+    if not isinstance(source, Mapping) or source.get("kind") != "huggingface":
+        return False
+    if str(source.get("model_id", "")).casefold() != model_id.casefold():
+        return False
+    base = getattr(model, "_orig_mod", model)
+    config = getattr(base, "config", getattr(model, "config", None))
+    live_commit = (
+        getattr(config, "_commit_hash", None)
+        or getattr(getattr(config, "text_config", None), "_commit_hash", None)
+    )
+    if not isinstance(live_commit, str) or live_commit != source.get("model_revision"):
+        return False
+    text_config = getattr(config, "text_config", config)
+    hidden = getattr(text_config, "hidden_size", getattr(text_config, "n_embd", None))
+    n_layers = getattr(
+        text_config, "num_hidden_layers", getattr(text_config, "n_layer", None),
+    )
+    layers = sidecar.get("source_layers", [])
+    return bool(
+        isinstance(hidden, int)
+        and not isinstance(hidden, bool)
+        and int(sidecar.get("d_model", -1)) == hidden
+        and isinstance(n_layers, int)
+        and not isinstance(n_layers, bool)
+        and isinstance(layers, list)
+        and layers
+        and all(isinstance(layer, int) and 0 <= layer < n_layers for layer in layers)
     )
 
 
@@ -1310,9 +1352,10 @@ class SaklasSession:
         self._lens_step_stash: dict[str, Any] | None = None
         self._live_lens_active_for_generation: bool = True
         self._last_lens_step_readings: dict[str, "ProbeReading"] | None = None
-        # Live sparse-autoencoder runtime. One release + one hook layer is
-        # resident in v1; weights stay owned by SAELens/HF cache. Readout
-        # probes are session-local siblings of the J-lens probe registry.
+        # Live sparse-autoencoder runtime. One source + one hook layer is
+        # resident in v1; provider weights stay in SAELens/HF caches while
+        # Saklas-trained weights live under SAKLAS_HOME. Readout probes are
+        # session-local siblings of the J-lens probe registry.
         self._sae_backend: Any = None
         self._sae_layer: int | None = None
         self._sae_width: int | None = None
@@ -1384,6 +1427,27 @@ class SaklasSession:
         # semantics: steering push/pop/steer/unsteer, probe install/remove,
         # profile mutation.
         self._prefix_cache: _PrefixCacheEntry | None = None
+
+        # An explicit ``sae use`` selection persists across sessions. Provider
+        # payloads are expected to be present in their own cache already;
+        # failure is non-fatal so an offline cache eviction cannot prevent the
+        # model itself from starting.
+        from saklas.io.sae import load_active_sae_source
+
+        active_sae = load_active_sae_source(self.model_id)
+        if active_sae is not None:
+            release = (
+                f"local:{active_sae['name']}"
+                if active_sae["kind"] == "local"
+                else active_sae["name"]
+            )
+            try:
+                self.load_sae(release)
+            except Exception as exc:
+                _log.warning(
+                    "could not restore active SAE %s for %s: %s",
+                    release, self.model_id, exc,
+                )
 
     # -- ModelHandle protocol surface (consumed by ManifoldExtractionPipeline) --
 
@@ -1824,9 +1888,9 @@ class SaklasSession:
     def jlens(self) -> "Any":
         """The model's fitted Jacobian lens, or ``None`` when not fitted.
 
-        Loaded lazily from the per-model ``jlens.json`` pointer and immutable
-        layer shards under ``models/<safe_id>/``; fit one with
-        :meth:`fit_jlens` or ``saklas lens fit``. Returns a
+        Loaded lazily from the active local/external source. Local fits use
+        immutable Saklas-owned shards; external bindings read provider-owned
+        cache bytes. Fit or fetch one with ``saklas lens fit|fetch``. Returns a
         :class:`saklas.core.jlens.JacobianLens`.
         """
         if self._generation_jlens_active:
@@ -1835,19 +1899,16 @@ class SaklasSession:
         from saklas.io.lens import load_lens, load_lens_sidecar
 
         sidecar = load_lens_sidecar(self.model_id)
-        live_fingerprint = loaded_model_fingerprint(self._model, self.model_id)
         if sidecar is None:
             if self._jlens is not None:
                 SaklasSession._evict_resident_jlens(self)
             return None
-        fitted_fingerprint = sidecar.get("model_fingerprint")
-        if fitted_fingerprint != live_fingerprint:
+        if not _jlens_matches_loaded_model(sidecar, self._model, self.model_id):
             if self._jlens is not None:
                 SaklasSession._evict_resident_jlens(self)
             _log.warning(
                 "ignoring stale Jacobian lens for %s: loaded-model "
-                "fingerprint is missing or changed; re-fit with "
-                "`saklas lens fit`",
+                "identity is missing or changed; fetch or re-fit the lens",
                 self.model_id,
             )
             return None
@@ -1858,7 +1919,9 @@ class SaklasSession:
         if loaded is None:
             SaklasSession._evict_resident_jlens(self)
             return None
-        if loaded[1].get("model_fingerprint") != live_fingerprint:
+        if not _jlens_matches_loaded_model(
+            loaded[1], self._model, self.model_id,
+        ):
             SaklasSession._evict_resident_jlens(self)
             _log.warning(
                 "ignoring concurrently replaced Jacobian lens for %s: "
@@ -1879,11 +1942,8 @@ class SaklasSession:
         from saklas.io.lens import load_lens, load_lens_sidecar
 
         sidecar = load_lens_sidecar(self.model_id)
-        live_fingerprint = loaded_model_fingerprint(self._model, self.model_id)
-        compatible = bool(
-            sidecar is not None
-            and sidecar.get("model_fingerprint")
-            == live_fingerprint
+        compatible = _jlens_matches_loaded_model(
+            sidecar, self._model, self.model_id,
         )
         if not compatible:
             if self._jlens is not None:
@@ -1898,7 +1958,9 @@ class SaklasSession:
             if loaded is None:
                 SaklasSession._evict_resident_jlens(self)
                 return False
-            if loaded[1].get("model_fingerprint") != live_fingerprint:
+            if not _jlens_matches_loaded_model(
+                loaded[1], self._model, self.model_id,
+            ):
                 SaklasSession._evict_resident_jlens(self)
                 return False
             SaklasSession._adopt_fitted_jlens(
@@ -1912,8 +1974,9 @@ class SaklasSession:
         lens = self.jlens
         if lens is None:
             raise LensNotFittedError(
-                f"no Jacobian lens fitted for {self.model_id} — run "
-                f"`saklas lens fit {self.model_id}` first"
+                f"no Jacobian lens available for {self.model_id} — run "
+                f"`saklas lens fetch {self.model_id}` for a supported official "
+                f"lens, or `saklas lens fit {self.model_id}`"
             )
         return lens
 
@@ -2067,8 +2130,8 @@ class SaklasSession:
         )
         from saklas.io.lens import (
             LENS_FORMAT_VERSION,
-            load_lens,
-            load_lens_sidecar,
+            load_local_lens as load_lens,
+            load_local_lens_sidecar as load_lens_sidecar,
             save_lens,
         )
         from saklas.io.lens import (
@@ -3576,19 +3639,111 @@ class SaklasSession:
 
     # -- Sparse-autoencoder runtime -------------------------------------
 
-    def load_sae(self, release: str, *, layer: int | None = None) -> dict[str, Any]:
-        """Load one SAELens release/layer as the session's resident SAE.
+    def train_sae(
+        self,
+        name: str,
+        documents: "Sequence[str]",
+        *,
+        layer: int,
+        corpus_spec: str = "user",
+        tokens: int = 1_000_000,
+        seq_len: int = 128,
+        batch_size: int = 8,
+        d_sae: int | None = None,
+        expansion: int = 8,
+        learning_rate: float = 3e-4,
+        l1_coefficient: float = 1e-3,
+        dead_feature_threshold: float = 1e-6,
+        seed: int = 0,
+        force: bool = False,
+        on_progress: "Callable[[str], None] | None" = None,
+    ) -> dict[str, Any]:
+        """Train and persist a Saklas-owned residual-post SAE."""
+        import hashlib
 
-        Release registry resolution stays eager while the selected layer's
-        weights are made resident here. The deterministic default is the
-        covered layer nearest 65% model depth, preferring the workspace band.
+        from saklas.core.sae_training import train_residual_sae
+        from saklas.io.sae_artifacts import (
+            local_sae_release,
+            normalize_local_sae_name,
+            save_local_sae,
+        )
+
+        local_name = normalize_local_sae_name(name)
+        docs = list(documents)
+        if not docs:
+            raise ValueError("SAE training needs at least one corpus document")
+        corpus_sha = hashlib.sha256(repr(docs).encode("utf-8")).hexdigest()
+        with self._model_exclusive(
+            "session.train_sae called while another model use is in flight",
+            phase_msg="session.train_sae called while a generation is in flight",
+        ):
+            SaklasSession._assert_unsteered_artifact_operation(self)
+            fit_model = getattr(self._model, "_orig_mod", self._model)
+            tensors, metrics = train_residual_sae(
+                fit_model,
+                self._tokenizer,
+                list(get_layers(fit_model)),
+                docs,
+                layer=layer,
+                tokens=tokens,
+                seq_len=seq_len,
+                batch_size=batch_size,
+                d_sae=d_sae,
+                expansion=expansion,
+                learning_rate=learning_rate,
+                l1_coefficient=l1_coefficient,
+                dead_feature_threshold=dead_feature_threshold,
+                seed=seed,
+                on_progress=on_progress,
+            )
+            manifest = save_local_sae(
+                self.model_id,
+                local_name,
+                tensors,
+                model_fingerprint=loaded_model_fingerprint(
+                    fit_model, self.model_id,
+                ),
+                model_source_fingerprint=getattr(
+                    fit_model, "_saklas_source_fingerprint", None,
+                ),
+                layer=layer,
+                corpus_spec=corpus_spec,
+                corpus_sha256=corpus_sha,
+                tokens_trained=int(metrics["tokens_trained"]),
+                seq_len=seq_len,
+                batch_size=batch_size,
+                learning_rate=learning_rate,
+                l1_coefficient=l1_coefficient,
+                dead_feature_threshold=dead_feature_threshold,
+                force=force,
+            )
+        runtime = self.load_sae(local_sae_release(local_name), layer=layer)
+        return {
+            "source": local_sae_release(local_name),
+            "artifact": str(manifest),
+            "metrics": metrics,
+            "runtime": runtime,
+        }
+
+    def load_sae(self, release: str, *, layer: int | None = None) -> dict[str, Any]:
+        """Load one local or SAELens source as the session's resident SAE.
+
+        Provider registry resolution stays eager while the selected layer's
+        weights are made resident here; local artifacts resolve directly from
+        Saklas storage. The deterministic default is the covered layer nearest
+        65% model depth, preferring the workspace band.
         """
         from saklas.core.sae import (
+            LocalSaeBackend,
             load_sae_backend,
             select_runtime_layer,
             validate_residual_width,
         )
-        from saklas.io.sae import load_sae_feature_meta, save_sae_metadata
+        from saklas.io.sae import (
+            load_sae_feature_meta,
+            save_sae_metadata,
+            set_active_sae_source,
+        )
 
         release = release.strip()
         if not release:
@@ -3600,6 +3755,16 @@ class SaklasSession:
                 release, model_id=self.model_id, device=self._device,
                 dtype=self._dtype,
             )
+            if (
+                isinstance(backend, LocalSaeBackend)
+                and backend.model_fingerprint is not None
+                and backend.model_fingerprint
+                != loaded_model_fingerprint(self._model, self.model_id)
+            ):
+                raise ValueError(
+                    f"local SAE {release!r} was trained against different "
+                    "loaded model weights"
+                )
             covered = frozenset(
                 idx for idx in backend.layers if 0 <= idx < len(self._layers)
             )
@@ -3613,7 +3778,10 @@ class SaklasSession:
             self._sae_backend = backend
             self._sae_layer = selected
             self._sae_width = width
-            self._sae_feature_meta = load_sae_feature_meta(self.model_id, release)
+            self._sae_feature_meta = (
+                {} if isinstance(backend, LocalSaeBackend)
+                else load_sae_feature_meta(self.model_id, release)
+            )
             self._live_sae = None
             self._sae_step_stash = None
             self._last_sae_step_readings = None
@@ -3624,17 +3792,22 @@ class SaklasSession:
             for name in list(self._sae_probes):
                 self._probe_hash_cache.pop(name, None)
             self._sae_probes.clear()
-            save_sae_metadata(self.model_id, release, {
-                "layer": selected,
-                "width": width,
-                "revision": backend.revision,
-                "fingerprint": backend.fingerprint,
-                "sae_id": backend.sae_ids_by_layer.get(str(selected)),
-                "repo_id": backend.repo_id,
-                "neuronpedia_id": backend.neuronpedia_ids_by_layer.get(
-                    str(selected)
-                ),
-            })
+            if isinstance(backend, LocalSaeBackend):
+                set_active_sae_source(
+                    self.model_id, "local", release.removeprefix("local:"),
+                )
+            else:
+                save_sae_metadata(self.model_id, release, {
+                    "layer": selected,
+                    "width": width,
+                    "revision": backend.revision,
+                    "fingerprint": backend.fingerprint,
+                    "sae_id": backend.sae_ids_by_layer.get(str(selected)),
+                    "repo_id": backend.repo_id,
+                    "neuronpedia_id": backend.neuronpedia_ids_by_layer.get(
+                        str(selected)
+                    ),
+                })
         self._invalidate_prefix_cache()
         self._invalidate_analytics_cache()
         return self.sae_info or {}
@@ -3685,7 +3858,8 @@ class SaklasSession:
         width = self._sae_width
         if backend is None or layer is None or width is None:
             raise SaeNotLoadedError(
-                "no SAE loaded for this session — load one with `saklas sae load` "
+                "no SAE loaded for this session — select one with "
+                "`saklas sae use MODEL SOURCE` "
                 "or POST /saklas/v1/sessions/default/sae/load"
             )
         return backend, int(layer), int(width)

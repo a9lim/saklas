@@ -78,7 +78,7 @@ Extraction is difference-of-means per [Im & Li, 2025](https://arxiv.org/abs/2502
 ```bash
 pip install saklas                  # everything needed to run it
 pip install saklas[gguf]            # adds the gguf package for llama.cpp interchange
-pip install saklas[sae]             # adds sae-lens for SAE-backed extraction
+pip install saklas[sae]             # adds SAELens for external SAE releases
 pip install saklas[research]        # adds datasets and pandas for dataset loading and DataFrames
 pip install saklas[notebook]        # adds plotly, pandas, and kaleido for Jupyter figure helpers
 pip install saklas[cuda]            # adds bitsandbytes and HF kernels for CUDA acceleration
@@ -170,7 +170,7 @@ The `%` coefficient slot is `along[,onto]`: `along` is how far to slide toward t
 
 > **Experimental.** This path is less tested than raw extraction.
 
-Install `saklas[sae]` and pass `--sae <release>` to `manifold extract` or `manifold fit` to run extraction in feature space. Saklas routes through SAELens, so any published release it covers (GemmaScope, the Eleuther Meta-LLaMA-3.1 SAEs, Joseph Bloom's, Apollo, Goodfire) should work. The fitted subspace is always model-space, so the hook never touches the SAE.
+Pass `--sae <source>` to `manifold extract` or `manifold fit` to run extraction in feature space. `saelens:<release>` uses a published SAELens release (and requires `saklas[sae]`); `local:<name>` uses an SAE trained by Saklas. The fitted subspace is always model-space, so the generation hook never touches the SAE.
 
 ### Cross-model transfer
 
@@ -502,10 +502,15 @@ Selectors are shared across surfaces: `<name>`, `<ns>/<name>`, `tag:<tag>`, `nam
 
 The Jacobian lens ([Gurnee et al. 2026](https://transformer-circuits.pub/2026/workspace/index.html)) reads out what an intermediate activation is disposed to make the model *say*: a per-layer matrix transports the residual into the final-layer basis, and the model's own unembedding decodes it into ranked vocabulary tokens. The paper shows these verbalizable directions form the model's global workspace — the small subspace its flexible reasoning routes through.
 
-Fit it once per model, then read, steer, gate, and decompose:
+Fetch an official Neuronpedia lens when the model is supported, or fit one
+locally, then read, steer, gate, and decompose:
 
 ```bash
-saklas lens fit google/gemma-3-4b-it --prompts 100        # one-time; resumes if interrupted
+saklas lens fetch google/gemma-3-4b-it                    # provider payload stays in HF cache
+# unsupported model:
+saklas lens fit org/model --prompts 100                   # local/default; resumes if interrupted
+saklas lens ls google/gemma-3-4b-it
+saklas lens use google/gemma-3-4b-it neuronpedia
 saklas lens top google/gemma-3-4b-it "Fact: the currency used in the country shaped like a boot is"
 saklas lens decompose confident.uncertain -m google/gemma-3-4b-it   # how verbalizable is a concept vector?
 saklas serve google/gemma-3-4b-it -S "!jlens/fake"        # ablate a lens direction
@@ -517,20 +522,33 @@ saklas serve google/gemma-3-4b-it -S "!jlens/fake"        # ablate a lens direct
 
 ## Sparse autoencoders
 
-Install the optional SAELens adapter, then prepare a compatible release:
+Use a published SAELens release, or train a local residual-post SAE when the
+model has no compatible release:
 
 ```bash
 pip install 'saklas[sae]'
-saklas sae load gemma-scope-2-4b-it-res -m google/gemma-3-4b-it
-saklas serve google/gemma-3-4b-it
+saklas sae fetch google/gemma-3-4b-it saelens:gemma-scope-2-4b-it-res
+
+# Unsupported model: train on FineWeb-Edu, or pass --corpus FILE.
+pip install 'saklas[hf]'
+saklas sae train org/model my-sae --layer 20 --tokens 1000000
+saklas sae use org/model local:my-sae
+saklas sae ls org/model
+saklas serve org/model
 ```
+
+Saklas owns artifacts it computes: local lenses and SAEs live below
+`$SAKLAS_HOME/models/<model>/jlens/local/` and `sae/local/`. External lens and
+SAE weights remain in Hugging Face/SAELens caches; Saklas stores only a pinned
+binding and the active-source selection. `lens rm` / `sae rm` therefore delete
+local payloads or forget bindings, but never purge provider caches.
 
 The dashboard SAE tab loads one release into the running session, streams its
 top feature activations, and pins features as probes. `0.3 sae/9143` steers on
 decoder row 9143; `!sae/9143` uses saklas's ordinary directional
 mean-ablation; `@when:sae/9143 > 3` gates on the raw post-nonlinearity encoder
 activation. V1 keeps one deterministic hook layer resident (nearest 65% depth,
-workspace band preferred); pass `--layer` to the CLI to preflight a different
+workspace band preferred); pass `--layer` to `sae fetch` or `sae train` to select a different
 covered layer. Feature labels are fetched lazily from Neuronpedia when the
 selected SAELens registry entry provides an id, and reads remain offline-first.
 

@@ -1,11 +1,12 @@
 """Per-model Jacobian-lens artifact: save/load under ``models/<safe_id>/``.
 
 The lens is a per-model transport (one ``J_l`` matrix per source layer), not a
-per-concept artifact, so it lives next to the neutral-activation cache rather
-than under ``manifolds/``:
+per-concept artifact. Lenses fitted by Saklas are owned by Saklas and live in
+the model's source registry:
 
-    ~/.saklas/models/<safe_model_id>/jlens.layer-<L>.gen-<id>.safetensors
-    ~/.saklas/models/<safe_model_id>/jlens.json          # atomic shard pointer
+    ~/.saklas/models/<safe_model_id>/jlens/local/default/
+      jlens.layer-<L>.gen-<id>.safetensors
+      manifest.json                                      # atomic shard pointer
 
 fp32 on disk and in memory, matching saklas' fitted manifold, subspace, profile,
 and neutral-activation artifacts. Keeping the estimator's fp32 accumulator
@@ -36,7 +37,6 @@ from safetensors import safe_open
 
 from saklas.core.jlens import JacobianLens
 from saklas.io.atomic import artifact_lock, fsync_directory, write_json_atomic
-from saklas.io.paths import model_dir
 
 log = logging.getLogger(__name__)
 
@@ -102,18 +102,21 @@ def _json_pointer_matches(path: Path, payload: Mapping[str, Any]) -> bool:
 
 def _lens_anchor_paths(model_id: str) -> tuple[Path, Path]:
     """Stable lock anchor and atomic durable pointer."""
-    md = model_dir(model_id)
-    return md / f"{_LENS_NAME}.safetensors", md / f"{_LENS_NAME}.json"
+    from saklas.io.lens_sources import local_lens_dir
+
+    root = local_lens_dir(model_id)
+    return root / f"{_LENS_NAME}.safetensors", root / "manifest.json"
 
 
 def _checkpoint_anchor_paths(model_id: str) -> tuple[Path, Path]:
     """Stable lock anchor and atomic checkpoint pointer."""
-    md = model_dir(model_id)
+    from saklas.io.lens_sources import local_lens_dir
+
+    md = local_lens_dir(model_id)
     return (
         md / f"{_LENS_CHECKPOINT_NAME}.safetensors",
-        md / f"{_LENS_CHECKPOINT_NAME}.json",
+        md / "checkpoint.json",
     )
-
 
 def _sidecar_tensor_path(anchor: Path, sidecar: Mapping[str, Any]) -> Path:
     """Resolve a representative generation for path-reporting compatibility."""
@@ -177,7 +180,7 @@ def lens_paths(model_id: str) -> tuple[Path, Path]:
     """Return a representative tensor shard and stable sidecar pointer path.
 
     The current format uses immutable per-layer generations and atomically
-    switches ``jlens.json`` to the complete shard map. Use
+    switches ``jlens/local/default/manifest.json`` to the complete shard map. Use
     :func:`lens_tensor_paths` when every layer path is required.
     """
     return _public_pointer_paths(*_lens_anchor_paths(model_id))
@@ -263,8 +266,8 @@ def _referenced_tensor_names(model_folder: Path) -> set[str] | None:
     """Read both pointers, failing closed if an existing pointer is unreadable."""
     out: set[str] = set()
     for sidecar_path in (
-        model_folder / f"{_LENS_NAME}.json",
-        model_folder / f"{_LENS_CHECKPOINT_NAME}.json",
+        model_folder / "manifest.json",
+        model_folder / "checkpoint.json",
     ):
         if not sidecar_path.exists():
             continue
@@ -483,11 +486,26 @@ def _load_sidecar_at(
         return None
 
 
-def load_lens_sidecar(model_id: str) -> dict[str, Any] | None:
-    """Load validated lens metadata without loading the tensor artifact."""
+def load_local_lens_sidecar(model_id: str) -> dict[str, Any] | None:
+    """Load Saklas-owned local/default metadata without its matrices."""
     anchor, sc_path = _lens_anchor_paths(model_id)
     with artifact_lock(anchor):
         return _load_sidecar_at(model_id, anchor, sc_path, label="jlens cache")
+
+
+def load_lens_sidecar(model_id: str) -> dict[str, Any] | None:
+    """Load metadata for the active local or external lens source."""
+    from saklas.io.lens_sources import (
+        load_active_lens_source,
+        load_external_lens_sidecar,
+    )
+
+    active = load_active_lens_source(model_id)
+    if active is None:
+        return None
+    if active["kind"] == "huggingface":
+        return load_external_lens_sidecar(model_id, active["name"])
+    return load_local_lens_sidecar(model_id)
 
 
 def load_lens_checkpoint_sidecar(model_id: str) -> dict[str, Any] | None:
@@ -527,7 +545,7 @@ def save_lens(
     """
     anchor, sc_path = _lens_anchor_paths(model_id)
     with lens_fit_lock(model_id):
-        return _save_lens_at(
+        path = _save_lens_at(
             lens, anchor, sc_path,
             corpus_spec=corpus_spec,
             corpus_sha256=corpus_sha256,
@@ -545,6 +563,10 @@ def save_lens(
             reuse_layers=reuse_layers,
             verified_reuse_proof=_verified_reuse_proof,
         )
+    from saklas.io.lens_sources import set_active_local_lens
+
+    set_active_local_lens(model_id)
+    return path
 
 
 def save_lens_checkpoint_accumulator(
@@ -893,8 +915,8 @@ def _lens_safetensors_header(
     return struct.pack("<Q", padded_len), raw_header
 
 
-def load_lens(model_id: str) -> tuple[JacobianLens, dict[str, Any]] | None:
-    """Load a model's fitted lens, or ``None`` when absent or unusable.
+def load_local_lens(model_id: str) -> tuple[JacobianLens, dict[str, Any]] | None:
+    """Load the Saklas-owned local/default lens when usable.
 
     Self-healing like the neutral-activation cache: a wrong format version,
     non-finite tensors, or any parse failure logs a warning and reads as
@@ -903,6 +925,21 @@ def load_lens(model_id: str) -> tuple[JacobianLens, dict[str, Any]] | None:
     """
     loaded = _load_lens_verified(model_id)
     return None if loaded is None else (loaded[0], loaded[1])
+
+
+def load_lens(model_id: str) -> tuple[JacobianLens, dict[str, Any]] | None:
+    """Load the active local or externally managed lens source."""
+    from saklas.io.lens_sources import (
+        load_active_lens_source,
+        load_external_lens,
+    )
+
+    active = load_active_lens_source(model_id)
+    if active is None:
+        return None
+    if active["kind"] == "huggingface":
+        return load_external_lens(model_id, active["name"])
+    return load_local_lens(model_id)
 
 
 def _load_lens_verified(
@@ -1023,6 +1060,9 @@ def promote_lens_checkpoint(
         fsync_directory(final_sc.parent)
         _cleanup_unreferenced_generations(final_anchor.parent)
         fsync_directory(final_sc.parent)
+        from saklas.io.lens_sources import set_active_local_lens
+
+        set_active_local_lens(model_id)
         return True
 
 
@@ -1259,6 +1299,11 @@ def remove_lens(model_id: str) -> bool:
             except OSError as exc:
                 log.warning("could not remove J-lens tensor %s: %s", path, exc)
         fsync_directory(final_anchor.parent)
+        from saklas.io.lens_sources import lens_active_path, load_active_lens_source
+
+        active = load_active_lens_source(model_id)
+        if active is not None and active["kind"] == "local":
+            lens_active_path(model_id).unlink(missing_ok=True)
         return removed
 
 

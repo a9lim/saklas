@@ -4,7 +4,9 @@
 (extract/generate/from-template/fit/bake/merge/transfer/compare/why); ``pack`` is
 the manifold *lifecycle* surface (ls/show/install/search/push/rm/clear/refresh/
 export); ``template`` owns the standalone templated-completion artifact; ``lens``
-owns the per-model Jacobian-lens artifact (fit/show/top/decompose/rm).  The
+owns the per-model Jacobian-lens artifact
+(fit/fetch/ls/show/use/top/decompose/rm); ``sae`` exposes the parallel
+train/fetch/ls/show/use/rm lifecycle.  The
 former ``subspace`` verb and the deprecated ``vector`` alias are gone — the
 flat-artifact verbs folded into ``manifold``.  These tests exercise the parser
 shape + dispatch wiring, not the backends.
@@ -42,16 +44,28 @@ def test_nine_top_level_verbs() -> None:
     }
 
 
-def test_sae_load_parses() -> None:
+def test_sae_fetch_parses_with_harmonized_model_first_shape() -> None:
     args = cli.parse_args([
-        "sae", "load", "gemma-scope", "-m", "m/x", "--layer", "14", "-j",
+        "sae", "fetch", "m/x", "saelens:gemma-scope", "--layer", "14", "-j",
     ])
     assert args.command == "sae"
-    assert args.sae_cmd == "load"
-    assert args.release == "gemma-scope"
+    assert args.sae_cmd == "fetch"
     assert args.model == "m/x"
+    assert args.source == "saelens:gemma-scope"
     assert args.layer == 14
     assert args.json_output is True
+
+
+def test_lens_and_sae_lifecycle_shapes_are_parallel() -> None:
+    lens = cli.parse_args(["lens", "use", "m/x", "neuronpedia"])
+    sae = cli.parse_args(["sae", "use", "m/x", "local:mine"])
+    assert (lens.model, lens.source) == ("m/x", "neuronpedia")
+    assert (sae.model, sae.source) == ("m/x", "local:mine")
+
+    lens_ls = cli.parse_args(["lens", "ls", "m/x", "-j"])
+    sae_ls = cli.parse_args(["sae", "ls", "m/x", "-j"])
+    assert lens_ls.model == sae_ls.model == "m/x"
+    assert lens_ls.json_output and sae_ls.json_output
 
 
 def test_template_verb_parses() -> None:

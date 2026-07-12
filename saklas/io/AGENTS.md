@@ -18,12 +18,13 @@ baseline user prompts; falls back to bundled `saklas/data/baseline_prompts.json`
 `ensure_within(root, *parts)` (path-traversal
 barrier).
 
-`sae.py` owns the small live-runtime metadata cache under
-`models/<safe>/sae/`: one release/layer identity sidecar plus the lazily
-fetched per-feature Neuronpedia metadata (`<release>-features.json` —
+`sae.py` owns source selection plus small external bindings under
+`models/<safe>/sae/{active.json,bindings/}`: one release/layer identity sidecar
+plus the lazily fetched per-feature Neuronpedia metadata (`<release>-features.json` —
 `{id: {label, max_act}}`, where `max_act` is `maxActApprox`, the strength
-unit that normalizes the readout channel to 0..1). SAE weights remain in the Hugging Face
-cache.
+unit that normalizes the readout channel to 0..1). External weights remain in
+the Hugging Face cache. `sae_artifacts.py` owns Saklas-trained fp32 artifacts
+under `sae/local/<name>/` and never writes into provider caches.
 
 Owns the tensor-filename variant scheme. A manifold folder can hold several
 fitted tensors per model, distinguished by filename suffix — exactly one *kind*
@@ -449,8 +450,8 @@ target write. Non-current cache generations miss and are replaced normally.
 
 ## lens.py
 
-The per-model Jacobian-lens artifact — an atomic `models/<safe_model_id>/
-jlens.json` pointer to immutable per-layer
+The Saklas-owned per-model Jacobian-lens artifact — an atomic
+`models/<safe_model_id>/jlens/local/default/manifest.json` pointer to immutable per-layer
 `jlens.layer-<L>.gen-<uuid>.safetensors` generations. Readers and writers require
 exactly `LENS_FORMAT_VERSION = 6`. Missing-layer top-ups carry forward unchanged shard pointers and write
 only the new matrices, after rehashing every reuse candidate; a corrupt reused
@@ -471,7 +472,7 @@ are materialized rather than a complete shard mapping. The
 verified loader can materialize only requested v6 shards for a fresh same-corpus
 subset no-op; the durable pointer and its full layer union remain unchanged.
 Resumable
-checkpoints use the same generation-pointer scheme under `jlens.partial.json`:
+checkpoints use the same generation-pointer scheme under `checkpoint.json`:
 the estimator writes a self-contained averaged checkpoint directly from raw sums,
 merging a prior prefix one layer at a time during fp32 streaming. This avoids a
 second full fp32 lens at checkpoint cadence and makes repeated interruptions
@@ -503,7 +504,10 @@ final/checkpoint preflight rejects incompatible corpora/layers before matrix IO.
 `load_lens` /
 `load_lens_checkpoint_sidecar` / `load_lens_checkpoint` /
 `promote_lens_checkpoint` / `remove_subsumed_lens_checkpoint` / `remove_lens`;
-the fit itself lives in `core/jlens.py`.
+the fit itself lives in `core/jlens.py`. `lens_sources.py` owns
+`jlens/active.json`, commit-pinned external bindings, Neuronpedia discovery, and
+the weights-only adapter that reads `.pt` payloads offline from the Hugging Face
+cache without copying or converting them into `SAKLAS_HOME`.
 
 All lens `*_sha256` identities are canonical lowercase 64-hex digests. A
 positive-progress checkpoint must carry the digest of its consumed token prefix;
