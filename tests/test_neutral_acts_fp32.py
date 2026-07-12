@@ -25,6 +25,7 @@ from saklas.core.mahalanobis import LayerWhitener, WhitenerError
 from saklas.io.alignment import (
     _neutral_acts_paths,
     load_or_compute_neutral_activations,
+    load_or_compute_neutral_activations_with_metadata,
     validate_neutral_cache_metadata,
 )
 from saklas.io.paths import model_dir
@@ -144,6 +145,33 @@ def test_compute_and_cache_paths_bit_identical(tmp_path: Path, monkeypatch: pyte
         assert torch.equal(out_compute[layer], out_cache[layer]), (
             f"layer {layer} differs across the cache boundary (precision seam)"
         )
+
+
+def test_metadata_returning_load_reuses_the_single_payload_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Dependent builders get identity without rehashing a validated cache."""
+    _install_home(tmp_path, monkeypatch)
+    _patch_compute(monkeypatch, _deterministic_acts())
+    _compute()
+
+    import saklas.io.alignment as alignment
+
+    real_hash = alignment.hash_file
+    hashed: list[Path] = []
+
+    def count_hash(path: Path) -> str:
+        hashed.append(Path(path))
+        return real_hash(path)
+
+    monkeypatch.setattr(alignment, "hash_file", count_hash)
+    acts, sidecar = load_or_compute_neutral_activations_with_metadata(
+        model=MODEL, tokenizer=TOKENIZER, layers=[0, 1, 2], model_id=MODEL_ID,
+    )
+
+    assert set(acts) == {0, 1, 2}
+    assert sidecar["tensor_sha256"] == real_hash(_neutral_acts_paths(MODEL_ID)[0])
+    assert hashed == [_neutral_acts_paths(MODEL_ID)[0]]
 
 
 def test_concurrent_cold_neutral_cache_is_single_flight(

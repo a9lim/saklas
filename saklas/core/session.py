@@ -2161,8 +2161,36 @@ class SaklasSession:
 
             corpus_hash_kind = "token_ids_v1"
             base: Any = None
+            checkpoint_sidecar = None
+            checkpoint_meta_matches = False
+            checkpoint_base_n = -1
+            checkpoint_n = -1
+            resident_evicted_early = False
+            pre_evicted_live: dict[str, Any] | None = None
+            durable_fallback_after_checkpoint = False
             if not force:
+                checkpoint_sidecar = load_lens_checkpoint_sidecar(self.model_id)
+                checkpoint_meta_matches = bool(
+                    checkpoint_sidecar is not None
+                    and checkpoint_sidecar.get("corpus_sha256") == corpus_sha
+                    and checkpoint_sidecar.get("corpus_hash_kind")
+                    == corpus_hash_kind
+                    and checkpoint_sidecar.get("seq_len") == seq_len
+                    and checkpoint_sidecar.get("model_fingerprint")
+                    == model_fingerprint
+                    and [
+                        int(l)
+                        for l in checkpoint_sidecar.get("source_layers", [])
+                    ] == expected_sources
+                )
+                if checkpoint_meta_matches:
+                    assert checkpoint_sidecar is not None
+                    checkpoint_base_n = int(
+                        checkpoint_sidecar.get("base_n_prompts", -1)
+                    )
+                    checkpoint_n = int(checkpoint_sidecar.get("n_prompts", -1))
                 sidecar = load_lens_sidecar(self.model_id)
+                saved_n = 0
                 if (
                     sidecar is not None
                     and sidecar.get("corpus_hash_kind") == corpus_hash_kind
@@ -2177,13 +2205,32 @@ class SaklasSession:
                         and saved_sha == _token_rows_sha(consumed_ids[:saved_n])
                     )
                     if corpus_matches or prefix_matches:
+                        prefer_checkpoint = bool(
+                            checkpoint_meta_matches
+                            and checkpoint_base_n == 0
+                            and checkpoint_n > saved_n
+                        )
                         existing_payload_verified = False
                         resident = self._jlens
                         resident_layers = (
                             set(resident.source_layers)
                             if resident is not None else set()
                         )
-                        if (
+                        if prefer_checkpoint:
+                            durable_fallback_after_checkpoint = True
+                            if resident is not None:
+                                pre_evicted_live = (
+                                    {
+                                        "layers": list(self._live_lens["layers"]),
+                                        "top_k": int(self._live_lens["top_k"]),
+                                    }
+                                    if self._live_lens is not None else None
+                                )
+                                SaklasSession._evict_resident_jlens(self)
+                                resident = None
+                                resident_evicted_early = True
+                            existing = None
+                        elif (
                             resident is not None
                             and resident.n_prompts == saved_n
                             # A resident stamped with the durable pointer must
@@ -2341,24 +2388,56 @@ class SaklasSession:
                         base = lens.select_layers(expected_sources)
                     else:
                         base = None
-                checkpoint_sidecar = load_lens_checkpoint_sidecar(self.model_id)
-                checkpoint_meta_matches = bool(
-                    checkpoint_sidecar is not None
-                    and checkpoint_sidecar.get("corpus_sha256") == corpus_sha
-                    and checkpoint_sidecar.get("corpus_hash_kind")
-                    == corpus_hash_kind
-                    and checkpoint_sidecar.get("seq_len") == seq_len
-                    and checkpoint_sidecar.get("model_fingerprint")
-                    == model_fingerprint
-                    and [
-                        int(l)
-                        for l in checkpoint_sidecar.get("source_layers", [])
-                    ] == expected_sources
+                load_checkpoint_payload = bool(
+                    checkpoint_meta_matches
+                    and (
+                        (
+                            checkpoint_base_n == 0
+                            and (base is None or checkpoint_n > base.n_prompts)
+                        )
+                        or (
+                            checkpoint_base_n > 0
+                            and base is not None
+                            and checkpoint_base_n == base.n_prompts
+                        )
+                    )
                 )
+                if (
+                    load_checkpoint_payload
+                    and checkpoint_base_n == 0
+                    and self._jlens is not None
+                    and not resident_evicted_early
+                ):
+                    pre_evicted_live = (
+                        {
+                            "layers": list(self._live_lens["layers"]),
+                            "top_k": int(self._live_lens["top_k"]),
+                        }
+                        if self._live_lens is not None else None
+                    )
+                    SaklasSession._evict_resident_jlens(self)
+                    resident_evicted_early = True
                 ckpt = (
                     load_lens_checkpoint(self.model_id)
-                    if checkpoint_meta_matches else None
+                    if load_checkpoint_payload else None
                 )
+                if (
+                    ckpt is None
+                    and load_checkpoint_payload
+                    and durable_fallback_after_checkpoint
+                ):
+                    # Metadata/header preflight intentionally avoids paging the
+                    # durable prefix, but the preferred checkpoint can still
+                    # fail its full digest/finite validation. Load the durable
+                    # artifact only after that failed payload is gone instead
+                    # of silently restarting from prompt zero.
+                    fallback = load_lens(self.model_id)
+                    if fallback is not None:
+                        fallback_lens, fallback_sidecar = fallback
+                        if set(fallback_lens.source_layers) >= expected_set:
+                            lens = fallback_lens
+                            sidecar = fallback_sidecar
+                            base = fallback_lens.select_layers(expected_sources)
                 if ckpt is not None:
                     partial, ckpt_sidecar = ckpt
                     if checkpoint_meta_matches:
@@ -2454,21 +2533,36 @@ class SaklasSession:
                 checkpoint_written = True
 
             if base is not None and not usable:
-                merged = _save_full(base)
-                return SaklasSession._adopt_fitted_jlens(
-                    self, merged, sidecar=load_lens_sidecar(self.model_id),
-                )
+                try:
+                    merged = _save_full(base)
+                    if pre_evicted_live is not None:
+                        self._live_lens = pre_evicted_live
+                    return SaklasSession._adopt_fitted_jlens(
+                        self, merged, sidecar=load_lens_sidecar(self.model_id),
+                    )
+                except BaseException:
+                    if resident_evicted_early:
+                        restored = load_lens(self.model_id)
+                        if restored is not None:
+                            if pre_evicted_live is not None:
+                                self._live_lens = pre_evicted_live
+                            SaklasSession._adopt_fitted_jlens(
+                                self, restored[0], sidecar=restored[1],
+                            )
+                    raise
 
             resident = self._jlens
-            had_resident = resident is not None
+            had_resident = resident is not None or resident_evicted_early
             resume_live = (
+                pre_evicted_live
+                if resident_evicted_early else
                 {
                     "layers": list(self._live_lens["layers"]),
                     "top_k": int(self._live_lens["top_k"]),
                 }
                 if self._live_lens is not None else None
             )
-            if had_resident:
+            if resident is not None:
                 # The estimator takes ownership and converts averages to sums.
                 # Drop any resident reference for the duration. It may alias
                 # the prefix or be a stale externally-replaced lens; retaining

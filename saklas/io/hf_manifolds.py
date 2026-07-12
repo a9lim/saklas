@@ -749,24 +749,84 @@ def _install_local_manifold(
         )
 
     dst = manifold_dir(dst_ns, dst_name)
+    same_path = (
+        src.expanduser().resolve() == dst.expanduser().resolve(strict=False)
+    )
     from saklas.io.manifold_folder import _locked_manifest
+    from saklas.io.staging import stage_verify_swap
 
-    with _locked_manifest(dst):
-        if dst.exists():
-            if not force:
+    def _install_from(source_path: Path) -> Path:
+        with _locked_manifest(dst):
+            backup = dst.with_name(dst.name + ".bak")
+            if not dst.exists() and backup.exists():
+                try:
+                    backup.rename(dst)
+                except OSError as exc:
+                    raise ManifoldInstallConflict(
+                        f"{dst}: could not recover interrupted local install ({exc})"
+                    ) from exc
+            if same_path:
+                if not force:
+                    raise ManifoldInstallConflict(
+                        f"{dst} already exists; pass force=True or as_=<ns>/<name>"
+                    )
+                # Reinstalling an already-installed folder onto itself is an exact
+                # no-op. Never reset the destination: it is the only source copy.
+                ManifoldFolder.load(src)
+                return dst
+            if dst.exists() and not force:
                 raise ManifoldInstallConflict(
                     f"{dst} already exists; pass force=True or as_=<ns>/<name>"
                 )
-            from saklas.io.manifold_folder import reset_manifold_folder
 
-            reset_manifold_folder(dst)
+            def _build(staging: Path) -> None:
+                if is_manifold:
+                    shutil.copytree(source_path, staging, dirs_exist_ok=True)
+                else:
+                    from saklas.io.manifolds import port_legacy_vector_folder
 
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        if is_manifold:
-            shutil.copytree(src, dst)
-        else:
-            from saklas.io.manifolds import port_legacy_vector_folder
-            port_legacy_vector_folder(
-                src, namespace=dst_ns, name=dst_name, force=force,
-            )
-    return dst
+                    # ``stage_verify_swap`` creates the staging root up front;
+                    # the legacy porter intentionally requires a fresh target.
+                    staging.rmdir()
+                    port_legacy_vector_folder(
+                        source_path, namespace=dst_ns, name=dst_name,
+                        _target_folder=staging,
+                    )
+                try:
+                    ManifoldFolder.load(staging)
+                except ManifoldFormatError as exc:
+                    raise ManifoldInstallConflict(
+                        f"{src}: staged local manifold failed validation ({exc})"
+                    ) from exc
+
+            def _swap() -> Path:
+                return stage_verify_swap(
+                    dst, force=force, label=str(src), build=_build,
+                    make_error=ManifoldInstallConflict,
+                )
+
+            if force and dst.exists():
+                from saklas.io.manifold_folder import (
+                    destructive_manifold_folder_transaction,
+                )
+
+                with destructive_manifold_folder_transaction(dst):
+                    return _swap()
+            return _swap()
+
+    source_resolved = src.expanduser().resolve()
+    reserved = {
+        dst.with_name(dst.name + ".staging").resolve(strict=False),
+        dst.with_name(dst.name + ".bak").resolve(strict=False),
+    }
+    if source_resolved in reserved:
+        import tempfile
+
+        # Snapshot reserved-sibling sources before recovery/staging cleanup can
+        # rename or delete their only copy. This path is rare and correctness is
+        # worth the extra copy; normal installs still stream source→staging once.
+        with tempfile.TemporaryDirectory(prefix="saklas-local-install-") as tmp:
+            snapshot = Path(tmp) / src.name
+            shutil.copytree(src, snapshot)
+            return _install_from(snapshot)
+    return _install_from(src)

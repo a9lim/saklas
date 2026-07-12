@@ -166,7 +166,12 @@ work; rm/recreate changes the folder artifact id. Fitted pairs use stable
 digest-named locks outside the removable folder; clear/rm/refresh acquire the
 manifest lock followed by affected pair locks in deterministic order. Transfer
 provenance is part of the initial sidecar publication, and a pair left unproven
-by a failed manifest update is repaired on an ordinary retry. Whole-folder force
+by a failed manifest update is repaired on an ordinary retry; the CLI delegates
+target existence to that proof-aware backend rather than treating raw path
+presence as a conflict. A short manifest+pair preflight proves the source and
+rejects only a trusted existing target before any model/alignment work; the
+backend repeats the proof authoritatively under its full transfer transaction.
+Whole-folder force
 authoring resets and HF stage swaps use the same manifest → sorted stable-pair
 order before removing/renaming a destination, so they cannot unlink a tensor
 while a fitted reader owns its logical pair lock. This composes with fit-side
@@ -308,8 +313,12 @@ the model card (`_render_manifold_card`) carries `library_name: saklas`,
 `saklas-manifold` tags, deduped `base_model:`, `base_model_relation: adapter`.
 `search_manifolds`/`fetch_manifold_info` fill the picker fields (`domain_label`,
 `node_count`, `fit_mode`, `tensor_models`); `install_manifold` orchestrates HF
-pulls + `_install_local_manifold` copies. `ManifoldInstallConflict` on an existing
-folder without `force`.
+pulls + `_install_local_manifold` copies. Local copies use the same validated
+stage/swap recovery discipline as HF pulls, and a force install whose source is
+already the resolved destination is an exact no-op rather than self-deletion.
+If a caller explicitly supplies the reserved `.staging`/`.bak` sibling as its
+only source, it is snapshotted before recovery/cleanup can rename or delete it.
+`ManifoldInstallConflict` on an existing folder without `force`.
 
 ## gguf_io.py
 
@@ -368,7 +377,12 @@ preflight; the materializing loader additionally checks finiteness. A stable
 per-model neutral-fit lock spans cache recheck, capture, and publication, while
 the directional source→target alignment-fit lock spans both model loads and the
 second cache recheck; concurrent cold transfer commands never duplicate the
-exact neutral forwards or Procrustes fit.
+exact neutral forwards or Procrustes fit. The alignment workflow uses the
+metadata-returning neutral loader, so each materialized cache also supplies its
+already-validated identity without a second payload hash. On a cold/stale
+alignment, the target whitener is built from those same resident target rows;
+an exact model-free repeat retains the offline cache loader. Transfer therefore
+does not reopen and refactor the target neutral artifact after alignment prep.
 `fit_alignment(src, tgt, *, min_shared_layers=10) → {layer: M_L}`
 (orthogonal Procrustes for matched dim, rectangular least-squares otherwise; both
 center first); `alignment_quality` is per-layer R². `transfer_profile(profile,
@@ -441,7 +455,7 @@ temp file, `fsync`, then `os.replace`; `ReleasableArtifactLock` supports short
 cache transactions inside a longer fit, and `artifact_process_lease` /
 `artifact_has_live_lease` protect mapped immutable shards after that lock is
 released (PID-stale markers are reaped). `staging.py` — `stage_verify_swap` is the
-shared HF-install choreography: build under `.staging/`, recover `.bak` on
+shared install choreography: build under `.staging/`, recover `.bak` on
 interrupted swaps, then promote atomically (`target → .bak`, `.staging → target`)
 with best-effort restore. (`datasource.py` is gone — extraction takes node corpora
 directly.)

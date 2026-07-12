@@ -390,3 +390,89 @@ def test_install_manifold_refuses_bare_control_vector_folder(tmp_path: Path, mon
     (bare / "model.safetensors").write_bytes(b"not a real tensor")
     with pytest.raises(ValueError, match="statements.json"):
         install_manifold(str(bare))
+
+
+def test_force_local_install_onto_itself_is_safe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path / "home"))
+    from saklas.io.hf_manifolds import install_manifold
+    from saklas.io.manifolds import ManifoldFolder
+
+    folder = _author_fake_manifold(tmp_path / "home", monkeypatch)
+    manifest_before = (folder / "manifold.json").read_bytes()
+
+    assert install_manifold(str(folder), force=True) == folder
+    assert (folder / "manifold.json").read_bytes() == manifest_before
+    ManifoldFolder.load(folder)
+
+
+def test_force_local_install_copy_failure_preserves_destination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("SAKLAS_HOME", str(home))
+    from saklas.io import hf_manifolds as hfm
+    from saklas.io.manifolds import ManifoldFolder
+
+    source = _author_fake_manifold(home, monkeypatch, name="source")
+    target = _author_fake_manifold(home, monkeypatch, name="target")
+    manifest_before = (target / "manifold.json").read_bytes()
+    real_copytree = hfm.shutil.copytree
+
+    def fail_source_copy(src: Any, dst: Any, *args: Any, **kwargs: Any) -> Any:
+        if Path(src) == source:
+            raise OSError("injected local copy failure")
+        return real_copytree(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(hfm.shutil, "copytree", fail_source_copy)
+    with pytest.raises(OSError, match="local copy failure"):
+        hfm.install_manifold(str(source), as_="local/target", force=True)
+
+    assert (target / "manifold.json").read_bytes() == manifest_before
+    ManifoldFolder.load(target)
+    assert not target.with_name("target.staging").exists()
+
+
+def test_local_install_recovers_backup_before_nonforce_conflict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("SAKLAS_HOME", str(home))
+    from saklas.io import hf_manifolds as hfm
+    from saklas.io.manifolds import ManifoldFolder
+
+    source = _author_fake_manifold(home, monkeypatch, name="source")
+    target = _author_fake_manifold(home, monkeypatch, name="target")
+    backup = target.with_name("target.bak")
+    target.rename(backup)
+
+    with pytest.raises(hfm.ManifoldInstallConflict, match="exists"):
+        hfm.install_manifold(str(source), as_="local/target", force=False)
+
+    assert target.exists()
+    assert not backup.exists()
+    assert ManifoldFolder.load(target).name == "target"
+
+
+@pytest.mark.parametrize("suffix", [".staging", ".bak"])
+def test_force_local_install_snapshots_reserved_sibling_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, suffix: str,
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("SAKLAS_HOME", str(home))
+    from saklas.io import hf_manifolds as hfm
+    from saklas.io.manifolds import ManifoldFolder
+    from saklas.io.paths import manifold_dir
+
+    source = _author_fake_manifold(home, monkeypatch, name="source")
+    target = manifold_dir("local", "target")
+    reserved_source = target.with_name(target.name + suffix)
+    source.rename(reserved_source)
+
+    installed = hfm.install_manifold(
+        str(reserved_source), as_="local/target", force=True,
+    )
+
+    assert installed == target
+    ManifoldFolder.load(target)

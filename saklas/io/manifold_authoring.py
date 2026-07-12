@@ -458,6 +458,7 @@ def _create_discover_manifold_folder(
     node_kinds: Optional[dict[str, str | None]] = None,
     template_ref: Optional[str] = None,
     legacy_scenarios: Optional[list[str]] = None,
+    target_folder: Path | None = None,
 ) -> Path:
     """Internal discover writer.
 
@@ -496,7 +497,10 @@ def _create_discover_manifold_folder(
         for label, kind in node_kinds.items():
             kinds_resolved[label] = _validate_node_kind(name, label, kind)
 
-    folder = manifold_dir(namespace, name)
+    folder = (
+        Path(target_folder) if target_folder is not None
+        else manifold_dir(namespace, name)
+    )
     if (folder / "manifold.json").exists():
         raise FileExistsError(f"manifold {namespace}/{name} already exists")
 
@@ -746,6 +750,7 @@ def port_legacy_vector_folder(
     namespace: str = "local",
     name: Optional[str] = None,
     force: bool = False,
+    _target_folder: Path | None = None,
 ) -> tuple[Path, "ManifoldFolder"]:
     """Port a legacy ``vectors/<ns>/<c>/`` folder to a 2-node ``pca`` manifold.
 
@@ -818,7 +823,10 @@ def port_legacy_vector_folder(
         except (json.JSONDecodeError, OSError):
             pass
 
-    target = manifold_dir(namespace, name)
+    target = (
+        Path(_target_folder) if _target_folder is not None
+        else manifold_dir(namespace, name)
+    )
     from saklas.io.manifold_folder import _locked_manifest
 
     with _locked_manifest(target):
@@ -836,6 +844,7 @@ def port_legacy_vector_folder(
             node_corpora={pos_label: pos_corpus, neg_label: neg_corpus},
             hyperparams={"max_dim": 1, "var_threshold": 0.70},
             legacy_scenarios=scenarios,
+            target_folder=target,
         )
         mf = ManifoldFolder.load(target)
         if tags:

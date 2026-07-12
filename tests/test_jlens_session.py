@@ -811,7 +811,7 @@ def test_fit_jlens_resumes_from_checkpoint_without_full_artifact() -> None:
     )
 
     messages: list[str] = []
-    resumed = _StubSession().fit_jlens(_PROMPTS, on_progress=messages.append)
+    resumed = head_session.fit_jlens(_PROMPTS, on_progress=messages.append)
 
     assert any("resuming from checkpoint at 2 prompts" in m for m in messages)
     assert resumed.n_prompts == len(_PROMPTS)
@@ -827,6 +827,7 @@ def test_fit_jlens_checkpoint_survives_two_interruptions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import saklas.core.jlens as jlens_mod
+    import saklas.io.lens as lens_io
 
     full = _StubSession().fit_jlens(_PROMPTS, force=True)
     head_session = _StubSession()
@@ -872,6 +873,15 @@ def test_fit_jlens_checkpoint_survives_two_interruptions(
     assert checkpoint[1]["base_n_prompts"] == 0
 
     monkeypatch.setattr(jlens_mod, "fit_jacobian_lens", real_fit)
+    monkeypatch.setattr(
+        lens_io, "load_lens",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError(
+                "farther self-contained checkpoint should win before "
+                "durable payload materialization"
+            )
+        ),
+    )
     messages: list[str] = []
     resumed = _StubSession().fit_jlens(_PROMPTS, on_progress=messages.append)
     assert any("checkpoint at 3 prompts" in message for message in messages)
@@ -879,6 +889,103 @@ def test_fit_jlens_checkpoint_survives_two_interruptions(
         assert torch.allclose(
             resumed.jacobians[layer], full.jacobians[layer], atol=2e-3,
         )
+
+
+def test_corrupt_farther_checkpoint_falls_back_to_durable_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import saklas.core.jlens as jlens_mod
+
+    session = _StubSession()
+    durable = session.fit_jlens(_PROMPTS[:2], force=True)
+    consumed = [
+        [int(tok) for tok in session._tokenizer(
+            prompt, return_tensors="pt",
+        )["input_ids"][0].tolist()]
+        for prompt in _PROMPTS
+    ]
+    corpus_sha = hashlib.sha256(repr(consumed).encode("utf-8")).hexdigest()
+    farther = JacobianLens(
+        {layer: tensor.clone() for layer, tensor in durable.jacobians.items()},
+        n_prompts=3, d_model=durable.d_model,
+    )
+    save_lens_checkpoint(
+        farther, _MODEL_ID, base_n_prompts=0,
+        corpus_spec="test", corpus_sha256=corpus_sha,
+        corpus_hash_kind="token_ids_v1", seq_len=128, dim_batch=8,
+        skip_first=16,
+        model_fingerprint=loaded_model_fingerprint(
+            session._model, _MODEL_ID,
+        ),
+    )
+    checkpoint_tensor, _checkpoint_sidecar = lens_checkpoint_paths(_MODEL_ID)
+    payload = bytearray(checkpoint_tensor.read_bytes())
+    payload[-1] ^= 1
+    checkpoint_tensor.write_bytes(payload)
+
+    real_fit = jlens_mod.fit_jacobian_lens
+    initial_counts: list[int | None] = []
+
+    def capture_initial(*args: Any, **kwargs: Any) -> Any:
+        initial = kwargs.get("initial_lens")
+        initial_counts.append(initial.n_prompts if initial is not None else None)
+        return real_fit(*args, **kwargs)
+
+    monkeypatch.setattr(jlens_mod, "fit_jacobian_lens", capture_initial)
+    result = session.fit_jlens(_PROMPTS)
+
+    assert initial_counts == [2]
+    assert result.n_prompts == len(_PROMPTS)
+
+
+def test_matching_checkpoint_evicts_incompatible_resident_before_load(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import gc
+    import weakref
+
+    import saklas.io.lens as lens_io
+
+    session = _StubSession()
+    session.fit_jlens(_PROMPTS[:2], force=True)
+    resident = session._jlens
+    assert resident is not None
+    resident_ref = weakref.ref(resident)
+    checkpoint = JacobianLens(
+        {layer: tensor.clone() for layer, tensor in resident.jacobians.items()},
+        n_prompts=2, d_model=resident.d_model,
+    )
+    del resident
+    changed = ["a changed first prompt that is long enough", *_PROMPTS[1:]]
+    consumed = [
+        [int(tok) for tok in session._tokenizer(
+            prompt, return_tensors="pt",
+        )["input_ids"][0].tolist()]
+        for prompt in changed
+    ]
+    save_lens_checkpoint(
+        checkpoint, _MODEL_ID, base_n_prompts=0,
+        corpus_spec="test",
+        corpus_sha256=hashlib.sha256(repr(consumed).encode("utf-8")).hexdigest(),
+        corpus_hash_kind="token_ids_v1", seq_len=128, dim_batch=8,
+        skip_first=16,
+        model_fingerprint=loaded_model_fingerprint(
+            session._model, _MODEL_ID,
+        ),
+    )
+    real_load = lens_io.load_lens_checkpoint
+    resident_gone_at_load: list[bool] = []
+
+    def observe_load(*args: Any, **kwargs: Any) -> Any:
+        gc.collect()
+        resident_gone_at_load.append(resident_ref() is None)
+        return real_load(*args, **kwargs)
+
+    monkeypatch.setattr(lens_io, "load_lens_checkpoint", observe_load)
+    result = session.fit_jlens(changed)
+
+    assert resident_gone_at_load == [True]
+    assert result.n_prompts == len(changed)
 
 
 def test_resident_prefix_is_reloaded_after_resume_failure(

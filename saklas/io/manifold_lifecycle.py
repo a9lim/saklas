@@ -451,6 +451,60 @@ def _refresh_manifold_locked(
 # the transferred tensor.  Do not rebuild the Procrustes solver here.
 
 
+def _transfer_preflight_locked(
+    folder: Path, *, from_model: str, to_model: str, force: bool,
+) -> tuple[Path, Path, dict[str, Any], dict[str, str], bool]:
+    """Prove the source pair and classify the target with locks already held."""
+    from saklas.io.packs import verify_integrity
+    from saklas.io.paths import tensor_filename
+
+    folder = Path(folder)
+    source = folder / tensor_filename(from_model)
+    target = folder / tensor_filename(to_model, transferred_from=from_model)
+    with open(folder / "manifold.json") as handle:
+        manifest = json.load(handle)
+    files = manifest.get("files", {})
+    if not isinstance(files, dict):
+        raise ManifoldFormatError("manifold files manifest must be an object")
+
+    def trusted_pair(tensor: Path) -> bool:
+        sidecar = tensor.with_suffix(".json")
+        expected = (
+            {tensor.name: files[tensor.name], sidecar.name: files[sidecar.name]}
+            if tensor.name in files and sidecar.name in files else {}
+        )
+        return bool(expected) and verify_integrity(folder, expected)[0]
+
+    if not trusted_pair(source):
+        raise ManifoldNotFoundError(
+            f"manifold {folder.name!r} has no trusted fit for source model "
+            f"{from_model!r} at {source}"
+        )
+    target_trusted = trusted_pair(target)
+    if target_trusted and not force:
+        raise ManifoldExistsError(
+            f"{target} already exists; pass force=True to overwrite"
+        )
+    return source, target, manifest, dict(files), target_trusted
+
+
+def preflight_transfer_manifold(
+    folder: Path, *, from_model: str, to_model: str, force: bool = False,
+) -> None:
+    """Cheap proof-aware transfer preflight before alignment/model work."""
+    from saklas.io.manifold_folder import _locked_manifest
+    from saklas.io.paths import tensor_filename
+
+    folder = Path(folder)
+    source = folder / tensor_filename(from_model)
+    target = folder / tensor_filename(to_model, transferred_from=from_model)
+    with _locked_manifest(folder):
+        with _locked_manifold_pairs([source, target]):
+            _transfer_preflight_locked(
+                folder, from_model=from_model, to_model=to_model, force=force,
+            )
+
+
 def transfer_manifold(
     folder: Path,
     *,
@@ -553,20 +607,25 @@ def _transfer_manifold_locked(
         save_manifold,
         transfer_manifold_subspaces,
     )
-    from saklas.io.paths import tensor_filename
 
     folder = Path(folder)
-    src_tensor = folder / tensor_filename(from_model)
-    if not src_tensor.exists():
-        raise ManifoldNotFoundError(
-            f"manifold {folder.name!r} has no fit for source model "
-            f"{from_model!r} at {src_tensor}"
-        )
+    (
+        src_tensor, out_path, manifest, files, target_trusted,
+    ) = _transfer_preflight_locked(
+        folder, from_model=from_model, to_model=to_model, force=force,
+    )
     if not alignment:
         raise ManifoldFormatError(
             f"transfer_manifold: alignment map for {from_model!r} → "
             f"{to_model!r} is empty"
         )
+
+    # Classify the destination before loading/folding the source manifold.  A
+    # proven pair preserves ordinary exists semantics; an unproven pair is a
+    # crash-left publication that this exact producer may repair.  The public
+    # wrapper holds manifest + source/target pair locks, so this proof remains
+    # authoritative until publication completes.
+    sidecar_path = out_path.with_suffix(".json")
 
     src = load_manifold(src_tensor)
     # ``load_manifold`` returns metadata from the same locked pair read.  Do
@@ -600,8 +659,6 @@ def _transfer_manifold_locked(
     except ValueError as exc:
         raise ManifoldFormatError(f"transfer_manifold: {exc}") from exc
 
-    out_path = folder / tensor_filename(to_model, transferred_from=from_model)
-
     # Carry the discover-mode per-model layout (``node_coords``) and the
     # source sidecar's provenance fields into the transferred tensor, then
     # stamp the transfer method + source id.  ``save_manifold`` reads
@@ -620,41 +677,18 @@ def _transfer_manifold_locked(
     metadata["share_metric"] = "mahalanobis"
     if transfer_quality_estimate is not None:
         metadata["transfer_quality_estimate"] = float(transfer_quality_estimate)
-    sidecar_path = out_path.with_suffix(".json")
-    from saklas.io.manifold_folder import _locked_manifest
-    from saklas.io.packs import verify_integrity
-
-    with _locked_manifest(folder):
-        with open(folder / "manifold.json") as handle:
-            manifest = json.load(handle)
-        files = manifest.get("files", {})
-        expected = (
-            {
-                out_path.name: files[out_path.name],
-                sidecar_path.name: files[sidecar_path.name],
-            }
-            if isinstance(files, dict)
-            and out_path.name in files and sidecar_path.name in files
-            else {}
-        )
-        trusted = bool(expected) and verify_integrity(folder, expected)[0]
-        if trusted and not force:
-            raise ManifoldExistsError(
-                f"{out_path} already exists; pass force=True to overwrite"
-            )
-        if not trusted:
-            out_path.unlink(missing_ok=True)
-            sidecar_path.unlink(missing_ok=True)
-            if isinstance(files, dict):
-                files = dict(files)
-                files.pop(out_path.name, None)
-                files.pop(sidecar_path.name, None)
-                manifest["files"] = files
-                write_json_atomic(folder / "manifold.json", manifest)
-        current = ManifoldFolder.load(folder, verify_manifest=False)
-        metadata["nodes_sha256"] = current.nodes_sha256()
-        save_manifold(transferred, out_path, metadata)
-        current.update_file_hashes(out_path, sidecar_path)
+    if not target_trusted:
+        out_path.unlink(missing_ok=True)
+        sidecar_path.unlink(missing_ok=True)
+        files = dict(files)
+        files.pop(out_path.name, None)
+        files.pop(sidecar_path.name, None)
+        manifest["files"] = files
+        write_json_atomic(folder / "manifold.json", manifest)
+    current = ManifoldFolder.load(folder, verify_manifest=False)
+    metadata["nodes_sha256"] = current.nodes_sha256()
+    save_manifold(transferred, out_path, metadata)
+    current.update_file_hashes(out_path, sidecar_path)
     return out_path
 
 

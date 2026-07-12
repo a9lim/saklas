@@ -100,9 +100,9 @@ def _load_or_fit_transfer_alignment(
     force: bool,
     label: str,
 ) -> tuple[
-    dict[int, Any], dict[int, float], Path, dict[str, Any], dict[str, Any],
+    dict[int, Any], dict[int, float], Path, dict[str, Any], dict[str, Any], Any,
 ]:
-    """Single-flight a complete transfer alignment, including model loads."""
+    """Single-flight a complete alignment plus its target metric."""
     from saklas.io.alignment import alignment_fit_lock
 
     with alignment_fit_lock(src_model, tgt_model):
@@ -118,16 +118,16 @@ def _load_or_fit_transfer_alignment_locked(
     force: bool,
     label: str,
 ) -> tuple[
-    dict[int, Any], dict[int, float], Path, dict[str, Any], dict[str, Any],
+    dict[int, Any], dict[int, float], Path, dict[str, Any], dict[str, Any], Any,
 ]:
-    """Load or fit a Procrustes alignment for vector/manifold transfer."""
+    """Load or fit an alignment and return its identity-matched target whitener."""
     from saklas.io.alignment import (
         AlignmentError,
         alignment_cache_path,
         alignment_quality,
         fit_alignment,
         load_alignment_map,
-        load_or_compute_neutral_activations,
+        load_or_compute_neutral_activations_with_metadata,
         neutral_cache_identity,
         save_alignment_map,
         validate_neutral_cache_metadata,
@@ -163,9 +163,12 @@ def _load_or_fit_transfer_alignment_locked(
                         int(k): float(v) for k, v in raw_q.items()
                     }
                     map_path, _ = alignment_cache_path(src_model, tgt_model)
+                    target_whitener = _target_whitener_from_neutral_cache(
+                        tgt_model, expected_identity=tgt_identity,
+                    )
                     return (
                         M, quality_per_layer, map_path,
-                        src_identity, tgt_identity,
+                        src_identity, tgt_identity, target_whitener,
                     )
         except (OSError, RuntimeError, ValueError, TypeError, KeyError):
             pass
@@ -182,21 +185,31 @@ def _load_or_fit_transfer_alignment_locked(
     with SaklasSession.from_pretrained(
         src_model, device="auto", probes=[],
     ) as src_sess:
-        src_acts = load_or_compute_neutral_activations(
+        src_acts, src_sidecar = load_or_compute_neutral_activations_with_metadata(
             src_sess.model, src_sess.tokenizer, src_sess.layers,
             model_id=src_model, force=force,
         )
-        src_sidecar = validate_neutral_cache_metadata(src_model)
         src_identity = neutral_cache_identity(src_sidecar)
     with SaklasSession.from_pretrained(
         tgt_model, device="auto", probes=[],
     ) as tgt_sess:
-        tgt_acts = load_or_compute_neutral_activations(
+        tgt_acts, tgt_sidecar = load_or_compute_neutral_activations_with_metadata(
             tgt_sess.model, tgt_sess.tokenizer, tgt_sess.layers,
             model_id=tgt_model, force=force,
         )
-        tgt_sidecar = validate_neutral_cache_metadata(tgt_model)
         tgt_identity = neutral_cache_identity(tgt_sidecar)
+    # The target activations are already resident for Procrustes. Build the
+    # mandatory target metric lazily from this exact validated tensor set just
+    # before return: this avoids reopening the cache without retaining a second
+    # centered row roster during the alignment SVDs.
+    from saklas.core.mahalanobis import LayerWhitener
+
+    def _resident_target_whitener() -> Any:
+        return LayerWhitener.from_neutral_activations(
+            tgt_acts,
+            {layer: tensor.mean(dim=0) for layer, tensor in tgt_acts.items()},
+        )
+
     cached = None if force else load_alignment_map(
         src_model, tgt_model,
         source_identity=src_identity, target_identity=tgt_identity,
@@ -206,7 +219,12 @@ def _load_or_fit_transfer_alignment_locked(
         raw_q = sidecar.get("quality_per_layer") or {}
         quality_per_layer = {int(k): float(v) for k, v in raw_q.items()}
         map_path, _ = alignment_cache_path(src_model, tgt_model)
-        return M, quality_per_layer, map_path, src_identity, tgt_identity
+        del src_acts
+        target_whitener = _resident_target_whitener()
+        return (
+            M, quality_per_layer, map_path, src_identity, tgt_identity,
+            target_whitener,
+        )
     try:
         M = fit_alignment(src_acts, tgt_acts)
     except AlignmentError as e:
@@ -219,7 +237,12 @@ def _load_or_fit_transfer_alignment_locked(
         source_identity=src_identity, target_identity=tgt_identity,
         quality_per_layer=quality_per_layer,
     )
-    return M, quality_per_layer, map_path, src_identity, tgt_identity
+    del src_acts
+    target_whitener = _resident_target_whitener()
+    return (
+        M, quality_per_layer, map_path, src_identity, tgt_identity,
+        target_whitener,
+    )
 
 
 def _make_session(args: argparse.Namespace, *, load_probes: bool = True):
@@ -2092,9 +2115,9 @@ def _run_manifold_transfer(args: argparse.Namespace) -> None:
     import json as _json
 
     from saklas.io.manifolds import (
-        ManifoldFormatError, transfer_manifold,
+        ManifoldFormatError, preflight_transfer_manifold, transfer_manifold,
     )
-    from saklas.io.paths import manifold_dir, safe_model_id, tensor_filename
+    from saklas.io.paths import manifold_dir, safe_model_id
 
     ns, name = _resolve_manifold_ns_name(args.name)
     folder = manifold_dir(ns, name)
@@ -2105,49 +2128,35 @@ def _run_manifold_transfer(args: argparse.Namespace) -> None:
         )
         sys.exit(1)
 
-    src_tensor = folder / tensor_filename(args.src_model)
-    if not src_tensor.exists():
-        print(
-            f"manifold transfer: source fit not found at {src_tensor} — fit "
-            f"the manifold on {args.src_model} first",
-            file=sys.stderr,
+    try:
+        preflight_transfer_manifold(
+            folder, from_model=args.src_model, to_model=args.tgt_model,
+            force=args.force,
         )
+    except (FileNotFoundError, FileExistsError, ManifoldFormatError) as e:
+        print(f"manifold transfer failed: {e}", file=sys.stderr)
         sys.exit(1)
 
-    tgt_tensor = folder / tensor_filename(
-        args.tgt_model, transferred_from=args.src_model,
-    )
-    if tgt_tensor.exists() and not args.force:
-        print(
-            f"manifold transfer: target already exists at {tgt_tensor}; "
-            f"pass -f to recompute",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    M, quality_per_layer, _, source_identity, target_identity = (
-        _load_or_fit_transfer_alignment(
-        args.src_model, args.tgt_model, force=args.force, label="manifold transfer",
-        )
-    )
-
-    median_quality = median_or_zero(list(quality_per_layer.values())) if quality_per_layer else None
-
-    # Target whitener for the Mahalanobis-share re-bake.  Read the target
-    # neutral cache directly and center by its own per-layer mean — the
-    # neutral mean *is* the probe-centering baseline, so no separate
-    # layer_means cache is needed.  Mahalanobis is mandatory: a missing /
-    # unusable target cache raises ``WhitenerError`` here (no Euclidean
-    # rebake), surfaced to the user as a fatal transfer error.
+    # Alignment construction also returns the identity-matched target
+    # whitener. On a cold/stale fit it is built directly from the target
+    # activations already resident for Procrustes; an exact model-free repeat
+    # uses the offline cache loader. Either path reads the target neutral
+    # artifact once for this operation.
     from saklas.core.mahalanobis import WhitenerError
 
     try:
-        target_whitener = _target_whitener_from_neutral_cache(
-            args.tgt_model, expected_identity=target_identity,
+        (
+            M, quality_per_layer, _, source_identity, target_identity,
+            target_whitener,
+        ) = _load_or_fit_transfer_alignment(
+            args.src_model, args.tgt_model, force=args.force,
+            label="manifold transfer",
         )
     except WhitenerError as e:
         print(f"manifold transfer failed: {e}", file=sys.stderr)
         sys.exit(1)
+
+    median_quality = median_or_zero(list(quality_per_layer.values())) if quality_per_layer else None
 
     try:
         out_path = transfer_manifold(

@@ -942,7 +942,11 @@ rebuilds the graph at the first uncommitted row. Self-contained checkpoints
 accumulator sums, avoiding a second full fp32 lens and supporting repeated
 interruption or missing-layer top-up resume. A resumed prefix is converted from
 average to weighted sum in place and becomes the tail estimator's accumulator,
-so resume retains one full fp32 lens rather than two. Sparse layer top-ups reuse the
+so resume retains one full fp32 lens rather than two. Sidecar progress is compared
+before payload load, so a farther self-contained checkpoint displaces the older
+durable/resident matrices without a transient two-lens peak; failed checkpoint
+digest validation falls back to the durable prefix only after releasing the bad
+payload. Sparse layer top-ups reuse the
 unchanged durable shard pointers and write only new matrices. The streamed
 safetensors writer never retains a complete fp16 mapping. Normal corpus extension
 resumes from an exact token-id prefix; the default dataset is commit-pinned;
@@ -1094,6 +1098,11 @@ transfer` routes to this one transfer path. Alignments cache under the *target*
 model dir. Stable per-model neutral-capture locks and directional alignment-fit
 locks span cache recheck through publication (including both serial model
 loads), so two cold transfer commands do not repeat the same capture/fit work.
+The materializing neutral loader returns the sidecar validated in that same
+transaction, and cold alignment prep builds the target whitener directly from
+the already-resident target rows. The model-free cached repeat keeps the offline
+loader; neither path reopens the target neutral artifact after returning the
+alignment.
 
 ---
 

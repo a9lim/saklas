@@ -12,6 +12,9 @@ Public surface:
 
 * :func:`load_or_compute_neutral_activations` — disk-cached per-model
   neutral-statement activations; ``[N=90, D]`` per layer, stored fp32.
+  Its metadata-returning sibling lets dependent artifact builders reuse the
+  sidecar validated in that same cache transaction instead of hashing the
+  payload again merely to recover its identity.
 * :func:`fit_alignment` — per-layer alignment map ``M_L : ℝ^D_src → ℝ^D_tgt``.
 * :func:`transfer_profile` — apply the alignment map to a profile.
 * :func:`alignment_cache_path` — disk cache for the fitted map keyed by
@@ -175,35 +178,57 @@ def load_or_compute_neutral_activations(
     model_id: str,
     force: bool = False,
 ) -> dict[int, torch.Tensor]:
-    """Single-flight wrapper around neutral-cache validation and capture."""
-    with neutral_fit_lock(model_id):
-        return _load_or_compute_neutral_activations_locked(
-            model, tokenizer, layers, model_id=model_id, force=force,
-        )
+    """Single-flight neutral-cache load/capture, returning activations only."""
+    activations, _sidecar = load_or_compute_neutral_activations_with_metadata(
+        model, tokenizer, layers, model_id=model_id, force=force,
+    )
+    return activations
 
 
-def _load_or_compute_neutral_activations_locked(
+def load_or_compute_neutral_activations_with_metadata(
     model: Any,
     tokenizer: Any,
     layers: Any,
     *,
     model_id: str,
     force: bool = False,
-) -> dict[int, torch.Tensor]:
+) -> tuple[dict[int, torch.Tensor], dict[str, Any]]:
+    """Return activations plus the sidecar proven in the same transaction.
+
+    Alignment fitting needs both the materialized neutral rows and their stable
+    cache identity.  Returning the already-validated sidecar avoids an immediate
+    second full-file digest pass through
+    :func:`validate_neutral_cache_metadata`.  The activation-only public API
+    above remains the compatibility surface for ordinary whitener/probe callers.
+    """
+    with neutral_fit_lock(model_id):
+        return _load_or_compute_neutral_activations_with_metadata_locked(
+            model, tokenizer, layers, model_id=model_id, force=force,
+        )
+
+
+def _load_or_compute_neutral_activations_with_metadata_locked(
+    model: Any,
+    tokenizer: Any,
+    layers: Any,
+    *,
+    model_id: str,
+    force: bool = False,
+) -> tuple[dict[int, torch.Tensor], dict[str, Any]]:
     """Disk-cached per-statement activations for one model.
 
     Cache identity binds the exact rendered token rows and pooling positions,
     the loaded model weights, and the fitted layer set. The tensor payload is
     digest-verified before reuse. Stale/legacy cache → recompute and replace.
 
-    Returns ``{layer_idx: [N, D] fp32 CPU tensor}``.  Stored fp32 on disk so
-    the whitener covariance is built and inverted at full precision and the
-    compute path (cache miss) and cache-hit path return bit-identical tensors
-    (no precision seam — bf16's ~0.4% input error landed on exactly the
-    inverted quantity).  fp16 was abandoned because its 65504 ceiling overflows
-    gemma-3's extreme late-layer channels to ±inf (poisoning ``λ`` / ``K``);
-    fp32 has the range and, unlike the former bf16 store, no input-precision
-    loss, at the cost of ~2× disk on this one cache.
+    Returns ``({layer_idx: [N, D] fp32 CPU tensor}, validated_sidecar)``.
+    Stored fp32 on disk so the whitener covariance is built and inverted at
+    full precision and the compute path (cache miss) and cache-hit path return
+    bit-identical tensors (no precision seam — bf16's ~0.4% input error landed
+    on exactly the inverted quantity).  fp16 was abandoned because its 65504
+    ceiling overflows gemma-3's extreme late-layer channels to ±inf (poisoning
+    ``λ`` / ``K``); fp32 has the range and, unlike the former bf16 store, no
+    input-precision loss, at the cost of ~2× disk on this one cache.
     """
     from saklas.core.model import loaded_model_fingerprint
     from saklas.core.vectors import (
@@ -250,7 +275,7 @@ def _load_or_compute_neutral_activations_locked(
             )
             if identity_matches:
                 log.debug("Loaded cached neutral activations for %s", model_id)
-                return out
+                return out, sc
             else:
                 log.info(
                     "Neutral activations stale (model/token/corpus/layer identity changed); "
@@ -278,7 +303,7 @@ def _load_or_compute_neutral_activations_locked(
         tmp_path = ts_path.with_suffix(ts_path.suffix + ".tmp")
         save_file(fp32, str(tmp_path))
         os.replace(tmp_path, ts_path)
-        write_json_atomic(sc_path, {
+        sidecar: dict[str, Any] = {
             "method": "neutral_activations",
             "format_version": _NEUTRAL_CACHE_FORMAT_VERSION,
             "capture_version": _NEUTRAL_CAPTURE_VERSION,
@@ -295,8 +320,9 @@ def _load_or_compute_neutral_activations_locked(
                 next(iter(activations.values())).shape[0] if activations else 0
             ),
             "n_layers": len(activations),
-        })
-    return activations
+        }
+        write_json_atomic(sc_path, sidecar)
+    return activations, sidecar
 
 
 # ---------------------------------------------------------------------------

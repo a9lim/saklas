@@ -81,7 +81,12 @@ materialize another complete fp32 lens. Checkpoints are self-contained
 full artifact. Resume transfers ownership of the loaded prefix matrices into
 the estimator, scales them to raw sums in place, and accumulates the tail into
 that same storage; it therefore holds one full fp32 matrix set, not a base plus
-an equally large tail. Cadence never fractures a healthy prompt microbatch. When the
+an equally large tail. Durable/checkpoint sidecars are compared before either
+payload is paged; a farther self-contained checkpoint wins without first
+materializing the older durable lens (and any superseded resident/device stack
+is evicted before the checkpoint load). A checkpoint that passes header
+preflight but fails full digest/finite validation falls back to the durable
+prefix after the failed payload is released. Cadence never fractures a healthy prompt microbatch. When the
 terminal checkpoint is already the complete lens, finalization fsyncs its
 immutable per-layer tensor generations and atomically repoints the durable sidecar instead
 of converting/writing the same artifact again. The checkpoint remains the

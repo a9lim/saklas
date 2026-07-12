@@ -1948,6 +1948,15 @@ def test_transfer_manifold_refuses_overwrite_without_force(
         source_model_fingerprint="fp:src/m",
         target_model_fingerprint="fp:tgt/m",
     )
+    import saklas.core.manifold as manifold_mod
+
+    real_transfer = manifold_mod.transfer_manifold_subspaces
+    monkeypatch.setattr(
+        manifold_mod, "transfer_manifold_subspaces",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("trusted target performed transfer compute")
+        ),
+    )
     with pytest.raises(FileExistsError):
         transfer_manifold(
             folder, from_model="src/m", to_model="tgt/m", alignment=align, whitener=w,
@@ -1955,6 +1964,7 @@ def test_transfer_manifold_refuses_overwrite_without_force(
             target_model_fingerprint="fp:tgt/m",
         )
     # force=True overwrites cleanly.
+    monkeypatch.setattr(manifold_mod, "transfer_manifold_subspaces", real_transfer)
     transfer_manifold(
         folder, from_model="src/m", to_model="tgt/m", alignment=align,
         source_model_fingerprint="fp:src/m",
