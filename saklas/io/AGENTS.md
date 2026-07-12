@@ -22,8 +22,7 @@ barrier).
 `models/<safe>/sae/`: one release/layer identity sidecar plus the lazily
 fetched per-feature Neuronpedia metadata (`<release>-features.json` —
 `{id: {label, max_act}}`, where `max_act` is `maxActApprox`, the strength
-unit that normalizes the readout channel to 0..1; a legacy labels-only
-`-labels.json` still reads through). SAE weights remain in the Hugging Face
+unit that normalizes the readout channel to 0..1). SAE weights remain in the Hugging Face
 cache.
 
 Owns the tensor-filename variant scheme. A manifold folder can hold several

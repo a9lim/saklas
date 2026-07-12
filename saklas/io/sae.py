@@ -33,11 +33,6 @@ def sae_metadata_path(model_id: str, release: str) -> Path:
     return sae_runtime_dir(model_id) / f"{safe_release_id(release)}.json"
 
 
-def sae_labels_path(model_id: str, release: str) -> Path:
-    """Legacy per-feature label cache (read-only fallback; no writer)."""
-    return sae_runtime_dir(model_id) / f"{safe_release_id(release)}-labels.json"
-
-
 def sae_features_path(model_id: str, release: str) -> Path:
     return sae_runtime_dir(model_id) / f"{safe_release_id(release)}-features.json"
 
@@ -87,44 +82,25 @@ def _coerce_feature_entry(value: Any) -> dict[str, Any] | None:
 
 
 def load_sae_feature_meta(model_id: str, release: str) -> dict[str, dict[str, Any]]:
-    """Per-feature metadata cache: ``{feature_id: {label, max_act}}``.
-
-    Falls back to the legacy labels-only file (pre-normalization sessions)
-    so cached Neuronpedia labels survive the format change.
-    """
+    """Load the current ``{feature_id: {label, max_act}}`` metadata cache."""
     import json
 
     path = sae_features_path(model_id, release)
-    if path.exists():
-        try:
-            payload = json.loads(path.read_text())
-        except (OSError, ValueError):
-            return {}
-        features = payload.get("features") if isinstance(payload, dict) else None
-        if not isinstance(features, dict):
-            return {}
-        out: dict[str, dict[str, Any]] = {}
-        for key, value in features.items():
-            entry = _coerce_feature_entry(value)
-            if entry is not None:
-                out[str(key)] = entry
-        return out
-    # Legacy fallback — a labels-only cache written before max_act existed.
-    legacy = sae_labels_path(model_id, release)
-    if not legacy.exists():
+    if not path.exists():
         return {}
     try:
-        payload = json.loads(legacy.read_text())
+        payload = json.loads(path.read_text())
     except (OSError, ValueError):
         return {}
-    labels = payload.get("labels", payload) if isinstance(payload, dict) else {}
-    if not isinstance(labels, dict):
+    features = payload.get("features") if isinstance(payload, dict) else None
+    if not isinstance(features, dict):
         return {}
-    return {
-        str(key): {"label": str(value), "max_act": None}
-        for key, value in labels.items()
-        if isinstance(value, str) and value.strip()
-    }
+    out: dict[str, dict[str, Any]] = {}
+    for key, value in features.items():
+        entry = _coerce_feature_entry(value)
+        if entry is not None:
+            out[str(key)] = entry
+    return out
 
 
 def save_sae_feature_meta(

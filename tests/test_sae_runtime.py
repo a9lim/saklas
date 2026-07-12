@@ -319,29 +319,16 @@ def test_sae_runtime_metadata_roundtrip(
     }
 
 
-def test_sae_feature_meta_roundtrip_and_legacy_labels_fallback(
+def test_sae_feature_meta_roundtrip(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    from saklas.io.atomic import write_json_atomic
     from saklas.io.sae import (
         load_sae_feature_meta,
-        sae_labels_path,
         save_sae_feature_meta,
     )
 
-    # Legacy labels-only cache (pre-normalization sessions) reads through.
-    write_json_atomic(sae_labels_path("org/model", "rel"), {
-        "format_version": 1,
-        "model_id": "org/model",
-        "release": "rel",
-        "labels": {"7": "days of the week", "8": "  "},
-    })
-    assert load_sae_feature_meta("org/model", "rel") == {
-        "7": {"label": "days of the week", "max_act": None},
-    }
-
-    # The features file wins once written; junk entries are dropped.
+    assert load_sae_feature_meta("org/model", "rel") == {}
     save_sae_feature_meta("org/model", "rel", cast("dict[str, dict[str, Any]]", {
         "7": {"label": "days of the week", "max_act": 121.11, "checked": True},
         "9": {"label": None, "max_act": -3.0},

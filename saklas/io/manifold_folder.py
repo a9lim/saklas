@@ -256,9 +256,6 @@ def sanitize_hyperparams(
     return {k: v for k, v in hyperparams.items() if k in allowed}
 
 
-# Back-compat alias: the function was renamed to the public ``sanitize_hyperparams``.
-_sanitize_hyperparams = sanitize_hyperparams
-
 # Manifold artifact format version.  Decoupled from concept packs'
 # ``PACK_FORMAT_VERSION`` so the two formats can churn independently.
 # v3 is the arbitrary-dimensional / arbitrary-topology format (domain

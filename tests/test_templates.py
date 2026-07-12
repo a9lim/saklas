@@ -146,6 +146,14 @@ def test_iter_and_remove():
 
 # ---- validation invariants -------------------------------------------------
 
+@pytest.mark.parametrize("version", [None, 0, 2, "1", True])
+def test_requires_current_format_version(version: Any):
+    payload = _make().to_payload()
+    payload["format_version"] = version
+    with pytest.raises(TemplateFormatError, match="format_version must be 1"):
+        TemplateFolder.from_payload(payload)
+
+
 def test_rejects_slot_in_history_turn():
     with pytest.raises(TemplateFormatError, match="not contain the slot"):
         create_template_folder(

@@ -1280,7 +1280,7 @@ def _run_manifold_fit(args: argparse.Namespace) -> None:
             requested_hyperparams["k_nn"] = int(args.k_nn)
         if args.bandwidth is not None:
             requested_hyperparams["bandwidth"] = float(args.bandwidth)
-        # Spectral-only knob — dropped by ``_sanitize_hyperparams`` for a pca
+        # Spectral-only knob — dropped by ``sanitize_hyperparams`` for a pca
         # fit (a flat fit's per-layer subspace dim is its layout dim, capped
         # by ``--max-dim``, not a separate knob).
         if getattr(args, "max_subspace_dim", None) is not None:

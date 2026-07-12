@@ -160,11 +160,6 @@ def all_concepts() -> list[ResolvedConcept]:
     return out
 
 
-# Back-compat alias: callers that import ``_all_concepts`` by the old name
-# continue to resolve here.  The public name is ``all_concepts``.
-_all_concepts = all_concepts
-
-
 def resolve(selector: Selector) -> list[ResolvedConcept]:
     concepts = all_concepts()
 
@@ -268,7 +263,7 @@ class ResolvedManifoldLabel:
 def _all_manifold_labels() -> list[ResolvedManifoldLabel]:
     """Flattened (namespace, manifold, label) index over every installed manifold.
 
-    Memoized on ``manifolds_dir()`` like :func:`_all_concepts`; callers filter
+    Memoized on ``manifolds_dir()`` like :func:`all_concepts`; callers filter
     in-memory by namespace + label. We cache the all-namespace walk (rather than
     keying the cache by namespace too) so a single entry serves every lookup,
     matching how ``resolve()`` filters the cached concept walk — bare-name

@@ -162,13 +162,10 @@ def test_allowlist_entries_are_still_present() -> None:
 _PROMOTED_OLD_NAMES = frozenset([
     "_manifold_is_affine",
     "_export_gguf_manifold",
-    "_all_concepts",
-    "_sanitize_hyperparams",
 ])
 
 # All cross-module import surfaces (cli/server/tui plus core helpers) must use
-# the promoted public names.  The old underscore aliases stay only for
-# back-compat monkeypatching in tests.
+# the promoted public names.
 _ALL_FRONTEND_DIRS = ("tui", "server", "cli", "core")
 
 _UNDERSCORE_IMPORT_RE = re.compile(

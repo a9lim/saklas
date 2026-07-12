@@ -1156,7 +1156,7 @@ def merge_discover_manifolds(
 
     Hyperparams default to the first source's; an explicit
     ``hyperparams`` arg replaces them wholesale (matches
-    ``create_discover_manifold_folder``'s shape).  ``_sanitize_hyperparams``
+    ``create_discover_manifold_folder``'s shape).  ``sanitize_hyperparams``
     drops cross-method keys at the IO boundary.
 
     The merged folder is written *unfitted* — no per-model tensor is

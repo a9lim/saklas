@@ -238,10 +238,14 @@ class TemplateFolder:
         if not isinstance(data, dict):
             raise TemplateFormatError("template.json must be a JSON object")
         fmt = data.get("format_version")
-        if fmt is not None and fmt > TEMPLATE_FORMAT_VERSION:
+        if (
+            not isinstance(fmt, int)
+            or isinstance(fmt, bool)
+            or fmt != TEMPLATE_FORMAT_VERSION
+        ):
             raise TemplateFormatError(
-                f"template format_version {fmt} is newer than this build "
-                f"supports ({TEMPLATE_FORMAT_VERSION})"
+                f"template format_version must be {TEMPLATE_FORMAT_VERSION}, "
+                f"got {fmt!r}"
             )
         name = data.get("name")
         if not isinstance(name, str) or not NAME_REGEX.match(name):
@@ -633,7 +637,11 @@ def materialize_bundled_templates() -> None:
             != _canonical_json_sha256(bundled_bytes)
         )
         fmt = on_disk_payload.get("format_version")
-        format_stale = isinstance(fmt, int) and fmt < TEMPLATE_FORMAT_VERSION
+        format_stale = (
+            not isinstance(fmt, int)
+            or isinstance(fmt, bool)
+            or fmt != TEMPLATE_FORMAT_VERSION
+        )
         if not hash_changed and not format_stale:
             continue
 
