@@ -34,8 +34,11 @@ band-restricted fit never backprops below its lowest source. A terminal-layer
 hook captures the target residual and aborts the rest of the forward before
 the final norm and full-vocabulary head. Row blocks are staged in bounded
 per-layer stripes, validated after transfer, and committed directly into the
-CPU fp32 cross-prompt accumulator. If a later VJP OOMs, the graph is rebuilt at
-the first uncommitted row instead of discarding earlier work. The MPS sync
+CPU fp32 cross-prompt accumulator; CUDA double-buffers those stripes so D2H for
+one can overlap the next backward block. If a later VJP OOMs, the graph is
+rebuilt at the first uncommitted row, and prompt-width backoff splits only that
+group while preserving its exact committed prefix and every prior microbatch.
+The MPS sync
 budget is bounded from both sides: a fully unsynced loop can exhaust Metal's
 asynchronous command queue, so periodic drains plus the zero-row guard remain.
 The fit is compute-bound (each prompt ≈ ``d_model × 2`` forward-equivalents
@@ -1064,6 +1067,7 @@ def fit_jacobian_lens(
         "d_model": 0,
         "stripe_rows": None,
         "host_stripes": None,
+        "cuda_transfer_stream": None,
         "vjp_mode": "batched" if requested_vjp_mode == "auto" else requested_vjp_mode,
         "requested_vjp_mode": requested_vjp_mode,
     }
@@ -1105,6 +1109,14 @@ def fit_jacobian_lens(
     prompt_bad_ceiling: int | None = None
     cursor = 0
     next_checkpoint = checkpoint_every
+    # A task says: contributions for prompts [start:end] below ``row_start``
+    # are already in the accumulator; fit only the remaining output rows.  A
+    # prompt-width OOM can therefore split the task without erasing earlier
+    # microbatches or double-counting its committed row prefix.  ``n_done`` is
+    # advanced only after every task in the original group completes, keeping
+    # progress/checkpoints aligned to internally consistent prompt boundaries.
+    pending_tasks: list[tuple[int, int, int]] = []
+    pending_group_width = 0
 
     def _partial() -> JacobianLens:
         acc = state["acc"]
@@ -1123,21 +1135,32 @@ def fit_jacobian_lens(
     try:
         with torch.enable_grad():
             while cursor < len(prepared_rows):
-                if cancel_event is not None and cancel_event.is_set():
-                    if n_done > 0:
-                        if checkpoint_accumulator_cb is not None:
-                            checkpoint_accumulator_cb(
-                                state["acc"], n_done, state["d_model"],
-                            )
-                        if checkpoint_cb is not None:
-                            checkpoint_cb(_partial())
-                    raise JacobianLensCancelled(
-                        f"Jacobian-lens fit cancelled after {n_done} prompts"
+                if not pending_tasks:
+                    # Cancellation is observed only between complete prompt
+                    # groups.  During a split recovery the accumulator carries
+                    # committed rows for the whole group but ``n_done`` quite
+                    # deliberately does not count it yet.
+                    if cancel_event is not None and cancel_event.is_set():
+                        if n_done > 0:
+                            if checkpoint_accumulator_cb is not None:
+                                checkpoint_accumulator_cb(
+                                    state["acc"], n_done, state["d_model"],
+                                )
+                            if checkpoint_cb is not None:
+                                checkpoint_cb(_partial())
+                        raise JacobianLensCancelled(
+                            f"Jacobian-lens fit cancelled after {n_done} prompts"
+                        )
+                    pending_group_width = min(
+                        active_prompt_batch, len(prepared_rows) - cursor,
                     )
-                width = min(
-                    active_prompt_batch, len(prepared_rows) - cursor,
-                )
-                chunk = prepared_rows[cursor : cursor + width]
+                    pending_tasks.append(
+                        (cursor, cursor + pending_group_width, 0),
+                    )
+
+                task_start, task_end, task_row_start = pending_tasks.pop(0)
+                width = task_end - task_start
+                chunk = prepared_rows[task_start:task_end]
                 lengths_cpu = torch.tensor(
                     [int(row.numel()) for _idx, row in chunk], dtype=torch.long,
                 )
@@ -1159,8 +1182,24 @@ def fit_jacobian_lens(
                     if bool((lengths_cpu != max_len).any()) else None
                 )
                 batch = max(1, min(active_dim_batch, state["d_model"] or active_dim_batch))
-                committed_row = 0
+                committed_row = task_row_start
                 restart_with_smaller_prompts = False
+
+                def split_current_task(*, row_start: int, max_width: int) -> None:
+                    """Prepend exact narrower tasks for this prompt group.
+
+                    Rows below ``row_start`` already contain the aggregate for
+                    every prompt in the current task, so each child starts at
+                    that same boundary.  Their suffix contributions add to the
+                    same result as the original ragged microbatch.
+                    """
+                    child_width = max(1, min(int(max_width), width - 1))
+                    children = [
+                        (start, min(start + child_width, task_end), row_start)
+                        for start in range(task_start, task_end, child_width)
+                    ]
+                    pending_tasks[0:0] = children
+
                 while True:
                     retry_batch: int | None = None
                     try:
@@ -1181,55 +1220,49 @@ def fit_jacobian_lens(
                             "jlens: batched VJP is unavailable on this backend — "
                             "falling back to replicated output-row VJPs"
                         )
-                        if width > 1 and durable > 0:
-                            # Rows committed from a multi-prompt graph cannot
-                            # be split into the B=1 graph replicated mode needs.
-                            # Restart the suffix shard rather than count them
-                            # again under the narrower corpus width.
-                            for accumulator in state["acc"].values():
-                                accumulator.zero_()
-                            n_done = 0
-                            cursor = 0
-                            next_checkpoint = checkpoint_every
-                            committed_row = 0
-                            restart_with_smaller_prompts = True
-                            log.warning(
-                                "jlens: batched VJP failed after committed "
-                                "rows; restarting the current fit shard in "
-                                "replicated mode"
-                            )
-                            break
                         if width > 1:
+                            split_current_task(row_start=durable, max_width=1)
                             restart_with_smaller_prompts = True
+                            if durable > task_row_start:
+                                log.warning(
+                                    "jlens: batched VJP failed after committed "
+                                    "rows; preserving the row prefix while "
+                                    "splitting the prompt group for replicated "
+                                    "mode"
+                                )
                             break
                         committed_row = durable
                         continue
                     except _PromptRowsCommitted as exc:
                         committed_row = exc.committed_until
+                        if _downgrade_cuda_stripe_buffers(state, device):
+                            _empty_device_cache(device)
+                            log.warning(
+                                "jlens: CUDA OOM — dropping the second transfer "
+                                "slot and retrying from row %d", committed_row,
+                            )
+                            continue
                         if batch <= 1:
                             if width <= 1:
                                 raise
-                            # The smallest row stripe still cannot fit the
-                            # multi-prompt graph.  Some rows are already folded
-                            # into the shard accumulator, so restart this shard
-                            # at a narrower prompt width rather than double
-                            # count them or escape without trying B=1.
-                            for accumulator in state["acc"].values():
-                                accumulator.zero_()
-                            n_done = 0
-                            cursor = 0
-                            next_checkpoint = checkpoint_every
-                            committed_row = 0
+                            # The committed prefix is the exact aggregate for
+                            # this whole task. Split only its unfinished suffix;
+                            # prior prompt groups remain durable in memory.
                             prompt_bad_ceiling = (
                                 width if prompt_bad_ceiling is None
                                 else min(prompt_bad_ceiling, width)
                             )
                             active_prompt_batch = max(1, width // 2)
+                            split_current_task(
+                                row_start=committed_row,
+                                max_width=active_prompt_batch,
+                            )
                             restart_with_smaller_prompts = True
                             _empty_device_cache(device)
                             log.warning(
                                 "jlens: OOM after committed rows at "
-                                "dim_batch=1 — restarting the fit shard with "
+                                "dim_batch=1 — preserving them and splitting "
+                                "the prompt group with "
                                 "prompt_batch=%d", active_prompt_batch,
                             )
                             break
@@ -1245,28 +1278,28 @@ def fit_jacobian_lens(
                     except RuntimeError as exc:  # OOM → halve dim_batch and retry
                         if not is_out_of_memory_error(exc):
                             raise
+                        if _downgrade_cuda_stripe_buffers(state, device):
+                            _empty_device_cache(device)
+                            log.warning(
+                                "jlens: CUDA OOM — dropping the second transfer "
+                                "slot before narrowing estimator batches"
+                            )
+                            continue
                         if width > 1:
-                            if committed_row > 0:
-                                # A previous row block from this prompt graph
-                                # already lives in the shard accumulator.  The
-                                # raw OOM gives us no further durable boundary;
-                                # narrowing the prompt graph in place would add
-                                # those rows twice. Restart the suffix shard.
-                                for accumulator in state["acc"].values():
-                                    accumulator.zero_()
-                                n_done = 0
-                                cursor = 0
-                                next_checkpoint = checkpoint_every
-                                committed_row = 0
                             prompt_bad_ceiling = (
                                 width if prompt_bad_ceiling is None
                                 else min(prompt_bad_ceiling, width)
                             )
                             active_prompt_batch = max(1, width // 2)
+                            split_current_task(
+                                row_start=committed_row,
+                                max_width=active_prompt_batch,
+                            )
                             restart_with_smaller_prompts = True
                             _empty_device_cache(device)
                             log.warning(
-                                "jlens: OOM — retrying with prompt_batch=%d",
+                                "jlens: OOM — preserving committed rows and "
+                                "retrying with prompt_batch=%d",
                                 active_prompt_batch,
                             )
                             break
@@ -1280,15 +1313,18 @@ def fit_jacobian_lens(
                     log.warning("jlens: OOM — retrying prompt with dim_batch=%d", batch)
                 if restart_with_smaller_prompts:
                     continue
-                n_done += width
-                cursor += width
+                if pending_tasks:
+                    continue
+                completed_width = pending_group_width
+                n_done += completed_width
+                cursor += completed_width
                 if on_progress is not None:
                     mode = str(state["vjp_mode"])
                     elapsed = max(time.perf_counter() - fit_started, 1e-9)
                     on_progress(
                         f"prompt {progress_base + n_done}/"
                         f"{progress_base + len(prepared_rows)} "
-                        f"(prompt_batch={width}, dim_batch="
+                        f"(prompt_batch={completed_width}, dim_batch="
                         f"{state.get('effective_dim_batch', batch)}, vjp={mode}, "
                         f"elapsed={elapsed:.1f}s, rate={n_done / elapsed:.3f}/s)"
                     )
@@ -1368,6 +1404,10 @@ def _accumulate_prompt_jacobian(
     del layer_modules
     device = ids.device
     committed_until = int(row_start)
+    cuda_pending: list[tuple[int, int, torch.cuda.Event] | None] = []
+    drain_cuda_slot: Callable[[int], None] = lambda _slot: None
+    drain_cuda_pending_in_order: Callable[[], None] = lambda: None
+
     if lengths is None:
         lengths = torch.full(
             (prompt_count,), seq_len, dtype=torch.long, device=device,
@@ -1432,30 +1472,88 @@ def _accumulate_prompt_jacobian(
             }
             state["d_model"] = d_model
         stripe_capacity = min(_ROW_STRIPE, d_model)
-        if device.type != "cpu" and state["stripe_rows"] is None:
+        if device.type == "cuda" and state["stripe_rows"] is None:
+            # Two device/host slots let stripe N's D2H transfer overlap the
+            # backward passes that fill stripe N+1.  Allocation pressure falls
+            # back to the former one-slot behavior without changing results.
+            try:
+                state["stripe_rows"] = [
+                    {
+                        l: torch.empty(
+                            stripe_capacity, d_model, dtype=torch.float32,
+                            device=device,
+                        )
+                        for l in sources
+                    }
+                    for _ in range(2)
+                ]
+                state["host_stripes"] = [
+                    {
+                        l: torch.empty(
+                            stripe_capacity, d_model, dtype=torch.float32,
+                            pin_memory=True,
+                        )
+                        for l in sources
+                    }
+                    for _ in range(2)
+                ]
+                state["cuda_transfer_stream"] = torch.cuda.Stream(device=device)
+            except RuntimeError:
+                state["stripe_rows"] = None
+                state["host_stripes"] = None
+                state["cuda_transfer_stream"] = None
+                _empty_device_cache(device)
+                state["stripe_rows"] = [
+                    {
+                        l: torch.empty(
+                            stripe_capacity, d_model, dtype=torch.float32,
+                            device=device,
+                        )
+                        for l in sources
+                    }
+                ]
+                try:
+                    host = {
+                        l: torch.empty(
+                            stripe_capacity, d_model, dtype=torch.float32,
+                            pin_memory=True,
+                        )
+                        for l in sources
+                    }
+                except RuntimeError:
+                    host = {
+                        l: torch.empty(
+                            stripe_capacity, d_model, dtype=torch.float32,
+                        )
+                        for l in sources
+                    }
+                state["host_stripes"] = [host]
+                state["cuda_transfer_stream"] = torch.cuda.Stream(device=device)
+                log.warning(
+                    "jlens: CUDA stripe double-buffer allocation failed; "
+                    "using one transfer slot"
+                )
+        elif device.type == "mps" and state["stripe_rows"] is None:
             state["stripe_rows"] = {
                 l: torch.empty(
                     stripe_capacity, d_model, dtype=torch.float32, device=device,
                 )
                 for l in sources
             }
-        if device.type != "cpu" and state["host_stripes"] is None:
-            try:
-                state["host_stripes"] = {
-                    l: torch.empty(
-                        stripe_capacity, d_model, dtype=torch.float32,
-                        pin_memory=device.type == "cuda",
-                    )
-                    for l in sources
-                }
-            except RuntimeError:
-                state["host_stripes"] = {
-                    l: torch.empty(stripe_capacity, d_model, dtype=torch.float32)
-                    for l in sources
-                }
-        stripe_rows: dict[int, torch.Tensor] | None = state["stripe_rows"]
-        host_stripes: dict[int, torch.Tensor] | None = state["host_stripes"]
+        if device.type == "mps" and state["host_stripes"] is None:
+            state["host_stripes"] = {
+                l: torch.empty(stripe_capacity, d_model, dtype=torch.float32)
+                for l in sources
+            }
+        stripe_rows = state["stripe_rows"]
+        host_stripes = state["host_stripes"]
         stripe_start = int(row_start)
+        cuda_slot = 0
+        cuda_pending = (
+            [None] * len(stripe_rows)
+            if device.type == "cuda" and isinstance(stripe_rows, list)
+            else []
+        )
         source_tensors: list[torch.Tensor] = []
         for l in sources:
             if not captured[l].requires_grad:
@@ -1465,24 +1563,15 @@ def _accumulate_prompt_jacobian(
                 )
             source_tensors.append(captured[l])
 
-        def flush_stripe(end: int) -> None:
-            nonlocal stripe_start, committed_until
-            if device.type == "cpu" or end <= stripe_start:
-                return
-            assert host_stripes is not None and stripe_rows is not None
-            n = end - stripe_start
-            for layer in sources:
-                host_stripes[layer][:n].copy_(
-                    stripe_rows[layer][:n], non_blocking=device.type == "cuda",
-                )
-            if device.type == "cuda":
-                torch.cuda.synchronize()
-            elif device.type == "mps":
-                torch.mps.synchronize()
+        def commit_host_stripe(
+            host: Mapping[int, torch.Tensor], start: int, end: int,
+        ) -> None:
+            nonlocal committed_until
+            n = end - start
             # Validate every layer before committing any: a failed asynchronous
             # transfer must not leave a partially counted stripe.
             for layer in sources:
-                rows = host_stripes[layer][:n]
+                rows = host[layer][:n]
                 if bool((rows.abs().sum(dim=1) == 0).any()):
                     raise JacobianLensError(
                         f"layer {layer} came back with zero rows from the device — "
@@ -1490,10 +1579,100 @@ def _accumulate_prompt_jacobian(
                         "queue; retrying at a smaller dim_batch"
                     )
             for layer in sources:
-                state["acc"][layer][stripe_start:end].add_(
-                    host_stripes[layer][:n]
-                )
+                state["acc"][layer][start:end].add_(host[layer][:n])
             committed_until = end
+
+        def _drain_cuda_slot(slot: int) -> None:
+            if not cuda_pending or cuda_pending[slot] is None:
+                return
+            pending = cuda_pending[slot]
+            assert pending is not None
+            start, end, done = pending
+            done.synchronize()
+            assert isinstance(host_stripes, list)
+            commit_host_stripe(host_stripes[slot], start, end)
+            cuda_pending[slot] = None
+
+        def _drain_cuda_pending_in_order() -> None:
+            """Commit completed transfers monotonically; discard suffix on error."""
+            pending_order = sorted(
+                (pending[0], slot)
+                for slot, pending in enumerate(cuda_pending)
+                if pending is not None
+            )
+            try:
+                for _start, slot in pending_order:
+                    _drain_cuda_slot(slot)
+            except BaseException:
+                # A failed event wait/validation leaves its slot record intact.
+                # Quiesce all copy work before clearing the uncommitted suffix;
+                # no later stripe may cross the failed predecessor.
+                transfer_stream = state.get("cuda_transfer_stream")
+                try:
+                    if transfer_stream is not None:
+                        transfer_stream.synchronize()
+                except BaseException:
+                    # Preserve the original drain/validation failure. CUDA may
+                    # surface the same asynchronous error again while quiescing.
+                    pass
+                finally:
+                    for slot in range(len(cuda_pending)):
+                        cuda_pending[slot] = None
+                raise
+
+        drain_cuda_pending_in_order = _drain_cuda_pending_in_order
+
+        drain_cuda_slot = _drain_cuda_slot
+
+        def flush_stripe(end: int) -> None:
+            nonlocal stripe_start, cuda_slot
+            if device.type == "cpu" or end <= stripe_start:
+                return
+            assert host_stripes is not None and stripe_rows is not None
+            start = stripe_start
+            n = end - start
+            if device.type == "cuda":
+                assert isinstance(stripe_rows, list)
+                assert isinstance(host_stripes, list)
+                transfer_stream = state["cuda_transfer_stream"]
+                assert isinstance(transfer_stream, torch.cuda.Stream)
+                next_slot = (cuda_slot + 1) % len(stripe_rows)
+                # The previous transfer in the slot we are about to reuse has
+                # overlapped all computation that filled the current stripe.
+                # Commit it before enqueueing a later stripe, preserving row
+                # order even when synchronization/validation fails.
+                drain_cuda_pending_in_order()
+                assert cuda_pending[cuda_slot] is None
+                current_stream = torch.cuda.current_stream(device)
+                transfer_stream.wait_stream(current_stream)
+                try:
+                    with torch.cuda.stream(transfer_stream):
+                        for layer in sources:
+                            host_stripes[cuda_slot][layer][:n].copy_(
+                                stripe_rows[cuda_slot][layer][:n],
+                                non_blocking=True,
+                            )
+                        done = torch.cuda.Event()
+                        done.record(transfer_stream)
+                except BaseException:
+                    # Some layer copies may already be queued, but no pending
+                    # record exists until the whole stripe + event succeeds.
+                    # Quiesce and discard this uncommitted stripe before retry.
+                    transfer_stream.synchronize()
+                    raise
+                cuda_pending[cuda_slot] = (start, end, done)
+                if len(stripe_rows) == 1:
+                    # No second device buffer exists to fill while D2H runs.
+                    # Drain before the caller reuses this sole slot.
+                    drain_cuda_slot(cuda_slot)
+                cuda_slot = next_slot
+            else:
+                assert isinstance(stripe_rows, dict)
+                assert isinstance(host_stripes, dict)
+                for layer in sources:
+                    host_stripes[layer][:n].copy_(stripe_rows[layer][:n])
+                torch.mps.synchronize()
+                commit_host_stripe(host_stripes, start, end)
             stripe_start = end
 
         cot = None
@@ -1550,7 +1729,13 @@ def _accumulate_prompt_jacobian(
                 )
                 if device.type != "cpu":
                     assert stripe_rows is not None
-                    stripe_rows[l][stripe_offset : stripe_offset + n_dims] = block
+                    if device.type == "cuda":
+                        assert isinstance(stripe_rows, list)
+                        target_rows = stripe_rows[cuda_slot]
+                    else:
+                        assert isinstance(stripe_rows, dict)
+                        target_rows = stripe_rows
+                    target_rows[l][stripe_offset : stripe_offset + n_dims] = block
                 else:
                     state["acc"][l][dim_start:write_end].add_(block)
             if device.type == "cpu":
@@ -1560,7 +1745,14 @@ def _accumulate_prompt_jacobian(
                 torch.mps.synchronize()
             dim_start = write_end
         flush_stripe(d_model)
+        drain_cuda_pending_in_order()
     except RuntimeError as exc:
+        # A later VJP can fail while the previous CUDA stripe is still in
+        # flight. Finish and commit that known-good transfer before reporting
+        # the durable row boundary to the retry scheduler.
+        drain_cuda_pending_in_order()
+        if isinstance(exc, _BatchedVjpUnavailable):
+            exc.committed_until = max(exc.committed_until, committed_until)
         if is_out_of_memory_error(exc) and committed_until > row_start:
             raise _PromptRowsCommitted(committed_until, str(exc)) from exc
         raise
@@ -1623,6 +1815,27 @@ def _source_grad_block(
         return grad[:n_dims].to(torch.float32).sum(dim=1)
     # [replicated_batch,D] (or [1,D] scalar) is already mean-position reduced.
     return grad[:n_dims].to(torch.float32)
+
+
+def _downgrade_cuda_stripe_buffers(
+    state: dict[str, Any], device: torch.device,
+) -> bool:
+    """Release the overlap slot after a CUDA OOM and keep one viable slot."""
+    if device.type != "cuda":
+        return False
+    device_rows = state.get("stripe_rows")
+    host_rows = state.get("host_stripes")
+    if (
+        not isinstance(device_rows, list) or len(device_rows) <= 1
+        or not isinstance(host_rows, list) or len(host_rows) <= 1
+    ):
+        return False
+    state["stripe_rows"] = [device_rows[0]]
+    state["host_stripes"] = [host_rows[0]]
+    # Drop the local references before emptying the allocator in the caller.
+    del device_rows[1:]
+    del host_rows[1:]
+    return True
 
 
 def _empty_device_cache(device: torch.device) -> None:

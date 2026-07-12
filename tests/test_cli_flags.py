@@ -281,12 +281,11 @@ def test_sae_revision_flag_is_not_advertised(argv: list[str]) -> None:
     assert exc.value.code == 2
 
 
-def test_fit_smoothing_override_preserves_node_role_and_kind(
+def test_fit_smoothing_override_is_delegated_to_fit_transaction(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from saklas.core.manifold import CustomDomain
     from saklas.io.manifold_authoring import create_discover_manifold_folder
-    from saklas.io.manifolds import ManifoldFolder
 
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     folder = create_discover_manifold_folder(
@@ -298,12 +297,15 @@ def test_fit_smoothing_override_preserves_node_role_and_kind(
     fake_manifold = SimpleNamespace(
         name="roles", layers={0: object()}, node_labels=["pirate", "scholar"],
         domain=CustomDomain(1), feature_space="raw",
+        metadata={"fit_mode": "auto"},
     )
+    fit_kwargs: dict[str, Any] = {}
 
     class _FakeSession:
         model_info = {}
 
-        def fit(self, *_args: Any, **_kwargs: Any) -> Any:
+        def fit(self, *_args: Any, **kwargs: Any) -> Any:
+            fit_kwargs.update(kwargs)
             return fake_manifold
 
     monkeypatch.setattr(
@@ -316,10 +318,8 @@ def test_fit_smoothing_override_preserves_node_role_and_kind(
         "--smoothing", "0.25",
     ])
     cli_runners._run_manifold_fit(args)
-    updated = ManifoldFolder.load(folder, verify_manifest=False)
-    assert updated.hyperparams["smoothing"] == 0.25
-    assert updated.node_roles == ["pirate", "scholar"]
-    assert updated.node_kinds == ["concrete", "abstract"]
+    assert fit_kwargs["fit_mode"] is None
+    assert fit_kwargs["hyperparams"] == {"smoothing": 0.25}
 
 
 def test_serve_stale_lens_gate_uses_weight_compatibility() -> None:

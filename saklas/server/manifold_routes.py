@@ -14,7 +14,6 @@ artifact lazily on scope entry.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import shutil
 from typing import Any, Callable, Literal, cast
@@ -27,7 +26,6 @@ from saklas.core.session import (
     ConcurrentExtractionError,
     SaklasSession,
 )
-from saklas.io.atomic import write_json_atomic
 from saklas.io.hf_manifolds import (
     HFError as ManifoldHFError,
     ManifoldInstallConflict,
@@ -37,7 +35,6 @@ from saklas.io.hf_manifolds import (
 from saklas.io.manifolds import (
     ManifoldFolder,
     ManifoldFormatError,
-    sanitize_hyperparams,
     append_discover_manifold_node,
     create_discover_manifold_folder,
     create_manifold_folder,
@@ -935,58 +932,12 @@ def register_manifold_routes(app: FastAPI) -> None:
         if not (folder / "manifold.json").exists():
             raise HTTPException(404, f"manifold {namespace}/{name} not found")
 
-        def _apply_fit_overrides() -> None:
-            if req.fit_mode is None and req.hyperparams is None:
-                return
-            # This path only reads authoring mode/hyperparameters before the
-            # subsequent fit validates its target pair. Avoid hashing every
-            # historical fitted variant merely to apply an override.
-            pre_mf = ManifoldFolder.load(folder, verify_manifest=False)
-            if not pre_mf.is_discover and (
-                req.fit_mode is not None or req.hyperparams is not None
-            ):
-                raise ValueError(
-                    f"fit_mode/hyperparams overrides are discover-mode "
-                    f"only; {namespace}/{name} is authored",
-                )
-            new_fit_mode = req.fit_mode or pre_mf.fit_mode
-            new_hp = dict(pre_mf.hyperparams)
-            if req.hyperparams is not None:
-                new_hp.update(req.hyperparams)
-            # Method-incompatible knobs get dropped at the IO boundary.
-            new_hp = sanitize_hyperparams(new_fit_mode, new_hp)
-            data = json.loads((folder / "manifold.json").read_text())
-            data["fit_mode"] = new_fit_mode
-            data["hyperparams"] = new_hp
-            data["nodes"] = [
-                {
-                    "label": label,
-                    **({"role": pre_mf.node_roles[idx]}
-                       if idx < len(pre_mf.node_roles)
-                       and pre_mf.node_roles[idx] is not None else {}),
-                    **({"kind": pre_mf.node_kinds[idx]}
-                       if idx < len(pre_mf.node_kinds)
-                       and pre_mf.node_kinds[idx] is not None else {}),
-                }
-                for idx, label in enumerate(pre_mf.node_labels)
-            ]
-            data.pop("domain", None)
-            # Staged write — a crash mid-rewrite would corrupt the
-            # manifest and 400 every subsequent route call.  Same
-            # discipline ``io.manifolds`` uses for every other manifest
-            # write; this override path was the lone outlier.
-            write_json_atomic(folder / "manifold.json", data)
-
         def _fit(on_progress: Callable[[str], None]) -> dict[str, Any]:
-            # Discover-mode hyperparam overrides must happen inside the same
-            # session lock as the fit.  The manifest rewrite changes the fit
-            # cache key, so racing it against generation/extraction can make a
-            # request observe one set of inputs while the tensor cache records
-            # another.
-            _apply_fit_overrides()
             manifold = session.fit(
                 folder, sae=req.sae,
                 layers=req.layers,
+                fit_mode=req.fit_mode,
+                hyperparams=req.hyperparams,
                 force=req.force,
                 on_progress=on_progress,
             )

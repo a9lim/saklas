@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -31,6 +32,7 @@ from saklas.io.lens import (
     lens_paths,
     load_lens,
     load_lens_checkpoint,
+    remove_lens,
     save_lens_checkpoint,
 )
 from tests._jlens_toys import CharTokenizer, frozen_toy
@@ -40,6 +42,7 @@ _MODEL_ID = "toy/jlens-model"
 
 class _StubSession:
     jlens = SaklasSession.jlens
+    has_compatible_jlens = SaklasSession.has_compatible_jlens
     _require_jlens = SaklasSession._require_jlens
     fit_jlens = SaklasSession.fit_jlens
     jlens_readout = SaklasSession.jlens_readout
@@ -156,7 +159,9 @@ def test_terminal_checkpoint_is_promoted_without_second_tensor_write(
     )
 
     assert fitted.n_prompts == 2
-    assert writes == 1
+    # One checkpoint shard per fitted layer; promotion only switches the
+    # durable sidecar pointer and performs no second serialization pass.
+    assert writes == len(fitted.source_layers)
     assert load_lens(_MODEL_ID) is not None
     assert load_lens_checkpoint(_MODEL_ID) is None
 
@@ -227,6 +232,69 @@ def test_resident_lens_is_not_reused_after_external_artifact_replacement() -> No
         assert torch.allclose(
             refreshed.jacobians[layer], disk_b.jacobians[layer], atol=2e-3,
         )
+
+
+def test_jlens_property_refreshes_and_evicts_after_external_lifecycle() -> None:
+    corpus_b = [f"replacement property prompt {i} with enough content" for i in range(4)]
+    session_a = _StubSession()
+    resident_a = session_a.fit_jlens(_PROMPTS, force=True)
+    session_a._profiles["jlens/example"] = {0: torch.ones(6)}
+    session_a._lens_probes["jlens/example"] = {
+        "word": "example", "token_id": 1, "layers": [0, 1],
+    }
+    disk_b = _StubSession().fit_jlens(corpus_b, force=True)
+
+    assert session_a.has_compatible_jlens()
+    refreshed = session_a._jlens
+
+    assert refreshed is not None
+    assert any(
+        not torch.equal(resident_a.jacobians[layer], refreshed.jacobians[layer])
+        for layer in refreshed.source_layers
+    )
+    for layer in disk_b.source_layers:
+        assert torch.allclose(
+            refreshed.jacobians[layer], disk_b.jacobians[layer], atol=2e-3,
+        )
+
+    assert remove_lens(_MODEL_ID)
+    assert not session_a.has_compatible_jlens()
+    assert session_a.jlens is None
+    assert "jlens/example" not in session_a._profiles
+    assert session_a._lens_probes["jlens/example"]["layers"] == []
+    assert session_a._live_lens is None
+
+
+def test_fit_jlens_serializes_complete_cross_session_transaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered: list[str] = []
+    first_entered = threading.Event()
+    release_first = threading.Event()
+
+    def _transaction(self: _StubSession, prompts: object, **kwargs: object) -> str:
+        del prompts, kwargs
+        entered.append(self.model_id)
+        if len(entered) == 1:
+            first_entered.set()
+            assert release_first.wait(timeout=1.0)
+        return "done"
+
+    monkeypatch.setattr(SaklasSession, "_fit_jlens_transaction", _transaction)
+    first = _StubSession()
+    second = _StubSession()
+    results: list[str] = []
+    thread_a = threading.Thread(target=lambda: results.append(first.fit_jlens(_PROMPTS)))
+    thread_b = threading.Thread(target=lambda: results.append(second.fit_jlens(_PROMPTS)))
+    thread_a.start()
+    assert first_entered.wait(timeout=1.0)
+    thread_b.start()
+    assert len(entered) == 1
+    release_first.set()
+    thread_a.join(timeout=1.0)
+    thread_b.join(timeout=1.0)
+    assert len(entered) == 2
+    assert results == ["done", "done"]
 
 
 def test_fresh_fit_does_not_promote_stale_incompatible_checkpoint() -> None:
@@ -624,6 +692,7 @@ def test_fit_jlens_missing_layer_topup_resumes_checkpoint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import saklas.core.jlens as jlens_mod
+    import saklas.io.lens as lens_io
 
     full = _StubSession().fit_jlens(
         _PROMPTS, force=True, source_layers=[0, 1],
@@ -650,11 +719,20 @@ def test_fit_jlens_missing_layer_topup_resumes_checkpoint(
     assert checkpoint[0].n_prompts == 2
 
     monkeypatch.setattr(jlens_mod, "fit_jacobian_lens", real_fit)
+    real_save = lens_io.save_lens
+    reused: list[set[int]] = []
+
+    def _capture_reuse(*args: Any, **kwargs: Any) -> Any:
+        reused.append(set(kwargs.get("reuse_layers") or ()))
+        return real_save(*args, **kwargs)
+
+    monkeypatch.setattr(lens_io, "save_lens", _capture_reuse)
     messages: list[str] = []
     resumed = _StubSession().fit_jlens(
         _PROMPTS, source_layers=[0, 1], on_progress=messages.append,
     )
     assert any("missing-layer checkpoint at 2" in message for message in messages)
+    assert reused == [{0}]
     for layer in full.source_layers:
         assert torch.allclose(
             resumed.jacobians[layer], full.jacobians[layer], atol=2e-3,

@@ -1195,7 +1195,7 @@ def test_clear_manifold_tensors_removes_tensors_keeps_corpus(
 
     capture_dir = model_dir("google/gemma-3-4b-it") / "manifold_capture"
     capture_dir.mkdir(parents=True)
-    capture_file = capture_dir / f"{capture_sha}.centroids.safetensors"
+    capture_file = capture_dir / f"{capture_sha}.centroids.layer_0.safetensors"
     capture_file.write_bytes(b"cached")
     n = clear_manifold_tensors("local", "mood")
     assert n == 2  # tensor + sidecar
@@ -1237,7 +1237,7 @@ def test_shared_capture_survives_until_last_fitted_owner_is_removed(
 
     capture_dir = model_dir("google/gemma-3-4b-it") / "manifold_capture"
     capture_dir.mkdir(parents=True)
-    capture_file = capture_dir / f"{capture_sha}.rows.safetensors"
+    capture_file = capture_dir / f"{capture_sha}.rows.layer_0.safetensors"
     capture_file.write_bytes(b"shared")
 
     clear_manifold_tensors("local", "mood-a")
@@ -1397,7 +1397,7 @@ def test_remove_manifold_folder_removes_referenced_capture_cache(
 
     capture_dir = model_dir("google/gemma-3-4b-it") / "manifold_capture"
     capture_dir.mkdir(parents=True)
-    capture_file = capture_dir / f"{capture_sha}.rows.safetensors"
+    capture_file = capture_dir / f"{capture_sha}.rows.layer_0.safetensors"
     capture_file.write_bytes(b"cached")
     remove_manifold_folder("local", "mood")
     assert not capture_file.exists()

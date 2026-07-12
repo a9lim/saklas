@@ -1011,8 +1011,9 @@ _LENS_DESCRIPTIONS: dict[str, str] = {
         "first-order effect of each layer's residual on the final-layer "
         "residual over a web-text corpus. One forward + ceil(d_model/dim_batch) "
         "backward passes per document — the only backward passes in saklas. "
-        "The artifact lands at ~/.saklas/models/<model>/jlens.safetensors "
-        "(fp16, ~0.5-1.5 GB) and backs `lens top`, `lens decompose`, the "
+        "The artifact lands under ~/.saklas/models/<model>/ as an atomic "
+        "jlens.json pointer plus fp16 per-layer shards (~0.5-1.5 GB total) "
+        "and backs `lens top`, `lens decompose`, the "
         "jlens/<word> steering atoms, and @when:jlens/<word> gates. "
         "Interrupted fits checkpoint and resume by default."
     ),
@@ -1030,7 +1031,7 @@ _LENS_DESCRIPTIONS: dict[str, str] = {
         "concept vectors typically carry only ~6-15% of their variance in the "
         "workspace) and the contributing tokens."
     ),
-    "rm": "Delete a model's fitted lens artifact (jlens.safetensors + sidecar).",
+    "rm": "Delete a model's fitted lens artifact (jlens.json + layer shards).",
 }
 
 _LENS_BUILDERS = {

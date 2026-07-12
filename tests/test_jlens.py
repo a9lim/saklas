@@ -313,6 +313,83 @@ def test_committed_row_oom_at_dim_one_restarts_with_smaller_prompt_batch(
         )
 
 
+def test_late_committed_row_oom_splits_only_current_group_without_replay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A late width backoff must not erase already completed microbatches."""
+    import saklas.core.jlens as jlens_module
+
+    model = _frozen_model(n_layers=2)
+    tokenizer = _CharTokenizer()
+    prompts = [
+        "the first prompt is comfortably long enough",
+        "the second prompt is comfortably long enough",
+        "the third prompt is comfortably long enough",
+        "the fourth prompt is comfortably long enough",
+    ]
+    expected = fit_jacobian_lens(
+        model, tokenizer, prompts, _layers(model),
+        dim_batch=1, prompt_batch=1,
+    )
+    real_block = jlens_module._grad_row_block
+    real_accumulate = jlens_module._accumulate_prompt_jacobian
+    grad_calls = 0
+    task_calls: list[tuple[int, int]] = []
+
+    def _late_oom(*args: Any, **kwargs: Any) -> Any:
+        nonlocal grad_calls
+        grad_calls += 1
+        # The toy hidden size is six: calls 1..6 complete the first B=2
+        # microbatch, call 7 commits row zero of the second, and call 8 fails.
+        if grad_calls == 8:
+            raise RuntimeError("DefaultCPUAllocator: can't allocate memory")
+        return real_block(*args, **kwargs)
+
+    def _count_tasks(*args: Any, **kwargs: Any) -> Any:
+        ids = args[1]
+        task_calls.append((int(ids.shape[0]), int(kwargs.get("row_start", 0))))
+        return real_accumulate(*args, **kwargs)
+
+    monkeypatch.setattr(jlens_module, "_grad_row_block", _late_oom)
+    monkeypatch.setattr(
+        jlens_module, "_accumulate_prompt_jacobian", _count_tasks,
+    )
+    resumed = fit_jacobian_lens(
+        model, tokenizer, prompts, _layers(model),
+        dim_batch=1, prompt_batch=2,
+    )
+
+    # The first B=2 task is never replayed. Only the failed second task is
+    # replaced by two B=1 suffix tasks sharing its committed row boundary.
+    assert task_calls == [(2, 0), (2, 0), (1, 1), (1, 1)]
+    assert grad_calls == 18  # 6 + (1 success + 1 OOM) + 2 * 5 suffix rows
+    assert resumed.n_prompts == len(prompts)
+    for layer in expected.source_layers:
+        assert torch.allclose(
+            resumed.jacobians[layer], expected.jacobians[layer], atol=1e-6,
+        )
+
+
+def test_cuda_oom_downgrades_transfer_buffers_to_one_slot() -> None:
+    import saklas.core.jlens as jlens_module
+
+    first_device = {0: object()}
+    first_host = {0: object()}
+    state: dict[str, Any] = {
+        "stripe_rows": [first_device, {0: object()}],
+        "host_stripes": [first_host, {0: object()}],
+    }
+
+    assert jlens_module._downgrade_cuda_stripe_buffers(
+        state, torch.device("cuda"),
+    )
+    assert state["stripe_rows"] == [first_device]
+    assert state["host_stripes"] == [first_host]
+    assert not jlens_module._downgrade_cuda_stripe_buffers(
+        state, torch.device("cuda"),
+    )
+
+
 def test_repeated_oom_after_committed_rows_never_double_counts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

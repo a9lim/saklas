@@ -25,7 +25,7 @@ import pathlib
 import tempfile
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from contextlib import nullcontext
 from typing import Any, Callable, Protocol, runtime_checkable
 
@@ -39,10 +39,76 @@ from saklas.core.sae import SaeBackend
 from saklas.io.paths import model_dir, tensor_filename
 
 
-_CAPTURE_CACHE_FORMAT_VERSION = 3
+_CAPTURE_CACHE_FORMAT_VERSION = 4
 _ROW_DIGEST_CACHE_MAX = 512
 _row_digest_cache: set[tuple[object, ...]] = set()
 _row_digest_cache_lock = threading.Lock()
+
+
+def _apply_fit_overrides_locked(
+    folder: pathlib.Path,
+    *,
+    fit_mode: str | None,
+    hyperparams: Mapping[str, object] | None,
+) -> None:
+    """Apply discover-fit overrides inside the folder transaction.
+
+    Callers pass only the values supplied by this request.  The merge happens
+    against the manifest reloaded under ``_locked_manifest``, so two fit
+    requests cannot publish a stale read/modify/write snapshot before either
+    fit computes its cache identity.
+    """
+    if fit_mode is None and hyperparams is None:
+        return
+
+    from saklas.io.atomic import write_json_atomic
+    from saklas.io.manifolds import ManifoldFolder, sanitize_hyperparams
+
+    mf = ManifoldFolder.load(folder, verify_manifest=False)
+    if not mf.is_discover:
+        raise ValueError(
+            "fit_mode/hyperparams overrides are discover-mode only; "
+            f"{folder} is authored"
+        )
+    requested_mode = fit_mode or mf.fit_mode
+    if requested_mode not in {"pca", "spectral", "auto"}:
+        raise ValueError(f"invalid discover fit mode {requested_mode!r}")
+    requested_hyperparams = dict(mf.hyperparams)
+    if hyperparams is not None:
+        requested_hyperparams.update(hyperparams)
+    requested_hyperparams = sanitize_hyperparams(
+        requested_mode, requested_hyperparams,
+    )
+    if (
+        requested_mode == mf.fit_mode
+        and requested_hyperparams == mf.hyperparams
+    ):
+        return
+
+    with open(folder / "manifold.json") as handle:
+        data = json.load(handle)
+    data["fit_mode"] = requested_mode
+    data["hyperparams"] = requested_hyperparams
+    # Discover nodes are label-only.  Preserve role/kind provenance while
+    # stripping any authored geometry left by a mode transition.
+    data["nodes"] = [
+        {
+            "label": label,
+            **(
+                {"role": mf.node_roles[idx]}
+                if idx < len(mf.node_roles) and mf.node_roles[idx] is not None
+                else {}
+            ),
+            **(
+                {"kind": mf.node_kinds[idx]}
+                if idx < len(mf.node_kinds) and mf.node_kinds[idx] is not None
+                else {}
+            ),
+        }
+        for idx, label in enumerate(mf.node_labels)
+    ]
+    data.pop("domain", None)
+    write_json_atomic(folder / "manifold.json", data)
 
 
 def _tensor_sha256(tensor: torch.Tensor) -> str:
@@ -129,10 +195,36 @@ def _save_safetensors_atomic(
         tmp.unlink(missing_ok=True)
 
 
+def _centroid_shard_path(
+    folder: pathlib.Path, stem: str, layer: int,
+) -> pathlib.Path:
+    return folder / f"{stem}.centroids.layer_{int(layer)}.safetensors"
+
+
+def _row_shard_path(
+    folder: pathlib.Path, stem: str, layer: int,
+) -> pathlib.Path:
+    return folder / f"{stem}.rows.layer_{int(layer)}.safetensors"
+
+
+def _capture_group_paths(
+    folder: pathlib.Path, stem: str,
+) -> list[pathlib.Path]:
+    """Current files for one content-addressed capture group."""
+    return [path for path in folder.glob(f"{stem}.*") if path.is_file()]
+
+
 def _prune_manifold_capture_cache(
     folder: pathlib.Path, *, keep_stem: str,
 ) -> None:
-    """Bound persistent capture-cache disk use, oldest corpus groups first."""
+    """Bound capture-cache disk use without invalidating an active fit.
+
+    Callers hold no capture-stem lock here.  A directory-wide prune lock
+    serializes eviction decisions, then each victim's own logical stem lock is
+    acquired and its files are re-read before deletion.  No code holds one stem
+    while acquiring another, avoiding the A->B / B->A deadlock that a naive
+    lock-aware pruner would introduce.
+    """
     try:
         limit_gb = float(os.environ.get("SAKLAS_MANIFOLD_CAPTURE_CACHE_GB", "8"))
     except ValueError:
@@ -140,33 +232,54 @@ def _prune_manifold_capture_cache(
     if limit_gb <= 0.0:
         return
     limit = int(limit_gb * 1024**3)
-    groups: dict[str, list[pathlib.Path]] = {}
-    for path in folder.iterdir():
-        if not path.is_file():
-            continue
-        stem = path.name.split(".", 1)[0]
-        if len(stem) == 64:
-            groups.setdefault(stem, []).append(path)
-    sizes = {
-        stem: sum(path.stat().st_size for path in paths)
-        for stem, paths in groups.items()
-    }
-    total = sum(sizes.values())
-    if total <= limit:
-        return
-    oldest = sorted(
-        (stem for stem in groups if stem != keep_stem),
-        key=lambda stem: min(path.stat().st_mtime_ns for path in groups[stem]),
-    )
-    for stem in oldest:
-        for path in groups[stem]:
+    from saklas.io.atomic import artifact_lock
+
+    folder.mkdir(parents=True, exist_ok=True)
+    with artifact_lock(folder / "capture-cache-prune"):
+        groups: dict[str, list[pathlib.Path]] = {}
+        for path in folder.iterdir():
+            if not path.is_file():
+                continue
+            stem = path.name.split(".", 1)[0]
+            if len(stem) == 64:
+                groups.setdefault(stem, []).append(path)
+        sizes: dict[str, int] = {}
+        mtimes: dict[str, int] = {}
+        for stem, paths in groups.items():
             try:
-                path.unlink()
+                stats = [path.stat() for path in paths]
             except FileNotFoundError:
-                pass
-        total -= sizes[stem]
+                continue
+            sizes[stem] = sum(stat.st_size for stat in stats)
+            mtimes[stem] = min(stat.st_mtime_ns for stat in stats)
+        total = sum(sizes.values())
         if total <= limit:
-            break
+            return
+        oldest = sorted(
+            (stem for stem in sizes if stem != keep_stem),
+            key=mtimes.__getitem__,
+        )
+        for stem in oldest:
+            with artifact_lock(folder / stem):
+                # The group may have been topped up or removed while we waited.
+                # Re-stat under its transaction lock and charge exactly what is
+                # about to be evicted.
+                paths = _capture_group_paths(folder, stem)
+                for path in paths:
+                    path.unlink(missing_ok=True)
+            # Other stem transactions do not take the directory prune lock and
+            # may have grown while we waited.  Recompute the advisory total
+            # instead of subtracting a stale pre-lock size.
+            total = 0
+            for path in folder.iterdir():
+                if not path.is_file() or len(path.name.split(".", 1)[0]) != 64:
+                    continue
+                try:
+                    total += path.stat().st_size
+                except FileNotFoundError:
+                    pass
+            if total <= limit:
+                break
 
 
 # ----------------------------------------------------------------------
@@ -382,14 +495,19 @@ class ManifoldExtractionPipeline:
         sae: str | SaeBackend | None = None,
         sae_revision: str | None = None,
         layer_indices: "Sequence[int] | str | None" = None,
+        fit_mode: str | None = None,
+        hyperparams: Mapping[str, object] | None = None,
         force: bool = False,
         on_progress: Callable[[str], None] | None = None,
     ):
-        """Serialize one folder's fit/cache/publication transaction."""
+        """Serialize one folder's override/fit/cache/publication transaction."""
         from saklas.io.manifold_folder import _locked_manifest
 
         folder_path = pathlib.Path(folder)
         with _locked_manifest(folder_path):
+            _apply_fit_overrides_locked(
+                folder_path, fit_mode=fit_mode, hyperparams=hyperparams,
+            )
             return self._fit_locked(
                 folder_path, sae=sae, sae_revision=sae_revision,
                 layer_indices=layer_indices, force=force,
@@ -696,7 +814,7 @@ class ManifoldExtractionPipeline:
                 / capture_sha
             )
             with artifact_lock(capture_lock_stem):
-                return self._fit_locked(
+                manifold = self._fit_locked(
                     folder,
                     sae=(sae_backend if isinstance(sae, str) else sae),
                     sae_revision=sae_revision,
@@ -708,6 +826,19 @@ class ManifoldExtractionPipeline:
                     _model_fingerprint=model_fingerprint,
                     _verified_cache_miss=True,
                 )
+            # Eviction must run after this stem transaction is fully complete.
+            # The pruner takes victim locks one at a time; calling it while the
+            # current stem were held would permit cross-stem lock inversion.
+            try:
+                _prune_manifold_capture_cache(
+                    capture_lock_stem.parent, keep_stem=capture_sha,
+                )
+            except (OSError, RuntimeError, ValueError) as exc:
+                # Cache eviction is advisory.  The fitted tensor and its capture
+                # group are already durably published; a prune failure must not
+                # turn successful model work into a failed fit.
+                _progress(f"Activation capture cache prune skipped: {exc}")
+            return manifold
 
         # 1. Per-node centroids (one forward pass per response) — shared
         #    between authored and discover paths.  Conversational (4.0 / A2):
@@ -737,14 +868,6 @@ class ManifoldExtractionPipeline:
         cache_stem = (
             capture_sha if capture_sha is not None else None
         )
-        centroid_cache = (
-            capture_dir / f"{cache_stem}.centroids.safetensors"
-            if cache_stem is not None else None
-        )
-        row_cache = (
-            capture_dir / f"{cache_stem}.rows.safetensors"
-            if cache_stem is not None else None
-        )
         cache_meta = (
             capture_dir / f"{cache_stem}.json"
             if cache_stem is not None else None
@@ -755,85 +878,131 @@ class ManifoldExtractionPipeline:
         centroid_layers: set[int] = set()
         row_layers: set[int] = set()
         loaded_row_layers: set[int] = set()
+        cached_centroid_files: dict[str, str] = {}
+        cached_row_files: dict[str, str] = {}
+        cached_file_digests: dict[str, str] = {}
+        cached_centroid_shapes: dict[str, object] = {}
         cached_row_shapes: dict[str, object] = {}
         cached_row_dtypes: dict[str, object] = {}
         cached_row_digests: dict[str, object] = {}
-        if (
-            not force and cache_meta is not None and cache_meta.exists()
-            and centroid_cache is not None and centroid_cache.exists()
-        ):
+        if not force and cache_meta is not None and cache_meta.exists():
             try:
                 from saklas.core.manifold import ActivationRowStore
                 from saklas.io.packs import verify_integrity
 
                 with open(cache_meta) as handle:
                     meta = json.load(handle)
+                format_version = int(meta.get("format_version", 0))
+                if format_version != _CAPTURE_CACHE_FORMAT_VERSION:
+                    raise ValueError("legacy capture cache needs v4 reshaping")
                 if (
-                    int(meta.get("format_version", 0))
-                    != _CAPTURE_CACHE_FORMAT_VERSION
-                    or meta.get("capture_sha256") != capture_sha
-                    or [int(size) for size in meta.get("node_sizes", [])]
-                    != node_sizes
+                    meta.get("capture_sha256") != capture_sha
+                    or [int(size) for size in meta.get("node_sizes", [])] != node_sizes
                 ):
                     raise ValueError("capture cache metadata identity mismatch")
                 cache_files = dict(meta.get("files", {}))
-                # Row caches are frequently multi-GiB. Their safetensors header
-                # is validated by ``ActivationRowStore.load`` and every selected
-                # layer is checked against its exact tensor digest below; do not
-                # hash the entire container merely to select a few layers.
-                files_to_verify = {
-                    centroid_cache.name: cache_files.get(
-                        centroid_cache.name, "",
-                    )
-                }
-                ok, _bad = verify_integrity(capture_dir, files_to_verify)
-                if not ok:
-                    raise ValueError("capture cache payload digest mismatch")
-                cached = load_file(str(centroid_cache), device="cpu")
-                stacks_cached = {
-                    int(key.split("_", 1)[1]): value.to(torch.float32)
-                    for key, value in cached.items() if key.startswith("layer_")
+                cached_file_digests = {
+                    str(filename): str(digest)
+                    for filename, digest in cache_files.items()
                 }
                 centroid_layers = {
                     int(idx) for idx in meta.get("centroid_layers", [])
                 }
                 row_layers = {int(idx) for idx in meta.get("row_layers", [])}
                 loaded_row_layers = set(row_layers)
-                if centroid_cache.name not in cache_files:
-                    raise ValueError("capture cache metadata omits payload digest")
+                cached_centroid_files = dict(meta.get("centroid_files", {}))
+                cached_row_files = dict(meta.get("row_files", {}))
+                cached_centroid_shapes = dict(meta.get("centroid_shapes", {}))
                 cached_row_shapes = dict(meta.get("row_shapes", {}))
                 cached_row_dtypes = dict(meta.get("row_dtypes", {}))
                 cached_row_digests = dict(meta.get("row_tensor_sha256", {}))
-                if set(stacks_cached) != centroid_layers or any(
-                    value.ndim != 2 or int(value.shape[0]) != K
-                    or not bool(torch.isfinite(value).all())
-                    for value in stacks_cached.values()
-                ):
-                    raise ValueError("centroid cache shape/finite check failed")
-                expected_centroid_shapes = dict(meta.get("centroid_shapes", {}))
+                assert cache_stem is not None
                 if any(
-                    expected_centroid_shapes.get(str(idx))
-                    != list(stacks_cached[idx].shape)
+                    str(idx) not in cached_centroid_files
+                    or str(idx) not in cached_centroid_shapes
+                    or cached_centroid_files.get(str(idx)) not in cache_files
+                    or cached_centroid_files.get(str(idx)) != _centroid_shard_path(
+                        capture_dir, cache_stem, idx,
+                    ).name
                     for idx in centroid_layers
+                ) or any(
+                    str(idx) not in cached_row_files
+                    or str(idx) not in cached_row_shapes
+                    or str(idx) not in cached_row_dtypes
+                    or str(idx) not in cached_row_digests
+                    or cached_row_files.get(str(idx)) != _row_shard_path(
+                        capture_dir, cache_stem, idx,
+                    ).name
+                    for idx in row_layers
                 ):
-                    raise ValueError("centroid cache metadata shape mismatch")
+                    raise ValueError("capture cache metadata omits layer shards")
                 if not row_layers <= centroid_layers:
                     raise ValueError("row-cache layers exceed centroid coverage")
+
+                # Verify and load only the layers this fit can consume.  A bad
+                # selected shard invalidates that layer, not unrelated durable
+                # coverage, so the capture pass tops up exactly the damage.
+                for idx in sorted(centroid_layers & set(fit_layers)):
+                    filename = cached_centroid_files[str(idx)]
+                    path = capture_dir / filename
+                    expected_file_digest = cache_files.get(filename, "")
+                    ok, _bad = verify_integrity(
+                        capture_dir, {filename: expected_file_digest},
+                    )
+                    if not ok:
+                        centroid_layers.discard(idx)
+                        row_layers.discard(idx)
+                        continue
+                    try:
+                        shard = load_file(str(path), device="cpu")
+                        key = f"layer_{idx}"
+                        if set(shard) != {key}:
+                            raise ValueError("centroid shard key mismatch")
+                        value = shard[key].to(torch.float32)
+                        if (
+                            cached_centroid_shapes.get(str(idx)) != list(value.shape)
+                            or value.ndim != 2 or int(value.shape[0]) != K
+                            or not bool(torch.isfinite(value).all())
+                        ):
+                            raise ValueError("centroid shard shape/finite mismatch")
+                        stacks_cached[idx] = value
+                    except (OSError, RuntimeError, ValueError, KeyError):
+                        centroid_layers.discard(idx)
+                        row_layers.discard(idx)
+
                 if row_layers and retain_node_rows and mf.fit_mode != "auto":
-                    if row_cache is None or not row_cache.exists():
-                        raise ValueError("capture metadata names a missing row cache")
                     selected_row_layers = sorted(row_layers & set(fit_layers))
                     if selected_row_layers:
-                        cached_rows = ActivationRowStore.load(
-                            row_cache, node_sizes, layer_indices=selected_row_layers,
-                        )
-                        if any(not _row_tensor_matches_cache_metadata(
-                            row_cache, idx, cached_rows.flat_rows(idx),
-                            expected_shape=cached_row_shapes.get(str(idx)),
-                            expected_dtype=cached_row_dtypes.get(str(idx)),
-                            expected_digest=cached_row_digests.get(str(idx)),
-                        ) for idx in selected_row_layers):
-                            raise ValueError("row cache metadata shape/dtype mismatch")
+                        valid_stores: list[ActivationRowStore] = []
+                        for idx in selected_row_layers:
+                            path = capture_dir / cached_row_files[str(idx)]
+                            row_store: ActivationRowStore | None = None
+                            try:
+                                row_store = ActivationRowStore.load_shards(
+                                    {idx: path}, node_sizes,
+                                )
+                                if not _row_tensor_matches_cache_metadata(
+                                    path, idx, row_store.flat_rows(idx),
+                                    expected_shape=cached_row_shapes.get(str(idx)),
+                                    expected_dtype=cached_row_dtypes.get(str(idx)),
+                                    expected_digest=cached_row_digests.get(str(idx)),
+                                ):
+                                    raise ValueError(
+                                        "row cache metadata shape/dtype mismatch"
+                                    )
+                                valid_stores.append(row_store)
+                                row_store = None  # ownership moved to valid_stores
+                            except (OSError, RuntimeError, ValueError, KeyError):
+                                if row_store is not None:
+                                    row_store.close()
+                                row_layers.discard(idx)
+                        if len(valid_stores) > 1:
+                            cached_rows = ActivationRowStore.combine_disjoint(
+                                valid_stores,
+                            )
+                        elif valid_stores:
+                            cached_rows = valid_stores[0]
+                loaded_row_layers = set(row_layers)
             except (
                 OSError, RuntimeError, ValueError, KeyError,
                 json.JSONDecodeError, TypeError,
@@ -841,6 +1010,11 @@ class ManifoldExtractionPipeline:
                 stacks_cached = {}
                 centroid_layers = set()
                 row_layers = set()
+                loaded_row_layers = set()
+                cached_centroid_files = {}
+                cached_row_files = {}
+                cached_file_digests = {}
+                cached_centroid_shapes = {}
                 cached_row_shapes = {}
                 cached_row_dtypes = {}
                 cached_row_digests = {}
@@ -896,6 +1070,9 @@ class ManifoldExtractionPipeline:
             _progress("Reusing token-exact manifold activation capture cache...")
 
         retained_rows = None
+        captured_row_layers = (
+            set(new_rows.layer_indices) if new_rows is not None else set()
+        )
         if retain_node_rows:
             from saklas.core.manifold import ActivationRowStore
 
@@ -905,19 +1082,11 @@ class ManifoldExtractionPipeline:
             elif new_rows is not None and cached_rows is None:
                 retained_rows = new_rows
                 new_rows = None
-                row_layers.update(capture_layers)
             else:
                 assert cached_rows is not None and new_rows is not None
-                retained_rows = ActivationRowStore(node_sizes)
-                flat_indices = torch.arange(sum(node_sizes), dtype=torch.long)
-                for store in (cached_rows, new_rows):
-                    for idx in store.layer_indices:
-                        retained_rows.write(
-                            idx, flat_indices, store.flat_rows(idx),
-                        )
-                row_layers = set(retained_rows.layer_indices)
-                cached_rows.close()
-                new_rows.close()
+                retained_rows = ActivationRowStore.combine_disjoint(
+                    [cached_rows, new_rows],
+                )
                 cached_rows = None
                 new_rows = None
 
@@ -926,84 +1095,47 @@ class ManifoldExtractionPipeline:
             for node_idx in range(K)
         ]
 
-        if capture_layers and centroid_cache is not None and cache_meta is not None:
+        if capture_layers and cache_stem is not None and cache_meta is not None:
             from saklas.io.atomic import write_json_atomic
             from saklas.io.packs import hash_file
 
             try:
                 capture_dir.mkdir(parents=True, exist_ok=True)
                 persist_rows_now = mf.fit_mode != "auto"
-                # A row cache is one safetensors container.  When a disjoint
-                # layer request tops it up, carry forward the unselected
-                # tensors before replacing that container; otherwise the new
-                # metadata and payload would silently discard prior coverage.
-                if (
-                    persist_rows_now
-                    and retained_rows is not None
-                    and row_cache is not None
-                    and row_cache.exists()
-                ):
-                    durable_only = sorted(
-                        row_layers - set(retained_rows.layer_indices)
+                files = {
+                    cached_centroid_files[str(idx)]: cached_file_digests[
+                        cached_centroid_files[str(idx)]
+                    ]
+                    for idx in centroid_layers
+                    if (
+                        str(idx) in cached_centroid_files
+                        and cached_centroid_files[str(idx)] in cached_file_digests
                     )
-                    if durable_only:
-                        from saklas.core.manifold import ActivationRowStore
+                }
+                for idx in capture_layers:
+                    centroid_path = _centroid_shard_path(capture_dir, cache_stem, idx)
+                    _save_safetensors_atomic(
+                        {f"layer_{idx}": stacks_cached[idx]}, centroid_path,
+                    )
+                    cached_centroid_files[str(idx)] = centroid_path.name
+                    cached_centroid_shapes[str(idx)] = list(
+                        stacks_cached[idx].shape,
+                    )
+                    files[centroid_path.name] = hash_file(centroid_path)
 
-                        durable_rows = ActivationRowStore.load(
-                            row_cache, node_sizes, layer_indices=durable_only,
-                        )
-                        try:
-                            if any(not _row_tensor_matches_cache_metadata(
-                                row_cache, idx, durable_rows.flat_rows(idx),
-                                expected_shape=cached_row_shapes.get(str(idx)),
-                                expected_dtype=cached_row_dtypes.get(str(idx)),
-                                expected_digest=cached_row_digests.get(str(idx)),
-                            ) for idx in durable_only):
-                                raise ValueError(
-                                    "durable row cache metadata mismatch"
-                                )
-                            combined_rows = ActivationRowStore(node_sizes)
-                            flat_indices = torch.arange(
-                                sum(node_sizes), dtype=torch.long,
-                            )
-                            for store in (durable_rows, retained_rows):
-                                for idx in store.layer_indices:
-                                    combined_rows.write(
-                                        idx, flat_indices, store.flat_rows(idx),
-                                    )
-                            retained_rows.close()
-                            retained_rows = combined_rows
-                        finally:
-                            durable_rows.close()
-                _save_safetensors_atomic(
-                    {
-                        f"layer_{idx}": stacks_cached[idx]
-                        for idx in sorted(centroid_layers)
-                    },
-                    centroid_cache,
-                )
-                if (
-                    persist_rows_now
-                    and retained_rows is not None and row_cache is not None
-                ):
-                    retained_rows.persist(row_cache)
-                    row_layers = set(retained_rows.layer_indices)
-                elif (
-                    (not row_layers or (not persist_rows_now and not loaded_row_layers))
-                    and row_cache is not None and row_cache.exists()
-                ):
-                    row_cache.unlink()
-                files = {centroid_cache.name: hash_file(centroid_cache)}
+                if persist_rows_now and retained_rows is not None:
+                    for idx in sorted(captured_row_layers):
+                        row_path = _row_shard_path(capture_dir, cache_stem, idx)
+                        rows = retained_rows.flat_rows(idx)
+                        _save_safetensors_atomic({f"layer_{idx}": rows}, row_path)
+                        cached_row_files[str(idx)] = row_path.name
+                        cached_row_shapes[str(idx)] = list(rows.shape)
+                        cached_row_dtypes[str(idx)] = str(rows.dtype)
+                        cached_row_digests[str(idx)] = _tensor_sha256(rows)
+                    row_layers.update(captured_row_layers)
                 metadata_row_layers = (
                     sorted(row_layers) if persist_rows_now
                     else sorted(loaded_row_layers)
-                )
-                row_digests = (
-                    {
-                        str(idx): _tensor_sha256(retained_rows.flat_rows(idx))
-                        for idx in retained_rows.layer_indices
-                    } if persist_rows_now and retained_rows is not None
-                    else cached_row_digests
                 )
                 write_json_atomic(cache_meta, {
                     "format_version": _CAPTURE_CACHE_FORMAT_VERSION,
@@ -1011,32 +1143,46 @@ class ManifoldExtractionPipeline:
                     "node_sizes": node_sizes,
                     "centroid_layers": sorted(centroid_layers),
                     "row_layers": metadata_row_layers,
-                    "centroid_shapes": {
-                        str(idx): list(stacks_cached[idx].shape)
+                    "centroid_files": {
+                        str(idx): cached_centroid_files[str(idx)]
                         for idx in sorted(centroid_layers)
                     },
-                    "row_shapes": (
-                        {
-                            str(idx): list(retained_rows.flat_rows(idx).shape)
-                            for idx in retained_rows.layer_indices
-                        } if persist_rows_now and retained_rows is not None
-                        else cached_row_shapes
-                    ),
-                    "row_dtypes": (
-                        {
-                            str(idx): str(retained_rows.flat_rows(idx).dtype)
-                            for idx in retained_rows.layer_indices
-                        } if persist_rows_now and retained_rows is not None
-                        else cached_row_dtypes
-                    ),
-                    "row_tensor_sha256": row_digests,
+                    "row_files": {
+                        str(idx): cached_row_files[str(idx)]
+                        for idx in metadata_row_layers
+                    },
+                    "centroid_shapes": {
+                        str(idx): cached_centroid_shapes[str(idx)]
+                        for idx in sorted(centroid_layers)
+                    },
+                    "row_shapes": {
+                        str(idx): cached_row_shapes[str(idx)]
+                        for idx in metadata_row_layers
+                    },
+                    "row_dtypes": {
+                        str(idx): cached_row_dtypes[str(idx)]
+                        for idx in metadata_row_layers
+                    },
+                    "row_tensor_sha256": {
+                        str(idx): cached_row_digests[str(idx)]
+                        for idx in metadata_row_layers
+                    },
                     "files": files,
                 })
-                assert cache_stem is not None
-                _prune_manifold_capture_cache(capture_dir, keep_stem=cache_stem)
+                keep_names = {
+                    cache_meta.name,
+                    *files,
+                    *(
+                        cached_row_files[str(idx)]
+                        for idx in metadata_row_layers
+                    ),
+                }
+                for old_path in _capture_group_paths(capture_dir, cache_stem):
+                    if old_path.name not in keep_names:
+                        old_path.unlink(missing_ok=True)
             except (OSError, RuntimeError, ValueError) as exc:
                 # The fit result is already in memory and remains valid. A cache
-                # write/prune failure must not turn successful model work into a
+                # write failure must not turn successful model work into a
                 # failed fit; next run simply captures again.
                 _progress(f"Activation capture cache write skipped: {exc}")
 
@@ -1609,29 +1755,28 @@ class ManifoldExtractionPipeline:
                 stores: list[ActivationRowStore] = []
                 if retained_rows is not None:
                     stores.append(retained_rows)
-                cached_auto_rows = None
                 selected_cached_layers = sorted(row_layers & set(fit_layers))
-                if (
-                    selected_cached_layers and row_cache is not None
-                    and row_cache.exists()
-                ):
-                    try:
-                        cached_auto_rows = ActivationRowStore.load(
-                            row_cache, node_sizes,
-                            layer_indices=selected_cached_layers,
-                        )
-                        if any(not _row_tensor_matches_cache_metadata(
-                            row_cache, idx, cached_auto_rows.flat_rows(idx),
-                            expected_shape=cached_row_shapes.get(str(idx)),
-                            expected_dtype=cached_row_dtypes.get(str(idx)),
-                            expected_digest=cached_row_digests.get(str(idx)),
-                        ) for idx in selected_cached_layers):
-                            raise ValueError("row cache metadata mismatch")
-                        stores.append(cached_auto_rows)
-                    except (OSError, RuntimeError, ValueError, KeyError):
-                        if cached_auto_rows is not None:
-                            cached_auto_rows.close()
-                        cached_auto_rows = None
+                if selected_cached_layers and cache_stem is not None:
+                    for idx in selected_cached_layers:
+                        path = capture_dir / cached_row_files[str(idx)]
+                        auto_store: ActivationRowStore | None = None
+                        try:
+                            auto_store = ActivationRowStore.load_shards(
+                                {idx: path}, node_sizes,
+                            )
+                            if not _row_tensor_matches_cache_metadata(
+                                path, idx, auto_store.flat_rows(idx),
+                                expected_shape=cached_row_shapes.get(str(idx)),
+                                expected_dtype=cached_row_dtypes.get(str(idx)),
+                                expected_digest=cached_row_digests.get(str(idx)),
+                            ):
+                                raise ValueError("row cache metadata mismatch")
+                            stores.append(auto_store)
+                            auto_store = None  # ownership moved to stores
+                        except (OSError, RuntimeError, ValueError, KeyError):
+                            if auto_store is not None:
+                                auto_store.close()
+                            row_layers.discard(idx)
                 covered_rows = {
                     idx for store in stores for idx in store.layer_indices
                 }
@@ -1659,13 +1804,7 @@ class ManifoldExtractionPipeline:
                     assert missing_rows is not None
                     stores.append(missing_rows)
                 if len(stores) > 1:
-                    combined = ActivationRowStore(node_sizes)
-                    flat_indices = torch.arange(sum(node_sizes), dtype=torch.long)
-                    for store in stores:
-                        for idx in store.layer_indices:
-                            combined.write(idx, flat_indices, store.flat_rows(idx))
-                        store.close()
-                    retained_rows = combined
+                    retained_rows = ActivationRowStore.combine_disjoint(stores)
                 elif stores:
                     retained_rows = stores[0]
             if retained_rows is None:
@@ -1679,59 +1818,43 @@ class ManifoldExtractionPipeline:
             # the spool; flat auto fits closed it above without this I/O.
             if (
                 mf.fit_mode == "auto"
-                and row_cache is not None
+                and cache_stem is not None
                 and cache_meta is not None
                 and cache_meta.exists()
             ):
-                from saklas.core.manifold import ActivationRowStore
                 from saklas.io.atomic import write_json_atomic
 
                 try:
-                    durable_only = sorted(
-                        row_layers - set(retained_rows.layer_indices)
+                    newly_durable = sorted(
+                        set(retained_rows.layer_indices) - row_layers
                     )
-                    if durable_only:
-                        durable_rows = ActivationRowStore.load(
-                            row_cache, node_sizes, layer_indices=durable_only,
-                        )
-                        try:
-                            if any(not _row_tensor_matches_cache_metadata(
-                                row_cache, idx, durable_rows.flat_rows(idx),
-                                expected_shape=cached_row_shapes.get(str(idx)),
-                                expected_dtype=cached_row_dtypes.get(str(idx)),
-                                expected_digest=cached_row_digests.get(str(idx)),
-                            ) for idx in durable_only):
-                                raise ValueError(
-                                    "durable row cache metadata mismatch"
-                                )
-                            combined_rows = ActivationRowStore(node_sizes)
-                            flat_indices = torch.arange(
-                                sum(node_sizes), dtype=torch.long,
-                            )
-                            for store in (durable_rows, retained_rows):
-                                for idx in store.layer_indices:
-                                    combined_rows.write(
-                                        idx, flat_indices, store.flat_rows(idx),
-                                    )
-                            retained_rows.close()
-                            retained_rows = combined_rows
-                        finally:
-                            durable_rows.close()
-                    retained_rows.persist(row_cache)
+                    for idx in newly_durable:
+                        row_path = _row_shard_path(capture_dir, cache_stem, idx)
+                        rows = retained_rows.flat_rows(idx)
+                        _save_safetensors_atomic({f"layer_{idx}": rows}, row_path)
+                        cached_row_files[str(idx)] = row_path.name
+                        cached_row_shapes[str(idx)] = list(rows.shape)
+                        cached_row_dtypes[str(idx)] = str(rows.dtype)
+                        cached_row_digests[str(idx)] = _tensor_sha256(rows)
+                    row_layers.update(newly_durable)
                     with open(cache_meta) as handle:
                         cache_payload = json.load(handle)
-                    durable_layers = list(retained_rows.layer_indices)
+                    durable_layers = sorted(row_layers)
                     cache_payload["row_layers"] = durable_layers
+                    cache_payload["row_files"] = {
+                        str(idx): cached_row_files[str(idx)]
+                        for idx in durable_layers
+                    }
                     cache_payload["row_shapes"] = {
-                        str(idx): list(retained_rows.flat_rows(idx).shape)
+                        str(idx): cached_row_shapes[str(idx)]
                         for idx in durable_layers
                     }
                     cache_payload["row_dtypes"] = {
-                        str(idx): str(retained_rows.flat_rows(idx).dtype)
+                        str(idx): cached_row_dtypes[str(idx)]
                         for idx in durable_layers
                     }
                     cache_payload["row_tensor_sha256"] = {
-                        str(idx): _tensor_sha256(retained_rows.flat_rows(idx))
+                        str(idx): cached_row_digests[str(idx)]
                         for idx in durable_layers
                     }
                     write_json_atomic(cache_meta, cache_payload)

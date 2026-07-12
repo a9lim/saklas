@@ -286,10 +286,11 @@ The third artifact family, **per-model** rather than per-concept (Gurnee et al.,
 "Verbalizable Representations Form a Global Workspace in Language Models",
 Transformer Circuits 2026). The lens is one matrix per source layer,
 `J_l = E[∂h_final/∂h_l]` — the average first-order effect of a layer's residual
-on the final-layer residual over positions and a web-text corpus — stored at
-`models/<safe_model_id>/jlens.{safetensors,json}` (fp16, `LENS_FORMAT_VERSION = 3`,
-sidecar records the immutable corpus spec + token-id sha256, exact source/live
-model identities, and tensor payload sha256).
+on the final-layer residual over positions and a web-text corpus — stored as
+immutable per-layer fp16 shards selected by
+`models/<safe_model_id>/jlens.json` (`LENS_FORMAT_VERSION = 4`; legacy v3
+monoliths still load). The sidecar records the immutable corpus spec + token-id
+sha256, exact source/live model identities, and one payload sha256 per layer.
 `lens fit` runs the estimator (`core/jlens.py::fit_jacobian_lens` — consecutive
 ragged prompts share one graph, then batched VJPs recover `dim_batch` output rows
 per backward without replicating the forward; unsupported batched VJPs fall back
@@ -607,10 +608,15 @@ must cover every selected layer), bake the per-layer
 Mahalanobis share, write the per-model tensor. `--sae <release>` reconstructs each
 centroid through the SAE before the fit; SAE weights load one layer at a time and
 the fitted subspace is always model-space, so the hook never touches the SAE.
+Discover fit-mode/hyperparameter overrides are merged into `manifold.json`
+inside the same manifest lock that derives the cache key and publishes the fit;
+CLI/server callers never perform an unlocked pre-fit rewrite.
 Capture is tokenized/length-bucketed once, terminates at the last requested
 transformer block, and writes curved-fit rows to a source-dtype layer-major spool;
 geometry-only refits reuse a digested, size-bounded token-exact per-model
-activation cache whose layer coverage can be sliced/topped up. `--layers`
+activation cache. Its v4 centroid/row payloads are per-layer shards, so scoped
+reads touch only requested layers and disjoint top-ups write only new shards;
+eviction waits for any active victim transaction. `--layers`
 can restrict the artifact to explicit indices or the workspace band.
 `min_nodes(n) = 2n+1` for a curved fit (a flat
 `pca` fit needs only `k+1`); authored nodes must be *poised* (affinely span the
@@ -913,8 +919,8 @@ All state under `~/.saklas/` (override via `$SAKLAS_HOME`):
                                        # probe-centering mean is its per-layer X.mean(0),
                                        # the whitener covariance is built from the stack
     alignments/<safe_src>.{safetensors,json} # optional cross-model Procrustes map
-    jlens.{safetensors,json}           # per-model Jacobian lens (fp16 J_l per
-                                       # layer + corpus-spec sidecar; `lens fit`)
+    jlens.json                         # atomic per-model Jacobian-lens pointer
+    jlens.layer-*.gen-*.safetensors    # immutable fp16 J_l layer shards (`lens fit`)
   vectors/<ns>/<concept>/              # LEGACY (pre-4.0) packs only — ported to
                                        # manifolds/ on first touch; no longer written
   conversations/<name>.json            # explicit loom-tree saves (no autosave)

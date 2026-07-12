@@ -4158,6 +4158,7 @@ class ActivationRowStore:
             tempfile.TemporaryDirectory(prefix="saklas-manifold-rows-")
         )
         self._layers: dict[int, torch.Tensor] = {}
+        self._owners: list[ActivationRowStore] = []
         self._closed = False
 
     @classmethod
@@ -4212,8 +4213,94 @@ class ActivationRowStore:
                 f"{sorted(store._layers)}, need {sorted(selected)}"
             )
         store._tmp = None
+        store._owners = []
         store._closed = False
         return store
+
+    @classmethod
+    def load_shards(
+        cls,
+        paths: "dict[int, Path]",
+        node_sizes: Sequence[int],
+    ) -> "ActivationRowStore":
+        """Load independently persisted per-layer activation-row shards.
+
+        Capture-cache v4 stores one safetensors file per layer so a scoped fit
+        neither maps nor rewrites unrelated multi-GiB row payloads.  Every
+        shard must carry exactly its named ``layer_<L>`` tensor; the caller
+        validates the tensor's exact digest against the atomically published
+        capture metadata.
+        """
+        if not paths:
+            raise ValueError("activation-row shard selection must not be empty")
+        store = cls.__new__(cls)
+        store.node_sizes = [int(size) for size in node_sizes]
+        store.offsets = []
+        offset = 0
+        for size in store.node_sizes:
+            store.offsets.append(offset)
+            offset += size
+        store.total_rows = offset
+        store._layers = {}
+        for idx, path in sorted(paths.items()):
+            expected_key = f"layer_{int(idx)}"
+            with safe_open(str(path), framework="pt", device="cpu") as tensors:
+                keys = list(tensors.keys())
+                if keys != [expected_key]:
+                    raise ValueError(
+                        f"activation-row shard at {path} has keys {keys}, "
+                        f"expected [{expected_key!r}]"
+                    )
+                shape = tuple(
+                    int(dim) for dim in tensors.get_slice(expected_key).get_shape()
+                )
+                if len(shape) != 2 or shape[0] != store.total_rows:
+                    raise ValueError(
+                        f"invalid activation-row shard tensor {expected_key!r} "
+                        f"at {path}"
+                    )
+                store._layers[int(idx)] = tensors.get_tensor(expected_key)
+        store._tmp = None
+        store._owners = []
+        store._closed = False
+        return store
+
+    @classmethod
+    def combine_disjoint(
+        cls, stores: Sequence["ActivationRowStore"],
+    ) -> "ActivationRowStore":
+        """Combine disjoint layer stores by view, transferring ownership.
+
+        Sharded cache top-ups often pair many immutable cached layers with one
+        newly captured temporary layer. Copying all ``N x D`` rows into a third
+        mmap merely to present one layer-major roster doubles multi-GiB I/O.
+        This composite aliases the existing tensors and keeps their stores
+        alive until the composite closes; no payload bytes move.
+        """
+        if not stores:
+            raise ValueError("activation-row combine needs at least one store")
+        node_sizes = list(stores[0].node_sizes)
+        if any(store._closed for store in stores):
+            raise RuntimeError("cannot combine a closed activation-row store")
+        if any(store.node_sizes != node_sizes for store in stores[1:]):
+            raise ValueError("activation-row stores must share node sizes")
+        layers: dict[int, torch.Tensor] = {}
+        for store in stores:
+            overlap = set(layers) & set(store._layers)
+            if overlap:
+                raise ValueError(
+                    f"activation-row stores overlap layers {sorted(overlap)}"
+                )
+            layers.update(store._layers)
+        combined = cls.__new__(cls)
+        combined.node_sizes = node_sizes
+        combined.offsets = list(stores[0].offsets)
+        combined.total_rows = stores[0].total_rows
+        combined._tmp = None
+        combined._layers = layers
+        combined._owners = list(stores)
+        combined._closed = False
+        return combined
 
     def _layer(self, idx: int, *, dim: int, dtype: torch.dtype) -> torch.Tensor:
         existing = self._layers.get(idx)
@@ -4279,6 +4366,10 @@ class ActivationRowStore:
         if self._closed:
             return
         self._layers.clear()
+        owners = getattr(self, "_owners", [])
+        self._owners = []
+        for owner in owners:
+            owner.close()
         if self._tmp is not None:
             self._tmp.cleanup()
         self._closed = True

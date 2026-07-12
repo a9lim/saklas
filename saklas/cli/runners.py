@@ -1092,15 +1092,12 @@ def _run_manifold_fit(args: argparse.Namespace) -> None:
     allowed).  When it resolves to a discover-mode folder (``pca`` /
     ``spectral``) any supplied hyperparam override (``--method`` / ``--max-dim``
     / ``--var-threshold`` / ``--k-nn`` / ``--bandwidth`` / ``--max-subspace-dim``)
-    is written into ``manifold.json`` atomically *before* the fit so the cache
-    key reflects the actual fit inputs.  Supplying overrides against an authored
-    folder is an error (mirrors the server's 400).
+    is passed into the fit transaction, which updates ``manifold.json`` under
+    the same lock used to derive the cache key. Supplying overrides against an
+    authored folder is an error (mirrors the server's 400).
     """
-    import json as _json
-    from saklas.io.atomic import write_json_atomic
     from saklas.io.manifolds import (
-        ManifoldFolder, ManifoldFormatError, sanitize_hyperparams,
-        domain_label,
+        ManifoldFolder, ManifoldFormatError, domain_label,
     )
 
     _require_model(args)
@@ -1139,8 +1136,8 @@ def _run_manifold_fit(args: argparse.Namespace) -> None:
         )
     )
 
-    new_fit_mode = mf.fit_mode
-    metadata_changed = False
+    requested_fit_mode: str | None = None
+    requested_hyperparams: dict[str, object] | None = None
     if override_supplied:
         if not mf.is_discover:
             # Mirror the server's 400: hyperparam overrides are discover-only.
@@ -1150,68 +1147,46 @@ def _run_manifold_fit(args: argparse.Namespace) -> None:
                 file=sys.stderr,
             )
             sys.exit(2)
-        new_fit_mode = args.method or mf.fit_mode
-        if new_fit_mode not in {"pca", "spectral", "auto"}:
+        requested_fit_mode = args.method
+        if requested_fit_mode is not None and requested_fit_mode not in {
+            "pca", "spectral", "auto",
+        }:
             print(
-                f"manifold fit: invalid method {new_fit_mode!r}",
+                f"manifold fit: invalid method {requested_fit_mode!r}",
                 file=sys.stderr,
             )
             sys.exit(2)
-        new_hyperparams = dict(mf.hyperparams)
+        requested_hyperparams = {}
         # PCA knobs.
         if args.max_dim is not None:
-            new_hyperparams["max_dim"] = int(args.max_dim)
+            requested_hyperparams["max_dim"] = int(args.max_dim)
         if args.var_threshold is not None:
-            new_hyperparams["var_threshold"] = float(args.var_threshold)
+            requested_hyperparams["var_threshold"] = float(args.var_threshold)
         # Spectral knobs.
         if getattr(args, "min_dim", None) is not None:
-            new_hyperparams["min_dim"] = int(args.min_dim)
+            requested_hyperparams["min_dim"] = int(args.min_dim)
         if args.k_nn is not None:
-            new_hyperparams["k_nn"] = int(args.k_nn)
+            requested_hyperparams["k_nn"] = int(args.k_nn)
         if args.bandwidth is not None:
-            new_hyperparams["bandwidth"] = float(args.bandwidth)
+            requested_hyperparams["bandwidth"] = float(args.bandwidth)
         # Spectral-only knob — dropped by ``_sanitize_hyperparams`` for a pca
         # fit (a flat fit's per-layer subspace dim is its layout dim, capped
         # by ``--max-dim``, not a separate knob).
         if getattr(args, "max_subspace_dim", None) is not None:
-            new_hyperparams["max_subspace_dim"] = int(args.max_subspace_dim)
+            requested_hyperparams["max_subspace_dim"] = int(
+                args.max_subspace_dim,
+            )
         # Curved-fit smoothing (spectral/auto): "auto" → GCV, else a float λ.
         if getattr(args, "smoothing", None) is not None:
             s = args.smoothing
-            new_hyperparams["smoothing"] = s if s == "auto" else float(s)
+            requested_hyperparams["smoothing"] = (
+                s if s == "auto" else float(s)
+            )
         # Auto-only: periodic-detection persistence threshold.
         if getattr(args, "persistence_frac", None) is not None:
-            new_hyperparams["persistence_frac"] = float(args.persistence_frac)
-        new_hyperparams = sanitize_hyperparams(new_fit_mode, new_hyperparams)
-
-        # Write back if anything changed.  Staged write — a crash mid-rewrite
-        # would leave the folder unreadable and ``ManifoldFolder.load`` would
-        # 400 on the next list call.
-        if new_fit_mode != mf.fit_mode or new_hyperparams != mf.hyperparams:
-            data = _json.loads((folder / "manifold.json").read_text())
-            data["fit_mode"] = new_fit_mode
-            data["hyperparams"] = new_hyperparams
-            # Re-author the nodes list in case fit_mode changed and it
-            # accidentally carries authored shape.  Discover nodes are
-            # label-only.
-            data["nodes"] = [
-                {
-                    "label": label,
-                    **({"role": mf.node_roles[idx]}
-                       if idx < len(mf.node_roles)
-                       and mf.node_roles[idx] is not None else {}),
-                    **({"kind": mf.node_kinds[idx]}
-                       if idx < len(mf.node_kinds)
-                       and mf.node_kinds[idx] is not None else {}),
-                }
-                for idx, label in enumerate(mf.node_labels)
-            ]
-            data.pop("domain", None)
-            write_json_atomic(folder / "manifold.json", data)
-            metadata_changed = True
-
-    if metadata_changed:
-        mf = ManifoldFolder.load(folder, verify_manifest=False)
+            requested_hyperparams["persistence_frac"] = float(
+                args.persistence_frac,
+            )
 
     _print_startup(args)
     session = _make_session(args, load_probes=False)
@@ -1221,6 +1196,8 @@ def _run_manifold_fit(args: argparse.Namespace) -> None:
             folder,
             sae=getattr(args, "sae", None),
             layers=getattr(args, "layers", None),
+            fit_mode=requested_fit_mode,
+            hyperparams=requested_hyperparams,
             force=bool(getattr(args, "force", False)),
             on_progress=lambda m: print(f"  {m}"),
         )
@@ -1230,9 +1207,8 @@ def _run_manifold_fit(args: argparse.Namespace) -> None:
     except Exception as e:
         print(f"manifold fit failed: {e}", file=sys.stderr)
         sys.exit(1)
-    tail = (
-        f", fit_mode={new_fit_mode}" if mf.is_discover else ""
-    )
+    fitted_mode = getattr(manifold, "metadata", {}).get("fit_mode", mf.fit_mode)
+    tail = f", fit_mode={fitted_mode}" if mf.is_discover else ""
     print(
         f"fitted manifold '{manifold.name}' "
         f"({len(manifold.layers)} layers, {len(manifold.node_labels)} nodes, "
@@ -2443,7 +2419,9 @@ def _try_lens_fit_noop_preflight(
     from saklas.core.jlens import DEFAULT_SEQ_LEN
     from saklas.core.model import model_source_fingerprint
     from saklas.io.lens import (
+        lens_artifact_size,
         lens_paths,
+        lens_payloads_match,
         load_lens_sidecar,
         resolved_default_lens_corpus_spec,
     )
@@ -2485,15 +2463,10 @@ def _try_lens_fit_noop_preflight(
     usable_count = int(sidecar.get("usable_prompt_count", -1))
     if usable_count < 0 or int(sidecar.get("n_prompts", -1)) < usable_count:
         return False
-    ts_path, _ = lens_paths(args.model)
-    from saklas.io.packs import hash_file
-
-    if (
-        not ts_path.exists()
-        or sidecar.get("tensor_sha256") != hash_file(ts_path)
-    ):
+    _ts_path, sidecar_path = lens_paths(args.model)
+    if not lens_payloads_match(args.model, sidecar):
         return False
-    size_mb = ts_path.stat().st_size / 1024**2 if ts_path.exists() else 0.0
+    size_mb = lens_artifact_size(args.model, sidecar) / 1024**2
     source_layers = [int(layer) for layer in sidecar["source_layers"]]
     print(
         f"Fitted Jacobian lens: {len(source_layers)} layers, "
@@ -2501,13 +2474,13 @@ def _try_lens_fit_noop_preflight(
         f"d_model={sidecar.get('d_model', '?')}"
     )
     print("Already fitted for this corpus and exact model source — nothing to do.")
-    print(f"Artifact: {ts_path} ({size_mb:.0f} MB)")
+    print(f"Artifact: {sidecar_path} ({size_mb:.0f} MB across layer shards)")
     return True
 
 
 def _run_lens_fit(args: argparse.Namespace) -> None:
     from saklas.core.session import SaklasSession
-    from saklas.io.lens import lens_paths
+    from saklas.io.lens import lens_artifact_size, lens_paths, load_lens_sidecar
 
     requested_layers = _parse_layer_list(getattr(args, "layers", None))
     if requested_layers == "sample":
@@ -2544,19 +2517,23 @@ def _run_lens_fit(args: argparse.Namespace) -> None:
             checkpoint_every=args.checkpoint_every,
             on_progress=lambda m: print(f"  {m}"),
         )
-    ts_path, _ = lens_paths(args.model)
-    size_mb = ts_path.stat().st_size / 1024**2 if ts_path.exists() else 0.0
+    _ts_path, sidecar_path = lens_paths(args.model)
+    sidecar = load_lens_sidecar(args.model)
+    size_mb = (
+        lens_artifact_size(args.model, sidecar) / 1024**2
+        if sidecar is not None else 0.0
+    )
     print(
         f"Fitted Jacobian lens: {len(lens.source_layers)} layers, "
         f"{lens.n_prompts} prompts, d_model={lens.d_model}"
     )
-    print(f"Artifact: {ts_path} ({size_mb:.0f} MB)")
+    print(f"Artifact: {sidecar_path} ({size_mb:.0f} MB across layer shards)")
 
 
 def _run_lens_show(args: argparse.Namespace) -> None:
     import json as _json
 
-    from saklas.io.lens import lens_paths, load_lens_sidecar
+    from saklas.io.lens import lens_artifact_size, lens_paths, load_lens_sidecar
 
     sidecar = load_lens_sidecar(args.model)
     if sidecar is None:
@@ -2566,13 +2543,13 @@ def _run_lens_show(args: argparse.Namespace) -> None:
             file=sys.stderr,
         )
         sys.exit(1)
-    ts_path, _ = lens_paths(args.model)
-    size_mb = ts_path.stat().st_size / 1024**2
+    _ts_path, sidecar_path = lens_paths(args.model)
+    size_mb = lens_artifact_size(args.model, sidecar) / 1024**2
     source_layers = [int(layer) for layer in sidecar["source_layers"]]
     if getattr(args, "json_output", False):
         print(_json.dumps({
             "model": args.model,
-            "path": str(ts_path),
+            "path": str(sidecar_path),
             "size_mb": round(size_mb, 1),
             **sidecar,
         }, indent=2))
@@ -2586,7 +2563,7 @@ def _run_lens_show(args: argparse.Namespace) -> None:
           f"(sha256 {str(sidecar.get('corpus_sha256', ''))[:12]}…)")
     print(f"  seq_len:  {sidecar.get('seq_len', '?')}, "
           f"skip_first: {sidecar.get('skip_first_positions', '?')}")
-    print(f"  artifact: {ts_path} ({size_mb:.0f} MB)")
+    print(f"  artifact: {sidecar_path} ({size_mb:.0f} MB across layer shards)")
 
 
 def _lens_default_top_layers(source_layers: list[int], count: int = 9) -> list[int]:
@@ -2710,14 +2687,14 @@ def _run_lens_decompose(args: argparse.Namespace) -> None:
 
 
 def _run_lens_rm(args: argparse.Namespace) -> None:
-    from saklas.io.lens import lens_paths, remove_lens
+    from saklas.io.lens import lens_paths, load_lens_sidecar, remove_lens
 
-    ts_path, _ = lens_paths(args.model)
-    if not ts_path.exists():
+    _ts_path, sidecar_path = lens_paths(args.model)
+    if load_lens_sidecar(args.model) is None:
         print(f"no fitted lens for {args.model}", file=sys.stderr)
         sys.exit(1)
     if not args.yes:
-        answer = input(f"Remove {ts_path}? [y/N] ").strip().lower()
+        answer = input(f"Remove {sidecar_path}? [y/N] ").strip().lower()
         if answer not in ("y", "yes"):
             print("Aborted.")
             return

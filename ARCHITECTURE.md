@@ -185,9 +185,13 @@ Centroid-only fits reduce by node before transfer. Raw curved fits write
 source-dtype rows to a layer-major mmap spool; sigma covariance projects that
 spool layer-major in bounded chunks, so it needs neither a second model pass, a
 resident fp32 hidden roster, nor one small hidden-dimension GEMM per node; token-exact per-model centroid/row
-caches include baseline/tokenizer-render identity, node boundaries, centroid
-digests + exact per-layer row digests, map only requested row layers, union
-layer coverage for subset/top-up reuse, and prune oldest groups past a configurable disk bound;
+caches include baseline/tokenizer-render identity and node boundaries. Format v4
+stores independently digested per-layer centroid and row shards: scoped fits
+verify/map only requested layers, disjoint top-ups write only missing shards, and
+legacy v3 monoliths are replaced on first use. Coverage is unioned for
+subset/top-up reuse; cached and newly captured row stores compose as zero-copy
+layer views for the covariance pass. Oldest-group pruning runs after the active stem transaction
+and locks each victim before deletion, past a configurable disk bound;
 geometry-only refits skip capture entirely. Fitted tensors carry the
 loaded-model fingerprint and selected layer set in their cache identity.
 
@@ -917,17 +921,18 @@ source derivative inside autograd from `[rows,B,T,D]` to `[rows,B,D]` while
 leaving the forward and upstream gradient unchanged. A final-block hook stops before norm + LM head. Every
 backend transfers bounded row stripes directly into the CPU accumulator; an OOM
 rebuilds the graph at the first uncommitted row. Self-contained checkpoints
-(`jlens.partial.*`) are written one layer at
-a time directly from raw accumulator sums, avoiding a second full fp32 lens and
-supporting repeated interruption or missing-layer top-up resume. The streamed
+(`jlens.partial.*`) are written as immutable per-layer shards directly from raw
+accumulator sums, avoiding a second full fp32 lens and supporting repeated
+interruption or missing-layer top-up resume. Sparse layer top-ups reuse the
+unchanged durable shard pointers and write only new matrices. The streamed
 safetensors writer never retains a complete fp16 mapping. Normal corpus extension
 resumes from an exact token-id prefix; the default dataset is commit-pinned;
 exact source/live-model fingerprints invalidate mutable revisions. A complete
 terminal checkpoint is fsynced and promoted at finalization instead of being
-rewritten; otherwise the full fp16 artifact is streamed once, with a payload digest
-verified on final and checkpoint loads.
+rewritten; otherwise each fp16 layer shard is streamed once, with its payload
+digest verified on final and checkpoint loads.
 The artifact (`io/lens.py`,
-`models/<safe_id>/jlens.safetensors`, fp16) then supports four
+`models/<safe_id>/jlens.json` plus fp16 layer shards) then supports four
 consumers with zero hot-path cost when unused:
 
 - the **readout** `softmax(W_U · norm(J_l h))` (`session.jlens_readout`

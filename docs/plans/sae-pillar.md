@@ -24,7 +24,7 @@ The J-lens is the template because it already solved the same problems:
 
 | Concern            | J-lens answer                                   | SAE transplant                                     |
 | ------------------ | ----------------------------------------------- | -------------------------------------------------- |
-| Per-model artifact | `models/<safe>/jlens.safetensors` + sidecar     | SAE weights (HF/sae-lens) + local metadata cache    |
+| Per-model artifact | `models/<safe>/jlens.json` + immutable layer shards | SAE weights (HF/sae-lens) + local metadata cache    |
 | Live readout       | `POST /lens/live`, WS `token.lens_readout`      | `POST /sae/live`, WS `token.sae_readout`            |
 | Steer atom         | `jlens/<word>` → `W_U[v] @ J_l` direction       | `sae/<id>` → decoder row `W_dec[i]`                 |
 | Probe/gate channel | readout channel, `coords = (strength,)`         | readout channel, `coords = (activation,)`           |

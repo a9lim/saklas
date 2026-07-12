@@ -4,8 +4,8 @@ The lens is a per-model transport (one ``J_l`` matrix per source layer), not a
 per-concept artifact, so it lives next to the neutral-activation cache rather
 than under ``manifolds/``:
 
-    ~/.saklas/models/<safe_model_id>/jlens.safetensors   # layer_<idx>, fp16
-    ~/.saklas/models/<safe_model_id>/jlens.json          # sidecar
+    ~/.saklas/models/<safe_model_id>/jlens.layer-<L>.gen-<id>.safetensors
+    ~/.saklas/models/<safe_model_id>/jlens.json          # atomic shard pointer
 
 fp16 on disk (the reference-repo convention — J entries are O(1), so range is
 no constraint and fp16's extra mantissa bits beat bf16; this deliberately
@@ -24,9 +24,10 @@ import hashlib
 import logging
 import os
 import struct
-from contextlib import suppress
+import uuid
+from contextlib import contextmanager, suppress
 from pathlib import Path
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from typing import Any, cast
 
 import torch
@@ -38,26 +39,228 @@ from saklas.io.paths import model_dir
 
 log = logging.getLogger(__name__)
 
-LENS_FORMAT_VERSION = 3
+LENS_FORMAT_VERSION = 4
+_LEGACY_LENS_FORMAT_VERSION = 3
 _LENS_NAME = "jlens"
 _LENS_CHECKPOINT_NAME = "jlens.partial"
 _LENS_METHOD = "jlens_cotangent_sum"
 LENS_CORPUS_PREPROCESS_VERSION = 1
 
 
-def lens_paths(model_id: str) -> tuple[Path, Path]:
-    """Return ``(safetensors_path, sidecar_path)`` for a model's lens."""
+def _lens_anchor_paths(model_id: str) -> tuple[Path, Path]:
+    """Stable lock/legacy paths for the durable lens pointer."""
     md = model_dir(model_id)
     return md / f"{_LENS_NAME}.safetensors", md / f"{_LENS_NAME}.json"
 
 
-def lens_checkpoint_paths(model_id: str) -> tuple[Path, Path]:
-    """Return ``(safetensors_path, sidecar_path)`` for the resumable checkpoint."""
+def _checkpoint_anchor_paths(model_id: str) -> tuple[Path, Path]:
+    """Stable lock/legacy paths for the checkpoint pointer."""
     md = model_dir(model_id)
     return (
         md / f"{_LENS_CHECKPOINT_NAME}.safetensors",
         md / f"{_LENS_CHECKPOINT_NAME}.json",
     )
+
+
+def _sidecar_tensor_path(anchor: Path, sidecar: Mapping[str, Any]) -> Path:
+    """Resolve a representative generation for path-reporting compatibility."""
+    shard_files = sidecar.get("tensor_files")
+    if isinstance(shard_files, Mapping) and shard_files:
+        try:
+            first_key = min(shard_files, key=lambda key: int(str(key)))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("invalid lens tensor shard keys") from exc
+        filename = shard_files[first_key]
+        if (
+            not isinstance(filename, str)
+            or not filename
+            or Path(filename).name != filename
+        ):
+            raise ValueError("invalid lens tensor shard filename")
+        return anchor.parent / filename
+    filename = sidecar.get("tensor_file")
+    if filename is None:
+        return anchor
+    if (
+        not isinstance(filename, str)
+        or not filename
+        or Path(filename).name != filename
+    ):
+        raise ValueError("invalid lens tensor generation filename")
+    return anchor.parent / filename
+
+
+def _sidecar_tensor_paths(
+    anchor: Path, sidecar: Mapping[str, Any], source_layers: list[int],
+) -> dict[int, Path]:
+    """Resolve every declared layer to its immutable tensor generation."""
+    shard_files = sidecar.get("tensor_files")
+    if shard_files is None:
+        monolith = _sidecar_tensor_path(anchor, sidecar)
+        return {layer: monolith for layer in source_layers}
+    if not isinstance(shard_files, Mapping):
+        raise ValueError("invalid lens tensor_files mapping")
+    out: dict[int, Path] = {}
+    for layer in source_layers:
+        filename = shard_files.get(str(layer))
+        if (
+            not isinstance(filename, str)
+            or not filename
+            or Path(filename).name != filename
+        ):
+            raise ValueError(f"missing or invalid tensor shard for layer {layer}")
+        out[layer] = anchor.parent / filename
+    if {str(layer) for layer in source_layers} != {str(key) for key in shard_files}:
+        raise ValueError("tensor shard keys do not match source_layers")
+    return out
+
+
+def _public_pointer_paths(
+    anchor: Path, sidecar_path: Path,
+) -> tuple[Path, Path]:
+    """Best-effort current tensor path for reporting/backward-compatible callers."""
+    try:
+        with open(sidecar_path) as handle:
+            sidecar = json.load(handle)
+        return _sidecar_tensor_path(anchor, sidecar), sidecar_path
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return anchor, sidecar_path
+
+
+def lens_paths(model_id: str) -> tuple[Path, Path]:
+    """Return a representative tensor shard and stable sidecar pointer path.
+
+    Legacy v3 artifacts have no ``tensor_file`` and continue to resolve to
+    ``jlens.safetensors``. New writes use immutable per-layer generations and
+    atomically switch ``jlens.json`` to the complete shard map. Use
+    :func:`lens_tensor_paths` when every layer path is required.
+    """
+    return _public_pointer_paths(*_lens_anchor_paths(model_id))
+
+
+def lens_checkpoint_paths(model_id: str) -> tuple[Path, Path]:
+    """Return the current checkpoint generation and stable sidecar pointer."""
+    return _public_pointer_paths(*_checkpoint_anchor_paths(model_id))
+
+
+def lens_tensor_paths(
+    model_id: str, sidecar: Mapping[str, Any], *, checkpoint: bool = False,
+) -> dict[int, Path]:
+    """Return every tensor generation named by a validated sidecar."""
+    anchor, _ = (
+        _checkpoint_anchor_paths(model_id) if checkpoint
+        else _lens_anchor_paths(model_id)
+    )
+    layers = [int(layer) for layer in sidecar.get("source_layers", [])]
+    return _sidecar_tensor_paths(anchor, sidecar, layers)
+
+
+def lens_artifact_size(
+    model_id: str, sidecar: Mapping[str, Any], *, checkpoint: bool = False,
+) -> int:
+    """Total bytes in the current pointer, retrying a stale caller snapshot."""
+    del sidecar  # the stable pointer is authoritative under its anchor lock
+    anchor, sc_path = (
+        _checkpoint_anchor_paths(model_id) if checkpoint
+        else _lens_anchor_paths(model_id)
+    )
+    with artifact_lock(anchor):
+        current = _load_sidecar_at(
+            model_id, anchor, sc_path,
+            label="jlens checkpoint" if checkpoint else "jlens cache",
+        )
+        if current is None:
+            return 0
+        return sum(
+            path.stat().st_size
+            for path in set(_sidecar_tensor_paths(
+                anchor, current,
+                [int(layer) for layer in current["source_layers"]],
+            ).values())
+        )
+
+
+def lens_payloads_match(
+    model_id: str, sidecar: Mapping[str, Any], *, checkpoint: bool = False,
+) -> bool:
+    """Validate exact payload digests without materializing fp32 matrices."""
+    from saklas.io.packs import hash_file
+
+    try:
+        paths = lens_tensor_paths(model_id, sidecar, checkpoint=checkpoint)
+        expected = sidecar.get("tensor_sha256")
+        if isinstance(expected, Mapping):
+            return all(
+                isinstance(expected.get(str(layer)), str)
+                and hash_file(path) == expected[str(layer)]
+                for layer, path in paths.items()
+            )
+        unique = set(paths.values())
+        return (
+            len(unique) == 1
+            and isinstance(expected, str)
+            and hash_file(next(iter(unique))) == expected
+        )
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
+@contextmanager
+def lens_fit_lock(model_id: str):
+    """Serialize the complete per-model fit/lifecycle transaction cross-process."""
+    anchor, _ = _lens_anchor_paths(model_id)
+    with artifact_lock(anchor.parent / "jlens.fit"):
+        yield
+
+
+def _new_layer_generation(anchor: Path, layer: int) -> Path:
+    return anchor.with_name(
+        f"{anchor.stem}.layer-{int(layer)}.gen-{uuid.uuid4().hex}{anchor.suffix}",
+    )
+
+
+def _referenced_tensor_names(model_folder: Path) -> set[str]:
+    """Read both atomic pointers so shared promoted generations stay live."""
+    out: set[str] = set()
+    for sidecar_path, legacy_name in (
+        (model_folder / f"{_LENS_NAME}.json", f"{_LENS_NAME}.safetensors"),
+        (
+            model_folder / f"{_LENS_CHECKPOINT_NAME}.json",
+            f"{_LENS_CHECKPOINT_NAME}.safetensors",
+        ),
+    ):
+        try:
+            with open(sidecar_path) as handle:
+                sidecar = json.load(handle)
+            shard_files = sidecar.get("tensor_files")
+            filenames = (
+                shard_files.values()
+                if isinstance(shard_files, Mapping)
+                else [sidecar.get("tensor_file", legacy_name)]
+            )
+            for filename in filenames:
+                if isinstance(filename, str) and Path(filename).name == filename:
+                    out.add(filename)
+        except (OSError, TypeError, json.JSONDecodeError):
+            continue
+    return out
+
+
+def _cleanup_unreferenced_generations(model_folder: Path) -> None:
+    """Remove immutable generations only after neither pointer references them."""
+    keep = _referenced_tensor_names(model_folder)
+    candidates = list(model_folder.glob("jlens*.gen-*.safetensors")) + [
+        model_folder / f"{_LENS_NAME}.safetensors",
+        model_folder / f"{_LENS_CHECKPOINT_NAME}.safetensors",
+    ]
+    for path in candidates:
+        if path.name not in keep:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as exc:
+                # Pointer publication is already complete. Generation GC is
+                # opportunistic and must not turn a valid fit into a failure.
+                log.warning("could not remove old J-lens generation %s: %s", path, exc)
 
 
 def lens_estimator_policy(*, skip_first: int | None = None) -> dict[str, Any]:
@@ -75,19 +278,23 @@ def lens_estimator_policy(*, skip_first: int | None = None) -> dict[str, Any]:
 
 
 def _load_sidecar_at(
-    model_id: str, ts_path: Path, sc_path: Path, *, label: str,
+    model_id: str, tensor_anchor: Path, sc_path: Path, *, label: str,
 ) -> dict[str, Any] | None:
-    if not (ts_path.exists() and sc_path.exists()):
+    if not sc_path.exists():
         return None
     try:
         with open(sc_path) as f:
             sidecar = json.load(f)
+        ts_path = _sidecar_tensor_path(tensor_anchor, sidecar)
+        if not ts_path.exists():
+            return None
         version = sidecar.get("format_version")
-        if version != LENS_FORMAT_VERSION:
+        if version not in {LENS_FORMAT_VERSION, _LEGACY_LENS_FORMAT_VERSION}:
             log.warning(
-                "%s for %s has format_version %r (need %d); ignoring "
+                "%s for %s has format_version %r (need %d or legacy %d); ignoring "
                 "— re-fit with `saklas lens fit`",
                 label, model_id, version, LENS_FORMAT_VERSION,
+                _LEGACY_LENS_FORMAT_VERSION,
             )
             return None
         if sidecar.get("estimator_policy") != lens_estimator_policy():
@@ -113,16 +320,25 @@ def _load_sidecar_at(
         sidecar = dict(sidecar)
         sidecar["source_layers"] = sorted(int(layer) for layer in source_layers_raw)
         sidecar["d_model"] = d_model
-        expected_keys = [f"layer_{layer}" for layer in sidecar["source_layers"]]
-        with safe_open(str(ts_path), framework="pt", device="cpu") as tensors:
-            if sorted(tensors.keys()) != sorted(expected_keys):
-                raise ValueError("tensor layer keys do not match sidecar")
-            for key in expected_keys:
-                view = tensors.get_slice(key)
-                if tuple(view.get_shape()) != (d_model, d_model):
-                    raise ValueError(f"{key} shape does not match sidecar")
-                if view.get_dtype() != "F16":
-                    raise ValueError(f"{key} is not float16")
+        tensor_paths = _sidecar_tensor_paths(
+            tensor_anchor, sidecar, sidecar["source_layers"],
+        )
+        grouped: dict[Path, list[int]] = {}
+        for layer, path in tensor_paths.items():
+            if not path.exists():
+                raise ValueError(f"missing tensor generation {path.name}")
+            grouped.setdefault(path, []).append(layer)
+        for path, path_layers in grouped.items():
+            path_keys = [f"layer_{layer}" for layer in path_layers]
+            with safe_open(str(path), framework="pt", device="cpu") as tensors:
+                if sorted(tensors.keys()) != sorted(path_keys):
+                    raise ValueError("tensor layer keys do not match sidecar")
+                for key in path_keys:
+                    view = tensors.get_slice(key)
+                    if tuple(view.get_shape()) != (d_model, d_model):
+                        raise ValueError(f"{key} shape does not match sidecar")
+                    if view.get_dtype() != "F16":
+                        raise ValueError(f"{key} is not float16")
         return sidecar
     except Exception as exc:
         log.warning("Corrupt %s sidecar for %s; ignoring: %s", label, model_id, exc)
@@ -131,17 +347,17 @@ def _load_sidecar_at(
 
 def load_lens_sidecar(model_id: str) -> dict[str, Any] | None:
     """Load validated lens metadata without loading the tensor artifact."""
-    ts_path, sc_path = lens_paths(model_id)
-    with artifact_lock(ts_path):
-        return _load_sidecar_at(model_id, ts_path, sc_path, label="jlens cache")
+    anchor, sc_path = _lens_anchor_paths(model_id)
+    with artifact_lock(anchor):
+        return _load_sidecar_at(model_id, anchor, sc_path, label="jlens cache")
 
 
 def load_lens_checkpoint_sidecar(model_id: str) -> dict[str, Any] | None:
     """Load validated checkpoint metadata without materializing its matrices."""
-    ts_path, sc_path = lens_checkpoint_paths(model_id)
-    with artifact_lock(ts_path):
+    anchor, sc_path = _checkpoint_anchor_paths(model_id)
+    with artifact_lock(anchor):
         return _load_sidecar_at(
-            model_id, ts_path, sc_path, label="jlens checkpoint",
+            model_id, anchor, sc_path, label="jlens checkpoint",
         )
 
 
@@ -162,26 +378,33 @@ def save_lens(
     model_layer_count: int | None = None,
     model_fingerprint: str | None = None,
     model_source_fingerprint: str | None = None,
+    reuse_layers: Iterable[int] | None = None,
 ) -> Path:
-    """Persist a fitted lens (fp16 tensors + atomic JSON sidecar)."""
-    ts_path, sc_path = lens_paths(model_id)
-    _save_lens_at(
-        lens, ts_path, sc_path,
-        corpus_spec=corpus_spec,
-        corpus_sha256=corpus_sha256,
-        seq_len=seq_len,
-        dim_batch=dim_batch,
-        skip_first=skip_first,
-        corpus_hash_kind=corpus_hash_kind,
-        durable=durable,
-        raw_corpus_sha256=raw_corpus_sha256,
-        raw_prompt_count=raw_prompt_count,
-        usable_prompt_count=usable_prompt_count,
-        model_layer_count=model_layer_count,
-        model_fingerprint=model_fingerprint,
-        model_source_fingerprint=model_source_fingerprint,
-    )
-    return ts_path
+    """Persist a fitted lens and atomically point at its layer generations.
+
+    ``reuse_layers`` names matrices known to be byte-identical to the current
+    durable artifact (the missing-layer top-up path). Valid v4 shard pointers
+    are carried forward; every other layer is converted and written anew.
+    """
+    anchor, sc_path = _lens_anchor_paths(model_id)
+    with lens_fit_lock(model_id):
+        return _save_lens_at(
+            lens, anchor, sc_path,
+            corpus_spec=corpus_spec,
+            corpus_sha256=corpus_sha256,
+            seq_len=seq_len,
+            dim_batch=dim_batch,
+            skip_first=skip_first,
+            corpus_hash_kind=corpus_hash_kind,
+            durable=durable,
+            raw_corpus_sha256=raw_corpus_sha256,
+            raw_prompt_count=raw_prompt_count,
+            usable_prompt_count=usable_prompt_count,
+            model_layer_count=model_layer_count,
+            model_fingerprint=model_fingerprint,
+            model_source_fingerprint=model_source_fingerprint,
+            reuse_layers=reuse_layers,
+        )
 
 
 def save_lens_checkpoint(
@@ -203,29 +426,29 @@ def save_lens_checkpoint(
     model_source_fingerprint: str | None = None,
 ) -> Path:
     """Persist a resumable partial shard without rewriting the full lens."""
-    ts_path, sc_path = lens_checkpoint_paths(model_id)
-    _save_lens_at(
-        partial, ts_path, sc_path,
-        corpus_spec=corpus_spec,
-        corpus_sha256=corpus_sha256,
-        seq_len=seq_len,
-        dim_batch=dim_batch,
-        skip_first=skip_first,
-        corpus_hash_kind=corpus_hash_kind,
-        durable=False,
-        raw_corpus_sha256=raw_corpus_sha256,
-        raw_prompt_count=raw_prompt_count,
-        usable_prompt_count=usable_prompt_count,
-        model_layer_count=model_layer_count,
-        model_fingerprint=model_fingerprint,
-        model_source_fingerprint=model_source_fingerprint,
-        extra_sidecar={
-            "checkpoint": True,
-            "base_n_prompts": int(base_n_prompts),
-            "partial_n_prompts": partial.n_prompts,
-        },
-    )
-    return ts_path
+    anchor, sc_path = _checkpoint_anchor_paths(model_id)
+    with lens_fit_lock(model_id):
+        return _save_lens_at(
+            partial, anchor, sc_path,
+            corpus_spec=corpus_spec,
+            corpus_sha256=corpus_sha256,
+            seq_len=seq_len,
+            dim_batch=dim_batch,
+            skip_first=skip_first,
+            corpus_hash_kind=corpus_hash_kind,
+            durable=False,
+            raw_corpus_sha256=raw_corpus_sha256,
+            raw_prompt_count=raw_prompt_count,
+            usable_prompt_count=usable_prompt_count,
+            model_layer_count=model_layer_count,
+            model_fingerprint=model_fingerprint,
+            model_source_fingerprint=model_source_fingerprint,
+            extra_sidecar={
+                "checkpoint": True,
+                "base_n_prompts": int(base_n_prompts),
+                "partial_n_prompts": partial.n_prompts,
+            },
+        )
 
 
 def save_lens_checkpoint_accumulator(
@@ -256,11 +479,11 @@ def save_lens_checkpoint_accumulator(
     ``base_n_prompts=0`` and can therefore survive any number of interruptions
     without depending on a separate full artifact.
     """
-    ts_path, sc_path = lens_checkpoint_paths(model_id)
+    anchor, sc_path = _checkpoint_anchor_paths(model_id)
     total_prompts = int(n_prompts) + (base.n_prompts if base is not None else 0)
-    with artifact_lock(ts_path):
-        _save_lens_components(
-            sums, total_prompts, d_model, ts_path, sc_path,
+    with lens_fit_lock(model_id), artifact_lock(anchor):
+        return _save_lens_components(
+            sums, total_prompts, d_model, anchor, sc_path,
             corpus_spec=corpus_spec,
             corpus_sha256=corpus_sha256,
             seq_len=seq_len,
@@ -282,7 +505,6 @@ def save_lens_checkpoint_accumulator(
                 "partial_n_prompts": total_prompts,
             },
         )
-    return ts_path
 
 
 def _save_lens_at(
@@ -303,10 +525,11 @@ def _save_lens_at(
     model_layer_count: int | None = None,
     model_fingerprint: str | None = None,
     model_source_fingerprint: str | None = None,
+    reuse_layers: Iterable[int] | None = None,
     extra_sidecar: dict[str, Any] | None = None,
-) -> None:
+) -> Path:
     with artifact_lock(ts_path):
-        _save_lens_components(
+        return _save_lens_components(
             lens.jacobians, lens.n_prompts, lens.d_model, ts_path, sc_path,
             corpus_spec=corpus_spec,
             corpus_sha256=corpus_sha256,
@@ -321,6 +544,7 @@ def _save_lens_at(
             model_layer_count=model_layer_count,
             model_fingerprint=model_fingerprint,
             model_source_fingerprint=model_source_fingerprint,
+            reuse_layers=reuse_layers,
             extra_sidecar=extra_sidecar,
         )
 
@@ -347,8 +571,9 @@ def _save_lens_components(
     model_source_fingerprint: str | None = None,
     raw_sum_count: int | None = None,
     average_base: JacobianLens | None = None,
+    reuse_layers: Iterable[int] | None = None,
     extra_sidecar: dict[str, Any] | None = None,
-) -> None:
+) -> Path:
     ts_path.parent.mkdir(parents=True, exist_ok=True)
     layer_ids = sorted(int(idx) for idx in jacobians)
 
@@ -366,9 +591,62 @@ def _save_lens_components(
             value.mul_(1.0 / max(int(n_prompts), 1))
         return value.to(torch.float16).contiguous()
 
-    tensor_sha256 = _save_fp16_square_safetensors_atomic(
-        ts_path, layer_ids, d_model, _rows, durable=durable,
-    )
+    reuse_set = {int(layer) for layer in reuse_layers or ()}
+    tensor_files: dict[str, str] = {}
+    tensor_sha256: dict[str, str] = {}
+    created: list[Path] = []
+    if reuse_set:
+        current = _load_sidecar_at(
+            "current", ts_path, sc_path, label="jlens reuse source",
+        )
+        if (
+            current is not None
+            and int(current.get("format_version", 0)) == LENS_FORMAT_VERSION
+            and int(current.get("d_model", -1)) == int(d_model)
+            and int(current.get("n_prompts", -1)) == int(n_prompts)
+            and current.get("corpus_sha256") == corpus_sha256
+            and current.get("corpus_hash_kind") == corpus_hash_kind
+            and int(current.get("seq_len", -1)) == int(seq_len)
+            and current.get("model_fingerprint") == model_fingerprint
+            and isinstance(current.get("tensor_sha256"), Mapping)
+        ):
+            current_layers = [int(layer) for layer in current["source_layers"]]
+            current_paths = _sidecar_tensor_paths(
+                ts_path, current, current_layers,
+            )
+            current_digests = current["tensor_sha256"]
+            from saklas.io.packs import hash_file
+
+            for layer in sorted(reuse_set & set(layer_ids) & set(current_layers)):
+                digest = current_digests.get(str(layer))
+                path = current_paths[layer]
+                try:
+                    payload_matches = (
+                        isinstance(digest, str) and len(digest) == 64
+                        and path.exists() and hash_file(path) == digest
+                    )
+                except OSError:
+                    payload_matches = False
+                if (
+                    payload_matches and isinstance(digest, str)
+                ):
+                    tensor_files[str(layer)] = path.name
+                    tensor_sha256[str(layer)] = digest
+    try:
+        for layer in layer_ids:
+            if str(layer) in tensor_files:
+                continue
+            generation_path = _new_layer_generation(ts_path, layer)
+            digest = _save_fp16_square_safetensors_atomic(
+                generation_path, [layer], d_model, _rows, durable=durable,
+            )
+            created.append(generation_path)
+            tensor_files[str(layer)] = generation_path.name
+            tensor_sha256[str(layer)] = digest
+    except BaseException:
+        for path in created:
+            path.unlink(missing_ok=True)
+        raise
     sidecar: dict[str, Any] = {
         "format_version": LENS_FORMAT_VERSION,
         "method": _LENS_METHOD,
@@ -384,6 +662,7 @@ def _save_lens_components(
         "skip_first_positions": skip_first,
         "estimator_policy": lens_estimator_policy(skip_first=skip_first),
         "tensor_sha256": tensor_sha256,
+        "tensor_files": tensor_files,
     }
     if raw_corpus_sha256 is not None:
         sidecar["raw_corpus_sha256"] = raw_corpus_sha256
@@ -399,7 +678,17 @@ def _save_lens_components(
         sidecar["model_source_fingerprint"] = model_source_fingerprint
     if extra_sidecar:
         sidecar.update(extra_sidecar)
-    write_json_atomic(sc_path, sidecar)
+    try:
+        # Every immutable layer generation is complete before this one atomic
+        # pointer switch. A sidecar failure leaves the prior pointer and tensor
+        # untouched, and the failed new generations are simply discarded.
+        write_json_atomic(sc_path, sidecar)
+    except BaseException:
+        for path in created:
+            path.unlink(missing_ok=True)
+        raise
+    _cleanup_unreferenced_generations(ts_path.parent)
+    return ts_path.parent / tensor_files[str(layer_ids[0])]
 
 
 def _save_fp16_square_safetensors_atomic(
@@ -417,7 +706,8 @@ def _save_fp16_square_safetensors_atomic(
     The wire format is deliberately simple: an 8-byte little-endian JSON-header
     length, a space-padded JSON header, then contiguous tensor payloads.  Writing
     256-row fp16 stripes preserves the public monolithic artifact without the
-    complete in-memory snapshot.
+    complete in-memory snapshot. New v4 writers call this once per layer;
+    keeping the multi-layer primitive preserves legacy fixtures and migration.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp") if path.suffix else path.with_name(
@@ -487,25 +777,25 @@ def load_lens(model_id: str) -> tuple[JacobianLens, dict[str, Any]] | None:
     "no lens" (the caller decides whether to error or re-fit) rather than
     crashing the session.
     """
-    ts_path, sc_path = lens_paths(model_id)
-    with artifact_lock(ts_path):
+    anchor, sc_path = _lens_anchor_paths(model_id)
+    with artifact_lock(anchor):
         sidecar = _load_sidecar_at(
-            model_id, ts_path, sc_path, label="jlens cache",
+            model_id, anchor, sc_path, label="jlens cache",
         )
         return _load_lens_at(
-            model_id, ts_path, sc_path, sidecar, label="jlens cache",
+            model_id, anchor, sc_path, sidecar, label="jlens cache",
         )
 
 
 def load_lens_checkpoint(model_id: str) -> tuple[JacobianLens, dict[str, Any]] | None:
     """Load a resumable partial lens shard, or ``None`` when absent/unusable."""
-    ts_path, sc_path = lens_checkpoint_paths(model_id)
-    with artifact_lock(ts_path):
+    anchor, sc_path = _checkpoint_anchor_paths(model_id)
+    with artifact_lock(anchor):
         sidecar = _load_sidecar_at(
-            model_id, ts_path, sc_path, label="jlens checkpoint",
+            model_id, anchor, sc_path, label="jlens checkpoint",
         )
         return _load_lens_at(
-            model_id, ts_path, sc_path, sidecar, label="jlens checkpoint",
+            model_id, anchor, sc_path, sidecar, label="jlens checkpoint",
         )
 
 
@@ -528,14 +818,15 @@ def promote_lens_checkpoint(
     potentially multi-GiB conversion and write.  Promote only after cheap exact
     identity checks; callers fall back to :func:`save_lens` on ``False``.
     """
-    checkpoint_ts, checkpoint_sc = lens_checkpoint_paths(model_id)
-    final_ts, final_sc = lens_paths(model_id)
-    with artifact_lock(checkpoint_ts), artifact_lock(final_ts):
+    checkpoint_anchor, checkpoint_sc = _checkpoint_anchor_paths(model_id)
+    final_anchor, final_sc = _lens_anchor_paths(model_id)
+    with lens_fit_lock(model_id), artifact_lock(checkpoint_anchor), artifact_lock(final_anchor):
         sidecar = _load_sidecar_at(
-            model_id, checkpoint_ts, checkpoint_sc, label="jlens checkpoint",
+            model_id, checkpoint_anchor, checkpoint_sc, label="jlens checkpoint",
         )
         if (
             sidecar is None
+            or int(sidecar.get("format_version", 0)) != LENS_FORMAT_VERSION
             or int(sidecar.get("n_prompts", -1)) != int(n_prompts)
             or [int(layer) for layer in sidecar.get("source_layers", [])]
             != sorted(int(layer) for layer in source_layers)
@@ -547,22 +838,32 @@ def promote_lens_checkpoint(
             or int(sidecar.get("base_n_prompts", -1)) != 0
         ):
             return False
-        # The checkpoint writer deliberately skips fsync because most shards
-        # are temporary. A promoted terminal shard becomes durable here.
-        with open(checkpoint_ts, "rb") as handle:
-            os.fsync(handle.fileno())
-        os.replace(checkpoint_ts, final_ts)
+        if not lens_payloads_match(model_id, sidecar, checkpoint=True):
+            return False
+        checkpoint_tensors = set(_sidecar_tensor_paths(
+            checkpoint_anchor, sidecar,
+            [int(layer) for layer in sidecar["source_layers"]],
+        ).values())
+        # The checkpoint writer deliberately skips fsync because most generations
+        # are temporary. A promoted terminal generation becomes durable here.
+        for checkpoint_ts in checkpoint_tensors:
+            with open(checkpoint_ts, "rb") as handle:
+                os.fsync(handle.fileno())
         durable_sidecar = dict(sidecar)
         for key in ("checkpoint", "base_n_prompts", "partial_n_prompts"):
             durable_sidecar.pop(key, None)
+        # Publish only the pointer. The immutable tensor stays referenced by the
+        # checkpoint until this succeeds, so any sidecar failure preserves both
+        # the prior durable lens and the complete resumable checkpoint.
         write_json_atomic(final_sc, durable_sidecar)
         checkpoint_sc.unlink(missing_ok=True)
+        _cleanup_unreferenced_generations(final_anchor.parent)
         return True
 
 
 def _load_lens_at(
     model_id: str,
-    ts_path: Path,
+    tensor_anchor: Path,
     _sc_path: Path,
     sidecar: dict[str, Any] | None,
     *,
@@ -573,60 +874,86 @@ def _load_lens_at(
     try:
         d_model = int(sidecar["d_model"])
         source_layers = [int(layer) for layer in sidecar["source_layers"]]
-        expected_digest = sidecar.get("tensor_sha256")
-        if not isinstance(expected_digest, str) or len(expected_digest) != 64:
+        jacobians: dict[int, torch.Tensor] = {}
+        tensor_paths = _sidecar_tensor_paths(
+            tensor_anchor, sidecar, source_layers,
+        )
+        expected_digests = sidecar.get("tensor_sha256")
+        sharded = isinstance(expected_digests, Mapping)
+        if sharded and int(sidecar.get("format_version", 0)) != LENS_FORMAT_VERSION:
+            raise ValueError("legacy lens cannot declare sharded digests")
+        if not sharded and (
+            not isinstance(expected_digests, str) or len(expected_digests) != 64
+        ):
             log.warning(
                 "%s for %s has no tensor digest; ignoring — re-fit with "
                 "`saklas lens fit`", label, model_id,
             )
             return None
-        prefix, raw_header = _lens_safetensors_header(source_layers, d_model)
-        digest = hashlib.sha256(prefix)
-        digest.update(raw_header)
-        jacobians: dict[int, torch.Tensor] = {}
-        with safe_open(str(ts_path), framework="pt", device="cpu") as tensors:
-            tensor_layers = sorted(
-                int(k.split("_", 1)[1]) for k in tensors.keys()
+
+        groups: list[tuple[Path, list[int], str]] = []
+        if sharded:
+            assert isinstance(expected_digests, Mapping)
+            for layer in source_layers:
+                expected = expected_digests.get(str(layer))
+                if not isinstance(expected, str) or len(expected) != 64:
+                    raise ValueError(f"layer {layer} has no valid tensor digest")
+                groups.append((tensor_paths[layer], [layer], expected))
+        else:
+            groups.append((
+                tensor_paths[source_layers[0]], source_layers,
+                cast(str, expected_digests),
+            ))
+
+        for ts_path, tensor_layers, expected_digest in groups:
+            prefix, raw_header = _lens_safetensors_header(
+                tensor_layers, d_model,
             )
-            if tensor_layers != source_layers:
+            digest = hashlib.sha256(prefix)
+            digest.update(raw_header)
+            with safe_open(str(ts_path), framework="pt", device="cpu") as tensors:
+                actual_layers = sorted(
+                    int(k.split("_", 1)[1]) for k in tensors.keys()
+                )
+                if actual_layers != tensor_layers:
+                    log.warning(
+                        "%s for %s has tensor layers %s but sidecar declares %s; "
+                        "ignoring — re-fit with `saklas lens fit`",
+                        label, model_id, actual_layers, tensor_layers,
+                    )
+                    return None
+                for layer in tensor_layers:
+                    raw = tensors.get_tensor(f"layer_{layer}")
+                    if (
+                        raw.dtype != torch.float16 or raw.ndim != 2
+                        or tuple(raw.shape) != (d_model, d_model)
+                    ):
+                        log.warning(
+                            "%s for %s layer %d has shape %s (need %dx%d); "
+                            "ignoring — re-fit with `saklas lens fit`",
+                            label, model_id, layer, tuple(raw.shape),
+                            d_model, d_model,
+                        )
+                        return None
+                    for start in range(0, d_model, 256):
+                        block = raw[start:start + 256].contiguous()
+                        digest.update(
+                            memoryview(cast(Any, block.numpy())).cast("B"),
+                        )
+                    J = raw.to(torch.float32)
+                    if not bool(torch.isfinite(J).all()):
+                        log.warning(
+                            "%s for %s contains non-finite values; ignoring — "
+                            "re-fit with `saklas lens fit`", label, model_id,
+                        )
+                        return None
+                    jacobians[layer] = J
+            if digest.hexdigest() != expected_digest:
                 log.warning(
-                    "%s for %s has tensor layers %s but sidecar declares %s; "
-                    "ignoring — re-fit with `saklas lens fit`",
-                    label, model_id, tensor_layers, source_layers,
+                    "%s for %s failed tensor digest validation; ignoring — "
+                    "re-fit with `saklas lens fit`", label, model_id,
                 )
                 return None
-            # Convert and validate one layer at a time.  ``load_file`` kept the
-            # complete fp16 mapping alive while also materializing the complete
-            # fp32 lens, producing a needless ~1.5x artifact peak on resume.
-            for layer in tensor_layers:
-                raw = tensors.get_tensor(f"layer_{layer}")
-                if (
-                    raw.dtype != torch.float16 or raw.ndim != 2
-                    or tuple(raw.shape) != (d_model, d_model)
-                ):
-                    log.warning(
-                        "%s for %s layer %d has shape %s (need %dx%d); "
-                        "ignoring — re-fit with `saklas lens fit`",
-                        label, model_id, layer, tuple(raw.shape), d_model, d_model,
-                    )
-                    return None
-                for start in range(0, d_model, 256):
-                    block = raw[start:start + 256].contiguous()
-                    digest.update(memoryview(cast(Any, block.numpy())).cast("B"))
-                J = raw.to(torch.float32)
-                if not bool(torch.isfinite(J).all()):
-                    log.warning(
-                        "%s for %s contains non-finite values; ignoring — "
-                        "re-fit with `saklas lens fit`", label, model_id,
-                    )
-                    return None
-                jacobians[layer] = J
-        if digest.hexdigest() != expected_digest:
-            log.warning(
-                "%s for %s failed tensor digest validation; ignoring — "
-                "re-fit with `saklas lens fit`", label, model_id,
-            )
-            return None
         lens = JacobianLens(
             jacobians,
             n_prompts=int(sidecar.get("n_prompts", 0)),
@@ -640,26 +967,41 @@ def _load_lens_at(
 
 def remove_lens_checkpoint(model_id: str) -> bool:
     """Delete a resumable checkpoint shard. Returns True when anything was removed."""
-    ts_path, sc_path = lens_checkpoint_paths(model_id)
-    with artifact_lock(ts_path):
-        removed = False
-        for path in (ts_path, sc_path):
-            if path.exists():
-                path.unlink()
-                removed = True
-        return removed
+    anchor, sc_path = _checkpoint_anchor_paths(model_id)
+    with lens_fit_lock(model_id), artifact_lock(anchor):
+        before = set(anchor.parent.glob("jlens*.safetensors"))
+        removed = sc_path.exists()
+        sc_path.unlink(missing_ok=True)
+        _cleanup_unreferenced_generations(anchor.parent)
+        after = set(anchor.parent.glob("jlens*.safetensors"))
+        return removed or before != after
 
 
 def remove_lens(model_id: str) -> bool:
     """Delete a model's lens artifact. Returns True when anything was removed."""
-    removed = False
-    for ts_path, sc_path in (lens_paths(model_id), lens_checkpoint_paths(model_id)):
-        with artifact_lock(ts_path):
-            for path in (ts_path, sc_path):
-                if path.exists():
-                    path.unlink()
-                    removed = True
-    return removed
+    final_anchor, final_sc = _lens_anchor_paths(model_id)
+    checkpoint_anchor, checkpoint_sc = _checkpoint_anchor_paths(model_id)
+    with (
+        lens_fit_lock(model_id),
+        artifact_lock(final_anchor),
+        artifact_lock(checkpoint_anchor),
+    ):
+        tensor_candidates = (
+            list(final_anchor.parent.glob("jlens*.gen-*.safetensors"))
+            + [final_anchor, checkpoint_anchor]
+        )
+        candidates = [*tensor_candidates, final_sc, checkpoint_sc]
+        removed = any(path.exists() for path in candidates)
+        # Remove the atomic pointers first: after this logical deletion, a
+        # best-effort tensor GC failure cannot expose a partially deleted lens.
+        final_sc.unlink(missing_ok=True)
+        checkpoint_sc.unlink(missing_ok=True)
+        for path in tensor_candidates:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as exc:
+                log.warning("could not remove J-lens tensor %s: %s", path, exc)
+        return removed
 
 
 #: Default web-text corpus for a lens fit (repo, config) — the paper-parity

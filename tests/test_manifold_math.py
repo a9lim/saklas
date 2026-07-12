@@ -963,6 +963,24 @@ def test_inject_norm_cap_bounds_output():
 # wire.  Absent ⇒ ``sigma_at`` returns 0 ⇒ exact legacy behavior.
 
 
+def test_activation_row_store_combines_disjoint_layers_without_copy() -> None:
+    left = ActivationRowStore([2, 1])
+    right = ActivationRowStore([2, 1])
+    indices = torch.arange(3)
+    left.write(0, indices, torch.randn(3, 5))
+    right.write(2, indices, torch.randn(3, 5))
+    left_ptr = left.flat_rows(0).data_ptr()
+    right_ptr = right.flat_rows(2).data_ptr()
+
+    combined = ActivationRowStore.combine_disjoint([left, right])
+
+    assert combined.layer_indices == [0, 2]
+    assert combined.flat_rows(0).data_ptr() == left_ptr
+    assert combined.flat_rows(2).data_ptr() == right_ptr
+    combined.close()
+    assert left._closed and right._closed
+
+
 def test_layer_major_store_covariances_match_node_reference() -> None:
     torch.manual_seed(4)
     node_sizes = [2, 3, 1]

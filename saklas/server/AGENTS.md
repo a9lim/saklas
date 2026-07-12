@@ -144,7 +144,7 @@ body + any typed safe-message formatter.
   `role_substitution_supported` / `user_role_supported` (against `ROLE_HEADERS` /
   `USER_ROLE_HEADERS` for the resolved `model_type`) and the resolved
   `default_assistant_role` / `default_user_role`, so the webui can gate roles,
-  plus `jlens_fitted` (`has_compatible_jlens`: v3 sidecar/payload plus loaded
+  plus `jlens_fitted` (`has_compatible_jlens`: v4 shard sidecar/payload plus loaded
   weight identity, gating the drilldown's j-lens tab without the lazy fp32 load),
   `live_lens_layers` (the live workspace readout's resolved layer list, `null`
   while off; coerced so stub sessions read as off), and `live_probe_scores`
@@ -214,8 +214,9 @@ per-model sidecar/tensor via `_resolve_intrinsic_dim` + a `load_manifold` read.
   gen-lock, 404 pre-lock; referenced activation-capture groups are removed too. Response `{namespace, name, source, removed,
   rematerializes_on_restart}`.
 - `POST /manifolds/{ns}/{name}/fit` — `session.fit` under the lock; SSE
-  / JSON. Discover folders accept `fit_mode` / `hyperparams` overrides, written
-  atomically into `manifold.json` (after `sanitize_hyperparams`) *before* the fit;
+  / JSON. Discover folders accept `fit_mode` / `hyperparams` overrides; the
+  pipeline merges them into `manifold.json` (after `sanitize_hyperparams`) inside
+  the same cross-process manifest transaction as cache-key derivation and fit;
   authored folders reject them with 400. `force=true` bypasses tensor/capture
   hits. `layers` optionally names explicit
   transformer indices or `"workspace"`/`"all"`; the fitted tensor sidecar pins
@@ -377,7 +378,7 @@ a flat-buffer node (raw-ness isn't stamped server-side, the client's render
 mode supplies it). Errors: `LensNotFittedError`/`UnknownNodeError` → 404,
 `InvalidNodeOperationError`/bad `layers`/`top_k` → 400, other `SaklasError`s →
 their `user_message()` status. Discovery rides
-the session-info `jlens_fitted` field (v3 sidecar + live-weight compatibility,
+the session-info `jlens_fitted` field (v4 shard sidecar + live-weight compatibility,
 never the ~GB lazy artifact load).
 
 `POST /sessions/{id}/lens/live` body `{enabled, layers?, top_k?=5}` — toggle

@@ -1842,44 +1842,69 @@ class SaklasSession:
     def jlens(self) -> "Any":
         """The model's fitted Jacobian lens, or ``None`` when not fitted.
 
-        Loaded lazily from the per-model artifact
-        (``models/<safe_id>/jlens.safetensors``); fit one with
+        Loaded lazily from the per-model ``jlens.json`` pointer and immutable
+        layer shards under ``models/<safe_id>/``; fit one with
         :meth:`fit_jlens` or ``saklas lens fit``. Returns a
         :class:`saklas.core.jlens.JacobianLens`.
         """
-        if self._jlens is None:
-            from saklas.io.lens import load_lens, load_lens_sidecar
+        from saklas.io.lens import load_lens, load_lens_sidecar
 
-            sidecar = load_lens_sidecar(self.model_id)
-            if sidecar is not None:
-                fitted_fingerprint = sidecar.get("model_fingerprint")
-                if fitted_fingerprint != loaded_model_fingerprint(
-                    self._model, self.model_id,
-                ):
-                    _log.warning(
-                        "ignoring stale Jacobian lens for %s: loaded-model "
-                        "fingerprint is missing or changed; re-fit with "
-                        "`saklas lens fit`",
-                        self.model_id,
-                    )
-                else:
-                    loaded = load_lens(self.model_id)
-                    if loaded is not None:
-                        self._jlens = loaded[0]
-                        self._jlens_identity = _jlens_sidecar_identity(loaded[1])
-                        self._jlens_device_cache = {}
+        sidecar = load_lens_sidecar(self.model_id)
+        live_fingerprint = loaded_model_fingerprint(self._model, self.model_id)
+        if sidecar is None:
+            if self._jlens is not None:
+                SaklasSession._evict_resident_jlens(self)
+            return None
+        fitted_fingerprint = sidecar.get("model_fingerprint")
+        if fitted_fingerprint != live_fingerprint:
+            if self._jlens is not None:
+                SaklasSession._evict_resident_jlens(self)
+            _log.warning(
+                "ignoring stale Jacobian lens for %s: loaded-model "
+                "fingerprint is missing or changed; re-fit with "
+                "`saklas lens fit`",
+                self.model_id,
+            )
+            return None
+        disk_identity = _jlens_sidecar_identity(sidecar)
+        if self._jlens is not None and self._jlens_identity == disk_identity:
+            return self._jlens
+        loaded = load_lens(self.model_id)
+        if loaded is None:
+            SaklasSession._evict_resident_jlens(self)
+            return None
+        SaklasSession._adopt_fitted_jlens(
+            self, loaded[0], sidecar=loaded[1],
+        )
         return self._jlens
 
     def has_compatible_jlens(self) -> bool:
         """Whether lens metadata matches the currently loaded weights."""
-        from saklas.io.lens import load_lens_sidecar
+        from saklas.io.lens import load_lens, load_lens_sidecar
 
         sidecar = load_lens_sidecar(self.model_id)
-        return bool(
+        compatible = bool(
             sidecar is not None
             and sidecar.get("model_fingerprint")
             == loaded_model_fingerprint(self._model, self.model_id)
         )
+        if not compatible:
+            if self._jlens is not None:
+                SaklasSession._evict_resident_jlens(self)
+            return False
+        assert sidecar is not None
+        if (
+            self._jlens is not None
+            and self._jlens_identity != _jlens_sidecar_identity(sidecar)
+        ):
+            loaded = load_lens(self.model_id)
+            if loaded is None:
+                SaklasSession._evict_resident_jlens(self)
+                return False
+            SaklasSession._adopt_fitted_jlens(
+                self, loaded[0], sidecar=loaded[1],
+            )
+        return True
 
     def _require_jlens(self) -> "Any":
         from saklas.core.jlens import LensNotFittedError
@@ -1891,6 +1916,28 @@ class SaklasSession:
                 f"`saklas lens fit {self.model_id}` first"
             )
         return lens
+
+    def _evict_resident_jlens(self) -> None:
+        """Drop a removed/replaced disk lens and every derived resident view."""
+        self._jlens = None
+        self._jlens_identity = None
+        self._jlens_device_cache = {}
+        self._jlens_readout_module_cache = None
+        self._jlens_depths_cache = {}
+        self._jlens_depth_tensor_cache = {}
+        self._readout_long_tensor_cache = {}
+        self._jlens_decode_cache = {}
+        self._lens_step_stash = None
+        self._last_lens_step_readings = None
+        for key in list(self._profiles):
+            if key.startswith("jlens/"):
+                self._profiles.pop(key, None)
+        for name, spec in self._lens_probes.items():
+            spec["layers"] = []
+            self._probe_hash_cache.pop(name, None)
+        self._live_lens = None
+        self._invalidate_prefix_cache()
+        self._invalidate_analytics_cache()
 
     def _adopt_fitted_jlens(
         self, lens: "Any", *, sidecar: "Mapping[str, Any] | None" = None,
@@ -1907,6 +1954,13 @@ class SaklasSession:
         self._jlens = lens
         self._jlens_identity = _jlens_sidecar_identity(sidecar)
         self._jlens_device_cache = {}
+        self._jlens_readout_module_cache = None
+        self._jlens_depths_cache = {}
+        self._jlens_depth_tensor_cache = {}
+        self._readout_long_tensor_cache = {}
+        self._jlens_decode_cache = {}
+        self._lens_step_stash = None
+        self._last_lens_step_readings = None
         for key in list(self._profiles):
             if key.startswith("jlens/"):
                 self._profiles.pop(key, None)
@@ -1931,6 +1985,44 @@ class SaklasSession:
         return lens
 
     def fit_jlens(
+        self,
+        prompts: "Sequence[str]",
+        *,
+        corpus_spec: str = "custom",
+        source_layers: "Sequence[int] | str | None" = None,
+        dim_batch: int | None = None,
+        prompt_batch: int | None = None,
+        seq_len: int | None = None,
+        force: bool = False,
+        checkpoint_every: int | None = None,
+        on_progress: Callable[[str], None] | None = None,
+        cancel_event: "Any | None" = None,
+    ) -> "Any":
+        """Fit/resume one per-model J-lens under its cross-process transaction."""
+        from saklas.io.lens import lens_fit_lock
+
+        with lens_fit_lock(self.model_id):
+            if cancel_event is not None and cancel_event.is_set():
+                from saklas.core.jlens import JacobianLensCancelled
+
+                raise JacobianLensCancelled(
+                    "Jacobian-lens fit cancelled before start",
+                )
+            return SaklasSession._fit_jlens_transaction(
+                self,
+                prompts,
+                corpus_spec=corpus_spec,
+                source_layers=source_layers,
+                dim_batch=dim_batch,
+                prompt_batch=prompt_batch,
+                seq_len=seq_len,
+                force=force,
+                checkpoint_every=checkpoint_every,
+                on_progress=on_progress,
+                cancel_event=cancel_event,
+            )
+
+    def _fit_jlens_transaction(
         self,
         prompts: "Sequence[str]",
         *,
@@ -2202,6 +2294,7 @@ class SaklasSession:
                             model_layer_count=len(fit_layers),
                             model_fingerprint=model_fingerprint,
                             model_source_fingerprint=model_source_fp,
+                            reuse_layers=existing_set,
                         )
                         remove_lens_checkpoint(self.model_id)
                         selected = merged.select_layers(expected_sources)
@@ -4580,6 +4673,52 @@ class SaklasSession:
         self._invalidate_prefix_cache()
         self._invalidate_analytics_cache()
 
+    def _evict_failed_manifold_override(
+        self, folder: Any, *, sae: str | None,
+    ) -> None:
+        """Drop consumers whose on-disk manifest changed before a failed fit."""
+        from pathlib import Path
+
+        folder_path = Path(folder)
+        artifact_names = {
+            folder_path.name,
+            f"{folder_path.parent.name}/{folder_path.name}",
+        }
+        target_feature = f"sae-{sae}" if sae is not None else "raw"
+
+        def _matches_key(key: str) -> bool:
+            head, variant = (
+                key.rsplit(":", 1) if ":" in key else (key, "raw")
+            )
+            if head not in artifact_names:
+                return False
+            feature = (
+                variant if variant.startswith("sae-")
+                else "raw" if variant == "raw" or variant.startswith("role-")
+                else None
+            )
+            return feature == target_feature
+
+        old_objects = {
+            id(manifold)
+            for key, manifold in self._manifolds.items()
+            if _matches_key(key)
+        }
+        for key in [key for key in self._manifolds if _matches_key(key)]:
+            self._manifolds.pop(key, None)
+        for key in [key for key in self._profiles if _matches_key(key)]:
+            self._profiles.pop(key, None)
+
+        monitor = getattr(self, "_monitor", None)
+        if monitor is not None:
+            for probe_name, attached in list(monitor.attached_probes().items()):
+                if id(attached.manifold) in old_objects:
+                    monitor.remove_probe(probe_name)
+                    self._probe_hash_cache.pop(probe_name, None)
+
+        self._invalidate_prefix_cache()
+        self._invalidate_analytics_cache()
+
     def fit(
         self,
         folder: Any,
@@ -4587,6 +4726,8 @@ class SaklasSession:
         sae: str | None = None,
         sae_revision: str | None = None,
         layers: "Sequence[int] | str | None" = None,
+        fit_mode: str | None = None,
+        hyperparams: Mapping[str, object] | None = None,
         force: bool = False,
         on_progress: Callable[[str], None] | None = None,
     ) -> Manifold:
@@ -4601,21 +4742,47 @@ class SaklasSession:
         tensor cache and re-pools/re-fits unconditionally (CLI ``-f/--force``).
         ``layers`` optionally restricts fitting to explicit transformer indices
         or the 40–90% ``"workspace"`` band.
+        ``fit_mode`` and ``hyperparams`` are discover-folder overrides applied
+        under the same manifest lock as cache-key derivation and publication.
         """
         with self._model_exclusive(
             "session.fit called while another model use is in flight",
             phase_msg="session.fit called while a generation is in flight",
         ):
             SaklasSession._assert_unsteered_artifact_operation(self)
+            manifest_before: bytes | None = None
+            if fit_mode is not None or hyperparams is not None:
+                from pathlib import Path
+
+                try:
+                    manifest_before = (Path(folder) / "manifold.json").read_bytes()
+                except OSError:
+                    pass
             try:
                 from saklas.core.extraction import ManifoldExtractionPipeline
                 pipe = ManifoldExtractionPipeline(self, self.events)
                 manifold = pipe.fit(
                     folder, sae=sae, sae_revision=sae_revision,
-                    layer_indices=layers, force=force, on_progress=on_progress,
+                    layer_indices=layers, fit_mode=fit_mode,
+                    hyperparams=hyperparams, force=force,
+                    on_progress=on_progress,
                 )
                 self._adopt_fitted_manifold(folder, manifold)
                 return manifold
+            except BaseException:
+                if manifest_before is not None:
+                    from pathlib import Path
+
+                    try:
+                        manifest_changed = (
+                            (Path(folder) / "manifold.json").read_bytes()
+                            != manifest_before
+                        )
+                    except OSError:
+                        manifest_changed = False
+                    if manifest_changed:
+                        self._evict_failed_manifold_override(folder, sae=sae)
+                raise
             finally:
                 # A re-fit changes the folded directions any probe reads from.
                 self._invalidate_analytics_cache()

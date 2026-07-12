@@ -170,8 +170,9 @@ category list through verbatim (tagged concepts only, no multi-node sweep).
   re-author the corpus, so without it an unchanged corpus always cache-hits and a
   code-level fit change (e.g. a topology-selection fix) can't be picked up. An
   authored folder runs `ManifoldExtractionPipeline` directly; a discover folder
-  (`pca`/`spectral`/`auto`) has any supplied hyperparam written into
-  `manifold.json` atomically *before* the fit. Supplying a discover hyperparam
+  (`pca`/`spectral`/`auto`) passes only the supplied override patch into
+  `session.fit`; the pipeline merges and writes it under the same manifest lock
+  as cache-key derivation and fit publication. Supplying a discover hyperparam
   against an authored folder is an error. Cache validation happens after model
   load so the sidecar can be checked against the actually loaded weight
   fingerprint (a mutable model id alone cannot prove a hit); actual fit sessions

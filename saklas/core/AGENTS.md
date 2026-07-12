@@ -59,8 +59,11 @@ at the shallowest requested source, so a `--layers`-restricted fit never
 backprops below its lowest layer. A terminal hook stops the forward after the
 final transformer residual, before final norm / LM head. Every backend uses
 bounded `_ROW_STRIPE` device + host buffers that validate and commit directly
-into the persistent CPU accumulator; if a later VJP OOMs the graph is rebuilt at
-the first uncommitted row. A fully unsynced
+into the persistent CPU accumulator. CUDA uses two ordered event-tracked slots
+to overlap D2H with the next backward stripe, discards an entire uncommitted
+suffix on transfer failure, and drops to one slot before narrowing estimator
+batches when the overlap buffer itself causes OOM. If a later VJP OOMs the graph
+is rebuilt at the first uncommitted row. A fully unsynced
 MPS loop can still let the CPU enqueue too far
 ahead, so the pass loop drains the queue every `_MPS_SYNC_EVERY_PASSES` (4), and
 zero rows raise before a stripe is committed. Prompt/dimension widths halve
@@ -73,11 +76,15 @@ prefix one layer at a time while converting to fp16, so checkpointing does not
 materialize another complete fp32 lens. Checkpoints are self-contained
 (`base_n_prompts=0`) and survive repeated interruptions even beside an older
 full artifact; cadence never fractures a healthy prompt microbatch. When the
-terminal checkpoint is already the complete lens, finalization fsyncs and
-promotes that shard instead of converting/writing the same artifact again.
+terminal checkpoint is already the complete lens, finalization fsyncs its
+immutable per-layer tensor generations and atomically repoints the durable sidecar instead
+of converting/writing the same artifact again. The checkpoint remains the
+recovery point until that pointer commit succeeds.
 `checkpoint_cb` remains the compatibility surface. `JacobianLens.merge` is the
 non-mutating n_prompts-weighted combiner; `merge_into` recycles a caller-owned
-tail; `union_layers` combines same-corpus layer shards.
+tail; `union_layers` combines same-corpus layer shards. Persisting a
+missing-layer union reuses the existing v4 shard pointers and serializes only
+the newly fitted layers.
 
 `JacobianLens` holds the fp32 matrices: `transport(h, layer)` maps a residual
 into the final basis; `token_direction(v, unembed)` is `W_U[v] @ J_l` per layer
@@ -214,16 +221,28 @@ the whole roster in fp32 RAM. A token-exact per-model capture cache lets domain,
 topology, and smoothing refits skip model forwards; its identity includes node
 boundaries, and its digest metadata validates centroid payloads plus exact
 per-layer row tensors; subset fits map/hash only requested row layers and validate
-the complete safetensors key/shape header without re-hashing the multi-GiB row
-container. The shared per-model capture stem is protected by `artifact_lock`
+only requested centroid/row layers. Capture-cache format v4 persists one
+safetensors shard per layer, so a disjoint top-up writes only the new shards
+instead of copying/replacing a multi-GiB container; v3 monoliths are safely
+recaptured and replaced on first use. Cached and freshly captured disjoint
+layer stores combine by view (ownership is transferred to the composite), so
+the sigma covariance pass does not copy the full row roster into a third mmap.
+Each row shard validates independently, so one damaged layer recaptures only
+itself; speculative auto-fit rows do not enter durable coverage until publish.
+The shared per-model capture stem is protected by `artifact_lock`
 across read/top-up/publish, and safetensors stage through unique same-directory
 tempfiles. Layer coverage is unioned/topped up, so full→subset needs no forward
 and overlapping subsets capture only missing layers. Cache groups prune oldest-first past 8 GiB
 (`SAKLAS_MANIFOLD_CAPTURE_CACHE_GB`) and `pack clear` / `pack rm` remove referenced
-group. `layer_indices` accepts an explicit set or the canonical 40–90% workspace
-band. It threads the folder's `node_kinds` /
-`node_roles` into the `Manifold` + sidecar metadata, then dispatches on
-`fit_mode`:
+group. Pruning runs only after the current stem transaction releases, under a
+directory prune lock plus one victim lock at a time, so eviction cannot remove
+another fit's active cache or introduce cross-stem lock inversion. `layer_indices` accepts an explicit set or the canonical 40–90% workspace
+band. It threads the folder's `node_kinds` / `node_roles` into the `Manifold` +
+sidecar metadata, then dispatches on `fit_mode`.
+Discover overrides and fit publication share the folder manifest transaction.
+If an override changes the manifest and the fit then fails, the session evicts
+only that namespace/variant's resident manifold, folded profile, attached probe,
+and prefix state; validation failures that did not write preserve consumers.
 
 Fit uses `ManifoldFolder.load(..., verify_manifest=False)`: it hashes the live
 corpus into the capture/final identities and validates the requested tensor, but
@@ -997,13 +1016,15 @@ events: `GenerationStarted`/`SteeringApplied`/
 `SteeringCleared`/`ProbeScored`/`GenerationFinished` + `VectorExtracted`/
 `ManifoldExtracted`; threaded subscribers hop via `loop.call_soon_threadsafe`.
 
-**Jacobian-lens surface.** `session.jlens` validates v3 sidecar/live-weight
-identity before loading, then verifies the payload digest while promoting each
-layer (`io/lens.py`, like `whitener`); `fit_jlens(prompts, …)` pre-filters too-short
+**Jacobian-lens surface.** `session.jlens` validates v4 sidecar/live-weight
+identity before loading, refreshes or evicts an already-resident lens when an
+external process replaces/removes its generation, then verifies the payload digest
+while promoting each layer (`io/lens.py`, like `whitener`); `fit_jlens(prompts, …)` pre-filters too-short
 prompts (so the saved `n_prompts` counts consumed prompts exactly — what makes
 resume slicing sound), hashes the filtered corpus, resumes a matching partial
 fit by default (`force=True` restarts), checkpoints via the io layer, and gates
-under `_model_exclusive` (forward AND backward passes). Shared readout helpers:
+under both a cross-process per-model fit lock and `_model_exclusive` (forward AND
+backward passes). Shared readout helpers:
 `_jlens_logits_rows` (the one bmm + unembed matvec over `(layer, hidden)` rows
 — per-layer top-k and aggregate both consume it), `_jlens_topk_rows` (accepts
 precomputed `logits=`), `_jlens_aggregate_rows` (`aggregate_readout` + decode),

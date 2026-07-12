@@ -22,8 +22,8 @@ Routes under ``/saklas/v1/sessions/{id}/lens``:
   regardless of what happens to the client.  Generations attempted while
   a fit holds the model raise cleanly through the ordinary busy path.
 
-Discovery rides ``jlens_fitted`` on the session info payload (a v3 sidecar,
-payload, and live-weight compatibility check, never the ~GB fp32 lens load).
+Discovery rides ``jlens_fitted`` on the session info payload (a v4 shard
+sidecar/payload and live-weight compatibility check, never the ~GB fp32 lens load).
 """
 
 # pyright: reportUnusedFunction=false
