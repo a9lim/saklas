@@ -36,6 +36,20 @@ def _random_activations(
     return {layer: torch.randn(n_prompts, dim, generator=g) for layer in range(n_layers)}
 
 
+def _alignment(dense: torch.Tensor) -> LayerAlignment:
+    """Current affine alignment shape for tests authored from dense maps."""
+    target_dim, source_dim = dense.shape
+    return LayerAlignment(
+        dense,
+        torch.eye(source_dim),
+        torch.zeros(target_dim),
+    )
+
+
+def _alignments(dense: dict[int, torch.Tensor]) -> dict[int, LayerAlignment]:
+    return {layer: _alignment(value) for layer, value in dense.items()}
+
+
 # ---------------------------------------------------------------------------
 # fit_alignment.
 # ---------------------------------------------------------------------------
@@ -157,7 +171,7 @@ class TestTransferProfile:
         # target Mahalanobis norm).
         D = 4
         eye = torch.eye(D)
-        M = {0: eye, 2: eye, 5: eye}
+        M = _alignments({0: eye, 2: eye, 5: eye})
 
         src_profile = Profile(
             {0: torch.tensor([1.0, 0.0, 0.0, 0.0]),
@@ -189,7 +203,7 @@ class TestTransferProfile:
 
     def test_drops_uncovered_layers(self) -> None:
         D = 4
-        M = {0: torch.eye(D), 5: torch.eye(D)}  # Layer 2 not covered.
+        M = _alignments({0: torch.eye(D), 5: torch.eye(D)})  # Layer 2 not covered.
         src_profile = Profile(
             {0: torch.ones(D), 2: torch.ones(D), 5: torch.ones(D)},
             metadata={"method": "contrastive_pca"},
@@ -223,7 +237,7 @@ class TestTransferProfile:
     def test_fully_disjoint_layers_raises(self) -> None:
         src_profile = Profile({0: torch.ones(4)}, metadata={})
         # Alignment covers layers 5-9; profile is only at layer 0.
-        M = {layer: torch.eye(4) for layer in range(5, 10)}
+        M = _alignments({layer: torch.eye(4) for layer in range(5, 10)})
         with pytest.raises(ProfileError, match="covered no layers"):
             transfer_profile(src_profile, M, source_model_id="src/model")
 
@@ -242,7 +256,7 @@ class TestAlignmentQuality:
         X = torch.randn(N, D)
         # Source = target → identity is a perfect map → R² ≈ 1.
         q = alignment_quality(
-            {0: eye},
+            _alignments({0: eye}),
             {0: X},
             {0: X},
         )
@@ -256,7 +270,7 @@ class TestAlignmentQuality:
         X_tgt = torch.randn(N, D)  # uncorrelated
         # Random alignment matrix — no structural relationship.
         q = alignment_quality(
-            {0: torch.randn(D, D)},
+            _alignments({0: torch.randn(D, D)}),
             {0: X_src},
             {0: X_tgt},
         )
@@ -287,7 +301,7 @@ class TestAlignmentCache:
     def test_save_load_round_trip(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
         D = 4
-        M = {0: torch.eye(D), 5: torch.eye(D)}
+        M = _alignments({0: torch.eye(D), 5: torch.eye(D)})
         quality = {0: 0.85, 5: 0.72}
 
         save_alignment_map(
@@ -303,7 +317,7 @@ class TestAlignmentCache:
 
         assert sorted(loaded_M.keys()) == [0, 5]
         for layer in loaded_M:
-            assert torch.allclose(loaded_M[layer].to_dense(), M[layer])
+            assert torch.allclose(loaded_M[layer].to_dense(), M[layer].to_dense())
         assert sidecar["source_model_id"] == "a/b"
         assert sidecar["target_model_id"] == "c/d"
         assert sidecar["shared_layers"] == [0, 5]
@@ -324,7 +338,7 @@ class TestAlignmentCache:
     ) -> None:
         monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
         save_alignment_map(
-            {0: torch.eye(3)}, "a/b", "c/d",
+            _alignments({0: torch.eye(3)}), "a/b", "c/d",
             source_identity=self._SRC_ID, target_identity=self._TGT_ID,
         )
         changed = {**self._SRC_ID, "model_fingerprint": "changed"}
@@ -338,7 +352,7 @@ class TestAlignmentCache:
     ) -> None:
         monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
         save_alignment_map(
-            {0: torch.eye(3)}, "a/b", "c/d",
+            _alignments({0: torch.eye(3)}), "a/b", "c/d",
             source_identity=self._SRC_ID, target_identity=self._TGT_ID,
         )
         import saklas.io.alignment as alignment_mod
@@ -392,7 +406,7 @@ class TestAlignmentCache:
             ),
         )
         saved = save_alignment_map(
-            {0: torch.eye(4), 5: torch.eye(4)}, "a/b", "c/d",
+            _alignments({0: torch.eye(4), 5: torch.eye(4)}), "a/b", "c/d",
             source_identity=self._SRC_ID, target_identity=self._TGT_ID,
         )
         assert saved.exists()
@@ -406,7 +420,7 @@ class TestAlignmentCache:
     ) -> None:
         monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
         save_alignment_map(
-            {0: torch.eye(4), 5: 2 * torch.eye(4)}, "a/b", "c/d",
+            _alignments({0: torch.eye(4), 5: 2 * torch.eye(4)}), "a/b", "c/d",
             source_identity=self._SRC_ID, target_identity=self._TGT_ID,
         )
         real_read = Path.read_bytes
@@ -435,7 +449,7 @@ class TestAlignmentCache:
         import saklas.io.alignment as alignment_mod
 
         save_alignment_map(
-            {0: torch.eye(4)}, "a/b", "c/d",
+            _alignments({0: torch.eye(4)}), "a/b", "c/d",
             source_identity=self._SRC_ID, target_identity=self._TGT_ID,
         )
         anchor, pointer = alignment_mod._alignment_anchor_paths("a/b", "c/d")
@@ -448,7 +462,7 @@ class TestAlignmentCache:
         monkeypatch.setattr(alignment_mod, "write_json_atomic", _fail_pointer)
         with pytest.raises(OSError, match="pointer failure"):
             save_alignment_map(
-                {0: 2 * torch.eye(4)}, "a/b", "c/d",
+                _alignments({0: 2 * torch.eye(4)}), "a/b", "c/d",
                 source_identity=self._SRC_ID, target_identity=self._TGT_ID,
             )
 
@@ -483,7 +497,7 @@ class TestAlignmentCache:
         monkeypatch.setattr(alignment_mod, "fsync_directory", _fail_fsync)
         with pytest.raises(OSError, match="fsync failure"):
             save_alignment_map(
-                {0: 2 * torch.eye(4)}, "a/b", "c/d",
+                _alignments({0: 2 * torch.eye(4)}), "a/b", "c/d",
                 source_identity=self._SRC_ID, target_identity=self._TGT_ID,
             )
 
@@ -517,7 +531,7 @@ class TestAlignmentCache:
             lambda _path: events.append("barrier"),
         )
         save_alignment_map(
-            {0: torch.eye(4)}, "a/b", "c/d",
+            _alignments({0: torch.eye(4)}), "a/b", "c/d",
             source_identity=self._SRC_ID, target_identity=self._TGT_ID,
         )
         assert events[0:3] == ["barrier", "pointer", "barrier"]
@@ -537,7 +551,7 @@ class TestAlignmentCache:
         monkeypatch.setattr(alignment_mod, "write_json_atomic", write_then_fail)
         with pytest.raises(OSError, match="after alignment pointer"):
             save_alignment_map(
-                {0: 3 * torch.eye(4)}, "a/b", "c/d",
+                _alignments({0: 3 * torch.eye(4)}), "a/b", "c/d",
                 source_identity=self._SRC_ID, target_identity=self._TGT_ID,
             )
 
@@ -553,7 +567,7 @@ class TestAlignmentCache:
     ) -> None:
         monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
         save_alignment_map(
-            {0: torch.eye(4)}, "a/b", "c/d",
+            _alignments({0: torch.eye(4)}), "a/b", "c/d",
             source_identity=self._SRC_ID, target_identity=self._TGT_ID,
             quality_per_layer={0: 0.8},
         )
@@ -571,7 +585,7 @@ class TestAlignmentCache:
 
         monkeypatch.setattr(Path, "read_bytes", reject_old_read)
         save_alignment_map(
-            {5: 2 * torch.eye(4)}, "a/b", "c/d",
+            _alignments({5: 2 * torch.eye(4)}), "a/b", "c/d",
             source_identity=self._SRC_ID, target_identity=self._TGT_ID,
             quality_per_layer={5: 0.9}, extend=True,
         )
@@ -587,7 +601,7 @@ class TestAlignmentCache:
         import saklas.io.alignment as alignment_mod
 
         save_alignment_map(
-            {0: torch.eye(4), 5: torch.eye(4)}, "a/b", "c/d",
+            _alignments({0: torch.eye(4), 5: torch.eye(4)}), "a/b", "c/d",
             source_identity=self._SRC_ID, target_identity=self._TGT_ID,
             quality_per_layer={0: 0.8, 5: 0.7},
         )
@@ -605,7 +619,7 @@ class TestAlignmentCache:
         )
         assert partial is not None and partial[0] == {}
         save_alignment_map(
-            {5: 2 * torch.eye(4)}, "a/b", "c/d",
+            _alignments({5: 2 * torch.eye(4)}), "a/b", "c/d",
             source_identity=self._SRC_ID, target_identity=self._TGT_ID,
             quality_per_layer={5: 0.9}, extend=True,
         )

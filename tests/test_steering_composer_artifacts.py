@@ -114,6 +114,7 @@ def test_transfer_variant_cold_loads_for_target_identity(
         model_fingerprint=source_fp,
     )
     from saklas.core.mahalanobis import LayerWhitener
+    from saklas.io.alignment import LayerAlignment
 
     acts = {0: torch.randn(32, 4)}
     whitener = LayerWhitener.from_neutral_activations(
@@ -121,7 +122,8 @@ def test_transfer_variant_cold_loads_for_target_identity(
     )
     transfer_manifold(
         folder, from_model=source_id, to_model=target_id,
-        alignment={0: torch.eye(4)}, whitener=whitener,
+        alignment={0: LayerAlignment(torch.eye(4), torch.eye(4), torch.zeros(4))},
+        whitener=whitener,
         source_model_fingerprint=source_fp,
         target_model_fingerprint=target_fp,
     )

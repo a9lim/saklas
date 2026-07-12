@@ -23,7 +23,17 @@ from saklas.core.manifold import (
     fit_layer_subspace,
 )
 from saklas.core.monitor import Monitor, _layer_geometry
+from saklas.io.alignment import LayerAlignment
 from tests._whitener import isotropic_whitener
+
+
+def _identity_alignments(
+    layers: tuple[int, ...], dim: int,
+) -> dict[int, LayerAlignment]:
+    return {
+        layer: LayerAlignment(torch.eye(dim), torch.eye(dim), torch.zeros(dim))
+        for layer in layers
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -216,7 +226,7 @@ class TestTransferProfileRebake:
         src = self._src_profile(d, layers)
         # Identity alignment (orthogonal) so v_tgt == v_src — isolates the
         # re-bake effect from the rotation.
-        align = {L: torch.eye(d) for L in layers}
+        align = _identity_alignments(layers, d)
         w = _make_whitener(
             layers=layers, d=d,
             cov_scale=torch.tensor([1.0, 3.0, 0.5, 2.0, 1.0, 4.0]),
@@ -226,7 +236,7 @@ class TestTransferProfileRebake:
         )
         assert out.metadata["bake"] == "mahalanobis"
         for L in layers:
-            v_tgt = align[L] @ src[L].float()
+            v_tgt = align[L].apply_vector(src[L].float())
             expected_norm = w.mahalanobis_norm(L, v_tgt)
             assert float(out[L].norm()) == pytest.approx(expected_norm, abs=1e-4)
             # Direction preserved (only magnitude re-scaled).
@@ -241,7 +251,7 @@ class TestTransferProfileRebake:
         from saklas.io.alignment import transfer_profile
         d, layers = 6, (0, 1, 2)
         src = self._src_profile(d, layers)
-        align = {L: torch.eye(d) for L in layers}
+        align = _identity_alignments(layers, d)
         with pytest.raises(WhitenerError, match="TARGET"):
             transfer_profile(src, align, source_model_id="src/m")
 
@@ -250,7 +260,7 @@ class TestTransferProfileRebake:
         from saklas.io.alignment import transfer_profile
         d, layers = 6, (0, 1, 2)
         src = self._src_profile(d, layers)
-        align = {L: torch.eye(d) for L in layers}
+        align = _identity_alignments(layers, d)
         w_partial = _make_whitener(layers=(0, 1), d=d)  # missing layer 2
         with pytest.raises(WhitenerError, match="TARGET"):
             transfer_profile(

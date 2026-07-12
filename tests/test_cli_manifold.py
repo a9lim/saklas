@@ -1406,7 +1406,12 @@ def test_run_manifold_transfer_calls_backend(monkeypatch: pytest.MonkeyPatch, tm
     )
 
     import torch
-    fake_M = {14: torch.eye(4), 15: torch.eye(4)}
+    from saklas.io.alignment import LayerAlignment
+
+    fake_M = {
+        layer: LayerAlignment(torch.eye(4), torch.eye(4), torch.zeros(4))
+        for layer in (14, 15)
+    }
     target_whitener = object()
     alignment_calls: list[dict[str, Any]] = []
 

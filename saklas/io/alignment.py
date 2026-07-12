@@ -128,29 +128,7 @@ class LayerAlignment:
         return self.left @ self.right
 
 
-AlignmentLike = LayerAlignment | torch.Tensor
-AlignmentMap = Mapping[int, AlignmentLike]
-
-
-def _as_layer_alignment(value: AlignmentLike) -> LayerAlignment:
-    if isinstance(value, LayerAlignment):
-        return value
-    dense = value.to(device="cpu", dtype=torch.float32)
-    if dense.ndim != 2:
-        raise ValueError("alignment matrix must be 2-D")
-    U, S, Vh = torch.linalg.svd(dense, full_matrices=False)
-    if S.numel() == 0:
-        raise ValueError("alignment matrix is empty")
-    tol = torch.finfo(S.dtype).eps * max(dense.shape) * float(S.max())
-    rank = int((S > tol).sum())
-    if rank == 0:
-        raise ValueError("alignment matrix is rank deficient (rank 0)")
-    left = U[:, :rank] * S[:rank]
-    right = Vh[:rank]
-    return LayerAlignment(
-        left.contiguous(), right.contiguous(),
-        torch.zeros(dense.shape[0], dtype=torch.float32),
-    )
+AlignmentMap = Mapping[int, LayerAlignment]
 
 
 # ---------------------------------------------------------------------------
@@ -698,8 +676,7 @@ def alignment_quality(
         X_src_c = X_src - X_src.mean(dim=0, keepdim=True)
         X_tgt_c = X_tgt - X_tgt.mean(dim=0, keepdim=True)
         # Translation cancels under centering; score the linear geometry.
-        alignment = _as_layer_alignment(M_L)
-        X_pred = alignment.apply_vectors(X_src_c)
+        X_pred = M_L.apply_vectors(X_src_c)
         residual = (X_tgt_c - X_pred).pow(2).sum().item()
         total = X_tgt_c.pow(2).sum().item()
         if total <= 1e-12:
@@ -778,8 +755,7 @@ def transfer_profile(
         M_L = alignment_map.get(layer)
         if M_L is None:
             continue
-        alignment = _as_layer_alignment(M_L)
-        staged[layer] = alignment.apply_vector(src_vec).cpu()
+        staged[layer] = M_L.apply_vector(src_vec).cpu()
         orig_dtype[layer] = src_vec.dtype
 
     if not staged:
@@ -930,7 +906,7 @@ def save_alignment_map(
     anchor, sc_path = _alignment_anchor_paths(src_model_id, tgt_model_id)
     anchor.parent.mkdir(parents=True, exist_ok=True)
 
-    normalized = {int(idx): _as_layer_alignment(value) for idx, value in M.items()}
+    normalized = {int(idx): value for idx, value in M.items()}
     if not normalized:
         raise ValueError("cannot save an empty alignment map")
     from saklas.io.atomic import artifact_lock

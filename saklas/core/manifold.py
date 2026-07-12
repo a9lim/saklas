@@ -57,6 +57,7 @@ from saklas.core.errors import SaklasError, is_out_of_memory_error
 
 if TYPE_CHECKING:
     from saklas.core.mahalanobis import LayerWhitener
+    from saklas.io.alignment import LayerAlignment
 
 log = logging.getLogger(__name__)
 
@@ -5361,7 +5362,7 @@ def _load_manifold_locked(
 
 def transfer_manifold_subspaces(
     src: Manifold,
-    alignment: Mapping[int, Any],
+    alignment: Mapping[int, "LayerAlignment"],
     *,
     whitener: "LayerWhitener | None",
     from_model: str,
@@ -5374,8 +5375,8 @@ def transfer_manifold_subspaces(
     transfer_manifold`).  Takes the already-loaded **source** ``Manifold``, a
     per-layer affine alignment map (the compact factorized
     :class:`saklas.io.alignment.LayerAlignment` returned by
-    :func:`saklas.io.alignment.fit_alignment`; legacy dense linear tensors are
-    accepted in memory), and the **target** model's whitener, and returns a new
+    :func:`saklas.io.alignment.fit_alignment`), and the **target** model's
+    whitener, and returns a new
     ``Manifold`` whose subspaces live in target space.
 
     Means and manifold points use the affine map (linear factor plus fitted
@@ -5418,15 +5419,8 @@ def transfer_manifold_subspaces(
             continue
         mean_f = sub.mean.to(torch.float32)
         basis_f = sub.basis.to(torch.float32)
-        if hasattr(M_L, "apply_vectors") and hasattr(M_L, "apply_points"):
-            raw_basis = M_L.apply_vectors(basis_f)
-            mean_tgt_f = M_L.apply_points(mean_f)
-        else:
-            # Compatibility for caller-supplied legacy dense linear maps.  They
-            # carry no affine translation; persisted caches never use this shape.
-            M = M_L.to(dtype=torch.float32)
-            raw_basis = basis_f @ M.transpose(0, 1)
-            mean_tgt_f = M @ mean_f
+        raw_basis = M_L.apply_vectors(basis_f)
+        mean_tgt_f = M_L.apply_points(mean_f)
 
         rank = int(raw_basis.shape[0])
         if raw_basis.ndim != 2 or raw_basis.shape[1] < rank:

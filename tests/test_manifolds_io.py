@@ -10,6 +10,7 @@ import pytest
 
 import torch
 
+from saklas.io.alignment import LayerAlignment
 from saklas.io.manifolds import (
     MANIFOLD_FORMAT_VERSION,
     BakedManifoldError,
@@ -35,6 +36,15 @@ from saklas.io.manifolds import (
     transfer_manifold,
     update_manifold_folder,
 )
+
+
+def _alignment(dense: torch.Tensor) -> LayerAlignment:
+    target_dim, source_dim = dense.shape
+    return LayerAlignment(dense, torch.eye(source_dim), torch.zeros(target_dim))
+
+
+def _alignments(dense: dict[int, torch.Tensor]) -> dict[int, LayerAlignment]:
+    return {layer: _alignment(value) for layer, value in dense.items()}
 
 
 def _box1d(periodic: bool, labels: list[str]) -> dict[str, Any]:
@@ -2180,7 +2190,7 @@ def test_transfer_rejects_source_generation_changed_after_preflight(
             folder,
             from_model="src/model",
             to_model="tgt/model",
-            alignment={layer: torch.eye(4) for layer in proof.layers},
+            alignment=_alignments({layer: torch.eye(4) for layer in proof.layers}),
             source_model_fingerprint="fp:src/model",
             target_model_fingerprint="fp:tgt/model",
             whitener=_target_whitener(dim=4),
@@ -2345,7 +2355,7 @@ def test_transfer_manifold_identity_alignment_preserves_geometry(
     src_man = load_manifold(src_tensor)
 
     # Identity map per fitted layer.
-    align = {L: torch.eye(6) for L in src_man.layers}
+    align = _alignments({L: torch.eye(6) for L in src_man.layers})
 
     out = transfer_manifold(
         folder, from_model=src_model, to_model=tgt_model,
@@ -2400,7 +2410,7 @@ def test_transfer_manifold_rebakes_share_in_target_space(
     tgt_model = "Qwen/Qwen2.5-7B-Instruct"
     src_tensor = _fit_real_manifold(folder, src_model, dim=6)
     src_man = load_manifold(src_tensor)
-    align = {L: torch.eye(6) for L in src_man.layers}
+    align = _alignments({L: torch.eye(6) for L in src_man.layers})
 
     # Target whitener over the fitted layers {4, 5, 6}.
     g = torch.Generator().manual_seed(99)
@@ -2450,7 +2460,7 @@ def test_transfer_manifold_rotation_maps_subspace(
     # Random orthogonal Q via QR.
     A = torch.randn(6, 6, generator=torch.Generator().manual_seed(7))
     Q, _ = torch.linalg.qr(A)
-    align = {L: Q for L in src_man.layers}
+    align = _alignments({L: Q for L in src_man.layers})
 
     out = transfer_manifold(
         folder, from_model=src_model, to_model=tgt_model, alignment=align,
@@ -2482,7 +2492,7 @@ def test_transfer_manifold_drops_uncovered_layers(
     src_model, tgt_model = "src/m", "tgt/m"
     _fit_real_manifold(folder, src_model, dim=6)  # writes the on-disk source fit
     # Cover only layer 5 of {4, 5, 6}.
-    align = {5: torch.eye(6)}
+    align = _alignments({5: torch.eye(6)})
     out = transfer_manifold(
         folder, from_model=src_model, to_model=tgt_model, alignment=align,
         source_model_fingerprint=f"fp:{src_model}",
@@ -2506,7 +2516,7 @@ def test_transfer_manifold_missing_source_raises(
     with pytest.raises(FileNotFoundError):
         transfer_manifold(
             folder, from_model="never/fitted", to_model="tgt/m",
-            alignment={0: torch.eye(4)},
+            alignment=_alignments({0: torch.eye(4)}),
             source_model_fingerprint="fp:never/fitted",
             target_model_fingerprint="fp:tgt/m",
         )
@@ -2545,7 +2555,7 @@ def test_transfer_manifold_no_overlap_raises(
     with pytest.raises(ManifoldFormatError, match="covered none"):
         transfer_manifold(
             folder, from_model="src/m", to_model="tgt/m",
-            alignment={0: torch.eye(6), 1: torch.eye(6)},
+            alignment=_alignments({0: torch.eye(6), 1: torch.eye(6)}),
             source_model_fingerprint="fp:src/m",
             target_model_fingerprint="fp:tgt/m",
         )
@@ -2564,7 +2574,7 @@ def test_transfer_manifold_refuses_overwrite_without_force(
         "local", "mood", "", domain, _author_nodes(["a", "b", "c"]),
     )
     src_tensor = _fit_real_manifold(folder, "src/m", dim=6)
-    align = {L: torch.eye(6) for L in load_manifold(src_tensor).layers}
+    align = _alignments({L: torch.eye(6) for L in load_manifold(src_tensor).layers})
     w = _target_whitener()
     transfer_manifold(
         folder, from_model="src/m", to_model="tgt/m", alignment=align, whitener=w,
@@ -2611,7 +2621,9 @@ def test_transfer_retries_pair_committed_before_manifest_update(
         "local", "mood", "", domain, _author_nodes(["a", "b", "c"]),
     )
     src_tensor = _fit_real_manifold(folder, "src/m", dim=6)
-    align = {layer: torch.eye(6) for layer in load_manifold(src_tensor).layers}
+    align = _alignments({
+        layer: torch.eye(6) for layer in load_manifold(src_tensor).layers
+    })
     whitener = _target_whitener()
     original = ManifoldFolder.update_file_hashes
     failed = False
@@ -2720,7 +2732,7 @@ def test_manifold_summary_reports_transfer_variant(
         "local", "mood", "", domain, _author_nodes(["a", "b", "c"]),
     )
     src_tensor = _fit_real_manifold(folder, "src/m", dim=6)
-    align = {L: torch.eye(6) for L in load_manifold(src_tensor).layers}
+    align = _alignments({L: torch.eye(6) for L in load_manifold(src_tensor).layers})
     transfer_manifold(
         folder, from_model="src/m", to_model="tgt/m", alignment=align,
         source_model_fingerprint="fp:src/m",
