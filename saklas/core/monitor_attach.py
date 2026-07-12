@@ -107,6 +107,10 @@ class AttachedManifoldProbe:
 
     name: str
     manifold: "Manifold"
+    # Candidate order and exact lookup are attachment invariants, built once
+    # from corpus nodes plus the optional synthetic neutral anchor.
+    candidate_labels: tuple[str, ...]
+    label_to_candidate_idx: dict[str, int]
     top_n: int = DEFAULT_NEAREST_TOP_N
     is_affine: bool = True
     # Whether the neutral anchor competes as a virtual candidate in this
@@ -118,8 +122,6 @@ class AttachedManifoldProbe:
     # followed by the synthetic neutral anchor when injected.  The mapping is
     # built once at attach (duplicate corpus labels resolve to their last
     # occurrence, matching the historic per-token dict comprehension).
-    candidate_labels: tuple[str, ...] = ()
-    label_to_candidate_idx: dict[str, int] = field(default_factory=dict)
     # Per-layer cache, indexed by layer index — same set of layers as
     # ``manifold.layers``.
     node_values_reduced: dict[int, torch.Tensor] = field(default_factory=dict)

@@ -765,21 +765,6 @@ class Monitor:
         # Preserve probe insertion order in the returned dict.
         return {name: out[name] for name in self._probes if name in out}
 
-    @staticmethod
-    def _gate_scalar_label_index(
-        probe: "AttachedManifoldProbe",
-    ) -> dict[str, int]:
-        if probe.label_to_candidate_idx:
-            return probe.label_to_candidate_idx
-        # Compatibility fallback for direct-constructed probes in tests or
-        # external callers.  Attached production probes carry this map already.
-        label_to_idx = {
-            label: idx for idx, label in enumerate(probe.manifold.node_labels)
-        }
-        if probe.inject_neutral:
-            label_to_idx[NEUTRAL_LABEL] = len(probe.manifold.node_labels)
-        return label_to_idx
-
     def _plan_probe_gate_scalars(
         self,
         probe: "AttachedManifoldProbe",
@@ -828,7 +813,7 @@ class Monitor:
         need_dist = bool(need_nearest or need_assignment)
         if not (need_coords or need_fraction or need_membership or need_dist):
             return None
-        label_to_idx = self._gate_scalar_label_index(probe)
+        label_to_idx = probe.label_to_candidate_idx
         dist_requests = tuple(
             (key, label_to_idx[label])
             for label, key in dist_labels.items()
