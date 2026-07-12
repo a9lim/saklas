@@ -71,7 +71,7 @@ class LoomController:
 
         Esc on the loom screen pops back to the chat screen.  Mutations
         from the loom screen flow into ``session.tree`` directly; the
-        chat screen's `_messages` property (a derived view) picks them
+        chat screen's session-history reads pick them
         up on the next render.
         """
 
@@ -312,7 +312,7 @@ class LoomController:
         # We need a prompt to regen from; if there isn't one yet, lift
         # it off the active path.
         if not prompt:
-            hist = app._messages
+            hist = app._session.history
             if hist and hist[-1]["role"] == "user":
                 prompt = hist[-1]["content"]
         if not prompt:
@@ -474,7 +474,7 @@ class LoomController:
         app = self._app
         chat = app._chat_panel
         # Read prompt off the active path.
-        hist = app._messages
+        hist = app._session.history
         prompt = None
         if hist and hist[-1]["role"] == "user":
             prompt = hist[-1]["content"]

@@ -26,10 +26,9 @@ def _make_app():
     """
     app: Any = object.__new__(SaklasApp)
     session: Any = MagicMock()
-    # v2.3 loom: conversation lives in ``session.tree`` (LoomTree).
-    # We install a real LoomTree so the regen/rewind path's
-    # navigate/edit calls work; ``session.history`` is the derived
-    # view the TUI's ``_messages`` property reads.
+    # Conversation lives in ``session.tree`` (LoomTree).  We install a real
+    # tree so regen/rewind navigation works; ``session.history`` is its
+    # current active-path view.
     from saklas import LoomTree as _LoomTree
     session.tree = _LoomTree()
     session.history = []
@@ -67,8 +66,6 @@ def _make_app():
     session.gen_state = saklas.GenState.IDLE
 
     app._session = session
-    # ``app._messages`` is now a property derived from ``session.history``
-    # under v2.3 loom; the v2.2 shared-list assignment is no longer needed.
     app._device_str = "cpu"
     app._alphas = {}
     app._enabled = {}
@@ -2094,24 +2091,24 @@ def test_pairs_modal_parses_pair_lines():
 
 
 # ---------------------------------------------------------------------------
-# /manifold-probe attach / remove + trait panel rendering
+# Unified /probe attach + curved-manifold trait panel rendering
 # ---------------------------------------------------------------------------
 
 
-def test_manifold_probe_requires_selector():
+def test_removed_manifold_probe_command_is_unknown():
     app = _make_app()
-    app._handle_command("/manifold-probe")
-    assert "Usage: /manifold-probe" in _msgs(app)
+    app._handle_command("/manifold-probe circumplex")
+    assert "Unknown command" in _msgs(app)
 
 
-def test_manifold_probe_remove_requires_name():
+def test_removed_manifold_probe_remove_command_is_unknown():
     app = _make_app()
-    app._handle_command("/manifold-probe-remove")
-    assert "Usage: /manifold-probe-remove" in _msgs(app)
+    app._handle_command("/manifold-probe-remove circumplex")
+    assert "Unknown command" in _msgs(app)
 
 
-def test_manifold_probe_attach_routes_through_session(monkeypatch: pytest.MonkeyPatch):
-    """``/manifold-probe <selector>`` calls the unified ``session.add_probe``
+def test_probe_curved_selector_routes_through_session(monkeypatch: pytest.MonkeyPatch):
+    """``/probe <selector>`` calls the unified ``session.add_probe``
     on a worker; on success ``_refresh_probe_panels`` splits the probe set by
     geometry and pushes the curved probe's manifold artifact to the trait
     panel's manifold section."""
@@ -2140,16 +2137,16 @@ def test_manifold_probe_attach_routes_through_session(monkeypatch: pytest.Monkey
     app.run_worker = lambda fn, thread=True: fn()
     app.call_from_thread = lambda fn, *a, **kw: fn(*a, **kw)
 
-    app._handle_command("/manifold-probe circumplex")
+    app._handle_command("/probe circumplex")
 
     assert captured["selector"] == "circumplex"
     app._trait_panel.set_active_manifold_probes.assert_called()
     pushed = app._trait_panel.set_active_manifold_probes.call_args.args[0]
     assert "circumplex" in pushed
-    assert "Manifold probe 'circumplex' active" in _msgs(app)
+    assert "Probe 'circumplex' active" in _msgs(app)
 
 
-def test_manifold_probe_remove_routes_through_session():
+def test_unprobe_curved_probe_routes_through_session():
     app = _make_app()
     app._session.monitor.probe_names = ["circumplex"]
     app._session.monitor.manifolds = {
@@ -2164,37 +2161,35 @@ def test_manifold_probe_remove_routes_through_session():
     app._trait_panel.set_active_manifold_probes = MagicMock()
     app._refresh_trait_why = MagicMock()
 
-    app._handle_command("/manifold-probe-remove circumplex")
+    app._handle_command("/unprobe circumplex")
 
     assert app._session.monitor.probe_names == []
     app._trait_panel.set_active_manifold_probes.assert_called_with({})
     assert "removed" in _msgs(app).lower()
 
 
-def test_manifold_probe_remove_missing_reports():
+def test_unprobe_curved_probe_missing_reports():
     app = _make_app()
     app._session.monitor.probe_names = []
-    app._handle_command("/manifold-probe-remove ghost")
+    app._handle_command("/unprobe ghost")
     assert "not active" in _msgs(app)
 
 
-def test_manifold_probe_mid_gen_enqueues_pending():
+def test_probe_curved_selector_mid_gen_enqueues_canonical_pending():
     from saklas.tui.chat_panel import PendingItem
 
     app = _make_app()
     app._session.is_generating = True
-    app._handle_command("/manifold-probe circumplex")
+    app._handle_command("/probe circumplex")
     assert app._pending_queue == [
-        PendingItem(
-            "manifold_probe", "/manifold-probe circumplex", ("circumplex",),
-        ),
+        PendingItem("probe", "/probe circumplex", ("circumplex",)),
     ]
 
 
-def test_manifold_probe_during_ab_shadow_is_refused():
+def test_probe_curved_selector_during_ab_shadow_is_refused():
     app = _make_app()
     app._ab_shadow_active = True
-    app._handle_command("/manifold-probe circumplex")
+    app._handle_command("/probe circumplex")
     assert "A/B shadow" in _msgs(app)
     assert app._pending_queue == []
 
@@ -2372,12 +2367,13 @@ def test_trait_panel_skips_minimap_for_higher_dim():
     assert "·" not in rendered
 
 
-def test_help_lists_manifold_probe_commands():
+def test_help_lists_only_canonical_probe_commands():
     app = _make_app()
     app._handle_command("/help")
     msg = _msgs(app)
-    assert "/manifold-probe" in msg
-    assert "/manifold-probe-remove" in msg
+    assert "/probe <selector>" in msg
+    assert "/unprobe" in msg
+    assert "/manifold-probe" not in msg
 
 
 def test_pairs_extract_routes_through_session_extract():

@@ -206,13 +206,6 @@ class SaklasApp(App[None]):
     ) -> None:
         super().__init__(ansi_color=True, **kwargs)
         self._session = session
-        # ``_messages`` was a direct reference to ``session._history`` in
-        # v2.2 — a shared mutable list.  Under v2.3 the conversation lives
-        # in :class:`~saklas.core.loom.LoomTree`; ``session.history`` is a
-        # derived view.  We expose the same shape (``list[dict]``) as a
-        # property; the four pop-sites that mutated it in v2.2 now route
-        # through :meth:`_rewind_active_assistant` so the tree stays
-        # consistent with the visible state.
         self._device_str = str(session.device)
 
         # Steering / probe extraction lives on :class:`ExtractionController`;
@@ -477,19 +470,6 @@ class SaklasApp(App[None]):
     def _loom_auto_regen_on(self, value: bool) -> None:
         self._get_loom_controller()._loom_auto_regen_on = value
 
-    @property
-    def _messages(self) -> list[dict[str, str]]:
-        """Compat shim — derived view over the loom tree's active path.
-
-        v2.2 had ``self._messages = session._history`` as a shared list
-        reference; v2.3's tree-backed history returns a fresh list per
-        access.  Reads that took ``[-1]`` or truthiness checks work
-        unchanged; the four pop-sites in regen/rewind paths now route
-        through :meth:`_rewind_active_assistant` instead of mutating
-        this property's return.
-        """
-        return self._session.history
-
     def _rewind_active_assistant(self) -> bool:
         """Move the loom tree's active pointer up one assistant turn.
 
@@ -497,8 +477,8 @@ class SaklasApp(App[None]):
         rewound; ``False`` when there's nothing to rewind.  Non-
         destructive — the rewound assistant stays in the tree as a now-
         dead branch, navigable via the loom sidebar / screen.  Replaces
-        v2.2's ``self._messages.pop()`` of a trailing assistant turn at
-        regen / rewind sites.
+        Direct list mutation of a trailing assistant turn at regen / rewind
+        sites would desynchronize the tree, so these paths navigate instead.
         """
         tree = self._session.tree
         active = tree.nodes.get(tree.active_node_id)
@@ -867,7 +847,7 @@ class SaklasApp(App[None]):
             "  /alpha <val> <name>         — adjust existing alpha\n"
             "  /unsteer <name|ns/>         — remove vector(s)\n"
             "Probes:\n"
-            "  /probe <concept>            — add probe (highlight on)\n"
+            "  /probe <selector>           — add any fitted probe (highlight on)\n"
             "  /probe <ns>/                — bulk add namespace as probes\n"
             "  /unprobe <name|ns/>         — remove probe(s)\n"
             "  /extract <concept>          — cache-warm; --role <slug> for role-aug.\n"
@@ -876,8 +856,6 @@ class SaklasApp(App[None]):
             "Manifold:\n"
             "  /steer <c> manifold%x,y     — steer toward a manifold point\n"
             "  /manifold fit <folder>      — fit a manifold pack folder\n"
-            "  /manifold-probe <selector>  — attach a read-side manifold probe\n"
-            "  /manifold-probe-remove <n>  — detach an attached probe\n"
             "Highlight:\n"
             "  ⌃Y / ⌃⇧Y                    — cycle {off → probe → surprise}\n"
             "Commit (no-gen send):\n"
@@ -1015,12 +993,6 @@ class SaklasApp(App[None]):
     def _handle_manifold(self, text: str) -> None:
         self._get_extraction_controller()._handle_manifold(text)
 
-    def _handle_manifold_probe(self, text: str) -> None:
-        self._get_extraction_controller()._handle_manifold_probe(text)
-
-    def _handle_manifold_probe_remove(self, text: str) -> None:
-        self._get_extraction_controller()._handle_manifold_probe_remove(text)
-
     def _handle_pairs(self, text: str) -> None:
         self._get_extraction_controller()._handle_pairs(text)
 
@@ -1028,11 +1000,6 @@ class SaklasApp(App[None]):
         # Drained from the pending queue by ``_dispatch_pending_action`` for a
         # ``manifold_fit`` item (the deferred ``/manifold fit`` path).
         self._get_extraction_controller()._start_manifold_fit(folder_arg)
-
-    def _start_manifold_probe_attach(self, selector: str) -> None:
-        # Drained from the pending queue by ``_dispatch_pending_action`` for a
-        # ``manifold_probe`` item (the deferred ``/manifold-probe`` path).
-        self._get_extraction_controller()._start_manifold_probe_attach(selector)
 
     def _start_pairs_extract(
         self, name: str, pairs: list[tuple[str, str]],
@@ -1091,7 +1058,7 @@ class SaklasApp(App[None]):
         self._chat_panel.add_system_message(msg)
 
     def _on_probe_added(self, name: str) -> None:
-        self._trait_panel.set_active_probes(set(self._session.monitor.probe_names))
+        self._refresh_probe_panels()
         # Per-token highlight default-on when a probe is explicitly added
         # via /probe. Seed to this probe; Ctrl+Y cycles the mode.
         self._highlight_probe = name
@@ -1118,17 +1085,6 @@ class SaklasApp(App[None]):
             f"(blend {term.coeff:.2f})"
         )
         self._refresh_left_panel()
-
-    def _on_manifold_probe_added(self, name: str) -> None:
-        """Mirror probe wiring — refresh the trait panel + announce.
-
-        Called back by ``ExtractionController._start_manifold_probe_attach``.
-        """
-        self._refresh_probe_panels()
-        self._refresh_trait_why()
-        self._chat_panel.add_system_message(
-            f"Manifold probe '{name}' active."
-        )
 
     def _refresh_probe_panels(self) -> None:
         """Split the unified monitor's probe set across the trait panel.
@@ -1241,7 +1197,7 @@ class SaklasApp(App[None]):
         self._refresh_input_mode()
 
     def _do_rewind(self) -> None:
-        if not self._messages:
+        if not self._session.history:
             self._chat_panel.add_system_message("Nothing to rewind.")
             return
         self._session.rewind()
@@ -1401,7 +1357,7 @@ class SaklasApp(App[None]):
             # re-send it as input.  Under v2.3 loom, ``add_user_turn``
             # dedups against the existing user-child so no explicit pop
             # is needed; just read the text.
-            hist = self._messages
+            hist = self._session.history
             if hist and hist[-1]["role"] == "user":
                 user_text = hist[-1]["content"]
             else:
@@ -2743,12 +2699,6 @@ class SaklasApp(App[None]):
                 # ``payload[0]`` is the folder path; the fit runs on a
                 # worker that enqueues its own ``done`` sentinel.
                 self._start_manifold_fit(payload[0] if payload else text)
-            elif kind == "manifold_probe":
-                # ``payload[0]`` is the selector; attach runs on a
-                # worker that enqueues its own ``done`` sentinel.
-                self._start_manifold_probe_attach(
-                    payload[0] if payload else text,
-                )
             elif kind == "regen_n":
                 # N-way regen after an interrupting gen completes; phase
                 # 1's engine serializes via ``session.generate(n=N)``.
@@ -2815,7 +2765,7 @@ class SaklasApp(App[None]):
                 return
             self._run_regen_n_worker(1)
             return
-        if not self._messages:
+        if not self._session.history:
             return
         if self._is_busy:
             # Queue the regen — runs after current gen + any earlier

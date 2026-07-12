@@ -472,9 +472,19 @@ class ExtractionController:
         self._app._run_worker_with_queue(_work)
 
     def _handle_probe(self, text: str) -> None:
-        ns = _detect_namespace_selector(text.strip())
+        selector = (text or "").strip()
+        ns = _detect_namespace_selector(selector)
         if ns is not None:
             self._handle_probe_namespace(ns)
+            return
+
+        # A spaced period is the one authoring form on this surface: extract
+        # the bipolar concept, then attach its folded rank-1 probe.  Every
+        # other input is already a selector and belongs to the unified
+        # session resolver, which handles both flat and curved manifolds.
+        _concept, baseline = self._app._parse_args(selector)
+        if baseline is None:
+            self._start_probe_attach(_unquote(selector))
             return
 
         def _on_success(name: str, _profile: Any, _alpha: Any) -> None:
@@ -485,6 +495,25 @@ class ExtractionController:
             self._app._session.add_probe(name)
             self._app.call_from_thread(self._app._on_probe_added, name)
         self._handle_extract(text, include_alpha=False, on_success=_on_success)
+
+    def _start_probe_attach(self, selector: str) -> None:
+        """Attach any current fitted probe shape through the unified resolver."""
+        chat = self._app._chat_panel
+        if self._app._ab_shadow_active:
+            chat.add_system_message("Cannot attach a probe during A/B shadow gen.")
+            return
+        if self._app._is_busy:
+            self._app._enqueue_pending(
+                PendingItem("probe", f"/probe {selector}", (selector,))
+            )
+            return
+        chat.add_system_message(f"Attaching probe '{selector}'...")
+
+        def _work() -> None:
+            name = self._app._session.add_probe(selector)
+            self._app.call_from_thread(self._app._on_probe_added, name)
+
+        self._app._run_worker_with_queue(_work)
 
     def _handle_extract_only(self, text: str) -> None:
         def _on_success(name: str, _profile: Any, _alpha: Any) -> None:
@@ -571,88 +600,6 @@ class ExtractionController:
             )
 
         self._app._run_worker_with_queue(_work)
-
-    def _handle_manifold_probe(self, text: str) -> None:
-        """``/manifold-probe <selector>`` — attach a curved manifold probe.
-
-        Routes through the unified ``session.add_probe`` — the selector can
-        be a bundled name (``emotions``, ``personas``), an ``ns/name`` form, or an
-        already-loaded manifold's registered name; the session's lazy-load
-        path (``_ensure_manifold_loaded``) handles resolution.  This is the
-        curved-probe front-end (the TUI mirror of the webui's "+ manifold
-        probe" launcher); ``/probe`` is the flat/concept front-end.  Both
-        land in the one monitor.  Refused
-        during A/B shadow gen for the same reason ``/probe`` is —
-        modifying the monitor set mid-shadow would interleave readings
-        across the steered/unsteered split.  Deferred behind an
-        in-flight gen via the pending queue (kind ``manifold_probe``).
-        """
-        chat = self._app._chat_panel
-        selector = (text or "").strip()
-        selector = _unquote(selector)
-        if not selector:
-            chat.add_system_message("Usage: /manifold-probe <selector>")
-            return
-        if self._app._ab_shadow_active:
-            chat.add_system_message(
-                "Cannot attach a manifold probe during A/B shadow gen."
-            )
-            return
-        if self._app._is_busy:
-            self._app._enqueue_pending(
-                PendingItem(
-                    "manifold_probe", f"/manifold-probe {selector}",
-                    (selector,),
-                )
-            )
-            return
-        self._start_manifold_probe_attach(selector)
-
-    def _start_manifold_probe_attach(self, selector: str) -> None:
-        """Run ``session.add_probe`` on a worker thread.
-
-        Mirrors ``_start_manifold_fit``'s worker structure — errors
-        surface as system messages and a ``done`` sentinel re-enters
-        the queue drain so a queued attach doesn't stall subsequent
-        items.
-        """
-        chat = self._app._chat_panel
-        chat.add_system_message(f"Attaching manifold probe '{selector}'...")
-
-        def _work() -> None:
-            name = self._app._session.add_probe(selector)
-            self._app.call_from_thread(self._app._on_manifold_probe_added, name)
-
-        self._app._run_worker_with_queue(_work)
-
-    def _handle_manifold_probe_remove(self, text: str) -> None:
-        """``/manifold-probe-remove <name>`` — detach an attached probe.
-
-        After the monitor unification there is one probe set, so this and
-        ``/unprobe`` are interchangeable; the command is kept for muscle
-        memory and detaches any probe shape via ``session.remove_probe``.
-        """
-        chat = self._app._chat_panel
-        name = (text or "").strip()
-        name = _unquote(name)
-        if not name:
-            chat.add_system_message("Usage: /manifold-probe-remove <name>")
-            return
-        monitor = self._app._session.monitor
-        if monitor is None or name not in monitor.probe_names:
-            chat.add_system_message(f"Manifold probe '{name}' not active.")
-            return
-        try:
-            self._app._session.remove_probe(name)
-        except SaklasError as e:
-            chat.add_system_message(e.user_message()[1])
-            return
-        except Exception as e:
-            chat.add_system_message(f"{type(e).__name__}: {e}")
-            return
-        self._app._refresh_probe_panels()
-        self._app._refresh_trait_why()
-        chat.add_system_message(f"Manifold probe '{name}' removed.")
 
     def _handle_pairs(self, text: str) -> None:
         """`/pairs <name>` — open the custom-statement extraction modal.
