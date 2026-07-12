@@ -582,6 +582,7 @@ async def _ws_handle_generate(
                     tid=tid,
                     lp=lp,
                     top_alts=top_alts,
+                    perplexity=perplexity,
                 )
                 loop.call_soon_threadsafe(
                     _token_queue.put_nowait, _TokenFrame(cast(JSONObject, event))
@@ -593,6 +594,7 @@ async def _ws_handle_generate(
                     per_layer_scores=True,
                     lens_readout=True,
                     sae_readout=True,
+                    perplexity=True,
                 ),
             )
             # Live J-lens workspace readout: computed only when the session's

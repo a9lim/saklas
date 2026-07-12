@@ -167,7 +167,7 @@
   });
 
   const activeNodeId = $derived(
-    loomTree.rev > 0 ? (loomTree.active_node_id ?? null) : null,
+    loomTree.loaded ? (loomTree.active_node_id ?? null) : null,
   );
   const activeNode = $derived(
     activeNodeId ? (loomTree.nodes.get(activeNodeId) ?? null) : null,
@@ -206,7 +206,7 @@
     sceneMode &&
       !genStatus.active &&
       input.trim() === "" &&
-      loomTree.rev > 0 &&
+      loomTree.loaded &&
       (userSeatActive || !onUserNode),
   );
 
@@ -1368,8 +1368,8 @@
       {#if turn.role === "assistant" && turn.meanLogprob != null && Number.isFinite(turn.meanLogprob)}
         <span
           class="prov"
-          title="perplexity of this generation (provenance: model-authored)"
-        >ppl {Math.exp(-turn.meanLogprob).toFixed(1)}</span>
+          title="realized-sequence perplexity: exp(mean chosen-token surprise); distinct from the footer's predictive-distribution entropy perplexity"
+        >seq ppl {Math.exp(-turn.meanLogprob).toFixed(1)}</span>
       {/if}
     </div>
 

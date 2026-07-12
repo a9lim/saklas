@@ -106,9 +106,11 @@
   let query: string = $state("");
   let searchInputRef: HTMLInputElement | null = $state(null);
 
-  // Per-row node-list collapse.  Node lists default OPEN, so a key
-  // present here means the user explicitly folded that row's nodes.
-  const collapsedNodes = new SvelteSet<string>();
+  // Per-row node-list disclosure.  Keep rows compact by default: opening a
+  // category containing ``personas`` must not immediately render 107 disabled
+  // controls and bury the next manifold several screens away.  Search still
+  // auto-expands matching node lists so discovery remains one-step.
+  const expandedNodes = new SvelteSet<string>();
 
   // Section-prefixed category expansion ("ft:register" / "un:register")
   // so the Fitted / Unfitted sections track open state independently.
@@ -190,11 +192,11 @@
   }
 
   function nodesOpen(key: string): boolean {
-    return searching || !collapsedNodes.has(key);
+    return searching || expandedNodes.has(key);
   }
   function toggleNodes(key: string): void {
-    if (collapsedNodes.has(key)) collapsedNodes.delete(key);
-    else collapsedNodes.add(key);
+    if (expandedNodes.has(key)) expandedNodes.delete(key);
+    else expandedNodes.add(key);
   }
 
   // ----- family filter + section split --------------------------------

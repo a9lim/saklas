@@ -1354,7 +1354,7 @@ class ManifoldExtractionPipeline:
                     and sc.capture_sha256 == capture_sha
                     and sc.fit_policy_version == MANIFOLD_FIT_POLICY_VERSION
                     and (
-                        sc.fitted_layers == requested_fit_layers
+                        sc.evaluated_layers == requested_fit_layers
                         if sae_release is None or layer_indices is not None
                         else sc.sae_full_coverage
                     )
@@ -2598,7 +2598,11 @@ class ManifoldExtractionPipeline:
             "nodes_sha256": nodes_sha,
             "model_fingerprint": model_fingerprint,
             "capture_sha256": capture_sha,
-            "fitted_layers": list(fit_layers),
+            # ``save_manifold`` derives ``fitted_layers`` from the actual
+            # tensor roster.  ``node_spread_per_layer`` below deliberately
+            # retains the complete evaluated roster so DLS-pruned layers are
+            # distinguishable from layers that were never fitted.
+            "fitted_layers": sorted(layer_subs),
             "fit_policy_version": MANIFOLD_FIT_POLICY_VERSION,
             # Provenance only (nothing branches on these at load).  The
             # whitener is mandatory for an activation-space fit, so both the

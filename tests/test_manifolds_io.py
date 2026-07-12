@@ -596,6 +596,30 @@ def test_manifold_sidecar_node_spread_round_trips(tmp_path: Path):
     assert peak[0] == "12"
 
 
+def test_manifold_sidecar_distinguishes_evaluated_from_dls_fitted_layers(
+    tmp_path: Path,
+) -> None:
+    """Pre-DLS diagnostics may cover layers absent from the tensor roster."""
+    path = tmp_path / "m.json"
+    payload = _sidecar_payload(
+        labels=["happy", "sad"],
+        domain={"type": "custom", "embed_dim": 1, "bounds": None},
+        fit_mode="pca",
+    )
+    payload.update({
+        "method": "manifold_discover_pca",
+        "fitted_layers": [5, 20],
+        "node_spread_per_layer": {"5": 0.5, "12": 8.25, "20": 3.0},
+        "mahalanobis_share_per_layer": {"5": 0.25, "20": 1.5},
+    })
+    path.write_text(json.dumps(payload))
+
+    sc = ManifoldSidecar.load(path)
+
+    assert sc.fitted_layers == [5, 20]
+    assert sc.evaluated_layers == [5, 12, 20]
+
+
 def test_manifold_sidecar_topology_provenance_round_trips(tmp_path: Path):
     """``auto``-fit topology provenance survives the save → load round-trip.
 

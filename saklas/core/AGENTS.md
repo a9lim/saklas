@@ -73,6 +73,10 @@ zero rows raise before a stripe is committed. Prompt/dimension widths halve
 independently on OOM and stay below the proven failure ceiling. The fit is
 compute-bound; `source_layers` restriction is
 the one real wall-time lever (1.73× for the 40–90% band).
+Estimator teardown removes the fit hooks, clears their retained autograd graph
+and accelerator stripe buffers, then flushes the MPS/CUDA allocator cache. A
+long-lived server must not carry the backward-pass working set into the next
+decode.
 `checkpoint_accumulator_cb` fires every `DEFAULT_CHECKPOINT_EVERY` (25) prompts
 for allocation-light resumable fits: IO normalizes live sums and merges any
 prefix one layer at a time while converting to fp16, so checkpointing does not
@@ -360,7 +364,7 @@ Discover coords come from the **consensus Gram** —
 `mean_L` of each layer's whitened, node-mean-centered `(K,K)` Gram
 `X̃_L Σ_L⁻¹ X̃_Lᵀ` (signal-weighted, layer-agnostic; no reference layer) — and the
 same per-layer Grams' traces are stamped into the sidecar as
-`node_spread_per_layer` (`{str(L): tr(G_L)}`), the concept's whitened
+`node_spread_per_layer` (`{str(L): tr(G_L)}`), the concept's pre-DLS whitened
 signal-by-layer profile. Diagnostic only (nothing runtime branches on it; absent →
 empty dict), surfaced by `manifold show`; computed for every K≥2 fit (authored too),
 distinct from `mahalanobis_share` (the same whitened spread restricted to the
@@ -637,8 +641,12 @@ origin_coord, along, onto)` and runs each active one through `subspace_inject`
 state `_manifold_feet` (cold → seed at `origin`, `_MANIFOLD_COLD_GN_STEPS = 4` GN
 steps; warm → one step). The dominant case — exactly one always-active
 (`Trigger.BOTH`) affine group — is precomputed at `recompose` into
-`_single_affine_fast` and `hook_fn` short-circuits to it: one `subspace_inject` +
-`copy_`, no group loop, no trigger re-check, no foot-seed. `all_fast_path()` is
+`_single_affine_fast`: pure push becomes one constant `add_`; mixed
+push+ablation precomputes that constant and projects only the nonzero-κ ablation
+rows in model dtype (the common single-ablation case is an elementwise dot +
+axpy, avoiding MPS's expensive tiny matmul dispatch); only the fallback runs one
+`subspace_inject` + `copy_`. There is no group loop, trigger re-check, or foot
+seed on these paths. `all_fast_path()` is
 true only unsteered (no hooks); `static_steerable()` is true when *every* hook is
 that static-affine fast path — those are the two StaticCache / graph-capture
 eligibility signals (`session.use_static_cache` ORs them). A curved / gated /

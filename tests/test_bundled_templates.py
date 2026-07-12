@@ -123,6 +123,20 @@ def test_process_scope_no_op(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     assert not manifest.exists()
 
 
+def test_process_scope_guard_is_per_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    pkg = tmp_path / "pkg"
+    _wire(monkeypatch, tmp_path, pkg)
+    _write_template(pkg, _DEMO)
+    materialize_bundled_templates()
+    assert (templates_dir() / "default" / "demo" / "template.json").exists()
+
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path / "second-home"))
+    materialize_bundled_templates()
+    assert (templates_dir() / "default" / "demo" / "template.json").exists()
+
+
 def test_bundle_update_recopies_and_backs_up(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):

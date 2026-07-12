@@ -345,6 +345,20 @@ def test_empty_synth_is_explicit_noop_shape() -> None:
     assert synth.layers == {}
 
 
+def test_synth_validation_does_not_concatenate_device_views(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Dispatch validation must avoid the MPS ``cat`` Metal-blit crash path."""
+    sub = LayerSubspace.affine(torch.zeros(4), torch.eye(2, 4))
+
+    def explode(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("SynthesizedSubspace validation called torch.cat")
+
+    monkeypatch.setattr(torch, "cat", explode)
+    synth = _synth_from_subspace(sub)
+    assert synth.layers[0] is sub
+
+
 def test_synth_rejects_mean_basis_width_mismatch() -> None:
     sub = LayerSubspace.affine(torch.zeros(4), torch.eye(2, 5))
     with pytest.raises(ValueError, match="mean width"):

@@ -550,11 +550,13 @@ class SteeringHook:
         # Model-dtype low-rank fast path for the single-affine mixed
         # push+ablation case.  The full ``subspace_inject`` fallback casts the
         # entire residual stream to fp32 and copies a full-width result back.
-        # For an affine subspace the update is exactly low-rank:
-        # ``q = h Bᵀ - μBᵀ`` and ``h += (along·(target - κq))B``.  Keeping the
-        # small reduced-space math in the model dtype avoids the full fp32
-        # residual copy while preserving the same geometry; pure-push still uses
-        # the even cheaper constant-add path above this.
+        # For an affine subspace the update is exactly low-rank.  Split its
+        # fixed push from its activation-dependent ablation at recompose time:
+        # ``h += c_push - along·(κₐ⊙(hBₐᵀ-μBₐᵀ))Bₐ``.  ``Bₐ`` contains
+        # only nonzero-κ rows, so a push + one ablation (the usual mixed
+        # expression) projects one axis instead of the entire merged span.  The
+        # rank-1 hot path below further lowers that projection to an elementwise
+        # dot + axpy, which is about 3x cheaper than two tiny MPS matmuls.
         self._single_affine_lowrank: tuple[
             torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
             torch.Tensor, float,
@@ -768,23 +770,40 @@ class SteeringHook:
         device: torch.device,
         dtype: "torch.dtype | None",
     ) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float] | None":
-        """Precompute model-dtype tensors for mixed affine push+ablation."""
+        """Precompute the fixed push and compact ablation-only projection.
+
+        The exact affine update is ``along·target@B -
+        along·(κ⊙q)@B``.  Its first term is constant and rows where
+        ``κ == 0`` never contribute to the second, so carrying the complete
+        merged rank through both hot-path matmuls is avoidable duplication.
+        """
         if dtype is None:
             return None
         if isinstance(kappa, torch.Tensor):
             kappa_tensor = cast(torch.Tensor, kappa)
             if not bool(kappa_tensor.any()):
                 return None
-            kappa_t = kappa_tensor.to(device=device, dtype=dtype)
+            kappa_f32 = kappa_tensor.to(device=device, dtype=torch.float32)
         else:
             if float(kappa) == 0.0:
                 return None
-            kappa_t = torch.full_like(target, float(kappa), device=device, dtype=dtype)
-        basis = sub.basis.to(device=device, dtype=dtype)       # (R, D)
-        basis_t = basis.T.contiguous()                         # (D, R)
-        target_t = target.to(device=device, dtype=dtype)       # (R,)
-        mean_proj_t = mean_proj.to(device=device, dtype=dtype) # (R,)
-        return basis, basis_t, target_t, kappa_t, mean_proj_t, float(along)
+            kappa_f32 = torch.full_like(
+                target, float(kappa), device=device, dtype=torch.float32,
+            )
+        basis_f32 = sub.basis.to(device=device, dtype=torch.float32)  # (R, D)
+        target_f32 = target.to(device=device, dtype=torch.float32)    # (R,)
+        const = ((float(along) * target_f32) @ basis_f32).to(dtype)   # (D,)
+        active = kappa_f32 != 0
+        ablate_basis = basis_f32[active].to(dtype).contiguous()       # (Ra, D)
+        ablate_basis_t = ablate_basis.T.contiguous()                  # (D, Ra)
+        ablate_kappa = kappa_f32[active].to(dtype)                    # (Ra,)
+        ablate_mean_proj = mean_proj.to(device=device, dtype=torch.float32)[
+            active
+        ].to(dtype)                                                    # (Ra,)
+        return (
+            ablate_basis, ablate_basis_t, ablate_kappa,
+            ablate_mean_proj, const, float(along),
+        )
 
     def hook_fn(self, module: Any, input: Any, output: Any) -> Any:
         # Constant-add fast path: one always-active **pure-push** affine group
@@ -800,15 +819,23 @@ class SteeringHook:
         lowrank = self._single_affine_lowrank
         if lowrank is not None:
             hidden = output if isinstance(output, torch.Tensor) else output[0]
-            basis, basis_t, target, kappa, mean_proj, along = lowrank
+            basis, basis_t, kappa, mean_proj, const, along = lowrank
             if hidden.dtype != basis.dtype:
                 basis = basis.to(hidden.dtype)
                 basis_t = basis.T.contiguous()
-                target = target.to(hidden.dtype)
                 kappa = kappa.to(hidden.dtype)
                 mean_proj = mean_proj.to(hidden.dtype)
-            q = hidden @ basis_t - mean_proj
-            delta = (along * (target - kappa * q)) @ basis
+                const = const.to(hidden.dtype)
+            if basis.shape[0] == 1:
+                # MPS dispatch dominates a rank-1 GEMM.  Express the same
+                # projection as a dot + axpy so Metal can use elementwise
+                # kernels and avoid allocating the full merged-rank ``q``.
+                row = basis[0]
+                q = (hidden * row).sum(dim=-1, keepdim=True) - mean_proj[0]
+                delta = const - (along * kappa[0]) * q * row
+            else:
+                q = hidden @ basis_t - mean_proj
+                delta = const - (along * (kappa * q)) @ basis
             hidden.add_(delta)
             return output
         # Fast path: one always-active affine group (the common steering case).

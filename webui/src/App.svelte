@@ -227,7 +227,11 @@
   </div>
 {:else}
   <div class="shell" class:loading={bootStatus === "loading"}>
-    <main class="layout" inert={paletteState.open}>
+    <main
+      class="layout"
+      inert={paletteState.open || bootStatus !== "ready"}
+      aria-busy={bootStatus === "loading"}
+    >
       <section class="loom-zone" aria-label="Threads" inert={drawerState.open !== null}>
         <LoomSidebar />
       </section>
@@ -339,6 +343,13 @@
       {/if}
     </main>
 
+    {#if bootStatus === "loading"}
+      <div class="boot-loading" role="status" aria-live="polite">
+        <span class="boot-spinner" aria-hidden="true"></span>
+        <span>loading workbench</span>
+      </div>
+    {/if}
+
     <Toaster />
     <CommandPalette />
   </div>
@@ -357,9 +368,40 @@
     overflow: hidden;
   }
   .shell.loading {
-    /* Slight desaturation so users can tell bootstrap hasn't finished
-     * without us blocking the entire frame. */
-    opacity: 0.85;
+    /* Keep the real frame visible for orientation while the explicit
+     * readiness veil below prevents controls racing their source data. */
+    color-scheme: dark;
+  }
+  .shell.loading .layout {
+    filter: saturate(0.72) brightness(0.82);
+  }
+  .boot-loading {
+    position: fixed;
+    inset: 0;
+    z-index: calc(var(--z-drawer) + 20);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: var(--space-3);
+    color: var(--fg-strong);
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    letter-spacing: 0.04em;
+    text-transform: lowercase;
+    background: rgba(2, 3, 8, 0.38);
+    backdrop-filter: blur(1px);
+    pointer-events: none;
+  }
+  .boot-spinner {
+    width: 12px;
+    height: 12px;
+    border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: boot-spin 0.7s linear infinite;
+  }
+  @keyframes boot-spin {
+    to { transform: rotate(360deg); }
   }
   /* Three permanent columns: threads · chat · rack.  The threads (loom)
    * column is 376px, the rack column 432px; min-width 1280px keeps the

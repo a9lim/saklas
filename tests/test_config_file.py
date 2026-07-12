@@ -129,6 +129,23 @@ def test_ensure_vectors_installed_all_present(monkeypatch: pytest.MonkeyPatch, t
     assert missing == []
 
 
+def test_bundled_manifolds_materialize_after_in_process_home_switch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """The process guard must not strand a newly selected artifact root."""
+    from saklas.io import manifolds as manifolds_mod
+    from saklas.io.paths import manifolds_dir
+
+    monkeypatch.setattr(manifolds_mod, "_materialized_this_process", False)
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path / "first"))
+    manifolds_mod.materialize_bundled_manifolds()
+    assert (manifolds_dir() / "default" / "formal.casual").is_dir()
+
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path / "second"))
+    manifolds_mod.materialize_bundled_manifolds()
+    assert (manifolds_dir() / "default" / "formal.casual").is_dir()
+
+
 def test_ensure_vectors_installed_missing_hf(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     from saklas.io.selectors import invalidate

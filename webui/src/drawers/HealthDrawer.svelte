@@ -7,6 +7,7 @@
     probeRack,
     refreshCorrelation,
     refreshLoomTree,
+    refreshManifoldList,
     refreshProbeList,
     refreshSession,
     refreshVectorList,
@@ -31,7 +32,7 @@
     if (!sessionState.info) out.push("session info is not loaded");
     if (sessionState.error) out.push(sessionState.error);
     if (loomTree.error) out.push(`loom API error: ${loomTree.error}`);
-    if (vectorsState.names.length === 0) out.push("no vectors registered in the session");
+    if (steerRack.catalog.length === 0) out.push("no manifold artifacts are available");
     if (probeRack.active.length === 0) out.push("no active probes; internal-state views will be sparse");
     return out;
   });
@@ -45,6 +46,7 @@
         refreshVectorList(),
         refreshProbeList(),
         refreshLoomTree(),
+        refreshManifoldList(),
         refreshCorrelation(),
       ]);
       lastAudit = new Date().toLocaleTimeString();
@@ -61,7 +63,7 @@
     <div class="title">
       <span class="eyebrow">model health</span>
       <div class="name-row">
-        <span class="meta">runtime readiness, tree state, vectors, probes, and UI coverage</span>
+        <span class="meta">runtime readiness, tree state, artifacts, probes, and UI coverage</span>
       </div>
     </div>
     <button type="button" class="close" aria-label="Close" onclick={closeDrawer}>✕</button>
@@ -89,19 +91,19 @@
         <p>{genStatus.tokensSoFar}/{genStatus.maxTokens || "—"} tokens · {genStatus.tokPerSec.toFixed(1)} tok/s</p>
       </div>
       <div class="tile">
-        <span>perplexity</span>
+        <span>entropy perplexity</span>
         <strong>{ppl === null ? "—" : ppl.toFixed(2)}</strong>
         <p>{genStatus.ppl.count} scored steps</p>
       </div>
       <div class="tile">
         <span>loom tree</span>
         <strong>{loomTree.nodes.size || "—"}</strong>
-        <p>rev {loomTree.rev || "—"} · active depth {loomTree.activePath.length || "—"}</p>
+        <p>rev {loomTree.loaded ? loomTree.rev : "—"} · active depth {loomTree.activePath.length || "—"}</p>
       </div>
       <div class="tile">
-        <span>vectors</span>
-        <strong>{vectorsState.names.length}</strong>
-        <p>{steerRack.entries.size} on rack · {steerRack.profiles.size} profiles cached</p>
+        <span>artifacts</span>
+        <strong>{steerRack.catalog.length}</strong>
+        <p>{steerRack.entries.size} on rack · {vectorsState.names.length} resident profiles</p>
       </div>
       <div class="tile">
         <span>probes</span>
@@ -114,8 +116,8 @@
       <h3>readiness checks</h3>
       <div class="checks">
         <div class:ok={!!sessionState.info}>session metadata</div>
-        <div class:ok={loomTree.rev > 0 && !loomTree.error}>loom API</div>
-        <div class:ok={vectorsState.names.length > 0}>vector registry</div>
+        <div class:ok={loomTree.loaded && !loomTree.error}>loom API</div>
+        <div class:ok={steerRack.catalog.length > 0}>manifold catalog</div>
         <div class:ok={probeRack.active.length > 0}>probe monitor</div>
         <div class:ok={steerRack.correlation !== null}>correlation cache</div>
       </div>

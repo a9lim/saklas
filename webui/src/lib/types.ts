@@ -1012,6 +1012,10 @@ export interface WSTokenEvent {
    *  consumer or an explicit ``logprobs``/``return_top_k`` request).
    *  Absent on current uncaptured events. */
   logprob?: number | null;
+  /** Per-token perplexity under the sampled distribution.  The native WS
+   *  explicitly opts into this channel so the workbench status and exported
+   *  turn provenance are backed by the engine rather than reconstructed. */
+  perplexity?: number | null;
   /** Logit-pass: top-K alternatives sorted by descending logprob.  Length
    *  matches ``SamplingConfig.return_top_k`` when populated, else absent.
    *  The chosen token may or may not appear in this list depending on

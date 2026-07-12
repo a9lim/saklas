@@ -17,6 +17,7 @@ def build_token_event(
     tid: int | None,
     lp: float | None,
     top_alts: list[TokenAlt] | None,
+    perplexity: float | None = None,
 ) -> dict[str, Any]:
     """Build one native WS ``token`` frame from the current engine state."""
     node_id = node_holder[0]
@@ -33,6 +34,8 @@ def build_token_event(
     }
     if lp is not None:
         event["logprob"] = float(lp)
+    if perplexity is not None:
+        event["perplexity"] = float(perplexity)
     if top_alts:
         event["top_alts"] = [
             {"id": int(a.id), "text": a.text, "logprob": float(a.logprob)}

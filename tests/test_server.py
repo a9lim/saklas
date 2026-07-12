@@ -1528,6 +1528,29 @@ class TestWSTokenEventLens:
         assert event["scores"] == {"calm": 0.424243}
         assert event["per_layer_scores"] == {"5": {"calm": 0.38}}
 
+    def test_perplexity_rides_token_frame(self) -> None:
+        from types import SimpleNamespace
+
+        from saklas.server.ws_events import build_token_event
+
+        session = SimpleNamespace(
+            token_probe_payload={},
+            tree=SimpleNamespace(active_node_id="node-1"),
+            generation_state=SimpleNamespace(emit_map=[]),
+        )
+        event = build_token_event(
+            session,
+            [None],
+            text=" x",
+            is_thinking=False,
+            tid=5,
+            lp=-0.1,
+            top_alts=None,
+            perplexity=2.75,
+        )
+
+        assert event["perplexity"] == 2.75
+
     def test_scores_are_not_reconstructed_from_tree_rows(self) -> None:
         from types import SimpleNamespace
 

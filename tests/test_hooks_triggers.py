@@ -9,11 +9,17 @@ apply.  A ``nn.Identity``-equivalent module is enough to drive the hook.
 
 from __future__ import annotations
 
+import pytest
 import torch
 import torch.nn as nn
 
 from saklas.core.hooks import SteeringHook, SteeringManager
-from saklas.core.manifold import CustomDomain, LayerSubspace, synthesize_subspace
+from saklas.core.manifold import (
+    CustomDomain,
+    LayerSubspace,
+    subspace_inject,
+    synthesize_subspace,
+)
 from saklas.core.triggers import Trigger, TriggerContext
 from tests._whitener import isotropic_whitener
 
@@ -98,6 +104,44 @@ def test_both_trigger_always_applies():
     before = hidden.clone()
     hook.hook_fn(None, None, hidden)
     assert not torch.allclose(hidden, before, atol=1e-3)
+
+
+@pytest.mark.parametrize("kappa", [torch.tensor([0.0, 1.0]), torch.tensor([0.4, 1.0])])
+def test_mixed_affine_lowrank_matches_unified_kernel(kappa: torch.Tensor) -> None:
+    """The compact ablation projection is algebraically exact for 1+ axes."""
+    basis = torch.eye(2, _DIM)
+    mean = torch.linspace(-0.2, 0.3, _DIM)
+    sub = LayerSubspace.affine(mean, basis)
+    target = torch.tensor([0.7, -0.25])
+    origin = torch.zeros(2)
+    along = 0.65
+    domain = CustomDomain(2)
+    ctx = TriggerContext()
+    hook = SteeringHook()
+    hook.recompose(
+        [(sub, domain, target, origin, along, 0.0, kappa, Trigger.BOTH)],
+        ctx,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    assert hook._single_affine_lowrank is not None
+
+    hidden = torch.randn(1, 3, _DIM)
+    expected, _ = subspace_inject(
+        hidden,
+        sub,
+        domain,
+        target,
+        origin,
+        along,
+        0.0,
+        mean_proj=mean @ basis.T,
+        kappa=kappa,
+    )
+    actual = hidden.clone()
+    hook.hook_fn(None, None, actual)
+
+    assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-6)
 
 
 def test_non_both_skips_when_inactive():

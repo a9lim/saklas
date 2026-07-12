@@ -2374,12 +2374,19 @@ class SynthesizedSubspace:
                 raise ValueError("SynthesizedSubspace target_coord must have shape (R,)")
             if self.kappa[layer].shape != (rank,):
                 raise ValueError("SynthesizedSubspace kappa must have shape (R,)")
-            values = torch.cat([
-                sub.mean.reshape(-1), sub.basis.reshape(-1),
-                self.target_coord[layer].reshape(-1),
-                self.kappa[layer].reshape(-1),
-            ])
-            if not bool(torch.isfinite(values).all()):
+            # Do not concatenate these device tensors just to validate them.
+            # PyTorch 2.12's MPS ``cat`` can segfault in the Metal blit path
+            # for the mixed view/stride shapes produced by dispatch-time
+            # synthesis, taking the whole server down before generation.  Four
+            # cold-path finite reductions are cheap and keep validation on the
+            # tensors' native device without allocating a joined buffer.
+            finite_parts = (
+                sub.mean,
+                sub.basis,
+                self.target_coord[layer],
+                self.kappa[layer],
+            )
+            if not all(bool(torch.isfinite(part).all()) for part in finite_parts):
                 raise ValueError("SynthesizedSubspace tensors must be finite")
             if (
                 isinstance(self.share[layer], bool)

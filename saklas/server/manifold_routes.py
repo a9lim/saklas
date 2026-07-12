@@ -354,7 +354,10 @@ def _manifold_json(
         out["domain"] = effective_domain
         out["domain_label"] = (
             domain_label(effective_domain)
-            if effective_domain else domain_label(mf.domain)
+            # An unfitted discover folder has no geometry yet.  Preserve the
+            # summary's useful ``discover-<mode>`` label instead of replacing
+            # it with the technically-derived but user-hostile ``?(0d)``.
+            if effective_domain else out["domain_label"]
         )
         out["intrinsic_dim"] = n
         out["min_nodes"] = min_nodes(n) if n > 0 else None

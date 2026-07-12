@@ -104,9 +104,10 @@ plus `manifold_discover_auto` discover, `merge` / `folded_vector` baked, and
 `manifold_procrustes_transfer` transfer + the
 share/subspace metrics, fit_mode, hyperparams, diagnostics, and
 `node_spread_per_layer` — the whitened between-node spread `{str(L): tr(G_L)}`,
-a diagnostic concept-signal-by-layer profile); the tensor
-save/load itself lives in `core/manifold.py`; its tensor-derived layer roster
-must equal the sidecar's `fitted_layers`. Merge component provenance always
+a diagnostic concept-signal-by-layer profile measured before DLS, whose keys are
+the evaluated-layer roster and may strictly contain `fitted_layers` when DLS
+drops a layer); the tensor save/load itself lives in `core/manifold.py`; its
+tensor-derived layer roster must equal the sidecar's `fitted_layers`. Merge component provenance always
 carries a manifest-proven lowercase sha256. `hash_manifold_files` reuses
 `packs.hash_file` for the per-file sha256 integrity manifest. After the first
 manifest population, `ManifoldFolder.update_file_hashes` hashes only the tensor
@@ -195,7 +196,8 @@ metadata-only, then strictly verifies the selected fitted pair when loading it.
 `materialize_bundled_manifolds`
 (copy-on-miss into `default/` for complete package-data folders only, plus a
 re-copy when the bundled manifest hash drifts or the on-disk `format_version`
-is not current). Bundle-drift comparison runs on the
+is not current). Its process guard is keyed by the resolved `SAKLAS_HOME`, so an
+in-process home switch still bootstraps the new artifact root. Bundle-drift comparison runs on the
 **`files`-stripped** canonical payload (`_manifest_content_sha256`) — the
 integrity map accumulates per-model fit proofs locally
 (`update_file_hashes`), so comparing it against the shipped manifest
@@ -246,7 +248,8 @@ manifold node-label slug; `_LABEL_REGEX` is redefined locally so the
 **Bundled templates.** `bundled_template_names` / `materialize_bundled_templates`
 mirror the manifold materializer for the template kind — copy-on-miss of
 `saklas/data/templates/<name>/template.json` into `~/.saklas/templates/default/`,
-re-copy on bundle drift (canonical hash or `format_version`), process-scope no-op.
+re-copy on bundle drift (canonical hash or `format_version`), per-home
+process-scope no-op.
 **Ordering**: every bootstrap site runs this *before*
 `materialize_bundled_manifolds`, because a templated bundled manifold
 (`default/<name>`) resolves its `template_ref` at fit (a hard

@@ -1416,6 +1416,27 @@ def fit_jacobian_lens(
     finally:
         for handle in handles:
             handle.remove()
+        # The hooks deliberately retain the latest source/final activations.
+        # On accelerator fits those tensors own the final autograd graph, and
+        # the reusable stripe buffers own additional device allocations.  A
+        # long-lived server otherwise carries the whole fit working set into
+        # the next generation; on MPS that can terminate the process instead
+        # of raising a recoverable OOM.  Break every reference before flushing
+        # the allocator.  The CPU accumulator is intentionally preserved.
+        captured.clear()
+        hook_state.clear()
+        state["hook_state"] = None
+        state["stripe_rows"] = None
+        state["host_stripes"] = None
+        state["cuda_transfer_stream"] = None
+        if device.type in {"mps", "cuda"}:
+            # Autograd can leave Python cycles around custom/vmap nodes; make
+            # those unreachable allocations visible to empty_cache now, at the
+            # artifact boundary, rather than during the user's next decode.
+            import gc
+
+            gc.collect()
+            _empty_device_cache(device)
 
     if state["acc"] is None or n_done == 0:
         raise JacobianLensError(

@@ -94,6 +94,10 @@ _log = logging.getLogger("saklas.io.manifolds")
 # it via ``saklas.io.manifolds._materialized_this_process`` (see the module
 # docstring).
 _materialized_this_process: bool = False
+# The no-op is scoped to one artifact root, not blindly to the Python process.
+# Tests, embedded callers, and notebook workflows may intentionally switch
+# ``SAKLAS_HOME`` in-process; that new root still needs a fresh bootstrap.
+_materialized_home: Path | None = None
 
 
 # ====================================================== bundled materialization ===
@@ -371,8 +375,8 @@ def materialize_bundled_manifolds() -> None:
     they're expensive to refit and the per-tensor ``nodes_sha256``
     check invalidates them automatically on next discover/fit.
 
-    **Process-scoped no-op after first call.**  Subsequent calls within
-    the same process return immediately without touching disk.  This
+    **Per-home process-scoped no-op after first call.**  Subsequent calls within
+    the same process and for the same ``SAKLAS_HOME`` return immediately without touching disk.  This
     prevents a second materialize (from e.g. ``SaklasSession.from_pretrained``
     later in the same CLI invocation) from clobbering CLI-set
     hyperparams that the runner wrote between the two calls — the
@@ -383,12 +387,13 @@ def materialize_bundled_manifolds() -> None:
     update mid-process would need a restart; this is not a real use
     case (bundle updates ship via pip and require restart anyway).
     """
-    global _materialized_this_process
-    if _materialized_this_process:
+    global _materialized_this_process, _materialized_home
+    home = saklas_home()
+    if _materialized_this_process and _materialized_home == home:
         return
     _materialized_this_process = True
+    _materialized_home = home
 
-    home = saklas_home()
     home.mkdir(parents=True, exist_ok=True)
 
     default_dir = manifolds_dir() / "default"

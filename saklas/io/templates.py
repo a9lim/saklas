@@ -574,6 +574,7 @@ def remove_template_folder(namespace: str, name: str) -> bool:
 # materializer — process-scope caching sidesteps the "bundle changed under user"
 # vs "user changed it via CLI" ambiguity (see that function's docstring).
 _templates_materialized_this_process: bool = False
+_templates_materialized_home: Path | None = None
 
 
 def _canonical_json_sha256(data: bytes) -> str:
@@ -636,13 +637,19 @@ def materialize_bundled_templates() -> None:
       replaced (fork under another namespace to keep a custom copy).
     - **No change** — skip.
 
-    Process-scoped no-op after the first call.  Must run BEFORE
+    Process-scoped no-op after the first call for a given ``SAKLAS_HOME``.
+    Switching homes in-process bootstraps the new root. Must run BEFORE
     ``materialize_bundled_manifolds`` — see the module note above.
     """
-    global _templates_materialized_this_process
-    if _templates_materialized_this_process:
+    global _templates_materialized_this_process, _templates_materialized_home
+    home = templates_dir().parent
+    if (
+        _templates_materialized_this_process
+        and _templates_materialized_home == home
+    ):
         return
     _templates_materialized_this_process = True
+    _templates_materialized_home = home
 
     names = bundled_template_names()
     if not names:

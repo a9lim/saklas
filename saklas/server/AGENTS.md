@@ -462,7 +462,7 @@ modes:
 Fork / prefill / commit are mutually exclusive (400 on mix). `n>1` fans out N sibling
 assistant nodes on one shared user parent, generated serially with deterministic
 derived seeds. Server → client: `started` (node_id filled lazily by the first
-token), `tree_mutated`, `token` (per token — `logprob`/`top_alts`
+token), `tree_mutated`, `token` (per token — `logprob`/`top_alts`/`perplexity`
 when captured, `scores`/`per_layer_scores` when probes are loaded, `probe_readings`
 `Record<name, {fraction, nearest}>` when any probe is attached, computed
 inline off `session._capture._per_layer`, and `lens_readout`

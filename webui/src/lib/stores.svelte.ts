@@ -1433,6 +1433,10 @@ export const chatLog: ChatLogState = $state({
 // projection of its active path; token deltas enrich that projection.
 
 export interface LoomTreeState {
+  /** True after the authoritative tree snapshot has loaded successfully.
+   * A pristine server tree legitimately has revision 0, so revision cannot
+   * double as an initialization sentinel. */
+  loaded: boolean;
   tree_format: number | null;
   saklas_version: string | null;
   session_id: string | null;
@@ -1444,7 +1448,7 @@ export interface LoomTreeState {
   nodes: Map<string, LoomNodeJSON>;
   /** parent_id → ordered child ids.  Same SvelteMap pattern. */
   children_of: Map<string, string[]>;
-  /** Monotonic revision cursor.  0 means no tree has been fetched yet. */
+  /** Monotonic server revision cursor.  A freshly loaded tree is revision 0. */
   rev: number;
   /** Pending in-flight gen target id (when known).  Reflects the
    *  ``started`` / ``tree_mutated`` event node identity; null
@@ -1461,6 +1465,7 @@ export interface LoomTreeState {
 }
 
 export const loomTree: LoomTreeState = $state({
+  loaded: false,
   tree_format: null,
   saklas_version: null,
   session_id: null,
@@ -1547,6 +1552,17 @@ function nodeToTurn(n: LoomNodeJSON): ChatTurn {
       return s;
     });
   }
+  const persistedPpl = [...(n.thinking_tokens ?? []), ...(n.tokens ?? [])]
+    .map((row) => row.perplexity)
+    .filter((value): value is number => (
+      typeof value === "number" && Number.isFinite(value) && value > 0
+    ));
+  if (persistedPpl.length > 0) {
+    turn.perplexity = Math.exp(
+      persistedPpl.reduce((sum, value) => sum + Math.log(value), 0)
+      / persistedPpl.length,
+    );
+  }
   if (n.thinking_tokens && n.thinking_tokens.length > 0) {
     turn.thinkingTokens = n.thinking_tokens.map((r) => {
       const s = tokenRowToScore(r);
@@ -1594,7 +1610,7 @@ function upsertLoomNode(raw: LoomNodeJSON & { children?: string[] }): LoomNodeJS
  *  between "tree is authoritative" and "live tokens land on an existing
  *  turn object." */
 function syncChatLogFromTree(): void {
-  if (loomTree.rev <= 0) return;
+  if (!loomTree.loaded) return;
   const path = loomTree.activePath;
   if (path.length === 0) {
     chatLog.turns = [];
@@ -1655,6 +1671,7 @@ function syncChatLogFromTree(): void {
 
 /** Replace the in-memory tree with a current server snapshot. */
 function applyTreeSnapshot(snap: LoomTreeJSON): void {
+  loomTree.loaded = true;
   loomTree.tree_format = snap.tree_format;
   loomTree.saklas_version = snap.saklas_version;
   loomTree.session_id = snap.session_id;
@@ -1692,7 +1709,7 @@ function applyTreeDelta(ev: {
 }): boolean {
   // First event after bootstrap is the rev=1 mutation; accept rev > 0
   // when our local rev is 0 (cold start) without claiming a gap.
-  if (loomTree.rev > 0 && ev.rev > loomTree.rev + 1) return false;
+  if (loomTree.loaded && ev.rev > loomTree.rev + 1) return false;
   // ``added``: inject node + extend its parent's children list.  Node
   // payloads from the server may include a ``children`` field
   // (the server serializer adds it); strip before storing so the cached node
@@ -1859,7 +1876,7 @@ export async function loomRegenerateActive(
   n: number = 1,
   opts: { recipe_override?: string | null } = {},
 ): Promise<void> {
-  if (loomTree.rev <= 0) return;
+  if (!loomTree.loaded) return;
   const activeId = loomTree.active_node_id;
   if (!activeId) return;
   const node = loomTree.nodes.get(activeId);
@@ -1887,7 +1904,7 @@ export async function loomRegenerateFromUser(
   userNodeId: string,
   opts: { n?: number; recipe_override?: string | null } = {},
 ): Promise<void> {
-  if (loomTree.rev <= 0) return;
+  if (!loomTree.loaded) return;
   const user = loomTree.nodes.get(userNodeId);
   if (!user || user.role !== "user") return;
   try {
@@ -2456,7 +2473,7 @@ function _currentWriteTurn(): ChatTurn | null {
  * The tree mutation that creates the node is ordered before its first token;
  * this binds the stream to that already-authoritative node. */
 function adoptStreamingNode(nodeId: string | null | undefined): void {
-  if (!nodeId || abState.processingAb || loomTree.rev <= 0) return;
+  if (!nodeId || abState.processingAb || !loomTree.loaded) return;
   loomTree.pendingNodeId = nodeId;
   if (!loomTree.nodes.has(nodeId)) {
     loomTree.error = `Token arrived before authoritative node ${nodeId}`;
@@ -2527,7 +2544,7 @@ function handleWsMessage(msg: WSServerMessage): void {
         // pendingIndex points at the steered turn so the streaming
         // pulse on Chat.svelte still highlights "this turn is live".
         chatLog.pendingIndex = abState.pendingTurnIdx;
-      } else if (loomTree.rev > 0 && msg.node_id) {
+      } else if (loomTree.loaded && msg.node_id) {
         // Loom path: the assistant node is already created server-side
         // (we got a ``tree_mutated`` add event before ``started``).  The
         // active-path sync seeds an empty turn for it; ensure the turn
@@ -2541,7 +2558,7 @@ function handleWsMessage(msg: WSServerMessage): void {
             turn.thinkingTokens = turn.thinkingTokens ?? [];
           }
         }
-      } else if (loomTree.rev > 0) {
+      } else if (loomTree.loaded) {
         // Loom path with a lazily-created assistant node: wait for
         // the authoritative tree mutation before allocating
         // the assistant turn. Appending a local placeholder here creates
@@ -2558,6 +2575,17 @@ function handleWsMessage(msg: WSServerMessage): void {
     case "token": {
       adoptStreamingNode(msg.node_id);
       genStatus.tokensSoFar += 1;
+      if (
+        typeof msg.perplexity === "number"
+        && Number.isFinite(msg.perplexity)
+        && msg.perplexity > 0
+      ) {
+        genStatus.ppl.logSum += Math.log(msg.perplexity);
+        genStatus.ppl.count += 1;
+        genStatus.ppl.mean = Math.exp(
+          genStatus.ppl.logSum / genStatus.ppl.count,
+        );
+      }
       if (genStatus.startedAt) {
         const elapsed = (performance.now() - genStatus.startedAt) / 1000;
         if (elapsed > 0) genStatus.tokPerSec = genStatus.tokensSoFar / elapsed;
@@ -2683,6 +2711,8 @@ function handleWsMessage(msg: WSServerMessage): void {
         // only).  Null when capture wasn't live; the inline surprise
         // mode + loom edge-weighting null-guard on this directly.
         turn.meanLogprob = msg.result?.mean_logprob ?? null;
+        const turnPpl = geometricMeanPpl(genStatus);
+        if (turnPpl !== null) turn.perplexity = turnPpl;
       }
       // Reconcile the live token counter against the server's
       // authoritative ``token_count``.  The streaming ``token`` events
@@ -2704,7 +2734,7 @@ function handleWsMessage(msg: WSServerMessage): void {
         loomTree.pendingNodeId = null;
         // Re-sync so the "streaming" decoration on the just-finished
         // turn switches off.
-        if (loomTree.rev > 0) syncChatLogFromTree();
+        if (loomTree.loaded) syncChatLogFromTree();
       }
 
       if (wasShadow) {
@@ -2753,7 +2783,7 @@ function handleWsMessage(msg: WSServerMessage): void {
           void _sendShadowGenerate(steeredIdx);
         } else if (
           override !== null &&
-          loomTree.rev > 0 &&
+          loomTree.loaded &&
           loomTree.active_node_id
         ) {
           // Pin the new sibling so the chat's right column shows it.
@@ -2800,7 +2830,7 @@ function handleWsMessage(msg: WSServerMessage): void {
       chatLog.pendingIndex = null;
       if (loomTree.pendingNodeId) {
         loomTree.pendingNodeId = null;
-        if (loomTree.rev > 0) syncChatLogFromTree();
+        if (loomTree.loaded) syncChatLogFromTree();
       }
       // The system turn appended above is rebuilt away whenever
       // ``syncChatLogFromTree`` runs (the tree knows nothing of it), so a
@@ -2911,6 +2941,16 @@ async function sendGenerateNow(
   input: string | unknown,
   opts: SendGenerateOpts = {},
 ): Promise<void> {
+  // The first server snapshot may legitimately be revision 0.  Require the
+  // explicit readiness bit instead of guessing from the revision, and retain
+  // this defensive fetch even though App gates user interaction during boot:
+  // store-level callers and future surfaces should be safe on their own.
+  if (!loomTree.loaded) {
+    await refreshLoomTree();
+    if (!loomTree.loaded) {
+      throw new Error("Conversation tree is not ready; retry after it loads");
+    }
+  }
   const sock = await ensureWebSocket();
   const steering =
     opts.steering === undefined ? currentSteeringExpression() : opts.steering;
@@ -2929,7 +2969,7 @@ async function sendGenerateNow(
   // the tree (it will emit ``tree_mutated`` with the added user node
   // and we'll sync from there) or when ``input`` is a messages list
   // (A/B shadow path — no fresh user turn to display).
-  if (loomTree.rev <= 0 && typeof input === "string") {
+  if (!loomTree.loaded && typeof input === "string") {
     chatLog.turns = [...chatLog.turns, { role: "user", text: input }];
   }
   // Remember the input verbatim so the auto-regen shadow path can replay
@@ -3429,7 +3469,7 @@ function schedulePersist(): void {
     // authoritative wire format.
     let tree: LoomTreeJSON | null = null;
     if (
-      loomTree.rev > 0 && loomTree.root_id && loomTree.active_node_id &&
+      loomTree.loaded && loomTree.root_id && loomTree.active_node_id &&
       loomTree.tree_format !== null && loomTree.saklas_version !== null
     ) {
       const nodes: LoomNodeJSON[] = [];

@@ -1150,6 +1150,7 @@ class TestManifoldRoutes:
             if m["name"] == "calendar"
         )
         assert weekday_row["resolved_fit_mode"] is None
+        assert weekday_row["domain_label"] == "discover-auto"
 
         detail = client.get("/saklas/v1/manifolds/local/calendar").json()
         monday = next(n for n in detail["nodes"] if n["label"] == "monday")

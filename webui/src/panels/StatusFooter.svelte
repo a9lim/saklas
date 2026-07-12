@@ -90,7 +90,10 @@
     <span class="text">{elapsedSec.toFixed(1)}s</span>
     {#if ppl !== null && Number.isFinite(ppl)}
       <span class="sep" aria-hidden="true">·</span>
-      <span class="text">ppl {ppl.toFixed(2)}</span>
+      <span
+        class="text"
+        title="predictive-distribution entropy perplexity, geometrically averaged across generated tokens"
+      >entropy ppl {ppl.toFixed(2)}</span>
     {/if}
     {#if !genStatus.active && finishLabel}
       <span class="sep" aria-hidden="true">·</span>

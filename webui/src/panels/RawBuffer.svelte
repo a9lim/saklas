@@ -96,7 +96,7 @@
 
   /** The active leaf node — what a clean continuation extends. */
   const activeLeaf = $derived(
-    loomTree.rev > 0 ? (loomTree.active_node_id ?? null) : null,
+    loomTree.loaded ? (loomTree.active_node_id ?? null) : null,
   );
 
   interface Divergence {

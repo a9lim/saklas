@@ -490,11 +490,23 @@ def validate_manifold_sidecar_payload(
     ):
         raise ManifoldFormatError(f"{location} has invalid fitted_layers")
     fitted_set = set(fitted)
-    for field_name in ("node_spread_per_layer", "mahalanobis_share_per_layer"):
-        _validate_layer_map(
-            data[field_name], location=location, field=field_name, fitted=fitted_set,
-            validate_value=lambda value: _finite_number(value) and float(value) >= 0,
-        )
+    # ``node_spread_per_layer`` is measured before DLS prunes axes/layers, so
+    # it records the complete *evaluated* layer roster.  Its keys may therefore
+    # be a strict superset of ``fitted_layers`` (the exact tensor roster).
+    # Keeping that distinction is what lets a cache prove that a dropped layer
+    # was evaluated rather than accidentally omitted.  Apply-time bakes remain
+    # tensor-bound and must use fitted-layer keys only.
+    _validate_layer_map(
+        data["node_spread_per_layer"], location=location,
+        field="node_spread_per_layer", fitted=fitted_set,
+        validate_value=lambda value: _finite_number(value) and float(value) >= 0,
+        require_fitted=False,
+    )
+    _validate_layer_map(
+        data["mahalanobis_share_per_layer"], location=location,
+        field="mahalanobis_share_per_layer", fitted=fitted_set,
+        validate_value=lambda value: _finite_number(value) and float(value) >= 0,
+    )
     _validate_layer_map(
         data["origin_per_layer"], location=location, field="origin_per_layer",
         fitted=fitted_set,
@@ -804,6 +816,19 @@ class ManifoldSidecar:
     # Per-node conceptual kind ("abstract"/"concrete"), ``node_labels`` order.
     # Mirrors ``node_roles``' independent-copy rationale; generation provenance.
     node_kinds: list[str | None] = field(default_factory=list)
+
+    @property
+    def evaluated_layers(self) -> list[int]:
+        """Layers evaluated by the fit before DLS pruning.
+
+        Multi-node activation fits always measure ``node_spread_per_layer``
+        before selecting the retained tensor layers.  Artifact kinds without
+        that diagnostic (for example baked and monopolar manifolds) evaluate
+        exactly their fitted tensor roster.
+        """
+        if self.node_spread_per_layer:
+            return sorted(int(layer) for layer in self.node_spread_per_layer)
+        return list(self.fitted_layers)
 
     @classmethod
     def load(cls, path: Path) -> "ManifoldSidecar":
