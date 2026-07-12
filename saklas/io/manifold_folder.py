@@ -239,21 +239,24 @@ def domain_label(spec: dict[str, Any]) -> str:
 def sanitize_hyperparams(
     fit_mode: str, hyperparams: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    """Drop hyperparam keys that don't apply to ``fit_mode``.
+    """Validate and return hyperparameters for one exact fit mode.
 
     Single source of truth for the per-method whitelist; both the create
     and the fit-override paths funnel through this so the folder
-    manifest never carries a key that would crash the dispatcher.  An
-    unknown ``fit_mode`` (already validated upstream) passes through
-    unchanged — better to land a soft "extra key" warning at fit time
-    than to silently drop everything.
+    manifest never accepts a key that the selected dispatcher would ignore.
     """
     if hyperparams is None:
         return {}
     allowed = _HYPERPARAMS_BY_MODE.get(fit_mode)
     if allowed is None:
-        return dict(hyperparams)
-    return {k: v for k, v in hyperparams.items() if k in allowed}
+        raise ManifoldFormatError(f"unknown fit_mode {fit_mode!r}")
+    invalid = set(hyperparams) - allowed
+    if invalid:
+        names = ", ".join(sorted(invalid))
+        raise ManifoldFormatError(
+            f"fit_mode {fit_mode!r} does not accept hyperparameter(s): {names}"
+        )
+    return dict(hyperparams)
 
 
 # Current manifold artifact format. v6 adds an optional per-layer

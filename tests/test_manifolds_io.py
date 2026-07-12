@@ -1058,41 +1058,30 @@ def test_discover_write_metadata_round_trip(tmp_path: Path, monkeypatch: pytest.
     assert again.node_coords == []
 
 
-def test_discover_create_drops_cross_method_hyperparams(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """A spectral key on a pca create gets dropped — would crash the dispatcher."""
+def test_discover_create_rejects_cross_method_hyperparams(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    folder = create_discover_manifold_folder(
-        "local", "sanity_pca", "",
-        fit_mode="pca",
-        node_corpora=_discover_corpora(["a", "b", "c"]),
-        hyperparams={
-            "max_dim": 8,            # shared — kept
-            "var_threshold": 0.70,   # pca — kept
-            "k_nn": 5,               # spectral — dropped
-            "bandwidth": 0.1,        # spectral — dropped
-            "foo": "bar",            # unknown — dropped
-        },
-    )
-    mf = ManifoldFolder.load(folder)
-    assert mf.hyperparams == {"max_dim": 8, "var_threshold": 0.70}
+    with pytest.raises(ManifoldFormatError, match="k_nn"):
+        create_discover_manifold_folder(
+            "local", "sanity_pca", "",
+            fit_mode="pca",
+            node_corpora=_discover_corpora(["a", "b", "c"]),
+            hyperparams={"max_dim": 8, "var_threshold": 0.70, "k_nn": 5},
+        )
 
 
-def test_discover_create_drops_cross_method_hyperparams_spectral(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """Mirror — a pca key on a spectral create gets dropped."""
+def test_discover_create_rejects_unknown_hyperparams(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    folder = create_discover_manifold_folder(
-        "local", "sanity_spec", "",
-        fit_mode="spectral",
-        node_corpora=_discover_corpora(["a", "b", "c"]),
-        hyperparams={
-            "max_dim": 8,
-            "k_nn": 5,
-            "bandwidth": 0.1,
-            "var_threshold": 0.70,   # pca — dropped
-        },
-    )
-    mf = ManifoldFolder.load(folder)
-    assert mf.hyperparams == {"max_dim": 8, "k_nn": 5, "bandwidth": 0.1}
+    with pytest.raises(ManifoldFormatError, match="foo"):
+        create_discover_manifold_folder(
+            "local", "sanity_spec", "",
+            fit_mode="spectral",
+            node_corpora=_discover_corpora(["a", "b", "c"]),
+            hyperparams={"max_dim": 8, "k_nn": 5, "foo": "bar"},
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -63,7 +63,8 @@ by `manifold.json::fit_mode`:
 - **`authored`** — user supplies `domain` + per-node `{label, coords}`. Curved RBF.
 - **`pca`** / **`spectral`** / **`auto`** (discover) — nodes carry `{label}` only;
   coords are derived per-model at fit time and stored in the safetensors;
-  `hyperparams` feeds the picker. `pca` is flat (also the 2-node vector case),
+`hyperparams` feeds the picker; keys outside the selected mode's exact whitelist
+raise at the authoring/override boundary rather than being discarded. `pca` is flat (also the 2-node vector case),
   `spectral` curved, `auto` lets `core.manifold.select_topology` pick flat-vs-
   curved (GCV) plus periodic `BoxDomain` axes (H1 persistent homology) per-model.
   All three are `is_discover`; `_HYPERPARAMS_BY_MODE` whitelists each (auto's
