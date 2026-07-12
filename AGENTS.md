@@ -287,8 +287,8 @@ The third artifact family, **per-model** rather than per-concept (Gurnee et al.,
 Transformer Circuits 2026). The lens is one matrix per source layer,
 `J_l = E[∂h_final/∂h_l]` — the average first-order effect of a layer's residual
 on the final-layer residual over positions and a web-text corpus — stored as
-immutable per-layer fp16 shards selected by
-`models/<safe_model_id>/jlens.json` (`LENS_FORMAT_VERSION = 5`, required exactly).
+immutable per-layer fp32 shards selected by
+`models/<safe_model_id>/jlens.json` (`LENS_FORMAT_VERSION = 6`, required exactly).
 The sidecar records the immutable corpus spec + token-id
 sha256, exact source/live model identities, and one payload sha256 per layer.
 `lens fit` runs the estimator (`core/jlens.py::fit_jacobian_lens` — consecutive
@@ -923,7 +923,7 @@ All state under `~/.saklas/` (override via `$SAKLAS_HOME`):
                                        # the whitener covariance is built from the stack
     alignments/<safe_src>.{safetensors,json} # optional cross-model Procrustes map
     jlens.json                         # atomic per-model Jacobian-lens pointer
-    jlens.layer-*.gen-*.safetensors    # immutable fp16 J_l layer shards (`lens fit`)
+    jlens.layer-*.gen-*.safetensors    # immutable fp32 J_l layer shards (`lens fit`)
   conversations/<name>.json            # explicit loom-tree saves (no autosave)
 ```
 

@@ -79,7 +79,7 @@ long-lived server must not carry the backward-pass working set into the next
 decode.
 `checkpoint_accumulator_cb` fires every `DEFAULT_CHECKPOINT_EVERY` (25) prompts
 for allocation-light resumable fits: IO normalizes live sums and merges any
-prefix one layer at a time while converting to fp16, so checkpointing does not
+prefix one layer at a time while streaming fp32, so checkpointing does not
 materialize another complete fp32 lens. Checkpoints are self-contained
 (`base_n_prompts=0`) and survive repeated interruptions even beside an older
 full artifact. Resume transfers ownership of the loaded prefix matrices into
@@ -105,7 +105,7 @@ recovery point until that pointer commit succeeds.
 `JacobianLens.merge` is the non-mutating n_prompts-weighted combiner;
 `merge_into` recycles a caller-owned
 tail; `union_layers` combines same-corpus layer shards. Persisting a
-missing-layer union reuses the existing v4 shard pointers and serializes only
+missing-layer union reuses the existing v6 shard pointers and serializes only
 the newly fitted layers. A same-session superset remains the full resident lens
 when `fit_jlens(..., source_layers=...)` returns a narrower no-op view; a fresh
 subset no-op materializes only the requested shards and leaves the full durable
@@ -1082,7 +1082,7 @@ events: `GenerationStarted`/`SteeringApplied`/
 `SteeringCleared`/`ProbeScored`/`GenerationFinished` + `VectorExtracted`/
 `ManifoldExtracted`; threaded subscribers hop via `loop.call_soon_threadsafe`.
 
-**Jacobian-lens surface.** `session.jlens` validates v4 sidecar/live-weight
+**Jacobian-lens surface.** `session.jlens` validates v6 sidecar/live-weight
 identity before loading, refreshes or evicts an already-resident lens when an
 external process replaces/removes its generation, then verifies the payload digest
 while promoting each layer (`io/lens.py`, like `whitener`). Generation refreshes

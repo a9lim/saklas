@@ -145,7 +145,7 @@ body + any typed safe-message formatter.
   `role_substitution_supported` / `user_role_supported` (against `ROLE_HEADERS` /
   `USER_ROLE_HEADERS` for the resolved `model_type`) and the resolved
   `default_assistant_role` / `default_user_role`, so the webui can gate roles,
-  plus `jlens_fitted` (`has_compatible_jlens`: v4 shard sidecar/payload plus loaded
+  plus `jlens_fitted` (`has_compatible_jlens`: v6 shard sidecar/payload plus loaded
   weight identity, gating the drilldown's j-lens tab without the lazy fp32 load),
   `live_lens_layers` (the live workspace readout's resolved layer list, `null`
   while off), and `live_probe_scores` (the CAA live toggle). Session metadata is
@@ -377,7 +377,7 @@ a flat-buffer node (raw-ness isn't stamped server-side, the client's render
 mode supplies it). Errors: `LensNotFittedError`/`UnknownNodeError` → 404,
 `InvalidNodeOperationError`/bad `layers`/`top_k` → 400, other `SaklasError`s →
 their `user_message()` status. Discovery rides
-the session-info `jlens_fitted` field (v4 shard sidecar + live-weight compatibility,
+the session-info `jlens_fitted` field (v6 shard sidecar + live-weight compatibility,
 never the ~GB lazy artifact load).
 
 `POST /sessions/{id}/lens/live` body `{enabled, layers?, top_k?=5}` — toggle

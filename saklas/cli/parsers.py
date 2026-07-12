@@ -1034,7 +1034,7 @@ _LENS_DESCRIPTIONS: dict[str, str] = {
         "residual over a web-text corpus. One forward + ceil(d_model/dim_batch) "
         "backward passes per document — the only backward passes in saklas. "
         "The artifact lands under ~/.saklas/models/<model>/ as an atomic "
-        "jlens.json pointer plus fp16 per-layer shards (~0.5-1.5 GB total) "
+        "jlens.json pointer plus fp32 per-layer shards (~1-3 GB total) "
         "and backs `lens top`, `lens decompose`, the "
         "jlens/<word> steering atoms, and @when:jlens/<word> gates. "
         "Interrupted fits checkpoint and resume by default."

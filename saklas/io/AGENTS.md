@@ -452,28 +452,28 @@ target write. Non-current cache generations miss and are replaced normally.
 The per-model Jacobian-lens artifact — an atomic `models/<safe_model_id>/
 jlens.json` pointer to immutable per-layer
 `jlens.layer-<L>.gen-<uuid>.safetensors` generations. Readers and writers require
-exactly `LENS_FORMAT_VERSION = 5`. Missing-layer top-ups carry forward unchanged shard pointers and write
+exactly `LENS_FORMAT_VERSION = 6`. Missing-layer top-ups carry forward unchanged shard pointers and write
 only the new matrices, after rehashing every reuse candidate; a corrupt reused
 shard is rewritten from the resident fp32 matrix while valid siblings stay put.
 a wrong version, missing/mismatched payload digest, non-finite tensors, or a corrupt sidecar all log a warning and
 read as "no lens" (`load_lens → None`) rather than crash — the caller decides
 whether to error (`LensNotFittedError` with the `lens fit` hint) or re-fit.
-Storage is **fp16** (deliberately unlike the neutral cache's fp32 invariant:
-J entries are O(1) so range is no constraint, and nothing here feeds a
-covariance inversion), promoted to fp32 on load. The sidecar records `method`,
+Storage is **fp32**, matching manifolds, subspaces, profiles, and neutral
+activations and preserving the estimator accumulator losslessly across save and
+resume. The sidecar records `method`,
 `n_prompts`, `d_model`, `source_layers`, the corpus spec + token-id sha256 (the
 resume/staleness key), optional raw-corpus sha/count metadata for model-load-free
 no-op checks, `seq_len`, `dim_batch`, `skip_first_positions`, exact model
 source/live-weight identities, per-layer tensor filenames + sha256 values, and the model's
 layer count (needed to prove `all`/`workspace` coverage without loading it).
-Loading uses `safe_open` one shard at a time, so fp16 source storage is released
-as the fp32 lens is materialized rather than coexisting as a full mapping. The
-verified loader can materialize only requested v4 shards for a fresh same-corpus
+Loading uses `safe_open` one shard at a time, so only the requested fp32 matrices
+are materialized rather than a complete shard mapping. The
+verified loader can materialize only requested v6 shards for a fresh same-corpus
 subset no-op; the durable pointer and its full layer union remain unchanged.
 Resumable
 checkpoints use the same generation-pointer scheme under `jlens.partial.json`:
 the estimator writes a self-contained averaged checkpoint directly from raw sums,
-merging a prior prefix one layer at a time during fp16 conversion. This avoids a
+merging a prior prefix one layer at a time during fp32 streaming. This avoids a
 second full fp32 lens at checkpoint cadence and makes repeated interruptions
 independent of an older full artifact (`base_n_prompts=0`). Every checkpoint
 payload is fsynced and its directory entry made durable before the checkpoint
@@ -481,7 +481,7 @@ pointer is published. Finalization promotes
 an already-complete terminal checkpoint by atomically pointing the durable sidecar
 at its immutable tensor generations, without moving or rewriting them; a pointer-write
 failure therefore preserves both the prior full artifact and the checkpoint.
-Promotion accepts only v4 checkpoints whose every shard matches its declared
+Promotion accepts only v6 checkpoints whose every shard matches its declared
 digest. Removal
 unpublishes both pointer sidecars, fsyncs that directory state, and only then
 performs best-effort shard garbage collection.

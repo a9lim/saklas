@@ -43,8 +43,8 @@ budget is bounded from both sides: a fully unsynced loop can exhaust Metal's
 asynchronous command queue, so periodic drains plus the zero-row guard remain.
 The fit is compute-bound (each prompt ≈ ``d_model × 2`` forward-equivalents
 of backward, dim_batch-invariant); restricting ``source_layers`` is the one
-lever that removes work. Entries are O(1), so fp16 storage downstream is
-safe.
+lever that removes work. The fp32 accumulator is persisted losslessly so saved,
+resumed, and loaded lenses retain the estimator's precision.
 """
 
 from __future__ import annotations
@@ -242,7 +242,7 @@ class JacobianLens:
         """Return a view-like lens containing only ``layers``.
 
         The tensors are shared with ``self``; callers that persist the result
-        will materialize their own fp16 copy through ``save_lens``.
+        will materialize their own fp32 shard through ``save_lens``.
         """
         requested = sorted(set(int(l) for l in layers))
         missing = [l for l in requested if l not in self.jacobians]

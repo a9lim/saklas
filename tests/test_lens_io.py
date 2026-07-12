@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 import torch
-from safetensors.torch import save_file
+from safetensors.torch import load_file, save_file
 
 from saklas.core.jlens import JacobianLens
 from saklas.io.lens import (
@@ -100,11 +100,12 @@ def test_save_load_round_trip() -> None:
     assert got.n_prompts == 7
     assert got.d_model == _D
     assert got.source_layers == [0, 1, 2]
-    # fp16 storage: round-trip within half-precision tolerance, promoted fp32
+    # fp32 storage is lossless across the artifact boundary.
     for layer in got.source_layers:
         assert got.jacobians[layer].dtype == torch.float32
-        assert torch.allclose(got.jacobians[layer], lens.jacobians[layer], atol=2e-3)
+        assert torch.equal(got.jacobians[layer], lens.jacobians[layer])
     assert sidecar["format_version"] == LENS_FORMAT_VERSION
+    assert sidecar["dtype"] == "float32"
     assert sidecar["corpus_spec"] == "test-corpus"
     assert sidecar["corpus_sha256"] == _digest("abc123")
     assert sidecar["corpus_hash_kind"] == "text_v1"
@@ -116,6 +117,9 @@ def test_save_load_round_trip() -> None:
         for layer, filename in sidecar["tensor_files"].items()
     )
     assert lens_paths(_MODEL)[0].name == sidecar["tensor_files"]["0"]
+    for layer, filename in sidecar["tensor_files"].items():
+        shard = load_file(str(lens_paths(_MODEL)[1].parent / filename))
+        assert shard[f"layer_{layer}"].dtype == torch.float32
 
 
 def test_missing_layer_topup_reuses_immutable_existing_shards() -> None:
@@ -519,11 +523,11 @@ def test_load_missing_returns_none() -> None:
     assert load_lens_sidecar(_MODEL) is None
 
 
-def test_load_wrong_format_version_returns_none() -> None:
+def test_load_previous_format_version_returns_none() -> None:
     _save(_lens())
     _, sc_path = lens_paths(_MODEL)
     sidecar = json.loads(sc_path.read_text())
-    sidecar["format_version"] = LENS_FORMAT_VERSION + 1
+    sidecar["format_version"] = LENS_FORMAT_VERSION - 1
     sc_path.write_text(json.dumps(sidecar))
     assert load_lens(_MODEL) is None
 
@@ -742,7 +746,7 @@ def test_checkpoint_payload_is_durable_before_pointer_publication(
     import saklas.io.lens as lens_io
 
     events: list[str] = []
-    real_payload = lens_io._save_fp16_square_safetensors_atomic
+    real_payload = lens_io._save_fp32_square_safetensors_atomic
     real_pointer = lens_io.write_json_atomic
 
     def record_payload(*args: object, **kwargs: object) -> str:
@@ -756,7 +760,7 @@ def test_checkpoint_payload_is_durable_before_pointer_publication(
         real_pointer(path, payload)
 
     monkeypatch.setattr(
-        lens_io, "_save_fp16_square_safetensors_atomic", record_payload,
+        lens_io, "_save_fp32_square_safetensors_atomic", record_payload,
     )
     monkeypatch.setattr(lens_io, "write_json_atomic", record_pointer)
     _save_checkpoint(

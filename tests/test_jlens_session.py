@@ -183,7 +183,7 @@ def test_terminal_checkpoint_is_promoted_without_second_tensor_write(
     import saklas.io.lens as lens_io
     from saklas.io import packs
 
-    real_save = lens_io._save_fp16_square_safetensors_atomic
+    real_save = lens_io._save_fp32_square_safetensors_atomic
     writes = 0
     hashes = 0
 
@@ -193,7 +193,7 @@ def test_terminal_checkpoint_is_promoted_without_second_tensor_write(
         return real_save(*args, **kwargs)
 
     monkeypatch.setattr(
-        lens_io, "_save_fp16_square_safetensors_atomic", _counting_save,
+        lens_io, "_save_fp32_square_safetensors_atomic", _counting_save,
     )
     real_hash = packs.hash_file
 
@@ -718,11 +718,11 @@ def test_fit_jlens_resumes_from_partial_and_matches_full_fit() -> None:
     assert any("resuming from 2 prompts" in m for m in messages)
     assert any("prompt 4/4" in m for m in messages)
     assert resumed.n_prompts == len(_PROMPTS)
-    # the resume base round-trips through the fp16 artifact — half-precision
-    # tolerance against the pure-fp32 from-scratch fit
+    # The resume base round-trips losslessly through the fp32 artifact. Allow
+    # only ordinary accumulation-order noise against the from-scratch fit.
     for layer in full.source_layers:
         assert torch.allclose(
-            resumed.jacobians[layer], full.jacobians[layer], atol=2e-3,
+            resumed.jacobians[layer], full.jacobians[layer], atol=1e-6,
         ), f"layer {layer}: resumed fit diverges from the from-scratch fit"
 
 

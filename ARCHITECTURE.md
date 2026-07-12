@@ -960,19 +960,19 @@ interrupted shorter corpus can be extended without fabricating the future full
 hash or restarting. Sparse layer top-ups reuse the unchanged durable shard
 pointers and write only new matrices. A transaction-scoped verified-pointer
 proof avoids rehashing just-loaded reuse shards; unverified callers still hash.
-Fresh same-corpus subset no-ops materialize only their requested v4 shards and
-leave the full durable union published. Since v4 records one corpus progress for
+Fresh same-corpus subset no-ops materialize only their requested v6 shards and
+leave the full durable union published. Since v6 records one corpus progress for
 all layers, extending a strict subset of a durable superset is rejected before
 matrix load unless the caller requests the full union or explicitly forces
 replacement; carrying unrequested old-prefix layers would make that progress
 false. Missing-layer top-ups preserve the full unchanged union, while selected
 resume views release their source containers before estimator entry.
 The streamed
-safetensors writer never retains a complete fp16 mapping. Normal corpus extension
+safetensors writer never retains a second complete tensor mapping. Normal corpus extension
 resumes from an exact token-id prefix; the default dataset is commit-pinned;
 exact source/live-model fingerprints invalidate mutable revisions. A complete
 terminal checkpoint is fsynced and promoted at finalization instead of being
-rewritten or immediately rehashed; otherwise each fp16 layer shard is streamed once, with its payload
+rewritten or immediately rehashed; otherwise each fp32 layer shard is streamed once, with its payload
 digest verified on final and checkpoint loads. Pointer-directory fsync follows
 pointer unlink before checkpoint/full-artifact shard GC and follows pointer
 publication before old-generation GC; fit preflight reaps crash-left streamed
@@ -980,7 +980,7 @@ temporaries. Exact no-op recovery removes a
 checkpoint left by a crash after final publication only when the final pointer
 provably subsumes its corpus, layers, estimator policy, and effective progress.
 The artifact (`io/lens.py`,
-`models/<safe_id>/jlens.json` plus fp16 layer shards) then supports four
+`models/<safe_id>/jlens.json` plus fp32 layer shards) then supports four
 consumers with zero hot-path cost when unused:
 
 - the **readout** `softmax(W_U · norm(J_l h))` (`session.jlens_readout`

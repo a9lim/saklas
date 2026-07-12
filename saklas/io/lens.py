@@ -7,10 +7,10 @@ than under ``manifolds/``:
     ~/.saklas/models/<safe_model_id>/jlens.layer-<L>.gen-<id>.safetensors
     ~/.saklas/models/<safe_model_id>/jlens.json          # atomic shard pointer
 
-fp16 on disk (the reference-repo convention — J entries are O(1), so range is
-no constraint and fp16's extra mantissa bits beat bf16; this deliberately
-differs from the neutral cache's fp32 invariant, which exists because that
-cache feeds a covariance inversion). Promoted to fp32 on load.
+fp32 on disk and in memory, matching saklas' fitted manifold, subspace, profile,
+and neutral-activation artifacts. Keeping the estimator's fp32 accumulator
+lossless across persistence also makes resumed fits numerically consistent with
+uninterrupted fits.
 
 The sidecar records the token-id corpus sha256 + loaded-model fingerprint so a
 different corpus or mutable model revision reads as stale, and ``n_prompts`` so an interrupted fit can resume
@@ -40,7 +40,7 @@ from saklas.io.paths import model_dir
 
 log = logging.getLogger(__name__)
 
-LENS_FORMAT_VERSION = 5
+LENS_FORMAT_VERSION = 6
 _LENS_NAME = "jlens"
 _LENS_CHECKPOINT_NAME = "jlens.partial"
 _LENS_METHOD = "jlens_cotangent_sum"
@@ -378,7 +378,7 @@ def _load_sidecar_at(
             )
             or source_layers_raw != sorted(set(source_layers_raw))
             or sidecar["method"] != _LENS_METHOD
-            or sidecar["dtype"] != "float16"
+            or sidecar["dtype"] != "float32"
             or any(
                 not isinstance(sidecar[key], str) or not sidecar[key]
                 for key in ("corpus_spec", "corpus_sha256", "corpus_hash_kind")
@@ -475,8 +475,8 @@ def _load_sidecar_at(
                     view = tensors.get_slice(key)
                     if tuple(view.get_shape()) != (d_model, d_model):
                         raise ValueError(f"{key} shape does not match sidecar")
-                    if view.get_dtype() != "F16":
-                        raise ValueError(f"{key} is not float16")
+                    if view.get_dtype() != "F32":
+                        raise ValueError(f"{key} is not float32")
         return sidecar
     except Exception as exc:
         log.warning("Corrupt %s sidecar for %s; ignoring: %s", label, model_id, exc)
@@ -522,7 +522,7 @@ def save_lens(
     """Persist a fitted lens and atomically point at its layer generations.
 
     ``reuse_layers`` names matrices known to be byte-identical to the current
-    durable artifact (the missing-layer top-up path). Valid v4 shard pointers
+    durable artifact (the missing-layer top-up path). Valid v6 shard pointers
     are carried forward; every other layer is converted and written anew.
     """
     anchor, sc_path = _lens_anchor_paths(model_id)
@@ -572,7 +572,7 @@ def save_lens_checkpoint_accumulator(
     """Write a self-contained checkpoint directly from raw estimator sums.
 
     Normalization and optional prefix merging happen one layer at a time while
-    converting to fp16, avoiding an extra full-fp32 ``JacobianLens``. The shard has
+    streaming fp32 rows, avoiding an extra full-fp32 ``JacobianLens``. The shard has
     ``base_n_prompts=0`` and can therefore survive any number of interruptions
     without depending on a separate full artifact.
     """
@@ -687,7 +687,7 @@ def _save_lens_components(
         value = jacobians[idx][start:end].to(device="cpu", dtype=torch.float32)
         if raw_sum_count is not None:
             # Stripe-local arithmetic: checkpointing never clones a complete
-            # fp32 layer or keeps a complete fp16 artifact mapping alive.
+            # fp32 layer or keeps a complete artifact mapping alive.
             value = value.clone()
             if average_base is not None:
                 value.add_(
@@ -695,7 +695,7 @@ def _save_lens_components(
                     alpha=average_base.n_prompts,
                 )
             value.mul_(1.0 / max(int(n_prompts), 1))
-        return value.to(torch.float16).contiguous()
+        return value.contiguous()
 
     reuse_set = {int(layer) for layer in reuse_layers or ()}
     tensor_files: dict[str, str] = {}
@@ -747,7 +747,7 @@ def _save_lens_components(
             if str(layer) in tensor_files:
                 continue
             generation_path = _new_layer_generation(ts_path, layer)
-            digest = _save_fp16_square_safetensors_atomic(
+            digest = _save_fp32_square_safetensors_atomic(
                 generation_path, [layer], d_model, _rows, durable=durable,
             )
             created.append(generation_path)
@@ -763,7 +763,7 @@ def _save_lens_components(
         "n_prompts": int(n_prompts),
         "d_model": int(d_model),
         "source_layers": sorted(int(layer) for layer in jacobians),
-        "dtype": "float16",
+        "dtype": "float32",
         "corpus_spec": corpus_spec,
         "corpus_sha256": corpus_sha256,
         "corpus_hash_kind": corpus_hash_kind,
@@ -816,7 +816,7 @@ def _save_lens_components(
     return ts_path.parent / tensor_files[str(layer_ids[0])]
 
 
-def _save_fp16_square_safetensors_atomic(
+def _save_fp32_square_safetensors_atomic(
     path: Path,
     layers: list[int],
     d_model: int,
@@ -824,13 +824,13 @@ def _save_fp16_square_safetensors_atomic(
     *,
     durable: bool = True,
 ) -> str:
-    """Stream square fp16 layer tensors into one atomic safetensors file.
+    """Stream square fp32 layer tensors into one atomic safetensors file.
 
     ``safetensors.torch.save_file`` requires a complete tensor mapping, which
-    made checkpoint RSS include every fp16 layer alongside the fp32 estimator.
+    would make checkpoint RSS include another full lens beside the fp32 estimator.
     The wire format is deliberately simple: an 8-byte little-endian JSON-header
     length, a space-padded JSON header, then contiguous tensor payloads.  Writing
-    256-row fp16 stripes avoid a complete in-memory snapshot. Current writers
+    256-row fp32 stripes avoids a complete in-memory snapshot. Current writers
     call this once per layer.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -849,11 +849,11 @@ def _save_fp16_square_safetensors_atomic(
                 for start in range(0, d_model, 256):
                     block = rows(layer, start, min(start + 256, d_model))
                     expected = (min(start + 256, d_model) - start, d_model)
-                    if block.dtype != torch.float16 or tuple(block.shape) != expected:
+                    if block.dtype != torch.float32 or tuple(block.shape) != expected:
                         raise ValueError(
                             f"streamed layer {layer} rows have "
                             f"{tuple(block.shape)} {block.dtype}; expected "
-                            f"{expected} float16"
+                            f"{expected} float32"
                         )
                     # Both file.write and hashlib accept the buffer protocol;
                     # keep the stripe tensor alive and avoid allocating a
@@ -875,12 +875,12 @@ def _lens_safetensors_header(
     layers: list[int], d_model: int,
 ) -> tuple[bytes, bytes]:
     """Canonical writer header bytes, shared by save and load-time digest."""
-    bytes_per_layer = int(d_model) * int(d_model) * 2
+    bytes_per_layer = int(d_model) * int(d_model) * 4
     offset = 0
     header: dict[str, dict[str, object]] = {}
     for layer in sorted(layers):
         header[f"layer_{layer}"] = {
-            "dtype": "F16",
+            "dtype": "F32",
             "shape": [int(d_model), int(d_model)],
             "data_offsets": [offset, offset + bytes_per_layer],
         }
@@ -968,9 +968,9 @@ def promote_lens_checkpoint(
     """Promote a complete checkpoint to the durable lens without rewriting it.
 
     Terminal checkpoint cadence can coincide with successful fit completion.
-    That shard is already the complete fp16 artifact, including any resumed
+    That shard is already the complete fp32 artifact, including any resumed
     base, so serializing the fp32 in-memory lens again would duplicate a
-    potentially multi-GiB conversion and write.  Promote only after cheap exact
+    potentially multi-GiB write. Promote only after cheap exact
     identity checks; callers fall back to :func:`save_lens` on ``False``.
     """
     checkpoint_anchor, checkpoint_sc = _checkpoint_anchor_paths(model_id)
@@ -1091,7 +1091,7 @@ def _load_lens_at(
                 for layer in tensor_layers:
                     raw = tensors.get_tensor(f"layer_{layer}")
                     if (
-                        raw.dtype != torch.float16 or raw.ndim != 2
+                        raw.dtype != torch.float32 or raw.ndim != 2
                         or tuple(raw.shape) != (d_model, d_model)
                     ):
                         log.warning(

@@ -40,7 +40,7 @@ The J-lens is the template because it already solved the same problems:
   `~/.saklas/models/<safe_model_id>/sae/<release>.json`. One release resident
   per session in v1 (multi-release is an open question below). The release
   pins a hook layer (or small set); we do NOT sweep all layers — SAE residency
-  is per-layer expensive where the lens is cheap-ish (fp16 J_l per layer vs
+  is per-layer expensive where the lens is cheap-ish (fp32 J_l per layer vs
   d×F encoder/decoder pairs; a 16k-feature SAE on a 4b model is ~2×
   d_model×16k×2 bytes per layer).
   As built, the CLI also takes `-m <model>` because its process has no existing
