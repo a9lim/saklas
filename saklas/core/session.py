@@ -1824,8 +1824,8 @@ class SaklasSession:
         :meth:`fit_jlens` or ``saklas lens fit``. Returns a
         :class:`saklas.core.jlens.JacobianLens`.
         """
-        if getattr(self, "_generation_jlens_active", False):
-            return getattr(self, "_generation_jlens", None)
+        if self._generation_jlens_active:
+            return self._generation_jlens
 
         from saklas.io.lens import load_lens, load_lens_sidecar
 
@@ -1868,8 +1868,8 @@ class SaklasSession:
 
     def has_compatible_jlens(self) -> bool:
         """Whether lens metadata matches the currently loaded weights."""
-        if getattr(self, "_generation_jlens_active", False):
-            return getattr(self, "_generation_jlens", None) is not None
+        if self._generation_jlens_active:
+            return self._generation_jlens is not None
 
         from saklas.io.lens import load_lens, load_lens_sidecar
 
@@ -2271,7 +2271,7 @@ class SaklasSession:
                             and resident_layers
                             == {int(layer) for layer in sidecar["source_layers"]}
                             and resident_layers >= expected_set
-                            and getattr(self, "_jlens_identity", None)
+                            and self._jlens_identity
                             == _jlens_sidecar_identity(sidecar)
                         ):
                             existing = (resident, sidecar)
@@ -2765,12 +2765,9 @@ class SaklasSession:
         self, lens: "Any", layers: list[int], device: torch.device,
     ) -> torch.Tensor:
         cache = cast(
-            "dict[tuple[int, str, tuple[int, ...]], torch.Tensor] | None",
-            getattr(self, "_jlens_device_cache", None),
+            "dict[tuple[int, str, tuple[int, ...]], torch.Tensor]",
+            self._jlens_device_cache,
         )
-        if cache is None:
-            cache = {}
-            self._jlens_device_cache = cache
         key = (id(lens), str(device), tuple(layers))
         cached = cache.get(key)
         if cached is not None:
@@ -2784,7 +2781,7 @@ class SaklasSession:
 
     def _jlens_readout_modules(self) -> tuple[torch.Tensor, torch.nn.Module]:
         """Final unembedding + norm modules for J-lens readout logits."""
-        cached = getattr(self, "_jlens_readout_module_cache", None)
+        cached = self._jlens_readout_module_cache
         if cached is not None:
             return cached
         from saklas.core.model import get_final_norm, get_unembedding
@@ -2796,11 +2793,8 @@ class SaklasSession:
     def _jlens_decode_id(self, token_id: int) -> str:
         """Cache-backed single-token decode shared by every lens readout."""
         decode_cache = cast(
-            "dict[int, str] | None", getattr(self, "_jlens_decode_cache", None),
+            "dict[int, str]", self._jlens_decode_cache,
         )
-        if decode_cache is None:
-            decode_cache = {}
-            self._jlens_decode_cache = decode_cache
         tok = decode_cache.get(token_id)
         if tok is None:
             tok = str(self._tokenizer.decode([token_id]))
@@ -2812,10 +2806,7 @@ class SaklasSession:
         block, 1 = last) — the depth axis of the aggregate readout's
         center-of-mass statistic."""
         layer_tuple = tuple(int(layer) for layer in layers)
-        cache = getattr(self, "_jlens_depths_cache", None)
-        if cache is None:
-            cache = {}
-            self._jlens_depths_cache = cache
+        cache = self._jlens_depths_cache
         cached = cache.get(layer_tuple)
         if cached is not None:
             return cached
@@ -2830,10 +2821,7 @@ class SaklasSession:
         device: torch.device,
     ) -> torch.Tensor:
         """Device depth column for a fixed layer set, cached across decode steps."""
-        cache = getattr(self, "_jlens_depth_tensor_cache", None)
-        if cache is None:
-            cache = {}
-            self._jlens_depth_tensor_cache = cache
+        cache = self._jlens_depth_tensor_cache
         layer_tuple = tuple(int(layer) for layer in layers)
         key = (str(device), layer_tuple)
         cached = cache.get(key)
@@ -2852,10 +2840,7 @@ class SaklasSession:
         device: torch.device,
     ) -> torch.Tensor:
         """Device long selector tensor cached by value tuple and device."""
-        cache = getattr(self, "_readout_long_tensor_cache", None)
-        if cache is None:
-            cache = {}
-            self._readout_long_tensor_cache = cache
+        cache = self._readout_long_tensor_cache
         value_tuple = tuple(int(value) for value in values)
         key = (str(device), value_tuple)
         cached = cache.get(key)
@@ -8140,7 +8125,7 @@ class SaklasSession:
         # the hooked path.  CUDA keeps its existing graph-capture path untouched.
         gen_model = self._model
         steering_uses_compiled_offsets = bool(
-            getattr(self, "_steering_uses_compiled_offsets", False)
+            self._steering_uses_compiled_offsets
         )
         if self._compiled and self._device.type == "mps":
             compiled_clean = not self._capture.is_transient() and (
@@ -8288,7 +8273,7 @@ class SaklasSession:
             # masked at the source — generations run aggregate-only capture
             # (probes still report the end-of-gen aggregate) and only probe
             # gates can force a per-token subset.
-            _live_scores_on = getattr(self, "_live_probe_scores", True)
+            _live_scores_on = self._live_probe_scores
             _wants_live_token_scores = bool(
                 _live_scores_on
                 and on_token is not None
@@ -8493,12 +8478,12 @@ class SaklasSession:
                 or stop_list is not None
             )
             _has_lens_consumer = bool(
-                getattr(self, "_live_lens", None) is not None
+                self._live_lens is not None
                 and on_token is not None
                 and getattr(on_token, "_saklas_wants_lens_readout", False)
             )
             _has_sae_consumer = bool(
-                getattr(self, "_live_sae", None) is not None
+                self._live_sae is not None
                 and on_token is not None
                 and getattr(on_token, "_saklas_wants_sae_readout", False)
             )

@@ -52,7 +52,8 @@ def _mock_session():
     monitor = MagicMock()
     monitor.probe_names = []
     monitor.profiles = {}
-    session._monitor = monitor
+    monitor.manifolds = {}
+    session.monitor = monitor
     session._tokenizer = MagicMock()
     session._layers = []
     session.lock = asyncio.Lock()

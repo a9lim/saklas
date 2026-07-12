@@ -704,8 +704,8 @@ def _transfer_manifold_locked(
     maps each layer's affine subspace (``mean`` + ``basis`` rows, both in
     model space) through the supplied compact factorized affine alignment
     (the shape :func:`saklas.io.alignment.fit_alignment` produces), and writes a
-    transferred per-model tensor at the ``_from-<safe_src>`` filename
-    variant (``<safe_to>_from-<safe_from>.safetensors`` —
+    transferred per-model tensor at the ``_from-<encoded_src>`` filename
+    variant (``<safe_to>_from-<encode_release_id(from_model)>.safetensors`` —
     :func:`saklas.io.paths.tensor_filename`'s transfer suffix).
 
     Translation applies to points/means but not directions.  The mapped basis

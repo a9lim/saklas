@@ -105,15 +105,7 @@ def register_ws_stream(app: FastAPI) -> None:
         def _on_loom_event(event: object) -> None:
             if not isinstance(event, LoomMutated):
                 return
-            try:
-                tree = session.tree
-                added_nodes = [
-                    node_json(session, nid)
-                    for nid in event.added
-                    if tree.has(nid)
-                ]
-            except Exception:
-                added_nodes = []
+            added_nodes = [node_json(session, nid) for nid in event.added]
             mutated_payload: dict[str, Any] = {
                 "type": "tree_mutated",
                 "op": event.op,
@@ -130,18 +122,15 @@ def register_ws_stream(app: FastAPI) -> None:
             if event.op == "cast":
                 # Roster ops carry no node ids — inline the full roster
                 # (small) so clients reconcile without a refetch.
-                try:
-                    mutated_payload["cast"] = {
-                        label: member.to_dict()
-                        for label, member in session.tree.cast.items()
-                    }
-                except Exception:
-                    mutated_payload["cast"] = {}
+                mutated_payload["cast"] = {
+                    label: member.to_dict()
+                    for label, member in session.tree.cast.items()
+                }
             _queue_tree_event(mutated_payload)
         loom_unsub = session.events.subscribe(_on_loom_event)
 
         async def _tree_forwarder():
-            """Forward tree-mutated / node-created events as WS frames.
+            """Forward tree-mutated events as WS frames.
 
             Runs as a dedicated task for the connection's lifetime so
             tree mutations from any source (this WS, a REST route on a

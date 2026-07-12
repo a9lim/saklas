@@ -2273,6 +2273,7 @@ def test_trait_panel_renders_manifold_minimap_for_2d_box():
     """A 2-D BoxDomain manifold draws an ASCII mini-map.  The coord dot
     from the aggregate lands on a row that contains the ``●`` marker."""
     import torch
+    from saklas.core.manifold import BoxAxis, BoxDomain
     from saklas.core.results import ProbeReading
     from saklas.tui.trait_panel import TraitPanel
 
@@ -2296,8 +2297,8 @@ def test_trait_panel_renders_manifold_minimap_for_2d_box():
     panel._manifold_content = SimpleNamespace(update=content_writes.append)
 
     # Russell-style 2-D box: valence x arousal, each in [-1, 1].
-    ax = SimpleNamespace(periodic=False, period=1.0, lo=-1.0, hi=1.0)
-    domain = SimpleNamespace(intrinsic_dim=2, axes=(ax, ax))
+    ax = BoxAxis(name="axis", periodic=False, period=1.0, lo=-1.0, hi=1.0)
+    domain = BoxDomain((ax, ax))
     # Five nodes: corners + origin.  Use a real tensor so .tolist() works.
     coords = torch.tensor([
         [-1.0, -1.0], [-1.0, 1.0], [1.0, -1.0], [1.0, 1.0], [0.0, 0.0],

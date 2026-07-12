@@ -30,13 +30,15 @@ fitted tensors per model, distinguished by filename suffix — exactly one *kind
 per file:
 
 - `<safe_model>.safetensors` — raw DiM (canonical)
-- `<safe_model>_sae-<release>.safetensors` — fit in SAE feature space
-- `<safe_model>_from-<safe_src>.safetensors` — cross-model transfer
+- `<safe_model>_sae-<encoded_release>.safetensors` — fit in SAE feature space
+- `<safe_model>_from-<encoded_src>.safetensors` — cross-model transfer
 
 `tensor_filename(model_id, *, release=None, transferred_from=None)` +
 `sidecar_filename(...)` construct (the two kind kwargs are mutually exclusive);
 `parse_tensor_filename(name) → (safe_model, variant)` inverts, variant ∈ `None` /
-`sae-<release>` / `from-<safe_src>`. Separators
+`sae-<encoded_release>` / `from-<encoded_src>`. Both values use the canonical,
+reversible lowercase Base32 `encode_release_id` codec; the parser rejects a
+noncanonical target model or variant identity. Separators
 `_VARIANT_SEP_SAE`/`_FROM`. Role-augmented extraction still uses the expression
 suffix `:role-<name>`, but the role is baked into the corpus and the fit writes
 the canonical raw tensor; it is not a tensor-file variant. There is **no `pca` variant and no method

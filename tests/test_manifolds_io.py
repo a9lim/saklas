@@ -582,6 +582,7 @@ def test_manifold_sidecar_node_spread_round_trips(tmp_path: Path):
     payload.update({
         "method": "manifold_discover_pca",
         "saklas_version": "4.0.0",
+        "fitted_layers": [5, 12, 20],
         "node_spread_per_layer": {"5": 0.5, "12": 8.25, "20": 3.0},
     })
     path.write_text(json.dumps(payload))
@@ -887,6 +888,30 @@ def test_sidecar_rejects_unknown_fields(tmp_path: Path) -> None:
     path.write_text(json.dumps(payload))
 
     with pytest.raises(ManifoldFormatError, match="exact schema"):
+        ManifoldSidecar.load(path)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("mahalanobis_share_per_layer", {"garbage": 1.0}),
+        ("origin_per_layer", {"0": "not-coordinates"}),
+        ("topology_candidates", [42]),
+        ("components", {"0:x": {"selector": "x", "alpha": 1.0}}),
+        ("diagnostics", {"invented_metric": 1.0}),
+        ("hyperparams", {"invented_knob": 1}),
+    ],
+)
+def test_sidecar_rejects_malformed_nested_contracts(
+    tmp_path: Path, field: str, value: object,
+) -> None:
+    path = tmp_path / "model.json"
+    payload = _sidecar_payload()
+    payload["fitted_layers"] = [0]
+    payload[field] = value
+    path.write_text(json.dumps(payload))
+
+    with pytest.raises(ManifoldFormatError):
         ManifoldSidecar.load(path)
 
 
@@ -2061,7 +2086,7 @@ def test_rectangular_affine_transfer_preserves_points_frame_and_steering(
         layers={0: LayerSubspace.affine(
             torch.tensor([0.5, -1.0, 2.0, 0.25]), basis,
             node_coords=node_coords,
-        )},
+        )}, mahalanobis_share={0: 1.0},
     )
     dense = torch.tensor([
         [2.0, 0.2, 0.0, 0.0], [0.0, 0.5, 0.0, 0.0],
@@ -2159,7 +2184,7 @@ def test_rectangular_transfer_rejects_collapsed_subspace_rank() -> None:
         layers={0: LayerSubspace.affine(
             torch.zeros(3), torch.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]),
             node_coords=torch.tensor([[0.0, 0.0], [1.0, 1.0]]),
-        )},
+        )}, mahalanobis_share={0: 1.0},
     )
     collapsed = torch.tensor([[1.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
     alignment = LayerAlignment(collapsed, torch.eye(3), torch.zeros(2))
@@ -2185,7 +2210,7 @@ def test_rectangular_transfer_rejects_oblique_rank_collapse() -> None:
         node_labels=["a", "b", "c"], node_coords=torch.eye(3),
         layers={0: LayerSubspace.affine(
             torch.zeros(3), torch.eye(3), node_coords=torch.eye(3),
-        )},
+        )}, mahalanobis_share={0: 1.0},
     )
     generator = torch.Generator().manual_seed(30061)
     collapsed = (

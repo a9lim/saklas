@@ -44,23 +44,11 @@ class LiveProbesRequest(NativeRequest):
 def _probe_info(name: str, probe: Any) -> dict[str, Any]:
     """Serialize one attached probe (any rank) to JSON for the wire."""
     manifold = probe.manifold
-    try:
-        domain_spec = manifold.domain.to_spec()
-    except Exception:
-        domain_spec = {}
-    try:
-        intrinsic_dim = int(manifold.domain.intrinsic_dim)
-    except Exception:
-        intrinsic_dim = 0
-    try:
-        nc = manifold.node_coords
-        node_coords = nc.tolist() if nc is not None else None
-    except Exception:
-        node_coords = None
-    try:
-        is_affine = manifold_is_affine(manifold)
-    except Exception:
-        is_affine = False
+    domain_spec = manifold.domain.to_spec()
+    intrinsic_dim = int(manifold.domain.intrinsic_dim)
+    nc = manifold.node_coords
+    node_coords = nc.tolist() if nc is not None else None
+    is_affine = manifold_is_affine(manifold)
     return {
         "name": name,
         "manifold": manifold.name,

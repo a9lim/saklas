@@ -1544,3 +1544,19 @@ def test_save_load_affine_manifold_round_trip(
                 manifold.manifold_point(idx, (c,)),
                 atol=1e-4,
             )
+
+
+@pytest.mark.parametrize("node_coords", [torch.zeros(1, 2), torch.zeros(2, 1)])
+def test_affine_runtime_geometry_requires_exact_k_by_r(
+    node_coords: torch.Tensor,
+) -> None:
+    sub = LayerSubspace.affine(
+        torch.zeros(4), torch.eye(2, 4), node_coords=node_coords,
+    )
+    manifold = Manifold(
+        name="bad-affine", domain=CustomDomain(2),
+        node_labels=["a", "b"], node_coords=torch.zeros(2, 2),
+        layers={0: sub}, mahalanobis_share={0: 1.0},
+    )
+    with pytest.raises(ValueError, match="node_coords must have shape"):
+        manifold.validate_runtime_geometry()

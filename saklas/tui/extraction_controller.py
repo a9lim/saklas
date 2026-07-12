@@ -23,6 +23,7 @@ from typing import Any, Callable, TYPE_CHECKING
 
 from saklas.io.selectors import AmbiguousSelectorError, canonicalize_atom
 from saklas.core.errors import SaklasError
+from saklas.core.profile import ProfileError
 from saklas.tui.chat_panel import PendingItem
 from saklas.tui.vector_panel import MAX_ALPHA
 from saklas.tui.app import (
@@ -1066,12 +1067,12 @@ class ExtractionController:
             # Mahalanobis-only: ``cosine_similarity`` requires the session
             # whitener (the Euclidean path is gone).  Pairs whose shared
             # layers the whitener doesn't cover raise and are skipped.
-            whitener = getattr(self._app._session, "whitener", None)
+            whitener = self._app._session.whitener
             scores = {}
             for name, prof in others.items():
                 try:
                     scores[name] = target.cosine_similarity(prof, whitener=whitener)
-                except Exception:
+                except ProfileError:
                     continue
             if not scores:
                 chat.add_system_message("No comparable profiles (no shared layers).")
@@ -1092,7 +1093,7 @@ class ExtractionController:
             if b_name is None:
                 return
             # Mahalanobis-only (see the 1-arg branch above).
-            whitener = getattr(self._app._session, "whitener", None)
+            whitener = self._app._session.whitener
             try:
                 sim = all_profiles[a_name].cosine_similarity(
                     all_profiles[b_name], whitener=whitener,

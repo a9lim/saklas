@@ -158,3 +158,12 @@ def test_fold_directions_rejects_missing_neutral_mean():
         fold_directions_to_subspace(
             "m", directions, {}, whitener=_whitener([0, 1], d),
         )
+
+
+def test_fold_directions_rejects_all_zero_profile():
+    directions = {3: torch.zeros(4)}
+    with pytest.raises(ValueError, match="only zero vectors"):
+        fold_directions_to_subspace(
+            "zero", directions, {3: torch.zeros(4)},
+            whitener=_whitener([3], 4),
+        )

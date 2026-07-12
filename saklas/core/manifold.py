@@ -1273,8 +1273,22 @@ class LayerSubspace:
         """
         return self.node_params is None
 
-    def validate_structure(self, *, feature_space: str) -> None:
+    def validate_structure(
+        self, *, feature_space: str, expected_node_count: int,
+    ) -> None:
         """Validate the exact affine/curved discriminated tensor shape."""
+        if self.mean.ndim != 1:
+            raise ValueError("LayerSubspace mean must have shape (D,)")
+        if self.basis.ndim != 2 or self.basis.shape[0] < 1:
+            raise ValueError("LayerSubspace basis must have shape (R, D) with R >= 1")
+        rank, dim = self.basis.shape
+        if self.mean.shape[0] != dim:
+            raise ValueError("LayerSubspace mean dimension must match basis width")
+        if self.coord_offset.ndim != 1 or self.coord_scale.ndim != 1:
+            raise ValueError("LayerSubspace coordinate normalization must be vectors")
+        if self.coord_offset.shape != self.coord_scale.shape:
+            raise ValueError("LayerSubspace coord_offset/coord_scale shapes must match")
+        embed_dim = int(self.coord_offset.shape[0])
         surface = (self.node_params, self.rbf_weights, self.poly_coeffs)
         surface_present = tuple(value is not None for value in surface)
         sigma_present = (
@@ -1288,8 +1302,17 @@ class LayerSubspace:
         if not any(surface_present):
             if self.node_coords is None:
                 raise ValueError("affine LayerSubspace requires node_coords")
-            if self.affine_map is not None and self.affine_map.shape[1] != self.rank:
-                raise ValueError("affine_map output dimension must equal subspace rank")
+            if self.node_coords.shape != (expected_node_count, rank):
+                raise ValueError(
+                    "affine LayerSubspace node_coords must have shape (K, R)"
+                )
+            if self.affine_map is None:
+                if embed_dim != rank:
+                    raise ValueError(
+                        "affine LayerSubspace without affine_map requires m == R"
+                    )
+            elif self.affine_map.shape != (embed_dim, rank):
+                raise ValueError("affine_map must have shape (m, R)")
             if any(sigma_present):
                 raise ValueError("affine LayerSubspace cannot carry a sigma field")
             return
@@ -1299,6 +1322,22 @@ class LayerSubspace:
             )
         if feature_space == "raw" and not all(sigma_present):
             raise ValueError("raw curved LayerSubspace requires a sigma field")
+        assert self.node_params is not None
+        assert self.rbf_weights is not None
+        assert self.poly_coeffs is not None
+        if self.node_params.shape != (expected_node_count, embed_dim):
+            raise ValueError("curved node_params must have shape (K, m)")
+        if self.rbf_weights.shape != (expected_node_count, rank):
+            raise ValueError("curved rbf_weights must have shape (K, R)")
+        if self.poly_coeffs.shape != (embed_dim + 1, rank):
+            raise ValueError("curved poly_coeffs must have shape (m + 1, R)")
+        if all(sigma_present):
+            assert self.sigma_rbf_weights is not None
+            assert self.sigma_poly_coeffs is not None
+            if self.sigma_rbf_weights.shape != (expected_node_count, 1):
+                raise ValueError("sigma_rbf_weights must have shape (K, 1)")
+            if self.sigma_poly_coeffs.shape != (embed_dim + 1, 1):
+                raise ValueError("sigma_poly_coeffs must have shape (m + 1, 1)")
 
     @classmethod
     def affine(
@@ -1953,7 +1992,10 @@ class Manifold:
             )
         for idx, sub in self.layers.items():
             try:
-                sub.validate_structure(feature_space=self.feature_space)
+                sub.validate_structure(
+                    feature_space=self.feature_space,
+                    expected_node_count=len(self.node_labels),
+                )
             except ValueError as exc:
                 raise ValueError(
                     f"manifold {self.name!r} layer {idx}: {exc}"
@@ -2280,8 +2322,7 @@ def synthesize_subspace(
 
     Each **ablation** term is a per-layer ``(R_i, D)`` (or ``(D,)``) direction
     set to remove; its target is the origin (``0``).  ``neutral_means`` supplies
-    each layer's anchor (``mean``); a layer absent from it is skipped (no
-    anchor ⇒ no subspace).
+    each layer's anchor (``mean``); it must cover every participating layer.
 
     Per layer (over the union of layers any term touches):
 
@@ -5142,6 +5183,7 @@ def save_manifold(
         node_spread_per_layer=cast(
             dict[str, Any], metadata.get("node_spread_per_layer", {}),
         ),
+        fitted_layers=sorted(manifold.layers),
     )
     # Per-layer Mahalanobis share weight (whitened bake-score analogue).
     # Stored as ``{str(idx): float}`` like EV; absent when no whitener was
@@ -5164,7 +5206,7 @@ def save_manifold(
         "nodes_sha256", "sae_release", "sae_revision", "sae_fingerprint",
         "sae_ids_by_layer",
         "sae_full_coverage",
-        "model_fingerprint", "capture_sha256", "fitted_layers",
+        "model_fingerprint", "capture_sha256",
         "fit_policy_version",
         # Share-weighting metric ("mahalanobis" / "euclidean") — the
         # manifold analogue of the vector sidecar's ``bake`` field.
@@ -5500,8 +5542,9 @@ def transfer_manifold_subspaces(
     :func:`subspace_share` (``sqrt(Σ_k coordsᵀ (B_tgt Σ_tgt⁻¹ B_tgtᵀ) coords)``
     — the same formula the fit pipeline bakes).  A missing or non-covering
     whitener raises :class:`~saklas.core.mahalanobis.WhitenerError`; there is no
-    Euclidean rebake. For curved layers, the source neutral foot is transformed
-    through the same exact companion map, yielding the target-frame origin.
+    Euclidean rebake. For curved layers, the target neutral mean is projected
+    into the transferred frame and inverted on the transferred surface,
+    yielding the target-model origin directly.
 
     Folder-level format guards (empty alignment, source fit missing) are the
     caller's concern; this function raises only :class:`~saklas.core.
@@ -5512,6 +5555,8 @@ def transfer_manifold_subspaces(
     from dataclasses import replace as _dc_replace
 
     from saklas.core.mahalanobis import WhitenerError
+
+    src.validate_runtime_geometry()
 
     # Map each covered layer's subspace into target space.  ``M_L`` is
     # ``(D_tgt, D_src)`` so ``mean_tgt = M_L @ mean_src`` and each basis row
@@ -5683,11 +5728,13 @@ def transfer_manifold_subspaces(
         )
         new_origin[layer] = origin.reshape(-1).to(torch.float32)
 
-    return _dc_replace(
+    transferred = _dc_replace(
         src, layers=new_layers,
         mahalanobis_share=new_share,
         origin=new_origin,
     )
+    transferred.validate_runtime_geometry()
+    return transferred
 
 
 def _gn_step(

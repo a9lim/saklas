@@ -225,6 +225,7 @@ def _fast_batch_session():
     s._steering_uses_compiled_offsets = False
     s._last_per_token_scores = None
     s._last_result = None
+    s._readout_long_tensor_cache = {}
     s._internal_steering_pop = False
     s._active_role = None
     s._steering_composer = SteeringComposer(s)
@@ -793,6 +794,7 @@ class TestPrefixCacheEligibility:
         s_any._tokenizer = object()
         s_any._gen_state = object()
         s._capture_state = CaptureState(persistent=False)
+        s._steering_uses_compiled_offsets = False
         s_any._capture = SimpleNamespace(
             ingest_persistent=lambda: None,
             fire_step_sink=lambda: None,

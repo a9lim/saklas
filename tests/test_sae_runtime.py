@@ -53,6 +53,7 @@ def _session() -> SaklasSession:
     session._profiles = {}
     session._probe_hash_cache = {}
     session._analytics_cpu_cache = {}
+    session._readout_long_tensor_cache = {}
     session._capture = _Capture(torch.tensor([0.2, 3.0, 5.0, 1.0]))
     session._live_sae_active_for_generation = True
     session._invalidate_prefix_cache = lambda: None  # type: ignore[method-assign]

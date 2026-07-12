@@ -745,13 +745,11 @@ def test_fire_auto_regen_streams_into_shadow_column():
     items = []
     while not app._ui_token_queue.empty():
         items.append(app._ui_token_queue.get_nowait())
-    tok_items = [it for it in items if it[0] == "tok"]
+    from saklas.tui.app import _UiToken
+
+    tok_items = [it for it in items if isinstance(it, _UiToken)]
     assert len(tok_items) == 2, items
-    # Position 7 is the ``is_shadow`` tag.  Tuple shape:
-    # (kind, text, thinking, scores, perplexity, logprob, widget,
-    # is_shadow, probe_readings) — nine elements, the unified per-token
-    # ``ProbeReading`` dict in the tail slot.
-    assert all(it[7] is True for it in tok_items)
+    assert all(it.shadow is True for it in tok_items)
     # And the right column had its shadow widget mounted.
     app._chat_panel.start_shadow_message.assert_called_once_with(row)
 

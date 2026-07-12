@@ -460,11 +460,8 @@ def register_vector_routes(app: FastAPI) -> None:
         # in the web UI hits this for every selected name (vector or probe).
         profile = session.vectors.get(name)
         if profile is None:
-            try:
-                folded = probe_profile_tensors(session, name)
-                profile = Profile(folded) if folded is not None else None
-            except Exception:
-                profile = None
+            folded = probe_profile_tensors(session, name)
+            profile = Profile(folded) if folded is not None else None
         if profile is None:
             raise HTTPException(404, f"vector or probe '{name}' not found")
 

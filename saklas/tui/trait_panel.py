@@ -10,6 +10,7 @@ from textual.containers import VerticalScroll
 from textual.widgets import Static
 
 from saklas.core.histogram import HIST_BUCKETS, bucketize
+from saklas.core.manifold import BoxDomain
 from saklas.tui.selectable import SelectableListWidget
 from saklas.tui.utils import BAR_WIDTH, build_bar
 
@@ -449,19 +450,15 @@ class TraitPanel(SelectableListWidget):
         ``CustomDomain`` / ``SphereDomain`` map skipped (no meaningful
         rectangular layout).
         """
-        domain = getattr(manifold, "domain", None)
-        if domain is None:
+        domain = manifold.domain
+        if not isinstance(domain, BoxDomain) or domain.intrinsic_dim != 2:
             return ""
-        if getattr(domain, "intrinsic_dim", 0) != 2:
-            return ""
-        axes = getattr(domain, "axes", None)
-        if axes is None or len(axes) != 2:
-            return ""
+        axes = domain.axes
         # Resolve per-axis (lo, hi).  Periodic axes use [0, period].
         def _axis_bounds(ax: Any) -> tuple[float, float]:
-            if getattr(ax, "periodic", False):
-                return 0.0, float(getattr(ax, "period", 1.0))
-            return float(getattr(ax, "lo", 0.0)), float(getattr(ax, "hi", 1.0))
+            if ax.periodic:
+                return 0.0, float(ax.period)
+            return float(ax.lo), float(ax.hi)
         x_lo, x_hi = _axis_bounds(axes[0])
         y_lo, y_hi = _axis_bounds(axes[1])
         if not (math.isfinite(x_lo) and math.isfinite(x_hi)
@@ -485,7 +482,7 @@ class TraitPanel(SelectableListWidget):
 
         # Build the grid with node markers.
         grid = [[" " for _ in range(MINIMAP_W)] for _ in range(MINIMAP_H)]
-        coords = getattr(manifold, "node_coords", None)
+        coords = manifold.node_coords
         if coords is not None:
             try:
                 rows = coords.tolist()
@@ -504,7 +501,7 @@ class TraitPanel(SelectableListWidget):
             coord_dot = _project(float(agg.coords[0]), float(agg.coords[1]))
         elif live is not None and live.nearest:
             label = live.nearest[0][0]
-            labels = getattr(manifold, "node_labels", None) or []
+            labels = manifold.node_labels
             try:
                 idx = labels.index(label)
             except ValueError:

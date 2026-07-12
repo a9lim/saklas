@@ -128,6 +128,22 @@ def test_parse_tensor_filename_rejects_non_safetensors():
     assert paths.parse_tensor_filename("model.gguf") is None
 
 
+@pytest.mark.parametrize(
+    "filename",
+    [
+        ".safetensors",
+        "not-encoded.safetensors",
+        "_zYQ_sae-bad.safetensors",
+        "_zYQ_from-notencoded.safetensors",
+        "_zYQ_sae-.safetensors",
+    ],
+)
+def test_parse_tensor_filename_rejects_noncanonical_identities(
+    filename: str,
+) -> None:
+    assert paths.parse_tensor_filename(filename) is None
+
+
 @pytest.mark.parametrize("reserved", ["_sae-", "_from-", "_role-"])
 def test_tensor_filename_round_trips_reserved_separator_in_model_id(
     reserved: str,

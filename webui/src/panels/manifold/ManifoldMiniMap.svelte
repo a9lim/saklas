@@ -35,22 +35,14 @@
 
   let { info, trajectory, settled, size = 168 }: Props = $props();
 
-  /** Pull the two box-domain axes out of the probe row.  The caller
-   *  (``_isMiniMapCandidate``) guarantees this is a 2D box, so the
-   *  fallback ``[-1, 1]`` only fires on malformed wire data. */
+  /** Pull the exact two box-domain axes out of the probe row. The caller
+   *  (``_isMiniMapCandidate``) guarantees this is a 2D box. */
   const axes = $derived.by<[AxisSpec, AxisSpec]>(() => {
     const d = info.domain as { type?: string; axes?: AxisSpec[] };
-    if (d?.type === "box" && Array.isArray(d.axes) && d.axes.length >= 2) {
-      return [d.axes[0], d.axes[1]];
+    if (d?.type !== "box" || !Array.isArray(d.axes) || d.axes.length !== 2) {
+      throw new Error(`probe ${info.name} has invalid 2D box geometry`);
     }
-    const fallback = (name: string): AxisSpec => ({
-      name,
-      periodic: false,
-      period: 2,
-      lo: -1,
-      hi: 1,
-    });
-    return [fallback("axis_0"), fallback("axis_1")];
+    return [d.axes[0], d.axes[1]];
   });
 
   /** Normalise an authoring coord to ``[0, 1]`` along its axis.  Used for

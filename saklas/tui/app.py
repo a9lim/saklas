@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import queue
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable, Literal, TYPE_CHECKING, overload
 
@@ -47,6 +47,22 @@ if TYPE_CHECKING:
 DEFAULT_ALPHA = 0.5
 _POLL_FPS = 15
 _TOKEN_DRAIN_LIMIT = 20
+
+
+@dataclass(frozen=True)
+class _UiToken:
+    """One exact token event crossing the generation-thread/UI boundary."""
+
+    text: str
+    thinking: bool
+    scores: Any
+    perplexity: float | None
+    logprob: float | None
+    widget: Any
+    shadow: bool
+    probe_readings: Any = None
+    lens_readout: Any = None
+    lens_aggregate: Any = None
 
 _LEFT, _CHAT, _TRAIT = 0, 1, 2
 
@@ -1428,10 +1444,12 @@ class SaklasApp(App[None]):
                         # Optional 10th/11th slots: the live J-lens workspace
                         # readout (``/lens``) + its layer-aggregated chip
                         # list — None when the live lens is off.
-                        ("tok", event.text, event.thinking, event.probe_readings,
-                         event.perplexity, event.logprob, widget, False,
-                         event.probe_readings, event.lens_readout,
-                         event.lens_aggregate),
+                        _UiToken(
+                            event.text, event.thinking, event.probe_readings,
+                            event.perplexity, event.logprob, widget, False,
+                            event.probe_readings, event.lens_readout,
+                            event.lens_aggregate,
+                        ),
                     )
                     self._gen_token_count += 1
                 # Normal completion — pull per-token scores out of the
@@ -1647,7 +1665,7 @@ class SaklasApp(App[None]):
         )
 
         def _on_token(text: str, is_thinking: bool, tid: Any, lp: Any, top_alts: Any, perplexity: Any) -> None:
-            # Mirrors the ``("tok", …)`` tuple ``_start_generation`` builds
+            # Mirrors the exact event ``_start_generation`` builds
             # from a ``TokenEvent``.  ``prefill_assistant``'s on_token
             # carries no probe scores (no streaming monitor hook on this
             # path) — pass ``None``; ``_finalize_widget_highlight`` fills
@@ -1656,8 +1674,10 @@ class SaklasApp(App[None]):
             # prefill path; the trait-panel manifold section refreshes
             # from the end-of-gen aggregate via ``_finalize_widget_highlight``.
             self._ui_token_queue.put(
-                ("tok", text, bool(is_thinking), None, perplexity, lp,
-                 widget, False, None),
+                _UiToken(
+                    text, bool(is_thinking), None, perplexity, lp,
+                    widget, False,
+                ),
             )
             self._gen_token_count += 1
 
@@ -1904,46 +1924,28 @@ class SaklasApp(App[None]):
                 item = self._ui_token_queue.get_nowait()
             except queue.Empty:
                 break
-            kind = item[0]
-            if kind == "tok":
+            kind = "tok" if isinstance(item, _UiToken) else item[0]
+            if isinstance(item, _UiToken):
                 # Tagged with the target widget + ``is_shadow`` flag so
                 # steered and shadow streams route to the right column
                 # without a global "current" lookup.  Shadow streams
                 # bypass the gen-stat counters (token count, ppl) — those
                 # describe the steered run only.
-                # Logit-pass: 7-element tuple now (logprob between
-                # perplexity and widget).  Drives the surprise highlight
-                # mode + the per-token logprob storage on the widget.
-                # Probe pass: optional 9th slot carries
-                # ``event.probe_readings`` — ``None`` when no probe is
+                # The typed event carries all token channels. Probe readings
+                # are ``None`` when no probe is
                 # attached or ``live_scores`` is off; otherwise the full
                 # per-probe ``ProbeReading`` dict the trait panel's curved
-                # section renders mid-gen.  Falls back to ``None`` for legacy
-                # producers (e.g. test stubs) that emit the 8-element form.
-                manifold_readings = None
-                lens_readout = None
-                lens_aggregate = None
-                if len(item) >= 11:
-                    (
-                        _, token, is_thinking, scores, perplexity, logprob,
-                        widget, is_shadow, manifold_readings, lens_readout,
-                        lens_aggregate,
-                    ) = item
-                elif len(item) >= 10:
-                    (
-                        _, token, is_thinking, scores, perplexity, logprob,
-                        widget, is_shadow, manifold_readings, lens_readout,
-                    ) = item
-                elif len(item) >= 9:
-                    (
-                        _, token, is_thinking, scores, perplexity, logprob,
-                        widget, is_shadow, manifold_readings,
-                    ) = item
-                else:
-                    (
-                        _, token, is_thinking, scores, perplexity, logprob,
-                        widget, is_shadow,
-                    ) = item
+                # section renders mid-gen.
+                token = item.text
+                is_thinking = item.thinking
+                scores = item.scores
+                perplexity = item.perplexity
+                logprob = item.logprob
+                widget = item.widget
+                is_shadow = item.shadow
+                manifold_readings = item.probe_readings
+                lens_readout = item.lens_readout
+                lens_aggregate = item.lens_aggregate
                 if manifold_readings is not None and not is_shadow:
                     # Push live readings to the trait panel.  The dict carries
                     # every probe's ``ProbeReading``; only curved probes
@@ -2556,20 +2558,20 @@ class SaklasApp(App[None]):
         """
         probe = self._trait_panel.get_selected_probe()
         monitor = self._session.monitor
-        if probe is None or monitor is None or probe not in monitor.manifolds:
+        if probe is None or probe not in monitor.manifolds:
             self._trait_panel.update_why(None, [])
             return
         manifold = monitor.manifolds[probe]
         layer_norms: list[tuple[int, float]]
-        try:
+        if all(sub.is_affine and sub.rank == 1 for sub in manifold.layers.values()):
             from saklas.core.vectors import folded_vector_directions
             profile = folded_vector_directions(manifold)
             layer_norms = sorted(
                 (int(lidx), float(t.norm().item()))
                 for lidx, t in profile.items()
             )
-        except Exception:
-            share = getattr(manifold, "mahalanobis_share", None) or {}
+        else:
+            share = manifold.mahalanobis_share
             layer_norms = sorted(
                 (int(lidx), float(v)) for lidx, v in share.items()
             )
@@ -2914,9 +2916,12 @@ class SaklasApp(App[None]):
                 )
                 for event in stream:
                     self._ui_token_queue.put(
-                        ("tok", event.text, event.thinking, event.probe_readings,
-                         event.perplexity, event.logprob, widget, True,
-                         event.probe_readings),
+                        _UiToken(
+                            event.text, event.thinking, event.probe_readings,
+                            event.perplexity, event.logprob, widget, True,
+                            event.probe_readings, event.lens_readout,
+                            event.lens_aggregate,
+                        ),
                     )
                 self._ui_token_queue.put(("finalize", widget, True))
             except BaseException as e:
@@ -3150,9 +3155,12 @@ class SaklasApp(App[None]):
                 )
                 for event in stream:
                     self._ui_token_queue.put(
-                        ("tok", event.text, event.thinking, event.probe_readings,
-                         event.perplexity, event.logprob, widget, True,
-                         event.probe_readings),
+                        _UiToken(
+                            event.text, event.thinking, event.probe_readings,
+                            event.perplexity, event.logprob, widget, True,
+                            event.probe_readings, event.lens_readout,
+                            event.lens_aggregate,
+                        ),
                     )
                 self._ui_token_queue.put(("finalize", widget, True))
             except BaseException as e:

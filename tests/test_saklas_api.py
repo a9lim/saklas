@@ -329,13 +329,22 @@ class TestProbes:
 
     def test_attach(self, session_and_client: Any) -> None:
         from types import SimpleNamespace
+        import torch
 
         session, client = session_and_client
         # Unified attach: body-carried selector → session.add_probe, 201 + info.
         mani = SimpleNamespace(
-            name="happy", layers={0: None}, node_labels=["+"],
+            name="happy",
+            layers={0: SimpleNamespace(is_affine=True)},
+            node_labels=["+"],
+            node_coords=torch.zeros(1, 1),
             feature_space="model",
-            domain=SimpleNamespace(to_spec=lambda: {}, intrinsic_dim=1),
+            domain=SimpleNamespace(
+                to_spec=lambda: {
+                    "type": "custom", "dimensions": 1, "bounds": None,
+                },
+                intrinsic_dim=1,
+            ),
         )
         session.add_probe.return_value = "happy"
         session.monitor.attached_probes.return_value = {

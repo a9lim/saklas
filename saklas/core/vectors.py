@@ -951,6 +951,9 @@ def fold_directions_to_subspace(
         layers[idx] = LayerSubspace.affine(mean, basis, node_coords=node_coords_L)
         mahalanobis_share[idx] = float(whitener.mahalanobis_norm(idx, d))
 
+    if not layers:
+        raise ValueError("cannot fold a direction profile containing only zero vectors")
+
     # Shared display layout: a single ``+`` pole at coord 1 (the real per-layer
     # pole distance ‖d_L‖ lives on each ``LayerSubspace.node_coords``).
     node_coords = torch.tensor([[1.0]], dtype=torch.float32, device=dev)
@@ -966,6 +969,7 @@ def fold_directions_to_subspace(
         mahalanobis_share=mahalanobis_share,
     )
     manifold.metadata["share_metric"] = "mahalanobis"
+    manifold.validate_runtime_geometry()
     return manifold
 
 

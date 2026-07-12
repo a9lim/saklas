@@ -274,5 +274,15 @@ def parse_tensor_filename(
         index, separator, kind = min(matches, key=lambda item: item[0])
         model = _decode_tensor_component(stem[:index])
         value = _decode_tensor_component(stem[index + len(separator):])
+        try:
+            unsafe_model_id(model)
+            decode_release_id(value)
+        except ValueError:
+            return None
         return model, f"{kind}-{value}"
-    return _decode_tensor_component(stem), None
+    model = _decode_tensor_component(stem)
+    try:
+        unsafe_model_id(model)
+    except ValueError:
+        return None
+    return model, None

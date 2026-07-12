@@ -283,6 +283,131 @@ MANIFOLD_SIDECAR_FIELDS = {
 }
 
 
+def _finite_number(value: Any) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(float(value))
+    )
+
+
+def _validate_layer_map(
+    value: Any, *, location: str, field: str, fitted: set[int],
+    validate_value: Any, require_fitted: bool = True,
+) -> None:
+    if not isinstance(value, dict):
+        raise ManifoldFormatError(f"{location} field {field!r} must be an object")
+    for raw_layer, item in value.items():
+        if (
+            not isinstance(raw_layer, str)
+            or not raw_layer.isascii()
+            or not raw_layer.isdecimal()
+            or str(int(raw_layer)) != raw_layer
+            or require_fitted and int(raw_layer) not in fitted
+        ):
+            raise ManifoldFormatError(
+                f"{location} field {field!r} has invalid fitted-layer key {raw_layer!r}"
+            )
+        if not validate_value(item):
+            raise ManifoldFormatError(
+                f"{location} field {field!r} has invalid value for layer {raw_layer}"
+            )
+
+
+def _validate_hyperparams(data: dict[str, Any], *, location: str) -> None:
+    params = data["hyperparams"]
+    mode = data["fit_mode"]
+    if not isinstance(params, dict):
+        raise ManifoldFormatError(f"{location} hyperparams must be an object")
+    if mode in {"authored", "baked"}:
+        if params:
+            raise ManifoldFormatError(f"{location} {mode} fit cannot carry hyperparams")
+        return
+    sanitize_hyperparams(mode, params)
+    int_keys = {"max_dim", "min_dim", "k_nn", "max_subspace_dim"}
+    float_keys = {"var_threshold", "bandwidth", "persistence_frac"}
+    for key, value in params.items():
+        valid = (
+            isinstance(value, int) and not isinstance(value, bool) and value > 0
+            if key in int_keys else
+            _finite_number(value)
+            if key in float_keys else
+            value == "auto" or _finite_number(value)
+            if key == "smoothing" else False
+        )
+        if not valid:
+            raise ManifoldFormatError(
+                f"{location} hyperparameter {key!r} has invalid value {value!r}"
+            )
+
+
+def _validate_diagnostics(value: Any, *, location: str) -> None:
+    if not isinstance(value, dict):
+        raise ManifoldFormatError(f"{location} diagnostics must be an object")
+    allowed = {
+        "per_component_variance", "cumulative_variance", "eigenvalues",
+        "picked_k", "gap_index", "k_nn", "component_count", "heuristic_k",
+        "threshold", "gap_magnitude", "bandwidth", "pinned", "min_dim",
+    }
+    if set(value) - allowed:
+        raise ManifoldFormatError(f"{location} diagnostics has unknown fields")
+    list_keys = {"per_component_variance", "cumulative_variance", "eigenvalues"}
+    int_keys = {"picked_k", "gap_index", "k_nn", "component_count", "heuristic_k", "min_dim"}
+    for key, item in value.items():
+        valid = (
+            isinstance(item, list) and bool(item) and all(_finite_number(v) for v in item)
+            if key in list_keys else
+            isinstance(item, int) and not isinstance(item, bool) and item >= 0
+            if key in int_keys else
+            isinstance(item, bool)
+            if key == "pinned" else
+            _finite_number(item)
+        )
+        if not valid:
+            raise ManifoldFormatError(f"{location} diagnostics field {key!r} is invalid")
+
+
+def _validate_topology_candidates(value: Any, *, location: str) -> None:
+    if not isinstance(value, list):
+        raise ManifoldFormatError(f"{location} topology_candidates must be an array")
+    fields = {"name", "fit_mode", "intrinsic_dim", "score", "viable", "reason"}
+    for candidate in value:
+        if not isinstance(candidate, dict) or set(candidate) != fields:
+            raise ManifoldFormatError(f"{location} has invalid topology candidate schema")
+        if (
+            not isinstance(candidate["name"], str) or not candidate["name"]
+            or candidate["fit_mode"] not in {"pca", "spectral"}
+            or isinstance(candidate["intrinsic_dim"], bool)
+            or not isinstance(candidate["intrinsic_dim"], int)
+            or candidate["intrinsic_dim"] < 1
+            or candidate["score"] is not None and not _finite_number(candidate["score"])
+            or not isinstance(candidate["viable"], bool)
+            or candidate["reason"] is not None and not isinstance(candidate["reason"], str)
+        ):
+            raise ManifoldFormatError(f"{location} has invalid topology candidate values")
+
+
+def _validate_components(value: Any, *, location: str) -> None:
+    if value is None:
+        return
+    if not isinstance(value, dict) or not value:
+        raise ManifoldFormatError(f"{location} components must be null or non-empty object")
+    fields = {"selector", "alpha", "tensor_sha256"}
+    for coord, item in value.items():
+        if (
+            not isinstance(coord, str) or not coord
+            or not isinstance(item, dict) or set(item) != fields
+            or not isinstance(item["selector"], str) or not item["selector"]
+            or not _finite_number(item["alpha"])
+            or item["tensor_sha256"] is not None and (
+                not isinstance(item["tensor_sha256"], str)
+                or len(item["tensor_sha256"]) != 64
+                or any(c not in "0123456789abcdef" for c in item["tensor_sha256"])
+            )
+        ):
+            raise ManifoldFormatError(f"{location} has invalid component provenance")
+
+
 def validate_manifold_sidecar_payload(
     data: Any, *, location: str = "manifold sidecar",
 ) -> dict[str, Any]:
@@ -309,13 +434,8 @@ def validate_manifold_sidecar_payload(
         or len(set(labels)) != len(labels)
     ):
         raise ManifoldFormatError(f"{location} has invalid node identity")
-    map_fields = (
-        "hyperparams", "diagnostics", "node_spread_per_layer",
-        "mahalanobis_share_per_layer", "origin_per_layer", "sae_ids_by_layer",
-        "rbf_smoothing_per_layer", "sigma_field_per_layer",
-    )
-    if any(not isinstance(data[key], dict) for key in map_fields):
-        raise ManifoldFormatError(f"{location} has a non-object mapping field")
+    _validate_hyperparams(data, location=location)
+    _validate_diagnostics(data["diagnostics"], location=location)
     if not isinstance(data["sae_full_coverage"], bool):
         raise ManifoldFormatError(f"{location} sae_full_coverage must be bool")
     nullable_strings = (
@@ -349,16 +469,53 @@ def validate_manifold_sidecar_payload(
         or fitted != sorted(set(fitted))
     ):
         raise ManifoldFormatError(f"{location} has invalid fitted_layers")
+    fitted_set = set(fitted)
+    for field_name in ("node_spread_per_layer", "mahalanobis_share_per_layer"):
+        _validate_layer_map(
+            data[field_name], location=location, field=field_name, fitted=fitted_set,
+            validate_value=lambda value: _finite_number(value) and float(value) >= 0,
+        )
+    _validate_layer_map(
+        data["origin_per_layer"], location=location, field="origin_per_layer",
+        fitted=fitted_set,
+        validate_value=lambda value: (
+            isinstance(value, list) and bool(value)
+            and all(_finite_number(coord) for coord in value)
+        ),
+    )
+    _validate_layer_map(
+        data["sae_ids_by_layer"], location=location, field="sae_ids_by_layer",
+        fitted=fitted_set,
+        validate_value=lambda value: (
+            isinstance(value, str) and bool(value)
+        ),
+        require_fitted=False,
+    )
+    _validate_layer_map(
+        data["rbf_smoothing_per_layer"], location=location,
+        field="rbf_smoothing_per_layer", fitted=fitted_set,
+        validate_value=lambda value: (
+            isinstance(value, dict) and set(value) == {"lambda", "edf", "gcv"}
+            and all(_finite_number(item) for item in value.values())
+        ),
+    )
+    _validate_layer_map(
+        data["sigma_field_per_layer"], location=location,
+        field="sigma_field_per_layer", fitted=fitted_set,
+        validate_value=lambda value: (
+            isinstance(value, dict)
+            and set(value) == {"sigma_mean", "sigma_min", "sigma_max", "lambda"}
+            and all(_finite_number(item) and float(item) >= 0 for item in value.values())
+        ),
+    )
     roles, kinds = data["node_roles"], data["node_kinds"]
     if not isinstance(roles, list) or not isinstance(kinds, list) or len(roles) != len(labels) or len(kinds) != len(labels):
         raise ManifoldFormatError(f"{location} node provenance is misaligned")
     for label, role, kind in zip(labels, roles, kinds, strict=True):
         _validate_node_role(data["name"], label, role)
         _validate_node_kind(data["name"], label, kind)
-    if not isinstance(data["topology_candidates"], list):
-        raise ManifoldFormatError(f"{location} topology_candidates must be an array")
-    if data["components"] is not None and not isinstance(data["components"], dict):
-        raise ManifoldFormatError(f"{location} components must be null or object")
+    _validate_topology_candidates(data["topology_candidates"], location=location)
+    _validate_components(data["components"], location=location)
     return data
 
 
@@ -368,6 +525,7 @@ def canonical_manifold_sidecar_payload(
     hyperparams: dict[str, Any] | None = None,
     diagnostics: dict[str, Any] | None = None,
     node_spread_per_layer: dict[str, Any] | None = None,
+    fitted_layers: list[int] | None = None,
 ) -> dict[str, Any]:
     """Build the one exact current fitted-manifold sidecar shape."""
     count = len(node_labels)
@@ -383,7 +541,7 @@ def canonical_manifold_sidecar_payload(
         "nodes_sha256": None, "sae_release": None, "sae_revision": None,
         "sae_fingerprint": None, "sae_ids_by_layer": {},
         "sae_full_coverage": False, "model_fingerprint": None,
-        "capture_sha256": None, "fitted_layers": [],
+        "capture_sha256": None, "fitted_layers": list(fitted_layers or []),
         "fit_policy_version": None, "share_metric": None,
         "subspace_metric": None, "rbf_smoothing_per_layer": {},
         "sigma_field_per_layer": {}, "resolved_fit_mode": None,

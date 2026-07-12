@@ -416,7 +416,5 @@ def test_legacy_projected_bake_requires_rebake(
         }
     }
     sidecar_path.write_text(__import__("json").dumps(payload))
-    mf = ManifoldFolder.load(folder, verify_manifest=False)
-    mf.update_file_hashes(sidecar_path, tensor_path)
-    with pytest.raises(Exception, match="legacy projected bake"):
-        load_manifold(tensor_path)
+    with pytest.raises(Exception, match="invalid component provenance"):
+        ManifoldFolder.load(folder, verify_manifest=False)
