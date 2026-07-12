@@ -1595,6 +1595,49 @@ def test_lifecycle_mutations_wait_for_stable_pair_lock(
     assert done.is_set()
 
 
+def test_force_authoring_reset_waits_for_stable_pair_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from saklas.io.manifold_folder import manifold_pair_lock
+
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    folder = create_discover_manifold_folder(
+        "local", "mood", "", fit_mode="pca",
+        node_corpora={"old": ["old response"]},
+    )
+    fitted = _fake_fit_tensor(folder, "google/gemma-3-4b-it")
+    started = threading.Event()
+    done = threading.Event()
+    errors: list[BaseException] = []
+
+    def reset() -> None:
+        started.set()
+        try:
+            plan_discover_generation(
+                folder, "mood", "", fit_mode="pca", labels=["new"],
+                force=True,
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+        finally:
+            done.set()
+
+    with manifold_pair_lock(fitted):
+        worker = threading.Thread(target=reset)
+        worker.start()
+        assert started.wait(1.0)
+        assert not done.wait(0.1)
+        assert fitted.exists()
+    worker.join(timeout=2.0)
+
+    assert not worker.is_alive()
+    assert errors == []
+    assert done.is_set()
+    assert not fitted.exists()
+    manifest = json.loads((folder / "manifold.json").read_text())
+    assert manifest["nodes"] == [{"label": "new"}]
+
+
 # ============================================================ B6a: transfer ===
 #
 # transfer_manifold applies a GIVEN per-layer Procrustes map to a fitted
@@ -2527,6 +2570,62 @@ def test_baked_manifold_round_trip(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     (tensor,) = list(folder.glob("*.safetensors"))
     folded = folded_vector_directions(load_manifold(tensor))
     assert set(folded) == set(directions)
+
+
+def test_baked_first_publication_retry_repairs_unproven_pair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    manifold, _directions = _baked_manifold("merged")
+    real_update = ManifoldFolder.update_file_hashes
+    failed = False
+
+    def fail_once(self: ManifoldFolder, *paths: Path) -> None:
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise OSError("injected baked manifest failure")
+        real_update(self, *paths)
+
+    monkeypatch.setattr(ManifoldFolder, "update_file_hashes", fail_once)
+    with pytest.raises(OSError, match="injected"):
+        create_baked_manifold_folder(
+            "local", "merged", "", manifold, "test/model",
+            method="merge", model_fingerprint="fp:test/model",
+        )
+
+    folder, _mf = create_baked_manifold_folder(
+        "local", "merged", "", manifold, "test/model",
+        method="merge", model_fingerprint="fp:test/model",
+    )
+    loaded = ManifoldFolder.load(folder)
+    assert loaded.tensor_models() == ["test__model"]
+
+
+def test_baked_force_replaces_manifestless_partial_folder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    from saklas.io.paths import manifold_dir
+
+    folder = manifold_dir("local", "merged")
+    folder.mkdir(parents=True)
+    (folder / "stale.safetensors").write_bytes(b"partial")
+    (folder / "stale.json").write_text("{bad sidecar")
+    manifold, _directions = _baked_manifold("merged")
+
+    with pytest.raises(FileExistsError, match="incomplete"):
+        create_baked_manifold_folder(
+            "local", "merged", "", manifold, "test/model",
+            method="merge", model_fingerprint="fp:test/model",
+        )
+
+    created, _mf = create_baked_manifold_folder(
+        "local", "merged", "", manifold, "test/model",
+        method="merge", model_fingerprint="fp:test/model", force=True,
+    )
+    assert not (created / "stale.safetensors").exists()
+    assert ManifoldFolder.load(created).tensor_models() == ["test__model"]
 
 
 def test_baked_manifold_clear_and_scoped_refresh_refused(

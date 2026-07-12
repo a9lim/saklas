@@ -34,7 +34,7 @@ import torch
 from safetensors import safe_open
 
 from saklas.core.jlens import JacobianLens
-from saklas.io.atomic import artifact_lock, write_json_atomic
+from saklas.io.atomic import artifact_lock, fsync_directory, write_json_atomic
 from saklas.io.paths import model_dir
 
 log = logging.getLogger(__name__)
@@ -247,12 +247,18 @@ def _referenced_tensor_names(model_folder: Path) -> set[str]:
 
 
 def _cleanup_unreferenced_generations(model_folder: Path) -> None:
-    """Remove immutable generations only after neither pointer references them."""
+    """Remove unreferenced generations and crash-left streaming temporaries."""
     keep = _referenced_tensor_names(model_folder)
-    candidates = list(model_folder.glob("jlens*.gen-*.safetensors")) + [
+    candidates = (
+        list(model_folder.glob("jlens*.gen-*.safetensors"))
+        + list(model_folder.glob("jlens*.gen-*.safetensors.tmp"))
+        + [
         model_folder / f"{_LENS_NAME}.safetensors",
         model_folder / f"{_LENS_CHECKPOINT_NAME}.safetensors",
-    ]
+        model_folder / f"{_LENS_NAME}.safetensors.tmp",
+        model_folder / f"{_LENS_CHECKPOINT_NAME}.safetensors.tmp",
+        ]
+    )
     for path in candidates:
         if path.name not in keep:
             try:
@@ -261,6 +267,13 @@ def _cleanup_unreferenced_generations(model_folder: Path) -> None:
                 # Pointer publication is already complete. Generation GC is
                 # opportunistic and must not turn a valid fit into a failure.
                 log.warning("could not remove old J-lens generation %s: %s", path, exc)
+
+
+def cleanup_lens_artifacts(model_id: str) -> None:
+    """Reap crash-left lens shards before a new fit allocates replacements."""
+    anchor, _ = _lens_anchor_paths(model_id)
+    with lens_fit_lock(model_id):
+        _cleanup_unreferenced_generations(anchor.parent)
 
 
 def lens_estimator_policy(*, skip_first: int | None = None) -> dict[str, Any]:
@@ -687,7 +700,12 @@ def _save_lens_components(
         for path in created:
             path.unlink(missing_ok=True)
         raise
+    # Make the new pointer rename durable before deleting any generation the
+    # previous pointer named. Otherwise power loss can roll the directory back
+    # to an old pointer whose shards GC already removed.
+    fsync_directory(sc_path.parent)
     _cleanup_unreferenced_generations(ts_path.parent)
+    fsync_directory(sc_path.parent)
     return ts_path.parent / tensor_files[str(layer_ids[0])]
 
 
@@ -856,8 +874,10 @@ def promote_lens_checkpoint(
         # checkpoint until this succeeds, so any sidecar failure preserves both
         # the prior durable lens and the complete resumable checkpoint.
         write_json_atomic(final_sc, durable_sidecar)
+        fsync_directory(final_sc.parent)
         checkpoint_sc.unlink(missing_ok=True)
         _cleanup_unreferenced_generations(final_anchor.parent)
+        fsync_directory(final_sc.parent)
         return True
 
 
@@ -1065,7 +1085,13 @@ def remove_lens(model_id: str) -> bool:
     ):
         tensor_candidates = (
             list(final_anchor.parent.glob("jlens*.gen-*.safetensors"))
-            + [final_anchor, checkpoint_anchor]
+            + list(final_anchor.parent.glob("jlens*.gen-*.safetensors.tmp"))
+            + [
+                final_anchor,
+                checkpoint_anchor,
+                final_anchor.with_suffix(final_anchor.suffix + ".tmp"),
+                checkpoint_anchor.with_suffix(checkpoint_anchor.suffix + ".tmp"),
+            ]
         )
         candidates = [*tensor_candidates, final_sc, checkpoint_sc]
         removed = any(path.exists() for path in candidates)
@@ -1078,6 +1104,7 @@ def remove_lens(model_id: str) -> bool:
                 path.unlink(missing_ok=True)
             except OSError as exc:
                 log.warning("could not remove J-lens tensor %s: %s", path, exc)
+        fsync_directory(final_anchor.parent)
         return removed
 
 

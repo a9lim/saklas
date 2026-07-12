@@ -2013,9 +2013,10 @@ class SaklasSession:
         cancel_event: "Any | None" = None,
     ) -> "Any":
         """Fit/resume one per-model J-lens under its cross-process transaction."""
-        from saklas.io.lens import lens_fit_lock
+        from saklas.io.lens import cleanup_lens_artifacts, lens_fit_lock
 
         with lens_fit_lock(self.model_id):
+            cleanup_lens_artifacts(self.model_id)
             if cancel_event is not None and cancel_event.is_set():
                 from saklas.core.jlens import JacobianLensCancelled
 
@@ -2276,7 +2277,9 @@ class SaklasSession:
                         ) -> None:
                             save_lens_checkpoint_accumulator(
                                 sums, completed, d_model, self.model_id,
-                                base=missing_base,
+                                # ``fit_jacobian_lens`` owns/mutates the prefix
+                                # as part of this raw accumulator.
+                                base=None,
                                 corpus_spec=corpus_spec,
                                 corpus_sha256=corpus_sha,
                                 corpus_hash_kind=corpus_hash_kind,
@@ -2305,13 +2308,9 @@ class SaklasSession:
                                 progress_base=topup_offset,
                                 input_id_rows=topup_ids,
                                 cancel_event=cancel_event,
+                                initial_lens=missing_base,
                             )
-                            missing = (
-                                JacobianLens.merge_into(
-                                    [missing_base, missing_tail], target=-1,
-                                )
-                                if missing_base is not None else missing_tail
-                            )
+                            missing = missing_tail
                         else:
                             assert missing_base is not None
                             missing = missing_base
@@ -2396,6 +2395,16 @@ class SaklasSession:
                             f"({len(usable)} remaining)"
                         )
 
+            # `select_layers` deliberately aliases selected tensors. Drop the
+            # source containers before resume so an all-layer resident/disk
+            # lens does not keep every unrequested fp32 matrix alive beside the
+            # subset accumulator. The selected `base` owns the only references
+            # the estimator needs.
+            existing = None
+            ckpt = None
+            partial = None
+            lens = None
+
             prompt_base = base.n_prompts if base is not None else 0
 
             def _save_full(lens: "Any") -> "Any":
@@ -2426,7 +2435,9 @@ class SaklasSession:
                 nonlocal checkpoint_written
                 save_lens_checkpoint_accumulator(
                     sums, completed, d_model, self.model_id,
-                    base=base,
+                    # The prefix is already folded into ``sums`` by the
+                    # single-accumulator resume path.
+                    base=None,
                     corpus_spec=corpus_spec,
                     corpus_sha256=corpus_sha,
                     corpus_hash_kind=corpus_hash_kind,
@@ -2448,39 +2459,69 @@ class SaklasSession:
                     self, merged, sidecar=load_lens_sidecar(self.model_id),
                 )
 
-            fitted = fit_jacobian_lens(
-                fit_model, self._tokenizer, usable, fit_layers,
-                source_layers=expected_sources, dim_batch=dim_batch,
-                prompt_batch=prompt_batch,
-                max_seq_len=seq_len,
-                checkpoint_accumulator_cb=_save_checkpoint_accumulator,
-                checkpoint_every=checkpoint_every,
-                on_progress=on_progress,
-                progress_base=prompt_base,
-                input_id_rows=consumed_ids,
-                cancel_event=cancel_event,
+            resident = self._jlens
+            had_resident = resident is not None
+            resume_live = (
+                {
+                    "layers": list(self._live_lens["layers"]),
+                    "top_k": int(self._live_lens["top_k"]),
+                }
+                if self._live_lens is not None else None
             )
-            merged = (
-                JacobianLens.merge_into([base, fitted], target=-1)
-                if base is not None else fitted
-            )
-            if checkpoint_written and promote_lens_checkpoint(
-                self.model_id,
-                n_prompts=merged.n_prompts,
-                source_layers=merged.source_layers,
-                corpus_sha256=corpus_sha,
-                corpus_hash_kind=corpus_hash_kind,
-                seq_len=seq_len,
-                d_model=merged.d_model,
-                model_fingerprint=model_fingerprint,
-            ):
-                return SaklasSession._adopt_fitted_jlens(
-                    self, merged, sidecar=load_lens_sidecar(self.model_id),
+            if had_resident:
+                # The estimator takes ownership and converts averages to sums.
+                # Drop any resident reference for the duration. It may alias
+                # the prefix or be a stale externally-replaced lens; retaining
+                # either (and especially its device-stack cache) would defeat
+                # the one-full-matrix-set resume bound. Fresh force refits get
+                # the same bounded behavior. Preserve only the tiny live config
+                # so adoption can rebuild it from the replacement lens.
+                SaklasSession._evict_resident_jlens(self)
+                resident = None
+            try:
+                merged = fit_jacobian_lens(
+                    fit_model, self._tokenizer, usable, fit_layers,
+                    source_layers=expected_sources, dim_batch=dim_batch,
+                    prompt_batch=prompt_batch,
+                    max_seq_len=seq_len,
+                    checkpoint_accumulator_cb=_save_checkpoint_accumulator,
+                    checkpoint_every=checkpoint_every,
+                    on_progress=on_progress,
+                    progress_base=prompt_base,
+                    input_id_rows=consumed_ids,
+                    cancel_event=cancel_event,
+                    initial_lens=base,
                 )
-            merged = _save_full(merged)
-            return SaklasSession._adopt_fitted_jlens(
-                self, merged, sidecar=load_lens_sidecar(self.model_id),
-            )
+                if checkpoint_written and promote_lens_checkpoint(
+                    self.model_id,
+                    n_prompts=merged.n_prompts,
+                    source_layers=merged.source_layers,
+                    corpus_sha256=corpus_sha,
+                    corpus_hash_kind=corpus_hash_kind,
+                    seq_len=seq_len,
+                    d_model=merged.d_model,
+                    model_fingerprint=model_fingerprint,
+                ):
+                    sidecar = load_lens_sidecar(self.model_id)
+                else:
+                    merged = _save_full(merged)
+                    sidecar = load_lens_sidecar(self.model_id)
+                if resume_live is not None:
+                    self._live_lens = resume_live
+                return SaklasSession._adopt_fitted_jlens(
+                    self, merged, sidecar=sidecar,
+                )
+            except BaseException:
+                if had_resident:
+                    restored = load_lens(self.model_id)
+                    if restored is not None:
+                        restored_lens, restored_sidecar = restored
+                        if resume_live is not None:
+                            self._live_lens = resume_live
+                        SaklasSession._adopt_fitted_jlens(
+                            self, restored_lens, sidecar=restored_sidecar,
+                        )
+                raise
 
     def _resolve_jlens_layers(
         self,
@@ -4567,9 +4608,10 @@ class SaklasSession:
                 node_roles: dict[str, str | None] | None = (
                     {label: role for label in node_corpora} if role else None
                 )
-                if manifest.exists():
-                    import shutil
-                    shutil.rmtree(folder)
+                if folder.exists():
+                    from saklas.io.manifold_folder import reset_manifold_folder
+
+                    reset_manifold_folder(folder)
                 create_discover_manifold_folder(
                     ns, name, description, fit_mode="pca",
                     node_corpora=node_corpora,

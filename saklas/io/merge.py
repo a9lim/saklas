@@ -8,6 +8,7 @@ silently substituting an offline Euclidean projection would change semantics.
 """
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 from typing import Any, Optional
@@ -92,18 +93,6 @@ def _manifold_tensor_path(ns: str, name: str, sid: str, variant: Optional[str]) 
         transferred_from_is_safe=transferred_from is not None,
     )
     return path if path.exists() and path.with_suffix(".json").exists() else None
-
-
-def _component_has_tensor_for(ns: str, name: str, sid: str, variant: Optional[str]) -> bool:
-    """True when ``(ns, name)`` has a usable fitted manifold tensor for ``sid``."""
-    try:
-        _resolve_component(
-            ns, name, sid, variant,
-            f"{ns}/{name}" if variant is None else f"{ns}/{name}:{variant}",
-        )
-    except (MergeError, OSError, ValueError):
-        return False
-    return True
 
 
 def _resolve_component(
@@ -243,55 +232,158 @@ class _MergeTerm:
         base = f"{self.ns}/{self.name}"
         return base if self.variant in (None, "raw") else f"{base}:{self.variant}"
 
-def _component_tensor_models(
-    ns: Optional[str], name: str, variant: Optional[str],
-) -> set[str]:
-    """Models carrying the exact foldable tensor variant for a component."""
-    if ns is None:
-        raise MergeError(
-            f"merge component '{name}' must be namespace-qualified "
-            f"(e.g. 'default/{name}')"
-        )
+def _candidate_term_models(term: _MergeTerm) -> set[str]:
+    """Enumerate cheap pair-presence candidates before exact resolution."""
+
     from saklas.io.paths import manifold_dir, parse_tensor_filename
-    mdir = manifold_dir(ns, name)
-    models: set[str] = set()
-    if mdir.is_dir():
-        for tensor in mdir.glob("*.safetensors"):
-            parsed = parse_tensor_filename(tensor.name)
-            if parsed is None:
-                continue
-            safe_model, parsed_variant = parsed
-            requested = None if variant in (None, "raw") else variant
-            candidate = _manifold_tensor_path(ns, name, safe_model, requested)
-            if (
-                candidate is not None
-                and candidate == tensor
-                and _component_has_tensor_for(
-                    ns, name, safe_model, requested,
+
+    candidates: set[str] = set()
+    mdir = manifold_dir(term.ns, term.name)
+    if not mdir.is_dir():
+        return candidates
+    for tensor in mdir.glob("*.safetensors"):
+        parsed = parse_tensor_filename(tensor.name)
+        if parsed is None:
+            continue
+        safe_model, _parsed_variant = parsed
+        requested = None if term.variant in (None, "raw") else term.variant
+        candidate = _manifold_tensor_path(
+            term.ns, term.name, safe_model, requested,
+        )
+        if candidate is None or candidate != tensor:
+            continue
+        candidates.add(safe_model)
+    return candidates
+
+
+def _shared_models_resolved(
+    terms: list[_MergeTerm],
+) -> tuple[list[str], dict[tuple[int, str], tuple[Profile, dict[str, Any]]]]:
+    """Return the shared model set plus the exact resolutions proving it."""
+
+    per_term_candidates = [_candidate_term_models(term) for term in terms]
+    if not per_term_candidates:
+        raise MergeError("no components provided")
+    candidates = set.intersection(*per_term_candidates)
+    if not candidates:
+        raise MergeError(f"no shared models across {[term.coord for term in terms]}")
+    # Integrity/hash/load/fold is expensive. Do it only for the cheap shared
+    # intersection and exactly once per term/model; discard a candidate if any
+    # component fails exact resolution.
+    ordered: list[str] = []
+    cache: dict[tuple[int, str], tuple[Profile, dict[str, Any]]] = {}
+    for sid in sorted(candidates):
+        resolved_for_model: dict[
+            tuple[int, str], tuple[Profile, dict[str, Any]]
+        ] = {}
+        try:
+            for term_index, term in enumerate(terms):
+                resolved_for_model[(term_index, sid)] = _resolve_component(
+                    term.ns, term.name, sid, term.variant, term.coord,
                 )
-            ):
-                models.add(safe_model)
-    return models
+        except (MergeError, OSError, ValueError):
+            continue
+        ordered.append(sid)
+        cache.update(resolved_for_model)
+    if not ordered:
+        raise MergeError(f"no shared models across {[term.coord for term in terms]}")
+    return ordered, cache
 
 
 def shared_models(expression: str) -> list[str]:
     """Return models for which every merge term has a tensor, sorted."""
     terms = _parse_merge_expr(expression)
-    per: list[set[str]] = []
-    for term in terms:
-        per.append(_component_tensor_models(term.ns, term.name, term.variant))
-    if not per:
-        raise MergeError("no components provided")
-    shared = set.intersection(*per)
-    if not shared:
-        raise MergeError(
-            f"no shared models across {[t.coord for t in terms]}"
-        )
-    return sorted(shared)
+    shared, _resolved = _shared_models_resolved(terms)
+    return shared
 
 
 def _term_desc(term: _MergeTerm) -> str:
     return f"{term.name} ({term.coeff})"
+
+
+def _resumable_baked_merge(
+    folder: Path,
+    *,
+    name: str,
+    description: str,
+    prepared_outputs: list[tuple[str, Any, dict[str, Any], str]],
+) -> tuple[bool, set[str]]:
+    """Validate an interrupted same-merge destination and its proven prefix."""
+
+    from saklas.io.manifold_folder import (
+        MANIFOLD_FORMAT_VERSION,
+        MERGE_BAKE_POLICY,
+        manifold_folder_tensor_paths,
+    )
+    from saklas.io.packs import verify_integrity
+    from saklas.io.paths import tensor_filename
+
+    try:
+        payload = json.loads((folder / "manifold.json").read_text())
+    except (OSError, json.JSONDecodeError, TypeError):
+        return False, set()
+    first_manifold = prepared_outputs[0][1]
+    identity = {
+        "format_version": payload.get("format_version"),
+        "name": payload.get("name"),
+        "description": payload.get("description"),
+        "fit_mode": payload.get("fit_mode"),
+        "domain": payload.get("domain"),
+        "nodes": payload.get("nodes"),
+        "tags": payload.get("tags", []),
+        "source": payload.get("source", "local"),
+    }
+    expected_identity = {
+        "format_version": MANIFOLD_FORMAT_VERSION,
+        "name": name,
+        "description": description,
+        "fit_mode": "baked",
+        "domain": first_manifold.domain.to_spec(),
+        "nodes": [{"label": label} for label in first_manifold.node_labels],
+        "tags": ["merge"],
+        "source": "local",
+    }
+    if identity != expected_identity:
+        return False, set()
+
+    expected_by_path = {
+        folder / tensor_filename(sid, model_id_is_safe=True): (
+            sid, component_info, fingerprint,
+        )
+        for sid, _manifold, component_info, fingerprint in prepared_outputs
+    }
+    if any(
+        tensor_path not in expected_by_path
+        for tensor_path in manifold_folder_tensor_paths(folder)
+    ):
+        return False, set()
+    files = payload.get("files", {})
+    if not isinstance(files, dict):
+        return False, set()
+
+    completed: set[str] = set()
+    for tensor_path, (sid, component_info, fingerprint) in expected_by_path.items():
+        sidecar_path = tensor_path.with_suffix(".json")
+        names = (tensor_path.name, sidecar_path.name)
+        expected = {filename: files[filename] for filename in names if filename in files}
+        if len(expected) != 2 or not verify_integrity(folder, expected)[0]:
+            continue
+        try:
+            sidecar = json.loads(sidecar_path.read_text())
+        except (OSError, json.JSONDecodeError, TypeError):
+            return False, set()
+        if not (
+            sidecar.get("method") == "merge"
+            and sidecar.get("fit_mode") == "baked"
+            and sidecar.get("model_fingerprint") == fingerprint
+            and sidecar.get("components") == component_info
+            and sidecar.get("bake_policy") == MERGE_BAKE_POLICY
+        ):
+            return False, set()
+        completed.add(sid)
+    # A fully proven destination remains an ordinary exists conflict.  Resume is
+    # only for a missing/unproven suffix of this exact deterministic merge.
+    return len(completed) < len(prepared_outputs), completed
 
 
 def merge_into_manifold(
@@ -339,7 +431,6 @@ def _merge_into_manifold_locked(
     """
     from saklas.core.vectors import fold_directions_to_subspace
     from saklas.io.manifolds import (
-        ManifoldFolder,
         create_baked_manifold_folder,
         save_baked_manifold_tensor,
     )
@@ -348,21 +439,24 @@ def _merge_into_manifold_locked(
     terms = _parse_merge_expr(expression)
 
     dst = manifold_dir("local", name)
-    if (dst / "manifold.json").exists() and not force:
-        raise MergeError(f"{dst} exists; pass force=True to overwrite")
 
+    resolved_cache: dict[
+        tuple[int, str], tuple[Profile, dict[str, Any]]
+    ] = {}
     if model is not None:
         sid_check = safe_model_id(model)
         target_models = [sid_check]
-        for term in terms:
-            if not _component_has_tensor_for(
-                term.ns, term.name, sid_check, term.variant,
-            ):
+        for term_index, term in enumerate(terms):
+            try:
+                resolved_cache[(term_index, sid_check)] = _resolve_component(
+                    term.ns, term.name, sid_check, term.variant, term.coord,
+                )
+            except (MergeError, OSError, ValueError):
                 raise MergeError(
                     f"component {term.coord} has no tensor for {model}"
-                )
+                ) from None
     else:
-        target_models = shared_models(expression)
+        target_models, resolved_cache = _shared_models_resolved(terms)
 
     description = f"Merged manifold: {' + '.join(_term_desc(t) for t in terms)}"
 
@@ -373,9 +467,7 @@ def _merge_into_manifold_locked(
         component_fingerprints: set[str] = set()
         fingerprint_complete = True
         for term_index, term in enumerate(terms):
-            profile, component_metadata = _resolve_component(
-                term.ns, term.name, sid, term.variant, term.coord,
-            )
+            profile, component_metadata = resolved_cache[(term_index, sid)]
             base_fingerprint = component_metadata.get("model_fingerprint")
             if isinstance(base_fingerprint, str):
                 component_fingerprints.add(base_fingerprint)
@@ -420,8 +512,19 @@ def _merge_into_manifold_locked(
     # All models are resolved, integrity-checked, folded, and identity-checked
     # before the first destination mutation. A late model failure therefore
     # cannot leave a partial new folder or delete a prior good force target.
+    completed: set[str] = set()
     folder: Optional[Path] = None
+    if (dst / "manifold.json").exists() and not force:
+        resumable, completed = _resumable_baked_merge(
+            dst, name=name, description=description,
+            prepared_outputs=prepared_outputs,
+        )
+        if not resumable:
+            raise MergeError(f"{dst} exists; pass force=True to overwrite")
+        folder = dst
     for sid, manifold, component_info, baked_fingerprint in prepared_outputs:
+        if sid in completed:
+            continue
         if folder is None:
             folder, _mf = create_baked_manifold_folder(
                 "local", name, description, manifold, sid,
@@ -431,15 +534,10 @@ def _merge_into_manifold_locked(
                 model_id_is_safe=True,
             )
         else:
-            tensor_path = save_baked_manifold_tensor(
+            save_baked_manifold_tensor(
                 folder, manifold, sid, method="merge", components=component_info,
                 model_fingerprint=baked_fingerprint,
                 model_id_is_safe=True,
-            )
-            ManifoldFolder.load(
-                folder, verify_manifest=False,
-            ).update_file_hashes(
-                tensor_path, tensor_path.with_suffix(".json"),
             )
 
     # ``target_models`` is non-empty (shared_models raises on an empty

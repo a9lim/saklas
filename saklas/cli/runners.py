@@ -102,6 +102,24 @@ def _load_or_fit_transfer_alignment(
 ) -> tuple[
     dict[int, Any], dict[int, float], Path, dict[str, Any], dict[str, Any],
 ]:
+    """Single-flight a complete transfer alignment, including model loads."""
+    from saklas.io.alignment import alignment_fit_lock
+
+    with alignment_fit_lock(src_model, tgt_model):
+        return _load_or_fit_transfer_alignment_locked(
+            src_model, tgt_model, force=force, label=label,
+        )
+
+
+def _load_or_fit_transfer_alignment_locked(
+    src_model: str,
+    tgt_model: str,
+    *,
+    force: bool,
+    label: str,
+) -> tuple[
+    dict[int, Any], dict[int, float], Path, dict[str, Any], dict[str, Any],
+]:
     """Load or fit a Procrustes alignment for vector/manifold transfer."""
     from saklas.io.alignment import (
         AlignmentError,

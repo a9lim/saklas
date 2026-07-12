@@ -120,7 +120,10 @@ advisories)`), `create_discover_manifold_folder` (`sanitize_hyperparams` drops
 cross-method keys at the IO boundary, gated by `_HYPERPARAMS_BY_MODE`; takes
 `node_roles=` / `node_kinds=` maps),
 `create_baked_manifold_folder` + `save_baked_manifold_tensor` (the `subspace
-merge` target — one fitted tensor per model, all sharing one `manifold.json`).
+merge` target — one fitted tensor per model, all sharing one `manifold.json`);
+each baked pair records its manifest proof before the call returns, and an
+ordinary identical producer retry replaces an unproven first/later pair left by
+a crash between pair publication and the manifest update.
 `port_legacy_vector_folder` ports a stale `vectors/<ns>/<name>/` pack to a 2-node
 `pca` discover folder (file-only — no tensors carried; they re-fit lazily).
 Streaming companions for big rosters (a crash keeps finished nodes):
@@ -163,7 +166,10 @@ work; rm/recreate changes the folder artifact id. Fitted pairs use stable
 digest-named locks outside the removable folder; clear/rm/refresh acquire the
 manifest lock followed by affected pair locks in deterministic order. Transfer
 provenance is part of the initial sidecar publication, and a pair left unproven
-by a failed manifest update is repaired on an ordinary retry. This composes with fit-side
+by a failed manifest update is repaired on an ordinary retry. Whole-folder force
+authoring resets and HF stage swaps use the same manifest → sorted stable-pair
+order before removing/renaming a destination, so they cannot unlink a tensor
+while a fitted reader owns its logical pair lock. This composes with fit-side
 size pruning, which locks victims one at a time after the publisher releases its
 own stem. Ordinary
 discovery/summary routing (`iter_manifold_folders`, `manifold_summary`, HTTP
@@ -340,7 +346,12 @@ over the union of their layer coverage), folds the result to a one-pole ray
 accepted. Triggers, `!`, `%`, multi-coefficients, and `~`/`|` are rejected;
 projection is Mahalanobis-only and cannot be reproduced without a live whitener.
 `shared_models(expression)` returns the models every term has a fitted tensor
-for. The baked sidecar carries `method="merge"`, the unanimous component model
+for. Merge discovery retains the exact verified/folded component resolutions and
+reuses them during preparation (one load/hash/fold per term/model, not two). A
+same-expression retry resumes only an incomplete baked destination whose proven
+prefix matches the component tensor hashes, coefficients, model fingerprints,
+and bake policy; a fully proven destination keeps ordinary exists semantics. The
+baked sidecar carries `method="merge"`, the unanimous component model
 fingerprint, and per-component `components` provenance. Legacy projected bakes
 are rejected at load and must be rebuilt.
 
@@ -353,7 +364,11 @@ model + rendered-token + layer-schema identity, payload-digest verified; self-he
 legacy bf16/fp16/non-finite caches). These are what the Mahalanobis whitener builds its
 covariance from. `validate_neutral_cache_metadata` checks the digest plus
 safetensors key/shape/dtype header without paging payloads for an exact-repeat
-preflight; the materializing loader additionally checks finiteness.
+preflight; the materializing loader additionally checks finiteness. A stable
+per-model neutral-fit lock spans cache recheck, capture, and publication, while
+the directional source→target alignment-fit lock spans both model loads and the
+second cache recheck; concurrent cold transfer commands never duplicate the
+exact neutral forwards or Procrustes fit.
 `fit_alignment(src, tgt, *, min_shared_layers=10) → {layer: M_L}`
 (orthogonal Procrustes for matched dim, rectangular least-squares otherwise; both
 center first); `alignment_quality` is per-layer R². `transfer_profile(profile,
@@ -404,7 +419,11 @@ no-op recovery removes a leftover checkpoint only after the validated final
 artifact proves it has matching fit semantics, covers its layers, and reaches at
 least its effective base-plus-partial prompt progress; newer or different-corpus
 checkpoints remain resumable.
-Unreferenced generations are collected only after pointer commit. A dedicated
+Unreferenced generations and crash-left streamed `.safetensors.tmp` shards are
+collected at fit preflight/removal and only after pointer commit. The pointer's
+parent directory is fsynced before old shards or a promoted checkpoint pointer
+are unlinked, preventing a power-loss rollback to a pointer whose payload was
+already collected. A dedicated
 per-model `jlens.fit` lock spans preflight, estimator/checkpoint work, final
 publication, and lifecycle removal across processes. Metadata-only
 final/checkpoint preflight rejects incompatible corpora/layers before matrix IO.

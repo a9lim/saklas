@@ -585,6 +585,35 @@ def test_fit_checkpoint_callback_fires() -> None:
     assert seen == [3, 4]
 
 
+def test_fit_resume_reuses_prefix_matrices_as_single_accumulator() -> None:
+    tokenizer = _CharTokenizer()
+    prompt = "a prompt that is long enough."
+    base_model = _frozen_model(n_layers=2)
+    base = fit_jacobian_lens(
+        base_model, tokenizer, [prompt], _layers(base_model),
+        dim_batch=3, prompt_batch=1,
+    )
+    pointers = {
+        layer: tensor.data_ptr() for layer, tensor in base.jacobians.items()
+    }
+
+    resumed_model = _frozen_model(n_layers=2)
+    resumed = fit_jacobian_lens(
+        resumed_model, tokenizer, [prompt] * 2, _layers(resumed_model),
+        dim_batch=3, prompt_batch=1, initial_lens=base,
+    )
+    full_model = _frozen_model(n_layers=2)
+    full = fit_jacobian_lens(
+        full_model, tokenizer, [prompt] * 3, _layers(full_model),
+        dim_batch=3, prompt_batch=1,
+    )
+
+    assert resumed.n_prompts == 3
+    for layer in resumed.source_layers:
+        assert resumed.jacobians[layer].data_ptr() == pointers[layer]
+        assert torch.allclose(resumed.jacobians[layer], full.jacobians[layer])
+
+
 def test_fit_skips_terminal_periodic_checkpoint() -> None:
     model = _frozen_model(n_layers=2)
     tokenizer = _CharTokenizer()

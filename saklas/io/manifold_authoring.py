@@ -29,6 +29,7 @@ from saklas.io.manifold_folder import (
     _node_filename,
     _node_payload_authored,
     _node_payload_discover,
+    reset_manifold_folder,
     sanitize_hyperparams,
     _validate_node_kind,
     _validate_node_role,
@@ -364,17 +365,31 @@ def create_manifold_from_template(
     """
     from saklas.io.templates import resolve_template
 
+    _validate_ns_name(namespace, name)
+    if fit_mode not in _FIT_MODES_DISCOVER:
+        raise ManifoldFormatError(
+            f"discover manifold {name!r} fit_mode {fit_mode!r} invalid; "
+            f"expected one of {sorted(_FIT_MODES_DISCOVER)}"
+        )
     tmpl = resolve_template(template_ref)
     node_corpora = tmpl.node_corpora()
+    _validate_discover_labels(name, list(node_corpora))
+    sanitized_hyperparams = sanitize_hyperparams(fit_mode, hyperparams)
     ref = f"{tmpl.path.parent.name}/{tmpl.name}" if tmpl.path else tmpl.name
     folder = manifold_dir(namespace, name)
-    if force and (folder / "manifold.json").exists():
-        shutil.rmtree(folder)
+    if folder.exists():
+        if force:
+            reset_manifold_folder(folder)
+        elif not (folder / "manifold.json").exists():
+            raise FileExistsError(
+                f"manifold {namespace}/{name} has an incomplete folder; "
+                "pass force=True to replace it"
+            )
     return create_discover_manifold_folder(
         namespace, name, description,
         fit_mode=fit_mode,
         node_corpora=node_corpora,
-        hyperparams=hyperparams,
+        hyperparams=sanitized_hyperparams,
         template_ref=ref,
     )
 
@@ -551,21 +566,21 @@ def create_baked_manifold_folder(
 
     For a multi-model merge, call this once for the first model and
     :func:`save_baked_manifold_tensor` for each subsequent model (sharing the
-    one ``manifold.json``), then a final :meth:`ManifoldFolder.write_metadata`
-    to fold every tensor into the ``files`` manifest.
+    one ``manifold.json``); each call publishes that pair's ``files`` proof
+    incrementally, so there is no final scan/rewrite over historical tensors.
 
     Raises :class:`ManifoldFormatError` on an invalid name/namespace and
     :class:`FileExistsError` when a manifold already lives at the path and
     ``force`` is ``False``.
     """
     _validate_ns_name(namespace, name)
+    if not model_fingerprint:
+        raise ValueError("baked manifold tensors require a proven model fingerprint")
+    from saklas.io.paths import tensor_filename
 
-    folder = manifold_dir(namespace, name)
-    if (folder / "manifold.json").exists():
-        if not force:
-            raise FileExistsError(f"manifold {namespace}/{name} already exists")
-        shutil.rmtree(folder)
-    folder.mkdir(parents=True, exist_ok=True)
+    # Validate the destination filename before a force reset can remove the
+    # prior corpus-less geometry.
+    tensor_filename(model_id, model_id_is_safe=model_id_is_safe)
 
     labels = list(manifold.node_labels)
     payload: dict[str, Any] = {
@@ -581,17 +596,91 @@ def create_baked_manifold_folder(
         payload["tags"] = [str(t) for t in tags]
     if source and source != "local":
         payload["source"] = source
-    write_json_atomic(folder / "manifold.json", payload)
 
-    tensor_path = save_baked_manifold_tensor(
+    folder = manifold_dir(namespace, name)
+    manifest_path = folder / "manifold.json"
+    if folder.exists() and not manifest_path.exists():
+        if force:
+            reset_manifold_folder(folder)
+        else:
+            raise FileExistsError(
+                f"manifold {namespace}/{name} has an incomplete folder; "
+                "pass force=True to replace it"
+            )
+    if manifest_path.exists():
+        if force:
+            reset_manifold_folder(folder)
+        elif not _recoverable_baked_first_publication(
+            folder, payload, model_id, model_id_is_safe=model_id_is_safe,
+        ):
+            raise FileExistsError(f"manifold {namespace}/{name} already exists")
+    if not manifest_path.exists():
+        folder.mkdir(parents=True, exist_ok=True)
+        write_json_atomic(manifest_path, payload)
+
+    save_baked_manifold_tensor(
         folder, manifold, model_id, method=method, components=components,
         model_fingerprint=model_fingerprint,
         model_id_is_safe=model_id_is_safe,
     )
 
-    mf = ManifoldFolder.load(folder, verify_manifest=False)
-    mf.update_file_hashes(tensor_path, tensor_path.with_suffix(".json"))
+    mf = ManifoldFolder.load(folder)
     return folder, mf
+
+
+def _recoverable_baked_first_publication(
+    folder: Path,
+    expected_manifest: dict[str, Any],
+    model_id: str,
+    *,
+    model_id_is_safe: bool,
+) -> bool:
+    """Whether ``folder`` is the interrupted first write of this baked target."""
+
+    from saklas.io.manifold_folder import manifold_folder_tensor_paths
+    from saklas.io.packs import verify_integrity
+    from saklas.io.paths import parse_tensor_filename, tensor_filename
+
+    try:
+        payload = json.loads((folder / "manifold.json").read_text())
+    except (OSError, json.JSONDecodeError, TypeError):
+        return False
+    # Transaction-only fields are allowed to differ; the authoring identity must
+    # otherwise be exactly the skeleton this request would have created.
+    actual_identity = {
+        key: value for key, value in payload.items()
+        if key not in {"files", "artifact_id", "fit_epochs"}
+    }
+    expected_identity = {
+        key: value for key, value in expected_manifest.items()
+        if key not in {"files", "artifact_id", "fit_epochs"}
+    }
+    if actual_identity != expected_identity:
+        return False
+
+    target = folder / tensor_filename(
+        model_id, model_id_is_safe=model_id_is_safe,
+    )
+    if any(path != target for path in manifold_folder_tensor_paths(folder)):
+        return False
+    pair_names = {target.name, target.with_suffix(".json").name}
+    files = payload.get("files", {})
+    if not isinstance(files, dict):
+        return False
+    expected = {name: files[name] for name in pair_names if name in files}
+    if len(expected) == 2 and verify_integrity(folder, expected)[0]:
+        return False  # a complete, trusted artifact preserves exists semantics
+    # Do not adopt an interrupted skeleton that also carries some other model's
+    # fitted pair; that is a multi-model merge concern with stronger provenance
+    # checks in ``io.merge``.
+    for filename in files:
+        candidate = (
+            Path(filename).with_suffix(".safetensors").name
+            if filename.endswith(".json") else filename
+        )
+        if parse_tensor_filename(candidate) is not None and filename not in pair_names:
+            return False
+    return True
 
 
 @_lock_folder_arg
@@ -609,9 +698,10 @@ def save_baked_manifold_tensor(
 
     Factored out of :func:`create_baked_manifold_folder` so a multi-model merge
     can share one ``manifold.json`` across every target model's tensor.  The
-    caller is responsible for the surrounding ``manifold.json`` write (once) and
-    a final :meth:`ManifoldFolder.write_metadata` (to fold every tensor into the
-    ``files`` manifest).  Returns the tensor path.
+    caller is responsible for the surrounding ``manifold.json`` write once.  Pair
+    publication and its manifest proof happen in this same folder transaction;
+    an interruption between them is repaired by overwriting/adopting the target
+    on the next producer retry.  Returns the tensor path.
     """
     from saklas.core.manifold import save_manifold
     from saklas.io.paths import tensor_filename
@@ -644,6 +734,9 @@ def save_baked_manifold_tensor(
         model_id, model_id_is_safe=model_id_is_safe,
     )
     save_manifold(manifold, tensor_path, save_meta)
+    ManifoldFolder.load(
+        folder, verify_manifest=False,
+    ).update_file_hashes(tensor_path, tensor_path.with_suffix(".json"))
     return tensor_path
 
 
@@ -729,13 +822,13 @@ def port_legacy_vector_folder(
     from saklas.io.manifold_folder import _locked_manifest
 
     with _locked_manifest(target):
-        if (target / "manifold.json").exists():
+        if target.exists():
             if not force:
                 raise FileExistsError(
                     f"manifold {namespace}/{name} already exists; pass "
                     "force=True to re-port"
                 )
-            shutil.rmtree(target)
+            reset_manifold_folder(target)
 
         _create_discover_manifold_folder(
             namespace, name, description,
@@ -1026,7 +1119,7 @@ def plan_discover_generation(
     # fit from publishing across a concurrent force-regeneration.  Remove even
     # a partial folder: force is the recovery path for a missing manifest.
     if force and folder.exists():
-        shutil.rmtree(folder)
+        reset_manifold_folder(folder)
 
     meta_path = folder / "manifold.json"
     nodes_dir = folder / "nodes"
@@ -1259,7 +1352,7 @@ def merge_discover_manifolds(
                 f"manifold {target_namespace}/{target_name} already exists; "
                 f"pass force=True to overwrite",
             )
-        shutil.rmtree(target_folder)
+        reset_manifold_folder(target_folder)
 
     return create_discover_manifold_folder(
         target_namespace,

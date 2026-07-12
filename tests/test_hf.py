@@ -1,5 +1,7 @@
 from typing import Any
 import json
+import shutil
+import threading
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -114,6 +116,98 @@ def test_pull_manifold_records_revision_in_source(tmp_path: Path, monkeypatch: p
     )
 
     assert ManifoldFolder.load(target).source == "hf://alice/mood@v1.2.0"
+
+
+def test_force_pull_waits_for_existing_pair_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from saklas.io import hf_manifolds as hfm
+    from saklas.io.manifold_folder import manifold_pair_lock
+
+    source = _author_fake_manifold(tmp_path, monkeypatch)
+    monkeypatch.setattr(hfm, "_hf_snapshot_download", lambda **kw: str(source))
+    target = tmp_path / "installed" / "mood"
+    shutil.copytree(source, target)
+    fitted = next(target.glob("*.safetensors"))
+    started = threading.Event()
+    done = threading.Event()
+    errors: list[BaseException] = []
+
+    def pull() -> None:
+        started.set()
+        try:
+            hfm.pull_manifold("alice/mood", target, force=True)
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+        finally:
+            done.set()
+
+    with manifold_pair_lock(fitted):
+        worker = threading.Thread(target=pull)
+        worker.start()
+        assert started.wait(1.0)
+        assert not done.wait(0.1)
+    worker.join(timeout=2.0)
+
+    assert not worker.is_alive()
+    assert errors == []
+    assert done.is_set()
+
+
+def test_pull_recovers_backup_before_nonforce_conflict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from saklas.io import hf_manifolds as hfm
+
+    source = _author_fake_manifold(tmp_path, monkeypatch)
+    target = tmp_path / "installed" / "mood"
+    backup = target.with_name("mood.bak")
+    shutil.copytree(source, backup)
+    monkeypatch.setattr(
+        hfm, "_hf_snapshot_download",
+        lambda **_kw: (_ for _ in ()).throw(
+            AssertionError("existing recovered target should fail before download")
+        ),
+    )
+
+    with pytest.raises(hfm.HFError, match="exists"):
+        hfm.pull_manifold("alice/mood", target, force=False)
+
+    assert target.exists()
+    assert not backup.exists()
+    assert next(target.glob("*.safetensors")).exists()
+
+
+def test_force_pull_recovered_backup_waits_for_logical_pair_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from saklas.io import hf_manifolds as hfm
+    from saklas.io.manifold_folder import manifold_pair_lock
+
+    source = _author_fake_manifold(tmp_path, monkeypatch)
+    monkeypatch.setattr(hfm, "_hf_snapshot_download", lambda **_kw: str(source))
+    target = tmp_path / "installed" / "mood"
+    backup = target.with_name("mood.bak")
+    shutil.copytree(source, backup)
+    logical_tensor = target / next(backup.glob("*.safetensors")).name
+    started = threading.Event()
+    done = threading.Event()
+
+    def pull() -> None:
+        started.set()
+        hfm.pull_manifold("alice/mood", target, force=True)
+        done.set()
+
+    with manifold_pair_lock(logical_tensor):
+        worker = threading.Thread(target=pull)
+        worker.start()
+        assert started.wait(1.0)
+        assert not done.wait(0.1)
+    worker.join(timeout=2.0)
+
+    assert not worker.is_alive()
+    assert done.is_set()
+    assert not backup.exists()
 
 
 def _capture_push_staging(monkeypatch: pytest.MonkeyPatch):

@@ -594,6 +594,47 @@ def test_remove_lens() -> None:
     assert remove_lens(_MODEL) is False
 
 
+def test_remove_lens_reaps_crash_left_streaming_temp() -> None:
+    generation, _ = lens_paths(_MODEL)
+    orphan = generation.parent / "jlens.layer-1.gen-deadbeef.safetensors.tmp"
+    orphan.parent.mkdir(parents=True, exist_ok=True)
+    orphan.write_bytes(b"partial shard")
+
+    assert remove_lens(_MODEL) is True
+    assert not orphan.exists()
+
+
+def test_pointer_directory_barrier_precedes_generation_gc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import saklas.io.lens as lens_io
+
+    events: list[str] = []
+    real_write = lens_io.write_json_atomic
+    real_cleanup = lens_io._cleanup_unreferenced_generations
+
+    def record_write(path: Path, payload: object) -> None:
+        real_write(path, payload)
+        events.append("pointer")
+
+    def record_barrier(_path: Path) -> None:
+        events.append("barrier")
+
+    def record_cleanup(path: Path) -> None:
+        events.append("gc")
+        real_cleanup(path)
+
+    monkeypatch.setattr(lens_io, "write_json_atomic", record_write)
+    monkeypatch.setattr(lens_io, "fsync_directory", record_barrier)
+    monkeypatch.setattr(
+        lens_io, "_cleanup_unreferenced_generations", record_cleanup,
+    )
+
+    _save(_lens())
+
+    assert events.index("pointer") < events.index("barrier") < events.index("gc")
+
+
 def test_remove_unpublishes_before_best_effort_tensor_gc(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -174,6 +174,35 @@ def test_shared_models_empty_raises(monkeypatch: pytest.MonkeyPatch, tmp_path: P
         merge.shared_models("0.5 default/happy + 0.5 a9lim/archaic")
 
 
+def test_merge_resolves_each_component_model_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    profile = {0: torch.tensor([1.0])}
+    _make_concept_with_tensors(
+        tmp_path, "default", "happy", {"gemma": profile},
+    )
+    _make_concept_with_tensors(
+        tmp_path, "a9lim", "archaic", {"gemma": profile},
+    )
+    real_resolve = merge._resolve_component
+    calls: list[tuple[str, str, str]] = []
+
+    def counted(ns: str, name: str, sid: str, variant: Any, coord: str):
+        calls.append((ns, name, sid))
+        return real_resolve(ns, name, sid, variant, coord)
+
+    monkeypatch.setattr(merge, "_resolve_component", counted)
+    merge.merge_into_manifold(
+        "bard", "default/happy + a9lim/archaic", model=None,
+    )
+
+    assert calls == [
+        ("default", "happy", "gemma"),
+        ("a9lim", "archaic", "gemma"),
+    ]
+
+
 def test_role_variant_uses_and_validates_canonical_tensor(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
@@ -272,6 +301,37 @@ def test_merge_into_manifold_conflict(monkeypatch: pytest.MonkeyPatch, tmp_path:
             "bard", "0.5 default/happy + 0.5 a9lim/archaic",
             model=None, force=False,
         )
+
+
+def test_merge_retry_repairs_later_unproven_baked_pair(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    profiles = {
+        "gemma": {0: torch.tensor([1.0])},
+        "qwen": {0: torch.tensor([2.0])},
+    }
+    _make_concept_with_tensors(tmp_path, "default", "happy", profiles)
+    _make_concept_with_tensors(tmp_path, "a9lim", "archaic", profiles)
+    real_update = ManifoldFolder.update_file_hashes
+    calls = 0
+
+    def fail_second(self: ManifoldFolder, *paths: Path) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("injected baked manifest failure")
+        real_update(self, *paths)
+
+    monkeypatch.setattr(ManifoldFolder, "update_file_hashes", fail_second)
+    expression = "default/happy + a9lim/archaic"
+    with pytest.raises(OSError, match="injected"):
+        merge.merge_into_manifold("bard", expression, model=None)
+    monkeypatch.setattr(ManifoldFolder, "update_file_hashes", real_update)
+
+    dst = merge.merge_into_manifold("bard", expression, model=None)
+    loaded = ManifoldFolder.load(dst)
+    assert sorted(loaded.tensor_models()) == ["gemma", "qwen"]
 
 
 def test_merge_into_manifold_explicit_model(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):

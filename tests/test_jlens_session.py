@@ -881,6 +881,108 @@ def test_fit_jlens_checkpoint_survives_two_interruptions(
         )
 
 
+def test_resident_prefix_is_reloaded_after_resume_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import saklas.core.jlens as jlens_mod
+
+    session = _StubSession()
+    session.fit_jlens(_PROMPTS[:2], force=True)
+    durable_pair = load_lens(_MODEL_ID)
+    assert durable_pair is not None
+    durable = durable_pair[0]
+    expected = {
+        layer: tensor.clone() for layer, tensor in durable.jacobians.items()
+    }
+    real_fit = jlens_mod.fit_jacobian_lens
+
+    def fail_after_one(*args: Any, **kwargs: Any) -> Any:
+        prompts = list(args[2])
+        args = (*args[:2], prompts[:1], *args[3:])
+        kwargs["input_id_rows"] = kwargs["input_id_rows"][:1]
+        real_fit(*args, **kwargs)
+        raise RuntimeError("injected resident resume failure")
+
+    monkeypatch.setattr(jlens_mod, "fit_jacobian_lens", fail_after_one)
+    with pytest.raises(RuntimeError, match="resident resume"):
+        session.fit_jlens(_PROMPTS)
+
+    assert session._jlens is not None
+    assert session._jlens.n_prompts == 2
+    for layer, tensor in expected.items():
+        assert torch.allclose(session._jlens.jacobians[layer], tensor)
+
+
+def test_subset_resume_releases_unrequested_resident_matrices(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import gc
+    import weakref
+
+    import saklas.core.jlens as jlens_mod
+
+    session = _StubSession()
+    session.fit_jlens(_PROMPTS[:2], force=True, source_layers=[0, 1])
+    assert session._jlens is not None
+    session._jlens_transport_stack(session._jlens, [0, 1], torch.device("cpu"))
+    assert session._jlens_device_cache
+    old_live_stack = torch.zeros(64)
+    live_stack_ref = weakref.ref(old_live_stack)
+    session._live_lens = {
+        "layers": [0], "top_k": 3, "J_stack": old_live_stack,
+    }
+    del old_live_stack
+    resident_ref = weakref.ref(session._jlens)
+    real_fit = jlens_mod.fit_jacobian_lens
+    released: list[bool] = []
+
+    def observe_release(*args: Any, **kwargs: Any) -> Any:
+        gc.collect()
+        released.append(
+            resident_ref() is None
+            and live_stack_ref() is None
+            and not session._jlens_device_cache
+        )
+        return real_fit(*args, **kwargs)
+
+    monkeypatch.setattr(jlens_mod, "fit_jacobian_lens", observe_release)
+    resumed = session.fit_jlens(_PROMPTS, source_layers=[0])
+
+    assert released == [True]
+    assert resumed.source_layers == [0]
+
+
+def test_finalization_failure_rebuilds_evicted_resident(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import saklas.io.lens as lens_io
+
+    session = _StubSession()
+    session.fit_jlens(_PROMPTS[:2], force=True)
+    durable_pair = load_lens(_MODEL_ID)
+    assert durable_pair is not None
+    expected = durable_pair[0]
+    assert session._jlens is not None
+    session._jlens_transport_stack(
+        session._jlens, session._jlens.source_layers, torch.device("cpu"),
+    )
+
+    def fail_promotion(*_args: Any, **_kwargs: Any) -> bool:
+        raise OSError("injected promotion failure")
+
+    monkeypatch.setattr(lens_io, "promote_lens_checkpoint", fail_promotion)
+    with pytest.raises(OSError, match="promotion failure"):
+        session.fit_jlens(_PROMPTS, checkpoint_every=1)
+
+    assert session._jlens is not None
+    assert session._jlens.n_prompts == expected.n_prompts
+    assert session._jlens_device_cache == {}
+    for layer in expected.source_layers:
+        assert torch.allclose(
+            session._jlens.jacobians[layer], expected.jacobians[layer],
+        )
+
+
 def test_fit_jlens_missing_layer_topup_resumes_checkpoint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

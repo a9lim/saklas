@@ -202,6 +202,14 @@ Long compute is serialized only per exact model/variant target; folder locks
 cover an exact-input snapshot and revision-CAS publication, so readers and other
 targets continue while fitting. Scoped clear epochs and a folder artifact id
 prevent a paused fit from undoing clear or publishing into an rm/recreated folder.
+Every destructive authoring reset or HF replacement follows the same manifest →
+sorted stable-pair lock order as lifecycle deletion before it removes or swaps a
+folder. Corpus-less baked writers publish each tensor/sidecar proof as part of
+the folder transaction; if manifest proof publication fails, an identical
+ordinary retry replaces the unproven pair and resumes a matching multi-model
+merge from its verified prefix. Merge model discovery carries its verified,
+folded components into preparation, so it never repeats artifact hash/load/fold
+work merely to rediscover the shared model intersection.
 
 ### 3.2 A steering vector as a 2-node fit
 
@@ -932,14 +940,18 @@ the CPU accumulator; an OOM
 rebuilds the graph at the first uncommitted row. Self-contained checkpoints
 (`jlens.partial.*`) are written as immutable per-layer shards directly from raw
 accumulator sums, avoiding a second full fp32 lens and supporting repeated
-interruption or missing-layer top-up resume. Sparse layer top-ups reuse the
+interruption or missing-layer top-up resume. A resumed prefix is converted from
+average to weighted sum in place and becomes the tail estimator's accumulator,
+so resume retains one full fp32 lens rather than two. Sparse layer top-ups reuse the
 unchanged durable shard pointers and write only new matrices. The streamed
 safetensors writer never retains a complete fp16 mapping. Normal corpus extension
 resumes from an exact token-id prefix; the default dataset is commit-pinned;
 exact source/live-model fingerprints invalidate mutable revisions. A complete
 terminal checkpoint is fsynced and promoted at finalization instead of being
 rewritten; otherwise each fp16 layer shard is streamed once, with its payload
-digest verified on final and checkpoint loads. Exact no-op recovery removes a
+digest verified on final and checkpoint loads. Pointer-directory fsync precedes
+old-generation GC/checkpoint unlink, and fit preflight reaps crash-left streamed
+temporaries. Exact no-op recovery removes a
 checkpoint left by a crash after final publication only when the final pointer
 provably subsumes its corpus, layers, estimator policy, and effective progress.
 The artifact (`io/lens.py`,
@@ -1079,7 +1091,9 @@ requirement; no lever — it's gone), clears `origin` (per-layer foot of the
 *source* neutral), and writes the
 `_from-<safe_src>` variant. Since a vector is a 2-node `pca` manifold, `manifold
 transfer` routes to this one transfer path. Alignments cache under the *target*
-model dir.
+model dir. Stable per-model neutral-capture locks and directional alignment-fit
+locks span cache recheck through publication (including both serial model
+loads), so two cold transfer commands do not repeat the same capture/fit work.
 
 ---
 

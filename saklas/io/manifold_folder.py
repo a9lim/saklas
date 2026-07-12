@@ -35,7 +35,7 @@ this module owns folder discovery, the node corpus, and integrity.
 """
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import hashlib
 import json
 import re
@@ -119,6 +119,66 @@ def manifold_pair_lock(tensor_path: Path):
 
     with artifact_lock(manifold_pair_lock_path(tensor_path)):
         yield
+
+
+def manifold_folder_tensor_paths(folder: Path) -> list[Path]:
+    """Return canonical tensor paths for every fitted/orphan pair in ``folder``.
+
+    Destructive folder replacement cannot trust ``manifold.json::files``: the
+    operation is also the recovery path for an interrupted publication whose
+    tensor or sidecar never acquired a manifest proof.  Scan both halves and
+    canonicalize sidecars back to their tensor path so each logical pair is
+    locked exactly once.
+    """
+
+    from saklas.io.paths import parse_tensor_filename
+
+    folder = Path(folder)
+    candidates = list(folder.glob("*.safetensors")) + [
+        sidecar
+        for sidecar in folder.glob("*.json")
+        if sidecar.name != "manifold.json"
+    ]
+    tensors: set[Path] = set()
+    for candidate in candidates:
+        tensor = (
+            candidate.with_suffix(".safetensors")
+            if candidate.suffix == ".json" else candidate
+        )
+        if parse_tensor_filename(tensor.name) is not None:
+            tensors.add(tensor)
+    return sorted(tensors)
+
+
+@contextmanager
+def destructive_manifold_folder_transaction(folder: Path):
+    """Quiesce fitted readers before a whole-folder reset or stage swap.
+
+    Global mutation order is manifest then stable pair locks, with pair locks in
+    deterministic tensor-path order.  The pair locks live outside the removable
+    folder, so holding this context across ``rmtree``/rename/recreation prevents
+    a new inode from bypassing a reader that still owns the old logical pair.
+    The manifest lock is re-entrant, allowing authoring entry points that already
+    serialize their destination to use this one shared destructive seam.
+    """
+
+    folder = Path(folder)
+    with _locked_manifest(folder):
+        with ExitStack() as stack:
+            for tensor_path in manifold_folder_tensor_paths(folder):
+                stack.enter_context(manifold_pair_lock(tensor_path))
+            yield
+
+
+def reset_manifold_folder(folder: Path) -> None:
+    """Remove ``folder`` only after all extant fitted pairs are quiescent."""
+
+    import shutil
+
+    folder = Path(folder)
+    with destructive_manifold_folder_transaction(folder):
+        if folder.exists():
+            shutil.rmtree(folder)
 
 # Per-method hyperparameter whitelists.  Anything outside the whitelist
 # for a given fit_mode is dropped at folder-create time so a user

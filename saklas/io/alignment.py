@@ -26,8 +26,9 @@ from __future__ import annotations
 
 import logging
 import os
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 import hashlib
 import json
 
@@ -60,6 +61,16 @@ def _neutral_acts_paths(model_id: str) -> tuple[Path, Path]:
         md / f"{_NEUTRAL_ACTS_NAME}.safetensors",
         md / f"{_NEUTRAL_ACTS_NAME}.json",
     )
+
+
+@contextmanager
+def neutral_fit_lock(model_id: str) -> Iterator[None]:
+    """Single-flight lock for one model's expensive neutral forward pass."""
+    from saklas.io.atomic import artifact_lock
+
+    ts_path, _ = _neutral_acts_paths(model_id)
+    with artifact_lock(ts_path.with_name(f"{ts_path.stem}.fit")):
+        yield
 
 
 def validate_neutral_cache_metadata(model_id: str) -> dict[str, Any]:
@@ -157,6 +168,21 @@ def neutral_cache_identity(sidecar: dict[str, Any]) -> dict[str, Any]:
 
 
 def load_or_compute_neutral_activations(
+    model: Any,
+    tokenizer: Any,
+    layers: Any,
+    *,
+    model_id: str,
+    force: bool = False,
+) -> dict[int, torch.Tensor]:
+    """Single-flight wrapper around neutral-cache validation and capture."""
+    with neutral_fit_lock(model_id):
+        return _load_or_compute_neutral_activations_locked(
+            model, tokenizer, layers, model_id=model_id, force=force,
+        )
+
+
+def _load_or_compute_neutral_activations_locked(
     model: Any,
     tokenizer: Any,
     layers: Any,
@@ -515,6 +541,16 @@ def alignment_cache_path(src_model_id: str, tgt_model_id: str) -> tuple[Path, Pa
     al_dir = md / "alignments"
     src_safe = safe_model_id(src_model_id)
     return (al_dir / f"{src_safe}.safetensors", al_dir / f"{src_safe}.json")
+
+
+@contextmanager
+def alignment_fit_lock(src_model_id: str, tgt_model_id: str) -> Iterator[None]:
+    """Single-flight a complete directional alignment fit, including loads."""
+    from saklas.io.atomic import artifact_lock
+
+    ts_path, _ = alignment_cache_path(src_model_id, tgt_model_id)
+    with artifact_lock(ts_path.with_name(f"{ts_path.stem}.fit")):
+        yield
 
 
 def save_alignment_map(

@@ -1031,13 +1031,17 @@ def fit_jacobian_lens(
     vjp_mode: str = "auto",
     cancel_event: Any | None = None,
     suppress_terminal_checkpoint: bool = False,
+    initial_lens: JacobianLens | None = None,
 ) -> JacobianLens:
     """Fit ``J_l`` for every source layer over ``prompts``.
 
     One graph per prompt microbatch + ``ceil(d_model/dim_batch)`` backwards
     (see the module docstring for the estimator). ``checkpoint_cb`` receives the partial lens
     every ``checkpoint_every`` prompts — the io layer uses it for resumable
-    fits (callers merging with a prior shard do so outside this function).
+    fits. ``initial_lens`` transfers ownership of an existing averaged prefix
+    to the estimator: its fp32 matrices are converted to weighted sums in
+    place and become the accumulator, so resume never allocates a second full
+    matrix set.
     ``checkpoint_accumulator_cb`` is the allocation-light persistence seam: it
     receives the raw fp32 sums, completed prompt count, and hidden size without
     materializing a second full averaged lens.  ``checkpoint_cb`` remains the
@@ -1081,6 +1085,17 @@ def fit_jacobian_lens(
             f"source_layers must lie in [0, {final_idx}) — the final layer is "
             f"the transport target, not a source; got {sources}"
         )
+    initial_n_prompts = 0
+    initial_acc: dict[int, torch.Tensor] | None = None
+    if initial_lens is not None:
+        if initial_lens.source_layers != sources:
+            raise ValueError(
+                "initial_lens source layers must exactly match the fit request"
+            )
+        if initial_lens.n_prompts <= 0:
+            raise ValueError("initial_lens must contain at least one prompt")
+        initial_n_prompts = int(initial_lens.n_prompts)
+        initial_acc = initial_lens.jacobians
     if input_id_rows is not None and len(input_id_rows) != len(prompts):
         raise ValueError(
             "input_id_rows must be aligned with prompts "
@@ -1088,18 +1103,6 @@ def fit_jacobian_lens(
         )
     requested_vjp_mode = _resolve_vjp_mode(vjp_mode)
 
-    # Cross-prompt state, threaded through every per-prompt sweep: the CPU
-    # fp32 accumulator, plus per-layer on-device row buffers reused across
-    # prompts (allocated once d_model is known).
-    state: dict[str, Any] = {
-        "acc": None,
-        "d_model": 0,
-        "stripe_rows": None,
-        "host_stripes": None,
-        "cuda_transfer_stream": None,
-        "vjp_mode": "batched" if requested_vjp_mode == "auto" else requested_vjp_mode,
-        "requested_vjp_mode": requested_vjp_mode,
-    }
     # Prepare once. Session orchestration normally supplies token IDs it already
     # hashed for resume; direct callers get the same one-time tokenization here.
     prepared_rows: list[tuple[int, torch.Tensor]] = []
@@ -1118,6 +1121,31 @@ def fit_jacobian_lens(
             )
             continue
         prepared_rows.append((prompt_idx, ids_cpu))
+
+    if not prepared_rows:
+        raise JacobianLensError(
+            f"no usable prompts: every prompt had <= {skip_first + 1} tokens"
+        )
+    if cancel_event is not None and cancel_event.is_set():
+        raise JacobianLensCancelled("Jacobian-lens fit cancelled before start")
+    if initial_acc is not None:
+        for tensor in initial_acc.values():
+            tensor.mul_(initial_n_prompts)
+        assert initial_lens is not None
+        initial_lens._atom_norm_cache.clear()
+
+    # Cross-prompt state, threaded through every per-prompt sweep: the CPU
+    # fp32 accumulator, plus per-layer on-device row buffers reused across
+    # prompts (allocated once d_model is known).
+    state: dict[str, Any] = {
+        "acc": initial_acc,
+        "d_model": initial_lens.d_model if initial_lens is not None else 0,
+        "stripe_rows": None,
+        "host_stripes": None,
+        "cuda_transfer_stream": None,
+        "vjp_mode": "batched" if requested_vjp_mode == "auto" else requested_vjp_mode,
+        "requested_vjp_mode": requested_vjp_mode,
+    }
 
     n_done = 0
     fit_started = time.perf_counter()
@@ -1150,9 +1178,10 @@ def fit_jacobian_lens(
     def _partial() -> JacobianLens:
         acc = state["acc"]
         assert acc is not None
+        total_done = initial_n_prompts + n_done
         return JacobianLens(
-            {l: a / max(n_done, 1) for l, a in acc.items()},
-            n_prompts=n_done,
+            {l: a / max(total_done, 1) for l, a in acc.items()},
+            n_prompts=total_done,
             d_model=state["d_model"],
         )
 
@@ -1173,7 +1202,9 @@ def fit_jacobian_lens(
                         if n_done > 0:
                             if checkpoint_accumulator_cb is not None:
                                 checkpoint_accumulator_cb(
-                                    state["acc"], n_done, state["d_model"],
+                                    state["acc"],
+                                    initial_n_prompts + n_done,
+                                    state["d_model"],
                                 )
                             if checkpoint_cb is not None:
                                 checkpoint_cb(_partial())
@@ -1385,7 +1416,9 @@ def fit_jacobian_lens(
                 ):
                     if checkpoint_accumulator_cb is not None:
                         checkpoint_accumulator_cb(
-                            state["acc"], n_done, state["d_model"],
+                            state["acc"],
+                            initial_n_prompts + n_done,
+                            state["d_model"],
                         )
                     if checkpoint_cb is not None:
                         checkpoint_cb(_partial())
@@ -1408,11 +1441,12 @@ def fit_jacobian_lens(
     # Finalization owns the accumulator now; normalize it in place instead of
     # allocating one additional fp32 artifact through ``_partial()``.
     acc: dict[int, torch.Tensor] = state["acc"]
-    inv_n = 1.0 / n_done
+    total_done = initial_n_prompts + n_done
+    inv_n = 1.0 / total_done
     for tensor in acc.values():
         tensor.mul_(inv_n)
     return JacobianLens(
-        acc, n_prompts=n_done, d_model=state["d_model"],
+        acc, n_prompts=total_done, d_model=state["d_model"],
     )
 
 
@@ -1510,6 +1544,13 @@ def _accumulate_prompt_jacobian(
                 l: torch.zeros(d_model, d_model, dtype=torch.float32) for l in sources
             }
             state["d_model"] = d_model
+        elif (
+            int(state["d_model"]) != int(d_model)
+            or set(state["acc"]) != set(sources)
+        ):
+            raise ValueError(
+                "initial_lens shape/layers do not match the loaded model"
+            )
         stripe_capacity = _row_stripe_capacity(
             d_model, len(sources), batch,
         )

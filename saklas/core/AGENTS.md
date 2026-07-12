@@ -78,7 +78,10 @@ for allocation-light resumable fits: IO normalizes live sums and merges any
 prefix one layer at a time while converting to fp16, so checkpointing does not
 materialize another complete fp32 lens. Checkpoints are self-contained
 (`base_n_prompts=0`) and survive repeated interruptions even beside an older
-full artifact; cadence never fractures a healthy prompt microbatch. When the
+full artifact. Resume transfers ownership of the loaded prefix matrices into
+the estimator, scales them to raw sums in place, and accumulates the tail into
+that same storage; it therefore holds one full fp32 matrix set, not a base plus
+an equally large tail. Cadence never fractures a healthy prompt microbatch. When the
 terminal checkpoint is already the complete lens, finalization fsyncs its
 immutable per-layer tensor generations and atomically repoints the durable sidecar instead
 of converting/writing the same artifact again. The checkpoint remains the

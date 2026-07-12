@@ -14,6 +14,7 @@ the real cache is never touched.
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 
 import pytest
@@ -143,6 +144,59 @@ def test_compute_and_cache_paths_bit_identical(tmp_path: Path, monkeypatch: pyte
         assert torch.equal(out_compute[layer], out_cache[layer]), (
             f"layer {layer} differs across the cache boundary (precision seam)"
         )
+
+
+def test_concurrent_cold_neutral_cache_is_single_flight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_home(tmp_path, monkeypatch)
+    calls = _patch_compute(monkeypatch, _deterministic_acts())
+    barrier = threading.Barrier(2)
+    results: list[dict[int, torch.Tensor]] = []
+    errors: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            barrier.wait()
+            results.append(_compute())
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=run) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5.0)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert errors == []
+    assert len(results) == 2
+    assert calls["n"] == 1
+
+
+def test_alignment_fit_lock_serializes_same_direction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from saklas.io.alignment import alignment_fit_lock
+
+    _install_home(tmp_path, monkeypatch)
+    entered = threading.Event()
+    done = threading.Event()
+
+    def acquire() -> None:
+        entered.set()
+        with alignment_fit_lock("source/model", "target/model"):
+            done.set()
+
+    with alignment_fit_lock("source/model", "target/model"):
+        worker = threading.Thread(target=acquire)
+        worker.start()
+        assert entered.wait(1.0)
+        assert not done.wait(0.1)
+    worker.join(timeout=2.0)
+
+    assert not worker.is_alive()
+    assert done.is_set()
 
 
 def test_legacy_bf16_cache_invalidated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

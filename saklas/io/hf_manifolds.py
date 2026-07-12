@@ -111,6 +111,22 @@ def _pull_manifold_locked(
     (safetensors with no manifest and no statements) carries no recoverable
     geometry/authoring, so it's refused — re-author it as a manifold.
     """
+    # Recover a crash-left stage swap before conflict policy or pair-lock
+    # discovery.  The public caller already owns the stable manifest lock.  A
+    # force replacement will now see the recovered folder and quiesce all its
+    # fitted pair readers; a non-force install must preserve it as an existing
+    # destination rather than silently overwrite it.
+    backup = target_folder.with_name(target_folder.name + ".bak")
+    if not target_folder.exists() and backup.exists():
+        try:
+            backup.rename(target_folder)
+        except OSError as exc:
+            raise HFError(
+                f"{coord}: could not recover interrupted install ({exc})"
+            ) from exc
+    if target_folder.exists() and not force:
+        raise HFError(f"{target_folder} exists; pass force=True to overwrite")
+
     tmp_dir = Path(_download(coord, revision=revision))
 
     if not (tmp_dir / "manifold.json").is_file():
@@ -154,13 +170,23 @@ def _pull_manifold_locked(
                 f"source stamp ({e})"
             ) from e
 
-    return stage_verify_swap(
-        target_folder,
-        force=force,
-        label=coord,
-        build=_build,
-        make_error=HFError,
-    )
+    def _swap() -> Path:
+        return stage_verify_swap(
+            target_folder,
+            force=force,
+            label=coord,
+            build=_build,
+            make_error=HFError,
+        )
+
+    if force and target_folder.exists():
+        from saklas.io.manifold_folder import (
+            destructive_manifold_folder_transaction,
+        )
+
+        with destructive_manifold_folder_transaction(target_folder):
+            return _swap()
+    return _swap()
 
 
 def _install_manifold(tmp_dir: Path, target_folder: Path, _coord: str) -> None:
@@ -731,7 +757,9 @@ def _install_local_manifold(
                 raise ManifoldInstallConflict(
                     f"{dst} already exists; pass force=True or as_=<ns>/<name>"
                 )
-            shutil.rmtree(dst)
+            from saklas.io.manifold_folder import reset_manifold_folder
+
+            reset_manifold_folder(dst)
 
         dst.parent.mkdir(parents=True, exist_ok=True)
         if is_manifold:

@@ -242,6 +242,22 @@ def write_bytes_atomic(path: Path, data: bytes) -> None:
     os.replace(tmp, path)
 
 
+def fsync_directory(path: Path) -> None:
+    """Best-effort durability barrier for prior directory-entry mutations."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        fd = os.open(Path(path), flags)
+    except OSError:
+        # Windows and a few network filesystems do not permit directory opens.
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
 def write_json_atomic(path: Path, payload: Any, *, indent: int = 2) -> None:
     """Atomically write ``payload`` as JSON to ``path``.
 
