@@ -93,9 +93,3 @@ def node_json(session: SaklasSession, node_id: str) -> dict[str, Any]:
     out = node.to_dict(include_tokens=True)
     out["children"] = list(session.tree.children_of.get(node_id, []))
     return out
-
-
-# Backcompat aliases for the old ``saklas_api.py`` import surface.
-_tree_to_json = tree_to_json
-_active_path_json = active_path_json
-_node_json = node_json

@@ -113,4 +113,4 @@ The dashboard speaks the existing `/saklas/v1/*` native API:
 * `WS /saklas/v1/sessions/default/stream` — token + probe co-stream; the `token` event carries optional `scores` (magnitude-weighted aggregate, drives the live inline highlight) + `per_layer_scores` (per-layer heatmap for the drilldown), and the `done` event carries `per_token_probes`
 * `GET /saklas/v1/sessions/default/traits/stream` — live per-token probe SSE
 
-See `saklas/server/saklas_api.py` for the Python side.
+See `saklas/server/native_routes.py` for the Python route registrar.

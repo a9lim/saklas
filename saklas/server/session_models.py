@@ -10,7 +10,7 @@ from pydantic import BaseModel
 from saklas.core.generation import supports_thinking, thinking_is_optional
 from saklas.core.session import SaklasSession
 from saklas.core.steering import Steering
-from saklas.server.native_common import resolve_session_id, session_aliases
+from saklas.server.native_common import session_aliases
 
 
 class CreateSessionRequest(BaseModel):
@@ -219,13 +219,3 @@ def session_info(
         # "lasts one turn" pre-submit warning.
         **_scene_capabilities(session),
     }
-
-
-# Backcompat aliases for the old ``saklas_api.py`` import surface.
-_resolve_session_id = resolve_session_id
-_session_config_dict = session_config_dict
-_session_model_type = session_model_type
-_role_support = role_support
-_default_role_labels = default_role_labels
-_device_dtype = device_dtype
-_session_info = session_info

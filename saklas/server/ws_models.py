@@ -117,9 +117,3 @@ def per_token_probes(
         }
         for i in range(n_tokens)
     ]
-
-
-# Backcompat aliases for the old ``saklas_api.py`` import surface.
-_build_sampling = build_sampling
-_result_to_json = result_to_json
-_per_token_probes = per_token_probes

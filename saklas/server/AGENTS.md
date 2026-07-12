@@ -10,7 +10,7 @@ the vectors-under-session routes (extract/merge); HF upload stays CLI-only.
 
 `app.py` registers the OpenAI routes inline, then calls
 `register_ollama_routes(app)` (`ollama.py`) and `register_saklas_routes(app)`
-(`saklas_api.py`), then mounts the Svelte SPA last (so its catch-all can't shadow
+(`native_routes.py`), then mounts the Svelte SPA last (so its catch-all can't shadow
 the API). `register_saklas_routes` is the native-tree orchestrator — it delegates
 to sub-module registrars (and owns the shared request bodies + serializer helpers
 those registrars import):
@@ -109,9 +109,8 @@ protocol: tool calling, JSON-schema/structured-output mode, embeddings.
 
 ## Native route modules and schemas
 
-`saklas_api.py` is now only the native-route registrar plus a backcompat re-export
-surface for old imports. New route-specific request bodies and serializers live
-beside their route groups:
+`native_routes.py` registers the native route groups. Route-specific request
+bodies and serializers live beside their route groups:
 
 - `native_common.py` — single-session id resolution.
 - `session_models.py` — session request bodies and `session_info`.

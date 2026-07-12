@@ -30,9 +30,3 @@ def resolve_session_id(session: SaklasSession, session_id: str) -> None:
         status_code=404,
         detail=f"session '{session_id}' not found",
     )
-
-
-# Backcompat aliases for the old ``saklas_api.py`` import surface.
-_SINGLE_SESSION_ID = SINGLE_SESSION_ID
-_session_aliases = session_aliases
-_resolve_session_id = resolve_session_id

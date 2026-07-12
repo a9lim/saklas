@@ -119,10 +119,3 @@ def coerce_corpora(source: Any) -> Any:
                 f"pairs[{idx}] must be a [positive, negative] pair",
             )
     return positive, negative
-
-
-# Backcompat aliases for the old ``saklas_api.py`` import surface.
-_profile_to_json = profile_to_json
-_extract_registry_name = extract_registry_name
-_probe_profile_tensors = probe_profile_tensors
-_coerce_corpora = coerce_corpora

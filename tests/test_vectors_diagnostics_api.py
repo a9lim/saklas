@@ -121,7 +121,7 @@ class TestVectorDiagnostics:
         assert data["model"] == "test/model"
         # ``total_layers`` is the *model's* depth (so the layer-norms drawer
         # can show layers DLS dropped), not the profile's — see the endpoint
-        # comment in ``saklas/server/saklas_api.py``.
+        # native vector-route contract.
         assert data["total_layers"] == session.model_info["num_layers"]
 
         hist = data["histogram"]

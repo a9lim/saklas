@@ -1,6 +1,6 @@
 // Shared types for the saklas webui.  Every panel/drawer/store imports
 // from here so renames stay one-shot.  Mirrors the JSON shapes in
-// saklas/server/saklas_api.py and the steering grammar in
+// saklas/server route models and the steering grammar in
 // saklas/core/steering_expr.py.
 
 // ---------------------------------------------------------- triggers --

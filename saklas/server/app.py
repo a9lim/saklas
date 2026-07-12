@@ -558,7 +558,7 @@ def create_app(session: SaklasSession,
     from saklas.server.ollama import register_ollama_routes
     register_ollama_routes(app)
 
-    from saklas.server.saklas_api import register_saklas_routes
+    from saklas.server.native_routes import register_saklas_routes
     register_saklas_routes(app)
 
     # Mount the Svelte+Vite SPA dashboard last so its catch-all route

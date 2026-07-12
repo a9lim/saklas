@@ -1789,7 +1789,7 @@ function applyTreeDelta(ev: {
   if (loomTree.rev > 0 && ev.rev > loomTree.rev + 1) return false;
   // ``added``: inject node + extend its parent's children list.  Node
   // payloads from the server may include a ``children`` field
-  // (_node_json adds it); strip before storing so the cached node
+  // (the server serializer adds it); strip before storing so the cached node
   // shape stays consistent with the bootstrap fetch.
   for (const raw of ev.added ?? []) {
     upsertLoomNode(raw as LoomNodeJSON & { children?: string[] });
@@ -3468,7 +3468,7 @@ async function _sendShadowGenerate(steeredIdx: number): Promise<void> {
     // to ``session._prepare_input`` which dispatches on isinstance(list).
     input: messages,
     // Empty steering string == unsteered shadow per the WS protocol
-    // (saklas_api._build_steering treats "" as "no expression").
+    // (the server treats "" as "no expression").
     steering: "",
     sampling,
     thinking: samplingState.thinking ?? false,
