@@ -165,6 +165,7 @@ def _author_manifold(
         "format_version": MANIFOLD_FORMAT_VERSION,
         "name": "mood",
         "description": "moods",
+        "fit_mode": "authored",
         "domain": domain,
         "nodes": [
             {"label": label, "coords": coords[i]}

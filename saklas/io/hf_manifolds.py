@@ -626,11 +626,21 @@ def fetch_manifold_info(
         raise HFError(f"{label}: fetch_manifold_info failed ({e})") from e
 
     fmt_version = data.get("format_version")
-    if fmt_version is not None and fmt_version > MANIFOLD_FORMAT_VERSION:
+    if (
+        not isinstance(fmt_version, int)
+        or isinstance(fmt_version, bool)
+        or fmt_version != MANIFOLD_FORMAT_VERSION
+    ):
         raise HFError(
-            f"{label}: manifold format_version {fmt_version} is newer than "
-            f"this saklas understands ({MANIFOLD_FORMAT_VERSION}); update saklas."
+            f"{label}: manifold format_version must be exactly "
+            f"{MANIFOLD_FORMAT_VERSION}, got {fmt_version!r}."
         )
+    manifest_name = data.get("name")
+    if not isinstance(manifest_name, str) or not NAME_REGEX.match(manifest_name):
+        raise HFError(f"{label}: manifold has invalid or missing name")
+    fit_mode = data.get("fit_mode")
+    if fit_mode not in {"authored", "pca", "spectral", "auto", "baked"}:
+        raise HFError(f"{label}: manifold has invalid or missing fit_mode")
 
     tensor_models = sorted(
         Path(f).stem for f in files
@@ -639,7 +649,6 @@ def fetch_manifold_info(
 
     ns, _, nm = coord.partition("/")
     domain = data.get("domain") or {}
-    fit_mode = data.get("fit_mode", "authored")
     nodes = data.get("nodes") or []
     node_count = len(nodes) if isinstance(nodes, list) else 0
 

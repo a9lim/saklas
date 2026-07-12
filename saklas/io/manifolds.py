@@ -268,7 +268,11 @@ def _materialize_one_bundled_manifold(default_dir: Path, name: str) -> None:
             != _manifest_content_sha256(bundled_manifest_bytes)
         )
         fmt = on_disk_payload.get("format_version")
-        format_stale = isinstance(fmt, int) and fmt < MANIFOLD_FORMAT_VERSION
+        format_stale = (
+            not isinstance(fmt, int)
+            or isinstance(fmt, bool)
+            or fmt != MANIFOLD_FORMAT_VERSION
+        )
         if not manifest_changed and not format_stale:
             return
 
@@ -347,8 +351,8 @@ def materialize_bundled_manifolds() -> None:
     - **Fresh install** (target dir doesn't exist) — copy every shipped
       file atomically.
     - **Bundle update** (canonical-JSON hash of bundled ``manifold.json``
-      differs from materialized, OR on-disk ``format_version`` is older
-      than :data:`MANIFOLD_FORMAT_VERSION`) — re-copy ``manifold.json``
+      differs from materialized, OR on-disk ``format_version`` is not exactly
+      :data:`MANIFOLD_FORMAT_VERSION`) — re-copy ``manifold.json``
       in place (writing a ``.bak``), re-copy every node file
       unconditionally, re-copy any other top-level shipped files.
     - **No change** (manifest hashes match AND format_version is

@@ -898,7 +898,7 @@ def _author_manifold_on_disk(
     name: str = "mood",
     labels: list[str] | None = None,
 ) -> Any:
-    """Hand-author a v4 authored 1-D box manifold under ``$SAKLAS_HOME``.
+    """Hand-author a current authored 1-D box manifold under ``$SAKLAS_HOME``.
 
     Mirrors the minimal fixture ``test_manifolds_io`` uses, but writes
     into the live ``manifolds/<ns>/<name>/`` tree so the server routes
@@ -925,6 +925,7 @@ def _author_manifold_on_disk(
         "format_version": MANIFOLD_FORMAT_VERSION,
         "name": name,
         "description": "a mood manifold",
+        "fit_mode": "authored",
         "domain": {
             "type": "box",
             "axes": [{"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}],

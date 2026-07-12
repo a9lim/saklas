@@ -28,6 +28,7 @@ import pytest
 
 from saklas.io import hf_manifolds as hfm
 from saklas.io.hf import HFError
+from saklas.io.manifolds import MANIFOLD_FORMAT_VERSION
 
 
 # --------------------------------------------------------------------------- #
@@ -129,7 +130,6 @@ def test_fetch_manifold_info_sphere_and_custom_and_discover(
           "domain": {"type": "custom", "embed_dim": 5}}, "custom(5d)"),
         ({"fit_mode": "auto"}, "discover-auto"),
         ({"fit_mode": "pca"}, "discover-pca"),
-        ({"fit_mode": "weird"}, "?"),     # no domain, non-discover -> ?
     ]
     for i, (extra, expect) in enumerate(cases):
         payload = {"format_version": 6, "name": f"m{i}", "nodes": []}
@@ -143,18 +143,36 @@ def test_fetch_manifold_info_sphere_and_custom_and_discover(
 def test_fetch_manifold_info_rejects_newer_format(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
-    from saklas.io.manifolds import MANIFOLD_FORMAT_VERSION
-
     manifest = _write_manifest(tmp_path / "repo", {
         "format_version": MANIFOLD_FORMAT_VERSION + 1,
-        "name": "future", "nodes": [],
+        "name": "future", "fit_mode": "pca", "nodes": [],
     })
     api = _FakeApi(files=["manifold.json"])
     monkeypatch.setattr(hfm, "_hf_hub_download", lambda c, fn, **kw: str(manifest))
     monkeypatch.setattr(hfm, "_hf_api", lambda: api)
 
-    with pytest.raises(HFError, match="newer than"):
+    with pytest.raises(HFError, match="must be exactly"):
         hfm.fetch_manifold_info("alice/future")
+
+
+@pytest.mark.parametrize("field", ["format_version", "name", "fit_mode"])
+def test_fetch_manifold_info_requires_current_identity_fields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str,
+) -> None:
+    payload = {
+        "format_version": MANIFOLD_FORMAT_VERSION,
+        "name": "current",
+        "fit_mode": "pca",
+        "nodes": [],
+    }
+    payload.pop(field)
+    manifest = _write_manifest(tmp_path / "repo", payload)
+    api = _FakeApi(files=["manifold.json"])
+    monkeypatch.setattr(hfm, "_hf_hub_download", lambda c, fn, **kw: str(manifest))
+    monkeypatch.setattr(hfm, "_hf_api", lambda: api)
+
+    with pytest.raises(HFError):
+        hfm.fetch_manifold_info("alice/current")
 
 
 def test_fetch_manifold_info_wraps_transport_failure(monkeypatch: pytest.MonkeyPatch):

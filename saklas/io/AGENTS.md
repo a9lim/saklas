@@ -56,8 +56,8 @@ profile-cache sidecars `profile.save_profile` writes.
 
 The on-disk format for every concept + steering manifold —
 `~/.saklas/manifolds/<ns>/<name>/`. `MANIFOLD_FORMAT_VERSION = 6` (decoupled from
-`PACK_FORMAT_VERSION`); reads v5 (missing `affine_map` means identity), writes v6,
-and rejects older formats. `min_nodes(n) = 2n+1`
+`PACK_FORMAT_VERSION`); readers and writers require exactly v6.
+`min_nodes(n) = 2n+1`
 (the curved-fit poisedness floor). Five `fit_mode`s share the class, discriminated
 by `manifold.json::fit_mode`:
 
@@ -181,7 +181,7 @@ metadata-only, then strictly verifies the selected fitted pair when loading it.
 `materialize_bundled_manifolds`
 (copy-on-miss into `default/` for complete package-data folders only, plus a
 re-copy when the bundled manifest hash drifts or the on-disk `format_version`
-predates `MANIFOLD_FORMAT_VERSION`). Bundle-drift comparison runs on the
+is not current). Bundle-drift comparison runs on the
 **`files`-stripped** canonical payload (`_manifest_content_sha256`) — the
 integrity map accumulates per-model fit proofs locally
 (`update_file_hashes`), so comparing it against the shipped manifest

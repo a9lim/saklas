@@ -87,6 +87,7 @@ def _author_manifold(
         "format_version": MANIFOLD_FORMAT_VERSION,
         "name": name,
         "description": "a mood manifold",
+        "fit_mode": "authored",
         "domain": spec["domain"],
         "nodes": spec["nodes"],
         "files": files if files is not None else {},
@@ -137,29 +138,6 @@ def test_stale_format_version_raises(tmp_path: Path):
         ManifoldFolder.load(folder)
 
 
-def test_v5_folder_remains_readable_under_v6_writer(tmp_path: Path) -> None:
-    """v5 means identity affine coords; v6 readers need no migration."""
-    from saklas.core.manifold import load_manifold
-    from saklas.io.packs import hash_file
-
-    folder = _author_manifold(tmp_path)
-    tensor = _fit_real_manifold(folder, "legacy/model", dim=4)
-    sidecar_path = tensor.with_suffix(".json")
-    sidecar = json.loads(sidecar_path.read_text())
-    sidecar["format_version"] = 5
-    sidecar_path.write_text(json.dumps(sidecar))
-
-    manifest_path = folder / "manifold.json"
-    manifest = json.loads(manifest_path.read_text())
-    manifest["format_version"] = 5
-    manifest["files"][sidecar_path.name] = hash_file(sidecar_path)
-    manifest_path.write_text(json.dumps(manifest))
-
-    loaded = ManifoldFolder.load(folder)
-    assert loaded.name == "mood"
-    assert load_manifold(tensor).name == "mood"
-
-
 def test_newer_format_version_raises(tmp_path: Path):
     # Symmetric ceiling, mirroring PackMetadata.load — a manifold authored
     # by a future saklas (format_version > local) must not load silently.
@@ -167,7 +145,19 @@ def test_newer_format_version_raises(tmp_path: Path):
     meta = json.loads((folder / "manifold.json").read_text())
     meta["format_version"] = MANIFOLD_FORMAT_VERSION + 1
     (folder / "manifold.json").write_text(json.dumps(meta))
-    with pytest.raises(ManifoldFormatError, match="newer saklas"):
+    with pytest.raises(ManifoldFormatError, match="need exactly"):
+        ManifoldFolder.load(folder)
+
+
+@pytest.mark.parametrize("field", ["format_version", "name", "fit_mode"])
+def test_current_manifest_requires_identity_fields(tmp_path: Path, field: str) -> None:
+    folder = _author_manifold(tmp_path)
+    manifest_path = folder / "manifold.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest.pop(field)
+    manifest_path.write_text(json.dumps(manifest))
+
+    with pytest.raises(ManifoldFormatError):
         ManifoldFolder.load(folder)
 
 
@@ -395,31 +385,6 @@ def test_update_file_hashes_only_reads_new_artifact(
     assert ManifoldFolder.load(folder).files == mf.files
 
 
-def test_update_file_hashes_upgrades_readable_v5_manifest(
-    tmp_path: Path,
-) -> None:
-    folder = _author_manifold(tmp_path)
-    manifest_path = folder / "manifold.json"
-    manifest = json.loads(manifest_path.read_text())
-    manifest["format_version"] = 5
-    manifest_path.write_text(json.dumps(manifest))
-    tensor = folder / "new-model.safetensors"
-    sidecar = folder / "new-model.json"
-    tensor.write_bytes(b"v6 tensor")
-    sidecar.write_text(json.dumps({
-        "format_version": MANIFOLD_FORMAT_VERSION,
-        "domain": _box1d(False, ["a", "b", "c"])["domain"],
-    }))
-
-    ManifoldFolder.load(folder, verify_manifest=False).update_file_hashes(
-        tensor, sidecar,
-    )
-
-    published = json.loads(manifest_path.read_text())
-    assert published["format_version"] == MANIFOLD_FORMAT_VERSION
-    assert {tensor.name, sidecar.name} <= set(published["files"])
-
-
 def test_update_file_hashes_rejects_unreadable_future_manifest(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -439,7 +404,7 @@ def test_update_file_hashes_rejects_unreadable_future_manifest(
         pytest.fail("an unreadable manifest must be rejected before payload hashing")
 
     monkeypatch.setattr(folder_mod, "hash_file", _unexpected_hash)
-    with pytest.raises(ManifoldFormatError, match="newer saklas"):
+    with pytest.raises(ManifoldFormatError, match="need exactly"):
         mf.update_file_hashes(tensor)
 
     assert json.loads(manifest_path.read_text()) == manifest
@@ -801,7 +766,7 @@ def test_write_metadata_rejects_concurrent_future_manifest(
     future["format_version"] = MANIFOLD_FORMAT_VERSION + 1
     manifest_path.write_text(json.dumps(future))
 
-    with pytest.raises(ManifoldFormatError, match="newer saklas"):
+    with pytest.raises(ManifoldFormatError, match="need exactly"):
         stale.write_metadata()
 
     assert json.loads(manifest_path.read_text()) == future
@@ -1069,18 +1034,6 @@ def test_discover_create_drops_cross_method_hyperparams_spectral(tmp_path: Path,
     )
     mf = ManifoldFolder.load(folder)
     assert mf.hyperparams == {"max_dim": 8, "k_nn": 5, "bandwidth": 0.1}
-
-
-def test_authored_fit_mode_defaults_when_field_absent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """A legacy v3 manifold.json without a ``fit_mode`` field loads as authored."""
-    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    folder = _author_manifold(tmp_path)
-    data = json.loads((folder / "manifold.json").read_text())
-    data.pop("fit_mode", None)
-    (folder / "manifold.json").write_text(json.dumps(data))
-    mf = ManifoldFolder.load(folder)
-    assert mf.fit_mode == "authored"
-    assert not mf.is_discover
 
 
 # ---------------------------------------------------------------------------
@@ -2142,72 +2095,6 @@ def test_rectangular_transfer_rejects_oblique_rank_collapse() -> None:
         )
 
 
-def test_rectangular_transfer_into_v5_folder_publishes_v6_boundary(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A v6 affine_map can never be trusted under a v5 manifest."""
-    from safetensors.torch import load_file
-    from saklas.core.manifold import (
-        MANIFOLD_FIT_POLICY_VERSION, CustomDomain, LayerSubspace, Manifold,
-        save_manifold,
-    )
-    from saklas.io.alignment import LayerAlignment
-    from saklas.io.paths import tensor_filename
-
-    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    folder = create_discover_manifold_folder(
-        "local", "rect-flat", "", fit_mode="pca",
-        node_corpora={"a": ["a"], "b": ["b"], "c": ["c"]},
-    )
-    node_coords = torch.tensor([[0.0, 0.0], [1.0, -0.5], [-0.25, 1.5]])
-    source = Manifold(
-        name="rect-flat", domain=CustomDomain(2),
-        node_labels=["a", "b", "c"], node_coords=node_coords,
-        layers={0: LayerSubspace.affine(
-            torch.tensor([0.5, -1.0, 2.0, 0.25]),
-            torch.tensor([
-                [1.0, 0.0, 0.0, 0.0],
-                [0.0, 1.0, 0.0, 0.0],
-            ]),
-            node_coords=node_coords.clone(),
-        )},
-    )
-    src_model, tgt_model = "src/model", "tgt/model"
-    src_path = folder / tensor_filename(src_model)
-    mf = ManifoldFolder.load(folder, verify_manifest=False)
-    save_manifold(source, src_path, {
-        "method": "manifold_pca",
-        "nodes_sha256": mf.nodes_sha256(),
-        "model_fingerprint": f"fp:{src_model}",
-        "fit_policy_version": MANIFOLD_FIT_POLICY_VERSION,
-    })
-    mf.update_file_hashes(src_path, src_path.with_suffix(".json"))
-    manifest_path = folder / "manifold.json"
-    manifest = json.loads(manifest_path.read_text())
-    manifest["format_version"] = 5
-    manifest_path.write_text(json.dumps(manifest))
-
-    dense = torch.tensor([
-        [2.0, 0.2, 0.0, 0.0], [0.0, 0.5, 0.0, 0.0],
-        [0.3, 0.0, 1.0, 0.0], [0.0, -0.4, 0.0, 1.0],
-        [0.1, 0.2, 0.0, 0.0], [0.0, 0.3, 0.0, 0.0],
-    ])
-    out = transfer_manifold(
-        folder, from_model=src_model, to_model=tgt_model,
-        alignment={0: LayerAlignment(
-            dense, torch.eye(4), torch.linspace(-0.5, 0.5, 6),
-        )},
-        source_model_fingerprint=f"fp:{src_model}",
-        target_model_fingerprint=f"fp:{tgt_model}",
-        whitener=_target_whitener(dim=6, layers=(0,)),
-    )
-
-    assert json.loads(manifest_path.read_text())["format_version"] == (
-        MANIFOLD_FORMAT_VERSION
-    )
-    assert "layer_0.affine_map" in load_file(str(out), device="cpu")
-
-
 def _target_whitener(*, dim: int = 6, layers: tuple[int, ...] = (4, 5, 6)):
     """A target-model whitener over the transferred layers.
 
@@ -2377,7 +2264,7 @@ def test_transfer_preflight_rejects_future_manifest_before_payload_hash(
             "future manifest reached payload hashing"
         ),
     )
-    with pytest.raises(ManifoldFormatError, match="newer saklas"):
+    with pytest.raises(ManifoldFormatError, match="need exactly"):
         preflight_transfer_manifold(
             folder, from_model="src/model", to_model="tgt/model",
         )

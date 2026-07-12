@@ -265,6 +265,7 @@ def create_manifold_folder(
         "format_version": MANIFOLD_FORMAT_VERSION,
         "name": name,
         "description": description,
+        "fit_mode": "authored",
         "domain": domain.to_spec(),
         "nodes": [
             _node_payload_authored(

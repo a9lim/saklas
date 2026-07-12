@@ -256,35 +256,13 @@ def sanitize_hyperparams(
     return {k: v for k, v in hyperparams.items() if k in allowed}
 
 
-# Manifold artifact format version.  Decoupled from concept packs'
-# ``PACK_FORMAT_VERSION`` so the two formats can churn independently.
-# v3 is the arbitrary-dimensional / arbitrary-topology format (domain
-# spec + per-node coordinates); v2 and earlier were the 1-D cyclic-spline
-# format and must be converted with ``scripts/upgrade_manifolds.py``.
-# v4 added a per-layer ``explained_variance_per_layer`` sidecar field
-# (a fit-quality ratio).  It is no longer read — cross-layer read
-# weighting now rides the Mahalanobis ``share`` (the same per-layer
-# budget that drives steering), so EV is neither baked nor loaded.  An
-# old sidecar that still carries the key loads fine (it's ignored); a
-# refit simply drops it.
-# v5 adds the per-layer ``origin_per_layer`` sidecar field (the per-layer
-# authoring-coordinate foot of the neutral mean, ``{str(L): [coord, ...]}``,
-# the cold-start foot seed).  Loading stays back-compatible — an absent
-# field loads as an empty dict (the apply path seeds a zero-coord foot per
-# layer), so no migration is needed; the bump just forces
-# materialize_bundled_manifolds to refresh the bundled fit so the origins
-# get baked on the next fit.
-# v6 adds an optional per-layer ``affine_map`` tensor for flat fitted
+# Current manifold artifact format. v6 adds an optional per-layer
+# ``affine_map`` tensor for flat fitted
 # subspaces.  Ordinary fits omit it (identity); rectangular/non-isometric
 # cross-model transfers persist the exact authoring-to-orthonormal-reduced
 # reparameterization.  Old readers would otherwise ignore that tensor and
 # silently move manifold world points, so this is a real format boundary.
 MANIFOLD_FORMAT_VERSION = 6
-# v5 has the same authoring/fitted structure; it simply cannot contain the
-# optional v6 affine coordinate map. Current readers interpret its absence as
-# identity, while v5 readers still reject v6 and therefore cannot silently
-# ignore transferred geometry.
-_MIN_READABLE_MANIFOLD_FORMAT_VERSION = 5
 
 
 def _validate_node_role(name: str, label: str, role: Any) -> str | None:
@@ -340,18 +318,13 @@ def validate_manifold_format_version(
     """Validate the shared readable/writable manifold format boundary."""
     if (
         not isinstance(value, int)
-        or value < _MIN_READABLE_MANIFOLD_FORMAT_VERSION
+        or isinstance(value, bool)
+        or value != MANIFOLD_FORMAT_VERSION
     ):
         raise ManifoldFormatError(
-            f"{location} has format_version={value!r}; need >= "
-            f"{_MIN_READABLE_MANIFOLD_FORMAT_VERSION}. Regenerate it with the "
-            "current saklas — run scripts/upgrade_manifolds.py for a legacy "
-            "pack, or re-fit a discover manifold."
-        )
-    if value > MANIFOLD_FORMAT_VERSION:
-        raise ManifoldFormatError(
-            f"{location} was created by a newer saklas (format v{value} > "
-            f"local v{MANIFOLD_FORMAT_VERSION}); upgrade saklas."
+            f"{location} has format_version={value!r}; "
+            f"need exactly {MANIFOLD_FORMAT_VERSION}. Regenerate or re-fit it "
+            "with the current saklas."
         )
     return value
 
@@ -531,7 +504,7 @@ class ManifoldFolder:
 
     Two folder shapes share this class via the ``fit_mode`` field:
 
-    - ``fit_mode == "authored"`` (default for legacy v3 manifolds): the
+    - ``fit_mode == "authored"``: the
       user supplied per-node ``coords`` on a declared ``domain``.  The
       fit pipeline embeds the coords and runs straight into
       ``fit_layer_subspace``.
@@ -645,22 +618,19 @@ class ManifoldFolder:
             )
 
         validate_manifold_format_version(
-            data.get("format_version", 1),
+            data.get("format_version"),
             location=f"manifold.json in {folder}",
         )
 
-        name = data.get("name", folder.name)
+        name = data.get("name")
         if not isinstance(name, str) or not NAME_REGEX.match(name):
             raise ManifoldFormatError(
                 f"manifold name {name!r} invalid; must match {NAME_REGEX.pattern}"
             )
 
-        # Authored vs discover.  Authored = the historical shape:
-        # ``domain`` + per-node ``coords``.  Discover = no ``domain`` and
-        # nodes carry ``{label}`` only; coords are derived per-model at
-        # fit time.  Default ``"authored"`` keeps every pre-discover v3
-        # manifold loading unchanged.
-        fit_mode = data.get("fit_mode", "authored")
+        # Authored manifolds carry ``domain`` + per-node ``coords``. Discover
+        # manifolds omit ``domain`` and derive coordinates per model at fit time.
+        fit_mode = data.get("fit_mode")
         if fit_mode not in _FIT_MODES_ALL:
             raise ManifoldFormatError(
                 f"manifold {name!r} fit_mode {fit_mode!r} invalid; "
@@ -1177,9 +1147,7 @@ class ManifoldFolder:
             if not isinstance(latest, dict):
                 raise ManifoldFormatError("manifold files manifest is not an object")
             # A newly published pair is always written by the current tensor
-            # writer.  Upgrade the enclosing manifest in the same locked CAS so
-            # a v6-only field (notably ``affine_map``) can never be trusted under
-            # a v5 manifest that an old reader would accept and misinterpret.
+            # writer. Preserve the exact current format in the same locked CAS.
             files = dict(latest)
             for resolved in resolved_paths:
                 files[resolved.name] = hash_file(resolved)
