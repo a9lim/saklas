@@ -20,15 +20,14 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response
-from pydantic import BaseModel
 
 from saklas.core.errors import SaklasError
 from saklas.core.manifold import manifold_is_affine
 from saklas.io.probes_bootstrap import load_default_manifolds
-from saklas.server.native_common import resolve_session_id
+from saklas.server.native_common import NativeRequest, resolve_session_id
 
 
-class ProbeRequest(BaseModel):
+class ProbeRequest(NativeRequest):
     """Body for ``POST /saklas/v1/sessions/{id}/probes``."""
 
     selector: str
@@ -36,7 +35,7 @@ class ProbeRequest(BaseModel):
     top_n: int | None = None
 
 
-class LiveProbesRequest(BaseModel):
+class LiveProbesRequest(NativeRequest):
     """Body for ``POST /saklas/v1/sessions/{id}/probes/live``."""
 
     enabled: bool

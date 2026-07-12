@@ -32,6 +32,7 @@ from saklas.server.tree_models import node_json
 from saklas.server.ws_events import build_token_event
 from saklas.server.ws_models import (
     WSGenerateMessage,
+    build_input,
     build_sampling,
     result_to_json,
 )
@@ -43,14 +44,10 @@ def register_ws_stream(app: FastAPI) -> None:
 
     @app.websocket("/saklas/v1/sessions/{session_id}/stream")
     async def session_stream(websocket: WebSocket, session_id: str):
-        # NOTE: only ``session_id == "default"`` is actually reachable
-        # here — HF model ids contain '/' and the FastAPI path parameter
-        # is not declared ``{session_id:path}``, so the model-id branch
-        # is an HTTP-route convenience only.  Kept as a no-op guard.
         if not ws_auth_ok(websocket):
             await websocket.close(code=1008, reason="unauthorized")
             return
-        if session_id not in (SINGLE_SESSION_ID, session.model_id):
+        if session_id != SINGLE_SESSION_ID:
             await websocket.accept()
             await websocket.close(code=1008, reason="session not found")
             return
@@ -648,7 +645,9 @@ async def _ws_handle_generate(
                             gen_kwargs["recipe_override"] = _recipe_override
                         if msg.generate_seat is not None:
                             gen_kwargs["gen_seat"] = msg.generate_seat
-                        result = session.generate(msg.input, **gen_kwargs).first
+                        result = session.generate(
+                            build_input(msg.input), **gen_kwargs,
+                        ).first
                     _result_holder.append(result)
                 except BaseException as e:
                     _error_holder.append(e)

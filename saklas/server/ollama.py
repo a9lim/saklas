@@ -58,16 +58,6 @@ class OllamaBadRequest(ValueError, SaklasError):
         return 400, str(self)
 
 
-def _aliases_for(session: SaklasSession) -> list[str]:
-    """Backward-compatible wrapper for tests/imports; new code uses model_names."""
-    return aliases_for_session(session)
-
-
-def _known_model_names(session: SaklasSession) -> set[str]:
-    """Backward-compatible wrapper for tests/imports; new code uses model_names."""
-    return known_model_names(session)
-
-
 def _digest_of(name: str) -> str:
     """Deterministic sha256-style digest for a model identifier."""
     return "sha256:" + hashlib.sha256(name.encode("utf-8")).hexdigest()
@@ -138,7 +128,7 @@ def _tag_entries(session: SaklasSession) -> list[dict[str, Any]]:
     digest = _digest_of(model_id)
 
     names = [model_id]
-    names.extend(_aliases_for(session))
+    names.extend(aliases_for_session(session))
     # Deduplicate while preserving order.
     seen: set[str] = set()
     unique = [n for n in names if not (n in seen or seen.add(n))]
@@ -437,8 +427,8 @@ def register_ollama_routes(app: FastAPI) -> None:
         # startup, so a true pull is out of scope.
         body = await request.json()
         name = str(body.get("model") or body.get("name") or "")
-        if name and name.lower() not in _known_model_names(session):
-            hosted = ", ".join(sorted({session.model_id, *_aliases_for(session)}))
+        if name and name.lower() not in known_model_names(session):
+            hosted = ", ".join(sorted({session.model_id, *aliases_for_session(session)}))
             return JSONResponse(status_code=404, content={
                 "error": (
                     f"model '{name}' not found. saklas currently hosts: {hosted}. "
@@ -503,8 +493,8 @@ def register_ollama_routes(app: FastAPI) -> None:
         if not strict_model_enabled():
             return
         name = str(body.get("model") or "")
-        if name and name.lower() not in _known_model_names(session):
-            hosted = ", ".join(sorted({session.model_id, *_aliases_for(session)}))
+        if name and name.lower() not in known_model_names(session):
+            hosted = ", ".join(sorted({session.model_id, *aliases_for_session(session)}))
             raise HTTPException(
                 status_code=404,
                 detail=(

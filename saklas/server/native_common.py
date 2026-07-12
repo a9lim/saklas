@@ -3,8 +3,15 @@
 from __future__ import annotations
 
 from fastapi import HTTPException
+from pydantic import BaseModel, ConfigDict
 
 SINGLE_SESSION_ID = "default"
+
+
+class NativeRequest(BaseModel):
+    """Strict base for the current native API request contract."""
+
+    model_config = ConfigDict(extra="forbid")
 
 
 def resolve_session_id(session_id: str) -> None:

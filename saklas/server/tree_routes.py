@@ -90,10 +90,8 @@ def register_tree_routes(app: FastAPI) -> None:
         without a follow-up fetch.
         """
         resolve_session_id(session_id)
-        # Cast role through the Literal-narrowing layer the tree owns.
-        role_arg = req.role
         new_id = session.tree.branch(
-            req.node_id, req.text, role=role_arg,  # pyright: ignore[reportArgumentType]  # req.role is str|None; branch() expects Role|None (Literal narrowing)
+            req.node_id, req.text, role=req.role,
         )
         return {
             "node_id": new_id,
@@ -237,11 +235,7 @@ def register_tree_routes(app: FastAPI) -> None:
         )
 
         resolve_session_id(session_id)
-        mode = req.mode or "default"
-        if mode not in ("default", "here", "merge"):
-            raise HTTPException(
-                400, f"unknown import mode {mode!r}; valid: default, here, merge",
-            )
+        mode = req.mode
         try:
             transcript = Transcript.from_yaml(req.yaml)
         except TranscriptFormatError as e:

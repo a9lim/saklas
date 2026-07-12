@@ -5,20 +5,19 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from pydantic import BaseModel
-
 from saklas.core.generation import supports_thinking, thinking_is_optional
 from saklas.core.session import SaklasSession
 from saklas.core.steering import Steering
+from saklas.server.native_common import NativeRequest
 
 
-class CreateSessionRequest(BaseModel):
+class CreateSessionRequest(NativeRequest):
     model: str | None = None
     device: str | None = None
     dtype: str | None = None
 
 
-class PatchSessionRequest(BaseModel):
+class PatchSessionRequest(NativeRequest):
     temperature: float | None = None
     top_p: float | None = None
     top_k: int | None = None

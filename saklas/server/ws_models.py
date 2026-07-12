@@ -4,13 +4,12 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel
-
 from saklas.core.results import GenerationResult, RunSet
 from saklas.core.sampling import SamplingConfig
+from saklas.server.native_common import NativeRequest
 
 
-class WSSamplingParams(BaseModel):
+class WSSamplingParams(NativeRequest):
     temperature: float | None = None
     top_p: float | None = None
     top_k: int | None = None
@@ -28,9 +27,16 @@ class WSSamplingParams(BaseModel):
     assistant_role: str | None = None
 
 
-class WSGenerateMessage(BaseModel):
-    type: str
-    input: Any = None
+class WSInputMessage(NativeRequest):
+    """One current chat message accepted by the native generation stream."""
+
+    role: Literal["system", "user", "assistant"]
+    content: str
+
+
+class WSGenerateMessage(NativeRequest):
+    type: Literal["generate"]
+    input: str | list[WSInputMessage] | None = None
     steering: str | None = None
     sampling: WSSamplingParams | None = None
     thinking: bool | None = None
@@ -38,7 +44,7 @@ class WSGenerateMessage(BaseModel):
     raw: bool = False
     parent_node_id: str | None = None
     n: int = 1
-    recipe_override: Any = None
+    recipe_override: str | None = None
     fork_node_id: str | None = None
     fork_raw_index: int | None = None
     fork_alt_token_id: int | None = None
@@ -80,6 +86,15 @@ def build_sampling(body: WSSamplingParams | None) -> SamplingConfig | None:
         persist_per_layer_scores=bool(body.persist_per_layer_scores),
         persist_subspace_coords=bool(body.persist_subspace_coords),
     )
+
+
+def build_input(
+    body: str | list[WSInputMessage] | None,
+) -> str | list[dict[str, str]] | None:
+    """Lower the strict wire message objects to the engine's mapping shape."""
+    if not isinstance(body, list):
+        return body
+    return [message.model_dump() for message in body]
 
 
 def result_to_json(result: GenerationResult | RunSet | None) -> dict[str, Any]:

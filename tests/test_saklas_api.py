@@ -136,6 +136,14 @@ class TestSessions:
         assert resp.status_code == 200
         assert resp.json()["id"] == "default"
 
+    def test_create_rejects_unknown_fields(self, session_and_client: Any) -> None:
+        _, client = session_and_client
+        resp = client.post("/saklas/v1/sessions", json={"legacy_id": "old"})
+        assert resp.status_code == 400
+        error = resp.json()["error"]
+        assert error["param"] == "legacy_id"
+        assert error["message"] == "Extra inputs are not permitted"
+
     def test_create_model_mismatch_logs_warning(self, session_and_client: Any, caplog: Any) -> None:
         _, client = session_and_client
         with patch("saklas.server.session_models.supports_thinking", return_value=False):
@@ -549,6 +557,29 @@ class TestWebSocket:
             assert tokens == ["Hello", " ", "world"]
             assert done["result"]["finish_reason"] == "stop"
             assert "per_token_probes" not in done["result"]
+
+    def test_generate_rejects_unknown_fields(self, session_and_client: Any) -> None:
+        _, client = session_and_client
+        with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
+            ws.send_json({"type": "generate", "input": "hi", "legacy": True})
+            msg = ws.receive_json()
+        assert msg["type"] == "error"
+        assert msg["code"] == "ValidationError"
+        assert "Extra inputs are not permitted" in msg["message"]
+
+    def test_generate_rejects_unknown_nested_message_fields(
+        self, session_and_client: Any,
+    ) -> None:
+        _, client = session_and_client
+        with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
+            ws.send_json({
+                "type": "generate",
+                "input": [{"role": "user", "content": "hi", "name": "old"}],
+            })
+            msg = ws.receive_json()
+        assert msg["type"] == "error"
+        assert msg["code"] == "ValidationError"
+        assert "Extra inputs are not permitted" in msg["message"]
 
     def test_stale_n_way_token_callback_stays_on_original_queue(
         self, session_and_client: Any,
@@ -991,7 +1022,7 @@ class TestScoreSingleToken:
 # NOTE: the ``test_autoload_*`` tests and the three ``test_steering_*``
 # variant/sign-flip tests were deleted in 4.0.  ``SaklasSession.
 # _try_autoload_vector`` (the ``vectors/``-pack safetensors scan) was
-# removed; profile resolution goes through ``_ensure_profile_registered``
+# removed; profile resolution goes through ``ensure_profile_registered``
 # (fold a fitted manifold / port a legacy folder).  ``resolve_pole`` no
 # longer canonicalizes against disk or flips a bipolar-pole sign, so the
 # ``honest`` → ``honest.deceptive`` canonicalization and the ``wolf`` →

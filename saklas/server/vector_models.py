@@ -5,16 +5,13 @@ from __future__ import annotations
 from operator import itemgetter
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict
-
 from saklas.core.profile import Profile
 from saklas.core.session import SaklasSession
+from saklas.server.native_common import NativeRequest
 
 
-class ExtractRequest(BaseModel):
+class ExtractRequest(NativeRequest):
     """Author and fit the current manifold representation of a concept."""
-
-    model_config = ConfigDict(extra="forbid")
 
     concept: str
     baseline: str | None = None
@@ -24,7 +21,7 @@ class ExtractRequest(BaseModel):
     force: bool = False
 
 
-class BakeVectorRequest(BaseModel):
+class BakeVectorRequest(NativeRequest):
     """Body for ``POST /saklas/v1/sessions/{id}/vectors/bake``."""
 
     name: str

@@ -18,7 +18,7 @@ import logging
 from typing import Any, Callable, Literal, cast
 
 from fastapi import FastAPI, HTTPException, Request
-from pydantic import BaseModel, Field
+from pydantic import ConfigDict, Field
 
 from saklas.core.manifold import domain_from_spec, manifold_is_affine
 from saklas.core.session import (
@@ -50,6 +50,7 @@ from saklas.io.manifolds import (
 from saklas.io.paths import manifold_dir
 from saklas.io.templates import AmbiguousTemplateError, TemplateNotFoundError
 from saklas.server.app import acquire_session_lock
+from saklas.server.native_common import NativeRequest
 from saklas.server.sse import ProgressCallback, progress_sse_response
 
 log = logging.getLogger("saklas.api")
@@ -57,7 +58,7 @@ log = logging.getLogger("saklas.api")
 
 # ----------------------------------------------------------- request models ---
 
-class BoxAxisSpec(BaseModel):
+class BoxAxisSpec(NativeRequest):
     name: str = "axis"
     periodic: bool = False
     period: float = 1.0
@@ -65,7 +66,7 @@ class BoxAxisSpec(BaseModel):
     hi: float = 1.0
 
 
-class DomainSpec(BaseModel):
+class DomainSpec(NativeRequest):
     """A manifold domain — box or sphere only (custom is JSON-authored)."""
 
     type: Literal["box", "sphere"]
@@ -73,7 +74,7 @@ class DomainSpec(BaseModel):
     dim: int | None = None
 
 
-class NodeSpec(BaseModel):
+class NodeSpec(NativeRequest):
     label: str
     coords: list[float]
     statements: list[str]
@@ -85,7 +86,7 @@ class NodeSpec(BaseModel):
     role: str | None = None
 
 
-class DiscoverNodeSpec(BaseModel):
+class DiscoverNodeSpec(NativeRequest):
     """A node in a discover-mode authoring payload — label + statements only.
 
     No ``coords``: coords are derived per-model at fit time from the
@@ -98,7 +99,7 @@ class DiscoverNodeSpec(BaseModel):
     role: str | None = None
 
 
-class CreateManifoldRequest(BaseModel):
+class CreateManifoldRequest(NativeRequest):
     namespace: str = "local"
     name: str
     description: str = ""
@@ -106,7 +107,7 @@ class CreateManifoldRequest(BaseModel):
     nodes: list[NodeSpec]
 
 
-class CreateDiscoverManifoldRequest(BaseModel):
+class CreateDiscoverManifoldRequest(NativeRequest):
     """Author a discover-mode manifold from supplied per-concept corpora.
 
     The user provides labeled statement corpora; the fit derives node
@@ -122,7 +123,7 @@ class CreateDiscoverManifoldRequest(BaseModel):
     hyperparams: dict[str, Any] = {}
 
 
-class CreateManifoldFromTemplateRequest(BaseModel):
+class CreateManifoldFromTemplateRequest(NativeRequest):
     """Author a discover manifold derived from a standalone template."""
 
     namespace: str = "local"
@@ -134,7 +135,7 @@ class CreateManifoldFromTemplateRequest(BaseModel):
     force: bool = False
 
 
-class GenerateManifoldRequest(BaseModel):
+class GenerateManifoldRequest(NativeRequest):
     """LLM-author a discover-mode manifold from a flat concept list.
 
     Wraps :meth:`SaklasSession.generate_responses` — produces one
@@ -163,12 +164,12 @@ class GenerateManifoldRequest(BaseModel):
     role_per_node: bool = False
 
 
-class UpdateManifoldRequest(BaseModel):
+class UpdateManifoldRequest(NativeRequest):
     description: str | None = None
     nodes: list[NodeSpec] | None = None
 
 
-class FitManifoldRequest(BaseModel):
+class FitManifoldRequest(NativeRequest):
     """Body for ``POST /manifolds/{ns}/{name}/fit``.
 
     For authored manifolds only ``sae`` is honored.
@@ -186,7 +187,7 @@ class FitManifoldRequest(BaseModel):
     hyperparams: dict[str, Any] | None = None
 
 
-class InstallManifoldRequest(BaseModel):
+class InstallManifoldRequest(NativeRequest):
     """Body for ``POST /manifolds/install``.
 
     ``target`` is an HF coord (``owner/name[@revision]``) or a local folder path;
@@ -198,17 +199,17 @@ class InstallManifoldRequest(BaseModel):
     as_: str | None = Field(default=None, alias="as")
     force: bool = False
 
-    model_config = {"populate_by_name": True}
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
 
-class MergeManifoldSource(BaseModel):
+class MergeManifoldSource(NativeRequest):
     """One source folder in a manifold merge — fully qualified ``ns/name``."""
 
     namespace: str
     name: str
 
 
-class MergeManifoldRequest(BaseModel):
+class MergeManifoldRequest(NativeRequest):
     """Body for ``POST /manifolds/merge``.
 
     Restricted to discover-mode (autofitted) sources by design — see

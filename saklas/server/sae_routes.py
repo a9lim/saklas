@@ -6,29 +6,29 @@ import time
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import Field
 
 from saklas.core.errors import SaklasError
 from saklas.core.loom import InvalidNodeOperationError, UnknownNodeError
 from saklas.server.app import acquire_session_lock
-from saklas.server.native_common import resolve_session_id
+from saklas.server.native_common import NativeRequest, resolve_session_id
 
 
-class SaeLoadRequest(BaseModel):
+class SaeLoadRequest(NativeRequest):
     release: str = Field(min_length=1)
     layer: int | None = Field(default=None, ge=0)
 
 
-class SaeLiveRequest(BaseModel):
+class SaeLiveRequest(NativeRequest):
     enabled: bool
     top_k: int = Field(default=8, ge=1, le=100)
 
 
-class SaeFeatureRequest(BaseModel):
+class SaeFeatureRequest(NativeRequest):
     id: int = Field(ge=0)
 
 
-class SaeFeatureMetaRequest(BaseModel):
+class SaeFeatureMetaRequest(NativeRequest):
     ids: list[int] = Field(min_length=1, max_length=64)
 
 

@@ -2,15 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Any
-
-from pydantic import BaseModel
-
+from saklas.server.native_common import NativeRequest
 from saklas.server.ws_models import WSSamplingParams
 
 
-class ExperimentFanRequest(BaseModel):
-    prompt: Any
+class ExperimentFanRequest(NativeRequest):
+    prompt: str | list[dict[str, str]]
     grid: dict[str, list[float]]
     base_steering: str | None = None
     sampling: WSSamplingParams | None = None

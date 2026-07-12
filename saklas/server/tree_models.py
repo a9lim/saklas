@@ -2,39 +2,38 @@
 
 from __future__ import annotations
 
-from typing import Any
-
-from pydantic import BaseModel
+from typing import Any, Literal
 
 from saklas.core.session import SaklasSession
+from saklas.server.native_common import NativeRequest
 
 
-class TreeNavigateRequest(BaseModel):
+class TreeNavigateRequest(NativeRequest):
     node_id: str
 
 
-class TreeEditRequest(BaseModel):
+class TreeEditRequest(NativeRequest):
     node_id: str
     text: str
 
 
-class TreeBranchRequest(BaseModel):
+class TreeBranchRequest(NativeRequest):
     node_id: str
     text: str = ""
-    role: str | None = None
+    role: Literal["user", "assistant", "system"] | None = None
 
 
-class TreeStarRequest(BaseModel):
+class TreeStarRequest(NativeRequest):
     node_id: str
     on: bool = True
 
 
-class TreeNoteRequest(BaseModel):
+class TreeNoteRequest(NativeRequest):
     node_id: str
     text: str
 
 
-class CastMemberRequest(BaseModel):
+class CastMemberRequest(NativeRequest):
     """Create/replace a cast member — a named label plus its standing
     recipe fragment.  All fields optional; a bare body authors a plain
     named label."""
@@ -45,22 +44,22 @@ class CastMemberRequest(BaseModel):
     notes: str = ""
 
 
-class TreeTranscriptRequest(BaseModel):
+class TreeTranscriptRequest(NativeRequest):
     node_id: str | None = None
 
 
-class TreeTranscriptLoadRequest(BaseModel):
+class TreeTranscriptLoadRequest(NativeRequest):
     yaml: str
-    mode: str = "default"
+    mode: Literal["default", "here", "merge"] = "default"
     strict: bool = False
 
 
-class TreeDiffRequest(BaseModel):
+class TreeDiffRequest(NativeRequest):
     a_id: str
     b_id: str
 
 
-class JointLogprobsRequest(BaseModel):
+class JointLogprobsRequest(NativeRequest):
     a_id: str
     b_id: str
 

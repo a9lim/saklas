@@ -112,7 +112,10 @@ protocol: tool calling, JSON-schema/structured-output mode, embeddings.
 `native_routes.py` registers the native route groups. Route-specific request
 bodies and serializers live beside their route groups:
 
-- `native_common.py` — single-session id resolution.
+- `native_common.py` — exact single-session id resolution and the shared
+  `NativeRequest` base. Every native request model inherits this base and rejects
+  unknown fields (`extra="forbid"`); nested native objects are strict too. The
+  OpenAI/Ollama protocol models remain protocol-specific.
 - `session_models.py` — session request bodies and `session_info`.
 - `vector_models.py` — vector/extract/bake request bodies and vector serializers.
 - `tree_models.py` — loom-tree request bodies and tree serializers.
@@ -418,8 +421,8 @@ across generations; multiple clients supported. Events: `start`
 
 ### WS /saklas/v1/sessions/{id}/stream (in `ws_stream.py`)
 
-Bidirectional WebSocket; only `session_id == "default"` is reachable (HF ids contain
-`/`). Client → server: `{type: "stop"}`, or `{type: "generate", input, steering,
+Bidirectional WebSocket; only the exact `session_id == "default"` is accepted.
+Client → server: `{type: "stop"}`, or `{type: "generate", input, steering,
 sampling, thinking, stateless, raw, parent_node_id?, n?, recipe_override?,
 generate_seat?}`. `generate_seat` (`"user"|"assistant"`, default assistant) is
 the cast model's seat selector: `"user"` renders the generation prompt as a

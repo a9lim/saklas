@@ -37,13 +37,13 @@ import threading
 import time
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import Field
 
 from saklas.core.errors import SaklasError
 from saklas.core.jlens import LensNotFittedError, resolve_word_token
 from saklas.core.loom import InvalidNodeOperationError, UnknownNodeError
 from saklas.server.app import acquire_session_lock
-from saklas.server.native_common import resolve_session_id
+from saklas.server.native_common import NativeRequest, resolve_session_id
 
 log = logging.getLogger(__name__)
 
@@ -51,7 +51,7 @@ log = logging.getLogger(__name__)
 _FIT_PROGRESS_RE = re.compile(r"prompt (\d+)/(\d+)")
 
 
-class LiveLensRequest(BaseModel):
+class LiveLensRequest(NativeRequest):
     """Body for ``POST .../lens/live``.
 
     ``layers`` is an explicit fitted-layer list; omitted, the session
@@ -64,13 +64,13 @@ class LiveLensRequest(BaseModel):
     top_k: int = 5
 
 
-class LensTokenValidationRequest(BaseModel):
+class LensTokenValidationRequest(NativeRequest):
     """Body for ``POST .../lens/token/validate``."""
 
     word: str
 
 
-class LensFitRequest(BaseModel):
+class LensFitRequest(NativeRequest):
     """Body for ``POST .../fit`` — all fields optional.
 
     Defaults mirror CLI ``lens fit`` except ``layers``, which defaults to

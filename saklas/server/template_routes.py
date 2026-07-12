@@ -14,7 +14,6 @@ import asyncio
 from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
 
 from saklas.io.templates import (
     AmbiguousTemplateError,
@@ -28,21 +27,22 @@ from saklas.io.templates import (
     template_dir,
 )
 from saklas.server.app import acquire_session_lock
+from saklas.server.native_common import NativeRequest
 
 
-class TemplateTurn(BaseModel):
+class TemplateTurn(NativeRequest):
     role: Literal["system", "user", "assistant"]
     content: str
 
 
-class TemplateContextSpec(BaseModel):
+class TemplateContextSpec(NativeRequest):
     """A multi-turn context: history turns + the slotted final assistant turn."""
 
     turns: list[TemplateTurn]
     assistant: str
 
 
-class CreateTemplateRequest(BaseModel):
+class CreateTemplateRequest(NativeRequest):
     namespace: str = "local"
     name: str
     slot: str
@@ -53,7 +53,7 @@ class CreateTemplateRequest(BaseModel):
     force: bool = False
 
 
-class ScoreTemplateRequest(BaseModel):
+class ScoreTemplateRequest(NativeRequest):
     """Score the value distribution against each context.
 
     ``steering`` runs the scoring forward under a steering expression (the
