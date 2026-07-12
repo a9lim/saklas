@@ -27,13 +27,14 @@ transferred probe as just another tensor on disk.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator
-import hashlib
-import json
+from typing import Any, Iterator, Mapping
 
 import torch
 from safetensors import safe_open
@@ -50,6 +51,103 @@ log = logging.getLogger(__name__)
 _NEUTRAL_ACTS_NAME = "neutral_activations"
 _NEUTRAL_CACHE_FORMAT_VERSION = 2
 _NEUTRAL_CAPTURE_VERSION = 1
+_ALIGNMENT_CACHE_FORMAT_VERSION = 3
+
+
+@dataclass(frozen=True)
+class LayerAlignment:
+    """Compact affine source->target activation map for one layer.
+
+    ``linear(x) = left @ (right @ x)`` stores a rank-``r`` map in
+    ``O(r * (D_src + D_tgt))`` rather than materializing ``D_tgt * D_src``.
+    ``offset`` is applied only to activation *points*.  Directions intentionally
+    use the linear component alone.
+    """
+
+    left: torch.Tensor       # (D_tgt, r)
+    right: torch.Tensor      # (r, D_src)
+    offset: torch.Tensor     # (D_tgt,)
+
+    def __post_init__(self) -> None:
+        if self.left.ndim != 2 or self.right.ndim != 2 or self.offset.ndim != 1:
+            raise ValueError("alignment factors must be 2-D, 2-D, and 1-D")
+        if self.left.shape[1] != self.right.shape[0]:
+            raise ValueError("alignment factor ranks do not match")
+        if self.left.shape[0] != self.offset.shape[0]:
+            raise ValueError("alignment offset does not match target dimension")
+        if self.left.shape[1] == 0:
+            raise ValueError("alignment rank must be positive")
+        device = self.left.device
+        object.__setattr__(
+            self, "left", self.left.to(device=device, dtype=torch.float32).contiguous(),
+        )
+        object.__setattr__(
+            self, "right", self.right.to(device=device, dtype=torch.float32).contiguous(),
+        )
+        object.__setattr__(
+            self, "offset", self.offset.to(device=device, dtype=torch.float32).contiguous(),
+        )
+
+    @property
+    def source_dim(self) -> int:
+        return int(self.right.shape[1])
+
+    @property
+    def target_dim(self) -> int:
+        return int(self.left.shape[0])
+
+    @property
+    def rank(self) -> int:
+        return int(self.left.shape[1])
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return (self.target_dim, self.source_dim)
+
+    @property
+    def device(self) -> torch.device:
+        return self.left.device
+
+    def apply_vector(self, value: torch.Tensor) -> torch.Tensor:
+        value = value.to(device=self.device, dtype=torch.float32)
+        return self.left @ (self.right @ value)
+
+    def apply_vectors(self, value: torch.Tensor) -> torch.Tensor:
+        """Apply the linear component to row-major ``(..., D_src)`` vectors."""
+        value = value.to(device=self.device, dtype=torch.float32)
+        return (value @ self.right.transpose(0, 1)) @ self.left.transpose(0, 1)
+
+    def apply_points(self, value: torch.Tensor) -> torch.Tensor:
+        value = value.to(device=self.device, dtype=torch.float32)
+        return self.apply_vectors(value) + self.offset
+
+    def to_dense(self) -> torch.Tensor:
+        return self.left @ self.right
+
+
+AlignmentLike = LayerAlignment | torch.Tensor
+AlignmentMap = Mapping[int, AlignmentLike]
+
+
+def _as_layer_alignment(value: AlignmentLike) -> LayerAlignment:
+    if isinstance(value, LayerAlignment):
+        return value
+    dense = value.to(device="cpu", dtype=torch.float32)
+    if dense.ndim != 2:
+        raise ValueError("alignment matrix must be 2-D")
+    U, S, Vh = torch.linalg.svd(dense, full_matrices=False)
+    if S.numel() == 0:
+        raise ValueError("alignment matrix is empty")
+    tol = torch.finfo(S.dtype).eps * max(dense.shape) * float(S.max())
+    rank = int((S > tol).sum())
+    if rank == 0:
+        raise ValueError("alignment matrix is rank deficient (rank 0)")
+    left = U[:, :rank] * S[:rank]
+    right = Vh[:rank]
+    return LayerAlignment(
+        left.contiguous(), right.contiguous(),
+        torch.zeros(dense.shape[0], dtype=torch.float32),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -342,22 +440,23 @@ def fit_alignment(
     tgt_acts: dict[int, torch.Tensor],
     *,
     min_shared_layers: int = 10,
-) -> dict[int, torch.Tensor]:
-    """Per-layer Procrustes mapping ``M_L : ℝ^D_src → ℝ^D_tgt``.
+) -> dict[int, LayerAlignment]:
+    """Per-layer compact affine mapping ``A_L : ℝ^D_src → ℝ^D_tgt``.
 
-    For each layer the two models share, fits ``M_L`` such that
-    ``X_tgt ≈ X_src @ M_L^T`` over the centered neutral activations.
+    For each layer the two models share, fits ``A_L(x) = M_L x + b_L`` such
+    that matched neutral activation *points* map source→target.  Directions
+    use ``M_L`` alone, so translations never contaminate profile transfer.
 
-    * **Same hidden dim:** orthogonal Procrustes via SVD —
-      ``X_tgt^T @ X_src = U @ S @ V^T`` then ``M_L = U @ V^T`` (rotation
-      that minimises ``||X_tgt - X_src @ M^T||``).
-    * **Different hidden dim:** general least-squares form
-      ``M_L = (X_src^+ @ X_tgt)^T`` shaped ``(D_tgt, D_src)``.  The
-      pseudoinverse handles rectangular systems cleanly; centring on
-      both sides keeps the fit translation-invariant.
+    * **Same hidden dim:** evidence-supported orthogonal Procrustes, factored
+      through economy QR row-space bases and a small ``<=N`` SVD.  No arbitrary
+      unobserved ``D-N`` complement is invented.
+    * **Different hidden dim:** minimum-norm least squares from the thin SVD of
+      ``X_src``.  The result stays as rank-sized factors instead of a dense
+      ``D_tgt × D_src`` matrix.
 
-    Returns ``{layer_idx: M_L}`` over the shared-layer set.  Tensors are
-    fp32, on CPU.  Raises :class:`AlignmentError` when fewer than
+    The translation is ``b_L = mean_tgt - M_L mean_src``.  Returns compact
+    :class:`LayerAlignment` objects over the shared-layer set; tensors are fp32
+    on CPU.  Raises :class:`AlignmentError` when fewer than
     ``min_shared_layers`` layers are common to both models — partial
     alignment under that threshold tends to produce noisy transfers.
     """
@@ -368,7 +467,7 @@ def fit_alignment(
             f"src={sorted(src_acts.keys())}, tgt={sorted(tgt_acts.keys())}"
         )
 
-    out: dict[int, torch.Tensor] = {}
+    out: dict[int, LayerAlignment] = {}
     for layer in shared:
         X_src = src_acts[layer].to(torch.float32)
         X_tgt = tgt_acts[layer].to(torch.float32)
@@ -380,31 +479,48 @@ def fit_alignment(
 
         # Center both sides — Procrustes is translation-invariant only
         # under shared origin.
-        X_src_c = X_src - X_src.mean(dim=0, keepdim=True)
-        X_tgt_c = X_tgt - X_tgt.mean(dim=0, keepdim=True)
+        src_mean = X_src.mean(dim=0)
+        tgt_mean = X_tgt.mean(dim=0)
+        X_src_c = X_src - src_mean
+        X_tgt_c = X_tgt - tgt_mean
 
         D_src = X_src_c.shape[1]
         D_tgt = X_tgt_c.shape[1]
 
         if D_src == D_tgt:
-            # Orthogonal Procrustes: closest rotation that maps src → tgt.
-            U, _S, Vh = torch.linalg.svd(
-                X_tgt_c.transpose(0, 1) @ X_src_c, full_matrices=False,
-            )
-            M = U @ Vh  # (D_tgt, D_src), orthogonal
+            # Low-rank orthogonal Procrustes.  Factor the two row spaces first,
+            # then SVD only their <=N cross-core; the unobserved D-N complement
+            # has no evidence and is deliberately not invented/persisted.
+            Qs, Rs = torch.linalg.qr(X_src_c.transpose(0, 1), mode="reduced")
+            Qt, Rt = torch.linalg.qr(X_tgt_c.transpose(0, 1), mode="reduced")
+            U, S, Vh = torch.linalg.svd(Rt @ Rs.transpose(0, 1), full_matrices=False)
+            tol = torch.finfo(S.dtype).eps * max(D_src, X_src_c.shape[0]) * float(S.max())
+            rank = int((S > tol).sum())
+            if rank == 0:
+                raise AlignmentError(f"layer {layer}: centered alignment has rank 0")
+            left = (Qt @ U[:, :rank]).contiguous()
+            right = (Vh[:rank] @ Qs.transpose(0, 1)).contiguous()
         else:
-            # Least-squares: solve X_src_c @ A = X_tgt_c, store M = A^T
-            # so the apply step is M @ v_src.  ``torch.linalg.lstsq`` is
-            # the stable rectangular solver.
-            sol = torch.linalg.lstsq(X_src_c, X_tgt_c).solution  # (D_src, D_tgt)
-            M = sol.transpose(0, 1).contiguous()  # (D_tgt, D_src)
+            # Minimum-norm least squares in factored form:
+            # M = X_tgt^T U S^-1 V^T for X_src = U S V^T.
+            U, S, Vh = torch.linalg.svd(X_src_c, full_matrices=False)
+            tol = torch.finfo(S.dtype).eps * max(X_src_c.shape) * float(S.max())
+            rank = int((S > tol).sum())
+            if rank == 0:
+                raise AlignmentError(f"layer {layer}: centered alignment has rank 0")
+            left = (
+                X_tgt_c.transpose(0, 1) @ U[:, :rank]
+            ).div(S[:rank].unsqueeze(0)).contiguous()
+            right = Vh[:rank].contiguous()
 
-        out[layer] = M
+        linear_src_mean = left @ (right @ src_mean)
+        offset = (tgt_mean - linear_src_mean).contiguous()
+        out[layer] = LayerAlignment(left, right, offset)
     return out
 
 
 def alignment_quality(
-    M: dict[int, torch.Tensor],
+    M: AlignmentMap,
     src_acts: dict[int, torch.Tensor],
     tgt_acts: dict[int, torch.Tensor],
 ) -> dict[int, float]:
@@ -426,8 +542,9 @@ def alignment_quality(
         X_tgt = tgt_acts[layer].to(torch.float32)
         X_src_c = X_src - X_src.mean(dim=0, keepdim=True)
         X_tgt_c = X_tgt - X_tgt.mean(dim=0, keepdim=True)
-        # Apply M to each row: X_src_c @ M_L^T
-        X_pred = X_src_c @ M_L.transpose(0, 1)
+        # Translation cancels under centering; score the linear geometry.
+        alignment = _as_layer_alignment(M_L)
+        X_pred = alignment.apply_vectors(X_src_c)
         residual = (X_tgt_c - X_pred).pow(2).sum().item()
         total = X_tgt_c.pow(2).sum().item()
         if total <= 1e-12:
@@ -444,7 +561,7 @@ def alignment_quality(
 
 def transfer_profile(
     profile: Profile,
-    alignment_map: dict[int, torch.Tensor],
+    alignment_map: AlignmentMap,
     *,
     source_model_id: str,
     transfer_quality_estimate: float | None = None,
@@ -506,8 +623,8 @@ def transfer_profile(
         M_L = alignment_map.get(layer)
         if M_L is None:
             continue
-        v_src = src_vec.to(torch.float32).to(M_L.device)
-        staged[layer] = (M_L @ v_src).cpu()
+        alignment = _as_layer_alignment(M_L)
+        staged[layer] = alignment.apply_vector(src_vec).cpu()
         orig_dtype[layer] = src_vec.dtype
 
     if not staged:
@@ -580,7 +697,7 @@ def alignment_fit_lock(src_model_id: str, tgt_model_id: str) -> Iterator[None]:
 
 
 def save_alignment_map(
-    M: dict[int, torch.Tensor],
+    M: AlignmentMap,
     src_model_id: str,
     tgt_model_id: str,
     *,
@@ -597,7 +714,12 @@ def save_alignment_map(
     ts_path, sc_path = alignment_cache_path(src_model_id, tgt_model_id)
     ts_path.parent.mkdir(parents=True, exist_ok=True)
 
-    tensors = {f"layer_{idx}": M_L.contiguous().cpu() for idx, M_L in M.items()}
+    normalized = {int(idx): _as_layer_alignment(value) for idx, value in M.items()}
+    tensors: dict[str, torch.Tensor] = {}
+    for idx, alignment in normalized.items():
+        tensors[f"layer_{idx}.left"] = alignment.left.contiguous().cpu()
+        tensors[f"layer_{idx}.right"] = alignment.right.contiguous().cpu()
+        tensors[f"layer_{idx}.offset"] = alignment.offset.contiguous().cpu()
     from saklas.io.atomic import artifact_lock
 
     with artifact_lock(ts_path):
@@ -605,14 +727,18 @@ def save_alignment_map(
         save_file(tensors, str(tmp_path))
         os.replace(tmp_path, ts_path)
         sidecar: dict[str, Any] = {
-            "format_version": 2,
-            "method": "procrustes_alignment",
+            "format_version": _ALIGNMENT_CACHE_FORMAT_VERSION,
+            "method": "factorized_affine_alignment",
             "source_model_id": src_model_id,
             "target_model_id": tgt_model_id,
-            "shared_layers": sorted(M.keys()),
+            "shared_layers": sorted(normalized),
             "tensor_schema": {
-                str(layer): list(tensor.shape)
-                for layer, tensor in sorted(M.items())
+                str(layer): {
+                    "left": list(alignment.left.shape),
+                    "right": list(alignment.right.shape),
+                    "offset": list(alignment.offset.shape),
+                }
+                for layer, alignment in sorted(normalized.items())
             },
             "source_neutral_identity": source_identity,
             "target_neutral_identity": target_identity,
@@ -632,7 +758,7 @@ def load_alignment_map(
     *,
     source_identity: dict[str, Any],
     target_identity: dict[str, Any],
-) -> tuple[dict[int, torch.Tensor], dict[str, Any]] | None:
+) -> tuple[dict[int, LayerAlignment], dict[str, Any]] | None:
     """Load a cached alignment map.  Returns ``None`` when not on disk."""
     import json
 
@@ -643,26 +769,56 @@ def load_alignment_map(
         if not ts_path.exists() or not sc_path.exists():
             return None
         try:
-            tensors = load_file(str(ts_path))
             with open(sc_path) as f:
                 sidecar = json.load(f)
+            # Identity mismatch is the common stale-cache case.  Reject it before
+            # hashing or materializing a potentially multi-GiB payload.
             if (
-                sidecar.get("format_version") != 2
+                sidecar.get("format_version") != _ALIGNMENT_CACHE_FORMAT_VERSION
+                or sidecar.get("method") != "factorized_affine_alignment"
+                or sidecar.get("source_model_id") != src_model_id
+                or sidecar.get("target_model_id") != tgt_model_id
                 or sidecar.get("source_neutral_identity") != source_identity
                 or sidecar.get("target_neutral_identity") != target_identity
-                or sidecar.get("tensor_sha256") != hash_file(ts_path)
             ):
                 return None
-            M = {int(k.split("_", 1)[1]): v for k, v in tensors.items()}
+            expected_digest = sidecar.get("tensor_sha256")
+            if not isinstance(expected_digest, str) or hash_file(ts_path) != expected_digest:
+                return None
             expected_layers = sidecar.get("shared_layers")
             schema = sidecar.get("tensor_schema") or {}
-            if sorted(M) != expected_layers or any(
-                list(tensor.shape) != schema.get(str(layer))
-                or tensor.ndim != 2
-                or not bool(torch.isfinite(tensor).all())
-                for layer, tensor in M.items()
-            ):
+            if not isinstance(expected_layers, list) or not expected_layers:
                 return None
+            expected_keys = {
+                f"layer_{int(layer)}.{part}"
+                for layer in expected_layers for part in ("left", "right", "offset")
+            }
+            with safe_open(str(ts_path), framework="pt", device="cpu") as payload:
+                if set(payload.keys()) != expected_keys:
+                    return None
+                for layer in expected_layers:
+                    spec = schema.get(str(layer), {})
+                    if not isinstance(spec, dict):
+                        return None
+                    for part in ("left", "right", "offset"):
+                        view = payload.get_slice(f"layer_{int(layer)}.{part}")
+                        if list(view.get_shape()) != spec.get(part) or view.get_dtype() != "F32":
+                            return None
+            tensors = load_file(str(ts_path))
+            M: dict[int, LayerAlignment] = {}
+            for raw_layer in expected_layers:
+                layer = int(raw_layer)
+                left = tensors[f"layer_{layer}.left"]
+                right = tensors[f"layer_{layer}.right"]
+                offset = tensors[f"layer_{layer}.offset"]
+                if (
+                    left.ndim != 2 or right.ndim != 2 or offset.ndim != 1
+                    or left.shape[1] != right.shape[0]
+                    or left.shape[0] != offset.shape[0]
+                    or not all(bool(torch.isfinite(t).all()) for t in (left, right, offset))
+                ):
+                    return None
+                M[layer] = LayerAlignment(left, right, offset)
             return M, sidecar
         except Exception as e:
             log.warning(

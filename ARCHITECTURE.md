@@ -125,7 +125,7 @@ and port pre-4.0 packs.)
     <safe_model>_role-<slug>.safetensors           # reserved; role fits validate the canonical tensor
   models/<safe_model>/
     neutral_activations.{safetensors,json}         # neutral corpus × layers, fp32
-    alignments/<safe_src>.{safetensors,json}       # Procrustes map
+    alignments/<safe_src>.{safetensors,json}       # factorized affine map
   vectors/<ns>/<concept>/                          # LEGACY (pre-4.0) only — ported on touch
 ```
 
@@ -1083,23 +1083,28 @@ Mistral-3 lacks a substitutable label and raises
 
 ## 8. Cross-model transfer
 
-`io/alignment.py` — per-layer orthogonal Procrustes (`fit_alignment`, SVD for
-matched dim, rectangular least-squares otherwise; both center first) maps
-`M_L : ℝ^D_src → ℝ^D_tgt`. `transfer_profile` applies `M_L @ v_src` per layer and
+`io/alignment.py` — per-layer compact affine alignment (`fit_alignment`,
+row-space orthogonal Procrustes for matched dim, rectangular minimum-norm
+least-squares otherwise; both low-rank factorized) maps points as
+`A_L(x)=M_L x+b_L`. `transfer_profile` applies only `M_L @ v_src` per layer and
 re-bakes each magnitude to its *target* Mahalanobis norm so the share is in the
 target metric. The target whitener is **required** and must cover the transferred
 layers (Mahalanobis-only — a missing/partial whitener raises `WhitenerError`;
 generate neutral activations for the target model first, there is no Euclidean
 rebake). `transfer_manifold` (`io/manifold_lifecycle.py`, with the pure-tensor core lifted to
-`core/manifold.py::transfer_manifold_subspaces`) maps a fitted manifold's per-layer
-`mean → M_L mean` and `basis → basis @ M_Lᵀ`, leaves the RBF + `node_coords`
-untouched (subspace/authoring-coordinate space, invariant under the model-space
-map), re-bakes the Mahalanobis **share** in target space (same whitener
+`core/manifold.py::transfer_manifold_subspaces`) maps a fitted manifold's points
+and mean through `A_L` while basis directions use `M_L`, then QR-orthonormalizes
+the mapped basis and transforms every affine/RBF reduced coefficient by the exact
+companion map. A collapsed span is rejected; a curved scalar sigma field is
+cleared when transfer makes its thickness anisotropic. It re-bakes the
+Mahalanobis **share** in target space (same whitener
 requirement; no lever — it's gone), clears `origin` (per-layer foot of the
 *source* neutral), and writes the
 `_from-<safe_src>` variant. Since a vector is a 2-node `pca` manifold, `manifold
-transfer` routes to this one transfer path. Alignments cache under the *target*
-model dir. Stable per-model neutral-capture locks and directional alignment-fit
+transfer` routes to this one transfer path. Alignment cache v3 stores the linear
+map as two rank-sized factors plus the translation under the *target* model dir;
+sidecar identity is checked before payload hashing/materialization. Stable
+per-model neutral-capture locks and directional alignment-fit
 locks span cache recheck through publication (including both serial model
 loads), so two cold transfer commands do not repeat the same capture/fit work.
 The materializing neutral loader returns the sidecar validated in that same

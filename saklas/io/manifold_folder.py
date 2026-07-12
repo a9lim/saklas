@@ -277,7 +277,17 @@ _sanitize_hyperparams = sanitize_hyperparams
 # layer), so no migration is needed; the bump just forces
 # materialize_bundled_manifolds to refresh the bundled fit so the origins
 # get baked on the next fit.
-MANIFOLD_FORMAT_VERSION = 5
+# v6 adds an optional per-layer ``affine_map`` tensor for flat fitted
+# subspaces.  Ordinary fits omit it (identity); rectangular/non-isometric
+# cross-model transfers persist the exact authoring-to-orthonormal-reduced
+# reparameterization.  Old readers would otherwise ignore that tensor and
+# silently move manifold world points, so this is a real format boundary.
+MANIFOLD_FORMAT_VERSION = 6
+# v5 has the same authoring/fitted structure; it simply cannot contain the
+# optional v6 affine coordinate map. Current readers interpret its absence as
+# identity, while v5 readers still reject v6 and therefore cannot silently
+# ignore transferred geometry.
+_MIN_READABLE_MANIFOLD_FORMAT_VERSION = 5
 
 
 def _validate_node_role(name: str, label: str, role: Any) -> str | None:
@@ -325,6 +335,28 @@ def _validate_node_kind(name: str, label: str, kind: Any) -> str | None:
 
 class ManifoldFormatError(ValueError, SaklasError):
     """Raised when a manifold folder is malformed or fails integrity."""
+
+
+def validate_manifold_format_version(
+    value: Any, *, location: str = "manifold",
+) -> int:
+    """Validate the shared readable/writable manifold format boundary."""
+    if (
+        not isinstance(value, int)
+        or value < _MIN_READABLE_MANIFOLD_FORMAT_VERSION
+    ):
+        raise ManifoldFormatError(
+            f"{location} has format_version={value!r}; need >= "
+            f"{_MIN_READABLE_MANIFOLD_FORMAT_VERSION}. Regenerate it with the "
+            "current saklas — run scripts/upgrade_manifolds.py for a legacy "
+            "pack, or re-fit a discover manifold."
+        )
+    if value > MANIFOLD_FORMAT_VERSION:
+        raise ManifoldFormatError(
+            f"{location} was created by a newer saklas (format v{value} > "
+            f"local v{MANIFOLD_FORMAT_VERSION}); upgrade saklas."
+        )
+    return value
 
 
 class BakedManifoldError(ValueError, SaklasError):
@@ -579,11 +611,13 @@ class ManifoldFolder:
     ) -> "ManifoldFolder":
         """Parse a manifold folder.
 
-        Lifecycle/install/publish callers keep the default full integrity walk.
-        Fit callers may set ``verify_manifest=False``: they hash the live corpus
-        into ``nodes_sha256`` and validate only the requested fitted tensor, so
-        re-fitting model B does not reread every historical model/SAE payload.
-        Structural checks and tensor/sidecar pairing still run either way.
+        Runtime/install/push callers keep the default full integrity walk.
+        Metadata-only inventory, authoring, and lifecycle routing callers may set
+        ``verify_manifest=False``; fit callers do likewise, hashing the live
+        corpus into ``nodes_sha256`` and validating only the requested fitted
+        tensor.  This avoids rereading every historical model/SAE payload when no
+        payload is being consumed.  Structural checks and tensor/sidecar pairing
+        still run either way.
         """
         folder = Path(folder)
         meta_path = folder / "manifold.json"
@@ -600,24 +634,10 @@ class ManifoldFolder:
                 f"manifold.json in {folder} is unreadable: {e}"
             ) from e
 
-        fmt = data.get("format_version", 1)
-        if not isinstance(fmt, int) or fmt < MANIFOLD_FORMAT_VERSION:
-            raise ManifoldFormatError(
-                f"manifold.json in {folder} has format_version={fmt!r}; "
-                f"need >= {MANIFOLD_FORMAT_VERSION}. Regenerate it with the "
-                f"current saklas — run scripts/upgrade_manifolds.py for a legacy "
-                f"pack, or re-fit a discover manifold."
-            )
-        if fmt > MANIFOLD_FORMAT_VERSION:
-            # Symmetric upper bound, mirroring ``PackMetadata.load`` — a
-            # manifold authored by a newer saklas may use fields this
-            # reader can't safely interpret, so refuse rather than load
-            # it silently.
-            raise ManifoldFormatError(
-                f"manifold.json in {folder} was created by a newer saklas "
-                f"(format v{fmt} > local v{MANIFOLD_FORMAT_VERSION}); "
-                f"upgrade saklas."
-            )
+        validate_manifold_format_version(
+            data.get("format_version", 1),
+            location=f"manifold.json in {folder}",
+        )
 
         name = data.get("name", folder.name)
         if not isinstance(name, str) or not NAME_REGEX.match(name):

@@ -1,5 +1,5 @@
 {
-  "format_version": 5,
+  "format_version": 6,
   "name": "sycophantic.blunt",
   "description": "Bipolar axis: sycophantic (+) vs blunt (-). Steer with negative alpha for the opposite pole.",
   "fit_mode": "pca",

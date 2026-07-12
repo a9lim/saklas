@@ -278,8 +278,10 @@ and prefix state; validation failures that did not write preserve consumers.
 
 Fit uses `ManifoldFolder.load(..., verify_manifest=False)`: it hashes the live
 corpus into the capture/final identities and validates the requested tensor, but
-does not reread every historical model/SAE payload. Lifecycle/install/publish
-loads retain full manifest verification.
+does not reread every historical model/SAE payload. Metadata-only authoring and
+lifecycle routing (source-tier reads for refresh/removal) also skip the payload
+walk. Runtime fitted-tensor use, install, and push retain strict integrity
+verification; publication hashes each newly committed pair exactly once.
 
 - **`pca`** (flat / discover; the 2-node-vector case): derive per-model coords
   (`discover_coords` over the layer-agnostic consensus Gram — `mean_L` of each
@@ -481,16 +483,19 @@ Metal). `synthesize_subspace` emits the κ mask (0 push / 1 ablate).
 point projection.
 
 `save_manifold`/`load_manifold` round-trip the per-model tensor (`layer_<L>.{mean,
-basis[,node_params,rbf_weights,poly_coeffs,coord_offset,coord_scale]}` + shared
+basis[,affine_map][,node_params,rbf_weights,poly_coeffs,coord_offset,coord_scale]}` + shared
 `node_coords` + optional `origin`) + sidecar (`mahalanobis_share_per_layer`,
 `origin_per_layer`, `share_metric`, `subspace_metric` — no
 `explained_variance_per_layer`, no `lever_per_layer`). `transfer_manifold_subspaces(src,
 alignment, *, whitener, from_model, to_model)` is the pure-tensor core of the
-cross-model Procrustes transfer: maps each covered layer's subspace into target
-space (`mean → M_L mean`, `basis → basis @ M_Lᵀ`), re-bakes the Mahalanobis
+cross-model affine transfer: maps points/means through `M_L x+b_L` and basis
+directions through `M_L`, QR-orthonormalizes the mapped rows, and transforms the
+affine/RBF reduced coefficients by the exact companion map. Rank collapse is
+rejected; a curved scalar sigma field is cleared when the companion map is not
+an isometry. It re-bakes the Mahalanobis
 **share** in target space via `subspace_share` (target whitener **required** —
 `WhitenerError` on a missing / partial one, no Euclidean rebake), clears `origin`,
-and returns the transferred `Manifold` (RBF + `node_coords` ride through untouched).
+and returns the transferred `Manifold`.
 The folder read/write orchestration around it (load the source tensor, write the
 `_from-<safe_src>` variant, patch the sidecar) stays in
 `io/manifold_lifecycle.py::transfer_manifold`. Discover: `derive_pca_coords`
@@ -516,8 +521,10 @@ MPS-unsafe).
 the surface stops being a zero-thickness wire and carries a within-node off-surface
 spread `σ(z)`. Raw curved fits retain activation rows from the shared centroid
 pass; `compute_store_reduced_covariances` streams the layer-major spool through
-bounded projection chunks after the basis exists, avoiding both a second model
-pass and `nodes × layers` small hidden-dimension GEMMs while accumulating each
+bounded fp32 chunks after the basis exists, centering out-of-place before the
+projection (stable at large common-mode activation offsets and never mutating an
+fp32 mmap view), avoiding both a second model pass and `nodes × layers` small
+hidden-dimension GEMMs while accumulating each
 node's reduced `(R,R)` covariance. `compute_node_reduced_covariance_from_rows`
 and `compute_node_reduced_covariance` remain for standalone callers
 without retained rows; `fit_sigma_field`

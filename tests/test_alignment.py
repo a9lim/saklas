@@ -1,4 +1,4 @@
-"""Cross-model probe alignment via per-layer Procrustes (v1.6).
+"""Cross-model probe alignment via compact per-layer affine maps.
 
 Covers ``fit_alignment`` (matched + mismatched dim, layer-count
 mismatch), ``transfer_profile`` (provenance + dropping uncovered
@@ -16,6 +16,7 @@ import torch
 from saklas.core.profile import Profile, ProfileError
 from saklas.io.alignment import (
     AlignmentError,
+    LayerAlignment,
     alignment_cache_path,
     alignment_quality,
     fit_alignment,
@@ -39,6 +40,28 @@ def _random_activations(
 
 
 class TestFitAlignment:
+    def test_factorized_fit_is_low_rank_and_carries_affine_offset(self) -> None:
+        torch.manual_seed(42)
+        n, d_src, d_tgt = 12, 64, 48
+        src = torch.randn(n, d_src)
+        dense = torch.randn(d_tgt, d_src)
+        offset = torch.linspace(-2.0, 2.0, d_tgt)
+        tgt = src @ dense.transpose(0, 1) + offset
+
+        fitted = fit_alignment(
+            {layer: src for layer in range(10)},
+            {layer: tgt for layer in range(10)},
+        )[0]
+
+        assert fitted.rank <= n - 1
+        assert fitted.left.numel() + fitted.right.numel() < d_src * d_tgt
+        assert torch.allclose(fitted.apply_points(src), tgt, atol=2e-4, rtol=2e-4)
+        assert torch.allclose(
+            fitted.offset,
+            tgt.mean(0) - fitted.apply_vector(src.mean(0)),
+            atol=1e-5,
+        )
+
     def test_same_dim_orthogonal_procrustes_recovers_rotation(self) -> None:
         # Generate a known rotation, apply it, fit alignment — should
         # recover the rotation up to numerical error.
@@ -58,7 +81,7 @@ class TestFitAlignment:
         )
 
         # M[0] should approximately equal Q (the orthogonal rotation).
-        assert torch.allclose(M[0], Q, atol=1e-2)
+        assert torch.allclose(M[0].to_dense(), Q, atol=1e-2)
 
     def test_mismatched_dim_uses_least_squares(self) -> None:
         # D_src = 8, D_tgt = 4.  Procrustes can't operate on different
@@ -79,7 +102,7 @@ class TestFitAlignment:
         # M is shaped (D_tgt, D_src) so v_tgt = M @ v_src.
         assert M[0].shape == (D_tgt, D_src)
         # Sanity: predict X_tgt and check residual is small.
-        X_pred = (X_src - X_src.mean(dim=0)) @ M[0].transpose(0, 1)
+        X_pred = M[0].apply_vectors(X_src - X_src.mean(dim=0))
         X_tgt_c = X_tgt - X_tgt.mean(dim=0)
         residual = (X_tgt_c - X_pred).norm().item()
         baseline = X_tgt_c.norm().item()
@@ -177,6 +200,19 @@ class TestTransferProfile:
         )
         assert transferred.layers == [0, 5]
 
+    def test_affine_offset_never_enters_direction_transfer(self) -> None:
+        direction = torch.tensor([1.0, -2.0, 0.5, 0.25])
+        alignment = LayerAlignment(
+            torch.eye(4), torch.eye(4), torch.full((4,), 10_000.0),
+        )
+        transferred = transfer_profile(
+            Profile({0: direction}, metadata={}), {0: alignment},
+            source_model_id="src/model", whitener=self._whitener(4, [0]),
+        )[0]
+        assert torch.nn.functional.cosine_similarity(
+            transferred.float(), direction.float(), dim=0,
+        ) == pytest.approx(1.0, abs=1e-6)
+
     def test_empty_alignment_raises(self) -> None:
         src_profile = Profile({0: torch.ones(4)}, metadata={})
         with pytest.raises(ProfileError, match="empty"):
@@ -265,7 +301,7 @@ class TestAlignmentCache:
 
         assert sorted(loaded_M.keys()) == [0, 5]
         for layer in loaded_M:
-            assert torch.allclose(loaded_M[layer], M[layer])
+            assert torch.allclose(loaded_M[layer].to_dense(), M[layer])
         assert sidecar["source_model_id"] == "a/b"
         assert sidecar["target_model_id"] == "c/d"
         assert sidecar["shared_layers"] == [0, 5]
@@ -294,6 +330,49 @@ class TestAlignmentCache:
             "a/b", "c/d", source_identity=changed,
             target_identity=self._TGT_ID,
         ) is None
+
+    def test_identity_drift_never_materializes_payload(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+        save_alignment_map(
+            {0: torch.eye(3)}, "a/b", "c/d",
+            source_identity=self._SRC_ID, target_identity=self._TGT_ID,
+        )
+        import saklas.io.alignment as alignment_mod
+
+        monkeypatch.setattr(
+            alignment_mod, "load_file",
+            lambda *_a, **_k: (_ for _ in ()).throw(
+                AssertionError("stale identity materialized alignment payload")
+            ),
+        )
+        changed = {**self._SRC_ID, "model_fingerprint": "changed"}
+        assert load_alignment_map(
+            "a/b", "c/d", source_identity=changed,
+            target_identity=self._TGT_ID,
+        ) is None
+
+    def test_cache_round_trips_factorized_offset(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+        alignment = LayerAlignment(
+            left=torch.randn(6, 2), right=torch.randn(2, 4),
+            offset=torch.arange(6, dtype=torch.float32),
+        )
+        save_alignment_map(
+            {3: alignment}, "a/b", "c/d",
+            source_identity=self._SRC_ID, target_identity=self._TGT_ID,
+        )
+        loaded = load_alignment_map(
+            "a/b", "c/d", source_identity=self._SRC_ID,
+            target_identity=self._TGT_ID,
+        )
+        assert loaded is not None
+        restored, sidecar = loaded
+        assert sidecar["format_version"] == 3
+        assert torch.equal(restored[3].left, alignment.left)
+        assert torch.equal(restored[3].right, alignment.right)
+        assert torch.equal(restored[3].offset, alignment.offset)
 
 
 # ---------------------------------------------------------------------------

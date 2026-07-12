@@ -138,6 +138,29 @@ def test_stale_format_version_raises(tmp_path: Path):
         ManifoldFolder.load(folder)
 
 
+def test_v5_folder_remains_readable_under_v6_writer(tmp_path: Path) -> None:
+    """v5 means identity affine coords; v6 readers need no migration."""
+    from saklas.core.manifold import load_manifold
+    from saklas.io.packs import hash_file
+
+    folder = _author_manifold(tmp_path)
+    tensor = _fit_real_manifold(folder, "legacy/model", dim=4)
+    sidecar_path = tensor.with_suffix(".json")
+    sidecar = json.loads(sidecar_path.read_text())
+    sidecar["format_version"] = 5
+    sidecar_path.write_text(json.dumps(sidecar))
+
+    manifest_path = folder / "manifold.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["format_version"] = 5
+    manifest["files"][sidecar_path.name] = hash_file(sidecar_path)
+    manifest_path.write_text(json.dumps(manifest))
+
+    loaded = ManifoldFolder.load(folder)
+    assert loaded.name == "mood"
+    assert load_manifold(tensor).name == "mood"
+
+
 def test_newer_format_version_raises(tmp_path: Path):
     # Symmetric ceiling, mirroring PackMetadata.load — a manifold authored
     # by a future saklas (format_version > local) must not load silently.
@@ -659,6 +682,29 @@ def test_update_manifold_folder_relabels_cleanly(tmp_path: Path, monkeypatch: py
     ]
 
 
+def test_update_manifold_folder_does_not_hash_fitted_payloads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    domain = {"type": "box", "axes": [
+        {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]}
+    folder, _ = create_manifold_folder(
+        "local", "mood", "", domain, _author_nodes(["a", "b", "c"]),
+    )
+    _fake_fit_tensor(folder, "test/model")
+    from saklas.io import packs
+
+    hashed: list[Path] = []
+
+    def unexpected_hash(path: Path) -> str:
+        hashed.append(Path(path))
+        raise AssertionError("metadata-only authoring hashed a fitted payload")
+
+    monkeypatch.setattr(packs, "hash_file", unexpected_hash)
+    update_manifold_folder(folder, description="edited")
+    assert hashed == []
+
+
 def test_malformed_json_raises_format_error(tmp_path: Path):
     # A corrupt manifest must surface as ManifoldFormatError, not a bare
     # JSONDecodeError — the HTTP routes and iter_manifold_folders only
@@ -976,6 +1022,39 @@ def test_merge_discover_unions_nodes(tmp_path: Path, monkeypatch: pytest.MonkeyP
     groups = dict(mf.node_groups())
     for label in mf.node_labels:
         assert len(groups[label]) == 3
+
+
+def test_merge_discover_does_not_hash_source_fitted_payloads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    folders = [
+        create_discover_manifold_folder(
+            "local", name, "", fit_mode="pca",
+            node_corpora=_discover_corpora(labels),
+        )
+        for name, labels in (
+            ("src_a", ["a", "b", "c"]),
+            ("src_b", ["d", "e", "f"]),
+        )
+    ]
+    for folder in folders:
+        _fake_fit_tensor(folder, "test/model")
+    from saklas.io import packs
+
+    hashed: list[Path] = []
+
+    def unexpected_hash(path: Path) -> str:
+        hashed.append(Path(path))
+        raise AssertionError("metadata-only merge hashed a fitted payload")
+
+    monkeypatch.setattr(packs, "hash_file", unexpected_hash)
+    merge_discover_manifolds(
+        "local", "combined", "", sources=[
+            ("local", "src_a"), ("local", "src_b"),
+        ],
+    )
+    assert hashed == []
 
 
 def test_merge_discover_refuses_authored_source(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -1451,6 +1530,30 @@ def test_refresh_manifold_skips_local(tmp_path: Path, monkeypatch: pytest.Monkey
     assert refresh_manifold("local", "mood") == "skipped"
 
 
+def test_metadata_only_lifecycle_does_not_hash_fitted_payloads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    domain = {"type": "box", "axes": [
+        {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]}
+    folder, _ = create_manifold_folder(
+        "local", "mood", "", domain, _author_nodes(["a", "b", "c"]),
+    )
+    _fake_fit_tensor(folder, "test/model")
+    from saklas.io import packs
+
+    hashed: list[Path] = []
+
+    def unexpected_hash(path: Path) -> str:
+        hashed.append(Path(path))
+        raise AssertionError("metadata-only lifecycle hashed a fitted payload")
+
+    monkeypatch.setattr(packs, "hash_file", unexpected_hash)
+    assert refresh_manifold("local", "mood") == "skipped"
+    assert remove_manifold_folder("local", "mood")["removed"] is True
+    assert hashed == []
+
+
 def test_refresh_manifold_hf_repulls(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """An ``hf://``-sourced manifold re-pulls via pull_manifold."""
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
@@ -1642,6 +1745,173 @@ def test_force_authoring_reset_waits_for_stable_pair_lock(
 #
 # transfer_manifold applies a GIVEN per-layer Procrustes map to a fitted
 # manifold's subspace, writing a _from-<safe_src> variant tensor.
+
+
+def test_rectangular_affine_transfer_preserves_points_frame_and_steering(
+    tmp_path: Path,
+) -> None:
+    import torch
+    from saklas.core.manifold import (
+        CustomDomain, LayerSubspace, Manifold, load_manifold, save_manifold,
+        transfer_manifold_subspaces,
+    )
+    from saklas.io.alignment import LayerAlignment
+
+    basis = torch.tensor([
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+    ])
+    node_coords = torch.tensor([[0.0, 0.0], [1.0, -0.5], [-0.25, 1.5]])
+    source = Manifold(
+        name="rect-flat", domain=CustomDomain(2), node_labels=["a", "b", "c"],
+        node_coords=node_coords,
+        layers={0: LayerSubspace.affine(
+            torch.tensor([0.5, -1.0, 2.0, 0.25]), basis,
+            node_coords=node_coords,
+        )},
+    )
+    dense = torch.tensor([
+        [2.0, 0.2, 0.0, 0.0], [0.0, 0.5, 0.0, 0.0],
+        [0.3, 0.0, 1.0, 0.0], [0.0, -0.4, 0.0, 1.0],
+        [0.1, 0.2, 0.0, 0.0], [0.0, 0.3, 0.0, 0.0],
+    ])
+    alignment = LayerAlignment(
+        dense, torch.eye(4), torch.linspace(-0.5, 0.5, 6),
+    )
+    target = transfer_manifold_subspaces(
+        source, {0: alignment}, whitener=_target_whitener(dim=6, layers=(0,)),
+        from_model="src", to_model="tgt",
+    )
+    for point in (torch.tensor([0.2, -0.4]), node_coords[1]):
+        assert torch.allclose(
+            target.manifold_point(0, point),
+            alignment.apply_points(source.manifold_point(0, point)),
+            atol=1e-5,
+        )
+    target_sub = target.layers[0]
+    assert torch.allclose(
+        target_sub.basis @ target_sub.basis.T, torch.eye(2), atol=1e-5,
+    )
+    assert target_sub.node_coords is not None
+    assert torch.allclose(
+        target_sub.node_coords[1] @ target_sub.basis,
+        alignment.apply_vector(node_coords[1] @ basis),
+        atol=1e-5,
+    )
+    # The explicit affine coordinate reparameterization is an on-disk contract,
+    # not merely an in-memory transfer detail.
+    path = tmp_path / "rect-flat.safetensors"
+    save_manifold(target, path, {"method": "manifold_procrustes_transfer"})
+    loaded = load_manifold(path, verify_manifest=False)
+    assert torch.allclose(
+        loaded.manifold_point(0, [0.2, -0.4]),
+        target.manifold_point(0, [0.2, -0.4]),
+        atol=1e-6,
+    )
+
+
+def test_rectangular_curved_transfer_preserves_world_points_and_clears_sigma() -> None:
+    import torch
+    from dataclasses import replace
+    from saklas.core.manifold import (
+        BoxAxis, BoxDomain, Manifold, fit_layer_subspace,
+        fit_rbf_interpolant, transfer_manifold_subspaces,
+    )
+    from saklas.io.alignment import LayerAlignment
+
+    domain = BoxDomain([BoxAxis("t", periodic=False, lo=0.0, hi=1.0)])
+    coords = torch.tensor([[0.0], [0.5], [1.0]])
+    embedded = domain.embed(coords)
+    centroids = torch.tensor([
+        [0.0, 0.0, 1.0, -1.0],
+        [0.8, 0.4, 0.3, -0.2],
+        [0.1, 1.2, -0.5, 0.5],
+    ])
+    sub, _ = fit_layer_subspace(centroids, embedded)
+    assert sub.node_params is not None
+    sigma_rw, sigma_pc = fit_rbf_interpolant(
+        sub.node_params, torch.zeros(3, 1),
+    )
+    sub = replace(sub, sigma_rbf_weights=sigma_rw, sigma_poly_coeffs=sigma_pc)
+    source = Manifold(
+        name="rect-curve", domain=domain, node_labels=["a", "b", "c"],
+        node_coords=coords, layers={0: sub},
+    )
+    dense = torch.tensor([
+        [1.8, 0.0, 0.0, 0.0], [0.2, 0.7, 0.0, 0.0],
+        [0.0, 0.1, 1.0, 0.0], [0.0, 0.0, 0.2, 1.0],
+        [0.3, 0.0, 0.0, 0.0], [0.0, -0.2, 0.0, 0.0],
+    ])
+    alignment = LayerAlignment(dense, torch.eye(4), torch.arange(6).float() / 10)
+    target = transfer_manifold_subspaces(
+        source, {0: alignment}, whitener=_target_whitener(dim=6, layers=(0,)),
+        from_model="src", to_model="tgt",
+    )
+    for position in ([0.0], [0.25], [0.5], [0.8], [1.0]):
+        assert torch.allclose(
+            target.manifold_point(0, position),
+            alignment.apply_points(source.manifold_point(0, position)),
+            atol=2e-5,
+        )
+    target_sub = target.layers[0]
+    assert torch.allclose(
+        target_sub.basis @ target_sub.basis.T,
+        torch.eye(target_sub.rank), atol=1e-5,
+    )
+    assert not target_sub.has_sigma
+
+
+def test_rectangular_transfer_rejects_collapsed_subspace_rank() -> None:
+    import torch
+    from saklas.core.manifold import CustomDomain, LayerSubspace, Manifold, transfer_manifold_subspaces
+    from saklas.io.alignment import LayerAlignment
+
+    source = Manifold(
+        name="collapsed", domain=CustomDomain(2), node_labels=["a", "b"],
+        node_coords=torch.tensor([[0.0, 0.0], [1.0, 1.0]]),
+        layers={0: LayerSubspace.affine(
+            torch.zeros(3), torch.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]),
+            node_coords=torch.tensor([[0.0, 0.0], [1.0, 1.0]]),
+        )},
+    )
+    collapsed = torch.tensor([[1.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+    alignment = LayerAlignment(collapsed, torch.eye(3), torch.zeros(2))
+    with pytest.raises(ValueError, match="rank-deficient"):
+        transfer_manifold_subspaces(
+            source, {0: alignment},
+            whitener=_target_whitener(dim=2, layers=(0,)),
+            from_model="src", to_model="tgt",
+        )
+
+
+def test_rectangular_transfer_rejects_oblique_rank_collapse() -> None:
+    """Rank detection uses singular values, not unpivoted QR diagonals."""
+    import torch
+    from saklas.core.manifold import (
+        CustomDomain, LayerSubspace, Manifold, transfer_manifold_subspaces,
+    )
+    from saklas.io.alignment import LayerAlignment
+
+    source = Manifold(
+        name="oblique-collapse", domain=CustomDomain(3),
+        node_labels=["a", "b", "c"], node_coords=torch.eye(3),
+        layers={0: LayerSubspace.affine(
+            torch.zeros(3), torch.eye(3), node_coords=torch.eye(3),
+        )},
+    )
+    generator = torch.Generator().manual_seed(30061)
+    collapsed = (
+        torch.randn(3, 2, generator=generator)
+        @ torch.randn(2, 3, generator=generator)
+    )
+    alignment = LayerAlignment(collapsed, torch.eye(3), torch.zeros(3))
+
+    with pytest.raises(ValueError, match="rank-deficient"):
+        transfer_manifold_subspaces(
+            source, {0: alignment},
+            whitener=_target_whitener(dim=3, layers=(0,)),
+            from_model="src", to_model="tgt",
+        )
 
 
 def _target_whitener(*, dim: int = 6, layers: tuple[int, ...] = (4, 5, 6)):
@@ -2580,6 +2850,33 @@ def test_baked_manifold_round_trip(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     (tensor,) = list(folder.glob("*.safetensors"))
     folded = folded_vector_directions(load_manifold(tensor))
     assert set(folded) == set(directions)
+
+
+def test_baked_publication_hashes_each_new_file_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    from saklas.io import manifold_folder as folder_module, packs
+
+    real_hash = folder_module.hash_file
+    hashed: list[Path] = []
+
+    def count_hash(path: Path) -> str:
+        hashed.append(Path(path))
+        return real_hash(Path(path))
+
+    monkeypatch.setattr(folder_module, "hash_file", count_hash)
+    monkeypatch.setattr(packs, "hash_file", count_hash)
+    manifold, _ = _baked_manifold("merged")
+
+    create_baked_manifold_folder(
+        "local", "merged", "", manifold, "test/model", method="merge",
+        model_fingerprint="fp:test/model",
+    )
+
+    assert [path.name for path in hashed] == [
+        "test__model.safetensors", "test__model.json",
+    ]
 
 
 def test_baked_first_publication_retry_repairs_unproven_pair(

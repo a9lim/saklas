@@ -44,7 +44,7 @@ import math
 import os
 import tempfile
 from abc import ABC, abstractmethod
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Sequence, cast
@@ -1123,8 +1123,10 @@ class LayerSubspace:
     **Affine (flat) case.**  When ``node_params`` / ``rbf_weights`` /
     ``poly_coeffs`` are ``None`` the subspace carries no RBF surface — the
     "surface" *is* the whole affine subspace (a folded steering vector at
-    ``n = R``), so the reduced coordinates equal the authoring coordinates
-    by an identity map and ``manifold_point(c) = mean + c @ basis``.  The
+    ``n = R``).  Ordinary fits use the identity authoring→reduced map;
+    rectangular cross-model transfers may carry an explicit ``affine_map`` so
+    ``manifold_point(c) = mean + c @ affine_map @ basis`` while ``basis`` stays
+    orthonormal.  The
     affine case has ``H_n ≡ 0`` (the surface fills its subspace), so
     ``subspace_inject`` takes an analytic shortcut that skips the
     Gauss-Newton foot solve, the RBF eval, and the tangent Gram-solve —
@@ -1150,6 +1152,12 @@ class LayerSubspace:
     # origin here, so the synthesizer reads ``node_coords[index]`` per layer
     # as the ``along`` target.  The shared ``Manifold.node_coords`` stays the
     # label/display layout; *these* are the geometry (§5 neutral-anchor).
+    affine_map: torch.Tensor | None = None
+    # (m, R) authoring-to-reduced coordinate map for affine subspaces.  ``None``
+    # is the historical identity map (m == R).  Cross-model transfer may need a
+    # non-isometric map after orthonormalizing a rectangular mapped basis; this
+    # explicit factor preserves the exact world surface without weakening the
+    # runtime's orthonormal-basis invariant.
     sigma_rbf_weights: torch.Tensor | None = None
     sigma_poly_coeffs: torch.Tensor | None = None
     # The **fuzzy-manifold σ-field** (curved subspaces only; ``None`` =
@@ -1189,12 +1197,15 @@ class LayerSubspace:
         basis: torch.Tensor,
         *,
         node_coords: torch.Tensor | None = None,
+        affine_map: torch.Tensor | None = None,
     ) -> "LayerSubspace":
         """Build a flat (affine, no-RBF) subspace from ``mean`` + ``basis``.
 
-        The authoring coordinates map to reduced coordinates by identity
+        By default authoring coordinates map to reduced coordinates by identity
         (``coord_offset = 0``, ``coord_scale = 1``), so
-        ``eval_at(c) = c @ basis + mean`` exactly.  ``basis`` is ``(R, D)``;
+        ``eval_at(c) = c @ basis + mean`` exactly.  ``affine_map`` optionally
+        supplies an ``(m, R)`` map after cross-model reparameterization.
+        ``basis`` is ``(R, D)``;
         the implied intrinsic dimension is ``n = R`` (the surface fills the
         span).  Backs the folded-vector / flat-subspace representation
         (Phase 2 §1).  ``node_coords`` ``(K, R)`` carries the per-layer real
@@ -1202,15 +1213,24 @@ class LayerSubspace:
         ``None`` for a bare span with no associated nodes.
         """
         r = int(basis.shape[0])
+        m = r
+        if affine_map is not None:
+            if affine_map.ndim != 2 or affine_map.shape[1] != r:
+                raise ValueError(
+                    f"affine_map must have shape (m, {r}), got "
+                    f"{tuple(affine_map.shape)}"
+                )
+            m = int(affine_map.shape[0])
         return cls(
             mean=mean,
             basis=basis,
             node_params=None,
             rbf_weights=None,
             poly_coeffs=None,
-            coord_offset=torch.zeros(r, device=mean.device, dtype=mean.dtype),
-            coord_scale=torch.ones(r, device=mean.device, dtype=mean.dtype),
+            coord_offset=torch.zeros(m, device=mean.device, dtype=mean.dtype),
+            coord_scale=torch.ones(m, device=mean.device, dtype=mean.dtype),
             node_coords=node_coords,
+            affine_map=affine_map,
         )
 
     def select_axes(self, kept: Sequence[int]) -> "LayerSubspace":
@@ -1245,7 +1265,13 @@ class LayerSubspace:
             self.node_coords[:, idx].contiguous()
             if self.node_coords is not None else None
         )
-        return LayerSubspace.affine(mean_k, basis_k, node_coords=nc_k)
+        amap_k = (
+            self.affine_map[:, idx].contiguous()
+            if self.affine_map is not None else None
+        )
+        return LayerSubspace.affine(
+            mean_k, basis_k, node_coords=nc_k, affine_map=amap_k,
+        )
 
     def rbf_params(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """The validated ``(node_params, rbf_weights, poly_coeffs)`` triple.
@@ -1278,6 +1304,7 @@ class LayerSubspace:
             coord_offset=self.coord_offset.to(device=device, dtype=dtype),
             coord_scale=self.coord_scale.to(device=device, dtype=dtype),
             node_coords=_cast(self.node_coords),
+            affine_map=_cast(self.affine_map),
             sigma_rbf_weights=_cast(self.sigma_rbf_weights),
             sigma_poly_coeffs=_cast(self.sigma_poly_coeffs),
         )
@@ -1299,9 +1326,11 @@ class LayerSubspace:
     def eval_at(self, embedded: torch.Tensor) -> torch.Tensor:
         """World-space activation ``(.., D)`` at embedded domain coords ``(.., m)``."""
         if self.is_affine:
-            # Flat: reduced coords == authoring coords (identity map), the
-            # surface fills the subspace ⇒ pure affine, no RBF eval.
-            return embedded @ self.basis + self.mean
+            # Flat: the historical representation has an identity
+            # authoring→reduced map.  Rectangular cross-model transfer may
+            # carry an explicit map after orthonormalizing the target basis.
+            reduced = embedded if self.affine_map is None else embedded @ self.affine_map
+            return reduced @ self.basis + self.mean
         reduced = eval_rbf(*self.rbf_params(), self._normalize(embedded))
         return reduced @ self.basis + self.mean
 
@@ -1331,9 +1360,11 @@ class LayerSubspace:
     def jacobian_at(self, embedded: torch.Tensor) -> torch.Tensor:
         """Activation Jacobian ``d activation / d embedded``: ``(m,) -> (D, m)``."""
         if self.is_affine:
-            # d(embedded @ basis + mean)/d embedded = basis.T, position-
-            # independent; broadcast across any leading batch dims.
-            jac = self.basis.transpose(-1, -2)  # (D, R) == (D, m)
+            # d(embedded @ A @ basis + mean)/d embedded = basis.T @ A.T,
+            # position-independent.  ``A`` is identity on ordinary fits.
+            jac = self.basis.transpose(-1, -2)
+            if self.affine_map is not None:
+                jac = jac @ self.affine_map.transpose(-1, -2)
             if embedded.ndim > 1:
                 jac = jac.expand(*embedded.shape[:-1], *jac.shape)
             return jac
@@ -2533,10 +2564,13 @@ def subspace_inject(
 
     if subspace.is_affine:
         # --- flat (folded-vector) shortcut --------------------------------
-        # The surface fills the subspace, so reduced coords *are* authoring
-        # coords (identity map): the foot is ``q`` exactly, ``H_n ≡ 0`` and
-        # ``onto`` is vacuous (ignored).  No GN solve, no RBF eval, no
-        # tangent Gram-solve — the cost the common steering case can't pay.
+        # The surface fills the subspace, so the injected target is already in
+        # the layer's orthonormal reduced frame: the foot is ``q`` exactly,
+        # ``H_n ≡ 0`` and ``onto`` is vacuous (ignored).  Ordinary fits have an
+        # identity authoring→reduced map; rectangular transfers bake their
+        # explicit map into the resolved per-layer target before this kernel.
+        # No GN solve, no RBF eval, no tangent Gram-solve — the cost the common
+        # steering case can't pay.
         #
         # ``q = (h − mean)·basisᵀ = h·basisᵀ − mean·basisᵀ`` is computed
         # **without** the full-width ``centered = h − mean`` temporary: the
@@ -4612,11 +4646,18 @@ def compute_store_reduced_covariances(
         rows = store.flat_rows(idx)
         reduced_rows = torch.empty(store.total_rows, rank, dtype=torch.float32)
         mean = sub.mean.to(device="cpu", dtype=torch.float32)
+        centered_buffer = torch.empty(
+            min(row_chunk, store.total_rows), rows.shape[1], dtype=torch.float32,
+        )
         for start in range(0, store.total_rows, row_chunk):
             end = min(start + row_chunk, store.total_rows)
-            centered_chunk = rows[start:end].to(torch.float32)
-            centered_chunk.sub_(mean)
-            reduced_rows[start:end] = centered_chunk @ basis_t
+            centered = centered_buffer[:end - start]
+            # Center before projection for numerical stability at the large
+            # common-mode offsets residual streams can carry. ``out=`` keeps
+            # the operation bounded and out-of-place even when the source row
+            # store is already fp32 (where ``.to(float32)`` would alias it).
+            torch.sub(rows[start:end], mean, out=centered)
+            reduced_rows[start:end] = centered @ basis_t
 
         for k, (start, end) in enumerate(boundaries):
             size = end - start
@@ -4863,9 +4904,9 @@ def save_manifold(
     ``origin_per_layer`` (the authoring-coordinate foot of the neutral mean,
     keyed by layer), plus the provenance fields in ``metadata``.
 
-    **Affine (flat / folded-vector) layers** write only ``layer_<L>.mean`` +
-    ``layer_<L>.basis`` — there is no RBF triple and the coord normalization
-    is identity (reconstructed from the basis shape by
+    **Affine (flat / folded-vector) layers** write ``layer_<L>.mean`` +
+    ``layer_<L>.basis`` and optional ``layer_<L>.affine_map`` — there is no RBF
+    triple and ordinary-fit coord normalization is identity (reconstructed by
     :meth:`LayerSubspace.affine` on load).  The *absence* of ``node_params``
     on disk is the read-side affine marker ``load_manifold`` keys on, so a
     folded-vector artifact and a fitted manifold share one save/load path.
@@ -4894,6 +4935,10 @@ def save_manifold(
             if sub.node_coords is not None:
                 tensors[f"layer_{idx}.node_coords"] = (
                     sub.node_coords.contiguous().to(torch.float32).cpu()
+                )
+            if sub.affine_map is not None:
+                tensors[f"layer_{idx}.affine_map"] = (
+                    sub.affine_map.contiguous().to(torch.float32).cpu()
                 )
             continue
         np_, rw, pc = sub.rbf_params()
@@ -5104,13 +5149,11 @@ def _load_manifold_locked(
             raise ManifoldFormatError(
                 f"manifold manifest is unreadable at {manifest_path}: {exc}"
             ) from exc
-        from saklas.io.manifolds import MANIFOLD_FORMAT_VERSION
+        from saklas.io.manifold_folder import validate_manifold_format_version
 
-        if manifest.get("format_version") != MANIFOLD_FORMAT_VERSION:
-            raise ManifoldFormatError(
-                f"manifold format_version={manifest.get('format_version')!r}; "
-                f"need exactly {MANIFOLD_FORMAT_VERSION}"
-            )
+        validate_manifold_format_version(
+            manifest.get("format_version"), location="manifold manifest",
+        )
         fit_mode = manifest.get("fit_mode", "authored")
         if not isinstance(manifest.get("name"), str) or fit_mode not in {
             "authored", "pca", "spectral", "auto", "baked",
@@ -5200,6 +5243,7 @@ def _load_manifold_locked(
             layers[idx] = LayerSubspace.affine(
                 mean=parts["mean"], basis=parts["basis"],
                 node_coords=parts.get("node_coords"),
+                affine_map=parts.get("affine_map"),
             )
             continue
         layers[idx] = LayerSubspace(
@@ -5255,7 +5299,7 @@ def _load_manifold_locked(
 
 def transfer_manifold_subspaces(
     src: Manifold,
-    alignment: dict[int, torch.Tensor],
+    alignment: Mapping[int, Any],
     *,
     whitener: "LayerWhitener | None",
     from_model: str,
@@ -5266,19 +5310,20 @@ def transfer_manifold_subspaces(
     The pure-tensor core of the cross-model Procrustes transfer (the folder
     read/write orchestration stays in :func:`saklas.io.manifold_lifecycle.
     transfer_manifold`).  Takes the already-loaded **source** ``Manifold``, a
-    per-layer alignment map ``{layer: M_L}`` (``v_tgt = M_L @ v_src``, the shape
-    :func:`saklas.io.alignment.fit_alignment` produces), and the **target**
-    model's whitener, and returns a new ``Manifold`` whose subspaces live in
-    target space.
+    per-layer affine alignment map (the compact factorized
+    :class:`saklas.io.alignment.LayerAlignment` returned by
+    :func:`saklas.io.alignment.fit_alignment`; legacy dense linear tensors are
+    accepted in memory), and the **target** model's whitener, and returns a new
+    ``Manifold`` whose subspaces live in target space.
 
-    Each covered layer's affine subspace maps as ``mean_tgt = M_L @ mean_src``
-    and ``basis_tgt = basis_src @ M_Lᵀ`` (each basis row transforms like a
-    vector).  Layers the alignment doesn't cover are dropped.  The RBF
-    interpolant fields (``node_params`` / ``rbf_weights`` / ``poly_coeffs`` /
-    ``coord_offset`` / ``coord_scale``) and the shared ``node_coords`` live in
-    subspace/authoring-coordinate space, not model space, so they ride through
-    untouched — the subspace relocates via the transformed ``mean``/``basis``
-    and the in-subspace parameterization is invariant.
+    Means and manifold points use the affine map (linear factor plus fitted
+    translation); basis rows and direction profiles use only its linear factor.
+    The mapped rows are QR-reparameterized to an orthonormal target frame and
+    every affine/RBF reduced-coordinate coefficient is transformed by the exact
+    companion matrix, preserving world points.  A collapsed source span is
+    rejected.  A curved scalar sigma field is retained only when that companion
+    map is an isometry; otherwise transfer would make its thickness anisotropic,
+    so the scalar field is cleared.  Layers the alignment doesn't cover drop.
 
     **Target-metric share re-bake (mandatory).**  The source fit's per-layer
     Mahalanobis ``share`` is a per-model quantity (``Σ`` belongs to
@@ -5309,12 +5354,98 @@ def transfer_manifold_subspaces(
         M_L = alignment.get(layer)
         if M_L is None:
             continue
-        M = M_L.to(dtype=torch.float32)
         mean_f = sub.mean.to(torch.float32)
         basis_f = sub.basis.to(torch.float32)
-        mean_tgt = (M @ mean_f).to(dtype=sub.mean.dtype)
-        basis_tgt = (basis_f @ M.transpose(0, 1)).to(dtype=sub.basis.dtype)
-        new_layers[layer] = _dc_replace(sub, mean=mean_tgt, basis=basis_tgt)
+        if hasattr(M_L, "apply_vectors") and hasattr(M_L, "apply_points"):
+            raw_basis = M_L.apply_vectors(basis_f)
+            mean_tgt_f = M_L.apply_points(mean_f)
+        else:
+            # Compatibility for caller-supplied legacy dense linear maps.  They
+            # carry no affine translation; persisted caches never use this shape.
+            M = M_L.to(dtype=torch.float32)
+            raw_basis = basis_f @ M.transpose(0, 1)
+            mean_tgt_f = M @ mean_f
+
+        rank = int(raw_basis.shape[0])
+        if raw_basis.ndim != 2 or raw_basis.shape[1] < rank:
+            raise ValueError(
+                f"alignment for layer {layer} cannot carry rank-{rank} source "
+                f"subspace into target shape {tuple(raw_basis.shape)}"
+            )
+        # Reparameterize B_raw = A @ B_ortho.  Runtime projection/injection
+        # requires orthonormal basis rows, while multiplying every reduced output
+        # by A preserves each mapped world-space manifold point exactly.
+        raw_gram = raw_basis @ raw_basis.transpose(0, 1)
+        identity = torch.eye(rank, dtype=raw_gram.dtype, device=raw_gram.device)
+        if torch.allclose(raw_gram, identity, atol=1e-5, rtol=1e-5):
+            # Preserve an already-orthonormal map byte-for-byte (identity and
+            # square Procrustes rotations need no coordinate change).
+            basis_tgt_f = raw_basis.contiguous()
+            reduced_map = identity
+        else:
+            Q, R = torch.linalg.qr(raw_basis.transpose(0, 1), mode="reduced")
+            # Unpivoted QR diagonals are not rank-revealing for oblique
+            # dependencies. Rank-test only this small R×R factor with singular
+            # values before publishing a supposedly orthonormal frame.
+            singular_values = torch.linalg.svdvals(R)
+            tol = (
+                torch.finfo(R.dtype).eps * max(raw_basis.shape)
+                * float(singular_values.max())
+            )
+            if (
+                singular_values.numel() != rank
+                or bool((singular_values <= tol).any())
+            ):
+                raise ValueError(
+                    f"alignment for layer {layer} collapses the rank-{rank} manifold "
+                    "subspace; refusing a rank-deficient transfer"
+                )
+            basis_tgt_f = Q.transpose(0, 1).contiguous()
+            reduced_map = R.transpose(0, 1).contiguous()
+        kwargs: dict[str, Any] = {
+            "mean": mean_tgt_f.to(dtype=sub.mean.dtype),
+            "basis": basis_tgt_f.to(dtype=sub.basis.dtype),
+        }
+        if sub.is_affine:
+            source_map = (
+                torch.eye(
+                    sub.rank, dtype=torch.float32, device=reduced_map.device,
+                )
+                if sub.affine_map is None
+                else sub.affine_map.to(
+                    device=reduced_map.device, dtype=torch.float32,
+                )
+            )
+            kwargs["affine_map"] = (source_map @ reduced_map).to(
+                dtype=sub.basis.dtype,
+            )
+            kwargs["node_coords"] = (
+                None if sub.node_coords is None
+                else (sub.node_coords.to(torch.float32) @ reduced_map).to(
+                    dtype=sub.node_coords.dtype,
+                )
+            )
+        else:
+            assert sub.rbf_weights is not None and sub.poly_coeffs is not None
+            kwargs["rbf_weights"] = (
+                sub.rbf_weights.to(torch.float32) @ reduced_map
+            ).to(dtype=sub.rbf_weights.dtype)
+            kwargs["poly_coeffs"] = (
+                sub.poly_coeffs.to(torch.float32) @ reduced_map
+            ).to(dtype=sub.poly_coeffs.dtype)
+            # A scalar isotropic tube thickness is invariant only under an
+            # isometry of this reduced frame.  A rectangular/non-isometric map
+            # makes the source sigma anisotropic; clearing it is honest whereas
+            # carrying the old scalar would fabricate target-model density.
+            gram = reduced_map @ reduced_map.transpose(0, 1)
+            isometric = torch.allclose(
+                gram, torch.eye(rank, dtype=gram.dtype, device=gram.device),
+                atol=1e-4, rtol=1e-4,
+            )
+            if not isometric:
+                kwargs["sigma_rbf_weights"] = None
+                kwargs["sigma_poly_coeffs"] = None
+        new_layers[layer] = _dc_replace(sub, **kwargs)
 
     if not new_layers:
         raise ValueError(

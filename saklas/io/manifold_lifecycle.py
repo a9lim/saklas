@@ -20,8 +20,6 @@ from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Any, Optional
 
-import torch
-
 from saklas.io.atomic import write_json_atomic
 from saklas.core.errors import ManifoldExistsError, ManifoldNotFoundError, SaklasError
 from saklas.core.manifold import domain_from_spec
@@ -332,7 +330,7 @@ def _remove_manifold_folder_locked(namespace: str, name: str) -> dict[str, Any]:
     # Read the source tier before deleting (best-effort — a corrupt
     # manifest just reports the namespace-implied tier).
     try:
-        source = ManifoldFolder.load(folder).source
+        source = ManifoldFolder.load(folder, verify_manifest=False).source
     except ManifoldFormatError:
         source = "bundled" if namespace == "default" else "local"
     rematerializes = namespace == "default" or source == "bundled"
@@ -417,7 +415,7 @@ def _refresh_manifold_locked(
         clear_manifold_tensors(namespace, name, model_scope, variant="all")
         return "scoped"
 
-    source = ManifoldFolder.load(folder).source
+    source = ManifoldFolder.load(folder, verify_manifest=False).source
 
     if namespace == "default" or source == "bundled":
         # Bundled tier — re-copy from package data.  Process-scoped, so
@@ -510,7 +508,7 @@ def transfer_manifold(
     *,
     from_model: str,
     to_model: str,
-    alignment: dict[int, torch.Tensor],
+    alignment: dict[int, Any],
     transfer_quality_estimate: Optional[float] = None,
     source_model_fingerprint: str,
     target_model_fingerprint: str,
@@ -542,7 +540,7 @@ def _transfer_manifold_locked(
     *,
     from_model: str,
     to_model: str,
-    alignment: dict[int, torch.Tensor],
+    alignment: dict[int, Any],
     transfer_quality_estimate: Optional[float] = None,
     source_model_fingerprint: str,
     target_model_fingerprint: str,
@@ -553,20 +551,17 @@ def _transfer_manifold_locked(
 
     Reads the source-model fit at ``<folder>/<safe_from>.safetensors``,
     maps each layer's affine subspace (``mean`` + ``basis`` rows, both in
-    model space) through the supplied ``alignment`` map
-    (``{layer: M_L}`` where ``v_tgt = M_L @ v_src``, the shape
-    :func:`saklas.io.alignment.fit_alignment` produces), and writes a
+    model space) through the supplied compact factorized affine alignment
+    (the shape :func:`saklas.io.alignment.fit_alignment` produces), and writes a
     transferred per-model tensor at the ``_from-<safe_src>`` filename
     variant (``<safe_to>_from-<safe_from>.safetensors`` —
     :func:`saklas.io.paths.tensor_filename`'s transfer suffix).
 
-    The RBF interpolant fields (``node_params`` / ``rbf_weights`` /
-    ``poly_coeffs`` / ``coord_offset`` / ``coord_scale``) live in
-    subspace/authoring-coordinate space, not model space, so they ride
-    through untouched — the subspace itself relocates via the transformed
-    ``mean``/``basis`` and the in-subspace parameterization is invariant.
-    ``node_coords`` (the intrinsic authoring layout) is likewise
-    model-independent.  Layers the alignment doesn't cover are dropped,
+    Translation applies to points/means but not directions.  The mapped basis
+    is orthonormalized and the affine/RBF reduced coefficients are transformed
+    exactly into that new frame; a rank collapse is rejected.  ``node_coords``
+    (the intrinsic authoring layout) remains model-independent.  Layers the
+    alignment doesn't cover are dropped,
     mirroring :func:`saklas.io.alignment.transfer_profile`.
 
     ``alignment`` is supplied by the caller (building it needs both

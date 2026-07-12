@@ -1004,6 +1004,9 @@ def test_layer_major_store_covariances_match_node_reference() -> None:
             basis,
         )
 
+    before = {
+        layer: store.flat_rows(layer).clone() for layer in store.layer_indices
+    }
     expected = [
         compute_node_reduced_covariance_from_rows(rows, layer_subs)
         for rows in store
@@ -1017,6 +1020,10 @@ def test_layer_major_store_covariances_match_node_reference() -> None:
             assert torch.allclose(
                 actual_node[layer], expected_node[layer], atol=1e-6,
             )
+    for layer, original in before.items():
+        assert torch.equal(store.flat_rows(layer), original), (
+            "covariance projection mutated the activation-row store"
+        )
     store.close()
 
 def _attach_constant_sigma(sub: Any, value: float) -> None:

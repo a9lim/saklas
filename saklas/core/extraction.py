@@ -1637,11 +1637,10 @@ class ManifoldExtractionPipeline:
         stacks: dict[int, torch.Tensor] = {
             idx: _stacked_centroids(idx) for idx in fit_layers
         }
-        if sae_backend is not None:
-            # All requested raw stacks were popped above. Clear the now-dead
-            # container explicitly so future edits cannot accidentally retain a
-            # raw K×D×L roster beside the reconstructed and whitened rosters.
-            stacks_cached.clear()
+        # Ownership has moved to ``stacks`` for raw fits and to the decoded
+        # replacements for SAE fits.  Clear the capture mapping in both cases so
+        # it cannot keep aliases alive after the final centroid consumer.
+        stacks_cached.clear()
 
         # 2c. Per-layer whitened between-node spread — the concept's signal
         #     concentration across the stack.  ``G_L = X̃_L Σ_L⁻¹ X̃_Lᵀ`` is the
@@ -1658,13 +1657,21 @@ class ManifoldExtractionPipeline:
         #     reuses ``layer_grams`` instead of recomputing them.
         whitened_rows: dict[int, torch.Tensor] = {}
         layer_grams: dict[int, torch.Tensor] = {}
-        for idx in fit_layers:
+
+        def _whitened_geometry(
+            idx: int,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            # Keep the full K×D temporaries in a short-lived frame; otherwise
+            # the final loop iteration remains bound after the roster clears.
             xc = stacks[idx].to(torch.float32)
             xc = xc - xc.mean(dim=0, keepdim=True)
             sinv_xc = maha_whitener.apply_inv(idx, xc).to(torch.float32)
             gram = xc @ sinv_xc.transpose(0, 1)
-            whitened_rows[idx] = sinv_xc
-            layer_grams[idx] = 0.5 * (gram + gram.transpose(0, 1))  # (K, K)
+            return sinv_xc, 0.5 * (gram + gram.transpose(0, 1))
+
+        for idx in fit_layers:
+            whitened_rows[idx], layer_grams[idx] = _whitened_geometry(idx)
+        del _whitened_geometry
         node_spread_per_layer: dict[int, float] = {
             idx: float(layer_grams[idx].diagonal().sum()) for idx in fit_layers
         }
@@ -1940,11 +1947,10 @@ class ManifoldExtractionPipeline:
             # ``max_subspace_dim`` knob for a flat fit: the affine span *is*
             # the layout, so any stray curved-fit override is ignored here.
             affine_kwargs = {"n_components": int(node_coords.shape[1])}
-            raw_fits: dict[int, tuple[Any, torch.Tensor]] = {}
-            for idx in fit_layers:
-                stacked = stacks[idx]
+
+            def _fit_affine_layer(idx: int) -> tuple[Any, torch.Tensor]:
                 sub, mu_coords, _ev_ratio = fit_affine_subspace(
-                    stacked, neutral_mean=_neutral_for(idx),
+                    stacks[idx], neutral_mean=_neutral_for(idx),
                     whitener=maha_whitener, layer=idx,
                     whitened_gram=layer_grams[idx],
                     whitened_rows=whitened_rows[idx],
@@ -1952,7 +1958,12 @@ class ManifoldExtractionPipeline:
                     basis_override=auto_fisher_bases.get(idx),
                     **affine_kwargs,
                 )
-                raw_fits[idx] = (sub, mu_coords)
+                return sub, mu_coords
+
+            raw_fits = {
+                idx: _fit_affine_layer(idx) for idx in fit_layers
+            }
+            del _fit_affine_layer
             # Per-axis DLS straddle over all fit layers at once (flat → DLS;
             # the global all-fail fallback matches the folded-vector path).
             dls_kept = compute_dls_axes(
@@ -1977,13 +1988,15 @@ class ManifoldExtractionPipeline:
                 rbf_plan = prepare_rbf_fit_plan(
                     node_params, smoothing=curved_smoothing,
                 )
-            for idx in fit_layers:
-                stacked = stacks[idx]
+
+            def _fit_curved_layer(
+                idx: int,
+            ) -> tuple[Any, dict[str, float]]:
                 # ``neutral_mean`` neutral-anchors the frame; ``maha_whitener``
                 # (mandatory, checked above) selects the whitened/Fisher basis.
                 _rbf_info: dict[str, float] = {}
                 sub, _ev_ratio = fit_layer_subspace(
-                    stacked, node_params,
+                    stacks[idx], node_params,
                     whitener=maha_whitener, layer=idx,
                     neutral_mean=_neutral_for(idx),
                     whitened_gram=layer_grams[idx],
@@ -1994,15 +2007,26 @@ class ManifoldExtractionPipeline:
                     basis_override=auto_fisher_bases.get(idx),
                     **fit_kwargs,
                 )
-                layer_subs[idx] = sub
-                if _rbf_info:
-                    rbf_smoothing_per_layer[idx] = _rbf_info
                 # μ-centered share (NOT ``eval_rbf(node_params)`` — the surface
                 # is neutral-anchored, so its node values aren't μ-centered).
-                mu_centered = stacked.to(torch.float32)
+                mu_centered = stacks[idx].to(torch.float32)
                 mu_centered = mu_centered - mu_centered.mean(dim=0)
                 mu_coords = mu_centered @ sub.basis.to(torch.float32).T  # (K, R)
                 _bake_share(idx, sub, mu_coords)
+                return sub, _rbf_info
+
+            for idx in fit_layers:
+                sub, rbf_info = _fit_curved_layer(idx)
+                layer_subs[idx] = sub
+                if rbf_info:
+                    rbf_smoothing_per_layer[idx] = rbf_info
+            del _fit_curved_layer
+
+        # Auto topology selection may hand the final fit one precomputed
+        # Fisher basis per layer.  Those R×D tensors are duplicated by the
+        # fitted LayerSubspace bases after step 4; release the planning roster
+        # before covariance and publication instead of carrying a second copy.
+        auto_fisher_bases.clear()
 
         # 4a. Neutral-center the flat (pca) display layout.  ``discover_coords``
         #     returns node coords centered on the **node centroid** (PCA removes
@@ -2027,22 +2051,42 @@ class ManifoldExtractionPipeline:
         #     Needs the neutral baseline — a CPU-stub handle without
         #     ``layer_means`` keeps the centroid origin (graceful, fit still valid).
         if effective_fit_mode == "pca" and _handle_means is not None:
-            g_cols: list[torch.Tensor] = []
-            for idx in fit_layers:
-                nu = _neutral_for(idx)
-                if nu is None:
-                    g_cols = []
-                    break
-                xc = stacks[idx].to(torch.float32)
-                xc = xc - xc.mean(dim=0, keepdim=True)
-                mu_L = stacks[idx].to(torch.float32).mean(dim=0, keepdim=True)
-                nu_c = nu.to(torch.float32).reshape(1, -1) - mu_L  # (1, D) ν − μ
-                g_cols.append(whitened_rows[idx] @ nu_c.reshape(-1))  # (K,) x̃ᵀΣ⁻¹ν̃
-            if g_cols:
-                g_nu = torch.stack(g_cols).mean(dim=0)             # (K,) layer-avg
+            def _neutral_cross_gram() -> torch.Tensor | None:
+                # Keep the K×D intermediates in a short-lived frame so the
+                # final loop iteration cannot pin a centroid roster after this
+                # last consumer returns.
+                g_cols: list[torch.Tensor] = []
+                for idx in fit_layers:
+                    nu = _neutral_for(idx)
+                    if nu is None:
+                        return None
+                    xc = stacks[idx].to(torch.float32)
+                    xc = xc - xc.mean(dim=0, keepdim=True)
+                    mu_L = stacks[idx].to(torch.float32).mean(
+                        dim=0, keepdim=True,
+                    )
+                    nu_c = (
+                        nu.to(torch.float32).reshape(1, -1) - mu_L
+                    )  # (1, D) ν − μ
+                    g_cols.append(
+                        whitened_rows[idx] @ nu_c.reshape(-1)
+                    )  # (K,) x̃ᵀΣ⁻¹ν̃
+                return torch.stack(g_cols).mean(dim=0)
+
+            g_nu = _neutral_cross_gram()
+            del _neutral_cross_gram
+            if g_nu is not None:
                 neutral_coords = neutral_layout_coord(node_coords, g_nu)
                 node_coords = (node_coords - neutral_coords).contiguous()
                 node_params = domain.embed(node_coords)
+
+        # Centroid stacks and their whitened/Gram siblings have no consumers
+        # after the optional flat neutral-layout translation.  Release the
+        # complete K×D×L rosters before curved covariance/sigma fitting and the
+        # remaining origin/publication work.
+        stacks.clear()
+        whitened_rows.clear()
+        layer_grams.clear()
 
         if effective_fit_mode == "pca" and retained_rows is not None:
             retained_rows.close()

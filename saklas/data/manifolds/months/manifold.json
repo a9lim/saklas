@@ -1,5 +1,5 @@
 {
-  "format_version": 5,
+  "format_version": 6,
   "name": "months",
   "description": "Authored periodic 1D-loop manifold over the twelve calendar months. Each month is a first-person node whose corpus is seasonal-embodiment responses to the shared baseline prompts — the model answers in character as the month (\"I am January…\"), letting its weather, light, daylight, and the feeling of its season color every reply, pooled in standard-assistant space (kind=custom). The geometry is authored, not discovered: a periodic BoxDomain axis places the months on a closed ring (January…December at coords 0…11, December wrapping back to January), so steering rides the cyclic calendar rather than a flat fan. This encodes known structure — the year is a cycle — that a per-model auto-fit scores as a worse GCV fit than a flat subspace; the corpus also carries a warm↔cold seasonal axis and a period-2 solstice/equinox 'extremeness' axis that lift the ring into a saddle.",
   "fit_mode": "authored",

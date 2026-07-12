@@ -1,5 +1,5 @@
 {
-  "format_version": 5,
+  "format_version": 6,
   "name": "refusing.compliant",
   "description": "Bipolar axis: refusing (+) vs compliant (-). Steer with negative alpha for the opposite pole.",
   "fit_mode": "pca",

@@ -223,7 +223,7 @@ def _load_with_advisories(folder: Path) -> tuple["ManifoldFolder", list[str]]:
     """Load a manifold folder, returning it plus any authoring-quality warnings."""
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        mf = ManifoldFolder.load(folder)
+        mf = ManifoldFolder.load(folder, verify_manifest=False)
     return mf, [str(w.message) for w in caught]
 
 
@@ -628,7 +628,10 @@ def create_baked_manifold_folder(
         model_id_is_safe=model_id_is_safe,
     )
 
-    mf = ManifoldFolder.load(folder)
+    # Publication already proved the newly written pair in ``files``.  The
+    # returned object is metadata-only; do not immediately reread every fitted
+    # payload merely to reconstruct it.
+    mf = ManifoldFolder.load(folder, verify_manifest=False)
     return folder, mf
 
 
@@ -1290,7 +1293,7 @@ def merge_discover_manifolds(
             raise FileNotFoundError(
                 f"merge source {ns}/{name} not found at {folder_path}",
             )
-        mf = ManifoldFolder.load(folder_path)
+        mf = ManifoldFolder.load(folder_path, verify_manifest=False)
         if not mf.is_discover:
             raise ManifoldFormatError(
                 f"merge source {ns}/{name} is authored ({mf.fit_mode!r}); "
@@ -1390,7 +1393,7 @@ def update_manifold_folder(
     them.  Returns ``(folder, advisories)``.
     """
     folder = Path(folder)
-    mf = ManifoldFolder.load(folder)
+    mf = ManifoldFolder.load(folder, verify_manifest=False)
     if description is not None:
         mf.description = description
     if nodes is not None:

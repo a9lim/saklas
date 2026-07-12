@@ -61,8 +61,9 @@ onto the profile-cache sidecars `profile.save_profile` writes
 ## manifolds.py
 
 The on-disk format for every concept + steering manifold —
-`~/.saklas/manifolds/<ns>/<name>/`. `MANIFOLD_FORMAT_VERSION = 5` (decoupled from
-`PACK_FORMAT_VERSION`); rejects any `format_version` below 5. `min_nodes(n) = 2n+1`
+`~/.saklas/manifolds/<ns>/<name>/`. `MANIFOLD_FORMAT_VERSION = 6` (decoupled from
+`PACK_FORMAT_VERSION`); reads v5 (missing `affine_map` means identity), writes v6,
+and rejects older formats. `min_nodes(n) = 2n+1`
 (the curved-fit poisedness floor). Five `fit_mode`s share the class, discriminated
 by `manifold.json::fit_mode`:
 
@@ -144,11 +145,13 @@ raw/sae/from/all; keeps `manifold.json` + corpus), `refresh_manifold` (unscoped:
 model's fit), `transfer_manifold(folder, *, from_model, to_model, alignment,
 whitener, ...)` (folder read/write orchestration only — the subspace math itself
 moved to `core.manifold.transfer_manifold_subspaces`). It loads the source tensor,
-hands the loaded `Manifold` + caller-supplied per-layer Procrustes `alignment` +
-target whitener to the core compute (which maps `mean → M_L mean`,
-`basis → basis @ M_Lᵀ`, leaves RBF + `node_coords` untouched, re-bakes the
+hands the loaded `Manifold` + caller-supplied compact affine `alignment` +
+target whitener to the core compute (which maps points/means through `M_L x+b_L`
+but directions through `M_L`, QR-orthonormalizes the mapped basis, transforms
+the affine/RBF reduced coefficients exactly into the new frame, re-bakes the
 Mahalanobis **share** in target space — target whitener **required**, `WhitenerError`
-otherwise; no Euclidean rebake — and clears `origin`), then writes the
+otherwise; no Euclidean rebake — clears a now-anisotropic scalar sigma field,
+and clears `origin`), then writes the
 `_from-<safe_src>` variant + patches the transfer-provenance sidecar. The core
 function raises a plain `ValueError` when the alignment covers no fitted layer; this
 function surfaces it as `ManifoldFormatError` (the `WhitenerError`, a `ValueError`
@@ -178,8 +181,10 @@ while a fitted reader owns its logical pair lock. This composes with fit-side
 size pruning, which locks victims one at a time after the publisher releases its
 own stem. Ordinary
 discovery/summary routing (`iter_manifold_folders`, `manifold_summary`, HTTP
-lookup) loads metadata with `verify_manifest=False`; install/push/fitted-tensor
-use stays strict. `bundled_manifold_names`, `materialize_bundled_manifolds`
+lookup), authoring edits/merges, and source-tier lifecycle reads load metadata
+with `verify_manifest=False`; install/push/fitted-tensor use stays strict, and
+pair publication hashes only the newly written files. `bundled_manifold_names`,
+`materialize_bundled_manifolds`
 (copy-on-miss into `default/` for complete package-data folders only, plus a
 re-copy when the bundled manifest hash drifts or the on-disk `format_version`
 predates `MANIFOLD_FORMAT_VERSION`). Bundle-drift comparison runs on the
@@ -399,10 +404,12 @@ identities still match their pre-load-verifiable model sources, it materializes
 the source cache too and runs `fit_alignment`/quality/save without loading either
 model. Transfer therefore never re-digests/refactors the target neutral artifact
 after alignment prep.
-`fit_alignment(src, tgt, *, min_shared_layers=10) → {layer: M_L}`
-(orthogonal Procrustes for matched dim, rectangular least-squares otherwise; both
-center first); `alignment_quality` is per-layer R². `transfer_profile(profile,
-alignment_map, *, source_model_id, ..., whitener)` applies `M_L @ v_src` per
+`fit_alignment(src, tgt, *, min_shared_layers=10) → {layer: LayerAlignment}`
+(row-space orthogonal Procrustes for matched dim, rectangular minimum-norm
+least-squares otherwise; both retained as low-rank factors), plus the fitted
+translation `b_L = mean_tgt - M_L mean_src`; `alignment_quality` is per-layer
+R². `transfer_profile(profile, alignment_map, *, source_model_id, ..., whitener)`
+applies only the linear `M_L @ v_src` per
 layer (uncovered layers dropped, `method="procrustes_transfer"`), re-scaling each
 magnitude to its *target* Mahalanobis norm. The target whitener is **required** and
 must cover the transferred layers (`WhitenerError` otherwise; Mahalanobis-only — no

@@ -1578,6 +1578,47 @@ def test_multi_node_sae_fit_releases_raw_centroid_layers_during_reconstruction(
     assert all(ref() is None for _idx, ref in raw_refs)
 
 
+def test_curved_fit_releases_centroid_rosters_before_covariance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The retained-row pass must not overlap the K x D centroid rosters."""
+    import saklas.core.manifold as manifold_module
+
+    folder = _author_manifold(tmp_path)
+    real_fit = manifold_module.fit_layer_subspace
+    real_covariances = manifold_module.compute_store_reduced_covariances
+    stack_refs: list[weakref.ReferenceType[torch.Tensor]] = []
+    whitened_refs: list[weakref.ReferenceType[torch.Tensor]] = []
+    gram_refs: list[weakref.ReferenceType[torch.Tensor]] = []
+    covariance_calls = 0
+
+    def track_fit(
+        centroids: torch.Tensor, *args: Any, **kwargs: Any,
+    ) -> Any:
+        stack_refs.append(weakref.ref(centroids))
+        whitened_refs.append(weakref.ref(kwargs["whitened_rows"]))
+        gram_refs.append(weakref.ref(kwargs["whitened_gram"]))
+        return real_fit(centroids, *args, **kwargs)
+
+    def check_lifetime(*args: Any, **kwargs: Any) -> Any:
+        nonlocal covariance_calls
+        covariance_calls += 1
+        gc.collect()
+        assert len(stack_refs) == _N_LAYERS
+        assert all(ref() is None for ref in stack_refs)
+        assert all(ref() is None for ref in whitened_refs)
+        assert all(ref() is None for ref in gram_refs)
+        return real_covariances(*args, **kwargs)
+
+    monkeypatch.setattr(manifold_module, "fit_layer_subspace", track_fit)
+    monkeypatch.setattr(
+        manifold_module, "compute_store_reduced_covariances", check_lifetime,
+    )
+
+    ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder)
+    assert covariance_calls == 1
+
+
 def test_fit_sae_cache_hit_resolves_identity_without_loading_weights(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
