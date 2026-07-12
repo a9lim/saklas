@@ -1103,25 +1103,43 @@ class TestManifoldRoutes:
         assert client.post("/saklas/v1/manifolds",
                            json=_box1d_payload()).status_code == 409
 
-    def test_create_templated(self, session_and_client: Any, tmp_path: Any,
-                              monkeypatch: Any) -> None:
+    def test_create_manifold_from_template(
+        self, session_and_client: Any, tmp_path: Any, monkeypatch: Any,
+    ) -> None:
         monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
         _session, client = session_and_client
-        payload = {
+        template_payload = {
             "name": "weekday",
-            "fit_mode": "auto",
             "slot": "[DAY]",
             "values": ["Monday", "Tuesday", "Wednesday"],
-            "pairs": [
-                {"user": "what day is it?", "assistant": "today is [DAY]"},
-                {"user": "which day?", "assistant": "it's [DAY]"},
+            "contexts": [
+                {
+                    "turns": [{"role": "user", "content": "what day is it?"}],
+                    "assistant": "today is [DAY]",
+                },
+                {
+                    "turns": [{"role": "user", "content": "which day?"}],
+                    "assistant": "it's [DAY]",
+                },
             ],
         }
-        resp = client.post("/saklas/v1/manifolds/templated", json=payload)
+        assert client.post(
+            "/saklas/v1/templates", json=template_payload,
+        ).status_code == 201
+        payload = {
+            "name": "calendar",
+            "fit_mode": "auto",
+            "template_ref": "local/weekday",
+        }
+        resp = client.post("/saklas/v1/manifolds/from-template", json=payload)
         assert resp.status_code == 201, resp.text
         body = resp.json()
-        assert body["name"] == "weekday"
+        assert body["name"] == "calendar"
         assert body["fit_mode"] == "auto"
+        manifest = json.loads(
+            (tmp_path / "manifolds/local/calendar/manifold.json").read_text()
+        )
+        assert manifest["template_ref"] == "local/weekday"
         assert body["node_labels"] == ["monday", "tuesday", "wednesday"]
         # Unfitted ``auto`` folder: geometry unresolved on the wire (null), so
         # the rack client shows it in *both* family drawers.  Regression: an
@@ -1130,34 +1148,58 @@ class TestManifoldRoutes:
         assert body["resolved_fit_mode"] is None
         weekday_row = next(
             m for m in client.get("/saklas/v1/manifolds").json()["manifolds"]
-            if m["name"] == "weekday"
+            if m["name"] == "calendar"
         )
         assert weekday_row["resolved_fit_mode"] is None
 
-        detail = client.get("/saklas/v1/manifolds/local/weekday").json()
+        detail = client.get("/saklas/v1/manifolds/local/calendar").json()
         monday = next(n for n in detail["nodes"] if n["label"] == "monday")
         assert monday["statements"] == ["today is Monday", "it's Monday"]
 
-        conflict = client.post("/saklas/v1/manifolds/templated", json=payload)
+        conflict = client.post("/saklas/v1/manifolds/from-template", json=payload)
         assert conflict.status_code == 409
         forced = client.post(
-            "/saklas/v1/manifolds/templated",
+            "/saklas/v1/manifolds/from-template",
             json={**payload, "force": True},
         )
         assert forced.status_code == 201, forced.text
 
-    def test_create_templated_slot_in_user_rejected(
+    def test_create_manifold_from_template_missing_template(
         self, session_and_client: Any, tmp_path: Any, monkeypatch: Any,
     ) -> None:
         monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
         _session, client = session_and_client
-        resp = client.post("/saklas/v1/manifolds/templated", json={
+        resp = client.post("/saklas/v1/manifolds/from-template", json={
             "name": "bad",
+            "template_ref": "local/missing",
+        })
+        assert resp.status_code == 404
+
+    def test_create_manifold_from_template_ambiguous_template(
+        self, session_and_client: Any, tmp_path: Any, monkeypatch: Any,
+    ) -> None:
+        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+        _session, client = session_and_client
+        template = {
+            "name": "weekday",
             "slot": "[DAY]",
             "values": ["Monday", "Tuesday"],
-            "pairs": [{"user": "is it [DAY]?", "assistant": "yes [DAY]"}],
+            "contexts": [{
+                "turns": [{"role": "user", "content": "which day?"}],
+                "assistant": "today is [DAY]",
+            }],
+        }
+        assert client.post(
+            "/saklas/v1/templates", json={**template, "namespace": "local"},
+        ).status_code == 201
+        assert client.post(
+            "/saklas/v1/templates", json={**template, "namespace": "other"},
+        ).status_code == 201
+        resp = client.post("/saklas/v1/manifolds/from-template", json={
+            "name": "calendar",
+            "template_ref": "weekday",
         })
-        assert resp.status_code == 400
+        assert resp.status_code == 409
 
     def test_create_too_few_nodes(self, session_and_client: Any, tmp_path: Any,
                                   monkeypatch: Any) -> None:

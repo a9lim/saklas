@@ -48,6 +48,7 @@ from saklas.io.manifolds import (
     update_manifold_folder,
 )
 from saklas.io.paths import manifold_dir
+from saklas.io.templates import AmbiguousTemplateError, TemplateNotFoundError
 from saklas.server.app import acquire_session_lock
 from saklas.server.sse import ProgressCallback, progress_sse_response
 
@@ -121,32 +122,14 @@ class CreateDiscoverManifoldRequest(BaseModel):
     hyperparams: dict[str, Any] = {}
 
 
-class TemplatePairSpec(BaseModel):
-    """One ``{user, assistant}`` chat-turn template. The slot lives in the
-    assistant turn (read off its last content token); the user turn is shared
-    common-mode across nodes (no slot)."""
-
-    user: str
-    assistant: str
-
-
-class CreateTemplatedManifoldRequest(BaseModel):
-    """Author a templated discover manifold from a slot + values + pair set.
-
-    The server writes a standalone template, expands ``slot`` across ``values``
-    into per-value node corpora, and writes a discover folder carrying a
-    ``template_ref`` back to that source template. The right tool for categories
-    one references rather than embodies (days, months, colours, directions).
-    Pair with ``POST .../fit`` (``fit_mode`` auto suits cyclic categories).
-    """
+class CreateManifoldFromTemplateRequest(BaseModel):
+    """Author a discover manifold derived from a standalone template."""
 
     namespace: str = "local"
     name: str
     description: str = ""
     fit_mode: Literal["pca", "spectral", "auto"] = "auto"
-    slot: str
-    values: list[str]
-    pairs: list[TemplatePairSpec]
+    template_ref: str
     hyperparams: dict[str, Any] = {}
     force: bool = False
 
@@ -572,40 +555,26 @@ def register_manifold_routes(app: FastAPI) -> None:
         mf = ManifoldFolder.load(folder)
         return _manifold_json(req.namespace, mf, session, full=True)
 
-    @app.post("/saklas/v1/manifolds/templated", status_code=201)
-    def create_templated_manifold(req: CreateTemplatedManifoldRequest):
-        """Author a templated manifold from a slot + values + pair set.
-
-        Bridge over the standalone-template artifact: writes a
-        ``~/.saklas/templates/<ns>/<name>/`` template (single-turn contexts from
-        the ``pairs``) then a discover manifold that ``template_ref``-erences it.
-        The template is the authoring source of truth; the manifold derives its
-        node corpora from it. Pair with ``POST .../fit`` to run discovery + fit.
-        (Multi-turn contexts + the completion scorer ride the dedicated template
-        routes / ``saklas template`` CLI.)
-        """
-        from saklas.io.templates import TemplateFormatError, create_template_folder
-
-        contexts = [
-            {"turns": [{"role": "user", "content": p.user}], "assistant": p.assistant}
-            for p in req.pairs
-        ]
+    @app.post("/saklas/v1/manifolds/from-template", status_code=201)
+    def create_manifold_from_template_route(
+        req: CreateManifoldFromTemplateRequest,
+    ):
+        """Author a discover manifold from an existing template artifact."""
         try:
-            create_template_folder(
-                req.namespace, req.name,
-                slot=req.slot, values=list(req.values), contexts=contexts,
-                description=req.description, force=req.force,
-            )
             folder = create_manifold_from_template(
                 req.namespace, req.name, req.description,
-                template_ref=f"{req.namespace}/{req.name}",
+                template_ref=req.template_ref,
                 fit_mode=req.fit_mode,
                 hyperparams=req.hyperparams or None,
                 force=req.force,
             )
         except FileExistsError as e:
             raise HTTPException(409, str(e)) from e
-        except (ManifoldFormatError, TemplateFormatError) as e:
+        except TemplateNotFoundError as e:
+            raise HTTPException(404, str(e)) from e
+        except AmbiguousTemplateError as e:
+            raise HTTPException(409, str(e)) from e
+        except ManifoldFormatError as e:
             raise HTTPException(400, str(e)) from e
         mf = ManifoldFolder.load(folder)
         return _manifold_json(req.namespace, mf, session, full=True)

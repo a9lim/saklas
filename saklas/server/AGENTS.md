@@ -224,11 +224,10 @@ per-model sidecar/tensor via `_resolve_intrinsic_dim` + a `load_manifold` read.
   `code: "PoisednessError"`; `ConcurrentExtractionError` → 409. Steering a fitted
   manifold needs no route — a `%` term loads it lazily on scope entry.
 
-The `POST /manifolds/templated` route survives as a **bridge** (back-compat for the
-webui's templated-manifold builder): it writes a standalone template
-(single-turn contexts from the `{user, assistant}` pairs) then a manifold that
-`template_ref`-erences it. Multi-turn contexts + the scorer ride the dedicated
-template routes.
+`POST /manifolds/from-template` derives a discover manifold from an existing
+standalone template selected by `template_ref`. Template authoring stays on
+`POST /templates`; the manifold route only materializes its value/context corpus
+and records the canonical template reference.
 
 ### template_routes.py
 

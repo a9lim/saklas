@@ -506,32 +506,15 @@ export interface CreateDiscoverManifoldRequest {
   hyperparams?: Record<string, number | string>;
 }
 
-/** One ``{user, assistant}`` chat-turn template. The slot token lives in
- *  the assistant turn (read off its last content token); the user turn is
- *  shared common-mode across nodes and carries no slot. */
-export interface TemplatePairSpec {
-  user: string;
-  assistant: string;
-}
-
-/** Body for POST /saklas/v1/manifolds/templated.
- *
- *  Author a *templated* discover manifold: the server fills ``slot`` across
- *  ``values`` (one node per value) over every ``pairs`` template, so the node
- *  corpora are the slot-filled assistant turns and the templates' user turns
- *  become the per-manifold elicitation prompts the fit pools against. The
- *  tool for categories one references rather than embodies — days, months,
- *  colours, directions. Pair with ``POST .../fit`` (``fit_mode`` auto suits
- *  cyclic categories). */
-export interface CreateTemplatedManifoldRequest {
+/** Body for POST /saklas/v1/manifolds/from-template. */
+export interface CreateManifoldFromTemplateRequest {
   namespace?: string;
   name: string;
   description?: string;
   fit_mode: "pca" | "spectral" | "auto";
-  slot: string;
-  values: string[];
-  pairs: TemplatePairSpec[];
+  template_ref: string;
   hyperparams?: Record<string, number | string>;
+  force?: boolean;
 }
 
 // ---- standalone templated-completion artifact (/saklas/v1/templates) ----

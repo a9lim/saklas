@@ -12,7 +12,7 @@ import type {
   CreateDiscoverManifoldRequest,
   CreateManifoldRequest,
   CreateTemplateRequest,
-  CreateTemplatedManifoldRequest,
+  CreateManifoldFromTemplateRequest,
   ExperimentFanRequest,
   ExperimentFanResponse,
   ExtractRequest,
@@ -64,7 +64,7 @@ export type {
   CreateDiscoverManifoldRequest,
   CreateManifoldRequest,
   CreateTemplateRequest,
-  CreateTemplatedManifoldRequest,
+  CreateManifoldFromTemplateRequest,
   FitManifoldRequest,
   GenerateManifoldRequest,
   ExperimentFanRequest,
@@ -108,11 +108,6 @@ export type {
   WSServerMessage,
 } from "./types";
 
-// Aliased name for legacy compat with the v1.6 ``WsMessage`` type — the
-// old Chat panel imports it; keeping the alias means we don't need to
-// touch panels in this phase.
-export type WsMessage = WSServerMessage;
-
 // --------------------------------------------------------- session id --
 
 /** The native API is multi-session-shaped but the current impl is single-session.
@@ -120,10 +115,6 @@ export type WsMessage = WSServerMessage;
  * isn't reachable via the WS path-param (HF model ids contain ``/`` which
  * the WS route doesn't declare as a ``:path`` param). */
 const SESSION = "default";
-
-/** Legacy v1.6 export — old panels build URLs as ``${API}/vectors``.  Kept
- * unchanged so this rewrite doesn't ripple into the panel layer. */
-export const API = `/saklas/v1/sessions/${SESSION}`;
 
 const SESSION_BASE = (id: string = SESSION) => `/saklas/v1/sessions/${id}`;
 const MANIFOLDS_BASE = "/saklas/v1/manifolds";
@@ -395,13 +386,11 @@ export const apiManifolds = {
   ): Promise<ManifoldInfo> {
     return request(`${MANIFOLDS_BASE}/discover`, jsonBody(req));
   },
-  /** Create a templated discover manifold — slot + values + chat-turn
-   *  templates, expanded server-side into per-value node corpora. Pair with
-   *  ``apiManifoldFitStream`` to fit. */
-  createTemplated(
-    req: CreateTemplatedManifoldRequest,
+  /** Derive a discover manifold from a standalone template artifact. */
+  createFromTemplate(
+    req: CreateManifoldFromTemplateRequest,
   ): Promise<ManifoldInfo> {
-    return request(`${MANIFOLDS_BASE}/templated`, jsonBody(req));
+    return request(`${MANIFOLDS_BASE}/from-template`, jsonBody(req));
   },
   update(
     namespace: string,
@@ -1110,17 +1099,4 @@ export function connectWs(id: string = SESSION): WebSocket {
     url += `?token=${encodeURIComponent(_apiKey)}`;
   }
   return new WebSocket(url);
-}
-
-// =================================================== legacy compat ====
-
-/** Legacy v1.6 export — kept so existing panels keep working through the
- * Phase 2/3 transition.  Newer code should use ``apiSessions.get()``. */
-export interface LegacySessionInfo {
-  id: string;
-  model_id: string;
-  device: string;
-  dtype: string;
-  vectors: string[];
-  probes: string[];
 }

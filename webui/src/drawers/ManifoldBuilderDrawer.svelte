@@ -13,6 +13,7 @@
 
   import {
     apiManifolds,
+    apiTemplates,
     apiManifoldFitStream,
     apiManifoldGenerateStream,
     ApiError,
@@ -31,7 +32,8 @@
     AxisSpec,
     CreateDiscoverManifoldRequest,
     CreateManifoldRequest,
-    CreateTemplatedManifoldRequest,
+    CreateManifoldFromTemplateRequest,
+    CreateTemplateRequest,
     GenerateManifoldRequest,
     ManifoldDomain,
   } from "../lib/types";
@@ -695,17 +697,23 @@
     if (templatedMaxDim !== null && templatedMaxDim >= 1) {
       hyperparams.max_dim = templatedMaxDim;
     }
-    const req: CreateTemplatedManifoldRequest = {
+    const templateReq: CreateTemplateRequest = {
+      namespace: namespaceSlug,
+      name: nameSlug,
+      description: description.trim(),
+      slot: templatedSlot.trim(),
+      values: templatedValues,
+      contexts: nonEmptyTemplatedPairs().map((p) => ({
+        turns: [{ role: "user", content: p.user }],
+        assistant: p.assistant,
+      })),
+    };
+    const manifoldReq: CreateManifoldFromTemplateRequest = {
       namespace: namespaceSlug,
       name: nameSlug,
       description: description.trim(),
       fit_mode: templatedFitMode,
-      slot: templatedSlot.trim(),
-      values: templatedValues,
-      pairs: nonEmptyTemplatedPairs().map((p) => ({
-        user: p.user,
-        assistant: p.assistant,
-      })),
+      template_ref: `${namespaceSlug}/${nameSlug}`,
       hyperparams,
     };
     const toastId = pushToast(
@@ -713,7 +721,8 @@
       { kind: "info", ttlMs: null },
     );
     try {
-      await apiManifolds.createTemplated(req);
+      await apiTemplates.create(templateReq);
+      await apiManifolds.createFromTemplate(manifoldReq);
       dismissToast(toastId);
       if (alsoFit) {
         const fitToastId = pushToast(
