@@ -295,9 +295,10 @@ ragged prompts share one graph, then batched VJPs recover `dim_batch` output row
 per backward without replicating the forward; unsupported batched VJPs fall back
 to exact replicated row batches; the **only**
 backward passes in saklas — everything else runs under `inference_mode`, so the
-fit seeds a grad leaf at the lowest source block's output via a returning hook and
-reads per-layer grads from `torch.autograd.grad(final, sources)`, never
-`retain_grad`). The final-block hook stops the forward before final norm + LM
+fit attaches transparent mean-position probe leaves at the requested source
+outputs (detaching the lowest one to cut the graph) and reads their already
+position-reduced `[dim_batch,B,D]` grads from
+`torch.autograd.grad(final, probes)`, never `retain_grad`). The final-block hook stops the forward before final norm + LM
 head. Row blocks transfer through bounded stripes directly into the CPU
 accumulator; an OOM resumes at the first uncommitted row. On MPS the pass loop drains the command
 queue every few passes (`_MPS_SYNC_EVERY_PASSES`): Metal reports queue
@@ -309,6 +310,8 @@ backward graph work below it. Fits resume by default (corpus-hash +
 source-layer + token-id corpus + loaded-model fingerprint match + checkpoint
 every 25 prompts); the default FineWeb-Edu stream pins its Hub dataset commit,
 ordinary corpus extension resumes from a matching token-id prefix; `-f` restarts.
+Checkpoint cadence does not fracture prompt microbatches, and a complete terminal
+checkpoint is promoted durably rather than rewriting the full lens.
 
 Three read surfaces, one write surface:
 

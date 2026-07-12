@@ -835,26 +835,22 @@ def compute_dls_axes(
         if C.ndim == 1:
             C = C.reshape(1, -1)
         C = C.reshape(int(C.shape[0]), -1)              # (K, D)
-        layer_checkable: set[int] = set()
-        layer_keep: set[int] = set()
-        for r in range(int(B32.shape[0])):
-            row = B32[r]
-            row_norm = float(row.norm())
-            if row_norm < 1e-12:
-                continue  # degenerate axis — drop, exclude from fallback
-            layer_checkable.add(r)
-            if mu_n_cpu is None:
-                # Baseline doesn't cover this layer.  Conservative: keep —
-                # over-include rather than drop a real discriminative axis
-                # for missing baseline data.
-                layer_keep.add(r)
-                continue
-            projs = (C - mu_n_cpu) @ (row / row_norm)   # (K,) node projections
-            # Straddle zero: both a negative and a positive projection ⇒ the
-            # axis separates nodes across the baseline.  At K=2 this is the
-            # bipolar ``proj_pos · proj_neg < 0`` opposite-sign test exactly.
-            if float(projs.min()) < 0.0 and float(projs.max()) > 0.0:
-                layer_keep.add(r)
+        norms = torch.linalg.vector_norm(B32, dim=1)
+        valid = norms >= 1e-12
+        layer_checkable = set(valid.nonzero(as_tuple=False).reshape(-1).tolist())
+        layer_keep: set[int]
+        if mu_n_cpu is None:
+            # Baseline doesn't cover this layer. Conservative: keep every
+            # non-degenerate axis rather than drop genuine signal.
+            layer_keep = set(layer_checkable)
+        elif layer_checkable:
+            normalized = B32[valid] / norms[valid].unsqueeze(1)
+            projs = (C - mu_n_cpu) @ normalized.transpose(0, 1)  # (K, R_valid)
+            straddles = (projs.amin(dim=0) < 0.0) & (projs.amax(dim=0) > 0.0)
+            valid_axes = valid.nonzero(as_tuple=False).reshape(-1)
+            layer_keep = set(valid_axes[straddles].tolist())
+        else:
+            layer_keep = set()
         if layer_checkable:
             checkable[L] = layer_checkable
         if layer_keep:

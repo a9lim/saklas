@@ -446,10 +446,28 @@ def test_fit_checkpoint_callback_fires() -> None:
     seen: list[int] = []
 
     fit_jacobian_lens(
-        model, tokenizer, [prompt] * 3, _layers(model),
-        dim_batch=3, checkpoint_every=2, checkpoint_cb=lambda l: seen.append(l.n_prompts),
+        model, tokenizer, [prompt] * 4, _layers(model),
+        dim_batch=3, prompt_batch=3, checkpoint_every=2,
+        checkpoint_cb=lambda l: seen.append(l.n_prompts),
     )
-    assert seen == [2]
+    # Cadence no longer fractures a healthy width-3 graph merely to stop at 2.
+    assert seen == [3, 4]
+
+
+def test_fit_skips_terminal_periodic_checkpoint() -> None:
+    model = _frozen_model(n_layers=2)
+    tokenizer = _CharTokenizer()
+    prompt = "a prompt that is long enough."
+    seen: list[int] = []
+
+    fit_jacobian_lens(
+        model, tokenizer, [prompt] * 2, _layers(model),
+        dim_batch=3, prompt_batch=2, checkpoint_every=2,
+        suppress_terminal_checkpoint=True,
+        checkpoint_cb=lambda lens: seen.append(lens.n_prompts),
+    )
+
+    assert seen == []
 
 
 def test_fit_cancellation_persists_completed_prefix_and_removes_hooks() -> None:

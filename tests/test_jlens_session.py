@@ -17,7 +17,7 @@ from typing import Any, cast
 import pytest
 import torch
 
-from saklas.core.jlens import LensNotFittedError, MultiTokenWordError
+from saklas.core.jlens import JacobianLens, LensNotFittedError, MultiTokenWordError
 from saklas.core.model import loaded_model_fingerprint, model_source_fingerprint
 from saklas.core.loom import (
     InvalidNodeOperationError,
@@ -135,6 +135,32 @@ def test_fit_jlens_persists_and_property_loads() -> None:
     assert fresh.jlens.n_prompts == len(_PROMPTS)
 
 
+def test_terminal_checkpoint_is_promoted_without_second_tensor_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import saklas.io.lens as lens_io
+
+    real_save = lens_io._save_fp16_square_safetensors_atomic
+    writes = 0
+
+    def _counting_save(*args: Any, **kwargs: Any) -> Any:
+        nonlocal writes
+        writes += 1
+        return real_save(*args, **kwargs)
+
+    monkeypatch.setattr(
+        lens_io, "_save_fp16_square_safetensors_atomic", _counting_save,
+    )
+    fitted = _StubSession().fit_jlens(
+        _PROMPTS[:2], force=True, checkpoint_every=2,
+    )
+
+    assert fitted.n_prompts == 2
+    assert writes == 1
+    assert load_lens(_MODEL_ID) is not None
+    assert load_lens_checkpoint(_MODEL_ID) is None
+
+
 def test_refit_rebuilds_live_lens_probes_and_evicts_directions() -> None:
     s = _StubSession()
     s.fit_jlens(_PROMPTS, source_layers=[0])
@@ -165,17 +191,77 @@ def test_jlens_property_rejects_legacy_sidecar_without_weight_identity() -> None
     assert _StubSession().jlens is None
 
 
-def test_fit_jlens_already_done_short_circuits() -> None:
+def test_fit_jlens_already_done_short_circuits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     s = _StubSession()
     first = s.fit_jlens(_PROMPTS)
     messages: list[str] = []
+    import saklas.io.lens as lens_io
+
+    monkeypatch.setattr(
+        lens_io, "load_lens",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("same-session no-op should reuse the resident lens")
+        ),
+    )
     again = s.fit_jlens(_PROMPTS, on_progress=messages.append)
     assert any("nothing to do" in m for m in messages)
-    # `again` reloads from the fp16 on-disk artifact — half-precision tolerance
     for layer in first.source_layers:
+        assert torch.equal(first.jacobians[layer], again.jacobians[layer])
+
+
+def test_resident_lens_is_not_reused_after_external_artifact_replacement() -> None:
+    corpus_b = [f"replacement corpus prompt {i} with enough content" for i in range(4)]
+    session_a = _StubSession()
+    resident_a = session_a.fit_jlens(_PROMPTS, force=True)
+    disk_b = _StubSession().fit_jlens(corpus_b, force=True)
+    assert any(
+        not torch.equal(resident_a.jacobians[layer], disk_b.jacobians[layer])
+        for layer in resident_a.source_layers
+    )
+
+    refreshed = session_a.fit_jlens(corpus_b)
+
+    for layer in disk_b.source_layers:
         assert torch.allclose(
-            first.jacobians[layer], again.jacobians[layer], atol=2e-3,
+            refreshed.jacobians[layer], disk_b.jacobians[layer], atol=2e-3,
         )
+
+
+def test_fresh_fit_does_not_promote_stale_incompatible_checkpoint() -> None:
+    prompts = _PROMPTS[:2]
+    tokenizer = CharTokenizer()
+    consumed = [
+        [int(tok) for tok in tokenizer(
+            prompt, return_tensors="pt",
+        )["input_ids"][0].tolist()]
+        for prompt in prompts
+    ]
+    corpus_sha = hashlib.sha256(repr(consumed).encode("utf-8")).hexdigest()
+    stale = JacobianLens(
+        {layer: torch.full((6, 6), 99.0) for layer in (0, 1)},
+        n_prompts=2, d_model=6,
+    )
+    save_lens_checkpoint(
+        stale, _MODEL_ID,
+        base_n_prompts=0,
+        corpus_spec="stale",
+        corpus_sha256=corpus_sha,
+        corpus_hash_kind="token_ids_v1",
+        seq_len=128,
+        dim_batch=8,
+        skip_first=16,
+        model_fingerprint="WRONG",
+    )
+
+    fitted = _StubSession().fit_jlens(prompts, checkpoint_every=25)
+    durable = load_lens(_MODEL_ID)
+
+    assert durable is not None
+    assert durable[1]["model_fingerprint"] != "WRONG"
+    for layer in fitted.source_layers:
+        assert not torch.equal(durable[0].jacobians[layer], stale.jacobians[layer])
 
 
 def test_fit_jlens_noop_revalidates_token_ids_before_loading_tensor() -> None:

@@ -876,10 +876,61 @@ def _looks_like_batched_vjp_unsupported(exc: RuntimeError) -> bool:
     )
 
 
+class _MeanSourceProbe(torch.autograd.Function):
+    """Transparent residual identity with a mean-position probe derivative.
+
+    The Jacobian estimator needs only the mean source-position derivative, not
+    the full ``[T,D]`` gradient at every fitted layer.  A zero-valued ``[B,D]``
+    shared perturbation over the valid source positions has exactly that
+    derivative.  This custom identity leaves the forward byte-for-byte
+    unchanged while collapsing each source gradient inside autograd, before it
+    can become a retained ``[rows,B,T,D]`` result.
+    """
+
+    generate_vmap_rule = True
+
+    @staticmethod
+    def forward(
+        residual: torch.Tensor,
+        probe: torch.Tensor,
+        counts: torch.Tensor,
+        source_start: int,
+    ) -> torch.Tensor:
+        del probe, counts, source_start
+        return residual
+
+    @staticmethod
+    def setup_context(ctx: Any, inputs: tuple[Any, ...], output: Any) -> None:
+        del output
+        _residual, _probe, counts, source_start = inputs
+        ctx.save_for_backward(counts)
+        ctx.source_start = int(source_start)
+
+    @staticmethod
+    def backward(
+        ctx: Any, *grad_outputs: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, None, None]:
+        if len(grad_outputs) != 1:
+            raise JacobianLensError("mean-source probe expected one gradient output")
+        grad_output = grad_outputs[0]
+        (counts,) = ctx.saved_tensors
+        # Target cotangents exist only at valid content positions. In a causal
+        # LM, excluded final/padded source positions cannot influence an earlier
+        # selected target, so their gradients are exactly zero; slicing the
+        # deliberately excluded prefix is therefore the exact valid-source sum.
+        pooled = grad_output[..., ctx.source_start :, :].sum(
+            dim=-2, dtype=torch.float32,
+        )
+        shape = [1] * (pooled.ndim - 2) + [int(counts.numel()), 1]
+        probe_grad = pooled / counts.reshape(shape)
+        return grad_output, probe_grad, None, None
+
+
 def _install_fit_hooks(
     layer_modules: Sequence[nn.Module],
     sources: Sequence[int],
     final_idx: int,
+    hook_state: dict[str, Any],
 ) -> tuple[dict[int, torch.Tensor], list[Any]]:
     captured: dict[int, torch.Tensor] = {}
     handles: list[Any] = []
@@ -889,12 +940,25 @@ def _install_fit_hooks(
     def make_capture(idx: int) -> Callable[..., Any]:
         def hook(_module: nn.Module, _args: tuple[Any, ...], output: Any) -> Any:
             residual = _output_tensor(output)
-            if idx == first_source:
+            if idx in sources:
                 # Seed at the source block's OUTPUT. Autograd gradients target
                 # this residual, so retaining the block's QKV/MLP internals
                 # cannot affect J but costs a full block of graph memory.
-                residual = residual.detach().clone().requires_grad_(True)
-                captured[idx] = residual
+                if idx == first_source:
+                    residual = residual.detach().clone()
+                counts = hook_state.get("source_counts")
+                source_start = hook_state.get("source_start")
+                if not isinstance(counts, torch.Tensor) or source_start is None:
+                    raise JacobianLensError("J-lens source probe state was not prepared")
+                probe = torch.zeros(
+                    residual.shape[0], residual.shape[-1],
+                    device=residual.device, dtype=torch.float32,
+                    requires_grad=True,
+                )
+                residual = _MeanSourceProbe.apply(
+                    residual, probe, counts, int(source_start),
+                )
+                captured[idx] = probe
                 if isinstance(output, tuple):
                     return (residual, *output[1:])
                 return residual
@@ -934,6 +998,7 @@ def fit_jacobian_lens(
     input_id_rows: Sequence[Sequence[int]] | None = None,
     vjp_mode: str = "auto",
     cancel_event: Any | None = None,
+    suppress_terminal_checkpoint: bool = False,
 ) -> JacobianLens:
     """Fit ``J_l`` for every source layer over ``prompts``.
 
@@ -1039,6 +1104,7 @@ def fit_jacobian_lens(
     active_prompt_batch = target_prompt_batch
     prompt_bad_ceiling: int | None = None
     cursor = 0
+    next_checkpoint = checkpoint_every
 
     def _partial() -> JacobianLens:
         acc = state["acc"]
@@ -1049,7 +1115,11 @@ def fit_jacobian_lens(
             d_model=state["d_model"],
         )
 
-    captured, handles = _install_fit_hooks(layer_modules, sources, final_idx)
+    hook_state: dict[str, Any] = {}
+    captured, handles = _install_fit_hooks(
+        layer_modules, sources, final_idx, hook_state,
+    )
+    state["hook_state"] = hook_state
     try:
         with torch.enable_grad():
             while cursor < len(prepared_rows):
@@ -1064,12 +1134,8 @@ def fit_jacobian_lens(
                     raise JacobianLensCancelled(
                         f"Jacobian-lens fit cancelled after {n_done} prompts"
                     )
-                # Never cross a checkpoint boundary: every persisted count is a
-                # prefix address into the corpus, even with prompt microbatches.
-                until_checkpoint = checkpoint_every - (n_done % checkpoint_every)
                 width = min(
-                    active_prompt_batch, until_checkpoint,
-                    len(prepared_rows) - cursor,
+                    active_prompt_batch, len(prepared_rows) - cursor,
                 )
                 chunk = prepared_rows[cursor : cursor + width]
                 lengths_cpu = torch.tensor(
@@ -1124,6 +1190,7 @@ def fit_jacobian_lens(
                                 accumulator.zero_()
                             n_done = 0
                             cursor = 0
+                            next_checkpoint = checkpoint_every
                             committed_row = 0
                             restart_with_smaller_prompts = True
                             log.warning(
@@ -1151,6 +1218,7 @@ def fit_jacobian_lens(
                                 accumulator.zero_()
                             n_done = 0
                             cursor = 0
+                            next_checkpoint = checkpoint_every
                             committed_row = 0
                             prompt_bad_ceiling = (
                                 width if prompt_bad_ceiling is None
@@ -1188,6 +1256,7 @@ def fit_jacobian_lens(
                                     accumulator.zero_()
                                 n_done = 0
                                 cursor = 0
+                                next_checkpoint = checkpoint_every
                                 committed_row = 0
                             prompt_bad_ceiling = (
                                 width if prompt_bad_ceiling is None
@@ -1228,7 +1297,17 @@ def fit_jacobian_lens(
                 # reduced value likewise stays put after an OOM.
                 if prompt_bad_ceiling is None:
                     active_prompt_batch = target_prompt_batch
-                if n_done % checkpoint_every == 0:
+                # Persist after the first complete microbatch that crosses the
+                # cadence.  Do not fracture an otherwise healthy prompt batch
+                # merely to land on an exact count, and do not write a complete
+                # terminal checkpoint immediately before the durable artifact.
+                if (
+                    n_done >= next_checkpoint
+                    and (
+                        cursor < len(prepared_rows)
+                        or not suppress_terminal_checkpoint
+                    )
+                ):
                     if checkpoint_accumulator_cb is not None:
                         checkpoint_accumulator_cb(
                             state["acc"], n_done, state["d_model"],
@@ -1240,6 +1319,9 @@ def fit_jacobian_lens(
                     # prompt re-allocates.
                     if device.type == "mps":
                         _empty_device_cache(device)
+                    next_checkpoint = (
+                        (n_done // checkpoint_every) + 1
+                    ) * checkpoint_every
     finally:
         for handle in handles:
             handle.remove()
@@ -1295,6 +1377,7 @@ def _accumulate_prompt_jacobian(
         (positions >= skip_first)
         & (positions < (lengths.to(device=device).unsqueeze(1) - 1))
     )
+    source_counts = valid_mask.sum(dim=1).clamp_min(1).to(torch.float32)
     captured.clear()
     try:
         vjp_mode = str(state["vjp_mode"])
@@ -1314,6 +1397,13 @@ def _accumulate_prompt_jacobian(
             if vjp_mode in {"batched", "scalar"} or attention_mask is None
             else attention_mask.expand(forward_batch, -1)
         )
+        hook_state: dict[str, Any] = state["hook_state"]
+        hook_state["source_counts"] = (
+            source_counts
+            if vjp_mode in {"batched", "scalar"}
+            else source_counts.expand(forward_batch)
+        )
+        hook_state["source_start"] = int(skip_first)
         try:
             try:
                 model(
@@ -1457,7 +1547,6 @@ def _accumulate_prompt_jacobian(
             for l, g in zip(sources, grads):
                 block = _source_grad_block(
                     g, mode=vjp_mode, n_dims=n_dims,
-                    valid_mask=valid_mask,
                 )
                 if device.type != "cpu":
                     assert stripe_rows is not None
@@ -1526,22 +1615,14 @@ def _source_grad_block(
     *,
     mode: str,
     n_dims: int,
-    valid_mask: torch.Tensor,
 ) -> torch.Tensor:
     if mode == "batched":
-        # [n_dims, B, T, D] from batched VJP. Preserve the estimator's
-        # equal-prompt weighting: mean source positions *within* each prompt,
-        # then sum prompt Jacobians into the raw corpus accumulator.
-        mask = valid_mask.to(dtype=torch.float32).unsqueeze(0).unsqueeze(-1)
-        counts = valid_mask.sum(dim=1).clamp_min(1).to(torch.float32)
-        per_prompt = (
-            (grad[:n_dims].to(torch.float32) * mask).sum(dim=2)
-            / counts.reshape(1, -1, 1)
-        )
-        return per_prompt.sum(dim=1)
-    # [replicated_batch, T, D] from the reference replicated-prompt path.
-    valid = valid_mask[0].nonzero(as_tuple=False).reshape(-1)
-    return grad[:n_dims, valid].mean(dim=1, dtype=torch.float32)
+        # [n_dims, B, D] — source-position means were collapsed by the
+        # transparent probe identity inside autograd. Preserve equal-prompt
+        # weighting by summing those per-prompt Jacobians.
+        return grad[:n_dims].to(torch.float32).sum(dim=1)
+    # [replicated_batch,D] (or [1,D] scalar) is already mean-position reduced.
+    return grad[:n_dims].to(torch.float32)
 
 
 def _empty_device_cache(device: torch.device) -> None:

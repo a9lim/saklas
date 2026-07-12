@@ -116,6 +116,49 @@ def _manifold_tensor_files(
     return sorted(out)
 
 
+def _capture_group_is_referenced(safe_model: str, capture_sha: str) -> bool:
+    """Whether any surviving fitted sidecar still owns a shared capture stem."""
+    from saklas.io.paths import manifolds_dir, parse_tensor_filename
+
+    for sidecar_path in manifolds_dir().glob("*/*/*.json"):
+        if sidecar_path.name == "manifold.json":
+            continue
+        parsed = parse_tensor_filename(
+            sidecar_path.with_suffix(".safetensors").name,
+        )
+        if parsed is None or parsed[0] != safe_model:
+            continue
+        try:
+            with open(sidecar_path) as handle:
+                sidecar = json.load(handle)
+        except (OSError, json.JSONDecodeError, TypeError):
+            continue
+        if sidecar.get("capture_sha256") == capture_sha:
+            return True
+    return False
+
+
+def _remove_unreferenced_capture_groups(
+    capture_groups: set[tuple[str, str]],
+) -> None:
+    """Garbage-collect content-addressed captures only after the last owner."""
+    if not capture_groups:
+        return
+    from saklas.io.atomic import artifact_lock
+    from saklas.io.paths import models_dir
+
+    for safe_model, capture_sha in capture_groups:
+        cache_dir = models_dir() / safe_model / "manifold_capture"
+        # The capture lock spans cache publication through fitted-sidecar
+        # publication.  Scan and delete under the same lock so lifecycle GC
+        # cannot race a different folder that is about to establish ownership.
+        with artifact_lock(cache_dir / capture_sha):
+            if _capture_group_is_referenced(safe_model, capture_sha):
+                continue
+            for cached in cache_dir.glob(f"{capture_sha}.*"):
+                cached.unlink()
+
+
 def clear_manifold_tensors(
     namespace: str, name: str, model_scope: Optional[str] = None, *, variant: str = "all",
 ) -> int:
@@ -188,13 +231,7 @@ def _clear_manifold_tensors_locked(
             pass
     for f in files:
         f.unlink(missing_ok=True)
-    if capture_groups:
-        from saklas.io.paths import models_dir
-
-        for safe_model, capture_sha in capture_groups:
-            cache_dir = models_dir() / safe_model / "manifold_capture"
-            for cached in cache_dir.glob(f"{capture_sha}.*"):
-                cached.unlink()
+    _remove_unreferenced_capture_groups(capture_groups)
     # Repair only the selected manifest entries. Re-hashing every survivor
     # here would bless an unrelated corrupt model/variant while clearing this
     # one. Preserve untouched expected digests byte-for-byte.
@@ -280,13 +317,7 @@ def _remove_manifold_folder_locked(namespace: str, name: str) -> dict[str, Any]:
         except (OSError, json.JSONDecodeError, TypeError):
             pass
     shutil.rmtree(folder)
-    if capture_groups:
-        from saklas.io.paths import models_dir
-
-        for safe_model, capture_sha in capture_groups:
-            cache_dir = models_dir() / safe_model / "manifold_capture"
-            for cached in cache_dir.glob(f"{capture_sha}.*"):
-                cached.unlink()
+    _remove_unreferenced_capture_groups(capture_groups)
     return {
         "namespace": namespace,
         "name": name,

@@ -917,7 +917,7 @@ def _build_lens_fit(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument(
         "--prompt-batch", type=_positive_int, default=None, metavar="B",
-        help="Corpus prompts per autograd graph (default: 4 on CPU/CUDA, 1 on "
+        help="Corpus prompts per autograd graph (default: 4 on CPU/CUDA, 2 on "
              "MPS). Preserves equal-prompt estimator weighting; backs off "
              "independently on OOM.",
     )

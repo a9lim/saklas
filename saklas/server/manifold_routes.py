@@ -938,7 +938,10 @@ def register_manifold_routes(app: FastAPI) -> None:
         def _apply_fit_overrides() -> None:
             if req.fit_mode is None and req.hyperparams is None:
                 return
-            pre_mf = ManifoldFolder.load(folder)
+            # This path only reads authoring mode/hyperparameters before the
+            # subsequent fit validates its target pair. Avoid hashing every
+            # historical fitted variant merely to apply an override.
+            pre_mf = ManifoldFolder.load(folder, verify_manifest=False)
             if not pre_mf.is_discover and (
                 req.fit_mode is not None or req.hyperparams is not None
             ):

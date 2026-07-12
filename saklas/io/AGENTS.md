@@ -376,11 +376,15 @@ checkpoints live beside the full artifact as `jlens.partial.{safetensors,json}`:
 the estimator writes a self-contained averaged checkpoint directly from raw sums,
 merging a prior prefix one layer at a time during fp16 conversion. This avoids a
 second full fp32 lens at checkpoint cadence and makes repeated interruptions
-independent of an older full artifact (`base_n_prompts=0`). Finalization writes
-the full artifact durably and removes the checkpoint. `lens_paths` /
+independent of an older full artifact (`base_n_prompts=0`). Finalization promotes
+an already-complete terminal checkpoint without rewriting its matrices, or writes
+the full artifact durably and removes an incomplete checkpoint. Metadata-only
+final/checkpoint preflight rejects incompatible corpora/layers before matrix IO.
+`lens_paths` /
 `lens_checkpoint_paths` / `save_lens` / `save_lens_checkpoint_accumulator` /
 `save_lens_checkpoint` (compatibility) / `load_lens` /
-`load_lens_checkpoint` / `remove_lens`; the fit itself lives in `core/jlens.py`.
+`load_lens_checkpoint_sidecar` / `load_lens_checkpoint` /
+`promote_lens_checkpoint` / `remove_lens`; the fit itself lives in `core/jlens.py`.
 
 ## atomic.py / staging.py
 

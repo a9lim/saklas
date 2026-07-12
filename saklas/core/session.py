@@ -739,6 +739,23 @@ class _SteeringContext:
 _PROFILE_ABSENT = object()
 
 
+def _jlens_sidecar_identity(sidecar: "Mapping[str, Any] | None") -> tuple[Any, ...] | None:
+    """Stable identity binding a resident fp32 lens to its disk artifact."""
+    if sidecar is None:
+        return None
+    return (
+        sidecar.get("tensor_sha256"),
+        sidecar.get("corpus_sha256"),
+        sidecar.get("corpus_hash_kind"),
+        sidecar.get("model_fingerprint"),
+        int(sidecar.get("n_prompts", 0)),
+        int(sidecar.get("d_model", 0)),
+        tuple(int(layer) for layer in sidecar.get("source_layers", [])),
+        int(sidecar.get("seq_len", 0)),
+        sidecar.get("estimator_policy"),
+    )
+
+
 class SaklasSession:
     """Unified backend for activation steering, monitoring, and generation.
 
@@ -1251,6 +1268,7 @@ class SaklasSession:
         self._layer_means: dict[int, torch.Tensor] = {}
         self._whitener: Any = None
         self._jlens: Any = None  # lazy per-model Jacobian lens (io/lens.py)
+        self._jlens_identity: tuple[Any, ...] | None = None
         self._jlens_device_cache: dict[tuple[int, str, tuple[int, ...]], torch.Tensor] = {}
         self._jlens_readout_module_cache: (
             tuple[torch.Tensor, torch.nn.Module] | None
@@ -1848,6 +1866,7 @@ class SaklasSession:
                     loaded = load_lens(self.model_id)
                     if loaded is not None:
                         self._jlens = loaded[0]
+                        self._jlens_identity = _jlens_sidecar_identity(loaded[1])
                         self._jlens_device_cache = {}
         return self._jlens
 
@@ -1873,7 +1892,9 @@ class SaklasSession:
             )
         return lens
 
-    def _adopt_fitted_jlens(self, lens: "Any") -> "Any":
+    def _adopt_fitted_jlens(
+        self, lens: "Any", *, sidecar: "Mapping[str, Any] | None" = None,
+    ) -> "Any":
         """Replace a fitted lens and rebuild every derived live consumer."""
         previous_live = self._live_lens
         previous_layers = (
@@ -1884,6 +1905,7 @@ class SaklasSession:
         )
 
         self._jlens = lens
+        self._jlens_identity = _jlens_sidecar_identity(sidecar)
         self._jlens_device_cache = {}
         for key in list(self._profiles):
             if key.startswith("jlens/"):
@@ -1953,6 +1975,8 @@ class SaklasSession:
         from saklas.io.lens import load_lens, load_lens_sidecar, save_lens
         from saklas.io.lens import (
             load_lens_checkpoint,
+            load_lens_checkpoint_sidecar,
+            promote_lens_checkpoint,
             remove_lens_checkpoint,
             save_lens_checkpoint_accumulator,
         )
@@ -2037,20 +2061,33 @@ class SaklasSession:
                     and sidecar.get("seq_len") == seq_len
                     and sidecar.get("model_fingerprint") == model_fingerprint
                 ):
-                    existing = load_lens(self.model_id)
-                else:
-                    existing = None
-                if existing is not None:
-                    lens, sidecar = existing
-                    saved_n = int(lens.n_prompts)
+                    saved_n = int(sidecar.get("n_prompts", 0))
                     saved_sha = sidecar.get("corpus_sha256")
                     corpus_matches = saved_sha == corpus_sha
                     prefix_matches = (
                         0 < saved_n <= len(consumed_ids)
                         and saved_sha == _token_rows_sha(consumed_ids[:saved_n])
                     )
-                    if not (corpus_matches or prefix_matches):
+                    if corpus_matches or prefix_matches:
+                        resident = self._jlens
+                        resident_layers = (
+                            set(resident.source_layers)
+                            if resident is not None else set()
+                        )
+                        if (
+                            resident is not None
+                            and resident.n_prompts == saved_n
+                            and resident_layers >= expected_set
+                            and getattr(self, "_jlens_identity", None)
+                            == _jlens_sidecar_identity(sidecar)
+                        ):
+                            existing = (resident, sidecar)
+                        else:
+                            existing = load_lens(self.model_id)
+                    else:
                         existing = None
+                else:
+                    existing = None
                 if existing is not None:
                     lens, sidecar = existing
                     existing_set = set(lens.source_layers)
@@ -2062,7 +2099,9 @@ class SaklasSession:
                                     "prompts — nothing to do"
                                 )
                             selected = lens.select_layers(expected_sources)
-                            return SaklasSession._adopt_fitted_jlens(self, selected)
+                            return SaklasSession._adopt_fitted_jlens(
+                                self, selected, sidecar=sidecar,
+                            )
                         missing_sources = sorted(expected_set - existing_set)
                         if on_progress is not None:
                             on_progress(
@@ -2070,19 +2109,26 @@ class SaklasSession:
                                 f"J-lens layers {missing_sources}"
                             )
                         missing_base = None
-                        topup_ckpt = load_lens_checkpoint(self.model_id)
+                        topup_sidecar = load_lens_checkpoint_sidecar(self.model_id)
+                        topup_meta_matches = bool(
+                            topup_sidecar is not None
+                            and topup_sidecar.get("corpus_sha256") == corpus_sha
+                            and topup_sidecar.get("corpus_hash_kind")
+                            == corpus_hash_kind
+                            and topup_sidecar.get("seq_len") == seq_len
+                            and topup_sidecar.get("model_fingerprint")
+                            == model_fingerprint
+                            and int(topup_sidecar.get("base_n_prompts", -1)) == 0
+                            and [int(l) for l in topup_sidecar.get("source_layers", [])]
+                            == missing_sources
+                        )
+                        topup_ckpt = (
+                            load_lens_checkpoint(self.model_id)
+                            if topup_meta_matches else None
+                        )
                         if topup_ckpt is not None:
                             partial, topup_sidecar = topup_ckpt
-                            if (
-                                topup_sidecar.get("corpus_sha256") == corpus_sha
-                                and topup_sidecar.get("corpus_hash_kind")
-                                == corpus_hash_kind
-                                and topup_sidecar.get("seq_len") == seq_len
-                                and topup_sidecar.get("model_fingerprint")
-                                == model_fingerprint
-                                and int(topup_sidecar.get("base_n_prompts", -1)) == 0
-                                and partial.source_layers == missing_sources
-                            ):
+                            if partial.source_layers == missing_sources:
                                 missing_base = partial
                                 if on_progress is not None:
                                     on_progress(
@@ -2159,24 +2205,35 @@ class SaklasSession:
                         )
                         remove_lens_checkpoint(self.model_id)
                         selected = merged.select_layers(expected_sources)
-                        return SaklasSession._adopt_fitted_jlens(self, selected)
+                        return SaklasSession._adopt_fitted_jlens(
+                            self, selected,
+                            sidecar=load_lens_sidecar(self.model_id),
+                        )
                     if existing_set >= expected_set:
                         base = lens.select_layers(expected_sources)
                     else:
                         base = None
-                ckpt = load_lens_checkpoint(self.model_id)
+                checkpoint_sidecar = load_lens_checkpoint_sidecar(self.model_id)
+                checkpoint_meta_matches = bool(
+                    checkpoint_sidecar is not None
+                    and checkpoint_sidecar.get("corpus_sha256") == corpus_sha
+                    and checkpoint_sidecar.get("corpus_hash_kind")
+                    == corpus_hash_kind
+                    and checkpoint_sidecar.get("seq_len") == seq_len
+                    and checkpoint_sidecar.get("model_fingerprint")
+                    == model_fingerprint
+                    and [
+                        int(l)
+                        for l in checkpoint_sidecar.get("source_layers", [])
+                    ] == expected_sources
+                )
+                ckpt = (
+                    load_lens_checkpoint(self.model_id)
+                    if checkpoint_meta_matches else None
+                )
                 if ckpt is not None:
                     partial, ckpt_sidecar = ckpt
-                    ckpt_matches = (
-                        ckpt_sidecar.get("corpus_sha256") == corpus_sha
-                        and ckpt_sidecar.get("corpus_hash_kind") == corpus_hash_kind
-                        and ckpt_sidecar.get("seq_len") == seq_len
-                        and ckpt_sidecar.get("model_fingerprint")
-                        == model_fingerprint
-                        and [int(l) for l in ckpt_sidecar.get("source_layers", [])]
-                        == expected_sources
-                    )
-                    if ckpt_matches:
+                    if checkpoint_meta_matches:
                         ckpt_base_n = int(ckpt_sidecar.get("base_n_prompts", -1))
                         if ckpt_base_n == 0 and (
                             base is None or partial.n_prompts >= base.n_prompts
@@ -2230,11 +2287,14 @@ class SaklasSession:
                 remove_lens_checkpoint(self.model_id)
                 return lens
 
+            checkpoint_written = False
+
             def _save_checkpoint_accumulator(
                 sums: "Mapping[int, torch.Tensor]",
                 completed: int,
                 d_model: int,
             ) -> None:
+                nonlocal checkpoint_written
                 save_lens_checkpoint_accumulator(
                     sums, completed, d_model, self.model_id,
                     base=base,
@@ -2251,10 +2311,13 @@ class SaklasSession:
                     model_fingerprint=model_fingerprint,
                     model_source_fingerprint=model_source_fp,
                 )
+                checkpoint_written = True
 
             if base is not None and not usable:
                 merged = _save_full(base)
-                return SaklasSession._adopt_fitted_jlens(self, merged)
+                return SaklasSession._adopt_fitted_jlens(
+                    self, merged, sidecar=load_lens_sidecar(self.model_id),
+                )
 
             fitted = fit_jacobian_lens(
                 fit_model, self._tokenizer, usable, fit_layers,
@@ -2272,8 +2335,23 @@ class SaklasSession:
                 JacobianLens.merge_into([base, fitted], target=-1)
                 if base is not None else fitted
             )
+            if checkpoint_written and promote_lens_checkpoint(
+                self.model_id,
+                n_prompts=merged.n_prompts,
+                source_layers=merged.source_layers,
+                corpus_sha256=corpus_sha,
+                corpus_hash_kind=corpus_hash_kind,
+                seq_len=seq_len,
+                d_model=merged.d_model,
+                model_fingerprint=model_fingerprint,
+            ):
+                return SaklasSession._adopt_fitted_jlens(
+                    self, merged, sidecar=load_lens_sidecar(self.model_id),
+                )
             merged = _save_full(merged)
-            return SaklasSession._adopt_fitted_jlens(self, merged)
+            return SaklasSession._adopt_fitted_jlens(
+                self, merged, sidecar=load_lens_sidecar(self.model_id),
+            )
 
     def _resolve_jlens_layers(
         self,
@@ -4466,9 +4544,11 @@ class SaklasSession:
                 matching_keys.append(key)
                 old_objects.add(id(loaded))
 
-        promoted = manifold.to(device=self._device, dtype=torch.float32)
-        for key in matching_keys:
-            self._manifolds[key] = promoted
+        promoted = None
+        if matching_keys:
+            promoted = manifold.to(device=self._device, dtype=torch.float32)
+            for key in matching_keys:
+                self._manifolds[key] = promoted
 
         # Rebuild attach-time whitened factors for probes backed by an evicted
         # object. Preserve public probe name and nearest-node roster size.
@@ -4482,6 +4562,7 @@ class SaklasSession:
             for probe_name, attached in monitor.attached_probes().items():
                 if id(attached.manifold) not in old_objects:
                     continue
+                assert promoted is not None
                 top_n = attached.top_n
                 monitor.remove_probe(probe_name)
                 monitor.add_probe(probe_name, promoted, top_n=top_n)

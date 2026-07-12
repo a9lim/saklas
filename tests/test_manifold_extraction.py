@@ -377,6 +377,31 @@ def test_shared_capture_stem_lock_serializes_independent_folders(
     assert calls == 1
 
 
+def test_cold_fit_prepares_token_identity_once_across_capture_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import saklas.core.extraction as extraction_module
+
+    folder = _author_manifold(tmp_path)
+    real_prepare = extraction_module.prepare_manifold_capture_identity
+    calls = 0
+
+    def _counting_prepare(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        return real_prepare(*args, **kwargs)
+
+    monkeypatch.setattr(
+        extraction_module, "prepare_manifold_capture_identity",
+        _counting_prepare,
+    )
+    ManifoldExtractionPipeline(_Handle(), EventBus()).fit(
+        folder, layer_indices=[0],
+    )
+
+    assert calls == 1
+
+
 def test_disjoint_layer_top_up_preserves_existing_row_cache(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

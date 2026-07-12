@@ -1210,6 +1210,42 @@ def test_clear_manifold_tensors_removes_tensors_keeps_corpus(
     assert not any(k.endswith(".safetensors") for k in mf.files)
 
 
+def test_shared_capture_survives_until_last_fitted_owner_is_removed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    domain = {"type": "box", "axes": [
+        {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]}
+    folders = [
+        create_manifold_folder(
+            "local", name, "", domain, _author_nodes(["a", "b", "c"]),
+        )[0]
+        for name in ("mood-a", "mood-b")
+    ]
+    capture_sha = "e" * 64
+    for folder in folders:
+        fitted = _fake_fit_tensor(folder, "google/gemma-3-4b-it")
+        sidecar_path = fitted.with_suffix(".json")
+        sidecar = json.loads(sidecar_path.read_text())
+        sidecar["capture_sha256"] = capture_sha
+        sidecar_path.write_text(json.dumps(sidecar))
+        ManifoldFolder.load(folder, verify_manifest=False).update_file_hashes(
+            fitted, sidecar_path,
+        )
+
+    from saklas.io.paths import model_dir
+
+    capture_dir = model_dir("google/gemma-3-4b-it") / "manifold_capture"
+    capture_dir.mkdir(parents=True)
+    capture_file = capture_dir / f"{capture_sha}.rows.safetensors"
+    capture_file.write_bytes(b"shared")
+
+    clear_manifold_tensors("local", "mood-a")
+    assert capture_file.exists()
+    remove_manifold_folder("local", "mood-b")
+    assert not capture_file.exists()
+
+
 def test_clear_manifold_tensors_repairs_orphan_sidecar(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):

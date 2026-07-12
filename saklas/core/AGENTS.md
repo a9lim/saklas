@@ -38,14 +38,18 @@ layer, averaged over positions ≥ `SKIP_FIRST_POSITIONS` (16, attention sinks)
 and a text corpus. `fit_jacobian_lens(model, tokenizer, prompts, layer_modules,
 …)` is the **only backward-pass code in saklas**: everything else runs under
 `inference_mode`, and with frozen params + integer inputs no autograd graph
-exists at all, so the fit runs under `torch.enable_grad()` with a returning
-forward hook on the first fitted block that replaces its output with a detached
-`requires_grad_(True)` leaf (reuses `get_layers`, zero per-arch wiring).
+exists at all, so the fit runs under `torch.enable_grad()` with returning
+forward hooks that attach transparent zero-valued mean-position probe leaves;
+the first fitted block also detaches its output (reuses `get_layers`, zero
+per-arch wiring).
 Consecutive ragged prompts share one right-padded graph (`prompt_batch`,
 CPU/CUDA default 4, MPS 2) and `ceil(d_model/dim_batch)` backwards. Each backward selects one block of output
 dims, sums those dims over the valid target positions, and calls
 `torch.autograd.grad(..., is_grads_batched=True)` so `dim_batch` VJPs come from a
-single unreplicated graph while preserving equal-prompt weighting.
+single unreplicated graph while preserving equal-prompt weighting. Autograd
+returns each source as `[dim_batch,B,D]`, not `[dim_batch,B,T,D]`: the probe
+identity collapses the valid source-position mean inside backward while passing
+the full residual gradient upstream unchanged.
 `SAKLAS_JLENS_VJP=replicated` restores the reference replicated-prompt estimator,
 and `auto` falls back to exact replicated row-batch VJPs when a backend lacks vmap
 coverage. Grads come from `torch.autograd.grad(final,
@@ -68,7 +72,9 @@ for allocation-light resumable fits: IO normalizes live sums and merges any
 prefix one layer at a time while converting to fp16, so checkpointing does not
 materialize another complete fp32 lens. Checkpoints are self-contained
 (`base_n_prompts=0`) and survive repeated interruptions even beside an older
-full artifact; finalization writes the full artifact durably once.
+full artifact; cadence never fractures a healthy prompt microbatch. When the
+terminal checkpoint is already the complete lens, finalization fsyncs and
+promotes that shard instead of converting/writing the same artifact again.
 `checkpoint_cb` remains the compatibility surface. `JacobianLens.merge` is the
 non-mutating n_prompts-weighted combiner; `merge_into` recycles a caller-owned
 tail; `union_layers` combines same-corpus layer shards.
@@ -455,9 +461,11 @@ MPS-unsafe).
 **Fuzzy-manifold σ-field (curved only).** Optional per-layer *tube thickness*:
 the surface stops being a zero-thickness wire and carries a within-node off-surface
 spread `σ(z)`. Raw curved fits retain activation rows from the shared centroid
-pass; `compute_node_reduced_covariance_from_rows` projects them after the basis
-exists, avoiding a second model pass while still accumulating each node's
-reduced `(R,R)` covariance. `compute_node_reduced_covariance` remains for callers
+pass; `compute_store_reduced_covariances` streams the layer-major spool through
+bounded projection chunks after the basis exists, avoiding both a second model
+pass and `nodes × layers` small hidden-dimension GEMMs while accumulating each
+node's reduced `(R,R)` covariance. `compute_node_reduced_covariance_from_rows`
+and `compute_node_reduced_covariance` remain for standalone callers
 without retained rows; `fit_sigma_field`
 reduces it to one off-surface scalar per node (`_off_surface_var` — the
 normal-complement trace via the surface tangent `_reduced_tangent`) and fits a

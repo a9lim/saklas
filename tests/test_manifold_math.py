@@ -13,6 +13,7 @@ import pytest
 import torch
 
 from saklas.core.manifold import (
+    ActivationRowStore,
     BoxAxis,
     BoxDomain,
     CustomDomain,
@@ -26,6 +27,8 @@ from saklas.core.manifold import (
     fit_rbf_interpolant,
     fit_rbf_smoothed,
     fit_sigma_field,
+    compute_node_reduced_covariance_from_rows,
+    compute_store_reduced_covariances,
     prepare_rbf_fit_plan,
     _gcv_select_lambda,
     _off_surface_var,
@@ -958,6 +961,45 @@ def test_inject_norm_cap_bounds_output():
 # gives the surface a *tube thickness*: soft ``onto`` shrinks the off-surface
 # residual toward ``σ`` (the typical set) instead of to the zero-thickness
 # wire.  Absent ⇒ ``sigma_at`` returns 0 ⇒ exact legacy behavior.
+
+
+def test_layer_major_store_covariances_match_node_reference() -> None:
+    torch.manual_seed(4)
+    node_sizes = [2, 3, 1]
+    store = ActivationRowStore(node_sizes)
+    total = sum(node_sizes)
+    indices = torch.arange(total)
+    layer_subs: dict[int, LayerSubspace] = {}
+    for layer in (0, 1, 2):
+        rows = (
+            torch.full((total, 7), 1_000_000.0) + 10.0 * torch.randn(total, 7)
+            if layer == 2
+            else torch.randn(total, 7, dtype=torch.float16)
+        )
+        store.write(layer, indices, rows)
+        basis = torch.linalg.qr(torch.randn(7, 3)).Q.T.contiguous()
+        layer_subs[layer] = LayerSubspace.affine(
+            (
+                torch.full((7,), 1_000_000.0)
+                if layer == 2 else torch.randn(7)
+            ),
+            basis,
+        )
+
+    expected = [
+        compute_node_reduced_covariance_from_rows(rows, layer_subs)
+        for rows in store
+    ]
+    actual = compute_store_reduced_covariances(
+        store, layer_subs, row_chunk=4,
+    )
+
+    for expected_node, actual_node in zip(expected, actual, strict=True):
+        for layer in layer_subs:
+            assert torch.allclose(
+                actual_node[layer], expected_node[layer], atol=1e-6,
+            )
+    store.close()
 
 def _attach_constant_sigma(sub: Any, value: float) -> None:
     """Fit a σ-RBF interpolating a constant ``σ = value`` over the layout.

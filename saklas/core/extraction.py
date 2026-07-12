@@ -23,6 +23,7 @@ import math
 import os
 import pathlib
 import tempfile
+import threading
 import time
 from collections.abc import Sequence
 from contextlib import nullcontext
@@ -39,6 +40,9 @@ from saklas.io.paths import model_dir, tensor_filename
 
 
 _CAPTURE_CACHE_FORMAT_VERSION = 3
+_ROW_DIGEST_CACHE_MAX = 512
+_row_digest_cache: set[tuple[object, ...]] = set()
+_row_digest_cache_lock = threading.Lock()
 
 
 def _tensor_sha256(tensor: torch.Tensor) -> str:
@@ -51,6 +55,61 @@ def _tensor_sha256(tensor: torch.Tensor) -> str:
         chunk = flat[start:start + 1_048_576].to(device="cpu").contiguous()
         digest.update(chunk.view(torch.uint8).numpy().tobytes())
     return digest.hexdigest()
+
+
+def _row_tensor_matches_cache_metadata(
+    path: pathlib.Path,
+    layer: int,
+    tensor: torch.Tensor,
+    *,
+    expected_shape: object,
+    expected_dtype: object,
+    expected_digest: object,
+) -> bool:
+    """Validate one row-cache tensor, memoizing an unchanged exact digest.
+
+    Row containers can be multi-GiB and geometry-only refits intentionally read
+    the same layer mappings repeatedly.  The first access still hashes every
+    byte; later accesses reuse that proof only while the container's full stat
+    identity and the expected per-layer digest remain unchanged.
+    """
+    if (
+        expected_shape != list(tensor.shape)
+        or expected_dtype != str(tensor.dtype)
+        or not isinstance(expected_digest, str)
+        or len(expected_digest) != 64
+    ):
+        return False
+    try:
+        before = path.stat()
+    except OSError:
+        return False
+    stat_key = (
+        str(path.resolve()), before.st_size, before.st_mtime_ns,
+        before.st_ctime_ns, before.st_dev, before.st_ino,
+        int(layer), expected_digest,
+    )
+    with _row_digest_cache_lock:
+        if stat_key in _row_digest_cache:
+            return True
+    if _tensor_sha256(tensor) != expected_digest:
+        return False
+    try:
+        after = path.stat()
+    except OSError:
+        return False
+    after_key = (
+        str(path.resolve()), after.st_size, after.st_mtime_ns,
+        after.st_ctime_ns, after.st_dev, after.st_ino,
+        int(layer), expected_digest,
+    )
+    if after_key != stat_key:
+        return False
+    with _row_digest_cache_lock:
+        if len(_row_digest_cache) >= _ROW_DIGEST_CACHE_MAX:
+            _row_digest_cache.clear()
+        _row_digest_cache.add(stat_key)
+    return True
 
 
 def _save_safetensors_atomic(
@@ -347,6 +406,9 @@ class ManifoldExtractionPipeline:
         force: bool = False,
         on_progress: Callable[[str], None] | None = None,
         _capture_lock_held: bool = False,
+        _prepared_identity: tuple[Any, ...] | None = None,
+        _model_fingerprint: str | None = None,
+        _verified_cache_miss: bool = False,
     ):
         """Fit (or load from cache) a manifold for the session's model.
 
@@ -373,7 +435,7 @@ class ManifoldExtractionPipeline:
             CustomDomain,
             Manifold,
             compute_manifold_node_stats,
-            compute_node_reduced_covariance_from_rows,
+            compute_store_reduced_covariances,
             discover_coords,
             domain_from_spec,
             fit_affine_subspace,
@@ -455,8 +517,10 @@ class ManifoldExtractionPipeline:
                 f"layer_indices must lie in [0, {n_layers}); got "
                 f"{requested_fit_layers}"
             )
-        model_fingerprint = loaded_model_fingerprint(
-            model, self._handle.model_id,
+        model_fingerprint = (
+            _model_fingerprint
+            if _model_fingerprint is not None
+            else loaded_model_fingerprint(model, self._handle.model_id)
         )
 
         # Resolve string requests through SAELens metadata before accepting a
@@ -497,12 +561,17 @@ class ManifoldExtractionPipeline:
         # tensor cache.  Source-text hashes alone miss baseline-prompt edits and
         # tokenizer/chat-template changes; both alter the actual residuals even
         # when the authored node files are byte-identical.
+        prepared_identity = (
+            _prepared_identity
+            if _prepared_identity is not None
+            else prepare_manifold_capture_identity(
+                self._handle, mf, model_fingerprint,
+            )
+        )
         (
             node_groups, baseline_prompts, prepared_rows, capture_sha,
             node_roles, node_kinds, model_type,
-        ) = prepare_manifold_capture_identity(
-            self._handle, mf, model_fingerprint,
-        )
+        ) = prepared_identity
         tokenizer = self._handle.tokenizer
         device = self._handle.device
         K = len(node_groups)
@@ -520,20 +589,22 @@ class ManifoldExtractionPipeline:
         # reconstructed through and does not ride the filename, so it is
         # checked here or a stale tensor is served.
         sidecar_path = tensor_path.with_suffix(".json")
-        target_integrity_ok = (
-            not mf.files and not tensor_path.exists() and not sidecar_path.exists()
-        )
-        expected_target_files = {
-            name: mf.files[name]
-            for name in (tensor_path.name, sidecar_path.name)
-            if name in mf.files
-        }
-        if len(expected_target_files) == 2:
-            from saklas.io.packs import verify_integrity
-
-            target_integrity_ok, _bad = verify_integrity(
-                pathlib.Path(folder), expected_target_files,
+        target_integrity_ok = False
+        if not _verified_cache_miss:
+            target_integrity_ok = (
+                not mf.files and not tensor_path.exists() and not sidecar_path.exists()
             )
+            expected_target_files = {
+                name: mf.files[name]
+                for name in (tensor_path.name, sidecar_path.name)
+                if name in mf.files
+            }
+            if len(expected_target_files) == 2:
+                from saklas.io.packs import verify_integrity
+
+                target_integrity_ok, _bad = verify_integrity(
+                    pathlib.Path(folder), expected_target_files,
+                )
         cached_revision = (
             sae_revision if isinstance(sae, str)
             else sae_backend.revision if sae_backend is not None
@@ -573,7 +644,11 @@ class ManifoldExtractionPipeline:
                 )
             ):
                 _progress(f"Loaded cached manifold '{mf.name}'.")
-                manifold = load_manifold(tensor_path)
+                # The folder lock plus the targeted pair proof and sidecar
+                # identity checks above already establish this exact load.
+                # Avoid repeating manifest/node-policy validation in the
+                # generic public loader.
+                manifold = load_manifold(tensor_path, verify_manifest=False)
                 self._events.emit(ManifoldExtracted(
                     name=mf.name, manifold=manifold,
                     metadata=dict(manifold.metadata),
@@ -629,6 +704,9 @@ class ManifoldExtractionPipeline:
                     force=force,
                     on_progress=on_progress,
                     _capture_lock_held=True,
+                    _prepared_identity=prepared_identity,
+                    _model_fingerprint=model_fingerprint,
+                    _verified_cache_miss=True,
                 )
 
         # 1. Per-node centroids (one forward pass per response) — shared
@@ -749,15 +827,12 @@ class ManifoldExtractionPipeline:
                         cached_rows = ActivationRowStore.load(
                             row_cache, node_sizes, layer_indices=selected_row_layers,
                         )
-                        if any(
-                            cached_row_shapes.get(str(idx))
-                            != list(cached_rows.flat_rows(idx).shape)
-                            or cached_row_dtypes.get(str(idx))
-                            != str(cached_rows.flat_rows(idx).dtype)
-                            or cached_row_digests.get(str(idx))
-                            != _tensor_sha256(cached_rows.flat_rows(idx))
-                            for idx in selected_row_layers
-                        ):
+                        if any(not _row_tensor_matches_cache_metadata(
+                            row_cache, idx, cached_rows.flat_rows(idx),
+                            expected_shape=cached_row_shapes.get(str(idx)),
+                            expected_dtype=cached_row_dtypes.get(str(idx)),
+                            expected_digest=cached_row_digests.get(str(idx)),
+                        ) for idx in selected_row_layers):
                             raise ValueError("row cache metadata shape/dtype mismatch")
             except (
                 OSError, RuntimeError, ValueError, KeyError,
@@ -807,9 +882,9 @@ class ManifoldExtractionPipeline:
                     capture_context=capture_context,
                 )
             for idx in capture_layers:
-                stacks_cached[idx] = torch.stack([
-                    newly_captured[node_idx][idx] for node_idx in range(K)
-                ]).to(torch.float32).contiguous()
+                stacks_cached[idx] = newly_captured[idx].to(
+                    torch.float32,
+                ).contiguous()
             centroid_layers.update(capture_layers)
             capture_elapsed = time.perf_counter() - capture_started
             _progress(
@@ -878,15 +953,12 @@ class ManifoldExtractionPipeline:
                             row_cache, node_sizes, layer_indices=durable_only,
                         )
                         try:
-                            if any(
-                                cached_row_shapes.get(str(idx))
-                                != list(durable_rows.flat_rows(idx).shape)
-                                or cached_row_dtypes.get(str(idx))
-                                != str(durable_rows.flat_rows(idx).dtype)
-                                or cached_row_digests.get(str(idx))
-                                != _tensor_sha256(durable_rows.flat_rows(idx))
-                                for idx in durable_only
-                            ):
+                            if any(not _row_tensor_matches_cache_metadata(
+                                row_cache, idx, durable_rows.flat_rows(idx),
+                                expected_shape=cached_row_shapes.get(str(idx)),
+                                expected_dtype=cached_row_dtypes.get(str(idx)),
+                                expected_digest=cached_row_digests.get(str(idx)),
+                            ) for idx in durable_only):
                                 raise ValueError(
                                     "durable row cache metadata mismatch"
                                 )
@@ -1548,15 +1620,12 @@ class ManifoldExtractionPipeline:
                             row_cache, node_sizes,
                             layer_indices=selected_cached_layers,
                         )
-                        if any(
-                            cached_row_shapes.get(str(idx))
-                            != list(cached_auto_rows.flat_rows(idx).shape)
-                            or cached_row_dtypes.get(str(idx))
-                            != str(cached_auto_rows.flat_rows(idx).dtype)
-                            or cached_row_digests.get(str(idx))
-                            != _tensor_sha256(cached_auto_rows.flat_rows(idx))
-                            for idx in selected_cached_layers
-                        ):
+                        if any(not _row_tensor_matches_cache_metadata(
+                            row_cache, idx, cached_auto_rows.flat_rows(idx),
+                            expected_shape=cached_row_shapes.get(str(idx)),
+                            expected_dtype=cached_row_dtypes.get(str(idx)),
+                            expected_digest=cached_row_digests.get(str(idx)),
+                        ) for idx in selected_cached_layers):
                             raise ValueError("row cache metadata mismatch")
                         stores.append(cached_auto_rows)
                     except (OSError, RuntimeError, ValueError, KeyError):
@@ -1626,15 +1695,12 @@ class ManifoldExtractionPipeline:
                             row_cache, node_sizes, layer_indices=durable_only,
                         )
                         try:
-                            if any(
-                                cached_row_shapes.get(str(idx))
-                                != list(durable_rows.flat_rows(idx).shape)
-                                or cached_row_dtypes.get(str(idx))
-                                != str(durable_rows.flat_rows(idx).dtype)
-                                or cached_row_digests.get(str(idx))
-                                != _tensor_sha256(durable_rows.flat_rows(idx))
-                                for idx in durable_only
-                            ):
+                            if any(not _row_tensor_matches_cache_metadata(
+                                row_cache, idx, durable_rows.flat_rows(idx),
+                                expected_shape=cached_row_shapes.get(str(idx)),
+                                expected_dtype=cached_row_dtypes.get(str(idx)),
+                                expected_digest=cached_row_digests.get(str(idx)),
+                            ) for idx in durable_only):
                                 raise ValueError(
                                     "durable row cache metadata mismatch"
                                 )
@@ -1675,10 +1741,9 @@ class ManifoldExtractionPipeline:
                 f"Fitting within-node σ-field across {len(layer_subs)} layers "
                 f"({K} nodes, retained activation rows)..."
             )
-            node_covs = [
-                compute_node_reduced_covariance_from_rows(rows, layer_subs)
-                for rows in retained_rows
-            ]
+            node_covs = compute_store_reduced_covariances(
+                retained_rows, layer_subs,
+            )
             retained_rows.close()
             retained_rows = None
             sigma_field_per_layer = fit_sigma_field(

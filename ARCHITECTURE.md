@@ -182,8 +182,9 @@ batches across node boundaries, tokenizes once, buckets by length, grows clean
 batches up to 64, and adapts down after OOM. Capture terminates after the last
 selected transformer layer, skipping unused upper blocks / final norm / LM head.
 Centroid-only fits reduce by node before transfer. Raw curved fits write
-source-dtype rows to a layer-major mmap spool so sigma covariance needs neither a
-second model pass nor a resident fp32 roster; token-exact per-model centroid/row
+source-dtype rows to a layer-major mmap spool; sigma covariance projects that
+spool layer-major in bounded chunks, so it needs neither a second model pass, a
+resident fp32 hidden roster, nor one small hidden-dimension GEMM per node; token-exact per-model centroid/row
 caches include baseline/tokenizer-render identity, node boundaries, centroid
 digests + exact per-layer row digests, map only requested row layers, union
 layer coverage for subset/top-up reuse, and prune oldest groups past a configurable disk bound;
@@ -911,7 +912,9 @@ fitted block's output under `torch.enable_grad()` and reads per-layer grads with
 uses exact ragged prompt microbatches (CPU/CUDA default 4, MPS 2) plus batched
 VJPs (`is_grads_batched=True`) for `ceil(d_model/dim_batch)` output-dim blocks,
 with an exact scalar fallback and env-overridable replicated reference mode
-(`SAKLAS_JLENS_VJP`). A final-block hook stops before norm + LM head. Every
+(`SAKLAS_JLENS_VJP`). Transparent mean-position probe identities collapse each
+source derivative inside autograd from `[rows,B,T,D]` to `[rows,B,D]` while
+leaving the forward and upstream gradient unchanged. A final-block hook stops before norm + LM head. Every
 backend transfers bounded row stripes directly into the CPU accumulator; an OOM
 rebuilds the graph at the first uncommitted row. Self-contained checkpoints
 (`jlens.partial.*`) are written one layer at
@@ -919,8 +922,9 @@ a time directly from raw accumulator sums, avoiding a second full fp32 lens and
 supporting repeated interruption or missing-layer top-up resume. The streamed
 safetensors writer never retains a complete fp16 mapping. Normal corpus extension
 resumes from an exact token-id prefix; the default dataset is commit-pinned;
-exact source/live-model fingerprints invalidate mutable revisions. The full fp16
-artifact is written only at durable finalization, with a streaming payload digest
+exact source/live-model fingerprints invalidate mutable revisions. A complete
+terminal checkpoint is fsynced and promoted at finalization instead of being
+rewritten; otherwise the full fp16 artifact is streamed once, with a payload digest
 verified on final and checkpoint loads.
 The artifact (`io/lens.py`,
 `models/<safe_id>/jlens.safetensors`, fp16) then supports four

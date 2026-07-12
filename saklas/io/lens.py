@@ -27,7 +27,7 @@ import struct
 from contextlib import suppress
 from pathlib import Path
 from collections.abc import Callable, Mapping
-from typing import Any
+from typing import Any, cast
 
 import torch
 from safetensors import safe_open
@@ -134,6 +134,15 @@ def load_lens_sidecar(model_id: str) -> dict[str, Any] | None:
     ts_path, sc_path = lens_paths(model_id)
     with artifact_lock(ts_path):
         return _load_sidecar_at(model_id, ts_path, sc_path, label="jlens cache")
+
+
+def load_lens_checkpoint_sidecar(model_id: str) -> dict[str, Any] | None:
+    """Load validated checkpoint metadata without materializing its matrices."""
+    ts_path, sc_path = lens_checkpoint_paths(model_id)
+    with artifact_lock(ts_path):
+        return _load_sidecar_at(
+            model_id, ts_path, sc_path, label="jlens checkpoint",
+        )
 
 
 def save_lens(
@@ -432,10 +441,10 @@ def _save_fp16_square_safetensors_atomic(
                             f"{tuple(block.shape)} {block.dtype}; expected "
                             f"{expected} float16"
                         )
-                    # ``tobytes`` is bounded to one row stripe (never a complete
-                    # layer/artifact), keeping the writer portable across file
-                    # implementations while preserving the low peak.
-                    payload = block.numpy().tobytes(order="C")
+                    # Both file.write and hashlib accept the buffer protocol;
+                    # keep the stripe tensor alive and avoid allocating a
+                    # second payload-sized ``bytes`` copy.
+                    payload = memoryview(cast(Any, block.numpy())).cast("B")
                     f.write(payload)
                     digest.update(payload)
             if durable:
@@ -500,6 +509,57 @@ def load_lens_checkpoint(model_id: str) -> tuple[JacobianLens, dict[str, Any]] |
         )
 
 
+def promote_lens_checkpoint(
+    model_id: str,
+    *,
+    n_prompts: int,
+    source_layers: list[int],
+    corpus_sha256: str,
+    corpus_hash_kind: str,
+    seq_len: int,
+    d_model: int,
+    model_fingerprint: str,
+) -> bool:
+    """Promote a complete checkpoint to the durable lens without rewriting it.
+
+    Terminal checkpoint cadence can coincide with successful fit completion.
+    That shard is already the complete fp16 artifact, including any resumed
+    base, so serializing the fp32 in-memory lens again would duplicate a
+    potentially multi-GiB conversion and write.  Promote only after cheap exact
+    identity checks; callers fall back to :func:`save_lens` on ``False``.
+    """
+    checkpoint_ts, checkpoint_sc = lens_checkpoint_paths(model_id)
+    final_ts, final_sc = lens_paths(model_id)
+    with artifact_lock(checkpoint_ts), artifact_lock(final_ts):
+        sidecar = _load_sidecar_at(
+            model_id, checkpoint_ts, checkpoint_sc, label="jlens checkpoint",
+        )
+        if (
+            sidecar is None
+            or int(sidecar.get("n_prompts", -1)) != int(n_prompts)
+            or [int(layer) for layer in sidecar.get("source_layers", [])]
+            != sorted(int(layer) for layer in source_layers)
+            or sidecar.get("corpus_sha256") != corpus_sha256
+            or sidecar.get("corpus_hash_kind") != corpus_hash_kind
+            or int(sidecar.get("seq_len", -1)) != int(seq_len)
+            or int(sidecar.get("d_model", -1)) != int(d_model)
+            or sidecar.get("model_fingerprint") != model_fingerprint
+            or int(sidecar.get("base_n_prompts", -1)) != 0
+        ):
+            return False
+        # The checkpoint writer deliberately skips fsync because most shards
+        # are temporary. A promoted terminal shard becomes durable here.
+        with open(checkpoint_ts, "rb") as handle:
+            os.fsync(handle.fileno())
+        os.replace(checkpoint_ts, final_ts)
+        durable_sidecar = dict(sidecar)
+        for key in ("checkpoint", "base_n_prompts", "partial_n_prompts"):
+            durable_sidecar.pop(key, None)
+        write_json_atomic(final_sc, durable_sidecar)
+        checkpoint_sc.unlink(missing_ok=True)
+        return True
+
+
 def _load_lens_at(
     model_id: str,
     ts_path: Path,
@@ -551,9 +611,8 @@ def _load_lens_at(
                     )
                     return None
                 for start in range(0, d_model, 256):
-                    digest.update(
-                        raw[start:start + 256].contiguous().numpy().tobytes(order="C")
-                    )
+                    block = raw[start:start + 256].contiguous()
+                    digest.update(memoryview(cast(Any, block.numpy())).cast("B"))
                 J = raw.to(torch.float32)
                 if not bool(torch.isfinite(J).all()):
                     log.warning(

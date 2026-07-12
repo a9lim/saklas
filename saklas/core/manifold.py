@@ -3274,18 +3274,22 @@ def _rbf_gcv_score(
     K = norm.shape[0]
     plan = plan or prepare_rbf_fit_plan(norm, smoothing=smoothing)
     E, Q = plan.E, plan.Q
+    fixed_smoother: torch.Tensor | None = None
+    fixed_edf = 0.0
+    if smoothing != "auto":
+        denom_e = K * K - K
+        e_scale = float(E.abs().sum() / denom_e) if denom_e > 0 else 1.0
+        lam = float(smoothing) * (e_scale if e_scale > 0.0 else 1.0)
+        fixed_smoother = _rbf_smoother_matrix(E, Q, lam)
+        fixed_edf = float(fixed_smoother.diagonal().sum().item())
     total = 0.0
     for y in targets.values():
         if smoothing == "auto":
             _lam, _edf, gcv = _gcv_select_lambda(E, Q, y, plan=plan)
         else:
-            denom_e = K * K - K
-            e_scale = float(E.abs().sum() / denom_e) if denom_e > 0 else 1.0
-            lam = float(smoothing) * (e_scale if e_scale > 0.0 else 1.0)
-            S = _rbf_smoother_matrix(E, Q, lam)
-            edf = float(S.diagonal().sum().item())
-            rss = float((y - S @ y).pow(2).sum().item())
-            gcv = _gcv_value(rss, edf, K)
+            assert fixed_smoother is not None
+            rss = float((y - fixed_smoother @ y).pow(2).sum().item())
+            gcv = _gcv_value(rss, fixed_edf, K)
         total += gcv
     return total
 
@@ -3411,23 +3415,27 @@ def _rips_h1_persistence(
     # H1 deaths: reduce triangle columns over edge rows (global edge indices, so
     # the pivot respects filtration order).  A reduced low on a positive edge
     # pairs that loop's birth with this triangle's death.
-    low_inv: dict[int, set[int]] = {}     # pivot edge-global → reduced column
+    # Python integers are compact C-level bitsets over edge rows.  Symmetric
+    # difference becomes one XOR and the pivot is ``bit_length()-1``; this is
+    # the identical GF(2) reduction without allocating/copying Python sets for
+    # every triangle column on dense auto-topology heaps.
+    low_inv: dict[int, int] = {}          # pivot edge-global → reduced bit column
     killed: dict[int, float] = {}         # edge filtration index → death filtration
     for fl, i, j, k in triangles:
-        col = {
-            eg(edge_id[(min(i, j), max(i, j))]),
-            eg(edge_id[(min(i, k), max(i, k))]),
-            eg(edge_id[(min(j, k), max(j, k))]),
-        }
+        col = (
+            (1 << eg(edge_id[(min(i, j), max(i, j))]))
+            | (1 << eg(edge_id[(min(i, k), max(i, k))]))
+            | (1 << eg(edge_id[(min(j, k), max(j, k))]))
+        )
         while col:
-            piv = max(col)
+            piv = col.bit_length() - 1
             if piv in low_inv:
                 col ^= low_inv[piv]
             else:
                 break
         if not col:
             continue  # triangle creates an H2 void — irrelevant to H1
-        piv = max(col)
+        piv = col.bit_length() - 1
         low_inv[piv] = col
         edge_idx = piv - K
         if edge_idx in positive_edges and edge_idx not in killed:
@@ -4296,15 +4304,17 @@ def compute_manifold_node_stats(
     retain_rows: bool = False,
     prepared_rows: "Sequence[tuple[torch.Tensor, int]] | None" = None,
     capture_context: "Any | None" = None,
-) -> tuple[list[dict[int, torch.Tensor]], ActivationRowStore | None]:
+) -> tuple[dict[int, torch.Tensor], ActivationRowStore | None]:
     """Fit-wide batched capture for all manifold nodes.
 
     Rows carry their node/within-node indices through one stream, so short
     template corpora share batches across node boundaries instead of paying one
     underfilled model forward per node.  Standard 48-response nodes retain the
     same chunking, while OOM backoff halves the active batch and cautiously grows
-    it again. Returns per-node fp32 centroids plus optional retained rows in the
-    capture source dtype.
+    it again. Returns layer-major ``(K, D)`` fp32 centroid stacks plus optional
+    retained rows in the capture source dtype.  Keeping the result layer-major
+    matches every fit consumer and avoids rebuilding each stack from ``K`` row
+    views immediately after capture.
     """
     from saklas.core.vectors import (
         _CAPTURE_BATCH_MAX,
@@ -4402,6 +4412,12 @@ def compute_manifold_node_stats(
 
         node_ids_cpu = torch.tensor([row[0] for row in chunk], dtype=torch.long)
         flat_indices_cpu = torch.tensor(chunk_indices, dtype=torch.long)
+        unique = inverse = None
+        if retained is None:
+            node_ids = node_ids_cpu.to(device)
+            unique, inverse = torch.unique(
+                node_ids, sorted=True, return_inverse=True,
+            )
         for idx in capture_layers:
             captured = per_layer[idx].detach()
             if idx not in sums:
@@ -4414,16 +4430,14 @@ def compute_manifold_node_stats(
                 # host values while they are already present.
                 host = captured.to(device="cpu")
                 retained.write(idx, flat_indices_cpu, host)
-                for batch_idx, node_idx in enumerate(node_ids_cpu.tolist()):
-                    sums[idx][node_idx].add_(host[batch_idx].to(torch.float32))
+                sums[idx].index_add_(
+                    0, node_ids_cpu, host.to(torch.float32),
+                )
             else:
                 # Centroid-only fits need one partial sum per node, not every
                 # response row.  Reduce on-device in fp32 and transfer U×D
                 # (usually 1×D) instead of B×D.
-                node_ids = node_ids_cpu.to(captured.device)
-                unique, inverse = torch.unique(
-                    node_ids, sorted=True, return_inverse=True,
-                )
+                assert unique is not None and inverse is not None
                 partial = torch.zeros(
                     unique.numel(), captured.shape[1],
                     dtype=torch.float32, device=captured.device,
@@ -4437,10 +4451,10 @@ def compute_manifold_node_stats(
         if is_mps:
             torch.mps.empty_cache()
 
-    centroids = [
-        {idx: sums[idx][node_idx] / node_sizes[node_idx] for idx in capture_layers}
-        for node_idx in range(len(node_groups))
-    ]
+    divisors = torch.tensor(node_sizes, dtype=torch.float32).reshape(-1, 1)
+    centroids = {
+        idx: (sums[idx] / divisors).contiguous() for idx in capture_layers
+    }
     return centroids, retained
 
 
@@ -4469,6 +4483,60 @@ def compute_node_reduced_covariance_from_rows(
         centered = z - z.mean(dim=0, keepdim=True)
         covs[idx] = centered.T @ centered / float(n - 1)
     return covs
+
+
+def compute_store_reduced_covariances(
+    store: ActivationRowStore,
+    layer_subs: "dict[int, LayerSubspace]",
+    *,
+    row_chunk: int = 2048,
+) -> list[dict[int, torch.Tensor]]:
+    """Project a layer-major activation spool into per-node covariances.
+
+    The legacy helper above is useful for one standalone node, but iterating it
+    over an :class:`ActivationRowStore` visits a layer-major mmap in node-major
+    order and launches one ``(N_node,D) @ (D,R)`` projection per node and layer.
+    This fit-wide sibling streams each layer once in bounded row chunks, performs
+    large projection GEMMs, and segments only the small ``(N,R)`` results by the
+    store's contiguous node boundaries.  Covariance is translation-invariant, so
+    projecting raw rows is exactly equivalent to subtracting ``sub.mean`` first
+    and then centering the reduced rows.
+    """
+    if row_chunk <= 0:
+        raise ValueError("row_chunk must be > 0")
+    if not set(layer_subs) <= set(store.layer_indices):
+        raise ValueError(
+            "activation-row store must cover every fitted subspace layer"
+        )
+
+    n_nodes = len(store.node_sizes)
+    out: list[dict[int, torch.Tensor]] = [dict() for _ in range(n_nodes)]
+    boundaries = [
+        (offset, offset + size)
+        for offset, size in zip(store.offsets, store.node_sizes, strict=True)
+    ]
+    for idx, sub in layer_subs.items():
+        basis_t = sub.basis.to(device="cpu", dtype=torch.float32).transpose(0, 1)
+        rank = sub.rank
+        rows = store.flat_rows(idx)
+        reduced_rows = torch.empty(store.total_rows, rank, dtype=torch.float32)
+        mean = sub.mean.to(device="cpu", dtype=torch.float32)
+        for start in range(0, store.total_rows, row_chunk):
+            end = min(start + row_chunk, store.total_rows)
+            centered_chunk = rows[start:end].to(torch.float32)
+            centered_chunk.sub_(mean)
+            reduced_rows[start:end] = centered_chunk @ basis_t
+
+        for k, (start, end) in enumerate(boundaries):
+            size = end - start
+            if size <= 1:
+                cov = torch.zeros(rank, rank, dtype=torch.float32)
+            else:
+                node_reduced = reduced_rows[start:end]
+                centered = node_reduced - node_reduced.mean(dim=0, keepdim=True)
+                cov = centered.transpose(0, 1) @ centered / float(size - 1)
+            out[k][idx] = cov
+    return out
 
 
 def compute_node_reduced_covariance(
@@ -5374,6 +5442,7 @@ __all__ = [
     "compute_node_activation_rows",
     "compute_manifold_node_stats",
     "compute_node_reduced_covariance_from_rows",
+    "compute_store_reduced_covariances",
     "save_manifold",
     "load_manifold",
     "invert_parameterization",
