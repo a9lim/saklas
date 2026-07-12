@@ -33,6 +33,7 @@ from saklas.io.manifold_folder import (
     sanitize_hyperparams,
     _validate_node_kind,
     _validate_node_role,
+    validate_manifold_format_version,
     min_nodes,
 )
 from saklas.core.manifold import domain_from_spec
@@ -1001,13 +1002,90 @@ def plan_discover_generation(
         raise ManifoldFormatError(
             f"manifold.json in {folder} is unreadable: {e}"
         ) from e
-    if data.get("fit_mode", "authored") not in _FIT_MODES_DISCOVER:
+    if not isinstance(data, dict):
+        raise ManifoldFormatError(
+            f"manifold.json in {folder} must be a JSON object"
+        )
+    validate_manifold_format_version(
+        data.get("format_version"), location=f"manifold.json in {folder}",
+    )
+    allowed = {
+        "format_version", "name", "description", "fit_mode", "hyperparams",
+        "nodes", "files", "source", "tags", "artifact_id", "fit_epochs",
+        "template_ref",
+    }
+    unknown_fields = set(data) - allowed
+    if unknown_fields:
+        raise ManifoldFormatError(
+            f"manifold at {folder} has unknown field(s): {sorted(unknown_fields)}"
+        )
+    if data.get("fit_mode") not in _FIT_MODES_DISCOVER:
         raise ManifoldFormatError(
             f"manifold at {folder} is not discover-mode; cannot "
             f"stream-generate into it"
         )
-    existing_nodes = data.get("nodes") or []
-    existing_labels = [n["label"] for n in existing_nodes]
+    if data.get("name") != name:
+        raise ManifoldFormatError(
+            f"manifold at {folder} is named {data.get('name')!r}, not {name!r}"
+        )
+    for key, expected in (
+        ("description", str), ("hyperparams", dict), ("nodes", list),
+        ("files", dict),
+    ):
+        if not isinstance(data.get(key), expected):
+            raise ManifoldFormatError(
+                f"manifold at {folder} field {key!r} must be {expected.__name__}"
+            )
+    if "source" in data and not isinstance(data["source"], str):
+        raise ManifoldFormatError(
+            f"manifold at {folder} field 'source' must be str"
+        )
+    if "artifact_id" in data and (
+        not isinstance(data["artifact_id"], str) or not data["artifact_id"]
+    ):
+        raise ManifoldFormatError(
+            f"manifold at {folder} field 'artifact_id' must be a non-empty str"
+        )
+    if "fit_epochs" in data and not isinstance(data["fit_epochs"], dict):
+        raise ManifoldFormatError(
+            f"manifold at {folder} field 'fit_epochs' must be dict"
+        )
+    if "tags" in data and (
+        not isinstance(data["tags"], list)
+        or not all(isinstance(tag, str) for tag in data["tags"])
+    ):
+        raise ManifoldFormatError(
+            f"manifold at {folder} field 'tags' must be a list of strings"
+        )
+    if "template_ref" in data and (
+        not isinstance(data["template_ref"], str) or not data["template_ref"]
+    ):
+        raise ManifoldFormatError(
+            f"manifold at {folder} field 'template_ref' must be a non-empty str"
+        )
+    existing_nodes = data["nodes"]
+    if not existing_nodes:
+        raise ManifoldFormatError(
+            f"manifold at {folder} needs a non-empty 'nodes' list"
+        )
+    for entry in existing_nodes:
+        if not isinstance(entry, dict):
+            raise ManifoldFormatError(
+                f"manifold at {folder} node {entry!r} must be an object"
+            )
+        unknown_node = set(entry) - {"label", "role", "kind"}
+        if unknown_node:
+            raise ManifoldFormatError(
+                f"manifold at {folder} node has unknown field(s): "
+                f"{sorted(unknown_node)}"
+            )
+    existing_labels = _validate_discover_labels(
+        name, [entry.get("label") for entry in existing_nodes],
+    )
+    for entry in existing_nodes:
+        label = entry["label"]
+        _validate_node_role(name, label, entry.get("role"))
+        _validate_node_kind(name, label, entry.get("kind"))
     existing_roles: dict[str, str | None] = {
         n["label"]: n.get("role") for n in existing_nodes
     }

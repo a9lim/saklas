@@ -210,9 +210,12 @@ def test_naturalness_preflight_does_not_hash_fitted_payloads(
         "domain": domain,
         "node_count": 3,
         "node_labels": ["a", "b", "c"],
-        "feature_space": "raw",
-        "fit_mode": "authored",
-    }))
+            "feature_space": "raw",
+            "fit_mode": "authored",
+            "hyperparams": {},
+            "diagnostics": {},
+            "node_spread_per_layer": {},
+        }))
     ManifoldFolder.load(folder, verify_manifest=False).update_file_hashes(
         tensor, sidecar,
     )

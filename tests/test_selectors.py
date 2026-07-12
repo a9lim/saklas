@@ -159,6 +159,9 @@ def _fake_fitted_tensor(folder: Path, filename: str) -> None:
         "node_labels": ["pos", "neg"],
         "feature_space": "raw",
         "fit_mode": "pca",
+        "hyperparams": {},
+        "diagnostics": {},
+        "node_spread_per_layer": {},
     }))
 
 

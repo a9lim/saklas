@@ -154,6 +154,37 @@ def test_requires_current_format_version(version: Any):
         TemplateFolder.from_payload(payload)
 
 
+def test_rejects_unknown_fields_at_every_schema_level():
+    import copy
+
+    base = _make().to_payload()
+    payload = copy.deepcopy(base)
+    payload["prompts"] = []
+    with pytest.raises(TemplateFormatError, match="unknown field"):
+        TemplateFolder.from_payload(payload)
+
+    payload = copy.deepcopy(base)
+    payload["contexts"][0]["prompt"] = "legacy"
+    with pytest.raises(TemplateFormatError, match="unknown field"):
+        TemplateFolder.from_payload(payload)
+
+    payload = copy.deepcopy(base)
+    payload["contexts"][0]["turns"][0]["name"] = "legacy"
+    with pytest.raises(TemplateFormatError, match="unknown field"):
+        TemplateFolder.from_payload(payload)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("description", 1), ("source", None), ("tags", "temporal")],
+)
+def test_optional_template_metadata_is_not_coerced(field: str, value: Any):
+    payload = _make().to_payload()
+    payload[field] = value
+    with pytest.raises(TemplateFormatError):
+        TemplateFolder.from_payload(payload)
+
+
 def test_rejects_slot_in_history_turn():
     with pytest.raises(TemplateFormatError, match="not contain the slot"):
         create_template_folder(

@@ -237,6 +237,15 @@ class TemplateFolder:
     ) -> "TemplateFolder":
         if not isinstance(data, dict):
             raise TemplateFormatError("template.json must be a JSON object")
+        allowed = {
+            "format_version", "name", "slot", "values", "contexts",
+            "description", "source", "tags",
+        }
+        unknown = set(data) - allowed
+        if unknown:
+            raise TemplateFormatError(
+                f"template.json has unknown field(s): {sorted(unknown)}"
+            )
         fmt = data.get("format_version")
         if (
             not isinstance(fmt, int)
@@ -253,16 +262,28 @@ class TemplateFolder:
                 f"template 'name' {name!r} must match {NAME_REGEX.pattern}"
             )
         slot, values, contexts = _validate_body(name, data)
-        tags = data.get("tags") or ()
-        if tags and not all(isinstance(t, str) for t in tags):
+        tags = data.get("tags", [])
+        if not isinstance(tags, list) or not all(
+            isinstance(t, str) for t in tags
+        ):
             raise TemplateFormatError(f"template {name!r} 'tags' must be strings")
+        description = data.get("description", "")
+        if not isinstance(description, str):
+            raise TemplateFormatError(
+                f"template {name!r} 'description' must be a string"
+            )
+        source = data.get("source", "local")
+        if not isinstance(source, str) or not source:
+            raise TemplateFormatError(
+                f"template {name!r} 'source' must be a non-empty string"
+            )
         return cls(
             name=name,
             slot=slot,
             values=tuple(values),
             contexts=tuple(contexts),
-            description=str(data.get("description", "") or ""),
-            source=str(data.get("source", "local") or "local"),
+            description=description,
+            source=source,
             tags=tuple(tags),
             path=path,
         )
@@ -340,6 +361,12 @@ def _validate_context(
             f"template {name!r} context {i} must be an object with "
             f"'turns' and 'assistant'"
         )
+    unknown = set(ctx) - {"turns", "assistant"}
+    if unknown:
+        raise TemplateFormatError(
+            f"template {name!r} context {i} has unknown field(s): "
+            f"{sorted(unknown)}"
+        )
     raw_turns = ctx.get("turns")
     if not isinstance(raw_turns, list) or not raw_turns:
         raise TemplateFormatError(
@@ -352,6 +379,12 @@ def _validate_context(
             raise TemplateFormatError(
                 f"template {name!r} context {i} turn {j} must be a "
                 f"{{role, content}} object"
+            )
+        unknown_turn = set(turn) - {"role", "content"}
+        if unknown_turn:
+            raise TemplateFormatError(
+                f"template {name!r} context {i} turn {j} has unknown field(s): "
+                f"{sorted(unknown_turn)}"
             )
         role = turn.get("role")
         content = turn.get("content")

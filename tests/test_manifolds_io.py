@@ -130,6 +130,9 @@ def _sidecar_payload(
         "node_labels": node_labels,
         "feature_space": "raw",
         "fit_mode": fit_mode,
+        "hyperparams": {},
+        "diagnostics": {},
+        "node_spread_per_layer": {},
     }
 
 
@@ -839,6 +842,31 @@ def test_sidecar_requires_current_identity_fields(tmp_path: Path) -> None:
         ManifoldSidecar.load(path)
 
 
+def test_sidecar_rejects_unknown_fields(tmp_path: Path) -> None:
+    path = tmp_path / "model.json"
+    payload = _sidecar_payload()
+    payload["legacy_diagnostics"] = {}
+    path.write_text(json.dumps(payload))
+
+    with pytest.raises(ManifoldFormatError, match="unknown field"):
+        ManifoldSidecar.load(path)
+
+
+def test_manifest_and_nodes_reject_unknown_fields(tmp_path: Path) -> None:
+    folder = _author_manifold(tmp_path)
+    manifest = json.loads((folder / "manifold.json").read_text())
+    manifest["legacy_vectors"] = []
+    (folder / "manifold.json").write_text(json.dumps(manifest))
+    with pytest.raises(ManifoldFormatError, match="unknown field"):
+        ManifoldFolder.load(folder)
+
+    del manifest["legacy_vectors"]
+    manifest["nodes"][0]["statements"] = ["inline legacy corpus"]
+    (folder / "manifold.json").write_text(json.dumps(manifest))
+    with pytest.raises(ManifoldFormatError, match="unknown field"):
+        ManifoldFolder.load(folder)
+
+
 def test_iter_manifold_folders_skips_malformed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     domain = {"type": "box", "axes": [
@@ -960,12 +988,13 @@ def test_discover_manifold_rejects_coords_on_nodes(tmp_path: Path):
     (folder / "manifold.json").write_text(json.dumps({
         "format_version": MANIFOLD_FORMAT_VERSION,
         "name": "leaky",
+        "description": "",
         "fit_mode": "pca",
         "hyperparams": {"max_dim": 4},
         "nodes": [{"label": "a", "coords": [0.5]}],
         "files": {},
     }))
-    with pytest.raises(ManifoldFormatError, match="must not carry 'coords'"):
+    with pytest.raises(ManifoldFormatError, match="unknown field"):
         ManifoldFolder.load(folder)
 
 
@@ -977,6 +1006,7 @@ def test_discover_manifold_rejects_domain_field(tmp_path: Path):
     (folder / "manifold.json").write_text(json.dumps({
         "format_version": MANIFOLD_FORMAT_VERSION,
         "name": "leaky2",
+        "description": "",
         "fit_mode": "spectral",
         "hyperparams": {"max_dim": 4},
         "domain": {"type": "box", "axes": [
@@ -985,7 +1015,7 @@ def test_discover_manifold_rejects_domain_field(tmp_path: Path):
         "nodes": [{"label": "a"}],
         "files": {},
     }))
-    with pytest.raises(ManifoldFormatError, match="must not carry a 'domain'"):
+    with pytest.raises(ManifoldFormatError, match="unknown field"):
         ManifoldFolder.load(folder)
 
 
@@ -2986,6 +3016,30 @@ def test_plan_partial_rejected_by_load_but_resumable(tmp_path: Path):
     assert plan2.pending == ("b",)
 
 
+@pytest.mark.parametrize(
+    ("mutation", "match"),
+    [
+        (lambda data: data.update({"legacy": True}), "unknown field"),
+        (lambda data: data.pop("format_version"), "need exactly"),
+        (lambda data: data.update({"name": "other"}), "not 'm'"),
+        (lambda data: data["nodes"][0].update({"coords": [0.0]}), "unknown field"),
+    ],
+)
+def test_plan_resume_requires_exact_partial_manifest(
+    tmp_path: Path, mutation: Any, match: str,
+) -> None:
+    folder = tmp_path / "m"
+    plan_discover_generation(folder, "m", "d", fit_mode="pca", labels=["a", "b"])
+    data = json.loads((folder / "manifold.json").read_text())
+    mutation(data)
+    (folder / "manifold.json").write_text(json.dumps(data))
+
+    with pytest.raises(ManifoldFormatError, match=match):
+        plan_discover_generation(
+            folder, "m", "d", fit_mode="pca", labels=["a", "b"],
+        )
+
+
 def test_plan_rejects_non_discover_existing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
@@ -3057,8 +3111,11 @@ def test_bundled_refresh_ignores_local_fit_proofs(
     bundled_manifest = {
         "format_version": M.MANIFOLD_FORMAT_VERSION,
         "name": "axis",
+        "description": "",
         "fit_mode": "pca",
+        "hyperparams": {},
         "nodes": [{"label": "pos"}, {"label": "neg"}],
+        "files": {},
     }
     (pkg / "manifold.json").write_text(json.dumps(bundled_manifest))
     (pkg / "nodes" / "00_pos.json").write_text('["a"]')
@@ -3358,7 +3415,7 @@ def test_baked_manifold_rejects_coords_on_node(tmp_path: Path):
         "files": {},
     }
     (folder / "manifold.json").write_text(json.dumps(payload))
-    with pytest.raises(ManifoldFormatError, match="must not carry 'coords'"):
+    with pytest.raises(ManifoldFormatError, match="unknown field"):
         ManifoldFolder.load(folder)
 
 

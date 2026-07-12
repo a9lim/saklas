@@ -120,6 +120,8 @@ a crash between pair publication and the manifest update.
 Streaming companions for big rosters (a crash keeps finished nodes):
 `init_discover_manifold_folder` (also takes `node_kinds=`) +
 `append_discover_manifold_node`; `plan_discover_generation → DiscoverGenerationPlan`
+resumes intentionally incomplete node corpora but requires the partial manifest
+itself to have the exact current version, fields, name, and label-only node shape.
 (also takes `node_kinds=`) is
 the shared resume/add-nodes planner (deliberately bypasses `ManifoldFolder.load` so
 it can inspect a partial). `merge_discover_manifolds` unions ≥2 discover sources'

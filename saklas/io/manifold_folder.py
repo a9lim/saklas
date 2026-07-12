@@ -66,7 +66,7 @@ _LABEL_REGEX = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 # Discover-mode fit modes — set as ``manifold.json::fit_mode`` for
 # manifolds whose node coordinates are derived from the model's
 # activations rather than authored by hand.  Authored manifolds carry
-# ``fit_mode == "authored"`` (or omit the field, which means the same).
+# ``fit_mode == "authored"``. Current manifests always carry the discriminator.
 # ``auto`` is a discover mode whose *resolved* geometry (flat ``pca`` vs curved
 # ``spectral``, plus periodic ``BoxDomain`` axes) is chosen per-model at fit
 # time by ``core.manifold.select_topology`` — the folder declares only the
@@ -499,6 +499,25 @@ def load_manifold_sidecar_data(path: Path) -> dict[str, Any]:
     validate_manifold_format_version(
         data.get("format_version"), location=f"manifold sidecar {path}",
     )
+    allowed = {
+        "format_version", "name", "method", "saklas_version", "domain",
+        "node_count", "node_labels", "feature_space", "fit_mode",
+        "hyperparams", "diagnostics", "node_spread_per_layer",
+        "mahalanobis_share_per_layer", "origin_per_layer", "nodes_sha256",
+        "sae_release", "sae_revision", "sae_fingerprint", "sae_ids_by_layer",
+        "sae_full_coverage", "model_fingerprint", "capture_sha256",
+        "fitted_layers", "fit_policy_version", "share_metric",
+        "subspace_metric", "rbf_smoothing_per_layer", "sigma_field_per_layer",
+        "resolved_fit_mode", "topology_winner", "topology_candidates",
+        "node_roles", "node_kinds", "components", "bake_policy",
+        "source_model_id", "source_model_fingerprint",
+        "transfer_quality_estimate",
+    }
+    unknown = set(data) - allowed
+    if unknown:
+        raise ManifoldFormatError(
+            f"manifold sidecar {path} has unknown field(s): {sorted(unknown)}"
+        )
     required_types: dict[str, type] = {
         "name": str,
         "method": str,
@@ -508,6 +527,9 @@ def load_manifold_sidecar_data(path: Path) -> dict[str, Any]:
         "node_labels": list,
         "feature_space": str,
         "fit_mode": str,
+        "hyperparams": dict,
+        "diagnostics": dict,
+        "node_spread_per_layer": dict,
     }
     for key, expected in required_types.items():
         value = data.get(key)
@@ -677,6 +699,12 @@ class ManifoldFolder:
             location=f"manifold.json in {folder}",
         )
 
+        common_fields = {
+            "format_version", "name", "description", "fit_mode", "nodes",
+            "files", "source", "tags", "artifact_id", "fit_epochs",
+            "template_ref",
+        }
+
         name = data.get("name")
         if not isinstance(name, str) or not NAME_REGEX.match(name):
             raise ManifoldFormatError(
@@ -690,6 +718,36 @@ class ManifoldFolder:
             raise ManifoldFormatError(
                 f"manifold {name!r} fit_mode {fit_mode!r} invalid; "
                 f"expected one of {sorted(_FIT_MODES_ALL)}"
+            )
+        mode_fields = (
+            {"domain"} if fit_mode in {"authored", "baked"}
+            else {"hyperparams"}
+        )
+        unknown = set(data) - common_fields - mode_fields
+        if unknown:
+            raise ManifoldFormatError(
+                f"manifold {name!r} has unknown field(s): {sorted(unknown)}"
+            )
+        for key, expected in (
+            ("description", str), ("files", dict),
+        ):
+            if not isinstance(data.get(key), expected):
+                raise ManifoldFormatError(
+                    f"manifold {name!r} field {key!r} must be {expected.__name__}"
+                )
+        if "source" in data and not isinstance(data["source"], str):
+            raise ManifoldFormatError(
+                f"manifold {name!r} field 'source' must be str"
+            )
+        if "artifact_id" in data and (
+            not isinstance(data["artifact_id"], str) or not data["artifact_id"]
+        ):
+            raise ManifoldFormatError(
+                f"manifold {name!r} field 'artifact_id' must be a non-empty str"
+            )
+        if "fit_epochs" in data and not isinstance(data["fit_epochs"], dict):
+            raise ManifoldFormatError(
+                f"manifold {name!r} field 'fit_epochs' must be dict"
             )
 
         nodes = data.get("nodes")
@@ -730,6 +788,12 @@ class ManifoldFolder:
                     raise ManifoldFormatError(
                         f"manifold {name!r} node {entry!r} must be an "
                         f"object with 'label' and 'coords'"
+                    )
+                unknown_node = set(entry) - {"label", "coords", "role", "kind"}
+                if unknown_node:
+                    raise ManifoldFormatError(
+                        f"manifold {name!r} node has unknown field(s): "
+                        f"{sorted(unknown_node)}"
                     )
                 label = entry.get("label")
                 if not isinstance(label, str) or not _LABEL_REGEX.match(label):
@@ -781,6 +845,12 @@ class ManifoldFolder:
                         f"baked manifold {name!r} node {entry!r} must be an "
                         f"object with 'label'"
                     )
+                unknown_node = set(entry) - {"label", "role", "kind"}
+                if unknown_node:
+                    raise ManifoldFormatError(
+                        f"baked manifold {name!r} node has unknown field(s): "
+                        f"{sorted(unknown_node)}"
+                    )
                 label = entry.get("label")
                 if not isinstance(label, str) or not _LABEL_REGEX.match(label):
                     raise ManifoldFormatError(
@@ -809,12 +879,23 @@ class ManifoldFolder:
                     f"fit time"
                 )
             domain_spec = {}
-            hyperparams = dict(data.get("hyperparams", {}))
+            raw_hyperparams = data.get("hyperparams")
+            if not isinstance(raw_hyperparams, dict):
+                raise ManifoldFormatError(
+                    f"discover manifold {name!r} field 'hyperparams' must be dict"
+                )
+            hyperparams = dict(raw_hyperparams)
             for entry in nodes:
                 if not isinstance(entry, dict):
                     raise ManifoldFormatError(
                         f"discover manifold {name!r} node {entry!r} must "
                         f"be an object with 'label'"
+                    )
+                unknown_node = set(entry) - {"label", "role", "kind"}
+                if unknown_node:
+                    raise ManifoldFormatError(
+                        f"discover manifold {name!r} node has unknown field(s): "
+                        f"{sorted(unknown_node)}"
                     )
                 label = entry.get("label")
                 if not isinstance(label, str) or not _LABEL_REGEX.match(label):
@@ -840,7 +921,7 @@ class ManifoldFolder:
                 f"manifold {name!r} has duplicate node labels"
             )
 
-        files = data.get("files", {})
+        files = data["files"]
         if not isinstance(files, dict):
             raise ManifoldFormatError(
                 f"manifold {name!r} 'files' must be an object"
@@ -886,7 +967,7 @@ class ManifoldFolder:
         inst = cls(
             folder=folder,
             name=name,
-            description=data.get("description", ""),
+            description=data["description"],
             domain=domain_spec,
             node_labels=node_labels,
             node_coords=node_coords,
