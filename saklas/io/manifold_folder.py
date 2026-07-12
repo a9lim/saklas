@@ -1284,15 +1284,13 @@ class DiscoverGenerationPlan:
     ``index_of`` maps each label to its on-disk node index (the ``NN_``
     filename prefix); ``pending`` is the declared labels whose corpus file
     is not yet on disk (the ones a run still needs to generate, in node
-    order); ``scenarios`` is the locked domain list read back from
-    ``scenarios.json`` (``None`` on a fresh folder); ``added`` is the
-    labels appended to ``manifold.json`` this call (the add-nodes case);
+    order); ``added`` is the labels appended to ``manifold.json`` this call
+    (the add-nodes case);
     ``resumed`` is ``True`` when an existing ``manifold.json`` was found.
     """
 
     folder: Path
     index_of: dict[str, int]
     pending: tuple[str, ...]
-    scenarios: tuple[str, ...] | None
     added: tuple[str, ...]
     resumed: bool

@@ -105,11 +105,7 @@ A node corpus is now a list of conversational *responses* (`list[str]`) aligned 
 the shared A2 baseline user prompts — `response[i]` answers `baseline_prompt[i % k]`
 (`baseline_prompts_path`), so a corpus length must be a multiple of `k`. The shared
 baseline prompts are global (bundled `saklas/data/baseline_prompts.json`), not
-per-manifold, so the generation path no longer writes `scenarios.json` and no
-longer calls `write_manifold_scenarios`. Fresh discover authoring has no
-`scenarios=` parameter; only legacy vector-folder migration writes
-`scenarios.json` while porting old packs, and the standalone read/write helpers
-remain for compatibility tests and old folders.
+per-manifold.
 
 Authoring: `create_manifold_folder` (authored webui/HTTP path, returns `(folder,
 advisories)`), `create_discover_manifold_folder` (`sanitize_hyperparams` drops

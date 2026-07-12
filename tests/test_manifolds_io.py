@@ -30,12 +30,10 @@ from saklas.io.manifolds import (
     min_nodes,
     plan_discover_generation,
     preflight_transfer_manifold,
-    read_manifold_scenarios,
     refresh_manifold,
     remove_manifold_folder,
     transfer_manifold,
     update_manifold_folder,
-    write_manifold_scenarios,
 )
 
 
@@ -2866,11 +2864,6 @@ def test_init_and_append_discover_streaming(
     assert (folder / "nodes").is_dir()
     assert list((folder / "nodes").glob("*.json")) == []
 
-    write_manifold_scenarios(folder, ["work", "home"])
-    assert json.loads((folder / "scenarios.json").read_text()) == {
-        "scenarios": ["work", "home"]
-    }
-
     for i, label in enumerate(labels):
         append_discover_manifold_node(
             folder, i, label, [f"{label} one", f"{label} two"],
@@ -2936,7 +2929,6 @@ def test_plan_fresh_creates_skeleton_all_pending(tmp_path: Path):
     assert isinstance(plan, DiscoverGenerationPlan)
     assert not plan.resumed
     assert plan.pending == ("a", "b", "c")
-    assert plan.scenarios is None
     assert plan.added == ()
     assert plan.index_of == {"a": 0, "b": 1, "c": 2}
     assert (folder / "manifold.json").exists()
@@ -3020,14 +3012,12 @@ def test_plan_resume_reports_only_missing(tmp_path: Path):
     folder = tmp_path / "m"
     labels = ["a", "b", "c", "d"]
     plan = plan_discover_generation(folder, "m", "d", fit_mode="pca", labels=labels)
-    write_manifold_scenarios(folder, ["s1", "s2"])
     # Simulate a kill after 2 of 4 nodes.
     for lbl in ["a", "b"]:
         append_discover_manifold_node(folder, plan.index_of[lbl], lbl, [f"{lbl} one"])
     plan2 = plan_discover_generation(folder, "m", "d", fit_mode="pca", labels=labels)
     assert plan2.resumed
     assert plan2.pending == ("c", "d")           # only the missing ones
-    assert plan2.scenarios == ("s1", "s2")        # locked to the original domains
     assert plan2.added == ()
     assert plan2.index_of == {"a": 0, "b": 1, "c": 2, "d": 3}
 
@@ -3036,7 +3026,6 @@ def test_plan_add_nodes_extends_manifest(tmp_path: Path):
     folder = tmp_path / "m"
     labels = ["a", "b", "c"]
     plan = plan_discover_generation(folder, "m", "d", fit_mode="pca", labels=labels)
-    write_manifold_scenarios(folder, ["s1"])
     for lbl in labels:
         append_discover_manifold_node(folder, plan.index_of[lbl], lbl, [f"{lbl} x"])
     # Re-plan with a superset roster — add-nodes.
@@ -3046,7 +3035,6 @@ def test_plan_add_nodes_extends_manifest(tmp_path: Path):
     assert plan2.resumed
     assert plan2.added == ("d", "e")
     assert plan2.pending == ("d", "e")            # only the new labels
-    assert plan2.scenarios == ("s1",)             # locked
     mj = json.loads((folder / "manifold.json").read_text())
     assert [n["label"] for n in mj["nodes"]] == ["a", "b", "c", "d", "e"]
     for lbl in ["d", "e"]:
@@ -3081,14 +3069,6 @@ def test_plan_rejects_non_discover_existing(
         )
 
 
-def test_read_manifold_scenarios_roundtrip(tmp_path: Path):
-    folder = tmp_path / "m"
-    folder.mkdir()
-    assert read_manifold_scenarios(folder) is None
-    write_manifold_scenarios(folder, ["alpha", "beta"])
-    assert read_manifold_scenarios(folder) == ["alpha", "beta"]
-
-
 def test_bundled_materialization_helpers_ignore_non_json_payloads(tmp_path: Path) -> None:
     """Package-data materialization should not mirror local metadata files."""
     from saklas.io import manifolds as M
@@ -3096,7 +3076,7 @@ def test_bundled_materialization_helpers_ignore_non_json_payloads(tmp_path: Path
     pkg = tmp_path / "pkg"
     (pkg / "nodes").mkdir(parents=True)
     (pkg / "manifold.json").write_text('{"name": "m"}')
-    (pkg / "scenarios.json").write_text('{"scenarios": []}')
+    (pkg / "extra.json").write_text('{"extra": []}')
     (pkg / ".DS_Store").write_text("finder")
     (pkg / "README.txt").write_text("not package data")
     (pkg / "nodes" / "00_alpha.json").write_text('["a"]')
@@ -3107,7 +3087,7 @@ def test_bundled_materialization_helpers_ignore_non_json_payloads(tmp_path: Path
     M._copy_bundled_manifold_fresh(pkg, target)
 
     assert (target / "manifold.json").is_file()
-    assert (target / "scenarios.json").is_file()
+    assert not (target / "extra.json").exists()
     assert (target / "nodes" / "00_alpha.json").is_file()
     assert not (target / ".DS_Store").exists()
     assert not (target / "README.txt").exists()

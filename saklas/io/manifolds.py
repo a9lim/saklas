@@ -69,10 +69,8 @@ from saklas.io.manifold_authoring import (
     iter_manifold_folders,
     merge_discover_manifolds,
     plan_discover_generation,
-    read_manifold_scenarios,
     save_baked_manifold_tensor,
     update_manifold_folder,
-    write_manifold_scenarios,
 )
 
 # -- lifecycle / transfer / summary -------------------------------------
@@ -195,7 +193,7 @@ def _copy_bundled_manifold_fresh(pkg_root: Any, target: Path) -> None:
     """Fresh install of a bundled manifold — copy JSON payloads only."""
     target.mkdir(parents=True, exist_ok=True)
     for entry in pkg_root.iterdir():
-        if _is_bundled_json_file(entry):
+        if entry.is_file() and entry.name == "manifold.json":
             write_bytes_atomic(target / entry.name, entry.read_bytes())
         elif entry.is_dir() and entry.name == "nodes":
             nodes_dir = target / "nodes"
@@ -411,8 +409,6 @@ __all__ = [
     "save_baked_manifold_tensor",
     "init_discover_manifold_folder",
     "append_discover_manifold_node",
-    "write_manifold_scenarios",
-    "read_manifold_scenarios",
     "plan_discover_generation",
     "DiscoverGenerationPlan",
     "merge_discover_manifolds",

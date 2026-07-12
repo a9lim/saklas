@@ -738,24 +738,6 @@ def save_baked_manifold_tensor(
     return tensor_path
 
 
-@_lock_folder_arg
-def write_manifold_scenarios(folder: Path, scenarios: list[str]) -> None:
-    """Persist the shared scenario list to ``<folder>/scenarios.json``.
-
-    Discover-mode generation provenance — the domains the node corpora
-    were generated against — mirroring the ``{"scenarios": [...]}``
-    schema the discover pipeline writes.  The all-at-once
-    :func:`create_discover_manifold_folder` (via its ``scenarios`` kwarg)
-    routes through here; under 4.0 conversational generation the shared
-    baseline prompts are global, so generation no longer writes per-manifold
-    scenarios.
-    """
-    write_json_atomic(
-        folder / "scenarios.json",
-        {"scenarios": [str(s) for s in scenarios]},
-    )
-
-
 @_lock_namespace_name
 def init_discover_manifold_folder(
     namespace: str,
@@ -773,8 +755,7 @@ def init_discover_manifold_folder(
     Writes ``manifold.json`` (label-only nodes, empty ``files``
     manifest) and an empty ``nodes/`` dir, then returns the folder.
     Node corpora are written incrementally via
-    :func:`append_discover_manifold_node` (one file per completed node)
-    and the scenario provenance via :func:`write_manifold_scenarios` —
+    :func:`append_discover_manifold_node` (one file per completed node) —
     the streaming companion to :func:`create_discover_manifold_folder`
     for big-roster generation, where holding every corpus in memory at
     once is wasteful and a crash should keep the nodes already finished.
@@ -873,29 +854,6 @@ def append_discover_manifold_node(
     )
 
 
-def read_manifold_scenarios(folder: Path) -> list[str] | None:
-    """Return the persisted shared scenario list, or ``None`` if absent.
-
-    Reads the ``{"scenarios": [...]}`` provenance file
-    :func:`write_manifold_scenarios` writes; tolerates the richer
-    CLI/server shape (extra keys alongside ``"scenarios"``).  Returns
-    ``None`` when there is no ``scenarios.json`` or it carries no list —
-    the signal a streaming run uses to lock resumed/added nodes onto the
-    original domains.
-    """
-    p = Path(folder) / "scenarios.json"
-    if not p.exists():
-        return None
-    try:
-        data = json.loads(p.read_text())
-    except (json.JSONDecodeError, OSError):
-        return None
-    scn = data.get("scenarios") if isinstance(data, dict) else None
-    if not isinstance(scn, list):
-        return None
-    return [str(s) for s in scn]
-
-
 def _discover_manifest_payload(
     name: str,
     description: str,
@@ -956,9 +914,6 @@ def plan_discover_generation(
       ``pending`` the declared labels whose ``nodes/NN_<label>.json`` is
       absent — so a run killed half-way resumes the missing nodes instead
       of starting over.
-    - ``scenarios.json`` (when present) is read back into
-      ``plan.scenarios`` so the caller can lock the resumed/added nodes
-      onto the original domains rather than regenerating fresh ones.
     - ``force=True`` removes the prior folder and publishes the fresh skeleton
       in the same manifest transaction.
 
@@ -1034,7 +989,6 @@ def plan_discover_generation(
             folder=folder,
             index_of={label: i for i, label in enumerate(labels)},
             pending=tuple(labels),
-            scenarios=None,
             added=(),
             resumed=False,
         )
@@ -1106,12 +1060,10 @@ def plan_discover_generation(
         label for label in full_labels
         if not (nodes_dir / _node_filename(index_of[label], label)).exists()
     )
-    scn = read_manifold_scenarios(folder)
     return DiscoverGenerationPlan(
         folder=folder,
         index_of=index_of,
         pending=pending,
-        scenarios=tuple(scn) if scn is not None else None,
         added=tuple(new_labels),
         resumed=True,
     )

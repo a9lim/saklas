@@ -229,13 +229,12 @@ def _install_manifold(tmp_dir: Path, target_folder: Path, _coord: str) -> None:
       * ``nodes/NN_<label>.json`` corpus files under ``nodes/``
       * Optional per-model fitted ``<safe_model>.safetensors`` + ``.json``
         sidecars at the root
-      * Optional ``scenarios.json`` provenance file (discover-mode)
 
     Anything else at the snapshot root (README, .gitattributes, etc.) is
     skipped — those are HF-side artifacts, not part of the manifold
     format.
     """
-    _ALLOWED_ROOT = {"manifold.json", "scenarios.json"}
+    _ALLOWED_ROOT = {"manifold.json"}
     _ALLOWED_SUFFIXES = (".safetensors", ".json")
 
     for entry in sorted(tmp_dir.iterdir()):
@@ -447,13 +446,6 @@ def push_manifold(
                                 staging / "nodes" / child.name,
                                 child.read_bytes(),
                             )
-                # Optional discover-mode provenance file.
-                scen = folder / "scenarios.json"
-                if scen.is_file():
-                    write_bytes_atomic(
-                        staging / "scenarios.json", scen.read_bytes(),
-                    )
-
                 # Stage the fitted tensors that survive the model/variant
                 # filter, each with its sidecar.
                 from saklas.core.manifold import load_manifold
