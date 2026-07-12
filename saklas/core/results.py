@@ -170,7 +170,6 @@ class GenerationResult:
     token_count: int
     tok_per_sec: float
     elapsed: float
-    readings: dict[str, ProbeReadings] = field(default_factory=dict)
     # Active-steering coefficient map at generation time: term -> coefficient.
     steering_alphas: dict[str, float] = field(default_factory=dict)
     prompt_tokens: int = 0
@@ -212,7 +211,6 @@ class GenerationResult:
             "token_count": self.token_count,
             "tok_per_sec": self.tok_per_sec,
             "elapsed": self.elapsed,
-            "readings": {k: v.to_dict() for k, v in self.readings.items()},
             "steering_alphas": dict(self.steering_alphas),
             "prompt_tokens": self.prompt_tokens,
             "finish_reason": self.finish_reason,
@@ -354,24 +352,13 @@ class ResultCollector:
             "tok_per_sec": result.tok_per_sec,
             "elapsed": result.elapsed,
         }
-        for probe_name, readings in result.readings.items():
-            # Per-coordinate columns.  A rank-1 probe (every 2-node
-            # concept axis) keeps the bare ``probe_<name>_<stat>`` column
-            # so existing concept-roster exports are unchanged; a
-            # higher-rank probe suffixes the axis index.
-            stats = {
-                "mean": readings.mean,
-                "std": readings.std,
-                "min": readings.min,
-                "max": readings.max,
-                "delta": readings.delta_per_gen,
-            }
-            for stat_name, vec in stats.items():
-                if len(vec) == 1:
-                    row[f"probe_{probe_name}_{stat_name}"] = vec[0]
-                else:
-                    for k, val in enumerate(vec):
-                        row[f"probe_{probe_name}_{stat_name}_{k}"] = val
+        for probe_name, reading in result.probe_readings.items():
+            for axis, value in enumerate(reading.coords):
+                suffix = "" if len(reading.coords) == 1 else f"_{axis}"
+                row[f"probe_{probe_name}_coord{suffix}"] = value
+            row[f"probe_{probe_name}_fraction"] = reading.fraction
+            row[f"probe_{probe_name}_residual"] = reading.residual
+            row[f"probe_{probe_name}_membership"] = reading.membership
         for term_name, alpha in result.steering_alphas.items():
             row[f"steering_{term_name}_alpha"] = alpha
         row.update(tags)

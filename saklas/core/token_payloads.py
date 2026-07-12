@@ -15,7 +15,6 @@ class TokenProbePayload:
     """Probe-derived payloads for one generated token."""
 
     scores: dict[str, float] | None = None
-    readings: dict[str, ProbeReading] | None = None
     per_layer_scores: dict[str, dict[str, float]] | None = None
     probe_readings: dict[str, ProbeReading] | None = None
 
@@ -24,7 +23,6 @@ class TokenProbePayload:
     ) -> dict[str, Any]:
         return {
             "scores": self.scores,
-            "readings": self.readings,
             "per_layer_scores": self.per_layer_scores,
             "probe_readings": self.probe_readings,
             "lens": lens,
@@ -37,23 +35,19 @@ class TokenProbePayload:
         extra: dict[str, ProbeReading],
         *,
         per_layer: bool = False,
-        live: bool = False,
     ) -> None:
         """Merge additional per-probe readings (e.g. J-lens token probes,
         which score on the lens path rather than through the Monitor) into
-        every populated channel, mirroring the shaping the monitor readings
-        got in :func:`build_token_probe_payload`."""
+        the canonical rich channel and its derived scalar views."""
         if not extra:
             return
         self.scores = {**(self.scores or {}), **_axis0_scores(extra)}
-        self.readings = {**(self.readings or {}), **extra}
+        self.probe_readings = {**(self.probe_readings or {}), **extra}
         if per_layer:
             merged = dict(self.per_layer_scores or {})
             for layer, row in (_per_layer_axis0(extra) or {}).items():
                 merged[layer] = {**merged.get(layer, {}), **row}
             self.per_layer_scores = merged or None
-        if live:
-            self.probe_readings = {**(self.probe_readings or {}), **extra}
 
 
 def _axis0_scores(
@@ -84,7 +78,6 @@ def build_token_probe_payload(
     capture_state: Any,
     incremental_readings: list[dict[str, ProbeReading]],
     needs_scores: bool,
-    wants_live_token_scores: bool,
     persists_layer_scores: bool,
     assistant_node_id: str | None,
 ) -> TokenProbePayload:
@@ -121,11 +114,10 @@ def build_token_probe_payload(
 
     return TokenProbePayload(
         scores=_axis0_scores(readings),
-        readings=readings,
         per_layer_scores=(
             _per_layer_axis0(readings)
             if assistant_node_id is not None and persists_layer_scores
             else None
         ),
-        probe_readings=readings if wants_live_token_scores else None,
+        probe_readings=readings,
     )

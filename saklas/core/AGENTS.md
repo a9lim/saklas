@@ -1275,14 +1275,12 @@ context. Surfaced as `session.score_choices` / `session.score_template`.
 `ProbeReading`, `ResultCollector`. `RunSet` is the
 list-like multi-run shape (`node_ids`/`grid`/`.first`/`.to_collector()`/
 `.to_dataframe()`). `TokenEvent` carries `thinking`, `logprob`, `top_alts`,
-`finish_reason`, `perplexity`, `probe_readings` (per-probe `ProbeReading`s — the
-full readings, live-stream-gated), and — while the live lens is on —
+`finish_reason`, `perplexity`, `probe_readings` (per-probe `ProbeReading`s), and
+— while the live lens is on —
 `lens_readout` (per-layer top-k) + `lens_aggregate` (the layer-aggregated
-`[(token, strength, com, spread)]` chip list); `scores` is a read-only
-back-compat property
-alias for `probe_readings`. `GenerationResult`
-carries `prompt_tokens`, `finish_reason`, optional `logprobs`, `readings`
-(per-probe `ProbeReadings`), `probe_readings`, and `applied_steering` (the
+`[(token, strength, com, spread)]` chip list). `GenerationResult`
+carries `prompt_tokens`, `finish_reason`, optional `logprobs`,
+`probe_readings`, and `applied_steering` (the
 canonical expression, round-trips through `parse_expr`). `ProbeReading`
 (`coords`/`fraction`/`nearest`/`residual` + `assignment`/`membership` +
 `fraction_per_layer`/`coords_per_layer`/`residual_per_layer` +
@@ -1297,9 +1295,9 @@ depths `layer/(n_layers−1)` — computed at both monitor assembly sites
 (`monitor.py::_depth_stats`); empty when the reading has no per-layer trace
 (lean modes) or the `Monitor` wasn't given `n_layers`. Every field is populated for flat and curved fits alike;
 `residual` is `0` for a flat fit (the surface fills its subspace) and the
-normalized off-surface distance for a curved fit. `ProbeReadings` is vectorized per
-coordinate axis (`mean`/`std`/`min`/`max`/`delta_per_gen` are `tuple[float,...]`,
-`per_generation` a list of coord tuples). `to_dict()` omits `hidden_states`.
+normalized off-surface distance for a curved fit. `ProbeReadings` remains an
+explicit multi-run summary shape for notebook plots; it is not embedded in a
+generation result. `to_dict()` omits `hidden_states`.
 
 ## histogram.py
 

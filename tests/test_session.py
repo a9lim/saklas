@@ -166,7 +166,7 @@ class TestGeneration:
         session.clear_history()
         result = session.generate("Tell me something exciting!").first
         if session.probes:
-            assert isinstance(result.readings, dict)
+            assert isinstance(result.probe_readings, dict)
 
     def test_last_result(self, session: SaklasSession) -> None:
         session.clear_history()

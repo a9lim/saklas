@@ -33,13 +33,11 @@ def test_build_token_probe_payload_scores_once_and_shapes_channels() -> None:
         capture_state=capture_state,
         incremental_readings=[],
         needs_scores=True,
-        wants_live_token_scores=True,
         persists_layer_scores=True,
         assistant_node_id="node-1",
     )
 
     assert payload.scores == {"toy": pytest.approx(0.25)}
-    assert payload.readings == {"toy": reading}
     assert payload.probe_readings == {"toy": reading}
     assert payload.per_layer_scores == {"3": {"toy": pytest.approx(0.25)}}
     assert payload.to_token_payload(lens={"3": [("tok", 1.0)]})["lens"] == {
@@ -63,11 +61,9 @@ def test_build_token_probe_payload_reuses_incremental_reading() -> None:
         capture_state=SimpleNamespace(incremental=True, lean=False),
         incremental_readings=[{"toy": reading}],
         needs_scores=True,
-        wants_live_token_scores=False,
         persists_layer_scores=False,
         assistant_node_id="node-1",
     )
 
     assert payload.scores == {"toy": pytest.approx(0.75)}
-    assert payload.readings == {"toy": reading}
-    assert payload.probe_readings is None
+    assert payload.probe_readings == {"toy": reading}

@@ -93,14 +93,14 @@ def build_token_event(
                 event["per_layer_scores"] = fallback_per_layer_blob
 
     # Rich channel: the full per-probe reading (coords + fraction + nearest)
-    # for the latest token.  ``readings`` and ``probe_readings`` in the payload
-    # are the *same* unified per-probe dict — the token tap is the single owner
+    # for the latest token. ``probe_readings`` is the unified per-probe dict;
+    # the token tap is the single owner
     # of live probe scoring, so event shaping never reaches into private capture
     # buffers or re-scores the token on the WebSocket path.
     with suppress(Exception):
         readings = None
         if payload is not None:
-            readings = payload.get("readings") or payload.get("probe_readings")
+            readings = payload.get("probe_readings")
         if readings:
             event["probe_readings"] = {
                 name: r.to_dict() for name, r in readings.items()

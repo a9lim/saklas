@@ -44,18 +44,8 @@ def register_experiment_routes(app: FastAPI) -> None:
         rows = []
         for idx, result in enumerate(runset):
             readings_summary: dict[str, float] = {}
-            for probe_name, reading in (
-                getattr(result, "readings", {}) or {}
-            ).items():
-                # ``per_generation`` samples and ``mean`` are per-axis
-                # coordinate tuples now; the scalar summary reads axis 0.
-                per_generation = getattr(reading, "per_generation", None)
-                sample = (
-                    per_generation[-1]
-                    if per_generation
-                    else getattr(reading, "mean", None)
-                )
-                value = sample[0] if sample else 0.0
+            for probe_name, reading in result.probe_readings.items():
+                value = reading.coords[0] if reading.coords else 0.0
                 readings_summary[probe_name] = round(float(value), 6)
             rows.append({
                 "idx": idx,

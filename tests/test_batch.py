@@ -37,7 +37,6 @@ def _make_result(text: str, applied: str | None = None) -> GenerationResult:
         token_count=3,
         tok_per_sec=50.0,
         elapsed=0.06,
-        readings={},
         steering_alphas={},
         prompt_tokens=4,
         finish_reason="stop",
@@ -415,11 +414,6 @@ class TestGenerateBatch:
             (30.0,),
             (100.0,),
         ]
-        assert [r.readings["mood"].mean for r in runset] == [
-            (2.0,),
-            (30.0,),
-            (100.0,),
-        ]
         assert cast(Any, s._monitor).scored == [2.0, 30.0, 100.0]
 
     def test_probe_batch_fast_path_honors_return_probe_readings_false(self) -> None:
@@ -440,7 +434,6 @@ class TestGenerateBatch:
 
         assert len(model.calls) == 1
         assert [r.tokens for r in runset] == [[10, 11], [12, 13, 14], [15]]
-        assert [r.readings for r in runset] == [{}, {}, {}]
         assert [r.probe_readings for r in runset] == [{}, {}, {}]
         assert cast(Any, s._monitor).scored == []
 
@@ -475,7 +468,6 @@ class TestGenerateBatch:
             (30.0,),
             (100.0,),
         ]
-        assert [r.readings for r in runset] == [{}, {}, {}]
 
     def test_sae_readout_probe_batch_fast_path_honors_return_probe_readings_false(self) -> None:
         from saklas.core.sampling import SamplingConfig
@@ -504,7 +496,6 @@ class TestGenerateBatch:
         )
 
         assert len(model.calls) == 1
-        assert [r.readings for r in runset] == [{}, {}, {}]
         assert [r.probe_readings for r in runset] == [{}, {}, {}]
 
     def test_lens_readout_probe_batch_fast_path_scores_per_row_aggregate(self) -> None:
@@ -537,7 +528,6 @@ class TestGenerateBatch:
             (30.0,),
             (100.0,),
         ]
-        assert [r.readings for r in runset] == [{}, {}, {}]
 
     def test_lens_readout_probe_batch_fast_path_honors_return_probe_readings_false(self) -> None:
         from saklas.core.sampling import SamplingConfig
@@ -565,7 +555,6 @@ class TestGenerateBatch:
         )
 
         assert len(model.calls) == 1
-        assert [r.readings for r in runset] == [{}, {}, {}]
         assert [r.probe_readings for r in runset] == [{}, {}, {}]
 
     def test_deterministic_fan_uses_batched_generation(self) -> None:
@@ -605,7 +594,6 @@ class TestGenerateBatch:
 
         assert len(model.calls) == 1
         assert runset.kind == "fan"
-        assert [r.readings for r in runset] == [{}, {}, {}]
         assert [r.probe_readings for r in runset] == [{}, {}, {}]
         assert cast(Any, s._monitor).scored == []
 

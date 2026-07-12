@@ -67,7 +67,6 @@ from saklas.core.profile import Profile, load_profile as _load_profile
 from saklas.core.results import (
     GenerationResult,
     ProbeReading,
-    ProbeReadings,
     RunSet,
     TokenEvent,
 )
@@ -7744,56 +7743,6 @@ class SaklasSession:
         )
         return ids.to(self._device) if to_device else ids
 
-    def build_readings(self) -> dict[str, ProbeReadings]:
-        """Per-probe cross-generation :class:`ProbeReadings`, per coordinate axis."""
-        readings: dict[str, ProbeReadings] = {}
-        if not self._monitor.probe_names:
-            return readings
-        for name in self._monitor.probe_names:
-            stats = self._monitor.get_stats(name)
-            count = stats["count"]
-            if count == 0:
-                continue
-            # Per-axis accumulators (axis 0 falls back to the scalar stats
-            # for a degenerate probe with no axis record).
-            axes = self._monitor.axis_stats(name) or [stats]
-            R = len(axes)
-            hist = [tuple(float(c) for c in coords)
-                    for coords in self._monitor.history.get(name, [])]
-            # An empty reading is accumulated as the rank-1 ``(0.0,)`` fallback
-            # (monitor ``_apply_accumulate``), while ``axes`` grows to the max
-            # rank a probe ever saw — so a probe that yields both an empty and a
-            # full reading leaves ``hist`` ragged.  Pad short rows to ``R`` (zeros
-            # match the axis-0 empty fallback) so the per-axis delta never
-            # over-indexes and ``per_generation`` stays uniform-width.
-            if any(len(row) < R for row in hist):
-                hist = [row + (0.0,) * (R - len(row)) if len(row) < R else row
-                        for row in hist]
-            means = tuple(a["sum"] / count for a in axes)
-            stds = tuple(
-                max(0.0, a["sum_sq"] / count - (a["sum"] / count) ** 2) ** 0.5
-                for a in axes
-            )
-            mins = tuple(
-                a["min"] if a["min"] != float("inf") else 0.0 for a in axes
-            )
-            maxs = tuple(
-                a["max"] if a["max"] != float("-inf") else 0.0 for a in axes
-            )
-            if len(hist) >= 2:
-                delta = tuple(
-                    sum(abs(hist[i][k] - hist[i - 1][k])
-                        for i in range(1, len(hist))) / (len(hist) - 1)
-                    for k in range(R)
-                )
-            else:
-                delta = tuple(0.0 for _ in range(R))
-            readings[name] = ProbeReadings(
-                per_generation=hist, mean=means, std=stds,
-                min=mins, max=maxs, delta_per_gen=delta,
-            )
-        return readings
-
     def _finalize_generation(
         self, generated_ids: list[int], elapsed: float,
         vector_snapshot: dict[str, float], prompt_tokens: int = 0,
@@ -8468,7 +8417,6 @@ class SaklasSession:
                         capture_state=self._capture_state,
                         incremental_readings=self._incremental_readings,
                         needs_scores=needs_scores,
-                        wants_live_token_scores=_wants_live_token_scores,
                         persists_layer_scores=_persists_layer_scores,
                         assistant_node_id=assistant_node_id,
                     )
@@ -8501,7 +8449,6 @@ class SaklasSession:
                             assistant_node_id is not None
                             and _persists_layer_scores
                         ),
-                        live=_wants_live_token_scores,
                     )
                 if sae_step is not None and self._last_sae_step_readings:
                     if payload is None:
@@ -8512,7 +8459,6 @@ class SaklasSession:
                             assistant_node_id is not None
                             and _persists_layer_scores
                         ),
-                        live=_wants_live_token_scores,
                     )
                 scores = payload.scores if payload is not None else None
                 per_layer_payload = (
@@ -8530,7 +8476,6 @@ class SaklasSession:
                         payload is not None
                         and (
                             payload.scores
-                            or payload.readings
                             or payload.per_layer_scores
                             or payload.probe_readings
                         )
@@ -9170,7 +9115,7 @@ class SaklasSession:
                 or getattr(self, "_lens_probes", None)
                 or getattr(self, "_sae_probes", None)
             ):
-                raw_readings = payload.get("readings")
+                raw_readings = payload.get("probe_readings")
                 if isinstance(raw_readings, dict) and raw_readings:
                     probe_readings = raw_readings
                     # ``update_live`` folds coordinate axis 0 of each reading
@@ -9352,25 +9297,6 @@ class SaklasSession:
             on_result=on_result,
         )
 
-    @staticmethod
-    def _stateless_readings_from_probe_aggregate(
-        agg_vals: dict[str, ProbeReading],
-    ) -> dict[str, ProbeReadings]:
-        """Stateless ``GenerationResult.readings`` from one aggregate row."""
-        readings: dict[str, ProbeReadings] = {}
-        for name, reading in agg_vals.items():
-            coords = reading.coords or (0.0,)
-            zeros = tuple(0.0 for _ in coords)
-            readings[name] = ProbeReadings(
-                per_generation=[coords],
-                mean=coords,
-                std=zeros,
-                min=coords,
-                max=coords,
-                delta_per_gen=zeros,
-            )
-        return readings
-
     def _finalize_batch_probe_result(
         self,
         *,
@@ -9381,7 +9307,6 @@ class SaklasSession:
         finish_reason: str,
         applied_steering: str | None,
         probe_readings: dict[str, ProbeReading],
-        reading_probe_readings: dict[str, ProbeReading] | None = None,
     ) -> GenerationResult:
         """Build a stateless batch result with pre-scored probe aggregates."""
         token_count = len(generated_ids)
@@ -9390,18 +9315,12 @@ class SaklasSession:
         )
         decoded = self._tokenizer.decode(generated_ids, skip_special_tokens=True)
         text = decoded if isinstance(decoded, str) else decoded[0]
-        readings = self._stateless_readings_from_probe_aggregate(
-            probe_readings
-            if reading_probe_readings is None
-            else reading_probe_readings
-        )
         result = GenerationResult(
             text=text,
             tokens=list(generated_ids),
             token_count=token_count,
             tok_per_sec=tok_per_sec,
             elapsed=elapsed,
-            readings=readings,
             steering_alphas=vector_snapshot,
             prompt_tokens=prompt_tokens,
             finish_reason=finish_reason,
@@ -9412,10 +9331,10 @@ class SaklasSession:
         )
         self._last_result = result
         self._last_per_token_scores = None
-        if readings:
+        if probe_readings:
             scalar_readings = {
-                name: (reading.mean[0] if reading.mean else 0.0)
-                for name, reading in readings.items()
+                name: (reading.coords[0] if reading.coords else 0.0)
+                for name, reading in probe_readings.items()
             }
             self.events.emit(ProbeScored(readings=scalar_readings))
         return result
@@ -9773,11 +9692,6 @@ class SaklasSession:
                     probe_readings.update(
                         self._batch_readout_probe_aggregate_for_row(pooled)
                     )
-                    monitor_readings = {
-                        name: probe_readings[name]
-                        for name in probe_names
-                        if name in probe_readings
-                    }
                     result = self._finalize_batch_probe_result(
                         generated_ids=generated_ids,
                         elapsed=elapsed,
@@ -9786,7 +9700,6 @@ class SaklasSession:
                         finish_reason=finish_reason,
                         applied_steering=applied_steering,
                         probe_readings=probe_readings,
-                        reading_probe_readings=monitor_readings,
                     )
                 else:
                     result = self._finalize_generation(

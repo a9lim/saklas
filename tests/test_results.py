@@ -54,27 +54,24 @@ class TestGenerationResult:
     def test_to_dict_no_probes(self):
         result = GenerationResult(
             text="Hello world", tokens=[1, 2, 3], token_count=3,
-            tok_per_sec=10.0, elapsed=0.3, readings={},
+            tok_per_sec=10.0, elapsed=0.3,
             steering_alphas={"happy": 1.5},
         )
         d = result.to_dict()
         assert d["text"] == "Hello world"
         assert d["tokens"] == [1, 2, 3]
-        assert d["readings"] == {}
+        assert d["probe_readings"] == {}
         assert d["steering_alphas"] == {"happy": 1.5}
 
     def test_to_dict_with_probes(self):
-        readings = ProbeReadings(
-            per_generation=[(0.5,)],
-            mean=(0.5,), std=(0.0,), min=(0.5,), max=(0.5,), delta_per_gen=(0.0,),
-        )
+        reading = ProbeReading(fraction=0.8, nearest=[], coords=(0.5,))
         result = GenerationResult(
             text="Hi", tokens=[1], token_count=1, tok_per_sec=5.0, elapsed=0.2,
-            readings={"honest": readings}, steering_alphas={},
+            probe_readings={"honest": reading}, steering_alphas={},
         )
         d = result.to_dict()
-        assert "honest" in d["readings"]
-        assert isinstance(d["readings"]["honest"], dict)
+        assert "honest" in d["probe_readings"]
+        assert isinstance(d["probe_readings"]["honest"], dict)
 
     def test_applied_steering_default_none(self):
         """Default value is ``None`` — no steering was active."""
@@ -155,7 +152,7 @@ class TestResultCollector:
     def _make_result(self, text: str = "Hello", alpha: float = 1.0) -> GenerationResult:
         return GenerationResult(
             text=text, tokens=[1, 2], token_count=2,
-            tok_per_sec=10.0, elapsed=0.2, readings={},
+            tok_per_sec=10.0, elapsed=0.2,
             steering_alphas={"happy": alpha},
         )
 
@@ -169,21 +166,16 @@ class TestResultCollector:
         assert dicts[0]["steering_happy_alpha"] == 1.0
 
     def test_probe_readings_flattened(self):
-        readings = ProbeReadings(
-            per_generation=[(0.5,)],
-            mean=(0.5,), std=(0.0,), min=(0.5,), max=(0.5,), delta_per_gen=(0.0,),
-        )
+        reading = ProbeReading(fraction=0.8, nearest=[], coords=(0.5,))
         result = GenerationResult(
             text="Hi", tokens=[1], token_count=1, tok_per_sec=5.0, elapsed=0.2,
-            readings={"honest": readings}, steering_alphas={},
+            probe_readings={"honest": reading}, steering_alphas={},
         )
         collector = ResultCollector()
         collector.add(result)
         d = collector.results[0]
-        assert d["probe_honest_mean"] == 0.5
-        assert d["probe_honest_std"] == 0.0
-        assert d["probe_honest_min"] == 0.5
-        assert d["probe_honest_max"] == 0.5
+        assert d["probe_honest_coord"] == 0.5
+        assert d["probe_honest_fraction"] == 0.8
 
     def test_to_jsonl(self):
         collector = ResultCollector()
@@ -251,7 +243,7 @@ class TestRunSet:
     def _make_result(self, text: str = "Hello") -> GenerationResult:
         return GenerationResult(
             text=text, tokens=[1, 2], token_count=2,
-            tok_per_sec=10.0, elapsed=0.2, readings={}, steering_alphas={},
+            tok_per_sec=10.0, elapsed=0.2, steering_alphas={},
         )
 
     def test_single_run_uses_explicit_first(self):

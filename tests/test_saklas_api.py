@@ -844,23 +844,16 @@ class TestTraitsStream:
 
     def test_event_ordering_start_token_done(self):
         """Events are serialized correctly: start → token → done."""
-        from saklas.core.results import ProbeReadings
+        from saklas.core.results import ProbeReading
 
         # Test the serialization logic directly rather than fighting TestClient
         # SSE streaming semantics. Build the events as they'd arrive on the
         # trait queue and verify the JSON output format.
         readings = {
-            "probe_a": ProbeReadings(
-                per_generation=[(0.42,)],
-                mean=(0.30,),
-                std=(0.1,),
-                min=(0.2,),
-                max=(0.42,),
-                delta_per_gen=(0.12,),
-            )
+            "probe_a": ProbeReading(fraction=0.2, nearest=[], coords=(0.30,))
         }
         fake_result = MagicMock()
-        fake_result.readings = readings
+        fake_result.probe_readings = readings
         fake_result.finish_reason = "stop"
 
         # Simulate the tagged tuple protocol.
@@ -889,13 +882,10 @@ class TestTraitsStream:
             elif tag == "done":
                 result = item[1]
                 agg = {}
-                rd = getattr(result, "readings", None)
+                rd = getattr(result, "probe_readings", None)
                 if rd:
                     for name, r in rd.items():
-                        pg = getattr(r, "per_generation", None)
-                        val = pg[-1] if pg else getattr(r, "mean", 0.0)
-                        if isinstance(val, tuple):
-                            val = val[0] if val else 0.0
+                        val = r.coords[0] if r.coords else 0.0
                         agg[name] = round(val, 6)
                 output_lines.append(json.dumps({
                     "type": "done", "generation_id": generation_id,
@@ -913,8 +903,7 @@ class TestTraitsStream:
         assert parsed[2]["type"] == "token"
         assert parsed[2]["idx"] == 1
         assert parsed[3]["type"] == "done"
-        # Key assertion: aggregate uses per_generation[-1] (0.42), not mean (0.30)
-        assert parsed[3]["aggregate"]["probe_a"] == 0.42
+        assert parsed[3]["aggregate"]["probe_a"] == 0.30
         assert parsed[3]["finish_reason"] == "stop"
 
     def test_multiple_queues_receive_same_event(self):

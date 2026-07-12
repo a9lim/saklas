@@ -195,8 +195,8 @@ class Monitor:
 
         # Per-coordinate history + summary stats.  ``history`` holds the
         # per-generation aggregate coordinate tuple; ``_stats`` is axis-0
-        # scalar stats (TUI compat) plus the per-axis accumulators the
-        # session reads for the vectorized ``ProbeReadings``.
+        # scalar stats (TUI compat). Rich result payloads use the pooled
+        # ``ProbeReading`` directly rather than synthesizing a second summary.
         self.history: dict[str, deque[tuple[float, ...]]] = {
             n: deque(maxlen=_MAX_HISTORY) for n in self._probes
         }
@@ -1668,12 +1668,10 @@ class Monitor:
     def _apply_accumulate(
         self, readings: dict[str, ProbeReading],
     ) -> None:
-        """Fold per-probe aggregate coords into history + per-axis stats.
+        """Fold per-probe aggregate coords into monitor history and stats.
 
-        ``history`` stores the full coordinate tuple; ``_stats`` keeps
-        axis-0 scalar accumulators (TUI compat) plus per-axis ``sum`` /
-        ``sum_sq`` / ``min`` / ``max`` lists for the session's vectorized
-        :class:`ProbeReadings`.
+        ``history`` stores recent full coordinate tuples; ``_stats`` keeps
+        lifetime axis-0 scalar accumulators for monitor diagnostics.
         """
         for name, reading in readings.items():
             if name not in self.history:
@@ -1689,19 +1687,6 @@ class Monitor:
                 s["min"] = v0
             if v0 > s["max"]:
                 s["max"] = v0
-            # Per-axis accumulators (lazily sized to the coord rank).
-            axes = s.setdefault("axes", [])
-            for i, v in enumerate(coords):
-                if i >= len(axes):
-                    axes.append({"sum": 0.0, "sum_sq": 0.0,
-                                 "min": float("inf"), "max": float("-inf")})
-                a = axes[i]
-                a["sum"] += v
-                a["sum_sq"] += v * v
-                if v < a["min"]:
-                    a["min"] = v
-                if v > a["max"]:
-                    a["max"] = v
         self._pending_aggregate = True
 
     def accumulate_readings(
@@ -2006,15 +1991,6 @@ class Monitor:
 
     def get_stats(self, name: str) -> dict[str, Any]:
         return self._stats.get(name, self._empty_stats())
-
-    def axis_stats(self, name: str) -> list[dict[str, Any]]:
-        """Per-coordinate-axis accumulators for the vectorized readings.
-
-        ``[{sum, sum_sq, min, max}, ...]`` aligned with the coordinate
-        axes; empty until the probe has accumulated a reading.  The
-        session reads this for the per-axis :class:`ProbeReadings`.
-        """
-        return self._stats.get(name, {}).get("axes", [])
 
     def get_sparkline(self, name: str) -> str:
         blocks = " ▁▂▃▄▅▆▇█"

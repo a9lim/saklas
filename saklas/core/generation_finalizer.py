@@ -7,7 +7,7 @@ from typing import Any
 import torch
 
 from saklas.core.events import ProbeScored
-from saklas.core.results import GenerationResult, ProbeReading, ProbeReadings
+from saklas.core.results import GenerationResult, ProbeReading
 
 
 def finalize_generation(
@@ -132,20 +132,8 @@ def finalize_generation(
             else:
                 agg_vals, per_token = {}, {}
         session._last_per_token_scores = per_token or None
-        if stateless:
-            readings = {}
-            for name, reading in agg_vals.items():
-                coords = reading.coords or (0.0,)
-                zeros = tuple(0.0 for _ in coords)
-                readings[name] = ProbeReadings(
-                    per_generation=[coords], mean=coords, std=zeros,
-                    min=coords, max=coords, delta_per_gen=zeros,
-                )
-        else:
-            readings = session.build_readings()
     else:
         session._last_per_token_scores = None
-        readings = {} if stateless else session.build_readings()
 
     hidden_states: dict[int, torch.Tensor] | None = None
     if return_hidden and generated_ids and captured_stack:
@@ -191,7 +179,7 @@ def finalize_generation(
     result = GenerationResult(
         text=text, tokens=list(generated_ids), token_count=token_count,
         tok_per_sec=tok_per_sec, elapsed=elapsed,
-        readings=readings, steering_alphas=vector_snapshot,
+        steering_alphas=vector_snapshot,
         prompt_tokens=prompt_tokens,
         finish_reason=session._gen_state.finish_reason,
         logprobs=logprobs_list,
@@ -201,10 +189,10 @@ def finalize_generation(
     )
     session._last_result = result
 
-    if readings:
+    if manifold_aggregates:
         scalar_readings = {
-            name: (reading.mean[0] if reading.mean else 0.0)
-            for name, reading in readings.items()
+            name: (reading.coords[0] if reading.coords else 0.0)
+            for name, reading in manifold_aggregates.items()
         }
         session.events.emit(ProbeScored(readings=scalar_readings))
 
@@ -232,8 +220,8 @@ def finalize_generation(
             assistant_node_id,
             text=text,
             aggregate_readings={
-                name: (reading.mean[0] if reading.mean else 0.0)
-                for name, reading in readings.items()
+                name: (reading.coords[0] if reading.coords else 0.0)
+                for name, reading in manifold_aggregates.items()
             },
             applied_steering=applied_steering,
             finish_reason=session._gen_state.finish_reason,

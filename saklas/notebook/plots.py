@@ -113,7 +113,7 @@ def plot_alpha_sweep(
     The alpha column is auto-detected when not specified — see
     :func:`_detect_alpha_column` for the rule.
 
-    Probe traces (left axis) are drawn for every ``probe_<name>_mean``
+    Probe traces (left axis) are drawn for every ``probe_<name>_coord``
     column on the DataFrame; one line per probe, sorted by name.  The
     secondary metric (right axis) defaults to ``tok_per_sec``; pass any
     other column name on your DataFrame (e.g. ``perplexity`` if you
@@ -134,12 +134,15 @@ def plot_alpha_sweep(
     alpha_col = alpha_column or _detect_alpha_column(df)
     df = df.sort_values(alpha_col).reset_index(drop=True)
 
-    probe_cols = sorted(c for c in df.columns if c.startswith("probe_") and c.endswith("_mean"))
+    probe_cols = sorted(
+        c for c in df.columns
+        if c.startswith("probe_") and c.endswith("_coord")
+    )
 
     fig = go.Figure()
     for col in probe_cols:
-        # "probe_<name>_mean" → "<name>" — strip the prefix/suffix exactly.
-        probe_name = col[len("probe_"):-len("_mean")]
+        # "probe_<name>_coord" → "<name>" — strip prefix/suffix exactly.
+        probe_name = col[len("probe_"):-len("_coord")]
         fig.add_trace(go.Scatter(
             x=df[alpha_col],
             y=df[col],

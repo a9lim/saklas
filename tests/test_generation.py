@@ -276,7 +276,6 @@ def test_stop_sequence_probe_aggregate_uses_visible_endpoint():
 
     assert result.text == "Hello"
     assert result.probe_readings == {"toy": visible}
-    assert result.readings["toy"].mean == (0.25,)
 
 
 def test_stop_sequence_only_tap_can_skip_full_token_table():
@@ -379,7 +378,6 @@ def test_finalize_reuses_scored_probe_aggregate() -> None:
 
     assert capture.calls == 1
     assert result.probe_readings == {"toy": reading}
-    assert result.readings["toy"].mean == (0.25,)
     assert session._last_per_token_scores == {"toy": [0.1, 0.25]}
 
 
@@ -418,7 +416,7 @@ def test_generate_stream_live_readouts_false_suppresses_readout_flags() -> None:
         flags["lens"] = bool(getattr(on_token, "_saklas_wants_lens_readout"))
         flags["sae"] = bool(getattr(on_token, "_saklas_wants_sae_readout"))
         session._last_token_probe_payload = {
-            "readings": {"sae/0": reading},
+                "probe_readings": {"sae/0": reading},
             "lens": {1: [("tok", 0.5)]},
             "lens_aggregate": [("tok", 0.5, 0.5, 0.0)],
             "sae": [(0, 1.0, None, None)],
@@ -636,7 +634,6 @@ def test_finalize_incremental_probe_path_does_not_stack_capture() -> None:
     )
 
     assert result.probe_readings == {"toy": reading1}
-    assert result.readings["toy"].mean == (0.25,)
     assert session._last_per_token_scores == {"toy": [0.1, 0.25]}
 
 
@@ -1132,7 +1129,6 @@ def test_stateless_zero_token_probe_result_does_not_use_history() -> None:
         stateless=True,
     )
 
-    assert result.readings == {}
     assert result.probe_readings == {}
     assert session._last_per_token_scores is None
 
@@ -1178,7 +1174,6 @@ def test_return_probe_readings_false_skips_probe_finalization() -> None:
         return_probe_readings=False,
     )
 
-    assert result.readings == {}
     assert result.probe_readings == {}
 
 

@@ -89,39 +89,15 @@ def register_traits_routes(app: FastAPI) -> None:
                     elif tag == "done":
                         result = item[1]
                         aggregate: dict[str, float] = {}
-                        # Additive rich channel: the full per-probe coordinate
-                        # reading (every axis + per-generation samples) so a
-                        # native client can read coordinates without the
-                        # wire-stable ``aggregate`` (axis-0) shape changing.
                         probe_readings: dict[str, Any] = {}
                         if result is not None:
-                            readings = getattr(result, "readings", None)
-                            if readings:
-                                for name, reading in readings.items():
-                                    per_generation = getattr(
-                                        reading, "per_generation", None,
-                                    )
-                                    # ``per_generation`` samples and ``mean``
-                                    # are per-axis coordinate tuples now; the
-                                    # scalar ``aggregate`` reads axis 0.
-                                    sample = (
-                                        per_generation[-1]
-                                        if per_generation
-                                        else getattr(reading, "mean", None)
-                                    )
-                                    value = (
-                                        sample[0]
-                                        if sample
-                                        else 0.0
-                                    )
-                                    aggregate[name] = round(float(value), 6)
-                                    with suppress(Exception):
-                                        probe_readings[name] = reading.to_dict()
                             mf_readings = getattr(
                                 result, "probe_readings", None,
                             )
                             if mf_readings:
                                 for name, agg in mf_readings.items():
+                                    value = agg.coords[0] if agg.coords else 0.0
+                                    aggregate[name] = round(float(value), 6)
                                     with suppress(Exception):
                                         probe_readings[name] = agg.to_dict()
                         payload = {
