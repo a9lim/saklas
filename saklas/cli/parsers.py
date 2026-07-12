@@ -269,7 +269,7 @@ def _build_vector_extract(p: argparse.ArgumentParser) -> None:
              "(e.g. 'pirate'), so the fit lives in role-baselined activation "
              "space. The role bakes into the generated node corpora and the "
              "fit writes the canonical tensor (there is no separate "
-             "``_role-<slug>`` file, and cross-session ``:role-<slug>`` "
+             "canonical tensor, and cross-session ``:role-<slug>`` "
              "selection isn't wired up yet). Slug must match ``[a-z0-9._-]+``. "
              "Mutually exclusive with ``--sae``. Mistral-3 families don't "
              "carry a substitutable role label and raise at runtime.",

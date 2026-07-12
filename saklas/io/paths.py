@@ -14,22 +14,19 @@ from pathlib import Path
 #   raw (DiM)           -> ``<safe_model_id>.safetensors``
 #   SAE-DiM             -> ``<safe_model_id>_sae-<release>.safetensors``
 #   transferred (v1.6)  -> ``<safe_model_id>_from-<safe_src>.safetensors``
-#   role                -> ``<safe_model_id>_role-<name>.safetensors``
 #
-# The literals ``_sae-``, ``_from-``, and ``_role-`` are the *kind*
+# The literals ``_sae-`` and ``_from-`` are the *kind*
 # separators. Model ids and right-hand-side slugs can legally contain those
 # literals, so filename components escape them before concatenation and the
 # parser splits at the earliest unescaped kind separator.
 # Difference-of-means is the only extraction method (4.0), so the raw
 # tensor carries no method suffix.  Kind suffixes are mutually exclusive
-# — a tensor is at most one of {SAE, transferred, role}.
+# — a tensor is at most one of {SAE, transferred}.
 _VARIANT_SEP_SAE = "_sae-"
 _VARIANT_SEP_FROM = "_from-"
-_VARIANT_SEP_ROLE = "_role-"
 _VARIANT_SEPARATORS: tuple[tuple[str, str], ...] = (
     (_VARIANT_SEP_SAE, "sae"),
     (_VARIANT_SEP_FROM, "from"),
-    (_VARIANT_SEP_ROLE, "role"),
 )
 _UNSAFE_VARIANT_CHARS = re.compile(r"[^a-z0-9._-]+")
 
@@ -200,37 +197,18 @@ def safe_from_suffix(source_safe_id: str | None) -> str:
     return f"{_VARIANT_SEP_FROM}{slug}"
 
 
-def safe_role_suffix(role_name: str | None) -> str:
-    """Filename suffix for a role variant.  ``None``/``""`` = raw (no suffix).
-
-    The role name is slugified with the same ``[a-z0-9._-]`` discipline
-    as :func:`safe_sae_suffix` — lowercased, unsafe characters collapsed
-    to ``_`` — so the parse is unambiguous against neighbouring kind
-    separators.  ``parse_tensor_filename`` splits on the literal ``_role-``
-    separator, so inner hyphens/dots round-trip.
-    """
-    if not role_name:
-        return ""
-    slug = _encode_tensor_component(
-        _UNSAFE_VARIANT_CHARS.sub("_", role_name.lower()),
-    )
-    return f"{_VARIANT_SEP_ROLE}{slug}"
-
-
 def tensor_filename(
     model_id: str,
     *,
     release: str | None = None,
     transferred_from: str | None = None,
-    role: str | None = None,
     model_id_is_safe: bool = False,
     transferred_from_is_safe: bool = False,
 ) -> str:
     """Construct the canonical tensor filename.
 
-    At most one of ``release``, ``transferred_from``, and ``role`` may be
-    set — composed kind variants (SAE-on-transferred, role-on-SAE, etc.)
-    are not supported. ``transferred_from`` accepts an HF/local model id by
+    At most one of ``release`` and ``transferred_from`` may be set — composed
+    kind variants are not supported. ``transferred_from`` accepts an HF/local model id by
     default. Internal callers holding parsed safe ids must set
     ``transferred_from_is_safe=True``; the target equivalent is
     ``model_id_is_safe=True``.
@@ -238,13 +216,10 @@ def tensor_filename(
     The raw tensor at the canonical path is difference-of-means (the only
     extraction method as of 4.0), so it carries no method suffix.
 
-    ``role`` (optional) names a role/persona variant; the filename gets
-    a ``_role-<safe_role>`` suffix, slugified like the SAE release slug.
     """
-    if sum(bool(x) for x in (release, transferred_from, role)) > 1:
+    if release and transferred_from:
         raise ValueError(
-            "tensor_filename: release, transferred_from, and role are "
-            "mutually exclusive"
+            "tensor_filename: release and transferred_from are mutually exclusive"
         )
     target_safe = model_id if model_id_is_safe else safe_model_id(model_id)
     target = _encode_tensor_component(target_safe)
@@ -256,8 +231,6 @@ def tensor_filename(
             if transferred_from_is_safe else safe_model_id(transferred_from)
         )
         return f"{target}{safe_from_suffix(src)}.safetensors"
-    if role:
-        return f"{target}{safe_role_suffix(role)}.safetensors"
     return f"{target}.safetensors"
 
 
@@ -266,13 +239,11 @@ def sidecar_filename(
     *,
     release: str | None = None,
     transferred_from: str | None = None,
-    role: str | None = None,
 ) -> str:
     """Sidecar JSON partner for a tensor filename."""
-    if sum(bool(x) for x in (release, transferred_from, role)) > 1:
+    if release and transferred_from:
         raise ValueError(
-            "sidecar_filename: release, transferred_from, and role are "
-            "mutually exclusive"
+            "sidecar_filename: release and transferred_from are mutually exclusive"
         )
     target = _encode_tensor_component(safe_model_id(model_id))
     if release:
@@ -280,8 +251,6 @@ def sidecar_filename(
     if transferred_from:
         src = safe_model_id(transferred_from)
         return f"{target}{safe_from_suffix(src)}.json"
-    if role:
-        return f"{target}{safe_role_suffix(role)}.json"
     return f"{target}.json"
 
 
@@ -294,8 +263,6 @@ def parse_tensor_filename(
       * ``None`` — raw DiM tensor (no separator).
       * ``"sae-<release>"`` — SAE-DiM variant.
       * ``"from-<safe_src>"`` — transferred-from variant.
-      * ``"role-<name>"`` — role variant.
-
     The variant string carries its kind tag so callers can dispatch
     without re-parsing.  Returns ``None`` for filenames that aren't
     ``.safetensors``.

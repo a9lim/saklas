@@ -152,46 +152,8 @@ def test_safe_from_suffix_slugs_unsafe_chars():
     assert paths.safe_from_suffix("google__gemma-3-4b-it") == "_from-google__gemma-3-4b-it"
 
 
-def test_tensor_filename_roundtrip_role():
-    name = paths.tensor_filename("google/gemma-2-2b-it", role="pirate")
-    assert name == "google__gemma-2-2b-it_role-pirate.safetensors"
-    parsed = paths.parse_tensor_filename(name)
-    assert parsed == ("google__gemma-2-2b-it", "role-pirate")
-
-
-def test_tensor_filename_role_excludes_sae():
-    import pytest as _pytest
-
-    with _pytest.raises(ValueError, match="mutually exclusive"):
-        paths.tensor_filename(
-            "google/gemma-2-2b-it",
-            role="pirate",
-            release="gemma-scope-2b-pt-res-canonical",
-        )
-
-
-def test_tensor_filename_role_excludes_transferred():
-    import pytest as _pytest
-
-    with _pytest.raises(ValueError, match="mutually exclusive"):
-        paths.tensor_filename(
-            "Qwen/Qwen2.5-7B-Instruct",
-            role="pirate",
-            transferred_from="google/gemma-3-4b-it",
-        )
-
-
-def test_safe_role_suffix_slug_normalization():
-    # Uppercase + spaces + slashes get lowercased and slugified per
-    # _UNSAFE_VARIANT_CHARS — the same discipline as the SAE suffix.
-    assert paths.safe_role_suffix(None) == ""
-    assert paths.safe_role_suffix("") == ""
-    assert paths.safe_role_suffix("Pirate") == "_role-pirate"
-    assert paths.safe_role_suffix("Salty Pirate") == "_role-salty_pirate"
-    assert paths.safe_role_suffix("Org/Persona") == "_role-org_persona"
-
-
-def test_sidecar_filename_role_partners_tensor():
-    assert paths.sidecar_filename("google/gemma-2-2b-it", role="pirate") == (
-        "google__gemma-2-2b-it_role-pirate.json"
+def test_role_like_text_is_part_of_raw_model_id() -> None:
+    name = paths.tensor_filename("org/model_role-pirate")
+    assert paths.parse_tensor_filename(name) == (
+        paths.safe_model_id("org/model_role-pirate"), None,
     )

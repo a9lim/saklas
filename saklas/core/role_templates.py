@@ -181,7 +181,7 @@ USER_ROLE_HEADERS: dict[str, RoleHeader | None] = _build_user_role_headers()
 # Same alphabet as ``io.paths._UNSAFE_VARIANT_CHARS`` — the slug discipline
 # shared with the SAE release / transfer-source / role filename variants.  A
 # custom role label is a user-provided string we splice into a rendered
-# template and (downstream) into a ``_role-<slug>`` filename, so keeping it
+# template and into a ``:role-<slug>`` selector suffix, so keeping it
 # ``[a-z0-9._-]`` rules out whitespace, uppercase, and punctuation that would
 # corrupt either surface.  At render time the underscore de-slugs to a space
 # (``_render_label``), so ``someone_happy`` displays as ``someone happy``.
