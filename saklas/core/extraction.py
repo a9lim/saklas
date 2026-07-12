@@ -75,7 +75,13 @@ def _apply_fit_overrides_locked(
     requested_mode = fit_mode or mf.fit_mode
     if requested_mode not in {"pca", "spectral", "auto"}:
         raise ValueError(f"invalid discover fit mode {requested_mode!r}")
-    requested_hyperparams = dict(mf.hyperparams)
+    # Hyperparameters belong to their discriminated fit mode. A mode change
+    # starts a fresh parameter set; carrying the previous mode's keys would
+    # either be ignored or violate the exact current schema.
+    requested_hyperparams = (
+        {} if fit_mode is not None and fit_mode != mf.fit_mode
+        else dict(mf.hyperparams)
+    )
     if hyperparams is not None:
         requested_hyperparams.update(hyperparams)
     requested_hyperparams = sanitize_hyperparams(
