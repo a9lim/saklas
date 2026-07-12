@@ -54,8 +54,7 @@ def _seed_neutral_cache(model_id: str, *, n: int = 64, seed: int = 5) -> None:
 
     ``manifold compare`` builds its (mandatory) whitener via
     ``LayerWhitener.from_cache(model_id)`` — there is no Euclidean path — so the
-    disk cache (``neutral_activations.safetensors``, keyed ``layer_<idx>``,
-    fp32) must exist for the layers the folded manifolds occupy.  The
+    sharded disk cache must exist for the layers the folded manifolds occupy. The
     probe-centering mean is derived from these activations (``X.mean(0)``), so
     there is no separate ``layer_means`` cache to seed.
     """
@@ -73,16 +72,22 @@ def _seed_neutral_cache(model_id: str, *, n: int = 64, seed: int = 5) -> None:
         mu = torch.randn(_DIM, generator=g, dtype=torch.float32) * 0.1
         X = torch.randn(n, _DIM, generator=g, dtype=torch.float32) * scale + mu
         acts[f"layer_{L}"] = X
-    tensor_path = md / "neutral_activations.safetensors"
-    save_file(acts, str(tensor_path))
+    tensor_files: dict[str, str] = {}
+    tensor_sha256: dict[str, str] = {}
+    for layer in _LAYERS:
+        tensor_path = md / f"neutral_activations.layer-{layer}.gen-test.safetensors"
+        save_file({f"layer_{layer}": acts[f"layer_{layer}"]}, str(tensor_path))
+        tensor_files[str(layer)] = tensor_path.name
+        tensor_sha256[str(layer)] = hash_file(tensor_path)
     (md / "neutral_activations.json").write_text(json.dumps({
         "method": "neutral_activations",
-        "format_version": 2,
+        "format_version": 3,
         "capture_version": 1,
         "capture_sha256": "test-capture",
         "model_fingerprint": "test-fingerprint",
         "model_source_fingerprint": "test-source",
-        "tensor_sha256": hash_file(tensor_path),
+        "tensor_sha256": tensor_sha256,
+        "tensor_files": tensor_files,
         "layers": list(_LAYERS),
         "tensor_schema": {
             str(layer): {

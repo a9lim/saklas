@@ -628,12 +628,13 @@ def test_cold_alignment_reuses_loaded_target_neutrals_for_whitener(
         loaded.append(model_id)
         acts = src_acts if model_id == "src/model" else tgt_acts
         return acts, {
-            "format_version": 2,
+            "format_version": 3,
             "capture_version": 1,
             "model_fingerprint": f"fp:{model_id}",
             "model_source_fingerprint": f"source:{model_id}",
             "capture_sha256": model_id,
-            "tensor_sha256": model_id,
+            "tensor_sha256": {"0": "0" * 64},
+            "tensor_files": {"0": "neutral.layer-0.safetensors"},
             "layers": [0],
             "tensor_schema": {"0": {"shape": [3, 2], "dtype": "torch.float32"}},
             "n_prompts": 3,
@@ -729,12 +730,16 @@ def test_cold_narrow_alignment_releases_full_seed_rosters_before_fit(
         }
         unrequested_refs.append(weakref.ref(rows[9]))
         return rows, {
-            "format_version": 2,
+            "format_version": 3,
             "capture_version": 1,
             "model_fingerprint": f"fp:{model_id}",
             "model_source_fingerprint": f"source:{model_id}",
             "capture_sha256": model_id,
-            "tensor_sha256": model_id,
+            "tensor_sha256": {str(layer): "0" * 64 for layer in range(10)},
+            "tensor_files": {
+                str(layer): f"neutral.layer-{layer}.safetensors"
+                for layer in range(10)
+            },
             "layers": list(range(10)),
             "tensor_schema": {
                 str(layer): {
@@ -793,12 +798,13 @@ def test_cached_alignment_keeps_model_free_offline_whitener_path(
 
     def sidecar(model_id: str) -> dict[str, Any]:
         return {
-            "format_version": 2,
+            "format_version": 3,
             "capture_version": 1,
             "model_fingerprint": f"fp:{model_id}",
             "model_source_fingerprint": f"source:{model_id}",
             "capture_sha256": model_id,
-            "tensor_sha256": model_id,
+            "tensor_sha256": {"0": "0" * 64},
+            "tensor_files": {"0": "neutral.layer-0.safetensors"},
             "layers": [0],
             "tensor_schema": {"0": {"shape": [3, 2], "dtype": "torch.float32"}},
             "n_prompts": 3,
@@ -874,12 +880,13 @@ def test_missing_cached_alignment_fits_offline_from_proven_neutral_rows(
 
     def sidecar(model_id: str) -> dict[str, Any]:
         return {
-            "format_version": 2,
+            "format_version": 3,
             "capture_version": 1,
             "model_fingerprint": f"fp:{model_id}",
             "model_source_fingerprint": f"source:{model_id}",
             "capture_sha256": model_id,
-            "tensor_sha256": model_id,
+            "tensor_sha256": {"0": "0" * 64},
+            "tensor_files": {"0": "neutral.layer-0.safetensors"},
             "layers": [0],
             "tensor_schema": {
                 "0": {"shape": [3, 2], "dtype": "torch.float32"},
@@ -975,10 +982,15 @@ def test_force_refits_only_requested_layer_without_loading_models(
 
     def sidecar(model_id: str) -> dict[str, Any]:
         return {
-            "format_version": 2, "capture_version": 1,
+            "format_version": 3, "capture_version": 1,
             "model_fingerprint": f"fp:{model_id}",
             "model_source_fingerprint": f"source:{model_id}",
-            "capture_sha256": model_id, "tensor_sha256": model_id,
+            "capture_sha256": model_id,
+            "tensor_sha256": {str(layer): "0" * 64 for layer in range(10)},
+            "tensor_files": {
+                str(layer): f"neutral.layer-{layer}.safetensors"
+                for layer in range(10)
+            },
             "layers": list(range(10)),
             "tensor_schema": {
                 str(layer): {"shape": [3, 2], "dtype": "torch.float32"}
@@ -1073,10 +1085,12 @@ def test_target_neutral_generation_race_replans_cached_alignment(
     def sidecar(model_id: str) -> dict[str, Any]:
         generation = target_generation if model_id == "tgt/model" else "stable"
         return {
-            "format_version": 2, "capture_version": 1,
+            "format_version": 3, "capture_version": 1,
             "model_fingerprint": f"fp:{model_id}:{generation}",
             "model_source_fingerprint": f"source:{model_id}",
-            "capture_sha256": generation, "tensor_sha256": generation,
+            "capture_sha256": generation,
+            "tensor_sha256": {"0": "0" * 64},
+            "tensor_files": {"0": "neutral.layer-0.safetensors"},
             "layers": [0],
             "tensor_schema": {"0": {"shape": [3, 2], "dtype": "torch.float32"}},
             "n_prompts": 3,
@@ -1149,10 +1163,15 @@ def test_concurrent_distinct_alignments_single_flight_shared_model_load(
 
     def sidecar(model_id: str) -> dict[str, Any]:
         return {
-            "format_version": 2, "capture_version": 1,
+            "format_version": 3, "capture_version": 1,
             "model_fingerprint": f"fp:{model_id}",
             "model_source_fingerprint": f"source:{model_id}",
-            "capture_sha256": model_id, "tensor_sha256": model_id,
+            "capture_sha256": model_id,
+            "tensor_sha256": {str(layer): "0" * 64 for layer in range(10)},
+            "tensor_files": {
+                str(layer): f"neutral.layer-{layer}.safetensors"
+                for layer in range(10)
+            },
             "layers": list(range(10)), "tensor_schema": {}, "n_prompts": 3,
         }
 
@@ -1271,10 +1290,12 @@ def test_cross_process_distinct_alignments_single_flight_shared_model_load(
 
     def sidecar(model_id: str) -> dict[str, Any]:
         return {
-            "format_version": 2, "capture_version": 1,
+            "format_version": 3, "capture_version": 1,
             "model_fingerprint": f"fp:{model_id}",
             "model_source_fingerprint": f"source:{model_id}",
-            "capture_sha256": model_id, "tensor_sha256": model_id,
+            "capture_sha256": model_id,
+            "tensor_sha256": {"0": "0" * 64},
+            "tensor_files": {"0": "neutral.layer-0.safetensors"},
             "layers": [0],
             "tensor_schema": {"0": {"shape": [3, 2], "dtype": "torch.float32"}},
             "n_prompts": 3,

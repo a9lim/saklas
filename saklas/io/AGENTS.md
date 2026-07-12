@@ -385,7 +385,7 @@ legacy bf16/fp16/non-finite caches). These are what the Mahalanobis whitener bui
 covariance from. Cache v3 is an atomic JSON pointer to one immutable fp32 shard
 per layer; every shard and its directory entry are durable before pointer
 publication, and old generations are collected only after the new pointer is
-durable. Legacy v2 fixed monoliths remain readable and migrate on recompute.
+durable. Readers require the current v3 sharded pointer format.
 `validate_neutral_cache_metadata` normally checks every digest plus the
 safetensors key/shape/dtype headers; exact-transfer preflight may request the
 header-only source proof, while `load_validated_neutral_cache(...,

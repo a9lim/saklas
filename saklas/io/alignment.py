@@ -40,7 +40,6 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import (
     load as load_safetensors,
-    load_file,
     save as save_safetensors,
 )
 
@@ -54,7 +53,6 @@ log = logging.getLogger(__name__)
 
 _NEUTRAL_ACTS_NAME = "neutral_activations"
 _NEUTRAL_CACHE_FORMAT_VERSION = 3
-_LEGACY_NEUTRAL_CACHE_FORMAT_VERSION = 2
 _NEUTRAL_CAPTURE_VERSION = 1
 _ALIGNMENT_CACHE_FORMAT_VERSION = 4
 
@@ -161,7 +159,7 @@ def _as_layer_alignment(value: AlignmentLike) -> LayerAlignment:
 
 
 def _neutral_acts_paths(model_id: str) -> tuple[Path, Path]:
-    """Return the stable legacy/lock anchor and atomic pointer sidecar."""
+    """Return the stable lock anchor and atomic pointer sidecar."""
     md = model_dir(model_id)
     return (
         md / f"{_NEUTRAL_ACTS_NAME}.safetensors",
@@ -267,10 +265,9 @@ def _validate_neutral_cache_metadata_locked(
         sidecar = json.load(handle)
     version = sidecar.get("format_version")
     if (
-        version not in {
-            _NEUTRAL_CACHE_FORMAT_VERSION,
-            _LEGACY_NEUTRAL_CACHE_FORMAT_VERSION,
-        }
+        not isinstance(version, int)
+        or isinstance(version, bool)
+        or version != _NEUTRAL_CACHE_FORMAT_VERSION
         or sidecar.get("capture_version") != _NEUTRAL_CAPTURE_VERSION
     ):
         raise ValueError("neutral activation cache identity mismatch")
@@ -280,28 +277,21 @@ def _validate_neutral_cache_metadata_locked(
         raise ValueError("neutral activation cache sidecar has no layer schema")
     normalized_layers = sorted(int(layer) for layer in layers)
     expected_n = int(sidecar.get("n_prompts", -1))
-    if version == _LEGACY_NEUTRAL_CACHE_FORMAT_VERSION:
-        if not ts_path.exists():
-            raise FileNotFoundError(f"neutral activation cache missing for {model_id}")
-        if verify_payload and sidecar.get("tensor_sha256") != hash_file(ts_path):
+    paths = _neutral_shard_paths(ts_path, sidecar, normalized_layers)
+    digests = sidecar.get("tensor_sha256")
+    if not isinstance(digests, Mapping):
+        raise ValueError("neutral activation cache has no tensor digests")
+    grouped = {path: [layer] for layer, path in paths.items()}
+    for layer, path in paths.items():
+        digest = digests.get(str(layer))
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or not path.exists()
+        ):
+            raise ValueError(f"invalid neutral shard for layer {layer}")
+        if verify_payload and hash_file(path) != digest:
             raise ValueError("neutral activation cache payload digest mismatch")
-        grouped = {ts_path: normalized_layers}
-    else:
-        paths = _neutral_shard_paths(ts_path, sidecar, normalized_layers)
-        digests = sidecar.get("tensor_sha256")
-        if not isinstance(digests, Mapping):
-            raise ValueError("neutral activation cache has no tensor digests")
-        grouped = {path: [layer] for layer, path in paths.items()}
-        for layer, path in paths.items():
-            digest = digests.get(str(layer))
-            if (
-                not isinstance(digest, str)
-                or len(digest) != 64
-                or not path.exists()
-            ):
-                raise ValueError(f"invalid neutral shard for layer {layer}")
-            if verify_payload and hash_file(path) != digest:
-                raise ValueError("neutral activation cache payload digest mismatch")
     for path, path_layers in grouped.items():
         with safe_open(str(path), framework="pt", device="cpu") as tensors:
             path_keys = {f"layer_{layer}" for layer in path_layers}
@@ -344,31 +334,19 @@ def load_validated_neutral_cache(
                 set(all_layers) & {int(layer) for layer in requested_layers}
             )
         )
-        version = sidecar.get("format_version")
-        if version == _LEGACY_NEUTRAL_CACHE_FORMAT_VERSION:
-            if sidecar.get("tensor_sha256") != hash_file(ts_path):
+        paths = _neutral_shard_paths(ts_path, sidecar, all_layers)
+        digests = sidecar["tensor_sha256"]
+        tensors: dict[str, torch.Tensor] = {}
+        for layer in selected:
+            payload = paths[layer].read_bytes()
+            if hashlib.sha256(payload).hexdigest() != digests[str(layer)]:
                 raise ValueError("neutral activation cache payload digest mismatch")
-            loaded = load_file(str(ts_path))
-            tensors = {
-                key: value for key, value in loaded.items()
-                if int(key.split("_", 1)[1]) in selected
-            }
-        else:
-            paths = _neutral_shard_paths(ts_path, sidecar, all_layers)
-            digests = sidecar["tensor_sha256"]
-            tensors: dict[str, torch.Tensor] = {}
-            for layer in selected:
-                payload = paths[layer].read_bytes()
-                if hashlib.sha256(payload).hexdigest() != digests[str(layer)]:
-                    raise ValueError("neutral activation cache payload digest mismatch")
-                shard = load_safetensors(payload)
-                tensors[f"layer_{layer}"] = shard[f"layer_{layer}"]
-        if version == _NEUTRAL_CACHE_FORMAT_VERSION:
-            # Reap superseded generations preserved by a signal immediately
-            # after pointer replacement. This runs under the pair lock, so the
-            # live pointer cannot change while its references are collected.
-            _cleanup_neutral_generations(ts_path, sidecar)
-            fsync_directory(ts_path.parent)
+            shard = load_safetensors(payload)
+            tensors[f"layer_{layer}"] = shard[f"layer_{layer}"]
+        # Reap superseded generations preserved by a signal immediately after
+        # pointer replacement while the pair lock keeps references stable.
+        _cleanup_neutral_generations(ts_path, sidecar)
+        fsync_directory(ts_path.parent)
     out: dict[int, torch.Tensor] = {}
     schema = sidecar["tensor_schema"]
     expected_n = int(sidecar.get("n_prompts", -1))
@@ -396,8 +374,7 @@ def neutral_cache_identity(sidecar: dict[str, Any]) -> dict[str, Any]:
         "n_prompts",
     )
     identity = {key: sidecar.get(key) for key in keys}
-    if sidecar.get("format_version") == _NEUTRAL_CACHE_FORMAT_VERSION:
-        identity["tensor_files"] = sidecar.get("tensor_files")
+    identity["tensor_files"] = sidecar.get("tensor_files")
     return identity
 
 
@@ -430,7 +407,7 @@ def load_or_compute_neutral_activations_with_metadata(
     cache identity.  Returning the already-validated sidecar avoids an immediate
     second full-file digest pass through
     :func:`validate_neutral_cache_metadata`.  The activation-only public API
-    above remains the compatibility surface for ordinary whitener/probe callers.
+    above remains the convenience surface for ordinary whitener/probe callers.
     """
     with neutral_fit_lock(model_id):
         return _load_or_compute_neutral_activations_with_metadata_locked(
@@ -450,7 +427,7 @@ def _load_or_compute_neutral_activations_with_metadata_locked(
 
     Cache identity binds the exact rendered token rows and pooling positions,
     the loaded model weights, and the fitted layer set. The tensor payload is
-    digest-verified before reuse. Stale/legacy cache → recompute and replace.
+    digest-verified before reuse. A stale cache is recomputed and replaced.
 
     Returns ``({layer_idx: [N, D] fp32 CPU tensor}, validated_sidecar)``.
     Stored fp32 on disk so the whitener covariance is built and inverted at

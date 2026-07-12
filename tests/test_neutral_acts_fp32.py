@@ -5,7 +5,7 @@ per-model neutral-activation cache was the last exception (bf16) and is now
 fp32 too.  These tests pin three things: the on-disk store is fp32, the
 compute path (cache miss) and the cache-hit path return bit-identical tensors
 (the seam fix — the whitener covariance is bit-reproducible across the cache
-boundary), and a pre-existing bf16 cache is invalidated and recomputed to fp32.
+boundary), and a stale bf16 cache is invalidated and recomputed to fp32.
 
 CPU-only: ``compute_neutral_activations`` is monkeypatched to a deterministic
 fp32 dict so no real model loads.  ``$SAKLAS_HOME`` is pointed at a tmp dir so
@@ -121,7 +121,7 @@ def test_metadata_preflight_does_not_materialize_tensor_payload(
     import saklas.io.alignment as alignment
 
     monkeypatch.setattr(
-        alignment, "load_file",
+        alignment, "load_safetensors",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             AssertionError("metadata preflight materialized tensors")
         ),
@@ -234,12 +234,12 @@ def test_alignment_fit_lock_serializes_same_direction(
     assert done.is_set()
 
 
-def test_legacy_bf16_cache_invalidated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_stale_bf16_cache_invalidated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _install_home(tmp_path, monkeypatch)
     acts = _deterministic_acts()
     calls = _patch_compute(monkeypatch, acts)
 
-    # Hand-write a legacy bf16 cache + matching sidecar (the pre-decision
+    # Hand-write a stale bf16 cache + matching sidecar (the pre-decision
     # shape).  The sidecar hash is left blank so staleness is decided purely
     # by the on-disk dtype, not the statements-hash check.
     ts_path, sc_path = _neutral_acts_paths(MODEL_ID)
@@ -260,12 +260,12 @@ def test_legacy_bf16_cache_invalidated(tmp_path: Path, monkeypatch: pytest.Monke
 
     # The bf16 dtype must be treated as stale and recomputed as fp32.
     out = _compute()
-    assert calls["n"] == 1, "legacy bf16 cache should trigger a recompute"
+    assert calls["n"] == 1, "stale bf16 cache should trigger a recompute"
 
     # In-memory result is fp32 ...
     for layer, t in out.items():
         assert t.dtype == torch.float32, f"layer {layer} returned {t.dtype}"
-    # ... and the fixed legacy monolith was replaced by fp32 v3 shards.
+    # ... and the fixed stale monolith was replaced by fp32 v3 shards.
     assert not ts_path.exists()
     sidecar = json.loads(sc_path.read_text())
     for layer, filename in sidecar["tensor_files"].items():
@@ -288,8 +288,8 @@ def test_sidecar_written(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Non
     assert sc["n_layers"] == 3
 
 
-def test_from_cache_rejects_legacy_bf16(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """``LayerWhitener.from_cache`` refuses a legacy bf16 neutral cache.
+def test_from_cache_rejects_stale_bf16(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``LayerWhitener.from_cache`` refuses a stale bf16 neutral cache.
 
     ``from_cache`` (the offline ``manifold compare`` + transfer-rebake path)
     can't recompute — no model is loaded — so it must fail loud rather than
