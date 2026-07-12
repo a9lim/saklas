@@ -110,7 +110,7 @@ The dashboard speaks the existing `/saklas/v1/*` native API:
 * `POST /saklas/v1/sessions/default/tree/{navigate,edit,branch,star,note,reset}` and `DELETE /tree/{node_id}` — loom mutations
 * `GET /saklas/v1/sessions/default/tree/{edge_label,filter}` — branch labels and search/filter support
 * `POST /saklas/v1/sessions/default/tree/{diff,joint_logprobs,transcript,transcript/load}` — compare branches and import/export transcripts
-* `WS /saklas/v1/sessions/default/stream` — token + probe co-stream; the `token` event carries optional `scores` (magnitude-weighted aggregate, drives the live inline highlight) + `per_layer_scores` (per-layer heatmap for the drilldown), and the `done` event carries `per_token_probes`
+* `WS /saklas/v1/sessions/default/stream` — token + probe co-stream; the `token` event carries optional `scores` (magnitude-weighted aggregate, drives the live inline highlight), `per_layer_scores` (per-layer heatmap for the drilldown), and rich `probe_readings`; the `done` event carries settled aggregate `probe_readings` in the same shape
 * `GET /saklas/v1/sessions/default/traits/stream` — live per-token probe SSE
 
 See `saklas/server/native_routes.py` for the Python route registrar.

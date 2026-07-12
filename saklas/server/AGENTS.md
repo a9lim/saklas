@@ -474,7 +474,7 @@ the frame; likewise `sae_readout`
 `[{id, activation, label, max_act}]` while the live SAE readout is on —
 `max_act` is the cached Neuronpedia maxActApprox strength unit, `null`
 until the metadata backfill lands), `done` (`result` with `text`, `tokens`,
-`finish_reason`, `usage`, `per_token_probes`, `mean_logprob`, `mean_surprise`,
+`finish_reason`, `usage`, `mean_logprob`, `mean_surprise`,
 `probe_readings` aggregate), `error` (validation errors keep the connection open;
 other failures close 1011).
 

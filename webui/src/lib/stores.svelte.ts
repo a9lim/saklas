@@ -2816,35 +2816,7 @@ function handleWsMessage(msg: WSServerMessage): void {
       if (!abState.processingAb) {
         setProbeAggregates(msg.result?.probe_readings);
       }
-      const perToken = msg.result?.per_token_probes ?? [];
       const turn = _currentWriteTurn();
-      if (turn?.tokens && perToken.length) {
-        // Server emits per_token_probes in token order over the full
-        // generated stream; thinking + response tokens share that order.
-        // Walk the union and partition by ``thinking`` flag from the
-        // local token rows so we preserve the live separation.
-        let idx = 0;
-        for (const row of turn.thinkingTokens ?? []) {
-          if (idx < perToken.length) {
-            const probes = perToken[idx].probes;
-            row.probes = probes;
-            if (highlightState.target) {
-              row.score = probes[highlightState.target];
-            }
-          }
-          idx++;
-        }
-        for (const row of turn.tokens ?? []) {
-          if (idx < perToken.length) {
-            const probes = perToken[idx].probes;
-            row.probes = probes;
-            if (highlightState.target) {
-              row.score = probes[highlightState.target];
-            }
-          }
-          idx++;
-        }
-      }
       if (turn) {
         turn.finishReason = msg.result?.finish_reason ?? "stop";
         turn.tokensSoFar = msg.result?.tokens ?? genStatus.tokensSoFar;

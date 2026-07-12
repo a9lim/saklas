@@ -36,8 +36,8 @@ export function parseProbeTarget(target: string): { base: string; axis: number }
  *
  *  Axis ``i`` reads the live per-token domain coordinates captured under
  *  ``coordsByProbe`` (the full rank-R reading off the ``probe_readings`` wire
- *  channel); axis 0 falls back to the collapsed ``probes`` row, which is the
- *  channel the end-of-gen ``per_token_probes`` pass and a tree reload restore.
+ *  channel); axis 0 falls back to the collapsed ``probes`` row streamed on the
+ *  token frame and restored by a tree reload.
  *  Returns ``undefined`` when neither source carries the target, so the caller
  *  can fall through to its own default (transparent tint). */
 export function probeScoreForTarget(

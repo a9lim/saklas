@@ -33,7 +33,6 @@ from saklas.server.ws_events import build_token_event
 from saklas.server.ws_models import (
     WSGenerateMessage,
     build_sampling,
-    per_token_probes,
     result_to_json,
 )
 
@@ -501,7 +500,6 @@ async def _ws_handle_generate(
                 "text": commit_text,
                 "node_id": new_id,
                 "finish_reason": "stop",
-                "per_token_probes": [],
                 "mean_logprob": None,
                 "mean_surprise": None,
             },
@@ -752,21 +750,14 @@ async def _ws_handle_generate(
             result = result_holder[0] if result_holder else None
             result_json = result_to_json(result)
             if result is not None:
-                result_json["per_token_probes"] = per_token_probes(
-                    session, getattr(result, "token_count", 0) or 0,
-                )
-                # Per-attached-manifold-probe aggregate readings ride on
-                # the ``done`` event so a WS client picks up the
-                # geometric channel alongside the existing vector-probe
-                # ``per_token_probes`` block.  Empty dict when no
-                # manifold probe is attached.  Shared with the SSE / NDJSON
-                # finalization via ``probe_reading_aggregate`` (result-
-                # parameterized so each n>1 sibling scores its own result).
+                # The settled per-probe aggregate rides the ``done`` event in
+                # the same rich shape as each token frame.  Shared with the
+                # SSE / NDJSON finalization via ``probe_reading_aggregate``
+                # (result-parameterized so each n>1 sibling scores its own
+                # result).
                 mf_readings = probe_reading_aggregate(session, result)
                 if mf_readings:
                     result_json["probe_readings"] = mf_readings
-            else:
-                result_json["per_token_probes"] = []
             # Phase 1 logit pass: stamp the per-turn logprob rollup on the
             # ``done`` event so subscribers (loom sidebar's sort-by-surprise,
             # webui chat-header summary) don't need to re-fetch the node.

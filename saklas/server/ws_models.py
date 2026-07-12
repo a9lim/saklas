@@ -8,7 +8,6 @@ from pydantic import BaseModel
 
 from saklas.core.results import GenerationResult, RunSet
 from saklas.core.sampling import SamplingConfig
-from saklas.core.session import SaklasSession
 
 
 class WSSamplingParams(BaseModel):
@@ -98,22 +97,3 @@ def result_to_json(result: GenerationResult | RunSet | None) -> dict[str, Any]:
             "total_tokens": prompt_tokens + completion,
         },
     }
-
-
-def per_token_probes(
-    session: SaklasSession, n_tokens: int,
-) -> list[dict[str, Any]]:
-    scores = session.last_per_token_scores
-    if not scores:
-        return []
-    return [
-        {
-            "token_idx": i,
-            "probes": {
-                name: float(vals[i])
-                for name, vals in scores.items()
-                if i < len(vals)
-            },
-        }
-        for i in range(n_tokens)
-    ]

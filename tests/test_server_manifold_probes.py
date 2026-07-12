@@ -842,6 +842,7 @@ class TestWebSocketProbeReadings:
 
         agg_blob = done["result"].get("probe_readings")
         assert agg_blob is not None
+        assert "per_token_probes" not in done["result"]
         assert agg_blob["circumplex"]["fraction"] == pytest.approx(0.42)
         assert agg_blob["circumplex"]["coords"] == [
             pytest.approx(0.61), pytest.approx(0.42),

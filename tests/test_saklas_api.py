@@ -583,9 +583,7 @@ class TestWebSocket:
                     break
             assert tokens == ["Hello", " ", "world"]
             assert done["result"]["finish_reason"] == "stop"
-            ptp = done["result"]["per_token_probes"]
-            assert len(ptp) == 3
-            assert ptp[0]["probes"]["happy"] == pytest.approx(0.1)
+            assert "per_token_probes" not in done["result"]
 
     def test_stale_n_way_token_callback_stays_on_original_queue(
         self, session_and_client: Any,

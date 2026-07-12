@@ -1072,11 +1072,6 @@ export interface WSTokenEvent {
   sae_readout?: SaeFeatureJSON[];
 }
 
-export interface WSDoneResultPerToken {
-  token_idx: number;
-  probes: Record<string, number>;
-}
-
 export interface WSDoneResult {
   text: string;
   tokens: number;
@@ -1086,7 +1081,6 @@ export interface WSDoneResult {
     completion_tokens: number;
     total_tokens: number;
   };
-  per_token_probes: WSDoneResultPerToken[];
   /** Logit-pass: per-turn mean chosen-token logprob over the assistant
    *  response span (thinking tokens excluded by construction).  Null when
    *  logprob capture wasn't live (replay / no on_token consumer). */
@@ -1415,10 +1409,9 @@ export interface TokenScore {
   /** Full per-axis domain-frame coordinates per probe, captured live from the
    *  ``probe_readings`` wire channel.  Backs per-PC token highlighting (the
    *  ``personas[3]`` axis targets) — axis 0 already lives in ``probes``, so
-   *  this is populated only for multi-axis (rank-R) probes.  The end-of-gen
-   *  ``per_token_probes`` pass is axis-0 only, so it survives ``done`` and
-   *  in-session navigation (held by reference in ``tokenScoreCache``) but is
-   *  absent after a transcript / localStorage reload. */
+   *  this is populated only for multi-axis (rank-R) probes.  It survives
+   *  in-session navigation by reference in ``tokenScoreCache`` but is absent
+   *  after a transcript / localStorage reload. */
   coordsByProbe?: Record<string, number[]>;
   /** Token-id from the WS event when available — useful for debugging. */
   tokenId?: number | null;
