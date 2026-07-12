@@ -480,7 +480,11 @@ resolution is eager, weights load lazily with only one layer resident, and a val
 fitted tensor cache hit does not import/load SAELens. Coverage
 is fail-fast (`SaeCoverageError` before the pooling loop). The SAE branch still
 whitens with the residual-stream whitener (the centroids are decoded back to model
-space before the fit).
+space before the fit). Reconstruction transfers the raw centroid roster one layer
+at a time: once a decoded `(K,D)` replacement exists, that layer's raw `(K,D)`
+stack is released. A multi-node SAE fit therefore never retains complete raw and
+reconstructed `K×D×L` rosters beside the later whitened rows; the one-node
+monopolar branch consumes its raw centroid before this ownership transfer.
 
 ### 3.10 Conversational corpus generation (A2)
 
@@ -1100,9 +1104,11 @@ locks span cache recheck through publication (including both serial model
 loads), so two cold transfer commands do not repeat the same capture/fit work.
 The materializing neutral loader returns the sidecar validated in that same
 transaction, and cold alignment prep builds the target whitener directly from
-the already-resident target rows. The model-free cached repeat keeps the offline
-loader; neither path reopens the target neutral artifact after returning the
-alignment.
+the already-resident target rows. The model-free preflight materializes the target
+neutral rows exactly once: an alignment hit builds the whitener from them, while
+an absent/corrupt alignment materializes the proven source rows too and fits,
+scores, and publishes Procrustes entirely offline. Neither outcome loads model
+weights or reopens/re-digests the target neutral artifact.
 
 ---
 

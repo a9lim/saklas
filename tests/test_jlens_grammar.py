@@ -361,3 +361,36 @@ def test_lens_noop_preflight_rejects_changed_default_dataset_revision(
         seq_len=None, corpus=None, prompts=100,
     )
     assert not _try_lens_fit_noop_preflight(args, [0])
+
+
+def test_lens_noop_preflight_holds_fit_lock_during_sidecar_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from contextlib import contextmanager
+
+    import saklas.io.lens as lens_io
+
+    held = False
+
+    @contextmanager
+    def fake_lock(_model: str):
+        nonlocal held
+        held = True
+        try:
+            yield
+        finally:
+            held = False
+
+    def read_sidecar(_model: str) -> None:
+        assert held
+        return None
+
+    monkeypatch.setattr(lens_io, "lens_fit_lock", fake_lock)
+    monkeypatch.setattr(lens_io, "load_lens_sidecar", read_sidecar)
+    args = argparse.Namespace(
+        force=False, model="toy/model", quantize=None, device="cpu",
+        seq_len=None, corpus=None, prompts=100,
+    )
+
+    assert not _try_lens_fit_noop_preflight(args, [0])
+    assert not held

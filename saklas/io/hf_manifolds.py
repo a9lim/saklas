@@ -43,6 +43,38 @@ from saklas.io.staging import stage_verify_swap
 _HF_SEARCH_CAP = 20
 
 
+def _rewrite_staged_manifold_name(
+    staged: ManifoldFolder, destination_name: str,
+) -> dict[str, str]:
+    """Rename a staged folder and every fitted sidecar as one identity.
+
+    A fitted manifold repeats its name in each per-model sidecar.  Rewriting
+    only ``manifold.json`` makes selector discovery address the destination
+    while runtime loads still expose the source name.  Update the sidecars in
+    staging and return the corresponding trusted hash map for the caller's
+    single manifest rewrite.
+    """
+    from saklas.io.atomic import write_json_atomic
+    from saklas.io.packs import hash_file
+
+    files = dict(staged.files)
+    for stem in staged.tensor_models():
+        tensor_path = staged.tensor_path(stem)
+        sidecar_path = tensor_path.with_suffix(".json")
+        if tensor_path.name not in files or sidecar_path.name not in files:
+            raise ManifoldFormatError(
+                f"cannot rename untrusted fitted pair {tensor_path.name}: "
+                "both tensor and sidecar must have manifest proofs"
+            )
+        with open(sidecar_path) as handle:
+            sidecar = json.load(handle)
+        sidecar["name"] = destination_name
+        write_json_atomic(sidecar_path, sidecar)
+        files[sidecar_path.name] = hash_file(sidecar_path)
+    staged.name = destination_name
+    return files
+
+
 # ---------------------------------------------------------------------- pull --
 
 
@@ -160,8 +192,20 @@ def _pull_manifold_locked(
         # manifest from the just-loaded folder and re-hashes ``files`` —
         # so the staged manifest stays self-consistent for the re-validate
         # below.
+        #
+        # The installed folder basename is its addressable identity.  An
+        # explicit ``--as ns/name`` must therefore rewrite the source repo's
+        # manifest name while the copy is still staged; otherwise selector
+        # discovery indexes the source name under a destination path that does
+        # not exist.
+        try:
+            files = _rewrite_staged_manifold_name(staged, target_folder.name)
+        except ManifoldFormatError as e:
+            raise HFError(
+                f"{coord}: staged manifold failed identity rewrite ({e})"
+            ) from e
         staged.source = source
-        staged.write_metadata(files=staged.files)
+        staged.write_metadata(files=files)
         try:
             ManifoldFolder.load(staging)
         except ManifoldFormatError as e:
@@ -397,15 +441,18 @@ def push_manifold(
     corpus alone re-fits on the consumer side, unlike a pack where a
     tensors-and-statements-empty push is rejected.
     """
+    from contextlib import ExitStack
     import tempfile
 
-    from saklas.io.atomic import write_bytes_atomic
     from saklas.io.manifolds import (
         ManifoldFolder, ManifoldFormatError, hash_manifold_files,
     )
     from saklas.io.paths import parse_tensor_filename, safe_model_id as _safe_id
-
-    mf = ManifoldFolder.load(folder)  # runs integrity check
+    from saklas.io.manifold_folder import (
+        _locked_manifest,
+        manifold_folder_tensor_paths,
+        manifold_pair_lock,
+    )
 
     scope_safe: Optional[str] = None
     if model_scope is not None:
@@ -413,50 +460,78 @@ def push_manifold(
 
     staging = Path(tempfile.mkdtemp(prefix="saklas-manifold-push-"))
     try:
-        # Always stage the corpus: manifold.json + the full nodes/ tree.
-        write_bytes_atomic(
-            staging / "manifold.json", (folder / "manifold.json").read_bytes(),
-        )
-        nodes_src = folder / "nodes"
-        if nodes_src.is_dir():
-            for child in sorted(nodes_src.iterdir()):
-                if child.is_file() and child.suffix == ".json":
-                    write_bytes_atomic(
-                        staging / "nodes" / child.name, child.read_bytes(),
-                    )
-        # Optional discover-mode provenance file.
-        scen = folder / "scenarios.json"
-        if scen.is_file():
-            write_bytes_atomic(staging / "scenarios.json", scen.read_bytes())
-
-        # Stage the fitted tensors that survive the model/variant filter,
-        # each with its sidecar.
-        from saklas.core.manifold import load_manifold
-
         kept_stems: list[str] = []
-        for ts in sorted(folder.glob("*.safetensors")):
-            parsed = parse_tensor_filename(ts.name)
-            if parsed is None:
-                continue
-            file_model, var_slug = parsed
-            if scope_safe is not None and file_model != scope_safe:
-                continue
-            vkey = "raw" if var_slug is None else var_slug
-            if not _manifold_variant_matches(vkey, variant):
-                continue
-            sc = ts.with_suffix(".json")
-            if not sc.exists():
-                raise ManifoldFormatError(
-                    f"cannot push unpaired fitted tensor {ts.name}"
+        folder = Path(folder)
+        # Snapshot publication uses the same global mutation order as folder
+        # lifecycle operations: manifest first, then every logical fitted pair
+        # in deterministic order.  Keep both source validation and every source
+        # byte read inside this one transaction, so authoring edits and pair
+        # replacement cannot produce a mixed-generation upload.  The locks end
+        # before any Hub request below.
+        with _locked_manifest(folder):
+            with ExitStack() as pair_locks:
+                tensor_paths = manifold_folder_tensor_paths(folder)
+                for tensor_path in tensor_paths:
+                    pair_locks.enter_context(manifold_pair_lock(tensor_path))
+
+                mf = ManifoldFolder.load(folder)  # runs integrity check
+
+                # Always stage the corpus: manifold.json + the full nodes/ tree.
+                write_bytes_atomic(
+                    staging / "manifold.json",
+                    (folder / "manifold.json").read_bytes(),
                 )
-            # Targeted runtime validation covers the trusted manifest pair,
-            # fit policy, and current corpus/domain/template identity. Without
-            # it a metadata edit could publish a current corpus beside a stale
-            # fitted tensor whose old bytes still pass the folder hash map.
-            load_manifold(ts)
-            write_bytes_atomic(staging / ts.name, ts.read_bytes())
-            kept_stems.append(ts.stem)
-            write_bytes_atomic(staging / sc.name, sc.read_bytes())
+                nodes_src = folder / "nodes"
+                if nodes_src.is_dir():
+                    for child in sorted(nodes_src.iterdir()):
+                        if child.is_file() and child.suffix == ".json":
+                            write_bytes_atomic(
+                                staging / "nodes" / child.name,
+                                child.read_bytes(),
+                            )
+                # Optional discover-mode provenance file.
+                scen = folder / "scenarios.json"
+                if scen.is_file():
+                    write_bytes_atomic(
+                        staging / "scenarios.json", scen.read_bytes(),
+                    )
+
+                # Stage the fitted tensors that survive the model/variant
+                # filter, each with its sidecar.
+                from saklas.core.manifold import load_manifold
+
+                # Iterate the candidate set whose logical locks we acquired.
+                # A lower-level writer that bypasses the documented
+                # manifest-before-pair order can create a new unmanifested pair
+                # while this snapshot owns the manifest lock; a second glob
+                # would see that unlocked generation and spuriously fail the
+                # push.  The frozen list keeps the staged snapshot exact.
+                for ts in tensor_paths:
+                    if not ts.is_file():
+                        continue
+                    parsed = parse_tensor_filename(ts.name)
+                    if parsed is None:
+                        continue
+                    file_model, var_slug = parsed
+                    if scope_safe is not None and file_model != scope_safe:
+                        continue
+                    vkey = "raw" if var_slug is None else var_slug
+                    if not _manifold_variant_matches(vkey, variant):
+                        continue
+                    sc = ts.with_suffix(".json")
+                    if not sc.exists():
+                        raise ManifoldFormatError(
+                            f"cannot push unpaired fitted tensor {ts.name}"
+                        )
+                    # Targeted runtime validation covers the trusted manifest
+                    # pair, fit policy, and current corpus/domain/template
+                    # identity. Without it a metadata edit could publish a
+                    # current corpus beside a stale fitted tensor whose old
+                    # bytes still pass the folder hash map.
+                    load_manifold(ts)
+                    write_bytes_atomic(staging / ts.name, ts.read_bytes())
+                    kept_stems.append(ts.stem)
+                    write_bytes_atomic(staging / sc.name, sc.read_bytes())
 
         # Re-hash the staged copy so the uploaded manifest matches the
         # bytes we upload (a model/variant filter changes the file set).
@@ -793,10 +868,25 @@ def _install_local_manifold(
                         _target_folder=staging,
                     )
                 try:
-                    ManifoldFolder.load(staging)
+                    staged = ManifoldFolder.load(staging)
                 except ManifoldFormatError as exc:
                     raise ManifoldInstallConflict(
                         f"{src}: staged local manifold failed validation ({exc})"
+                    ) from exc
+                try:
+                    files = _rewrite_staged_manifold_name(staged, dst_name)
+                except ManifoldFormatError as exc:
+                    raise ManifoldInstallConflict(
+                        f"{src}: staged local manifold failed identity "
+                        f"rewrite ({exc})"
+                    ) from exc
+                staged.write_metadata(files=files)
+                try:
+                    ManifoldFolder.load(staging)
+                except ManifoldFormatError as exc:
+                    raise ManifoldInstallConflict(
+                        f"{src}: staged local manifold failed re-validation "
+                        f"after destination rename ({exc})"
                     ) from exc
 
             def _swap() -> Path:

@@ -1,4 +1,5 @@
 from typing import Any
+import hashlib
 import json
 import shutil
 import threading
@@ -11,7 +12,12 @@ from saklas.io import hf
 
 
 def _write_fitted_manifold(
-    folder: Path, model_id: str, *, release: str | None = None,
+    folder: Path,
+    model_id: str,
+    *,
+    release: str | None = None,
+    direction: tuple[float, float] = (1.0, 0.0),
+    publish_manifest: bool = True,
 ) -> Path:
     import torch
 
@@ -23,7 +29,7 @@ def _write_fitted_manifold(
     from saklas.io.paths import tensor_filename
 
     manifold = fold_directions_to_subspace(
-        folder.name, {0: torch.tensor([1.0, 0.0])}, None, label="test",
+        folder.name, {0: torch.tensor(direction)}, None, label="test",
         feature_space="raw" if release is None else f"sae-{release}",
     )
     mf = ManifoldFolder.load(folder, verify_manifest=False)
@@ -41,7 +47,8 @@ def _write_fitted_manifold(
             sae_fingerprint=f"sae:{release}",
         )
     save_manifold(manifold, path, metadata)
-    mf.update_file_hashes(path, path.with_suffix(".json"))
+    if publish_manifest:
+        mf.update_file_hashes(path, path.with_suffix(".json"))
     return path
 
 
@@ -351,6 +358,119 @@ def test_push_manifold_rejects_fitted_tensor_after_corpus_edit(
         hfm.push_manifold(folder, "alice/mood", dry_run=True)
 
 
+def test_push_manifold_stages_one_locked_source_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A concurrent fitted-pair replacement cannot split the push snapshot."""
+    from saklas.io import hf_manifolds as hfm
+
+    folder = _author_fake_manifold(tmp_path, monkeypatch)
+    tensor = next(folder.glob("*.safetensors"))
+    old_tensor = tensor.read_bytes()
+    staged = _capture_push_staging(monkeypatch)
+    real_write = hfm.write_bytes_atomic
+    manifest_copied = threading.Event()
+    continue_snapshot = threading.Event()
+
+    def pause_after_manifest(path: Path, data: bytes) -> None:
+        real_write(path, data)
+        path = Path(path)
+        if (
+            path.name == "manifold.json"
+            and path.parent.name.startswith("saklas-manifold-push-")
+        ):
+            manifest_copied.set()
+            assert continue_snapshot.wait(2.0)
+
+    monkeypatch.setattr(hfm, "write_bytes_atomic", pause_after_manifest)
+    push_errors: list[BaseException] = []
+    mutation_errors: list[BaseException] = []
+    push_done = threading.Event()
+    mutation_done = threading.Event()
+
+    def push() -> None:
+        try:
+            hfm.push_manifold(folder, "alice/mood", dry_run=True)
+        except BaseException as exc:  # pragma: no cover - asserted below
+            push_errors.append(exc)
+        finally:
+            push_done.set()
+
+    def replace_pair() -> None:
+        try:
+            _write_fitted_manifold(
+                folder,
+                "google/gemma-2-2b-it",
+                direction=(0.0, 1.0),
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            mutation_errors.append(exc)
+        finally:
+            mutation_done.set()
+
+    push_worker = threading.Thread(target=push)
+    push_worker.start()
+    assert manifest_copied.wait(1.0)
+
+    mutation_worker = threading.Thread(target=replace_pair)
+    mutation_worker.start()
+    # The push owns the logical pair lock from validation through the tensor
+    # copy, so replacement cannot enter the old manifest/tensor split window.
+    assert not mutation_done.wait(0.1)
+
+    continue_snapshot.set()
+    push_worker.join(timeout=2.0)
+    mutation_worker.join(timeout=2.0)
+
+    assert not push_worker.is_alive()
+    assert not mutation_worker.is_alive()
+    assert push_done.is_set()
+    assert mutation_done.is_set()
+    assert push_errors == []
+    assert mutation_errors == []
+    assert staged[tensor.name] == old_tensor
+    assert tensor.read_bytes() != old_tensor
+    staged_manifest = json.loads(staged["manifold.json"])
+    assert staged_manifest["files"][tensor.name] == hashlib.sha256(
+        old_tensor,
+    ).hexdigest()
+
+
+def test_push_manifold_freezes_candidates_before_staging(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lower-level new pair born after the lock scan is not re-globbed."""
+    from saklas.io import hf_manifolds as hfm
+
+    folder = _author_fake_manifold(tmp_path, monkeypatch)
+    staged = _capture_push_staging(monkeypatch)
+    real_write = hfm.write_bytes_atomic
+    injected: list[Path] = []
+
+    def inject_after_manifest(path: Path, data: bytes) -> None:
+        real_write(path, data)
+        path = Path(path)
+        if (
+            not injected
+            and path.name == "manifold.json"
+            and path.parent.name.startswith("saklas-manifold-push-")
+        ):
+            injected.append(_write_fitted_manifold(
+                folder, "new/model", publish_manifest=False,
+            ))
+
+    monkeypatch.setattr(hfm, "write_bytes_atomic", inject_after_manifest)
+    hfm.push_manifold(folder, "alice/mood", dry_run=True)
+
+    new_tensor = injected[0]
+    assert new_tensor.is_file()
+    assert new_tensor.name not in staged
+    assert new_tensor.with_suffix(".json").name not in staged
+    staged_manifest = json.loads(staged["manifold.json"])
+    assert new_tensor.name not in staged_manifest["files"]
+    assert new_tensor.with_suffix(".json").name not in staged_manifest["files"]
+
+
 # ========================================================== legacy-pack port ===
 #
 # 4.0 back-compat: `manifold install` ports a published/local legacy
@@ -405,6 +525,118 @@ def test_force_local_install_onto_itself_is_safe(
     assert install_manifold(str(folder), force=True) == folder
     assert (folder / "manifold.json").read_bytes() == manifest_before
     ManifoldFolder.load(folder)
+
+
+def test_local_as_install_rewrites_identity_and_resolves_destination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("SAKLAS_HOME", str(home))
+    from saklas.io import hf_manifolds as hfm
+    from saklas.core.manifold import load_manifold
+    from saklas.io.manifolds import ManifoldFolder
+    from saklas.io.paths import manifold_dir, tensor_filename
+    from saklas.io.selectors import invalidate, parse, resolve
+
+    source = _author_fake_manifold(home, monkeypatch, name="source")
+    installed = hfm.install_manifold(
+        str(source), as_="renamed/target", force=False,
+    )
+
+    assert installed == manifold_dir("renamed", "target")
+    assert ManifoldFolder.load(installed).name == "target"
+    fitted = load_manifold(installed / tensor_filename("google/gemma-2-2b-it"))
+    assert fitted.name == "target"
+    assert fitted.metadata["name"] == "target"
+    invalidate()
+    matches = resolve(parse("renamed/target"))
+    assert [(m.namespace, m.name, m.folder) for m in matches] == [
+        ("renamed", "target", installed),
+    ]
+
+
+def test_hf_as_install_rewrites_identity_and_resolves_destination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("SAKLAS_HOME", str(home))
+    from saklas.io import hf_manifolds as hfm
+    from saklas.core.manifold import load_manifold
+    from saklas.io.manifolds import ManifoldFolder
+    from saklas.io.paths import manifold_dir, tensor_filename
+    from saklas.io.selectors import invalidate, parse, resolve
+
+    source = _author_fake_manifold(home, monkeypatch, name="source")
+    monkeypatch.setattr(
+        hfm, "_hf_snapshot_download", lambda **_kw: str(source),
+    )
+    installed = hfm.install_manifold(
+        "alice/source", as_="renamed/target", force=False,
+    )
+
+    assert installed == manifold_dir("renamed", "target")
+    mf = ManifoldFolder.load(installed)
+    assert mf.name == "target"
+    assert mf.source == "hf://alice/source"
+    fitted = load_manifold(installed / tensor_filename("google/gemma-2-2b-it"))
+    assert fitted.name == "target"
+    assert fitted.metadata["name"] == "target"
+    invalidate()
+    matches = resolve(parse("renamed/target"))
+    assert [(m.namespace, m.name, m.folder) for m in matches] == [
+        ("renamed", "target", installed),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("source_kind", "remove"),
+    [
+        ("local", "sidecar"),
+        ("local", "both"),
+        ("hf", "tensor"),
+        ("hf", "both"),
+    ],
+)
+def test_install_rejects_unmanifested_fitted_pair_during_rename(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source_kind: str,
+    remove: str,
+) -> None:
+    """Install-as never blesses a fitted half absent from source proofs."""
+    home = tmp_path / "home"
+    monkeypatch.setenv("SAKLAS_HOME", str(home))
+    from saklas.io import hf_manifolds as hfm
+    from saklas.io.paths import manifold_dir
+
+    source = _author_fake_manifold(home, monkeypatch, name="source")
+    tensor = next(source.glob("*.safetensors"))
+    sidecar = tensor.with_suffix(".json")
+    manifest_path = source / "manifold.json"
+    manifest = json.loads(manifest_path.read_text())
+    if remove in {"tensor", "both"}:
+        manifest["files"].pop(tensor.name)
+    if remove in {"sidecar", "both"}:
+        manifest["files"].pop(sidecar.name)
+    manifest_path.write_text(json.dumps(manifest))
+
+    target = manifold_dir("renamed", "target")
+    if source_kind == "hf":
+        monkeypatch.setattr(
+            hfm, "_hf_snapshot_download", lambda **_kw: str(source),
+        )
+        with pytest.raises(hfm.HFError, match="untrusted fitted pair"):
+            hfm.install_manifold(
+                "alice/source", as_="renamed/target", force=False,
+            )
+    else:
+        with pytest.raises(
+            hfm.ManifoldInstallConflict, match="untrusted fitted pair",
+        ):
+            hfm.install_manifold(
+                str(source), as_="renamed/target", force=False,
+            )
+    assert not target.exists()
 
 
 def test_force_local_install_copy_failure_preserves_destination(

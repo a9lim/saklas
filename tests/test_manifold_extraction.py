@@ -7,8 +7,10 @@ real model is needed.
 from __future__ import annotations
 
 import hashlib
+import gc
 import json
 import threading
+import weakref
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, cast
@@ -1542,6 +1544,38 @@ def test_fit_sae_variant(tmp_path: Path) -> None:
     assert manifold.feature_space == "sae-mock-rel"
     assert sorted(manifold.layers) == list(range(_N_LAYERS))
     assert (folder / "stub-model_sae-mock-rel.safetensors").exists()
+
+
+def test_multi_node_sae_fit_releases_raw_centroid_layers_during_reconstruction(
+    tmp_path: Path,
+) -> None:
+    """SAE reconstruction does not retain a second raw K x D x L roster."""
+    folder = _author_manifold(tmp_path)
+    raw_refs: list[tuple[int, weakref.ReferenceType[torch.Tensor]]] = []
+
+    def encode(idx: int, hidden: torch.Tensor) -> torch.Tensor:
+        gc.collect()
+        assert all(
+            ref() is None for prior_idx, ref in raw_refs if prior_idx < idx
+        ), "a reconstructed layer retained its raw centroid roster"
+        raw_refs.append((idx, weakref.ref(hidden)))
+        return hidden
+
+    def decode(_idx: int, features: torch.Tensor) -> torch.Tensor:
+        # Force a distinct reconstructed payload; an identity return would
+        # intentionally make raw and reconstructed storage the same tensor.
+        return features.clone()
+
+    sae = MockSaeBackend(
+        layers=frozenset(range(_N_LAYERS)), d_model=_DIM,
+        release="memory-rel", fingerprint="memory-rel-fingerprint",
+        encode_fn=encode, decode_fn=decode,
+    )
+    ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder, sae=sae)
+
+    gc.collect()
+    assert len(raw_refs) == _N_LAYERS
+    assert all(ref() is None for _idx, ref in raw_refs)
 
 
 def test_fit_sae_cache_hit_resolves_identity_without_loading_weights(

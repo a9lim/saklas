@@ -1884,6 +1884,14 @@ class SaklasSession:
         if loaded is None:
             SaklasSession._evict_resident_jlens(self)
             return None
+        if loaded[1].get("model_fingerprint") != live_fingerprint:
+            SaklasSession._evict_resident_jlens(self)
+            _log.warning(
+                "ignoring concurrently replaced Jacobian lens for %s: "
+                "loaded payload does not match the live model",
+                self.model_id,
+            )
+            return None
         SaklasSession._adopt_fitted_jlens(
             self, loaded[0], sidecar=loaded[1],
         )
@@ -1897,10 +1905,11 @@ class SaklasSession:
         from saklas.io.lens import load_lens, load_lens_sidecar
 
         sidecar = load_lens_sidecar(self.model_id)
+        live_fingerprint = loaded_model_fingerprint(self._model, self.model_id)
         compatible = bool(
             sidecar is not None
             and sidecar.get("model_fingerprint")
-            == loaded_model_fingerprint(self._model, self.model_id)
+            == live_fingerprint
         )
         if not compatible:
             if self._jlens is not None:
@@ -1913,6 +1922,9 @@ class SaklasSession:
         ):
             loaded = load_lens(self.model_id)
             if loaded is None:
+                SaklasSession._evict_resident_jlens(self)
+                return False
+            if loaded[1].get("model_fingerprint") != live_fingerprint:
                 SaklasSession._evict_resident_jlens(self)
                 return False
             SaklasSession._adopt_fitted_jlens(

@@ -198,10 +198,12 @@ category list through verbatim (tagged concepts only, no multi-node sweep).
 - `manifold transfer`: `name`, `--from SRC` / `--to TGT` (required), `-f`, `-j`.
   Fits/loads a Procrustes alignment and writes the target's `from-<safe_src>`
   **manifold** tensor via `transfer_manifold` — one transfer path (the old
-  vector-side transfer bridge is gone). The runner calls
-  `_target_whitener_from_neutral_cache` (→ `LayerWhitener.from_cache`) on the
-  target model's cached `neutral_activations.safetensors` (no model load on a cache
-  hit) so transferred shares are re-baked in the target Mahalanobis metric;
+  vector-side transfer bridge is gone). The runner materializes the target's
+  proven neutral cache once and builds the whitener from those resident rows. A
+  cached alignment loads no model; if the map alone is missing/corrupt and both
+  neutral-cache source identities remain proven, the runner fits and saves the
+  map offline from those cached matrices. Transferred shares are re-baked in the
+  target Mahalanobis metric;
   **mandatory** — a missing/unusable target cache raises `WhitenerError` (the runner
   exits 1 with a regenerate-neutrals hint), there is no Euclidean rebake.
 - `manifold compare`: `concepts` (1+), `-m/--model` (required), `-v`, `-j`,

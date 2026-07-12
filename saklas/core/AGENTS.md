@@ -327,6 +327,9 @@ loads retain full manifest verification.
 `--sae` reconstructs each centroid through the SAE before the fit (fail-fast
 `SaeCoverageError`); the fitted subspace is model-space regardless. Bakes
 `mahalanobis_share` (+ `share_metric`/`subspace_metric`), `origin`. **No lever.**
+For multi-node SAE fits, reconstruction pops raw centroid layers as their decoded
+replacements are produced, so raw and reconstructed full rosters do not coexist;
+the `per_node` view is built only by the K=1 monopolar branch.
 Discover coords come from the **consensus Gram** —
 `mean_L` of each layer's whitened, node-mean-centered `(K,K)` Gram
 `X̃_L Σ_L⁻¹ X̃_Lᵀ` (signal-weighted, layer-agnostic; no reference layer) — and the

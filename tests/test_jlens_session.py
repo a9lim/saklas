@@ -783,6 +783,46 @@ def test_jlens_property_rejects_changed_loaded_weights() -> None:
     assert changed.jlens is None
 
 
+def test_jlens_property_rechecks_loaded_pointer_fingerprint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import saklas.io.lens as lens_io
+
+    session = _StubSession()
+    live_fp = loaded_model_fingerprint(session._model, _MODEL_ID)
+    lens = JacobianLens({0: torch.eye(6)}, n_prompts=1, d_model=6)
+    compatible = {
+        "model_fingerprint": live_fp, "source_layers": [0],
+        "n_prompts": 1, "tensor_sha256": "a" * 64,
+    }
+    replaced = {**compatible, "model_fingerprint": "different-weights"}
+    monkeypatch.setattr(lens_io, "load_lens_sidecar", lambda _model: compatible)
+    monkeypatch.setattr(lens_io, "load_lens", lambda _model: (lens, replaced))
+
+    assert session.jlens is None
+
+
+def test_has_compatible_jlens_rechecks_loaded_pointer_fingerprint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import saklas.io.lens as lens_io
+
+    session = _StubSession()
+    live_fp = loaded_model_fingerprint(session._model, _MODEL_ID)
+    lens = JacobianLens({0: torch.eye(6)}, n_prompts=1, d_model=6)
+    compatible = {
+        "model_fingerprint": live_fp, "source_layers": [0],
+        "n_prompts": 1, "tensor_sha256": "a" * 64,
+    }
+    replaced = {**compatible, "model_fingerprint": "different-weights"}
+    session._jlens = lens
+    session._jlens_identity = ("old",)
+    monkeypatch.setattr(lens_io, "load_lens_sidecar", lambda _model: compatible)
+    monkeypatch.setattr(lens_io, "load_lens", lambda _model: (lens, replaced))
+
+    assert not session.has_compatible_jlens()
+
+
 def test_fit_jlens_resumes_from_checkpoint_without_full_artifact() -> None:
     full = _StubSession().fit_jlens(_PROMPTS, force=True)
     head_session = _StubSession()

@@ -65,32 +65,19 @@ def _resolve_probes(raw: list[str] | None) -> list[str] | None:
     return raw
 
 
-def _target_whitener_from_neutral_cache(
-    model_id: str, *, expected_identity: dict[str, Any] | None = None,
+def _target_whitener_from_neutral_activations(
+    activations: dict[int, Any],
 ) -> Any:
-    """Build a target-model whitener from neutral activations without loading a model.
+    """Build the transfer target metric from an already-proven row roster."""
+    from saklas.core.mahalanobis import LayerWhitener
 
-    Transfer re-bakes the share in the target Mahalanobis metric, which is
-    now mandatory — there is no Euclidean rebake.  A missing, stale, or
-    degenerate target neutral cache raises :class:`WhitenerError` (wrapped
-    from whatever the loader raised) so the caller fails loudly with an
-    actionable hint instead of silently degrading.
-    """
-    from saklas.core.mahalanobis import LayerWhitener, WhitenerError
-
-    try:
-        return LayerWhitener.from_cache(
-            model_id, expected_identity=expected_identity,
-        )
-    except WhitenerError:
-        raise
-    except Exception as e:
-        raise WhitenerError(
-            f"transfer requires a Mahalanobis whitener for the target model "
-            f"'{model_id}', but its neutral activation cache is missing or "
-            f"unusable ({e}); generate neutral activations for the TARGET "
-            f"model first"
-        ) from e
+    return LayerWhitener.from_neutral_activations(
+        activations,
+        {
+            layer: tensor.mean(dim=0)
+            for layer, tensor in activations.items()
+        },
+    )
 
 
 def _load_or_fit_transfer_alignment(
@@ -127,51 +114,106 @@ def _load_or_fit_transfer_alignment_locked(
         alignment_quality,
         fit_alignment,
         load_alignment_map,
+        load_validated_neutral_cache,
         load_or_compute_neutral_activations_with_metadata,
         neutral_cache_identity,
         save_alignment_map,
         validate_neutral_cache_metadata,
     )
 
-    # Exact no-model repeat: immutable Hub commit or local snapshot identity
-    # proves that both validated neutral caches still describe the requested
-    # sources, and the alignment binds those cache identities + its own digest.
+    # Exact no-model path: immutable Hub commit or local snapshot identity proves
+    # that both validated neutral caches still describe the requested sources.
+    # Materialize the target roster once because both outcomes consume it: a
+    # cached alignment needs its whitener, while an absent/corrupt alignment can
+    # be fitted entirely from the two cached row matrices.  The source remains a
+    # metadata-only proof on an alignment hit and is materialized only on a miss.
     if not force:
+        offline_inputs: tuple[
+            dict[str, Any], dict[str, Any], dict[int, Any],
+        ] | None = None
         try:
             from saklas.core.model import model_source_fingerprint
 
             src_cached_sidecar = validate_neutral_cache_metadata(src_model)
-            tgt_cached_sidecar = validate_neutral_cache_metadata(tgt_model)
             src_identity = neutral_cache_identity(src_cached_sidecar)
-            tgt_identity = neutral_cache_identity(tgt_cached_sidecar)
             src_source = model_source_fingerprint(src_model)
             tgt_source = model_source_fingerprint(tgt_model)
             if (
                 src_source is not None
                 and tgt_source is not None
                 and src_identity.get("model_source_fingerprint") == src_source
-                and tgt_identity.get("model_source_fingerprint") == tgt_source
             ):
-                cached = load_alignment_map(
-                    src_model, tgt_model,
-                    source_identity=src_identity, target_identity=tgt_identity,
+                # Do not page the target cache until the cheap source proof says
+                # a no-model path is possible. Once loaded, the same target rows
+                # serve both the cached-map and offline-fit outcomes.
+                tgt_acts, tgt_cached_sidecar = load_validated_neutral_cache(
+                    tgt_model,
                 )
-                if cached is not None:
-                    M, sidecar = cached
-                    raw_q = sidecar.get("quality_per_layer") or {}
-                    quality_per_layer = {
-                        int(k): float(v) for k, v in raw_q.items()
-                    }
-                    map_path, _ = alignment_cache_path(src_model, tgt_model)
-                    target_whitener = _target_whitener_from_neutral_cache(
-                        tgt_model, expected_identity=tgt_identity,
-                    )
-                    return (
-                        M, quality_per_layer, map_path,
-                        src_identity, tgt_identity, target_whitener,
-                    )
+                tgt_identity = neutral_cache_identity(tgt_cached_sidecar)
+                if (
+                    tgt_identity.get("model_source_fingerprint") == tgt_source
+                ):
+                    offline_inputs = (src_identity, tgt_identity, tgt_acts)
         except (OSError, RuntimeError, ValueError, TypeError, KeyError):
             pass
+
+        if offline_inputs is not None:
+            src_identity, tgt_identity, tgt_acts = offline_inputs
+            cached = load_alignment_map(
+                src_model, tgt_model,
+                source_identity=src_identity, target_identity=tgt_identity,
+            )
+            if cached is not None:
+                M, sidecar = cached
+                raw_q = sidecar.get("quality_per_layer") or {}
+                quality_per_layer = {
+                    int(k): float(v) for k, v in raw_q.items()
+                }
+                map_path, _ = alignment_cache_path(src_model, tgt_model)
+                target_whitener = _target_whitener_from_neutral_activations(
+                    tgt_acts,
+                )
+                return (
+                    M, quality_per_layer, map_path,
+                    src_identity, tgt_identity, target_whitener,
+                )
+
+            # The source was kept metadata-only on the hit path. Materialize it
+            # now and require the identity to remain the exact snapshot already
+            # checked against the immutable/local source fingerprint. A writer
+            # racing this preflight therefore falls through to the live-model
+            # path instead of mixing two cache generations.
+            current_src_sidecar: dict[str, Any] | None = None
+            try:
+                src_acts, current_src_sidecar = load_validated_neutral_cache(
+                    src_model,
+                )
+            except (OSError, RuntimeError, ValueError, TypeError, KeyError):
+                src_acts = None
+            if (
+                src_acts is not None
+                and current_src_sidecar is not None
+                and neutral_cache_identity(current_src_sidecar) == src_identity
+            ):
+                try:
+                    M = fit_alignment(src_acts, tgt_acts)
+                except AlignmentError as e:
+                    print(f"{label}: {e}", file=sys.stderr)
+                    sys.exit(1)
+                quality_per_layer = alignment_quality(M, src_acts, tgt_acts)
+                map_path = save_alignment_map(
+                    M, src_model, tgt_model,
+                    source_identity=src_identity, target_identity=tgt_identity,
+                    quality_per_layer=quality_per_layer,
+                )
+                del src_acts
+                target_whitener = _target_whitener_from_neutral_activations(
+                    tgt_acts,
+                )
+                return (
+                    M, quality_per_layer, map_path,
+                    src_identity, tgt_identity, target_whitener,
+                )
 
     # Need both models loaded to compute neutrals.  Loading two large models
     # simultaneously is non-trivial, so serialize: source, then target.
@@ -198,18 +240,6 @@ def _load_or_fit_transfer_alignment_locked(
             model_id=tgt_model, force=force,
         )
         tgt_identity = neutral_cache_identity(tgt_sidecar)
-    # The target activations are already resident for Procrustes. Build the
-    # mandatory target metric lazily from this exact validated tensor set just
-    # before return: this avoids reopening the cache without retaining a second
-    # centered row roster during the alignment SVDs.
-    from saklas.core.mahalanobis import LayerWhitener
-
-    def _resident_target_whitener() -> Any:
-        return LayerWhitener.from_neutral_activations(
-            tgt_acts,
-            {layer: tensor.mean(dim=0) for layer, tensor in tgt_acts.items()},
-        )
-
     cached = None if force else load_alignment_map(
         src_model, tgt_model,
         source_identity=src_identity, target_identity=tgt_identity,
@@ -220,7 +250,7 @@ def _load_or_fit_transfer_alignment_locked(
         quality_per_layer = {int(k): float(v) for k, v in raw_q.items()}
         map_path, _ = alignment_cache_path(src_model, tgt_model)
         del src_acts
-        target_whitener = _resident_target_whitener()
+        target_whitener = _target_whitener_from_neutral_activations(tgt_acts)
         return (
             M, quality_per_layer, map_path, src_identity, tgt_identity,
             target_whitener,
@@ -238,7 +268,7 @@ def _load_or_fit_transfer_alignment_locked(
         quality_per_layer=quality_per_layer,
     )
     del src_acts
-    target_whitener = _resident_target_whitener()
+    target_whitener = _target_whitener_from_neutral_activations(tgt_acts)
     return (
         M, quality_per_layer, map_path, src_identity, tgt_identity,
         target_whitener,
@@ -2434,6 +2464,23 @@ def _try_lens_fit_noop_preflight(
     *,
     docs: list[str] | None = None,
 ) -> bool:
+    """Serialize the complete model-free proof/reap/report transaction."""
+    if args.force:
+        return False
+    from saklas.io.lens import lens_fit_lock
+
+    with lens_fit_lock(args.model):
+        return _try_lens_fit_noop_preflight_locked(
+            args, requested_layers, docs=docs,
+        )
+
+
+def _try_lens_fit_noop_preflight_locked(
+    args: argparse.Namespace,
+    requested_layers: "list[int] | str | None",
+    *,
+    docs: list[str] | None = None,
+) -> bool:
     """Prove an existing fit is exact without loading model weights."""
     import hashlib
 
@@ -2448,8 +2495,6 @@ def _try_lens_fit_noop_preflight(
         resolved_default_lens_corpus_spec,
     )
 
-    if args.force:
-        return False
     sidecar = load_lens_sidecar(args.model)
     if sidecar is None:
         return False

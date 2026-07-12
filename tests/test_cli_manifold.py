@@ -660,13 +660,6 @@ def test_cold_alignment_reuses_loaded_target_neutrals_for_whitener(
         alignment_mod, "save_alignment_map",
         lambda *_args, **_kwargs: tmp_path / "alignment.safetensors",
     )
-    monkeypatch.setattr(
-        runners, "_target_whitener_from_neutral_cache",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("cold path reloaded target neutral activations")
-        ),
-    )
-
     maps, quality, _path, _src_id, _tgt_id, whitener = (
         runners._load_or_fit_transfer_alignment(
             "src/model", "tgt/model", force=True, label="test transfer",
@@ -682,7 +675,7 @@ def test_cold_alignment_reuses_loaded_target_neutrals_for_whitener(
 def test_cached_alignment_keeps_model_free_offline_whitener_path(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
-    """An exact cached repeat loads no model and builds its target metric once."""
+    """A cached repeat loads target rows once and never loads model weights."""
     import torch
 
     import saklas.core.model as model_mod
@@ -703,8 +696,26 @@ def test_cached_alignment_keeps_model_free_offline_whitener_path(
             "n_prompts": 3,
         }
 
+    metadata_calls: list[str] = []
+    payload_calls: list[str] = []
+    target_acts = {0: torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])}
+
+    def metadata_only(model_id: str) -> dict[str, Any]:
+        metadata_calls.append(model_id)
+        return sidecar(model_id)
+
+    def load_validated(
+        model_id: str,
+    ) -> tuple[dict[int, torch.Tensor], dict[str, Any]]:
+        payload_calls.append(model_id)
+        assert model_id == "tgt/model"
+        return target_acts, sidecar(model_id)
+
     monkeypatch.setattr(
-        alignment_mod, "validate_neutral_cache_metadata", sidecar,
+        alignment_mod, "validate_neutral_cache_metadata", metadata_only,
+    )
+    monkeypatch.setattr(
+        alignment_mod, "load_validated_neutral_cache", load_validated,
     )
     monkeypatch.setattr(
         model_mod, "model_source_fingerprint",
@@ -729,26 +740,116 @@ def test_cached_alignment_keeps_model_free_offline_whitener_path(
             AssertionError("exact cached repeat loaded a model")
         )),
     )
-    target_whitener = object()
-    offline_calls: list[tuple[str, dict[str, Any]]] = []
+    result = runners._load_or_fit_transfer_alignment(
+        "src/model", "tgt/model", force=False, label="test transfer",
+    )
 
-    def offline_whitener(
-        model_id: str, *, expected_identity: dict[str, Any],
-    ) -> object:
-        offline_calls.append((model_id, expected_identity))
-        return target_whitener
+    assert result[1] == {0: 0.75}
+    assert result[5].layers == {0}
+    assert metadata_calls == ["src/model"]
+    assert payload_calls == ["tgt/model"]
+
+
+def test_missing_cached_alignment_fits_offline_from_proven_neutral_rows(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A map miss reuses both neutral caches and never loads either model."""
+    import torch
+
+    import saklas.core.model as model_mod
+    import saklas.core.session as session_mod
+    import saklas.io.alignment as alignment_mod
+    from saklas.cli import runners
+
+    src_acts = {0: torch.tensor([[1.0, 0.0], [0.0, 1.0], [2.0, 1.0]])}
+    tgt_acts = {0: torch.tensor([[2.0, 1.0], [1.0, 3.0], [4.0, 2.0]])}
+
+    def sidecar(model_id: str) -> dict[str, Any]:
+        return {
+            "format_version": 2,
+            "capture_version": 1,
+            "model_fingerprint": f"fp:{model_id}",
+            "model_source_fingerprint": f"source:{model_id}",
+            "capture_sha256": model_id,
+            "tensor_sha256": model_id,
+            "layers": [0],
+            "tensor_schema": {
+                "0": {"shape": [3, 2], "dtype": "torch.float32"},
+            },
+            "n_prompts": 3,
+        }
+
+    metadata_calls: list[str] = []
+    payload_calls: list[str] = []
+
+    def metadata_only(model_id: str) -> dict[str, Any]:
+        metadata_calls.append(model_id)
+        return sidecar(model_id)
+
+    def load_validated(
+        model_id: str,
+    ) -> tuple[dict[int, torch.Tensor], dict[str, Any]]:
+        payload_calls.append(model_id)
+        return (
+            src_acts if model_id == "src/model" else tgt_acts,
+            sidecar(model_id),
+        )
 
     monkeypatch.setattr(
-        runners, "_target_whitener_from_neutral_cache", offline_whitener,
+        alignment_mod, "validate_neutral_cache_metadata", metadata_only,
+    )
+    monkeypatch.setattr(
+        alignment_mod, "load_validated_neutral_cache", load_validated,
+    )
+    monkeypatch.setattr(
+        model_mod, "model_source_fingerprint",
+        lambda model_id: f"source:{model_id}",
+    )
+    monkeypatch.setattr(
+        alignment_mod, "load_alignment_map", lambda *_args, **_kwargs: None,
+    )
+    fitted: list[tuple[dict[int, torch.Tensor], dict[int, torch.Tensor]]] = []
+
+    def fit_offline(
+        src: dict[int, torch.Tensor], tgt: dict[int, torch.Tensor],
+    ) -> dict[int, torch.Tensor]:
+        fitted.append((src, tgt))
+        return {0: torch.eye(2)}
+
+    monkeypatch.setattr(alignment_mod, "fit_alignment", fit_offline)
+    monkeypatch.setattr(
+        alignment_mod, "alignment_quality",
+        lambda _maps, _src, _tgt: {0: 0.9},
+    )
+    saved: list[dict[str, Any]] = []
+
+    def save_offline(*_args: Any, **kwargs: Any) -> Path:
+        saved.append(kwargs)
+        return tmp_path / "alignment.safetensors"
+
+    monkeypatch.setattr(alignment_mod, "save_alignment_map", save_offline)
+    monkeypatch.setattr(
+        session_mod.SaklasSession,
+        "from_pretrained",
+        staticmethod(lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("offline alignment fit loaded model weights")
+        )),
     )
 
     result = runners._load_or_fit_transfer_alignment(
         "src/model", "tgt/model", force=False, label="test transfer",
     )
 
-    assert result[1] == {0: 0.75}
-    assert result[5] is target_whitener
-    assert offline_calls == [("tgt/model", result[4])]
+    assert metadata_calls == ["src/model"]
+    assert payload_calls == ["tgt/model", "src/model"]
+    assert len(fitted) == 1
+    assert fitted[0][0] is src_acts
+    assert fitted[0][1] is tgt_acts
+    assert len(saved) == 1
+    assert saved[0]["source_identity"] == result[3]
+    assert saved[0]["target_identity"] == result[4]
+    assert result[1] == {0: 0.9}
+    assert result[5].layers == {0}
 
 
 def test_run_manifold_transfer_calls_backend(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
@@ -793,14 +894,6 @@ def test_run_manifold_transfer_calls_backend(monkeypatch: pytest.MonkeyPatch, tm
         return folder_arg / "Qwen__Qwen3-4B_from-google__gemma-3-4b-it.safetensors"
 
     monkeypatch.setattr("saklas.io.manifolds.transfer_manifold", fake_transfer)
-    # Alignment owns the target metric now; the runner must not reopen the
-    # neutral cache after that helper returns.
-    monkeypatch.setattr(
-        "saklas.cli.runners._target_whitener_from_neutral_cache",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("runner reloaded the target neutral cache")
-        ),
-    )
     cli.main([
         "manifold", "transfer", "local/circumplex",
         "--from", src_model, "--to", "Qwen/Qwen3-4B",
@@ -846,12 +939,6 @@ def test_run_manifold_transfer_json(monkeypatch: pytest.MonkeyPatch, tmp_path: P
         "saklas.io.manifolds.transfer_manifold",
         lambda f, **k: f / "out.safetensors",
     )
-    monkeypatch.setattr(
-        "saklas.cli.runners._target_whitener_from_neutral_cache",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("runner reloaded the target neutral cache")
-        ),
-    )
     cli.main([
         "manifold", "transfer", "local/circumplex",
         "--from", src_model, "--to", "tgt/model", "-j",
@@ -892,12 +979,6 @@ def test_run_manifold_transfer_retries_unproven_target(
             {"model_fingerprint": "src-fp"},
             {"model_fingerprint": "tgt-fp"},
             target_whitener,
-        ),
-    )
-    monkeypatch.setattr(
-        "saklas.cli.runners._target_whitener_from_neutral_cache",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("runner reloaded the target neutral cache")
         ),
     )
     target = folder / tensor_filename(tgt_model, transferred_from=src_model)

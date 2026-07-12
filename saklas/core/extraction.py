@@ -1348,6 +1348,10 @@ class ManifoldExtractionPipeline:
                 stacks_cached[idx] = newly_captured[idx].to(
                     torch.float32,
                 ).contiguous()
+            # ``to(...).contiguous()`` aliases an already-contiguous fp32
+            # capture. Drop the producer mapping now so SAE reconstruction can
+            # release each raw layer as soon as its decoded replacement exists.
+            del newly_captured
             centroid_layers.update(capture_layers)
             capture_elapsed = time.perf_counter() - capture_started
             _progress(
@@ -1378,11 +1382,6 @@ class ManifoldExtractionPipeline:
                 )
                 cached_rows = None
                 new_rows = None
-
-        per_node = [
-            {idx: stacks_cached[idx][node_idx] for idx in fit_layers}
-            for node_idx in range(K)
-        ]
 
         if capture_layers and cache_stem is not None and cache_meta is not None:
             from saklas.io.atomic import write_json_atomic
@@ -1496,6 +1495,9 @@ class ManifoldExtractionPipeline:
         #     needs ``k + 1 ≥ 2`` poised nodes).
         if mf.fit_mode == "pca" and K == 1:
             from saklas.core.vectors import fold_directions_to_subspace
+            per_node = [
+                {idx: stacks_cached[idx][0] for idx in fit_layers}
+            ]
             means = getattr(self._handle, "layer_means", None) or {}
             if not means:
                 raise ValueError(
@@ -1618,7 +1620,13 @@ class ManifoldExtractionPipeline:
         def _stacked_centroids(idx: int) -> torch.Tensor:
             # The capture cache already owns the contiguous (K,D) stack. Alias
             # it instead of rebuilding the same ~K*D payload from row views.
-            s = stacks_cached[idx]
+            # On an SAE fit, transfer ownership out of ``stacks_cached`` one
+            # layer at a time. Once the decoded replacement is returned, no raw
+            # centroid roster remains for that layer.
+            s = (
+                stacks_cached.pop(idx)
+                if sae_backend is not None else stacks_cached[idx]
+            )
             if sae_backend is not None:
                 with torch.no_grad():
                     feat = sae_backend.encode_layer(idx, s.to(device))
@@ -1629,6 +1637,11 @@ class ManifoldExtractionPipeline:
         stacks: dict[int, torch.Tensor] = {
             idx: _stacked_centroids(idx) for idx in fit_layers
         }
+        if sae_backend is not None:
+            # All requested raw stacks were popped above. Clear the now-dead
+            # container explicitly so future edits cannot accidentally retain a
+            # raw K×D×L roster beside the reconstructed and whitened rosters.
+            stacks_cached.clear()
 
         # 2c. Per-layer whitened between-node spread — the concept's signal
         #     concentration across the stack.  ``G_L = X̃_L Σ_L⁻¹ X̃_Lᵀ`` is the

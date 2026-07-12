@@ -316,6 +316,18 @@ the model card (`_render_manifold_card`) carries `library_name: saklas`,
 pulls + `_install_local_manifold` copies. Local copies use the same validated
 stage/swap recovery discipline as HF pulls, and a force install whose source is
 already the resolved destination is an exact no-op rather than self-deletion.
+Both HF and local staged installs rewrite `manifold.json::name` and every fitted
+sidecar's repeated `name` to the destination basename, re-hash those sidecars,
+then run final validation. A fitted pair is eligible for that rewrite only when
+both its tensor and original sidecar already have source-manifest proofs; rename
+never blesses a partial/unmanifested pair. Thus `--as ns/name` changes runtime
+identity as well as the directory; selector discovery retains the loader's actual
+`ManifoldFolder.folder` rather than reconstructing a path from manifest metadata.
+`push_manifold` snapshots its source under one manifest-then-sorted-pair lock
+transaction spanning validation and every corpus, tensor, and sidecar copy into
+staging. The tensor candidate list is frozen before those pair locks are
+acquired, so a lower-level unmanifested pair cannot enter through a later glob;
+the local locks are released before any Hub network request.
 If a caller explicitly supplies the reserved `.staging`/`.bak` sibling as its
 only source, it is snapshotted before recovery/cleanup can rename or delete it.
 `ManifoldInstallConflict` on an existing folder without `force`.
@@ -381,8 +393,12 @@ exact neutral forwards or Procrustes fit. The alignment workflow uses the
 metadata-returning neutral loader, so each materialized cache also supplies its
 already-validated identity without a second payload hash. On a cold/stale
 alignment, the target whitener is built from those same resident target rows;
-an exact model-free repeat retains the offline cache loader. Transfer therefore
-does not reopen and refactor the target neutral artifact after alignment prep.
+the model-free preflight materializes the target cache once for either a cached-map
+whitener or an offline map fit. When the map is missing/corrupt but both neutral
+identities still match their pre-load-verifiable model sources, it materializes
+the source cache too and runs `fit_alignment`/quality/save without loading either
+model. Transfer therefore never re-digests/refactors the target neutral artifact
+after alignment prep.
 `fit_alignment(src, tgt, *, min_shared_layers=10) → {layer: M_L}`
 (orthogonal Procrustes for matched dim, rectangular least-squares otherwise; both
 center first); `alignment_quality` is per-layer R². `transfer_profile(profile,

@@ -21,6 +21,7 @@ import torch
 from saklas.core import vectors as V
 from saklas.core.events import EventBus
 from saklas.core.extraction import ManifoldExtractionPipeline
+from saklas.core.sae import MockSaeBackend
 from saklas.core.vectors import folded_vector_directions
 from saklas.io.manifolds import ManifoldFolder, create_discover_manifold_folder
 from saklas.io.paths import manifold_dir
@@ -134,6 +135,21 @@ def test_monopolar_fits_one_node_ray() -> None:
         # δ̂ = unit(concept − ν) points +along dim 0 (the only displaced axis).
         assert float(vec[0]) > 0.0
         assert torch.allclose(vec[1:], torch.zeros(_DIM - 1), atol=1e-5)
+
+
+def test_monopolar_sae_fit_keeps_single_node_branch() -> None:
+    folder = _author()
+    sae = MockSaeBackend(
+        layers=frozenset(range(_N_LAYERS)), d_model=_DIM,
+        release="mono-rel",
+    )
+    manifold = ManifoldExtractionPipeline(_Handle(), EventBus()).fit(
+        folder, sae=sae,
+    )
+
+    assert manifold.node_labels == ["agentic"]
+    assert manifold.metadata.get("method") == "manifold_monopolar_sae"
+    assert sorted(manifold.layers) == list(range(_N_LAYERS))
 
 
 def test_monopolar_requires_layer_means() -> None:

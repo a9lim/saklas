@@ -22,7 +22,7 @@ from typing import Optional
 
 from saklas.core.errors import SaklasError
 from saklas.io.packs import NAME_REGEX
-from saklas.io.paths import VARIANT_SUFFIX_RE, manifold_dir, manifolds_dir
+from saklas.io.paths import VARIANT_SUFFIX_RE, manifolds_dir
 
 # Single source of truth lives in ``io.paths`` (owns the variant scheme).
 _VARIANT_REGEX = VARIANT_SUFFIX_RE
@@ -153,7 +153,7 @@ def all_concepts() -> list[ResolvedConcept]:
         return out
     for ns, mf in folders:
         out.append(ResolvedConcept(
-            namespace=ns, name=mf.name, folder=manifold_dir(ns, mf.name),
+            namespace=ns, name=mf.name, folder=mf.folder,
             tags=list(mf.tags or []),
         ))
     _concepts_cache[root] = out
