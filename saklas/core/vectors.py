@@ -349,7 +349,7 @@ def _encode_and_capture_all(
         dict mapping layer_idx -> pooled vector (dim,) in fp32.
     """
     ids, content_end = _render_and_tokenize_for_capture(
-        tokenizer, prompt, response, device,
+        tokenizer, prompt, response,
         role=role, model_type=model_type, system_msg=system_msg,
     )
     ids = ids.to(device)
@@ -415,7 +415,7 @@ def _encode_and_capture_all_batch(
         raise ValueError("batched capture accepts role= or roles=, not both")
     if rendered is None:
         rendered_rows = _prepare_capture_batch(
-            tokenizer, prompts, responses, device,
+            tokenizer, prompts, responses,
             role=role, roles=roles, model_type=model_type,
             system_msg=system_msg,
         )
@@ -467,7 +467,6 @@ def _prepare_capture_batch(
     tokenizer: Any,
     prompts: "Sequence[str | list[dict[str, str]]]",
     responses: Sequence[str],
-    device: torch.device,
     *,
     role: str | None = None,
     roles: Sequence[str | None] | None = None,
@@ -526,7 +525,7 @@ def _prepare_capture_batch(
         pass
     return [
         _render_and_tokenize_for_capture(
-            tokenizer, prompt, response, device,
+            tokenizer, prompt, response,
             role=row_role, model_type=model_type, system_msg=system_msg,
             special_ids=skip,
         )
@@ -585,7 +584,6 @@ def _render_and_tokenize_for_capture(
     tokenizer: Any,
     prompt: "str | list[dict[str, str]]",
     response: str,
-    device: torch.device,
     *,
     role: str | None = None,
     model_type: str | None = None,
@@ -627,7 +625,6 @@ def _render_and_tokenize_for_capture(
     content_end = last_content_index(
         ids[0].tolist(), tokenizer, skip=special_ids,
     )
-    del device  # retained in the private signature for compatibility callers
     return ids, content_end
 
 

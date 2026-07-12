@@ -570,7 +570,7 @@ def test_fit_can_reuse_pretokenized_rows_without_tokenizer_call() -> None:
     assert lens.n_prompts == 1
 
 
-def test_fit_checkpoint_callback_fires() -> None:
+def test_fit_checkpoint_accumulator_callback_fires() -> None:
     model = _frozen_model(n_layers=2)
     tokenizer = _CharTokenizer()
     prompt = "a prompt that is long enough."
@@ -579,7 +579,7 @@ def test_fit_checkpoint_callback_fires() -> None:
     fit_jacobian_lens(
         model, tokenizer, [prompt] * 4, _layers(model),
         dim_batch=3, prompt_batch=3, checkpoint_every=2,
-        checkpoint_cb=lambda l: seen.append(l.n_prompts),
+        checkpoint_accumulator_cb=lambda _sums, count, _dim: seen.append(count),
     )
     # Cadence no longer fractures a healthy width-3 graph merely to stop at 2.
     assert seen == [3, 4]
@@ -624,7 +624,7 @@ def test_fit_skips_terminal_periodic_checkpoint() -> None:
         model, tokenizer, [prompt] * 2, _layers(model),
         dim_batch=3, prompt_batch=2, checkpoint_every=2,
         suppress_terminal_checkpoint=True,
-        checkpoint_cb=lambda lens: seen.append(lens.n_prompts),
+        checkpoint_accumulator_cb=lambda _sums, count, _dim: seen.append(count),
     )
 
     assert seen == []

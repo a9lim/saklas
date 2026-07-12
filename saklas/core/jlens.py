@@ -1021,7 +1021,6 @@ def fit_jacobian_lens(
     max_seq_len: int = DEFAULT_SEQ_LEN,
     skip_first: int = SKIP_FIRST_POSITIONS,
     checkpoint_every: int = DEFAULT_CHECKPOINT_EVERY,
-    checkpoint_cb: Callable[[JacobianLens], None] | None = None,
     checkpoint_accumulator_cb: (
         Callable[[Mapping[int, torch.Tensor], int, int], None] | None
     ) = None,
@@ -1036,17 +1035,15 @@ def fit_jacobian_lens(
     """Fit ``J_l`` for every source layer over ``prompts``.
 
     One graph per prompt microbatch + ``ceil(d_model/dim_batch)`` backwards
-    (see the module docstring for the estimator). ``checkpoint_cb`` receives the partial lens
-    every ``checkpoint_every`` prompts — the io layer uses it for resumable
-    fits. ``initial_lens`` transfers ownership of an existing averaged prefix
+    (see the module docstring for the estimator). ``initial_lens`` transfers
+    ownership of an existing averaged prefix
     to the estimator: its fp32 matrices are converted to weighted sums in
     place and become the accumulator, so resume never allocates a second full
     matrix set.
     ``checkpoint_accumulator_cb`` is the allocation-light persistence seam: it
     receives the raw fp32 sums, completed prompt count, and hidden size without
-    materializing a second full averaged lens.  ``checkpoint_cb`` remains the
-    public compatibility callback. ``input_id_rows`` is the pre-tokenized sibling
-    of ``prompts``.  When supplied
+    materializing a second full averaged lens. ``input_id_rows`` is the
+    pre-tokenized sibling of ``prompts``. When supplied
     it must be aligned 1:1 with ``prompts`` and already reflect the caller's
     truncation/hash policy; the fit still applies ``max_seq_len`` defensively.
     This lets session-level resume/filtering reuse the IDs it already computed
@@ -1175,16 +1172,6 @@ def fit_jacobian_lens(
     pending_tasks: list[tuple[int, int, int]] = []
     pending_group_width = 0
 
-    def _partial() -> JacobianLens:
-        acc = state["acc"]
-        assert acc is not None
-        total_done = initial_n_prompts + n_done
-        return JacobianLens(
-            {l: a / max(total_done, 1) for l, a in acc.items()},
-            n_prompts=total_done,
-            d_model=state["d_model"],
-        )
-
     hook_state: dict[str, Any] = {}
     captured, handles = _install_fit_hooks(
         layer_modules, sources, final_idx, hook_state,
@@ -1206,8 +1193,6 @@ def fit_jacobian_lens(
                                     initial_n_prompts + n_done,
                                     state["d_model"],
                                 )
-                            if checkpoint_cb is not None:
-                                checkpoint_cb(_partial())
                         raise JacobianLensCancelled(
                             f"Jacobian-lens fit cancelled after {n_done} prompts"
                         )
@@ -1420,8 +1405,6 @@ def fit_jacobian_lens(
                             initial_n_prompts + n_done,
                             state["d_model"],
                         )
-                    if checkpoint_cb is not None:
-                        checkpoint_cb(_partial())
                     # Allocator hygiene at checkpoint cadence only — a per-prompt
                     # empty_cache forces a sync and dumps the pool the very next
                     # prompt re-allocates.
@@ -1438,8 +1421,7 @@ def fit_jacobian_lens(
         raise JacobianLensError(
             f"no usable prompts: every prompt had <= {skip_first + 1} tokens"
         )
-    # Finalization owns the accumulator now; normalize it in place instead of
-    # allocating one additional fp32 artifact through ``_partial()``.
+    # Finalization owns the accumulator now; normalize it in place.
     acc: dict[int, torch.Tensor] = state["acc"]
     total_done = initial_n_prompts + n_done
     inv_n = 1.0 / total_done

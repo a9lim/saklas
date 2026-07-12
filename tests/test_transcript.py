@@ -98,9 +98,10 @@ def test_schema_round_trip():
     assert t2.turns[1].readings["angry.calm"] == pytest.approx(-0.12)
 
 
-def test_from_yaml_rejects_unknown_version():
+@pytest.mark.parametrize("version", [1, 99])
+def test_from_yaml_rejects_unsupported_version(version: int):
     with pytest.raises(TranscriptFormatError, match="version"):
-        Transcript.from_yaml("saklas_transcript: 99\nturns: []\n")
+        Transcript.from_yaml(f"saklas_transcript: {version}\nturns: []\n")
 
 
 def test_from_yaml_rejects_non_mapping_root():
@@ -410,23 +411,6 @@ def test_v2_round_trip_speaker_and_cast(tmp_path: Path):
     assert t2.turns[0].speaker == "captain"
     assert t2.turns[2].recipe is not None
     assert t2.cast == t.cast
-
-
-def test_v1_files_still_load():
-    yaml_text = (
-        "saklas_transcript: 1\n"
-        "model_id: m\n"
-        "system_prompt: null\n"
-        "probes: []\n"
-        "turns:\n"
-        "- role: user\n"
-        "  text: hi\n"
-        "- role: assistant\n"
-        "  text: hello\n"
-    )
-    t = Transcript.from_yaml(yaml_text)
-    assert [x.speaker for x in t.turns] == [None, None]
-    assert t.cast == {}
 
 
 def test_import_reattaches_generated_user_seat_turn():

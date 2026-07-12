@@ -884,7 +884,7 @@ def prepare_manifold_capture_identity(
                 flat_responses.append(response)
                 flat_roles.append(role)
         prepared_rows = _prepare_capture_batch(
-            tokenizer, flat_prompts, flat_responses, handle.device,
+            tokenizer, flat_prompts, flat_responses,
             roles=flat_roles, model_type=model_type,
         )
         capture_model_fingerprint = {

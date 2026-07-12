@@ -476,7 +476,7 @@ def _load_or_compute_neutral_activations_with_metadata_locked(
     prompts = [prompt for prompt, _ in pairs]
     responses = [response for _, response in pairs]
     prepared = _prepare_capture_batch(
-        tokenizer, prompts, responses, torch.device("cpu"),
+        tokenizer, prompts, responses,
     )
     rendered_payload = [
         {"input_ids": ids[0].tolist(), "content_end": int(content_end)}

@@ -28,11 +28,9 @@ Schema (v2 — the cast model)::
         recipe: {...}            # generated turns (either seat); provenance
         readings: {...}          # generated turns
 
-A v1 file (``saklas_transcript: 1``) loads through the same reader —
-``speaker`` and ``cast`` simply default empty.  On import, a turn with
-a ``recipe`` re-attaches as a *generated* node in its recorded seat
-(provenance = recipe presence, the cast model's invariant); a
-recipe-less turn is a committed one.  Cast entries merge into the
+On import, a turn with a ``recipe`` re-attaches as a *generated* node in its
+recorded seat (provenance = recipe presence, the cast model's invariant); a
+recipe-less turn is a committed one. Cast entries merge into the
 session tree's roster; a label the live roster already holds with a
 *different* member is left alone and flagged in the guard notes.
 
@@ -67,11 +65,6 @@ from saklas.core.loom import CastMember, LoomTree, Recipe
 
 
 SAKLAS_TRANSCRIPT_VERSION = 2
-
-# Versions ``from_yaml`` accepts.  v1 predates the cast model — no
-# ``speaker`` on turns, no ``cast`` block; both default empty.
-_SUPPORTED_VERSIONS = (1, 2)
-
 
 # ---------------------------------------------------------------------------
 # Errors
@@ -276,10 +269,10 @@ class Transcript:
                 f"transcript root must be a mapping, got {type(data).__name__}"
             )
         version = data.get("saklas_transcript")
-        if version not in _SUPPORTED_VERSIONS:
+        if version != SAKLAS_TRANSCRIPT_VERSION:
             raise TranscriptFormatError(
                 f"unsupported saklas_transcript version {version!r} "
-                f"(this build supports {list(_SUPPORTED_VERSIONS)})"
+                f"(this build requires {SAKLAS_TRANSCRIPT_VERSION})"
             )
         probes = [
             ProbeRef(name=str(p["name"]), sha256=str(p.get("sha256", "")))

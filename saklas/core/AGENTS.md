@@ -98,8 +98,8 @@ in-transaction pointer proof: terminal promotion and missing-layer shard reuse
 skip a redundant full rehash only while that exact pointer remains under the fit
 lock; unverified public callers retain defensive digest validation. The checkpoint remains the
 recovery point until that pointer commit succeeds.
-`checkpoint_cb` remains the compatibility surface. `JacobianLens.merge` is the
-non-mutating n_prompts-weighted combiner; `merge_into` recycles a caller-owned
+`JacobianLens.merge` is the non-mutating n_prompts-weighted combiner;
+`merge_into` recycles a caller-owned
 tail; `union_layers` combines same-corpus layer shards. Persisting a
 missing-layer union reuses the existing v4 shard pointers and serializes only
 the newly fitted layers. A same-session superset remains the full resident lens
@@ -188,7 +188,7 @@ values to skip trailing chat-template markers (where outlier channels dominate).
 `special_token_ids` + `last_content_index` are the one canonical "last non-special
 token" definition shared by every single-state readout (centroid pooling, vector
 aggregate, manifold aggregate). `_render_and_tokenize_for_capture(tokenizer,
-prompt, response, device, *, role=, model_type=)` is the shared
+prompt, response, *, role=, model_type=)` is the shared
 render+tokenize+walkback front half; `role` substitutes the assistant label only
 when an explicit per-node role override is set (the persona-baselined fit), the
 swap-back default being the standard assistant. `_load_baseline_prompts` loads the
@@ -1227,8 +1227,8 @@ b − a`, sorted by `abs(delta)`), `per_token_diff` (byte-offset alignment),
 
 Transcript export/import for loom paths. `SAKLAS_TRANSCRIPT_VERSION = 2`
 (the cast model: per-turn `speaker:` = `role_label`, `thinking:` =
-`thinking_text`, top-level `cast:` block; v1 files still load — the fields
-default empty). `to_yaml`/`from_yaml`. Import modes: **default** (new top-level
+`thinking_text`, top-level `cast:` block). `to_yaml`/`from_yaml` require that
+exact version. Import modes: **default** (new top-level
 branch), **here** (child of active), **merge** (attach the non-matching tail at
 the deepest matching prefix). Import re-attaches a recipe-bearing turn as a
 *generated* node in its recorded seat (`begin_assistant(seat=turn.role)`) and

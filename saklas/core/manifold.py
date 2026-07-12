@@ -4497,7 +4497,6 @@ def compute_manifold_node_stats(
             tokenizer,
             [row[2] for row in flat],
             [row[3] for row in flat],
-            device,
             roles=[row[4] for row in flat],
             model_type=model_type,
         )
