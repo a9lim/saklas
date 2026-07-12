@@ -16,6 +16,23 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
+def _nonnegative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be a non-negative integer")
+    return parsed
+
+
+def _bounded_int(lo: int, hi: int):
+    def parse(value: str) -> int:
+        parsed = int(value)
+        if not lo <= parsed <= hi:
+            raise argparse.ArgumentTypeError(f"must be in [{lo}, {hi}]")
+        return parsed
+
+    return parse
+
+
 def _add_common_args(p: argparse.ArgumentParser) -> None:
     """Model-loading args shared between `tui` and `serve`."""
     p.add_argument(
@@ -62,7 +79,8 @@ def _add_logit_args(p: argparse.ArgumentParser) -> None:
     YAML equivalent: ``return_top_k:`` int in ``[0, 256]``.
     """
     p.add_argument(
-        "--top-k-alts", dest="top_k_alts", type=int, default=None, metavar="N",
+        "--top-k-alts", dest="top_k_alts", type=_bounded_int(0, 256),
+        default=None, metavar="N",
         help="Session default for top-K alternatives capture (0–256). "
              "0 (default) = chosen-token logprob only; N>0 ships top-N "
              "decoded alternatives per token for distributional surfaces. "
@@ -202,7 +220,7 @@ def _build_tui_parser(parser: argparse.ArgumentParser) -> None:
                         help="Device: auto (detect), cuda, mps, or cpu")
     parser.add_argument("-p", "--probes", nargs="*", default=None,
                         help="Probe categories (default: all)")
-    parser.add_argument("--max-tokens", type=int, default=1024,
+    parser.add_argument("--max-tokens", type=_positive_int, default=1024,
                         help="Default max generation tokens")
     _add_injection_args(parser)
     _add_logit_args(parser)
@@ -233,7 +251,10 @@ def _build_serve_parser(parser: argparse.ArgumentParser) -> None:
         help="Probe categories: all, none, epistemic, alignment, register, cultural (default: all)",
     )
     parser.add_argument("-H", "--host", default="0.0.0.0", help="Bind address")
-    parser.add_argument("-P", "--port", type=int, default=8000, help="Bind port")
+    parser.add_argument(
+        "-P", "--port", type=_bounded_int(1, 65535), default=8000,
+        help="Bind port",
+    )
     parser.add_argument("-S", "--steer", default=None, metavar="EXPR",
                         help='Default steering expression, e.g. "0.5 honest + 0.3 warm"')
     parser.add_argument("-C", "--cors", action="append", default=[], metavar="ORIGIN",
@@ -365,16 +386,16 @@ def _build_manifold_fit(fit: argparse.ArgumentParser) -> None:
              "axes via persistent homology (default: keep folder's setting)",
     )
     fit.add_argument(
-        "--max-dim", dest="max_dim", type=int, default=None, metavar="N",
+        "--max-dim", dest="max_dim", type=_positive_int, default=None, metavar="N",
         help="Discover-mode: cap intrinsic dimension "
              "(default: 8 for PCA, 8 for spectral)",
     )
     fit.add_argument(
-        "--min-dim", dest="min_dim", type=int, default=None, metavar="N",
+        "--min-dim", dest="min_dim", type=_positive_int, default=None, metavar="N",
         help="Discover spectral: floor the intrinsic dimension the "
              "eigenvalue-ratio cliff picks (the cliff undershoots when one "
              "mode dominates — set --min-dim == --max-dim to pin the dim "
-             "exactly, e.g. PAD's 3). Ignored for --method pca.",
+             "exactly, e.g. PAD's 3). Valid only for spectral/auto fits.",
     )
     fit.add_argument(
         "--var-threshold", dest="var_threshold", type=float, default=None,
@@ -383,7 +404,7 @@ def _build_manifold_fit(fit: argparse.ArgumentParser) -> None:
              "crosses T is picked (default: 0.70)",
     )
     fit.add_argument(
-        "--k-nn", dest="k_nn", type=int, default=None, metavar="K",
+        "--k-nn", dest="k_nn", type=_positive_int, default=None, metavar="K",
         help="Discover spectral: number of nearest neighbors in the k-NN "
              "graph (default: max(5, ceil(log K)))",
     )
@@ -393,27 +414,28 @@ def _build_manifold_fit(fit: argparse.ArgumentParser) -> None:
              "(default: median k-NN distance)",
     )
     fit.add_argument(
-        "--max-subspace-dim", dest="max_subspace_dim", type=int, default=None,
+        "--max-subspace-dim", dest="max_subspace_dim", type=_positive_int,
+        default=None,
         metavar="R",
         help="Discover spectral (curved) only: per-layer RBF subspace dim "
              "cap (default 64). Smaller values give finer-grained steering "
              "control at large K — each axis the RBF can move along is an "
              "axis subspace_inject can displace, so fewer axes = smaller "
-             "per-α effect = wider coherence regime. Ignored for --method pca "
+             "per-α effect = wider coherence regime. Valid only for spectral/auto "
              "(a flat fit's subspace dim is its layout dim — use --max-dim).",
     )
     fit.add_argument(
         "--smoothing", dest="smoothing", default=None, metavar="LAMBDA",
         help="Discover spectral/auto (curved): penalized-RBF smoothing — "
              "'auto' (GCV-selected, the default), '0' (exact interpolation), "
-             "or a float λ. Ignored for --method pca (no RBF surface).",
+             "or a float λ. Valid only for spectral/auto (no PCA RBF surface).",
     )
     fit.add_argument(
         "--persistence-frac", dest="persistence_frac", type=float,
         default=None, metavar="F",
         help="Discover auto: H1 loop-significance threshold as a fraction of "
              "the connectivity scale (default 0.5); higher = stricter periodic "
-             "detection. Ignored unless --method auto.",
+             "detection. Valid only for --method auto.",
     )
     fit.set_defaults(quantize=None, device="auto", probes=None)
 
@@ -445,7 +467,7 @@ def _build_manifold_generate(generate: argparse.ArgumentParser) -> None:
     )
     generate.add_argument(
         "--samples-per-prompt", dest="samples_per_prompt",
-        type=int, default=1, metavar="K",
+        type=_positive_int, default=1, metavar="K",
         help="In-character responses generated per baseline prompt (default: 1)",
     )
     generate.add_argument(
@@ -493,7 +515,7 @@ def _build_manifold_from_template(p: argparse.ArgumentParser) -> None:
              "categories like days/months).",
     )
     p.add_argument(
-        "--max-dim", dest="max_dim", type=int, default=None, metavar="N",
+        "--max-dim", dest="max_dim", type=_positive_int, default=None, metavar="N",
         help="Cap the discovered intrinsic dimension (optional).",
     )
     p.add_argument(
@@ -955,7 +977,7 @@ def _build_lens_top(p: argparse.ArgumentParser) -> None:
     p.add_argument("model", help="HuggingFace model ID or local path")
     p.add_argument("prompt", help="Raw prompt to read out (no chat template)")
     p.add_argument(
-        "-k", "--top-k", type=int, default=8, metavar="K",
+        "-k", "--top-k", type=_positive_int, default=8, metavar="K",
         help="Tokens per (layer, position) readout (default 8)",
     )
     p.add_argument(
@@ -985,7 +1007,7 @@ def _build_lens_decompose(p: argparse.ArgumentParser) -> None:
         help="Model whose lens + fitted direction to use",
     )
     p.add_argument(
-        "-k", "--top-k", type=int, default=16, metavar="K",
+        "-k", "--top-k", type=_positive_int, default=16, metavar="K",
         help="Sparsity budget: atoms in the J-space component (default 16)",
     )
     p.add_argument(
@@ -1102,7 +1124,7 @@ def _build_sae_parser(parser: argparse.ArgumentParser) -> None:
     load.add_argument("release", help="SAELens registry release name")
     load.add_argument("-m", "--model", required=True,
                       help="HuggingFace model ID or local path")
-    load.add_argument("--layer", type=int, default=None,
+    load.add_argument("--layer", type=_nonnegative_int, default=None,
                       help="Explicit covered hook layer (default: nearest 65%% depth)")
     load.add_argument("-d", "--device", default="auto")
     load.add_argument("-q", "--quantize", choices=["4bit", "8bit"], default=None)
@@ -1150,7 +1172,7 @@ def _build_experiment_fan(p: argparse.ArgumentParser) -> None:
     p.add_argument("-q", "--quantize", choices=["4bit", "8bit"], default=None)
     p.add_argument("-d", "--device", default="auto")
     p.add_argument("-p", "--probes", nargs="*", default=None)
-    p.add_argument("--max-tokens", type=int, default=256)
+    p.add_argument("--max-tokens", type=_positive_int, default=256)
     p.add_argument("-j", "--json", dest="json_output", action="store_true")
     _add_injection_args(p)
     _add_logit_args(p)
@@ -1204,7 +1226,7 @@ def _build_experiment_transcript_parser(parser: argparse.ArgumentParser) -> None
         help="Probe categories (default: all)",
     )
     run.add_argument(
-        "--max-tokens", type=int, default=256,
+        "--max-tokens", type=_positive_int, default=256,
         help="Default max generation tokens per replay turn",
     )
     _add_injection_args(run)
@@ -1240,7 +1262,7 @@ def _build_experiment_naturalness(p: argparse.ArgumentParser) -> None:
         help="Also score a linear-chord steering baseline (the manifold "
              "term must be a single '%%' term)",
     )
-    p.add_argument("--max-tokens", type=int, default=128)
+    p.add_argument("--max-tokens", type=_positive_int, default=128)
     p.add_argument("-q", "--quantize", choices=["4bit", "8bit"], default=None)
     p.add_argument("-d", "--device", default="auto")
     p.add_argument("-p", "--probes", nargs="*", default=None)

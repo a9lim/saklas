@@ -130,8 +130,7 @@ category list through verbatim (tagged concepts only, no multi-node sweep).
   Mahalanobis-only — there is **no** `--projection-metric`/`--steer-mode`/
   `--theta-max`/`--legacy`.
 - **Logit block** (`_add_logit_args`): `--top-k-alts N` (→ session
-  `SamplingConfig.return_top_k`). The `[0,256]` bound is validated only on the YAML
-  `return_top_k` key, not on this flag (a plain `type=int`).
+  `SamplingConfig.return_top_k`). Both CLI and YAML enforce `[0,256]`.
 - `tui`: `model` optional (a `-c` config with `model:` can supply it); `--max-tokens`
   default 1024.
 - `serve`: `-H/--host` (default `0.0.0.0`), `-P/--port` (8000), `-S/--steer EXPR`,
@@ -182,10 +181,10 @@ category list through verbatim (tagged concepts only, no multi-node sweep).
   `--method auto` defers flat-vs-curved + periodic-axis selection to
   `select_topology` per-model. `--max-subspace-dim` caps the per-layer RBF subspace
   dim for the curved spectral fit (argparse-default `None` → engine 64) and is
-  dropped by `sanitize_hyperparams` for `--method pca` — a flat fit's subspace dim
+  rejected for `--method pca` — a flat fit's subspace dim
   is its `--max-dim` layout dim. `--min-dim` (spectral only) floors the intrinsic
   dim the eigenvalue-ratio cliff picks (set `--min-dim == --max-dim` to pin it,
-  e.g. PAD's 3); ignored for `--method pca`. `--smoothing` (curved only: GCV `auto` / exact `0`
+  e.g. PAD's 3); it is rejected for `--method pca`. `--smoothing` (curved only: GCV `auto` / exact `0`
   / fixed λ) sets the penalized-RBF regularization; `--persistence-frac` (auto
   only) is the H1 loop-significance threshold. This verb folds the former separate
   `discover` verb.

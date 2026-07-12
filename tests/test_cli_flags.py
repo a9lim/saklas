@@ -10,6 +10,23 @@ from saklas import cli
 from saklas.cli import runners as cli_runners
 
 
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["tui", "model", "--top-k-alts", "-1"],
+        ["serve", "model", "--top-k-alts", "257"],
+        ["tui", "model", "--max-tokens", "0"],
+        ["serve", "model", "--port", "70000"],
+        ["manifold", "fit", "m", "--max-dim", "0"],
+        ["manifold", "fit", "m", "--k-nn", "-2"],
+        ["sae", "load", "release", "-m", "model", "--layer", "-1"],
+    ],
+)
+def test_numeric_flags_reject_out_of_range_values(argv: list[str]) -> None:
+    with pytest.raises(SystemExit):
+        cli.parse_args(argv)
+
+
 # ---------------------------------------------------------------------------
 # parse_args — top-level subcommand dispatch
 # ---------------------------------------------------------------------------

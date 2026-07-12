@@ -1280,9 +1280,9 @@ def _run_manifold_fit(args: argparse.Namespace) -> None:
             requested_hyperparams["k_nn"] = int(args.k_nn)
         if args.bandwidth is not None:
             requested_hyperparams["bandwidth"] = float(args.bandwidth)
-        # Spectral-only knob — dropped by ``sanitize_hyperparams`` for a pca
-        # fit (a flat fit's per-layer subspace dim is its layout dim, capped
-        # by ``--max-dim``, not a separate knob).
+        # Spectral-only knob. The exact-mode sanitizer rejects it for PCA (a
+        # flat fit's per-layer subspace dim is its layout dim, capped by
+        # ``--max-dim``, not a separate knob).
         if getattr(args, "max_subspace_dim", None) is not None:
             requested_hyperparams["max_subspace_dim"] = int(
                 args.max_subspace_dim,
@@ -3183,7 +3183,10 @@ def _run_transcript_run(args: argparse.Namespace) -> None:
             continue
         print(f"assistant: {result.text[:120]}")
         if expected is not None and expected.readings:
-            actual = {n: r.mean[0] for n, r in result.readings.items()}
+            actual = {
+                name: (reading.coords[0] if reading.coords else 0.0)
+                for name, reading in result.probe_readings.items()
+            }
             deltas = []
             for name, expected_v in expected.readings.items():
                 actual_v = actual.get(name, 0.0)
