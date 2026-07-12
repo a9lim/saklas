@@ -72,7 +72,7 @@ class TestConstruction:
         assert len(session.probes) > 0
 
     def test_history_starts_empty(self, session: SaklasSession) -> None:
-        assert session.history == []
+        assert session.tree.messages_for() == []
 
     def test_vectors_starts_empty(self, session: SaklasSession) -> None:
         assert session.vectors == {}
@@ -149,9 +149,10 @@ class TestGeneration:
     def test_generate_appends_to_history(self, session: SaklasSession) -> None:
         session.clear_history()
         session.generate("Say hi.")
-        assert len(session.history) == 2
-        assert session.history[0]["role"] == "user"
-        assert session.history[1]["role"] == "assistant"
+        messages = session.tree.messages_for()
+        assert len(messages) == 2
+        assert messages[0]["role"] == "user"
+        assert messages[1]["role"] == "assistant"
 
     def test_generate_with_alphas(self, session: SaklasSession) -> None:
         name, profile = session.extract_vector_from_corpora(

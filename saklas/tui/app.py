@@ -1196,7 +1196,7 @@ class SaklasApp(App[None]):
         self._refresh_input_mode()
 
     def _do_rewind(self) -> None:
-        if not self._session.history:
+        if not self._session.tree.messages_for():
             self._chat_panel.add_system_message("Nothing to rewind.")
             return
         self._session.rewind()
@@ -1356,7 +1356,7 @@ class SaklasApp(App[None]):
             # re-send it as input.  Under v2.3 loom, ``add_user_turn``
             # dedups against the existing user-child so no explicit pop
             # is needed; just read the text.
-            hist = self._session.history
+            hist = self._session.tree.messages_for()
             if hist and hist[-1]["role"] == "user":
                 user_text = hist[-1]["content"]
             else:
@@ -2764,7 +2764,7 @@ class SaklasApp(App[None]):
                 return
             self._run_regen_n_worker(1)
             return
-        if not self._session.history:
+        if not self._session.tree.messages_for():
             return
         if self._is_busy:
             # Queue the regen — runs after current gen + any earlier

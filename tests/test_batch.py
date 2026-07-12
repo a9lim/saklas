@@ -271,6 +271,7 @@ class TestGenerateBatch:
 
         s = SaklasSession.__new__(SaklasSession)
         s._steering_composer = SteeringComposer(s)
+        s._trait_queues = [object()]
         return s
 
     def test_returns_results_in_prompt_order(self) -> None:
@@ -389,6 +390,7 @@ class TestGenerateBatch:
     def test_probes_fall_back_to_serial_generation(self) -> None:
         s, model = _fast_batch_session()
         cast(Any, s._monitor).probe_names = ["mood"]
+        s._trait_queues = [object()]
         capture: list[Any] = []
         _stub_generate_core(s, capture=capture)
 
@@ -904,6 +906,8 @@ class TestGenerateSweep:
         from saklas.core.session import SaklasSession
 
         s = SaklasSession.__new__(SaklasSession)
+        from saklas.core.generation import GenerationConfig
+        s.config = GenerationConfig()
         return s
 
     def test_single_concept_sweep_yields_one_per_alpha(self) -> None:

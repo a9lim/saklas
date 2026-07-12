@@ -1168,11 +1168,9 @@ class SaklasSession:
         # ``_gen_state`` is the *generator's*.
         self._gen_phase: GenState = GenState.IDLE
 
-        # Conversation state lives in a :class:`LoomTree` (v2.3).  The
-        # active path through the tree is what the model sees as context;
-        # ``self.history`` is a derived property over ``tree.active_path``
-        # for backward-compatibility with v2.2 callers that read the flat
-        # list directly.  Generation routes through ``tree.add_user_turn``
+        # Conversation state lives in a :class:`LoomTree`. The active path
+        # through the tree is what the model sees as context. Generation routes
+        # through ``tree.add_user_turn``
         # / ``tree.begin_assistant`` / ``tree.finalize_assistant``.  The
         # tree is in-memory only — there is no automatic cross-session
         # persistence; the TUI's ``/save`` and ``/load`` are the explicit
@@ -1586,6 +1584,15 @@ class SaklasSession:
         state the server/TUI read while a generation is in flight.
         """
         return self._gen_state
+
+    @property
+    def token_probe_payload(self) -> dict[str, Any]:
+        """Latest token-tap payload for live frontend serialization.
+
+        The token tap is the sole producer. Frontends consume this current
+        step snapshot instead of reconstructing it from persisted loom rows.
+        """
+        return self._last_token_probe_payload or {}
 
     @property
     def gen_lock(self) -> "threading.RLock":
@@ -7224,17 +7231,6 @@ class SaklasSession:
                 f"reservation (reservation root: {reservation})"
             )
 
-    @property
-    def history(self) -> list[dict[str, str]]:
-        """Compat shim — chat messages along the active path.
-
-        Replaces v2.2's ``self._history`` flat list with a derived view
-        over :attr:`tree.active_path`.  Callers that mutated ``_history``
-        directly need to migrate; readers (`session.history`) work
-        unchanged.
-        """
-        return self.tree.messages_for()
-
     def rewind(self) -> None:
         """Walk the active node back one user→assistant pair.
 
@@ -8522,7 +8518,7 @@ class SaklasSession:
             # capture).  Capture then rides the persistent buffers; steering rides the
             # offsets — both compile-clean.
             self._compiled_clean_eligible = bool(
-                getattr(self, "_compiled", False)
+                self._compiled
                 and self._device.type == "mps"
                 and self._static_cache_active
                 and self._capture_buffers
@@ -9154,38 +9150,15 @@ class SaklasSession:
         """
         if len(prompts) < 2 or not stateless:
             return None
-        if not self._batch_fast_runtime_available():
-            return None
         if self._batch_fast_sampling_blocked(sampling):
             return None
-        if getattr(self, "_trait_queues", None):
+        if self._trait_queues:
             return None
         return_probe_readings = bool(
             sampling is None or sampling.return_probe_readings
         )
-        has_monitor_probes = bool(
-            return_probe_readings
-            and getattr(getattr(self, "_monitor", None), "probe_names", [])
-        )
-        has_lens_probes = bool(return_probe_readings and getattr(
-            self, "_lens_probes", None,
-        ))
-        has_sae_probes = bool(return_probe_readings and getattr(
-            self, "_sae_probes", None,
-        ))
-        has_probe_aggregates = has_monitor_probes or has_lens_probes or has_sae_probes
-        if has_probe_aggregates and not (
-            hasattr(self, "_layers")
-            and hasattr(self, "_capture")
-        ):
-            return None
-        if has_monitor_probes and not callable(
-            getattr(self._monitor, "probe_layers", None)
-        ):
-            return None
-        if has_lens_probes and not callable(getattr(self, "_lens_probe_layers", None)):
-            return None
-        if has_sae_probes and getattr(self, "_sae_layer", None) is None:
+        has_sae_probes = bool(return_probe_readings and self._sae_probes)
+        if has_sae_probes and self._sae_layer is None:
             return None
 
         (
@@ -9315,24 +9288,6 @@ class SaklasSession:
         if getattr(self, "_sae_probes", None):
             out.update(self._score_sae_probes(pooled))
         return out
-
-    def _batch_fast_runtime_available(self) -> bool:
-        """Return True when a real session has the pieces the fast path uses."""
-        required = (
-            "_model",
-            "_tokenizer",
-            "_device",
-            "_gen_lock",
-            "_gen_phase",
-            "_gen_state",
-            "_monitor",
-            "_profiles",
-            "_steering",
-            "_default_return_top_k",
-            "config",
-            "events",
-        )
-        return all(hasattr(self, name) for name in required)
 
     @staticmethod
     def _batch_fast_sampling_blocked(sampling: SamplingConfig | None) -> bool:
@@ -9900,8 +9855,6 @@ class SaklasSession:
         shared ``generate_batch`` fast path.
         """
         if len(jobs) < 2 or not stateless:
-            return None
-        if not self._batch_fast_runtime_available():
             return None
         first = jobs[0]
         gen_config = self._compose_gen_config(first.sampling)

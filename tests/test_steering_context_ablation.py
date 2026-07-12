@@ -47,7 +47,7 @@ def _skeleton_session() -> SaklasSession:
     session._device = torch.device("cpu")
     session._dtype = torch.float32
     session._profiles = {}
-    session._layer_means = {}
+    session._layer_means = {1: torch.zeros(3)}
     session._steering = SteeringManager()
     session._steering_composer = SteeringComposer(session)
     # v2.2: _push_steering / _pop_steering acquire _gen_lock; skeleton
@@ -60,6 +60,9 @@ def _skeleton_session() -> SaklasSession:
     session._gen_phase = GenState.IDLE
     session._internal_steering_pop = False
     session._whitener = None
+    session._compiled = False
+    session._compiled_clean_eligible = False
+    session._monitor = type("_Monitor", (), {"probe_names": []})()
     # Skeleton session has no real model.  These ablation tests don't
     # materialize ``~``/``|`` projections (which would now require a covering
     # whitener), so the stub ``whitener`` property returns ``None``.

@@ -48,6 +48,7 @@ from saklas.core.sampling import SamplingConfig
 from saklas.core.steering import Steering
 
 if TYPE_CHECKING:  # avoid a hard import cycle at module load
+    from saklas.core.loom import Recipe
     from saklas.core.session import SaklasSession
 
 
@@ -325,13 +326,13 @@ def _row_token_ids(rows: list[dict[str, Any]] | None) -> tuple[list[int], list[s
     return ids, texts
 
 
-def _sampling_from_recipe(recipe: Any) -> SamplingConfig:
-    sampling = getattr(recipe, "sampling", None)
-    if not isinstance(sampling, SamplingConfig):
+def _sampling_from_recipe(recipe: "Recipe | None") -> SamplingConfig:
+    sampling = recipe.sampling if recipe is not None else None
+    if sampling is None:
         sampling = SamplingConfig()
-    seed = getattr(recipe, "seed", None)
+    seed = recipe.seed if recipe is not None else None
     if seed is not None and sampling.seed is None:
-        sampling = replace(sampling, seed=int(seed))
+        sampling = replace(sampling, seed=seed)
     return sampling
 
 
@@ -346,45 +347,21 @@ def _compose_replay_config(
     session: "SaklasSession",
     sampling: SamplingConfig,
 ) -> GenerationConfig:
-    compose = getattr(session, "_compose_gen_config", None)
-    if compose is not None:
-        return compose(sampling)
-
-    base = getattr(session, "config", None)
-    if isinstance(base, GenerationConfig):
-        cfg = base
-    else:
-        cfg = GenerationConfig(
-            max_new_tokens=int(getattr(base, "max_new_tokens", 1024)),
-            temperature=float(getattr(base, "temperature", 1.0)),
-            top_p=float(getattr(base, "top_p", 0.9)),
-            top_k=getattr(base, "top_k", None),
-            system_prompt=getattr(base, "system_prompt", None),
-        )
-    overrides: dict[str, Any] = {}
-    if sampling.temperature is not None:
-        overrides["temperature"] = sampling.temperature
-    if sampling.top_p is not None:
-        overrides["top_p"] = sampling.top_p
-    if sampling.top_k is not None:
-        overrides["top_k"] = sampling.top_k
-    if sampling.max_tokens is not None:
-        overrides["max_new_tokens"] = sampling.max_tokens
-    return replace(cfg, **overrides) if overrides else cfg
+    return session._compose_gen_config(sampling)
 
 
 def _branch_inputs(session: "SaklasSession", node_id: str) -> _ReplayBranch:
     tree = session.tree
     tokenizer = session.tokenizer
     node = tree.nodes[node_id]
-    recipe = getattr(node, "recipe", None)
+    recipe = node.recipe
     sampling = _sampling_from_recipe(recipe)
     steering = Steering.from_value(
-        getattr(recipe, "steering", None),
-        profile_names=set(getattr(session, "_profiles", {})),
+        recipe.steering if recipe is not None else None,
+        profile_names=set(session.profiles),
     )
 
-    stamped_thinking = getattr(recipe, "thinking", None)
+    stamped_thinking = recipe.thinking if recipe is not None else None
     if stamped_thinking is None:
         if steering is not None and steering.thinking is not None:
             thinking = bool(steering.thinking)
@@ -393,13 +370,13 @@ def _branch_inputs(session: "SaklasSession", node_id: str) -> _ReplayBranch:
     else:
         thinking = bool(stamped_thinking)
 
-    parent_id = getattr(node, "parent_id", None)
+    parent_id = node.parent_id
     parent = tree.nodes.get(parent_id) if parent_id is not None else None
     if parent is not None and parent.role == "user":
         prompt_messages = tree.messages_for(parent.id)
     else:
         prompt_messages = tree.messages_for(node_id)
-    system_prompt = getattr(getattr(session, "config", None), "system_prompt", None) or None
+    system_prompt = session.config.system_prompt or None
     prompt_input = build_chat_input(
         tokenizer,
         prompt_messages,
@@ -409,9 +386,9 @@ def _branch_inputs(session: "SaklasSession", node_id: str) -> _ReplayBranch:
     )
     prompt_ids = [int(t) for t in prompt_input[0].tolist()]
 
-    response_ids, response_texts = _row_token_ids(getattr(node, "tokens", None))
+    response_ids, response_texts = _row_token_ids(node.tokens)
     thinking_ids, _thinking_texts = _row_token_ids(
-        getattr(node, "thinking_tokens", None)
+        node.thinking_tokens
     )
 
     if not response_ids:
@@ -468,10 +445,7 @@ def _replay_branch_logprobs(
     ``[n_rows, vocab]`` tensors filled mostly with ``-inf``.
     """
     model = session.model
-    try:
-        device = next(model.parameters()).device
-    except StopIteration:  # pragma: no cover - defensive for odd test doubles
-        device = torch.device("cpu")
+    device = next(model.parameters()).device
 
     forced_ids = branch.thinking_ids + branch.response_ids
     if not forced_ids:
@@ -494,34 +468,22 @@ def _replay_branch_logprobs(
         bias_idx = torch.tensor(list(logit_bias.keys()), dtype=torch.long, device=device)
         bias_val = torch.tensor(list(logit_bias.values()), dtype=torch.float32, device=device)
 
-    ctx = getattr(getattr(session, "_steering", None), "ctx", None)
+    ctx = session._steering.ctx
     steering_cm = contextlib.nullcontext()
-    if branch.steering is not None and branch.steering.alphas and hasattr(session, "steering"):
+    if branch.steering is not None and branch.steering.alphas:
         steering_cm = session.steering(branch.steering)
 
     row_logps: dict[int, torch.Tensor] = {}
     vocab_size: int | None = None
 
     with steering_cm:
-        if ctx is not None:
-            ctx.reset()
-        begin_capture = getattr(session, "_begin_capture", None)
-        end_capture = getattr(session, "_end_capture", None)
-        monitor = getattr(session, "_monitor", None)
-        if begin_capture is not None:
-            begin_capture(widen=False)
-        if monitor is not None and hasattr(monitor, "begin_live"):
-            monitor.begin_live()
+        ctx.reset()
+        session._begin_capture(widen=False)
+        session._monitor.begin_live()
         try:
-            needs_gating = (
-                bool(session._steering_needs_probe_gating())
-                if hasattr(session, "_steering_needs_probe_gating")
-                else False
-            )
+            needs_gating = session._steering_needs_probe_gating()
             gating_callback = (
-                session._build_gating_score_callback()
-                if needs_gating and hasattr(session, "_build_gating_score_callback")
-                else None
+                session._build_gating_score_callback() if needs_gating else None
             )
 
             current_input = torch.tensor(
@@ -558,10 +520,9 @@ def _replay_branch_logprobs(
 
             with torch.inference_mode():
                 for forced_idx, token_id in enumerate(forced_ids):
-                    if ctx is not None:
-                        ctx.is_prefill = prefill
-                        ctx.thinking = forced_idx < len(branch.thinking_ids)
-                        ctx.gen_step = forced_idx
+                    ctx.is_prefill = prefill
+                    ctx.thinking = forced_idx < len(branch.thinking_ids)
+                    ctx.gen_step = forced_idx
 
                     kwargs: dict[str, Any] = {
                         "input_ids": current_input,
@@ -577,7 +538,7 @@ def _replay_branch_logprobs(
                     outputs = _call_model(model, **kwargs)
                     prefill = False
 
-                    if gating_callback is not None and ctx is not None:
+                    if gating_callback is not None:
                         ctx.probe_scores = gating_callback()
 
                     if not no_cache_mode:
@@ -615,10 +576,8 @@ def _replay_branch_logprobs(
                     next_token = forced_tensor[:, forced_idx:forced_idx + 1]
                     _advance_current_input(next_token)
         finally:
-            if end_capture is not None:
-                end_capture()
-            if monitor is not None and hasattr(monitor, "end_live"):
-                monitor.end_live()
+            session._end_capture()
+            session._monitor.end_live()
 
     return row_logps if vocab_size is not None else {}
 

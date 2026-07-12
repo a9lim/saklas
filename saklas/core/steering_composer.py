@@ -30,7 +30,6 @@ import torch
 from saklas.core.events import SteeringApplied, SteeringCleared
 from saklas.core.manifold import manifold_is_affine
 from saklas.core.session import (
-    CaptureState,
     ConcurrentGenerationError,
     GenState,
     ManifoldNotRegisteredError,
@@ -813,11 +812,7 @@ class SteeringComposer:
         # J-lens token probes referenced by active gates score on the lens
         # path (readout-channel strength), not through the Monitor —
         # detected once per generation here, merged into every return below.
-        monitor_gate_keys = (
-            self.gated_probe_keys()
-            if hasattr(monitor, "probe_names")
-            else set()
-        )
+        monitor_gate_keys = self.gated_probe_keys()
         lens_gate_keys = self.gated_lens_probe_keys()
         sae_gate_keys = self.gated_sae_probe_keys()
         has_lens_gates = bool(lens_gate_keys)
@@ -835,48 +830,34 @@ class SteeringComposer:
         ) -> dict[str, float]:
             if not gate_keys:
                 return {}
-            plan_gate_scalars = getattr(monitor, "plan_gate_scalars", None)
-            score_planned_gate_scalars = getattr(
-                monitor, "score_planned_gate_scalars", None,
+            frozen_keys = frozenset(gate_keys)
+            frozen_probes = (
+                frozenset(probe_names) if probe_names is not None else None
             )
-            if callable(plan_gate_scalars) and callable(score_planned_gate_scalars):
-                frozen_keys = frozenset(gate_keys)
-                frozen_probes = (
-                    frozenset(probe_names) if probe_names is not None else None
+            cache_key = (frozen_keys, frozen_probes)
+            plan = monitor_gate_plan_cache.get(cache_key)
+            if plan is None:
+                plan = monitor.plan_gate_scalars(
+                    set(frozen_keys),
+                    probe_names=(
+                        set(frozen_probes) if frozen_probes is not None else None
+                    ),
                 )
-                cache_key = (frozen_keys, frozen_probes)
-                plan = monitor_gate_plan_cache.get(cache_key)
-                if plan is None:
-                    plan = plan_gate_scalars(
-                        set(frozen_keys),
-                        probe_names=(
-                            set(frozen_probes)
-                            if frozen_probes is not None else None
-                        ),
-                    )
-                    monitor_gate_plan_cache[cache_key] = plan
-                return (
-                    cast(
-                        dict[str, float],
-                        score_planned_gate_scalars(latest, plan),
-                    )
-                    if plan else {}
-                )
-            return monitor.score_gate_scalars(
-                latest,
-                gate_keys,
-                probe_names=probe_names,
+                monitor_gate_plan_cache[cache_key] = plan
+            return (
+                cast(dict[str, float], monitor.score_planned_gate_scalars(latest, plan))
+                if plan else {}
             )
 
         def _monitor_scalars() -> dict[str, float]:
-            incremental_readings = getattr(session, "_incremental_readings", [])
-            incremental_gate_scores = getattr(session, "_incremental_gate_scores", [])
+            incremental_readings = session._incremental_readings
+            incremental_gate_scores = session._incremental_gate_scores
             # The step sink already scored this token's readings — reuse them so
             # the gate doesn't trigger a second pass.  In gating-only-subset mode
             # (FIX #4) the rows hold just the gated probes, which is exactly the
             # set the gate consults; in the full incremental mode they hold the
             # whole roster.  Both reuse the latest appended row.
-            state = getattr(session, "_capture_state", None) or CaptureState()
+            state = session._capture_state
             gating_subset = state.gating_subset
             gate_keys = state.gating_keys or monitor_gate_keys
             if (
@@ -968,23 +949,15 @@ class SteeringComposer:
         steering = session._steering
 
         steering.clear_all()
-        # Raw attr (not the lazily-building ``layer_means`` property): real
-        # sessions populate it at construction / first extraction, and a
-        # model-less context (test stub) keeps an empty dict rather than
-        # triggering a model-dependent build.  An empty anchor ⇒ the synthesizer
-        # skips every layer (no steering), the same degenerate path the old
-        # ablation took without ``layer_means``.
-        neutral_means = session._layer_means
+        neutral_means = session.layer_means
 
         # Whitened push normalization (Mahalanobis-only): hand the synthesizer the
         # session whitener so the per-layer ``along`` budget is the whitened
         # displacement ``‖Δ‖_M`` and the target is a whitened-unit direction —
         # making ``along`` a scale-stable strength knob instead of inheriting each
         # node's raw-Euclidean distance from neutral (which spans ~100× across
-        # targets).  Gated on a real session (means populated): a model-less stub
-        # keeps the Euclidean fallback, and the property soft-fails to ``None``
-        # (covers_all is then false) so a missing whitener degrades, never raises.
-        whitener = session.whitener if neutral_means else None
+        # targets).
+        whitener = session.whitener
 
         # trigger -> {"push": [(basis_dirs, coord_dirs, coeff)], "ablate": [dirs]}
         grouped: dict[Trigger, dict[str, list[Any]]] = {}
@@ -1077,15 +1050,13 @@ class SteeringComposer:
         session = self._session
         steering = session._steering
         session._steering_uses_compiled_offsets = False
-        # ``getattr`` defaults keep skeleton sessions (``__new__`` test stubs that
-        # bypass ``__init__``) on the transient path — they never compile.
         if (
-            getattr(session, "_compiled", False)
+            session._compiled
             and session._device.type == "mps"
             and steering.has_compiled_offsets()
             and (
                 not session._monitor.probe_names
-                or getattr(session, "_compiled_clean_eligible", False)
+                or session._compiled_clean_eligible
             )
         ):
             offsets = steering.compute_static_offsets()

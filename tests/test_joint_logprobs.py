@@ -24,6 +24,8 @@ from saklas.core.joint_logprobs import (
     _shared_prefix_len,
     reorient_for_request,
 )
+from saklas.core.generation import GenerationConfig
+from saklas.core.triggers import TriggerContext
 from tests.conftest import FakeLogitsModel
 
 
@@ -343,10 +345,6 @@ class _MockTree:
         return out
 
 
-class _MockConfig:
-    system_prompt: str | None = None
-
-
 class _MockSession:
     """Just enough surface for ``compute_joint_logprobs`` to run."""
 
@@ -359,7 +357,18 @@ class _MockSession:
         self._model = _MockModel(vocab=len(self.tokenizer._vocab) + 16)
         self.model = self._model
         self.tree = _MockTree()
-        self.config = _MockConfig()
+        self.config = GenerationConfig()
+        self.profiles: dict[str, Any] = {}
+        self._steering = type("SteeringState", (), {"ctx": TriggerContext()})()
+        self._monitor = type(
+            "MonitorState", (),
+            {"begin_live": lambda _self: None, "end_live": lambda _self: None},
+        )()
+        self._compose_gen_config = lambda _sampling: self.config
+        self._begin_capture = lambda **_kwargs: None
+        self._end_capture = lambda: None
+        self._steering_needs_probe_gating = lambda: False
+        self._build_gating_score_callback = lambda: None
 
 
 def test_compute_joint_logprobs_runs_end_to_end_on_mock():

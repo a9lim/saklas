@@ -252,6 +252,8 @@ def test_stop_sequence_probe_aggregate_uses_visible_endpoint():
             raise AssertionError("incremental stop aggregate should not stack")
 
     class Monitor:
+        probe_names = ("toy",)
+
         probe_names = ["toy"]
 
     session: Any = SaklasSession.__new__(SaklasSession)
@@ -511,6 +513,9 @@ def test_token_tap_skips_unconsumed_live_readout_helpers_and_empty_payload(
         zero_compiled_offsets=lambda: None,
     )
     session._capture_state = CaptureState()
+    session._compiled = False
+    session._static_cache_active = False
+    session._capture_buffers = {}
     session._capture = SimpleNamespace(per_layer_buckets=lambda: {})
     session._incremental_readings = []
     session._incremental_gate_scores = []
@@ -917,6 +922,8 @@ def test_gating_callback_backfills_exact_keys_hidden_by_top_n() -> None:
             return {0: torch.ones(4)}
 
     class Monitor:
+        probe_names = ("toy",)
+
         def __init__(self) -> None:
             self.plan_calls: list[frozenset[str]] = []
             self.score_calls: list[tuple[str, frozenset[str]]] = []
@@ -1057,15 +1064,22 @@ def test_mixed_monitor_and_lens_gates_score_only_monitor_gate_keys() -> None:
         def __init__(self) -> None:
             self.requested: set[str] | None = None
 
-        def score_gate_scalars(
+        def plan_gate_scalars(
             self,
-            _latest: dict[int, torch.Tensor],
             gate_keys: set[str],
             *,
             probe_names: set[str] | None = None,
-        ) -> dict[str, float]:
+        ) -> frozenset[str]:
             assert probe_names is None
             self.requested = set(gate_keys)
+            return frozenset(gate_keys)
+
+        def score_planned_gate_scalars(
+            self,
+            _latest: dict[int, torch.Tensor],
+            plan: frozenset[str],
+        ) -> dict[str, float]:
+            assert plan == frozenset({"toy"})
             return {"toy": 0.2}
 
         def score_single_token(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:

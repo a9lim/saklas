@@ -208,11 +208,10 @@ class Transcript:
             )
             turns.append(turn)
 
-        probes: list[ProbeRef] = []
-        for name in getattr(session._monitor, "probe_names", ()):
-            digest = session._probe_hash(name)
-            if digest is not None:
-                probes.append(ProbeRef(name=name, sha256=digest))
+        probes = [
+            ProbeRef(name=name, sha256=digest)
+            for name, digest in session.probe_hashes().items()
+        ]
 
         return cls(
             model_id=getattr(session, "model_id", None)
@@ -393,10 +392,7 @@ class Transcript:
                 f"system_prompt_mismatch: original was {self.system_prompt!r}"
             )
 
-        session_hashes = {
-            name: session._probe_hash(name)
-            for name in getattr(session._monitor, "probe_names", ())
-        }
+        session_hashes = session.probe_hashes()
         drift: list[str] = []
         missing: list[str] = []
         for ref in self.probes:

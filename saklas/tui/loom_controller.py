@@ -312,7 +312,7 @@ class LoomController:
         # We need a prompt to regen from; if there isn't one yet, lift
         # it off the active path.
         if not prompt:
-            hist = app._session.history
+            hist = app._session.tree.messages_for()
             if hist and hist[-1]["role"] == "user":
                 prompt = hist[-1]["content"]
         if not prompt:
@@ -474,7 +474,7 @@ class LoomController:
         app = self._app
         chat = app._chat_panel
         # Read prompt off the active path.
-        hist = app._session.history
+        hist = app._session.tree.messages_for()
         prompt = None
         if hist and hist[-1]["role"] == "user":
             prompt = hist[-1]["content"]
