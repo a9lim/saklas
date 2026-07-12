@@ -39,6 +39,7 @@ from saklas.tui.vector_panel import LeftPanel, MAX_ALPHA
 from saklas.tui.trait_panel import TraitPanel
 
 if TYPE_CHECKING:
+    from saklas.core.results import ProbeReading
     from saklas.core.session import SaklasSession
     from saklas.tui.extraction_controller import ExtractionController
     from saklas.tui.input_history_controller import InputHistoryController
@@ -55,14 +56,38 @@ class _UiToken:
 
     text: str
     thinking: bool
-    scores: Any
     perplexity: float | None
     logprob: float | None
-    widget: Any
+    widget: RawBuffer | _AssistantMessage
     shadow: bool
-    probe_readings: Any = None
-    lens_readout: Any = None
-    lens_aggregate: Any = None
+    probe_readings: dict[str, "ProbeReading"] | None = None
+    lens_readout: dict[int, list[tuple[str, float]]] | None = None
+    lens_aggregate: list[tuple[str, float, float, float]] | None = None
+
+
+@dataclass(frozen=True)
+class _UiFinalize:
+    widget: RawBuffer | _AssistantMessage
+    shadow: bool
+
+
+@dataclass(frozen=True)
+class _UiError:
+    message: str
+    shadow: bool
+
+
+@dataclass(frozen=True)
+class _UiDone:
+    shadow: bool
+
+
+_UiQueueItem = (
+    _UiToken
+    | _UiFinalize
+    | _UiError
+    | _UiDone
+)
 
 _LEFT, _CHAT, _TRAIT = 0, 1, 2
 
@@ -304,7 +329,7 @@ class SaklasApp(App[None]):
         self._get_loom_controller()
         # UI-side gen flag.  Tracks the *TUI's* gen lifecycle, which differs
         # slightly from the session's: the TUI counts a gen as "still going"
-        # until the ``("done",)`` sentinel lands on the local ``_ui_token_queue``
+        # until the `_UiDone` event lands on the local ``_ui_token_queue``
         # (see ``_poll_generation``), even after the session has already
         # returned to ``GenState.IDLE``.  Use ``self._session.is_generating``
         # for "is the engine running right now?" — this flag is for UI-only
@@ -321,7 +346,7 @@ class SaklasApp(App[None]):
         self._highlighting: bool = True
         self._highlight_probe: str | None = SURPRISE_PROBE
         self._default_seed: int | None = None
-        self._ui_token_queue: queue.SimpleQueue[Any] = queue.SimpleQueue()
+        self._ui_token_queue: queue.SimpleQueue[_UiQueueItem] = queue.SimpleQueue()
 
         self._gen_start_time: float = 0.0
         self._gen_token_count: int = 0
@@ -1038,7 +1063,7 @@ class SaklasApp(App[None]):
         Errors surface through ``_steer_status`` — ``SaklasError`` via its
         ``user_message()``, ``ValueError`` as a bare string, anything else
         as ``"<Type>: <msg>"`` — and the ``finally`` block enqueues a
-        ``("done", False)`` sentinel so the pending-queue drain keeps
+        `_UiDone(False)` event so the pending-queue drain keeps
         advancing (these handlers run off the gen loop, so no natural
         ``done`` arrives).  Pass ``on_error`` to override the default
         error surfacing entirely.
@@ -1065,7 +1090,7 @@ class SaklasApp(App[None]):
                         self._steer_status, f"{type(e).__name__}: {e}"
                     )
             finally:
-                self._ui_token_queue.put(("done", False))
+                self._ui_token_queue.put(_UiDone(False))
 
         self.run_worker(_worker, thread=True)
 
@@ -1157,7 +1182,7 @@ class SaklasApp(App[None]):
         # Navigating the loom tree mid-generation logically abandons the
         # in-flight turn — the active pointer has moved elsewhere.  Stop
         # the worker so its tokens stop chasing a widget we're about to
-        # detach; its ``("done",)`` sentinel still drains cleanly through
+        # detach; its `_UiDone` event still drains cleanly through
         # ``_poll_generation`` (which reads ``_current_assistant_widget``,
         # set to ``None`` just below).
         if self._session.is_generating:
@@ -1445,7 +1470,7 @@ class SaklasApp(App[None]):
                         # readout (``/lens``) + its layer-aggregated chip
                         # list — None when the live lens is off.
                         _UiToken(
-                            event.text, event.thinking, event.probe_readings,
+                            event.text, event.thinking,
                             event.perplexity, event.logprob, widget, False,
                             event.probe_readings, event.lens_readout,
                             event.lens_aggregate,
@@ -1454,17 +1479,17 @@ class SaklasApp(App[None]):
                     self._gen_token_count += 1
                 # Normal completion — pull per-token scores out of the
                 # session and push to the widget for highlight.
-                self._ui_token_queue.put(("finalize", widget, False))
+                self._ui_token_queue.put(_UiFinalize(widget, False))
             except BaseException as e:
                 msg = e.user_message()[1] if isinstance(e, SaklasError) else str(e)
-                self._ui_token_queue.put(("error", msg, False))
+                self._ui_token_queue.put(_UiError(msg, False))
             finally:
                 if self._session.device.type == "mps":
                     try:
                         torch.mps.synchronize()
                     except Exception:
                         pass
-                self._ui_token_queue.put(("done", False))
+                self._ui_token_queue.put(_UiDone(False))
 
         self.run_worker(_generate, thread=True)
 
@@ -1670,12 +1695,12 @@ class SaklasApp(App[None]):
             # carries no probe scores (no streaming monitor hook on this
             # path) — pass ``None``; ``_finalize_widget_highlight`` fills
             # the canonical per-token scores in at finalize.  Manifold
-            # readings (final tuple slot) are also unsourced on the
+            # readings (typed probe_readings field) are also unsourced on the
             # prefill path; the trait-panel manifold section refreshes
             # from the end-of-gen aggregate via ``_finalize_widget_highlight``.
             self._ui_token_queue.put(
                 _UiToken(
-                    text, bool(is_thinking), None, perplexity, lp,
+                    text, bool(is_thinking), perplexity, lp,
                     widget, False,
                 ),
             )
@@ -1689,17 +1714,17 @@ class SaklasApp(App[None]):
                     sampling=sampling,
                     on_token=_on_token,
                 )
-                self._ui_token_queue.put(("finalize", widget, False))
+                self._ui_token_queue.put(_UiFinalize(widget, False))
             except BaseException as e:
                 msg = e.user_message()[1] if isinstance(e, SaklasError) else str(e)
-                self._ui_token_queue.put(("error", msg, False))
+                self._ui_token_queue.put(_UiError(msg, False))
             finally:
                 if self._session.device.type == "mps":
                     try:
                         torch.mps.synchronize()
                     except Exception:
                         pass
-                self._ui_token_queue.put(("done", False))
+                self._ui_token_queue.put(_UiDone(False))
 
         self.run_worker(_prefill, thread=True)
 
@@ -1837,7 +1862,7 @@ class SaklasApp(App[None]):
                     f"raw commit failed: {msg}",
                 )
             finally:
-                self._ui_token_queue.put(("done", False))
+                self._ui_token_queue.put(_UiDone(False))
 
         self.run_worker(_commit, thread=True)
 
@@ -1850,7 +1875,7 @@ class SaklasApp(App[None]):
         a user node) we surface a system message and skip the mount via
         a post-mount remove.
 
-        The worker enqueues a ``("done", False)`` sentinel in its
+        The worker enqueues a `_UiDone(False)` event in its
         finally block — without it the pending-queue drain loop stalls
         after a queued commit, because commits don't run a generation
         and therefore don't produce a natural ``done`` event.
@@ -1874,7 +1899,7 @@ class SaklasApp(App[None]):
             finally:
                 # Advance the queue drain — commits don't stream so no
                 # natural ``done`` arrives via the gen worker.
-                self._ui_token_queue.put(("done", False))
+                self._ui_token_queue.put(_UiDone(False))
 
         self.run_worker(_commit, thread=True)
 
@@ -1886,7 +1911,7 @@ class SaklasApp(App[None]):
         on a worker thread.  Highlight goes plain — authored turns carry
         no per-token scores.
 
-        Worker enqueues ``("done", False)`` in finally so the pending-
+        Worker enqueues `_UiDone(False)` in finally so the pending-
         queue drain advances; see :meth:`_start_commit_user` for the
         rationale.
         """
@@ -1910,7 +1935,7 @@ class SaklasApp(App[None]):
                     self._chat_panel.add_system_message(f"commit failed: {msg}")
                 self.call_from_thread(_rollback)
             finally:
-                self._ui_token_queue.put(("done", False))
+                self._ui_token_queue.put(_UiDone(False))
 
         self.run_worker(_commit, thread=True)
 
@@ -1924,7 +1949,6 @@ class SaklasApp(App[None]):
                 item = self._ui_token_queue.get_nowait()
             except queue.Empty:
                 break
-            kind = "tok" if isinstance(item, _UiToken) else item[0]
             if isinstance(item, _UiToken):
                 # Tagged with the target widget + ``is_shadow`` flag so
                 # steered and shadow streams route to the right column
@@ -1938,7 +1962,7 @@ class SaklasApp(App[None]):
                 # section renders mid-gen.
                 token = item.text
                 is_thinking = item.thinking
-                scores = item.scores
+                scores = item.probe_readings
                 perplexity = item.perplexity
                 logprob = item.logprob
                 widget = item.widget
@@ -1991,17 +2015,15 @@ class SaklasApp(App[None]):
                         self._log_ppl_sum += math.log(perplexity)
                         self._ppl_count += 1
                 tokens_consumed += 1
-            elif kind == "finalize":
+            elif isinstance(item, _UiFinalize):
                 # Normal end — pull per-token scores stashed by session's
                 # _finalize_generation and push to the widget for highlight.
-                _, widget, _is_shadow = item
-                self._finalize_widget_highlight(widget)
-            elif kind == "error":
-                _, msg, is_shadow = item
-                tag = "A/B shadow error" if is_shadow else "generation error"
-                chat.add_system_message(f"{tag}: {msg}")
-            elif kind == "done":
-                _, is_shadow = item
+                self._finalize_widget_highlight(item.widget)
+            elif isinstance(item, _UiError):
+                tag = "A/B shadow error" if item.shadow else "generation error"
+                chat.add_system_message(f"{tag}: {item.message}")
+            else:
+                is_shadow = item.shadow
                 widget = self._current_assistant_widget
                 if widget:
                     widget.ensure_thinking_collapsed()
@@ -2298,7 +2320,9 @@ class SaklasApp(App[None]):
             hl_label = self._highlight_probe or "off"
         self._left_panel.update_highlight(hl_label)
 
-    def _finalize_widget_highlight(self, widget: _AssistantMessage) -> None:
+    def _finalize_widget_highlight(
+        self, widget: RawBuffer | _AssistantMessage,
+    ) -> None:
         """Pull per-token scores the session stashed during finalize and
         push to the widget for highlight-mode overlays.
 
@@ -2917,23 +2941,23 @@ class SaklasApp(App[None]):
                 for event in stream:
                     self._ui_token_queue.put(
                         _UiToken(
-                            event.text, event.thinking, event.probe_readings,
+                            event.text, event.thinking,
                             event.perplexity, event.logprob, widget, True,
                             event.probe_readings, event.lens_readout,
                             event.lens_aggregate,
                         ),
                     )
-                self._ui_token_queue.put(("finalize", widget, True))
+                self._ui_token_queue.put(_UiFinalize(widget, True))
             except BaseException as e:
                 msg = e.user_message()[1] if isinstance(e, SaklasError) else str(e)
-                self._ui_token_queue.put(("error", msg, True))
+                self._ui_token_queue.put(_UiError(msg, True))
             finally:
                 if self._session.device.type == "mps":
                     try:
                         torch.mps.synchronize()
                     except Exception:
                         pass
-                self._ui_token_queue.put(("done", True))
+                self._ui_token_queue.put(_UiDone(True))
 
         self.run_worker(_shadow_generate, thread=True)
 
@@ -3156,22 +3180,22 @@ class SaklasApp(App[None]):
                 for event in stream:
                     self._ui_token_queue.put(
                         _UiToken(
-                            event.text, event.thinking, event.probe_readings,
+                            event.text, event.thinking,
                             event.perplexity, event.logprob, widget, True,
                             event.probe_readings, event.lens_readout,
                             event.lens_aggregate,
                         ),
                     )
-                self._ui_token_queue.put(("finalize", widget, True))
+                self._ui_token_queue.put(_UiFinalize(widget, True))
             except BaseException as e:
                 msg = e.user_message()[1] if isinstance(e, SaklasError) else str(e)
-                self._ui_token_queue.put(("error", msg, True))
+                self._ui_token_queue.put(_UiError(msg, True))
             finally:
                 if self._session.device.type == "mps":
                     try:
                         torch.mps.synchronize()
                     except Exception:
                         pass
-                self._ui_token_queue.put(("done", True))
+                self._ui_token_queue.put(_UiDone(True))
 
         self.run_worker(_stream_worker, thread=True)

@@ -28,6 +28,7 @@ from saklas.tui.chat_panel import PendingItem
 from saklas.tui.vector_panel import MAX_ALPHA
 from saklas.tui.app import (
     DEFAULT_ALPHA,
+    _UiDone,
     _detect_namespace_selector,
     _resolve_active_name,
     _unquote,
@@ -444,23 +445,8 @@ class ExtractionController:
         def _work() -> None:
             self._app._session.ensure_manifold_loaded(term.manifold)
             manifold = self._app._session.manifolds[term.manifold]
-            # ``resolve_position`` validates label-form (raises
-            # UnknownManifoldLabelError on miss) and passes through
-            # coord-form unchanged.  A test-double manifold without
-            # ``resolve_position`` falls back to ``term.position``
-            # directly — fine for coord form, raises here for
-            # label form (the real engine path catches it).
-            resolve = getattr(manifold, "resolve_position", None)
-            if resolve is not None:
-                resolved = resolve(term.position)
-            elif isinstance(term.position, str):
-                raise ValueError(
-                    f"manifold '{term.manifold}' cannot resolve "
-                    f"label {term.position!r} — manifold lacks "
-                    f"resolve_position()"
-                )
-            else:
-                resolved = term.position
+            # Validates label-form and passes coordinate form through.
+            resolved = manifold.resolve_position(term.position)
             want = manifold.domain.intrinsic_dim
             got = len(resolved)
             if got != want:
@@ -579,7 +565,7 @@ class ExtractionController:
             chat.add_system_message(
                 f"/manifold fit: no manifold.json in {folder}"
             )
-            self._app._ui_token_queue.put(("done", False))
+            self._app._ui_token_queue.put(_UiDone(False))
             return
         chat.add_system_message(f"Fitting manifold from {folder}...")
 
@@ -696,7 +682,7 @@ class ExtractionController:
                     self._app._steer_status, f"{type(e).__name__}: {e}",
                 )
             finally:
-                self._app._ui_token_queue.put(("done", False))
+                self._app._ui_token_queue.put(_UiDone(False))
 
         self._app.run_worker(_worker, thread=True)
 
@@ -1023,26 +1009,20 @@ class ExtractionController:
         # curved probe has no single direction to compare and is skipped.
         from saklas.core.profile import Profile
         all_profiles: dict[str, Profile] = {}
-        for name, prof in self._app._session.profiles.items():
-            if isinstance(prof, Profile):
-                all_profiles[name] = prof
-            elif isinstance(prof, dict) and prof:
-                all_profiles[name] = Profile(prof)
+        for name, tensors in self._app._session.profiles.items():
+            all_profiles[name] = Profile(tensors)
         monitor = self._app._session.monitor
-        if monitor:
-            from saklas.core.vectors import folded_vector_directions
-            for name in monitor.probe_names:
-                if name in all_profiles:
-                    continue
-                manifold = monitor.manifolds.get(name)
-                if manifold is None:
-                    continue
-                try:
-                    folded = folded_vector_directions(manifold)
-                except Exception:
-                    continue
-                if folded:
-                    all_profiles[name] = Profile(folded)
+        from saklas.core.vectors import folded_vector_directions
+        for name in monitor.probe_names:
+            if name in all_profiles:
+                continue
+            manifold = monitor.manifolds[name]
+            if not all(
+                sub.is_affine and sub.rank == 1
+                for sub in manifold.layers.values()
+            ):
+                continue
+            all_profiles[name] = Profile(folded_vector_directions(manifold))
 
         def _resolve(raw: str) -> str | None:
             matches = _resolve_active_name(raw, all_profiles)

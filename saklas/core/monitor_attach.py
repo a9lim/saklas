@@ -240,9 +240,9 @@ def _probe_is_affine_for_manifold(manifold: "Manifold") -> bool:
     curved (``spectral`` / ``authored``), so the first fitted layer decides.
     An empty manifold is treated as affine (it scores to nothing anyway).
     """
-    for sub in manifold.layers.values():
-        return bool(sub.is_affine)
-    return True
+    from saklas.core.manifold import manifold_is_affine
+
+    return manifold_is_affine(manifold)
 
 
 def _affine_coord_map(
@@ -262,21 +262,12 @@ def _affine_coord_map(
     dev = X.device
     sub_f = sub.to(device=dev, dtype=torch.float32)
     basis = sub_f.basis                                   # (R, D)
-    mean = sub_f.mean                                     # (D,)
     R = int(basis.shape[0])
     node_coords = manifold.node_coords.to(device=dev, dtype=torch.float32)
     K_nodes = int(node_coords.shape[0])
     n_dim = int(manifold.domain.intrinsic_dim)
-    embedded = manifold.domain.embed(
-        manifold.domain.clamp_position(node_coords)
-    ).to(device=dev, dtype=torch.float32)
-    if sub_f.node_coords is not None:
-        # True per-layer node activation in-subspace: ``node_coords @ basis``
-        # (== ``eval_at`` − mean for a flat fit, but pruned-basis-consistent —
-        # the shared domain layout would mis-dimension a DLS-pruned layer).
-        v_centered = sub_f.node_coords.to(device=dev, dtype=torch.float32) @ basis
-    else:
-        v_centered = sub_f.eval_at(embedded) - mean      # (K, D) fallback
+    assert sub_f.node_coords is not None
+    v_centered = sub_f.node_coords.to(device=dev, dtype=torch.float32) @ basis
     si_vc = _woodbury_apply(v_centered, X, K, lam)       # (K, D) = Σ⁻¹ v_centered
     g_nodes = si_vc @ basis.T                             # (K, R) = B Σ⁻¹ v_centered
     c_nodes = (g_nodes @ m_r_inv.T).cpu()                # (K, R) whitened M-proj coords
@@ -368,26 +359,22 @@ def _build_whitened_factors(
         # Neutral anchor in the whitened metric.  Affine: the frame is
         # neutral-anchored, so neutral is reduced coord 0.  Curved: map the
         # baked per-layer ``origin`` (authoring-coord foot of the neutral mean)
-        # through the same eval_at → basis → chol pipeline as a node.  A curved
-        # fit without a stored origin falls back to the subspace mean (0).
+        # through the same eval_at → basis → chol pipeline as a node.
         if sub.is_affine:
             neutral_white = torch.zeros(R, device=dev, dtype=torch.float32)
         else:
-            o = manifold.origin.get(layer_idx)
-            if o is None:
-                neutral_white = torch.zeros(R, device=dev, dtype=torch.float32)
-            else:
-                o_dom = o.to(device=dev, dtype=torch.float32).reshape(1, -1)
-                emb = manifold.domain.embed(
-                    manifold.domain.clamp_position(o_dom)
-                ).to(device=dev, dtype=torch.float32)
-                v_centered = sub.eval_at(emb) - sub.mean.to(
-                    device=dev, dtype=torch.float32,
-                )
-                v_red = v_centered @ sub.basis.to(
-                    device=dev, dtype=torch.float32,
-                ).T                                  # (1, R)
-                neutral_white = (v_red @ chol_dev).reshape(-1)
+            o = manifold.origin[layer_idx]
+            o_dom = o.to(device=dev, dtype=torch.float32).reshape(1, -1)
+            emb = manifold.domain.embed(
+                manifold.domain.clamp_position(o_dom)
+            ).to(device=dev, dtype=torch.float32)
+            v_centered = sub.eval_at(emb) - sub.mean.to(
+                device=dev, dtype=torch.float32,
+            )
+            v_red = v_centered @ sub.basis.to(
+                device=dev, dtype=torch.float32,
+            ).T                                  # (1, R)
+            neutral_white = (v_red @ chol_dev).reshape(-1)
         mean_dev = sub.mean.to(device=dev, dtype=torch.float32)
         # Precompute ``Σ⁻¹ mean`` once (constant in mean + whitener), so the
         # per-token ``_layer_geometry`` centers via ``sih − s_mean`` against the

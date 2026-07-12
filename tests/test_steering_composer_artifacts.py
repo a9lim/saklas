@@ -45,7 +45,7 @@ def test_baked_manifold_cold_loads_with_proven_fingerprint(
         "merged", {0: torch.tensor([1.0, 0.0, 0.0, 0.0])}, label="merged",
     )
     create_baked_manifold_folder(
-        "local", "merged", "", manifold, model_id, method="merge",
+        "local", "merged", "", manifold, model_id, method="folded_vector",
         model_fingerprint=fingerprint,
     )
 
@@ -63,7 +63,7 @@ def test_cold_load_rejects_finite_tensor_corruption(
     fingerprint = loaded_model_fingerprint(model, model_id)
     manifold = _fold("merged", {0: torch.ones(4)}, label="merged")
     folder, _ = create_baked_manifold_folder(
-        "local", "merged", "", manifold, model_id, method="merge",
+        "local", "merged", "", manifold, model_id, method="folded_vector",
         model_fingerprint=fingerprint,
     )
     tensor = next(folder.glob("*.safetensors"))
@@ -86,7 +86,7 @@ def test_cold_load_rejects_untracked_fitted_pair(
     fingerprint = loaded_model_fingerprint(model, model_id)
     manifold = _fold("merged", {0: torch.ones(4)}, label="merged")
     folder, _ = create_baked_manifold_folder(
-        "local", "merged", "", manifold, model_id, method="merge",
+        "local", "merged", "", manifold, model_id, method="folded_vector",
         model_fingerprint=fingerprint,
     )
     manifest_path = folder / "manifold.json"
@@ -115,7 +115,7 @@ def test_transfer_variant_cold_loads_for_target_identity(
         "merged", {0: torch.tensor([1.0, 0.0, 0.0, 0.0])}, label="merged",
     )
     folder, _ = create_baked_manifold_folder(
-        "local", "merged", "", manifold, source_id, method="merge",
+        "local", "merged", "", manifold, source_id, method="folded_vector",
         model_fingerprint=source_fp,
     )
     from saklas.core.mahalanobis import LayerWhitener

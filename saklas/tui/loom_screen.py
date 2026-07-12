@@ -431,23 +431,20 @@ class LoomScreen(Screen[None]):
         Parse / eval failures fall back to ``None`` (every node bright)
         and surface in the chat panel — the loom screen never blanks.
         """
-        expr = getattr(self._app, "_loom_prune_expr", None)
+        expr = self._app._loom_prune_expr
         if not expr:
             return None
         try:
             return set(self._session.tree.filter_by_expr(expr))
         except Exception as e:
-            try:
-                self._app._chat_panel.add_system_message(
-                    f"/prune filter eval failed: {e}"
-                )
-            except Exception:
-                pass
+            self._app._chat_panel.add_system_message(
+                f"/prune filter eval failed: {e}"
+            )
             return None
 
     def _highlight_probe(self) -> str | None:
         """The chat screen's currently selected highlight probe, if any."""
-        probe = getattr(self._app, "_highlight_probe", None)
+        probe = self._app._highlight_probe
         if isinstance(probe, str) and probe and not probe.startswith("__"):
             return probe
         return None
@@ -743,7 +740,7 @@ class LoomScreen(Screen[None]):
         )
 
     def action_prune(self) -> None:
-        current = getattr(self._app, "_loom_prune_expr", None) or ""
+        current = self._app._loom_prune_expr or ""
         self._open_overlay(
             "prune filter (blank clears — dims non-matching nodes):",
             initial=current, kind="prune",

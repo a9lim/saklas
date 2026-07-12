@@ -102,6 +102,18 @@ class TestMergeVector:
         )
         merged_folder, _ = create_baked_manifold_folder(
             "local", "noble", "merged", manifold, session.model_id, method="merge",
+            components={
+                "0": {
+                    "selector": "default/honest",
+                    "alpha": 0.3,
+                    "tensor_sha256": None,
+                },
+                "1": {
+                    "selector": "default/warm",
+                    "alpha": 0.4,
+                    "tensor_sha256": None,
+                },
+            },
             model_fingerprint=loaded_model_fingerprint(
                 session._model, session.model_id,
             ),

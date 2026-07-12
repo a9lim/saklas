@@ -558,6 +558,9 @@ def test_manifold_sidecar_load(tmp_path: Path):
         "feature_space": "sae-gemma",
         "nodes_sha256": "deadbeef",
         "sae_release": "gemma",
+        "sae_revision": "rev-1",
+        "sae_fingerprint": "fingerprint",
+        "sae_ids_by_layer": {"0": "mock-layer-0"},
     })
     path.write_text(json.dumps(payload))
     sc = ManifoldSidecar.load(path)
@@ -623,7 +626,7 @@ def test_manifold_sidecar_topology_provenance_round_trips(tmp_path: Path):
             node_coords=coords, layers=layers,
             mahalanobis_share={4: 1.0, 5: 2.0},
             origin={
-                layer: torch.zeros(sub.rank)
+                    layer: torch.zeros(domain.intrinsic_dim)
                 for layer, sub in layers.items() if not sub.is_affine
             },
             feature_space="sae-test",
@@ -639,6 +642,9 @@ def test_manifold_sidecar_topology_provenance_round_trips(tmp_path: Path):
         "method": "manifold_discover_auto", "nodes_sha256": "x",
         "fit_mode": "auto", "resolved_fit_mode": "pca",
         "topology_winner": "flat-pca", "topology_candidates": candidates,
+        "sae_release": "test", "sae_revision": "rev-1",
+        "sae_fingerprint": "fingerprint",
+        "sae_ids_by_layer": {"4": "mock-4", "5": "mock-5"},
     })
     # The written sidecar JSON carries the provenance (the whitelist passes it).
     sidecar = json.loads(out.with_suffix(".json").read_text())
@@ -2120,7 +2126,10 @@ def test_rectangular_affine_transfer_preserves_points_frame_and_steering(
     # The explicit affine coordinate reparameterization is an on-disk contract,
     # not merely an in-memory transfer detail.
     path = tmp_path / "rect-flat.safetensors"
-    save_manifold(target, path, {"method": "manifold_procrustes_transfer"})
+    save_manifold(target, path, {
+        "method": "manifold_procrustes_transfer",
+        "source_model_id": "src", "source_model_fingerprint": "src-fp",
+    })
     loaded = load_manifold(path, verify_manifest=False)
     assert torch.allclose(
         loaded.manifold_point(0, [0.2, -0.4]),
@@ -2156,7 +2165,8 @@ def test_rectangular_curved_transfer_rejects_anisotropic_tube() -> None:
         name="rect-curve", domain=domain, node_labels=["a", "b", "c"],
         node_coords=coords, layers={0: sub},
         node_roles=[None, None, None], node_kinds=[None, None, None],
-        mahalanobis_share={0: 1.0}, origin={0: torch.zeros(sub.rank)},
+        mahalanobis_share={0: 1.0},
+        origin={0: torch.zeros(domain.intrinsic_dim)},
     )
     dense = torch.tensor([
         [1.8, 0.0, 0.0, 0.0], [0.2, 0.7, 0.0, 0.0],
@@ -2274,7 +2284,7 @@ def _fit_real_manifold(folder: Path, model_id: str, *, dim: int = 6, seed: int =
             sigma_poly_coeffs=sigma_pc,
         )
         layers[layer] = sub
-        origins[layer] = torch.zeros(sub.rank)
+        origins[layer] = torch.zeros(domain.intrinsic_dim)
     man = Manifold(
         name=folder.name,
         domain=domain,
@@ -3369,7 +3379,7 @@ def test_baked_manifold_round_trip(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     manifold, directions = _baked_manifold("merged")
     folder, mf = create_baked_manifold_folder(
         "local", "merged", "a merged vector", manifold, "test/model",
-        method="merge", model_fingerprint="fp:test/model",
+        method="folded_vector", model_fingerprint="fp:test/model",
     )
     assert mf.fit_mode == "baked"
     assert mf.is_discover is False
@@ -3408,7 +3418,7 @@ def test_baked_publication_hashes_each_new_file_once(
     manifold, _ = _baked_manifold("merged")
 
     create_baked_manifold_folder(
-        "local", "merged", "", manifold, "test/model", method="merge",
+        "local", "merged", "", manifold, "test/model", method="folded_vector",
         model_fingerprint="fp:test/model",
     )
 
@@ -3435,12 +3445,12 @@ def test_baked_first_publication_retry_repairs_unproven_pair(
     with pytest.raises(OSError, match="injected"):
         create_baked_manifold_folder(
             "local", "merged", "", manifold, "test/model",
-            method="merge", model_fingerprint="fp:test/model",
+            method="folded_vector", model_fingerprint="fp:test/model",
         )
 
     folder, _mf = create_baked_manifold_folder(
         "local", "merged", "", manifold, "test/model",
-        method="merge", model_fingerprint="fp:test/model",
+        method="folded_vector", model_fingerprint="fp:test/model",
     )
     loaded = ManifoldFolder.load(folder)
     assert loaded.tensor_models() == [safe_model_id("test/model")]
@@ -3461,12 +3471,12 @@ def test_baked_force_replaces_manifestless_partial_folder(
     with pytest.raises(FileExistsError, match="incomplete"):
         create_baked_manifold_folder(
             "local", "merged", "", manifold, "test/model",
-            method="merge", model_fingerprint="fp:test/model",
+            method="folded_vector", model_fingerprint="fp:test/model",
         )
 
     created, _mf = create_baked_manifold_folder(
         "local", "merged", "", manifold, "test/model",
-        method="merge", model_fingerprint="fp:test/model", force=True,
+        method="folded_vector", model_fingerprint="fp:test/model", force=True,
     )
     assert not (created / "stale.safetensors").exists()
     assert ManifoldFolder.load(created).tensor_models() == [safe_model_id("test/model")]
@@ -3478,7 +3488,7 @@ def test_baked_manifold_clear_and_scoped_refresh_refused(
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     manifold, _ = _baked_manifold("merged")
     create_baked_manifold_folder(
-        "local", "merged", "", manifold, "test/model", method="merge",
+        "local", "merged", "", manifold, "test/model", method="folded_vector",
         model_fingerprint="fp:test/model",
     )
     # Both tensor-deleting ops refuse — a baked manifold can't re-fit, so
@@ -3493,7 +3503,7 @@ def test_baked_manifold_node_groups_refused(tmp_path: Path, monkeypatch: pytest.
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     manifold, _ = _baked_manifold("merged")
     _, mf = create_baked_manifold_folder(
-        "local", "merged", "", manifold, "test/model", method="merge",
+        "local", "merged", "", manifold, "test/model", method="folded_vector",
         model_fingerprint="fp:test/model",
     )
     with pytest.raises(ManifoldFormatError, match="no node corpus"):

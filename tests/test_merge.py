@@ -281,7 +281,9 @@ def test_transfer_variant_routes_concrete_tensor(
     source_tensor = folder / tensor_filename("src")
     target_tensor.write_bytes(source_tensor.read_bytes())
     payload = __import__("json").loads(source_tensor.with_suffix(".json").read_text())
+    payload["method"] = "manifold_procrustes_transfer"
     payload["source_model_id"] = "src"
+    payload["source_model_fingerprint"] = "fp:src"
     payload["model_fingerprint"] = "fp:target"
     target_sidecar.write_text(__import__("json").dumps(payload))
     ManifoldFolder.load(folder, verify_manifest=False).update_file_hashes(

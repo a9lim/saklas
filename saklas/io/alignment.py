@@ -287,6 +287,8 @@ def _validate_neutral_cache_metadata_locked(
         or isinstance(sidecar["n_prompts"], bool)
         or not isinstance(sidecar["n_prompts"], int)
         or sidecar["n_prompts"] <= 0
+        or isinstance(sidecar["n_layers"], bool)
+        or not isinstance(sidecar["n_layers"], int)
         or sidecar["n_layers"] != len(layers)
     ):
         raise ValueError("neutral activation cache sidecar has no layer schema")
@@ -322,7 +324,14 @@ def _validate_neutral_cache_metadata_locked(
                 view = tensors.get_slice(key)
                 shape = list(view.get_shape())
                 if (
-                    view.get_dtype() != "F32"
+                    not isinstance(spec, dict)
+                    or set(spec) != {"shape", "dtype"}
+                    or not isinstance(spec["shape"], list)
+                    or any(
+                        isinstance(dim, bool) or not isinstance(dim, int) or dim <= 0
+                        for dim in spec["shape"]
+                    )
+                    or view.get_dtype() != "F32"
                     or spec.get("dtype") != "torch.float32"
                     or shape != spec.get("shape")
                     or len(shape) != 2
@@ -965,7 +974,7 @@ def save_alignment_map(
         tensor_files: dict[str, str] = {}
         tensor_sha256: dict[str, str] = {}
         tensor_schema: dict[str, Any] = {}
-        merged_quality: dict[str, float] = {}
+        merged_quality: dict[str, float | None] = {}
         if extend and sc_path.exists():
             try:
                 with open(sc_path) as handle:
@@ -1021,6 +1030,7 @@ def save_alignment_map(
                         merged_quality.update({
                             str(layer): float(value)
                             for layer, value in raw_quality.items()
+                            if value is not None
                         })
             except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError) as exc:
                 log.warning("could not extend current alignment generation: %s", exc)
@@ -1068,6 +1078,8 @@ def save_alignment_map(
                 str(layer): round(float(q), 6)
                 for layer, q in quality_per_layer.items()
             })
+        for layer in sidecar["shared_layers"]:
+            merged_quality.setdefault(str(layer), None)
         sidecar["quality_per_layer"] = merged_quality
         if set(sidecar) != _ALIGNMENT_SIDECAR_FIELDS:
             raise AssertionError("alignment writer produced a non-canonical sidecar")
@@ -1146,11 +1158,13 @@ def load_alignment_map(
             if (
                 not isinstance(digests, Mapping)
                 or set(digests) != layer_keys
-                or set(quality) - layer_keys
+                or set(quality) != layer_keys
                 or any(
-                    not isinstance(value, (int, float))
-                    or isinstance(value, bool)
-                    or not math.isfinite(float(value))
+                    value is not None and (
+                        not isinstance(value, (int, float))
+                        or isinstance(value, bool)
+                        or not math.isfinite(float(value))
+                    )
                     for value in quality.values()
                 )
             ):

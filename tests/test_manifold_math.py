@@ -1560,3 +1560,32 @@ def test_affine_runtime_geometry_requires_exact_k_by_r(
     )
     with pytest.raises(ValueError, match="node_coords must have shape"):
         manifold.validate_runtime_geometry()
+
+
+def test_runtime_geometry_rejects_explicit_empty_node_roster() -> None:
+    coords = torch.tensor([[1.0], [-1.0]])
+    sub = LayerSubspace.affine(
+        torch.zeros(4), torch.ones(1, 4) / 2, node_coords=coords,
+    )
+    manifold = Manifold(
+        name="bad-roster", domain=CustomDomain(1),
+        node_labels=["a", "b"], node_coords=coords, layers={0: sub},
+        node_roles=[], node_kinds=[None, None],
+        mahalanobis_share={0: 1.0},
+    )
+    with pytest.raises(ValueError, match="node_roles must align exactly"):
+        manifold.validate_runtime_geometry()
+
+
+def test_runtime_geometry_rejects_wrong_shared_authoring_arity() -> None:
+    per_layer = torch.tensor([[1.0], [-1.0]])
+    sub = LayerSubspace.affine(
+        torch.zeros(4), torch.ones(1, 4) / 2, node_coords=per_layer,
+    )
+    manifold = Manifold(
+        name="bad-domain", domain=CustomDomain(1),
+        node_labels=["a", "b"], node_coords=torch.zeros(2, 2),
+        layers={0: sub}, mahalanobis_share={0: 1.0},
+    )
+    with pytest.raises(ValueError, match=r"shape \(K, n\)"):
+        manifold.validate_runtime_geometry()

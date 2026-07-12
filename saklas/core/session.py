@@ -3656,9 +3656,9 @@ class SaklasSession:
 
     @property
     def sae_info(self) -> dict[str, Any] | None:
-        backend = getattr(self, "_sae_backend", None)
-        layer = getattr(self, "_sae_layer", None)
-        width = getattr(self, "_sae_width", None)
+        backend = self._sae_backend
+        layer = self._sae_layer
+        width = self._sae_width
         if backend is None or layer is None or width is None:
             return None
         return {
@@ -3675,9 +3675,9 @@ class SaklasSession:
     def _require_sae(self) -> tuple[Any, int, int]:
         from saklas.core.errors import SaeNotLoadedError
 
-        backend = getattr(self, "_sae_backend", None)
-        layer = getattr(self, "_sae_layer", None)
-        width = getattr(self, "_sae_width", None)
+        backend = self._sae_backend
+        layer = self._sae_layer
+        width = self._sae_width
         if backend is None or layer is None or width is None:
             raise SaeNotLoadedError(
                 "no SAE loaded for this session — load one with `saklas sae load` "
@@ -8707,7 +8707,7 @@ class SaklasSession:
             # ``mean_logprob_count == 0`` covers both "no captures because
             # gen was empty" and "no captures because no on_token consumer
             # was wired" — both produce ``None`` so the wire/tree carry a
-            # clean back-compat shape.
+            # current empty/no-capture shape.
             _mean_logprob_out: float | None = None
             _mean_surprise_out: float | None = None
             if mean_logprob_count > 0:

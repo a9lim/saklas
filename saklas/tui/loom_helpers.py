@@ -283,9 +283,9 @@ def format_node_detail(tree: LoomTree, node_id: str) -> str:
             lines.append(f"recipe.sd : {recipe.seed}")
         if recipe.sampling is not None:
             samp = recipe.sampling
-            t = getattr(samp, "temperature", None)
-            p = getattr(samp, "top_p", None)
-            m = getattr(samp, "max_tokens", None)
+            t = samp.temperature
+            p = samp.top_p
+            m = samp.max_tokens
             lines.append(f"recipe.sm : T={t} top_p={p} max={m}")
         if recipe.thinking is not None:
             lines.append(f"recipe.th : {recipe.thinking}")

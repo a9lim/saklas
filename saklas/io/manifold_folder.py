@@ -35,6 +35,7 @@ this module owns folder discovery, the node corpus, and integrity.
 from __future__ import annotations
 
 from contextlib import ExitStack, contextmanager
+from collections.abc import Mapping
 import hashlib
 import json
 import math
@@ -516,6 +517,46 @@ def validate_manifold_sidecar_payload(
         _validate_node_kind(data["name"], label, kind)
     _validate_topology_candidates(data["topology_candidates"], location=location)
     _validate_components(data["components"], location=location)
+    is_auto = data["fit_mode"] == "auto"
+    if is_auto != bool(
+        data["resolved_fit_mode"] is not None
+        and data["topology_winner"] is not None
+        and data["topology_candidates"]
+    ):
+        raise ManifoldFormatError(f"{location} has inconsistent auto-topology provenance")
+    if not is_auto and any(
+        value is not None
+        for value in (data["resolved_fit_mode"], data["topology_winner"])
+    ) or not is_auto and data["topology_candidates"]:
+        raise ManifoldFormatError(f"{location} non-auto fit carries topology provenance")
+    is_merge = data["method"] == "merge"
+    if is_merge:
+        if data["fit_mode"] != "baked" or data["components"] is None or data["bake_policy"] != MERGE_BAKE_POLICY:
+            raise ManifoldFormatError(f"{location} has incomplete merge provenance")
+    elif data["components"] is not None or data["bake_policy"] is not None:
+        raise ManifoldFormatError(f"{location} non-merge fit carries merge provenance")
+    is_transfer = data["method"] == "manifold_procrustes_transfer"
+    transfer_values = (
+        data["source_model_id"], data["source_model_fingerprint"],
+        data["transfer_quality_estimate"],
+    )
+    if is_transfer:
+        if transfer_values[0] is None or transfer_values[1] is None:
+            raise ManifoldFormatError(f"{location} has incomplete transfer provenance")
+    elif any(value is not None for value in transfer_values):
+        raise ManifoldFormatError(f"{location} non-transfer fit carries transfer provenance")
+    sae_values = (
+        data["sae_release"], data["sae_revision"], data["sae_fingerprint"],
+    )
+    if data["feature_space"] == "raw":
+        if any(value is not None for value in sae_values) or data["sae_ids_by_layer"] or data["sae_full_coverage"]:
+            raise ManifoldFormatError(f"{location} raw fit carries SAE provenance")
+    elif (
+        not data["feature_space"].startswith("sae-")
+        or data["sae_release"] is None
+        or not data["sae_ids_by_layer"]
+    ):
+        raise ManifoldFormatError(f"{location} has incomplete SAE provenance")
     return data
 
 
@@ -526,6 +567,7 @@ def canonical_manifold_sidecar_payload(
     diagnostics: dict[str, Any] | None = None,
     node_spread_per_layer: dict[str, Any] | None = None,
     fitted_layers: list[int] | None = None,
+    semantic_metadata: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the one exact current fitted-manifold sidecar shape."""
     count = len(node_labels)
@@ -550,6 +592,14 @@ def canonical_manifold_sidecar_payload(
         "components": None, "bake_policy": None, "source_model_id": None,
         "source_model_fingerprint": None, "transfer_quality_estimate": None,
     }
+    for key in (
+        "sae_release", "sae_revision", "sae_fingerprint", "sae_ids_by_layer",
+        "sae_full_coverage", "resolved_fit_mode", "topology_winner",
+        "topology_candidates", "components", "bake_policy", "source_model_id",
+        "source_model_fingerprint", "transfer_quality_estimate",
+    ):
+        if semantic_metadata is not None and key in semantic_metadata:
+            payload[key] = semantic_metadata[key]
     return validate_manifold_sidecar_payload(payload)
 
 

@@ -492,14 +492,13 @@ def test_probe_seeds_highlight():
 
 def test_compare_pairwise():
     import torch
-    from saklas.core.profile import Profile
     from tests._whitener import isotropic_whitener
 
     app = _make_app()
     t = {0: torch.randn(8), 1: torch.randn(8)}
     app._session.profiles = {
-        "angry.calm": Profile(t),
-        "happy.sad": Profile({k: v.clone() for k, v in t.items()}),
+        "angry.calm": t,
+        "happy.sad": {k: v.clone() for k, v in t.items()},
     }
     app._session.monitor.profiles = {}
     # /compare is Mahalanobis-only now: the session exposes a covering whitener.
@@ -511,21 +510,16 @@ def test_compare_pairwise():
 
 def test_compare_ranked():
     import torch
-    from saklas.core.profile import Profile
     from tests._whitener import isotropic_whitener
 
     app = _make_app()
     base = {0: torch.randn(8), 1: torch.randn(8)}
     app._session.profiles = {
-        "angry.calm": Profile(base),
-        "happy.sad": Profile({k: torch.randn(8) for k in base}),
-        "formal.casual": Profile({k: torch.randn(8) for k in base}),
+        "angry.calm": base,
+        "happy.sad": {k: torch.randn(8) for k in base},
+        "formal.casual": {k: torch.randn(8) for k in base},
     }
-    app._session.monitor.profiles = {
-        "angry.calm": Profile(base),
-        "happy.sad": Profile({k: torch.randn(8) for k in base}),
-        "formal.casual": Profile({k: torch.randn(8) for k in base}),
-    }
+    app._session.monitor.profiles = {}
     app._session.whitener = isotropic_whitener([0, 1], 8)
     app._handle_command("/compare angry.calm")
     msg = _msgs(app)
@@ -1902,7 +1896,9 @@ def test_steer_manifold_term_validates_and_registers(monkeypatch: pytest.MonkeyP
 
     # Stub the session manifold-load + registry so validation passes.
     domain = SimpleNamespace(intrinsic_dim=2)
-    manifold = SimpleNamespace(domain=domain)
+    manifold = SimpleNamespace(
+        domain=domain, resolve_position=lambda position: position,
+    )
 
     def _ensure(key: Any) -> None:
         app._session.manifolds[key] = manifold
@@ -1930,7 +1926,9 @@ def test_steer_manifold_term_arity_mismatch_reports(monkeypatch: pytest.MonkeyPa
     app = _make_app()
     # Domain is 2-D but the position has 3 coords.
     domain = SimpleNamespace(intrinsic_dim=2)
-    manifold = SimpleNamespace(domain=domain)
+    manifold = SimpleNamespace(
+        domain=domain, resolve_position=lambda position: position,
+    )
 
     def _ensure(key: Any) -> None:
         app._session.manifolds[key] = manifold
@@ -1987,7 +1985,9 @@ def test_steer_mixed_expression_applies_vector_siblings(monkeypatch: pytest.Monk
     app._session.extract = _fake_extract
 
     domain = SimpleNamespace(intrinsic_dim=1)
-    manifold = SimpleNamespace(domain=domain)
+    manifold = SimpleNamespace(
+        domain=domain, resolve_position=lambda position: position,
+    )
 
     def _ensure(key: Any) -> None:
         app._session.manifolds[key] = manifold
@@ -2121,6 +2121,7 @@ def test_probe_curved_selector_routes_through_session(monkeypatch: pytest.Monkey
         domain=SimpleNamespace(intrinsic_dim=1),
         node_labels=["a"], node_coords=None,
         layers={0: SimpleNamespace(is_affine=False)},
+        validate_runtime_geometry=lambda: None,
     )
 
     def _fake_add(selector: Any, **kwargs: Any) -> Any:

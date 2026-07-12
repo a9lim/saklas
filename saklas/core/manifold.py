@@ -1877,6 +1877,10 @@ def fit_layer_subspace(
 
 # =============================================================== manifold ===
 
+class _OmittedNodeRoster(list[str | None]):
+    """Distinct default: an explicitly supplied empty roster is malformed."""
+
+
 @dataclass
 class Manifold:
     """A fitted manifold: a domain + per-layer subspaces, plus identity.
@@ -1903,7 +1907,7 @@ class Manifold:
     # the standard assistant baseline" (the legacy shape, what every
     # non-role manifold carries).  Used by
     # :meth:`Manifold.nearest_node_role` for role-paired steering.
-    node_roles: list[str | None] = field(default_factory=list)
+    node_roles: list[str | None] = field(default_factory=_OmittedNodeRoster)
     # Per-node conceptual ``kind`` — ``"abstract"`` (a trait/quality, e.g.
     # ``happy``) or ``"concrete"`` (an entity, e.g. ``pirate``), aligned with
     # ``node_labels``.  ``None`` = unspecified.  A *generation-time* attribute
@@ -1912,7 +1916,7 @@ class Manifold:
     # conversational corpus.  It does NOT feed the fit — extraction pools in
     # standard-assistant space (swap-back) regardless — so it is carried for
     # provenance / regeneration, not consumed by ``compute_node_centroid``.
-    node_kinds: list[str | None] = field(default_factory=list)
+    node_kinds: list[str | None] = field(default_factory=_OmittedNodeRoster)
     # Per-layer Mahalanobis share weight recorded at fit time —
     # ``share_L = ‖Bᵀ coords_k‖_M`` summed over
     # nodes, the subspace-restricted analogue of vector steering's
@@ -1946,9 +1950,9 @@ class Manifold:
         # The programmatic constructor emits the same exact full-length roster
         # as the current wire format. ``None`` is a real per-node value; an
         # omitted constructor argument is not a second in-memory shape.
-        if not self.node_roles:
+        if isinstance(self.node_roles, _OmittedNodeRoster):
             self.node_roles = [None] * len(self.node_labels)
-        if not self.node_kinds:
+        if isinstance(self.node_kinds, _OmittedNodeRoster):
             self.node_kinds = [None] * len(self.node_labels)
 
     @property
@@ -1966,9 +1970,13 @@ class Manifold:
         """
         if not self.layers:
             raise ValueError(f"manifold {self.name!r} has no fitted layers")
-        if len(self.node_labels) != int(self.node_coords.shape[0]):
+        node_count = len(self.node_labels)
+        intrinsic_dim = int(self.domain.intrinsic_dim)
+        if self.node_coords.ndim != 2 or self.node_coords.shape != (
+            node_count, intrinsic_dim,
+        ):
             raise ValueError(
-                f"manifold {self.name!r} node labels and coordinates are misaligned"
+                f"manifold {self.name!r} node_coords must have shape (K, n)"
             )
         for field_name, values in (
             ("node_roles", self.node_roles),
@@ -1986,10 +1994,20 @@ class Manifold:
                 "its fitted layers"
             )
         curved = {idx: sub for idx, sub in self.layers.items() if not sub.is_affine}
+        if curved and len(curved) != len(self.layers):
+            raise ValueError(
+                f"manifold {self.name!r} cannot mix affine and curved layers"
+            )
         if set(self.origin) != set(curved):
             raise ValueError(
                 f"manifold {self.name!r} origins must cover exactly its curved layers"
             )
+        for idx, value in self.origin.items():
+            if value.ndim != 1 or value.shape != (intrinsic_dim,):
+                raise ValueError(
+                    f"manifold {self.name!r} origin for layer {idx} must "
+                    "have shape (n,)"
+                )
         for idx, sub in self.layers.items():
             try:
                 sub.validate_structure(
@@ -5139,8 +5157,7 @@ def save_manifold(
             # by ``LayerSubspace.affine`` on load.  Persist mean + basis (the
             # *absence* of ``node_params`` on disk is the affine marker), plus
             # the per-layer **real, neutral-anchored** node coords ``(K, R)``
-            # when present — the steer-target source (§5).  Older affine
-            # artifacts without it load with ``node_coords=None``.
+            # when present — the steer-target source (§5).
             if sub.node_coords is not None:
                 tensors[f"layer_{idx}.node_coords"] = (
                     sub.node_coords.contiguous().to(torch.float32).cpu()
@@ -5158,9 +5175,7 @@ def save_manifold(
         tensors[f"layer_{idx}.coord_scale"] = sub.coord_scale.contiguous().to(torch.float32).cpu()
         # Fuzzy-manifold σ-field (curved fits with the within-node spread pass).
         # The log-σ RBF over the same normalized ``node_params``; its *absence*
-        # on disk is the read-side "zero-thickness wire" marker (legacy curved
-        # fits and SAE fits skip it), so a fuzzy and a legacy manifold share one
-        # save/load path exactly as affine/curved do.
+        # on disk is the current SAE-space "zero-thickness wire" marker.
         if sub.sigma_rbf_weights is not None and sub.sigma_poly_coeffs is not None:
             tensors[f"layer_{idx}.sigma_rbf_weights"] = (
                 sub.sigma_rbf_weights.contiguous().to(torch.float32).cpu()
@@ -5184,6 +5199,7 @@ def save_manifold(
             dict[str, Any], metadata.get("node_spread_per_layer", {}),
         ),
         fitted_layers=sorted(manifold.layers),
+        semantic_metadata=metadata,
     )
     # Per-layer Mahalanobis share weight (whitened bake-score analogue).
     # Stored as ``{str(idx): float}`` like EV; absent when no whitener was
@@ -5412,41 +5428,43 @@ def _load_manifold_locked(
                 f"fitted manifold {path.name} uses an older numerical fit "
                 "policy; refit it with the current saklas"
             )
-    if verify_manifest and sidecar.get("method") == "merge":
-        from saklas.io.manifold_folder import MERGE_BAKE_POLICY
-
-        if sidecar.get("bake_policy") != MERGE_BAKE_POLICY:
-            from saklas.io.manifold_folder import ManifoldFormatError
-
-            raise ManifoldFormatError(
-                "legacy projected bake has no current additive/Mahalanobis "
-                "policy stamp; rebake the expression"
-            )
-        components = sidecar.get("components")
-        if isinstance(components, dict) and any(
-            isinstance(info, dict) and info.get("project_away") is not None
-            for info in components.values()
-        ):
-            from saklas.io.manifold_folder import ManifoldFormatError
-
-            raise ManifoldFormatError(
-                "legacy projected bake used Euclidean projection; rebake the "
-                "expression under the current Mahalanobis-only policy"
-            )
-
     # The shared, layer-agnostic node_coords tensor — pop it before the
     # per-layer key split, which assumes ``layer_<idx>.<field>``.
+    from saklas.io.manifold_folder import ManifoldFormatError
+
     node_coords = tensors.pop("node_coords", None)
+    if node_coords is None:
+        raise ManifoldFormatError("fitted manifold tensor is missing node_coords")
 
     by_layer: dict[int, dict[str, torch.Tensor]] = {}
+    allowed_fields = {
+        "mean", "basis", "node_coords", "affine_map", "node_params",
+        "rbf_weights", "poly_coeffs", "coord_offset", "coord_scale",
+        "sigma_rbf_weights", "sigma_poly_coeffs",
+    }
     for key, tensor in tensors.items():
-        head, field_name = key.rsplit(".", 1)
-        idx = int(head.split("_", 1)[1])
+        if key.count(".") != 1:
+            raise ManifoldFormatError(f"invalid fitted manifold tensor key {key!r}")
+        head, field_name = key.split(".", 1)
+        raw_layer = head.removeprefix("layer_")
+        if (
+            not head.startswith("layer_") or not raw_layer.isascii()
+            or not raw_layer.isdecimal() or str(int(raw_layer)) != raw_layer
+            or field_name not in allowed_fields
+        ):
+            raise ManifoldFormatError(f"invalid fitted manifold tensor key {key!r}")
+        idx = int(raw_layer)
         by_layer.setdefault(idx, {})[field_name] = tensor
 
     layers: dict[int, LayerSubspace] = {}
     for idx, parts in by_layer.items():
         if "node_params" not in parts:
+            if not {"mean", "basis"}.issubset(parts) or set(parts) - {
+                "mean", "basis", "node_coords", "affine_map",
+            }:
+                raise ManifoldFormatError(
+                    f"affine manifold layer {idx} has invalid tensor fields"
+                )
             # Affine (flat / folded-vector) layer — only mean + basis on disk
             # (the coord normalization is identity, rebuilt from the basis
             # shape), plus the per-layer real node coords when the writer
@@ -5457,6 +5475,19 @@ def _load_manifold_locked(
                 affine_map=parts.get("affine_map"),
             )
             continue
+        required_curved = {
+            "mean", "basis", "node_params", "rbf_weights", "poly_coeffs",
+            "coord_offset", "coord_scale",
+        }
+        sigma_fields = {"sigma_rbf_weights", "sigma_poly_coeffs"}
+        if (
+            not required_curved.issubset(parts)
+            or set(parts) - required_curved - sigma_fields
+            or bool(set(parts) & sigma_fields) != sigma_fields.issubset(parts)
+        ):
+            raise ManifoldFormatError(
+                f"curved manifold layer {idx} has invalid tensor fields"
+            )
         layers[idx] = LayerSubspace(
             mean=parts["mean"],
             basis=parts["basis"],
@@ -5908,10 +5939,8 @@ def manifold_is_affine(manifold: "Manifold") -> bool:
     A fit is all-affine (``fit_mode=pca``) or all-curved (authored / spectral);
     a curved ``%`` gets its own two-op instead.
     """
-    layers = getattr(manifold, "layers", None)
-    if not layers:
-        return False
-    return all(sub.is_affine for sub in layers.values())
+    manifold.validate_runtime_geometry()
+    return next(iter(manifold.layers.values())).is_affine
 
 
 __all__ = [

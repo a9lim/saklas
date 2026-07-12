@@ -2120,7 +2120,7 @@ class Monitor:
                 "pca_rotation": pca_rotation,
                 "explained_variance_pcs": ev_pcs,
                 "mahalanobis_share": float(
-                    manifold.mahalanobis_share.get(layer_idx, 0.0),
+                    manifold.mahalanobis_share[layer_idx],
                 ),
                 "overlay": overlay,
             }

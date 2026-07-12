@@ -48,6 +48,7 @@ def _write_fitted_manifold(
             sae_release=release,
             sae_revision="test",
             sae_fingerprint=f"sae:{release}",
+            sae_ids_by_layer={"0": f"{release}:layer-0"},
         )
     save_manifold(manifold, path, metadata)
     if publish_manifest:

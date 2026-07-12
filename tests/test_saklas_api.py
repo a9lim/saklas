@@ -331,20 +331,15 @@ class TestProbes:
         from types import SimpleNamespace
         import torch
 
+        from saklas.core.vectors import fold_directions_to_subspace
+        from tests._whitener import isotropic_whitener
+
         session, client = session_and_client
         # Unified attach: body-carried selector → session.add_probe, 201 + info.
-        mani = SimpleNamespace(
-            name="happy",
-            layers={0: SimpleNamespace(is_affine=True)},
-            node_labels=["+"],
-            node_coords=torch.zeros(1, 1),
-            feature_space="model",
-            domain=SimpleNamespace(
-                to_spec=lambda: {
-                    "type": "custom", "dimensions": 1, "bounds": None,
-                },
-                intrinsic_dim=1,
-            ),
+        means = {0: torch.zeros(2)}
+        mani = fold_directions_to_subspace(
+            "happy", {0: torch.tensor([1.0, 0.0])}, means,
+            whitener=isotropic_whitener(means, 2),
         )
         session.add_probe.return_value = "happy"
         session.monitor.attached_probes.return_value = {
