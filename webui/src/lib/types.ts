@@ -652,10 +652,8 @@ export interface VectorListResponse {
 }
 
 export interface ExtractRequest {
-  name: string;
-  /** Either a string (concept name like "happy.sad"), a {pos, neg} pair,
-   * or a {pairs: [{positive, negative}, ...]} bundle. */
-  source?: unknown;
+  /** Concept represented by the positive node (or sole monopolar node). */
+  concept: string;
   baseline?: string | null;
   sae?: string | null;
   /** Role-augmented extraction: replace the assistant-role label in
@@ -675,7 +673,6 @@ export interface ExtractRequest {
   /** Regenerate/re-author the manifold corpus and refit even when a valid
    *  fitted tensor exists. Default false keeps the exact cache hit. */
   force?: boolean;
-  register?: boolean;
 }
 
 export interface ExtractResponse {

@@ -299,7 +299,7 @@ not a re-render pass.
 
 ### Vectors under `/sessions/{id}/vectors` (in `vector_routes.py`)
 
-- `GET` list, `GET /{name}` profile JSON, `POST` load-from-disk, `DELETE /{name}`
+- `GET` list, `GET /{name}` profile JSON, `DELETE /{name}`
   (also drops the name from `default_steering`).
 - `GET /{name}/diagnostics` — 16-bucket `‖baked‖` histogram + per-layer magnitudes +
   the `diagnostics_by_layer` blocks when present.
@@ -308,15 +308,12 @@ not a re-render pass.
   whitened cosine is single-layer, so each cell is whitened in `a`'s row-layer frame.
   `session.whitener` must cover every row-layer of `a`, else 409 (regenerate the
   neutral cache). Registered *before* `GET /vectors/{name}` so the literal path wins.
-- `POST /extract` — in `asyncio.to_thread`; SSE / JSON. `coerce_corpora`
-  normalizes `source`: a concept name routes to `session.extract` (a composite
-  name fits a 2-node `pca`; a monopolar name with no baseline fits the 1-node
-  neutral-anchored ray), while two pole corpora (`{positive, negative}` /
-  `{pairs: [...]}` / a bare single `{positive, negative}`) route to
-  `session.extract_vector_from_corpora` and land a 2-node `pca` manifold.
-  `namespace` controls the destination; `force` bypasses the tensor cache;
-  `auto_register` (wire field `register`, default true) steers the result in as a
-  vector on success. There is no `/extract/preview` (the A0
+- `POST /extract` — in `asyncio.to_thread`; SSE / JSON. The exact request shape is
+  `{concept, baseline?, sae?, role?, namespace?, force?}` and routes to
+  `session.extract`: a concept with a baseline fits a 2-node `pca`; a monopolar
+  concept fits the 1-node neutral-anchored ray. The resulting manifold's folded
+  profile is always registered in the live session. `namespace` controls the
+  destination and `force` bypasses the tensor cache. There is no `/extract/preview` (the A0
   scenario/preview machinery was removed — A2 has no scenarios).
 - `POST /vectors/bake` (`BakeVectorRequest`) body `{name, expression}` — wraps
   `merge_into_manifold` (model-scoped, `force=True`): lands a corpus-less baked

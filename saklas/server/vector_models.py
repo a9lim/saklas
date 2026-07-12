@@ -5,29 +5,23 @@ from __future__ import annotations
 from operator import itemgetter
 from typing import Any
 
-from fastapi import HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict
 
 from saklas.core.profile import Profile
 from saklas.core.session import SaklasSession
 
 
 class ExtractRequest(BaseModel):
-    name: str
-    source: Any = None
+    """Author and fit the current manifold representation of a concept."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    concept: str
     baseline: str | None = None
     sae: str | None = None
     role: str | None = None
     namespace: str | None = None
     force: bool = False
-    auto_register: bool = Field(True, alias="register")
-
-    model_config = {"populate_by_name": True}
-
-
-class LoadVectorRequest(BaseModel):
-    name: str
-    source_path: str
 
 
 class BakeVectorRequest(BaseModel):
@@ -75,47 +69,3 @@ def probe_profile_tensors(
     if not is_foldable_vector_manifold(manifold):
         return None
     return folded_vector_directions(manifold)
-
-
-def coerce_corpora(source: Any) -> Any:
-    """Normalize a JSON extract source into a concept name or two pole corpora."""
-    if not isinstance(source, dict):
-        return source
-
-    if (
-        isinstance(source.get("positive"), list)
-        and isinstance(source.get("negative"), list)
-    ):
-        return (
-            [str(s) for s in source["positive"]],
-            [str(s) for s in source["negative"]],
-        )
-
-    raw_pairs: list[Any]
-    if "pairs" in source:
-        raw_pairs = list(source["pairs"])
-    elif "positive" in source and "negative" in source:
-        raw_pairs = [source]
-    else:
-        return source
-
-    positive: list[str] = []
-    negative: list[str] = []
-    for idx, pair in enumerate(raw_pairs):
-        if isinstance(pair, dict):
-            if "positive" not in pair or "negative" not in pair:
-                raise HTTPException(
-                    400,
-                    f"pairs[{idx}] must contain 'positive' and 'negative'",
-                )
-            positive.append(str(pair["positive"]))
-            negative.append(str(pair["negative"]))
-        elif isinstance(pair, (list, tuple)) and len(pair) == 2:
-            positive.append(str(pair[0]))
-            negative.append(str(pair[1]))
-        else:
-            raise HTTPException(
-                400,
-                f"pairs[{idx}] must be a [positive, negative] pair",
-            )
-    return positive, negative

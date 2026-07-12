@@ -346,13 +346,16 @@ class TestExtract:
         session.extract.return_value = ("angry.calm", profile)
         resp = client.post(
             "/saklas/v1/sessions/default/extract",
-            json={"name": "angry.calm", "source": "angry", "register": False},
+            json={"concept": "angry", "baseline": "calm"},
         )
         assert resp.status_code == 200
         data = resp.json()
         assert data["canonical"] == "angry.calm"
         assert data["profile"]["layers"] == [0, 1]
         assert "on_progress" in session.extract.call_args.kwargs
+        session.extract.assert_called_once()
+        assert session.extract.call_args.args == ("angry", "calm")
+        session.steer.assert_called_once_with("angry.calm", profile)
 
     def test_extract_json_registers_returned_variant_and_namespace(
         self, session_and_client: Any,
@@ -366,11 +369,10 @@ class TestExtract:
         resp = client.post(
             "/saklas/v1/sessions/default/extract",
             json={
-                "name": "honest.deceptive",
-                "source": "honest",
+                "concept": "honest",
+                "baseline": "deceptive",
                 "role": "pirate",
                 "namespace": "alice",
-                "register": True,
             },
         )
 
@@ -414,7 +416,7 @@ class TestExtract:
         with client.stream(
             "POST",
             "/saklas/v1/sessions/default/extract",
-            json={"name": "angry.calm", "source": "angry", "register": False},
+            json={"concept": "angry", "baseline": "calm"},
             headers={"Accept": "text/event-stream"},
         ) as resp:
             assert resp.status_code == 200
@@ -452,10 +454,9 @@ class TestExtract:
             "POST",
             "/saklas/v1/sessions/default/extract",
             json={
-                "name": "honest.deceptive",
-                "source": "honest",
+                "concept": "honest",
+                "baseline": "deceptive",
                 "role": "pirate",
-                "register": True,
             },
             headers={"Accept": "text/event-stream"},
         ) as resp:
@@ -467,68 +468,31 @@ class TestExtract:
             "honest.deceptive:role-pirate", profile,
         )
 
-    def test_extract_json_coerces_dict_pairs_and_uses_keyword_progress(self, session_and_client: Any) -> None:
-        import torch
-        from saklas.core.profile import Profile
+    def test_extract_rejects_legacy_polymorphic_shape(
+        self, session_and_client: Any,
+    ) -> None:
         session, client = session_and_client
-        profile = Profile({0: torch.ones(4)})
-
-        def _extract(name: Any, positive: Any, negative: Any, *, on_progress: Any = None, **_kwargs: Any) -> Any:
-            # A {pairs:[...]} payload unzips into two pole corpora fed to the
-            # 2-node pca fit — no {positive,negative} pairs, no DataSource.
-            assert name == "custom"
-            assert positive == ["positive text"]
-            assert negative == ["negative text"]
-            assert on_progress is not None
-            on_progress("progress")
-            return "custom", profile
-
-        session.extract_vector_from_corpora.side_effect = _extract
         resp = client.post(
             "/saklas/v1/sessions/default/extract",
             json={
-                "name": "custom",
-                "source": {
-                    "pairs": [
-                        {
-                            "positive": "positive text",
-                            "negative": "negative text",
-                        }
-                    ]
-                },
+                "concept": "custom",
+                "source": {"positive": ["yes"], "negative": ["no"]},
                 "register": False,
             },
         )
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["canonical"] == "custom"
-        assert data["progress"] == ["progress"]
+        assert resp.status_code == 400
+        session.extract.assert_not_called()
 
-    def test_extract_json_coerces_single_pair_dict(self, session_and_client: Any) -> None:
-        # A bare {positive, negative} object — not wrapped in {"pairs": ...}
-        # — coerces to two one-element pole corpora carrying the request name.
-        import torch
-        from saklas.core.profile import Profile
+    def test_raw_profile_load_route_is_removed(
+        self, session_and_client: Any,
+    ) -> None:
         session, client = session_and_client
-        profile = Profile({0: torch.ones(4)})
-
-        def _extract(name: Any, positive: Any, negative: Any, **_kwargs: Any) -> Any:
-            assert name == "mood"
-            assert positive == ["pos one"]
-            assert negative == ["neg one"]
-            return "mood", profile
-
-        session.extract_vector_from_corpora.side_effect = _extract
         resp = client.post(
-            "/saklas/v1/sessions/default/extract",
-            json={
-                "name": "mood",
-                "source": {"positive": "pos one", "negative": "neg one"},
-                "register": False,
-            },
+            "/saklas/v1/sessions/default/vectors",
+            json={"name": "custom", "source_path": "/tmp/profile.pt"},
         )
-        assert resp.status_code == 200
-        assert resp.json()["canonical"] == "mood"
+        assert resp.status_code == 405
+        session.load_profile.assert_not_called()
 
 
 # ---- WebSocket token+probe co-stream ------------------------------------

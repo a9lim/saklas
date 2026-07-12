@@ -1,7 +1,7 @@
 """Native vectors route group (``/saklas/v1/sessions/{id}/vectors/*``).
 
-Steering-vector lifecycle under the session: list / profile JSON /
-load-from-disk / delete / extract / bake / diagnostics, plus the
+Steering-vector lifecycle under the session: list / profile JSON / delete /
+extract / bake / diagnostics, plus the
 cross-layer whitened ``pairwise`` matrix and the N×N ``correlation``
 matrix across loaded vectors and probes.
 """
@@ -24,8 +24,6 @@ from saklas.server.sse import ProgressCallback, progress_sse_response
 from saklas.server.vector_models import (
     BakeVectorRequest,
     ExtractRequest,
-    LoadVectorRequest,
-    coerce_corpora,
     extract_registry_name,
     probe_profile_tensors,
     profile_to_json,
@@ -209,16 +207,6 @@ def register_vector_routes(app: FastAPI) -> None:
             raise HTTPException(404, f"vector '{name}' not found")
         return profile_to_json(name, vectors[name])
 
-    @app.post("/saklas/v1/sessions/{session_id}/vectors")
-    def load_vector(session_id: str, req: LoadVectorRequest):
-        resolve_session_id(session, session_id)
-        try:
-            profile = session.load_profile(req.source_path)
-        except FileNotFoundError as e:
-            raise HTTPException(400, f"file not found: {req.source_path}") from e
-        session.steer(req.name, profile)
-        return profile_to_json(req.name, profile)
-
     @app.get("/saklas/v1/sessions/{session_id}/correlation")
     def correlation_matrix(session_id: str, names: str | None = None):
         """N×N magnitude-weighted cosine matrix across loaded vectors and probes.
@@ -366,23 +354,10 @@ def register_vector_routes(app: FastAPI) -> None:
     @app.post("/saklas/v1/sessions/{session_id}/extract")
     async def extract_vector(session_id: str, req: ExtractRequest, request: Request):
         resolve_session_id(session, session_id)
-        coerced: Any = coerce_corpora(
-            req.source if req.source is not None else req.name
-        )
 
         def _run(on_progress: ProgressCallback) -> tuple[str, Any]:
-            # Two pole corpora -> author + fit directly; a concept name ->
-            # generate the corpora first.  Both land a 2-node ``pca`` manifold.
-            if isinstance(coerced, tuple):
-                positive, negative = coerced
-                return session.extract_vector_from_corpora(
-                    req.name, positive, negative,
-                    on_progress=on_progress,
-                    sae=req.sae,
-                    role=req.role, namespace=req.namespace, force=req.force,
-                )
             return session.extract(
-                coerced, req.baseline,
+                req.concept, req.baseline,
                 on_progress=on_progress,
                 sae=req.sae,
                 role=req.role, namespace=req.namespace, force=req.force,
@@ -393,8 +368,7 @@ def register_vector_routes(app: FastAPI) -> None:
             async def _job(on_progress: ProgressCallback) -> dict[str, Any]:
                 canonical, profile = await asyncio.to_thread(_run, on_progress)
                 registry_name = extract_registry_name(canonical, req.namespace)
-                if req.auto_register:
-                    session.steer(registry_name, profile)
+                session.steer(registry_name, profile)
                 return {
                     "done": True,
                     "profile": profile_to_json(registry_name, profile),
@@ -414,8 +388,7 @@ def register_vector_routes(app: FastAPI) -> None:
                 raise HTTPException(503, "session locked")
             canonical, profile = await asyncio.to_thread(_run, progress_msgs.append)
             registry_name = extract_registry_name(canonical, req.namespace)
-            if req.auto_register:
-                session.steer(registry_name, profile)
+            session.steer(registry_name, profile)
         return {
             "canonical": registry_name,
             "profile": profile_to_json(registry_name, profile),
