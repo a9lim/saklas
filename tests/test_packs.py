@@ -79,13 +79,13 @@ def test_save_load_profile_roundtrip_slim_sidecar(tmp_path: Path):
     }
     path = tmp_path / "google__gemma-2-2b-it.safetensors"
     save_profile(profile, str(path), {
-        "method": "difference_of_means",
-        "statements_sha256": "abc",
+        "method": "contrastive_pca",
+        "statements_sha256": "a" * 64,
     })
     loaded, meta = load_profile(str(path))
     assert sorted(loaded.keys()) == [0, 14]
-    assert meta["method"] == "difference_of_means"
-    assert meta["statements_sha256"] == "abc"
+    assert meta["method"] == "contrastive_pca"
+    assert meta["statements_sha256"] == "a" * 64
     assert "saklas_version" in meta
     # Scores no longer live on disk — shares are baked into tensor magnitudes.
     assert "scores" not in meta

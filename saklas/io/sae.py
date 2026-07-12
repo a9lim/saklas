@@ -10,6 +10,8 @@ tensors into a second cache.
 from __future__ import annotations
 
 from pathlib import Path
+import math
+import re
 from typing import Any
 
 from saklas.io.atomic import write_json_atomic
@@ -83,7 +85,9 @@ def _validate_runtime_payload(
     ):
         return False
     return all(
-        payload[key] is None or isinstance(payload[key], str)
+        payload[key] is None or (
+            isinstance(payload[key], str) and bool(payload[key].strip())
+        )
         for key in ("sae_id", "repo_id", "neuronpedia_id")
     )
 
@@ -114,6 +118,7 @@ def _validate_feature_entry(value: Any) -> dict[str, Any] | None:
     if max_act is not None and (
         isinstance(max_act, bool)
         or not isinstance(max_act, (int, float))
+        or not math.isfinite(float(max_act))
         or float(max_act) <= 0
     ):
         return None
@@ -144,7 +149,7 @@ def load_sae_feature_meta(model_id: str, release: str) -> dict[str, dict[str, An
         return {}
     out: dict[str, dict[str, Any]] = {}
     for key, value in features.items():
-        if not isinstance(key, str):
+        if not isinstance(key, str) or not re.fullmatch(r"0|[1-9][0-9]*", key):
             return {}
         entry = _validate_feature_entry(value)
         if entry is not None:
@@ -159,6 +164,12 @@ def save_sae_feature_meta(
 ) -> Path:
     normalized: dict[str, dict[str, Any]] = {}
     for key, value in features.items():
+        key_value: Any = key
+        if (
+            not isinstance(key_value, str)
+            or not re.fullmatch(r"0|[1-9][0-9]*", key_value)
+        ):
+            raise ValueError(f"invalid SAE feature id {key!r}")
         # The resident session may carry ephemeral lookup state (currently
         # ``checked``). Persist only the two fields in the cache contract.
         row = {"label": value.get("label"), "max_act": value.get("max_act")}

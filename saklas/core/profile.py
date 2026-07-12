@@ -17,6 +17,7 @@ subspace kernel reads the baked magnitudes as per-layer weights.
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import math
 import pathlib
@@ -24,7 +25,7 @@ import re
 from typing import Any, Iterable, Iterator, Literal, Mapping, overload
 
 import torch
-from safetensors.torch import load_file, save_file
+from safetensors.torch import load as load_safetensors, save as save_safetensors
 
 from saklas.core.errors import SaklasError
 
@@ -35,10 +36,15 @@ _PROFILE_SIDECAR_FIELDS = {
     "components", "bake", "sae_release", "sae_revision",
     "sae_ids_by_layer", "source_model_id", "alignment_map_hash",
     "transfer_quality_estimate", "diagnostics_by_layer",
+    "tensor_sha256",
 }
 _PROFILE_METADATA_FIELDS = _PROFILE_SIDECAR_FIELDS - {
-    "format_version", "saklas_version", "diagnostics_by_layer",
+    "format_version", "saklas_version", "diagnostics_by_layer", "tensor_sha256",
 } | {"diagnostics"}
+
+_PROFILE_METHODS = frozenset({
+    "profile", "merge", "contrastive_pca", "procrustes_transfer",
+})
 
 
 class ProfileError(ValueError, SaklasError):
@@ -46,6 +52,118 @@ class ProfileError(ValueError, SaklasError):
 
     def user_message(self) -> tuple[int, str]:
         return (400, str(self) or self.__class__.__name__)
+
+
+def _validate_profile_sidecar(
+    data: Any, *, tensor_sha256: str | None = None,
+    layers: set[int] | None = None,
+) -> None:
+    if not isinstance(data, dict) or set(data) != _PROFILE_SIDECAR_FIELDS:
+        raise ProfileError("profile sidecar does not match the current exact schema")
+    method = data["method"]
+    if method not in _PROFILE_METHODS:
+        raise ProfileError(f"profile sidecar has invalid method {method!r}")
+    from saklas.io.packs import PROFILE_FORMAT_VERSION
+
+    if (
+        isinstance(data["format_version"], bool)
+        or data["format_version"] != PROFILE_FORMAT_VERSION
+        or not isinstance(data["saklas_version"], str)
+        or not data["saklas_version"]
+    ):
+        raise ProfileError("profile sidecar has invalid format identity")
+    digest = data["tensor_sha256"]
+    if (
+        not isinstance(digest, str) or len(digest) != 64
+        or any(c not in "0123456789abcdef" for c in digest)
+        or tensor_sha256 is not None and digest != tensor_sha256
+    ):
+        raise ProfileError("profile sidecar has invalid tensor sha256")
+    diag = data["diagnostics_by_layer"]
+    if diag is not None:
+        if not isinstance(diag, dict):
+            raise ProfileError("profile diagnostics_by_layer must be an object")
+        for layer, metrics in diag.items():
+            if not re.fullmatch(r"0|[1-9][0-9]*", layer) or not isinstance(metrics, dict):
+                raise ProfileError("profile diagnostics_by_layer has invalid layer schema")
+            if any(
+                not isinstance(name, str) or not name
+                or isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                for name, value in metrics.items()
+            ):
+                raise ProfileError("profile diagnostics_by_layer has invalid metrics")
+        if layers is not None and {int(layer) for layer in diag} != layers:
+            raise ProfileError("profile diagnostics_by_layer does not cover tensor layers")
+    sae_ids = data["sae_ids_by_layer"]
+    if sae_ids is not None and (
+        not isinstance(sae_ids, dict) or any(
+            not isinstance(key, str) or not re.fullmatch(r"0|[1-9][0-9]*", key)
+            or not isinstance(value, str) or not value
+            for key, value in sae_ids.items()
+        )
+    ):
+        raise ProfileError("profile sae_ids_by_layer is invalid")
+    if sae_ids is not None and layers is not None and {
+        int(layer) for layer in sae_ids
+    } != layers:
+        raise ProfileError("profile sae_ids_by_layer does not cover tensor layers")
+    components = data["components"]
+    if components is not None:
+        if not isinstance(components, dict) or not components:
+            raise ProfileError("profile components must be a non-empty object")
+        for key, row in components.items():
+            if (
+                not isinstance(key, str) or not key or not isinstance(row, dict)
+                or set(row) != {"selector", "alpha", "tensor_sha256"}
+                or not isinstance(row["selector"], str) or not row["selector"]
+                or isinstance(row["alpha"], bool)
+                or not isinstance(row["alpha"], (int, float))
+                or not math.isfinite(float(row["alpha"]))
+                or not isinstance(row["tensor_sha256"], str)
+                or not re.fullmatch(r"[0-9a-f]{64}", row["tensor_sha256"])
+            ):
+                raise ProfileError("profile components has invalid provenance")
+    if method == "merge" and components is None:
+        raise ProfileError("merge profile requires component provenance")
+    if method != "merge" and components is not None:
+        raise ProfileError("non-merge profile carries component provenance")
+    nullable_strings = {
+        "statements_sha256", "bake", "sae_release", "sae_revision",
+        "source_model_id", "alignment_map_hash",
+    }
+    if any(
+        data[key] is not None and (
+            not isinstance(data[key], str) or not data[key]
+        ) for key in nullable_strings
+    ):
+        raise ProfileError("profile sidecar has invalid string provenance")
+    for key in ("statements_sha256", "alignment_map_hash"):
+        value = data[key]
+        if value is not None and not re.fullmatch(r"[0-9a-f]{64}", value):
+            raise ProfileError(f"profile sidecar field {key!r} is not a sha256")
+    transfer_fields = (
+        data["source_model_id"], data["alignment_map_hash"],
+        data["transfer_quality_estimate"],
+    )
+    if method == "procrustes_transfer":
+        if transfer_fields[0] is None or transfer_fields[1] is None:
+            raise ProfileError("transfer profile has incomplete provenance")
+    elif any(value is not None for value in transfer_fields):
+        raise ProfileError("non-transfer profile carries transfer provenance")
+    if data["transfer_quality_estimate"] is not None and (
+        isinstance(data["transfer_quality_estimate"], bool)
+        or not isinstance(data["transfer_quality_estimate"], (int, float))
+        or not math.isfinite(float(data["transfer_quality_estimate"]))
+    ):
+        raise ProfileError("profile transfer quality must be finite")
+    sae_present = any(
+        data[key] is not None for key in ("sae_release", "sae_revision", "sae_ids_by_layer")
+    )
+    if sae_present and (
+        data["sae_release"] is None or data["sae_ids_by_layer"] is None
+    ):
+        raise ProfileError("profile has incomplete SAE provenance")
 
 
 def save_profile(
@@ -56,8 +174,9 @@ def save_profile(
     """Save a baked vector profile as .safetensors with a slim .json sidecar.
 
     ``metadata`` must contain at minimum:
-        method            - str, e.g. "merge" / "procrustes_transfer" /
-                            "neutral_activations" / "gguf_import"
+        method            - one of the current safetensor profile producers:
+                            "profile" / "merge" / "contrastive_pca" /
+                            "procrustes_transfer"
 
     Optional keys honored:
         statements_sha256 - str, hash of the source neutral corpus at write time
@@ -82,7 +201,12 @@ def save_profile(
     if not profile:
         raise ProfileError("profile requires at least one layer tensor")
     for layer, tensor in profile.items():
-        if isinstance(layer, bool) or not isinstance(layer, int) or layer < 0:
+        layer_value: Any = layer
+        if (
+            isinstance(layer_value, bool)
+            or not isinstance(layer_value, int)
+            or layer_value < 0
+        ):
             raise ProfileError(f"profile layer must be a non-negative int: {layer!r}")
         if tensor.ndim != 1 or tensor.numel() == 0:
             raise ProfileError(f"profile layer {layer} must be a non-empty rank-1 tensor")
@@ -99,7 +223,8 @@ def save_profile(
         f"layer_{idx}": vec.to(dtype=torch.float32).contiguous().cpu()
         for idx, vec in profile.items()
     }
-    save_file(tensors, str(path))
+    tensor_bytes = save_safetensors(tensors)
+    tensor_digest = hashlib.sha256(tensor_bytes).hexdigest()
 
     from saklas import __version__ as _saklas_version
     from saklas.io.packs import PROFILE_FORMAT_VERSION
@@ -118,6 +243,7 @@ def save_profile(
         "alignment_map_hash": metadata.get("alignment_map_hash"),
         "transfer_quality_estimate": metadata.get("transfer_quality_estimate"),
         "diagnostics_by_layer": None,
+        "tensor_sha256": tensor_digest,
     }
     # Diagnostics: stringify layer keys so the JSON round-trips through
     # standard parsers (JSON object keys must be strings).  Reader inverts.
@@ -126,14 +252,19 @@ def save_profile(
         if not isinstance(diagnostics, dict):
             raise ProfileError("profile metadata 'diagnostics' must be an object")
         sidecar["diagnostics_by_layer"] = {
-            str(layer): {k: float(v) for k, v in metrics.items()}
+            str(layer): dict(metrics)
             for layer, metrics in diagnostics.items()
         }
 
-    from saklas.io.atomic import write_json_atomic
+    _validate_profile_sidecar(
+        sidecar, tensor_sha256=tensor_digest, layers=set(profile),
+    )
+    from saklas.io.atomic import artifact_lock, write_bytes_atomic, write_json_atomic
 
     meta_path = path.with_suffix(".json")
-    write_json_atomic(meta_path, sidecar)
+    with artifact_lock(path):
+        write_bytes_atomic(path, tensor_bytes)
+        write_json_atomic(meta_path, sidecar)
 
     log.info("Saved profile (%d layers) to %s", len(profile), path)
 
@@ -152,38 +283,16 @@ def load_profile(path: str | pathlib.Path) -> tuple[dict[int, torch.Tensor], dic
 
         return read_gguf_profile(path)
 
-    tensors = load_file(str(path))
     meta_path = path.with_suffix(".json")
-    with open(meta_path) as f:
-        metadata = json.load(f)
+    from saklas.io.atomic import artifact_lock
 
-    from saklas.io.packs import PROFILE_FORMAT_VERSION
+    with artifact_lock(path):
+        tensor_bytes = path.read_bytes()
+        with open(meta_path) as f:
+            metadata = json.load(f)
+    tensor_digest = hashlib.sha256(tensor_bytes).hexdigest()
+    tensors = load_safetensors(tensor_bytes)
 
-    if not isinstance(metadata, dict):
-        raise ProfileError(f"profile sidecar {meta_path} must be a JSON object")
-    fmt_ver = metadata.get("format_version")
-    if (
-        not isinstance(fmt_ver, int)
-        or isinstance(fmt_ver, bool)
-        or fmt_ver != PROFILE_FORMAT_VERSION
-    ):
-        raise ProfileError(
-            f"profile sidecar {meta_path} has format_version={fmt_ver!r}; "
-            f"need exactly {PROFILE_FORMAT_VERSION}. Regenerate it with "
-            "the current saklas"
-        )
-    if not isinstance(metadata.get("method"), str) or not metadata["method"]:
-        raise ProfileError(
-            f"profile sidecar {meta_path} requires a non-empty 'method' string"
-        )
-    if set(metadata) != _PROFILE_SIDECAR_FIELDS:
-        raise ProfileError(
-            f"profile sidecar {meta_path} does not match the current exact schema"
-        )
-    if not isinstance(metadata.get("saklas_version"), str) or not metadata["saklas_version"]:
-        raise ProfileError(
-            f"profile sidecar {meta_path} requires a non-empty 'saklas_version'"
-        )
 
     if not tensors:
         raise ProfileError(f"profile tensor {path} has no layers")
@@ -199,55 +308,17 @@ def load_profile(path: str | pathlib.Path) -> tuple[dict[int, torch.Tensor], dic
         if not bool(torch.isfinite(tensor).all().item()):
             raise ProfileError(f"profile tensor {path} layer {layer} is non-finite")
         profile[layer] = tensor
-
-    string_fields = {
-        "statements_sha256", "bake", "sae_release", "sae_revision",
-        "source_model_id", "alignment_map_hash",
-    }
-    for key in string_fields:
-        if metadata[key] is not None and (
-            not isinstance(metadata[key], str) or not metadata[key]
-        ):
-            raise ProfileError(f"profile sidecar {meta_path} field {key!r} must be str")
-    for key in {"components", "sae_ids_by_layer"}:
-        if metadata[key] is not None and not isinstance(metadata[key], dict):
-            raise ProfileError(
-                f"profile sidecar {meta_path} field {key!r} must be an object"
-            )
-    if metadata["transfer_quality_estimate"] is not None and (
-        isinstance(metadata["transfer_quality_estimate"], bool)
-        or not isinstance(metadata["transfer_quality_estimate"], (int, float))
-        or not math.isfinite(float(metadata["transfer_quality_estimate"]))
-    ):
-        raise ProfileError(
-            f"profile sidecar {meta_path} transfer_quality_estimate must be finite"
-        )
+    _validate_profile_sidecar(
+        metadata, tensor_sha256=tensor_digest, layers=set(profile),
+    )
 
     # Invert the layer-key stringification done at save time so diagnostics
     # are addressable by ``int`` consistently with the profile dict.
     raw_diag = metadata["diagnostics_by_layer"]
     if raw_diag is not None:
-        if not isinstance(raw_diag, dict):
-            raise ProfileError(
-                f"profile sidecar {meta_path} diagnostics_by_layer must be an object"
-            )
-        try:
-            metadata["diagnostics"] = {
-                int(layer): {
-                    str(name): float(value)
-                    for name, value in metrics.items()
-                }
-                for layer, metrics in raw_diag.items()
-                if isinstance(metrics, dict)
-            }
-        except (TypeError, ValueError) as exc:
-            raise ProfileError(
-                f"profile sidecar {meta_path} has malformed diagnostics_by_layer"
-            ) from exc
-        if len(metadata["diagnostics"]) != len(raw_diag):
-            raise ProfileError(
-                f"profile sidecar {meta_path} has malformed diagnostics_by_layer"
-            )
+        metadata["diagnostics"] = {
+            int(layer): dict(metrics) for layer, metrics in raw_diag.items()
+        }
 
     return profile, metadata
 

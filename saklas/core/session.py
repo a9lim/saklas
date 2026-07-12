@@ -39,6 +39,12 @@ from saklas.core.generation import (
     supports_thinking,
 )
 from saklas.core.hooks import HiddenCapture, SteeringManager
+from saklas.core.token_callback import (
+    TokenCallback,
+    TokenConsumer,
+    TokenConsumerOptions,
+    consumer_options,
+)
 from saklas.core.scene import (
     SceneGrammarError,
     TurnGrammar,
@@ -68,6 +74,7 @@ from saklas.core.results import (
     GenerationResult,
     ProbeReading,
     RunSet,
+    TokenAlt,
     TokenEvent,
 )
 from saklas.core.sampling import SamplingConfig
@@ -230,9 +237,9 @@ class _SerialGenerationJob:
     sampling: SamplingConfig | None = None
     raw: bool = False
     thinking: bool | None = None
-    on_token: Callable[..., None] | None = None
+    on_token: TokenCallback | None = None
     parent_node_id: str | None = None
-    recipe_override: Any = None
+    recipe_override: Recipe | str | None = None
     grid: dict[str, Any] | None = None
     gen_seat: str = "assistant"
 
@@ -1452,15 +1459,12 @@ class SaklasSession:
         from saklas.core.vectors import is_foldable_vector_manifold
 
         names = set(self._profiles)  # registered vectors are always R=1
-        try:
-            for pname in self._monitor.probe_names:
-                if pname in names:
-                    continue  # a registered vector wins the same-named probe
-                manifold = self._monitor.manifolds.get(pname)
-                if manifold is not None and is_foldable_vector_manifold(manifold):
-                    names.add(pname)
-        except Exception:
-            pass
+        for pname in self._monitor.probe_names:
+            if pname in names:
+                continue  # a registered vector wins the same-named probe
+            manifold = self._monitor.manifolds.get(pname)
+            if manifold is not None and is_foldable_vector_manifold(manifold):
+                names.add(pname)
         return sorted(names)
 
     def _live_direction_tensors(self, name: str) -> "dict[int, torch.Tensor] | None":
@@ -1715,16 +1719,17 @@ class SaklasSession:
                 # the neutral artifact while this thread waited.
                 if not self._layer_means:
                     try:
-                        self._layer_means = bootstrap_layer_means(
+                        means = bootstrap_layer_means(
                             self._model, self._tokenizer, self._layers,
                             self._model_info,
                         )
-                    except Exception as exc:  # pragma: no cover — defensive
-                        _log.warning(
-                            "session.layer_means lazy build failed: %s; "
-                            "DLS and Mahalanobis paths will fall back to "
-                            "no-baseline behavior", exc,
-                        )
+                    except Exception as exc:
+                        raise SaklasError(
+                            "failed to build neutral layer means"
+                        ) from exc
+                    if not means:
+                        raise SaklasError("neutral layer-mean bootstrap returned empty")
+                    self._layer_means = means
         return self._layer_means
 
     # -- Mahalanobis whitener (v2.1) --
@@ -6643,14 +6648,8 @@ class SaklasSession:
                 # ``tensor.detach().cpu().contiguous()`` keeps the hash stable
                 # across device placements; fp32 cast normalizes dtype so
                 # mixed-precision storage doesn't change the hex digest.
-                try:
-                    arr = tensor.detach().to("cpu").to(torch.float32).contiguous()
-                    h.update(arr.numpy().tobytes())
-                except Exception:
-                    # Synthetic probes from unit tests may not be torch
-                    # tensors — fall through to a stable text representation
-                    # so the cache still produces something deterministic.
-                    h.update(repr((layer_idx, tensor)).encode("utf-8"))
+                arr = tensor.detach().to("cpu").to(torch.float32).contiguous()
+                h.update(arr.numpy().tobytes())
         digest = h.hexdigest()
         self._probe_hash_cache[name] = digest
         return digest
@@ -6801,7 +6800,7 @@ class SaklasSession:
         raw_index: int,
         alt_token_id: int,
         *,
-        on_token: Callable[..., None] | None = None,
+        on_token: TokenCallback | None = None,
     ) -> GenerationResult:
         """Logit fork — regenerate ``node_id`` as a sibling with one token swapped.
 
@@ -6890,7 +6889,7 @@ class SaklasSession:
         *,
         steering: "str | Steering | None" = None,
         sampling: SamplingConfig | None = None,
-        on_token: Callable[..., None] | None = None,
+        on_token: TokenCallback | None = None,
     ) -> GenerationResult:
         """Answer-prefill — seed the assistant reply under a user node.
 
@@ -8044,7 +8043,7 @@ class SaklasSession:
         *,
         use_thinking: bool,
         want_hidden: bool,
-        effective_tap: Callable[..., None] | None,
+        effective_tap: TokenCallback | None,
         seed: int | None,
         stop_list: list[str] | None,
         logit_bias: dict[int, float] | None,
@@ -8188,7 +8187,7 @@ class SaklasSession:
         stateless: bool = False,
         raw: bool = False,
         thinking: bool | None = None,
-        on_token: Callable[..., None] | None = None,
+        on_token: TokenCallback | None = None,
         parent_node_id: str | None = None,
         recipe_override: "Recipe | str | None" = None,
         forced_prefix: list[int] | None = None,
@@ -8274,20 +8273,18 @@ class SaklasSession:
             # (probes still report the end-of-gen aggregate) and only probe
             # gates can force a per-token subset.
             _live_scores_on = self._live_probe_scores
+            _callback_options = consumer_options(on_token)
             _wants_live_token_scores = bool(
                 _live_scores_on
                 and on_token is not None
-                and getattr(on_token, "_saklas_wants_live_scores", False)
+                and _callback_options.live_scores
             )
             _persists_layer_scores = bool(
                 _live_scores_on
                 and (
                     (sampling is not None and sampling.persist_per_layer_scores)
                     or (
-                        on_token is not None
-                        and getattr(
-                            on_token, "_saklas_wants_per_layer_scores", False,
-                        )
+                        on_token is not None and _callback_options.per_layer_scores
                     )
                 )
             )
@@ -8308,7 +8305,10 @@ class SaklasSession:
 
             _has_monitor_probes = bool(self._monitor.probe_names)
 
-            def _token_tap(text: str, is_thinking: bool, tid: int | None, lp: float | None, top_alts: Any, perplexity: float | None) -> None:
+            def _token_tap(
+                text: str, is_thinking: bool, tid: int | None, lp: float | None,
+                top_alts: list[TokenAlt] | None, perplexity: float | None = None,
+            ) -> None:
                 nonlocal mean_logprob_sum, mean_logprob_count
                 self._last_token_probe_payload = None
                 if logprobs_list is not None and tid is not None and tid >= 0 and not is_thinking:
@@ -8480,12 +8480,12 @@ class SaklasSession:
             _has_lens_consumer = bool(
                 self._live_lens is not None
                 and on_token is not None
-                and getattr(on_token, "_saklas_wants_lens_readout", False)
+                and _callback_options.lens_readout
             )
             _has_sae_consumer = bool(
                 self._live_sae is not None
                 and on_token is not None
-                and getattr(on_token, "_saklas_wants_sae_readout", False)
+                and _callback_options.sae_readout
             )
             _effective_tap = _token_tap if _need_tap else None
             _tap_has_text_consumer = bool(
@@ -8676,15 +8676,12 @@ class SaklasSession:
                     # in.  Stateless server streaming (OpenAI/Ollama deltas, the
                     # native WS tap) never reads per-token ppl, so it skips the
                     # sync.  Callers can force it via ``on_token
-                    # ._saklas_wants_perplexity = True``.
+                    # requests perplexity through ``TokenConsumerOptions``.
                     want_perplexity=(
                         not stateless
                         or assistant_node_id is not None
                         or (
-                            on_token is not None
-                            and getattr(
-                                on_token, "_saklas_wants_perplexity", False,
-                            )
+                            on_token is not None and _callback_options.perplexity
                         )
                     ),
                     cache_token_text=_tap_has_text_consumer,
@@ -8785,7 +8782,7 @@ class SaklasSession:
         stateless: bool = False,
         raw: bool = False,
         thinking: bool | None = None,
-        on_token: Callable[..., None] | None = None,
+        on_token: TokenCallback | None = None,
         parent_node_id: str | None = None,
         n: int = 1,
         recipe_override: "Recipe | str | None" = None,
@@ -8868,7 +8865,7 @@ class SaklasSession:
         stateless: bool,
         raw: bool,
         thinking: bool | None,
-        on_token: Callable[..., None] | None,
+        on_token: TokenCallback | None,
         parent_node_id: str | None,
         n: int,
         recipe_override: "Recipe | str | None",
@@ -8911,7 +8908,7 @@ class SaklasSession:
         stateless: bool = False,
         raw: bool = False,
         thinking: bool | None = None,
-        on_token: Callable[..., None] | None = None,
+        on_token: TokenCallback | None = None,
         parent_node_id: str | None = None,
         n: int = 1,
         recipe_override: "Recipe | str | None" = None,
@@ -9020,7 +9017,10 @@ class SaklasSession:
         exc_holder: list[BaseException] = []
         idx_counter = [0]
 
-        def _push(text: str, is_thinking: bool, tid: int | None, lp: float | None, top_alts: Any, perplexity: float | None) -> None:
+        def _push(
+            text: str, is_thinking: bool, tid: int | None, lp: float | None,
+            top_alts: list[TokenAlt] | None, perplexity: float | None = None,
+        ) -> None:
             payload = self._last_token_probe_payload or {}
             probe_readings: dict[str, "ProbeReading"] | None = None
             # Monitor probes AND pinned lens probes (readout channel) both
@@ -9052,10 +9052,14 @@ class SaklasSession:
             )
             idx_counter[0] += 1
             q.put(event)
-        _push_flags: Any = _push
-        _push_flags._saklas_wants_live_scores = bool(live_scores)
-        _push_flags._saklas_wants_lens_readout = bool(live_readouts)
-        _push_flags._saklas_wants_sae_readout = bool(live_readouts)
+        consumer = TokenConsumer(
+            _push,
+            TokenConsumerOptions(
+                live_scores=bool(live_scores),
+                lens_readout=bool(live_readouts),
+                sae_readout=bool(live_readouts),
+            ),
+        )
 
         def _worker():
             try:
@@ -9066,7 +9070,7 @@ class SaklasSession:
                     stateless=stateless,
                     raw=raw,
                     thinking=thinking,
-                    on_token=_push,
+                    on_token=consumer,
                     parent_node_id=parent_node_id,
                     recipe_override=recipe_override,
                     gen_seat=gen_seat,
@@ -9740,8 +9744,8 @@ class SaklasSession:
         row and the consume gate would refuse the hit anyway), no
         ``return_hidden`` and no thinking (both force a full re-prefill), at
         least two rows, and a shared prefix of at least
-        :data:`_PREFIX_CACHE_MIN_TOKENS`.  Best-effort: any failure to render or
-        cache falls back to the uncached path without disturbing the batch.
+        :data:`_PREFIX_CACHE_MIN_TOKENS`. Ordinary ineligibility returns False;
+        lifecycle, rendering, and initialization failures propagate.
         """
         if len(prompts) < 2 or not stateless:
             return False
@@ -9751,34 +9755,24 @@ class SaklasSession:
             return False
         if not self._steering_value_prefill_inactive(steering):
             return False
-        try:
-            common = self._batch_common_prefix_ids(prompts, raw=raw)
-            if common is None:
-                return False
-            max_new_tokens = (
-                sampling.max_tokens
-                if sampling is not None and sampling.max_tokens is not None
-                else self.config.max_new_tokens
-            )
-            return (
-                self.cache_prefix(
-                    common,
-                    max_new_tokens=max_new_tokens,
-                    prefer_static=bool(
-                        self._static_cache_active
-                        and steering is None
-                    ),
-                )
-                >= _PREFIX_CACHE_MIN_TOKENS
-            )
-        except Exception as exc:
-            # Prefix caching is a pure optimization: a cache_prefix guard
-            # (active scope / in-flight gen), a render failure, or an
-            # under-initialized session must fall back to the normal per-row
-            # prefill, never break the batch.  ``cache_prefix`` clears its own
-            # state before setting it, so no half-built cache can leak.
-            _log.debug("generate_batch: skipping prefix cache (%s)", exc)
+        common = self._batch_common_prefix_ids(prompts, raw=raw)
+        if common is None:
             return False
+        max_new_tokens = (
+            sampling.max_tokens
+            if sampling is not None and sampling.max_tokens is not None
+            else self.config.max_new_tokens
+        )
+        return (
+            self.cache_prefix(
+                common,
+                max_new_tokens=max_new_tokens,
+                prefer_static=bool(
+                    self._static_cache_active and steering is None
+                ),
+            )
+            >= _PREFIX_CACHE_MIN_TOKENS
+        )
 
     def _batch_common_prefix_ids(
         self, prompts: list[Any], *, raw: bool,

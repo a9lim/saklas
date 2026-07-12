@@ -32,6 +32,7 @@ reach the same state.
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
+from textual.css.query import NoMatches
 
 from saklas.tui.chat_panel import (
     _KIND_CHAIN_INLINE,
@@ -80,6 +81,20 @@ class InputHistoryController:
         # for edit with ``↑``.
         self._pending_queue: list[PendingItem] = []
 
+    def release_pulled_slot(self) -> int | None:
+        """Atomically return and clear the currently edited queue slot."""
+        slot = self._pulled_slot
+        if slot is None:
+            return None
+        self._pulled_slot = None
+        self._sync_pull_state()
+        return slot
+
+    def clear_pending_edit_state(self) -> None:
+        self._pending_queue.clear()
+        self._pulled_slot = None
+        self._sync_pull_state()
+
     # -- Input history (↑/↓ in chat input) --
 
     def _push_input_history(self, text: str) -> None:
@@ -127,7 +142,7 @@ class InputHistoryController:
         """
         try:
             inp = self._app.query_one("#chat-input", ChatInput)
-        except Exception:
+        except NoMatches:
             return
 
         n_pending = len(self._pending_queue)
@@ -206,9 +221,7 @@ class InputHistoryController:
             return
         try:
             inp = self._app.query_one("#chat-input", ChatInput)
-        except Exception:
-            self._pulled_slot = None
-            self._sync_pull_state()
+        except NoMatches:
             return
         self._pulled_slot = None
         self._history_index = None
@@ -232,7 +245,7 @@ class InputHistoryController:
         """
         try:
             inp = self._app.query_one("#chat-input", ChatInput)
-        except Exception:
+        except NoMatches:
             pass
         else:
             inp.allow_empty_submit = self._pulled_slot is not None

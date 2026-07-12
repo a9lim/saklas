@@ -14,15 +14,18 @@ import asyncio
 import uuid
 from collections import deque
 from contextlib import suppress
-from typing import Any, Awaitable, Callable
+from dataclasses import dataclass
+from typing import Any, Awaitable, Callable, cast
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from pydantic import ValidationError
 
 from saklas.core.errors import SaklasError
 from saklas.core.loom import LoomMutated
 from saklas.core.results import GenerationResult, TokenAlt
 from saklas.core.sampling import SamplingConfig
 from saklas.core.session import SaklasSession
+from saklas.core.token_callback import TokenConsumer, TokenConsumerOptions
 from saklas.core.steering import Steering
 from saklas.server.app import acquire_session_lock, ws_auth_ok
 from saklas.server.native_common import SINGLE_SESSION_ID
@@ -36,6 +39,46 @@ from saklas.server.ws_models import (
     build_sampling,
     result_to_json,
 )
+
+JSONValue = None | bool | int | float | str | list["JSONValue"] | dict[str, "JSONValue"]
+JSONObject = dict[str, JSONValue]
+
+
+@dataclass(frozen=True)
+class _Stop:
+    pass
+
+
+@dataclass(frozen=True)
+class _Disconnect:
+    pass
+
+
+@dataclass(frozen=True)
+class _ReaderFailure:
+    message: str
+    code: str
+
+
+@dataclass(frozen=True)
+class _InvalidInbound:
+    message: str
+
+
+_Inbound = WSGenerateMessage | _Stop | _Disconnect | _ReaderFailure | _InvalidInbound
+
+
+@dataclass(frozen=True)
+class _TokenFrame:
+    payload: JSONObject
+
+
+@dataclass(frozen=True)
+class _TokenDone:
+    pass
+
+
+_TokenQueueItem = _TokenFrame | _TokenDone
 
 
 def register_ws_stream(app: FastAPI) -> None:
@@ -63,20 +106,29 @@ def register_ws_stream(app: FastAPI) -> None:
         # incoming frame through one queue lets both the outer dispatch
         # loop and the in-flight generation share the read side without
         # ever overlapping calls into the WS.
-        incoming: asyncio.Queue[Any] = asyncio.Queue()
-        _DISCONNECT = object()
+        incoming: asyncio.Queue[_Inbound] = asyncio.Queue()
 
         async def _reader():
             try:
                 while True:
-                    msg = await websocket.receive_json()
-                    await incoming.put(msg)
+                    raw = await websocket.receive_json()
+                    if not isinstance(raw, dict):
+                        await incoming.put(_InvalidInbound("message must be an object"))
+                    elif raw.get("type") == "generate":
+                        try:
+                            await incoming.put(WSGenerateMessage(**raw))
+                        except ValidationError as exc:
+                            await incoming.put(_InvalidInbound(str(exc)))
+                    elif raw.get("type") == "stop":
+                        await incoming.put(_Stop())
+                    else:
+                        await incoming.put(_InvalidInbound(f"unknown message type: {raw.get('type')!r}"))
             except WebSocketDisconnect:
-                await incoming.put(_DISCONNECT)
+                await incoming.put(_Disconnect())
             except Exception as e:
                 # Surface any other read-side failure into the queue so
                 # the dispatcher can close cleanly instead of leaking.
-                await incoming.put({"_reader_error": str(e), "_type": type(e).__name__})
+                await incoming.put(_ReaderFailure(str(e), type(e).__name__))
 
         reader_task = asyncio.create_task(_reader())
 
@@ -85,7 +137,7 @@ def register_ws_stream(app: FastAPI) -> None:
         # in a queue + forwarder task so the EventBus callback (which
         # runs on the gen thread) never touches the WS directly.
         loop = asyncio.get_running_loop()
-        tree_event_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        tree_event_queue: asyncio.Queue[JSONObject] = asyncio.Queue()
         # ``websocket.send_json`` is not safe for concurrent callers —
         # starlette serializes per-call but two tasks can interleave
         # bytes on the wire and corrupt the frame sequence.  This lock
@@ -94,11 +146,11 @@ def register_ws_stream(app: FastAPI) -> None:
         # every send.
         ws_send_lock = asyncio.Lock()
 
-        async def _send_json(payload: Any) -> None:
+        async def _send_json(payload: JSONObject) -> None:
             async with ws_send_lock:
                 await websocket.send_json(payload)
 
-        def _queue_tree_event(payload: dict[str, Any]) -> None:
+        def _queue_tree_event(payload: JSONObject) -> None:
             with suppress(Exception):
                 loop.call_soon_threadsafe(tree_event_queue.put_nowait, payload)
 
@@ -106,7 +158,7 @@ def register_ws_stream(app: FastAPI) -> None:
             if not isinstance(event, LoomMutated):
                 return
             added_nodes = [node_json(session, nid) for nid in event.added]
-            mutated_payload: dict[str, Any] = {
+            mutated_payload = cast(JSONObject, {
                 "type": "tree_mutated",
                 "op": event.op,
                 "rev": event.rev,
@@ -118,7 +170,7 @@ def register_ws_stream(app: FastAPI) -> None:
                     if session.tree.has(nid)
                 ],
                 "active_node_id": event.active_node_id,
-            }
+            })
             if event.op == "cast":
                 # Roster ops carry no node ids — inline the full roster
                 # (small) so clients reconcile without a refetch.
@@ -149,7 +201,7 @@ def register_ws_stream(app: FastAPI) -> None:
 
         forwarder_task = asyncio.create_task(_tree_forwarder())
 
-        deferred_incoming: deque[Any] = deque()
+        deferred_incoming: deque[_Inbound] = deque()
 
         async def _cancel_and_wait(task: asyncio.Task[Any]) -> None:
             task.cancel()
@@ -167,34 +219,23 @@ def register_ws_stream(app: FastAPI) -> None:
                     if deferred_incoming
                     else await incoming.get()
                 )
-                if msg is _DISCONNECT:
+                if isinstance(msg, _Disconnect):
                     raise WebSocketDisconnect(code=1000)
-                if isinstance(msg, dict) and "_reader_error" in msg:
-                    raise RuntimeError(msg["_reader_error"])
-
-                mtype = msg.get("type") if isinstance(msg, dict) else None
-                if mtype == "generate":
-                    try:
-                        parsed = WSGenerateMessage(**msg)
-                    except Exception as e:
-                        await _send_json({
-                            "type": "error",
-                            "message": f"invalid generate message: {e}",
-                            "code": "ValidationError",
-                        })
-                        continue
+                if isinstance(msg, _ReaderFailure):
+                    raise RuntimeError(msg.message)
+                if isinstance(msg, WSGenerateMessage):
                     await _ws_handle_generate(
-                        session, parsed, app.state.default_steering, incoming,
+                        session, msg, app.state.default_steering, incoming,
                         deferred_incoming, _send_json,
                     )
-                elif mtype == "stop":
+                elif isinstance(msg, _Stop):
                     # Idle-state stop: nothing in flight.
                     continue
                 else:
                     await _send_json({
                         "type": "error",
-                        "message": f"unknown message type: {mtype!r}",
-                        "code": "UnknownMessageType",
+                        "message": msg.message,
+                        "code": "ValidationError",
                     })
         except WebSocketDisconnect:
             # Ensure any stray generation is signaled.
@@ -227,9 +268,9 @@ async def _ws_handle_generate(
     session: SaklasSession,
     msg: WSGenerateMessage,
     default_steering: "Steering | None",
-    incoming: asyncio.Queue[Any],
-    deferred_incoming: "deque[Any]",
-    send_json: Callable[[Any], Awaitable[None]],
+    incoming: asyncio.Queue[_Inbound],
+    deferred_incoming: "deque[_Inbound]",
+    send_json: Callable[[JSONObject], Awaitable[None]],
 ) -> None:
     """Run one generate turn and stream token/done/error events.
 
@@ -515,8 +556,7 @@ async def _ws_handle_generate(
                 base_sc = sampling if sampling is not None else SamplingConfig()
                 per_sibling_sampling = _dc_replace(base_sc, seed=seed_i)
 
-            token_queue: asyncio.Queue[Any] = asyncio.Queue()
-            _SENTINEL = object()
+            token_queue: asyncio.Queue[_TokenQueueItem] = asyncio.Queue()
             # The tree assigns the assistant node id at ``begin_assistant``
             # time inside ``_generate_core``; we don't know it before the
             # gen starts.  The on_token callback reads the live active
@@ -532,7 +572,7 @@ async def _ws_handle_generate(
                 top_alts: list[TokenAlt] | None,
                 perplexity: float | None = None,
                 _node_holder: list[str | None] = current_node_holder,
-                _token_queue: asyncio.Queue[Any] = token_queue,
+                _token_queue: asyncio.Queue[_TokenQueueItem] = token_queue,
             ) -> None:
                 event = build_token_event(
                     session,
@@ -543,17 +583,23 @@ async def _ws_handle_generate(
                     lp=lp,
                     top_alts=top_alts,
                 )
-                loop.call_soon_threadsafe(_token_queue.put_nowait, event)
-            _on_token_flags: Any = _on_token
-            _on_token_flags._saklas_wants_live_scores = True
-            _on_token_flags._saklas_wants_per_layer_scores = True
+                loop.call_soon_threadsafe(
+                    _token_queue.put_nowait, _TokenFrame(cast(JSONObject, event))
+                )
+            consumer = TokenConsumer(
+                _on_token,
+                TokenConsumerOptions(
+                    live_scores=True,
+                    per_layer_scores=True,
+                    lens_readout=True,
+                    sae_readout=True,
+                ),
+            )
             # Live J-lens workspace readout: computed only when the session's
             # live lens is enabled (POST .../lens/live) AND the tap consumer
-            # declares interest — this stamp is the declaration (mirrors
-            # ``generate_stream``'s ``_push_flags``), so an enabled lens
+            # declares interest through ``TokenConsumerOptions`` (the same
+            # typed capability object used by ``generate_stream``), so an enabled lens
             # streams per-step top-k on the ``token`` frame's ``lens_readout``.
-            _on_token_flags._saklas_wants_lens_readout = True
-            _on_token_flags._saklas_wants_sae_readout = True
 
             result_holder: list[GenerationResult] = []
             error_holder: list[BaseException] = []
@@ -568,12 +614,11 @@ async def _ws_handle_generate(
 
             def _worker(
                 _sampling: SamplingConfig | None = per_sibling_sampling,
-                _on_token: Callable[..., Any] = _on_token,
+                _on_token: TokenConsumer = consumer,
                 _result_holder: list[GenerationResult] = result_holder,
                 _error_holder: list[BaseException] = error_holder,
-                _token_queue: asyncio.Queue[Any] = token_queue,
-                _sentinel: object = _SENTINEL,
-                _recipe_override: Any = recipe_override,
+                _token_queue: asyncio.Queue[_TokenQueueItem] = token_queue,
+                _recipe_override: str | None = recipe_override,
             ) -> None:
                 try:
                     if msg.fork_node_id is not None:
@@ -620,7 +665,7 @@ async def _ws_handle_generate(
                 except BaseException as e:
                     _error_holder.append(e)
                 finally:
-                    loop.call_soon_threadsafe(_token_queue.put_nowait, _sentinel)
+                    loop.call_soon_threadsafe(_token_queue.put_nowait, _TokenDone())
 
             await send_json({
                 "type": "started",
@@ -653,48 +698,30 @@ async def _ws_handle_generate(
                     )
                     if client_get in finished:
                         incoming_msg = client_get.result()
-                        # ``_DISCONNECT`` / reader-error sentinels:
+                        # Disconnect / reader-error lifecycle messages:
                         # signal the worker to wind down; let the outer
                         # loop propagate the disconnect on the next
                         # iteration.
-                        if isinstance(incoming_msg, dict):
-                            if incoming_msg.get("type") == "stop":
-                                _stop_session_safely()
-                                stop_signaled = True
-                            elif "_reader_error" in incoming_msg:
-                                _stop_session_safely()
-                                stop_signaled = True
-                                # Defer so the outer dispatch loop
-                                # surfaces the error after we wind down.
-                                deferred_incoming.append(incoming_msg)
-                            else:
-                                # Out-of-band frame during a generation —
-                                # defer so the outer loop sees it
-                                # after this turn finishes.  Most likely
-                                # an early ``{type: "generate"}`` from a
-                                # client that didn't wait for ``done``.
-                                #
-                                # Do not put it back on ``incoming`` here:
-                                # the next loop iteration would consume it
-                                # immediately, cancel token_queue.get(), and
-                                # spin until the worker happened to have a
-                                # token already queued.
-                                deferred_incoming.append(incoming_msg)
-                        else:
-                            # Disconnect sentinel from the reader.
+                        if isinstance(incoming_msg, _Stop):
+                            _stop_session_safely()
+                            stop_signaled = True
+                        elif isinstance(incoming_msg, (_Disconnect, _ReaderFailure)):
                             _stop_session_safely()
                             stop_signaled = True
                             deferred_incoming.append(incoming_msg)
+                        else:
+                            # Out-of-band generate/invalid frame: defer until done.
+                            deferred_incoming.append(incoming_msg)
                     if token_get in finished:
                         item = token_get.result()
-                        if item is _SENTINEL:
+                        if isinstance(item, _TokenDone):
                             done = True
                         else:
-                            await send_json(item)
+                            await send_json(item.payload)
                     for task in pending:
                         task.cancel()
-                    if pending:
-                        await asyncio.gather(*pending, return_exceptions=True)
+                        with suppress(asyncio.CancelledError):
+                            await task
             finally:
                 # Drain any residual events the worker pushed between
                 # sentinel and join — should be none because the

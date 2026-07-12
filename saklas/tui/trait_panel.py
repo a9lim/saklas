@@ -10,7 +10,7 @@ from textual.containers import VerticalScroll
 from textual.widgets import Static
 
 from saklas.core.histogram import HIST_BUCKETS, bucketize
-from saklas.core.manifold import BoxDomain
+from saklas.core.manifold import BoxAxis, BoxDomain, Manifold
 from saklas.tui.selectable import SelectableListWidget
 from saklas.tui.utils import BAR_WIDTH, build_bar
 
@@ -52,7 +52,7 @@ class TraitPanel(SelectableListWidget):
         # from ``GenerationResult.probe_readings`` at finalize (the same
         # ``ProbeReading`` shape, pooled at the last-content token).  Either
         # may be empty; rendering degrades cleanly.
-        self._manifold_probes: dict[str, Any] = {}
+        self._manifold_probes: dict[str, Manifold] = {}
         self._manifold_readings: dict[str, "ProbeReading"] = {}
         self._manifold_aggregates: dict[str, "ProbeReading"] = {}
         self._cached_manifold_text: str = ""
@@ -252,7 +252,7 @@ class TraitPanel(SelectableListWidget):
 
     # ------------------------------------------------- manifold probes ---
 
-    def set_active_manifold_probes(self, probes: dict[str, Any]) -> None:
+    def set_active_manifold_probes(self, probes: dict[str, Manifold]) -> None:
         """Replace the attached-manifold-probe registry.
 
         ``probes`` maps probe name (the key the session registered) to the
@@ -435,7 +435,7 @@ class TraitPanel(SelectableListWidget):
 
     def _render_minimap(
         self,
-        manifold: Any,
+        manifold: Manifold,
         agg: "ProbeReading | None",
         live: "ProbeReading | None",
     ) -> str:
@@ -455,7 +455,7 @@ class TraitPanel(SelectableListWidget):
             return ""
         axes = domain.axes
         # Resolve per-axis (lo, hi).  Periodic axes use [0, period].
-        def _axis_bounds(ax: Any) -> tuple[float, float]:
+        def _axis_bounds(ax: BoxAxis) -> tuple[float, float]:
             if ax.periodic:
                 return 0.0, float(ax.period)
             return float(ax.lo), float(ax.hi)

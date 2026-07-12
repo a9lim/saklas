@@ -55,6 +55,13 @@ def _save_checkpoint(
         layer: matrix * partial.n_prompts
         for layer, matrix in partial.jacobians.items()
     }
+    kwargs.setdefault(
+        "consumed_prefix_sha256",
+        hashlib.sha256(json.dumps({
+            "corpus_sha256": kwargs.get("corpus_sha256"),
+            "n_prompts": partial.n_prompts,
+        }, sort_keys=True).encode()).hexdigest(),
+    )
     return save_lens_checkpoint_accumulator(
         sums, partial.n_prompts, partial.d_model, model_id,
         base=None, **kwargs,

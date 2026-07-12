@@ -68,9 +68,9 @@ def _make_app():
 
     app._session = session
     app._device_str = "cpu"
-    app._alphas = {}
-    app._enabled = {}
-    app._manifold_terms = {}
+    app._get_extraction_controller()._alphas = {}
+    app._get_extraction_controller()._enabled = {}
+    app._get_extraction_controller()._manifold_terms = {}
     app._supports_thinking = False
     app._is_base_model = False
     app._render_mode = "chat"
@@ -86,21 +86,21 @@ def _make_app():
     # ``_pulled_slot`` tracks an in-progress ↑-pull-and-edit; default
     # None means "no slot pulled."  Tests inspect ``_pending_queue``
     # directly or build :class:`PendingItem` instances for dispatch.
-    app._pending_queue = []
-    app._pulled_slot = None
+    app._get_input_history_controller()._pending_queue = []
+    app._get_input_history_controller()._pulled_slot = None
     app._ui_gen_active = False
     app._focused_panel_idx = 1
     app._highlighting = False
     app._highlight_probe = None
     app._default_seed = None
-    app._loom_prune_expr = None
-    app._loom_auto_regen_mode = "unsteered"
-    app._loom_auto_regen_on = False
+    app._get_loom_controller()._loom_prune_expr = None
+    app._get_loom_controller()._loom_auto_regen_mode = "unsteered"
+    app._get_loom_controller()._loom_auto_regen_on = False
     import queue as _queue
     app._ui_token_queue = _queue.SimpleQueue()
-    app._input_history = []
-    app._history_index = None
-    app._history_stash = ""
+    app._get_input_history_controller()._input_history = []
+    app._get_input_history_controller()._history_index = None
+    app._get_input_history_controller()._history_stash = ""
     app._gen_start_time = 0.0
     app._gen_token_count = 0
     app._last_tok_per_sec = 0.0
@@ -697,8 +697,8 @@ def test_fire_auto_regen_streams_into_shadow_column():
     uid, aid = _seed_tree(app._session.tree)
 
     # Auto-regen state: on, with a non-unsteered mode.
-    app._loom_auto_regen_on = True
-    app._loom_auto_regen_mode = "inverted"
+    app._get_loom_controller()._loom_auto_regen_on = True
+    app._get_loom_controller()._loom_auto_regen_mode = "inverted"
 
     # Stub the chat panel's shadow widget mount.  We only need an
     # object with the highlight method; the worker pushes events into
@@ -843,7 +843,7 @@ def test_prune_parses_and_stashes_expression():
     aid = tree.begin_assistant(uid)
     tree.finalize_assistant(aid, text="x", aggregate_readings={"angry.calm": 0.5})
     app._handle_command("/prune agg:angry.calm > 0.4")
-    assert app._loom_prune_expr == "agg:angry.calm > 0.4"
+    assert app._get_loom_controller()._loom_prune_expr == "agg:angry.calm > 0.4"
     assert any("/prune active" in m for m in app._chat_panel.messages)
     # Empty arg clears.
     app._handle_command("/prune")
@@ -868,7 +868,7 @@ def test_auto_regen_no_args_reports_state():
 def test_auto_regen_sets_mode():
     app = _make_app()
     app._handle_command("/auto-regen inverted")
-    assert app._loom_auto_regen_mode == "inverted"
+    assert app._get_loom_controller()._loom_auto_regen_mode == "inverted"
 
 
 def test_auto_regen_on_off():
@@ -884,7 +884,7 @@ def test_auto_regen_unknown_mode_rejects():
     app._handle_command("/auto-regen bogus")
     assert any("unknown mode" in m for m in app._chat_panel.messages)
     # Mode unchanged from default.
-    assert app._loom_auto_regen_mode == "unsteered"
+    assert app._get_loom_controller()._loom_auto_regen_mode == "unsteered"
 
 
 def test_auto_regen_custom_parses_into_recipe():
@@ -907,11 +907,11 @@ def test_auto_regen_custom_parses_into_recipe():
 def test_auto_regen_custom_parse_error_keeps_mode_unchanged():
     """A bad ``custom:`` expression posts to chat and leaves mode alone."""
     app = _make_app()
-    app._loom_auto_regen_mode = "inverted"
+    app._get_loom_controller()._loom_auto_regen_mode = "inverted"
     app._handle_command("/auto-regen custom: ::: gibberish :::")
     assert any("custom parse error" in m or "expression"  in m
                for m in app._chat_panel.messages)
-    assert app._loom_auto_regen_mode == "inverted"
+    assert app._get_loom_controller()._loom_auto_regen_mode == "inverted"
 
 
 def test_auto_regen_custom_empty_expression():
@@ -919,7 +919,7 @@ def test_auto_regen_custom_empty_expression():
     app = _make_app()
     app._handle_command("/auto-regen custom:")
     assert any("needs an expression" in m for m in app._chat_panel.messages)
-    assert app._loom_auto_regen_mode == "unsteered"
+    assert app._get_loom_controller()._loom_auto_regen_mode == "unsteered"
 
 
 def test_fan_parses_alpha_grid_and_kicks_worker():
@@ -1151,7 +1151,7 @@ def test_user_submitted_on_user_node_defers_prefill_target_in_pending():
     app._session.stop = MagicMock()
     app._start_prefill = MagicMock()
     app.on_chat_panel_user_submitted(SimpleNamespace(text="seed it"))  # pyright: ignore[reportArgumentType]  # SimpleNamespace used as UserSubmitted test double
-    assert app._pending_queue == [
+    assert app._get_input_history_controller()._pending_queue == [
         PendingSubmit("seed it", uid),
     ]
     app._start_prefill.assert_not_called()
@@ -1226,7 +1226,7 @@ def test_commit_action_empty_input_is_noop():
     app._start_commit_user.assert_not_called()
     app._start_commit_assistant.assert_not_called()
     assert inp.text == "   "
-    assert app._input_history == []
+    assert app._get_input_history_controller()._input_history == []
 
 
 def test_commit_action_during_gen_queues_commit_user():
@@ -1244,7 +1244,7 @@ def test_commit_action_during_gen_queues_commit_user():
     app._session.stop = MagicMock()
     app._start_commit_user = MagicMock()
     app.action_commit_text()
-    assert app._pending_queue == [PendingCommitUser("next bit")]
+    assert app._get_input_history_controller()._pending_queue == [PendingCommitUser("next bit")]
     app._start_commit_user.assert_not_called()
     app._session.stop.assert_not_called()
 
@@ -1263,7 +1263,7 @@ def test_commit_action_during_gen_queues_commit_assistant_with_target():
     app._session.stop = MagicMock()
     app._start_commit_assistant = MagicMock()
     app.action_commit_text()
-    assert app._pending_queue == [
+    assert app._get_input_history_controller()._pending_queue == [
         PendingCommitAssistant("the canned reply", uid),
     ]
     app._start_commit_assistant.assert_not_called()

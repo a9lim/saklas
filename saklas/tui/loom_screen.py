@@ -927,7 +927,7 @@ class LoomScreen(Screen[None]):
 
         if kind == "prune":
             expr = value.strip()
-            self._app._loom_prune_expr = expr or None
+            self._app._get_loom_controller().set_prune_expr(expr or None)
             chat.add_system_message(
                 f"prune filter: {expr}" if expr else "prune filter cleared."
             )

@@ -462,8 +462,8 @@ def test_generate_stream_live_readouts_false_suppresses_readout_flags() -> None:
 
     def _fake_generate_core(*_args: Any, **kwargs: Any) -> GenerationResult:
         on_token = kwargs["on_token"]
-        flags["lens"] = bool(getattr(on_token, "_saklas_wants_lens_readout"))
-        flags["sae"] = bool(getattr(on_token, "_saklas_wants_sae_readout"))
+        flags["lens"] = on_token.options.lens_readout
+        flags["sae"] = on_token.options.sae_readout
         session._last_token_probe_payload = {
                 "probe_readings": {"sae/0": reading},
             "lens": {1: [("tok", 0.5)]},

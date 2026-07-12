@@ -13,6 +13,7 @@ import torch
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 from saklas.core.results import TokenAlt
+from saklas.core.token_callback import TokenCallback
 from saklas.core.scene import (
     SceneRenderError,
     SceneTurn,
@@ -850,7 +851,7 @@ def generate_steered(
     input_ids: torch.Tensor,
     config: GenerationConfig,
     state: GenerationState,
-    on_token: Callable[..., None] | None = None,
+    on_token: TokenCallback | None = None,
     thinking: bool = False,
     seed: int | None = None,
     stop: list[str] | None = None,

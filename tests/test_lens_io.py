@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+
 import json
 import threading
 from pathlib import Path
@@ -31,6 +33,10 @@ from saklas.io.lens import (
 from saklas.io.paths import safe_model_id
 
 _MODEL = "test-org/tiny-model"
+
+
+def _digest(value: str) -> str:
+    return hashlib.sha256(value.encode()).hexdigest()
 _D = 8
 
 
@@ -51,7 +57,7 @@ def _lens(n_layers: int = 3, n_prompts: int = 7) -> JacobianLens:
 def _save(lens: JacobianLens) -> None:
     save_lens(
         lens, _MODEL,
-        corpus_spec="test-corpus", corpus_sha256="abc123",
+        corpus_spec="test-corpus", corpus_sha256=_digest("abc123"),
         seq_len=128, dim_batch=8, skip_first=16,
     )
 
@@ -71,6 +77,7 @@ def _save_checkpoint(
         layer: matrix * partial.n_prompts
         for layer, matrix in partial.jacobians.items()
     }
+    kwargs.setdefault("consumed_prefix_sha256", _digest("consumed-prefix"))
     return save_lens_checkpoint_accumulator(
         sums, partial.n_prompts, partial.d_model, model_id,
         base=base, **kwargs,
@@ -99,7 +106,7 @@ def test_save_load_round_trip() -> None:
         assert torch.allclose(got.jacobians[layer], lens.jacobians[layer], atol=2e-3)
     assert sidecar["format_version"] == LENS_FORMAT_VERSION
     assert sidecar["corpus_spec"] == "test-corpus"
-    assert sidecar["corpus_sha256"] == "abc123"
+    assert sidecar["corpus_sha256"] == _digest("abc123")
     assert sidecar["corpus_hash_kind"] == "text_v1"
     assert sidecar["skip_first_positions"] == 16
     assert set(sidecar["tensor_files"]) == {"0", "1", "2"}
@@ -128,7 +135,7 @@ def test_missing_layer_topup_reuses_immutable_existing_shards() -> None:
 
     save_lens(
         merged, _MODEL,
-        corpus_spec="test-corpus", corpus_sha256="abc123",
+        corpus_spec="test-corpus", corpus_sha256=_digest("abc123"),
         seq_len=128, dim_batch=8, skip_first=16,
         reuse_layers={0, 1},
     )
@@ -169,7 +176,7 @@ def test_unverified_shard_reuse_falls_back_to_payload_hashes(
     monkeypatch.setattr(packs, "hash_file", _count_hash)
     save_lens(
         merged, _MODEL,
-        corpus_spec="test-corpus", corpus_sha256="abc123",
+        corpus_spec="test-corpus", corpus_sha256=_digest("abc123"),
         seq_len=128, dim_batch=8, skip_first=16,
         reuse_layers={0, 1},
     )
@@ -189,7 +196,7 @@ def test_shard_reuse_is_refused_when_fit_identity_changes() -> None:
 
     save_lens(
         lens, _MODEL,
-        corpus_spec="other-corpus", corpus_sha256="different",
+        corpus_spec="other-corpus", corpus_sha256=_digest("different"),
         seq_len=128, dim_batch=8, skip_first=16,
         reuse_layers={0, 1},
     )
@@ -229,7 +236,7 @@ def test_corrupt_reusable_shard_is_rewritten_while_valid_shard_is_kept() -> None
 
     save_lens(
         merged, _MODEL,
-        corpus_spec="test-corpus", corpus_sha256="abc123",
+        corpus_spec="test-corpus", corpus_sha256=_digest("abc123"),
         seq_len=128, dim_batch=8, skip_first=16,
         reuse_layers={0, 1},
     )
@@ -247,11 +254,12 @@ def test_save_load_checkpoint_round_trip() -> None:
         partial, _MODEL,
         base_n_prompts=7,
         corpus_spec="test-corpus",
-        corpus_sha256="abc123",
+        corpus_sha256=_digest("abc123"),
         seq_len=128,
         dim_batch=8,
         skip_first=16,
-        raw_corpus_sha256="raw456",
+        consumed_prefix_sha256=_digest("consumed-prefix"),
+        raw_corpus_sha256=_digest("raw456"),
         raw_prompt_count=13,
         usable_prompt_count=12,
     )
@@ -264,7 +272,7 @@ def test_save_load_checkpoint_round_trip() -> None:
     assert sidecar["checkpoint"] is True
     assert sidecar["base_n_prompts"] == 0
     assert sidecar["partial_n_prompts"] == 12
-    assert sidecar["raw_corpus_sha256"] == "raw456"
+    assert sidecar["raw_corpus_sha256"] == _digest("raw456")
     assert sidecar["raw_prompt_count"] == 13
     assert sidecar["usable_prompt_count"] == 12
 
@@ -278,11 +286,12 @@ def test_checkpoint_accumulator_is_self_contained_and_merges_prefix() -> None:
         sums, tail.n_prompts, _D, _MODEL,
         base=base,
         corpus_spec="test-corpus",
-        corpus_sha256="abc123",
+        corpus_sha256=_digest("abc123"),
         seq_len=128,
         dim_batch=8,
         skip_first=16,
         model_layer_count=3,
+        consumed_prefix_sha256=_digest("consumed-prefix"),
     )
 
     loaded = load_lens_checkpoint(_MODEL)
@@ -340,14 +349,14 @@ def test_checkpoint_promotion_sidecar_failure_preserves_both_artifacts(
 
     final = _lens(n_layers=2, n_prompts=3)
     save_lens(
-        final, _MODEL, corpus_spec="old", corpus_sha256="old-sha",
+        final, _MODEL, corpus_spec="old", corpus_sha256=_digest("old-sha"),
         seq_len=128, dim_batch=8, skip_first=16,
         model_fingerprint="weights",
     )
     checkpoint = _lens(n_layers=2, n_prompts=5)
     _save_checkpoint(
         checkpoint, _MODEL, base_n_prompts=0,
-        corpus_spec="new", corpus_sha256="new-sha",
+        corpus_spec="new", corpus_sha256=_digest("new-sha"),
         corpus_hash_kind="token_ids_v1", seq_len=128, dim_batch=8,
         skip_first=16, model_fingerprint="weights",
     )
@@ -363,7 +372,7 @@ def test_checkpoint_promotion_sidecar_failure_preserves_both_artifacts(
     with pytest.raises(OSError, match="pointer failure"):
         promote_lens_checkpoint(
             _MODEL, n_prompts=5, source_layers=[0, 1],
-            corpus_sha256="new-sha", corpus_hash_kind="token_ids_v1",
+            corpus_sha256=_digest("new-sha"), corpus_hash_kind="token_ids_v1",
             seq_len=128, d_model=_D, model_fingerprint="weights",
         )
 
@@ -376,13 +385,13 @@ def test_checkpoint_promotion_sidecar_failure_preserves_both_artifacts(
 def test_checkpoint_promotion_rejects_corrupt_shard_and_keeps_pointers() -> None:
     save_lens(
         _lens(n_layers=2, n_prompts=3), _MODEL,
-        corpus_spec="old", corpus_sha256="old-sha",
+        corpus_spec="old", corpus_sha256=_digest("old-sha"),
         seq_len=128, dim_batch=8, skip_first=16,
         model_fingerprint="weights",
     )
     _save_checkpoint(
         _lens(n_layers=2, n_prompts=5), _MODEL, base_n_prompts=0,
-        corpus_spec="new", corpus_sha256="new-sha",
+        corpus_spec="new", corpus_sha256=_digest("new-sha"),
         corpus_hash_kind="token_ids_v1", seq_len=128, dim_batch=8,
         skip_first=16, model_fingerprint="weights",
     )
@@ -393,7 +402,7 @@ def test_checkpoint_promotion_rejects_corrupt_shard_and_keeps_pointers() -> None
 
     assert not promote_lens_checkpoint(
         _MODEL, n_prompts=5, source_layers=[0, 1],
-        corpus_sha256="new-sha", corpus_hash_kind="token_ids_v1",
+        corpus_sha256=_digest("new-sha"), corpus_hash_kind="token_ids_v1",
         seq_len=128, d_model=_D, model_fingerprint="weights",
     )
     final = load_lens(_MODEL)
@@ -404,7 +413,7 @@ def test_checkpoint_promotion_rejects_corrupt_shard_and_keeps_pointers() -> None
 def test_subsumed_checkpoint_recovery_handles_base_progress_and_subset_layers() -> None:
     final = _lens(n_layers=3, n_prompts=7)
     save_lens(
-        final, _MODEL, corpus_spec="same", corpus_sha256="same-sha",
+        final, _MODEL, corpus_spec="same", corpus_sha256=_digest("same-sha"),
         corpus_hash_kind="token_ids_v1", seq_len=128, dim_batch=8,
         skip_first=16, model_fingerprint="weights",
     )
@@ -415,7 +424,7 @@ def test_subsumed_checkpoint_recovery_handles_base_progress_and_subset_layers() 
     )
     _save_checkpoint(
         checkpoint, _MODEL, base_n_prompts=3,
-        corpus_spec="same", corpus_sha256="same-sha",
+        corpus_spec="same", corpus_sha256=_digest("same-sha"),
         corpus_hash_kind="token_ids_v1", seq_len=128, dim_batch=8,
         skip_first=16, model_fingerprint="weights",
     )
@@ -429,13 +438,13 @@ def test_subsumed_checkpoint_recovery_handles_base_progress_and_subset_layers() 
 def test_subsumed_checkpoint_recovery_preserves_farther_progress() -> None:
     save_lens(
         _lens(n_layers=2, n_prompts=3), _MODEL,
-        corpus_spec="same", corpus_sha256="same-sha",
+        corpus_spec="same", corpus_sha256=_digest("same-sha"),
         corpus_hash_kind="token_ids_v1", seq_len=128, dim_batch=8,
         skip_first=16, model_fingerprint="weights",
     )
     _save_checkpoint(
         _lens(n_layers=2, n_prompts=2), _MODEL, base_n_prompts=3,
-        corpus_spec="same", corpus_sha256="same-sha",
+        corpus_spec="same", corpus_sha256=_digest("same-sha"),
         corpus_hash_kind="token_ids_v1", seq_len=128, dim_batch=8,
         skip_first=16, model_fingerprint="weights",
     )
@@ -447,13 +456,13 @@ def test_subsumed_checkpoint_recovery_preserves_farther_progress() -> None:
 def test_subsumed_checkpoint_recovery_preserves_other_corpus() -> None:
     save_lens(
         _lens(n_layers=2, n_prompts=7), _MODEL,
-        corpus_spec="final", corpus_sha256="final-sha",
+        corpus_spec="final", corpus_sha256=_digest("final-sha"),
         corpus_hash_kind="token_ids_v1", seq_len=128, dim_batch=8,
         skip_first=16, model_fingerprint="weights",
     )
     _save_checkpoint(
         _lens(n_layers=1, n_prompts=2), _MODEL, base_n_prompts=0,
-        corpus_spec="checkpoint", corpus_sha256="other-sha",
+        corpus_spec="checkpoint", corpus_sha256=_digest("other-sha"),
         corpus_hash_kind="token_ids_v1", seq_len=128, dim_batch=8,
         skip_first=16, model_fingerprint="weights",
     )
@@ -465,13 +474,13 @@ def test_subsumed_checkpoint_recovery_preserves_other_corpus() -> None:
 def test_subsumed_checkpoint_recovery_preserves_recovery_point_if_final_corrupt() -> None:
     save_lens(
         _lens(n_layers=2, n_prompts=7), _MODEL,
-        corpus_spec="same", corpus_sha256="same-sha",
+        corpus_spec="same", corpus_sha256=_digest("same-sha"),
         corpus_hash_kind="token_ids_v1", seq_len=128, dim_batch=8,
         skip_first=16, model_fingerprint="weights",
     )
     _save_checkpoint(
         _lens(n_layers=1, n_prompts=2), _MODEL, base_n_prompts=0,
-        corpus_spec="same", corpus_sha256="same-sha",
+        corpus_spec="same", corpus_sha256=_digest("same-sha"),
         corpus_hash_kind="token_ids_v1", seq_len=128, dim_batch=8,
         skip_first=16, model_fingerprint="weights",
     )
@@ -574,7 +583,7 @@ def test_remove_lens() -> None:
         _lens(n_layers=1), _MODEL,
         base_n_prompts=0,
         corpus_spec="test-corpus",
-        corpus_sha256="abc123",
+        corpus_sha256=_digest("abc123"),
         seq_len=128,
         dim_batch=8,
         skip_first=16,
@@ -604,7 +613,7 @@ def test_checkpoint_pointer_unlink_is_durable_before_shard_gc(
 
     _save_checkpoint(
         _lens(n_layers=1), _MODEL, base_n_prompts=0,
-        corpus_spec="test-corpus", corpus_sha256="abc123",
+        corpus_spec="test-corpus", corpus_sha256=_digest("abc123"),
         seq_len=128, dim_batch=8, skip_first=16,
     )
     events: list[str] = []
@@ -635,13 +644,13 @@ def test_subsumed_checkpoint_unlink_is_durable_before_shard_gc(
 
     save_lens(
         _lens(n_layers=2, n_prompts=7), _MODEL,
-        corpus_spec="same", corpus_sha256="same-sha",
+        corpus_spec="same", corpus_sha256=_digest("same-sha"),
         corpus_hash_kind="token_ids_v1", seq_len=128, dim_batch=8,
         skip_first=16, model_fingerprint="weights",
     )
     _save_checkpoint(
         _lens(n_layers=1, n_prompts=2), _MODEL, base_n_prompts=0,
-        corpus_spec="same", corpus_sha256="same-sha",
+        corpus_spec="same", corpus_sha256=_digest("same-sha"),
         corpus_hash_kind="token_ids_v1", seq_len=128, dim_batch=8,
         skip_first=16, model_fingerprint="weights",
     )
@@ -676,7 +685,7 @@ def test_full_lens_pointer_unlinks_are_durable_before_shard_removal(
     _save(_lens())
     _save_checkpoint(
         _lens(n_layers=1), _MODEL, base_n_prompts=0,
-        corpus_spec="test-corpus", corpus_sha256="abc123",
+        corpus_spec="test-corpus", corpus_sha256=_digest("abc123"),
         seq_len=128, dim_batch=8, skip_first=16,
     )
     events: list[str] = []
@@ -752,7 +761,7 @@ def test_checkpoint_payload_is_durable_before_pointer_publication(
     monkeypatch.setattr(lens_io, "write_json_atomic", record_pointer)
     _save_checkpoint(
         _lens(n_layers=2, n_prompts=2), _MODEL, base_n_prompts=0,
-        corpus_spec="test-corpus", corpus_sha256="abc123", seq_len=128,
+        corpus_spec="test-corpus", corpus_sha256=_digest("abc123"), seq_len=128,
         dim_batch=8, skip_first=16,
     )
     assert events == ["payload", "payload", "pointer"]
@@ -816,7 +825,7 @@ def test_checkpoint_promotion_directory_barrier_precedes_pointer(
     checkpoint = _lens(n_layers=2, n_prompts=5)
     _save_checkpoint(
         checkpoint, _MODEL, base_n_prompts=0,
-        corpus_spec="new", corpus_sha256="new-sha",
+        corpus_spec="new", corpus_sha256=_digest("new-sha"),
         corpus_hash_kind="token_ids_v1", seq_len=128, dim_batch=8,
         skip_first=16, model_fingerprint="weights",
     )
@@ -862,7 +871,7 @@ def test_checkpoint_promotion_directory_barrier_precedes_pointer(
 
     assert promote_lens_checkpoint(
         _MODEL, n_prompts=5, source_layers=[0, 1],
-        corpus_sha256="new-sha", corpus_hash_kind="token_ids_v1",
+        corpus_sha256=_digest("new-sha"), corpus_hash_kind="token_ids_v1",
         seq_len=128, d_model=_D, model_fingerprint="weights",
     )
     pointer_index = events.index("pointer")
@@ -888,4 +897,26 @@ def test_remove_unpublishes_before_best_effort_tensor_gc(
 
     assert remove_lens(_MODEL)
     assert load_lens(_MODEL) is None
+    assert load_lens_checkpoint(_MODEL) is None
+
+
+def test_lens_rejects_noncanonical_identity_digest() -> None:
+    _save(_lens())
+    _anchor, sidecar_path = lens_paths(_MODEL)
+    sidecar = json.loads(sidecar_path.read_text())
+    sidecar["corpus_sha256"] = "not-a-digest"
+    sidecar_path.write_text(json.dumps(sidecar))
+    assert load_lens(_MODEL) is None
+
+
+def test_checkpoint_progress_requires_consumed_prefix_identity() -> None:
+    _save_checkpoint(
+        _lens(n_layers=2, n_prompts=2), _MODEL, base_n_prompts=0,
+        corpus_spec="test", corpus_sha256=_digest("test"),
+        seq_len=8, dim_batch=2, skip_first=0,
+    )
+    _anchor, sidecar_path = lens_checkpoint_paths(_MODEL)
+    sidecar = json.loads(sidecar_path.read_text())
+    sidecar["consumed_prefix_sha256"] = None
+    sidecar_path.write_text(json.dumps(sidecar))
     assert load_lens_checkpoint(_MODEL) is None

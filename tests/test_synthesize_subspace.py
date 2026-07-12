@@ -382,3 +382,14 @@ def test_synth_rejects_nonorthonormal_basis() -> None:
     )
     with pytest.raises(ValueError, match="orthonormal"):
         _synth_from_subspace(sub)
+
+
+@pytest.mark.parametrize("share", [0.0, -1.0, float("inf"), True, "1.0"])
+def test_synth_rejects_invalid_share_scalar(share: object) -> None:
+    sub = LayerSubspace.affine(torch.zeros(4), torch.eye(2, 4))
+    with pytest.raises(ValueError, match="finite and positive"):
+        SynthesizedSubspace(
+            layers={0: sub}, target_coord={0: torch.zeros(2)},
+            share={0: share},  # type: ignore[dict-item]
+            kappa={0: torch.zeros(2)},
+        )

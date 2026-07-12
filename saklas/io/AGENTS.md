@@ -51,7 +51,10 @@ What remains: `NAME_REGEX = ^[a-z][a-z0-9._-]{0,63}$` (manifolds reuse it),
 `hash_file` / `verify_integrity` (the sha256 integrity
 helpers behind the neutral/layer-means/alignment caches and the manifold integrity
 manifest), and `PROFILE_FORMAT_VERSION = 5`, stamped onto the exact profile
-sidecars `profile.save_profile` writes.
+sidecars `profile.save_profile` writes. Standalone safetensor profiles use a
+stable pair lock and bind the exact tensor bytes through `tensor_sha256`; one
+shared validator gates writer and reader, with a closed method set and exact
+component, SAE-layer, and diagnostic-layer schemas covering the tensor roster.
 
 ## manifolds.py
 
@@ -498,6 +501,10 @@ final/checkpoint preflight rejects incompatible corpora/layers before matrix IO.
 `load_lens_checkpoint_sidecar` / `load_lens_checkpoint` /
 `promote_lens_checkpoint` / `remove_subsumed_lens_checkpoint` / `remove_lens`;
 the fit itself lives in `core/jlens.py`.
+
+All lens `*_sha256` identities are canonical lowercase 64-hex digests. A
+positive-progress checkpoint must carry the digest of its consumed token prefix;
+zero progress must not claim one.
 
 ## atomic.py / staging.py
 

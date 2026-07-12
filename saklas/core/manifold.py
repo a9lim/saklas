@@ -1993,6 +1993,16 @@ class Manifold:
                 f"manifold {self.name!r} Mahalanobis shares must cover exactly "
                 "its fitted layers"
             )
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value <= 0.0
+            for value in self.mahalanobis_share.values()
+        ):
+            raise ValueError(
+                f"manifold {self.name!r} Mahalanobis shares must be finite and positive"
+            )
         curved = {idx: sub for idx, sub in self.layers.items() if not sub.is_affine}
         if curved and len(curved) != len(self.layers):
             raise ValueError(
@@ -2371,8 +2381,15 @@ class SynthesizedSubspace:
             ])
             if not bool(torch.isfinite(values).all()):
                 raise ValueError("SynthesizedSubspace tensors must be finite")
-            if not math.isfinite(float(self.share[layer])):
-                raise ValueError("SynthesizedSubspace shares must be finite")
+            if (
+                isinstance(self.share[layer], bool)
+                or not isinstance(self.share[layer], (int, float))
+                or not math.isfinite(self.share[layer])
+                or self.share[layer] <= 0.0
+            ):
+                raise ValueError(
+                    "SynthesizedSubspace shares must be finite and positive"
+                )
 
 
 def synthesize_subspace(
@@ -5781,9 +5798,11 @@ def transfer_manifold_subspaces(
     new_share: dict[int, float] = {}
     for layer, sub_tgt in new_layers.items():
         sub_f = sub_tgt.to(device=torch.device("cpu"), dtype=torch.float32)
-        # ``coords`` are the reduced node values in subspace-coordinate space —
-        # invariant under the model-space alignment, so identical to the source
-        # fit.  ``subspace_share`` computes the μ-centered whitened spread
+        # ``coords`` are the reduced node values in subspace-coordinate space.
+        # For a K=1 affine folded ray there is no node cloud to μ-center: its
+        # share is the target-metric norm of the actual neutral→pole world
+        # direction. For K>=2 affine and every curved fit, ``subspace_share``
+        # computes the μ-centered whitened spread
         # ``sqrt(Σ_k c_kᵀ M_R c_k)`` (``M_R = B_tgt Σ_tgt⁻¹ B_tgtᵀ`` via
         # ``subspace_gram``, the *target* Σ⁻¹ restricted to the transferred
         # basis) — the same formula the fit pipeline bakes, now in target space.
@@ -5797,6 +5816,12 @@ def transfer_manifold_subspaces(
                     "transfer_manifold_subspaces: affine LayerSubspace has"
                     " node_coords=None — the saved manifold sidecar may be corrupt"
                 )
+            if coords.shape[0] == 1:
+                world_direction = coords[0] @ sub_f.basis
+                new_share[layer] = float(
+                    whitener.mahalanobis_norm(layer, world_direction)
+                )
+                continue
         else:
             _np, _rw, _pc = sub_f.rbf_params()
             coords = eval_rbf(_np, _rw, _pc, _np)  # (K, R)

@@ -44,6 +44,12 @@ class LoomController:
 
     _AUTO_REGEN_MODES = ("unsteered", "inverted", "reseed", "cool", "hot")
 
+    def set_prune_expr(self, expression: str | None) -> None:
+        self._loom_prune_expr = expression
+
+    def set_auto_regen_enabled(self, enabled: bool) -> None:
+        self._loom_auto_regen_on = enabled
+
     def __init__(self, app: "SaklasApp") -> None:
         self._app = app
         # Phase-4 loom: stashed prune expression + auto-regen mode.  Phase 5

@@ -468,7 +468,7 @@ when captured, `scores`/`per_layer_scores` when probes are loaded, `probe_readin
 inline off `session._capture._per_layer`, and `lens_readout`
 `Record<layerStr, [token, score][]>` + `lens_aggregate`
 `[token, strength, com, spread][]` while the live lens is on — the WS
-`_on_token` stamps `_saklas_wants_lens_readout` so the engine computes the
+The stream wraps `_on_token` in a typed `TokenConsumer` whose options request lens readout so the engine computes the
 step readout, and `build_token_event` copies the token tap's `lens` /
 `lens_aggregate` slots onto
 the frame; likewise `sae_readout`

@@ -400,10 +400,23 @@ def _load_sidecar_at(
             "model_source_fingerprint", "consumed_prefix_sha256",
         )
         if any(
-            sidecar[key] is not None and not isinstance(sidecar[key], str)
+            sidecar[key] is not None and (
+                not isinstance(sidecar[key], str) or not sidecar[key]
+            )
             for key in nullable_strings
         ):
             raise ValueError("lens sidecar has invalid nullable string metadata")
+        digest_fields = (
+            "corpus_sha256", "raw_corpus_sha256", "consumed_prefix_sha256",
+        )
+        if any(
+            sidecar[key] is not None and (
+                len(sidecar[key]) != 64
+                or any(char not in "0123456789abcdef" for char in sidecar[key])
+            )
+            for key in digest_fields
+        ):
+            raise ValueError("lens sidecar has invalid identity digest")
         nullable_ints = (
             "raw_prompt_count", "usable_prompt_count", "model_layer_count",
             "base_n_prompts", "partial_n_prompts",
@@ -418,6 +431,16 @@ def _load_sidecar_at(
         if sidecar["checkpoint"]:
             if sidecar["base_n_prompts"] is None or sidecar["partial_n_prompts"] is None:
                 raise ValueError("lens checkpoint is missing progress metadata")
+            if (
+                sidecar["partial_n_prompts"] > 0
+                and sidecar["consumed_prefix_sha256"] is None
+            ):
+                raise ValueError("lens checkpoint is missing consumed-prefix identity")
+            if (
+                sidecar["partial_n_prompts"] == 0
+                and sidecar["consumed_prefix_sha256"] is not None
+            ):
+                raise ValueError("zero-progress lens checkpoint carries prefix identity")
         elif any(
             sidecar[key] is not None
             for key in ("base_n_prompts", "partial_n_prompts", "consumed_prefix_sha256")

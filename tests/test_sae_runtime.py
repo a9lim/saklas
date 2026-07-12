@@ -443,3 +443,29 @@ def test_fetch_sae_feature_meta_batch_caches_and_updates_probes(
 
     on_disk = load_sae_feature_meta("org/model", "mock-release")
     assert on_disk["1"]["max_act"] == 4.0
+
+
+@pytest.mark.parametrize("max_act", [float("nan"), float("inf")])
+def test_sae_feature_meta_rejects_nonfinite_scale(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, max_act: float,
+) -> None:
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    from saklas.io.sae import save_sae_feature_meta
+
+    with pytest.raises(ValueError, match="invalid SAE feature metadata"):
+        save_sae_feature_meta("org/model", "release", {
+            "1": {"label": "feature", "max_act": max_act},
+        })
+
+
+@pytest.mark.parametrize("feature_id", ["", "01", "-1", "feature"])
+def test_sae_feature_meta_rejects_noncanonical_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, feature_id: str,
+) -> None:
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    from saklas.io.sae import save_sae_feature_meta
+
+    with pytest.raises(ValueError, match="feature id"):
+        save_sae_feature_meta("org/model", "release", {
+            feature_id: {"label": "feature", "max_act": 1.0},
+        })

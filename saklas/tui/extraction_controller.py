@@ -19,11 +19,15 @@ and those App helpers through ``self._app``.
 from __future__ import annotations
 
 import shlex
+from types import MappingProxyType
+from collections.abc import Mapping
 from typing import Any, Callable, TYPE_CHECKING
 
 from saklas.io.selectors import AmbiguousSelectorError, canonicalize_atom
 from saklas.core.errors import SaklasError
 from saklas.core.profile import ProfileError
+from saklas.core.steering import AlphaEntry
+from saklas.core.steering_expr import ManifoldTerm
 from saklas.tui.chat_panel import (
     PendingExtract,
     PendingManifoldFit,
@@ -60,9 +64,38 @@ class ExtractionController:
         # generation time (``AlphaEntry`` already admits ``ManifoldTerm``,
         # so the engine needs no change).  ``_enabled`` is shared — a
         # manifold key toggles through the same left-panel control.
-        self._manifold_terms: dict[str, Any] = {}
+        self._manifold_terms: dict[str, ManifoldTerm] = {}
 
-    def _active_alphas(self) -> dict[str, Any]:
+    @property
+    def alphas(self) -> Mapping[str, float]:
+        return MappingProxyType(self._alphas)
+
+    @property
+    def enabled(self) -> Mapping[str, bool]:
+        return MappingProxyType(self._enabled)
+
+    @property
+    def manifold_terms(self) -> Mapping[str, ManifoldTerm]:
+        return MappingProxyType(self._manifold_terms)
+
+    def register_manifold_term(self, key: str, term: ManifoldTerm) -> None:
+        self._manifold_terms[key] = term
+        self._enabled[key] = True
+
+    def remove_steering_entry(self, name: str) -> None:
+        self._manifold_terms.pop(name, None)
+        self._alphas.pop(name, None)
+        self._enabled.pop(name, None)
+
+    def toggle_steering_entry(self, name: str) -> None:
+        self._enabled[name] = not self._enabled.get(name, True)
+
+    def adjust_vector_alpha(self, name: str, delta: float) -> None:
+        self._alphas[name] = max(
+            -MAX_ALPHA, min(MAX_ALPHA, self._alphas.get(name, 0.0) + delta)
+        )
+
+    def _active_alphas(self) -> dict[str, AlphaEntry]:
         """Build the alphas dict for generation from enabled entries.
 
         Merges plain scalar vectors (``_alphas``) with manifold terms
@@ -72,7 +105,7 @@ class ExtractionController:
         :class:`~saklas.core.steering_expr.ManifoldTerm` for manifolds —
         ``Steering.alphas``'s ``AlphaEntry`` union admits both.
         """
-        out: dict[str, Any] = {
+        out: dict[str, AlphaEntry] = {
             name: alpha for name, alpha in self._alphas.items()
             if self._enabled.get(name, True)
         }

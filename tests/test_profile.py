@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+import json
 
 import pytest
 import torch
@@ -355,13 +356,48 @@ def test_save_metadata_override_merges_on_top_of_self_metadata(tmp_path: Path):
     """
     p = Profile(
         _mk(layers=(0, 1)),
-        metadata={"method": "contrastive_pca", "statements_sha256": "selfhash"},
+        metadata={"method": "contrastive_pca", "statements_sha256": "a" * 64},
     )
     path = tmp_path / "cv.safetensors"
-    p.save(path, metadata={"method": "overridden"})
+    p.save(path, metadata={"method": "profile"})
     loaded = Profile.load(path)
-    assert loaded.metadata["method"] == "overridden"
-    assert loaded.metadata["statements_sha256"] == "selfhash"
+    assert loaded.metadata["method"] == "profile"
+    assert loaded.metadata["statements_sha256"] == "a" * 64
+
+
+@pytest.mark.parametrize("metadata", [
+    {"method": "invented"},
+    {"method": "profile", "diagnostics": {0: {"score": "1.0"}}},
+    {"method": "profile", "components": {"x": {}}},
+    {"method": "profile", "sae_release": "r"},
+    {"method": "profile", "source_model_id": "src"},
+])
+def test_invalid_nested_metadata_rejects_before_publication(
+    tmp_path: Path, metadata: dict[str, Any],
+) -> None:
+    path = tmp_path / "invalid.safetensors"
+    with pytest.raises(ProfileError):
+        Profile(_mk(layers=(0, 1))).save(path, metadata=metadata)
+    assert not path.exists()
+    assert not path.with_suffix(".json").exists()
+
+
+def test_profile_digest_binds_tensor_pair(tmp_path: Path) -> None:
+    path = tmp_path / "profile.safetensors"
+    Profile(_mk(layers=(0,))).save(path, metadata={"method": "profile"})
+    sidecar = json.loads(path.with_suffix(".json").read_text())
+    sidecar["tensor_sha256"] = "0" * 64
+    path.with_suffix(".json").write_text(json.dumps(sidecar))
+    with pytest.raises(ProfileError, match="tensor sha256"):
+        Profile.load(path)
+
+
+def test_profile_per_layer_metadata_requires_exact_coverage(tmp_path: Path) -> None:
+    path = tmp_path / "profile.safetensors"
+    with pytest.raises(ProfileError, match="cover tensor layers"):
+        Profile(_mk(layers=(0, 1))).save(path, metadata={
+            "method": "profile", "diagnostics": {0: {"score": 1.0}},
+        })
 
 
 # ---------------------------------------------------------------------------

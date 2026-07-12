@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 from collections.abc import Callable
 from typing import Any, cast
 
@@ -1103,13 +1105,12 @@ def _normalize_shares_mean1(raw: dict[int, float]) -> dict[int, float]:
 
     So ``eff_along_L = share_L · base`` is a clean per-layer slide fraction
     ≈ ``base`` on a typical layer and n_layers-invariant (see
-    ``_MANIFOLD_ONTO_GAIN``).  Degenerate guard: an all-zero / near-zero total
-    falls back to a uniform ``1.0`` per layer.
+    ``_MANIFOLD_ONTO_GAIN``). Inputs are exact positive current geometry.
     """
-    n_layers = max(1, len(raw))
+    if not raw or any(not math.isfinite(s) or s <= 0.0 for s in raw.values()):
+        raise ValueError("layer shares must be a nonempty finite positive mapping")
+    n_layers = len(raw)
     total = sum(raw.values())
-    if total <= 1e-12:
-        return dict.fromkeys(raw, 1.0)
     return {L: s / total * n_layers for L, s in raw.items()}
 
 
@@ -1120,9 +1121,7 @@ def _manifold_layer_shares(manifold: Manifold) -> dict[int, float]:
     # ``ManifoldExtractionPipeline.fit``).  Requires *full* layer coverage:
     # the share is a cross-layer-normalized weight, so mixing whitened and
     # Euclidean scalars across layers would compare incommensurable
-    # metrics.  When the baked share is absent (no whitener at fit time —
-    # CPU test stubs) or partial, fall back to the Euclidean centroid-
-    # spread ``‖coords‖_F``.  Normalized to **mean 1** (``Σ_L share_L =
+    # metrics. Normalized to **mean 1** (``Σ_L share_L =
     # n_layers``, not 1) so ``eff_along_L = share_L · base_gain`` is a clean
     # per-layer slide fraction ≈ ``base`` on a typical layer and
     # n_layers-invariant — see ``_MANIFOLD_ONTO_GAIN``.

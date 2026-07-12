@@ -1595,3 +1595,18 @@ def test_runtime_geometry_rejects_wrong_shared_authoring_arity() -> None:
     )
     with pytest.raises(ValueError, match=r"shape \(K, n\)"):
         manifold.validate_runtime_geometry()
+
+
+@pytest.mark.parametrize("share", [0.0, -1.0, float("nan"), True, "1.0"])
+def test_runtime_geometry_rejects_invalid_share_scalar(share: object) -> None:
+    coords = torch.tensor([[1.0], [-1.0]])
+    sub = LayerSubspace.affine(
+        torch.zeros(4), torch.ones(1, 4) / 2, node_coords=coords,
+    )
+    manifold = Manifold(
+        name="bad-share", domain=CustomDomain(1),
+        node_labels=["a", "b"], node_coords=coords, layers={0: sub},
+        mahalanobis_share={0: share},  # type: ignore[dict-item]
+    )
+    with pytest.raises(ValueError, match="finite and positive"):
+        manifold.validate_runtime_geometry()

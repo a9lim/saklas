@@ -7,6 +7,7 @@ import queue
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
+from collections.abc import Mapping
 from typing import Any, Callable, Iterable, Literal, TYPE_CHECKING, overload
 
 import torch
@@ -19,6 +20,9 @@ from textual import events as _textual_events
 from saklas import Recipe, SamplingConfig, Steering
 from saklas.core.errors import SaklasError
 from saklas.core.generation import supports_thinking, thinking_is_optional
+from saklas.core.results import TokenAlt
+from saklas.core.steering import AlphaEntry
+from saklas.core.steering_expr import ManifoldTerm
 from saklas.io.paths import saklas_home
 from saklas.io.probes_bootstrap import load_default_manifolds as load_defaults
 from saklas.core.results import ResultCollector
@@ -423,28 +427,16 @@ class SaklasApp(App[None]):
     # dicts the moved ``_handle_*`` handlers mutate.
 
     @property
-    def _alphas(self) -> dict[str, float]:
-        return self._get_extraction_controller()._alphas
-
-    @_alphas.setter
-    def _alphas(self, value: dict[str, float]) -> None:
-        self._get_extraction_controller()._alphas = value
+    def _alphas(self) -> Mapping[str, float]:
+        return self._get_extraction_controller().alphas
 
     @property
-    def _enabled(self) -> dict[str, bool]:
-        return self._get_extraction_controller()._enabled
-
-    @_enabled.setter
-    def _enabled(self, value: dict[str, bool]) -> None:
-        self._get_extraction_controller()._enabled = value
+    def _enabled(self) -> Mapping[str, bool]:
+        return self._get_extraction_controller().enabled
 
     @property
-    def _manifold_terms(self) -> dict[str, Any]:
-        return self._get_extraction_controller()._manifold_terms
-
-    @_manifold_terms.setter
-    def _manifold_terms(self, value: dict[str, Any]) -> None:
-        self._get_extraction_controller()._manifold_terms = value
+    def _manifold_terms(self) -> Mapping[str, ManifoldTerm]:
+        return self._get_extraction_controller().manifold_terms
 
     # -- Input-history / pending-queue proxies (own: InputHistoryController)
     #
@@ -457,41 +449,21 @@ class SaklasApp(App[None]):
     def _input_history(self) -> list[str]:
         return self._get_input_history_controller()._input_history
 
-    @_input_history.setter
-    def _input_history(self, value: list[str]) -> None:
-        self._get_input_history_controller()._input_history = value
-
     @property
     def _history_index(self) -> int | None:
         return self._get_input_history_controller()._history_index
-
-    @_history_index.setter
-    def _history_index(self, value: int | None) -> None:
-        self._get_input_history_controller()._history_index = value
 
     @property
     def _history_stash(self) -> str:
         return self._get_input_history_controller()._history_stash
 
-    @_history_stash.setter
-    def _history_stash(self, value: str) -> None:
-        self._get_input_history_controller()._history_stash = value
-
     @property
     def _pulled_slot(self) -> int | None:
         return self._get_input_history_controller()._pulled_slot
 
-    @_pulled_slot.setter
-    def _pulled_slot(self, value: int | None) -> None:
-        self._get_input_history_controller()._pulled_slot = value
-
     @property
-    def _pending_queue(self) -> list[PendingItem]:
-        return self._get_input_history_controller()._pending_queue
-
-    @_pending_queue.setter
-    def _pending_queue(self, value: list[PendingItem]) -> None:
-        self._get_input_history_controller()._pending_queue = value
+    def _pending_queue(self) -> tuple[PendingItem, ...]:
+        return tuple(self._get_input_history_controller()._pending_queue)
 
     # -- Loom-state proxies (own: LoomController) -------------------------
     #
@@ -505,25 +477,13 @@ class SaklasApp(App[None]):
     def _loom_prune_expr(self) -> str | None:
         return self._get_loom_controller()._loom_prune_expr
 
-    @_loom_prune_expr.setter
-    def _loom_prune_expr(self, value: str | None) -> None:
-        self._get_loom_controller()._loom_prune_expr = value
-
     @property
     def _loom_auto_regen_mode(self) -> "str | Recipe":
         return self._get_loom_controller()._loom_auto_regen_mode
 
-    @_loom_auto_regen_mode.setter
-    def _loom_auto_regen_mode(self, value: "str | Recipe") -> None:
-        self._get_loom_controller()._loom_auto_regen_mode = value
-
     @property
     def _loom_auto_regen_on(self) -> bool:
         return self._get_loom_controller()._loom_auto_regen_on
-
-    @_loom_auto_regen_on.setter
-    def _loom_auto_regen_on(self, value: bool) -> None:
-        self._get_loom_controller()._loom_auto_regen_on = value
 
     def _rewind_active_assistant(self) -> bool:
         """Move the loom tree's active pointer up one assistant turn.
@@ -544,7 +504,7 @@ class SaklasApp(App[None]):
         tree.navigate(active.parent_id)
         return True
 
-    def _active_alphas(self) -> dict[str, Any]:
+    def _active_alphas(self) -> dict[str, AlphaEntry]:
         """Enabled steering entries for generation — derived off the
         controller's ``_alphas`` / ``_manifold_terms`` / ``_enabled``."""
         return self._get_extraction_controller()._active_alphas()
@@ -728,9 +688,7 @@ class SaklasApp(App[None]):
         # ``Ctrl+U``, hit ``Enter`` and the slot is removed.  The
         # symmetric "back out without removing" gesture is ``Esc``
         # (handled in ``action_stop_generation``).
-        replace_slot = self._pulled_slot
-        self._pulled_slot = None
-        self._sync_pull_state()
+        replace_slot = self._get_input_history_controller().release_pulled_slot()
         if not text:
             # Reached us only via the pulled-slot cancel path
             # (``ChatInput.allow_empty_submit=True``).  Remove the
@@ -1125,15 +1083,14 @@ class SaklasApp(App[None]):
     def _refresh_left_panel(self) -> None:
         self._left_panel.update_vectors(self._vector_list_for_panel())
 
-    def _on_manifold_added(self, key: str, term: Any) -> None:
+    def _on_manifold_added(self, key: str, term: ManifoldTerm) -> None:
         """Register a validated manifold term and refresh the left panel.
 
         Called back (via ``call_from_thread``) by
         ``ExtractionController._dispatch_manifold_term`` once the artifact has
         loaded + the position arity validated.
         """
-        self._manifold_terms[key] = term
-        self._enabled[key] = True
+        self._get_extraction_controller().register_manifold_term(key, term)
         coords_str = ",".join(f"{c:g}" for c in term.position)
         self._chat_panel.add_system_message(
             f"Manifold '{term.manifold}' % {coords_str} active "
@@ -1704,7 +1661,11 @@ class SaklasApp(App[None]):
             logprobs=0,
         )
 
-        def _on_token(text: str, is_thinking: bool, tid: Any, lp: Any, top_alts: Any, perplexity: Any) -> None:
+        def _on_token(
+            text: str, is_thinking: bool, tid: int | None,
+            lp: float | None, top_alts: list[TokenAlt] | None,
+            perplexity: float | None = None,
+        ) -> None:
             # Mirrors the exact event ``_start_generation`` builds
             # from a ``TokenEvent``.  ``prefill_assistant``'s on_token
             # carries no probe scores (no streaming monitor hook on this
@@ -1775,8 +1736,7 @@ class SaklasApp(App[None]):
         self._push_input_history(text)
         # Forward the pulled slot so a re-edited queued item stays at
         # its original position rather than sliding to the queue tail.
-        replace_slot = self._pulled_slot
-        self._pulled_slot = None
+        replace_slot = self._get_input_history_controller().release_pulled_slot()
         self._commit_with_text(text, replace_slot=replace_slot)
 
     def _commit_with_text(self, text: str, *, replace_slot: int | None = None) -> None:
@@ -2180,13 +2140,11 @@ class SaklasApp(App[None]):
                 # Manifold rows aren't session-registered profiles —
                 # drop the local term and let the next gen rebuild
                 # ``Steering`` without it.
-                self._manifold_terms.pop(name, None)
-                self._enabled.pop(name, None)
+                self._get_extraction_controller().remove_steering_entry(name)
                 self._refresh_left_panel()
                 return
             self._session.unsteer(name)
-            self._alphas.pop(name, None)
-            self._enabled.pop(name, None)
+            self._get_extraction_controller().remove_steering_entry(name)
             self._refresh_left_panel()
 
     def _remove_selected_probe(self) -> None:
@@ -2205,7 +2163,7 @@ class SaklasApp(App[None]):
         sel = lp.get_selected()
         if sel:
             name = sel["name"]
-            self._enabled[name] = not self._enabled.get(name, True)
+            self._get_extraction_controller().toggle_steering_entry(name)
             self._refresh_left_panel()
 
     def _adjust_alpha(self, delta: float) -> None:
@@ -2219,7 +2177,7 @@ class SaklasApp(App[None]):
                 # alpha — ←/→ has nothing to nudge.
                 return
             name = sel["name"]
-            self._alphas[name] = max(-MAX_ALPHA, min(MAX_ALPHA, self._alphas.get(name, 0.0) + delta))
+            self._get_extraction_controller().adjust_vector_alpha(name, delta)
             self._refresh_left_panel()
 
     def action_cycle_highlight_mode(self, direction: int = 1) -> None:
@@ -2753,9 +2711,7 @@ class SaklasApp(App[None]):
             import traceback
             traceback.print_exc(file=sys.stderr)
             self._ui_gen_active = False
-            self._pending_queue.clear()
-            self._pulled_slot = None
-            self._sync_pull_state()
+            self._get_input_history_controller().clear_pending_edit_state()
             self._current_assistant_widget = None
             chat.add_system_message(f"error dispatching {item.kind}: {e}")
 
@@ -2838,7 +2794,7 @@ class SaklasApp(App[None]):
             return
         was_off = not self._ab_mode
         self._ab_mode = not self._ab_mode
-        self._loom_auto_regen_on = self._ab_mode
+        self._get_loom_controller().set_auto_regen_enabled(self._ab_mode)
         chat.set_ab_mode(self._ab_mode)
         chat.add_system_message(
             f"A/B mode {'on' if self._ab_mode else 'off'} "

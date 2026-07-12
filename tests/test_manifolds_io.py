@@ -2151,6 +2151,36 @@ def test_rectangular_affine_transfer_preserves_points_frame_and_steering(
     )
 
 
+def test_monopolar_affine_transfer_rebakes_positive_world_direction_share() -> None:
+    from saklas.core.manifold import (
+        CustomDomain, LayerSubspace, Manifold, transfer_manifold_subspaces,
+    )
+    from saklas.io.alignment import LayerAlignment
+
+    basis = torch.tensor([[1.0, 0.0, 0.0]])
+    real_coord = torch.tensor([[2.5]])
+    source = Manifold(
+        name="ray", domain=CustomDomain(1), node_labels=["positive"],
+        node_coords=torch.tensor([[1.0]]),
+        layers={0: LayerSubspace.affine(
+            torch.zeros(3), basis, node_coords=real_coord,
+        )},
+        mahalanobis_share={0: 1.0},
+    )
+    whitener = _target_whitener(dim=3, layers=(0,))
+    transferred = transfer_manifold_subspaces(
+        source,
+        {0: LayerAlignment(torch.eye(3), torch.eye(3), torch.zeros(3))},
+        whitener=whitener, target_layer_means=whitener.layer_means,
+        from_model="src", to_model="tgt",
+    )
+    expected_world = transferred.layers[0].node_coords[0] @ transferred.layers[0].basis
+    assert transferred.mahalanobis_share[0] == pytest.approx(
+        whitener.mahalanobis_norm(0, expected_world), rel=1e-5,
+    )
+    assert transferred.mahalanobis_share[0] > 0.0
+
+
 def test_rectangular_curved_transfer_rejects_anisotropic_tube() -> None:
     import torch
     from dataclasses import replace
