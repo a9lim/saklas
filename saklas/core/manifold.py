@@ -4844,6 +4844,11 @@ def fit_sigma_field(
 
 # ------------------------------------------------------------- save/load ---
 
+def _replace_manifold_file(source: Path, target: Path) -> None:
+    """Atomic replace seam used by publication failure-injection tests."""
+
+    os.replace(source, target)
+
 def save_manifold(
     manifold: Manifold, path: str | Path, metadata: dict[str, object],
 ) -> None:
@@ -5001,17 +5006,62 @@ def save_manifold(
         # by the inspector the way the legacy pack sidecar's ``components``
         # was.  Absent on every non-merge fit.
         "components", "bake_policy",
+        # Cross-model transfer provenance. Persisted in the initial sidecar so
+        # pair publication has no post-save patch crash window.
+        "source_model_id", "source_model_fingerprint",
+        "transfer_quality_estimate",
     ):
         if key in metadata:
             sidecar[key] = metadata[key]
 
-    from saklas.io.atomic import artifact_lock, write_json_atomic
+    from saklas.io.manifold_folder import manifold_pair_lock
 
-    with artifact_lock(path):
-        tensor_tmp = path.with_suffix(path.suffix + ".tmp")
-        save_file(tensors, str(tensor_tmp))
-        os.replace(tensor_tmp, path)
-        write_json_atomic(path.with_suffix(".json"), sidecar)
+    with manifold_pair_lock(path):
+        sidecar_path = path.with_suffix(".json")
+        tensor_fd, tensor_name = tempfile.mkstemp(
+            prefix=f".{path.name}.", suffix=".tmp", dir=path.parent,
+        )
+        os.close(tensor_fd)
+        sidecar_fd, sidecar_name = tempfile.mkstemp(
+            prefix=f".{sidecar_path.name}.", suffix=".tmp", dir=path.parent,
+        )
+        tensor_tmp = Path(tensor_name)
+        sidecar_tmp = Path(sidecar_name)
+        try:
+            # Stage and fsync *both* payloads before replacing either canonical
+            # path.  Commit the sidecar first: an interruption on a first fit
+            # then leaves an ignored orphan sidecar, never the tensor-without-
+            # sidecar shape the folder loader must reject.  On replacement an
+            # interrupted mixed pair fails its old manifest proof and the next
+            # target fit deterministically overwrites it.
+            save_file(tensors, str(tensor_tmp))
+            with open(tensor_tmp, "rb") as handle:
+                os.fsync(handle.fileno())
+            sidecar_bytes = (json.dumps(sidecar, indent=2) + "\n").encode()
+            with os.fdopen(sidecar_fd, "wb", closefd=True) as handle:
+                sidecar_fd = -1
+                handle.write(sidecar_bytes)
+                handle.flush()
+                os.fsync(handle.fileno())
+            _replace_manifold_file(sidecar_tmp, sidecar_path)
+            _replace_manifold_file(tensor_tmp, path)
+            # Make both directory entries durable before the manifest CAS can
+            # publish their hashes as the current pair.
+            try:
+                dir_fd = os.open(path.parent, os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except OSError:
+                # Directory fsync is unavailable on some platforms; both files
+                # themselves are still fsynced and retry recovery remains safe.
+                pass
+        finally:
+            if sidecar_fd >= 0:
+                os.close(sidecar_fd)
+            tensor_tmp.unlink(missing_ok=True)
+            sidecar_tmp.unlink(missing_ok=True)
     log.info("Saved manifold %r (%d layers) to %s",
              manifold.name, len(manifold.layers), path)
 
@@ -5020,8 +5070,7 @@ def load_manifold(
     path: str | Path, *, verify_manifest: bool = True,
 ) -> Manifold:
     """Load a fitted manifold, verifying its targeted manifest pair by default."""
-    from saklas.io.atomic import artifact_lock
-    from saklas.io.manifold_folder import _locked_manifest
+    from saklas.io.manifold_folder import _locked_manifest, manifold_pair_lock
 
     resolved = Path(path)
     if verify_manifest:
@@ -5029,11 +5078,11 @@ def load_manifold(
         # Fit/publication already uses this order; readers must match it or a
         # reader holding the pair can deadlock a fitter holding the folder.
         with _locked_manifest(resolved.parent):
-            with artifact_lock(resolved):
+            with manifold_pair_lock(resolved):
                 return _load_manifold_locked(
                     resolved, verify_manifest=verify_manifest,
                 )
-    with artifact_lock(resolved):
+    with manifold_pair_lock(resolved):
         return _load_manifold_locked(resolved, verify_manifest=False)
 
 

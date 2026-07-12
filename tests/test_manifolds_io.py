@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -370,6 +371,21 @@ def test_update_file_hashes_only_reads_new_artifact(
 
     assert hashed == [new_tensor, new_sidecar]
     assert ManifoldFolder.load(folder).files == mf.files
+
+
+def test_bundle_drift_ignores_local_fit_transaction_state() -> None:
+    from saklas.io.manifolds import _manifest_content_sha256
+
+    base = {"format_version": MANIFOLD_FORMAT_VERSION, "name": "mood", "files": {}}
+    local = {
+        **base,
+        "files": {"model.safetensors": "a" * 64},
+        "artifact_id": "local-generation",
+        "fit_epochs": {"model:raw": 3},
+    }
+    assert _manifest_content_sha256(json.dumps(base).encode()) == (
+        _manifest_content_sha256(json.dumps(local).encode())
+    )
 
 
 def test_update_file_hashes_merges_latest_manifest_from_stale_instances(
@@ -1504,6 +1520,81 @@ def test_refresh_manifold_missing_raises(tmp_path: Path, monkeypatch: pytest.Mon
         refresh_manifold("local", "nope")
 
 
+def test_manifold_pair_lock_identity_is_external_stable_and_bounded(
+    tmp_path: Path,
+) -> None:
+    from saklas.io.manifold_folder import manifold_pair_lock_path
+
+    folder = tmp_path / "manifolds" / "local" / "mood"
+    tensor = folder / ("model_" + "x" * 220 + ".safetensors")
+    before = manifold_pair_lock_path(tensor)
+    folder.mkdir(parents=True)
+    folder.rmdir()
+    after = manifold_pair_lock_path(tensor)
+
+    assert before == after
+    assert before.parent == folder.parent
+    assert len(before.name) < 100
+
+
+@pytest.mark.parametrize("operation", ["clear", "rm", "refresh"])
+def test_lifecycle_mutations_wait_for_stable_pair_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    from saklas.io.manifold_folder import manifold_pair_lock
+
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    domain = {"type": "box", "axes": [
+        {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]}
+    namespace = "alice" if operation == "refresh" else "local"
+    folder, _ = create_manifold_folder(
+        namespace, "mood", "", domain, _author_nodes(["a", "b", "c"]),
+    )
+    fitted = _fake_fit_tensor(folder, "google/gemma-3-4b-it")
+    if operation == "refresh":
+        mf = ManifoldFolder.load(folder)
+        mf.source = "hf://alice/mood@v1"
+        mf.write_metadata()
+        import saklas.io.hf_manifolds as hfm
+
+        monkeypatch.setattr(
+            hfm,
+            "pull_manifold",
+            lambda coord, *, target_folder, force, revision=None: target_folder,
+        )
+
+    started = threading.Event()
+    done = threading.Event()
+    errors: list[BaseException] = []
+
+    def mutate() -> None:
+        started.set()
+        try:
+            if operation == "clear":
+                clear_manifold_tensors(namespace, "mood")
+            elif operation == "rm":
+                remove_manifold_folder(namespace, "mood")
+            else:
+                refresh_manifold(namespace, "mood")
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+        finally:
+            done.set()
+
+    with manifold_pair_lock(fitted):
+        worker = threading.Thread(target=mutate)
+        worker.start()
+        assert started.wait(1.0)
+        assert not done.wait(0.1)
+    worker.join(timeout=2.0)
+
+    assert not worker.is_alive()
+    assert errors == []
+    assert done.is_set()
+
+
 # ============================================================ B6a: transfer ===
 #
 # transfer_manifold applies a GIVEN per-layer Procrustes map to a fitted
@@ -1829,6 +1920,62 @@ def test_transfer_manifold_refuses_overwrite_without_force(
     )
 
 
+def test_transfer_retries_pair_committed_before_manifest_update(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unproven transferred pair is repaired without requiring force."""
+    import torch
+    from saklas.core.manifold import load_manifold
+    from saklas.io.paths import tensor_filename
+
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    domain = {"type": "box", "axes": [
+        {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]}
+    folder, _ = create_manifold_folder(
+        "local", "mood", "", domain, _author_nodes(["a", "b", "c"]),
+    )
+    src_tensor = _fit_real_manifold(folder, "src/m", dim=6)
+    align = {layer: torch.eye(6) for layer in load_manifold(src_tensor).layers}
+    whitener = _target_whitener()
+    original = ManifoldFolder.update_file_hashes
+    failed = False
+
+    def fail_transfer_manifest_once(
+        self: ManifoldFolder, *paths: Path,
+    ) -> None:
+        nonlocal failed
+        if not failed and any("_from-" in path.name for path in paths):
+            failed = True
+            raise RuntimeError("injected post-pair manifest failure")
+        original(self, *paths)
+
+    monkeypatch.setattr(
+        ManifoldFolder, "update_file_hashes", fail_transfer_manifest_once,
+    )
+    kwargs = dict(
+        folder=folder, from_model="src/m", to_model="tgt/m",
+        alignment=align, whitener=whitener,
+        source_model_fingerprint="fp:src/m",
+        target_model_fingerprint="fp:tgt/m",
+    )
+    with pytest.raises(RuntimeError, match="post-pair manifest"):
+        transfer_manifold(**kwargs)
+
+    target = folder / tensor_filename("tgt/m", transferred_from="src/m")
+    assert target.exists()
+    assert target.with_suffix(".json").exists()
+    assert target.name not in json.loads(
+        (folder / "manifold.json").read_text(),
+    )["files"]
+
+    retried = transfer_manifold(**kwargs)
+    assert retried == target
+    loaded = load_manifold(retried)
+    assert loaded.metadata["source_model_id"] == "src/m"
+    assert loaded.metadata["source_model_fingerprint"] == "fp:src/m"
+    ManifoldFolder.load(folder)
+
+
 # ============================================================ B6b: summary ===
 
 
@@ -2003,6 +2150,79 @@ def test_plan_fresh_creates_skeleton_all_pending(tmp_path: Path):
     assert plan.index_of == {"a": 0, "b": 1, "c": 2}
     assert (folder / "manifold.json").exists()
     assert (folder / "nodes").is_dir()
+
+
+def test_plan_force_reset_and_skeleton_share_manifest_transaction(
+    tmp_path: Path,
+) -> None:
+    from saklas.io.manifold_folder import _locked_manifest
+
+    folder = tmp_path / "m"
+    first = plan_discover_generation(
+        folder, "m", "old", fit_mode="pca", labels=["a", "b"],
+    )
+    append_discover_manifold_node(folder, first.index_of["a"], "a", ["old"])
+
+    started = threading.Event()
+    done = threading.Event()
+    errors: list[BaseException] = []
+
+    def reset() -> None:
+        started.set()
+        try:
+            plan_discover_generation(
+                folder, "m", "new", fit_mode="pca", labels=["c", "d"],
+                force=True,
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+        finally:
+            done.set()
+
+    with _locked_manifest(folder):
+        worker = threading.Thread(target=reset)
+        worker.start()
+        assert started.wait(1.0)
+        assert not done.wait(0.1)
+    worker.join(timeout=2.0)
+
+    assert not worker.is_alive()
+    assert errors == []
+    assert done.is_set()
+    data = json.loads((folder / "manifold.json").read_text())
+    assert data["description"] == "new"
+    assert [node["label"] for node in data["nodes"]] == ["c", "d"]
+    assert not (folder / "nodes" / "00_a.json").exists()
+
+
+def test_plan_force_validates_before_removing_prior_folder(tmp_path: Path) -> None:
+    folder = tmp_path / "m"
+    plan_discover_generation(
+        folder, "m", "kept", fit_mode="pca", labels=["a", "b"],
+    )
+    before = (folder / "manifold.json").read_bytes()
+
+    with pytest.raises(ManifoldFormatError):
+        plan_discover_generation(
+            folder, "m", "bad", fit_mode="pca", labels=["not.valid", "b"],
+            force=True,
+        )
+
+    assert (folder / "manifold.json").read_bytes() == before
+
+
+def test_plan_force_recovers_partial_folder_without_manifest(tmp_path: Path) -> None:
+    folder = tmp_path / "m"
+    folder.mkdir()
+    (folder / "orphan").write_text("partial")
+
+    plan = plan_discover_generation(
+        folder, "m", "fresh", fit_mode="pca", labels=["a", "b"], force=True,
+    )
+
+    assert plan.pending == ("a", "b")
+    assert not (folder / "orphan").exists()
+    assert (folder / "manifold.json").exists()
 
 
 def test_plan_resume_reports_only_missing(tmp_path: Path):

@@ -443,6 +443,10 @@ def push_manifold(
         staged_manifest = staging / "manifold.json"
         with open(staged_manifest) as f:
             staged_data = json.load(f)
+        # Transaction identity is local to one installed folder generation;
+        # publishing it would make every pull share the same rm/recreate epoch.
+        staged_data.pop("artifact_id", None)
+        staged_data.pop("fit_epochs", None)
         staged_data["files"] = hash_manifold_files(staging)
         _write_json_atomic(staged_manifest, staged_data)
 

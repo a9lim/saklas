@@ -965,6 +965,83 @@ def _load_lens_at(
         return None
 
 
+def _final_lens_subsumes_checkpoint(
+    final: Mapping[str, Any], checkpoint: Mapping[str, Any],
+) -> bool:
+    """Whether the durable pointer contains every result in ``checkpoint``."""
+    if checkpoint.get("checkpoint") is not True:
+        return False
+    semantic_keys = (
+        "corpus_sha256",
+        "corpus_hash_kind",
+        "seq_len",
+        "d_model",
+        "model_fingerprint",
+        "estimator_policy",
+    )
+    if any(final.get(key) != checkpoint.get(key) for key in semantic_keys):
+        return False
+    try:
+        final_layers = {int(layer) for layer in final.get("source_layers", [])}
+        checkpoint_layers = {
+            int(layer) for layer in checkpoint.get("source_layers", [])
+        }
+        final_progress = int(final.get("n_prompts", -1))
+        checkpoint_progress = int(checkpoint.get("base_n_prompts", 0)) + int(
+            checkpoint.get("n_prompts", -1),
+        )
+    except (TypeError, ValueError):
+        return False
+    return bool(
+        checkpoint_layers
+        and final_layers >= checkpoint_layers
+        and final_progress >= checkpoint_progress > 0
+    )
+
+
+def remove_subsumed_lens_checkpoint(
+    model_id: str,
+    *,
+    verified_final_sidecar: Mapping[str, Any] | None = None,
+) -> bool:
+    """Reap a crash-left checkpoint only when the durable lens proves it redundant.
+
+    Final publication and checkpoint unlink are necessarily two filesystem
+    operations. A process death between them leaves two complete shard sets.
+    This recovery path preserves a farther-ahead or semantically different
+    checkpoint and validates the final payload before discarding the recovery
+    point. Callers that just validated the exact current final sidecar may pass it
+    to avoid hashing a multi-GiB lens twice.
+    """
+    final_anchor, final_sc = _lens_anchor_paths(model_id)
+    checkpoint_anchor, checkpoint_sc = _checkpoint_anchor_paths(model_id)
+    with (
+        lens_fit_lock(model_id),
+        artifact_lock(final_anchor),
+        artifact_lock(checkpoint_anchor),
+    ):
+        checkpoint = _load_sidecar_at(
+            model_id, checkpoint_anchor, checkpoint_sc,
+            label="jlens checkpoint",
+        )
+        if checkpoint is None:
+            return False
+        final = _load_sidecar_at(
+            model_id, final_anchor, final_sc, label="jlens cache",
+        )
+        if final is None or not _final_lens_subsumes_checkpoint(final, checkpoint):
+            return False
+        caller_verified_current = bool(
+            verified_final_sidecar is not None
+            and dict(verified_final_sidecar) == final
+        )
+        if not caller_verified_current and not lens_payloads_match(model_id, final):
+            return False
+        checkpoint_sc.unlink(missing_ok=True)
+        _cleanup_unreferenced_generations(final_anchor.parent)
+        return True
+
+
 def remove_lens_checkpoint(model_id: str) -> bool:
     """Delete a resumable checkpoint shard. Returns True when anything was removed."""
     anchor, sc_path = _checkpoint_anchor_paths(model_id)

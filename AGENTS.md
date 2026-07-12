@@ -300,8 +300,9 @@ fit attaches transparent mean-position probe leaves at the requested source
 outputs (detaching the lowest one to cut the graph) and reads their already
 position-reduced `[dim_batch,B,D]` grads from
 `torch.autograd.grad(final, probes)`, never `retain_grad`). The final-block hook stops the forward before final norm + LM
-head. Row blocks transfer through bounded stripes directly into the CPU
-accumulator; an OOM resumes at the first uncommitted row. On MPS the pass loop drains the command
+head. Row blocks transfer through byte-budgeted, allocation-adaptive stripes
+directly into the CPU accumulator; an OOM resumes at the first uncommitted row.
+On MPS the pass loop drains the command
 queue every few passes (`_MPS_SYNC_EVERY_PASSES`): Metal reports queue
 exhaustion as an *asynchronous* command-buffer error that silently zeroes the
 work rather than raising, so a fully unsynced loop corrupts the fit (a
@@ -312,7 +313,9 @@ source-layer + token-id corpus + loaded-model fingerprint match + checkpoint
 every 25 prompts); the default FineWeb-Edu stream pins its Hub dataset commit,
 ordinary corpus extension resumes from a matching token-id prefix; `-f` restarts.
 Checkpoint cadence does not fracture prompt microbatches, and a complete terminal
-checkpoint is promoted durably rather than rewriting the full lens.
+checkpoint is promoted durably rather than rewriting the full lens. Exact no-op
+recovery reaps a crash-left checkpoint only when the validated final artifact
+provably subsumes its semantics, layers, and effective prompt progress.
 
 Three read surfaces, one write surface:
 

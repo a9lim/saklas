@@ -156,8 +156,16 @@ imports are now just `load_manifold` / `save_manifold` /
 serializer shared by `pack show -j` + the HTTP summary route.
 `clear` / `rm` garbage-collect shared format-v4 per-layer capture shards only
 after the last fitted-sidecar owner disappears, under the same capture-stem lock
-used by fitting; this composes with fit-side size pruning, which locks victims
-one at a time after the publisher releases its own stem. Ordinary
+used by fitting and only when no live PID lease is consuming mapped rows; stale
+crash leases are reaped lazily. Scoped clear increments only its model/variant
+fit epoch, invalidating a paused matching fit without discarding unrelated target
+work; rm/recreate changes the folder artifact id. Fitted pairs use stable
+digest-named locks outside the removable folder; clear/rm/refresh acquire the
+manifest lock followed by affected pair locks in deterministic order. Transfer
+provenance is part of the initial sidecar publication, and a pair left unproven
+by a failed manifest update is repaired on an ordinary retry. This composes with fit-side
+size pruning, which locks victims one at a time after the publisher releases its
+own stem. Ordinary
 discovery/summary routing (`iter_manifold_folders`, `manifold_summary`, HTTP
 lookup) loads metadata with `verify_manifest=False`; install/push/fitted-tensor
 use stays strict. `bundled_manifold_names`, `materialize_bundled_manifolds`
@@ -391,6 +399,11 @@ failure therefore preserves both the prior full artifact and the checkpoint.
 Promotion accepts only v4 checkpoints whose every shard matches its declared
 digest; legacy v3 checkpoints fall back to ordinary v4 serialization. Removal
 unpublishes both pointer sidecars before best-effort shard garbage collection.
+Because final publication and checkpoint unlink are separate crash points, exact
+no-op recovery removes a leftover checkpoint only after the validated final
+artifact proves it has matching fit semantics, covers its layers, and reaches at
+least its effective base-plus-partial prompt progress; newer or different-corpus
+checkpoints remain resumable.
 Unreferenced generations are collected only after pointer commit. A dedicated
 per-model `jlens.fit` lock spans preflight, estimator/checkpoint work, final
 publication, and lifecycle removal across processes. Metadata-only
@@ -399,12 +412,16 @@ final/checkpoint preflight rejects incompatible corpora/layers before matrix IO.
 `lens_checkpoint_paths` / `save_lens` / `save_lens_checkpoint_accumulator` /
 `save_lens_checkpoint` (compatibility) / `load_lens` /
 `load_lens_checkpoint_sidecar` / `load_lens_checkpoint` /
-`promote_lens_checkpoint` / `remove_lens`; the fit itself lives in `core/jlens.py`.
+`promote_lens_checkpoint` / `remove_subsumed_lens_checkpoint` / `remove_lens`;
+the fit itself lives in `core/jlens.py`.
 
 ## atomic.py / staging.py
 
 `atomic.py` — `write_bytes_atomic` / `write_json_atomic`: stage to a same-directory
-temp file, `fsync`, then `os.replace`. `staging.py` — `stage_verify_swap` is the
+temp file, `fsync`, then `os.replace`; `ReleasableArtifactLock` supports short
+cache transactions inside a longer fit, and `artifact_process_lease` /
+`artifact_has_live_lease` protect mapped immutable shards after that lock is
+released (PID-stale markers are reaped). `staging.py` — `stage_verify_swap` is the
 shared HF-install choreography: build under `.staging/`, recover `.bak` on
 interrupted swaps, then promote atomically (`target → .bak`, `.staging → target`)
 with best-effort restore. (`datasource.py` is gone — extraction takes node corpora

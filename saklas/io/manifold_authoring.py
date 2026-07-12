@@ -940,6 +940,7 @@ def _discover_manifest_payload(
     return payload
 
 
+@_lock_folder_arg
 def plan_discover_generation(
     folder: Path,
     name: str,
@@ -951,6 +952,7 @@ def plan_discover_generation(
     node_roles: Optional[dict[str, str | None]] = None,
     node_kinds: Optional[dict[str, str | None]] = None,
     tags: Optional[list[str]] = None,
+    force: bool = False,
 ) -> DiscoverGenerationPlan:
     """Ensure a streamable discover skeleton at ``folder`` covering every
     label in ``labels``, and report which node corpora still need writing.
@@ -970,6 +972,8 @@ def plan_discover_generation(
     - ``scenarios.json`` (when present) is read back into
       ``plan.scenarios`` so the caller can lock the resumed/added nodes
       onto the original domains rather than regenerating fresh ones.
+    - ``force=True`` removes the prior folder and publishes the fresh skeleton
+      in the same manifest transaction.
 
     The read is deliberately lenient — it does **not** route through
     :meth:`ManifoldFolder.load`, which rejects a partially-written folder
@@ -1004,26 +1008,38 @@ def plan_discover_generation(
             f"discover manifold {name!r} node_kinds carries labels not in "
             f"the roster: {sorted(unknown_k)}"
         )
+    # Validate every replacement input before a force reset can remove the
+    # prior folder.  The resolved maps are also reused by the fresh path.
+    roles_resolved = {
+        label: _validate_node_role(name, label, roles_in.get(label))
+        for label in labels
+    }
+    kinds_resolved = {
+        label: _validate_node_kind(name, label, kinds_in.get(label))
+        for label in labels
+    }
+    sanitized_hyperparams = sanitize_hyperparams(fit_mode, hyperparams)
+
+    # Reset and skeleton publication are one manifest transaction.  Keeping
+    # this inside the planner prevents a fitter from snapshotting between an
+    # external ``rmtree`` and the replacement manifest, and prevents a stale
+    # fit from publishing across a concurrent force-regeneration.  Remove even
+    # a partial folder: force is the recovery path for a missing manifest.
+    if force and folder.exists():
+        shutil.rmtree(folder)
 
     meta_path = folder / "manifold.json"
     nodes_dir = folder / "nodes"
 
     if not meta_path.exists():
         # Fresh skeleton — everything is pending.
-        roles_resolved = {
-            label: _validate_node_role(name, label, roles_in.get(label))
-            for label in labels
-        }
-        kinds_resolved = {
-            label: _validate_node_kind(name, label, kinds_in.get(label))
-            for label in labels
-        }
         folder.mkdir(parents=True, exist_ok=True)
         nodes_dir.mkdir(exist_ok=True)
         write_json_atomic(
             meta_path,
             _discover_manifest_payload(
-                name, description, fit_mode, labels, roles_resolved, hyperparams,
+                name, description, fit_mode, labels, roles_resolved,
+                sanitized_hyperparams,
                 kinds_resolved, tags,
             ),
         )

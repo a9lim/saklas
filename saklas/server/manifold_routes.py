@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import shutil
 from typing import Any, Callable, Literal, cast
 
 from fastapi import FastAPI, HTTPException, Request
@@ -769,14 +768,13 @@ def register_manifold_routes(app: FastAPI) -> None:
         def _gen(on_progress: Callable[[str], None]) -> dict[str, Any]:
             # ``force`` is a clean slate; the default *resumes* — fill missing
             # nodes + append any concepts new to the roster.
-            if req.force and (folder / "manifold.json").exists():
-                shutil.rmtree(folder)
             try:
                 plan = plan_discover_generation(
                     folder, req.name, req.description,
                     fit_mode=req.fit_mode, labels=list(req.concepts),
                     hyperparams=req.hyperparams, node_roles=node_roles_map,
                     node_kinds=node_kinds_map,
+                    force=req.force,
                 )
             except ManifoldFormatError as e:
                 raise HTTPException(400, str(e)) from e

@@ -21,6 +21,7 @@ from saklas.io.lens import (
     load_lens_checkpoint,
     load_lens_sidecar,
     remove_lens,
+    remove_subsumed_lens_checkpoint,
     promote_lens_checkpoint,
     save_lens,
     save_lens_checkpoint,
@@ -405,6 +406,89 @@ def test_checkpoint_promotion_rejects_legacy_v3_without_destroying_it() -> None:
     loaded = load_lens_checkpoint(_MODEL)
     assert loaded is not None and loaded[0].n_prompts == 5
     assert legacy.exists() and checkpoint_sc.exists()
+
+
+def test_subsumed_checkpoint_recovery_handles_base_progress_and_subset_layers() -> None:
+    final = _lens(n_layers=3, n_prompts=7)
+    save_lens(
+        final, _MODEL, corpus_spec="same", corpus_sha256="same-sha",
+        corpus_hash_kind="token_ids_v1", seq_len=128, dim_batch=8,
+        skip_first=16, model_fingerprint="weights",
+    )
+    # Legacy-compatible progress semantics: 3 durable base prompts plus a
+    # 2-prompt partial means this checkpoint reaches prompt 5, not prompt 2.
+    checkpoint = JacobianLens(
+        {1: torch.eye(_D)}, n_prompts=2, d_model=_D,
+    )
+    save_lens_checkpoint(
+        checkpoint, _MODEL, base_n_prompts=3,
+        corpus_spec="same", corpus_sha256="same-sha",
+        corpus_hash_kind="token_ids_v1", seq_len=128, dim_batch=8,
+        skip_first=16, model_fingerprint="weights",
+    )
+
+    assert remove_subsumed_lens_checkpoint(_MODEL)
+    assert load_lens_checkpoint(_MODEL) is None
+    loaded = load_lens(_MODEL)
+    assert loaded is not None and loaded[0].source_layers == [0, 1, 2]
+
+
+def test_subsumed_checkpoint_recovery_preserves_farther_progress() -> None:
+    save_lens(
+        _lens(n_layers=2, n_prompts=3), _MODEL,
+        corpus_spec="same", corpus_sha256="same-sha",
+        corpus_hash_kind="token_ids_v1", seq_len=128, dim_batch=8,
+        skip_first=16, model_fingerprint="weights",
+    )
+    save_lens_checkpoint(
+        _lens(n_layers=2, n_prompts=2), _MODEL, base_n_prompts=3,
+        corpus_spec="same", corpus_sha256="same-sha",
+        corpus_hash_kind="token_ids_v1", seq_len=128, dim_batch=8,
+        skip_first=16, model_fingerprint="weights",
+    )
+
+    assert not remove_subsumed_lens_checkpoint(_MODEL)
+    assert load_lens_checkpoint(_MODEL) is not None
+
+
+def test_subsumed_checkpoint_recovery_preserves_other_corpus() -> None:
+    save_lens(
+        _lens(n_layers=2, n_prompts=7), _MODEL,
+        corpus_spec="final", corpus_sha256="final-sha",
+        corpus_hash_kind="token_ids_v1", seq_len=128, dim_batch=8,
+        skip_first=16, model_fingerprint="weights",
+    )
+    save_lens_checkpoint(
+        _lens(n_layers=1, n_prompts=2), _MODEL, base_n_prompts=0,
+        corpus_spec="checkpoint", corpus_sha256="other-sha",
+        corpus_hash_kind="token_ids_v1", seq_len=128, dim_batch=8,
+        skip_first=16, model_fingerprint="weights",
+    )
+
+    assert not remove_subsumed_lens_checkpoint(_MODEL)
+    assert load_lens_checkpoint(_MODEL) is not None
+
+
+def test_subsumed_checkpoint_recovery_preserves_recovery_point_if_final_corrupt() -> None:
+    save_lens(
+        _lens(n_layers=2, n_prompts=7), _MODEL,
+        corpus_spec="same", corpus_sha256="same-sha",
+        corpus_hash_kind="token_ids_v1", seq_len=128, dim_batch=8,
+        skip_first=16, model_fingerprint="weights",
+    )
+    save_lens_checkpoint(
+        _lens(n_layers=1, n_prompts=2), _MODEL, base_n_prompts=0,
+        corpus_spec="same", corpus_sha256="same-sha",
+        corpus_hash_kind="token_ids_v1", seq_len=128, dim_batch=8,
+        skip_first=16, model_fingerprint="weights",
+    )
+    final_tensor, _ = lens_paths(_MODEL)
+    payload = bytearray(final_tensor.read_bytes())
+    payload[-1] ^= 1
+    final_tensor.write_bytes(payload)
+
+    assert not remove_subsumed_lens_checkpoint(_MODEL)
+    assert load_lens_checkpoint(_MODEL) is not None
 
 
 def test_remove_waits_for_fit_transaction() -> None:

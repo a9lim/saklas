@@ -58,8 +58,11 @@ the multi-backward loop would corrupt the rows — which also stops the graph wa
 at the shallowest requested source, so a `--layers`-restricted fit never
 backprops below its lowest layer. A terminal hook stops the forward after the
 final transformer residual, before final norm / LM head. Every backend uses
-bounded `_ROW_STRIPE` device + host buffers that validate and commit directly
-into the persistent CPU accumulator. CUDA uses two ordered event-tracked slots
+byte-budgeted device + host row stripes (up to `_ROW_STRIPE`, never smaller than
+one active VJP block) that validate and commit directly into the persistent CPU
+accumulator. Allocation failure halves the stripe independently of prompt width;
+a later dim-batch OOM releases an oversized persistent slot before retry. CUDA
+uses two ordered event-tracked slots
 to overlap D2H with the next backward stripe, discards an entire uncommitted
 suffix on transfer failure, and drops to one slot before narrowing estimator
 batches when the overlap buffer itself causes OOM. If a later VJP OOMs the graph
@@ -84,7 +87,11 @@ recovery point until that pointer commit succeeds.
 non-mutating n_prompts-weighted combiner; `merge_into` recycles a caller-owned
 tail; `union_layers` combines same-corpus layer shards. Persisting a
 missing-layer union reuses the existing v4 shard pointers and serializes only
-the newly fitted layers.
+the newly fitted layers. A superset durable artifact remains the session's full
+resident lens even when `fit_jlens(..., source_layers=...)` returns a narrower
+view. Exact no-op paths also reap a crash-left checkpoint only when the validated
+final pointer matches its semantics/layers and has reached at least its effective
+`base_n_prompts + n_prompts` progress.
 
 `JacobianLens` holds the fp32 matrices: `transport(h, layer)` maps a residual
 into the final basis; `token_direction(v, unembed)` is `W_U[v] @ J_l` per layer
@@ -230,8 +237,13 @@ the sigma covariance pass does not copy the full row roster into a third mmap.
 Each row shard validates independently, so one damaged layer recaptures only
 itself; speculative auto-fit rows do not enter durable coverage until publish.
 The shared per-model capture stem is protected by `artifact_lock`
-across read/top-up/publish, and safetensors stage through unique same-directory
-tempfiles. Layer coverage is unioned/topped up, so full→subset needs no forward
+only across read/top-up/publish; the downstream topology/covariance fit retains a
+PID-backed process lease that prune/GC honors without holding the exclusive stem
+lock. Safetensors stage through unique same-directory tempfiles. `force` drops
+only the requested layers from the loaded v4 pointer, so a forced subset keeps
+all unselected shard identities. Deferred auto-curved row top-ups reload and
+merge the latest pointer under the reacquired stem lock. Layer coverage is
+unioned/topped up, so full→subset needs no forward
 and overlapping subsets capture only missing layers. Cache groups prune oldest-first past 8 GiB
 (`SAKLAS_MANIFOLD_CAPTURE_CACHE_GB`) and `pack clear` / `pack rm` remove referenced
 group. Pruning runs only after the current stem transaction releases, under a
@@ -239,7 +251,19 @@ directory prune lock plus one victim lock at a time, so eviction cannot remove
 another fit's active cache or introduce cross-stem lock inversion. `layer_indices` accepts an explicit set or the canonical 40–90% workspace
 band. It threads the folder's `node_kinds` / `node_roles` into the `Manifold` +
 sidecar metadata, then dispatches on `fit_mode`.
-Discover overrides and fit publication share the folder manifest transaction.
+The long fit lock is target-scoped and stored outside the removable folder.
+Folder-manifest locks cover only override/snapshot and final publication: the
+snapshot hashes exact nodes plus the resolved template/baseline and target clear
+epochs; publication compare-and-swaps that revision. Readers and unrelated model
+targets therefore proceed during compute, while authoring edits, scoped clears,
+and rm/recreate prevent stale publication. Tensor and sidecar payloads are both
+staged+fsynced before a sidecar-first pair commit; any interrupted mixed/orphan
+pair is a cache miss or is repaired at the next target fit.
+Every fitted tensor/sidecar read, replacement, clear, transfer, and folder
+removal uses a digest-named pair lock under the namespace parent (not inside the
+removable manifold folder). Folder-wide lifecycle operations take the manifest
+lock then all affected pair locks in sorted order, so `rm`/HF stage-swap cannot
+delete a lock inode or tear a cache-hit proof/read transaction.
 If an override changes the manifest and the fit then fails, the session evicts
 only that namespace/variant's resident manifold, folded profile, attached probe,
 and prefix state; validation failures that did not write preserve consumers.
@@ -1019,7 +1043,12 @@ events: `GenerationStarted`/`SteeringApplied`/
 **Jacobian-lens surface.** `session.jlens` validates v4 sidecar/live-weight
 identity before loading, refreshes or evicts an already-resident lens when an
 external process replaces/removes its generation, then verifies the payload digest
-while promoting each layer (`io/lens.py`, like `whitener`); `fit_jlens(prompts, …)` pre-filters too-short
+while promoting each layer (`io/lens.py`, like `whitener`). Generation refreshes
+that disk identity once in `_begin_capture` (or the compatible-batch preamble) and
+pins the resulting resident lens through token scoring, gates, and final
+aggregation; per-token paths never reopen the sidecar or its layer shards, and an
+external pointer switch becomes visible at the next generation boundary.
+`fit_jlens(prompts, …)` pre-filters too-short
 prompts (so the saved `n_prompts` counts consumed prompts exactly — what makes
 resume slicing sound), hashes the filtered corpus, resumes a matching partial
 fit by default (`force=True` restarts), checkpoints via the io layer, and gates

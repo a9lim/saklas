@@ -25,6 +25,7 @@ import pathlib
 import tempfile
 import threading
 import time
+import uuid
 from collections.abc import Mapping, Sequence
 from contextlib import nullcontext
 from typing import Any, Callable, Protocol, runtime_checkable
@@ -109,6 +110,78 @@ def _apply_fit_overrides_locked(
     ]
     data.pop("domain", None)
     write_json_atomic(folder / "manifold.json", data)
+
+
+def _repair_incomplete_target_locked(
+    folder: pathlib.Path, tensor_path: pathlib.Path,
+) -> None:
+    """Remove an interrupted one-sided fitted pair and its stale proofs."""
+
+    sidecar_path = tensor_path.with_suffix(".json")
+    if tensor_path.exists() == sidecar_path.exists():
+        return
+    tensor_path.unlink(missing_ok=True)
+    sidecar_path.unlink(missing_ok=True)
+    manifest_path = folder / "manifold.json"
+    with open(manifest_path) as handle:
+        payload = json.load(handle)
+    files = payload.get("files", {})
+    if isinstance(files, dict):
+        files = dict(files)
+        files.pop(tensor_path.name, None)
+        files.pop(sidecar_path.name, None)
+        payload["files"] = files
+        from saklas.io.atomic import write_json_atomic
+
+        write_json_atomic(manifest_path, payload)
+
+
+class ManifoldAuthoringChangedError(RuntimeError):
+    """The authoring inputs changed while a target was being fitted."""
+
+
+def _assert_authoring_revision(
+    folder: pathlib.Path, target_path: pathlib.Path, expected_revision: str,
+) -> None:
+    from saklas.io.manifold_folder import _locked_manifest
+
+    with _locked_manifest(folder):
+        _mf, _nodes_sha, actual, _groups, _baseline = (
+            _authoring_snapshot_locked(folder, target_path)
+        )
+    if actual != expected_revision:
+        raise ManifoldAuthoringChangedError(
+            f"manifold authoring changed during fit ({expected_revision[:12]}"
+            f" -> {actual[:12]}); retry against the current revision"
+        )
+
+
+def _publish_fit_if_current(
+    folder: pathlib.Path,
+    *,
+    expected_revision: str,
+    manifold: Any,
+    tensor_path: pathlib.Path,
+    metadata: dict[str, Any],
+) -> None:
+    """CAS-publish a fitted pair while the authoring revision is unchanged."""
+
+    from saklas.core.manifold import save_manifold
+    from saklas.io.manifold_folder import _locked_manifest
+
+    with _locked_manifest(folder):
+        current, _nodes_sha, actual, _groups, _baseline = (
+            _authoring_snapshot_locked(folder, tensor_path)
+        )
+        if actual != expected_revision:
+            raise ManifoldAuthoringChangedError(
+                f"manifold authoring changed during fit ({expected_revision[:12]}"
+                f" -> {actual[:12]}); retry against the current revision"
+            )
+        save_manifold(manifold, tensor_path, metadata)
+        current.update_file_hashes(
+            tensor_path, tensor_path.with_suffix(".json"),
+        )
 
 
 def _tensor_sha256(tensor: torch.Tensor) -> str:
@@ -214,6 +287,70 @@ def _capture_group_paths(
     return [path for path in folder.glob(f"{stem}.*") if path.is_file()]
 
 
+def _publish_deferred_row_shards(
+    capture_dir: pathlib.Path,
+    cache_stem: str,
+    cache_meta: pathlib.Path,
+    retained_rows: Any,
+    node_sizes: list[int],
+    row_layers: set[int],
+    row_files: dict[str, str],
+    row_shapes: dict[str, object],
+    row_dtypes: dict[str, object],
+    row_digests: dict[str, object],
+) -> None:
+    """Top up auto-curved row shards in a short stem transaction."""
+
+    from saklas.io.atomic import artifact_lock, write_json_atomic
+
+    with artifact_lock(capture_dir / cache_stem):
+        with open(cache_meta) as handle:
+            payload = json.load(handle)
+        if (
+            int(payload.get("format_version", 0)) != _CAPTURE_CACHE_FORMAT_VERSION
+            or payload.get("capture_sha256") != cache_stem
+            or [int(x) for x in payload.get("node_sizes", [])] != node_sizes
+        ):
+            raise ValueError("capture cache changed identity during deferred row top-up")
+        current_layers = {int(i) for i in payload.get("row_layers", [])}
+        current_files = dict(payload.get("row_files", {}))
+        current_shapes = dict(payload.get("row_shapes", {}))
+        current_dtypes = dict(payload.get("row_dtypes", {}))
+        current_digests = dict(payload.get("row_tensor_sha256", {}))
+        for idx in current_layers:
+            key = str(idx)
+            if not all(
+                key in mapping for mapping in (
+                    current_files, current_shapes, current_dtypes, current_digests,
+                )
+            ):
+                raise ValueError("capture row pointer changed incompletely")
+            row_files[key] = current_files[key]
+            row_shapes[key] = current_shapes[key]
+            row_dtypes[key] = current_dtypes[key]
+            row_digests[key] = current_digests[key]
+        row_layers.update(current_layers)
+        newly_durable = sorted(set(retained_rows.layer_indices) - current_layers)
+        for idx in newly_durable:
+            row_path = _row_shard_path(capture_dir, cache_stem, idx)
+            rows = retained_rows.flat_rows(idx)
+            _save_safetensors_atomic({f"layer_{idx}": rows}, row_path)
+            row_files[str(idx)] = row_path.name
+            row_shapes[str(idx)] = list(rows.shape)
+            row_dtypes[str(idx)] = str(rows.dtype)
+            row_digests[str(idx)] = _tensor_sha256(rows)
+        row_layers.update(newly_durable)
+        durable = sorted(row_layers)
+        payload["row_layers"] = durable
+        payload["row_files"] = {str(i): row_files[str(i)] for i in durable}
+        payload["row_shapes"] = {str(i): row_shapes[str(i)] for i in durable}
+        payload["row_dtypes"] = {str(i): row_dtypes[str(i)] for i in durable}
+        payload["row_tensor_sha256"] = {
+            str(i): row_digests[str(i)] for i in durable
+        }
+        write_json_atomic(cache_meta, payload)
+
+
 def _prune_manifold_capture_cache(
     folder: pathlib.Path, *, keep_stem: str,
 ) -> None:
@@ -232,7 +369,7 @@ def _prune_manifold_capture_cache(
     if limit_gb <= 0.0:
         return
     limit = int(limit_gb * 1024**3)
-    from saklas.io.atomic import artifact_lock
+    from saklas.io.atomic import artifact_has_live_lease, artifact_lock
 
     folder.mkdir(parents=True, exist_ok=True)
     with artifact_lock(folder / "capture-cache-prune"):
@@ -261,6 +398,8 @@ def _prune_manifold_capture_cache(
         )
         for stem in oldest:
             with artifact_lock(folder / stem):
+                if artifact_has_live_lease(folder / stem):
+                    continue
                 # The group may have been topped up or removed while we waited.
                 # Re-stat under its transaction lock and charge exactly what is
                 # about to be evicted.
@@ -344,6 +483,9 @@ def prepare_manifold_capture_identity(
     handle: ModelHandle,
     mf: Any,
     model_fingerprint: str,
+    *,
+    node_groups_snapshot: list[tuple[str, list[str]]] | None = None,
+    baseline_prompts_snapshot: list[str | list[dict[str, str]]] | None = None,
 ) -> tuple[
     list[tuple[str, list[str]]],
     list[str | list[dict[str, str]]],
@@ -357,7 +499,10 @@ def prepare_manifold_capture_identity(
     model = handle.model
     base_model = getattr(model, "_orig_mod", model)
     config = getattr(base_model, "config", getattr(model, "config", None))
-    node_groups = mf.node_groups()
+    node_groups = (
+        [(label, list(rows)) for label, rows in node_groups_snapshot]
+        if node_groups_snapshot is not None else mf.node_groups()
+    )
     node_roles = mf._roles_padded()
     node_kinds = mf._kinds_padded()
     model_type = getattr(getattr(model, "config", None), "model_type", None)
@@ -366,7 +511,9 @@ def prepare_manifold_capture_identity(
             f"manifold {mf.name!r} carries per-node roles but model config "
             "has no 'model_type' — cannot resolve role headers"
         )
-    if mf.template_ref is not None:
+    if baseline_prompts_snapshot is not None:
+        baseline_prompts = list(baseline_prompts_snapshot)
+    elif mf.template_ref is not None:
         from saklas.io.templates import resolve_template
 
         tmpl = resolve_template(mf.template_ref)
@@ -425,6 +572,89 @@ def prepare_manifold_capture_identity(
         node_groups, baseline_prompts, prepared_rows, capture_sha,
         node_roles, node_kinds, model_type,
     )
+
+
+def _authoring_snapshot_locked(
+    folder: pathlib.Path,
+    target_path: pathlib.Path,
+) -> tuple[
+    Any,
+    str,
+    str,
+    list[tuple[str, list[str]]],
+    list[str | list[dict[str, str]]],
+]:
+    """Materialize template inputs and snapshot one exact authoring revision."""
+
+    from saklas.io.manifolds import ManifoldFolder
+
+    manifest_path = folder / "manifold.json"
+    with open(manifest_path) as handle:
+        identity_payload = json.load(handle)
+    artifact_id = identity_payload.get("artifact_id")
+    if not isinstance(artifact_id, str) or not artifact_id:
+        artifact_id = uuid.uuid4().hex
+        identity_payload["artifact_id"] = artifact_id
+        identity_payload.setdefault("fit_epochs", {})
+        from saklas.io.atomic import write_json_atomic
+
+        write_json_atomic(manifest_path, identity_payload)
+    from saklas.io.paths import parse_tensor_filename
+
+    parsed = parse_tensor_filename(target_path.name)
+    if parsed is None:
+        raise ValueError(f"invalid manifold tensor target {target_path.name!r}")
+    safe_model, raw_variant = parsed
+    variant = "raw" if raw_variant is None else raw_variant.split("-", 1)[0]
+    fit_epochs_raw = identity_payload.get("fit_epochs", {})
+    fit_epochs = fit_epochs_raw if isinstance(fit_epochs_raw, dict) else {}
+    epoch_keys = (
+        "*:all", f"*:{variant}", f"{safe_model}:all",
+        f"{safe_model}:{variant}", target_path.name,
+    )
+    target_epochs = {key: int(fit_epochs.get(key, 0)) for key in epoch_keys}
+    mf = ManifoldFolder.load(folder, verify_manifest=False)
+    template_sha: str | None = None
+    if mf.template_ref is not None:
+        from saklas.io.manifold_authoring import _write_node_corpus
+        from saklas.io.templates import resolve_template
+
+        tmpl = resolve_template(mf.template_ref)
+        template_sha = tmpl.sha256()
+        expected_corpora = tmpl.node_corpora()
+        if dict(mf.node_groups()) != expected_corpora:
+            _write_node_corpus(
+                folder,
+                [
+                    {"label": label, "statements": statements}
+                    for label, statements in expected_corpora.items()
+                ],
+            )
+            mf.node_labels = list(expected_corpora)
+            mf.node_roles = [None] * len(mf.node_labels)
+            mf.node_kinds = [None] * len(mf.node_labels)
+            mf.write_metadata()
+            mf = ManifoldFolder.load(folder, verify_manifest=False)
+        baseline: list[str | list[dict[str, str]]] = [
+            context.messages() for context in tmpl.contexts
+        ]
+    else:
+        from saklas.core.vectors import _load_baseline_prompts
+
+        baseline = list(_load_baseline_prompts())
+    groups = mf.node_groups()
+    nodes_sha = mf.nodes_sha256(resolved_template_sha256=template_sha)
+    revision_payload = json.dumps(
+        {
+            "artifact_id": artifact_id,
+            "target_epochs": target_epochs,
+            "nodes_sha256": nodes_sha,
+            "baseline_prompts": baseline,
+        },
+        sort_keys=True, separators=(",", ":"),
+    ).encode()
+    revision = hashlib.sha256(revision_payload).hexdigest()
+    return mf, nodes_sha, revision, groups, baseline
 
 
 def _diagnostics_to_dict(diag: Any) -> dict[str, Any]:
@@ -500,18 +730,49 @@ class ManifoldExtractionPipeline:
         force: bool = False,
         on_progress: Callable[[str], None] | None = None,
     ):
-        """Serialize one folder's override/fit/cache/publication transaction."""
-        from saklas.io.manifold_folder import _locked_manifest
+        """Fit against a stable authoring snapshot, publishing by revision CAS.
+
+        The long-running lock is target-scoped, so two model/variant targets in
+        one folder may compute concurrently and readers keep using the prior
+        published artifact.  The folder lock is held only while taking the exact
+        authoring snapshot and again during final compare-and-swap publication.
+        """
+        from saklas.io.atomic import artifact_lock
+        from saklas.io.manifold_folder import _locked_manifest, manifold_pair_lock
 
         folder_path = pathlib.Path(folder)
-        with _locked_manifest(folder_path):
-            _apply_fit_overrides_locked(
-                folder_path, fit_mode=fit_mode, hyperparams=hyperparams,
-            )
+        sae_release = (
+            sae if isinstance(sae, str)
+            else (sae.release if sae is not None else None)
+        )
+        target_path = folder_path / tensor_filename(
+            self._handle.model_id, release=sae_release,
+        )
+        # Lock outside the removable folder.  ``rm`` + recreate must not mint a
+        # fresh lock inode while a stale fit still owns the old one.
+        fit_lock_key = hashlib.sha256(
+            f"{folder_path.resolve(strict=False)}\0{target_path.name}".encode()
+        ).hexdigest()
+        fit_lock = folder_path.parent / f".saklas-fit-{fit_lock_key}"
+        with artifact_lock(fit_lock):
+            with _locked_manifest(folder_path):
+                with manifold_pair_lock(target_path):
+                    _repair_incomplete_target_locked(folder_path, target_path)
+                _apply_fit_overrides_locked(
+                    folder_path, fit_mode=fit_mode, hyperparams=hyperparams,
+                )
+                mf, nodes_sha, revision, groups, baseline = _authoring_snapshot_locked(
+                    folder_path, target_path,
+                )
             return self._fit_locked(
                 folder_path, sae=sae, sae_revision=sae_revision,
                 layer_indices=layer_indices, force=force,
                 on_progress=on_progress,
+                _snapshot_mf=mf,
+                _snapshot_nodes_sha=nodes_sha,
+                _authoring_revision=revision,
+                _node_groups_snapshot=groups,
+                _baseline_prompts_snapshot=baseline,
             )
 
     def _fit_locked(
@@ -527,6 +788,12 @@ class ManifoldExtractionPipeline:
         _prepared_identity: tuple[Any, ...] | None = None,
         _model_fingerprint: str | None = None,
         _verified_cache_miss: bool = False,
+        _snapshot_mf: Any | None = None,
+        _snapshot_nodes_sha: str | None = None,
+        _authoring_revision: str | None = None,
+        _node_groups_snapshot: list[tuple[str, list[str]]] | None = None,
+        _baseline_prompts_snapshot: list[str | list[dict[str, str]]] | None = None,
+        _release_capture_lock: Callable[[], None] | None = None,
     ):
         """Fit (or load from cache) a manifold for the session's model.
 
@@ -560,10 +827,8 @@ class ManifoldExtractionPipeline:
             fit_layer_subspace,
             fit_sigma_field,
             invert_parameterization,
-            load_manifold,
             neutral_layout_coord,
             prepare_rbf_fit_plan,
-            save_manifold,
             subspace_share,
         )
         from saklas.core.vectors import compute_dls_axes
@@ -580,32 +845,11 @@ class ManifoldExtractionPipeline:
         if sae_revision is not None and sae is None:
             raise ValueError("sae_revision requires an SAE release")
         fit_started = time.perf_counter()
-        mf = ManifoldFolder.load(
-            pathlib.Path(folder), verify_manifest=False,
+        mf = (
+            _snapshot_mf if _snapshot_mf is not None
+            else ManifoldFolder.load(pathlib.Path(folder), verify_manifest=False)
         )
-        if mf.template_ref is not None:
-            from saklas.io.manifold_authoring import _write_node_corpus
-            from saklas.io.templates import resolve_template
-
-            tmpl = resolve_template(mf.template_ref)
-            expected_corpora = tmpl.node_corpora()
-            current_corpora = dict(mf.node_groups())
-            if current_corpora != expected_corpora:
-                _write_node_corpus(
-                    pathlib.Path(folder),
-                    [
-                        {"label": label, "statements": statements}
-                        for label, statements in expected_corpora.items()
-                    ],
-                )
-                mf.node_labels = list(expected_corpora)
-                mf.node_roles = [None] * len(mf.node_labels)
-                mf.node_kinds = [None] * len(mf.node_labels)
-                mf.write_metadata()
-                mf = ManifoldFolder.load(
-                    pathlib.Path(folder), verify_manifest=False,
-                )
-        nodes_sha = mf.nodes_sha256()
+        nodes_sha = _snapshot_nodes_sha or mf.nodes_sha256()
         model = self._handle.model
         layers = self._handle.layers
         n_layers = len(layers)
@@ -684,6 +928,8 @@ class ManifoldExtractionPipeline:
             if _prepared_identity is not None
             else prepare_manifold_capture_identity(
                 self._handle, mf, model_fingerprint,
+                node_groups_snapshot=_node_groups_snapshot,
+                baseline_prompts_snapshot=_baseline_prompts_snapshot,
             )
         )
         (
@@ -707,71 +953,83 @@ class ManifoldExtractionPipeline:
         # reconstructed through and does not ride the filename, so it is
         # checked here or a stale tensor is served.
         sidecar_path = tensor_path.with_suffix(".json")
-        target_integrity_ok = False
-        if not _verified_cache_miss:
-            target_integrity_ok = (
-                not mf.files and not tensor_path.exists() and not sidecar_path.exists()
-            )
-            expected_target_files = {
-                name: mf.files[name]
-                for name in (tensor_path.name, sidecar_path.name)
-                if name in mf.files
-            }
-            if len(expected_target_files) == 2:
-                from saklas.io.packs import verify_integrity
-
-                target_integrity_ok, _bad = verify_integrity(
-                    pathlib.Path(folder), expected_target_files,
-                )
         cached_revision = (
             sae_revision if isinstance(sae, str)
             else sae_backend.revision if sae_backend is not None
             else None
         )
-        if (
-            not force and target_integrity_ok
-            and tensor_path.exists() and sidecar_path.exists()
-        ):
-            try:
-                sc = ManifoldSidecar.load(sidecar_path)
-            except (KeyError, ValueError):
-                sc = None
-            if (
-                sc is not None
-                and sc.nodes_sha256 == nodes_sha
-                and sc.sae_release == sae_release
-                and (
-                    sae_release is None
-                    or (
-                        sae_fingerprint is not None
-                        and sc.sae_fingerprint == sae_fingerprint
+        cached_manifold: Manifold | None = None
+        if not force and not _verified_cache_miss:
+            from saklas.core.manifold import _load_manifold_locked
+            from saklas.io.manifold_folder import manifold_pair_lock
+            from saklas.io.packs import verify_integrity
+
+            # Clear/rm/refresh take the folder lock and then this same stable
+            # pair lock.  The fast path deliberately takes only the pair lock:
+            # it proves the *current* manifest pair, reads the sidecar, and
+            # loads the tensor in one transaction, then releases it before the
+            # authoring-CAS check takes the folder lock.  This avoids both the
+            # old proof->load deletion window and a folder/pair lock inversion.
+            with manifold_pair_lock(tensor_path):
+                try:
+                    with open(pathlib.Path(folder) / "manifold.json") as handle:
+                        current_manifest = json.load(handle)
+                    current_files = current_manifest.get("files", {})
+                    expected_target_files = {
+                        name: current_files[name]
+                        for name in (tensor_path.name, sidecar_path.name)
+                        if isinstance(current_files, dict) and name in current_files
+                    }
+                    pair_ok = (
+                        len(expected_target_files) == 2
+                        and tensor_path.exists()
+                        and sidecar_path.exists()
+                        and verify_integrity(
+                            pathlib.Path(folder), expected_target_files,
+                        )[0]
                     )
-                )
-                and (
-                    sc.sae_revision == cached_revision
-                    if cached_revision is not None or sae_release is None
-                    else True
-                )
-                and sc.model_fingerprint == model_fingerprint
-                and sc.capture_sha256 == capture_sha
-                and sc.fit_policy_version == MANIFOLD_FIT_POLICY_VERSION
-                and (
-                    sc.fitted_layers == requested_fit_layers
-                    if sae_release is None or layer_indices is not None
-                    else sc.sae_full_coverage
-                )
-            ):
-                _progress(f"Loaded cached manifold '{mf.name}'.")
-                # The folder lock plus the targeted pair proof and sidecar
-                # identity checks above already establish this exact load.
-                # Avoid repeating manifest/node-policy validation in the
-                # generic public loader.
-                manifold = load_manifold(tensor_path, verify_manifest=False)
-                self._events.emit(ManifoldExtracted(
-                    name=mf.name, manifold=manifold,
-                    metadata=dict(manifold.metadata),
-                ))
-                return manifold
+                    sc = ManifoldSidecar.load(sidecar_path) if pair_ok else None
+                except (OSError, json.JSONDecodeError, KeyError, ValueError):
+                    sc = None
+                if (
+                    sc is not None
+                    and sc.nodes_sha256 == nodes_sha
+                    and sc.sae_release == sae_release
+                    and (
+                        sae_release is None
+                        or (
+                            sae_fingerprint is not None
+                            and sc.sae_fingerprint == sae_fingerprint
+                        )
+                    )
+                    and (
+                        sc.sae_revision == cached_revision
+                        if cached_revision is not None or sae_release is None
+                        else True
+                    )
+                    and sc.model_fingerprint == model_fingerprint
+                    and sc.capture_sha256 == capture_sha
+                    and sc.fit_policy_version == MANIFOLD_FIT_POLICY_VERSION
+                    and (
+                        sc.fitted_layers == requested_fit_layers
+                        if sae_release is None or layer_indices is not None
+                        else sc.sae_full_coverage
+                    )
+                ):
+                    cached_manifold = _load_manifold_locked(
+                        tensor_path, verify_manifest=False,
+                    )
+        if cached_manifold is not None:
+            _assert_authoring_revision(
+                pathlib.Path(folder), tensor_path,
+                _authoring_revision or nodes_sha,
+            )
+            _progress(f"Loaded cached manifold '{mf.name}'.")
+            self._events.emit(ManifoldExtracted(
+                name=mf.name, manifold=cached_manifold,
+                metadata=dict(cached_manifold.metadata),
+            ))
+            return cached_manifold
 
         # SAE coverage — fail-fast.  Validate the fit-layer set here, before
         # the expensive per-node centroid pooling, so an SAE release that
@@ -800,20 +1058,27 @@ class ManifoldExtractionPipeline:
             feature_space = "raw"
 
         # Capture payloads are shared per model and token identity, not per
-        # manifold folder.  Re-enter the fit once while holding that logical
-        # capture-stem lock so the centroid/row/meta snapshot is read, topped
-        # up, and published as one transaction across otherwise independent
-        # manifold fits.  Passing an already-resolved SAE backend avoids a
-        # second registry resolution on this internal re-entry.
+        # manifold folder. Re-enter once with an explicitly releasable stem
+        # transaction: cache read/top-up/publish is exclusive, then downstream
+        # fitting runs under a process lease that prune/GC observes. Passing an
+        # already-resolved SAE backend avoids a second registry resolution.
         if capture_sha is not None and not _capture_lock_held:
-            from saklas.io.atomic import artifact_lock
+            from saklas.io.atomic import (
+                ReleasableArtifactLock,
+                artifact_process_lease,
+            )
 
             capture_lock_stem = (
                 model_dir(self._handle.model_id)
                 / "manifold_capture"
                 / capture_sha
             )
-            with artifact_lock(capture_lock_stem):
+            transaction = ReleasableArtifactLock(capture_lock_stem).acquire()
+            lease_context = artifact_process_lease(capture_lock_stem)
+            lease_entered = False
+            try:
+                lease_context.__enter__()
+                lease_entered = True
                 manifold = self._fit_locked(
                     folder,
                     sae=(sae_backend if isinstance(sae, str) else sae),
@@ -825,7 +1090,23 @@ class ManifoldExtractionPipeline:
                     _prepared_identity=prepared_identity,
                     _model_fingerprint=model_fingerprint,
                     _verified_cache_miss=True,
+                    _snapshot_mf=mf,
+                    _snapshot_nodes_sha=nodes_sha,
+                    _authoring_revision=_authoring_revision,
+                    _node_groups_snapshot=_node_groups_snapshot,
+                    _baseline_prompts_snapshot=_baseline_prompts_snapshot,
+                    _release_capture_lock=transaction.release,
                 )
+            finally:
+                # The inner cache stage normally releases early. Reacquire before
+                # removing the lease marker so creation/removal and prune's live-
+                # lease decision are all ordered by the same stem transaction.
+                transaction.acquire()
+                try:
+                    if lease_entered:
+                        lease_context.__exit__(None, None, None)
+                finally:
+                    transaction.release()
             # Eviction must run after this stem transaction is fully complete.
             # The pruner takes victim locks one at a time; calling it while the
             # current stem were held would permit cross-stem lock inversion.
@@ -885,7 +1166,10 @@ class ManifoldExtractionPipeline:
         cached_row_shapes: dict[str, object] = {}
         cached_row_dtypes: dict[str, object] = {}
         cached_row_digests: dict[str, object] = {}
-        if not force and cache_meta is not None and cache_meta.exists():
+        # Always read a valid v4 pointer, including on force.  Force invalidates
+        # only the selected fit layers; unselected immutable shards remain part
+        # of the durable union and must not be silently unlinked by a scoped fit.
+        if cache_meta is not None and cache_meta.exists():
             try:
                 from saklas.core.manifold import ActivationRowStore
                 from saklas.io.packs import verify_integrity
@@ -939,6 +1223,11 @@ class ManifoldExtractionPipeline:
                 if not row_layers <= centroid_layers:
                     raise ValueError("row-cache layers exceed centroid coverage")
 
+                if force:
+                    forced = set(fit_layers)
+                    centroid_layers.difference_update(forced)
+                    row_layers.difference_update(forced)
+
                 # Verify and load only the layers this fit can consume.  A bad
                 # selected shard invalidates that layer, not unrelated durable
                 # coverage, so the capture pass tops up exactly the damage.
@@ -970,7 +1259,7 @@ class ManifoldExtractionPipeline:
                         centroid_layers.discard(idx)
                         row_layers.discard(idx)
 
-                if row_layers and retain_node_rows and mf.fit_mode != "auto":
+                if row_layers and retain_node_rows:
                     selected_row_layers = sorted(row_layers & set(fit_layers))
                     if selected_row_layers:
                         valid_stores: list[ActivationRowStore] = []
@@ -1186,6 +1475,13 @@ class ManifoldExtractionPipeline:
                 # failed fit; next run simply captures again.
                 _progress(f"Activation capture cache write skipped: {exc}")
 
+        # Centroid tensors are resident and row payloads are protected by the
+        # process lease from this point onward.  Hand the short cache transaction
+        # lock back before topology/PCA/RBF/covariance work; prune/GC observes the
+        # lease until this fit returns (including exceptional returns).
+        if _release_capture_lock is not None:
+            _release_capture_lock()
+
         # 1b. Monopolar (concept-vs-neutral).  A 1-node ``pca`` folder has no
         #     second pole to span an affine subspace, so it can only mean one
         #     thing: the concept against the **neutral baseline**.  Its steering
@@ -1278,9 +1574,12 @@ class ManifoldExtractionPipeline:
                 metadata["node_roles"] = list(node_roles)
             if any_kind:
                 metadata["node_kinds"] = list(node_kinds)
-            save_manifold(manifold, tensor_path, metadata)
+            _publish_fit_if_current(
+                pathlib.Path(folder),
+                expected_revision=_authoring_revision or nodes_sha,
+                manifold=manifold, tensor_path=tensor_path, metadata=metadata,
+            )
             manifold.metadata.update(metadata)
-            mf.update_file_hashes(tensor_path, tensor_path.with_suffix(".json"))
             self._events.emit(ManifoldExtracted(
                 name=mf.name, manifold=manifold, metadata=metadata,
             ))
@@ -1755,7 +2054,12 @@ class ManifoldExtractionPipeline:
                 stores: list[ActivationRowStore] = []
                 if retained_rows is not None:
                     stores.append(retained_rows)
-                selected_cached_layers = sorted(row_layers & set(fit_layers))
+                already_loaded = {
+                    idx for store in stores for idx in store.layer_indices
+                }
+                selected_cached_layers = sorted(
+                    (row_layers & set(fit_layers)) - already_loaded
+                )
                 if selected_cached_layers and cache_stem is not None:
                     for idx in selected_cached_layers:
                         path = capture_dir / cached_row_files[str(idx)]
@@ -1822,42 +2126,13 @@ class ManifoldExtractionPipeline:
                 and cache_meta is not None
                 and cache_meta.exists()
             ):
-                from saklas.io.atomic import write_json_atomic
-
                 try:
-                    newly_durable = sorted(
-                        set(retained_rows.layer_indices) - row_layers
+                    _publish_deferred_row_shards(
+                        capture_dir, cache_stem, cache_meta, retained_rows,
+                        node_sizes,
+                        row_layers, cached_row_files, cached_row_shapes,
+                        cached_row_dtypes, cached_row_digests,
                     )
-                    for idx in newly_durable:
-                        row_path = _row_shard_path(capture_dir, cache_stem, idx)
-                        rows = retained_rows.flat_rows(idx)
-                        _save_safetensors_atomic({f"layer_{idx}": rows}, row_path)
-                        cached_row_files[str(idx)] = row_path.name
-                        cached_row_shapes[str(idx)] = list(rows.shape)
-                        cached_row_dtypes[str(idx)] = str(rows.dtype)
-                        cached_row_digests[str(idx)] = _tensor_sha256(rows)
-                    row_layers.update(newly_durable)
-                    with open(cache_meta) as handle:
-                        cache_payload = json.load(handle)
-                    durable_layers = sorted(row_layers)
-                    cache_payload["row_layers"] = durable_layers
-                    cache_payload["row_files"] = {
-                        str(idx): cached_row_files[str(idx)]
-                        for idx in durable_layers
-                    }
-                    cache_payload["row_shapes"] = {
-                        str(idx): cached_row_shapes[str(idx)]
-                        for idx in durable_layers
-                    }
-                    cache_payload["row_dtypes"] = {
-                        str(idx): cached_row_dtypes[str(idx)]
-                        for idx in durable_layers
-                    }
-                    cache_payload["row_tensor_sha256"] = {
-                        str(idx): cached_row_digests[str(idx)]
-                        for idx in durable_layers
-                    }
-                    write_json_atomic(cache_meta, cache_payload)
                 except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
                     _progress(f"Deferred activation-row cache write skipped: {exc}")
             _progress(
@@ -1971,9 +2246,12 @@ class ManifoldExtractionPipeline:
             # ``node_labels`` order; absent when no node carries a kind.
             metadata["node_kinds"] = list(node_kinds)
         metadata.update(discover_metadata)
-        save_manifold(manifold, tensor_path, metadata)
+        _publish_fit_if_current(
+            pathlib.Path(folder),
+            expected_revision=_authoring_revision or nodes_sha,
+            manifold=manifold, tensor_path=tensor_path, metadata=metadata,
+        )
         manifold.metadata.update(metadata)
-        mf.update_file_hashes(tensor_path, tensor_path.with_suffix(".json"))
 
         self._events.emit(ManifoldExtracted(
             name=mf.name, manifold=manifold, metadata=metadata,

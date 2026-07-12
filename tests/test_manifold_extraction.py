@@ -230,6 +230,48 @@ def test_templated_fit_rematerializes_value_and_assistant_edits() -> None:
     assert dict(mf.node_groups())["wednesday"] == ["Wednesday answers now"]
 
 
+def test_template_mutation_between_resolve_and_hash_cannot_publish_stale_inputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from saklas.core.extraction import ManifoldAuthoringChangedError
+    from saklas.io.manifolds import create_manifold_from_template
+    from saklas.io.templates import TemplateFolder, create_template_folder
+
+    create_template_folder(
+        "local", "racy-template", slot="[X]", values=["A", "B", "C"],
+        contexts=[{
+            "turns": [{"role": "user", "content": "choose"}],
+            "assistant": "[X] old",
+        }],
+    )
+    folder = create_manifold_from_template(
+        "local", "racy-fit", "", template_ref="local/racy-template",
+        fit_mode="pca",
+    )
+    real_sha = TemplateFolder.sha256
+    mutated = False
+
+    def _mutating_sha(self: TemplateFolder) -> str:
+        nonlocal mutated
+        digest = real_sha(self)
+        if not mutated:
+            mutated = True
+            create_template_folder(
+                "local", "racy-template", slot="[X]",
+                values=["A", "B", "C"],
+                contexts=[{
+                    "turns": [{"role": "user", "content": "choose"}],
+                    "assistant": "[X] new",
+                }],
+                force=True,
+            )
+        return digest
+
+    monkeypatch.setattr(TemplateFolder, "sha256", _mutating_sha)
+    with pytest.raises(ManifoldAuthoringChangedError):
+        ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder)
+
+
 def test_fit_can_restrict_transformer_layers(tmp_path: Path) -> None:
     folder = _author_manifold(tmp_path)
     pipe = ManifoldExtractionPipeline(_Handle(), EventBus())
@@ -488,6 +530,268 @@ def test_fit_overrides_share_manifest_transaction_without_lost_update(
     assert final.node_kinds[0] == "concrete"
 
 
+def test_distinct_model_targets_compute_concurrently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    folder = _author_manifold(tmp_path)
+    barrier = threading.Barrier(2)
+    entered: list[str] = []
+    errors: list[BaseException] = []
+
+    def _overlap(
+        self: ManifoldExtractionPipeline, _folder: Path, **_kwargs: Any,
+    ) -> object:
+        entered.append(self._handle.model_id)  # pyright: ignore[reportPrivateUsage]
+        barrier.wait(timeout=5)
+        return object()
+
+    monkeypatch.setattr(ManifoldExtractionPipeline, "_fit_locked", _overlap)
+    handles = [_Handle(), _Handle()]
+    handles[1].model_id = "other-model"
+
+    def _run(handle: _Handle) -> None:
+        try:
+            ManifoldExtractionPipeline(handle, EventBus()).fit(folder)
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_run, args=(handle,)) for handle in handles]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+    assert errors == []
+    assert sorted(entered) == ["other-model", "stub-model"]
+
+
+def test_target_fit_lock_name_is_bounded_for_long_valid_inputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    folder = _author_manifold(tmp_path / ("f" * 64))
+    handle = _Handle()
+    handle.model_id = "org/" + ("model" * 30)
+    monkeypatch.setattr(
+        ManifoldExtractionPipeline, "_fit_locked",
+        lambda *_args, **_kwargs: object(),
+    )
+    ManifoldExtractionPipeline(handle, EventBus()).fit(folder)
+
+
+def test_reader_stays_available_and_authoring_cas_rejects_stale_fit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import saklas.core.manifold as manifold_module
+    from saklas.core.extraction import ManifoldAuthoringChangedError
+    from saklas.core.manifold import load_manifold
+    from saklas.io.paths import tensor_filename
+
+    folder = _author_manifold(tmp_path)
+    pipe = ManifoldExtractionPipeline(_Handle(), EventBus())
+    pipe.fit(folder)
+    target = folder / tensor_filename("stub-model")
+    entered = threading.Event()
+    release = threading.Event()
+    real_fit = manifold_module.fit_layer_subspace
+    first = True
+
+    def _blocking_fit(*args: Any, **kwargs: Any) -> Any:
+        nonlocal first
+        if first:
+            first = False
+            entered.set()
+            assert release.wait(timeout=5)
+        return real_fit(*args, **kwargs)
+
+    monkeypatch.setattr(manifold_module, "fit_layer_subspace", _blocking_fit)
+    errors: list[BaseException] = []
+
+    def _run() -> None:
+        try:
+            pipe.fit(folder, force=True)
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    thread = threading.Thread(target=_run)
+    thread.start()
+    assert entered.wait(timeout=5)
+    assert load_manifold(target).name == "mood"
+    node_path = folder / "nodes" / "00_calm.json"
+    node_path.write_text(json.dumps(["calm changed"] * 3))
+    release.set()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], ManifoldAuthoringChangedError)
+
+
+def test_interrupted_pair_publish_is_retryable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import saklas.core.manifold as manifold_module
+
+    folder = _author_manifold(tmp_path)
+    pipe = ManifoldExtractionPipeline(_Handle(), EventBus())
+    real_replace = manifold_module._replace_manifold_file
+    failed = False
+
+    def _fail_tensor_once(source: Path, target: Path) -> None:
+        nonlocal failed
+        if target.suffix == ".safetensors" and not failed:
+            failed = True
+            raise OSError("injected tensor commit failure")
+        real_replace(source, target)
+
+    monkeypatch.setattr(
+        manifold_module, "_replace_manifold_file", _fail_tensor_once,
+    )
+    with pytest.raises(OSError, match="injected"):
+        pipe.fit(folder)
+    assert not (folder / "stub-model.safetensors").exists()
+    assert (folder / "stub-model.json").exists()
+
+    monkeypatch.setattr(
+        manifold_module, "_replace_manifold_file", real_replace,
+    )
+    fitted = pipe.fit(folder)
+    assert fitted.name == "mood"
+    assert (folder / "stub-model.safetensors").exists()
+
+
+def test_interrupted_existing_pair_replacement_self_repairs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import saklas.core.manifold as manifold_module
+    from saklas.core.manifold import load_manifold
+    from saklas.io.paths import tensor_filename
+
+    folder = _author_manifold(tmp_path)
+    pipe = ManifoldExtractionPipeline(_Handle(), EventBus())
+    pipe.fit(folder)
+    target = folder / tensor_filename("stub-model")
+    real_replace = manifold_module._replace_manifold_file
+    failed = False
+
+    def _fail_between_pair_replacements(source: Path, dest: Path) -> None:
+        nonlocal failed
+        if dest == target and not failed:
+            failed = True
+            raise OSError("injected replacement split")
+        real_replace(source, dest)
+
+    monkeypatch.setattr(
+        manifold_module, "_replace_manifold_file", _fail_between_pair_replacements,
+    )
+    with pytest.raises(OSError, match="replacement split"):
+        pipe.fit(folder, force=True)
+    monkeypatch.setattr(manifold_module, "_replace_manifold_file", real_replace)
+    pipe.fit(folder)
+    assert load_manifold(target).name == "mood"
+    ManifoldFolder.load(folder)
+
+
+def test_pair_committed_before_manifest_failure_self_repairs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from saklas.core.manifold import load_manifold
+    from saklas.io.paths import tensor_filename
+
+    folder = _author_manifold(tmp_path)
+    pipe = ManifoldExtractionPipeline(_Handle(), EventBus())
+    pipe.fit(folder)
+    target = folder / tensor_filename("stub-model")
+    real_update = ManifoldFolder.update_file_hashes
+    failed = False
+
+    def _fail_manifest_once(self: ManifoldFolder, *paths: Path) -> None:
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise OSError("injected manifest commit failure")
+        real_update(self, *paths)
+
+    monkeypatch.setattr(ManifoldFolder, "update_file_hashes", _fail_manifest_once)
+    with pytest.raises(OSError, match="manifest commit"):
+        pipe.fit(folder, force=True)
+    monkeypatch.setattr(ManifoldFolder, "update_file_hashes", real_update)
+    pipe.fit(folder)
+    assert load_manifold(target).name == "mood"
+    ManifoldFolder.load(folder)
+
+
+def test_clear_invalidates_only_selected_inflight_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from saklas.core.extraction import (
+        ManifoldAuthoringChangedError,
+        _authoring_snapshot_locked,
+        _publish_fit_if_current,
+    )
+    from saklas.io import manifold_lifecycle
+    from saklas.io.manifold_folder import _locked_manifest
+    from saklas.io.paths import tensor_filename
+
+    folder = _author_manifold(tmp_path)
+    handle_a = _Handle()
+    fit_a = ManifoldExtractionPipeline(handle_a, EventBus()).fit(folder)
+    handle_b = _Handle()
+    handle_b.model_id = "other-model"
+    fit_b = ManifoldExtractionPipeline(handle_b, EventBus()).fit(folder)
+    target_a = folder / tensor_filename(handle_a.model_id)
+    target_b = folder / tensor_filename(handle_b.model_id)
+    with _locked_manifest(folder):
+        _m, _n, revision_a, _g, _b = _authoring_snapshot_locked(
+            folder, target_a,
+        )
+        _m, _n, revision_b, _g, _b = _authoring_snapshot_locked(
+            folder, target_b,
+        )
+
+    monkeypatch.setattr(manifold_lifecycle, "manifold_dir", lambda *_: folder)
+    manifold_lifecycle.clear_manifold_tensors(
+        "local", "mood", handle_a.model_id, variant="raw",
+    )
+    with pytest.raises(ManifoldAuthoringChangedError):
+        _publish_fit_if_current(
+            folder, expected_revision=revision_a, manifold=fit_a,
+            tensor_path=target_a, metadata=dict(fit_a.metadata),
+        )
+    _publish_fit_if_current(
+        folder, expected_revision=revision_b, manifold=fit_b,
+        tensor_path=target_b, metadata=dict(fit_b.metadata),
+    )
+    assert not target_a.exists()
+    assert target_b.exists()
+
+
+def test_removed_and_recreated_folder_rejects_stale_publication(
+    tmp_path: Path,
+) -> None:
+    from saklas.core.extraction import (
+        ManifoldAuthoringChangedError,
+        _authoring_snapshot_locked,
+        _publish_fit_if_current,
+    )
+    from saklas.io.manifold_folder import _locked_manifest
+    from saklas.io.paths import tensor_filename
+
+    folder = _author_manifold(tmp_path)
+    fitted = ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder)
+    target = folder / tensor_filename("stub-model")
+    with _locked_manifest(folder):
+        _m, _n, revision, _g, _b = _authoring_snapshot_locked(folder, target)
+    import shutil
+
+    shutil.rmtree(folder)
+    replacement = _author_manifold(tmp_path)
+    assert replacement == folder
+    with pytest.raises(ManifoldAuthoringChangedError):
+        _publish_fit_if_current(
+            folder, expected_revision=revision, manifold=fitted,
+            tensor_path=target, metadata=dict(fitted.metadata),
+        )
+    assert not target.exists()
+
+
 def test_disjoint_layer_top_up_preserves_existing_row_cache(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -542,6 +846,64 @@ def test_disjoint_layer_top_up_preserves_existing_row_cache(
     for idx, row_path in enumerate(row_paths):
         with safe_open(str(row_path), framework="pt", device="cpu") as tensors:
             assert set(tensors.keys()) == {f"layer_{idx}"}
+
+
+def test_concurrent_deferred_row_topups_merge_latest_pointer(
+    tmp_path: Path,
+) -> None:
+    from saklas.core.extraction import _publish_deferred_row_shards
+    from saklas.core.manifold import ActivationRowStore
+
+    stem = "c" * 64
+    meta_path = tmp_path / f"{stem}.json"
+    meta_path.write_text(json.dumps({
+        "format_version": 4,
+        "capture_sha256": stem,
+        "node_sizes": [2],
+        "centroid_layers": [0, 1],
+        "row_layers": [],
+        "centroid_files": {},
+        "row_files": {},
+        "centroid_shapes": {},
+        "row_shapes": {},
+        "row_dtypes": {},
+        "row_tensor_sha256": {},
+        "files": {},
+    }))
+    stores: list[ActivationRowStore] = []
+    for layer in (0, 1):
+        store = ActivationRowStore([2])
+        store.write(
+            layer, torch.arange(2),
+            torch.full((2, 3), float(layer + 1)),
+        )
+        stores.append(store)
+    barrier = threading.Barrier(2)
+    errors: list[BaseException] = []
+
+    def _topup(store: ActivationRowStore) -> None:
+        try:
+            barrier.wait(timeout=5)
+            _publish_deferred_row_shards(
+                tmp_path, stem, meta_path, store, [2],
+                set(), {}, {}, {}, {},
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_topup, args=(store,)) for store in stores]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+    for store in stores:
+        store.close()
+
+    assert errors == []
+    payload = json.loads(meta_path.read_text())
+    assert payload["row_layers"] == [0, 1]
+    assert set(payload["row_files"]) == {"0", "1"}
+    assert all((tmp_path / name).exists() for name in payload["row_files"].values())
 
 
 def test_v3_monolith_is_replaced_safely_by_v4_layer_shards(
@@ -903,6 +1265,113 @@ def test_capture_cache_prune_waits_for_active_victim_transaction(
     assert keep.exists()
 
 
+def test_capture_process_lease_survives_payload_publish_and_blocks_prune(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from saklas.core.extraction import (
+        _capture_group_paths,
+        _prune_manifold_capture_cache,
+    )
+    from saklas.io.atomic import (
+        artifact_has_live_lease,
+        artifact_process_lease,
+    )
+
+    victim_stem = "a" * 64
+    keep_stem = "b" * 64
+    victim = tmp_path / f"{victim_stem}.rows.layer_0.safetensors"
+    keep = tmp_path / f"{keep_stem}.centroids.layer_0.safetensors"
+    victim.write_bytes(b"leased")
+    keep.write_bytes(b"current")
+    monkeypatch.setenv("SAKLAS_MANIFOLD_CAPTURE_CACHE_GB", "0.000000001")
+
+    with artifact_process_lease(tmp_path / victim_stem):
+        assert artifact_has_live_lease(tmp_path / victim_stem)
+        assert all(".lease." not in path.name for path in _capture_group_paths(
+            tmp_path, victim_stem,
+        ))
+        _prune_manifold_capture_cache(tmp_path, keep_stem=keep_stem)
+        assert victim.exists()
+    assert not artifact_has_live_lease(tmp_path / victim_stem)
+    _prune_manifold_capture_cache(tmp_path, keep_stem=keep_stem)
+    assert not victim.exists()
+
+
+def test_capture_lease_enter_failure_releases_transaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from saklas.io import atomic
+
+    folder = _author_manifold(tmp_path)
+    real_lock_class = atomic.ReleasableArtifactLock
+    paths: list[Path] = []
+
+    def _track(path: Path) -> atomic.ReleasableArtifactLock:
+        paths.append(Path(path))
+        return real_lock_class(path)
+
+    class _BrokenLease:
+        def __enter__(self) -> None:
+            raise OSError("injected lease marker failure")
+
+        def __exit__(self, *_args: object) -> None:
+            raise AssertionError("unentered lease must not exit")
+
+    monkeypatch.setattr(atomic, "ReleasableArtifactLock", _track)
+    monkeypatch.setattr(atomic, "artifact_process_lease", lambda _path: _BrokenLease())
+    with pytest.raises(OSError, match="lease marker"):
+        ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder)
+    acquired = threading.Event()
+
+    def _acquire() -> None:
+        with atomic.artifact_lock(paths[0]):
+            acquired.set()
+
+    thread = threading.Thread(target=_acquire)
+    thread.start()
+    assert acquired.wait(timeout=5)
+    thread.join(timeout=5)
+
+
+def test_capture_lease_marker_removed_while_transaction_held(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from saklas.io import atomic
+
+    folder = _author_manifold(tmp_path)
+    real_lock_class = atomic.ReleasableArtifactLock
+    active: list[Any] = []
+    exit_states: list[bool] = []
+
+    class _TrackedLock:
+        def __init__(self, path: Path) -> None:
+            self.inner = real_lock_class(path)
+            self.held = False
+            active.append(self)
+
+        def acquire(self) -> Any:
+            self.inner.acquire()
+            self.held = True
+            return self
+
+        def release(self) -> None:
+            self.inner.release()
+            self.held = False
+
+    class _Lease:
+        def __enter__(self) -> None:
+            return None
+
+        def __exit__(self, *_args: object) -> None:
+            exit_states.append(bool(active[-1].held))
+
+    monkeypatch.setattr(atomic, "ReleasableArtifactLock", _TrackedLock)
+    monkeypatch.setattr(atomic, "artifact_process_lease", lambda _path: _Lease())
+    ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder)
+    assert exit_states == [True]
+    assert active[-1].held is False
+
+
 def test_tampered_activation_cache_recaptures(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -957,6 +1426,40 @@ def test_fit_force_bypasses_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     manifold = pipe.fit(folder, force=True)  # corpus unchanged, but forced
     assert calls["n"] > 0        # cache bypassed, forward passes re-run
     assert manifold.name == "mood"
+
+
+def test_forced_subset_preserves_unselected_capture_shards(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from saklas.io.paths import model_dir
+
+    folder = _author_manifold(tmp_path)
+    pipe = ManifoldExtractionPipeline(_Handle(), EventBus())
+    pipe.fit(folder)
+    capture_dir = model_dir("stub-model") / "manifold_capture"
+    before = {
+        path.name: (path.stat().st_ino, path.stat().st_mtime_ns)
+        for path in capture_dir.glob("*.layer_*.safetensors")
+        if ".layer_1." not in path.name
+    }
+    scopes: list[list[int]] = []
+
+    def _counting(*args: Any, **kwargs: Any) -> Any:
+        scopes.append(list(kwargs["layer_indices"]))
+        return _stub_encoder_batch(*args, **kwargs)
+
+    monkeypatch.setattr(V, "_encode_and_capture_all_batch", _counting)
+    pipe.fit(folder, layer_indices=[1], force=True)
+    assert scopes == [[1]]
+    assert before == {
+        path.name: (path.stat().st_ino, path.stat().st_mtime_ns)
+        for path in capture_dir.glob("*.layer_*.safetensors")
+        if ".layer_1." not in path.name
+    }
+
+    scopes.clear()
+    pipe.fit(folder)
+    assert scopes == []
 
 
 def test_curved_raw_fit_reuses_retained_rows_for_sigma_field(

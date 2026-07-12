@@ -1546,13 +1546,6 @@ def _run_manifold_generate(args: argparse.Namespace) -> None:
         namespace, name = name.split("/", 1)
 
     folder = manifold_dir(namespace, name)
-    # ``-f/--force`` is a clean slate; the default *resumes* -- fills any
-    # missing node corpora and appends concepts new to the roster, so a run
-    # killed half-way picks up where it left off and adding a node is a re-run.
-    if args.force and (folder / "manifold.json").exists():
-        import shutil
-        shutil.rmtree(folder)
-
     # ``--role-per-node``: the concept slug doubles as that node's assistant-role
     # substitution -- a persona manifold pooled in role-baselined space (the
     # explicit role overrides the kind-derived elicitation label at both
@@ -1569,6 +1562,7 @@ def _run_manifold_generate(args: argparse.Namespace) -> None:
             folder, name, args.description,
             fit_mode="pca", labels=list(args.concepts),
             node_roles=node_roles, node_kinds=node_kinds,
+            force=args.force,
         )
     except ManifoldFormatError as e:
         print(f"manifold generate failed: {e}", file=sys.stderr)
@@ -2423,6 +2417,7 @@ def _try_lens_fit_noop_preflight(
         lens_paths,
         lens_payloads_match,
         load_lens_sidecar,
+        remove_subsumed_lens_checkpoint,
         resolved_default_lens_corpus_spec,
     )
 
@@ -2466,6 +2461,9 @@ def _try_lens_fit_noop_preflight(
     _ts_path, sidecar_path = lens_paths(args.model)
     if not lens_payloads_match(args.model, sidecar):
         return False
+    remove_subsumed_lens_checkpoint(
+        args.model, verified_final_sidecar=sidecar,
+    )
     size_mb = lens_artifact_size(args.model, sidecar) / 1024**2
     source_layers = [int(layer) for layer in sidecar["source_layers"]]
     print(

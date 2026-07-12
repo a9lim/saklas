@@ -67,17 +67,27 @@ class _StubSession:
     _score_lens_probes = SaklasSession._score_lens_probes
     _score_lens_gate_scalars = SaklasSession._score_lens_gate_scalars
 
-    def __init__(self) -> None:
-        model = frozen_toy(n_layers=3)
+    def __init__(self, *, n_layers: int = 3) -> None:
+        model = frozen_toy(n_layers=n_layers)
         self._model = model
         self._tokenizer = CharTokenizer()
         self._layers = model.model.layers
         self._device = torch.device("cpu")
         self._profiles: dict[str, Any] = {}
         self._jlens: Any = None
+        self._jlens_identity: Any = None
+        self._generation_jlens: Any = None
+        self._generation_jlens_active = False
         self._live_lens: Any = None
         self._capture: Any = None
+        self._capture_buffers: dict[int, torch.Tensor] = {}
+        self._compiled_clean_eligible = False
+        self._steering_uses_compiled_offsets = False
+        self._steering: Any = None
         self._lens_probes: dict[str, Any] = {}
+        self._live_lens_active_for_generation = True
+        self._live_sae: Any = None
+        self._sae_probes: dict[str, Any] = {}
         self._probe_hash_cache: dict[str, str] = {}
         self._lens_step_stash: Any = None
         self._last_lens_step_readings: Any = None
@@ -216,6 +226,82 @@ def test_fit_jlens_already_done_short_circuits(
         assert torch.equal(first.jacobians[layer], again.jacobians[layer])
 
 
+def test_subset_noop_keeps_full_durable_lens_resident() -> None:
+    s = _StubSession()
+    full = s.fit_jlens(_PROMPTS, source_layers=[0, 1], force=True)
+
+    selected = s.fit_jlens(_PROMPTS, source_layers=[1])
+
+    assert selected.source_layers == [1]
+    assert full.source_layers == [0, 1]
+    assert s._jlens.source_layers == [0, 1]
+    assert s.jlens.source_layers == [0, 1]
+
+
+def test_exact_noop_reaps_checkpoint_left_after_final_publication() -> None:
+    s = _StubSession()
+    full = s.fit_jlens(_PROMPTS, force=True)
+    loaded = load_lens(_MODEL_ID)
+    assert loaded is not None
+    sidecar = loaded[1]
+    save_lens_checkpoint(
+        full, _MODEL_ID, base_n_prompts=0,
+        corpus_spec=str(sidecar["corpus_spec"]),
+        corpus_sha256=str(sidecar["corpus_sha256"]),
+        corpus_hash_kind=str(sidecar["corpus_hash_kind"]),
+        seq_len=int(sidecar["seq_len"]),
+        dim_batch=int(sidecar["dim_batch"]),
+        skip_first=int(sidecar["skip_first_positions"]),
+        model_fingerprint=str(sidecar["model_fingerprint"]),
+    )
+    assert load_lens_checkpoint(_MODEL_ID) is not None
+
+    selected = s.fit_jlens(_PROMPTS)
+
+    assert selected.source_layers == full.source_layers
+    assert load_lens_checkpoint(_MODEL_ID) is None
+
+
+def test_resident_noop_does_not_reap_checkpoint_when_final_payload_corrupt() -> None:
+    s = _StubSession()
+    full = s.fit_jlens(_PROMPTS, force=True)
+    loaded = load_lens(_MODEL_ID)
+    assert loaded is not None
+    sidecar = loaded[1]
+    save_lens_checkpoint(
+        full, _MODEL_ID, base_n_prompts=0,
+        corpus_spec=str(sidecar["corpus_spec"]),
+        corpus_sha256=str(sidecar["corpus_sha256"]),
+        corpus_hash_kind=str(sidecar["corpus_hash_kind"]),
+        seq_len=int(sidecar["seq_len"]),
+        dim_batch=int(sidecar["dim_batch"]),
+        skip_first=int(sidecar["skip_first_positions"]),
+        model_fingerprint=str(sidecar["model_fingerprint"]),
+    )
+    final_tensor, _ = lens_paths(_MODEL_ID)
+    payload = bytearray(final_tensor.read_bytes())
+    payload[-1] ^= 1
+    final_tensor.write_bytes(payload)
+
+    # The resident lens makes the fit a no-op, but it is not proof that the
+    # current on-disk payload is sound enough to discard the recovery point.
+    selected = s.fit_jlens(_PROMPTS)
+
+    assert selected.source_layers == full.source_layers
+    assert load_lens_checkpoint(_MODEL_ID) is not None
+
+
+def test_overlapping_topup_keeps_preserved_extra_layer_resident() -> None:
+    s = _StubSession(n_layers=4)
+    s.fit_jlens(_PROMPTS, source_layers=[0, 1], force=True)
+
+    selected = s.fit_jlens(_PROMPTS, source_layers=[1, 2])
+
+    assert selected.source_layers == [1, 2]
+    assert s._jlens.source_layers == [0, 1, 2]
+    assert s.jlens.source_layers == [0, 1, 2]
+
+
 def test_resident_lens_is_not_reused_after_external_artifact_replacement() -> None:
     corpus_b = [f"replacement corpus prompt {i} with enough content" for i in range(4)]
     session_a = _StubSession()
@@ -263,6 +349,113 @@ def test_jlens_property_refreshes_and_evicts_after_external_lifecycle() -> None:
     assert "jlens/example" not in session_a._profiles
     assert session_a._lens_probes["jlens/example"]["layers"] == []
     assert session_a._live_lens is None
+
+
+def test_generation_boundary_refreshes_external_lens_once() -> None:
+    """A generation snapshots the current pointer before fixing capture layers."""
+    session_a = _StubSession()
+    resident_a = session_a.fit_jlens(_PROMPTS, force=True)
+    session_a._lens_probes["jlens/example"] = {
+        "word": "example", "token_id": 1,
+        "layers": list(resident_a.source_layers),
+    }
+
+    corpus_b = [
+        f"replacement boundary prompt {i} with enough content" for i in range(4)
+    ]
+    disk_b = _StubSession().fit_jlens(corpus_b, force=True)
+
+    class _Capture:
+        def clear(self) -> None:
+            pass
+
+        def attach(self, _layers: Any, _indices: list[int]) -> None:
+            pass
+
+        def set_aggregate_tail(self, _depth: int) -> None:
+            pass
+
+    session_a._capture = _Capture()
+    session_a._capture_buffers = {}
+    session_a._compiled_clean_eligible = False
+    session_a._steering_uses_compiled_offsets = False
+    session_a._steering = SimpleNamespace(all_fast_path=lambda: True)
+    session_a._monitor = SimpleNamespace(
+        probe_names=[],
+        enable_curved_warm=lambda _enabled: None,
+    )
+    session_a._live_sae = None
+    session_a._sae_probes = {}
+
+    SaklasSession._begin_capture(
+        cast(Any, session_a), final_probe_aggregate=True,
+    )
+
+    snap = session_a._generation_jlens
+    assert snap is not None and snap is session_a._jlens
+    assert session_a._generation_jlens_active is True
+    assert any(
+        not torch.equal(resident_a.jacobians[layer], snap.jacobians[layer])
+        for layer in snap.source_layers
+    )
+    for layer in disk_b.source_layers:
+        assert torch.allclose(
+            snap.jacobians[layer], disk_b.jacobians[layer], atol=2e-3,
+        )
+
+    # An external deletion is likewise observed before the next generation,
+    # and the validated missing state is pinned (no per-token retry loop).
+    assert remove_lens(_MODEL_ID)
+    SaklasSession._begin_capture(
+        cast(Any, session_a), final_probe_aggregate=True,
+    )
+    assert session_a._generation_jlens_active is True
+    assert session_a._generation_jlens is None
+    assert session_a._jlens is None
+    assert session_a._lens_probes["jlens/example"]["layers"] == []
+
+
+def test_generation_lens_snapshot_avoids_per_token_disk_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Probe and gate scoring share the boundary snapshot without shard opens."""
+    import saklas.io.lens as lens_io
+
+    session = _StubSession()
+    lens = session.fit_jlens(_PROMPTS, force=True)
+    layers = list(lens.source_layers)
+    session._lens_probes["jlens/a"] = {
+        "word": "a", "token_id": 1, "layers": layers,
+    }
+    session._generation_jlens = lens
+    session._generation_jlens_active = True
+    session._live_lens_active_for_generation = False
+
+    monkeypatch.setattr(
+        lens_io,
+        "load_lens_sidecar",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("per-token lens scoring reopened the disk pointer")
+        ),
+    )
+    assert session.jlens is lens
+    assert session.has_compatible_jlens()
+
+    vocab = int(session._model.lm_head.weight.shape[0])
+    probabilities = torch.softmax(torch.randn(len(layers), vocab), dim=-1)
+    for _ in range(3):
+        readings = session._score_lens_probes(
+            {}, probabilities=probabilities, layers=layers,
+        )
+        assert "jlens/a" in readings
+
+    hidden = {
+        layer: torch.randn(lens.d_model)
+        for layer in layers
+    }
+    session._capture = SimpleNamespace(latest_per_layer=lambda: hidden)
+    for _ in range(3):
+        assert "jlens/a" in session._score_lens_gate_scalars({"jlens/a"})
 
 
 def test_fit_jlens_serializes_complete_cross_session_transaction(

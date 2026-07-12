@@ -91,6 +91,35 @@ _MPS_SYNC_EVERY_PASSES = 4
 #: many output rows per layer on device + host, validate/commit the stripe, and
 #: resume from the first uncommitted row after an OOM.
 _ROW_STRIPE = 256
+#: Maximum fp32 bytes held by one device/host stripe slot.  A row spans every
+#: fitted source layer, so a fixed 256-row allocation grows into GiBs on large
+#: hidden sizes / all-layer fits and can OOM independently of ``dim_batch``.
+#: This is a per-slot budget (CUDA may use two slots for overlap); the active
+#: VJP block remains the hard minimum so one result block always fits.
+_ROW_STRIPE_BYTES_PER_SLOT = 128 * 1024**2
+
+
+def _row_stripe_capacity(
+    d_model: int,
+    n_sources: int,
+    dim_batch: int,
+    *,
+    byte_budget: int = _ROW_STRIPE_BYTES_PER_SLOT,
+) -> int:
+    """Largest bounded stripe that holds at least one complete VJP block."""
+    if d_model <= 0 or n_sources <= 0 or dim_batch <= 0 or byte_budget <= 0:
+        raise ValueError("stripe dimensions and byte_budget must be positive")
+    row_bytes = int(d_model) * int(n_sources) * 4  # fp32 staging
+    budget_rows = max(1, int(byte_budget) // row_bytes)
+    return min(int(d_model), _ROW_STRIPE, max(int(dim_batch), budget_rows))
+
+
+def _smaller_row_stripe_capacity(capacity: int, dim_batch: int) -> int | None:
+    """Next allocation-backoff capacity, or ``None`` at the VJP-block floor."""
+    floor = max(1, int(dim_batch))
+    if int(capacity) <= floor:
+        return None
+    return max(floor, int(capacity) // 2)
 
 
 class JacobianLensError(RuntimeError, SaklasError):
@@ -1268,6 +1297,11 @@ def fit_jacobian_lens(
                             break
                         batch = max(1, batch // 2)
                         active_dim_batch = batch
+                        if _shrink_device_stripe_buffers(state, device, batch):
+                            log.warning(
+                                "jlens: releasing the one-slot staging tier at "
+                                "the reduced dim_batch"
+                            )
                         _empty_device_cache(device)
                         log.warning(
                             "jlens: OOM after row %d — resuming prompt batch "
@@ -1309,6 +1343,11 @@ def fit_jacobian_lens(
                     assert retry_batch is not None
                     batch = retry_batch
                     active_dim_batch = batch
+                    if _shrink_device_stripe_buffers(state, device, batch):
+                        log.warning(
+                            "jlens: releasing the one-slot staging tier at the "
+                            "reduced dim_batch"
+                        )
                     _empty_device_cache(device)
                     log.warning("jlens: OOM — retrying prompt with dim_batch=%d", batch)
                 if restart_with_smaller_prompts:
@@ -1471,80 +1510,145 @@ def _accumulate_prompt_jacobian(
                 l: torch.zeros(d_model, d_model, dtype=torch.float32) for l in sources
             }
             state["d_model"] = d_model
-        stripe_capacity = min(_ROW_STRIPE, d_model)
+        stripe_capacity = _row_stripe_capacity(
+            d_model, len(sources), batch,
+        )
+        capacity_limit = state.get("stripe_capacity_limit")
+        if capacity_limit is not None:
+            stripe_capacity = max(
+                batch, min(stripe_capacity, int(capacity_limit)),
+            )
         if device.type == "cuda" and state["stripe_rows"] is None:
             # Two device/host slots let stripe N's D2H transfer overlap the
-            # backward passes that fill stripe N+1.  Allocation pressure falls
-            # back to the former one-slot behavior without changing results.
-            try:
-                state["stripe_rows"] = [
-                    {
-                        l: torch.empty(
-                            stripe_capacity, d_model, dtype=torch.float32,
-                            device=device,
-                        )
-                        for l in sources
-                    }
-                    for _ in range(2)
-                ]
-                state["host_stripes"] = [
-                    {
-                        l: torch.empty(
-                            stripe_capacity, d_model, dtype=torch.float32,
-                            pin_memory=True,
-                        )
-                        for l in sources
-                    }
-                    for _ in range(2)
-                ]
-                state["cuda_transfer_stream"] = torch.cuda.Stream(device=device)
-            except RuntimeError:
-                state["stripe_rows"] = None
-                state["host_stripes"] = None
-                state["cuda_transfer_stream"] = None
-                _empty_device_cache(device)
-                state["stripe_rows"] = [
-                    {
-                        l: torch.empty(
-                            stripe_capacity, d_model, dtype=torch.float32,
-                            device=device,
-                        )
-                        for l in sources
-                    }
-                ]
+            # backward passes that fill stripe N+1. Allocation pressure first
+            # drops overlap, then halves the stripe itself. Prompt/dim backoff
+            # cannot cure a fixed staging allocation, so do that recovery here.
+            while True:
+                device_rows: list[dict[int, torch.Tensor]] | None = None
+                host_rows: list[dict[int, torch.Tensor]] | None = None
                 try:
-                    host = {
+                    device_rows = [
+                        {
+                            l: torch.empty(
+                                stripe_capacity, d_model, dtype=torch.float32,
+                                device=device,
+                            )
+                            for l in sources
+                        }
+                        for _ in range(2)
+                    ]
+                    host_rows = [
+                        {
+                            l: torch.empty(
+                                stripe_capacity, d_model, dtype=torch.float32,
+                                pin_memory=True,
+                            )
+                            for l in sources
+                        }
+                        for _ in range(2)
+                    ]
+                    transfer_stream = torch.cuda.Stream(device=device)
+                except RuntimeError:
+                    device_rows = None
+                    host_rows = None
+                    _empty_device_cache(device)
+                    one_device: dict[int, torch.Tensor] | None = None
+                    one_host: dict[int, torch.Tensor] | None = None
+                    try:
+                        one_device = {
+                            l: torch.empty(
+                                stripe_capacity, d_model, dtype=torch.float32,
+                                device=device,
+                            )
+                            for l in sources
+                        }
+                        try:
+                            one_host = {
+                                l: torch.empty(
+                                    stripe_capacity, d_model, dtype=torch.float32,
+                                    pin_memory=True,
+                                )
+                                for l in sources
+                            }
+                        except RuntimeError:
+                            one_host = {
+                                l: torch.empty(
+                                    stripe_capacity, d_model, dtype=torch.float32,
+                                )
+                                for l in sources
+                            }
+                        transfer_stream = torch.cuda.Stream(device=device)
+                        assert one_device is not None and one_host is not None
+                        device_rows = [one_device]
+                        host_rows = [one_host]
+                        log.warning(
+                            "jlens: CUDA stripe double-buffer allocation failed; "
+                            "using one transfer slot (%d rows)", stripe_capacity,
+                        )
+                    except RuntimeError:
+                        one_device = None
+                        one_host = None
+                        device_rows = None
+                        host_rows = None
+                        _empty_device_cache(device)
+                        smaller = _smaller_row_stripe_capacity(
+                            stripe_capacity, batch,
+                        )
+                        if smaller is None:
+                            raise
+                        log.warning(
+                            "jlens: CUDA stripe allocation failed — retrying "
+                            "with %d rows instead of %d",
+                            smaller, stripe_capacity,
+                        )
+                        stripe_capacity = smaller
+                        continue
+                assert device_rows is not None and host_rows is not None
+                state["stripe_rows"] = device_rows
+                state["host_stripes"] = host_rows
+                state["cuda_transfer_stream"] = transfer_stream
+                state["stripe_capacity"] = stripe_capacity
+                break
+        elif device.type == "mps" and state["stripe_rows"] is None:
+            while True:
+                device_rows_mps: dict[int, torch.Tensor] | None = None
+                host_rows_mps: dict[int, torch.Tensor] | None = None
+                try:
+                    device_rows_mps = {
                         l: torch.empty(
                             stripe_capacity, d_model, dtype=torch.float32,
-                            pin_memory=True,
+                            device=device,
+                        )
+                        for l in sources
+                    }
+                    host_rows_mps = {
+                        l: torch.empty(
+                            stripe_capacity, d_model, dtype=torch.float32,
                         )
                         for l in sources
                     }
                 except RuntimeError:
-                    host = {
-                        l: torch.empty(
-                            stripe_capacity, d_model, dtype=torch.float32,
-                        )
-                        for l in sources
-                    }
-                state["host_stripes"] = [host]
-                state["cuda_transfer_stream"] = torch.cuda.Stream(device=device)
-                log.warning(
-                    "jlens: CUDA stripe double-buffer allocation failed; "
-                    "using one transfer slot"
-                )
-        elif device.type == "mps" and state["stripe_rows"] is None:
-            state["stripe_rows"] = {
-                l: torch.empty(
-                    stripe_capacity, d_model, dtype=torch.float32, device=device,
-                )
-                for l in sources
-            }
-        if device.type == "mps" and state["host_stripes"] is None:
-            state["host_stripes"] = {
-                l: torch.empty(stripe_capacity, d_model, dtype=torch.float32)
-                for l in sources
-            }
+                    device_rows_mps = None
+                    host_rows_mps = None
+                    _empty_device_cache(device)
+                    smaller = _smaller_row_stripe_capacity(
+                        stripe_capacity, batch,
+                    )
+                    if smaller is None:
+                        raise
+                    log.warning(
+                        "jlens: MPS stripe allocation failed — retrying with "
+                        "%d rows instead of %d", smaller, stripe_capacity,
+                    )
+                    stripe_capacity = smaller
+                    continue
+                assert device_rows_mps is not None and host_rows_mps is not None
+                state["stripe_rows"] = device_rows_mps
+                state["host_stripes"] = host_rows_mps
+                state["stripe_capacity"] = stripe_capacity
+                break
+        if device.type in {"cuda", "mps"}:
+            stripe_capacity = int(state["stripe_capacity"])
         stripe_rows = state["stripe_rows"]
         host_stripes = state["host_stripes"]
         stripe_start = int(row_start)
@@ -1835,6 +1939,29 @@ def _downgrade_cuda_stripe_buffers(
     # Drop the local references before emptying the allocator in the caller.
     del device_rows[1:]
     del host_rows[1:]
+    return True
+
+
+def _shrink_device_stripe_buffers(
+    state: dict[str, Any], device: torch.device, dim_batch: int,
+) -> bool:
+    """Release a quiescent one-slot staging tier and lower its next capacity.
+
+    ``_accumulate_prompt_jacobian`` drains every pending CUDA transfer before an
+    OOM escapes, so the retry scheduler can safely discard these persistent
+    buffers without losing a committed row prefix.
+    """
+    if device.type not in {"cuda", "mps"}:
+        return False
+    capacity = int(state.get("stripe_capacity", 0) or 0)
+    smaller = _smaller_row_stripe_capacity(capacity, dim_batch)
+    if smaller is None:
+        return False
+    state["stripe_rows"] = None
+    state["host_stripes"] = None
+    state["cuda_transfer_stream"] = None
+    state["stripe_capacity"] = 0
+    state["stripe_capacity_limit"] = smaller
     return True
 
 

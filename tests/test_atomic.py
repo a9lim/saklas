@@ -2,8 +2,12 @@
 from __future__ import annotations
 
 import json
+import ctypes
 from pathlib import Path
 
+import pytest
+
+from saklas.io import atomic
 from saklas.io.atomic import _temp_path, write_bytes_atomic, write_json_atomic
 
 
@@ -87,6 +91,66 @@ def test_atomic_overwrite_preserves_prior_on_simulated_crash(tmp_path: Path):
 
     # And the original still loads cleanly.
     assert json.loads(path.read_text()) == {"version": 1}
+
+
+def test_releasable_artifact_lock_can_reacquire_after_early_release(
+    tmp_path: Path,
+) -> None:
+    transaction = atomic.ReleasableArtifactLock(tmp_path / "capture")
+
+    assert transaction.acquire() is transaction
+    transaction.release()
+    assert transaction.acquire() is transaction
+    transaction.release()
+    transaction.release()  # idempotent final cleanup
+
+
+class _WinCall:
+    def __init__(self, result: int) -> None:
+        self.result = result
+        self.restype = None
+
+    def __call__(self, *_args: object) -> int:
+        return self.result
+
+
+@pytest.mark.parametrize(
+    "wait_result, expected", [(0x102, True), (0, False), (0xFFFFFFFF, True)],
+)
+def test_windows_process_probe_never_uses_os_kill(
+    monkeypatch: pytest.MonkeyPatch, wait_result: int, expected: bool,
+) -> None:
+    class _Kernel:
+        OpenProcess = _WinCall(123)
+        WaitForSingleObject = _WinCall(wait_result)
+        CloseHandle = _WinCall(1)
+
+    class _Windll:
+        kernel32 = _Kernel()
+
+    monkeypatch.setattr(ctypes, "windll", _Windll(), raising=False)
+    monkeypatch.setattr(atomic.os, "name", "nt")
+    monkeypatch.setattr(
+        atomic.os, "kill",
+        lambda *_: (_ for _ in ()).throw(AssertionError("os.kill is unsafe here")),
+    )
+    assert atomic._process_exists(987654) is expected
+
+
+def test_windows_access_denied_process_is_treated_as_live(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Kernel:
+        OpenProcess = _WinCall(0)
+        WaitForSingleObject = _WinCall(0)
+        CloseHandle = _WinCall(1)
+        GetLastError = _WinCall(5)
+
+    class _Windll:
+        kernel32 = _Kernel()
+
+    monkeypatch.setattr(ctypes, "windll", _Windll(), raising=False)
+    assert atomic._windows_process_exists(42)
 
 
 # NOTE: ``test_pack_metadata_future_format_version_*`` and the two

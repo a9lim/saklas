@@ -1269,6 +1269,14 @@ class SaklasSession:
         self._whitener: Any = None
         self._jlens: Any = None  # lazy per-model Jacobian lens (io/lens.py)
         self._jlens_identity: tuple[Any, ...] | None = None
+        # One immutable resident-lens snapshot per generation.  Disk pointer
+        # refresh belongs at the generation boundary, never in a per-token
+        # probe/gate scorer (where reopening every fitted shard is O(T*L)
+        # filesystem work).  ``_generation_jlens_active`` distinguishes a
+        # validated missing lens from the idle state, whose public read methods
+        # should still consult ``session.jlens`` normally.
+        self._generation_jlens: Any = None
+        self._generation_jlens_active = False
         self._jlens_device_cache: dict[tuple[int, str, tuple[int, ...]], torch.Tensor] = {}
         self._jlens_readout_module_cache: (
             tuple[torch.Tensor, torch.nn.Module] | None
@@ -1847,6 +1855,9 @@ class SaklasSession:
         :meth:`fit_jlens` or ``saklas lens fit``. Returns a
         :class:`saklas.core.jlens.JacobianLens`.
         """
+        if getattr(self, "_generation_jlens_active", False):
+            return getattr(self, "_generation_jlens", None)
+
         from saklas.io.lens import load_lens, load_lens_sidecar
 
         sidecar = load_lens_sidecar(self.model_id)
@@ -1880,6 +1891,9 @@ class SaklasSession:
 
     def has_compatible_jlens(self) -> bool:
         """Whether lens metadata matches the currently loaded weights."""
+        if getattr(self, "_generation_jlens_active", False):
+            return getattr(self, "_generation_jlens", None) is not None
+
         from saklas.io.lens import load_lens, load_lens_sidecar
 
         sidecar = load_lens_sidecar(self.model_id)
@@ -2070,6 +2084,7 @@ class SaklasSession:
             load_lens_checkpoint_sidecar,
             promote_lens_checkpoint,
             remove_lens_checkpoint,
+            remove_subsumed_lens_checkpoint,
             save_lens_checkpoint_accumulator,
         )
 
@@ -2161,6 +2176,7 @@ class SaklasSession:
                         and saved_sha == _token_rows_sha(consumed_ids[:saved_n])
                     )
                     if corpus_matches or prefix_matches:
+                        existing_payload_verified = False
                         resident = self._jlens
                         resident_layers = (
                             set(resident.source_layers)
@@ -2169,6 +2185,11 @@ class SaklasSession:
                         if (
                             resident is not None
                             and resident.n_prompts == saved_n
+                            # A resident stamped with the durable pointer must
+                            # represent that whole artifact, not merely the
+                            # selected return view from an earlier subset call.
+                            and resident_layers
+                            == {int(layer) for layer in sidecar["source_layers"]}
                             and resident_layers >= expected_set
                             and getattr(self, "_jlens_identity", None)
                             == _jlens_sidecar_identity(sidecar)
@@ -2176,10 +2197,13 @@ class SaklasSession:
                             existing = (resident, sidecar)
                         else:
                             existing = load_lens(self.model_id)
+                            existing_payload_verified = existing is not None
                     else:
                         existing = None
+                        existing_payload_verified = False
                 else:
                     existing = None
+                    existing_payload_verified = False
                 if existing is not None:
                     lens, sidecar = existing
                     existing_set = set(lens.source_layers)
@@ -2190,10 +2214,21 @@ class SaklasSession:
                                     f"lens already fitted on {lens.n_prompts} "
                                     "prompts — nothing to do"
                                 )
-                            selected = lens.select_layers(expected_sources)
-                            return SaklasSession._adopt_fitted_jlens(
-                                self, selected, sidecar=sidecar,
+                            # A kill after durable publication but before the
+                            # checkpoint unlink leaves a second full shard set.
+                            # Reap it only when the final artifact proves it is
+                            # not farther ahead or semantically different.
+                            remove_subsumed_lens_checkpoint(
+                                self.model_id,
+                                verified_final_sidecar=(
+                                    sidecar if existing_payload_verified else None
+                                ),
                             )
+                            selected = lens.select_layers(expected_sources)
+                            SaklasSession._adopt_fitted_jlens(
+                                self, lens, sidecar=sidecar,
+                            )
+                            return selected
                         missing_sources = sorted(expected_set - existing_set)
                         if on_progress is not None:
                             on_progress(
@@ -2298,10 +2333,11 @@ class SaklasSession:
                         )
                         remove_lens_checkpoint(self.model_id)
                         selected = merged.select_layers(expected_sources)
-                        return SaklasSession._adopt_fitted_jlens(
-                            self, selected,
+                        SaklasSession._adopt_fitted_jlens(
+                            self, merged,
                             sidecar=load_lens_sidecar(self.model_id),
                         )
+                        return selected
                     if existing_set >= expected_set:
                         base = lens.select_layers(expected_sources)
                     else:
@@ -5304,6 +5340,41 @@ class SaklasSession:
         gated probe layers and keeps no full-roster tail. ``None`` (or empty)
         keeps the full per-token scoring.
         """
+        # Refresh an externally replaced/removed J-lens exactly once before
+        # fixing this generation's capture layers.  Every token, gate, and
+        # final aggregate below consumes the same resident generation even if
+        # another process switches ``jlens.json`` mid-decode.  Cold protocol
+        # stubs used by CPU tests do not carry ``_jlens_identity``; preserve
+        # their explicit live/probe fixtures without invoking disk/model code.
+        configured_live_lens = (
+            getattr(self, "_live_lens", None) if live_lens_active else None
+        )
+        configured_lens_probes = getattr(self, "_lens_probes", None) or {}
+        configured_lens_gate_names = {
+            key.split("[", 1)[0]
+            for key in (lens_gating_probe_keys or set())
+            if key.split("[", 1)[0] in configured_lens_probes
+        }
+        needs_lens_snapshot = bool(
+            configured_live_lens is not None
+            or (
+                configured_lens_probes
+                and (final_probe_aggregate or configured_lens_gate_names)
+            )
+        )
+        # A prior defensive/standalone capture may not have run the ordinary
+        # generation-finally cleanup. Never let its snapshot suppress this
+        # boundary's disk refresh.
+        self._generation_jlens = None
+        self._generation_jlens_active = False
+        if needs_lens_snapshot and hasattr(self, "_jlens_identity"):
+            self._generation_jlens = self.jlens
+        else:
+            self._generation_jlens = (
+                getattr(self, "_jlens", None) if needs_lens_snapshot else None
+            )
+        self._generation_jlens_active = needs_lens_snapshot
+
         # ``getattr`` like ``_compiled_clean_eligible`` below — spec'd mock
         # stubs carry class attributes only, not instance state.
         live_lens = getattr(self, "_live_lens", None) if live_lens_active else None
@@ -6046,7 +6117,11 @@ class SaklasSession:
 
         if not self._lens_probes:
             return {}
-        lens = self.jlens
+        lens = (
+            getattr(self, "_generation_jlens", None)
+            if getattr(self, "_generation_jlens_active", False)
+            else self.jlens
+        )
         if lens is None:
             return {}
         band = self._lens_probe_layers()
@@ -6134,7 +6209,11 @@ class SaklasSession:
         """
         if not self._lens_probes:
             return {}
-        lens = self.jlens
+        lens = (
+            getattr(self, "_generation_jlens", None)
+            if getattr(self, "_generation_jlens_active", False)
+            else self.jlens
+        )
         if lens is None:
             return {}
         latest = self._capture.latest_per_layer()
@@ -8551,6 +8630,8 @@ class SaklasSession:
             self._last_token_probe_payload = None
             self._live_lens_active_for_generation = True
             self._live_sae_active_for_generation = True
+            self._generation_jlens = None
+            self._generation_jlens_active = False
             # Reset capture state to the default (FULL, non-persistent) so the
             # next gen starts clean (finalize has already consumed the rows by
             # now). Belt-and-suspenders: ``_begin_capture`` resets it at gen start
@@ -9314,6 +9395,19 @@ class SaklasSession:
             has_lens_probes = bool(return_probe_readings and getattr(
                 self, "_lens_probes", None,
             ))
+            if has_lens_probes:
+                # Batched generation bypasses ``_begin_capture`` but still
+                # owns one generation transaction. Pin one disk-refreshed lens
+                # across every row aggregate rather than reopening all shards
+                # once per batch item.
+                self._generation_jlens = None
+                self._generation_jlens_active = False
+                self._generation_jlens = (
+                    self.jlens
+                    if hasattr(self, "_jlens_identity")
+                    else getattr(self, "_jlens", None)
+                )
+                self._generation_jlens_active = True
             has_sae_probes = bool(return_probe_readings and getattr(
                 self, "_sae_probes", None,
             ))
@@ -9479,6 +9573,8 @@ class SaklasSession:
                     self._end_capture()
                 self._active_gen_reservation = None
                 self._last_token_probe_payload = None
+                self._generation_jlens = None
+                self._generation_jlens_active = False
                 self._capture_state = CaptureState()
                 self._compiled_clean_eligible = False
                 self._incremental_readings = []

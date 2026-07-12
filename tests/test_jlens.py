@@ -390,6 +390,60 @@ def test_cuda_oom_downgrades_transfer_buffers_to_one_slot() -> None:
     )
 
 
+def test_row_stripe_capacity_is_byte_bounded_and_never_splits_a_vjp() -> None:
+    import saklas.core.jlens as jlens_module
+
+    budget = 128 * 1024**2
+    capacity = jlens_module._row_stripe_capacity(
+        8192, 80, 8, byte_budget=budget,
+    )
+
+    assert 8 <= capacity < jlens_module._ROW_STRIPE
+    assert capacity * 8192 * 80 * 4 <= budget
+    # If one VJP block itself exceeds the budget, exactness wins: staging must
+    # still hold that complete block and estimator dim-batch backoff owns it.
+    assert jlens_module._row_stripe_capacity(
+        8192, 80, 64, byte_budget=1024,
+    ) == 64
+
+
+def test_row_stripe_allocation_backoff_terminates_at_vjp_width() -> None:
+    import saklas.core.jlens as jlens_module
+
+    capacity = 51
+    seen: list[int] = []
+    while True:
+        seen.append(capacity)
+        smaller = jlens_module._smaller_row_stripe_capacity(capacity, 8)
+        if smaller is None:
+            break
+        capacity = smaller
+
+    assert seen == [51, 25, 12, 8]
+
+
+def test_one_slot_oom_releases_staging_and_caps_retry_capacity() -> None:
+    import saklas.core.jlens as jlens_module
+
+    state: dict[str, Any] = {
+        "stripe_rows": [{0: object()}],
+        "host_stripes": [{0: object()}],
+        "cuda_transfer_stream": object(),
+        "stripe_capacity": 51,
+    }
+
+    assert jlens_module._shrink_device_stripe_buffers(
+        state, torch.device("cuda"), 8,
+    )
+    assert state["stripe_rows"] is None
+    assert state["host_stripes"] is None
+    assert state["cuda_transfer_stream"] is None
+    assert state["stripe_capacity_limit"] == 25
+    assert not jlens_module._shrink_device_stripe_buffers(
+        {"stripe_capacity": 8}, torch.device("mps"), 8,
+    )
+
+
 def test_repeated_oom_after_committed_rows_never_double_counts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

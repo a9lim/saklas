@@ -162,8 +162,9 @@ def bundled_manifold_names() -> list[str]:
 
 def _manifest_content_sha256(data: bytes) -> str:
     """Bundle-drift sha of a manifest payload — canonical JSON (sorted
-    keys, no whitespace, so cosmetic differences compare equal) with the
-    ``files`` integrity map stripped before hashing.
+    keys, no whitespace, so cosmetic differences compare equal) with local
+    fit-transaction state (``files`` / ``artifact_id`` / ``fit_epochs``)
+    stripped before hashing.
 
     ``files`` accumulates per-model fit proofs *locally*
     (:meth:`ManifoldFolder.update_file_hashes` after every fit), so it is
@@ -180,7 +181,8 @@ def _manifest_content_sha256(data: bytes) -> str:
     except (json.JSONDecodeError, UnicodeDecodeError):
         return hashlib.sha256(data).hexdigest()
     if isinstance(parsed, dict):
-        parsed.pop("files", None)
+        for key in ("files", "artifact_id", "fit_epochs"):
+            parsed.pop(key, None)
     return hashlib.sha256(_canonical_json(parsed)).hexdigest()
 
 

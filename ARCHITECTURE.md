@@ -190,10 +190,18 @@ stores independently digested per-layer centroid and row shards: scoped fits
 verify/map only requested layers, disjoint top-ups write only missing shards, and
 legacy v3 monoliths are replaced on first use. Coverage is unioned for
 subset/top-up reuse; cached and newly captured row stores compose as zero-copy
-layer views for the covariance pass. Oldest-group pruning runs after the active stem transaction
-and locks each victim before deletion, past a configurable disk bound;
+layer views for the covariance pass. Forced subset fits recapture only their
+selected layers and carry all other v4 pointers forward. The exclusive stem lock
+ends after cache publication; a live PID lease protects mapped rows through the
+later covariance pass, and deferred auto-curved row top-ups merge the latest
+pointer when they briefly reacquire the lock. Oldest-group pruning runs after the active stem transaction
+and locks each victim before deletion (skipping live leases), past a configurable disk bound;
 geometry-only refits skip capture entirely. Fitted tensors carry the
 loaded-model fingerprint and selected layer set in their cache identity.
+Long compute is serialized only per exact model/variant target; folder locks
+cover an exact-input snapshot and revision-CAS publication, so readers and other
+targets continue while fitting. Scoped clear epochs and a folder artifact id
+prevent a paused fit from undoing clear or publishing into an rm/recreated folder.
 
 ### 3.2 A steering vector as a 2-node fit
 
@@ -919,7 +927,8 @@ with an exact scalar fallback and env-overridable replicated reference mode
 (`SAKLAS_JLENS_VJP`). Transparent mean-position probe identities collapse each
 source derivative inside autograd from `[rows,B,T,D]` to `[rows,B,D]` while
 leaving the forward and upstream gradient unchanged. A final-block hook stops before norm + LM head. Every
-backend transfers bounded row stripes directly into the CPU accumulator; an OOM
+backend transfers byte-budgeted, allocation-adaptive row stripes directly into
+the CPU accumulator; an OOM
 rebuilds the graph at the first uncommitted row. Self-contained checkpoints
 (`jlens.partial.*`) are written as immutable per-layer shards directly from raw
 accumulator sums, avoiding a second full fp32 lens and supporting repeated
@@ -930,7 +939,9 @@ resumes from an exact token-id prefix; the default dataset is commit-pinned;
 exact source/live-model fingerprints invalidate mutable revisions. A complete
 terminal checkpoint is fsynced and promoted at finalization instead of being
 rewritten; otherwise each fp16 layer shard is streamed once, with its payload
-digest verified on final and checkpoint loads.
+digest verified on final and checkpoint loads. Exact no-op recovery removes a
+checkpoint left by a crash after final publication only when the final pointer
+provably subsumes its corpus, layers, estimator policy, and effective progress.
 The artifact (`io/lens.py`,
 `models/<safe_id>/jlens.json` plus fp16 layer shards) then supports four
 consumers with zero hot-path cost when unused:

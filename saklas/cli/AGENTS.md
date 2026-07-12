@@ -246,7 +246,9 @@ category list through verbatim (tagged concepts only, no multi-node sweep).
   An exact metadata-only no-op can run before corpus streaming/model load when
   the sidecar's immutable model-source identity, pinned default-dataset revision
   (or custom raw-corpus hash), layer coverage, and tensor digest all match;
-  otherwise loaded token IDs + live weights decide. A superset stored lens satisfies
+  otherwise loaded token IDs + live weights decide. That exact proof also reaps
+  a crash-left checkpoint when the durable final artifact provably subsumes it.
+  A superset stored lens satisfies
   narrower layer requests without refit, and missing layers
   are fitted as a checkpointed/resumable top-up. A normal 100→1000 corpus
   extension resumes when the saved token-id hash matches the new prefix; model

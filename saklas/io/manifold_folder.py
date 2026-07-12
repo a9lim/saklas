@@ -94,6 +94,32 @@ def _locked_manifest(folder: Path):
     with artifact_lock(folder.parent / f"{folder.name}.manifest"):
         yield
 
+
+def manifold_pair_lock_path(tensor_path: Path) -> Path:
+    """Stable, bounded logical lock path for one fitted tensor pair.
+
+    The lock lives under the manifold namespace rather than inside the
+    removable manifold folder.  Consequently ``rm`` and stage-swap refreshes
+    cannot unlink the held lock inode and let a later process acquire a fresh
+    inode for the same logical pair.  The digest also bounds the filename for
+    long model/release-derived tensor names.
+    """
+
+    tensor_path = Path(tensor_path).expanduser().resolve(strict=False)
+    identity = f"{tensor_path.parent}\0{tensor_path.name}".encode()
+    digest = hashlib.sha256(identity).hexdigest()
+    return tensor_path.parent.parent / f".saklas-pair-{digest}"
+
+
+@contextmanager
+def manifold_pair_lock(tensor_path: Path):
+    """Lock a fitted tensor/sidecar pair using stable external identity."""
+
+    from saklas.io.atomic import artifact_lock
+
+    with artifact_lock(manifold_pair_lock_path(tensor_path)):
+        yield
+
 # Per-method hyperparameter whitelists.  Anything outside the whitelist
 # for a given fit_mode is dropped at folder-create time so a user
 # POSTing ``{fit_mode: "pca", hyperparams: {"k_nn": 5}}`` doesn't land
@@ -824,7 +850,9 @@ class ManifoldFolder:
             groups.append((label, list(statements)))
         return groups
 
-    def nodes_sha256(self) -> str:
+    def nodes_sha256(
+        self, *, resolved_template_sha256: str | None = None,
+    ) -> str:
         """Stable hash of the inputs that determine a fit's output.
 
         The staleness key: a fitted tensor's sidecar records this, and a
@@ -888,6 +916,9 @@ class ManifoldFolder:
         # ``None`` (every non-templated manifold) hashes identically to a missing
         # field.
         if self.template_ref is not None:
+            if resolved_template_sha256 is not None:
+                h.update(resolved_template_sha256.encode())
+                return h.hexdigest()
             from saklas.io.templates import (
                 AmbiguousTemplateError,
                 TemplateNotFoundError,
@@ -928,9 +959,10 @@ class ManifoldFolder:
         explicit trusted mapping is not provided.
         """
         with _locked_manifest(self.folder):
+            with open(self.folder / "manifold.json") as handle:
+                latest_payload = json.load(handle)
             if files is None:
-                with open(self.folder / "manifold.json") as handle:
-                    latest = json.load(handle).get("files", {})
+                latest = latest_payload.get("files", {})
                 if not isinstance(latest, dict):
                     raise ManifoldFormatError(
                         "manifold files manifest is not an object"
@@ -944,6 +976,9 @@ class ManifoldFolder:
                 "fit_mode": self.fit_mode,
                 "files": files,
             }
+            for key in ("artifact_id", "fit_epochs"):
+                if key in latest_payload:
+                    payload[key] = latest_payload[key]
         # Preserve provenance across re-fits, mirroring how a pack's
         # ``source`` survives ``PackMetadata.write``.  Only the default
         # ``"local"`` is omitted, so a hand-authored / generated folder
