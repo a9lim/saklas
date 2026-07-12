@@ -40,14 +40,34 @@ system_prompt: "You are helpful."
     assert c.system_prompt == "You are helpful."
 
 
-def test_parse_unknown_keys_warn_but_accept(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+def test_parse_rejects_unknown_keys(tmp_path: Path) -> None:
     p = tmp_path / "setup.yaml"
     p.write_text("model: x\nsomething_new: 1\n")
-    import logging
-    caplog.set_level(logging.WARNING, logger="saklas.cli.config_file")
-    c = cfg.ConfigFile.load(p)
-    assert c.model == "x"
-    assert any("unknown" in r.message for r in caplog.records)
+    with pytest.raises(cfg.ConfigFileError, match="something_new"):
+        cfg.ConfigFile.load(p)
+
+
+@pytest.mark.parametrize(
+    ("body", "message"),
+    [
+        ("model: 12\n", "model"),
+        ('thinking: "yes"\n', "thinking"),
+        ('temperature: "hot"\n', "temperature"),
+        ("temperature: -0.1\n", "temperature"),
+        ("top_p: 0\n", "top_p"),
+        ("top_p: 1.1\n", "top_p"),
+        ("max_tokens: false\n", "max_tokens"),
+        ("max_tokens: 0\n", "max_tokens"),
+        ("system_prompt: [bad]\n", "system_prompt"),
+    ],
+)
+def test_parse_rejects_invalid_current_field_shapes(
+    tmp_path: Path, body: str, message: str,
+) -> None:
+    p = tmp_path / "setup.yaml"
+    p.write_text(body)
+    with pytest.raises(cfg.ConfigFileError, match=message):
+        cfg.ConfigFile.load(p)
 
 
 def test_parse_rejects_map_form(tmp_path: Path) -> None:

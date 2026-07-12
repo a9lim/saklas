@@ -89,7 +89,8 @@ calls `ensure_vectors_installed`. There is **no** `method`/`injection_mode`/
 `theta_max`/`projection_metric` threading — those config keys were removed with the
 unified injection kernel and the Mahalanobis-only collapse.
 
-`ConfigFile.load` parses the YAML, warns on unknown keys, and validates the
+`ConfigFile.load` parses the YAML, rejects unknown keys, and validates exact
+types/ranges for every current field plus the
 `vectors:` value (a single steering expression) through `parse_expr` at load time.
 `compose` overrides field-by-field (later wins; `vectors` wholesale). Known keys
 (`_KNOWN_KEYS`): `model`, `vectors`, `thinking`, `temperature`, `top_p`,
