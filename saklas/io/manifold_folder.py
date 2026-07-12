@@ -37,6 +37,7 @@ from __future__ import annotations
 from contextlib import ExitStack, contextmanager
 import hashlib
 import json
+import math
 import re
 import warnings
 from dataclasses import dataclass, field
@@ -265,7 +266,7 @@ def sanitize_hyperparams(
 # cross-model transfers persist the exact authoring-to-orthonormal-reduced
 # reparameterization.  Old readers would otherwise ignore that tensor and
 # silently move manifold world points, so this is a real format boundary.
-MANIFOLD_FORMAT_VERSION = 8
+MANIFOLD_FORMAT_VERSION = 9
 
 MANIFOLD_SIDECAR_FIELDS = {
     "format_version", "name", "method", "saklas_version", "domain",
@@ -282,6 +283,85 @@ MANIFOLD_SIDECAR_FIELDS = {
 }
 
 
+def validate_manifold_sidecar_payload(
+    data: Any, *, location: str = "manifold sidecar",
+) -> dict[str, Any]:
+    """Validate every field of the exact current fitted-sidecar contract."""
+    if not isinstance(data, dict) or set(data) != MANIFOLD_SIDECAR_FIELDS:
+        raise ManifoldFormatError(f"{location} does not match the current exact schema")
+    validate_manifold_format_version(data["format_version"], location=location)
+    from saklas.core.manifold import validate_domain_spec
+
+    validate_domain_spec(data["domain"])
+    for key in ("name", "method", "saklas_version", "feature_space", "fit_mode"):
+        if not isinstance(data[key], str) or not data[key]:
+            raise ManifoldFormatError(f"{location} field {key!r} must be non-empty str")
+    if data["fit_mode"] not in _FIT_MODES_ALL:
+        raise ManifoldFormatError(f"{location} has invalid fit_mode")
+    labels = data["node_labels"]
+    if (
+        isinstance(data["node_count"], bool)
+        or not isinstance(data["node_count"], int)
+        or not isinstance(labels, list)
+        or not labels
+        or data["node_count"] != len(labels)
+        or any(not isinstance(label, str) or not _LABEL_REGEX.match(label) for label in labels)
+        or len(set(labels)) != len(labels)
+    ):
+        raise ManifoldFormatError(f"{location} has invalid node identity")
+    map_fields = (
+        "hyperparams", "diagnostics", "node_spread_per_layer",
+        "mahalanobis_share_per_layer", "origin_per_layer", "sae_ids_by_layer",
+        "rbf_smoothing_per_layer", "sigma_field_per_layer",
+    )
+    if any(not isinstance(data[key], dict) for key in map_fields):
+        raise ManifoldFormatError(f"{location} has a non-object mapping field")
+    if not isinstance(data["sae_full_coverage"], bool):
+        raise ManifoldFormatError(f"{location} sae_full_coverage must be bool")
+    nullable_strings = (
+        "nodes_sha256", "sae_release", "sae_revision", "sae_fingerprint",
+        "model_fingerprint", "capture_sha256", "share_metric",
+        "subspace_metric", "resolved_fit_mode", "topology_winner",
+        "bake_policy", "source_model_id", "source_model_fingerprint",
+    )
+    if any(
+        data[key] is not None and (not isinstance(data[key], str) or not data[key])
+        for key in nullable_strings
+    ):
+        raise ManifoldFormatError(f"{location} has invalid nullable string metadata")
+    if data["fit_policy_version"] is not None and (
+        isinstance(data["fit_policy_version"], bool)
+        or not isinstance(data["fit_policy_version"], int)
+        or data["fit_policy_version"] < 0
+    ):
+        raise ManifoldFormatError(f"{location} has invalid fit_policy_version")
+    quality = data["transfer_quality_estimate"]
+    if quality is not None and (
+        isinstance(quality, bool)
+        or not isinstance(quality, (int, float))
+        or not math.isfinite(float(quality))
+    ):
+        raise ManifoldFormatError(f"{location} has invalid transfer quality")
+    fitted = data["fitted_layers"]
+    if (
+        not isinstance(fitted, list)
+        or any(isinstance(v, bool) or not isinstance(v, int) or v < 0 for v in fitted)
+        or fitted != sorted(set(fitted))
+    ):
+        raise ManifoldFormatError(f"{location} has invalid fitted_layers")
+    roles, kinds = data["node_roles"], data["node_kinds"]
+    if not isinstance(roles, list) or not isinstance(kinds, list) or len(roles) != len(labels) or len(kinds) != len(labels):
+        raise ManifoldFormatError(f"{location} node provenance is misaligned")
+    for label, role, kind in zip(labels, roles, kinds, strict=True):
+        _validate_node_role(data["name"], label, role)
+        _validate_node_kind(data["name"], label, kind)
+    if not isinstance(data["topology_candidates"], list):
+        raise ManifoldFormatError(f"{location} topology_candidates must be an array")
+    if data["components"] is not None and not isinstance(data["components"], dict):
+        raise ManifoldFormatError(f"{location} components must be null or object")
+    return data
+
+
 def canonical_manifold_sidecar_payload(
     *, name: str, method: str, saklas_version: str, domain: dict[str, Any],
     node_labels: list[str], feature_space: str, fit_mode: str,
@@ -291,7 +371,7 @@ def canonical_manifold_sidecar_payload(
 ) -> dict[str, Any]:
     """Build the one exact current fitted-manifold sidecar shape."""
     count = len(node_labels)
-    return {
+    payload = {
         "format_version": MANIFOLD_FORMAT_VERSION,
         "name": name, "method": method, "saklas_version": saklas_version,
         "domain": domain, "node_count": count, "node_labels": node_labels,
@@ -312,6 +392,7 @@ def canonical_manifold_sidecar_payload(
         "components": None, "bake_policy": None, "source_model_id": None,
         "source_model_fingerprint": None, "transfer_quality_estimate": None,
     }
+    return validate_manifold_sidecar_payload(payload)
 
 
 def _validate_node_role(name: str, label: str, role: Any) -> str | None:
@@ -548,6 +629,7 @@ def load_manifold_sidecar_data(path: Path) -> dict[str, Any]:
         raise ManifoldFormatError(
             f"manifold sidecar {path} does not match the current exact schema"
         )
+    validate_manifold_sidecar_payload(data, location=f"manifold sidecar {path}")
     required_types: dict[str, type] = {
         "name": str,
         "method": str,

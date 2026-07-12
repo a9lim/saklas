@@ -1,5 +1,5 @@
 {
-  "format_version": 8,
+  "format_version": 9,
   "name": "direct.indirect",
   "description": "Bipolar axis: direct (+) vs indirect (-). Steer with negative alpha for the opposite pole.",
   "fit_mode": "pca",

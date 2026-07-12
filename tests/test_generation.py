@@ -58,6 +58,18 @@ def _complete_finalizer_session(session: Any) -> None:
 class _CurrentSessionStub(SaklasSession):
     """Narrow current-shape session whose lens is supplied in memory."""
 
+    def __new__(cls) -> "_CurrentSessionStub":
+        instance = super().__new__(cls)
+        instance._lens_probes = {}
+        instance._sae_probes = {}
+        instance._live_lens = None
+        instance._live_sae = None
+        instance._live_lens_active_for_generation = True
+        instance._live_sae_active_for_generation = True
+        instance._generation_jlens = None
+        instance._generation_jlens_active = False
+        return instance
+
     @property
     def jlens(self) -> Any:
         return self._jlens
@@ -1009,6 +1021,9 @@ def test_gating_callback_backfills_exact_keys_hidden_by_top_n() -> None:
         ),
         _incremental_readings=[{"toy": object()}],
         _incremental_gate_scores=[],
+        _lens_probes={},
+        _sae_probes={},
+        _profiles={},
     )
 
     callback = SteeringComposer(session).build_gating_score_callback()

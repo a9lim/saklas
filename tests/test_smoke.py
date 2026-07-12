@@ -75,7 +75,13 @@ def _extract_profile(model: Any, tokenizer: Any, concept: str, layers: Any) -> A
         L: (pos[L].to(torch.float32) - neg[L].to(torch.float32))
         for L in pos if L in neg
     }
-    mfld = fold_directions_to_subspace(concept, directions, None, label="p")
+    from tests._whitener import isotropic_whitener
+    neutral_means = {L: neg[L].to(torch.float32) for L in directions}
+    dim = int(next(iter(directions.values())).numel())
+    mfld = fold_directions_to_subspace(
+        concept, directions, neutral_means,
+        whitener=isotropic_whitener(directions, dim), label="p",
+    )
     return folded_vector_directions(mfld)
 
 
@@ -124,7 +130,12 @@ def _steer_subspace(mgr: Any, *pairs: Any) -> None:
             coord_dirs[L] = torch.tensor([n], device=v.device)
             neutral_means.setdefault(L, torch.zeros_like(v))
         push.append((basis_dirs, coord_dirs, alpha))
-    synth = synthesize_subspace(push, [], neutral_means=neutral_means)
+    from tests._whitener import isotropic_whitener
+    dim = int(next(iter(neutral_means.values())).numel())
+    synth = synthesize_subspace(
+        push, [], neutral_means=neutral_means,
+        whitener=isotropic_whitener(neutral_means, dim),
+    )
     mgr.add_subspace("steer", synth)
 
 
@@ -175,7 +186,7 @@ class TestSteering:
 
         # Steered
         mgr = SteeringManager()
-        _steer_subspace(mgr, (happy_profile, 1.5))
+        _steer_subspace(mgr, (happy_profile, 5.0))
         mgr.apply_to_model(layers, device, dtype)
 
         state1 = GenerationState()

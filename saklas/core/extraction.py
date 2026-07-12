@@ -791,6 +791,12 @@ class ModelHandle(Protocol):
     @property
     def layers(self) -> Any: ...  # ``get_layers`` returns ``nn.ModuleList`` — list-like
 
+    @property
+    def whitener(self) -> Any: ...
+
+    @property
+    def layer_means(self) -> dict[int, torch.Tensor]: ...
+
     def _run_generator(
         self, system_msg: str, prompt: str, max_new_tokens: int,
     ) -> str:
@@ -1422,12 +1428,19 @@ class ManifoldExtractionPipeline:
         # has already pooled every manifold response.
         maha_whitener = _resolved_whitener
         if maha_whitener is None:
-            maha_whitener = getattr(self._handle, "whitener", None)
+            maha_whitener = self._handle.whitener
         if maha_whitener is None or not maha_whitener.covers_all(fit_layers):
             raise WhitenerError(
                 f"manifold {mf.name!r}: the Mahalanobis whitener must cover "
                 f"every fit layer (regenerate the neutral activation cache "
                 f"for {self._handle.model_id!r})"
+            )
+        layer_means = self._handle.layer_means
+        missing_means = sorted(set(fit_layers) - set(layer_means))
+        if missing_means:
+            raise WhitenerError(
+                f"manifold {mf.name!r}: neutral layer means must cover every "
+                f"fit layer (missing {missing_means})"
             )
 
         # Capture payloads are shared per model and token identity, not per
@@ -1880,22 +1893,12 @@ class ManifoldExtractionPipeline:
             per_node = [
                 {idx: stacks_cached[idx][0] for idx in fit_layers}
             ]
-            means = getattr(self._handle, "layer_means", None) or {}
-            if not means:
-                raise ValueError(
-                    f"monopolar manifold {mf.name!r} (a 1-node concept-vs-"
-                    f"neutral fit) needs the model's neutral activation mean "
-                    f"(layer_means) as its negative pole, but none is "
-                    f"available; regenerate the neutral corpus so layer_means "
-                    f"can build"
-                )
+            means = layer_means
             maha = maha_whitener
             concept_label = node_groups[0][0]
             directions: dict[int, torch.Tensor] = {}
             for idx in fit_layers:
-                nu = means.get(idx)
-                if nu is None:
-                    continue  # no neutral anchor at this layer → can't fold it
+                nu = means[idx]
                 c = per_node[0][idx].to(torch.float32).reshape(-1)
                 if sae_backend is not None:
                     with torch.no_grad():
@@ -2261,17 +2264,13 @@ class ManifoldExtractionPipeline:
         # whitener: the curved fit's neutral-anchor (``mean = P_basis(ν)``,
         # §5) consumes it.  ``None`` on a CPU-stub handle ⇒ the fit falls back
         # to the centroid-mean anchor.  (Also drives the origin foot below.)
-        _handle_means = getattr(self._handle, "layer_means", None)
+        _handle_means = layer_means
         fit_kwargs: dict[str, Any] = {}
         if max_subspace_dim_override is not None:
             fit_kwargs["n_components"] = max_subspace_dim_override
 
-        def _neutral_for(idx: int) -> "torch.Tensor | None":
-            return (
-                _handle_means[idx]
-                if _handle_means is not None and idx in _handle_means
-                else None
-            )
+        def _neutral_for(idx: int) -> torch.Tensor:
+            return _handle_means[idx]
 
         def _bake_share(
             idx: int, sub: Any, mu_coords: torch.Tensor,
@@ -2453,7 +2452,7 @@ class ManifoldExtractionPipeline:
         #     into and the monitor reads as a soft node-assignment bandwidth.
         #     Skipped for SAE fits (the σ would mix raw activation spread with an
         #     SAE-reconstructed mean surface) and flat fits (``H_n ≡ 0``, the tube
-        #     is vacuous) — both leave ``σ`` absent ⇒ exact zero-thickness legacy.
+        #     is vacuous); neither current shape carries sigma tensors.
         sigma_field_per_layer: dict[int, dict[str, float]] = {}
         if effective_fit_mode != "pca" and sae_backend is None and layer_subs:
             if mf.fit_mode == "auto":
@@ -2568,10 +2567,8 @@ class ManifoldExtractionPipeline:
         # ``rbf_params()`` and raise.  Each layer's cold-start foot seed; layers
         # whose mean isn't resolvable (CPU stub) are simply absent.
         origin: dict[int, torch.Tensor] = {}
-        if effective_fit_mode != "pca" and _handle_means is not None:
+        if effective_fit_mode != "pca":
             for idx, sub in layer_subs.items():
-                if idx not in _handle_means:
-                    continue
                 mu = _handle_means[idx].to(
                     device="cpu", dtype=torch.float32,
                 ).reshape(-1)
@@ -2630,7 +2627,7 @@ class ManifoldExtractionPipeline:
             # spread summary (``sigma_mean``/``sigma_min``/``sigma_max`` + the
             # log-σ RBF's smoothing λ).  Diagnostic — the σ-RBF tensors themselves
             # ride the per-model safetensors; this is the inspector-facing
-            # summary.  Absent on flat / SAE / legacy fits (no tube).
+            # summary. Absent on flat and SAE fits (no raw tube model).
             metadata["sigma_field_per_layer"] = {
                 str(idx): info for idx, info in sigma_field_per_layer.items()
             }

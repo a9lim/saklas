@@ -106,9 +106,10 @@ def test_tensor_filename_roundtrip_from_transferred(monkeypatch: pytest.MonkeyPa
         "Qwen/Qwen2.5-7B-Instruct",
         transferred_from="google/gemma-3-4b-it",
     )
-    assert name == f"{QWEN_2_5}_from-{GOOGLE_3_4B.lower()}.safetensors"
+    source = paths.encode_release_id("google/gemma-3-4b-it")
+    assert name == f"{QWEN_2_5}_from-{source}.safetensors"
     parsed = paths.parse_tensor_filename(name)
-    assert parsed == (QWEN_2_5, f"from-{GOOGLE_3_4B.lower()}")
+    assert parsed == (QWEN_2_5, f"from-{source}")
 
 
 def test_tensor_filename_rejects_double_variant():
@@ -144,7 +145,7 @@ def test_transfer_filename_round_trips_reserved_separators_in_both_ids() -> None
     filename = paths.tensor_filename(target, transferred_from=source)
     assert paths.parse_tensor_filename(filename) == (
         paths.safe_model_id(target),
-        f"from-{paths.safe_model_id(source).lower()}",
+        f"from-{paths.encode_release_id(source)}",
     )
 
 
@@ -160,15 +161,17 @@ def test_sidecar_filename_partners_tensor():
     assert paths.sidecar_filename(
         "Qwen/Qwen2.5-7B-Instruct",
         transferred_from="google/gemma-3-4b-it",
-    ) == f"{QWEN_2_5}_from-{GOOGLE_3_4B.lower()}.json"
+    ) == f"{QWEN_2_5}_from-{paths.encode_release_id('google/gemma-3-4b-it')}.json"
 
 
 def test_safe_from_suffix_slugs_unsafe_chars():
-    # Source ids are usually already safe (since the caller passes the
-    # safe form), but the helper is defensively idempotent on slashes.
+    # Source ids use the same reversible lowercase identity codec as releases.
     assert paths.safe_from_suffix(None) == ""
     assert paths.safe_from_suffix("") == ""
-    assert paths.safe_from_suffix(GOOGLE_3_4B) == f"_from-{GOOGLE_3_4B.lower()}"
+    assert paths.safe_from_suffix("google/gemma-3-4b-it") == (
+        f"_from-{paths.encode_release_id('google/gemma-3-4b-it')}"
+    )
+    assert paths.safe_from_suffix("Org/Model") != paths.safe_from_suffix("org/model")
 
 
 def test_role_like_text_is_part_of_raw_model_id() -> None:

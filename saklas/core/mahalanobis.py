@@ -133,23 +133,32 @@ class LayerWhitener:
     iterate via ``in`` / :attr:`layers` see only the covered set.
     """
 
-    __slots__ = ("_K", "_X", "_dim", "_lambda")
+    __slots__ = ("_K", "_X", "_dim", "_lambda", "_mean")
 
     def __init__(
         self,
         centered: Mapping[int, torch.Tensor],
         small_inv: Mapping[int, torch.Tensor],
         ridge: Mapping[int, float],
+        layer_means: Mapping[int, torch.Tensor],
     ) -> None:
         if not centered:
             raise WhitenerError("LayerWhitener requires at least one layer")
-        if set(centered) != set(small_inv) or set(centered) != set(ridge):
+        if (
+            set(centered) != set(small_inv)
+            or set(centered) != set(ridge)
+            or set(centered) != set(layer_means)
+        ):
             raise WhitenerError(
                 "centered / small_inv / ridge must cover the same layer set"
             )
         self._X: dict[int, torch.Tensor] = dict(centered)
         self._K: dict[int, torch.Tensor] = dict(small_inv)
         self._lambda: dict[int, float] = dict(ridge)
+        self._mean = {
+            layer: mean.to(device="cpu", dtype=torch.float32).reshape(-1)
+            for layer, mean in layer_means.items()
+        }
         # Cache hidden-dim per layer for input-shape validation.  Allowing
         # mismatched dims would silently corrupt the matvec.
         self._dim: dict[int, int] = {
@@ -253,7 +262,15 @@ class LayerWhitener:
             raise WhitenerError(
                 "no layers shared between neutral_activations and layer_means"
             )
-        return cls(centered, small_inv, ridge)
+        return cls(
+            centered, small_inv, ridge,
+            {layer: layer_means[layer] for layer in centered},
+        )
+
+    @property
+    def layer_means(self) -> dict[int, torch.Tensor]:
+        """Defensive copy of the neutral means defining this metric."""
+        return {layer: mean.clone() for layer, mean in self._mean.items()}
 
     @classmethod
     def from_cache(

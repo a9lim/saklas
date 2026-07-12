@@ -110,10 +110,13 @@ def isotropic_whitener(
     was Euclidean before the collapse — the isotropic metric reproduces it to
     a loose tolerance.  Zero means, so it doesn't recenter test vectors.
     """
+    del n, seed
     layers = list(layers)
     means = {L: torch.zeros(dim, dtype=torch.float32) for L in layers}
-    acts: dict[int, torch.Tensor] = {}
-    for L in layers:
-        g = torch.Generator().manual_seed(seed * 7 + L)
-        acts[L] = torch.randn(n, dim, generator=g, dtype=torch.float32)
-    return LayerWhitener.from_neutral_activations(acts, means, ridge_scale=1.0)
+    # Exact identity metric: X=0 makes the Woodbury correction vanish and
+    # λ=1 leaves apply_inv(v)=v.  This fixture is for geometry tests; synthetic
+    # covariance behavior is covered by ``synthetic_whitener`` above.
+    centered = {L: torch.zeros(1, dim, dtype=torch.float32) for L in layers}
+    small_inv = {L: torch.ones(1, 1, dtype=torch.float32) for L in layers}
+    ridge = {L: 1.0 for L in layers}
+    return LayerWhitener(centered, small_inv, ridge, means)

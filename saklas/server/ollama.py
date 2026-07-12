@@ -43,6 +43,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from saklas.core.errors import SaklasError
+from saklas.core.results import GenerationResult
 from saklas.core.session import ConcurrentGenerationError, SaklasSession
 from saklas.core.steering import Steering
 from saklas.server.model_names import aliases_for_session, known_model_names
@@ -314,14 +315,14 @@ def _resolve_options(
 # Response assembly
 # ---------------------------------------------------------------------------
 
-def _duration_stats(result: Any, elapsed_ns: int) -> dict[str, int]:
+def _duration_stats(result: GenerationResult, elapsed_ns: int) -> dict[str, int]:
     """Build Ollama's *_duration and *_count fields from a GenerationResult.
 
     All durations are in nanoseconds.  Saklas tracks tokens/sec so we split the
     measured elapsed time proportionally between prompt-eval and eval.
     """
-    prompt_tokens = int(getattr(result, "prompt_tokens", 0) or 0)
-    completion_tokens = int(getattr(result, "token_count", 0) or 0)
+    prompt_tokens = result.prompt_tokens
+    completion_tokens = result.token_count
     total = max(prompt_tokens + completion_tokens, 1)
     prompt_ns = elapsed_ns * prompt_tokens // total
     eval_ns = max(elapsed_ns - prompt_ns, 1)
@@ -559,7 +560,7 @@ def register_ollama_routes(app: FastAPI) -> None:
 
         model_name = str(body.get("model") or session.model_id)
         created_at = _now_iso()
-        done_reason = _finish_to_done_reason(getattr(result, "finish_reason", None))
+        done_reason = _finish_to_done_reason(result.finish_reason)
         stats = _duration_stats(result, elapsed_ns)
 
         # Saklas-specific extension: per-attached-manifold-probe aggregate

@@ -1388,9 +1388,8 @@ export interface TokenScore {
   /** Per-layer × per-probe heatmap data captured during streaming.
    * Drives the click-token drilldown drawer. */
   perLayerScores?: Record<string, Record<string, number>>;
-  /** Logit-pass: chosen-token post-sampler logprob.  Absent on legacy /
-   *  replayed turns when ``return_top_k`` wasn't enabled and the engine
-   *  didn't run log_softmax.  Drives the inline ``surprise`` highlight
+  /** Logit-pass: chosen-token post-sampler logprob. Absent on imported
+   *  turns and when no consumer requested log-softmax capture. Drives the inline ``surprise`` highlight
    *  mode and the token drilldown's logits tab. */
   logprob?: number | null;
   /** Logit-pass: top-K alternatives captured at this position (descending

@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import logging
 import uuid
 from contextlib import contextmanager
@@ -262,6 +263,13 @@ def _validate_neutral_cache_metadata_locked(
         or version != _NEUTRAL_CACHE_FORMAT_VERSION
         or sidecar["capture_version"] != _NEUTRAL_CAPTURE_VERSION
         or sidecar["method"] != "neutral_activations"
+        or any(
+            not isinstance(sidecar[key], str) or not sidecar[key]
+            for key in (
+                "capture_sha256", "model_fingerprint",
+                "model_source_fingerprint",
+            )
+        )
     ):
         raise ValueError("neutral activation cache identity mismatch")
     layers = sidecar["layers"]
@@ -286,7 +294,10 @@ def _validate_neutral_cache_metadata_locked(
     expected_n = sidecar["n_prompts"]
     paths = _neutral_shard_paths(ts_path, sidecar, normalized_layers)
     digests = sidecar.get("tensor_sha256")
-    if not isinstance(digests, Mapping):
+    if (
+        not isinstance(digests, Mapping)
+        or set(digests) != {str(layer) for layer in layers}
+    ):
         raise ValueError("neutral activation cache has no tensor digests")
     grouped = {path: [layer] for layer, path in paths.items()}
     for layer, path in paths.items():
@@ -294,6 +305,7 @@ def _validate_neutral_cache_metadata_locked(
         if (
             not isinstance(digest, str)
             or len(digest) != 64
+            or any(char not in "0123456789abcdef" for char in digest)
             or not path.exists()
         ):
             raise ValueError(f"invalid neutral shard for layer {layer}")
@@ -845,7 +857,7 @@ def transfer_profile(
 def _alignment_anchor_paths(
     src_model_id: str, tgt_model_id: str,
 ) -> tuple[Path, Path]:
-    """Stable legacy/lock anchor and atomic v4 pointer sidecar."""
+    """Stable lock anchor and atomic v5 pointer sidecar."""
     md = model_dir(tgt_model_id)
     al_dir = md / "alignments"
     src_safe = safe_model_id(src_model_id)
@@ -1129,7 +1141,19 @@ def load_alignment_map(
             all_layers = expected_layers
             paths = _alignment_shard_paths(anchor, sidecar, all_layers)
             digests = sidecar.get("tensor_sha256")
-            if not isinstance(digests, Mapping):
+            layer_keys = {str(layer) for layer in all_layers}
+            quality = sidecar["quality_per_layer"]
+            if (
+                not isinstance(digests, Mapping)
+                or set(digests) != layer_keys
+                or set(quality) - layer_keys
+                or any(
+                    not isinstance(value, (int, float))
+                    or isinstance(value, bool)
+                    or not math.isfinite(float(value))
+                    for value in quality.values()
+                )
+            ):
                 return None
             # Validate declared headers independently before payload materialization.
             # One damaged layer must remain repairable without discarding the
@@ -1140,8 +1164,10 @@ def load_alignment_map(
                 digest = digests.get(str(layer))
                 if (
                     not isinstance(spec, dict)
+                    or set(spec) != {"left", "right", "offset"}
                     or not isinstance(digest, str)
                     or len(digest) != 64
+                    or any(char not in "0123456789abcdef" for char in digest)
                     or not paths[layer].exists()
                 ):
                     continue

@@ -1449,8 +1449,13 @@ class TestAnalyticsMultiNodeProbe:
         # one rank-3 multi-node probe (the shape that used to crash), all over
         # layers {0, 1} in dim 4.
         vx = {0: torch.randn(4), 1: torch.randn(4)}
+        g = torch.Generator().manual_seed(11)
+        acts = {L: torch.randn(80, 4, generator=g) for L in (0, 1)}
+        means = {L: torch.zeros(4) for L in (0, 1)}
+        whitener = LayerWhitener.from_neutral_activations(acts, means)
         vp = fold_directions_to_subspace(
-            "vp", {0: torch.randn(4), 1: torch.randn(4)}, None,
+            "vp", {0: torch.randn(4), 1: torch.randn(4)}, means,
+            whitener=whitener,
         )
         K, R, D = 4, 3, 4
         basis, _ = torch.linalg.qr(torch.randn(D, R))
@@ -1488,10 +1493,7 @@ class TestAnalyticsMultiNodeProbe:
             lambda n: SaklasSession.analytics_profile(session, n)
         )
 
-        g = torch.Generator().manual_seed(11)
-        acts = {L: torch.randn(80, 4, generator=g) for L in (0, 1)}
-        means = {L: torch.zeros(4) for L in (0, 1)}
-        session.whitener = LayerWhitener.from_neutral_activations(acts, means)
+        session.whitener = whitener
         return session, cast(TestClient, client)
 
     def test_analytics_names_excludes_multinode(self, session_and_client: Any) -> None:

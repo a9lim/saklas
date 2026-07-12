@@ -185,19 +185,11 @@ def safe_sae_suffix(release: str | None) -> str:
     return f"{_VARIANT_SEP_SAE}{encode_release_id(release)}"
 
 
-def safe_from_suffix(source_safe_id: str | None) -> str:
-    """Filename suffix for a transferred-profile variant.
-
-    Input is a *safe model id* (already passed through :func:`safe_model_id`)
-    so the slug is byte-stable across operating systems.  Returns the
-    empty string for ``None`` / empty (no transfer = raw).
-    """
-    if not source_safe_id:
+def safe_from_suffix(source_model_id: str | None) -> str:
+    """Reversibly encode a source model id for a transfer variant suffix."""
+    if not source_model_id:
         return ""
-    slug = _encode_tensor_component(
-        _UNSAFE_VARIANT_CHARS.sub("_", source_safe_id.lower()),
-    )
-    return f"{_VARIANT_SEP_FROM}{slug}"
+    return f"{_VARIANT_SEP_FROM}{encode_release_id(source_model_id)}"
 
 
 def tensor_filename(
@@ -206,14 +198,14 @@ def tensor_filename(
     release: str | None = None,
     transferred_from: str | None = None,
     model_id_is_safe: bool = False,
-    transferred_from_is_safe: bool = False,
+    transferred_from_is_encoded: bool = False,
 ) -> str:
     """Construct the canonical tensor filename.
 
     At most one of ``release`` and ``transferred_from`` may be set — composed
     kind variants are not supported. ``transferred_from`` accepts an HF/local model id by
-    default. Internal callers holding parsed safe ids must set
-    ``transferred_from_is_safe=True``; the target equivalent is
+    default. Internal callers holding a parsed ``from-*`` filename component
+    set ``transferred_from_is_encoded=True``. The target equivalent remains
     ``model_id_is_safe=True``.
 
     The raw tensor at the canonical path is difference-of-means (the only
@@ -229,11 +221,12 @@ def tensor_filename(
     if release:
         return f"{target}{safe_sae_suffix(release)}.safetensors"
     if transferred_from:
-        src = (
-            transferred_from
-            if transferred_from_is_safe else safe_model_id(transferred_from)
+        suffix = (
+            f"{_VARIANT_SEP_FROM}{transferred_from}"
+            if transferred_from_is_encoded
+            else safe_from_suffix(transferred_from)
         )
-        return f"{target}{safe_from_suffix(src)}.safetensors"
+        return f"{target}{suffix}.safetensors"
     return f"{target}.safetensors"
 
 
@@ -252,8 +245,7 @@ def sidecar_filename(
     if release:
         return f"{target}{safe_sae_suffix(release)}.json"
     if transferred_from:
-        src = safe_model_id(transferred_from)
-        return f"{target}{safe_from_suffix(src)}.json"
+        return f"{target}{safe_from_suffix(transferred_from)}.json"
     return f"{target}.json"
 
 

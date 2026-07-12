@@ -27,10 +27,13 @@ def _write_fitted_manifold(
     from saklas.core.vectors import fold_directions_to_subspace
     from saklas.io.manifolds import ManifoldFolder
     from saklas.io.paths import tensor_filename
+    from tests._whitener import isotropic_whitener
 
+    means = {0: torch.zeros(len(direction))}
     manifold = fold_directions_to_subspace(
-        folder.name, {0: torch.tensor(direction)}, None, label="test",
+        folder.name, {0: torch.tensor(direction)}, means, label="test",
         feature_space="raw" if release is None else f"sae-{release}",
+        whitener=isotropic_whitener(means, len(direction)),
     )
     mf = ManifoldFolder.load(folder, verify_manifest=False)
     path = folder / tensor_filename(model_id, release=release)

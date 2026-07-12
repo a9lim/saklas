@@ -484,9 +484,9 @@ export async function checkLensFit(): Promise<void> {
     const st = await apiLens.fitStatus();
     _applyFitStatus(st);
     if (st.running) void pollLensFit();
-  } catch {
-    // Older server without the fit route — the button will surface the
-    // error if clicked; the status check stays silent.
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    pushToast(`lens fit status failed — ${msg}`, { kind: "error" });
   }
 }
 
@@ -2544,7 +2544,7 @@ function handleWsMessage(msg: WSServerMessage): void {
       } else if (loomTree.rev > 0) {
         // Loom path with a lazily-created assistant node: wait for
         // the authoritative tree mutation before allocating
-        // the assistant turn.  Appending a legacy placeholder here creates
+        // the assistant turn. Appending a local placeholder here creates
         // a duplicate local assistant and is the source of many branch /
         // highlight misroutes.
         chatLog.pendingIndex = null;
@@ -2576,7 +2576,7 @@ function handleWsMessage(msg: WSServerMessage): void {
         // Logit-pass: pipe chosen-token logprob + top-K alternatives onto
         // the per-token row.  Both ride the WS ``token`` event directly
         // from Phase 1's engine capture; absent when ``return_top_k == 0``
-        // and no other on_token consumer is live (legacy default).
+        // and no other on-token consumer requested capture.
         logprob: msg.logprob ?? null,
         topAlts: msg.top_alts ?? null,
         // Raw decode-step index — the join key the logit fork slices
@@ -2941,7 +2941,7 @@ async function sendGenerateNow(
     input,
     steering: steeringPayload,
     sampling,
-    // Coerce ``null`` (legacy "auto") to explicit ``false`` so the
+    // Coerce the current family-level automatic setting to explicit ``false`` so the
     // unchecked checkbox really means "no thinking" — the server's
     // chat-template templates treat ``null`` and ``False`` differently
     // on some families and we promised the user a binary toggle.

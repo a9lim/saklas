@@ -21,12 +21,21 @@ from saklas.core.hooks import _SUBSPACE_GAIN, SteeringManager
 from saklas.core.manifold import (
     CustomDomain,
     SynthesizedSubspace,
-    synthesize_subspace,
+    synthesize_subspace as _synthesize_subspace,
 )
 from saklas.core.triggers import Trigger
+from tests._whitener import isotropic_whitener
 
 
 _DIM = 8
+
+
+def synthesize_subspace(*args, neutral_means, whitener=None, **kwargs):
+    if whitener is None:
+        whitener = isotropic_whitener(neutral_means, _DIM)
+    return _synthesize_subspace(
+        *args, neutral_means=neutral_means, whitener=whitener, **kwargs,
+    )
 
 
 @pytest.fixture(autouse=True)

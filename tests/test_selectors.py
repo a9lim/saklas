@@ -151,7 +151,8 @@ def _fake_fitted_tensor(folder: Path, filename: str) -> None:
     sidecar = Path(folder) / (Path(filename).stem + ".json")
     sidecar.write_text(json.dumps(canonical_manifold_sidecar_payload(
         name=folder.name, method="manifold_pca", saklas_version="0",
-        domain={"kind": "custom", "dim": 1}, node_labels=["pos", "neg"],
+        domain={"type": "custom", "embed_dim": 1, "bounds": None},
+        node_labels=["pos", "neg"],
         feature_space="raw", fit_mode="pca",
     )))
 

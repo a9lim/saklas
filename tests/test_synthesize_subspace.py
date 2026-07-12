@@ -23,8 +23,19 @@ from saklas.core.manifold import (
     _ortho_basis,
     decompose,
     subspace_inject,
-    synthesize_subspace,
+    synthesize_subspace as _synthesize_subspace,
 )
+
+
+def synthesize_subspace(*args, neutral_means, whitener=None, **kwargs):
+    """Current-shape test adapter: every synthesis owns a covering metric."""
+    if whitener is None and neutral_means:
+        from tests._whitener import isotropic_whitener
+        first = next(iter(neutral_means.values()))
+        whitener = isotropic_whitener(list(neutral_means), int(first.numel()))
+    return _synthesize_subspace(
+        *args, neutral_means=neutral_means, whitener=whitener, **kwargs,
+    )
 
 
 def _unit(v: torch.Tensor) -> torch.Tensor:
@@ -154,11 +165,14 @@ def test_rank8_push_fragment():
     )
     sub = synth.layers[0]
     assert sub.rank == 8
-    # Δ = 0.5·(coords @ B8); the merged basis re-rotates within the same span,
-    # so the world target reconstructs from the reduced target_coord.
+    # The merged basis preserves the requested direction while the universal
+    # synthesis norm cap may shorten a high-rank displacement.
     delta = 0.5 * (coords @ B8)
     world_target = synth.target_coord[0] @ sub.basis     # (R,) @ (R, D) -> (D,)
-    assert torch.allclose(world_target, delta, atol=1e-4)
+    assert torch.nn.functional.cosine_similarity(
+        world_target, delta, dim=0,
+    ) == pytest.approx(1.0, abs=1e-5)
+    assert torch.linalg.vector_norm(world_target) <= torch.linalg.vector_norm(delta)
     assert synth.share[0] == pytest.approx(
         float(torch.linalg.vector_norm(delta)), abs=1e-4,
     )
@@ -200,17 +214,18 @@ def test_pure_ablation_zero_target_basis_spans():
 
 # --------------------------------------------------------------- layer gating ---
 
-def test_skips_layer_without_neutral():
+def test_rejects_layer_without_neutral():
+    from saklas.core.mahalanobis import WhitenerError
     u = _unit(torch.randn(8))
-    synth = synthesize_subspace(
-        push=[(
-            {3: _row(u), 7: _row(u)},
-            {3: torch.tensor([1.0]), 7: torch.tensor([1.0])},
-            0.5,
-        )],
-        ablate=[], neutral_means={3: torch.zeros(8)},
-    )
-    assert sorted(synth.layers) == [3]     # layer 7 has no anchor → dropped
+    with pytest.raises(WhitenerError, match=r"missing \[7\]"):
+        synthesize_subspace(
+            push=[(
+                {3: _row(u), 7: _row(u)},
+                {3: torch.tensor([1.0]), 7: torch.tensor([1.0])},
+                0.5,
+            )],
+            ablate=[], neutral_means={3: torch.zeros(8)},
+        )
 
 
 def test_drops_degenerate_direction_layer():

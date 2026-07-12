@@ -54,8 +54,8 @@ sidecars `profile.save_profile` writes.
 ## manifolds.py
 
 The on-disk format for every concept + steering manifold —
-`~/.saklas/manifolds/<ns>/<name>/`. `MANIFOLD_FORMAT_VERSION = 8` (decoupled from
-the profile format); readers and writers require exactly v8.
+`~/.saklas/manifolds/<ns>/<name>/`. `MANIFOLD_FORMAT_VERSION = 9` (decoupled from
+the profile format); readers and writers require exactly v9.
 `min_nodes(n) = 2n+1`
 (the curved-fit poisedness floor). Five `fit_mode`s share the class, discriminated
 by `manifold.json::fit_mode`:
@@ -382,12 +382,12 @@ are rejected at load and must be rebuilt.
 Cross-model probe alignment via per-layer Procrustes.
 `load_or_compute_neutral_activations(...)` is the disk-cached per-model neutrals
 (the neutral corpus × layers, **fp32** — the project-wide invariant; exact loaded
-model + rendered-token + layer-schema identity, payload-digest verified; self-heals
-legacy bf16/fp16/non-finite caches). These are what the Mahalanobis whitener builds its
+model + rendered-token + layer-schema identity, payload-digest verified; non-current
+or corrupt caches miss and are replaced). These are what the Mahalanobis whitener builds its
 covariance from. Cache v4 is an atomic JSON pointer to one immutable fp32 shard
 per layer; every shard and its directory entry are durable before pointer
 publication, and old generations are collected only after the new pointer is
-durable. Readers require the current v3 sharded pointer format.
+durable. Readers require the current v4 sharded pointer format.
 `validate_neutral_cache_metadata` normally checks every digest plus the
 safetensors key/shape/dtype headers; exact-transfer preflight may request the
 header-only source proof, while `load_validated_neutral_cache(...,

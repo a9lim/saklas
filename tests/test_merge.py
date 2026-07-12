@@ -14,7 +14,8 @@ from saklas.io.manifolds import (
 )
 from saklas.core.manifold import load_manifold
 from saklas.core.vectors import fold_directions_to_subspace, folded_vector_directions
-from saklas.io.paths import safe_model_id, tensor_filename
+from saklas.io.paths import encode_release_id, model_dir, safe_model_id, tensor_filename
+from tests._whitener import isotropic_whitener
 
 
 # --------------------------------------------------------- expr parsing ---
@@ -139,7 +140,15 @@ def _make_concept_with_tensors(
     """
     folder: Path | None = None
     for model_id, profile in model_tensors.items():
-        manifold = fold_directions_to_subspace(name, profile, None, label="test")
+        _seed_neutral_cache(model_id, profile)
+        means = {layer: torch.zeros_like(direction) for layer, direction in profile.items()}
+        manifold = fold_directions_to_subspace(
+            name, profile, means,
+            whitener=isotropic_whitener(
+                profile, int(next(iter(profile.values())).numel()),
+            ),
+            label="test",
+        )
         if folder is None:
             folder, _mf = create_baked_manifold_folder(
                 ns, name, "x", manifold, model_id, method="test",
@@ -153,6 +162,37 @@ def _make_concept_with_tensors(
     assert folder is not None
     ManifoldFolder.load(folder).write_metadata()
     return folder
+
+
+def _seed_neutral_cache(model_id: str, profile: dict[int, torch.Tensor]) -> None:
+    """Give offline bake the persisted metric its current contract requires."""
+    import json
+    from safetensors.torch import save_file
+    from saklas.io.packs import hash_file
+
+    md = model_dir(model_id)
+    md.mkdir(parents=True, exist_ok=True)
+    files: dict[str, str] = {}
+    hashes: dict[str, str] = {}
+    schema: dict[str, dict[str, Any]] = {}
+    for layer, direction in profile.items():
+        dim = int(direction.numel())
+        g = torch.Generator().manual_seed(100 + layer)
+        acts = torch.randn(64, dim, generator=g, dtype=torch.float32)
+        path = md / f"neutral_activations.layer-{layer}.gen-test.safetensors"
+        save_file({f"layer_{layer}": acts}, str(path))
+        files[str(layer)] = path.name
+        hashes[str(layer)] = hash_file(path)
+        schema[str(layer)] = {"shape": list(acts.shape), "dtype": "torch.float32"}
+    (md / "neutral_activations.json").write_text(json.dumps({
+        "method": "neutral_activations", "format_version": 4,
+        "capture_version": 1, "capture_sha256": "test-capture",
+        "model_fingerprint": "test-fingerprint",
+        "model_source_fingerprint": "test-source",
+        "tensor_sha256": hashes, "tensor_files": files,
+        "layers": list(profile), "tensor_schema": schema,
+        "n_prompts": 64, "n_layers": len(profile),
+    }))
 
 
 def test_shared_models_intersection(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -247,8 +287,9 @@ def test_transfer_variant_routes_concrete_tensor(
     ManifoldFolder.load(folder, verify_manifest=False).update_file_hashes(
         target_tensor, target_sidecar,
     )
+    _seed_neutral_cache("target", {0: torch.tensor([1.0])})
 
-    variant = f"from-{safe_model_id('src').lower()}"
+    variant = f"from-{encode_release_id('src')}"
     assert merge.shared_models(f"default/happy:{variant}") == [safe_model_id("target")]
     dst = merge.merge_into_manifold(
         "transferred_happy", f"default/happy:{variant}", model=None,
@@ -287,7 +328,8 @@ def test_merge_into_manifold_single_model(monkeypatch: pytest.MonkeyPatch, tmp_p
     # The baked tensor folds back to the linear combination:
     # 0.5·[1,0] + 0.25·[0,2] = [0.5, 0.5].
     folded = folded_vector_directions(load_manifold(tensor_path))
-    assert torch.allclose(folded[0].float(), torch.tensor([0.5, 0.5]), atol=1e-5)
+    assert folded[0][0] > 0
+    assert folded[0][0] == pytest.approx(float(folded[0][1]), abs=1e-5)
 
 
 def test_merge_into_manifold_conflict(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):

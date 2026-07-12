@@ -1190,7 +1190,7 @@ class SaklasSession:
         # save/restore path (``LoomTree.save`` / ``LoomTree.load``).
         self.tree = LoomTree(
             events=self.events,
-            model_id=getattr(self._model_info, "model_id", None),
+            model_id=self._model_info["model_id"],
             conflict_check=self._loom_conflict_check,
         )
         self._joint_logprob_cache: dict[tuple[str, str], Any] = {}
@@ -1314,6 +1314,7 @@ class SaklasSession:
         # readout channel to a 0..1 strength; entries are lazily fetched.
         self._sae_feature_meta: dict[str, dict[str, Any]] = {}
         self._live_sae: dict[str, Any] | None = None
+        self._live_sae_active_for_generation: bool = True
         self._sae_probes: dict[str, dict[str, Any]] = {}
         self._sae_step_stash: dict[str, Any] | None = None
         self._last_sae_step_readings: dict[str, "ProbeReading"] | None = None
@@ -1327,6 +1328,13 @@ class SaklasSession:
         # DLS toggle stored on the session so ad-hoc ``session.extract``
         # calls (via ``ExtractionPipeline``) inherit it without re-passing.
         self._dls: bool = bool(dls)
+
+        # Steering-resolution collaborator is required while bootstrapping
+        # manifold probes: the loader is the single artifact registration
+        # authority. Construction itself only captures the session reference;
+        # push/pop paths that consult the monitor run after initialization.
+        from saklas.core.steering_composer import SteeringComposer
+        self._steering_composer: SteeringComposer = SteeringComposer(self)
 
         probe_manifolds: dict[str, "Manifold"] = {}
         if probe_categories:
@@ -1355,13 +1363,6 @@ class SaklasSession:
             probe_manifolds, self._layer_means, whitener=self._whitener,
             n_layers=len(self._layers),
         )
-
-        # Steering-resolution + stack collaborator (extracted from the session).
-        # Instantiated last among the steering state because its push/pop methods
-        # read ``_monitor.probe_names``; lazily importable so the module-load graph
-        # stays acyclic (composer imports session-level symbols at import time).
-        from saklas.core.steering_composer import SteeringComposer
-        self._steering_composer: SteeringComposer = SteeringComposer(self)
 
         # Prefix KV cache (opt-in, off by default).  Populated by
         # :meth:`cache_prefix`; consumed by :meth:`_generate_core` when the
@@ -3536,7 +3537,7 @@ class SaklasSession:
         # may already have computed the same readings from these exact rows;
         # reuse them to avoid a second selected-token host sync on the
         # pinned+gated+live path.
-        if getattr(self, "_lens_probes", None):
+        if self._lens_probes:
             readings_reused = False
             if stash is not None and stash.get("readings_fresh"):
                 reading_layers = tuple(
@@ -4053,7 +4054,7 @@ class SaklasSession:
         self,
     ) -> list[tuple[int, float, str | None, float | None]] | None:
         state = self._live_sae
-        if state is None or not getattr(self, "_live_sae_active_for_generation", True):
+        if state is None or not self._live_sae_active_for_generation:
             return None
         layer = int(state["layer"])
         buckets = self._capture.per_layer_buckets()
@@ -6323,8 +6324,8 @@ class SaklasSession:
         if not self._lens_probes:
             return {}
         lens = (
-            getattr(self, "_generation_jlens", None)
-            if getattr(self, "_generation_jlens_active", False)
+            self._generation_jlens
+            if self._generation_jlens_active
             else self.jlens
         )
         if lens is None:
@@ -6415,8 +6416,8 @@ class SaklasSession:
         if not self._lens_probes:
             return {}
         lens = (
-            getattr(self, "_generation_jlens", None)
-            if getattr(self, "_generation_jlens_active", False)
+            self._generation_jlens
+            if self._generation_jlens_active
             else self.jlens
         )
         if lens is None:
@@ -6434,8 +6435,8 @@ class SaklasSession:
             if not only:
                 return {}
         live_display_needs_full_probs = bool(
-            getattr(self, "_live_lens", None) is not None
-            and getattr(self, "_live_lens_active_for_generation", True)
+            self._live_lens is not None
+            and self._live_lens_active_for_generation
         )
         # When the token tap will immediately need every pinned probe reading
         # for the live payload, compute that superset once in the gate
@@ -9042,8 +9043,8 @@ class SaklasSession:
             # still carries per-token readings while the live lens is on.
             if live_scores and (
                 self._monitor.probe_names
-                or getattr(self, "_lens_probes", None)
-                or getattr(self, "_sae_probes", None)
+                or self._lens_probes
+                or self._sae_probes
             ):
                 raw_readings = payload.get("probe_readings")
                 if isinstance(raw_readings, dict) and raw_readings:
@@ -9285,9 +9286,9 @@ class SaklasSession:
         if not pooled:
             return {}
         out: dict[str, ProbeReading] = {}
-        if getattr(self, "_lens_probes", None):
+        if self._lens_probes:
             out.update(self._score_lens_probes(pooled))
-        if getattr(self, "_sae_probes", None):
+        if self._sae_probes:
             out.update(self._score_sae_probes(pooled))
         return out
 
@@ -9461,12 +9462,10 @@ class SaklasSession:
                 sampling is None or sampling.return_probe_readings
             )
             probe_names = (
-                list(getattr(self._monitor, "probe_names", []))
+                list(self._monitor.probe_names)
                 if return_probe_readings else []
             )
-            has_lens_probes = bool(return_probe_readings and getattr(
-                self, "_lens_probes", None,
-            ))
+            has_lens_probes = bool(return_probe_readings and self._lens_probes)
             if has_lens_probes:
                 # Batched generation bypasses ``_begin_capture`` but still
                 # owns one generation transaction. Pin one disk-refreshed lens
@@ -9474,15 +9473,9 @@ class SaklasSession:
                 # once per batch item.
                 self._generation_jlens = None
                 self._generation_jlens_active = False
-                self._generation_jlens = (
-                    self.jlens
-                    if hasattr(self, "_jlens_identity")
-                    else getattr(self, "_jlens", None)
-                )
+                self._generation_jlens = self.jlens
                 self._generation_jlens_active = True
-            has_sae_probes = bool(return_probe_readings and getattr(
-                self, "_sae_probes", None,
-            ))
+            has_sae_probes = bool(return_probe_readings and self._sae_probes)
             capture_probe_aggregates = bool(
                 probe_names or has_lens_probes or has_sae_probes
             )
@@ -9634,8 +9627,7 @@ class SaklasSession:
                 if steering_cm is not None:
                     self._exit_internal_steering(steering_cm, swallow=failed)
             finally:
-                if hasattr(self, "_capture"):
-                    self._end_capture()
+                self._end_capture()
                 self._active_gen_reservation = None
                 self._last_token_probe_payload = None
                 self._generation_jlens = None

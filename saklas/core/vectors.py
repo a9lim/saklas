@@ -6,9 +6,12 @@ import json
 import warnings
 from collections.abc import Sequence
 from importlib import resources as _resources
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
+
+if TYPE_CHECKING:
+    from saklas.core.manifold import Manifold
 
 
 # Default chunk size for the batched capture path (:func:`_encode_and_capture_all_batch`
@@ -871,9 +874,9 @@ def compute_dls_axes(
 def fold_directions_to_subspace(
     name: str,
     directions: dict[int, torch.Tensor],
-    neutral_means: dict[int, torch.Tensor] | None,
+    neutral_means: dict[int, torch.Tensor],
     *,
-    whitener: "Any | None" = None,
+    whitener: "Any",
     label: str = "+",
     feature_space: str = "raw",
 ) -> "Any":  # -> saklas.core.manifold.Manifold
@@ -892,25 +895,35 @@ def fold_directions_to_subspace(
 
     Per layer: ``basis = d̂_L``; ``LayerSubspace.node_coords = [[‖d_L‖]]`` —
     the real coord of the pole, a step of ``‖d_L‖`` along ``d̂`` from the
-    neutral origin (coord 0).  ``share = ‖d_L‖_M`` (whitened) / ``‖d_L‖₂``
-    (Euclidean) — the direction magnitude itself is the budget (a single
+    neutral origin (coord 0). ``share = ‖d_L‖_M``: the whitened direction
+    magnitude itself is the budget (a single
     direction has no node cloud to take a μ-centered spread over, so this is
     *not* :func:`~saklas.core.manifold.subspace_share`'s √2-scaled form; the
-    apply-time normalization handles the cross-layer scale either way).  No
+    apply-time normalization handles the cross-layer scale). No
     DLS — a derived direction has no polarity for the straddle test; the
-    caller's layer set folds verbatim.  No origin store (coord 0, §2).
-    ``neutral_means=None`` (CPU stubs) anchors at coord 0.
+    caller's layer set folds verbatim. No origin store (coord 0, §2).
+    Neutral means and a covering whitener are mandatory.
     """
     from saklas.core.manifold import (
         CustomDomain, LayerSubspace, Manifold,
     )
 
+    from saklas.core.mahalanobis import WhitenerError
+
     present = sorted(directions)
-    maha_w = (
-        whitener
-        if whitener is not None and whitener.covers_all(present)
-        else None
-    )
+    if not present:
+        raise ValueError("cannot fold an empty direction profile")
+    missing_means = sorted(set(present) - set(neutral_means))
+    if missing_means:
+        raise WhitenerError(
+            f"folding {name!r} requires neutral means for every layer; "
+            f"missing {missing_means}"
+        )
+    if whitener is None or not whitener.covers_all(present):
+        raise WhitenerError(
+            f"folding {name!r} requires a Mahalanobis whitener covering "
+            f"every layer {present}"
+        )
 
     # Every fresh tensor follows the directions' device so the folded manifold
     # is internally device-consistent.  The dispatch-time fold runs over a
@@ -928,20 +941,15 @@ def fold_directions_to_subspace(
         if norm <= 1e-12:
             continue
         basis = (d / norm).reshape(1, -1)          # (1, D) unit d̂
-        nu = (
-            neutral_means[idx].to(device=d.device, dtype=torch.float32).reshape(-1)
-            if neutral_means is not None and idx in neutral_means
-            else None
-        )
+        nu = neutral_means[idx].to(
+            device=d.device, dtype=torch.float32,
+        ).reshape(-1)
         # Neutral-anchored: mean = P_basis(ν) (off-span part of ν dropped);
         # the pole sits at the real coord ‖d‖ along d̂ from the origin.
-        mean = (nu @ basis.T) @ basis if nu is not None else torch.zeros_like(d)
+        mean = (nu @ basis.T) @ basis
         node_coords_L = torch.tensor([[norm]], dtype=torch.float32, device=d.device)
         layers[idx] = LayerSubspace.affine(mean, basis, node_coords=node_coords_L)
-        mahalanobis_share[idx] = (
-            float(maha_w.mahalanobis_norm(idx, d))
-            if maha_w is not None else norm
-        )
+        mahalanobis_share[idx] = float(whitener.mahalanobis_norm(idx, d))
 
     # Shared display layout: a single ``+`` pole at coord 1 (the real per-layer
     # pole distance ‖d_L‖ lives on each ``LayerSubspace.node_coords``).
@@ -957,13 +965,11 @@ def fold_directions_to_subspace(
         node_kinds=[None],
         mahalanobis_share=mahalanobis_share,
     )
-    manifold.metadata["share_metric"] = (
-        "mahalanobis" if maha_w is not None else "euclidean"
-    )
+    manifold.metadata["share_metric"] = "mahalanobis"
     return manifold
 
 
-def is_foldable_vector_manifold(manifold: "Any") -> bool:
+def is_foldable_vector_manifold(manifold: "Manifold") -> bool:
     """True iff *manifold* is a folded (affine ``R = 1``) steering vector —
     the only shape :func:`folded_vector_directions` accepts.
 
@@ -973,16 +979,16 @@ def is_foldable_vector_manifold(manifold: "Any") -> bool:
     ``vectors/pairwise``).  Callers use this to skip such probes instead of
     letting the fold raise — an empty / layerless manifold is also False.
     """
-    layers = getattr(manifold, "layers", None)
+    layers = manifold.layers
     if not layers:
         return False
     return all(
-        getattr(sub, "is_affine", False) and getattr(sub, "rank", 0) == 1
+        sub.is_affine and sub.rank == 1
         for sub in layers.values()
     )
 
 
-def folded_vector_directions(manifold: "Any") -> dict[int, torch.Tensor]:
+def folded_vector_directions(manifold: "Manifold") -> dict[int, torch.Tensor]:
     """Baked-direction view of a folded (affine ``R = 1``) vector manifold.
 
     Returns ``{L: δ̂_L · share_L}`` — the steering-vector-equivalent baked
@@ -1005,14 +1011,15 @@ def folded_vector_directions(manifold: "Any") -> dict[int, torch.Tensor]:
     single-direction view is only meaningful for a folded ``R = 1`` vector.
     """
     out: dict[int, torch.Tensor] = {}
-    share_map = getattr(manifold, "mahalanobis_share", None) or {}
+    manifold.validate_runtime_geometry()
+    share_map = manifold.mahalanobis_share
     for idx, sub in manifold.layers.items():
         if not sub.is_affine or sub.rank != 1:
             raise ValueError(
                 "folded_vector_directions requires affine R=1 layers; "
                 f"layer {idx} is rank {sub.rank}, affine={sub.is_affine}"
             )
-        share = float(share_map.get(idx, 1.0))
+        share = float(share_map[idx])
         out[idx] = sub.basis.reshape(-1).to(torch.float32) * share
     return out
 

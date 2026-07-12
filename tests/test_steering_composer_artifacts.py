@@ -13,13 +13,24 @@ from saklas.core.steering_composer import SteeringComposer
 from saklas.core.vectors import fold_directions_to_subspace
 from saklas.io.manifold_folder import ManifoldFormatError
 from saklas.io.manifolds import create_baked_manifold_folder, transfer_manifold
-from saklas.io.paths import safe_model_id
+from saklas.io.paths import encode_release_id
+from tests._whitener import synthetic_means, synthetic_whitener
 
 
 def _runtime(model_id: str, model: torch.nn.Module) -> Any:
     return SimpleNamespace(
         model_id=model_id, _model=model, _device=torch.device("cpu"),
         _manifolds={}, _profiles={},
+    )
+
+
+def _fold(name: str, directions: dict[int, torch.Tensor], *, label: str) -> Any:
+    layers = sorted(directions)
+    dim = int(next(iter(directions.values())).numel())
+    means = synthetic_means(layers, dim)
+    whitener = synthetic_whitener(layers, dim, means=means)
+    return fold_directions_to_subspace(
+        name, directions, means, whitener=whitener, label=label,
     )
 
 
@@ -30,9 +41,8 @@ def test_baked_manifold_cold_loads_with_proven_fingerprint(
     model = torch.nn.Linear(4, 4, bias=False)
     model_id = "test/model"
     fingerprint = loaded_model_fingerprint(model, model_id)
-    manifold = fold_directions_to_subspace(
-        "merged", {0: torch.tensor([1.0, 0.0, 0.0, 0.0])}, None,
-        label="merged",
+    manifold = _fold(
+        "merged", {0: torch.tensor([1.0, 0.0, 0.0, 0.0])}, label="merged",
     )
     create_baked_manifold_folder(
         "local", "merged", "", manifold, model_id, method="merge",
@@ -51,9 +61,7 @@ def test_cold_load_rejects_finite_tensor_corruption(
     model = torch.nn.Linear(4, 4, bias=False)
     model_id = "test/model"
     fingerprint = loaded_model_fingerprint(model, model_id)
-    manifold = fold_directions_to_subspace(
-        "merged", {0: torch.ones(4)}, None, label="merged",
-    )
+    manifold = _fold("merged", {0: torch.ones(4)}, label="merged")
     folder, _ = create_baked_manifold_folder(
         "local", "merged", "", manifold, model_id, method="merge",
         model_fingerprint=fingerprint,
@@ -76,9 +84,7 @@ def test_cold_load_rejects_untracked_fitted_pair(
     model = torch.nn.Linear(4, 4, bias=False)
     model_id = "test/model"
     fingerprint = loaded_model_fingerprint(model, model_id)
-    manifold = fold_directions_to_subspace(
-        "merged", {0: torch.ones(4)}, None, label="merged",
-    )
+    manifold = _fold("merged", {0: torch.ones(4)}, label="merged")
     folder, _ = create_baked_manifold_folder(
         "local", "merged", "", manifold, model_id, method="merge",
         model_fingerprint=fingerprint,
@@ -105,9 +111,8 @@ def test_transfer_variant_cold_loads_for_target_identity(
     source_fp = "source-fingerprint"
     target_model = torch.nn.Linear(4, 4, bias=False)
     target_fp = loaded_model_fingerprint(target_model, target_id)
-    manifold = fold_directions_to_subspace(
-        "merged", {0: torch.tensor([1.0, 0.0, 0.0, 0.0])}, None,
-        label="merged",
+    manifold = _fold(
+        "merged", {0: torch.tensor([1.0, 0.0, 0.0, 0.0])}, label="merged",
     )
     folder, _ = create_baked_manifold_folder(
         "local", "merged", "", manifold, source_id, method="merge",
@@ -124,11 +129,12 @@ def test_transfer_variant_cold_loads_for_target_identity(
         folder, from_model=source_id, to_model=target_id,
         alignment={0: LayerAlignment(torch.eye(4), torch.eye(4), torch.zeros(4))},
         whitener=whitener,
+        target_layer_means={0: acts[0].mean(dim=0)},
         source_model_fingerprint=source_fp,
         target_model_fingerprint=target_fp,
     )
 
-    key = f"local/merged:from-{safe_model_id(source_id)}"
+    key = f"local/merged:from-{encode_release_id(source_id)}"
     runtime = _runtime(target_id, target_model)
     SteeringComposer(runtime).ensure_manifold_loaded(key)
     assert key in runtime._manifolds

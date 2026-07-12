@@ -688,6 +688,8 @@ def test_save_load_manifold_round_trip(tmp_path: Path, monkeypatch: pytest.Monke
         # is 1-D, so each ``O_L`` is ``(1,)``).
         origin={4: torch.tensor([0.42]), 9: torch.tensor([0.55])},
     )
+    for sub in manifold.layers.values():
+        _attach_constant_sigma(sub, 0.1)
     path = tmp_path / "mood" / "model.safetensors"
     save_manifold(manifold, path, {"method": "manifold_pca",
                                    "nodes_sha256": "abc123",
@@ -725,12 +727,10 @@ def test_save_load_manifold_round_trip(tmp_path: Path, monkeypatch: pytest.Monke
     )
 
 
-def test_load_manifold_with_empty_share_fields(
+def test_save_rejects_manifold_with_empty_share_fields(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A fit with no whitener (no ``mahalanobis_share`` / ``share_metric``)
-    round-trips with an empty share dict and no crash — the apply path
-    then falls back to the Euclidean spread."""
+    """Persistence rejects geometry without complete Mahalanobis shares."""
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     ca, domain, node_params = _circle(7, dim=20)
     manifold = Manifold(
@@ -742,15 +742,9 @@ def test_load_manifold_with_empty_share_fields(
         feature_space="raw",
     )  # no mahalanobis_share
     path = tmp_path / "mood" / "model.safetensors"
-    save_manifold(manifold, path, {"method": "manifold_pca",
-                                   "nodes_sha256": "abc"})
-    loaded = load_manifold(path)
-    assert loaded.mahalanobis_share == {}
-    assert loaded.metadata["share_metric"] is None
-    assert loaded.metadata["mahalanobis_share_per_layer"] == {}
-    # A manifold saved with ``origin=None`` round-trips with absence
-    # preserved — no ``origin`` tensor written, loads back as ``None``.
-    assert loaded.origin == {}
+    with pytest.raises(ValueError, match="Mahalanobis shares"):
+        save_manifold(manifold, path, {"method": "manifold_pca",
+                                       "nodes_sha256": "abc"})
 
 
 def test_layer_subspace_to_device_dtype():
@@ -1325,6 +1319,7 @@ def test_sigma_field_save_load_round_trip(tmp_path: Path):
         name="fuzzy", domain=domain,
         node_labels=[f"n{i}" for i in range(9)],
         node_coords=coords, layers={0: sub},
+        mahalanobis_share={0: 1.0}, origin={0: torch.zeros(2)},
     )
     path = tmp_path / "fuzzy.safetensors"
     save_manifold(man, path, {"method": "manifold_spectral"})
@@ -1336,9 +1331,7 @@ def test_sigma_field_save_load_round_trip(tmp_path: Path):
         assert abs(float(lsub.sigma_at(z)) - float(sub.sigma_at(z))) < 1e-4
 
 
-def test_legacy_curved_manifold_loads_without_sigma(tmp_path: Path):
-    # A curved manifold saved with no σ-field loads with σ absent (back-compat):
-    # sigma_at returns 0, soft onto degenerates to the hard collapse.
+def test_curved_manifold_without_sigma_is_rejected(tmp_path: Path):
     sub, domain = _grid_manifold()
     coords = torch.tensor(
         [[u, v] for u in (0.0, 0.5, 1.0) for v in (0.0, 0.5, 1.0)]
@@ -1347,13 +1340,11 @@ def test_legacy_curved_manifold_loads_without_sigma(tmp_path: Path):
         name="legacy", domain=domain,
         node_labels=[f"n{i}" for i in range(9)],
         node_coords=coords, layers={0: sub},
+        mahalanobis_share={0: 1.0}, origin={0: torch.zeros(2)},
     )
     path = tmp_path / "legacy.safetensors"
-    save_manifold(man, path, {"method": "manifold_spectral"})
-    loaded = load_manifold(path)
-    assert not loaded.layers[0].has_sigma
-    z = domain.embed(torch.tensor([0.4, 0.4]))
-    assert float(loaded.layers[0].sigma_at(z)) == 0.0
+    with pytest.raises(ValueError, match="requires a sigma field"):
+        save_manifold(man, path, {"method": "manifold_spectral"})
 
 
 # ------------------------------------------------- affine (flat) subspace ---
@@ -1502,15 +1493,18 @@ def test_save_load_affine_manifold_round_trip(
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     sub_a, _ = _folded_vector(dim=18, seed=1)
     sub_b, _ = _folded_vector(dim=18, seed=2)
+    real_node_coords = torch.tensor([[0.8], [-0.8]])
+    sub_a.node_coords = real_node_coords.clone()
+    sub_b.node_coords = real_node_coords.clone()
     manifold = Manifold(
         name="folded",
         domain=CustomDomain(1),
         node_labels=["pos", "neg"],
-        node_coords=torch.tensor([[0.8], [-0.8]]),
+        node_coords=real_node_coords,
         layers={5: sub_a, 11: sub_b},
         feature_space="raw",
         mahalanobis_share={5: 1.2, 11: 0.7},
-        origin={5: torch.tensor([0.0]), 11: torch.tensor([0.0])},
+        origin={},
     )
     path = tmp_path / "folded" / "model.safetensors"
     save_manifold(manifold, path, {"method": "folded_vector",

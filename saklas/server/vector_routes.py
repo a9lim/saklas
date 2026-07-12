@@ -132,7 +132,7 @@ def register_vector_routes(app: FastAPI) -> None:
         # access).  It must cover every row-layer of ``a`` (each row is
         # framed in its row-layer's covariance) — there is no Euclidean
         # fallback, so a missing / non-covering whitener is a 409.
-        whitener = getattr(session, "whitener", None)
+        whitener = session.whitener
         if whitener is None or not whitener.covers_all(layers_a):
             raise HTTPException(
                 409,
@@ -144,11 +144,7 @@ def register_vector_routes(app: FastAPI) -> None:
         matrix: list[list[float | None]] = []
         for la, va in zip(layers_a, vecs_a, strict=True):
             row: list[float | None] = [None] * len(vecs_b)
-            try:
-                si_va = whitener.apply_inv(la, va).float()
-            except Exception:
-                matrix.append(row)
-                continue
+            si_va = whitener.apply_inv(la, va).float()
             aa = max(
                 float(_torch.dot(va.reshape(-1), si_va.reshape(-1)).item()),
                 0.0,
@@ -172,11 +168,7 @@ def register_vector_routes(app: FastAPI) -> None:
                 continue
 
             block = _torch.stack(b_rows)
-            try:
-                si_block = whitener.apply_inv(la, block).float()
-            except Exception:
-                matrix.append(row)
-                continue
+            si_block = whitener.apply_inv(la, block).float()
             bb = (block.reshape(len(b_rows), -1) * si_block.reshape(
                 len(b_rows), -1,
             )).sum(dim=1).clamp_min(0.0)
@@ -196,7 +188,7 @@ def register_vector_routes(app: FastAPI) -> None:
             "layers_a": layers_a,
             "layers_b": layers_b,
             "matrix": matrix,
-            "model": getattr(session, "model_id", None),
+            "model": session.model_id,
         }
 
     @app.get("/saklas/v1/sessions/{session_id}/vectors/{name}")
@@ -259,7 +251,7 @@ def register_vector_routes(app: FastAPI) -> None:
         # whitener is a 409 (regenerate the neutral cache).  A pair the
         # whitener doesn't fully cover still raises inside the loop and
         # lands as ``None`` for that cell.
-        whitener = getattr(session, "whitener", None)
+        whitener = session.whitener
         if whitener is None:
             raise HTTPException(
                 409,
@@ -279,12 +271,9 @@ def register_vector_routes(app: FastAPI) -> None:
         for name, prof in pool.items():
             entries: dict[int, tuple[Any, Any, float]] = {}
             for layer, tensor in prof.items():
-                try:
-                    vec = tensor.float().cpu().reshape(-1)
-                    si_vec = whitener.apply_inv(layer, vec).float().reshape(-1)
-                    norm_sq = max(float(_torch.dot(vec, si_vec).item()), 0.0)
-                except Exception:
-                    continue
+                vec = tensor.float().cpu().reshape(-1)
+                si_vec = whitener.apply_inv(layer, vec).float().reshape(-1)
+                norm_sq = max(float(_torch.dot(vec, si_vec).item()), 0.0)
                 entries[int(layer)] = (vec, si_vec, norm_sq)
             white_cache[name] = entries
 
@@ -493,7 +482,7 @@ def register_vector_routes(app: FastAPI) -> None:
 
         # ``diagnostics`` is a Profile attribute; a probe folded from its
         # manifold carries no ``diagnostics`` block.  ``getattr`` covers both.
-        diagnostics = getattr(profile, "diagnostics", None)
+        diagnostics = profile.diagnostics
         # ``total_layers`` is the *model's* layer count, not the profile's
         # — the layer-norms drawer in the web UI fills layers absent from
         # the profile with zero so the user can read the DLS pattern.

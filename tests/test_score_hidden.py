@@ -385,8 +385,7 @@ def test_partial_coverage_raises():
         1: torch.tensor([0.0, 1.0, 0.0, 0.0]),
     }
     means = {0: mean0, 1: torch.zeros(4)}
-    m = fold_directions_to_subspace("x", direction, means, whitener=whitener)
-    # Coverage is enforced at attach: the partial whitener doesn't cover the
-    # probe's layer 1, so building the per-probe whitened factors raises.
+    # Coverage is enforced at construction: a partial whitener cannot produce
+    # a current manifold carrying mixed metrics across its layers.
     with pytest.raises(WhitenerError, match="whitener"):
-        Monitor({"x": m}, layer_means=means, whitener=whitener)
+        fold_directions_to_subspace("x", direction, means, whitener=whitener)

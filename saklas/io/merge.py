@@ -16,7 +16,7 @@ from typing import Any, Optional
 import torch
 
 from saklas.core.errors import SaklasError
-from saklas.io.paths import safe_model_id
+from saklas.io.paths import safe_model_id, unsafe_model_id
 
 log = logging.getLogger(__name__)
 
@@ -90,7 +90,7 @@ def _manifold_tensor_path(ns: str, name: str, sid: str, variant: Optional[str]) 
     path = manifold_dir(ns, name) / tensor_filename(
         sid, release=release, transferred_from=transferred_from,
         model_id_is_safe=True,
-        transferred_from_is_safe=transferred_from is not None,
+        transferred_from_is_encoded=transferred_from is not None,
     )
     return path if path.exists() and path.with_suffix(".json").exists() else None
 
@@ -131,13 +131,13 @@ def _resolve_component(
             f"component {coord} is role-baselined; select its :role-* alias"
         )
     if variant is not None and variant.startswith("from-"):
-        from saklas.io.paths import safe_model_id
+        from saklas.io.paths import encode_release_id
 
         requested_source = variant[len("from-"):]
         source_id = metadata.get("source_model_id")
         if (
             not isinstance(source_id, str)
-            or safe_model_id(source_id).lower() != requested_source.lower()
+            or encode_release_id(source_id) != requested_source
         ):
             raise MergeError(
                 f"component {coord} transfer provenance does not match "
@@ -486,11 +486,18 @@ def _merge_into_manifold_locked(
             }
 
         merged = linear_sum(profiles_and_alphas, strict=strict)
-        # Fold the derived direction into a corpus-less one-pole ray
-        # (neutral_means=None — an offline merge has no model/whitener loaded,
-        # so the subspace anchors at coord 0 and the share is the Euclidean
-        # ‖merged_L‖, the same magnitude the components already carry baked in).
-        manifold = fold_directions_to_subspace(name, merged, None, label="merged")
+        # Fold the derived direction under the target model's persisted neutral
+        # metric. Offline means model-free, not metric-free: current baked
+        # manifolds use the same Mahalanobis unit and neutral anchor as live
+        # composition.
+        from saklas.core.mahalanobis import LayerWhitener
+
+        model_id = unsafe_model_id(sid)
+        whitener = LayerWhitener.from_cache(model_id)
+        manifold = fold_directions_to_subspace(
+            name, merged, whitener.layer_means,
+            whitener=whitener, label="merged",
+        )
         baked_fingerprint = (
             next(iter(component_fingerprints))
             if fingerprint_complete and len(component_fingerprints) == 1

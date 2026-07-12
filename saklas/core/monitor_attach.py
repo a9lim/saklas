@@ -437,8 +437,7 @@ def _attach_manifold_probe(
     it is present for every probed layer; an absent share (CPU stub / partial
     fit) falls back to uniform weighting via the floor.
     """
-    if not manifold.layers:
-        raise ValueError(f"manifold {manifold.name!r} carries no fitted layers")
+    manifold.validate_runtime_geometry()
     if manifold.node_coords.numel() == 0 or not manifold.node_labels:
         raise ValueError(
             f"manifold {manifold.name!r} carries no node coords / labels"
@@ -468,9 +467,7 @@ def _attach_manifold_probe(
             v_centered = v_world - sub_f32.mean
             v_reduced = v_centered @ sub_f32.basis.T  # (K, R)
         node_values_reduced[layer_idx] = v_reduced.contiguous()
-        share_weights_raw[layer_idx] = float(
-            manifold.mahalanobis_share.get(layer_idx, 0.0)
-        )
+        share_weights_raw[layer_idx] = float(manifold.mahalanobis_share[layer_idx])
     total = sum(max(_MIN_SHARE_WEIGHT, w) for w in share_weights_raw.values())
     if total <= 0.0:
         n_layers = max(1, len(share_weights_raw))

@@ -20,6 +20,7 @@ from saklas.core.steering import Steering
 from saklas.core.steering_composer import SteeringComposer
 from saklas.core.steering_expr import AblationTerm
 from saklas.core.triggers import Trigger
+from tests._whitener import isotropic_whitener
 
 
 @pytest.fixture(autouse=True)
@@ -59,14 +60,10 @@ def _skeleton_session() -> SaklasSession:
     from saklas.core.session import GenState
     session._gen_phase = GenState.IDLE
     session._internal_steering_pop = False
-    session._whitener = None
+    session._whitener = isotropic_whitener([1], 3)
     session._compiled = False
     session._compiled_clean_eligible = False
     session._monitor = type("_Monitor", (), {"probe_names": []})()
-    # Skeleton session has no real model.  These ablation tests don't
-    # materialize ``~``/``|`` projections (which would now require a covering
-    # whitener), so the stub ``whitener`` property returns ``None``.
-    type(session).whitener = property(lambda _self: None)  # pyright: ignore[reportAttributeAccessIssue]  # monkey-patching read-only property on type for skeleton stub
     session.events = EventBus()
     session._history = []  # pyright: ignore[reportAttributeAccessIssue]  # skeleton: _history is dynamically set
     return session

@@ -15,6 +15,7 @@ import torch.nn as nn
 from saklas.core.hooks import SteeringHook, SteeringManager
 from saklas.core.manifold import CustomDomain, LayerSubspace, synthesize_subspace
 from saklas.core.triggers import Trigger, TriggerContext
+from tests._whitener import isotropic_whitener
 
 
 _DIM = 16
@@ -49,6 +50,7 @@ def _affine_group(layer: int, trigger: Trigger) -> _AffineEntry:
     synth = synthesize_subspace(
         push=[({layer: u.reshape(1, -1)}, {layer: torch.tensor([1.0])}, 0.8)],
         ablate=[], neutral_means={layer: neutral},
+        whitener=isotropic_whitener([layer], _DIM),
     )
     sub = synth.layers[layer]
     return (
@@ -135,6 +137,7 @@ def test_manager_threads_ctx_into_hooks():
     synth = synthesize_subspace(
         push=[({0: _unit(_DIM).reshape(1, -1)}, {0: torch.tensor([1.0])}, 0.5)],
         ablate=[], neutral_means={0: 20.0 + torch.randn(_DIM)},
+        whitener=isotropic_whitener([0], _DIM),
     )
     mgr.add_subspace("__affine__", synth)
     layers = nn.ModuleList([nn.Identity() for _ in range(2)])

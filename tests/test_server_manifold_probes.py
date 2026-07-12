@@ -938,7 +938,10 @@ def _author_manifold_on_disk(
         "fit_mode": "authored",
         "domain": {
             "type": "box",
-            "axes": [{"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}],
+            "axes": [{
+                "name": "t", "periodic": False, "period": 1.0,
+                "lo": 0.0, "hi": 1.0,
+            }],
         },
         "nodes": nodes,
         "files": {},

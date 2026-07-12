@@ -664,7 +664,7 @@ def test_cold_alignment_reuses_loaded_target_neutrals_for_whitener(
         alignment_mod, "save_alignment_map",
         lambda *_args, **_kwargs: tmp_path / "alignment.safetensors",
     )
-    maps, quality, _path, _src_id, _tgt_id, whitener = (
+    maps, quality, _path, _src_id, _tgt_id, whitener, layer_means = (
         runners._load_or_fit_transfer_alignment(
             "src/model", "tgt/model", force=True, label="test transfer",
         )
@@ -674,6 +674,7 @@ def test_cold_alignment_reuses_loaded_target_neutrals_for_whitener(
     assert quality == {0: 1.0}
     assert torch.equal(maps[0], torch.eye(2))
     assert whitener.layers == {0}
+    assert set(layer_means) == {0}
 
 
 def test_cold_narrow_alignment_releases_full_seed_rosters_before_fit(
@@ -1413,6 +1414,7 @@ def test_run_manifold_transfer_calls_backend(monkeypatch: pytest.MonkeyPatch, tm
         for layer in (14, 15)
     }
     target_whitener = object()
+    target_layer_means = {14: torch.zeros(4), 15: torch.zeros(4)}
     alignment_calls: list[dict[str, Any]] = []
 
     def fake_alignment(*_args: Any, **kwargs: Any):
@@ -1422,6 +1424,7 @@ def test_run_manifold_transfer_calls_backend(monkeypatch: pytest.MonkeyPatch, tm
             {"model_fingerprint": "src-fp"},
             {"model_fingerprint": "tgt-fp"},
             target_whitener,
+            target_layer_means,
         )
 
     monkeypatch.setattr(
@@ -1434,13 +1437,14 @@ def test_run_manifold_transfer_calls_backend(monkeypatch: pytest.MonkeyPatch, tm
                       alignment: Any, transfer_quality_estimate: Any = None,
                       source_model_fingerprint: Any = None,
                       target_model_fingerprint: Any = None,
-                      whitener: Any = None, layer_means: Any = None,
+                      whitener: Any = None, target_layer_means: Any = None,
                       force: bool = False,
                       expected_source_proof: Any = None) -> Path:
         calls.append({
             "folder": folder_arg, "from": from_model, "to": to_model,
             "layers": sorted(alignment.keys()), "quality": transfer_quality_estimate,
             "force": force, "whitener": whitener,
+            "target_layer_means": target_layer_means,
             "source_proof": expected_source_proof,
         })
         return folder_arg / "Qwen__Qwen3-4B_from-google__gemma-3-4b-it.safetensors"
@@ -1456,6 +1460,7 @@ def test_run_manifold_transfer_calls_backend(monkeypatch: pytest.MonkeyPatch, tm
     assert c["to"] == "Qwen/Qwen3-4B"
     assert c["layers"] == [14, 15]
     assert c["whitener"] is target_whitener
+    assert c["target_layer_means"] is target_layer_means
     assert alignment_calls[0]["requested_layers"] == [14, 15]
     assert c["source_proof"] is source_proof
     # Median of {0.9, 0.8} = 0.85.
@@ -1487,6 +1492,7 @@ def test_run_manifold_transfer_json(monkeypatch: pytest.MonkeyPatch, tmp_path: P
             {"model_fingerprint": "src-fp"},
             {"model_fingerprint": "tgt-fp"},
             target_whitener,
+            {10: torch.zeros(2)},
         ),
     )
     monkeypatch.setattr(
@@ -1533,6 +1539,7 @@ def test_run_manifold_transfer_retries_unproven_target(
             {"model_fingerprint": "src-fp"},
             {"model_fingerprint": "tgt-fp"},
             target_whitener,
+            {0: torch.zeros(2)},
         ),
     )
     target = folder / tensor_filename(tgt_model, transferred_from=src_model)

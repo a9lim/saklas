@@ -89,6 +89,7 @@ def _load_or_fit_transfer_alignment(
     requested_layers: "Sequence[int] | None" = None,
 ) -> tuple[
     dict[int, Any], dict[int, float], Path, dict[str, Any], dict[str, Any], Any,
+    dict[int, Any],
 ]:
     """Single-flight a complete alignment plus its target metric."""
     from saklas.io.alignment import alignment_fit_lock
@@ -109,6 +110,7 @@ def _load_or_fit_transfer_alignment_locked(
     requested_layers: "Sequence[int] | None" = None,
 ) -> tuple[
     dict[int, Any], dict[int, float], Path, dict[str, Any], dict[str, Any], Any,
+    dict[int, Any],
 ]:
     """Load or fit an alignment and return its identity-matched target whitener."""
     from saklas.io.alignment import (
@@ -268,6 +270,7 @@ def _load_or_fit_transfer_alignment_locked(
             {layer: cached_M[layer] for layer in sorted(wanted)},
             selected_quality, map_path, src_identity, expected_tgt_identity,
             _target_whitener_from_neutral_activations(tgt_acts),
+            {layer: tensor.mean(dim=0) for layer, tensor in tgt_acts.items()},
         )
 
     missing = wanted if force else (wanted - set(cached_M))
@@ -312,6 +315,7 @@ def _load_or_fit_transfer_alignment_locked(
         {layer: result_M[layer] for layer in sorted(wanted)},
         selected_quality, map_path, src_identity, expected_tgt_identity,
         _target_whitener_from_neutral_activations(tgt_acts),
+        {layer: tensor.mean(dim=0) for layer, tensor in tgt_acts.items()},
     )
 
 
@@ -2187,7 +2191,7 @@ def _run_manifold_transfer(args: argparse.Namespace) -> None:
     from saklas.io.manifolds import (
         ManifoldFormatError, preflight_transfer_manifold, transfer_manifold,
     )
-    from saklas.io.paths import manifold_dir, safe_model_id
+    from saklas.io.paths import encode_release_id, manifold_dir
 
     ns, name = _resolve_manifold_ns_name(args.name)
     folder = manifold_dir(ns, name)
@@ -2220,7 +2224,7 @@ def _run_manifold_transfer(args: argparse.Namespace) -> None:
     try:
         (
             M, quality_per_layer, _, source_identity, target_identity,
-            target_whitener,
+            target_whitener, target_layer_means,
         ) = _load_or_fit_transfer_alignment(
             args.src_model, args.tgt_model, force=args.force,
             label="manifold transfer",
@@ -2242,6 +2246,7 @@ def _run_manifold_transfer(args: argparse.Namespace) -> None:
             source_model_fingerprint=source_identity["model_fingerprint"],
             target_model_fingerprint=target_identity["model_fingerprint"],
             whitener=target_whitener,
+            target_layer_means=target_layer_means,
             force=args.force,
             expected_source_proof=source_proof,
         )
@@ -2271,7 +2276,7 @@ def _run_manifold_transfer(args: argparse.Namespace) -> None:
         f"  layers:           {len(M)} shared\n"
         f"  median quality:   {quality_str} (R^2 across shared layers)\n"
         f"  tensor:           {out_path}\n"
-        f"  variant suffix:   :from-{safe_model_id(args.src_model)}"
+        f"  variant suffix:   :from-{encode_release_id(args.src_model)}"
     )
 
 

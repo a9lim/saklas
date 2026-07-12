@@ -251,7 +251,9 @@ def create_manifold_folder(
     """
     _validate_ns_name(namespace, name)
     try:
-        domain = domain_from_spec(domain_spec)
+        from saklas.core.manifold import normalize_domain_spec
+
+        domain = domain_from_spec(normalize_domain_spec(domain_spec))
     except (ValueError, KeyError) as e:
         raise ManifoldFormatError(f"invalid manifold domain: {e}") from e
     _validate_authored_nodes(name, domain, nodes)

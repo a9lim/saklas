@@ -131,11 +131,10 @@ class _Handle:
 
 
 def _box1d_domain(periodic: bool, k: int) -> dict[str, Any]:
-    axis = (
-        {"name": "t", "periodic": True, "period": 1.0}
-        if periodic
-        else {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}
-    )
+    axis = {
+        "name": "t", "periodic": periodic, "period": 1.0,
+        "lo": 0.0, "hi": 1.0,
+    }
     return {"type": "box", "axes": [axis]}
 
 
@@ -2069,8 +2068,10 @@ def test_fit_n2_box_manifold(tmp_path: Path) -> None:
     domain = {
         "type": "box",
         "axes": [
-            {"name": "u", "periodic": False, "lo": 0.0, "hi": 1.0},
-            {"name": "v", "periodic": False, "lo": 0.0, "hi": 1.0},
+            {"name": "u", "periodic": False, "period": 1.0,
+             "lo": 0.0, "hi": 1.0},
+            {"name": "v", "periodic": False, "period": 1.0,
+             "lo": 0.0, "hi": 1.0},
         ],
     }
     coords = [[x, y] for x in (0.0, 0.5, 1.0) for y in (0.0, 0.5, 1.0)]
@@ -2090,8 +2091,10 @@ def test_fit_rejects_poisedness_failure(tmp_path: Path) -> None:
     domain = {
         "type": "box",
         "axes": [
-            {"name": "u", "periodic": False, "lo": 0.0, "hi": 1.0},
-            {"name": "v", "periodic": False, "lo": 0.0, "hi": 1.0},
+            {"name": "u", "periodic": False, "period": 1.0,
+             "lo": 0.0, "hi": 1.0},
+            {"name": "v", "periodic": False, "period": 1.0,
+             "lo": 0.0, "hi": 1.0},
         ],
     }
     coords = [[t, t] for t in (0.0, 0.25, 0.5, 0.75, 1.0)]
@@ -2655,23 +2658,25 @@ def test_auto_curved_partial_topup_reuses_durable_rows_without_recapture(
     )
 
 
+def _fold_test_direction(name: str, direction: torch.Tensor):
+    from saklas.core.vectors import fold_directions_to_subspace
+
+    whitener = synthetic_whitener([0], int(direction.numel()))
+    return fold_directions_to_subspace(
+        name, {0: direction}, whitener.layer_means,
+        label=name, whitener=whitener,
+    )
+
+
 def test_adopt_fitted_manifold_rebinds_loaded_probe_profile_and_prefix(
     tmp_path: Path,
 ) -> None:
     from types import SimpleNamespace
 
     from saklas.core.session import SaklasSession
-    from saklas.core.vectors import fold_directions_to_subspace
-
-    old = fold_directions_to_subspace(
-        "mood", {0: torch.tensor([1.0, 0.0])}, None, label="mood",
-    )
-    other = fold_directions_to_subspace(
-        "mood", {0: torch.tensor([0.0, 1.0])}, None, label="mood",
-    )
-    new = fold_directions_to_subspace(
-        "mood", {0: torch.tensor([0.0, 2.0])}, None, label="mood",
-    )
+    old = _fold_test_direction("mood", torch.tensor([1.0, 0.0]))
+    other = _fold_test_direction("mood", torch.tensor([0.0, 1.0]))
+    new = _fold_test_direction("mood", torch.tensor([0.0, 2.0]))
 
     class _Monitor:
         def __init__(self) -> None:
@@ -2714,8 +2719,10 @@ def test_adopt_fitted_manifold_rebinds_loaded_probe_profile_and_prefix(
     attached = session._monitor.probes["mood-probe"]
     assert attached.manifold is live
     assert attached.top_n == 4
+    from saklas.core.vectors import folded_vector_directions
+
     assert torch.allclose(
-        session._profiles["local/mood"][0], torch.tensor([0.0, 2.0]),
+        session._profiles["local/mood"][0], folded_vector_directions(new)[0],
     )
     assert session._prefix_cache is None
     assert session._analytics_cpu_cache == {}
@@ -2728,14 +2735,8 @@ def test_failed_fit_override_evicts_stale_manifold_consumers(
     from types import SimpleNamespace
 
     from saklas.core.session import SaklasSession
-    from saklas.core.vectors import fold_directions_to_subspace
-
-    old = fold_directions_to_subspace(
-        "mood", {0: torch.tensor([1.0, 0.0])}, None, label="mood",
-    )
-    other = fold_directions_to_subspace(
-        "mood", {0: torch.tensor([0.0, 1.0])}, None, label="mood",
-    )
+    old = _fold_test_direction("mood", torch.tensor([1.0, 0.0]))
+    other = _fold_test_direction("mood", torch.tensor([0.0, 1.0]))
 
     class _Monitor:
         def __init__(self) -> None:
@@ -2803,11 +2804,7 @@ def test_override_validation_failure_preserves_unchanged_consumers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from saklas.core.session import SaklasSession
-    from saklas.core.vectors import fold_directions_to_subspace
-
-    old = fold_directions_to_subspace(
-        "mood", {0: torch.tensor([1.0, 0.0])}, None, label="mood",
-    )
+    old = _fold_test_direction("mood", torch.tensor([1.0, 0.0]))
 
     class _Monitor:
         def attached_probes(self) -> dict[str, Any]:

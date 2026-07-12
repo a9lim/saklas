@@ -188,7 +188,7 @@ class SteeringComposer:
             )
         fname = tensor_filename(
             model_id, release=release, transferred_from=transferred_from,
-            transferred_from_is_safe=transferred_from is not None,
+            transferred_from_is_encoded=transferred_from is not None,
         )
 
         matches = [
@@ -214,7 +214,7 @@ class SteeringComposer:
         manifold = load_manifold(tensor_path)
         metadata = manifold.metadata
         from saklas.core.model import loaded_model_fingerprint
-        from saklas.io.paths import safe_model_id
+        from saklas.io.paths import encode_release_id
 
         live_fingerprint = loaded_model_fingerprint(
             self._session._model, model_id,
@@ -223,7 +223,7 @@ class SteeringComposer:
             source_id = metadata.get("source_model_id")
             if (
                 not isinstance(source_id, str)
-                or safe_model_id(source_id).lower() != transferred_from.lower()
+                or encode_release_id(source_id) != transferred_from
             ):
                 raise ManifoldNotRegisteredError(
                     f"manifold '{key}' transfer provenance does not match "
@@ -687,7 +687,7 @@ class SteeringComposer:
         the gating score callback.  Only keys whose base name is an attached
         lens probe count, mirroring the monitor filter.
         """
-        attached = set(getattr(self._session, "_lens_probes", None) or ())
+        attached = set(self._session._lens_probes)
         if not attached:
             return set()
         out: set[str] = set()
@@ -706,7 +706,7 @@ class SteeringComposer:
 
     def gated_sae_probe_keys(self) -> set[str]:
         """Exact gate scalar keys referencing attached SAE feature probes."""
-        attached = set(getattr(self._session, "_sae_probes", None) or ())
+        attached = set(self._session._sae_probes)
         if not attached:
             return set()
         out: set[str] = set()
@@ -765,7 +765,7 @@ class SteeringComposer:
 
         try:
             s = Steering.from_value(
-                value, profile_names=set(getattr(self._session, "_profiles", {})),
+                value, profile_names=set(self._session._profiles),
             )
         except Exception:
             return False
@@ -1010,7 +1010,9 @@ class SteeringComposer:
             # one-pole-ray subspace and push label-form, exactly as an affine
             # ``%`` term does.  There is no separate baked-vector fragment.
             prof = self.ensure_profile_registered(name)
-            folded = fold_directions_to_subspace(name, prof, neutral_means)
+            folded = fold_directions_to_subspace(
+                name, prof, neutral_means, whitener=whitener,
+            )
             if not folded.layers:
                 continue
             basis_dirs, coord_dirs = _affine_manifold_push(

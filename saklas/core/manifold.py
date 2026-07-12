@@ -588,32 +588,115 @@ class CustomDomain(ManifoldDomain):
         return coords
 
     def to_spec(self) -> dict[str, Any]:
-        spec: dict[str, Any] = {"type": "custom", "embed_dim": self._embed_dim}
-        if self._bounds is not None:
-            spec["bounds"] = [[lo, hi] for lo, hi in self._bounds]
-        return spec
+        return {
+            "type": "custom",
+            "embed_dim": self._embed_dim,
+            "bounds": (
+                None
+                if self._bounds is None
+                else [[lo, hi] for lo, hi in self._bounds]
+            ),
+        }
+
+
+def validate_domain_spec(spec: Any) -> dict[str, Any]:
+    """Validate the exact current tagged-union domain wire shape."""
+    if not isinstance(spec, dict):
+        raise ValueError("manifold domain must be an object")
+    kind = spec.get("type")
+    if kind == "box":
+        if set(spec) != {"type", "axes"} or not isinstance(spec["axes"], list) or not spec["axes"]:
+            raise ValueError("box domain requires exactly type + non-empty axes")
+        for index, axis in enumerate(spec["axes"]):
+            if not isinstance(axis, dict) or set(axis) != {
+                "name", "periodic", "period", "lo", "hi",
+            }:
+                raise ValueError(f"box axis {index} has a non-current schema")
+            if not isinstance(axis["name"], str) or not axis["name"]:
+                raise ValueError(f"box axis {index} name must be non-empty")
+            if not isinstance(axis["periodic"], bool):
+                raise ValueError(f"box axis {index} periodic must be bool")
+            for key in ("period", "lo", "hi"):
+                value = axis[key]
+                if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+                    raise ValueError(f"box axis {index} {key} must be finite")
+            if float(axis["period"]) <= 0 or float(axis["hi"]) <= float(axis["lo"]):
+                raise ValueError(f"box axis {index} has invalid bounds/period")
+    elif kind == "sphere":
+        if set(spec) != {"type", "dim"} or isinstance(spec["dim"], bool) or not isinstance(spec["dim"], int) or spec["dim"] < 1:
+            raise ValueError("sphere domain requires exactly type + positive integer dim")
+    elif kind == "custom":
+        if set(spec) != {"type", "embed_dim", "bounds"}:
+            raise ValueError("custom domain requires exactly type, embed_dim, bounds")
+        dim = spec["embed_dim"]
+        if isinstance(dim, bool) or not isinstance(dim, int) or dim < 1:
+            raise ValueError("custom domain embed_dim must be a positive integer")
+        bounds = spec["bounds"]
+        if bounds is not None and (
+            not isinstance(bounds, list)
+            or len(bounds) != dim
+            or any(
+                not isinstance(row, list)
+                or len(row) != 2
+                or any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(float(v)) for v in row)
+                or float(row[1]) <= float(row[0])
+                for row in bounds
+            )
+        ):
+            raise ValueError("custom domain bounds must be null or one finite [lo, hi] pair per dimension")
+    else:
+        raise ValueError(f"unknown manifold domain type {kind!r}")
+    return spec
+
+
+def normalize_domain_spec(spec: Any) -> dict[str, Any]:
+    """Normalize ergonomic authoring input into the exact persisted union."""
+    if not isinstance(spec, dict):
+        raise ValueError("manifold domain must be an object")
+    kind = spec.get("type")
+    if kind == "box" and set(spec) == {"type", "axes"} and isinstance(spec["axes"], list):
+        normalized = {
+            "type": "box",
+            "axes": [
+                {
+                    "name": axis.get("name", f"axis{index}"),
+                    "periodic": axis.get("periodic", False),
+                    "period": axis.get("period", 1.0),
+                    "lo": axis.get("lo", 0.0),
+                    "hi": axis.get("hi", 1.0),
+                }
+                for index, axis in enumerate(spec["axes"])
+                if isinstance(axis, dict)
+            ],
+        }
+    elif kind == "custom" and set(spec) <= {"type", "embed_dim", "bounds"}:
+        normalized = {**spec, "bounds": spec.get("bounds")}
+    else:
+        normalized = dict(spec)
+    return validate_domain_spec(normalized)
 
 
 def domain_from_spec(spec: dict[str, Any]) -> ManifoldDomain:
     """Build a :class:`ManifoldDomain` from a ``manifold.json`` domain object."""
-    kind = spec.get("type")
+    spec = validate_domain_spec(spec)
+    kind = spec["type"]
     if kind == "box":
         axes = [
             BoxAxis(
-                name=str(a.get("name", f"axis{i}")),
-                periodic=bool(a.get("periodic", False)),
-                period=float(a.get("period", 1.0)),
-                lo=float(a.get("lo", 0.0)),
-                hi=float(a.get("hi", 1.0)),
+                name=a["name"],
+                periodic=a["periodic"],
+                period=float(a["period"]),
+                lo=float(a["lo"]),
+                hi=float(a["hi"]),
             )
-            for i, a in enumerate(spec.get("axes", []))
+            for a in spec["axes"]
         ]
         return BoxDomain(axes)
     if kind == "sphere":
         return SphereDomain(int(spec["dim"]))
     if kind == "custom":
         return CustomDomain(
-            int(spec["embed_dim"]), bounds=spec.get("bounds"),
+            spec["embed_dim"], bounds=spec["bounds"],
         )
     raise ValueError(f"unknown manifold domain type {kind!r}")
 
@@ -1155,14 +1238,14 @@ class LayerSubspace:
     # label/display layout; *these* are the geometry (§5 neutral-anchor).
     affine_map: torch.Tensor | None = None
     # (m, R) authoring-to-reduced coordinate map for affine subspaces.  ``None``
-    # is the historical identity map (m == R).  Cross-model transfer may need a
+    # is the canonical identity map (m == R). Cross-model transfer may need a
     # non-isometric map after orthonormalizing a rectangular mapped basis; this
     # explicit factor preserves the exact world surface without weakening the
     # runtime's orthonormal-basis invariant.
     sigma_rbf_weights: torch.Tensor | None = None
     sigma_poly_coeffs: torch.Tensor | None = None
-    # The **fuzzy-manifold σ-field** (curved subspaces only; ``None`` =
-    # zero-thickness wire = legacy behavior).  A *separate* ``r**3`` RBF over
+    # The **fuzzy-manifold σ-field** (raw curved subspaces only). A separate
+    # ``r**3`` RBF over
     # the **same** normalized ``node_params`` that interpolates per-node
     # ``log σ`` — the within-node off-surface activation spread (the corpus a
     # node produces scatters off the mean surface; ``σ`` is that scatter's
@@ -1170,10 +1253,9 @@ class LayerSubspace:
     # RBF (rather than appended as an extra value column) so the ``(R,)``-shape
     # contracts the surface consumers rely on are untouched; ``sigma_at`` is the
     # one extra ``eval_rbf`` (``O(K)``) paid only on the already-slow curved
-    # path.  ``sigma_rbf_weights`` is ``(K, 1)``, ``sigma_poly_coeffs`` is
-    # ``(m+1, 1)``.  ``None`` (affine, legacy, or a curved fit predating the
-    # σ-field) ⇒ ``sigma_at`` returns ``0`` ⇒ soft-onto degenerates to the hard
-    # collapse and the read bandwidth degenerates to argmax — exact legacy.
+    # path. ``sigma_rbf_weights`` is ``(K, 1)``, ``sigma_poly_coeffs`` is
+    # ``(m+1, 1)``. Affine and SAE-curved fits do not model a raw-activation
+    # tube and therefore carry neither sigma tensor.
 
     @property
     def rank(self) -> int:
@@ -1190,6 +1272,33 @@ class LayerSubspace:
         fit at ``R = n``) is not.
         """
         return self.node_params is None
+
+    def validate_structure(self, *, feature_space: str) -> None:
+        """Validate the exact affine/curved discriminated tensor shape."""
+        surface = (self.node_params, self.rbf_weights, self.poly_coeffs)
+        surface_present = tuple(value is not None for value in surface)
+        sigma_present = (
+            self.sigma_rbf_weights is not None,
+            self.sigma_poly_coeffs is not None,
+        )
+        if any(surface_present) and not all(surface_present):
+            raise ValueError("curved LayerSubspace requires the complete RBF triple")
+        if sigma_present[0] != sigma_present[1]:
+            raise ValueError("LayerSubspace sigma tensors must be present as a pair")
+        if not any(surface_present):
+            if self.node_coords is None:
+                raise ValueError("affine LayerSubspace requires node_coords")
+            if self.affine_map is not None and self.affine_map.shape[1] != self.rank:
+                raise ValueError("affine_map output dimension must equal subspace rank")
+            if any(sigma_present):
+                raise ValueError("affine LayerSubspace cannot carry a sigma field")
+            return
+        if self.node_coords is not None or self.affine_map is not None:
+            raise ValueError(
+                "curved LayerSubspace cannot carry affine node_coords/affine_map"
+            )
+        if feature_space == "raw" and not all(sigma_present):
+            raise ValueError("raw curved LayerSubspace requires a sigma field")
 
     @classmethod
     def affine(
@@ -1314,10 +1423,8 @@ class LayerSubspace:
     def has_sigma(self) -> bool:
         """True iff this subspace carries a fuzzy-manifold σ-field.
 
-        A curved subspace fitted with the within-node spread pass; ``False``
-        for affine fits, legacy curved fits, and any subspace where the σ-RBF
-        wasn't built.  Gates :meth:`sigma_at` (which returns ``0`` when absent)
-        so every σ consumer degrades to the exact zero-thickness behavior.
+        A raw curved subspace fitted with the within-node spread pass; ``False``
+        for affine and SAE-curved fits, which do not model raw tube density.
         """
         return self.sigma_rbf_weights is not None and self.sigma_poly_coeffs is not None
 
@@ -1327,7 +1434,7 @@ class LayerSubspace:
     def eval_at(self, embedded: torch.Tensor) -> torch.Tensor:
         """World-space activation ``(.., D)`` at embedded domain coords ``(.., m)``."""
         if self.is_affine:
-            # Flat: the historical representation has an identity
+            # Flat: the canonical representation has an identity
             # authoring→reduced map.  Rectangular cross-model transfer may
             # carry an explicit map after orthonormalizing the target basis.
             reduced = embedded if self.affine_map is None else embedded @ self.affine_map
@@ -1343,8 +1450,7 @@ class LayerSubspace:
         a positive ``(..,)`` thickness in the layer's reduced-coordinate units
         (the same units ``H_n`` is measured in, since the basis is
         orthonormal).  Returns an all-zeros ``(..,)`` when the subspace carries
-        no σ-field (:attr:`has_sigma` false): affine fits, legacy curved fits,
-        the degenerate-but-safe path that makes every σ consumer exact-legacy.
+        no σ-field (:attr:`has_sigma` false): affine and SAE-curved fits.
         Hot-path safe (one extra ``eval_rbf``, no ``.item()`` / host sync).
         """
         lead = embedded.shape[:-1]
@@ -1768,14 +1874,11 @@ class Manifold:
     # standard-assistant space (swap-back) regardless — so it is carried for
     # provenance / regeneration, not consumed by ``compute_node_centroid``.
     node_kinds: list[str | None] = field(default_factory=list)
-    # Per-layer Mahalanobis share weight recorded at fit time when a
-    # whitener was available — ``share_L = ‖Bᵀ coords_k‖_M`` summed over
+    # Per-layer Mahalanobis share weight recorded at fit time —
+    # ``share_L = ‖Bᵀ coords_k‖_M`` summed over
     # nodes, the subspace-restricted analogue of vector steering's
-    # ``‖d‖_M`` bake score (see ``LayerWhitener.subspace_gram``).  When
-    # populated *and* covering every layer, ``hooks._manifold_layer_shares``
-    # uses it in place of the Euclidean centroid-spread; an empty dict
-    # (no whitener at fit time, e.g. CPU test stubs, or partial layer
-    # coverage) falls back to the Euclidean ``‖coords‖_F`` weighting.
+    # ``‖d‖_M`` bake score (see ``LayerWhitener.subspace_gram``). Coverage is
+    # exact: every fitted layer has one share value.
     # These are raw per-layer scalars with two normalized consumers: the
     # apply-time **steer** weight (normalized to mean 1, ``Σ_L share_L =
     # n_layers``) in ``_manifold_layer_shares``, and the **read** weight
@@ -1799,6 +1902,15 @@ class Manifold:
     # dict on a fit with no neutral means available (CPU test stubs); the apply
     # path then seeds that layer's foot at the coord-space origin ``zeros(n)``.
     origin: dict[int, torch.Tensor] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        # The programmatic constructor emits the same exact full-length roster
+        # as the current wire format. ``None`` is a real per-node value; an
+        # omitted constructor argument is not a second in-memory shape.
+        if not self.node_roles:
+            self.node_roles = [None] * len(self.node_labels)
+        if not self.node_kinds:
+            self.node_kinds = [None] * len(self.node_labels)
 
     @property
     def layer_indices(self) -> list[int]:
@@ -1840,19 +1952,12 @@ class Manifold:
                 f"manifold {self.name!r} origins must cover exactly its curved layers"
             )
         for idx, sub in self.layers.items():
-            if sub.is_affine:
-                if sub.node_coords is None:
-                    raise ValueError(
-                        f"affine manifold {self.name!r} layer {idx} has no node coords"
-                    )
-                if sub.has_sigma:
-                    raise ValueError(
-                        f"affine manifold {self.name!r} layer {idx} carries a tube"
-                    )
-            elif self.feature_space == "raw" and not sub.has_sigma:
+            try:
+                sub.validate_structure(feature_space=self.feature_space)
+            except ValueError as exc:
                 raise ValueError(
-                    f"raw curved manifold {self.name!r} layer {idx} has no sigma field"
-                )
+                    f"manifold {self.name!r} layer {idx}: {exc}"
+                ) from exc
 
     def to(self, *, device: torch.device, dtype: torch.dtype) -> "Manifold":
         """Return a copy with every layer tensor on ``device`` in ``dtype``."""
@@ -2008,22 +2113,13 @@ class Manifold:
     ) -> str | None:
         """Role of the node nearest ``position`` — or ``None``.
 
-        Returns ``None`` when the nearest node carries no role (legacy
-        nodes, or nodes that opted out of role substitution).  The
+        Returns ``None`` when the nearest node opts out of role substitution. The
         return value rides through to ``session._active_role`` so the
         generation prefill re-applies the substitution at decode time,
-        producing role-paired manifold steering (Phase A.3).
-
-        ``node_roles`` may be empty on a legacy fitted manifold whose
-        sidecar predates the per-node-role schema — that case also
-        returns ``None`` (treat the whole manifold as standard
-        assistant baseline).
+        producing role-paired manifold steering (Phase A.3). The role roster is
+        exact and aligned with :attr:`node_labels`.
         """
-        if not self.node_roles:
-            return None
         idx = self.nearest_node_index(position)
-        if idx >= len(self.node_roles):
-            return None
         return self.node_roles[idx]
 
     def tangent(
@@ -2143,12 +2239,11 @@ class SynthesizedSubspace:
     collapse): the kernel applies ``target − κ⊙q``, so push axes ignore ``q``
     (fixed offset) while ablation axes drive ``q`` toward ``0``.  ``share`` is the
     un-normalized per-layer budget weight — the push-displacement magnitude
-    ``‖Δ_L‖_M`` (whitened) when a covering ``whitener`` is supplied, else the
-    raw-Euclidean ``‖Δ_L‖₂``; a pure-ablation layer weights by the summed
+    ``‖Δ_L‖_M`` under the required covering whitener; a pure-ablation layer
+    weights by the summed
     ablation magnitude instead.  The apply path normalizes it across layers
     (mean-1).  ``target_coord`` is correspondingly a whitened-unit direction on
-    the whitened path (magnitude carried by ``share``) or the raw reduced
-    displacement on the Euclidean fallback.
+    the whitened path, with magnitude carried by ``share``.
 
     Fields are keyed by layer index; only layers carrying at least one
     non-degenerate active direction (and present in ``neutral_means``) appear.
@@ -2169,7 +2264,7 @@ def synthesize_subspace(
     ablate: Sequence[dict[int, torch.Tensor]],
     neutral_means: dict[int, torch.Tensor],
     *,
-    whitener: "LayerWhitener | None" = None,
+    whitener: "LayerWhitener",
     eps: float = 1e-9,
 ) -> SynthesizedSubspace:
     """Compose an active steering term set into one affine subspace per layer.
@@ -2229,16 +2324,10 @@ def synthesize_subspace(
       budget (``Σ_L eff_along_L = gain·n_layers``), distributed across layers by
       where its signal lives; ``along`` becomes a scale-stable strength knob.
 
-    This is all-or-nothing (Mahalanobis-only): a partially-covering / absent
-    whitener falls back to the raw-Euclidean ``‖Δ‖₂`` path below (CPU stubs,
-    degenerate fits), never mixing the two metrics across layers within one
-    steer (a mixed cross-layer profile would be meaningless under the mean-1
-    normalization).
-
-    Because the basis is orthonormal, ``‖target‖₂ = ‖Δ‖₂`` on the Euclidean
-    fallback (the per-layer budget weight and the steered coordinate sit on one
-    scale); the whitened path instead decouples them — ``share`` carries the
-    per-layer magnitude, ``target`` carries only the unit direction.
+    This is all-or-nothing (Mahalanobis-only): missing neutral means or partial
+    whitener coverage raise before synthesis, so a cross-layer profile can
+    never mix metrics. ``share`` carries the per-layer magnitude and ``target``
+    carries only the whitened-unit direction.
 
     The strengths live in ``target`` (per-axis), not in a single ``along`` — the
     caller picks ``along`` (the overall slide, the existing manifold-``%``
@@ -2253,19 +2342,21 @@ def synthesize_subspace(
     for dirs in ablate:
         all_layers |= dirs.keys()
 
-    # All-or-nothing whitened normalization: only when the whitener covers every
-    # layer that will actually be synthesized (present in ``neutral_means``).  A
-    # mixed whitened/Euclidean cross-layer profile is meaningless under the
-    # apply-time mean-1 share normalization, so gate the whole synth on one
-    # ``covers_all`` rather than per-layer.
-    present_layers = sorted(L for L in all_layers if L in neutral_means)
-    maha = (
-        whitener
-        if whitener is not None
-        and present_layers
-        and whitener.covers_all(present_layers)
-        else None
-    )
+    from saklas.core.mahalanobis import WhitenerError
+
+    present_layers = sorted(all_layers)
+    missing_means = sorted(all_layers - set(neutral_means))
+    if missing_means:
+        raise WhitenerError(
+            f"steering synthesis requires neutral means for every layer; "
+            f"missing {missing_means}"
+        )
+    if whitener is None or not whitener.covers_all(present_layers):
+        raise WhitenerError(
+            "steering synthesis requires a Mahalanobis whitener covering "
+            f"every layer {present_layers}"
+        )
+    maha = whitener
 
     layers: dict[int, "LayerSubspace"] = {}
     target_coord: dict[int, torch.Tensor] = {}
@@ -2273,8 +2364,6 @@ def synthesize_subspace(
     kappa: dict[int, torch.Tensor] = {}
 
     for L in sorted(all_layers):
-        if L not in neutral_means:
-            continue
         mean = neutral_means[L].to(torch.float32).reshape(-1)
 
         # Push fragments present at this layer: their basis rows (for the span)
@@ -2333,33 +2422,20 @@ def synthesize_subspace(
             # scale cancels under the apply-time mean-1 normalization, leaving
             # only the relative across-layer shape (steer where the signal is).
             raw_delta = torch.stack([cf * wd for cf, wd in push_frags]).sum(0)
-            if maha is not None:
-                share_L = float(maha.mahalanobis_norm(L, raw_delta))
-                # Target = Σ_i coeff_i · (B @ world_dir_i)/‖world_dir_i‖_M — each
-                # fragment a **whitened-unit** direction (node-distance stripped,
-                # so scale-stable across targets) scaled by its user coeff (the
-                # strength knob the mean-1 ``share`` would otherwise cancel).
-                tc = basis.new_zeros(basis.shape[0])
-                for cf, wd in push_frags:
-                    wn = float(maha.mahalanobis_norm(L, wd))
-                    if wn > eps:
-                        tc = tc + (cf / wn) * (basis @ wd)
-                if float(torch.linalg.vector_norm(tc)) < eps:
-                    # Every fragment degenerate in the whitened metric here —
-                    # fall back to the raw reduced target so the layer still steers.
-                    tc = basis @ raw_delta
-                    share_L = float(torch.linalg.vector_norm(raw_delta))
-            else:
-                tc = basis @ raw_delta                    # Euclidean fallback
-                share_L = float(torch.linalg.vector_norm(raw_delta))
+            share_L = float(maha.mahalanobis_norm(L, raw_delta))
+            # Target = Σ_i coeff_i · (B @ world_dir_i)/‖world_dir_i‖_M — each
+            # fragment a whitened-unit direction scaled by its user coefficient.
+            tc = basis.new_zeros(basis.shape[0])
+            for cf, wd in push_frags:
+                wn = float(maha.mahalanobis_norm(L, wd))
+                if wn > eps:
+                    tc = tc + (cf / wn) * (basis @ wd)
+            if float(torch.linalg.vector_norm(tc)) < eps:
+                continue
             target_coord[L] = tc                          # ablation axes ≈ 0
         else:
             ablate_sum = torch.stack(ablate_raw).sum(0)
-            share_L = (
-                float(maha.mahalanobis_norm(L, ablate_sum))
-                if maha is not None
-                else float(torch.linalg.vector_norm(ablate_sum))
-            )
+            share_L = float(maha.mahalanobis_norm(L, ablate_sum))
             target_coord[L] = basis.new_zeros(basis.shape[0])   # (R,) all ≈ 0
         # Per-axis collapse weight κ: 0 on the push span (translate — preserve
         # the per-token in-subspace spread), 1 on the ablate-only complement
@@ -5001,10 +5077,12 @@ def save_manifold(
     """
     from saklas.io.manifold_folder import (
         MANIFOLD_SIDECAR_FIELDS, canonical_manifold_sidecar_payload,
+        validate_manifold_sidecar_payload,
     )
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    manifold.validate_runtime_geometry()
 
     # Every saklas safetensor artifact is stored fp32 (cast at the writer);
     # fits already produce fp32, so the casts are idempotent guarantees.
@@ -5053,12 +5131,12 @@ def save_manifold(
 
     sidecar: dict[str, object] = canonical_manifold_sidecar_payload(
         name=manifold.name,
-        method=str(metadata.get("method", "manifold_pca")),
+        method=cast(str, metadata.get("method", "manifold_pca")),
         saklas_version=_saklas_version,
         domain=manifold.domain.to_spec(),
         node_labels=list(manifold.node_labels),
         feature_space=manifold.feature_space,
-        fit_mode=str(metadata.get("fit_mode", "authored")),
+        fit_mode=cast(str, metadata.get("fit_mode", "authored")),
         hyperparams=cast(dict[str, Any], metadata.get("hyperparams", {})),
         diagnostics=cast(dict[str, Any], metadata.get("diagnostics", {})),
         node_spread_per_layer=cast(
@@ -5152,6 +5230,7 @@ def save_manifold(
 
     if set(sidecar) != MANIFOLD_SIDECAR_FIELDS:
         raise ValueError("manifold writer produced a non-canonical sidecar")
+    validate_manifold_sidecar_payload(sidecar, location="manifold writer sidecar")
 
     from saklas.io.manifold_folder import manifold_pair_lock
 
@@ -5237,33 +5316,13 @@ def _load_manifold_locked(
     path = Path(path)
     manifest_path = path.parent / "manifold.json"
     verified_tensor_sha256: str | None = None
+    folder_view: Any | None = None
     if verify_manifest and manifest_path.exists():
         from saklas.io.packs import verify_integrity
+        from saklas.io.manifold_folder import ManifoldFolder
 
-        try:
-            with open(manifest_path) as handle:
-                manifest = json.load(handle)
-        except (OSError, json.JSONDecodeError) as exc:
-            raise ManifoldFormatError(
-                f"manifold manifest is unreadable at {manifest_path}: {exc}"
-            ) from exc
-        if not isinstance(manifest, dict):
-            raise ManifoldFormatError(
-                f"manifold manifest at {manifest_path} must be a JSON object"
-            )
-        from saklas.io.manifold_folder import validate_manifold_format_version
-
-        validate_manifold_format_version(
-            manifest.get("format_version"), location="manifold manifest",
-        )
-        fit_mode = manifest.get("fit_mode", "authored")
-        if not isinstance(manifest.get("name"), str) or fit_mode not in {
-            "authored", "pca", "spectral", "auto", "baked",
-        }:
-            raise ManifoldFormatError("manifold manifest identity is incomplete")
-        files = manifest.get("files", {})
-        if not isinstance(files, dict):
-            raise ManifoldFormatError("manifold integrity manifest is not an object")
+        folder_view = ManifoldFolder.load(path.parent, verify_manifest=False)
+        files = folder_view.files
         pair_names = (path.name, path.with_suffix(".json").name)
         missing = [name for name in pair_names if name not in files]
         if missing:
@@ -5297,12 +5356,10 @@ def _load_manifold_locked(
         and manifest_path.exists()
         and sidecar["fit_mode"] != "baked"
     ):
-        from saklas.io.manifold_folder import ManifoldFolder
-
         # ``load_manifold`` holds the folder lock outside the pair lock.
-        current_nodes = ManifoldFolder.load(
-            path.parent, verify_manifest=False,
-        ).nodes_sha256()
+        if folder_view is None:
+            raise AssertionError("validated manifold folder view is unavailable")
+        current_nodes = folder_view.nodes_sha256()
         if sidecar.get("nodes_sha256") != current_nodes:
             raise ManifoldFormatError(
                 f"fitted manifold {path.name} is stale for the live corpus/"
@@ -5388,7 +5445,7 @@ def _load_manifold_locked(
         for k, v in origin_raw.items()
     }
 
-    return Manifold(
+    manifold = Manifold(
         name=sidecar["name"],
         domain=domain,
         node_labels=list(sidecar["node_labels"]),
@@ -5401,6 +5458,8 @@ def _load_manifold_locked(
         mahalanobis_share=mahalanobis_share,
         origin=origin,
     )
+    manifold.validate_runtime_geometry()
+    return manifold
 
 
 def transfer_manifold_subspaces(
@@ -5408,6 +5467,7 @@ def transfer_manifold_subspaces(
     alignment: Mapping[int, "LayerAlignment"],
     *,
     whitener: "LayerWhitener | None",
+    target_layer_means: Mapping[int, torch.Tensor],
     from_model: str,
     to_model: str,
 ) -> Manifold:
@@ -5457,7 +5517,6 @@ def transfer_manifold_subspaces(
     # ``(D_tgt, D_src)`` so ``mean_tgt = M_L @ mean_src`` and each basis row
     # transforms the same way → ``basis_tgt = basis_src @ M_L^T``.
     new_layers: dict[int, LayerSubspace] = {}
-    new_origin: dict[int, torch.Tensor] = {}
     for layer, sub in src.layers.items():
         M_L = alignment.get(layer)
         if M_L is None:
@@ -5548,15 +5607,6 @@ def transfer_manifold_subspaces(
                     "manifold coordinates; anisotropic tube transfer is not "
                     "representable by the current scalar sigma field"
                 )
-            try:
-                source_origin = src.origin[layer]
-            except KeyError as exc:
-                raise ValueError(
-                    f"curved source manifold is missing origin for layer {layer}"
-                ) from exc
-            new_origin[layer] = (
-                source_origin.to(torch.float32) @ reduced_map
-            ).to(dtype=sub.basis.dtype)
         new_layers[layer] = _dc_replace(sub, **kwargs)
 
     if not new_layers:
@@ -5576,6 +5626,15 @@ def transfer_manifold_subspaces(
             "manifold transfer requires a Mahalanobis whitener covering every "
             f"transferred layer {sorted(new_layers.keys())}; generate neutral "
             "activations for the TARGET model first (the Euclidean path is gone)"
+        )
+    curved_layers = {
+        layer for layer, subspace in new_layers.items() if not subspace.is_affine
+    }
+    missing_means = sorted(curved_layers - set(target_layer_means))
+    if missing_means:
+        raise WhitenerError(
+            "manifold transfer requires target neutral means covering every "
+            f"transferred layer; missing {missing_means}"
         )
 
     new_share: dict[int, float] = {}
@@ -5604,6 +5663,25 @@ def transfer_manifold_subspaces(
         new_share[layer] = subspace_share(
             mu_coords, sub_f.basis, whitener=whitener, layer=layer,
         )
+
+    new_origin: dict[int, torch.Tensor] = {}
+    for layer, sub_tgt in new_layers.items():
+        if sub_tgt.is_affine:
+            continue
+        sub_f = sub_tgt.to(device=torch.device("cpu"), dtype=torch.float32)
+        target_mean = target_layer_means[layer].to(
+            device="cpu", dtype=torch.float32,
+        ).reshape(-1)
+        if target_mean.shape != sub_f.mean.shape:
+            raise ValueError(
+                f"target neutral mean for layer {layer} has shape "
+                f"{tuple(target_mean.shape)}, expected {tuple(sub_f.mean.shape)}"
+            )
+        query = (target_mean - sub_f.mean) @ sub_f.basis.T
+        origin, _distance = invert_parameterization(
+            sub_f, src.domain, query, src.node_coords.to(torch.float32),
+        )
+        new_origin[layer] = origin.reshape(-1).to(torch.float32)
 
     return _dc_replace(
         src, layers=new_layers,

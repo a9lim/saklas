@@ -118,6 +118,8 @@ def _toy_manifold(
         sub, ev_ratio = _fit_layer_subspace_with_ev(
             centroids, domain.embed(coords),
         )
+        sub.sigma_rbf_weights = torch.zeros(coords.shape[0], 1)
+        sub.sigma_poly_coeffs = torch.zeros(domain.embed(coords).shape[1] + 1, 1)
         layers[layer_idx] = sub
         share[layer_idx] = ev_ratio
     return Manifold(
@@ -127,6 +129,7 @@ def _toy_manifold(
         node_coords=coords,
         layers=layers,
         mahalanobis_share=share,
+        origin={layer: torch.zeros(domain.intrinsic_dim) for layer in layers},
     )
 
 
@@ -458,12 +461,15 @@ def _curved_toy(dim: int = 8, seed: int = 0) -> "Manifold":
         s = 1.0 + 0.5 * layer_idx
         centroids = s * (u.unsqueeze(1) * e1 + (u ** 2).unsqueeze(1) * e2)
         sub, ev_ratio = _fit_layer_subspace_with_ev(centroids, domain.embed(coords))
+        sub.sigma_rbf_weights = torch.zeros(coords.shape[0], 1)
+        sub.sigma_poly_coeffs = torch.zeros(domain.embed(coords).shape[1] + 1, 1)
         layers[layer_idx] = sub
         share[layer_idx] = ev_ratio
     return Manifold(
         name="curve", domain=domain,
         node_labels=["a", "b", "c", "d", "e"],
         node_coords=coords, layers=layers, mahalanobis_share=share,
+        origin={layer: torch.zeros(domain.intrinsic_dim) for layer in layers},
     )
 
 
@@ -675,16 +681,15 @@ def test_membership_high_on_surface_low_off_tube():
     assert mem_off < mem_on
 
 
-def test_membership_one_without_sigma_field():
-    # No σ-field → no tube → membership defaults to 1.0 even far off-surface.
+def test_curved_probe_without_sigma_field_is_rejected():
+    # Raw curved runtime geometry requires a complete tube field.
     m = _curved_toy(dim=8)
+    for sub in m.layers.values():
+        sub.sigma_rbf_weights = None
+        sub.sigma_poly_coeffs = None
     mon = _iso_monitor(m)
-    mon.add_probe("curve", m)
-    off = {
-        L: _node_world(m, L)[2] + 5.0 * sub.basis[1]
-        for L, sub in m.layers.items()
-    }
-    assert mon.score_single_token(off)["curve"].membership == pytest.approx(1.0)
+    with pytest.raises(ValueError, match="requires a sigma field"):
+        mon.add_probe("curve", m)
 
 
 # ============================================== inverse_projection / aggregate ===

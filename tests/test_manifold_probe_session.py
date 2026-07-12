@@ -64,6 +64,10 @@ def _toy_manifold(*, dim: int = 8, n_layers: int = 2) -> Manifold:
         sub, ev_ratio = _fit_layer_subspace_with_ev(
             centroids, domain.embed(coords),
         )
+        assert sub.node_params is not None
+        sub.sigma_rbf_weights = torch.zeros((len(coords), 1))
+        sub.sigma_poly_coeffs = torch.zeros((sub.node_params.shape[1] + 1, 1))
+        sub.sigma_poly_coeffs[0, 0] = -20.0
         layers[layer_idx] = sub
         share[layer_idx] = ev_ratio
     return Manifold(

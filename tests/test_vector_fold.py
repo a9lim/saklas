@@ -14,6 +14,7 @@ through ``extraction.py``'s whitened ``fit_affine_subspace``.
 from __future__ import annotations
 
 import torch
+import pytest
 
 from saklas.core.vectors import (
     fold_directions_to_subspace,
@@ -31,13 +32,16 @@ def _p_basis(vec: torch.Tensor, basis: torch.Tensor) -> torch.Tensor:
     return (vec @ basis.T) @ basis
 
 
+def _whitener(layers: list[int], dim: int):
+    from tests._whitener import isotropic_whitener
+    return isotropic_whitener(layers, dim)
+
+
 # --------------------------------------------------------------- geometry ---
 
 def test_folded_vector_directions_rejects_curved():
     """A curved (RBF-fitted, non-affine) manifold has no single direction —
     the view must refuse it."""
-    import pytest
-
     from saklas.core.manifold import (
         BoxAxis, BoxDomain, Manifold, fit_layer_subspace,
     )
@@ -53,6 +57,9 @@ def test_folded_vector_directions_rejects_curved():
         node_labels=[f"n{i}" for i in range(K)],
         node_coords=node_params,
         layers={0: curved},
+        mahalanobis_share={0: 1.0},
+        origin={0: torch.zeros(1)},
+        feature_space="sae-test",
     )
     with pytest.raises(ValueError, match="affine"):
         folded_vector_directions(mfld)
@@ -81,9 +88,9 @@ def test_is_foldable_vector_manifold_rejects_multinode_affine():
         node_labels=[f"n{i}" for i in range(K)],
         node_coords=node_coords,
         layers={0: sub},
+        mahalanobis_share={0: 1.0},
     )
     assert not is_foldable_vector_manifold(mfld)
-    import pytest
     with pytest.raises(ValueError, match="affine R=1"):
         folded_vector_directions(mfld)
 
@@ -93,7 +100,11 @@ def test_is_foldable_vector_manifold_accepts_r1_and_rejects_empty():
     from saklas.core.manifold import CustomDomain, Manifold
 
     d = 6
-    mfld = fold_directions_to_subspace("v", {0: torch.randn(d), 3: torch.randn(d)}, None)
+    directions = {0: torch.randn(d), 3: torch.randn(d)}
+    mfld = fold_directions_to_subspace(
+        "v", directions, {0: torch.zeros(d), 3: torch.zeros(d)},
+        whitener=_whitener([0, 3], d),
+    )
     assert is_foldable_vector_manifold(mfld)
     empty = Manifold(
         name="empty", domain=CustomDomain(1),
@@ -106,18 +117,18 @@ def test_fold_directions_to_subspace_neutral_anchored():
     """A derived direction folds to a one-pole ray: basis = d̂, mean =
     P_basis(ν), real pole coord = ‖d‖, share = ‖d‖, single + node, no
     stored origin."""
-    import pytest
-
     d = 8
     dir0, dir1 = torch.randn(d), torch.randn(d)
     directions = {2: dir0, 5: dir1}
     neutral = {2: 10.0 + torch.randn(d), 5: 3.0 + torch.randn(d)}
+    whitener = _whitener([2, 5], d)
     mfld = fold_directions_to_subspace(
-        "merged", directions, neutral, label="merged",
+        "merged", directions, neutral,
+        whitener=whitener, label="merged",
     )
     assert mfld.node_labels == ["merged"]
     assert torch.allclose(mfld.node_coords, torch.tensor([[1.0]]))  # display layout
-    assert mfld.metadata["share_metric"] == "euclidean"
+    assert mfld.metadata["share_metric"] == "mahalanobis"
     assert mfld.origin == {}
     for L, raw in ((2, dir0), (5, dir1)):
         sub = mfld.layers[L]
@@ -125,7 +136,9 @@ def test_fold_directions_to_subspace_neutral_anchored():
         assert torch.allclose(sub.basis.reshape(-1), raw / raw.norm(), atol=1e-5)
         # neutral-anchored: mean = P_basis(ν), not the raw neutral vector
         assert torch.allclose(sub.mean, _p_basis(neutral[L], sub.basis), atol=1e-5)
-        assert mfld.mahalanobis_share[L] == pytest.approx(float(raw.norm()), abs=1e-4)
+        assert mfld.mahalanobis_share[L] == pytest.approx(
+            whitener.mahalanobis_norm(L, raw), abs=1e-4,
+        )
         # real per-layer pole coord = ‖d‖ (a step of ‖d‖ along d̂ from origin)
         assert sub.node_coords.reshape(-1).item() == pytest.approx(
             float(raw.norm()), abs=1e-4,
@@ -138,9 +151,10 @@ def test_fold_directions_to_subspace_neutral_anchored():
     )
 
 
-def test_fold_directions_drops_zero_and_anchors_at_origin_without_neutral():
+def test_fold_directions_rejects_missing_neutral_mean():
     d = 5
     directions = {0: torch.randn(d), 1: torch.zeros(d)}   # layer 1 degenerate
-    mfld = fold_directions_to_subspace("m", directions, None)  # no neutral
-    assert sorted(mfld.layers) == [0]
-    assert torch.allclose(mfld.layers[0].mean, torch.zeros(d))    # P_basis(∅) = 0
+    with pytest.raises(ValueError, match="neutral means"):
+        fold_directions_to_subspace(
+            "m", directions, {}, whitener=_whitener([0, 1], d),
+        )

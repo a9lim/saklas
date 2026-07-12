@@ -146,7 +146,8 @@ def test_load_rejects_template_ref_on_authored(tmp_path: Path):
             "description": "",
             "fit_mode": "authored",
         "domain": {"type": "box", "axes": [
-            {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0},
+            {"name": "t", "periodic": False, "period": 1.0,
+             "lo": 0.0, "hi": 1.0},
         ]},
         "nodes": [
             {"label": "a", "coords": [0.0], "role": None, "kind": None},

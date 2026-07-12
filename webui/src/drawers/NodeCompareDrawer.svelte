@@ -202,8 +202,8 @@
   // tokenization for free, plus the hover-cross-highlight is exact
   // because each rendered span carries its own counterpart index.
   //
-  // ``per_token`` may be empty (loaded transcripts that didn't persist
-  // token sequences, or pre-v2.3 nodes); in that case we fall back to
+  // ``per_token`` may be empty for imported transcripts that do not carry
+  // token sequences; in that case we fall back to
   // the whitespace-split renderer so the diff stays visible — alignment
   // tooltips just won't fire on the fallback path.
 

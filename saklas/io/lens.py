@@ -380,6 +380,10 @@ def _load_sidecar_at(
             or sidecar["method"] != _LENS_METHOD
             or sidecar["dtype"] != "float16"
             or any(
+                not isinstance(sidecar[key], str) or not sidecar[key]
+                for key in ("corpus_spec", "corpus_sha256", "corpus_hash_kind")
+            )
+            or any(
                 isinstance(sidecar[key], bool) or not isinstance(sidecar[key], int)
                 or sidecar[key] < 0
                 for key in ("n_prompts", "seq_len", "dim_batch", "skip_first_positions")
@@ -426,6 +430,7 @@ def _load_sidecar_at(
             or {str(key) for key in expected_digests} != expected_keys
             or any(
                 not isinstance(digest, str) or len(digest) != 64
+                or any(char not in "0123456789abcdef" for char in digest)
                 for digest in expected_digests.values()
             )
         ):

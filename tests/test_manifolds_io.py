@@ -52,9 +52,9 @@ def _box1d(periodic: bool, labels: list[str]) -> dict[str, Any]:
     """A 1-D box domain spec with evenly-spaced node coords."""
     k = len(labels)
     axis = (
-        {"name": "t", "periodic": True, "period": 1.0}
+        {"name": "t", "periodic": True, "period": 1.0, "lo": 0.0, "hi": 1.0}
         if periodic
-        else {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}
+        else {"name": "t", "periodic": False, "period": 1.0, "lo": 0.0, "hi": 1.0}
     )
     if periodic:
         coords = [[i / k] for i in range(k)]
@@ -130,7 +130,7 @@ def _sidecar_payload(
         "domain": domain or {
             "type": "box",
             "axes": [
-                {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0},
+                {"name": "t", "periodic": False, "period": 1.0, "lo": 0.0, "hi": 1.0},
             ],
         },
         "node_count": len(node_labels),
@@ -255,8 +255,8 @@ def test_too_few_nodes_for_2d(tmp_path: Path):
     domain = {
         "type": "box",
         "axes": [
-            {"name": "u", "periodic": False, "lo": 0.0, "hi": 1.0},
-            {"name": "v", "periodic": False, "lo": 0.0, "hi": 1.0},
+            {"name": "u", "periodic": False, "period": 1.0, "lo": 0.0, "hi": 1.0},
+            {"name": "v", "periodic": False, "period": 1.0, "lo": 0.0, "hi": 1.0},
         ],
     }
     nodes = [
@@ -306,8 +306,8 @@ def test_poisedness_soft_warning(tmp_path: Path):
     domain = {
         "type": "box",
         "axes": [
-            {"name": "u", "periodic": False, "lo": 0.0, "hi": 1.0},
-            {"name": "v", "periodic": False, "lo": 0.0, "hi": 1.0},
+            {"name": "u", "periodic": False, "period": 1.0, "lo": 0.0, "hi": 1.0},
+            {"name": "v", "periodic": False, "period": 1.0, "lo": 0.0, "hi": 1.0},
         ],
     }
     nodes = [
@@ -333,7 +333,7 @@ def _add_dummy_tensor(folder: Path) -> None:
     (folder / "stub-model.json").write_text(json.dumps(_sidecar_payload(
         labels=["calm", "uneasy", "afraid", "frantic"],
         domain={"type": "box", "axes": [
-            {"name": "t", "periodic": True, "period": 1.0},
+            {"name": "t", "periodic": True, "period": 1.0, "lo": 0.0, "hi": 1.0},
         ]},
     )))
 
@@ -576,7 +576,7 @@ def test_manifold_sidecar_node_spread_round_trips(tmp_path: Path):
     path = tmp_path / "m.json"
     payload = _sidecar_payload(
         labels=["happy", "sad"],
-        domain={"type": "custom", "dim": 1},
+        domain={"type": "custom", "embed_dim": 1, "bounds": None},
         fit_mode="pca",
     )
     payload.update({
@@ -617,11 +617,16 @@ def test_manifold_sidecar_topology_provenance_round_trips(tmp_path: Path):
     for layer in (4, 5):
         sub, _ev_ratio = fit_layer_subspace(torch.randn(3, 6, generator=g), embedded)
         layers[layer] = sub
-    man = Manifold(
-        name="autotopo", domain=domain, node_labels=["a", "b", "c"],
-        node_coords=coords, layers=layers,
-        mahalanobis_share={4: 1.0, 5: 2.0},
-    )
+        man = Manifold(
+            name="autotopo", domain=domain, node_labels=["a", "b", "c"],
+            node_coords=coords, layers=layers,
+            mahalanobis_share={4: 1.0, 5: 2.0},
+            origin={
+                layer: torch.zeros(sub.rank)
+                for layer, sub in layers.items() if not sub.is_affine
+            },
+            feature_space="sae-test",
+        )
     candidates = [
         {"name": "flat-pca", "fit_mode": "pca", "intrinsic_dim": 2,
          "score": 12.5, "viable": True, "reason": None},
@@ -2068,6 +2073,7 @@ def test_rectangular_affine_transfer_preserves_points_frame_and_steering(
     )
     target = transfer_manifold_subspaces(
         source, {0: alignment}, whitener=_target_whitener(dim=6, layers=(0,)),
+        target_layer_means={0: torch.zeros(6)},
         from_model="src", to_model="tgt",
     )
     for point in (torch.tensor([0.2, -0.4]), node_coords[1]):
@@ -2137,6 +2143,7 @@ def test_rectangular_curved_transfer_rejects_anisotropic_tube() -> None:
         transfer_manifold_subspaces(
             source, {0: alignment},
             whitener=_target_whitener(dim=6, layers=(0,)),
+            target_layer_means={0: torch.zeros(6)},
             from_model="src", to_model="tgt",
         )
 
@@ -2160,6 +2167,7 @@ def test_rectangular_transfer_rejects_collapsed_subspace_rank() -> None:
         transfer_manifold_subspaces(
             source, {0: alignment},
             whitener=_target_whitener(dim=2, layers=(0,)),
+            target_layer_means={0: torch.zeros(2)},
             from_model="src", to_model="tgt",
         )
 
@@ -2190,6 +2198,7 @@ def test_rectangular_transfer_rejects_oblique_rank_collapse() -> None:
         transfer_manifold_subspaces(
             source, {0: alignment},
             whitener=_target_whitener(dim=3, layers=(0,)),
+            target_layer_means={0: torch.zeros(3)},
             from_model="src", to_model="tgt",
         )
 
@@ -2296,6 +2305,7 @@ def test_transfer_rejects_source_generation_changed_after_preflight(
             source_model_fingerprint="fp:src/model",
             target_model_fingerprint="fp:tgt/model",
             whitener=_target_whitener(dim=4),
+            target_layer_means=_target_whitener(dim=4).layer_means,
             expected_source_proof=proof,
         )
 
@@ -2459,12 +2469,14 @@ def test_transfer_manifold_identity_alignment_preserves_geometry(
     # Identity map per fitted layer.
     align = _alignments({L: torch.eye(6) for L in src_man.layers})
 
+    target_whitener = _target_whitener()
     out = transfer_manifold(
         folder, from_model=src_model, to_model=tgt_model,
         alignment=align, transfer_quality_estimate=0.9,
         source_model_fingerprint=f"fp:{src_model}",
         target_model_fingerprint=f"fp:{tgt_model}",
-        whitener=_target_whitener(),
+        whitener=target_whitener,
+        target_layer_means=target_whitener.layer_means,
     )
     # Filename uses the transfer variant suffix.
     from saklas.io.paths import tensor_filename
@@ -2521,7 +2533,7 @@ def test_transfer_manifold_rebakes_share_in_target_space(
 
     out = transfer_manifold(
         folder, from_model=src_model, to_model=tgt_model,
-        alignment=align, whitener=w,
+        alignment=align, whitener=w, target_layer_means=w.layer_means,
         source_model_fingerprint=f"fp:{src_model}",
         target_model_fingerprint=f"fp:{tgt_model}",
     )
@@ -2563,11 +2575,13 @@ def test_transfer_manifold_rotation_maps_subspace(
     Q, _ = torch.linalg.qr(A)
     align = _alignments({L: Q for L in src_man.layers})
 
+    target_whitener = _target_whitener()
     out = transfer_manifold(
         folder, from_model=src_model, to_model=tgt_model, alignment=align,
         source_model_fingerprint=f"fp:{src_model}",
         target_model_fingerprint=f"fp:{tgt_model}",
-        whitener=_target_whitener(),
+        whitener=target_whitener,
+        target_layer_means=target_whitener.layer_means,
     )
     tgt_man = load_manifold(out)
     # World-space activation at node 0 should be Q @ (source activation).
@@ -2594,11 +2608,13 @@ def test_transfer_manifold_drops_uncovered_layers(
     _fit_real_manifold(folder, src_model, dim=6)  # writes the on-disk source fit
     # Cover only layer 5 of {4, 5, 6}.
     align = _alignments({5: torch.eye(6)})
+    target_whitener = _target_whitener(layers=(5,))
     out = transfer_manifold(
         folder, from_model=src_model, to_model=tgt_model, alignment=align,
         source_model_fingerprint=f"fp:{src_model}",
         target_model_fingerprint=f"fp:{tgt_model}",
-        whitener=_target_whitener(layers=(5,)),
+        whitener=target_whitener,
+        target_layer_means=target_whitener.layer_means,
     )
     tgt_man = load_manifold(out)
     assert sorted(tgt_man.layers) == [5]
@@ -2620,6 +2636,7 @@ def test_transfer_manifold_missing_source_raises(
             alignment=_alignments({0: torch.eye(4)}),
             source_model_fingerprint="fp:never/fitted",
             target_model_fingerprint="fp:tgt/m",
+            target_layer_means={},
         )
 
 
@@ -2638,6 +2655,7 @@ def test_transfer_manifold_empty_alignment_raises(
             folder, from_model="src/m", to_model="tgt/m", alignment={},
             source_model_fingerprint="fp:src/m",
             target_model_fingerprint="fp:tgt/m",
+            target_layer_means={},
         )
 
 
@@ -2659,6 +2677,7 @@ def test_transfer_manifold_no_overlap_raises(
             alignment=_alignments({0: torch.eye(6), 1: torch.eye(6)}),
             source_model_fingerprint="fp:src/m",
             target_model_fingerprint="fp:tgt/m",
+            target_layer_means={},
         )
 
 
@@ -2679,7 +2698,7 @@ def test_transfer_manifold_refuses_overwrite_without_force(
     w = _target_whitener()
     transfer_manifold(
         folder, from_model="src/m", to_model="tgt/m", alignment=align, whitener=w,
-        source_model_fingerprint="fp:src/m",
+        source_model_fingerprint="fp:src/m", target_layer_means=w.layer_means,
         target_model_fingerprint="fp:tgt/m",
     )
     import saklas.core.manifold as manifold_mod
@@ -2694,7 +2713,7 @@ def test_transfer_manifold_refuses_overwrite_without_force(
     with pytest.raises(FileExistsError):
         transfer_manifold(
             folder, from_model="src/m", to_model="tgt/m", alignment=align, whitener=w,
-            source_model_fingerprint="fp:src/m",
+            source_model_fingerprint="fp:src/m", target_layer_means=w.layer_means,
             target_model_fingerprint="fp:tgt/m",
         )
     # force=True overwrites cleanly.
@@ -2703,7 +2722,7 @@ def test_transfer_manifold_refuses_overwrite_without_force(
         folder, from_model="src/m", to_model="tgt/m", alignment=align,
         source_model_fingerprint="fp:src/m",
         target_model_fingerprint="fp:tgt/m",
-        whitener=w, force=True,
+        whitener=w, target_layer_means=w.layer_means, force=True,
     )
 
 
@@ -2744,6 +2763,7 @@ def test_transfer_retries_pair_committed_before_manifest_update(
     kwargs = dict(
         folder=folder, from_model="src/m", to_model="tgt/m",
         alignment=align, whitener=whitener,
+        target_layer_means=whitener.layer_means,
         source_model_fingerprint="fp:src/m",
         target_model_fingerprint="fp:tgt/m",
     )
@@ -2835,17 +2855,22 @@ def test_manifold_summary_reports_transfer_variant(
     )
     src_tensor = _fit_real_manifold(folder, "src/m", dim=6)
     align = _alignments({L: torch.eye(6) for L in load_manifold(src_tensor).layers})
+    target_whitener = _target_whitener()
     transfer_manifold(
         folder, from_model="src/m", to_model="tgt/m", alignment=align,
         source_model_fingerprint="fp:src/m",
         target_model_fingerprint="fp:tgt/m",
-        whitener=_target_whitener(),
+        whitener=target_whitener,
+        target_layer_means=target_whitener.layer_means,
     )
     summ = manifold_summary(folder)
     src_safe = safe_model_id("src/m")
+    from saklas.io.paths import encode_release_id
     tgt_safe = safe_model_id("tgt/m")
     assert summ["tensor_variants"][src_safe] == ["raw"]
-    assert summ["tensor_variants"][tgt_safe] == [f"from-{src_safe.lower()}"]
+    assert summ["tensor_variants"][tgt_safe] == [
+        f"from-{encode_release_id('src/m')}"
+    ]
 
 
 
@@ -3301,7 +3326,14 @@ def _baked_manifold(name: str = "merged", n_layers: int = 3):
     from saklas.core.vectors import fold_directions_to_subspace
 
     directions = {i: torch.randn(8) for i in range(n_layers)}
-    return fold_directions_to_subspace(name, directions, None, label=name), directions
+    whitener = _target_whitener(dim=8, layers=range(n_layers))
+    return (
+        fold_directions_to_subspace(
+            name, directions, whitener.layer_means,
+            label=name, whitener=whitener,
+        ),
+        directions,
+    )
 
 
 def test_baked_manifold_round_trip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -3453,7 +3485,7 @@ def test_baked_manifold_rejects_coords_on_node(tmp_path: Path):
         "name": "merged",
         "description": "",
         "fit_mode": "baked",
-        "domain": {"type": "custom", "embed_dim": 1},
+        "domain": {"type": "custom", "embed_dim": 1, "bounds": None},
         "nodes": [{"label": "merged", "coords": [1.0], "role": None, "kind": None}],
         "files": {},
         "source": "local", "tags": [], "template_ref": None,
@@ -3472,7 +3504,7 @@ def test_baked_manifold_requires_tensor(tmp_path: Path):
         "name": "merged",
         "description": "",
         "fit_mode": "baked",
-        "domain": {"type": "custom", "embed_dim": 1},
+        "domain": {"type": "custom", "embed_dim": 1, "bounds": None},
         "nodes": [{"label": "merged", "role": None, "kind": None}],
         "files": {},
         "source": "local", "tags": [], "template_ref": None,

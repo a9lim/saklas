@@ -192,7 +192,8 @@ def test_naturalness_preflight_does_not_hash_fitted_payloads(
 
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     domain = {"type": "box", "axes": [
-        {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0},
+        {"name": "t", "periodic": False, "period": 1.0,
+         "lo": 0.0, "hi": 1.0},
     ]}
     nodes = [
         {"label": label, "coords": [i / 2], "statements": [label]}

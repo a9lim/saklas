@@ -50,6 +50,7 @@ class _Tokenizer:
 
 TOKENIZER = _Tokenizer()
 MODEL = torch.nn.Module()
+MODEL._saklas_source_fingerprint = "1" * 64
 
 
 def _deterministic_acts() -> dict[int, torch.Tensor]:

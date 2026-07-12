@@ -19,7 +19,9 @@ import shutil
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
+
+import torch
 
 from saklas.io.atomic import write_json_atomic
 from saklas.core.errors import ManifoldExistsError, ManifoldNotFoundError, SaklasError
@@ -656,6 +658,7 @@ def transfer_manifold(
     source_model_fingerprint: str,
     target_model_fingerprint: str,
     whitener: "Any | None" = None,
+    target_layer_means: Mapping[int, torch.Tensor],
     force: bool = False,
     expected_source_proof: TransferSourceProof | None = None,
 ) -> Path:
@@ -675,7 +678,8 @@ def transfer_manifold(
                 transfer_quality_estimate=transfer_quality_estimate,
                 source_model_fingerprint=source_model_fingerprint,
                 target_model_fingerprint=target_model_fingerprint,
-                whitener=whitener, force=force,
+                whitener=whitener, target_layer_means=target_layer_means,
+                force=force,
                 expected_source_proof=expected_source_proof,
             )
 
@@ -690,6 +694,7 @@ def _transfer_manifold_locked(
     source_model_fingerprint: str,
     target_model_fingerprint: str,
     whitener: "Any | None" = None,
+    target_layer_means: Mapping[int, torch.Tensor],
     force: bool = False,
     expected_source_proof: TransferSourceProof | None = None,
 ) -> Path:
@@ -810,6 +815,7 @@ def _transfer_manifold_locked(
     try:
         transferred = transfer_manifold_subspaces(
             src, alignment, whitener=whitener,
+            target_layer_means=target_layer_means,
             from_model=from_model, to_model=to_model,
         )
     except SaklasError:

@@ -1,5 +1,5 @@
 {
-  "format_version": 8,
+  "format_version": 9,
   "name": "curious.disinterested",
   "description": "Bipolar axis: curious (+) vs disinterested (-). Steer with negative alpha for the opposite pole.",
   "fit_mode": "pca",

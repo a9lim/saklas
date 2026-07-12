@@ -63,7 +63,7 @@ saklas manifold transfer <name> --from SRC --to TGT [-f]   # cross-model Procrus
 saklas manifold compare <concepts...> -m MODEL [--ridge-scale R]
 saklas manifold why <concept> -m MODEL [-j]       # per-layer ||baked|| as a 16-bucket histogram
 saklas pack ls [-v|-j] | show <name> [-j]            # list / inspect manifolds
-saklas pack install <target> [-a NS/N] [-f]          # HF coord or local folder (also ports legacy saklas-packs)
+saklas pack install <target> [-a NS/N] [-f]          # HF coord or current local manifold folder
 saklas pack search <query> [-j|-v]                   # search HF hub for saklas-manifold repos
 saklas pack push <name> [-a OWNER/N] [-m MODEL] [--variant raw|sae|all]
 saklas pack rm <name> [-y]                           # remove folder (bundled respawns)
@@ -924,8 +924,6 @@ All state under `~/.saklas/` (override via `$SAKLAS_HOME`):
     alignments/<safe_src>.{safetensors,json} # optional cross-model Procrustes map
     jlens.json                         # atomic per-model Jacobian-lens pointer
     jlens.layer-*.gen-*.safetensors    # immutable fp16 J_l layer shards (`lens fit`)
-  vectors/<ns>/<concept>/              # LEGACY (pre-4.0) packs only — ported to
-                                       # manifolds/ on first touch; no longer written
   conversations/<name>.json            # explicit loom-tree saves (no autosave)
 ```
 
@@ -937,7 +935,7 @@ at most one kind per file (no `pca` suffix). `tensor_filename` /
 form that isn't emitted yet — `extract --role` bakes the role into the corpus and
 writes the canonical tensor).
 `materialize_bundled_manifolds()` is copy-on-miss. Current artifacts live only
-under `manifolds/`; pre-manifold vector folders are not read or migrated.
+under `manifolds/`.
 
 ## Performance invariants
 

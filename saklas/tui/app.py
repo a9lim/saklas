@@ -2357,12 +2357,12 @@ class SaklasApp(App[None]):
         probe shape; only curved probes render in the manifold section.
         No-op when no result is cached or no probes are attached.
         """
-        last = getattr(self._session, "last_result", None)
+        last = self._session.last_result
         if last is None:
             return
-        aggregates = getattr(last, "probe_readings", None) or {}
+        aggregates = last.probe_readings
         monitor = self._session.monitor
-        if not aggregates and (monitor is None or not monitor.probe_names):
+        if not aggregates and not monitor.probe_names:
             return
         self._trait_panel.update_manifold_readings(aggregates=aggregates)
 

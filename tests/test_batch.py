@@ -108,6 +108,12 @@ class _BatchModel:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
         self.config = SimpleNamespace(vocab_size=200)
+
+    def named_parameters(self):
+        return iter(())
+
+    def named_buffers(self):
+        return iter(())
         self.generation_config = SimpleNamespace(eos_token_id=99)
 
     def generate(self, **kwargs: Any):
@@ -177,6 +183,8 @@ def _fast_batch_session():
     model = _BatchModel()
     s_any = cast(Any, s)
     s_any._model = model
+    s._model_info = {"model_id": "batch/test"}
+    s._jlens = None
     s_any._tokenizer = _BatchTokenizer()
     s._device = torch.device("cpu")
     s_any._gen_lock = threading.Lock()
@@ -209,6 +217,8 @@ def _fast_batch_session():
     s._active_gen_reservation = None
     s._last_token_probe_payload = None
     s._capture_state = CaptureState()
+    from saklas.core.hooks import HiddenCapture
+    s._capture = HiddenCapture()
     s._compiled_clean_eligible = False
     s._incremental_readings = []
     s._incremental_gate_scores = []
@@ -634,6 +644,7 @@ class TestPrefixCacheEligibility:
         from saklas.core.session import SaklasSession
         session = SaklasSession.__new__(SaklasSession)
         session._steering_composer = SteeringComposer(session)
+        session._profiles = {}
         return session
 
     @pytest.mark.parametrize(

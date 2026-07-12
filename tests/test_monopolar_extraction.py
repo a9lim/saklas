@@ -159,7 +159,7 @@ def test_monopolar_requires_layer_means() -> None:
     handle = _Handle()
     handle.layer_means = {}
     pipe = ManifoldExtractionPipeline(handle, EventBus())
-    with pytest.raises(ValueError, match="layer_means"):
+    with pytest.raises(ValueError, match="neutral layer means"):
         pipe.fit(folder)
 
 

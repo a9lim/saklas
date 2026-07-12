@@ -94,7 +94,12 @@ class TestMergeVector:
         from saklas.io.paths import tensor_filename
 
         dirs = {0: torch.tensor([1.0, 0.0, 0.0, 0.0]), 5: torch.tensor([0.0, 2.0, 0.0, 0.0])}
-        manifold = fold_directions_to_subspace("noble", dirs, None, label="merged")
+        from tests._whitener import isotropic_whitener
+        means = {layer: torch.zeros_like(direction) for layer, direction in dirs.items()}
+        manifold = fold_directions_to_subspace(
+            "noble", dirs, means,
+            whitener=isotropic_whitener(dirs, 4), label="merged",
+        )
         merged_folder, _ = create_baked_manifold_folder(
             "local", "noble", "merged", manifold, session.model_id, method="merge",
             model_fingerprint=loaded_model_fingerprint(
