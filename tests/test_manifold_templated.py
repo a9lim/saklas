@@ -140,9 +140,10 @@ def test_load_rejects_template_ref_on_authored(tmp_path: Path):
     folder = tmp_path / "bad"
     (folder / "nodes").mkdir(parents=True)
     (folder / "manifold.json").write_text(json.dumps({
-        "format_version": 6,
-        "name": "bad",
-        "fit_mode": "authored",
+            "format_version": 6,
+            "name": "bad",
+            "description": "",
+            "fit_mode": "authored",
         "domain": {"type": "box", "axes": [
             {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0},
         ]},
