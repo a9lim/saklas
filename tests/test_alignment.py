@@ -8,6 +8,8 @@ CPU-only, no model load — alignment math runs over synthetic
 activation tensors.
 """
 from __future__ import annotations
+
+import json
 from pathlib import Path
 
 import pytest
@@ -342,7 +344,7 @@ class TestAlignmentCache:
         import saklas.io.alignment as alignment_mod
 
         monkeypatch.setattr(
-            alignment_mod, "load_file",
+            alignment_mod, "load_safetensors",
             lambda *_a, **_k: (_ for _ in ()).throw(
                 AssertionError("stale identity materialized alignment payload")
             ),
@@ -369,10 +371,127 @@ class TestAlignmentCache:
         )
         assert loaded is not None
         restored, sidecar = loaded
-        assert sidecar["format_version"] == 3
+        assert sidecar["format_version"] == 4
         assert torch.equal(restored[3].left, alignment.left)
         assert torch.equal(restored[3].right, alignment.right)
         assert torch.equal(restored[3].offset, alignment.offset)
+
+    def test_sharded_save_avoids_payload_rehash_and_cleans_legacy_monolith(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+        import saklas.io.alignment as alignment_mod
+
+        anchor, _ = alignment_mod._alignment_anchor_paths("a/b", "c/d")
+        anchor.parent.mkdir(parents=True, exist_ok=True)
+        anchor.write_bytes(b"legacy-v3")
+        monkeypatch.setattr(
+            alignment_mod, "hash_file",
+            lambda *_a, **_k: (_ for _ in ()).throw(
+                AssertionError("alignment save reread a written shard")
+            ),
+        )
+        saved = save_alignment_map(
+            {0: torch.eye(4), 5: torch.eye(4)}, "a/b", "c/d",
+            source_identity=self._SRC_ID, target_identity=self._TGT_ID,
+        )
+        assert saved.exists()
+        assert not anchor.exists()
+        sidecar = json.loads(anchor.with_suffix(".json").read_text())
+        assert set(sidecar["tensor_files"]) == {"0", "5"}
+        assert len(set(sidecar["tensor_files"].values())) == 2
+
+    def test_selective_load_reads_only_requested_factor_shard(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+        save_alignment_map(
+            {0: torch.eye(4), 5: 2 * torch.eye(4)}, "a/b", "c/d",
+            source_identity=self._SRC_ID, target_identity=self._TGT_ID,
+        )
+        real_read = Path.read_bytes
+        read_names: list[str] = []
+
+        def counted_read(path: Path) -> bytes:
+            read_names.append(path.name)
+            return real_read(path)
+
+        monkeypatch.setattr(Path, "read_bytes", counted_read)
+        loaded = load_alignment_map(
+            "a/b", "c/d", source_identity=self._SRC_ID,
+            target_identity=self._TGT_ID, requested_layers=[5, 99],
+        )
+        assert loaded is not None
+        factors, sidecar = loaded
+        assert set(factors) == {5}
+        assert sidecar["shared_layers"] == [0, 5]
+        assert len(read_names) == 1
+        assert ".layer-5." in read_names[0]
+
+    def test_failed_pointer_publication_preserves_prior_generation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+        import saklas.io.alignment as alignment_mod
+
+        save_alignment_map(
+            {0: torch.eye(4)}, "a/b", "c/d",
+            source_identity=self._SRC_ID, target_identity=self._TGT_ID,
+        )
+        anchor, pointer = alignment_mod._alignment_anchor_paths("a/b", "c/d")
+        prior_pointer = pointer.read_bytes()
+        prior_files = set(json.loads(prior_pointer)["tensor_files"].values())
+
+        def _fail_pointer(_path: Path, _payload: object) -> None:
+            raise OSError("simulated alignment pointer failure")
+
+        monkeypatch.setattr(alignment_mod, "write_json_atomic", _fail_pointer)
+        with pytest.raises(OSError, match="pointer failure"):
+            save_alignment_map(
+                {0: 2 * torch.eye(4)}, "a/b", "c/d",
+                source_identity=self._SRC_ID, target_identity=self._TGT_ID,
+            )
+
+        assert pointer.read_bytes() == prior_pointer
+        assert {
+            path.name for path in anchor.parent.glob(
+                f"{anchor.stem}.layer-*.gen-*.safetensors"
+            )
+        } == prior_files
+        loaded = load_alignment_map(
+            "a/b", "c/d", source_identity=self._SRC_ID,
+            target_identity=self._TGT_ID,
+        )
+        assert loaded is not None
+        assert torch.equal(loaded[0][0].to_dense(), torch.eye(4))
+
+    def test_post_pointer_fsync_failure_preserves_new_generation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """After pointer replace, a durability error must not delete its shards."""
+        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+        import saklas.io.alignment as alignment_mod
+
+        def _fail_fsync(_folder: Path) -> None:
+            raise OSError("simulated directory fsync failure")
+
+        monkeypatch.setattr(alignment_mod, "fsync_directory", _fail_fsync)
+        with pytest.raises(OSError, match="fsync failure"):
+            save_alignment_map(
+                {0: 2 * torch.eye(4)}, "a/b", "c/d",
+                source_identity=self._SRC_ID, target_identity=self._TGT_ID,
+            )
+
+        anchor, pointer = alignment_mod._alignment_anchor_paths("a/b", "c/d")
+        sidecar = json.loads(pointer.read_text())
+        current = anchor.parent / sidecar["tensor_files"]["0"]
+        assert current.is_file()
+        loaded = load_alignment_map(
+            "a/b", "c/d", source_identity=self._SRC_ID,
+            target_identity=self._TGT_ID,
+        )
+        assert loaded is not None
+        assert torch.equal(loaded[0][0].to_dense(), 2 * torch.eye(4))
 
 
 # ---------------------------------------------------------------------------

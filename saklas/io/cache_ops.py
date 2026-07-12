@@ -80,7 +80,10 @@ def export_gguf_manifold(
     from saklas.core.vectors import folded_vector_directions
 
     mdir = manifold_dir(ns, name)
-    mf = ManifoldFolder.load(mdir)
+    # Preflight needs folder identity/source and fitted filenames only.  Each
+    # selected raw tensor is integrity-checked by ``load_manifold`` below; do
+    # not eagerly hash unrelated models, SAE variants, or prior GGUF exports.
+    mf = ManifoldFolder.load(mdir, verify_manifest=False)
 
     raw_models: set[str] = set()
     for tensor in mdir.glob("*.safetensors"):

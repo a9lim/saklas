@@ -26,6 +26,7 @@ import os
 import struct
 import uuid
 from contextlib import contextmanager, suppress
+from dataclasses import dataclass
 from pathlib import Path
 from collections.abc import Callable, Iterable, Mapping
 from typing import Any, cast
@@ -45,6 +46,39 @@ _LENS_NAME = "jlens"
 _LENS_CHECKPOINT_NAME = "jlens.partial"
 _LENS_METHOD = "jlens_cotangent_sum"
 LENS_CORPUS_PREPROCESS_VERSION = 1
+
+
+@dataclass(frozen=True)
+class _LensPayloadProof:
+    """Transaction-scoped proof that one immutable pointer was byte-verified.
+
+    Constructed only after a successful load or pointer publication.  Callers
+    may reuse it while holding ``lens_fit_lock``; public/unverified callers pass
+    no proof and retain full digest verification.
+    """
+
+    anchor: str
+    pointer_sha256: str
+
+
+def _lens_payload_proof(
+    anchor: Path, sidecar: Mapping[str, Any],
+) -> _LensPayloadProof:
+    canonical = json.dumps(
+        dict(sidecar), sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    return _LensPayloadProof(
+        anchor=str(anchor.resolve(strict=False)),
+        pointer_sha256=hashlib.sha256(canonical).hexdigest(),
+    )
+
+
+def _proof_matches(
+    proof: _LensPayloadProof | None,
+    anchor: Path,
+    sidecar: Mapping[str, Any],
+) -> bool:
+    return proof == _lens_payload_proof(anchor, sidecar) if proof is not None else False
 
 
 def _lens_anchor_paths(model_id: str) -> tuple[Path, Path]:
@@ -392,6 +426,7 @@ def save_lens(
     model_fingerprint: str | None = None,
     model_source_fingerprint: str | None = None,
     reuse_layers: Iterable[int] | None = None,
+    _verified_reuse_proof: _LensPayloadProof | None = None,
 ) -> Path:
     """Persist a fitted lens and atomically point at its layer generations.
 
@@ -417,6 +452,7 @@ def save_lens(
             model_fingerprint=model_fingerprint,
             model_source_fingerprint=model_source_fingerprint,
             reuse_layers=reuse_layers,
+            verified_reuse_proof=_verified_reuse_proof,
         )
 
 
@@ -437,6 +473,7 @@ def save_lens_checkpoint(
     model_layer_count: int | None = None,
     model_fingerprint: str | None = None,
     model_source_fingerprint: str | None = None,
+    consumed_prefix_sha256: str | None = None,
 ) -> Path:
     """Persist a resumable partial shard without rewriting the full lens."""
     anchor, sc_path = _checkpoint_anchor_paths(model_id)
@@ -460,6 +497,10 @@ def save_lens_checkpoint(
                 "checkpoint": True,
                 "base_n_prompts": int(base_n_prompts),
                 "partial_n_prompts": partial.n_prompts,
+                **(
+                    {"consumed_prefix_sha256": consumed_prefix_sha256}
+                    if consumed_prefix_sha256 is not None else {}
+                ),
             },
         )
 
@@ -483,6 +524,8 @@ def save_lens_checkpoint_accumulator(
     model_layer_count: int | None = None,
     model_fingerprint: str | None = None,
     model_source_fingerprint: str | None = None,
+    consumed_prefix_sha256: str | None = None,
+    _proof_out: list[_LensPayloadProof] | None = None,
 ) -> Path:
     """Write a self-contained checkpoint directly from raw estimator sums.
 
@@ -516,7 +559,12 @@ def save_lens_checkpoint_accumulator(
                 "checkpoint": True,
                 "base_n_prompts": 0,
                 "partial_n_prompts": total_prompts,
+                **(
+                    {"consumed_prefix_sha256": consumed_prefix_sha256}
+                    if consumed_prefix_sha256 is not None else {}
+                ),
             },
+            proof_out=_proof_out,
         )
 
 
@@ -539,6 +587,7 @@ def _save_lens_at(
     model_fingerprint: str | None = None,
     model_source_fingerprint: str | None = None,
     reuse_layers: Iterable[int] | None = None,
+    verified_reuse_proof: _LensPayloadProof | None = None,
     extra_sidecar: dict[str, Any] | None = None,
 ) -> Path:
     with artifact_lock(ts_path):
@@ -558,6 +607,7 @@ def _save_lens_at(
             model_fingerprint=model_fingerprint,
             model_source_fingerprint=model_source_fingerprint,
             reuse_layers=reuse_layers,
+            verified_reuse_proof=verified_reuse_proof,
             extra_sidecar=extra_sidecar,
         )
 
@@ -585,7 +635,9 @@ def _save_lens_components(
     raw_sum_count: int | None = None,
     average_base: JacobianLens | None = None,
     reuse_layers: Iterable[int] | None = None,
+    verified_reuse_proof: _LensPayloadProof | None = None,
     extra_sidecar: dict[str, Any] | None = None,
+    proof_out: list[_LensPayloadProof] | None = None,
 ) -> Path:
     ts_path.parent.mkdir(parents=True, exist_ok=True)
     layer_ids = sorted(int(idx) for idx in jacobians)
@@ -629,6 +681,9 @@ def _save_lens_components(
             )
             current_digests = current["tensor_sha256"]
             from saklas.io.packs import hash_file
+            pointer_verified = _proof_matches(
+                verified_reuse_proof, ts_path, current,
+            )
 
             for layer in sorted(reuse_set & set(layer_ids) & set(current_layers)):
                 digest = current_digests.get(str(layer))
@@ -636,7 +691,8 @@ def _save_lens_components(
                 try:
                     payload_matches = (
                         isinstance(digest, str) and len(digest) == 64
-                        and path.exists() and hash_file(path) == digest
+                        and path.exists()
+                        and (pointer_verified or hash_file(path) == digest)
                     )
                 except OSError:
                     payload_matches = False
@@ -704,6 +760,8 @@ def _save_lens_components(
     # previous pointer named. Otherwise power loss can roll the directory back
     # to an old pointer whose shards GC already removed.
     fsync_directory(sc_path.parent)
+    if proof_out is not None:
+        proof_out[:] = [_lens_payload_proof(ts_path, sidecar)]
     _cleanup_unreferenced_generations(ts_path.parent)
     fsync_directory(sc_path.parent)
     return ts_path.parent / tensor_files[str(layer_ids[0])]
@@ -795,13 +853,27 @@ def load_lens(model_id: str) -> tuple[JacobianLens, dict[str, Any]] | None:
     "no lens" (the caller decides whether to error or re-fit) rather than
     crashing the session.
     """
+    loaded = _load_lens_verified(model_id)
+    return None if loaded is None else (loaded[0], loaded[1])
+
+
+def _load_lens_verified(
+    model_id: str,
+) -> tuple[JacobianLens, dict[str, Any], _LensPayloadProof] | None:
+    """Load a durable lens plus a proof reusable under the fit transaction."""
     anchor, sc_path = _lens_anchor_paths(model_id)
     with artifact_lock(anchor):
         sidecar = _load_sidecar_at(
             model_id, anchor, sc_path, label="jlens cache",
         )
-        return _load_lens_at(
+        loaded = _load_lens_at(
             model_id, anchor, sc_path, sidecar, label="jlens cache",
+        )
+        if loaded is None:
+            return None
+        lens, verified_sidecar = loaded
+        return lens, verified_sidecar, _lens_payload_proof(
+            anchor, verified_sidecar,
         )
 
 
@@ -827,6 +899,7 @@ def promote_lens_checkpoint(
     seq_len: int,
     d_model: int,
     model_fingerprint: str,
+    _verified_proof: _LensPayloadProof | None = None,
 ) -> bool:
     """Promote a complete checkpoint to the durable lens without rewriting it.
 
@@ -856,7 +929,9 @@ def promote_lens_checkpoint(
             or int(sidecar.get("base_n_prompts", -1)) != 0
         ):
             return False
-        if not lens_payloads_match(model_id, sidecar, checkpoint=True):
+        if not _proof_matches(
+            _verified_proof, checkpoint_anchor, sidecar,
+        ) and not lens_payloads_match(model_id, sidecar, checkpoint=True):
             return False
         checkpoint_tensors = set(_sidecar_tensor_paths(
             checkpoint_anchor, sidecar,

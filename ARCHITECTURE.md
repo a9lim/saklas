@@ -125,7 +125,8 @@ and port pre-4.0 packs.)
     <safe_model>_role-<slug>.safetensors           # reserved; role fits validate the canonical tensor
   models/<safe_model>/
     neutral_activations.{safetensors,json}         # neutral corpus × layers, fp32
-    alignments/<safe_src>.{safetensors,json}       # factorized affine map
+    alignments/<safe_src>.json                     # atomic factorized-affine shard pointer
+    alignments/<safe_src>.layer-L.gen-*.safetensors # one bounded factor shard per layer
   vectors/<ns>/<concept>/                          # LEGACY (pre-4.0) only — ported on touch
 ```
 
@@ -950,13 +951,17 @@ so resume retains one full fp32 lens rather than two. Sidecar progress is compar
 before payload load, so a farther self-contained checkpoint displaces the older
 durable/resident matrices without a transient two-lens peak; failed checkpoint
 digest validation falls back to the durable prefix only after releasing the bad
-payload. Sparse layer top-ups reuse the
-unchanged durable shard pointers and write only new matrices. The streamed
+payload. Checkpoints carry the token-id hash of their consumed prefix, so an
+interrupted shorter corpus can be extended without fabricating the future full
+hash or restarting. Sparse layer top-ups reuse the unchanged durable shard
+pointers and write only new matrices. A transaction-scoped verified-pointer
+proof avoids rehashing just-loaded reuse shards; unverified callers still hash.
+The streamed
 safetensors writer never retains a complete fp16 mapping. Normal corpus extension
 resumes from an exact token-id prefix; the default dataset is commit-pinned;
 exact source/live-model fingerprints invalidate mutable revisions. A complete
 terminal checkpoint is fsynced and promoted at finalization instead of being
-rewritten; otherwise each fp16 layer shard is streamed once, with its payload
+rewritten or immediately rehashed; otherwise each fp16 layer shard is streamed once, with its payload
 digest verified on final and checkpoint loads. Pointer-directory fsync precedes
 old-generation GC/checkpoint unlink, and fit preflight reaps crash-left streamed
 temporaries. Exact no-op recovery removes a
@@ -1101,9 +1106,11 @@ Mahalanobis **share** in target space (same whitener
 requirement; no lever — it's gone), clears `origin` (per-layer foot of the
 *source* neutral), and writes the
 `_from-<safe_src>` variant. Since a vector is a 2-node `pca` manifold, `manifold
-transfer` routes to this one transfer path. Alignment cache v3 stores the linear
-map as two rank-sized factors plus the translation under the *target* model dir;
-sidecar identity is checked before payload hashing/materialization. Stable
+transfer` routes to this one transfer path. Alignment cache v4 stores each
+layer's linear map as two rank-sized factors plus translation in an immutable
+shard under the *target* model dir. The atomic pointer's identity and every
+declared header are checked before selective payload materialization; selected
+shards are read once for digest + decode. Stable
 per-model neutral-capture locks and directional alignment-fit
 locks span cache recheck through publication (including both serial model
 loads), so two cold transfer commands do not repeat the same capture/fit work.

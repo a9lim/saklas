@@ -28,6 +28,7 @@ from saklas.core.manifold import (
     fit_rbf_smoothed,
     fit_sigma_field,
     compute_node_reduced_covariance_from_rows,
+    compute_manifold_node_stats,
     compute_store_reduced_covariances,
     prepare_rbf_fit_plan,
     _gcv_select_lambda,
@@ -981,6 +982,43 @@ def test_activation_row_store_combines_disjoint_layers_without_copy() -> None:
     assert left._closed and right._closed
 
 
+def test_node_stats_returns_normalized_accumulator_ownership(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Centroid normalization does not allocate a second K x D roster."""
+    import saklas.core.manifold as manifold_module
+    from saklas.core import vectors
+
+    captured_accumulators: list[torch.Tensor] = []
+    real_zeros = torch.zeros
+
+    def tracked_zeros(*args: Any, **kwargs: Any) -> torch.Tensor:
+        result = real_zeros(*args, **kwargs)
+        if args[:2] == (2, 2) and kwargs.get("device") is None:
+            captured_accumulators.append(result)
+        return result
+
+    def fake_capture(*_args: Any, **_kwargs: Any) -> dict[int, torch.Tensor]:
+        return {0: torch.tensor([
+            [1.0, 3.0], [3.0, 5.0], [10.0, 14.0], [14.0, 18.0],
+        ])}
+
+    monkeypatch.setattr(manifold_module.torch, "zeros", tracked_zeros)
+    monkeypatch.setattr(vectors, "_encode_and_capture_all_batch", fake_capture)
+    centroids, retained = compute_manifold_node_stats(
+        torch.nn.Linear(1, 1), object(),
+        torch.nn.ModuleList([torch.nn.Identity()]), torch.device("cpu"),
+        [("a", ["a1", "a2"]), ("b", ["b1", "b2"])], ["prompt"],
+        roles=[None, None], layer_indices=[0], retain_rows=False,
+        prepared_rows=[(torch.tensor([[1]]), 0)] * 4,
+    )
+
+    assert retained is None
+    assert len(captured_accumulators) == 1
+    assert centroids[0] is captured_accumulators[0]
+    assert torch.equal(centroids[0], torch.tensor([[2.0, 4.0], [12.0, 16.0]]))
+
+
 def test_layer_major_store_covariances_match_node_reference() -> None:
     torch.manual_seed(4)
     node_sizes = [2, 3, 1]
@@ -1152,6 +1190,76 @@ def test_off_surface_vars_matches_scalar_helper():
     ])
 
     assert torch.allclose(batched, scalar, atol=1e-6)
+
+
+def test_off_surface_variance_uses_actual_rank_at_fold() -> None:
+    # Nominal n=2, but a local fold collapses the tangent to rank 1.  The
+    # actual normal complement is 2-D, so isotropic unit covariance stays 1.
+    cov = torch.eye(3)
+    tangent = torch.tensor([
+        [1.0, 0.0],
+        [0.0, 0.0],
+        [0.0, 0.0],
+    ])
+    assert _off_surface_var(cov, tangent, R=3, n=2) == pytest.approx(1.0)
+    assert _off_surface_vars(
+        cov.unsqueeze(0), tangent.unsqueeze(0), R=3, n=2,
+    ).item() == pytest.approx(1.0)
+
+
+def test_off_surface_variance_rank_deficient_when_r_le_n() -> None:
+    # Even when nominal n fills R, a rank-1 tangent leaves a real normal axis;
+    # sigma must isolate its variance instead of averaging tangent+normal.
+    cov = torch.diag(torch.tensor([3.0, 7.0]))
+    tangent = torch.tensor([[1.0, 0.0], [0.0, 0.0]])
+    assert _off_surface_var(cov, tangent, R=2, n=2) == pytest.approx(7.0)
+    assert _off_surface_vars(
+        cov.unsqueeze(0), tangent.unsqueeze(0), R=2, n=2,
+    ).item() == pytest.approx(7.0)
+
+
+def test_off_surface_variance_fuses_rank_and_projector_svd(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fused SVD uses the matrix-rank tolerance at a near-rank fold."""
+    R = n = 2
+    eps = torch.finfo(torch.float32).eps
+    threshold = max(R, n) * eps
+    tangents = torch.stack([
+        torch.diag(torch.tensor([1.0, threshold * 2.0])),
+        torch.diag(torch.tensor([1.0, threshold * 0.5])),
+        torch.zeros(2, 2),
+    ])
+    covs = torch.stack([
+        torch.diag(torch.tensor([3.0, 7.0])),
+        torch.diag(torch.tensor([3.0, 7.0])),
+        torch.diag(torch.tensor([3.0, 7.0])),
+    ])
+
+    original_svd = torch.linalg.svd
+    calls = 0
+
+    def counted_svd(*args: object, **kwargs: object):
+        nonlocal calls
+        calls += 1
+        return original_svd(*args, **kwargs)
+
+    monkeypatch.setattr(torch.linalg, "svd", counted_svd)
+    monkeypatch.setattr(
+        torch.linalg, "pinv",
+        lambda *_args, **_kwargs: pytest.fail("projector repeated the SVD"),
+    )
+    monkeypatch.setattr(
+        torch.linalg, "matrix_rank",
+        lambda *_args, **_kwargs: pytest.fail("rank repeated the SVD"),
+    )
+
+    result = _off_surface_vars(covs, tangents, R, n)
+
+    assert calls == 1
+    # Above tolerance the tangent fills R, selecting the isotropic fallback;
+    # below it the second axis is normal and its variance is isolated.
+    assert result.tolist() == pytest.approx([5.0, 7.0, 5.0])
 
 
 def test_fit_sigma_field_interpolates_node_thickness():

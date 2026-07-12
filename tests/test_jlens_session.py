@@ -152,9 +152,11 @@ def test_terminal_checkpoint_is_promoted_without_second_tensor_write(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import saklas.io.lens as lens_io
+    from saklas.io import packs
 
     real_save = lens_io._save_fp16_square_safetensors_atomic
     writes = 0
+    hashes = 0
 
     def _counting_save(*args: Any, **kwargs: Any) -> Any:
         nonlocal writes
@@ -164,6 +166,14 @@ def test_terminal_checkpoint_is_promoted_without_second_tensor_write(
     monkeypatch.setattr(
         lens_io, "_save_fp16_square_safetensors_atomic", _counting_save,
     )
+    real_hash = packs.hash_file
+
+    def _counting_hash(path: Path) -> str:
+        nonlocal hashes
+        hashes += 1
+        return real_hash(path)
+
+    monkeypatch.setattr(packs, "hash_file", _counting_hash)
     fitted = _StubSession().fit_jlens(
         _PROMPTS[:2], force=True, checkpoint_every=2,
     )
@@ -172,6 +182,7 @@ def test_terminal_checkpoint_is_promoted_without_second_tensor_write(
     # One checkpoint shard per fitted layer; promotion only switches the
     # durable sidecar pointer and performs no second serialization pass.
     assert writes == len(fitted.source_layers)
+    assert hashes == 0
     assert load_lens(_MODEL_ID) is not None
     assert load_lens_checkpoint(_MODEL_ID) is None
 
@@ -823,24 +834,28 @@ def test_has_compatible_jlens_rechecks_loaded_pointer_fingerprint(
     assert not session.has_compatible_jlens()
 
 
-def test_fit_jlens_resumes_from_checkpoint_without_full_artifact() -> None:
+def test_fit_jlens_extends_real_prefix_checkpoint_without_full_artifact() -> None:
     full = _StubSession().fit_jlens(_PROMPTS, force=True)
     head_session = _StubSession()
     head = head_session.fit_jlens(_PROMPTS[:2], force=True)
     for path in lens_paths(_MODEL_ID):
         path.unlink()
-    consumed = [
+    consumed_prefix = [
         [int(tok) for tok in head_session._tokenizer(
             p, return_tensors="pt",
         )["input_ids"][0].tolist()]
-        for p in _PROMPTS
+        for p in _PROMPTS[:2]
     ]
-    corpus_sha = hashlib.sha256(repr(consumed).encode("utf-8")).hexdigest()
+    prefix_sha = hashlib.sha256(
+        repr(consumed_prefix).encode("utf-8")
+    ).hexdigest()
     save_lens_checkpoint(
         head, _MODEL_ID,
         base_n_prompts=0,
         corpus_spec="test",
-        corpus_sha256=corpus_sha,
+        # This is the real identity an interrupted two-prompt request owns,
+        # not the future four-prompt corpus hash.
+        corpus_sha256=prefix_sha,
         corpus_hash_kind="token_ids_v1",
         seq_len=128,
         dim_batch=8,
@@ -848,6 +863,7 @@ def test_fit_jlens_resumes_from_checkpoint_without_full_artifact() -> None:
         model_fingerprint=loaded_model_fingerprint(
             head_session._model, _MODEL_ID,
         ),
+        consumed_prefix_sha256=prefix_sha,
     )
 
     messages: list[str] = []
@@ -1135,6 +1151,7 @@ def test_fit_jlens_missing_layer_topup_resumes_checkpoint(
 ) -> None:
     import saklas.core.jlens as jlens_mod
     import saklas.io.lens as lens_io
+    from saklas.io import packs
 
     full = _StubSession().fit_jlens(
         _PROMPTS, force=True, source_layers=[0, 1],
@@ -1163,6 +1180,15 @@ def test_fit_jlens_missing_layer_topup_resumes_checkpoint(
     monkeypatch.setattr(jlens_mod, "fit_jacobian_lens", real_fit)
     real_save = lens_io.save_lens
     reused: list[set[int]] = []
+    hashes = 0
+    real_hash = packs.hash_file
+
+    def _count_hash(path: Path) -> str:
+        nonlocal hashes
+        hashes += 1
+        return real_hash(path)
+
+    monkeypatch.setattr(packs, "hash_file", _count_hash)
 
     def _capture_reuse(*args: Any, **kwargs: Any) -> Any:
         reused.append(set(kwargs.get("reuse_layers") or ()))
@@ -1175,6 +1201,7 @@ def test_fit_jlens_missing_layer_topup_resumes_checkpoint(
     )
     assert any("missing-layer checkpoint at 2" in message for message in messages)
     assert reused == [{0}]
+    assert hashes == 0
     for layer in full.source_layers:
         assert torch.allclose(
             resumed.jacobians[layer], full.jacobians[layer], atol=2e-3,

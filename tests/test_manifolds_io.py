@@ -29,6 +29,7 @@ from saklas.io.manifolds import (
     merge_discover_manifolds,
     min_nodes,
     plan_discover_generation,
+    preflight_transfer_manifold,
     read_manifold_scenarios,
     refresh_manifold,
     remove_manifold_folder,
@@ -396,6 +397,56 @@ def test_update_file_hashes_only_reads_new_artifact(
     assert ManifoldFolder.load(folder).files == mf.files
 
 
+def test_update_file_hashes_upgrades_readable_v5_manifest(
+    tmp_path: Path,
+) -> None:
+    folder = _author_manifold(tmp_path)
+    manifest_path = folder / "manifold.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["format_version"] = 5
+    manifest_path.write_text(json.dumps(manifest))
+    tensor = folder / "new-model.safetensors"
+    sidecar = folder / "new-model.json"
+    tensor.write_bytes(b"v6 tensor")
+    sidecar.write_text(json.dumps({
+        "format_version": MANIFOLD_FORMAT_VERSION,
+        "domain": _box1d(False, ["a", "b", "c"])["domain"],
+    }))
+
+    ManifoldFolder.load(folder, verify_manifest=False).update_file_hashes(
+        tensor, sidecar,
+    )
+
+    published = json.loads(manifest_path.read_text())
+    assert published["format_version"] == MANIFOLD_FORMAT_VERSION
+    assert {tensor.name, sidecar.name} <= set(published["files"])
+
+
+def test_update_file_hashes_rejects_unreadable_future_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    folder = _author_manifold(tmp_path)
+    mf = ManifoldFolder.load(folder, verify_manifest=False)
+    manifest_path = folder / "manifold.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["format_version"] = MANIFOLD_FORMAT_VERSION + 1
+    manifest["files"] = ["future-schema"]
+    manifest_path.write_text(json.dumps(manifest))
+    tensor = folder / "new-model.safetensors"
+    tensor.write_bytes(b"future tensor")
+
+    from saklas.io import manifold_folder as folder_mod
+
+    def _unexpected_hash(_path: Path) -> str:
+        pytest.fail("an unreadable manifest must be rejected before payload hashing")
+
+    monkeypatch.setattr(folder_mod, "hash_file", _unexpected_hash)
+    with pytest.raises(ManifoldFormatError, match="newer saklas"):
+        mf.update_file_hashes(tensor)
+
+    assert json.loads(manifest_path.read_text()) == manifest
+
+
 def test_bundle_drift_ignores_local_fit_transaction_state() -> None:
     from saklas.io.manifolds import _manifest_content_sha256
 
@@ -713,6 +764,57 @@ def test_malformed_json_raises_format_error(tmp_path: Path):
     (folder / "manifold.json").write_text("{ not valid json")
     with pytest.raises(ManifoldFormatError):
         ManifoldFolder.load(folder)
+
+
+@pytest.mark.parametrize("root", ["[]", "null", "1"])
+def test_non_object_manifest_raises_format_error(
+    tmp_path: Path, root: str,
+) -> None:
+    folder = _author_manifold(tmp_path)
+    (folder / "manifold.json").write_text(root)
+
+    with pytest.raises(ManifoldFormatError, match="JSON object"):
+        ManifoldFolder.load(folder)
+
+
+def test_non_object_manifest_rejected_by_locked_metadata_writers(
+    tmp_path: Path,
+) -> None:
+    folder = _author_manifold(tmp_path)
+    mf = ManifoldFolder.load(folder, verify_manifest=False)
+    manifest_path = folder / "manifold.json"
+    manifest_path.write_text("[]")
+    tensor = folder / "new-model.safetensors"
+    tensor.write_bytes(b"payload")
+
+    with pytest.raises(ManifoldFormatError, match="JSON object"):
+        mf.update_file_hashes(tensor)
+    with pytest.raises(ManifoldFormatError, match="JSON object"):
+        mf.write_metadata()
+
+
+def test_write_metadata_rejects_concurrent_future_manifest(
+    tmp_path: Path,
+) -> None:
+    folder = _author_manifold(tmp_path)
+    stale = ManifoldFolder.load(folder, verify_manifest=False)
+    manifest_path = folder / "manifold.json"
+    future = json.loads(manifest_path.read_text())
+    future["format_version"] = MANIFOLD_FORMAT_VERSION + 1
+    manifest_path.write_text(json.dumps(future))
+
+    with pytest.raises(ManifoldFormatError, match="newer saklas"):
+        stale.write_metadata()
+
+    assert json.loads(manifest_path.read_text()) == future
+
+
+def test_non_object_sidecar_raises_format_error(tmp_path: Path) -> None:
+    path = tmp_path / "model.json"
+    path.write_text("[]")
+
+    with pytest.raises(ManifoldFormatError, match="JSON object"):
+        ManifoldSidecar.load(path)
 
 
 def test_iter_manifold_folders_skips_malformed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -1914,6 +2016,72 @@ def test_rectangular_transfer_rejects_oblique_rank_collapse() -> None:
         )
 
 
+def test_rectangular_transfer_into_v5_folder_publishes_v6_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A v6 affine_map can never be trusted under a v5 manifest."""
+    from safetensors.torch import load_file
+    from saklas.core.manifold import (
+        MANIFOLD_FIT_POLICY_VERSION, CustomDomain, LayerSubspace, Manifold,
+        save_manifold,
+    )
+    from saklas.io.alignment import LayerAlignment
+    from saklas.io.paths import tensor_filename
+
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    folder = create_discover_manifold_folder(
+        "local", "rect-flat", "", fit_mode="pca",
+        node_corpora={"a": ["a"], "b": ["b"], "c": ["c"]},
+    )
+    node_coords = torch.tensor([[0.0, 0.0], [1.0, -0.5], [-0.25, 1.5]])
+    source = Manifold(
+        name="rect-flat", domain=CustomDomain(2),
+        node_labels=["a", "b", "c"], node_coords=node_coords,
+        layers={0: LayerSubspace.affine(
+            torch.tensor([0.5, -1.0, 2.0, 0.25]),
+            torch.tensor([
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+            ]),
+            node_coords=node_coords.clone(),
+        )},
+    )
+    src_model, tgt_model = "src/model", "tgt/model"
+    src_path = folder / tensor_filename(src_model)
+    mf = ManifoldFolder.load(folder, verify_manifest=False)
+    save_manifold(source, src_path, {
+        "method": "manifold_pca",
+        "nodes_sha256": mf.nodes_sha256(),
+        "model_fingerprint": f"fp:{src_model}",
+        "fit_policy_version": MANIFOLD_FIT_POLICY_VERSION,
+    })
+    mf.update_file_hashes(src_path, src_path.with_suffix(".json"))
+    manifest_path = folder / "manifold.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["format_version"] = 5
+    manifest_path.write_text(json.dumps(manifest))
+
+    dense = torch.tensor([
+        [2.0, 0.2, 0.0, 0.0], [0.0, 0.5, 0.0, 0.0],
+        [0.3, 0.0, 1.0, 0.0], [0.0, -0.4, 0.0, 1.0],
+        [0.1, 0.2, 0.0, 0.0], [0.0, 0.3, 0.0, 0.0],
+    ])
+    out = transfer_manifold(
+        folder, from_model=src_model, to_model=tgt_model,
+        alignment={0: LayerAlignment(
+            dense, torch.eye(4), torch.linspace(-0.5, 0.5, 6),
+        )},
+        source_model_fingerprint=f"fp:{src_model}",
+        target_model_fingerprint=f"fp:{tgt_model}",
+        whitener=_target_whitener(dim=6, layers=(0,)),
+    )
+
+    assert json.loads(manifest_path.read_text())["format_version"] == (
+        MANIFOLD_FORMAT_VERSION
+    )
+    assert "layer_0.affine_map" in load_file(str(out), device="cpu")
+
+
 def _target_whitener(*, dim: int = 6, layers: tuple[int, ...] = (4, 5, 6)):
     """A target-model whitener over the transferred layers.
 
@@ -1970,6 +2138,178 @@ def _fit_real_manifold(folder: Path, model_id: str, *, dim: int = 6, seed: int =
     })
     mf.update_file_hashes(out, out.with_suffix(".json"))
     return out
+
+
+def test_transfer_preflight_returns_locked_source_layer_header(
+    tmp_path: Path,
+) -> None:
+    folder = _author_manifold(tmp_path)
+    _fit_real_manifold(folder, "src/model", dim=4)
+
+    proof = preflight_transfer_manifold(
+        folder, from_model="src/model", to_model="tgt/model",
+    )
+    assert proof.layers == (4, 5, 6)
+
+
+def test_transfer_rejects_source_generation_changed_after_preflight(
+    tmp_path: Path,
+) -> None:
+    folder = _author_manifold(tmp_path)
+    _fit_real_manifold(folder, "src/model", dim=4, seed=0)
+    proof = preflight_transfer_manifold(
+        folder, from_model="src/model", to_model="tgt/model",
+    )
+    _fit_real_manifold(folder, "src/model", dim=4, seed=1)
+
+    with pytest.raises(ManifoldFormatError, match="changed while alignment"):
+        transfer_manifold(
+            folder,
+            from_model="src/model",
+            to_model="tgt/model",
+            alignment={layer: torch.eye(4) for layer in proof.layers},
+            source_model_fingerprint="fp:src/model",
+            target_model_fingerprint="fp:tgt/model",
+            whitener=_target_whitener(dim=4),
+            expected_source_proof=proof,
+        )
+
+    from saklas.io.paths import tensor_filename
+
+    assert not (
+        folder / tensor_filename("tgt/model", transferred_from="src/model")
+    ).exists()
+
+
+def test_transfer_preflight_wraps_corrupt_manifest(tmp_path: Path) -> None:
+    folder = _author_manifold(tmp_path)
+    _fit_real_manifold(folder, "src/model", dim=4)
+    (folder / "manifold.json").write_text("{")
+
+    with pytest.raises(ManifoldFormatError, match="manifest is unreadable"):
+        preflight_transfer_manifold(
+            folder, from_model="src/model", to_model="tgt/model",
+        )
+
+
+@pytest.mark.parametrize("root", ["[]", "null", '"manifest"'])
+def test_transfer_preflight_rejects_non_object_manifest_before_payload_hash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, root: str,
+) -> None:
+    folder = _author_manifold(tmp_path)
+    _fit_real_manifold(folder, "src/model", dim=4)
+    (folder / "manifold.json").write_text(root)
+    monkeypatch.setattr(
+        "saklas.io.packs.verify_integrity",
+        lambda *_args, **_kwargs: pytest.fail(
+            "non-object manifest reached payload hashing"
+        ),
+    )
+
+    with pytest.raises(ManifoldFormatError, match="JSON object"):
+        preflight_transfer_manifold(
+            folder, from_model="src/model", to_model="tgt/model",
+        )
+
+
+@pytest.mark.parametrize("digest", [None, 7, "abc", "g" * 64])
+def test_transfer_preflight_rejects_invalid_selected_digest_before_hashing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, digest: object,
+) -> None:
+    folder = _author_manifold(tmp_path)
+    source = _fit_real_manifold(folder, "src/model", dim=4)
+    manifest_path = folder / "manifold.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["files"][source.name] = digest
+    manifest_path.write_text(json.dumps(manifest))
+    monkeypatch.setattr(
+        "saklas.io.packs.verify_integrity",
+        lambda *_args, **_kwargs: pytest.fail(
+            "malformed selected digest reached payload hashing"
+        ),
+    )
+
+    with pytest.raises(ManifoldFormatError, match="invalid sha256"):
+        preflight_transfer_manifold(
+            folder, from_model="src/model", to_model="tgt/model",
+        )
+
+
+def test_transfer_preflight_rejects_future_manifest_before_payload_hash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    folder = _author_manifold(tmp_path)
+    _fit_real_manifold(folder, "src/model", dim=4)
+    manifest_path = folder / "manifold.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["format_version"] = MANIFOLD_FORMAT_VERSION + 1
+    manifest_path.write_text(json.dumps(manifest))
+
+    monkeypatch.setattr(
+        "saklas.io.packs.verify_integrity",
+        lambda *_args, **_kwargs: pytest.fail(
+            "future manifest reached payload hashing"
+        ),
+    )
+    with pytest.raises(ManifoldFormatError, match="newer saklas"):
+        preflight_transfer_manifold(
+            folder, from_model="src/model", to_model="tgt/model",
+        )
+
+
+def test_strict_fitted_load_rejects_non_object_manifest(tmp_path: Path) -> None:
+    from saklas.core.manifold import load_manifold
+
+    folder = _author_manifold(tmp_path)
+    source = _fit_real_manifold(folder, "src/model", dim=4)
+    (folder / "manifold.json").write_text("[]")
+
+    with pytest.raises(ManifoldFormatError, match="JSON object"):
+        load_manifold(source)
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"), [("{", "unreadable"), ("[]", "JSON object")],
+)
+def test_strict_fitted_load_normalizes_trusted_corrupt_sidecar(
+    tmp_path: Path, payload: str, message: str,
+) -> None:
+    from saklas.core.manifold import load_manifold
+    from saklas.io.packs import hash_file
+
+    folder = _author_manifold(tmp_path)
+    source = _fit_real_manifold(folder, "src/model", dim=4)
+    sidecar = source.with_suffix(".json")
+    sidecar.write_text(payload)
+    manifest_path = folder / "manifold.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["files"][sidecar.name] = hash_file(sidecar)
+    manifest_path.write_text(json.dumps(manifest))
+
+    with pytest.raises(ManifoldFormatError, match=message):
+        load_manifold(source)
+
+
+def test_strict_fitted_load_rejects_invalid_digest_before_hashing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from saklas.core.manifold import load_manifold
+
+    folder = _author_manifold(tmp_path)
+    source = _fit_real_manifold(folder, "src/model", dim=4)
+    manifest_path = folder / "manifold.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["files"][source.name] = "invalid"
+    manifest_path.write_text(json.dumps(manifest))
+    monkeypatch.setattr(
+        "saklas.io.packs.verify_integrity",
+        lambda *_args, **_kwargs: pytest.fail(
+            "invalid digest reached fitted payload hashing"
+        ),
+    )
+
+    with pytest.raises(ManifoldFormatError, match="invalid sha256"):
+        load_manifold(source)
 
 
 def test_transfer_manifold_identity_alignment_preserves_geometry(

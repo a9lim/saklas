@@ -231,6 +231,8 @@ category list through verbatim (tagged concepts only, no multi-node sweep).
   `transcript` is not a top-level verb.
 - `experiment naturalness`: `model` + `prompt`, `--manifold FOLDER` / `-S/--steer
   EXPR` (required), `--compare-linear`, `--max-tokens` (128), `-j`.
+  Its behavior-manifold preflight consumes only authoring geometry/corpus, so it
+  does not hash unrelated fitted payloads.
 - `config show`/`validate` — flags as in `config_file`.
 - `lens fit`: positional `model`, `--corpus FILE`, `--prompts N` (100),
   `--seq-len T` (128), `--dim-batch K` (8; total backward work is K-invariant,

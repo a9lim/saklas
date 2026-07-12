@@ -860,22 +860,35 @@ def test_run_manifold_transfer_calls_backend(monkeypatch: pytest.MonkeyPatch, tm
     (folder / "manifold.json").write_text("{}")
     src_model = "google/gemma-3-4b-it"
     (folder / f"{safe_model_id(src_model)}.safetensors").write_bytes(b"x")
+    from saklas.io.manifolds import TransferSourceProof
+
+    source_proof = TransferSourceProof(
+        tensor_name="source.safetensors",
+        tensor_sha256="a" * 64,
+        sidecar_sha256="b" * 64,
+        layers=(14, 15),
+    )
     monkeypatch.setattr(
         "saklas.io.manifolds.preflight_transfer_manifold",
-        lambda *_args, **_kwargs: None,
+        lambda *_args, **_kwargs: source_proof,
     )
 
     import torch
     fake_M = {14: torch.eye(4), 15: torch.eye(4)}
     target_whitener = object()
-    monkeypatch.setattr(
-        "saklas.cli.runners._load_or_fit_transfer_alignment",
-        lambda *args, **kwargs: (
+    alignment_calls: list[dict[str, Any]] = []
+
+    def fake_alignment(*_args: Any, **kwargs: Any):
+        alignment_calls.append(kwargs)
+        return (
             fake_M, {14: 0.9, 15: 0.8}, tmp_path / "alignment.safetensors",
             {"model_fingerprint": "src-fp"},
             {"model_fingerprint": "tgt-fp"},
             target_whitener,
-        ),
+        )
+
+    monkeypatch.setattr(
+        "saklas.cli.runners._load_or_fit_transfer_alignment", fake_alignment,
     )
 
     calls: list[dict[str, Any]] = []
@@ -885,11 +898,13 @@ def test_run_manifold_transfer_calls_backend(monkeypatch: pytest.MonkeyPatch, tm
                       source_model_fingerprint: Any = None,
                       target_model_fingerprint: Any = None,
                       whitener: Any = None, layer_means: Any = None,
-                      force: bool = False) -> Path:
+                      force: bool = False,
+                      expected_source_proof: Any = None) -> Path:
         calls.append({
             "folder": folder_arg, "from": from_model, "to": to_model,
             "layers": sorted(alignment.keys()), "quality": transfer_quality_estimate,
             "force": force, "whitener": whitener,
+            "source_proof": expected_source_proof,
         })
         return folder_arg / "Qwen__Qwen3-4B_from-google__gemma-3-4b-it.safetensors"
 
@@ -904,6 +919,8 @@ def test_run_manifold_transfer_calls_backend(monkeypatch: pytest.MonkeyPatch, tm
     assert c["to"] == "Qwen/Qwen3-4B"
     assert c["layers"] == [14, 15]
     assert c["whitener"] is target_whitener
+    assert alignment_calls[0]["requested_layers"] == [14, 15]
+    assert c["source_proof"] is source_proof
     # Median of {0.9, 0.8} = 0.85.
     assert abs(c["quality"] - 0.85) < 1e-9
     out = capsys.readouterr().out

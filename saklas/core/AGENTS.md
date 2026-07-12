@@ -89,7 +89,12 @@ preflight but fails full digest/finite validation falls back to the durable
 prefix after the failed payload is released. Cadence never fractures a healthy prompt microbatch. When the
 terminal checkpoint is already the complete lens, finalization fsyncs its
 immutable per-layer tensor generations and atomically repoints the durable sidecar instead
-of converting/writing the same artifact again. The checkpoint remains the
+of converting/writing the same artifact again. Each checkpoint stamps the
+token-id hash of the prefix actually consumed, so a later corpus extension can
+resume honestly from that prefix. Successful loads/writes also yield an
+in-transaction pointer proof: terminal promotion and missing-layer shard reuse
+skip a redundant full rehash only while that exact pointer remains under the fit
+lock; unverified public callers retain defensive digest validation. The checkpoint remains the
 recovery point until that pointer commit succeeds.
 `checkpoint_cb` remains the compatibility surface. `JacobianLens.merge` is the
 non-mutating n_prompts-weighted combiner; `merge_into` recycles a caller-owned
@@ -157,7 +162,9 @@ is no per-row H2D followed by a blocking `.tolist()` D2H. `role=` is uniform;
 `_CAPTURE_BATCH` and amortize the MPS `empty_cache` per chunk.
 Fit-wide manifold capture tokenizes once, sorts rows by token length, grows clean
 batches up to `_CAPTURE_BATCH_MAX`, and stops the model after the last selected
-layer so unused upper blocks, final norm, and LM head never run.
+layer so unused upper blocks, final norm, and LM head never run. Its layer-major
+centroid accumulators are normalized in place and transferred directly to fit
+ownership, avoiding a second full `layers × nodes × hidden_dim` fp32 roster.
 `_encode_and_capture_all` is the single-pair sibling. `_capture_all_hidden_states`
 hooks every layer at once and accepts an `int` (single) or `(B,)` tensor (per-row)
 `pool_index`. Capture is **conversational** (4.0 / A2): a corpus item is an
@@ -529,7 +536,10 @@ node's reduced `(R,R)` covariance. `compute_node_reduced_covariance_from_rows`
 and `compute_node_reduced_covariance` remain for standalone callers
 without retained rows; `fit_sigma_field`
 reduces it to one off-surface scalar per node (`_off_surface_var` — the
-normal-complement trace via the surface tangent `_reduced_tangent`) and fits a
+normal-complement trace via the surface tangent `_reduced_tangent`, divided by
+the normal degrees of freedom from the tangent's **actual local rank**, including
+rank-deficient folds where `R <= n`; one batched economy SVD supplies both rank
+and the tangent projector) and fits a
 **separate** `log σ` RBF over the same normalized `node_params`, stored on
 `LayerSubspace.{sigma_rbf_weights,sigma_poly_coeffs}` (None ⇒ `has_sigma` False ⇒
 `sigma_at` returns 0 ⇒ exact legacy). `sigma_at(embedded)` is the one extra

@@ -7,7 +7,7 @@ import functools
 from operator import itemgetter
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, TypeVar
+from typing import TYPE_CHECKING, Any, Callable, Sequence, TypeVar
 
 from saklas.cli.parsers import (
     _EXPERIMENT_VERBS, _LENS_VERBS, _MANIFOLD_VERBS, _PACK_VERBS, _SAE_VERBS,
@@ -86,6 +86,7 @@ def _load_or_fit_transfer_alignment(
     *,
     force: bool,
     label: str,
+    requested_layers: "Sequence[int] | None" = None,
 ) -> tuple[
     dict[int, Any], dict[int, float], Path, dict[str, Any], dict[str, Any], Any,
 ]:
@@ -95,6 +96,7 @@ def _load_or_fit_transfer_alignment(
     with alignment_fit_lock(src_model, tgt_model):
         return _load_or_fit_transfer_alignment_locked(
             src_model, tgt_model, force=force, label=label,
+            requested_layers=requested_layers,
         )
 
 
@@ -104,6 +106,7 @@ def _load_or_fit_transfer_alignment_locked(
     *,
     force: bool,
     label: str,
+    requested_layers: "Sequence[int] | None" = None,
 ) -> tuple[
     dict[int, Any], dict[int, float], Path, dict[str, Any], dict[str, Any], Any,
 ]:
@@ -120,6 +123,12 @@ def _load_or_fit_transfer_alignment_locked(
         save_alignment_map,
         validate_neutral_cache_metadata,
     )
+
+    def _selected(M: dict[int, Any]) -> dict[int, Any]:
+        if requested_layers is None:
+            return M
+        wanted = {int(layer) for layer in requested_layers}
+        return {layer: value for layer, value in M.items() if layer in wanted}
 
     # Exact no-model path: immutable Hub commit or local snapshot identity proves
     # that both validated neutral caches still describe the requested sources.
@@ -162,6 +171,7 @@ def _load_or_fit_transfer_alignment_locked(
             cached = load_alignment_map(
                 src_model, tgt_model,
                 source_identity=src_identity, target_identity=tgt_identity,
+                requested_layers=requested_layers,
             )
             if cached is not None:
                 M, sidecar = cached
@@ -174,7 +184,7 @@ def _load_or_fit_transfer_alignment_locked(
                     tgt_acts,
                 )
                 return (
-                    M, quality_per_layer, map_path,
+                    _selected(M), quality_per_layer, map_path,
                     src_identity, tgt_identity, target_whitener,
                 )
 
@@ -211,7 +221,7 @@ def _load_or_fit_transfer_alignment_locked(
                     tgt_acts,
                 )
                 return (
-                    M, quality_per_layer, map_path,
+                    _selected(M), quality_per_layer, map_path,
                     src_identity, tgt_identity, target_whitener,
                 )
 
@@ -243,6 +253,7 @@ def _load_or_fit_transfer_alignment_locked(
     cached = None if force else load_alignment_map(
         src_model, tgt_model,
         source_identity=src_identity, target_identity=tgt_identity,
+        requested_layers=requested_layers,
     )
     if cached is not None:
         M, sidecar = cached
@@ -252,7 +263,7 @@ def _load_or_fit_transfer_alignment_locked(
         del src_acts
         target_whitener = _target_whitener_from_neutral_activations(tgt_acts)
         return (
-            M, quality_per_layer, map_path, src_identity, tgt_identity,
+            _selected(M), quality_per_layer, map_path, src_identity, tgt_identity,
             target_whitener,
         )
     try:
@@ -270,7 +281,7 @@ def _load_or_fit_transfer_alignment_locked(
     del src_acts
     target_whitener = _target_whitener_from_neutral_activations(tgt_acts)
     return (
-        M, quality_per_layer, map_path, src_identity, tgt_identity,
+        _selected(M), quality_per_layer, map_path, src_identity, tgt_identity,
         target_whitener,
     )
 
@@ -2159,13 +2170,16 @@ def _run_manifold_transfer(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     try:
-        preflight_transfer_manifold(
+        source_proof = preflight_transfer_manifold(
             folder, from_model=args.src_model, to_model=args.tgt_model,
             force=args.force,
         )
     except (FileNotFoundError, FileExistsError, ManifoldFormatError) as e:
         print(f"manifold transfer failed: {e}", file=sys.stderr)
         sys.exit(1)
+    requested_alignment_layers = (
+        list(source_proof.layers) if source_proof is not None else None
+    )
 
     # Alignment construction also returns the identity-matched target
     # whitener. On a cold/stale fit it is built directly from the target
@@ -2181,6 +2195,7 @@ def _run_manifold_transfer(args: argparse.Namespace) -> None:
         ) = _load_or_fit_transfer_alignment(
             args.src_model, args.tgt_model, force=args.force,
             label="manifold transfer",
+            requested_layers=requested_alignment_layers,
         )
     except WhitenerError as e:
         print(f"manifold transfer failed: {e}", file=sys.stderr)
@@ -2199,6 +2214,7 @@ def _run_manifold_transfer(args: argparse.Namespace) -> None:
             target_model_fingerprint=target_identity["model_fingerprint"],
             whitener=target_whitener,
             force=args.force,
+            expected_source_proof=source_proof,
         )
     except (FileNotFoundError, FileExistsError, ManifoldFormatError) as e:
         print(f"manifold transfer failed: {e}", file=sys.stderr)
@@ -2887,7 +2903,9 @@ def _run_experiment_naturalness(args: argparse.Namespace) -> None:
             file=sys.stderr,
         )
         sys.exit(2)
-    mf = ManifoldFolder.load(mfolder)
+    # Naturalness consumes only authoring geometry + node corpus; fitted
+    # payload integrity is irrelevant to this independent behavior-space fit.
+    mf = ManifoldFolder.load(mfolder, verify_manifest=False)
     node_groups = mf.node_groups()
     domain = domain_from_spec(mf.domain)
     node_coords = torch.tensor(mf.node_coords, dtype=torch.float32)

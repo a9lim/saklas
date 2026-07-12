@@ -31,18 +31,24 @@ import hashlib
 import json
 import logging
 import os
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator, Mapping
+from typing import Any, Iterable, Iterator, Mapping
 
 import torch
 from safetensors import safe_open
-from safetensors.torch import load_file, save_file
+from safetensors.torch import (
+    load as load_safetensors,
+    load_file,
+    save as save_safetensors,
+    save_file,
+)
 
 from saklas.core.errors import SaklasError
 from saklas.core.profile import Profile
-from saklas.io.atomic import write_json_atomic
+from saklas.io.atomic import fsync_directory, write_bytes_atomic, write_json_atomic
 from saklas.io.paths import model_dir, safe_model_id
 from saklas.io.packs import hash_file
 
@@ -51,7 +57,7 @@ log = logging.getLogger(__name__)
 _NEUTRAL_ACTS_NAME = "neutral_activations"
 _NEUTRAL_CACHE_FORMAT_VERSION = 2
 _NEUTRAL_CAPTURE_VERSION = 1
-_ALIGNMENT_CACHE_FORMAT_VERSION = 3
+_ALIGNMENT_CACHE_FORMAT_VERSION = 4
 
 
 @dataclass(frozen=True)
@@ -673,17 +679,77 @@ def transfer_profile(
 # ---------------------------------------------------------------------------
 
 
-def alignment_cache_path(src_model_id: str, tgt_model_id: str) -> tuple[Path, Path]:
-    """``(safetensors, sidecar)`` paths for a cached alignment map.
-
-    Layout: ``~/.saklas/models/<safe_tgt>/alignments/<safe_src>.{safetensors,json}``.
-    Lives under the *target* model's directory so deleting a target
-    model's cache (``rm -rf models/<tgt>``) wipes its alignments too.
-    """
+def _alignment_anchor_paths(
+    src_model_id: str, tgt_model_id: str,
+) -> tuple[Path, Path]:
+    """Stable legacy/lock anchor and atomic v4 pointer sidecar."""
     md = model_dir(tgt_model_id)
     al_dir = md / "alignments"
     src_safe = safe_model_id(src_model_id)
     return (al_dir / f"{src_safe}.safetensors", al_dir / f"{src_safe}.json")
+
+
+def alignment_cache_path(src_model_id: str, tgt_model_id: str) -> tuple[Path, Path]:
+    """Representative shard and stable pointer path for an alignment cache."""
+    anchor, sidecar_path = _alignment_anchor_paths(src_model_id, tgt_model_id)
+    try:
+        with open(sidecar_path) as handle:
+            sidecar = json.load(handle)
+        files = sidecar.get("tensor_files")
+        layers = sidecar.get("shared_layers")
+        if isinstance(files, Mapping) and isinstance(layers, list) and layers:
+            filename = files.get(str(min(int(layer) for layer in layers)))
+            if isinstance(filename, str) and Path(filename).name == filename:
+                return anchor.parent / filename, sidecar_path
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        pass
+    return anchor, sidecar_path
+
+
+def _alignment_generation_path(anchor: Path, layer: int) -> Path:
+    return anchor.with_name(
+        f"{anchor.stem}.layer-{int(layer)}.gen-{uuid.uuid4().hex}{anchor.suffix}",
+    )
+
+
+def _alignment_shard_paths(
+    anchor: Path, sidecar: Mapping[str, Any], layers: list[int],
+) -> dict[int, Path]:
+    files = sidecar.get("tensor_files")
+    if not isinstance(files, Mapping):
+        raise ValueError("alignment cache has no tensor shard map")
+    if {str(layer) for layer in layers} != {str(key) for key in files}:
+        raise ValueError("alignment tensor shard keys do not match shared layers")
+    out: dict[int, Path] = {}
+    for layer in layers:
+        filename = files.get(str(layer))
+        if (
+            not isinstance(filename, str)
+            or not filename
+            or Path(filename).name != filename
+        ):
+            raise ValueError(f"invalid alignment shard for layer {layer}")
+        out[layer] = anchor.parent / filename
+    return out
+
+
+def _cleanup_alignment_generations(anchor: Path, sidecar: Mapping[str, Any]) -> None:
+    files = sidecar.get("tensor_files")
+    keep = (
+        {str(filename) for filename in files.values() if isinstance(filename, str)}
+        if isinstance(files, Mapping) else set()
+    )
+    for path in (
+        *anchor.parent.glob(f"{anchor.stem}.layer-*.gen-*.safetensors"),
+        *anchor.parent.glob(f"{anchor.stem}.layer-*.gen-*.safetensors.tmp"),
+        anchor,
+        anchor.with_suffix(anchor.suffix + ".tmp"),
+    ):
+        if path.name not in keep:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as exc:
+                log.warning("could not remove old alignment generation %s: %s", path, exc)
 
 
 @contextmanager
@@ -691,7 +757,7 @@ def alignment_fit_lock(src_model_id: str, tgt_model_id: str) -> Iterator[None]:
     """Single-flight a complete directional alignment fit, including loads."""
     from saklas.io.atomic import artifact_lock
 
-    ts_path, _ = alignment_cache_path(src_model_id, tgt_model_id)
+    ts_path, _ = _alignment_anchor_paths(src_model_id, tgt_model_id)
     with artifact_lock(ts_path.with_name(f"{ts_path.stem}.fit")):
         yield
 
@@ -707,28 +773,41 @@ def save_alignment_map(
 ) -> Path:
     """Persist a fitted alignment map.
 
-    Returns the path to the written safetensors file.  Sidecar JSON
-    carries provenance: source/target model ids, per-layer quality
-    estimates if available, and a fit method tag.
+    Writes one bounded safetensors shard per layer, then atomically switches the
+    JSON pointer.  Payload digests are computed from the exact bytes being
+    written, so publication never rereads a complete shard.
     """
-    ts_path, sc_path = alignment_cache_path(src_model_id, tgt_model_id)
-    ts_path.parent.mkdir(parents=True, exist_ok=True)
+    anchor, sc_path = _alignment_anchor_paths(src_model_id, tgt_model_id)
+    anchor.parent.mkdir(parents=True, exist_ok=True)
 
     normalized = {int(idx): _as_layer_alignment(value) for idx, value in M.items()}
-    tensors: dict[str, torch.Tensor] = {}
-    for idx, alignment in normalized.items():
-        tensors[f"layer_{idx}.left"] = alignment.left.contiguous().cpu()
-        tensors[f"layer_{idx}.right"] = alignment.right.contiguous().cpu()
-        tensors[f"layer_{idx}.offset"] = alignment.offset.contiguous().cpu()
+    if not normalized:
+        raise ValueError("cannot save an empty alignment map")
     from saklas.io.atomic import artifact_lock
 
-    with artifact_lock(ts_path):
-        tmp_path = ts_path.with_suffix(ts_path.suffix + ".tmp")
-        save_file(tensors, str(tmp_path))
-        os.replace(tmp_path, ts_path)
+    with artifact_lock(anchor):
+        tensor_files: dict[str, str] = {}
+        tensor_sha256: dict[str, str] = {}
+        created: list[Path] = []
+        try:
+            for idx, alignment in sorted(normalized.items()):
+                path = _alignment_generation_path(anchor, idx)
+                payload = save_safetensors({
+                    "left": alignment.left.contiguous().cpu(),
+                    "right": alignment.right.contiguous().cpu(),
+                    "offset": alignment.offset.contiguous().cpu(),
+                })
+                write_bytes_atomic(path, payload)
+                created.append(path)
+                tensor_files[str(idx)] = path.name
+                tensor_sha256[str(idx)] = hashlib.sha256(payload).hexdigest()
+        except BaseException:
+            for path in created:
+                path.unlink(missing_ok=True)
+            raise
         sidecar: dict[str, Any] = {
             "format_version": _ALIGNMENT_CACHE_FORMAT_VERSION,
-            "method": "factorized_affine_alignment",
+            "method": "sharded_factorized_affine_alignment",
             "source_model_id": src_model_id,
             "target_model_id": tgt_model_id,
             "shared_layers": sorted(normalized),
@@ -742,15 +821,27 @@ def save_alignment_map(
             },
             "source_neutral_identity": source_identity,
             "target_neutral_identity": target_identity,
-            "tensor_sha256": hash_file(ts_path),
+            "tensor_files": tensor_files,
+            "tensor_sha256": tensor_sha256,
         }
         if quality_per_layer:
             sidecar["quality_per_layer"] = {
                 str(layer): round(float(q), 6)
                 for layer, q in quality_per_layer.items()
             }
-        write_json_atomic(sc_path, sidecar)
-    return ts_path
+        try:
+            write_json_atomic(sc_path, sidecar)
+        except BaseException:
+            for path in created:
+                path.unlink(missing_ok=True)
+            raise
+        # The pointer is now authoritative. If directory fsync itself fails,
+        # preserve the generations it names; deleting them here would turn a
+        # successfully replaced pointer into an immediately broken cache.
+        fsync_directory(sc_path.parent)
+        _cleanup_alignment_generations(anchor, sidecar)
+        fsync_directory(sc_path.parent)
+    return anchor.parent / tensor_files[str(min(normalized))]
 
 
 def load_alignment_map(
@@ -758,15 +849,19 @@ def load_alignment_map(
     *,
     source_identity: dict[str, Any],
     target_identity: dict[str, Any],
+    requested_layers: Iterable[int] | None = None,
 ) -> tuple[dict[int, LayerAlignment], dict[str, Any]] | None:
-    """Load a cached alignment map.  Returns ``None`` when not on disk."""
-    import json
+    """Load all or selected factor shards after identity/header preflight.
 
-    ts_path, sc_path = alignment_cache_path(src_model_id, tgt_model_id)
+    ``requested_layers`` materializes only the requested intersection with the
+    cache's shared layers.  The returned sidecar remains the complete pointer.
+    """
+
+    anchor, sc_path = _alignment_anchor_paths(src_model_id, tgt_model_id)
     from saklas.io.atomic import artifact_lock
 
-    with artifact_lock(ts_path):
-        if not ts_path.exists() or not sc_path.exists():
+    with artifact_lock(anchor):
+        if not sc_path.exists():
             return None
         try:
             with open(sc_path) as f:
@@ -775,42 +870,61 @@ def load_alignment_map(
             # hashing or materializing a potentially multi-GiB payload.
             if (
                 sidecar.get("format_version") != _ALIGNMENT_CACHE_FORMAT_VERSION
-                or sidecar.get("method") != "factorized_affine_alignment"
+                or sidecar.get("method") != "sharded_factorized_affine_alignment"
                 or sidecar.get("source_model_id") != src_model_id
                 or sidecar.get("target_model_id") != tgt_model_id
                 or sidecar.get("source_neutral_identity") != source_identity
                 or sidecar.get("target_neutral_identity") != target_identity
             ):
                 return None
-            expected_digest = sidecar.get("tensor_sha256")
-            if not isinstance(expected_digest, str) or hash_file(ts_path) != expected_digest:
-                return None
             expected_layers = sidecar.get("shared_layers")
             schema = sidecar.get("tensor_schema") or {}
             if not isinstance(expected_layers, list) or not expected_layers:
                 return None
-            expected_keys = {
-                f"layer_{int(layer)}.{part}"
-                for layer in expected_layers for part in ("left", "right", "offset")
-            }
-            with safe_open(str(ts_path), framework="pt", device="cpu") as payload:
-                if set(payload.keys()) != expected_keys:
+            all_layers = sorted(int(layer) for layer in expected_layers)
+            paths = _alignment_shard_paths(anchor, sidecar, all_layers)
+            digests = sidecar.get("tensor_sha256")
+            if not isinstance(digests, Mapping):
+                return None
+            # Validate every declared shard header before any tensor payload is
+            # materialized. Payload digests are checked only for selected layers
+            # so a narrow request never reads unrelated full shards.
+            for layer in all_layers:
+                spec = schema.get(str(layer), {})
+                digest = digests.get(str(layer))
+                if (
+                    not isinstance(spec, dict)
+                    or not isinstance(digest, str)
+                    or len(digest) != 64
+                    or not paths[layer].exists()
+                ):
                     return None
-                for layer in expected_layers:
-                    spec = schema.get(str(layer), {})
-                    if not isinstance(spec, dict):
+                with safe_open(
+                    str(paths[layer]), framework="pt", device="cpu",
+                ) as shard:
+                    if set(shard.keys()) != {"left", "right", "offset"}:
                         return None
                     for part in ("left", "right", "offset"):
-                        view = payload.get_slice(f"layer_{int(layer)}.{part}")
-                        if list(view.get_shape()) != spec.get(part) or view.get_dtype() != "F32":
+                        view = shard.get_slice(part)
+                        if (
+                            list(view.get_shape()) != spec.get(part)
+                            or view.get_dtype() != "F32"
+                        ):
                             return None
-            tensors = load_file(str(ts_path))
+            selected = (
+                all_layers if requested_layers is None else sorted(
+                    set(all_layers) & {int(layer) for layer in requested_layers}
+                )
+            )
             M: dict[int, LayerAlignment] = {}
-            for raw_layer in expected_layers:
-                layer = int(raw_layer)
-                left = tensors[f"layer_{layer}.left"]
-                right = tensors[f"layer_{layer}.right"]
-                offset = tensors[f"layer_{layer}.offset"]
+            for layer in selected:
+                payload = paths[layer].read_bytes()
+                if hashlib.sha256(payload).hexdigest() != digests[str(layer)]:
+                    return None
+                tensors = load_safetensors(payload)
+                left = tensors["left"]
+                right = tensors["right"]
+                offset = tensors["offset"]
                 if (
                     left.ndim != 2 or right.ndim != 2 or offset.ndim != 1
                     or left.shape[1] != right.shape[0]
@@ -819,6 +933,7 @@ def load_alignment_map(
                 ):
                     return None
                 M[layer] = LayerAlignment(left, right, offset)
+            _cleanup_alignment_generations(anchor, sidecar)
             return M, sidecar
         except Exception as e:
             log.warning(

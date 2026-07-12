@@ -79,6 +79,7 @@ from saklas.io.manifold_authoring import (
 
 # -- lifecycle / transfer / summary -------------------------------------
 from saklas.io.manifold_lifecycle import (
+    TransferSourceProof,
     clear_manifold_tensors,
     manifold_summary,
     preflight_transfer_manifold,
@@ -422,6 +423,7 @@ __all__ = [
     "clear_manifold_tensors",
     "remove_manifold_folder",
     "refresh_manifold",
+    "TransferSourceProof",
     "preflight_transfer_manifold",
     "transfer_manifold",
     "manifold_summary",

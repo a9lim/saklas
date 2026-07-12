@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import shutil
 from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
@@ -30,6 +31,7 @@ from saklas.io.manifold_folder import (
     domain_label,
     manifold_pair_lock,
     min_nodes,
+    validate_manifold_format_version,
 )
 from saklas.io.paths import manifold_dir
 
@@ -449,6 +451,16 @@ def _refresh_manifold_locked(
 # the transferred tensor.  Do not rebuild the Procrustes solver here.
 
 
+@dataclass(frozen=True)
+class TransferSourceProof:
+    """Immutable source-pair generation selected before alignment work."""
+
+    tensor_name: str
+    tensor_sha256: str
+    sidecar_sha256: str
+    layers: tuple[int, ...]
+
+
 def _transfer_preflight_locked(
     folder: Path, *, from_model: str, to_model: str, force: bool,
 ) -> tuple[Path, Path, dict[str, Any], dict[str, str], bool]:
@@ -459,18 +471,42 @@ def _transfer_preflight_locked(
     folder = Path(folder)
     source = folder / tensor_filename(from_model)
     target = folder / tensor_filename(to_model, transferred_from=from_model)
-    with open(folder / "manifold.json") as handle:
-        manifest = json.load(handle)
+    manifest_path = folder / "manifold.json"
+    try:
+        with open(manifest_path) as handle:
+            manifest = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ManifoldFormatError(
+            f"manifold manifest is unreadable at {manifest_path}: {exc}"
+        ) from exc
+    if not isinstance(manifest, dict):
+        raise ManifoldFormatError(
+            f"manifold manifest at {manifest_path} must be a JSON object"
+        )
+    validate_manifold_format_version(
+        manifest.get("format_version"), location=str(manifest_path),
+    )
     files = manifest.get("files", {})
     if not isinstance(files, dict):
         raise ManifoldFormatError("manifold files manifest must be an object")
 
     def trusted_pair(tensor: Path) -> bool:
         sidecar = tensor.with_suffix(".json")
-        expected = (
-            {tensor.name: files[tensor.name], sidecar.name: files[sidecar.name]}
-            if tensor.name in files and sidecar.name in files else {}
-        )
+        if tensor.name not in files or sidecar.name not in files:
+            return False
+        expected = {
+            tensor.name: files[tensor.name], sidecar.name: files[sidecar.name],
+        }
+        for name, digest in expected.items():
+            if (
+                not isinstance(digest, str)
+                or len(digest) != 64
+                or any(char not in "0123456789abcdef" for char in digest)
+            ):
+                raise ManifoldFormatError(
+                    f"manifold manifest has invalid sha256 for selected file "
+                    f"{name!r}"
+                )
         return bool(expected) and verify_integrity(folder, expected)[0]
 
     if not trusted_pair(source):
@@ -488,8 +524,9 @@ def _transfer_preflight_locked(
 
 def preflight_transfer_manifold(
     folder: Path, *, from_model: str, to_model: str, force: bool = False,
-) -> None:
-    """Cheap proof-aware transfer preflight before alignment/model work."""
+) -> TransferSourceProof:
+    """Prove transfer viability and return the locked source-fit layer header."""
+    from safetensors import SafetensorError, safe_open
     from saklas.io.manifold_folder import _locked_manifest
     from saklas.io.paths import tensor_filename
 
@@ -498,8 +535,35 @@ def preflight_transfer_manifold(
     target = folder / tensor_filename(to_model, transferred_from=from_model)
     with _locked_manifest(folder):
         with _locked_manifold_pairs([source, target]):
-            _transfer_preflight_locked(
-                folder, from_model=from_model, to_model=to_model, force=force,
+            source, _target, _manifest, _files, _trusted = (
+                _transfer_preflight_locked(
+                    folder, from_model=from_model, to_model=to_model,
+                    force=force,
+                )
+            )
+            try:
+                with safe_open(
+                    str(source), framework="pt", device="cpu",
+                ) as tensors:
+                    layers = sorted({
+                        int(key.split(".", 1)[0].split("_", 1)[1])
+                        for key in tensors.keys()
+                        if key.startswith("layer_") and key.endswith(".mean")
+                    })
+            except (OSError, ValueError, SafetensorError) as exc:
+                raise ManifoldFormatError(
+                    f"source fit {source} has an unreadable tensor header: {exc}"
+                ) from exc
+            if not layers:
+                raise ManifoldFormatError(
+                    f"source fit {source} carries no fitted layer means"
+                )
+            sidecar = source.with_suffix(".json")
+            return TransferSourceProof(
+                tensor_name=source.name,
+                tensor_sha256=_files[source.name],
+                sidecar_sha256=_files[sidecar.name],
+                layers=tuple(layers),
             )
 
 
@@ -514,6 +578,7 @@ def transfer_manifold(
     target_model_fingerprint: str,
     whitener: "Any | None" = None,
     force: bool = False,
+    expected_source_proof: TransferSourceProof | None = None,
 ) -> Path:
     """Publish one transferred tensor/sidecar/manifest update atomically."""
     from saklas.io.manifold_folder import _locked_manifest
@@ -532,6 +597,7 @@ def transfer_manifold(
                 source_model_fingerprint=source_model_fingerprint,
                 target_model_fingerprint=target_model_fingerprint,
                 whitener=whitener, force=force,
+                expected_source_proof=expected_source_proof,
             )
 
 
@@ -546,6 +612,7 @@ def _transfer_manifold_locked(
     target_model_fingerprint: str,
     whitener: "Any | None" = None,
     force: bool = False,
+    expected_source_proof: TransferSourceProof | None = None,
 ) -> Path:
     """Apply a per-layer alignment map to a fitted manifold, target-side.
 
@@ -609,6 +676,23 @@ def _transfer_manifold_locked(
     ) = _transfer_preflight_locked(
         folder, from_model=from_model, to_model=to_model, force=force,
     )
+    if expected_source_proof is not None:
+        sidecar_path = src_tensor.with_suffix(".json")
+        current_pair = (
+            src_tensor.name,
+            files.get(src_tensor.name),
+            files.get(sidecar_path.name),
+        )
+        expected_pair = (
+            expected_source_proof.tensor_name,
+            expected_source_proof.tensor_sha256,
+            expected_source_proof.sidecar_sha256,
+        )
+        if current_pair != expected_pair:
+            raise ManifoldFormatError(
+                "source manifold fit changed while alignment was prepared; "
+                "retry the transfer against the current source generation"
+            )
     if not alignment:
         raise ManifoldFormatError(
             f"transfer_manifold: alignment map for {from_model!r} → "

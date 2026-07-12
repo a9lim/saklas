@@ -183,7 +183,11 @@ own stem. Ordinary
 discovery/summary routing (`iter_manifold_folders`, `manifold_summary`, HTTP
 lookup), authoring edits/merges, and source-tier lifecycle reads load metadata
 with `verify_manifest=False`; install/push/fitted-tensor use stays strict, and
-pair publication hashes only the newly written files. `bundled_manifold_names`,
+pair publication hashes only the newly written files, validates that the live
+manifest version is readable, and atomically stamps the current writer version
+with those proofs. GGUF export likewise keeps its folder-shape preflight
+metadata-only, then strictly verifies the selected fitted pair when loading it.
+`bundled_manifold_names`,
 `materialize_bundled_manifolds`
 (copy-on-miss into `default/` for complete package-data folders only, plus a
 re-copy when the bundled manifest hash drifts or the on-disk `format_version`
@@ -415,7 +419,15 @@ magnitude to its *target* Mahalanobis norm. The target whitener is **required** 
 must cover the transferred layers (`WhitenerError` otherwise; Mahalanobis-only — no
 Euclidean transfer). The fitted map binds both validated neutral-cache identities,
 both model fingerprints, and its own payload digest under the *target* model dir
-(`models/<safe_tgt>/alignments/<safe_src>.…`). `transfer_manifold`
+(`models/<safe_tgt>/alignments/<safe_src>.json`, cache v4): one immutable
+factor shard per layer, atomically pointer-switched. Identity + all headers are
+preflighted before payload materialization; a requested layer subset reads and
+digest-validates only those shards, with digest computed from the same bytes fed
+to safetensors decode. Transfer preflight binds that selective layer roster to
+the source tensor + sidecar manifest digests; the final pair-locked publication
+revalidates the proof and rejects a concurrent source refit before source load or
+target write. Legacy v3 monoliths miss and are removed on replacement.
+`transfer_manifold`
 (`manifolds.py`) is the manifold counterpart.
 
 ## lens.py

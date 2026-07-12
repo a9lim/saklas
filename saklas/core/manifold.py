@@ -4577,10 +4577,12 @@ def compute_manifold_node_stats(
             torch.mps.empty_cache()
 
     divisors = torch.tensor(node_sizes, dtype=torch.float32).reshape(-1, 1)
-    centroids = {
-        idx: (sums[idx] / divisors).contiguous() for idx in capture_layers
-    }
-    return centroids, retained
+    # The accumulators already have the final layer-major K×D shape and sole
+    # ownership here. Normalize them in place instead of allocating a second
+    # complete fp32 centroid roster at the capture/fitting boundary.
+    for idx in capture_layers:
+        sums[idx].div_(divisors)
+    return sums, retained
 
 
 def compute_node_reduced_covariance_from_rows(
@@ -4788,20 +4790,26 @@ def _off_surface_var(
 
     ``cov`` is the node's reduced ``(R, R)`` within-node covariance, ``tangent``
     its ``(R, n)`` surface tangent.  Projects ``cov`` onto the normal complement
-    ``P = I − t(tᵀt)⁺tᵀ`` and returns ``tr(P cov)/(R − n)`` — the part of the
+    ``P = I − tt⁺`` and returns ``tr(P cov)/(R − rank(t))`` — the part of the
     node's scatter that lives *off* the mean surface, which is what the tube
     thickness should be (tangential scatter is the node sliding *along* the
     surface, expected and not thickness).  Degenerates to the full isotropic
-    ``tr(cov)/R`` when the surface fills its subspace (``R ≤ n``, no normal
-    complement).  Clamped non-negative (sample-covariance round-off).
+    ``tr(cov)/R`` only when the actual tangent range fills the reduced subspace.
+    Clamped non-negative (sample-covariance round-off).
     """
-    if R <= n:
-        return float(torch.diagonal(cov).sum() / max(R, 1))
-    tt = tangent.T @ tangent                                   # (n, n)
-    proj = tangent @ torch.linalg.pinv(tt) @ tangent.T          # (R, R) onto tangent
-    normal = torch.eye(R, dtype=cov.dtype) - proj               # onto normal complement
-    var = torch.trace(normal @ cov) / float(R - n)
-    return float(var.clamp(min=0.0))
+    if cov.shape != (R, R):
+        raise ValueError(
+            f"covariance must have shape ({R}, {R}), got {tuple(cov.shape)}"
+        )
+    if tangent.shape != (R, n):
+        raise ValueError(
+            f"tangent must have shape ({R}, {n}), got {tuple(tangent.shape)}"
+        )
+    return float(
+        _off_surface_vars(
+            cov.reshape(1, R, R), tangent.reshape(1, R, n), R, n,
+        )[0]
+    )
 
 
 def _off_surface_vars(
@@ -4810,16 +4818,39 @@ def _off_surface_vars(
     """Batched counterpart to :func:`_off_surface_var`.
 
     ``covs`` is ``(K, R, R)`` and ``tangents`` is ``(K, R, n)``.  Returns one
-    non-negative off-surface variance per node, keeping the small pseudoinverse
-    solve batched on CPU during σ-field fitting.
+    non-negative off-surface variance per node, keeping the economy SVD batched
+    on CPU during σ-field fitting.
     """
-    if R <= n:
-        return torch.diagonal(covs, dim1=-2, dim2=-1).sum(dim=-1) / max(R, 1)
-    tt = tangents.transpose(-1, -2) @ tangents                  # (K, n, n)
-    proj = tangents @ torch.linalg.pinv(tt) @ tangents.transpose(-1, -2)
+    if covs.ndim != 3 or covs.shape[-2:] != (R, R):
+        raise ValueError(
+            f"covariances must have shape (K, {R}, {R}), got {tuple(covs.shape)}"
+        )
+    if tangents.shape != (covs.shape[0], R, n):
+        raise ValueError(
+            f"tangents must have shape ({covs.shape[0]}, {R}, {n}), "
+            f"got {tuple(tangents.shape)}"
+        )
+    # One economy SVD supplies both the numerical rank and the projector onto
+    # the *actual* local tangent range.  An RBF surface may have a fold/pinch
+    # where rank(T) < n; using nominal ``R-n`` there overstates tube variance.
+    # Match ``torch.linalg.matrix_rank``'s default relative tolerance so this
+    # fused path preserves the old rank boundary without a second decomposition.
+    U, singular_values, _ = torch.linalg.svd(tangents, full_matrices=False)
+    relative_tol = (
+        singular_values[..., :1]
+        * (max(R, n) * torch.finfo(singular_values.dtype).eps)
+    )
+    active = singular_values > relative_tol
+    tangent_rank = active.sum(dim=-1)
+    tangent_frame = U * active.unsqueeze(-2)
+    proj = tangent_frame @ U.transpose(-1, -2)
     normal = torch.eye(R, dtype=covs.dtype, device=covs.device) - proj
-    var = torch.einsum("kij,kji->k", normal, covs) / float(R - n)
-    return var.clamp(min=0.0)
+    normal_dof = R - tangent_rank
+    normal_var = torch.einsum("kij,kji->k", normal, covs) / normal_dof.clamp_min(1)
+    # A full-row-rank tangent fills the fitted subspace: there is no normal
+    # direction to average. Preserve the established isotropic fallback.
+    isotropic = torch.diagonal(covs, dim1=-2, dim2=-1).sum(dim=-1) / max(R, 1)
+    return torch.where(normal_dof > 0, normal_var, isotropic).clamp(min=0.0)
 
 
 def fit_sigma_field(
@@ -5135,11 +5166,12 @@ def _load_manifold_locked(
     path: str | Path, *, verify_manifest: bool = True,
 ) -> Manifold:
     """Read one fitted manifold while its tensor/sidecar pair lock is held."""
+    from saklas.io.manifold_folder import ManifoldFormatError
+
     path = Path(path)
     manifest_path = path.parent / "manifold.json"
     verified_tensor_sha256: str | None = None
     if verify_manifest and manifest_path.exists():
-        from saklas.io.manifold_folder import ManifoldFormatError
         from saklas.io.packs import verify_integrity
 
         try:
@@ -5149,6 +5181,10 @@ def _load_manifold_locked(
             raise ManifoldFormatError(
                 f"manifold manifest is unreadable at {manifest_path}: {exc}"
             ) from exc
+        if not isinstance(manifest, dict):
+            raise ManifoldFormatError(
+                f"manifold manifest at {manifest_path} must be a JSON object"
+            )
         from saklas.io.manifold_folder import validate_manifold_format_version
 
         validate_manifold_format_version(
@@ -5169,6 +5205,16 @@ def _load_manifold_locked(
                 f"manifold integrity manifest has no proof for {missing}"
             )
         expected = {name: files[name] for name in pair_names}
+        for name, digest in expected.items():
+            if (
+                not isinstance(digest, str)
+                or len(digest) != 64
+                or any(char not in "0123456789abcdef" for char in digest)
+            ):
+                raise ManifoldFormatError(
+                    f"manifold integrity manifest has invalid sha256 for "
+                    f"selected file {name!r}"
+                )
         ok, bad = verify_integrity(path.parent, expected)
         if not ok:
             raise ManifoldFormatError(
@@ -5176,8 +5222,18 @@ def _load_manifold_locked(
             )
         verified_tensor_sha256 = str(expected[path.name])
     tensors = load_file(str(path))
-    with open(path.with_suffix(".json")) as f:
-        sidecar = json.load(f)
+    sidecar_path = path.with_suffix(".json")
+    try:
+        with open(sidecar_path) as f:
+            sidecar = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ManifoldFormatError(
+            f"manifold sidecar is unreadable at {sidecar_path}: {exc}"
+        ) from exc
+    if not isinstance(sidecar, dict):
+        raise ManifoldFormatError(
+            f"manifold sidecar at {sidecar_path} must be a JSON object"
+        )
     if verified_tensor_sha256 is not None:
         sidecar["_tensor_sha256"] = verified_tensor_sha256
     if (
@@ -5185,7 +5241,7 @@ def _load_manifold_locked(
         and manifest_path.exists()
         and sidecar.get("fit_mode", "authored") != "baked"
     ):
-        from saklas.io.manifold_folder import ManifoldFolder, ManifoldFormatError
+        from saklas.io.manifold_folder import ManifoldFolder
 
         # ``load_manifold`` holds the folder lock outside the pair lock.
         current_nodes = ManifoldFolder.load(

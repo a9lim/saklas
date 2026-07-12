@@ -2093,6 +2093,7 @@ class SaklasSession:
         )
         from saklas.io.lens import load_lens, load_lens_sidecar, save_lens
         from saklas.io.lens import (
+            _load_lens_verified,
             load_lens_checkpoint,
             load_lens_checkpoint_sidecar,
             promote_lens_checkpoint,
@@ -2167,9 +2168,20 @@ class SaklasSession:
             corpus_sha = hashlib.sha256(
                 repr(consumed_ids).encode("utf-8")
             ).hexdigest()
+            all_consumed_ids = list(consumed_ids)
 
             def _token_rows_sha(rows: "Sequence[Sequence[int]]") -> str:
                 return hashlib.sha256(repr(list(rows)).encode("utf-8")).hexdigest()
+
+            def _checkpoint_progress(sidecar: "Mapping[str, Any] | None") -> int:
+                if sidecar is None:
+                    return -1
+                try:
+                    return int(sidecar.get("base_n_prompts", 0)) + int(
+                        sidecar.get("n_prompts", -1)
+                    )
+                except (TypeError, ValueError):
+                    return -1
 
             corpus_hash_kind = "token_ids_v1"
             base: Any = None
@@ -2180,13 +2192,25 @@ class SaklasSession:
             resident_evicted_early = False
             pre_evicted_live: dict[str, Any] | None = None
             durable_fallback_after_checkpoint = False
+            existing_reuse_proof: Any = None
             if not force:
                 checkpoint_sidecar = load_lens_checkpoint_sidecar(self.model_id)
+                checkpoint_progress = _checkpoint_progress(checkpoint_sidecar)
+                checkpoint_prefix_matches = bool(
+                    checkpoint_sidecar is not None
+                    and 0 < checkpoint_progress <= len(all_consumed_ids)
+                    and checkpoint_sidecar.get("consumed_prefix_sha256")
+                    == _token_rows_sha(all_consumed_ids[:checkpoint_progress])
+                )
                 checkpoint_meta_matches = bool(
                     checkpoint_sidecar is not None
-                    and checkpoint_sidecar.get("corpus_sha256") == corpus_sha
+                    and (
+                        checkpoint_sidecar.get("corpus_sha256") == corpus_sha
+                        or checkpoint_prefix_matches
+                    )
                     and checkpoint_sidecar.get("corpus_hash_kind")
                     == corpus_hash_kind
+                    and checkpoint_progress > 0
                     and checkpoint_sidecar.get("seq_len") == seq_len
                     and checkpoint_sidecar.get("model_fingerprint")
                     == model_fingerprint
@@ -2256,7 +2280,13 @@ class SaklasSession:
                         ):
                             existing = (resident, sidecar)
                         else:
-                            existing = load_lens(self.model_id)
+                            verified_existing = _load_lens_verified(self.model_id)
+                            if verified_existing is None:
+                                existing = None
+                                existing_reuse_proof = None
+                            else:
+                                existing = verified_existing[:2]
+                                existing_reuse_proof = verified_existing[2]
                             existing_payload_verified = existing is not None
                     else:
                         existing = None
@@ -2297,15 +2327,31 @@ class SaklasSession:
                             )
                         missing_base = None
                         topup_sidecar = load_lens_checkpoint_sidecar(self.model_id)
+                        topup_progress = _checkpoint_progress(topup_sidecar)
+                        topup_corpus_matches = bool(
+                            topup_sidecar is not None
+                            and (
+                                topup_sidecar.get("corpus_sha256") == corpus_sha
+                                or (
+                                    0 < topup_progress <= len(all_consumed_ids)
+                                    and topup_sidecar.get(
+                                        "consumed_prefix_sha256"
+                                    ) == _token_rows_sha(
+                                        all_consumed_ids[:topup_progress]
+                                    )
+                                )
+                            )
+                        )
                         topup_meta_matches = bool(
                             topup_sidecar is not None
-                            and topup_sidecar.get("corpus_sha256") == corpus_sha
+                            and topup_corpus_matches
                             and topup_sidecar.get("corpus_hash_kind")
                             == corpus_hash_kind
+                            and topup_progress > 0
                             and topup_sidecar.get("seq_len") == seq_len
                             and topup_sidecar.get("model_fingerprint")
                             == model_fingerprint
-                            and int(topup_sidecar.get("base_n_prompts", -1)) == 0
+                            and topup_sidecar.get("base_n_prompts") == 0
                             and [int(l) for l in topup_sidecar.get("source_layers", [])]
                             == missing_sources
                         )
@@ -2351,6 +2397,9 @@ class SaklasSession:
                                 model_layer_count=len(fit_layers),
                                 model_fingerprint=model_fingerprint,
                                 model_source_fingerprint=model_source_fp,
+                                consumed_prefix_sha256=_token_rows_sha(
+                                    all_consumed_ids[:completed]
+                                ),
                             )
 
                         if topup_prompts:
@@ -2388,6 +2437,7 @@ class SaklasSession:
                             model_fingerprint=model_fingerprint,
                             model_source_fingerprint=model_source_fp,
                             reuse_layers=existing_set,
+                            _verified_reuse_proof=existing_reuse_proof,
                         )
                         remove_lens_checkpoint(self.model_id)
                         selected = merged.select_layers(expected_sources)
@@ -2517,13 +2567,15 @@ class SaklasSession:
                 return lens
 
             checkpoint_written = False
+            checkpoint_proof: Any = None
 
             def _save_checkpoint_accumulator(
                 sums: "Mapping[int, torch.Tensor]",
                 completed: int,
                 d_model: int,
             ) -> None:
-                nonlocal checkpoint_written
+                nonlocal checkpoint_written, checkpoint_proof
+                proof_out: list[Any] = []
                 save_lens_checkpoint_accumulator(
                     sums, completed, d_model, self.model_id,
                     # The prefix is already folded into ``sums`` by the
@@ -2541,8 +2593,13 @@ class SaklasSession:
                     model_layer_count=len(fit_layers),
                     model_fingerprint=model_fingerprint,
                     model_source_fingerprint=model_source_fp,
+                    consumed_prefix_sha256=_token_rows_sha(
+                        all_consumed_ids[:completed]
+                    ),
+                    _proof_out=proof_out,
                 )
                 checkpoint_written = True
+                checkpoint_proof = proof_out[0] if proof_out else None
 
             if base is not None and not usable:
                 try:
@@ -2607,6 +2664,7 @@ class SaklasSession:
                     seq_len=seq_len,
                     d_model=merged.d_model,
                     model_fingerprint=model_fingerprint,
+                    _verified_proof=checkpoint_proof,
                 ):
                     sidecar = load_lens_sidecar(self.model_id)
                 else:
@@ -5332,7 +5390,11 @@ class SaklasSession:
             if name in probes or key in probes:
                 continue
             try:
-                folder = ManifoldFolder.load(manifold_dir("default", name))
+                # Attach preflight needs fitted stems only.  The selected
+                # model pair is strictly verified by ensure_manifold_loaded.
+                folder = ManifoldFolder.load(
+                    manifold_dir("default", name), verify_manifest=False,
+                )
             except (ManifoldFormatError, FileNotFoundError):
                 continue
             if stem not in folder.tensor_models():

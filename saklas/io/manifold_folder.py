@@ -481,8 +481,17 @@ class ManifoldSidecar:
 
     @classmethod
     def load(cls, path: Path) -> "ManifoldSidecar":
-        with open(path) as f:
-            data = json.load(f)
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError) as exc:
+            raise ManifoldFormatError(
+                f"manifold sidecar {path} is unreadable: {exc}"
+            ) from exc
+        if not isinstance(data, dict):
+            raise ManifoldFormatError(
+                f"manifold sidecar {path} must be a JSON object"
+            )
         domain = data.get("domain")
         if not isinstance(domain, dict):
             raise ManifoldFormatError(
@@ -633,6 +642,10 @@ class ManifoldFolder:
             raise ManifoldFormatError(
                 f"manifold.json in {folder} is unreadable: {e}"
             ) from e
+        if not isinstance(data, dict):
+            raise ManifoldFormatError(
+                f"manifold.json in {folder} must be a JSON object"
+            )
 
         validate_manifold_format_version(
             data.get("format_version", 1),
@@ -1039,8 +1052,21 @@ class ManifoldFolder:
         explicit trusted mapping is not provided.
         """
         with _locked_manifest(self.folder):
-            with open(self.folder / "manifold.json") as handle:
-                latest_payload = json.load(handle)
+            manifest_path = self.folder / "manifold.json"
+            try:
+                with open(manifest_path) as handle:
+                    latest_payload = json.load(handle)
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ManifoldFormatError(
+                    f"cannot update unreadable manifest at {manifest_path}: {exc}"
+                ) from exc
+            if not isinstance(latest_payload, dict):
+                raise ManifoldFormatError(
+                    f"manifold manifest at {manifest_path} must be a JSON object"
+                )
+            validate_manifold_format_version(
+                latest_payload.get("format_version"), location=str(manifest_path),
+            )
             if files is None:
                 latest = latest_payload.get("files", {})
                 if not isinstance(latest, dict):
@@ -1141,12 +1167,26 @@ class ManifoldFolder:
                 raise ManifoldFormatError(
                     f"cannot update unreadable manifest at {manifest_path}: {exc}"
                 ) from exc
+            if not isinstance(payload, dict):
+                raise ManifoldFormatError(
+                    f"manifold manifest at {manifest_path} must be a JSON object"
+                )
+            # Reject an unknown schema before interpreting even familiar fields:
+            # a future writer may have changed their shape or semantics.
+            validate_manifold_format_version(
+                payload.get("format_version"), location=str(manifest_path),
+            )
             latest = payload.get("files", {})
             if not isinstance(latest, dict):
                 raise ManifoldFormatError("manifold files manifest is not an object")
+            # A newly published pair is always written by the current tensor
+            # writer.  Upgrade the enclosing manifest in the same locked CAS so
+            # a v6-only field (notably ``affine_map``) can never be trusted under
+            # a v5 manifest that an old reader would accept and misinterpret.
             files = dict(latest)
             for resolved in resolved_paths:
                 files[resolved.name] = hash_file(resolved)
+            payload["format_version"] = MANIFOLD_FORMAT_VERSION
             payload["files"] = files
             write_json_atomic(manifest_path, payload)
             self.files = files

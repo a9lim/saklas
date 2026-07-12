@@ -151,6 +151,40 @@ def test_missing_layer_topup_reuses_immutable_existing_shards() -> None:
     assert loaded is not None and loaded[0].source_layers == [0, 1, 2]
 
 
+def test_unverified_shard_reuse_falls_back_to_payload_hashes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import saklas.io.packs as packs
+
+    initial = _lens(n_layers=2)
+    _save(initial)
+    merged = JacobianLens(
+        {**initial.jacobians, 2: torch.eye(_D)},
+        n_prompts=initial.n_prompts,
+        d_model=_D,
+    )
+    real_hash = packs.hash_file
+    hashed: list[Path] = []
+
+    def _count_hash(path: Path) -> str:
+        hashed.append(path)
+        return real_hash(path)
+
+    monkeypatch.setattr(packs, "hash_file", _count_hash)
+    save_lens(
+        merged, _MODEL,
+        corpus_spec="test-corpus", corpus_sha256="abc123",
+        seq_len=128, dim_batch=8, skip_first=16,
+        reuse_layers={0, 1},
+    )
+
+    assert len(hashed) == 2
+    assert {path.name for path in hashed} == {
+        json.loads(lens_paths(_MODEL)[1].read_text())["tensor_files"][layer]
+        for layer in ("0", "1")
+    }
+
+
 def test_shard_reuse_is_refused_when_fit_identity_changes() -> None:
     lens = _lens(n_layers=2)
     _save(lens)

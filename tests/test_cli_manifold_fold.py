@@ -15,7 +15,7 @@ runner's ``LayerWhitener.from_cache`` build.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Generator
+from typing import Any, Generator, cast
 
 import pytest
 import torch
@@ -402,3 +402,95 @@ class TestGgufFold:
                 model_scope=_MODEL, output=str(tmp_path / "x.gguf"),
                 model_hint="llama",
             )
+
+    def test_export_preflight_skips_unrelated_variant_hashes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from saklas.io import gguf_io, packs
+        from saklas.io.cache_ops import export_gguf_manifold
+        from saklas.io.manifolds import ManifoldFolder
+
+        folder = _make_full_manifold("default", "happy.sad")
+        raw = folder / tensor_filename(_MODEL)
+        unrelated = folder / tensor_filename(_MODEL, release="unrelated")
+        unrelated.write_bytes(raw.read_bytes())
+        unrelated.with_suffix(".json").write_bytes(
+            raw.with_suffix(".json").read_bytes()
+        )
+        ManifoldFolder.load(folder, verify_manifest=False).update_file_hashes(
+            unrelated, unrelated.with_suffix(".json"),
+        )
+        packs._FINGERPRINT_CACHE.clear()
+        real_hash = packs.hash_file
+        hashed: list[str] = []
+
+        def track_hash(path: Path) -> str:
+            hashed.append(Path(path).name)
+            return real_hash(Path(path))
+
+        def fake_write(_profile: object, path: Path, **_kwargs: object) -> None:
+            Path(path).write_bytes(b"gguf")
+
+        monkeypatch.setattr(packs, "hash_file", track_hash)
+        monkeypatch.setattr(gguf_io, "write_gguf_profile", fake_write)
+        export_gguf_manifold(
+            "default", "happy.sad", model_scope=_MODEL,
+            output=str(tmp_path / "out.gguf"), model_hint="llama",
+        )
+
+        assert raw.name in hashed and raw.with_suffix(".json").name in hashed
+        assert unrelated.name not in hashed
+        assert unrelated.with_suffix(".json").name not in hashed
+
+
+def test_default_probe_preflight_skips_unrelated_variant_hashes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from saklas.core.manifold import load_manifold
+    from saklas.core.session import SaklasSession
+    from saklas.io import packs
+    from saklas.io.manifolds import ManifoldFolder
+    import saklas.io.manifolds as manifolds_module
+    import saklas.io.probes_bootstrap as probes_module
+
+    folder = _make_full_manifold("default", "probe")
+    raw = folder / tensor_filename(_MODEL)
+    unrelated = folder / tensor_filename(_MODEL, release="unrelated")
+    unrelated.write_bytes(raw.read_bytes())
+    unrelated.with_suffix(".json").write_bytes(raw.with_suffix(".json").read_bytes())
+    ManifoldFolder.load(folder, verify_manifest=False).update_file_hashes(
+        unrelated, unrelated.with_suffix(".json"),
+    )
+    packs._FINGERPRINT_CACHE.clear()
+    real_hash = packs.hash_file
+    hashed: list[str] = []
+
+    def track_hash(path: Path) -> str:
+        hashed.append(Path(path).name)
+        return real_hash(Path(path))
+
+    class StubSession:
+        model_id = _MODEL
+        _manifolds: dict[str, Manifold] = {}
+
+        def _get_steering_composer(self) -> object:
+            session = self
+
+            class Composer:
+                def ensure_manifold_loaded(self, key: str) -> None:
+                    session._manifolds[key] = load_manifold(raw)
+
+            return Composer()
+
+    monkeypatch.setattr(packs, "hash_file", track_hash)
+    monkeypatch.setattr(probes_module, "load_default_manifolds", lambda: {})
+    monkeypatch.setattr(manifolds_module, "bundled_manifold_names", lambda: ["probe"])
+    session = StubSession()
+    probes = SaklasSession._bootstrap_manifold_probes(
+        cast(Any, session), [], include_fitted_defaults=True,
+    )
+
+    assert "default/probe" in probes
+    assert raw.name in hashed and raw.with_suffix(".json").name in hashed
+    assert unrelated.name not in hashed
+    assert unrelated.with_suffix(".json").name not in hashed
