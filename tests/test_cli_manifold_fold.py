@@ -135,11 +135,18 @@ def _write_fitted_manifold(
         layers=layers,
         mahalanobis_share=share,
     )
+    from saklas.io.manifolds import create_discover_manifold_folder
+
     folder = manifold_dir(ns, name)
-    folder.mkdir(parents=True, exist_ok=True)
+    if not (folder / "manifold.json").exists():
+        folder = create_discover_manifold_folder(
+            ns, name, "", fit_mode="pca",
+            node_corpora={pos_label: ["positive"], neg_label: ["negative"]},
+        )
     path = folder / tensor_filename(_MODEL, release=None)
     metadata: dict[str, object] = {
-        "method": "folded_vector", "share_metric": "euclidean",
+        "method": "manifold_discover_pca", "fit_mode": "pca",
+        "share_metric": "euclidean",
         "model_fingerprint": "test-fingerprint",
     }
     manifest = folder / "manifold.json"
@@ -151,6 +158,12 @@ def _write_fitted_manifold(
         ).nodes_sha256()
         metadata["fit_policy_version"] = MANIFOLD_FIT_POLICY_VERSION
     save_manifold(mfld, path, metadata)
+    if manifest.exists():
+        from saklas.io.manifolds import ManifoldFolder
+
+        ManifoldFolder.load(folder, verify_manifest=False).update_file_hashes(
+            path, path.with_suffix(".json"),
+        )
     return path
 
 

@@ -4,16 +4,19 @@ from __future__ import annotations
 
 from typing import Any
 
+from saklas.core.results import TokenAlt
+from saklas.core.session import SaklasSession
+
 
 def build_token_event(
-    session: Any,
+    session: SaklasSession,
     node_holder: list[str | None],
     *,
     text: str,
     is_thinking: bool,
     tid: int | None,
     lp: float | None,
-    top_alts: list[Any] | None,
+    top_alts: list[TokenAlt] | None,
 ) -> dict[str, Any]:
     """Build one native WS ``token`` frame from the current engine state."""
     node_id = node_holder[0]

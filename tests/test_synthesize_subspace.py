@@ -19,6 +19,7 @@ import torch
 
 from saklas.core.manifold import (
     CustomDomain,
+    LayerSubspace,
     SynthesizedSubspace,
     _ortho_basis,
     decompose,
@@ -329,3 +330,55 @@ def test_synthesized_inject_identity_at_along_zero():
         along=0.0, onto=0.0,
     )
     assert torch.allclose(out, h, atol=1e-5)
+
+
+def _synth_from_subspace(sub: LayerSubspace) -> SynthesizedSubspace:
+    rank = sub.rank
+    return SynthesizedSubspace(
+        layers={0: sub}, target_coord={0: torch.zeros(rank)},
+        share={0: 1.0}, kappa={0: torch.zeros(rank)},
+    )
+
+
+def test_empty_synth_is_explicit_noop_shape() -> None:
+    synth = SynthesizedSubspace(layers={}, target_coord={}, share={}, kappa={})
+    assert synth.layers == {}
+
+
+def test_synth_rejects_mean_basis_width_mismatch() -> None:
+    sub = LayerSubspace.affine(torch.zeros(4), torch.eye(2, 5))
+    with pytest.raises(ValueError, match="mean width"):
+        _synth_from_subspace(sub)
+
+
+def test_synth_rejects_wrong_coordinate_normalization_shape() -> None:
+    from dataclasses import replace
+
+    sub = replace(
+        LayerSubspace.affine(torch.zeros(4), torch.eye(2, 4)),
+        coord_offset=torch.zeros(1),
+    )
+    with pytest.raises(ValueError, match="coord_offset/coord_scale"):
+        _synth_from_subspace(sub)
+
+
+def test_synth_rejects_artifact_only_fields() -> None:
+    from dataclasses import replace
+
+    sub = replace(
+        LayerSubspace.affine(torch.zeros(4), torch.eye(2, 4)),
+        affine_map=torch.eye(2),
+    )
+    with pytest.raises(ValueError, match="artifact surface fields"):
+        _synth_from_subspace(sub)
+
+
+def test_synth_rejects_nonorthonormal_basis() -> None:
+    sub = LayerSubspace.affine(
+        torch.zeros(4), torch.tensor([
+            [1.0, 0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+        ]),
+    )
+    with pytest.raises(ValueError, match="orthonormal"):
+        _synth_from_subspace(sub)

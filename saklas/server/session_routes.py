@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import is_dataclass, replace
-from typing import Any, cast
+from dataclasses import replace
 import logging
 
 from fastapi import FastAPI, HTTPException
@@ -59,25 +58,20 @@ def register_session_routes(app: FastAPI) -> None:
     @app.patch("/saklas/v1/sessions/{session_id}")
     def patch_session(session_id: str, req: PatchSessionRequest):
         resolve_session_id(session_id)
-        overrides: dict[str, Any] = {}
-        if req.temperature is not None:
-            overrides["temperature"] = req.temperature
-        if req.top_p is not None:
-            overrides["top_p"] = req.top_p
-        if req.top_k is not None:
-            overrides["top_k"] = req.top_k
-        if req.max_tokens is not None:
-            overrides["max_new_tokens"] = req.max_tokens
-        if req.system_prompt is not None:
-            overrides["system_prompt"] = req.system_prompt
-        if req.thinking is not None:
-            overrides["thinking"] = req.thinking
-        if overrides:
-            if is_dataclass(session.config):
-                session.config = replace(cast(Any, session.config), **overrides)
-            else:
-                for key, value in overrides.items():
-                    setattr(session.config, key, value)
+        config = session.config
+        session.config = replace(
+            config,
+            temperature=req.temperature if req.temperature is not None else config.temperature,
+            top_p=req.top_p if req.top_p is not None else config.top_p,
+            top_k=req.top_k if req.top_k is not None else config.top_k,
+            max_new_tokens=(
+                req.max_tokens if req.max_tokens is not None else config.max_new_tokens
+            ),
+            system_prompt=(
+                req.system_prompt if req.system_prompt is not None else config.system_prompt
+            ),
+            thinking=req.thinking if req.thinking is not None else config.thinking,
+        )
         return session_info(
             session, app.state.default_steering, app.state.created_ts,
         )

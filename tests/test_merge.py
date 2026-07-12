@@ -151,12 +151,12 @@ def _make_concept_with_tensors(
         )
         if folder is None:
             folder, _mf = create_baked_manifold_folder(
-                ns, name, "x", manifold, model_id, method="test",
+                ns, name, "x", manifold, model_id, method="folded_vector",
                 model_fingerprint=f"fp:{model_id}",
             )
         else:
             save_baked_manifold_tensor(
-                folder, manifold, model_id, method="test",
+                folder, manifold, model_id, method="folded_vector",
                 model_fingerprint=f"fp:{model_id}",
             )
     assert folder is not None

@@ -283,6 +283,20 @@ MANIFOLD_SIDECAR_FIELDS = {
     "source_model_fingerprint", "transfer_quality_estimate",
 }
 
+MANIFOLD_METHOD_FIT_MODES: dict[str, frozenset[str]] = {
+    "manifold_pca": frozenset({"authored"}),
+    "manifold_sae": frozenset({"authored"}),
+    "manifold_monopolar": frozenset({"authored"}),
+    "manifold_monopolar_sae": frozenset({"authored"}),
+    "manifold_discover_auto": frozenset({"auto"}),
+    "manifold_discover_pca": frozenset({"pca"}),
+    "manifold_discover_spectral": frozenset({"spectral"}),
+    "manifold_discover_sae": frozenset({"pca", "spectral", "auto"}),
+    "manifold_procrustes_transfer": frozenset(_FIT_MODES_ALL),
+    "merge": frozenset({"baked"}),
+    "folded_vector": frozenset({"baked"}),
+}
+
 
 def _finite_number(value: Any) -> bool:
     return (
@@ -400,7 +414,7 @@ def _validate_components(value: Any, *, location: str) -> None:
             or not isinstance(item, dict) or set(item) != fields
             or not isinstance(item["selector"], str) or not item["selector"]
             or not _finite_number(item["alpha"])
-            or item["tensor_sha256"] is not None and (
+            or (
                 not isinstance(item["tensor_sha256"], str)
                 or len(item["tensor_sha256"]) != 64
                 or any(c not in "0123456789abcdef" for c in item["tensor_sha256"])
@@ -424,6 +438,11 @@ def validate_manifold_sidecar_payload(
             raise ManifoldFormatError(f"{location} field {key!r} must be non-empty str")
     if data["fit_mode"] not in _FIT_MODES_ALL:
         raise ManifoldFormatError(f"{location} has invalid fit_mode")
+    allowed_fit_modes = MANIFOLD_METHOD_FIT_MODES.get(data["method"])
+    if allowed_fit_modes is None or data["fit_mode"] not in allowed_fit_modes:
+        raise ManifoldFormatError(
+            f"{location} has invalid method/fit_mode combination"
+        )
     labels = data["node_labels"]
     if (
         isinstance(data["node_count"], bool)

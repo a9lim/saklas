@@ -24,7 +24,12 @@ from typing import Any, Callable, TYPE_CHECKING
 from saklas.io.selectors import AmbiguousSelectorError, canonicalize_atom
 from saklas.core.errors import SaklasError
 from saklas.core.profile import ProfileError
-from saklas.tui.chat_panel import PendingItem
+from saklas.tui.chat_panel import (
+    PendingExtract,
+    PendingManifoldFit,
+    PendingProbe,
+    PendingSteer,
+)
 from saklas.tui.vector_panel import MAX_ALPHA
 from saklas.tui.app import (
     DEFAULT_ALPHA,
@@ -155,12 +160,17 @@ class ExtractionController:
         if self._app._is_busy:
             # Reconstruct the canonical slash-command form so pulling
             # the item back via ↑ surfaces something the user can
-            # re-Enter as a slash command.  ``payload[0]`` carries the
-            # raw args the dispatcher hands to the handler.
+            # re-Enter as a slash command.  The typed action also carries
+            # the raw args the dispatcher hands to the handler.
             display_text = f"/{pending_type} {text}".rstrip()
-            self._app._enqueue_pending(
-                PendingItem(pending_type, display_text, (text,))
+            item = (
+                PendingSteer(display_text, text)
+                if pending_type == "steer"
+                else PendingProbe(display_text, text)
+                if pending_type == "probe"
+                else PendingExtract(display_text, text)
             )
+            self._app._enqueue_pending(item)
             return
         # Peel ``--role <slug>`` off the args before the bipolar parser
         # runs, so a multi-word pole (``a dog . a pair of cats``) doesn't
@@ -491,7 +501,7 @@ class ExtractionController:
             return
         if self._app._is_busy:
             self._app._enqueue_pending(
-                PendingItem("probe", f"/probe {selector}", (selector,))
+                PendingProbe(f"/probe {selector}", selector)
             )
             return
         chat.add_system_message(f"Attaching probe '{selector}'...")
@@ -541,10 +551,7 @@ class ExtractionController:
             return
         if self._app._is_busy:
             self._app._enqueue_pending(
-                PendingItem(
-                    "manifold_fit", f"/manifold fit {folder_arg}",
-                    (folder_arg,),
-                )
+                PendingManifoldFit(f"/manifold fit {folder_arg}", folder_arg)
             )
             return
         self._start_manifold_fit(folder_arg)
@@ -851,7 +858,7 @@ class ExtractionController:
             return
         if self._app._is_busy:
             arg = f"{ns}/"
-            self._app._enqueue_pending(PendingItem("steer", f"/steer {arg}", (arg,)))
+            self._app._enqueue_pending(PendingSteer(f"/steer {arg}", arg))
             return
 
         from saklas.io.selectors import all_concepts
@@ -898,7 +905,7 @@ class ExtractionController:
             return
         if self._app._is_busy:
             arg = f"{ns}/"
-            self._app._enqueue_pending(PendingItem("probe", f"/probe {arg}", (arg,)))
+            self._app._enqueue_pending(PendingProbe(f"/probe {arg}", arg))
             return
 
         from saklas.io.selectors import all_concepts

@@ -2316,6 +2316,64 @@ class SynthesizedSubspace:
         default_factory=dict
     )
 
+    def __post_init__(self) -> None:
+        # An empty synth is the explicit no-op result when every active
+        # fragment cancels or degenerates; SteeringManager skips it.
+        keys = set(self.layers)
+        for name, mapping in (
+            ("target_coord", self.target_coord),
+            ("share", self.share),
+            ("kappa", self.kappa),
+        ):
+            if set(mapping) != keys:
+                raise ValueError(
+                    f"SynthesizedSubspace {name} must cover exactly its layers"
+                )
+        for layer, sub in self.layers.items():
+            if not sub.is_affine:
+                raise ValueError("SynthesizedSubspace layers must be affine")
+            if sub.mean.ndim != 1:
+                raise ValueError("synthesized mean must have shape (D,)")
+            if sub.basis.ndim != 2 or sub.basis.shape[0] < 1:
+                raise ValueError("synthesized basis must have shape (R, D), R >= 1")
+            rank = sub.rank
+            dim = int(sub.basis.shape[1])
+            if sub.mean.shape != (dim,):
+                raise ValueError("synthesized mean width must match basis width")
+            if sub.coord_offset.shape != (rank,) or sub.coord_scale.shape != (rank,):
+                raise ValueError(
+                    "synthesized coord_offset/coord_scale must have shape (R,)"
+                )
+            if (
+                sub.node_coords is not None
+                or sub.affine_map is not None
+                or sub.sigma_rbf_weights is not None
+                or sub.sigma_poly_coeffs is not None
+                or sub.node_params is not None
+                or sub.rbf_weights is not None
+                or sub.poly_coeffs is not None
+            ):
+                raise ValueError(
+                    "synthesized affine spans cannot carry artifact surface fields"
+                )
+            gram = sub.basis @ sub.basis.T
+            identity = torch.eye(rank, dtype=gram.dtype, device=gram.device)
+            if not torch.allclose(gram, identity, atol=1e-5, rtol=1e-5):
+                raise ValueError("synthesized basis rows must be orthonormal")
+            if self.target_coord[layer].shape != (rank,):
+                raise ValueError("SynthesizedSubspace target_coord must have shape (R,)")
+            if self.kappa[layer].shape != (rank,):
+                raise ValueError("SynthesizedSubspace kappa must have shape (R,)")
+            values = torch.cat([
+                sub.mean.reshape(-1), sub.basis.reshape(-1),
+                self.target_coord[layer].reshape(-1),
+                self.kappa[layer].reshape(-1),
+            ])
+            if not bool(torch.isfinite(values).all()):
+                raise ValueError("SynthesizedSubspace tensors must be finite")
+            if not math.isfinite(float(self.share[layer])):
+                raise ValueError("SynthesizedSubspace shares must be finite")
+
 
 def synthesize_subspace(
     push: Sequence[
@@ -3434,7 +3492,7 @@ class TopologyChoice:
     # Laplacian eigenpairs the spectral/periodic embedding rode), or ``None``
     # when unavailable.  Lets an ``auto`` fit emit a diagnostics block so the
     # inspector renders the same bars a pinned ``pca``/``spectral`` fit does.
-    diagnostics: "object | None" = None
+    diagnostics: "PcaDiagnostics | SpectralDiagnostics | None" = None
     # Curved winner's already-normalized, factorized layout plan.  Auto-mode
     # spends this work while scoring the candidate; the final per-layer fit can
     # reuse it instead of repeating QR/eigh/LU over the same node geometry.
@@ -5455,6 +5513,13 @@ def _load_manifold_locked(
             raise ManifoldFormatError(f"invalid fitted manifold tensor key {key!r}")
         idx = int(raw_layer)
         by_layer.setdefault(idx, {})[field_name] = tensor
+
+    tensor_layers = set(by_layer)
+    sidecar_layers = set(sidecar["fitted_layers"])
+    if not tensor_layers or tensor_layers != sidecar_layers:
+        raise ManifoldFormatError(
+            "fitted manifold tensor layers do not match sidecar fitted_layers"
+        )
 
     layers: dict[int, LayerSubspace] = {}
     for idx, parts in by_layer.items():

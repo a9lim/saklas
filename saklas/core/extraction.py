@@ -35,7 +35,11 @@ import torch
 from safetensors.torch import load_file, save as serialize_safetensors, save_file
 
 from saklas.core.events import EventBus, ManifoldExtracted
-from saklas.core.manifold import MANIFOLD_FIT_POLICY_VERSION
+from saklas.core.manifold import (
+    MANIFOLD_FIT_POLICY_VERSION,
+    PcaDiagnostics,
+    SpectralDiagnostics,
+)
 from saklas.core.model import loaded_model_fingerprint, workspace_layer_indices
 from saklas.core.sae import SaeBackend
 from saklas.io.paths import model_dir, tensor_filename
@@ -1000,38 +1004,33 @@ def _authoring_snapshot_locked(
     return mf, nodes_sha, revision, groups, baseline
 
 
-def _diagnostics_to_dict(diag: Any) -> dict[str, Any]:
-    """Convert a discover-mode diagnostics dataclass into a JSON-safe dict.
-
-    Both :class:`PcaDiagnostics` and :class:`SpectralDiagnostics` carry
-    one or more tensor fields; the sidecar is JSON, so tensors are
-    converted to plain Python lists and floats here.  The dispatcher is
-    structural — duck-typed on the dataclass fields — so adding a third
-    method later doesn't require touching this helper as long as the
-    dataclass stays JSON-serializable in this way.
-    """
-    out: dict[str, Any] = {}
-    for name in (
-        "per_component_variance", "cumulative_variance", "eigenvalues",
-    ):
-        if hasattr(diag, name):
-            t = getattr(diag, name)
-            if isinstance(t, torch.Tensor):
-                out[name] = [float(x) for x in t.tolist()]
-            else:
-                out[name] = list(t)
-    for name in (
-        "picked_k", "gap_index", "k_nn", "component_count", "heuristic_k",
-    ):
-        if hasattr(diag, name):
-            out[name] = int(getattr(diag, name))
-    for name in ("threshold", "gap_magnitude", "bandwidth"):
-        if hasattr(diag, name):
-            out[name] = float(getattr(diag, name))
-    # Spectral dimensionality-floor provenance (optional / bool).
-    if hasattr(diag, "pinned"):
-        out["pinned"] = bool(diag.pinned)
-    if getattr(diag, "min_dim", None) is not None:
+def _diagnostics_to_dict(
+    diag: PcaDiagnostics | SpectralDiagnostics,
+) -> dict[str, Any]:
+    """Exhaustively serialize the current diagnostics tagged union."""
+    if isinstance(diag, PcaDiagnostics):
+        return {
+            "per_component_variance": [
+                float(x) for x in diag.per_component_variance.tolist()
+            ],
+            "cumulative_variance": [
+                float(x) for x in diag.cumulative_variance.tolist()
+            ],
+            "picked_k": int(diag.picked_k),
+            "threshold": float(diag.threshold),
+        }
+    out: dict[str, Any] = {
+        "eigenvalues": [float(x) for x in diag.eigenvalues.tolist()],
+        "picked_k": int(diag.picked_k),
+        "gap_index": int(diag.gap_index),
+        "gap_magnitude": float(diag.gap_magnitude),
+        "bandwidth": float(diag.bandwidth),
+        "k_nn": int(diag.k_nn),
+        "component_count": int(diag.component_count),
+        "heuristic_k": int(diag.heuristic_k),
+        "pinned": bool(diag.pinned),
+    }
+    if diag.min_dim is not None:
         out["min_dim"] = int(diag.min_dim)
     return out
 
@@ -2235,10 +2234,10 @@ class ManifoldExtractionPipeline:
                 resolved_hyperparams["max_subspace_dim"] = max_subspace_dim_override
             if curved_smoothing is not None:
                 resolved_hyperparams["smoothing"] = curved_smoothing
-            if hasattr(diagnostics, "k_nn"):  # SpectralDiagnostics
-                resolved_hyperparams["k_nn"] = int(diagnostics.k_nn)  # pyright: ignore[reportAttributeAccessIssue]  # SpectralDiagnostics only; guarded by hasattr
+            if isinstance(diagnostics, SpectralDiagnostics):
+                resolved_hyperparams["k_nn"] = int(diagnostics.k_nn)
                 resolved_hyperparams["bandwidth"] = float(
-                    diagnostics.bandwidth,  # pyright: ignore[reportAttributeAccessIssue]  # SpectralDiagnostics only; guarded by hasattr
+                    diagnostics.bandwidth,
                 )
             discover_metadata = {
                 "fit_mode": mf.fit_mode,

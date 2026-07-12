@@ -904,6 +904,9 @@ def test_sidecar_rejects_unknown_fields(tmp_path: Path) -> None:
         ("origin_per_layer", {"0": "not-coordinates"}),
         ("topology_candidates", [42]),
         ("components", {"0:x": {"selector": "x", "alpha": 1.0}}),
+        ("components", {"0:x": {
+            "selector": "x", "alpha": 1.0, "tensor_sha256": None,
+        }}),
         ("diagnostics", {"invented_metric": 1.0}),
         ("hyperparams", {"invented_knob": 1}),
     ],
@@ -918,6 +921,16 @@ def test_sidecar_rejects_malformed_nested_contracts(
     path.write_text(json.dumps(payload))
 
     with pytest.raises(ManifoldFormatError):
+        ManifoldSidecar.load(path)
+
+
+def test_sidecar_rejects_unknown_method(tmp_path: Path) -> None:
+    path = tmp_path / "model.json"
+    payload = _sidecar_payload()
+    payload["method"] = "invented_current_method"
+    path.write_text(json.dumps(payload))
+
+    with pytest.raises(ManifoldFormatError, match="method/fit_mode"):
         ManifoldSidecar.load(path)
 
 

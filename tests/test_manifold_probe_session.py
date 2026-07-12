@@ -128,6 +128,7 @@ def _stub_session() -> SaklasSession:
     session._live_lens_active_for_generation = True
     session._incremental_readings = []
     session._incremental_gate_scores = []
+    session._compiled_clean_eligible = False
     session._layers = []
     # Minimal prefix-cache invalidator + tree spy.
     session._prefix_cache = None

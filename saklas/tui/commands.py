@@ -484,7 +484,7 @@ def dispatch(
     came from a pulled-and-re-edited pending row, so the new item
     replaces its slot rather than sliding to the queue tail.
     """
-    from saklas.tui.chat_panel import PendingItem
+    from saklas.tui.chat_panel import PendingClear, PendingQuit, PendingRewind
 
     text = text.strip()
     parts = text.split(maxsplit=1)
@@ -510,10 +510,16 @@ def dispatch(
         # queue head on each ``("done",)`` sentinel and calls
         # ``_dispatch_pending_action``.  Carry the full slash text
         # so the user can pull and edit the queued item via ↑.
-        app._enqueue_pending(
-            PendingItem(cmd.pending_kind or cmd.name.lstrip("/"), text),
-            replace_slot=replace_slot,
-        )
+        kind = cmd.pending_kind or cmd.name.lstrip("/")
+        if kind == "clear":
+            item = PendingClear(text)
+        elif kind == "rewind":
+            item = PendingRewind(text)
+        elif kind == "quit":
+            item = PendingQuit(text)
+        else:
+            raise AssertionError(f"interrupting command lacks typed pending action: {kind}")
+        app._enqueue_pending(item, replace_slot=replace_slot)
         return
 
     cmd.handler(app, raw_args)

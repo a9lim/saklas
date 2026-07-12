@@ -23,6 +23,8 @@ from fastapi.responses import Response
 
 from saklas.core.errors import SaklasError
 from saklas.core.manifold import manifold_is_affine
+from saklas.core.monitor_attach import AttachedManifoldProbe
+from saklas.core.session import SaklasSession
 from saklas.io.probes_bootstrap import load_default_manifolds
 from saklas.server.native_common import NativeRequest, resolve_session_id
 
@@ -41,7 +43,7 @@ class LiveProbesRequest(NativeRequest):
     enabled: bool
 
 
-def _probe_info(name: str, probe: Any) -> dict[str, Any]:
+def _probe_info(name: str, probe: AttachedManifoldProbe) -> dict[str, Any]:
     """Serialize one attached probe (any rank) to JSON for the wire."""
     manifold = probe.manifold
     domain_spec = manifold.domain.to_spec()
@@ -96,7 +98,7 @@ def _lens_probe_info(name: str, spec: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _lens_probe_specs(session: Any) -> dict[str, dict[str, Any]]:
+def _lens_probe_specs(session: SaklasSession) -> dict[str, dict[str, Any]]:
     """Snapshot the session's pinned lens-probe registry."""
     return session.lens_probe_specs
 
@@ -126,7 +128,7 @@ def _sae_probe_info(name: str, spec: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _sae_probe_specs(session: Any) -> dict[str, dict[str, Any]]:
+def _sae_probe_specs(session: SaklasSession) -> dict[str, dict[str, Any]]:
     return session.sae_probe_specs
 
 

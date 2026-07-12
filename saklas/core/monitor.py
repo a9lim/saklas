@@ -12,7 +12,6 @@ from saklas.core.monitor_attach import (
     DEFAULT_NEAREST_TOP_N,
     NEUTRAL_LABEL,
     _FRACTION_EPSILON,
-    _MIN_SHARE_WEIGHT,
     _woodbury_apply,
     AttachedManifoldProbe,  # re-exported: tests import from saklas.core.monitor
     _build_whitened_factors,
@@ -374,11 +373,8 @@ class Monitor:
         shared = [idx for idx in manifold.layers if idx in hidden_per_layer]
         if not shared:
             return ProbeReading(fraction=0.0, nearest=[], coords=())
-        total_w = sum(sw.get(idx, 0.0) for idx in shared)
-        if total_w <= _MIN_SHARE_WEIGHT:
-            w_shared = {idx: 1.0 / len(shared) for idx in shared}
-        else:
-            w_shared = {idx: sw.get(idx, 0.0) / total_w for idx in shared}
+        total_w = sum(sw[idx] for idx in shared)
+        w_shared = {idx: sw[idx] / total_w for idx in shared}
 
         K = probe.node_values_reduced[shared[0]].shape[0]
         inject_neutral = probe.inject_neutral
@@ -912,11 +908,8 @@ class Monitor:
         shared = [idx for idx in manifold.layers if idx in hidden_per_layer]
         if not shared:
             return {}
-        total_w = sum(sw.get(idx, 0.0) for idx in shared)
-        if total_w <= _MIN_SHARE_WEIGHT:
-            w_shared = {idx: 1.0 / len(shared) for idx in shared}
-        else:
-            w_shared = {idx: sw.get(idx, 0.0) / total_w for idx in shared}
+        total_w = sum(sw[idx] for idx in shared)
+        w_shared = {idx: sw[idx] / total_w for idx in shared}
 
         n_dim = manifold.domain.intrinsic_dim
         frac_mean_t: torch.Tensor | None = None
@@ -1333,7 +1326,7 @@ class Monitor:
                 for w in whs
             ])
             wt = torch.tensor(
-                [float(self._probes[n].share_weights.get(layer_idx, 0.0))
+                [float(self._probes[n].share_weights[layer_idx])
                  for n in present],
                 device=device, dtype=torch.float32,
             )

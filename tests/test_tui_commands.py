@@ -1284,13 +1284,13 @@ def test_history_navigate_walks_pending_then_history():
     """``↑`` walks the queue (most-recent first) before falling into
     committed input history.  Pending positions land on
     ``_pulled_slot``; history positions land on ``_history_index``."""
-    from saklas.tui.chat_panel import PendingItem
+    from saklas.tui.chat_panel import PendingSubmit
 
     app = _make_app()
     app._input_history = ["older"]
     app._pending_queue = [
-        PendingItem("submit", "first queued"),
-        PendingItem("submit", "second queued"),
+        PendingSubmit("first queued"),
+        PendingSubmit("second queued"),
     ]
     inp = _wire_fake_input(app, value="composing")
 
@@ -1322,12 +1322,12 @@ def test_history_navigate_walks_pending_then_history():
 
 def test_history_navigate_down_returns_through_pending_to_live():
     """``↓`` walks back through pending and restores the stash at live."""
-    from saklas.tui.chat_panel import PendingItem
+    from saklas.tui.chat_panel import PendingSubmit
 
     app = _make_app()
     app._pending_queue = [
-        PendingItem("submit", "alpha"),
-        PendingItem("submit", "beta"),
+        PendingSubmit("alpha"),
+        PendingSubmit("beta"),
     ]
     inp = _wire_fake_input(app, value="composing")
 
@@ -1349,14 +1349,14 @@ def test_history_navigate_down_returns_through_pending_to_live():
 def test_pulled_pending_resubmit_replaces_slot_in_place():
     """``Enter`` after editing a pulled slot replaces *that* slot rather
     than appending to the queue tail — slot-preserving edit."""
-    from saklas.tui.chat_panel import ChatPanel, PendingItem
+    from saklas.tui.chat_panel import ChatPanel, PendingSubmit
 
     app = _make_app()
     app._session.is_generating = True  # busy so submit enqueues
     app._pending_queue = [
-        PendingItem("submit", "a"),
-        PendingItem("submit", "b"),
-        PendingItem("submit", "c"),
+        PendingSubmit("a"),
+        PendingSubmit("b"),
+        PendingSubmit("c"),
     ]
     _wire_fake_input(app, value="")
     # Simulate the user having pulled slot 1 ("b") via ↑↑.
@@ -1373,12 +1373,12 @@ def test_pulled_pending_resubmit_replaces_slot_in_place():
 def test_pulled_pending_empty_enter_removes_slot():
     """Empty ``Enter`` while a slot is pulled removes that slot —
     keyboard equivalent of the GUI's per-bubble ``×``."""
-    from saklas.tui.chat_panel import ChatPanel, PendingItem
+    from saklas.tui.chat_panel import ChatPanel, PendingSubmit
 
     app = _make_app()
     app._pending_queue = [
-        PendingItem("submit", "keep me"),
-        PendingItem("submit", "cancel me"),
+        PendingSubmit("keep me"),
+        PendingSubmit("cancel me"),
     ]
     _wire_fake_input(app, value="")
     app._pulled_slot = 1
@@ -1392,10 +1392,10 @@ def test_pulled_pending_empty_enter_removes_slot():
 def test_pulled_pending_esc_cancels_pull_without_removing():
     """``Esc`` while pulled cancels the *edit* — the slot stays in the
     queue, the input restores its pre-pull stash."""
-    from saklas.tui.chat_panel import PendingItem
+    from saklas.tui.chat_panel import PendingSubmit
 
     app = _make_app()
-    app._pending_queue = [PendingItem("submit", "queued")]
+    app._pending_queue = [PendingSubmit("queued")]
     inp = _wire_fake_input(app, value="composing")
 
     app._history_navigate(-1)  # pull slot 0
@@ -1405,20 +1405,20 @@ def test_pulled_pending_esc_cancels_pull_without_removing():
     app.action_stop_generation()  # no gen running → cancel pull
     assert app._pulled_slot is None
     assert inp.text == "composing"
-    assert app._pending_queue == [PendingItem("submit", "queued")]
+    assert app._pending_queue == [PendingSubmit("queued")]
     assert inp.allow_empty_submit is False
 
 
 def test_drain_next_pending_decrements_pulled_slot():
     """When the queue head drains during a pull, the pulled-slot index
     shifts so the user keeps tracking the same item."""
-    from saklas.tui.chat_panel import PendingItem
+    from saklas.tui.chat_panel import PendingSubmit
 
     app = _make_app()
     app._pending_queue = [
-        PendingItem("submit", "head"),
-        PendingItem("submit", "middle"),
-        PendingItem("submit", "tail"),
+        PendingSubmit("head"),
+        PendingSubmit("middle"),
+        PendingSubmit("tail"),
     ]
     _wire_fake_input(app, value="")
     app._pulled_slot = 2  # user is editing "tail"
@@ -1434,12 +1434,12 @@ def test_drain_next_pending_cancels_pull_when_head_was_pulled():
     """When the user pulled slot 0, the drain pops that very item —
     cancel the pull so the stale ``_pulled_slot`` doesn't outlive the
     queue mutation."""
-    from saklas.tui.chat_panel import PendingItem
+    from saklas.tui.chat_panel import PendingSubmit
 
     app = _make_app()
     app._pending_queue = [
-        PendingItem("submit", "about to fire"),
-        PendingItem("submit", "next up"),
+        PendingSubmit("about to fire"),
+        PendingSubmit("next up"),
     ]
     inp = _wire_fake_input(app, value="draft")
     app._history_stash = "draft"
@@ -1462,7 +1462,7 @@ def test_pending_strip_markup_round_trips_through_rich():
     nothing to close`` when the strip first re-rendered."""
     from rich.console import Console
     from rich.text import Text
-    from saklas.tui.chat_panel import PendingItem, PendingStrip
+    from saklas.tui.chat_panel import PendingClear, PendingSteer, PendingSubmit, PendingStrip
     import io
 
     # Side-step Textual's mount lifecycle by calling the markup
@@ -1475,11 +1475,11 @@ def test_pending_strip_markup_round_trips_through_rich():
     strip._queue = []
 
     items = [
-        PendingItem("submit", "what do you think?"),
-        PendingItem("clear", "/clear"),
-        PendingItem("steer", "/steer 0.5 angry"),
-        PendingItem("submit", "with [brackets] and \\backslashes"),
-        PendingItem("submit", "multi\nline\nmessage"),
+        PendingSubmit("what do you think?"),
+        PendingClear("/clear"),
+        PendingSteer("/steer 0.5 angry", "0.5 angry"),
+        PendingSubmit("with [brackets] and \\backslashes"),
+        PendingSubmit("multi\nline\nmessage"),
     ]
     for slot in [None, 0, 2, len(items) - 1]:
         PendingStrip.update_queue(strip, items, pulled_slot=slot)
@@ -1494,7 +1494,7 @@ def test_slash_command_during_gen_enqueues_canonical_text():
     """Mid-gen ``/clear`` enqueues a :class:`PendingItem` carrying the
     full slash text so the user can pull and edit it via ↑.  The
     in-flight gen is not stopped — queue model preserves tokens."""
-    from saklas.tui.chat_panel import PendingItem
+    from saklas.tui.chat_panel import PendingClear
 
     app = _make_app()
     app._session.is_generating = True
@@ -1502,7 +1502,7 @@ def test_slash_command_during_gen_enqueues_canonical_text():
 
     app._handle_command("/clear")
 
-    assert app._pending_queue == [PendingItem("clear", "/clear")]
+    assert app._pending_queue == [PendingClear("/clear")]
     app._session.stop.assert_not_called()
 
 
@@ -1671,7 +1671,7 @@ def test_apply_highlight_to_all_preserves_surprise_sentinel():
 
 def test_predicted_on_user_node_falls_through_to_live_when_queue_empty():
     """No queued items → predicted equals live."""
-    from saklas.tui.chat_panel import PendingItem
+    from saklas.tui.chat_panel import PendingSteer
 
     app = _make_app()
     # Live active is the synthetic root (system) — not a user node.
@@ -1680,24 +1680,25 @@ def test_predicted_on_user_node_falls_through_to_live_when_queue_empty():
 
     # A queued ``/steer`` doesn't shift the role, so prediction still
     # mirrors live.
-    app._pending_queue = [PendingItem("steer", "/steer 0.5 angry", ("0.5 angry",))]
+    app._pending_queue = [PendingSteer("/steer 0.5 angry", "0.5 angry")]
     assert app._predicted_on_user_node() is False
 
 
 def test_predicted_on_user_node_reflects_queued_commit_user():
     """A queued ``commit_user`` predicts the next submission as prefill."""
-    from saklas.tui.chat_panel import PendingItem
+    from saklas.tui.chat_panel import PendingCommitAssistant, PendingCommitUser, PendingItem
 
     app = _make_app()
     # Live active is root — not a user node.
     assert app._predicted_on_user_node() is False
 
     # Queue a commit_user — the next item should land in prefill mode.
-    app._pending_queue = [PendingItem("commit_user", "hi")]
+    queue: list[PendingItem] = [PendingCommitUser("hi")]
+    app._pending_queue = queue
     assert app._predicted_on_user_node() is True
 
     # Add a commit_assistant on top — final role flips back to assistant.
-    app._pending_queue.append(PendingItem("commit_assistant", "hello", ("uid",)))
+    app._pending_queue.append(PendingCommitAssistant("hello", "uid"))
     assert app._predicted_on_user_node() is False
 
 
@@ -1705,13 +1706,13 @@ def test_predicted_walks_past_no_change_kinds():
     """Items with no role mapping (``/steer``, ``/probe``) are walked past
     so a queued ``commit_user`` followed by ``/steer`` still predicts
     user mode."""
-    from saklas.tui.chat_panel import PendingItem
+    from saklas.tui.chat_panel import PendingCommitUser, PendingProbe, PendingSteer
 
     app = _make_app()
     app._pending_queue = [
-        PendingItem("commit_user", "hi"),
-        PendingItem("steer", "/steer 0.5 angry", ("0.5 angry",)),
-        PendingItem("probe", "/probe calm", ("calm",)),
+        PendingCommitUser("hi"),
+        PendingSteer("/steer 0.5 angry", "0.5 angry"),
+        PendingProbe("/probe calm", "calm"),
     ]
     assert app._predicted_on_user_node() is True
 
@@ -1719,26 +1720,26 @@ def test_predicted_walks_past_no_change_kinds():
 def test_enqueue_pending_refreshes_input_mode():
     """Enqueueing a role-shifting item updates the placeholder
     immediately — no need to wait for the queue to drain."""
-    from saklas.tui.chat_panel import PendingItem
+    from saklas.tui.chat_panel import PendingCommitAssistant, PendingCommitUser
 
     app = _make_app()
     set_prefill_mode = MagicMock()
     app._chat_panel.set_prefill_mode = set_prefill_mode
 
-    app._enqueue_pending(PendingItem("commit_user", "hi"))
+    app._enqueue_pending(PendingCommitUser("hi"))
     # Last call reflects the queue-aware mode.
     set_prefill_mode.assert_called_with(True)
 
-    app._enqueue_pending(PendingItem("commit_assistant", "hello", ("uid",)))
+    app._enqueue_pending(PendingCommitAssistant("hello", "uid"))
     set_prefill_mode.assert_called_with(False)
 
 
 def test_remove_pending_slot_refreshes_input_mode():
     """Cancelling the queued role-shifter restores live mode."""
-    from saklas.tui.chat_panel import PendingItem
+    from saklas.tui.chat_panel import PendingCommitUser
 
     app = _make_app()
-    app._pending_queue = [PendingItem("commit_user", "hi")]
+    app._pending_queue = [PendingCommitUser("hi")]
     set_prefill_mode = MagicMock()
     app._chat_panel.set_prefill_mode = set_prefill_mode
 
@@ -1756,13 +1757,13 @@ def test_drain_next_pending_chains_through_sync_kinds():
     """A run of sync slash kinds (/clear /steer /probe /rewind) drains
     all in one call — the old single-item drain would have left them
     stuck waiting for a ``done`` that never arrives."""
-    from saklas.tui.chat_panel import PendingItem
+    from saklas.tui.chat_panel import PendingClear, PendingProbe, PendingSteer
 
     app = _make_app()
     app._pending_queue = [
-        PendingItem("steer", "/steer 0.5 angry", ("0.5 angry",)),
-        PendingItem("probe", "/probe calm", ("calm",)),
-        PendingItem("clear", "/clear"),
+        PendingSteer("/steer 0.5 angry", "0.5 angry"),
+        PendingProbe("/probe calm", "calm"),
+        PendingClear("/clear"),
     ]
     _wire_fake_input(app, value="")
     dispatched: list[str] = []
@@ -1780,13 +1781,13 @@ def test_drain_next_pending_breaks_at_first_async_kind():
     """Drain chains through sync kinds but breaks at the first kind
     that runs a worker / kicks a gen — that one's own ``done`` will
     advance the queue, so chaining past it would race the worker."""
-    from saklas.tui.chat_panel import PendingItem
+    from saklas.tui.chat_panel import PendingClear, PendingCommitUser, PendingSubmit
 
     app = _make_app()
     app._pending_queue = [
-        PendingItem("clear", "/clear"),                # sync — chain
-        PendingItem("commit_user", "hi"),              # async — break here
-        PendingItem("submit", "next"),                 # stays queued
+        PendingClear("/clear"),                # sync — chain
+        PendingCommitUser("hi"),              # async — break here
+        PendingSubmit("next"),                 # stays queued
     ]
     _wire_fake_input(app, value="")
     dispatched: list[str] = []
@@ -1804,12 +1805,12 @@ def test_drain_next_pending_handles_pure_async_chain():
     """When the head is async, drain pops exactly one — matches the
     pre-existing single-item semantics every gen-bearing kind
     depends on."""
-    from saklas.tui.chat_panel import PendingItem
+    from saklas.tui.chat_panel import PendingSubmit
 
     app = _make_app()
     app._pending_queue = [
-        PendingItem("submit", "first"),
-        PendingItem("submit", "second"),
+        PendingSubmit("first"),
+        PendingSubmit("second"),
     ]
     _wire_fake_input(app, value="")
     app._dispatch_pending_action = MagicMock()
@@ -1868,13 +1869,13 @@ def test_manifold_fit_runs_session_fit(tmp_path: Path) -> None:
 def test_manifold_fit_mid_gen_enqueues_pending():
     """`/manifold fit` while a generation is in flight queues a
     ``manifold_fit`` PendingItem rather than running immediately."""
-    from saklas.tui.chat_panel import PendingItem
+    from saklas.tui.chat_panel import PendingManifoldFit
 
     app = _make_app()
     app._session.is_generating = True
     app._handle_command("/manifold fit /tmp/myfold")
     assert app._pending_queue == [
-        PendingItem("manifold_fit", "/manifold fit /tmp/myfold", ("/tmp/myfold",))
+        PendingManifoldFit("/manifold fit /tmp/myfold", "/tmp/myfold")
     ]
 
 
@@ -2177,13 +2178,13 @@ def test_unprobe_curved_probe_missing_reports():
 
 
 def test_probe_curved_selector_mid_gen_enqueues_canonical_pending():
-    from saklas.tui.chat_panel import PendingItem
+    from saklas.tui.chat_panel import PendingProbe
 
     app = _make_app()
     app._session.is_generating = True
     app._handle_command("/probe circumplex")
     assert app._pending_queue == [
-        PendingItem("probe", "/probe circumplex", ("circumplex",)),
+        PendingProbe("/probe circumplex", "circumplex"),
     ]
 
 

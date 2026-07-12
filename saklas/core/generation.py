@@ -664,13 +664,13 @@ def _try_scene_render(
     gen_role: str | None,
     gen_seat: str,
 ) -> torch.Tensor | None:
-    """Render ``chat`` through the stitcher, or ``None`` for the legacy paths.
+    """Render ``chat`` through the stitcher, or ``None`` for chat-template paths.
 
     ``None`` means "this render is servable by the chat-template paths":
     no grammar, a mid-conversation system turn (template semantics differ
     per family — preserve them), or an assistant-seat render the grammar
     can't produce (e.g. a missing thinking-mode appendix).  A render the
-    legacy paths *cannot* serve (non-assistant ``gen_seat``) re-raises
+    chat-template paths *cannot* serve (non-assistant ``gen_seat``) re-raises
     instead of degrading.
     """
     if scene is None:
@@ -732,7 +732,7 @@ def build_chat_input(
     stitched bytes match ``apply_chat_template`` on standard alternating
     conversations, so passing ``scene`` never changes an existing render.
 
-    Without ``scene`` the legacy paths apply: a zero-overhead
+    Without ``scene`` the standard chat-template paths apply: a zero-overhead
     ``apply_chat_template`` pass-through when no label is present, else the
     render-then-splice path (``apply_with_per_turn_roles``, requiring
     ``model_type``).  A non-assistant ``gen_seat`` requires ``scene``.

@@ -483,7 +483,7 @@ class LoomScreen(Screen[None]):
             parts.append("[reverse] help [/]")
         elif self._compare_mode:
             parts.append("[reverse] compare [/]")
-        expr = getattr(self._app, "_loom_prune_expr", None)
+        expr = self._app._loom_prune_expr
         if expr:
             parts.append(f"filter: {escape(str(expr))}")
         self._header.update("  ·  ".join(parts))
@@ -647,10 +647,7 @@ class LoomScreen(Screen[None]):
             return
         # Prefer the active-path descendant so ``l`` walks the visible
         # chat thread by default.
-        try:
-            active_path_ids = {n.id for n in self._session.tree.active_path()}
-        except Exception:
-            active_path_ids = set()
+        active_path_ids = {n.id for n in self._session.tree.active_path()}
         for cid in kids:
             if cid in active_path_ids:
                 self._select_node(cid)
@@ -683,10 +680,7 @@ class LoomScreen(Screen[None]):
         delete) all change the active path, and the chat panel must
         reflect it rather than the turns last streamed into it.
         """
-        try:
-            self._app._repaint_chat_from_active_path()
-        except Exception:
-            pass
+        self._app._repaint_chat_from_active_path()
         self._app.pop_screen()
 
     def action_set_active(self) -> None:

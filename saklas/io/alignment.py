@@ -261,6 +261,8 @@ def _validate_neutral_cache_metadata_locked(
         not isinstance(version, int)
         or isinstance(version, bool)
         or version != _NEUTRAL_CACHE_FORMAT_VERSION
+        or isinstance(sidecar["capture_version"], bool)
+        or not isinstance(sidecar["capture_version"], int)
         or sidecar["capture_version"] != _NEUTRAL_CAPTURE_VERSION
         or sidecar["method"] != "neutral_activations"
         or any(
@@ -1179,6 +1181,20 @@ def load_alignment_map(
                 if (
                     not isinstance(spec, dict)
                     or set(spec) != {"left", "right", "offset"}
+                    or any(
+                        not isinstance(spec[part], list)
+                        or not spec[part]
+                        or any(
+                            isinstance(dim, bool) or not isinstance(dim, int)
+                            or dim <= 0 for dim in spec[part]
+                        )
+                        for part in ("left", "right", "offset")
+                    )
+                    or len(spec["left"]) != 2
+                    or len(spec["right"]) != 2
+                    or len(spec["offset"]) != 1
+                    or spec["left"][1] != spec["right"][0]
+                    or spec["left"][0] != spec["offset"][0]
                     or not isinstance(digest, str)
                     or len(digest) != 64
                     or any(char not in "0123456789abcdef" for char in digest)

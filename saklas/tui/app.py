@@ -29,7 +29,22 @@ from saklas.tui.chat_panel import (
     _KIND_ENDS_ON_USER_NODE,
     ChatInput,
     ChatPanel,
+    PendingClear,
+    PendingCommitAssistant,
+    PendingCommitUser,
+    PendingExtract,
+    PendingFan,
     PendingItem,
+    PendingManifoldFit,
+    PendingProbe,
+    PendingQuit,
+    PendingRawCommit,
+    PendingRawContinue,
+    PendingRegenerate,
+    PendingRegenN,
+    PendingRewind,
+    PendingSteer,
+    PendingSubmit,
     RawBuffer,
     _AssistantMessage,
     _RawTextArea,
@@ -763,7 +778,7 @@ class SaklasApp(App[None]):
             else:
                 queued_target = prefill_target
             self._enqueue_pending(
-                PendingItem("submit", text, (queued_target,)),
+                PendingSubmit(text, queued_target),
                 replace_slot=replace_slot,
             )
             return
@@ -1306,7 +1321,7 @@ class SaklasApp(App[None]):
             # Queue quit behind any in-flight work — preserves "Stop
             # only stops; queue drains on done" semantics.  Hit ``Esc``
             # first if you want to short-circuit.
-            self._enqueue_pending(PendingItem("quit", "/quit"))
+            self._enqueue_pending(PendingQuit())
         else:
             self.exit()
 
@@ -1535,7 +1550,7 @@ class SaklasApp(App[None]):
         """
         if self._is_busy:
             self._enqueue_pending(
-                PendingItem("raw_continue", draft), replace_slot=replace_slot,
+                PendingRawContinue(draft), replace_slot=replace_slot,
             )
             return
         tail, parent = self._resolve_raw_divergence(draft)
@@ -1790,15 +1805,11 @@ class SaklasApp(App[None]):
             # an earlier queued ``commit_user``) stamps ``ACTIVE_AT_DRAIN``
             # so the dispatcher resolves the parent fresh at drain time.
             if user_node_id is not None:
-                item = PendingItem(
-                    "commit_assistant", text, (user_node_id,),
-                )
+                item = PendingCommitAssistant(text, user_node_id)
             elif self._predicted_on_user_node():
-                item = PendingItem(
-                    "commit_assistant", text, (ACTIVE_AT_DRAIN,),
-                )
+                item = PendingCommitAssistant(text, ACTIVE_AT_DRAIN)
             else:
-                item = PendingItem("commit_user", text)
+                item = PendingCommitUser(text)
             self._enqueue_pending(item, replace_slot=replace_slot)
             return
         if user_node_id is not None:
@@ -1834,7 +1845,7 @@ class SaklasApp(App[None]):
         """Land the raw buffer's divergent span without generating."""
         if self._is_busy:
             self._enqueue_pending(
-                PendingItem("raw_commit", draft), replace_slot=replace_slot,
+                PendingRawCommit(draft), replace_slot=replace_slot,
             )
             return
         self._start_raw_commit(draft)
@@ -2643,30 +2654,28 @@ class SaklasApp(App[None]):
 
     def _dispatch_pending_action(self, item: PendingItem) -> None:
         """Handle a queued action dispatched once the current gen finishes."""
-        kind = item.kind
         text = item.text
-        payload = item.payload
         chat = self._chat_panel
         try:
-            if kind == "regenerate":
+            if isinstance(item, PendingRegenerate):
                 if self._raw_mode:
                     self._run_regen_n_worker(1)
                 else:
                     self._rewind_active_assistant()
                     chat.rewind_last_assistant()
                     self._start_generation()
-            elif kind == "submit":
+            elif isinstance(item, PendingSubmit):
                 # Phase 5 carries the role decision made at submit time
                 # so the deferred dispatch matches whatever the user-row
-                # mount did.  ``payload[0]`` is the optional
-                # ``prefill_target`` node id, or ``ACTIVE_AT_DRAIN`` when
+                # mount did.  ``target`` is the optional prefill node id,
+                # or ``ACTIVE_AT_DRAIN`` when
                 # the queue role-aware path stamped it for late binding
                 # (parent created by an earlier-queued action; resolve
                 # the live active here).  Mount the user row here
                 # (deferred from queueing) so the row appears alongside
                 # the new assistant reply rather than floating above the
                 # previous in-flight one.
-                target = payload[0] if payload else None
+                target = item.target
                 if target == ACTIVE_AT_DRAIN:
                     target = self._prefill_target_node_id()
                 if target is not None:
@@ -2674,7 +2683,7 @@ class SaklasApp(App[None]):
                 else:
                     self._chat_panel.add_user_message(text)
                     self._start_generation(text)
-            elif kind == "raw_continue":
+            elif isinstance(item, PendingRawContinue):
                 # Raw-mode continuation queued behind an in-flight gen.
                 # ``text`` is the full submitted draft; divergence is
                 # resolved fresh here so it binds to the current tree.
@@ -2683,19 +2692,19 @@ class SaklasApp(App[None]):
                     tail, raw_continuation=True,
                     raw_draft=text, raw_parent=parent,
                 )
-            elif kind == "raw_commit":
+            elif isinstance(item, PendingRawCommit):
                 self._start_raw_commit(text)
-            elif kind == "commit_user":
+            elif isinstance(item, PendingCommitUser):
                 # Ctrl+Enter from a non-user active node, queued behind
                 # in-flight gen.  The role decision was made at submit
                 # time so we don't re-resolve it here (the active node
                 # may have shifted during gen).
                 self._start_commit_user(text)
-            elif kind == "commit_assistant":
+            elif isinstance(item, PendingCommitAssistant):
                 # Ctrl+Enter from a user node, queued behind in-flight
-                # gen.  ``payload[0]`` is the user node id, or
+                # gen.  ``parent_id`` is the user node id, or
                 # ``ACTIVE_AT_DRAIN`` for queue role-aware deferral.
-                parent = payload[0]
+                parent = item.parent_id
                 if parent == ACTIVE_AT_DRAIN:
                     parent = self._prefill_target_node_id()
                 if parent is None:
@@ -2705,40 +2714,37 @@ class SaklasApp(App[None]):
                     self._start_commit_user(text)
                 else:
                     self._start_commit_assistant(parent, text)
-            elif kind == "clear":
+            elif isinstance(item, PendingClear):
                 self._do_clear()
-            elif kind == "rewind":
+            elif isinstance(item, PendingRewind):
                 self._rewind_active_assistant()
                 chat.rewind_last_assistant()
                 self._do_rewind()
-            elif kind == "steer":
+            elif isinstance(item, PendingSteer):
                 # ``text`` is the canonical slash form (``/steer …``);
-                # ``payload[0]`` is the raw arg string the handler
-                # actually consumes.
-                self._handle_steer(payload[0] if payload else text)
-            elif kind == "probe":
-                self._handle_probe(payload[0] if payload else text)
-            elif kind == "extract":
-                self._handle_extract_only(payload[0] if payload else text)
-            elif kind == "manifold_fit":
-                # ``payload[0]`` is the folder path; the fit runs on a
-                # worker that enqueues its own ``done`` sentinel.
-                self._start_manifold_fit(payload[0] if payload else text)
-            elif kind == "regen_n":
+                # ``argument`` is the raw string the handler consumes.
+                self._handle_steer(item.argument)
+            elif isinstance(item, PendingProbe):
+                self._handle_probe(item.selector)
+            elif isinstance(item, PendingExtract):
+                self._handle_extract_only(item.argument)
+            elif isinstance(item, PendingManifoldFit):
+                # The fit runs on a worker that enqueues its own ``done`` sentinel.
+                self._start_manifold_fit(item.folder)
+            elif isinstance(item, PendingRegenN):
                 # N-way regen after an interrupting gen completes; phase
                 # 1's engine serializes via ``session.generate(n=N)``.
-                # ``payload = (n, mode_or_None)``.
-                n = payload[0]
-                mode = payload[1] if len(payload) > 1 else None
+                n = item.count
+                mode = item.mode
                 if mode is not None:
                     self._run_regen_modifier_worker(n, mode)
                 else:
                     self._run_regen_n_worker(n)
-            elif kind == "fan":
-                # ``payload = (vector, alphas, prompt)``.
-                vector, alphas, prompt = payload
-                self._run_fan_worker(vector, alphas, prompt)
-            elif kind == "quit":
+            elif isinstance(item, PendingFan):
+                self._run_fan_worker(item.vector, list(item.alphas), item.prompt)
+            else:
+                # Pyright narrows the closed union's final member here.
+                assert isinstance(item, PendingQuit)
                 self.exit()
         except KeyboardInterrupt:
             raise
@@ -2751,7 +2757,7 @@ class SaklasApp(App[None]):
             self._pulled_slot = None
             self._sync_pull_state()
             self._current_assistant_widget = None
-            chat.add_system_message(f"error dispatching {kind}: {e}")
+            chat.add_system_message(f"error dispatching {item.kind}: {e}")
 
     def action_toggle_thinking(self) -> None:
         if not self._supports_thinking:
@@ -2786,7 +2792,7 @@ class SaklasApp(App[None]):
     def action_regenerate(self) -> None:
         if self._raw_mode:
             if self._is_busy:
-                self._enqueue_pending(PendingItem("regenerate", "regen"))
+                self._enqueue_pending(PendingRegenerate())
                 return
             self._run_regen_n_worker(1)
             return
@@ -2795,7 +2801,7 @@ class SaklasApp(App[None]):
         if self._is_busy:
             # Queue the regen — runs after current gen + any earlier
             # pending items finish.  Hit ``Esc`` first to short-circuit.
-            self._enqueue_pending(PendingItem("regenerate", "regen"))
+            self._enqueue_pending(PendingRegenerate())
             return
         # Loom: move active up so the next gen creates a sibling under
         # the user-parent rather than a child of the old assistant.

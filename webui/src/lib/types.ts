@@ -1089,7 +1089,8 @@ export interface WSErrorEvent {
 /** Wire-shape mirror of saklas.core.loom.LoomNode.  Optional fields are
  * absent on the wire when null/empty server-side to keep payloads slim. */
 /** One token-row inside a node's ``tokens`` / ``thinking_tokens`` array.
- *  Server-side ``TokenScoreDict`` is loose (``dict[str, Any]``); the
+ *  Server-side token rows have required identity/score fields plus
+ *  feature-dependent optional capture channels; the
  *  fields below are the ones :meth:`session._token_tap` stamps and the
  *  ones the webui knows how to consume.  All optional because the engine
  *  legitimately omits some on certain paths (e.g. ``top_alts`` only when

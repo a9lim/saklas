@@ -956,7 +956,7 @@ class SteeringHook:
 # beyond 1 would overshoot through the zero-thickness wire or σ-tube).
 #
 # This is the **onto** (off-surface collapse) gain only: ``eff_onto_L =
-# clamp(onto · share_L · _MANIFOLD_ONTO_GAIN, 0, 1)``.  On a legacy zero-thickness
+# clamp(onto · share_L · _MANIFOLD_ONTO_GAIN, 0, 1)``.  On an SAE-space
 # curved fit the kernel scales the off-surface residual by ``(1 − eff_onto)``; on
 # a fuzzy σ-field fit it instead shrinks residual norm toward the local tube
 # thickness.  That residual carries the per-token content variation, so combined
@@ -1440,19 +1440,14 @@ class SteeringManager:
             # is a clean per-layer slide fraction and n_layers-invariant (one
             # covered layer and a 30-layer fit both put ≈ ``base`` of slide on
             # each contributing layer; A⊂B steers its shared axis identically).
-            raw_share = {L: float(synth.share.get(L, 0.0)) for L in layer_set}
+            raw_share = {L: float(synth.share[L]) for L in layer_set}
             shares = _normalize_shares_mean1(raw_share)
 
             for L in layer_set:
                 sub_L = synth.layers[L]
                 sub_target = synth.target_coord[L].to(torch.float32)
-                # Per-axis collapse mask κ (0 push / translate, 1 ablate /
-                # collapse) — default all-translate when a synth predates it.
-                sub_kappa = synth.kappa.get(L)
-                sub_kappa = (
-                    sub_kappa.to(torch.float32) if sub_kappa is not None
-                    else torch.zeros(sub_L.rank, dtype=torch.float32)
-                )
+                # Per-axis collapse mask κ (0 push / translate, 1 ablate).
+                sub_kappa = synth.kappa[L].to(torch.float32)
                 # Orthogonalize the affine subspace against any curved manifold
                 # sharing this layer (curved wins the shared directions); κ rides
                 # through the re-orthonormalization.  Drop the layer if the affine
@@ -1560,12 +1555,12 @@ class SteeringManager:
             layer_set = list(synth.layers)
             if not layer_set:
                 continue
-            raw_share = {L: float(synth.share.get(L, 0.0)) for L in layer_set}
+            raw_share = {L: float(synth.share[L]) for L in layer_set}
             shares = _normalize_shares_mean1(raw_share)
             for L in layer_set:
                 sub_L = synth.layers[L]
-                kappa = synth.kappa.get(L)
-                if kappa is not None and bool((kappa.abs() > 0).any()):
+                kappa = synth.kappa[L]
+                if bool((kappa.abs() > 0).any()):
                     return None  # ablation: injection depends on h, not a const
                 target = synth.target_coord[L].to(torch.float32)
                 basis = sub_L.basis.to(torch.float32)              # (R, D)

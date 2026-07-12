@@ -1322,7 +1322,9 @@ def test_sigma_field_save_load_round_trip(tmp_path: Path):
         mahalanobis_share={0: 1.0}, origin={0: torch.zeros(2)},
     )
     path = tmp_path / "fuzzy.safetensors"
-    save_manifold(man, path, {"method": "manifold_spectral"})
+    save_manifold(man, path, {
+        "method": "manifold_discover_spectral", "fit_mode": "spectral",
+    })
     loaded = load_manifold(path)
     lsub = loaded.layers[0]
     assert lsub.has_sigma
@@ -1344,7 +1346,9 @@ def test_curved_manifold_without_sigma_is_rejected(tmp_path: Path):
     )
     path = tmp_path / "legacy.safetensors"
     with pytest.raises(ValueError, match="requires a sigma field"):
-        save_manifold(man, path, {"method": "manifold_spectral"})
+        save_manifold(man, path, {
+            "method": "manifold_discover_spectral", "fit_mode": "spectral",
+        })
 
 
 # ------------------------------------------------- affine (flat) subspace ---
@@ -1507,8 +1511,10 @@ def test_save_load_affine_manifold_round_trip(
         origin={},
     )
     path = tmp_path / "folded" / "model.safetensors"
-    save_manifold(manifold, path, {"method": "folded_vector",
-                                   "share_metric": "mahalanobis"})
+    save_manifold(manifold, path, {
+        "method": "folded_vector", "fit_mode": "baked",
+        "share_metric": "mahalanobis",
+    })
 
     # The on-disk payload omits the RBF triple + coord normalization for the
     # flat layers — only mean + basis (plus the shared node_coords).

@@ -1006,7 +1006,7 @@ def folded_vector_directions(manifold: "Manifold") -> dict[int, torch.Tensor]:
     proportional for cross-concept magnitude (``merge`` / GGUF export, which
     migrate to read the folded artifact natively).
 
-    Lets the unified folded Manifold back the legacy direction-math surface
+    Lets the unified folded Manifold back the direction-view API
     (``Profile``-returning ``extract()``, ``manifold compare``/``manifold why``) without a
     second *stored* representation — the concept's only on-disk artifact stays
     the folded Manifold; this is a downstream in-memory view.

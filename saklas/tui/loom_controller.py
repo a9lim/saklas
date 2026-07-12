@@ -33,7 +33,7 @@ from typing import Any, TYPE_CHECKING
 from saklas import Recipe, SamplingConfig, Steering
 from saklas.core.errors import SaklasError
 from saklas.io.selectors import AmbiguousSelectorError
-from saklas.tui.chat_panel import PendingItem
+from saklas.tui.chat_panel import PendingFan, PendingRegenN
 
 if TYPE_CHECKING:
     from saklas.tui.app import SaklasApp
@@ -325,7 +325,7 @@ class LoomController:
         if app._is_busy:
             display_text = f"/fan {vector} ({len(alphas)} α)"
             app._enqueue_pending(
-                PendingItem("fan", display_text, (vector, alphas, prompt))
+                PendingFan(display_text, vector, tuple(alphas), prompt)
             )
             return
         # Through the App attr so a test that monkeypatches
@@ -417,7 +417,7 @@ class LoomController:
         if app._is_busy:
             mode_tag = f" {mode}" if isinstance(mode, str) else ""
             app._enqueue_pending(
-                PendingItem("regen_n", f"/regen {n}{mode_tag}", (n, mode))
+                PendingRegenN(f"/regen {n}{mode_tag}", n, mode)
             )
             return
         if mode is not None:

@@ -93,13 +93,18 @@ fit_mode, hyperparams}` (discover) / a baked sentinel, folding in any non-`None`
 node role and any non-`None` node kind.
 `ManifoldSidecar` is the lean per-tensor JSON. Both folder discovery and direct
 tensor loading require its exact current `format_version` plus the current
-identity fields; missing fields are never synthesized. `method` round-trips
-`manifold_pca`/`manifold_sae` authored, `manifold_discover_{pca,spectral,sae}`
-discover, `merge` baked, `manifold_procrustes_transfer` transfer + the
+identity fields; missing fields are never synthesized. `method` is a closed
+discriminator coupled to `fit_mode`, not a free provenance string. It round-trips
+`manifold_pca`/`manifold_sae`/`manifold_monopolar{,_sae}` authored,
+`manifold_discover_{pca,spectral,sae}`
+plus `manifold_discover_auto` discover, `merge` / `folded_vector` baked, and
+`manifold_procrustes_transfer` transfer + the
 share/subspace metrics, fit_mode, hyperparams, diagnostics, and
 `node_spread_per_layer` — the whitened between-node spread `{str(L): tr(G_L)}`,
 a diagnostic concept-signal-by-layer profile); the tensor
-save/load itself lives in `core/manifold.py`. `hash_manifold_files` reuses
+save/load itself lives in `core/manifold.py`; its tensor-derived layer roster
+must equal the sidecar's `fitted_layers`. Merge component provenance always
+carries a manifest-proven lowercase sha256. `hash_manifold_files` reuses
 `packs.hash_file` for the per-file sha256 integrity manifest. After the first
 manifest population, `ManifoldFolder.update_file_hashes` hashes only the tensor
 and sidecar just replaced; already-verified historical variants are preserved.

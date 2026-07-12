@@ -100,18 +100,24 @@ class TestMergeVector:
             "noble", dirs, means,
             whitener=isotropic_whitener(dirs, 4), label="merged",
         )
+        from saklas.io.packs import hash_file
+
+        honest_source = tmp_path / "honest-source.safetensors"
+        warm_source = tmp_path / "warm-source.safetensors"
+        honest_source.write_bytes(b"manifest-proven honest source")
+        warm_source.write_bytes(b"manifest-proven warm source")
         merged_folder, _ = create_baked_manifold_folder(
             "local", "noble", "merged", manifold, session.model_id, method="merge",
             components={
                 "0": {
                     "selector": "default/honest",
                     "alpha": 0.3,
-                    "tensor_sha256": None,
+                    "tensor_sha256": hash_file(honest_source),
                 },
                 "1": {
                     "selector": "default/warm",
                     "alpha": 0.4,
-                    "tensor_sha256": None,
+                    "tensor_sha256": hash_file(warm_source),
                 },
             },
             model_fingerprint=loaded_model_fingerprint(

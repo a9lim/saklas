@@ -1087,7 +1087,7 @@ class SaklasSession:
         # Active assistant-role label for the current ``session.steering()``
         # scope — populated when every role-tagged term in the resolved
         # expression agrees on a role.  ``None`` means "use the family's
-        # standard assistant label", the legacy zero-overhead path.
+        # standard assistant label", the standard zero-overhead path.
         # Push/save/restore is handled by ``_SteeringContext`` so nested
         # scopes inner-wins for the duration of the inner block.  The
         # generation surface reads this when assembling the chat-template
@@ -1099,7 +1099,7 @@ class SaklasSession:
         # round-trip-validated against the live chat template on first
         # access.  ``None`` after resolution = scene mode unavailable
         # (base model, label-free family, or validation failure) — every
-        # render falls back to the legacy chat-template paths.
+        # render falls back to the standard chat-template paths.
         self._scene_grammar: TurnGrammar | None = None
         self._scene_grammar_resolved: bool = False
 
@@ -5638,7 +5638,7 @@ class SaklasSession:
             # compile; layer_idxs selects the subset this generation consumes.
             # Live lens layers can therefore ride the same compile-clean path
             # instead of forcing transient hooks.
-            and getattr(self, "_compiled_clean_eligible", False)
+            and self._compiled_clean_eligible
             and self._capture_buffers
             and (
                 self._steering_uses_compiled_offsets
@@ -7351,7 +7351,7 @@ class SaklasSession:
         # configurations, so the bracketing here is always safe.
         self._end_capture()
 
-        use_static = bool(prefer_static and getattr(self, "_static_cache_active", False))
+        use_static = bool(prefer_static and self._static_cache_active)
         static_max_cache_len: int | None = None
         past_key_values: object | None = None
         cache_position: torch.Tensor | None = None
@@ -7538,10 +7538,10 @@ class SaklasSession:
         bit-identical to ``apply_chat_template`` on standard alternating
         conversations.  ``None`` = scene mode unavailable (base model,
         label-free family like mistral, or a template shape that defeated
-        the autopsy); rendering falls back to the legacy paths and a
+        the autopsy); rendering falls back to the chat-template paths and a
         one-time warning names the reason.
         """
-        if not getattr(self, "_scene_grammar_resolved", False):
+        if not self._scene_grammar_resolved:
             self._scene_grammar_resolved = True
             self._scene_grammar = None
             template = getattr(self._tokenizer, "chat_template", None)
@@ -7620,7 +7620,7 @@ class SaklasSession:
         # elicitation-baseline contract is an assistant-seat construct, so
         # ``_active_role`` doesn't apply there).  Prior turns' labels ride
         # on the messages themselves (above).
-        steer_role = getattr(self, "_active_role", None)
+        steer_role = self._active_role
         if gen_seat == "assistant":
             gen_role = steer_role if steer_role is not None else assistant_role
             if (
@@ -9765,7 +9765,7 @@ class SaklasSession:
                     common,
                     max_new_tokens=max_new_tokens,
                     prefer_static=bool(
-                        getattr(self, "_static_cache_active", False)
+                        self._static_cache_active
                         and steering is None
                     ),
                 )

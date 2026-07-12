@@ -17,6 +17,8 @@ import from :mod:`saklas.core.monitor` (no circular dependency).
 
 from __future__ import annotations
 
+import math
+
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -455,15 +457,16 @@ def _attach_manifold_probe(
             v_reduced = v_centered @ sub_f32.basis.T  # (K, R)
         node_values_reduced[layer_idx] = v_reduced.contiguous()
         share_weights_raw[layer_idx] = float(manifold.mahalanobis_share[layer_idx])
+    if any(
+        not math.isfinite(value) or value <= 0.0
+        for value in share_weights_raw.values()
+    ):
+        raise ValueError("manifold probe shares must be finite and positive")
     total = sum(max(_MIN_SHARE_WEIGHT, w) for w in share_weights_raw.values())
-    if total <= 0.0:
-        n_layers = max(1, len(share_weights_raw))
-        share_weights = dict.fromkeys(share_weights_raw, 1.0 / n_layers)
-    else:
-        share_weights = {
-            idx: max(_MIN_SHARE_WEIGHT, w) / total
-            for idx, w in share_weights_raw.items()
-        }
+    share_weights = {
+        idx: max(_MIN_SHARE_WEIGHT, w) / total
+        for idx, w in share_weights_raw.items()
+    }
     inject_neutral = NEUTRAL_LABEL not in manifold.node_labels
     candidate_labels = tuple(manifold.node_labels)
     label_to_candidate_idx = {
@@ -596,7 +599,7 @@ def _compute_assign_bandwidth(
             torch.cat([band, neutral_band.reshape(1)])
             if probe.inject_neutral else band
         )                                                    # (Kc,)
-        w = float(sw.get(layer_idx, 0.0))
+        w = float(sw[layer_idx])
         acc = cand * w if acc is None else acc + cand * w
         wsum += w
     if acc is None:

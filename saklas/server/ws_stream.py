@@ -20,7 +20,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 from saklas.core.errors import SaklasError
 from saklas.core.loom import LoomMutated
-from saklas.core.results import GenerationResult
+from saklas.core.results import GenerationResult, TokenAlt
 from saklas.core.sampling import SamplingConfig
 from saklas.core.session import SaklasSession
 from saklas.core.steering import Steering
@@ -529,7 +529,7 @@ async def _ws_handle_generate(
                 is_thinking: bool,
                 tid: int | None,
                 lp: float | None,
-                top_alts: list[Any] | None,
+                top_alts: list[TokenAlt] | None,
                 perplexity: float | None = None,
                 _node_holder: list[str | None] = current_node_holder,
                 _token_queue: asyncio.Queue[Any] = token_queue,
